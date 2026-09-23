@@ -5,13 +5,14 @@ import { crc32, gzipSync } from "node:zlib";
 import { afterAll, describe, expect, it } from "vitest";
 import { AUDIT_LIMITS } from "../scripts/staging-ops/image-audit/subject.mjs";
 import { createStagingBudget, inventoryLayer } from "../scripts/staging-ops/image-audit/export-walk.mjs";
+import { createRetainedStateBudget } from "../scripts/staging-ops/image-audit/budgets.mjs";
 import { SCAN_HEADER, archiveSurfaceGroup } from "../scripts/staging-ops/image-audit/scan-surface.mjs";
 import { transitionReadiness } from "../scripts/staging-ops/image-audit/evidence.mjs";
 import { compareInventory, expectedInventory, inventorySummary } from "../scripts/staging-ops/image-audit/expected-tree.mjs";
 import { latestAppMembers } from "../scripts/staging-ops/image-audit/inspect.mjs";
 import { mergedFilesystem } from "../scripts/staging-ops/image-audit/layers.mjs";
 import { buildTar, syntheticSecret } from "./helpers/tar-fixture";
-import { inspectSynthetic, memberScanFiles, scanSurface, scratchPool, surfaceScanFiles, synthesizeImage } from "./helpers/synthetic-image";
+import { inspectSynthetic, memberScanFiles, scanFiles as scanFilesUnder, scanSurface, scratchPool, surfaceScanFiles, synthesizeImage } from "./helpers/synthetic-image";
 
 /**
  * AC-AUDIT-02/03/04 through the FULL inspector, on correctly hashed synthetic images.
@@ -1019,6 +1020,102 @@ describe("a member path past the supported bound refuses the run (B9)", () => {
     const path = `app/${Array.from({ length: 127 }, (_, i) => `s${i}`).join("/")}`;
     const result = await inspectLayers([buildTar([{ name: path, content: "deep", paxLongName: true }])]);
     expect(result.appMembers.map((m) => m.path)).toEqual([path]);
+  });
+});
+
+/**
+ * B10 — an OPAQUE marker's position in the layer matters. The pinned runtime's overlay converter keeps a
+ * same-layer descendant written before the marker; its non-overlay converter can remove one whose
+ * intermediate directory was only created implicitly. The audit records the ambiguity rather than
+ * choosing a runtime. The marker here targets `cache/`, OUTSIDE `/app`: no expected file is involved,
+ * so an ELIGIBLE row stays ready and only the ambiguity moves the verdict.
+ */
+describe("opaque-marker ordering ambiguity (B10)", () => {
+  const marker = { name: "cache/.wh..wh..opq", content: "" };
+  const upper = (...members: { name: string; content?: string; type?: "directory" }[]) => [buildTar(baseMembers), buildTar(members)];
+
+  const rows: [string, { name: string; content?: string; type?: "directory" }[], boolean][] = [
+    ["an earlier deep descendant with an UNDECLARED intermediate", [{ name: "cache/sub/x.js", content: "x" }, marker], true],
+    ["an earlier DIRECTORY descendant with an undeclared intermediate", [{ name: "cache/sub/deeper/", type: "directory" }, marker], true],
+    ["a descendant missing ONE intermediate of a longer chain", [{ name: "cache/a/", type: "directory" }, { name: "cache/a/b/x.js", content: "x" }, marker], true],
+    ["the intermediate declared AFTER the marker", [{ name: "cache/sub/x.js", content: "x" }, marker, { name: "cache/sub/", type: "directory" }], true],
+    ["the marker FIRST", [marker, { name: "cache/sub/x.js", content: "x" }], false],
+    ["an earlier DIRECT child", [{ name: "cache/x.js", content: "x" }, marker], false],
+    ["the intermediate declared BEFORE its descendant", [{ name: "cache/sub/", type: "directory" }, { name: "cache/sub/x.js", content: "x" }, marker], false],
+    ["the intermediate declared BETWEEN descendant and marker", [{ name: "cache/sub/x.js", content: "x" }, { name: "cache/sub/", type: "directory" }, marker], false],
+    ["a complete chain declared earlier", [{ name: "cache/a/", type: "directory" }, { name: "cache/a/b/", type: "directory" }, { name: "cache/a/b/x.js", content: "x" }, marker], false],
+    ["a segment-PREFIX sibling directory", [{ name: "cache2/sub/x.js", content: "x" }, marker], false],
+    ["an unrelated nested sibling", [{ name: "other/sub/x.js", content: "x" }, marker], false],
+  ];
+
+  for (const [label, members, ambiguous] of rows) {
+    it(`${ambiguous ? "BLOCKS" : "stays eligible"}: ${label}`, async () => {
+      const result = await inspectLayers(upper(...members));
+      const { readiness, kinds } = chain(result);
+      if (ambiguous) {
+        expect(result.coverage.limitations).toContainEqual({ kind: "merged-type-conflict", layer: 1 });
+        expect(readiness.transitionReady).toBe(false);
+      } else {
+        expect(kinds).toEqual([]);
+        expect(readiness.transitionReady).toBe(true);
+      }
+    });
+  }
+
+  it("the ambiguous layer's bytes are still on the scan surface", async () => {
+    const secret = syntheticSecret();
+    const result = await inspectLayers(upper({ name: "cache/sub/x.js", content: `K=${secret}` }, marker));
+    expect(result.coverage.limitations).toContainEqual({ kind: "merged-type-conflict", layer: 1 });
+    expect(scanSurface(result.scanDir)).toContain(secret);
+    expectNotPublished(result, secret);
+  });
+
+  it("the ROOT opaque marker keeps its own behaviour", async () => {
+    const result = await inspectLayers([buildTar(baseMembers), buildTar([{ name: "app/sub/x.js", content: "x" }, { name: ".wh..wh..opq", content: "" }])]);
+    // Root opacity empties what is below it (B7) and is not itself an ordering conflict.
+    expect(result.coverage.limitations).toEqual([]);
+    expect(chain(result).inventory.counts.missing).toBe(2);
+  });
+});
+
+/** B9-R at the INVENTORY boundary: a refusal happens before the allocation, and leaves no partial output. */
+describe("the retained-state budget refuses inside a layer inventory (B9-R)", () => {
+  it("refuses before staging completes, with the fixed code and no partial staged file", () => {
+    const dir = pool.make();
+    const layerTarPath = join(dir, "layer.tar");
+    writeFileSync(layerTarPath, buildTar([{ name: "app/a.js", content: "a" }, { name: "app/b.js", content: "b" }, { name: "app/c.js", content: "c" }]));
+    const scanDir = join(dir, "scan");
+    expect(() => inventoryLayer({
+      layerTarPath, layerIndex: 0, scanDir, limits: AUDIT_LIMITS,
+      stagingBudget: createStagingBudget(),
+      retained: createRetainedStateBudget({ maxLogicalBytes: 2048 }),
+    })).toThrow(expect.objectContaining({ code: "AUDIT_TAR_LIMIT_EXCEEDED" }));
+    // Whatever was staged before the refusal is complete; nothing half-written is left behind.
+    for (const path of scanFilesUnder(scanDir)) expect(readFileSync(path).length).toBeGreaterThanOrEqual(SCAN_HEADER.length);
+  });
+
+  it("a budget refusal inside a NESTED archive refuses instead of becoming an undecodable gap", () => {
+    const nested = gzipSync(buildTar([{ name: "fixture/a.txt", content: "inner" }]));
+    const layerOf = (name: string) => {
+      const dir = pool.make();
+      const layerTarPath = join(dir, "layer.tar");
+      writeFileSync(layerTarPath, buildTar([{ name, content: nested }]));
+      return { layerTarPath, scanDir: join(dir, "scan") };
+    };
+    // What the whole layer costs, measured — the nested expansion's charges come last.
+    const measured = createRetainedStateBudget();
+    inventoryLayer({ ...layerOf("app/pkg.tgz"), layerIndex: 0, limits: AUDIT_LIMITS, stagingBudget: createStagingBudget(), retained: measured });
+    // A ceiling just BELOW that total therefore refuses inside the nested expansion.
+    const nestedLayer = layerOf("app/pkg.tgz");
+    let thrown: unknown;
+    try {
+      inventoryLayer({
+        ...nestedLayer, layerIndex: 0, limits: AUDIT_LIMITS, stagingBudget: createStagingBudget(),
+        retained: createRetainedStateBudget({ maxLogicalBytes: measured.used - 128 }),
+      });
+    } catch (error) { thrown = error; }
+    // It ESCAPED: a resource refusal is not the nested-archive-undecodable gap.
+    expect(thrown).toMatchObject({ code: "AUDIT_TAR_LIMIT_EXCEEDED" });
   });
 });
 

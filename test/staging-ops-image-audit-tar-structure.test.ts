@@ -14,7 +14,7 @@ import {
 } from "../scripts/staging-ops/image-audit/tar-reader.mjs";
 import { mergedFilesystem, whiteoutOf } from "../scripts/staging-ops/image-audit/layers.mjs";
 import { membersThroughSymlink } from "../scripts/staging-ops/image-audit/inspect.mjs";
-import { createRetainedStateBudget, createWorkBudget } from "../scripts/staging-ops/image-audit/budgets.mjs";
+import { RETAINED_CHARGES, createRetainedStateBudget, createWorkBudget } from "../scripts/staging-ops/image-audit/budgets.mjs";
 import { buildTar, syntheticSecret } from "./helpers/tar-fixture";
 
 /**
@@ -794,5 +794,85 @@ describe("member paths are bounded before any ancestor work (B9)", () => {
     const one = expiring(2);
     expect(() => membersThroughSymlink(["a/b/c/d/e"], new Set(["zz"]), one, { deadlineEvery: 1 })).toThrow(/deadline/);
     expect(one.asked).toEqual(["symlink ancestry", "symlink ancestry"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B9-R — the two authorities: retained logical bytes, and CPU/deadline
+// ---------------------------------------------------------------------------
+
+describe("the retained-state budget is charged before insertion and never refunds (B9-R)", () => {
+  const limitCode = { code: "AUDIT_TAR_LIMIT_EXCEEDED" };
+  /** What one `place()` of a single-segment key costs: its string plus its map membership. */
+  const placeCharge = (key: string) => RETAINED_CHARGES.string(key) + RETAINED_CHARGES.membership;
+
+  it("admits an exact charge and refuses the next byte", () => {
+    const budget = createRetainedStateBudget({ maxLogicalBytes: RETAINED_CHARGES.string("a") });
+    expect(() => budget.string("a")).not.toThrow();
+    expect(budget.used).toBe(budget.limit);
+    expect(() => budget.membership()).toThrow(expect.objectContaining(limitCode));
+    // …and the refusal did not consume the budget it refused.
+    expect(budget.used).toBe(budget.limit);
+  });
+
+  it("enforces the secondary relation ceiling independently of bytes", () => {
+    const budget = createRetainedStateBudget({ maxLogicalBytes: 1024 * 1024, maxRelations: 2 });
+    budget.relation("a/");
+    budget.relation("b/");
+    expect(() => budget.relation("c/")).toThrow(/relations exceed the 2 bound/);
+    // A proven duplicate membership costs neither a byte nor a relation.
+    const proven = createRetainedStateBudget({ maxLogicalBytes: 1024 * 1024, maxRelations: 1 });
+    proven.relation("a/");
+    expect(() => proven.relation("a/", { alreadyMember: true })).not.toThrow();
+  });
+
+  it("charges a long SHALLOW path — no ancestors — before it is retained", () => {
+    const shallow = "r".repeat(3000);
+    const budget = createRetainedStateBudget({ maxLogicalBytes: placeCharge(shallow) - 1 });
+    expect(() => mergedFilesystem([[shallow]], { retained: budget })).toThrow(expect.objectContaining(limitCode));
+    expect(() => mergedFilesystem([[shallow]], { retained: createRetainedStateBudget({ maxLogicalBytes: 1024 * 1024 }) })).not.toThrow();
+  });
+
+  it("cannot be evaded by unique depth, shared prefixes, duplicates, cross-layer growth or churn", () => {
+    const tiny = () => createRetainedStateBudget({ maxLogicalBytes: 4096 });
+    // Unique deep chains.
+    expect(() => mergedFilesystem([Array.from({ length: 40 }, (_, i) => `u${i}/a/b/c/x.js`)], { retained: tiny() })).toThrow(expect.objectContaining(limitCode));
+    // One shared prefix, many leaves: the relations still cost.
+    expect(() => mergedFilesystem([Array.from({ length: 40 }, (_, i) => `shared/a/b/x${i}.js`)], { retained: tiny() })).toThrow(expect.objectContaining(limitCode));
+    // The same key repeated across layers: each re-placement is charged again.
+    expect(() => mergedFilesystem(Array.from({ length: 40 }, () => ["dup/a/b/x.js"]), { retained: tiny() })).toThrow(expect.objectContaining(limitCode));
+    // CHURN: write, delete, rewrite. A refund would make this free.
+    const churn = Array.from({ length: 30 }, (_, i) => (i % 2 === 0 ? ["c/a/x.js"] : [".wh.c"]));
+    expect(() => mergedFilesystem(churn, { retained: tiny() })).toThrow(expect.objectContaining(limitCode));
+  });
+
+  it("a representative clean workload uses a small fraction of the production ceiling", () => {
+    const layers = [
+      ["app/", "app/index.js", "app/d/", ...Array.from({ length: 150 }, (_, i) => `app/d/file${i}.js`)],
+      ["usr/", "usr/bin/", ...Array.from({ length: 150 }, (_, i) => `usr/bin/tool${i}`)],
+    ];
+    const budget = createRetainedStateBudget();
+    mergedFilesystem(layers, { retained: budget });
+    expect(budget.used).toBeLessThan(budget.limit / 100);
+    expect(budget.relations).toBeLessThan(budget.relationLimit / 100);
+  });
+});
+
+describe("the work budget covers shallow and marker-only workloads (B9-R)", () => {
+  const limitCode = { code: "AUDIT_TAR_LIMIT_EXCEEDED" };
+
+  it("root-level entries with NO ancestors still consume steps", () => {
+    const roots = Array.from({ length: 50 }, (_, i) => `root${i}.js`);
+    expect(() => mergedFilesystem([roots], { work: createWorkBudget({ maxSteps: 10 }) })).toThrow(expect.objectContaining(limitCode));
+    const counted = createWorkBudget({ maxSteps: 10_000 });
+    mergedFilesystem([roots], { work: counted });
+    expect(counted.steps).toBeGreaterThanOrEqual(roots.length);
+  });
+
+  it("unrelated opaque markers are charged per candidate, before any prefix filter", () => {
+    const layer = [...Array.from({ length: 30 }, (_, i) => `other/f${i}.js`), ...Array.from({ length: 30 }, (_, i) => `m${i}/.wh..wh..opq`)];
+    expect(() => mergedFilesystem([layer], { work: createWorkBudget({ maxSteps: 200 }) })).toThrow(expect.objectContaining(limitCode));
+    const deadline = { calls: 0, assert() { this.calls += 1; if (this.calls >= 3) throw Object.assign(new Error("deadline"), { code: "STAGING_OPERATION_TIMEOUT" }); } };
+    expect(() => mergedFilesystem([layer], { work: createWorkBudget({ deadline, deadlineEvery: 1 }) })).toThrow(/deadline/);
   });
 });
