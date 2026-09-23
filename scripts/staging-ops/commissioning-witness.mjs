@@ -50,6 +50,9 @@
 
 import { createHash } from "node:crypto";
 import { inflateRawSync } from "node:zlib";
+import {
+  CLOUD_CASE_SEQUENCE, REHEARSAL_CASE_ID, REHEARSAL_ROLE, caseOrdinal,
+} from "./commissioning-case.mjs";
 
 export const WITNESS_SCHEMA_VERSION = 1;
 
@@ -106,6 +109,15 @@ const NONCE = /^[0-9a-f]{64}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const FULL_SHA = /^[0-9a-f]{40}$/;
 const DECIMAL = /^[1-9][0-9]{0,17}$/;
+
+const isPositiveSafeInteger = (value) => typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+const isPositiveSafeDecimal = (value) => typeof value === "string" && DECIMAL.test(value)
+  && Number.isSafeInteger(Number(value)) && Number(value) > 0;
+const isCanonicalTimestamp = (value) => {
+  if (typeof value !== "string") return false;
+  const time = Date.parse(value);
+  return Number.isFinite(time) && new Date(time).toISOString() === value;
+};
 
 /** Stable, key-sorted JSON. Every digest in the harness goes through this, so an ordering
  *  difference is never mistaken for a content one. Defined HERE and re-exported by the runner so
@@ -412,10 +424,28 @@ export function validateGovernedSnapshot(snapshot, allowed) {
   const refuse = (why) => { throw new WitnessRefusal(`the witness snapshot is not usable policy evidence: ${why}`); };
   if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) refuse("it is not an object");
   if (snapshot.inert === true) refuse("it is an inert rehearsal observation and carries no policy measurement");
+  assertClosedKeys(snapshot, OBSERVATION_FIELDS, "the witness snapshot", refuse);
+  if (!isCanonicalTimestamp(snapshot.started_at) || !isCanonicalTimestamp(snapshot.completed_at)) {
+    refuse("its measurement window is not two canonical timestamps");
+  }
+  const startedAt = Date.parse(snapshot.started_at);
+  const completedAt = Date.parse(snapshot.completed_at);
+  if (typeof snapshot.span_ms !== "number" || !Number.isFinite(snapshot.span_ms)
+    || snapshot.span_ms < 0 || snapshot.span_ms > MAX_POLICY_READ_SPAN_MS
+    || completedAt - startedAt !== snapshot.span_ms) {
+    refuse("its observation span does not exactly describe a bounded measurement window");
+  }
+  if (!Number.isInteger(snapshot.applicability_pages) || snapshot.applicability_pages < 1
+    || snapshot.applicability_pages > WITNESS_MAX_PAGES) {
+    refuse(`its applicability page count is not an integer from 1 through ${WITNESS_MAX_PAGES}`);
+  }
   const list = snapshot.governed_rulesets;
   if (!Array.isArray(list) || !list.length) refuse("it carries no complete governed ruleset set");
+  if (list.length > snapshot.applicability_pages * WITNESS_PAGE_SIZE) {
+    refuse("it carries more governed rulesets than its bounded applicability read could contain");
+  }
   const classic = snapshot.classic_protection;
-  if (!classic || typeof classic !== "object" || classic.present !== false || Number(classic.status) !== 404) {
+  if (!classic || typeof classic !== "object" || Array.isArray(classic) || classic.present !== false || classic.status !== 404) {
     refuse("it does not carry the measured no-classic-protection representation");
   }
   /**
@@ -429,19 +459,35 @@ export function validateGovernedSnapshot(snapshot, allowed) {
    */
   assertClosedKeys(classic, ["present", "status"], "the witness snapshot's classic protection", refuse);
   const sources = snapshot.source_identities;
-  if (!Array.isArray(sources)) refuse("it carries no measured source-identity list");
+  if (!Array.isArray(sources) || !sources.length) refuse("it carries no measured source-identity list");
   for (const entry of sources) {
-    if (!allowed.sources.has(String(entry))) {
-      refuse(`it names the source ${JSON.stringify(String(entry))}, which is not one this run approved in intent`);
+    if (typeof entry !== "string" || !allowed.sources.has(entry)) {
+      refuse(`it names the source ${JSON.stringify(entry)}, which is not one this run approved in intent`);
     }
   }
-  const span = Number(snapshot.span_ms);
-  if (!Number.isFinite(span) || span < 0 || span > MAX_POLICY_READ_SPAN_MS) refuse(`its observation span (${snapshot.span_ms}) is outside the contemporaneity bound`);
+  if (canonicalJson(sources) !== canonicalJson([...new Set(sources)].sort())) {
+    refuse("its source identities are not the unique canonical source list produced by the measurer");
+  }
   const governed = list.map((entry) => {
-    if (!entry || typeof entry !== "object") refuse("a projected ruleset is not an object");
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) refuse("a projected ruleset is not an object");
+    assertClosedKeys(entry, ["id", "source_type", "source", "governed"], "a projected ruleset", refuse);
+    if (!isPositiveSafeInteger(entry.id)) refuse("a projected ruleset carries no positive safe provider identity");
+    if (typeof entry.source_type !== "string" || !RULESET_SOURCE_TYPES.includes(entry.source_type)) {
+      refuse("a projected ruleset carries no supported source type");
+    }
+    if (typeof entry.source !== "string" || !allowed.sources.has(entry.source)) {
+      refuse("a projected ruleset carries no source identity approved by intent");
+    }
+    if (!entry.governed || typeof entry.governed !== "object" || Array.isArray(entry.governed)) {
+      refuse("a projected ruleset carries no governed object");
+    }
     // Re-project the governed body through the same closed schema. A snapshot that would not survive
     // the projection is not a snapshot this consumer may reason about.
-    return projectGovernedRuleset({ ...entry.governed, id: entry.id ?? undefined, source_type: entry.source_type ?? undefined, source: entry.source ?? undefined }, allowed).governed;
+    const projected = projectGovernedRuleset({ ...entry.governed, id: entry.id, source_type: entry.source_type, source: entry.source }, allowed);
+    if (canonicalJson(projected) !== canonicalJson(entry)) {
+      refuse("a projected ruleset is not the exact closed representation produced by the measurer");
+    }
+    return projected.governed;
   });
   if (canonicalHash(governed) !== String(snapshot.projected_governed_digest)) {
     refuse("its projected governed digest does not match the governed set it carries");
@@ -686,23 +732,51 @@ export function assertResponseShape(response, { domain = null } = {}) {
   assertClosedKeys(response, RESPONSE_FIELDS, "the witness response", refuse);
   if (!NONCE.test(String(response.challenge_nonce ?? ""))) refuse("the witness response binds no challenge nonce");
   if (!SHA256.test(String(response.challenge_digest ?? ""))) refuse("the witness response binds no exact challenge bytes");
-  const createdAt = Date.parse(String(response.created_at));
-  const expiresAt = Date.parse(String(response.challenge_expires_at));
-  if (!Number.isFinite(createdAt)) refuse("the witness response carries no parseable creation time");
-  if (!Number.isFinite(expiresAt)) refuse("the witness response carries no challenge expiry");
+  if (!isCanonicalTimestamp(response.created_at)) refuse("the witness response carries no canonical creation time");
+  if (!isCanonicalTimestamp(response.challenge_expires_at)) refuse("the witness response carries no canonical challenge expiry");
+  const createdAt = Date.parse(response.created_at);
 
   // THE BINDING FIELDS, with EXACT derived shapes rather than mere presence. A response whose role
   // or ordinal is a string where the consumer derives a number binds nothing on that field.
-  if (!DECIMAL.test(String(response.repository_id ?? ""))) refuse("the witness response carries no numeric repository ID");
-  if (!DECIMAL.test(String(response.original_run_id ?? "")) || !DECIMAL.test(String(response.original_attempt ?? ""))) {
+  if (!isPositiveSafeInteger(response.repository_id)) refuse("the witness response carries no positive safe numeric repository ID");
+  if (!isPositiveSafeDecimal(response.original_run_id) || !isPositiveSafeDecimal(response.original_attempt)) {
     refuse("the witness response carries no original run identity");
   }
-  if (!WITNESS_MODES.includes(String(response.source_mode))) refuse("the witness response declares an unknown source mode");
-  if (!FULL_SHA.test(String(response.source_sha ?? ""))) refuse("the witness response carries no immutable source SHA");
-  if (!["pre", "post"].includes(String(response.direction))) refuse("the witness response's direction is pre or post");
+  if (typeof response.source_mode !== "string" || !WITNESS_MODES.includes(response.source_mode)) refuse("the witness response declares an unknown source mode");
+  if (typeof response.source_sha !== "string" || !FULL_SHA.test(response.source_sha)) refuse("the witness response carries no immutable source SHA");
+  if (typeof response.direction !== "string" || !["pre", "post"].includes(response.direction)) refuse("the witness response's direction is pre or post");
   if (!Number.isInteger(response.case_ordinal) || response.case_ordinal < 0) refuse("the witness response carries no case ordinal");
   for (const field of ["repository", "workflow_path", "role", "job_id", "case_id", "target_ref", "domain"]) {
     if (typeof response[field] !== "string" || !response[field]) refuse(`the witness response carries no ${field}`);
+  }
+
+  const responseDomain = response.domain;
+  if (!["commission", "rehearsal"].includes(responseDomain)) refuse("the witness response declares an unknown domain");
+  if (domain !== null && responseDomain !== domain) refuse(`the witness response is not in the expected ${domain} domain`);
+  if (responseDomain === "commission") {
+    const sequence = CLOUD_CASE_SEQUENCE[response.role];
+    if (!sequence || !sequence.includes(response.case_id)) refuse("the witness response's case is not in its role's closed case sequence");
+    if (response.source_mode !== "commission") refuse("a commissioning response must come from commission mode");
+    if (response.job_id !== response.role) refuse("a commissioning response's job is not the fixed job for its actor role");
+    if (response.case_ordinal !== caseOrdinal(response.role, response.case_id)) refuse("the witness response's case ordinal is not derived from its closed case sequence");
+    const expectedTarget = `refs/heads/aios-policy-commissioning/run-${response.original_run_id}-${response.original_attempt}-${response.role}`;
+    if (response.target_ref !== expectedTarget) refuse("the witness response's target is not the ref derived for its run, attempt and role");
+    if (!isPositiveSafeInteger(response.intended_app_id)) refuse("the witness response carries no positive safe intended App identity");
+    if (!isPositiveSafeDecimal(response.intended_installation_id)) refuse("the witness response carries no positive safe intended installation identity");
+    if (typeof response.manifest_sha256 !== "string" || !SHA256.test(response.manifest_sha256)
+      || typeof response.graph_sha256 !== "string" || !SHA256.test(response.graph_sha256)) {
+      refuse("the witness response carries no immutable manifest and graph digests");
+    }
+  } else {
+    if (response.source_mode !== "transport-rehearsal" || response.role !== REHEARSAL_ROLE
+      || response.job_id !== REHEARSAL_JOB_ID || response.case_id !== REHEARSAL_CASE_ID
+      || response.case_ordinal !== 0 || response.direction !== "pre" || response.target_ref !== "rehearsal") {
+      refuse("the rehearsal response does not carry the fixed role, job, case, ordinal, direction and inert target");
+    }
+    if (response.intended_app_id !== null || response.intended_installation_id !== null
+      || response.manifest_sha256 !== null || response.graph_sha256 !== null) {
+      refuse("the rehearsal response must carry null actor, installation, manifest and graph bindings");
+    }
   }
 
   const identity = response.witness_identity;
@@ -710,7 +784,7 @@ export function assertResponseShape(response, { domain = null } = {}) {
   // John measured this", so a response that does not say which identity measured it is unusable.
   if (!identity || typeof identity !== "object" || Array.isArray(identity)) refuse("the witness response carries no measuring identity");
   assertClosedKeys(identity, ["login", "user_id", "type"], "the witness response's identity", refuse);
-  if (Number(identity.user_id) !== OWNER_USER_ID || String(identity.login) !== OWNER_LOGIN || String(identity.type) !== OWNER_USER_TYPE) {
+  if (identity.user_id !== OWNER_USER_ID || identity.login !== OWNER_LOGIN || identity.type !== OWNER_USER_TYPE) {
     refuse("the witness response does not name the one authorized local measuring identity");
   }
 
@@ -722,9 +796,11 @@ export function assertResponseShape(response, { domain = null } = {}) {
   assertClosedKeys(observation, inert ? INERT_OBSERVATION_FIELDS : OBSERVATION_FIELDS, "the witness observation", refuse);
   // ACTUAL FINITE TIMESTAMPS, not values that coerce. `Number(null)` is 0 and `Date.parse` of a
   // missing field is NaN; both have to be refusals here rather than measurements downstream.
-  const startedAt = Date.parse(String(observation.started_at));
-  const completedAt = Date.parse(String(observation.completed_at));
-  if (!Number.isFinite(startedAt) || !Number.isFinite(completedAt)) refuse("the witness observation carries no parseable measurement window");
+  if (!isCanonicalTimestamp(observation.started_at) || !isCanonicalTimestamp(observation.completed_at)) {
+    refuse("the witness observation carries no canonical measurement window");
+  }
+  const startedAt = Date.parse(observation.started_at);
+  const completedAt = Date.parse(observation.completed_at);
   if (completedAt < startedAt) refuse("the witness observation completed before it started; the ordering is impossible");
   if (typeof observation.span_ms !== "number" || !Number.isFinite(observation.span_ms) || observation.span_ms < 0) {
     refuse("the witness observation carries no finite measured span");
@@ -735,12 +811,31 @@ export function assertResponseShape(response, { domain = null } = {}) {
   // finished. The challenge-side half of the ordering is in `assertResponseBinding`.
   if (completedAt > createdAt) refuse("the witness observation claims to have completed after the response reporting it was created");
   if (!inert) {
+    if (!Number.isInteger(observation.applicability_pages) || observation.applicability_pages < 1
+      || observation.applicability_pages > WITNESS_MAX_PAGES) {
+      refuse(`the witness observation's applicability page count is not an integer from 1 through ${WITNESS_MAX_PAGES}`);
+    }
     if (!Array.isArray(observation.governed_rulesets) || !observation.governed_rulesets.length) {
       refuse("the witness observation carries no complete governed ruleset set");
     }
-    if (!SHA256.test(String(observation.raw_governed_digest ?? "")) || !SHA256.test(String(observation.projected_governed_digest ?? ""))) {
+    if (observation.governed_rulesets.length > observation.applicability_pages * WITNESS_PAGE_SIZE) {
+      refuse("the witness observation carries more governed rulesets than its bounded applicability read could contain");
+    }
+    for (const entry of observation.governed_rulesets) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) refuse("a projected ruleset is not an object");
+      assertClosedKeys(entry, ["id", "source_type", "source", "governed"], "a projected ruleset", refuse);
+      if (!isPositiveSafeInteger(entry.id) || typeof entry.source_type !== "string"
+        || !RULESET_SOURCE_TYPES.includes(entry.source_type) || typeof entry.source !== "string" || !entry.source
+        || !entry.governed || typeof entry.governed !== "object" || Array.isArray(entry.governed)) {
+        refuse("a projected ruleset does not carry exact safe identity, source and governed object fields");
+      }
+    }
+    if (typeof observation.raw_governed_digest !== "string" || !SHA256.test(observation.raw_governed_digest)
+      || typeof observation.projected_governed_digest !== "string" || !SHA256.test(observation.projected_governed_digest)) {
       refuse("the witness observation carries no digests of the measurement it was projected from");
     }
+  } else if (observation.inert !== true || observation.span_ms !== 0 || startedAt !== completedAt) {
+    refuse("the inert rehearsal observation must use one instant for both timestamps and a zero span");
   }
   return response;
 }
@@ -1033,6 +1128,9 @@ export function assertOriginalSubject({ response, originalRun, expected }) {
   if (!originalRun || typeof originalRun !== "object") {
     throw new WitnessIncomplete("the witness publisher could not measure the original run its envelope names");
   }
+  if (!isPositiveSafeInteger(originalRun.id) || String(originalRun.id) !== String(response.original_run_id)) {
+    refuse("the envelope's original run identity is not the run the provider returned");
+  }
   if (String(originalRun.path) !== expected.workflowPath) refuse("the envelope's original run is not the reviewed commissioning workflow");
   if (String(originalRun.event) !== "workflow_dispatch") refuse("the envelope's original run was not dispatched manually");
   if (String(originalRun.head_sha) !== String(expected.sourceSha)) {
@@ -1083,6 +1181,17 @@ export function publishWitnessResponse({ response, envelope, expected, publisher
   }
   // THE ORIGINAL SUBJECT, from provider metadata rather than from the envelope's own claims.
   const subject = assertOriginalSubject({ response, originalRun, expected });
+  if (typeof envelope !== "string" || envelope !== JSON.stringify(response)) {
+    throw new WitnessRefusal("the witness publisher will write only the exact canonical response bytes it validated");
+  }
+  if (!expected?.binding || typeof expected.binding !== "object") {
+    throw new WitnessRefusal("the witness publisher has no independently derived binding for the response it was asked to publish");
+  }
+  for (const field of BINDING_FIELDS) {
+    if (canonicalJson(response[field] ?? null) !== canonicalJson(expected.binding[field] ?? null)) {
+      throw new WitnessRefusal(`the witness envelope's ${field} is not the value the publisher independently derived`);
+    }
+  }
   /**
    * ── THE NESTED GOVERNED CONTRACT, ALSO BEFORE THE BYTES (F11, corrected) ────────────────────────
    *

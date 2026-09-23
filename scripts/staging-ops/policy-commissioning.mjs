@@ -2057,7 +2057,10 @@ export async function readApplicableBranchRulesets({ request, branch }) {
     if (detail.status !== 200 || !detail.body) throw new IncompleteEvidence(`applicable ruleset ${id} returned no readable definition`);
     rulesets.push(detail.body);
   }
-  return { rulesets, applicabilityMeasured: true, ruleCount: rules.length };
+  // The reader stops only after a terminal short page, so the request count is derivable even when
+  // the terminal page is empty.
+  const applicabilityPages = Math.floor(rules.length / PAGE_SIZE) + 1;
+  return { rulesets, applicabilityMeasured: true, ruleCount: rules.length, applicabilityPages };
 }
 
 /**
@@ -5463,8 +5466,17 @@ export async function readOriginalIntentArtifact({ request, requestArchive, runI
   if (canonicalJson(intent.derived_ruleset_names) !== canonicalJson(derivedRulesetNames(runId, attempt))) refuse("carries generated ruleset names this run does not derive");
   const normalAppId = positiveProviderId(intent.normal_app_id);
   const emergencyAppId = positiveProviderId(intent.emergency_app_id);
-  if (normalAppId === null || emergencyAppId === null) refuse("carries no positive normal and emergency App identities");
+  const normalInstallationId = positiveProviderId(intent.normal_installation_id);
+  const emergencyInstallationId = positiveProviderId(intent.emergency_installation_id);
+  if (normalAppId === null || emergencyAppId === null || !Number.isSafeInteger(normalAppId) || !Number.isSafeInteger(emergencyAppId)) {
+    refuse("carries no positive safe normal and emergency App identities");
+  }
   if (normalAppId === emergencyAppId) refuse("names the same App as both release identities");
+  if (normalInstallationId === null || emergencyInstallationId === null
+    || !Number.isSafeInteger(normalInstallationId) || !Number.isSafeInteger(emergencyInstallationId)) {
+    refuse("carries no positive safe normal and emergency installation identities");
+  }
+  if (normalInstallationId === emergencyInstallationId) refuse("names the same installation for both release identities");
   return {
     intent,
     provenance: {
@@ -5541,6 +5553,7 @@ export async function runWitnessPublisherJob(env = process.env, deps = {}) {
   const rehearsalDomain = String(response.domain ?? "") === REHEARSAL_DOMAIN;
   let allowed = null;
   let intentProvenance = null;
+  let authenticatedIntent = null;
   if (!rehearsalDomain) {
     const role = String(response.role ?? "");
     if (!ACTOR_ROLES.includes(role)) {
@@ -5552,21 +5565,43 @@ export async function runWitnessPublisherJob(env = process.env, deps = {}) {
       expected: { sourceSha, repositoryId: ctx.repositoryId },
     });
     intentProvenance = original.provenance;
+    authenticatedIntent = original.intent;
     // The SAME closed vocabulary the offline assessor derives, from the SAME authenticated facts.
     allowed = offlinePublishableVocabulary({
       runId: String(response.original_run_id), attempt: String(response.original_attempt), actor: role,
       normalAppId: Number(original.intent.normal_app_id), emergencyAppId: Number(original.intent.emergency_app_id),
     });
   }
+  const binding = rehearsalDomain
+    ? {
+        domain: REHEARSAL_DOMAIN, repository: COMMISSIONING_REPOSITORY, repository_id: Number(ctx.repositoryId),
+        source_mode: "transport-rehearsal", original_run_id: String(originalRunResponse.body.id),
+        original_attempt: String(originalRunResponse.body.run_attempt), workflow_path: COMMISSIONING_WORKFLOW_PATH,
+        source_sha: sourceSha, role: REHEARSAL_ROLE, job_id: REHEARSAL_JOB_ID,
+        case_id: REHEARSAL_CASE_ID, case_ordinal: 0, direction: "pre", target_ref: REHEARSAL_TARGET,
+        intended_app_id: null, intended_installation_id: null, manifest_sha256: null, graph_sha256: null,
+      }
+    : {
+        domain: COMMISSION_DOMAIN, repository: COMMISSIONING_REPOSITORY, repository_id: Number(authenticatedIntent.repository_id),
+        source_mode: "commission", original_run_id: String(originalRunResponse.body.id),
+        original_attempt: String(originalRunResponse.body.run_attempt), workflow_path: COMMISSIONING_WORKFLOW_PATH,
+        source_sha: sourceSha, role: String(response.role), job_id: assertRoleBinding(String(response.role)).job,
+        case_id: String(response.case_id), case_ordinal: caseOrdinal(String(response.role), String(response.case_id)),
+        direction: String(response.direction),
+        target_ref: derivedRef(String(originalRunResponse.body.id), String(originalRunResponse.body.run_attempt), String(response.role)),
+        intended_app_id: Number(response.role === "normal" ? authenticatedIntent.normal_app_id : authenticatedIntent.emergency_app_id),
+        intended_installation_id: String(response.role === "normal" ? authenticatedIntent.normal_installation_id : authenticatedIntent.emergency_installation_id),
+        manifest_sha256: response.manifest_sha256, graph_sha256: response.graph_sha256,
+      };
   const witnessDir = path.join(evidenceDir, "witness");
-  mkdirSync(witnessDir, { recursive: true, mode: 0o700 });
   const result = publishWitnessResponse({
     response, envelope, publisherRunId: runId, originalRun: originalRunResponse.body, allowed,
     expected: {
       repository: COMMISSIONING_REPOSITORY, workflowPath: COMMISSIONING_WORKFLOW_PATH, sourceSha,
-      dispatchBranch: branchOf(COMMISSIONING_DISPATCH_REF),
+      dispatchBranch: branchOf(COMMISSIONING_DISPATCH_REF), binding,
     },
     writeEntry: (name, bytes) => {
+      mkdirSync(witnessDir, { recursive: true, mode: 0o700 });
       const target = path.join(witnessDir, name);
       const fd = openSync(target, "wx", 0o600);
       try { writeSync(fd, bytes); fsyncSync(fd); } finally { closeSync(fd); }
@@ -5779,7 +5814,7 @@ export async function measureCompletePolicy({ request, ctx, actor, now = () => n
     classicBody: protection.status === 404 ? null : protection.body,
     allowed: publishableVocabulary({ ctx, actor }),
     startedAt, completedAt,
-    pages: measured.ruleCount,
+    pages: measured.applicabilityPages,
     sourceIdentities: measured.rulesets.map((ruleset) => String(ruleset?.source ?? COMMISSIONING_REPOSITORY)),
   });
 }
@@ -6024,8 +6059,8 @@ export async function beginWitnessItem({
   let observation;
   if (expectDomain === REHEARSAL_DOMAIN) {
     // Inert: no policy read, no graph, no resource journal. See {@link runRehearsalStage}.
-    const startedAt = now().toISOString();
-    observation = { started_at: startedAt, completed_at: now().toISOString(), span_ms: 0, inert: true };
+    const observedAt = now().toISOString();
+    observation = { started_at: observedAt, completed_at: observedAt, span_ms: 0, inert: true };
   } else {
     // SOURCE CONTINUITY AT LOCAL WITNESS DISPATCH (F3), immediately before the measurement it
     // carries: a policy measured against a tree that is no longer the trusted source is not

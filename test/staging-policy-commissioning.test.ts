@@ -3646,7 +3646,7 @@ describe("correction pass 2 — F1: the local witness transport and its refusals
     };
     const publisherExpected = {
       repository: COMMISSIONING_REPOSITORY, workflowPath: COMMISSIONING_WORKFLOW_PATH,
-      sourceSha: WORKFLOW_SHA, dispatchBranch: "staging",
+      sourceSha: WORKFLOW_SHA, dispatchBranch: "staging", binding: WITNESS_BINDING,
     };
     const result = publishWitnessResponse({
       response: ok, envelope, publisherRunId: "77001", originalRun, expected: publisherExpected,
@@ -3901,6 +3901,8 @@ describe("correction pass 2 — F1: the local witness transport and its refusals
     expect(challenge.manifest_sha256).toBeNull();
     expect(challenge.graph_sha256).toBeNull();
     github.addArtifact(challengeName, `${challengeName}.json`, bytes, 88001);
+    let clockMs = Date.parse(challenge.created_at) + 1_000;
+    const advancingNow = () => new Date(clockMs++);
     // The local witness serves it with an INERT observation: no policy read at all.
     const witnessSession = await openWitnessSession({
       runId: "88001", attempt: "1", evidenceDir, env: LOCAL_ENV,
@@ -3912,7 +3914,7 @@ describe("correction pass 2 — F1: the local witness transport and its refusals
         request: witnessSession.request, requestArchive: witnessSession.requestArchive, ctx: witnessSession.ctx,
         journal: witnessSession.journal, item: { role: "rehearsal", caseId: "transport-rehearsal", ordinal: 0, direction: "pre" },
         operator: witnessSession.operator, domain: "rehearsal", setupBindings: witnessSession.setupBindings,
-        now: () => new Date(), sleep: async () => {}, intervalMs: 1,
+        now: advancingNow, sleep: async () => {}, intervalMs: 1,
       });
     } finally { witnessSession.lock.release(); }
     const consumed = await runRehearsalStage({ stage: "consume", env: rehearsalEnv, deps });
@@ -3922,7 +3924,14 @@ describe("correction pass 2 — F1: the local witness transport and its refusals
     // The rehearsal's response is an INERT observation, so no actor could reason about it as policy.
     const response = JSON.parse(readSingleEntryZip([...github.artifacts.values()].find((a) => a.name.startsWith("commissioning-witness-88001"))!.zip).bytes.toString("utf8"));
     expect(response.observation.inert).toBe(true);
+    expect(response.observation.started_at).toBe(response.observation.completed_at);
+    expect(response.observation.span_ms).toBe(0);
     expect(response.observation.governed_rulesets).toBeUndefined();
+    const mismatched = structuredClone(response);
+    mismatched.observation.completed_at = new Date(Date.parse(mismatched.observation.started_at) + 1).toISOString();
+    mismatched.created_at = mismatched.observation.completed_at;
+    expect(() => assertResponseShape(mismatched, { domain: "rehearsal" }))
+      .toThrow(/span does not describe its own measurement window/);
     expect(() => validateGovernedSnapshot(response.observation, {
       rulesetNames: new Set(), refPatterns: new Set(), contexts: new Set(),
       producerIds: new Set(), bypassAppIds: new Set(), sources: new Set(),
@@ -5461,23 +5470,38 @@ describe("correction pass 4 — the actual publisher reads the authenticated int
     ? { status: 200, bytes, diagnostic: { status: 200, category: "ok", ruleIds: [], policyDenial: false } }
     : { status: 404, bytes: null, diagnostic: { status: 404, category: "not-found", ruleIds: [], policyDenial: false } });
 
-  /** Run the ACTUAL publisher job over one observation, with one intent, and see what it writes. */
-  async function publish(observation: Record<string, unknown>, options: {
-    intent?: Record<string, unknown> | null;
-    transport?: ReturnType<typeof publisherTransport>;
-  } = {}) {
-    const intent = options.intent === undefined ? await genuineIntent() : options.intent;
-    const dir = mkdtempSync(path.join(tmpdir(), "aio1124-pub-"));
-    created.push(dir);
+  /** A closed observation with its real governed digest, suitable as a one-mutation baseline. */
+  const soundObservation = () => {
+    const observation = validObservation() as Record<string, unknown>;
+    const rulesets = observation.governed_rulesets as { governed: unknown }[];
+    observation.projected_governed_digest = canonicalHash(rulesets.map((entry) => entry.governed));
+    return observation;
+  };
+
+  const publisherResponse = () => {
     const challenge = buildChallenge({
       binding: WITNESS_BINDING, nonce: "d".repeat(64), createdAt: "2026-09-10T09:00:00.000Z",
       extra: { before_sha: "1".repeat(40), requested_sha: "2".repeat(40) },
     });
-    const response = buildResponse({
-      challenge, challengeDigest: "f".repeat(64), observation,
+    return buildResponse({
+      challenge, challengeDigest: "f".repeat(64), observation: soundObservation(),
       witnessIdentity: { login: OWNER_LOGIN, user_id: OWNER_USER_ID, type: "User" },
       createdAt: "2026-09-10T09:00:00.000Z",
-    });
+    }) as Record<string, any>;
+  };
+
+  /** Run the ACTUAL publisher job over one observation, with one intent, and see what it writes. */
+  async function publish(observation: Record<string, unknown>, options: {
+    intent?: Record<string, unknown> | null;
+    transport?: ReturnType<typeof publisherTransport>;
+    mutateResponse?: (response: Record<string, any>) => void;
+  } = {}) {
+    const intent = options.intent === undefined ? await genuineIntent() : options.intent;
+    const dir = mkdtempSync(path.join(tmpdir(), "aio1124-pub-"));
+    created.push(dir);
+    const response = publisherResponse();
+    response.observation = observation;
+    options.mutateResponse?.(response);
     const eventPath = path.join(dir, "event.json");
     writeFileSync(eventPath, JSON.stringify({ inputs: { mode: "policy-witness", witness_envelope: JSON.stringify(response) } }));
     const env = cloudEnv("policy-witness", {
@@ -5506,7 +5530,6 @@ describe("correction pass 4 — the actual publisher reads the authenticated int
     observation.projected_governed_digest = canonicalHash(rulesets.map((entry) => entry.governed));
     return observation;
   };
-  const soundObservation = () => withDigest(validObservation() as Record<string, unknown>);
 
   it("P1 · an UNKNOWN nested governed field is refused, and no bytes are written", async () => {
     const observation = soundObservation() as Record<string, unknown>;
@@ -5515,6 +5538,39 @@ describe("correction pass 4 — the actual publisher reads the authenticated int
     const { outcome, bytes } = await publish(withDigest(observation));
     expect(outcome.ok, "the publisher published an unknown nested governed field").toBe(false);
     expect(bytes, "bytes reached the artifact").toBeNull();
+  });
+
+  it.each([
+    ["unknown governed wrapper field", (response: Record<string, any>) => { response.observation.governed_rulesets[0].private_data = "SYNTHETIC-DISCLOSURE"; }],
+    ["object ruleset identity", (response: Record<string, any>) => { response.observation.governed_rulesets[0].id = { marker: "SYNTHETIC-DISCLOSURE" }; }],
+    ["object applicability page count", (response: Record<string, any>) => { response.observation.applicability_pages = { marker: "SYNTHETIC-DISCLOSURE" }; }],
+    ["object intended App identity", (response: Record<string, any>) => { response.intended_app_id = { marker: "SYNTHETIC-DISCLOSURE" }; }],
+    ["case outside the closed sequence", (response: Record<string, any>) => { response.case_id = "arbitrary-case"; }],
+    ["non-digest manifest identity", (response: Record<string, any>) => { response.manifest_sha256 = "not-a-digest"; }],
+  ] as const)("publication boundary refuses %s through both the public helper and full publisher job", async (_label, mutate) => {
+    const response = publisherResponse();
+    mutate(response);
+    const envelope = JSON.stringify(response);
+    let helperWrote = false;
+    const originalRun = {
+      id: Number(RUN_ID), path: COMMISSIONING_WORKFLOW_PATH, event: "workflow_dispatch",
+      head_sha: WORKFLOW_SHA, head_branch: "staging", run_attempt: Number(ATTEMPT),
+      actor: OWNER_IDENTITY, triggering_actor: OWNER_IDENTITY,
+    };
+    expect(() => publishWitnessResponse({
+      response, envelope, publisherRunId: PUBLISHER_RUN, originalRun,
+      expected: {
+        repository: COMMISSIONING_REPOSITORY, workflowPath: COMMISSIONING_WORKFLOW_PATH,
+        sourceSha: WORKFLOW_SHA, dispatchBranch: "staging", binding: WITNESS_BINDING,
+      },
+      allowed: plannedVocabulary(),
+      writeEntry: () => { helperWrote = true; return "unreachable"; },
+    })).toThrow();
+    expect(helperWrote, "the public helper wrote malformed bytes").toBe(false);
+
+    const { outcome, bytes } = await publish(soundObservation(), { mutateResponse: mutate });
+    expect(outcome.ok, "the full publisher job accepted malformed bytes").toBe(false);
+    expect(bytes, "the full publisher job wrote witness bytes").toBeNull();
   });
 
   it("P2 · an UNAPPROVED source identity is refused", async () => {
