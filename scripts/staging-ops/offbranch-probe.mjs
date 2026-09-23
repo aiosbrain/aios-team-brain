@@ -184,6 +184,11 @@ export const RESOURCE_LINK_FIELDS = Object.freeze(["intent_artifact", "intent_sh
  */
 const RESPONSE_FACTS = Object.freeze(["http_status", "response_complete", "response_incomplete", "measured_status"]);
 export const PROBE_JOURNAL_EVENTS = Object.freeze({
+  "original-identity-bound": Object.freeze(["capture"]),
+  "capture-progress": Object.freeze(["run_id", "kind", "page", "capture"]),
+  "capture-failed": Object.freeze(["run_id", "phase", "category", "capture_sequences"]),
+  "qualification-ended": Object.freeze(["run_id", "reason", "terminal_sequence"]),
+  "admission-observed": Object.freeze(["run_id", "environment", "job_id", "run_capture", "jobs_descriptor"]),
   "probe-opened": Object.freeze(["intent_artifact", "intent_sha256", "commissioning_run_id", "commissioning_attempt"]),
   "registration-verified": Object.freeze(["workflow_id", "workflow_state", "workflow_created_at", "source_sha256", "descriptor"]),
   "automation-inspected": Object.freeze(["workflow_count", "workflows_sha256", "induced"]),
@@ -861,7 +866,10 @@ export function verifyProbeRegistration(dir, record, { windowStartMs }) {
 
 /** Read and closed-check every probe journal record's payload. */
 export function checkProbeJournalShape(records) {
+  let closed = false;
   for (const record of records) {
+    if (closed) refuse("a closed probe journal has a later record");
+    closed = record.type === "probe-closed";
     if (!PROBE_JOURNAL_EVENT_TYPES.includes(String(record.type))) refuse(`the probe journal carries the unknown event ${JSON.stringify(record.type)}`);
     assertProbeEventPayload(record.type, record.data);
   }
@@ -913,6 +921,48 @@ export function assessRunContinuity(records, { dir, repositoryId, workflowSha })
     observations.push({ seq: record.seq, boundary: record.data.boundary, body: captured.body });
   }
   return observations;
+}
+
+
+/** Independent original identity: the intent declares a login; the provider measures two tuples. */
+export function assertOriginalProbeIdentity(body, { commissioning, dispatcher, baseline = null }) {
+  if (!isPlainObject(body) || !Number.isSafeInteger(body.id) || String(body.id) !== commissioning.run_id
+    || body.run_attempt !== Number(commissioning.attempt)) refuse("the original run/attempt identity does not match its trusted intent");
+  for (const field of ["repository", "head_repository"]) {
+    if (body[field]?.id !== Number(commissioning.repository_id) || body[field]?.full_name !== commissioning.repository) refuse(`the original ${field} identity does not match its trusted intent`);
+  }
+  if (body.head_sha !== commissioning.workflow_sha || body.path !== commissioning.workflow_path
+    || body.event !== "workflow_dispatch" || body.head_branch !== "staging") refuse("the original source/workflow/event/branch identity does not match its trusted intent");
+  if (typeof dispatcher !== "string" || !dispatcher) refuse("the original trusted intent has no declared dispatcher");
+  const identity = { actor: parseActor(body.actor, "the original actor"), triggering_actor: parseActor(body.triggering_actor, "the original triggering actor") };
+  if (identity.actor.login !== dispatcher) refuse("the original actor differs from its declared dispatcher");
+  if (baseline) equalOrRefuse(identity, baseline, "the original measured actor identity");
+  return identity;
+}
+
+export function assessOriginalProbeBinding(records, { dir, commissioning, dispatcher }) {
+  const bindings = records.filter((record) => record.type === "original-identity-bound");
+  if (bindings.length !== 1) refuse("the probe requires exactly one retained original identity binding");
+  const captured = readRaw(dir, bindings[0].data.capture, "the original identity capture", RAW_REF_FIELDS);
+  if (captured.completed > timeOf(bindings[0].ts, "the original identity binding time")) refuse("the original identity binding predates its capture");
+  return assertOriginalProbeIdentity(captured.body, { commissioning, dispatcher });
+}
+
+/** Shared history facts used by every public phase and by offline qualification. */
+export function assessProbePhaseState(records, { workflowSha }) {
+  checkProbeJournalShape(records);
+  const has = (type) => records.some((row) => row.type === type);
+  const observations = records.filter((row) => row.type === "observation-recorded");
+  const captures = records.filter((row) => row.type === "capture-recorded");
+  const paired = PROBE_ENVIRONMENTS.every((environment) => observations.filter((row) => row.data.environment === environment).length === 1)
+    && ["run", "jobs"].every((kind) => captures.filter((row) => row.data.kind === kind).length === 1)
+    && PROBE_ENVIRONMENTS.every((environment) => captures.some((row) => row.data.kind === "denial" && row.data.environment === environment));
+  const failed = has("admission-observed") || observations.some((row) => row.data.outcome === "admitted");
+  const ended = has("qualification-ended") || has("capture-failed") || has("cancel-intent") || assessSourceContinuity(records).interrupted;
+  const ref = assessRefOwnership(records, { workflowSha });
+  return Object.freeze({ closed: has("probe-closed"), staged: has("probe-opened"), create: has("ref-create-intent"), dispatch: has("dispatch-intent"),
+    cleanup: has("cleanup-intent"), paired, failed, ended, aborted: has("qualification-ended"), ref,
+    qualification: failed ? "failed" : ended ? "inconclusive" : paired ? "measured" : "incomplete" });
 }
 
 export const REF_OWNERSHIP_STATES = Object.freeze(["unowned", "owned", "ended", "uncertain"]);
@@ -1004,6 +1054,10 @@ export function assessRefOwnership(records, { workflowSha }) {
   for (const record of records ?? []) {
     const data = record?.data ?? {};
     switch (record?.type) {
+      case "ref-create-intent":
+        if (state === "unowned" && !pending) pending = Object.freeze({ seq: record.seq, of: "ref-create-intent", outcome: "unknown" });
+        else contradict("a probe creation intent was repeated", "assertion");
+        break;
       case "ref-create-result":
         if (state === "unowned" && data.response_complete === true && data.http_status === 201 && data.object_sha === workflowSha) {
           state = "owned";
@@ -1011,7 +1065,7 @@ export function assessRefOwnership(records, { workflowSha }) {
         } else if (state === "unowned") {
           // A complete error can follow an applied create just as a lost response can. It is not
           // evidence of nonapplication and must survive process restart until a bounded readback.
-          pending = Object.freeze({ seq: record.seq, of: "ref-create-intent", outcome: "unknown" });
+          pending ??= Object.freeze({ seq: record.seq, of: "ref-create-intent", outcome: "unknown" });
         }
         break;
       case "ref-readback":

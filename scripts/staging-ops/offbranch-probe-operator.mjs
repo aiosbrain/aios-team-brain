@@ -48,6 +48,7 @@ import {
   OFFBRANCH_SCHEMA_VERSION, PAGE_SIZE, PROBE_ATTEMPT, PROBE_BRANCH, PROBE_DISPATCHER, PROBE_ENVIRONMENTS, PROBE_EVENT,
   PROBE_INTENT_SCHEMA_VERSION, PROBE_JOBS, PROBE_REF, PROBE_WORKFLOW_FILE, PROBE_WORKFLOW_PATH, PROBE_WORKFLOW_SHA256,
   ProbeRefusal, RESOURCE_LINK_EVENT, SOURCE_OBSERVED_EVENT, assertInertProbeWorkflow, assertProbeEventPayload, assertProbeRunIdentity,
+  assessProbePhaseState, assessOriginalProbeBinding, assertOriginalProbeIdentity,
   assessRefOwnership, assessRunContinuity, assessRunSelectionContinuity, assessSourceContinuity, commissioningIdentity, inducedAutomation,
   parseCheckRunUrl, parseProbeIntent, probeCaptureName, probeIntentName, probeJournalName, probeObservationName,
   readPolicyDescriptor, selectEligibleRuns, unresolvedProbeIntents, verifyProbeCaptures,
@@ -145,43 +146,55 @@ async function openProbeSession({ runId, attempt, evidenceDir, env, deps, phase,
   }
   const commissioning = commissioningIdentity({ intent, runId, attempt, repository: REPO, workflowPath: COMMISSIONING_WORKFLOW_PATH });
   guardCtx.probeSha = commissioning.workflow_sha;
-  /**
-   * MEASURED IN `observe` ON EVERY PHASE, AND ENFORCED BY THE PHASE AFTERWARDS (R06-F3).
-   *
-   * This used to run in the caller's mode, so on `stage` and `dispatch` a moved staging head threw
-   * from HERE — before the probe journal was opened and before anything could be written down. The
-   * attempt then had no memory of it: restore staging and the very same staged attempt dispatched,
-   * collected and closed as though the move had never been measured. Measuring without throwing
-   * makes the observation durable first; `assertSourceNotMoved` is the refusal, and it is the
-   * phase's, not the session's.
-   */
-  const sourceContinuity = await assertSourceContinuity({
-    request, label: "the staged off-branch probe", mode: "observe",
-    expected: { repositoryId: Number(intent.repository_id), workflowSha: commissioning.workflow_sha },
-  });
   const session = {
-    dir, now, request, guardCtx, operator, intent, commissioning, sourceContinuity, deps, env,
-    /** What this phase would ENFORCE, which is what the observation records — not how it measured. */
+    dir, now, request, guardCtx, operator, intent, commissioning, sourceContinuity: null, deps, env,
     continuityMode: continuity, phase: String(phase ?? ""), sourceRecorded: null, originalRun: null,
     runId: String(runId), attempt: String(attempt), sleep: deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
   };
-  // BEFORE THE NEXT FALLIBLE READ. A move already measured must not be lost because the original
-  // attempt's own read then failed; recording it here is what makes "every phase records what it
-  // measured" true on the failing paths as well as the passing one.
-  if (sourceContinuity.moved === true) persistKnownSourceMove(session);
-  const run = await request("GET", `/repos/${REPO}/actions/runs/${runId}/attempts/${attempt}`);
-  if (run.status !== 200 || !run.body) throw new IncompleteEvidence("the original commissioning attempt could not be measured");
-  if (run.body.head_sha !== commissioning.workflow_sha || run.body.path !== COMMISSIONING_WORKFLOW_PATH || run.body.event !== COMMISSIONING_EVENT_NAME
-    || run.body.head_branch !== branchOf(COMMISSIONING_DISPATCH_REF)) {
-    throw new AssertionFailure("the original attempt is not the reviewed commissioning run its intent describes");
+  // Authenticate local history before qualification reads or writer-lock acquisition. Closed
+  // reporting is read-only even when a process died with the final fsynced close still locked.
+  const records = readJournal({ dir, runId, attempt, kind: "probe" });
+  const state = asAssertion(() => assessProbePhaseState(records, { workflowSha: commissioning.workflow_sha }));
+  let baseline = null;
+  if (records.length) {
+    const staged = loadStagedProbe(session);
+    if (records.some((row) => row.source !== commissioning.workflow_sha)
+      || records[0]?.type !== "probe-opened" || records[0].data.intent_sha256 !== staged.digest
+      || records[0].data.intent_artifact !== staged.name || records[0].data.commissioning_run_id !== String(runId)
+      || records[0].data.commissioning_attempt !== String(attempt)) throw new AssertionFailure("the probe history is not bound to the original intent");
+    baseline = asAssertion(() => assessOriginalProbeBinding(records, { dir, commissioning, dispatcher: intent.dispatcher }));
+  } else if (phase !== "stage") throw new IncompleteEvidence("no probe has been staged for this attempt");
+  session.state = state;
+  if (state.closed) {
+    if (!["cancel", "cleanup"].includes(phase)) throw new AssertionFailure("the probe is closed; its terminal history cannot reopen");
+    return session;
   }
-  session.originalRun = run.body;
+  if (phase === "stage" && records.length) throw new AssertionFailure("a probe is already staged for this attempt");
+  if (["dispatch", "collect"].includes(phase) && (state.cleanup || state.aborted || state.ended || state.failed || state.ref.state === "uncertain")) {
+    throw new IncompleteEvidence("this probe's cumulative history ended qualification; only bounded recovery remains");
+  }
+  if (phase === "collect" && !state.dispatch) throw new IncompleteEvidence("the probe has no dispatch intent to collect");
+  const recovery = phase === "cancel" || phase === "cleanup";
+  // Recovery relies on the retained authenticated original baseline and independently re-proves
+  // exact run/ref ownership. Qualification-only reads cannot revoke that recovery authority.
+  try {
+    session.sourceContinuity = await assertSourceContinuity({ request, label: "the staged off-branch probe", mode: "observe",
+      expected: { repositoryId: Number(intent.repository_id), workflowSha: commissioning.workflow_sha } });
+  } catch (error) { if (!recovery) throw error; }
+  if (session.sourceContinuity?.moved === true) persistKnownSourceMove(session);
+  if (!recovery) {
+    const captured = await rawCapture(session, `/repos/${REPO}/actions/runs/${runId}/attempts/${attempt}`, "the original commissioning attempt");
+    asAssertion(() => assertOriginalProbeIdentity(captured.body, { commissioning, dispatcher: intent.dispatcher, baseline }));
+    session.originalRun = captured.body;
+    session.originalCapture = captured.ref;
+  }
   return session;
 }
 
 /** The measured live source, in the exact closed shape both journals carry it in. */
 function sourceObservation(session, phase) {
   const measured = session.sourceContinuity;
+  if (!measured) throw new IncompleteEvidence("source continuity was unavailable");
   return {
     phase, mode: String(session.continuityMode ?? "observe"), moved: measured?.moved === true,
     staging_sha: String(measured?.staging_sha ?? ""), trusted_source_sha: String(measured?.trusted_source_sha ?? ""),
@@ -282,7 +295,7 @@ function recordSourceObservation(session, probe, phase) {
   if (probe.records().some((record) => record.type === "probe-closed")) return assessSourceContinuity(probe.records());
   // Already written, by the session, into THIS journal (R06-F3): a measured move is recorded before
   // the phase's other fallible reads, so appending it again here would double the same observation.
-  if (session.sourceRecorded !== "probe") probe.append(SOURCE_OBSERVED_EVENT, sourceObservation(session, phase));
+  if (session.sourceContinuity && session.sourceRecorded !== "probe") probe.append(SOURCE_OBSERVED_EVENT, sourceObservation(session, phase));
   return assessSourceContinuity(probe.records());
 }
 
@@ -304,8 +317,9 @@ function loadStagedProbe(session) {
   try { bytes = readFileSync(path.join(session.dir, name)); } catch { throw new IncompleteEvidence("no probe has been staged for this attempt"); }
   const digest = sha256(bytes);
   const resource = readJournal({ dir: session.dir, runId: session.runId, attempt: session.attempt });
+  if (!resource.length || resource.some((row) => row.source !== session.commissioning.workflow_sha)) throw new AssertionFailure("the original resource journal has an invalid source binding");
   const links = resource.filter((record) => record.type === RESOURCE_LINK_EVENT);
-  if (links.length !== 1 || links[0].data?.intent_artifact !== name || links[0].data?.intent_sha256 !== digest) {
+  if (links.length !== 1 || links[0].data?.intent_artifact !== name || links[0].data?.intent_sha256 !== digest || links[0].data?.probe_journal !== probeJournalName(session.runId, session.attempt)) {
     throw new AssertionFailure("the probe intent is not the one linked, exactly once, into the original attempt's journal");
   }
   const intent = JSON.parse(bytes.toString("utf8"));
@@ -498,6 +512,7 @@ export async function runStage({ runId, attempt, evidenceDir, env, deps }) {
   const probe = openProbeJournal(session);
   try {
     probe.append("probe-opened", { intent_artifact: intentName, intent_sha256: written.sha256, commissioning_run_id: session.runId, commissioning_attempt: session.attempt });
+    probe.append("original-identity-bound", { capture: session.originalCapture });
     recordSourceObservation(session, probe, "stage");
     probe.append("registration-verified", {
       workflow_id: workflow.body.id, workflow_state: workflow.body.state, workflow_created_at: String(workflow.body.created_at),
@@ -910,6 +925,7 @@ export async function runCollect({ runId, attempt, evidenceDir, env, deps }) {
 
 export async function runCancel({ runId, attempt, evidenceDir, env, deps }) {
   const session = await openProbeSession({ runId, attempt, evidenceDir, env, deps, phase: "cancel", continuity: "observe" });
+  if (session.state.closed) return result(session, "cancel", "already-closed");
   loadStagedProbe(session);
   const probe = openProbeJournal(session);
   try {
@@ -949,6 +965,7 @@ function closeOutcome(records, { workflowSha }) {
 
 export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
   const session = await openProbeSession({ runId, attempt, evidenceDir, env, deps, phase: "cleanup", continuity: "observe" });
+  if (session.state.closed) return result(session, "cleanup", "already-closed");
   loadStagedProbe(session);
   const deleteRef = deps.deleteRef ?? createGitLeaseDeleter({ spawnImpl: deps.spawnImpl, env });
   const probe = openProbeJournal(session);

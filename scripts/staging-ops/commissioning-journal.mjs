@@ -456,6 +456,9 @@ export function readJournal({ dir, runId, attempt, kind = "resource" }) {
     if (record.kind !== undefined && String(record.kind) !== String(kind)) {
       throw new JournalChainError(`journal record ${expectedSeq} belongs to the ${String(record.kind)} chain, not the ${String(kind)} one`);
     }
+    if (kind === "probe" && records.some((entry) => entry.type === "probe-closed")) {
+      throw new JournalChainError("a closed probe journal has a later record; terminal history cannot reopen");
+    }
     records.push(record);
     previous = digestOf(line);
     expectedSeq += 1;
@@ -493,6 +496,9 @@ export function openJournal({ dir, runId, attempt, source, lock, kind = "resourc
   let seq = records.length;
 
   function append(type, data) {
+    if (kind === "probe" && readJournal({ dir: root, runId, attempt, kind }).some((entry) => entry.type === "probe-closed")) {
+      throw new JournalRefusalError("a closed probe journal cannot receive another event");
+    }
     if (!spec.events.includes(type)) throw new JournalRefusalError(`unknown ${kind} journal event type ${type}`);
     const held = readLockOwner(root, runId, attempt, kind);
     if (held?.nonce !== lock.nonce) throw new JournalRefusalError("this writer no longer holds the run-scoped journal lock");
