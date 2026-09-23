@@ -1484,3 +1484,70 @@ describe("a whiteout under a non-directory parent is a blocking gap (round 10)",
     expect(chain(result).readiness.transitionReady).toBe(true);
   });
 });
+
+/**
+ * ROUND 11 — THE ORDERED EXTRACTION-PARENT INVARIANT, over every member event.
+ *
+ * The exact-94c witness: an upper `cache/x` written under a lower REGULAR `cache`, followed by `cache/`
+ * and a marker, reported no limitations, a matching inventory and readiness true. The extractor prepares
+ * a member's parents before creating it, so `cache/x` already failed with ENOTDIR; a directory entry
+ * further down the tar cannot repair it. Every blocking row below must record `merged-type-conflict`
+ * with an OTHERWISE-MATCHING inventory, and every control must reach genuine readiness true — so the
+ * fixtures live outside `/app` and leave the expected inventory satisfied.
+ */
+describe("a member under a non-directory parent blocks, whatever the layer does later (round 11)", () => {
+  const lowerWith = (blocker: { name: string; content?: string; type?: "hardlink" | "fifo" | "symlink"; linkTarget?: string }) =>
+    buildTar([...baseMembers, blocker]);
+  const regular = { name: "cache", content: "z" };
+  const hardlink = { name: "cache", type: "hardlink" as const, linkTarget: "app/index.js" };
+  const fifo = { name: "cache", type: "fifo" as const };
+
+  const blocking: [string, typeof regular, { name: string; content?: string; type?: "directory" }[]][] = [
+    ["child, directory, then an OPAQUE marker", regular, [{ name: "cache/x", content: "z" }, { name: "cache/", type: "directory" }, { name: "cache/.wh..wh..opq", content: "" }]],
+    ["child, directory, then an ORDINARY delete marker", regular, [{ name: "cache/x", content: "z" }, { name: "cache/", type: "directory" }, { name: "cache/.wh.y", content: "" }]],
+    ["child then directory, with NO marker at all", regular, [{ name: "cache/x", content: "z" }, { name: "cache/", type: "directory" }]],
+    ["a lower HARDLINK parent", hardlink, [{ name: "cache/x", content: "z" }, { name: "cache/", type: "directory" }]],
+    ["a lower FIFO parent", fifo, [{ name: "cache/x", content: "z" }, { name: "cache/", type: "directory" }]],
+    ["a HIGHER ancestor than the immediate parent", regular, [{ name: "cache/a/b.js", content: "b" }, { name: "cache/", type: "directory" }, { name: "cache/a/", type: "directory" }]],
+    ["a DIRECTORY descendant below the blocking ancestor", regular, [{ name: "cache/sub/", type: "directory" }]],
+    ["the historical no-follow case: a lower SYMLINK parent", { name: "cache", type: "symlink" as const, linkTarget: "app/index.js" }, [{ name: "cache/x", content: "z" }, { name: "cache/", type: "directory" }]],
+  ];
+
+  for (const [label, blocker, upper] of blocking) {
+    it(`BLOCKS: ${label}`, async () => {
+      const result = await inspectLayers([lowerWith(blocker), buildTar(upper)]);
+      expect(result.coverage.limitations.some((l: { kind: string }) => l.kind === "merged-type-conflict"), "no merged-type-conflict").toBe(true);
+      const { inventory, readiness } = chain(result);
+      // The inventory itself is otherwise fine: the namespace is what blocks.
+      expect(inventory.counts.missing).toBe(0);
+      expect(inventory.findings).toBe(0);
+      expect(readiness.transitionReady).toBe(false);
+      expect(result.coverage.stagedBytes).toBeGreaterThan(0);
+    });
+  }
+
+  it("BLOCKS: a same-layer file written before its own child", async () => {
+    const result = await inspectLayers([buildTar(baseMembers), buildTar([{ name: "fresh", content: "f" }, { name: "fresh/x", content: "x" }])]);
+    expect(result.coverage.limitations.some((l: { kind: string }) => l.kind === "merged-type-conflict")).toBe(true);
+    expect(chain(result).readiness.transitionReady).toBe(false);
+  });
+
+  const eligible: [string, Buffer[]][] = [
+    ["the directory is declared BEFORE its first use", [lowerWith(regular), buildTar([{ name: "cache/", type: "directory" }, { name: "cache/x", content: "z" }])]],
+    ["no blocking parent exists at all", [buildTar(baseMembers), buildTar([{ name: "fresh2/x", content: "z" }, { name: "fresh2/", type: "directory" }])]],
+    ["an EARLIER layer removed the blocker before the child", [lowerWith(regular), buildTar([{ name: ".wh.cache", content: "" }]), buildTar([{ name: "cache/", type: "directory" }, { name: "cache/x", content: "z" }])]],
+    ["a prefix-sharing SIBLING of the blocker", [lowerWith(regular), buildTar([{ name: "cache2/x", content: "z" }, { name: "cache2/", type: "directory" }])]],
+    ["root opacity with a full same-layer recreation", [buildTar(baseMembers), buildTar([{ name: ".wh..wh..opq", content: "" }, ...baseMembers])]],
+  ];
+
+  for (const [label, layers] of eligible) {
+    it(`stays READY: ${label}`, async () => {
+      const result = await inspectLayers(layers);
+      expect(result.coverage.limitations).toEqual([]);
+      const { inventory, readiness } = chain(result);
+      expect(inventory.counts.missing).toBe(0);
+      // A genuine readiness-true control, not merely the absence of one limitation kind.
+      expect(readiness.transitionReady).toBe(true);
+    });
+  }
+});

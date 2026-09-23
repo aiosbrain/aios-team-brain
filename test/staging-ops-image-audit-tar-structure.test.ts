@@ -975,3 +975,29 @@ describe("symlink ancestry is charged to the SHARED work authority (round 10)", 
     expect(membersThroughSymlink(["a/b/c.js"], new Set(["zz"]))).toBe(false);
   });
 });
+
+describe("the ordered parent invariant is charged and bounded (round 11)", () => {
+  const lower = ["app/", "cache"];
+
+  it("blocks a later repair, respects an earlier one, and stays sticky", () => {
+    expect(mergedFilesystem([lower, ["cache/x", "cache/"]]).conflicts).toEqual([1]);
+    expect(mergedFilesystem([lower, ["cache/", "cache/x"]]).conflicts).toEqual([]);
+    // Sticky: a valid entry after the failure does not clear the gap.
+    expect(mergedFilesystem([lower, ["cache/x", "cache/", "cache/ok.js"]]).conflicts).toEqual([1]);
+    // Only the offending layer is recorded.
+    expect(mergedFilesystem([lower, ["other/"], ["cache/x"]]).conflicts).toEqual([2]);
+  });
+
+  it("charges every ancestor visit to the shared work authority, and a tiny ceiling refuses", () => {
+    const deep = Array.from({ length: 30 }, (_, i) => `a/b/c/d/e/f${i}.js`);
+    const many = createWorkBudget({ maxSteps: 1_000_000 });
+    mergedFilesystem([deep], { work: many });
+    const few = createWorkBudget({ maxSteps: 1_000_000 });
+    mergedFilesystem([deep.slice(0, 5)], { work: few });
+    expect(many.steps).toBeGreaterThan(few.steps);
+    // The per-event parent walk is charged: five ancestors per path, plus the event itself.
+    expect(many.steps - few.steps).toBeGreaterThanOrEqual(25 * 6);
+    expect(() => mergedFilesystem([deep], { work: createWorkBudget({ maxSteps: 20 }) }))
+      .toThrow(expect.objectContaining({ code: "AUDIT_TAR_LIMIT_EXCEEDED" }));
+  });
+});
