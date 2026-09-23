@@ -842,8 +842,24 @@ describe("the retained-state budget is charged before insertion and never refund
     // The same key repeated across layers: each re-placement is charged again.
     expect(() => mergedFilesystem(Array.from({ length: 40 }, () => ["dup/a/b/x.js"]), { retained: tiny() })).toThrow(expect.objectContaining(limitCode));
     // CHURN: write, delete, rewrite. A refund would make this free.
-    const churn = Array.from({ length: 30 }, (_, i) => (i % 2 === 0 ? ["c/a/x.js"] : [".wh.c"]));
-    expect(() => mergedFilesystem(churn, { retained: tiny() })).toThrow(expect.objectContaining(limitCode));
+    const churn = (cycles: number) => Array.from({ length: cycles * 2 }, (_, i) => (i % 2 === 0 ? ["c/a/x.js"] : [".wh.c"]));
+    expect(() => mergedFilesystem(churn(15), { retained: tiny() })).toThrow(expect.objectContaining(limitCode));
+    // …and the charge GROWS with the cycles: a refund on delete would flatten this.
+    const measure = (cycles: number) => {
+      const budget = createRetainedStateBudget();
+      mergedFilesystem(churn(cycles), { retained: budget });
+      return budget.used;
+    };
+    const one = measure(1);
+    const five = measure(5);
+    expect(five).toBeGreaterThan(one * 3);
+    // …and a refund cannot even be expressed: the budget refuses a non-positive charge.
+    const budget = createRetainedStateBudget();
+    budget.string("seed");
+    const seeded = budget.used;
+    expect(() => budget.membership(-1)).toThrow(TypeError);
+    expect(() => budget.membership(0)).toThrow(TypeError);
+    expect(budget.used).toBe(seeded);
   });
 
   it("a representative clean workload uses a small fraction of the production ceiling", () => {
@@ -860,6 +876,25 @@ describe("the retained-state budget is charged before insertion and never refund
 
 describe("the work budget covers shallow and marker-only workloads (B9-R)", () => {
   const limitCode = { code: "AUDIT_TAR_LIMIT_EXCEEDED" };
+
+  it("charges every opaque CANDIDATE before the prefix filter, not only matching ones", () => {
+    const files = Array.from({ length: 40 }, (_, i) => `other/f${i}.js`);
+    const markers = Array.from({ length: 10 }, (_, i) => `m${i}/.wh..wh..opq`);
+    const stepsOf = (layer: string[]) => {
+      const work = createWorkBudget({ maxSteps: 1_000_000 });
+      mergedFilesystem([layer], { work });
+      return work.steps;
+    };
+    // Markers FIRST: no earlier entries exist, so no candidate comparison happens at all.
+    const baseline = stepsOf([...markers, ...files]);
+    // Entries FIRST: every earlier entry is a candidate for every marker — and each is charged BEFORE
+    // the prefix test, even though none of them sits beneath any marker's directory.
+    const withCandidates = stepsOf([...files, ...markers]);
+    expect(withCandidates).toBeGreaterThanOrEqual(baseline + files.length * markers.length);
+    // A ceiling that the marker-first order fits under must refuse the candidate-heavy order.
+    expect(() => mergedFilesystem([[...files, ...markers]], { work: createWorkBudget({ maxSteps: baseline + 50 }) }))
+      .toThrow(expect.objectContaining(limitCode));
+  });
 
   it("root-level entries with NO ancestors still consume steps", () => {
     const roots = Array.from({ length: 50 }, (_, i) => `root${i}.js`);

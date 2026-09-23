@@ -1080,6 +1080,25 @@ describe("opaque-marker ordering ambiguity (B10)", () => {
 
 /** B9-R at the INVENTORY boundary: a refusal happens before the allocation, and leaves no partial output. */
 describe("the retained-state budget refuses inside a layer inventory (B9-R)", () => {
+  it("charges each retained PATH itself — measured on DIRECTORIES, which are neither staged nor inventoried", () => {
+    // A directory member has no staged file and no `/app` record, so the ONLY thing its name can cost
+    // is the `paths` entry the merge later consumes. Long directory names must therefore cost more.
+    const layerWith = (name: (i: number) => string) => {
+      const dir = pool.make();
+      const layerTarPath = join(dir, "layer.tar");
+      writeFileSync(layerTarPath, buildTar(Array.from({ length: 10 }, (_, i) => ({ name: `${name(i)}/`, type: "directory" as const, paxLongName: true }))));
+      const retained = createRetainedStateBudget();
+      inventoryLayer({ layerTarPath, layerIndex: 0, scanDir: join(dir, "scan"), limits: AUDIT_LIMITS, stagingBudget: createStagingBudget(), retained });
+      return retained.used;
+    };
+    const short = layerWith((i) => `app/s${i}`);
+    const long = layerWith((i) => `app/${Array.from({ length: 8 }, (_, part) => `d${part}${"n".repeat(70)}`).join("/")}/${i}`);
+    // Each path is charged by its LENGTH before it is retained, so the long-named layer costs more by
+    // roughly two bytes per extra character per member — not the same flat amount.
+    // Two bytes per extra UTF-16 unit, ten members, ~570 extra characters each.
+    expect(long - short).toBeGreaterThan(10 * 500 * 2);
+  });
+
   it("refuses before staging completes, with the fixed code and no partial staged file", () => {
     const dir = pool.make();
     const layerTarPath = join(dir, "layer.tar");

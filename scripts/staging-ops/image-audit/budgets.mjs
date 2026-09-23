@@ -54,6 +54,9 @@ export function createRetainedStateBudget({
   let used = 0;
   let relations = 0;
   const take = (bytes) => {
+    // MONOTONIC BY CONSTRUCTION: a refund cannot be expressed through this API at all, so no caller can
+    // "give back" budget on delete, overwrite or layer completion and then reuse it.
+    if (!Number.isFinite(bytes) || bytes <= 0) throw new TypeError("a retained-state charge must be a positive number of bytes");
     if (used + bytes > maxLogicalBytes) {
       refuse(`retained audit state would exceed the ${maxLogicalBytes}-byte supported bound`);
     }
