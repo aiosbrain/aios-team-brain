@@ -116,6 +116,19 @@ export function scanSurface(scanDir: string): string {
   return scanFiles(scanDir).map((path) => readFileSync(path, "utf8")).join("\n");
 }
 
+/**
+ * Staged MEMBER-CONTENT files only — excluding the archive-surface files under each layer's `M/` group
+ * (AC-AUDIT-02). For assertions about one member's staged copy.
+ */
+export function memberScanFiles(scanDir: string): string[] {
+  return scanFiles(scanDir).filter((path) => !/[\\/]M[\\/]/.test(path));
+}
+
+/** Staged ARCHIVE-SURFACE files only: headers, metadata, padding, terminators, trailers. */
+export function surfaceScanFiles(scanDir: string): string[] {
+  return scanFiles(scanDir).filter((path) => /[\\/]M[\\/]/.test(path));
+}
+
 /** Every staged scan file, absolute, depth-first. */
 export function scanFiles(scanDir: string): string[] {
   return readdirSync(scanDir).flatMap((entry) => {

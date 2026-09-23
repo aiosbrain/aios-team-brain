@@ -50,6 +50,17 @@ export const SCANNER = Object.freeze({
   sha256: "a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb",
   configPath: "config/staging-ops/image-audit-gitleaks.toml",
   /**
+   * SHA-256 of the tracked config bytes at `configPath`, PINNED beside the asset checksum (AC-AUDIT-07).
+   *
+   * THE TRUST ANCHOR IS THIS CONSTANT, not the file. A reported `configSha256` used to be accepted as
+   * any 64-hex string — an independent probe reconciled a record carrying 64 `f`s to ready — and "hash
+   * whatever is at the config path" would anchor trust in a mutable file. So: a build-failing guard
+   * hashes the tracked config against this value, the producer refuses when the bytes it is about to
+   * use differ, and the original-evidence validator refuses a record reporting anything else. Editing
+   * the config therefore REQUIRES editing this line in the same reviewed change.
+   */
+  configSha256: "1bd01cf22ede13355c811874836d46c76d30a30904f59677bfc19312745d73ec",
+  /**
    * Every flag this audit's invocation passes. Measured against the pinned binary's own help output
    * at run time — the spec is explicit that capabilities must be checked at the ACTUAL pinned version
    * rather than inferred from 8.18.4 or from current master. Each of these appears in the pinned
@@ -90,6 +101,7 @@ export const SCANNER_RULE_LIMITATIONS = Object.freeze([
   "the pinned scanner extends its default configuration, whose global allowlist is inherited; this audit stages every file under one neutral generated id so no inherited PATH/extension rule can select it, but inherited value and stopword allowlists are not removed",
   "detection is limited to the pinned version's rule set: a credential in a shape those rules do not match, or in an encoding this audit's byte-preserving representation does not make textual, is not detected",
   "archive traversal stays at the pinned version's default of disabled; nested content is expanded by the audit itself, and every format or depth it cannot expand is a recorded coverage limitation",
+  "coverage is of the decoded tar bytes available to the inspector: every layer member's content and every header, extended-metadata record, link target, padding, unsupported-member body, end block and trailing byte of each decoded layer and gzip-decoded nested tar reaches the scan surface or is a recorded limitation; original registry-layer gzip framing (FNAME, FCOMMENT, FEXTRA and bytes after the compressed stream), which a classic-store docker save export may not contain, is outside this claim, and identity verification does not extend it",
 ]);
 
 /**
@@ -104,17 +116,61 @@ export const SCANNER_RULE_LIMITATIONS = Object.freeze([
  */
 export const SCANNER_IGNORE_FILE = ".gitleaksignore";
 
+/**
+ * THE REVIEWED SCANNER SETTINGS POLICY (AC-AUDIT-06) — the exact coverage-relevant settings a
+ * supported v2 audit records, as constants shared by the producer (`runAudit` refuses to assemble a
+ * record whose measured settings differ) and the original-evidence validator (which refuses one that
+ * reports anything else). Not prose to be matched loosely and not recomputed from a mutable file:
+ * `scannerSettings` below builds its strings FROM these constants, so the two cannot drift apart.
+ *
+ * The policy is: no scanner file-size skip, archive traversal left at the pinned default, an
+ * audit-owned empty ignore file, the audit's own archive expansion, and the recorded rule limitations.
+ */
+const IGNORE_PATH_PINNED = "pinned to an audit-owned empty file in scratch";
+const ARCHIVE_DEPTH_DEFAULT = "0 (default: archive traversal disabled)";
+const ARCHIVE_EXPANSION =
+  "performed by the audit to its own recorded depth bound, reclassifying every expanded member at every depth; " +
+  "the archive surface of every decoded layer and gzip-decoded nested tar is staged as its own scan input; " +
+  "unexpandable formats, oversized members and the depth bound itself are recorded as coverage limitations";
+
+export const SCANNER_SETTINGS_POLICY = Object.freeze({
+  gitleaksIgnorePath: IGNORE_PATH_PINNED,
+  ruleLimitations: SCANNER_RULE_LIMITATIONS,
+  maxTargetMegabytes: "0",
+  maxArchiveDepth: ARCHIVE_DEPTH_DEFAULT,
+  archiveExpansion: ARCHIVE_EXPANSION,
+});
+
+/**
+ * Do these recorded settings EQUAL the reviewed policy? Exact keys, exact strings, exact list — an
+ * extra key, a missing key or a reworded limitation is not the reviewed configuration.
+ */
+export function settingsMatchPolicy(settings, policy = SCANNER_SETTINGS_POLICY) {
+  if (settings === null || typeof settings !== "object" || Array.isArray(settings)) return false;
+  const keys = Object.keys(policy);
+  if (Object.keys(settings).length !== keys.length) return false;
+  return keys.every((key) => {
+    const expected = policy[key];
+    const actual = settings[key];
+    if (Array.isArray(expected)) {
+      return Array.isArray(actual) && actual.length === expected.length && expected.every((value, index) => actual[index] === value);
+    }
+    return actual === expected;
+  });
+}
+
 /** Report fields this audit will read. Everything else in the report stays in private scratch. */
 export const REPORT_ALLOWLIST = Object.freeze(["RuleID", "File"]);
 
 export function assertScannerPinned(scanner = SCANNER) {
-  if (scanner.sha256 === CHECKSUM_UNRECORDED || !/^[0-9a-f]{64}$/.test(String(scanner.sha256 ?? ""))) {
+  if (scanner.sha256 === CHECKSUM_UNRECORDED || !/^[0-9a-f]{64}$/.test(String(scanner.sha256 ?? ""))
+    || !/^[0-9a-f]{64}$/.test(String(scanner.configSha256 ?? ""))) {
     // A FIXED code, because this refusal happens before scratch exists and the sanitized evidence
     // record carries the code and nothing else. "Unpinned scanner" and "the runner died" must not
     // read the same to a coordinator.
     throw Object.assign(
       new Error(
-        `the ${scanner.name} ${scanner.version} download checksum is not recorded (${String(scanner.sha256)}). ` +
+        `the ${scanner.name} ${scanner.version} download or config checksum is not recorded. ` +
         `A secret scan whose binary was never verified is not evidence. Record the real sha256 in ` +
         `scripts/staging-ops/image-audit/scanner.mjs before dispatching this audit.`
       ),
@@ -122,6 +178,21 @@ export function assertScannerPinned(scanner = SCANNER) {
     );
   }
   return scanner;
+}
+
+/**
+ * The config bytes the scan is ABOUT to use, against the pinned constant (AC-AUDIT-07). Refuses with
+ * a fixed code before any scan runs; the message names neither digest.
+ */
+export function verifyScannerConfig(configBytes, scanner = SCANNER) {
+  const measured = createHash("sha256").update(configBytes).digest("hex");
+  if (measured !== scanner.configSha256) {
+    throw Object.assign(
+      new Error("the scanner config this run would use is not the reviewed, pinned config"),
+      { code: "AUDIT_SCANNER_CONFIG_MISMATCH" },
+    );
+  }
+  return measured;
 }
 
 /** The downloaded asset, hashed. There is no "skip verification" path and no fallback mirror. */
@@ -329,7 +400,7 @@ export function scannerSettings(args = scannerArgs({ sourceDir: ".", reportPath:
      * fact; where that file lived is a scratch path, and scratch paths do not go in this artifact.
      */
     gitleaksIgnorePath: args.includes("--gitleaks-ignore-path")
-      ? "pinned to an audit-owned empty file in scratch"
+      ? IGNORE_PATH_PINNED
       : "unset (the documented default is the working directory, which may carry a .gitleaksignore)",
     ruleLimitations: SCANNER_RULE_LIMITATIONS,
     // `0` = no size cap in gitleaks' own terms ("files larger than this will be skipped" with no
@@ -339,9 +410,7 @@ export function scannerSettings(args = scannerArgs({ sourceDir: ".", reportPath:
     // The scanner's archive traversal stays at its documented 8.28.0 default of `0` (disabled): this
     // audit expands one nested level itself and records every format it could not expand as a
     // coverage limitation, so unexpanded content is reported rather than silently opaque.
-    maxArchiveDepth: maxArchiveDepth ?? "0 (default: archive traversal disabled)",
-    archiveExpansion:
-      "performed by the audit to its own recorded depth bound, reclassifying every expanded member at every depth; " +
-      "unexpandable formats, oversized members and the depth bound itself are recorded as coverage limitations",
+    maxArchiveDepth: maxArchiveDepth ?? ARCHIVE_DEPTH_DEFAULT,
+    archiveExpansion: ARCHIVE_EXPANSION,
   });
 }
