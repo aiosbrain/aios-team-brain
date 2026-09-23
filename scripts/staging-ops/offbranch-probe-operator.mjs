@@ -48,7 +48,7 @@ import {
   OFFBRANCH_SCHEMA_VERSION, PAGE_SIZE, PROBE_ATTEMPT, PROBE_BRANCH, PROBE_DISPATCHER, PROBE_ENVIRONMENTS, PROBE_EVENT,
   PROBE_INTENT_SCHEMA_VERSION, PROBE_JOBS, PROBE_REF, PROBE_WORKFLOW_FILE, PROBE_WORKFLOW_PATH, PROBE_WORKFLOW_SHA256,
   ProbeRefusal, RESOURCE_LINK_EVENT, SOURCE_OBSERVED_EVENT, assertInertProbeWorkflow, assertProbeEventPayload, assertProbeRunIdentity,
-  assessRefOwnership, assessRunContinuity, assessSourceContinuity, commissioningIdentity, inducedAutomation,
+  assessRefOwnership, assessRunContinuity, assessRunSelectionContinuity, assessSourceContinuity, commissioningIdentity, inducedAutomation,
   parseCheckRunUrl, parseProbeIntent, probeCaptureName, probeIntentName, probeJournalName, probeObservationName,
   readPolicyDescriptor, selectEligibleRuns, unresolvedProbeIntents, verifyProbeCaptures,
 } from "./offbranch-probe.mjs";
@@ -107,13 +107,14 @@ async function rawCapture(session, requestPath, label) {
 }
 
 /** Every page of a fixed listing, read to its terminal page inside the canonical bound. */
-async function pagedCapture(session, endpoint, listKey, label) {
+async function pagedCapture(session, endpoint, listKey, label, onPage = null) {
   const pages = [];
   let seen = 0;
   for (let page = 1; page <= MAX_PAGES; page += 1) {
     const separator = endpoint.includes("?") ? "&" : "?";
     const { ref, body } = await rawCapture(session, `${endpoint}${separator}per_page=${PAGE_SIZE}&page=${page}`, `${label} page ${page}`);
     pages.push({ page, ...ref });
+    if (onPage) await onPage(page, ref, body);
     const rows = listKey ? body?.[listKey] : body;
     if (!Array.isArray(rows)) throw new IncompleteEvidence(`${label} page ${page} is not the documented shape`);
     seen += rows.length;
@@ -542,21 +543,20 @@ export async function runDispatch({ runId, attempt, evidenceDir, env, deps }) {
     const created = await session.request("POST", `/repos/${REPO}/git/refs`, { ref: PROBE_REF, sha });
     const objectSha = created.complete === true && FULL_SHA.test(String(created.body?.object?.sha ?? "")) ? created.body.object.sha : null;
     probe.append("ref-create-result", { ref: PROBE_REF, sha, ...facts(created), object_sha: objectSha });
-    if (created.complete !== true) {
+    if (!(created.complete === true && created.status === 201 && objectSha === sha)) {
       const readback = await session.request("GET", probeRefPath);
       probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), object_sha: readback.complete === true ? (String(readback.body?.object?.sha ?? "") || null) : null, measured_at: session.now().toISOString() });
       const at = session.now().toISOString();
       if (readback.complete === true && readback.status === 404) {
         probe.append("reconciliation", { of: "ref-create-intent", outcome: "absent", object_sha: null, measured_at: at });
-        throw new IncompleteEvidence("the probe ref create answer was lost and the ref is absent; it is not re-created for this attempt");
+        throw new IncompleteEvidence("the probe ref create did not establish application and the ref is absent; it is not re-created for this attempt");
       }
       if (readback.complete === true && readback.status === 200) {
         probe.append("reconciliation", { of: "ref-create-intent", outcome: "present-ownership-uncertain", object_sha: String(readback.body?.object?.sha ?? "") || null, measured_at: at });
-        throw new IncompleteEvidence("the probe ref create answer was lost and a ref now exists; ownership is uncertain, so it is neither dispatched nor deleted — root reconciliation is required");
+        throw new IncompleteEvidence("the probe ref create did not establish application and a ref now exists; ownership is uncertain, so it is neither dispatched nor deleted — root reconciliation is required");
       }
-      throw new IncompleteEvidence("the probe ref create answer was lost and its readback failed; the create intent stays unresolved");
+      throw new IncompleteEvidence("the probe ref create did not establish application and its readback failed; the create intent stays unresolved");
     }
-    if (created.status !== 201 || objectSha !== sha) throw new AssertionFailure(`the provider did not create the probe ref at the reviewed source (${created.status})`);
     const readback = await session.request("GET", probeRefPath);
     probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), object_sha: readback.complete === true ? (String(readback.body?.object?.sha ?? "") || null) : null, measured_at: session.now().toISOString() });
     if (readback.complete !== true || readback.status !== 200 || readback.body?.object?.sha !== sha) throw new IncompleteEvidence("the created probe ref could not be read back at the reviewed source");
@@ -683,6 +683,17 @@ async function reconcileOwnedRun(session, probe) {
   const dispatchMs = Date.parse(dispatch.ts);
   const deadlineMs = Date.parse(dispatch.data.deadline_at);
   const identity = { repositoryId: session.commissioning.repository_id, workflowSha: session.commissioning.workflow_sha };
+  const assessSelections = () => asIncomplete(() => assessRunSelectionContinuity(probe.records(), {
+    dir: session.dir, dispatchIntentMs: dispatchMs, deadlineMs, identity,
+  }));
+  // A prior rejected peek/page binds this process before any fresh provider response can restore it.
+  assessSelections();
+  const nextSelectionId = () => Math.max(0, ...probe.records().filter((record) => record.type === "run-selection-observed")
+    .map((record) => Number(record.data.selection_id))) + 1;
+  const retainSelection = (selectionId, boundary, page, ref) => {
+    probe.append("run-selection-observed", { selection_id: selectionId, boundary, page, capture: ref });
+    assessSelections();
+  };
   /** Resolve an interrupted dispatch intent exactly once, from what the listing actually shows. */
   const reconcileDispatch = (outcome, objectSha) => {
     const current = probe.records();
@@ -694,13 +705,24 @@ async function reconcileOwnedRun(session, probe) {
   // THE ONE ELIGIBLE RUN. Zero or several is never resolved by picking; nothing is re-dispatched.
   const listing = `/repos/${REPO}/actions/workflows/${PROBE_WORKFLOW_FILE}/runs?branch=${PROBE_BRANCH}&event=${PROBE_EVENT}`;
   for (;;) {
-    const peek = await session.request("GET", `${listing}&per_page=${PAGE_SIZE}&page=1`);
-    const seen = peek.complete === true && peek.status === 200 && Array.isArray(peek.body?.workflow_runs)
-      ? asIncomplete(() => selectEligibleRuns([{ page: 1, body: { ...peek.body, total_count: peek.body.workflow_runs.length } }], { dispatchIntentMs: dispatchMs, deadlineMs, identity })).length : 0;
+    let seen = 0;
+    let captured = false;
+    try {
+      const peek = await rawCapture(session, `${listing}&per_page=${PAGE_SIZE}&page=1`, "the probe run listing peek");
+      captured = true;
+      retainSelection(nextSelectionId(), "peek", 1, peek.ref);
+      seen = asIncomplete(() => selectEligibleRuns([{ page: 1, body: { ...peek.body, total_count: peek.body.workflow_runs.length } }], { dispatchIntentMs: dispatchMs, deadlineMs, identity })).length;
+    } catch (error) {
+      // Unavailable peeks remain incomplete reads and may be retried inside the original deadline.
+      // Once exact bytes were retained, any rejection derived from them is durable and must escape.
+      if (captured || !(error instanceof IncompleteEvidence)) throw error;
+    }
     if (seen > 0 || session.now().getTime() >= deadlineMs) break;
     await session.sleep(PROBE_POLL_INTERVAL_MS);
   }
-  const selection = await pagedCapture(session, listing, "workflow_runs", "the probe run listing");
+  const listingId = nextSelectionId();
+  const selection = await pagedCapture(session, listing, "workflow_runs", "the probe run listing",
+    async (page, ref) => retainSelection(listingId, "listing", page, ref));
   const descriptor = writeDescriptor(session, { capture_schema_version: CAPTURE_SCHEMA_VERSION, kind: "run-selection", pages: selection.pages });
   const pages = selection.pages.map((ref) => ({ page: ref.page, body: JSON.parse(readFileSync(path.join(session.dir, ref.artifact), "utf8")) }));
   const eligible = asIncomplete(() => selectEligibleRuns(pages, { dispatchIntentMs: dispatchMs, deadlineMs, identity }));
@@ -942,7 +964,24 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
     // A contradiction recorded by any earlier invocation binds this one. It is re-derived here, so
     // a fresh process reaches the same refusal, and a ref that merely LOOKS familiar again cannot
     // re-open a creation whose ownership already ended.
-    const ownership = assessRefOwnership(records, { workflowSha: sha });
+    let ownership = assessRefOwnership(records, { workflowSha: sha });
+    // A result row is not proof that a create had no effect. If the writer stopped after retaining
+    // an error result but before its bounded readback, cleanup performs that read-only reconciliation
+    // first. Exact absence may establish that no resource remains; any presence makes ownership
+    // uncertainty permanent and never grants adoption or deletion authority.
+    if (ownership.pending?.of === "ref-create-intent") {
+      const readback = await session.request("GET", probeRefPath);
+      probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), object_sha: readback.complete === true ? (String(readback.body?.object?.sha ?? "") || null) : null, measured_at: session.now().toISOString() });
+      if (readback.complete === true && readback.status === 404) {
+        probe.append("reconciliation", { of: "ref-create-intent", outcome: "absent", object_sha: null, measured_at: session.now().toISOString() });
+      } else if (readback.complete === true && readback.status === 200) {
+        probe.append("reconciliation", { of: "ref-create-intent", outcome: "present-ownership-uncertain", object_sha: String(readback.body?.object?.sha ?? "") || null, measured_at: session.now().toISOString() });
+      } else {
+        throw new IncompleteEvidence("the uncertain probe ref create could not be reconciled; the journal remains open and no resource is deleted");
+      }
+      ownership = assessRefOwnership(probe.records(), { workflowSha: sha });
+      records = probe.records();
+    }
     if (ownership.state === "uncertain") {
       throw ownership.severity === "assertion" ? new AssertionFailure(ownership.reason) : new IncompleteEvidence(ownership.reason);
     }

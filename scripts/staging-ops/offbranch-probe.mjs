@@ -194,6 +194,7 @@ export const PROBE_JOURNAL_EVENTS = Object.freeze({
   "policy-captured": Object.freeze(["phase", "environment", "environment_id", "descriptor", "completed_at"]),
   "dispatch-intent": Object.freeze(["workflow_file", "ref", "deadline_at"]),
   "dispatch-result": Object.freeze(RESPONSE_FACTS),
+  "run-selection-observed": Object.freeze(["selection_id", "boundary", "page", "capture"]),
   "run-identified": Object.freeze(["run_id", "eligible", "descriptor"]),
   "run-unidentified": Object.freeze(["eligible", "descriptor", "reason"]),
   "run-observed": Object.freeze(["run_id", "boundary", "capture"]),
@@ -236,6 +237,12 @@ export function assertProbeEventPayload(type, data) {
     decimalString(data.run_id, "the observed run id");
     if (!["read", "cancel", "cleanup-entry", "delete", "closure"].includes(data.boundary)) refuse("unknown run observation boundary");
     assertClosed(data.capture, RAW_REF_FIELDS, "the run observation capture");
+  }
+  if (type === "run-selection-observed") {
+    positiveInt(data.selection_id, "the run-selection observation id");
+    positiveInt(data.page, "the run-selection observation page");
+    if (!["peek", "listing"].includes(data.boundary)) refuse("unknown run-selection observation boundary");
+    assertClosed(data.capture, RAW_REF_FIELDS, "the run-selection observation capture");
   }
   if (type === "lock-recovered") {
     assertClosed(data.replaced_owner, ["pid", "host", "acquired_at"], "the replaced lock owner");
@@ -636,6 +643,11 @@ export function selectEligibleRuns(pages, { dispatchIntentMs, deadlineMs, identi
   }
   if (rows.length !== total) refuse("the run-selection listing is incomplete");
   if (pages.length !== Math.max(1, Math.ceil(total / PAGE_SIZE))) refuse("the run-selection listing was not read to its terminal page");
+  return eligibleRunIds(rows, { dispatchIntentMs, deadlineMs, identity });
+}
+
+/** Validate every candidate in one authoritative selection response before any caller interprets it. */
+function eligibleRunIds(rows, { dispatchIntentMs, deadlineMs, identity }) {
   if (!isPlainObject(identity) || !POSITIVE_DECIMAL.test(String(identity.repositoryId ?? "")) || !/^[0-9a-f]{40}$/.test(String(identity.workflowSha ?? ""))) {
     refuse("probe-run selection needs the trusted commissioning repository identity and source to establish ownership");
   }
@@ -654,6 +666,40 @@ export function selectEligibleRuns(pages, { dispatchIntentMs, deadlineMs, identi
     }
     return String(row.id);
   });
+}
+
+/**
+ * Fold every retained pre-selection response, including observations rejected before a run ID was
+ * chosen. A restored attempt/source/actor or a later smaller listing cannot erase a contradiction.
+ * Partial listings are not treated as complete selection evidence, but identities actually present
+ * in any retained page remain binding.
+ */
+export function assessRunSelectionContinuity(records, { dir, dispatchIntentMs, deadlineMs, identity }) {
+  const groups = new Map();
+  for (const record of records ?? []) {
+    if (record?.type !== "run-selection-observed") continue;
+    assertProbeEventPayload(record.type, record.data);
+    const captured = readRaw(dir, record.data.capture, "the retained run-selection observation", RAW_REF_FIELDS);
+    if (captured.completed > timeOf(record.ts, "the run-selection observation journal time")) refuse("a run-selection observation was journaled before its capture completed");
+    if (!isPlainObject(captured.body) || !Number.isSafeInteger(captured.body.total_count) || !Array.isArray(captured.body.workflow_runs)) {
+      refuse(`run-selection ${record.data.boundary} page ${record.data.page} is not the documented shape`);
+    }
+    const eligible = eligibleRunIds(captured.body.workflow_runs, { dispatchIntentMs, deadlineMs, identity });
+    const key = String(record.data.selection_id);
+    const group = groups.get(key) ?? { selection_id: record.data.selection_id, boundary: record.data.boundary, pages: [], eligible: [] };
+    if (group.boundary !== record.data.boundary || group.pages.some((page) => page.page === record.data.page)) {
+      refuse("a retained run-selection observation reuses an id or page inconsistently");
+    }
+    group.pages.push({ page: record.data.page, ...record.data.capture });
+    group.eligible.push(...eligible);
+    groups.set(key, group);
+    if (group.eligible.length > 1) refuse(`${group.eligible.length} eligible probe runs were observed before selection; none is selected, and the probe cannot pass`);
+  }
+  return Object.freeze([...groups.values()].map((group) => Object.freeze({
+    selection_id: group.selection_id, boundary: group.boundary,
+    pages: Object.freeze([...group.pages].sort((a, b) => a.page - b.page)),
+    eligible: Object.freeze([...group.eligible]),
+  })));
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -829,7 +875,9 @@ export function unresolvedProbeIntents(records) {
     const later = records.slice(index + 1);
     const nextIntent = later.findIndex((entry) => entry.type === record.type);
     const window = nextIntent >= 0 ? later.slice(0, nextIntent) : later;
-    const resolved = window.some((entry) => entry.type === resultType
+    const resolved = window.some((entry) => (entry.type === resultType
+        && (record.type !== "ref-create-intent" || (entry.data.response_complete === true
+          && entry.data.http_status === 201 && entry.data.object_sha === record.data.sha)))
       || (entry.type === "reconciliation" && entry.data?.of === record.type
         && (record.type !== "dispatch-intent" || entry.data.outcome === "present-unchanged"))
       || (record.type === "cancel-intent" && entry.type === "run-terminal"
@@ -952,15 +1000,29 @@ export function assessRefOwnership(records, { workflowSha }) {
     const data = record?.data ?? {};
     switch (record?.type) {
       case "ref-create-result":
-        if (state === "unowned" && data.response_complete === true && data.http_status === 201 && data.object_sha === workflowSha) state = "owned";
+        if (state === "unowned" && data.response_complete === true && data.http_status === 201 && data.object_sha === workflowSha) {
+          state = "owned";
+          pending = null;
+        } else if (state === "unowned") {
+          // A complete error can follow an applied create just as a lost response can. It is not
+          // evidence of nonapplication and must survive process restart until a bounded readback.
+          pending = Object.freeze({ seq: record.seq, of: "ref-create-intent", outcome: "unknown" });
+        }
         break;
       case "ref-readback":
         if (data.response_complete === true && data.http_status === 200) {
-          observePresent(String(data.object_sha ?? ""), "the owned probe ref points at a SHA this probe did not create; it is never deleted");
+          if (state === "unowned" && pending?.of === "ref-create-intent") {
+            contradict("the probe ref exists after a create whose application was not established; ownership is uncertain, so it is never adopted or deleted automatically — root reconciliation is required", "incomplete");
+          } else {
+            observePresent(String(data.object_sha ?? ""), "the owned probe ref points at a SHA this probe did not create; it is never deleted");
+          }
         // A COMPLETE 404 under this event is the same measured disappearance as one under
         // `absence-verified` (R06-F1): the post-create readback is where it is actually seen, and
         // reducing it only under the other event's name left the ownership standing.
-        } else if (data.response_complete === true && data.http_status === 404) observeAbsent();
+        } else if (data.response_complete === true && data.http_status === 404) {
+          if (state === "unowned" && pending?.of === "ref-create-intent") pending = null;
+          else observeAbsent();
+        }
         break;
       case "ref-absent-verified":
       case "absence-verified":
@@ -984,7 +1046,10 @@ export function assessRefOwnership(records, { workflowSha }) {
         if (data.of === "ref-create-intent") {
           if (data.outcome === "present-ownership-uncertain") {
             contradict("the probe ref's ownership is uncertain; it is never deleted automatically — root reconciliation is required", "incomplete");
-          } else if (data.outcome === "absent") observeAbsent();
+          } else if (data.outcome === "absent") {
+            if (state === "unowned" && pending?.of === "ref-create-intent") pending = null;
+            else observeAbsent();
+          }
         } else if (data.of === "cleanup-intent") {
           if (data.outcome === "absent") observeAbsent();
           else if (data.outcome === "present-unchanged" || data.outcome === "present-changed") {
@@ -1100,6 +1165,10 @@ export function assessProbeLifecycle(records, { dir, intentSha256, intentArtifac
   if (deadlineMs > dispatchMs + DISPATCH_DEADLINE_MS || deadlineMs < dispatchMs + DISPATCH_DEADLINE_MS - 60_000) {
     refuse("the dispatch deadline is not ten minutes from the durable dispatch intent");
   }
+  const selectionHistory = assessRunSelectionContinuity(records, {
+    dir, dispatchIntentMs: dispatchMs, deadlineMs,
+    identity: { repositoryId: commissioning.repository_id, workflowSha },
+  });
   // The DISPATCH INTENT owns its own outcome (R04-F2). Normally its result is journaled; when the
   // process was cut between the durable intent and the provider's answer, the intent is instead
   // resolved by exactly one reconciliation that found the owned run. That reconciliation is not a
@@ -1121,6 +1190,15 @@ export function assessProbeLifecycle(records, { dir, intentSha256, intentArtifac
   }
   if (records.some((record) => record.type === "run-unidentified")) refuse("the probe run could not be identified uniquely");
   const identified = only(records, "run-identified");
+  const identifiedSelection = readDescriptor(dir, identified.data.descriptor, "the identified run-selection descriptor");
+  assertClosed(identifiedSelection, CAPTURE_DESCRIPTORS["run-selection"].fields, "the identified run-selection descriptor");
+  if (identifiedSelection.capture_schema_version !== CAPTURE_SCHEMA_VERSION || identifiedSelection.kind !== "run-selection") {
+    refuse("the identified run-selection descriptor is not a version-1 selection capture");
+  }
+  if (!selectionHistory.some((group) => group.boundary === "listing"
+    && canonicalJson(group.pages) === canonicalJson(identifiedSelection.pages))) {
+    refuse("the identified run-selection descriptor is not bound to the pre-interpretation page observations");
+  }
   const runObservations = assessRunContinuity(records, { dir, repositoryId: commissioning.repository_id, workflowSha });
   if (identified.data.eligible !== 1) refuse("the probe run was not the single eligible run");
   const terminal = only(records, "run-terminal");
