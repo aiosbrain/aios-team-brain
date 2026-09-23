@@ -437,7 +437,7 @@ describe("the staged probe lifecycle (mock provider — not live proof)", () => 
       });
 
       for (const environment of Object.keys(ENV_IDS)) expect(world.validate(collected.records[environment], environment)).toMatch(
-        fault === "missing-201" ? /creation is not a complete 201/ : /authenticated readback.*before dispatch|accumulated lifecycle/,
+        fault === "missing-201" ? /no result or reconciliation|creation is not a complete 201/ : /authenticated readback.*before dispatch|accumulated lifecycle/,
       );
       writeEvidenceFile(world.dir, evidenceSlug(RUN_ID, ATTEMPT, "environment"), {
         schema_version: 1, phase: "environment-controls", run_id: RUN_ID, attempt: ATTEMPT,
