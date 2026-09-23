@@ -315,6 +315,27 @@ export function mergedFilesystem(layerPaths, {
   };
   const isDirectoryKey = (key) => key.endsWith("/") || key === ".";
 
+  /**
+   * Does any EARLIER same-layer descendant of `target` depend on an intermediate directory that was not
+   * declared before this marker? Bounded: every candidate costs a step BEFORE the prefix test, so a
+   * layer full of unrelated markers cannot buy unchecked quadratic scanning, and no second transitive
+   * index is built — the per-layer set of declared directories plus this scan is the whole state.
+   */
+  const opaqueOrderAmbiguity = (target, earlierOrdinary, explicitDirsSeen) => {
+    for (const candidate of earlierOrdinary) {
+      work.step("opaque ordering candidate");
+      if (candidate === target || !candidate.startsWith(target)) continue; // `target` ends in `/`
+      const missing = forEachAncestor(candidate, (ancestor) => {
+        work.step("opaque ordering ancestor");
+        // Only the directories strictly BETWEEN the marker's target and this descendant matter.
+        if (ancestor.length <= target.length) return false;
+        return !explicitDirsSeen.has(ancestor);
+      });
+      if (missing) return true;
+    }
+    return false;
+  };
+
   layerPaths.forEach((paths, index) => {
     for (const name of paths) {
       // Entry validation is charged work even for a root-level name with no ancestors at all.
@@ -348,13 +369,39 @@ export function mergedFilesystem(layerPaths, {
     const isLower = (key) => visible.has(key) && !placedHere.has(key);
 
     /**
-     * PASS 1 — this layer's whiteouts, against the state BELOW it (I1). A `.wh.<x>` removes `x`, `x/` and
-     * everything beneath; an opaque marker removes the children of its directory — and at the ROOT
-     * (target `""`) every visible entry except the `.` sentinel (B7).
+     * B10 — THE OPAQUE MARKER'S ORDER MATTERS, so pass 1 walks the layer in TAR ORDER and remembers
+     * what came before each marker.
+     *
+     * The pinned runtime has two extraction paths. The overlay converter keeps a same-layer descendant
+     * written before an opaque marker; the non-overlay converter can REMOVE one whose intermediate
+     * directory it only created implicitly, because that directory is not in its unpacked set. Rather
+     * than pick a runtime, the audit records the existing `merged-type-conflict` for the ambiguous
+     * shape: an earlier descendant beneath the marker's directory with an intermediate directory that
+     * was never declared as its own entry before the marker.
+     *
+     * Supported, and deliberately NOT flagged: a marker that precedes its descendants, an earlier
+     * DIRECT child (no intermediate at all), an earlier deep descendant whose whole intermediate chain
+     * was declared before the marker (in any order relative to the descendant), and unrelated or
+     * merely prefix-sharing siblings. The root marker keeps its own behaviour (B7).
      */
+    const explicitDirsSeen = new Set();
+    const earlierOrdinary = [];
     for (const name of paths) {
       const white = whiteoutOf(name);
       work.step("merged namespace marker");
+      if (white.kind === "none") {
+        // Ordinary entries are remembered in order, so a later marker can ask what preceded it.
+        retained.membership();
+        earlierOrdinary.push(name);
+        if (isDirectoryKey(name)) {
+          if (!explicitDirsSeen.has(name)) retained.membership();
+          explicitDirsSeen.add(name);
+        }
+        continue;
+      }
+      if (white.kind === "opaque" && white.target !== "" && opaqueOrderAmbiguity(white.target, earlierOrdinary, explicitDirsSeen)) {
+        conflicts.add(index);
+      }
       if (white.kind === "delete") {
         const target = white.target;
         // B8: an ordinary whiteout overlapping this layer's own entry is order-dependent across
