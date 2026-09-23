@@ -67,6 +67,7 @@ const parsedMaxCommits = maxCommitsRaw !== null && /^[1-9]\d*$/.test(maxCommitsR
   ? Number(maxCommitsRaw)
   : null;
 const maxCommits = Number.isSafeInteger(parsedMaxCommits) ? parsedMaxCommits : null;
+const RANGE_SCANNED_BYTE_LIMIT = 64 * 1024 * 1024;
 
 class CommitRangeLimitError extends Error {
   constructor(commitCount, limit) {
@@ -126,10 +127,27 @@ function matchesAnyEre(value, terms) {
   throw new Error("confidential-pattern scan could not run");
 }
 
-function matchingTermSets(values, terms) {
+export function matchingTermSets(values, terms) {
   const sets = values.map(() => new Set());
   if (values.length === 0) return sets;
-  const input = values.join("\n");
+  // grep reports physical input-line numbers, not logical value indexes. Preserve each value's
+  // independent POSIX line semantics while batching by mapping every real physical record back to
+  // its owner. A terminal LF terminates the preceding record; it does not create another empty
+  // record. An empty value has no physical record, matching grep on empty stdin. Appending one final
+  // LF makes a final empty record observable without changing non-empty record matching.
+  const records = [];
+  const recordOwners = [];
+  for (const [valueIndex, value] of values.entries()) {
+    if (value.length === 0) continue;
+    const valueRecords = value.split("\n");
+    if (value.endsWith("\n")) valueRecords.pop();
+    for (const record of valueRecords) {
+      records.push(record);
+      recordOwners.push(valueIndex);
+    }
+  }
+  if (records.length === 0) return sets;
+  const input = `${records.join("\n")}\n`;
   for (const [termIndex, term] of terms.entries()) {
     const result = spawnSync("grep", ["-Ein", "-e", term], {
       input,
@@ -140,8 +158,18 @@ function matchingTermSets(values, terms) {
     if (result.status === 1) continue;
     if (result.status !== 0) throw new Error("confidential-pattern scan could not run");
     for (const line of result.stdout.split("\n").filter(Boolean)) {
-      const valueIndex = Number(line.slice(0, line.indexOf(":"))) - 1;
-      if (sets[valueIndex]) sets[valueIndex].add(termIndex);
+      const separator = line.indexOf(":");
+      const rawLineNumber = separator > 0 ? line.slice(0, separator) : "";
+      if (!/^[1-9]\d*$/.test(rawLineNumber)) throw new Error("confidential-pattern scan could not run");
+      const lineNumber = Number(rawLineNumber);
+      if (!Number.isSafeInteger(lineNumber) || lineNumber > recordOwners.length) {
+        throw new Error("confidential-pattern scan could not run");
+      }
+      const valueIndex = recordOwners[lineNumber - 1];
+      if (!Number.isSafeInteger(valueIndex) || valueIndex < 0 || valueIndex >= sets.length) {
+        throw new Error("confidential-pattern scan could not run");
+      }
+      sets[valueIndex].add(termIndex);
     }
   }
   return sets;
@@ -327,10 +355,24 @@ export function scan(terms, { revealLines = false, cwd = process.cwd(), treeish 
  * markers rather than file:line, because a patch hunk's "location" is a commit, and naming it is
  * enough to find it locally.
  */
-export function scanRange(terms, rangeSpec, { revealLines = false, cwd = process.cwd(), maxCommits = null } = {}) {
+export function scanRange(
+  terms,
+  rangeSpec,
+  {
+    revealLines = false,
+    cwd = process.cwd(),
+    maxCommits = null,
+    // Focused tests may tighten this bound to exercise resource behavior without allocating tens
+    // of MiB. It cannot raise or disable the production limit, and the CLI never exposes it.
+    maxScannedBytes = RANGE_SCANNED_BYTE_LIMIT,
+  } = {}
+) {
   if (terms.length === 0) throw new Error("no active NDA terms — refusing to report a pass");
   assertSafeTerms(terms);
   if (maxCommits !== null && (!Number.isSafeInteger(maxCommits) || maxCommits < 1)) {
+    throw new Error("confidential-pattern scan could not run");
+  }
+  if (!Number.isSafeInteger(maxScannedBytes) || maxScannedBytes < 1 || maxScannedBytes > RANGE_SCANNED_BYTE_LIMIT) {
     throw new Error("confidential-pattern scan could not run");
   }
   if (maxCommits !== null) {
@@ -348,6 +390,12 @@ export function scanRange(terms, rangeSpec, { revealLines = false, cwd = process
   }
   let changedPathCount = 0;
   let scannedByteCount = 0;
+  // Exact normalized text owns its complete term-index result for this invocation only. The key is
+  // the text itself (never a collision-prone digest), the term set is fixed above, and consumers
+  // only inspect the cached Sets. The existing 64 MiB bound therefore caps unique matching input
+  // while unchanged content revisited across commits and merge parents does not spend the budget
+  // repeatedly.
+  const rangeMatches = new Map();
 
   // ADDED LINES ONLY. A commit that REMOVES a term necessarily contains it on the removed side of
   // its own patch — so a naive scan fails every scrub commit, including the one that introduced
@@ -380,16 +428,15 @@ export function scanRange(terms, rangeSpec, { revealLines = false, cwd = process
     const currentSubmodules = new Set(submodulePaths(cwd, commit));
 
     const corpus = [];
-    const corpusIndexes = new Map();
+    const corpusValues = new Set();
     const addCorpus = (value) => {
-      const existing = corpusIndexes.get(value);
-      if (existing !== undefined) return existing;
-      scannedByteCount += Buffer.byteLength(value);
-      if (scannedByteCount > 64 * 1024 * 1024) throw new Error("confidential-pattern scan could not run");
-      const index = corpus.length;
+      if (corpusValues.has(value)) return;
+      if (!rangeMatches.has(value)) {
+        scannedByteCount += Buffer.byteLength(value);
+        if (scannedByteCount > maxScannedBytes) throw new Error("confidential-pattern scan could not run");
+      }
       corpus.push(value);
-      corpusIndexes.set(value, index);
-      return index;
+      corpusValues.add(value);
     };
     const currentBlobs = new Map();
     const previousBlobs = new Map();
@@ -397,23 +444,26 @@ export function scanRange(terms, rangeSpec, { revealLines = false, cwd = process
       addCorpus(path.normalize("NFKC"));
       if (!currentSubmodules.has(path)) {
         const value = trackedText(path, cwd, commit).normalize("NFKC").replace(/[\0\r\n]/g, " ");
-        currentBlobs.set(path, value);
         addCorpus(value);
+        currentBlobs.set(path, value);
       }
     }
     for (const entry of changedEntries) {
       if (entry.oldPath) addCorpus(entry.oldPath.normalize("NFKC"));
       if (!entry.parent || !entry.oldPath) continue;
-      try {
-        const value = trackedText(entry.oldPath, cwd, entry.parent).normalize("NFKC").replace(/[\0\r\n]/g, " ");
-        previousBlobs.set(entry, value);
-        addCorpus(value);
-      } catch {
-        // A missing parent blob is equivalent to no previous match.
-      }
+      // `diff-tree` supplied this old path for this exact parent, which proves the object should
+      // exist. Only an add has no prior blob (`oldPath === null` above); every read/resource failure
+      // for a reported prior object must propagate and block.
+      const value = trackedText(entry.oldPath, cwd, entry.parent).normalize("NFKC").replace(/[\0\r\n]/g, " ");
+      addCorpus(value);
+      previousBlobs.set(entry, value);
     }
-    const corpusMatches = matchingTermSets(corpus, normalizedTerms);
-    const matchesFor = (value) => corpusMatches[corpusIndexes.get(value)] ?? new Set();
+    const unseenCorpus = corpus.filter((value) => !rangeMatches.has(value));
+    const unseenMatches = matchingTermSets(unseenCorpus, normalizedTerms);
+    for (const [index, value] of unseenCorpus.entries()) {
+      rangeMatches.set(value, unseenMatches[index]);
+    }
+    const matchesFor = (value) => rangeMatches.get(value) ?? new Set();
 
     const matchedBefore = (entry, kind) => {
       if (!entry.parent || !entry.oldPath) return new Set();
