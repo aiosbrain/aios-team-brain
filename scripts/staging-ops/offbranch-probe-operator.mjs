@@ -1163,8 +1163,11 @@ export function parseProbeArgs(argv) {
 }
 
 export async function runProbePhase({ phase, runId, attempt, evidenceDir, env = process.env, deps = {} }) {
-  const run = { stage: runStage, dispatch: runDispatch, collect: runCollect, cancel: runCancel, cleanup: runCleanup }[phase];
-  if (!run) throw new UsageError(`unsupported probe phase ${JSON.stringify(String(phase))}`);
+  const phases = Object.freeze({ stage: runStage, dispatch: runDispatch, collect: runCollect, cancel: runCancel, cleanup: runCleanup });
+  if (!PROBE_PHASES.includes(phase) || !Object.hasOwn(phases, phase)) {
+    throw new UsageError(`unsupported probe phase ${JSON.stringify(String(phase))}`);
+  }
+  const run = phases[phase];
   try {
     return await run({ runId, attempt, evidenceDir, env, deps });
   } catch (error) {

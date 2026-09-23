@@ -716,6 +716,17 @@ describe("the historical September 6 fixture: shape coverage only, never current
 // ──────────────────────────────────────────────────────────────────────────────
 
 describe("lifecycle ownership: create once, dispatch once, never adopt, never retry an ambiguous write", () => {
+  it("rejects inherited object names at the direct phase API before opening a provider session", async () => {
+    let requests = 0;
+    for (const phase of ["toString", "constructor", "__proto__"]) {
+      await expect(runProbePhase({
+        phase: phase as any, runId: RUN_ID, attempt: ATTEMPT, evidenceDir: world.dir, env: {},
+        deps: { transport: async () => { requests += 1; throw new Error("provider request escaped phase admission"); } },
+      })).rejects.toThrow(/unsupported probe phase/);
+    }
+    expect(requests).toBe(0);
+  });
+
   it("refuses a preexisting probe ref at stage — even at the desired SHA — and writes nothing", async () => {
     world.seedOriginal();
     world.setRef(world.sha);
