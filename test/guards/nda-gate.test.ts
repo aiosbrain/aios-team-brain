@@ -228,6 +228,142 @@ describe("guard: the NDA confidentiality gate", () => {
     }
   });
 
+  it("reuses exact normalized range matches while still scanning a newly modified value", () => {
+    const dir = mkdtempSync(join(tmpdir(), "nda-gate-range-cache-"));
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8" });
+    try {
+      git("init", "-q");
+      git("config", "user.email", "t@t.local");
+      git("config", "user.name", "t");
+      git("commit", "-qm", "base", "--allow-empty");
+      const base = git("rev-parse", "HEAD").trim();
+      const repeatedBody = `SAFE-${"x".repeat(160)}\n`;
+
+      writeFileSync(join(dir, "a.txt"), repeatedBody);
+      git("add", ".");
+      git("commit", "-qm", "add repeated body");
+      renameSync(join(dir, "a.txt"), join(dir, "b.txt"));
+      git("add", "-A");
+      git("commit", "-qm", "rename repeated body once");
+      renameSync(join(dir, "b.txt"), join(dir, "c.txt"));
+      git("add", "-A");
+      git("commit", "-qm", "rename repeated body twice");
+      writeFileSync(join(dir, "c.txt"), `${repeatedBody.trim()} SYNTHETICTERM\n`);
+      git("commit", "-qam", "modify repeated body");
+
+      // The 400-byte test bound is below the old per-commit accounting total but above the exact
+      // unique normalized values. The modified value is distinct, so it must still be matched.
+      const findings = scanRange(["SYNTHETICTERM"], `${base}..HEAD`, {
+        cwd: dir,
+        maxScannedBytes: 400,
+      });
+      expect(findings.some((finding) => finding.file.includes("changed tracked content"))).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the range budget fail-closed for distinct content and cannot raise the 64 MiB cap", () => {
+    const dir = mkdtempSync(join(tmpdir(), "nda-gate-range-budget-"));
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8" });
+    try {
+      git("init", "-q");
+      git("config", "user.email", "t@t.local");
+      git("config", "user.name", "t");
+      git("commit", "-qm", "base", "--allow-empty");
+      const base = git("rev-parse", "HEAD").trim();
+      writeFileSync(join(dir, "one.txt"), `ONE-${"a".repeat(160)}\n`);
+      git("add", ".");
+      git("commit", "-qm", "add first distinct body");
+      writeFileSync(join(dir, "two.txt"), `TWO-${"b".repeat(160)}\n`);
+      git("add", ".");
+      git("commit", "-qm", "add second distinct body");
+
+      expect(() => scanRange(["SYNTHETIC_NEVER_PRESENT"], `${base}..HEAD`, {
+        cwd: dir,
+        maxScannedBytes: 300,
+      })).toThrow(/scan could not run/i);
+      expect(() => scanRange(["SYNTHETIC_NEVER_PRESENT"], `${base}..HEAD`, {
+        cwd: dir,
+        maxScannedBytes: 64 * 1024 * 1024 + 1,
+      })).toThrow(/scan could not run/i);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("isolates cached matches between term sets and range invocations", () => {
+    const dir = mkdtempSync(join(tmpdir(), "nda-gate-range-cache-scope-"));
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8" });
+    try {
+      git("init", "-q");
+      git("config", "user.email", "t@t.local");
+      git("config", "user.name", "t");
+      git("commit", "-qm", "base", "--allow-empty");
+      const base = git("rev-parse", "HEAD").trim();
+      writeFileSync(join(dir, "scope.txt"), "safe\n");
+      git("add", ".");
+      git("commit", "-qm", "safe range");
+      const safe = git("rev-parse", "HEAD").trim();
+      writeFileSync(join(dir, "scope.txt"), "safe SYNTHETICTERM\n");
+      git("commit", "-qam", "matching range");
+
+      expect(scanRange(["SYNTHETICTERM"], `${base}..${safe}`, { cwd: dir })).toEqual([]);
+      expect(scanRange(["SYNTHETIC_NEVER_PRESENT"], `${base}..HEAD`, { cwd: dir })).toEqual([]);
+      expect(scanRange(["SYNTHETICTERM"], `${base}..HEAD`, { cwd: dir }).length).toBeGreaterThan(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("propagates a previous-parent blob read failure after exact path existence is proven", () => {
+    const dir = mkdtempSync(join(tmpdir(), "nda-gate-parent-read-"));
+    const shimDir = mkdtempSync(join(tmpdir(), "nda-gate-git-shim-"));
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8" });
+    const previousPath = process.env.PATH;
+    const previousRealGit = process.env.NDA_TEST_REAL_GIT;
+    const previousFailObject = process.env.NDA_TEST_FAIL_OBJECT;
+    try {
+      git("init", "-q");
+      git("config", "user.email", "t@t.local");
+      git("config", "user.name", "t");
+      writeFileSync(join(dir, "resource.txt"), "before\n");
+      git("add", ".");
+      git("commit", "-qm", "base");
+      const base = git("rev-parse", "HEAD").trim();
+      writeFileSync(join(dir, "resource.txt"), "after\n");
+      git("commit", "-qam", "modify resource");
+
+      const realGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+      const gitShim = join(shimDir, "git");
+      writeFileSync(
+        gitShim,
+        `#!/bin/sh
+if [ "$1" = "show" ] && [ "$2" = "$NDA_TEST_FAIL_OBJECT" ]; then
+  exit 97
+fi
+exec "$NDA_TEST_REAL_GIT" "$@"
+`
+      );
+      chmodSync(gitShim, 0o755);
+      process.env.NDA_TEST_REAL_GIT = realGit;
+      process.env.NDA_TEST_FAIL_OBJECT = `${base}:resource.txt`;
+      process.env.PATH = `${shimDir}:${previousPath ?? ""}`;
+
+      expect(() => scanRange(["SYNTHETIC_NEVER_PRESENT"], `${base}..HEAD`, { cwd: dir })).toThrow(
+        /tracked content could not be read/i
+      );
+    } finally {
+      process.env.PATH = previousPath;
+      if (previousRealGit === undefined) delete process.env.NDA_TEST_REAL_GIT;
+      else process.env.NDA_TEST_REAL_GIT = previousRealGit;
+      if (previousFailObject === undefined) delete process.env.NDA_TEST_FAIL_OBJECT;
+      else process.env.NDA_TEST_FAIL_OBJECT = previousFailObject;
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(shimDir, { recursive: true, force: true });
+    }
+  });
+
   it("returns real clean and blocked verdicts for ranges over 100 commits", () => {
     const dir = mkdtempSync(join(tmpdir(), "nda-gate-long-range-"));
     const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8" });
