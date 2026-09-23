@@ -316,6 +316,18 @@ export function mergedFilesystem(layerPaths, {
   const isDirectoryKey = (key) => key.endsWith("/") || key === ".";
 
   /**
+   * Is any proper ancestor of this MARKER currently a non-directory — from a lower layer, or written
+   * earlier in this same layer — with no explicit directory entry before the marker to replace it?
+   * Bounded by the shared work authority, one step per ancestor, and it follows no link.
+   */
+  const markerParentConflict = (markerName, explicitDirsSeen, nonDirsSeenHere) => ancestors(markerName, (ancestor) => {
+    if (explicitDirsSeen.has(ancestor)) return false; // replaced by an explicit directory, before the marker
+    const bare = ancestor.slice(0, -1);
+    if (nonDirsSeenHere.has(bare)) return true; // a file this layer wrote earlier
+    return visible.has(bare) && !isDirectoryKey(bare); // a file a lower layer left there
+  });
+
+  /**
    * Does any EARLIER same-layer descendant of `target` depend on an intermediate directory that was not
    * declared before this marker? Bounded: every candidate costs a step BEFORE the prefix test, so a
    * layer full of unrelated markers cannot buy unchecked quadratic scanning, and no second transitive
@@ -386,6 +398,8 @@ export function mergedFilesystem(layerPaths, {
      * merely prefix-sharing siblings. The root marker keeps its own behaviour (B7).
      */
     const explicitDirsSeen = new Set();
+    /** Ordinary NON-directory keys this layer has written so far, in tar order (round 10). */
+    const nonDirsSeenHere = new Set();
     const earlierOrdinary = [];
     for (const name of paths) {
       const white = whiteoutOf(name);
@@ -397,8 +411,22 @@ export function mergedFilesystem(layerPaths, {
         if (isDirectoryKey(name)) {
           if (!explicitDirsSeen.has(name)) retained.membership();
           explicitDirsSeen.add(name);
+        } else if (!nonDirsSeenHere.has(name)) {
+          retained.membership();
+          nonDirsSeenHere.add(name);
         }
         continue;
+      }
+      /**
+       * THE MARKER'S OWN PARENT CHAIN (round 10). The pinned extractor prepares a member's parents
+       * BEFORE it interprets a whiteout, and preparing a parent that is currently a regular file or a
+       * link fails with ENOTDIR — it does not silently replace it with a directory. So a marker under a
+       * non-directory cannot produce the filesystem this audit would otherwise report as complete. An
+       * explicit directory entry earlier in THIS layer does replace it, and is respected; a declaration
+       * after the marker does not retroactively make it valid.
+       */
+      if ((white.kind === "delete" || white.kind === "opaque") && markerParentConflict(name, explicitDirsSeen, nonDirsSeenHere)) {
+        conflicts.add(index);
       }
       /**
        * B10 applies to the ROOT marker too (round 9). A root `.wh..wh..opq` after entries that created

@@ -207,7 +207,7 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
       if (!symlinkLocations.has(link)) retained.path(link);
       symlinkLocations.add(link);
     }
-    if (symlinkLocations.size > 0 && membersThroughSymlink(inventory.paths, symlinkLocations, deadline)) {
+    if (symlinkLocations.size > 0 && membersThroughSymlink(inventory.paths, symlinkLocations, deadline, { work })) {
       limitations.record({ kind: "member-through-symlink", layer: layerIndex });
     }
     layers.push(Object.freeze({
@@ -293,16 +293,23 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
  * ancestors — a set lookup per segment, never a pairwise scan — with the clock consulted as it goes.
  * Only the canonical names are compared; no link target is ever read or resolved.
  */
-export function membersThroughSymlink(paths, symlinkLocations, deadline, { deadlineEvery = 1024 } = {}) {
-  let steps = 0;
+export function membersThroughSymlink(paths, symlinkLocations, deadline, {
+  deadlineEvery = 1024,
+  /**
+   * The run's SHARED work authority (round 10). These ancestor visits used to be counted only by a
+   * private local counter, so they were absent from the run's reported CPU total. A direct caller that
+   * passes none gets a finite default rather than an unaccounted traversal.
+   */
+  work = createWorkBudget({ deadline, deadlineEvery }),
+} = {}) {
   for (const path of paths) {
-    // Bounded BEFORE any ancestor work, for direct callers too (B9).
+    // Bounded BEFORE any ancestor work, for direct callers too (B9), and charged as entry validation.
+    work.step("symlink ancestry entry");
     assertMemberPathBounded(path);
-    // One pass over the path's separators — no repeated joins — with the clock consulted INSIDE a
-    // single path as well as across paths.
+    // One pass over the path's separators — no repeated joins. The WORK budget owns both the step count
+    // and the clock, so the deadline is consulted inside a single path as well as across paths, once.
     const hit = forEachAncestor(path, (ancestor) => {
-      steps += 1;
-      if (deadline && steps % deadlineEvery === 0) deadline.assert("symlink ancestry");
+      work.step("symlink ancestry");
       return symlinkLocations.has(ancestor.slice(0, -1));
     });
     if (hit) return true;

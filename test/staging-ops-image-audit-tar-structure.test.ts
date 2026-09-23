@@ -793,7 +793,8 @@ describe("member paths are bounded before any ancestor work (B9)", () => {
   it("the symlink-ancestry check consults the clock inside a single path", () => {
     const one = expiring(2);
     expect(() => membersThroughSymlink(["a/b/c/d/e"], new Set(["zz"]), one, { deadlineEvery: 1 })).toThrow(/deadline/);
-    expect(one.asked).toEqual(["symlink ancestry", "symlink ancestry"]);
+    // The entry validation and the first ancestor visit — the second call is INSIDE the first path.
+    expect(one.asked).toEqual(["symlink ancestry entry", "symlink ancestry"]);
   });
 });
 
