@@ -137,11 +137,13 @@ function pseudoMember(name: string, typeflag: string, body: Buffer): Buffer {
 }
 
 function paxRecord(key: string, value: string): string {
-  // The length field counts its own digits, so it has to be solved rather than measured once.
-  const body = ` ${key}=${value}\n`;
-  let length = body.length + 1;
-  while (String(length).length + body.length !== length) length = String(length).length + body.length;
-  return `${length}${body}`;
+  // The length field counts its own digits AND is a BYTE count, so it is solved over UTF-8 bytes.
+  // Counting UTF-16 code units (`.length`) is the defect AC-AUDIT-05 fixed in the reader; a fixture
+  // that repeats it cannot be the oracle for non-ASCII metadata.
+  const body = Buffer.byteLength(` ${key}=${value}\n`, "utf8");
+  let length = body + 1;
+  while (String(length).length + body !== length) length = String(length).length + body;
+  return `${length} ${key}=${value}\n`;
 }
 
 export function buildTar(members: TarMemberSpec[]): Buffer {

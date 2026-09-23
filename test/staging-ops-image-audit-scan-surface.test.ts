@@ -17,7 +17,7 @@ import { SCANNER, scannerArgs, scannerSettings } from "../scripts/staging-ops/im
 import { scannerIsolation } from "../scripts/staging-ops/image-audit.mjs";
 import { createOperationBudget } from "../scripts/staging-ops/operation-deadline.mjs";
 import { buildTar, syntheticSecret } from "./helpers/tar-fixture";
-import { inspectSynthetic, scanFiles, scanSurface, scratchPool, synthesizeImage } from "./helpers/synthetic-image";
+import { inspectSynthetic, memberScanFiles, scanFiles, scanSurface, scratchPool, synthesizeImage } from "./helpers/synthetic-image";
 
 /**
  * THE THREE MEASURED COVERAGE DEFECTS (F1, F2, F3) and the bounds that were recorded but unenforced
@@ -50,7 +50,7 @@ describe("F1 — a staged scan file is a fixed header plus the member's EXACT by
     const image = synthesizeImage([buildTar([{ name: "app/bin/tool", content: original }])]);
     const result = await inspectSynthetic(image, pool.make());
 
-    const staged = scanFiles(join(result.scanDir, "L0"));
+    const staged = memberScanFiles(join(result.scanDir, "L0"));
     expect(staged).toHaveLength(1);
     const bytes = readFileSync(staged[0]);
 
@@ -84,16 +84,22 @@ describe("F1 — a staged scan file is a fixed header plus the member's EXACT by
 
   it("reports the image's own bytes and the scanner's surface as SEPARATE figures", async () => {
     const body = Buffer.alloc(100, 0x41);
-    const image = synthesizeImage([buildTar([{ name: "app/a", content: body }])]);
+    const layer = buildTar([{ name: "app/a", content: body }]);
+    const image = synthesizeImage([layer]);
     const result = await inspectSynthetic(image, pool.make());
 
     // Stating only the surface would overstate how much IMAGE was read; stating only the content
     // would hide that the scanner's input is not byte-identical to the member.
-    expect(result.coverage.stagedBytes).toBe(100);
+    //
+    // THE ARCHIVE SURFACE (AC-AUDIT-02) is every byte of the layer that is not member content: here
+    // the member's header, its padding and the two end blocks — the layer minus the 100 content bytes.
+    // It is counted on its own AND charged to the same staged total.
+    expect(result.coverage.archiveSurfaceBytes).toBe(layer.length - 100);
+    expect(result.coverage.stagedBytes).toBe(layer.length);
     expect(result.coverage.configBytes).toBe(image.configBytes.length);
-    // One layer member and the config, each carrying one header.
-    expect(result.coverage.representationOverheadBytes).toBe(2 * SCAN_HEADER.length);
-    expect(result.coverage.scanSurfaceBytes).toBe(100 + image.configBytes.length + 2 * SCAN_HEADER.length);
+    // One member file, one archive-surface file and the config, each carrying one header.
+    expect(result.coverage.representationOverheadBytes).toBe(3 * SCAN_HEADER.length);
+    expect(result.coverage.scanSurfaceBytes).toBe(layer.length + image.configBytes.length + 3 * SCAN_HEADER.length);
     expect(result.coverage.representation).toBe(SCAN_REPRESENTATION.version);
     // The surface figure is a real measurement of the tree, not an arithmetic claim about it.
     const onDisk = scanFiles(result.scanDir).reduce((total, path) => total + readFileSync(path).length, 0);
@@ -120,21 +126,47 @@ describe("F1 — a staged scan file is a fixed header plus the member's EXACT by
    */
   describe("the capability canary decides coverage, and never contributes a finding", () => {
     it("is UNVERIFIED when the scanner did not detect the sentinel in this representation", () => {
-      expect(assessCanary({ wrappedFindings: 0, unwrappedFindings: 0 }).status).toBe("unverified");
+      expect(assessCanary({ wrappedFindings: 0, unwrappedFindings: 0, archiveSurfaceFindings: 1 }).status).toBe("unverified");
       // Even with the negative control absent: what matters is whether the representation was read.
-      expect(assessCanary({ wrappedFindings: 0, unwrappedFindings: 1 }).status).toBe("unverified");
-      // A missing/garbled count is not a pass either.
-      expect(assessCanary({ wrappedFindings: undefined, unwrappedFindings: 0 }).status).toBe("unverified");
+      expect(assessCanary({ wrappedFindings: 0, unwrappedFindings: 1, archiveSurfaceFindings: 1 }).status).toBe("unverified");
+      // A missing/garbled count is not a pass either — and reports NO archive boolean, having no answer.
+      const unreadable = assessCanary({ wrappedFindings: undefined, unwrappedFindings: 0, archiveSurfaceFindings: 1 });
+      expect(unreadable.status).toBe("unverified");
+      expect(unreadable).not.toHaveProperty("archiveSurfaceDetected");
     });
 
-    it("is VERIFIED when the wrapped fixture was detected, and reports the negative control honestly", () => {
-      const reproduced = assessCanary({ wrappedFindings: 1, unwrappedFindings: 0 });
+    it("is UNVERIFIED when the archive-metadata sentinel was missed, or its count is absent (AC-AUDIT-07)", () => {
+      const missed = assessCanary({ wrappedFindings: 1, unwrappedFindings: 0, archiveSurfaceFindings: 0 });
+      expect(missed).toMatchObject({ status: "unverified", archiveSurfaceDetected: false, representation: SCAN_REPRESENTATION.version });
+      // A pre-v2 caller that never measured the archive surface does not get a verified canary.
+      expect(assessCanary({ wrappedFindings: 1, unwrappedFindings: 0 }).status).toBe("unverified");
+    });
+
+    it("is VERIFIED only when the wrapped AND archive fixtures were detected, and reports the negative control honestly", () => {
+      const reproduced = assessCanary({ wrappedFindings: 1, unwrappedFindings: 0, archiveSurfaceFindings: 1 });
       expect(reproduced.status).toBe("verified");
       expect(reproduced.binaryMagicSkipReproduced).toBe(true);
+      expect(reproduced.archiveSurfaceDetected).toBe(true);
       // The skip not reproducing is a FACT to record, not a failure and not something to imply away.
-      const notReproduced = assessCanary({ wrappedFindings: 1, unwrappedFindings: 1 });
+      const notReproduced = assessCanary({ wrappedFindings: 1, unwrappedFindings: 1, archiveSurfaceFindings: 1 });
       expect(notReproduced.status).toBe("verified");
       expect(notReproduced.binaryMagicSkipReproduced).toBe(false);
+    });
+
+    it("builds the archive-metadata fixture as a wrapped, NUL-padded 512-byte block with a NUL-TERMINATED value", () => {
+      const sentinel = canarySentinel();
+      const fixtures = canaryFixtures(sentinel);
+      expect(fixtures.archiveMetadataBlock.length).toBe(512);
+      expect(fixtures.archiveMetadata.equals(wrapForScan(fixtures.archiveMetadataBlock))).toBe(true);
+      // The assignment shape the pinned rule was measured on — but NUL-delimited like a real header or
+      // link field, with no newline anywhere in the block (F9): the harder, realistic shape.
+      const line = Buffer.from(`GITHUB_TOKEN=${sentinel}`, "ascii");
+      expect(fixtures.archiveMetadataBlock.includes(0x0a)).toBe(false);
+      const at = fixtures.archiveMetadataBlock.indexOf(line);
+      // NUL-padded on both sides, as a tar header field is.
+      expect(at).toBeGreaterThan(0);
+      expect(fixtures.archiveMetadataBlock.subarray(0, at).every((byte) => byte === 0)).toBe(true);
+      expect(fixtures.archiveMetadataBlock.subarray(at + line.length).every((byte) => byte === 0)).toBe(true);
     });
 
     it("builds both fixtures from ONE sentinel, differing only by the representation", () => {
@@ -162,18 +194,24 @@ describe("F2 — a staged id carries NO suffix inherited from the member's name"
     ])]);
     const result = await inspectSynthetic(image, pool.make());
 
-    expect([...result.staged.keys()]).toEqual([
+    const memberEntries = [...result.staged].filter(([, detail]) => detail.name !== undefined);
+    expect(memberEntries.map(([id]) => id)).toEqual([
       `L0/000000${SCAN_REPRESENTATION.suffix}`,
       `L0/000001${SCAN_REPRESENTATION.suffix}`,
       `L0/000002${SCAN_REPRESENTATION.suffix}`,
     ]);
+    // The archive surface is named from the same closed vocabulary, under the layer's `M/` group, and
+    // carries a fixed category and no name at all.
+    const surfaceEntries = [...result.staged].filter(([, detail]) => detail.name === undefined);
+    expect(surfaceEntries.map(([id]) => id)).toEqual([`L0/M/000000${SCAN_REPRESENTATION.suffix}`]);
+    expect(surfaceEntries.map(([, detail]) => detail)).toEqual([{ category: "archive-metadata", layer: 0, depth: 0 }]);
     // ∀, not ∃: no staged file ANYWHERE in the tree ends in a suffix the image chose.
     for (const path of scanFiles(result.scanDir)) {
       expect(path.endsWith(SCAN_REPRESENTATION.suffix), `${path} is not neutrally named`).toBe(true);
     }
     expect(scanFiles(result.scanDir).some((path) => /\.(bin|svg)$/.test(path))).toBe(false);
     // The real names survive PRIVATELY, which is what a bounded coordinator rerun resolves through.
-    expect([...result.staged.values()].map((detail) => detail.name))
+    expect(memberEntries.map(([, detail]) => detail.name))
       .toEqual(["app/neutral.txt", "app/payload.bin", "app/payload.svg"]);
   });
 

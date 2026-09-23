@@ -13,7 +13,7 @@ import {
   inventorySummary,
   provenanceCategory,
 } from "../scripts/staging-ops/image-audit/expected-tree.mjs";
-import { CONFIG_SCAN_GROUP, SCAN_HEADER, SCAN_REPRESENTATION } from "../scripts/staging-ops/image-audit/scan-surface.mjs";
+import { CONFIG_SCAN_GROUP, SCAN_REPRESENTATION } from "../scripts/staging-ops/image-audit/scan-surface.mjs";
 import { buildTar, syntheticSecret } from "./helpers/tar-fixture";
 
 /**
@@ -307,8 +307,9 @@ describe("coverage gaps are REPORTED, never silently narrowed (PUB-03)", () => {
    */
   it("stops staging at the TOTAL byte bound, even when every layer is individually within its limit", async () => {
     const perLayer = 4096;
+    const first = buildTar([{ name: "app/first.bin", content: Buffer.alloc(perLayer, 1) }]);
     const image = synthesizeImage([
-      buildTar([{ name: "app/first.bin", content: Buffer.alloc(perLayer, 1) }]),
+      first,
       buildTar([{ name: "app/second.bin", content: Buffer.alloc(perLayer, 2) }]),
     ]);
     const dir = scratch();
@@ -321,10 +322,12 @@ describe("coverage gaps are REPORTED, never silently narrowed (PUB-03)", () => {
       platform: "linux/amd64",
       limits: {
         ...AUDIT_LIMITS,
-        // Each layer is allowed its whole content; the RUN is allowed only the first one's worth.
+        // Each layer is allowed its whole content; the RUN is allowed only the first one's worth —
+        // which, with the archive surface charged to the same allowance (AC-AUDIT-02), is the whole
+        // first layer tar: its member content plus its header, padding and end blocks.
         maxExpandedBytesPerLayer: perLayer * 4,
         maxMemberBytes: perLayer * 4,
-        maxTotalStagedBytes: perLayer + 1,
+        maxTotalStagedBytes: first.length + 1,
       },
     });
 
@@ -332,7 +335,8 @@ describe("coverage gaps are REPORTED, never silently narrowed (PUB-03)", () => {
     expect(result.coverage.limitations).toContainEqual({ kind: "total-staging-budget-exhausted", layer: 1 });
     // The FIRST layer is unaffected — a total bound must stop staging, not retroactively invalidate
     // what was already read.
-    expect(result.coverage.stagedBytes).toBe(perLayer);
+    expect(result.coverage.stagedBytes).toBe(first.length);
+    expect(result.coverage.archiveSurfaceBytes).toBe(first.length - perLayer);
     expect(scanSurface(result.scanDir)).toContain(Buffer.alloc(perLayer, 1).toString("utf8"));
     // …and the refused member left NO partial file behind for the scanner to read as a whole one.
     expect(scanSurface(result.scanDir)).not.toContain(Buffer.alloc(1, 2).toString("utf8"));
@@ -348,6 +352,12 @@ describe("coverage gaps are REPORTED, never silently narrowed (PUB-03)", () => {
       { name: "app/a.js", content: "x".repeat(64) },
       { name: "app/node_modules/pkg/test.tar.gz", content: nested },
     ])]);
+    /**
+     * What the layer has staged at the moment the nested archive is expanded: both members' content
+     * AND the archive surface read so far — `a.js`'s header and padding, and the `.tar.gz` member's
+     * header. Its trailing padding and the end blocks come later, after the member is handled.
+     */
+    const stagedBeforeExpansion = 64 + nested.length + 512 + (512 - 64) + 512;
     const dir = scratch();
     const exportPath = join(dir, "image.tar");
     writeFileSync(exportPath, image.exportTar);
@@ -358,7 +368,7 @@ describe("coverage gaps are REPORTED, never silently narrowed (PUB-03)", () => {
       platform: "linux/amd64",
       // Enough for the two layer members, not for the inflated copy of the nested archive: an
       // expansion that ignored the budget is how a decompression bomb fills a runner disk.
-      limits: { ...AUDIT_LIMITS, maxTotalStagedBytes: 64 + nested.length },
+      limits: { ...AUDIT_LIMITS, maxTotalStagedBytes: stagedBeforeExpansion },
     });
     // `depth: 1` is asserted, not omitted: it is what says the refusal happened INSIDE the nested
     // expansion rather than while staging a top-level member, and those are different gaps.
@@ -366,7 +376,7 @@ describe("coverage gaps are REPORTED, never silently narrowed (PUB-03)", () => {
     // The two layer members were staged; the archive's INFLATED contents were not. Counted rather
     // than searched for the secret: the staged `.gz` is compressed bytes, so its absence from a utf8
     // read would prove nothing about whether the expansion happened.
-    expect(readdirSync(join(result.scanDir, "L0"))).toHaveLength(2);
+    expect(readdirSync(join(result.scanDir, "L0")).filter((entry) => entry !== "M")).toHaveLength(2);
     expect(scanSurface(result.scanDir)).not.toContain(secret);
   });
 

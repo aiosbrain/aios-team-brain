@@ -15,10 +15,13 @@ import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import {
   classifyLayerMember,
+  forEachAncestor,
   mergedFilesystem,
   verifyConfig,
 } from "./layers.mjs";
 import { LAYER_MEDIA_TYPES } from "./subject.mjs";
+import { assertMemberPathBounded } from "./tar-reader.mjs";
+import { createLimitationCollector, createRetainedStateBudget, createWorkBudget } from "./budgets.mjs";
 import {
   copyMemberToFile,
   createStagingBudget,
@@ -70,7 +73,7 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
   try {
     // The budget reaches PASS 1, not only the layer loop below: hashing every member of a large
     // export is real work, and it happens before anything is decoded.
-    index = indexExportByDigest(source, { deadline });
+    index = indexExportByDigest(source, { deadline, limits });
     const configEntry = index.get(manifest.config.digest);
     if (!configEntry) {
       // The export does not contain the config the registry manifest names. Refusing here is the
@@ -84,11 +87,29 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
   const config = verifyConfig(configBytes, manifest, { platform });
 
   const layers = [];
-  const limitations = [];
   const layerPaths = [];
+  /**
+   * EVERY SYMLINK LOCATION SEEN SO FAR, image-wide (B5). An extractor resolves a member's parent
+   * directories inside the rootfs, following symlinks — so `side -> app` then `side/planted.js` writes
+   * `/app/planted.js`, which the `/app` inventory never compares. The auditor never follows a link; it
+   * records a member whose proper ancestor IS or WAS a symlink (in a lower layer, or anywhere in the
+   * same layer whatever the tar order) as a blocking gap. A historical union: a link later replaced
+   * still counts, which is conservative.
+   */
+  const symlinkLocations = new Set();
+  /**
+   * ONE retained-state authority and ONE work authority for the whole run (B9-R), created before the
+   * first member is inventoried and shared by every layer and the merge, so the ceiling covers
+   * everything held at once rather than each structure in isolation.
+   */
+  const retained = createRetainedStateBudget();
+  const work = createWorkBudget({ deadline });
+  /** The run's own charged writer: each layer's limitations are ADOPTED, and the inspector's own RECORDED. */
+  const limitations = createLimitationCollector(retained);
   const appMembers = [];
   const staged = new Map();
   const buildOutputs = new Map();
+  let archiveSurfaceBytes = 0;
   // ONE allowance for the whole scan tree, shared across every layer and every nested expansion
   // inside them (PUB-01). A per-layer bound is not a total.
   const stagingBudget = createStagingBudget(
@@ -157,15 +178,38 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
     }
     const classified = classifyLayerMember({ rawSha, descriptor, diffId, decode: () => measured });
 
-    const inventory = inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, stagingBudget, deadline });
+    const inventory = inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, stagingBudget, deadline, retained, work });
+    // The cross-layer array of this layer's paths, kept until the merge runs.
+    retained.membership();
     layerPaths.push(inventory.paths);
-    appMembers.push(...inventory.appMembers.map((member) => ({ ...member, layer: layerIndex })));
-    for (const [id, detail] of inventory.staged) staged.set(id, detail);
+    for (const member of inventory.appMembers) {
+      // A COPY with the layer index — its own record, charged before it is built.
+      work.step("app member copy");
+      retained.record(4);
+      retained.string(member.path);
+      appMembers.push({ ...member, layer: layerIndex });
+    }
+    for (const [id, detail] of inventory.staged) {
+      retained.membership();
+      staged.set(id, detail);
+    }
     for (const [category, totals] of Object.entries(inventory.buildOutputs)) {
       const running = buildOutputs.get(category) ?? { files: 0, bytes: 0 };
       buildOutputs.set(category, { files: running.files + totals.files, bytes: running.bytes + totals.bytes });
     }
-    limitations.push(...inventory.limitations);
+    for (const limitation of inventory.limitations) {
+      work.step("limitation adoption");
+      limitations.adopt(limitation);
+    }
+    archiveSurfaceBytes += inventory.archiveSurfaceBytes;
+    for (const link of inventory.symlinks) {
+      work.step("symlink location");
+      if (!symlinkLocations.has(link)) retained.path(link);
+      symlinkLocations.add(link);
+    }
+    if (symlinkLocations.size > 0 && membersThroughSymlink(inventory.paths, symlinkLocations, deadline, { work })) {
+      limitations.record({ kind: "member-through-symlink", layer: layerIndex });
+    }
     layers.push(Object.freeze({
       index: layerIndex,
       digest: descriptor.digest,
@@ -181,7 +225,10 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
     rmSync(layerTarPath, { force: true });
   }
 
-  const merged = mergedFilesystem(layerPaths);
+  // The run's own clock reaches INSIDE the merge (B9), not only around it.
+  const merged = mergedFilesystem(layerPaths, { deadline, retained, work });
+  // Layers whose merged view extractors would not agree on (B6) — each a blocking gap.
+  for (const layer of merged.conflicts) limitations.record({ kind: "merged-type-conflict", layer });
   return {
     config,
     configScanId,
@@ -203,8 +250,16 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
       complete: limitations.length === 0,
       layers: layers.length,
       members: layers.reduce((total, layer) => total + layer.members, 0),
-      /** Bytes actually written into the scan tree, against the run's cumulative allowance. */
+      /**
+       * Bytes actually written into the scan tree, against the run's cumulative allowance — member
+       * content AND archive surface, because both are charged to that one allowance.
+       */
       stagedBytes: stagingBudget.used,
+      /**
+       * THE ARCHIVE SURFACE, counted on its own (AC-AUDIT-02): the non-content bytes of every decoded
+       * layer and every gzip-decoded nested tar that reached the scanner. Included in `stagedBytes`.
+       */
+      archiveSurfaceBytes,
       // `Infinity` does not survive JSON, so an unbounded budget says so in words rather than
       // serializing as `null` and reading like a missing measurement.
       stagedByteLimit: Number.isFinite(stagingBudget.limit) ? stagingBudget.limit : "unbounded",
@@ -220,10 +275,46 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
       configBytes: configBytes.length,
       scanSurfaceBytes: stagingBudget.used + configBytes.length + stagingBudget.overheadUsed + SCAN_HEADER.length,
       representationOverheadBytes: stagingBudget.overheadUsed + SCAN_HEADER.length,
-      limitations: Object.freeze(limitations.map((limitation) => Object.freeze(limitation))),
+      /**
+       * The published copy is retained too: one membership per limitation, charged before the copy.
+       * (`Object.freeze` on the originals adds nothing retained.)
+       */
+      limitations: Object.freeze(limitations.items.map((limitation) => {
+        retained.membership();
+        return Object.freeze(limitation);
+      })),
     }),
     identityVerified: layers.length === manifest.layers.length && layers.every((layer) => layer.form),
   };
+}
+
+/**
+ * Does any member in `paths` sit BENEATH a known symlink? Segment by segment over each path's proper
+ * ancestors — a set lookup per segment, never a pairwise scan — with the clock consulted as it goes.
+ * Only the canonical names are compared; no link target is ever read or resolved.
+ */
+export function membersThroughSymlink(paths, symlinkLocations, deadline, {
+  deadlineEvery = 1024,
+  /**
+   * The run's SHARED work authority (round 10). These ancestor visits used to be counted only by a
+   * private local counter, so they were absent from the run's reported CPU total. A direct caller that
+   * passes none gets a finite default rather than an unaccounted traversal.
+   */
+  work = createWorkBudget({ deadline, deadlineEvery }),
+} = {}) {
+  for (const path of paths) {
+    // Bounded BEFORE any ancestor work, for direct callers too (B9), and charged as entry validation.
+    work.step("symlink ancestry entry");
+    assertMemberPathBounded(path);
+    // One pass over the path's separators — no repeated joins. The WORK budget owns both the step count
+    // and the clock, so the deadline is consulted inside a single path as well as across paths, once.
+    const hit = forEachAncestor(path, (ancestor) => {
+      work.step("symlink ancestry");
+      return symlinkLocations.has(ancestor.slice(0, -1));
+    });
+    if (hit) return true;
+  }
+  return false;
 }
 
 /**

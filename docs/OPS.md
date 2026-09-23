@@ -354,7 +354,7 @@ chooses to adopt.
 ## 7. Upgrading across a brain-api contract bump
 
 The brain-api wire contract is versioned in **`aios-workspace/docs/brain-api.md`** (this server
-declares **v1.26** — `lib/api/version.ts`; this paragraph said v1.21 until 2026-08-25, which is the
+declares **v1.27** — `lib/api/version.ts`; this paragraph said v1.21 until 2026-08-25, which is the
 drift the table below exists to prevent and did not) — the single pinned contract both `aios-workspace` (the CLI/MCP client) and
 `aios-team-brain` (this server) build against. Per that doc's own change policy: a **breaking**
 change requires a **major version bump** (`/api/v2`); **additive** changes (new endpoints, new
@@ -1272,6 +1272,89 @@ public evidence.**
     inflated payload has no name at all) is a recorded `unexpanded-archive-format` gap. The label is
     `extension` when the NAME was recognised and `format` when the BYTES were, each from a closed
     vocabulary in reviewed source — neither is derived from the member.
+  - **The archive surface is scanned too** (scan representation **v2**, AIO-1112). Every byte of a
+    decoded layer or gzip-decoded nested tar that is not member content — headers, PAX/GNU metadata,
+    link targets, padding, unsupported-member bodies, end blocks and trailing bytes — is staged as
+    whole ranges under a fixed `archive-metadata` category (never a path) and counted in
+    `coverage.archiveSurfaceBytes`. A range too large for one surface file is an
+    `archive-surface-range-unstageable` gap, never a split. **Non-zero bytes after a layer's or
+    nested tar's end blocks** are staged but are also an `archive-trailer-nonzero` gap: opaque
+    scanning is not decoding, and a gzip stream, ZIP or second tar can sit there. Zero padding is fine.
+    A nested member is treated as a tar when its first block is a header **the reader itself would
+    accept** (ustar or magic-less V7, by the same checksum rule), when it opens with **two zero
+    blocks** (the canonical empty archive), or when its name is `.tar`/`.tgz`/`.tar.gz` — a declared
+    tar that does not parse is a `nested-archive-undecodable` gap (its inflated bytes are not staged,
+    so this blocks rather than being scanned). An ordinary `.gz` still inflates.
+  - **Member names are compared CANONICALLY**, after ustar/PAX/GNU resolution — where only a POSIX
+    ustar header's bytes 345–500 are a name prefix; a GNU, V7 or STAR header carrying anything there
+    refuses the run rather than being named two ways: repeated `/` and `.`
+    segments collapse (`././app/x`, `.//app/x` and `app/./x` are all `app/x`), Unicode and case are
+    kept. The inventory, whiteout merge, build-output categories and public path lookup all use that
+    one form. A name that depends on the host — absolute, drive-letter, traversing, NUL-bearing, empty,
+    or a file/link with a trailing `/` — is an `unsafe-member-path` gap at any depth: its content is
+    scanned, and the record says the inventory could not account for it. **A backslash is refused the
+    same way even though it is a legal Linux filename byte** (e.g. systemd's `\x2d` unit names): a
+    deliberate, conservative limitation — an image containing one records the gap and cannot reach
+    ready without coordinator adjudication.
+  - **Numeric header fields** (checksum, size, mode) trim NUL and space at both ends and must be octal
+    inside; an interior NUL or other byte refuses the run instead of truncating the value.
+  - **Whiteouts are merged per layer before that layer's own entries**: a `.wh.<dir>` removes the
+    directory, its trailing-slash spelling and everything beneath it (never a sibling that merely shares
+    the prefix), and an expected `/app` file under a deleted directory is reported missing. Deleted
+    bytes are still scanned. A **root** opaque marker (`.wh..wh..opq` at the top level) empties every
+    lower entry. An ordinary whiteout that overlaps an entry of **its own layer** — the entry, its
+    directory spelling or a descendant — is a `merged-type-conflict` gap in either tar order: OCI
+    applies whiteouts to lower layers only, containerd removes the entry when the whiteout follows it,
+    and the audit does not pick one (it accounts the whiteout lower-only). An opaque marker beside its
+    own layer's children is supported. A whiteout is recognised by its basename whatever the entry's
+    type (as extractors do), but only an **empty regular file** is a valid marker: any other is applied
+    and recorded as a `malformed-whiteout` gap, and one naming nothing, `.` or `..` (`.wh.`, `.wh..`,
+    `.wh...`) deletes nothing and is recorded the same way.
+  - **Member paths are bounded** at 4,096 UTF-8 bytes and 128 segments — the audit's own supported
+    input, not a claim about any extractor's limit. A longer name refuses the run with
+    `AUDIT_TAR_LIMIT_EXCEEDED` before any path work.
+  - **Two independent authorities bound the path work.** A shared **retained-state budget** charges the
+    logical bytes of everything the run keeps — paths, symlinks, `/app` records, private staged records,
+    limitations, the merged view and its ancestor index — before each insertion, with a 256 MiB ceiling
+    and a secondary 500,000-relation ceiling. It is **monotonic**: deleting, overwriting or finishing a
+    layer never refunds, so churn cannot buy more state. A separate **work budget** counts CPU steps and
+    consults the deadline, including for names with no ancestors. Either one exceeded refuses the run
+    with `AUDIT_TAR_LIMIT_EXCEEDED` and a sanitized record. The 256 MiB figure is a conservative
+    supported-input boundary, **not a measured heap guarantee**: the per-item charges deliberately
+    over-estimate real object sizes.
+  - **An opaque marker's position in its layer matters.** If an ordinary entry written *earlier in the
+    same layer* sits beneath the marker's directory and depends on an intermediate directory that was
+    never declared as its own entry before the marker, the layer records `merged-type-conflict`: the
+    pinned runtime's overlay converter keeps such an entry while its non-overlay converter can remove
+    it, and the audit does not pick one. A marker that comes first, an earlier direct child, a complete
+    intermediate chain declared before the marker, and unrelated or prefix-sharing siblings are all
+    unaffected. This is a conservative accepted-format boundary, not extraction emulation.
+  - **Type changes replace, not merge** (OCI "changeset over existing files"): a file or link replacing a
+    lower directory removes that directory's whole subtree, a directory replacing a lower file removes
+    the file, and directories merge. A directory's identity is its type, so `app` and `app/` written as
+    directories are one entry. A layer the extractors would not agree on — a file and a directory of one
+    name, a non-directory with entries beneath it, or entries beneath a lower non-directory — is a
+    `merged-type-conflict` gap, and a file or link named exactly `app` is an
+    `inventory-root-not-directory` gap; either way the affected `/app` files are reported missing.
+  - **A member beneath a symlink is a gap.** An extractor follows a parent symlink inside the rootfs,
+    so `side -> app` then `side/planted.js` writes `/app/planted.js` — outside the `/app` names the
+    inventory compares. The audit never follows a link; it records any member whose parent path is, or
+    was in that layer or a lower one, a symlink anywhere in the image as `member-through-symlink`. This
+    is conservative: a link that was later replaced still counts. The bytes are still scanned.
+  - These gap kinds carry only the layer index, never a path or link target, and each blocks readiness
+    until a coordinator adjudicates it.
+  - **Ambiguous extended metadata refuses the run**: a repeated local PAX header, a global PAX header
+    while member metadata is pending, a GNU long name together with a PAX `path` (or long link with
+    `linkpath`) in either order, a repeated GNU long name/link, and any `GNU.sparse.*` key. The claim is about the **decoded tar
+    bytes**: original registry-layer gzip framing (`FNAME`/`FCOMMENT`/`FEXTRA`, bytes after the
+    stream), which a `docker save` export may not contain, is outside it.
+  - **Malformed archives refuse the run** with a fixed code: `AUDIT_TAR_STRUCTURE_INVALID` (short,
+    truncated or unterminated input, a header-only member declaring a body, a global PAX
+    path/linkpath/size override, an empty or NUL-bearing PAX `path`/`linkpath`, an empty GNU long
+    name/link, a non-zero
+    trailer on the outer export) or `AUDIT_TAR_LIMIT_EXCEEDED`
+    (a metadata body, accumulated metadata or physical-header count past its reviewed bound). A broken
+    *nested* tar is a `nested-archive-undecodable` gap instead.
 - **`provenance.recipe`** is measured *and* gates the verdict: a `violated` or `unverified` assertion
   blocks `transitionReady` and lands the verdict on **`unresolved`** — a question for coordinator
   adjudication, deliberately *not* re-labelled as secret presence. A missing recipe blocks too, so a
@@ -1281,7 +1364,16 @@ public evidence.**
 - **`scanner.settings`** records the coverage-relevant flags read back from the invocation that ran:
   no file-size cap (`--max-target-megabytes 0`), and the scanner's own archive traversal left at the
   8.28.0 default of disabled — the audit expands one nested level itself and records every format it
-  could not expand.
+  could not expand. These must **equal the reviewed policy** (`SCANNER_SETTINGS_POLICY`): the run
+  refuses with `AUDIT_SCANNER_SETTINGS_UNSUPPORTED` otherwise, and reconciliation refuses a record
+  that reports anything else.
+- **`scanner.capabilityCanary`** is measured on three private synthetic fixtures before the real scan,
+  with the same binary, config and isolation: the wrapped ELF case, its unwrapped negative control,
+  and a wrapped NUL-padded 512-byte **archive-metadata** block whose value is NUL-terminated, as a
+  real header field is. Verified means both wrapped fixtures were detected
+  (`archiveSurfaceDetected: true`); a miss of either — or no canary at all — is `unverified`, a
+  coverage gap that blocks. Its `reason`/`note` are fixed strings, and reconciliation refuses any other. The archive-metadata case has **not yet been measured on the live 8.28.0 binary** — the
+  first real run establishes it, and a miss blocks rather than passes.
 - **`failure`** appears only on a refused run, and carries a fixed `stage` from a closed vocabulary
   plus an error **code**, never a message. `AUDIT_SUBPROCESS_TIMEOUT`, `AUDIT_SUBPROCESS_LOG_OVERFLOW`
   and `AUDIT_SUBPROCESS_START` are distinct because the remedies are. A prerequisite refusal
@@ -1302,7 +1394,11 @@ public evidence.**
   - That route is the `reconcile` command (`node scripts/staging-ops/image-audit.mjs reconcile
     --evidence <audit.json> --operator <inventory.json>`), and it **validates the audit record
     first**: schema, exact subject binding, every required measurement (including the persisted
-    `provenance.identityVerified`), and internal consistency. An absent, foreign, incomplete,
+    `provenance.identityVerified`, the pinned `scanner.configSha256`, the reviewed
+    `scanner.settings`, the v2 `scanner.representation`, the `capabilityCanary` and
+    `coverage.representation`), and internal consistency. A **v1 original** (captured before the
+    archive surface was scanned) is refused as `original-scan-representation-unsupported` and needs a
+    fresh audit — no operator inventory can grandfather it. An absent, foreign, incomplete,
     self-contradictory or itself-`refused` record is **refused** — verdict `refused`,
     `transitionReady: false`, fixed codes in `provenance.refusal.codes`, and no reconciled
     measurements at all. Readiness is then RECOMPUTED from the validated measurements by the same
@@ -1350,6 +1446,12 @@ for auditing or exposing the currently covered package.
   the same version and executing this exact linux_x64 binary is a separate measurement. The repo's
   `ci.yml` gitleaks download is unpinned by checksum and on an older version — it is **not** evidence
   for this one.
+- **The scanner CONFIG digest — PINNED.** `SCANNER.configSha256` holds the sha256 of
+  `config/staging-ops/image-audit-gitleaks.toml` (`1bd01cf2…d73ec`). `test/guards/image-audit-config-digest.test.ts`
+  fails the build if the tracked file drifts from it, the run refuses with
+  `AUDIT_SCANNER_CONFIG_MISMATCH` before any scan if the bytes it would use differ, and reconciliation
+  refuses any other reported digest. Editing the config means re-pinning the constant in the same
+  reviewed change.
 - **The `docker save` export form.** How a layer is decoded is decided by its **declared media type**,
   never by which digest the export happens to contain: for an uncompressed `…layer.v1.tar` layer the
   descriptor digest *is* the `diff_id`, so "the export has a member hashing to the descriptor" is true

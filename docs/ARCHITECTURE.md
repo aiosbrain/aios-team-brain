@@ -509,7 +509,7 @@ unversioned `/api/brain/*` + `/api/dashboard/*` surfaces; `GET /api/v1/timeline`
 and `GET /api/v1/tasks` still discards its computed `truncated` (both need a brain-api bump, so they are
 deliberately not in this change).
 
-This server **implements brain-api v1.26** (the shipped member-facing wire contract; source of truth:
+This server **implements brain-api v1.27** (the shipped member-facing wire contract; source of truth:
 `aios-workspace/docs/brain-api.md`; see the v1.14 by-key lookup on
 `GET /api/v1/tasks` below; v1.8 added the subscriptions endpoint,
 `POST /api/v1/subscriptions`; the optional `context_health` object on `POST /api/v1/metrics`,
@@ -525,7 +525,7 @@ request-admission supplement** for `POST /api/v1/codebases` — canonical
 `aios-workspace/docs/contract/codebase-request-limits-v1.json`, vendored and sha256-pinned at
 `test/fixtures/contract/codebase-request-limits-v1.json`, carrying its own `revision: 1` and
 `appliesFromMemberApiVersion: "1.23"`. The effective contract is therefore *the published payload
-shape plus this admission supplement*, and the two move independently. `BRAIN_API_VERSION` is **1.26** with the separate finding intake endpoint; the admission
+shape plus this admission supplement*, and the two move independently. `BRAIN_API_VERSION` is **1.27** (1.26 added the separate finding intake endpoint; 1.27 adds `POST /api/v1/evidence/search`); the admission
 supplement remains independently versioned and does not itself bump the member API version. A limit is a **resource-admission** change, and the canonical change
 policy names that as an explicit exception to "breaking semantics go to /v2" — precedent: the 1.20
 `rows` cap and the dated 2026-06-19 same-route full-metrics tightening. (That exception and the
@@ -807,6 +807,17 @@ DoS: worst case per key rises from ~144 MB/min to ~648 MB/min (120 × 5.4 MB), m
 existing **120 pushes/min per key** rate limit on an already-authenticated principal in a self-hosted,
 single-org deployment — a real but small increase in blast radius, taken so legitimate imports stop
 failing.
+
+### Evidence search — `POST /api/v1/evidence/search`
+
+The route authenticates member/delegated credentials, enforces a dedicated 30/minute
+bucket and obtains the live visible-item set. `lib/query/evidence.ts` reuses the
+shared FTS term builder and ranked SQL search with project/visibility predicates
+before ranking and LIMIT. It resolves only the selected source attribution signals
+against same-team identity records; it never treats a connector as an author.
+`lib/query/evidence-format.ts` builds valid JSON under 20,000 characters, disclosing
+excerpt/result omissions. Lookup errors remain errors. No graph, external model,
+conversation or corpus write occurs; duration/count diagnostics omit source text.
 
 ### Grounded query — `POST /api/v1/query` (SSE)
 
@@ -1655,6 +1666,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/auth/slack/start` — member-authed: mint single-use state nonce + return Slack OAuth authorize_url with the full `slack-personal` user-scope set (including matched conversation read/history scopes and `files:write`; signed short-TTL state JWT; CSRF/replay guard)
 - `GET /api/auth/slack/callback` — browser (no API key): verify+consume state nonce, exchange `code` (`oauth.v2.access`), re-validate via `auth.test`, store the user token encrypted (`member_secrets`) + capture identity; renders HTML (never the token)
 - `GET /api/auth/slack/status` — member-authed: `{ connected, slack_user_id, workspace }` (never returns the token; `no-store`)
+- `POST /api/v1/evidence/search` — bounded native FTS passages with recorded contributors; live member/delegated visibility, no answer generation
 - `POST /api/v1/query` — SSE grounded query (`delta`/`sources`/`done`); persists the thread (`conversation_id`)
 - `GET /api/v1/conversations` — API-key list of the key member's own chat threads (owner-scoped)
 - `GET /api/v1/conversations/:id` — API-key read of a thread's messages (owner-only)
@@ -1960,9 +1972,12 @@ error and partial cues coexist. V1/v2/absent census is unknown, measured zero is
 explicit, and required completeness never implies all-check completeness. Producer
 emission remains disabled until the separate production acceptance gate.
 
-The member conformance snapshot is now the full Workspace member API 1.26 contract,
-vendored from Workspace merge `ce28fa75e6cbe35d7d7e3c9d9620e82cecd31255` (document
-revision 1.28). Its availability metadata identifies implemented Brain commit
+The member conformance snapshot is now the full Workspace member API 1.27 contract,
+vendored from Workspace merge `73ed9c33c2e8e39d575c361572ca875754aa91ec` (document
+revision 1.29, which adds `POST /api/v1/evidence/search`; the fixture's semantic keys are
+unchanged from 1.26 — only `version` and `contentHash` move). The debt intake section keeps
+its own `version: "1.26"`, the member version that introduced it. Its availability metadata
+identifies implemented Brain commit
 `87be1293dd8338dde953020c757bad336f2da9b4`; deployment and activation still require
 verification in each target environment, with no production availability claim. Scanner payloads
 remain independently pinned to `codebase-payload-1.25`; gateway remains 1.10.
