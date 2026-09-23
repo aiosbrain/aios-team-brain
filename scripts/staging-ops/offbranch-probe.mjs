@@ -185,6 +185,7 @@ export const RESOURCE_LINK_FIELDS = Object.freeze(["intent_artifact", "intent_sh
 const RESPONSE_FACTS = Object.freeze(["http_status", "response_complete", "response_incomplete", "measured_status"]);
 export const PROBE_JOURNAL_EVENTS = Object.freeze({
   "original-identity-bound": Object.freeze(["capture"]),
+  "original-identity-observed": Object.freeze(["capture"]),
   "capture-progress": Object.freeze(["run_id", "kind", "page", "capture"]),
   "capture-failed": Object.freeze(["run_id", "phase", "category", "capture_sequences"]),
   "qualification-ended": Object.freeze(["run_id", "reason", "terminal_sequence"]),
@@ -238,7 +239,7 @@ export function assertProbeEventPayload(type, data) {
   const fields = PROBE_JOURNAL_EVENTS[String(type)];
   if (!fields) refuse(`unknown probe journal event ${JSON.stringify(String(type))}`);
   assertClosed(data, fields, `the ${type} payload`);
-  if (type === "original-identity-bound") assertClosed(data.capture, RAW_REF_FIELDS, "the original identity capture");
+  if (["original-identity-bound", "original-identity-observed"].includes(type)) assertClosed(data.capture, RAW_REF_FIELDS, "the original identity capture");
   if (["capture-progress", "capture-failed", "qualification-ended", "admission-observed"].includes(type)) decimalString(data.run_id, "the capture run identity");
   if (type === "capture-progress") {
     if (!["run", "jobs", "check", "annotations", "terminal"].includes(data.kind)) refuse("unknown capture progress kind");
@@ -965,13 +966,20 @@ export function assertOriginalProbeIdentity(body, { commissioning, dispatcher, b
   return identity;
 }
 
-export function assessOriginalProbeBinding(records, { dir, commissioning, dispatcher }) {
+export function assessOriginalProbeBinding(records, { dir, commissioning, dispatcher, qualification = false }) {
   const bindings = records.filter((record) => record.type === "original-identity-bound");
   if (bindings.length !== 1) refuse("the probe requires exactly one retained original identity binding");
   if (records.some((row) => ["ref-create-intent", "dispatch-intent"].includes(row.type) && row.seq < bindings[0].seq)) refuse("original identity was not bound before launch");
   const captured = readRaw(dir, bindings[0].data.capture, "the original identity capture", RAW_REF_FIELDS);
   if (captured.completed > timeOf(bindings[0].ts, "the original identity binding time")) refuse("the original identity binding predates its capture");
-  return assertOriginalProbeIdentity(captured.body, { commissioning, dispatcher });
+  const baseline = assertOriginalProbeIdentity(captured.body, { commissioning, dispatcher });
+  if (qualification) for (const row of records.filter((entry) => entry.type === "original-identity-observed")) {
+    const observed = readRaw(dir, row.data.capture, "the original identity observation", RAW_REF_FIELDS);
+    if (observed.completed > Date.parse(row.ts)) refuse("the original identity observation predates capture");
+    assertOriginalProbeIdentity(observed.body, { commissioning, dispatcher, baseline });
+    if (observed.body.status === "completed") refuse("the original commissioning attempt completed; qualification has ended");
+  }
+  return baseline;
 }
 
 
@@ -1049,7 +1057,7 @@ export function assessProbePhaseState(records, { workflowSha }) {
   const ended = has("qualification-ended") || has("capture-failed") || has("cancel-intent") || assessSourceContinuity(records).interrupted;
   const ref = assessRefOwnership(records, { workflowSha });
   return Object.freeze({ closed: has("probe-closed"), staged: has("probe-opened"), create: has("ref-create-intent"), dispatch: has("dispatch-intent"),
-    cleanup: has("cleanup-intent"), paired, failed, ended, aborted: has("qualification-ended"), ref,
+    cleanup: has("cleanup-intent"), capture_started: has("capture-progress") || has("capture-recorded"), paired, failed, ended, aborted: has("qualification-ended"), ref,
     qualification: failed ? "failed" : ended ? "inconclusive" : paired ? "measured" : "incomplete" });
 }
 
@@ -1271,7 +1279,7 @@ export function assessProbeLifecycle(records, { dir, intentSha256, intentArtifac
   if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_RAW_CAPTURE_BYTES) refuse("the original intent file is not bounded regular evidence");
   const originalIntent = parseJsonBytes(readFileSync(originalFile), "the original trusted intent");
   if (canonicalHash(originalIntent) !== commissioning.intent_sha256) refuse("the original intent no longer matches its authenticated binding");
-  assessOriginalProbeBinding(records, { dir, commissioning, dispatcher: originalIntent.dispatcher });
+  assessOriginalProbeBinding(records, { dir, commissioning, dispatcher: originalIntent.dispatcher, qualification: true });
   verifyProbeRecoveryHistory(records, { dir, commissioning });
   const phaseState = assessProbePhaseState(records, { workflowSha });
   if (phaseState.failed || phaseState.ended) refuse("the cumulative probe qualification is failed, interrupted or irreversibly incomplete");

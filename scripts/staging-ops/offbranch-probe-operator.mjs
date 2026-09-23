@@ -163,7 +163,7 @@ async function openProbeSession({ runId, attempt, evidenceDir, env, deps, phase,
       || records[0].data.intent_artifact !== staged.name || records[0].data.commissioning_run_id !== String(runId)
       || records[0].data.commissioning_attempt !== String(attempt)) throw new AssertionFailure("the probe history is not bound to the original intent");
     asAssertion(() => verifyProbeRecoveryHistory(records, { dir, commissioning }));
-    baseline = asAssertion(() => assessOriginalProbeBinding(records, { dir, commissioning, dispatcher: intent.dispatcher }));
+    baseline = asAssertion(() => assessOriginalProbeBinding(records, { dir, commissioning, dispatcher: intent.dispatcher, qualification: !["cancel", "cleanup"].includes(phase) }));
   } else if (phase !== "stage") throw new IncompleteEvidence("no probe has been staged for this attempt");
   session.state = state;
   if (state.closed) {
@@ -174,6 +174,7 @@ async function openProbeSession({ runId, attempt, evidenceDir, env, deps, phase,
   if (["dispatch", "collect"].includes(phase) && (state.cleanup || state.aborted || state.ended || state.failed || state.ref.state === "uncertain")) {
     throw new IncompleteEvidence("this probe's cumulative history interrupted or ended qualification; mutations are never re-issued and only bounded recovery remains");
   }
+  if (phase === "collect" && state.capture_started && !state.paired) throw new IncompleteEvidence("the original capture was interrupted; explicit cancel must end incomplete qualification before cleanup");
   if (phase === "collect" && !state.dispatch) throw new IncompleteEvidence("the probe has no dispatch intent to collect");
   const recovery = phase === "cancel" || phase === "cleanup";
   // Recovery relies on the retained authenticated original baseline and independently re-proves
@@ -185,6 +186,7 @@ async function openProbeSession({ runId, attempt, evidenceDir, env, deps, phase,
   if (session.sourceContinuity?.moved === true) persistKnownSourceMove(session);
   if (!recovery) {
     const captured = await rawCapture(session, `/repos/${REPO}/actions/runs/${runId}/attempts/${attempt}`, "the original commissioning attempt");
+    if (records.length) appendUnderLock(session, "probe", "original-identity-observed", { capture: captured.ref });
     asAssertion(() => assertOriginalProbeIdentity(captured.body, { commissioning, dispatcher: intent.dispatcher, baseline }));
     session.originalRun = captured.body;
     session.originalCapture = captured.ref;
@@ -554,30 +556,30 @@ export async function runDispatch({ runId, attempt, evidenceDir, env, deps }) {
     if (state.create && !state.ref.may_delete) throw new IncompleteEvidence("the original probe create is unresolved or unowned; it is never re-issued or adopted");
     const sha = session.commissioning.workflow_sha;
     if (!state.create) {
-    const absent = await session.request("GET", probeRefPath);
-    probe.append("ref-absent-verified", { ref: PROBE_REF, ...facts(absent), measured_at: session.now().toISOString() });
-    if (absent.complete === true && absent.status === 200) throw new AssertionFailure("the fixed probe ref appeared after staging; an unowned ref is never adopted");
-    if (!(absent.complete === true && absent.status === 404)) throw new IncompleteEvidence("the probe ref's absence could not be measured");
+      const absent = await session.request("GET", probeRefPath);
+      probe.append("ref-absent-verified", { ref: PROBE_REF, ...facts(absent), measured_at: session.now().toISOString() });
+      if (absent.complete === true && absent.status === 200) throw new AssertionFailure("the fixed probe ref appeared after staging; an unowned ref is never adopted");
+      if (!(absent.complete === true && absent.status === 404)) throw new IncompleteEvidence("the probe ref's absence could not be measured");
 
-    // CREATE ONCE: durable intent, one request, its result — and reconciliation, not a retry.
-    probe.append("ref-create-intent", { ref: PROBE_REF, sha });
-    const created = await session.request("POST", `/repos/${REPO}/git/refs`, { ref: PROBE_REF, sha });
-    const objectSha = created.complete === true && FULL_SHA.test(String(created.body?.object?.sha ?? "")) ? created.body.object.sha : null;
-    probe.append("ref-create-result", { ref: PROBE_REF, sha, ...facts(created), object_sha: objectSha });
-    if (!(created.complete === true && created.status === 201 && objectSha === sha)) {
-      const readback = await session.request("GET", probeRefPath);
-      probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), object_sha: readback.complete === true ? (String(readback.body?.object?.sha ?? "") || null) : null, measured_at: session.now().toISOString() });
-      const at = session.now().toISOString();
-      if (readback.complete === true && readback.status === 404) {
-        probe.append("reconciliation", { of: "ref-create-intent", outcome: "absent", object_sha: null, measured_at: at });
-        throw new IncompleteEvidence("the probe ref create did not establish application and the ref is absent; it is not re-created for this attempt");
+      // CREATE ONCE: durable intent, one request, its result — and reconciliation, not a retry.
+      probe.append("ref-create-intent", { ref: PROBE_REF, sha });
+      const created = await session.request("POST", `/repos/${REPO}/git/refs`, { ref: PROBE_REF, sha });
+      const objectSha = created.complete === true && FULL_SHA.test(String(created.body?.object?.sha ?? "")) ? created.body.object.sha : null;
+      probe.append("ref-create-result", { ref: PROBE_REF, sha, ...facts(created), object_sha: objectSha });
+      if (!(created.complete === true && created.status === 201 && objectSha === sha)) {
+        const readback = await session.request("GET", probeRefPath);
+        probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), object_sha: readback.complete === true ? (String(readback.body?.object?.sha ?? "") || null) : null, measured_at: session.now().toISOString() });
+        const at = session.now().toISOString();
+        if (readback.complete === true && readback.status === 404) {
+          probe.append("reconciliation", { of: "ref-create-intent", outcome: "absent", object_sha: null, measured_at: at });
+          throw new IncompleteEvidence("the probe ref create did not establish application and the ref is absent; it is not re-created for this attempt");
+        }
+        if (readback.complete === true && readback.status === 200) {
+          probe.append("reconciliation", { of: "ref-create-intent", outcome: "present-ownership-uncertain", object_sha: String(readback.body?.object?.sha ?? "") || null, measured_at: at });
+          throw new IncompleteEvidence("the probe ref create did not establish application and a ref now exists; ownership is uncertain, so it is neither dispatched nor deleted — root reconciliation is required");
+        }
+        throw new IncompleteEvidence("the probe ref create did not establish application and its readback failed; the create intent stays unresolved");
       }
-      if (readback.complete === true && readback.status === 200) {
-        probe.append("reconciliation", { of: "ref-create-intent", outcome: "present-ownership-uncertain", object_sha: String(readback.body?.object?.sha ?? "") || null, measured_at: at });
-        throw new IncompleteEvidence("the probe ref create did not establish application and a ref now exists; ownership is uncertain, so it is neither dispatched nor deleted — root reconciliation is required");
-      }
-      throw new IncompleteEvidence("the probe ref create did not establish application and its readback failed; the create intent stays unresolved");
-    }
     }
     const readback = await session.request("GET", probeRefPath);
     probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), object_sha: readback.complete === true ? (String(readback.body?.object?.sha ?? "") || null) : null, measured_at: session.now().toISOString() });
@@ -990,8 +992,23 @@ export async function runCancel({ runId, attempt, evidenceDir, env, deps }) {
       if (state.paired) return result(session, "cancel", "already-terminal");
       if (!state.aborted) {
         const records = probe.records();
-        const jobs = records.find((row) => row.type === "capture-recorded" && row.data.kind === "jobs");
-        const run = records.filter((row) => row.type === "run-observed" && row.seq < (jobs?.seq ?? 0)).at(-1);
+        let jobs = records.find((row) => row.type === "capture-recorded" && row.data.kind === "jobs");
+        // A process may stop after fsyncing the last jobs page and before its descriptor/admission
+        // append. Reuse those exact retained pages; this is recovery of original facts, no re-read.
+        if (!jobs) {
+          const pages = records.filter((row) => row.type === "capture-progress" && row.data.kind === "jobs");
+          const bodies = pages.map((row) => JSON.parse(readFileSync(path.join(session.dir, row.data.capture.artifact), "utf8")));
+          const total = bodies[0]?.total_count;
+          if (pages.length && Number.isSafeInteger(total) && pages.every((row, index) => row.data.page === index + 1)
+            && bodies.every((body) => body.total_count === total && Array.isArray(body.jobs))
+            && bodies.reduce((count, body) => count + body.jobs.length, 0) === total
+            && pages.length === Math.max(1, Math.ceil(total / PAGE_SIZE))) {
+            const descriptor = writeDescriptor(session, { capture_schema_version: CAPTURE_SCHEMA_VERSION, kind: "jobs", pages: pages.map((row) => ({ page: row.data.page, ...row.data.capture })) });
+            jobs = probe.append("capture-recorded", { kind: "jobs", environment: null, descriptor, completed_at: pages.at(-1).data.capture.completed_at });
+          }
+        }
+        const firstJobPage = records.find((row) => row.type === "capture-progress" && row.data.kind === "jobs");
+        const run = records.filter((row) => row.type === "run-observed" && row.seq < (firstJobPage?.seq ?? jobs?.seq ?? 0)).at(-1);
         if (jobs && run) retainAdmissions(session, probe, identified.data.run_id, run.data.capture, jobs.data.descriptor);
         const terminal = probe.records().filter((row) => row.type === "run-observed").at(-1);
         probe.append("qualification-ended", { run_id: identified.data.run_id, reason: "operator-terminal-abort", terminal_sequence: terminal.seq });
@@ -1006,12 +1023,14 @@ export async function runCancel({ runId, attempt, evidenceDir, env, deps }) {
   }
 }
 
-function closeOutcome(records, { workflowSha }) {
+function closeOutcome(records, { workflowSha, session }) {
   const observations = records.filter((record) => record.type === "observation-recorded");
   // An ADMITTED job is a real negative-control failure and keeps precedence over every other
   // reading: an interrupted attempt is untrustworthy in the passing direction, not in this one.
   const state = assessProbePhaseState(records, { workflowSha });
   if (state.failed) return "failed";
+  try { assessOriginalProbeBinding(records, { dir: session.dir, commissioning: session.commissioning, dispatcher: session.intent.dispatcher, qualification: true }); }
+  catch (error) { if (!(error instanceof ProbeRefusal)) throw error; return "inconclusive"; }
   if (state.ended || !state.paired) return "inconclusive";
   // MEASURED needs the accumulated lifecycle to support it: the owned ref actually gone and its
   // absence measured (R05-F1), and no recorded source interruption anywhere in this history
@@ -1117,7 +1136,7 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
       if (open.length) {
         throw new IncompleteEvidence(`${open.length} probe intent(s) are still unresolved (${open.map((entry) => `${entry.type}#${entry.seq}`).join(", ")}); the journal is not closed until each is reconciled`);
       }
-      const outcome = closeOutcome(current, { workflowSha: sha });
+      const outcome = closeOutcome(current, { workflowSha: sha, session });
       probe.append("probe-closed", { outcome });
       return result(session, "cleanup", status, { outcome, ...extra });
     };

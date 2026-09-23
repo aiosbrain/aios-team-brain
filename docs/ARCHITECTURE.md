@@ -117,7 +117,7 @@ the one fixed disposable ref `remediation/pc06-off-branch-negative-20260921` by
 `cancel`) under a `probe` role at the same request boundary. Its intent is linked into the ORIGINAL
 attempt's resource journal (`probe-staged`) before the ref exists; its own ownership chain is the
 third journal kind (`.probe.jsonl`). **What that chain permits is DERIVED from the whole of it, never
-from its newest row:** `assessRefOwnership` and `assessSourceContinuity` in
+from its newest row:** `assessProbePhaseState`, `assessRefOwnership` and `assessSourceContinuity` in
 `scripts/staging-ops/offbranch-probe.mjs` are the one derivation both the operator and the offline
 assessment use, so a successful deletion ends that creation's authority irreversibly (a same-SHA
 recreation is somebody else's ref), a ref seen at another SHA is not revived by being put back, and a
@@ -126,6 +126,14 @@ cancellation still run, measurement and acceptance do not. `check-evidence` reac
 `scripts/staging-ops/offbranch-probe.mjs` only for that control key with `offbranch_schema_version: 1`,
 and re-derives the refusal from retained raw run/jobs/check/annotation responses and before/after
 environment policy captures — never from a verdict field. Runbook: `docs/OPS.md` §14.
+The shared phase state distinguishes irreversible closure, qualification, run/ref authority and
+capture completeness. Original provider identity is retained before launch, with separately measured
+actor and triggering-actor tuples checked against the original intent's declared dispatcher.
+Recovery uses that authenticated baseline plus fresh exact resource authority, independently of
+qualification-only live reads. Partial captures and proven admission survive diagnostic outages;
+explicit terminal abort ends incomplete qualification without a cancellation request, while complete
+paired collection remains idempotent. The journal reader and writer reject every post-close event;
+closed reporting runs before writer-lock acquisition and leaves stale locks untouched.
 The probe retains every complete ref observation and raw run identity observation before using it.
 Cleanup requires a fresh exact-attempt terminal read immediately before lease deletion and final
 closure. Observed recreation, rerun or terminal-state contradiction survives later restoration.

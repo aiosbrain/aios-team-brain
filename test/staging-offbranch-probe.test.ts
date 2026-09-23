@@ -18,7 +18,7 @@ import {
   ALLOWED_OPERATIONS, PROTECTED_JOBS, assertAllowedRequest, assessEvidence, completedJsonResponse, createGuardedRequest, createRedactor,
   evidenceSlug, incompleteResponse, readEvidenceFile, validateEnvironmentControl, writeEvidenceFile,
 } from "../scripts/staging-ops/policy-commissioning.mjs";
-import { acquireJournalLock, openJournal, readJournal, readLockOwner, recoverJournalLock } from "../scripts/staging-ops/commissioning-journal.mjs";
+import { acquireJournalLock, journalPath, openJournal, readJournal, readLockOwner, recoverJournalLock } from "../scripts/staging-ops/commissioning-journal.mjs";
 import {
   GENERIC_DIAGNOSTIC_MESSAGE, OFFBRANCH_CONTROL, PROBE_BRANCH, PROBE_JOBS, PROBE_JOURNAL_EVENTS, PROBE_REF,
   PROBE_WORKFLOW_FILE, PROBE_WORKFLOW_PATH, SOURCE_OBSERVED_EVENT, assertPolicyAgreesWithCommissioning, assessRefOwnership,
@@ -2241,5 +2241,80 @@ describe("phase admission and terminal recovery", () => {
     };
     await expect(invoke("dispatch", { transport })).rejects.toThrow(/actor identity/);
     expect(world.calls.filter((call) => call.method !== "GET")).toHaveLength(0);
+  });
+});
+
+
+describe("durable close and capture process cuts", () => {
+  const cutAfter = (predicate: (row: any) => boolean) => {
+    const file = journalPath(world.dir, RUN_ID, ATTEMPT, "probe");
+    const lines = readFileSync(file, "utf8").trimEnd().split("\n");
+    const index = lines.findIndex((line) => predicate(JSON.parse(line)));
+    expect(index).toBeGreaterThanOrEqual(0);
+    writeFileSync(file, `${lines.slice(0, index + 1).join("\n")}\n`, { mode: 0o600 });
+  };
+  for (const boundary of ["run-terminal", "capture-progress", "capture-recorded", "admission-observed", "capture-failed"]) {
+    it(`explicit cancel recovers a process cut after ${boundary} without diagnostic reads`, async () => {
+      world.seedOriginal(); await world.phase("stage"); world.admitted = "probe-emergency"; await world.phase("dispatch");
+      const unavailable = (method: string, route: string, body: any) => route.includes("/check-runs/") ? Promise.resolve(incompleteResponse("transport-timeout")) : world.transport(method, route, body);
+      await expect(world.phase("collect", { transport: unavailable })).rejects.toThrow();
+      cutAfter((row) => row.type === boundary);
+      const cancelled: any = await world.phase("cancel", { transport: unavailable });
+      expect(cancelled.status).toBe("terminal-aborted");
+      expect(cancelled.outcome).toBe(boundary === "run-terminal" ? "inconclusive" : "failed");
+      const abort = world.probeRecords().filter((row: any) => row.type === "qualification-ended");
+      await world.phase("cancel", { transport: unavailable });
+      expect(world.probeRecords().filter((row: any) => row.type === "qualification-ended")).toEqual(abort);
+      await world.phase("cleanup", { transport: unavailable });
+      expect(world.refSha()).toBeNull(); expect(world.count("POST", "/cancel")).toBe(0);
+    });
+  }
+  it("partial paired observation stays immutable and becomes permanently nonaccepting after abort", async () => {
+    world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch"); const collected: any = await world.phase("collect");
+    cutAfter((row) => row.type === "observation-recorded");
+    const observation = readFileSync(path.join(world.dir, collected.records["staging-release"].artifact));
+    await expect(world.phase("cleanup")).rejects.toThrow(/collect before cleanup/);
+    expect((await world.phase("cancel") as any).status).toBe("terminal-aborted");
+    expect((await world.phase("cleanup") as any).outcome).toBe("inconclusive");
+    expect(readFileSync(path.join(world.dir, collected.records["staging-release"].artifact))).toEqual(observation);
+    expect(world.validate(collected.records["staging-release"], "staging-release")).not.toBeNull();
+  });
+  it("closed reporting leaves a stale writer lock intact and recovery never calls its callback", async () => {
+    world.seedOriginal(); await world.phase("stage"); await world.phase("cleanup");
+    const modulePath = path.join(__dirname, "../scripts/staging-ops/commissioning-journal.mjs");
+    const script = `import { acquireJournalLock } from ${JSON.stringify(modulePath)}; process.stdout.write(JSON.stringify(acquireJournalLock(${JSON.stringify({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, kind: "probe" })})));`;
+    const owner = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8" }));
+    const before = JSON.stringify(world.probeRecords()); let callbacks = 0;
+    for (const phase of ["cancel", "cleanup"]) expect((await world.phase(phase) as any).status).toBe("already-closed");
+    await expect(recoverJournalLock({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, kind: "probe", ownerGone: true, now: world.now, reconcile: async () => { callbacks++; return { reconciled: true }; } })).rejects.toThrow(/open probe/);
+    expect(callbacks).toBe(0); expect(readLockOwner(world.dir, RUN_ID, ATTEMPT, "probe").nonce).toBe(owner.nonce);
+    expect(JSON.stringify(world.probeRecords())).toBe(before);
+  });
+  it("low-level append refuses after close and runtime/offline reject a valid-hash post-close record", async () => {
+    const collected: any = await world.fullProbe();
+    const lock = acquireJournalLock({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, kind: "probe", now: world.now });
+    try {
+      const journal = openJournal({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, kind: "probe", source: world.sha, lock, now: world.now });
+      expect(() => journal.append("ref-create-intent", { ref: PROBE_REF, sha: world.sha })).toThrow(/closed/);
+    } finally { lock.release(); }
+    const file = journalPath(world.dir, RUN_ID, ATTEMPT, "probe");
+    const bytes = readFileSync(file, "utf8"); const lastLine = bytes.trimEnd().split("\n").at(-1)!; const last = JSON.parse(lastLine);
+    const forged = { ...last, seq: last.seq + 1, prev: sha256(lastLine), ts: world.now().toISOString(), type: "ref-create-intent", data: { ref: PROBE_REF, sha: world.sha } };
+    writeFileSync(file, `${bytes}${JSON.stringify(forged)}\n`);
+    await expect(world.phase("cleanup")).rejects.toThrow(/closed/);
+    expect(world.validate(collected.records["staging-release"], "staging-release")).toMatch(/closed/);
+  });
+  it("an original numeric identity contradiction remains disqualifying after the provider response restores", async () => {
+    world.seedOriginal(); await world.phase("stage");
+    await expect(world.phase("dispatch", { transport: async (method: string, route: string, body: any) => {
+      if (route.endsWith(`/actions/runs/${RUN_ID}/attempts/${ATTEMPT}`)) {
+        const response = world.respond(method, route, body).body; response.actor.id++;
+        return completedJsonResponse(200, Buffer.from(JSON.stringify(response)), createRedactor(), { retainRaw: true });
+      }
+      return world.transport(method, route, body);
+    } })).rejects.toThrow(/actor identity/);
+    await expect(world.phase("dispatch")).rejects.toThrow(/actor identity/);
+    expect(world.count("POST", "/git/refs")).toBe(0);
+    expect((await world.phase("cleanup") as any).status).toBe("nothing-owned");
   });
 });

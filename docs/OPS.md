@@ -1811,6 +1811,30 @@ node $P cleanup  $A   # exact-SHA lease deletion via local git; verified absence
 node $P cancel   $A   # operator abort: cancels ONLY the identified probe run, confirms terminal
 ```
 
+Each phase validates the original intent, its prior resource-journal link and the complete probe
+history. Before launch, the provider's full original run/attempt/repository identity must agree with
+that intent. The original declared dispatcher login is checked against a separately retained provider
+actor tuple; the triggering actor has its own tuple and need not be the dispatcher. Neither is
+required to be the probe operator. Later original identity contradictions remain disqualifying.
+
+Qualification and recovery have separate admission rules. An unavailable original/source read,
+completed original run or expired capture window cannot authorize another launch or positive
+measurement. Authenticated retained original identity plus fresh exact owned-run/ref evidence can
+still authorize cancellation and cleanup, without renewing either deadline.
+
+If terminal collection stops during diagnostics, retained run/jobs/pages remain in the journal.
+Identity-bound execution evidence records a failed control before optional diagnostic reads. Invoke
+`cancel` to explicitly end incomplete terminal qualification, then `cleanup`: terminal abort sends no
+provider cancellation and returns `terminal-aborted`, with failed admission taking precedence over
+inconclusive evidence. Cleanup does not silently choose this abort. A fully completed paired
+collection followed by `cancel` returns `already-terminal` and preserves its original observations.
+
+A closed probe never reopens. Stage, dispatch and collect refuse it; cancel and cleanup report
+`already-closed` without appending or taking a writer lock. A leftover lock after a durable close is
+left intact; explicit lock recovery remains restricted to open probes. A create intent whose result
+was lost is reconciled once by retained fixed-ref reads: absence can close inconclusive, while any
+observed presence leaves ownership uncertain and never permits adoption or deletion.
+
 Exit codes follow the commissioning CLI: 1 = a measured failure (an admitted job or a changed ref),
 3 = incomplete (lost answers, a non-204 dispatch response, no eligible run, cancellation, policy
 drift), 2 = usage. No command takes a ref, workflow, URL or environment; there is nothing to point elsewhere.
@@ -1825,7 +1849,7 @@ DELETE. A run still nonterminal two minutes after cancellation blocks cleanup an
 
 **What the journal permits is DERIVED from all of it, not from its newest row.** Both the operator
 and the offline assessment read the probe journal through one shared derivation
-(`assessRefOwnership` / `assessRunContinuity` / `assessSourceContinuity`), so a refusal cannot be walked back by appending
+(`assessProbePhaseState` / `assessRefOwnership` / `assessRunContinuity` / `assessSourceContinuity`), so a refusal cannot be walked back by appending
 something later:
 
 - **A deletion this probe recorded as SUCCESSFUL ends that creation's ownership for good.** If the
