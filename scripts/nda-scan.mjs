@@ -127,10 +127,27 @@ function matchesAnyEre(value, terms) {
   throw new Error("confidential-pattern scan could not run");
 }
 
-function matchingTermSets(values, terms) {
+export function matchingTermSets(values, terms) {
   const sets = values.map(() => new Set());
   if (values.length === 0) return sets;
-  const input = values.join("\n");
+  // grep reports physical input-line numbers, not logical value indexes. Preserve each value's
+  // independent POSIX line semantics while batching by mapping every real physical record back to
+  // its owner. A terminal LF terminates the preceding record; it does not create another empty
+  // record. An empty value has no physical record, matching grep on empty stdin. Appending one final
+  // LF makes a final empty record observable without changing non-empty record matching.
+  const records = [];
+  const recordOwners = [];
+  for (const [valueIndex, value] of values.entries()) {
+    if (value.length === 0) continue;
+    const valueRecords = value.split("\n");
+    if (value.endsWith("\n")) valueRecords.pop();
+    for (const record of valueRecords) {
+      records.push(record);
+      recordOwners.push(valueIndex);
+    }
+  }
+  if (records.length === 0) return sets;
+  const input = `${records.join("\n")}\n`;
   for (const [termIndex, term] of terms.entries()) {
     const result = spawnSync("grep", ["-Ein", "-e", term], {
       input,
@@ -141,8 +158,18 @@ function matchingTermSets(values, terms) {
     if (result.status === 1) continue;
     if (result.status !== 0) throw new Error("confidential-pattern scan could not run");
     for (const line of result.stdout.split("\n").filter(Boolean)) {
-      const valueIndex = Number(line.slice(0, line.indexOf(":"))) - 1;
-      if (sets[valueIndex]) sets[valueIndex].add(termIndex);
+      const separator = line.indexOf(":");
+      const rawLineNumber = separator > 0 ? line.slice(0, separator) : "";
+      if (!/^[1-9]\d*$/.test(rawLineNumber)) throw new Error("confidential-pattern scan could not run");
+      const lineNumber = Number(rawLineNumber);
+      if (!Number.isSafeInteger(lineNumber) || lineNumber > recordOwners.length) {
+        throw new Error("confidential-pattern scan could not run");
+      }
+      const valueIndex = recordOwners[lineNumber - 1];
+      if (!Number.isSafeInteger(valueIndex) || valueIndex < 0 || valueIndex >= sets.length) {
+        throw new Error("confidential-pattern scan could not run");
+      }
+      sets[valueIndex].add(termIndex);
     }
   }
   return sets;

@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseTerms, scan, scanRange } from "@/scripts/nda-scan.mjs";
+import { matchingTermSets, parseTerms, scan, scanRange } from "@/scripts/nda-scan.mjs";
 
 /**
  * The NDA gate must not be able to become decorative.
@@ -60,6 +60,62 @@ describe("guard: the NDA confidentiality gate", () => {
     // Two gates that disagree about what a term IS are worse than one, because the disagreement is
     // only ever discovered by a leak getting through the weaker one.
     expect(parseTerms("# a comment\n\n  spaced  \nterm-two\n#trailing\n")).toEqual(["spaced", "term-two"]);
+  });
+
+  it("maps physical grep records to exact values across empty and newline edge positions", () => {
+    const matches = matchingTermSets(
+      ["", "\nleading", "trailing\n", "trailing\n\n", "multiple\n\nlines", "both ALPHA beta\n"],
+      ["^$", "^leading$", "^trailing$", "^multiple$", "^lines$", "alpha", "beta"]
+    );
+
+    expect(matches.map((indexes) => [...indexes])).toEqual([
+      [],
+      [0, 1],
+      [2],
+      [0, 2],
+      [0, 3, 4],
+      [5, 6],
+    ]);
+  });
+
+  it("fails closed on malformed or out-of-range grep record indexes", () => {
+    const dir = mkdtempSync(join(tmpdir(), "nda-gate-grep-records-"));
+    const previousPath = process.env.PATH;
+    const previousRealGrep = process.env.NDA_TEST_REAL_GREP;
+    const previousMode = process.env.NDA_TEST_GREP_MODE;
+    try {
+      const realGrep = execFileSync("sh", ["-c", "command -v grep"], { encoding: "utf8" }).trim();
+      const grepShim = join(dir, "grep");
+      writeFileSync(
+        grepShim,
+        `#!/bin/sh
+if [ "$NDA_TEST_GREP_MODE" = "malformed" ]; then
+  printf 'not-a-record\n'
+  exit 0
+fi
+if [ "$NDA_TEST_GREP_MODE" = "out-of-range" ]; then
+  printf '2:value\n'
+  exit 0
+fi
+exec "$NDA_TEST_REAL_GREP" "$@"
+`
+      );
+      chmodSync(grepShim, 0o755);
+      process.env.NDA_TEST_REAL_GREP = realGrep;
+      process.env.PATH = `${dir}:${previousPath ?? ""}`;
+
+      process.env.NDA_TEST_GREP_MODE = "malformed";
+      expect(() => matchingTermSets(["value"], ["value"])).toThrow(/scan could not run/i);
+      process.env.NDA_TEST_GREP_MODE = "out-of-range";
+      expect(() => matchingTermSets(["value"], ["value"])).toThrow(/scan could not run/i);
+    } finally {
+      process.env.PATH = previousPath;
+      if (previousRealGrep === undefined) delete process.env.NDA_TEST_REAL_GREP;
+      else process.env.NDA_TEST_REAL_GREP = previousRealGrep;
+      if (previousMode === undefined) delete process.env.NDA_TEST_GREP_MODE;
+      else process.env.NDA_TEST_GREP_MODE = previousMode;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("REDACTS by default — this repo's Actions logs are world-readable", () => {
@@ -223,6 +279,39 @@ describe("guard: the NDA confidentiality gate", () => {
       const pathScrubbed = git("rev-parse", "HEAD").trim();
       expect(scanRange(["SYNTHETICTERM"], `${removed}..${pathAdded}`, { cwd: dir }).length).toBeGreaterThan(0);
       expect(scanRange(["SYNTHETICTERM"], `${pathAdded}..${pathScrubbed}`, { cwd: dir })).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks add-then-scrub history when a newline path precedes a reused matching value", () => {
+    const dir = mkdtempSync(join(tmpdir(), "nda-gate-newline-owner-"));
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8" });
+    const term = "SYNTHETIC[[:space:]]+TERM";
+    try {
+      git("init", "-q");
+      git("config", "user.email", "t@t.local");
+      git("config", "user.name", "t");
+      writeFileSync(join(dir, "legacy.txt"), "SYNTHETIC\nTERM\n");
+      writeFileSync(join(dir, "target.txt"), "SYNTHETIC\n");
+      git("add", ".");
+      git("commit", "-qm", "base");
+      const base = git("rev-parse", "HEAD").trim();
+
+      writeFileSync(join(dir, "legacy.txt"), "safe\n");
+      writeFileSync(join(dir, "a\nb.txt"), "neutral\n");
+      git("add", ".");
+      git("commit", "-qm", "scrub legacy and add newline path");
+      writeFileSync(join(dir, "target.txt"), "SYNTHETIC\nTERM\n");
+      git("commit", "-qam", "publish matching target");
+      writeFileSync(join(dir, "target.txt"), "safe\n");
+      git("commit", "-qam", "scrub matching target");
+
+      expect(scan([term], { cwd: dir })).toEqual([]);
+      const result = run({ NDA_TERMS: term, CI: "true" }, ["--range", `${base}..HEAD`, "--max-commits", "500"], dir);
+      expect(result.code).toBe(1);
+      expect(result.err).toMatch(/BLOCKED/);
+      expect(`${result.out}\n${result.err}`).not.toContain(term);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
