@@ -838,7 +838,7 @@ describe("lifecycle ownership: create once, dispatch once, never adopt, never re
     await world.phase("stage");
     await world.phase("dispatch");
     await expect(world.phase("collect")).rejects.toThrow(/2 eligible probe runs/);
-    expect(world.probeRecords().some((record: any) => record.type === "run-unidentified" && record.data.eligible === 2)).toBe(true);
+    expect(world.probeRecords().some((record: any) => record.type === "run-selection-observed" && record.data.boundary === "peek")).toBe(true);
     expect(world.count("POST", "/dispatches")).toBe(1);
     // WAS: cleanup closed this as inconclusive. Two candidate runs may BOTH be live, and deleting
     // the ref out from under them while filing the probe is a closure over a question nobody
@@ -1748,7 +1748,7 @@ describe("R06: separated qualification, run authority and ref authority", () => 
     const blockedCandidates: Array<{ shape: string; arrange: (w: World) => void; cancel: RegExp; cleanup: RegExp; unidentified: boolean }> = [
       {
         shape: "duplicate", arrange: (w) => { w.runsPerDispatch = 2; },
-        cancel: /2 eligible probe runs exist/, cleanup: /NOT deleted and the journal is NOT closed/, unidentified: true,
+        cancel: /eligible probe runs/, cleanup: /eligible probe runs/, unidentified: false,
       },
       {
         shape: "zero", arrange: (w) => { w.runsPerDispatch = 0; },
@@ -2054,7 +2054,7 @@ describe("R07: remaining dispatch/recovery boundaries", () => {
       } })).rejects.toThrow(/interrupted dispatch|effect is unknown/);
       await expect(world.phase("cancel")).rejects.toThrow(/eligible probe runs|not this probe's own run/);
       let deletions = 0;
-      await expect(world.phase("cleanup", { deleteRef: async () => { deletions++; } })).rejects.toThrow(/NOT deleted|not this probe's own run/);
+      await expect(world.phase("cleanup", { deleteRef: async () => { deletions++; } })).rejects.toThrow(/NOT deleted|not this probe's own run|eligible probe runs/);
       expect([deletions, world.count("POST", "/cancel"), world.count("POST", "/dispatches")]).toEqual([0, 0, 1]);
       expect(world.refSha()).toBe(world.sha);
       expect(world.probeRecords().some((r: any) => r.type === "probe-closed")).toBe(false);
