@@ -72,7 +72,7 @@ import { buildMainRulesets, REQUIRED_MAIN_CONTEXTS, verifyEffectiveMainPolicy } 
  */
 const resolveInstallationTokenHelper = async () => (await import("./release-controller.mjs")).createInstallationToken;
 import {
-  acquireJournalLock, assertPrivateDirectory, openJournal, readJournal, recordWitnessEventOnce,
+  JournalChainError, acquireJournalLock, assertPrivateDirectory, openJournal, readJournal, recordWitnessEventOnce,
   writeJournalSnapshot,
 } from "./commissioning-journal.mjs";
 import {
@@ -6673,10 +6673,17 @@ export function validateEnvironmentControl(record, { dir, key, environment, envi
     if (String(key) !== OFFBRANCH_CONTROL) return `carries the cross-run off-branch marker, which only ${OFFBRANCH_CONTROL} may use`;
     if (record.offbranch_schema_version !== OFFBRANCH_SCHEMA_VERSION) return `declares the off-branch schema version ${JSON.stringify(record.offbranch_schema_version)}, which this build does not know`;
     if (!offbranch) return "is a cross-run off-branch record, but no trusted commissioning context exists to validate it against";
-    return validateOffBranchRecord(record, {
-      dir, environment, environmentId, expected: schema.expected, trusted: offbranch,
-      readProbeJournal: () => readJournal({ dir, runId, attempt, kind: "probe" }),
-    });
+    try {
+      return validateOffBranchRecord(record, {
+        dir, environment, environmentId, expected: schema.expected, trusted: offbranch,
+        readProbeJournal: () => readJournal({ dir, runId, attempt, kind: "probe" }),
+      });
+    } catch (error) {
+      // The offline control API returns a blocker; corrupt/terminal journal history must not
+      // escape as an unclassified process error. Runtime journal reads still refuse directly.
+      if (error instanceof JournalChainError) return `the probe journal is invalid: ${error.message}`;
+      throw error;
+    }
   }
   const status = String(record.status ?? "");
   if (status !== "verified") return `is ${status || "absent"}`;

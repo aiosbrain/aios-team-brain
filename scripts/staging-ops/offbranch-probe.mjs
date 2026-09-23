@@ -1275,7 +1275,8 @@ export function assessProbeLifecycle(records, { dir, intentSha256, intentArtifac
   if (!records.length) refuse("the probe journal is absent or empty");
   checkProbeJournalShape(records);
   const originalFile = path.join(dir, `commissioning-${commissioning.run_id}-${commissioning.attempt}-intent.json`);
-  const stat = lstatSync(originalFile);
+  let stat;
+  try { stat = lstatSync(originalFile); } catch { refuse("the original intent file is absent"); }
   if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_RAW_CAPTURE_BYTES) refuse("the original intent file is not bounded regular evidence");
   const originalIntent = parseJsonBytes(readFileSync(originalFile), "the original trusted intent");
   if (canonicalHash(originalIntent) !== commissioning.intent_sha256) refuse("the original intent no longer matches its authenticated binding");

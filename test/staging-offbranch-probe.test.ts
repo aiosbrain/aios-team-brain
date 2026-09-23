@@ -2302,7 +2302,7 @@ describe("durable close and capture process cuts", () => {
     const forged = { ...last, seq: last.seq + 1, prev: sha256(lastLine), ts: world.now().toISOString(), type: "ref-create-intent", data: { ref: PROBE_REF, sha: world.sha } };
     writeFileSync(file, `${bytes}${JSON.stringify(forged)}\n`);
     await expect(world.phase("cleanup")).rejects.toThrow(/closed/);
-    expect(() => world.validate(collected.records["staging-release"], "staging-release")).toThrow(/closed/);
+    expect(world.validate(collected.records["staging-release"], "staging-release")).toMatch(/probe journal is invalid:.*closed/);
   });
   it("an original numeric identity contradiction remains disqualifying after the provider response restores", async () => {
     world.seedOriginal(); await world.phase("stage");
