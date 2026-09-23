@@ -14,6 +14,7 @@ import {
 } from "../scripts/staging-ops/image-audit/tar-reader.mjs";
 import { mergedFilesystem, whiteoutOf } from "../scripts/staging-ops/image-audit/layers.mjs";
 import { membersThroughSymlink } from "../scripts/staging-ops/image-audit/inspect.mjs";
+import { createRetainedStateBudget, createWorkBudget } from "../scripts/staging-ops/image-audit/budgets.mjs";
 import { buildTar, syntheticSecret } from "./helpers/tar-fixture";
 
 /**
@@ -760,8 +761,8 @@ describe("member paths are bounded before any ancestor work (B9)", () => {
 
   it("refuses when aggregate ancestor work passes an injected budget", () => {
     const paths = Array.from({ length: 10 }, (_, i) => `a/b/c/d/f${i}`);
-    expect(() => mergedFilesystem([paths], { maxAncestorSteps: 20 })).toThrow(expect.objectContaining(limitCode));
-    expect(() => mergedFilesystem([paths], { maxAncestorSteps: 10_000 })).not.toThrow();
+    expect(() => mergedFilesystem([paths], { work: createWorkBudget({ maxSteps: 20 }) })).toThrow(expect.objectContaining(limitCode));
+    expect(() => mergedFilesystem([paths], { work: createWorkBudget({ maxSteps: 10_000 }) })).not.toThrow();
   });
 
   const expiring = (after: number, only?: string) => {
@@ -779,14 +780,14 @@ describe("member paths are bounded before any ancestor work (B9)", () => {
   it("consults the clock INSIDE one path, across paths, and during subtree removal", () => {
     // Inside ONE path: six ancestors, expiry on the third check.
     const one = expiring(3);
-    expect(() => mergedFilesystem([["a/b/c/d/e/f/g"]], { deadline: one, deadlineEvery: 1 })).toThrow(/deadline/);
+    expect(() => mergedFilesystem([["a/b/c/d/e/f/g"]], { work: createWorkBudget({ deadline: one, deadlineEvery: 1 }) })).toThrow(/deadline/);
     expect(one.asked.length).toBe(3);
     // Across paths: one ancestor each, expiry part-way through the list.
     const across = expiring(5);
-    expect(() => mergedFilesystem([Array.from({ length: 20 }, (_, i) => `d/f${i}`)], { deadline: across, deadlineEvery: 1 })).toThrow(/deadline/);
+    expect(() => mergedFilesystem([Array.from({ length: 20 }, (_, i) => `d/f${i}`)], { work: createWorkBudget({ deadline: across, deadlineEvery: 1 }) })).toThrow(/deadline/);
     // During the removal of a whited-out subtree.
     const removal = expiring(2, "merged namespace removal");
-    expect(() => mergedFilesystem([["d/", ...Array.from({ length: 10 }, (_, i) => `d/f${i}`)], ["x", ".wh.d"]], { deadline: removal, deadlineEvery: 1 })).toThrow(/deadline/);
+    expect(() => mergedFilesystem([["d/", ...Array.from({ length: 10 }, (_, i) => `d/f${i}`)], ["x", ".wh.d"]], { work: createWorkBudget({ deadline: removal, deadlineEvery: 1 }) })).toThrow(/deadline/);
   });
 
   it("the symlink-ancestry check consults the clock inside a single path", () => {

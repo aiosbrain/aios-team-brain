@@ -21,6 +21,7 @@ import {
 } from "./layers.mjs";
 import { LAYER_MEDIA_TYPES } from "./subject.mjs";
 import { assertMemberPathBounded } from "./tar-reader.mjs";
+import { createRetainedStateBudget, createWorkBudget } from "./budgets.mjs";
 import {
   copyMemberToFile,
   createStagingBudget,
@@ -97,6 +98,13 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
    * still counts, which is conservative.
    */
   const symlinkLocations = new Set();
+  /**
+   * ONE retained-state authority and ONE work authority for the whole run (B9-R), created before the
+   * first member is inventoried and shared by every layer and the merge, so the ceiling covers
+   * everything held at once rather than each structure in isolation.
+   */
+  const retained = createRetainedStateBudget();
+  const work = createWorkBudget({ deadline });
   const appMembers = [];
   const staged = new Map();
   const buildOutputs = new Map();
@@ -169,17 +177,32 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
     }
     const classified = classifyLayerMember({ rawSha, descriptor, diffId, decode: () => measured });
 
-    const inventory = inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, stagingBudget, deadline });
+    const inventory = inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, stagingBudget, deadline, retained, work });
+    // The cross-layer array of this layer's paths, kept until the merge runs.
+    retained.membership();
     layerPaths.push(inventory.paths);
-    appMembers.push(...inventory.appMembers.map((member) => ({ ...member, layer: layerIndex })));
-    for (const [id, detail] of inventory.staged) staged.set(id, detail);
+    for (const member of inventory.appMembers) {
+      // A COPY with the layer index — its own record, charged before it is built.
+      work.step("app member copy");
+      retained.record(4);
+      retained.string(member.path);
+      appMembers.push({ ...member, layer: layerIndex });
+    }
+    for (const [id, detail] of inventory.staged) {
+      retained.membership();
+      staged.set(id, detail);
+    }
     for (const [category, totals] of Object.entries(inventory.buildOutputs)) {
       const running = buildOutputs.get(category) ?? { files: 0, bytes: 0 };
       buildOutputs.set(category, { files: running.files + totals.files, bytes: running.bytes + totals.bytes });
     }
     limitations.push(...inventory.limitations);
     archiveSurfaceBytes += inventory.archiveSurfaceBytes;
-    for (const link of inventory.symlinks) symlinkLocations.add(link);
+    for (const link of inventory.symlinks) {
+      work.step("symlink location");
+      if (!symlinkLocations.has(link)) retained.path(link);
+      symlinkLocations.add(link);
+    }
     if (symlinkLocations.size > 0 && membersThroughSymlink(inventory.paths, symlinkLocations, deadline)) {
       limitations.push({ kind: "member-through-symlink", layer: layerIndex });
     }
@@ -199,7 +222,7 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
   }
 
   // The run's own clock reaches INSIDE the merge (B9), not only around it.
-  const merged = mergedFilesystem(layerPaths, { deadline });
+  const merged = mergedFilesystem(layerPaths, { deadline, retained, work });
   // Layers whose merged view extractors would not agree on (B6) — each a blocking gap.
   for (const layer of merged.conflicts) limitations.push({ kind: "merged-type-conflict", layer });
   return {

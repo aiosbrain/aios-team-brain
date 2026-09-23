@@ -27,6 +27,7 @@ import { pipeline } from "node:stream/promises";
 import { createGunzip, gunzipSync } from "node:zlib";
 import { TarFormatError, bufferSource, isChecksumValidTarHeader, readTarMembers } from "./tar-reader.mjs";
 import { AUDIT_LIMITS } from "./subject.mjs";
+import { createRetainedStateBudget, createWorkBudget } from "./budgets.mjs";
 import { whiteoutOf } from "./layers.mjs";
 import { ARCHIVE_SURFACE_CATEGORY, CONFIG_SCAN_GROUP, SCAN_HEADER, archiveSurfaceGroup, scanId } from "./scan-surface.mjs";
 
@@ -425,7 +426,16 @@ export function buildOutputCategory(path) {
  * nothing and gets the reviewed defaults; it exists so a test can drive expiry and the partial-file
  * cleanup through THIS code path without staging tens of megabytes.
  */
-export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, prefix = "app/", stagingBudget, deadline, readerTuning = {} }) {
+export function inventoryLayer({
+  layerTarPath, layerIndex, scanDir, limits, prefix = "app/", stagingBudget, deadline, readerTuning = {},
+  /**
+   * The run's RETAINED-STATE and CPU authorities (B9-R), shared with every other layer and the merge.
+   * Everything this layer keeps — each path, symlink, `/app` record, private staged record and
+   * limitation — is charged BEFORE it is stored. Direct callers get finite defaults.
+   */
+  retained = createRetainedStateBudget(),
+  work = createWorkBudget({ deadline }),
+}) {
   const source = fileSource(layerTarPath);
   mkdirSync(join(scanDir, `L${layerIndex}`), { recursive: true });
   const budget = stagingBudget ?? createStagingBudget(limits.maxTotalStagedBytes ?? Number.POSITIVE_INFINITY);
@@ -439,6 +449,12 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
   let sequence = 0;
   let expandedBytes = 0;
   let members = 0;
+  /** Every limitation is retained for the whole run, so each is charged before it is recorded. */
+  const recordLimitation = (limitation) => {
+    retained.record(1);
+    retained.string(limitation.kind);
+    limitations.push(limitation);
+  };
   let malformedWhiteoutRecorded = false;
   let rootReplacedRecorded = false;
 
@@ -473,6 +489,10 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
       throw error;
     }
     sink.close();
+    // The private staged record — id, real name and layer — is retained for the whole run.
+    retained.record(2);
+    retained.string(id);
+    retained.string(name);
     staged.set(id, { name, layer: layerIndex, depth });
     return id;
   };
@@ -543,6 +563,8 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
           const path = join(scanDir, id);
           current = { id, path, sink: openSink(path), bytes: 0 };
           current.sink.write(SCAN_HEADER);
+          retained.record(2);
+          retained.string(id);
           staged.set(id, { category: ARCHIVE_SURFACE_CATEGORY, layer: layerIndex, depth });
         }
         try {
@@ -602,6 +624,9 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
       // THE CANONICAL PATH (B2) is what the inventory, whiteouts, categories and public lookup compare.
       // An unsafe name has none; it keeps its raw spelling here and is recorded as a gap just below.
       const name = member.canonicalName ?? member.name;
+      // Charged before the push, and charged for a root-level name with no ancestors just the same.
+      work.step("layer inventory entry");
+      retained.path(name);
       paths.push(name);
       /**
        * AN UNSAFE NAME IS A GAP, never a silent inventory omission. An absolute, traversing, NUL-bearing
@@ -609,8 +634,11 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
        * simply not be compared — while an extractor may still write it somewhere. Its content is staged
        * and scanned as usual; the record says the inventory could not account for it.
        */
-      if (!member.path.safe) limitations.push({ kind: "unsafe-member-path", layer: layerIndex });
-      if (member.type === "symlink") symlinks.push(name);
+      if (!member.path.safe) recordLimitation({ kind: "unsafe-member-path", layer: layerIndex });
+      if (member.type === "symlink") {
+        retained.path(name);
+        symlinks.push(name);
+      }
       /**
        * A WHITEOUT MARKER THAT IS NOT AN EMPTY REGULAR FILE (B6). OCI permits only that form; extractors
        * still act on a directory-, link- or content-bearing marker by its basename. The merge applies it
@@ -620,7 +648,7 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
       // …and an ordinary marker naming nothing, `.` or `..` (L6), which deletes nothing here.
       if ((whiteout === "malformed" || (whiteout !== "none" && (member.type !== "file" || member.size !== 0))) && !malformedWhiteoutRecorded) {
         malformedWhiteoutRecorded = true;
-        limitations.push({ kind: "malformed-whiteout", layer: layerIndex });
+        recordLimitation({ kind: "malformed-whiteout", layer: layerIndex });
       }
       /**
        * THE INVENTORY ROOT AS A NON-DIRECTORY (B6). A file or link named exactly `app` replaces the
@@ -629,12 +657,15 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
        */
       if (name === prefix.replace(/\/$/, "") && member.type !== "directory" && !rootReplacedRecorded) {
         rootReplacedRecorded = true;
-        limitations.push({ kind: "inventory-root-not-directory", layer: layerIndex });
+        recordLimitation({ kind: "inventory-root-not-directory", layer: layerIndex });
       }
 
       if (member.type === "symlink" || member.type === "hardlink") {
         // Compared AS LINKS. The target is a string here and stays one — nothing resolves it.
         if (name.startsWith(prefix)) {
+          retained.record(3);
+          retained.string(name);
+          retained.string(member.linkTarget);
           appMembers.push({ path: name, type: "symlink", linkTarget: member.linkTarget, sha256: undefined });
         }
         continue;
@@ -688,7 +719,11 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
         break;
       }
       expandedBytes += member.size;
-      if (name.startsWith(prefix)) appMembers.push({ path: name, type: "file", sha256: digest, scratchId: id });
+      if (name.startsWith(prefix)) {
+        retained.record(3);
+        retained.string(name);
+        appMembers.push({ path: name, type: "file", sha256: digest, scratchId: id });
+      }
       else countBuildOutput(name, member.size);
 
       classifyExpanded({
@@ -871,6 +906,9 @@ function expandArchive({ bytes, name, depth, context }) {
     }
   } catch (error) {
     if (error?.code === "STAGING_OPERATION_TIMEOUT") throw error;
+    // A RESOURCE refusal is not a "this archive would not decode" gap: it means the run's own budget is
+    // exhausted, so it propagates to the sanitized run-refusal path instead of becoming a limitation.
+    if (error?.code === "AUDIT_TAR_LIMIT_EXCEEDED") throw error;
     // A nested archive that would not decode is a GAP, not a pass. Only the error's NAME is kept —
     // its message can quote member paths and content.
     limitations.push({ kind: "nested-archive-undecodable", layer: layerIndex, reason: error?.name ?? "Error", ...at });

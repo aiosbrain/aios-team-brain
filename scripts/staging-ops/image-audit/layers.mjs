@@ -21,6 +21,7 @@ import { createHash } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 import { CONFIG_MEDIA_TYPES, LAYER_MEDIA_TYPES, isDigest } from "./subject.mjs";
 import { assertMemberPathBounded } from "./tar-reader.mjs";
+import { createRetainedStateBudget, createWorkBudget } from "./budgets.mjs";
 import { ACCEPTED_MEDIA_TYPES } from "../image-publication.mjs";
 
 export class AuditIdentityError extends Error {
@@ -239,13 +240,15 @@ export function forEachAncestor(key, visit) {
 }
 
 /**
- * The finite AGGREGATE budget for ancestor-index work across every path of every layer (B9). Each
- * ancestor visited costs one step; exceeding the budget refuses the run with the fixed limit code
- * rather than letting the index grow without bound. Real images use a small fraction of it.
+ * The merged view, under the run's TWO authorities (B9-R): `retained` bounds the logical bytes of state
+ * this function keeps (visible, shadowed, the ancestor index, layer-local sets and the B10 ordering
+ * state), and `work` bounds CPU steps and consults the deadline. Direct callers get finite defaults.
  */
-export const MERGE_WORK_LIMITS = Object.freeze({ maxAncestorSteps: 64_000_000, deadlineEvery: 1024 });
-
-export function mergedFilesystem(layerPaths, { deadline, maxAncestorSteps = MERGE_WORK_LIMITS.maxAncestorSteps, deadlineEvery = MERGE_WORK_LIMITS.deadlineEvery } = {}) {
+export function mergedFilesystem(layerPaths, {
+  deadline,
+  retained = createRetainedStateBudget(),
+  work = createWorkBudget({ deadline }),
+} = {}) {
   const visible = new Map();
   const shadowed = [];
   /**
@@ -257,16 +260,7 @@ export function mergedFilesystem(layerPaths, { deadline, maxAncestorSteps = MERG
    */
   const conflicts = new Set();
 
-  /** Bounded work: one step per ancestor visited or key removed, the clock every `deadlineEvery`. */
-  let steps = 0;
-  const step = (operation) => {
-    steps += 1;
-    if (steps > maxAncestorSteps) {
-      throw Object.assign(new Error(`merged-namespace work exceeds the ${maxAncestorSteps}-step bound`), { name: "TarLimitError", code: "AUDIT_TAR_LIMIT_EXCEEDED" });
-    }
-    if (deadline && steps % deadlineEvery === 0) deadline.assert(operation);
-  };
-  const ancestors = (key, visit) => forEachAncestor(key, (ancestor) => { step("merged namespace"); return visit(ancestor); });
+  const ancestors = (key, visit) => forEachAncestor(key, (ancestor) => { work.step("merged namespace"); return visit(ancestor); });
 
   /**
    * THE KEY MODEL. A directory key ends in `/` (canonical directory identity is type-driven, so `app`
@@ -278,34 +272,79 @@ export function mergedFilesystem(layerPaths, { deadline, maxAncestorSteps = MERG
   const beneath = new Map();
   const place = (key, layer) => {
     assertMemberPathBounded(key);
+    work.step("merged namespace placement");
+    // The visible entry itself: its key string and the map membership, charged before the insertion.
+    if (!visible.has(key)) retained.path(key);
     visible.set(key, layer);
     ancestors(key, (ancestor) => {
       let set = beneath.get(ancestor);
-      if (!set) beneath.set(ancestor, (set = new Set()));
+      if (!set) {
+        // A new ancestor container is charged (and stays charged) even if every member later leaves.
+        retained.container(ancestor);
+        beneath.set(ancestor, (set = new Set()));
+      }
+      // A relation is only free when the exact membership is PROVEN to exist already.
+      retained.relation(ancestor, { alreadyMember: set.has(key) });
       set.add(key);
     });
   };
   const remove = (key, removedBy, reason) => {
-    step("merged namespace removal");
+    work.step("merged namespace removal");
     if (!visible.has(key)) return;
+    // The shadow record is retained for the whole run: charge it before pushing.
+    retained.record(2);
+    retained.string(key);
+    retained.string(reason);
     shadowed.push({ path: key, layer: visible.get(key), removedBy, reason });
     visible.delete(key);
     ancestors(key, (ancestor) => { beneath.get(ancestor)?.delete(key); });
   };
-  /** `target` itself, its directory spelling, and everything beneath it — on a segment boundary. */
-  const subtree = (target) => [target, `${target}/`, ...(beneath.get(`${target}/`) ?? [])];
+  /**
+   * `target` itself, its directory spelling, and everything beneath it — on a segment boundary. The
+   * snapshot array is real retained state while it exists, so each member is charged before the copy.
+   */
+  const subtree = (target) => {
+    const out = [target, `${target}/`];
+    retained.membership(2);
+    for (const key of beneath.get(`${target}/`) ?? []) {
+      work.step("merged namespace subtree");
+      retained.membership();
+      out.push(key);
+    }
+    return out;
+  };
   const isDirectoryKey = (key) => key.endsWith("/") || key === ".";
 
   layerPaths.forEach((paths, index) => {
-    for (const name of paths) assertMemberPathBounded(name);
+    for (const name of paths) {
+      // Entry validation is charged work even for a root-level name with no ancestors at all.
+      work.step("merged namespace entry");
+      assertMemberPathBounded(name);
+    }
     // This layer's ordinary entries, and every directory they sit beneath — computed ONCE, before
     // either pass, so both passes and the conflict rules see the same sets whatever the tar order.
-    const entries = paths.filter((name) => whiteoutOf(name).kind === "none");
-    const keys = new Set(entries);
+    const entries = [];
+    for (const name of paths) {
+      work.step("merged namespace filter");
+      if (whiteoutOf(name).kind === "none") {
+        retained.membership();
+        entries.push(name);
+      }
+    }
+    const keys = new Set();
+    for (const key of entries) {
+      work.step("merged namespace key set");
+      if (!keys.has(key)) retained.membership();
+      keys.add(key);
+    }
     const hasDescendantHere = new Set();
-    for (const key of entries) ancestors(key, (ancestor) => { hasDescendantHere.add(ancestor); });
+    for (const key of entries) ancestors(key, (ancestor) => {
+      if (!hasDescendantHere.has(ancestor)) retained.relation(ancestor);
+      hasDescendantHere.add(ancestor);
+    });
     /** Keys THIS layer placed. Anything else visible is lower — no per-layer copy of the whole map. */
     const placedHere = new Set();
+    const rememberPlaced = (key) => { if (!placedHere.has(key)) retained.membership(); placedHere.add(key); };
     const isLower = (key) => visible.has(key) && !placedHere.has(key);
 
     /**
@@ -315,6 +354,7 @@ export function mergedFilesystem(layerPaths, { deadline, maxAncestorSteps = MERG
      */
     for (const name of paths) {
       const white = whiteoutOf(name);
+      work.step("merged namespace marker");
       if (white.kind === "delete") {
         const target = white.target;
         // B8: an ordinary whiteout overlapping this layer's own entry is order-dependent across
@@ -322,9 +362,14 @@ export function mergedFilesystem(layerPaths, { deadline, maxAncestorSteps = MERG
         if (keys.has(target) || keys.has(`${target}/`) || hasDescendantHere.has(`${target}/`)) conflicts.add(index);
         for (const existing of subtree(target)) remove(existing, index, "deleted");
       } else if (white.kind === "opaque") {
-        const children = white.target === ""
-          ? [...visible.keys()].filter((key) => key !== ".")
-          : [...(beneath.get(white.target) ?? [])];
+        const source = white.target === "" ? visible.keys() : (beneath.get(white.target) ?? []);
+        const children = [];
+        for (const key of source) {
+          work.step("merged namespace opaque scan");
+          if (white.target === "" && key === ".") continue;
+          retained.membership();
+          children.push(key);
+        }
         for (const existing of children) remove(existing, index, "opaque-directory");
       }
     }
@@ -341,7 +386,7 @@ export function mergedFilesystem(layerPaths, { deadline, maxAncestorSteps = MERG
         if (isLower(bare) && !isDirectoryKey(bare)) remove(bare, index, "replaced-by-directory");
       } else {
         if (keys.has(`${key}/`) || hasDescendantHere.has(`${key}/`)) conflicts.add(index);
-        for (const existing of [`${key}/`, ...(beneath.get(`${key}/`) ?? [])]) {
+        for (const existing of subtree(key).slice(1)) {
           if (isLower(existing)) remove(existing, index, "replaced-by-non-directory");
         }
       }
@@ -352,7 +397,7 @@ export function mergedFilesystem(layerPaths, { deadline, maxAncestorSteps = MERG
       });
       if (visible.has(key)) remove(key, index, "overwritten");
       place(key, index);
-      placedHere.add(key);
+      rememberPlaced(key);
     }
   });
   return { visible, shadowed, conflicts: Object.freeze([...conflicts].sort((a, b) => a - b)) };
