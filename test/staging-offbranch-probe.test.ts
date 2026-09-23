@@ -643,9 +643,28 @@ describe("provider shape parsers (real-shaped synthetic captures)", () => {
   it("selects exactly the runs created inside [dispatch intent, deadline] from a complete listing", () => {
     const body = { total_count: 1, workflow_runs: [run] };
     const created = Date.parse(run.created_at);
-    expect(selectEligibleRuns([{ page: 1, body }], { dispatchIntentMs: created - 500, deadlineMs: created + 600_000 })).toEqual([String(run.id)]);
-    expect(selectEligibleRuns([{ page: 1, body }], { dispatchIntentMs: created + 1500, deadlineMs: created + 600_000 })).toEqual([]);
-    expect(() => selectEligibleRuns([{ page: 1, body: { total_count: 2, workflow_runs: [run] } }], { dispatchIntentMs: 0, deadlineMs: Infinity })).toThrow(/incomplete/);
+    const identity = { repositoryId: String(REPO_ID), workflowSha: world.sha };
+    expect(selectEligibleRuns([{ page: 1, body }], { dispatchIntentMs: created - 500, deadlineMs: created + 600_000, identity })).toEqual([String(run.id)]);
+    expect(selectEligibleRuns([{ page: 1, body }], { dispatchIntentMs: created + 1500, deadlineMs: created + 600_000, identity })).toEqual([]);
+    expect(() => selectEligibleRuns([{ page: 1, body: { total_count: 2, workflow_runs: [run] } }], { dispatchIntentMs: 0, deadlineMs: Infinity, identity })).toThrow(/incomplete/);
+  });
+
+  it("needs the trusted identity, and refuses an in-window candidate that fails it rather than picking another", () => {
+    const created = Date.parse(run.created_at);
+    const bounds = { dispatchIntentMs: created - 500, deadlineMs: created + 600_000 };
+    const identity = { repositoryId: String(REPO_ID), workflowSha: world.sha };
+    // No trusted identity at all: selection refuses rather than matching on the coarse selector.
+    expect(() => selectEligibleRuns([{ page: 1, body: { total_count: 1, workflow_runs: [run] } }], bounds as any)).toThrow(/trusted commissioning repository/);
+    // One of ours and one foreign, both matching workflow/ref/event/window: nothing is selected.
+    for (const foreign of [
+      { ...run, id: run.id + 1, actor: { id: 12345, login: "someone-else", type: "User" } },
+      { ...run, id: run.id + 1, triggering_actor: { id: 12345, login: "someone-else", type: "User" } },
+      { ...run, id: run.id + 1, run_attempt: 2 },
+      { ...run, id: run.id + 1, repository: { id: 999, full_name: REPO } },
+    ]) {
+      const listing = [{ page: 1, body: { total_count: 2, workflow_runs: [run, { ...foreign, url: `${API}/actions/runs/${foreign.id}`, html_url: `${WEB}/actions/runs/${foreign.id}` }] } }];
+      expect(() => selectEligibleRuns(listing, { ...bounds, identity })).toThrow(/not this probe's own run/);
+    }
   });
 });
 
@@ -1025,7 +1044,12 @@ describe("R04-F1: a run is owned only once its full immutable identity is establ
   it("never adopts a candidate whose attempt or source moved", async () => {
     for (const [mutate, pattern] of [
       [(w: World) => { w.runs[0].attempt = 2; }, /attempt/],
-      [(w: World) => { w.sha = w.otherSha; }, /source SHA|branch|head/],
+      // Only the PROBE run's source moves; the original commissioning attempt is untouched, so the
+      // refusal has to come from the probe run's own identity rather than from the session opening.
+      [(w: World) => {
+        const body = w.runBody.bind(w);
+        w.runBody = ((entry: any) => ({ ...body(entry), head_sha: w.otherSha })) as any;
+      }, /source SHA/],
     ] as Array<[(w: World) => void, RegExp]>) {
       const local = new World();
       try {

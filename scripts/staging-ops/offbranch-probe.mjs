@@ -330,10 +330,19 @@ export function parseActor(value, label) {
 }
 
 /**
- * The probe RUN, from `GET /repos/{repo}/actions/runs/{R}`. Returns the governing projection the
- * terminal re-read must reproduce exactly.
+ * The probe run's IMMUTABLE IDENTITY, established WITHOUT its terminal state.
+ *
+ * Selection, guard binding, recovery and the instant before a cancellation each need to know that a
+ * run is OURS, and none of them can wait for it to be terminal. Keeping this separate from the
+ * refusal parsing below is the whole point (R04-F1): the fixed workflow, ref, event and time window
+ * are a COARSE selector — a run matching all four can still belong to a different dispatcher,
+ * source, repository or attempt, and a cancellation aimed at it mutates somebody else's run.
+ *
+ * Every field here is immutable for the life of a run, so the same check holds while it is queued,
+ * in progress and completed; a rerun moves `run_attempt` and is therefore refused rather than
+ * silently followed.
  */
-export function parseProbeRun(body, { runId, repositoryId, workflowSha }) {
+export function assertProbeRunIdentity(body, { runId, repositoryId, workflowSha }) {
   if (!isPlainObject(body)) refuse("the probe run capture is not an object");
   const id = positiveInt(body.id, "the probe run id");
   if (String(id) !== String(runId)) refuse(`the probe run capture describes run ${id}, not ${runId}`);
@@ -351,17 +360,27 @@ export function parseProbeRun(body, { runId, repositoryId, workflowSha }) {
   const triggeringActor = parseActor(body.triggering_actor, "the probe run triggering actor");
   equalOrRefuse(actor, PROBE_DISPATCHER, "the probe run actor");
   equalOrRefuse(triggeringActor, PROBE_DISPATCHER, "the probe run triggering actor");
-  if (body.status !== "completed") refuse(`the probe run is ${JSON.stringify(body.status)}, not completed`);
-  if (body.conclusion !== "failure") refuse(`the probe run concluded ${JSON.stringify(body.conclusion)}; only a provider refusal (failure) can carry this measurement`);
-  const checkSuiteId = positiveInt(body.check_suite_id, "the probe run check suite id");
   const createdAt = timeOf(body.created_at, "the probe run created_at");
   if (body.url !== `${repoApi()}/actions/runs/${id}`) refuse("the probe run's API URL is not its reconstructed route");
   if (body.html_url !== `${repoWeb()}/actions/runs/${id}`) refuse("the probe run's web URL is not its reconstructed route");
   return {
     run_id: String(id), run_attempt: 1, repository_id: body.repository.id, path: body.path, event: body.event,
     head_branch: body.head_branch, head_sha: body.head_sha, actor, triggering_actor: triggeringActor,
-    status: body.status, conclusion: body.conclusion, check_suite_id: checkSuiteId, created_at: body.created_at, created_ms: createdAt,
+    created_at: body.created_at, created_ms: createdAt,
   };
+}
+
+/**
+ * The probe RUN, from `GET /repos/{repo}/actions/runs/{R}`: its immutable identity PLUS the terminal
+ * state a measurement needs. Returns the governing projection the terminal re-read must reproduce
+ * exactly.
+ */
+export function parseProbeRun(body, { runId, repositoryId, workflowSha }) {
+  const identity = assertProbeRunIdentity(body, { runId, repositoryId, workflowSha });
+  if (body.status !== "completed") refuse(`the probe run is ${JSON.stringify(body.status)}, not completed`);
+  if (body.conclusion !== "failure") refuse(`the probe run concluded ${JSON.stringify(body.conclusion)}; only a provider refusal (failure) can carry this measurement`);
+  const checkSuiteId = positiveInt(body.check_suite_id, "the probe run check suite id");
+  return { ...identity, status: body.status, conclusion: body.conclusion, check_suite_id: checkSuiteId };
 }
 
 /** Parse `check_run_url` into its positive decimal check ID, accepting only the one exact spelling. */
@@ -576,8 +595,16 @@ export function assertPolicyAgreesWithCommissioning(policy, environment) {
 /**
  * Probe-run SELECTION from every page of the fixed workflow-runs listing: exactly one eligible run
  * created inside [dispatch intent, deadline]. Zero or several is never resolved by picking one.
+ *
+ * `identity` is REQUIRED and carries the trusted commissioning repository ID and source SHA
+ * (R04-F1). The window, workflow, ref and event are only a coarse selector; a row that matches all
+ * of them is a CANDIDATE, and a candidate becomes eligible only once its full immutable identity —
+ * repository, source, attempt 1 and the measured dispatcher — is established from the listing's own
+ * bytes. A candidate that fails that check is not quietly dropped in favour of a more convenient
+ * row: it refuses the whole selection, because a run somebody else started on our fixed ref inside
+ * our dispatch window is an ambiguity nobody can resolve by picking.
  */
-export function selectEligibleRuns(pages, { dispatchIntentMs, deadlineMs }) {
+export function selectEligibleRuns(pages, { dispatchIntentMs, deadlineMs, identity }) {
   let total = null;
   const rows = [];
   for (const { page, body } of pages) {
@@ -589,13 +616,24 @@ export function selectEligibleRuns(pages, { dispatchIntentMs, deadlineMs }) {
   }
   if (rows.length !== total) refuse("the run-selection listing is incomplete");
   if (pages.length !== Math.max(1, Math.ceil(total / PAGE_SIZE))) refuse("the run-selection listing was not read to its terminal page");
+  if (!isPlainObject(identity) || !POSITIVE_DECIMAL.test(String(identity.repositoryId ?? "")) || !/^[0-9a-f]{40}$/.test(String(identity.workflowSha ?? ""))) {
+    refuse("probe-run selection needs the trusted commissioning repository identity and source to establish ownership");
+  }
   // Provider times are whole seconds; the intent is floored to its second rather than given any
   // positive allowance. A run the provider dates before that second is not attributable to it.
   const floor = Math.floor(dispatchIntentMs / 1000) * 1000;
-  const eligible = rows.filter((row) => isPlainObject(row) && row.path === PROBE_WORKFLOW_PATH && row.head_branch === PROBE_BRANCH
+  const candidates = rows.filter((row) => isPlainObject(row) && row.path === PROBE_WORKFLOW_PATH && row.head_branch === PROBE_BRANCH
     && row.event === PROBE_EVENT && Number.isFinite(Date.parse(String(row.created_at))) && Date.parse(String(row.created_at)) >= floor
     && Date.parse(String(row.created_at)) <= deadlineMs);
-  return eligible.map((row) => String(row.id));
+  return candidates.map((row) => {
+    try {
+      assertProbeRunIdentity(row, { runId: row.id, repositoryId: identity.repositoryId, workflowSha: identity.workflowSha });
+    } catch (error) {
+      if (!(error instanceof ProbeRefusal)) throw error;
+      refuse(`a run on the fixed probe ref inside this dispatch window is not this probe's own run (${error.message}); nothing is selected and nothing is cancelled`);
+    }
+    return String(row.id);
+  });
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -699,6 +737,57 @@ export function readPolicyDescriptor(dir, ref, { environment, phase }) {
   return { policy, started: Math.min(...intervals.map((entry) => entry.started)), completed: Math.max(...intervals.map((entry) => entry.completed)) };
 }
 
+/**
+ * The probe workflow's REGISTRATION, re-established offline from its retained descriptor and the
+ * RAW provider bytes behind it (R04-F3).
+ *
+ * Mandatory default-branch registration before the original baseline is a sequencing requirement of
+ * the accepted design, so the journal's `workflow_id` / `workflow_state` / `workflow_created_at` /
+ * `source_sha256` are ASSERTIONS THE COLLECTOR MADE, not evidence. This reads the descriptor and
+ * both captures, re-hashes them through {@link readRetained}, decodes the registered source and
+ * requires the reviewed digest, and requires the journal's four values to REPEAT what the bytes
+ * carry. Missing, corrupt, substituted or out-of-order evidence refuses; nothing here is replaced
+ * by another caller-supplied boolean.
+ *
+ * `windowStartMs` is the trusted original commissioning window opening: the workflow must have been
+ * registered at or before it, and both captures must have been taken after it.
+ */
+export function verifyProbeRegistration(dir, record, { windowStartMs }) {
+  const claimed = record?.data ?? {};
+  const descriptor = readDescriptor(dir, assertClosed(claimed.descriptor, ARTIFACT_REF_FIELDS, "the registration descriptor reference"), "the registration descriptor");
+  assertClosed(descriptor, CAPTURE_DESCRIPTORS.registration.fields, "the registration descriptor");
+  if (descriptor.capture_schema_version !== CAPTURE_SCHEMA_VERSION || descriptor.kind !== "registration") refuse("the registration descriptor is not a version-1 registration capture");
+  const workflow = readRaw(dir, assertClosed(descriptor.workflow, RAW_REF_FIELDS, "the registered workflow capture"), "the registered probe workflow", RAW_REF_FIELDS);
+  const source = readRaw(dir, assertClosed(descriptor.source, RAW_REF_FIELDS, "the registered source capture"), "the registered probe workflow source", RAW_REF_FIELDS);
+
+  const registered = workflow.body;
+  if (!isPlainObject(registered)) refuse("the registered probe workflow capture is not an object");
+  const workflowId = positiveInt(registered.id, "the registered probe workflow id");
+  if (registered.path !== PROBE_WORKFLOW_PATH) refuse(`the registered workflow is ${JSON.stringify(registered.path)}, not the fixed probe workflow`);
+  if (registered.state !== "active") refuse(`the retained registration shows the probe workflow ${JSON.stringify(registered.state)}, not active`);
+  const createdMs = timeOf(registered.created_at, "the registered probe workflow created_at");
+
+  const file = source.body;
+  if (!isPlainObject(file) || file.path !== PROBE_WORKFLOW_PATH || file.encoding !== "base64" || typeof file.content !== "string") {
+    refuse("the retained registered source is not a base64 file capture of the fixed probe workflow");
+  }
+  if (sha256(Buffer.from(file.content, "base64")) !== PROBE_WORKFLOW_SHA256) refuse("the retained registered source is not the reviewed probe workflow bytes");
+
+  // The journal may only REPEAT the bytes.
+  if (claimed.workflow_id !== workflowId) refuse("the journal's registered workflow id is not the one the retained response carries");
+  if (claimed.workflow_state !== registered.state) refuse("the journal's registered workflow state is not the one the retained response carries");
+  if (String(claimed.workflow_created_at) !== String(registered.created_at)) refuse("the journal's registration time is not the one the retained response carries");
+  if (claimed.source_sha256 !== PROBE_WORKFLOW_SHA256) refuse("the registered probe workflow is not the reviewed active source");
+
+  // ORDERING, against the trusted original window — registration precedes the commissioning baseline.
+  if (createdMs > windowStartMs) refuse("the probe workflow was registered after the original attempt's baseline window opened");
+  if (Math.min(workflow.started, source.started) < windowStartMs) refuse("the registered workflow capture predates the original commissioning window");
+  return {
+    workflow_id: workflowId, created_ms: createdMs,
+    started: Math.min(workflow.started, source.started), completed: Math.max(workflow.completed, source.completed),
+  };
+}
+
 /** Read and closed-check every probe journal record's payload. */
 export function checkProbeJournalShape(records) {
   for (const record of records) {
@@ -737,7 +826,9 @@ const only = (records, type, label) => {
  * The COMPLETE, RECONCILED lifecycle of the owned probe, from its own verified chain.
  * Returns the facts the observation must agree with. Any gap refuses.
  */
-export function assessProbeLifecycle(records, { intentSha256, intentArtifact, commissioning, workflowSha }) {
+export function assessProbeLifecycle(records, { dir, intentSha256, intentArtifact, commissioning, workflowSha, windowStartMs }) {
+  if (typeof dir !== "string" || !dir) refuse("the probe lifecycle is assessed against retained evidence, so it needs the evidence directory");
+  if (!Number.isFinite(windowStartMs)) refuse("the probe lifecycle is assessed against the trusted original commissioning window");
   if (!records.length) refuse("the probe journal is absent or empty");
   checkProbeJournalShape(records);
   const foreign = records.filter((record) => String(record.source) !== String(workflowSha));
@@ -750,8 +841,8 @@ export function assessProbeLifecycle(records, { intentSha256, intentArtifact, co
   const open = unresolvedProbeIntents(records);
   if (open.length) refuse(`${open.length} probe intent(s) have no result or reconciliation (${open.map((entry) => `${entry.type}#${entry.seq}`).join(", ")})`);
 
-  const registration = only(records, "registration-verified");
-  if (registration.data.source_sha256 !== PROBE_WORKFLOW_SHA256 || registration.data.workflow_state !== "active") refuse("the registered probe workflow is not the reviewed active source");
+  // REGISTRATION is traversed evidence, not a journal assertion (R04-F3).
+  const registration = verifyProbeRegistration(dir, only(records, "registration-verified"), { windowStartMs });
   const automation = only(records, "automation-inspected");
   if (!Array.isArray(automation.data.induced) || automation.data.induced.length) refuse("the probe ref lifecycle was found to induce other automation");
 
@@ -780,8 +871,24 @@ export function assessProbeLifecycle(records, { intentSha256, intentArtifact, co
   if (deadlineMs > dispatchMs + DISPATCH_DEADLINE_MS || deadlineMs < dispatchMs + DISPATCH_DEADLINE_MS - 60_000) {
     refuse("the dispatch deadline is not ten minutes from the durable dispatch intent");
   }
-  const dispatched = only(records, "dispatch-result");
-  if (dispatched.data.response_complete === true && dispatched.data.http_status !== 204) refuse("the provider refused the probe dispatch");
+  // The DISPATCH INTENT owns its own outcome (R04-F2). Normally its result is journaled; when the
+  // process was cut between the durable intent and the provider's answer, the intent is instead
+  // resolved by exactly one reconciliation that found the owned run. That reconciliation is not a
+  // weaker substitute for the 204: the run it points at is separately re-derived below from the
+  // retained listing and the raw run captures — its identity, attempt, source and dispatcher — so
+  // the evidence chain is the run itself rather than an acknowledgement of a request.
+  const results = records.filter((record) => record.type === "dispatch-result");
+  if (results.length > 1) refuse(`the probe journal records ${results.length} dispatch results, not exactly one`);
+  if (results.length === 1) {
+    if (results[0].data.response_complete === true && results[0].data.http_status !== 204) refuse("the provider refused the probe dispatch");
+  } else {
+    const reconciled = records.filter((record) => record.type === "reconciliation" && record.data.of === "dispatch-intent");
+    if (reconciled.length !== 1) refuse(`the probe dispatch has no result and ${reconciled.length} reconciliation(s); exactly one must resolve it`);
+    if (reconciled[0].data.outcome !== "present-unchanged" || reconciled[0].data.object_sha !== workflowSha) {
+      refuse("the interrupted probe dispatch was not reconciled to an owned run at the reviewed source");
+    }
+    if (reconciled[0].seq < dispatch.seq) refuse("the probe dispatch reconciliation precedes the intent it resolves");
+  }
   if (records.some((record) => record.type === "run-unidentified")) refuse("the probe run could not be identified uniquely");
   const identified = only(records, "run-identified");
   if (identified.data.eligible !== 1) refuse("the probe run was not the single eligible run");
@@ -806,7 +913,7 @@ export function assessProbeLifecycle(records, { intentSha256, intentArtifact, co
   if (closed.seq !== records[records.length - 1].seq || closed.data.outcome !== "measured") refuse("the probe journal is not closed as a measured probe");
   const policies = records.filter((record) => record.type === "policy-captured");
   return {
-    run_id: identified.data.run_id, dispatch_ms: dispatchMs, deadline_ms: deadlineMs,
+    run_id: identified.data.run_id, dispatch_ms: dispatchMs, deadline_ms: deadlineMs, registration,
     selection: identified.data.descriptor, cleanup_confirmed_ms: timeOf(lastAbsent.data.measured_at, "the absence readback time"),
     cleanup_intent_ms: timeOf(cleanupIntents[0].ts, "the cleanup intent time"),
     captures: records.filter((record) => record.type === "capture-recorded").map((record) => record.data),
@@ -935,9 +1042,13 @@ export function validateOffBranchRecord(record, { dir, environment, environmentI
     const linkMs = timeOf(link.ts, "the staged link time");
     if (parsedIntent.staged_ms > linkMs) refuse("the probe intent claims to be staged after it was linked");
 
+    const windowStart = Date.parse(window.start);
+    const windowEnd = Date.parse(window.end);
+    if (!Number.isFinite(windowStart) || !Number.isFinite(windowEnd)) refuse("the trusted commissioning window is not a measurable interval");
     const probeRecords = readProbeJournal();
     const lifecycle = assessProbeLifecycle(probeRecords, {
-      intentSha256: observation.probe_intent.sha256, intentArtifact: observation.probe_intent.artifact, commissioning, workflowSha: commissioning.workflow_sha,
+      dir, intentSha256: observation.probe_intent.sha256, intentArtifact: observation.probe_intent.artifact,
+      commissioning, workflowSha: commissioning.workflow_sha, windowStartMs: windowStart,
     });
     if (lifecycle.run_id !== observation.run_id) refuse("the observation's probe run is not the run the probe journal identified");
     // The ownership chain opens after the link, never before it: a pre-existing chain cannot adopt it.
@@ -949,7 +1060,10 @@ export function validateOffBranchRecord(record, { dir, environment, environmentI
     const selection = readDescriptor(dir, lifecycle.selection, "the run-selection descriptor");
     assertClosed(selection, CAPTURE_DESCRIPTORS["run-selection"].fields, "the run-selection descriptor");
     if (selection.capture_schema_version !== CAPTURE_SCHEMA_VERSION || selection.kind !== "run-selection") refuse("the run-selection descriptor is not a version-1 selection capture");
-    const eligible = selectEligibleRuns(readPages(dir, selection.pages, "the run-selection listing"), { dispatchIntentMs: lifecycle.dispatch_ms, deadlineMs: lifecycle.deadline_ms });
+    const eligible = selectEligibleRuns(readPages(dir, selection.pages, "the run-selection listing"), {
+      dispatchIntentMs: lifecycle.dispatch_ms, deadlineMs: lifecycle.deadline_ms,
+      identity: { repositoryId: commissioning.repository_id, workflowSha: commissioning.workflow_sha },
+    });
     if (eligible.length !== 1 || eligible[0] !== observation.run_id) refuse(`the retained run listing shows ${eligible.length} eligible probe run(s); exactly the one observed run is required`);
 
     // THE PROVIDER EVIDENCE, re-parsed; the refusal is DERIVED here, never read.
@@ -988,10 +1102,10 @@ export function validateOffBranchRecord(record, { dir, environment, environmentI
     if (baseline.policy.environment_id !== observation.environment_id) refuse("the staged baseline measured a different numeric environment");
 
     // THE ORIGINAL ORDER, end to end, inside the original run's window.
-    const windowStart = Date.parse(window.start);
-    const windowEnd = Date.parse(window.end);
     const ordered = [
       ["the commissioning window opening", windowStart],
+      ["the registered workflow capture", lifecycle.registration.completed],
+      ["the baseline policy capture start", baseline.started],
       ["the baseline policy capture", baseline.completed],
       ["the probe intent staging", parsedIntent.staged_ms],
       ["the staged link", linkMs],
