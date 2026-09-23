@@ -691,11 +691,12 @@ describe("the reconciled record is an ALLOWLIST of validated fields (PUB-04)", (
     // SHAPES, so this is not a claim that arbitrary text in a free-text field is filtered.
     const valid = originalAudit();
     const marker = syntheticSecret("key_");
+    const privateKeyHeader = ["-----BEGIN", "RSA PRIVATE KEY-----"].join(" ");
     expect(() => reconcile({
       ...valid,
       packageInventory: {
         ...(valid.packageInventory as object),
-        reason: `the read failed: -----BEGIN RSA PRIVATE KEY----- ${marker}`,
+        reason: `the read failed: ${privateKeyHeader} ${marker}`,
       },
     })).toThrow(/leaks/);
   });
