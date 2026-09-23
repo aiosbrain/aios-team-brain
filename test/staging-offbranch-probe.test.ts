@@ -9,7 +9,7 @@
  */
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -356,9 +356,18 @@ describe("the staged probe lifecycle (mock provider — not live proof)", () => 
     const raw = readdirSync(world.dir).filter((name) => name.includes("-offbranch-raw-"));
     expect(raw.length).toBeGreaterThan(10);
     for (const name of raw) {
-      const stat = execFileSync("stat", ["-f", "%Lp", path.join(world.dir, name)], { encoding: "utf8" }).trim();
-      expect(stat).toBe("600");
+      // Node's own mode bits, masked to the permission triplet: `stat -f %Lp` is a BSD/macOS
+      // spelling that GNU coreutils on the CI runner does not accept, and this assertion has to
+      // hold on both.
+      expect((statSync(path.join(world.dir, name)).mode & 0o777).toString(8).padStart(3, "0")).toBe("600");
     }
+    // Create-once, and readable back: a second exclusive create of a retained name is refused, and
+    // the bytes already there are untouched by that refusal.
+    const first = path.join(world.dir, raw[0]);
+    const retained = readFileSync(first);
+    expect(retained.length).toBeGreaterThan(0);
+    expect(() => writeFileSync(first, "overwritten", { flag: "wx", mode: 0o600 })).toThrow(/EEXIST/);
+    expect(readFileSync(first)).toEqual(retained);
   });
 
   it("wires into assessEvidence: an accepted pair raises no off-branch blocker; a forged one does", async () => {
@@ -642,10 +651,16 @@ describe("provider shape parsers (real-shaped synthetic captures)", () => {
 
 describe("the historical September 6 fixture: shape coverage only, never current acceptance", () => {
   const load = (name: string) => readFileSync(path.join(FIXTURE, name));
-  it("is the retained bytes", () => {
+  it("is the retained bytes, with only the two documented removals", () => {
     expect(sha256(load("jobs.json"))).toBe("4723f398b0f0698f63684217232c47e337ae882df75f376182d0d3095d1283c7");
-    expect(sha256(load("check.json"))).toBe("59089a7981d5f9f0016cb5ddfd46d8f2b87a87473a8f1a010e481dee05bc2e7b");
     expect(sha256(load("annotations.json"))).toBe("3a591de07bfbeeb38eb5167bc159070798f6a0d984eb187563e06c5a66395bad");
+    // `check.json` is the retained response minus `app.client_id` — see the fixture README. The
+    // retained original (`59089a79…5bc2e7b`) is unchanged in private evidence; this asserts the
+    // published, sanitized bytes, so a further edit to the public copy fails here.
+    expect(sha256(load("check.json"))).toBe("3dc715b029c18ddf19306399db1f1ecfdfb01fb8594c60e53618db5cc57f4a4a");
+    const check = JSON.parse(load("check.json").toString("utf8"));
+    expect(Object.hasOwn(check.app, "client_id")).toBe(false);
+    expect([check.app.id, check.app.slug, check.app.owner.id]).toEqual([15368, "github-actions", 9919]);
   });
 
   it("passes the isolated shape parser with its true historical subject", () => {
