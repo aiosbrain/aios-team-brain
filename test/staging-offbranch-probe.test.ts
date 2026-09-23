@@ -1582,7 +1582,7 @@ describe("R06: separated qualification, run authority and ref authority", () => 
 
       // Staging is back, and the attempt is still disqualified — but its own run is still its own.
       const cancelled: any = await world.phase("cancel");
-      expect(cancelled.status).toBe("already-terminal");
+      expect(cancelled.status).toBe("cancelled");
       const events = world.probeRecords().map((record: any) => record.type);
       expect(events).toContain("run-identified");
       expect(events).toContain("run-terminal");
@@ -1891,5 +1891,87 @@ describe("R07: explicit public probe lock recovery", () => {
     await expect(recover({ now: () => { if (++reads === 3) throw new Error("append clock failure"); return world.now(); } })).rejects.toThrow(/append clock failure/);
     expect(readLockOwner(world.dir, RUN_ID, ATTEMPT, "probe")).toBeNull();
     expect((await world.phase("cleanup") as any).status).toBe("nothing-owned");
+  });
+});
+
+
+describe("R07: remaining dispatch/recovery boundaries", () => {
+  for (const response of ["missing", "500"]) for (const candidate of ["duplicate", "foreign"]) {
+    it(`refuses ${candidate} candidates after ${response} dispatch through cancel and cleanup`, async () => {
+      world.seedOriginal(); world.neverComplete = true;
+      world.runsPerDispatch = candidate === "duplicate" ? 2 : 1;
+      await world.phase("stage");
+      await expect(world.phase("dispatch", { transport: async (method: string, p: string, body?: unknown) => {
+        const answer = await world.transport(method, p, body);
+        if (method === "POST" && p.endsWith("/dispatches")) {
+          if (candidate === "foreign") world.runs[0].actor = { id: 3, login: "foreign", type: "User" };
+          if (response === "missing") throw new Error("interrupted dispatch");
+          return completedJsonResponse(500, Buffer.from('{}'), createRedactor(), { retainRaw: true });
+        }
+        return answer;
+      } })).rejects.toThrow(/interrupted dispatch|effect is unknown/);
+      await expect(world.phase("cancel")).rejects.toThrow(/eligible probe runs|not this probe's own run/);
+      let deletions = 0;
+      await expect(world.phase("cleanup", { deleteRef: async () => { deletions++; } })).rejects.toThrow(/NOT deleted|not this probe's own run/);
+      expect([deletions, world.count("POST", "/cancel"), world.count("POST", "/dispatches")]).toEqual([0, 0, 1]);
+      expect(world.refSha()).toBe(world.sha);
+      expect(world.probeRecords().some((r: any) => r.type === "probe-closed")).toBe(false);
+    });
+  }
+
+  it("can identify a real applied run after complete 500, without redispatching", async () => {
+    world.seedOriginal(); await world.phase("stage");
+    await expect(world.phase("dispatch", { transport: async (method: string, p: string, body?: unknown) => {
+      const answer = await world.transport(method, p, body);
+      return method === "POST" && p.endsWith("/dispatches")
+        ? completedJsonResponse(500, Buffer.from('{}'), createRedactor(), { retainRaw: true }) : answer;
+    } })).rejects.toThrow(/effect is unknown/);
+    const measured: any = await world.phase("collect");
+    await world.phase("cleanup");
+    expect(world.count("POST", "/dispatches")).toBe(1);
+    for (const environment of ["staging-release", "staging-emergency"]) expect(world.validate(measured.records[environment], environment)).toBeNull();
+  });
+
+  it("recovering a missing create result does not adopt the unknown ref", async () => {
+    world.seedOriginal(); await world.phase("stage");
+    await expect(world.phase("dispatch", { transport: async (method: string, p: string, body?: unknown) => {
+      const result = await world.transport(method, p, body);
+      if (method === "POST" && p.endsWith("/git/refs")) throw new Error("interrupted create result");
+      return result;
+    } })).rejects.toThrow(/interrupted create/);
+    acquireJournalLock({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, kind: "probe", pid: 2147483647, now: world.now });
+    const seen: any[] = [];
+    const recovered = await recoverJournalLock({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, kind: "probe", ownerGone: true, now: world.now,
+      reconcile: async (intent: any) => { seen.push(intent); return { reconciled: true, readback: { present: true } }; } });
+    expect(seen.map((i) => i.kind_of_intent)).toEqual(["ref-create-intent"]);
+    expect(recovered.unresolvedIntentType).toBe("ref-create-intent"); recovered.lock.release();
+    await expect(world.phase("cleanup")).rejects.toThrow(/unresolved probe intent/);
+    expect(world.refSha()).toBe(world.sha);
+    expect(world.count("POST", "/dispatches")).toBe(0);
+  });
+
+  it("recovers an interrupted deletion by exact absence without a second deletion", async () => {
+    world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch"); const measured: any = await world.phase("collect");
+    let deletions = 0;
+    await expect(world.phase("cleanup", { deleteRef: async () => { deletions++; world.setRef(null); throw new Error("interrupted deletion result"); } })).rejects.toThrow(/interrupted deletion/);
+    acquireJournalLock({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, kind: "probe", pid: 2147483647, now: world.now });
+    const seen: any[] = [];
+    const recovered = await recoverJournalLock({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, kind: "probe", ownerGone: true, now: world.now,
+      reconcile: async (intent: any) => { seen.push(intent); return { reconciled: true }; } });
+    expect(seen.map((i) => i.kind_of_intent)).toEqual(["ref-create-intent", "dispatch-intent", "cleanup-intent"]);
+    expect(recovered.unresolvedIntentType).toBe("cleanup-intent"); recovered.lock.release();
+    expect((await world.phase("cleanup", { deleteRef: async () => { deletions++; } }) as any).outcome).toBe("measured");
+    expect(deletions).toBe(1);
+    expect(world.validate(measured.records["staging-release"], "staging-release")).toBeNull();
+  });
+
+  it("does not replace a lock when a later mutation readback stays unresolved", async () => {
+    world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch");
+    const owner = acquireJournalLock({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, kind: "probe", pid: 2147483647, now: world.now });
+    const seen: string[] = [];
+    await expect(recoverJournalLock({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, kind: "probe", ownerGone: true, now: world.now,
+      reconcile: async (intent: any) => { seen.push(intent.kind_of_intent); return { reconciled: intent.kind_of_intent !== "dispatch-intent" }; } })).rejects.toThrow(/could not be reconciled/);
+    expect(seen).toEqual(["ref-create-intent", "dispatch-intent"]);
+    expect(readLockOwner(world.dir, RUN_ID, ATTEMPT, "probe").nonce).toBe(owner.nonce);
   });
 });

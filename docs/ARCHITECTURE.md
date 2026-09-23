@@ -126,6 +126,12 @@ cancellation still run, measurement and acceptance do not. `check-evidence` reac
 `scripts/staging-ops/offbranch-probe.mjs` only for that control key with `offbranch_schema_version: 1`,
 and re-derives the refusal from retained raw run/jobs/check/annotation responses and before/after
 environment policy captures — never from a verdict field. Runbook: `docs/OPS.md` §14.
+The probe retains every complete ref observation and raw run identity observation before using it.
+Cleanup requires a fresh exact-attempt terminal read immediately before lease deletion and final
+closure. Observed recreation, rerun or terminal-state contradiction survives later restoration.
+A missing dispatch result or complete error response plus an empty listing remains unresolved;
+it cannot authorize ref deletion or closure. Probe lock recovery has a separate closed event,
+reconciles all mutation intents, and grants no resource ownership or retry authority.
 
 **What each of those joins actually recomputes** (AIO-1124 defensive correction). `check-evidence` is
 a re-derivation, not a re-reading, so five things it used to accept as declarations are now rebuilt

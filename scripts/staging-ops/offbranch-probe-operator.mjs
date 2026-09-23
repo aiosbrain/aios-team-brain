@@ -782,6 +782,7 @@ export async function runCollect({ runId, attempt, evidenceDir, env, deps }) {
 
     // THE ORIGINAL PROVIDER RESPONSES, retained byte-for-byte.
     const runInitial = await rawCapture(session, `/repos/${REPO}/actions/runs/${probeRunId}`, "the probe run");
+    probe.append("run-observed", { run_id: probeRunId, boundary: "read", capture: runInitial.ref });
     const jobs = await pagedCapture(session, `/repos/${REPO}/actions/runs/${probeRunId}/jobs?filter=all`, "jobs", "the probe jobs");
     const jobsDescriptor = writeDescriptor(session, { capture_schema_version: CAPTURE_SCHEMA_VERSION, kind: "jobs", pages: jobs.pages });
     const jobRows = jobs.pages.flatMap((ref) => JSON.parse(readFileSync(path.join(session.dir, ref.artifact), "utf8")).jobs ?? []);
@@ -801,6 +802,7 @@ export async function runCollect({ runId, attempt, evidenceDir, env, deps }) {
       });
     }
     const runTerminal = await rawCapture(session, `/repos/${REPO}/actions/runs/${probeRunId}`, "the probe run re-read");
+    probe.append("run-observed", { run_id: probeRunId, boundary: "read", capture: runTerminal.ref });
     const runDescriptor = writeDescriptor(session, { capture_schema_version: CAPTURE_SCHEMA_VERSION, kind: "run", initial: runInitial.ref, terminal: runTerminal.ref });
     const capturedAt = session.now().toISOString();
     probe.append("capture-recorded", { kind: "run", environment: null, descriptor: runDescriptor, completed_at: capturedAt });
