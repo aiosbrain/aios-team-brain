@@ -838,13 +838,17 @@ describe("lifecycle ownership: create once, dispatch once, never adopt, never re
     await world.phase("stage");
     await world.phase("dispatch");
     await expect(world.phase("collect")).rejects.toThrow(/2 eligible probe runs/);
-    expect(world.probeRecords().some((record: any) => record.type === "run-selection-observed" && record.data.boundary === "peek")).toBe(true);
+    const rejected = world.probeRecords().find((record: any) => record.type === "run-selection-observed" && record.data.boundary === "peek");
+    expect(rejected).toBeTruthy();
+    expect(JSON.parse(readFileSync(path.join(world.dir, rejected.data.capture.artifact), "utf8")).workflow_runs).toHaveLength(2);
     expect(world.count("POST", "/dispatches")).toBe(1);
     // WAS: cleanup closed this as inconclusive. Two candidate runs may BOTH be live, and deleting
     // the ref out from under them while filing the probe is a closure over a question nobody
     // answered (R06). It is blocked, and the evidence is kept for root reconciliation.
-    await expect(world.phase("cleanup")).rejects.toThrow(/NOT deleted and the journal is NOT closed/);
+    await expect(world.phase("cleanup")).rejects.toThrow(/eligible probe runs/);
     expect(world.refSha()).toBe(world.sha);
+    expect(world.count("POST", "/cancel")).toBe(0);
+    expect(world.probeRecords().some((record: any) => record.type === "cleanup-intent" || record.type === "probe-closed")).toBe(false);
   });
 
   for (const contradiction of ["attempt", "actor", "source"] as const) {
