@@ -5,7 +5,7 @@ import { crc32, gzipSync } from "node:zlib";
 import { afterAll, describe, expect, it } from "vitest";
 import { AUDIT_LIMITS } from "../scripts/staging-ops/image-audit/subject.mjs";
 import { createStagingBudget, inventoryLayer } from "../scripts/staging-ops/image-audit/export-walk.mjs";
-import { createRetainedStateBudget } from "../scripts/staging-ops/image-audit/budgets.mjs";
+import { createRetainedStateBudget, createWorkBudget } from "../scripts/staging-ops/image-audit/budgets.mjs";
 import { SCAN_HEADER, archiveSurfaceGroup } from "../scripts/staging-ops/image-audit/scan-surface.mjs";
 import { transitionReadiness } from "../scripts/staging-ops/image-audit/evidence.mjs";
 import { compareInventory, expectedInventory, inventorySummary } from "../scripts/staging-ops/image-audit/expected-tree.mjs";
@@ -1262,5 +1262,170 @@ describe("expiry and partial output go through the production error path (AC-AUD
       readerTuning: { chunkBytes: 256, deadlineEveryBytes: 1024 },
     });
     expect(asked.filter((operation) => operation === "tar member content").length).toBeGreaterThanOrEqual(3);
+  });
+});
+
+/**
+ * ROUND 9 — every limitation family is charged, and the authorities grow with the work.
+ *
+ * The exact-d89 probe found 300 nested limitation records costing 0 bytes and 1 work step: the charged
+ * writer was used by three call sites out of nineteen, and the recursive context carried neither
+ * authority. Each family below must therefore show BOTH counters growing with the number of gaps, and
+ * must refuse under a small ceiling.
+ */
+describe("every limitation family is charged against the shared authorities (round 9)", () => {
+  const runLayer = (members: Parameters<typeof buildTar>[0], limits: Partial<typeof AUDIT_LIMITS> = {}, ceiling?: number) => {
+    const dir = pool.make();
+    const layerTarPath = join(dir, "layer.tar");
+    writeFileSync(layerTarPath, buildTar(members));
+    const retained = createRetainedStateBudget(ceiling === undefined ? {} : { maxLogicalBytes: ceiling });
+    const work = createWorkBudget({});
+    const result = inventoryLayer({
+      layerTarPath, layerIndex: 0, scanDir: join(dir, "scan"),
+      limits: { ...AUDIT_LIMITS, ...limits }, stagingBudget: createStagingBudget(), retained, work,
+    });
+    return { retained, work, result, dir };
+  };
+
+  const families: [string, (count: number) => Parameters<typeof buildTar>[0], Partial<typeof AUDIT_LIMITS>, string][] = [
+    ["unsupported member types", (n) => Array.from({ length: n }, (_, i) => ({ name: `app/odd${i}`, content: "x", rawTypeflag: "M" })), {}, "unsupported-member-type"],
+    ["unsafe member paths", (n) => Array.from({ length: n }, (_, i) => ({ name: `/abs${i}.js`, content: "x" })), {}, "unsafe-member-path"],
+    ["unexpandable formats", (n) => Array.from({ length: n }, (_, i) => ({ name: `app/pkg${i}.zip`, content: "PK\u0003\u0004zip" })), {}, "unexpanded-archive-format"],
+    ["oversized members", (n) => Array.from({ length: n }, (_, i) => ({ name: `app/big${i}.bin`, content: "y".repeat(600) })), { maxMemberBytes: 100 }, "oversized-member"],
+    ["nested decode failures", (n) => Array.from({ length: n }, (_, i) => ({ name: `app/broken${i}.tgz`, content: gzipSync(Buffer.from("not a tar at all")) })), {}, "nested-archive-undecodable"],
+    ["nested depth limits", (n) => Array.from({ length: n }, (_, i) => ({ name: `app/outer${i}.tgz`, content: gzipSync(buildTar([{ name: "inner.tgz", content: gzipSync(buildTar([{ name: "deep.txt", content: "d" }])) }])) })), {}, "nested-archive-depth-limit"],
+    ["nested unsupported members", (n) => Array.from({ length: n }, (_, i) => ({ name: `app/odd${i}.tgz`, content: gzipSync(buildTar([{ name: "weird", content: "x", rawTypeflag: "M" }])) })), {}, "unsupported-member-type"],
+  ];
+
+  for (const [label, members, limits, kind] of families) {
+    it(`${label}: charge and work grow with the gaps, and a small ceiling refuses`, () => {
+      const few = runLayer(members(2), limits);
+      const many = runLayer(members(20), limits);
+      expect(few.result.limitations.filter((l: { kind: string }) => l.kind === kind).length).toBeGreaterThan(0);
+      expect(many.result.limitations.length).toBeGreaterThan(few.result.limitations.length);
+      // BOTH authorities move. A zero here is exactly the probe the review ran.
+      expect(many.retained.used).toBeGreaterThan(few.retained.used);
+      expect(many.work.steps).toBeGreaterThan(few.work.steps);
+      // …and the same workload refuses under a ceiling the small case fits inside.
+      expect(() => runLayer(members(20), limits, few.retained.used)).toThrow(expect.objectContaining({ code: "AUDIT_TAR_LIMIT_EXCEEDED" }));
+    });
+  }
+
+  it("EVERY nested entry is charged work, not only the ones that record a gap", () => {
+    const withInner = (count: number) => {
+      const inner = buildTar(Array.from({ length: count }, (_, i) => ({ name: `inner/f${i}.txt`, content: "i" })));
+      return runLayer([{ name: "app/pkg.tgz", content: gzipSync(inner) }]);
+    };
+    const one = withInner(1);
+    const many = withInner(50);
+    // Each nested member costs BOTH an entry step and a classification step; charging only one of the
+    // two halves this difference.
+    expect(many.work.steps - one.work.steps).toBeGreaterThanOrEqual(2 * 49);
+  });
+
+  it("a non-zero trailer's gap is charged too", () => {
+    const clean = runLayer([{ name: "app/a.js", content: "a" }]);
+    const dir = pool.make();
+    const layerTarPath = join(dir, "layer.tar");
+    writeFileSync(layerTarPath, Buffer.concat([buildTar([{ name: "app/a.js", content: "a" }]), Buffer.from("PK\u0003\u0004")]));
+    const retained = createRetainedStateBudget();
+    const trailed = inventoryLayer({
+      layerTarPath, layerIndex: 0, scanDir: join(dir, "scan"), limits: AUDIT_LIMITS,
+      stagingBudget: createStagingBudget(), retained, work: createWorkBudget({}),
+    });
+    expect(trailed.limitations).toContainEqual({ kind: "archive-trailer-nonzero", layer: 0 });
+    expect(retained.used).toBeGreaterThan(clean.retained.used);
+  });
+});
+
+/** ROUND 9 — a refused reservation must leave NOTHING behind: no file, no header, no map entry. */
+describe("staging reserves before any side effect (round 9)", () => {
+  const stagedFiles = (scanDir: string) => { try { return scanFilesUnder(scanDir); } catch { return []; } };
+
+  const refuseAt = (ceiling: number, members: Parameters<typeof buildTar>[0]) => {
+    const dir = pool.make();
+    const layerTarPath = join(dir, "layer.tar");
+    writeFileSync(layerTarPath, buildTar(members));
+    const scanDir = join(dir, "scan");
+    let thrown: unknown;
+    try {
+      inventoryLayer({
+        layerTarPath, layerIndex: 0, scanDir, limits: AUDIT_LIMITS, stagingBudget: createStagingBudget(),
+        retained: createRetainedStateBudget({ maxLogicalBytes: ceiling }), work: createWorkBudget({}),
+      });
+    } catch (error) { thrown = error; }
+    return { thrown, scanDir };
+  };
+
+  /**
+   * A budget that refuses at an EXACT reservation, so each staging path can be refused on its own. It
+   * delegates every charge to a real budget, then throws on the chosen `record()` call.
+   */
+  const refuseOnRecord = (nth: number) => {
+    const real = createRetainedStateBudget();
+    let records = 0;
+    return new Proxy(real, {
+      get(target, property, receiver) {
+        if (property !== "record") return Reflect.get(target, property, receiver);
+        return (fields?: number) => {
+          records += 1;
+          if (records === nth) throw Object.assign(new Error("refused"), { code: "AUDIT_TAR_LIMIT_EXCEEDED" });
+          return target.record(fields);
+        };
+      },
+    });
+  };
+
+  const runWith = (retained: ReturnType<typeof createRetainedStateBudget>, members: Parameters<typeof buildTar>[0]) => {
+    const dir = pool.make();
+    const layerTarPath = join(dir, "layer.tar");
+    writeFileSync(layerTarPath, buildTar(members));
+    const scanDir = join(dir, "scan");
+    let thrown: unknown;
+    try {
+      inventoryLayer({
+        layerTarPath, layerIndex: 0, scanDir, limits: AUDIT_LIMITS,
+        stagingBudget: createStagingBudget(), retained, work: createWorkBudget({}),
+      });
+    } catch (error) { thrown = error; }
+    return { thrown, scanDir };
+  };
+
+  it("a refused MEMBER record opens no file at all", () => {
+    // Reservation order for one member: the surface range's record, then the member's. Refusing the
+    // SECOND one lands exactly on the member staging path.
+    const { thrown, scanDir } = runWith(refuseOnRecord(2), [{ name: "app/a.js", content: "a" }]);
+    expect(thrown).toMatchObject({ code: "AUDIT_TAR_LIMIT_EXCEEDED" });
+    const memberFiles = stagedFiles(scanDir).filter((path) => !path.includes(`${archiveSurfaceGroup(0)}/`));
+    expect(memberFiles).toEqual([]);
+  });
+
+  it("a refused SURFACE record leaves no header-only file", () => {
+    // The FIRST record reservation is the surface range's: refusing it must open nothing either.
+    const direct = runWith(refuseOnRecord(1), [{ name: "app/a.js", content: "a" }]);
+    expect(direct.thrown).toMatchObject({ code: "AUDIT_TAR_LIMIT_EXCEEDED" });
+    expect(stagedFiles(direct.scanDir)).toEqual([]);
+    // …and the same through the ordinary ceiling path.
+    const { thrown, scanDir } = refuseAt(100, [{ name: "app/a.js", content: "a" }]);
+    expect(thrown).toMatchObject({ code: "AUDIT_TAR_LIMIT_EXCEEDED" });
+    for (const path of stagedFiles(scanDir)) expect(readFileSync(path).length).toBeGreaterThan(SCAN_HEADER.length);
+    expect(stagedFiles(join(scanDir, archiveSurfaceGroup(0)))).toEqual([]);
+  });
+});
+
+/** ROUND 9 — a nested READER limit is still a gap; only the run's own authority escapes. */
+describe("nested reader limits keep their gap semantics (round 9)", () => {
+  it("a 129-segment path inside a nested archive records nested-archive-undecodable", async () => {
+    const deep = `${Array.from({ length: 129 }, (_, i) => `s${i}`).join("/")}/x.js`;
+    const nested = gzipSync(buildTar([{ name: deep, content: "x", paxLongName: true }]));
+    const result = await inspectLayers([buildTar([{ name: "app/pkg.tgz", content: nested }])]);
+    expect(result.coverage.limitations).toContainEqual({ kind: "nested-archive-undecodable", layer: 0, reason: "TarLimitError", depth: 1 });
+    expect(result.coverage.complete).toBe(false);
+  });
+
+  it("a top-level 129-segment path still refuses the whole run", async () => {
+    const deep = `${Array.from({ length: 129 }, (_, i) => `s${i}`).join("/")}/x.js`;
+    await expect(inspectLayers([buildTar([{ name: deep, content: "x", paxLongName: true }])]))
+      .rejects.toMatchObject({ code: "AUDIT_TAR_LIMIT_EXCEEDED" });
   });
 });

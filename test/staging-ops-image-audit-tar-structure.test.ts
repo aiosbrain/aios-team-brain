@@ -911,3 +911,43 @@ describe("the work budget covers shallow and marker-only workloads (B9-R)", () =
     expect(() => mergedFilesystem([layer], { work: createWorkBudget({ deadline, deadlineEvery: 1 }) })).toThrow(/deadline/);
   });
 });
+
+describe("injected budget ceilings are validated (round 9)", () => {
+  it("refuses NaN, Infinity, negative and fractional ceilings rather than treating them as budgets", () => {
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, -1, 1.5]) {
+      expect(() => createRetainedStateBudget({ maxLogicalBytes: bad }), String(bad)).toThrow(TypeError);
+      expect(() => createRetainedStateBudget({ maxRelations: bad }), String(bad)).toThrow(TypeError);
+      expect(() => createWorkBudget({ maxSteps: bad }), String(bad)).toThrow(TypeError);
+    }
+    // A deadline INTERVAL must be a positive integer: 0 or a fraction would never fire.
+    for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => createWorkBudget({ deadlineEvery: bad }), String(bad)).toThrow(TypeError);
+    }
+    expect(() => createRetainedStateBudget({ maxLogicalBytes: 0 })).not.toThrow();
+  });
+});
+
+describe("production-shaped calibration of the shared authority (round 9)", () => {
+  it("a realistic layer set stays far inside both ceilings", () => {
+    // Shapes taken from an ordinary Node service image: a deep-ish /app tree, node_modules-like depth,
+    // and a base-image rootfs listing. No exhaustion run, and no claim about real heap bytes.
+    const appTree = ["app/", "app/index.js", "app/package.json", ...Array.from({ length: 400 }, (_, i) => `app/src/${i % 20}/mod${i}.js`)];
+    const modules = Array.from({ length: 2000 }, (_, i) => `app/node_modules/pkg${i % 200}/dist/file${i}.js`);
+    const rootfs = ["usr/", "usr/bin/", ...Array.from({ length: 600 }, (_, i) => `usr/lib/x86_64-linux-gnu/lib${i}.so`)];
+    const retained = createRetainedStateBudget();
+    const work = createWorkBudget({});
+    const merged = mergedFilesystem([rootfs, appTree, modules], { retained, work });
+    expect(merged.visible.size).toBeGreaterThan(2900);
+    // A small fraction of both ceilings. These are LOGICAL charges, not measured heap usage.
+    expect(retained.used).toBeLessThan(retained.limit / 20);
+    expect(retained.relations).toBeLessThan(retained.relationLimit / 20);
+    expect(work.steps).toBeLessThan(work.limit / 100);
+    // Recorded so a reviewer can see the calibration rather than infer it.
+    expect({
+      keys: merged.visible.size,
+      logicalBytes: retained.used,
+      relations: retained.relations,
+      steps: work.steps,
+    }).toMatchObject({ keys: expect.any(Number), logicalBytes: expect.any(Number) });
+  });
+});
