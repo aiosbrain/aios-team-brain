@@ -1452,13 +1452,20 @@ export function assessProbeLifecycle(records, { dir, intentSha256, intentArtifac
   if (created.seq < create.seq || created.data.http_status !== 201 || created.data.response_complete !== true || created.data.object_sha !== workflowSha) {
     refuse("the probe ref's creation is not a complete 201 at the reviewed source; ownership is not established");
   }
-  const readback = records.find((record) => record.type === "ref-readback" && record.seq > created.seq);
-  if (!readback || readback.data.http_status !== 200 || readback.data.response_complete !== true || readback.data.object_sha !== workflowSha) {
-    refuse("the created probe ref has no complete readback at the reviewed source");
-  }
   const dispatch = only(records, "dispatch-intent");
   equalOrRefuse({ workflow_file: dispatch.data.workflow_file, ref: dispatch.data.ref }, { workflow_file: PROBE_WORKFLOW_FILE, ref: PROBE_BRANCH }, "the probe dispatch intent");
-  if (dispatch.seq < readback.seq) refuse("the probe was dispatched before its ref was read back");
+  // Creation and dispatch are immutable once-only bindings. Readbacks are replayable observations:
+  // an incomplete read decides nothing, while a complete contradiction remains sticky. Select a
+  // matching pre-dispatch observation only when the cumulative history through that exact row still
+  // proves the original complete-201 ownership. A later match therefore cannot erase a prior 404,
+  // changed SHA or uncertain creation, and a post-dispatch/cleanup read can never qualify the launch.
+  const readback = records.find((record, index) => record.type === "ref-readback"
+    && record.seq > created.seq && record.seq < dispatch.seq
+    && record.data.ref === PROBE_REF
+    && record.data.http_status === 200 && record.data.response_complete === true
+    && record.data.object_sha === workflowSha
+    && assessRefOwnership(records.slice(0, index + 1), { workflowSha }).may_delete);
+  if (!readback) refuse("the created probe ref has no complete authenticated readback at the reviewed source before dispatch");
   const dispatchMs = timeOf(dispatch.ts, "the dispatch intent time");
   // The operator computes the deadline from its clock read immediately BEFORE the durable append, so
   // it can only be at or before ten minutes from the record's own time — never later. The stricter

@@ -355,6 +355,49 @@ describe("the staged probe lifecycle (mock provider — not live proof)", () => 
     expect(links[0].data.intent_artifact).toBe(probeIntentName(RUN_ID, ATTEMPT));
   });
 
+  it("accepts a complete-201 creation after its first readback times out and a bounded pre-dispatch read proves continuous ownership", async () => {
+    world.seedOriginal();
+    await world.phase("stage");
+    let loseFirstCreatedRead = true;
+    const interruptedReadback = async (method: string, requestPath: string, body?: unknown) => {
+      if (method === "GET" && loseFirstCreatedRead && world.refSha() === world.sha
+        && requestPath === `/repos/${REPO}/git/ref/heads/${PROBE_BRANCH}`) {
+        loseFirstCreatedRead = false;
+        world.calls.push({ method, path: requestPath, body });
+        return incompleteResponse("transport-timeout");
+      }
+      return world.transport(method, requestPath, body);
+    };
+    await expect(world.phase("dispatch", { transport: interruptedReadback })).rejects.toThrow(/could not be read back/);
+    expect([world.count("POST", "/git/refs"), world.count("POST", "/dispatches")]).toEqual([1, 0]);
+
+    await world.phase("dispatch");
+    const collected: any = await world.phase("collect");
+    let deletions = 0;
+    const cleaned: any = await world.phase("cleanup", { deleteRef: async () => {
+      deletions += 1;
+      world.setRef(null);
+      return { outcome: "deleted", exit_code: 0 };
+    } });
+    const records = world.probeRecords();
+    const created = records.find((record: any) => record.type === "ref-create-result");
+    const dispatch = records.find((record: any) => record.type === "dispatch-intent");
+    const readbacks = records.filter((record: any) => record.type === "ref-readback" && record.seq > created.seq && record.seq < dispatch.seq);
+    expect(readbacks.map((record: any) => [record.data.response_complete, record.data.http_status, record.data.object_sha]))
+      .toEqual([[false, 0, null], [true, 200, world.sha]]);
+    expect([collected.status, cleaned.outcome, world.count("POST", "/git/refs"), world.count("POST", "/dispatches"), deletions])
+      .toEqual(["measured", "measured", 1, 1, 1]);
+    expect(world.refSha()).toBeNull();
+    for (const environment of Object.keys(ENV_IDS)) expect(world.validate(collected.records[environment], environment)).toBeNull();
+
+    writeEvidenceFile(world.dir, evidenceSlug(RUN_ID, ATTEMPT, "environment"), {
+      schema_version: 1, phase: "environment-controls", run_id: RUN_ID, attempt: ATTEMPT,
+      controls: { [OFFBRANCH_CONTROL]: collected.records },
+    });
+    const blockers = assessEvidence({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, now: () => new Date(world.clock + 1000) }).blockers;
+    expect(blockers.filter((entry: any) => entry.detail.includes(OFFBRANCH_CONTROL))).toEqual([]);
+  });
+
   it("retains the provider's exact bytes, create-once at mode 0600", async () => {
     await world.fullProbe();
     const raw = readdirSync(world.dir).filter((name) => name.includes("-offbranch-raw-"));
