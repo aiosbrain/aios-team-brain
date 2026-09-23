@@ -340,6 +340,38 @@ const rewriteProbeJournal = (target: World, mutate: (records: any[]) => void) =>
   writeFileSync(journalPath(target.dir, RUN_ID, ATTEMPT, "probe"), `${lines.join("\n")}\n`);
 };
 
+const truncateProbeJournalAfter = (target: World, predicate: (record: any) => boolean) => {
+  const file = journalPath(target.dir, RUN_ID, ATTEMPT, "probe");
+  const lines = readFileSync(file, "utf8").trimEnd().split("\n");
+  const index = lines.findIndex((line) => predicate(JSON.parse(line)));
+  expect(index).toBeGreaterThanOrEqual(0);
+  writeFileSync(file, `${lines.slice(0, index + 1).join("\n")}\n`, { mode: 0o600 });
+};
+
+/** Rewrite one already-authenticated policy observation and every journal reference to it. */
+const rewriteObservedPolicy = (target: World, phase: "before" | "after", environment: string, mutate: (settings: any) => void) => {
+  const observed = target.probeRecords().find((row: any) => row.type === "policy-observed" && row.data.phase === phase && row.data.environment === environment);
+  expect(observed).toBeDefined();
+  const descriptorFile = path.join(target.dir, observed.data.descriptor.artifact);
+  const descriptor = JSON.parse(readFileSync(descriptorFile, "utf8"));
+  const settingsFile = path.join(target.dir, descriptor.settings.artifact);
+  const settings = JSON.parse(readFileSync(settingsFile, "utf8"));
+  mutate(settings);
+  const settingsBytes = Buffer.from(JSON.stringify(settings, null, 2), "utf8");
+  writeFileSync(settingsFile, settingsBytes, { mode: 0o600 });
+  descriptor.settings.sha256 = sha256(settingsBytes);
+  const descriptorBytes = Buffer.from(`${JSON.stringify(descriptor, null, 2)}\n`, "utf8");
+  writeFileSync(descriptorFile, descriptorBytes, { mode: 0o600 });
+  const descriptorHash = sha256(descriptorBytes);
+  rewriteProbeJournal(target, (records) => {
+    for (const row of records.filter((entry: any) => ["policy-observed", "policy-captured"].includes(entry.type)
+      && entry.data.phase === phase && entry.data.environment === environment)) {
+      row.data.descriptor.sha256 = descriptorHash;
+      if (row.type === "policy-captured") row.data.environment_id = String(settings.id);
+    }
+  });
+};
+
 let world: World;
 beforeEach(() => { world = new World(); });
 afterEach(() => { rmSync(world.root, { recursive: true, force: true }); });
@@ -491,6 +523,94 @@ describe("the staged probe lifecycle (mock provider — not live proof)", () => 
     const blockers = assessEvidence({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT }).blockers.filter((entry: any) => entry.detail.includes(OFFBRANCH_CONTROL));
     expect(blockers).toHaveLength(1);
     expect(blockers[0].kind).toBe("unverified");
+  });
+
+  for (const environment of Object.keys(ENV_IDS)) {
+    it(`keeps a complete ${environment} policy contradiction failed after provider restoration and cleans the owned ref once`, async () => {
+      world.seedOriginal(); await world.phase("stage");
+      world.canAdminsBypass[environment] = true;
+      await expect(world.phase("dispatch")).rejects.toThrow(/lets administrators bypass/);
+      const observed = world.probeRecords().filter((row: any) => row.type === "policy-observed" && row.data.environment === environment);
+      expect(observed).toHaveLength(1);
+      world.canAdminsBypass[environment] = false;
+      await expect(world.phase("dispatch")).rejects.toThrow(/cumulative history interrupted or ended qualification/);
+      let deletions = 0;
+      const cleaned: any = await world.phase("cleanup", { deleteRef: async () => {
+        deletions++; world.setRef(null); return { outcome: "deleted", exit_code: 0 };
+      } });
+      expect([cleaned.outcome, world.count("POST", "/git/refs"), world.count("POST", "/dispatches"), deletions])
+        .toEqual(["failed", 1, 0, 1]);
+      expect(world.refSha()).toBeNull();
+    });
+
+    it(`does not adopt an orphan ${environment} policy descriptor after a cut before policy-observed`, async () => {
+      world.seedOriginal(); await world.phase("stage");
+      world.canAdminsBypass[environment] = undefined;
+      await expect(world.phase("dispatch")).rejects.toThrow(/bypass state is unmeasured/);
+      const intent = world.probeRecords().find((row: any) => row.type === "policy-capture-intent" && row.data.environment === environment);
+      expect(intent).toBeDefined();
+      truncateProbeJournalAfter(world, (row) => row.seq === intent.seq);
+      expect(readdirSync(world.dir).some((name) => name.includes("-offbranch-desc-"))).toBe(true);
+      world.canAdminsBypass[environment] = false;
+      await expect(world.phase("dispatch")).rejects.toThrow(/cumulative history interrupted or ended qualification/);
+      let deletions = 0;
+      expect((await world.phase("cleanup", { deleteRef: async () => {
+        deletions++; world.setRef(null); return { outcome: "deleted", exit_code: 0 };
+      } }) as any).outcome).toBe("inconclusive");
+      expect([world.count("POST", "/git/refs"), world.count("POST", "/dispatches"), deletions]).toEqual([1, 0, 1]);
+    });
+
+    for (const incomplete of ["transport", "missing-field", "malformed-page"] as const) {
+      it(`keeps ${environment} ${incomplete} policy capture incomplete after restoration`, async () => {
+        world.seedOriginal(); await world.phase("stage");
+        const transport = async (method: string, route: string, body: any) => {
+          const settings = route.split("?")[0].endsWith(`/environments/${environment}`);
+          const pages = route.split("?")[0].endsWith(`/environments/${environment}/deployment-branch-policies`);
+          if (incomplete === "transport" && settings) return incompleteResponse("transport-timeout");
+          if (incomplete === "missing-field" && settings) {
+            const response: any = world.respond(method, route, body).body; delete response.can_admins_bypass;
+            return completedJsonResponse(200, Buffer.from(JSON.stringify(response)), createRedactor(), { retainRaw: true });
+          }
+          if (incomplete === "malformed-page" && pages) {
+            return completedJsonResponse(200, Buffer.from(JSON.stringify({ total_count: 1, branch_policies: {} })), createRedactor(), { retainRaw: true });
+          }
+          return world.transport(method, route, body);
+        };
+        await expect(world.phase("dispatch", { transport })).rejects.toThrow();
+        await expect(world.phase("dispatch")).rejects.toThrow(/cumulative history interrupted or ended qualification/);
+        let deletions = 0;
+        expect((await world.phase("cleanup", { deleteRef: async () => {
+          deletions++; world.setRef(null); return { outcome: "deleted", exit_code: 0 };
+        } }) as any).outcome).toBe("inconclusive");
+        expect([world.count("POST", "/git/refs"), world.count("POST", "/dispatches"), deletions]).toEqual([1, 0, 1]);
+      });
+    }
+  }
+
+  for (const change of ["administrator-bypass", "environment-id"] as const) {
+    it(`both offline APIs reject every environment after retained ${change} policy evidence and provider restoration`, async () => {
+      const collected: any = await world.fullProbe();
+      rewriteObservedPolicy(world, "before", "staging-release", (settings) => {
+        if (change === "administrator-bypass") settings.can_admins_bypass = true;
+        else settings.id += 1000;
+      });
+      for (const environment of Object.keys(ENV_IDS)) expect(world.validate(collected.records[environment], environment)).toMatch(/qualification|failed/);
+      writeEvidenceFile(world.dir, evidenceSlug(RUN_ID, ATTEMPT, "environment"), {
+        schema_version: 1, phase: "environment-controls", run_id: RUN_ID, attempt: ATTEMPT,
+        controls: { [OFFBRANCH_CONTROL]: collected.records },
+      });
+      expect(assessEvidence({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, now: () => new Date(world.clock + 1000) }).blockers
+        .filter((entry: any) => entry.detail.includes(OFFBRANCH_CONTROL))).toHaveLength(2);
+    });
+  }
+
+  it("keeps local policy artifact corruption a hard integrity refusal", async () => {
+    const collected: any = await world.fullProbe();
+    const observed = world.probeRecords().find((row: any) => row.type === "policy-observed" && row.data.phase === "before");
+    const descriptor = JSON.parse(readFileSync(path.join(world.dir, observed.data.descriptor.artifact), "utf8"));
+    writeFileSync(path.join(world.dir, descriptor.settings.artifact), "{}", { mode: 0o600 });
+    for (const environment of Object.keys(ENV_IDS)) expect(world.validate(collected.records[environment], environment)).toMatch(/digest/);
+    await expect(world.phase("cleanup")).rejects.toThrow(/digest/);
   });
 });
 

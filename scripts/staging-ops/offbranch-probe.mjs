@@ -931,13 +931,7 @@ function readPolicyDescriptorUnchecked(dir, ref, { environment, phase }) {
 }
 
 export function readPolicyDescriptor(dir, ref, context) {
-  try {
-    return readPolicyDescriptorUnchecked(dir, ref, context);
-  } catch (error) {
-    if (error instanceof PolicyContradiction || error instanceof PolicyObservationIncomplete) throw error;
-    if (error instanceof ProbeRefusal) policyIncomplete(error.message);
-    throw error;
-  }
+  return readPolicyDescriptorUnchecked(dir, ref, context);
 }
 
 /**
@@ -1229,8 +1223,9 @@ export function verifyProbeRecoveryHistory(records, { dir, commissioning }) {
  * descriptor is incomplete; an observed complete contradiction is failed. Later captures cannot
  * erase either disposition, and unjournaled descriptor files are never discovered or adopted.
  */
-export function assessPolicyCaptureHistory(records, { dir = null } = {}) {
+export function assessPolicyCaptureHistory(records, { dir = null, baselinePolicy = null } = {}) {
   const boundaries = records.filter((row) => ["policy-capture-intent", "policy-observed", "policy-captured"].includes(row.type));
+  const baseline = new Map();
   let failed = false;
   let incomplete = false;
   for (const phase of ["before", "after"]) {
@@ -1250,9 +1245,17 @@ export function assessPolicyCaptureHistory(records, { dir = null } = {}) {
           const retained = readPolicyDescriptor(dir, observed[0].data.descriptor, { environment, phase });
           policy = retained.policy;
           if (new Date(retained.completed).toISOString() !== observed[0].data.completed_at) refuse(`the ${environment} ${phase} policy observation completion contradicts its exact captures`);
+          if (baselinePolicy) {
+            if (!baseline.has(environment)) {
+              const ref = baselinePolicy[environment];
+              if (!ref) refuse(`the staged probe has no ${environment} baseline policy binding`);
+              baseline.set(environment, readPolicyDescriptor(dir, ref, { environment, phase: "baseline" }).policy);
+            }
+            if (canonicalJson(policy) !== canonicalJson(baseline.get(environment))) failed = true;
+          }
         } catch (error) {
           if (error instanceof PolicyContradiction) failed = true;
-          else if (error instanceof ProbeRefusal) incomplete = true;
+          else if (error instanceof PolicyObservationIncomplete) incomplete = true;
           else throw error;
         }
       }
@@ -1268,7 +1271,7 @@ export function assessPolicyCaptureHistory(records, { dir = null } = {}) {
 }
 
 /** Shared history facts used by every public phase and by offline qualification. */
-export function assessProbePhaseState(records, { workflowSha, dir = null }) {
+export function assessProbePhaseState(records, { workflowSha, dir = null, baselinePolicy = null }) {
   checkProbeJournalShape(records);
   const has = (type) => records.some((row) => row.type === type);
   const observations = records.filter((row) => row.type === "observation-recorded");
@@ -1277,7 +1280,7 @@ export function assessProbePhaseState(records, { workflowSha, dir = null }) {
     && ["refused", "admitted"].includes(row.data.outcome)).length === 1)
     && ["run", "jobs"].every((kind) => captures.filter((row) => row.data.kind === kind).length === 1)
     && PROBE_ENVIRONMENTS.every((environment) => captures.some((row) => row.data.kind === "denial" && row.data.environment === environment));
-  const policy = assessPolicyCaptureHistory(records, { dir });
+  const policy = assessPolicyCaptureHistory(records, { dir, baselinePolicy });
   const failed = has("admission-observed") || observations.some((row) => row.data.outcome === "admitted") || policy.failed;
   const ended = has("qualification-incomplete") || has("qualification-ended") || has("capture-failed") || has("cancel-intent") || policy.incomplete || assessSourceContinuity(records).interrupted;
   const ref = assessRefOwnership(records, { workflowSha });
@@ -1507,7 +1510,11 @@ export function assessProbeLifecycle(records, { dir, intentSha256, intentArtifac
   if (canonicalHash(originalIntent) !== commissioning.intent_sha256) refuse("the original intent no longer matches its authenticated binding");
   assessOriginalProbeBinding(records, { dir, commissioning, dispatcher: originalIntent.dispatcher, qualification: true });
   verifyProbeRecoveryHistory(records, { dir, commissioning });
-  const phaseState = assessProbePhaseState(records, { workflowSha, dir });
+  const retainedProbeIntent = parseJsonBytes(readRetained(dir, { artifact: intentArtifact, sha256: intentSha256 }, {
+    maxBytes: MAX_OBSERVATION_BYTES, label: "the staged probe intent",
+  }), "the staged probe intent");
+  parseProbeIntent(retainedProbeIntent, { commissioning });
+  const phaseState = assessProbePhaseState(records, { workflowSha, dir, baselinePolicy: retainedProbeIntent.baseline_policy });
   if (phaseState.failed || phaseState.ended) refuse("the cumulative probe qualification is failed, interrupted or irreversibly incomplete");
   const foreign = records.filter((record) => String(record.source) !== String(workflowSha));
   if (foreign.length) refuse(`${foreign.length} probe journal record(s) were written against a different immutable source`);
