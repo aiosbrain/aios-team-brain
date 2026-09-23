@@ -863,17 +863,54 @@ describe("lifecycle ownership: create once, dispatch once, never adopt, never re
     expect(world.refSha()).toBe(world.otherSha);
   });
 
-  it("reconciles an ambiguous deletion: absent closes it; present requires a fresh explicit lease", async () => {
+  /**
+   * WAS: "present requires a fresh explicit lease" — a POSITIVE expectation, and an INVALID ORACLE
+   * (R06). It asserted that an ambiguous deletion followed by the ref still sitting at the reviewed
+   * SHA proved the deletion had not applied, so one fresh lease deletion could be issued. The only
+   * thing that made that reading true was the MOCK's private knowledge that its `deleteRef` had
+   * done nothing — knowledge the operator does not have. An applied deletion followed by another
+   * creation at the same bytes produces byte-for-byte the same observations, and the retry then
+   * deletes a ref this probe never created. The scenario is kept; its expectation is now refusal.
+   */
+  it("refuses a second deletion after an ambiguous one, however often cleanup is run", async () => {
     world.seedOriginal();
     await world.phase("stage");
     await world.phase("dispatch");
     await world.phase("collect");
-    await expect(world.phase("cleanup", { deleteRef: async () => ({ outcome: "ambiguous", exit_code: 128 }) })).rejects.toThrow(/run cleanup again/);
+    let deletions = 0;
+    const ambiguous = async () => { deletions += 1; return { outcome: "ambiguous", exit_code: 128 }; };
+    await expect(world.phase("cleanup", { deleteRef: ambiguous })).rejects.toThrow(/NO second deletion is issued/);
     expect(world.refSha()).toBe(world.sha);
     expect(world.probeRecords().some((r: any) => r.type === "reconciliation" && r.data.outcome === "present-unchanged")).toBe(true);
-    const cleaned: any = await world.phase("cleanup");
-    expect(cleaned.status).toBe("cleaned");
-    expect(world.refSha()).toBeNull();
+    // Re-running cleanup — a fresh process, re-deriving from the journal — reaches the same answer,
+    // and the ref is still there. The undecided deletion is never decided by equal bytes.
+    await expect(world.phase("cleanup", { deleteRef: ambiguous })).rejects.toThrow(/NO second deletion is issued/);
+    await expect(world.phase("cleanup", { deleteRef: ambiguous })).rejects.toThrow(/NO second deletion is issued/);
+    expect([deletions, world.refSha()]).toEqual([1, world.sha]);
+    expect(assessRefOwnership(world.probeRecords(), { workflowSha: world.sha }).may_delete).toBe(false);
+  });
+
+  /**
+   * The counterexample the retry could not survive: the deletion DID apply, and another creation put
+   * a ref back at the same SHA before the readback. Observationally identical to the case above.
+   */
+  it("refuses just the same when the ambiguous deletion applied and the ref was recreated at the same SHA", async () => {
+    world.seedOriginal();
+    await world.phase("stage");
+    await world.phase("dispatch");
+    await world.phase("collect");
+    let deletions = 0;
+    const applied = async () => {
+      deletions += 1;
+      world.setRef(null);        // the deletion really did apply …
+      world.setRef(world.sha);   // … and somebody else's creation is now at the same bytes.
+      return { outcome: "ambiguous", exit_code: 128 };
+    };
+    await expect(world.phase("cleanup", { deleteRef: applied })).rejects.toThrow(/NO second deletion is issued/);
+    await expect(world.phase("cleanup", { deleteRef: applied })).rejects.toThrow(/NO second deletion is issued/);
+    // The replacement ref is untouched, and the probe never closes over it.
+    expect([deletions, world.refSha()]).toEqual([1, world.sha]);
+    expect(world.probeRecords().some((record: any) => record.type === "probe-closed")).toBe(false);
   });
 
   it("closes an ambiguous deletion that did take effect as absent after reconciliation", async () => {
@@ -890,8 +927,11 @@ describe("lifecycle ownership: create once, dispatch once, never adopt, never re
     world.seedOriginal();
     await world.phase("stage");
     await world.phase("dispatch");
-    await expect(world.phase("cleanup")).rejects.toThrow(/collect before cleanup/);
+    // Cleanup reconciles the dispatched run itself (R06-F2) and then refuses on what it found: the
+    // run is live, so the ref stays. The refusal names a phase that can actually act on it.
+    await expect(world.phase("cleanup")).rejects.toThrow(/not terminal; cancel \(or collect\)/);
     expect(world.refSha()).toBe(world.sha);
+    expect(world.probeRecords().some((record: any) => record.type === "probe-closed")).toBe(false);
   });
 
   it("refuses the acceptance when an original protected job was approved before the probe was cleaned", async () => {
@@ -1098,8 +1138,9 @@ describe("R04-F2: the durable dispatch intent owns recovery, with or without its
     expect(events).not.toContain("dispatch-result");
     expect(world.runs).toHaveLength(1);
 
-    // Cleanup may NOT close over a run nobody has reconciled, and must not delete the ref.
-    await expect(world.phase("cleanup")).rejects.toThrow(/collect before cleanup/);
+    // Cleanup may NOT close over a live run, and must not delete the ref. It reconciles the run
+    // from the durable intent itself (R06-F2) rather than deferring to a collection.
+    await expect(world.phase("cleanup")).rejects.toThrow(/not terminal; cancel \(or collect\)/);
     expect(world.refSha()).toBe(world.sha);
     expect(world.probeRecords().some((record: any) => record.type === "probe-closed")).toBe(false);
     expect(world.runState(world.runs[0]).status).toBe("queued");
@@ -1332,17 +1373,21 @@ describe("R05-F1: a successful deletion ends that creation's ownership irreversi
     expect([cleaned.status, cleaned.outcome, deletions]).toEqual(["cleaned-after-reconciliation", "measured", 1]);
     expect(world.validate(collected.records["staging-release"], "staging-release")).toBeNull();
 
-    // An ambiguous deletion the ref itself shows did NOT apply may still issue one fresh lease.
+    // An ambiguous deletion that the ref itself LATER shows to be absent is still a positive
+    // recovery: that absence is an observation about this very ref, and it decides the deletion
+    // applied. (What is NOT a positive recovery — and used to be asserted here as one — is an
+    // ambiguous deletion plus a ref still present at the same SHA: see the two refusal regressions
+    // in the lifecycle-ownership suite. R06.)
     const local = new World();
     try {
       local.seedOriginal();
       await local.phase("stage");
       await local.phase("dispatch");
       const localCollected: any = await local.phase("collect");
-      await expect(local.phase("cleanup", { deleteRef: async () => ({ outcome: "ambiguous", exit_code: 128 }) })).rejects.toThrow(/run cleanup again/);
-      const retried: any = await local.phase("cleanup");
-      expect([retried.status, retried.outcome]).toEqual(["cleaned", "measured"]);
-      expect(local.refSha()).toBeNull();
+      let localDeletions = 0;
+      const lostAnswer = async () => { localDeletions += 1; local.setRef(null); return { outcome: "ambiguous", exit_code: null }; };
+      const reconciled: any = await local.phase("cleanup", { deleteRef: lostAnswer });
+      expect([reconciled.outcome, localDeletions, local.refSha()]).toEqual(["measured", 1, null]);
       expect(local.validate(localCollected.records["staging-emergency"], "staging-emergency")).toBeNull();
     } finally { rmSync(local.root, { recursive: true, force: true }); }
   });
