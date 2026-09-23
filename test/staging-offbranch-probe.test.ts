@@ -999,3 +999,199 @@ describe("the probe journal is closed per event", () => {
     expect(ENVIRONMENT_CONTROL_SCHEMAS[OFFBRANCH_CONTROL].expected).toEqual(EXPECTED);
   });
 });
+
+// ──────────────────────────────────────────────────────────────────────────────
+// F. R04: durable cuts, run identity, registration evidence and delete recovery.
+//
+// Each case here reproduces one accepted PC06-R04 finding through the ACTUAL operator entry
+// points and the actual offline validator — never a helper called directly. The shared failure
+// they cover: lifecycle consumers inferring ownership from a matching partial listing, or from
+// the presence/absence of a later event, instead of from durable intent plus verified identity.
+// ──────────────────────────────────────────────────────────────────────────────
+
+describe("R04-F1: a run is owned only once its full immutable identity is established", () => {
+  it("never selects or cancels a run on the fixed ref that a different dispatcher started", async () => {
+    world.seedOriginal();
+    world.neverComplete = true;
+    await world.phase("stage");
+    await world.phase("dispatch");
+    // Same workflow, same fixed ref, same event, inside the window — different dispatcher.
+    world.runs[0].actor = { id: 12345, login: "someone-else", type: "User" };
+    await expect(world.phase("collect")).rejects.toThrow(/not this probe's own run/);
+    expect(world.count("POST", "/cancel")).toBe(0);
+    expect(world.probeRecords().some((record: any) => record.type === "run-identified")).toBe(false);
+  });
+
+  it("never adopts a candidate whose attempt or source moved", async () => {
+    for (const [mutate, pattern] of [
+      [(w: World) => { w.runs[0].attempt = 2; }, /attempt/],
+      [(w: World) => { w.sha = w.otherSha; }, /source SHA|branch|head/],
+    ] as Array<[(w: World) => void, RegExp]>) {
+      const local = new World();
+      try {
+        local.seedOriginal();
+        local.neverComplete = true;
+        await local.phase("stage");
+        await local.phase("dispatch");
+        mutate(local);
+        await expect(local.phase("collect")).rejects.toThrow(pattern);
+        expect(local.calls.filter((call) => call.method === "POST" && call.path.endsWith("/cancel"))).toEqual([]);
+      } finally { rmSync(local.root, { recursive: true, force: true }); }
+    }
+  });
+
+  it("re-establishes identity immediately before the deadline cancellation, and refuses if it moved", async () => {
+    world.seedOriginal();
+    world.neverComplete = true;
+    await world.phase("stage");
+    await world.phase("dispatch");
+    // Ours at selection; somebody else's by the time the deadline wants to cancel it.
+    let selected = false;
+    const transport = async (method: string, requestPath: string, body?: unknown) => {
+      const answer = await world.transport(method, requestPath, body);
+      if (method === "GET" && requestPath.includes(`/actions/workflows/${PROBE_WORKFLOW_FILE}/runs`)) selected = true;
+      else if (selected) world.runs[0].actor = { id: 12345, login: "someone-else", type: "User" };
+      return answer;
+    };
+    await expect(world.phase("collect", { transport })).rejects.toThrow(/not this probe's own run/);
+    expect(world.count("POST", "/cancel")).toBe(0);
+  });
+});
+
+describe("R04-F2: the durable dispatch intent owns recovery, with or without its result", () => {
+  it("blocks cleanup after an interrupted dispatch, then reconciles the live run without re-dispatching", async () => {
+    world.seedOriginal();
+    await world.phase("stage");
+    // The provider applied the dispatch; this process died before it could append the result.
+    const transport = async (method: string, requestPath: string, body?: unknown) => {
+      const answer = await world.transport(method, requestPath, body);
+      if (method === "POST" && requestPath.endsWith("/dispatches")) throw new Error("simulated process interruption after the provider applied the dispatch");
+      return answer;
+    };
+    await expect(world.phase("dispatch", { transport })).rejects.toThrow(/simulated process interruption/);
+    const events = world.probeRecords().map((record: any) => record.type);
+    expect(events).toContain("dispatch-intent");
+    expect(events).not.toContain("dispatch-result");
+    expect(world.runs).toHaveLength(1);
+
+    // Cleanup may NOT close over a run nobody has reconciled, and must not delete the ref.
+    await expect(world.phase("cleanup")).rejects.toThrow(/collect before cleanup/);
+    expect(world.refSha()).toBe(world.sha);
+    expect(world.probeRecords().some((record: any) => record.type === "probe-closed")).toBe(false);
+    expect(world.runState(world.runs[0]).status).toBe("queued");
+
+    // Collect reconciles the intent from the run itself. One dispatch, ever.
+    const collected: any = await world.phase("collect");
+    expect(collected.status).toBe("measured");
+    expect(world.count("POST", "/dispatches")).toBe(1);
+    const reconciled = world.probeRecords().filter((record: any) => record.type === "reconciliation" && record.data.of === "dispatch-intent");
+    expect(reconciled).toHaveLength(1);
+    expect(reconciled[0].data.outcome).toBe("present-unchanged");
+    const cleaned: any = await world.phase("cleanup");
+    expect(cleaned.outcome).toBe("measured");
+    expect(world.refSha()).toBeNull();
+    expect(world.validate(collected.records["staging-release"], "staging-release")).toBeNull();
+  });
+
+  it("closes an interrupted dispatch that produced no run at all, without re-dispatching", async () => {
+    world.seedOriginal();
+    await world.phase("stage");
+    const transport = async (method: string, requestPath: string, body?: unknown) => {
+      if (method === "POST" && requestPath.endsWith("/dispatches")) { world.calls.push({ method, path: requestPath }); throw new Error("simulated interruption before the provider applied anything"); }
+      return world.transport(method, requestPath, body);
+    };
+    await expect(world.phase("dispatch", { transport })).rejects.toThrow(/simulated interruption/);
+    expect(world.runs).toHaveLength(0);
+    await expect(world.phase("collect")).rejects.toThrow(/no eligible probe run/);
+    const reconciled = world.probeRecords().filter((record: any) => record.type === "reconciliation" && record.data.of === "dispatch-intent");
+    expect(reconciled).toHaveLength(1);
+    expect(reconciled[0].data.outcome).toBe("absent");
+    const cleaned: any = await world.phase("cleanup");
+    expect(cleaned.outcome).toBe("inconclusive");
+    expect(world.count("POST", "/dispatches")).toBe(1);
+  });
+});
+
+describe("R04-F3: registration is traversed evidence, never a journal assertion", () => {
+  it("refuses when the registration descriptor is gone", async () => {
+    const collected: any = await world.fullProbe();
+    const record = collected.records["staging-release"];
+    expect(world.validate(record, "staging-release")).toBeNull();
+    const registration = world.probeRecords().find((entry: any) => entry.type === "registration-verified");
+    rmSync(path.join(world.dir, registration.data.descriptor.artifact));
+    expect(world.validate(record, "staging-release")).toMatch(/registration/);
+  });
+
+  it("refuses when the retained registered workflow or source bytes were altered", async () => {
+    for (const member of ["workflow", "source"]) {
+      const local = new World();
+      try {
+        const collected: any = await local.fullProbe();
+        const registration = local.probeRecords().find((entry: any) => entry.type === "registration-verified");
+        const descriptor = JSON.parse(readFileSync(path.join(local.dir, registration.data.descriptor.artifact), "utf8"));
+        const target = path.join(local.dir, descriptor[member].artifact);
+        const body = JSON.parse(readFileSync(target, "utf8"));
+        if (member === "source") body.content = Buffer.from("name: not the reviewed probe workflow\n").toString("base64");
+        else body.state = "disabled_manually";
+        rmSync(target);
+        writeFileSync(target, `${JSON.stringify(body, null, 2)}\n`, { mode: 0o600 });
+        expect(local.validate(collected.records["staging-release"], "staging-release")).toMatch(/digest|registered|registration/);
+      } finally { rmSync(local.root, { recursive: true, force: true }); }
+    }
+  });
+});
+
+describe("R04-F4: a successful deletion owns the recovery of its own missing readback", () => {
+  it("recovers a confirmed-absent ref after a lost absence readback, without a second deletion", async () => {
+    world.seedOriginal();
+    await world.phase("stage");
+    await world.phase("dispatch");
+    const collected: any = await world.phase("collect");
+    let deleted = false;
+    let deletions = 0;
+    const deleteRef = async () => { deletions += 1; world.setRef(null); deleted = true; return { outcome: "deleted", exit_code: 0 }; };
+    const transport = async (method: string, requestPath: string, body?: unknown) =>
+      (deleted && requestPath.startsWith(`/repos/${REPO}/git/ref/heads/${PROBE_BRANCH}`)
+        ? incompleteResponse("transport-timeout")
+        : world.transport(method, requestPath, body));
+    await expect(world.phase("cleanup", { transport, deleteRef })).rejects.toThrow(/absence could not be confirmed/);
+    expect(deletions).toBe(1);
+    expect(world.refSha()).toBeNull();
+
+    const cleaned: any = await world.phase("cleanup", { deleteRef });
+    expect(cleaned.status).toBe("cleaned-after-reconciliation");
+    expect(cleaned.outcome).toBe("measured");
+    expect(deletions).toBe(1);
+    expect(world.probeRecords().some((record: any) => record.type === "probe-closed")).toBe(true);
+    expect(world.validate(collected.records["staging-release"], "staging-release")).toBeNull();
+  });
+
+  it("still refuses an unowned disappearance and a ref that moved under a recorded deletion", async () => {
+    // No deletion this probe recorded: an absent owned ref is a broken ownership history.
+    world.seedOriginal();
+    await world.phase("stage");
+    await world.phase("dispatch");
+    await world.phase("collect");
+    world.setRef(null);
+    await expect(world.phase("cleanup")).rejects.toThrow(/disappeared without this probe deleting it/);
+
+    // A recorded deletion whose readback was lost, and the ref now sits at another SHA: refused.
+    const local = new World();
+    try {
+      local.seedOriginal();
+      await local.phase("stage");
+      await local.phase("dispatch");
+      await local.phase("collect");
+      let deleted = false;
+      const deleteRef = async () => { deleted = true; return { outcome: "deleted", exit_code: 0 }; };
+      const transport = async (method: string, requestPath: string, body?: unknown) =>
+        (deleted && requestPath.startsWith(`/repos/${REPO}/git/ref/heads/${PROBE_BRANCH}`)
+          ? incompleteResponse("transport-timeout")
+          : local.transport(method, requestPath, body));
+      await expect(local.phase("cleanup", { transport, deleteRef })).rejects.toThrow(/absence could not be confirmed/);
+      local.setRef(local.otherSha);
+      await expect(local.phase("cleanup")).rejects.toThrow(/never deleted at another SHA/);
+      expect(local.refSha()).toBe(local.otherSha);
+    } finally { rmSync(local.root, { recursive: true, force: true }); }
+  });
+});
