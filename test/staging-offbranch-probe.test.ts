@@ -51,6 +51,21 @@ const missingRefIdentity = () => ({
   returned_ref: null, returned_ref_state: "missing", object_type: null, object_type_state: "missing",
   object_sha: null, object_sha_state: "missing",
 });
+type RefIdentityFault = "foreign-ref" | "missing-ref" | "malformed-ref" | "missing-type" | "noncommit-type" | "wrong-sha" | "missing-sha";
+const mutateRefIdentityBody = (body: any, fault: RefIdentityFault, wrongSha: string) => {
+  const changed = structuredClone(body);
+  if (fault === "foreign-ref") changed.ref = "refs/heads/foreign-probe";
+  if (fault === "missing-ref") delete changed.ref;
+  if (fault === "malformed-ref") changed.ref = 7;
+  if (fault === "missing-type") delete changed.object.type;
+  if (fault === "noncommit-type") changed.object.type = "tag";
+  if (fault === "wrong-sha") changed.object.sha = wrongSha;
+  if (fault === "missing-sha") delete changed.object.sha;
+  return changed;
+};
+const completedBody = (status: number, body: unknown) => completedJsonResponse(
+  status, Buffer.from(JSON.stringify(body)), createRedactor(), { retainRaw: true },
+);
 
 const git = (args: string[], cwd?: string) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 
@@ -454,6 +469,169 @@ describe("the staged probe lifecycle (mock provider — not live proof)", () => 
     expect(blockers.filter((entry: any) => entry.detail.includes(OFFBRANCH_CONTROL))).toEqual([]);
   });
 
+  for (const fault of ["missing-ref", "malformed-ref", "missing-type", "missing-sha"] as const) {
+    it(`R14 recovers an exact 201 after a structurally ${fault} first readback only through a later exact bounded read`, async () => {
+      world.seedOriginal(); await world.phase("stage");
+      let created = false, alterNextRead = true;
+      const transport = async (method: string, route: string, body?: unknown) => {
+        const answer: any = await world.transport(method, route, body);
+        if (method === "POST" && route.endsWith("/git/refs")) created = true;
+        if (method === "GET" && created && alterNextRead && route.endsWith(`/git/ref/heads/${PROBE_BRANCH}`)) {
+          alterNextRead = false;
+          return completedBody(200, mutateRefIdentityBody(answer.body, fault, world.otherSha));
+        }
+        return answer;
+      };
+      await expect(world.phase("dispatch", { transport })).rejects.toThrow(/incomplete|could not be read back/);
+      expect(assessRefOwnership(world.probeRecords(), { workflowSha: world.sha }).may_delete).toBe(true);
+      await world.phase("dispatch");
+      await world.phase("collect");
+      let deletions = 0;
+      const cleaned: any = await world.phase("cleanup", { deleteRef: async () => { deletions += 1; world.setRef(null); return { outcome: "deleted", exit_code: 0 }; } });
+      expect([cleaned.outcome, world.count("POST", "/git/refs"), world.count("POST", "/dispatches"), deletions]).toEqual(["measured", 1, 1, 1]);
+    });
+  }
+
+  for (const fault of ["foreign-ref", "noncommit-type", "wrong-sha"] as const) {
+    it(`R14 keeps a ${fault} post-create readback contradiction sticky after the provider restores`, async () => {
+      world.seedOriginal(); await world.phase("stage");
+      let created = false, alterNextRead = true;
+      const transport = async (method: string, route: string, body?: unknown) => {
+        const answer: any = await world.transport(method, route, body);
+        if (method === "POST" && route.endsWith("/git/refs")) created = true;
+        if (method === "GET" && created && alterNextRead && route.endsWith(`/git/ref/heads/${PROBE_BRANCH}`)) {
+          alterNextRead = false;
+          return completedBody(200, mutateRefIdentityBody(answer.body, fault, world.otherSha));
+        }
+        return answer;
+      };
+      await expect(world.phase("dispatch", { transport })).rejects.toThrow(/fixed probe ref|reviewed commit/);
+      await expect(world.phase("dispatch")).rejects.toThrow(/never re-issued|fixed probe ref|reviewed commit/);
+      let deletions = 0;
+      await expect(world.phase("cleanup", { deleteRef: async () => { deletions += 1; return { outcome: "deleted", exit_code: 0 }; } }))
+        .rejects.toThrow(/fixed probe ref|reviewed commit/);
+      expect([world.count("POST", "/git/refs"), world.count("POST", "/dispatches"), deletions, world.refSha()])
+        .toEqual([1, 0, 0, world.sha]);
+    });
+  }
+
+  for (const fault of ["foreign-ref", "missing-ref", "malformed-ref", "missing-type", "noncommit-type", "wrong-sha", "missing-sha"] as const) {
+    it(`R14 never manufactures ownership from a ${fault} complete-201 response`, async () => {
+      world.seedOriginal(); await world.phase("stage");
+      const transport = async (method: string, route: string, body?: unknown) => {
+        const answer: any = await world.transport(method, route, body);
+        return method === "POST" && route.endsWith("/git/refs")
+          ? completedBody(201, mutateRefIdentityBody(answer.body, fault, world.otherSha)) : answer;
+      };
+      await expect(world.phase("dispatch", { transport })).rejects.toThrow(/identity|fixed probe ref|ownership is uncertain/);
+      const created = world.probeRecords().find((row: any) => row.type === "ref-create-result");
+      if (["foreign-ref", "noncommit-type", "wrong-sha"].includes(fault)) {
+        expect([created.data.returned_ref, created.data.object_type, created.data.object_sha]).not.toEqual([PROBE_REF, "commit", world.sha]);
+      } else {
+        expect([created.data.returned_ref_state, created.data.object_type_state, created.data.object_sha_state]
+          .some((state: string) => ["missing", "invalid"].includes(state))).toBe(true);
+      }
+      await expect(world.phase("dispatch")).rejects.toThrow(/never re-issued|fixed probe ref|ownership is uncertain/);
+      let deletions = 0;
+      await expect(world.phase("cleanup", { deleteRef: async () => { deletions += 1; return { outcome: "deleted", exit_code: 0 }; } }))
+        .rejects.toThrow(/identity|fixed probe ref|ownership is uncertain/);
+      expect([world.count("POST", "/git/refs"), world.count("POST", "/dispatches"), deletions, world.refSha()])
+        .toEqual([1, 0, 0, world.sha]);
+    });
+  }
+
+  for (const fault of ["foreign-ref", "missing-ref", "missing-type", "noncommit-type", "wrong-sha", "missing-sha"] as const) {
+    it(`R14 rejects a closed ${fault} creation identity through both offline APIs`, async () => {
+      const collected: any = await world.fullProbe();
+      rewriteProbeJournal(world, (records) => {
+        const created = records.find((row: any) => row.type === "ref-create-result");
+        if (fault === "foreign-ref") Object.assign(created.data, { returned_ref: "refs/heads/foreign-probe", returned_ref_state: "present" });
+        if (fault === "missing-ref") Object.assign(created.data, { returned_ref: null, returned_ref_state: "missing" });
+        if (fault === "missing-type") Object.assign(created.data, { object_type: null, object_type_state: "missing" });
+        if (fault === "noncommit-type") Object.assign(created.data, { object_type: "tag", object_type_state: "present" });
+        if (fault === "wrong-sha") Object.assign(created.data, { object_sha: world.otherSha, object_sha_state: "valid-sha" });
+        if (fault === "missing-sha") Object.assign(created.data, { object_sha: null, object_sha_state: "missing" });
+      });
+      for (const environment of Object.keys(ENV_IDS)) expect(world.validate(collected.records[environment], environment)).toMatch(/no result or reconciliation|creation is not a complete 201|ownership/);
+      writeEvidenceFile(world.dir, evidenceSlug(RUN_ID, ATTEMPT, "environment"), {
+        schema_version: 1, phase: "environment-controls", run_id: RUN_ID, attempt: ATTEMPT,
+        controls: { [OFFBRANCH_CONTROL]: collected.records },
+      });
+      expect(assessEvidence({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, now: () => new Date(world.clock + 1000) }).blockers
+        .filter((entry: any) => entry.detail.includes(OFFBRANCH_CONTROL))).toHaveLength(2);
+    });
+  }
+
+  for (const fault of ["foreign-ref", "noncommit-type", "wrong-sha"] as const) {
+    it(`R14 keeps a ${fault} pre-delete readback contradiction sticky without deleting`, async () => {
+      world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch"); await world.phase("collect");
+      let alterNextRead = true, deletions = 0;
+      const transport = async (method: string, route: string, body?: unknown) => {
+        const answer: any = await world.transport(method, route, body);
+        if (method === "GET" && alterNextRead && route.endsWith(`/git/ref/heads/${PROBE_BRANCH}`)) {
+          alterNextRead = false;
+          return completedBody(200, mutateRefIdentityBody(answer.body, fault, world.otherSha));
+        }
+        return answer;
+      };
+      const deleteRef = async () => { deletions += 1; world.setRef(null); return { outcome: "deleted", exit_code: 0 }; };
+      await expect(world.phase("cleanup", { transport, deleteRef })).rejects.toThrow(/fixed probe ref|reviewed commit/);
+      await expect(world.phase("cleanup", { deleteRef })).rejects.toThrow(/fixed probe ref|reviewed commit/);
+      expect([deletions, world.refSha()]).toEqual([0, world.sha]);
+    });
+  }
+
+  it("R14 retries a structurally incomplete pre-delete identity only with a later exact read", async () => {
+    world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch"); await world.phase("collect");
+    let alterNextRead = true, deletions = 0;
+    const transport = async (method: string, route: string, body?: unknown) => {
+      const answer: any = await world.transport(method, route, body);
+      if (method === "GET" && alterNextRead && route.endsWith(`/git/ref/heads/${PROBE_BRANCH}`)) {
+        alterNextRead = false;
+        return completedBody(200, mutateRefIdentityBody(answer.body, "missing-ref", world.otherSha));
+      }
+      return answer;
+    };
+    const deleteRef = async () => { deletions += 1; world.setRef(null); return { outcome: "deleted", exit_code: 0 }; };
+    await expect(world.phase("cleanup", { transport, deleteRef })).rejects.toThrow(/incomplete affirmative identity/);
+    expect((await world.phase("cleanup", { deleteRef }) as any).outcome).toBe("measured");
+    expect([deletions, world.refSha()]).toEqual([1, null]);
+  });
+
+  for (const fault of ["foreign-ref", "noncommit-type", "wrong-sha"] as const) {
+    it(`R14 keeps a ${fault} post-delete reconciliation readback sticky without a second delete`, async () => {
+      world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch"); await world.phase("collect");
+      let probeReads = 0, deletions = 0;
+      const transport = async (method: string, route: string, body?: unknown) => {
+        const answer: any = await world.transport(method, route, body);
+        if (method === "GET" && route.endsWith(`/git/ref/heads/${PROBE_BRANCH}`) && ++probeReads === 2) {
+          return completedBody(200, mutateRefIdentityBody(answer.body, fault, world.otherSha));
+        }
+        return answer;
+      };
+      const deleteRef = async () => { deletions += 1; return { outcome: "ambiguous", exit_code: null }; };
+      await expect(world.phase("cleanup", { transport, deleteRef })).rejects.toThrow(/fixed probe ref|reviewed commit/);
+      await expect(world.phase("cleanup", { deleteRef })).rejects.toThrow(/fixed probe ref|reviewed commit/);
+      expect([deletions, world.refSha()]).toEqual([1, world.sha]);
+    });
+  }
+
+  it("R14 closes an applied delete after an incomplete affirmative identity and a later exact 404", async () => {
+    world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch"); await world.phase("collect");
+    let probeReads = 0, deletions = 0;
+    const transport = async (method: string, route: string, body?: unknown) => {
+      const answer: any = await world.transport(method, route, body);
+      if (method === "GET" && route.endsWith(`/git/ref/heads/${PROBE_BRANCH}`) && ++probeReads === 2) {
+        return completedBody(200, mutateRefIdentityBody({ ref: PROBE_REF, object: { type: "commit", sha: world.sha } }, "missing-sha", world.otherSha));
+      }
+      return answer;
+    };
+    const deleteRef = async () => { deletions += 1; world.setRef(null); return { outcome: "deleted", exit_code: 0 }; };
+    await expect(world.phase("cleanup", { transport, deleteRef })).rejects.toThrow(/incomplete affirmative identity/);
+    expect((await world.phase("cleanup", { deleteRef }) as any).status).toBe("cleaned-after-reconciliation");
+    expect([deletions, world.refSha()]).toEqual([1, null]);
+  });
+
   for (const fault of ["postdispatch-only", "missing-201", "foreign-ref", "404-then-restored", "changed-sha-then-restored", "late-measured-time"] as const) {
     it(`refuses ${fault} lifecycle evidence through both offline validators`, async () => {
       const collected: any = await world.fullProbe();
@@ -464,7 +642,7 @@ describe("the staged probe lifecycle (mock provider — not live proof)", () => 
         if (fault === "missing-201") {
           Object.assign(created.data, { http_status: 0, response_complete: false, response_incomplete: "transport-timeout", measured_status: null, ...missingRefIdentity() });
         } else if (fault === "foreign-ref") {
-          initial.data.ref = "refs/heads/foreign-probe";
+          Object.assign(initial.data, { returned_ref: "refs/heads/foreign-probe", returned_ref_state: "present" });
         } else if (fault === "404-then-restored") {
           Object.assign(initial.data, { http_status: 404, response_complete: true, response_incomplete: null, measured_status: 404, ...missingRefIdentity() });
         } else if (fault === "changed-sha-then-restored") {

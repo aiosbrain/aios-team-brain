@@ -641,15 +641,22 @@ export async function runDispatch({ runId, attempt, evidenceDir, env, deps }) {
       const createdData = { ref: PROBE_REF, sha, ...facts(created), ...refResponseIdentity(created) };
       probe.append("ref-create-result", createdData);
       const createdIdentity = asAssertion(() => assessRefResponseIdentity(createdData, { expectedSha: sha, label: "the probe ref creation result" }));
+      if (created.complete === true && created.status === 201 && createdIdentity.classification === "contradictory") {
+        throw new AssertionFailure(createdIdentity.reason);
+      }
       if (!(created.complete === true && created.status === 201 && createdIdentity.matches)) {
         const readback = await session.request("GET", probeRefPath);
-        probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), ...refResponseIdentity(readback), measured_at: session.now().toISOString() });
+        const readbackData = { ref: PROBE_REF, ...facts(readback), ...refResponseIdentity(readback), measured_at: session.now().toISOString() };
+        probe.append("ref-readback", readbackData);
         const at = session.now().toISOString();
         if (readback.complete === true && readback.status === 404) {
           probe.append("reconciliation", { of: "ref-create-intent", outcome: "absent", object_sha: null, measured_at: at });
           throw new IncompleteEvidence("the probe ref create did not establish application and the ref is absent; it is not re-created for this attempt");
         }
         if (readback.complete === true && readback.status === 200) {
+          const identity = asAssertion(() => assessRefResponseIdentity(readbackData, { expectedSha: sha, label: "the uncertain probe create readback" }));
+          if (identity.classification === "contradictory") throw new AssertionFailure(identity.reason);
+          if (identity.classification === "incomplete") throw new IncompleteEvidence("the probe ref create did not establish application and its affirmative readback has incomplete identity; the create intent stays unresolved");
           probe.append("reconciliation", { of: "ref-create-intent", outcome: "present-ownership-uncertain", object_sha: String(readback.body?.object?.sha ?? "") || null, measured_at: at });
           throw new IncompleteEvidence("the probe ref create did not establish application and a ref now exists; ownership is uncertain, so it is neither dispatched nor deleted — root reconciliation is required");
         }
@@ -1161,10 +1168,14 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
     // uncertainty permanent and never grants adoption or deletion authority.
     if (ownership.pending?.of === "ref-create-intent") {
       const readback = await session.request("GET", probeRefPath);
-      probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), ...refResponseIdentity(readback), measured_at: session.now().toISOString() });
+      const readbackData = { ref: PROBE_REF, ...facts(readback), ...refResponseIdentity(readback), measured_at: session.now().toISOString() };
+      probe.append("ref-readback", readbackData);
       if (readback.complete === true && readback.status === 404) {
         probe.append("reconciliation", { of: "ref-create-intent", outcome: "absent", object_sha: null, measured_at: session.now().toISOString() });
       } else if (readback.complete === true && readback.status === 200) {
+        const identity = asAssertion(() => assessRefResponseIdentity(readbackData, { expectedSha: sha, label: "the uncertain probe create cleanup readback" }));
+        if (identity.classification === "contradictory") throw new AssertionFailure(identity.reason);
+        if (identity.classification === "incomplete") throw new IncompleteEvidence("the uncertain probe ref create has an incomplete affirmative readback; the journal remains open and no resource is deleted");
         probe.append("reconciliation", { of: "ref-create-intent", outcome: "present-ownership-uncertain", object_sha: String(readback.body?.object?.sha ?? "") || null, measured_at: session.now().toISOString() });
       } else {
         throw new IncompleteEvidence("the uncertain probe ref create could not be reconciled; the journal remains open and no resource is deleted");
@@ -1262,7 +1273,8 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
      */
     if (ownership.pending) {
       const readback = await session.request("GET", probeRefPath);
-      probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), ...refResponseIdentity(readback), measured_at: session.now().toISOString() });
+      const readbackData = { ref: PROBE_REF, ...facts(readback), ...refResponseIdentity(readback), measured_at: session.now().toISOString() };
+      probe.append("ref-readback", readbackData);
       if (readback.complete === true && readback.status === 404) {
         probe.append("reconciliation", { of: "cleanup-intent", outcome: "absent", object_sha: null, measured_at: at() });
         probe.append("absence-verified", { ref: PROBE_REF, ...facts(readback), measured_at: at() });
@@ -1270,7 +1282,10 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
         return await close("cleaned-after-reconciliation");
       }
       if (readback.complete === true && readback.status === 200) {
-        const objectSha = String(readback.body?.object?.sha ?? "");
+        const identity = asAssertion(() => assessRefResponseIdentity(readbackData, { expectedSha: sha, label: "the pending probe deletion readback" }));
+        if (identity.classification === "contradictory") throw new AssertionFailure(identity.reason);
+        if (identity.classification === "incomplete") throw new IncompleteEvidence("a lost deletion has an incomplete affirmative readback and remains unresolved");
+        const objectSha = readbackData.object_sha;
         probe.append("reconciliation", { of: "cleanup-intent", outcome: objectSha === sha ? "present-unchanged" : "present-changed", object_sha: objectSha || null, measured_at: at() });
         settle();
         throw new IncompleteEvidence(UNDECIDED_DELETION);
@@ -1279,7 +1294,8 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
     }
 
     const readback = await session.request("GET", probeRefPath);
-    probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), ...refResponseIdentity(readback), measured_at: session.now().toISOString() });
+    const readbackData = { ref: PROBE_REF, ...facts(readback), ...refResponseIdentity(readback), measured_at: session.now().toISOString() };
+    probe.append("ref-readback", readbackData);
     if (readback.complete !== true || ![200, 404].includes(readback.status)) throw new IncompleteEvidence("the owned probe ref could not be read back before cleanup");
     if (readback.status === 404) {
       probe.append("absence-verified", { ref: PROBE_REF, ...facts(readback), measured_at: at() });
@@ -1288,8 +1304,9 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
       settle();
       return await close("cleaned-after-reconciliation");
     }
-    if (readback.body?.object?.sha !== sha) {
-      probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), ...refResponseIdentity(readback), measured_at: at() });
+    const readbackIdentity = asAssertion(() => assessRefResponseIdentity(readbackData, { expectedSha: sha, label: "the pre-delete probe ref readback" }));
+    if (readbackIdentity.classification === "incomplete") throw new IncompleteEvidence("the owned probe ref has an incomplete affirmative identity before cleanup");
+    if (readbackIdentity.classification === "contradictory") {
       // `settle` is what refuses, and it is what makes the refusal STICK: the recorded readback
       // leaves the ownership permanently uncertain, so a later invocation finding the ref restored
       // to the reviewed SHA derives the same answer instead of deleting somebody else's ref. The
@@ -1307,7 +1324,8 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
     probe.append("cleanup-result", { ref: PROBE_REF, expected_sha: sha, outcome, exit_code: Number.isInteger(deletion?.exit_code) ? deletion.exit_code : null });
     if (outcome === "lease-refused") throw new AssertionFailure("the lease deletion was refused: the owned probe ref changed, and it is left untouched");
     const after = await session.request("GET", probeRefPath);
-    probe.append("ref-readback", { ref: PROBE_REF, ...facts(after), ...refResponseIdentity(after), measured_at: session.now().toISOString() });
+    const afterData = { ref: PROBE_REF, ...facts(after), ...refResponseIdentity(after), measured_at: session.now().toISOString() };
+    probe.append("ref-readback", afterData);
     if (after.complete === true && after.status === 404) {
       if (outcome === "ambiguous") probe.append("reconciliation", { of: "cleanup-intent", outcome: "absent", object_sha: null, measured_at: at() });
       probe.append("absence-verified", { ref: PROBE_REF, ...facts(after), measured_at: at() });
@@ -1315,7 +1333,10 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
       return await close("cleaned");
     }
     if (after.complete === true && after.status === 200) {
-      const objectSha = String(after.body?.object?.sha ?? "");
+      const identity = asAssertion(() => assessRefResponseIdentity(afterData, { expectedSha: sha, label: "the post-delete probe ref readback" }));
+      if (identity.classification === "contradictory") throw new AssertionFailure(identity.reason);
+      if (identity.classification === "incomplete") throw new IncompleteEvidence("the owned probe ref has an incomplete affirmative identity after deletion; cleanup remains unresolved");
+      const objectSha = afterData.object_sha;
       probe.append("reconciliation", { of: "cleanup-intent", outcome: objectSha === sha ? "present-unchanged" : "present-changed", object_sha: objectSha || null, measured_at: at() });
       settle();
       throw new IncompleteEvidence(UNDECIDED_DELETION);

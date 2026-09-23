@@ -1437,8 +1437,13 @@ export function assessRefOwnership(records, { workflowSha }) {
       case "ref-readback":
         if (data.response_complete === true && data.http_status === 200) {
           const identity = assessRefResponseIdentity(data, { expectedSha: workflowSha, label: "the probe ref readback" });
-          if (!identity.matches) {
-            contradict(identity.reason, identity.classification === "contradictory" ? "assertion" : "incomplete");
+          if (identity.classification === "contradictory") {
+            contradict(identity.reason, "assertion");
+          } else if (identity.classification === "incomplete") {
+            // A structurally incomplete affirmative response is no observation of identity. Keep
+            // the existing creation/deletion authority and any pending mutation exactly as they
+            // were so a later bounded exact read can recover it. Only retained contrary values are
+            // sticky contradictions.
           } else if (state === "unowned" && pending?.of === "ref-create-intent") {
             contradict("the probe ref exists after a create whose application was not established; ownership is uncertain, so it is never adopted or deleted automatically — root reconciliation is required", "incomplete");
           } else {
