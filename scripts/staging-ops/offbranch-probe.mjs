@@ -106,7 +106,16 @@ const repoWeb = (repository = PROBE_REPOSITORY) => `${WEB_ORIGIN}/${repository}`
 export class ProbeRefusal extends Error {
   constructor(message) { super(message); this.name = "ProbeRefusal"; }
 }
+/** A retained, hash-valid provider listing that cannot establish a complete qualification view. */
+export class ProbeProviderIncomplete extends ProbeRefusal {
+  constructor(category, message) {
+    super(message);
+    this.name = "ProbeProviderIncomplete";
+    this.category = category;
+  }
+}
 const refuse = (message) => { throw new ProbeRefusal(message); };
+const providerIncomplete = (category, message) => { throw new ProbeProviderIncomplete(category, message); };
 
 // ──────────────────────────────────────────────────────────────────────────────
 // 2. Derived local file names. Plain basenames inside the private evidence directory.
@@ -357,11 +366,15 @@ function parseJsonBytes(bytes, label) {
 
 /** A retained descriptor (closed, ≤64KiB) or raw provider body (≤1MiB), parsed. */
 export const readDescriptor = (dir, ref, label) => parseJsonBytes(readRetained(dir, ref, { maxBytes: MAX_DESCRIPTOR_BYTES, label }), label);
-function readRaw(dir, ref, label, fields) {
+function readRawEnvelope(dir, ref, label, fields) {
   const bytes = readRetained(dir, ref, { maxBytes: MAX_RAW_CAPTURE_BYTES, label, fields });
   const started = timeOf(ref.started_at, `${label} started_at`);
   const completed = timeOf(ref.completed_at, `${label} completed_at`);
   if (completed < started) refuse(`${label} completed before it started`);
+  return { bytes, started, completed };
+}
+function readRaw(dir, ref, label, fields) {
+  const { bytes, started, completed } = readRawEnvelope(dir, ref, label, fields);
   const body = parseJsonBytes(bytes, label);
   if (body === null || typeof body !== "object") refuse(`${label} is not a JSON object or array`);
   return { body, started, completed };
@@ -377,6 +390,48 @@ function readPages(dir, pages, label) {
     const { page, ...raw } = ref;
     return { page, ...readRaw(dir, raw, `${label} page ${page}`, RAW_REF_FIELDS) };
   });
+}
+
+/**
+ * Validate the retained jobs page set for recovery admission. Descriptor/reference integrity is a
+ * hard refusal; only the provider body's shape/count/pagination can be classified incomplete.
+ */
+export function readAdmissionJobPages(dir, pages, label = "the admission jobs") {
+  if (!Array.isArray(pages) || !pages.length) refuse(`${label} retains no pages`);
+  if (pages.length > MAX_PAGES) refuse(`${label} retains more than ${MAX_PAGES} pages`);
+  const parsed = pages.map((ref, index) => {
+    assertClosed(ref, PAGED_RAW_REF_FIELDS, `${label} page ${index + 1}`);
+    if (ref.page !== index + 1) refuse(`${label} pages are not the contiguous sequence 1..${pages.length}`);
+    const { page, ...raw } = ref;
+    const capture = readRawEnvelope(dir, raw, `${label} page ${page}`, RAW_REF_FIELDS);
+    let text;
+    try { text = STRICT_UTF8.decode(capture.bytes); }
+    catch { providerIncomplete("jobs-page-invalid-utf8", `${label} page ${page} is not valid UTF-8`); }
+    let body;
+    try { body = JSON.parse(text); }
+    catch { providerIncomplete("jobs-page-invalid-json", `${label} page ${page} is not parseable JSON`); }
+    if (!isPlainObject(body) || !Array.isArray(body.jobs)) {
+      providerIncomplete("jobs-page-malformed", `${label} page ${page} is not the documented shape`);
+    }
+    if (!Number.isSafeInteger(body.total_count) || body.total_count < 0) {
+      providerIncomplete("jobs-total-missing-or-invalid", `${label} page ${page} has no valid total_count`);
+    }
+    if (body.jobs.length > PAGE_SIZE) providerIncomplete("jobs-page-malformed", `${label} page ${page} exceeds the fixed page size`);
+    return { page, body, started: capture.started, completed: capture.completed };
+  });
+  const total = parsed[0].body.total_count;
+  if (parsed.some((page) => page.body.total_count !== total)) {
+    providerIncomplete("jobs-total-mismatch", `${label} pages disagree about their total count`);
+  }
+  if (parsed.slice(0, -1).some((page) => page.body.jobs.length !== PAGE_SIZE)) {
+    providerIncomplete("jobs-page-truncated", `${label} has a short non-terminal page`);
+  }
+  const rows = parsed.flatMap((page) => page.body.jobs);
+  if (rows.length !== total) providerIncomplete("jobs-row-count-mismatch", `${label} listing is incomplete`);
+  if (parsed.length !== Math.max(1, Math.ceil(total / PAGE_SIZE))) {
+    providerIncomplete("jobs-terminal-page-missing", `${label} was not read to its terminal page`);
+  }
+  return { pages: parsed, rows };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1035,8 +1090,14 @@ export function assertOriginalProbeIdentity(body, { commissioning, dispatcher, b
     || body.event !== "workflow_dispatch" || body.head_branch !== "staging") refuse("the original source/workflow/event/branch identity does not match its trusted intent");
   if (typeof dispatcher !== "string" || !dispatcher) refuse("the original trusted intent has no declared dispatcher");
   for (const field of ["actor", "triggering_actor"]) {
-    if (typeof body[field]?.login !== "string" || !/^[A-Za-z0-9][A-Za-z0-9-]*$/.test(body[field].login)
-      || !["User", "Bot", "Organization"].includes(body[field]?.type)) refuse(`the original ${field} tuple is malformed`);
+    const type = body[field]?.type;
+    const login = body[field]?.login;
+    const loginMatchesType = type === "Bot"
+      ? /^[A-Za-z0-9][A-Za-z0-9-]*\[bot\]$/.test(login)
+      : /^(?:[A-Za-z0-9][A-Za-z0-9-]*)$/.test(login);
+    if (typeof login !== "string" || !["User", "Bot", "Organization"].includes(type) || !loginMatchesType) {
+      refuse(`the original ${field} tuple is malformed`);
+    }
   }
   const identity = { actor: parseActor(body.actor, "the original actor"), triggering_actor: parseActor(body.triggering_actor, "the original triggering actor") };
   if (identity.actor.login !== dispatcher) refuse("the original actor differs from its declared dispatcher");
@@ -1069,11 +1130,7 @@ export function deriveProbeAdmissions(dir, { runCapture, jobsDescriptor, commiss
   const descriptor = readDescriptor(dir, jobsDescriptor, "the admission jobs");
   assertClosed(descriptor, CAPTURE_DESCRIPTORS.jobs.fields, "the admission jobs descriptor");
   if (descriptor.kind !== "jobs" || descriptor.capture_schema_version !== CAPTURE_SCHEMA_VERSION) refuse("invalid admission jobs descriptor");
-  const pages = readPages(dir, descriptor.pages, "the admission jobs");
-  const rows = pages.flatMap((page) => Array.isArray(page.body.jobs) ? page.body.jobs : []);
-  const total = pages[0].body.total_count;
-  if (!Number.isSafeInteger(total) || rows.length !== total || pages.some((page) => page.body.total_count !== total)
-    || pages.length !== Math.max(1, Math.ceil(total / PAGE_SIZE))) refuse("the admission jobs listing is incomplete");
+  const { pages, rows } = readAdmissionJobPages(dir, descriptor.pages);
   const admitted = [];
   for (const spec of PROBE_JOBS) {
     const matches = rows.filter((job) => job?.name === spec.job_key);
@@ -1102,7 +1159,7 @@ export function verifyProbeRecoveryHistory(records, { dir, commissioning }) {
     if (["capture-progress", "capture-failed", "qualification-ended", "admission-observed"].includes(row.type)
       && (!identified || data.run_id !== identified.data.run_id)) refuse("a recovery disposition names an unowned run");
     if (row.type === "capture-progress") {
-      const raw = readRaw(dir, data.capture, "the retained capture progress", RAW_REF_FIELDS);
+      const raw = readRawEnvelope(dir, data.capture, "the retained capture progress", RAW_REF_FIELDS);
       if (raw.completed > Date.parse(row.ts)) refuse("capture progress predates its provider read");
     }
     if (row.type === "capture-failed") {
@@ -1129,7 +1186,8 @@ export function assessProbePhaseState(records, { workflowSha }) {
   const has = (type) => records.some((row) => row.type === type);
   const observations = records.filter((row) => row.type === "observation-recorded");
   const captures = records.filter((row) => row.type === "capture-recorded");
-  const paired = PROBE_ENVIRONMENTS.every((environment) => observations.filter((row) => row.data.environment === environment).length === 1)
+  const paired = PROBE_ENVIRONMENTS.every((environment) => observations.filter((row) => row.data.environment === environment
+    && ["refused", "admitted"].includes(row.data.outcome)).length === 1)
     && ["run", "jobs"].every((kind) => captures.filter((row) => row.data.kind === kind).length === 1)
     && PROBE_ENVIRONMENTS.every((environment) => captures.some((row) => row.data.kind === "denial" && row.data.environment === environment));
   const failed = has("admission-observed") || observations.some((row) => row.data.outcome === "admitted");

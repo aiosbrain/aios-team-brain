@@ -47,11 +47,11 @@ import {
   CANCEL_CONFIRM_MS, CAPTURE_SCHEMA_VERSION, DIAGNOSTIC_SCHEMA_VERSION, DISPATCH_DEADLINE_MS, MAX_PAGES, OFFBRANCH_CONTROL,
   OFFBRANCH_SCHEMA_VERSION, PAGE_SIZE, PROBE_ATTEMPT, PROBE_BRANCH, PROBE_DISPATCHER, PROBE_ENVIRONMENTS, PROBE_EVENT,
   PROBE_INTENT_SCHEMA_VERSION, PROBE_JOBS, PROBE_REF, PROBE_WORKFLOW_FILE, PROBE_WORKFLOW_PATH, PROBE_WORKFLOW_SHA256,
-  ProbeRefusal, RESOURCE_LINK_EVENT, SOURCE_OBSERVED_EVENT, assertInertProbeWorkflow, assertProbeEventPayload, assertProbeRunIdentity,
+  ProbeProviderIncomplete, ProbeRefusal, RESOURCE_LINK_EVENT, SOURCE_OBSERVED_EVENT, assertInertProbeWorkflow, assertProbeEventPayload, assertProbeRunIdentity,
   deriveProbeResolutionEvents, verifyIdentifiedProbeRun, deriveProbeAdmissions, verifyProbeRecoveryHistory, assessProbePhaseState, assessOriginalProbeBinding, assertOriginalProbeIdentity,
   assessRefOwnership, assessRunContinuity, assessRunSelectionContinuity, assessSourceContinuity, commissioningIdentity, inducedAutomation,
   parseCheckRunUrl, parseProbeIntent, probeCaptureName, probeIntentName, probeJournalName, probeObservationName,
-  readPolicyDescriptor, selectEligibleRuns, unresolvedProbeIntents, verifyProbeCaptures,
+  readAdmissionJobPages, readPolicyDescriptor, selectEligibleRuns, unresolvedProbeIntents, verifyProbeCaptures,
 } from "./offbranch-probe.mjs";
 
 export const PROBE_PHASES = Object.freeze(["stage", "dispatch", "collect", "cancel", "cleanup"]);
@@ -994,12 +994,20 @@ export async function runCollect({ runId, attempt, evidenceDir, env, deps }) {
 }
 
 function retainAdmissions(session, probe, runId, runCapture, jobsDescriptor) {
-  const admitted = asIncomplete(() => deriveProbeAdmissions(session.dir, { runCapture, jobsDescriptor, commissioning: session.commissioning, runId }));
+  let admitted;
+  try {
+    admitted = deriveProbeAdmissions(session.dir, { runCapture, jobsDescriptor, commissioning: session.commissioning, runId });
+  } catch (error) {
+    if (error instanceof ProbeProviderIncomplete) return { complete: false, category: error.category };
+    if (error instanceof ProbeRefusal) throw new AssertionFailure(error.message);
+    throw error;
+  }
   for (const fact of admitted) {
     if (!probe.records().some((row) => row.type === "admission-observed" && row.data.environment === fact.environment)) {
       probe.append("admission-observed", { run_id: runId, ...fact, run_capture: runCapture, jobs_descriptor: jobsDescriptor });
     }
   }
+  return { complete: true, admitted };
 }
 
 export async function runCancel({ runId, attempt, evidenceDir, env, deps }) {
@@ -1027,14 +1035,18 @@ export async function runCancel({ runId, attempt, evidenceDir, env, deps }) {
         // append. Reuse those exact retained pages; this is recovery of original facts, no re-read.
         if (!jobs) {
           const pages = records.filter((row) => row.type === "capture-progress" && row.data.kind === "jobs");
-          const bodies = pages.map((row) => JSON.parse(readFileSync(path.join(session.dir, row.data.capture.artifact), "utf8")));
-          const total = bodies[0]?.total_count;
-          if (pages.length && Number.isSafeInteger(total) && pages.every((row, index) => row.data.page === index + 1)
-            && bodies.every((body) => body.total_count === total && Array.isArray(body.jobs))
-            && bodies.reduce((count, body) => count + body.jobs.length, 0) === total
-            && pages.length === Math.max(1, Math.ceil(total / PAGE_SIZE))) {
-            const descriptor = writeDescriptor(session, { capture_schema_version: CAPTURE_SCHEMA_VERSION, kind: "jobs", pages: pages.map((row) => ({ page: row.data.page, ...row.data.capture })) });
-            jobs = probe.append("capture-recorded", { kind: "jobs", environment: null, descriptor, completed_at: pages.at(-1).data.capture.completed_at });
+          if (pages.length) {
+            let complete = true;
+            try { readAdmissionJobPages(session.dir, pages.map((row) => ({ page: row.data.page, ...row.data.capture }))); }
+            catch (error) {
+              if (error instanceof ProbeProviderIncomplete) complete = false;
+              else if (error instanceof ProbeRefusal) throw new AssertionFailure(error.message);
+              else throw error;
+            }
+            if (complete) {
+              const descriptor = writeDescriptor(session, { capture_schema_version: CAPTURE_SCHEMA_VERSION, kind: "jobs", pages: pages.map((row) => ({ page: row.data.page, ...row.data.capture })) });
+              jobs = probe.append("capture-recorded", { kind: "jobs", environment: null, descriptor, completed_at: pages.at(-1).data.capture.completed_at });
+            }
           }
         }
         const firstJobPage = records.find((row) => row.type === "capture-progress" && row.data.kind === "jobs");

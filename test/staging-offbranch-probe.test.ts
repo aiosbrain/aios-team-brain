@@ -22,7 +22,7 @@ import { acquireJournalLock, journalPath, openJournal, readJournal, readLockOwne
 import {
   GENERIC_DIAGNOSTIC_MESSAGE, OFFBRANCH_CONTROL, PROBE_BRANCH, PROBE_JOBS, PROBE_JOURNAL_EVENTS, PROBE_REF,
   PROBE_WORKFLOW_FILE, PROBE_WORKFLOW_PATH, SOURCE_OBSERVED_EVENT, assertPolicyAgreesWithCommissioning, assessRefOwnership,
-  assessSourceContinuity, commissioningIdentity,
+  assessProbePhaseState, assessSourceContinuity, commissioningIdentity,
   parseCheckRunUrl, parseDiagnosticAnnotations, parseEnvironmentPolicy, parseProbeCheck, parseProbeJobs, parseProbeRun,
   probeIntentName, probeObservationName, selectEligibleRuns, specificDiagnosticMessage,
 } from "../scripts/staging-ops/offbranch-probe.mjs";
@@ -62,6 +62,9 @@ class World {
   otherSha: string;
   calls: Array<{ method: string; path: string; body?: unknown }> = [];
   originalRunStatus = "in_progress";
+  originalDispatcher = "original-dispatcher";
+  originalActor: any = { id: 22, login: "original-dispatcher", type: "User" };
+  originalTrigger: any = { id: 23, login: "original-trigger", type: "User" };
   approvals: any[] = [];
   registrationCreatedAt = "2026-09-01T00:00:00Z";
   sourceBytes: Buffer = PROBE_YAML;
@@ -194,7 +197,7 @@ class World {
     if (p === "" ) return { status: 200, body: { id: REPO_ID, full_name: REPO, default_branch: "staging" } };
     if (p === "/git/ref/heads/staging") return { status: 200, body: { ref: "refs/heads/staging", object: { sha: this.sha, type: "commit" } } };
     if (p === `/actions/runs/${RUN_ID}/attempts/${ATTEMPT}`) {
-      return { status: 200, body: { id: Number(RUN_ID), run_attempt: Number(ATTEMPT), repository: { id: REPO_ID, full_name: REPO }, head_repository: { id: REPO_ID, full_name: REPO }, actor: { id: 22, login: "original-dispatcher", type: "User" }, triggering_actor: { id: 23, login: "original-trigger", type: "User" }, head_sha: this.sha, path: COMMISSIONING_WORKFLOW_PATH, event: "workflow_dispatch", head_branch: "staging", status: this.originalRunStatus } };
+      return { status: 200, body: { id: Number(RUN_ID), run_attempt: Number(ATTEMPT), repository: { id: REPO_ID, full_name: REPO }, head_repository: { id: REPO_ID, full_name: REPO }, actor: { ...this.originalActor }, triggering_actor: { ...this.originalTrigger }, head_sha: this.sha, path: COMMISSIONING_WORKFLOW_PATH, event: "workflow_dispatch", head_branch: "staging", status: this.originalRunStatus } };
     }
     if (p === `/actions/runs/${RUN_ID}/approvals`) return { status: 200, body: this.approvals };
     if (p === `/actions/runs/${RUN_ID}/attempts/${ATTEMPT}/jobs`) return { status: 200, body: { total_count: 1, jobs: [{ name: PROTECTED_JOBS[1].name, status: "waiting" }] } };
@@ -274,7 +277,7 @@ class World {
     writeEvidenceFile(this.dir, evidenceSlug(RUN_ID, ATTEMPT, "intent"), {
       schema_version: 1, issue: "AIO-1124", phase: "intent", repository: REPO, repository_id: REPO_ID, run_id: RUN_ID, attempt: ATTEMPT,
       workflow_path: COMMISSIONING_WORKFLOW_PATH, workflow_sha: this.sha, dispatch_ref: "refs/heads/staging", event: "workflow_dispatch",
-      provider_measured: false, dispatcher: "original-dispatcher",
+      provider_measured: false, dispatcher: this.originalDispatcher,
       // The rest of the closed intent manifest; values irrelevant to the probe, present so the intent binds.
       derived_refs: {}, derived_contexts: [], graph_plan: [], normal_app_id: 1, emergency_app_id: 2, producer_ids_hash: "0".repeat(64),
       normal_installation_id: "11", emergency_installation_id: "12",
@@ -2243,6 +2246,60 @@ describe("phase admission and terminal recovery", () => {
     await expect(invoke("dispatch", { transport })).rejects.toThrow(/actor identity/);
     expect(world.calls.filter((call) => call.method !== "GET")).toHaveLength(0);
   });
+
+  for (const role of ["actor", "triggering_actor"] as const) {
+    it(`accepts a documented App slug[bot] as the distinct original ${role} through offline validation`, async () => {
+      if (role === "actor") {
+        world.originalDispatcher = "commissioning-dispatcher[bot]";
+        world.originalActor = { id: 2201, login: "commissioning-dispatcher[bot]", type: "Bot" };
+      } else {
+        world.originalTrigger = { id: 2301, login: "commissioning-trigger[bot]", type: "Bot" };
+      }
+      const collected: any = await world.fullProbe();
+      for (const environment of Object.keys(ENV_IDS)) expect(world.validate(collected.records[environment], environment)).toBeNull();
+      writeEvidenceFile(world.dir, evidenceSlug(RUN_ID, ATTEMPT, "environment"), {
+        schema_version: 1, phase: "environment-controls", run_id: RUN_ID, attempt: ATTEMPT,
+        controls: { [OFFBRANCH_CONTROL]: collected.records },
+      });
+      const blockers = assessEvidence({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, now: () => new Date(world.clock + 1000) }).blockers;
+      expect(blockers.filter((entry: any) => entry.detail.includes(OFFBRANCH_CONTROL))).toEqual([]);
+    });
+  }
+
+  for (const [type, login] of [["User", "commissioning-dispatcher[bot]"], ["Bot", "commissioning-dispatcher"], ["Bot", "[bot]"], ["Bot", "dispatcher[bot]extra"]]) {
+    it(`rejects type-inconsistent or malformed original identity ${type}/${login}`, async () => {
+      world.originalDispatcher = login;
+      world.originalActor = { id: 2201, login, type };
+      world.seedOriginal();
+      await expect(invoke("stage")).rejects.toThrow(/tuple is malformed/);
+      expect(world.calls.filter((call) => call.method !== "GET")).toHaveLength(0);
+    });
+  }
+
+  for (const shape of ["missing-total", "mismatched-total", "malformed-page", "truncated-pages", "malformed-diagnostic"]) {
+    it(`terminal ${shape} remains nonaccepting but explicit abort and repeated cleanup recover the exact owned ref`, async () => {
+      world.seedOriginal(); await invoke("stage"); await invoke("dispatch");
+      const transport = async (method: string, route: string, body: any) => {
+        const response: any = world.respond(method, route, body);
+        if (/\/actions\/runs\/\d+\/jobs\?/.test(route)) {
+          if (shape === "missing-total") delete response.body.total_count;
+          if (shape === "mismatched-total") response.body.total_count += 1;
+          if (shape === "malformed-page") response.body.jobs = { malformed: true };
+          if (shape === "truncated-pages") response.body = { total_count: 101, jobs: response.body.jobs };
+        }
+        if (shape === "malformed-diagnostic" && route.includes("/annotations")) response.body = { annotations: [] };
+        return completedJsonResponse(response.status, Buffer.from(JSON.stringify(response.body)), createRedactor(), { retainRaw: true });
+      };
+      await expect(invoke("collect", { transport })).rejects.toThrow();
+      expect((await invoke("cancel") as any).status).toBe("terminal-aborted");
+      expect((await invoke("cancel") as any).status).toBe("terminal-aborted");
+      expect((await invoke("cleanup") as any).outcome).toBe("inconclusive");
+      expect((await invoke("cleanup") as any).status).toBe("already-closed");
+      expect(world.refSha()).toBeNull();
+      expect(world.count("POST", "/cancel")).toBe(0);
+      expect(assessProbePhaseState(world.probeRecords(), { workflowSha: world.sha }).qualification).toBe("inconclusive");
+    });
+  }
 });
 
 
