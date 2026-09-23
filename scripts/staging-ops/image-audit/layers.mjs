@@ -316,15 +316,16 @@ export function mergedFilesystem(layerPaths, {
   const isDirectoryKey = (key) => key.endsWith("/") || key === ".";
 
   /**
-   * Is any proper ancestor of this MARKER currently a non-directory — from a lower layer, or written
-   * earlier in this same layer — with no explicit directory entry before the marker to replace it?
+   * Is any proper ancestor this member needs RIGHT NOW an occupied non-directory? `visible` holds the
+   * layers below plus whatever this layer's earlier whiteouts have already removed, so a prior removal
+   * or an earlier explicit directory replacement makes the parent legitimate; anything later does not.
    * Bounded by the shared work authority, one step per ancestor, and it follows no link.
    */
-  const markerParentConflict = (markerName, explicitDirsSeen, nonDirsSeenHere) => ancestors(markerName, (ancestor) => {
-    if (explicitDirsSeen.has(ancestor)) return false; // replaced by an explicit directory, before the marker
+  const extractionParentConflict = (path, explicitDirsSeen, nonDirsSeenHere) => ancestors(path, (ancestor) => {
+    if (explicitDirsSeen.has(ancestor)) return false; // replaced by an explicit directory, before this event
     const bare = ancestor.slice(0, -1);
-    if (nonDirsSeenHere.has(bare)) return true; // a file this layer wrote earlier
-    return visible.has(bare) && !isDirectoryKey(bare); // a file a lower layer left there
+    if (nonDirsSeenHere.has(bare)) return true; // a non-directory this layer wrote earlier
+    return visible.has(bare) && !isDirectoryKey(bare); // a non-directory a lower layer left there
   });
 
   /**
@@ -403,7 +404,25 @@ export function mergedFilesystem(layerPaths, {
     const earlierOrdinary = [];
     for (const name of paths) {
       const white = whiteoutOf(name);
-      work.step("merged namespace marker");
+      work.step("merged namespace event");
+      /**
+       * THE ORDERED EXTRACTION-PARENT INVARIANT (round 11), applied to EVERY member event — ordinary
+       * entries and whiteout markers alike — BEFORE this event records any directory declaration or
+       * replacement of its own.
+       *
+       * The pinned extractor prepares a member's parents before it creates or interprets that member,
+       * and preparing a parent that is currently a regular file, a hardlink, a FIFO or a link fails
+       * with ENOTDIR. So a member written under such a parent never appears, whatever the layer does
+       * LATER: a directory entry further down the tar cannot repair an extraction that already failed.
+       * Checking the chain here, in tar order, is what makes "later" impossible to mistake for "before"
+       * — an earlier whiteout that removed the blocking ancestor, or an earlier explicit directory that
+       * replaced it, is respected because it has already been applied to this state.
+       *
+       * Directory members are checked too: a directory below a blocking ancestor is as impossible as a
+       * file. The gap is the existing sticky `merged-type-conflict`, every byte is still staged, and no
+       * link is followed.
+       */
+      if (extractionParentConflict(name, explicitDirsSeen, nonDirsSeenHere)) conflicts.add(index);
       if (white.kind === "none") {
         // Ordinary entries are remembered in order, so a later marker can ask what preceded it.
         retained.membership();
@@ -425,9 +444,6 @@ export function mergedFilesystem(layerPaths, {
        * explicit directory entry earlier in THIS layer does replace it, and is respected; a declaration
        * after the marker does not retroactively make it valid.
        */
-      if ((white.kind === "delete" || white.kind === "opaque") && markerParentConflict(name, explicitDirsSeen, nonDirsSeenHere)) {
-        conflicts.add(index);
-      }
       /**
        * B10 applies to the ROOT marker too (round 9). A root `.wh..wh..opq` after entries that created
        * `app/` and `app/d/` implicitly is the same ambiguity one level up: the non-overlay converter can
@@ -472,11 +488,11 @@ export function mergedFilesystem(layerPaths, {
           if (isLower(existing)) remove(existing, index, "replaced-by-non-directory");
         }
       }
-      // Writing beneath a path a LOWER layer left as a non-directory is not a merge any extractor agrees on.
-      ancestors(key, (ancestor) => {
-        const bare = ancestor.slice(0, -1);
-        if (isLower(bare) && !keys.has(ancestor)) conflicts.add(index);
-      });
+      /**
+       * The old whole-layer check lived here and asked whether the layer declared the directory ANYWHERE
+       * (`keys.has(ancestor)`), which let a later declaration excuse an earlier member. The ordered
+       * invariant in pass 1 replaces it: it asks what existed when the member was actually written.
+       */
       if (visible.has(key)) remove(key, index, "overwritten");
       place(key, index);
       rememberPlaced(key);
