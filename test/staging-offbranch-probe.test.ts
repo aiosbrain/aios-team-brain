@@ -1902,7 +1902,8 @@ describe("R05-F1: a successful deletion ends that creation's ownership irreversi
       .rejects.toThrow(/not the fixed probe ref at the reviewed commit/);
     expect(deletions).toBe(0);
     expect(world.refSha()).toBe(world.sha);
-    expect(world.validate(collected.records["staging-release"], "staging-release")).toMatch(/does not support acceptance \(the owned probe ref points at a SHA/);
+    expect(world.validate(collected.records["staging-release"], "staging-release"))
+      .toMatch(/does not support acceptance \(the probe ref readback identifies .* not the fixed probe ref at the reviewed commit/);
   });
 
   it("refuses a ref that comes back after an absence this probe never explained", async () => {
