@@ -842,10 +842,30 @@ export const REF_OWNERSHIP_STATES = Object.freeze(["unowned", "owned", "ended", 
  *  - A ref measured at another SHA ends it too, and a later return to the reviewed SHA does not
  *    revive it. The state is monotonic, so a restored value cannot walk the contradiction back.
  *  - An UNDECIDED deletion — an ambiguous transport, or an intent whose result was never appended
- *    — stays undecided until evidence about THAT SAME operation decides it. Absence decides it
- *    applied. Presence at the reviewed SHA decides it unapplied ONLY while no successful deletion
- *    is on record; that, and only that, is the case that may issue one fresh lease deletion.
+ *    — stays undecided until evidence about THAT SAME operation decides it. EXACT ABSENCE decides
+ *    it applied. PRESENCE AT THE REVIEWED SHA DECIDES NOTHING AT ALL (R06).
  *  - Absence with no deletion of ours on record is a broken ownership history, not a clean end.
+ *
+ * ── WHY EQUAL BYTES CANNOT DECIDE AN UNDECIDED DELETION (R06) ───────────────────────────────────
+ *
+ * What this replaces treated "the deletion was ambiguous and the ref is still at the reviewed SHA"
+ * as proof the deletion did not apply, and issued one fresh lease deletion on that basis. Two
+ * histories produce byte-for-byte identical observations:
+ *
+ *   (A) the deletion never applied, and the ref this probe created still holds SHA S;
+ *   (B) the deletion applied, and ANOTHER creation has since put a new ref at the same SHA S.
+ *
+ * The expected-SHA lease tests S. It does not test creation identity, so it cannot separate them —
+ * and under (B) the "retry" deletes somebody else's ref. Nothing available to the operator decides
+ * between them: `createGitLeaseDeleter` distinguishes only `deleted`, the exact stale-info
+ * `lease-refused`, and otherwise `ambiguous`, and a stale-info refusal is evidence of a MISMATCHED
+ * ref condition, not of continuous ownership. So a matching presence is INERT here: it neither
+ * resolves the pending deletion nor contradicts ownership, and `may_delete` stays false for good.
+ * An exact 404 afterwards still resolves it — that observation really is about this ref.
+ *
+ * Every COMPLETE ref observation is reduced, whichever phase captured it and whatever the event is
+ * called: a post-create `ref-readback` of 404 is the same measured disappearance as an
+ * `absence-verified` 404 (R06-F1). An INCOMPLETE read is not an observation of anything.
  *
  * `uncertain` is terminal, and it survives a fresh process precisely because it is re-derived from
  * the journal rather than held in memory. The operator and the offline assessment both derive from
@@ -873,7 +893,9 @@ export function assessRefOwnership(records, { workflowSha }) {
     if (state === "ended") {
       return contradict("a deletion this probe recorded as successful did not remove the owned probe ref; that history is inconsistent, so no second deletion is issued — root reconciliation is required", "incomplete");
     }
-    pending = null;
+    // A ref present at the reviewed BYTES while a deletion of ours is undecided says nothing about
+    // that deletion: an unapplied delete and an applied-then-recreated one look exactly like this
+    // (R06). So `pending` is deliberately NOT cleared here — equal bytes are not a decision.
   };
   const observeAbsent = () => {
     if (state === "uncertain" || state === "unowned") return;
@@ -894,8 +916,12 @@ export function assessRefOwnership(records, { workflowSha }) {
       case "ref-readback":
         if (data.response_complete === true && data.http_status === 200) {
           observePresent(String(data.object_sha ?? ""), "the owned probe ref points at a SHA this probe did not create; it is never deleted");
-        }
+        // A COMPLETE 404 under this event is the same measured disappearance as one under
+        // `absence-verified` (R06-F1): the post-create readback is where it is actually seen, and
+        // reducing it only under the other event's name left the ownership standing.
+        } else if (data.response_complete === true && data.http_status === 404) observeAbsent();
         break;
+      case "ref-absent-verified":
       case "absence-verified":
         if (data.response_complete === true && data.http_status === 404) observeAbsent();
         break;
@@ -917,7 +943,7 @@ export function assessRefOwnership(records, { workflowSha }) {
         if (data.of === "ref-create-intent") {
           if (data.outcome === "present-ownership-uncertain") {
             contradict("the probe ref's ownership is uncertain; it is never deleted automatically — root reconciliation is required", "incomplete");
-          }
+          } else if (data.outcome === "absent") observeAbsent();
         } else if (data.of === "cleanup-intent") {
           if (data.outcome === "absent") observeAbsent();
           else if (data.outcome === "present-unchanged" || data.outcome === "present-changed") {

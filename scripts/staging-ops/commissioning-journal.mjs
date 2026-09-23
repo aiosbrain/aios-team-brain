@@ -34,7 +34,7 @@ import {
 } from "node:fs";
 import { hostname } from "node:os";
 import path from "node:path";
-import { PROBE_JOURNAL_EVENT_TYPES, RESOURCE_LINK_EVENT } from "./offbranch-probe.mjs";
+import { PROBE_JOURNAL_EVENT_TYPES, RESOURCE_LINK_EVENT, SOURCE_OBSERVED_EVENT } from "./offbranch-probe.mjs";
 
 export const JOURNAL_SCHEMA_VERSION = 1;
 
@@ -79,6 +79,15 @@ export const JOURNAL_EVENTS = Object.freeze([
    * and it points forward only — a probe cannot attach itself to an attempt that never staged it.
    */
   RESOURCE_LINK_EVENT,
+  /**
+   * A MEASURED LIVE SOURCE observed by a phase that has no probe journal to write it into yet
+   * (R06-F3). PC-06's staging phase measures the live head before anything is staged; when that
+   * head has moved, the refusal must leave a durable trace, or restoring staging lets the very same
+   * attempt stage later as though the move had never been seen. This original attempt's own
+   * hash-chained journal is the trusted bound history available at that moment — nothing is
+   * fabricated to hold it, and a journal already closed is never reopened to log it.
+   */
+  SOURCE_OBSERVED_EVENT,
   "run-closed",
 ]);
 
