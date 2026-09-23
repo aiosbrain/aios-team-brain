@@ -1236,13 +1236,17 @@ describe("lifecycle ownership: create once, dispatch once, never adopt, never re
     expect(readdirSync(world.dir).includes(probeObservationName(RUN_ID, ATTEMPT, "staging-release"))).toBe(false);
   });
 
-  it("leaves the control unverified when the policy drifts across the probe", async () => {
+  it("keeps observed policy drift failed before any observation is accepted", async () => {
     world.seedOriginal();
     world.afterDispatchPolicyChange = () => { world.branchPolicies["staging-emergency"] = [{ id: 73, node_id: "BP3", name: "staging", type: "branch" }]; };
     await world.phase("stage");
     await world.phase("dispatch");
-    await expect(world.phase("collect")).rejects.toThrow(/unverified/);
-    expect(world.probeRecords().filter((record: any) => record.type === "observation-recorded").map((r: any) => r.data.outcome)).toContain("unverified");
+    await expect(world.phase("collect")).rejects.toThrow(/FAILED/);
+    expect(world.probeRecords().some((record: any) => record.type === "policy-observed" && record.data.environment === "staging-emergency")).toBe(true);
+    expect(world.probeRecords().filter((record: any) => record.type === "observation-recorded")).toHaveLength(0);
+    expect((await world.phase("cancel") as any).outcome).toBe("failed");
+    expect((await world.phase("cleanup") as any).outcome).toBe("failed");
+    expect(world.refSha()).toBeNull();
   });
 
   it("leaves the control unverified for an unknown diagnostic shape", async () => {

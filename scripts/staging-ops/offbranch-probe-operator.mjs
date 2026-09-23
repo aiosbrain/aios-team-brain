@@ -1002,7 +1002,14 @@ export async function runCollect({ runId, attempt, evidenceDir, env, deps }) {
       probe.append("capture-failed", { run_id: captureRunId, phase: "collect", category: captureCategory,
         capture_sequences: probe.records().filter((row) => ["capture-progress", "capture-recorded", "run-observed"].includes(row.type)).map((row) => row.seq) });
     }
-    if (assessProbePhaseState(probe.records(), { workflowSha: session.commissioning.workflow_sha, dir: session.dir, baselinePolicy: session.probeIntent.baseline_policy }).failed) throw new AssertionFailure("the cumulative probe evidence FAILED; retained captures require explicit cancel before cleanup");
+    const retained = probe.records();
+    if (assessProbePhaseState(retained, { workflowSha: session.commissioning.workflow_sha, dir: session.dir, baselinePolicy: session.probeIntent.baseline_policy }).failed) {
+      const admitted = retained.some((row) => row.type === "admission-observed"
+        || (row.type === "observation-recorded" && row.data.outcome === "admitted"));
+      throw new AssertionFailure(admitted
+        ? "an exactly bound probe job was admitted; the negative control FAILED and retained captures require explicit cancel before cleanup"
+        : "the cumulative probe evidence FAILED; retained captures require explicit cancel before cleanup");
+    }
     throw error;
   } finally {
     probe.lock.release();
