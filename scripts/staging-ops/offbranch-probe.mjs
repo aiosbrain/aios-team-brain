@@ -973,6 +973,8 @@ export function deriveProbeResolutionEvents(records, { dir, commissioning }) {
         && row.data.ref === PROBE_REF && row.data.response_complete === true && row.data.http_status === 404
         && row.data.measured_status === 404 && row.data.response_incomplete === null);
       if (!absence || ownership.state === "uncertain") continue;
+      const measured = timeOf(absence.data.measured_at, "the retained absence measurement");
+      if (measured < timeOf(intent.ts, "the ref mutation intent") || measured > timeOf(absence.ts, "the retained absence journal time")) refuse("the retained absence is outside its mutation and journal bounds");
       const supported = type === "ref-create-intent" ? ownership.state === "unowned" : ownership.state === "ended" && ownership.absence_confirmed;
       if (!supported) continue;
       if (pending.some((row) => row.seq === intent.seq)) reconciliation(type, "absent", absence);
@@ -1096,6 +1098,7 @@ export function verifyProbeRecoveryHistory(records, { dir, commissioning }) {
   const identified = records.find((row) => row.type === "run-identified");
   for (const row of records) {
     const data = row.data;
+    if (row.type === "qualification-incomplete" && timeOf(data.observed_at, "the qualification gap observation") > timeOf(row.ts, "the qualification gap journal time")) refuse("the qualification gap predates its observation");
     if (["capture-progress", "capture-failed", "qualification-ended", "admission-observed"].includes(row.type)
       && (!identified || data.run_id !== identified.data.run_id)) refuse("a recovery disposition names an unowned run");
     if (row.type === "capture-progress") {

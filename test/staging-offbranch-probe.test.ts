@@ -2319,3 +2319,116 @@ describe("durable close and capture process cuts", () => {
     expect((await world.phase("cleanup") as any).status).toBe("nothing-owned");
   });
 });
+
+/** Each prefix is a real fsynced public sequence; provider effects survive the process cut. */
+describe("durable effect recovery matrix", () => {
+  const cutAfter = (predicate: (row: any) => boolean) => {
+    const file = journalPath(world.dir, RUN_ID, ATTEMPT, "probe");
+    const lines = readFileSync(file, "utf8").trimEnd().split("\n");
+    const index = lines.findIndex((line) => predicate(JSON.parse(line)));
+    expect(index).toBeGreaterThanOrEqual(0);
+    writeFileSync(file, `${lines.slice(0, index + 1).join("\n")}\n`, { mode: 0o600 });
+  };
+  for (const boundary of ["ref-create-intent", "ref-readback", "reconciliation"]) {
+    it(`create with missing result resumes after ${boundary} without another POST`, async () => {
+      world.seedOriginal(); await world.phase("stage");
+      await expect(world.phase("dispatch", { transport: async (method: string, route: string, body: any) => {
+        if (method === "POST" && route.endsWith("/git/refs")) {
+          world.calls.push({ method, path: route, body }); throw new Error("cut before create effect/result");
+        }
+        return world.transport(method, route, body);
+      } })).rejects.toThrow(/cut before create/);
+      await world.phase("cleanup");
+      cutAfter((row) => row.type === boundary);
+      expect((await world.phase("cleanup") as any).status).toBe("nothing-owned");
+      expect((await world.phase("cleanup") as any).status).toBe("already-closed");
+      expect(world.count("POST", "/git/refs")).toBe(1); expect(world.refSha()).toBeNull();
+      expect(world.probeRecords().filter((row: any) => row.type === "reconciliation" && row.data.of === "ref-create-intent")).toHaveLength(1);
+    });
+  }
+  for (const boundary of ["dispatch-intent", "run-selection-page", "run-identified", "reconciliation"]) {
+    it(`applied dispatch with missing result resumes after ${boundary} without another POST`, async () => {
+      world.seedOriginal(); await world.phase("stage");
+      await expect(world.phase("dispatch", { transport: async (method: string, route: string, body: any) => {
+        const response = await world.transport(method, route, body);
+        if (method === "POST" && route.endsWith("/dispatches")) throw new Error("cut after dispatch effect");
+        return response;
+      } })).rejects.toThrow(/cut after dispatch/);
+      await world.phase("collect");
+      cutAfter((row) => row.type === boundary && (boundary !== "reconciliation" || row.data.of === "dispatch-intent"));
+      await world.phase("cancel");
+      expect((await world.phase("cleanup") as any).outcome).toBe("inconclusive");
+      expect((await world.phase("cleanup") as any).status).toBe("already-closed");
+      expect(world.count("POST", "/dispatches")).toBe(1); expect(world.refSha()).toBeNull();
+      expect(world.probeRecords().filter((row: any) => row.type === "reconciliation" && row.data.of === "dispatch-intent")).toHaveLength(1);
+    });
+  }
+  for (const boundary of ["cancel-intent", "cancel-result", "run-observed", "run-terminal"]) {
+    it(`cancel resumes after ${boundary} without a second cancellation`, async () => {
+      world.seedOriginal(); await world.phase("stage"); world.neverComplete = true; await world.phase("dispatch");
+      await world.phase("cancel");
+      const intent = world.probeRecords().find((row: any) => row.type === "cancel-intent");
+      cutAfter((row) => row.type === boundary && row.seq >= intent.seq);
+      await world.phase("cancel");
+      expect((await world.phase("cleanup") as any).outcome).toBe("inconclusive");
+      expect(world.count("POST", "/cancel")).toBe(1); expect(world.refSha()).toBeNull();
+      expect((await world.phase("cancel") as any).status).toBe("already-closed");
+    });
+  }
+  for (const outcome of ["deleted", "ambiguous"]) for (const boundary of ["cleanup-intent", "cleanup-result", "ref-readback", "reconciliation", "absence-verified"]) {
+    it(`${outcome} deletion resumes after ${boundary} with one deletion and both offline controls`, async () => {
+      world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch"); const collected: any = await world.phase("collect");
+      let deletions = 0;
+      const deleteRef = async () => { deletions++; world.setRef(null); return { outcome, exit_code: outcome === "deleted" ? 0 : 128 }; };
+      await world.phase("cleanup", { deleteRef });
+      const intent = world.probeRecords().find((row: any) => row.type === "cleanup-intent");
+      cutAfter((row) => row.type === boundary && row.seq >= intent.seq);
+      expect((await world.phase("cleanup", { deleteRef }) as any).outcome).toBe("measured");
+      expect((await world.phase("cleanup", { deleteRef }) as any).status).toBe("already-closed");
+      expect(deletions).toBe(1); expect(world.refSha()).toBeNull();
+      for (const environment of Object.keys(ENV_IDS)) expect(world.validate(collected.records[environment], environment)).toBeNull();
+    });
+  }
+
+  for (const capture of ["paired", "incomplete"]) for (const fault of ["repository-unavailable", "source-unavailable", "source-invalid", "repository-invalid", "original-unavailable", "original-invalid", "original-inactive"]) {
+    for (const phase of ["cancel", "cleanup"]) it(`${capture} ${phase} retains ${fault} through restoration for both validators`, async () => {
+      world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch"); const collected: any = await world.phase("collect");
+      if (capture === "incomplete") cutAfter((row) => row.type === "capture-progress");
+      const transport = async (method: string, route: string, body: any) => {
+        const repository = route === `/repos/${REPO}`;
+        const source = route.endsWith("/git/ref/heads/staging");
+        const original = route.endsWith(`/actions/runs/${RUN_ID}/attempts/${ATTEMPT}`);
+        if ((fault === "repository-unavailable" && repository) || (fault === "source-unavailable" && source) || (fault === "original-unavailable" && original)) return incompleteResponse("transport-timeout");
+        if ((fault === "source-invalid" && source) || (fault === "repository-invalid" && repository) || (fault === "original-invalid" && original) || (fault === "original-inactive" && original)) {
+          const answer = world.respond(method, route, body);
+          if (source) answer.body.object.sha = "invalid";
+          if (repository) answer.body.id++;
+          if (original && fault === "original-invalid") answer.body.actor.id++;
+          if (original && fault === "original-inactive") answer.body.status = "completed";
+          return completedJsonResponse(answer.status, Buffer.from(JSON.stringify(answer.body)), createRedactor(), { retainRaw: true });
+        }
+        return world.transport(method, route, body);
+      };
+      if (capture === "incomplete" && phase === "cleanup") await expect(world.phase(phase, { transport })).rejects.toThrow(/collect before cleanup/);
+      else await world.phase(phase, { transport });
+      const gaps = world.probeRecords().filter((row: any) => row.type === "qualification-incomplete");
+      expect(gaps.length).toBeGreaterThan(0);
+      expect(world.probeRecords().some((row: any) => row.type === "source-observed" && row.data.moved === true)).toBe(false);
+      if (!world.probeRecords().some((row: any) => row.type === "probe-closed")) {
+        if (capture === "incomplete") await world.phase("cancel");
+        expect((await world.phase("cleanup") as any).outcome).toBe("inconclusive");
+      }
+      expect(world.probeRecords().at(-1)?.data.outcome).toBe("inconclusive");
+      expect(world.probeRecords().filter((row: any) => row.type === "qualification-incomplete")).toEqual(gaps);
+      expect(world.refSha()).toBeNull(); expect(world.count("POST", "/cancel")).toBe(0);
+      for (const environment of Object.keys(ENV_IDS)) expect(world.validate(collected.records[environment], environment)).toEqual(expect.any(String));
+    });
+  }
+  it("admitted failure takes precedence over a later qualification gap", async () => {
+    world.seedOriginal(); await world.phase("stage"); world.admitted = "probe-emergency"; await world.phase("dispatch");
+    const collected: any = await world.phase("collect");
+    const transport = (method: string, route: string, body: any) => route.endsWith("/git/ref/heads/staging") ? Promise.resolve(incompleteResponse("transport-timeout")) : world.transport(method, route, body);
+    expect((await world.phase("cleanup", { transport }) as any).outcome).toBe("failed");
+    for (const environment of Object.keys(ENV_IDS)) expect(world.validate(collected.records[environment], environment)).toEqual(expect.any(String));
+  });
+});
