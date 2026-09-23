@@ -2390,7 +2390,7 @@ describe("durable effect recovery matrix", () => {
     });
   }
 
-  for (const capture of ["paired", "incomplete"]) for (const fault of ["repository-unavailable", "source-unavailable", "source-invalid", "repository-invalid", "original-unavailable", "original-invalid", "original-inactive"]) {
+  for (const capture of ["paired", "incomplete"]) for (const fault of ["repository-unavailable", "source-unavailable", "source-invalid", "repository-invalid", "original-unavailable", "original-invalid", "original-inactive", "source-http-error", "original-http-error", "original-unretained", "repository-policy-invalid"]) {
     for (const phase of ["cancel", "cleanup"]) it(`${capture} ${phase} retains ${fault} through restoration for both validators`, async () => {
       world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch"); const collected: any = await world.phase("collect");
       if (capture === "incomplete") cutAfter((row) => row.type === "capture-progress");
@@ -2399,6 +2399,12 @@ describe("durable effect recovery matrix", () => {
         const source = route.endsWith("/git/ref/heads/staging");
         const original = route.endsWith(`/actions/runs/${RUN_ID}/attempts/${ATTEMPT}`);
         if ((fault === "repository-unavailable" && repository) || (fault === "source-unavailable" && source) || (fault === "original-unavailable" && original)) return incompleteResponse("transport-timeout");
+        if ((fault === "source-http-error" && source) || (fault === "original-http-error" && original)) return completedJsonResponse(500, Buffer.from('{"message":"unavailable"}'), createRedactor(), { retainRaw: true });
+        if (fault === "original-unretained" && original) return completedJsonResponse(200, Buffer.from(JSON.stringify(world.respond(method, route, body).body)), createRedactor());
+        if (fault === "repository-policy-invalid" && repository) {
+          const answer = world.respond(method, route, body); answer.body.default_branch = "main";
+          return completedJsonResponse(200, Buffer.from(JSON.stringify(answer.body)), createRedactor(), { retainRaw: true });
+        }
         if ((fault === "source-invalid" && source) || (fault === "repository-invalid" && repository) || (fault === "original-invalid" && original) || (fault === "original-inactive" && original)) {
           const answer = world.respond(method, route, body);
           if (source) answer.body.object.sha = "invalid";
@@ -2421,13 +2427,16 @@ describe("durable effect recovery matrix", () => {
       expect(world.probeRecords().at(-1)?.data.outcome).toBe("inconclusive");
       expect(world.probeRecords().filter((row: any) => row.type === "qualification-incomplete")).toEqual(gaps);
       expect(world.refSha()).toBeNull(); expect(world.count("POST", "/cancel")).toBe(0);
-      for (const environment of Object.keys(ENV_IDS)) expect(world.validate(collected.records[environment], environment)).toEqual(expect.any(String));
+      for (const environment of Object.keys(ENV_IDS)) expect(world.validate(collected.records[environment], environment)).toMatch(/qualification|original/);
     });
   }
   it("admitted failure takes precedence over a later qualification gap", async () => {
     world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch");
     const collected: any = await world.phase("collect");
     cutAfter((row) => row.type === "run-terminal"); world.admitted = "probe-emergency";
+    // One admitted job and one denied job still give this retained run a failure conclusion.
+    const state = world.runState.bind(world);
+    world.runState = (run: Run) => ({ ...state(run), conclusion: state(run).status === "completed" ? "failure" : null });
     await expect(world.phase("collect")).rejects.toThrow(/admitted/);
     await world.phase("cancel");
     const transport = (method: string, route: string, body: any) => route.endsWith("/git/ref/heads/staging") ? Promise.resolve(incompleteResponse("transport-timeout")) : world.transport(method, route, body);
@@ -2463,5 +2472,37 @@ describe("recovery gap schema and original closure", () => {
     } })).rejects.toThrow(/unexpected bug/);
     expect(world.probeRecords().some((row: any) => row.type === "qualification-incomplete")).toBe(false);
     expect(world.probeRecords().some((row: any) => row.type === "probe-closed")).toBe(false);
+  });
+});
+
+
+describe("authenticated recovery facts", () => {
+  const truncate = (predicate: (row: any) => boolean) => {
+    const file = journalPath(world.dir, RUN_ID, ATTEMPT, "probe");
+    const lines = readFileSync(file, "utf8").trimEnd().split("\n"); const index = lines.findIndex((line) => predicate(JSON.parse(line)));
+    expect(index).toBeGreaterThanOrEqual(0); writeFileSync(file, `${lines.slice(0, index + 1).join("\n")}\n`);
+  };
+  for (const boundary of ["ref-create-result", "ref-readback"]) it(`successful creation cut after ${boundary} retains exact cleanup authority`, async () => {
+    world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch");
+    // Simulate a cut before dispatch itself reached the provider: only the create took effect.
+    world.runs = []; world.calls = world.calls.filter((call) => !call.path.endsWith("/dispatches"));
+    truncate((row) => row.type === boundary);
+    expect((await world.phase("cleanup") as any).outcome).toBe("inconclusive");
+    expect(world.count("POST", "/git/refs")).toBe(1); expect(world.count("POST", "/dispatches")).toBe(0); expect(world.refSha()).toBeNull();
+  });
+  for (const mutation of ["category", "phase", "extra", "future"]) it(`rejects ${mutation} corruption of a retained qualification gap at runtime and both offline validators`, async () => {
+    world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch"); const collected: any = await world.phase("collect");
+    await world.phase("cancel", { transport: (method: string, route: string, body: any) => route.endsWith("/git/ref/heads/staging") ? Promise.resolve(incompleteResponse("transport-timeout")) : world.transport(method, route, body) });
+    const rows = world.probeRecords(); const gap = rows.find((row: any) => row.type === "qualification-incomplete");
+    if (mutation === "category") gap.data.category = "convenient-assumption";
+    if (mutation === "phase") gap.data.phase = "approve";
+    if (mutation === "extra") gap.data.accept = true;
+    if (mutation === "future") gap.data.observed_at = iso(world.clock + 60000);
+    let previous = rows[0].prev;
+    const lines = rows.map((row: any) => { const line = JSON.stringify({ ...row, prev: previous }); previous = sha256(line); return line; });
+    writeFileSync(journalPath(world.dir, RUN_ID, ATTEMPT, "probe"), `${lines.join("\n")}\n`);
+    await expect(world.phase("cleanup")).rejects.toThrow(/qualification|schema/);
+    for (const environment of Object.keys(ENV_IDS)) expect(world.validate(collected.records[environment], environment)).toMatch(/qualification|schema/);
+    expect(world.refSha()).toBe(world.sha);
   });
 });
