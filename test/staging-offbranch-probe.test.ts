@@ -1899,7 +1899,7 @@ describe("R05-F1: a successful deletion ends that creation's ownership irreversi
     world.setRef(world.sha);
     let deletions = 0;
     await expect(world.phase("cleanup", { deleteRef: async () => { deletions += 1; world.setRef(null); return { outcome: "deleted", exit_code: 0 }; } }))
-      .rejects.toThrow(/points at a SHA this probe did not create/);
+      .rejects.toThrow(/not the fixed probe ref at the reviewed commit/);
     expect(deletions).toBe(0);
     expect(world.refSha()).toBe(world.sha);
     expect(world.validate(collected.records["staging-release"], "staging-release")).toMatch(/does not support acceptance \(the owned probe ref points at a SHA/);
@@ -2384,7 +2384,7 @@ describe("R07: observable mutation uncertainty and current cleanup authority", (
       expect(world.probeRecords().some((r: any) => r.type === "ref-readback" && r.data.http_status === 200
         && r.seq > world.probeRecords().find((e: any) => e.type === "cleanup-result").seq)).toBe(true);
       world.setRef(null);
-      await expect(world.phase("cleanup", { deleteRef })).rejects.toThrow(/inconsistent|points elsewhere|SHA this probe did not create/);
+      await expect(world.phase("cleanup", { deleteRef })).rejects.toThrow(/inconsistent|points elsewhere|SHA this probe did not create|not the fixed probe ref at the reviewed commit/);
       expect(deletes).toBe(1);
       for (const environment of ["staging-release", "staging-emergency"]) expect(world.validate(collected.records[environment], environment)).not.toBeNull();
     });
