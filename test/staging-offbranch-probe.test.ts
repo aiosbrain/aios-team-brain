@@ -774,6 +774,42 @@ describe("lifecycle ownership: create once, dispatch once, never adopt, never re
     expect(cleaned.status).toBe("nothing-owned");
   });
 
+  it("keeps a complete-error applied create permanently uncertain across restored absence and repeated cleanup", async () => {
+    world.seedOriginal();
+    await world.phase("stage");
+    await expect(world.phase("dispatch", { transport: async (method: string, requestPath: string, body?: unknown) => {
+      const answer = await world.transport(method, requestPath, body);
+      return method === "POST" && requestPath.endsWith("/git/refs")
+        ? completedJsonResponse(500, Buffer.from('{"message":"server failure"}'), createRedactor(), { retainRaw: true }) : answer;
+    } })).rejects.toThrow(/ownership is uncertain/);
+    expect(world.refSha()).toBe(world.sha);
+    expect(world.probeRecords().some((record: any) => record.type === "reconciliation"
+      && record.data.of === "ref-create-intent" && record.data.outcome === "present-ownership-uncertain")).toBe(true);
+    world.setRef(null); // A later 404 cannot erase the already observed unknown presence.
+    await expect(world.phase("cleanup")).rejects.toThrow(/ownership is uncertain/);
+    await expect(world.phase("cleanup")).rejects.toThrow(/ownership is uncertain/);
+    expect(world.probeRecords().some((record: any) => record.type === "probe-closed")).toBe(false);
+    expect(world.count("POST", "/dispatches")).toBe(0);
+  });
+
+  it("reconciles a complete-error unapplied create only to absent, without re-creation or positive measurement", async () => {
+    world.seedOriginal();
+    await world.phase("stage");
+    const transport = async (method: string, requestPath: string, body?: unknown) => {
+      if (method === "POST" && requestPath.endsWith("/git/refs")) {
+        world.calls.push({ method, path: requestPath, body });
+        return completedJsonResponse(500, Buffer.from('{"message":"server failure"}'), createRedactor(), { retainRaw: true });
+      }
+      return world.transport(method, requestPath, body);
+    };
+    await expect(world.phase("dispatch", { transport })).rejects.toThrow(/ref is absent.*not re-created/);
+    await expect(world.phase("dispatch", { transport })).rejects.toThrow(/never re-issued/);
+    const cleaned: any = await world.phase("cleanup", { transport });
+    expect(cleaned.status).toBe("nothing-owned");
+    expect((await world.phase("cleanup", { transport }) as any).status).toBe("already-closed");
+    expect([world.count("POST", "/git/refs"), world.count("POST", "/dispatches"), world.refSha()]).toEqual([1, 0, null]);
+  });
+
   it("does not re-dispatch after a lost dispatch answer; collect reconciles the one run", async () => {
     world.seedOriginal();
     await world.phase("stage");
@@ -798,6 +834,63 @@ describe("lifecycle ownership: create once, dispatch once, never adopt, never re
     // answered (R06). It is blocked, and the evidence is kept for root reconciliation.
     await expect(world.phase("cleanup")).rejects.toThrow(/NOT deleted and the journal is NOT closed/);
     expect(world.refSha()).toBe(world.sha);
+  });
+
+  for (const contradiction of ["attempt", "actor", "source"] as const) {
+    it(`retains a rejected ${contradiction} in the initial selection peek across restoration and restart`, async () => {
+      world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch");
+      const original = world.runBody.bind(world);
+      if (contradiction === "attempt") world.runs[0].attempt = 2;
+      if (contradiction === "actor") world.runs[0].actor = { id: 3, login: "foreign", type: "User" };
+      if (contradiction === "source") world.runBody = ((run: Run) => ({ ...original(run), head_sha: world.otherSha })) as any;
+      await expect(world.phase("collect")).rejects.toThrow(/not this probe's own run/);
+      const observed = world.probeRecords().filter((record: any) => record.type === "run-selection-observed");
+      expect(observed.some((record: any) => record.data.boundary === "peek")).toBe(true);
+      const listingReads = world.count("GET", `/actions/workflows/${PROBE_WORKFLOW_FILE}/runs`);
+      world.runs[0].attempt = 1; world.runs[0].actor = { ...JOHN }; world.runBody = original as any;
+      await expect(world.phase("collect")).rejects.toThrow(/not this probe's own run/);
+      expect(world.count("GET", `/actions/workflows/${PROBE_WORKFLOW_FILE}/runs`)).toBe(listingReads);
+      expect(world.probeRecords().some((record: any) => record.type === "observation-recorded")).toBe(false);
+    });
+  }
+
+  for (const contradiction of ["duplicate", "foreign"] as const) {
+    it(`retains a rejected ${contradiction} candidate set across restoration and restart`, async () => {
+      world.seedOriginal(); world.runsPerDispatch = 2; await world.phase("stage"); await world.phase("dispatch");
+      if (contradiction === "foreign") world.runs[1].actor = { id: 3, login: "foreign", type: "User" };
+      await expect(world.phase("collect")).rejects.toThrow(/eligible probe runs were observed|not this probe's own run/);
+      const listingReads = world.count("GET", `/actions/workflows/${PROBE_WORKFLOW_FILE}/runs`);
+      world.runs.splice(1, 1);
+      await expect(world.phase("collect")).rejects.toThrow(/eligible probe runs were observed|not this probe's own run/);
+      expect(world.count("GET", `/actions/workflows/${PROBE_WORKFLOW_FILE}/runs`)).toBe(listingReads);
+      expect(world.probeRecords().some((record: any) => record.type === "probe-closed")).toBe(false);
+    });
+  }
+
+  it("retains a rejected page-2 candidate before interpretation and binds it after the listing is restored", async () => {
+    world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch");
+    const valid = world.runBody(world.runs[0]);
+    const filler = Array.from({ length: 100 }, (_, index) => ({ ...valid, id: valid.id + 100 + index, head_branch: "outside-window" }));
+    const foreignId = valid.id + 1000;
+    const foreign = { ...valid, id: foreignId, run_attempt: 2, url: `${API}/actions/runs/${foreignId}`, html_url: `${WEB}/actions/runs/${foreignId}` };
+    let reads = 0;
+    const transport = async (method: string, requestPath: string, body?: unknown) => {
+      if (method === "GET" && requestPath.includes(`/actions/workflows/${PROBE_WORKFLOW_FILE}/runs`)) {
+        reads += 1;
+        if (reads === 1) return world.transport(method, requestPath, body); // retained peek sees one valid run
+        world.calls.push({ method, path: requestPath, body });
+        const page = Number(/(?:^|&)page=(\d+)/.exec(requestPath.split("?")[1] ?? "")?.[1] ?? "1");
+        const response = page === 1 ? { total_count: 101, workflow_runs: filler } : { total_count: 101, workflow_runs: [foreign] };
+        return completedJsonResponse(200, Buffer.from(JSON.stringify(response)), createRedactor(), { retainRaw: true });
+      }
+      return world.transport(method, requestPath, body);
+    };
+    await expect(world.phase("collect", { transport })).rejects.toThrow(/not this probe's own run/);
+    const listing = world.probeRecords().filter((record: any) => record.type === "run-selection-observed" && record.data.boundary === "listing");
+    expect(listing.map((record: any) => record.data.page)).toEqual([1, 2]);
+    const listingReads = world.count("GET", `/actions/workflows/${PROBE_WORKFLOW_FILE}/runs`);
+    await expect(world.phase("collect")).rejects.toThrow(/not this probe's own run/);
+    expect(world.count("GET", `/actions/workflows/${PROBE_WORKFLOW_FILE}/runs`)).toBe(listingReads);
   });
 
   it("cancels only the exact probe run at the ten-minute deadline; cancellation is inconclusive, never success", async () => {
