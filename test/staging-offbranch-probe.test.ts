@@ -1254,7 +1254,7 @@ describe("R05-F1: a successful deletion ends that creation's ownership irreversi
     expect(world.refSha()).toBe(world.sha);
     expect(world.probeRecords().some((record: any) => record.type === "probe-closed")).toBe(false);
     // And the measurement that lifecycle produced is not accepted offline.
-    expect(world.validate(collected.records["staging-release"], "staging-release")).toMatch(/does not support acceptance|no second deletion/);
+    expect(world.validate(collected.records["staging-release"], "staging-release")).toMatch(/does not support acceptance \(a deletion this probe recorded as successful/);
   });
 
   it("does not revive a changed ref that is put back at the reviewed SHA", async () => {
@@ -1269,10 +1269,10 @@ describe("R05-F1: a successful deletion ends that creation's ownership irreversi
     world.setRef(world.sha);
     let deletions = 0;
     await expect(world.phase("cleanup", { deleteRef: async () => { deletions += 1; world.setRef(null); return { outcome: "deleted", exit_code: 0 }; } }))
-      .rejects.toThrow(/never deleted at another SHA|does not authorise/);
+      .rejects.toThrow(/points at a SHA this probe did not create/);
     expect(deletions).toBe(0);
     expect(world.refSha()).toBe(world.sha);
-    expect(world.validate(collected.records["staging-release"], "staging-release")).toMatch(/does not support acceptance/);
+    expect(world.validate(collected.records["staging-release"], "staging-release")).toMatch(/does not support acceptance \(the owned probe ref points at a SHA/);
   });
 
   it("refuses a ref that comes back after an absence this probe never explained", async () => {

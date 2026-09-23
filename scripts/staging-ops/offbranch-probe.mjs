@@ -1056,20 +1056,13 @@ export function assessProbeLifecycle(records, { dir, intentSha256, intentArtifac
   for (const record of records.filter((entry) => entry.type === "observation-recorded")) {
     if (record.data.outcome !== "refused") refuse(`the collector recorded ${record.data.environment} as ${record.data.outcome}`);
   }
-  const cleanupIntents = records.filter((record) => record.type === "cleanup-intent");
-  if (!cleanupIntents.length) refuse("the owned probe ref has no cleanup intent");
-  for (const intent of cleanupIntents) equalOrRefuse(intent.data, { ref: PROBE_REF, expected_sha: workflowSha }, "a probe cleanup intent");
-  const absent = records.filter((record) => record.type === "absence-verified");
-  const lastAbsent = absent[absent.length - 1];
-  if (!lastAbsent || lastAbsent.data.http_status !== 404 || lastAbsent.data.response_complete !== true || lastAbsent.seq < cleanupIntents[0].seq) {
-    refuse("the owned probe ref's absence was not verified after cleanup");
-  }
-  if (records.some((record) => record.type === "cleanup-result" && record.data.outcome === "lease-refused")) refuse("the owned probe ref changed and its cleanup was refused");
 
   // ── THE SAME DERIVATION THE OPERATOR ACTS ON (R05) ───────────────────────────────────────────
   // Acceptance follows from the accumulated lifecycle, so a contradiction recorded at any point —
   // a ref that came back after a successful deletion, a ref that moved and was put back, a
-  // deletion still undecided — refuses here exactly as it refuses the next mutation.
+  // deletion still undecided — refuses here exactly as it refuses the next mutation. It is derived
+  // BEFORE the individual cleanup rows are read, so the refusal names the contradiction itself
+  // rather than whichever downstream row it happens to break.
   const ownership = assessRefOwnership(records, { workflowSha });
   if (!ownership.may_accept) {
     refuse(`the owned probe ref's accumulated lifecycle does not support acceptance (${ownership.reason ?? `ownership is ${ownership.state}`})`);
@@ -1092,6 +1085,15 @@ export function assessProbeLifecycle(records, { dir, intentSha256, intentArtifac
     refuse(`the probe measured the live staging head at ${continuity.first_move.staging_sha.slice(0, 12)} during ${continuity.first_move.phase}; the attempt is interrupted and is never accepted`);
   }
 
+  const cleanupIntents = records.filter((record) => record.type === "cleanup-intent");
+  if (!cleanupIntents.length) refuse("the owned probe ref has no cleanup intent");
+  for (const intent of cleanupIntents) equalOrRefuse(intent.data, { ref: PROBE_REF, expected_sha: workflowSha }, "a probe cleanup intent");
+  const absent = records.filter((record) => record.type === "absence-verified");
+  const lastAbsent = absent[absent.length - 1];
+  if (!lastAbsent || lastAbsent.data.http_status !== 404 || lastAbsent.data.response_complete !== true || lastAbsent.seq < cleanupIntents[0].seq) {
+    refuse("the owned probe ref's absence was not verified after cleanup");
+  }
+  if (records.some((record) => record.type === "cleanup-result" && record.data.outcome === "lease-refused")) refuse("the owned probe ref changed and its cleanup was refused");
   const closed = only(records, "probe-closed");
   if (closed.seq !== records[records.length - 1].seq || closed.data.outcome !== "measured") refuse("the probe journal is not closed as a measured probe");
   const policies = records.filter((record) => record.type === "policy-captured");
