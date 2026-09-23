@@ -261,6 +261,8 @@ function assertSourceNotMoved(session) {
 /** The original attempt is still running and nobody has approved a protected job. */
 async function assertOriginalUnapproved(session) {
   if (session.originalRun.status === "completed") throw new AssertionFailure("the original commissioning attempt has completed; a probe can only be staged and run while it is active");
+  if (!["queued", "in_progress", "waiting", "pending", "requested"].includes(session.originalRun.status)) throw new AssertionFailure("the original commissioning attempt has no measured active status");
+  if (readJournal({ dir: session.dir, runId: session.runId, attempt: session.attempt }).some((row) => row.type === "run-closed")) throw new AssertionFailure("the original commissioning attempt's journal is closed; qualification has ended");
   const approvals = summarizeApprovals(await session.request("GET", `/repos/${REPO}/actions/runs/${session.runId}/approvals`));
   if (!approvals.measured) throw new IncompleteEvidence(`the original attempt's approval history could not be measured (${approvals.reason})`);
   if (approvals.entries.some((entry) => entry.state === "approved")) {

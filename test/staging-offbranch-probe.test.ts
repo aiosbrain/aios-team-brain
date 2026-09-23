@@ -2216,6 +2216,7 @@ describe("phase admission and terminal recovery", () => {
     head_repository_id: (b) => { b.head_repository.id++; }, head_repository_name: (b) => { b.head_repository.full_name = "other/repo"; },
     actor_login: (b) => { b.actor.login = "substitute"; }, actor_id_missing: (b) => { delete b.actor.id; },
     actor_type: (b) => { b.actor.type = ""; }, trigger_missing: (b) => { delete b.triggering_actor; },
+    status_missing: (b) => { delete b.status; }, status_unknown: (b) => { b.status = "unknown"; },
     run_attempt_missing: (b) => { delete b.run_attempt; }, repository_missing: (b) => { delete b.repository; },
   };
   for (const [field, substitute] of Object.entries(substitutions)) it(`original ${field} substitution refuses before launch mutation`, async () => {
