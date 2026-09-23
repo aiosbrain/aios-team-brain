@@ -292,6 +292,63 @@ describe("guard: the NDA confidentiality gate", () => {
     }
   });
 
+  it("rejects the first over-budget value before reading a later changed blob", () => {
+    const dir = mkdtempSync(join(tmpdir(), "nda-gate-early-budget-"));
+    const shimDir = mkdtempSync(join(tmpdir(), "nda-gate-early-budget-shim-"));
+    const marker = join(shimDir, "late-blob-read");
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8" });
+    const previousPath = process.env.PATH;
+    const previousRealGit = process.env.NDA_TEST_REAL_GIT;
+    const previousLateObject = process.env.NDA_TEST_LATE_OBJECT;
+    const previousLateMarker = process.env.NDA_TEST_LATE_READ_MARKER;
+    try {
+      git("init", "-q");
+      git("config", "user.email", "t@t.local");
+      git("config", "user.name", "t");
+      git("commit", "-qm", "base", "--allow-empty");
+      const base = git("rev-parse", "HEAD").trim();
+      writeFileSync(join(dir, "a-over-budget.txt"), `${"a".repeat(128)}\n`);
+      writeFileSync(join(dir, "z-must-not-read.txt"), `${"z".repeat(128)}\n`);
+      git("add", ".");
+      git("commit", "-qm", "add ordered budget fixtures");
+      const head = git("rev-parse", "HEAD").trim();
+
+      const realGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+      const gitShim = join(shimDir, "git");
+      writeFileSync(
+        gitShim,
+        `#!/bin/sh
+if [ "$1" = "show" ] && [ "$2" = "$NDA_TEST_LATE_OBJECT" ]; then
+  : > "$NDA_TEST_LATE_READ_MARKER"
+  exit 97
+fi
+exec "$NDA_TEST_REAL_GIT" "$@"
+`
+      );
+      chmodSync(gitShim, 0o755);
+      process.env.NDA_TEST_REAL_GIT = realGit;
+      process.env.NDA_TEST_LATE_OBJECT = `${head}:z-must-not-read.txt`;
+      process.env.NDA_TEST_LATE_READ_MARKER = marker;
+      process.env.PATH = `${shimDir}:${previousPath ?? ""}`;
+
+      expect(() => scanRange(["SYNTHETIC_NEVER_PRESENT"], `${base}..${head}`, {
+        cwd: dir,
+        maxScannedBytes: 80,
+      })).toThrow(/scan could not run/i);
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      process.env.PATH = previousPath;
+      if (previousRealGit === undefined) delete process.env.NDA_TEST_REAL_GIT;
+      else process.env.NDA_TEST_REAL_GIT = previousRealGit;
+      if (previousLateObject === undefined) delete process.env.NDA_TEST_LATE_OBJECT;
+      else process.env.NDA_TEST_LATE_OBJECT = previousLateObject;
+      if (previousLateMarker === undefined) delete process.env.NDA_TEST_LATE_READ_MARKER;
+      else process.env.NDA_TEST_LATE_READ_MARKER = previousLateMarker;
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(shimDir, { recursive: true, force: true });
+    }
+  });
+
   it("isolates cached matches between term sets and range invocations", () => {
     const dir = mkdtempSync(join(tmpdir(), "nda-gate-range-cache-scope-"));
     const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8" });

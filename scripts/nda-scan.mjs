@@ -404,6 +404,10 @@ export function scanRange(
     const corpusValues = new Set();
     const addCorpus = (value) => {
       if (corpusValues.has(value)) return;
+      if (!rangeMatches.has(value)) {
+        scannedByteCount += Buffer.byteLength(value);
+        if (scannedByteCount > maxScannedBytes) throw new Error("confidential-pattern scan could not run");
+      }
       corpus.push(value);
       corpusValues.add(value);
     };
@@ -413,8 +417,8 @@ export function scanRange(
       addCorpus(path.normalize("NFKC"));
       if (!currentSubmodules.has(path)) {
         const value = trackedText(path, cwd, commit).normalize("NFKC").replace(/[\0\r\n]/g, " ");
-        currentBlobs.set(path, value);
         addCorpus(value);
+        currentBlobs.set(path, value);
       }
     }
     for (const entry of changedEntries) {
@@ -424,14 +428,10 @@ export function scanRange(
       // exist. Only an add has no prior blob (`oldPath === null` above); every read/resource failure
       // for a reported prior object must propagate and block.
       const value = trackedText(entry.oldPath, cwd, entry.parent).normalize("NFKC").replace(/[\0\r\n]/g, " ");
-      previousBlobs.set(entry, value);
       addCorpus(value);
+      previousBlobs.set(entry, value);
     }
     const unseenCorpus = corpus.filter((value) => !rangeMatches.has(value));
-    for (const value of unseenCorpus) {
-      scannedByteCount += Buffer.byteLength(value);
-      if (scannedByteCount > maxScannedBytes) throw new Error("confidential-pattern scan could not run");
-    }
     const unseenMatches = matchingTermSets(unseenCorpus, normalizedTerms);
     for (const [index, value] of unseenCorpus.entries()) {
       rangeMatches.set(value, unseenMatches[index]);
