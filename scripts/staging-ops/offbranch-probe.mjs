@@ -238,6 +238,27 @@ export function assertProbeEventPayload(type, data) {
   const fields = PROBE_JOURNAL_EVENTS[String(type)];
   if (!fields) refuse(`unknown probe journal event ${JSON.stringify(String(type))}`);
   assertClosed(data, fields, `the ${type} payload`);
+  if (type === "original-identity-bound") assertClosed(data.capture, RAW_REF_FIELDS, "the original identity capture");
+  if (["capture-progress", "capture-failed", "qualification-ended", "admission-observed"].includes(type)) decimalString(data.run_id, "the capture run identity");
+  if (type === "capture-progress") {
+    if (!["run", "jobs", "check", "annotations", "terminal"].includes(data.kind)) refuse("unknown capture progress kind");
+    positiveInt(data.page, "the capture progress page");
+    assertClosed(data.capture, RAW_REF_FIELDS, "the retained partial capture");
+  }
+  if (type === "capture-failed") {
+    if (data.phase !== "collect" || !["run", "jobs", "denial", "terminal", "policy", "derivation"].includes(data.category)) refuse("unknown capture failure disposition");
+    if (!Array.isArray(data.capture_sequences) || data.capture_sequences.some((seq) => !Number.isSafeInteger(seq) || seq < 1)) refuse("invalid capture failure references");
+  }
+  if (type === "qualification-ended") {
+    if (data.reason !== "operator-terminal-abort") refuse("unknown qualification end reason");
+    positiveInt(data.terminal_sequence, "the abort terminal evidence sequence");
+  }
+  if (type === "admission-observed") {
+    if (!PROBE_ENVIRONMENTS.includes(data.environment)) refuse("unknown admitted environment");
+    decimalString(data.job_id, "the admitted job identity");
+    assertClosed(data.run_capture, RAW_REF_FIELDS, "the admission run capture");
+    assertClosed(data.jobs_descriptor, ARTIFACT_REF_FIELDS, "the admission jobs descriptor");
+  }
   if (type === "run-observed") {
     decimalString(data.run_id, "the observed run id");
     if (!["read", "cancel", "cleanup-entry", "delete", "closure"].includes(data.boundary)) refuse("unknown run observation boundary");
@@ -934,6 +955,10 @@ export function assertOriginalProbeIdentity(body, { commissioning, dispatcher, b
   if (body.head_sha !== commissioning.workflow_sha || body.path !== commissioning.workflow_path
     || body.event !== "workflow_dispatch" || body.head_branch !== "staging") refuse("the original source/workflow/event/branch identity does not match its trusted intent");
   if (typeof dispatcher !== "string" || !dispatcher) refuse("the original trusted intent has no declared dispatcher");
+  for (const field of ["actor", "triggering_actor"]) {
+    if (typeof body[field]?.login !== "string" || !/^[A-Za-z0-9][A-Za-z0-9-]*$/.test(body[field].login)
+      || !["User", "Bot", "Organization"].includes(body[field]?.type)) refuse(`the original ${field} tuple is malformed`);
+  }
   const identity = { actor: parseActor(body.actor, "the original actor"), triggering_actor: parseActor(body.triggering_actor, "the original triggering actor") };
   if (identity.actor.login !== dispatcher) refuse("the original actor differs from its declared dispatcher");
   if (baseline) equalOrRefuse(identity, baseline, "the original measured actor identity");
@@ -943,9 +968,72 @@ export function assertOriginalProbeIdentity(body, { commissioning, dispatcher, b
 export function assessOriginalProbeBinding(records, { dir, commissioning, dispatcher }) {
   const bindings = records.filter((record) => record.type === "original-identity-bound");
   if (bindings.length !== 1) refuse("the probe requires exactly one retained original identity binding");
+  if (records.some((row) => ["ref-create-intent", "dispatch-intent"].includes(row.type) && row.seq < bindings[0].seq)) refuse("original identity was not bound before launch");
   const captured = readRaw(dir, bindings[0].data.capture, "the original identity capture", RAW_REF_FIELDS);
   if (captured.completed > timeOf(bindings[0].ts, "the original identity binding time")) refuse("the original identity binding predates its capture");
   return assertOriginalProbeIdentity(captured.body, { commissioning, dispatcher });
+}
+
+
+/** Admission is derived without denial diagnostics, from a terminal exact run and bound jobs. */
+export function deriveProbeAdmissions(dir, { runCapture, jobsDescriptor, commissioning, runId }) {
+  const run = readRaw(dir, runCapture, "the admission run", RAW_REF_FIELDS);
+  assertProbeRunIdentity(run.body, { runId, repositoryId: commissioning.repository_id, workflowSha: commissioning.workflow_sha });
+  if (run.body.status !== "completed") refuse("admission requires terminal run evidence");
+  const descriptor = readDescriptor(dir, jobsDescriptor, "the admission jobs");
+  assertClosed(descriptor, CAPTURE_DESCRIPTORS.jobs.fields, "the admission jobs descriptor");
+  if (descriptor.kind !== "jobs" || descriptor.capture_schema_version !== CAPTURE_SCHEMA_VERSION) refuse("invalid admission jobs descriptor");
+  const pages = readPages(dir, descriptor.pages, "the admission jobs");
+  const rows = pages.flatMap((page) => Array.isArray(page.body.jobs) ? page.body.jobs : []);
+  const total = pages[0].body.total_count;
+  if (!Number.isSafeInteger(total) || rows.length !== total || pages.some((page) => page.body.total_count !== total)
+    || pages.length !== Math.max(1, Math.ceil(total / PAGE_SIZE))) refuse("the admission jobs listing is incomplete");
+  const admitted = [];
+  for (const spec of PROBE_JOBS) {
+    const matches = rows.filter((job) => job?.name === spec.job_key);
+    if (matches.length !== 1) continue;
+    const job = matches[0];
+    if (!Number.isSafeInteger(job.id) || job.id <= 0 || rows.filter((row) => row?.id === job.id).length !== 1
+      || String(job.run_id) !== String(runId) || job.run_attempt !== PROBE_ATTEMPT
+      || job.head_branch !== PROBE_BRANCH || job.head_sha !== commissioning.workflow_sha || job.status !== "completed"
+      || job.url !== `${repoApi()}/actions/jobs/${job.id}` || job.run_url !== `${repoApi()}/actions/runs/${runId}`
+      || job.html_url !== `${repoWeb()}/actions/runs/${runId}/job/${job.id}` || typeof job.node_id !== "string" || !job.node_id) continue;
+    const start = Date.parse(job.started_at), end = Date.parse(job.completed_at);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end < start || start < Date.parse(run.body.created_at)
+      || pages.some((page) => page.started < end) || run.started < end) continue;
+    if (job.conclusion === "success" || (Array.isArray(job.steps) && job.steps.length > 0)
+      || (Number.isSafeInteger(job.runner_id) && job.runner_id > 0)) admitted.push({ environment: spec.environment, job_id: String(job.id) });
+  }
+  return admitted;
+}
+
+/** Retained recovery dispositions are authenticated facts, never positive qualification. */
+export function verifyProbeRecoveryHistory(records, { dir, commissioning }) {
+  const identified = records.find((row) => row.type === "run-identified");
+  for (const row of records) {
+    const data = row.data;
+    if (["capture-progress", "capture-failed", "qualification-ended", "admission-observed"].includes(row.type)
+      && (!identified || data.run_id !== identified.data.run_id)) refuse("a recovery disposition names an unowned run");
+    if (row.type === "capture-progress") {
+      const raw = readRaw(dir, data.capture, "the retained capture progress", RAW_REF_FIELDS);
+      if (raw.completed > Date.parse(row.ts)) refuse("capture progress predates its provider read");
+    }
+    if (row.type === "capture-failed") {
+      const expected = records.filter((entry) => entry.seq < row.seq && ["capture-progress", "capture-recorded", "run-observed"].includes(entry.type)).map((entry) => entry.seq);
+      equalOrRefuse(data.capture_sequences, expected, "the failed capture references");
+    }
+    if (row.type === "qualification-ended") {
+      const terminal = records.find((entry) => entry.seq === data.terminal_sequence && entry.seq < row.seq && entry.type === "run-observed");
+      if (!terminal || terminal.data.run_id !== data.run_id) refuse("the qualification abort lacks its exact terminal proof");
+      const raw = readRaw(dir, terminal.data.capture, "the abort terminal proof", RAW_REF_FIELDS);
+      assertProbeRunIdentity(raw.body, { runId: data.run_id, repositoryId: commissioning.repository_id, workflowSha: commissioning.workflow_sha });
+      if (raw.body.status !== "completed") refuse("the qualification abort run was not terminal");
+    }
+    if (row.type === "admission-observed") {
+      const admitted = deriveProbeAdmissions(dir, { runCapture: data.run_capture, jobsDescriptor: data.jobs_descriptor, commissioning, runId: data.run_id });
+      if (!admitted.some((entry) => entry.environment === data.environment && entry.job_id === data.job_id)) refuse("the admitted fact has no bound execution evidence");
+    }
+  }
 }
 
 /** Shared history facts used by every public phase and by offline qualification. */
@@ -1178,6 +1266,15 @@ export function assessProbeLifecycle(records, { dir, intentSha256, intentArtifac
   if (!Number.isFinite(windowStartMs)) refuse("the probe lifecycle is assessed against the trusted original commissioning window");
   if (!records.length) refuse("the probe journal is absent or empty");
   checkProbeJournalShape(records);
+  const originalFile = path.join(dir, `commissioning-${commissioning.run_id}-${commissioning.attempt}-intent.json`);
+  const stat = lstatSync(originalFile);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_RAW_CAPTURE_BYTES) refuse("the original intent file is not bounded regular evidence");
+  const originalIntent = parseJsonBytes(readFileSync(originalFile), "the original trusted intent");
+  if (canonicalHash(originalIntent) !== commissioning.intent_sha256) refuse("the original intent no longer matches its authenticated binding");
+  assessOriginalProbeBinding(records, { dir, commissioning, dispatcher: originalIntent.dispatcher });
+  verifyProbeRecoveryHistory(records, { dir, commissioning });
+  const phaseState = assessProbePhaseState(records, { workflowSha });
+  if (phaseState.failed || phaseState.ended) refuse("the cumulative probe qualification is failed or irreversibly incomplete");
   const foreign = records.filter((record) => String(record.source) !== String(workflowSha));
   if (foreign.length) refuse(`${foreign.length} probe journal record(s) were written against a different immutable source`);
   if (records[0].type !== "probe-opened") refuse("the probe journal does not begin with its opening record");

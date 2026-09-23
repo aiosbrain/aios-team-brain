@@ -194,7 +194,7 @@ class World {
     if (p === "" ) return { status: 200, body: { id: REPO_ID, full_name: REPO, default_branch: "staging" } };
     if (p === "/git/ref/heads/staging") return { status: 200, body: { ref: "refs/heads/staging", object: { sha: this.sha, type: "commit" } } };
     if (p === `/actions/runs/${RUN_ID}/attempts/${ATTEMPT}`) {
-      return { status: 200, body: { id: Number(RUN_ID), head_sha: this.sha, path: COMMISSIONING_WORKFLOW_PATH, event: "workflow_dispatch", head_branch: "staging", status: this.originalRunStatus } };
+      return { status: 200, body: { id: Number(RUN_ID), run_attempt: Number(ATTEMPT), repository: { id: REPO_ID, full_name: REPO }, head_repository: { id: REPO_ID, full_name: REPO }, actor: { id: 22, login: "original-dispatcher", type: "User" }, triggering_actor: { id: 23, login: "original-trigger", type: "User" }, head_sha: this.sha, path: COMMISSIONING_WORKFLOW_PATH, event: "workflow_dispatch", head_branch: "staging", status: this.originalRunStatus } };
     }
     if (p === `/actions/runs/${RUN_ID}/approvals`) return { status: 200, body: this.approvals };
     if (p === `/actions/runs/${RUN_ID}/attempts/${ATTEMPT}/jobs`) return { status: 200, body: { total_count: 1, jobs: [{ name: PROTECTED_JOBS[1].name, status: "waiting" }] } };
@@ -274,7 +274,7 @@ class World {
     writeEvidenceFile(this.dir, evidenceSlug(RUN_ID, ATTEMPT, "intent"), {
       schema_version: 1, issue: "AIO-1124", phase: "intent", repository: REPO, repository_id: REPO_ID, run_id: RUN_ID, attempt: ATTEMPT,
       workflow_path: COMMISSIONING_WORKFLOW_PATH, workflow_sha: this.sha, dispatch_ref: "refs/heads/staging", event: "workflow_dispatch",
-      provider_measured: false,
+      provider_measured: false, dispatcher: "original-dispatcher",
       // The rest of the closed intent manifest; values irrelevant to the probe, present so the intent binds.
       derived_refs: {}, derived_contexts: [], graph_plan: [], normal_app_id: 1, emergency_app_id: 2, producer_ids_hash: "0".repeat(64),
       normal_installation_id: "11", emergency_installation_id: "12",
