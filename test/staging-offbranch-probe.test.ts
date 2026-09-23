@@ -1895,6 +1895,14 @@ describe("R07: explicit public probe lock recovery", () => {
     const restored = await recover(); restored.lock.release();
   });
 
+  it("does not strand an unreadable lock when acquisition fails before its first bytes", async () => {
+    world.seedOriginal(); await world.phase("stage");
+    // Serialization fails after exclusive creation but before any nonce is readable from disk.
+    expect(() => acquireJournalLock({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, kind: "probe", pid: 1n as any, now: world.now })).toThrow(/BigInt/);
+    expect(readLockOwner(world.dir, RUN_ID, ATTEMPT, "probe")).toBeNull();
+    expect((await world.phase("cleanup") as any).status).toBe("nothing-owned");
+  });
+
   it("releases the replacement when its recovery append fails", async () => {
     world.seedOriginal(); await world.phase("stage"); abandoned();
     let reads = 0;

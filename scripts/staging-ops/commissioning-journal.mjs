@@ -29,7 +29,7 @@
 
 import { createHash } from "node:crypto";
 import {
-  closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync,
+  closeSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync,
   renameSync, statSync, unlinkSync, writeSync,
 } from "node:fs";
 import { hostname } from "node:os";
@@ -254,8 +254,12 @@ export function acquireJournalLock({
     writeSync(fd, `${JSON.stringify(owner)}\n`);
     fsyncSync(fd);
   } catch (error) {
-    // An unsuccessful acquisition must not leave a lock owned by no returned handle.
-    if (readLockOwner(root, runId, attempt, kind)?.nonce === nonce) unlinkSync(file);
+    // A partial write may not contain a readable nonce. The exclusive file descriptor still
+    // identifies our own creation; never remove a replacement at the same pathname.
+    const created = fstatSync(fd);
+    let current;
+    try { current = lstatSync(file); } catch { /* already removed */ }
+    if (current?.dev === created.dev && current?.ino === created.ino) unlinkSync(file);
     throw error;
   } finally {
     closeSync(fd);
