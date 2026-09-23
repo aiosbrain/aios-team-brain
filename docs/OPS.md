@@ -1312,8 +1312,23 @@ public evidence.**
     `.wh...`) deletes nothing and is recorded the same way.
   - **Member paths are bounded** at 4,096 UTF-8 bytes and 128 segments — the audit's own supported
     input, not a claim about any extractor's limit. A longer name refuses the run with
-    `AUDIT_TAR_LIMIT_EXCEEDED` before any path work, and the merge and symlink-ancestry work run
-    under the run's deadline and a finite aggregate budget.
+    `AUDIT_TAR_LIMIT_EXCEEDED` before any path work.
+  - **Two independent authorities bound the path work.** A shared **retained-state budget** charges the
+    logical bytes of everything the run keeps — paths, symlinks, `/app` records, private staged records,
+    limitations, the merged view and its ancestor index — before each insertion, with a 256 MiB ceiling
+    and a secondary 500,000-relation ceiling. It is **monotonic**: deleting, overwriting or finishing a
+    layer never refunds, so churn cannot buy more state. A separate **work budget** counts CPU steps and
+    consults the deadline, including for names with no ancestors. Either one exceeded refuses the run
+    with `AUDIT_TAR_LIMIT_EXCEEDED` and a sanitized record. The 256 MiB figure is a conservative
+    supported-input boundary, **not a measured heap guarantee**: the per-item charges deliberately
+    over-estimate real object sizes.
+  - **An opaque marker's position in its layer matters.** If an ordinary entry written *earlier in the
+    same layer* sits beneath the marker's directory and depends on an intermediate directory that was
+    never declared as its own entry before the marker, the layer records `merged-type-conflict`: the
+    pinned runtime's overlay converter keeps such an entry while its non-overlay converter can remove
+    it, and the audit does not pick one. A marker that comes first, an earlier direct child, a complete
+    intermediate chain declared before the marker, and unrelated or prefix-sharing siblings are all
+    unaffected. This is a conservative accepted-format boundary, not extraction emulation.
   - **Type changes replace, not merge** (OCI "changeset over existing files"): a file or link replacing a
     lower directory removes that directory's whole subtree, a directory replacing a lower file removes
     the file, and directories merge. A directory's identity is its type, so `app` and `app/` written as
