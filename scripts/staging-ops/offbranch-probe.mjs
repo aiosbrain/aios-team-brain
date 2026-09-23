@@ -1454,19 +1454,23 @@ export function assessProbeLifecycle(records, { dir, intentSha256, intentArtifac
   }
   const dispatch = only(records, "dispatch-intent");
   equalOrRefuse({ workflow_file: dispatch.data.workflow_file, ref: dispatch.data.ref }, { workflow_file: PROBE_WORKFLOW_FILE, ref: PROBE_BRANCH }, "the probe dispatch intent");
+  const createdRecordMs = timeOf(created.ts, "the ref creation result time");
+  const dispatchMs = timeOf(dispatch.ts, "the dispatch intent time");
   // Creation and dispatch are immutable once-only bindings. Readbacks are replayable observations:
   // an incomplete read decides nothing, while a complete contradiction remains sticky. Select a
   // matching pre-dispatch observation only when the cumulative history through that exact row still
   // proves the original complete-201 ownership. A later match therefore cannot erase a prior 404,
   // changed SHA or uncertain creation, and a post-dispatch/cleanup read can never qualify the launch.
-  const readback = records.find((record, index) => record.type === "ref-readback"
-    && record.seq > created.seq && record.seq < dispatch.seq
-    && record.data.ref === PROBE_REF
-    && record.data.http_status === 200 && record.data.response_complete === true
-    && record.data.object_sha === workflowSha
-    && assessRefOwnership(records.slice(0, index + 1), { workflowSha }).may_delete);
+  const readback = records.find((record, index) => {
+    if (record.type !== "ref-readback" || record.seq <= created.seq || record.seq >= dispatch.seq
+      || record.data.ref !== PROBE_REF || record.data.http_status !== 200
+      || record.data.response_complete !== true || record.data.object_sha !== workflowSha) return false;
+    const measuredMs = timeOf(record.data.measured_at, "the ref readback measurement time");
+    const recordedMs = timeOf(record.ts, "the ref readback journal time");
+    return measuredMs >= createdRecordMs && measuredMs <= recordedMs && recordedMs < dispatchMs
+      && assessRefOwnership(records.slice(0, index + 1), { workflowSha }).may_delete;
+  });
   if (!readback) refuse("the created probe ref has no complete authenticated readback at the reviewed source before dispatch");
-  const dispatchMs = timeOf(dispatch.ts, "the dispatch intent time");
   // The operator computes the deadline from its clock read immediately BEFORE the durable append, so
   // it can only be at or before ten minutes from the record's own time — never later. The stricter
   // of the two bounds governs; a deadline that would extend the window refuses.

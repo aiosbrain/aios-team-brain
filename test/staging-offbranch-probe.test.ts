@@ -384,6 +384,7 @@ describe("the staged probe lifecycle (mock provider — not live proof)", () => 
     await expect(world.phase("dispatch", { transport: interruptedReadback })).rejects.toThrow(/could not be read back/);
     expect([world.count("POST", "/git/refs"), world.count("POST", "/dispatches")]).toEqual([1, 0]);
 
+    world.clock += 1000;
     await world.phase("dispatch");
     const collected: any = await world.phase("collect");
     let deletions = 0;
@@ -398,6 +399,8 @@ describe("the staged probe lifecycle (mock provider — not live proof)", () => 
     const readbacks = records.filter((record: any) => record.type === "ref-readback" && record.seq > created.seq && record.seq < dispatch.seq);
     expect(readbacks.map((record: any) => [record.data.response_complete, record.data.http_status, record.data.object_sha]))
       .toEqual([[false, 0, null], [true, 200, world.sha]]);
+    expect(Date.parse(readbacks[1].data.measured_at)).toBeGreaterThan(Date.parse(readbacks[0].data.measured_at) + 900);
+    expect(Date.parse(readbacks[1].data.measured_at)).toBeLessThan(Date.parse(dispatch.ts));
     expect([collected.status, cleaned.outcome, world.count("POST", "/git/refs"), world.count("POST", "/dispatches"), deletions])
       .toEqual(["measured", "measured", 1, 1, 1]);
     expect(world.refSha()).toBeNull();
@@ -411,7 +414,7 @@ describe("the staged probe lifecycle (mock provider — not live proof)", () => 
     expect(blockers.filter((entry: any) => entry.detail.includes(OFFBRANCH_CONTROL))).toEqual([]);
   });
 
-  for (const fault of ["postdispatch-only", "missing-201", "foreign-ref", "404-then-restored", "changed-sha-then-restored"] as const) {
+  for (const fault of ["postdispatch-only", "missing-201", "foreign-ref", "404-then-restored", "changed-sha-then-restored", "late-measured-time"] as const) {
     it(`refuses ${fault} lifecycle evidence through both offline validators`, async () => {
       const collected: any = await world.fullProbe();
       rewriteProbeJournal(world, (records) => {
@@ -426,6 +429,8 @@ describe("the staged probe lifecycle (mock provider — not live proof)", () => 
           Object.assign(initial.data, { http_status: 404, response_complete: true, response_incomplete: null, measured_status: 404, object_sha: null });
         } else if (fault === "changed-sha-then-restored") {
           initial.data.object_sha = world.otherSha;
+        } else if (fault === "late-measured-time") {
+          initial.data.measured_at = iso(Date.parse(dispatch.ts) + 1000);
         } else {
           Object.assign(initial.data, { http_status: 0, response_complete: false, response_incomplete: "transport-timeout", measured_status: null, object_sha: null });
         }
