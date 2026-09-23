@@ -424,6 +424,12 @@ export function validateGovernedSnapshot(snapshot, allowed) {
   const refuse = (why) => { throw new WitnessRefusal(`the witness snapshot is not usable policy evidence: ${why}`); };
   if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) refuse("it is not an object");
   if (snapshot.inert === true) refuse("it is an inert rehearsal observation and carries no policy measurement");
+  const list = snapshot.governed_rulesets;
+  if (!Array.isArray(list) || !list.length) refuse("it carries no complete governed ruleset set");
+  const classic = snapshot.classic_protection;
+  if (!classic || typeof classic !== "object" || Array.isArray(classic) || classic.present !== false || classic.status !== 404) {
+    refuse("it does not carry the measured no-classic-protection representation");
+  }
   assertClosedKeys(snapshot, OBSERVATION_FIELDS, "the witness snapshot", refuse);
   if (!isCanonicalTimestamp(snapshot.started_at) || !isCanonicalTimestamp(snapshot.completed_at)) {
     refuse("its measurement window is not two canonical timestamps");
@@ -439,14 +445,8 @@ export function validateGovernedSnapshot(snapshot, allowed) {
     || snapshot.applicability_pages > WITNESS_MAX_PAGES) {
     refuse(`its applicability page count is not an integer from 1 through ${WITNESS_MAX_PAGES}`);
   }
-  const list = snapshot.governed_rulesets;
-  if (!Array.isArray(list) || !list.length) refuse("it carries no complete governed ruleset set");
   if (list.length > snapshot.applicability_pages * WITNESS_PAGE_SIZE) {
     refuse("it carries more governed rulesets than its bounded applicability read could contain");
-  }
-  const classic = snapshot.classic_protection;
-  if (!classic || typeof classic !== "object" || Array.isArray(classic) || classic.present !== false || classic.status !== 404) {
-    refuse("it does not carry the measured no-classic-protection representation");
   }
   /**
    * The classic representation is CLOSED, and the source list is VOCABULARY-BOUND.
@@ -489,10 +489,10 @@ export function validateGovernedSnapshot(snapshot, allowed) {
     }
     return projected.governed;
   });
-  if (canonicalHash(governed) !== String(snapshot.projected_governed_digest)) {
+  if (typeof snapshot.projected_governed_digest !== "string" || canonicalHash(governed) !== snapshot.projected_governed_digest) {
     refuse("its projected governed digest does not match the governed set it carries");
   }
-  if (!SHA256.test(String(snapshot.raw_governed_digest ?? ""))) refuse("it carries no digest of the raw measurement it was projected from");
+  if (typeof snapshot.raw_governed_digest !== "string" || !SHA256.test(snapshot.raw_governed_digest)) refuse("it carries no digest of the raw measurement it was projected from");
   return { governed, classicProtection: null, classicMeasured: { present: false, status: 404 } };
 }
 
@@ -505,6 +505,13 @@ export const BINDING_FIELDS = Object.freeze([
   "domain", "repository", "repository_id", "source_mode", "original_run_id", "original_attempt",
   "workflow_path", "source_sha", "role", "job_id", "case_id", "case_ordinal", "direction",
   "target_ref", "intended_app_id", "intended_installation_id", "manifest_sha256", "graph_sha256",
+]);
+
+/** Binding fields the publisher can derive independently from provider metadata and intent. */
+const PUBLISHER_DERIVED_FIELDS = Object.freeze([
+  "domain", "repository", "repository_id", "source_mode", "original_run_id", "original_attempt",
+  "workflow_path", "source_sha", "job_id", "case_ordinal", "target_ref",
+  "intended_app_id", "intended_installation_id",
 ]);
 
 /**
@@ -730,8 +737,8 @@ export function assertResponseShape(response, { domain = null } = {}) {
   if (response.kind !== RESPONSE_KIND) refuse("the payload does not declare itself a commissioning witness response");
   // CLOSED. Nothing may travel beside the governed projection.
   assertClosedKeys(response, RESPONSE_FIELDS, "the witness response", refuse);
-  if (!NONCE.test(String(response.challenge_nonce ?? ""))) refuse("the witness response binds no challenge nonce");
-  if (!SHA256.test(String(response.challenge_digest ?? ""))) refuse("the witness response binds no exact challenge bytes");
+  if (typeof response.challenge_nonce !== "string" || !NONCE.test(response.challenge_nonce)) refuse("the witness response binds no challenge nonce");
+  if (typeof response.challenge_digest !== "string" || !SHA256.test(response.challenge_digest)) refuse("the witness response binds no exact challenge bytes");
   if (!isCanonicalTimestamp(response.created_at)) refuse("the witness response carries no canonical creation time");
   if (!isCanonicalTimestamp(response.challenge_expires_at)) refuse("the witness response carries no canonical challenge expiry");
   const createdAt = Date.parse(response.created_at);
@@ -1182,12 +1189,15 @@ export function publishWitnessResponse({ response, envelope, expected, publisher
   // THE ORIGINAL SUBJECT, from provider metadata rather than from the envelope's own claims.
   const subject = assertOriginalSubject({ response, originalRun, expected });
   if (typeof envelope !== "string" || envelope !== JSON.stringify(response)) {
-    throw new WitnessRefusal("the witness publisher will write only the exact canonical response bytes it validated");
+    throw new WitnessRefusal("the witness publisher will write only the exact producer response bytes it validated");
   }
   if (!expected?.binding || typeof expected.binding !== "object") {
     throw new WitnessRefusal("the witness publisher has no independently derived binding for the response it was asked to publish");
   }
-  for (const field of BINDING_FIELDS) {
+  for (const field of PUBLISHER_DERIVED_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(expected.binding, field)) {
+      throw new WitnessRefusal(`the witness publisher did not independently derive the response's ${field}`);
+    }
     if (canonicalJson(response[field] ?? null) !== canonicalJson(expected.binding[field] ?? null)) {
       throw new WitnessRefusal(`the witness envelope's ${field} is not the value the publisher independently derived`);
     }

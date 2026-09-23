@@ -5577,21 +5577,18 @@ export async function runWitnessPublisherJob(env = process.env, deps = {}) {
         domain: REHEARSAL_DOMAIN, repository: COMMISSIONING_REPOSITORY, repository_id: Number(ctx.repositoryId),
         source_mode: "transport-rehearsal", original_run_id: String(originalRunResponse.body.id),
         original_attempt: String(originalRunResponse.body.run_attempt), workflow_path: COMMISSIONING_WORKFLOW_PATH,
-        source_sha: sourceSha, role: REHEARSAL_ROLE, job_id: REHEARSAL_JOB_ID,
-        case_id: REHEARSAL_CASE_ID, case_ordinal: 0, direction: "pre", target_ref: REHEARSAL_TARGET,
-        intended_app_id: null, intended_installation_id: null, manifest_sha256: null, graph_sha256: null,
+        source_sha: sourceSha, job_id: REHEARSAL_JOB_ID, case_ordinal: 0, target_ref: REHEARSAL_TARGET,
+        intended_app_id: null, intended_installation_id: null,
       }
     : {
         domain: COMMISSION_DOMAIN, repository: COMMISSIONING_REPOSITORY, repository_id: Number(authenticatedIntent.repository_id),
         source_mode: "commission", original_run_id: String(originalRunResponse.body.id),
         original_attempt: String(originalRunResponse.body.run_attempt), workflow_path: COMMISSIONING_WORKFLOW_PATH,
-        source_sha: sourceSha, role: String(response.role), job_id: assertRoleBinding(String(response.role)).job,
-        case_id: String(response.case_id), case_ordinal: caseOrdinal(String(response.role), String(response.case_id)),
-        direction: String(response.direction),
+        source_sha: sourceSha, job_id: assertRoleBinding(String(response.role)).job,
+        case_ordinal: caseOrdinal(String(response.role), String(response.case_id)),
         target_ref: derivedRef(String(originalRunResponse.body.id), String(originalRunResponse.body.run_attempt), String(response.role)),
         intended_app_id: Number(response.role === "normal" ? authenticatedIntent.normal_app_id : authenticatedIntent.emergency_app_id),
         intended_installation_id: String(response.role === "normal" ? authenticatedIntent.normal_installation_id : authenticatedIntent.emergency_installation_id),
-        manifest_sha256: response.manifest_sha256, graph_sha256: response.graph_sha256,
       };
   const witnessDir = path.join(evidenceDir, "witness");
   const result = publishWitnessResponse({
