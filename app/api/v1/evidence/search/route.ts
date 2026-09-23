@@ -30,11 +30,15 @@ export async function POST(req: NextRequest) {
     const reader = req.body?.getReader(); let bytes = 0; let body = '';
     const decoder = new TextDecoder();
     if (reader) try {
-      while (true) {
-        const {done,value} = await reader.read(); if (done) break;
-        bytes += value.byteLength;
+      // The termination condition is the READ RESULT itself, not a `while (true)` with a break: the
+      // first read happens inside this try/finally (so a rejection still releases the lock and still
+      // reaches the route's one generic catch), and each iteration updates the state it loops on.
+      let read = await reader.read();
+      while (!read.done) {
+        bytes += read.value.byteLength;
         if (bytes > 16384) { await reader.cancel(); return errorResponse('invalid_payload', 'request too large', 422); }
-        body += decoder.decode(value, {stream:true});
+        body += decoder.decode(read.value, {stream:true});
+        read = await reader.read();
       }
       body += decoder.decode();
     } finally { reader.releaseLock(); }
