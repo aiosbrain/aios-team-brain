@@ -2346,7 +2346,7 @@ describe("durable effect recovery matrix", () => {
       expect(world.probeRecords().filter((row: any) => row.type === "reconciliation" && row.data.of === "ref-create-intent")).toHaveLength(1);
     });
   }
-  for (const boundary of ["dispatch-intent", "run-selection-page", "run-identified", "reconciliation"]) {
+  for (const boundary of ["dispatch-intent", "run-selection-observed", "run-identified", "reconciliation"]) {
     it(`applied dispatch with missing result resumes after ${boundary} without another POST`, async () => {
       world.seedOriginal(); await world.phase("stage");
       await expect(world.phase("dispatch", { transport: async (method: string, route: string, body: any) => {
@@ -2375,7 +2375,7 @@ describe("durable effect recovery matrix", () => {
       expect((await world.phase("cancel") as any).status).toBe("already-closed");
     });
   }
-  for (const outcome of ["deleted", "ambiguous"]) for (const boundary of ["cleanup-intent", "cleanup-result", "ref-readback", "reconciliation", "absence-verified"]) {
+  for (const outcome of ["deleted", "ambiguous"]) for (const boundary of ["cleanup-intent", "cleanup-result", "ref-readback", ...(outcome === "ambiguous" ? ["reconciliation"] : []), "absence-verified"]) {
     it(`${outcome} deletion resumes after ${boundary} with one deletion and both offline controls`, async () => {
       world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch"); const collected: any = await world.phase("collect");
       let deletions = 0;
@@ -2425,10 +2425,43 @@ describe("durable effect recovery matrix", () => {
     });
   }
   it("admitted failure takes precedence over a later qualification gap", async () => {
-    world.seedOriginal(); await world.phase("stage"); world.admitted = "probe-emergency"; await world.phase("dispatch");
+    world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch");
     const collected: any = await world.phase("collect");
+    cutAfter((row) => row.type === "run-terminal"); world.admitted = "probe-emergency";
+    await expect(world.phase("collect")).rejects.toThrow(/admitted/);
+    await world.phase("cancel");
     const transport = (method: string, route: string, body: any) => route.endsWith("/git/ref/heads/staging") ? Promise.resolve(incompleteResponse("transport-timeout")) : world.transport(method, route, body);
     expect((await world.phase("cleanup", { transport }) as any).outcome).toBe("failed");
     for (const environment of Object.keys(ENV_IDS)) expect(world.validate(collected.records[environment], environment)).toEqual(expect.any(String));
+  });
+});
+
+
+describe("recovery gap schema and original closure", () => {
+  for (const capture of ["paired", "incomplete"]) for (const phase of ["cancel", "cleanup"]) it(`${capture} ${phase} records original closure without reviving qualification`, async () => {
+    world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch"); const collected: any = await world.phase("collect");
+    if (capture === "incomplete") {
+      const file = journalPath(world.dir, RUN_ID, ATTEMPT, "probe");
+      const lines = readFileSync(file, "utf8").trimEnd().split("\n");
+      const index = lines.findIndex((line) => JSON.parse(line).type === "capture-progress");
+      expect(index).toBeGreaterThanOrEqual(0); writeFileSync(file, `${lines.slice(0, index + 1).join("\n")}\n`);
+    }
+    const lock = acquireJournalLock({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, now: world.now });
+    try { openJournal({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, source: world.sha, lock, now: world.now }).append("run-closed", { phase: "cleanup" }); } finally { lock.release(); }
+    if (capture === "incomplete" && phase === "cleanup") await expect(world.phase(phase)).rejects.toThrow(/collect before cleanup/);
+    else await world.phase(phase);
+    if (!world.probeRecords().some((row: any) => row.type === "probe-closed")) { if (capture === "incomplete") await world.phase("cancel"); await world.phase("cleanup"); }
+    expect(world.probeRecords().some((row: any) => row.type === "qualification-incomplete" && row.data.category === "original-closed")).toBe(true);
+    expect(world.probeRecords().at(-1)?.data.outcome).toBe("inconclusive"); expect(world.refSha()).toBeNull();
+    for (const environment of Object.keys(ENV_IDS)) expect(world.validate(collected.records[environment], environment)).toEqual(expect.any(String));
+  });
+  for (const read of ["source", "original"]) it(`unexpected ${read} programmer errors are not converted into recoverable gaps`, async () => {
+    world.seedOriginal(); await world.phase("stage");
+    await expect(world.phase("cleanup", { transport: async (method: string, route: string, body: any) => {
+      if (route.endsWith(read === "source" ? "/git/ref/heads/staging" : `/actions/runs/${RUN_ID}/attempts/${ATTEMPT}`)) throw new TypeError("unexpected bug");
+      return world.transport(method, route, body);
+    } })).rejects.toThrow(/unexpected bug/);
+    expect(world.probeRecords().some((row: any) => row.type === "qualification-incomplete")).toBe(false);
+    expect(world.probeRecords().some((row: any) => row.type === "probe-closed")).toBe(false);
   });
 });

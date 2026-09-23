@@ -122,7 +122,11 @@ from its newest row:** `assessProbePhaseState`, `assessRefOwnership` and `assess
 assessment use, so a successful deletion ends that creation's authority irreversibly (a same-SHA
 recreation is somebody else's ref), a ref seen at another SHA is not revived by being put back, and a
 measured staging move recorded by any phase interrupts the attempt permanently — cleanup and owned
-cancellation still run, measurement and acceptance do not. `check-evidence` reaches the separate validator in
+cancellation still run, measurement and acceptance do not. The shared `deriveProbeResolutionEvents`
+planner authenticates retained effects before completing missing reconciliation after a process cut;
+it never retries a mutation. Typed `qualification-incomplete` history also withholds acceptance after
+an unavailable or invalid recovery source/original read, while independent exact ownership checks
+continue to govern cleanup. `check-evidence` reaches the separate validator in
 `scripts/staging-ops/offbranch-probe.mjs` only for that control key with `offbranch_schema_version: 1`,
 and re-derives the refusal from retained raw run/jobs/check/annotation responses and before/after
 environment policy captures — never from a verdict field. Runbook: `docs/OPS.md` §14.

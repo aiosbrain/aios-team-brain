@@ -1820,7 +1820,16 @@ required to be the probe operator. Later original identity contradictions remain
 Qualification and recovery have separate admission rules. An unavailable original/source read,
 completed original run or expired capture window cannot authorize another launch or positive
 measurement. Authenticated retained original identity plus fresh exact owned-run/ref evidence can
-still authorize cancellation and cleanup, without renewing either deadline.
+still authorize cancellation and cleanup, without renewing either deadline. Each unavailable or invalid
+qualification read during recovery is recorded as a typed `qualification-incomplete` event before
+cleanup continues. Both environment validators reject that history even if a later read succeeds;
+unavailable source evidence is never described as measured source movement.
+
+Every phase writer completes missing reconciliation from the original authenticated durable effect:
+a complete fixed-ref absence, an exactly bound unique run selection, or a retained terminal run
+observation. A process cut between those facts and their bookkeeping does not require another
+mutation. Result-row presence alone does not resolve an unknown effect. Existing ownership
+contradictions remain binding, and recovery never extends the original selection/cancellation bound.
 
 If terminal collection stops during diagnostics, retained run/jobs/pages remain in the journal.
 Identity-bound execution evidence records a failed control before optional diagnostic reads. Invoke
