@@ -676,6 +676,7 @@ function eligibleRunIds(rows, { dispatchIntentMs, deadlineMs, identity }) {
  */
 export function assessRunSelectionContinuity(records, { dir, dispatchIntentMs, deadlineMs, identity }) {
   const groups = new Map();
+  const eligibleAcrossHistory = new Set();
   for (const record of records ?? []) {
     if (record?.type !== "run-selection-observed") continue;
     assertProbeEventPayload(record.type, record.data);
@@ -694,6 +695,10 @@ export function assessRunSelectionContinuity(records, { dir, dispatchIntentMs, d
     group.eligible.push(...eligible);
     groups.set(key, group);
     if (group.eligible.length > 1) refuse(`${group.eligible.length} eligible probe runs were observed before selection; none is selected, and the probe cannot pass`);
+    for (const runId of eligible) eligibleAcrossHistory.add(runId);
+    if (eligibleAcrossHistory.size > 1) {
+      refuse(`${eligibleAcrossHistory.size} different eligible probe runs were observed across the original dispatch window; a later listing cannot replace the earlier candidate, so none is selected and the probe cannot pass`);
+    }
   }
   return Object.freeze([...groups.values()].map((group) => Object.freeze({
     selection_id: group.selection_id, boundary: group.boundary,

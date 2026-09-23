@@ -893,6 +893,26 @@ describe("lifecycle ownership: create once, dispatch once, never adopt, never re
     expect(world.count("GET", `/actions/workflows/${PROBE_WORKFLOW_FILE}/runs`)).toBe(listingReads);
   });
 
+  it("does not let a later eligible run replace a different candidate retained from an earlier selection group", async () => {
+    world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch");
+    let listingReads = 0;
+    const interruptedListing = async (method: string, requestPath: string, body?: unknown) => {
+      if (method === "GET" && requestPath.includes(`/actions/workflows/${PROBE_WORKFLOW_FILE}/runs`)) {
+        listingReads += 1;
+        if (listingReads === 2) return incompleteResponse("transport-timeout");
+      }
+      return world.transport(method, requestPath, body);
+    };
+    await expect(world.phase("collect", { transport: interruptedListing })).rejects.toThrow(/could not be captured/);
+    const firstRunId = world.runs[0].id;
+    world.createRuns();
+    world.runs.shift();
+    expect(world.runs[0].id).not.toBe(firstRunId);
+    await expect(world.phase("collect")).rejects.toThrow(/different eligible probe runs were observed/);
+    expect(world.probeRecords().filter((record: any) => record.type === "run-selection-observed" && record.data.boundary === "peek")).toHaveLength(2);
+    expect(world.probeRecords().some((record: any) => record.type === "run-identified")).toBe(false);
+  });
+
   it("cancels only the exact probe run at the ten-minute deadline; cancellation is inconclusive, never success", async () => {
     world.seedOriginal();
     world.neverComplete = true;
