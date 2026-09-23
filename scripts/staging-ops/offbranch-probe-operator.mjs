@@ -47,7 +47,7 @@ import {
   CANCEL_CONFIRM_MS, CAPTURE_SCHEMA_VERSION, DIAGNOSTIC_SCHEMA_VERSION, DISPATCH_DEADLINE_MS, MAX_PAGES, OFFBRANCH_CONTROL,
   OFFBRANCH_SCHEMA_VERSION, PAGE_SIZE, PROBE_ATTEMPT, PROBE_BRANCH, PROBE_DISPATCHER, PROBE_ENVIRONMENTS, PROBE_EVENT,
   PROBE_INTENT_SCHEMA_VERSION, PROBE_JOBS, PROBE_REF, PROBE_WORKFLOW_FILE, PROBE_WORKFLOW_PATH, PROBE_WORKFLOW_SHA256,
-  ProbeProviderIncomplete, ProbeRefusal, RESOURCE_LINK_EVENT, SOURCE_OBSERVED_EVENT, assertInertProbeWorkflow, assertProbeEventPayload, assertProbeRunIdentity,
+  PolicyContradiction, PolicyObservationIncomplete, ProbeProviderIncomplete, ProbeRefusal, RESOURCE_LINK_EVENT, SOURCE_OBSERVED_EVENT, assertInertProbeWorkflow, assertProbeEventPayload, assertProbeRunIdentity,
   deriveProbeResolutionEvents, verifyIdentifiedProbeRun, deriveProbeAdmissions, verifyProbeRecoveryHistory, assessProbePhaseState, assessOriginalProbeBinding, assertOriginalProbeIdentity,
   assessRefOwnership, assessRunContinuity, assessRunSelectionContinuity, assessSourceContinuity, commissioningIdentity, inducedAutomation,
   parseCheckRunUrl, parseProbeIntent, probeCaptureName, probeIntentName, probeJournalName, probeObservationName,
@@ -154,7 +154,7 @@ async function openProbeSession({ runId, attempt, evidenceDir, env, deps, phase,
   // Authenticate local history before qualification reads or writer-lock acquisition. Closed
   // reporting is read-only even when a process died with the final fsynced close still locked.
   const records = readJournal({ dir, runId, attempt, kind: "probe" });
-  const state = asAssertion(() => assessProbePhaseState(records, { workflowSha: commissioning.workflow_sha }));
+  const state = asAssertion(() => assessProbePhaseState(records, { workflowSha: commissioning.workflow_sha, dir }));
   let baseline = null;
   if (records.length) {
     const staged = loadStagedProbe(session);
@@ -369,6 +369,15 @@ const asAssertion = (fn) => {
 const asIncomplete = (fn) => {
   try { return fn(); } catch (error) { if (error instanceof ProbeRefusal) throw new IncompleteEvidence(error.message); throw error; }
 };
+const asPolicyCapture = (fn) => {
+  try { return fn(); }
+  catch (error) {
+    if (error instanceof PolicyObservationIncomplete) throw new IncompleteEvidence(error.message);
+    if (error instanceof PolicyContradiction) throw new AssertionFailure(error.message);
+    if (error instanceof ProbeRefusal) throw new IncompleteEvidence(error.message);
+    throw error;
+  }
+};
 
 const facts = (response) => {
   const evidence = responseEvidence(response);
@@ -392,15 +401,20 @@ const probeRefPath = `/repos/${REPO}/git/ref/heads/${PROBE_BRANCH}`;
 const UNDECIDED_DELETION = "this probe's deletion of the owned ref has no decided effect, and a ref present at the reviewed source does not decide it — an unapplied deletion and an applied one followed by another creation at the same bytes are indistinguishable from here; NO second deletion is issued, and root reconciliation is required";
 
 /** One environment's settings plus every page of its branch policies, retained, parsed, agreeing. */
-async function capturePolicy(session, environment, phase) {
+async function capturePolicy(session, environment, phase, probe = null) {
+  if (probe) probe.append("policy-capture-intent", { phase, environment });
   const settings = await rawCapture(session, `/repos/${REPO}/environments/${environment}`, `${environment} settings`);
   const branch = await pagedCapture(session, `/repos/${REPO}/environments/${environment}/deployment-branch-policies`, "branch_policies", `${environment} branch policies`);
   const ref = writeDescriptor(session, {
     capture_schema_version: CAPTURE_SCHEMA_VERSION, kind: "environment-policy", phase, environment,
     settings: settings.ref, branch_policies: branch.pages,
   });
-  const { policy, completed } = asAssertion(() => readPolicyDescriptor(session.dir, ref, { environment, phase }));
-  return { ref, policy, completed_at: new Date(completed).toISOString() };
+  const completedAt = new Date(Math.max(Date.parse(settings.ref.completed_at), ...branch.pages.map((page) => Date.parse(page.completed_at)))).toISOString();
+  if (probe) probe.append("policy-observed", { phase, environment, descriptor: ref, completed_at: completedAt });
+  const { policy, completed } = asPolicyCapture(() => readPolicyDescriptor(session.dir, ref, { environment, phase }));
+  const completed_at = new Date(completed).toISOString();
+  if (probe) probe.append("policy-captured", { phase, environment, environment_id: policy.environment_id, descriptor: ref, completed_at });
+  return { ref, policy, completed_at };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -584,7 +598,7 @@ export async function runDispatch({ runId, attempt, evidenceDir, env, deps }) {
     // moment's reading. Nothing is created, and nothing is dispatched.
     const interrupted = sourceInterruption(recordSourceObservation(session, probe, "dispatch"));
     if (interrupted) throw new IncompleteEvidence(`${interrupted}; clean up next`);
-    const state = assessProbePhaseState(records, { workflowSha: session.commissioning.workflow_sha });
+    const state = assessProbePhaseState(records, { workflowSha: session.commissioning.workflow_sha, dir: session.dir });
     if (state.dispatch) throw new AssertionFailure("the probe was already dispatched; dispatch is never re-issued");
     if (state.create && !state.ref.may_delete) throw new IncompleteEvidence("the original probe create is unresolved or unowned; it is never re-issued or adopted");
     const sha = session.commissioning.workflow_sha;
@@ -627,8 +641,7 @@ export async function runDispatch({ runId, attempt, evidenceDir, env, deps }) {
         continue;
       }
       const baseline = asIncomplete(() => readPolicyDescriptor(session.dir, staged.intent.baseline_policy[environment], { environment, phase: "baseline" }));
-      const before = await capturePolicy(session, environment, "before");
-      probe.append("policy-captured", { phase: "before", environment, environment_id: before.policy.environment_id, descriptor: before.ref, completed_at: before.completed_at });
+      const before = await capturePolicy(session, environment, "before", probe);
       if (canonicalHash(before.policy) !== canonicalHash(baseline.policy)) throw new AssertionFailure(`${environment}'s policy changed between staging and dispatch; the probe is not dispatched`);
     }
 
@@ -911,8 +924,7 @@ export async function runCollect({ runId, attempt, evidenceDir, env, deps }) {
     captureCategory = "policy";
     const after = {};
     for (const environment of PROBE_ENVIRONMENTS) {
-      after[environment] = await capturePolicy(session, environment, "after");
-      probe.append("policy-captured", { phase: "after", environment, environment_id: after[environment].policy.environment_id, descriptor: after[environment].ref, completed_at: after[environment].completed_at });
+      after[environment] = await capturePolicy(session, environment, "after", probe);
     }
 
     captureCategory = "derivation";
@@ -982,11 +994,11 @@ export async function runCollect({ runId, attempt, evidenceDir, env, deps }) {
       note: "Measured, not accepted: clean up next, then check-evidence re-derives everything offline.",
     });
   } catch (error) {
-    if (captureCategory && captureRunId && !assessProbePhaseState(probe.records(), { workflowSha: session.commissioning.workflow_sha }).paired) {
+    if (captureCategory && captureRunId && !assessProbePhaseState(probe.records(), { workflowSha: session.commissioning.workflow_sha, dir: session.dir }).paired) {
       probe.append("capture-failed", { run_id: captureRunId, phase: "collect", category: captureCategory,
         capture_sequences: probe.records().filter((row) => ["capture-progress", "capture-recorded", "run-observed"].includes(row.type)).map((row) => row.seq) });
     }
-    if (assessProbePhaseState(probe.records(), { workflowSha: session.commissioning.workflow_sha }).failed) throw new AssertionFailure("an exactly bound probe job was admitted; the negative control FAILED and retained captures require explicit cancel before cleanup");
+    if (assessProbePhaseState(probe.records(), { workflowSha: session.commissioning.workflow_sha, dir: session.dir }).failed) throw new AssertionFailure("the cumulative probe evidence FAILED; retained captures require explicit cancel before cleanup");
     throw error;
   } finally {
     probe.lock.release();
@@ -1026,7 +1038,7 @@ export async function runCancel({ runId, attempt, evidenceDir, env, deps }) {
     const live = await bindProbeRun(session, probe, identified.data.run_id, "before cancelling it", "cancel");
     if (live.status === "completed") {
       if (!probe.records().some((record) => record.type === "run-terminal")) journalTerminal(session, probe, identified.data.run_id, live);
-      let state = assessProbePhaseState(probe.records(), { workflowSha: session.commissioning.workflow_sha });
+      let state = assessProbePhaseState(probe.records(), { workflowSha: session.commissioning.workflow_sha, dir: session.dir });
       if (state.paired) return result(session, "cancel", "already-terminal");
       if (!state.aborted) {
         const records = probe.records();
@@ -1055,7 +1067,7 @@ export async function runCancel({ runId, attempt, evidenceDir, env, deps }) {
         const terminal = probe.records().filter((row) => row.type === "run-observed").at(-1);
         probe.append("qualification-ended", { run_id: identified.data.run_id, reason: "operator-terminal-abort", terminal_sequence: terminal.seq });
       }
-      state = assessProbePhaseState(probe.records(), { workflowSha: session.commissioning.workflow_sha });
+      state = assessProbePhaseState(probe.records(), { workflowSha: session.commissioning.workflow_sha, dir: session.dir });
       return result(session, "cancel", "terminal-aborted", { outcome: state.failed ? "failed" : "inconclusive" });
     }
     await cancelAndConfirm(session, probe, identified.data.run_id, "operator");
@@ -1069,7 +1081,7 @@ function closeOutcome(records, { workflowSha, session }) {
   const observations = records.filter((record) => record.type === "observation-recorded");
   // An ADMITTED job is a real negative-control failure and keeps precedence over every other
   // reading: an interrupted attempt is untrustworthy in the passing direction, not in this one.
-  const state = assessProbePhaseState(records, { workflowSha });
+  const state = assessProbePhaseState(records, { workflowSha, dir: session.dir });
   if (state.failed) return "failed";
   try { assessOriginalProbeBinding(records, { dir: session.dir, commissioning: session.commissioning, dispatcher: session.intent.dispatcher, qualification: true }); }
   catch (error) { if (!(error instanceof ProbeRefusal)) throw error; return "inconclusive"; }
@@ -1165,7 +1177,7 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
     // The collection this waits for exists to capture the evidence of a probe that could still pass.
     // An attempt whose source moved can never pass, so requiring it there protects nothing and only
     // strands the cleanup — the one phase the interruption must NOT stop (R06-F2).
-    if (terminal && !cancelled && !assessSourceContinuity(records).interrupted && !assessProbePhaseState(records, { workflowSha: sha }).paired && !records.some((record) => record.type === "qualification-ended")) {
+    if (terminal && !cancelled && !assessSourceContinuity(records).interrupted && !assessProbePhaseState(records, { workflowSha: sha, dir: session.dir }).paired && !records.some((record) => record.type === "qualification-ended")) {
       throw new IncompleteEvidence("the terminal probe run has not been collected; collect before cleanup so the original evidence is captured first");
     }
     const at = () => session.now().toISOString();

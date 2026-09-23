@@ -114,8 +114,18 @@ export class ProbeProviderIncomplete extends ProbeRefusal {
     this.category = category;
   }
 }
+/** A policy observation whose retained bytes do not establish one complete relevant policy. */
+export class PolicyObservationIncomplete extends ProbeRefusal {
+  constructor(message) { super(message); this.name = "PolicyObservationIncomplete"; }
+}
+/** A complete measured policy that contradicts the commissioned policy. */
+export class PolicyContradiction extends ProbeRefusal {
+  constructor(message) { super(message); this.name = "PolicyContradiction"; }
+}
 const refuse = (message) => { throw new ProbeRefusal(message); };
 const providerIncomplete = (category, message) => { throw new ProbeProviderIncomplete(category, message); };
+const policyIncomplete = (message) => { throw new PolicyObservationIncomplete(message); };
+const policyContradiction = (message) => { throw new PolicyContradiction(message); };
 
 // ──────────────────────────────────────────────────────────────────────────────
 // 2. Derived local file names. Plain basenames inside the private evidence directory.
@@ -207,6 +217,8 @@ export const PROBE_JOURNAL_EVENTS = Object.freeze({
   "ref-create-intent": Object.freeze(["ref", "sha"]),
   "ref-create-result": Object.freeze(["ref", "sha", ...RESPONSE_FACTS, "object_sha"]),
   "ref-readback": Object.freeze(["ref", ...RESPONSE_FACTS, "object_sha", "measured_at"]),
+  "policy-capture-intent": Object.freeze(["phase", "environment"]),
+  "policy-observed": Object.freeze(["phase", "environment", "descriptor", "completed_at"]),
   "policy-captured": Object.freeze(["phase", "environment", "environment_id", "descriptor", "completed_at"]),
   "dispatch-intent": Object.freeze(["workflow_file", "ref", "deadline_at"]),
   "dispatch-result": Object.freeze(RESPONSE_FACTS),
@@ -264,6 +276,14 @@ export function assertProbeEventPayload(type, data) {
     if (!["stage", "dispatch", "collect", "cancel", "cleanup"].includes(data.phase)
       || !["source-unavailable", "source-invalid", "original-unavailable", "original-invalid", "original-inactive", "original-closed"].includes(data.category)) refuse("unknown qualification incompleteness category");
     timeOf(data.observed_at, "the qualification incompleteness time");
+  }
+  if (["policy-capture-intent", "policy-observed", "policy-captured"].includes(type)) {
+    if (!["before", "after"].includes(data.phase) || !PROBE_ENVIRONMENTS.includes(data.environment)) refuse("unknown policy capture boundary");
+    if (type !== "policy-capture-intent") {
+      assertClosed(data.descriptor, ARTIFACT_REF_FIELDS, "the policy capture descriptor reference");
+      timeOf(data.completed_at, "the policy capture completion time");
+    }
+    if (type === "policy-captured") decimalString(data.environment_id, "the captured policy environment identity");
   }
   if (type === "qualification-ended") {
     if (data.reason !== "operator-terminal-abort") refuse("unknown qualification end reason");
@@ -637,10 +657,10 @@ export function parseDiagnosticAnnotations(pages, { branch, environment, sha, re
  * One environment's COMPLETE relevant policy: the environment itself plus every page of its
  * deployment branch policies. Normalised for exact before/after comparison.
  */
-export function parseEnvironmentPolicy({ settings, branchPages }, { environment }) {
+function parseEnvironmentPolicyUnchecked({ settings, branchPages }, { environment }) {
   if (!isPlainObject(settings)) refuse(`${environment}'s settings capture is not an object`);
   const id = positiveInt(settings.id, `${environment}'s environment id`);
-  if (settings.name !== environment) refuse(`the settings capture names ${JSON.stringify(settings.name)}, not ${environment}`);
+  if (settings.name !== environment) policyContradiction(`the settings capture names ${JSON.stringify(settings.name)}, not ${environment}`);
   timeOf(settings.created_at, `${environment}'s created_at`);
   if (typeof settings.can_admins_bypass !== "boolean") refuse(`${environment}'s administrator bypass state is unmeasured`);
   const dbp = settings.deployment_branch_policy;
@@ -662,7 +682,7 @@ export function parseEnvironmentPolicy({ settings, branchPages }, { environment 
     if (rule.type === "branch_policy") return { type: rule.type, id: ruleId };
     // A wait timer, a custom deployment protection rule or any unknown type is another way to refuse
     // a deployment; a refusal it caused is not a branch-policy refusal, so it is not admitted here.
-    return refuse(`${environment} carries a ${JSON.stringify(String(rule.type))} protection rule; a refusal could be attributed to it rather than to branch policy`);
+    return policyContradiction(`${environment} carries a ${JSON.stringify(String(rule.type))} protection rule; a refusal could be attributed to it rather than to branch policy`);
   }).sort((a, b) => a.id - b.id);
   let total = null;
   const branchPolicies = [];
@@ -687,6 +707,16 @@ export function parseEnvironmentPolicy({ settings, branchPages }, { environment 
   };
 }
 
+export function parseEnvironmentPolicy(input, context) {
+  try {
+    return parseEnvironmentPolicyUnchecked(input, context);
+  } catch (error) {
+    if (error instanceof PolicyContradiction || error instanceof PolicyObservationIncomplete) throw error;
+    if (error instanceof ProbeRefusal) policyIncomplete(error.message);
+    throw error;
+  }
+}
+
 /**
  * The configuration the ORIGINAL commissioning controls expect, required of every policy capture:
  * the owner as sole reviewer, self-review prevented, branch-only `staging` (never a tag rule named
@@ -694,16 +724,20 @@ export function parseEnvironmentPolicy({ settings, branchPages }, { environment 
  * interpreting the probe; it never becomes evidence for the UI-only administrator-bypass control.
  */
 export function assertPolicyAgreesWithCommissioning(policy, environment) {
-  equalOrRefuse(policy.deployment_branch_policy, { protected_branches: false, custom_branch_policies: true }, `${environment}'s deployment branch policy`);
+  const equalPolicy = (actual, expected, label) => {
+    try { equalOrRefuse(actual, expected, label); }
+    catch (error) { if (error instanceof ProbeRefusal) policyContradiction(error.message); throw error; }
+  };
+  equalPolicy(policy.deployment_branch_policy, { protected_branches: false, custom_branch_policies: true }, `${environment}'s deployment branch policy`);
   const reviewerRules = policy.rules.filter((rule) => rule.type === "required_reviewers");
   const branchRules = policy.rules.filter((rule) => rule.type === "branch_policy");
-  if (reviewerRules.length !== 1 || branchRules.length !== 1) refuse(`${environment} does not carry exactly one reviewer rule and one branch-policy rule`);
-  equalOrRefuse(reviewerRules[0].reviewers, [{ type: OWNER_USER_TYPE, id: OWNER_USER_ID, login: OWNER_LOGIN }], `${environment}'s required reviewers`);
-  if (reviewerRules[0].prevent_self_review !== true) refuse(`${environment} does not prevent self-review`);
+  if (reviewerRules.length !== 1 || branchRules.length !== 1) policyContradiction(`${environment} does not carry exactly one reviewer rule and one branch-policy rule`);
+  equalPolicy(reviewerRules[0].reviewers, [{ type: OWNER_USER_TYPE, id: OWNER_USER_ID, login: OWNER_LOGIN }], `${environment}'s required reviewers`);
+  if (reviewerRules[0].prevent_self_review !== true) policyContradiction(`${environment} does not prevent self-review`);
   if (policy.branch_policies.length !== 1 || policy.branch_policies[0].name !== "staging" || policy.branch_policies[0].type !== "branch") {
-    refuse(`${environment}'s deployment branch policies are not exactly the one branch rule \`staging\``);
+    policyContradiction(`${environment}'s deployment branch policies are not exactly the one branch rule \`staging\``);
   }
-  if (policy.can_admins_bypass !== false) refuse(`${environment} lets administrators bypass its protection rules`);
+  if (policy.can_admins_bypass !== false) policyContradiction(`${environment} lets administrators bypass its protection rules`);
   return policy;
 }
 
@@ -884,7 +918,7 @@ export function parseProbeIntent(intent, { commissioning }) {
 }
 
 /** One environment policy descriptor → its normalised policy and the capture interval. */
-export function readPolicyDescriptor(dir, ref, { environment, phase }) {
+function readPolicyDescriptorUnchecked(dir, ref, { environment, phase }) {
   const descriptor = readDescriptor(dir, ref, `the ${environment} ${phase} policy descriptor`);
   assertClosed(descriptor, CAPTURE_DESCRIPTORS["environment-policy"].fields, `the ${environment} ${phase} policy descriptor`);
   if (descriptor.capture_schema_version !== CAPTURE_SCHEMA_VERSION || descriptor.kind !== "environment-policy") refuse(`the ${environment} ${phase} policy descriptor is not a version-1 policy capture`);
@@ -894,6 +928,16 @@ export function readPolicyDescriptor(dir, ref, { environment, phase }) {
   const policy = assertPolicyAgreesWithCommissioning(parseEnvironmentPolicy({ settings: settings.body, branchPages }, { environment }), environment);
   const intervals = [settings, ...branchPages];
   return { policy, started: Math.min(...intervals.map((entry) => entry.started)), completed: Math.max(...intervals.map((entry) => entry.completed)) };
+}
+
+export function readPolicyDescriptor(dir, ref, context) {
+  try {
+    return readPolicyDescriptorUnchecked(dir, ref, context);
+  } catch (error) {
+    if (error instanceof PolicyContradiction || error instanceof PolicyObservationIncomplete) throw error;
+    if (error instanceof ProbeRefusal) policyIncomplete(error.message);
+    throw error;
+  }
 }
 
 /**
@@ -1180,8 +1224,51 @@ export function verifyProbeRecoveryHistory(records, { dir, commissioning }) {
   }
 }
 
+/**
+ * Derive every journal-bound policy capture from cumulative history. An intent without an observed
+ * descriptor is incomplete; an observed complete contradiction is failed. Later captures cannot
+ * erase either disposition, and unjournaled descriptor files are never discovered or adopted.
+ */
+export function assessPolicyCaptureHistory(records, { dir = null } = {}) {
+  const boundaries = records.filter((row) => ["policy-capture-intent", "policy-observed", "policy-captured"].includes(row.type));
+  let failed = false;
+  let incomplete = false;
+  for (const phase of ["before", "after"]) {
+    for (const environment of PROBE_ENVIRONMENTS) {
+      const matching = (type) => boundaries.filter((row) => row.type === type && row.data.phase === phase && row.data.environment === environment);
+      const intents = matching("policy-capture-intent");
+      const observed = matching("policy-observed");
+      const captured = matching("policy-captured");
+      if (!intents.length && !observed.length && !captured.length) continue;
+      if (intents.length !== 1) refuse(`the probe journal records ${intents.length} ${environment} ${phase} policy capture intent(s), not exactly one`);
+      if (observed.length > 1 || captured.length > 1) refuse(`the probe journal repeats the ${environment} ${phase} policy capture boundary`);
+      if (!observed.length) { incomplete = true; continue; }
+      if (observed[0].seq <= intents[0].seq) refuse(`the ${environment} ${phase} policy observation predates its intent`);
+      let policy = null;
+      if (dir) {
+        try {
+          const retained = readPolicyDescriptor(dir, observed[0].data.descriptor, { environment, phase });
+          policy = retained.policy;
+          if (new Date(retained.completed).toISOString() !== observed[0].data.completed_at) refuse(`the ${environment} ${phase} policy observation completion contradicts its exact captures`);
+        } catch (error) {
+          if (error instanceof PolicyContradiction) failed = true;
+          else if (error instanceof ProbeRefusal) incomplete = true;
+          else throw error;
+        }
+      }
+      if (!captured.length) { incomplete = true; continue; }
+      if (captured[0].seq <= observed[0].seq) refuse(`the ${environment} ${phase} accepted policy predates its observation`);
+      if (canonicalJson(captured[0].data.descriptor) !== canonicalJson(observed[0].data.descriptor)
+        || captured[0].data.completed_at !== observed[0].data.completed_at) refuse(`the ${environment} ${phase} accepted policy is not its journal-bound observation`);
+      if (policy && captured[0].data.environment_id !== policy.environment_id) refuse(`the ${environment} ${phase} accepted policy names a different numeric environment`);
+      if (!dir) incomplete = true;
+    }
+  }
+  return Object.freeze({ failed, incomplete, boundaries });
+}
+
 /** Shared history facts used by every public phase and by offline qualification. */
-export function assessProbePhaseState(records, { workflowSha }) {
+export function assessProbePhaseState(records, { workflowSha, dir = null }) {
   checkProbeJournalShape(records);
   const has = (type) => records.some((row) => row.type === type);
   const observations = records.filter((row) => row.type === "observation-recorded");
@@ -1190,8 +1277,9 @@ export function assessProbePhaseState(records, { workflowSha }) {
     && ["refused", "admitted"].includes(row.data.outcome)).length === 1)
     && ["run", "jobs"].every((kind) => captures.filter((row) => row.data.kind === kind).length === 1)
     && PROBE_ENVIRONMENTS.every((environment) => captures.some((row) => row.data.kind === "denial" && row.data.environment === environment));
-  const failed = has("admission-observed") || observations.some((row) => row.data.outcome === "admitted");
-  const ended = has("qualification-incomplete") || has("qualification-ended") || has("capture-failed") || has("cancel-intent") || assessSourceContinuity(records).interrupted;
+  const policy = assessPolicyCaptureHistory(records, { dir });
+  const failed = has("admission-observed") || observations.some((row) => row.data.outcome === "admitted") || policy.failed;
+  const ended = has("qualification-incomplete") || has("qualification-ended") || has("capture-failed") || has("cancel-intent") || policy.incomplete || assessSourceContinuity(records).interrupted;
   const ref = assessRefOwnership(records, { workflowSha });
   return Object.freeze({ closed: has("probe-closed"), staged: has("probe-opened"), create: has("ref-create-intent"), dispatch: has("dispatch-intent"),
     cleanup: has("cleanup-intent"), capture_started: has("capture-progress") || has("capture-recorded"), paired, failed, ended, aborted: has("qualification-ended"), ref,
@@ -1419,7 +1507,7 @@ export function assessProbeLifecycle(records, { dir, intentSha256, intentArtifac
   if (canonicalHash(originalIntent) !== commissioning.intent_sha256) refuse("the original intent no longer matches its authenticated binding");
   assessOriginalProbeBinding(records, { dir, commissioning, dispatcher: originalIntent.dispatcher, qualification: true });
   verifyProbeRecoveryHistory(records, { dir, commissioning });
-  const phaseState = assessProbePhaseState(records, { workflowSha });
+  const phaseState = assessProbePhaseState(records, { workflowSha, dir });
   if (phaseState.failed || phaseState.ended) refuse("the cumulative probe qualification is failed, interrupted or irreversibly incomplete");
   const foreign = records.filter((record) => String(record.source) !== String(workflowSha));
   if (foreign.length) refuse(`${foreign.length} probe journal record(s) were written against a different immutable source`);
