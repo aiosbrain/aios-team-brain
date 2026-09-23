@@ -952,3 +952,26 @@ describe("production-shaped calibration of the shared authority (round 9)", () =
     }).toMatchObject({ keys: expect.any(Number), logicalBytes: expect.any(Number) });
   });
 });
+
+describe("symlink ancestry is charged to the SHARED work authority (round 10)", () => {
+  it("shared steps grow with the ancestry walked, and a tiny shared ceiling refuses", () => {
+    const paths = Array.from({ length: 20 }, (_, i) => `a/b/c/d/e/f${i}.js`);
+    const counted = createWorkBudget({ maxSteps: 1_000_000 });
+    expect(membersThroughSymlink(paths, new Set(["zz"]), undefined, { work: counted })).toBe(false);
+    // One entry validation plus five ancestor visits per path — none of which used to be counted.
+    expect(counted.steps).toBeGreaterThanOrEqual(paths.length * 6);
+
+    const fewer = createWorkBudget({ maxSteps: 1_000_000 });
+    membersThroughSymlink(paths.slice(0, 5), new Set(["zz"]), undefined, { work: fewer });
+    expect(counted.steps).toBeGreaterThan(fewer.steps);
+
+    // The shared ceiling refuses independently of any deadline.
+    expect(() => membersThroughSymlink(paths, new Set(["zz"]), undefined, { work: createWorkBudget({ maxSteps: 10 }) }))
+      .toThrow(expect.objectContaining({ code: "AUDIT_TAR_LIMIT_EXCEEDED" }));
+  });
+
+  it("a direct caller with no work budget still gets a finite default", () => {
+    expect(membersThroughSymlink(["a/b/c.js"], new Set(["a"]))).toBe(true);
+    expect(membersThroughSymlink(["a/b/c.js"], new Set(["zz"]))).toBe(false);
+  });
+});

@@ -1429,3 +1429,58 @@ describe("nested reader limits keep their gap semantics (round 9)", () => {
       .rejects.toMatchObject({ code: "AUDIT_TAR_LIMIT_EXCEEDED" });
   });
 });
+
+/**
+ * ROUND 10 — A WHITEOUT BENEATH A NON-DIRECTORY PARENT.
+ *
+ * The pinned extractor prepares a member's parents before interpreting a whiteout, and preparing a
+ * parent that is a regular file or a link fails with ENOTDIR — it does not replace it with a directory.
+ * The exact-4d6 witness (`app/index.js/.wh..wh..opq` over a lower regular `app/index.js`) returned no
+ * limitations, matched 2, readiness true. Every negative row below must now block through the existing
+ * `merged-type-conflict` gap after an otherwise-valid inventory comparison, and each control stays ready.
+ */
+describe("a whiteout under a non-directory parent is a blocking gap (round 10)", () => {
+  const conflicted = (result: Awaited<ReturnType<typeof inspectLayers>>) =>
+    result.coverage.limitations.some((l: { kind: string }) => l.kind === "merged-type-conflict");
+
+  const negatives: [string, { name: string; content?: string; type?: "directory" | "symlink"; linkTarget?: string }[]][] = [
+    ["an opaque marker directly below a lower regular file", [{ name: "app/index.js/.wh..wh..opq", content: "" }]],
+    ["an opaque marker DEEPER below that non-directory ancestor", [{ name: "app/index.js/nested/deeper/.wh..wh..opq", content: "" }]],
+    ["an ORDINARY delete marker below a lower regular file", [{ name: "app/index.js/.wh.child", content: "" }]],
+    ["a marker below a lower SYMLINK", [{ name: "app/link/.wh..wh..opq", content: "" }]],
+    ["a same-layer file at the target, then a marker beneath it", [{ name: "app/fresh.js", content: "f" }, { name: "app/fresh.js/.wh..wh..opq", content: "" }]],
+    ["a marker first, with the directory replacement only LATER in the layer", [{ name: "app/index.js/.wh..wh..opq", content: "" }, { name: "app/index.js/", type: "directory" }]],
+  ];
+
+  for (const [label, members] of negatives) {
+    it(`BLOCKS: ${label}`, async () => {
+      const lower = [...baseMembers, { name: "app/link", type: "symlink" as const, linkTarget: "index.js" }];
+      const result = await inspectLayers([buildTar(lower), buildTar(members)]);
+      expect(conflicted(result), "no merged-type-conflict recorded").toBe(true);
+      const { readiness } = chain(result);
+      expect(readiness.transitionReady).toBe(false);
+      // The layer's bytes are still staged and scanned.
+      expect(result.coverage.stagedBytes).toBeGreaterThan(0);
+    });
+  }
+
+  const controls: [string, { name: string; content?: string; type?: "directory" }[]][] = [
+    ["an explicit directory replacement BEFORE the marker", [{ name: "app/index.js/", type: "directory" }, { name: "app/index.js/.wh..wh..opq", content: "" }]],
+    ["a marker first, over a path no lower file blocks", [{ name: "app/fresh/.wh..wh..opq", content: "" }, { name: "app/fresh/", type: "directory" }, { name: "app/fresh/kept.js", content: "k" }]],
+    ["ordinary opacity over a real directory", [{ name: "app/d/.wh..wh..opq", content: "" }, { name: "app/d/", type: "directory" }, { name: "app/d/x.js", content: "x" }]],
+    ["a segment-PREFIX sibling of the lower file", [{ name: "app/index.jsx/", type: "directory" }, { name: "app/index.jsx/.wh..wh..opq", content: "" }]],
+  ];
+
+  for (const [label, members] of controls) {
+    it(`stays eligible: ${label}`, async () => {
+      const result = await inspectLayers([buildTar(baseMembers), buildTar(members)]);
+      expect(conflicted(result), "an unexpected merged-type-conflict").toBe(false);
+    });
+  }
+
+  it("the ordinary root opacity control is unaffected", async () => {
+    const result = await inspectLayers([buildTar(baseMembers), buildTar([{ name: ".wh..wh..opq", content: "" }, ...baseMembers])]);
+    expect(result.coverage.limitations).toEqual([]);
+    expect(chain(result).readiness.transitionReady).toBe(true);
+  });
+});
