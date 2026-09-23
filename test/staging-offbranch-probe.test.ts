@@ -1846,7 +1846,17 @@ describe("R07: observable mutation uncertainty and current cleanup authority", (
 
 describe("R07: explicit public probe lock recovery", () => {
   const recover = (extra: any = {}) => recoverJournalLock({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, kind: "probe", ownerGone: true, now: world.now, reconcile: async () => ({ reconciled: true }), ...extra });
-  const abandoned = () => acquireJournalLock({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, kind: "probe", pid: 2147483647, host: "synthetic-gone-owner", now: world.now });
+  const abandoned = () => {
+    // A real child owns the lock, then exits without release. Its synchronous exit verifies the
+    // owner is gone; no elapsed-time heuristic or manual lock deletion participates in recovery.
+    const modulePath = path.join(__dirname, "../scripts/staging-ops/commissioning-journal.mjs");
+    const script = `import { acquireJournalLock } from ${JSON.stringify(modulePath)};
+      const lock = acquireJournalLock(${JSON.stringify({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, kind: "probe" })});
+      process.stdout.write(JSON.stringify(lock)); process.exit(0);`;
+    const owner = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8" }));
+    expect(() => process.kill(owner.pid, 0)).toThrow();
+    return owner;
+  };
 
   it("recovers stage→cleanup and repeated recovery without adopting resources", async () => {
     world.seedOriginal(); await world.phase("stage");

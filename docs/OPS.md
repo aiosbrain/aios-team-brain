@@ -1811,9 +1811,9 @@ node $P cleanup  $A   # exact-SHA lease deletion via local git; verified absence
 node $P cancel   $A   # operator abort: cancels ONLY the identified probe run, confirms terminal
 ```
 
-Exit codes follow the commissioning CLI: 1 = a measured failure (an admitted job, a changed ref, a
-refused dispatch), 3 = incomplete (lost answers, no eligible run, cancellation, policy drift), 2 =
-usage. No command takes a ref, workflow, URL or environment; there is nothing to point elsewhere.
+Exit codes follow the commissioning CLI: 1 = a measured failure (an admitted job or a changed ref),
+3 = incomplete (lost answers, a non-204 dispatch response, no eligible run, cancellation, policy
+drift), 2 = usage. No command takes a ref, workflow, URL or environment; there is nothing to point elsewhere.
 
 **What never happens.** No approval, rejection or bypass of a deployment review; no environment,
 policy, reviewer, App or protection change; no run records deleted. A lost create, dispatch or
@@ -1825,7 +1825,7 @@ DELETE. A run still nonterminal two minutes after cancellation blocks cleanup an
 
 **What the journal permits is DERIVED from all of it, not from its newest row.** Both the operator
 and the offline assessment read the probe journal through one shared derivation
-(`assessRefOwnership` / `assessSourceContinuity`), so a refusal cannot be walked back by appending
+(`assessRefOwnership` / `assessRunContinuity` / `assessSourceContinuity`), so a refusal cannot be walked back by appending
 something later:
 
 - **A deletion this probe recorded as SUCCESSFUL ends that creation's ownership for good.** If the
@@ -1834,15 +1834,30 @@ something later:
   this process and every later one, and `check-evidence` refuses the observations too. The
   reconciliation row that refusal writes is a fact about the ref, not a permission to try again.
 - **A ref measured at another SHA is not revived by being put back** at the reviewed SHA.
-- **Still supported, unchanged:** a `deleted` result whose absence readback was lost recovers when
-  the ref reads 404, with no second deletion; and an ambiguous deletion the ref itself shows did not
-  apply may issue exactly one fresh lease deletion.
+- **Exact absence can reconcile a lost deletion answer**, with no second deletion. A same-SHA
+  presence cannot distinguish an unapplied deletion from deletion followed by another creation;
+  it stays unresolved and never authorizes another lease deletion.
+- **An empty run listing does not prove the dispatch never applied.** Missing results and complete
+  non-204 responses (including 5xx) remain unresolved until the exact owned run is established.
+  Zero, duplicate or foreign candidates authorize neither deletion nor closure, and never redispatch.
+- **Historical terminal evidence is refreshed at cancellation, deletion and closure.** Each complete
+  run observation is retained before identity checks; an observed rerun, foreign identity or change
+  from terminal state remains a contradiction after later restoration. Each complete ref read is
+  likewise retained, including a present immediate readback after acknowledged deletion.
 - **A measured move of the live `staging` head interrupts the attempt permanently.** Every phase
   records what it measured (`source-observed`), so a head that returns to the trusted source does
   not erase it and a fresh process re-derives it. `collect` then refuses to measure; `cancel` and
   `cleanup` deliberately still run — removing what the run created is exactly what must not be
   blocked — but the journal closes `inconclusive`, never `measured`, and offline acceptance refuses.
   Root reconciles.
+
+**Recovering an interrupted local writer.** The shared `recoverJournalLock` API accepts the probe
+journal kind only with explicit verified-gone-owner evidence, its exact original journal/intent/source
+binding, and provider reconciliation of every recorded create, dispatch, cancel and cleanup intent.
+Its closed `lock-recovered` event concerns exclusive local ownership only; it cannot resolve a
+resource outcome, authorize retries or adopt a ref. A failed callback leaves the old lock in place;
+a failed append releases the replacement lock. Subsequent public phases re-establish provider facts
+under the original deadlines. Do not manually delete a lock or edit retained journal history.
 
 **What `collect` writes.** One create-once, mode-0600 observation per environment
 (`commissioning-<run>-<attempt>-offbranch-observation-<environment>.json`), only when the refusal is
