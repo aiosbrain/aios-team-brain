@@ -544,7 +544,7 @@ export async function runDispatch({ runId, attempt, evidenceDir, env, deps }) {
     probe.append("ref-create-result", { ref: PROBE_REF, sha, ...facts(created), object_sha: objectSha });
     if (created.complete !== true) {
       const readback = await session.request("GET", probeRefPath);
-    probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), object_sha: readback.complete === true ? (String(readback.body?.object?.sha ?? "") || null) : null, measured_at: session.now().toISOString() });
+      probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), object_sha: readback.complete === true ? (String(readback.body?.object?.sha ?? "") || null) : null, measured_at: session.now().toISOString() });
       const at = session.now().toISOString();
       if (readback.complete === true && readback.status === 404) {
         probe.append("reconciliation", { of: "ref-create-intent", outcome: "absent", object_sha: null, measured_at: at });
@@ -628,17 +628,18 @@ async function bindProbeRun(session, probe, runId, when, boundary = "read") {
 }
 
 /**
- * Poll the ONE identified run until it is terminal or the given instant passes. Non-retaining reads
- * — but every read re-checks the identity, so a run that is rerun or otherwise stops being ours
+ * Poll the ONE identified run until it is terminal or the given instant passes. Each complete
+ * observation is retained before its identity check, so a run that is rerun or stops being ours
  * during the wait refuses here instead of being carried into a cancellation.
  */
 async function waitTerminal(session, probe, runId, untilMs) {
   for (;;) {
     let body;
+    const beforeRead = probe.records().length;
     try { body = await assertOwnedProbeRun(session, probe, runId, "while waiting for it to reach a terminal state"); }
     catch (error) {
       // Unavailable reads may be retried inside the original bound; retained contradictions may not.
-      if (!(error instanceof IncompleteEvidence) || probe.records().at(-1)?.type === "run-observed") throw error;
+      if (!(error instanceof IncompleteEvidence) || probe.records().length !== beforeRead) throw error;
     }
     if (body?.status === "completed") return body;
     if (session.now().getTime() >= untilMs) return null;
@@ -666,7 +667,7 @@ async function waitTerminal(session, probe, runId, untilMs) {
  * What it returns is the identification, never a measurement: `collect` still has to earn its
  * captures, and an interrupted attempt is still never accepted.
  */
-async function reconcileOwnedRun(session, probe, when) {
+async function reconcileOwnedRun(session, probe) {
   const records = probe.records();
   const identified = records.find((record) => record.type === "run-identified");
   if (identified) return identified;
@@ -1030,7 +1031,7 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
      */
     if (ownership.pending) {
       const readback = await session.request("GET", probeRefPath);
-    probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), object_sha: readback.complete === true ? (String(readback.body?.object?.sha ?? "") || null) : null, measured_at: session.now().toISOString() });
+      probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), object_sha: readback.complete === true ? (String(readback.body?.object?.sha ?? "") || null) : null, measured_at: session.now().toISOString() });
       if (readback.complete === true && readback.status === 404) {
         probe.append("reconciliation", { of: "cleanup-intent", outcome: "absent", object_sha: null, measured_at: at() });
         probe.append("absence-verified", { ref: PROBE_REF, ...facts(readback), measured_at: at() });

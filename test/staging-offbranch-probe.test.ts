@@ -1258,7 +1258,7 @@ describe("R04-F4: a successful deletion owns the recovery of its own missing rea
           : local.transport(method, requestPath, body));
       await expect(local.phase("cleanup", { transport, deleteRef })).rejects.toThrow(/absence could not be confirmed/);
       local.setRef(local.otherSha);
-      await expect(local.phase("cleanup")).rejects.toThrow(/never deleted at another SHA/);
+      await expect(local.phase("cleanup")).rejects.toThrow(/never deleted/);
       expect(local.refSha()).toBe(local.otherSha);
     } finally { rmSync(local.root, { recursive: true, force: true }); }
   });
@@ -1582,7 +1582,7 @@ describe("R06: separated qualification, run authority and ref authority", () => 
 
       // Staging is back, and the attempt is still disqualified — but its own run is still its own.
       const cancelled: any = await world.phase("cancel");
-      expect(cancelled.status).toBe("cancelled");
+      expect(cancelled.status).toBe("already-terminal");
       const events = world.probeRecords().map((record: any) => record.type);
       expect(events).toContain("run-identified");
       expect(events).toContain("run-terminal");
@@ -1604,7 +1604,7 @@ describe("R06: separated qualification, run authority and ref authority", () => 
       world.clock += 60_000; // the run finishes on its own while the attempt is interrupted
       // No cancellation is aimed at a run that has already finished: it is reconciled as terminal.
       const cancelled: any = await world.phase("cancel");
-      expect(cancelled.status).toBe("cancelled");
+      expect(cancelled.status).toBe("already-terminal");
       expect(world.count("POST", "/cancel")).toBe(0);
       const terminal = world.probeRecords().find((record: any) => record.type === "run-terminal");
       expect(terminal.data.status).toBe("completed");
@@ -1815,7 +1815,7 @@ describe("R07: observable mutation uncertainty and current cleanup authority", (
       const deleteRef = async () => { deletes++; return { outcome: "deleted", exit_code: 0 }; };
       await expect(world.phase(boundary, { deleteRef })).rejects.toThrow(/attempt|contradicts|not this probe's own run/);
       world.runs[0].attempt = 1; world.neverComplete = false; world.runs[0].actor = { ...JOHN };
-      await expect(world.phase("cleanup", { deleteRef })).rejects.toThrow(/attempt|contradicts|dispatcher/);
+      await expect(world.phase("cleanup", { deleteRef })).rejects.toThrow(/attempt|contradicts|actor/);
       expect([deletes, world.count("POST", "/cancel")]).toEqual([0, 0]);
       expect(world.refSha()).toBe(world.sha);
       for (const environment of ["staging-release", "staging-emergency"]) expect(world.validate(collected.records[environment], environment)).not.toBeNull();

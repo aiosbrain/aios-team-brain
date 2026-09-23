@@ -253,6 +253,10 @@ export function acquireJournalLock({
   try {
     writeSync(fd, `${JSON.stringify(owner)}\n`);
     fsyncSync(fd);
+  } catch (error) {
+    // An unsuccessful acquisition must not leave a lock owned by no returned handle.
+    if (readLockOwner(root, runId, attempt, kind)?.nonce === nonce) unlinkSync(file);
+    throw error;
   } finally {
     closeSync(fd);
   }
@@ -313,6 +317,9 @@ export async function recoverJournalLock({ dir, runId, attempt, kind = "resource
   try {
     writeSync(recoveryFd, `${JSON.stringify({ v: JOURNAL_SCHEMA_VERSION, pid: process.pid, host: hostname(), started_at: now().toISOString() })}\n`);
     fsyncSync(recoveryFd);
+  } catch (error) {
+    unlinkSync(recoveryLock);
+    throw error;
   } finally {
     closeSync(recoveryFd);
   }
@@ -377,6 +384,9 @@ export async function recoverJournalLock({ dir, runId, attempt, kind = "resource
     const current = readLockOwner(root, runId, attempt, kind);
     if (!current) throw new JournalRefusalError("the lock this recovery started from was already released; re-check the run rather than replacing it");
     if (current.nonce !== owner.nonce) throw new JournalRefusalError("the lock was replaced while this recovery was reconciling; refusing to remove the new owner's lock");
+    if (JSON.stringify(readJournal({ dir: root, runId, attempt, kind })) !== JSON.stringify(records)) {
+      throw new JournalRefusalError("the journal changed while recovery was reconciling; the original lock is retained");
+    }
     unlinkSync(lockPath(root, runId, attempt, kind));
     const lock = acquireJournalLock({ dir: root, runId, attempt, kind, now });
     try {

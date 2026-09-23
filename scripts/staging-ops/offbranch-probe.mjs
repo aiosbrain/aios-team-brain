@@ -1061,6 +1061,12 @@ export function assessProbeLifecycle(records, { dir, intentSha256, intentArtifac
     intent_artifact: intentArtifact, intent_sha256: intentSha256,
     commissioning_run_id: commissioning.run_id, commissioning_attempt: commissioning.attempt,
   }, "the probe journal's opening binding");
+  for (const recovery of records.filter((row) => row.type === "lock-recovered")) {
+    if (recovery.data.intent_sha256 !== intentSha256) refuse("the recovered probe lock names another intent");
+    equalOrRefuse(recovery.data.reconciled_intents,
+      records.filter((row) => row.seq < recovery.seq && PROBE_INTENT_PAIRS[row.type]).map((row) => ({ seq: row.seq, type: row.type })),
+      "the recovered probe mutation bindings");
+  }
   const open = unresolvedProbeIntents(records);
   if (open.length) refuse(`${open.length} probe intent(s) have no result or reconciliation (${open.map((entry) => `${entry.type}#${entry.seq}`).join(", ")})`);
 
