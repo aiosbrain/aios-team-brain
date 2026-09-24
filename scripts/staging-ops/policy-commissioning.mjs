@@ -6531,9 +6531,11 @@ export async function runCleanupPhase({ runId, attempt, evidenceDir, env, deps =
       const owned = lifetime.identity;
       const detail = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/rulesets/${owned.id}`);
       if (detail.status === 404) {
-        journal.append("resource-retired", {
-          ...resourceEventIdentity(owned), lifecycle_key: lifetime.key, reason: "confirmed-absent", readback_status: 404,
-        });
+        if (lifetime.state !== "retired") {
+          journal.append("resource-retired", {
+            ...resourceEventIdentity(owned), lifecycle_key: lifetime.key, reason: "confirmed-absent", readback_status: 404,
+          });
+        }
         outcomes.push({ kind: "ruleset", id: owned.id, name: owned.name, result: "already-absent" });
         continue;
       }
@@ -6638,10 +6640,12 @@ export async function runCleanupPhase({ runId, attempt, evidenceDir, env, deps =
       const owned = lifetime.identity;
       const currentSha = await readDerivedRefSha({ request, ref: owned.ref });
       if (currentSha === null) {
-        journal.append("resource-retired", {
-          ...resourceEventIdentity(owned), lifecycle_key: lifetime.key, reason: "confirmed-absent",
-          readback_absent: true, readback_sha: null,
-        });
+        if (lifetime.state !== "retired") {
+          journal.append("resource-retired", {
+            ...resourceEventIdentity(owned), lifecycle_key: lifetime.key, reason: "confirmed-absent",
+            readback_absent: true, readback_sha: null,
+          });
+        }
         outcomes.push({ kind: "ref", ref: owned.ref, result: "already-absent" });
         continue;
       }
@@ -6684,10 +6688,12 @@ export async function runCleanupPhase({ runId, attempt, evidenceDir, env, deps =
         outcomes.push({ kind: "pull-request", number: pull.number, result: "refused-retargeted" });
         refused += 1;
       } else if (String(detail.body.state) === "closed") {
-        journal.append("resource-retired", {
-          ...resourceEventIdentity(pull), lifecycle_key: pullLifetime.key, reason: "confirmed-closed",
-          readback_status: 200, readback_state: "closed",
-        });
+        if (pullLifetime.state !== "retired") {
+          journal.append("resource-retired", {
+            ...resourceEventIdentity(pull), lifecycle_key: pullLifetime.key, reason: "confirmed-closed",
+            readback_status: 200, readback_state: "closed",
+          });
+        }
         outcomes.push({ kind: "pull-request", number: pull.number, result: "already-closed" });
       } else if (pullLifetime.state === "retired") {
         journal.append("reconciliation", {
@@ -8579,9 +8585,11 @@ export function assessEvidence({ dir, runId, attempt, now = () => new Date() }) 
         : result === "closed"
           ? terminal.some((event) => event.type === "cleanup-result" && event.data?.closed === true)
           : result === "already-absent"
-            ? terminal.some((event) => event.type === "resource-retired" && event.data?.reason === "confirmed-absent")
+            ? terminal.some((event) => (event.type === "resource-retired" && event.data?.reason === "confirmed-absent")
+              || (event.type === "cleanup-result" && event.data?.removed === true))
             : result === "already-closed"
-              ? terminal.some((event) => event.type === "resource-retired" && event.data?.reason === "confirmed-closed")
+              ? terminal.some((event) => (event.type === "resource-retired" && event.data?.reason === "confirmed-closed")
+                || (event.type === "cleanup-result" && event.data?.closed === true))
               : true;
       if (!joined) {
         block("PC-07", "invalid", `cleanup outcome ${lifetime.key}:${result} has no matching durable cleanup/readback transition before the latest run closure`);

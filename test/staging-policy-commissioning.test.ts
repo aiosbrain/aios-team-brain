@@ -39,7 +39,7 @@ import {
 import { buildMainRulesets, REQUIRED_MAIN_CONTEXTS } from "../scripts/staging-ops/main-policy.mjs";
 import {
   acquireJournalLock, journalPath, openJournal, readJournal, readLockOwner, recordWitnessEventOnce,
-  recoverJournalLock,
+  recoverJournalLock, reduceResourceLifecycles, resourceLifecycleKey,
 } from "../scripts/staging-ops/commissioning-journal.mjs";
 import { openCaseStateStore } from "../scripts/staging-ops/commissioning-case.mjs";
 import {
@@ -835,6 +835,156 @@ beforeEach(() => {
   globalThis.fetch = ((input: unknown) => {
     throw new Error(`the commissioning suite attempted a real network request to ${String(input)}`);
   }) as unknown as typeof fetch;
+});
+
+describe("RIR residual resource lifetime and offline authority regressions", () => {
+  const cliResult = async (phase: string, deps: Record<string, unknown> = {}, env: NodeJS.ProcessEnv = LOCAL_ENV) => {
+    let raw = "";
+    const exit = await main(
+      [phase, "--run-id", RUN_ID, "--attempt", ATTEMPT, "--evidence-dir", evidenceDir],
+      env,
+      { ...deps, write: (text: string) => { raw += text; } },
+    );
+    return { exit, payload: JSON.parse(raw) };
+  };
+
+  it("RIR2 · persistent foreign collision is rechecked on retry and both setup attempts issue zero mutations", async () => {
+    const github = createFakeGitHub();
+    const desired = transformToDisposable(
+      buildMainRulesets({ normalAppId: NORMAL_APP, emergencyAppId: EMERGENCY_APP, producerIds: PRODUCER_IDS }),
+      { runId: RUN_ID, attempt: ATTEMPT, actor: "normal", normalAppId: NORMAL_APP },
+    )[0];
+    github.rulesets.set(999999, { ...desired, id: 999999 });
+    await runIntentPhase({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: INTENT_ENV() });
+
+    const firstStart = github.calls.length;
+    const first = await cliResult("setup", localDeps(github));
+    const firstWrites = github.calls.slice(firstStart).filter((call) => ["POST", "PATCH", "DELETE"].includes(call.method));
+    const secondStart = github.calls.length;
+    const second = await cliResult("setup", localDeps(github));
+    const secondWrites = github.calls.slice(secondStart).filter((call) => ["POST", "PATCH", "DELETE"].includes(call.method));
+
+    expect(first.exit).not.toBe(0);
+    expect(second.exit).not.toBe(0);
+    expect(first.payload.errors.join(" ")).toMatch(/already exists outside an active exact journaled lifetime/);
+    expect(second.payload.errors.join(" ")).toMatch(/already exists outside an active exact journaled lifetime/);
+    expect(firstWrites).toEqual([]);
+    expect(secondWrites).toEqual([]);
+    expect(github.rulesets.get(999999)).toEqual(expect.objectContaining({ id: 999999, name: desired.name }));
+  });
+
+  it("RIR2 · an intent alone cannot adopt a matching foreign ruleset, while ambiguous-result recovery remains covered", async () => {
+    const github = createFakeGitHub();
+    const desired = transformToDisposable(
+      buildMainRulesets({ normalAppId: NORMAL_APP, emergencyAppId: EMERGENCY_APP, producerIds: PRODUCER_IDS }),
+      { runId: RUN_ID, attempt: ATTEMPT, actor: "normal", normalAppId: NORMAL_APP },
+    )[0];
+    github.rulesets.set(999999, { ...desired, id: 999999 });
+    await runIntentPhase({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: INTENT_ENV() });
+    await cliResult("setup", localDeps(github));
+
+    const lock = acquireJournalLock({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT });
+    try {
+      const journal = openJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, source: WORKFLOW_SHA, lock });
+      journal.append("mutation-intent", {
+        kind: "ruleset", actor: "normal", name: desired.name,
+        target_ref: desired.conditions.ref_name.include[0], hash: canonicalHash(desired),
+      });
+    } finally {
+      lock.release();
+    }
+
+    const before = github.calls.length;
+    const retried = await cliResult("setup", localDeps(github));
+    const writes = github.calls.slice(before).filter((call) => ["POST", "PATCH", "DELETE"].includes(call.method));
+    expect(retried.exit).not.toBe(0);
+    expect(writes).toEqual([]);
+    const records = readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }) as JournalRecord[];
+    expect(records).toContainEqual(expect.objectContaining({
+      type: "reconciliation",
+      data: expect.objectContaining({ outcome: "ownership-unprovable", measured_at_stage: "intent-only-reconciliation" }),
+    }));
+    expect(records.some((record) => record.type === "resource-created" && record.data.id === 999999)).toBe(false);
+  });
+
+  it("RIR1 · confirmed removal retires a ref lifetime, so same-name same-SHA recreation is never deleted", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    const ref = derivedRef(RUN_ID, ATTEMPT, "normal");
+    const originalSha = github.refs.get(ref)!;
+    const first = await cliResult("cleanup", localDeps(github));
+    expect(first.exit).toBe(0);
+    expect(github.refs.has(ref)).toBe(false);
+    const terminalBefore = reduceResourceLifecycles(readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }))
+      .resources.reduce((count, entry) => count + entry.terminalEvents.length, 0);
+
+    github.refs.set(ref, originalSha);
+    const before = github.calls.length;
+    const second = await cliResult("cleanup", localDeps(github));
+    const deletes = github.calls.slice(before).filter((call) => call.method === "DELETE");
+    expect(second.exit).not.toBe(0);
+    expect(deletes).toEqual([]);
+    expect(github.refs.get(ref)).toBe(originalSha);
+    expect(second.payload.errors.join(" ")).toMatch(/remain|fingerprint|retired/i);
+    const terminalAfter = reduceResourceLifecycles(readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }))
+      .resources.reduce((count, entry) => count + entry.terminalEvents.length, 0);
+    expect(terminalAfter).toBe(terminalBefore);
+  });
+
+  it("RIR1 · an unresolved cleanup intent is read back and safely retried for the same active lifetime", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    const records = readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }) as JournalRecord[];
+    const refIdentity = records.find((record) => record.type === "resource-created" && record.data.kind === "ref")!.data;
+    const lifecycleKey = resourceLifecycleKey(refIdentity)!;
+    const lock = acquireJournalLock({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT });
+    try {
+      const journal = openJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, source: WORKFLOW_SHA, lock });
+      journal.append("cleanup-intent", {
+        kind: "ref", ref: refIdentity.ref, sha: github.refs.get(String(refIdentity.ref)), lifecycle_key: lifecycleKey,
+      });
+    } finally {
+      lock.release();
+    }
+
+    const result = await cliResult("cleanup", localDeps(github));
+    expect(result.exit).toBe(0);
+    expect(github.refs.has(String(refIdentity.ref))).toBe(false);
+    const history = reduceResourceLifecycles(readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }));
+    expect(history.errors).toEqual([]);
+    expect(history.resources.find((entry) => entry.key === lifecycleKey)).toMatchObject({ state: "retired", pendingCleanup: null });
+  });
+
+  it("RIR3 · final assessment requires retained cleanup transitions and latest closure, not a derived summary", async () => {
+    const { clock } = await coherentPacket();
+    expect(assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, now: clock.now }).blockers).toEqual([]);
+    const journalFile = journalPath(evidenceDir, RUN_ID, ATTEMPT);
+    const lines = readFileSync(journalFile, "utf8").trimEnd().split("\n");
+    const firstCleanup = lines.findIndex((line) => JSON.parse(line).type === "cleanup-intent");
+    expect(firstCleanup).toBeGreaterThan(0);
+    writeFileSync(journalFile, `${lines.slice(0, firstCleanup).join("\n")}\n`);
+
+    const assessment = assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, now: clock.now });
+    expect(assessment.blockers).toContainEqual(expect.objectContaining({ gate: "PC-07", kind: "unverified" }));
+    const cli = await cliResult("check-evidence", { now: clock.now });
+    expect(cli.exit).toBe(3);
+  });
+
+  it("RIR4 · retained response observations are authoritative and copied timing cannot move a mutation earlier", async () => {
+    const { clock } = await coherentPacket();
+    expect(assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, now: clock.now }).blockers).toEqual([]);
+    const slug = evidenceSlug(RUN_ID, ATTEMPT, "normal");
+    const packet = readEvidenceFile(evidenceDir, slug);
+    const record = packet.cases[0];
+    for (const key of ["started_at", "completed_at"]) {
+      record.witness.pre_observation[key] = new Date(Date.parse(record.witness.pre_observation[key]) - 100_000).toISOString();
+    }
+    record.mutation_started_at = new Date(Date.parse(record.mutation_started_at) - 100_000).toISOString();
+    writeEvidenceFile(evidenceDir, slug, packet);
+
+    const blockers = assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, now: clock.now }).blockers;
+    expect(blockers.some((entry) => /copied pre observation|mutated before the pre-witness observation/.test(entry.detail))).toBe(true);
+  });
 });
 afterEach(() => {
   globalThis.fetch = realFetch;
