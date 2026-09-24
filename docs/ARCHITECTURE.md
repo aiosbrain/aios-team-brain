@@ -261,6 +261,15 @@ field stayed producer-only, so catching up needed no version bump). That version
 `test/fixtures/contract/brain-contract.json` (regenerated in lockstep with the canonical
 copy in `aios-workspace/docs/contract/`) — bump all of them together on a contract change.
 
+**Planned MCP contract supplement (AIO-1185):**
+[`docs/design/mcp-next-contract-v1.md`](design/mcp-next-contract-v1.md) describes the
+separate proposed `mcp-next-v1` specification and its vendored test fixtures. It
+does not enable routes or change the runtime version declaration. The inspected
+Brain baseline declares 1.23 while the canonical Workspace member contract declares
+1.27; this existing discrepancy requires evidence-based reconciliation before
+release, not an assumed version bump. Supplement conformance is specification
+validation, not proof that governed actions or revision-safe task writes ship.
+
 Brain API 1.19 opens `POST /api/v1/query` to delegated `aiosd_*` tokens (Phase B slice 3, spec
 §10/§17-B), retiring 1.18's 403 `delegation_not_supported` on that route. A delegated query is
 ALWAYS attenuated — retrieval filters to the token's live triple-intersection effective set and

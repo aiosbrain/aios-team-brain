@@ -1,0 +1,1058 @@
+{
+  "version": "1.0.0",
+  "valid": [
+    {
+      "name": "profile-posix",
+      "schema": "urn:aios:mcp-next:1:profile#/definitions/Profile",
+      "value": {
+        "id": "demo",
+        "mode": "workspace",
+        "generation": 1,
+        "brainOrigin": "https://brain.example.test",
+        "teamId": "team-demo",
+        "projectId": "project-demo",
+        "credentialSource": "brain",
+        "root": "/work/demo",
+        "rootIdentity": "device-1:inode-2",
+        "grants": {
+          "brainActions": false,
+          "workspaceRead": false,
+          "workspaceDraft": false,
+          "workspacePublish": false
+        },
+        "readRoots": [
+          "2-work"
+        ],
+        "draftRoots": [
+          "2-work"
+        ]
+      }
+    },
+    {
+      "name": "profile-windows",
+      "schema": "urn:aios:mcp-next:1:profile#/definitions/Profile",
+      "value": {
+        "id": "demo",
+        "mode": "workspace",
+        "generation": 1,
+        "brainOrigin": "https://brain.example.test",
+        "teamId": "team-demo",
+        "projectId": "project-demo",
+        "credentialSource": "brain",
+        "root": "C:\\Work\\Demo",
+        "rootIdentity": "device-1:inode-2",
+        "grants": {
+          "brainActions": false,
+          "workspaceRead": false,
+          "workspaceDraft": false,
+          "workspacePublish": false
+        },
+        "readRoots": [
+          "2-work"
+        ],
+        "draftRoots": [
+          "2-work"
+        ]
+      }
+    },
+    {
+      "name": "profile-unc",
+      "schema": "urn:aios:mcp-next:1:profile#/definitions/Profile",
+      "value": {
+        "id": "demo",
+        "mode": "workspace",
+        "generation": 1,
+        "brainOrigin": "https://brain.example.test",
+        "teamId": "team-demo",
+        "projectId": "project-demo",
+        "credentialSource": "brain",
+        "root": "\\\\server\\share\\Demo",
+        "rootIdentity": "device-1:inode-2",
+        "grants": {
+          "brainActions": false,
+          "workspaceRead": false,
+          "workspaceDraft": false,
+          "workspacePublish": false
+        },
+        "readRoots": [
+          "2-work"
+        ],
+        "draftRoots": [
+          "2-work"
+        ]
+      }
+    },
+    {
+      "name": "brain-only-no-filesystem",
+      "schema": "urn:aios:mcp-next:1:profile#/definitions/Profile",
+      "value": {
+        "id": "demo",
+        "mode": "brain-only",
+        "generation": 1,
+        "brainOrigin": "https://brain.example.test",
+        "teamId": "team-demo",
+        "projectId": "project-demo",
+        "credentialSource": "brain",
+        "root": null,
+        "rootIdentity": null,
+        "grants": {
+          "brainActions": false,
+          "workspaceRead": false,
+          "workspaceDraft": false,
+          "workspacePublish": false
+        },
+        "readRoots": [],
+        "draftRoots": []
+      }
+    },
+    {
+      "name": "migration-preserves-broker2",
+      "schema": "urn:aios:mcp-next:1:profile#/definitions/MigrationInput",
+      "value": {
+        "schemaVersion": 2,
+        "defaultWorkspace": "/work/demo",
+        "credentialSources": {
+          "brain": "env:AIOS_BRAIN_KEY"
+        },
+        "requestedProfiles": [
+          {
+            "id": "demo",
+            "mode": "workspace",
+            "generation": 1,
+            "brainOrigin": "https://brain.example.test",
+            "teamId": "team-demo",
+            "projectId": "project-demo",
+            "credentialSource": "brain",
+            "root": "/work/demo",
+            "rootIdentity": "device-1:inode-2",
+            "grants": {
+              "brainActions": false,
+              "workspaceRead": false,
+              "workspaceDraft": false,
+              "workspacePublish": false
+            },
+            "readRoots": [
+              "2-work"
+            ],
+            "draftRoots": [
+              "2-work"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "status",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/StatusInput",
+      "value": {
+        "profileId": "demo"
+      }
+    },
+    {
+      "name": "list",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/ListInput",
+      "value": {
+        "profileId": "demo",
+        "path": "2-work",
+        "limit": 50
+      }
+    },
+    {
+      "name": "read",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/ReadInput",
+      "value": {
+        "profileId": "demo",
+        "path": "2-work/draft.md"
+      }
+    },
+    {
+      "name": "write-create",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/WriteInput",
+      "value": {
+        "profileId": "demo",
+        "path": "2-work/draft.md",
+        "expectedHash": null,
+        "content": "---\naccess: team\n---\nHello\n",
+        "access": "team"
+      }
+    },
+    {
+      "name": "write-update",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/WriteInput",
+      "value": {
+        "profileId": "demo",
+        "path": "2-work/draft.md",
+        "expectedHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "content": "Hello",
+        "access": "team"
+      }
+    },
+    {
+      "name": "collect-weekly-default",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/CollectInput",
+      "value": {
+        "profileId": "demo"
+      }
+    },
+    {
+      "name": "preview",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/PreviewInput",
+      "value": {
+        "profileId": "demo",
+        "paths": [
+          "2-work/draft.md"
+        ]
+      }
+    },
+    {
+      "name": "stored-plan",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/Plan",
+      "value": {
+        "planId": "plan-1",
+        "profileId": "demo",
+        "profileGeneration": 1,
+        "rootIdentity": "device-1:inode-2",
+        "brainOrigin": "https://brain.example.test",
+        "teamId": "team-demo",
+        "projectId": "project-demo",
+        "createdAt": "2026-09-24T10:00:00Z",
+        "expiresAt": "2026-09-24T10:15:00Z",
+        "planHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "items": [
+          {
+            "itemId": "item-1",
+            "path": "2-work/draft.md",
+            "contentHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "payloadHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "kind": "task",
+            "access": "team",
+            "expectedRevision": "rev-3"
+          }
+        ]
+      }
+    },
+    {
+      "name": "apply",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/ApplyInput",
+      "value": {
+        "profileId": "demo",
+        "planId": "plan-1"
+      }
+    },
+    {
+      "name": "revoked-error",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/ApplyOutput",
+      "value": {
+        "ok": false,
+        "code": "AUTH_REVOKED",
+        "message": "Publishing grant revoked.",
+        "recovery": "Review setup grants and create a fresh preview.",
+        "retryable": false
+      }
+    },
+    {
+      "name": "envelope-StatusOutput",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/StatusOutput",
+      "value": {
+        "ok": true,
+        "profileId": "demo",
+        "mode": "workspace",
+        "root": "/work/demo",
+        "brainOrigin": "https://brain.example.test",
+        "teamId": "team-demo",
+        "projectId": "project-demo",
+        "credentialSourceClass": "env",
+        "generation": 1,
+        "grants": {
+          "brainActions": false,
+          "workspaceRead": false,
+          "workspaceDraft": false,
+          "workspacePublish": false
+        },
+        "effectiveGrants": {
+          "brainActions": false,
+          "workspaceRead": false,
+          "workspaceDraft": false,
+          "workspacePublish": false
+        },
+        "readOnly": true,
+        "identityVerified": true
+      }
+    },
+    {
+      "name": "envelope-ListOutput",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/ListOutput",
+      "value": {
+        "ok": true,
+        "entries": [
+          {
+            "path": "2-work/draft.md",
+            "kind": "file",
+            "sizeBytes": 3
+          }
+        ],
+        "nextCursor": null
+      }
+    },
+    {
+      "name": "envelope-ReadOutput",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/ReadOutput",
+      "value": {
+        "ok": true,
+        "path": "2-work/draft.md",
+        "content": "abc",
+        "hash": "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        "sizeBytes": 3,
+        "access": "team"
+      }
+    },
+    {
+      "name": "envelope-WriteOutput",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/WriteOutput",
+      "value": {
+        "ok": true,
+        "path": "2-work/draft.md",
+        "hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "sizeBytes": 3,
+        "created": false
+      }
+    },
+    {
+      "name": "envelope-CollectOutput",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/CollectOutput",
+      "value": {
+        "ok": true,
+        "profileId": "demo",
+        "cadence": "weekly",
+        "manifestJson": "{}",
+        "hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "name": "envelope-PreviewOutput",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/PreviewOutput",
+      "value": {
+        "ok": true,
+        "plan": {
+          "planId": "plan-1",
+          "profileId": "demo",
+          "profileGeneration": 1,
+          "rootIdentity": "device-1:inode-2",
+          "brainOrigin": "https://brain.example.test",
+          "teamId": "team-demo",
+          "projectId": "project-demo",
+          "createdAt": "2026-09-24T10:00:00Z",
+          "expiresAt": "2026-09-24T10:15:00Z",
+          "planHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "items": [
+            {
+              "itemId": "item-1",
+              "path": "2-work/draft.md",
+              "contentHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "payloadHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "kind": "task",
+              "access": "team",
+              "expectedRevision": "rev-3"
+            }
+          ]
+        },
+        "excluded": []
+      }
+    },
+    {
+      "name": "envelope-ApplyOutput",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/ApplyOutput",
+      "value": {
+        "ok": true,
+        "planId": "plan-1",
+        "state": "complete",
+        "receipts": [
+          {
+            "itemId": "item-1",
+            "state": "succeeded",
+            "operationId": "operation-1",
+            "actionId": "action-1",
+            "entityId": "task-1",
+            "revision": "rev-4",
+            "auditRef": "audit-1",
+            "retryable": false,
+            "errorCode": null
+          }
+        ],
+        "canResume": false
+      }
+    },
+    {
+      "name": "publish-item-input",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/PublishItemInput",
+      "value": {
+        "operationId": "op-1",
+        "projectId": "project-demo",
+        "itemId": "item-1",
+        "kind": "task",
+        "access": "team",
+        "payloadJson": "{\"row_key\":\"task-demo\",\"title\":\"Synthetic task\"}",
+        "payloadHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "expectedRevision": null
+      }
+    },
+    {
+      "name": "publish-status-input",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/PublishStatusInput",
+      "value": {
+        "operationId": "op-1",
+        "projectId": "project-demo"
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "brain-only-filesystem-grant",
+      "schema": "urn:aios:mcp-next:1:profile#/definitions/Profile",
+      "value": {
+        "id": "demo",
+        "mode": "brain-only",
+        "generation": 1,
+        "brainOrigin": "https://brain.example.test",
+        "teamId": "team-demo",
+        "projectId": "project-demo",
+        "credentialSource": "brain",
+        "root": null,
+        "rootIdentity": null,
+        "grants": {
+          "brainActions": false,
+          "workspaceRead": true,
+          "workspaceDraft": false,
+          "workspacePublish": false
+        },
+        "readRoots": [],
+        "draftRoots": []
+      }
+    },
+    {
+      "name": "relative-root",
+      "schema": "urn:aios:mcp-next:1:profile#/definitions/Profile",
+      "value": {
+        "id": "demo",
+        "mode": "workspace",
+        "generation": 1,
+        "brainOrigin": "https://brain.example.test",
+        "teamId": "team-demo",
+        "projectId": "project-demo",
+        "credentialSource": "brain",
+        "root": "work/demo",
+        "rootIdentity": "device-1:inode-2",
+        "grants": {
+          "brainActions": false,
+          "workspaceRead": false,
+          "workspaceDraft": false,
+          "workspacePublish": false
+        },
+        "readRoots": [
+          "2-work"
+        ],
+        "draftRoots": [
+          "2-work"
+        ]
+      }
+    },
+    {
+      "name": "secret-in-profile",
+      "schema": "urn:aios:mcp-next:1:profile#/definitions/Profile",
+      "value": {
+        "id": "demo",
+        "mode": "workspace",
+        "generation": 1,
+        "brainOrigin": "https://brain.example.test",
+        "teamId": "team-demo",
+        "projectId": "project-demo",
+        "credentialSource": "brain",
+        "root": "/work/demo",
+        "rootIdentity": "device-1:inode-2",
+        "grants": {
+          "brainActions": false,
+          "workspaceRead": false,
+          "workspaceDraft": false,
+          "workspacePublish": false
+        },
+        "readRoots": [
+          "2-work"
+        ],
+        "draftRoots": [
+          "2-work"
+        ],
+        "apiKey": "synthetic-not-a-key"
+      }
+    },
+    {
+      "name": "inline-secret-reference",
+      "schema": "urn:aios:mcp-next:1:profile#/definitions/CredentialReference",
+      "value": "synthetic-literal"
+    },
+    {
+      "name": "unsupported-broker-version",
+      "schema": "urn:aios:mcp-next:1:profile#/definitions/MigrationInput",
+      "value": {
+        "schemaVersion": 1,
+        "defaultWorkspace": null,
+        "credentialSources": {},
+        "requestedProfiles": []
+      }
+    },
+    {
+      "name": "cwd-selector",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/ReadInput",
+      "value": {
+        "path": "2-work/draft.md"
+      }
+    },
+    {
+      "name": "path-escape-0",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/ReadInput",
+      "value": {
+        "profileId": "demo",
+        "path": "../secret.md"
+      }
+    },
+    {
+      "name": "path-escape-1",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/ReadInput",
+      "value": {
+        "profileId": "demo",
+        "path": "2-work/../secret.md"
+      }
+    },
+    {
+      "name": "path-escape-2",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/ReadInput",
+      "value": {
+        "profileId": "demo",
+        "path": "/etc/secret.md"
+      }
+    },
+    {
+      "name": "path-escape-3",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/ReadInput",
+      "value": {
+        "profileId": "demo",
+        "path": "C:\\secret.md"
+      }
+    },
+    {
+      "name": "path-escape-4",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/ReadInput",
+      "value": {
+        "profileId": "demo",
+        "path": "2-work//draft.md"
+      }
+    },
+    {
+      "name": "path-escape-5",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/ReadInput",
+      "value": {
+        "profileId": "demo",
+        "path": "2-work/file:stream"
+      }
+    },
+    {
+      "name": "missing-write-hash",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/WriteInput",
+      "value": {
+        "profileId": "demo",
+        "path": "2-work/draft.md",
+        "content": "hello",
+        "access": "team"
+      }
+    },
+    {
+      "name": "apply-caller-content",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/ApplyInput",
+      "value": {
+        "profileId": "demo",
+        "planId": "plan-1",
+        "content": "changed"
+      }
+    },
+    {
+      "name": "preview-too-many-paths",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/PreviewInput",
+      "value": {
+        "profileId": "demo",
+        "paths": [
+          "2-work/0.md",
+          "2-work/1.md",
+          "2-work/2.md",
+          "2-work/3.md",
+          "2-work/4.md",
+          "2-work/5.md",
+          "2-work/6.md",
+          "2-work/7.md",
+          "2-work/8.md",
+          "2-work/9.md",
+          "2-work/10.md",
+          "2-work/11.md",
+          "2-work/12.md",
+          "2-work/13.md",
+          "2-work/14.md",
+          "2-work/15.md",
+          "2-work/16.md",
+          "2-work/17.md",
+          "2-work/18.md",
+          "2-work/19.md",
+          "2-work/20.md",
+          "2-work/21.md",
+          "2-work/22.md",
+          "2-work/23.md",
+          "2-work/24.md",
+          "2-work/25.md",
+          "2-work/26.md",
+          "2-work/27.md",
+          "2-work/28.md",
+          "2-work/29.md",
+          "2-work/30.md",
+          "2-work/31.md",
+          "2-work/32.md",
+          "2-work/33.md",
+          "2-work/34.md",
+          "2-work/35.md",
+          "2-work/36.md",
+          "2-work/37.md",
+          "2-work/38.md",
+          "2-work/39.md",
+          "2-work/40.md",
+          "2-work/41.md",
+          "2-work/42.md",
+          "2-work/43.md",
+          "2-work/44.md",
+          "2-work/45.md",
+          "2-work/46.md",
+          "2-work/47.md",
+          "2-work/48.md",
+          "2-work/49.md",
+          "2-work/50.md",
+          "2-work/51.md",
+          "2-work/52.md",
+          "2-work/53.md",
+          "2-work/54.md",
+          "2-work/55.md",
+          "2-work/56.md",
+          "2-work/57.md",
+          "2-work/58.md",
+          "2-work/59.md",
+          "2-work/60.md",
+          "2-work/61.md",
+          "2-work/62.md",
+          "2-work/63.md",
+          "2-work/64.md",
+          "2-work/65.md",
+          "2-work/66.md",
+          "2-work/67.md",
+          "2-work/68.md",
+          "2-work/69.md",
+          "2-work/70.md",
+          "2-work/71.md",
+          "2-work/72.md",
+          "2-work/73.md",
+          "2-work/74.md",
+          "2-work/75.md",
+          "2-work/76.md",
+          "2-work/77.md",
+          "2-work/78.md",
+          "2-work/79.md",
+          "2-work/80.md",
+          "2-work/81.md",
+          "2-work/82.md",
+          "2-work/83.md",
+          "2-work/84.md",
+          "2-work/85.md",
+          "2-work/86.md",
+          "2-work/87.md",
+          "2-work/88.md",
+          "2-work/89.md",
+          "2-work/90.md",
+          "2-work/91.md",
+          "2-work/92.md",
+          "2-work/93.md",
+          "2-work/94.md",
+          "2-work/95.md",
+          "2-work/96.md",
+          "2-work/97.md",
+          "2-work/98.md",
+          "2-work/99.md",
+          "2-work/100.md"
+        ]
+      }
+    },
+    {
+      "name": "admin-plan",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/Plan",
+      "value": {
+        "planId": "plan-1",
+        "profileId": "demo",
+        "profileGeneration": 1,
+        "rootIdentity": "device-1:inode-2",
+        "brainOrigin": "https://brain.example.test",
+        "teamId": "team-demo",
+        "projectId": "project-demo",
+        "createdAt": "2026-09-24T10:00:00Z",
+        "expiresAt": "2026-09-24T10:15:00Z",
+        "planHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "items": [
+          {
+            "itemId": "item-1",
+            "path": "2-work/draft.md",
+            "contentHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "payloadHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "kind": "task",
+            "access": "admin",
+            "expectedRevision": "rev-3"
+          }
+        ]
+      }
+    },
+    {
+      "name": "publish-actor-override",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/PublishItemInput",
+      "value": {
+        "operationId": "op-1",
+        "projectId": "project-demo",
+        "itemId": "item-1",
+        "kind": "task",
+        "access": "team",
+        "payloadJson": "{\"row_key\":\"task-demo\",\"title\":\"Synthetic task\"}",
+        "payloadHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "expectedRevision": null,
+        "actorId": "other"
+      }
+    },
+    {
+      "name": "publish-private-tier",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/PublishItemInput",
+      "value": {
+        "operationId": "op-1",
+        "projectId": "project-demo",
+        "itemId": "item-1",
+        "kind": "task",
+        "access": "admin",
+        "payloadJson": "{\"row_key\":\"task-demo\",\"title\":\"Synthetic task\"}",
+        "payloadHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "expectedRevision": null
+      }
+    }
+  ],
+  "semantic": [
+    {
+      "name": "migration-no-escalation",
+      "rule": "migration-defaults",
+      "input": {
+        "legacy": {
+          "schemaVersion": 2,
+          "defaultWorkspace": "/old",
+          "credentialSources": {
+            "brain": "env:OLD"
+          },
+          "extension": {
+            "retain": true
+          }
+        },
+        "setupConsent": false
+      },
+      "expected": {
+        "credentialSources": {
+          "brain": "env:OLD"
+        },
+        "defaultWorkspace": "/old",
+        "extension": {
+          "retain": true
+        },
+        "newProfileGrants": {
+          "brainActions": false,
+          "workspaceRead": false,
+          "workspaceDraft": false,
+          "workspacePublish": false
+        },
+        "cwdFallback": false
+      }
+    },
+    {
+      "name": "migration-preserves-grants",
+      "rule": "migration-repeat",
+      "input": {
+        "existingProfile": {
+          "id": "demo",
+          "mode": "workspace",
+          "generation": 1,
+          "brainOrigin": "https://brain.example.test",
+          "teamId": "team-demo",
+          "projectId": "project-demo",
+          "credentialSource": "brain",
+          "root": "/work/demo",
+          "rootIdentity": "device-1:inode-2",
+          "grants": {
+            "brainActions": false,
+            "workspaceRead": true,
+            "workspaceDraft": false,
+            "workspacePublish": false
+          },
+          "readRoots": [
+            "2-work"
+          ],
+          "draftRoots": [
+            "2-work"
+          ]
+        },
+        "requestedIdenticalProfile": true
+      },
+      "expected": {
+        "generation": 1,
+        "grants": {
+          "brainActions": false,
+          "workspaceRead": true,
+          "workspaceDraft": false,
+          "workspacePublish": false
+        },
+        "changed": false
+      }
+    },
+    {
+      "name": "credential-no-fallback",
+      "rule": "credential-resolution",
+      "input": {
+        "profileSource": "missing",
+        "credentialSources": {
+          "default": "env:OTHER"
+        }
+      },
+      "expected": {
+        "code": "PROFILE_NOT_FOUND",
+        "resolvedReferences": []
+      }
+    },
+    {
+      "name": "two-brains-isolated",
+      "rule": "launch-profile",
+      "input": {
+        "launchProfile": "demo",
+        "requestProfile": "other",
+        "cwd": "/work/other"
+      },
+      "expected": {
+        "code": "PROFILE_CHANGED",
+        "reads": 0,
+        "writes": 0
+      }
+    },
+    {
+      "name": "readonly-overrides",
+      "rule": "grant-intersection",
+      "input": {
+        "grants": {
+          "brainActions": true,
+          "workspaceRead": true,
+          "workspaceDraft": true,
+          "workspacePublish": true
+        },
+        "readOnly": true
+      },
+      "expected": {
+        "effectiveGrants": {
+          "brainActions": false,
+          "workspaceRead": true,
+          "workspaceDraft": false,
+          "workspacePublish": false
+        }
+      }
+    },
+    {
+      "name": "symlink-escape",
+      "rule": "path-identity",
+      "input": {
+        "root": "/work/demo",
+        "path": "2-work/link.md",
+        "resolved": "/private/secret.md"
+      },
+      "expected": {
+        "code": "PATH_DENIED",
+        "bytesRead": 0
+      }
+    },
+    {
+      "name": "utf8-byte-limit",
+      "rule": "file-admission",
+      "input": {
+        "contentCodePoint": "U+1F600",
+        "repeat": 65537
+      },
+      "expected": {
+        "utf8Bytes": 262148,
+        "code": "LIMIT_EXCEEDED",
+        "writes": 0
+      }
+    },
+    {
+      "name": "exact-hash",
+      "rule": "hash-bytes",
+      "input": {
+        "utf8": "abc"
+      },
+      "expected": {
+        "hash": "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+      }
+    },
+    {
+      "name": "atomic-edit-conflict",
+      "rule": "expected-hash",
+      "input": {
+        "expectedHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "observedHash": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "expected": {
+        "code": "CONTENT_CONFLICT",
+        "writes": 0
+      }
+    },
+    {
+      "name": "expiry-boundary",
+      "rule": "plan-expiry",
+      "input": {
+        "createdAt": "2026-09-24T10:00:00Z",
+        "expiresAt": "2026-09-24T10:15:00Z",
+        "applyAt": "2026-09-24T10:15:00Z"
+      },
+      "expected": {
+        "code": "PLAN_EXPIRED",
+        "sends": 0
+      }
+    },
+    {
+      "name": "generation-revocation",
+      "rule": "plan-generation",
+      "input": {
+        "storedGeneration": 2,
+        "currentGeneration": 3
+      },
+      "expected": {
+        "code": "PLAN_STALE",
+        "sends": 0
+      }
+    },
+    {
+      "name": "revoked-before-apply",
+      "rule": "call-time-authorization",
+      "input": {
+        "storedGeneration": 2,
+        "currentGeneration": 2,
+        "serverAuthorized": false
+      },
+      "expected": {
+        "code": "AUTH_REVOKED",
+        "sends": 0
+      }
+    },
+    {
+      "name": "changed-source",
+      "rule": "preview-hash",
+      "input": {
+        "storedHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "currentHash": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "expected": {
+        "code": "PLAN_STALE",
+        "sends": 0
+      }
+    },
+    {
+      "name": "setup-grant-no-extra-prompt",
+      "rule": "setup-consent",
+      "input": {
+        "unchangedPlan": true,
+        "unexpired": true,
+        "publishGrant": true,
+        "serverAuthorized": true
+      },
+      "expected": {
+        "additionalApprovalPrompt": false,
+        "execute": true
+      }
+    },
+    {
+      "name": "resumable-receipts",
+      "rule": "resume",
+      "input": {
+        "receipts": [
+          {
+            "itemId": "one",
+            "state": "succeeded"
+          },
+          {
+            "itemId": "two",
+            "state": "failed",
+            "retryable": true
+          }
+        ],
+        "unchangedPlan": true,
+        "unexpired": true,
+        "authorized": true
+      },
+      "expected": {
+        "sendItemIds": [
+          "two"
+        ],
+        "reuseOperationIds": true,
+        "replaySucceeded": false
+      }
+    },
+    {
+      "name": "uncertain-delivery",
+      "rule": "durable-intent",
+      "input": {
+        "itemId": "one",
+        "transportOutcome": "timeout",
+        "durableIntent": true
+      },
+      "expected": {
+        "resolveByOperationIdBeforeResend": true,
+        "newOperationId": false
+      }
+    },
+    {
+      "name": "private-content",
+      "rule": "publish-tier",
+      "input": {
+        "paths": [
+          {
+            "path": "3-log/private.md",
+            "access": "admin"
+          },
+          {
+            "path": "2-work/missing.md",
+            "access": null
+          }
+        ]
+      },
+      "expected": {
+        "code": "INVALID_CONTENT",
+        "sends": 0,
+        "eligibleItems": 0
+      }
+    },
+    {
+      "name": "migration-grant-escalation-rejected",
+      "rule": "migration-defaults",
+      "input": {
+        "existingProfiles": [],
+        "requestedNewProfileGrants": {
+          "brainActions": false,
+          "workspaceRead": false,
+          "workspaceDraft": false,
+          "workspacePublish": true
+        },
+        "setupConsent": false
+      },
+      "expected": {
+        "code": "CAPABILITY_DENIED",
+        "writes": 0
+      }
+    }
+  ]
+}

@@ -1,0 +1,927 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:aios:mcp-next:1:actions",
+  "title": "MCP next version 1 \u2014 proposed member action contracts",
+  "definitions": {
+    "Destination": {
+      "type": "object",
+      "properties": {
+        "project_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "additionalProperties": false
+    },
+    "NoteInput": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "pattern": "\\S"
+        },
+        "body": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 25000,
+          "pattern": "\\S"
+        }
+      },
+      "required": [
+        "title",
+        "body"
+      ],
+      "additionalProperties": false
+    },
+    "TaskFields": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "pattern": "\\S"
+        },
+        "assignee": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "enum": [
+            "backlog",
+            "in_progress",
+            "in_review",
+            "blocked",
+            "done",
+            "ready"
+          ]
+        },
+        "due": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "title",
+        "assignee",
+        "status",
+        "due"
+      ],
+      "additionalProperties": false
+    },
+    "TaskCreateInput": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "pattern": "\\S"
+        },
+        "assignee": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "enum": [
+            "backlog",
+            "in_progress",
+            "in_review",
+            "blocked",
+            "done",
+            "ready"
+          ]
+        },
+        "due": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "operation_id",
+        "title",
+        "assignee",
+        "status",
+        "due"
+      ],
+      "additionalProperties": false
+    },
+    "TaskUpdateInput": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+        },
+        "task_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+        },
+        "expected_revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "changes": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500,
+              "pattern": "\\S"
+            },
+            "assignee": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128,
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "status": {
+              "enum": [
+                "backlog",
+                "in_progress",
+                "in_review",
+                "blocked",
+                "done",
+                "ready"
+              ]
+            },
+            "due": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [],
+          "additionalProperties": false,
+          "minProperties": 1
+        }
+      },
+      "required": [
+        "operation_id",
+        "task_id",
+        "expected_revision",
+        "changes"
+      ],
+      "additionalProperties": false
+    },
+    "DecisionInput": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "pattern": "\\S"
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 25000,
+          "pattern": "\\S"
+        },
+        "impact": {
+          "type": "string",
+          "maxLength": 5000
+        }
+      },
+      "required": [
+        "operation_id",
+        "title",
+        "rationale",
+        "impact"
+      ],
+      "additionalProperties": false
+    },
+    "TaskGetInput": {
+      "type": "object",
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+        }
+      },
+      "required": [
+        "task_id"
+      ],
+      "additionalProperties": false
+    },
+    "StatusInput": {
+      "type": "object",
+      "properties": {
+        "action_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+        }
+      },
+      "required": [
+        "action_id"
+      ],
+      "additionalProperties": false
+    },
+    "Error": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "enum": [
+            "invalid_payload",
+            "unauthorized",
+            "not_found",
+            "forbidden",
+            "revoked_authorization",
+            "stale_revision",
+            "operation_id_conflict",
+            "mapping_required",
+            "upgrade_required",
+            "capability_unavailable",
+            "rate_limited",
+            "execution_failed",
+            "operation_in_progress"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "recovery": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "retryable",
+        "recovery"
+      ],
+      "additionalProperties": false
+    },
+    "Entity": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "enum": [
+            "note",
+            "task",
+            "decision"
+          ]
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "required": [
+        "kind",
+        "id",
+        "revision"
+      ],
+      "additionalProperties": false
+    },
+    "Sync": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "enum": [
+            "not_applicable",
+            "pending",
+            "synced",
+            "conflict",
+            "failed"
+          ]
+        },
+        "providers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "provider": {
+                "enum": [
+                  "linear",
+                  "plane"
+                ]
+              },
+              "state": {
+                "enum": [
+                  "pending",
+                  "synced",
+                  "conflict",
+                  "failed"
+                ]
+              },
+              "error_code": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "maxLength": 100
+              }
+            },
+            "required": [
+              "provider",
+              "state",
+              "error_code"
+            ],
+            "additionalProperties": false
+          },
+          "maxItems": 2
+        }
+      },
+      "required": [
+        "state",
+        "providers"
+      ],
+      "additionalProperties": false
+    },
+    "SubmitRequest": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "contract_version": {
+              "const": "mcp-next/1"
+            },
+            "type": {
+              "const": "note.append"
+            },
+            "destination": {
+              "$ref": "#/definitions/Destination"
+            },
+            "params": {
+              "$ref": "#/definitions/NoteInput"
+            }
+          },
+          "required": [
+            "contract_version",
+            "type",
+            "destination",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "contract_version": {
+              "const": "mcp-next/1"
+            },
+            "type": {
+              "const": "task.create"
+            },
+            "destination": {
+              "$ref": "#/definitions/Destination"
+            },
+            "params": {
+              "$ref": "#/definitions/TaskCreateInput"
+            }
+          },
+          "required": [
+            "contract_version",
+            "type",
+            "destination",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "contract_version": {
+              "const": "mcp-next/1"
+            },
+            "type": {
+              "const": "task.update"
+            },
+            "destination": {
+              "$ref": "#/definitions/Destination"
+            },
+            "params": {
+              "$ref": "#/definitions/TaskUpdateInput"
+            }
+          },
+          "required": [
+            "contract_version",
+            "type",
+            "destination",
+            "params"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "contract_version": {
+              "const": "mcp-next/1"
+            },
+            "type": {
+              "const": "decision.record"
+            },
+            "destination": {
+              "$ref": "#/definitions/Destination"
+            },
+            "params": {
+              "$ref": "#/definitions/DecisionInput"
+            }
+          },
+          "required": [
+            "contract_version",
+            "type",
+            "destination",
+            "params"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ActionOutcome": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "contract_version": {
+              "const": "mcp-next/1"
+            },
+            "action_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+            },
+            "audit_ref": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+            },
+            "status": {
+              "const": "succeeded"
+            },
+            "entity": {
+              "$ref": "#/definitions/Entity"
+            },
+            "sync": {
+              "$ref": "#/definitions/Sync"
+            }
+          },
+          "required": [
+            "contract_version",
+            "action_id",
+            "audit_ref",
+            "status",
+            "entity",
+            "sync"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "contract_version": {
+              "const": "mcp-next/1"
+            },
+            "action_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+            },
+            "audit_ref": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+            },
+            "status": {
+              "const": "pending_approval"
+            },
+            "approval_request_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+            }
+          },
+          "required": [
+            "contract_version",
+            "action_id",
+            "audit_ref",
+            "status",
+            "approval_request_id"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "contract_version": {
+              "const": "mcp-next/1"
+            },
+            "action_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+            },
+            "audit_ref": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+            },
+            "status": {
+              "const": "denied"
+            },
+            "error": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "required": [
+            "contract_version",
+            "action_id",
+            "audit_ref",
+            "status",
+            "error"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "contract_version": {
+              "const": "mcp-next/1"
+            },
+            "action_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+            },
+            "audit_ref": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+            },
+            "status": {
+              "const": "conflict"
+            },
+            "error": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "required": [
+            "contract_version",
+            "action_id",
+            "audit_ref",
+            "status",
+            "error"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "contract_version": {
+              "const": "mcp-next/1"
+            },
+            "action_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+            },
+            "audit_ref": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+            },
+            "status": {
+              "const": "failed"
+            },
+            "error": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "required": [
+            "contract_version",
+            "action_id",
+            "audit_ref",
+            "status",
+            "error"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "TransportError": {
+      "type": "object",
+      "properties": {
+        "error": {
+          "$ref": "#/definitions/Error"
+        }
+      },
+      "required": [
+        "error"
+      ],
+      "additionalProperties": false
+    },
+    "ActionStatus": {
+      "oneOf": [
+        {
+          "$ref": "#/definitions/ActionOutcome"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "contract_version": {
+              "const": "mcp-next/1"
+            },
+            "action_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+            },
+            "audit_ref": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+            },
+            "status": {
+              "enum": [
+                "requested",
+                "running"
+              ]
+            }
+          },
+          "required": [
+            "contract_version",
+            "action_id",
+            "audit_ref",
+            "status"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Task": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+        },
+        "project_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+        },
+        "row_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "pattern": "\\S"
+        },
+        "assignee": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "enum": [
+            "backlog",
+            "in_progress",
+            "in_review",
+            "blocked",
+            "done",
+            "ready"
+          ]
+        },
+        "due": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "permitted_fields": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "title",
+              "assignee",
+              "status",
+              "due"
+            ]
+          },
+          "maxItems": 4
+        },
+        "eligible_assignees": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+              },
+              "label": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              }
+            },
+            "required": [
+              "id",
+              "label"
+            ],
+            "additionalProperties": false
+          },
+          "maxItems": 1000
+        },
+        "eligible_statuses": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "backlog",
+              "in_progress",
+              "in_review",
+              "blocked",
+              "done",
+              "ready"
+            ]
+          },
+          "maxItems": 6
+        },
+        "sync": {
+          "$ref": "#/definitions/Sync"
+        }
+      },
+      "required": [
+        "id",
+        "project_id",
+        "row_key",
+        "revision",
+        "title",
+        "assignee",
+        "status",
+        "due",
+        "permitted_fields",
+        "eligible_assignees",
+        "eligible_statuses",
+        "sync"
+      ],
+      "additionalProperties": false
+    },
+    "Capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "contract_versions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "const": "mcp-next/1"
+          },
+          "maxItems": 1
+        },
+        "actions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "note.append",
+              "task.create",
+              "task.update",
+              "decision.record"
+            ]
+          },
+          "maxItems": 4
+        },
+        "task_revisions": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "contract_versions",
+        "actions",
+        "task_revisions"
+      ]
+    }
+  }
+}

@@ -1,0 +1,1044 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:aios:mcp-next:1:workspace",
+  "title": "Reserved bounded workspace contracts 1.0.0",
+  "definitions": {
+    "RelativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\\\:\\x00])(?!.*//)(?!.*\\/$).+$"
+    },
+    "ContentHash": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "Error": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ok": {
+          "const": false
+        },
+        "code": {
+          "enum": [
+            "PROFILE_REQUIRED",
+            "PROFILE_NOT_FOUND",
+            "PROFILE_CHANGED",
+            "CAPABILITY_DENIED",
+            "READ_ONLY",
+            "DESTINATION_MISMATCH",
+            "PATH_DENIED",
+            "CONTENT_CONFLICT",
+            "INVALID_CONTENT",
+            "LIMIT_EXCEEDED",
+            "PLAN_NOT_FOUND",
+            "PLAN_EXPIRED",
+            "PLAN_STALE",
+            "AUTH_REVOKED",
+            "UPGRADE_REQUIRED",
+            "UNAVAILABLE",
+            "OPERATION_NOT_FOUND",
+            "IDEMPOTENCY_CONFLICT"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "recovery": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ok",
+        "code",
+        "message",
+        "recovery",
+        "retryable"
+      ]
+    },
+    "StatusInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profileId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        }
+      },
+      "required": [
+        "profileId"
+      ]
+    },
+    "StatusOutput": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "profileId": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+            },
+            "mode": {
+              "enum": [
+                "brain-only",
+                "workspace"
+              ]
+            },
+            "root": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 4096,
+                  "pattern": "^(?:/[^\\x00]*|[A-Za-z]:\\\\[^\\x00]*|\\\\\\\\[^\\\\]+\\\\[^\\\\]+(?:\\\\[^\\x00]*)?)$"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "brainOrigin": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "teamId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "projectId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "credentialSourceClass": {
+              "enum": [
+                "env",
+                "keychain"
+              ]
+            },
+            "generation": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2147483647
+            },
+            "grants": {
+              "$ref": "urn:aios:mcp-next:1:profile#/definitions/Grants"
+            },
+            "effectiveGrants": {
+              "$ref": "urn:aios:mcp-next:1:profile#/definitions/Grants"
+            },
+            "readOnly": {
+              "type": "boolean"
+            },
+            "identityVerified": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "ok",
+            "profileId",
+            "mode",
+            "root",
+            "brainOrigin",
+            "teamId",
+            "projectId",
+            "credentialSourceClass",
+            "generation",
+            "grants",
+            "effectiveGrants",
+            "readOnly",
+            "identityVerified"
+          ]
+        },
+        {
+          "$ref": "urn:aios:mcp-next:1:workspace#/definitions/Error"
+        }
+      ]
+    },
+    "ListInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profileId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\\\:\\x00])(?!.*//)(?!.*\\/$).+$"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "profileId",
+        "path"
+      ]
+    },
+    "ListOutput": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "entries": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024,
+                    "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\\\:\\x00])(?!.*//)(?!.*\\/$).+$"
+                  },
+                  "kind": {
+                    "enum": [
+                      "file",
+                      "directory"
+                    ]
+                  },
+                  "sizeBytes": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 262144
+                  }
+                },
+                "required": [
+                  "path",
+                  "kind",
+                  "sizeBytes"
+                ]
+              },
+              "maxItems": 100,
+              "uniqueItems": true
+            },
+            "nextCursor": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 1024
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "entries",
+            "nextCursor"
+          ]
+        },
+        {
+          "$ref": "urn:aios:mcp-next:1:workspace#/definitions/Error"
+        }
+      ]
+    },
+    "ReadInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profileId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\\\:\\x00])(?!.*//)(?!.*\\/$).+$"
+        }
+      },
+      "required": [
+        "profileId",
+        "path"
+      ]
+    },
+    "ReadOutput": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024,
+              "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\\\:\\x00])(?!.*//)(?!.*\\/$).+$"
+            },
+            "content": {
+              "type": "string",
+              "maxLength": 262144
+            },
+            "hash": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            "sizeBytes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 262144
+            },
+            "access": {
+              "enum": [
+                "admin",
+                "team",
+                "external"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "path",
+            "content",
+            "hash",
+            "sizeBytes",
+            "access"
+          ]
+        },
+        {
+          "$ref": "urn:aios:mcp-next:1:workspace#/definitions/Error"
+        }
+      ]
+    },
+    "WriteInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profileId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\\\:\\x00])(?!.*//)(?!.*\\/$).+$"
+        },
+        "expectedHash": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "content": {
+          "type": "string",
+          "maxLength": 262144
+        },
+        "access": {
+          "enum": [
+            "admin",
+            "team",
+            "external"
+          ]
+        }
+      },
+      "required": [
+        "profileId",
+        "path",
+        "expectedHash",
+        "content",
+        "access"
+      ]
+    },
+    "WriteOutput": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024,
+              "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\\\:\\x00])(?!.*//)(?!.*\\/$).+$"
+            },
+            "hash": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            "sizeBytes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 262144
+            },
+            "created": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "ok",
+            "path",
+            "hash",
+            "sizeBytes",
+            "created"
+          ]
+        },
+        {
+          "$ref": "urn:aios:mcp-next:1:workspace#/definitions/Error"
+        }
+      ]
+    },
+    "CollectInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profileId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "cadence": {
+          "enum": [
+            "daily",
+            "weekly"
+          ]
+        }
+      },
+      "required": [
+        "profileId"
+      ]
+    },
+    "CollectOutput": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "profileId": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+            },
+            "cadence": {
+              "enum": [
+                "daily",
+                "weekly"
+              ]
+            },
+            "manifestJson": {
+              "type": "string",
+              "maxLength": 1048576
+            },
+            "hash": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            }
+          },
+          "required": [
+            "ok",
+            "profileId",
+            "cadence",
+            "manifestJson",
+            "hash"
+          ]
+        },
+        {
+          "$ref": "urn:aios:mcp-next:1:workspace#/definitions/Error"
+        }
+      ]
+    },
+    "PreviewInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profileId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+            "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\\\:\\x00])(?!.*//)(?!.*\\/$).+$"
+          },
+          "maxItems": 100,
+          "uniqueItems": true,
+          "minItems": 1
+        }
+      },
+      "required": [
+        "profileId",
+        "paths"
+      ]
+    },
+    "PlanItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "itemId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\\\:\\x00])(?!.*//)(?!.*\\/$).+$"
+        },
+        "contentHash": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "payloadHash": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "kind": {
+          "enum": [
+            "task",
+            "decision",
+            "deliverable",
+            "hours"
+          ]
+        },
+        "access": {
+          "enum": [
+            "team",
+            "external"
+          ]
+        },
+        "expectedRevision": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "itemId",
+        "path",
+        "contentHash",
+        "payloadHash",
+        "kind",
+        "access",
+        "expectedRevision"
+      ]
+    },
+    "Plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "planId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "profileId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "profileGeneration": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "rootIdentity": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "brainOrigin": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "teamId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "planHash": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:aios:mcp-next:1:workspace#/definitions/PlanItem"
+          },
+          "maxItems": 100,
+          "uniqueItems": true,
+          "minItems": 1
+        }
+      },
+      "required": [
+        "planId",
+        "profileId",
+        "profileGeneration",
+        "rootIdentity",
+        "brainOrigin",
+        "teamId",
+        "projectId",
+        "createdAt",
+        "expiresAt",
+        "planHash",
+        "items"
+      ]
+    },
+    "PreviewOutput": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "plan": {
+              "$ref": "urn:aios:mcp-next:1:workspace#/definitions/Plan"
+            },
+            "excluded": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024,
+                    "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\\\:\\x00])(?!.*//)(?!.*\\/$).+$"
+                  },
+                  "reason": {
+                    "enum": [
+                      "ADMIN_TIER",
+                      "MISSING_TIER",
+                      "UNSUPPORTED_KIND",
+                      "UNCHANGED"
+                    ]
+                  }
+                },
+                "required": [
+                  "path",
+                  "reason"
+                ]
+              },
+              "maxItems": 100,
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "ok",
+            "plan",
+            "excluded"
+          ]
+        },
+        {
+          "$ref": "urn:aios:mcp-next:1:workspace#/definitions/Error"
+        }
+      ]
+    },
+    "ApplyInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profileId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "planId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        }
+      },
+      "required": [
+        "profileId",
+        "planId"
+      ]
+    },
+    "Receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "itemId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "state": {
+          "enum": [
+            "succeeded",
+            "pending_approval",
+            "denied",
+            "conflict",
+            "failed",
+            "not_attempted",
+            "processing"
+          ]
+        },
+        "operationId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "actionId": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "entityId": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revision": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "auditRef": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "errorCode": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "itemId",
+        "state",
+        "operationId",
+        "actionId",
+        "entityId",
+        "revision",
+        "auditRef",
+        "retryable",
+        "errorCode"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "succeeded"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "entityId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "revision": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "auditRef": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "pending_approval"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "actionId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "retryable": {
+                "const": false
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ApplyOutput": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "planId": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+            },
+            "state": {
+              "enum": [
+                "complete",
+                "partial",
+                "pending_approval",
+                "stale"
+              ]
+            },
+            "receipts": {
+              "type": "array",
+              "items": {
+                "$ref": "urn:aios:mcp-next:1:workspace#/definitions/Receipt"
+              },
+              "maxItems": 100,
+              "uniqueItems": true
+            },
+            "canResume": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "ok",
+            "planId",
+            "state",
+            "receipts",
+            "canResume"
+          ]
+        },
+        {
+          "$ref": "urn:aios:mcp-next:1:workspace#/definitions/Error"
+        }
+      ]
+    },
+    "PublishItemInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operationId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "itemId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "kind": {
+          "enum": [
+            "task",
+            "decision",
+            "deliverable",
+            "hours"
+          ]
+        },
+        "access": {
+          "enum": [
+            "team",
+            "external"
+          ]
+        },
+        "payloadJson": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1048576
+        },
+        "payloadHash": {
+          "$ref": "#/definitions/ContentHash"
+        },
+        "expectedRevision": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "operationId",
+        "projectId",
+        "itemId",
+        "kind",
+        "access",
+        "payloadJson",
+        "payloadHash",
+        "expectedRevision"
+      ]
+    },
+    "PublishItemOutput": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "receipt": {
+              "$ref": "#/definitions/Receipt"
+            }
+          },
+          "required": [
+            "ok",
+            "receipt"
+          ]
+        },
+        {
+          "$ref": "#/definitions/Error"
+        }
+      ]
+    },
+    "PublishStatusInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operationId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      },
+      "required": [
+        "operationId",
+        "projectId"
+      ]
+    },
+    "PublishStatusOutput": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "receipt": {
+              "$ref": "#/definitions/Receipt"
+            }
+          },
+          "required": [
+            "ok",
+            "receipt"
+          ]
+        },
+        {
+          "$ref": "#/definitions/Error"
+        }
+      ]
+    }
+  }
+}
