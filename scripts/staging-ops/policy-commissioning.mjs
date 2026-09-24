@@ -73,7 +73,7 @@ import { buildMainRulesets, REQUIRED_MAIN_CONTEXTS, verifyEffectiveMainPolicy } 
 const resolveInstallationTokenHelper = async () => (await import("./release-controller.mjs")).createInstallationToken;
 import {
   JournalChainError, acquireJournalLock, assertPrivateDirectory, openJournal, readJournal, recordWitnessEventOnce,
-  writeJournalSnapshot,
+  reduceResourceLifecycles, writeJournalSnapshot,
 } from "./commissioning-journal.mjs";
 import {
   CHALLENGE_DIRECTIONS, CLOUD_CASE_SEQUENCE, COMMISSION_DOMAIN,
@@ -3343,19 +3343,33 @@ export async function measureProductionBaseline({ request, excludeRulesetIds = n
  * complete bounded inventory before anything is created, and "I saw no collision in the part I
  * read" is not that proof.
  */
-export async function assertNoCollision({ request, ctx }) {
+export async function assertNoCollision({ request, ctx, records = [] }) {
+  const lifecycle = reduceResourceLifecycles(records);
+  if (lifecycle.errors.length) {
+    throw new IncompleteEvidence(`the resource lifecycle history is contradictory (${lifecycle.errors.join("; ")})`);
+  }
+  const active = lifecycle.resources.filter((entry) => entry.state !== "retired");
+  const graphShas = new Set(active.filter((entry) => entry.kind === "commit").map((entry) => String(entry.identity.sha)));
+  const activeRefs = new Map(active.filter((entry) => entry.kind === "ref").map((entry) => [String(entry.identity.ref), entry]));
   for (const suffix of REF_SUFFIXES) {
     const ref = derivedRef(ctx.runId, ctx.attempt, suffix);
     const existing = await readDerivedRefSha({ request, ref });
-    if (existing) throw new AssertionFailure(`${ref} already exists; commissioning refuses to adopt or delete a resource it did not create`);
+    if (existing && !(activeRefs.has(ref) && graphShas.has(existing))) {
+      throw new AssertionFailure(`${ref} already exists outside an active exact journaled lifetime; commissioning refuses to adopt or delete it`);
+    }
   }
   const inventory = await readAllPages({
     request, endpoint: `/repos/${COMMISSIONING_REPOSITORY}/rulesets`,
     label: "the repository ruleset inventory (collision check)",
   });
   const derived = new Set(Object.values(derivedRulesetNames(ctx.runId, ctx.attempt)).flat());
+  const activeRulesets = new Map(active.filter((entry) => entry.kind === "ruleset")
+    .map((entry) => [Number(entry.identity.id), String(entry.identity.name)]));
   for (const ruleset of inventory) {
-    if (derived.has(String(ruleset?.name))) throw new AssertionFailure(`a ruleset named ${String(ruleset.name)} already exists; commissioning refuses to adopt it`);
+    if (derived.has(String(ruleset?.name))
+      && activeRulesets.get(Number(ruleset?.id)) !== String(ruleset?.name)) {
+      throw new AssertionFailure(`a ruleset named ${String(ruleset.name)} already exists outside an active exact journaled lifetime; commissioning refuses to adopt it`);
+    }
   }
   return { measured: true, inventory_size: inventory.length };
 }
@@ -3372,6 +3386,14 @@ export function buildDisposablePlan(ctx) {
 }
 
 const journaledResources = (records, kind) => records.filter((record) => record.type === "resource-created" && record.data?.kind === kind).map((record) => record.data);
+
+/** The event identity copied from one exact journal-established resource lifetime. */
+const resourceEventIdentity = (identity) => {
+  if (identity?.kind === "ruleset") return { kind: "ruleset", id: Number(identity.id), name: String(identity.name) };
+  if (identity?.kind === "ref") return { kind: "ref", ref: String(identity.ref) };
+  if (identity?.kind === "pull-request") return { kind: "pull-request", number: Number(identity.number) };
+  return { kind: String(identity?.kind ?? "unknown") };
+};
 
 /** The provider-shape fingerprints measured by a readback AFTER the create was journaled (F5). */
 const journaledFingerprints = (records) => new Map(
@@ -3811,6 +3833,16 @@ export async function reconcileCreateIntents({ request, ctx, journal }) {
         outcomes.push(outcome);
         continue;
       }
+      if (pending.state === "response-lost") {
+        const gap = {
+          ...base, outcome: "ownership-unprovable", id,
+          reason: "a create intent without a provider response cannot distinguish a pre-existing collision from a resource this run created",
+          measured_at_stage: "intent-only-reconciliation",
+        };
+        journal.append("reconciliation", gap);
+        outcomes.push(gap);
+        continue;
+      }
       const detail = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/rulesets/${id}`);
       if (detail.status !== 200 || !detail.body) throw new IncompleteEvidence(`reconciliation could not read ruleset ${id} recorded by an unresolved intent; this attempt is not resumable`);
       if (String(detail.body.name) !== String(pending.intent.name)) {
@@ -3865,6 +3897,16 @@ export async function reconcileCreateIntents({ request, ctx, journal }) {
       if (String(present) !== String(pending.intent.sha)) {
         throw new AssertionFailure(`reconciliation found ${pending.intent.ref} at a commit the intent did not request; commissioning refuses to adopt or delete it`);
       }
+      if (pending.state === "response-lost") {
+        const gap = {
+          ...base, outcome: "ownership-unprovable", ref: pending.intent.ref, sha: present,
+          reason: "a create intent without a provider response cannot distinguish a pre-existing ref from a ref this run created",
+          measured_at_stage: "intent-only-reconciliation",
+        };
+        journal.append("reconciliation", gap);
+        outcomes.push(gap);
+        continue;
+      }
       const outcome = { ...base, outcome: "adopted-from-intent", ref: pending.intent.ref, sha: present };
       journal.append("reconciliation", outcome);
       journal.append("resource-created", { kind: "ref", suffix: pending.intent.suffix, ref: pending.intent.ref, start_node: REF_START_NODES[pending.intent.suffix], sha: present, provenance: "reconciled-from-intent" });
@@ -3891,6 +3933,16 @@ export async function reconcileCreateIntents({ request, ctx, journal }) {
       const outcome = { ...base, outcome: "absent", safe_to_recreate: true };
       journal.append("reconciliation", outcome);
       outcomes.push(outcome);
+      continue;
+    }
+    if (pending.state === "response-lost") {
+      const gap = {
+        ...base, outcome: "ownership-unprovable", number,
+        reason: "a create intent without a provider response cannot distinguish a pre-existing pull request from one this run created",
+        measured_at_stage: "intent-only-reconciliation",
+      };
+      journal.append("reconciliation", gap);
+      outcomes.push(gap);
       continue;
     }
     const outcome = { ...base, outcome: "adopted-from-intent", number };
@@ -4005,12 +4057,16 @@ export async function runSetupPhase({ runId, attempt, evidenceDir, env, deps = {
       journal.append("run-opened", { operator_login: operator.login, operator_id: operator.id, workflow_sha: ctx.workflowSha, repository_id: ctx.repositoryId });
       baseline = await measureProductionBaseline({ request });
       journal.append("baseline-measured", baseline);
-      await assertNoCollision({ request, ctx });
     }
     // RECONCILE BEFORE CREATING (F5). A resumed attempt whose previous run lost a create response
     // must resolve that intent by bounded readback of the exact name/ref it recorded, BEFORE any new
     // POST — otherwise the resume is the duplicate-creation path this reconciliation exists to close.
     const reconciliations = await reconcileCreateIntents({ request, ctx, journal });
+    // A baseline is a measurement, never collision admission. Re-run the COMPLETE current
+    // inventory check on every entry after read-only reconciliation has either established an exact
+    // journal-owned partial resource or left the intent blocking. No create intent by itself waives
+    // this check, and no provider mutation occurs before it passes.
+    await assertNoCollision({ request, ctx, records: journal.read() });
     for (const entry of journaledResources(journal.read(), "ruleset")) {
       if (positiveProviderId(entry.id) !== null) guardCtx.rulesetIds.add(positiveProviderId(entry.id));
     }
@@ -6402,7 +6458,7 @@ export async function runCleanupPhase({ runId, attempt, evidenceDir, env, deps =
     // before cleanup". A cleanup that ran with an unresolved create intent would be a cleanup that
     // cannot say whether the resource it is not deleting exists.
     const reconciliations = await reconcileCreateIntents({ request, ctx, journal });
-    const current = journal.read();
+    let current = journal.read();
     /**
      * REFRESH THE OWNED-ID GUARD CONTEXT AFTER RECONCILIATION (F7).
      *
@@ -6419,6 +6475,46 @@ export async function runCleanupPhase({ runId, attempt, evidenceDir, env, deps =
     }
     for (const entry of journaledResources(current, "commit")) guardCtx.graphShas.add(String(entry.sha));
     guardCtx.pullNumber = positiveProviderId(journaledResources(current, "pull-request")[0]?.number);
+    let lifecycle = reduceResourceLifecycles(current);
+    if (lifecycle.errors.length) {
+      throw new IncompleteEvidence(`cleanup cannot proceed over contradictory resource history (${lifecycle.errors.join("; ")})`);
+    }
+    // A lost cleanup response is reconciled by an exact readback before another mutation. Presence
+    // resolves the old intent only when the same lifetime identity is still measurable; absence or
+    // closure retires it immediately, before any later run-closed summary can be written.
+    for (const lifetime of lifecycle.resources.filter((entry) => entry.pendingCleanup)) {
+      const identity = resourceEventIdentity(lifetime.identity);
+      const pending = lifetime.pendingCleanup;
+      if (lifetime.kind === "ruleset") {
+        const readback = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/rulesets/${lifetime.identity.id}`);
+        if (readback.status === 404) {
+          journal.append("resource-retired", { ...identity, lifecycle_key: lifetime.key, reason: "confirmed-absent", cleanup_intent_seq: pending.seq, readback_status: 404 });
+        } else if (readback.status === 200 && String(readback.body?.name) === String(lifetime.identity.name)) {
+          journal.append("reconciliation", { ...identity, lifecycle_key: lifetime.key, cleanup_intent_seq: pending.seq, outcome: "cleanup-still-present", readback_status: 200 });
+        }
+      } else if (lifetime.kind === "ref") {
+        const sha = await readDerivedRefSha({ request, ref: lifetime.identity.ref });
+        if (sha === null) {
+          journal.append("resource-retired", { ...identity, lifecycle_key: lifetime.key, reason: "confirmed-absent", cleanup_intent_seq: pending.seq, readback_absent: true, readback_sha: null });
+        } else if (guardCtx.graphShas.has(sha)) {
+          journal.append("reconciliation", { ...identity, lifecycle_key: lifetime.key, cleanup_intent_seq: pending.seq, outcome: "cleanup-still-present", readback_sha: sha });
+        }
+      } else if (lifetime.kind === "pull-request") {
+        const readback = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/pulls/${lifetime.identity.number}`);
+        const exact = String(readback.body?.base?.ref) === String(lifetime.identity.base)
+          && String(readback.body?.head?.ref) === String(lifetime.identity.head);
+        if (readback.status === 200 && exact && String(readback.body?.state) === "closed") {
+          journal.append("resource-retired", { ...identity, lifecycle_key: lifetime.key, reason: "confirmed-closed", cleanup_intent_seq: pending.seq, readback_status: 200, readback_state: "closed" });
+        } else if (readback.status === 200 && exact && String(readback.body?.state) === "open") {
+          journal.append("reconciliation", { ...identity, lifecycle_key: lifetime.key, cleanup_intent_seq: pending.seq, outcome: "cleanup-still-present", readback_status: 200, readback_state: "open" });
+        }
+      }
+    }
+    current = journal.read();
+    lifecycle = reduceResourceLifecycles(current);
+    if (lifecycle.errors.length) {
+      throw new IncompleteEvidence(`cleanup reconciliation produced contradictory resource history (${lifecycle.errors.join("; ")})`);
+    }
     /**
      * The INDEPENDENTLY DERIVED intended bodies (F8), recomputed from the immutable intent rather
      * than read back from the provider. This is what an unfingerprinted resource has to match
@@ -6431,10 +6527,30 @@ export async function runCleanupPhase({ runId, attempt, evidenceDir, env, deps =
     const outcomes = [];
     let refused = 0;
 
-    for (const owned of journaledResources(current, "ruleset")) {
+    for (const lifetime of lifecycle.resources.filter((entry) => entry.kind === "ruleset")) {
+      const owned = lifetime.identity;
       const detail = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/rulesets/${owned.id}`);
-      if (detail.status === 404) { outcomes.push({ kind: "ruleset", id: owned.id, name: owned.name, result: "already-absent" }); continue; }
+      if (detail.status === 404) {
+        journal.append("resource-retired", {
+          ...resourceEventIdentity(owned), lifecycle_key: lifetime.key, reason: "confirmed-absent", readback_status: 404,
+        });
+        outcomes.push({ kind: "ruleset", id: owned.id, name: owned.name, result: "already-absent" });
+        continue;
+      }
       if (detail.status !== 200 || !detail.body) { outcomes.push({ kind: "ruleset", id: owned.id, name: owned.name, result: "unreadable" }); refused += 1; continue; }
+      if (lifetime.state === "retired") {
+        journal.append("reconciliation", {
+          ...resourceEventIdentity(owned), lifecycle_key: lifetime.key, outcome: "retired-resource-reappeared", readback_status: 200,
+        });
+        outcomes.push({ kind: "ruleset", id: owned.id, name: owned.name, result: "refused-retired-resource-reappeared" });
+        refused += 1;
+        continue;
+      }
+      if (lifetime.state === "cleanup-pending") {
+        outcomes.push({ kind: "ruleset", id: owned.id, name: owned.name, result: "refused-unresolved-cleanup" });
+        refused += 1;
+        continue;
+      }
       const include = detail.body?.conditions?.ref_name?.include ?? [];
       const measured = governedFingerprint(detail.body);
       let recorded = fingerprints.get(`ruleset:${owned.name}`);
@@ -6506,47 +6622,93 @@ export async function runCleanupPhase({ runId, attempt, evidenceDir, env, deps =
         refused += 1;
         continue;
       }
-      journal.append("cleanup-intent", { kind: "ruleset", id: owned.id, name: owned.name });
+      journal.append("cleanup-intent", { kind: "ruleset", id: owned.id, name: owned.name, lifecycle_key: lifetime.key });
       const response = await request("DELETE", `/repos/${COMMISSIONING_REPOSITORY}/rulesets/${owned.id}`);
       const readback = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/rulesets/${owned.id}`);
       const removed = readback.status === 404;
-      journal.append("cleanup-result", { kind: "ruleset", id: owned.id, status: response.status, ...responseEvidence(response), removed });
+      journal.append("cleanup-result", {
+        kind: "ruleset", id: owned.id, name: owned.name, lifecycle_key: lifetime.key,
+        status: response.status, ...responseEvidence(response), removed, readback_status: readback.status,
+      });
       outcomes.push({ kind: "ruleset", id: owned.id, name: owned.name, result: removed ? "removed" : "still-present", fingerprint_stage: fingerprintStage });
       if (!removed) refused += 1;
     }
 
-    for (const owned of journaledResources(current, "ref")) {
-      const current = await readDerivedRefSha({ request, ref: owned.ref });
-      if (current === null) { outcomes.push({ kind: "ref", ref: owned.ref, result: "already-absent" }); continue; }
-      if (!guardCtx.graphShas.has(current)) {
+    for (const lifetime of lifecycle.resources.filter((entry) => entry.kind === "ref")) {
+      const owned = lifetime.identity;
+      const currentSha = await readDerivedRefSha({ request, ref: owned.ref });
+      if (currentSha === null) {
+        journal.append("resource-retired", {
+          ...resourceEventIdentity(owned), lifecycle_key: lifetime.key, reason: "confirmed-absent",
+          readback_absent: true, readback_sha: null,
+        });
+        outcomes.push({ kind: "ref", ref: owned.ref, result: "already-absent" });
+        continue;
+      }
+      if (lifetime.state === "retired") {
+        journal.append("reconciliation", {
+          ...resourceEventIdentity(owned), lifecycle_key: lifetime.key, outcome: "retired-resource-reappeared", readback_sha: currentSha,
+        });
+        outcomes.push({ kind: "ref", ref: owned.ref, result: "refused-retired-resource-reappeared" });
+        refused += 1;
+        continue;
+      }
+      if (lifetime.state === "cleanup-pending") {
+        outcomes.push({ kind: "ref", ref: owned.ref, result: "refused-unresolved-cleanup" });
+        refused += 1;
+        continue;
+      }
+      if (!guardCtx.graphShas.has(currentSha)) {
         // Something outside this run wrote here. Deleting it would destroy evidence that is not ours.
         outcomes.push({ kind: "ref", ref: owned.ref, result: "refused-unowned-content" });
         refused += 1;
         continue;
       }
-      journal.append("cleanup-intent", { kind: "ref", ref: owned.ref, sha: current });
+      journal.append("cleanup-intent", { kind: "ref", ref: owned.ref, sha: currentSha, lifecycle_key: lifetime.key });
       const response = await request("DELETE", `/repos/${COMMISSIONING_REPOSITORY}/git/refs/heads/${branchOf(owned.ref)}`);
       const readback = await readDerivedRefSha({ request, ref: owned.ref });
-      journal.append("cleanup-result", { kind: "ref", ref: owned.ref, status: response.status, ...responseEvidence(response), removed: readback === null });
+      journal.append("cleanup-result", {
+        kind: "ref", ref: owned.ref, lifecycle_key: lifetime.key, status: response.status,
+        ...responseEvidence(response), removed: readback === null, readback_absent: readback === null, readback_sha: readback,
+      });
       outcomes.push({ kind: "ref", ref: owned.ref, result: readback === null ? "removed" : "still-present" });
       if (readback !== null) refused += 1;
     }
 
-    const pull = journaledResources(current, "pull-request")[0];
-    if (pull) {
+    const pullLifetime = lifecycle.resources.find((entry) => entry.kind === "pull-request");
+    const pull = pullLifetime?.identity;
+    if (pull && pullLifetime) {
       const detail = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/pulls/${pull.number}`);
       if (detail.status !== 200 || !detail.body) { outcomes.push({ kind: "pull-request", number: pull.number, result: "unreadable" }); refused += 1; }
       else if (String(detail.body.base?.ref) !== pull.base || String(detail.body.head?.ref) !== pull.head) {
         outcomes.push({ kind: "pull-request", number: pull.number, result: "refused-retargeted" });
         refused += 1;
       } else if (String(detail.body.state) === "closed") {
+        journal.append("resource-retired", {
+          ...resourceEventIdentity(pull), lifecycle_key: pullLifetime.key, reason: "confirmed-closed",
+          readback_status: 200, readback_state: "closed",
+        });
         outcomes.push({ kind: "pull-request", number: pull.number, result: "already-closed" });
+      } else if (pullLifetime.state === "retired") {
+        journal.append("reconciliation", {
+          ...resourceEventIdentity(pull), lifecycle_key: pullLifetime.key, outcome: "retired-resource-reappeared",
+          readback_status: 200, readback_state: String(detail.body.state),
+        });
+        outcomes.push({ kind: "pull-request", number: pull.number, result: "refused-retired-resource-reappeared" });
+        refused += 1;
+      } else if (pullLifetime.state === "cleanup-pending") {
+        outcomes.push({ kind: "pull-request", number: pull.number, result: "refused-unresolved-cleanup" });
+        refused += 1;
       } else {
-        journal.append("cleanup-intent", { kind: "pull-request", number: pull.number });
+        journal.append("cleanup-intent", { kind: "pull-request", number: pull.number, lifecycle_key: pullLifetime.key });
         const response = await request("PATCH", `/repos/${COMMISSIONING_REPOSITORY}/pulls/${pull.number}`, { state: "closed" });
         const readback = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/pulls/${pull.number}`);
         const closed = String(readback.body?.state) === "closed";
-        journal.append("cleanup-result", { kind: "pull-request", number: pull.number, status: response.status, ...responseEvidence(response), closed });
+        journal.append("cleanup-result", {
+          kind: "pull-request", number: pull.number, lifecycle_key: pullLifetime.key,
+          status: response.status, ...responseEvidence(response), closed,
+          readback_status: readback.status, readback_state: String(readback.body?.state ?? ""),
+        });
         outcomes.push({ kind: "pull-request", number: pull.number, result: closed ? "closed" : "still-open" });
         if (!closed) refused += 1;
       }
@@ -7247,6 +7409,7 @@ function reconstructCaseTransport(record, { runId, attempt, role, kase, intent, 
     }
   }
   // ── SOURCE CONTINUITY AT BOTH CONSUMPTION BOUNDARIES ────────────────────────────────────────────
+  const responseObservations = { pre: null, post: null };
   for (const direction of ["pre", "post"]) {
     const continuity = record?.source_continuity?.[direction];
     if (!continuity || typeof continuity !== "object" || continuity.measured !== true) {
@@ -7270,6 +7433,14 @@ function reconstructCaseTransport(record, { runId, attempt, role, kase, intent, 
     if (!challenge || !response || !SHA256_HEX.test(String(digest ?? ""))) {
       problems.push(`retains no ${direction} challenge/response pair to re-bind`);
       continue;
+    }
+    responseObservations[direction] = response.observation ?? null;
+    if (!responseObservations[direction]) {
+      problems.push(`retains no ${direction} observation inside the authenticated response`);
+    }
+    const duplicateObservation = witness[`${direction}_observation`];
+    if (canonicalJson(duplicateObservation ?? null) !== canonicalJson(responseObservations[direction])) {
+      problems.push(`records a copied ${direction} observation that is not canonically equal to the authenticated response observation`);
     }
     /**
      * ── THE RECEIPT IS A DISTINCT MEASURED EVENT (root's condition 3) ────────────────────────────
@@ -7400,8 +7571,8 @@ function reconstructCaseTransport(record, { runId, attempt, role, kase, intent, 
   }
 
   // ── THE TIMINGS, RECOMPUTED FROM THE FACTS ──────────────────────────────────────────────────────
-  const preObservation = witness.pre_observation ?? witness.pre_response?.observation ?? null;
-  const postObservation = witness.post_observation ?? witness.post_response?.observation ?? null;
+  const preObservation = responseObservations.pre;
+  const postObservation = responseObservations.post;
   const mutationStartedAt = Date.parse(String(record?.mutation_started_at ?? ""));
   const readbackAt = Date.parse(String(record?.readback_at ?? ""));
   if (!Number.isFinite(mutationStartedAt)) problems.push("carries no parseable mutation start time");
@@ -7466,6 +7637,10 @@ export function assessEvidence({ dir, runId, attempt, now = () => new Date() }) 
   catch (error) { journalError = error instanceof Error ? error.message : String(error); }
   if (journalError) block("PC-07", "failed", `the local journal chain does not verify: ${journalError}`);
   else if (!journalRecords.length) block("PC-07", "unverified", "the local journal is empty; no local phase has run");
+  const resourceHistory = journalRecords ? reduceResourceLifecycles(journalRecords) : null;
+  if (resourceHistory?.errors.length) {
+    block("PC-07", "invalid", `the resource lifecycle history is contradictory (${resourceHistory.errors.join("; ")})`);
+  }
 
   /**
    * ── THE SECOND HASH-CHAINED JOURNAL, VERIFIED (F2) ────────────────────────────────────────────
@@ -8367,6 +8542,51 @@ export function assessEvidence({ dir, runId, attempt, now = () => new Date() }) 
     const outcomes = Array.isArray(files.cleanup.outcomes) ? files.cleanup.outcomes : [];
     const leftovers = outcomes.filter((entry) => !["removed", "already-absent", "closed", "already-closed"].includes(entry?.result));
     if (leftovers.length) block("PC-07", "failed", `${leftovers.length} owned resource(s) were not removed`);
+    const closure = resourceHistory?.latestClosure ?? null;
+    if (!closure) {
+      block("PC-07", "unverified", "the verified resource history ends before cleanup closure; a derived cleanup summary is not durable ownership evidence");
+    } else {
+      if (Number(closure.data?.cleanup_refusals) !== Number(files.cleanup.refusals)) {
+        block("PC-07", "invalid", "the cleanup evidence's refusal count is not the latest run-closed summary in the verified journal");
+      }
+      if (canonicalJson([...(closure.data?.production_drift ?? [])].sort()) !== canonicalJson([...(files.cleanup.production_drift ?? [])].sort())) {
+        block("PC-07", "invalid", "the cleanup evidence's production drift is not the latest run-closed summary in the verified journal");
+      }
+      if (Number(closure.data?.unresolved_intents) !== Number(files.cleanup.unresolved_intents)) {
+        block("PC-07", "invalid", "the cleanup evidence's unresolved-intent count is not the latest run-closed summary in the verified journal");
+      }
+    }
+    for (const lifetime of resourceHistory?.resources.filter((entry) => entry.kind !== "commit") ?? []) {
+      if (lifetime.pendingCleanup) {
+        block("PC-07", "unverified", `resource lifetime ${lifetime.key} has an unresolved cleanup intent`);
+      } else if (lifetime.state !== "retired") {
+        block("PC-07", "unverified", `resource lifetime ${lifetime.key} has no durable removal, absence or closure fact`);
+      }
+    }
+    for (const outcome of outcomes) {
+      const lifetime = resourceHistory?.resources.find((entry) => {
+        if (outcome?.kind !== entry.kind) return false;
+        if (entry.kind === "ruleset") return Number(entry.identity.id) === Number(outcome.id);
+        if (entry.kind === "ref") return String(entry.identity.ref) === String(outcome.ref);
+        if (entry.kind === "pull-request") return Number(entry.identity.number) === Number(outcome.number);
+        return false;
+      });
+      if (!lifetime) continue;
+      const terminal = lifetime.terminalEvents.filter((event) => !closure || event.seq < closure.seq);
+      const result = String(outcome?.result ?? "");
+      const joined = result === "removed"
+        ? terminal.some((event) => event.type === "cleanup-result" && event.data?.removed === true)
+        : result === "closed"
+          ? terminal.some((event) => event.type === "cleanup-result" && event.data?.closed === true)
+          : result === "already-absent"
+            ? terminal.some((event) => event.type === "resource-retired" && event.data?.reason === "confirmed-absent")
+            : result === "already-closed"
+              ? terminal.some((event) => event.type === "resource-retired" && event.data?.reason === "confirmed-closed")
+              : true;
+      if (!joined) {
+        block("PC-07", "invalid", `cleanup outcome ${lifetime.key}:${result} has no matching durable cleanup/readback transition before the latest run closure`);
+      }
+    }
     // COVERAGE, computed from the verified journal rather than from the cleanup file's own list. An
     // empty `outcomes: []` used to satisfy every check above by having nothing to object to.
     if (journalRecords?.length) {

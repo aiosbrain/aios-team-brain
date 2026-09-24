@@ -60,6 +60,8 @@ export const JOURNAL_EVENTS = Object.freeze([
   "case-outcome",
   "cleanup-intent",
   "cleanup-result",
+  /** A readback, without a mutation, proved an owned resource absent or a pull request closed. */
+  "resource-retired",
   /**
    * The bounded outcome of reconciling an intent whose result was lost. Distinct from `recovery`,
    * which is about a LOCK: this is about a MUTATION whose response never arrived, and it is what
@@ -464,6 +466,142 @@ export function readJournal({ dir, runId, attempt, kind = "resource" }) {
     expectedSeq += 1;
   }
   return records;
+}
+
+const positiveIdentity = (value) => {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+};
+
+/** The exact identity of one creation lifetime. Names and SHAs alone never acquire ownership. */
+export function resourceLifecycleKey(data) {
+  if (data?.kind === "ruleset") {
+    const id = positiveIdentity(data.id);
+    const name = typeof data.name === "string" && data.name ? data.name : null;
+    return id !== null && name ? `ruleset:${id}:${name}` : null;
+  }
+  if (data?.kind === "ref") {
+    return typeof data.ref === "string" && data.ref ? `ref:${data.ref}` : null;
+  }
+  if (data?.kind === "pull-request") {
+    const number = positiveIdentity(data.number);
+    return number !== null ? `pull-request:${number}` : null;
+  }
+  if (data?.kind === "commit") {
+    const node = typeof data.node === "string" && data.node ? data.node : null;
+    const sha = typeof data.sha === "string" && /^[0-9a-f]{40}$/.test(data.sha) ? data.sha : null;
+    return node && sha ? `commit:${node}:${sha}` : null;
+  }
+  return null;
+}
+
+function lifecycleForEvent(resources, data) {
+  if (data?.kind === "ruleset") {
+    const id = positiveIdentity(data.id);
+    const matches = [...resources.values()].filter((entry) => entry.kind === "ruleset" && positiveIdentity(entry.identity.id) === id);
+    return matches.length === 1 ? matches[0] : null;
+  }
+  if (data?.kind === "ref") {
+    const matches = [...resources.values()].filter((entry) => entry.kind === "ref" && entry.identity.ref === data.ref);
+    return matches.length === 1 ? matches[0] : null;
+  }
+  if (data?.kind === "pull-request") {
+    const number = positiveIdentity(data.number);
+    const matches = [...resources.values()].filter((entry) => entry.kind === "pull-request" && positiveIdentity(entry.identity.number) === number);
+    return matches.length === 1 ? matches[0] : null;
+  }
+  return null;
+}
+
+/**
+ * Reduce a verified RESOURCE-journal prefix into creation lifetimes.
+ *
+ * This deliberately does not require `run-closed`: setup and cleanup must read open prefixes while
+ * recovering. Consumers that claim a final packet use `latestClosure` and the terminal states.
+ */
+export function reduceResourceLifecycles(records) {
+  const resources = new Map();
+  const errors = [];
+  const closures = [];
+  for (const record of records) {
+    if (record?.kind !== undefined && record.kind !== "resource") continue;
+    if (record.type === "resource-created") {
+      const key = resourceLifecycleKey(record.data);
+      if (!key) { errors.push(`resource-created record ${record.seq} has no exact lifecycle identity`); continue; }
+      if (resources.has(key)) {
+        errors.push(`resource-created record ${record.seq} attempts to reacquire existing lifetime ${key}`);
+        continue;
+      }
+      resources.set(key, {
+        key, kind: record.data.kind, identity: record.data, createdSeq: record.seq,
+        state: record.data.kind === "commit" ? "inert" : "owned-active",
+        pendingCleanup: null, terminalEvents: [], cleanupEvents: [],
+      });
+      continue;
+    }
+    if (record.type === "cleanup-intent") {
+      const lifetime = lifecycleForEvent(resources, record.data);
+      if (!lifetime) { errors.push(`cleanup-intent record ${record.seq} names no exact creation lifetime`); continue; }
+      if (record.data?.lifecycle_key !== lifetime.key) { errors.push(`cleanup-intent record ${record.seq} does not bind exact lifetime ${lifetime.key}`); continue; }
+      if (lifetime.state === "retired") { errors.push(`cleanup-intent record ${record.seq} tries to mutate retired lifetime ${lifetime.key}`); continue; }
+      if (lifetime.pendingCleanup) { errors.push(`cleanup-intent record ${record.seq} overlaps unresolved cleanup intent ${lifetime.pendingCleanup.seq}`); continue; }
+      lifetime.pendingCleanup = { seq: record.seq, data: record.data };
+      lifetime.state = "cleanup-pending";
+      lifetime.cleanupEvents.push(record);
+      continue;
+    }
+    if (record.type === "cleanup-result") {
+      const lifetime = lifecycleForEvent(resources, record.data);
+      if (!lifetime) { errors.push(`cleanup-result record ${record.seq} names no exact creation lifetime`); continue; }
+      if (record.data?.lifecycle_key !== lifetime.key) { errors.push(`cleanup-result record ${record.seq} does not bind exact lifetime ${lifetime.key}`); continue; }
+      if (!lifetime.pendingCleanup) { errors.push(`cleanup-result record ${record.seq} has no pending cleanup intent for ${lifetime.key}`); continue; }
+      lifetime.cleanupEvents.push(record);
+      lifetime.pendingCleanup = null;
+      const retired = lifetime.kind === "ruleset"
+        ? record.data?.removed === true && Number(record.data?.readback_status) === 404
+        : lifetime.kind === "ref"
+          ? record.data?.removed === true && record.data?.readback_absent === true && record.data?.readback_sha === null
+          : record.data?.closed === true && Number(record.data?.readback_status) === 200 && record.data?.readback_state === "closed";
+      lifetime.state = retired ? "retired" : "owned-active";
+      if (retired) lifetime.terminalEvents.push(record);
+      continue;
+    }
+    if (record.type === "reconciliation" && positiveIdentity(record.data?.cleanup_intent_seq) !== null) {
+      const lifetime = lifecycleForEvent(resources, record.data);
+      if (!lifetime || lifetime.pendingCleanup?.seq !== positiveIdentity(record.data.cleanup_intent_seq)) {
+        errors.push(`cleanup reconciliation record ${record.seq} does not resolve its exact pending cleanup intent`);
+        continue;
+      }
+      if (record.data?.lifecycle_key !== lifetime.key || record.data?.outcome !== "cleanup-still-present") {
+        errors.push(`cleanup reconciliation record ${record.seq} does not carry the exact active lifetime readback`);
+        continue;
+      }
+      lifetime.cleanupEvents.push(record);
+      lifetime.pendingCleanup = null;
+      lifetime.state = "owned-active";
+      continue;
+    }
+    if (record.type === "resource-retired") {
+      const lifetime = lifecycleForEvent(resources, record.data);
+      const allowed = lifetime?.kind === "pull-request"
+        ? record.data?.reason === "confirmed-closed"
+        : record.data?.reason === "confirmed-absent";
+      if (!lifetime || !allowed || record.data?.lifecycle_key !== lifetime.key) { errors.push(`resource-retired record ${record.seq} has no exact truthful retirement identity`); continue; }
+      if (lifetime.pendingCleanup && positiveIdentity(record.data?.cleanup_intent_seq) !== lifetime.pendingCleanup.seq) {
+        errors.push(`resource-retired record ${record.seq} does not resolve the pending cleanup intent for ${lifetime.key}`);
+        continue;
+      }
+      lifetime.pendingCleanup = null;
+      lifetime.state = "retired";
+      lifetime.terminalEvents.push(record);
+      continue;
+    }
+    if (record.type === "run-closed") closures.push(record);
+  }
+  return {
+    resources: [...resources.values()], errors, closures,
+    latestClosure: closures.at(-1) ?? null,
+  };
 }
 
 /**
