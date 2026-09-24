@@ -222,11 +222,7 @@
               ]
             },
             "code": {
-              "enum": [
-                "divergent_change",
-                "mapping_required",
-                "stale_revision"
-              ]
+              "const": "divergent_change"
             }
           },
           "required": [
@@ -304,11 +300,7 @@
               ]
             },
             "code": {
-              "enum": [
-                "divergent_change",
-                "mapping_required",
-                "stale_revision"
-              ]
+              "const": "divergent_change"
             }
           },
           "required": [
@@ -377,11 +369,7 @@
               ]
             },
             "code": {
-              "enum": [
-                "divergent_change",
-                "mapping_required",
-                "stale_revision"
-              ]
+              "const": "divergent_change"
             }
           },
           "required": [
@@ -453,11 +441,7 @@
               ]
             },
             "code": {
-              "enum": [
-                "divergent_change",
-                "mapping_required",
-                "stale_revision"
-              ]
+              "const": "divergent_change"
             }
           },
           "required": [
@@ -470,6 +454,111 @@
             "origin",
             "code"
           ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "task_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "revision": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "origin": {
+              "enum": [
+                "workspace",
+                "linear",
+                "plane"
+              ]
+            },
+            "code": {
+              "const": "stale_revision"
+            }
+          },
+          "required": [
+            "task_id",
+            "revision",
+            "origin",
+            "code"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "task_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "revision": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "origin": {
+              "enum": [
+                "workspace",
+                "linear",
+                "plane"
+              ]
+            },
+            "code": {
+              "const": "mapping_required"
+            },
+            "field": {
+              "enum": [
+                "assignee",
+                "status"
+              ]
+            },
+            "provider_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "raw_value": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 500
+                },
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "maxLength": 256
+                  },
+                  "maxItems": 100
+                }
+              ]
+            },
+            "mapping_revision": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 128
+            }
+          },
+          "required": [
+            "task_id",
+            "revision",
+            "origin",
+            "code",
+            "field",
+            "provider_id",
+            "raw_value",
+            "mapping_revision"
+          ],
+          "additionalProperties": false
         }
       ]
     },
@@ -506,7 +595,7 @@
           "items": {
             "$ref": "#/definitions/Conflict"
           },
-          "maxItems": 5000
+          "maxItems": 20000
         }
       },
       "required": [

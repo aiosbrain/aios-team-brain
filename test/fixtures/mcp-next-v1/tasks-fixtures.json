@@ -11,6 +11,30 @@
         "operation_id": "op-1",
         "rows": []
       }
+    },
+    {
+      "name": "unmapped-provider-status-is-not-guessed",
+      "schema": "urn:aios:mcp-next:1:tasks#/definitions/Conflict",
+      "value": {
+        "task_id": "task-1",
+        "revision": "r1",
+        "origin": "linear",
+        "code": "mapping_required",
+        "field": "status",
+        "provider_id": "state-custom",
+        "raw_value": "provider-status-custom-42",
+        "mapping_revision": null
+      }
+    },
+    {
+      "name": "row-level-stale-revision",
+      "schema": "urn:aios:mcp-next:1:tasks#/definitions/Conflict",
+      "value": {
+        "task_id": "task-1",
+        "revision": "r2",
+        "origin": "workspace",
+        "code": "stale_revision"
+      }
     }
   ],
   "invalid": [

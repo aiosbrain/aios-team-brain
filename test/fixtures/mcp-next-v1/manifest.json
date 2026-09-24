@@ -2,14 +2,14 @@
   "version": "1.0.0",
   "status": "proposed",
   "files": {
-    "actions-fixtures.json": "28f9fdc1b6af3df0ea159688abb1920b631437f8f19c48f1a9ef1dd1bff1c5f4",
+    "actions-fixtures.json": "eaa0994f4b8a5c12cff8be3320857246764a4c5c0c22bcfa4b1de05579bc2f54",
     "actions.schema.json": "5f5949d79a878b7027c5edc9635041ee8895d2146d558bdfa5fcb0e9f57cb2e4",
     "operations.json": "4e997bf3b91edf4378a5746b0699a1fe492a36f9f96bbbee82d962eafeedbd16",
     "profile.schema.json": "25a322a0cf859ee0033997b6f60d04f33a797ecbb7e093b6e1d65bc0cc4a7a33",
     "read-baseline.json": "657753d3397889fcf0dfb12c7169ade68de5fcdc28a91b06539eb39e035fa0c1",
-    "tasks-fixtures.json": "a3f8ce434e770fe622a88716f7afbd1b9b1c77fceb5a2761364ab3616ed3eb8e",
-    "tasks.schema.json": "0be873310a25189c041eead6af3995645dbd8e69e790303f44f16910b526ea71",
-    "workspace-fixtures.json": "026c9dedb9c161d194f8144cd3bcbd0c10dcd5b3d4bd8903b946570e8cff8c08",
-    "workspace.schema.json": "42615ab96fbfe27e7e7fb03def553467250d029aad5d4ba19e0982df14171727"
+    "tasks-fixtures.json": "c11d3d27c0d4acbe76997561d171b668ab26bc1cf27e3f0e69f0128b3e510220",
+    "tasks.schema.json": "b88f910b4a9a37a3043b641c9e814680ef188468403f14e8aa0a4d6263d5f95a",
+    "workspace-fixtures.json": "1e54c15cfa7333d66cb2c87798d21315db55771dd32a48998712f9d939edcc6c",
+    "workspace.schema.json": "4a1a3705afaafe30a2bf779d13489d48800de97c2367995d665c2e8bf8595773"
   }
 }

@@ -560,6 +560,16 @@
               "type": "null"
             }
           ]
+        },
+        "taskBatch": {
+          "anyOf": [
+            {
+              "$ref": "urn:aios:mcp-next:1:tasks#/definitions/Batch"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -569,7 +579,50 @@
         "payloadHash",
         "kind",
         "access",
-        "expectedRevision"
+        "expectedRevision",
+        "taskBatch"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "task"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "expectedRevision": {
+                "type": "null"
+              },
+              "taskBatch": {
+                "allOf": [
+                  {
+                    "$ref": "urn:aios:mcp-next:1:tasks#/definitions/Batch"
+                  },
+                  {
+                    "properties": {
+                      "rows": {
+                        "minItems": 1
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "taskBatch": {
+                "type": "null"
+              }
+            }
+          }
+        }
       ]
     },
     "Plan": {
@@ -801,6 +854,24 @@
               "type": "null"
             }
           ]
+        },
+        "kind": {
+          "enum": [
+            "task",
+            "decision",
+            "deliverable",
+            "hours"
+          ]
+        },
+        "taskResult": {
+          "anyOf": [
+            {
+              "$ref": "urn:aios:mcp-next:1:tasks#/definitions/Result"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -812,7 +883,9 @@
         "revision",
         "auditRef",
         "retryable",
-        "errorCode"
+        "errorCode",
+        "kind",
+        "taskResult"
       ],
       "allOf": [
         {
@@ -826,11 +899,6 @@
           "then": {
             "properties": {
               "entityId": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 256
-              },
-              "revision": {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 256
@@ -862,6 +930,114 @@
                 "const": false
               }
             }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "task"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "revision": {
+                "type": "null"
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "state": {
+                      "const": "succeeded"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "taskResult": {
+                      "allOf": [
+                        {
+                          "$ref": "urn:aios:mcp-next:1:tasks#/definitions/Result"
+                        },
+                        {
+                          "properties": {
+                            "applied": {
+                              "minItems": 1
+                            },
+                            "conflicts": {
+                              "maxItems": 0
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "state": {
+                      "const": "conflict"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "taskResult": {
+                      "allOf": [
+                        {
+                          "$ref": "urn:aios:mcp-next:1:tasks#/definitions/Result"
+                        },
+                        {
+                          "properties": {
+                            "conflicts": {
+                              "minItems": 1
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    "retryable": {
+                      "const": false
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "else": {
+            "properties": {
+              "taskResult": {
+                "type": "null"
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "state": {
+                      "const": "succeeded"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "revision": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    }
+                  }
+                }
+              }
+            ]
           }
         }
       ]
@@ -946,7 +1122,8 @@
         "payloadJson": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 1048576
+          "maxLength": 1048576,
+          "description": "Exact UTF-8 JSON; kind=task must parse as tasks Batch with project_id=projectId, operation_id=operationId, source_item_id=itemId and nonempty rows. The server enforces parsed schema, identity binding and exact payloadHash before any write."
         },
         "payloadHash": {
           "$ref": "#/definitions/ContentHash"
@@ -962,6 +1139,16 @@
               "type": "null"
             }
           ]
+        },
+        "taskBatch": {
+          "anyOf": [
+            {
+              "$ref": "urn:aios:mcp-next:1:tasks#/definitions/Batch"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -972,7 +1159,50 @@
         "access",
         "payloadJson",
         "payloadHash",
-        "expectedRevision"
+        "expectedRevision",
+        "taskBatch"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "task"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "expectedRevision": {
+                "type": "null"
+              },
+              "taskBatch": {
+                "allOf": [
+                  {
+                    "$ref": "urn:aios:mcp-next:1:tasks#/definitions/Batch"
+                  },
+                  {
+                    "properties": {
+                      "rows": {
+                        "minItems": 1
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "taskBatch": {
+                "type": "null"
+              }
+            }
+          }
+        }
       ]
     },
     "PublishItemOutput": {

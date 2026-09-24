@@ -223,10 +223,52 @@
             "itemId": "item-1",
             "path": "2-work/draft.md",
             "contentHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-            "payloadHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "payloadHash": "sha256:4ba179217a1f9d3558475d92eda3ab4738ef952fd1d3e56bad0f730a4e57ad5b",
             "kind": "task",
             "access": "team",
-            "expectedRevision": "rev-3"
+            "expectedRevision": null,
+            "taskBatch": {
+              "contract_version": "mcp-next/1",
+              "project_id": "project-demo",
+              "source_item_id": "item-1",
+              "operation_id": "op-1",
+              "rows": [
+                {
+                  "task_id": "task-1",
+                  "row_key": "row-1",
+                  "expected_revision": "rev-3",
+                  "baseline": {
+                    "title": "Synthetic task",
+                    "assignee": null,
+                    "status": "backlog",
+                    "due": null
+                  },
+                  "values": {
+                    "title": "Synthetic task",
+                    "assignee": null,
+                    "status": "in_progress",
+                    "due": null
+                  }
+                },
+                {
+                  "task_id": "task-2",
+                  "row_key": "row-2",
+                  "expected_revision": "rev-9",
+                  "baseline": {
+                    "title": "Second task",
+                    "assignee": null,
+                    "status": "backlog",
+                    "due": null
+                  },
+                  "values": {
+                    "title": "Second task revised",
+                    "assignee": null,
+                    "status": "backlog",
+                    "due": null
+                  }
+                }
+              ]
+            }
           }
         ]
       }
@@ -349,10 +391,52 @@
               "itemId": "item-1",
               "path": "2-work/draft.md",
               "contentHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-              "payloadHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+              "payloadHash": "sha256:4ba179217a1f9d3558475d92eda3ab4738ef952fd1d3e56bad0f730a4e57ad5b",
               "kind": "task",
               "access": "team",
-              "expectedRevision": "rev-3"
+              "expectedRevision": null,
+              "taskBatch": {
+                "contract_version": "mcp-next/1",
+                "project_id": "project-demo",
+                "source_item_id": "item-1",
+                "operation_id": "op-1",
+                "rows": [
+                  {
+                    "task_id": "task-1",
+                    "row_key": "row-1",
+                    "expected_revision": "rev-3",
+                    "baseline": {
+                      "title": "Synthetic task",
+                      "assignee": null,
+                      "status": "backlog",
+                      "due": null
+                    },
+                    "values": {
+                      "title": "Synthetic task",
+                      "assignee": null,
+                      "status": "in_progress",
+                      "due": null
+                    }
+                  },
+                  {
+                    "task_id": "task-2",
+                    "row_key": "row-2",
+                    "expected_revision": "rev-9",
+                    "baseline": {
+                      "title": "Second task",
+                      "assignee": null,
+                      "status": "backlog",
+                      "due": null
+                    },
+                    "values": {
+                      "title": "Second task revised",
+                      "assignee": null,
+                      "status": "backlog",
+                      "due": null
+                    }
+                  }
+                ]
+              }
             }
           ]
         },
@@ -370,13 +454,27 @@
           {
             "itemId": "item-1",
             "state": "succeeded",
-            "operationId": "operation-1",
+            "operationId": "op-1",
             "actionId": "action-1",
-            "entityId": "task-1",
-            "revision": "rev-4",
+            "entityId": "item-1",
+            "revision": null,
             "auditRef": "audit-1",
             "retryable": false,
-            "errorCode": null
+            "errorCode": null,
+            "kind": "task",
+            "taskResult": {
+              "applied": [
+                {
+                  "task_id": "task-1",
+                  "revision": "rev-4"
+                },
+                {
+                  "task_id": "task-2",
+                  "revision": "rev-10"
+                }
+              ],
+              "conflicts": []
+            }
           }
         ],
         "canResume": false
@@ -391,9 +489,51 @@
         "itemId": "item-1",
         "kind": "task",
         "access": "team",
-        "payloadJson": "{\"row_key\":\"task-demo\",\"title\":\"Synthetic task\"}",
-        "payloadHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-        "expectedRevision": null
+        "payloadJson": "{\"contract_version\":\"mcp-next/1\",\"operation_id\":\"op-1\",\"project_id\":\"project-demo\",\"rows\":[{\"baseline\":{\"assignee\":null,\"due\":null,\"status\":\"backlog\",\"title\":\"Synthetic task\"},\"expected_revision\":\"rev-3\",\"row_key\":\"row-1\",\"task_id\":\"task-1\",\"values\":{\"assignee\":null,\"due\":null,\"status\":\"in_progress\",\"title\":\"Synthetic task\"}},{\"baseline\":{\"assignee\":null,\"due\":null,\"status\":\"backlog\",\"title\":\"Second task\"},\"expected_revision\":\"rev-9\",\"row_key\":\"row-2\",\"task_id\":\"task-2\",\"values\":{\"assignee\":null,\"due\":null,\"status\":\"backlog\",\"title\":\"Second task revised\"}}],\"source_item_id\":\"item-1\"}",
+        "payloadHash": "sha256:4ba179217a1f9d3558475d92eda3ab4738ef952fd1d3e56bad0f730a4e57ad5b",
+        "expectedRevision": null,
+        "taskBatch": {
+          "contract_version": "mcp-next/1",
+          "project_id": "project-demo",
+          "source_item_id": "item-1",
+          "operation_id": "op-1",
+          "rows": [
+            {
+              "task_id": "task-1",
+              "row_key": "row-1",
+              "expected_revision": "rev-3",
+              "baseline": {
+                "title": "Synthetic task",
+                "assignee": null,
+                "status": "backlog",
+                "due": null
+              },
+              "values": {
+                "title": "Synthetic task",
+                "assignee": null,
+                "status": "in_progress",
+                "due": null
+              }
+            },
+            {
+              "task_id": "task-2",
+              "row_key": "row-2",
+              "expected_revision": "rev-9",
+              "baseline": {
+                "title": "Second task",
+                "assignee": null,
+                "status": "backlog",
+                "due": null
+              },
+              "values": {
+                "title": "Second task revised",
+                "assignee": null,
+                "status": "backlog",
+                "due": null
+              }
+            }
+          ]
+        }
       }
     },
     {
@@ -402,6 +542,93 @@
       "value": {
         "operationId": "op-1",
         "projectId": "project-demo"
+      }
+    },
+    {
+      "name": "multi-task-plan-distinct-revisions",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/PlanItem",
+      "value": {
+        "itemId": "item-1",
+        "path": "3-log/tasks.md",
+        "contentHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "payloadHash": "sha256:4ba179217a1f9d3558475d92eda3ab4738ef952fd1d3e56bad0f730a4e57ad5b",
+        "kind": "task",
+        "access": "team",
+        "expectedRevision": null,
+        "taskBatch": {
+          "contract_version": "mcp-next/1",
+          "project_id": "project-demo",
+          "source_item_id": "item-1",
+          "operation_id": "op-1",
+          "rows": [
+            {
+              "task_id": "task-1",
+              "row_key": "row-1",
+              "expected_revision": "rev-3",
+              "baseline": {
+                "title": "Synthetic task",
+                "assignee": null,
+                "status": "backlog",
+                "due": null
+              },
+              "values": {
+                "title": "Synthetic task",
+                "assignee": null,
+                "status": "in_progress",
+                "due": null
+              }
+            },
+            {
+              "task_id": "task-2",
+              "row_key": "row-2",
+              "expected_revision": "rev-9",
+              "baseline": {
+                "title": "Second task",
+                "assignee": null,
+                "status": "backlog",
+                "due": null
+              },
+              "values": {
+                "title": "Second task revised",
+                "assignee": null,
+                "status": "backlog",
+                "due": null
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "task-receipt-partially-applied-conflict",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/Receipt",
+      "value": {
+        "itemId": "item-1",
+        "kind": "task",
+        "state": "conflict",
+        "operationId": "op-1",
+        "actionId": null,
+        "entityId": "item-1",
+        "revision": null,
+        "auditRef": "audit-1",
+        "retryable": false,
+        "errorCode": "STALE_REVISION",
+        "taskResult": {
+          "applied": [
+            {
+              "task_id": "task-1",
+              "revision": "rev-4"
+            }
+          ],
+          "conflicts": [
+            {
+              "task_id": "task-2",
+              "revision": "rev-10",
+              "origin": "workspace",
+              "code": "stale_revision"
+            }
+          ]
+        }
       }
     }
   ],
@@ -702,10 +929,52 @@
             "itemId": "item-1",
             "path": "2-work/draft.md",
             "contentHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-            "payloadHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "payloadHash": "sha256:4ba179217a1f9d3558475d92eda3ab4738ef952fd1d3e56bad0f730a4e57ad5b",
             "kind": "task",
             "access": "admin",
-            "expectedRevision": "rev-3"
+            "expectedRevision": null,
+            "taskBatch": {
+              "contract_version": "mcp-next/1",
+              "project_id": "project-demo",
+              "source_item_id": "item-1",
+              "operation_id": "op-1",
+              "rows": [
+                {
+                  "task_id": "task-1",
+                  "row_key": "row-1",
+                  "expected_revision": "rev-3",
+                  "baseline": {
+                    "title": "Synthetic task",
+                    "assignee": null,
+                    "status": "backlog",
+                    "due": null
+                  },
+                  "values": {
+                    "title": "Synthetic task",
+                    "assignee": null,
+                    "status": "in_progress",
+                    "due": null
+                  }
+                },
+                {
+                  "task_id": "task-2",
+                  "row_key": "row-2",
+                  "expected_revision": "rev-9",
+                  "baseline": {
+                    "title": "Second task",
+                    "assignee": null,
+                    "status": "backlog",
+                    "due": null
+                  },
+                  "values": {
+                    "title": "Second task revised",
+                    "assignee": null,
+                    "status": "backlog",
+                    "due": null
+                  }
+                }
+              ]
+            }
           }
         ]
       }
@@ -719,10 +988,52 @@
         "itemId": "item-1",
         "kind": "task",
         "access": "team",
-        "payloadJson": "{\"row_key\":\"task-demo\",\"title\":\"Synthetic task\"}",
-        "payloadHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "payloadJson": "{\"contract_version\":\"mcp-next/1\",\"operation_id\":\"op-1\",\"project_id\":\"project-demo\",\"rows\":[{\"baseline\":{\"assignee\":null,\"due\":null,\"status\":\"backlog\",\"title\":\"Synthetic task\"},\"expected_revision\":\"rev-3\",\"row_key\":\"row-1\",\"task_id\":\"task-1\",\"values\":{\"assignee\":null,\"due\":null,\"status\":\"in_progress\",\"title\":\"Synthetic task\"}},{\"baseline\":{\"assignee\":null,\"due\":null,\"status\":\"backlog\",\"title\":\"Second task\"},\"expected_revision\":\"rev-9\",\"row_key\":\"row-2\",\"task_id\":\"task-2\",\"values\":{\"assignee\":null,\"due\":null,\"status\":\"backlog\",\"title\":\"Second task revised\"}}],\"source_item_id\":\"item-1\"}",
+        "payloadHash": "sha256:4ba179217a1f9d3558475d92eda3ab4738ef952fd1d3e56bad0f730a4e57ad5b",
         "expectedRevision": null,
-        "actorId": "other"
+        "actorId": "other",
+        "taskBatch": {
+          "contract_version": "mcp-next/1",
+          "project_id": "project-demo",
+          "source_item_id": "item-1",
+          "operation_id": "op-1",
+          "rows": [
+            {
+              "task_id": "task-1",
+              "row_key": "row-1",
+              "expected_revision": "rev-3",
+              "baseline": {
+                "title": "Synthetic task",
+                "assignee": null,
+                "status": "backlog",
+                "due": null
+              },
+              "values": {
+                "title": "Synthetic task",
+                "assignee": null,
+                "status": "in_progress",
+                "due": null
+              }
+            },
+            {
+              "task_id": "task-2",
+              "row_key": "row-2",
+              "expected_revision": "rev-9",
+              "baseline": {
+                "title": "Second task",
+                "assignee": null,
+                "status": "backlog",
+                "due": null
+              },
+              "values": {
+                "title": "Second task revised",
+                "assignee": null,
+                "status": "backlog",
+                "due": null
+              }
+            }
+          ]
+        }
       }
     },
     {
@@ -734,9 +1045,259 @@
         "itemId": "item-1",
         "kind": "task",
         "access": "admin",
-        "payloadJson": "{\"row_key\":\"task-demo\",\"title\":\"Synthetic task\"}",
-        "payloadHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-        "expectedRevision": null
+        "payloadJson": "{\"contract_version\":\"mcp-next/1\",\"operation_id\":\"op-1\",\"project_id\":\"project-demo\",\"rows\":[{\"baseline\":{\"assignee\":null,\"due\":null,\"status\":\"backlog\",\"title\":\"Synthetic task\"},\"expected_revision\":\"rev-3\",\"row_key\":\"row-1\",\"task_id\":\"task-1\",\"values\":{\"assignee\":null,\"due\":null,\"status\":\"in_progress\",\"title\":\"Synthetic task\"}},{\"baseline\":{\"assignee\":null,\"due\":null,\"status\":\"backlog\",\"title\":\"Second task\"},\"expected_revision\":\"rev-9\",\"row_key\":\"row-2\",\"task_id\":\"task-2\",\"values\":{\"assignee\":null,\"due\":null,\"status\":\"backlog\",\"title\":\"Second task revised\"}}],\"source_item_id\":\"item-1\"}",
+        "payloadHash": "sha256:4ba179217a1f9d3558475d92eda3ab4738ef952fd1d3e56bad0f730a4e57ad5b",
+        "expectedRevision": null,
+        "taskBatch": {
+          "contract_version": "mcp-next/1",
+          "project_id": "project-demo",
+          "source_item_id": "item-1",
+          "operation_id": "op-1",
+          "rows": [
+            {
+              "task_id": "task-1",
+              "row_key": "row-1",
+              "expected_revision": "rev-3",
+              "baseline": {
+                "title": "Synthetic task",
+                "assignee": null,
+                "status": "backlog",
+                "due": null
+              },
+              "values": {
+                "title": "Synthetic task",
+                "assignee": null,
+                "status": "in_progress",
+                "due": null
+              }
+            },
+            {
+              "task_id": "task-2",
+              "row_key": "row-2",
+              "expected_revision": "rev-9",
+              "baseline": {
+                "title": "Second task",
+                "assignee": null,
+                "status": "backlog",
+                "due": null
+              },
+              "values": {
+                "title": "Second task revised",
+                "assignee": null,
+                "status": "backlog",
+                "due": null
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "task-plan-missing-row-baseline",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/PlanItem",
+      "value": {
+        "itemId": "item-1",
+        "path": "3-log/tasks.md",
+        "contentHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "payloadHash": "sha256:0fb292fa3e8e05192fd40181155973fa659946bb4816e1607db6b360790234ec",
+        "kind": "task",
+        "access": "team",
+        "expectedRevision": null,
+        "taskBatch": {
+          "contract_version": "mcp-next/1",
+          "project_id": "project-demo",
+          "source_item_id": "item-1",
+          "operation_id": "op-1",
+          "rows": [
+            {
+              "task_id": "task-1",
+              "row_key": "row-1",
+              "expected_revision": "rev-3",
+              "baseline": {
+                "title": "Synthetic task",
+                "assignee": null,
+                "status": "backlog",
+                "due": null
+              },
+              "values": {
+                "title": "Synthetic task",
+                "assignee": null,
+                "status": "in_progress",
+                "due": null
+              }
+            },
+            {
+              "task_id": "task-2",
+              "row_key": "row-2",
+              "expected_revision": "rev-9",
+              "values": {
+                "title": "Second task revised",
+                "assignee": null,
+                "status": "backlog",
+                "due": null
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "task-plan-document-revision-forbidden",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/PlanItem",
+      "value": {
+        "itemId": "item-1",
+        "path": "3-log/tasks.md",
+        "contentHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "payloadHash": "sha256:4ba179217a1f9d3558475d92eda3ab4738ef952fd1d3e56bad0f730a4e57ad5b",
+        "kind": "task",
+        "access": "team",
+        "expectedRevision": "one-revision-for-two-tasks",
+        "taskBatch": {
+          "contract_version": "mcp-next/1",
+          "project_id": "project-demo",
+          "source_item_id": "item-1",
+          "operation_id": "op-1",
+          "rows": [
+            {
+              "task_id": "task-1",
+              "row_key": "row-1",
+              "expected_revision": "rev-3",
+              "baseline": {
+                "title": "Synthetic task",
+                "assignee": null,
+                "status": "backlog",
+                "due": null
+              },
+              "values": {
+                "title": "Synthetic task",
+                "assignee": null,
+                "status": "in_progress",
+                "due": null
+              }
+            },
+            {
+              "task_id": "task-2",
+              "row_key": "row-2",
+              "expected_revision": "rev-9",
+              "baseline": {
+                "title": "Second task",
+                "assignee": null,
+                "status": "backlog",
+                "due": null
+              },
+              "values": {
+                "title": "Second task revised",
+                "assignee": null,
+                "status": "backlog",
+                "due": null
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "task-success-with-conflicting-row",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/Receipt",
+      "value": {
+        "itemId": "item-1",
+        "kind": "task",
+        "state": "succeeded",
+        "operationId": "op-1",
+        "actionId": null,
+        "entityId": "item-1",
+        "revision": null,
+        "auditRef": "audit-1",
+        "retryable": false,
+        "errorCode": "STALE_REVISION",
+        "taskResult": {
+          "applied": [
+            {
+              "task_id": "task-1",
+              "revision": "rev-4"
+            }
+          ],
+          "conflicts": [
+            {
+              "task_id": "task-2",
+              "revision": "rev-10",
+              "origin": "workspace",
+              "code": "stale_revision"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "task-success-without-result",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/Receipt",
+      "value": {
+        "itemId": "item-1",
+        "kind": "task",
+        "state": "succeeded",
+        "operationId": "op-1",
+        "actionId": null,
+        "entityId": "item-1",
+        "revision": null,
+        "auditRef": "audit-1",
+        "retryable": false,
+        "errorCode": "STALE_REVISION",
+        "taskResult": null
+      }
+    },
+    {
+      "name": "publish-task-missing-row-revision",
+      "schema": "urn:aios:mcp-next:1:workspace#/definitions/PublishItemInput",
+      "value": {
+        "operationId": "op-1",
+        "projectId": "project-demo",
+        "itemId": "item-1",
+        "kind": "task",
+        "access": "team",
+        "payloadJson": "{\"contract_version\":\"mcp-next/1\",\"operation_id\":\"op-1\",\"project_id\":\"project-demo\",\"rows\":[{\"baseline\":{\"assignee\":null,\"due\":null,\"status\":\"backlog\",\"title\":\"Synthetic task\"},\"expected_revision\":\"rev-3\",\"row_key\":\"row-1\",\"task_id\":\"task-1\",\"values\":{\"assignee\":null,\"due\":null,\"status\":\"in_progress\",\"title\":\"Synthetic task\"}},{\"baseline\":{\"assignee\":null,\"due\":null,\"status\":\"backlog\",\"title\":\"Second task\"},\"row_key\":\"row-2\",\"task_id\":\"task-2\",\"values\":{\"assignee\":null,\"due\":null,\"status\":\"backlog\",\"title\":\"Second task revised\"}}],\"source_item_id\":\"item-1\"}",
+        "payloadHash": "sha256:dec1baa4412a90b4b9b0e96e716f8bbe860e70f7af7754bdf322139d7d9d6bb6",
+        "expectedRevision": null,
+        "taskBatch": {
+          "contract_version": "mcp-next/1",
+          "project_id": "project-demo",
+          "source_item_id": "item-1",
+          "operation_id": "op-1",
+          "rows": [
+            {
+              "task_id": "task-1",
+              "row_key": "row-1",
+              "expected_revision": "rev-3",
+              "baseline": {
+                "title": "Synthetic task",
+                "assignee": null,
+                "status": "backlog",
+                "due": null
+              },
+              "values": {
+                "title": "Synthetic task",
+                "assignee": null,
+                "status": "in_progress",
+                "due": null
+              }
+            },
+            {
+              "task_id": "task-2",
+              "row_key": "row-2",
+              "baseline": {
+                "title": "Second task",
+                "assignee": null,
+                "status": "backlog",
+                "due": null
+              },
+              "values": {
+                "title": "Second task revised",
+                "assignee": null,
+                "status": "backlog",
+                "due": null
+              }
+            }
+          ]
+        }
       }
     }
   ],
