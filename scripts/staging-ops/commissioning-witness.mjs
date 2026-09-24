@@ -310,8 +310,8 @@ export function projectGovernedRuleset(ruleset, allowed) {
   const projectedRules = rules.map((rule) => {
     if (!rule || typeof rule !== "object" || Array.isArray(rule)) refuse(`ruleset ${name} carries a rule that is not an object`);
     const type = String(rule.type ?? "");
+    if (!Object.hasOwn(GOVERNED_RULE_PARAMETERS, type)) refuse(`ruleset ${name} carries the ungoverned rule type ${JSON.stringify(type)}`);
     const schema = GOVERNED_RULE_PARAMETERS[type];
-    if (!schema) refuse(`ruleset ${name} carries the ungoverned rule type ${JSON.stringify(type)}`);
     const ruleKeys = Object.keys(rule).sort();
     if (ruleKeys.some((key) => !["type", "parameters"].includes(key))) refuse(`ruleset ${name}'s ${type} rule carries an ungoverned field`);
     if (rule.parameters === undefined || rule.parameters === null) return { type };
@@ -319,8 +319,8 @@ export function projectGovernedRuleset(ruleset, allowed) {
     if (typeof parameters !== "object" || Array.isArray(parameters)) refuse(`ruleset ${name}'s ${type} rule carries non-object parameters`);
     const projected = {};
     for (const [key, value] of Object.entries(parameters)) {
+      if (!Object.hasOwn(schema, key)) refuse(`ruleset ${name}'s ${type} rule carries the ungoverned parameter ${JSON.stringify(key)}`);
       const kind = schema[key];
-      if (!kind) refuse(`ruleset ${name}'s ${type} rule carries the ungoverned parameter ${JSON.stringify(key)}`);
       if (kind === "boolean") {
         if (typeof value !== "boolean") refuse(`ruleset ${name}'s ${type}.${key} is not a boolean`);
         projected[key] = value;

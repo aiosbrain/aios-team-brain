@@ -5596,6 +5596,73 @@ describe("correction pass 4 — the actual publisher reads the authenticated int
     expect(bytes, "the full publisher job wrote witness bytes").toBeNull();
   });
 
+  it("publication boundary refuses inherited rule and parameter names through both public paths", async () => {
+    const originalRun = {
+      id: Number(RUN_ID), path: COMMISSIONING_WORKFLOW_PATH, event: "workflow_dispatch",
+      head_sha: WORKFLOW_SHA, head_branch: "staging", run_attempt: Number(ATTEMPT),
+      actor: OWNER_IDENTITY, triggering_actor: OWNER_IDENTITY,
+    };
+    const expected = {
+      repository: COMMISSIONING_REPOSITORY, workflowPath: COMMISSIONING_WORKFLOW_PATH,
+      sourceSha: WORKFLOW_SHA, dispatchBranch: "staging", binding: WITNESS_BINDING,
+    };
+    const assertHelperRefuses = (response: Record<string, unknown>) => {
+      let wrote = false;
+      expect(() => publishWitnessResponse({
+        response, envelope: JSON.stringify(response), publisherRunId: PUBLISHER_RUN, originalRun,
+        expected, allowed: plannedVocabulary(), writeEntry: () => { wrote = true; return "unreachable"; },
+      })).toThrow(/ungoverned rule type|ungoverned parameter/);
+      expect(wrote, "the public helper wrote a prototype-key mutation").toBe(false);
+    };
+
+    for (const inherited of ["toString", "constructor", "__proto__", "valueOf", "hasOwnProperty"]) {
+      const response = publisherResponse();
+      const observation = responseObservation(response);
+      const governed = responseRulesets(response)[0].governed as Record<string, unknown>;
+      governed.rules = [{ type: inherited }];
+      withDigest(observation);
+      assertHelperRefuses(response);
+
+      const { outcome, bytes } = await publish(soundObservation(), { mutateResponse: (candidate) => {
+        const candidateObservation = responseObservation(candidate);
+        const candidateGoverned = responseRulesets(candidate)[0].governed as Record<string, unknown>;
+        candidateGoverned.rules = [{ type: inherited }];
+        withDigest(candidateObservation);
+      }});
+      expect(outcome.ok, `the full publisher job accepted inherited rule type ${inherited}`).toBe(false);
+      expect(bytes, `the full publisher job wrote inherited rule type ${inherited}`).toBeNull();
+    }
+
+    for (const inherited of ["toString", "constructor", "__proto__", "valueOf", "hasOwnProperty"]) {
+      const response = publisherResponse();
+      const observation = responseObservation(response);
+      const governed = responseRulesets(response)[0].governed as Record<string, unknown>;
+      governed.rules = [{ type: "update", parameters: { [inherited]: true } }];
+      withDigest(observation);
+      assertHelperRefuses(response);
+
+      const { outcome, bytes } = await publish(soundObservation(), { mutateResponse: (candidate) => {
+        const candidateObservation = responseObservation(candidate);
+        const candidateGoverned = responseRulesets(candidate)[0].governed as Record<string, unknown>;
+        candidateGoverned.rules = [{ type: "update", parameters: { [inherited]: true } }];
+        withDigest(candidateObservation);
+      }});
+      expect(outcome.ok, `the full publisher job accepted inherited parameter ${inherited}`).toBe(false);
+      expect(bytes, `the full publisher job wrote inherited parameter ${inherited}`).toBeNull();
+    }
+
+    const control = publisherResponse();
+    let helperWrites = 0;
+    expect(publishWitnessResponse({
+      response: control, envelope: JSON.stringify(control), publisherRunId: PUBLISHER_RUN, originalRun,
+      expected, allowed: plannedVocabulary(), writeEntry: () => { helperWrites += 1; return "/tmp/witness.json"; },
+    }).status).toBe("published");
+    expect(helperWrites).toBe(1);
+    const fullControl = await publish(soundObservation());
+    expect(fullControl.outcome.ok ? fullControl.outcome.value.status : fullControl.outcome.error.message).toBe("published");
+    expect(fullControl.bytes).not.toBeNull();
+  });
+
   it("P2 · an UNAPPROVED source identity is refused", async () => {
     const observation = soundObservation() as Record<string, unknown>;
     observation.source_identities = ["SYNTHETIC-UNAPPROVED-SOURCE"];
