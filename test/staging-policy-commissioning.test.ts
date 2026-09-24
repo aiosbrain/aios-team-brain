@@ -14,7 +14,7 @@ import {
   ROLE_APP_PERMISSIONS, ROLE_BINDINGS,
   assertAllowedRequest, assertCasePrecondition, assertDerivedRef, assertManifestBinding,
   assertChallengeShape, assertObservationProximity, assertPublisherArtifactProvenance,
-  assertPublisherContext, assertResponseBinding, assertRoleBinding, assertRunContext, assessEvidence,
+  assertPublisherContext, assertResponseBinding, assertResponseShape, assertRoleBinding, assertRunContext, assessEvidence,
   awaitManifestFromRef, buildChallenge, buildGovernedSnapshot, buildResponse, buildActorMatrix,
   buildGraphPlan, openWitnessSession, publishWitnessResponse, readWitnessEnvelopeFromEvent,
   serializeDispatchEnvelope, validateGovernedSnapshot,
@@ -3476,7 +3476,7 @@ describe("correction pass 2 — F1: the local witness transport and its refusals
       witness_identity: { login: OWNER_LOGIN, user_id: OWNER_USER_ID, type: "User" },
       observation: validObservation(),
     };
-    const response = { ...small, observation: validObservation({}, 400) };
+    const response = { ...small, observation: validObservation({ applicability_pages: 10 }, 400) };
     expect(() => serializeDispatchEnvelope({ response })).toThrow(/beyond this harness's 60000-byte bound/);
     const envelope = serializeDispatchEnvelope({ response: small });
     expect(envelope.bytes).toBeLessThan(60_000);
@@ -3502,16 +3502,28 @@ describe("correction pass 2 — F1: the local witness transport and its refusals
     // Challenge BYTES this job never published.
     expect(() => assertResponseBinding({ ...response, challenge_digest: "0".repeat(64) }, { challenge, challengeDigest: digest, expectedBinding: binding, receivedAt: created }))
       .toThrow(/answers challenge bytes this job did not publish/);
-    // Every binding field, one at a time.
-    for (const [field, value] of [
-      ["case_id", "normal-delete"], ["direction", "post"], ["role", "emergency"],
-      ["source_sha", sha("moved")], ["original_attempt", "9"], ["intended_app_id", EMERGENCY_APP],
-      ["manifest_sha256", "9".repeat(64)], ["graph_sha256", "9".repeat(64)], ["job_id", "emergency"],
-      ["source_mode", "transport-rehearsal"], ["domain", "rehearsal"],
-    ] as [string, unknown][]) {
-      expect(() => assertResponseBinding({ ...response, [field]: value }, { challenge, challengeDigest: digest, expectedBinding: binding, receivedAt: created }), field)
-        .toThrow(new RegExp(`response's ${field} is not the value this job derived`));
+    // Every alternative remains internally shape-valid, so this exercises challenge binding rather
+    // than passing because a dependent fixed field was left inconsistent.
+    for (const [label, mutate] of [
+      ["case", (value: Record<string, unknown>) => ({ ...value, case_id: "normal-delete", case_ordinal: 7 })],
+      ["direction", (value: Record<string, unknown>) => ({ ...value, direction: "post" })],
+      ["role", (value: Record<string, unknown>) => ({
+        ...value, role: "emergency", job_id: "emergency", case_id: "emergency-update-no-checks",
+        case_ordinal: 1, target_ref: derivedRef(RUN_ID, ATTEMPT, "emergency"), intended_app_id: EMERGENCY_APP,
+      })],
+      ["source", (value: Record<string, unknown>) => ({ ...value, source_sha: sha("moved") })],
+      ["attempt", (value: Record<string, unknown>) => ({ ...value, original_attempt: "9", target_ref: derivedRef(RUN_ID, "9", "normal") })],
+      ["App", (value: Record<string, unknown>) => ({ ...value, intended_app_id: EMERGENCY_APP })],
+      ["manifest", (value: Record<string, unknown>) => ({ ...value, manifest_sha256: "9".repeat(64) })],
+      ["graph", (value: Record<string, unknown>) => ({ ...value, graph_sha256: "9".repeat(64) })],
+    ] as [string, (value: Record<string, unknown>) => Record<string, unknown>][]) {
+      expect(() => assertResponseBinding(mutate(response), { challenge, challengeDigest: digest, expectedBinding: binding, receivedAt: created }), label)
+        .toThrow(/not the value this job derived/);
     }
+    // Role/job/mode/domain combinations outside the fixed table are shape failures in their own right.
+    expect(() => assertResponseShape({ ...response, job_id: "emergency" })).toThrow(/fixed job/);
+    expect(() => assertResponseShape({ ...response, source_mode: "transport-rehearsal" })).toThrow(/commission mode/);
+    expect(() => assertResponseShape({ ...response, domain: "rehearsal" })).toThrow(/rehearsal response/);
     // CLOCK ORDER: a response created before the challenge it answers is impossible, and impossible
     // is a refusal rather than a tolerance to widen. No positive skew allowance exists.
     // ONE invariant: the response is created before the challenge, and its observation moves with
@@ -3545,11 +3557,13 @@ describe("correction pass 2 — F1: the local witness transport and its refusals
     // An observation that COMPLETED after the response reporting it was created (shape half).
     expect(() => assertResponseBinding({ ...response, observation: validObservation({ started_at: created, completed_at: "2026-09-10T09:00:00.001Z", span_ms: 1 }) }, { ...receipt, receivedAt: "2026-09-10T09:00:01.000Z" }))
       .toThrow(/completed after the response reporting it was created/);
-    // A CHANGED echoed expiry — later, earlier, or merely re-spelled — is some other challenge's lifetime.
-    for (const echoed of ["2026-09-10T09:03:00.001Z", "2026-09-10T09:02:59.999Z", "2026-09-10T10:03:00.000+01:00"]) {
+    // A CHANGED canonical echoed expiry is some other challenge's lifetime.
+    for (const echoed of ["2026-09-10T09:03:00.001Z", "2026-09-10T09:02:59.999Z"]) {
       expect(() => assertResponseBinding({ ...response, challenge_expires_at: echoed }, { ...receipt, receivedAt: created }), echoed)
         .toThrow(/echoes a challenge expiry that is not the exact expiry/);
     }
+    expect(() => assertResponseShape({ ...response, challenge_expires_at: "2026-09-10T10:03:00.000+01:00" }))
+      .toThrow(/canonical challenge expiry/);
     // The boundaries themselves are inclusive: every instant equal is a valid, if tight, ordering.
     expect(assertResponseBinding(response, { ...receipt, receivedAt: String(challenge.expires_at) })).toBe(true);
     expect(() => assertResponseBinding(response, { ...receipt, receivedAt: new Date(Date.parse(String(challenge.expires_at)) + 1).toISOString() }))
@@ -3646,7 +3660,7 @@ describe("correction pass 2 — F1: the local witness transport and its refusals
     };
     const publisherExpected = {
       repository: COMMISSIONING_REPOSITORY, workflowPath: COMMISSIONING_WORKFLOW_PATH,
-      sourceSha: WORKFLOW_SHA, dispatchBranch: "staging",
+      sourceSha: WORKFLOW_SHA, dispatchBranch: "staging", binding: WITNESS_BINDING,
     };
     const result = publishWitnessResponse({
       response: ok, envelope, publisherRunId: "77001", originalRun, expected: publisherExpected,
@@ -3901,6 +3915,8 @@ describe("correction pass 2 — F1: the local witness transport and its refusals
     expect(challenge.manifest_sha256).toBeNull();
     expect(challenge.graph_sha256).toBeNull();
     github.addArtifact(challengeName, `${challengeName}.json`, bytes, 88001);
+    let clockMs = Date.parse(challenge.created_at) + 1_000;
+    const advancingNow = () => new Date(clockMs++);
     // The local witness serves it with an INERT observation: no policy read at all.
     const witnessSession = await openWitnessSession({
       runId: "88001", attempt: "1", evidenceDir, env: LOCAL_ENV,
@@ -3912,17 +3928,24 @@ describe("correction pass 2 — F1: the local witness transport and its refusals
         request: witnessSession.request, requestArchive: witnessSession.requestArchive, ctx: witnessSession.ctx,
         journal: witnessSession.journal, item: { role: "rehearsal", caseId: "transport-rehearsal", ordinal: 0, direction: "pre" },
         operator: witnessSession.operator, domain: "rehearsal", setupBindings: witnessSession.setupBindings,
-        now: () => new Date(), sleep: async () => {}, intervalMs: 1,
+        now: advancingNow, sleep: async () => {}, intervalMs: 1,
       });
     } finally { witnessSession.lock.release(); }
-    const consumed = await runRehearsalStage({ stage: "consume", env: rehearsalEnv, deps });
+    const consumed = await runRehearsalStage({ stage: "consume", env: rehearsalEnv, deps: { ...deps, now: advancingNow } });
     expect(consumed.status).toBe("rehearsed");
     expect(consumed.note).toMatch(/NO enforcement verdict, NO policy measurement and NO actor authority/);
     expect(consumed.domain).toBe("rehearsal");
     // The rehearsal's response is an INERT observation, so no actor could reason about it as policy.
     const response = JSON.parse(readSingleEntryZip([...github.artifacts.values()].find((a) => a.name.startsWith("commissioning-witness-88001"))!.zip).bytes.toString("utf8"));
     expect(response.observation.inert).toBe(true);
+    expect(response.observation.started_at).toBe(response.observation.completed_at);
+    expect(response.observation.span_ms).toBe(0);
     expect(response.observation.governed_rulesets).toBeUndefined();
+    const mismatched = structuredClone(response);
+    mismatched.observation.completed_at = new Date(Date.parse(mismatched.observation.started_at) + 1).toISOString();
+    mismatched.created_at = mismatched.observation.completed_at;
+    expect(() => assertResponseShape(mismatched, { domain: "rehearsal" }))
+      .toThrow(/span does not describe its own measurement window/);
     expect(() => validateGovernedSnapshot(response.observation, {
       rulesetNames: new Set(), refPatterns: new Set(), contexts: new Set(),
       producerIds: new Set(), bypassAppIds: new Set(), sources: new Set(),
@@ -5461,23 +5484,44 @@ describe("correction pass 4 — the actual publisher reads the authenticated int
     ? { status: 200, bytes, diagnostic: { status: 200, category: "ok", ruleIds: [], policyDenial: false } }
     : { status: 404, bytes: null, diagnostic: { status: 404, category: "not-found", ruleIds: [], policyDenial: false } });
 
-  /** Run the ACTUAL publisher job over one observation, with one intent, and see what it writes. */
-  async function publish(observation: Record<string, unknown>, options: {
-    intent?: Record<string, unknown> | null;
-    transport?: ReturnType<typeof publisherTransport>;
-  } = {}) {
-    const intent = options.intent === undefined ? await genuineIntent() : options.intent;
-    const dir = mkdtempSync(path.join(tmpdir(), "aio1124-pub-"));
-    created.push(dir);
+  /** A closed observation with its real governed digest, suitable as a one-mutation baseline. */
+  const soundObservation = () => {
+    const observation = validObservation() as Record<string, unknown>;
+    const rulesets = observation.governed_rulesets as { governed: unknown }[];
+    observation.projected_governed_digest = canonicalHash(rulesets.map((entry) => entry.governed));
+    return observation;
+  };
+
+  const publisherResponse = () => {
     const challenge = buildChallenge({
       binding: WITNESS_BINDING, nonce: "d".repeat(64), createdAt: "2026-09-10T09:00:00.000Z",
       extra: { before_sha: "1".repeat(40), requested_sha: "2".repeat(40) },
     });
-    const response = buildResponse({
-      challenge, challengeDigest: "f".repeat(64), observation,
+    return buildResponse({
+      challenge, challengeDigest: "f".repeat(64), observation: soundObservation(),
       witnessIdentity: { login: OWNER_LOGIN, user_id: OWNER_USER_ID, type: "User" },
       createdAt: "2026-09-10T09:00:00.000Z",
-    });
+    }) as Record<string, unknown>;
+  };
+
+  const responseObservation = (response: Record<string, unknown>) =>
+    response.observation as Record<string, unknown>;
+
+  const responseRulesets = (response: Record<string, unknown>) =>
+    responseObservation(response).governed_rulesets as Record<string, unknown>[];
+
+  /** Run the ACTUAL publisher job over one observation, with one intent, and see what it writes. */
+  async function publish(observation: Record<string, unknown>, options: {
+    intent?: Record<string, unknown> | null;
+    transport?: ReturnType<typeof publisherTransport>;
+    mutateResponse?: (response: Record<string, unknown>) => void;
+  } = {}) {
+    const intent = options.intent === undefined ? await genuineIntent() : options.intent;
+    const dir = mkdtempSync(path.join(tmpdir(), "aio1124-pub-"));
+    created.push(dir);
+    const response = publisherResponse();
+    response.observation = observation;
+    options.mutateResponse?.(response);
     const eventPath = path.join(dir, "event.json");
     writeFileSync(eventPath, JSON.stringify({ inputs: { mode: "policy-witness", witness_envelope: JSON.stringify(response) } }));
     const env = cloudEnv("policy-witness", {
@@ -5506,7 +5550,6 @@ describe("correction pass 4 — the actual publisher reads the authenticated int
     observation.projected_governed_digest = canonicalHash(rulesets.map((entry) => entry.governed));
     return observation;
   };
-  const soundObservation = () => withDigest(validObservation() as Record<string, unknown>);
 
   it("P1 · an UNKNOWN nested governed field is refused, and no bytes are written", async () => {
     const observation = soundObservation() as Record<string, unknown>;
@@ -5515,6 +5558,42 @@ describe("correction pass 4 — the actual publisher reads the authenticated int
     const { outcome, bytes } = await publish(withDigest(observation));
     expect(outcome.ok, "the publisher published an unknown nested governed field").toBe(false);
     expect(bytes, "bytes reached the artifact").toBeNull();
+  });
+
+  it.each([
+    ["unknown governed wrapper field", (response: Record<string, unknown>) => { responseRulesets(response)[0].private_data = "SYNTHETIC-DISCLOSURE"; }],
+    ["object ruleset identity", (response: Record<string, unknown>) => { responseRulesets(response)[0].id = { marker: "SYNTHETIC-DISCLOSURE" }; }],
+    ["object applicability page count", (response: Record<string, unknown>) => { responseObservation(response).applicability_pages = { marker: "SYNTHETIC-DISCLOSURE" }; }],
+    ["object intended App identity", (response: Record<string, unknown>) => { response.intended_app_id = { marker: "SYNTHETIC-DISCLOSURE" }; }],
+    ["case outside the closed sequence", (response: Record<string, unknown>) => { response.case_id = "arbitrary-case"; }],
+    ["non-digest manifest identity", (response: Record<string, unknown>) => { response.manifest_sha256 = "not-a-digest"; }],
+    ["array challenge nonce scalar", (response: Record<string, unknown>) => { response.challenge_nonce = ["d".repeat(64)]; }],
+    ["array challenge digest scalar", (response: Record<string, unknown>) => { response.challenge_digest = ["f".repeat(64)]; }],
+    ["array raw governed digest scalar", (response: Record<string, unknown>) => { responseObservation(response).raw_governed_digest = ["a".repeat(64)]; }],
+  ] as const)("publication boundary refuses %s through both the public helper and full publisher job", async (_label, mutate) => {
+    const response = publisherResponse();
+    mutate(response);
+    const envelope = JSON.stringify(response);
+    let helperWrote = false;
+    const originalRun = {
+      id: Number(RUN_ID), path: COMMISSIONING_WORKFLOW_PATH, event: "workflow_dispatch",
+      head_sha: WORKFLOW_SHA, head_branch: "staging", run_attempt: Number(ATTEMPT),
+      actor: OWNER_IDENTITY, triggering_actor: OWNER_IDENTITY,
+    };
+    expect(() => publishWitnessResponse({
+      response, envelope, publisherRunId: PUBLISHER_RUN, originalRun,
+      expected: {
+        repository: COMMISSIONING_REPOSITORY, workflowPath: COMMISSIONING_WORKFLOW_PATH,
+        sourceSha: WORKFLOW_SHA, dispatchBranch: "staging", binding: WITNESS_BINDING,
+      },
+      allowed: plannedVocabulary(),
+      writeEntry: () => { helperWrote = true; return "unreachable"; },
+    })).toThrow();
+    expect(helperWrote, "the public helper wrote malformed bytes").toBe(false);
+
+    const { outcome, bytes } = await publish(soundObservation(), { mutateResponse: mutate });
+    expect(outcome.ok, "the full publisher job accepted malformed bytes").toBe(false);
+    expect(bytes, "the full publisher job wrote witness bytes").toBeNull();
   });
 
   it("P2 · an UNAPPROVED source identity is refused", async () => {
