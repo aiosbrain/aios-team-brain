@@ -1,0 +1,1153 @@
+# AIO-1124 — bounded protected-policy commissioning harness (PC-01 … PC-08).
+#
+# This workflow PROVES NOTHING BY ITSELF and PROMOTES NOTHING. It exercises the normal and emergency
+# release App identities against real GitHub ref/ruleset enforcement on DISPOSABLE refs, without
+# exporting their private keys out of `staging-release` / `staging-emergency`. It never touches main,
+# staging, a tag, a Railway deploy or a release acceptance — see `docs/RELEASING.md` for the release
+# path this is a PREREQUISITE for, not a part of.
+#
+# ── THREE CLOSED MODES, AND WHY THE `if:` LINES LOOK LIKE THIS ──────────────────────────────────────
+#
+# `mode` selects which jobs may run AT ALL, and each job states its own admission:
+#
+#   commission          intent + fixture + the two protected actor jobs. The publisher and the
+#                       rehearsal are skipped.
+#   policy-witness      the ONE non-protected publisher job, and nothing else. It republishes a
+#                       bounded witness envelope as a single-entry artifact. No App secret, no
+#                       protected environment, no write scope.
+#   transport-rehearsal the ONE non-protected, no-secrets rehearsal job, and nothing else. Its target
+#                       is the literal `rehearsal`, never a Git ref, and it produces no enforcement
+#                       verdict and no actor authority.
+#
+# Every `if:` compares `inputs.mode` to an EXACT string, so an unknown or empty mode is admitted by no
+# job at all. There is deliberately no `!= 'policy-witness'` anywhere: a negative condition is how an
+# unrecognised mode would fall through into commissioning.
+#
+# WHY EVERY JOB REPEATS THE SAME `if:`. A `needs:` edge propagates a SKIP, but it is not admission
+# control: a job whose needs are satisfied runs under whatever ref/repository created the run. Two of
+# these jobs carry release App private keys, so each states its own admission.
+#
+# ── WHY THE ACTOR JOBS HAVE FIVE STEPS PER CASE ─────────────────────────────────────────────────────
+#
+# `GET /repos/{repo}/rulesets/{id}` returns `bypass_actors` only to a caller with WRITE access to the
+# ruleset, and these jobs hold `metadata: read` by design — so a protected job CANNOT measure the
+# complete policy it is being tested against. The local `johnellison` identity already holds admin and
+# is the only complete-policy measurement authority here, so each case measures the policy through the
+# local witness: the job publishes a challenge, the witness measures and dispatches this same reviewed
+# workflow in `policy-witness` mode, the publisher republishes the response, and the job binds it to
+# its own private nonce before it mutates anything.
+#
+# Only an official Actions step can upload an artifact, which is why the five steps exist and why two
+# of them are `actions/upload-artifact`. The steps are FIXED YAML, generated once and reviewed — there
+# is no case selector, no dynamic matrix and no way to reach `await-and-execute` without the `prepare`
+# that measured its preconditions. `test/guards/staging-policy-commissioning-workflow.test.ts`
+# enumerates every case against `CLOUD_CASE_SEQUENCE` and rejects an omitted, duplicated or reordered
+# stage.
+#
+# ⚠️ The pre/post pair is a BOUNDED CONTEMPORANEOUS measurement under administrative quiescence. It is
+# NOT an atomic policy-at-mutation proof: an undetected transient policy change followed by restoration
+# is outside the guarantee, and root establishes a quiet commissioning window.
+#
+# ── THE EVIDENCE CONTRACT (closed) ──────────────────────────────────────────────────────────────────
+#
+# Each job writes exactly one sanitized JSON file into the shared evidence dir, and its upload step
+# names that file EXACTLY. The names are deliberately NOT retyped here — they are
+# `commissioning-<run_id>-<attempt>-<slug>.json`, produced by `evidenceFileName()` in
+# `scripts/staging-ops/policy-commissioning.mjs`, and the workflow guard suite compares these paths
+# against that function rather than against a second hand-maintained list. A name invented on either
+# side is not cosmetic: with `if-no-files-found: error` it is a red job whose evidence never existed.
+#
+# Challenge artifacts are the one other thing uploaded, and their names are derived on both sides by
+# `challengeArtifactName()`. Nothing else in that directory is uploaded — the local mode-0600 journal
+# and any raw provider body are local-only (PC-07), so a directory or glob path here would be the leak.
+#
+# ── THE TOKEN CONTRACT ──────────────────────────────────────────────────────────────────────────────
+#
+# `checks: write` is the ONLY write grant in the file and belongs to the fixture job alone. The two
+# protected actor jobs' `GITHUB_TOKEN`s are READ-ONLY (`contents: read` + `actions: read`) and used
+# only to read run/commit/artifact metadata — they are never actors in the matrix. The actor in each
+# protected job is the short-lived App installation token minted INSIDE the one step that mutates, from
+# a private key that is passed to that step and to no other. The intent, publisher and rehearsal
+# entrypoints receive no App secret at all. (`actions/checkout` still authenticates its own clone with
+# the default token and drops it via `persist-credentials: false`.)
+name: Release policy commissioning (AIO-1124)
+
+on:
+  workflow_dispatch:
+    inputs:
+      # A CLOSED choice. PC-01 requires that no caller can supply a repo, ref, endpoint, script path,
+      # ruleset ID or resource name, and none of these does: `mode` selects among three reviewed job
+      # sets, and `witness_envelope` is DATA read from the event payload by fixed checked-out code —
+      # never interpolated into a shell command, a script or a logged environment block.
+      mode:
+        description: "Which reviewed job set may run"
+        required: false
+        default: commission
+        type: choice
+        options:
+          - commission
+          - policy-witness
+          - transport-rehearsal
+      witness_envelope:
+        description: "policy-witness mode only: the bounded witness response envelope (JSON)"
+        required: false
+        default: ""
+        type: string
+
+# Read-only default. Only the fixture job widens it, and only to `checks: write`.
+permissions:
+  contents: read
+  actions: read
+
+# Isolated PER MODE, RUN AND ATTEMPT, and never cancelling.
+#
+# The mode is in the group for a specific reason the transport crosscheck names: a protected actor job
+# BLOCKS waiting for a witness publisher run, so a group that could serialise the publisher behind the
+# source run — or cancel the source run — would deadlock the harness against itself. `github.run_id`
+# already differs per run, and including the mode makes that independence explicit rather than
+# incidental. Each attempt also derives a fresh ref/ruleset suffix (PC-03), so two attempts hold
+# disjoint resources and must not queue behind one another.
+concurrency:
+  group: aios-policy-commissioning-${{ inputs.mode }}-${{ github.run_id }}-${{ github.run_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  intent:
+    name: Commissioning intent (credential-free)
+    # Fixed repository, fixed dispatch branch, manual event, EXACT mode. Stated on every job.
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'aiosbrain/aios-team-brain' && github.ref == 'refs/heads/staging' && inputs.mode == 'commission'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      # The TRUSTED IMMUTABLE dispatch SHA, never the moving `staging` ref: the `if` above pins WHERE
+      # the dispatch came from, but checking out the branch NAME would still run whatever landed on it
+      # between dispatch and job start.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      # PC-03: runs FIRST and receives NO credential — no App secret, and no `GITHUB_TOKEN` either. It
+      # publishes the immutable workflow/run/repository identity and the closed set of derived
+      # resource names that local setup re-derives independently. A credential here would make the
+      # first artifact in the chain the least trustworthy.
+      #
+      # It therefore makes NO request. Everything it asserts is platform-injected into this
+      # environment — `GITHUB_REPOSITORY` and `GITHUB_REPOSITORY_ID`, `GITHUB_EVENT_NAME`,
+      # `GITHUB_REF`, `GITHUB_WORKFLOW_REF`, `GITHUB_SHA`, run ID and attempt — and the artifact says
+      # `provider_measured: false` so nobody can read a claim as a measurement. Local `setup`
+      # re-measures every one of those against the provider before it creates anything, and
+      # `check-evidence` refuses a packet in which that re-measurement is missing.
+      - name: Publish credential-free commissioning intent
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+        run: >-
+          node scripts/staging-ops/policy-commissioning.mjs intent
+          --run-id "$GITHUB_RUN_ID"
+          --attempt "$GITHUB_RUN_ATTEMPT"
+          --evidence-dir "$RUNNER_TEMP/policy-commissioning"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: policy-commissioning-intent-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/policy-commissioning/commissioning-${{ github.run_id }}-${{ github.run_attempt }}-intent.json
+          if-no-files-found: error
+          retention-days: 30
+
+  fixture:
+    name: Synthetic check fixture (no App secrets)
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'aiosbrain/aios-team-brain' && github.ref == 'refs/heads/staging' && inputs.mode == 'commission'
+    needs: intent
+    runs-on: ubuntu-latest
+    # Backstop for the helper's bounded local-setup wait: the helper owns the real deadline (25
+    # minutes, inside this one) and refuses rather than hangs, and this stops a stalled poll from
+    # holding the run open. THE CANONICAL JOB BOUND IS 30 MINUTES and every job in this file states
+    # exactly that or less — a job that allowed itself longer than the accepted contract is not a
+    # safety bound, it is a second contract. Asserted against `MAX_JOB_MINUTES`.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      # The ONE write grant in this workflow, and the reason this is a SEPARATE job. It manufactures
+      # TEST-ONLY check names on JOURNALED SYNTHETIC commits, giving the actor matrix a second
+      # independent measured producer (the GitHub Actions app) for its wrong-producer control cases.
+      # It is deliberately NOT enrolled in a protected environment and holds NO App secret: a job
+      # that can mint a check must not also be able to move a ref, and it must be able to run while
+      # `normal` / `emergency` are still parked waiting for a human.
+      checks: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      # A HELPER, not a CLI phase: the phase enum is closed by the spec, so the fixture calls
+      # `runFixtureChecks` directly on a fixed inline module command with no arguments to widen. The
+      # helper guards `GITHUB_JOB=fixture` itself and takes its evidence dir from the environment.
+      - name: Await local setup and mint TEST-ONLY checks on synthetic commits
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          # Carries the `checks: write` above and nothing else.
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+        run: >-
+          node --input-type=module -e 'import { runFixtureChecks } from "./scripts/staging-ops/policy-commissioning.mjs"; await runFixtureChecks(process.env);'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: policy-commissioning-fixture-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/policy-commissioning/commissioning-${{ github.run_id }}-${{ github.run_attempt }}-fixture-checks.json
+          if-no-files-found: error
+          retention-days: 30
+
+  normal:
+    name: Normal App actor tests (protected)
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'aiosbrain/aios-team-brain' && github.ref == 'refs/heads/staging' && inputs.mode == 'commission'
+    # `fixture` is a REAL dependency: the normal App's accepted case requires every exact synthetic
+    # check already green on the target commit, and its missing/red/wrong-producer denials require
+    # those checks in a known state first. It also means this job only enters "waiting for approval"
+    # once local setup has completed — the state PC-03 asks a human to inspect before approving.
+    needs: [intent, fixture]
+    runs-on: ubuntu-latest
+    # THE CANONICAL 30-MINUTE JOB BOUND (F15). Seven cases, each waiting on two witness publications
+    # with a 180-second challenge lifetime, so a run in which EVERY publication took its full
+    # lifetime would not fit — and that is deliberately not concealed by a wider window. Measuring
+    # whether the real queue meets these bounds is what the inert transport rehearsal is for; a job
+    # that overran would report incomplete, which is the honest outcome the canonical asks for.
+    timeout-minutes: 30
+    # Protected: parks until a human reviewer approves. That approval — captured from GitHub's own
+    # review history — IS the PC-06 evidence; nothing here may self-approve.
+    environment: staging-release
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      # The normal App's INSTALLATION-LEVEL positive control, once, before the first case: its
+      # TEST-ONLY check publication (PC-05). Its scope is installation-level within this exact
+      # attempt — it is NOT a per-token positive-write claim, and every denied case below still
+      # requires its own policy diagnostics and an unchanged ref.
+      - name: Establish installation-level positive-write liveness (TEST-ONLY checks)
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: >-
+          node --input-type=module -e 'import { runNormalCheckPublication } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runNormalCheckPublication();'
+      - name: Case 01 normal-update-missing-check — 1/5 prepare and create the pre-nonce challenge
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "prepare", caseId: "normal-update-missing-check" });'
+      - name: Case 01 normal-update-missing-check — 2/5 publish the pre challenge
+        uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-01-pre
+          path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-01-pre.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Case 01 normal-update-missing-check — 3/5 await the pre witness, verify, mutate once, read back
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "await-and-execute", caseId: "normal-update-missing-check" });'
+      - name: Case 01 normal-update-missing-check — 4/5 publish the post challenge
+        uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-01-post
+          path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-01-post.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Case 01 normal-update-missing-check — 5/5 await the post witness and record the case
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "await-and-finalize", caseId: "normal-update-missing-check" });'
+      - name: Case 02 normal-update-failed-check — 1/5 prepare and create the pre-nonce challenge
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "prepare", caseId: "normal-update-failed-check" });'
+      - name: Case 02 normal-update-failed-check — 2/5 publish the pre challenge
+        uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-02-pre
+          path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-02-pre.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Case 02 normal-update-failed-check — 3/5 await the pre witness, verify, mutate once, read back
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "await-and-execute", caseId: "normal-update-failed-check" });'
+      - name: Case 02 normal-update-failed-check — 4/5 publish the post challenge
+        uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-02-post
+          path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-02-post.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Case 02 normal-update-failed-check — 5/5 await the post witness and record the case
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "await-and-finalize", caseId: "normal-update-failed-check" });'
+      - name: Case 03 normal-update-wrong-producer — 1/5 prepare and create the pre-nonce challenge
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "prepare", caseId: "normal-update-wrong-producer" });'
+      - name: Case 03 normal-update-wrong-producer — 2/5 publish the pre challenge
+        uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-03-pre
+          path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-03-pre.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Case 03 normal-update-wrong-producer — 3/5 await the pre witness, verify, mutate once, read back
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "await-and-execute", caseId: "normal-update-wrong-producer" });'
+      - name: Case 03 normal-update-wrong-producer — 4/5 publish the post challenge
+        uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-03-post
+          path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-03-post.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Case 03 normal-update-wrong-producer — 5/5 await the post witness and record the case
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "await-and-finalize", caseId: "normal-update-wrong-producer" });'
+      - name: Case 04 normal-update-all-green — 1/5 prepare and create the pre-nonce challenge
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "prepare", caseId: "normal-update-all-green" });'
+      - name: Case 04 normal-update-all-green — 2/5 publish the pre challenge
+        uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-04-pre
+          path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-04-pre.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Case 04 normal-update-all-green — 3/5 await the pre witness, verify, mutate once, read back
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "await-and-execute", caseId: "normal-update-all-green" });'
+      - name: Case 04 normal-update-all-green — 4/5 publish the post challenge
+        uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-04-post
+          path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-04-post.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Case 04 normal-update-all-green — 5/5 await the post witness and record the case
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "await-and-finalize", caseId: "normal-update-all-green" });'
+      - name: Case 05 normal-force-rewind — 1/5 prepare and create the pre-nonce challenge
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "prepare", caseId: "normal-force-rewind" });'
+      - name: Case 05 normal-force-rewind — 2/5 publish the pre challenge
+        uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-05-pre
+          path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-05-pre.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Case 05 normal-force-rewind — 3/5 await the pre witness, verify, mutate once, read back
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "await-and-execute", caseId: "normal-force-rewind" });'
+      - name: Case 05 normal-force-rewind — 4/5 publish the post challenge
+        uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-05-post
+          path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-05-post.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Case 05 normal-force-rewind — 5/5 await the post witness and record the case
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "await-and-finalize", caseId: "normal-force-rewind" });'
+      - name: Case 06 normal-force-divergent — 1/5 prepare and create the pre-nonce challenge
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "prepare", caseId: "normal-force-divergent" });'
+      - name: Case 06 normal-force-divergent — 2/5 publish the pre challenge
+        uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-06-pre
+          path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-06-pre.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Case 06 normal-force-divergent — 3/5 await the pre witness, verify, mutate once, read back
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "await-and-execute", caseId: "normal-force-divergent" });'
+      - name: Case 06 normal-force-divergent — 4/5 publish the post challenge
+        uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-06-post
+          path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-06-post.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Case 06 normal-force-divergent — 5/5 await the post witness and record the case
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "await-and-finalize", caseId: "normal-force-divergent" });'
+      - name: Case 07 normal-delete — 1/5 prepare and create the pre-nonce challenge
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "prepare", caseId: "normal-delete" });'
+      - name: Case 07 normal-delete — 2/5 publish the pre challenge
+        uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-07-pre
+          path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-07-pre.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Case 07 normal-delete — 3/5 await the pre witness, verify, mutate once, read back
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "await-and-execute", caseId: "normal-delete" });'
+      - name: Case 07 normal-delete — 4/5 publish the post challenge
+        uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-07-post
+          path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-07-post.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Case 07 normal-delete — 5/5 await the post witness and record the case
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "await-and-finalize", caseId: "normal-delete" });'
+      # The FINALIZER. It runs no case: it assembles this job's evidence from the durable per-case
+      # states and succeeds only when every assigned case succeeded. `always()` so a halted matrix
+      # still produces the artifact a reviewer needs in exactly that situation.
+      - name: Assemble the normal actor evidence
+        if: always()
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+        run: >-
+          node scripts/staging-ops/policy-commissioning.mjs normal-tests
+          --run-id "$GITHUB_RUN_ID"
+          --attempt "$GITHUB_RUN_ATTEMPT"
+          --evidence-dir "$RUNNER_TEMP/policy-commissioning"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: policy-commissioning-normal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/policy-commissioning/commissioning-${{ github.run_id }}-${{ github.run_attempt }}-normal-tests.json
+          if-no-files-found: error
+          retention-days: 30
+
+  emergency:
+    name: Emergency App actor tests (protected)
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'aiosbrain/aios-team-brain' && github.ref == 'refs/heads/staging' && inputs.mode == 'commission'
+    # Only `intent`. The emergency case is "fast-forward with checks ABSENT accepted", so it has no
+    # dependency on the fixture's checks, and it targets its own distinct disposable ref (PC-03) so it
+    # cannot race `normal`. Its readiness gate is the human approval below; the runner still
+    # re-verifies the setup readback from trusted run metadata before it acts.
+    needs: intent
+    runs-on: ubuntu-latest
+    # The canonical 30-minute job bound (F15), for the same reason as the normal job above.
+    timeout-minutes: 30
+    environment: staging-emergency
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Case 01 emergency-update-no-checks — 1/5 prepare and create the pre-nonce challenge
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          EMERGENCY_APP_ID: ${{ secrets.EMERGENCY_APP_ID }}
+          EMERGENCY_APP_INSTALLATION_ID: ${{ secrets.EMERGENCY_APP_INSTALLATION_ID }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "prepare", caseId: "emergency-update-no-checks" });'
+      - name: Case 01 emergency-update-no-checks — 2/5 publish the pre challenge
+        uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-01-pre
+          path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-01-pre.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Case 01 emergency-update-no-checks — 3/5 await the pre witness, verify, mutate once, read back
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          EMERGENCY_APP_ID: ${{ secrets.EMERGENCY_APP_ID }}
+          EMERGENCY_APP_INSTALLATION_ID: ${{ secrets.EMERGENCY_APP_INSTALLATION_ID }}
+          EMERGENCY_APP_PRIVATE_KEY: ${{ secrets.EMERGENCY_APP_PRIVATE_KEY }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "await-and-execute", caseId: "emergency-update-no-checks" });'
+      - name: Case 01 emergency-update-no-checks — 4/5 publish the post challenge
+        uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-01-post
+          path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-01-post.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Case 01 emergency-update-no-checks — 5/5 await the post witness and record the case
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          EMERGENCY_APP_ID: ${{ secrets.EMERGENCY_APP_ID }}
+          EMERGENCY_APP_INSTALLATION_ID: ${{ secrets.EMERGENCY_APP_INSTALLATION_ID }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "await-and-finalize", caseId: "emergency-update-no-checks" });'
+      - name: Case 02 emergency-force-rewind — 1/5 prepare and create the pre-nonce challenge
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          EMERGENCY_APP_ID: ${{ secrets.EMERGENCY_APP_ID }}
+          EMERGENCY_APP_INSTALLATION_ID: ${{ secrets.EMERGENCY_APP_INSTALLATION_ID }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "prepare", caseId: "emergency-force-rewind" });'
+      - name: Case 02 emergency-force-rewind — 2/5 publish the pre challenge
+        uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-02-pre
+          path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-02-pre.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Case 02 emergency-force-rewind — 3/5 await the pre witness, verify, mutate once, read back
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          EMERGENCY_APP_ID: ${{ secrets.EMERGENCY_APP_ID }}
+          EMERGENCY_APP_INSTALLATION_ID: ${{ secrets.EMERGENCY_APP_INSTALLATION_ID }}
+          EMERGENCY_APP_PRIVATE_KEY: ${{ secrets.EMERGENCY_APP_PRIVATE_KEY }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "await-and-execute", caseId: "emergency-force-rewind" });'
+      - name: Case 02 emergency-force-rewind — 4/5 publish the post challenge
+        uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-02-post
+          path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-02-post.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Case 02 emergency-force-rewind — 5/5 await the post witness and record the case
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          EMERGENCY_APP_ID: ${{ secrets.EMERGENCY_APP_ID }}
+          EMERGENCY_APP_INSTALLATION_ID: ${{ secrets.EMERGENCY_APP_INSTALLATION_ID }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "await-and-finalize", caseId: "emergency-force-rewind" });'
+      - name: Case 03 emergency-force-divergent — 1/5 prepare and create the pre-nonce challenge
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          EMERGENCY_APP_ID: ${{ secrets.EMERGENCY_APP_ID }}
+          EMERGENCY_APP_INSTALLATION_ID: ${{ secrets.EMERGENCY_APP_INSTALLATION_ID }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "prepare", caseId: "emergency-force-divergent" });'
+      - name: Case 03 emergency-force-divergent — 2/5 publish the pre challenge
+        uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-03-pre
+          path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-03-pre.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Case 03 emergency-force-divergent — 3/5 await the pre witness, verify, mutate once, read back
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          EMERGENCY_APP_ID: ${{ secrets.EMERGENCY_APP_ID }}
+          EMERGENCY_APP_INSTALLATION_ID: ${{ secrets.EMERGENCY_APP_INSTALLATION_ID }}
+          EMERGENCY_APP_PRIVATE_KEY: ${{ secrets.EMERGENCY_APP_PRIVATE_KEY }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "await-and-execute", caseId: "emergency-force-divergent" });'
+      - name: Case 03 emergency-force-divergent — 4/5 publish the post challenge
+        uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-03-post
+          path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-03-post.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Case 03 emergency-force-divergent — 5/5 await the post witness and record the case
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          EMERGENCY_APP_ID: ${{ secrets.EMERGENCY_APP_ID }}
+          EMERGENCY_APP_INSTALLATION_ID: ${{ secrets.EMERGENCY_APP_INSTALLATION_ID }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "await-and-finalize", caseId: "emergency-force-divergent" });'
+      - name: Case 04 emergency-delete — 1/5 prepare and create the pre-nonce challenge
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          EMERGENCY_APP_ID: ${{ secrets.EMERGENCY_APP_ID }}
+          EMERGENCY_APP_INSTALLATION_ID: ${{ secrets.EMERGENCY_APP_INSTALLATION_ID }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "prepare", caseId: "emergency-delete" });'
+      - name: Case 04 emergency-delete — 2/5 publish the pre challenge
+        uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-04-pre
+          path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-04-pre.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Case 04 emergency-delete — 3/5 await the pre witness, verify, mutate once, read back
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          EMERGENCY_APP_ID: ${{ secrets.EMERGENCY_APP_ID }}
+          EMERGENCY_APP_INSTALLATION_ID: ${{ secrets.EMERGENCY_APP_INSTALLATION_ID }}
+          EMERGENCY_APP_PRIVATE_KEY: ${{ secrets.EMERGENCY_APP_PRIVATE_KEY }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "await-and-execute", caseId: "emergency-delete" });'
+      - name: Case 04 emergency-delete — 4/5 publish the post challenge
+        uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-04-post
+          path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-04-post.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Case 04 emergency-delete — 5/5 await the post witness and record the case
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+          EMERGENCY_APP_ID: ${{ secrets.EMERGENCY_APP_ID }}
+          EMERGENCY_APP_INSTALLATION_ID: ${{ secrets.EMERGENCY_APP_INSTALLATION_ID }}
+        run: >-
+          node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runCaseStage({ stage: "await-and-finalize", caseId: "emergency-delete" });'
+      - name: Assemble the emergency actor evidence
+        if: always()
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_NORMAL_INSTALLATION_ID: ${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}
+          COMMISSIONING_EMERGENCY_INSTALLATION_ID: ${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+        run: >-
+          node scripts/staging-ops/policy-commissioning.mjs emergency-tests
+          --run-id "$GITHUB_RUN_ID"
+          --attempt "$GITHUB_RUN_ATTEMPT"
+          --evidence-dir "$RUNNER_TEMP/policy-commissioning"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: policy-commissioning-emergency-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/policy-commissioning/commissioning-${{ github.run_id }}-${{ github.run_attempt }}-emergency-tests.json
+          if-no-files-found: error
+          retention-days: 30
+
+  policy-witness:
+    name: Local policy witness publisher (no secrets)
+    # `policy-witness` mode ONLY, and every other job is skipped in it. This job is the F1 transport's
+    # single hop: it republishes a bounded witness envelope the authenticated local operator dispatched.
+    #
+    # It holds NO App secret, NO protected environment and NO write scope. GitHub authenticates its
+    # ACTOR, the immutable source it ran and the artifact bytes — it does NOT attest that the
+    # measurement inside is true, and the runner's own comment header says so where it matters.
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'aiosbrain/aios-team-brain' && github.ref == 'refs/heads/staging' && inputs.mode == 'policy-witness'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+          cache: npm
+      # No `npm ci`: the publisher uses node built-ins and the repository-approved pinned upload
+      # action only. An install step here would be an unnecessary supply-chain surface in the one job
+      # whose whole purpose is to move bytes it did not compute.
+      - name: Republish the witness envelope as a single-entry artifact
+        id: publish
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+        run: >-
+          node --input-type=module -e 'import { runWitnessPublisherJob } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runWitnessPublisherJob(process.env);'
+      # The artifact NAME is derived by reviewed code from validated envelope fields and handed to
+      # this fixed step as a step output. There is nothing here for a caller to choose, and a name is
+      # never taken from the dispatch input.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.publish.outputs.artifact_name }}
+          path: ${{ runner.temp }}/policy-commissioning/witness/witness.json
+          if-no-files-found: error
+          retention-days: 30
+
+  transport-rehearsal:
+    name: Transport rehearsal (inert, no secrets)
+    # `transport-rehearsal` mode ONLY. This measures the queue, clock and serialization viability of
+    # the witness transport BEFORE any protected approval exists — which is the circularity the
+    # canonical revision resolves by giving the rehearsal its own source mode, its own closed case and
+    # an inert target. Its target is the literal `rehearsal`, never a Git ref; it touches no synthetic
+    # graph, no resource journal and no policy; and every actor consumer rejects its source mode,
+    # domain, case and target before credentials.
+    #
+    # A failed rehearsal does not authorize broader infrastructure or relaxed bounds, and its response
+    # can never satisfy an actor case or contribute to the commissioning publication count.
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'aiosbrain/aios-team-brain' && github.ref == 'refs/heads/staging' && inputs.mode == 'transport-rehearsal'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Rehearsal 1/3 create the inert challenge
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+        run: >-
+          node --input-type=module -e 'import { runRehearsalStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runRehearsalStage({ stage: "challenge" });'
+      - name: Rehearsal 2/3 publish the inert challenge
+        uses: actions/upload-artifact@v4
+        with:
+          name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-rehearsal-00-pre
+          path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-rehearsal-00-pre.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Rehearsal 3/3 consume the inert response
+        env:
+          COMMISSIONING_MODE: ${{ inputs.mode }}
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+        run: >-
+          node --input-type=module -e 'import { runRehearsalStage } from "./scripts/staging-ops/policy-commissioning.mjs";
+          await runRehearsalStage({ stage: "consume" });'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: policy-commissioning-rehearsal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/policy-commissioning/commissioning-${{ github.run_id }}-${{ github.run_attempt }}-transport-rehearsal.json
+          if-no-files-found: error
+          retention-days: 30

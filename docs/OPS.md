@@ -1463,3 +1463,554 @@ for auditing or exposing the currently covered package.
 - **Package-metadata access.** The job token must be able to pull this linked private package and
   enumerate its versions. A failure is an explicit permission prerequisite. **Do not create a PAT,
   broaden scopes, or make the package public to get past it.**
+
+---
+
+## 14. Release-policy commissioning runbook — `release-policy-commissioning.yml` (AIO-1124)
+
+The harness, what it cannot do, and the phase sequence are in `docs/RELEASING.md` §5. This section is
+the operational half: what must exist before a run, what each of the three roles holds, and the two
+places where an honest result is `unverified` rather than a pass.
+
+**⚠️ Commissioning is not activation.** Nothing here promotes `main`, changes `main`/`staging`
+protection, cuts a tag, deploys, restarts a service or accepts a release — and no job in it holds a
+credential that could. The output is one sanitized evidence packet.
+
+**One local file in that packet is PRIVATE and must stay local.**
+`commissioning-<run>-<attempt>-production-inputs.json` is written mode-0600 by `setup` and holds the
+exact twelve-context producer map plus the raw `buildMainRulesets` subject it generates. It exists so
+`check-evidence` can **regenerate** the production subject and its hash instead of comparing the
+packet's own copies of a digest with each other, and its digest is anchored in the resource journal so
+a swapped file refuses on resume. It is not in any upload path, dispatch envelope, published manifest
+or log, and the published intent continues to expose only the producer-map **digest**. Do not attach
+it to a ticket; attach the sanitized packet.
+
+### Prerequisites — all of them, or the run measures nothing
+
+| Prerequisite | Why a run without it is not evidence |
+|---|---|
+| Distinct normal + emergency GitHub Apps, installed on **this repository only** | The runner refuses identical App IDs, and each protected job MEASURES its own App with the App JWT before exercising anything: `GET /app` for the App's declared permissions, `GET /app/installations/<id>` for that installation's granted permissions, `repository_selection` and `suspended_at`. An org-wide, suspended or wrongly-owned installation refuses there. |
+| The exact grants: **normal** = `contents: write`, `checks: write`, `metadata: read`; **emergency** = `contents: write`, `metadata: read` | `ROLE_APP_PERMISSIONS` in the runner is closed BOTH ways — an extra grant, a missing one, and a grant at the wrong level are each a refusal, and all three happen **before the first write**. An over-granted release identity would make an acceptance in the matrix a statement about the grant rather than about the policy. The emergency App must not hold `checks: write`: the identity that can mint a required check must not also be the one whose bypass makes that check irrelevant. |
+| Their keys in `staging-release` / `staging-emergency`, **each in its own environment** | The protected jobs assert they cannot see the counterpart key. Both in one environment is one identity, not two. |
+| John as required reviewer, `prevent_self_review = true`, staging-only branch policy, administrators cannot bypass | These are the PC-06 controls. Read them back in the UI where the API omits the field. |
+| A **distinct dispatcher identity** (the dispatch-only App) | `GITHUB_ACTOR` is the dispatcher and may be a bot. If the dispatcher is also the approver, `check-evidence` reports a **self-review failure** — the run happened, but it is not two-identity evidence. |
+| Repository variables `COMMISSIONING_REPOSITORY_ID`, `COMMISSIONING_NORMAL_APP_ID`, `COMMISSIONING_EMERGENCY_APP_ID`, `COMMISSIONING_PRODUCER_IDS_JSON` | Nonsecret numeric identities. The producer map must be **complete** — all twelve real contexts. A partial map is exit 3; the runner refuses to invent a producer ID. |
+| Repository variables `COMMISSIONING_NORMAL_INSTALLATION_ID`, `COMMISSIONING_EMERGENCY_INSTALLATION_ID` | The **planned** installation identities, and they must be positive and **distinct**. They are nonsecret numeric identifiers, not keys, and they go in the credential-free intent deliberately: without a plan the only available "expectation" was the value the protected job was configured with, and `measureAppGrants` recorded that requested value back as though it had been measured. With the plan, the runner compares the job's configuration to it **before** the credential exchange and the provider's **returned** `installation.id` to it after. Absent values refuse at run time rather than defaulting — provisioning them is an owner prerequisite. |
+| Local `gh` admin identity — **exactly `johnellison`, numeric ID `5806135`, type `User`** | Administers the disposable resources, runs the human/admin cases, and is the **complete-policy measurement authority** for the witness protocol. All three of the ID, the login and the account type are required: a second administrator, or a machine account holding admin, would satisfy an any-admin check while producing evidence about a different identity. It is never uploaded into Actions, and no new long-lived admin token is created. |
+| That same local identity can **dispatch this workflow** | The witness protocol needs it to dispatch `policy-witness` mode. Measure that prerequisite with the separately approved, non-privileged **transport rehearsal** (mode `transport-rehearsal`) — absence is `incomplete`, never grounds for a new grant. |
+| A **quiet commissioning window**: no concurrent policy writer | The pre/post witness pair is a bounded contemporaneous measurement under administrative quiescence, **not** an atomic policy-at-mutation proof. A known concurrent policy writer interrupts the run. |
+| `staging` is the repository's default branch, and the reviewed workflow is merged to it | Dispatch uses the fixed workflow path at ref `staging`. Original dispatch, witness dispatch, publisher execution and response consumption all resolve `staging` and require the **original** trusted workflow SHA; movement interrupts the attempt with cleanup and root reconciliation, rather than continuing against a tree nobody reviewed. |
+| No release in progress | Cleanup asserts the SHAs, classic protections and resolved applicable-ruleset definitions of **both `main` and `staging`**, plus every `v*` tag ruleset, are unchanged. Every list is read to complete pagination and refuses a full final page rather than assuming it was the last. Concurrent legitimate movement is an **interrupted** result needing reconciliation, never an automatic rollback of somebody else's change. |
+
+### The three modes, the three roles, and the three jobs that are not actors
+
+`mode` is a closed dispatch input, and each job is admitted in **exactly one** of its three values by
+an equality condition — so an unknown or empty mode is admitted by no job at all. There is
+deliberately no `!= 'policy-witness'` anywhere: a negative condition is how an unrecognised mode would
+fall through into commissioning.
+
+| Mode | What may run |
+|---|---|
+| `commission` (default) | `intent`, `fixture`, and the two protected actor jobs. |
+| `policy-witness` | The one non-protected `policy-witness` publisher job, alone. |
+| `transport-rehearsal` | The one non-protected, no-secrets `transport-rehearsal` job, alone. |
+
+- **local** — the operator's existing `gh` identity. Creates and removes the disposable graph, refs,
+  rulesets and its one synthetic PR; runs the human/admin cases; owns cleanup and the resource journal;
+  and runs the **witness** process that measures the complete policy for the cloud cases.
+- **normal** — the `staging-release` job. Holds only the three normal-App secrets. Its
+  **installation-level positive control** is its TEST-ONLY check publication, once, before its first
+  case; it is the actor for the missing / red / wrong-producer / all-green cases.
+- **emergency** — the `staging-emergency` job. Holds only its own three secrets. Its acceptance with
+  checks absent is both a case and the installation-level liveness proof for that identity.
+- **fixture** — `checks: write` and **no App secret**. It is the second, independently measured
+  producer (the GitHub Actions app) that makes a wrong-producer control case possible at all. It waits
+  a bounded time for local setup to publish the manifest, then refuses rather than hanging, so its
+  `always()` artifact upload still runs.
+- **policy-witness** — no App secret, no protected environment, no write scope, and no `npm ci`. It
+  republishes the exact bytes of a witness envelope as a single-entry artifact named from a step output
+  that reviewed code derived. It is the only job admitted in its mode, and a re-run of it is refused —
+  a publisher re-run would republish a nonce that is consumed once.
+- **transport-rehearsal** — no App secret, no ref, no synthetic graph, no resource journal and no
+  policy. Its target is the literal `rehearsal` and its domain is `rehearsal`; every actor consumer
+  rejects that source mode, domain, case and target before credentials. It exists to measure the
+  transport's queue, clock and serialization viability **before** any protected approval exists.
+
+> ⚠️ **Installation-level, not per-token.** Positive-write liveness is established once per attempt at
+> the installation level. It is **not** a claim that every later token performed a successful write:
+> each freshly minted token proves its exact intended App, installation, repository, grant set and one
+> successful scoped READ, and every denied case still requires its own policy-enforcement diagnostics
+> and an unchanged ref.
+
+### The witness protocol, and its bounds
+
+Per cloud case, five FIXED workflow steps — the runner owns three, and two are official upload steps
+because only an Actions step can publish an artifact:
+
+1. `prepare` — verify the prior case finalized, the journaled graph/ref/check preconditions and this
+   job's own role/mode/job binding; persist bounded private state; create a 256-bit **pre**-nonce.
+2. upload the pre challenge.
+3. `await-and-execute` — consume exactly one fresh pre-witness, run the production verifier on its
+   complete governed policy, re-check ref/check state, mint the actor token **just in time**, fsync a
+   mutation-used marker, issue **exactly one** mutation, read back independently, create the post-nonce.
+4. upload the post challenge.
+5. `await-and-finalize` — consume the post-witness, require the complete governed policy and the
+   classic representation to be **equal** across the window, and record the case result.
+
+There are exactly **seven normal and four emergency** cloud cases, so a complete attempt requires
+exactly **22** distinct successful witness publications — one pre and one post per case. Missing,
+extra or duplicate responses refuse; `64` is a bounded *discovery* ceiling, not permission to publish
+that many. The separate rehearsal source run requires exactly one response and **cannot** contribute
+to the 22.
+
+Every bound fails closed and none of them promises hosted-runner capacity: a 180-second challenge
+lifetime inclusive of queue and upload latency (never extended, never restamped); a 15-second ceiling
+on the complete local policy read; 90 seconds from the pre-observation to the mutation and from the
+readback to the post-observation; five-second polling with a finite deadline; a 60,000-byte cap on the
+whole serialized dispatch envelope including JSON overhead; one artifact, one ZIP entry, 60,000
+uncompressed bytes, a 128 KiB archive; 10 pages of 100 objects per endpoint with a terminal page
+required; and a 30-minute ceiling on both the witness process and each job. Queue latency can make a
+legitimate run **incomplete** — and that is the reported result, never one concealed by extending a
+window or retrying a case.
+
+**An ambiguous mutation is never retried.** A crash after the fsynced marker, a missing or changed
+post-witness, or an unexpected force/delete success stops further actor mutations in that attempt; the
+state machine refuses a second mutation for a case, and a halt is terminal for the whole role. A case
+may also only begin after its predecessor recorded its EXPECTED OUTCOME — `finalized` is not enough,
+because finalization writes that state and then throws for an inconclusive verdict, which would leave
+the next case measuring against a ref state nobody established.
+
+A request whose response never arrived (status 0) is **inconclusive and halts, whatever the readback
+shows**. A readback at the requested commit is kept as reconciliation evidence, but it proves where the
+ref is, not that this request put it there — so it is never recorded as an acceptance, at runtime or
+by `check-evidence`, and no later actor case starts.
+
+The same holds for a response that arrived but did **not complete**. Both transports (`gh` and the
+App token) hold every JSON answer to one bounded completed-response contract: a finished status line
+and head, the whole body collected under the 1 MiB bound (collection stops at the bound), a body read
+or `gh` exit that finished, strict UTF-8, a JSON body — or an *empty* 204 — and the endpoint's
+documented success shape. A body read that failed, malformed or oversize JSON, a `gh` exit that does
+not match its status, or a refusal whose text was cut off is recorded as status 0 with the reason
+(`response_incomplete`) and the status line it did see (`measured_status`), and it is never read as a
+policy denial. Every journal, case-state, post-challenge and evidence record carries
+`response_complete` beside the status; a record without it is ambiguous, not a status to trust.
+
+The halt and the exit code are separate facts. A halted matrix whose failing cases are all
+inconclusive or not-run exits **3** (`incomplete`); a matrix with any measured failure — an
+unexpected success, denial or mutation, including a must-deny ref that moved while its response was
+cut off — exits **1** (`failed`), whatever inconclusive cases sit beside it.
+
+The local **human** cases obey the same rule through the verified resource journal rather than a
+per-job state file. Each case is admitted from its journaled intent → result → readback → outcome
+history before any request: a case with any history is never issued again. Re-running `human-tests`
+takes a settled case's outcome from that history, and an unresolved one (a crash after the intent, a
+readback that failed after the request) or a halting one stops every later human case. `check-evidence`
+joins every human case record to its one journaled history, so a duplicate, unresolved, hidden or
+rewritten attempt refuses even when the derived `human` evidence file shows a single clean record.
+
+**Witness timing has no tolerance.** A response is accepted only when challenge creation ≤ observation
+start ≤ observation completion ≤ response creation ≤ actual receipt ≤ challenge expiry, with the
+response echoing the challenge's exact expiry. The receipt instant is read after the response artifact
+has been completely acquired — so time spent on the lookup and download counts against the lifetime —
+and `check-evidence` re-applies the same order to the retained timestamps.
+
+**The witness serves READY WORK ACROSS ROLES, in each role's own order.** The two protected jobs are
+independent — `emergency` needs only `intent` — so whichever human approves first is the role whose
+challenge appears first, and that is a supported ordering rather than a misuse. A role whose next
+item has no challenge published yet is SKIPPED for this pass, never waited on, so an independently
+approved emergency job cannot starve behind normal's fourteen responses and expire unserved. Per-role
+sequence, once-only nonce consumption, the 180-second lifetime and the approval requirement are
+unchanged; nothing is served out of its own role's order.
+
+**A restart never re-dispatches a nonce.** Before any new measurement or POST, the witness reads its
+own journal for a `dispatch-intent` with no reconciled publication. A dispatch already in flight is
+reconciled against the exact expected artifact through the SAME provenance, byte and binding rules a
+consumer applies — never from a listing row under a matching name — and if the artifact has not
+landed yet the item stays PENDING within its ORIGINAL expiry. Known-pending, measured-absent, refused
+and ambiguous stay four different states; none of them is resolved by dispatching again.
+
+### Reading the packet
+
+Ten files feed the assessment — `commissioning-<runId>-<attempt>-<slug>.json`, mode 0600, one per
+phase plus the local witness process's own summary and the operator-supplied environment controls;
+`collect` and `check-evidence` write their own summaries alongside. The publisher and the rehearsal
+write their own records too, and neither feeds a commissioning gate: a rehearsal response can satisfy
+no actor case.
+
+**Nothing in a file is trusted because of its filename.** Each of the nine is checked for its schema
+version, run, attempt, phase, a CLOSED list of required fields, and agreement with the run's immutable
+workflow SHA — before any gate reads a field out of it. A file that fails is discarded and reported
+`invalid`, and the coverage it was carrying is reported LOST rather than quietly assessed as fewer
+cases than the matrix has. Beyond that:
+
+- **Case outcomes are DERIVED from the run's FROZEN GRAPH, not read.** `passed: true` is a claim a file
+  makes about itself, and so is every SHA in it. Each case's before/requested identities must be the
+  journaled synthetic nodes its own case declares, and the RELATION between them must be the one the
+  operation needs: an `update` to a strict descendant, a `force` to a real ancestor or a divergent
+  commit, never a target the ref is already at. A no-op recorded as a permitted write, and a force flag
+  on a ref that never moved recorded as a denied non-fast-forward, are both blockers.
+- **The diagnostic is RE-CLASSIFIED, not believed.** `policyDenial` in a file is a caller-supplied
+  boolean, so the recorded diagnostic CATEGORY is looked up in this build's closed table instead. An
+  invented category, or a `credential-failure` dressed as a policy denial, is a blocker.
+- **The declared check state is RECOMPUTED** from its own per-context measurement. `measured: true`
+  beside a measurement that contradicts the expectation next to it is not sufficient for anything.
+- **A case is only counted from its own actor's file.** A `passed: true` for a normal-App case sitting
+  in the human evidence is not that case's outcome.
+- **The witness transport is JOINED across four sources, not counted.** Both hash-chained journals
+  are verified — the resource journal AND the separate witness journal — and the exact eleven cloud
+  cases × two directions are then joined across the immutable intent's derived plan, each actor
+  job's own consumed evidence, the resource journal's synthetic graph and the witness journal's
+  observed challenges and reconciled publications. A publication whose case/direction pair is not
+  one of the closed 22 is an invented case; one whose artifact the witness journal does not record
+  reconciling is a claim with no counterparty; one naming no publisher run has no provenance to
+  re-derive. Counting distinct IDs and checking digest SYNTAX is not this, and was what let a
+  packet with invented case names, absent publisher runs and no witness journal at all pass.
+- **Each case's own proof is re-derived, not the first case's.** Per case and per direction the
+  assessment re-runs the same governed projection validator and compares the retained bounded
+  projection against the disposable policy it derives for itself; it re-checks that case's OWN
+  token/installation proof (repository by NUMERIC ID, exactly one reachable repository), that
+  case's OWN measured grants, its manifest and graph bindings, and its pre==post governed digest.
+  A measured interval must be an actual finite number: an absent timing is not a zero one.
+  Every policy record must carry the bounded pre/post guarantee verbatim; a packet that drops it or
+  restates it as an atomicity claim is `invalid`.
+- **Cleanup drift is RECOMPUTED from the two baselines the file carries**, not read from its
+  `production_drift`. Different before/after SHAs beside an empty drift list is a measured failure, and
+  the "before" baseline must be the one the verified journal recorded at the start of the run.
+- **Cleanup coverage comes from the verified journal**, not from the cleanup file's own list. An
+  `outcomes: []` satisfies nothing; each journaled ref, ruleset and pull request must have an outcome,
+  and an outcome for a resource the journal does not record this run creating is `invalid`. Every
+  journaled ruleset must also have a measured provider-shape fingerprint, and any create intent whose
+  outcome the journal cannot account for blocks.
+- **The App grants must be the measured object**, matching `ROLE_APP_PERMISSIONS` — *and* the two App
+  identities must be **distinct** and be the ones the immutable intent configured. A packet naming the
+  same unrelated App for both actors agrees with itself perfectly, which is why self-agreement is not
+  the check.
+- **The approval must be the configured HUMAN reviewer, by numeric identity**, distinct from the
+  dispatcher measured from the provider's own run metadata, with the protected job concluding
+  **success in this exact attempt**. A bot login, a `completed` job that failed, or a success borrowed
+  from another attempt is a blocker.
+
+Three blocker kinds, and they mean different things. **`failed`** is a measured statement about the
+subject. **`unverified`** is "we could not look, or nobody has looked yet". **`invalid`** is "a file
+claiming to be this evidence is not this evidence". Only an empty blocker list is a pass.
+
+### The one thing that is honestly unverified
+
+**The protected-environment negative controls.** This harness cannot impersonate a second reviewer,
+cannot read `prevent_self_review` back from the environments API, and a skipped off-branch job proves
+workflow *admission* rather than environment branch policy — PC-06's own instruction for that last
+case is to report it unverified rather than widen admission to arbitrary refs. So each control is
+operator-supplied evidence in `commissioning-<runId>-<attempt>-environment-controls.json`.
+
+Because it is operator-supplied, the SHAPE of it is checked hard — and **a digest alone is not
+evidence**. It proves which bytes were retained; it says nothing about whether the control passed,
+which control it was, or when. So every verified record must carry, against its OWN closed schema
+(`ENVIRONMENT_CONTROL_SCHEMAS`):
+
+- the control's `expected` outcome, **equal** to this build's declared one — a record cannot bring its
+  own weaker expectation;
+- a `measured` value that **equals** that expectation, so a measurement showing the control OFF is a
+  blocker rather than an accepted observation;
+- the exact `environment_name` **and** numeric `environment_id` it was measured on;
+- a `measured_at` inside this run's window — a historical capture is not this run's evidence, however
+  correctly it is hashed;
+- `run_id`/`attempt` for the three run-bound negative controls, because an attempt outcome belongs to
+  an attempt;
+- a retained artifact inside the evidence directory whose SHA-256 `check-evidence` recomputes from
+  disk **and** whose parsed content names the same control, the same environment and the same measured
+  value — which is what makes reusing one file across controls a refusal rather than a pass;
+- **its own provenance inside that artifact.** The retained observation is a closed object carrying
+  `control`, `environment`, `environment_id`, `source`, `measured_at`, `measured` and, for a run-bound
+  control, `run_id`/`attempt` — nothing else. Every one is required in the bytes, and the outer record
+  may only repeat it exactly. A stale observation from another run, attempt, environment or year inside
+  a freshly stamped record is refused however honestly its digest matches: the digest proves which
+  stale bytes were kept, and a wrapper cannot supply provenance its observation lacks or contradicts.
+  All accepted observations of one environment must agree on its numeric ID.
+
+`administrators_cannot_bypass` is deliberately **UI-only**: the environments API does not return that
+field, so a `provider-api` claim about it would be a claim about something nobody read.
+
+Coverage is the **cross product** of the seven controls and the two protected environments — fourteen
+records. The environments are configured separately; one of them being right says nothing whatever
+about the other, and a single record covering "the environments" would hide exactly that.
+
+```json
+{
+  "schema_version": 1, "phase": "environment-controls", "run_id": "…", "attempt": "…",
+  "controls": {
+    "prevent_self_review_enabled": {
+      "staging-release": {
+        "status": "verified",
+        "source": "provider-ui",
+        "environment_name": "staging-release",
+        "environment_id": 4401,
+        "expected": { "prevent_self_review": true },
+        "measured": { "prevent_self_review": true },
+        "measured_at": "2026-09-10T09:00:00.000Z",
+        "artifact": "env-prevent-self-review-staging-release.json",
+        "artifact_sha256": "<64 hex, recomputed from that file>"
+      },
+      "staging-emergency": { "…": "…" }
+    },
+    "self_review_refused": {
+      "staging-release": {
+        "status": "verified", "source": "provider-ui",
+        "environment_name": "staging-release", "environment_id": 4401,
+        "expected": { "attempt_outcome": "refused" }, "measured": { "attempt_outcome": "refused" },
+        "measured_at": "2026-09-10T09:05:00.000Z",
+        "run_id": "…", "attempt": "…",
+        "artifact": "env-self-review-refused-staging-release.json",
+        "artifact_sha256": "<64 hex>"
+      },
+      "staging-emergency": { "…": "…" }
+    },
+    "unauthorized_reviewer_refused": {
+      "staging-release":   { "status": "unverified", "note": "no second reviewer identity is available" },
+      "staging-emergency": { "status": "unverified", "note": "no second reviewer identity is available" }
+    }
+  }
+}
+```
+
+Each named artifact is a small closed JSON observation, written when the control is measured, so its
+content and provenance can be bound rather than merely hashed: `{"control":
+"prevent_self_review_enabled", "environment": "staging-release", "environment_id": 4401, "source":
+"provider-ui", "measured_at": "2026-09-10T09:00:00.000Z", "measured": {"prevent_self_review":
+true}}` (plus `"run_id"`/`"attempt"` for a run-bound control), alongside whatever screenshot or export
+the operator retains next to it. The record above repeats those values; it never supplies them.
+
+If the second identity does not exist, leave that control `unverified` — it blocks full activation,
+which is the correct outcome, and per-control granularity is the whole reason it does not drag the
+other six down with a single flag.
+
+### The staged off-branch probe — `release-environment-negative-probe.yml` (PC-06)
+
+`off_branch_environment_reference_refused` is the one control that can be measured honestly without
+widening the commissioning workflow's admission: a SEPARATE inert workflow, dispatched once from one
+fixed disposable ref, whose two jobs target `staging-release` and `staging-emergency`. Both
+environments admit only the branch `staging`, so the expected result is a provider refusal before any
+runner exists. It is API-only: UI denial evidence has no reviewed closed schema and stays unverified.
+
+**Prerequisite, before the commissioning attempt is dispatched.** The workflow must already be merged
+to the default branch (`staging`) through a normal reviewed PR, because `workflow_dispatch` needs the
+file on the default branch. The probe's source is the ORIGINAL attempt's trusted workflow SHA, so the
+commit that commissioning dispatches from must carry the reviewed probe bytes (`PROBE_WORKFLOW_SHA256`).
+`stage` refuses a registration newer than the original attempt's journal window.
+
+**Sequence** — all while the original attempt is active and its protected jobs are UNAPPROVED, after
+`setup` recorded the baseline, and before approving anything:
+
+```bash
+P=scripts/staging-ops/offbranch-probe-operator.mjs
+A="--run-id <original run> --attempt <its attempt> --evidence-dir <the same private dir>"
+node $P stage    $A   # registration + reviewed bytes, no induced automation, ref ABSENT, baseline policies,
+                      # create-once intent, linked into the ORIGINAL journal, probe journal opened
+node $P dispatch $A   # create the ref once, before-probe policies, dispatch once (10-minute deadline)
+node $P collect  $A   # one eligible run; terminal or cancel at the deadline; raw captures; observations
+node $P cleanup  $A   # exact-SHA lease deletion via local git; verified absence; journal closed
+node $P cancel   $A   # operator abort: cancels ONLY the identified probe run, confirms terminal
+```
+
+Each phase validates the original intent, its prior resource-journal link and the complete probe
+history. Before launch, the provider's full original run/attempt/repository identity must agree with
+that intent. The original declared dispatcher login is checked against a separately retained provider
+actor tuple; the triggering actor has its own tuple and need not be the dispatcher. Neither is
+required to be the probe operator. Later original identity contradictions remain disqualifying.
+
+Qualification and recovery have separate admission rules. An unavailable original/source read,
+completed original run or expired capture window cannot authorize another launch or positive
+measurement. Authenticated retained original identity plus fresh exact owned-run/ref evidence can
+still authorize cancellation and cleanup, without renewing either deadline. Each unavailable or invalid
+qualification read during recovery is recorded as a typed `qualification-incomplete` event before
+cleanup continues. Both environment validators reject that history even if a later read succeeds;
+unavailable source evidence is never described as measured source movement.
+
+Every phase writer completes missing reconciliation from the original authenticated durable effect:
+a complete fixed-ref absence, an exactly bound unique run selection, or a retained terminal run
+observation. A process cut between those facts and their bookkeeping does not require another
+mutation. Result-row presence alone does not resolve an unknown effect. Existing ownership
+contradictions remain binding, and recovery never extends the original selection/cancellation bound.
+
+If terminal collection stops during diagnostics, retained run/jobs/pages remain in the journal.
+Identity-bound execution evidence records a failed control before optional diagnostic reads. Invoke
+`cancel` to explicitly end incomplete terminal qualification, then `cleanup`: terminal abort sends no
+provider cancellation and returns `terminal-aborted`, with failed admission taking precedence over
+inconclusive evidence. Cleanup does not silently choose this abort. A fully completed paired
+collection followed by `cancel` returns `already-terminal` and preserves its original observations.
+
+A closed probe never reopens. Stage, dispatch and collect refuse it; cancel and cleanup report
+`already-closed` without appending or taking a writer lock. A leftover lock after a durable close is
+left intact; explicit lock recovery remains restricted to open probes. A create intent whose result
+was lost is reconciled through retained fixed-ref reads: absence can close inconclusive, while any
+observed presence leaves ownership uncertain and never permits adoption or deletion.
+
+Exit codes follow the commissioning CLI: 1 = a measured failure (an admitted job or a changed ref),
+3 = incomplete (lost answers, a non-204 dispatch response, no eligible run, cancellation, policy
+drift), 2 = usage. No command takes a ref, workflow, URL or environment; there is nothing to point elsewhere.
+
+**What never happens.** No approval, rejection or bypass of a deployment review; no environment,
+policy, reviewer, App or protection change; no run records deleted. A lost create, dispatch or
+deletion answer is reconciled by readback and never retried or adopted: a probe ref of uncertain
+ownership is neither dispatched nor deleted (root reconciles it), a second eligible run is refused
+rather than selected, and a changed ref is left untouched because the deletion carries an
+expected-old-SHA lease (`git push --force-with-lease=<ref>:<sha> … :<ref>`), not a GET followed by a
+DELETE. A run still nonterminal two minutes after cancellation blocks cleanup and claims nothing.
+
+**What the journal permits is DERIVED from all of it, not from its newest row.** Both the operator
+and the offline assessment read the probe journal through one shared derivation
+(`assessProbePhaseState` / `assessRefOwnership` / `assessRunContinuity` / `assessSourceContinuity`), so a refusal cannot be walked back by appending
+something later:
+
+- **A deletion this probe recorded as SUCCESSFUL ends that creation's ownership for good.** If the
+  ref is PRESENT afterwards, that is a contradiction and never continuity — an equal SHA is equal
+  bytes, and a same-SHA recreation belongs to whoever made it. `cleanup` refuses from then on, in
+  this process and every later one, and `check-evidence` refuses the observations too. The
+  reconciliation row that refusal writes is a fact about the ref, not a permission to try again.
+- **A ref measured at another SHA is not revived by being put back** at the reviewed SHA.
+- **Exact absence can reconcile a lost deletion answer**, with no second deletion. A same-SHA
+  presence cannot distinguish an unapplied deletion from deletion followed by another creation;
+  it stays unresolved and never authorizes another lease deletion.
+- **An empty run listing does not prove the dispatch never applied.** Missing results and complete
+  non-204 responses (including 5xx) remain unresolved until the exact owned run is established.
+  Zero, duplicate or foreign candidates authorize neither deletion nor closure, and never redispatch.
+- **Historical terminal evidence is refreshed at cancellation, deletion and closure.** Each complete
+  run observation is retained before identity checks; an observed rerun, foreign identity or change
+  from terminal state remains a contradiction after later restoration. Each complete ref read is
+  likewise retained, including a present immediate readback after acknowledged deletion.
+- **A measured move of the live `staging` head interrupts the attempt permanently.** Every phase
+  records what it measured (`source-observed`), so a head that returns to the trusted source does
+  not erase it and a fresh process re-derives it. `collect` then refuses to measure; `cancel` and
+  `cleanup` deliberately still run — removing what the run created is exactly what must not be
+  blocked — but the journal closes `inconclusive`, never `measured`, and offline acceptance refuses.
+  Root reconciles.
+
+**Recovering an interrupted local writer.** The shared `recoverJournalLock` API accepts the probe
+journal kind only with explicit verified-gone-owner evidence, its exact original journal/intent/source
+binding, and provider reconciliation of every recorded create, dispatch, cancel and cleanup intent.
+Its closed `lock-recovered` event concerns exclusive local ownership only; it cannot resolve a
+resource outcome, authorize retries or adopt a ref. A failed callback leaves the old lock in place;
+a failed append releases the replacement lock. Subsequent public phases re-establish provider facts
+under the original deadlines. Do not manually delete a lock or edit retained journal history.
+
+**What `collect` writes.** One create-once, mode-0600 observation per environment
+(`commissioning-<run>-<attempt>-offbranch-observation-<environment>.json`), only when the refusal is
+re-derived from the retained raw responses, plus the exact `environment-controls` record to file for
+each. That record carries `offbranch_schema_version: 1` and the `commissioning` identity, and its
+`run_id`/`attempt` name the PROBE run (attempt `"1"`) — the only control where they may differ from
+the commissioning run. `check-evidence` re-derives everything: the forward link, the probe journal's
+reconciled lifecycle, the one eligible run, the run → job → `check_run_url` → check → suite/producer/
+deployment joins, the exact branch-policy annotation for this branch and environment, unchanged
+policies (baseline = before = after, agreeing with the other controls), original times in order, and
+cleanup completed before any original protected approval. A passing probe is still not PC-06 on its
+own; actual human approval of the original protected jobs remains separately required.
+
+**What it cannot claim.** Captures are taken under the trusted local operator boundary: hashes and
+local JSON are not a provider signature, `check-evidence` does not re-contact GitHub, and
+before/after equality shows the endpoints agreed, not that the policy was continuously immutable.
+
+> **A note on what changed here.** An earlier version of this section claimed the two release Apps'
+> installation permission sets were "an owner provisioning fact this harness does not measure", and
+> asked for them as two more attested controls. That was wrong: each protected job already holds its
+> own App private key and can therefore sign an App JWT, and GitHub documents `GET /app` and
+> `GET /app/installations/{installation_id}` as reporting exactly those grants. They are now MEASURED,
+> in the job, before any credential is exercised — see the prerequisites table above. The two
+> `*_app_permissions_confirmed` controls no longer exist.
+
+### What the protected jobs can and cannot read — and what replaced the guess
+
+> **A note on what changed here, because the previous version of this section was wrong in a way that
+> mattered.** It listed "the protected jobs must be able to read ruleset definitions" as a live
+> prerequisite nobody could settle from a mocked run, and had the actor jobs feed those read-only
+> bodies into the production verifier while passing `classicProtection: null` for a dimension they had
+> not measured. That produced a `compatible` verdict about a policy the job had not seen. It is not an
+> unknown: GitHub **documents** that `GET /repos/{repo}/rulesets/{id}` returns `bypass_actors` only to
+> a caller with write access to the ruleset, so a 200 with the bypass matrix absent is the CORRECT
+> response to `metadata: read` — and the emergency App's entire acceptance depends on that matrix.
+
+- **The complete governed policy comes from the local witness**, measured under the operator's admin
+  identity, per case, and bound to that case's private nonce, the immutable source and a 180-second
+  window. The actor runs the unchanged production verifier on the inverse-transformed **full** governed
+  set plus the measured classic representation. Its record states the guarantee it is limited to:
+  a bounded contemporaneous pre/post measurement under administrative quiescence, **not** an atomic
+  policy-at-mutation proof.
+- **What the actor job's own read-only token still does** is measure the applicability SUMMARY — which
+  planned rulesets apply to its ref, their targets and their enforcement mode, all of which
+  `metadata: read` genuinely exposes. That is recorded as `verdict: "applicability-only"` with
+  `bypass_visibility: "redacted-to-this-credential-by-documented-provider-contract"`, so nobody can
+  read it as the compatibility verdict.
+- **Only a measured no-classic-protection 404 is publishable.** If the tested branch reports classic
+  protection, the local process records a mismatch or measurement-incomplete and stops **before** the
+  witness dispatch. That deliberately narrows what this bounded commissioning can measure — it is not
+  a compatibility waiver, and it must not be reported as one.
+- **The narrow disclosure refuses rather than redacts.** An unexpected bypass identity, an arbitrary
+  team name, a condition the harness does not govern or a rule parameter outside the closed schema
+  stops the run before publication. The initial bounded commissioning may therefore refuse an
+  additional inherited policy that might have been compatible; it must not claim a compatibility it
+  cannot safely publish.
+
+### The live prerequisite that remains
+
+**Whether the local identity can dispatch this workflow, and whether the queue meets the bounds.**
+Both are facts about the live repository and the hosted runners, not something a mocked run settles —
+which is exactly what the `transport-rehearsal` mode is for. Run it FIRST, before spending two human
+approvals: it exposes no App key, modifies no policy or ref, produces no enforcement verdict, and
+measures the dispatch → publish → download → bind path against the same clock and serialization
+checks the real cases use. A failed rehearsal does not authorize broader infrastructure or relaxed
+bounds — and its response can satisfy no actor case.
+
+### If something goes wrong
+
+- **An actor unexpectedly SUCCEEDS at a force or delete.** That actor's remaining cases are recorded
+  `not-run` and nothing further is attempted with a credential just shown to be over-privileged. Run
+  `cleanup` — it removes only journaled resources — and stop.
+- **A partial setup.** Re-run `setup` for the same run and attempt. It resumes from the verified
+  journal, reading each journaled resource back before adopting it, and refuses a collision rather
+  than adopting or deleting anything it did not create. A **rerun attempt** derives a fresh suffix and
+  reuses nothing.
+- **A create whose RESPONSE was lost.** The create RESULT and its returned identity are fsynced before
+  any further fallible read, so a `201` followed by a failed readback still leaves the resource's exact
+  ID in the journal. A resume RECONCILES that intent — by the exact name or ref the intent recorded, in
+  a run/attempt-scoped namespace whose absence the collision check already proved — and never by
+  re-issuing the POST or by matching a name prefix. If reconciliation cannot settle it, the state stays
+  explicitly unresolved and `cleanup` reports it rather than claiming the run left nothing behind.
+- **A witness response that never arrives.** The case exits `incomplete` when its 180-second challenge
+  expires. The expiry is never extended, the observation is never restamped, and the case is not
+  retried; check the witness process is running (step 2 of the sequence) and whether the rehearsal
+  still passes before re-dispatching a fresh attempt.
+- **A witness dispatch whose response is ambiguous.** A dispatch returns `204` with no body, so even a
+  clean success says nothing about which run it created. The witness always answers the same way —
+  look for the exact expected artifact — and it journals intent-then-result, so a restarted witness
+  reconciles an existing publication instead of publishing a second response for a consumed nonce.
+  Only a *complete* refusal stops a dispatch; a 5xx, a 204 carrying stray bytes or a cut-off refusal
+  stays pending and is reconciled by the exact artifact, never dispatched again.
+- **The complete governed policy changed across a case's window.** The case stops. That is the pre/post
+  pair doing its job — and it is worth being precise about what it does not do: a change made and
+  reverted inside the window is outside the guarantee, which is why the quiet-window prerequisite is a
+  prerequisite and not a nicety.
+- **A stale lock.** Not removed on elapsed time alone: a slow provider call and a dead process look
+  identical by clock. Recovery needs positive evidence the owner is gone *and* a provider readback
+  that reconciles its last recorded mutation.
+- **`cleanup` reports a refusal.** A ruleset is deleted only if its COMPLETE governed fingerprint —
+  name, target, enforcement, conditions, bypass actors and rules, hashed from the readback journaled
+  at creation — still matches. A body edited at the same ID, name and target is a different policy and
+  is left in place for a human. Nothing is ever deleted by wildcard or by prefix sweep, and an owned
+  leftover is reported as a cleanup refusal rather than as production drift.
+- **An UNPROVABLE first fingerprint is an ownership gap, never a fresh one.** When a create was
+  durable but its first fingerprint readback failed — a 201 followed by a 503 — the resource is
+  owned and has no measured fingerprint. Measuring it NOW and trusting that value would make a
+  ruleset edited after creation its own evidence of identity, and then delete it. So the current
+  body is proved against the intended policy recomputed from the immutable intent, allowing only
+  provider default expansion and key ordering; if that cannot be proved, an `ownership-unprovable`
+  reconciliation is journalled, the resource is REFUSED and left in place for root, and the run
+  does not claim it left nothing behind. Never make a deletion safe by first trusting the value
+  being deleted.
+- **Cleanup runs under the SAME named-operator admission as every other local phase.** Opening a
+  local session — setup, human tests, cleanup, collect — measures `/user` for the numeric ID, the
+  login, the account type and current repository admin. The identity that created the journal is
+  not evidence about the identity now deleting things, and the operator who ran cleanup is recorded
+  in its evidence so the final assessment can require it.
+- **A crashed cleanup.** Recovery reconciles a pending `cleanup-intent` as well as a pending
+  mutation — an interrupted DELETE is the most consequential thing a crashed cleanup leaves behind,
+  and it is the one a resumed run most needs read back before deciding anything. Recoveries are
+  serialised by their own lock, and a recovery whose original lock was replaced while it was
+  reconciling refuses rather than removing the new owner's lock.

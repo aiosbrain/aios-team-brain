@@ -1,0 +1,32 @@
+{
+  "total_count": 1,
+  "jobs": [
+    {
+      "id": 101401894241,
+      "run_id": 34001809129,
+      "workflow_name": "scan-on-merge",
+      "head_branch": "staging",
+      "run_url": "https://api.github.com/repos/aiosbrain/aios-team-brain/actions/runs/34001809129",
+      "run_attempt": 1,
+      "node_id": "CR_kwDOS5szgs8AAAAXnAYdYQ",
+      "head_sha": "f8c099f646cd13448e6f1b15e41ce2a0e68d5bcb",
+      "url": "https://api.github.com/repos/aiosbrain/aios-team-brain/actions/jobs/101401894241",
+      "html_url": "https://github.com/aiosbrain/aios-team-brain/actions/runs/34001809129/job/101401894241",
+      "status": "completed",
+      "conclusion": "failure",
+      "created_at": "2026-09-06T00:38:16Z",
+      "started_at": "2026-09-06T00:38:16Z",
+      "completed_at": "2026-09-06T00:38:18Z",
+      "name": "codebase readiness scan \u2192 brain",
+      "steps": [],
+      "check_run_url": "https://api.github.com/repos/aiosbrain/aios-team-brain/check-runs/101401894241",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "runner_id": 0,
+      "runner_name": "",
+      "runner_group_id": 0,
+      "runner_group_name": ""
+    }
+  ]
+}

@@ -81,6 +81,101 @@ journal ready. The app/startup fence holds a shared form of the same lock. Durab
 authenticated readback, explicit bootstrap/rollback, bounded catch-up, and complete Railway
 deployment enumeration prevent a partial pair or stale deployment selection from becoming ready.
 
+**Main's release policy is measured before it is armed** (AIO-1124). `main-policy.mjs` builds main's
+three release rulesets and `verifyEffectiveMainPolicy` evaluates them, but every existing test asserts
+a MODEL of GitHub's rules. `scripts/staging-ops/policy-commissioning.mjs`, driven by the manual
+protected workflow `.github/workflows/release-policy-commissioning.yml`, performs one bounded
+disposable experiment that measures what the provider actually does when the normal App, the emergency
+App and a human admin each push, force-push, delete and merge against that policy — on DERIVED
+`refs/heads/aios-policy-commissioning/run-<runId>-<attempt>-*` refs, with the release keys confined to
+their own protected environments, and with everything it created deleted afterwards against a
+mode-0600 append-only journal (`commissioning-journal.mjs`). It promotes nothing: no main promotion,
+no protection mutation, no tag, no deploy, no release acceptance. A denial counts only when the
+provider refused AND the ref is unchanged; an acceptance only when an independent readback shows the
+exact expected descendant; everything else is `inconclusive`. Each protected job measures its own App's
+grants with an App JWT and refuses an unexpected set before exercising the credential.
+
+**Where the complete policy comes from, and why it is not the protected job.** GitHub documents that
+`GET /repos/{repo}/rulesets/{id}` returns `bypass_actors` only to a caller with write access to the
+ruleset, and the actor jobs hold `metadata: read` — so a protected job cannot measure the bypass matrix
+its own case depends on. The existing local `johnellison` admin identity is therefore the
+complete-policy measurement authority: per case, the actor publishes a challenge carrying a fresh
+private nonce, the local **witness** process (`commissioning-witness.mjs`, CLI phase `witness`)
+measures the full governed policy and dispatches the same reviewed workflow in `policy-witness` mode,
+one non-protected publisher job republishes those exact bytes as a single-entry artifact, and the actor
+binds it to its own nonce and immutable source before running the production verifier and mutating.
+Eleven cloud cases × pre and post = exactly **22** publications per attempt, and `check-evidence`
+JOINS that exact closed set across the immutable intent, each actor's own consumed evidence and BOTH
+hash-chained journals rather than counting it.
+
+**The one cross-run negative control: the staged off-branch probe** (PC-06). The commissioning
+workflow admits only `staging`, so `off_branch_environment_reference_refused` is measured by a
+SEPARATE inert workflow, `.github/workflows/release-environment-negative-probe.yml` (no inputs,
+`permissions: {}`, one literal no-op per protected environment, bytes pinned), dispatched once from
+the one fixed disposable ref `remediation/pc06-off-branch-negative-20260921` by
+`scripts/staging-ops/offbranch-probe-operator.mjs` (`stage → dispatch → collect → cleanup`, plus
+`cancel`) under a `probe` role at the same request boundary. Its intent is linked into the ORIGINAL
+attempt's resource journal (`probe-staged`) before the ref exists; its own ownership chain is the
+third journal kind (`.probe.jsonl`). **What that chain permits is DERIVED from the whole of it, never
+from its newest row:** `assessProbePhaseState`, `assessRefOwnership` and `assessSourceContinuity` in
+`scripts/staging-ops/offbranch-probe.mjs` are the one derivation both the operator and the offline
+assessment use, so a successful deletion ends that creation's authority irreversibly (a same-SHA
+recreation is somebody else's ref), a ref seen at another SHA is not revived by being put back, and a
+measured staging move recorded by any phase interrupts the attempt permanently — cleanup and owned
+cancellation still run, measurement and acceptance do not. The shared `deriveProbeResolutionEvents`
+planner authenticates retained effects before completing missing reconciliation after a process cut;
+it never retries a mutation. Typed `qualification-incomplete` history also withholds acceptance after
+an unavailable or invalid recovery source/original read, while independent exact ownership checks
+continue to govern cleanup. `check-evidence` reaches the separate validator in
+`scripts/staging-ops/offbranch-probe.mjs` only for that control key with `offbranch_schema_version: 1`,
+and re-derives the refusal from retained raw run/jobs/check/annotation responses and before/after
+environment policy captures — never from a verdict field. Runbook: `docs/OPS.md` §14.
+The shared phase state distinguishes irreversible closure, qualification, run/ref authority and
+capture completeness. Original provider identity is retained before launch, with separately measured
+actor and triggering-actor tuples checked against the original intent's declared dispatcher.
+Recovery uses that authenticated baseline plus fresh exact resource authority, independently of
+qualification-only live reads. Partial captures and proven admission survive diagnostic outages;
+explicit terminal abort ends incomplete qualification without a cancellation request, while complete
+paired collection remains idempotent. The journal reader and writer reject every post-close event;
+closed reporting runs before writer-lock acquisition and leaves stale locks untouched.
+The probe retains every complete ref observation and raw run identity observation before using it.
+Cleanup requires a fresh exact-attempt terminal read immediately before lease deletion and final
+closure. Observed recreation, rerun or terminal-state contradiction survives later restoration.
+A missing dispatch result or complete error response plus an empty listing remains unresolved;
+it cannot authorize ref deletion or closure. Probe lock recovery has a separate closed event,
+reconciles all mutation intents, and grants no resource ownership or retry authority.
+
+**What each of those joins actually recomputes** (AIO-1124 defensive correction). `check-evidence` is
+a re-derivation, not a re-reading, so five things it used to accept as declarations are now rebuilt
+from independent artefacts:
+
+| Claim | Reconstructed from |
+|---|---|
+| ownership of a disposable ruleset | the intended governed body recomputed from the immutable intent (`buildDisposablePlan`). **Every** added field refuses — including a provider default such as `update_allows_fetch_and_merge` — and a real expansion is reported as a named `provider-normalization` gap rather than adopted. Applies to **every** first fingerprint adoption, the successful-`201` readback included: a 201 does not prove the later GET body |
+| the production subject and its hash | a **private, local, mode-0600** `production-inputs` record holding the exact twelve-context producer map and the raw `buildMainRulesets` output, digest-anchored in the resource journal. `buildMainRulesets` is regenerated from it and the manifest is rebuilt; the published intent still exposes only the producer-map **digest**, and this file is never uploaded, dispatched or logged |
+| the publisher's publishable vocabulary | the ORIGINAL run's authenticated **intent artifact**, read by the publisher job with the `actions: read` it already holds, through the existing bounded archive transport and single-entry ZIP reader at a fixed entry name. The exact planned App identities come from there — never from an arbitrary-positive inference |
+| a credential's installation identity | typed, positive, **distinct planned installation IDs** in the credential-free intent (`vars.COMMISSIONING_*_INSTALLATION_ID`), compared to the protected job's configuration *before* the exchange and to the provider's **returned** `installation.id` after it |
+| a publication's bytes | the **dispatch → exact retained bytes → entry digest → challenge nonce** join. The bytes are retained and re-hashed under the same serialization contract they were dispatched under, so an unknown or changed byte stream refuses even when the parsed response objects look equivalent |
+
+Two lifecycle rules underpin them. Each of the 22 keys carries **exactly one** `challenge-observed`,
+`dispatch-intent`, `dispatch-result` and `response-reconciled`; the producer reaches that through one
+shared validated once-only transition (`recordWitnessEventOnce`), so a restarted witness replays the
+retained record instead of appending a second, and a conflicting publication or observation under the
+same key refuses. And every timestamp is judged as **history**: a response's creation and its receipt
+are distinct measured events, a missing receipt is incomplete rather than substituted, and controls
+and approvals must fall inside the run's window at both ends — a capture dated after the run is as
+unmoored as one dated before it. ⚠️ This is a bounded
+contemporaneous pre/post measurement under administrative quiescence, **not an atomic
+policy-at-mutation proof**; every policy record in the packet carries that sentence and
+`check-evidence` refuses a packet that drops it. A separate `transport-rehearsal` mode measures that
+transport inertly — no key, no ref, no policy, no verdict — before any protected approval exists.
+
+The one structurally unproducible gate — the protected environments' negative controls — stays
+`unverified` and blocks activation; its operator-supplied proof must state the expected AND measured
+control values, name the exact environment, sit inside the run's window, and name a retained artifact
+whose digest `check-evidence` recomputes and whose content it binds to that control and environment.
+Sequence: `docs/RELEASING.md` §5; runbook: `docs/OPS.md` §14.
+
 Draining is a POLL, not a single request. Both maintenance adapters
 (`scripts/staging-ops/local-maintenance.mjs`, `railway-maintenance.mjs`) re-list the active
 deployments and re-request a stop until their own deadline, and the listing is the only thing that
@@ -1520,6 +1615,11 @@ guard enforces it, it's named.
   fork, and `scripts/migrate-from-existing.mjs` requires the release tag to be DECLARED in
   `DEFAULT_TAGS` before it is cut (`nextTagPolicy`) — the lane runs on every PR, so getting that
   order wrong reds the whole repo.
+- **Arm or change main's release policy** → the policy itself is `scripts/staging-ops/main-policy.mjs`,
+  but a change to it is not proved by its unit tests: those assert a model of GitHub's rules. Re-run the
+  bounded commissioning experiment (`docs/RELEASING.md` §5, runbook `docs/OPS.md` §14) and read
+  `check-evidence`'s exit code — `3` means a gate could not be measured, which is not a pass. Passing it
+  is still not authorization to change main.
 - **Copy production data anywhere** (e.g. refreshing staging) → `scripts/staging-refresh.sh` is the
   only sanctioned path, and its refusals are pure + unit-tested in
   `scripts/staging-refresh-decision.mjs`. The dump EXCLUDES the data of every table carrying a
