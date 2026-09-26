@@ -35,6 +35,7 @@ import {
 import { hostname } from "node:os";
 import path from "node:path";
 import { PROBE_INTENT_PAIRS, PROBE_JOURNAL_EVENT_TYPES, RESOURCE_LINK_EVENT, SOURCE_OBSERVED_EVENT, assertProbeEventPayload, checkProbeJournalShape, parseProbeIntent, readDescriptor } from "./offbranch-probe.mjs";
+import { CONTROLS as REVIEWER_CONTROLS, REVIEWER_EVENTS, REVIEWER_LINK_EVENT, canonical as reviewerCanonical, digest as reviewerDigest, hash as reviewerHash, replay as replayReviewer, reviewerEvent, time as reviewerTime } from "./reviewer-negative-probe.mjs";
 
 export const JOURNAL_SCHEMA_VERSION = 1;
 
@@ -81,6 +82,7 @@ export const JOURNAL_EVENTS = Object.freeze([
    * and it points forward only — a probe cannot attach itself to an attempt that never staged it.
    */
   RESOURCE_LINK_EVENT,
+  REVIEWER_LINK_EVENT,
   /**
    * A MEASURED LIVE SOURCE observed by a phase that has no probe journal to write it into yet
    * (R06-F3). PC-06's staging phase measures the live head before anything is staged; when that
@@ -119,6 +121,8 @@ export const JOURNAL_KINDS = Object.freeze({
   // dispatch, run identity, captures, cancellation and exact-SHA cleanup. Its payloads are closed
   // per event in `offbranch-probe.mjs`; this vocabulary is the same list, imported, not retyped.
   probe: Object.freeze({ suffix: ".probe", events: PROBE_JOURNAL_EVENT_TYPES }),
+  "reviewer-self": Object.freeze({ suffix: ".reviewer-self", events: Object.keys(REVIEWER_EVENTS) }),
+  "reviewer-app": Object.freeze({ suffix: ".reviewer-app", events: Object.keys(REVIEWER_EVENTS) }),
 });
 
 function assertJournalKind(kind) {
@@ -430,6 +434,7 @@ export async function recoverJournalLock({ dir, runId, attempt, kind = "resource
 export function readJournal({ dir, runId, attempt, kind = "resource" }) {
   assertRunIdentity(runId, attempt);
   assertJournalKind(kind);
+  if (kind === "reviewer-self" || kind === "reviewer-app") return readReviewerJournal({ dir, runId, attempt, kind });
   const file = journalPath(dir, runId, attempt, kind);
   assertRegularOrAbsent(file);
   let text;
@@ -466,6 +471,70 @@ export function readJournal({ dir, runId, attempt, kind = "resource" }) {
     expectedSeq += 1;
   }
   return records;
+}
+
+/** The reviewer chain has its own closed wire format; it cannot be interpreted as resource ownership. */
+export function readReviewerJournal({ dir, runId, attempt, kind }) {
+  assertRunIdentity(runId, attempt);
+  if (kind !== "reviewer-self" && kind !== "reviewer-app") throw new JournalRefusalError("reviewer journal kind is not control-scoped");
+  const file = journalPath(dir, runId, attempt, kind);
+  assertRegularOrAbsent(file);
+  let body;
+  try { body = readFileSync(file, "utf8"); } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+  if (!body) return [];
+  if (!body.endsWith("\n")) throw new JournalChainError("reviewer journal is truncated");
+  const records = [];
+  let prev = null;
+  for (const line of body.slice(0, -1).split("\n")) {
+    let r;
+    try { r = JSON.parse(line); } catch { throw new JournalChainError("reviewer journal JSON is invalid"); }
+    if (!r || Object.keys(r).sort().join("|") !== "at|event|intent_sha256|journal_version|original_attempt|original_run_id|payload|prev_sha256|seq") {
+      throw new JournalChainError("reviewer journal record shape is invalid");
+    }
+    if (r.journal_version !== 1 || r.seq !== records.length + 1 || r.prev_sha256 !== prev
+      || r.original_run_id !== String(runId) || r.original_attempt !== String(attempt)) {
+      throw new JournalChainError("reviewer journal chain/identity is invalid");
+    }
+    try { reviewerTime(r.at); reviewerHash(r.intent_sha256); reviewerEvent(r.event, r.payload); } catch (error) {
+      throw new JournalChainError(`reviewer journal event is invalid: ${error.message}`);
+    }
+    if (records.length && r.intent_sha256 !== records[0].intent_sha256) throw new JournalChainError("reviewer intent digest changed");
+    if (line !== reviewerCanonical(r)) throw new JournalChainError("reviewer journal record is not canonical");
+    records.push(r);
+    prev = reviewerDigest(Buffer.from(line));
+  }
+  try { replayReviewer(records.map((r) => ({ type: r.event, data: r.payload }))); } catch (error) {
+    throw new JournalChainError(`reviewer journal lifecycle is invalid: ${error.message}`);
+  }
+  return records;
+}
+
+export function openReviewerJournal({ dir, runId, attempt, kind, intentSha256, lock, now = () => new Date() }) {
+  const root = assertPrivateDirectory(dir);
+  assertRunIdentity(runId, attempt);
+  reviewerHash(intentSha256);
+  if ((kind !== "reviewer-self" && kind !== "reviewer-app") || lock?.kind !== kind || !lock.nonce) throw new JournalRefusalError("reviewer journal requires its control-scoped exclusive lock");
+  const file = journalPath(root, runId, attempt, kind);
+  return {
+    path: file,
+    read: () => readReviewerJournal({ dir: root, runId, attempt, kind }),
+    append(event, payload) {
+      if (readLockOwner(root, runId, attempt, kind)?.nonce !== lock.nonce) throw new JournalRefusalError("reviewer lock was lost");
+      reviewerEvent(event, payload);
+      const prior = readReviewerJournal({ dir: root, runId, attempt, kind });
+      if (prior.length && prior[0].intent_sha256 !== intentSha256) throw new JournalRefusalError("reviewer intent changed");
+      const prev = prior.length ? reviewerDigest(Buffer.from(reviewerCanonical(prior[prior.length - 1]))) : null;
+      const record = { journal_version: 1, seq: prior.length + 1, prev_sha256: prev, at: now().toISOString(),
+        original_run_id: String(runId), original_attempt: String(attempt), intent_sha256: intentSha256, event, payload };
+      replayReviewer([...prior.map((r) => ({ type: r.event, data: r.payload })), { type: event, data: payload }]);
+      const fd = openSync(file, "a", 0o600);
+      try { writeSync(fd, `${reviewerCanonical(record)}\n`); fsyncSync(fd); } finally { closeSync(fd); }
+      return record;
+    },
+  };
 }
 
 const positiveIdentity = (value) => {
@@ -635,6 +704,7 @@ export function reduceResourceLifecycles(records) {
  * record written under a different source is a different run's evidence wearing this run's name.
  */
 export function openJournal({ dir, runId, attempt, source, lock, kind = "resource", now = () => new Date() }) {
+  if (kind === "reviewer-self" || kind === "reviewer-app") throw new JournalRefusalError("reviewer journals use their closed dedicated writer");
   assertRunIdentity(runId, attempt);
   const spec = assertJournalKind(kind);
   const root = assertPrivateDirectory(dir);
@@ -662,6 +732,19 @@ export function openJournal({ dir, runId, attempt, source, lock, kind = "resourc
       throw new JournalRefusalError("a closed probe journal cannot receive another event");
     }
     if (!spec.events.includes(type)) throw new JournalRefusalError(`unknown ${kind} journal event type ${type}`);
+    if (type === REVIEWER_LINK_EVENT) {
+      if (kind !== "resource" || !data || typeof data !== "object" || Array.isArray(data)
+        || Object.keys(data).sort().join("|") !== "control|intent_sha256|probe_journal_artifact"
+        || !REVIEWER_CONTROLS.includes(data.control)) throw new JournalRefusalError("invalid reviewer probe link");
+      reviewerHash(data.intent_sha256);
+      if (typeof data.probe_journal_artifact !== "string"
+        || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$/.test(data.probe_journal_artifact)) {
+        throw new JournalRefusalError("invalid reviewer journal basename");
+      }
+      if (readJournal({ dir: root, runId, attempt, kind }).some((entry) => entry.type === REVIEWER_LINK_EVENT && entry.data?.control === data.control)) {
+        throw new JournalRefusalError("reviewer control is already linked to this original attempt");
+      }
+    }
     const held = readLockOwner(root, runId, attempt, kind);
     if (held?.nonce !== lock.nonce) throw new JournalRefusalError("this writer no longer holds the run-scoped journal lock");
     assertNoCredentialShapedValues(data, type);

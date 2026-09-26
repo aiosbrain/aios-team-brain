@@ -1,0 +1,21 @@
+name: PC-06 reviewer negative probe
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  probe-release:
+    name: probe-release
+    if: github.repository == 'aiosbrain/aios-team-brain' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/staging' && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    environment: staging-release
+    steps:
+      - run: ':'
+  probe-emergency:
+    name: probe-emergency
+    if: github.repository == 'aiosbrain/aios-team-brain' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/staging' && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    environment: staging-emergency
+    steps:
+      - run: ':'

@@ -9,6 +9,20 @@ line go stale while the code moved on, so it is not restated.
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-09-26
+
+### Added
+
+- **AIO-1124 — diagnostic reviewer probes.** A separate inert staging workflow and private collector
+  retain self-review and unauthorized-App observations for later fixture review. These observations
+  remain unverified and cannot satisfy production policy commissioning.
+
+### Release status
+
+- This version is an **unpromoted validation candidate** for measuring the protected validation
+  check producer. It is not a production release. A later accepting-parser change requires a new
+  reviewed version and candidate.
+
 ### Changed
 
 - **STAGINGMARK-2 — the PRET-6 migration now repairs a markerless fleet instead of only refusing
