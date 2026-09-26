@@ -6533,14 +6533,15 @@ export async function runCleanupPhase({ runId, attempt, evidenceDir, env, deps =
       if (detail.status === 404) {
         if (lifetime.state !== "retired") {
           journal.append("resource-retired", {
-            ...resourceEventIdentity(owned), lifecycle_key: lifetime.key, reason: "confirmed-absent", readback_status: 404,
+            ...resourceEventIdentity(owned), lifecycle_key: lifetime.key, reason: "confirmed-absent",
+            ...(lifetime.pendingCleanup ? { cleanup_intent_seq: lifetime.pendingCleanup.seq } : {}), readback_status: 404,
           });
         }
         outcomes.push({ kind: "ruleset", id: owned.id, name: owned.name, result: "already-absent" });
         continue;
       }
       if (detail.status !== 200 || !detail.body) { outcomes.push({ kind: "ruleset", id: owned.id, name: owned.name, result: "unreadable" }); refused += 1; continue; }
-      if (lifetime.state === "retired") {
+      if (lifetime.state === "retired" || lifetime.state === "retired-reappeared") {
         journal.append("reconciliation", {
           ...resourceEventIdentity(owned), lifecycle_key: lifetime.key, outcome: "retired-resource-reappeared", readback_status: 200,
         });
@@ -6643,13 +6644,14 @@ export async function runCleanupPhase({ runId, attempt, evidenceDir, env, deps =
         if (lifetime.state !== "retired") {
           journal.append("resource-retired", {
             ...resourceEventIdentity(owned), lifecycle_key: lifetime.key, reason: "confirmed-absent",
+            ...(lifetime.pendingCleanup ? { cleanup_intent_seq: lifetime.pendingCleanup.seq } : {}),
             readback_absent: true, readback_sha: null,
           });
         }
         outcomes.push({ kind: "ref", ref: owned.ref, result: "already-absent" });
         continue;
       }
-      if (lifetime.state === "retired") {
+      if (lifetime.state === "retired" || lifetime.state === "retired-reappeared") {
         journal.append("reconciliation", {
           ...resourceEventIdentity(owned), lifecycle_key: lifetime.key, outcome: "retired-resource-reappeared", readback_sha: currentSha,
         });
@@ -6691,11 +6693,12 @@ export async function runCleanupPhase({ runId, attempt, evidenceDir, env, deps =
         if (pullLifetime.state !== "retired") {
           journal.append("resource-retired", {
             ...resourceEventIdentity(pull), lifecycle_key: pullLifetime.key, reason: "confirmed-closed",
+            ...(pullLifetime.pendingCleanup ? { cleanup_intent_seq: pullLifetime.pendingCleanup.seq } : {}),
             readback_status: 200, readback_state: "closed",
           });
         }
         outcomes.push({ kind: "pull-request", number: pull.number, result: "already-closed" });
-      } else if (pullLifetime.state === "retired") {
+      } else if (pullLifetime.state === "retired" || pullLifetime.state === "retired-reappeared") {
         journal.append("reconciliation", {
           ...resourceEventIdentity(pull), lifecycle_key: pullLifetime.key, outcome: "retired-resource-reappeared",
           readback_status: 200, readback_state: String(detail.body.state),
@@ -6718,6 +6721,15 @@ export async function runCleanupPhase({ runId, attempt, evidenceDir, env, deps =
         outcomes.push({ kind: "pull-request", number: pull.number, result: closed ? "closed" : "still-open" });
         if (!closed) refused += 1;
       }
+    }
+
+    const completedHistory = reduceResourceLifecycles(journal.read());
+    if (completedHistory.errors.length) {
+      throw new IncompleteEvidence(`cleanup produced contradictory resource history (${completedHistory.errors.join("; ")})`);
+    }
+    const pendingCleanup = completedHistory.resources.filter((entry) => entry.pendingCleanup);
+    if (pendingCleanup.length) {
+      throw new IncompleteEvidence(`${pendingCleanup.length} cleanup intent(s) remain unresolved after resource readback`);
     }
 
     const after = await measureProductionBaseline({
@@ -7580,8 +7592,13 @@ function reconstructCaseTransport(record, { runId, attempt, role, kase, intent, 
   const preObservation = responseObservations.pre;
   const postObservation = responseObservations.post;
   const mutationStartedAt = Date.parse(String(record?.mutation_started_at ?? ""));
+  const preReceivedAt = Date.parse(String(witness.pre_received_at ?? ""));
   const readbackAt = Date.parse(String(record?.readback_at ?? ""));
   if (!Number.isFinite(mutationStartedAt)) problems.push("carries no parseable mutation start time");
+  if (!Number.isFinite(preReceivedAt)) problems.push("carries no parseable authenticated pre-response receipt time");
+  if (Number.isFinite(mutationStartedAt) && Number.isFinite(preReceivedAt) && mutationStartedAt < preReceivedAt) {
+    problems.push("mutated before the authenticated pre-response was received; the ordering is impossible");
+  }
   if (!Number.isFinite(readbackAt)) problems.push("carries no parseable readback time");
   if (Number.isFinite(mutationStartedAt) && Number.isFinite(readbackAt) && readbackAt < mutationStartedAt) {
     problems.push("records a readback that happened before the mutation it reads back; the ordering is impossible");
@@ -8552,6 +8569,11 @@ export function assessEvidence({ dir, runId, attempt, now = () => new Date() }) 
     if (!closure) {
       block("PC-07", "unverified", "the verified resource history ends before cleanup closure; a derived cleanup summary is not durable ownership evidence");
     } else {
+      for (const lifetime of resourceHistory?.resources ?? []) {
+        if (lifetime.kind !== "commit" && lifetime.lastMaterialSeq > closure.seq) {
+          block("PC-07", "unverified", `resource lifetime ${lifetime.key} has material history after the latest cleanup closure`);
+        }
+      }
       if (Number(closure.data?.cleanup_refusals) !== Number(files.cleanup.refusals)) {
         block("PC-07", "invalid", "the cleanup evidence's refusal count is not the latest run-closed summary in the verified journal");
       }

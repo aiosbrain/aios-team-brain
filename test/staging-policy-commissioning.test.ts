@@ -985,6 +985,110 @@ describe("RIR residual resource lifetime and offline authority regressions", () 
     const blockers = assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, now: clock.now }).blockers;
     expect(blockers.some((entry) => /copied pre observation|mutated before the pre-witness observation/.test(entry.detail))).toBe(true);
   });
+
+  it("RLR1 · a durable reappearance after closure invalidates the earlier cleanup even if interrupted", async () => {
+    const { github, clock } = await coherentPacket();
+    expect(assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, now: clock.now }).blockers).toEqual([]);
+    const ref = derivedRef(RUN_ID, ATTEMPT, "normal");
+    const owned = (readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }) as JournalRecord[])
+      .find((record) => record.type === "resource-created" && record.data.kind === "ref" && record.data.ref === ref)!;
+    github.refs.set(ref, String(owned.data.sha));
+    const before = github.calls.length;
+    const transport = async (method: string, endpoint: string, body: unknown) => {
+      const records = readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }) as JournalRecord[];
+      if (records.some((record) => record.data?.outcome === "retired-resource-reappeared")) {
+        throw new Error("interrupted after durable reappearance");
+      }
+      return wire(github.handle("local", method, endpoint, body));
+    };
+    await expect(runPhase({ phase: "cleanup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV,
+      deps: { transport, now: clock.now } })).rejects.toThrow("interrupted after durable reappearance");
+    expect(github.calls.slice(before).filter((call) => call.method === "DELETE")).toEqual([]);
+    expect(github.refs.get(ref)).toBe(owned.data.sha);
+    const history = reduceResourceLifecycles(readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }));
+    expect(history.errors).toEqual([]);
+    expect(history.resources.find((entry) => entry.key === resourceLifecycleKey(owned.data))?.state).toBe("retired-reappeared");
+    expect(assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, now: clock.now }).blockers)
+      .toContainEqual(expect.objectContaining({ gate: "PC-07", kind: "unverified" }));
+    const check = await cliResult("check-evidence", { now: clock.now });
+    expect(check.exit).toBe(3);
+  });
+
+  it("RLR2 · transient recovery failure then definitive ruleset absence resolves its original intent", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    const owned = (readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }) as JournalRecord[])
+      .find((record) => record.type === "resource-created" && record.data.kind === "ruleset")!.data;
+    const lock = acquireJournalLock({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT });
+    let intentSeq: number;
+    try {
+      const journal = openJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, source: WORKFLOW_SHA, lock });
+      intentSeq = journal.append("cleanup-intent", { kind: "ruleset", id: owned.id, name: owned.name,
+        lifecycle_key: resourceLifecycleKey(owned) }).seq;
+    } finally { lock.release(); }
+    github.rulesets.delete(Number(owned.id));
+    let reads = 0;
+    const transport = async (method: string, endpoint: string, body: unknown) => {
+      if (method === "GET" && endpoint === `/repos/${COMMISSIONING_REPOSITORY}/rulesets/${owned.id}` && ++reads === 1) {
+        return wire({ status: 503, body: { message: "temporary unavailable" } });
+      }
+      return wire(github.handle("local", method, endpoint, body));
+    };
+    const first = await cliResult("cleanup", { transport });
+    expect(first.exit).toBe(0);
+    expect(reads).toBeGreaterThanOrEqual(2);
+    const history = reduceResourceLifecycles(readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }));
+    expect(history.errors).toEqual([]);
+    expect(history.resources.find((entry) => entry.key === resourceLifecycleKey(owned))?.pendingCleanup).toBeNull();
+    expect((readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }) as JournalRecord[])
+      .find((record) => record.type === "resource-retired" && record.data.id === owned.id)?.data.cleanup_intent_seq).toBe(intentSeq);
+    expect((await cliResult("cleanup", { transport })).exit).toBe(0);
+  });
+
+  it("RLR2 · transient recovery failure then confirmed PR closure resolves its original intent", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    const owned = (readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }) as JournalRecord[])
+      .find((record) => record.type === "resource-created" && record.data.kind === "pull-request")!.data;
+    const lock = acquireJournalLock({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT });
+    let intentSeq: number;
+    try {
+      const journal = openJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, source: WORKFLOW_SHA, lock });
+      intentSeq = journal.append("cleanup-intent", { kind: "pull-request", number: owned.number,
+        lifecycle_key: resourceLifecycleKey(owned) }).seq;
+    } finally { lock.release(); }
+    github.pulls.get(Number(owned.number))!.state = "closed";
+    let reads = 0;
+    const transport = async (method: string, endpoint: string, body: unknown) => {
+      if (method === "GET" && endpoint === `/repos/${COMMISSIONING_REPOSITORY}/pulls/${owned.number}` && ++reads === 1) {
+        return wire({ status: 503, body: { message: "temporary unavailable" } });
+      }
+      return wire(github.handle("local", method, endpoint, body));
+    };
+    expect((await cliResult("cleanup", { transport })).exit).toBe(0);
+    const history = reduceResourceLifecycles(readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }));
+    expect(history.errors).toEqual([]);
+    expect(history.resources.find((entry) => entry.key === resourceLifecycleKey(owned))?.pendingCleanup).toBeNull();
+    expect((readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }) as JournalRecord[])
+      .find((record) => record.type === "resource-retired" && record.data.number === owned.number)?.data.cleanup_intent_seq).toBe(intentSeq);
+  });
+
+  it("RLR3 · mutation one millisecond before authenticated pre-response receipt is rejected", async () => {
+    const { clock } = await coherentPacket();
+    expect(assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, now: clock.now }).blockers).toEqual([]);
+    const slug = evidenceSlug(RUN_ID, ATTEMPT, "normal");
+    const packet = readEvidenceFile(evidenceDir, slug);
+    const record = packet.cases[0];
+    const receipt = Date.parse(record.witness.pre_received_at);
+    const observed = Date.parse(record.witness.pre_response.observation.completed_at);
+    expect(receipt).toBeGreaterThan(observed);
+    record.mutation_started_at = new Date(receipt - 1).toISOString();
+    record.witness.pre_to_mutation_ms = receipt - 1 - observed;
+    writeEvidenceFile(evidenceDir, slug, packet);
+    expect(assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, now: clock.now }).blockers)
+      .toContainEqual(expect.objectContaining({ detail: expect.stringMatching(/mutated before the authenticated pre-response/) }));
+    expect((await cliResult("check-evidence", { now: clock.now })).exit).toBe(1);
+  });
 });
 afterEach(() => {
   globalThis.fetch = realFetch;

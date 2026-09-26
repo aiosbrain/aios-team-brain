@@ -535,7 +535,7 @@ export function reduceResourceLifecycles(records) {
       resources.set(key, {
         key, kind: record.data.kind, identity: record.data, createdSeq: record.seq,
         state: record.data.kind === "commit" ? "inert" : "owned-active",
-        pendingCleanup: null, terminalEvents: [], cleanupEvents: [],
+        pendingCleanup: null, terminalEvents: [], cleanupEvents: [], lastMaterialSeq: record.seq,
       });
       continue;
     }
@@ -548,6 +548,7 @@ export function reduceResourceLifecycles(records) {
       lifetime.pendingCleanup = { seq: record.seq, data: record.data };
       lifetime.state = "cleanup-pending";
       lifetime.cleanupEvents.push(record);
+      lifetime.lastMaterialSeq = record.seq;
       continue;
     }
     if (record.type === "cleanup-result") {
@@ -557,6 +558,7 @@ export function reduceResourceLifecycles(records) {
       if (!lifetime.pendingCleanup) { errors.push(`cleanup-result record ${record.seq} has no pending cleanup intent for ${lifetime.key}`); continue; }
       lifetime.cleanupEvents.push(record);
       lifetime.pendingCleanup = null;
+      lifetime.lastMaterialSeq = record.seq;
       const retired = lifetime.kind === "ruleset"
         ? record.data?.removed === true && Number(record.data?.readback_status) === 404
         : lifetime.kind === "ref"
@@ -579,6 +581,24 @@ export function reduceResourceLifecycles(records) {
       lifetime.cleanupEvents.push(record);
       lifetime.pendingCleanup = null;
       lifetime.state = "owned-active";
+      lifetime.lastMaterialSeq = record.seq;
+      continue;
+    }
+    if (record.type === "reconciliation" && record.data?.outcome === "retired-resource-reappeared") {
+      const lifetime = lifecycleForEvent(resources, record.data);
+      const present = lifetime?.kind === "ruleset"
+        ? Number(record.data?.readback_status) === 200
+        : lifetime?.kind === "ref"
+          ? typeof record.data?.readback_sha === "string" && /^[a-f0-9]{40}$/i.test(record.data.readback_sha)
+          : Number(record.data?.readback_status) === 200 && record.data?.readback_state === "open";
+      if (!lifetime || record.data?.lifecycle_key !== lifetime.key
+        || !["retired", "retired-reappeared"].includes(lifetime.state) || !present) {
+        errors.push(`reappearance record ${record.seq} does not bind a retired lifetime and present readback`);
+        continue;
+      }
+      lifetime.state = "retired-reappeared";
+      lifetime.cleanupEvents.push(record);
+      lifetime.lastMaterialSeq = record.seq;
       continue;
     }
     if (record.type === "resource-retired") {
@@ -594,6 +614,7 @@ export function reduceResourceLifecycles(records) {
       lifetime.pendingCleanup = null;
       lifetime.state = "retired";
       lifetime.terminalEvents.push(record);
+      lifetime.lastMaterialSeq = record.seq;
       continue;
     }
     if (record.type === "run-closed") closures.push(record);
