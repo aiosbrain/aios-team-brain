@@ -281,7 +281,7 @@ jobs:
       # the upload opts into that ONE path and treats an absent redacted evidence set as an error.
       - name: Upload redacted harness receipts and logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: staging-pair-receipts
           path: .staging-pair-artifacts
