@@ -314,6 +314,7 @@ export function readLockOwner(dir, runId, attempt, kind = "resource") {
 export async function recoverJournalLock({ dir, runId, attempt, kind = "resource", ownerGone, reconcile, now = () => new Date() }) {
   assertRunIdentity(runId, attempt);
   assertJournalKind(kind);
+  if (kind === "reviewer-self" || kind === "reviewer-app") throw new JournalRefusalError("reviewer locks require closed reviewer recovery");
   const root = assertPrivateDirectory(dir);
   const recoveryLock = recoveryLockPath(root, runId, attempt, kind);
   assertRegularOrAbsent(recoveryLock);
@@ -423,6 +424,35 @@ export async function recoverJournalLock({ dir, runId, attempt, kind = "resource
     }
   } finally {
     try { unlinkSync(recoveryLock); } catch { /* a recovery that never created it has nothing to remove */ }
+  }
+}
+
+/** Recovery only removes an orphan lock after exact journal and provider reconciliation. It appends no
+ * synthetic result and grants no permission to repeat a consumed mutation marker. */
+export async function recoverReviewerLock({ dir, runId, attempt, kind, ownerGone, reconcile, now = () => new Date() }) {
+  if (kind !== "reviewer-self" && kind !== "reviewer-app") throw new JournalRefusalError("reviewer recovery kind is required");
+  if (ownerGone !== true || typeof reconcile !== "function") throw new JournalRefusalError("reviewer recovery requires owner-death proof and provider readback");
+  const root = assertPrivateDirectory(dir);
+  const guardFile = recoveryLockPath(root, runId, attempt, kind);
+  const guard = openSync(guardFile, "wx", 0o600);
+  try {
+    writeSync(guard, `${JSON.stringify({ v: 1, pid: process.pid, started_at: now().toISOString() })}\n`);
+    fsyncSync(guard);
+    const owner = readLockOwner(root, runId, attempt, kind);
+    if (!owner?.nonce) throw new JournalRefusalError("no identifiable orphan reviewer lock");
+    const records = readReviewerJournal({ dir: root, runId, attempt, kind });
+    if (!records.length || records.at(-1).event === "complete") throw new JournalRefusalError("reviewer journal is empty or already terminal");
+    const result = await reconcile({ records, owner });
+    if (result?.reconciled !== true) throw new JournalRefusalError("reviewer mutation history is not reconciled; old lock remains");
+    if (readLockOwner(root, runId, attempt, kind)?.nonce !== owner.nonce
+      || JSON.stringify(readReviewerJournal({ dir: root, runId, attempt, kind })) !== JSON.stringify(records)) {
+      throw new JournalRefusalError("reviewer lock or journal changed during reconciliation");
+    }
+    unlinkSync(lockPath(root, runId, attempt, kind));
+    return { recovered: true, cleanupOnly: true, records };
+  } finally {
+    closeSync(guard);
+    unlinkSync(guardFile);
   }
 }
 

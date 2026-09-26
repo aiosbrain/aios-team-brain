@@ -1,0 +1,78 @@
+import { execFileSync } from 'node:child_process';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { acquireJournalLock, openJournal, openReviewerJournal, readJournal, readReviewerJournal } from '../scripts/staging-ops/commissioning-journal.mjs';
+import { collectApp, collectSelf, dispatch, openSession, stage } from '../scripts/staging-ops/reviewer-negative-probe-operator.mjs';
+import { JOHN, WORKFLOW_NAME, WORKFLOW_PATH, canonical, diagnosticResult, digest, retain } from '../scripts/staging-ops/reviewer-negative-probe.mjs';
+
+const root=path.join(__dirname,'..');const source=execFileSync('git',['rev-parse','HEAD'],{cwd:root,encoding:'utf8'}).trim();
+const dirs:string[]=[];afterEach(()=>{for(const d of dirs.splice(0))rmSync(d,{recursive:true,force:true});});
+const artifact=(dir:string,name:string,value:unknown)=>{writeFileSync(path.join(dir,name),`${JSON.stringify(value)}\n`,{mode:0o600});};
+const fake=()=>{const calls:Array<[string,string,unknown]>=[];let dispatchCount=0;const cancelled=new Set<number>();
+ const original={id:900,run_attempt:1,status:'in_progress',conclusion:null,head_sha:source,path:'.github/workflows/release-policy-commissioning.yml',repository:{id:1268462466,full_name:'aiosbrain/aios-team-brain'}};
+ const probe=(runId=901)=>({id:runId,workflow_id:13,run_attempt:1,status:cancelled.has(runId)?'completed':'waiting',conclusion:cancelled.has(runId)?'cancelled':null,head_sha:source,head_branch:'staging',path:'.github/workflows/release-reviewer-negative-probe.yml',event:'workflow_dispatch',created_at:'2026-09-26T09:00:00Z',updated_at:'2026-09-26T09:00:01Z',repository:{id:1268462466,full_name:'aiosbrain/aios-team-brain'},actor:{id:5806135,login:'johnellison',type:'User'},triggering_actor:{id:5806135,login:'johnellison',type:'User'}});
+ const environment=(name:string)=>({id:name==='staging-release'?11:12,name,deployment_branch_policy:{protected_branches:false,custom_branch_policies:true},protection_rules:[{type:'required_reviewers',prevent_self_review:true,reviewers:[{type:'User',id:5806135,login:'johnellison'}]},{type:'branch_policy'}]});
+ const jobs=(runId=901)=>['staging-release','staging-emergency'].map((name,n)=>({id:101+(runId-901)*2+n,run_id:runId,run_attempt:1,head_sha:source,name:n?'probe-emergency':'probe-release',environment:name,status:cancelled.has(runId)?'completed':'waiting',conclusion:cancelled.has(runId)?'cancelled':null,steps:[],runner_id:null,runner_name:null}));
+ const transport=async(method:string,target:string,body:unknown)=>{calls.push([method,target,body]);let status=200,bodyValue:any={};if(method==='POST'){status=204;bodyValue=null;if(target.endsWith('/dispatches'))dispatchCount++;else if(target.endsWith('/cancel'))cancelled.add(Number(target.match(/runs\/(\d+)\/cancel$/)?.[1]));else throw new Error(`unexpected write ${target}`);}
+ else if(target==='/repos/aiosbrain/aios-team-brain')bodyValue={id:1268462466,full_name:'aiosbrain/aios-team-brain',default_branch:'staging'};
+ else if(target.endsWith('/git/ref/heads/staging'))bodyValue={object:{sha:source}};
+ else if(target.endsWith('/actions/runs/900'))bodyValue=original;
+ else if(target.endsWith('/actions/runs/900/pending_deployments'))bodyValue=[{environment:{id:11,name:'staging-release'}},{environment:{id:12,name:'staging-emergency'}}];
+ else if(target.endsWith('/actions/runs/900/approvals'))bodyValue=[];
+ else if(target.endsWith('/actions/workflows/release-reviewer-negative-probe.yml'))bodyValue={id:13,path:'.github/workflows/release-reviewer-negative-probe.yml',name:'PC-06 reviewer negative probe',state:'active'};
+ else if(target.includes('/actions/workflows/13/runs?'))bodyValue={total_count:dispatchCount,workflow_runs:Array.from({length:dispatchCount},(_,n)=>probe(901+n))};
+ else if(/\/actions\/runs\/90[12](?:\/attempts\/1)?$/.test(target))bodyValue=probe(Number(target.match(/runs\/(\d+)/)?.[1]));
+ else if(/\/actions\/runs\/90[12]\/attempts\/1\/jobs\?/.test(target))bodyValue={total_count:2,jobs:jobs(Number(target.match(/runs\/(\d+)/)?.[1]))};
+ else if(/\/actions\/runs\/90[12]\/pending_deployments$/.test(target))bodyValue=cancelled.has(Number(target.match(/runs\/(\d+)/)?.[1]))?[]:[{environment:{id:11,name:'staging-release'}},{environment:{id:12,name:'staging-emergency'}}];
+ else if(/\/actions\/runs\/90[12]\/approvals$/.test(target))bodyValue=[];
+ else if(target.includes('/deployment-branch-policies?'))bodyValue={total_count:1,branch_policies:[{name:'staging',type:'branch'}]};
+ else if(target.includes('/environments/'))bodyValue=environment(target.endsWith('staging-release')?'staging-release':'staging-emergency');
+ else throw new Error(`unexpected fixture path ${target}`);
+ return {complete:true,status,body:bodyValue,raw_text:status===204?'':JSON.stringify(bodyValue)};};return {calls,transport};};
+async function setup(){const dir=mkdtempSync(path.join(tmpdir(),'reviewer-stage-'));chmodSync(dir,0o700);dirs.push(dir);artifact(dir,'commissioning-900-1-intent.json',{schema_version:1,repository:'aiosbrain/aios-team-brain',repository_id:1268462466,run_id:'900',attempt:'1',workflow_path:'.github/workflows/release-policy-commissioning.yml',workflow_sha:source});for(const name of ['staging-release','staging-emergency'])artifact(dir,`reviewer-900-1-${name}-admin-bypass.json`,{environment:name,can_admins_bypass:false});const lock=acquireJournalLock({dir,runId:'900',attempt:'1'});try{openJournal({dir,runId:'900',attempt:'1',lock,source}).append('run-opened',{phase:'active'});}finally{lock.release();}const f=fake();const options={runId:'900',attempt:'1',dir,control:'self_review_refused',observer:f.transport,hooksProjection:async()=>({status:200,entries:[]})};return {dir,f,options};}
+describe('reviewer staged one-shot lifecycle',()=>{
+ it('links the original before one fixed dispatch and refuses a competing dispatch without a second POST',async()=>{const {dir,f,options}=await setup();const session=await openSession(options);const staged=await stage(session);expect(staged.status).toBe('staged');expect(readJournal({dir,runId:'900',attempt:'1'}).filter(x=>x.type==='reviewer-probe-linked')).toHaveLength(1);expect(readReviewerJournal({dir,runId:'900',attempt:'1',kind:'reviewer-self'}).map(x=>x.event)).toEqual(['intent-linked']);const first=await dispatch(await openSession(options));expect(first.status).toBe('dispatch-sent');expect(f.calls.filter(x=>x[0]==='POST')).toHaveLength(1);await expect(dispatch(await openSession(options))).rejects.toThrow(/already consumed/);expect(f.calls.filter(x=>x[0]==='POST')).toHaveLength(1);});
+ it('consumes a dispatch with a lost response and never sends another',async()=>{const {dir,f,options}=await setup();await stage(await openSession(options));let writes=0;const lossy=async(method:string,target:string,body:unknown)=>{if(method==='POST'){writes++;return {complete:false,status:0};}return f.transport(method,target,body);};const result=await dispatch(await openSession({...options,observer:lossy}));expect(result.status).toBe('dispatch-response-lost');expect(writes).toBe(1);await expect(dispatch(await openSession({...options,observer:lossy}))).rejects.toThrow(/already consumed/);expect(writes).toBe(1);expect(readReviewerJournal({dir,runId:'900',attempt:'1',kind:'reviewer-self'}).map(x=>x.event)).toEqual(['intent-linked','dispatch-used']);});
+ it('blocks dispatch if a downstream hook is active',async()=>{const {dir,options}=await setup();await expect(stage(await openSession({...options,hooksProjection:async()=>({status:200,entries:[{id:'661488152',active:true,events:['*']}]})}))).rejects.toThrow(/trigger blocks dispatch/);expect(readReviewerJournal({dir,runId:'900',attempt:'1',kind:'reviewer-self'})).toHaveLength(0);});
+ it('retains two distinct human UI slots and a cancelled complete bundle that stays unverified',async()=>{const {dir,options}=await setup();const clock=()=>new Date('2026-09-26T09:00:00.000Z');const opts={...options,now:clock};await stage(await openSession(opts));await dispatch(await openSession(opts));const result=await collectSelf(await openSession(opts),{onSlot:async({slot,files}:{slot:{sha256:string},files:{session:string,image:string,participation:string,transcription:string}})=>{
+  artifact(dir,files.session,{source:'provider-ui',participant:{kind:'User',user_id:'5806135',login:'johnellison',provider_type:'User'},run_id:'901',attempt:'1',observed_at:clock().toISOString()});
+  writeFileSync(path.join(dir,files.image),Buffer.from([137,80,78,71,13,10,26,10,0,0,0,0]),{mode:0o600});
+  writeFileSync(path.join(dir,files.participation),`John personally used the UI for run 901 in ${files.participation.includes('staging-release')?'staging-release':'staging-emergency'} slot ${slot.sha256}`,{mode:0o600});
+  writeFileSync(path.join(dir,files.transcription),'Self-review action was not available in the provider UI.',{mode:0o600});
+ }});expect(result.status).toBe('diagnostic-unverified');expect(result.cleanup_status).toBe('complete');const bundleName='reviewer-900-1-self-bundle.json';const bytes=readFileSync(path.join(dir,bundleName));const assessed=diagnosticResult({dir,bundleRef:{artifact:bundleName,sha256:digest(bytes)},journalRecords:readReviewerJournal({dir,runId:'900',attempt:'1',kind:'reviewer-self'}),originalRecords:readJournal({dir,runId:'900',attempt:'1'})});expect(assessed.status).toBe('diagnostic-unverified');expect(assessed.observations).toBe(2);
+ });
+});
+
+describe('isolated App diagnostic request',()=>{
+ it('stops after the first generic 403, cancels the second inert run and revokes only its token',async()=>{
+  const {dir,f,options}=await setup();const clock=()=>new Date('2026-09-26T09:00:00.000Z');const selfOpts={...options,now:clock};
+  await stage(await openSession(selfOpts));await dispatch(await openSession(selfOpts));
+  await collectSelf(await openSession(selfOpts),{onSlot:async({slot,files}:{slot:{sha256:string},files:{session:string,image:string,participation:string,transcription:string}})=>{
+   artifact(dir,files.session,{source:'provider-ui',participant:JOHN,run_id:'901',attempt:'1',observed_at:clock().toISOString()});
+   writeFileSync(path.join(dir,files.image),Buffer.from([137,80,78,71,13,10,26,10,0,0,0,0]),{mode:0o600});
+   writeFileSync(path.join(dir,files.participation),`John personally used the UI for run 901 in ${files.participation.includes('staging-release')?'staging-release':'staging-emergency'} slot ${slot.sha256}`,{mode:0o600});
+   writeFileSync(path.join(dir,files.transcription),'The provider UI did not permit self-review.',{mode:0o600});
+  }});
+  const selfIntent=JSON.parse(readFileSync(path.join(dir,'reviewer-900-1-self-intent.json'),'utf8'));
+  const priorBytes=readFileSync(path.join(dir,'reviewer-900-1-self-lifecycle.json'));const prior={artifact:'reviewer-900-1-self-lifecycle.json',sha256:digest(priorBytes)};
+  const owner=retain(dir,'synthetic-owner.json','{}');const provisioning=retain(dir,'synthetic-provisioning.json',`${canonical({provisioning_version:1,principal:{kind:'AppInstallation',app_id:'5043150',app_slug:'aios-reviewer-diagnostic',installation_id:'163986129',account_id:'293764221',account_login:'aiosbrain',repository_id:'1268462466'},required_permissions:{deployments:'write',metadata:'read'},repository_selection:'selected',owner_decision:owner})}\n`);
+  const app={kind:'AppInstallation',app_id:'5043150',app_slug:'aios-reviewer-diagnostic',installation_id:'163986129',account_id:'293764221',account_login:'aiosbrain',repository_id:'1268462466'};
+  const i={...selfIntent,control:'unauthorized_reviewer_refused',submitter:app,prior_probe:prior,provisioning,existing_runs:['901'],journal_artifact:'commissioning-900-1.reviewer-app.jsonl'};
+  const intentRef=retain(dir,'reviewer-900-1-app-intent.json',`${canonical(i)}\n`);
+  const resourceLock=acquireJournalLock({dir,runId:'900',attempt:'1'});let seq;
+  try{const j=openJournal({dir,runId:'900',attempt:'1',lock:resourceLock,source});seq=j.append('reviewer-probe-linked',{control:i.control,intent_sha256:intentRef.sha256,probe_journal_artifact:i.journal_artifact}).seq;}finally{resourceLock.release();}
+  const originalLink=retain(dir,'reviewer-900-1-app-original-link-001.json',`${canonical({link_version:1,control:i.control,original_run_id:'900',original_attempt:'1',journal_seq:seq,intent_sha256:intentRef.sha256,journal_artifact:i.journal_artifact})}\n`);
+  const reviewerLock=acquireJournalLock({dir,runId:'900',attempt:'1',kind:'reviewer-app'});
+  try{openReviewerJournal({dir,runId:'900',attempt:'1',kind:'reviewer-app',intentSha256:intentRef.sha256,lock:reviewerLock,now:clock}).append('intent-linked',{intent:intentRef,original_link:originalLink});}finally{reviewerLock.release();}
+  const appOpts={...options,control:'unauthorized_reviewer_refused',now:clock};await dispatch(await openSession(appOpts));
+  let reviews=0,revokes=0,mints=0;const response=(status:number,body:unknown)=>({complete:true,status,body,raw_text:status===204?'':JSON.stringify(body)});
+  const jwtAdapter=async(method:string,target:string)=>{if(method==='GET'&&target==='/app')return response(200,{id:5043150,slug:'aios-reviewer-diagnostic'});if(method==='GET'&&target==='/app/installations/163986129')return response(200,{id:163986129,app_id:5043150,account:{id:293764221,login:'aiosbrain'},repository_selection:'selected',permissions:{deployments:'write',metadata:'read'}});if(method==='POST'&&target.endsWith('/access_tokens')){mints++;return response(201,{token:'synthetic-in-memory-token',expires_at:'2026-09-26T09:20:00Z',repositories:[{id:1268462466}],permissions:{deployments:'write',metadata:'read'}});}throw new Error('unexpected JWT route');};
+  const tokenFactory=(_token:string)=>async(method:string,target:string)=>{if(method==='GET'&&target.startsWith('/installation/repositories?'))return response(200,{total_count:1,repositories:[{id:1268462466,full_name:'aiosbrain/aios-team-brain'}]});if(method==='POST'&&target.endsWith('/pending_deployments')){reviews++;return response(403,{message:'Forbidden'});}if(method==='DELETE'&&target==='/installation/token'){revokes++;return response(204,null);}throw new Error('unexpected token route');};
+  const result=await collectApp(await openSession(appOpts),{appJwtAdapter:jwtAdapter,tokenAdapterFactory:tokenFactory});
+  expect(result.status).toBe('diagnostic-unverified');expect(result.reason).toBe('unknown_cause');expect(result.cleanup_status).toBe('complete');expect({mints,reviews,revokes}).toEqual({mints:1,reviews:1,revokes:1});
+  const journal=readReviewerJournal({dir,runId:'900',attempt:'1',kind:'reviewer-app'});expect(journal.filter(x=>x.event==='review-used')).toHaveLength(1);expect(journal.map(x=>x.event)).toContain('token-revoke-used');
+  const bundleName='reviewer-900-1-app-bundle.json';const bytes=readFileSync(path.join(dir,bundleName));const assessed=diagnosticResult({dir,bundleRef:{artifact:bundleName,sha256:digest(bytes)},journalRecords:journal,originalRecords:readJournal({dir,runId:'900',attempt:'1'}),provisioned:app});expect(assessed.status).toBe('diagnostic-unverified');expect(assessed.observations).toBe(1);
+ },20000);
+});

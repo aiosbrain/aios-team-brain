@@ -2014,3 +2014,75 @@ bounds — and its response can satisfy no actor case.
   and it is the one a resumed run most needs read back before deciding anything. Recoveries are
   serialised by their own lock, and a recovery whose original lock was replaced while it was
   reconciling refuses rather than removing the new owner's lock.
+
+### Reviewer negative probes — diagnostic collection only (PC-06)
+
+The separate `release-reviewer-negative-probe.yml` workflow is inert: its two one-minute jobs run
+only `:` after their staging environment gates. It has no credentials, checkout, action or candidate
+code. The local collector under `scripts/staging-ops/reviewer-negative-probe-operator.mjs` measures two
+*different* runs: John's own UI review attempt first, then an unauthorized deployment-only App
+request. Neither observation satisfies PC-06. The accepted collector format always reports
+`diagnostic-unverified`; no refusal parser or positive human approval path exists in this version.
+The original protected commissioning run remains active and unapproved while these are measured.
+
+After the inert workflow and collector have passed ordinary review/CI and are registered on the exact
+reviewed staging source, create a private mode-0700 evidence directory for the original commissioning
+run. The original intent and active run, baseline policy, source and original journal must already be
+there. Retain both environments' original UI administrator-bypass observations at the fixed names
+`reviewer-<run>-<attempt>-staging-release-admin-bypass.json` and
+`reviewer-<run>-<attempt>-staging-emergency-admin-bypass.json`, mode 0600, with exact
+`{"environment":"staging-release","can_admins_bypass":false}` (and the matching emergency name).
+These are real UI observations; the API does not supply that fact. Do not create them from an API
+boolean. Keep the original evidence and diagnostic captures private for at least 30 days.
+
+From the checkout containing the exact reviewed staging commit, use only the original run ID,
+attempt and absolute private evidence directory as CLI arguments:
+
+```sh
+node scripts/staging-ops/reviewer-negative-probe-operator.mjs stage-self --run-id <original-run> --attempt 1 --evidence-dir <private-dir>
+node scripts/staging-ops/reviewer-negative-probe-operator.mjs dispatch-self --run-id <original-run> --attempt 1 --evidence-dir <private-dir>
+node scripts/staging-ops/reviewer-negative-probe-operator.mjs collect-self --run-id <original-run> --attempt 1 --evidence-dir <private-dir>
+```
+
+`stage-self` retains a source/policy/trigger baseline and an immutable intent before the single
+fixed dispatch. `collect-self` discovers exactly one new John-dispatched run, confirms the two
+waiting jobs, issues one 15-second UI slot at a time, and prints the fixed job URL and filenames.
+John must personally use the authenticated GitHub UI during that slot. For each environment he
+supplies an original PNG screenshot, exact UI text transcription, original UI session identity record
+and a contemporaneous communication saying he personally acted on the named run/environment and
+slot digest. The files must use the names printed by the command and be mode 0600. An agent's `gh`
+identity or screenshot inspection is not participation. Missing or late evidence consumes the slot;
+no interaction is retried. The collector deliberately cancels only its identified inert run and
+confirms terminal jobs. A lost dispatch or cancel response is reconciled by reads, never resent.
+
+The separately owner-adjudicated nonsecret `diagnostic-provisioning.json` and
+`diagnostic-owner-decision.json` must be copied as original bytes into the same private directory
+before the App stage; the collector checks their pinned hashes and measures live App, installation,
+repository selection and permission records again. The App's private key path is provided only to
+the isolated `collect-app` process through `AIOS_REVIEWER_DIAGNOSTIC_APP_KEY_PATH`; do not pass key
+bytes or an installation token through argv, Actions, logs or evidence files. The root operator must
+make the provisioning decision and copy the record; the collector never creates or removes an App.
+
+```sh
+node scripts/staging-ops/reviewer-negative-probe-operator.mjs stage-app --run-id <original-run> --attempt 1 --evidence-dir <private-dir>
+node scripts/staging-ops/reviewer-negative-probe-operator.mjs dispatch-app --run-id <original-run> --attempt 1 --evidence-dir <private-dir>
+AIOS_REVIEWER_DIAGNOSTIC_APP_KEY_PATH=<local-private-key-path> node scripts/staging-ops/reviewer-negative-probe-operator.mjs collect-app --run-id <original-run> --attempt 1 --evidence-dir <private-dir>
+node scripts/staging-ops/reviewer-negative-probe-operator.mjs assess --run-id <original-run> --attempt 1 --evidence-dir <private-dir>
+```
+
+The App process mints only one selected-repository deployments-write installation token, checks
+its live single-repository scope, and may submit one fixed review body to a waiting inert run. The
+first unknown non-2xx response, including a generic 403, stops further submissions; a 2xx is
+unexpected admission and also stops. It cancels the owned run, then revokes only the in-memory
+owned token after a durable one-use marker. A lost response or crash consumes that marker; a later
+process never blindly mints, submits or revokes again. Observed passage of the token's actual
+recorded expiry can resolve token cleanup only after that deadline. It does not remove the App grant.
+
+If an explicit `cancel-self` or `cancel-app` is needed, use the same three arguments. `recover-self`
+/ `recover-app` can clear an orphan local lock only after the recorded local PID is demonstrably gone
+and exact provider readbacks reconcile the journal; recovery is cleanup-only. Never remove a lock
+by elapsed time or start another original attempt under its consumed marker. An unresolved run,
+active job, changed source/policy/trigger inventory, lost token identity or failed terminal
+confirmation leaves cleanup blocked and the original commissioning assessment unverified. The
+original bot-dispatched run still needs John's genuine independent approvals and successful
+protected jobs for a future positive release decision.
