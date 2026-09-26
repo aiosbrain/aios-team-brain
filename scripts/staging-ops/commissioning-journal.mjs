@@ -30,7 +30,7 @@
 import { createHash } from "node:crypto";
 import {
   closeSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync,
-  renameSync, statSync, unlinkSync, writeSync,
+  renameSync, statSync, unlinkSync, writeSync, constants,
 } from "node:fs";
 import { hostname } from "node:os";
 import path from "node:path";
@@ -510,7 +510,11 @@ export function readReviewerJournal({ dir, runId, attempt, kind }) {
   const file = journalPath(dir, runId, attempt, kind);
   assertRegularOrAbsent(file);
   let body;
-  try { body = readFileSync(file, "utf8"); } catch (error) {
+  try {
+    const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try { const stat = fstatSync(fd); if (!stat.isFile() || (stat.mode & 0o777) !== 0o600 || stat.size > 32 * 1024 * 1024) throw new JournalChainError("reviewer journal type/mode/size invalid"); body = readFileSync(fd, "utf8"); }
+    finally { closeSync(fd); }
+  } catch (error) {
     if (error?.code === "ENOENT") return [];
     throw error;
   }
@@ -560,8 +564,10 @@ export function openReviewerJournal({ dir, runId, attempt, kind, intentSha256, l
       const record = { journal_version: 1, seq: prior.length + 1, prev_sha256: prev, at: now().toISOString(),
         original_run_id: String(runId), original_attempt: String(attempt), intent_sha256: intentSha256, event, payload };
       replayReviewer([...prior.map((r) => ({ type: r.event, data: r.payload, at: r.at })), { type: event, data: payload, at: record.at }]);
-      const fd = openSync(file, "a", 0o600);
-      try { writeSync(fd, `${reviewerCanonical(record)}\n`); fsyncSync(fd); } finally { closeSync(fd); }
+      const fd = openSync(file, constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+      try { const stat = fstatSync(fd); if (!stat.isFile() || (stat.mode & 0o777) !== 0o600) throw new JournalRefusalError("reviewer journal file changed"); writeSync(fd, `${reviewerCanonical(record)}\n`); fsyncSync(fd); } finally { closeSync(fd); }
+      const directory = openSync(root, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try { fsyncSync(directory); } finally { closeSync(directory); }
       return record;
     },
   };
