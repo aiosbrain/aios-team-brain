@@ -586,6 +586,14 @@ migration. Validate the exact candidate on Railway staging before production rel
 uses `staging`, and production promotion follows `docs/RELEASING.md`. Deferring a manual migration
 command does not defer the deployed artifact's DDL.
 
+**Planned MCP contract supplement (AIO-1185):**
+[`docs/design/mcp-next-contract-v1.md`](design/mcp-next-contract-v1.md) describes the
+separate proposed `mcp-next-v1` specification and its vendored test fixtures. It
+does not enable routes or change the runtime version declaration. The historical
+Brain baseline inspected for this supplement declared 1.23; the current staging
+member API and canonical Workspace contract both declare 1.27. Supplement conformance is specification
+validation, not proof that governed actions or revision-safe task writes ship.
+
 Brain API 1.19 opens `POST /api/v1/query` to delegated `aiosd_*` tokens (Phase B slice 3, spec
 §10/§17-B), retiring 1.18's 403 `delegation_not_supported` on that route. A delegated query is
 ALWAYS attenuated — retrieval filters to the token's live triple-intersection effective set and

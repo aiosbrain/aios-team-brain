@@ -72,9 +72,10 @@ import { buildMainRulesets, REQUIRED_MAIN_CONTEXTS, verifyEffectiveMainPolicy } 
  */
 const resolveInstallationTokenHelper = async () => (await import("./release-controller.mjs")).createInstallationToken;
 import {
-  JournalChainError, acquireJournalLock, assertPrivateDirectory, openJournal, readJournal, recordWitnessEventOnce,
+  JournalChainError, acquireJournalLock, assertPrivateDirectory, openJournal, readJournal, readReviewerJournal, recordWitnessEventOnce,
   reduceResourceLifecycles, writeJournalSnapshot,
 } from "./commissioning-journal.mjs";
+import { diagnosticResult as assessReviewerDiagnostic, fileRef as reviewerFileRef } from "./reviewer-negative-probe.mjs";
 import {
   CHALLENGE_DIRECTIONS, CLOUD_CASE_SEQUENCE, COMMISSION_DOMAIN,
   REHEARSAL_CASE_ID, REHEARSAL_DOMAIN, REHEARSAL_ROLE, REHEARSAL_TARGET,
@@ -6872,6 +6873,22 @@ export function validateEnvironmentControl(record, { dir, key, environment, envi
   if (!schema) return `names the control ${JSON.stringify(String(key))}, which is outside the closed PC-06 list`;
   if (record === undefined || record === null) return "is absent";
   if (typeof record !== "object" || Array.isArray(record)) return "is not a control record";
+  if (Object.hasOwn(record, "reviewer_diagnostic_version")) {
+    if (key !== "self_review_refused" && key !== "unauthorized_reviewer_refused") return "carries a reviewer diagnostic marker under the wrong control";
+    if (Object.keys(record).sort().join("|") !== "artifact|reviewer_diagnostic_version|sha256|status"
+      || record.reviewer_diagnostic_version !== 1 || record.status !== "unverified") return "has an invalid reviewer diagnostic reference";
+    try {
+      const ref = reviewerFileRef({ artifact: record.artifact, sha256: record.sha256 });
+      // A diagnostic descriptor is reviewable, but no diagnostic result in this revision can
+      // supply the accepting 'refused' value. The original protected run still needs real approval.
+      const kind = key === "self_review_refused" ? "reviewer-self" : "reviewer-app";
+      const result = assessReviewerDiagnostic({ dir, bundleRef: ref,
+        journalRecords: readReviewerJournal({ dir, runId, attempt, kind }),
+        originalRecords: readJournal({ dir, runId, attempt }) });
+      return result.status === "invalid-diagnostic" || result.control !== key
+        ? `has invalid diagnostic evidence (${result.reason ?? "wrong control"})` : "is diagnostic-unverified";
+    } catch (error) { return `has invalid diagnostic evidence (${error.message})`; }
+  }
   /**
    * ── THE ONE CROSS-RUN VARIANT, SELECTED EXPLICITLY (accepted PC-06 API-only design) ─────────────
    *
