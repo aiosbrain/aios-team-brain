@@ -1,10 +1,10 @@
-import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { acquireJournalLock, openReviewerJournal, readReviewerJournal } from '../scripts/staging-ops/commissioning-journal.mjs';
 import { validateEnvironmentControl } from '../scripts/staging-ops/policy-commissioning.mjs';
-import { JOHN, WORKFLOW_PATH, WORKFLOW_NAME, assertWorkflow, apiInteraction, canonical, capture, diagnosticResult, digest, environmentPair, fileRef, fixedReviewBody, image, installation, intent, json, lifecycle, original, probe, readCapture, replay, retain, retained, reviewerEvent, slot, state, time, tokenRecord, user } from '../scripts/staging-ops/reviewer-negative-probe.mjs';
+import { JOHN, WORKFLOW_PATH, WORKFLOW_NAME, capture, diagnosticResult, environmentPair, fileRef, fixedReviewBody, image, installation, intent, json, original, probe, replay, retain, retained, slot, time, user } from '../scripts/staging-ops/reviewer-negative-probe.mjs';
 
 const folders:string[]=[];afterEach(()=>{for(const p of folders.splice(0))rmSync(p,{recursive:true,force:true});});
 const privateDir=()=>{const p=mkdtempSync(path.join(tmpdir(),'reviewer-negative-'));chmodSync(p,0o700);folders.push(p);return p;};
@@ -37,7 +37,8 @@ describe('reviewer diagnostic closed and nonaccepting boundary',()=>{
  });
  it('rejects replayed mutation/review markers and never treats a 403 as refusal',()=>{
   const events=[{type:'intent-linked',data:appendPayload},{type:'dispatch-used',data:{workflow_id:'13',sha,ref:'staging',body_sha256:h,before_runs:ref,trigger:ref,deadline:at}},{type:'dispatch-reconciled',data:{run_id:'901',attempt:'1',discovered:ref,matching_count:1}},{type:'review-used',data:{environment:envs[0],channel:'human-ui',state:ref,trigger:ref,slot:ref}}];
-  expect(replay(events).complete).toBe(false);expect(()=>replay([...events,events.at(-1)])).toThrow();expect(()=>replay([...events,{type:'review-used',data:{...events.at(-1)!.data,environment:envs[1]}}])).not.toThrow();
+  expect(replay(events).complete).toBe(false);expect(()=>replay([...events,events.at(-1)])).toThrow();expect(()=>replay([...events,{type:'review-used',data:{...events.at(-1)!.data,environment:envs[1]}}])).toThrow();
+  expect(()=>replay([...events,{type:'review-observed',data:{environment:envs[0],interaction:ref,after:ref}},{type:'review-used',data:{...events.at(-1)!.data,environment:envs[1]}}])).not.toThrow();
   expect(()=>replay([...events,{type:'stop',data:{reason:'unknown_cause',state:ref}},{type:'review-used',data:{...events.at(-1)!.data,environment:envs[1]}}])).toThrow();
   expect(diagnosticResult({dir:privateDir(),bundleRef:ref}).status).toBe('invalid-diagnostic');
  });

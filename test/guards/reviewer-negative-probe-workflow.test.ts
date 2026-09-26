@@ -6,7 +6,8 @@ import { assertWorkflow, WORKFLOW_PATH, WORKFLOW_NAME } from '../../scripts/stag
 import { inducedTriggers, fixedRead, fixedMutation, makeBoundary } from '../../scripts/staging-ops/reviewer-negative-probe-operator.mjs';
 
 const source=readFileSync(join(__dirname,'../..',WORKFLOW_PATH),'utf8');
-const doc=parseYaml(source);
+type WorkflowDoc = { on: Record<string, unknown>; permissions: unknown; jobs: Record<string, { steps: unknown; if: unknown; environment: unknown; env?: unknown }> };
+const doc=parseYaml(source) as WorkflowDoc;
 describe('PC-06 inert reviewer workflow',()=>{
  it('has exactly the fixed trigger, permissions and two literal no-op jobs',()=>{
   expect(assertWorkflow(source).name).toBe(WORKFLOW_NAME);
@@ -16,10 +17,10 @@ describe('PC-06 inert reviewer workflow',()=>{
  });
  it('rejects extra trigger, permission, code, job and changed admission',()=>{
   for(const mutate of [
-   (x:any)=>{x.on.push=null;},(x:any)=>{x.permissions={contents:'read'};},
-   (x:any)=>{x.jobs.extra={...x.jobs['probe-release']};},(x:any)=>{x.jobs['probe-release'].steps=[{run:'echo hello'}];},
-   (x:any)=>{x.jobs['probe-release'].if='true';},(x:any)=>{x.jobs['probe-release'].environment='staging-emergency';},
-   (x:any)=>{x.jobs['probe-release'].env={SECRET:'x'};},
+   (x:WorkflowDoc)=>{x.on.push=null;},(x:WorkflowDoc)=>{x.permissions={contents:'read'};},
+   (x:WorkflowDoc)=>{x.jobs.extra={...x.jobs['probe-release']};},(x:WorkflowDoc)=>{x.jobs['probe-release'].steps=[{run:'echo hello'}];},
+   (x:WorkflowDoc)=>{x.jobs['probe-release'].if='true';},(x:WorkflowDoc)=>{x.jobs['probe-release'].environment='staging-emergency';},
+   (x:WorkflowDoc)=>{x.jobs['probe-release'].env={SECRET:'x'};},
   ]){const x=structuredClone(doc);mutate(x);expect(()=>assertWorkflow(JSON.stringify(x))).toThrow();}
  });
  it('blocks potentially induced workflows and active hooks; excludes an exact other workflow_run name',()=>{
