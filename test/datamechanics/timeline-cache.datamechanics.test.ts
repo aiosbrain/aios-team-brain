@@ -118,7 +118,7 @@ describe("work-timeline cache layer (real Postgres)", () => {
     expect((extRow?.payload as { days: unknown[] }).days.length).toBe(0);
   });
 
-  it("SWR: a stale row is served immediately, and the background rebuild picks up new work", async () => {
+  it("rebuilds inline when a stale row's visible item set changed", async () => {
     const seed = await seedLinkedTeam();
     await seedCommit(seed, "commit-a", recentIso());
     const { days: first } = await getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId); // cold miss → builds [A], persists
@@ -138,13 +138,11 @@ describe("work-timeline cache layer (real Postgres)", () => {
     await seedCommit(seed, "commit-b", recentIso());
     await bustTeamTimeline(db(), seed.teamId);
 
-    // Next read returns the STALE payload immediately (still 1 item) and fires the background rebuild.
-    const { days: staleServe } = await getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId);
-    expect(evCount(staleServe.flatMap((d) => d.people))).toBe(1); // served stale, not yet rebuilt
+    // A changed visible item set invalidates stale serving, even when the project-set key matches.
+    const { days: rebuilt } = await getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId);
+    expect(evCount(rebuilt.flatMap((d) => d.people))).toBe(2);
 
-    // The deduped background rebuild lands the new payload (2 items) into the persisted row. Await the
-    // actual in-flight promise rather than polling a timeout — the rebuild does real DB work, so a fixed
-    // budget is a race, not an assertion (this failed ~1 in 3 on a loaded runner).
+    // The background synopsis pass may follow the inline build; wait for its actual promise.
     await settleTimelineRefreshes();
     const row = await readRow(seed, "team");
     const days = ((row?.payload as { days?: { people: { tasks: { evidenceCount: number }[] }[] }[] })?.days) ?? [];

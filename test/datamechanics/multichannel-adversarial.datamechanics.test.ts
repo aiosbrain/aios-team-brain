@@ -171,17 +171,25 @@ describe("multi-channel adversarial retrieval (real Postgres)", () => {
     // "Atlas" means different things per channel: a project in #eng, a vendor in #sales. Scoping
     // explicitly ("...in the sales channel") now filters retrieval to that channel's path prefix, so
     // the #eng Atlas no longer bleeds in — while an UNSCOPED "Atlas" query still sees both.
-    await post("slack/eng", "atlas", "Project Atlas: refactoring the retrieval layer to add reranking.");
-    await post("slack/sales", "atlas", "Atlas Corp (vendor) sent the renewal quote for the analytics contract.");
+    // Use the exact legacy Slack path shape; the shared namespace parser does not assign an
+    // identity to arbitrary filenames such as the suite's generic post() helper creates.
+    const eng = "slack/eng/1718900000.000100.md";
+    const sales = "slack/sales/1718900000.000100.md";
+    await ingest(seed, { kind: "transcript", path: eng,
+      body: "Project Atlas: refactoring the retrieval layer to add reranking.", access: "team",
+      frontmatter: { source: "slack", channel: "eng" } });
+    await ingest(seed, { kind: "transcript", path: sales,
+      body: "Atlas Corp (vendor) sent the renewal quote for the analytics contract.", access: "team",
+      frontmatter: { source: "slack", channel: "sales" } });
 
     const scoped = await paths("what's the latest on Atlas in the sales channel?");
-    expect(scoped).toContain("slack/sales/atlas.md");
+    expect(scoped).toContain(sales);
     expect(scoped.filter((p) => p.startsWith("slack/eng/")), "eng bled into a sales-scoped query").toEqual([]);
 
     // Sanity: without a scope, both channels' Atlas are eligible (no over-filtering).
     const unscoped = await paths("what's the latest on Atlas?");
-    expect(unscoped).toContain("slack/sales/atlas.md");
-    expect(unscoped).toContain("slack/eng/atlas.md");
+    expect(unscoped).toContain(sales);
+    expect(unscoped).toContain(eng);
   });
 
   // Deleted WITH its subject (PRET-6): "STRENGTH: task aggregation is correct past the 80 cap

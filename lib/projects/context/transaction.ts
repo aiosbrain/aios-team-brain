@@ -20,6 +20,7 @@ export interface LockedItemAuthority {
   work_at: string;
   member_id: string | null;
   member_id_locked: boolean | null;
+  actor: string;
   frontmatter: Record<string, unknown> | null;
   created_at: string;
   work_at_from_source: boolean | null;
@@ -99,7 +100,7 @@ export async function lockItemContext(
 ): Promise<LockedItemContext | null> {
   const result = await withAcquisitionTimeout(session, () =>
     session.executeSql<LockedItemAuthority>(
-      `select id, access, content_sha256, work_at, project_id, path, kind, member_id,
+      `select id, access, content_sha256, work_at, project_id, path, kind, member_id, actor,
               member_id_locked, frontmatter, created_at, work_at_from_source
          from items
         where team_id = $1 and id = $2
@@ -127,7 +128,7 @@ export async function lockIngestItemByPath(
 ): Promise<LockedItemContext | null> {
   const result = await withAcquisitionTimeout(session, () =>
     session.executeSql<LockedItemAuthority>(
-      `select id, access, content_sha256, work_at, project_id, path, kind, member_id,
+      `select id, access, content_sha256, work_at, project_id, path, kind, member_id, actor,
               member_id_locked, frontmatter, created_at, work_at_from_source
          from items
         where team_id = $1 and project_id = $2 and path = $3
@@ -151,7 +152,7 @@ export async function refreshLockedItemContext(
   context: LockedItemContext
 ): Promise<LockedItemContext | null> {
   const result = await context.session.executeSql<LockedItemAuthority>(
-    `select id, access, content_sha256, work_at, project_id, path, kind, member_id,
+    `select id, access, content_sha256, work_at, project_id, path, kind, member_id, actor,
             member_id_locked, frontmatter, created_at, work_at_from_source
        from items
       where team_id = $1 and id = $2`,

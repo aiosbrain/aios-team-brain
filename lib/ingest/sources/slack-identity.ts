@@ -22,5 +22,6 @@ export async function syncSlackIdentities(
   teamId: string,
   users: SlackUser[]
 ): Promise<SlackIdentitySyncResult> {
-  return syncProviderIdentities(admin, teamId, "slack", users);
+  // Exact email only: Slack attribution must never rest on the local-part → handle guess (spec AC-07).
+  return syncProviderIdentities(admin, teamId, "slack", users, { exactEmailOnly: true });
 }

@@ -153,6 +153,85 @@ describe("groupTimeline (evidence-gated task → evidence nesting; unlinked work
   });
 });
 
+describe("groupTimeline Slack evidence visibility", () => {
+  const messages = (prefix: string, source: string, count: number, taskId: string | null) =>
+    Array.from({ length: count }, (_, n) => ev({
+      id: `${prefix}-${n}`,
+      title: `${prefix} ${n}`,
+      source,
+      kind: "message",
+      at: `2026-07-22T${String(n).padStart(2, "0")}:00:00Z`,
+      taskId,
+    }));
+
+  it("keeps every loaded Slack row in both task and Other groups while other sources retain the default cap", () => {
+    const evidence = [
+      ...messages("linked-slack", "slack", 9, "t1"),
+      ...messages("other-slack", "slack", 8, null),
+      ...messages("linked-github", "github", 7, "t1"),
+      ...messages("other-notion", "notion", 7, null),
+    ].reverse();
+    const p = groupTimeline(evidence, taskInfo, members, today)[0].people[0];
+    const linked = new Map(p.tasks[0].sources.map((group) => [group.source, group]));
+    const other = new Map(p.other.map((group) => [group.source, group]));
+
+    expect(p.tasks[0].evidenceCount).toBe(16);
+    expect(p.unlinked).toBe(15);
+    expect(p.total).toBe(31);
+    expect(linked.get("slack")?.count).toBe(9);
+    expect(linked.get("slack")?.items.map((item) => item.id)).toEqual(
+      Array.from({ length: 9 }, (_, n) => `linked-slack-${8 - n}`),
+    );
+    expect(other.get("slack")?.count).toBe(8);
+    expect(other.get("slack")?.items.map((item) => item.id)).toEqual(
+      Array.from({ length: 8 }, (_, n) => `other-slack-${7 - n}`),
+    );
+    expect(linked.get("github")?.count).toBe(7);
+    expect(linked.get("github")?.items).toHaveLength(6);
+    expect(other.get("notion")?.count).toBe(7);
+    expect(other.get("notion")?.items).toHaveLength(6);
+  });
+
+  it("ignores an explicit evidence cap for Slack, retaining it for other sources and signals", () => {
+    const evidence = [
+      ...messages("linked-slack", "slack", 7, "t1"),
+      ...messages("other-slack", "slack", 7, null),
+      ...messages("linked-github", "github", 4, "t1"),
+      ...messages("other-notion", "notion", 4, null),
+    ];
+    const signals: SignalWithMember[] = Array.from({ length: 4 }, (_, n) => ({
+      id: `decision-${n}`, memberId: "m1", kind: "decision", title: `Decision ${n}`, at: today,
+    }));
+    const p = groupTimeline(evidence, taskInfo, members, today, 2, signals)[0].people[0];
+    const linked = new Map(p.tasks[0].sources.map((group) => [group.source, group]));
+    const other = new Map(p.other.map((group) => [group.source, group]));
+
+    expect(linked.get("slack")?.items).toHaveLength(7);
+    expect(other.get("slack")?.items).toHaveLength(7);
+    expect(linked.get("github")?.count).toBe(4);
+    expect(linked.get("github")?.items).toHaveLength(2);
+    expect(other.get("notion")?.count).toBe(4);
+    expect(other.get("notion")?.items).toHaveLength(2);
+    expect(p.signals[0].count).toBe(4);
+    expect(p.signals[0].items).toHaveLength(2);
+    expect(p.total).toBe(22);
+    const prompt = summaryPromptFor(p, "Today", 2);
+    expect(prompt).toContain("linked-slack 6; linked-slack 5");
+    expect(prompt).not.toContain("linked-slack 4");
+  });
+
+  it("orders equal-time Slack rows by evidence ID regardless of fetch order", () => {
+    const pair = [
+      ev({ id: "b", taskId: "t1", source: "slack", at: "2026-07-22T09:00:00Z" }),
+      ev({ id: "a", taskId: "t1", source: "slack", at: "2026-07-22T09:00:00Z" }),
+    ];
+    const ids = (rows: EvidenceWithMember[]) => groupTimeline(rows, taskInfo, members, today)[0]
+      .people[0].tasks[0].sources[0].items.map((item) => item.id);
+    expect(ids(pair)).toEqual(["a", "b"]);
+    expect(ids([...pair].reverse())).toEqual(["a", "b"]);
+  });
+});
+
 /**
  * Spec for the Home "Working on" collapse: one entry per person = their MOST RECENT day of work,
  * ordered by recency. This is what makes "Working on" identical to (a slice of) the Timeline.

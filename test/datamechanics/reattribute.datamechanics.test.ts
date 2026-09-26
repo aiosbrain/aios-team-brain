@@ -3,8 +3,13 @@ import { describe, expect, it } from "vitest";
 import { ingestItem } from "@/lib/ingest";
 import { reattributeItems } from "@/lib/ingest/reattribute";
 import { setMemberIdentity } from "@/lib/identity/member-identities";
+import { readSlackTeamGenerations } from "@/lib/ingest/slack-message-ledger";
+import { transactionCapability } from "@/lib/projects/context/transaction";
 import { addAuthorAlias } from "@/lib/admin/aliases";
-import { db, seedTeam, sha, type Seed } from "./helpers";
+import { db, seedTeam, sha, transactionSessionDecoratedDb, type Seed } from "./helpers";
+
+const generation = (teamId: string) => transactionCapability(db()).transaction(async (s) =>
+  (await readSlackTeamGenerations(s, teamId)).identityGeneration);
 
 // Spec: ingest only stamps items.member_id on create/change, and (post attribution-fix) an
 // unresolved author is left unattributed (null), never falling back to the ingesting connector.
@@ -125,11 +130,133 @@ describe("reattributeItems (real Postgres)", () => {
       provider: "slack",
       externalId: "U1",
     });
+    expect(await generation(seed.teamId)).toBe("1");
     const s = await reattributeItems(db(), seed.teamId);
     expect(s.updated).toBe(1);
     expect(await memberOf(seed.teamId, "slack/eng/1.md")).toBe(author); // now the real person
+    expect(await generation(seed.teamId)).toBe("3"); // item and its historical version changed
 
     expect((await reattributeItems(db(), seed.teamId)).updated).toBe(0); // idempotent
+    expect(await generation(seed.teamId)).toBe("3");
+  });
+
+  it("rolls back a Slack attribution row if its revision cannot be written", async () => {
+    const seed = await seedTeam();
+    const connector = await addMember(seed.teamId, { connector: true });
+    const author = await addMember(seed.teamId);
+    await putUnresolved(seed, connector, "slack/eng/failed-revision.md",
+      { source: "slack", author_id: "U-failed-revision" });
+    await setMemberIdentity(db(), seed.teamId, author,
+      { provider: "slack", externalId: "U-failed-revision" });
+    const failing = transactionSessionDecoratedDb(db(), (session) => ({ ...session,
+      executeSql: async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        if (sql.includes("update slack_team_state") && sql.includes("identity_generation")) {
+          throw new Error("generation unavailable");
+        }
+        return session.executeSql<T>(sql, params);
+      },
+    }));
+    await expect(reattributeItems(failing, seed.teamId)).rejects.toThrow("generation unavailable");
+    expect(await memberOf(seed.teamId, "slack/eng/failed-revision.md")).toBeNull();
+    expect(await versionMembersOf(seed.teamId, "slack/eng/failed-revision.md")).toEqual([null]);
+    expect(await generation(seed.teamId)).toBe("1");
+  });
+
+  it("rolls back a Slack version correction if its revision cannot be written", async () => {
+    const seed = await seedTeam();
+    const connector = await addMember(seed.teamId, { connector: true });
+    const author = await addMember(seed.teamId);
+    const path = "slack/eng/failed-version-revision.md";
+    await putUnresolved(seed, connector, path, { source: "slack", author_id: "U-version-failure" });
+    await setMemberIdentity(db(), seed.teamId, author,
+      { provider: "slack", externalId: "U-version-failure" });
+    // Isolate the later version write: the item is already healed, while its version is not.
+    await db().from("items").update({ member_id: author }).eq("team_id", seed.teamId).eq("path", path);
+    const failing = transactionSessionDecoratedDb(db(), (session) => ({ ...session,
+      executeSql: async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        if (sql.includes("update slack_team_state") && sql.includes("identity_generation")) {
+          throw new Error("generation unavailable");
+        }
+        return session.executeSql<T>(sql, params);
+      },
+    }));
+    await expect(reattributeItems(failing, seed.teamId)).rejects.toThrow("generation unavailable");
+    expect(await memberOf(seed.teamId, path)).toBe(author);
+    expect(await versionMembersOf(seed.teamId, path)).toEqual([null]);
+    expect(await generation(seed.teamId)).toBe("1");
+  });
+
+  it("retries a scan whose identity-map snapshot is overtaken by a remap", async () => {
+    const seed = await seedTeam();
+    const connector = await addMember(seed.teamId, { connector: true });
+    const first = await addMember(seed.teamId);
+    const second = await addMember(seed.teamId);
+    await putUnresolved(seed, connector, "slack/eng/raced-map.md",
+      { source: "slack", author_id: "U-raced-map" });
+    await setMemberIdentity(db(), seed.teamId, first,
+      { provider: "slack", externalId: "U-raced-map" });
+    let release!: () => void;
+    let arrived!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const reached = new Promise<void>((resolve) => { arrived = resolve; });
+    let reads = 0;
+    const paused = transactionSessionDecoratedDb(db(), (session) => ({ ...session,
+      executeSql: async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        if (sql.includes("from slack_team_state where team_id = $1") && ++reads === 2) {
+          arrived();
+          await gate;
+        }
+        return session.executeSql<T>(sql, params);
+      },
+    }));
+    const pending = reattributeItems(paused, seed.teamId);
+    await reached; // map was read for the first member; hold the after-map revision check
+    try {
+      await setMemberIdentity(db(), seed.teamId, second,
+        { provider: "slack", externalId: "U-raced-map" }, { force: true });
+    } finally {
+      release();
+    }
+    await pending;
+    expect(await memberOf(seed.teamId, "slack/eng/raced-map.md")).toBe(second);
+    expect(await versionMembersOf(seed.teamId, "slack/eng/raced-map.md")).toEqual([second]);
+  });
+
+  it("rolls back an in-flight old-map item write before retrying a remap", async () => {
+    const seed = await seedTeam();
+    const connector = await addMember(seed.teamId, { connector: true });
+    const first = await addMember(seed.teamId);
+    const second = await addMember(seed.teamId);
+    const path = "slack/eng/raced-write.md";
+    await putUnresolved(seed, connector, path, { source: "slack", author_id: "U-raced-write" });
+    await setMemberIdentity(db(), seed.teamId, first,
+      { provider: "slack", externalId: "U-raced-write" });
+    let release!: () => void;
+    let arrived!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const reached = new Promise<void>((resolve) => { arrived = resolve; });
+    let pausedOnce = false;
+    const paused = transactionSessionDecoratedDb(db(), (session) => ({ ...session,
+      executeSql: async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        if (!pausedOnce && sql.includes("update slack_team_state") && sql.includes("identity_generation")) {
+          pausedOnce = true;
+          arrived(); // item changed only inside the uncommitted scan transaction
+          await gate;
+        }
+        return session.executeSql<T>(sql, params);
+      },
+    }));
+    const pending = reattributeItems(paused, seed.teamId);
+    await reached;
+    try {
+      await setMemberIdentity(db(), seed.teamId, second,
+        { provider: "slack", externalId: "U-raced-write" }, { force: true });
+    } finally {
+      release();
+    }
+    await pending;
+    expect(await memberOf(seed.teamId, path)).toBe(second);
+    expect(await versionMembersOf(seed.teamId, path)).toEqual([second]);
   });
 
   it("re-points a git commit item once an email alias is added", async () => {
@@ -144,6 +271,7 @@ describe("reattributeItems (real Postgres)", () => {
     await addAuthorAlias(db(), seed.teamId, author, "bob@personal.com");
     expect((await reattributeItems(db(), seed.teamId)).updated).toBe(1);
     expect(await memberOf(seed.teamId, "commits/repo/abc.md")).toBe(author);
+    expect(await generation(seed.teamId)).toBe("0"); // non-Slack correction does not advance Slack revision
   });
 
   it("never un-attributes a real human's existing attribution when the author no longer resolves", async () => {
