@@ -309,7 +309,8 @@
             "capability_unavailable",
             "rate_limited",
             "execution_failed",
-            "operation_in_progress"
+            "operation_in_progress",
+            "unavailable"
           ]
         },
         "message": {
@@ -332,7 +333,25 @@
         "retryable",
         "recovery"
       ],
-      "additionalProperties": false
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "unavailable"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "retryable": {
+                "const": true
+              }
+            }
+          }
+        }
+      ]
     },
     "Entity": {
       "type": "object",
@@ -890,28 +909,29 @@
     },
     "Capabilities": {
       "type": "object",
-      "additionalProperties": false,
+      "additionalProperties": true,
       "properties": {
         "contract_versions": {
           "type": "array",
           "uniqueItems": true,
           "items": {
-            "const": "mcp-next/1"
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "\\S"
           },
-          "maxItems": 1
+          "maxItems": 32
         },
         "actions": {
           "type": "array",
           "uniqueItems": true,
           "items": {
-            "enum": [
-              "note.append",
-              "task.create",
-              "task.update",
-              "decision.record"
-            ]
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "\\S"
           },
-          "maxItems": 4
+          "maxItems": 128
         },
         "task_revisions": {
           "type": "boolean"
@@ -921,7 +941,14 @@
         "contract_versions",
         "actions",
         "task_revisions"
-      ]
+      ],
+      "maxProperties": 64,
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "\\S"
+      }
     }
   }
 }
