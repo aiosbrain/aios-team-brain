@@ -1,0 +1,371 @@
+{
+  "version": "1.0.0",
+  "valid": [
+    {
+      "name": "explicit-empty-batch-is-not-delete",
+      "schema": "urn:aios:mcp-next:1:tasks#/definitions/Batch",
+      "value": {
+        "contract_version": "mcp-next/1",
+        "project_id": "project-demo",
+        "source_item_id": "item-demo",
+        "operation_id": "op-1",
+        "rows": []
+      }
+    },
+    {
+      "name": "unmapped-provider-status-is-not-guessed",
+      "schema": "urn:aios:mcp-next:1:tasks#/definitions/Conflict",
+      "value": {
+        "task_id": "task-1",
+        "revision": "r1",
+        "origin": "linear",
+        "code": "mapping_required",
+        "field": "status",
+        "provider_id": "state-custom",
+        "raw_value": "provider-status-custom-42",
+        "mapping_revision": null
+      }
+    },
+    {
+      "name": "row-level-stale-revision",
+      "schema": "urn:aios:mcp-next:1:tasks#/definitions/Conflict",
+      "value": {
+        "task_id": "task-1",
+        "revision": "r2",
+        "origin": "workspace",
+        "code": "stale_revision"
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "revisionless-row-rejected",
+      "schema": "urn:aios:mcp-next:1:tasks#/definitions/Row",
+      "value": {
+        "task_id": "task-1",
+        "row_key": "ROW-1",
+        "baseline": {
+          "assignee": null,
+          "due": null,
+          "title": "Task",
+          "status": "backlog"
+        },
+        "values": {
+          "assignee": null,
+          "due": null,
+          "title": "Changed",
+          "status": "backlog"
+        }
+      }
+    }
+  ],
+  "semantic": [
+    {
+      "name": "title-unchanged",
+      "rule": "field-reconciliation",
+      "input": {
+        "field": "title",
+        "baseline": "Base",
+        "brain": "Base",
+        "incoming": "Base"
+      },
+      "expected": {
+        "outcome": "noop",
+        "value": "Base"
+      }
+    },
+    {
+      "name": "title-one-sided-incoming",
+      "rule": "field-reconciliation",
+      "input": {
+        "field": "title",
+        "baseline": "Base",
+        "brain": "Base",
+        "incoming": "Local"
+      },
+      "expected": {
+        "outcome": "apply",
+        "value": "Local"
+      }
+    },
+    {
+      "name": "title-one-sided-brain",
+      "rule": "field-reconciliation",
+      "input": {
+        "field": "title",
+        "baseline": "Base",
+        "brain": "Local",
+        "incoming": "Base"
+      },
+      "expected": {
+        "outcome": "keep",
+        "value": "Local"
+      }
+    },
+    {
+      "name": "title-equal-change",
+      "rule": "field-reconciliation",
+      "input": {
+        "field": "title",
+        "baseline": "Base",
+        "brain": "Local",
+        "incoming": "Local"
+      },
+      "expected": {
+        "outcome": "agree",
+        "value": "Local"
+      }
+    },
+    {
+      "name": "title-divergent",
+      "rule": "field-reconciliation",
+      "input": {
+        "field": "title",
+        "baseline": "Base",
+        "brain": "Local",
+        "incoming": "Remote"
+      },
+      "expected": {
+        "outcome": "conflict",
+        "value": "Local"
+      }
+    },
+    {
+      "name": "assignee-unchanged",
+      "rule": "field-reconciliation",
+      "input": {
+        "field": "assignee",
+        "baseline": "member-a",
+        "brain": "member-a",
+        "incoming": "member-a"
+      },
+      "expected": {
+        "outcome": "noop",
+        "value": "member-a"
+      }
+    },
+    {
+      "name": "assignee-one-sided-incoming",
+      "rule": "field-reconciliation",
+      "input": {
+        "field": "assignee",
+        "baseline": "member-a",
+        "brain": "member-a",
+        "incoming": "member-b"
+      },
+      "expected": {
+        "outcome": "apply",
+        "value": "member-b"
+      }
+    },
+    {
+      "name": "assignee-one-sided-brain",
+      "rule": "field-reconciliation",
+      "input": {
+        "field": "assignee",
+        "baseline": "member-a",
+        "brain": "member-b",
+        "incoming": "member-a"
+      },
+      "expected": {
+        "outcome": "keep",
+        "value": "member-b"
+      }
+    },
+    {
+      "name": "assignee-equal-change",
+      "rule": "field-reconciliation",
+      "input": {
+        "field": "assignee",
+        "baseline": "member-a",
+        "brain": "member-b",
+        "incoming": "member-b"
+      },
+      "expected": {
+        "outcome": "agree",
+        "value": "member-b"
+      }
+    },
+    {
+      "name": "assignee-divergent",
+      "rule": "field-reconciliation",
+      "input": {
+        "field": "assignee",
+        "baseline": "member-a",
+        "brain": "member-b",
+        "incoming": "member-c"
+      },
+      "expected": {
+        "outcome": "conflict",
+        "value": "member-b"
+      }
+    },
+    {
+      "name": "status-unchanged",
+      "rule": "field-reconciliation",
+      "input": {
+        "field": "status",
+        "baseline": "backlog",
+        "brain": "backlog",
+        "incoming": "backlog"
+      },
+      "expected": {
+        "outcome": "noop",
+        "value": "backlog"
+      }
+    },
+    {
+      "name": "status-one-sided-incoming",
+      "rule": "field-reconciliation",
+      "input": {
+        "field": "status",
+        "baseline": "backlog",
+        "brain": "backlog",
+        "incoming": "in_progress"
+      },
+      "expected": {
+        "outcome": "apply",
+        "value": "in_progress"
+      }
+    },
+    {
+      "name": "status-one-sided-brain",
+      "rule": "field-reconciliation",
+      "input": {
+        "field": "status",
+        "baseline": "backlog",
+        "brain": "in_progress",
+        "incoming": "backlog"
+      },
+      "expected": {
+        "outcome": "keep",
+        "value": "in_progress"
+      }
+    },
+    {
+      "name": "status-equal-change",
+      "rule": "field-reconciliation",
+      "input": {
+        "field": "status",
+        "baseline": "backlog",
+        "brain": "in_progress",
+        "incoming": "in_progress"
+      },
+      "expected": {
+        "outcome": "agree",
+        "value": "in_progress"
+      }
+    },
+    {
+      "name": "status-divergent",
+      "rule": "field-reconciliation",
+      "input": {
+        "field": "status",
+        "baseline": "backlog",
+        "brain": "in_progress",
+        "incoming": "done"
+      },
+      "expected": {
+        "outcome": "conflict",
+        "value": "in_progress"
+      }
+    },
+    {
+      "name": "due-unchanged",
+      "rule": "field-reconciliation",
+      "input": {
+        "field": "due",
+        "baseline": null,
+        "brain": null,
+        "incoming": null
+      },
+      "expected": {
+        "outcome": "noop",
+        "value": null
+      }
+    },
+    {
+      "name": "due-one-sided-incoming",
+      "rule": "field-reconciliation",
+      "input": {
+        "field": "due",
+        "baseline": null,
+        "brain": null,
+        "incoming": "2026-10-01"
+      },
+      "expected": {
+        "outcome": "apply",
+        "value": "2026-10-01"
+      }
+    },
+    {
+      "name": "due-one-sided-brain",
+      "rule": "field-reconciliation",
+      "input": {
+        "field": "due",
+        "baseline": null,
+        "brain": "2026-10-01",
+        "incoming": null
+      },
+      "expected": {
+        "outcome": "keep",
+        "value": "2026-10-01"
+      }
+    },
+    {
+      "name": "due-equal-change",
+      "rule": "field-reconciliation",
+      "input": {
+        "field": "due",
+        "baseline": null,
+        "brain": "2026-10-01",
+        "incoming": "2026-10-01"
+      },
+      "expected": {
+        "outcome": "agree",
+        "value": "2026-10-01"
+      }
+    },
+    {
+      "name": "due-divergent",
+      "rule": "field-reconciliation",
+      "input": {
+        "field": "due",
+        "baseline": null,
+        "brain": "2026-10-01",
+        "incoming": "2026-10-02"
+      },
+      "expected": {
+        "outcome": "conflict",
+        "value": "2026-10-01"
+      }
+    },
+    {
+      "name": "legacy-True-True",
+      "rule": "legacy-batch",
+      "input": {
+        "revision_enabled": true,
+        "changed_or_deleted": true
+      },
+      "expected": "upgrade_required"
+    },
+    {
+      "name": "legacy-True-False",
+      "rule": "legacy-batch",
+      "input": {
+        "revision_enabled": true,
+        "changed_or_deleted": false
+      },
+      "expected": "legacy_compatible"
+    },
+    {
+      "name": "legacy-False-True",
+      "rule": "legacy-batch",
+      "input": {
+        "revision_enabled": false,
+        "changed_or_deleted": true
+      },
+      "expected": "legacy_compatible"
+    }
+  ]
+}

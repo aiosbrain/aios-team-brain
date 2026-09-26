@@ -1,0 +1,206 @@
+{
+  "version": "1.0.0",
+  "status": "proposed",
+  "note": "CLI spellings are reserved, not registered by this contract. Structured CLI --json success equals MCP structuredContent; text content is JSON of that value. Errors use mapped error contract and isError; no string truncation creates invalid JSON. Profile is selected at installation/startup (--profile); workspace input profileId must equal that bound profile. CLI flags map exactly to schema names; CLI input-file may carry the schema JSON without shell escaping. No fallback to legacy writes.",
+  "operations": [
+    {
+      "tool": "brain_push_note",
+      "cli": "aios brain note push",
+      "input": "urn:aios:mcp-next:1:actions#/definitions/NoteInput",
+      "output": "urn:aios:mcp-next:1:actions#/definitions/ActionStatus",
+      "error": "urn:aios:mcp-next:1:actions#/definitions/TransportError",
+      "grants": [
+        "brainActions"
+      ],
+      "transport": "POST /api/v1/actions/submit",
+      "action": "note.append",
+      "envelope": "urn:aios:mcp-next:1:actions#/definitions/SubmitRequest"
+    },
+    {
+      "tool": "brain_create_task",
+      "cli": "aios brain task create",
+      "input": "urn:aios:mcp-next:1:actions#/definitions/TaskCreateInput",
+      "output": "urn:aios:mcp-next:1:actions#/definitions/ActionStatus",
+      "error": "urn:aios:mcp-next:1:actions#/definitions/TransportError",
+      "grants": [
+        "brainActions"
+      ],
+      "transport": "POST /api/v1/actions/submit",
+      "action": "task.create",
+      "envelope": "urn:aios:mcp-next:1:actions#/definitions/SubmitRequest"
+    },
+    {
+      "tool": "brain_update_task",
+      "cli": "aios brain task update",
+      "input": "urn:aios:mcp-next:1:actions#/definitions/TaskUpdateInput",
+      "output": "urn:aios:mcp-next:1:actions#/definitions/ActionStatus",
+      "error": "urn:aios:mcp-next:1:actions#/definitions/TransportError",
+      "grants": [
+        "brainActions"
+      ],
+      "transport": "POST /api/v1/actions/submit",
+      "action": "task.update",
+      "envelope": "urn:aios:mcp-next:1:actions#/definitions/SubmitRequest"
+    },
+    {
+      "tool": "brain_record_decision",
+      "cli": "aios brain decision record",
+      "input": "urn:aios:mcp-next:1:actions#/definitions/DecisionInput",
+      "output": "urn:aios:mcp-next:1:actions#/definitions/ActionStatus",
+      "error": "urn:aios:mcp-next:1:actions#/definitions/TransportError",
+      "grants": [
+        "brainActions"
+      ],
+      "transport": "POST /api/v1/actions/submit",
+      "action": "decision.record",
+      "envelope": "urn:aios:mcp-next:1:actions#/definitions/SubmitRequest"
+    },
+    {
+      "tool": "brain_action_status",
+      "cli": "aios brain action status",
+      "input": "urn:aios:mcp-next:1:actions#/definitions/StatusInput",
+      "output": "urn:aios:mcp-next:1:actions#/definitions/ActionStatus",
+      "error": "urn:aios:mcp-next:1:actions#/definitions/TransportError",
+      "grants": [],
+      "transport": "GET /api/v1/actions/{action_id}"
+    },
+    {
+      "tool": "brain_get_task",
+      "cli": "aios brain task get",
+      "input": "urn:aios:mcp-next:1:actions#/definitions/TaskGetInput",
+      "output": "urn:aios:mcp-next:1:actions#/definitions/Task",
+      "error": "urn:aios:mcp-next:1:actions#/definitions/TransportError",
+      "grants": [],
+      "transport": "GET /api/v1/tasks/{task_id}"
+    },
+    {
+      "tool": "workspace_status",
+      "cli": "aios workspace status",
+      "input": "urn:aios:mcp-next:1:workspace#/definitions/StatusInput",
+      "output": "urn:aios:mcp-next:1:workspace#/definitions/StatusOutput",
+      "error": "urn:aios:mcp-next:1:workspace#/definitions/Error",
+      "grants": [],
+      "transport": "local installed toolkit"
+    },
+    {
+      "tool": "workspace_list",
+      "cli": "aios workspace list",
+      "input": "urn:aios:mcp-next:1:workspace#/definitions/ListInput",
+      "output": "urn:aios:mcp-next:1:workspace#/definitions/ListOutput",
+      "error": "urn:aios:mcp-next:1:workspace#/definitions/Error",
+      "grants": [
+        "workspaceRead"
+      ],
+      "transport": "local installed toolkit"
+    },
+    {
+      "tool": "workspace_read",
+      "cli": "aios workspace read",
+      "input": "urn:aios:mcp-next:1:workspace#/definitions/ReadInput",
+      "output": "urn:aios:mcp-next:1:workspace#/definitions/ReadOutput",
+      "error": "urn:aios:mcp-next:1:workspace#/definitions/Error",
+      "grants": [
+        "workspaceRead"
+      ],
+      "transport": "local installed toolkit"
+    },
+    {
+      "tool": "workspace_write",
+      "cli": "aios workspace write",
+      "input": "urn:aios:mcp-next:1:workspace#/definitions/WriteInput",
+      "output": "urn:aios:mcp-next:1:workspace#/definitions/WriteOutput",
+      "error": "urn:aios:mcp-next:1:workspace#/definitions/Error",
+      "grants": [
+        "workspaceDraft"
+      ],
+      "transport": "local installed toolkit"
+    },
+    {
+      "tool": "workspace_sync_preview",
+      "cli": "aios workspace sync preview",
+      "input": "urn:aios:mcp-next:1:workspace#/definitions/PreviewInput",
+      "output": "urn:aios:mcp-next:1:workspace#/definitions/PreviewOutput",
+      "error": "urn:aios:mcp-next:1:workspace#/definitions/Error",
+      "grants": [
+        "workspaceRead",
+        "workspacePublish"
+      ],
+      "transport": "local installed toolkit"
+    },
+    {
+      "tool": "workspace_sync_apply",
+      "cli": "aios workspace sync apply",
+      "input": "urn:aios:mcp-next:1:workspace#/definitions/ApplyInput",
+      "output": "urn:aios:mcp-next:1:workspace#/definitions/ApplyOutput",
+      "error": "urn:aios:mcp-next:1:workspace#/definitions/Error",
+      "grants": [
+        "workspaceRead",
+        "workspacePublish"
+      ],
+      "transport": "local installed toolkit"
+    },
+    {
+      "tool": "aios_loop_collect",
+      "cli": "aios loop collect",
+      "input": "urn:aios:mcp-next:1:workspace#/definitions/CollectInput",
+      "output": "urn:aios:mcp-next:1:workspace#/definitions/CollectOutput",
+      "error": "urn:aios:mcp-next:1:workspace#/definitions/Error",
+      "grants": [
+        "workspaceRead"
+      ],
+      "transport": "local installed toolkit"
+    }
+  ],
+  "http_contracts": [
+    {
+      "method": "POST",
+      "path": "/api/v1/actions/submit",
+      "input": "urn:aios:mcp-next:1:actions#/definitions/SubmitRequest",
+      "output": "urn:aios:mcp-next:1:actions#/definitions/ActionStatus"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/actions/{action_id}",
+      "input": "urn:aios:mcp-next:1:actions#/definitions/StatusInput",
+      "output": "urn:aios:mcp-next:1:actions#/definitions/ActionStatus"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/tasks/{task_id}",
+      "input": "urn:aios:mcp-next:1:actions#/definitions/TaskGetInput",
+      "output": "urn:aios:mcp-next:1:actions#/definitions/Task"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/tasks/reconcile",
+      "input": "urn:aios:mcp-next:1:tasks#/definitions/Batch",
+      "output": "urn:aios:mcp-next:1:tasks#/definitions/Result"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/items/publish",
+      "input": "urn:aios:mcp-next:1:workspace#/definitions/PublishItemInput",
+      "output": "urn:aios:mcp-next:1:workspace#/definitions/PublishItemOutput"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/items/publish/{operationId}?projectId={projectId}",
+      "input": "urn:aios:mcp-next:1:workspace#/definitions/PublishStatusInput",
+      "output": "urn:aios:mcp-next:1:workspace#/definitions/PublishStatusOutput"
+    }
+  ],
+  "status_extension": {
+    "tool": "brain_status",
+    "cli": "aios brain status",
+    "transport": "GET /api/v1/me",
+    "schema": "urn:aios:mcp-next:1:actions#/definitions/Capabilities",
+    "field": "capabilities",
+    "absent": "new operations unavailable"
+  },
+  "configuration": {
+    "cli": "aios mcp install --profile <id>",
+    "input": "urn:aios:mcp-next:1:profile#/definitions/Profile",
+    "migrationInput": "urn:aios:mcp-next:1:profile#/definitions/MigrationInput",
+    "migrationOutput": "urn:aios:mcp-next:1:profile#/definitions/MigrationOutput"
+  }
+}
