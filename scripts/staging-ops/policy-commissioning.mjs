@@ -72,7 +72,7 @@ import { buildMainRulesets, REQUIRED_MAIN_CONTEXTS, verifyEffectiveMainPolicy } 
  */
 const resolveInstallationTokenHelper = async () => (await import("./release-controller.mjs")).createInstallationToken;
 import {
-  JournalChainError, acquireJournalLock, assertPrivateDirectory, openJournal, readJournal, recordWitnessEventOnce,
+  JournalChainError, acquireJournalLock, assertPrivateDirectory, openJournal, readJournal, readReviewerJournal, recordWitnessEventOnce,
   reduceResourceLifecycles, writeJournalSnapshot,
 } from "./commissioning-journal.mjs";
 import { diagnosticResult as assessReviewerDiagnostic, fileRef as reviewerFileRef } from "./reviewer-negative-probe.mjs";
@@ -6881,8 +6881,12 @@ export function validateEnvironmentControl(record, { dir, key, environment, envi
       const ref = reviewerFileRef({ artifact: record.artifact, sha256: record.sha256 });
       // A diagnostic descriptor is reviewable, but no diagnostic result in this revision can
       // supply the accepting 'refused' value. The original protected run still needs real approval.
-      const result = assessReviewerDiagnostic({ dir, intentRef: ref });
-      return result.status === "invalid-diagnostic" ? `has invalid diagnostic evidence (${result.reason})` : "is diagnostic-unverified";
+      const kind = key === "self_review_refused" ? "reviewer-self" : "reviewer-app";
+      const result = assessReviewerDiagnostic({ dir, bundleRef: ref,
+        journalRecords: readReviewerJournal({ dir, runId, attempt, kind }),
+        originalRecords: readJournal({ dir, runId, attempt }) });
+      return result.status === "invalid-diagnostic" || result.control !== key
+        ? `has invalid diagnostic evidence (${result.reason ?? "wrong control"})` : "is diagnostic-unverified";
     } catch (error) { return `has invalid diagnostic evidence (${error.message})`; }
   }
   /**

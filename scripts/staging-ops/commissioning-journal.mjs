@@ -506,7 +506,7 @@ export function readReviewerJournal({ dir, runId, attempt, kind }) {
     records.push(r);
     prev = reviewerDigest(Buffer.from(line));
   }
-  try { replayReviewer(records.map((r) => ({ type: r.event, data: r.payload }))); } catch (error) {
+  try { replayReviewer(records.map((r) => ({ type: r.event, data: r.payload, at: r.at }))); } catch (error) {
     throw new JournalChainError(`reviewer journal lifecycle is invalid: ${error.message}`);
   }
   return records;
@@ -529,7 +529,7 @@ export function openReviewerJournal({ dir, runId, attempt, kind, intentSha256, l
       const prev = prior.length ? reviewerDigest(Buffer.from(reviewerCanonical(prior[prior.length - 1]))) : null;
       const record = { journal_version: 1, seq: prior.length + 1, prev_sha256: prev, at: now().toISOString(),
         original_run_id: String(runId), original_attempt: String(attempt), intent_sha256: intentSha256, event, payload };
-      replayReviewer([...prior.map((r) => ({ type: r.event, data: r.payload })), { type: event, data: payload }]);
+      replayReviewer([...prior.map((r) => ({ type: r.event, data: r.payload, at: r.at })), { type: event, data: payload, at: record.at }]);
       const fd = openSync(file, "a", 0o600);
       try { writeSync(fd, `${reviewerCanonical(record)}\n`); fsyncSync(fd); } finally { closeSync(fd); }
       return record;
