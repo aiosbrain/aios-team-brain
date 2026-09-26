@@ -1089,6 +1089,75 @@ describe("RIR residual resource lifetime and offline authority regressions", () 
       .toContainEqual(expect.objectContaining({ detail: expect.stringMatching(/mutated before the authenticated pre-response/) }));
     expect((await cliResult("check-evidence", { now: clock.now })).exit).toBe(1);
   });
+
+  it("CA1 · setup refuses a durably reappeared retired PR-head ref before any write", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    const ref = derivedRef(RUN_ID, ATTEMPT, "pr-head");
+    const original = github.refs.get(ref)!;
+    const firstTransport = async (method: string, endpoint: string, body: unknown) => {
+      if (method === "DELETE" && endpoint.includes("/rulesets/")) {
+        return wire({ status: 403, body: { message: "forbidden" } });
+      }
+      const records = readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }) as JournalRecord[];
+      if (records.some((record) => record.type === "cleanup-result" && record.data.kind === "ref"
+        && record.data.ref === ref && record.data.removed === true)) {
+        throw new Error("stop after exact ref retirement");
+      }
+      return wire(github.handle("local", method, endpoint, body));
+    };
+    await expect(runPhase({ phase: "cleanup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV,
+      deps: { transport: firstTransport } })).rejects.toThrow("stop after exact ref retirement");
+    expect(github.refs.has(ref)).toBe(false);
+
+    github.refs.set(ref, original);
+    const secondTransport = async (method: string, endpoint: string, body: unknown) => {
+      if (method === "DELETE" && endpoint.includes("/rulesets/")) {
+        return wire({ status: 403, body: { message: "forbidden" } });
+      }
+      const records = readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }) as JournalRecord[];
+      if (records.some((record) => record.data?.outcome === "retired-resource-reappeared")) {
+        throw new Error("stop after durable reappearance");
+      }
+      return wire(github.handle("local", method, endpoint, body));
+    };
+    const beforeSecond = github.calls.length;
+    await expect(runPhase({ phase: "cleanup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV,
+      deps: { transport: secondTransport } })).rejects.toThrow("stop after durable reappearance");
+    expect(github.refs.get(ref)).toBe(original);
+    expect(github.calls.slice(beforeSecond).some((call) => call.method === "DELETE" && call.path.endsWith(`/heads/${ref.split("/").at(-1)}`))).toBe(false);
+
+    const history = reduceResourceLifecycles(readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }));
+    expect(history.errors).toEqual([]);
+    expect(history.resources.find((entry) => entry.identity.ref === ref)?.state).toBe("retired-reappeared");
+    const beforeSetup = github.calls.length;
+    const setup = await cliResult("setup", localDeps(github));
+    expect(setup.exit).not.toBe(0);
+    expect(setup.payload.errors.join(" ")).toMatch(/outside an active exact journaled lifetime/);
+    expect(github.calls.slice(beforeSetup).filter((call) => ["POST", "PATCH", "DELETE", "PUT"].includes(call.method))).toEqual([]);
+    expect(github.refs.get(ref)).toBe(original);
+  });
+
+  it("CA1 · a reappeared retired lifetime cannot accept a fresh cleanup intent", () => {
+    const identity = { kind: "ref", ref: derivedRef(RUN_ID, ATTEMPT, "pr-head"), sha: "a".repeat(40) };
+    const lifecycleKey = resourceLifecycleKey(identity)!;
+    const event = (seq: number, type: string, data: Record<string, unknown>) => ({ seq, type, kind: "resource", data });
+    const prefix = [
+      event(1, "resource-created", identity),
+      event(2, "cleanup-intent", { ...identity, lifecycle_key: lifecycleKey }),
+      event(3, "cleanup-result", { ...identity, lifecycle_key: lifecycleKey, removed: true, readback_absent: true, readback_sha: null }),
+      event(4, "reconciliation", { ...identity, lifecycle_key: lifecycleKey, outcome: "retired-resource-reappeared", readback_sha: identity.sha }),
+    ];
+    expect(reduceResourceLifecycles(prefix).resources[0]).toMatchObject({ state: "retired-reappeared", pendingCleanup: null });
+    const refused = reduceResourceLifecycles([...prefix, event(5, "cleanup-intent", { ...identity, lifecycle_key: lifecycleKey })]);
+    expect(refused.errors).toContainEqual(expect.stringMatching(/tries to mutate retired lifetime/));
+    expect(refused.resources[0]).toMatchObject({ state: "retired-reappeared", pendingCleanup: null });
+    const absent = reduceResourceLifecycles([...prefix, event(5, "resource-retired", {
+      ...identity, lifecycle_key: lifecycleKey, reason: "confirmed-absent", readback_absent: true, readback_sha: null,
+    })]);
+    expect(absent.errors).toEqual([]);
+    expect(absent.resources[0]).toMatchObject({ state: "retired", pendingCleanup: null });
+  });
 });
 afterEach(() => {
   globalThis.fetch = realFetch;

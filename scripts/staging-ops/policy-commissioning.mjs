@@ -3348,7 +3348,7 @@ export async function assertNoCollision({ request, ctx, records = [] }) {
   if (lifecycle.errors.length) {
     throw new IncompleteEvidence(`the resource lifecycle history is contradictory (${lifecycle.errors.join("; ")})`);
   }
-  const active = lifecycle.resources.filter((entry) => entry.state !== "retired");
+  const active = lifecycle.resources.filter((entry) => !["retired", "retired-reappeared"].includes(entry.state));
   const graphShas = new Set(active.filter((entry) => entry.kind === "commit").map((entry) => String(entry.identity.sha)));
   const activeRefs = new Map(active.filter((entry) => entry.kind === "ref").map((entry) => [String(entry.identity.ref), entry]));
   for (const suffix of REF_SUFFIXES) {

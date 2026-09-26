@@ -543,7 +543,10 @@ export function reduceResourceLifecycles(records) {
       const lifetime = lifecycleForEvent(resources, record.data);
       if (!lifetime) { errors.push(`cleanup-intent record ${record.seq} names no exact creation lifetime`); continue; }
       if (record.data?.lifecycle_key !== lifetime.key) { errors.push(`cleanup-intent record ${record.seq} does not bind exact lifetime ${lifetime.key}`); continue; }
-      if (lifetime.state === "retired") { errors.push(`cleanup-intent record ${record.seq} tries to mutate retired lifetime ${lifetime.key}`); continue; }
+      if (["retired", "retired-reappeared"].includes(lifetime.state)) {
+        errors.push(`cleanup-intent record ${record.seq} tries to mutate retired lifetime ${lifetime.key}`);
+        continue;
+      }
       if (lifetime.pendingCleanup) { errors.push(`cleanup-intent record ${record.seq} overlaps unresolved cleanup intent ${lifetime.pendingCleanup.seq}`); continue; }
       lifetime.pendingCleanup = { seq: record.seq, data: record.data };
       lifetime.state = "cleanup-pending";
