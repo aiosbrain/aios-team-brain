@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ingestUsageCost } from "@/lib/costs/ingest";
 import {
   getExternalCosts,
@@ -9,6 +9,16 @@ import { IngestValidationError } from "@/lib/api/schemas";
 import { db, seedTeam } from "./helpers";
 
 describe("usage_costs ingest + read (W2.1)", () => {
+  beforeEach(() => {
+    // Keep the dated fixtures inside the rolling 90-day read window, while
+    // retaining real timers for the Postgres client.
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-07-10T12:00:00Z"));
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("upserts daily provider cost and reads it back team-wide for admin", async () => {
     const seed = await seedTeam();
     const auth = {
