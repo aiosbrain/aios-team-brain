@@ -59,6 +59,19 @@ describe("governed notes with real Postgres", () => {
     expect(version).toMatchObject({ body: request.params.body, frontmatter: { title: request.params.title }, member_id: f.memberId });
   });
 
+  it("accepts explicit suitable General placement without creating or altering authority", async () => {
+    const f = await noteFixture();
+    const general = (await noteSql("select id from projects where team_id=$1 and slug='general' and kind='system'", [f.teamId])).rows[0];
+    const authority = () => noteSql(`select
+      (select jsonb_agg(to_jsonb(p) order by p.id) from projects p where p.team_id=$1) projects,
+      (select jsonb_agg(to_jsonb(g) order by g.id) from groups g where g.team_id=$1) groups,
+      (select jsonb_agg(to_jsonb(g) order by g.project_id,g.group_id) from project_groups g where g.team_id=$1) grants`, [f.teamId]);
+    const before = (await authority()).rows[0];
+    const result = await complete(f, noteRequest(general.id));
+    expect((await stored(result.entity.id)).project_id).toBe(general.id);
+    expect((await authority()).rows[0]).toEqual(before);
+  });
+
   it("converges independent concurrent submitters on one durable note", async () => {
     const f = await noteFixture();
     const results = await Promise.all(Array.from({ length: 8 }, () => complete(f)));
@@ -121,6 +134,22 @@ describe("governed notes with real Postgres", () => {
     expect(result.status).toBe("succeeded");
     expect(await service().decide(input)).toEqual(result);
     expect(await service().submit(f.auth, f.request)).toEqual(result);
+    expect(await noteCounts(f.teamId)).toMatchObject({ notes: 1, versions: 1, origins: 1, succeeded: 1 });
+  });
+
+  it("retains pending approval while disabled and executes it once after re-enable", async () => {
+    const f = await noteFixture("require_approval");
+    const approver = await noteMember(f, "admin");
+    const pending = await service().submit(f.auth, f.request);
+    const input = approval(f, pending, approver.id);
+    const disabled = service(noteConsumer, () => false);
+    await expect(disabled.decide(input)).rejects.toMatchObject({ code: "capability_unavailable" });
+    expect(await disabled.status(f.auth, pending.action_id)).toEqual(pending);
+    expect(await noteCounts(f.teamId)).toMatchObject({ notes: 0, versions: 0, origins: 0 });
+    const result = await service().decide(input);
+    expect(result.status).toBe("succeeded");
+    expect(result.action_id).toBe(pending.action_id);
+    expect(await service().decide(input)).toEqual(result);
     expect(await noteCounts(f.teamId)).toMatchObject({ notes: 1, versions: 1, origins: 1, succeeded: 1 });
   });
 
