@@ -3,6 +3,7 @@ import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
 import type { GraphitiClient } from "@/lib/graph/graphiti-client";
 import { retireEpisodesForItems, chunk, IN_CLAUSE_BATCH } from "@/lib/graph/project";
+import { ImmutableOriginError } from "./governed-origin";
 
 /**
  * REMOVAL of already-ingested content — the counterpart to `ingestItem`, and part of the same
@@ -153,6 +154,15 @@ export async function purgeItemIds(
   opts: PurgeOptions & { scope?: string } = {}
 ): Promise<PurgeResult> {
   if (itemIds.length === 0) return { items: 0, episodes: 0 };
+
+  // Check the WHOLE batch before any graph or database mutation. The delete
+  // trigger is too late to protect graph episodes already retired remotely.
+  for (const batch of chunk(itemIds, IN_CLAUSE_BATCH)) {
+    const { data, error } = await db.from("governed_item_origins")
+      .select("item_id").eq("team_id", teamId).in("item_id", batch).limit(1);
+    if (error) throw new Error("governed origin lookup unavailable");
+    if (data?.length) throw new ImmutableOriginError();
+  }
 
   // WHAT we are about to delete, read BEFORE deleting it — the rows are the only record of their own
   // paths, so after the cascade the question "what did this purge remove?" has no answer anywhere.
