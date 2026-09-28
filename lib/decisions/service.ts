@@ -34,7 +34,7 @@ export async function createDashboardDecision(db: DbClient, input: {
   await requireDecisionActor(db, input.teamId, input.memberId);
   const { canSeeProjectRow } = await import("@/lib/access/enforce");
   if (!(await canSeeProjectRow(db, { teamId: input.teamId, memberId: input.memberId }, input.projectId)))
-    throw new DomainFailure("forbidden", "denied");
+    throw new Error("project not found");
   const title = input.title.trim();
   if (!title) throw new Error("title and project required");
   for (let attempt = 0; attempt < 2; attempt++) {

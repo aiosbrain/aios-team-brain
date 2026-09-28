@@ -164,7 +164,7 @@ const TITLE_SURFACE_WIRING: [string, RegExp][] = [
   // un-hides it (§2.1 content arms), so both create actions gate on the same row visibility.
   ["app/actions/tasks.ts", /await canSeeProjectRow\(adminClient\(\)/],
   ["app/actions/decisions.ts", /await createDashboardDecision\(await serverClient\(\), \{ \.\.\.input, memberId: me\.id \}\)/],
-  ["lib/decisions/service.ts", /if \(!\(await canSeeProjectRow\(db, \{ teamId: input\.teamId, memberId: input\.memberId \}, input\.projectId\)\)\)\s*throw new DomainFailure\("forbidden", "denied"\)/],
+  ["lib/decisions/service.ts", /if \(!\(await canSeeProjectRow\(db, \{ teamId: input\.teamId, memberId: input\.memberId \}, input\.projectId\)\)\)\s*throw new Error\("project not found"\)/],
   ["app/t/[team]/page.tsx", /decisionsCardWindow\(team\.id, provCtx/],
   ["app/t/[team]/library/[itemId]/page.tsx", /await canSeeProjectRow\(/],
   ["app/api/v1/projects/route.ts", /\.in\("id", \[\.\.\.rows\.ids\]\)/],
@@ -308,7 +308,7 @@ describe("ENFB-2 — title/count surfaces APPLY the oracle (wiring + sweep tripw
     expect(action.test("await createDashboardDecision(await serverClient(), input)")).toBe(false);
     const domain = TITLE_SURFACE_WIRING.find(([f]) => f === "lib/decisions/service.ts")![1];
     const gate = 'await canSeeProjectRow(db, { teamId: input.teamId, memberId: input.memberId }, input.projectId)';
-    expect(domain.test(`if (!(${gate})) throw new DomainFailure("forbidden", "denied")`)).toBe(true);
+    expect(domain.test(`if (!(${gate})) throw new Error("project not found")`)).toBe(true);
     expect(domain.test(gate), "resolving visibility without refusing must fail").toBe(false);
     expect(domain.test(`if (!(${gate})) console.log("hidden")`)).toBe(false);
   });
