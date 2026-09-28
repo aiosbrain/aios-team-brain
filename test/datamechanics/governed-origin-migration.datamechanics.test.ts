@@ -37,7 +37,12 @@ it("upgrades populated pre-origin schema, preserves legacy rows, and replays imm
     const audit = (await db.query("insert into audit_log(team_id,actor_kind,action) values($1,'system','prior.decision') returning *", [team])).rows[0];
     const migration = readFileSync(new URL("../../postgres/migrations/20260928110000_governed_item_origins.sql", import.meta.url), "utf8");
     const assertLegacy = async () => {
-      expect((await db!.query("select * from items where id=$1", [legacyItem.id])).rows[0]).toEqual(legacyItem);
+      const current = (await db!.query("select * from items where id=$1", [legacyItem.id])).rows[0];
+      if ("note_search_title" in current) {
+        expect(current.note_search_title).toBe("");
+        delete current.note_search_title;
+      }
+      expect(current).toEqual(legacyItem);
       expect((await db!.query("select * from decisions where id=$1", [legacyDecision.id])).rows[0]).toEqual(legacyDecision);
       expect((await db!.query("select * from audit_log where id=$1", [audit.id])).rows[0]).toEqual(audit);
     };
