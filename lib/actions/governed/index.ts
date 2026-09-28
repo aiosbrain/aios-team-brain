@@ -1,3 +1,5 @@
+import { noteConsumer } from "./consumers/note";
+import { decisionConsumer } from "./consumers/decision";
 import "server-only";
 import { randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
@@ -642,4 +644,4 @@ export function createGovernedActionService(
   };
 }
 /** Intentionally empty. Consumers land in separately reviewed increments. */
-export const governedActions = createGovernedActionService();
+export const governedActions = createGovernedActionService({ consumers: [decisionConsumer, noteConsumer] });

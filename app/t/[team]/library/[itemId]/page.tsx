@@ -7,6 +7,7 @@ import { Markdown } from "@/components/markdown";
 import { KindBadge } from "@/components/kind-badge";
 import { TierBadge } from "@/components/tier-badge";
 import { fmtDate, timeAgo } from "@/components/format";
+import { noteTitle } from "@/lib/notes/presentation";
 
 export default async function LibraryItemPage({
   params,
@@ -26,7 +27,7 @@ export default async function LibraryItemPage({
   const { data: item } = await db
     .from("items")
     .select(
-      "id, path, kind, access, body, content_sha256, actor, synced_at, updated_at, project_id, projects(slug), members(display_name), item_versions(count)"
+      "id, path, kind, access, frontmatter, body, content_sha256, actor, synced_at, updated_at, project_id, projects(slug), members(display_name), item_versions(count)"
     )
     .eq("team_id", team.id)
     .eq("id", itemId)
@@ -52,6 +53,7 @@ export default async function LibraryItemPage({
   const member = item.members as unknown as { display_name: string } | null;
   const versionCount =
     (item.item_versions as unknown as { count: number }[] | null)?.[0]?.count ?? 0;
+  const title = noteTitle(item.kind, item.frontmatter);
 
   return (
     <div className="mx-auto flex max-w-5xl flex-col gap-6">
@@ -63,7 +65,9 @@ export default async function LibraryItemPage({
           <KindBadge kind={item.kind} />
           <TierBadge tier={item.access} />
         </div>
-        <h1 className="mt-2 break-all font-mono text-lg font-semibold text-ink">{item.path}</h1>
+        <h1 className={title ? "mt-2 whitespace-pre-wrap break-words text-lg font-semibold text-ink" : "mt-2 break-all font-mono text-lg font-semibold text-ink"}>
+          {title ?? item.path}
+        </h1>
       </div>
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_16rem]">

@@ -56,9 +56,10 @@ with sys as (
 ),
 scoped as (
   select i.id,
-         case when i.access = 'external' then sys.external_id else sys.general_id end as target_id,
-         case when i.access = 'external' then sys.general_id else sys.external_id end as opposite_id
+         coalesce(g.project_id, case when i.access = 'external' then sys.external_id else sys.general_id end) as target_id,
+         case when g.item_id is not null then null else case when i.access = 'external' then sys.general_id else sys.external_id end end as opposite_id
     from items i cross join sys
+    left join governed_item_origins g on g.team_id=i.team_id and g.item_id=i.id
    where i.team_id = $1
      and ($4::uuid is null or i.id > $4::uuid)
      and ($5::timestamptz is null or i.created_at < $5::timestamptz)

@@ -371,7 +371,7 @@ export function storedChunkingComplete(args: {
 
 /** Item kinds worth projecting as graph episodes — content-bearing knowledge, not raw config.
  * `skill`/`blueprint` are configuration manifests, not events/knowledge, so they're excluded. */
-export const PROJECTABLE_KINDS = ["transcript", "deliverable", "decision", "task", "artifact"] as const;
+export const PROJECTABLE_KINDS = ["transcript", "deliverable", "decision", "task", "artifact", "note"] as const;
 
 /** Human label per kind for the episode's source description (provenance the LLM extractor sees). */
 const KIND_LABEL: Record<string, string> = {

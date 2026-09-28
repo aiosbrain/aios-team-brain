@@ -76,6 +76,7 @@ export interface SourceRules {
  * Freezing a work-time wrongly makes real work invisible, which is the worse error of the two.
  */
 export const SOURCE_RULES: Readonly<Record<string, SourceRules>> = {
+  governed: { workTimeOnUnchangedBody: "noise", retainSupersededBodies: true, emitsTicketDocuments: false },
   // ── Event-shaped timestamps: the move IS the work ──────────────────────────────────────────────
   /** Thread `ts` — immutable per thread; a new message changes the body anyway.
    *

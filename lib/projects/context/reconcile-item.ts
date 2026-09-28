@@ -76,6 +76,20 @@ export async function reconcileItemContext(
   itemId: string,
   sys?: { general: string; externalShared: string }
 ): Promise<ReconcileItemResult> {
+  // Governed provenance binds placement to the accepted destination, including later sweeps.
+  // It is not inferred from frontmatter, and cannot silently fall back to General.
+  const { data: governed, error: governedError } = await db.from("governed_item_origins")
+    .select("project_id").eq("team_id", teamId).eq("item_id", itemId).maybeSingle();
+  if (governedError) return { ok: false, error: "governed origin read failed" };
+  if (governed) {
+    const unit = await reconcileItemUnit(db, teamId, itemId);
+    if (!unit.ok || !unit.unitId) return { ok: false, error: "governed unit unavailable" };
+    const placed = await ensureIncludeMembership(db, teamId, {
+      projectId: governed.project_id as string, contextUnitId: unit.unitId, method: "explicit_ref",
+    });
+    if (!placed.ok) return { ok: false, error: "governed destination placement refused" };
+    return { ok: true, unitId: unit.unitId, unitCreated: unit.created, membershipCreated: placed.created };
+  }
   let projects = sys;
   if (!projects) {
     const resolved = await systemProjectIds(db, teamId);

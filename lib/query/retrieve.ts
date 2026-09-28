@@ -605,10 +605,10 @@ async function nativeRetrieve(
   const dTeam = dParams.add(teamId);
   const dAccess = isRestrictedTier(tier) ? `and d.audience = 'external'` : "";
   const decisionsB = runSql<{
-    row_key: string; decided_at: string | Date | null; title: string; decided_by: string;
+    row_key: string; decided_at: string | Date | null; title: string; rationale: string; decided_by: string;
     still_valid: boolean; source_item_id: string | null; created_by: string | null; slug: string;
   }>(
-    `select d.row_key, d.decided_at, d.title, d.decided_by, d.still_valid, d.source_item_id, d.created_by,
+    `select d.row_key, d.decided_at, d.title, d.rationale, d.decided_by, d.still_valid, d.source_item_id, d.created_by,
             coalesce(p.slug, '') as slug
        from decisions d
        left join projects p on p.id = d.project_id
@@ -855,7 +855,7 @@ async function nativeRetrieve(
 
   // Decisions: the recency-50 window PLUS any keyword-matched decision that scrolled past it (Gap #6),
   // deduped by row_key. Recency rows first (fresh context), then the older matches under their own note.
-  type DecisionLine = { row_key: string; decided_at: string | null; title: string; decided_by: string; still_valid: boolean; source_item_id: string | null; slug: string };
+  type DecisionLine = { row_key: string; decided_at: string | null; title: string; rationale: string; decided_by: string; still_valid: boolean; source_item_id: string | null; slug: string };
   // ENFB-2 §2.2: BOTH decision legs now filter IN-QUERY (the recency window above, the keyword
   // window inside matchingDecisions) — the post-LIMIT filters this map replaced were the ENFB-1
   // deferred starvation site. The rule's owners: lib/access/provenance (TS) +
@@ -865,6 +865,7 @@ async function nativeRetrieve(
     decided_at:
       d.decided_at instanceof Date ? d.decided_at.toISOString().slice(0, 10) : ((d.decided_at as string | null) ?? null),
     title: d.title as string,
+    rationale: d.rationale as string,
     decided_by: d.decided_by as string,
     still_valid: d.still_valid as boolean,
     source_item_id: (d.source_item_id as string | null) ?? null,
@@ -873,7 +874,7 @@ async function nativeRetrieve(
   const recencyKeys = new Set(recencyDecisions.map((d) => d.row_key));
   const olderMatches = matchedDecisions.filter((d) => !recencyKeys.has(d.row_key));
   const fmtDecision = (d: DecisionLine) =>
-    `- #${d.row_key} (${d.decided_at ?? "?"}, ${d.slug}) ${d.title} — by ${d.decided_by}${d.still_valid ? "" : " [SUPERSEDED]"}`;
+    `- #${d.row_key} (${d.decided_at ?? "?"}, ${d.slug}) ${d.title} — by ${d.decided_by}${d.still_valid ? "" : " [SUPERSEDED]"}\n  Rationale: ${Array.from(d.rationale).slice(0, 25000).join("")}`;
 
   // The disabled set the relationships renderer consults (Codex QMIR-1 Medium 1) — sourced from
   // the same actors fetch the actor filter uses, so the two filters cannot disagree about who is
