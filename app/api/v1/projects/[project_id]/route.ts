@@ -12,7 +12,12 @@ const noStore = (response: Response): Response => {
 
 /** Verify one explicitly selected destination using current member authorization. */
 export async function GET(req: NextRequest, context: { params: Promise<{ project_id: string }> }) {
-  const auth = await authenticateApiKey(req);
+  let auth;
+  try {
+    auth = await authenticateApiKey(req, { preserveErrors: true });
+  } catch {
+    return noStore(errorResponse("unavailable", "destination verification unavailable", 503));
+  }
   if (!auth) return noStore(errorResponse("unauthorized", "invalid API key or team", 401));
   const { project_id } = await context.params;
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(project_id)) {
