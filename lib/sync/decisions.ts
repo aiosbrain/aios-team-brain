@@ -52,8 +52,8 @@ export async function getDecisionWriteback(
     `d.updated_at > ${p.add(since)}::timestamptz`,
     provenanceRowSqlFromIds("d", p, enforce),
     // UI-changed: dashboard-created (null source — already provenance-proven hand-typed
-    // above) OR a synced row edited after its source item's push.
-    `(d.source_item_id is null or (i.synced_at is not null and d.updated_at > i.synced_at))`,
+    // above), an immutable governed record, or a synced row edited after its source item's push.
+    `(d.source_item_id is null or exists (select 1 from governed_item_origins go where go.entity_id=d.id and go.team_id=d.team_id and go.project_id=d.project_id and go.kind='decision') or (i.synced_at is not null and d.updated_at > i.synced_at))`,
   ];
   if (isRestrictedTier(tier)) conds.push(`d.audience = 'external'`);
 

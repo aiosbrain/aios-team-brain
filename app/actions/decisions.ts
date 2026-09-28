@@ -2,7 +2,7 @@
 
 import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
-import { uiRowKey, isUniqueViolation } from "@/lib/ids";
+import { createDashboardDecision } from "@/lib/decisions/service";
 
 export interface NewDecisionInput {
   teamId: string;
@@ -39,42 +39,12 @@ export async function createDecisionAction(
     return { ok: false, error: "admins and leads only" };
   }
 
-  const db = await serverClient();
-  // ENFB-2 (Fable diff HIGH 2): a hand-typed decision in P makes P's row content-visible to
-  // the whole team (§2.1's decisions arm) — the write gates on the same row-visibility the
-  // read surfaces use, or filing into an unseen container un-hides it. Role alone is not the
-  // gate (content→membership applies to admins too, the ENFB-1 data-browser ruling).
-  const { canSeeProjectRow } = await import("@/lib/access/enforce");
-  const { adminClient } = await import("@/lib/db/admin");
-  if (!(await canSeeProjectRow(adminClient(), { teamId: input.teamId, memberId: me.id }, input.projectId))) {
-    return { ok: false, error: "project not found" };
+  try {
+    const decision = await createDashboardDecision(await serverClient(), { ...input, memberId: me.id });
+    return { ok: true, decision };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : "could not create decision" };
   }
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const { data, error } = await db
-      .from("decisions")
-      .insert({
-        team_id: input.teamId,
-        project_id: input.projectId,
-        source_item_id: null,
-        // ENFB-1 §2.7: creation provenance — this action is the SOLE writer of created_by
-        // (non-null proves hand-typed; sync never sets it), which is what re-admits this row
-        // to the enforced read surfaces.
-        created_by: me.id,
-        row_key: uiRowKey(),
-        decided_at: input.decidedAt || null,
-        title,
-        rationale: input.rationale.trim(),
-        decided_by: input.decidedBy.trim(),
-        impact: input.impact.trim(),
-        audience: input.audience === "external" ? "external" : "team",
-      })
-      .select("id, row_key, title")
-      .single();
-    if (!error && data) return { ok: true, decision: data as DecisionRow };
-    if (attempt === 0 && isUniqueViolation(error?.message)) continue;
-    return { ok: false, error: error?.message ?? "could not create decision" };
-  }
-  return { ok: false, error: "could not create decision" };
 }
 
 /**
@@ -92,6 +62,11 @@ export async function setDecisionValidityAction(
     .eq("id", decisionId)
     .maybeSingle();
   if (!decision) return { ok: false, error: "decision not found" };
+
+  const { data: origin, error: originError } = await db.from("governed_item_origins")
+    .select("item_id").eq("kind", "decision").eq("entity_id", decisionId).maybeSingle();
+  if (originError) return { ok: false, error: "decision authority unavailable" };
+  if (origin) return { ok: false, error: "This governed record is immutable; refresh the read-only mirror." };
 
   const me = await currentMember((decision as { team_id: string }).team_id);
   if (!me || (me.role !== "admin" && me.role !== "lead")) {
