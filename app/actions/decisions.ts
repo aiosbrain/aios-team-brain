@@ -63,15 +63,16 @@ export async function setDecisionValidityAction(
     .maybeSingle();
   if (!decision) return { ok: false, error: "decision not found" };
 
-  const { data: origin, error: originError } = await db.from("governed_item_origins")
-    .select("item_id").eq("kind", "decision").eq("entity_id", decisionId).maybeSingle();
-  if (originError) return { ok: false, error: "decision authority unavailable" };
-  if (origin) return { ok: false, error: "This governed record is immutable; refresh the read-only mirror." };
-
   const me = await currentMember((decision as { team_id: string }).team_id);
   if (!me || (me.role !== "admin" && me.role !== "lead")) {
     return { ok: false, error: "admins and leads only" };
   }
+
+  // Origin classification is visible only after live team membership and role authorization.
+  const { data: origin, error: originError } = await db.from("governed_item_origins")
+    .select("item_id").eq("kind", "decision").eq("entity_id", decisionId).maybeSingle();
+  if (originError) return { ok: false, error: "decision authority unavailable" };
+  if (origin) return { ok: false, error: "This governed record is immutable; refresh the read-only mirror." };
 
   const { error } = await db
     .from("decisions")
