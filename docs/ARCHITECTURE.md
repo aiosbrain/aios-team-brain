@@ -1364,6 +1364,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/v1/attribution` — attribution health (brain-api v1.13): the SAME derived read as Admin → Attribution (`lib/attribution/health`), so the CLI/LLM read it too — summary (`bySource`/`byMember`/`lowAttributionSources`), or `?member=<uuid>|unattributed` [+ `?source=`/`?limit=`] for the per-item provenance drill-down. **Team-tier ADMIN only** (all-tier read, member names + admin-content counts, no RLS backstop) — external/non-admin → 403
 - `GET /api/v1/pm-sync/health` — team-tier projection health and recent runs for CLI/agent observability
 - `GET /api/v1/decisions` — dashboard decision changes for `aios pull` writeback (tier-scoped)
+- `GET /api/v1/projects/:project_id` — uncached exact configured destination verification with live member/project authorization
 - `GET /api/v1/projects` — team project list for `aios pull` brain-project registration (team-tier only)
 - `GET /api/v1/company-graph` — structured stakeholder map for `aios stakeholders` / MCP `brain_stakeholders` (brain-api v1.5): `people[]` (actor entities with attrs-projected `role`/`job_family`/`reports_to`) + `ownership[]` (server-resolved `OWNS`/`TOUCHES`/`PRODUCES` edges → target workflow name/kind/job_family); team-tier only, app-code gate (no RLS backstop); unseeded team → `200` empty arrays
 - `GET /api/v1/me` — authenticated member identity + role (drives client UI gating)
