@@ -1,0 +1,218 @@
+{
+  "version": "1.0.0",
+  "sourceCommit": "80413da13a2ee8c8e66f0b46ae4ba1935c8f2940",
+  "tools": [
+    {
+      "name": "brain_status",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "brain_search_evidence",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000,
+            "description": "Natural-language question or source identifier."
+          },
+          "project": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "Optional source project slug."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20,
+            "default": 8
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "brain_query",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "question": {
+            "type": "string",
+            "description": "The natural-language question."
+          },
+          "project": {
+            "type": "string",
+            "description": "Optional project slug to scope the answer to one project."
+          }
+        },
+        "required": [
+          "question"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "brain_list_projects",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "brain_list_tasks",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "since": {
+            "type": "string",
+            "description": "Optional ISO-8601 cursor; return only rows updated strictly after it."
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "brain_list_decisions",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "since": {
+            "type": "string",
+            "description": "Optional ISO-8601 cursor; return only rows updated strictly after it."
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "brain_pull_items",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "since": {
+            "type": "string",
+            "description": "Optional ISO-8601 cursor (updated_at)."
+          },
+          "project": {
+            "type": "string",
+            "description": "Optional project slug filter."
+          },
+          "kinds": {
+            "type": "string",
+            "description": "Optional comma list: deliverable,transcript,decision,task,artifact,skill."
+          },
+          "path_prefix": {
+            "type": "string",
+            "description": "Optional path prefix, e.g. '2-work/' or '.claude/skills/<name>/' for a whole skill."
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque pagination cursor from a prior call."
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "brain_get_item",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The item UUID."
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "brain_stakeholders",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "owns": {
+            "type": "string",
+            "description": "Domain/workflow term \u2014 returns the people who own/touch/produce a match."
+          },
+          "who": {
+            "type": "string",
+            "description": "Person name (substring) \u2014 returns their role, org, and owned workflows."
+          },
+          "meeting": {
+            "type": "string",
+            "description": "Meeting title (substring) \u2014 returns attendees from the meeting item."
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      }
+    }
+  ]
+}

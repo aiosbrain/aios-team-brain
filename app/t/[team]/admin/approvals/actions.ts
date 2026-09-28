@@ -4,6 +4,7 @@ import { revalidatePath } from "next/cache";
 import { adminClient } from "@/lib/db/admin";
 import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { resolveApproval } from "@/lib/actions";
+import { governedActions, GovernedError } from "@/lib/actions/governed";
 import { createE2BSandbox } from "@/lib/actions/sandbox/e2b";
 import { getSessionUser } from "@/lib/auth/session";
 import {
@@ -22,24 +23,52 @@ export async function decideApproval(
   teamSlug: string,
   approvalRequestId: string,
   decision: "approved" | "denied",
-  note?: string
+  note?: string,
 ): Promise<{ ok: boolean; error?: string; message?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
-  if (decision !== "approved" && decision !== "denied") return { ok: false, error: "invalid decision" };
+  if (decision !== "approved" && decision !== "denied")
+    return { ok: false, error: "invalid decision" };
   try {
+    // New approval ownership is explicit; never let the legacy resolver decide one.
+    const db = adminClient();
+    const { data: governed, error: lookupError } = await db
+      .from("governed_actions")
+      .select("id")
+      .eq("approval_request_id", approvalRequestId)
+      .maybeSingle();
+    if (lookupError) return { ok: false, error: "could not decide" };
+    if (governed) {
+      const result = await governedActions.decide({
+        teamId: ctx.teamId,
+        deciderMemberId: ctx.memberId,
+        approvalRequestId,
+        decision,
+        note,
+      });
+      revalidatePath(`/t/${teamSlug}/admin/approvals`);
+      return { ok: true, message: `Action ${result.status}.` };
+    }
     const outcome = await resolveApproval(
       adminClient(),
       { approvalRequestId, decision, deciderMemberId: ctx.memberId, note },
-      { sandbox: createE2BSandbox() }
+      { sandbox: createE2BSandbox() },
     );
     revalidatePath(`/t/${teamSlug}/admin/approvals`);
-    if (outcome.status === "not_found") return { ok: false, error: "approval not found" };
-    if (outcome.status === "already_decided") return { ok: false, error: "already decided by someone else" };
+    if (outcome.status === "not_found")
+      return { ok: false, error: "approval not found" };
+    if (outcome.status === "already_decided")
+      return { ok: false, error: "already decided by someone else" };
     if (outcome.status === "denied") return { ok: true, message: "Denied." };
-    return { ok: true, message: `Approved${outcome.actionStatus ? ` — action ${outcome.actionStatus}` : ""}.` };
+    return {
+      ok: true,
+      message: `Approved${outcome.actionStatus ? ` — action ${outcome.actionStatus}` : ""}.`,
+    };
   } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : "could not decide" };
+    return {
+      ok: false,
+      error: e instanceof GovernedError ? e.message : "could not decide",
+    };
   }
 }
 
@@ -61,21 +90,14 @@ export async function decideManagedGatewayApproval(
   if (!user) return { ok: false, error: "admins only" };
   try {
     const ctx = await authorizeGatewayAdmin(teamSlug, user.id);
-    await decideGatewayApproval(
-      ctx,
-      approvalId,
-      decision,
-      correlationId,
-    );
+    await decideGatewayApproval(ctx, approvalId, decision, correlationId);
     revalidatePath(`/t/${teamSlug}/admin/approvals`);
     return { ok: true };
   } catch (error) {
     return {
       ok: false,
       error:
-        error instanceof GatewayAdminError
-          ? error.code
-          : "could not decide",
+        error instanceof GatewayAdminError ? error.code : "could not decide",
     };
   }
 }

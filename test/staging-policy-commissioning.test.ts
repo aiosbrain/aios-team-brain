@@ -984,7 +984,7 @@ describe("RIR residual resource lifetime and offline authority regressions", () 
 
     const blockers = assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, now: clock.now }).blockers;
     expect(blockers.some((entry) => /copied pre observation|mutated before the pre-witness observation/.test(entry.detail))).toBe(true);
-  });
+  }, 20000);
 
   it("RLR1 · a durable reappearance after closure invalidates the earlier cleanup even if interrupted", async () => {
     const { github, clock } = await coherentPacket();

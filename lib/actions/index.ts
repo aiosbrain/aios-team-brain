@@ -151,6 +151,13 @@ export async function resolveApproval(
 ): Promise<ResolveApprovalOutcome> {
   const { approvalRequestId, decision, deciderMemberId, note } = input;
 
+  // Governed approvals have their own transactional resolver, never the legacy registry.
+  const { data: governed, error: governedError } = await db.from("governed_actions")
+    .select("id").eq("approval_request_id", approvalRequestId).maybeSingle();
+  if (governedError) throw new Error("approval ownership unavailable");
+  if (governed) return { approvalRequestId, status: "not_found" };
+
+
   const { data: appr } = await db
     .from("approval_requests")
     .select("id, team_id, status")

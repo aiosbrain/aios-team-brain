@@ -1,0 +1,335 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:aios:mcp-next:1:profile",
+  "title": "Reserved MCP next profile contracts 1.0.0",
+  "$ref": "#/definitions/ProfilesExtension",
+  "definitions": {
+    "Profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "mode": {
+          "enum": [
+            "brain-only",
+            "workspace"
+          ]
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "brainOrigin": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https://[^/?#@]+(?::[0-9]+)?$"
+        },
+        "teamId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "projectId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "credentialSource": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "root": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 4096,
+              "pattern": "^(?:/[^\\x00]*|[A-Za-z]:\\\\[^\\x00]*|\\\\\\\\[^\\\\]+\\\\[^\\\\]+(?:\\\\[^\\x00]*)?)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rootIdentity": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "grants": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "brainActions": {
+              "type": "boolean"
+            },
+            "workspaceRead": {
+              "type": "boolean"
+            },
+            "workspaceDraft": {
+              "type": "boolean"
+            },
+            "workspacePublish": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "brainActions",
+            "workspaceRead",
+            "workspaceDraft",
+            "workspacePublish"
+          ]
+        },
+        "readRoots": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+            "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\\\:\\x00])(?!.*//)(?!.*\\/$).+$"
+          },
+          "maxItems": 32,
+          "uniqueItems": true
+        },
+        "draftRoots": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+            "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\\\:\\x00])(?!.*//)(?!.*\\/$).+$"
+          },
+          "maxItems": 32,
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "id",
+        "mode",
+        "generation",
+        "brainOrigin",
+        "teamId",
+        "projectId",
+        "credentialSource",
+        "root",
+        "rootIdentity",
+        "grants",
+        "readRoots",
+        "draftRoots"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "brain-only"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "root": {
+                "type": "null"
+              },
+              "rootIdentity": {
+                "type": "null"
+              },
+              "grants": {
+                "properties": {
+                  "workspaceRead": {
+                    "const": false
+                  },
+                  "workspaceDraft": {
+                    "const": false
+                  },
+                  "workspacePublish": {
+                    "const": false
+                  }
+                }
+              },
+              "readRoots": {
+                "maxItems": 0
+              },
+              "draftRoots": {
+                "maxItems": 0
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "root": {
+                "type": "string",
+                "maxLength": 4096,
+                "pattern": "^(?:/[^\\x00]*|[A-Za-z]:\\\\[^\\x00]*|\\\\\\\\[^\\\\]+\\\\[^\\\\]+(?:\\\\[^\\x00]*)?)$"
+              },
+              "rootIdentity": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              }
+            }
+          }
+        }
+      ]
+    },
+    "Grants": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "brainActions": {
+          "type": "boolean"
+        },
+        "workspaceRead": {
+          "type": "boolean"
+        },
+        "workspaceDraft": {
+          "type": "boolean"
+        },
+        "workspacePublish": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "brainActions",
+        "workspaceRead",
+        "workspaceDraft",
+        "workspacePublish"
+      ]
+    },
+    "CredentialReference": {
+      "type": "string",
+      "pattern": "^(env:[A-Za-z_][A-Za-z0-9_]*|keychain:[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,255})$"
+    },
+    "ProfilesExtension": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "const": "1.0.0"
+        },
+        "profiles": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:aios:mcp-next:1:profile#/definitions/Profile"
+          },
+          "maxItems": 64,
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "version",
+        "profiles"
+      ]
+    },
+    "ProfileSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profileId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        }
+      },
+      "required": [
+        "profileId"
+      ]
+    },
+    "MigrationInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "const": 2
+        },
+        "defaultWorkspace": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 4096,
+              "pattern": "^(?:/[^\\x00]*|[A-Za-z]:\\\\[^\\x00]*|\\\\\\\\[^\\\\]+\\\\[^\\\\]+(?:\\\\[^\\x00]*)?)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "credentialSources": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+          },
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^(env:[A-Za-z_][A-Za-z0-9_]*|keychain:[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,255})$"
+          }
+        },
+        "requestedProfiles": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:aios:mcp-next:1:profile#/definitions/Profile"
+          },
+          "maxItems": 64,
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "requestedProfiles"
+      ]
+    },
+    "MigrationOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "const": 2
+        },
+        "defaultWorkspace": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 4096,
+              "pattern": "^(?:/[^\\x00]*|[A-Za-z]:\\\\[^\\x00]*|\\\\\\\\[^\\\\]+\\\\[^\\\\]+(?:\\\\[^\\x00]*)?)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "credentialSources": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+          },
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^(env:[A-Za-z_][A-Za-z0-9_]*|keychain:[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,255})$"
+          }
+        },
+        "connectionProfiles": {
+          "$ref": "urn:aios:mcp-next:1:profile#/definitions/ProfilesExtension"
+        },
+        "changed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "connectionProfiles",
+        "changed"
+      ]
+    }
+  }
+}

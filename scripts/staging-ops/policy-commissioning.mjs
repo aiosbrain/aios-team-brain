@@ -47,7 +47,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, statSync, writeSync } from "node:fs";
+import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, statSync, writeSync } from "node:fs";
 import path from "node:path";
 import { isDirectEntry as directEntry } from "./direct-entry.mjs";
 import { buildMainRulesets, REQUIRED_MAIN_CONTEXTS, verifyEffectiveMainPolicy } from "./main-policy.mjs";
@@ -72,9 +72,10 @@ import { buildMainRulesets, REQUIRED_MAIN_CONTEXTS, verifyEffectiveMainPolicy } 
  */
 const resolveInstallationTokenHelper = async () => (await import("./release-controller.mjs")).createInstallationToken;
 import {
-  JournalChainError, acquireJournalLock, assertPrivateDirectory, openJournal, readJournal, recordWitnessEventOnce,
+  JournalChainError, acquireJournalLock, assertPrivateDirectory, openJournal, readJournal, readReviewerJournal, recordWitnessEventOnce,
   reduceResourceLifecycles, writeJournalSnapshot,
 } from "./commissioning-journal.mjs";
+import { authoritativeBundle as reviewerAuthoritativeBundle, diagnosticResult as assessReviewerDiagnostic, fileRef as reviewerFileRef, digest as reviewerDigest, intent as reviewerIntent, json as reviewerJson } from "./reviewer-negative-probe.mjs";
 import {
   CHALLENGE_DIRECTIONS, CLOUD_CASE_SEQUENCE, COMMISSION_DOMAIN,
   REHEARSAL_CASE_ID, REHEARSAL_DOMAIN, REHEARSAL_ROLE, REHEARSAL_TARGET,
@@ -6872,6 +6873,23 @@ export function validateEnvironmentControl(record, { dir, key, environment, envi
   if (!schema) return `names the control ${JSON.stringify(String(key))}, which is outside the closed PC-06 list`;
   if (record === undefined || record === null) return "is absent";
   if (typeof record !== "object" || Array.isArray(record)) return "is not a control record";
+  if (Object.hasOwn(record, "reviewer_diagnostic_version")) {
+    if (key !== "self_review_refused" && key !== "unauthorized_reviewer_refused") return "carries a reviewer diagnostic marker under the wrong control";
+    if (Object.keys(record).sort().join("|") !== "artifact|reviewer_diagnostic_version|sha256|status"
+      || record.reviewer_diagnostic_version !== 1 || record.status !== "unverified") return "has an invalid reviewer diagnostic reference";
+    try {
+      const ref = reviewerFileRef({ artifact: record.artifact, sha256: record.sha256 });
+      // A diagnostic descriptor is reviewable, but no diagnostic result in this revision can
+      // supply the accepting 'refused' value. The original protected run still needs real approval.
+      const kind = key === "self_review_refused" ? "reviewer-self" : "reviewer-app";
+      const result = assessReviewerDiagnostic({ dir, bundleRef: ref,
+        journalRecords: readReviewerJournal({ dir, runId, attempt, kind }),
+        priorRecords: kind === 'reviewer-app' ? readReviewerJournal({ dir, runId, attempt, kind: 'reviewer-self' }) : null,
+        originalRecords: readJournal({ dir, runId, attempt }) });
+      return result.status === "invalid-diagnostic" || result.control !== key
+        ? `has invalid diagnostic evidence (${result.reason ?? "wrong control"})` : "is diagnostic-unverified";
+    } catch (error) { return `has invalid diagnostic evidence (${error.message})`; }
+  }
   /**
    * ── THE ONE CROSS-RUN VARIANT, SELECTED EXPLICITLY (accepted PC-06 API-only design) ─────────────
    *
@@ -7651,6 +7669,16 @@ function reconstructCaseTransport(record, { runId, attempt, role, kase, intent, 
   return problems;
 }
 
+function retainedReviewerRef(dir, artifact) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$/.test(artifact)) throw new Error("unsafe reviewer artifact name");
+  const fd = openSync(path.join(dir, artifact), constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile() || (st.mode & 0o777) !== 0o600 || st.size > 64 * 1024) throw new Error("reviewer artifact is not a private bounded regular file");
+    return reviewerFileRef({ artifact, sha256: reviewerDigest(readFileSync(fd)) });
+  } finally { closeSync(fd); }
+}
+
 export function assessEvidence({ dir, runId, attempt, now = () => new Date() }) {
   const blockers = [];
   const block = (gate, kind, detail) => { blockers.push({ gate, kind, detail }); };
@@ -7663,6 +7691,28 @@ export function assessEvidence({ dir, runId, attempt, now = () => new Date() }) 
   const resourceHistory = journalRecords ? reduceResourceLifecycles(journalRecords) : null;
   if (resourceHistory?.errors.length) {
     block("PC-07", "invalid", `the resource lifecycle history is contradictory (${resourceHistory.errors.join("; ")})`);
+  }
+  for (const link of journalRecords?.filter((record) => record.type === "reviewer-probe-linked") ?? []) {
+    try {
+      const control = link.data?.control;
+      const stub = control === "self_review_refused" ? "self" : control === "unauthorized_reviewer_refused" ? "app" : null;
+      if (!stub) throw new Error("unknown linked reviewer control");
+      const intentRef = retainedReviewerRef(dir, `reviewer-${runId}-${attempt}-${stub}-intent.json`);
+      if (intentRef.sha256 !== link.data.intent_sha256) throw new Error("linked reviewer intent digest differs");
+      const diagnosticIntent = reviewerIntent(reviewerJson(dir, intentRef));
+      if (diagnosticIntent.control !== control || diagnosticIntent.original.run_id !== String(runId)
+        || diagnosticIntent.original.attempt !== String(attempt) || diagnosticIntent.journal_artifact !== link.data.probe_journal_artifact)
+        throw new Error("linked reviewer identity differs");
+      const kind = stub === "self" ? "reviewer-self" : "reviewer-app";
+      const reviewerRecords = readReviewerJournal({ dir, runId, attempt, kind });
+      const result = assessReviewerDiagnostic({ dir,
+        bundleRef: reviewerAuthoritativeBundle(dir, reviewerRecords, String(runId), String(attempt), control),
+        journalRecords: reviewerRecords, priorRecords: kind === 'reviewer-app' ? readReviewerJournal({ dir, runId, attempt, kind: 'reviewer-self' }) : null, originalRecords: journalRecords });
+      if (result.status !== "diagnostic-unverified" || result.control !== control || result.cleanup_status !== "complete")
+        throw new Error(`linked reviewer evidence is ${result.status}: ${result.reason ?? result.cleanup_status}`);
+    } catch (error) {
+      block("PC-07", "unverified", `linked reviewer ${link.data?.control ?? "unknown"} has no complete valid cleanup (${error instanceof Error ? error.message : String(error)})`);
+    }
   }
 
   /**
