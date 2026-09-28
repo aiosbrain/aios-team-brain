@@ -11,6 +11,9 @@ export const EXCLUDED_PAIRED_TABLE_DATA = Object.freeze([
   "gateway_resolution_leases",
   "gateway_service_credentials",
   "gateway_service_identities",
+  // Execution history is bound to excluded API keys; identities must not outlive copied attempts.
+  "governed_action_identities",
+  "governed_actions",
   "integrations",
   "llm_failures",
   "llm_usage",

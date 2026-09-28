@@ -76,7 +76,7 @@ async function contextAction(action, kind = "team") {
   return JSON.parse(stdout.trim().split("\n").filter(Boolean).at(-1) ?? "{}");
 }
 
-async function seedPostgres(client, suffix = "v1") {
+export async function seedPostgres(client, suffix = "v1") {
   await client.query("INSERT INTO auth_users(id,email,password_hash) VALUES($1,'internal@example.test','production-password-hash'),($2,'external@example.test','production-password-hash')", [AUTH_INTERNAL, AUTH_EXTERNAL]);
   await client.query("INSERT INTO teams(id,slug,name) VALUES($1,'paired-test','Paired Test')", [TEAM]);
   await client.query(`INSERT INTO members(id,team_id,auth_user_id,email,display_name,actor_handle,role,tier,status) VALUES
@@ -102,6 +102,29 @@ async function seedPostgres(client, suffix = "v1") {
   await client.query("INSERT INTO arc_corrections(id,team_id,arc_id,arc_title,corrected_text,group_key,created_by) VALUES('55555555-5555-4555-8555-555555555555',$1,'arc-1','Arc','corrected truth','g:paired_team',$2)", [TEAM, INTERNAL]);
   await client.query("INSERT INTO graph_episodes(team_id,source_table,source_id,group_id,content_sha256,episode_uuid) VALUES($1,'arc_corrections','55555555-5555-4555-8555-555555555555','paired_team',$2,'ep-correction')", [TEAM, "c".repeat(64)]);
   await client.query("INSERT INTO social_jobs(team_id,kind,payload) VALUES($1,'publish','{}')", [TEAM]);
+  // A real credential-bound attempt makes missing exclusion closure fail during pg_restore.
+  // These rows belong only to this synthetic source; production history is never deleted.
+  const credential = (await client.query(
+    "INSERT INTO api_keys(team_id,member_id,key_id,key_hash,name) VALUES($1,$2,'governed-fixture',$3,'source-governed-fixture') RETURNING id",
+    [TEAM, INTERNAL, createHash("sha256").update("synthetic-governed-secret").digest("hex")],
+  )).rows[0].id;
+  const request = JSON.stringify({ type: "note.append", destination: { project_id: PROJECTS.team }, content: "synthetic governed note" });
+  const identity = (await client.query(
+    "INSERT INTO governed_action_identities(team_id,member_id,project_id,operation_key,canonical_request,request_hash) VALUES($1,$2,$3,'paired-governed-fixture',$4,$5) RETURNING id",
+    [TEAM, INTERNAL, PROJECTS.team, request, createHash("sha256").update(request).digest("hex")],
+  )).rows[0].id;
+  const audit = (await client.query(
+    "INSERT INTO audit_log(team_id,actor_kind,member_id,api_key_id,action) VALUES($1,'api_key',$2,$3,'governed.requested') RETURNING id",
+    [TEAM, INTERNAL, credential],
+  )).rows[0].id;
+  await client.query(
+    "INSERT INTO governed_actions(identity_id,attempt,credential_id,credential_fingerprint,request,status,result,audit_ref) VALUES($1,1,$2,'synthetic-governed-fingerprint',$3,'requested','{}',$4)",
+    [identity, credential, request, audit],
+  );
+  const linked = await client.query(`SELECT count(*)::int AS n FROM governed_actions a
+    JOIN governed_action_identities i ON i.id=a.identity_id JOIN api_keys k ON k.id=a.credential_id
+    JOIN audit_log l ON l.id=a.audit_ref WHERE i.id=$1 AND k.id=$2`, [identity, credential]);
+  if (linked.rows[0].n !== 1) throw new Error("fixture did not seed one linked governed attempt");
 }
 
 async function substrateCounts(client) {
@@ -306,6 +329,17 @@ async function assertBootstrapRestored(expectedMode, expectedRunId) {
     return { status: "bootstrap-pair-restored", ...serving };
   } finally { await staging.end(); await driver.close(); }
 }
+/** Kept separate so the real PostgreSQL pair can verify the same oracle without a graph server. */
+export async function assertGovernedHistorySanitized(client) {
+  const { rows } = await client.query(`SELECT
+    (SELECT count(*)::int FROM governed_action_identities) AS identities,
+    (SELECT count(*)::int FROM governed_actions) AS actions`);
+  if (rows[0].identities !== 0 || rows[0].actions !== 0) {
+    throw new Error(`governed execution history survived sanitation: ${JSON.stringify(rows[0])}`);
+  }
+  return rows[0];
+}
+
 async function assertInstalled(expected = "v1") {
   const staging = await pgClient(process.env.STAGING_DATABASE_URL); const driver = await graphDriver(process.env.STAGING_NEO4J_URL, "stagingtest1");
   try {
@@ -313,6 +347,7 @@ async function assertInstalled(expected = "v1") {
     if (!password.rows[0]?.password_hash || password.rows[0].password_hash === "production-password-hash") throw new Error("staging tester password was not safely reapplied");
     const forbidden = await staging.query("SELECT (SELECT count(*) FROM social_jobs)+(SELECT count(*) FROM integrations)+(SELECT count(*) FROM api_keys) AS n");
     if (Number(forbidden.rows[0].n) !== 0) throw new Error("credentials or outbound queues survived sanitation");
+    await assertGovernedHistorySanitized(staging);
     const pending = await staging.query("SELECT count(*) AS n FROM graph_episodes WHERE pending_delete_group_id IS NOT NULL OR pending_delete_at IS NOT NULL");
     if (Number(pending.rows[0].n) !== 0) throw new Error("sanitized old-group cleanup metadata was not cleared with the removed graph content");
     const session = driver.session({ defaultAccessMode: neo4j.session.READ });
