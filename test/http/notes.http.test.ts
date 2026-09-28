@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
+import { sha } from "../datamechanics/helpers";
 import { BASE_URL, seedMemberEmail } from "./http-helpers";
 import { noteCounts, noteFixture, noteMember, noteRequest, noteSql } from "../datamechanics/note-fixture";
 
@@ -113,6 +114,28 @@ describe.runIf(process.env.AIOS_GOVERNED_ACTIONS_ENABLED === "true")("governed n
     expect((await fetch(`${BASE_URL}/api/v1/actions/${result.action_id}`, { headers: f.headers })).status).toBe(404);
     expect((await fetch(`${BASE_URL}/api/v1/items/${result.entity.id}`, { headers: f.headers })).status).toBe(404);
     expect(await noteCounts(f.teamId)).toMatchObject({ notes: 1, versions: 1 });
+  });
+
+  it("rejects legacy note edits, reclassification and fresh reserved-path squatting", async () => {
+    const f = await noteFixture();
+    const result = await success(f.headers, f.request);
+    const read = await fetch(`${BASE_URL}/api/v1/items/${result.entity.id}`, { headers: f.headers });
+    const { project, path, kind, access, frontmatter, body, content_sha256, actor } = await read.json();
+    const echo = { project, path, kind, access, frontmatter, body, content_sha256, actor };
+    for (const edit of [
+      { ...echo, frontmatter: { ...frontmatter, title: "Replacement" } },
+      { ...echo, body: "Replacement", content_sha256: sha("Replacement") },
+      { ...echo, kind: "artifact" },
+      { ...echo, access: "external" },
+      { ...echo, path: `1-inbox/governed/note/${randomUUID()}.md` },
+    ]) {
+      const response = await post(f.headers, edit, `${BASE_URL}/api/v1/items`);
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ error: { code: "immutable_origin" } });
+    }
+    const retained = await fetch(`${BASE_URL}/api/v1/items/${result.entity.id}`, { headers: f.headers });
+    expect(await retained.json()).toMatchObject(echo);
+    expect(await noteCounts(f.teamId)).toMatchObject({ notes: 1, versions: 1, origins: 1 });
   });
 
   it("renders the escaped title to an authorized dashboard member and hides it from a General-only member", async () => {
