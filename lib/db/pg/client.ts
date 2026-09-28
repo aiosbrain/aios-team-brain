@@ -9,8 +9,9 @@ import { runSql } from "./pool";
  * Auth is handled separately by lib/auth (this client has no `.auth`).
  */
 export class PgClient {
+  constructor(private readonly executeSql: typeof runSql = runSql) {}
   from<T = unknown>(table: string): PgQuery<T> {
-    return new PgQuery<T>(table);
+    return new PgQuery<T>(table, this.executeSql);
   }
 
   async rpc(
@@ -19,14 +20,14 @@ export class PgClient {
   ): Promise<{ data: unknown; error: { message: string } | null }> {
     try {
       if (fn === "rate_limit_hit") {
-        const { rows } = await runSql<{ result: number }>(
+        const { rows } = await this.executeSql<{ result: number }>(
           `SELECT rate_limit_hit($1, $2) AS result`,
           [args.p_bucket, args.p_window_start]
         );
         return { data: rows[0]?.result ?? 0, error: null };
       }
       if (fn === "reconcile_codebase_findings") {
-        const { rows } = await runSql<{ result: Record<string, number> }>(
+        const { rows } = await this.executeSql<{ result: Record<string, number> }>(
           `SELECT reconcile_codebase_findings($1, $2, $3, $4::jsonb) AS result`,
           [
             args.p_team_id,
@@ -38,7 +39,7 @@ export class PgClient {
         return { data: rows[0]?.result ?? {}, error: null };
       }
       if (fn === "decide_codebase_finding") {
-        const { rows } = await runSql<{ result: { finding_id: string; status: string } }>(
+        const { rows } = await this.executeSql<{ result: { finding_id: string; status: string } }>(
           `SELECT decide_codebase_finding($1, $2, $3, $4, $5, $6, $7, $8) AS result`,
           [
             args.p_team_id,
