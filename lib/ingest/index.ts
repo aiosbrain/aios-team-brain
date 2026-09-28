@@ -1,4 +1,4 @@
-import { assertNotGovernedItem } from "./governed-origin";
+import { assertNotGovernedItem, governedNoteEcho } from "./governed-origin";
 import { assertGovernedDecisionEcho } from "./decisions";
 import "server-only";
 
@@ -132,6 +132,8 @@ export async function ingestItem(
   const { data: destination, error: destinationError } = await db.from("projects")
     .select("id").eq("team_id", auth.teamId).eq("slug", payload.project).maybeSingle();
   if (destinationError) throw new Error("destination preflight unavailable");
+  const noteEcho = await governedNoteEcho(db, auth, destination?.id ?? null, payload, pusherTier);
+  if (noteEcho) return { status: "unchanged", id: noteEcho, projectId: destination!.id as string };
   await assertNotGovernedItem(db, auth.teamId, destination?.id ?? null, payload.path);
   if (destination && payload.kind === "decision" && payload.rows) {
     await assertGovernedDecisionEcho(db, auth.teamId, destination.id as string, payload.rows);

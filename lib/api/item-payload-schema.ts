@@ -119,7 +119,7 @@ const commonItemFields = {
 };
 
 const nonRowPayloadSchema = (
-  kind: "deliverable" | "transcript" | "artifact" | "skill" | "blueprint",
+  kind: "deliverable" | "transcript" | "artifact" | "skill" | "blueprint" | "note",
 ) =>
   z.strictObject({
     ...commonItemFields,
@@ -153,6 +153,8 @@ function buildItemPayloadSchema(maxRows: number | null) {
     nonRowPayloadSchema("artifact"),
     nonRowPayloadSchema("skill"),
     nonRowPayloadSchema("blueprint"),
+    // Parsing permits only the exact existing-note echo; ingest rejects all fresh note writes.
+    nonRowPayloadSchema("note"),
   ]);
 }
 
