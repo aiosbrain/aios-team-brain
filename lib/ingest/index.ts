@@ -1,3 +1,5 @@
+import { assertNotGovernedItem } from "./governed-origin";
+import { assertGovernedDecisionEcho } from "./decisions";
 import "server-only";
 
 import { createHash } from "node:crypto";
@@ -126,6 +128,14 @@ export async function ingestItem(
   // dedup. It is NOT rejected — the body is the source of truth and we can always hash it correctly.
   const contentSha = contentHash(payload.body);
   const shaMismatch = contentSha !== payload.content_sha256;
+  // Refuse immutable-origin changes before the legacy project/item upsert has any effect.
+  const { data: destination, error: destinationError } = await db.from("projects")
+    .select("id").eq("team_id", auth.teamId).eq("slug", payload.project).maybeSingle();
+  if (destinationError) throw new Error("destination preflight unavailable");
+  await assertNotGovernedItem(db, auth.teamId, destination?.id ?? null, payload.path);
+  if (destination && payload.kind === "decision" && payload.rows) {
+    await assertGovernedDecisionEcho(db, auth.teamId, destination.id as string, payload.rows);
+  }
   const now = new Date().toISOString();
   const { data: project, error: projectError } = await db
     .from("projects")

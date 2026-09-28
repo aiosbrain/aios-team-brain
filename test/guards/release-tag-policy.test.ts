@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_TAGS, nextTagPolicy } from "../../scripts/migrate-from-existing.mjs";
+import { inspectUnpromotedCandidate, verifiedCandidateExemption } from "../../scripts/migration-candidate-policy.mjs";
 
 /**
  * RELPTR-1 — cutting a release used to be impossible without freezing the repo.
@@ -116,14 +117,23 @@ describe("release tag policy — the anti-rot rule survives (criteria 3, 4, 5)",
     expect(() => nextTagPolicy(CUT_FIXTURE, ["v0.99.0", ...REAL_TAGS])).toThrow(/stale: v0\.99\.0/);
   });
 
-  itWithTags("the LIVE declared list is in a legal state — the only thing that stays true mid-release", () => {
+  itWithTags("the LIVE declared list is legal only with the required publication evidence", async () => {
     // This is what replaced "nothing is pending". A declared-but-uncut tag is a legal state (it is how
     // a release is prepared); an illegal one is a middle hole or a stale list. Asserting legality holds
     // between releases AND during one, so declaring a release can never redden this file.
     expect(gitTags).toContain("v0.10.0");
-    expect(() => nextTagPolicy(DEFAULT_TAGS, gitTags)).not.toThrow();
+    let candidateExemption = null;
+    if (inspectUnpromotedCandidate(DEFAULT_TAGS, gitTags)) {
+      // Real git alone must remain stale. Publication is a FIXTURE here; the actual
+      // migration command requires a fresh authenticated GitHub response.
+      expect(() => nextTagPolicy(DEFAULT_TAGS, gitTags)).toThrow(/stale: v0\.13\.0/);
+      candidateExemption = await verifiedCandidateExemption(DEFAULT_TAGS, gitTags, {
+        token: "synthetic-unit-fixture", fetchImpl: async () => new Response(null, { status: 404 }),
+      });
+    }
+    expect(() => nextTagPolicy(DEFAULT_TAGS, gitTags, { candidateExemption })).not.toThrow();
     // …and still non-vacuous against live git: a newer real tag nobody declared is a stale list.
-    expect(() => nextTagPolicy(DEFAULT_TAGS, ["v0.99.0", ...gitTags])).toThrow(/stale: v0\.99\.0/);
+    expect(() => nextTagPolicy(DEFAULT_TAGS, ["v0.99.0", ...gitTags], { candidateExemption })).toThrow(/stale: v0\.99\.0/);
   });
 
   it("DECLARES v0.11.0 — the intermediate release the PRET-6 upgrade path passes through", () => {
@@ -342,7 +352,8 @@ describe("release tag policy — the CALL SITE, not just the function (criterion
   const SRC = readFileSync(join(ROOT, "scripts", "migrate-from-existing.mjs"), "utf8");
 
   it("main() routes the declared tags THROUGH the policy", () => {
-    expect(SRC).toMatch(/const policy = nextTagPolicy\(tags, known, \{ allowPending: usingDeclaration \}\)/);
+    expect(SRC).toMatch(/const candidateExemption = await verifiedCandidateExemption\(tags, known, \{ usingDeclaration \}\)/);
+    expect(SRC).toMatch(/const policy = nextTagPolicy\(tags, known, \{ allowPending: usingDeclaration, candidateExemption \}\)/);
   });
 
   it("main() upgrades from policy.usable — not from the raw declared list", () => {
@@ -379,6 +390,8 @@ describe("release tag policy — the lane's preconditions (criteria 7, 8, 9)", (
     const migrationJob = jobs.find((j) => j.includes("migrate-from-existing"));
     expect(migrationJob, "ci.yml must still run the migration lane").toBeTruthy();
     expect(migrationJob!, "the migration job itself needs fetch-depth: 0").toMatch(/fetch-depth:\s*0/);
+    expect(migrationJob!).toMatch(/permissions:\s*\n\s+contents: read/);
+    expect(migrationJob!).toMatch(/run: npm run test:migrate-from-existing\s*\n\s+env:\s*\n\s+GITHUB_TOKEN: \$\{\{ github\.token \}\}/);
     // Non-vacuity: a job that does NOT ask for full history must not satisfy this.
     const shallow = jobs.find((j) => !j.includes("fetch-depth: 0") && j.includes("steps:"));
     if (shallow) expect(shallow).not.toMatch(/fetch-depth:\s*0/);

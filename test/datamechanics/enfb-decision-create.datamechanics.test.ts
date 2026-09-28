@@ -17,6 +17,7 @@ vi.mock("@/lib/db/server", () => ({
 describe("ENFB-1 — createDecisionAction writes creation provenance", () => {
   it("created_by = the creating member; the row passes the provenance rule at team posture and fails it at external", async () => {
     const seed = await seedTeam();
+    await db().from("members").update({ role: "admin" }).eq("id", seed.memberId);
     const { data: proj } = await db().from("projects").insert({ team_id: seed.teamId, slug: "dc", name: "DC", kind: "initiative" }).select("id").single();
     // ENFB-2 H2: the create action now gates on row visibility — grant the creator the
     // fresh initiative the way createProjectAction's D1 grant would have.

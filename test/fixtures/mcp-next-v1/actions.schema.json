@@ -10,7 +10,10 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+          "not": {
+            "pattern": "\\u0000"
+          }
         }
       },
       "required": [
@@ -25,13 +28,19 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 200,
-          "pattern": "\\S"
+          "pattern": "\\S",
+          "not": {
+            "pattern": "\\u0000"
+          }
         },
         "body": {
           "type": "string",
           "minLength": 1,
           "maxLength": 25000,
-          "pattern": "\\S"
+          "pattern": "\\S",
+          "not": {
+            "pattern": "\\u0000"
+          }
         }
       },
       "required": [
@@ -47,7 +56,10 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 500,
-          "pattern": "\\S"
+          "pattern": "\\S",
+          "not": {
+            "pattern": "\\u0000"
+          }
         },
         "assignee": {
           "anyOf": [
@@ -55,7 +67,10 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 128,
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+              "not": {
+                "pattern": "\\u0000"
+              }
             },
             {
               "type": "null"
@@ -76,7 +91,10 @@
           "anyOf": [
             {
               "type": "string",
-              "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+              "not": {
+                "pattern": "\\u0000"
+              }
             },
             {
               "type": "null"
@@ -99,13 +117,19 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+          "not": {
+            "pattern": "\\u0000"
+          }
         },
         "title": {
           "type": "string",
           "minLength": 1,
           "maxLength": 500,
-          "pattern": "\\S"
+          "pattern": "\\S",
+          "not": {
+            "pattern": "\\u0000"
+          }
         },
         "assignee": {
           "anyOf": [
@@ -113,7 +137,10 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 128,
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+              "not": {
+                "pattern": "\\u0000"
+              }
             },
             {
               "type": "null"
@@ -134,7 +161,10 @@
           "anyOf": [
             {
               "type": "string",
-              "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+              "not": {
+                "pattern": "\\u0000"
+              }
             },
             {
               "type": "null"
@@ -158,18 +188,27 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+          "not": {
+            "pattern": "\\u0000"
+          }
         },
         "task_id": {
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+          "not": {
+            "pattern": "\\u0000"
+          }
         },
         "expected_revision": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 128
+          "maxLength": 128,
+          "not": {
+            "pattern": "\\u0000"
+          }
         },
         "changes": {
           "type": "object",
@@ -178,7 +217,10 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 500,
-              "pattern": "\\S"
+              "pattern": "\\S",
+              "not": {
+                "pattern": "\\u0000"
+              }
             },
             "assignee": {
               "anyOf": [
@@ -186,7 +228,10 @@
                   "type": "string",
                   "minLength": 1,
                   "maxLength": 128,
-                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+                  "not": {
+                    "pattern": "\\u0000"
+                  }
                 },
                 {
                   "type": "null"
@@ -207,7 +252,10 @@
               "anyOf": [
                 {
                   "type": "string",
-                  "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+                  "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                  "not": {
+                    "pattern": "\\u0000"
+                  }
                 },
                 {
                   "type": "null"
@@ -235,23 +283,35 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+          "not": {
+            "pattern": "\\u0000"
+          }
         },
         "title": {
           "type": "string",
           "minLength": 1,
           "maxLength": 500,
-          "pattern": "\\S"
+          "pattern": "\\S",
+          "not": {
+            "pattern": "\\u0000"
+          }
         },
         "rationale": {
           "type": "string",
           "minLength": 1,
           "maxLength": 25000,
-          "pattern": "\\S"
+          "pattern": "\\S",
+          "not": {
+            "pattern": "\\u0000"
+          }
         },
         "impact": {
           "type": "string",
-          "maxLength": 5000
+          "maxLength": 5000,
+          "not": {
+            "pattern": "\\u0000"
+          }
         }
       },
       "required": [
@@ -269,7 +329,10 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+          "not": {
+            "pattern": "\\u0000"
+          }
         }
       },
       "required": [
@@ -284,7 +347,10 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+          "not": {
+            "pattern": "\\u0000"
+          }
         }
       },
       "required": [
@@ -316,7 +382,10 @@
         "message": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 1000
+          "maxLength": 1000,
+          "not": {
+            "pattern": "\\u0000"
+          }
         },
         "retryable": {
           "type": "boolean"
@@ -324,7 +393,10 @@
         "recovery": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 1000
+          "maxLength": 1000,
+          "not": {
+            "pattern": "\\u0000"
+          }
         }
       },
       "required": [
@@ -367,12 +439,18 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+          "not": {
+            "pattern": "\\u0000"
+          }
         },
         "revision": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 128
+          "maxLength": 128,
+          "not": {
+            "pattern": "\\u0000"
+          }
         }
       },
       "required": [
@@ -549,13 +627,19 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 128,
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+              "not": {
+                "pattern": "\\u0000"
+              }
             },
             "audit_ref": {
               "type": "string",
               "minLength": 1,
               "maxLength": 128,
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+              "not": {
+                "pattern": "\\u0000"
+              }
             },
             "status": {
               "const": "succeeded"
@@ -587,13 +671,19 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 128,
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+              "not": {
+                "pattern": "\\u0000"
+              }
             },
             "audit_ref": {
               "type": "string",
               "minLength": 1,
               "maxLength": 128,
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+              "not": {
+                "pattern": "\\u0000"
+              }
             },
             "status": {
               "const": "pending_approval"
@@ -602,7 +692,10 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 128,
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+              "not": {
+                "pattern": "\\u0000"
+              }
             }
           },
           "required": [
@@ -624,13 +717,19 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 128,
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+              "not": {
+                "pattern": "\\u0000"
+              }
             },
             "audit_ref": {
               "type": "string",
               "minLength": 1,
               "maxLength": 128,
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+              "not": {
+                "pattern": "\\u0000"
+              }
             },
             "status": {
               "const": "denied"
@@ -658,13 +757,19 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 128,
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+              "not": {
+                "pattern": "\\u0000"
+              }
             },
             "audit_ref": {
               "type": "string",
               "minLength": 1,
               "maxLength": 128,
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+              "not": {
+                "pattern": "\\u0000"
+              }
             },
             "status": {
               "const": "conflict"
@@ -692,13 +797,19 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 128,
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+              "not": {
+                "pattern": "\\u0000"
+              }
             },
             "audit_ref": {
               "type": "string",
               "minLength": 1,
               "maxLength": 128,
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+              "not": {
+                "pattern": "\\u0000"
+              }
             },
             "status": {
               "const": "failed"
@@ -745,13 +856,19 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 128,
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+              "not": {
+                "pattern": "\\u0000"
+              }
             },
             "audit_ref": {
               "type": "string",
               "minLength": 1,
               "maxLength": 128,
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+              "not": {
+                "pattern": "\\u0000"
+              }
             },
             "status": {
               "enum": [
@@ -777,30 +894,45 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+          "not": {
+            "pattern": "\\u0000"
+          }
         },
         "project_id": {
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+          "not": {
+            "pattern": "\\u0000"
+          }
         },
         "row_key": {
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+          "not": {
+            "pattern": "\\u0000"
+          }
         },
         "revision": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 128
+          "maxLength": 128,
+          "not": {
+            "pattern": "\\u0000"
+          }
         },
         "title": {
           "type": "string",
           "minLength": 1,
           "maxLength": 500,
-          "pattern": "\\S"
+          "pattern": "\\S",
+          "not": {
+            "pattern": "\\u0000"
+          }
         },
         "assignee": {
           "anyOf": [
@@ -808,7 +940,10 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 128,
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+              "not": {
+                "pattern": "\\u0000"
+              }
             },
             {
               "type": "null"
@@ -829,7 +964,10 @@
           "anyOf": [
             {
               "type": "string",
-              "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+              "not": {
+                "pattern": "\\u0000"
+              }
             },
             {
               "type": "null"
@@ -857,12 +995,18 @@
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 128,
-                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+                "not": {
+                  "pattern": "\\u0000"
+                }
               },
               "label": {
                 "type": "string",
                 "minLength": 1,
-                "maxLength": 200
+                "maxLength": 200,
+                "not": {
+                  "pattern": "\\u0000"
+                }
               }
             },
             "required": [
@@ -918,7 +1062,10 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 128,
-            "pattern": "\\S"
+            "pattern": "\\S",
+            "not": {
+              "pattern": "\\u0000"
+            }
           },
           "maxItems": 32
         },
@@ -929,7 +1076,10 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 128,
-            "pattern": "\\S"
+            "pattern": "\\S",
+            "not": {
+              "pattern": "\\u0000"
+            }
           },
           "maxItems": 128
         },
@@ -947,7 +1097,10 @@
         "type": "string",
         "minLength": 1,
         "maxLength": 128,
-        "pattern": "\\S"
+        "pattern": "\\S",
+        "not": {
+          "pattern": "\\u0000"
+        }
       }
     }
   }

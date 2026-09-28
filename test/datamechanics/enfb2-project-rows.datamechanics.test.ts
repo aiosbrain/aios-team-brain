@@ -13,10 +13,10 @@ import { createGroup, grantProjectToGroup, addMemberToGroup } from "@/lib/access
 vi.mock("@/lib/auth/guard", () => ({ currentMember: vi.fn() }));
 vi.mock("@/lib/db/server", () => ({ serverClient: vi.fn() }));
 
-async function seedMember(seed: Seed, posture: "team" | "external" = "team"): Promise<string> {
+async function seedMember(seed: Seed, posture: "team" | "external" = "team", role: "member" | "admin" = "member"): Promise<string> {
   const { data } = await db()
     .from("members")
-    .insert({ team_id: seed.teamId, email: `${randomUUID()}@test.local`, display_name: "M", actor_handle: `h-${randomUUID().slice(0, 10)}`, role: "member", tier: posture, status: "active" })
+    .insert({ team_id: seed.teamId, email: `${randomUUID()}@test.local`, display_name: "M", actor_handle: `h-${randomUUID().slice(0, 10)}`, role, tier: posture, status: "active" })
     .select("id")
     .single();
   await placeMemberByTier(seed.teamId, data!.id as string, posture);
@@ -220,8 +220,8 @@ describe("ENFB-2 D1 — createProjectAction grants its creator (round-2 blockers
 
   it("HIGH-2 pin: the WRITE routes gate on row visibility — filing into an unseen container refuses instead of un-hiding it", async () => {
     const seed = await seedTeam();
-    const insider = await seedMember(seed);
-    const outsider = await seedMember(seed);
+    const insider = await seedMember(seed, "team", "admin");
+    const outsider = await seedMember(seed, "team", "admin");
     // A restricted initiative only the insider can row-see.
     const secretItem = await ingest(seed, { path: "w.md", body: "w", access: "team", project: "srcp" });
     await backfillTeamContext(db(), seed.teamId);
@@ -234,7 +234,7 @@ describe("ENFB-2 D1 — createProjectAction grants its creator (round-2 blockers
 
     // The outsider cannot file into it (both actions refuse with the absent-project shape,
     // §5.7 — a success would make the container CONTENT-VISIBLE to the whole team). The
-    // outsider is mocked as an ADMIN: role must not bypass the wall (content→membership
+    // outsider is an ADMIN in the database and session: role must not bypass the wall (content→membership
     // applies to admins — the ENFB-1 data-browser ruling).
     const { currentMember: cm } = await import("@/lib/auth/guard");
     const { serverClient: sc } = await import("@/lib/db/server");

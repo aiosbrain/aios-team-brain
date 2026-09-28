@@ -22,7 +22,7 @@ type Vector = { name: string; schema: string; value: unknown };
 
 describe("proposed MCP next contract companion", () => {
   it("keeps a separate proposed version and a complete content-addressed inventory", () => {
-    expect(manifest.version).toBe("1.0.0");
+    expect(manifest.version).toBe("1.0.1");
     expect(manifest.status).toBe("proposed");
     expect(Object.keys(manifest.files).sort()).toEqual(files);
     expect(schemas.length).toBeGreaterThan(0);

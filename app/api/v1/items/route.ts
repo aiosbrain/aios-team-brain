@@ -1,3 +1,4 @@
+import { ImmutableOriginError } from "@/lib/ingest/governed-origin";
 import { NextRequest, after } from "next/server";
 import { adminClient } from "@/lib/db/admin";
 import { authenticateApiKey, authenticateAgentToken, isAgentBearer } from "@/lib/api/auth";
@@ -186,6 +187,7 @@ export async function POST(req: NextRequest) {
       { status: result.status === "created" ? 201 : 200 }
     );
   } catch (e) {
+    if (e instanceof ImmutableOriginError) return errorResponse(e.code, e.message, 409);
     // Client validation failures (e.g. a bad task row or a parent-integrity violation) are 422,
     // not 500 — the CLI needs a structured signal to fix the markdown and retry.
     if (e instanceof IngestValidationError) {

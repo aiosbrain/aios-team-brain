@@ -374,3 +374,31 @@ Two limits worth stating rather than discovering, both found in review:
 That rule is not a nuisance. Its own comment explains it: a hardcoded list *"rots SILENTLY — the lane
 would keep upgrading from an ever-staler state and stay green, which is the exact failure shape this
 file exists to remove."*
+
+### Historical unpromoted validation tag
+
+The migration lane has one exact historical exception to the newest-existing-tag **staleness
+comparison**: `v0.13.0`, annotated object `a8f33f700027999e2af8486e1d813360abd9f8d0`, peeled commit
+`1c3af67a54fa721a4d4040afad1089d10faf6229`. Its annotation is exactly
+`AIOS Team Brain v0.13.0 — unpromoted validation candidate for release commissioning`.
+It was created on a separate, unpromoted lineage; it is not a declaration that this checkout has
+adopted that release's schema or application version.
+
+`scripts/migration-candidate-policy.mjs` permits this exclusion only while the tag remains newer
+than the newest declared upgrade, is itself undeclared, and is absent from both the tested HEAD's
+ancestry and the configured `RELEASE_BRANCH` ancestry. Full Git history and
+both refs are required. The immutable tag metadata is checked again after a fresh authenticated
+GitHub published-release-by-tag lookup. Only HTTP404 permits exclusion; HTTP200, including a
+published prerelease, refuses it. Authentication, network, timeout, unexpected HTTP and Git errors
+fail closed. This endpoint establishes absence of a **published release**, not absence of drafts;
+drafts do not constitute promotion. See [GitHub's release endpoint documentation](https://docs.github.com/en/rest/releases/releases#get-a-release-by-tag-name).
+
+The migration CI step receives a `contents: read` GitHub token. A local operator must supply
+`GITHUB_TOKEN` or `GH_TOKEN` when this exact exception is needed. No release write permission is
+required. The lane emits the exact excluded tag, tag object and peeled commit in its output.
+
+This does not remove the tag from Git's known corpus, change any declared upgrade baseline, or
+relax explicit `--tags`. Selecting `--tags v0.13.0` still upgrades and replays that schema and reports
+any mismatch. Other undeclared newer tags still fail the anti-rot check. Ordinary release preparation
+continues to require the declaration/version/changelog agreement above; future candidate work must
+use the existing candidate naming and promotion process, not expand this historical exception.

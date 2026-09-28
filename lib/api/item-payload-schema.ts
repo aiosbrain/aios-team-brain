@@ -73,9 +73,9 @@ export const decisionRowSchema = z.strictObject({
   row_key: z.string().min(1).max(200),
   decided_at: z.string().max(64).nullable().optional(),
   title: z.string().max(2000),
-  rationale: z.string().max(4000).optional().default(""),
+  rationale: z.string().refine((value) => [...value].length <= 25000 && !/[\u0000\uD800-\uDFFF]/u.test(value)).optional().default(""),
   decided_by: z.string().max(500).optional().default(""),
-  impact: z.string().max(4000).optional().default(""),
+  impact: z.string().refine((value) => [...value].length <= 5000 && !/[\u0000\uD800-\uDFFF]/u.test(value)).optional().default(""),
   tier: z.number().int().min(1).max(3).nullable().optional(),
   audience: z.enum(["team", "external"]).optional().default("team"),
 });
