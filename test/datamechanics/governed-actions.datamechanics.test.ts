@@ -4,6 +4,8 @@ import { getPool } from "@/lib/db/pg/pool";
 import { authenticateApiKey } from "@/lib/api/auth";
 import {
   createGovernedActionService,
+  canonicalRequest,
+  GovernedError,
   DomainFailure,
   type GovernedConsumer,
   type ActionStatus,
@@ -119,9 +121,16 @@ describe("durable governed actions: real Postgres", () => {
   it("commits one effect/audit/result across concurrent submission and reconstructed retry", async () => {
     const f = await fixture();
     const s = service();
-    const results = await Promise.all(
+    const attempts = await Promise.allSettled(
       Array.from({ length: 6 }, () => s.submit(f.auth, f.request)),
     );
+    expect(attempts.some(result => result.status === "fulfilled")).toBe(true);
+    const results = await Promise.all(attempts.map(async result => {
+      if (result.status === "fulfilled") return result.value;
+      expect(result.reason).toBeInstanceOf(GovernedError);
+      expect(result.reason).toMatchObject({ code: "unavailable", status: 503, detail: { retryable: true } });
+      return service().submit(f.auth, f.request);
+    }));
     const final = await service().submit(f.auth, f.request);
     expect(final.status).toBe("succeeded");
     expect(results.every((r) => r.action_id === final.action_id)).toBe(true);
@@ -154,6 +163,26 @@ describe("durable governed actions: real Postgres", () => {
       }),
     ).rejects.toMatchObject({ code: "operation_id_conflict" });
     expect(await s.status(f.auth, final.action_id)).toEqual(final);
+  });
+  it("returns retryable unavailable before acceptance commits and recovers the same identity", async () => {
+    const f = await fixture();
+    const blocker = await getPool().connect();
+    try {
+      await blocker.query("BEGIN");
+      const identity = canonicalRequest([f.teamId, f.memberId, f.projectId, "operation"]);
+      await blocker.query("select pg_advisory_xact_lock(hashtextextended($1,0))", ["governed:" + identity]);
+      await expect(service().submit(f.auth, f.request)).rejects.toMatchObject({
+        code: "unavailable", status: 503, detail: { retryable: true },
+      });
+      expect(await counts()).toEqual({ effects: 0, actions: 0, identities: 0 });
+    } finally {
+      await blocker.query("ROLLBACK");
+      blocker.release();
+    }
+    const result = await service().submit(f.auth, f.request);
+    expect(result.status).toBe("succeeded");
+    expect(await service().submit(f.auth, f.request)).toEqual(result);
+    expect(await counts()).toEqual({ effects: 1, actions: 1, identities: 1 });
   });
   it("returns requested during a claim and never runs a concurrent callback", async () => {
     const f = await fixture(),

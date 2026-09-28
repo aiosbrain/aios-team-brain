@@ -101,6 +101,8 @@ Retain terminal history and identity tombstones; no retention deletion is added.
 Acceptance is a short transaction creating requested action and required audit
 reference together. Replay reauthorizes before comparing or returning records.
 Changed canonical input conflicts without mutating the original result.
+Before acceptance commits, a contending request may receive retryable503 because
+no durable action/audit identity exists yet; it retries the identical operation.
 
 Execution obtains a database transaction-scoped exclusive claim on the action;
 an already-held claim returns202 requested/running without blocking indefinitely.
