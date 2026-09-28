@@ -26,6 +26,11 @@ const post = (body: unknown, headers: Record<string, string>) => fetch(`${BASE_U
 describe("decision.record production HTTP", () => {
   it("returns committed identity and rationale writeback and repeats the original result", async () => {
     const f = await fixture();
+    const identity = await fetch(`${BASE_URL}/api/v1/me`, { headers: f.headers });
+    expect(identity.status).toBe(200);
+    expect((await identity.json()).capabilities).toMatchObject({
+      contract_versions: ["mcp-next/1"], actions: expect.arrayContaining(["decision.record"]), task_revisions: false,
+    });
     const response = await post(f.request, f.headers);
     expect(response.status).toBe(200);
     const result = await response.json();
