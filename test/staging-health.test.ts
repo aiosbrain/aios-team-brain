@@ -1,5 +1,13 @@
+import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
+import { getPool } from "@/lib/db/pg/pool";
+import { GET } from "@/app/api/health/route";
 import { healthResponse } from "@/lib/staging/health";
+
+vi.mock("@/lib/db/pg/pool", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/lib/db/pg/pool")>(),
+  getPool: vi.fn(),
+}));
 
 describe("deployment health", () => {
   it("public readiness requires a bounded Postgres success and exposes no data", async () => {
@@ -9,6 +17,7 @@ describe("deployment health", () => {
       probeNeo4j: vi.fn(),
       env: { RAILWAY_GIT_COMMIT_SHA: "abc123" },
     });
+    expect(response.headers.get("cache-control")).toBe("no-store");
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({ ok: true, commit: "abc123" });
   });
@@ -20,6 +29,7 @@ describe("deployment health", () => {
       probeNeo4j: vi.fn(),
       env: {},
     });
+    expect(response.headers.get("cache-control")).toBe("no-store");
     expect(response.status).toBe(503);
     await expect(response.json()).resolves.toEqual({ ok: false });
   });
@@ -33,6 +43,7 @@ describe("deployment health", () => {
       probeNeo4j: vi.fn(),
       env: { STAGING_HEALTH_TOKEN: "x".repeat(32) },
     });
+    expect(response.headers.get("cache-control")).toBe("no-store");
     expect(response.status).toBe(401);
   });
 
@@ -46,6 +57,7 @@ describe("deployment health", () => {
       probeNeo4j: vi.fn().mockResolvedValue(true),
       env: { STAGING_HEALTH_TOKEN: token, RAILWAY_GIT_COMMIT_SHA: "candidate-sha" },
     });
+    expect(response.headers.get("cache-control")).toBe("no-store");
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({
       ok: true,
@@ -89,6 +101,7 @@ describe("deployment health", () => {
       probeNeo4j: graph,
       env: { STAGING_HEALTH_TOKEN: token },
     });
+    expect(response.headers.get("cache-control")).toBe("no-store");
     expect(response.status).toBe(503);
     expect(graph).not.toHaveBeenCalled();
   });
@@ -100,6 +113,7 @@ describe("deployment health", () => {
       readRuntimeState: vi.fn().mockResolvedValue({ mode: "copy-ready", ready: false, runId: "run-boot" }),
       env: { STAGING_HEALTH_TOKEN: token, RAILWAY_GIT_COMMIT_SHA: "a".repeat(40) },
     });
+    expect(response.headers.get("cache-control")).toBe("no-store");
     expect(response.status).toBe(202);
     expect(await response.json()).toMatchObject({ ok: false, booted: true, refreshRunId: "run-boot", graph: "readable" });
   });
@@ -115,6 +129,7 @@ describe("deployment health", () => {
       probeNeo4j: vi.fn(),
       env: { RAILWAY_GIT_COMMIT_SHA: "prod-sha" },
     });
+    expect(response.headers.get("cache-control")).toBe("no-store");
     expect(response.status).toBe(200);
     const body = await response.json();
     expect(body).toEqual({ ok: true, commit: "prod-sha" });
@@ -133,6 +148,7 @@ describe("deployment health", () => {
       probeNeo4j: vi.fn(),
       env: { RAILWAY_GIT_COMMIT_SHA: "prod-sha" },
     });
+    expect(response.headers.get("cache-control")).toBe("no-store");
     expect(response.status).toBe(401);
   });
 });
@@ -152,6 +168,7 @@ describe("M1 — an undeclared staging mode fails CLOSED", () => {
       probeNeo4j: vi.fn(),
       env: { STAGING_HEALTH_TOKEN: token },
     });
+    expect(response.headers.get("cache-control")).toBe("no-store");
     expect(response.status).toBe(503);
   });
 
@@ -164,8 +181,38 @@ describe("M1 — an undeclared staging mode fails CLOSED", () => {
       probeNeo4j: vi.fn(),
       env: { STAGING_HEALTH_TOKEN: token, RAILWAY_GIT_COMMIT_SHA: "baseline-sha" },
     });
+    expect(response.headers.get("cache-control")).toBe("no-store");
     expect(response.status).toBe(200);
     // Legacy declares no graph readability — that is the mode's whole point.
     expect(await response.json()).toMatchObject({ ok: true, mode: "legacy-pg-only", graph: "disabled" });
+  });
+});
+
+
+describe("the deployed health route uses bounded database checkout", () => {
+  it("fails safely by the deadline and releases a late connection without querying it", async () => {
+    vi.useFakeTimers();
+    vi.stubEnv("STAGING_HEALTH_PROBE_TIMEOUT_MS", "25");
+    let resolve!: (client: never) => void;
+    const pending = new Promise<never>((done) => { resolve = done; });
+    const client = Object.assign(new EventEmitter(), { query: vi.fn(), release: vi.fn() });
+    vi.mocked(getPool).mockReturnValue({ connect: () => pending } as never);
+    try {
+      const responsePromise = GET(new Request("http://brain/api/health"));
+      await vi.advanceTimersByTimeAsync(26);
+      const response = await responsePromise;
+      expect(response.status).toBe(503);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(await response.json()).toEqual({ ok: false });
+      resolve(client as never);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(client.release).toHaveBeenCalledOnce();
+      expect(client.query).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllEnvs();
+      vi.mocked(getPool).mockReset();
+    }
   });
 });

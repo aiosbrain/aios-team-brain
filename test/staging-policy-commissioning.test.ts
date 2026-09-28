@@ -968,7 +968,7 @@ describe("RIR residual resource lifetime and offline authority regressions", () 
     expect(assessment.blockers).toContainEqual(expect.objectContaining({ gate: "PC-07", kind: "unverified" }));
     const cli = await cliResult("check-evidence", { now: clock.now });
     expect(cli.exit).toBe(3);
-  });
+  }, 20000); // Full fsynced commissioning packet; logical deadlines use the injected clock.
 
   it("RIR4 · retained response observations are authoritative and copied timing cannot move a mutation earlier", async () => {
     const { clock } = await coherentPacket();
@@ -1012,7 +1012,7 @@ describe("RIR residual resource lifetime and offline authority regressions", () 
       .toContainEqual(expect.objectContaining({ gate: "PC-07", kind: "unverified" }));
     const check = await cliResult("check-evidence", { now: clock.now });
     expect(check.exit).toBe(3);
-  });
+  }, 20000);
 
   it("RLR2 · transient recovery failure then definitive ruleset absence resolves its original intent", async () => {
     const github = createFakeGitHub();
@@ -1088,7 +1088,7 @@ describe("RIR residual resource lifetime and offline authority regressions", () 
     expect(assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, now: clock.now }).blockers)
       .toContainEqual(expect.objectContaining({ detail: expect.stringMatching(/mutated before the authenticated pre-response/) }));
     expect((await cliResult("check-evidence", { now: clock.now })).exit).toBe(1);
-  });
+  }, 20000);
 
   it("CA1 · setup refuses a durably reappeared retired PR-head ref before any write", async () => {
     const github = createFakeGitHub();
@@ -6248,7 +6248,7 @@ describe("correction pass 4 — future and contradictory times are refused, on a
       expect(Date.parse(stamp), `control stamped ${stamp} is not inside the run`).toBeLessThanOrEqual(Date.parse(clock.peek()) + 1000);
       expect(new Date(stamp).getUTCFullYear(), "a corrected baseline must not be dated in the future").toBeLessThan(2030);
     }
-  });
+  }, 20000);
 
   it("K1 · a control captured AFTER the run it describes is refused", async () => {
     await coherentPacket();
@@ -6263,7 +6263,7 @@ describe("correction pass 4 — future and contradictory times are refused, on a
     const detail = blockersOf().map((entry) => entry.detail).join("\n");
     expect(detail, "a control dated 2099 produced no blocker").not.toBe("");
     expect(detail).toMatch(/after this run|future|window/i);
-  });
+  }, 20000);
 
   it("K2 · an approval recorded AFTER the run it approves is refused", async () => {
     await coherentPacket();
@@ -6277,7 +6277,7 @@ describe("correction pass 4 — future and contradictory times are refused, on a
     const detail = blockersOf().map((entry) => entry.detail).join("\n");
     expect(detail, "an approval dated 2099 produced no blocker").not.toBe("");
     expect(detail).toMatch(/approval|approved_at|after this run|future|window/i);
-  });
+  }, 20000);
 
   it("K3 · a phase collected BEFORE the cases it reports on is a contradictory phase time", async () => {
     await coherentPacket();
@@ -6290,7 +6290,7 @@ describe("correction pass 4 — future and contradictory times are refused, on a
     const detail = blockersOf().map((entry) => entry.detail).join("\n");
     expect(detail, "a collection time before the cases produced no blocker").not.toBe("");
     expect(detail).toMatch(/collect|ordering|before|phase/i);
-  });
+  }, 20000);
 });
 
 /**
@@ -6346,7 +6346,7 @@ describe("correction pass 5 — the dispatch/bytes/receipt join and the once-onl
     const detail = blockersOf().map((entry) => entry.detail).join("\n");
     expect(detail, "a missing receipt produced no blocker").not.toBe("");
     expect(detail).toMatch(/receipt|received_at/i);
-  });
+  }, 20000);
 
   it("R2 · a dispatch envelope digest that does not describe the published bytes refuses", async () => {
     await coherentPacket();
@@ -6358,7 +6358,7 @@ describe("correction pass 5 — the dispatch/bytes/receipt join and the once-onl
     const detail = blockersOf().map((entry) => entry.detail).join("\n");
     expect(detail, "a wrong dispatch envelope digest produced no blocker").not.toBe("");
     expect(detail).toMatch(/dispatch|envelope/i);
-  });
+  }, 20000);
 
   it("R3 · retained response BYTES that do not hash to the entry digest refuse, however equivalent the object", async () => {
     await coherentPacket();
@@ -6377,7 +6377,7 @@ describe("correction pass 5 — the dispatch/bytes/receipt join and the once-onl
     const detail = blockersOf().map((entry) => entry.detail).join("\n");
     expect(detail, "a changed byte stream produced no blocker").not.toBe("");
     expect(detail).toMatch(/bytes|digest/i);
-  });
+  }, 20000);
 
   it("R4 · an already-valid historical packet assesses without the wall clock, and late NEW consumption still refuses", async () => {
     const { github } = await coherentPacket();
@@ -6395,7 +6395,7 @@ describe("correction pass 5 — the dispatch/bytes/receipt join and the once-onl
       { role: "normal", caseId: firstNormalCase(), ordinal, direction: "pre" },
       {}, expired.now,
     )).rejects.toThrow(/expired|expiry/i);
-  });
+  }, 20000);
 
   it("T1 · serving the SAME validated publication again returns the prior record and appends nothing", async () => {
     const { github } = await coherentPacket();
@@ -6423,7 +6423,7 @@ describe("correction pass 5 — the dispatch/bytes/receipt join and the once-onl
     expect(countOf(after as never, "response-reconciled"), "a replay appended a second reconciliation").toBe(1);
     // And the packet still passes: an idempotent replay changes no evidence.
     expect(blockersOf()).toEqual([]);
-  });
+  }, 20000);
 
   it("T2 · the poll path is idempotent for the same publication", async () => {
     const { github } = await coherentPacket();
@@ -6458,7 +6458,7 @@ describe("correction pass 5 — the dispatch/bytes/receipt join and the once-onl
         && String(record.data?.case_id) === firstNormalCase() && String(record.data?.direction) === "pre").length,
       "the poll appended a second reconciliation").toBe(1);
     } finally { session.lock.release(); }
-  });
+  }, 20000);
 
   it("T3 · a CONFLICTING publication or observation under the same key refuses", async () => {
     await coherentPacket();
@@ -6485,7 +6485,7 @@ describe("correction pass 5 — the dispatch/bytes/receipt join and the once-onl
       expect(replay.appended).toBe(false);
       expect(replay.record).toEqual(reconciled);
     } finally { lock.release(); }
-  });
+  }, 20000);
 
   it("T4 · a correctly chained DUPLICATE history refuses, and a missing event refuses", async () => {
     await coherentPacket();
@@ -6508,7 +6508,7 @@ describe("correction pass 5 — the dispatch/bytes/receipt join and the once-onl
       && String(record.data.direction) === "pre" ? null : record));
     const missing = blockersOf().map((entry) => entry.detail).join("\n");
     expect(missing).toMatch(/records no dispatch-result/);
-  });
+  }, 20000);
 });
 
 describe("R2 — a local human case is issued once, admitted from the verified journal, and joined to it offline", () => {
