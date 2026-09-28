@@ -40,6 +40,9 @@ describe('reviewer diagnostic closed and nonaccepting boundary',()=>{
   expect(replay(events).complete).toBe(false);expect(()=>replay([...events,events.at(-1)])).toThrow();expect(()=>replay([...events,{type:'review-used',data:{...events.at(-1)!.data,environment:envs[1]}}])).toThrow();
   expect(()=>replay([...events,{type:'review-observed',data:{environment:envs[0],interaction:ref,after:ref}},{type:'review-used',data:{...events.at(-1)!.data,environment:envs[1]}}])).not.toThrow();
   expect(()=>replay([...events,{type:'stop',data:{reason:'unknown_cause',state:ref}},{type:'review-used',data:{...events.at(-1)!.data,environment:envs[1]}}])).toThrow();
+  const cleanup=[{type:'cancel-used',data:{run_id:'901',attempt:'1',reason:'interrupted'}},{type:'terminal-observed',data:{state:ref,trigger:ref,outcome:'cancelled'}},{type:'complete',data:{lifecycle:ref}}];
+  expect(()=>replay([...events,...cleanup])).toThrow(/unresolved review slot/);
+  expect(replay([...events,{type:'review-unresolved',data:{environment:envs[0],reason:'unknown',after:null}},...cleanup]).complete).toBe(true);
   expect(diagnosticResult({dir:privateDir(),bundleRef:ref}).status).toBe('invalid-diagnostic');
  });
  it('writes a separate hash-chained reviewer journal with durable one-use state',()=>{

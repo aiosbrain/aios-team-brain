@@ -75,7 +75,7 @@ import {
   JournalChainError, acquireJournalLock, assertPrivateDirectory, openJournal, readJournal, readReviewerJournal, recordWitnessEventOnce,
   reduceResourceLifecycles, writeJournalSnapshot,
 } from "./commissioning-journal.mjs";
-import { diagnosticResult as assessReviewerDiagnostic, fileRef as reviewerFileRef, digest as reviewerDigest, intent as reviewerIntent, json as reviewerJson } from "./reviewer-negative-probe.mjs";
+import { authoritativeBundle as reviewerAuthoritativeBundle, diagnosticResult as assessReviewerDiagnostic, fileRef as reviewerFileRef, digest as reviewerDigest, intent as reviewerIntent, json as reviewerJson } from "./reviewer-negative-probe.mjs";
 import {
   CHALLENGE_DIRECTIONS, CLOUD_CASE_SEQUENCE, COMMISSION_DOMAIN,
   REHEARSAL_CASE_ID, REHEARSAL_DOMAIN, REHEARSAL_ROLE, REHEARSAL_TARGET,
@@ -7706,7 +7706,7 @@ export function assessEvidence({ dir, runId, attempt, now = () => new Date() }) 
       const kind = stub === "self" ? "reviewer-self" : "reviewer-app";
       const reviewerRecords = readReviewerJournal({ dir, runId, attempt, kind });
       const result = assessReviewerDiagnostic({ dir,
-        bundleRef: retainedReviewerRef(dir, `reviewer-${runId}-${attempt}-${stub}-bundle.json`),
+        bundleRef: reviewerAuthoritativeBundle(dir, reviewerRecords, String(runId), String(attempt), control),
         journalRecords: reviewerRecords, priorRecords: kind === 'reviewer-app' ? readReviewerJournal({ dir, runId, attempt, kind: 'reviewer-self' }) : null, originalRecords: journalRecords });
       if (result.status !== "diagnostic-unverified" || result.control !== control || result.cleanup_status !== "complete")
         throw new Error(`linked reviewer evidence is ${result.status}: ${result.reason ?? result.cleanup_status}`);
