@@ -386,7 +386,7 @@ adopted that release's schema or application version.
 
 `scripts/migration-candidate-policy.mjs` permits this exclusion only while the tag remains newer
 than the newest declared upgrade, is itself undeclared, and is absent from both the tested HEAD's
-ancestry and the configured `RELEASE_BRANCH` ancestry (`origin/main` today). Full Git history and
+ancestry and the configured `RELEASE_BRANCH` ancestry. Full Git history and
 both refs are required. The immutable tag metadata is checked again after a fresh authenticated
 GitHub published-release-by-tag lookup. Only HTTP404 permits exclusion; HTTP200, including a
 published prerelease, refuses it. Authentication, network, timeout, unexpected HTTP and Git errors
