@@ -1,6 +1,5 @@
 import "server-only";
-import type { PoolClient } from "pg";
-import { getPool } from "@/lib/db/pg/pool";
+import { probePostgres as boundedPostgresProbe, READINESS_TIMEOUT_MS } from "@/lib/health/readiness";
 import { runRead } from "@/lib/graph/neo4j";
 import {
   copiedStagingSpendAllowed,
@@ -12,7 +11,7 @@ import {
   type StagingRuntimeState,
 } from "@/lib/staging/runtime-policy";
 
-const DEFAULT_PROBE_MS = 2_500;
+const DEFAULT_PROBE_MS = READINESS_TIMEOUT_MS;
 
 /**
  * What this deployment will actually do with a query, in one word.
@@ -37,24 +36,12 @@ function positiveTimeout(raw: string | undefined, fallback = DEFAULT_PROBE_MS): 
   return Number.isFinite(n) && n > 0 && n <= 10_000 ? n : fallback;
 }
 
-export async function probePostgres(timeoutMs = DEFAULT_PROBE_MS): Promise<boolean> {
-  let client: PoolClient | undefined;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    client = await getPool().connect();
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("postgres health probe timed out")), timeoutMs);
-    });
-    await Promise.race([client.query("select 1"), timeout]);
-    return true;
-  } catch {
-    client?.release(true);
-    client = undefined;
-    return false;
-  } finally {
-    if (timer) clearTimeout(timer);
-    client?.release();
-  }
+export function probePostgres(timeoutMs = DEFAULT_PROBE_MS): Promise<boolean> {
+  return boundedPostgresProbe(undefined, timeoutMs);
+}
+
+function healthJson(body: unknown, status = 200): Response {
+  return Response.json(body, { status, headers: { "Cache-Control": "no-store" } });
 }
 
 export async function probeNeo4j(timeoutMs = DEFAULT_PROBE_MS): Promise<boolean> {
@@ -85,25 +72,25 @@ export async function healthResponse(
   deps: HealthDependencies = defaults(process.env)
 ): Promise<Response> {
   const timeoutMs = positiveTimeout(deps.env.STAGING_HEALTH_PROBE_TIMEOUT_MS);
-  if (!(await deps.probePostgres(timeoutMs))) return Response.json({ ok: false }, { status: 503 });
+  if (!(await deps.probePostgres(timeoutMs))) return healthJson({ ok: false }, 503);
 
   const presented = request.headers.get("x-aios-staging-health-token");
   if (!presented) {
-    return Response.json({ ok: true, commit: deps.env.RAILWAY_GIT_COMMIT_SHA ?? null });
+    return healthJson({ ok: true, commit: deps.env.RAILWAY_GIT_COMMIT_SHA ?? null });
   }
   if (!stagingHealthTokenMatches(presented, deps.env)) {
-    return Response.json({ ok: false }, { status: 401 });
+    return healthJson({ ok: false }, 401);
   }
 
   const state = await deps.readRuntimeState();
   const bootProbe = request.headers.get("x-aios-staging-boot-probe") === "true";
-  if ((!state.ready && !bootProbe) || state.mode === "copy-safe-refusal") return Response.json({ ok: false }, { status: 503 });
+  if ((!state.ready && !bootProbe) || state.mode === "copy-safe-refusal") return healthJson({ ok: false }, 503);
   let graph: "disabled" | "readable" = "disabled";
   if (state.mode === "copy-ready") {
-    if (!(await deps.probeNeo4j(timeoutMs))) return Response.json({ ok: false }, { status: 503 });
+    if (!(await deps.probeNeo4j(timeoutMs))) return healthJson({ ok: false }, 503);
     graph = "readable";
   }
-  return Response.json({
+  return healthJson({
     ok: state.ready,
     booted: bootProbe && !state.ready ? true : undefined,
     commit: deps.env.RAILWAY_GIT_COMMIT_SHA ?? null,
@@ -115,5 +102,5 @@ export async function healthResponse(
     // could mistake for "queries work here". Model-backed answering is disabled in copy scope and
     // the optional budgeted mode is not implemented, so this is the honest word for it.
     answering: answeringPosture(state.mode, deps.env),
-  }, { status: state.ready ? 200 : 202 });
+  }, state.ready ? 200 : 202);
 }

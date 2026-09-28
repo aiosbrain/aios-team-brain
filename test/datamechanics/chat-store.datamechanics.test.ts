@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import { db, seedTeam } from "./helpers";
 import {
@@ -93,13 +93,29 @@ describe("chat store (data-mechanics)", () => {
     expect((await listConversations(db(), owner)).map((c) => c.id)).not.toContain(convo!.id);
   });
 
-  it("lists conversations newest-active first", async () => {
+  it.each(["clock skew", "submillisecond precision"])(
+    "lists conversations newest-active first despite %s", async (scenario) => {
     const seed = await seedTeam();
     const owner = { teamId: seed.teamId, memberId: seed.memberId };
     const a = await createConversation(db(), owner, "first");
     const b = await createConversation(db(), owner, "second");
-    // Touch `a` so it becomes most-recently-active.
-    await appendMessage(db(), owner, a!.id, "user", "bump");
+    if (scenario === "submillisecond precision") {
+      // Reproduce a DB creation timestamp 500 microseconds after the app's
+      // millisecond timestamp. No sleep or timing-dependent race is required.
+      const { error } = await db()
+        .from("conversations")
+        .update({ updated_at: "2000-01-01T00:00:00.000500Z" })
+        .eq("id", b!.id);
+      expect(error).toBeNull();
+    }
+    // Creation uses the database clock. A delayed application clock must not undo
+    // activity ordering (millisecond rounding can cause the same reversal).
+    const appClock = vi.spyOn(Date.prototype, "toISOString").mockReturnValue("2000-01-01T00:00:00.000Z");
+    try {
+      await appendMessage(db(), owner, a!.id, "user", "bump");
+    } finally {
+      appClock.mockRestore();
+    }
     const ids = (await listConversations(db(), owner)).map((c) => c.id);
     expect(ids.indexOf(a!.id)).toBeLessThan(ids.indexOf(b!.id));
   });

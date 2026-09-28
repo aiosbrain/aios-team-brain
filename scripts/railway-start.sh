@@ -1,8 +1,8 @@
 #!/usr/bin/env sh
 set -eu
 
-# Railway's custom start command replaces the Docker ENTRYPOINT, so keep the same idempotent
-# bootstrap for both existing deployments and template-created installs.
+# Railway pre-deploy owns schema migration. Runtime provisioning and persisted-secret loading
+# remain inside the startup fence, so staging admission precedes every bootstrap write.
 #
 # ⚠️ THE INIT IS LOAD-BEARING, and it must be HERE rather than only in the image's ENTRYPOINT.
 # Railway overrides ENTRYPOINT/CMD with railway.json's startCommand (`sh scripts/railway-start.sh`),
@@ -21,4 +21,15 @@ set -eu
 # tini forwards TERM/INT to its direct child — the fence — and exits with the fence's status, so
 # signal handling and exit propagation are unchanged. Deliberately NOT `-g`: group-wide forwarding
 # would signal processes the fence owns and stops itself, through its own bounded lifecycle.
-exec /usr/bin/tini -s -- node scripts/staging-ops/startup-fence.mjs -- sh -c 'node docker/bootstrap.mjs && exec npm start'
+exec /usr/bin/tini -s -- node scripts/staging-ops/startup-fence.mjs -- sh -ec '
+node docker/bootstrap.mjs --schema=predeployed
+
+# Bootstrap cannot export generated secrets from its child process. Preserve supplied values.
+if [ -n "${DEV_SECRETS_FILE:-}" ] && [ -f "$DEV_SECRETS_FILE" ] &&
+   { [ -z "${AUTH_SECRET:-}" ] || [ -z "${SECRETS_KEY:-}" ]; }; then
+  . "$DEV_SECRETS_FILE"
+  export AUTH_SECRET SECRETS_KEY
+fi
+
+exec npm start
+'

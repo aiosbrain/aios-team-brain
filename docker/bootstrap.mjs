@@ -20,6 +20,9 @@
 import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 import { randomBytes } from "node:crypto";
 import pg from "pg";
 import { shouldUseSsl } from "../scripts/pg-load-schema.mjs";
@@ -44,7 +47,7 @@ const WAIT_TIMEOUT_MS = Number(process.env.DB_WAIT_TIMEOUT_MS || 60_000);
 const ssl = shouldUseSsl(DATABASE_URL) ? { rejectUnauthorized: false } : undefined;
 
 function run(cmd, args) {
-  const r = spawnSync(cmd, args, { stdio: "inherit", cwd: "/app" });
+  const r = spawnSync(cmd, args, { stdio: "inherit", cwd: APP_ROOT });
   if (r.status !== 0) {
     console.error(`bootstrap: \`${cmd} ${args.join(" ")}\` exited ${r.status}`);
     process.exit(r.status ?? 1);
@@ -155,7 +158,7 @@ async function hasCredential(email) {
 
 /** Run a command, capturing output instead of inheriting it. */
 function runQuiet(cmd, args) {
-  const r = spawnSync(cmd, args, { encoding: "utf8", cwd: "/app" });
+  const r = spawnSync(cmd, args, { encoding: "utf8", cwd: APP_ROOT });
   if (r.status !== 0) {
     console.error(r.stdout ?? "");
     console.error(r.stderr ?? "");
@@ -169,7 +172,7 @@ function runQuiet(cmd, args) {
  *  the boot (PRET-2 review Low 1: a die() inside the spawned command would otherwise become a
  *  restart loop, the deploy-policy incident class; the scheduler pass is the retry). */
 function runSoft(cmd, args) {
-  const r = spawnSync(cmd, args, { encoding: "utf8", cwd: "/app" });
+  const r = spawnSync(cmd, args, { encoding: "utf8", cwd: APP_ROOT });
   if (r.stdout) console.log(r.stdout.trimEnd());
   if (r.status !== 0) {
     console.error(r.stderr ?? "");
@@ -260,13 +263,22 @@ async function provisionRealTeam() {
 }
 
 async function main() {
+  const args = process.argv.slice(2);
+  if (args.length > 1 || (args.length === 1 && args[0] !== "--schema=predeployed")) {
+    throw new Error("usage: bootstrap.mjs [--schema=predeployed]");
+  }
+  const predeployed = args[0] === "--schema=predeployed";
   ensureDevSecrets();
 
   console.log("▶ waiting for postgres…");
   await waitForDatabase();
 
-  console.log("▶ loading schema (idempotent; also applies migrations)…");
-  run("node", ["scripts/pg-load-schema.mjs"]);
+  if (predeployed) {
+    console.log("▶ schema owned by pre-deploy — continuing runtime provisioning");
+  } else {
+    console.log("▶ loading schema (idempotent; also applies migrations)…");
+    run("node", ["scripts/pg-load-schema.mjs"]);
+  }
 
   // A REAL install: the operator's own team, not the Northwind demo. Without this, the only local
   // path that produced something you could log into was the demo — `SEED_DEMO=false` returned here
