@@ -1,9 +1,11 @@
+import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { BASE_URL, db, seedTeam, issueKeyFor, keyHeaders } from "./http-helpers";
 
 async function fixture(role = "admin", effect = "allow") {
   const seed = await seedTeam();
+  expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
   await db().from("members").update({ role }).eq("id", seed.memberId);
   const { data: project, error } = await db().from("projects").insert({
     team_id: seed.teamId, slug: `decision-${randomUUID().slice(0, 8)}`, kind: "initiative", graph_group_id: `decision-${randomUUID()}`,

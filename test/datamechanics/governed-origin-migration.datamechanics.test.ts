@@ -56,6 +56,11 @@ it("upgrades populated pre-origin schema, preserves legacy rows, and replays imm
     expect(diffFingerprints(firstShape, await fingerprint(db))).toMatchObject({ missing: [], extra: [] });
     await assertLegacy();
     expect((await db.query("select * from governed_item_origins")).rows).toEqual([origin]);
+    // BEFORE UPDATE sees NULL for generated search; harmless sync stamps must still pass.
+    const syncedAt = "2026-09-28T00:00:00.000Z";
+    await db.query("update items set synced_at=$2 where id=$1", [canonicalItem.id, syncedAt]);
+    const stamped = (await db.query("select * from items where id=$1", [canonicalItem.id])).rows[0];
+    expect(stamped).toEqual({ ...canonicalItem, synced_at: new Date(syncedAt) });
     const spare = await insertItem("spare.md");
     const otherItem = (await db.query("insert into items(team_id,project_id,path,kind,access,content_sha256) values($1,$2,'other.md','decision','team',$3) returning id", [otherTeam, otherProject, "b".repeat(64)])).rows[0].id;
     await expect(insertOrigin(otherItem, member, project, randomUUID(), "other-item")).rejects.toMatchObject({ code: "23503" });

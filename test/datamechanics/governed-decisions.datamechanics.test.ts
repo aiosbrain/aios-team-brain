@@ -4,6 +4,7 @@ import { getPool } from "@/lib/db/pg/pool";
 import { authenticateApiKey } from "@/lib/api/auth";
 import { createGovernedActionService, type ActionStatus, type SubmitRequest } from "@/lib/actions/governed";
 import { decisionConsumer } from "@/lib/actions/governed/consumers/decision";
+import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
 import { visibleItemIds } from "@/lib/access/enforce";
 import { getDecisionWriteback } from "@/lib/sync/decisions";
 import { retrieve } from "@/lib/query/retrieve";
@@ -16,8 +17,9 @@ import { db, seedTeam, sha, placeMemberByTier } from "./helpers";
 
 const sql = (q: string, v: unknown[] = []) => getPool().query(q, v);
 const service = (enabled = () => true) => createGovernedActionService({ consumers: [decisionConsumer], enabled });
-async function fixture(effect = "allow", role = "admin") {
+async function fixture(effect = "allow", role = "admin", bootstrap = true) {
   const f = await seedTeam();
+  if (bootstrap) expect((await ensureAccessBootstrap(db(), f.teamId)).ok).toBe(true);
   await sql("update members set role=$2 where id=$1", [f.memberId, role]);
   const projectId = randomUUID();
   await sql("insert into projects(id,team_id,slug,kind,graph_group_id) values($1,$2,'orbit','initiative',$3)", [projectId, f.teamId, `fixture-${projectId}`]);
@@ -59,6 +61,24 @@ describe("governed decisions durable domain outcomes", () => {
     expect(source).toMatchObject({ kind: "decision", access: "team", member_id: f.memberId });
     expect(source.body).toContain(f.request.params.rationale);
     expect((await sql("select action,target_id from audit_log where id=$1", [r.audit_ref])).rows[0]).toEqual({ action: "governed.succeeded", target_id: r.action_id });
+  });
+  it.each(["source", "custom-system", "unbootstrapped", "missing-pointer", "empty-pointer"])("refuses unsupported %s destination without domain effects", async variant => {
+    const f = await fixture("allow", "admin", variant !== "unbootstrapped");
+    if (variant === "source") await sql("update projects set kind='source' where id=$1", [f.projectId]);
+    if (variant === "custom-system") await sql("update projects set kind='system' where id=$1", [f.projectId]);
+    if (variant === "missing-pointer") await sql("update projects set graph_group_id=null where team_id=$1 and kind='system' and slug='general'", [f.teamId]);
+    if (variant === "empty-pointer") await sql("update projects set graph_group_id='' where team_id=$1 and kind='system' and slug='general'", [f.teamId]);
+    expect(await service().submit(f.auth, f.request)).toMatchObject({ status: "denied", error: { code: "forbidden" } });
+    expect((await decisionRows(f.teamId)).rows).toEqual([]);
+    expect((await sql("select id from items where team_id=$1", [f.teamId])).rows).toEqual([]);
+    expect((await sql("select item_id from governed_item_origins where team_id=$1", [f.teamId])).rows).toEqual([]);
+  });
+  it("accepts the initialized system General destination", async () => {
+    const f = await fixture();
+    const general = (await sql("select id from projects where team_id=$1 and kind='system' and slug='general'", [f.teamId])).rows[0];
+    const request = { ...f.request, destination: { project_id: general.id } };
+    expect(await service().submit(f.auth, request)).toMatchObject({ status: "succeeded" });
+    expect((await decisionRows(f.teamId)).rows[0].project_id).toBe(general.id);
   });
   it("recovers a lost response by replay/status and refuses changed rationale", async () => {
     const f = await fixture();

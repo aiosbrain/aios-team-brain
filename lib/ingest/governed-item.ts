@@ -15,11 +15,19 @@ export async function appendGovernedItem(
   ctx: GovernedContext,
   input: GovernedItemInput,
 ): Promise<{ itemId: string; revision: string }> {
-  const destination = await ctx.query<{ id: string; graph_group_id: string | null }>(
-    "select id,graph_group_id from projects where team_id=$1 and id=$2",
+  const destination = await ctx.query<{ id: string; kind: string; slug: string; graph_group_id: string | null; general_ready: boolean }>(
+    `select id,kind,slug,graph_group_id,
+       exists(select 1 from projects g where g.team_id=$1 and g.kind='system'
+         and g.slug='general' and nullif(g.graph_group_id,'') is not null) as general_ready
+       from projects where team_id=$1 and id=$2`,
     [ctx.teamId, ctx.projectId],
   );
-  if (!destination.rows[0]?.graph_group_id) throw new DomainFailure("forbidden", "denied");
+  const project = destination.rows[0];
+  // The projector serves initialized General or initiative partitions. Its legacy
+  // unbootstrapped fallback must never widen an explicitly placed governed item.
+  if (!project?.graph_group_id || !project.general_ready ||
+      !(project.kind === "initiative" || (project.kind === "system" && project.slug === "general")))
+    throw new DomainFailure("forbidden", "denied");
   const gate = await noWideningGate(ctx.db, ctx.teamId, ctx.projectId, "team");
   if (!gate.ok) {
     if (gate.refused) throw new DomainFailure("forbidden", "denied");

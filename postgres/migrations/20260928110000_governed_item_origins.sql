@@ -19,8 +19,9 @@ create table if not exists governed_item_origins (
 create or replace function protect_governed_item_origin() returns trigger language plpgsql as $$
 begin
   if tg_table_name = 'items' then
+    -- Generated search is NULL in NEW before UPDATE; compare its immutable source columns instead.
     if exists(select 1 from governed_item_origins where item_id=old.id)
-       and (tg_op='DELETE' or to_jsonb(new)-'synced_at' is distinct from to_jsonb(old)-'synced_at') then
+       and (tg_op='DELETE' or to_jsonb(new)-'synced_at'-'search' is distinct from to_jsonb(old)-'synced_at'-'search') then
       raise exception using errcode='23514', message='immutable_origin';
     end if;
   elsif tg_table_name = 'decisions' then
