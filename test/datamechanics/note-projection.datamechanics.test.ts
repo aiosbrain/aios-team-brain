@@ -72,6 +72,11 @@ describe("note retrieval and projection with real Postgres", () => {
     const group = (await noteSql("select graph_group_id from projects where id=$1", [f.projectId])).rows[0].graph_group_id;
     const fake = new FakeGraphiti();
     await projectItemsToGraph(db(), { teamId: f.teamId, teamSlug: f.teamSlug, client: client(fake) });
+    expect(fake.pushes).toHaveLength(0); // Cold destinations retain deferred extraction.
+    expect((await noteSql("select group_id,deferred from graph_episodes where source_id=$1", [result.entity.id])).rows)
+      .toEqual([{ group_id: group, deferred: true }]);
+    await noteSql("update graph_episodes set deferred=false where source_id=$1", [result.entity.id]);
+    await projectItemsToGraph(db(), { teamId: f.teamId, teamSlug: f.teamSlug, client: client(fake) });
     expect(fake.pushes.length).toBeGreaterThan(0);
     expect(new Set(fake.pushes.map((p) => p.groupId))).toEqual(new Set([group]));
     expect(fake.pushedEpisodes.some((e) => e.sourceDescription.includes("Note"))).toBe(true);
@@ -89,8 +94,10 @@ describe("note retrieval and projection with real Postgres", () => {
     const body = "x".repeat(25000 - tail.length) + tail;
     expect([...body].length).toBe(25000);
     const result = await service().submit(f.auth, noteRequest(f.projectId, "Maximum note", body));
-    expect(result.status).toBe("succeeded");
+    if (result.status !== "succeeded") throw new Error(result.status);
     const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: f.teamId, teamSlug: f.teamSlug, client: client(fake) });
+    await noteSql("update graph_episodes set deferred=false where source_id=$1", [result.entity.id]);
     await projectItemsToGraph(db(), { teamId: f.teamId, teamSlug: f.teamSlug, client: client(fake) });
     expect(fake.pushedEpisodes.length).toBeGreaterThan(0);
     expect(fake.pushedEpisodes.length).toBeLessThanOrEqual(MAX_EPISODE_CHUNKS);

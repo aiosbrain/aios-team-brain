@@ -188,6 +188,25 @@ describe("governed notes with real Postgres", () => {
     expect(await noteCounts(f.teamId)).toMatchObject({ notes: 0, origins: 0 });
   });
 
+  it("protects accepted note content and provenance against legacy database mutation", async () => {
+    const f = await noteFixture();
+    const result = await complete(f);
+    const before = await stored(result.entity.id);
+    for (const statement of [
+      "update items set body='replacement' where id=$1",
+      "update items set frontmatter=jsonb_set(frontmatter,'{title}','\"replacement\"') where id=$1",
+      "update items set kind='artifact' where id=$1",
+      "update items set access='external' where id=$1",
+      "update items set actor='forged' where id=$1",
+      "update items set path='replacement.md' where id=$1",
+      "delete from items where id=$1",
+      "update governed_item_origins set revision=gen_random_uuid() where item_id=$1",
+      "delete from governed_item_origins where item_id=$1",
+    ]) await expect(noteSql(statement, [result.entity.id])).rejects.toMatchObject({ code: "23514", message: "immutable_origin" });
+    expect(await stored(result.entity.id)).toEqual(before);
+    expect(await noteCounts(f.teamId)).toMatchObject({ notes: 1, versions: 1, origins: 1 });
+  });
+
   it("reauthorizes successful replay/status and keeps committed history when capability is disabled", async () => {
     const f = await noteFixture();
     const result = await complete(f);
