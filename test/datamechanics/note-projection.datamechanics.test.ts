@@ -5,7 +5,7 @@ import { canSeeItem, visibleItemIds } from "@/lib/access/enforce";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { reconcileItemContext } from "@/lib/projects/context/reconcile-item";
 import { rankedFtsSearch } from "@/lib/query/fts-search";
-import { nativeRetrieve } from "@/lib/query/retrieve";
+import { retrieve } from "@/lib/query/retrieve";
 import { projectItemsToGraph, MAX_EPISODE_CHUNKS } from "@/lib/graph/project";
 import { db } from "./helpers";
 import { FakeGraphiti, client } from "./fake-graphiti";
@@ -17,6 +17,7 @@ afterEach(() => vi.unstubAllEnvs());
 describe("note retrieval and projection with real Postgres", () => {
   it("retrieves exact note content by title or body using the member's current visibility", async () => {
     vi.stubEnv("GRAPHITI_URL", "");
+    vi.stubEnv("CONTEXT_PROVIDER", "native");
     vi.stubEnv("EMBEDDINGS_URL", "");
     const f = await noteFixture();
     const request = noteRequest(f.projectId, "Zephyrlantern planning", "The body mentions obsidianharbor.");
@@ -28,7 +29,7 @@ describe("note retrieval and projection with real Postgres", () => {
     for (const term of ["Zephyrlantern", "obsidianharbor"]) {
       const hits = await rankedFtsSearch(f.teamId, "team", term, 20, null, [...view.ids], { metadata: true });
       expect(hits).toEqual(expect.arrayContaining([expect.objectContaining({ id: result.entity.id, kind: "note", body: request.params.body, title: request.params.title })]));
-      const retrieved = await nativeRetrieve(db(), f.teamId, "team", term, f.projectSlug, {
+      const retrieved = await retrieve(db(), f.teamId, "team", term, f.projectSlug, {
         visibleItemIds: view.ids, principal: "member", graphProjectIds: view.projectIds,
       });
       expect(retrieved.sources).toEqual(expect.arrayContaining([expect.objectContaining({ item_id: result.entity.id, kind: "note" })]));

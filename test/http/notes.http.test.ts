@@ -122,6 +122,9 @@ describe.runIf(process.env.AIOS_GOVERNED_ACTIONS_ENABLED === "true")("governed n
     const read = await fetch(`${BASE_URL}/api/v1/items/${result.entity.id}`, { headers: f.headers });
     const { project, path, kind, access, frontmatter, body, content_sha256, actor } = await read.json();
     const echo = { project, path, kind, access, frontmatter, body, content_sha256, actor };
+    const unchanged = await post(f.headers, echo, `${BASE_URL}/api/v1/items`);
+    expect(unchanged.status).toBe(200);
+    expect(await unchanged.json()).toMatchObject({ status: "unchanged", id: result.entity.id });
     for (const edit of [
       { ...echo, frontmatter: { ...frontmatter, title: "Replacement" } },
       { ...echo, body: "Replacement", content_sha256: sha("Replacement") },
