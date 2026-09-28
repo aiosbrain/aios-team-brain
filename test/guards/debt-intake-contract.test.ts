@@ -10,11 +10,11 @@ const directory = join(import.meta.dirname, "../fixtures/contract");
 const contract = snapshot.debtIntakeEventsContract;
 
 describe("AIO-1101 immutable upstream contract", () => {
-  it("implements member 1.27 without relabeling the 1.26 intake section, scanner or gateway payloads", () => {
-    // The intake section keeps the member version that introduced it; 1.27 added evidence search.
+  it("implements member 1.28 without relabeling the 1.26 intake section, scanner or gateway payloads", () => {
+    // The intake section keeps the member version that introduced it; later API versions add separate routes.
     expect(contract.version).toBe("1.26");
     expect(BRAIN_API_VERSION).toBe(snapshot.version);
-    expect(BRAIN_API_VERSION).toBe("1.27");
+    expect(BRAIN_API_VERSION).toBe("1.28");
     expect(snapshot.codebasePayloadContract.version).toBe("1.25");
     expect(GATEWAY_CONTRACT_VERSION).toBe("1.10");
     expect(MAX_INTAKE_BYTES).toBe(contract.maxRawBodyBytes);

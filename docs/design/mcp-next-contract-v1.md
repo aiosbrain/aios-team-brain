@@ -10,17 +10,20 @@ The normative supplement and machine-readable schemas live in
 canonical Workspace artifacts first, then copy the exact bytes and regenerate the
 manifest. These files specify future behavior; passing their tests does not prove
 that Brain routes implement it.
+The proposed v2.1.0-based Workspace documentation candidate for member API 1.28 is
+based on the earlier toolkit tag and does not include this separately reviewed
+supplement from Workspace main. That branch separation does not enable a runtime
+consumer or change the vendored artifact bytes.
 
 ## Version boundary
 
 At the historical Brain base commit `5b9400e74ff9b470682b785dcd33366cfbd74172`,
 `BRAIN_API_VERSION` and its conformance fixture declared **1.23**, while
-the canonical Workspace contract declared member API **1.27**. Current staging
-declares member API **1.27**; the proposed supplement remains unimplemented.
-The proposed supplement has its own version **1.0.0**. It does not change the
-runtime version constant, existing fixture, or member endpoint behavior. Reconcile
-the implemented member contract with evidence before release; a documentation
-revision or fixture copy alone cannot establish runtime compatibility.
+the canonical Workspace contract declared member API **1.27**. This candidate
+declares member API **1.28** for the separately implemented, disabled-by-default
+governed submit/status foundation. The rest of the proposed supplement remains
+unimplemented. Its own version is **1.0.0**; fixture conformance alone does not
+enable any domain action consumer or establish deployment compatibility.
 
 ## Implementation seams
 
