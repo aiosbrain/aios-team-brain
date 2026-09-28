@@ -5877,7 +5877,7 @@ describe("correction pass 4 — the actual publisher reads the authenticated int
   it("P1 · an UNKNOWN nested governed field is refused, and no bytes are written", async () => {
     const observation = soundObservation() as Record<string, unknown>;
     const rulesets = observation.governed_rulesets as { governed: Record<string, unknown> }[];
-    rulesets[0].governed.unknown_secret = "SYNTHETIC-NESTED-DISCLOSURE";
+    rulesets[0].governed.unknown_secret = "SYNTHETIC-NESTED-DISCLOSURE"; // aios-secret-fixture:SYNTHETIC-NESTED-DISCLOSURE
     const { outcome, bytes } = await publish(withDigest(observation));
     expect(outcome.ok, "the publisher published an unknown nested governed field").toBe(false);
     expect(bytes, "bytes reached the artifact").toBeNull();
@@ -6748,7 +6748,7 @@ describe("R02 — an incomplete provider response is never decisive, from the ad
     return { counter, response: { status, ok: status >= 200 && status < 300, headers: new Headers(options.headers ?? {}), body } };
   };
   const tokenOver = (response: unknown, extra: Record<string, unknown> = {}) => createTokenTransport({
-    token: "LOCAL-MOCK-NOT-A-CREDENTIAL", fetchImpl: (async () => response) as unknown as typeof fetch, ...extra,
+    token: "LOCAL-MOCK-NOT-A-CREDENTIAL", fetchImpl: (async () => response) as unknown as typeof fetch, ...extra, // aios-secret-fixture:LOCAL-MOCK-NOT-A-CREDENTIAL
   });
 
   /**
