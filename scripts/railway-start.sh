@@ -1,8 +1,15 @@
 #!/usr/bin/env sh
 set -eu
 
-# Railway's custom start command replaces the Docker ENTRYPOINT, so keep the same idempotent
-# bootstrap for both existing deployments and template-created installs.
-node docker/bootstrap.mjs
+# Railway preDeployCommand owns migrations. Keep runtime provisioning and secrets,
+# but never repeat DDL while the previous application is serving traffic.
+node docker/bootstrap.mjs --schema=predeployed
+
+# Match docker/entrypoint.sh: child-process bootstrap cannot export generated secrets.
+if [ -n "${DEV_SECRETS_FILE:-}" ] && [ -f "$DEV_SECRETS_FILE" ] &&
+   { [ -z "${AUTH_SECRET:-}" ] || [ -z "${SECRETS_KEY:-}" ]; }; then
+  . "$DEV_SECRETS_FILE"
+  export AUTH_SECRET SECRETS_KEY
+fi
 
 exec npm start

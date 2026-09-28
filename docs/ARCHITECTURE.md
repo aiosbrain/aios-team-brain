@@ -40,8 +40,14 @@ runner stage reads nothing from the build context and asserts its boot chain at 
 failed two production deploys.
 
 On first start, `railway.json` runs the idempotent schema loader before release. The opt-in Railway
-startup wrapper then runs the shared bootstrap to ensure the real team and first admin from
-`TEAM_*` / `ADMIN_*`. Bootstrap runs on
+startup wrapper then runs the shared bootstrap with `--schema=predeployed` to ensure the real team and first admin from
+`TEAM_*` / `ADMIN_*`, without repeating schema DDL. Default Docker bootstrap still loads the schema.
+Both startup wrappers source persisted `DEV_SECRETS_FILE` values before starting the server.
+Railway's 120-second deployment gate polls uncached `GET /api/health`; it returns a public
+`{ok:true,commit}` only when the application's Postgres pool can check out a connection and
+execute `select 1` within a combined 2.5-second deadline. Failure returns safe 503 `{ok:false}`.
+Late checkouts are released and failed active connections destroyed. This is database readiness,
+not a claim that every optional provider or domain workflow is healthy. Bootstrap runs on
 every restart but checks for an existing credential before calling the admin writer, so later
 password changes are preserved. A user-supplied `ADMIN_PASSWORD` is never rendered into logs.
 
@@ -1335,6 +1341,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 ### API surface
 
 <!-- drift:routes -->
+- `GET /api/health` — public uncached PostgreSQL readiness; 2.5-second combined checkout/query deadline, safe 503 on failure; Railway cutover gate
 
 - `POST /api/internal/executor-gateway/v1/resolve-lease` — service-authenticated, version-pinned, one-use 30-second credential-resolution lease
 - `POST /api/internal/executor-gateway/v1/authorize-and-redeem` — exact-call policy decision and post-audit request-local PAT sealing
