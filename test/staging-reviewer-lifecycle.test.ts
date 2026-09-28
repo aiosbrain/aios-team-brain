@@ -1,7 +1,8 @@
-import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { acquireJournalLock, openJournal, openReviewerJournal, readJournal, readReviewerJournal } from '../scripts/staging-ops/commissioning-journal.mjs';
 import { cancelAndFinalize, collectApp, collectSelf, dispatch, fixedFetchTransport, openSession, stage } from '../scripts/staging-ops/reviewer-negative-probe-operator.mjs';
@@ -39,6 +40,42 @@ async function setup(){const dir=mkdtempSync(path.join(tmpdir(),'reviewer-stage-
  ['administrators_cannot_bypass',{can_admins_bypass:false},'provider-ui']
 ] as const){const filename=`env-${control}-${name}.json`;artifact(dir,filename,{control,environment:name,environment_id,source:sourceKind,measured});const artifact_sha256=digest(readFileSync(path.join(dir,filename)));(controls[control]??={})[name]={status:'verified',environment_name:name,environment_id,source:sourceKind,expected:measured,measured,artifact:filename,artifact_sha256,measured_at:'2026-09-26T08:59:30.000Z'};}}artifact(dir,'commissioning-900-1-environment-controls.json',{schema_version:1,phase:'setup',run_id:'900',attempt:'1',controls});const lock=acquireJournalLock({dir,runId:'900',attempt:'1'});try{openJournal({dir,runId:'900',attempt:'1',lock,source,now:()=>new Date('2026-09-26T08:59:00.000Z')}).append('run-opened',{phase:'active'});}finally{lock.release();}const f=fake();const options={runId:'900',attempt:'1',dir,control:'self_review_refused',observer:f.transport,hooksProjection:async()=>({status:200,entries:[]})};return {dir,f,options};}
 describe('reviewer staged one-shot lifecycle',()=>{
+ it('refuses a competing process lock before writing the original link or immutable intent',async()=>{
+  const {dir,options}=await setup();
+  const moduleUrl=pathToFileURL(path.join(root,'scripts/staging-ops/commissioning-journal.mjs')).href;
+  const holderCode=`import {acquireJournalLock} from ${JSON.stringify(moduleUrl)}; const lock=acquireJournalLock({dir:process.argv[1],runId:'900',attempt:'1',kind:'reviewer-self'}); process.send('locked'); process.on('message',()=>{lock.release();process.exit(27)});`;
+  const holder=spawn(process.execPath,['--input-type=module','-e',holderCode,dir],{cwd:root,stdio:['ignore','pipe','pipe','ipc']});
+  let stderr='';holder.stderr.on('data',chunk=>{stderr+=chunk;});
+  const exit=new Promise<number|null>(resolve=>holder.once('exit',resolve));
+  try{
+   await new Promise<void>((resolve,reject)=>{holder.once('message',()=>resolve());holder.once('error',reject);holder.once('exit',code=>reject(new Error(`lock holder exited before ready: ${code} ${stderr}`)));});
+   const originalBefore=readJournal({dir,runId:'900',attempt:'1'});
+   await expect(stage(await openSession(options))).rejects.toThrow(/another commissioning writer holds/);
+   expect(readJournal({dir,runId:'900',attempt:'1'})).toEqual(originalBefore);
+   expect(readReviewerJournal({dir,runId:'900',attempt:'1',kind:'reviewer-self'})).toHaveLength(0);
+   expect(existsSync(path.join(dir,'reviewer-900-1-self-intent.json'))).toBe(false);
+   holder.send('release');expect(await exit).toBe(27);
+   expect((await stage(await openSession(options))).status).toBe('staged');
+   expect(readJournal({dir,runId:'900',attempt:'1'}).filter(x=>x.type==='reviewer-probe-linked')).toHaveLength(1);
+  }finally{if(holder.exitCode===null)holder.kill();await exit;}
+ },60000);
+ it('refuses an App stage while another process owns the App reviewer lock',async()=>{
+  const {dir,options}=await setup();
+  const moduleUrl=pathToFileURL(path.join(root,'scripts/staging-ops/commissioning-journal.mjs')).href;
+  const holderCode=`import {acquireJournalLock} from ${JSON.stringify(moduleUrl)}; const lock=acquireJournalLock({dir:process.argv[1],runId:'900',attempt:'1',kind:'reviewer-app'}); process.send('locked'); process.on('message',()=>{lock.release();process.exit(27)});`;
+  const holder=spawn(process.execPath,['--input-type=module','-e',holderCode,dir],{cwd:root,stdio:['ignore','pipe','pipe','ipc']});
+  let stderr='';holder.stderr.on('data',chunk=>{stderr+=chunk;});
+  const exit=new Promise<number|null>(resolve=>holder.once('exit',resolve));
+  try{
+   await new Promise<void>((resolve,reject)=>{holder.once('message',()=>resolve());holder.once('error',reject);holder.once('exit',code=>reject(new Error(`lock holder exited before ready: ${code} ${stderr}`)));});
+   const originalBefore=readJournal({dir,runId:'900',attempt:'1'});
+   await expect(stage(await openSession({...options,control:'unauthorized_reviewer_refused'}))).rejects.toThrow(/another commissioning writer holds/);
+   expect(readJournal({dir,runId:'900',attempt:'1'})).toEqual(originalBefore);
+   expect(readReviewerJournal({dir,runId:'900',attempt:'1',kind:'reviewer-app'})).toHaveLength(0);
+   expect(existsSync(path.join(dir,'reviewer-900-1-app-intent.json'))).toBe(false);
+   holder.send('release');expect(await exit).toBe(27);
+  }finally{if(holder.exitCode===null)holder.kill();await exit;}
+ },60000);
  it('links the original before one fixed dispatch and refuses a competing dispatch without a second POST',async()=>{const {dir,f,options}=await setup();const session=await openSession(options);const staged=await stage(session);expect(staged.status).toBe('staged');expect(assessEvidence({dir,runId:'900',attempt:'1'}).blockers.some(x=>x.gate==='PC-07'&&x.detail.includes('linked reviewer'))).toBe(true);expect(readJournal({dir,runId:'900',attempt:'1'}).filter(x=>x.type==='reviewer-probe-linked')).toHaveLength(1);expect(readReviewerJournal({dir,runId:'900',attempt:'1',kind:'reviewer-self'}).map(x=>x.event)).toEqual(['intent-linked']);const first=await dispatch(await openSession(options));expect(first.status).toBe('dispatch-sent');expect(f.calls.filter(x=>x[0]==='POST')).toHaveLength(1);await expect(dispatch(await openSession(options))).rejects.toThrow(/already consumed/);expect(f.calls.filter(x=>x[0]==='POST')).toHaveLength(1);});
  it('consumes a dispatch with a lost response and never sends another',async()=>{const {dir,f,options}=await setup();await stage(await openSession(options));let writes=0;const lossy=async(method:string,target:string,body:unknown)=>{if(method==='POST'){writes++;return {complete:false,status:0};}return f.transport(method,target,body);};const result=await dispatch(await openSession({...options,observer:lossy}));expect(result.status).toBe('dispatch-response-lost');expect(writes).toBe(1);await expect(dispatch(await openSession({...options,observer:lossy}))).rejects.toThrow(/already consumed/);expect(writes).toBe(1);expect(readReviewerJournal({dir,runId:'900',attempt:'1',kind:'reviewer-self'}).map(x=>x.event)).toEqual(['intent-linked','dispatch-used']);});
  it('blocks dispatch if a downstream hook is active',async()=>{const {dir,options}=await setup();await expect(stage(await openSession({...options,hooksProjection:async()=>({status:200,entries:[{id:'661488152',active:true,events:['*']}]})}))).rejects.toThrow(/trigger blocks dispatch/);expect(readReviewerJournal({dir,runId:'900',attempt:'1',kind:'reviewer-self'})).toHaveLength(0);});
