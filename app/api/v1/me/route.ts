@@ -1,3 +1,4 @@
+import { governedActions } from "@/lib/actions/governed";
 import { NextRequest } from "next/server";
 import { authenticateApiKey, markApiKeyUsed } from "@/lib/api/auth";
 import { errorResponse } from "@/lib/api/schemas";
@@ -18,5 +19,6 @@ export async function GET(req: NextRequest) {
     role: auth.memberRole,
     tier: auth.memberTier,
     team: auth.teamId,
+    capabilities: governedActions.capabilities(),
   });
 }
