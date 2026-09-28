@@ -29,8 +29,6 @@ const REAL_TAGS = ["v0.11.0", "v0.10.0", "v0.9.0", "v0.8.0", "v0.7.0"]; // newes
  *  legitimately carries a declared-but-uncut release during preparation, and assertions that assumed
  *  otherwise turned red the moment a release was declared. */
 const CUT_FIXTURE = ["v0.7.0", "v0.8.0", "v0.9.0", "v0.10.0", "v0.11.0"];
-// Independently verified released tags; keep policy scenario fixtures above stable.
-const RELEASED_TAGS = [...CUT_FIXTURE, "v0.12.0", "v0.13.0"];
 
 /**
  * Does THIS checkout have the release tags?
@@ -146,8 +144,8 @@ describe("release tag policy — the anti-rot rule survives (criteria 3, 4, 5)",
     // Counted against a STATIC known-cut fixture, not live git and not a set derived from DEFAULT_TAGS.
     // Both reviewers landed here: gating it on live tags would skip it in CI's TAGLESS unit job — the
     // one place it most needs to run — and deriving the set from DEFAULT_TAGS is what made it vacuous.
-    // RELEASED_TAGS grows each time a release is actually cut, which is a deliberate edit.
-    const declaredButAbsent = DEFAULT_TAGS.filter((t) => !RELEASED_TAGS.includes(t));
+    // CUT_FIXTURE grows by one each time a release is actually cut, which is a deliberate edit.
+    const declaredButAbsent = DEFAULT_TAGS.filter((t) => !CUT_FIXTURE.includes(t));
     expect(declaredButAbsent.length, `pending: ${declaredButAbsent.join(", ") || "none"}`).toBeLessThanOrEqual(1);
   });
 
