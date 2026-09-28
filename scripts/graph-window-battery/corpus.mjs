@@ -223,7 +223,7 @@ export const CANDIDATE_SQL = `
 `;
 
 /** The projectable kinds, mirrored from lib/graph/project.ts PROJECTABLE_KINDS (pinned by test). */
-export const PROJECTABLE_KINDS = ["transcript", "deliverable", "decision", "task", "artifact"];
+export const PROJECTABLE_KINDS = ["transcript", "deliverable", "decision", "task", "artifact", "note"];
 
 /**
  * Recompute the SELECTED corpus's episode counts with the projector's REAL `chunkContent`.

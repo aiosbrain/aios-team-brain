@@ -64,7 +64,7 @@ function inAppSources(): string[] {
   const found = new Set<string>();
   for (const file of libFiles(join(ROOT, "lib"))) {
     const text = readFileSync(file, "utf8");
-    if (!text.includes("ItemPayload")) continue;
+    if (!text.includes("ItemPayload") && !text.includes("function appendGovernedItem(")) continue;
     for (const m of text.matchAll(/^\s*source:\s*"([a-z0-9_-]+)",/gm)) found.add(m[1]);
   }
   return [...found];
@@ -76,6 +76,7 @@ describe("guard: every ingest source has an explicit per-source rule", () => {
     // assert nothing, which is precisely the vacuous-coverage failure the work-time key list had.
     expect(sidecarSources()).toContain("local");
     expect(inAppSources()).toContain("slack");
+    expect(inAppSources()).toContain("governed");
     expect(inAppSources().length).toBeGreaterThanOrEqual(4);
   });
 

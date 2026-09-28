@@ -38,7 +38,10 @@ export async function appendGovernedItem(
   const entityId = input.kind === "note" ? itemId : input.entityId;
   const path = `${GOVERNED_ITEM_PREFIX}${input.kind}/${itemId}.md`;
   const contentSha = createHash("sha256").update(input.body, "utf8").digest("hex");
-  const frontmatter = { title: input.title, kind: input.kind, access: "team", source: "governed" };
+  const frontmatter = {
+    title: input.title, kind: input.kind, access: "team",
+    source: "governed",
+  };
   await ctx.query(
     `insert into items(id,team_id,project_id,path,kind,access,frontmatter,body,content_sha256,actor,member_id,member_id_locked,work_at_from_source)
      values($1,$2,$3,$4,$5,'team',$6,$7,$8,$9,$10,true,true)`,
