@@ -2,6 +2,11 @@ import "server-only";
 import { authenticateApiKey } from "@/lib/api/auth";
 import { governedActions, GovernedError, type ActionStatus } from "./index";
 const MAX_BYTES = 256 * 1024;
+class BodyLimitError extends GovernedError {
+  constructor() {
+    super("invalid_payload", 422);
+  }
+}
 async function body(req: Request): Promise<unknown> {
   const reader = req.body?.getReader();
   if (!reader) throw new GovernedError("invalid_payload", 422);
@@ -13,8 +18,11 @@ async function body(req: Request): Promise<unknown> {
       if (r.done) break;
       size += r.value.byteLength;
       if (size > MAX_BYTES) {
-        await reader.cancel();
-        throw new Error("limit");
+        // Leave unread bytes to the closing connection. Cancelling the incoming
+        // Node stream can tear down its socket before the response is flushed;
+        // keeping it alive instead can make the next request reuse that socket.
+        // Do not drain or retain the remainder of an unbounded request.
+        throw new BodyLimitError();
       }
       chunks.push(r.value);
     }
@@ -29,17 +37,19 @@ async function body(req: Request): Promise<unknown> {
       ignoreBOM: true,
     }).decode(bytes);
     return JSON.parse(value);
-  } catch {
+  } catch (error) {
+    if (error instanceof BodyLimitError) throw error;
     throw new GovernedError("invalid_payload", 422);
   } finally {
     reader.releaseLock();
   }
 }
-function response(value: unknown, status: number) {
+function response(value: unknown, status: number, closeConnection = false) {
   return Response.json(value, {
     status,
     headers: {
       "Cache-Control": "no-store",
+      ...(closeConnection ? { Connection: "close" } : {}),
       ...(status === 503 ? { "Retry-After": "1" } : {}),
     },
   });
@@ -49,7 +59,11 @@ export function errorResponse(error: unknown) {
     error instanceof GovernedError
       ? error
       : new GovernedError("unavailable", 503);
-  return response({ error: safe.detail }, safe.status);
+  return response(
+    { error: safe.detail },
+    safe.status,
+    error instanceof BodyLimitError,
+  );
 }
 function submitStatus(r: ActionStatus) {
   return {

@@ -121,20 +121,22 @@ describe("governed actions production HTTP boundary", () => {
     });
     // The wire contract uses a typed validation failure, not an unstructured HTML error.
     await expectError(response, 422, "invalid_payload");
+    expect(response.headers.get("connection")).toBe("close");
+    // An early rejected upload must not poison the pooled connection used by the next read.
+    const healthy = await fetch(`${BASE_URL}/api/v1/me`, { headers });
+    expect(healthy.status).toBe(200);
+    expect((await healthy.json()).role).toBe("member");
   });
 
   it("preserves existing identity reads and advertises no unimplemented consumers", async () => {
     const { seed, headers } = await authenticated();
-    const response = await fetch(`${BASE_URL}/api/v1/me`, {
-      headers, signal: AbortSignal.timeout(10_000),
-    });
+    const response = await fetch(`${BASE_URL}/api/v1/me`, { headers });
     expect(response.status).toBe(200);
     const body = await response.json();
     expect(body).toMatchObject({ team: seed.teamId, role: "member", tier: "team", actor: expect.any(String) });
     expect(body.capabilities?.actions ?? []).toEqual([]);
     expect(body.capabilities?.task_revisions ?? false).toBe(false);
-  // Includes real database seeding and the first cold identity route load in CI.
-  }, 15_000);
+  });
 
   it("cannot execute a valid request through the empty production registry", async () => {
     const { headers, projectId } = await authenticated();
