@@ -81,6 +81,8 @@ jobs:
   datamechanics-tests:
     name: Data-mechanics tests (real Postgres)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     services:
       postgres:
         image: postgres:16
@@ -120,6 +122,8 @@ jobs:
       # LAST on purpose: it takes ~10s, and running it first would let a red fingerprint abort the
       # job and suppress the data-mechanics output for that run. Both signals on every run.
       - run: npm run test:migrate-from-existing
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
   http-tests:
     name: Integration tests (HTTP)

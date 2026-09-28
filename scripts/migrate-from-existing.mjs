@@ -56,6 +56,7 @@ import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import { fingerprint, diffFingerprints } from "./schema-fingerprint.mjs";
 import { assertServiceIdentity } from "./service-guard.mjs";
+import { UNPROMOTED_CANDIDATE, verifiedCandidateExemption } from "./migration-candidate-policy.mjs";
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -113,7 +114,7 @@ const RELEASE_TAG_RE = /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
  * @returns {{ usable: string[], pending: string|null, notice: string|null }}
  * @throws  on a hole in the middle, or on a stale list
  */
-export function nextTagPolicy(declared, existing, { allowPending = true } = {}) {
+export function nextTagPolicy(declared, existing, { allowPending = true, candidateExemption = null } = {}) {
   const known = new Set(existing ?? []);
   const list = [...(declared ?? [])];
 
@@ -139,7 +140,14 @@ export function nextTagPolicy(declared, existing, { allowPending = true } = {}) 
   // The anti-rot rule, unchanged in substance: a tag that EXISTS and is newer than everything declared
   // means the list went stale after a release. Compared by VERSION rather than by git's sort order, so
   // it cannot be fooled by a non-release tag sorting first.
-  const newestExisting = (existing ?? []).filter((t) => RELEASE_TAG_RE.test(t)).sort(compareVersions).pop() ?? null;
+  const excludedCandidate = allowPending && candidateExemption?.publishedReleaseStatus === 404 &&
+    candidateExemption.tag === UNPROMOTED_CANDIDATE.tag &&
+    candidateExemption.object === UNPROMOTED_CANDIDATE.object &&
+    candidateExemption.commit === UNPROMOTED_CANDIDATE.commit &&
+    candidateExemption.annotation === UNPROMOTED_CANDIDATE.annotation &&
+    newestDeclared && compareVersions(candidateExemption.tag, newestDeclared) > 0 &&
+    !list.includes(candidateExemption.tag) ? candidateExemption.tag : null;
+  const newestExisting = (existing ?? []).filter((t) => RELEASE_TAG_RE.test(t) && t !== excludedCandidate).sort(compareVersions).pop() ?? null;
   if (list.length && newestExisting && !list.includes(newestExisting)) {
     throw new Error(
       `DEFAULT_TAGS is stale: ${newestExisting} is the newest release tag but is not in the upgrade ` +
@@ -521,7 +529,13 @@ export async function main(argv = process.argv.slice(2)) {
   // `allowPending` only for the declaration. An explicit `--tags` is the operator's request, and a
   // request naming a tag that does not exist is an error, not a release being prepared.
   const usingDeclaration = !argv.includes("--tags");
-  const policy = nextTagPolicy(tags, known, { allowPending: usingDeclaration });
+  const candidateExemption = await verifiedCandidateExemption(tags, known, { usingDeclaration });
+  const policy = nextTagPolicy(tags, known, { allowPending: usingDeclaration, candidateExemption });
+  if (candidateExemption) console.log(
+    `  · Excluding only ${candidateExemption.tag} (${candidateExemption.commit}; tag object ${candidateExemption.object}) ` +
+    "from the staleness comparison: exact off-lineage unpromoted candidate; fresh authenticated published-release lookup returned HTTP 404. " +
+    "All declared upgrades and explicit --tags remain unchanged.",
+  );
   if (policy.notice) console.log(`  · ${policy.notice}`);
   const usableTags = policy.usable;
 
