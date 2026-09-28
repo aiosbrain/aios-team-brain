@@ -44,6 +44,7 @@ export interface DecisionMatch {
   row_key: string;
   decided_at: string | null;
   title: string;
+  rationale: string;
   decided_by: string;
   still_valid: boolean;
   source_item_id: string | null;
@@ -89,7 +90,7 @@ export async function matchingDecisions(
     });
     const params: unknown[] = p.values;
     const sql = `
-      select d.row_key, d.decided_at, d.title, d.decided_by, d.still_valid, d.source_item_id, d.created_by, coalesce(p.slug, '') as slug,
+      select d.row_key, d.decided_at, d.title, d.rationale, d.decided_by, d.still_valid, d.source_item_id, d.created_by, coalesce(p.slug, '') as slug,
              ts_rank(to_tsvector('english', coalesce(d.title,'') || ' ' || coalesce(d.rationale,'')),
                      websearch_to_tsquery('english', $1)) as rank
       from decisions d
@@ -104,6 +105,7 @@ export async function matchingDecisions(
       row_key: string;
       decided_at: string | Date | null;
       title: string;
+      rationale: string;
       decided_by: string;
       still_valid: boolean;
       source_item_id: string | null;
@@ -113,6 +115,7 @@ export async function matchingDecisions(
       row_key: r.row_key,
       decided_at: r.decided_at instanceof Date ? r.decided_at.toISOString().slice(0, 10) : (r.decided_at as string | null),
       title: r.title,
+      rationale: r.rationale,
       decided_by: r.decided_by,
       still_valid: r.still_valid,
       source_item_id: r.source_item_id,

@@ -152,6 +152,7 @@ jobs:
       # Production build first; global-setup spawns `next start` against .next.
       - run: npm run build
       - run: npm run test:http
+      - run: npm run test:http:governed
       - run: npm run test:http:gateway-approval
 
   # The real-Neo4j tier — the ONLY behavioural proof that graph tier isolation holds (group_id is

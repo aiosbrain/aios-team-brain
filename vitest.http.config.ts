@@ -41,7 +41,11 @@ process.env.HTTP_TEST_PORT ??= "3010";
 export default defineConfig({
   test: {
     environment: "node",
-    include: ["test/http/**/*.http.test.ts"],
+    include: process.env.AIOS_GOVERNED_ACTIONS_ENABLED === "true"
+      ? ["test/http/**/*-governed.http.test.ts"]
+      : ["test/http/**/*.http.test.ts"],
+    exclude: process.env.AIOS_GOVERNED_ACTIONS_ENABLED === "true"
+      ? [] : ["test/http/**/*-governed.http.test.ts"],
     // Boot one production server for the whole suite (not per file).
     globalSetup: ["test/http/global-setup.ts"],
     // Reuse the data-mechanics per-test truncation (TRUNCATE ... CASCADE clears the

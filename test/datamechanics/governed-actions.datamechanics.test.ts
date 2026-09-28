@@ -13,6 +13,7 @@ import {
   type SubmitRequest,
 } from "@/lib/actions/governed";
 import { seedTeam, sha, placeMemberByTier } from "./helpers";
+import { createGovernedActionHttp } from "@/lib/actions/governed/http";
 const sql = (text: string, values: unknown[] = []) =>
   getPool().query(text, values);
 const effect: GovernedConsumer = {
@@ -452,13 +453,34 @@ describe("durable governed actions: real Postgres", () => {
       code: "unauthorized",
     });
   });
+  it.each(["title", "body"] as const)("rejects NUL in note %s with 422 before any durable acceptance", async field => {
+    const f = await fixture();
+    const keyId = (await sql("select key_id from api_keys where id=$1", [f.auth.apiKeyId])).rows[0].key_id;
+    const response = await createGovernedActionHttp(service({ ...effect, type: "note.append" })).submit(
+      new Request("http://local/api/v1/actions/submit", {
+        method: "POST",
+        headers: { authorization: `Bearer aios_${keyId}_synthetic`, "content-type": "application/json" },
+        body: JSON.stringify({ contract_version: "mcp-next/1", type: "note.append",
+          destination: { project_id: f.projectId }, params: { title: "Note", body: "Content", [field]: "exact\u0000content" } }),
+      }),
+    );
+    expect(response.status).toBe(422);
+    expect(await response.json()).toMatchObject({ error: { code: "invalid_payload" } });
+    expect(await counts()).toEqual({ effects: 0, actions: 0, identities: 0 });
+    expect((await sql(`select
+      (select count(*)::int from audit_log where team_id=$1 and action like 'governed.%') audits,
+      (select count(*)::int from approval_requests where team_id=$1) approvals,
+      (select count(*)::int from items where team_id=$1) items,
+      (select count(*)::int from governed_item_origins where team_id=$1) origins`, [f.teamId])).rows[0])
+      .toEqual({ audits: 0, approvals: 0, items: 0, origins: 0 });
+  });
   it("notes reuse active/succeeded attempts and retain denied history before fresh authorization", async () => {
     const f = await fixture("deny");
     const note: SubmitRequest = {
       contract_version: "mcp-next/1",
       type: "note.append",
       destination: { project_id: f.projectId },
-      params: { title: "same", body: "exact\u0000content" },
+      params: { title: "same", body: "exact\tcontent\r\n" },
     };
     const consumer: GovernedConsumer = {
       ...effect,

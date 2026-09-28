@@ -45,8 +45,8 @@ describe("guard: the candidate predicate's SQL shape", () => {
     // BOTH derivations, not merely "i.access appears somewhere": a mutation that corrupts only the
     // target expression leaves the opposite one referencing i.access and passes a looser check. That
     // exact mutation SURVIVED an earlier version of this guard, which is how it got tightened.
-    const target = sql.match(/case when ([^\n]*?) then [^\n]*? end as target_id/);
-    const opposite = sql.match(/case when ([^\n]*?) then [^\n]*? end as opposite_id/);
+    const target = sql.match(/([^\n]+) as target_id/);
+    const opposite = sql.match(/([^\n]+) as opposite_id/);
     expect(target?.[1], "target_id must be derived from items.access").toContain("i.access");
     expect(opposite?.[1], "opposite_id must be derived from items.access").toContain("i.access");
     // …and nothing anywhere may key off the units.audience MIRROR, whatever alias it is given.
@@ -105,8 +105,9 @@ describe("guard: the candidate predicate's SQL shape", () => {
   it("maps target and opposite to the RIGHT projects — a swap must not pass", () => {
     // The gap a reviewer found: asserting both derivations mention i.access still passes when
     // general_id and external_id are swapped, which would invert every partition decision.
-    expect(sql).toMatch(/case when i\.access = 'external' then sys\.external_id else sys\.general_id end as target_id/);
-    expect(sql).toMatch(/case when i\.access = 'external' then sys\.general_id else sys\.external_id end as opposite_id/);
+    expect(sql).toContain("left join governed_item_origins g on g.team_id=i.team_id and g.item_id=i.id");
+    expect(sql).toMatch(/coalesce\(g\.project_id, case when i\.access = 'external' then sys\.external_id else sys\.general_id end\) as target_id/);
+    expect(sql).toMatch(/case when g\.item_id is not null then null else case when i\.access = 'external' then sys\.general_id else sys\.external_id end end as opposite_id/);
   });
 
   it("parameterises team, cutoff and paging — no interpolation", () => {

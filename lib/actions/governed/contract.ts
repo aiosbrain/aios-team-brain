@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { TASK_STATUSES } from "@/lib/api/schemas";
 
-const scalar = (s: string) => !/[\uD800-\uDFFF]/u.test(s);
+const scalar = (s: string) => !/[\u0000\uD800-\uDFFF]/u.test(s);
 const text = (max: number, min = 1) =>
   z
     .string()

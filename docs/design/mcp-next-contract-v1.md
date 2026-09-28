@@ -17,7 +17,7 @@ At the inspected Brain base commit `5b9400e74ff9b470682b785dcd33366cfbd74172`,
 `BRAIN_API_VERSION` and the existing conformance fixture declare **1.23**, while
 the canonical Workspace contract declares member API **1.27**. That pre-existing
 discrepancy is recorded, not resolved by declaring unimplemented capabilities.
-The proposed supplement has its own version **1.0.0**. It does not change the
+The proposed supplement has its own version **1.0.1**. It does not change the
 runtime version constant, existing fixture, or member endpoint behavior. Reconcile
 the implemented member contract with evidence before release; a documentation
 revision or fixture copy alone cannot establish runtime compatibility.

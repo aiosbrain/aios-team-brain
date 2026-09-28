@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => ({
   audit: vi.fn(),
@@ -40,7 +40,9 @@ function request(team?: string) {
 }
 
 describe("member API key team identity", () => {
+  afterEach(() => vi.unstubAllEnvs());
   beforeEach(() => {
+    vi.stubEnv("AIOS_GOVERNED_ACTIONS_ENABLED", "false");
     h.audit.mockReset().mockResolvedValue(undefined);
     h.updateError = null;
     h.key = {
@@ -96,6 +98,7 @@ describe("member API key team identity", () => {
       role: "lead",
       tier: "team",
       team: TEAM_ID,
+      capabilities: { contract_versions: ["mcp-next/1"], actions: [], task_revisions: false },
     });
   });
 
