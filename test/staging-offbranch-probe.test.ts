@@ -489,7 +489,7 @@ describe("the staged probe lifecycle (mock provider — not live proof)", () => 
       let deletions = 0;
       const cleaned: any = await world.phase("cleanup", { deleteRef: async () => { deletions += 1; world.setRef(null); return { outcome: "deleted", exit_code: 0 }; } });
       expect([cleaned.outcome, world.count("POST", "/git/refs"), world.count("POST", "/dispatches"), deletions]).toEqual(["measured", 1, 1, 1]);
-    });
+    }, 20000); // Multiple fsynced lifecycle phases; provider deadlines use world.clock.
   }
 
   for (const fault of ["foreign-ref", "noncommit-type", "wrong-sha"] as const) {

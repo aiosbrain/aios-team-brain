@@ -968,7 +968,7 @@ describe("RIR residual resource lifetime and offline authority regressions", () 
     expect(assessment.blockers).toContainEqual(expect.objectContaining({ gate: "PC-07", kind: "unverified" }));
     const cli = await cliResult("check-evidence", { now: clock.now });
     expect(cli.exit).toBe(3);
-  });
+  }, 20000); // Full fsynced commissioning packet; logical deadlines use the injected clock.
 
   it("RIR4 · retained response observations are authoritative and copied timing cannot move a mutation earlier", async () => {
     const { clock } = await coherentPacket();
