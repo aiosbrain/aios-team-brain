@@ -382,6 +382,11 @@ describe("durable governed actions: real Postgres", () => {
     await expect(s.status(other.auth, pending.action_id)).rejects.toMatchObject(
       { code: "not_found" },
     );
+    // Even a same-team administrator with project visibility is not the owner.
+    const sameTeamAdminKey = await keyFor(f.teamId, f.admin);
+    await expect(s.status(sameTeamAdminKey, pending.action_id)).rejects.toMatchObject({
+      code: "not_found",
+    });
     await sql("delete from project_groups where project_id=$1", [f.projectId]);
     await expect(s.status(f.auth, pending.action_id)).rejects.toMatchObject({
       code: "not_found",
