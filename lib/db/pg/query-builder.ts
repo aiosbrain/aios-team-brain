@@ -92,7 +92,7 @@ export class PgQuery<T = unknown> implements PromiseLike<PgResult<T>> {
   private conflictCols?: string;
   private textSearchSpec?: { col: string; query: string; config: string };
 
-  constructor(private readonly table: string) {}
+  constructor(private readonly table: string, private readonly executeSql: typeof runSql = runSql) {}
 
   // ── shape ──────────────────────────────────────────────────────────────────
   select(spec = "*", opts?: { count?: "exact"; head?: boolean }): this {
@@ -342,19 +342,19 @@ export class PgQuery<T = unknown> implements PromiseLike<PgResult<T>> {
     const p = new Params();
     const where = this.whereClause(p);
     if (this.headMode && this.countMode) {
-      const { rows } = await runSql<{ count: number }>(
+      const { rows } = await this.executeSql<{ count: number }>(
         `SELECT count(*)::int AS count FROM ${this.table} ${where}`,
         p.values
       );
       return { data: null, error: null, count: rows[0]?.count ?? 0 };
     }
     const sql = `SELECT ${this.selectList()} FROM ${this.table} ${where} ${this.orderClause()} ${this.limitClause()}`;
-    const { rows } = await runSql<T>(sql, p.values);
+    const { rows } = await this.executeSql<T>(sql, p.values);
     let count: number | null = null;
     if (this.countMode) {
       const cp = new Params();
       const cwhere = this.whereClause(cp);
-      const { rows: cr } = await runSql<{ count: number }>(
+      const { rows: cr } = await this.executeSql<{ count: number }>(
         `SELECT count(*)::int AS count FROM ${this.table} ${cwhere}`,
         cp.values
       );
@@ -397,7 +397,7 @@ export class PgQuery<T = unknown> implements PromiseLike<PgResult<T>> {
         : ` ON CONFLICT (${target}) DO NOTHING`;
     }
     const sql = `INSERT INTO ${this.table} (${columns.join(", ")}) VALUES ${valuesSql}${conflict}${this.returningClause()}`;
-    const { rows: out } = await runSql<T>(sql, p.values);
+    const { rows: out } = await this.executeSql<T>(sql, p.values);
     return this.returningSpec ? this.finalizeRows(out, null) : { data: null, error: null, count: null };
   }
 
@@ -409,7 +409,7 @@ export class PgQuery<T = unknown> implements PromiseLike<PgResult<T>> {
       .join(", ");
     const where = this.whereClause(p);
     const sql = `UPDATE ${this.table} SET ${set} ${where}${this.returningClause()}`;
-    const { rows } = await runSql<T>(sql, p.values);
+    const { rows } = await this.executeSql<T>(sql, p.values);
     return this.returningSpec ? this.finalizeRows(rows, null) : { data: null, error: null, count: null };
   }
 
@@ -417,7 +417,7 @@ export class PgQuery<T = unknown> implements PromiseLike<PgResult<T>> {
     const p = new Params();
     const where = this.whereClause(p);
     const sql = `DELETE FROM ${this.table} ${where}${this.returningClause()}`;
-    const { rows } = await runSql<T>(sql, p.values);
+    const { rows } = await this.executeSql<T>(sql, p.values);
     return this.returningSpec ? this.finalizeRows(rows, null) : { data: null, error: null, count: null };
   }
 }
