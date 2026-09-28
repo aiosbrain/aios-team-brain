@@ -1,3 +1,4 @@
+import { governedActions } from "@/lib/actions/governed";
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
@@ -59,6 +60,26 @@ describe.runIf(process.env.AIOS_GOVERNED_ACTIONS_ENABLED === "true")("governed n
     expect(await noteCounts(f.teamId)).toMatchObject({ notes: 0, identities: 0 });
     await success(f.headers, noteRequest(f.projectId, "🧠".repeat(200), "🧠".repeat(25000)));
     expect(await noteCounts(f.teamId)).toMatchObject({ notes: 1, versions: 1 });
+  });
+
+  it("creates no note while awaiting approval and reads back the production resolver's result", async () => {
+    const f = await noteFixture("require_approval");
+    const approver = await noteMember(f, "admin");
+    const response = await post(f.headers, f.request);
+    expect(response.status).toBe(202);
+    const pending = await response.json();
+    expect(pending.status).toBe("pending_approval");
+    expect(await noteCounts(f.teamId)).toMatchObject({ notes: 0, versions: 0 });
+    const result = await governedActions.decide({
+      teamId: f.teamId, deciderMemberId: approver.id,
+      approvalRequestId: pending.approval_request_id, decision: "approved",
+    });
+    expect(result.status).toBe("succeeded");
+    const readback = await fetch(`${BASE_URL}/api/v1/actions/${pending.action_id}`, { headers: f.headers });
+    expect(readback.status).toBe(200);
+    expect(await readback.json()).toEqual(result);
+    expect(await success(f.headers, f.request)).toEqual(result);
+    expect(await noteCounts(f.teamId)).toMatchObject({ notes: 1, versions: 1, origins: 1 });
   });
 
   it("concurrent retries converge to one accepted note and persisted revision", async () => {
