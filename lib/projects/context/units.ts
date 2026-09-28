@@ -38,7 +38,8 @@ type ItemRow = { id: string; access: "team" | "external"; content_sha256: string
 export async function reconcileItemUnit(
   db: DbClient,
   teamId: string,
-  itemId: string
+  itemId: string,
+  query: <T>(sql: string, values: unknown[]) => Promise<{ rows: T[] }> = runSql
 ): Promise<ReconcileResult> {
   const { data: itemData, error: iErr } = await db
     .from("items")
@@ -82,7 +83,7 @@ export async function reconcileItemUnit(
       // catch. Restoring the contract is the point of this try/catch, not defensiveness.
       let mirrored;
       try {
-        mirrored = await runSql<{ audience: "team" | "external" }>(
+        mirrored = await query<{ audience: "team" | "external" }>(
           `update project_context_units u
               set audience = i.access,
                   content_sha256 = i.content_sha256,

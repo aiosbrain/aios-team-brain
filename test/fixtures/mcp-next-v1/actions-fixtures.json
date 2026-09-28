@@ -1,5 +1,5 @@
 {
-  "version": "1.0.0",
+  "version": "1.0.1",
   "valid": [
     {
       "name": "note-title-body-only",
@@ -488,6 +488,24 @@
           "title": "Release decision",
           "body": "Use the synthetic launch workspace."
         }
+      }
+    },
+    {
+      "name": "note-nul-rejected",
+      "schema": "urn:aios:mcp-next:1:actions#/definitions/NoteInput",
+      "value": {
+        "title": "Synthetic",
+        "body": "Before\u0000after"
+      }
+    },
+    {
+      "name": "decision-nul-rejected",
+      "schema": "urn:aios:mcp-next:1:actions#/definitions/DecisionInput",
+      "value": {
+        "operation_id": "synthetic-nul",
+        "title": "Synthetic",
+        "rationale": "Before\u0000after",
+        "impact": ""
       }
     }
   ],
