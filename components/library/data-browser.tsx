@@ -8,7 +8,16 @@ import { TierBadge } from "@/components/tier-badge";
 import { EmptyState } from "@/components/empty-state";
 import { timeAgo } from "@/components/format";
 import { ChannelRail } from "@/components/library/channel-rail";
-import { groupChannels, freshnessNow, previewLine, type ChannelRow } from "@/lib/library/channels";
+import {
+  belongsToChannel,
+  channelExactPath,
+  channelFeedFilename,
+  channelFeedPattern,
+  groupChannels,
+  freshnessNow,
+  previewLine,
+  type ChannelRow,
+} from "@/lib/library/channels";
 
 // Occasional-use verification view: scan a bounded recent window for the channel list, and a single
 // channel's feed on demand. Both are generous for dogfooding; counts beyond the cap show as "N+".
@@ -91,25 +100,40 @@ export async function DataBrowser({
 
   const selected =
     channelParam && channels.some((c) => c.key === channelParam) ? channelParam : channels[0]?.key ?? null;
+  const selectedChannel = channels.find((c) => c.key === selected) ?? null;
   const limit = Math.min(MAX_FEED, Math.max(PAGE_SIZE, Number(limitParam) || PAGE_SIZE));
 
-  // 2) Selected channel feed — newest first, one extra row to detect "load more".
+  // 2) Selected channel feed — newest first, one extra matching row to detect "load more".
+  // A legacy Slack prefix can also match scoped paths with the same workspace segment. Keep fetching
+  // until the post-parser filter has a full page; filtering one limited SQL result can underfill it.
   let items: FeedItem[] = [];
   let hasMore = false;
-  if (selected) {
-    let feedQuery = db
-      .from("items")
-      .select("id, path, kind, access, actor, synced_at, body")
-      .eq("team_id", team.id)
-      .like("path", `${selected}/%`)
-      .order("synced_at", { ascending: false })
-      .limit(limit + 1);
-    feedQuery = visibleItems(feedQuery, tier).in("id", visArr); // posture wall + the ENFB-1 oracle gate
-    const { data: feed } = await feedQuery;
-    // Exact prefix guard: LIKE treats `_` as a wildcard, so confirm the path segment boundary in JS.
-    const rows = ((feed ?? []) as FeedItem[]).filter((it) => it.path.startsWith(`${selected}/`));
-    hasMore = rows.length > limit;
-    items = rows.slice(0, limit);
+  if (selected && selectedChannel) {
+    const batchSize = limit + 1;
+    let offset = 0;
+    const matching: FeedItem[] = [];
+    while (matching.length < limit + 1) {
+      let feedQuery = db
+        .from("items")
+        .select("id, path, kind, access, actor, synced_at, body")
+        .eq("team_id", team.id);
+      feedQuery = selectedChannel.source === "unknown" || !selected.includes("/")
+        ? feedQuery.eq("path", channelExactPath(selected))
+        : feedQuery.like("path", channelFeedPattern(selected));
+      feedQuery = feedQuery
+        .order("synced_at", { ascending: false })
+        .order("id", { ascending: false })
+        .range(offset, offset + batchSize - 1);
+      feedQuery = visibleItems(feedQuery, tier).in("id", visArr); // posture wall + the ENFB-1 oracle gate
+      const { data: feed, error: feedError } = await feedQuery;
+      if (feedError) throw new Error(`Data channel feed: ${feedError.message}`);
+      const batch = (feed ?? []) as FeedItem[];
+      matching.push(...batch.filter((it) => belongsToChannel(it.path, selected)));
+      offset += batch.length;
+      if (batch.length < batchSize) break;
+    }
+    hasMore = limit < MAX_FEED && matching.length > limit;
+    items = matching.slice(0, limit);
   }
 
   const railChannels = channels.map((c) => ({
@@ -120,7 +144,6 @@ export async function DataBrowser({
     ago: timeAgo(c.lastSyncedAt),
     fresh: freshnessNow(c.lastSyncedAt),
   }));
-  const selectedChannel = channels.find((c) => c.key === selected) ?? null;
   const totalItems = channels.reduce((sum, c) => sum + c.count, 0);
   const cappedNote = (chRows ?? []).length >= CHANNEL_SCAN_CAP ? "+" : "";
 
@@ -149,7 +172,9 @@ export async function DataBrowser({
           <section className="flex min-w-0 flex-col gap-3">
             {selectedChannel && (
               <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 border-b border-border-subtle pb-2">
-                <h3 className="font-mono text-sm font-medium text-ink">{selectedChannel.key}</h3>
+                <h3 className="font-mono text-sm font-medium text-ink">
+                  {selectedChannel.source === "unknown" ? channelExactPath(selectedChannel.key) : selectedChannel.key}
+                </h3>
                 <span className="text-xs text-ink-tertiary">
                   {selectedChannel.count}
                   {cappedNote} items · last received {timeAgo(selectedChannel.lastSyncedAt)}
@@ -162,7 +187,7 @@ export async function DataBrowser({
             ) : (
               <ol className="flex flex-col divide-y divide-border-subtle">
                 {items.map((it) => {
-                  const file = it.path.split("/").slice(2).join("/") || it.path;
+                  const file = channelFeedFilename(it.path, selected ?? "");
                   const preview = previewLine(it.body);
                   return (
                     <li key={it.id}>

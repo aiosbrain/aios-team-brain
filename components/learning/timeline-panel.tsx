@@ -1,7 +1,7 @@
+import { createHash, randomUUID } from "node:crypto";
 import { adminClient } from "@/lib/db/admin";
 import { getCachedWorkTimeline } from "@/lib/dashboard/timeline-cache";
 import { WINDOW_DAYS, MAX_WINDOW_DAYS } from "@/lib/dashboard/work-timeline";
-import { TimelineDays } from "@/components/dashboard/timeline-days";
 import { TimelineLoadMore } from "@/components/dashboard/timeline-load-more";
 
 /**
@@ -32,22 +32,20 @@ export async function TimelinePanel({
   // `freshness.stale` here (a "last updated" line) is a UI change, deliberately not bundled with the
   // wire fix — see the PR's follow-ups.
   const { days } = await getCachedWorkTimeline(adminClient(), teamId, tier, memberId);
-  const shownDates = days.map((d) => d.date);
+  // A router refresh merges Server Component props into mounted Client Components. Remount the owner
+  // on every new server render: even an identical seven-day snapshot cannot authorize older days that
+  // were fetched by client expansion before a revocation. Include the viewer and current authorized
+  // days in a fixed-length key without exposing evidence in the key itself.
+  const snapshotKey = createHash("sha256")
+    .update(JSON.stringify([teamId, teamSlug, tier, memberId, days, randomUUID()]))
+    .digest("hex");
 
   return (
     <div className="flex flex-col gap-6">
-      {days.length === 0 ? (
-        <p className="rounded-lg border border-border-subtle px-4 py-6 text-center text-sm text-ink-tertiary">
-          No work in the last {WINDOW_DAYS} days — the timeline fills in as commits, tasks, and docs land.
-          Look further back below.
-        </p>
-      ) : (
-        <TimelineDays days={days} />
-      )}
-
       <TimelineLoadMore
+        key={snapshotKey}
         teamSlug={teamSlug}
-        shownDates={shownDates}
+        initialDays={days}
         initialWindow={WINDOW_DAYS}
         maxWindow={MAX_WINDOW_DAYS}
       />

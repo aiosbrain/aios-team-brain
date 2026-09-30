@@ -1,5 +1,6 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
+import { channelScopeSql, resolveVisibleChannelScope, type VisibleChannelScope } from "./channel-scope";
 
 /**
  * Ranked keyword (FTS) retrieval over `items.search`. The builder path emits a bare
@@ -34,7 +35,7 @@ export async function rankedFtsSearch(
   tier: "team" | "external",
   orQuery: string,
   limit = 20,
-  channel?: string | null,
+  channel?: string | VisibleChannelScope | null,
   // Access enforcement (Phase B slice 2, Codex fold): the membership-visible item set, applied
   // IN-QUERY so `limit` ranks over VISIBLE rows only — a post-filter would let invisible rows
   // crowd visible ones out of the top-N (under-return) and leak an abstention side channel. Null
@@ -56,17 +57,16 @@ export async function rankedFtsSearch(
   if (visibleIds) {
     params.push(visibleIds);
     where += ` and i.id = any($${params.length}::uuid[])`;
+  } else if (tier === "external") {
+    // The helper also supports direct calls without an oracle set. Keep that permissive mode
+    // behind the ordinary external posture wall; route callers pass visibleIds explicitly.
+    where += " and i.access = 'external'";
   }
   if (channel) {
-    // Channel scope (Gap #4). The channel NAME appears in a path's 2nd segment for sources that key
-    // paths by name (`linear/aio/…`) — but NOT for Slack, whose path is keyed on the immutable
-    // channel ID so a rename can't re-key every thread into duplicate items. Slack carries its
-    // readable name in `frontmatter.channel`, so match EITHER. Without the frontmatter arm a
-    // "#growth" question silently retrieves zero Slack threads (and the scope phrase is stripped
-    // from the query, so the word doesn't even survive as a content term).
-    params.push(channel);
-    const idx = params.length;
-    where += ` and (split_part(i.path, '/', 2) = $${idx} or lower(i.frontmatter->>'channel') = lower($${idx}))`;
+    const scope = typeof channel === "string"
+      ? await resolveVisibleChannelScope(teamId, tier, channel, visibleIds)
+      : channel;
+    where += ` and ${channelScopeSql(scope, "i", params)}`;
   }
   if (options?.project) {
     params.push(options.project);

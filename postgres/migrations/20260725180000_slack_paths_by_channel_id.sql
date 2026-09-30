@@ -11,16 +11,23 @@
 -- `item_versions` (the work ledger that drives credit), `item_chunks` and `graph_episodes` all keep
 -- pointing at the same item. A delete-and-reingest would have thrown that history away.
 --
--- MERGE-STYLE + IDEMPOTENT: the new code may already have pushed an ID-keyed copy before this runs
--- (a deploy tick between release and schema load). Where BOTH exist, the older name-keyed row is the
--- one with history, so the fresh duplicate is removed first — otherwise the UPDATE would violate the
--- uniqueness constraint. Safe to re-run: after the first pass nothing matches.
+-- COLLISION-SAFE + IDEMPOTENT: if an ID-keyed target already exists, this migration FAILS CLOSED.
+-- Both rows may have independent versions, chunks, graph facts, or Slack evidence, so neither is a
+-- disposable duplicate. An operator must resolve the collision with verified provenance before a
+-- replay can proceed. With no collision, re-running is a no-op after the first in-place move.
 
 begin;
 
 -- The ID-keyed path an item SHOULD have. Mirrors `safeSegment(channelId)` in slack-normalize:
 -- Slack ids are uppercase alphanumeric, so lower() is the whole transformation.
-create temporary view slack_repath as
+--
+-- This is deliberately the ORIGINAL `slack/<channel-name>/<root-ts>.md` shape, not merely a path
+-- whose first segment is `slack`. Later migrations add a workspace segment
+-- (`slack/<workspace>/<channel-id>/<root-ts>`); a full replay of this historical migration must
+-- never reinterpret, rename, or delete that scoped state, even when its frontmatter has an
+-- differently-cased channel_id. The old writer emitted a lower-case slug and a valid Slack root
+-- timestamp filename; malformed three-segment values are not safe to repair by inference.
+create or replace temporary view slack_repath as
 select
   i.id,
   i.team_id,
@@ -30,33 +37,36 @@ select
 from items i
 where i.frontmatter ->> 'source' = 'slack'
   and coalesce(i.frontmatter ->> 'channel_id', '') <> ''
-  and split_part(i.path, '/', 1) = 'slack'
+  and i.path ~ '^slack/[a-z0-9_-]+/[1-9][0-9]*[.][0-9]{1,6}[.]md$'
   and split_part(i.path, '/', 2) <> lower(i.frontmatter ->> 'channel_id'); -- already migrated → skip
 
--- 1. Drop any ID-keyed DUPLICATE the new code created in the window. The name-keyed row is older and
---    carries the version history, so it wins; this fresh copy is what would block the UPDATE.
---    `graph_episodes` has NO FK to items (it is an idempotency ledger keyed by source_id), so its rows
---    must be removed explicitly or the duplicate's facts are orphaned in Graphiti forever.
-delete from graph_episodes ge
-using items dup, slack_repath r
-where ge.source_table = 'items'
-  and ge.source_id = dup.id
-  and dup.team_id = r.team_id
-  and dup.project_id = r.project_id
-  and dup.path = r.new_path
-  and dup.id <> r.id;
+-- Do this check before any write. The message deliberately contains no path, team, item id or
+-- content: deployment logs are operationally visible, while the operator only needs the stable
+-- instruction to inspect the migration collision through authorized tooling.
+do $$
+begin
+  if exists (
+    select 1
+    from slack_repath r
+    join items target
+      on target.team_id = r.team_id
+     and target.project_id = r.project_id
+     and target.path = r.new_path
+     and target.id <> r.id
+  ) then
+    raise exception 'slack path migration collision: operator resolution required before replay'
+      using errcode = 'P0001';
+  end if;
+end $$;
 
-delete from items dup
-using slack_repath r
-where dup.team_id = r.team_id
-  and dup.project_id = r.project_id
-  and dup.path = r.new_path
-  and dup.id <> r.id; -- item_versions / item_chunks cascade on delete
-
--- 2. Move the surviving (history-carrying) rows onto the ID-keyed path.
+-- Move the genuine legacy row IN PLACE only after the no-collision proof.
 update items i
 set path = r.new_path
 from slack_repath r
 where i.id = r.id;
+
+-- TEMP views outlive a transaction on a pooled connection. Remove this one so a later full replay
+-- is a genuine no-op rather than depending on which connection receives it.
+drop view slack_repath;
 
 commit;

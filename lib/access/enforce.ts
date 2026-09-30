@@ -1,7 +1,7 @@
 import "server-only";
 import { createHash } from "node:crypto";
 import type { DbClient } from "@/lib/db/types";
-import { visibleProjects, effectiveVisibleProjects, type Principal } from "@/lib/access/oracle";
+import { visibleProjects, visibleProjectsWithError, effectiveVisibleProjects, type Principal } from "@/lib/access/oracle";
 import { newSqlParams, itemVisibleSql, provenanceRowSql, type ProvenanceSqlCtx } from "@/lib/access/provenance-sql";
 import { runSql } from "@/lib/db/pg/pool";
 
@@ -169,9 +169,9 @@ export async function delegatedVisibleItemIds(
  * A member's VISIBILITY for CACHED/derived surfaces (Phase B slice 4, spec §5.8): the effective
  * project set + the hash that KEYS the cache variant — sha256 of the SORTED post-attenuation
  * effective-project set, so two members with identical group signatures share one cache row and a
- * group change moves the member to a new key on the next read. This is the CHEAP half (projects
- * only): a cache HIT needs the hash alone, so materializing the item-id set on every read (even a
- * hit) would defeat what the cache is for (Fable B4 Medium). PRET-6: always resolves (never
+ * group change moves the member to a new key on the next read. This resolves projects only;
+ * the timeline cache now separately fingerprints current item IDs on every hit because an item
+ * membership can close without changing the project-set hash. PRET-6: always resolves (never
  * null) — a substrate read error throws and the caller fails closed (500/no data).
  */
 export interface MemberVisibility {
@@ -181,15 +181,17 @@ export interface MemberVisibility {
 }
 
 export async function memberVisibility(db: DbClient, principal: Principal): Promise<MemberVisibility> {
-  const { projectIds } = await visibleProjects(db, principal);
+  const { set, error } = await visibleProjectsWithError(db, principal);
+  if (error) throw new Error("access substrate read failed while resolving member visibility");
+  const { projectIds } = set;
   const visibilityHash = createHash("sha256").update([...projectIds].sort().join(",")).digest("hex").slice(0, 16);
   return { visibleProjectIds: projectIds, visibilityHash };
 }
 
 /**
  * The EXPENSIVE half — the membership-visible item-id set — resolved lazily from a
- * `MemberVisibility` only when a surface actually BUILDS (cache miss / stale rebuild), never on a
- * hit. Structured rows gate on their source item; null-source rows go through the CREATED_BY
+ * `MemberVisibility`. Timeline cache readers also call it on hits to detect item-level revocation
+ * that leaves the project-set hash unchanged. Structured rows gate on their source item; null-source rows go through the CREATED_BY
  * provenance rule (`lib/access/provenance`, ENFB-1 — `origin` is durability, never provenance;
  * `tasks.project_id` is the INGEST project, not an access-control project).
  */

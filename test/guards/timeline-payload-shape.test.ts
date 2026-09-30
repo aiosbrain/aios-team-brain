@@ -26,6 +26,8 @@ import { groupTimeline } from "@/lib/dashboard/timeline-group";
 
 /** Every node type in the payload → the keys that version is allowed to carry. */
 const SHAPE_BY_VERSION: Record<number, Record<string, string[]>> = {
+  // v15 changes evidence meaning and adds revision stamps to the envelope; TimelineDay stays the same.
+  get 15() { return this[12]; },
   10: {
     // `summary` is attached on the cache-build path (`timeline-summary`), not by the pure builder, so
     // the fixture can't produce it — it is allowed but not required.
@@ -72,6 +74,7 @@ const SHAPE_BY_VERSION: Record<number, Record<string, string[]>> = {
  * field a stale payload still carries is the same hazard as adding one.
  */
 const REQUIRED_BY_VERSION: Record<number, Record<string, string[]>> = {
+  get 15() { return this[12]; },
   10: {
     personDay: ["memberId", "name", "handle", "total", "tasks", "other", "unlinked", "signals"],
     taskGroup: ["taskId", "title", "status", "source", "sources", "evidenceCount", "assignee"],

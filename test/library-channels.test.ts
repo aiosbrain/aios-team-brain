@@ -1,5 +1,14 @@
 import { describe, it, expect } from "vitest";
-import { parseChannel, groupChannels, freshness, previewLine } from "@/lib/library/channels";
+import {
+  belongsToChannel,
+  channelExactPath,
+  channelFeedFilename,
+  channelFeedPattern,
+  parseChannel,
+  groupChannels,
+  freshness,
+  previewLine,
+} from "@/lib/library/channels";
 
 // Spec (Data page channel inspector): a "channel" is the source stream derived from an item's path
 // prefix; channels carry counts + most-recent arrival (the freshness signal) and sort newest-first.
@@ -15,15 +24,84 @@ describe("parseChannel", () => {
   it("falls back to a single segment when the path has no channel part", () => {
     expect(parseChannel("orphan.md")).toEqual({ key: "orphan.md", source: "orphan.md", name: "orphan.md" });
   });
+
+  it("keeps canonical scoped paths separate by workspace and preserves exact legacy paths", () => {
+    expect(parseChannel("slack/t1/c1/1718900000.000100.md")).toEqual({
+      key: "slack/t1/c1", source: "slack", name: "c1",
+    });
+    expect(parseChannel("slack/t2/c1/1718900000.000100.md").key).toBe("slack/t2/c1");
+    expect(parseChannel("slack/c1/1718900000.000100.md").key).toBe("slack/c1");
+  });
+
+  it("does not infer a Slack channel from malformed or extra path segments", () => {
+    for (const path of [
+      "slack/t1/c1/not-a-root.md",
+      "slack/t1/c1/1718900000.000100.md/extra",
+      "slack//c1/1718900000.000100.md",
+      "slack/t1/c1/1718900000.000100.MD",
+      "slack/T1/C1/1718900000.000100.md",
+      "slack/t1",
+      "/slack/t1/c1/1718900000.000100.md",
+    ]) {
+      expect(parseChannel(path)).toEqual({ key: `unrecognized-slack://${path}`, source: "unknown", name: path });
+      expect(channelExactPath(parseChannel(path).key)).toBe(path);
+    }
+  });
+});
+
+describe("channel feed boundaries", () => {
+  it("matches only the selected workspace or exact legacy shape", () => {
+    const root = "1718900000.000100.md";
+    expect(belongsToChannel(`slack/t1/c1/${root}`, "slack/t1/c1")).toBe(true);
+    expect(belongsToChannel(`slack/t2/c1/${root}`, "slack/t1/c1")).toBe(false);
+    expect(belongsToChannel(`slack/c1/${root}`, "slack/t1/c1")).toBe(false);
+    expect(belongsToChannel(`slack/t1/c1/${root}`, "slack/t1")).toBe(false);
+    expect(belongsToChannel(`slack/t1/${root}`, "slack/t1")).toBe(true);
+    expect(channelFeedFilename(`slack/t1/c1/${root}`, "slack/t1/c1")).toBe(root);
+    expect(channelFeedFilename(`slack/t1/${root}`, "slack/t1")).toBe(root);
+  });
+
+  it("escapes non-Slack LIKE metacharacters before adding the feed wildcard", () => {
+    expect(channelFeedPattern("github/my_repo%\\archive")).toBe("github/my\\_repo\\%\\\\archive/%");
+    expect(belongsToChannel("github/my_repo%\\archive/file.md", "github/my_repo%\\archive")).toBe(true);
+    expect(belongsToChannel("github/myXrepo%\\archive/file.md", "github/my_repo%\\archive")).toBe(false);
+  });
 });
 
 describe("groupChannels", () => {
+  it("keeps same-named channels in two workspaces and a legacy row distinct", () => {
+    const channels = groupChannels([
+      { path: "slack/t1/c1/1718900000.000100.md", synced_at: "2026-07-03T00:00:00Z", label: "general" },
+      { path: "slack/t2/c1/1718900000.000100.md", synced_at: "2026-07-02T00:00:00Z", label: "general" },
+      { path: "slack/c1/1718900000.000100.md", synced_at: "2026-07-01T00:00:00Z", label: "general" },
+    ]);
+    expect(channels.map((channel) => channel.key)).toEqual(["slack/t1/c1", "slack/t2/c1", "slack/c1"]);
+    expect(channels.map((channel) => channel.count)).toEqual([1, 1, 1]);
+  });
+  it("does not merge an unrecognized Slack path with a legacy key", () => {
+    const channels = groupChannels([
+      { path: "slack/t1", synced_at: "2026-07-03T00:00:00Z", label: "general" },
+      { path: "slack/t1/1718900000.000100.md", synced_at: "2026-07-02T00:00:00Z" },
+    ]);
+    expect(channels.map((channel) => channel.key)).toEqual([
+      "unrecognized-slack://slack/t1", "slack/t1",
+    ]);
+  });
+  it("keeps malformed Slack rows separate from arbitrary non-Slack path prefixes", () => {
+    const malformed = "slack/t1";
+    const other = "unrecognized-slack:slack/t1/file.md";
+    expect(parseChannel(malformed).key).not.toBe(parseChannel(other).key);
+    expect(groupChannels([
+      { path: malformed, synced_at: "2026-07-03T00:00:00Z" },
+      { path: other, synced_at: "2026-07-02T00:00:00Z" },
+    ])).toHaveLength(2);
+  });
   it("counts items per channel, keeps the most-recent arrival, and sorts newest-first", () => {
     const channels = groupChannels([
-      { path: "slack/eng/3.md", synced_at: "2026-06-25T10:00:00Z" },
-      { path: "slack/eng/1.md", synced_at: "2026-06-25T09:00:00Z" },
+      { path: "slack/eng/1718900003.000100.md", synced_at: "2026-06-25T10:00:00Z" },
+      { path: "slack/eng/1718900001.000100.md", synced_at: "2026-06-25T09:00:00Z" },
       { path: "linear/aio/A-1.md", synced_at: "2026-06-25T11:00:00Z" },
-      { path: "slack/eng/2.md", synced_at: "2026-06-25T08:00:00Z" },
+      { path: "slack/eng/1718900002.000100.md", synced_at: "2026-06-25T08:00:00Z" },
     ]);
     expect(channels.map((c) => c.key)).toEqual(["linear/aio", "slack/eng"]); // linear is more recent → first
     const eng = channels.find((c) => c.key === "slack/eng")!;
@@ -36,8 +114,8 @@ describe("groupChannels", () => {
   // whenever ≥2 channels existed. groupChannels must accept both and normalize.
   it("accepts Date-typed synced_at (the pg adapter's real shape) without crashing", () => {
     const channels = groupChannels([
-      { path: "slack/eng/3.md", synced_at: new Date("2026-06-25T10:00:00Z") },
-      { path: "slack/eng/1.md", synced_at: new Date("2026-06-25T09:00:00Z") },
+      { path: "slack/eng/1718900003.000100.md", synced_at: new Date("2026-06-25T10:00:00Z") },
+      { path: "slack/eng/1718900001.000100.md", synced_at: new Date("2026-06-25T09:00:00Z") },
       { path: "linear/aio/A-1.md", synced_at: new Date("2026-06-25T11:00:00Z") },
     ]);
     expect(channels.map((c) => c.key)).toEqual(["linear/aio", "slack/eng"]);
@@ -79,7 +157,7 @@ describe("previewLine", () => {
 describe("groupChannels — display label", () => {
   it("shows the source's real name instead of an opaque path segment", () => {
     const [ch] = groupChannels([
-      { path: "slack/c0b8v119g4d/1.md", synced_at: "2026-07-01T00:00:00Z", label: "all-vibrana" },
+      { path: "slack/c0b8v119g4d/1718900001.000100.md", synced_at: "2026-07-01T00:00:00Z", label: "all-vibrana" },
     ]);
     expect(ch.name).toBe("all-vibrana");
     expect(ch.key).toBe("slack/c0b8v119g4d"); // key stays the PATH prefix — it's the feed query
@@ -87,8 +165,8 @@ describe("groupChannels — display label", () => {
 
   it("prefers the most recently synced name, so a rename surfaces", () => {
     const [ch] = groupChannels([
-      { path: "slack/c1/2.md", synced_at: "2026-07-02T00:00:00Z", label: "marketing" }, // newer
-      { path: "slack/c1/1.md", synced_at: "2026-07-01T00:00:00Z", label: "growth" }, // older
+      { path: "slack/c1/1718900002.000100.md", synced_at: "2026-07-02T00:00:00Z", label: "marketing" }, // newer
+      { path: "slack/c1/1718900001.000100.md", synced_at: "2026-07-01T00:00:00Z", label: "growth" }, // older
     ]);
     expect(ch.name).toBe("marketing");
     expect(ch.count).toBe(2); // one channel, not two — the rename did NOT split it

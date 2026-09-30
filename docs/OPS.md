@@ -838,6 +838,9 @@ Table **data** excluded (the tables themselves are created, empty):
   extraction verdict to "stalled", and the resulting synthetic `graph_extract` leg is the one
   **confirmation-exempt** leg in the system: no staleness threshold could ever clear it. A permanently
   red "graph extraction is broken" banner, manufactured by our own refresh.
+- `slack_integration_bindings`, `slack_method_budgets`, and `slack_sync_channels` — integration-owned
+  source state. Their data depends on excluded credential rows and cannot be restored coherently
+  without them; the FK-closure guard keeps this set complete as Slack state evolves.
 
 Kept deliberately: `auth_users` / `auth_tokens` / `api_keys` / `agent_tokens` (hashes, not reversible
 secrets — dropping them leaves nobody able to log into staging), `members`, and `ingest_runs` (its
