@@ -512,20 +512,35 @@ describe("TIERRET-1 AC-12 — timeline via the production cache path", () => {
 });
 
 /**
- * AC-14 — a DISPOSABLE CLIENT, executed end to end against the production route handlers.
+ * AC-14 — a DISPOSABLE CLIENT FIXTURE, executed end to end against the production route handlers.
  *
- * This is NOT the installed `aios` CLI (its source was not readable from the builder session, and no
- * external CLI was executed). It is an explicit, minimal client that follows the release-note
- * procedure literally: a real `.aios/state.json` in a throwaway directory holding the four documented
- * cursor keys PLUS unrelated push state; one cursor per feed (`last_tasks_pull` → tasks writeback,
- * `last_sync_tasks_pull` → tasks sync-origin, `last_decisions_pull` → decisions, `last_pull` → the
- * OKF bundle, paged by `next_cursor`); every received row MERGED BY ROW KEY into a local store; and
- * each cursor advanced to the pull's start time. What it proves is the SERVER half plus the merge
- * contract the release note relies on — that older newly admitted rows come back only after the
- * reset, and that repeated pulls cannot duplicate a row key.
+ * FIXTURE ONLY: this is NOT the installed `aios` CLI, and no installed/external CLI was executed or
+ * read by this test. It is an explicit, minimal client that mirrors the four cursor mappings the
+ * coordinator confirmed in the installed toolkit (read-only inspection, outside this repository) and
+ * follows the release-note procedure literally:
+ *   - a real `.aios/state.json` in a throwaway directory holding EXACTLY the four documented cursor
+ *     keys PLUS unrelated push state;
+ *   - one cursor per feed: `last_pull` → `GET /api/v1/items` (paged by `next_cursor`),
+ *     `last_tasks_pull` → tasks writeback, `last_sync_tasks_pull` → tasks sync-origin,
+ *     `last_decisions_pull` → decisions;
+ *   - every received row MERGED BY ROW KEY into a local store, each cursor advanced to the pull's
+ *     start time.
+ * The OKF bundle is NOT one of those four keys: an OKF consumer keeps its OWN cursor, held here in a
+ * separate consumer state file outside `.aios/state.json`, and the release notes tell it to discard
+ * that cursor separately. What this proves is the SERVER half plus the merge contract the release note
+ * relies on — older newly admitted rows come back only after the matching reset, and repeated pulls
+ * cannot duplicate a row key.
  */
 const CURSOR_KEYS = ["last_pull", "last_tasks_pull", "last_sync_tasks_pull", "last_decisions_pull"] as const;
 const EPOCH = "1970-01-01T00:00:00Z";
+
+/** Merge-by-row-key store shared by both fixture clients: a re-delivered row REPLACES, never appends. */
+function merger(store: Map<string, string>, delivered: string[]) {
+  return (id: string, value: string) => {
+    delivered.push(id);
+    store.set(id, value);
+  };
+}
 
 class DisposableClient {
   /** The local copy, keyed by feed + row key — the merge identity. */
@@ -541,16 +556,23 @@ class DisposableClient {
     await mkdir(join(this.dir, ".aios"), { recursive: true });
     await writeFile(this.statePath, JSON.stringify(s, null, 2));
   }
-  /** One `pull`: returns the row keys DELIVERED by the server in this pull (duplicates included). */
+  /** One `pull` over the four CLI feeds: returns the row keys DELIVERED in this pull (duplicates included). */
   async pull(): Promise<string[]> {
     const s = await this.state();
     const startedAt = new Date().toISOString();
     const since = (k: (typeof CURSOR_KEYS)[number]) => encodeURIComponent(typeof s[k] === "string" ? (s[k] as string) : EPOCH);
     const delivered: string[] = [];
-    const merge = (id: string, value: string) => {
-      delivered.push(id);
-      this.store.set(id, value); // merge by row key: a re-delivered row REPLACES, never appends
-    };
+    const merge = merger(this.store, delivered);
+    // `last_pull` → the items feed (the CLI's own cursor for item bodies), paged by next_cursor.
+    let itemsQuery = `?since=${since("last_pull")}`;
+    for (let page = 0; page < 50; page++) {
+      const ires = await itemsGET(req(`/api/v1/items${itemsQuery}`, this.key));
+      expect(ires.status).toBe(200);
+      const body = (await ires.json()) as { items: { path: string; content_sha256: string }[]; next_cursor: string | null };
+      for (const it of body.items) merge(`item:${it.path}`, it.content_sha256);
+      if (!body.next_cursor) break;
+      itemsQuery = `?cursor=${encodeURIComponent(body.next_cursor)}`;
+    }
     for (const [path, prefix] of [
       [`/api/v1/tasks?since=${since("last_tasks_pull")}`, "task"],
       [`/api/v1/tasks?mode=sync-origin&since=${since("last_sync_tasks_pull")}`, "task"],
@@ -566,15 +588,6 @@ class DisposableClient {
     for (const p of ((await dres.json()) as { decisions: { rows: { row_key: string; title: string }[] }[] }).decisions) {
       for (const r of p.rows) merge(`decision:${r.row_key}`, r.title);
     }
-    let okfQuery = `?since=${since("last_pull")}`;
-    for (let page = 0; page < 50; page++) {
-      const ores = await okfGET(req(`/api/v1/okf-bundle${okfQuery}`, this.key));
-      expect(ores.status).toBe(200);
-      const body = (await ores.json()) as { bundle: { nodes: { path: string }[] }; next_cursor: string | null };
-      for (const n of body.bundle.nodes) merge(`okf:${n.path}`, n.path);
-      if (!body.next_cursor) break;
-      okfQuery = `?cursor=${encodeURIComponent(body.next_cursor)}`;
-    }
     // Advance ONLY the four cursor keys; every other key is written back untouched.
     const next = { ...s };
     for (const k of CURSOR_KEYS) next[k] = startedAt;
@@ -583,8 +596,40 @@ class DisposableClient {
   }
 }
 
+/** A separate OKF consumer with its OWN cursor state (not a CLI key): `{ since }` in its own file. */
+class OkfConsumer {
+  readonly store = new Map<string, string>();
+  readonly cursorPath: string;
+  constructor(readonly dir: string, readonly key: string) {
+    this.cursorPath = join(dir, "okf-consumer", "cursor.json");
+  }
+  async cursor(): Promise<string> {
+    return (JSON.parse(await readFile(this.cursorPath, "utf8")) as { since: string }).since;
+  }
+  async writeCursor(since: string): Promise<void> {
+    await mkdir(join(this.dir, "okf-consumer"), { recursive: true });
+    await writeFile(this.cursorPath, JSON.stringify({ since }, null, 2));
+  }
+  async pull(): Promise<string[]> {
+    const startedAt = new Date().toISOString();
+    const delivered: string[] = [];
+    const merge = merger(this.store, delivered);
+    let okfQuery = `?since=${encodeURIComponent(await this.cursor())}`;
+    for (let page = 0; page < 50; page++) {
+      const ores = await okfGET(req(`/api/v1/okf-bundle${okfQuery}`, this.key));
+      expect(ores.status).toBe(200);
+      const body = (await ores.json()) as { bundle: { nodes: { path: string }[] }; next_cursor: string | null };
+      for (const n of body.bundle.nodes) merge(`okf:${n.path}`, n.path);
+      if (!body.next_cursor) break;
+      okfQuery = `?cursor=${encodeURIComponent(body.next_cursor)}`;
+    }
+    await this.writeCursor(startedAt);
+    return delivered;
+  }
+}
+
 describe("TIERRET-1 AC-14 — a full re-pull recovers older newly admitted rows without duplicates", () => {
-  it("a disposable client: advanced cursors miss the older admitted rows; backup + resetting exactly the four keys recovers them once; repeat pulls never duplicate", async () => {
+  it("a disposable client fixture: advanced cursors miss the older admitted rows; backup + resetting exactly the four CLI keys recovers items/tasks/decisions once; the OKF consumer's own cursor reset recovers OKF; repeat pulls never duplicate", async () => {
     const F = await buildFixture();
     // Every row predates the client's cursors (access changes do not move timestamps): items synced
     // two hours ago, structured rows last touched an hour ago — after their source synced, so the
@@ -601,6 +646,7 @@ describe("TIERRET-1 AC-14 — a full re-pull recovers older newly admitted rows 
     const dir = await mkdtemp(join(tmpdir(), "tierret1-client-"));
     try {
       const client = new DisposableClient(dir, F.externalKey);
+      const okf = new OkfConsumer(dir, F.externalKey);
       const unrelated = {
         project: "src",
         push_hashes: { "notes/a.md": "sha-a", "notes/b.md": "sha-b" },
@@ -608,25 +654,34 @@ describe("TIERRET-1 AC-14 — a full re-pull recovers older newly admitted rows 
         team: F.seed.teamId,
       };
       await client.writeState({ ...unrelated, ...Object.fromEntries(CURSOR_KEYS.map((k) => [k, EPOCH])) });
+      await okf.writeCursor(EPOCH);
 
-      const ADMITTED = ["task:HTX-1", "task:LX-1", "decision:DX-1", "decision:HDX-1", "okf:x.md", "okf:x2.md"];
-      const NEVER = ["task:LY-9", "task:HTS-1", "decision:DY-1", "okf:y.md"];
+      // The four CLI feeds (items via last_pull, tasks ×2, decisions) and the separate OKF consumer.
+      const ADMITTED = ["item:x.md", "item:x2.md", "task:HTX-1", "task:LX-1", "decision:DX-1", "decision:HDX-1"];
+      const NEVER = ["item:y.md", "task:LY-9", "task:HTS-1", "decision:DY-1"];
+      const OKF_ADMITTED = ["okf:x.md", "okf:x2.md"];
+      const OKF_NEVER = ["okf:y.md"];
 
       const p1 = await client.pull();
+      const o1 = await okf.pull();
       for (const k of ADMITTED) expect(p1, `${k}: not yet admitted`).not.toContain(k);
+      for (const k of OKF_ADMITTED) expect(o1, `${k}: not yet admitted`).not.toContain(k);
 
       // The grant now applies (what deploying TIERRET-1 does for an existing grant).
       expect((await addMemberToGroup(db(), F.seed.teamId, F.clientsGroup, F.external, F.seed.memberId)).ok).toBe(true);
 
       const p2 = await client.pull();
+      const o2 = await okf.pull();
       for (const k of ADMITTED) expect(p2, `${k}: older than the advanced cursors, so an ordinary pull misses it`).not.toContain(k);
       for (const k of ADMITTED) expect(client.store.has(k)).toBe(false);
+      for (const k of OKF_ADMITTED) expect(o2, `${k}: older than the consumer's own advanced cursor`).not.toContain(k);
 
       // Release-note step 1: back up the state file — byte-identical copy.
       const before = await readFile(client.statePath, "utf8");
       const backup = `${client.statePath}.bak`;
       await copyFile(client.statePath, backup);
       expect(await readFile(backup, "utf8")).toBe(before);
+      const okfCursorBefore = await readFile(okf.cursorPath, "utf8");
 
       // Step 2: reset EXACTLY the four cursor keys; every other key is preserved verbatim.
       const s = await client.state();
@@ -639,15 +694,27 @@ describe("TIERRET-1 AC-14 — a full re-pull recovers older newly admitted rows 
         else expect(after[k], `${k} must survive the reset`).toEqual(s[k]);
       }
       expect(after).toMatchObject(unrelated);
+      expect(await readFile(okf.cursorPath, "utf8"), "the CLI reset does not touch the OKF consumer's own cursor").toBe(okfCursorBefore);
 
-      // Step 3: pull — the older newly admitted rows arrive, once each; nothing hidden arrives.
+      // Step 3: pull — the older newly admitted items/tasks/decisions arrive, once each; nothing hidden arrives.
       const p3 = await client.pull();
       for (const k of ADMITTED) expect(client.store.has(k), `${k} recovered by the epoch re-pull`).toBe(true);
       for (const k of NEVER) expect(client.store.has(k), `${k} is never delivered`).toBe(false);
       for (const k of NEVER) expect(p3).not.toContain(k);
       const feedDupes = p3.filter((k, i) => p3.indexOf(k) !== i && !k.startsWith("task:"));
-      expect(feedDupes, "within one pull, a decision/OKF row is delivered at most once").toEqual([]);
+      expect(feedDupes, "within one pull, an item/decision row is delivered at most once").toEqual([]);
       const sizeAfterRecovery = client.store.size;
+
+      // The OKF consumer's cursor is NOT a CLI key, so the CLI reset alone does not recover OKF —
+      // the release note's SEPARATE OKF step is required.
+      const o3 = await okf.pull();
+      for (const k of OKF_ADMITTED) expect(o3, `${k}: still behind the consumer's own cursor`).not.toContain(k);
+      await okf.writeCursor(EPOCH);
+      const o4 = await okf.pull();
+      for (const k of OKF_ADMITTED) expect(okf.store.has(k), `${k} recovered after the consumer discards its cursor`).toBe(true);
+      for (const k of OKF_NEVER) expect(okf.store.has(k), `${k} is never delivered`).toBe(false);
+      expect(o4.filter((k, i) => o4.indexOf(k) !== i), "within one OKF pull, a node is delivered at most once").toEqual([]);
+      const okfSizeAfterRecovery = okf.store.size;
 
       // A second pull (cursors advanced again) and a SECOND full reset + pull: the merge keeps one
       // entry per row key — re-delivery replaces, it never duplicates.
@@ -657,9 +724,16 @@ describe("TIERRET-1 AC-14 — a full re-pull recovers older newly admitted rows 
       expect(new Set(p5), "the repeated epoch pull re-delivers the same row-key set").toEqual(new Set(p3));
       expect(client.store.size, "…and the merged store does not grow").toBe(sizeAfterRecovery);
       expect(await client.state(), "unrelated push state survives every pull").toMatchObject(unrelated);
+      await okf.writeCursor(EPOCH);
+      const o5 = await okf.pull();
+      expect(new Set(o5), "the repeated OKF epoch pull re-delivers the same node set").toEqual(new Set(o4));
+      expect(okf.store.size, "…and the OKF store does not grow").toBe(okfSizeAfterRecovery);
       // The pre-reset backup still holds the advanced cursors an operator could restore.
       const bak = JSON.parse(await readFile(backup, "utf8")) as Record<string, unknown>;
       for (const k of CURSOR_KEYS) expect(bak[k]).not.toBe(EPOCH);
+      expect(Object.keys(bak).sort(), "the state file holds exactly the four CLI cursors plus push state — no OKF cursor").toEqual(
+        [...CURSOR_KEYS, ...Object.keys(unrelated)].sort()
+      );
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
