@@ -471,6 +471,12 @@ describe("guard: a token can never acquire member provenance semantics", () => {
     const tc = codeOnly(read("lib/dashboard/timeline-cache.ts"));
     expect(tc).toMatch(/await resolveContentAdmission\(db, teamId, memberId\)/);
     expect(tc).toMatch(/contentReaderFor\(view\.admission\)/);
+    // Final review HIGH: the resolved admission's posture is the ONLY posture authority — every
+    // builder call takes it (never the caller's auth-time tier), and the view carries no second tier.
+    const builds = tc.match(/getWorkTimeline\(\w+, teamId, [\w.]+,/g) ?? [];
+    expect(builds.length, "cold + background build call sites").toBe(2);
+    for (const b of builds) expect(b, "builder posture comes from the resolved admission").toMatch(/, (posture|view\.admission\.posture),$/);
+    expect(tc, "no independent tier on the cached view").not.toMatch(/\bview\.tier\b|\.\.\.variant, tier/);
     // enforce.ts: the READ rows come from the resolver; the WRITER rule is the explicit legacy arm.
     const en = codeOnly(read("lib/access/enforce.ts"));
     expect(en).toMatch(/await resolveContentAdmission\(db, principal\.teamId, principal\.memberId\)/);
