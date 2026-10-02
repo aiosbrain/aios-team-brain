@@ -561,6 +561,10 @@ class DisposableClient {
     const s = await this.state();
     const startedAt = new Date().toISOString();
     const since = (k: (typeof CURSOR_KEYS)[number]) => encodeURIComponent(typeof s[k] === "string" ? (s[k] as string) : EPOCH);
+    // sync-origin is single-project (`project` is required): the workspace's own project slug, read
+    // from the state file. A missing slug is a broken fixture — fail, never send an empty project.
+    const project = s.project;
+    if (typeof project !== "string" || !project) throw new Error("fixture state.json has no workspace project");
     const delivered: string[] = [];
     const merge = merger(this.store, delivered);
     // `last_pull` → the items feed (the CLI's own cursor for item bodies), paged by next_cursor.
@@ -575,7 +579,7 @@ class DisposableClient {
     }
     for (const [path, prefix] of [
       [`/api/v1/tasks?since=${since("last_tasks_pull")}`, "task"],
-      [`/api/v1/tasks?mode=sync-origin&since=${since("last_sync_tasks_pull")}`, "task"],
+      [`/api/v1/tasks?mode=sync-origin&project=${encodeURIComponent(project)}&since=${since("last_sync_tasks_pull")}`, "task"],
     ] as const) {
       const res = await tasksGET(req(path, this.key));
       expect(res.status).toBe(200);

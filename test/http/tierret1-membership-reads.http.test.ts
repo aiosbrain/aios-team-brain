@@ -195,7 +195,19 @@ describe("TIERRET-1 over HTTP — the membership-only member read rule", () => {
     const absent = await get(F, `/api/v1/items/${randomUUID()}`, F.externalKey);
     expect(hidden.status).toBe(404);
     expect(absent.status).toBe(404);
-    expect(await hidden.json(), "an ungranted item reads exactly like a missing one").toEqual(await absent.json());
+    // Every error carries its own per-request trace id (`errorResponse` mints a fresh UUID), so the
+    // bodies are compared field by field: same shape, code and message; distinct, valid trace ids.
+    type ErrBody = { error: { code: string; message: string; request_id: string } };
+    const h = (await hidden.json()) as ErrBody;
+    const a = (await absent.json()) as ErrBody;
+    expect(Object.keys(h).sort(), "no extra top-level fields on the hidden 404").toEqual(Object.keys(a).sort());
+    expect(Object.keys(h.error).sort(), "no extra error fields on the hidden 404").toEqual(Object.keys(a.error).sort());
+    expect(h.error.code, "an ungranted item reads exactly like a missing one").toBe(a.error.code);
+    expect(h.error.message, "an ungranted item reads exactly like a missing one").toBe(a.error.message);
+    const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    expect(h.error.request_id).toMatch(UUID);
+    expect(a.error.request_id).toMatch(UUID);
+    expect(h.error.request_id, "each response has its own trace id").not.toBe(a.error.request_id);
   });
 
   it("the decisions feed serves the granted sourced + granted hand-entered decisions only (AC-01/AC-04)", async () => {
