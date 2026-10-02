@@ -6,10 +6,10 @@ Measurements were taken on 2026-10-02. This note records what was measured and o
 Operational limits and residuals are in [`docs/OPS.md` §11](../OPS.md) ("Runtime recovery limits").
 
 **Status: final acceptance pending.** The final independent code and security reviews have been
-returned and their accepted findings fixed (see [Final reviews](#final-reviews)). A focused review
-of the follow-up fixes and the final acceptance decision are still pending. The pull request
-records the final review and acceptance disposition. This note does not claim acceptance is
-complete.
+returned and their accepted findings fixed (see [Final reviews](#final-reviews)). The focused
+review of the follow-up fixes has been completed with no blocker. The final acceptance decision is
+still pending; the pull request records it after coordinator adjudication. This note does not
+claim acceptance is complete.
 
 ## What is being verified
 
@@ -144,7 +144,7 @@ behavior is unchanged. Failures and retries are listed as they happened; none is
 | Existing item-context suites | up to `a4815204` | 2 files / 62 cases: 61 pass, 1 existing timing case failed on its unchanged 16 s harness bound. The exact unchanged held-lock case then passed in isolation in 10.57 s. Both results retained; no cause is inferred. |
 | Existing disposal units | up to `a4815204` | 3 files / 15 tests pass |
 | Unit/guard suites after the final follow-up fixes | `ede72d2c` | 10 files / 99 tests pass, including 13 AC-03 guard cases, under the unchanged default 5 s test timeout. Typecheck, lint and `check:docs` pass. The guard's baseline cache is an efficiency fix; it is not claimed as the exclusive cause of the earlier timeout. |
-| Runtime-owner dm suite, first run after the follow-up fixes | `ede72d2c` | 31 pass, 3 timing failures, 1,071.87 s total: one `beforeEach` hook timeout (30 s), one 30 s case timeout (AC-05 slow contender), and the AC-07 bare-default case, whose client-side measurement was 11.684 s against its ≥ 29.95 s bound although the server canceled at its 30 s default. No code cause is assumed and no test bound is waived. |
+| Runtime-owner dm suite, first run after the follow-up fixes | `ede72d2c` | 31 pass, 3 timing failures, 1,071.87 s total: one `beforeEach` hook timeout (30 s), one 30 s case timeout (AC-05 slow contender), and the AC-07 bare-default case, whose client-side measurement was 11.684 s against its ≥ 29.95 s bound. The server canceled the statement with `57014` (statement timeout), and the run stopped before the same-backend 30 s setting assertion. No code cause is assumed and no test bound is waived. |
 | Runtime-owner dm suite, rerun with the machine kept awake | `ede72d2c` | 34/34 real-PG tests pass in 99.52 s. The coordinator independently confirmed that the run exited with status 0. The earlier failed run above is retained, not superseded. |
 
 ## Final reviews
@@ -161,8 +161,10 @@ were also accepted and fixed in `ede72d2c`: monotonic elapsed timing in the new 
 inherited scheduler failure-ledger recovery item (F4) is deferred outside this slice as a
 follow-up. The startup-evidence and runtime-profile limits (F7, F8) are retained above.
 
-**Pending:** a focused review of the follow-up fixes in `ede72d2c` and the final acceptance
-decision. Node 20 CI results will be reported only once they have actually run.
+The focused review of the follow-up fixes in `ede72d2c` has been completed with no blocker.
+
+**Pending:** the final acceptance decision, which the pull request records after coordinator
+adjudication. Node 20 CI results will be reported only once they have actually run.
 
 ## Evidence provenance
 

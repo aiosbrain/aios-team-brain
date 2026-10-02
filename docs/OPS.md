@@ -1025,9 +1025,10 @@ invocation may fail at 2 s; after the winner commits, a fresh invocation returns
 without materialization writes or audits. Runtime settings do not replace PRET-6 loader settings.
 
 Known transaction failures roll back membership and marker together. Work is reported only after
-an acknowledged COMMIT. If the COMMIT call does not complete with an acknowledgement — whether the
-acknowledgement was lost or the call failed before COMMIT was transmitted — the transaction may or
-may not have committed. The result reports an unknown outcome (`outcomeUnknown`), the connection is
+an acknowledged COMMIT. If the COMMIT call does not complete with an acknowledgement, the
+transaction may or may not have committed. This covers any error from the COMMIT call, including an
+error returned by the server; a lost acknowledgement and a failure before COMMIT was transmitted
+are examples, not an exhaustive list. The result reports an unknown outcome (`outcomeUnknown`), the connection is
 discarded, and the call is not replayed within that invocation. Inspect the marker
 and membership state through a fresh connection before deciding what to do next. An orphan
 executing statement can retain locks until cancellation or completion. Once idle, the existing
