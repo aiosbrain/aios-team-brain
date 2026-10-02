@@ -2,9 +2,12 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import type { PoolClient } from "pg";
 import { db, transactionSessionDecoratedDb } from "./helpers";
 import { getPool } from "@/lib/db/pg/pool";
-import type { TransactionCapableDbClient } from "@/lib/db/types";
+import { PgClient } from "@/lib/db/pg/client";
+import { runPgClientTransaction, type PgTransactionFactory } from "@/lib/db/pg/tx";
+import type { SqlExecutor, TransactionCapableDbClient, TransactionSession } from "@/lib/db/types";
 import { materializeBuiltinMembershipOnce } from "@/lib/access/groups";
 import { makeMaterializeDeps, runMaterializeCommand, type MaterializeResult } from "@/lib/access/materialize-command";
 
@@ -225,4 +228,129 @@ describe("STAGINGMARK-5 AC-02 (stale state) — confirmed CLI acting on a state 
     expect(outcome.lines.some((l) => l.includes(SERVICE_ERROR))).toBe(true);
     expect(await effects()).toEqual(before);
   }, CASE_TIMEOUT_MS);
+});
+
+const FUNCTION_SQL = "SELECT materialize_builtin_membership_once() AS result";
+
+/**
+ * Test-owned pinned transaction fixture (Stage 1 slice of AC-07): the REAL engine over a REAL pool
+ * checkout, with a query facade that records each statement and the backend PID that ran it, and —
+ * right after the function SELECT returns, on the same connection, before the engine's COMMIT —
+ * reads the effective isolation and local caps. No production hook; release is delegated as-is.
+ */
+function pinnedDb() {
+  const log: { pid: number; sql: string; params: unknown[] }[] = [];
+  const effective: Record<string, string> = {};
+  const releases: (Error | undefined)[] = [];
+  const factory: PgTransactionFactory = {
+    connect: async () => {
+      const real = await getPool().connect();
+      const pid = (real as unknown as { processID: number }).processID;
+      return {
+        query: async (text: string, params: unknown[] = []) => {
+          log.push({ pid, sql: text, params });
+          const result = await real.query(text, params);
+          if (text === FUNCTION_SQL) {
+            for (const name of ["transaction_isolation", "statement_timeout", "lock_timeout"]) {
+              effective[name] = (await real.query(`show ${name}`)).rows[0][name];
+            }
+            effective.backend = String((await real.query("select pg_backend_pid() as pid")).rows[0].pid);
+          }
+          return result;
+        },
+        release: (err?: Error) => {
+          releases.push(err);
+          real.release(err);
+        },
+      } as unknown as PoolClient;
+    },
+    makeBoundClient: (executor, reportFailure) => new PgClient({ executor, reportFailure, bound: true }),
+  };
+  const outer = db() as TransactionCapableDbClient;
+  const client: TransactionCapableDbClient = {
+    from: outer.from.bind(outer),
+    rpc: outer.rpc.bind(outer),
+    transaction: <T>(fn: (session: TransactionSession) => Promise<T>) => runPgClientTransaction(factory, fn),
+  };
+  return { client, log, effective, releases };
+}
+
+describe("STAGINGMARK-5 AC-07 (order slice) — one owned transaction on one real backend, required order", () => {
+  it("BEGIN → READ COMMITTED → local 120000ms/2000ms → one function SELECT → COMMIT on one PID; effective settings observed", async () => {
+    const a = await team();
+    const { client, log, effective, releases } = pinnedDb();
+
+    expect(await materializeBuiltinMembershipOnce(client)).toEqual({ ok: true, ran: true });
+
+    expect(log.map(({ sql, params }) => ({ sql, params }))).toEqual([
+      { sql: "BEGIN", params: [] },
+      { sql: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED", params: [] },
+      { sql: "SELECT set_config('statement_timeout', $1, true)", params: ["120000ms"] },
+      { sql: "SELECT set_config('lock_timeout', $1, true)", params: ["2000ms"] },
+      { sql: FUNCTION_SQL, params: [] },
+      { sql: "COMMIT", params: [] },
+    ]);
+    const pids = new Set(log.map((e) => e.pid));
+    expect(pids.size).toBe(1);
+    expect(String([...pids][0])).toBe(effective.backend);
+    expect(effective).toMatchObject({ transaction_isolation: "read committed", statement_timeout: "2min", lock_timeout: "2s" });
+    expect(releases).toEqual([undefined]);
+    expect((await effects()).marker).toHaveLength(1);
+    await expectBuiltinsFor([a]);
+
+    // Marked: the same owner commits a no-op and reports ran:false.
+    const second = pinnedDb();
+    expect(await materializeBuiltinMembershipOnce(second.client)).toEqual({ ok: true, ran: false });
+    expect(second.log.filter((e) => e.sql === FUNCTION_SQL)).toHaveLength(1);
+  }, CASE_TIMEOUT_MS);
+});
+
+describe("STAGINGMARK-5 AC-11 (real PG) — nested and malformed results fail closed", () => {
+  it("a real transaction-bound PgClient is refused by the existing guard: no function call, no effects", async () => {
+    await team();
+    const before = await effects();
+    const executed: string[] = [];
+    const outer = new PgClient({
+      decorateSessionExecutor: (executor: SqlExecutor): SqlExecutor => async <T>(text: string, params: unknown[] = []) => {
+        executed.push(text);
+        return executor<T>(text, params);
+      },
+    });
+    const nested = await outer.transaction(async (session) => materializeBuiltinMembershipOnce(session.db));
+    expect(nested.ok).toBe(false);
+    expect(nested.error).toMatch(/transaction-session-already-bound/);
+    expect(executed.some((sql) => /materialize_builtin_membership_once/.test(sql))).toBe(false);
+    expect(await effects()).toEqual(before);
+  }, CASE_TIMEOUT_MS);
+
+  // Each variant really runs the frozen function (effects happen inside the transaction) and then
+  // shapes its output wrongly; the owner must abort BEFORE COMMIT so the effects roll back.
+  const variants: [string, string][] = [
+    ["zero rows", "select v as result from r where not v"],
+    ["two rows", "select v as result from r cross join generate_series(1, 2)"],
+    ["null result", "select null::boolean as result from r"],
+    ["string result", "select v::text as result from r"],
+    ["missing result column", "select v as other from r"],
+  ];
+  for (const [label, shape] of variants) {
+    it(`${label}: named failure after real in-transaction effects, all rolled back`, async () => {
+      await team();
+      const before = await effects();
+      const inside: number[] = [];
+      const client = new PgClient({
+        decorateSessionExecutor: (executor: SqlExecutor): SqlExecutor => async <T>(text: string, params: unknown[] = []) => {
+          if (text !== FUNCTION_SQL) return executor<T>(text, params);
+          const out = await executor<T>(`with r as materialized (select materialize_builtin_membership_once() as v) ${shape}`, params);
+          const seen = await executor<{ n: number }>("select count(*)::int as n from migration_markers where name = $1", [MARKER]);
+          inside.push(seen.rows[0].n);
+          return out;
+        },
+      });
+      const result = await materializeBuiltinMembershipOnce(client);
+      expect(result.ok).toBe(false);
+      expect(result.error).toMatch(/malformed result/);
+      expect(inside, "non-vacuity: the function stamped inside the transaction").toEqual([1]);
+      expect(await effects()).toEqual(before);
+    }, CASE_TIMEOUT_MS);
+  }
 });
