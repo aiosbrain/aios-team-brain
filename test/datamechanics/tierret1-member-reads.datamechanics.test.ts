@@ -914,4 +914,121 @@ describe("TIERRET-1 AC-10 — access-health drift blocker: external-tier human i
     } as unknown as ReturnType<typeof db>;
     await expect(assessAccessHealth(broken, seed.teamId)).rejects.toThrow();
   });
+
+  /**
+   * A real-Postgres client in which ONE per-principal oracle chain fails. Every `from(table)` chain on
+   * the targeted table is wrapped and its builder calls recorded; only a chain whose recorded calls
+   * satisfy `hit` resolves `{ data: null, error }` — and only while `probe.armed`. Every other read,
+   * INCLUDING the same table's team-wide bulk reads (health's members read, `builtinMembershipBySlug`,
+   * the system-edge census), reaches Postgres unchanged.
+   */
+  type Call = [method: string, args: unknown[]];
+  interface Probe { armed: boolean; chains: number; hits: number }
+  function scopedOracleFault(table: string, hit: (calls: Call[]) => boolean, probe: Probe): ReturnType<typeof db> {
+    const real = db();
+    const wrap = (target: object, calls: Call[]): object =>
+      new Proxy(target, {
+        get(t, p) {
+          if (p === "then" && probe.armed && hit(calls)) {
+            probe.hits++;
+            return (res: (v: unknown) => unknown, rej?: (e: unknown) => unknown) =>
+              Promise.resolve({ data: null, error: { message: "induced per-principal oracle read failure" } }).then(res, rej);
+          }
+          const v = Reflect.get(t, p, t);
+          if (typeof v !== "function") return v;
+          if (p === "then" || p === "catch" || p === "finally") return v.bind(t);
+          return (...args: unknown[]) => {
+            const out = v.apply(t, args);
+            return out !== null && typeof out === "object" ? wrap(out, [...calls, [String(p), args]]) : out;
+          };
+        },
+      });
+    return new Proxy(real as object, {
+      get(t, p) {
+        if (p === "from") {
+          return (tbl: string) => {
+            const q = (t as ReturnType<typeof db>).from(tbl);
+            if (tbl !== table) return q;
+            probe.chains++;
+            return wrap(q as object, []);
+          };
+        }
+        const v = Reflect.get(t, p, t);
+        return typeof v === "function" ? v.bind(t) : v;
+      },
+    }) as ReturnType<typeof db>;
+  }
+
+  const calledWith = (calls: Call[], method: string, col: string, match: (v: unknown) => boolean) =>
+    calls.some(([m, a]) => m === method && a[0] === col && match(a[1]));
+
+  it("a per-agent oracle read failure cannot return clean health — while every bulk health read succeeds, the failed resolution is never a 'grantless' agent", async () => {
+    const seed = await team();
+    // A standing agent with a LEGITIMATE custom grant (so a healthy scan does not list it as unplaced) …
+    const placed = await rawMember(seed, { kind: "agent" });
+    const proj = await db().from("projects").insert({ team_id: seed.teamId, slug: `ag-${randomUUID().slice(0, 6)}`, name: "agent proj", kind: "initiative" }).select("id").single();
+    expect(proj.error).toBeNull();
+    const g = await createGroup(db(), seed.teamId, `agents-${randomUUID().slice(0, 6)}`, "Agents", seed.memberId);
+    expect(g.ok, g.error).toBe(true);
+    const agentGroup = g.groupId!;
+    expect((await addMemberToGroup(db(), seed.teamId, agentGroup, placed, seed.memberId)).ok).toBe(true);
+    expect((await grantProjectToGroup(db(), seed.teamId, (proj.data as { id: string }).id, agentGroup, seed.memberId)).ok).toBe(true);
+    // … and a GENUINELY grantless active agent: the legitimate unplaced-warning control.
+    const grantless = await rawMember(seed, { kind: "agent" });
+
+    // Healthy control on the REAL client: clean, the grantless agent is the only unplaced one.
+    const control = await assessAccessHealth(db(), seed.teamId);
+    expect(control.blockers, control.blockers.join(" | ")).toEqual([]);
+    expect(control.healthy).toBe(true);
+    expect(control.agentPrincipals).toBe(2);
+    expect(control.unplacedAgents.map((a) => a.memberId), "genuinely grantless agent → unplaced warning").toEqual([grantless]);
+    expect(control.warnings.join(" "), "…reported as the unplaced-agent warning").toMatch(/agent member\(s\) are in no granted group/);
+
+    // Each targeted fault hits ONE query of the placed agent's own oracle resolution and nothing else:
+    // members filtered by its id, group_members filtered by its member_id, and the grant read over the
+    // group set only it belongs to. Team-wide bulk reads of the same tables carry none of those filters.
+    const isPlaced = (v: unknown) => v === placed;
+    const faults: [label: string, table: string, hit: (calls: Call[]) => boolean][] = [
+      ["oracle member read (members.id = agent)", "members", (c) => calledWith(c, "eq", "id", isPlaced)],
+      ["oracle membership read (group_members.member_id = agent)", "group_members", (c) => calledWith(c, "eq", "member_id", isPlaced)],
+      [
+        "oracle grant read (project_groups over the agent's group set)",
+        "project_groups",
+        (c) => calledWith(c, "in", "group_id", (v) => Array.isArray(v) && v.includes(agentGroup)),
+      ],
+    ];
+    for (const [label, table, hit] of faults) {
+      const probe: Probe = { armed: false, chains: 0, hits: 0 };
+      const client = scopedOracleFault(table, hit, probe);
+
+      // Transparency control: the SAME wrapper, unarmed, is indistinguishable from the real client.
+      const transparent = await assessAccessHealth(client, seed.teamId);
+      expect(transparent.healthy, `${label}: unarmed wrapper is transparent`).toBe(true);
+      expect(transparent.unplacedAgents.map((a) => a.memberId), `${label}: unarmed wrapper is transparent`).toEqual([grantless]);
+
+      probe.armed = true;
+      probe.chains = 0;
+      let outcome: { threw: string } | { health: Awaited<ReturnType<typeof assessAccessHealth>> };
+      try {
+        outcome = { health: await assessAccessHealth(client, seed.teamId) };
+      } catch (e) {
+        outcome = { threw: e instanceof Error ? e.message : String(e) };
+      }
+      // Non-vacuity: the agent's oracle query WAS reached and faulted, and other reads of the same
+      // table (the team-wide bulk read and/or other principals' resolutions) still went to Postgres.
+      expect(probe.hits, `${label}: the targeted oracle query was reached`).toBeGreaterThan(0);
+      expect(probe.chains, `${label}: non-targeted reads of ${table} ran un-faulted`).toBeGreaterThan(probe.hits);
+
+      // AC-10: a read error cannot return clean health. Either an explicit throw or healthy=false is
+      // acceptable — but the failure must NAME the agent, and must never be filed as a grantless agent.
+      if ("threw" in outcome) {
+        expect(outcome.threw, `${label}: the error names the agent whose resolution failed`).toContain(placed);
+      } else {
+        const h = outcome.health;
+        expect(h.healthy, `${label}: a failed per-agent resolution reported CLEAN health (blockers: ${h.blockers.join(" | ") || "none"})`).toBe(false);
+        expect(h.blockers.join(" | "), `${label}: a named, actionable blocker identifies the agent`).toContain(placed);
+        expect(h.unplacedAgents.map((a) => a.memberId), `${label}: a failed resolution is not a genuinely grantless agent`).not.toContain(placed);
+      }
+    }
+  });
 });

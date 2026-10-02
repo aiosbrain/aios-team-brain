@@ -259,9 +259,17 @@ describe("TIERRET-1 AC-07 — Social member reads are the EVERY-evidence rule at
     const granted = await createOpportunity(db(), F.seed.teamId, { access: "team", sourceType: "arc", title: "granted story", evidence: [{ itemId: F.x }] }, { memberId: F.seed.memberId });
     const mixed = await createOpportunity(db(), F.seed.teamId, { access: "team", sourceType: "arc", title: "mixed story", evidence: [{ itemId: F.x }, { itemId: F.y }] }, { memberId: F.seed.memberId });
     // Missing evidence: one cited item resolves to no row (the store's tier rule treats it as restrictive).
-    await createOpportunity(db(), F.seed.teamId, { access: "team", sourceType: "arc", title: "dangling story", evidence: [{ itemId: F.x }, { itemId: randomUUID() }] }, { memberId: F.seed.memberId });
+    const dangling = await createOpportunity(db(), F.seed.teamId, { access: "team", sourceType: "arc", title: "dangling story", evidence: [{ itemId: F.x }, { itemId: randomUUID() }] }, { memberId: F.seed.memberId });
     const plan = await createPlan(db(), F.seed.teamId, mixed.id, {}, { memberId: F.seed.memberId });
     const variant = await addVariant(db(), F.seed.teamId, plan.id, { platform: "x", format: "text", tone: "punchy", body: "mixed variant body" });
+    // The POSITIVE variant chain (final focused review, AC-07 "opportunity AND variant reads"): a
+    // team-labelled plan + variant under the ALL-granted opportunity, and one under the missing-evidence
+    // opportunity so both denial shapes are exercised through the same gated listing.
+    const grantedPlan = await createPlan(db(), F.seed.teamId, granted.id, {}, { memberId: F.seed.memberId });
+    const grantedVariant = await addVariant(db(), F.seed.teamId, grantedPlan.id, { platform: "x", format: "text", tone: "punchy", body: "granted variant body" });
+    expect(grantedVariant.access, "the variant inherits the opportunity's TEAM label").toBe("team");
+    const danglingPlan = await createPlan(db(), F.seed.teamId, dangling.id, {}, { memberId: F.seed.memberId });
+    const danglingVariant = await addVariant(db(), F.seed.teamId, danglingPlan.id, { platform: "x", format: "text", tone: "punchy", body: "dangling variant body" });
 
     // A team-posture human (builtin Everyone) with the SAME custom X grant as the external member.
     const peer = await createMember(db(), F.seed.teamId, { email: `${randomUUID()}@test.local`, displayName: "Peer", actorHandle: `p-${randomUUID().slice(0, 8)}`, role: "member", tier: "team" });
@@ -279,6 +287,14 @@ describe("TIERRET-1 AC-07 — Social member reads are the EVERY-evidence rule at
       const titles = (await listOpportunities(db(), F.seed.teamId, ceiling, 100, view.ids)).map((o) => o.title);
       return { view, ceiling, titles };
     };
+    // The gated VARIANT listing. `listVariants` itself takes only plan + label ceiling — it is NOT a
+    // membership check — so the membership authorization is the parent-chain gate (`actorSeesChain`
+    // against the resolver's oracle set) on the plan; the listing then runs at the resolver-derived
+    // ceiling. A denied chain lists nothing (hidden parent ≡ absent parent).
+    const gatedVariantIds = async (r: Awaited<ReturnType<typeof socialRead>>, planId: string) =>
+      (await actorSeesChain(db(), F.seed.teamId, { planId }, r.view.ids))
+        ? (await listVariants(db(), F.seed.teamId, planId, r.ceiling)).map((v) => v.id)
+        : [];
 
     for (const [label, memberId, posture] of [
       ["external-posture member", F.external, "external"],
@@ -292,6 +308,24 @@ describe("TIERRET-1 AC-07 — Social member reads are the EVERY-evidence rule at
       expect(r.titles, `${label}: one missing evidence item denies the whole opportunity`).not.toContain("dangling story");
       expect(await actorSeesChain(db(), F.seed.teamId, { variantId: variant.id }, r.view.ids), `${label}: a variant inherits its parent's denial`).toBe(false);
       expect(await actorSeesChain(db(), F.seed.teamId, { opportunityId: granted.id }, r.view.ids), label).toBe(true);
+
+      // POSITIVE variant chain: every link of the all-granted chain passes the gate, and the gated
+      // listing at the resolver's ceiling serves the team-labelled variant.
+      expect(await actorSeesChain(db(), F.seed.teamId, { planId: grantedPlan.id }, r.view.ids), `${label}: all-granted plan chain`).toBe(true);
+      expect(await actorSeesChain(db(), F.seed.teamId, { variantId: grantedVariant.id }, r.view.ids), `${label}: all-granted variant chain`).toBe(true);
+      expect(await gatedVariantIds(r, grantedPlan.id), `${label}: the all-granted team-labelled variant is listed`).toEqual([grantedVariant.id]);
+      // NEGATIVE variant chains through the SAME gated composition: hidden and missing evidence each deny.
+      expect(await gatedVariantIds(r, plan.id), `${label}: one hidden evidence item denies the variant listing`).toEqual([]);
+      expect(await actorSeesChain(db(), F.seed.teamId, { variantId: danglingVariant.id }, r.view.ids), `${label}: missing-evidence variant chain`).toBe(false);
+      expect(await gatedVariantIds(r, danglingPlan.id), `${label}: one missing evidence item denies the variant listing`).toEqual([]);
+    }
+
+    // The variant ceiling is load-bearing too: the external member's raw POSTURE as the ceiling (instead
+    // of the adapter's) hides the team-labelled variant even though its chain is fully granted.
+    {
+      const extView = await resolveContentView(db(), F.seed.teamId, F.external);
+      expect(extView.admission.posture).toBe("external");
+      expect((await listVariants(db(), F.seed.teamId, grantedPlan.id, extView.admission.posture)).map((v) => v.id)).not.toContain(grantedVariant.id);
     }
 
     // The store DOES apply its tier argument: composing the external member's oracle set with its raw
@@ -312,6 +346,7 @@ describe("TIERRET-1 AC-07 — Social member reads are the EVERY-evidence rule at
       expect(r.view.admission.kind, label).toBe("legacy");
       expect(r.ceiling, `${label}: baseline posture ceiling from the resolver`).toBe(ceiling);
       expect(r.titles, `${label}: gains no Social content`).toEqual([]);
+      expect(await gatedVariantIds(r, grantedPlan.id), `${label}: gains no variant through the gated listing`).toEqual([]);
     }
 
     // Positive-admission failure: an inactive human's read throws before it reaches the store.
@@ -322,6 +357,10 @@ describe("TIERRET-1 AC-07 — Social member reads are the EVERY-evidence rule at
     // Generation/publication ceilings are untouched (negative control): a team-labelled variant is
     // never part of an EXTERNAL-ceiling listing.
     expect((await listVariants(db(), F.seed.teamId, plan.id, "external")).map((v) => v.id)).not.toContain(variant.id);
+    expect(
+      (await listVariants(db(), F.seed.teamId, grantedPlan.id, "external")).map((v) => v.id),
+      "the raw external ceiling still hides the all-granted team-labelled variant"
+    ).not.toContain(grantedVariant.id);
   });
 });
 

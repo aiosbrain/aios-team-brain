@@ -12,6 +12,7 @@ import {
   resolveTimelineVariant,
   readTimelineCache,
   writeTimelineCache,
+  TIMELINE_TTL_MS,
 } from "@/lib/dashboard/timeline-cache";
 
 /**
@@ -218,30 +219,75 @@ describe("TIERRET-1 HIGH — timeline cache posture is the resolved admission's,
     expect.soft(JSON.stringify(persisted.days), "stale team tier must not retrieve the wider variant (persisted hit)").not.toContain(title);
   });
 
-  it("stale-row refresh path: a stale EXTERNAL caller's scheduled background build does not publish team-authority content under the external legacy key", async () => {
+  it("stale-row refresh path: a stale EXTERNAL caller hitting the connector's persisted-STALE team variant refreshes that team variant only — never the external legacy key", async () => {
     const seed = await seedTeam();
     const title = await sentinelDecision(seed);
     const connector = await legacyMember(seed, { is_connector: true, tier: "external" });
     const offroster = await legacyMember(seed, { kind: "offroster", tier: "external" });
 
-    // The external legacy row exists legitimately (built under external authority) and is then stale.
+    // The external legacy row exists legitimately (built under external authority) for the second reader.
     const legit = await getCachedWorkTimeline(db(), seed.teamId, "external", offroster.id);
     expect(JSON.stringify(legit.days)).not.toContain(title);
     await settleTimelineRefreshes();
-    await bustTeamTimeline(db(), seed.teamId);
 
     await moveTierViaUpsert(seed, connector, "team");
     const after = await resolveContentAdmission(db(), seed.teamId, connector.id);
     expect(after).toMatchObject({ kind: "legacy", posture: "team" });
     expect(await directRender(seed, after), "positive control: current authority renders the sentinel").toContain(title);
 
-    await getCachedWorkTimeline(db(), seed.teamId, "external", connector.id); // stale caller tier
-    await settleTimelineRefreshes(); // whatever it scheduled has now built and written
+    // The CURRENT admission's variant (team legacy) is built legitimately — consistent caller tier —
+    // and settled, so a canonical team row exists and carries the sentinel.
+    const teamKey = await timelineViewKey(db(), seed.teamId, "team", connector.id);
+    expect(teamKey.startsWith("adm:lg:team:"), `the connector's current key is the team legacy variant (got ${teamKey})`).toBe(true);
+    const built = await getCachedWorkTimeline(db(), seed.teamId, "team", connector.id);
+    expect(JSON.stringify(built.days), "positive control: the legit team variant serves the sentinel").toContain(title);
+    await settleTimelineRefreshes();
+    const teamRow = async () => {
+      const { data, error } = await db()
+        .from("work_timeline_cache")
+        .select("payload, computed_at")
+        .eq("team_id", seed.teamId)
+        .eq("group_key", teamKey)
+        .maybeSingle();
+      if (error) throw new Error(`team row read failed: ${error.message}`);
+      const row = data as { payload: unknown; computed_at: string | Date } | null;
+      return row && { text: JSON.stringify(row.payload), at: new Date(row.computed_at).getTime() };
+    };
+    const legitRow = await teamRow();
+    expect(legitRow, "the canonical team legacy row is persisted").not.toBeNull();
+    expect(legitRow!.text, "…and carries the sentinel").toContain(title);
 
+    // Stale it: evict this process's memory copies and age every persisted row past the TTL.
+    await bustTeamTimeline(db(), seed.teamId);
+    const staledRow = await teamRow();
+    expect(staledRow, "the bust ages the team row, it does not delete it").not.toBeNull();
+    expect(Date.now() - staledRow!.at, "the team row is now past the TTL").toBeGreaterThan(TIMELINE_TTL_MS);
+
+    // The racing request: stale EXTERNAL caller tier. HARD branch evidence — a cold miss reports
+    // `stale:false` with a fresh computedAt; only the persisted-stale branch returns `stale:true` stamped
+    // with the aged row's own computed_at, serving that row's (team-authority) days.
+    const raced = await getCachedWorkTimeline(db(), seed.teamId, "external", connector.id);
+    expect(raced.freshness.stale, "persisted-STALE hit, not a cold miss").toBe(true);
+    expect(raced.freshness.computedAt, "served from the aged canonical team row").toBe(staledRow!.at);
+    expect(JSON.stringify(raced.days), "the stale hit is the team variant's payload (current authority)").toContain(title);
+    await settleTimelineRefreshes(); // the stale branch's scheduled background rebuild has built and written
+
+    // The refresh landed on the TEAM key: re-stamped current, still the team-authority payload.
+    const refreshed = await teamRow();
+    expect(refreshed!.at, "the background refresh re-stamped the canonical team row").toBeGreaterThan(staledRow!.at);
+    expect(Date.now() - refreshed!.at, "…and it is current again").toBeLessThan(TIMELINE_TTL_MS);
+    expect(refreshed!.text, "the refreshed team row keeps the current-authority sentinel").toContain(title);
+
+    // Nothing under the external legacy key carries team-authority content — persisted, memory, persisted hit.
     const persisted = await persistedUnder(seed.teamId, LG_EXTERNAL);
+    expect(persisted.keys.length, "non-vacuity: the external legacy row exists").toBeGreaterThan(0);
     expect.soft(persisted.text, `background write under ${persisted.keys.join(",")} must not hold team-authority content`).not.toContain(title);
     const second = await getCachedWorkTimeline(db(), seed.teamId, "external", offroster.id);
     expect.soft(JSON.stringify(second.days), "second external legacy reader must not see the background-built sentinel").not.toContain(title);
+    await settleTimelineRefreshes();
+    await forcePersistedHit(seed.teamId);
+    const third = await getCachedWorkTimeline(db(), seed.teamId, "external", offroster.id);
+    expect.soft(JSON.stringify(third.days), "second external legacy reader (persisted hit) must not see the sentinel").not.toContain(title);
   });
 
   it("exported read/write helpers: a tier argument that disagrees with the supplied resolved variant cannot address another reader class's row", async () => {
