@@ -78,10 +78,13 @@ async function seedProject(teamId: string): Promise<string> {
   return (data as { id: string }).id;
 }
 
+// A dashboard-created row, as `createTaskAction` writes it: `origin: "ui"` AND `created_by` (the
+// hand-typed provenance proof). TIERRET-1 HIGH-1: edits now require the pre-TIERRET row writer
+// predicate, under which a null-source row with NO creator (source-purged) is nobody's to edit.
 async function seedTask(teamId: string, projectId: string, rowKey: string, over: Record<string, unknown> = {}): Promise<string> {
   const { data } = await db()
     .from("tasks")
-    .insert({ team_id: teamId, project_id: projectId, row_key: rowKey, title: rowKey, status: "backlog", origin: "ui", ...over })
+    .insert({ team_id: teamId, project_id: projectId, row_key: rowKey, title: rowKey, status: "backlog", origin: "ui", created_by: h.memberId || null, ...over })
     .select("id")
     .single();
   return (data as { id: string }).id;

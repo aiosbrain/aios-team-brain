@@ -289,7 +289,10 @@ describe("visibility-keyed timeline cache (§5.8)", () => {
     ).toEqual([]);
   });
 
-  it("fail closed: a substrate read error while resolving enforcement THROWS and caches nothing (Codex B4 Medium — an error-empty must not become a fresh shared variant)", async () => {
+  it("fail closed: the DIRECT helper `resolveTimelineEnforcement` THROWS on a substrate read error rather than returning an error-empty set (Codex B4 Medium)", async () => {
+    // TIERRET-1 code review 1 LOW-1: the cache no longer builds through this helper (it resolves the
+    // admission and calls its own `buildEnforcement`), so the "no cache row" half moved to the next
+    // test, which drives the real cache path. This one keeps the helper's own contract.
     const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
     await backfillTeamContext(db(), seed.teamId);
     await commit(seed, "feat: probe (ERR-1)");
@@ -308,9 +311,59 @@ describe("visibility-keyed timeline cache (§5.8)", () => {
       },
     } as unknown as ReturnType<typeof db>;
     await expect(resolveTimelineEnforcement(brokenDb, seed.teamId, vis!)).rejects.toThrow();
-    // And no timeline row was written as a side effect of the failed resolution.
+  });
+
+  it("fail closed THROUGH THE CACHE: admission resolves but the item-membership read fails inside the cache's build → the read rejects and NO success variant lands in Postgres or process memory (TIERRET-1 LOW-1)", async () => {
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
+    const item = await commit(seed, "feat: cache fault probe (ERR-2)");
+    await insertTask(seed, item.projectId!, { row_key: "ERR-2", title: "Cache fault probe task", source_item_id: item.id });
+    const member = await seedMember(seed);
+    await backfillTeamContext(db(), seed.teamId);
+
+    // The REAL db, with exactly ONE table faulted: admission (members, group_members, groups,
+    // project_groups) reads normally, so the failure lands in `buildEnforcement`'s
+    // `project_context_memberships` read — not earlier in the admission resolver, which the
+    // admission-error tests already cover.
+    const failure = { data: null, error: { message: "connection reset" } };
+    const failingChain = (): unknown => {
+      const chain: Record<string, unknown> = {};
+      for (const m of ["select", "eq", "neq", "in", "is", "not", "order", "limit"]) chain[m] = () => chain;
+      chain.maybeSingle = () => Promise.resolve(failure);
+      chain.single = () => Promise.resolve(failure);
+      chain.then = (resolve: (v: unknown) => void) => resolve(failure);
+      return chain;
+    };
+    const real = db();
+    let faulted = 0;
+    const brokenDb = new Proxy(real, {
+      get: (target, prop) => {
+        if (prop === "from") {
+          return (t: string) => {
+            if (t !== "project_context_memberships") return target.from(t);
+            faulted++;
+            return failingChain();
+          };
+        }
+        const v = Reflect.get(target, prop);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    }) as ReturnType<typeof db>;
+
+    await expect(getCachedWorkTimeline(brokenDb, seed.teamId, "team", member)).rejects.toThrow();
+    await settleTimelineRefreshes();
+    expect(faulted, "non-vacuity: the cache build reached the faulted membership read").toBeGreaterThan(0);
     const rows = ((await db().from("work_timeline_cache").select("group_key").eq("team_id", seed.teamId)).data ?? []) as { group_key: string }[];
-    expect(rows.some((r) => r.group_key.startsWith("vis:") || r.group_key.startsWith("adm:")), "no variant row may be persisted from a failed resolution").toBe(false);
+    expect(rows.some((r) => r.group_key.startsWith("vis:") || r.group_key.startsWith("adm:")), "no variant row may be persisted from a failed build").toBe(false);
+
+    // Negative control with the fault removed: the same read now BUILDS and serves the visible task.
+    // Had the failed read left an (empty) success entry in process memory, this fresh-TTL read would
+    // be served from it and the task would be missing.
+    const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team", member);
+    await settleTimelineRefreshes();
+    expect(taskTitles(days)).toContain("Cache fault probe task");
+    const after = ((await db().from("work_timeline_cache").select("group_key").eq("team_id", seed.teamId)).data ?? []) as { group_key: string }[];
+    expect(after.some((r) => r.group_key.startsWith("adm:me:team:")), "the successful build persists its variant").toBe(true);
   });
 
   it("fail closed: a timeline read with NO principal throws — the memberId==null arm is always-throw (PRET-6), never the tier row", async () => {

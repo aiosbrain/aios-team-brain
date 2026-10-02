@@ -224,7 +224,17 @@ export async function ensureIncludeMembershipLocked(
   if (unitError) return { ok: false, error: `context unit read failed: ${unitError.message}` };
   if (!unit) return { ok: false, error: "context unit not found or no longer belongs to item" };
 
-  // The routing authority is the LOCKED item (N1) — a stale unit mirror can never admit it.
+  // The routing authority is the LOCKED item (N1) — a stale unit mirror can never admit it, and a
+  // MISMATCHING mirror is refused before any membership mutation (spec §3, code review 1 LOW-2):
+  // reconciliation re-copies the mirror from the locked item in this same transaction before it
+  // gets here, so only a caller that skipped that refresh can arrive with a mismatch — in either
+  // direction, whatever the target. The refusal names the drift; it never trusts or repairs it.
+  const unitAudience = (unit as { audience: string | null }).audience;
+  if (unitAudience !== context.item.access) {
+    return integrityRefusal(
+      `the unit's audience mirror ('${unitAudience}') disagrees with the locked item ('${context.item.access}') — reconcile the unit before placing it`
+    );
+  }
   const gate = await systemIntegrityGate(
     context.session.db,
     context.teamId,

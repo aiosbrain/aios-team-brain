@@ -352,6 +352,47 @@ export async function canSeeProjectRow(db: DbClient, principal: MemberPrincipal,
   }
 }
 
+/**
+ * WRITER predicate for an EXISTING structured row — the edit/move/validity actions' authorization
+ * (TIERRET-1 code review 1, HIGH-1). The member READ rule widened, so the board and decisions page
+ * now hand an external collaborator the ids of rows it could never reach before; a server action is
+ * a POST endpoint, so "the row is on my screen" must not become "I may edit it and project it to
+ * the PM tool". The rule is the pre-TIERRET ROW predicate exactly — the writer rule above applied to
+ * one row: the posture label ceiling (`audience = 'external'` unless team posture), a sourced row's
+ * source item membership-visible, a hand-entered row `created_by`-proven at team posture. It is NOT
+ * `canSeeProjectRow`: a directly granted container does not prove row provenance, and a container
+ * conjunct would refuse rows the old board let a member edit. Never the reader helpers.
+ * Fail-closed: a foreign/absent row, any resolution or read error → false.
+ */
+const STRUCTURED_WRITE_TABLES = { tasks: "tasks", decisions: "decisions" } as const;
+
+export async function canWriteStructuredRow(
+  db: DbClient,
+  principal: MemberPrincipal,
+  table: keyof typeof STRUCTURED_WRITE_TABLES,
+  rowId: string
+): Promise<boolean> {
+  try {
+    const { granted, rule } = await writerRule(db, principal);
+    const p = newSqlParams();
+    const ctx: ProvenanceSqlCtx = { teamId: principal.teamId, grantedProjectIds: granted, ...rule.ctx };
+    const idPh = p.add(rowId);
+    const team = p.add(principal.teamId);
+    const noCeiling = p.add(!rule.labelCeiling);
+    const res = await runSql<{ id: string }>(
+      `select r.id from ${STRUCTURED_WRITE_TABLES[table]} r
+        where r.id = ${idPh} and r.team_id = ${team}
+          and (${noCeiling} or r.audience = 'external')
+          and ${provenanceRowSql("r", p, ctx)}
+        limit 1`,
+      p.values
+    );
+    return res.rows.length > 0;
+  } catch {
+    return false; // fail closed
+  }
+}
+
 /** READER predicate (TIERRET-1): which projects' names/slugs/counts this member may SEE — granted,
  *  or holding content their admission serves. Fail-closed: any resolution error → empty + flagged. */
 export async function readableProjectRows(db: DbClient, principal: MemberPrincipal): Promise<VisibleProjectRows> {

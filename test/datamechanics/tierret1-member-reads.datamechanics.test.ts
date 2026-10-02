@@ -18,6 +18,7 @@ import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { visibleItemIds, visibleProjectCards, canSeeProjectRow } from "@/lib/access/enforce";
 import { retrieve } from "@/lib/query/retrieve";
+import { resolveContentView, retrieveEnforceFor } from "@/lib/access/admission";
 import { listMeetingNotesForTeam, getMeetingNote } from "@/lib/meetings/notes";
 import { assessAccessHealth } from "@/lib/admin/access-health";
 import { formatAccessHealth } from "@/lib/admin/access-health-format";
@@ -427,6 +428,49 @@ describe("TIERRET-1 AC-06 — grounding counts the granted team-labelled corpus"
     expect(ctx.structured).toContain("X decision");
     expect(ctx.structured).not.toContain("Y secret task");
     expect(ctx.structured).not.toContain("Y secret decision");
+  });
+
+  // Code review 1 MEDIUM-1: the two cases above hand-build the enforcement and assert sourced rows
+  // only. This one takes the PRODUCTION path both query routes take — `retrieveEnforceFor(await
+  // resolveContentView(...))` with the route's posture tier — and asserts the GRANTED-PROJECT arm for
+  // HAND-ENTERED rows on every structured leg: the task window, the decision recency window, and the
+  // keyword leg (`matchingDecisions`), which only surfaces a decision the 50-row recency window lost.
+  it("production enforcement: granted hand-entered task + decision reach retrieval's task, recency AND keyword (matchingDecisions) legs; the ungranted hand-entered rows never do", async () => {
+    const F = await buildFixture();
+    const enforce = retrieveEnforceFor(await resolveContentView(db(), F.seed.teamId, F.external));
+    expect(enforce.principal, "the external human is a positively admitted member").toBe("member");
+
+    const first = await retrieve(db(), F.seed.teamId, "external", `what about ${TERM_X}`, null, enforce);
+    expect(first.structured).toContain("HTX-1 [in_progress] Hand-typed X task");
+    expect(first.structured).toContain("#HDX-1 ");
+    expect(first.structured).not.toContain("HTS-1");
+    expect(first.structured).not.toContain("Hand-typed src task");
+
+    // Keyword leg: an OLD hand-entered decision in granted X carrying a sentinel, an equally old
+    // hand-entered sentinel decision in the UNGRANTED src container and a Y-sourced one, then 50
+    // newer visible decisions so the recency window cannot carry any of them.
+    const SENTINEL = "verdigrisotter";
+    const old = "2020-01-01";
+    for (const d of [
+      { row_key: "HDQ-1", title: "Old granted hand decision", project_id: F.X, source_item_id: null, created_by: F.seed.memberId },
+      { row_key: "HDQS-1", title: "Old src hand decision", project_id: F.srcId, source_item_id: null, created_by: F.seed.memberId },
+      { row_key: "DYQ-1", title: "Old Y sourced decision", project_id: F.srcId, source_item_id: F.y, created_by: null },
+    ]) {
+      const { error } = await db().from("decisions").insert({ team_id: F.seed.teamId, rationale: `because ${SENTINEL}`, decided_by: "tester", decided_at: old, still_valid: true, audience: "team", ...d });
+      expect(error).toBeNull();
+    }
+    const fillers = Array.from({ length: 50 }, (_, i) => ({
+      team_id: F.seed.teamId, project_id: F.X, row_key: `HDF-${i}`, title: `Filler ${i}`, decided_by: "tester",
+      decided_at: now().slice(0, 10), still_valid: true, audience: "team", source_item_id: null, created_by: F.seed.memberId,
+    }));
+    expect((await db().from("decisions").insert(fillers)).error).toBeNull();
+
+    const second = await retrieve(db(), F.seed.teamId, "external", `what about ${SENTINEL}`, null, enforce);
+    const [recency, older = ""] = second.structured.split("## Older decisions matching this query");
+    expect(recency, "non-vacuity: the recency window is full of newer rows and lost the old decision").not.toContain("#HDQ-1 ");
+    expect(older, "matchingDecisions surfaces the granted hand-entered decision").toContain("#HDQ-1 ");
+    expect(second.structured).not.toContain("HDQS-1");
+    expect(second.structured).not.toContain("DYQ-1");
   });
 });
 

@@ -4,6 +4,7 @@ import type { AddressInfo } from "node:net";
 // augmentation never adds its target to the TS program, and `test/` is tsconfig-excluded, so this import
 // is what makes `vitest` resolvable for the ProvidedContext augmentation below under `tsc --noEmit`.
 import type {} from "vitest";
+import { scrubbedEnv } from "../../scripts/test-env-scrub";
 
 /**
  * TEST-ONLY loopback fakes for the opt-in TIERRET-1 query harness (`vitest.tierret1-query.config.ts`).
@@ -139,55 +140,8 @@ export function startFakeGraphiti(): Promise<FakeServer> {
   });
 }
 
-/**
- * Credentials and optional outbound endpoints blanked in the `next start` child (and in the seeding test
- * process). Set to "" rather than deleted: Next.js reads `process.env` FIRST and stops once a variable
- * is found, so an empty value also stops a local `.env*` file from re-supplying a real key.
- */
-const SCRUBBED = [
-  "ANTHROPIC_API_KEY",
-  "ANTHROPIC_AUTH_TOKEN",
-  "CLAUDE_CODE_OAUTH_TOKEN",
-  "OPENAI_API_KEY",
-  "OPENAI_BASE_URL",
-  "OPENAI_ORG_ID",
-  "OPENROUTER_API_KEY",
-  "GEMINI_API_KEY",
-  "GOOGLE_API_KEY",
-  "GROQ_API_KEY",
-  "MISTRAL_API_KEY",
-  "TOGETHER_API_KEY",
-  "EMBEDDINGS_URL",
-  "EMBEDDINGS_API_KEY",
-  "RERANK_URL",
-  "RERANK_TOKEN",
-  "RETRIEVAL_AUGMENT_URL",
-  "RETRIEVAL_AUGMENT_TOKEN",
-  "NEO4J_URL",
-  "NEO4J_USER",
-  "NEO4J_PASSWORD",
-  "GRAPH_LLM_PROXY_SECRET",
-  "RESEND_API_KEY",
-  "SMTP_URL",
-  "SENTRY_DSN",
-  "NEXT_PUBLIC_SENTRY_DSN",
-  "SENTRY_AUTH_TOKEN",
-  "STAGING_DATA_MODE",
-  "STAGING_OPS_ENVIRONMENT_ID",
-  "RAILWAY_ENVIRONMENT_ID",
-  "STAGING_QUERY_LLM_ENABLED",
-  "STAGING_QUERY_LLM_BUDGET_USD",
-];
-/** Harness secrets the server legitimately needs (fixed test values set by vitest.http.config.ts). */
-const KEEP = new Set(["AUTH_SECRET", "SECRETS_KEY", "DATABASE_URL", "DATABASE_TEST_URL"]);
-const SECRET_SHAPED = /(API_KEY|_TOKEN|_SECRET|PASSWORD)$/;
-
-export function scrubbedEnv(base: NodeJS.ProcessEnv): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const k of SCRUBBED) out[k] = "";
-  for (const k of Object.keys(base)) if (SECRET_SHAPED.test(k) && !KEEP.has(k)) out[k] = "";
-  return out;
-}
+// The credential/outbound scrub is the ONE shared pure policy (scripts/test-env-scrub.ts): the root
+// Vitest config uses it at runtime and may not import from `test/` (AC18-07), so it lives there.
 
 function assertLoopback(name: string, value: string): void {
   if (!value) throw new Error(`TIERRET-1 query harness: ${name} must be a non-empty loopback URL`);
