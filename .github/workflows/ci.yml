@@ -224,6 +224,12 @@ jobs:
       - run: npm run build
       - run: npm run test:http
       - run: npm run test:http:gateway-approval
+      # TIERRET-1 (AC-03/05/11): the real /api/v1/query route against loopback fake answering +
+      # Graphiti spies, with its OWN global setup (it refuses to attach to an already-serving port
+      # and tears its server down). Sequential after the ordinary tier — same port and test DB; the
+      # ordinary tier's no-model server contract is untouched. No skip path: a missing build, fake
+      # setup, capture or assertion fails the step.
+      - run: npm run test:http:tierret1-query
 
   # The real-Neo4j tier — the ONLY behavioural proof that graph tier isolation holds (group_id is
   # the sole enforcement, no RLS backstop) and, since GRAPHSAT-1, of the per-item episode lookup

@@ -5,7 +5,13 @@ import { getCachedWorkTimeline, purgeTimelineCacheTier, settleTimelineRefreshes,
 import type { TimelineDay } from "@/lib/dashboard/timeline-group";
 import { db, seedTeam, ingest, type Seed } from "./helpers";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
-import { memberEnforcement } from "@/lib/access/enforce";
+import { contentTimelineEnforcement } from "@/lib/access/admission";
+
+/** TIERRET-1: the builder's enforcement now carries the READER from the one admission resolver —
+ *  exactly what the cache layer and the >7d route build with. (A bare item set would close the
+ *  hand-entered arm and the meeting leg, which is the fail-closed default, not the product.) */
+const memberEnforcement = (d: ReturnType<typeof db>, p: { teamId: string; memberId: string }) =>
+  contentTimelineEnforcement(d, p.teamId, p.memberId);
 import { createGroup, grantProjectToGroup, addMemberToGroup } from "@/lib/access/groups";
 
 // Phase B slice 4 (spec §5.8/§17-B), post-PRET-6 — the work-timeline read path through the
@@ -182,7 +188,7 @@ describe("enforced work-timeline builder (Phase B slice 4)", () => {
 });
 
 describe("visibility-keyed timeline cache (§5.8)", () => {
-  it("enforcing: the read NEVER serves the full-tier row — it builds and persists a vis:<hash> variant", async () => {
+  it("enforcing: the read NEVER serves the full-tier row — it builds and persists an admission variant (TIERRET-1: adm:<class>:<tier>:<hash>)", async () => {
     const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
     await backfillTeamContext(db(), seed.teamId);
     const item = await commit(seed, "feat: general note (AIO-50)");
@@ -203,7 +209,8 @@ describe("visibility-keyed timeline cache (§5.8)", () => {
 
     const { data: rows } = await db().from("work_timeline_cache").select("group_key").eq("team_id", seed.teamId);
     const keys = ((rows ?? []) as { group_key: string }[]).map((r) => r.group_key);
-    expect(keys.some((k) => k.startsWith("vis:team:")), `expected a vis:team:<hash> row, got ${keys.join()}`).toBe(true);
+    expect(keys.some((k) => k.startsWith("adm:me:team:")), `expected an adm:me:team:<hash> row, got ${keys.join()}`).toBe(true);
+    expect(keys.some((k) => k.startsWith("vis:")), "the old namespace is never written").toBe(false);
   });
 
   it("two members with the SAME group signature share one variant row; a third with different groups gets another", async () => {
@@ -218,7 +225,7 @@ describe("visibility-keyed timeline cache (§5.8)", () => {
     await getCachedWorkTimeline(db(), seed.teamId, "team", b);
     await settleTimelineRefreshes();
     const visRows = async () => {
-      const { data } = await db().from("work_timeline_cache").select("group_key").eq("team_id", seed.teamId).like("group_key", "vis:%");
+      const { data } = await db().from("work_timeline_cache").select("group_key").eq("team_id", seed.teamId).like("group_key", "adm:%");
       return ((data ?? []) as { group_key: string }[]).map((r) => r.group_key);
     };
     const afterTwo = await visRows();
@@ -253,30 +260,39 @@ describe("visibility-keyed timeline cache (§5.8)", () => {
     expect(JSON.stringify(days), "cross-key salvage would leak tier prose into an enforced payload").not.toContain("SALVAGE-POISON");
   });
 
-  it("purgeTimelineCacheTier removes the tier row AND every vis variant of that tier", async () => {
+  it("purgeTimelineCacheTier removes the tier row, every old vis variant AND every new adm variant of that tier (N4)", async () => {
     const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
     await backfillTeamContext(db(), seed.teamId);
     await commit(seed, "feat: purge probe (AIO-80)");
     const member = await seedMember(seed);
     await backfillTeamContext(db(), seed.teamId);
-    await getCachedWorkTimeline(db(), seed.teamId, "team", member); // writes a vis:team:<hash> variant
+    await getCachedWorkTimeline(db(), seed.teamId, "team", member); // writes an adm:me:team:<hash> variant
     await settleTimelineRefreshes();
-    // Seed the plain tier row DIRECTLY (an enforcing read never writes it, so the "removes the tier
-    // row" half would be vacuous otherwise — Fable B4 Low): both halves must now discriminate.
-    await db().from("work_timeline_cache").upsert({
-      team_id: seed.teamId, group_key: "team",
-      payload: JSON.stringify({ v: PAYLOAD_VERSION, days: [] }), computed_at: new Date().toISOString(),
-    }, { onConflict: "team_id,group_key" });
+    // Seed the plain tier row and an OLD-namespace variant DIRECTLY (the new code writes neither, so
+    // those halves would be vacuous otherwise — Fable B4 Low): every half must discriminate.
+    for (const group_key of ["team", "vis:team:0000000000000000"]) {
+      await db().from("work_timeline_cache").upsert({
+        team_id: seed.teamId, group_key,
+        payload: JSON.stringify({ v: PAYLOAD_VERSION, days: [] }), computed_at: new Date().toISOString(),
+      }, { onConflict: "team_id,group_key" });
+    }
     const before = ((await db().from("work_timeline_cache").select("group_key").eq("team_id", seed.teamId)).data ?? []) as { group_key: string }[];
     expect(before.some((r) => r.group_key === "team"), "tier row must exist before purge").toBe(true);
-    expect(before.some((r) => r.group_key.startsWith("vis:team:")), "a variant must exist before purge").toBe(true);
+    expect(before.some((r) => r.group_key.startsWith("vis:team:")), "an old variant must exist before purge").toBe(true);
+    expect(before.some((r) => r.group_key.startsWith("adm:me:team:")), "a new variant must exist before purge").toBe(true);
     await purgeTimelineCacheTier(db(), seed.teamId, "team");
     const { data } = await db().from("work_timeline_cache").select("group_key").eq("team_id", seed.teamId);
     const keys = ((data ?? []) as { group_key: string }[]).map((r) => r.group_key);
-    expect(keys.filter((k) => k === "team" || k.startsWith("vis:team:")), `tier purge must sweep variants, got ${keys.join()}`).toEqual([]);
+    expect(
+      keys.filter((k) => k === "team" || k.startsWith("vis:team:") || /^adm:[a-z]{2}:team:/.test(k)),
+      `tier purge must sweep every variant of the tier, got ${keys.join()}`
+    ).toEqual([]);
   });
 
-  it("fail closed: a substrate read error while resolving enforcement THROWS and caches nothing (Codex B4 Medium — an error-empty must not become a fresh shared variant)", async () => {
+  it("fail closed: the DIRECT helper `resolveTimelineEnforcement` THROWS on a substrate read error rather than returning an error-empty set (Codex B4 Medium)", async () => {
+    // TIERRET-1 code review 1 LOW-1: the cache no longer builds through this helper (it resolves the
+    // admission and calls its own `buildEnforcement`), so the "no cache row" half moved to the next
+    // test, which drives the real cache path. This one keeps the helper's own contract.
     const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
     await backfillTeamContext(db(), seed.teamId);
     await commit(seed, "feat: probe (ERR-1)");
@@ -295,9 +311,59 @@ describe("visibility-keyed timeline cache (§5.8)", () => {
       },
     } as unknown as ReturnType<typeof db>;
     await expect(resolveTimelineEnforcement(brokenDb, seed.teamId, vis!)).rejects.toThrow();
-    // And no timeline row was written as a side effect of the failed resolution.
+  });
+
+  it("fail closed THROUGH THE CACHE: admission resolves but the item-membership read fails inside the cache's build → the read rejects and NO success variant lands in Postgres or process memory (TIERRET-1 LOW-1)", async () => {
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
+    const item = await commit(seed, "feat: cache fault probe (ERR-2)");
+    await insertTask(seed, item.projectId!, { row_key: "ERR-2", title: "Cache fault probe task", source_item_id: item.id });
+    const member = await seedMember(seed);
+    await backfillTeamContext(db(), seed.teamId);
+
+    // The REAL db, with exactly ONE table faulted: admission (members, group_members, groups,
+    // project_groups) reads normally, so the failure lands in `buildEnforcement`'s
+    // `project_context_memberships` read — not earlier in the admission resolver, which the
+    // admission-error tests already cover.
+    const failure = { data: null, error: { message: "connection reset" } };
+    const failingChain = (): unknown => {
+      const chain: Record<string, unknown> = {};
+      for (const m of ["select", "eq", "neq", "in", "is", "not", "order", "limit"]) chain[m] = () => chain;
+      chain.maybeSingle = () => Promise.resolve(failure);
+      chain.single = () => Promise.resolve(failure);
+      chain.then = (resolve: (v: unknown) => void) => resolve(failure);
+      return chain;
+    };
+    const real = db();
+    let faulted = 0;
+    const brokenDb = new Proxy(real, {
+      get: (target, prop) => {
+        if (prop === "from") {
+          return (t: string) => {
+            if (t !== "project_context_memberships") return target.from(t);
+            faulted++;
+            return failingChain();
+          };
+        }
+        const v = Reflect.get(target, prop);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    }) as ReturnType<typeof db>;
+
+    await expect(getCachedWorkTimeline(brokenDb, seed.teamId, "team", member)).rejects.toThrow();
+    await settleTimelineRefreshes();
+    expect(faulted, "non-vacuity: the cache build reached the faulted membership read").toBeGreaterThan(0);
     const rows = ((await db().from("work_timeline_cache").select("group_key").eq("team_id", seed.teamId)).data ?? []) as { group_key: string }[];
-    expect(rows.some((r) => r.group_key.startsWith("vis:")), "no variant row may be persisted from a failed resolution").toBe(false);
+    expect(rows.some((r) => r.group_key.startsWith("vis:") || r.group_key.startsWith("adm:")), "no variant row may be persisted from a failed build").toBe(false);
+
+    // Negative control with the fault removed: the same read now BUILDS and serves the visible task.
+    // Had the failed read left an (empty) success entry in process memory, this fresh-TTL read would
+    // be served from it and the task would be missing.
+    const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team", member);
+    await settleTimelineRefreshes();
+    expect(taskTitles(days)).toContain("Cache fault probe task");
+    const after = ((await db().from("work_timeline_cache").select("group_key").eq("team_id", seed.teamId)).data ?? []) as { group_key: string }[];
+    expect(after.some((r) => r.group_key.startsWith("adm:me:team:")), "the successful build persists its variant").toBe(true);
   });
 
   it("fail closed: a timeline read with NO principal throws — the memberId==null arm is always-throw (PRET-6), never the tier row", async () => {

@@ -1,4 +1,5 @@
 import "server-only";
+import { createHash } from "node:crypto";
 import { adminClient } from "@/lib/db/admin";
 import type { DbClient } from "@/lib/db/types";
 import type { ViewerTier } from "@/lib/auth/visibility";
@@ -6,7 +7,8 @@ import { getWorkTimeline } from "./work-timeline";
 import { attachPersonDaySummaries, type SummaryPassResult } from "./timeline-summary";
 import type { TimelineDay } from "./timeline-group";
 import { freshness, type Freshness } from "@/lib/freshness";
-import { memberVisibility, resolveTimelineEnforcement, type MemberVisibility } from "@/lib/access/enforce";
+import { visibleItemIdsForProjects } from "@/lib/access/enforce";
+import { resolveContentAdmission, contentReaderFor, type ContentAdmission, type ContentReader } from "@/lib/access/admission";
 
 /**
  * The persisted, queryable work-timeline LAYER. `lib/dashboard/work-timeline.getWorkTimeline` is the
@@ -21,32 +23,87 @@ import { memberVisibility, resolveTimelineEnforcement, type MemberVisibility } f
  * result is the truth of a quiet week — pinning last week's work would be misleading. A stale row is
  * still served for one cycle, but an empty rebuild is accepted.
  *
- * `group_key` = the viewer TIER ('team' | 'external') — or, on an ENFORCING team (Phase B slice 4,
- * spec §5.8), a VISIBILITY VARIANT `vis:<tier>:<hash>` keyed by the member's sorted effective-
- * project-set hash: members with identical group signatures share one row (bounded cardinality =
+ * `group_key` was the viewer TIER ('team' | 'external'), then (Phase B slice 4, spec §5.8) a
+ * VISIBILITY VARIANT `vis:<tier>:<hash>`, and is now (TIERRET-1) an admission variant — all keyed by
+ * the member's sorted effective-project-set hash: members with identical group signatures (and
+ * admission class) share one row (bounded cardinality =
  * distinct group combinations, not principal count), and an enforcing read NEVER touches the plain
  * tier row, whose payload (titles + LLM prose) may name work outside the member's visibility. The
  * (team_id, group_key) PK accommodates both without a migration. No cross-tier bleed, no RLS
- * backstop (CLAUDE.md §5) — the builder's `visibleItems`/`visibleTasks` (+ the §5.8 enforce filter)
- * do the row-level filtering; the key keeps each view's payload in its own row.
+ * backstop (CLAUDE.md §5) — the builder's membership filters do the row-level filtering; the key
+ * keeps each view's payload in its own row.
+ *
+ * TIERRET-1 — a NEW key namespace, `adm:<class>:<tier>:<hash>` (see `admissionTimelineKey`):
+ *   · CLASS is the member-content admission (`me` oracle-accepted Everyone member, `mg` any other
+ *     admitted member, `lg` legacy non-principal). Two readers sharing a posture and a project hash
+ *     can still differ in payload — a connector's legacy hand-entered rule vs a grantless agent's
+ *     closed arm — so the class is part of every key, not inferred from the hash.
+ *   · The NAMESPACE is one the pre-TIERRET code never reads: its reader and its same-key salvage both
+ *     look up exactly `vis:<tier>:<hash>`. A version bump alone could not give that isolation —
+ *     `MIN_SALVAGEABLE_VERSION` is a FLOOR, so old code would salvage a wider v16 summary after a
+ *     rollback. New code never writes `vis:` rows and never salvages across namespaces.
+ *   · Old code cannot purge `adm:` rows while it runs, so rolling FORWARD after a rollback must first
+ *     run `purgeAdmissionTimelineNamespace` (the mandatory roll-forward step in
+ *     docs/RELEASE-NOTES-tierret1.md, "Timeline cache — rollback and roll-forward").
  */
 
-/** One cached view of the timeline: the plain tier row, or a §5.8 visibility variant. Carries the
- *  CHEAP visibility (project set + hash); the expensive item-id set is resolved only when a build
- *  actually runs (miss/stale), never on a hit — see `buildEnforcement`. */
+/** One cached view: the reader's ADMISSION (class + granted projects + posture). Carries the
+ *  CHEAP part only (the admission + hash); the expensive item-id set is resolved only when a build
+ *  actually runs (miss/stale), never on a hit — see `buildEnforcement`.
+ *
+ *  There is deliberately NO separate tier field (TIERRET-1 final review HIGH). The posture that keys
+ *  the row and the posture the builder's legacy arm reads are ONE value — `admission.posture`, captured
+ *  once by the resolver. A caller's tier was read earlier (auth) and can disagree after a legal
+ *  membership write lands in between; letting it pick the key while the admission picked the rows
+ *  published one authority's payload under another reader class's key. */
 interface TimelineView {
-  tier: ViewerTier;
-  vis: MemberVisibility | null;
+  admission: ContentAdmission;
+  /** sha256(sorted granted project ids)[0,16] — the §5.8 visibility hash; ∅ for legacy. */
+  visibilityHash: string;
 }
-// The POSTURE segment is LOAD-BEARING (PRET-5 L3): since the enforcing walls dropped, two
-// members sharing a visibilityHash differ in payload ONLY by the meeting leg's posture gate —
-// a hash-only "simplification" of this key would merge postures and leak meeting evidence.
-const viewKey = (v: TimelineView): string => `vis:${v.tier}:${v.vis!.visibilityHash}`; // PRET-6: the tier-row arm retired — every read is a vis-variant
-/** Resolve the item-id set for a build. Called ONLY on a miss/rebuild — and freshly on each
- *  trailing-edge re-run, so a bust landing mid-rebuild rebuilds with the CURRENT membership set,
- *  not a frozen snapshot (Fable B4 Low). */
-const buildEnforcement = (db: DbClient, teamId: string, view: TimelineView) =>
-  view.vis ? resolveTimelineEnforcement(db, teamId, view.vis) : Promise.resolve(null);
+
+/** The three admission classes a timeline payload can differ by (see the header). */
+export type TimelineAdmissionClass = "me" | "mg" | "lg";
+
+export function timelineAdmissionClass(a: { kind: string; everyone?: boolean }): TimelineAdmissionClass {
+  if (a.kind === "member") return a.everyone === true ? "me" : "mg";
+  if (a.kind === "legacy") return "lg";
+  throw new Error(`timeline: unknown admission kind ${JSON.stringify(a.kind)} (fail closed)`);
+}
+
+/** The NEW namespace prefix — never `vis:` (the pre-TIERRET reader's), never a bare tier. */
+export const ADMISSION_NAMESPACE = "adm";
+
+export function admissionTimelineKey(cls: TimelineAdmissionClass, tier: ViewerTier, visibilityHash: string): string {
+  return `${ADMISSION_NAMESPACE}:${cls}:${tier}:${visibilityHash}`;
+}
+
+function visibilityHashOf(admission: ContentAdmission): string {
+  const projects = admission.kind === "member" ? [...admission.grantedProjectIds] : [];
+  return createHash("sha256").update(projects.sort().join(",")).digest("hex").slice(0, 16);
+}
+
+// The POSTURE (tier) segment stays (PRET-5 L3): the legacy arm's payload still depends on it, and
+// keeping it for every class means no two postures ever share a row. It is the RESOLVED admission's
+// posture — never a caller-supplied tier (see `TimelineView`).
+const viewKey = (v: TimelineView): string =>
+  admissionTimelineKey(timelineAdmissionClass(v.admission), v.admission.posture, v.visibilityHash);
+
+/** Resolve the item-id set + reader for a build. Called ONLY on a miss/rebuild — and freshly on
+ *  each trailing-edge re-run, so a bust landing mid-rebuild rebuilds with the CURRENT membership set
+ *  of the frozen grant set, not a frozen item snapshot (Fable B4 Low). THROWS on a substrate read
+ *  error (Codex B4 Medium): an error-derived empty must never be cached as a shared variant. */
+async function buildEnforcement(
+  db: DbClient,
+  teamId: string,
+  view: TimelineView
+): Promise<{ visibleItemIds: ReadonlySet<string>; reader: ContentReader }> {
+  const reader = contentReaderFor(view.admission);
+  if (view.admission.kind !== "member") return { visibleItemIds: new Set<string>(), reader };
+  const { ids, error } = await visibleItemIdsForProjects(db, teamId, new Set(view.admission.grantedProjectIds));
+  if (error) throw new Error("access substrate read failed while resolving timeline enforcement");
+  return { visibleItemIds: ids, reader };
+}
 
 const TTL_MS = 5 * 60_000; // 5-min freshness; the ledger is cheap, so refresh often.
 /** The same TTL, exported: it's the threshold that decides `freshness.stale`, so a consumer reasoning
@@ -96,7 +153,13 @@ export const TIMELINE_TTL_MS = TTL_MS;
 // v14 (PRET-6): the permissive tier row is retired — every row is a vis-variant and the
 // posture walls are gone from the evidence legs; pre-change rows read as misses.
 // v13 (PRET-5): the enforcing build's walls went mode-keyed.
-export const PAYLOAD_VERSION = 14;
+// v16 (TIERRET-1): membership is the only member read rule — admitted members now get granted
+// meetings and hand-entered rows (meaning change). 15 is RESERVED by the pending Slack-semantics PR
+// (#714), so this deliberately skips it: two incompatible payloads must never share a version (the
+// v8 lesson below). The version is NOT the isolation mechanism — the `adm:` namespace is (header).
+// Integrating #714 later must keep both bumps distinct (take the next unclaimed number) and keep
+// its revision/item fingerprints; this change does not touch the Slack leg.
+export const PAYLOAD_VERSION = 16;
 
 /** The timeline WITH the per-person-day synopsis attached. Runs the (up to 7d × roster) best-effort LLM
  *  calls — so it's used ONLY on the BACKGROUND refresh path, never inline on a request (a cold miss
@@ -118,7 +181,21 @@ async function buildTimeline(db: DbClient, teamId: string, view: TimelineView): 
     console.warn("[timeline] doc-task inference skipped:", err instanceof Error ? err.message : err);
   }
   const enforce = await buildEnforcement(db, teamId, view);
-  return attachPersonDaySummaries(db, teamId, await getWorkTimeline(db, teamId, view.tier, undefined, enforce));
+  return attachPersonDaySummaries(db, teamId, await getWorkTimeline(db, teamId, view.admission.posture, undefined, enforce));
+}
+
+/** The cheap half of a read: the reader's admission + the key it maps to. Throws on any resolution
+ *  error — the caller writes nothing (no empty success row from a failed resolution). Takes no tier:
+ *  the admission it resolves is the sole posture authority for everything downstream. */
+async function resolveView(db: DbClient, teamId: string, memberId: string): Promise<TimelineView> {
+  const admission = await resolveContentAdmission(db, teamId, memberId);
+  return { admission, visibilityHash: visibilityHashOf(admission) };
+}
+
+/** The cache key a member's read maps to right now — for operators and the dm tier (AC-12). `_tier`
+ *  is kept for signature compatibility and IGNORED: the key's posture is the resolved admission's. */
+export async function timelineViewKey(db: DbClient, teamId: string, _tier: ViewerTier, memberId: string): Promise<string> {
+  return viewKey(await resolveView(db, teamId, memberId));
 }
 
 
@@ -230,7 +307,7 @@ interface CacheEntry {
   degraded: boolean;
 }
 
-// In-memory cache (per process), fronting the Postgres row. Keyed by `${teamId}:${tier}`.
+// In-memory cache (per process), fronting the Postgres row. Keyed by `${teamId}:${viewKey}`.
 const mem = new Map<string, CacheEntry>();
 // Keys refreshing in the background, so N concurrent stale reads fire ONE rebuild. The PROMISE is
 // retained (not just the key) so an in-flight rebuild can be awaited — see `settleTimelineRefreshes`.
@@ -277,16 +354,28 @@ async function readSalvageableSummaries(
   }
 }
 
-/** Read the cached ledger for one team+tier. Null on miss/any error (best-effort — a cache read must
- *  never fail the panel; the caller builds inline). */
+/** The admission-keyed part of a view — what `readTimelineCache`/`writeTimelineCache` address. */
+export type TimelineVariant = Pick<TimelineView, "admission" | "visibilityHash">;
+
+/** Resolve a member's variant (admission + hash) — the ONE resolver, so a fixture or operator tool
+ *  addresses exactly the row a real read would. Throws on any resolution error. */
+export async function resolveTimelineVariant(db: DbClient, teamId: string, memberId: string): Promise<TimelineVariant> {
+  const { admission, visibilityHash } = await resolveView(db, teamId, memberId);
+  return { admission, visibilityHash };
+}
+
+/** Read the cached ledger for one variant. Null on miss/any error (best-effort — a cache read
+ *  must never fail the panel; the caller builds inline). `_tier` is kept for signature compatibility
+ *  and IGNORED: the row is addressed by the variant's own resolved posture, so a disagreeing tier can
+ *  never reach another reader class's row. */
 export async function readTimelineCache(
   db: DbClient,
   teamId: string,
-  tier: ViewerTier,
-  vis: MemberVisibility | null = null
+  _tier: ViewerTier,
+  variant: TimelineVariant
 ): Promise<CacheEntry | null> {
   try {
-    const row = await readTimelineCacheRow(db, teamId, viewKey({ tier, vis }));
+    const row = await readTimelineCacheRow(db, teamId, viewKey(variant));
     if (!row) return null;
     // Payload is `{ v, days }`. A missing/older version = a shape from a previous deploy → treat as a
     // MISS so the caller rebuilds (never render a stale wrong shape).
@@ -303,8 +392,14 @@ export async function readTimelineCache(
   }
 }
 
-/** Upsert the ledger for one team+tier, stamping `computed_at` now. Best-effort — a failed write must
- *  never fail the build (the days are still returned). */
+/** Upsert the ledger for one variant, stamping `computed_at` now. Best-effort — a failed write must
+ *  never fail the build (the days are still returned).
+ *
+ *  The row is addressed by the variant's resolved posture, never by `tier`. A `tier` that DISAGREES
+ *  with that posture is REFUSED (nothing written): `days` is caller-assembled, and a mismatched tier
+ *  is the sign it was built under a different authority than the variant's key names — placing it
+ *  anywhere could publish one reader class's payload to another. Internal callers always pass the
+ *  variant's own posture. */
 export async function writeTimelineCache(
   db: DbClient,
   teamId: string,
@@ -313,17 +408,21 @@ export async function writeTimelineCache(
   /** The per-person-day synopses are missing or carried over, so the prose wasn't computed for this
    *  ledger. Persisted (R2/M6) so the NEXT reader of this row inherits the verdict instead of being
    *  handed a partial payload as healthy. Defaults false — the callers that know pass it explicitly. */
-  degraded = false,
-  /** §5.8 visibility variant: present → the row is keyed vis:<tier>:<hash>, never the tier row. */
-  vis: MemberVisibility | null = null
+  degraded: boolean,
+  /** The admission-keyed variant — the row is `adm:<class>:<posture>:<hash>`, never a tier/`vis:` row. */
+  variant: TimelineVariant
 ): Promise<void> {
+  if (tier !== variant.admission.posture) {
+    console.warn("[timeline] cache write refused: caller tier disagrees with the resolved admission posture");
+    return;
+  }
   try {
     // `payload` is a top-level JSON array — serialize it ourselves (the pg adapter binds a raw JS array
     // as a Postgres array literal, which the jsonb column rejects); a text param assignment-casts to jsonb.
     await db.from("work_timeline_cache").upsert(
       {
         team_id: teamId,
-        group_key: viewKey({ tier, vis }),
+        group_key: viewKey(variant),
         payload: JSON.stringify({ v: PAYLOAD_VERSION, days }),
         computed_at: new Date().toISOString(),
         degraded,
@@ -382,14 +481,58 @@ export async function purgeTimelineCacheTier(
   // The tier row AND its §5.8 visibility variants: a vis:<tier>:<hash> payload is built from the
   // same tier-filtered set, so whatever made the tier row no longer servable applies to every
   // variant of it (this is the "narrowed external→team" path — titles/prose must actually go).
-  const memPrefixes = [memKey(teamId, tier), memKey(teamId, `vis:${tier}:`)];
-  for (const key of [...mem.keys()]) if (memPrefixes.some((p) => key === p || key.startsWith(p))) mem.delete(key);
+  // TIERRET-1 (N4): the NEW namespace too, or a renamed key would evade this purge. Every
+  // `adm:<class>:<tier>:*` variant of the tier goes; and on the EXTERNAL purge (an item leaving
+  // external-shared), every `adm:mg:*` variant as well — a non-Everyone member may have seen the
+  // item ONLY through an external-shared grant, and its key (class + grant hash) does not move when
+  // the item does. Everyone members (`me`) keep General and external-shared both, so the narrowed
+  // item stays visible to them and their rows are left for the stale-mark backstop.
+  const shapes = [
+    { exact: tier },
+    { prefix: `vis:${tier}:` },
+    ...(["me", "mg", "lg"] as const).map((cls) => ({ prefix: `${ADMISSION_NAMESPACE}:${cls}:${tier}:` })),
+    ...(tier === "external" ? [{ prefix: `${ADMISSION_NAMESPACE}:mg:` }] : []),
+  ];
+  for (const key of [...mem.keys()]) {
+    if (!key.startsWith(`${teamId}:`)) continue;
+    const group = key.slice(teamId.length + 1);
+    if (shapes.some((s) => ("exact" in s ? group === s.exact : group.startsWith(s.prefix)))) mem.delete(key);
+  }
+  // An in-flight rebuild of a purged key read pre-narrowing inputs: re-run it (trailing edge).
+  for (const key of refreshing.keys()) {
+    if (!key.startsWith(`${teamId}:`)) continue;
+    const group = key.slice(teamId.length + 1);
+    if (shapes.some((s) => ("exact" in s ? group === s.exact : group.startsWith(s.prefix)))) dirty.add(key);
+  }
   try {
-    await db.from("work_timeline_cache").delete().eq("team_id", teamId).eq("group_key", tier);
-    await db.from("work_timeline_cache").delete().eq("team_id", teamId).like("group_key", `vis:${tier}:%`);
+    for (const s of shapes) {
+      if ("exact" in s) await db.from("work_timeline_cache").delete().eq("team_id", teamId).eq("group_key", s.exact);
+      else await db.from("work_timeline_cache").delete().eq("team_id", teamId).like("group_key", `${s.prefix}%`);
+    }
   } catch {
     // best-effort — the caller's stale-mark backstop bounds a SERVED stale payload to one TTL (see the
     // header for why that is no longer the whole story for the summaries)
+  }
+}
+
+/**
+ * TIERRET-1 ROLL-FORWARD STEP (mandatory after any rollback — docs/RELEASE-NOTES-tierret1.md,
+ * "Timeline cache — rollback and roll-forward"): delete
+ * EVERY `adm:` row, instance-wide, and this process's copies. While rolled back, the old code serves
+ * from `vis:` and cannot see — let alone purge — `adm:` rows, so a narrowing that happened then left
+ * them stale; the new code must not serve or salvage them when it returns. Old `vis:` rows are left
+ * alone (the new code never reads them). Idempotent; run before the rolled-forward build serves.
+ * Returns ok:false on a write failure so the operator can retry rather than proceed.
+ */
+export async function purgeAdmissionTimelineNamespace(db: DbClient): Promise<{ ok: boolean; error?: string }> {
+  const marker = `:${ADMISSION_NAMESPACE}:`;
+  for (const key of [...mem.keys()]) if (key.includes(marker)) mem.delete(key);
+  for (const key of refreshing.keys()) if (key.includes(marker)) dirty.add(key);
+  try {
+    const { error } = await db.from("work_timeline_cache").delete().like("group_key", `${ADMISSION_NAMESPACE}:%`);
+    return error ? { ok: false, error: error.message } : { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
 }
 
@@ -423,7 +566,7 @@ function refreshInBackground(teamId: string, view: TimelineView): void {
         dirty.delete(key); // claim the current request; anything arriving from here re-dirties the key
         const built = await buildTimeline(bg, teamId, view);
         mem.set(key, { days: built.days, at: Date.now(), degraded: built.degraded });
-        await writeTimelineCache(bg, teamId, view.tier, built.days, built.degraded, view.vis);
+        await writeTimelineCache(bg, teamId, view.admission.posture, built.days, built.degraded, view);
       } while (dirty.has(key));
     } catch (err) {
       console.error("[timeline] background refresh failed:", err instanceof Error ? err.message : err);
@@ -461,29 +604,29 @@ export interface CachedTimeline {
  *   1. fresh in-memory → return instantly;
  *   2. Postgres `work_timeline_cache` — fresh → return; stale → return stale NOW + rebuild behind the request;
  *   3. cold miss → build inline, then persist.
- * The one reader every surface calls (panel, `/api/v1/timeline`). Tier isolation is enforced inside the
- * builder's `visibleItems`/`visibleTasks`, so this is safe with `adminClient`.
+ * The one reader every surface calls (panel, `/api/v1/timeline`). Access is enforced inside the
+ * builder (membership filters + the reader's provenance ctx), so this is safe with `adminClient`.
  *
- * `memberId` is REQUIRED (Phase B slice 4, §5.8): on an ENFORCING team the read resolves the
- * member's enforcement view and serves a `vis:<tier>:<hash>` variant — never the tier row. Pass
- * `null` only for a read with no principal (tests, internal permissive paths); on an enforcing
- * team that THROWS (fail closed — serving the tier row to an unidentified principal is the leak).
- * On a permissive team the view is null and behavior is byte-identical to before.
+ * `memberId` is REQUIRED (Phase B slice 4, §5.8): the read resolves the member's CONTENT ADMISSION
+ * (TIERRET-1 — `lib/access/admission.ts`, the one resolver) and serves its
+ * `adm:<class>:<posture>:<hash>` variant. `null` THROWS (fail closed — PRET-6: there is no tier row).
+ * A resolution error throws BEFORE any write, so a failure never becomes a cached empty success.
+ *
+ * `_tier` is kept for call-site compatibility and IGNORED (TIERRET-1 final review HIGH). It was read
+ * at auth time and a legal membership write can move the posture before the admission is resolved
+ * here; the ONE captured `view.admission.posture` governs the key, lookup, cold build, salvage, write
+ * and the background refresh alike, so no path can mix two authorities.
  */
 export async function getCachedWorkTimeline(
   db: DbClient,
   teamId: string,
-  tier: ViewerTier,
+  _tier: ViewerTier,
   memberId: string | null
 ): Promise<CachedTimeline> {
-  let vis: MemberVisibility | null = null;
-  if (memberId != null) {
-    vis = await memberVisibility(db, { teamId, memberId }); // CHEAP (projects only)
-  } else {
-    // PRET-6: there is no permissive tier row anymore — a principal-less read is a caller bug.
-    throw new Error("timeline read without a principal (fail closed)");
-  }
-  const view: TimelineView = { tier, vis };
+  // PRET-6: there is no permissive tier row anymore — a principal-less read is a caller bug.
+  if (memberId == null) throw new Error("timeline read without a principal (fail closed)");
+  const view = await resolveView(db, teamId, memberId); // CHEAP (admission + project hash)
+  const posture = view.admission.posture;
   const key = memKey(teamId, viewKey(view));
   const now = Date.now();
 
@@ -492,7 +635,7 @@ export async function getCachedWorkTimeline(
     return { days: cached.days, freshness: freshness(cached.at, TTL_MS, { now, degraded: cached.degraded }) };
   }
 
-  const persisted = await readTimelineCache(db, teamId, tier, vis);
+  const persisted = await readTimelineCache(db, teamId, posture, view);
   if (persisted) {
     mem.set(key, { days: persisted.days, at: persisted.at, degraded: persisted.degraded });
     // ONE envelope for both the fresh and the stale branch — `freshness()` derives `stale` from the same
@@ -509,7 +652,7 @@ export async function getCachedWorkTimeline(
   // add the per-person-day synopsis in the background. The first viewer sees the timeline immediately;
   // summaries appear on the next view once the background pass writes them (kept off the request path so
   // a big team's fan-out can't blow the page / route budget).
-  const built = await getWorkTimeline(db, teamId, tier, undefined, await buildEnforcement(db, teamId, view));
+  const built = await getWorkTimeline(db, teamId, posture, undefined, await buildEnforcement(db, teamId, view));
   // …but a cold miss is USUALLY A VERSION BUMP, not a genuinely empty cache — and that path was
   // silently deleting the synopsis from every person-day until a background pass finished. Twice the
   // user's report was "we've lost the summaries at the top of each person's day", both times right
@@ -518,6 +661,8 @@ export async function getCachedWorkTimeline(
   // Best-effort by construction: no salvageable row → `built`, unchanged.
   // SAME-KEY salvage only: prose from the tier row was written about the FULL tier-visible set and
   // can name work outside this view's visibility — carrying it into a variant payload is a leak.
+  // TIERRET-1: the same key is an `adm:` key, so salvage never crosses the authorization namespace in
+  // either direction (old `vis:` prose is never read here; old code never reads `adm:` rows).
   const days = attachSalvagedSummaries(built, await readSalvageableSummaries(db, teamId, viewKey(view)));
   const at = Date.now();
   mem.set(key, { days, at, degraded: true });
@@ -525,7 +670,7 @@ export async function getCachedWorkTimeline(
   // prose is either absent or salvaged from an older payload version — so the flag has to live on the row
   // or the very next request hands the same partial ledger over as healthy. Self-healing: the background
   // pass below rewrites the row with the real verdict once summaries land.
-  await writeTimelineCache(db, teamId, tier, days, true, vis);
+  await writeTimelineCache(db, teamId, posture, days, true, view);
   refreshInBackground(teamId, view);
   // DEGRADED, deliberately. A cold miss returns the pure ledger: its per-person-day synopses are either
   // absent (the background pass hasn't run) or SALVAGED from an older payload version. Both are "this is

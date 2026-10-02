@@ -1,7 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { isPrincipal } from "@/lib/access/eligibility";
-import { visibleProjects } from "@/lib/access/oracle";
+import { visibleProjectsWithError } from "@/lib/access/oracle";
 import { findUnpartitionedItems } from "@/lib/projects/context/coverage";
 import { GENERAL_SLUG, EXTERNAL_SHARED_SLUG } from "@/lib/access/bootstrap";
 import { censusTeamSystemEdges } from "@/lib/access/groups";
@@ -45,6 +45,16 @@ export interface AccessHealth {
   unplacedAgents: BlindPrincipal[];
   /** Active connector service accounts: they push, and a pull through their key reads nothing. */
   activeConnectors: BlindPrincipal[];
+  /**
+   * TIERRET-1 — DRIFT, not intent: active eligible humans whose PERSISTED `members.tier` is
+   * `external` but who hold a row in the team's actual builtin Everyone group. Everyone grants
+   * General (all team content), and since TIERRET-1 a member's grants are its whole read rule, so
+   * this combination is worth a BLOCKER. It is an operator warning that fails health — never a
+   * runtime read veto and never an auto-removal. It cannot detect a contractor who was deliberately
+   * moved INTO Everyone through the sanctioned writer (that mirrors tier to `team`), only a record
+   * and a membership that disagree.
+   */
+  externalTierInEveryone: BlindPrincipal[];
 }
 
 type MemberRow = {
@@ -60,7 +70,7 @@ type MemberRow = {
  * Is anyone blind, is anything unreachable, RIGHT NOW? Read-only.
  *
  * The checks are deliberately derived from the SAME primitives the enforced read uses rather than
- * from a proxy for them: per-member visibility comes from the oracle itself (`visibleProjects`),
+ * from a proxy for them: per-member visibility comes from the oracle itself (`visibleProjectsWithError`),
  * so a broken group/grant edge anywhere in the chain shows up as the member actually going blind,
  * not as a table row that looks plausible. An inspector that agrees with enforcement is the only
  * kind worth having (the §15.6 rule).
@@ -132,6 +142,7 @@ export async function assessAccessHealth(db: DbClient, teamId: string): Promise<
   const blindHumans: BlindPrincipal[] = [];
   const customOnlyHumans: BlindPrincipal[] = [];
   const unplacedAgents: BlindPrincipal[] = [];
+  const externalTierInEveryone: BlindPrincipal[] = [];
   let humanPrincipals = 0;
   let agentPrincipals = 0;
 
@@ -141,7 +152,19 @@ export async function assessAccessHealth(db: DbClient, teamId: string): Promise<
   const { builtinMembershipBySlug } = await import("@/lib/access/groups");
   const builtinRows = await builtinMembershipBySlug(db, teamId);
   for (const m of principals) {
-    const { projectIds } = await visibleProjects(db, { teamId, memberId: m.id });
+    // TIERRET-1 AC-10: the ERROR-VISIBLE oracle read. `visibleProjects` collapses a failed member/
+    // membership/grant read into the same empty set a genuinely grantless member gets, so a broken
+    // read on one agent became an "unplaced agent" warning and health stayed clean. Fail here, before
+    // the empty set is interpreted — the same throw as the bulk reads above, naming the member.
+    const { set, error: visErr } = await visibleProjectsWithError(db, { teamId, memberId: m.id });
+    if (visErr) {
+      throw new Error(
+        `access visibility resolution failed for ${m.kind} member ${m.id}` +
+          `${m.email ? ` (${m.email})` : ""}: a member, group-membership or grant read errored, so its ` +
+          `access is UNVERIFIED and health cannot be assessed — retry, and check the database if it persists`
+      );
+    }
+    const { projectIds } = set;
     const identity: BlindPrincipal = { memberId: m.id, email: m.email, kind: m.kind, tier: m.tier };
     if (m.kind === "human") {
       humanPrincipals++;
@@ -152,6 +175,10 @@ export async function assessAccessHealth(db: DbClient, teamId: string): Promise<
       // system project — the access-violation warning.
       const inEveryone = builtinRows.everyone.has(m.id);
       const inExternal = builtinRows.external.has(m.id);
+      // TIERRET-1 drift blocker. `builtinMembershipBySlug` counts BUILTIN groups only, so an ordinary
+      // group named "Everyone" never trips it; `principals` already excludes inactive rows; external-
+      // only and custom-grant humans are not in Everyone. Both builtins + persisted external DOES trip.
+      if (inEveryone && m.tier === "external") externalTierInEveryone.push(identity);
       if (inEveryone || inExternal) {
         const required = inEveryone ? [generalId, externalSharedId] : [externalSharedId];
         if (required.some((p) => !p || !projectIds.has(p))) blindHumans.push(identity);
@@ -179,6 +206,16 @@ export async function assessAccessHealth(db: DbClient, teamId: string): Promise<
   if (blindHumans.length > 0) {
     blockers.push(
       `${blindHumans.length} active human member(s) see NOTHING — their groups grant no path to their builtin's system project`
+    );
+  }
+  if (externalTierInEveryone.length > 0) {
+    blockers.push(
+      `${externalTierInEveryone.length} active external-tier human member(s) are in the builtin Everyone group ` +
+        `(${externalTierInEveryone.map((m) => m.email ?? m.memberId).join(", ")}) — Everyone grants General, i.e. ALL ` +
+        `team content, and group membership is the whole read rule. If they are collaborators, remove them from ` +
+        `Everyone (and keep External plus their project grants); if they are staff, set their tier to team. ` +
+        `This flags a persisted tier/membership MISMATCH only — a deliberate add through the groups writer ` +
+        `mirrors tier and is not detected here`
     );
   }
   if (customOnlyHumans.length > 0) {
@@ -235,6 +272,7 @@ export async function assessAccessHealth(db: DbClient, teamId: string): Promise<
     blindHumans,
     unplacedAgents,
     activeConnectors: activeConnectors.map((m) => ({ memberId: m.id, email: m.email, kind: m.kind, tier: m.tier })),
+    externalTierInEveryone,
   };
 }
 

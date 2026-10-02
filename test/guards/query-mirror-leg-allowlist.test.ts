@@ -21,6 +21,9 @@ describe("guard: the QMIR-1 org-structural leg allowlists", () => {
   it("the serve condition is the positive member test — never a token negation", () => {
     expect(SRC).toContain('enforce?.principal === "member"');
     expect(SRC, "a !== token gate fails open on an absent/foreign principal").not.toContain('principal !== "token"');
+    // TIERRET-1: the explicit LEGACY arm keeps the legs it already had (baseline preservation, not a
+    // grant) — still a POSITIVE enumeration, so an absent/foreign discriminator stays closed.
+    expect(SRC).toContain('const serveOrgStructural = enforce?.principal === "member" || enforce?.principal === "legacy";');
   });
 
   it("the enforcing relationship allowlist is exactly REPORTS_TO", () => {
@@ -58,13 +61,16 @@ describe("guard: the QMIR-1 org-structural leg allowlists", () => {
     const V1 = readFileSync(join(import.meta.dirname, "..", "..", "app", "api", "v1", "query", "route.ts"), "utf8");
     const DASH = readFileSync(join(import.meta.dirname, "..", "..", "app", "api", "dashboard", "query", "route.ts"), "utf8");
     for (const [name, src] of [["v1", V1], ["dashboard", DASH]] as const) {
-      expect(src, `${name}: graphProjectIds is unconditional on the member arm`).toContain(
-        'principal: "member", graphProjectIds: projectIds'
-      );
+      // TIERRET-1: both routes delegate the member arm to the admission resolver …
+      expect(src, `${name}: the member arm is the admission resolver's`).toMatch(/retrieveEnforceFor\(\s*await\s+resolveContentView\(/);
       expect(src, `${name}: no tier condition may gate the graph scope`).not.toMatch(
         /=== "team"\s*\?\s*\{\s*graphProjectIds/
       );
     }
+    // … whose member arm carries graphProjectIds UNCONDITIONALLY (no posture/tier branch).
+    const ADM = readFileSync(join(import.meta.dirname, "..", "..", "lib", "access", "admission.ts"), "utf8");
+    expect(ADM).toContain("graphProjectIds: view.projectIds,");
+    expect(ADM).not.toMatch(/posture\s*===\s*"team"\s*\?\s*\{?\s*graphProjectIds/);
     // And retrieve's enforced graph arm keys on scope presence alone:
     expect(SRC).toContain("if (!enforce?.graphProjectIds) return [];"); // PRET-6: optional-chained (enforce is the only path)
     expect(SRC).not.toContain('tier !== "team" || !enforce.graphProjectIds');

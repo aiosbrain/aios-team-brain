@@ -12,7 +12,9 @@ import { TASK_STATUSES, type Task, type TaskStatus } from "@/components/kanban/t
 
 /**
  * Task mutations initiated from the Kanban board. There is no RLS on the postgres target, so the
- * `currentMember()` guard is the access control. (Browser → server action so no PostgREST is needed.)
+ * `currentMember()` guard plus the per-row/per-container WRITER predicates (`canWriteStructuredRow`
+ * for edits, `canSeeProjectRow` for creates) are the access control. (Browser → server action so
+ * no PostgREST is needed.)
  *
  * Reactive projection (brain-api v1.2 Phase 2): each successful write schedules a single-row
  * projection into the team's primary PM tool via `after()` (runs after the response). It loads the
@@ -27,6 +29,15 @@ function scheduleProjection(taskId: string) {
   after(async () => {
     await projectTaskByIdAfterWrite(adminClient(), taskId);
   });
+}
+
+// TIERRET-1 (code review 1 HIGH-1): membership is a team-level check, not a row-level one. The board
+// now serves rows the member could only READ before, so an edit/move must also pass the pre-TIERRET
+// row WRITER predicate (`canWriteStructuredRow`) — refused exactly like an absent task, before any
+// write or projection. Read visibility never authorizes a write.
+async function canWriteTask(teamId: string, memberId: string, taskId: string): Promise<boolean> {
+  const { canWriteStructuredRow } = await import("@/lib/access/enforce");
+  return canWriteStructuredRow(adminClient(), { teamId, memberId }, "tasks", taskId);
 }
 
 export interface NewTaskInput {
@@ -50,8 +61,10 @@ export async function moveTaskAction(
     .eq("id", taskId)
     .maybeSingle();
   if (!task) return { ok: false, error: "task not found" };
-  const me = await currentMember((task as { team_id: string }).team_id);
+  const teamId = (task as { team_id: string }).team_id;
+  const me = await currentMember(teamId);
   if (!me) return { ok: false, error: "not a member of this team" };
+  if (!(await canWriteTask(teamId, me.id, taskId))) return { ok: false, error: "task not found" };
 
   const { error } = await db
     .from("tasks")
@@ -62,7 +75,8 @@ export async function moveTaskAction(
     // to write it back — the markdown would sit on `todo` forever. Guarded by
     // test/guards/task-status-raw-status.test.ts.
     .update({ status, raw_status: null, updated_at: new Date().toISOString() })
-    .eq("id", taskId);
+    .eq("id", taskId)
+    .eq("team_id", teamId);
   if (error) return { ok: false, error: error.message };
   scheduleProjection(taskId);
   return { ok: true };
@@ -149,6 +163,8 @@ export async function updateTaskAction(
   const row = task as { team_id: string; project_id: string; row_key: string | null };
   const me = await currentMember(row.team_id);
   if (!me) return { ok: false, error: "not a member of this team" };
+  // Before parent validation too: its "not found in project" answers must not probe a refused row.
+  if (!(await canWriteTask(row.team_id, me.id, input.taskId))) return { ok: false, error: "task not found" };
 
   // Parent integrity (when provided + non-empty): reject self-parent; require the parent to exist in
   // the same (team, project); and reject any re-parent that would close a cycle (the epic→sub graph
@@ -196,7 +212,7 @@ export async function updateTaskAction(
     update.parent_row_key = parent || null;
   }
 
-  const { error } = await db.from("tasks").update(update).eq("id", input.taskId);
+  const { error } = await db.from("tasks").update(update).eq("id", input.taskId).eq("team_id", row.team_id);
   if (error) return { ok: false, error: error.message };
   scheduleProjection(input.taskId);
   return { ok: true };

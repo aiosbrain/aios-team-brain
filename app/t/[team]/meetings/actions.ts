@@ -215,8 +215,9 @@ export async function extractMeetingActionItemsAction(
 
   const admin = adminClient();
 
-  // Resolve the note → its transcript item (id/path/access + body). getMeetingNote enforces the
-  // team-tier gate and confirms the note belongs to this team.
+  // Resolve the note → its transcript item (id/path/access + body). The WRITE gate is the explicit
+  // `canSeeMeetingNotes(me.tier)` check above (preserved by TIERRET-1); getMeetingNote is a READ — it
+  // confirms the note belongs to this team and that the member can see its transcript (the oracle).
   const note = await getMeetingNote(admin, team.id, noteId, { memberId: me.id, tier: me.tier });
   if (!note) return { ok: false, error: "meeting note not found" };
 

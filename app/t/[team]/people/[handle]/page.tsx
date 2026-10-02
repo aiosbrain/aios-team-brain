@@ -102,6 +102,13 @@ export default async function PersonPage({
     teamPosture: me.tier === "team",
     // Member-only surface (AUDITFIX-1 §2a): session-authenticated profile page. This ctx reaches
     // the provenance predicate via deriveProjects (lib/identity/context.ts).
+    // TIERRET-1 (code review 1 LOW-4, deliberately DEFERRED): the people identity-context ceiling is an
+    // EXCLUDED, preserved surface in the accepted spec, so this ctx keeps its PRE-TIERRET semantics on
+    // purpose — RAW posture as the hand-typed "all" bit and no granted-project scope (non-team posture →
+    // closed), exactly the output it had before. It is not built by the admission resolver, so it is
+    // NOT the oracle-accepted Everyone bit the member arm means elsewhere, and nothing here proves who
+    // can reach the page (the session guard does not select kind/is_connector). Do not copy this shape
+    // to another surface, and do not "fix" it here without a scoped decision for this surface.
     principal: "member" as const,
   });
   const canEdit = !!context && (me.id === p.member_id || me.role === "admin");

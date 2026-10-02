@@ -50,9 +50,13 @@ async function seedHandEntered(seed: Seed, projectId: string): Promise<{ task: s
 
 const retrieveAs = async (seed: Seed, ids: Set<string>, principal: "member" | "token") => {
   const { retrieve } = await import("@/lib/query/retrieve");
+  // TIERRET-1: the member CONTROL is the seed admin — an oracle-accepted Everyone human — so it
+  // carries exactly what `retrieveEnforceFor` emits for one (`memberEveryone: true`). A member arm
+  // without that authority now fails closed by design. The token arm is unchanged (no forward).
   return retrieve(db(), seed.teamId, "team", `tell me about ${TERM}`, null, {
     visibleItemIds: ids,
     principal,
+    ...(principal === "member" ? { memberEveryone: true, memberProjectIds: [] } : {}),
   } as Parameters<typeof retrieve>[5]);
 };
 

@@ -63,8 +63,8 @@ async function graphDriver(url, password) { const driver = neo4j.driver(url, neo
  *
  * It is a separate TypeScript process because those two tables have single-writer owner modules,
  * enforced by a build-failing guard, and every invariant they carry lives there. Hand-rolled SQL
- * here would seed rows that no longer had to obey the no-widening gate — in a harness whose whole
- * purpose is checking an access boundary.
+ * here would seed rows that no longer had to obey the system-integrity gate (TIERRET-1's replacement
+ * for the no-widening gate) — in a harness whose whole purpose is checking an access boundary.
  */
 async function contextAction(action, kind = "team") {
   const { execFile } = await import("node:child_process");

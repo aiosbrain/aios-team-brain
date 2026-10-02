@@ -187,20 +187,32 @@ DB**, and cross-organization isolation is **not** a concern. The `team_id` scopi
 _internal_ (separating teams _within_ one org's DB) and only matters if an instance hosts more
 than one team.
 
-**What still matters regardless of multi-tenancy: TIER isolation.** An `external`-tier principal
-(a client/consultant collaborator) must never read `team`/`admin` content; `admin`/`private`
-content never leaves the workspace. This is a product feature (the `external` API tier, OKF link
-redaction), independent of multi-tenancy.
+**What still matters regardless of multi-tenancy: ACCESS isolation — and since TIERRET-1 it is
+MEMBERSHIP, not tier.** A member reads exactly what its group grants serve (the oracle,
+`lib/access/oracle.ts`): a client/consultant collaborator granted a project reads that project's
+content whatever its `team`/`external` label, and reads nothing it was not granted. Labels still route
+automatic placement (team → General, external → external-shared) and still narrow an EXPLICIT external
+export (OKF `?tier=external`, link redaction); `admin`/`private` content never leaves the workspace.
 
-There is **no RLS** — Postgres is the one and only backend, and tier isolation is enforced
-**entirely in app code**. A missing `access`/tier filter has **no DB backstop**. Tier isolation
-is therefore a **standing invariant** that the app code must guarantee on every read path.
+There is **no RLS** — Postgres is the one and only backend, and access is enforced **entirely in app
+code**. A missing membership filter has **no DB backstop**, so it is a **standing invariant** on every
+read path:
 
-> ✅ **Enforced (was a known gap, now closed):** API routes and `lib/query/retrieve.ts` re-apply the
-> tier filter, and dashboard server-component reads (`app/t/[team]/*`) route through the
-> **`lib/auth/visibility` choke-point** (`visibleItems`/`canSeeAccess`) — guarded by
-> `test/guards/dashboard-tier-filter.test.ts` and proven by the data-mechanics tier. New dashboard
-> surfaces (e.g. Codebases) must add their own app-code tier gate + guard; there is no RLS backstop.
+> ✅ **Enforced:** every member content read resolves WHO is asking through the ONE admission resolver,
+> **`lib/access/admission.ts`** (`resolveContentAdmission`/`resolveContentView`): a same-team active
+> human or standing agent (`isPrincipal`) is a **member** — membership is its whole read rule, sourced
+> rows follow their source item, hand-entered rows follow Everyone-or-grants; an ACTIVE connector or
+> offroster row is the explicit **legacy** arm and keeps its old posture rule (no gain). An inactive
+> row, an unknown kind, a missing/foreign row or a read error enters NEITHER arm (fail closed). A valid API key is NOT memberhood. Tokens keep their effective-project attenuation.
+> Dashboard reads still route through the **`lib/auth/visibility` choke-points**
+> (`visibleItems`/`visibleDecisions`/`canSeeAccess`), now fed the reader's LABEL ceiling
+> (`contentLabelTier` — none for a member) on top of the oracle intersect — guarded by
+> `test/guards/dashboard-tier-filter.test.ts` and `test/guards/provenance-principal-callsites.test.ts`,
+> proven by the data-mechanics tier (`tierret1-*`). WRITE authority is separate and unchanged
+> (`canSeeProjectRow` for create destinations; `canWriteStructuredRow` — the same pre-TIERRET writer
+> rule applied to one row — for editing an existing task/decision), and read visibility must never be
+> used to authorize a write: a row the widened board SHOWS is not thereby editable. New surfaces must
+> carry the admission reader + an app-code gate + a guard; there is no RLS backstop.
 
 ---
 

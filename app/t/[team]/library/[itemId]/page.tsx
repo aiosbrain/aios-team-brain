@@ -31,22 +31,26 @@ export default async function LibraryItemPage({
     .eq("team_id", team.id)
     .eq("id", itemId)
     .maybeSingle();
-  // Tier check (no RLS backstop in postgres mode): hide above-tier items as 404 — and ENFB-1:
-  // the MEMBERSHIP oracle gates the body too (a restricted-initiative item 404s for a
-  // non-granted member, indistinguishable from absent, §5.7).
+  // ENFB-1: the MEMBERSHIP oracle gates the body (a restricted-initiative item 404s for a
+  // non-granted member, indistinguishable from absent, §5.7). TIERRET-1: the label check is the
+  // reader's admission ceiling — none for an admitted member, posture for a non-principal — so a
+  // granted team-labelled item opens here exactly as it lists. No RLS backstop in postgres mode.
   const me = await currentMember(team.id);
-  if (!item || !me || !canSeeAccess(me.tier, item.access as string)) notFound();
-  const { canSeeItem, canSeeProjectRow } = await import("@/lib/access/enforce");
+  if (!item || !me) notFound();
+  const { canSeeItem, canReadProjectRow } = await import("@/lib/access/enforce");
+  const { resolveContentAdmission, contentLabelTier } = await import("@/lib/access/admission");
   const { adminClient } = await import("@/lib/db/admin");
+  const labelTier = contentLabelTier(await resolveContentAdmission(adminClient(), team.id, me.id));
+  if (!canSeeAccess(labelTier, item.access as string)) notFound();
   if (!(await canSeeItem(adminClient(), { teamId: team.id, memberId: me.id }, itemId))) notFound();
 
   // ENFB-2 D3 (design round 2 H5): an entitled item can live in a container whose ROW the
   // viewer cannot see (cross-project curation) — the container link/slug renders only when
-  // the row is visible, otherwise the page reads as a container-less item (§5.7 for names).
+  // the row is READABLE, otherwise the page reads as a container-less item (§5.7 for names).
   const projectEmbed = item.projects as unknown as { slug: string } | null;
   const containerVisible =
     projectEmbed?.slug && item.project_id
-      ? await canSeeProjectRow(adminClient(), { teamId: team.id, memberId: me.id }, item.project_id as string)
+      ? await canReadProjectRow(adminClient(), { teamId: team.id, memberId: me.id }, item.project_id as string)
       : false;
   const project = containerVisible ? projectEmbed : null;
   const member = item.members as unknown as { display_name: string } | null;

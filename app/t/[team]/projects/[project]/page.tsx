@@ -53,14 +53,18 @@ export default async function ProjectPage({
 
   // ENFB-2 D3 (§5.7): the container page — its spine is the maximal title inventory — gates
   // on PROJECT-ROW visibility; membership-denied is byte-indistinguishable from an unknown
-  // slug (the SAME notFound). No member → notFound (fail closed).
+  // slug (the SAME notFound). No member → notFound (fail closed). TIERRET-1: this is a READ, so
+  // it takes the READER rule (`canReadProjectRow` — content-visible through the member's
+  // admission); the create actions keep the writer rule (`canSeeProjectRow`).
   const me = await currentMember(team.id);
-  const { canSeeProjectRow, visibleItemIds } = await import("@/lib/access/enforce");
-  if (!me || !(await canSeeProjectRow(db, { teamId: team.id, memberId: me.id }, project.id))) notFound();
-  // The spine intersects the item ORACLE (posture stays a conjunct via visibleItems); a
-  // resolution error serves an empty spine, never the unfiltered container.
-  const vis = await visibleItemIds((await import("@/lib/db/admin")).adminClient(), { teamId: team.id, memberId: me.id });
+  const { canReadProjectRow } = await import("@/lib/access/enforce");
+  if (!me || !(await canReadProjectRow(db, { teamId: team.id, memberId: me.id }, project.id))) notFound();
+  // The spine intersects the item ORACLE; the label tier is the reader's admission ceiling (none
+  // for an admitted member). A resolution error serves an empty spine, never the unfiltered container.
+  const { resolveContentView, contentLabelTier, provenanceCtxFor } = await import("@/lib/access/admission");
+  const vis = await resolveContentView((await import("@/lib/db/admin")).adminClient(), team.id, me.id);
   const visArr = vis.error ? [] : [...vis.ids];
+  const labelTier = contentLabelTier(vis.admission);
   const [{ data: items }, { data: decisions }, { data: roster }] = await Promise.all([
     visibleItems(
       db
@@ -70,16 +74,16 @@ export default async function ProjectPage({
         .eq("project_id", project.id)
         .in("id", visArr)
         .order("path"),
-      me?.tier ?? "external"
+      labelTier
     ),
     visibleDecisions(
       db
         .from("decisions")
-        .select("id, row_key, decided_at, title, decided_by, still_valid, source_item_id, created_by")
+        .select("id, row_key, decided_at, title, decided_by, still_valid, source_item_id, created_by, project_id")
         .eq("team_id", team.id)
         .eq("project_id", project.id)
         .order("decided_at", { ascending: false }),
-      me?.tier ?? "external"
+      labelTier
     ),
     db
       .from("members")
@@ -91,10 +95,12 @@ export default async function ProjectPage({
 
   const itemRows = (items ?? []) as Item[];
   // ENFB-2: the decisions table takes the ONE-owner provenance rule (the page previously
-  // served titles at posture with no provenance columns selected).
-  const { rowVisibleByProvenance } = await import("@/lib/access/provenance");
-  const decisionRows = ((decisions ?? []) as (Decision & { source_item_id?: string | null; created_by?: string | null })[]).filter((d) =>
-    rowVisibleByProvenance(d, vis.error ? null : vis.ids, me?.tier === "external" ? "external" : "team", "member")
+  // served titles at posture with no provenance columns selected). TIERRET-1: over the reader's
+  // admission ctx — the same value every other member surface uses.
+  const { rowVisibleByProvenanceCtx } = await import("@/lib/access/provenance");
+  const provCtx = provenanceCtxFor(vis);
+  const decisionRows = ((decisions ?? []) as (Decision & { source_item_id?: string | null; created_by?: string | null; project_id?: string | null })[]).filter((d) =>
+    rowVisibleByProvenanceCtx(d, provCtx)
   );
 
   // Spine: group items by top-level directory of path

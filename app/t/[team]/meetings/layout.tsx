@@ -30,11 +30,13 @@ export default async function MeetingsLayout({
   if (!me) return null;
 
   // ENFB-3: the list is bounded to the viewer's ORACLE set (loadMeetingNotes → the in-query
-  // intersect); external posture still gets [] (the coarse wall, unchanged).
+  // intersect). TIERRET-1: that oracle is the whole READ rule — an external-posture member sees the
+  // notes whose transcripts their grants reach (AC-07); the posture wall left the read path.
   const sorted = sortedMeetingNotes(await loadMeetingNotes(teamId, me.id, me.tier));
   // SPLIT flags (design round 2 M5): Upload keeps the posture bit (ordinary members upload
-  // meetings); Import is the repo's admin gate — a member-triggered TEAM-WIDE materialization
-  // job whose {created, scanned} counts disclose meetings the caller may not see (D1).
+  // meetings — a WRITE privilege TIERRET-1 deliberately leaves unchanged); Import is the repo's
+  // admin gate — a member-triggered TEAM-WIDE materialization job whose {created, scanned} counts
+  // disclose meetings the caller may not see (D1).
   const canUpload = me.tier === "team";
   const { canAccessAdmin } = await import("@/lib/auth/admin-access");
   const canImport = canAccessAdmin(me);

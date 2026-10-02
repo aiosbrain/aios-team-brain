@@ -19,12 +19,12 @@ export default async function TeamToolsPage({ params }: { params: Promise<{ team
   if (!team) return null;
 
   const me = await currentMember(team.id);
-  // Latest published blueprint for the team; tier-filtered in app code (no RLS in pg mode) —
-  // and ENFB-1: membership-gated (an invisible latest blueprint yields the next visible or the
-  // empty state; no member resolution → empty, fail closed).
-  const { visibleItemIds } = await import("@/lib/access/enforce");
+  // Latest published blueprint for the team; ENFB-1: membership-gated (an invisible latest
+  // blueprint yields the next visible or the empty state; no member resolution → empty, fail
+  // closed). TIERRET-1: label tier = the reader's admission ceiling (none for an admitted member).
+  const { resolveContentView, contentLabelTier } = await import("@/lib/access/admission");
   const { adminClient } = await import("@/lib/db/admin");
-  const vis = me ? await visibleItemIds(adminClient(), { teamId: team.id, memberId: me.id }) : null;
+  const vis = me ? await resolveContentView(adminClient(), team.id, me.id) : null;
   const { data } = vis && !vis.error && vis.ids.size > 0
     ? await visibleItems(
         db
@@ -35,7 +35,7 @@ export default async function TeamToolsPage({ params }: { params: Promise<{ team
           .in("id", [...vis.ids])
           .order("updated_at", { ascending: false })
           .limit(1),
-        me!.tier
+        contentLabelTier(vis.admission)
       ).maybeSingle()
     : { data: null };
   const bp = data as BlueprintItem | null;

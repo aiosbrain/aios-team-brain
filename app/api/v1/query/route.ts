@@ -143,15 +143,14 @@ export async function POST(req: NextRequest) {
     .maybeSingle();
   const timeZone = pickTimezone([prof?.timezone, DEFAULT_TIMEZONE]);
 
-  // Access enforcement (spec §5.2/§5.8b/§10). Members: on an 'enforcing' team, retrieval filters
-  // to the member's membership-visible items (permissive → null → byte-identical to today).
-  // Delegated tokens: ALWAYS attenuated to the live triple intersection — flag-independent; a
-  // permissive team must never widen a scoped token to full-corpus answers. Graph legs (PCCC-6):
-  // team-tier MEMBERS get the K-capped partitioned leg via graphProjectIds; external members and
-  // delegated tokens keep the §5.8b omit. Any error fails closed (500).
+  // Access enforcement (spec §5.2/§5.8b/§10). Delegated tokens: ALWAYS attenuated to the live triple
+  // intersection. Every other key: the admission resolver's arm (TIERRET-1) — an admitted member's
+  // membership-visible items and its K-capped graph partitions (graphProjectIds, either posture);
+  // a legacy connector/offroster key gets no graph scope. Tokens keep the §5.8b omit. Any error
+  // fails closed (500).
   let enforce: import("@/lib/query/retrieve").RetrieveEnforce | null = null;
   try {
-    const { visibleItemIds, delegatedVisibleItemIds } = await import("@/lib/access/enforce");
+    const { delegatedVisibleItemIds } = await import("@/lib/access/enforce");
     if (agent) {
       const { ids, projectIds } = await delegatedVisibleItemIds(db, agent);
       // QMIR-1: a delegated token is `principal: "token"` — the org-structural mirror legs stay
@@ -161,14 +160,15 @@ export async function POST(req: NextRequest) {
       // here, which would be a second oracle read free to disagree with the first.
       enforce = { visibleItemIds: ids, principal: "token", tokenProjectIds: projectIds };
     } else {
-      // PRET-6: enforcing is the only behavior — the member arm is unconditional.
-      const { ids, projectIds } = await visibleItemIds(db, { teamId, memberId: auth!.memberId });
-      // PCCC-6, widened by PRET-4 §1b (ruling 2): EVERY member principal gets the graph leg
-      // over their oracle-resolved partitions — an external member's projectIds resolve their
-      // granted projects, so their graph scope is exactly their membership. The delegated path
-      // above still passes NO graphProjectIds (token omit, program §8). QMIR-1's
-      // `principal: "member"` readmits the org-structural mirror legs for every member.
-      enforce = { visibleItemIds: ids, principal: "member", graphProjectIds: projectIds };
+      // PRET-6: enforcing is the only behavior — enforcement is always constructed (no flag read,
+      // no permissive null arm). TIERRET-1: that does NOT make every `aios_` key a member. The ONE
+      // admission resolver decides, unconditionally: an admitted member (active human/standing agent) gets its oracle item
+      // set, its hand-entered authority and its graph partitions (PCCC-6/PRET-4 ruling 2 — exactly
+      // its membership); a connector/offroster key gets the explicit LEGACY arm — the baseline it
+      // already had (no sourced items, posture hand-entered rule, org-structure legs) and no graph
+      // scope. A resolution error throws into the 500 below.
+      const { resolveContentView, retrieveEnforceFor } = await import("@/lib/access/admission");
+      enforce = retrieveEnforceFor(await resolveContentView(db, teamId, auth!.memberId));
     }
   } catch {
     return errorResponse("internal", "enforcement check failed", 500);

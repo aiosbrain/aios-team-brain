@@ -245,21 +245,23 @@ export interface VisibleProjectRows {
 }
 
 /**
- * AUDITFIX-1 §2b. The three project-row helpers below (`visibleProjectRows`, `canSeeProjectRow`,
- * `visibleProjectCards`) are member-only, and as of Codex's diff review they are member-only BY
- * TYPE rather than only by call-site enumeration.
+ * AUDITFIX-1 §2b. The project-row helpers below are session/`aios_`-only, and as of Codex's diff
+ * review they are so BY TYPE rather than only by call-site enumeration: they take a
+ * `MemberPrincipal`, which cannot carry a token scope.
  *
- * The review's point was sharp: they took a `Principal`, whose `projectScope` makes it token-shaped,
- * while unconditionally asserting memberhood inside. That combination is a footgun the type system
- * endorsed — a future token route could legitimately call `visibleProjectRows(db, tokenPrincipal)`,
- * get the hand-typed arm opened for it, and redden nothing, because the member literal lives in this
- * allow-listed file and the new caller need not contain one. So the parameter is now
- * `MemberPrincipal`, which cannot carry a scope, and the assertion inside is true by construction.
- *
- * The value is still named once, HERE, rather than spelled at each call site — a bare `"member"`
- * literal scattered through the file is the shape a future token path would copy.
+ * TIERRET-1 split them by PURPOSE (spec "Authority and admission contracts"):
+ *   · WRITER — `visibleProjectRows` / `canSeeProjectRow` keep the pre-TIERRET predicate EXACTLY
+ *     (posture conjuncts on every content arm; the hand-entered arm by raw posture — now spelled as
+ *     the explicit `legacy` arm, which IS that rule). Their callers decide where a member may FILE a
+ *     task/decision or scope a token: the create actions, the create dropdowns, the agent-token
+ *     picker, `/api/v1/projects`. A newly READABLE container must not silently become a new write
+ *     destination.
+ *   · READER — `readableProjectRows` / `canReadProjectRow` / `visibleProjectCards` take the
+ *     member-content admission (`lib/access/admission.ts`): an admitted member's content arms carry
+ *     no label conjunct and its hand-entered arm is Everyone-or-grants; a legacy reader keeps the
+ *     writer rule. Container pages, the projects list and container slugs use these.
  */
-const MEMBER_ONLY_SURFACE = "member" as const;
+const LEGACY_WRITER_RULE = "legacy" as const;
 
 /**
  * A principal that CANNOT be a delegated token. `projectScope?: never` makes a token-shaped value a
@@ -270,40 +272,63 @@ const MEMBER_ONLY_SURFACE = "member" as const;
 export type MemberPrincipal = Principal & { projectScope?: never };
 
 /**
- * The discriminator is a parameter of this SQL builder so the policy stays in one place
- * (`admitsUnsourced`), and its three callers below all pass `MEMBER_ONLY_SURFACE` — which is honest
- * only because they now take a `MemberPrincipal` that cannot be a token. An earlier version of this
- * comment claimed the parameterisation itself was the safety property; it was not, and Codex's diff
- * review caught the claim before the type made it true.
+ * The project-row SQL. `rule` is the reader identity: `labelCeiling` adds the pre-TIERRET audience
+ * conjunct to every content arm (`(posture or label = 'external')` — Fable diff L10's "rows never
+ * exceed what the container's own surfaces list"), and `ctx` carries the provenance discriminator.
+ * The WRITER rule passes the legacy arm with raw posture and a posture-derived ceiling, which is
+ * byte-for-byte the predicate this function had before TIERRET-1.
  */
 function projectRowVisibleSql(
   teamId: string,
   granted: readonly string[],
-  teamPosture: boolean,
-  principal: "member" | "token" | undefined
+  rule: { labelCeiling: boolean; ctx: Omit<ProvenanceSqlCtx, "teamId" | "grantedProjectIds"> }
 ) {
   const p = newSqlParams();
-  const ctx: ProvenanceSqlCtx = { teamId, grantedProjectIds: granted, teamPosture, principal };
+  const ctx: ProvenanceSqlCtx = { teamId, grantedProjectIds: granted, ...rule.ctx };
   const team = p.add(teamId);
   const grantedPh = p.add([...granted]);
-  // Posture stays a CONJUNCT on every content arm (Fable diff L10): an external-posture
-  // member's row-visibility must not exceed what the container's own surfaces would list for
-  // them (membership ∧ audience, matching the pages' visibleItems/visibleTasks walls).
-  const posture = p.add(teamPosture);
+  const noCeiling = p.add(!rule.labelCeiling);
   const where = `p.team_id = ${team} and (
       p.id = any(${grantedPh}::uuid[])
-      or exists (select 1 from items i where i.team_id = ${team} and i.project_id = p.id and (${posture} or i.access = 'external') and ${itemVisibleSql("i.id", p, ctx)})
-      or exists (select 1 from tasks t where t.team_id = ${team} and t.project_id = p.id and (${posture} or t.audience = 'external') and ${provenanceRowSql("t", p, ctx)})
-      or exists (select 1 from decisions d where d.team_id = ${team} and d.project_id = p.id and (${posture} or d.audience = 'external') and ${provenanceRowSql("d", p, ctx)})
+      or exists (select 1 from items i where i.team_id = ${team} and i.project_id = p.id and (${noCeiling} or i.access = 'external') and ${itemVisibleSql("i.id", p, ctx)})
+      or exists (select 1 from tasks t where t.team_id = ${team} and t.project_id = p.id and (${noCeiling} or t.audience = 'external') and ${provenanceRowSql("t", p, ctx)})
+      or exists (select 1 from decisions d where d.team_id = ${team} and d.project_id = p.id and (${noCeiling} or d.audience = 'external') and ${provenanceRowSql("d", p, ctx)})
     )`;
   return { p, where };
 }
 
+/** The pre-TIERRET rule — posture ceiling + raw-posture hand-entered arm — for WRITE destinations. */
+async function writerRule(db: DbClient, principal: MemberPrincipal) {
+  const { projectIds } = await visibleProjects(db, principal);
+  const posture = await teamPostureFor(db, principal);
+  return {
+    granted: [...projectIds],
+    rule: { labelCeiling: !posture, ctx: { teamPosture: posture, principal: LEGACY_WRITER_RULE } },
+  };
+}
+
+/** TIERRET-1: the READ rule, from the one admission resolver (throws on any resolution error). */
+async function readerRule(db: DbClient, principal: MemberPrincipal) {
+  const { resolveContentAdmission, contentReaderFor, contentLabelTier, provenanceCtxForReader } = await import(
+    "@/lib/access/admission"
+  );
+  const admission = await resolveContentAdmission(db, principal.teamId, principal.memberId);
+  const reader = contentReaderFor(admission);
+  const prov = provenanceCtxForReader(reader, new Set());
+  return {
+    granted: admission.kind === "member" ? [...admission.grantedProjectIds] : [],
+    rule: {
+      labelCeiling: contentLabelTier(admission) === "external",
+      ctx: { teamPosture: prov.teamPosture, principal: prov.principal, memberProjectIds: prov.memberProjectIds },
+    },
+  };
+}
+
+/** WRITER predicate — where this member may file/scope. Unchanged by TIERRET-1 (see header). */
 export async function visibleProjectRows(db: DbClient, principal: MemberPrincipal): Promise<VisibleProjectRows> {
   try {
-    const { projectIds } = await visibleProjects(db, principal);
-    const posture = await teamPostureFor(db, principal);
-    const { p, where } = projectRowVisibleSql(principal.teamId, [...projectIds], posture, MEMBER_ONLY_SURFACE);
+    const { granted, rule } = await writerRule(db, principal);
+    const { p, where } = projectRowVisibleSql(principal.teamId, granted, rule);
     const res = await runSql<{ id: string }>(`select p.id from projects p where ${where}`, p.values);
     return { ids: new Set(res.rows.map((r) => r.id)) };
   } catch {
@@ -311,11 +336,11 @@ export async function visibleProjectRows(db: DbClient, principal: MemberPrincipa
   }
 }
 
+/** WRITER predicate, by id — the create actions' authorization. Unchanged by TIERRET-1. */
 export async function canSeeProjectRow(db: DbClient, principal: MemberPrincipal, projectId: string): Promise<boolean> {
   try {
-    const { projectIds } = await visibleProjects(db, principal);
-    const posture = await teamPostureFor(db, principal);
-    const { p, where } = projectRowVisibleSql(principal.teamId, [...projectIds], posture, MEMBER_ONLY_SURFACE);
+    const { granted, rule } = await writerRule(db, principal);
+    const { p, where } = projectRowVisibleSql(principal.teamId, granted, rule);
     const idPh = p.add(projectId);
     const res = await runSql<{ id: string }>(
       `select p.id from projects p where p.id = ${idPh} and ${where} limit 1`,
@@ -327,7 +352,74 @@ export async function canSeeProjectRow(db: DbClient, principal: MemberPrincipal,
   }
 }
 
-/** The projects-LIST card read (ENFB-2 §1 row 1): row-visible non-system projects with
+/**
+ * WRITER predicate for an EXISTING structured row — the edit/move/validity actions' authorization
+ * (TIERRET-1 code review 1, HIGH-1). The member READ rule widened, so the board and decisions page
+ * now hand an external collaborator the ids of rows it could never reach before; a server action is
+ * a POST endpoint, so "the row is on my screen" must not become "I may edit it and project it to
+ * the PM tool". The rule is the pre-TIERRET ROW predicate exactly — the writer rule above applied to
+ * one row: the posture label ceiling (`audience = 'external'` unless team posture), a sourced row's
+ * source item membership-visible, a hand-entered row `created_by`-proven at team posture. It is NOT
+ * `canSeeProjectRow`: a directly granted container does not prove row provenance, and a container
+ * conjunct would refuse rows the old board let a member edit. Never the reader helpers.
+ * Fail-closed: a foreign/absent row, any resolution or read error → false.
+ */
+const STRUCTURED_WRITE_TABLES = { tasks: "tasks", decisions: "decisions" } as const;
+
+export async function canWriteStructuredRow(
+  db: DbClient,
+  principal: MemberPrincipal,
+  table: keyof typeof STRUCTURED_WRITE_TABLES,
+  rowId: string
+): Promise<boolean> {
+  try {
+    const { granted, rule } = await writerRule(db, principal);
+    const p = newSqlParams();
+    const ctx: ProvenanceSqlCtx = { teamId: principal.teamId, grantedProjectIds: granted, ...rule.ctx };
+    const idPh = p.add(rowId);
+    const team = p.add(principal.teamId);
+    const noCeiling = p.add(!rule.labelCeiling);
+    const res = await runSql<{ id: string }>(
+      `select r.id from ${STRUCTURED_WRITE_TABLES[table]} r
+        where r.id = ${idPh} and r.team_id = ${team}
+          and (${noCeiling} or r.audience = 'external')
+          and ${provenanceRowSql("r", p, ctx)}
+        limit 1`,
+      p.values
+    );
+    return res.rows.length > 0;
+  } catch {
+    return false; // fail closed
+  }
+}
+
+/** READER predicate (TIERRET-1): which projects' names/slugs/counts this member may SEE — granted,
+ *  or holding content their admission serves. Fail-closed: any resolution error → empty + flagged. */
+export async function readableProjectRows(db: DbClient, principal: MemberPrincipal): Promise<VisibleProjectRows> {
+  try {
+    const { granted, rule } = await readerRule(db, principal);
+    const { p, where } = projectRowVisibleSql(principal.teamId, granted, rule);
+    const res = await runSql<{ id: string }>(`select p.id from projects p where ${where}`, p.values);
+    return { ids: new Set(res.rows.map((r) => r.id)) };
+  } catch {
+    return { ids: new Set(), error: true };
+  }
+}
+
+/** READER predicate, by id — container pages and container slugs. Never a write authorization. */
+export async function canReadProjectRow(db: DbClient, principal: MemberPrincipal, projectId: string): Promise<boolean> {
+  try {
+    const { granted, rule } = await readerRule(db, principal);
+    const { p, where } = projectRowVisibleSql(principal.teamId, granted, rule);
+    const idPh = p.add(projectId);
+    const res = await runSql<{ id: string }>(`select p.id from projects p where p.id = ${idPh} and ${where} limit 1`, p.values);
+    return res.rows.length > 0;
+  } catch {
+    return false; // fail closed
+  }
+}
+
+/** The projects-LIST card read (ENFB-2 §1 row 1): READABLE non-system projects with
  *  VIEWER-VISIBLE item/task counts — the `items(count)`/`tasks(count)` embeds counted
  *  per-project TOTALS (invisible content included), so they are replaced, not filtered. */
 export interface ProjectRowCard {
@@ -344,26 +436,20 @@ export async function visibleProjectCards(
   principal: MemberPrincipal
 ): Promise<{ rows: ProjectRowCard[]; error?: boolean }> {
   try {
-    const { projectIds } = await visibleProjects(db, principal);
-    const posture0 = await teamPostureFor(db, principal);
-    const { p, where } = projectRowVisibleSql(principal.teamId, [...projectIds], posture0, MEMBER_ONLY_SURFACE);
+    const { granted, rule } = await readerRule(db, principal);
+    const { p, where } = projectRowVisibleSql(principal.teamId, granted, rule);
     // AUDITFIX-1: the count ctx takes the SAME discriminator as the row rule above. Omitting it here
     // is not fail-safe — it silently CLOSES the hand-typed arm for a member, so a card would report
-    // fewer tasks than the project page lists. That is a member-visible regression, and this slice
-    // narrows tokens only (§1). Pinned by the visibleTasks assertion in enfb2-project-rows.
-    const ctx: ProvenanceSqlCtx = {
-      teamId: principal.teamId,
-      grantedProjectIds: [...projectIds],
-      teamPosture: posture0,
-      principal: MEMBER_ONLY_SURFACE,
-    };
-    // The card counts carry the SAME posture conjuncts as the row rule and the detail page's
-    // walls (Fable diff L10 — counts must never exceed what the container page lists).
-    const posture = p.add(posture0);
+    // fewer tasks than the project page lists. Pinned by the visibleTasks assertion in enfb2-project-rows.
+    const ctx: ProvenanceSqlCtx = { teamId: principal.teamId, grantedProjectIds: granted, ...rule.ctx };
+    // The card counts carry the SAME label rule as the row rule and the detail page (Fable diff
+    // L10 — counts must never exceed what the container page lists). TIERRET-1: for an admitted
+    // member that rule has no label conjunct, so the counts describe exactly what it is served.
+    const noCeiling = p.add(!rule.labelCeiling);
     const res = await runSql<{ id: string; slug: string; name: string; last_synced_at: string | Date | null; visible_items: number; visible_tasks: number }>(
       `select p.id, p.slug, p.name, p.last_synced_at,
-              (select count(*) from items i where i.team_id = p.team_id and i.project_id = p.id and (${posture} or i.access = 'external') and ${itemVisibleSql("i.id", p, ctx)})::int as visible_items,
-              (select count(*) from tasks t where t.team_id = p.team_id and t.project_id = p.id and (${posture} or t.audience = 'external') and ${provenanceRowSql("t", p, ctx)})::int as visible_tasks
+              (select count(*) from items i where i.team_id = p.team_id and i.project_id = p.id and (${noCeiling} or i.access = 'external') and ${itemVisibleSql("i.id", p, ctx)})::int as visible_items,
+              (select count(*) from tasks t where t.team_id = p.team_id and t.project_id = p.id and (${noCeiling} or t.audience = 'external') and ${provenanceRowSql("t", p, ctx)})::int as visible_tasks
          from projects p
         where p.kind <> 'system' and ${where}
         order by p.last_synced_at desc nulls last`,

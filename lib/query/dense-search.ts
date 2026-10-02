@@ -8,9 +8,10 @@ import type { Source } from "./provider";
 
 /**
  * Query-time dense (semantic) passage retrieval over `item_chunks`. Embeds the question, runs an
- * HNSW cosine-distance search (best chunk per item), and returns hits in ascending distance. Tier is
- * enforced in-DB on the LIVE `items.access` (the authoritative copy) — external callers never get
- * team content. Best-effort + optional: returns [] unless EMBEDDINGS_URL is set AND the pgvector
+ * HNSW cosine-distance search (best chunk per item), and returns hits in ascending distance. Access is
+ * the caller's membership-visible item set (the oracle set), applied in-DB; there is no label
+ * (`items.access`) filter (PRET-6/TIERRET-1 — membership is the member read rule), and `tier` is
+ * accepted but does not filter. Best-effort + optional: returns [] unless EMBEDDINGS_URL is set AND the pgvector
  * schema is loaded, and on any error, so retrieval degrades to keyword FTS + Graphiti.
  */
 

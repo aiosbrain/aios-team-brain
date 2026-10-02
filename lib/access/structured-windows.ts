@@ -1,6 +1,6 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
-import { newSqlParams, provenanceRowSqlFromIds } from "@/lib/access/provenance-sql";
+import { newSqlParams, provenanceRowSqlFromIds, type ProvenanceIdsCtx } from "@/lib/access/provenance-sql";
 
 /**
  * The app-layer structured WINDOWS (ENFB-2 §2.2) — capped task/decision reads whose
@@ -10,15 +10,16 @@ import { newSqlParams, provenanceRowSqlFromIds } from "@/lib/access/provenance-s
  * it, and pinned by the guard's TITLE_SURFACE_WIRING.
  */
 
-export interface ProvenanceCtx {
-  visibleItemIds: ReadonlySet<string>;
-  teamPosture: boolean;
-  /** WHO is asking (AUDITFIX-1). These windows serve session/aios_ MEMBERS only. */
-  principal?: "member" | "token";
-}
+/**
+ * WHO is asking and with what hand-entered authority (AUDITFIX-1; TIERRET-1). These windows serve
+ * session/`aios_` readers only, and their ctx comes from `lib/access/admission.ts#provenanceCtxFor`
+ * (member or legacy arm). The `externalAudienceOnly` argument each window takes is the reader's
+ * LABEL ceiling (`contentLabelTier(admission) === "external"`) — false for an admitted member.
+ */
+export type ProvenanceCtx = ProvenanceIdsCtx;
 
 /** The tasks BOARD's 500-row window (app/t/[team]/tasks) — column list matches the board's
- *  previous builder select verbatim; audience conjunct preserved. */
+ *  previous builder select verbatim; the label conjunct applies only under a label ceiling. */
 export async function boardTaskWindow<T>(teamId: string, ctx: ProvenanceCtx, externalAudienceOnly: boolean): Promise<T[]> {
   const p = newSqlParams();
   const access = externalAudienceOnly ? `and t.audience = 'external'` : "";
@@ -89,7 +90,10 @@ export interface TaskFeedRow {
  *  grant does not bump `updated_at` — so a row hidden at pull time that is granted later sits
  *  behind every client cursor until a re-push/edit moves it. That is D2's ruling (repair is
  *  re-establishing provenance via re-sync), stated here so a stale-markdown report starts at
- *  this comment instead of a debugging session. */
+ *  this comment instead of a debugging session. TIERRET-1 (AC-14) hits exactly this: rows newly
+ *  admitted by the label-ceiling retirement are OLDER than every client cursor, so the release
+ *  notes require a full re-pull (reset `last_tasks_pull`/`last_sync_tasks_pull`/`last_decisions_pull`
+ *  /`last_pull` to epoch) — the server's cursor semantics are deliberately unchanged. */
 export async function taskFeedWindow(teamId: string, ctx: ProvenanceCtx, opts: TaskFeedWindowOpts): Promise<TaskFeedRow[]> {
   const p = newSqlParams();
   const conds = [

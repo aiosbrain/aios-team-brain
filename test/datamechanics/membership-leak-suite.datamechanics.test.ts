@@ -9,7 +9,12 @@ import { createMember } from "@/lib/admin/members";
 import { createGroup, addMemberToGroup, grantProjectToGroup } from "@/lib/access/groups";
 import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
-import { visibleItemIds, memberEnforcement } from "@/lib/access/enforce";
+import { visibleItemIds } from "@/lib/access/enforce";
+import { contentTimelineEnforcement } from "@/lib/access/admission";
+
+/** TIERRET-1: the timeline's production enforcement — item set + the admission READER. */
+const memberEnforcement = (d: ReturnType<typeof db>, p: { teamId: string; memberId: string }) =>
+  contentTimelineEnforcement(d, p.teamId, p.memberId);
 import { visibleProjects } from "@/lib/access/oracle";
 import { retrieve } from "@/lib/query/retrieve";
 import { selectEnforcedGraphPartitions, resolveArcScope } from "@/lib/graph/partition-read";
@@ -276,8 +281,8 @@ describe("PRET-5 A5 — structure serves every member", () => {
   });
 });
 
-describe("PRET-5 A6 — the timeline wall drop (the §1 change)", () => {
-  it("X's team evidence reaches the member's ledger; Y's ABSENT; a null-source hand-typed team task ABSENT; a meeting note in X ABSENT", async () => {
+describe("PRET-5 A6 — the timeline wall drop (the §1 change), completed by TIERRET-1", () => {
+  it("X's team evidence, X's hand-typed task and X's meeting reach the member's ledger; Y's ABSENT", async () => {
     const F: Fixture = await buildFixture();
     // Evidence: git + slack items in X, one in Y; a sourced task heading X's evidence; a
     // decision sourced from X; a null-source hand-typed task; a meeting note sourced from X.
@@ -303,7 +308,7 @@ describe("PRET-5 A6 — the timeline wall drop (the §1 change)", () => {
     // the one-condition-per-fixture rule caught it).
     const gitHT = await ingest(F.seed, {
       path: "commits/ht1.md",
-      body: `chore: hand-typed follow-up (HT-1) ${TERM_X}`,
+      body: `chore: hand-typed follow-up (HT-1) (HT-2) ${TERM_X}`,
       access: "team",
       project: "src",
       kind: "deliverable",
@@ -324,6 +329,11 @@ describe("PRET-5 A6 — the timeline wall drop (the §1 change)", () => {
     await db()
       .from("tasks")
       .insert({ team_id: F.seed.teamId, project_id: F.projectXId, row_key: "HT-1", title: "Hand-typed team task", assignee: "Tester", status: "in_progress", source_item_id: null, created_by: F.seed.memberId, audience: "team", origin: "ui" });
+    // TIERRET-1 negative twin: a hand-typed task in an UNGRANTED project (Y) — the member's
+    // hand-entered arm is its GRANTED projects, not every project (AC-04 revised).
+    await db()
+      .from("tasks")
+      .insert({ team_id: F.seed.teamId, project_id: F.projectYId, row_key: "HT-2", title: "Hand-typed Y task", assignee: "Tester", status: "in_progress", source_item_id: null, created_by: F.seed.memberId, audience: "team", origin: "ui" });
     // The link-target leak channel (Codex M1): a NON-ACTIVE task sourced from INVISIBLE Y,
     // whose key is cited by VISIBLE X evidence — reachable only via the all-status read; its
     // title must never surface for this member.
@@ -368,15 +378,19 @@ describe("PRET-5 A6 — the timeline wall drop (the §1 change)", () => {
     expect(flat, "an invisible-source task's title never surfaces via link-target maps (Codex M1's leak channel)").not.toContain("Y secret linked task");
     expect(flat, "X's decision flows").toContain("X decision");
     expect(flat, "Y's evidence never flows").not.toContain("y secret");
-    expect(flat, "the null-source hand-typed team task stays walled (H2 ruling)").not.toContain("Hand-typed team task");
-    expect(flat, "meeting notes keep the posture gate (the kept carve-out)").not.toContain("X standup");
+    // TIERRET-1 (AC-04 revised): PRET-5 H2's "a hand-typed task belongs to NO project" premise was
+    // false (AUDITFIX-7: it carries project_id). The member's GRANTED project X admits it…
+    expect(flat, "the hand-typed task in the granted project now flows").toContain("Hand-typed team task");
+    // …and an ungranted project's hand-typed task does not, even though the same visible commit cites it.
+    expect(flat, "a hand-typed task in an ungranted project never flows").not.toContain("Hand-typed Y task");
+    // TIERRET-1 (AC-07): PRET-5's "kept carve-out" is retired — the transcript oracle is the read rule.
+    expect(flat, "the meeting whose transcript X grants flows at external posture").toContain("X standup");
 
-    // POSITIVE CONTROL for the carve-out (diff-review H1): a TEAM-POSTURE member GRANTED X
-    // does see the meeting — so the external absence above is provably the posture gate, not
-    // an unattributable-note artifact (nor an oracle one: this viewer has the same X grant).
+    // CONTROL: a viewer with the SAME X grant at TEAM posture sees the same meeting — posture is no
+    // longer what decides it (the absence of a difference is the property).
     expect((await addMemberToGroup(db(), F.seed.teamId, F.groupXMembersId, F.seed.memberId, F.seed.memberId)).ok).toBe(true);
     const teamDays = await getWorkTimeline(db(), F.seed.teamId, "team", 14, await memberEnforcement(db(), { teamId: F.seed.teamId, memberId: F.seed.memberId }));
-    expect(JSON.stringify(teamDays), "the entitled viewer sees the meeting").toContain("X standup");
+    expect(JSON.stringify(teamDays), "the entitled team-posture viewer sees the meeting too").toContain("X standup");
   });
 });
 

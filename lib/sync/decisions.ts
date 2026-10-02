@@ -1,10 +1,9 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
-import { isRestrictedTier } from "@/lib/auth/visibility";
 import { runSql } from "@/lib/db/pg/pool";
-import { newSqlParams, provenanceRowSqlFromIds } from "@/lib/access/provenance-sql";
+import { newSqlParams, provenanceRowSqlFromIds, labelCeilingApplies, type ProvenanceIdsCtx } from "@/lib/access/provenance-sql";
 
-/** Tier of the pulling principal (the API key's member tier). */
+/** Tier of the pulling principal (the API key's member POSTURE — the legacy arm's label ceiling). */
 export type ViewerTier = "team" | "external";
 
 export interface DecisionWritebackRow {
@@ -35,15 +34,17 @@ export interface DecisionWritebackGroup {
  * before the 500-row window — a caller receives a window of rows it may see that will all
  * serve (design round 1 F3: an app-side mode filter after LIMIT re-opens starvation).
  *
- * Tier isolation (no RLS on postgres — the audience conjunct is the sole posture
- * enforcement): an `external` viewer receives only `audience='external'` decisions.
+ * TIERRET-1: an admitted member's rows are decided by provenance alone (sourced → source item
+ * visible; hand-entered → Everyone or the member's granted projects). The `audience='external'`
+ * conjunct is the LABEL ceiling and applies only where `labelCeilingApplies` says so — the legacy
+ * (non-principal key) arm at external posture, exactly as before. No RLS backstop either way.
  */
 export async function getDecisionWriteback(
   db: DbClient,
   teamId: string,
   tier: ViewerTier,
   since: string,
-  enforce: { visibleItemIds: ReadonlySet<string>; teamPosture: boolean; principal?: "member" | "token" }
+  enforce: ProvenanceIdsCtx
 ): Promise<DecisionWritebackGroup[]> {
   void db; // the feed reads through the shared pool (raw SQL); kept for signature stability
   const p = newSqlParams();
@@ -55,7 +56,7 @@ export async function getDecisionWriteback(
     // above) OR a synced row edited after its source item's push.
     `(d.source_item_id is null or (i.synced_at is not null and d.updated_at > i.synced_at))`,
   ];
-  if (isRestrictedTier(tier)) conds.push(`d.audience = 'external'`);
+  if (labelCeilingApplies(enforce.principal, tier)) conds.push(`d.audience = 'external'`);
 
   const res = await runSql<{
     row_key: string;

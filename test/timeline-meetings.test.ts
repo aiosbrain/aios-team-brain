@@ -120,7 +120,9 @@ describe("meetings on the person card (spec: meeting-participation-as-work-v1)",
     // dropping the bump back to 11 sails straight through it — which is the v8 incident class the
     // guard's own comment records. MIN_SALVAGEABLE_VERSION must NOT follow the bump: raising it blanks
     // every person-day summary, a regression reported twice as "we've lost the summaries".
-    expect(PAYLOAD_VERSION).toBe(14); // v14: PRET-6 tier-row retirement (meaning change, shape identical)
+    // v16: TIERRET-1 member-admission cutover (meaning change, shape identical). 15 is reserved by the
+    // pending Slack-semantics PR #714 and deliberately skipped; isolation itself is the `adm:` namespace.
+    expect(PAYLOAD_VERSION).toBe(16);
     expect(MIN_SALVAGEABLE_VERSION).toBe(11);
     expect(MIN_SALVAGEABLE_VERSION).toBeLessThan(PAYLOAD_VERSION);
   });

@@ -9,9 +9,10 @@ export const runtime = "nodejs";
 
 // GET /api/v1/items/<id> — fetch a single item on demand (e.g. one deliverable).
 // ENFB-1: the MEMBERSHIP oracle gates the read (the list/by-id disagreement closed — a row the
-// list omits can no longer be fetched by id); the posture arm stays as the coarse outer wall.
-// A membership-denied id returns the SAME 404 as an absent one (§5.7 — absent and invisible
-// are indistinguishable).
+// list omits can no longer be fetched by id). TIERRET-1: the old posture arm is now the reader's
+// LABEL ceiling from the admission resolver — none for an admitted member (so by-id agrees with
+// the membership-only list), the posture ceiling for a legacy key. A membership-denied id returns
+// the SAME 404 as an absent one (§5.7 — absent and invisible are indistinguishable).
 export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const auth = await authenticateApiKey(req);
   if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
@@ -30,6 +31,13 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
   if (!(await canSeeItem(db, { teamId: auth.teamId, memberId: auth.memberId }, id))) {
     return NOT_FOUND();
   }
+  let labelTier: "team" | "external";
+  try {
+    const { resolveContentAdmission, contentLabelTier } = await import("@/lib/access/admission");
+    labelTier = contentLabelTier(await resolveContentAdmission(db, auth.teamId, auth.memberId));
+  } catch {
+    return errorResponse("internal", "access resolution failed", 500); // fail closed, never a default
+  }
 
   let q = db
     .from("items")
@@ -37,7 +45,7 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
     .eq("team_id", auth.teamId)
     .eq("id", id)
     .limit(1);
-  if (isRestrictedTier(auth.memberTier)) q = q.eq("access", "external");
+  if (isRestrictedTier(labelTier)) q = q.eq("access", "external");
 
   const { data, error } = await q;
   if (error) return errorResponse("internal", error.message, 500);

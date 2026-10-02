@@ -4,9 +4,15 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient, type GraphFact } from "@/lib/graph/graphiti-client";
 import { selectEnforcedGraphPartitions } from "@/lib/graph/partition-read";
-import { isRestrictedTier } from "@/lib/auth/visibility";
 import { runSql } from "@/lib/db/pg/pool";
-import { newSqlParams, provenanceRowSqlFromIds, type MemberTag, type TokenTag } from "@/lib/access/provenance-sql";
+import {
+  newSqlParams,
+  provenanceRowSqlFromIds,
+  labelCeilingApplies,
+  type MemberTag,
+  type LegacyTag,
+  type TokenTag,
+} from "@/lib/access/provenance-sql";
 import {
   selectedProviderName,
   type RetrievalProvider,
@@ -173,6 +179,23 @@ export type RetrieveEnforce =
       visibleItemIds: ReadonlySet<string>;
       graphProjectIds?: readonly string[];
       principal: MemberTag;
+      /** TIERRET-1: oracle-accepted Everyone (the hand-entered `all` arm). REQUIRED — built only by
+       *  `lib/access/admission.ts#retrieveEnforceFor`; never raw posture. */
+      memberEveryone: boolean;
+      /** TIERRET-1: the member's oracle GRANTED project set — the hand-entered arm for a member that
+       *  is not Everyone. REQUIRED for the same M13 reason as `tokenProjectIds`. */
+      memberProjectIds: readonly string[];
+      tokenProjectIds?: undefined;
+    }
+  | {
+      // TIERRET-1: a valid key/session whose ACTIVE member is NOT a principal (connector/offroster).
+      // Baseline-preserving: posture rule for hand-entered rows (from the route's tier), the
+      // org-structural legs it already had, and NO graph scope.
+      visibleItemIds: ReadonlySet<string>;
+      graphProjectIds?: undefined;
+      principal: LegacyTag;
+      memberEveryone?: undefined;
+      memberProjectIds?: undefined;
       tokenProjectIds?: undefined;
     }
   | {
@@ -182,6 +205,8 @@ export type RetrieveEnforce =
       /** The token's effective project set. REQUIRED: an omitted forward looks exactly like the
        *  fail-closed default and so reddens nothing on its own (the M13 lesson). */
       tokenProjectIds: readonly string[];
+      memberEveryone?: undefined;
+      memberProjectIds?: undefined;
     };
 
 /** The wire half of the graph leg, injectable for tests (the client was previously constructed
@@ -478,7 +503,14 @@ async function nativeRetrieve(
   // surface); tokens and both default-deny arms (absent/foreign principal) do not. The POSITIVE
   // `=== "member"` test is the rule — a `!== "token"` negation would fail OPEN for a future
   // constructor that omits the field (guard-pinned).
-  const serveOrgStructural = enforce?.principal === "member";
+  // TIERRET-1: the explicit LEGACY arm (a valid ordinary key whose member is a connector/offroster)
+  // keeps these legs because it HAD them — the query route labelled every ordinary key "member"
+  // before admission existed. Preserved, not granted: a separate eligibility-hardening proposal may
+  // close it; this slice must not silently change it (spec "Legacy decision").
+  const serveOrgStructural = enforce?.principal === "member" || enforce?.principal === "legacy";
+  // TIERRET-1: the LABEL ceiling — lifted for an admitted member (membership is its read rule), kept
+  // for legacy, tokens and any unrecognised discriminator (`labelCeilingApplies`, fail closed).
+  const labelRestricted = labelCeilingApplies(enforce?.principal, tier);
   // In-query filter array (Codex fold): applied inside the item-leg SQL so LIMITs rank over
   // visible rows only. null = permissive. The visible() post-filter below stays as defense-in-depth.
   const visArr: string[] | null = visibleIds ? [...visibleIds] : null;
@@ -539,7 +571,9 @@ async function nativeRetrieve(
   const { query: ftsQuery, terms } = buildFtsQuery(q);
   const ftsP = rankedFtsSearch(teamId, tier, ftsQuery, FTS_CANDIDATE_LIMIT, channel, visArr);
   // Grounding specificity (Gap #3) — runs concurrently; combined with hadFtsHit below.
-  const specificityP = analyzeTermSpecificity(teamId, tier, terms, visArr ?? []); // ENFB-1: the visible corpus is the statistic's universe
+  // ENFB-1: the visible corpus is the statistic's universe — TIERRET-1: EXACTLY the corpus retrieval
+  // serves (no label conjunct for an admitted member, so a granted team-labelled item counts).
+  const specificityP = analyzeTermSpecificity(teamId, labelRestricted, terms, visArr ?? []);
   // Structured-context scaling (Gaps #5/#6): a FULL-corpus task count (aggregates survive the 80-row
   // cap) + a keyword search over ALL decisions (an old-but-relevant decision survives the 50-row
   // recency window). Both run concurrently; folded into the structured block below.
@@ -547,7 +581,9 @@ async function nativeRetrieve(
   const matchedDecisionsP = terms.length
     ? matchingDecisions(teamId, tier, ftsQuery, 10, {
         visibleItemIds: visibleIds ?? new Set(),
-        teamPosture: tier === "team",
+        // TIERRET-1: the member arm's hand-entered `all` is the ORACLE-accepted Everyone bit carried
+        // in the enforcement, never the route's posture; legacy/token keep the tier reading.
+        teamPosture: enforce?.principal === "member" ? enforce?.memberEveryone === true : tier === "team",
         // FORWARDED, never re-derived (AUDITFIX-1 §2a). This leg is token-reachable, and the
         // discriminator is the only thing standing between a scoped token and every hand-typed
         // decision in the team. Deriving it here from `tier` would say "member" for every token.
@@ -556,6 +592,8 @@ async function nativeRetrieve(
         // of the spec review found acceptance that seeded only a TASK — which would have gated the
         // task leg correctly and left THIS one open. Forwarded on the same terms.
         tokenProjectIds: enforce?.tokenProjectIds,
+        // TIERRET-1: a non-Everyone member's granted projects — forward-only, like the token set.
+        memberProjectIds: enforce?.memberProjectIds,
       })
     : Promise.resolve([]);
 
@@ -599,21 +637,25 @@ async function nativeRetrieve(
   // (before LIMIT), so the recency-50 and task-80 windows fill with rows THIS principal may
   // see — the ENFB-1 deferred starvation class (Codex M1) dies here. The id-array fragment is
   // the exact SQL twin of `rowVisibleByProvenance` (one contract, THREE owners, dm-pinned to
-  // fixture-level expected truth). Audience conjuncts preserved verbatim.
+  // fixture-level expected truth). TIERRET-1: the audience conjunct is the LABEL ceiling — lifted for
+  // an admitted member (sourced rows follow their source item), kept for legacy/token/unknown.
   // `principal` is FORWARDED from the caller's enforcement view — see AUDITFIX-1 §2a. Absent
   // enforcement yields `undefined`, which CLOSES the hand-typed arm; it must never become "member".
   const provCtx = {
     visibleItemIds: visibleIds ?? new Set<string>(),
-    teamPosture: tier === "team",
+    teamPosture: enforce?.principal === "member" ? enforce?.memberEveryone === true : tier === "team",
     principal: enforce?.principal,
     // AUDITFIX-7: FORWARDED, never derived. Absent closes the hand-typed arm for a token, which is
     // the fail-closed direction and also today's behaviour — so a deleted forward reddens nothing on
     // its own. That is why the guard requires this to be CARRIED alongside `principal`.
     tokenProjectIds: enforce?.tokenProjectIds,
+    // TIERRET-1: same discipline for a member's granted projects — an omitted forward would silently
+    // close a granted member's hand-entered rows, so the guard requires it carried too.
+    memberProjectIds: enforce?.memberProjectIds,
   };
   const dParams = newSqlParams();
   const dTeam = dParams.add(teamId);
-  const dAccess = isRestrictedTier(tier) ? `and d.audience = 'external'` : "";
+  const dAccess = labelRestricted ? `and d.audience = 'external'` : "";
   const decisionsB = runSql<{
     row_key: string; decided_at: string | Date | null; title: string; decided_by: string;
     still_valid: boolean; source_item_id: string | null; created_by: string | null; slug: string;
@@ -632,11 +674,11 @@ async function nativeRetrieve(
   // can ground on finished tasks. `tasks.updated_at` is bumped on every sync upsert (incl. a
   // status→done transition), so recency ordering surfaces today's completions. (Was active-only:
   // `in_progress/blocked/ready`, which structurally hid every completion from the brain.)
-  // Tasks carry `audience` (audit H1); an external principal sees only external-tier tasks. Without
-  // this filter the external query context leaked every internal task board.
+  // Tasks carry `audience` (audit H1). TIERRET-1: a non-member reader under the label ceiling still
+  // sees only external-audience tasks; an admitted member's rows are decided by provenance alone.
   const tParams = newSqlParams();
   const tTeam = tParams.add(teamId);
-  const tAccess = isRestrictedTier(tier) ? `and t.audience = 'external'` : "";
+  const tAccess = labelRestricted ? `and t.audience = 'external'` : "";
   const tasksB = runSql<{
     row_key: string; title: string; assignee: string | null; status: string; sprint: string | null;
     updated_at: string | Date | null; source_item_id: string | null; created_by: string | null; slug: string;

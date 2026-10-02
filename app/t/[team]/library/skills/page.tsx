@@ -71,11 +71,12 @@ export default async function SkillsPage({ params }: { params: Promise<{ team: s
   if (!team) return null;
 
   const me = await currentMember(team.id);
-  // ENFB-1: the membership oracle gates skill BODIES — the posture helper stays as the coarse
-  // outer wall; no member resolution → empty list (fail closed).
-  const { visibleItemIds } = await import("@/lib/access/enforce");
+  // ENFB-1: the membership oracle gates skill BODIES; no member resolution → empty list (fail
+  // closed). TIERRET-1: the label tier is the reader's admission ceiling — none for an admitted
+  // member (membership is the rule), the posture ceiling for a non-principal.
+  const { resolveContentView, contentLabelTier } = await import("@/lib/access/admission");
   const { adminClient } = await import("@/lib/db/admin");
-  const vis = me ? await visibleItemIds(adminClient(), { teamId: team.id, memberId: me.id }) : null;
+  const vis = me ? await resolveContentView(adminClient(), team.id, me.id) : null;
   const { data: items } = vis && !vis.error && vis.ids.size > 0
     ? await visibleItems(
         db
@@ -86,7 +87,7 @@ export default async function SkillsPage({ params }: { params: Promise<{ team: s
           .in("id", [...vis.ids])
           .order("synced_at", { ascending: false })
           .limit(200),
-        me!.tier
+        contentLabelTier(vis.admission)
       )
     : { data: [] };
   const skills = (items ?? []) as unknown as SkillItem[];

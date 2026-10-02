@@ -4,7 +4,7 @@ import { ListTodo, ScanLine } from "lucide-react";
 import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { currentMember } from "@/lib/auth/guard";
-import { rowVisibleByProvenance } from "@/lib/access/provenance";
+import { rowVisibleByProvenanceCtx } from "@/lib/access/provenance";
 import { Board } from "@/components/kanban/board";
 import { TaskHierarchy } from "@/components/kanban/task-hierarchy";
 import { EmptyState } from "@/components/empty-state";
@@ -24,17 +24,21 @@ export default async function TasksPage({ params }: { params: Promise<{ team: st
   if (!team) return null;
 
   const user = await getSessionUser();
-  // Tier isolation (audit H1): an external-tier dashboard member must not see internal task boards.
   const viewer = await currentMember(team.id);
+  // Posture still gates the team-only WRITE affordance below (meeting extraction); it no longer
+  // gates what the board READS (TIERRET-1).
   const tier = viewer?.tier ?? "external";
   // ENFB-1: the board serves task BODIES — the settled provenance rule gates each row (sourced →
-  // source item in the viewer's oracle set; null-source → hand-typed at team posture). Resolved
-  // once; no member → empty board (fail closed).
-  const { visibleItemIds, visibleProjectRows } = await import("@/lib/access/enforce");
+  // source item in the viewer's oracle set; null-source → hand-typed and admitted). TIERRET-1: the
+  // reader and its label ceiling come from the one admission resolver (an admitted member has no
+  // audience ceiling). Resolved once; no member → empty board (fail closed).
+  const { visibleProjectRows } = await import("@/lib/access/enforce");
+  const { resolveContentView, contentLabelTier, provenanceCtxFor } = await import("@/lib/access/admission");
   const { adminClient } = await import("@/lib/db/admin");
-  const vis = viewer ? await visibleItemIds(adminClient(), { teamId: team.id, memberId: viewer.id }) : null;
-  // ENFB-2 §2.1: the create-form dropdown lists only ROW-VISIBLE containers (you file into a
-  // project you can see) — this is the row-visible set, NOT vis.projectIds (the granted set).
+  const vis = viewer ? await resolveContentView(adminClient(), team.id, viewer.id) : null;
+  const provCtx = vis ? provenanceCtxFor(vis) : { visibleItemIds: new Set<string>(), teamPosture: false };
+  // ENFB-2 §2.1: the create-form dropdown lists only containers this member may FILE into — the
+  // WRITER row set (unchanged by TIERRET-1), NOT vis.projectIds (the granted set).
   const projRows = viewer ? await visibleProjectRows(adminClient(), { teamId: team.id, memberId: viewer.id }) : null;
 
   // PM links are fetched as a sibling query and grouped in JS rather than as an embedded resource:
@@ -44,12 +48,12 @@ export default async function TasksPage({ params }: { params: Promise<{ team: st
   // ENFB-2 §2.2: the 500-row board window compiles the provenance predicate IN-QUERY via the
   // structured-windows domain service (the post-LIMIT filter below stays as the guard-pinned
   // defense-in-depth layer over the same contract) — invisible rows can no longer starve
-  // visible ones out of the window. The audience conjunct is preserved inside the window.
+  // visible ones out of the window. The label conjunct applies only under the reader's ceiling.
   const { boardTaskWindow } = await import("@/lib/access/structured-windows");
-  const boardTasksP = boardTaskWindow<Task & { source_item_id?: string | null; created_by?: string | null }>(
+  const boardTasksP = boardTaskWindow<Task & { source_item_id?: string | null; created_by?: string | null; project_id?: string | null }>(
     team.id,
-    { visibleItemIds: vis && !vis.error ? vis.ids : new Set<string>(), teamPosture: tier === "team", principal: "member" as const },
-    tier === "external"
+    provCtx,
+    vis ? contentLabelTier(vis.admission) === "external" : true
   ).then((rows) => ({ data: rows }));
   const [{ data: tasks }, { data: links }, { data: projects }, { data: members }, { data: me }] =
     await Promise.all([
@@ -88,9 +92,9 @@ export default async function TasksPage({ params }: { params: Promise<{ team: st
     arr.push(badge);
     linksByTask.set(task_id, arr);
   }
-  const taskRows = ((tasks ?? []) as (Task & { source_item_id?: string | null; created_by?: string | null })[])
-    // ENFB-1 provenance rule — the ONE shared owner (lib/access/provenance).
-    .filter((t) => rowVisibleByProvenance(t, vis && !vis.error ? vis.ids : null, tier, "member"))
+  const taskRows = ((tasks ?? []) as (Task & { source_item_id?: string | null; created_by?: string | null; project_id?: string | null })[])
+    // ENFB-1 provenance rule — the ONE shared owner (lib/access/provenance), over the same ctx.
+    .filter((t) => rowVisibleByProvenanceCtx(t, provCtx))
     .map((t) => ({
       ...t,
       task_pm_links: linksByTask.get(t.id) ?? [],

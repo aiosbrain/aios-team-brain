@@ -101,9 +101,11 @@ describe("meetings on the timeline, per attendee (real Postgres)", () => {
     expect(pusherDay?.total).toBe(1);
   });
 
-  it("TIER: an external viewer's ledger contains no meeting evidence at all", async () => {
-    // Sole enforcement — `meeting_notes` has no access/audience column, so no visibility helper can
-    // gate it. Mutation-checked by deleting the `canSeeMeetingNotes` call.
+  it("an UNGRANTED external viewer's ledger contains no meeting evidence at all", async () => {
+    // TIERRET-1: the gate is the note's source TRANSCRIPT item (ENFB-3's `srcVisible`), not posture:
+    // this transcript lands in General, which the external-only viewer is not granted. (The posture
+    // `canSeeMeetingNotes` call left the member read path; a GRANTED external viewer's positive case
+    // is tierret1-member-reads AC-07/AC-12.)
     const seed = await seedTeam();
     await backfillTeamContext(db(), seed.teamId); // ENFB-3: the gate needs a context-bootstrapped team (prod guarantee: bootstrap/scheduler)
     await createMeetingNote(db(), seed.teamId, {

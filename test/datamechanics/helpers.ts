@@ -133,36 +133,32 @@ export async function placeMemberByTier(teamId: string, memberId: string, tier: 
 export async function viewFor(
   seed: Seed,
   tier: "team" | "external" = "team"
-): Promise<{ visibleItemIds: ReadonlySet<string>; visibleProjectIds: ReadonlySet<string> }> {
+) {
   const viewerId = tier === "external" ? await externalMember(seed) : seed.memberId;
   const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
   const r = await backfillTeamContext(db(), seed.teamId);
   if (!r.ok) throw new Error(`viewFor backfill failed: ${r.error}`);
-  const { memberEnforcement } = await import("@/lib/access/enforce");
-  const e = await memberEnforcement(db(), { teamId: seed.teamId, memberId: viewerId });
-  if (!e) throw new Error("viewFor: the viewer resolved no enforcement");
-  return e;
+  // TIERRET-1: the PRODUCTION timeline enforcement — item set + the reader from the one admission
+  // resolver (a builder call without a reader closes the hand-entered arm and the meeting leg).
+  const { contentTimelineEnforcement } = await import("@/lib/access/admission");
+  return contentTimelineEnforcement(db(), seed.teamId, viewerId);
 }
 
-/** A route-shaped MEMBER enforcement for retrieve(): vis-set + principal + graph scope — what
- *  both query routes construct (PRET-6: retrieve throws without one). Backfills first. */
-export async function memberRetrieveEnforce(
-  seed: Seed,
-  tier: "team" | "external" = "team"
-): Promise<{ visibleItemIds: ReadonlySet<string>; principal: "member"; graphProjectIds: string[] }> {
+/** A route-shaped enforcement for retrieve() — EXACTLY what both query routes construct
+ *  (`retrieveEnforceFor(resolveContentView(...))`; PRET-6: retrieve throws without one). Backfills first. */
+export async function memberRetrieveEnforce(seed: Seed, tier: "team" | "external" = "team") {
   const viewerId = tier === "external" ? await externalMember(seed) : seed.memberId;
   const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
   const r = await backfillTeamContext(db(), seed.teamId);
   if (!r.ok) throw new Error(`memberRetrieveEnforce backfill failed: ${r.error}`);
-  const { visibleItemIds } = await import("@/lib/access/enforce");
-  const { ids, projectIds } = await visibleItemIds(db(), { teamId: seed.teamId, memberId: viewerId });
-  return { visibleItemIds: ids, principal: "member", graphProjectIds: projectIds };
+  const { resolveContentView, retrieveEnforceFor } = await import("@/lib/access/admission");
+  return retrieveEnforceFor(await resolveContentView(db(), seed.teamId, viewerId));
 }
 
-/** The member's cheap §5.8 visibility (projects + hash) — what keys their vis-variant cache row. */
+/** The member's timeline cache VARIANT (admission class + project hash) — what keys their row. */
 export async function visOf(seed: Seed, memberId: string = seed.memberId) {
-  const { memberVisibility } = await import("@/lib/access/enforce");
-  return memberVisibility(db(), { teamId: seed.teamId, memberId });
+  const { resolveTimelineVariant } = await import("@/lib/dashboard/timeline-cache");
+  return resolveTimelineVariant(db(), seed.teamId, memberId);
 }
 
 /** Mint an ACTIVE external-posture member (invite-default shape: the external builtin row). */

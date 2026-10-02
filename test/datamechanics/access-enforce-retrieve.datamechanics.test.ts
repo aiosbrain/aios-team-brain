@@ -181,18 +181,23 @@ describe("enforced retrieval (Phase B slice 2)", () => {
     await backfillTeamContext(db(), seed.teamId);
     const member = await seedMember(seed);
 
-    // AUDITFIX-1: the discriminator is threaded EXPLICITLY — this test asserts the MEMBER
-    // hand-typed rule, and an omitted `principal` is `undefined`, which closes that arm.
-    const teamView = { visibleItemIds: (await visibleItemIds(db(), { teamId: seed.teamId, memberId: member })).ids, principal: "member" as const };
+    // AUDITFIX-1: the discriminator is threaded EXPLICITLY. TIERRET-1: through the PRODUCTION
+    // composition (`retrieveEnforceFor(resolveContentView(...))`) — the member arm's hand-entered
+    // authority (Everyone bit / granted projects) is REQUIRED and a hand-built `{principal:"member"}`
+    // without it now fails closed.
+    const { resolveContentView, retrieveEnforceFor } = await import("@/lib/access/admission");
+    const teamView = retrieveEnforceFor(await resolveContentView(db(), seed.teamId, member));
     const asTeam = await retrieve(db(), seed.teamId, "team", `${TERM} tasks`, null, teamView);
-    expect(asTeam.structured, "the hand-typed task survives for a team member").toContain("Hand-typed dashboard task");
+    expect(asTeam.structured, "the hand-typed task survives for an Everyone member").toContain("Hand-typed dashboard task");
     expect(asTeam.structured, "a purged-basis synced task stays dropped").not.toContain("Purged-basis synced task");
 
     const { externalMember } = await import("./helpers");
     const ext = await externalMember(seed);
-    const extView = { visibleItemIds: (await visibleItemIds(db(), { teamId: seed.teamId, memberId: ext })).ids, principal: "member" as const };
+    const extView = retrieveEnforceFor(await resolveContentView(db(), seed.teamId, ext));
     const asExt = await retrieve(db(), seed.teamId, "external", `${TERM} tasks`, null, extView);
-    expect(asExt.structured, "a hand-typed row has no membership axis — the posture wall holds").not.toContain("Hand-typed dashboard task");
+    // TIERRET-1: not a posture wall any more — the external member's GRANTED projects (the
+    // external-shared floor) do not include `src`, so its hand-typed row stays out by membership.
+    expect(asExt.structured, "a hand-typed row in an ungranted project stays out").not.toContain("Hand-typed dashboard task");
   });
 
   it("enforcing: a member in NO groups retrieves nothing (fail closed)", async () => {
@@ -240,7 +245,7 @@ describe("ENFB-1 AC5 — the grounding existence-oracle closes", () => {
     // §2.6 error contract, direct: a statistic failure yields the conservative shape, so
     // grounding falls to the (vis-scoped) fts evidence — never the whole corpus.
     const { analyzeTermSpecificity } = await import("@/lib/query/grounding");
-    const broken = await analyzeTermSpecificity(seed.teamId, "team", ["zephyrquill"], ["not-a-uuid"]);
+    const broken = await analyzeTermSpecificity(seed.teamId, false, ["zephyrquill"], ["not-a-uuid"]);
     expect(broken, "a failing statistic degrades conservative").toEqual({ specificMatching: false, allCommon: true });
   });
 });

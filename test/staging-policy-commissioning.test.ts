@@ -4169,6 +4169,9 @@ describe("correction pass 2 — F1: the local witness transport and its refusals
     try {
       const item = { role: "normal", caseId: CLOUD_CASE_SEQUENCE.normal[0], ordinal: 1, direction: "pre" as const };
       const name = challengeArtifactName({ runId: RUN_ID, attempt: ATTEMPT, role: item.role, ordinal: item.ordinal, direction: item.direction });
+      // ONE clock read per challenge: two separate Date.now() calls can straddle a tick, encoding a
+      // lifetime other than exactly 180 s — which the witness rightly refuses before the check under test.
+      const base = Date.now();
       const sound = {
         schema_version: 1, kind: "commissioning-witness-challenge", domain: "commission",
         repository: COMMISSIONING_REPOSITORY, repository_id: REPOSITORY_ID, source_mode: "commission",
@@ -4178,8 +4181,9 @@ describe("correction pass 2 — F1: the local witness transport and its refusals
         intended_app_id: NORMAL_APP, intended_installation_id: "5001",
         manifest_sha256: session.setupBindings.manifest_sha256, graph_sha256: session.setupBindings.graph_sha256,
         nonce: "a".repeat(64),
-        created_at: new Date(Date.now()).toISOString(), expires_at: new Date(Date.now() + 180_000).toISOString(),
+        created_at: new Date(base).toISOString(), expires_at: new Date(base + 180_000).toISOString(),
       };
+      expect(Date.parse(sound.expires_at) - Date.parse(sound.created_at)).toBe(180_000);
       const serve = (challenge: unknown) => {
         for (const id of [...github.artifacts.keys()]) github.artifacts.delete(id);
         github.addArtifact(name, `${name}.json`, Buffer.from(`${JSON.stringify(challenge)}\n`, "utf8"), Number(RUN_ID));
@@ -4198,7 +4202,9 @@ describe("correction pass 2 — F1: the local witness transport and its refusals
       await expect(serve({ ...sound, domain: "rehearsal", source_mode: "transport-rehearsal", target_ref: "rehearsal", manifest_sha256: null, graph_sha256: null }))
         .rejects.toThrow(/declares domain "rehearsal"/);
       // An EXPIRED challenge is never served late, and the expiry is never extended.
-      const stale = { ...sound, created_at: new Date(Date.now() - 400_000).toISOString(), expires_at: new Date(Date.now() - 220_000).toISOString() };
+      const staleBase = Date.now();
+      const stale = { ...sound, created_at: new Date(staleBase - 400_000).toISOString(), expires_at: new Date(staleBase - 220_000).toISOString() };
+      expect(Date.parse(stale.expires_at) - Date.parse(stale.created_at)).toBe(180_000);
       await expect(serve(stale)).rejects.toThrow(/expired before this witness could serve it/);
       // And a challenge artifact owned by ANOTHER run cannot be adopted.
       for (const id of [...github.artifacts.keys()]) github.artifacts.delete(id);

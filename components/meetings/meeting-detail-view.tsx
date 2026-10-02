@@ -21,8 +21,9 @@ export async function MeetingDetailView({
   viewer: { memberId: string; tier: ViewerTier };
 }) {
   const db = await serverClient();
-  // ENFB-3: getMeetingNote gates on the viewer's ORACLE (canSeeItem on the source transcript)
-  // plus posture — denied, tombstoned, and unknown all take the same notFound (§5.7).
+  // ENFB-3: getMeetingNote gates on the viewer's ORACLE (canSeeItem on the source transcript) —
+  // the whole read rule since TIERRET-1 — denied, tombstoned, and unknown all take the same
+  // notFound (§5.7).
   const note = await getMeetingNote(db, teamId, noteId, viewer);
   if (!note) notFound();
 
