@@ -17,7 +17,9 @@ import { makeMaterializeDeps, runMaterializeCommand, type MaterializeResult } fr
  * cascade barrier, repeatable-read connection-default variant), AC-04 (posture matrix), AC-05
  * (racing owners), AC-06 (atomic failures, best-effort audit), AC-07 (order and the real 31s
  * deadline), AC-08 (production 2s lock cap), AC-09 (cancellation after effects, same-backend
- * restoration) and the real-PG slice of AC-11. Later criteria (AC-03, AC-10, AC-12) land later.
+ * restoration), AC-10 (lost COMMIT acknowledgement, both marker outcomes) and the real-PG slice of
+ * AC-11. AC-03's invocation guard is test/guards/materializer-sql-caller-owner.test.ts; AC-12 is
+ * the separate capacity/startup evidence, not this file.
  *
  * These are written from the spec, not from the implementation. Against the pre-conversion
  * TypeScript materializer (lib/access/groups.ts), which reads the marker but never the substrate,
@@ -1806,5 +1808,320 @@ describe("STAGINGMARK-5 AC-09 (restoration) — every healthy path ends the owne
     expectRestoredOnSameBackend(owned, "ROLLBACK");
     expect(owned.statements.some((s) => s.sql === "COMMIT")).toBe(false);
     expect(await effects()).toEqual(before);
+  }, CASE_TIMEOUT_MS);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Stage 5 — AC-10 real COMMIT acknowledgement loss.
+// ---------------------------------------------------------------------------------------------
+
+/** The five relations the frozen function locks (postgres/schema.sql), in its lock order. */
+const MATERIALIZER_TABLES = ["teams", "members", "groups", "group_members", "migration_markers"];
+const TRANSPORT_MESSAGE = "read ECONNRESET";
+const UNKNOWN_COMMIT_MESSAGE = `COMMIT failed; outcome unknown and will not be replayed: ${TRANSPORT_MESSAGE}`;
+const UNKNOWN_SERVICE_ERROR =
+  `${UNKNOWN_COMMIT_MESSAGE} — the marker and builtin membership may already be committed; re-read the marker before acting`;
+
+/** A reset socket as Node surfaces it to `pg`. Only the transport "fails"; every statement the server receives is real. */
+function transportReset(): Error {
+  return Object.assign(new Error(TRANSPORT_MESSAGE), { code: "ECONNRESET", syscall: "read" });
+}
+
+type CommitWitness = { marker: number; groups: number; edges: number; audits: number; locked: string[] };
+
+/** Read on the owned backend while its transaction is still healthy, just before COMMIT would be sent. */
+const COMMIT_WITNESS_SQL = `select (select count(*)::int from migration_markers where name = $1) as marker,
+        (select count(*)::int from groups where is_builtin) as groups,
+        (select count(*)::int from group_members gm join groups g on g.id = gm.group_id where g.is_builtin) as edges,
+        (select count(*)::int from audit_log where action = 'access.builtin_materialized') as audits,
+        array(select distinct l.relation::regclass::text from pg_locks l
+               where l.pid = pg_backend_pid() and l.locktype = 'relation' and l.granted
+                 and l.relation in ('teams'::regclass, 'members'::regclass, 'groups'::regclass,
+                                    'group_members'::regclass, 'migration_markers'::regclass)) as locked`;
+
+/**
+ * Test-owned pinned fixture for AC-10: the REAL engine (`runPgClientTransaction`) over a REAL pool
+ * checkout through the existing `factory.connect` seam. Every statement the service sends reaches
+ * that real backend. Only the engine's own control `COMMIT` is intercepted. It is sent on the
+ * underlying PoolClient, never through the session decorator, which records what the session sent.
+ * At that COMMIT:
+ *  1. the healthy open transaction is read once: the function's real effects and the relation locks
+ *     this backend holds (the witness — so neither outcome below is vacuous);
+ *  2. `after-commit` sends the REAL COMMIT and awaits its acknowledgement; `before-commit` never sends it;
+ *  3. either way the facade then throws a transport reset, as if the socket died before the reply was
+ *     read. From then on the connection is uncertain: any further query on it is recorded as a
+ *     violation and refused, so nothing is ever SHOWn on it.
+ * Each checkout is forwarded to the real pool's release exactly once (pg-pool throws on a double
+ * release), so the engine's `release(error)` really destroys the backend. `dispose()` is the bounded
+ * harness fallback: it destroys any checkout the engine never released, and is otherwise a no-op.
+ */
+function lostAckDb(schedule: "after-commit" | "before-commit") {
+  const statements: { pid: number; sql: string; params: unknown[]; sent: boolean }[] = [];
+  const sessionStatements: string[] = [];
+  const releases: (Error | undefined)[] = [];
+  const violations: string[] = [];
+  const checkouts: { real: PoolClient; forwarded: boolean }[] = [];
+  const state: { connects: number; pid?: number; baseline?: Settings; witness?: CommitWitness; acknowledged: boolean; transport?: Error } = {
+    connects: 0,
+    acknowledged: false,
+  };
+  const ended = deferred();
+  const forward = (checkout: { real: PoolClient; forwarded: boolean }, err?: Error) => {
+    if (checkout.forwarded) return;
+    checkout.forwarded = true;
+    checkout.real.release(err);
+  };
+  const factory: PgTransactionFactory = {
+    connect: async () => {
+      state.connects += 1;
+      const checkout = { real: await getPool().connect(), forwarded: false };
+      checkouts.push(checkout);
+      const { real } = checkout;
+      if (checkouts.length === 1) real.once("end", () => ended.resolve());
+      const pid = (real as unknown as { processID: number }).processID;
+      try {
+        state.baseline ??= await settingsOf(real);
+      } catch (error) {
+        forward(checkout, error instanceof Error ? error : new Error(String(error)));
+        throw error;
+      }
+      state.pid ??= pid;
+      let uncertain = false;
+      return {
+        query: async (text: string, params: unknown[] = []) => {
+          if (uncertain) {
+            violations.push(text);
+            throw new Error("stagingmark5: query on a discarded uncertain connection");
+          }
+          const entry = { pid, sql: text, params, sent: false };
+          statements.push(entry);
+          if (text !== "COMMIT") {
+            entry.sent = true;
+            return real.query(text, params);
+          }
+          state.witness = (await real.query(COMMIT_WITNESS_SQL, [MARKER])).rows[0] as CommitWitness;
+          if (schedule === "after-commit") {
+            entry.sent = true;
+            await real.query("COMMIT", params);
+            state.acknowledged = true;
+          }
+          uncertain = true;
+          state.transport = transportReset();
+          throw state.transport;
+        },
+        release: (err?: Error) => {
+          releases.push(err);
+          forward(checkout, err);
+        },
+      } as unknown as PoolClient;
+    },
+    decorateExecutor: (executor: SqlExecutor): SqlExecutor => async <T>(text: string, params: unknown[] = []) => {
+      sessionStatements.push(text);
+      return executor<T>(text, params);
+    },
+    makeBoundClient: (executor, reportFailure) => new PgClient({ executor, reportFailure, bound: true }),
+  };
+  const outer = db() as TransactionCapableDbClient;
+  const client: TransactionCapableDbClient = {
+    from: outer.from.bind(outer),
+    rpc: outer.rpc.bind(outer),
+    transaction: <T>(fn: (session: TransactionSession) => Promise<T>) => runPgClientTransaction(factory, fn),
+  };
+  const dispose = () => {
+    for (const checkout of checkouts) forward(checkout, new Error("stagingmark5: lost-acknowledgement harness cleanup"));
+  };
+  return { client, statements, sessionStatements, releases, violations, state, ended: ended.promise, dispose };
+}
+type LostAckDb = ReturnType<typeof lostAckDb>;
+
+/**
+ * The one uncertain call: one checkout on an ordinary baseline backend, the required order with a
+ * single function SELECT and no in-call replay, COMMIT on the control path only (absent from the
+ * session's statements), real effects and all five locks witnessed just before COMMIT, then exactly
+ * one destroying release carrying the engine's unknownCommit error, and nothing queried after it.
+ */
+function expectUncertainCall(lost: LostAckDb, fx: PostureFleet, commitSent: boolean) {
+  expect(lost.state.connects).toBe(1);
+  const pid = lost.state.pid;
+  expect(lost.state.baseline).toMatchObject({ statement_timeout: "30s", idle_in_transaction_session_timeout: "1min", backend: pid, materializer_locks: 0 });
+  expect(lost.statements.every((s) => s.pid === pid)).toBe(true);
+  expect(lost.statements.map(({ sql, params, sent }) => ({ sql, params, sent }))).toEqual([
+    ...ownedOrder(PRODUCTION_STATEMENT_TIMEOUT).map((s) => ({ ...s, sent: true })),
+    { sql: FUNCTION_SQL, params: [], sent: true },
+    { sql: "COMMIT", params: [], sent: commitSent },
+  ]);
+  expect(lost.sessionStatements).toEqual(["SET TRANSACTION ISOLATION LEVEL READ COMMITTED", STATEMENT_TIMEOUT_SQL, LOCK_TIMEOUT_SQL, FUNCTION_SQL]);
+  expect(lost.state.acknowledged).toBe(commitSent);
+  const witness = lost.state.witness;
+  expect(witness && { ...witness, locked: [...witness.locked].sort() }).toEqual({
+    marker: 1,
+    groups: fx.teamIds.length * 2,
+    edges: fx.expectedEdges.length,
+    audits: fx.expectedAudits.length,
+    locked: [...MATERIALIZER_TABLES].sort(),
+  });
+  expect(lost.releases).toHaveLength(1);
+  const [released] = lost.releases;
+  expect(released).toBeInstanceOf(TransactionExecutionError);
+  expect(released).toMatchObject({ message: UNKNOWN_COMMIT_MESSAGE, code: "ECONNRESET", unknownCommit: true });
+  expect((released as TransactionExecutionError).cause).toBe(lost.state.transport);
+  expect(lost.violations).toEqual([]);
+}
+
+/** Bounded poll until the destroyed backend has left the server: no session and no lock of any kind. */
+async function awaitBackendGone(pid: number) {
+  const deadline = Date.now() + 5_000;
+  let last = { sessions: -1, locks: -1 };
+  while (Date.now() < deadline) {
+    last = (await query(
+      `select (select count(*)::int from pg_stat_activity where pid = $1) as sessions,
+              (select count(*)::int from pg_locks where pid = $1) as locks`,
+      [pid]
+    )).rows[0];
+    if (last.sessions === 0 && last.locks === 0) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return last;
+}
+
+/**
+ * Nobody still holds the function's SHARE ROW EXCLUSIVE locks: ROW EXCLUSIVE NOWAIT (which conflicts
+ * with them, but not with autovacuum) succeeds on all five, then rolls back. A refusal destroys the probe.
+ */
+async function expectMaterializerTablesFree(): Promise<void> {
+  const probe = await getPool().connect();
+  try {
+    await probe.query("BEGIN");
+    await probe.query(`LOCK TABLE ${MATERIALIZER_TABLES.join(", ")} IN ROW EXCLUSIVE MODE NOWAIT`);
+    await probe.query("ROLLBACK");
+    probe.release();
+  } catch (error) {
+    probe.release(error instanceof Error ? error : new Error(String(error)));
+    throw error;
+  }
+}
+
+/** A later normal invocation ran on a DIFFERENT, ordinary backend whose settings equal the destroyed one's pre-BEGIN baseline. */
+function expectFreshBaseline(retry: OwnedDb, lost: LostAckDb) {
+  expect(retry.state.pid).toBeDefined();
+  expect(retry.state.pid).not.toBe(lost.state.pid);
+  expect(retry.state.baseline).toEqual({ ...lost.state.baseline, backend: retry.state.pid });
+}
+
+describe("STAGINGMARK-5 AC-10 — lost COMMIT acknowledgement preserves uncertainty: no in-call replay, the backend is destroyed, a fresh backend has baseline settings", () => {
+  // The engine sees the same thing in both schedules — COMMIT failed on the wire — so outcomeUnknown
+  // is the truthful report for both. Only the server's own state, read on another connection after
+  // the uncertain backend is gone, tells the two outcomes apart; neither is inferred from the error.
+
+  it("after the REAL COMMIT: outcomeUnknown with one function SELECT; independently the marker, membership and audits are committed exactly; the destroyed backend disappears; a later invocation on a fresh baseline backend is ran:false and preserves the raw state", async () => {
+    const fx = await postureFleet("none");
+    const before = await postureState();
+    expect(before.marker).toEqual([]);
+    const lost = lostAckDb("after-commit");
+    try {
+      const from = await dbNow();
+      const result = await within(materializeBuiltinMembershipOnce(lost.client), 10_000, "owner with a lost COMMIT acknowledgement");
+      const to = await dbNow();
+
+      expect(result).toEqual({ ok: false, outcomeUnknown: true, error: UNKNOWN_SERVICE_ERROR });
+      expectUncertainCall(lost, fx, true);
+      await within(lost.ended, 5_000, "uncertain client socket end");
+      expect(await awaitBackendGone(lost.state.pid!)).toEqual({ sessions: 0, locks: 0 });
+      await expectMaterializerTablesFree();
+
+      // Independent readback: the real COMMIT landed, with exactly the reconciliation it carried.
+      const after = await postureState();
+      expectExactMaterialization(fx, before, after, { from, to });
+
+      const retry = ownedDb();
+      expect(await within(materializeBuiltinMembershipOnce(retry.client), 10_000, "later invocation")).toEqual({ ok: true, ran: false });
+      await within(retry.released, 10_000, "retry release inspection");
+      functionStatement(retry);
+      expectRestoredOnSameBackend(retry, "COMMIT");
+      expectFreshBaseline(retry, lost);
+      // Raw rows (timestamps as wire strings), audits included: nothing re-stamped, no duplicate audit.
+      expect(await postureState()).toEqual(after);
+    } finally {
+      lost.dispose();
+    }
+  }, CASE_TIMEOUT_MS);
+
+  it("before COMMIT is sent: outcomeUnknown after real in-transaction effects; destroying the backend rolls everything back and releases its locks; a later invocation on a fresh baseline backend runs and stamps exactly", async () => {
+    const fx = await postureFleet("none");
+    const before = await postureState();
+    expect(before.marker).toEqual([]);
+    const lost = lostAckDb("before-commit");
+    try {
+      const result = await within(materializeBuiltinMembershipOnce(lost.client), 10_000, "owner losing its connection before COMMIT");
+
+      expect(result).toEqual({ ok: false, outcomeUnknown: true, error: UNKNOWN_SERVICE_ERROR });
+      expectUncertainCall(lost, fx, false);
+      await within(lost.ended, 5_000, "uncertain client socket end");
+      expect(await awaitBackendGone(lost.state.pid!)).toEqual({ sessions: 0, locks: 0 });
+      await expectMaterializerTablesFree();
+
+      // Rollback proved by the server's state on another connection, after the backend is gone.
+      const rolledBack = await postureState();
+      expect(rolledBack).toEqual(before);
+
+      const retry = ownedDb();
+      const from = await dbNow();
+      expect(await within(materializeBuiltinMembershipOnce(retry.client), 10_000, "later invocation")).toEqual({ ok: true, ran: true });
+      const to = await dbNow();
+      await within(retry.released, 10_000, "retry release inspection");
+      functionStatement(retry);
+      expectRestoredOnSameBackend(retry, "COMMIT");
+      expectFreshBaseline(retry, lost);
+      expectExactMaterialization(fx, rolledBack, await postureState(), { from, to });
+    } finally {
+      lost.dispose();
+    }
+  }, CASE_TIMEOUT_MS);
+
+  it("confirmed CLI over a lost acknowledgement after the real COMMIT: exit 1 with uncertainty and recheck guidance, never 'did not stamp'; the recommended recheck then reports the committed marker", async () => {
+    await team();
+    const lost = lostAckDb("after-commit");
+    try {
+      const real = makeMaterializeDeps(lost.client);
+      const results: MaterializeResult[] = [];
+      const outcome = await within(
+        runMaterializeCommand(
+          {
+            readState: real.readState,
+            materialize: async () => {
+              const r = await real.materialize();
+              results.push(r);
+              return r;
+            },
+          },
+          { confirm: true, confirmProduction: true }
+        ),
+        10_000,
+        "confirmed CLI"
+      );
+
+      expect(results).toEqual([{ ok: false, outcomeUnknown: true, error: UNKNOWN_SERVICE_ERROR }]);
+      expect(outcome.exitCode).toBe(1);
+      const text = outcome.lines.join("\n");
+      expect(text).toContain(UNKNOWN_SERVICE_ERROR);
+      expect(text).toMatch(/may already have been committed/);
+      expect(text).toMatch(/check the marker before acting/);
+      expect(text).not.toMatch(/did not stamp/i);
+      expect(lost.state.connects).toBe(1);
+      expect(lost.state.acknowledged).toBe(true);
+      expect(lost.releases).toHaveLength(1);
+      expect(lost.releases[0]).toMatchObject({ unknownCommit: true });
+      expect(lost.violations).toEqual([]);
+      await within(lost.ended, 5_000, "uncertain client socket end");
+      expect(await awaitBackendGone(lost.state.pid!)).toEqual({ sessions: 0, locks: 0 });
+
+      // Independently committed, and the recheck the CLI asks for (no --confirm) reports it.
+      expect((await effects()).marker).toHaveLength(1);
+      const recheck = await runMaterializeCommand(makeMaterializeDeps(db()), { confirm: false, confirmProduction: false });
+      expect(recheck.exitCode).toBe(0);
+      expect(recheck.lines.join("\n")).toMatch(/already materialized/);
+    } finally {
+      lost.dispose();
+    }
   }, CASE_TIMEOUT_MS);
 });
