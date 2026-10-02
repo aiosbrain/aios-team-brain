@@ -152,7 +152,7 @@ describe("AUDITFIX-1 AC5: the real POST /api/v1/query attenuates a delegated tok
     const minted = await mintAgentToken(
       db(),
       seed.teamId,
-      { memberId: agent, projectScope: [bySlug.get("rproj")!] },
+      { memberId: agent, scope: { kind: "projects", projectIds: [bySlug.get("rproj")!] } },
       seed.memberId
     );
     expect(minted.ok, minted.error).toBe(true);
@@ -174,7 +174,7 @@ describe("AUDITFIX-1 AC5: the real POST /api/v1/query attenuates a delegated tok
     expect(structured, "an OUT-OF-SCOPE hand-entered DECISION must never reach a token's prompt").not.toContain(secretDecision);
   });
 
-  it("an UNSCOPED token (projectScope: null) gets its launcher's projects — NOT nothing, NOT everything", async () => {
+  it("an all-reachable token (stored projectScope: null) gets its launcher's projects — NOT nothing, NOT everything", async () => {
     // Spec round 2's BLOCKER. The oracle attenuates only when the scope is NON-NULL, so `null` means
     // "the launcher's granted projects" while `[]` means "sees nothing". Every other criterion here
     // uses an explicit non-empty scope, so an implementation returning `[]` for a null scope would
@@ -201,13 +201,16 @@ describe("AUDITFIX-1 AC5: the real POST /api/v1/query attenuates a delegated tok
       if (r.error) throw new Error(`task seed failed: ${r.error.message}`);
     }
 
-    // The agent is granted ONLY uproj. The token names NO scope at all.
+    // The agent is granted ONLY uproj. The token names no project list: it deliberately chose
+    // all-reachable (AUDITFIX-19 — omission is refused now), which stores NULL.
     const agent = await seedMember(seed, { kind: "agent" });
     const g = await createGroup(db(), seed.teamId, `ut-${randomUUID().slice(0, 6)}`, "G", seed.memberId);
     await addMemberToGroup(db(), seed.teamId, g.groupId!, agent, seed.memberId);
     await grantProjectToGroup(db(), seed.teamId, bySlug.get("uproj")!, g.groupId!, seed.memberId);
-    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent, projectScope: null }, seed.memberId);
+    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent, scope: { kind: "all-reachable" } }, seed.memberId);
     expect(minted.ok, minted.error).toBe(true);
+    const { verifyAgentToken } = await import("@/lib/access/agent-tokens");
+    expect((await verifyAgentToken(db(), minted.token!))!.projectScope, "all-reachable is stored NULL").toBeNull();
 
     const { POST: queryPOST } = await import("@/app/api/v1/query/route");
     const res = await queryPOST(queryReq(minted.token!, `tell me about ${TERM}`));

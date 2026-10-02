@@ -34,6 +34,11 @@ function revalidateAgents(teamSlug: string): void {
  * rule enforced only by the mint form binds only the people who use the form. The policy module is
  * separate because a `"use server"` file may export nothing but async functions, and the form and
  * this action have to share one lifetime cap.
+ *
+ * AUDITFIX-19: the request must carry an explicit `scope` choice — omission, the legacy
+ * `projectScope` key and malformed choices are refused before anything is written. After the admin
+ * gate, `validateMintRequest` captures and normalizes the whole request synchronously, BEFORE the
+ * first visibility await; from then on only that normalized copy is used.
  */
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -42,33 +47,43 @@ export async function mintAgentTokenAction(
   teamSlug: string,
   input: MintRequest
 ): Promise<MintResult> {
+  // Authorization FIRST; team and admin identity come from the gate, never from the request.
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
 
   const policy = validateMintRequest(input, Date.now());
   if (!policy.ok) return { ok: false, error: policy.error };
+  const request = policy.request;
 
-  // SCOPE ⊆ WHAT THE ADMIN CAN SEE **AND** WHAT THE LAUNCHER CAN SEE. Two different properties,
-  // and Codex's diff review was right that checking only the first is not enough:
-  //   · the ADMIN check is authorization — you cannot grant reach you do not have yourself;
+  // SELECTED-PROJECTS MODE ONLY: the chosen list must be visible to BOTH the admin AND the launcher,
+  // judged by the existing writer/destination predicate `visibleProjectRows` (the same one the
+  // picker uses — not the membership read rule). Two different properties:
+  //   · the ADMIN check is this mode's issuance policy — an admin cannot hand-pick a project they
+  //     cannot themselves file into;
   //   · the LAUNCHER check is meaning — the token reads AS that member, so a project they cannot
   //     see would mint a scope that silently grants nothing (the oracle intersects live).
-  // They differ whenever the admin mints for someone else, which is the normal case. Fail-closed:
-  // a substrate error yields an empty set, so a scoped mint is refused rather than waved through.
-  // NOT race-free by construction — visibility can change between this read and the insert. That is
-  // acceptable because it is not the enforcement boundary: the oracle re-derives visibility on every
-  // request, so a stale grant here can only ever be narrower in effect, never wider.
-  if (input.projectScope != null) {
+  // This is NOT a cap on every credential an admin can issue. An explicit all-reachable choice does
+  // no enumeration: it stores NULL and reads whatever the LAUNCHER can see, live, including projects
+  // the admin cannot — the same credential-management authority as issuing that member an API key
+  // (docs/design/auditfix19-explicit-agent-scope.md). Fail-closed: a lookup error refuses the mint.
+  // NOT race-free — visibility can change between this read and the insert, and the admin leg is
+  // never rechecked on later token reads; the oracle re-derives the LAUNCHER's live visibility on
+  // every request, which is the enforcement boundary.
+  if (request.scope.kind === "projects") {
+    const projectIds = request.scope.projectIds;
     const db = adminClient();
     const [adminVisible, launcherVisible] = await Promise.all([
       visibleProjectRows(db, { teamId: ctx.teamId, memberId: ctx.memberId }),
-      visibleProjectRows(db, { teamId: ctx.teamId, memberId: input.memberId }),
+      visibleProjectRows(db, { teamId: ctx.teamId, memberId: request.memberId }),
     ]);
-    if (input.projectScope.some((id) => !adminVisible.ids.has(id))) {
-      return { ok: false, error: "projectScope names project(s) you cannot see" };
+    if (adminVisible.error || launcherVisible.error) {
+      return { ok: false, error: "could not verify project visibility for scope.projectIds — try again" };
     }
-    if (input.projectScope.some((id) => !launcherVisible.ids.has(id))) {
-      return { ok: false, error: "projectScope names project(s) the launching member cannot see" };
+    if (projectIds.some((id) => !adminVisible.ids.has(id))) {
+      return { ok: false, error: "scope.projectIds names project(s) you cannot see" };
+    }
+    if (projectIds.some((id) => !launcherVisible.ids.has(id))) {
+      return { ok: false, error: "scope.projectIds names project(s) the launching member cannot see" };
     }
   }
 
@@ -76,12 +91,12 @@ export async function mintAgentTokenAction(
     adminClient(),
     ctx.teamId,
     {
-      memberId: input.memberId,
+      memberId: request.memberId,
       // Refused by policy above; passed as null so the shape stays explicit at the writer.
       onBehalfOf: null,
-      projectScope: input.projectScope ?? null,
-      name: input.name?.slice(0, 200),
-      expiresAt: input.expiresAt ?? null,
+      scope: request.scope,
+      name: request.name,
+      expiresAt: request.expiresAt,
     },
     ctx.memberId
   );

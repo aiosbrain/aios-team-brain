@@ -16,10 +16,17 @@ export const metadata: Metadata = { title: "Agents" };
  * entering the RSC payload, and there is no RLS behind it (CLAUDE.md §5) — so the layout is defence
  * in depth, not the control. `teamId` is taken from the gate's result, never from the slug.
  *
- * PROJECT READ: the picker is gated by `visibleProjectRows` (ENFB-2), not a raw team-wide select.
- * Being an admin is authority to MANAGE, not a bypass of the access chain. The matching PROPERTY —
- * an admin cannot scope a token to a project they cannot themselves see — is enforced in the ACTION
- * (`mintAgentTokenAction`), not here: this picker only decides what is easy to choose.
+ * PROJECT READ: the picker is gated by `visibleProjectRows` (ENFB-2) — the existing WRITER/destination
+ * predicate — not a raw team-wide select. Being an admin is authority to MANAGE, not a bypass of the
+ * access chain. The picker only decides what is easy to choose; the binding rule is in the ACTION
+ * (`mintAgentTokenAction`), and it is MODE-SPECIFIC (AUDITFIX-19):
+ *   · "only these projects" — every chosen project must be visible to BOTH the admin and the
+ *     launching member under that same predicate;
+ *   · "everything the member can see" — no enumeration; the token stores NULL and reads whatever
+ *     the LAUNCHER can see, live, which may include projects the admin cannot see. That is the same
+ *     credential-management authority as issuing that member an API key — not a subset of the
+ *     admin's own visibility, so this picker is not a cap on what an issued credential can reach.
+ * An admin with an empty picker can still deliberately choose the second option.
  * Fail-closed: on a substrate error the helper returns an empty set, so the picker offers nothing
  * rather than everything.
  *
@@ -80,8 +87,10 @@ export default async function AgentsAdminPage({ params }: { params: Promise<{ te
       <div className="flex items-start justify-between gap-4">
         <div className="max-w-3xl text-sm text-ink-secondary">
           <p>
-            Delegated tokens let an agent read the brain <em>as</em> a member, narrowed to chosen
-            projects and an expiry date. Unlike an API key, a delegated token creates no chat threads
+            Delegated tokens let an agent read the brain <em>as</em> a member until an expiry date.
+            Each token is minted with a deliberate choice: either only the projects you pick (each
+            must be visible to both you and that member), or everything that member can see as their
+            access changes. Unlike an API key, a delegated token creates no chat threads
             — so agent queries stay out of that member&apos;s Query tab. Secrets are hashed at rest and
             shown exactly once.
           </p>

@@ -8,7 +8,7 @@ import {
   MAX_TOKEN_LIFETIME_MS,
   MAX_PROJECT_SCOPE,
   canSubmitMint,
-  expiryInstantFor,
+  mintRequestFor,
   type ScopeChoice,
 } from "@/lib/access/agent-token-policy";
 
@@ -23,10 +23,11 @@ type ProjectOpt = { id: string; name: string; slug: string };
  * is deliberate: a server action is a public endpoint, so a constraint that lives only here binds
  * only people who use this page.
  *
- * SCOPE HAS NO DEFAULT. `null` (inherit) and a populated array are both legal, and they differ
- * enormously in blast radius, so the admin must SAY which. An untouched control yields no
- * submittable payload at all — never a silent `null` (which would inherit everything) and never a
- * silent `[]` (which mints a token that reads nothing).
+ * SCOPE HAS NO DEFAULT. "Everything the member can see" (`{ kind: "all-reachable" }`) and "only
+ * these projects" (`{ kind: "projects", projectIds }`) are both legal, and they differ enormously in
+ * blast radius, so the admin must SAY which. An untouched control yields no submittable payload at
+ * all — never a silent inherit-everything and never a silent `[]` (a token that reads nothing). The
+ * exact request is built by `mintRequestFor`; the action refuses anything else (AUDITFIX-19).
  *
  * The secret is rendered in a `<code>`, never an `<input>`: an input invites password-manager and
  * autofill capture. It is held in state only until dismissed, and is never attached to an error —
@@ -188,8 +189,8 @@ export function MintAgentToken({
           <input
             type="radio"
             name="scope"
-            checked={scope?.kind === "inherit"}
-            onChange={() => setScope({ kind: "inherit" })}
+            checked={scope?.kind === "all-reachable"}
+            onChange={() => setScope({ kind: "all-reachable" })}
           />
           <span>Everything the member can see (inherits their access as it changes)</span>
         </label>
@@ -197,12 +198,12 @@ export function MintAgentToken({
           <input
             type="radio"
             name="scope"
-            checked={scope?.kind === "restrict"}
-            onChange={() => setScope({ kind: "restrict", projectIds: [] })}
+            checked={scope?.kind === "projects"}
+            onChange={() => setScope({ kind: "projects", projectIds: [] })}
           />
           <span>Only the projects I choose</span>
         </label>
-        {scope?.kind === "restrict" && (
+        {scope?.kind === "projects" && (
           <div className="ml-6 flex max-h-40 flex-col gap-1 overflow-y-auto">
             {projects.length === 0 && (
               <span className="text-ink-tertiary">
@@ -217,7 +218,7 @@ export function MintAgentToken({
                   disabled={!scope.projectIds.includes(p.id) && scope.projectIds.length >= MAX_PROJECT_SCOPE}
                   onChange={(e) =>
                     setScope({
-                      kind: "restrict",
+                      kind: "projects",
                       // Capped here too: the action refuses more than MAX_PROJECT_SCOPE, and the
                       // form must not be able to compose a request the action will reject.
                       projectIds: e.target.checked
@@ -253,14 +254,13 @@ export function MintAgentToken({
           onClick={() =>
             startTransition(async () => {
               setError(null);
-              const res = await mintAgentTokenAction(teamSlug, {
-                memberId,
-                name,
-                // End of the chosen day, CLAMPED to the cap — picking the max offered date used to
-                // submit an instant ~12h past the exact 365-day limit, which the action then refused.
-                expiresAt: expiryInstantFor(expiry, Date.now()),
-                projectScope: scope?.kind === "restrict" ? scope.projectIds : null,
-              });
+              // The exact contract: one of the two deliberate choices, or nothing to send at all.
+              const request = mintRequestFor({ memberId, name, expiry, scope }, Date.now());
+              if (!request) {
+                setError("Choose what this token can read to continue.");
+                return;
+              }
+              const res = await mintAgentTokenAction(teamSlug, request);
               // Deliberately does NOT include res.token in any error path.
               if (!res.ok || !res.token) {
                 setError(res.error || "mint failed");

@@ -1,10 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import type { NextRequest } from 'next/server';
 import { POST } from '@/app/api/v1/evidence/search/route';
-import { db, seedTeam, ingest, externalMember } from './helpers';
+import { db, seedTeam, ingest, externalMember, persistLegacyEmptyScopeForTest } from './helpers';
 import { issueApiKey } from '@/lib/admin/keys';
 import { backfillTeamContext } from '@/lib/projects/context/backfill';
-import { mintAgentToken, revokeAgentToken } from '@/lib/access/agent-tokens';
+import { mintAgentToken, revokeAgentToken, verifyAgentToken } from '@/lib/access/agent-tokens';
 import { createGroup, addMemberToGroup, grantProjectToGroup, revokeProjectFromGroup } from '@/lib/access/groups';
 import { searchEvidence } from '@/lib/query/evidence';
 import { visibleItemIds } from '@/lib/access/enforce';
@@ -37,7 +37,9 @@ describe('evidence search real database and route',()=>{
   });
   it('delegation is scope-limited and revocation is live',async()=>{
     const s=await seedTeam();await ingest(s,{path:'private.md',body:'nonenal private evidence',access:'team'});await backfillTeamContext(db(),s.teamId);
-    const token=await mintAgentToken(db(),s.teamId,{memberId:s.memberId,projectScope:[]},s.memberId);expect(token.ok).toBe(true);
+    // AUDITFIX-19: new mints cannot request []; the legacy empty token is test-only persisted-row setup (read contract unchanged).
+    const token=await mintAgentToken(db(),s.teamId,{memberId:s.memberId,scope:{kind:'all-reachable'}},s.memberId);expect(token.ok).toBe(true);
+    await persistLegacyEmptyScopeForTest(s.teamId,token.tokenRowId!);expect((await verifyAgentToken(db(),token.token!))!.projectScope).toEqual([]);
     const r=await ask(token.token!,{query:'nonenal'});expect(r.status).toBe(200);expect((await r.json()).sources).toEqual([]);
     await revokeAgentToken(db(),s.teamId,token.tokenRowId!,s.memberId);expect((await ask(token.token!,{query:'nonenal'})).status).toBe(401);
   });
@@ -53,7 +55,7 @@ describe('evidence search real database and route',()=>{
     const group=await createGroup(db(),s.teamId,'researchers','Researchers',s.memberId);
     expect((await addMemberToGroup(db(),s.teamId,group.groupId!,s.memberId,s.memberId)).ok).toBe(true);
     const {key}=await issueApiKey(db(),s.teamId,s.memberId,'member');
-    const token=await mintAgentToken(db(),s.teamId,{memberId:s.memberId,projectScope:[project!.id]},s.memberId);expect(token.ok).toBe(true);
+    const token=await mintAgentToken(db(),s.teamId,{memberId:s.memberId,scope:{kind:'projects',projectIds:[project!.id]}},s.memberId);expect(token.ok).toBe(true);
     for(const k of [key,token.token!])expect((await (await ask(k,{query:'quuxrestricted'})).json()).sources).toEqual([]);
     expect((await grantProjectToGroup(db(),s.teamId,project!.id,group.groupId!,s.memberId)).ok).toBe(true);
     for(const k of [key,token.token!]){const r=await ask(k,{query:'quuxrestricted'});expect(r.status).toBe(200);expect(JSON.stringify(await r.json())).toContain('Secret Person');}

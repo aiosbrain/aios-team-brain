@@ -76,7 +76,10 @@ so the model stays one edge type).
    delegation, never by copying memberships: its access = the person's *current* access ∩ the
    token's scope, so it tracks group changes instantly and can only be narrowed at launch, never
    widened. An intersection can only shrink, so privilege expansion is impossible rather than
-   forbidden. An **autonomous** agent is instead its own principal: put in groups like a person,
+   forbidden. *(Superseded 2026-10-02 by AUDITFIX-19, `docs/design/auditfix19-explicit-agent-scope.md`,
+   for mint-time defaults only: full inheritance is no longer a default — every new mint must state
+   `all-reachable` or a project list, and omission is refused. Live inheritance for an explicit
+   all-reachable token, and the stored NULL/`[]`/list read semantics, are unchanged.)* An **autonomous** agent is instead its own principal: put in groups like a person,
    seeing exactly what its groups see, auto-joined to nothing (a new agent sees nothing until an
    admin places it).
    Old API keys keep working unchanged; the QM integration gets this principal model first, before
@@ -894,6 +897,14 @@ decision 3 / Part II invariant 2 — stays intact; invariant 10 separately bound
 credential was made: person-spawned = delegated token defaulting to full inheritance; standing =
 its own member row with explicit grants and no inherited anything.
 
+> **Superseded at mint time (2026-10-02, AUDITFIX-19 — `docs/design/auditfix19-explicit-agent-scope.md`).**
+> There is no longer a *default* scope: the guarded writer and the admin action refuse a mint that
+> does not choose `{ kind: "all-reachable" }` (stored `project_scope = NULL`) or
+> `{ kind: "projects", projectIds }` (stored list). Choosing all-reachable gives exactly the live,
+> non-copied inheritance described above. The stored read semantics in this section — NULL = no
+> attenuation, `'{}'` = sees nothing, list = intersection — are unchanged, and existing NULL/`'{}'`
+> tokens keep them.
+
 **Autonomous agents as first-class principals — group-governed, same one rule.** Delegation above
 covers an agent acting *as someone* — including the spawn default just stated; a standing
 autonomous agent (a scheduled workflow, a team bot
@@ -1059,7 +1070,9 @@ under `app/t/[team]/admin/*` and the guard that pages read through the oracle.
    `project_scope = NULL`, never the enumerated project list the picker displayed** — the display
    is a preview of live inheritance, not the credential's content; minting the displayed list
    would freeze a snapshot, exactly what the spawn default forbids (and what §14's gain-direction
-   probe exists to catch).
+   probe exists to catch). *(Superseded 2026-10-02 by AUDITFIX-19: an untouched launcher mints
+   NOTHING — the admin must choose all-reachable, which stores NULL, or a project list. The
+   no-snapshot rule for the all-reachable choice still holds.)*
 8. **Signal view** — placeholder rendering `intent_records` at the viewer's disclosure level; ships
    dark until §13 is built.
 

@@ -7,6 +7,16 @@ type: issue-spec
 
 # Admin → Agents — the surface that makes delegated tokens usable
 
+> **Scope rules superseded (2026-10-02) by AUDITFIX-19 —
+> [`auditfix19-explicit-agent-scope.md`](auditfix19-explicit-agent-scope.md), which is authoritative
+> for mint scope.** Where this document permits an omitted or `projectScope: null` request at the
+> action, or maps a form "inherit" choice to `projectScope: null`, that is replaced: the request now
+> carries a required `scope` — `{ kind: "all-reachable" }` (stored NULL) or
+> `{ kind: "projects", projectIds }` (stored canonical list) — and omission, the legacy
+> `projectScope` key and empty lists are refused at both the action and the guarded writer. The
+> form's "no default / untouched is not submittable" rule and the three stored read states below
+> (NULL / `[]` / list) are unchanged. The rest of this document is historical build context.
+
 ## What / why
 
 Delegated agent tokens are built, tested and enforced, and **no human can create one**.
