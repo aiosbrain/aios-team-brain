@@ -53,25 +53,27 @@ const TOKEN_CAPABLE = ["lib/query/retrieve.ts", "lib/query/structured-extras.ts"
  * listed here (lib/api/auth.ts).
  */
 const MEMBER_BOUNDARIES = new Set([
-  // The named constant (`MEMBER_ONLY_SURFACE`) feeding the three project-row helpers. Its authority
-  // is call-site enumeration: every caller is a session page or an `aios_` member route.
-  "lib/access/enforce.ts",
-  // NOT lib/metrics/pulse.ts: its absent-ctx fallback used to synthesise "member", which §2d
-  // forbids outright. It now synthesises nothing and the real ctx arrives from the page below.
-  "lib/dashboard/work-timeline.ts", // session-authenticated timeline
-  "app/api/v1/decisions/route.ts", // aios_ member key; authenticateApiKey rejects aiosd_
-  // Both found by the dm tier, NOT by the spec's §0 inventory, which said "exactly 7 consumers"
-  // and was wrong by two. Omitting the discriminator here closed the hand-typed arm and dropped
-  // every UI-origin task out of the writeback feed (tasks-sync-origin-feed reddened).
-  "app/api/v1/tasks/route.ts", // aios_ member key; authenticateApiKey rejects aiosd_
+  // TIERRET-1: THE positive admission boundary. "member" is emitted only after the members row
+  // passed `isPrincipal` (active human/standing agent, same team). Every session page and `aios_`
+  // route that used to spell "member" itself — and so silently called connector/offroster keys
+  // members — now receives its reader from here (`resolveContentView`/`provenanceCtxFor`/
+  // `retrieveEnforceFor`), and left this list: the timeline library, both query routes, the tasks
+  // and decisions feeds, the Pulse/tasks/decisions/project pages, and enforce.ts (whose WRITER rule
+  // is now the explicit legacy arm). A new entry needs the same authority.
+  "lib/access/admission.ts",
+  // PRESERVED unchanged (spec: lib/identity/context.ts's people identity-context ceiling is out of
+  // scope): the session member's posture still decides that surface's hand-typed arm.
   "app/t/[team]/people/[handle]/page.tsx", // session member; reaches the predicate via deriveProjects
-  "app/api/v1/query/route.ts", // the MEMBER branch, after authenticateApiKey (the token branch forwards "token")
-  "app/api/dashboard/query/route.ts", // session member
-  "app/t/[team]/page.tsx",
-  "app/t/[team]/tasks/page.tsx",
-  "app/t/[team]/decisions/page.tsx", // TS twin, positional
-  "app/t/[team]/projects/[project]/page.tsx", // TS twin, positional
 ]);
+
+/**
+ * TIERRET-1 — the LEGACY discriminator also carries authority (at team posture it is the old
+ * all-hand-entered arm), so it is inventoried the same way: only the admission resolver (for a
+ * non-principal) and enforce.ts's WRITER rule (the pre-TIERRET create-destination predicate) may
+ * manufacture it.
+ */
+const LEGACY_BOUNDARIES = new Set(["lib/access/admission.ts", "lib/access/enforce.ts"]);
+const LEGACY_LITERAL = /principal\s*:\s*["'`]legacy["'`](?!\s*\|)|(?:const|let|var)\s+\w+\s*(?::[^=;]*)?=\s*["'`]legacy["'`]/;
 
 function filesUnder(dir: string): string[] {
   const out: string[] = [];
@@ -126,9 +128,11 @@ function filesUnder(dir: string): string[] {
  * arms. Read this guard as the fast build-failing layer over a tier that independently proves the
  * outcome — not as the only thing between a token and the hand-typed rows.
  */
-/** The two fields that carry a principal's AUTHORITY. Both are forward-only, and both are equally
- *  deletable-without-reddening, so every rule below treats them identically. */
-const AUTHORITY_FIELDS = new Set(["principal", "tokenProjectIds"]);
+/** The fields that carry a principal's AUTHORITY. All are forward-only, and all are equally
+ *  deletable-without-reddening, so every rule below treats them identically. TIERRET-1 added
+ *  `memberProjectIds` (a non-Everyone member's granted projects): a dropped forward silently closes
+ *  a granted member's hand-entered rows — the M13 lesson, member edition. */
+const AUTHORITY_FIELDS = new Set(["principal", "tokenProjectIds", "memberProjectIds"]);
 
 function astViolations(code: string, rel = "inline.ts"): string[] {
   const src = ts.createSourceFile(rel, code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
@@ -142,11 +146,11 @@ function astViolations(code: string, rel = "inline.ts"): string[] {
     return ts.isIdentifier(inner.expression) && inner.expression.text === "enforce" && inner.name.text === "principal";
   };
 
-  /** The ONE permitted initialiser for the token project set: `enforce?.tokenProjectIds`. */
-  const isForwardedProjects = (e: ts.Expression): boolean => {
+  /** The ONE permitted initialiser for an authority set: `enforce?.<field>` of the SAME name. */
+  const isForwardedField = (e: ts.Expression, field: string): boolean => {
     const inner = ts.isNonNullExpression(e) ? e.expression : e;
     if (!ts.isPropertyAccessExpression(inner)) return false;
-    return ts.isIdentifier(inner.expression) && inner.expression.text === "enforce" && inner.name.text === "tokenProjectIds";
+    return ts.isIdentifier(inner.expression) && inner.expression.text === "enforce" && inner.name.text === field;
   };
 
   /** A property's name, resolving a literal COMPUTED key — the spelling Codex demonstrated. */
@@ -226,19 +230,22 @@ function astViolations(code: string, rel = "inline.ts"): string[] {
         // Deleting the forward closes the hand-typed arm for every token — which is EXACTLY today's
         // behaviour, so no token test would notice and no mutation would redden. Same reasoning that
         // put `principal` here: an absent forward is indistinguishable from the fail-closed default.
-        if (!names.includes("tokenProjectIds")) {
-          bad.push(`${at(node)} provenance ctx omits tokenProjectIds — a token's hand-typed arm closes silently`);
-        } else {
+        // TIERRET-1: `memberProjectIds` is the same hazard for a granted non-Everyone member.
+        for (const field of ["tokenProjectIds", "memberProjectIds"] as const) {
+          if (!names.includes(field)) {
+            bad.push(`${at(node)} provenance ctx omits ${field} — that principal's hand-typed arm closes silently`);
+            continue;
+          }
           // Fable diff review, LOW: presence alone was ASYMMETRIC with rule (1), which requires
-          // `principal` to be initialised to exactly `enforce?.principal`. `tokenProjectIds: undefined`
-          // or a locally recomputed set satisfied mere presence — and recomputing the authority is a
-          // second oracle read free to disagree with the first, which is the whole reason
-          // `delegatedVisibleItemIds` returns it. Same rule, same shape, both fields.
-          const prop = node.properties[names.indexOf("tokenProjectIds")];
-          if (prop && ts.isPropertyAssignment(prop) && !isForwardedProjects(prop.initializer)) {
-            bad.push(`${at(prop)} tokenProjectIds is \`${prop.initializer.getText(src)}\`, not enforce?.tokenProjectIds`);
+          // `principal` to be initialised to exactly `enforce?.principal`. `field: undefined` or a
+          // locally recomputed set satisfied mere presence — and recomputing the authority is a
+          // second oracle read free to disagree with the first, which is the whole reason the
+          // resolvers return it. Same rule, same shape, every authority field.
+          const prop = node.properties[names.indexOf(field)];
+          if (prop && ts.isPropertyAssignment(prop) && !isForwardedField(prop.initializer, field)) {
+            bad.push(`${at(prop)} ${field} is \`${prop.initializer.getText(src)}\`, not enforce?.${field}`);
           } else if (prop && ts.isShorthandPropertyAssignment(prop)) {
-            bad.push(`${at(prop)} shorthand \`{ tokenProjectIds }\` — forwarding cannot be spelled that way`);
+            bad.push(`${at(prop)} shorthand \`{ ${field} }\` — forwarding cannot be spelled that way`);
           }
         }
       }
@@ -286,6 +293,9 @@ describe("guard: a token can never acquire member provenance semantics", () => {
       expect(bad, `${rel}:\n  ${bad.join("\n  ")}`).toEqual([]);
       // …and they must actually DO the forwarding, or a file with no ctx at all would pass above.
       expect(read(rel), `${rel} must forward the discriminator`).toMatch(/principal:\s*enforce\?\.principal/);
+      expect(read(rel), `${rel} must forward a member's granted projects (TIERRET-1)`).toMatch(
+        /memberProjectIds:\s*enforce\?\.memberProjectIds/
+      );
     }
   });
 
@@ -293,40 +303,58 @@ describe("guard: a token can never acquire member provenance semantics", () => {
     // Each of these passed the regex guard at some point in this slice's history. They are kept as
     // negative controls so a future simplification of the walk reddens here rather than silently
     // reopening the hole.
-    const FORWARD = "const ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, principal: enforce?.principal };";
+    // Every shape below carries a CORRECT member forward (`M`) unless the shape is ABOUT that field,
+    // so each evasion is rejected for the reason its name states, not incidentally.
+    const M = "memberProjectIds: enforce?.memberProjectIds";
+    const FORWARD = `const ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, ${M}, principal: enforce?.principal };`;
     const EVASIONS: [string, string][] = [
-      ["literal", 'const ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, principal: "member" };'],
-      ["named constant", "const ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, principal: MEMBER_ONLY_SURFACE };"],
+      ["literal", `const ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, ${M}, principal: "member" };`],
+      ["named constant", `const ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, ${M}, principal: MEMBER_ONLY_SURFACE };`],
       [
         "local binding + shorthand (Fable's HIGH)",
-        'const principal = "member" as ProvenancePrincipal;\nconst ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, principal };',
+        `const principal = "member" as ProvenancePrincipal;\nconst ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, ${M}, principal };`,
       ],
       [
         "AUDITFIX-7: tokenProjectIds RECOMPUTED rather than forwarded (a second oracle read free to disagree)",
-        "const ctx = { visibleItemIds, teamPosture, tokenProjectIds: await recomputeProjects(), principal: enforce?.principal };",
+        `const ctx = { visibleItemIds, teamPosture, tokenProjectIds: await recomputeProjects(), ${M}, principal: enforce?.principal };`,
       ],
       [
         "AUDITFIX-7: tokenProjectIds omitted (closes every token's hand-typed arm SILENTLY)",
-        "const ctx = { visibleItemIds, teamPosture, principal: enforce?.principal };",
+        `const ctx = { visibleItemIds, teamPosture, ${M}, principal: enforce?.principal };`,
       ],
-      ["computed key", 'const ctx = { visibleItemIds, teamPosture, tokenProjectIds, ["principal"]: "member" };'],
+      [
+        "TIERRET-1: memberProjectIds RECOMPUTED rather than forwarded",
+        "const ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, memberProjectIds: await grantedProjects(), principal: enforce?.principal };",
+      ],
+      [
+        "TIERRET-1: memberProjectIds omitted (closes a granted member's hand-typed arm SILENTLY)",
+        "const ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, principal: enforce?.principal };",
+      ],
+      [
+        "TIERRET-1: memberProjectIds shorthand",
+        "const ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, memberProjectIds, principal: enforce?.principal };",
+      ],
+      ["computed key", `const ctx = { visibleItemIds, teamPosture, tokenProjectIds, ${M}, ["principal"]: "member" };`],
       [
         "spread override",
-        'const o = { principal: "member" };\nconst ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, principal: enforce?.principal, ...o };',
+        `const o = { principal: "member" };\nconst ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, ${M}, principal: enforce?.principal, ...o };`,
       ],
       ["direct assignment", `${FORWARD}\nenforce!.principal = "member";`],
       // ⚠️ Codex's diff review demonstrated this exact bypass: build the literal CORRECTLY, then
       // mutate it one line later. The object-literal rule inspects construction; it says nothing
-      // about the value. Both authority fields, all three reflective shapes.
+      // about the value. Every authority field, all three reflective shapes.
       ["post-construction mutation of tokenProjectIds", `${FORWARD}\nctx.tokenProjectIds = ["out-of-scope"];`],
+      ["post-construction mutation of memberProjectIds", `${FORWARD}\nctx.memberProjectIds = ["out-of-scope"];`],
       ["post-construction mutation of principal", `${FORWARD}\nctx.principal = "member";`],
       ["Object.assign over tokenProjectIds", `${FORWARD}\nObject.assign(ctx, { "tokenProjectIds": ["out-of-scope"] });`],
+      ["Object.assign over memberProjectIds", `${FORWARD}\nObject.assign(ctx, { memberProjectIds: ["out-of-scope"] });`],
       ["Object.assign over principal", `${FORWARD}\nObject.assign(ctx, { "principal": "member" });`],
       ["Reflect.set over tokenProjectIds", `${FORWARD}\nReflect.set(ctx, "tokenProjectIds", ["out-of-scope"]);`],
+      ["Reflect.set over memberProjectIds", `${FORWARD}\nReflect.set(ctx, "memberProjectIds", ["out-of-scope"]);`],
       ["logical-or assignment", `${FORWARD}\nenforce!.principal ||= "member";`],
       ["Reflect.set", `${FORWARD}\nReflect.set(enforce, "principal", "member");`],
       ["defineProperty", `${FORWARD}\nObject.defineProperty(enforce, "principal", { value: "member" });`],
-      ["derived from tier", 'const ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, principal: tier === "team" ? "member" : "token" };'],
+      ["derived from tier", `const ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, ${M}, principal: tier === "team" ? "member" : "token" };`],
       ["omitted entirely (M13)", "const ctx = { visibleItemIds, teamPosture };"],
       ["as-const literal", 'const ctx = { visibleItemIds, principal: "member" as const };'],
     ];
@@ -336,7 +364,7 @@ describe("guard: a token can never acquire member provenance semantics", () => {
 
     // …and it must ACCEPT the one legal shape, or it is a check that always fails.
     expect(astViolations(FORWARD), "forwarding must pass").toEqual([]);
-    expect(astViolations("const ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, principal: enforce.principal };")).toEqual([]);
+    expect(astViolations(`const ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, ${M}, principal: enforce.principal };`)).toEqual([]);
     // The three shapes that broke the hand-rolled scanner, all now handled by the parser.
     expect(
       astViolations('interface E { visibleItemIds: ReadonlySet<string>; principal?: "member" | "token" }'),
@@ -344,7 +372,7 @@ describe("guard: a token can never acquire member provenance semantics", () => {
     ).toEqual([]);
     expect(astViolations("const { visibleItemIds } = enforce;"), "destructuring is not a construction").toEqual([]);
     expect(
-      astViolations('const s = "{ visibleItemIds }";\nconst ctx = { visibleItemIds, tokenProjectIds: enforce?.tokenProjectIds, principal: enforce?.principal };'),
+      astViolations(`const s = "{ visibleItemIds }";\nconst ctx = { visibleItemIds, tokenProjectIds: enforce?.tokenProjectIds, ${M}, principal: enforce?.principal };`),
       "a brace inside a string no longer misleads anything"
     ).toEqual([]);
   });
@@ -379,6 +407,32 @@ describe("guard: a token can never acquire member provenance semantics", () => {
     // …and codeOnly must not swallow a generator method, which would be a hiding place.
     expect(codeOnly('class C {\n  *iter() { const principal = "member"; }\n}')).toContain("principal");
     expect(codeOnly(" * a jsdoc continuation line"), "prose is still stripped").not.toContain("jsdoc");
+  });
+
+  it("TIERRET-1: every LEGACY literal sits at the admission resolver or the writer rule", () => {
+    const offenders = [...filesUnder("lib"), ...filesUnder("app"), ...filesUnder("scripts")]
+      .filter((rel) => !LEGACY_BOUNDARIES.has(rel))
+      .filter((rel) => LEGACY_LITERAL.test(codeOnly(read(rel))));
+    expect(offenders, "only admission.ts (non-principal) and enforce.ts (writer rule) may manufacture the legacy arm").toEqual([]);
+    const stale = [...LEGACY_BOUNDARIES].filter((rel) => !LEGACY_LITERAL.test(codeOnly(read(rel))));
+    expect(stale, "a listed legacy boundary no longer manufactures the arm — check before deleting the entry").toEqual([]);
+    // non-vacuity
+    expect(LEGACY_LITERAL.test('const c = { principal: "legacy" };')).toBe(true);
+    expect(LEGACY_LITERAL.test('const LEGACY_WRITER_RULE = "legacy" as const;')).toBe(true);
+    expect(LEGACY_LITERAL.test('if (reader.principal === "legacy") return x;'), "a comparison reads").toBe(false);
+    expect(LEGACY_LITERAL.test('principal: "member" | "legacy" | "token";'), "a union declares").toBe(false);
+  });
+
+  it("TIERRET-1: the admission resolver emits the member arm ONLY after isPrincipal", () => {
+    const adm = codeOnly(read("lib/access/admission.ts"));
+    const principalCheck = adm.indexOf("if (!isPrincipal(member)) return { kind: \"legacy\"");
+    const memberReturn = adm.indexOf('kind: "member",');
+    expect(principalCheck, "the positive eligibility check must exist").toBeGreaterThan(-1);
+    expect(memberReturn, "and precede the member arm").toBeGreaterThan(principalCheck);
+    // Errors throw (fail closed) rather than default to either arm.
+    expect(adm).toMatch(/if \(error\) throw new ContentAdmissionError/);
+    expect(adm).toMatch(/if \(!data\) throw new ContentAdmissionError/);
+    expect(adm).toMatch(/if \(oracleError\) throw new ContentAdmissionError/);
   });
 
   it("the allow-list is honest — every listed boundary really does assert memberhood", () => {

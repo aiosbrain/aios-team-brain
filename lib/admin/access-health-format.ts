@@ -28,6 +28,11 @@ export function formatAccessHealth(r: AccessHealth): string[] {
     `  health: ${healthVerdict(r)} · ${r.humanPrincipals} human(s), ${r.agentPrincipals} agent(s), ${r.itemsScanned} item(s) scanned`,
   ];
   for (const b of r.blockers) lines.push(`  ✗ ${b}`);
+  // TIERRET-1: the drift blocker names WHO, by member id as well as email — an operator acting on it
+  // needs an identifier the groups CLI accepts, and a blocker that only counts is not actionable.
+  for (const m of r.externalTierInEveryone ?? []) {
+    lines.push(`    · external-tier in Everyone: ${m.memberId}${m.email ? ` <${m.email}>` : ""}`);
+  }
   for (const w of r.warnings) lines.push(`  ⚠ ${w}`);
   return lines;
 }

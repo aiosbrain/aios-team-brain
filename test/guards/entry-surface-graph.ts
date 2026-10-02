@@ -1457,7 +1457,8 @@ export const ENTRY_INVENTORY: Record<string, EntryRecord> = {
     reason:
       "imports getCachedWorkTimeline (lib/dashboard/timeline-cache) and getWorkTimeline/WINDOW_DAYS " +
       "(lib/dashboard/work-timeline); work-timeline reaches the writer only through canSeeMeetingNotes " +
-      "in lib/meetings/notes, a visibility READER",
+      "in lib/meetings/notes (the legacy arm's posture predicate — a pure READER), and reaches " +
+      "lib/access/admission only for its types/ctx builder (no write path)",
   },
   "app/api/dashboard/team-work/route.ts": {
     class: "IMPORT_ONLY",

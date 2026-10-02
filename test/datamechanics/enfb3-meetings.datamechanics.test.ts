@@ -113,7 +113,7 @@ describe("ENFB-3 — the meetings surfaces gate on the item oracle", () => {
     }
   });
 
-  it("D4: a tombstone (merged_into) refuses at detail even for a grantee; external posture stays walled", async () => {
+  it("D4: a tombstone (merged_into) refuses at detail even for a grantee; an ungranted external member sees no note", async () => {
     const seed = await seedTeam();
     await backfillTeamContext(db(), seed.teamId);
     const member = await seedMember(seed);
@@ -129,7 +129,10 @@ describe("ENFB-3 — the meetings surfaces gate on the item oracle", () => {
     expect(await getMeetingNote(db(), seed.teamId, target.noteId, viewer(member)), "the survivor serves").not.toBeNull();
 
     const external = await seedMember(seed, "external");
-    expect(await listMeetingNotesForTeam(db(), seed.teamId, viewer(external, "external")), "external posture → [] (the coarse wall, unchanged)").toEqual([]);
+    // TIERRET-1 (AC-07): the posture wall is gone from meeting READS — this external member sees
+    // nothing because no grant reaches these transcripts (General), not because of their posture.
+    // The granted-external positive lives in tierret1-member-reads (AC-07).
+    expect(await listMeetingNotesForTeam(db(), seed.teamId, viewer(external, "external")), "no grant reaches the transcripts → []").toEqual([]);
   });
 
   it("the transcript ACTIONS refuse a denied noteId before any write (extract + regenerate + push), and work for the grantee", async () => {
