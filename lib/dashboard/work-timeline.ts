@@ -737,6 +737,12 @@ export async function getWorkTimeline(
       // instead would need an OR for null-dated notes, which this query builder has no `.or()` for —
       // and meetings are a low-volume table (tens of rows per team), so a capped ordered scan is both
       // simpler and exactly correct.
+      //
+      // The transcript oracle is IN-QUERY, before the cap, like every item leg's `withVis`: a
+      // post-filter alone let newer hidden notes fill the cap and starve an older visible one. A null
+      // vis-set compiles to `WHERE false`, matching `srcVisible`'s fail-closed null. The `srcVisible`
+      // post-filter below stays as defense in depth.
+      .in("source_item_id", visArr ?? [])
       .order("occurred_at", { ascending: false })
       .limit(MEETING_NOTE_LIMIT);
     if (meetRes.error) {

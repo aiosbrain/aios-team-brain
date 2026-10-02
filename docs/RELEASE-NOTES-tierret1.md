@@ -19,7 +19,10 @@ Ticket AIO-1045 (brain row TIERRET-1). Spec: `docs/design/tierret1-membership-on
   rule" below); push coercion (an external key still cannot overwrite a team item and a fresh
   external push is still stored `external`); explicit `?tier=external` OKF export narrowing and link
   redaction; people identity context; codebase/maturity telemetry; social admin gating and
-  publication ceilings.
+  publication ceilings; the workspace project-registration / push-destination boundary
+  (`GET /api/v1/projects` still refuses an external-posture key with `403 forbidden_tier` before its
+  writer-row-set lookup — an external collaborator's full pull does NOT gain brain-created project
+  marker registration from this route; AC-14's recovery covers items, tasks, decisions and OKF only).
 - Grants take effect **immediately on deploy** — there is no migration, no re-ingest, no data rewrite.
 
 ### Who GAINS and who LOSES on deploy — read before rolling out

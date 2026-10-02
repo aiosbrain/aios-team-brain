@@ -263,7 +263,10 @@ describe("TIERRET-1 AC-07 — Social member reads are the EVERY-evidence rule at
 
     const view = await resolveContentView(db(), F.seed.teamId, F.external);
     expect(view.admission.posture).toBe("external");
-    // The page's member read: no label veto (the page passes its label-free arm), EVERY evidence.
+    // HELPER-LEVEL store policy proof only: the store's member read applies no label veto when
+    // handed the oracle set, and admits by EVERY evidence regardless of the tier argument. It does
+    // NOT show an external-posture user reaching the social admin page — that page and the media
+    // route keep their unchanged `canAccessAdmin` role/posture gate.
     const titles = (await listOpportunities(db(), F.seed.teamId, "team", 100, view.ids)).map((o) => o.title);
     expect(titles, "all evidence granted → served at external posture").toContain("granted story");
     expect(titles, "one hidden evidence item denies the whole opportunity").not.toContain("mixed story");
