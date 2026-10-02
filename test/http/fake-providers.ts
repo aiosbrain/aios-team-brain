@@ -1,5 +1,9 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+// Type-only and erased at runtime (the global setup must not load vitest's runtime). A `declare module`
+// augmentation never adds its target to the TS program, and `test/` is tsconfig-excluded, so this import
+// is what makes `vitest` resolvable for the ProvidedContext augmentation below under `tsc --noEmit`.
+import type {} from "vitest";
 
 /**
  * TEST-ONLY loopback fakes for the opt-in TIERRET-1 query harness (`vitest.tierret1-query.config.ts`).
