@@ -33,10 +33,23 @@ describe("signed encrypted staging bundle", () => {
       exporterSigningPrivateKey: key(signing.privateKey, "private"),
       importerEncryptionPublicKey: key(importer.publicKey, "public"),
     });
+    // Overwriting trailing base64 symbols is a no-op whenever they already hold the replacement
+    // value, so flip one bit of the decoded bytes instead and prove the bytes really changed.
+    const flipFirstBit = (encoded: string) => {
+      const original = Buffer.from(encoded, "base64");
+      expect(original.length).toBeGreaterThan(0);
+      const flipped = Buffer.from(original);
+      flipped[0] ^= 0x01;
+      const reencoded = flipped.toString("base64");
+      const decoded = Buffer.from(reencoded, "base64");
+      expect(decoded).toHaveLength(original.length);
+      expect(decoded.equals(original)).toBe(false);
+      return reencoded;
+    };
     const changed = structuredClone(bundle);
-    if (part === "ciphertext") changed.ciphertext = `${changed.ciphertext.slice(0, -2)}AA`;
+    if (part === "ciphertext") changed.ciphertext = flipFirstBit(changed.ciphertext);
     if (part === "manifest") changed.manifest.runId = "other";
-    if (part === "signature") changed.manifest.signature = `${changed.manifest.signature.slice(0, -2)}AA`;
+    if (part === "signature") changed.manifest.signature = flipFirstBit(changed.manifest.signature);
     expect(() => openSignedEncryptedBundle({
       bundle: changed,
       exporterSigningPublicKey: key(signing.publicKey, "public"),
