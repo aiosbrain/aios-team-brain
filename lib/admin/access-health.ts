@@ -1,7 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { isPrincipal } from "@/lib/access/eligibility";
-import { visibleProjects } from "@/lib/access/oracle";
+import { visibleProjectsWithError } from "@/lib/access/oracle";
 import { findUnpartitionedItems } from "@/lib/projects/context/coverage";
 import { GENERAL_SLUG, EXTERNAL_SHARED_SLUG } from "@/lib/access/bootstrap";
 import { censusTeamSystemEdges } from "@/lib/access/groups";
@@ -70,7 +70,7 @@ type MemberRow = {
  * Is anyone blind, is anything unreachable, RIGHT NOW? Read-only.
  *
  * The checks are deliberately derived from the SAME primitives the enforced read uses rather than
- * from a proxy for them: per-member visibility comes from the oracle itself (`visibleProjects`),
+ * from a proxy for them: per-member visibility comes from the oracle itself (`visibleProjectsWithError`),
  * so a broken group/grant edge anywhere in the chain shows up as the member actually going blind,
  * not as a table row that looks plausible. An inspector that agrees with enforcement is the only
  * kind worth having (the §15.6 rule).
@@ -152,7 +152,19 @@ export async function assessAccessHealth(db: DbClient, teamId: string): Promise<
   const { builtinMembershipBySlug } = await import("@/lib/access/groups");
   const builtinRows = await builtinMembershipBySlug(db, teamId);
   for (const m of principals) {
-    const { projectIds } = await visibleProjects(db, { teamId, memberId: m.id });
+    // TIERRET-1 AC-10: the ERROR-VISIBLE oracle read. `visibleProjects` collapses a failed member/
+    // membership/grant read into the same empty set a genuinely grantless member gets, so a broken
+    // read on one agent became an "unplaced agent" warning and health stayed clean. Fail here, before
+    // the empty set is interpreted — the same throw as the bulk reads above, naming the member.
+    const { set, error: visErr } = await visibleProjectsWithError(db, { teamId, memberId: m.id });
+    if (visErr) {
+      throw new Error(
+        `access visibility resolution failed for ${m.kind} member ${m.id}` +
+          `${m.email ? ` (${m.email})` : ""}: a member, group-membership or grant read errored, so its ` +
+          `access is UNVERIFIED and health cannot be assessed — retry, and check the database if it persists`
+      );
+    }
+    const { projectIds } = set;
     const identity: BlindPrincipal = { memberId: m.id, email: m.email, kind: m.kind, tier: m.tier };
     if (m.kind === "human") {
       humanPrincipals++;
