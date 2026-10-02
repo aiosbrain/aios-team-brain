@@ -6,7 +6,7 @@ import type { PoolClient } from "pg";
 import { db, transactionSessionDecoratedDb } from "./helpers";
 import { getPool } from "@/lib/db/pg/pool";
 import { PgClient } from "@/lib/db/pg/client";
-import { runPgClientTransaction, type PgTransactionFactory } from "@/lib/db/pg/tx";
+import { runPgClientTransaction, TransactionExecutionError, type PgTransactionFactory } from "@/lib/db/pg/tx";
 import type { SqlExecutor, TransactionCapableDbClient, TransactionSession } from "@/lib/db/types";
 import { materializeBuiltinMembershipOnce, type MaterializeOnceResult } from "@/lib/access/groups";
 import { makeMaterializeDeps, runMaterializeCommand, type MaterializeResult } from "@/lib/access/materialize-command";
@@ -15,8 +15,9 @@ import { makeMaterializeDeps, runMaterializeCommand, type MaterializeResult } fr
  * STAGINGMARK-5 / AIO-1132 — one bounded runtime owner for builtin materialization.
  * Spec: docs/design/stagingmark5-runtime-owner.md (v2.2). Covers AC-01, AC-02 (stale state, blocked
  * cascade barrier, repeatable-read connection-default variant), AC-04 (posture matrix), AC-05
- * (racing owners), AC-06 (atomic failures, best-effort audit) and Stage 1 slices of AC-07/AC-11.
- * Later criteria (AC-03, AC-07..AC-12 remainder) land in later stages.
+ * (racing owners), AC-06 (atomic failures, best-effort audit), AC-07 (order and the real 31s
+ * deadline), AC-08 (production 2s lock cap), AC-09 (cancellation after effects, same-backend
+ * restoration) and the real-PG slice of AC-11. Later criteria (AC-03, AC-10, AC-12) land later.
  *
  * These are written from the spec, not from the implementation. Against the pre-conversion
  * TypeScript materializer (lib/access/groups.ts), which reads the marker but never the substrate,
@@ -40,13 +41,15 @@ const CANONICAL_SQL = join(root, "postgres/schema.sql");
 /**
  * Mutation harness ONLY (see the STAGINGMARK-5 core-stage2/stage3 handoffs): a disposable COPY of
  * the schema file whose materializer has exactly ONE post-lock check removed — the substrate check
- * (`STAGINGMARK5_MUTANT_KIND` unset or `substrate`) or the marker recheck (`marker`). Both unset in
- * every ordinary run, so the canonical file is installed and every assertion below stays normative.
+ * (`STAGINGMARK5_MUTANT_KIND` unset or `substrate`) or the marker recheck (`marker`) — or (`atomicity`,
+ * Stage 4) both checks intact plus an added `query_canceled` handler that swallows a cancellation.
+ * All unset in every ordinary run, so the canonical file is installed and every assertion below
+ * stays normative.
  */
 const MUTANT_SQL = process.env.STAGINGMARK5_MUTANT_SQL;
 const MUTANT_KIND = process.env.STAGINGMARK5_MUTANT_KIND;
 const MARKER_CHECK = /select\s+1\s+from\s+migration_markers\s+where\s+name\s*=\s*'pret4_builtin_materialize'/gi;
-type PostLockChecks = { substrate: 0 | 1; marker: 0 | 1 };
+type PostLockChecks = { substrate: 0 | 1; marker: 0 | 1; queryCanceled?: true };
 const CANONICAL_CHECKS: PostLockChecks = { substrate: 1, marker: 1 };
 
 function mutantChecks(): PostLockChecks {
@@ -56,6 +59,7 @@ function mutantChecks(): PostLockChecks {
   }
   if (MUTANT_KIND === undefined || MUTANT_KIND === "substrate") return { substrate: 0, marker: 1 };
   if (MUTANT_KIND === "marker") return { substrate: 1, marker: 0 };
+  if (MUTANT_KIND === "atomicity") return { ...CANONICAL_CHECKS, queryCanceled: true };
   throw new Error(`unknown STAGINGMARK5_MUTANT_KIND: ${MUTANT_KIND}`);
 }
 
@@ -73,16 +77,23 @@ async function installMaterializer(path: string, postLock: PostLockChecks): Prom
   expect(postLockText.split(SUBSTRATE_MESSAGE)).toHaveLength(postLock.substrate + 1);
   expect(preLock.match(MARKER_CHECK) ?? []).toHaveLength(1);
   expect(postLockText.match(MARKER_CHECK) ?? []).toHaveLength(postLock.marker);
+  // The frozen function catches only WHEN OTHERS, which never matches 57014; a cancellation
+  // handler exists only in the deliberate atomicity mutant (so that copy cannot be a no-op edit).
+  expect(/\bquery_canceled\b/i.test(block[0]), "query_canceled handler present").toBe(postLock.queryCanceled === true);
   await query("drop function if exists materialize_builtin_membership_once()");
   await query(block[0]);
 }
 
-/** Test-owned fault triggers (AC-06). Dropped before and after the file, and in each case's finally. */
+/** Test-owned fault/delay triggers (AC-06, AC-09). Dropped before and after the file, and in each case's finally. */
 async function dropTestFaults(): Promise<void> {
   await query("drop trigger if exists stagingmark5_late_fault on migration_markers");
   await query("drop function if exists stagingmark5_late_fault()");
   await query("drop trigger if exists stagingmark5_audit_fault on audit_log");
   await query("drop function if exists stagingmark5_audit_fault()");
+  await query("drop trigger if exists stagingmark5_late_delay on migration_markers");
+  await query("drop function if exists stagingmark5_late_delay()");
+  await query("drop trigger if exists stagingmark5_audit_delay on audit_log");
+  await query("drop function if exists stagingmark5_audit_delay()");
 }
 
 beforeAll(async () => {
@@ -1264,5 +1275,536 @@ describe("STAGINGMARK-5 AC-06 — failures are atomic and retryable; the audit a
     expect([...pinned.notices].sort()).toEqual(
       fx.expectedAudits.map((a) => `access.builtin_materialized audit failed for group ${idOf.get(a.group)}: stagingmark5 audit fault`).sort()
     );
+  }, CASE_TIMEOUT_MS);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Stage 4 — AC-07 real deadline, AC-08 production lock cap, AC-09 cancellation and restoration.
+// ---------------------------------------------------------------------------------------------
+
+const STATEMENT_TIMEOUT_SQL = "SELECT set_config('statement_timeout', $1, true)";
+const PRODUCTION_STATEMENT_TIMEOUT = "120000ms";
+/** AC-09 fault cases ONLY: the requested 120000ms is sent as 200ms so a real cancellation lands mid-statement. */
+const FAULT_STATEMENT_TIMEOUT = "200ms";
+const STATEMENT_TIMEOUT_MESSAGE = "canceling statement due to statement timeout";
+/** AC-07 only: ~30s negative + ~31s positive. No other case or suite budget is raised. */
+const DEADLINE_CASE_TIMEOUT_MS = 100_000;
+/**
+ * AC-07's ONE outer statement: a MATERIALIZED CTE sleeps 31s before the UNCHANGED function call is
+ * evaluated over its single row. Deadline containment, not throughput; no separate sleep statement.
+ */
+const DELAYED_FUNCTION_SQL = `WITH stagingmark5_delay AS MATERIALIZED (SELECT pg_sleep(31)) ${FUNCTION_SQL} FROM stagingmark5_delay`;
+
+type Settings = {
+  statement_timeout: string;
+  lock_timeout: string;
+  idle_in_transaction_session_timeout: string;
+  transaction_isolation: string;
+  default_transaction_isolation: string;
+  backend: number;
+  materializer_locks: number;
+};
+
+/** One read of a backend's actual settings, its PID, and any relation lock it holds on the five tables the function locks. */
+async function settingsOf(real: PoolClient): Promise<Settings> {
+  return (await real.query(
+    `select current_setting('statement_timeout') as statement_timeout,
+            current_setting('lock_timeout') as lock_timeout,
+            current_setting('idle_in_transaction_session_timeout') as idle_in_transaction_session_timeout,
+            current_setting('transaction_isolation') as transaction_isolation,
+            current_setting('default_transaction_isolation') as default_transaction_isolation,
+            pg_backend_pid() as backend,
+            (select count(*)::int from pg_locks l
+              where l.pid = pg_backend_pid() and l.locktype = 'relation'
+                and l.relation in ('teams'::regclass, 'members'::regclass, 'groups'::regclass,
+                                   'group_members'::regclass, 'migration_markers'::regclass)) as materializer_locks`
+  )).rows[0] as Settings;
+}
+
+/**
+ * Test-owned pinned fixture for AC-07/08/09: the REAL engine (`runPgClientTransaction`) over ONE real
+ * pool checkout via the existing `factory.connect` seam. Same backend throughout:
+ *  - `baseline`: its actual settings at checkout, before the engine's BEGIN;
+ *  - `effective`: read right after the lock-cap statement succeeds — a healthy point inside the
+ *    owned transaction, before the function SELECT. Nothing is ever read after a failed statement,
+ *    so an aborted transaction is never queried;
+ *  - `restored`: the engine's healthy release is synchronous, so the facade retains the real
+ *    checkout, reads the same backend AFTER COMMIT/ROLLBACK, then genuinely releases it (destroying
+ *    it if anything leaked). The engine does not await this — the test awaits `released`.
+ * A destroying release (error) is passed straight through and never inspected.
+ */
+function ownedDb(decorateExecutor?: (executor: SqlExecutor) => SqlExecutor) {
+  const statements: { pid: number; sql: string; params: unknown[]; ms: number }[] = [];
+  const notices: string[] = [];
+  const effective: Settings[] = [];
+  const restored: Settings[] = [];
+  const releases: (Error | undefined)[] = [];
+  const state: { connects: number; pid?: number; baseline?: Settings; inspectionError?: string } = { connects: 0 };
+  const done = deferred();
+  const factory: PgTransactionFactory = {
+    connect: async () => {
+      state.connects += 1;
+      const real = await getPool().connect();
+      const pid = (real as unknown as { processID: number }).processID;
+      try {
+        state.baseline = await settingsOf(real);
+      } catch (error) {
+        real.release(error instanceof Error ? error : new Error(String(error)));
+        done.resolve();
+        throw error;
+      }
+      state.pid = pid;
+      const onNotice = (notice: { message?: string }) => notices.push(String(notice.message));
+      real.on("notice", onNotice);
+      return {
+        query: async (text: string, params: unknown[] = []) => {
+          const entry = { pid, sql: text, params, ms: -1 };
+          statements.push(entry);
+          const started = Date.now();
+          let result: unknown;
+          try {
+            result = await real.query(text, params);
+          } finally {
+            entry.ms = Date.now() - started;
+          }
+          // Reached only on success: a failed statement has already propagated, so its aborted
+          // transaction is never queried.
+          if (text === LOCK_TIMEOUT_SQL) effective.push(await settingsOf(real));
+          return result;
+        },
+        release: (err?: Error) => {
+          releases.push(err);
+          real.off("notice", onNotice);
+          if (err) {
+            real.release(err);
+            done.resolve();
+            return;
+          }
+          void (async () => {
+            try {
+              const after = await settingsOf(real);
+              restored.push(after);
+              const same = JSON.stringify(after) === JSON.stringify(state.baseline);
+              real.release(same ? undefined : new Error("stagingmark5: backend settings not restored"));
+            } catch (error) {
+              state.inspectionError = String(error);
+              real.release(error instanceof Error ? error : new Error(String(error)));
+            }
+          })().finally(() => done.resolve());
+        },
+      } as unknown as PoolClient;
+    },
+    decorateExecutor,
+    makeBoundClient: (executor, reportFailure) => new PgClient({ executor, reportFailure, bound: true }),
+  };
+  const outer = db() as TransactionCapableDbClient;
+  const client: TransactionCapableDbClient = {
+    from: outer.from.bind(outer),
+    rpc: outer.rpc.bind(outer),
+    transaction: <T>(fn: (session: TransactionSession) => Promise<T>) => runPgClientTransaction(factory, fn),
+  };
+  return { client, statements, notices, effective, restored, releases, state, released: done.promise };
+}
+type OwnedDb = ReturnType<typeof ownedDb>;
+
+/**
+ * The same backend went baseline → owned caps → baseline. Baseline is the ACTUAL ordinary pool
+ * default (lib/db/pg/pool.ts: 30s statement cap, default 60s idle-in-transaction cap) plus whatever
+ * lock/isolation the backend really had; inside, only the statement cap, the 2s lock cap and READ
+ * COMMITTED differ; after the engine's COMMIT/ROLLBACK every field equals the baseline again.
+ */
+function expectRestoredOnSameBackend(owned: OwnedDb, end: "COMMIT" | "ROLLBACK", statementCap = "2min") {
+  expect(owned.state.connects).toBe(1);
+  const pid = owned.state.pid;
+  const baseline = owned.state.baseline!;
+  expect(baseline).toMatchObject({ statement_timeout: "30s", idle_in_transaction_session_timeout: "1min", backend: pid, materializer_locks: 0 });
+  expect(baseline.lock_timeout).not.toBe("2s");
+  expect(owned.statements.length).toBeGreaterThan(0);
+  expect(owned.statements.every((s) => s.pid === pid)).toBe(true);
+  expect(owned.statements.at(-1)?.sql).toBe(end);
+  expect(owned.effective).toEqual([{ ...baseline, statement_timeout: statementCap, lock_timeout: "2s", transaction_isolation: "read committed" }]);
+  expect(owned.releases).toEqual([undefined]);
+  expect(owned.state.inspectionError).toBeUndefined();
+  expect(owned.restored).toEqual([baseline]);
+}
+
+function functionStatement(owned: OwnedDb) {
+  const calls = owned.statements.filter((s) => s.sql.includes("materialize_builtin_membership_once"));
+  expect(calls, "exactly one function-carrying statement").toHaveLength(1);
+  return calls[0];
+}
+
+/** AC-07: rewrites ONLY the exact function SELECT into the one delayed outer statement, and records each request. */
+function delayingExecutor(requested: string[]) {
+  return (executor: SqlExecutor): SqlExecutor => async <T>(text: string, params: unknown[] = []) => {
+    if (text !== FUNCTION_SQL) return executor<T>(text, params);
+    requested.push(text);
+    return executor<T>(DELAYED_FUNCTION_SQL, params);
+  };
+}
+
+/**
+ * AC-09 fault cases ONLY: records the statement and lock caps the service REQUESTED and, only when the
+ * statement cap is exactly the production 120000ms, sends 200ms instead. Thrown failures are recorded, never altered.
+ */
+function cancellingExecutor(requested: { statement: unknown[][]; lock: unknown[][] }, failures: SqlFailure[]) {
+  return (executor: SqlExecutor): SqlExecutor => async <T>(text: string, params: unknown[] = []) => {
+    let sent = params;
+    if (text === STATEMENT_TIMEOUT_SQL) {
+      requested.statement.push(params);
+      if (params.length === 1 && params[0] === PRODUCTION_STATEMENT_TIMEOUT) sent = [FAULT_STATEMENT_TIMEOUT];
+    }
+    if (text === LOCK_TIMEOUT_SQL) requested.lock.push(params);
+    try {
+      return await executor<T>(text, sent);
+    } catch (error) {
+      const e = error as { code?: unknown; message?: unknown };
+      failures.push({ code: typeof e.code === "string" ? e.code : undefined, message: String(e.message ?? error) });
+      throw error;
+    }
+  };
+}
+
+const ownedOrder = (statementCap: string) => [
+  { sql: "BEGIN", params: [] },
+  { sql: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED", params: [] },
+  { sql: STATEMENT_TIMEOUT_SQL, params: [statementCap] },
+  { sql: LOCK_TIMEOUT_SQL, params: [PRODUCTION_LOCK_TIMEOUT] },
+];
+
+describe("STAGINGMARK-5 AC-07 (deadline) — one real 31s function SELECT: the ordinary 30s default cancels it, the owner's local 120s commits it", () => {
+  it("bare default-30s transaction cancels the delayed SELECT with 57014 and no effects; the service runs the same statement past 31s under its local 120000ms and commits; one function SELECT, required order, one PID, settings restored", async () => {
+    const a = await team();
+    const before = await effects();
+    expect(before.marker).toEqual([]);
+
+    // NEGATIVE control (not the service): the same delayed statement in a real engine transaction
+    // with READ COMMITTED and the 2s lock cap but NO statement cap — only the ordinary 30s default.
+    const bareRequested: string[] = [];
+    const bare = ownedDb(delayingExecutor(bareRequested));
+    let bareError: unknown;
+    try {
+      await within(
+        bare.client.transaction(async (session) => {
+          await session.executeSql("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+          await session.executeSql(LOCK_TIMEOUT_SQL, [PRODUCTION_LOCK_TIMEOUT]);
+          return session.executeSql(FUNCTION_SQL);
+        }),
+        45_000,
+        "bare default-30s transaction"
+      );
+    } catch (error) {
+      bareError = error;
+    }
+    await within(bare.released, 10_000, "bare release inspection");
+
+    expect(bareError).toBeInstanceOf(TransactionExecutionError);
+    expect(bareError).toMatchObject({ code: "57014", message: `transaction SQL failed: ${STATEMENT_TIMEOUT_MESSAGE}` });
+    expect(bareRequested).toEqual([FUNCTION_SQL]);
+    expect(bare.statements.map(({ sql, params }) => ({ sql, params }))).toEqual([
+      { sql: "BEGIN", params: [] },
+      { sql: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED", params: [] },
+      { sql: LOCK_TIMEOUT_SQL, params: [PRODUCTION_LOCK_TIMEOUT] },
+      { sql: DELAYED_FUNCTION_SQL, params: [] },
+      { sql: "ROLLBACK", params: [] },
+    ]);
+    // The 57014/ROLLBACK/no-effects assertions prove the 30s default cancelled it. `ms` is CLIENT
+    // delivery time (send → error received), not the server's cancellation instant, so it only
+    // bounds the case: at least the 30s default, and within the finite 45s harness above.
+    const bareCall = functionStatement(bare);
+    expect(bareCall.ms).toBeGreaterThanOrEqual(29_950);
+    expect(bareCall.ms).toBeLessThan(45_000);
+    expectRestoredOnSameBackend(bare, "ROLLBACK", "30s");
+    expect(await effects()).toEqual(before);
+
+    // POSITIVE: the real service, the same single delayed outer statement, its own local 120000ms.
+    const requested: string[] = [];
+    const owned = ownedDb(delayingExecutor(requested));
+    const result = await within(materializeBuiltinMembershipOnce(owned.client), 60_000, "owner under its local 120s cap");
+    await within(owned.released, 10_000, "owner release inspection");
+
+    expect(result).toEqual({ ok: true, ran: true });
+    expect(requested).toEqual([FUNCTION_SQL]);
+    expect(owned.statements.map(({ sql, params }) => ({ sql, params }))).toEqual([
+      ...ownedOrder(PRODUCTION_STATEMENT_TIMEOUT),
+      { sql: DELAYED_FUNCTION_SQL, params: [] },
+      { sql: "COMMIT", params: [] },
+    ]);
+    const call = functionStatement(owned);
+    expect(call.ms).toBeGreaterThanOrEqual(31_000);
+    expect(call.ms).toBeLessThan(120_000);
+    expectRestoredOnSameBackend(owned, "COMMIT");
+    expect((await effects()).marker).toHaveLength(1);
+    await expectBuiltinsFor([a]);
+  }, DEADLINE_CASE_TIMEOUT_MS);
+});
+
+/** A dedicated connection holding ROW EXCLUSIVE on `teams` — it conflicts with the function's first lock and writes nothing. */
+async function holdConflictingLock() {
+  const holder = await getPool().connect();
+  let open = false;
+  const unlock = async () => {
+    if (open) await holder.query("ROLLBACK");
+    open = false;
+  };
+  const dispose = async () => {
+    try {
+      await unlock();
+      holder.release();
+    } catch (error) {
+      holder.release(error instanceof Error ? error : new Error(String(error)));
+    }
+  };
+  try {
+    const pid = (await holder.query("select pg_backend_pid() as pid")).rows[0].pid as number;
+    await holder.query("BEGIN");
+    open = true;
+    await holder.query("LOCK TABLE teams IN ROW EXCLUSIVE MODE");
+    return { pid, unlock, dispose };
+  } catch (error) {
+    await dispose();
+    throw error;
+  }
+}
+
+describe("STAGINGMARK-5 AC-08 — the production 2000ms lock cap refuses contention near 2s, not after the 120s statement budget", () => {
+  it("held conflicting lock on teams → exact 55P03 near 2s, nothing written, owner's backend restored holding no locks; unlock → fresh retry ran:true", async () => {
+    const a = await team();
+    const b = await team();
+    const before = await effects();
+    const requested: unknown[][] = [];
+    const failures: SqlFailure[] = [];
+    const owned = ownedDb(observingExecutor(requested, failures));
+    const holder = await holdConflictingLock();
+    let settled = false;
+    let service: Promise<MaterializeOnceResult> | undefined;
+    try {
+      service = materializeBuiltinMembershipOnce(owned.client).finally(() => {
+        settled = true;
+      });
+      const observed = await awaitServiceBlockedBehind(holder.pid, () => settled);
+      const waitingOn = await ungrantedLocks(observed.pid);
+      expect(observed).toMatchObject({ premature: false, count: 1, waiting: "Lock" });
+      expect(observed.blockers).toContain(holder.pid);
+      expect(observed.pid).toBe(owned.state.pid);
+      expect(waitingOn).toEqual([{ relation: "teams", mode: "ShareRowExclusiveLock" }]);
+
+      const result = await within(service, 10_000, "owner lock timeout");
+      await within(owned.released, 10_000, "owner release inspection");
+
+      expect(result).toEqual({ ok: false, error: `transaction SQL failed: ${LOCK_TIMEOUT_MESSAGE}` });
+      expect(failures).toEqual([{ code: "55P03", message: LOCK_TIMEOUT_MESSAGE }]);
+      expect(requested).toEqual([[PRODUCTION_LOCK_TIMEOUT]]);
+      expect(owned.statements.map(({ sql, params }) => ({ sql, params }))).toEqual([
+        ...ownedOrder(PRODUCTION_STATEMENT_TIMEOUT),
+        { sql: FUNCTION_SQL, params: [] },
+        { sql: "ROLLBACK", params: [] },
+      ]);
+      // The production 2s lock cap fired — far inside the 120s statement budget.
+      const call = functionStatement(owned);
+      expect(call.ms).toBeGreaterThanOrEqual(1_950);
+      expect(call.ms).toBeLessThan(10_000);
+      // Same backend after ROLLBACK: original settings and no relation lock on the five tables.
+      expectRestoredOnSameBackend(owned, "ROLLBACK");
+      expect(await effects()).toEqual(before);
+
+      await holder.unlock();
+      const retryFailures: SqlFailure[] = [];
+      const retry = ownedDb(observingExecutor([], retryFailures));
+      expect(await within(materializeBuiltinMembershipOnce(retry.client), 10_000, "fresh retry")).toEqual({ ok: true, ran: true });
+      await within(retry.released, 10_000, "retry release inspection");
+      expect(retryFailures).toEqual([]);
+      expectRestoredOnSameBackend(retry, "COMMIT");
+      expect((await effects()).marker).toHaveLength(1);
+      await expectBuiltinsFor([a, b]);
+    } finally {
+      await holder.dispose();
+      await Promise.allSettled([service]);
+    }
+  }, CASE_TIMEOUT_MS);
+});
+
+const PROGRESS_COUNTS = `(select count(*) from groups where is_builtin),
+        (select count(*) from group_members gm join groups g on g.id = gm.group_id where g.is_builtin),
+        (select count(*) from audit_log where action = 'access.builtin_materialized')`;
+
+/**
+ * AC-09 test-owned delays: a BEFORE INSERT trigger that first NOTICEs what this transaction has
+ * already written (the progress witness — a NOTICE reaches the client even though the statement is
+ * then rolled back) and then sleeps far past the 200ms fault cap. `late` fires on the marker insert
+ * (the function's LAST write); `audit` fires inside the frozen best-effort audit block.
+ */
+const DELAY_TRIGGERS = {
+  late: { table: "migration_markers", when: "new.name = 'pret4_builtin_materialize'", seconds: 5 },
+  audit: { table: "audit_log", when: "new.action = 'access.builtin_materialized'", seconds: 2 },
+} as const;
+
+async function installDelay(kind: keyof typeof DELAY_TRIGGERS): Promise<void> {
+  const { table, when, seconds } = DELAY_TRIGGERS[kind];
+  await query(`create or replace function stagingmark5_${kind}_delay() returns trigger language plpgsql as $$
+    begin
+      raise notice 'stagingmark5 ${kind} delay: builtin groups=% builtin edges=% materialization audits=%',
+        ${PROGRESS_COUNTS};
+      perform pg_sleep(${seconds});
+      return new;
+    end $$`);
+  await query(`create trigger stagingmark5_${kind}_delay before insert on ${table}
+    for each row when (${when}) execute function stagingmark5_${kind}_delay()`);
+}
+
+describe("STAGINGMARK-5 AC-09 — a finite statement cancellation after real effects rolls back, is retryable, and leaves the same backend restored", () => {
+  it("late cancellation: requested 120000ms (sent as 200ms for this fault only) cancels 57014 in a delay after every group/edge/audit write; all rolled back on the same healthy backend; retry after removal stamps exactly", async () => {
+    const fx = await postureFleet("none");
+    const before = await postureState();
+    const witness =
+      `stagingmark5 late delay: builtin groups=${fx.teamIds.length * 2} ` +
+      `builtin edges=${fx.expectedEdges.length} materialization audits=${fx.expectedAudits.length}`;
+    // Non-vacuity: every witnessed count differs from the pre-call state.
+    expect(builtinsById(before).size).toBeLessThan(fx.teamIds.length * 2);
+    expect(builtinEdges(before).length).not.toBe(fx.expectedEdges.length);
+    expect(before.audits).toEqual([]);
+
+    const requested = { statement: [] as unknown[][], lock: [] as unknown[][] };
+    const failures: SqlFailure[] = [];
+    const owned = ownedDb(cancellingExecutor(requested, failures));
+    let result: MaterializeOnceResult;
+    try {
+      await installDelay("late");
+      result = await within(materializeBuiltinMembershipOnce(owned.client), 10_000, "cancelled owner");
+      await within(owned.released, 10_000, "owner release inspection");
+    } finally {
+      await dropTestFaults();
+    }
+
+    expect(result).toEqual({ ok: false, error: `transaction SQL failed: ${STATEMENT_TIMEOUT_MESSAGE}` });
+    expect(failures).toEqual([{ code: "57014", message: STATEMENT_TIMEOUT_MESSAGE }]);
+    expect(owned.notices).toEqual([witness]);
+    expect(requested).toEqual({ statement: [[PRODUCTION_STATEMENT_TIMEOUT]], lock: [[PRODUCTION_LOCK_TIMEOUT]] });
+    expect(owned.statements.map(({ sql, params }) => ({ sql, params }))).toEqual([
+      ...ownedOrder(FAULT_STATEMENT_TIMEOUT),
+      { sql: FUNCTION_SQL, params: [] },
+      { sql: "ROLLBACK", params: [] },
+    ]);
+    // A real server cancellation at the cap, not the 5s delay completing.
+    const call = functionStatement(owned);
+    expect(call.ms).toBeGreaterThanOrEqual(190);
+    expect(call.ms).toBeLessThan(5_000);
+    expectRestoredOnSameBackend(owned, "ROLLBACK", FAULT_STATEMENT_TIMEOUT);
+    const rolledBack = await postureState();
+    expect(rolledBack).toEqual(before);
+
+    const retry = ownedDb();
+    const from = await dbNow();
+    expect(await within(materializeBuiltinMembershipOnce(retry.client), 10_000, "retry")).toEqual({ ok: true, ran: true });
+    const to = await dbNow();
+    await within(retry.released, 10_000, "retry release inspection");
+    expect(retry.notices).toEqual([]);
+    expectRestoredOnSameBackend(retry, "COMMIT");
+    expectExactMaterialization(fx, rolledBack, await postureState(), { from, to });
+  }, CASE_TIMEOUT_MS);
+
+  it("cancellation inside the best-effort audit block is not swallowed by WHEN OTHERS: 57014, no audit-failed notice, nothing written, same backend restored; retry stamps", async () => {
+    const a = await team();
+    const b = await team();
+    const before = await effects();
+    expect([before.groups, before.edges, before.audits, before.marker]).toEqual([[], [], [], []]);
+    // Groups are all created before the loop; the first changed builtin adds its one member, then audits.
+    const witness = "stagingmark5 audit delay: builtin groups=4 builtin edges=1 materialization audits=0";
+
+    const requested = { statement: [] as unknown[][], lock: [] as unknown[][] };
+    const failures: SqlFailure[] = [];
+    const owned = ownedDb(cancellingExecutor(requested, failures));
+    let result: MaterializeOnceResult;
+    try {
+      await installDelay("audit");
+      result = await within(materializeBuiltinMembershipOnce(owned.client), 10_000, "cancelled owner");
+      await within(owned.released, 10_000, "owner release inspection");
+    } finally {
+      await dropTestFaults();
+    }
+
+    expect(result).toEqual({ ok: false, error: `transaction SQL failed: ${STATEMENT_TIMEOUT_MESSAGE}` });
+    expect(failures).toEqual([{ code: "57014", message: STATEMENT_TIMEOUT_MESSAGE }]);
+    // Exactly the one witness: a swallowed cancel would add `audit failed …` and further delay notices.
+    expect(owned.notices).toEqual([witness]);
+    expect(requested).toEqual({ statement: [[PRODUCTION_STATEMENT_TIMEOUT]], lock: [[PRODUCTION_LOCK_TIMEOUT]] });
+    expect(functionStatement(owned).ms).toBeLessThan(2_000);
+    expectRestoredOnSameBackend(owned, "ROLLBACK", FAULT_STATEMENT_TIMEOUT);
+    expect(await effects()).toEqual(before);
+
+    const retry = ownedDb();
+    expect(await within(materializeBuiltinMembershipOnce(retry.client), 10_000, "retry")).toEqual({ ok: true, ran: true });
+    await within(retry.released, 10_000, "retry release inspection");
+    expectRestoredOnSameBackend(retry, "COMMIT");
+    const after = await effects();
+    expect(after.marker).toHaveLength(1);
+    expect(after.audits).toHaveLength(4);
+    await expectBuiltinsFor([a, b]);
+  }, CASE_TIMEOUT_MS);
+});
+
+describe("STAGINGMARK-5 AC-09 (restoration) — every healthy path ends the owned transaction and the same backend returns to its original settings", () => {
+  it("success: COMMIT, then the same PID shows the original statement/idle/lock/isolation settings", async () => {
+    const a = await team();
+    const owned = ownedDb();
+    expect(await materializeBuiltinMembershipOnce(owned.client)).toEqual({ ok: true, ran: true });
+    await within(owned.released, 10_000, "owner release inspection");
+    expectRestoredOnSameBackend(owned, "COMMIT");
+    expect((await effects()).marker).toHaveLength(1);
+    await expectBuiltinsFor([a]);
+  }, CASE_TIMEOUT_MS);
+
+  it("SQL refusal: exact P0001 substrate refusal → ROLLBACK, same PID restored, nothing written", async () => {
+    const a = await team();
+    await corpus(a.id, { partitioned: false });
+    const before = await effects();
+    const failures: SqlFailure[] = [];
+    const owned = ownedDb(observingExecutor([], failures));
+    expect(await materializeBuiltinMembershipOnce(owned.client)).toEqual({ ok: false, error: SERVICE_ERROR });
+    await within(owned.released, 10_000, "owner release inspection");
+    expect(failures).toEqual([{ code: "P0001", message: SUBSTRATE_MESSAGE }]);
+    expectRestoredOnSameBackend(owned, "ROLLBACK");
+    expect(await effects()).toEqual(before);
+  }, CASE_TIMEOUT_MS);
+
+  it("ordinary failure after real writes: late P0001 fault → ROLLBACK, same PID restored, nothing written", async () => {
+    await team();
+    const before = await effects();
+    const witness = "stagingmark5 late fault: builtin groups=2 builtin edges=2 materialization audits=2";
+    const failures: SqlFailure[] = [];
+    const owned = ownedDb(observingExecutor([], failures));
+    let result: MaterializeOnceResult;
+    try {
+      await installLateFault();
+      result = await materializeBuiltinMembershipOnce(owned.client);
+      await within(owned.released, 10_000, "owner release inspection");
+    } finally {
+      await dropTestFaults();
+    }
+    expect(result).toEqual({ ok: false, error: `transaction SQL failed: ${witness}` });
+    expect(failures).toEqual([{ code: "P0001", message: witness }]);
+    expectRestoredOnSameBackend(owned, "ROLLBACK");
+    expect(await effects()).toEqual(before);
+  }, CASE_TIMEOUT_MS);
+
+  it("malformed result after real writes: zero rows → ROLLBACK before COMMIT, same PID restored, nothing written", async () => {
+    await team();
+    const before = await effects();
+    const inside: number[] = [];
+    const owned = ownedDb((executor: SqlExecutor): SqlExecutor => async <T>(text: string, params: unknown[] = []) => {
+      if (text !== FUNCTION_SQL) return executor<T>(text, params);
+      const out = await executor<T>("with r as materialized (select materialize_builtin_membership_once() as v) select v as result from r where not v", params);
+      inside.push((await executor<{ n: number }>("select count(*)::int as n from migration_markers where name = $1", [MARKER])).rows[0].n);
+      return out;
+    });
+    expect(await materializeBuiltinMembershipOnce(owned.client)).toEqual({
+      ok: false,
+      error: "materialize_builtin_membership_once() returned a malformed result: expected exactly one row with a boolean result, got []",
+    });
+    await within(owned.released, 10_000, "owner release inspection");
+    expect(inside, "non-vacuity: the function stamped inside the transaction").toEqual([1]);
+    expectRestoredOnSameBackend(owned, "ROLLBACK");
+    expect(owned.statements.some((s) => s.sql === "COMMIT")).toBe(false);
+    expect(await effects()).toEqual(before);
   }, CASE_TIMEOUT_MS);
 });
