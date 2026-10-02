@@ -38,7 +38,7 @@ import {
   validatedSystemProjectIds,
   type SystemProjectIds,
 } from "@/lib/projects/context/reconcile-item";
-import { noWideningGate } from "@/lib/projects/context/memberships";
+import { systemIntegrityGate } from "@/lib/projects/context/memberships";
 
 export interface IngestResult {
   status: "created" | "updated" | "unchanged";
@@ -224,12 +224,16 @@ export async function ingestItem(
       if (topology === undefined) throw new Error("context: system project read failed");
       contextProjects = topology;
       // Early desired-audience preflight: before inherited/social cascade mutation. The context
-      // writer repeats this gate authoritatively after the item/unit writes.
-      if (topology && effectiveAccess === "team") {
-        const gate = await noWideningGate(db, auth.teamId, topology.general, effectiveAccess);
+      // writer repeats this gate authoritatively after the item/unit writes. TIERRET-1: the
+      // target-integrity gate runs in BOTH directions (team → General, external → external-shared)
+      // — a corrupted external-shared now stops a widening push too (N2), rolling the whole
+      // transaction back; repair the forbidden edge (AUDITFIX-21) to unblock it.
+      if (topology) {
+        const target = effectiveAccess === "team" ? topology.general : topology.externalShared;
+        const gate = await systemIntegrityGate(db, auth.teamId, target, effectiveAccess);
         if (!gate.ok) {
           throw new Error(
-            `context gate refusal: ${gate.error ?? "no-widening refused desired audience"}`
+            `context gate refusal: ${gate.error ?? "system-integrity refused desired audience"}`
           );
         }
       }

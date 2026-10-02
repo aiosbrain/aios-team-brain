@@ -1,6 +1,13 @@
 import "server-only";
 import type { DbClient, TransactionSession } from "@/lib/db/types";
 import {
+  EXTERNAL_SHARED_SLUG,
+  GENERAL_SLUG,
+  isProtectedProject,
+  isSanctionedSystemEdge,
+  type EdgeGroupIdentity,
+} from "@/lib/access/system-projects";
+import {
   contextFailureMessage,
   lockItemContext,
   MembershipStateChangedError,
@@ -26,7 +33,7 @@ export interface EnsureIncludeArgs {
 }
 
 export type MembershipRefusalReason =
-  | "no-widening"
+  | "system-integrity"
   | "protected-target-exclusion"
   | "membership-state-changed";
 
@@ -38,45 +45,77 @@ export interface WriteResult {
   refusalReason?: MembershipRefusalReason;
 }
 
-type ExternalReach = { ok: true; reachable: boolean } | { ok: false; error: string };
+/** The ONE audience → protected-target routing (team → General, external → external-shared). */
+const ROUTED_SLUG: Readonly<Record<string, string>> = { team: GENERAL_SLUG, external: EXTERNAL_SHARED_SLUG };
 
-async function projectIsExternalVisible(
-  db: DbClient,
-  teamId: string,
-  projectId: string
-): Promise<ExternalReach> {
-  const { data, error } = await db
-    .from("project_groups")
-    .select("groups(slug)")
-    .eq("team_id", teamId)
-    .eq("project_id", projectId);
-  if (error) return { ok: false, error: error.message };
-  const rows = (data ?? []) as { groups: { slug: string } | null }[];
-  return { ok: true, reachable: rows.some((row) => row.groups?.slug === "external") };
+function integrityRefusal(detail: string): WriteResult {
+  return { ok: false, refused: true, refusalReason: "system-integrity", error: `system-integrity: ${detail}` };
 }
 
-/** Shared pure preflight and authoritative writer gate. */
-export async function noWideningGate(
+/**
+ * TIERRET-1 — the TARGET-INTEGRITY gate that REPLACES `noWideningGate` (AC-09; spec "Concrete change
+ * boundary" §3). Shared pure preflight (ingest + reconcile) and the authoritative writer gate.
+ *
+ * WHAT CHANGED AND WHY. The old gate refused a TEAM unit into any project holding a grant to a group
+ * SLUGGED `external` — a label veto over a membership grant, which is exactly what this slice
+ * retires: a custom initiative granted to the actual builtin External group may now hold team
+ * content (the grant is the sharing act). What the old gate ALSO protected — the two system
+ * projects whose grants ARE the access substrate — is now protected precisely:
+ *
+ *   · ordinary / initiative target → no audience check at all;
+ *   · PROTECTED target (`isProtectedProject`: a system project, or a reserved-slug source project
+ *     before adoption — no second classifier) →
+ *       1. exact ROUTING from `audience`, which callers pass from the LOCKED `items.access` (never
+ *          the unit's mirror, never a caller label): team → General, external → external-shared.
+ *          An unknown audience or an unknown protected slug refuses;
+ *       2. EVERY grant on the target is a sanctioned system edge (`isSanctionedSystemEdge`, the
+ *          AUDITFIX-3/23 definition the census uses). An unresolvable group, or any unsanctioned
+ *          custom/singleton/builtin edge, refuses — in BOTH directions (N2): a corrupted
+ *          external-shared now stops a widening push, a corrupted General a narrowing/backfill.
+ *   · missing target → refused (settled).
+ *
+ * Settled policy refusals are `system-integrity` (`refused: true`); READ errors stay plain errors
+ * (`ok:false` without `refused`), so callers keep their error-versus-refusal handling and a substrate
+ * outage is never mistaken for a decision. Nothing here mutates. This is NOT serialization against a
+ * concurrent administrative grant write — the grant writer's own AUDITFIX-3 prevention covers that.
+ */
+export async function systemIntegrityGate(
   db: DbClient,
   teamId: string,
   projectId: string,
-  unitAudience: string
+  audience: string
 ): Promise<WriteResult> {
-  if (unitAudience !== "team") return { ok: true };
-  const reach = await projectIsExternalVisible(db, teamId, projectId);
-  if (!reach.ok) {
-    return {
-      ok: false,
-      error: `no-widening: external reachability undetermined — ${reach.error}`,
-    };
+  const { data: project, error: projectError } = await db
+    .from("projects")
+    .select("id, kind, slug")
+    .eq("team_id", teamId)
+    .eq("id", projectId)
+    .maybeSingle();
+  if (projectError) return { ok: false, error: `system-integrity: target project read failed — ${projectError.message}` };
+  if (!project) return integrityRefusal("target project not found in this team");
+  const target = project as { kind: string; slug: string };
+  if (!isProtectedProject(target)) return { ok: true };
+
+  const routed = ROUTED_SLUG[audience];
+  if (!routed) return integrityRefusal(`unknown audience '${audience}' for a protected target`);
+  if (target.slug !== routed) {
+    return integrityRefusal(
+      `a ${audience}-audience unit may enter only '${routed}', not the protected project '${target.slug}'`
+    );
   }
-  if (reach.reachable) {
-    return {
-      ok: false,
-      refused: true,
-      refusalReason: "no-widening",
-      error: "no-widening: a team-audience unit cannot enter an external-visible project",
-    };
+
+  const { data: grants, error: grantsError } = await db
+    .from("project_groups")
+    .select("group_id, groups(slug, is_builtin)")
+    .eq("team_id", teamId)
+    .eq("project_id", projectId);
+  if (grantsError) return { ok: false, error: `system-integrity: target grants unreadable — ${grantsError.message}` };
+  for (const row of (grants ?? []) as { group_id: string; groups: EdgeGroupIdentity | null }[]) {
+    if (!isSanctionedSystemEdge(target.slug, row.groups ?? null)) {
+      return integrityRefusal(
+        `'${target.slug}' holds an unsanctioned grant to ${row.groups ? `group '${row.groups.slug}'` : `unresolved group ${row.group_id}`} — repair it (AUDITFIX-21) before placing content`
+      );
+    }
   }
   return { ok: true };
 }
@@ -185,7 +224,8 @@ export async function ensureIncludeMembershipLocked(
   if (unitError) return { ok: false, error: `context unit read failed: ${unitError.message}` };
   if (!unit) return { ok: false, error: "context unit not found or no longer belongs to item" };
 
-  const gate = await noWideningGate(
+  // The routing authority is the LOCKED item (N1) — a stale unit mirror can never admit it.
+  const gate = await systemIntegrityGate(
     context.session.db,
     context.teamId,
     args.projectId,

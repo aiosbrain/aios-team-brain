@@ -13,15 +13,21 @@ import { MEETING_TODO_PROJECT_SLUG } from "@/lib/meetings/extract-todos";
  * metadata layer `items` has no columns for: who submitted it, who attended, an LLM-written
  * summary. Guarded by test/guards/single-writer-meeting-notes.test.ts.
  *
- * Meeting notes are TEAM-TIER ONLY by design (see `canSeeMeetingNotes`) — always ingested at
- * access='team', never external. There is no UI path to make one external.
+ * Meeting notes are always ingested at access='team', never external; there is no UI path to make
+ * one external. TIERRET-1: that LABEL no longer decides who may READ a note — its source transcript
+ * item's membership does (the list/detail below, and the timeline's meeting leg). Uploading,
+ * refreshing, merging and pushing meeting todos stay team-posture actions (`canSeeMeetingNotes`).
  */
 
 export const MEETING_NOTES_PROJECT_SLUG = "meeting-notes";
 
 export type ViewerTier = "team" | "external";
 
-/** Meeting notes are internal-only content — mirrors lib/identity/context.canSeeMemberContext. */
+/**
+ * The meeting WRITE/upload gate (actions.ts, the layout's upload button, the timeline's LEGACY arm):
+ * team posture only — unchanged by TIERRET-1, which split READ authorization out of it. Do NOT use
+ * this to gate a note read: reads are the transcript oracle (`listMeetingNotesForTeam`/`getMeetingNote`).
+ */
 export function canSeeMeetingNotes(tier: ViewerTier): boolean {
   return tier === "team";
 }
@@ -335,20 +341,22 @@ type NoteRow = {
 };
 
 /**
- * The meetings LIST read (ENFB-3): posture stays the coarse wall, and the MEMBERSHIP oracle
- * bounds the rows — a note's restriction axis is its source transcript item, so the list
- * intersects `source_item_id` with the viewer's visible set IN-QUERY, before the cap (the
- * ENFB-2 starvation discipline). The viewer is a PRINCIPAL, not a caller-supplied tier alone
- * — a tier-shaped parameter is one refactor from being passed a constant.
- * Fail directions: external posture → [] (unchanged); oracle resolution ERROR → throws (the
- * layout surfaces the error boundary — an empty meetings list must mean empty, not broken).
+ * The meetings LIST read (ENFB-3): the MEMBERSHIP oracle bounds the rows — a note's restriction
+ * axis is its source transcript item, so the list intersects `source_item_id` with the viewer's
+ * visible set IN-QUERY, before the cap (the ENFB-2 starvation discipline). The viewer is a
+ * PRINCIPAL, not a caller-supplied tier — a tier-shaped parameter is one refactor from being
+ * passed a constant. TIERRET-1: the posture wall that used to sit in front of this is RETIRED for
+ * reads (AC-07) — an external-posture member granted a transcript's project sees its note; a
+ * non-principal resolves no visible items and so sees none. `viewer.tier` is carried for callers
+ * that also render posture-gated WRITE controls; it does not gate this read.
+ * Fail direction: oracle resolution ERROR → throws (the layout surfaces the error boundary — an
+ * empty meetings list must mean empty, not broken).
  */
 export async function listMeetingNotesForTeam(
   db: DbClient,
   teamId: string,
   viewer: { memberId: string; tier: ViewerTier }
 ): Promise<MeetingNoteSummary[]> {
-  if (!canSeeMeetingNotes(viewer.tier)) return [];
   const { visibleItemIds } = await import("@/lib/access/enforce");
   const vis = await visibleItemIds(db, { teamId, memberId: viewer.memberId });
   if (vis.error) throw new Error("meeting visibility resolution failed");
@@ -413,6 +421,7 @@ export async function listMeetingNotesForTeam(
  * shows" — the merge survivor is the one canonical note (D4). Null for denied ≡ null for
  * unknown (§5.7). The list and this probe share the ENFB-1 predicate (canSeeItem ≡
  * visibleItemIds.has, dm-pinned there), so list-membership ≡ detail-200 by construction.
+ * TIERRET-1: no posture wall on the read (AC-07) — the by-id transcript probe is the whole rule.
  */
 export async function getMeetingNote(
   db: DbClient,
@@ -420,8 +429,6 @@ export async function getMeetingNote(
   id: string,
   viewer: { memberId: string; tier: ViewerTier }
 ): Promise<MeetingNoteDetail | null> {
-  if (!canSeeMeetingNotes(viewer.tier)) return null;
-
   const { data: note } = await db
     .from("meeting_notes")
     .select("id, source_item_id, submitted_by, title, summary, occurred_at, created_at, merged_into")

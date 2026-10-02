@@ -61,8 +61,9 @@ export const RELATIONSHIPS: Record<string, Record<string, Relationship>> = {
     groups: { kind: "one", table: "groups", local: "group_id", foreign: "id" },
   },
   project_groups: {
-    // the membership no-widening gate checks whether a project is granted to the `external`
-    // built-in group (lib/projects/context/memberships.ts).
+    // the membership system-integrity gate (TIERRET-1, replacing the no-widening gate) checks
+    // every grant on a protected target against the sanctioned edge set
+    // (lib/projects/context/memberships.ts).
     groups: { kind: "one", table: "groups", local: "group_id", foreign: "id" },
     // AUDITFIX-23's system-edge census reads the team's whole edge set and needs BOTH sides in one
     // statement: the project to test `kind`/`slug`, the group to test the sanctioned pair. The

@@ -88,8 +88,8 @@ export function parseTaskKeys(raw: string | null, mode: TaskFeedMode): TaskKeysP
  * counts, and it still returns null rather than a list that would be quietly wrong — the same rule
  * the CI consumer applies, kept on the side that actually knows.
  *
- * A key hidden by the caller's tier is reported as unknown, deliberately: "it exists but you may not
- * see it" is itself a disclosure, and the audience conjunct in the feed SQL is the only enforcement (no RLS).
+ * A key hidden from the caller is reported as unknown, deliberately: "it exists but you may not see
+ * it" is itself a disclosure, and the in-query feed predicate is the only enforcement (no RLS).
  */
 export function unknownKeysFor(
   requested: string[],
@@ -117,9 +117,9 @@ export function unknownKeysFor(
  *    Linear status + assignee changes back into its markdown. Without it the markdown decays —
  *    the projection is one-way and the writeback feed is dashboard-origin only.
  *
- * Tier isolation (audit H1) applies to every mode: the `tasks.audience` conjunct compiles into
- * the feed SQL (ENFB-2 — with the membership provenance predicate), so an external-tier key
- * never reads a team board. There is no RLS.
+ * Access applies to every mode: the membership provenance predicate compiles into the feed SQL
+ * (ENFB-2), so a key never reads a board it has no grant to. TIERRET-1: the `tasks.audience`
+ * conjunct is the LABEL ceiling of a legacy (non-principal) key only. There is no RLS.
  */
 export async function GET(req: NextRequest) {
   const auth = await authenticateApiKey(req);

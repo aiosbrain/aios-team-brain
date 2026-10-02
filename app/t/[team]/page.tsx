@@ -188,13 +188,15 @@ export default async function TeamHome({
   // card serves 8 VISIBLE rows (a post-filter would starve it to 0-8), and the select now
   // carries `created_by` so hand-typed decisions survive (the PRET-5 H2 class). The viewer's
   // oracle set resolves once here and feeds getPulseMetrics too.
-  const { visibleItemIds } = await import("@/lib/access/enforce");
+  const { resolveContentView, provenanceCtxFor, contentLabelTier } = await import("@/lib/access/admission");
   const { adminClient } = await import("@/lib/db/admin");
   const { decisionsCardWindow } = await import("@/lib/access/structured-windows");
-  const vis = await visibleItemIds(adminClient(), { teamId: team.id, memberId });
-  // Member-only surface (AUDITFIX-1 §2a): session-authenticated dashboard.
-  const provCtx = { visibleItemIds: vis.error ? new Set<string>() : vis.ids, teamPosture: tier === "team", principal: "member" as const };
-  const decisionsCardP = decisionsCardWindow(team.id, provCtx, tier === "external").then((rows) => ({ data: rows }));
+  // TIERRET-1: the reader comes from the ONE admission resolver (session member → member or legacy
+  // arm); an admitted member's card and counts carry no audience ceiling. An item-substrate error
+  // closes the ctx (provenanceCtxFor) — serve nothing rather than a partial answer.
+  const vis = await resolveContentView(adminClient(), team.id, memberId);
+  const provCtx = provenanceCtxFor(vis);
+  const decisionsCardP = decisionsCardWindow(team.id, provCtx, contentLabelTier(vis.admission) === "external").then((rows) => ({ data: rows }));
   const [pulse, { data: decisions }, pipelineHealth, llmHealth] = await Promise.all([
     getPulseMetrics(db, team.id, range, { isAdmin, memberId, tier, provCtx }),
     decisionsCardP,

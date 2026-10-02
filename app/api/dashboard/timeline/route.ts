@@ -5,7 +5,7 @@ import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
 import { getCachedWorkTimeline } from "@/lib/dashboard/timeline-cache";
 import { getWorkTimeline, WINDOW_DAYS, MAX_WINDOW_DAYS } from "@/lib/dashboard/work-timeline";
-import { memberEnforcement } from "@/lib/access/enforce";
+import { contentTimelineEnforcement } from "@/lib/access/admission";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -53,10 +53,11 @@ export async function GET(req: NextRequest) {
   // Note `Number(null) === 0`, so a request with no `days` param clamps to 7 and takes the cached arm —
   // i.e. the default request is the one that would have broken.
   // §5.8: BOTH arms carry the member's enforcement — the fresh-build arm resolves it explicitly
-  // (it bypasses the cache layer, so the cache layer's resolution can't cover it).
+  // (it bypasses the cache layer, so the cache layer's resolution can't cover it). TIERRET-1: that
+  // enforcement includes the READER from the one admission resolver, exactly like the cached arm.
   const timeline =
     days <= WINDOW_DAYS
       ? (await getCachedWorkTimeline(adminClient(), team.id, tier, memberId)).days
-      : await getWorkTimeline(adminClient(), team.id, tier, days, await memberEnforcement(adminClient(), { teamId: team.id, memberId }));
+      : await getWorkTimeline(adminClient(), team.id, tier, days, await contentTimelineEnforcement(adminClient(), team.id, memberId));
   return Response.json({ days: timeline, window_days: days });
 }

@@ -214,19 +214,14 @@ export async function POST(req: NextRequest) {
   // member's membership-visible items on an 'enforcing' team; permissive → null → byte-identical.
   let enforce: import("@/lib/query/retrieve").RetrieveEnforce | null = null;
   try {
-    const { visibleItemIds } = await import("@/lib/access/enforce");
-    {
-      // PRET-6: enforcing is the only behavior — enforcement is always constructed.
-      const { ids, projectIds } = await visibleItemIds(db, { teamId: team.id, memberId: me.id });
-      // PCCC-6: the dashboard chat is the members' PRIMARY conversational surface — it gets the
-      // K-capped partitioned graph leg exactly like /api/v1/query (review Medium 7: leaving it on
-      // the omit path while the API had the leg was an unrecorded split). Team-tier members only.
-      // QMIR-1: only members reach this route — it authenticates via getSessionUser() (session
-      // cookie + members lookup); an aiosd_ bearer has no session, so no token can land here.
-      // Hence `principal: "member"`. PRET-4 §1b (ruling 2): every member principal carries
-      // graphProjectIds — an external member's oracle resolves their granted projects.
-      enforce = { visibleItemIds: ids, principal: "member", graphProjectIds: projectIds };
-    }
+    // PRET-6: enforcing is the only behavior — enforcement is always constructed.
+    // PCCC-6: the dashboard chat is the members' PRIMARY conversational surface — it gets the
+    // K-capped partitioned graph leg exactly like /api/v1/query (review Medium 7). Session-only:
+    // an aiosd_ bearer has no session, so no token can land here. TIERRET-1: the reader comes from
+    // the ONE admission resolver — an admitted member's graph scope is its oracle grant set; a
+    // non-principal session (legacy) keeps the baseline arm with no graph scope.
+    const { resolveContentView, retrieveEnforceFor } = await import("@/lib/access/admission");
+    enforce = retrieveEnforceFor(await resolveContentView(db, team.id, me.id));
   } catch {
     return errorResponse("internal", "enforcement check failed", 500);
   }

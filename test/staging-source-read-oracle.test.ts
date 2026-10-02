@@ -91,10 +91,15 @@ describe("the fixture seeds the substrate the handler actually reads through", (
   it("writes the substrate through its CANONICAL OWNERS, not hand-rolled SQL", () => {
     // Those two tables have single-writer owner modules and a build-failing guard. Parameterised SQL
     // in the fixture was permitted, but it would have seeded rows that no longer had to obey the
-    // no-widening gate or the locked revalidation protocol — in a harness whose whole purpose is
-    // checking an access boundary.
+    // system-integrity gate (TIERRET-1's replacement for the no-widening gate) or the locked
+    // revalidation protocol — in a harness whose whole purpose is checking an access boundary.
     expect(context).toContain("reconcileItemUnit");
     expect(context).toContain("ensureIncludeMembership");
+    // …and the owner module it routes through still CARRIES that gate (deleting it from the writer
+    // must redden here, not only in the dm tier).
+    expect(readFileSync("lib/projects/context/memberships.ts", "utf8")).toMatch(
+      /const gate = await systemIntegrityGate\(\s*context\.session\.db,\s*context\.teamId,\s*args\.projectId,\s*context\.item\.access\s*\)/
+    );
     expect(fixture).not.toMatch(/INSERT INTO project_context_(units|memberships)/i);
     // `reconcileItemContext` is NOT the model: it needs system projects this fixture never creates
     // and can return `skipped`, which would seed nothing and still look successful.

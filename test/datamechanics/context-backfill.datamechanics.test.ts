@@ -94,7 +94,7 @@ describe("§11 backfill — day-one visibility byte-identical to today", () => {
     expect(after, "the stale external-shared membership must be closed").not.toContain(sys.externalShared);
   });
 
-  it("no-widening gate: the writer REFUSES a team-audience unit into external-shared (Codex H1)", async () => {
+  it("system-integrity gate (TIERRET-1's replacement for no-widening): the writer REFUSES a team-audience unit into external-shared (Codex H1)", async () => {
     const seed = await seedTeam();
     const item = await ingest(seed, { path: "team.md", body: "team", access: "team", project: "src" });
     await ensureAccessBootstrap(db(), seed.teamId);
@@ -102,7 +102,8 @@ describe("§11 backfill — day-one visibility byte-identical to today", () => {
     const u = await reconcileItemUnit(db(), seed.teamId, item.id);
     const r = await ensureIncludeMembership(db(), seed.teamId, { projectId: sys.externalShared, contextUnitId: u.unitId! });
     expect(r.ok).toBe(false);
-    expect(r.refused, "must be a no-widening refusal, not a DB error").toBe(true);
+    expect(r.refused, "must be a settled refusal, not a DB error").toBe(true);
+    expect(r.refusalReason, "the protected-target routing refusal").toBe("system-integrity");
     // and nothing was written
     const { data } = await db()
       .from("project_context_memberships")

@@ -6,7 +6,7 @@ import { reconcileItemUnitLocked } from "@/lib/projects/context/units";
 import {
   closeMembershipIntoLocked,
   ensureIncludeMembershipLocked,
-  noWideningGate,
+  systemIntegrityGate,
   type MembershipRefusalReason,
 } from "@/lib/projects/context/memberships";
 import {
@@ -94,22 +94,23 @@ export async function reconcileLockedItemContext(
   const other = unit.audience === "external" ? projects.general : projects.externalShared;
   const narrowing = unit.audience === "team";
 
-  if (narrowing) {
-    const preflight = await noWideningGate(
-      context.session.db,
-      context.teamId,
-      target,
-      unit.audience
-    );
-    if (!preflight.ok) {
-      return {
-        ok: false,
-        error: `membership: ${preflight.error}`,
-        refused: preflight.refused,
-        refusalReason: preflight.refusalReason,
-      };
-    }
+  // TIERRET-1 preflight, BOTH directions, before any membership mutation: the routed system target
+  // must match the LOCKED item's audience and hold only sanctioned grants (`systemIntegrityGate`).
+  // The unit mirror was re-copied from the locked item above in this same transaction; the gate
+  // still reads `context.item.access` itself (N1 — the mirror is never the authority). The writer
+  // repeats it authoritatively. Narrowing needs it most (it CLOSES first); widening opens first, so
+  // the writer gate would also refuse before any close — the preflight just names it earlier.
+  const preflight = await systemIntegrityGate(context.session.db, context.teamId, target, context.item.access);
+  if (!preflight.ok) {
+    return {
+      ok: false,
+      error: `membership: ${preflight.error}`,
+      refused: preflight.refused,
+      refusalReason: preflight.refusalReason,
+    };
+  }
 
+  if (narrowing) {
     const closed = await closeMembershipIntoLocked(context, unit.unitId, other);
     if (!closed.ok) return { ok: false, error: `move: ${closed.error}` };
     const opened = await ensureIncludeMembershipLocked(context, {

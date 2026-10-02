@@ -1837,10 +1837,12 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
       projectId: fixture.system.externalShared,
       contextUnitId: teamUnitId,
     });
+    // TIERRET-1 (N1): the replacement gate routes from the LOCKED item — a team item may enter only
+    // General — so the planted external mirror is refused as a settled system-integrity policy.
     expect.soft(teamResult).toMatchObject({
       ok: false,
       refused: true,
-      refusalReason: "no-widening",
+      refusalReason: "system-integrity",
     });
     const teamMembership = await db()
       .from("project_context_memberships")
@@ -3154,10 +3156,10 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
     { pathKind: "unchanged-body", changed: false },
     { pathKind: "changed-body", changed: true },
   ])(
-    "A13-08: settled no-widening refusal rolls back the $pathKind trusted narrowing",
+    "A13-08: settled system-integrity refusal (forbidden General edge) rolls back the $pathKind trusted narrowing",
     async ({ pathKind, changed }) => {
       const fixture = await seedConvergedExternalItem(
-        `auditfix13/no-widening-${pathKind}.md`
+        `auditfix13/system-integrity-${pathKind}.md`
       );
       await grantGeneralToExternal(fixture);
       const before = await storedState(fixture.seed, fixture.itemId);
@@ -3181,7 +3183,7 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
       ).toEqual(before);
       expect(outcome.result, "the ingest must not claim a refused narrowing succeeded").toBeNull();
       expect(outcome.error, "the refusal is named and distinguishable from a read outage").toMatch(
-        /(?:context|no-widening).*(?:gate|refus)|(?:gate|refus).*no-widening/i
+        /context gate refusal: system-integrity/i
       );
       expect(
         await canSeeItem(
