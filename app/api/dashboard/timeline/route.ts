@@ -16,8 +16,12 @@ export const maxDuration = 60;
  * the same payload the SSR panel + CLI read); a larger window is built FRESH and uncached (an on-demand,
  * infrequent action) via `getWorkTimeline`, so older days carry counts, not the per-person LLM synopsis —
  * that fan-out is deliberately kept off this request path. `days` is clamped to [WINDOW_DAYS, MAX_WINDOW_DAYS].
- * Session-authed; tier decides visibility (`visibleItems`/`visibleTasks`, the sole enforcement — no RLS,
- * CLAUDE.md §5).
+ * Session-authed. Access (TIERRET-1, CLAUDE.md §5 — no RLS): both windows resolve the member through the
+ * ONE admission resolver (`lib/access/admission.ts`) — the cached window via `getCachedWorkTimeline`'s
+ * `adm:` variant, the expansion via `contentTimelineEnforcement` — so an admitted member reads exactly its
+ * membership (oracle-visible evidence/meetings, sourced tasks by source item, hand-entered tasks by
+ * Everyone-or-grants) at either posture. Posture (`tier`) remains only a cache-key segment and the legacy
+ * arm's rule; it is not a member read ceiling.
  */
 export async function GET(req: NextRequest) {
   const rls = await serverClient();

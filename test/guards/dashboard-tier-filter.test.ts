@@ -355,6 +355,35 @@ describe("TIERRET-1 — writer predicates stay on the legacy rule; reader helper
     expect(enforce).toMatch(/export async function visibleProjectRows[\s\S]{0,200}?await writerRule\(db, principal\)/);
     expect(enforce).toMatch(/export async function canReadProjectRow[\s\S]{0,200}?await readerRule\(db, principal\)/);
   });
+
+  // Code review 1 HIGH-1: the widened board/decisions page hands readers ids of rows they could only
+  // READ, and every card renders drag/edit controls. Each EXISTING-row write action must apply the
+  // pre-TIERRET row WRITER predicate before its UPDATE (and so before `scheduleProjection`). Per-action
+  // pins: deleting the gate from one action must redden even while its sibling still carries it.
+  const ROW_WRITE_ACTIONS: [string, string, RegExp][] = [
+    ["app/actions/tasks.ts", "moveTaskAction", /canWriteTask\(teamId, me\.id, taskId\)/],
+    ["app/actions/tasks.ts", "updateTaskAction", /canWriteTask\(row\.team_id, me\.id, input\.taskId\)/],
+    ["app/actions/decisions.ts", "setDecisionValidityAction", /await canWriteStructuredRow\(adminClient\(\), \{ teamId, memberId: me\.id \}, "decisions", decisionId\)/],
+  ];
+  it.each(ROW_WRITE_ACTIONS)("%s %s gates the row with the WRITER predicate before its UPDATE", (file, fn, gate) => {
+    const src = readFileSync(join(ROOT, file), "utf8");
+    const start = src.indexOf(`export async function ${fn}(`);
+    expect(start, `${fn} must exist`).toBeGreaterThan(-1);
+    const next = src.indexOf("export async function", start + 1);
+    const body = src.slice(start, next === -1 ? undefined : next);
+    const gateAt = body.search(gate);
+    const updateAt = body.search(/\.update\(/);
+    expect(gateAt, `${fn} must call the row writer gate`).toBeGreaterThan(-1);
+    expect(updateAt, `${fn} must still write`).toBeGreaterThan(-1);
+    expect(gateAt, `${fn}: the gate must precede the UPDATE`).toBeLessThan(updateAt);
+  });
+  it("the task gate helper is the writer predicate (never a reader helper, never canSeeProjectRow)", () => {
+    const tasks = readFileSync(join(ROOT, "app/actions/tasks.ts"), "utf8");
+    expect(tasks).toMatch(/async function canWriteTask[\s\S]{0,300}?canWriteStructuredRow\(adminClient\(\), \{ teamId, memberId \}, "tasks", taskId\)/);
+    const enforce = readFileSync(join(ROOT, "lib/access/enforce.ts"), "utf8");
+    expect(enforce).toMatch(/export async function canWriteStructuredRow[\s\S]{0,400}?await writerRule\(db, principal\)/);
+    expect(enforce, "the row gate is not a container gate").not.toMatch(/export async function canWriteStructuredRow[\s\S]{0,1200}?canSeeProjectRow\(/);
+  });
 });
 
 describe("ENFB-4 — the social chain APPLIES the membership oracle (admission/read/action/generation/door)", () => {

@@ -209,7 +209,9 @@ read path:
 > (`contentLabelTier` — none for a member) on top of the oracle intersect — guarded by
 > `test/guards/dashboard-tier-filter.test.ts` and `test/guards/provenance-principal-callsites.test.ts`,
 > proven by the data-mechanics tier (`tierret1-*`). WRITE authority is separate and unchanged
-> (`canSeeProjectRow`), and read visibility must never be used to authorize a write. New surfaces must
+> (`canSeeProjectRow` for create destinations; `canWriteStructuredRow` — the same pre-TIERRET writer
+> rule applied to one row — for editing an existing task/decision), and read visibility must never be
+> used to authorize a write: a row the widened board SHOWS is not thereby editable. New surfaces must
 > carry the admission reader + an app-code gate + a guard; there is no RLS backstop.
 
 ---

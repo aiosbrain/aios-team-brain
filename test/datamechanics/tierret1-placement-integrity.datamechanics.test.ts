@@ -217,6 +217,59 @@ describe("TIERRET-1 AC-09 — protected targets with an UNSANCTIONED grant refus
   });
 });
 
+/**
+ * Code review 1 LOW-2 — spec §3: "Existing reconciliation may re-copy a stale unit audience from that
+ * locked item inside the same transaction; otherwise a mismatching mirror is refused before membership
+ * mutation." The writer used to READ the mirror and ignore it, so a stale mirror on an ordinary target
+ * (or the reverse direction on a protected one) still mutated membership.
+ */
+describe("TIERRET-1 AC-09 — a mismatching unit mirror is refused before membership mutation (LOW-2)", () => {
+  async function initiativeOf(seed: Seed): Promise<string> {
+    const { data } = await db().from("projects").insert({ team_id: seed.teamId, slug: `mm-${randomUUID().slice(0, 6)}`, name: "MM", kind: "initiative" }).select("id").single();
+    return (data as { id: string }).id;
+  }
+  async function plantMirror(seed: Seed, unitId: string, audience: "team" | "external"): Promise<void> {
+    const { error } = await db().from("project_context_units").update({ audience }).eq("team_id", seed.teamId).eq("id", unitId);
+    expect(error, "mirror-drift fixture must apply").toBeNull();
+  }
+
+  it.each([
+    { item: "team" as const, mirror: "external" as const },
+    { item: "external" as const, mirror: "team" as const },
+  ])("a $item item with a stale $mirror mirror is refused (system-integrity) on an ORDINARY target, with no membership written; a matching mirror is then admitted", async ({ item: access, mirror }) => {
+    const seed = await converged();
+    const item = await ingest(seed, { path: `mm-${access}.md`, body: `mm ${access}`, access, project: "src" });
+    const initiative = await initiativeOf(seed);
+    const unitId = await unitOf(seed, item.id); // reconciles the mirror first — the drift is planted after
+    await plantMirror(seed, unitId, mirror);
+
+    const refused = await ensureIncludeMembership(db(), seed.teamId, { projectId: initiative, contextUnitId: unitId });
+    expect(refused).toMatchObject({ ok: false, refused: true, refusalReason: "system-integrity" });
+    expect(await currentIncludes(seed, item.id), "no membership mutation on a mismatching mirror").not.toContain(initiative);
+
+    // Matching control: the unit writer re-copies the mirror from the locked item → admitted.
+    await unitOf(seed, item.id);
+    expect(await ensureIncludeMembership(db(), seed.teamId, { projectId: initiative, contextUnitId: unitId })).toMatchObject({ ok: true, created: true });
+    expect(await currentIncludes(seed, item.id)).toContain(initiative);
+  });
+
+  it("reconciliation, which re-copies the mirror inside its own transaction, still converges a stale mirror to the routed system project", async () => {
+    const seed = await converged();
+    const s = await sys(seed);
+    const item = await ingest(seed, { path: "mm-reconcile.md", body: "mm reconcile", access: "team", project: "src" });
+    await backfillTeamContext(db(), seed.teamId);
+    const unitId = await unitOf(seed, item.id);
+    await plantMirror(seed, unitId, "external");
+
+    const r = await reconcileItemContext(db(), seed.teamId, item.id);
+    expect(r.ok, r.error).toBe(true);
+    const { data: unit } = await db().from("project_context_units").select("audience").eq("id", unitId).single();
+    expect((unit as { audience: string }).audience, "the mirror was refreshed from the locked item").toBe("team");
+    expect(await currentIncludes(seed, item.id)).toContain(s.general);
+    expect(await currentIncludes(seed, item.id)).not.toContain(s.externalShared);
+  });
+});
+
 describe("TIERRET-1 AC-09 — concurrent flips/reconcile still agree after commit", () => {
   it("racing access flips and reconciles leave item, unit and exactly one routed system include in agreement", async () => {
     const seed = await converged();

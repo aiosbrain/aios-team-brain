@@ -43,7 +43,8 @@ import { resolveContentAdmission, contentReaderFor, type ContentAdmission, type 
  *     `MIN_SALVAGEABLE_VERSION` is a FLOOR, so old code would salvage a wider v16 summary after a
  *     rollback. New code never writes `vis:` rows and never salvages across namespaces.
  *   · Old code cannot purge `adm:` rows while it runs, so rolling FORWARD after a rollback must first
- *     run `purgeAdmissionTimelineNamespace` (docs/OPS runbook step in the TIERRET-1 release notes).
+ *     run `purgeAdmissionTimelineNamespace` (the mandatory roll-forward step in
+ *     docs/RELEASE-NOTES-tierret1.md, "Timeline cache — rollback and roll-forward").
  */
 
 /** One cached view: the reader's ADMISSION (class + granted projects) and its tier. Carries the
@@ -495,7 +496,8 @@ export async function purgeTimelineCacheTier(
 }
 
 /**
- * TIERRET-1 ROLL-FORWARD STEP (mandatory after any rollback — release notes / docs/OPS.md): delete
+ * TIERRET-1 ROLL-FORWARD STEP (mandatory after any rollback — docs/RELEASE-NOTES-tierret1.md,
+ * "Timeline cache — rollback and roll-forward"): delete
  * EVERY `adm:` row, instance-wide, and this process's copies. While rolled back, the old code serves
  * from `vis:` and cannot see — let alone purge — `adm:` rows, so a narrowing that happened then left
  * them stale; the new code must not serve or salvage them when it returns. Old `vis:` rows are left

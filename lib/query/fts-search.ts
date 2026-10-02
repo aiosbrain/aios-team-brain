@@ -9,8 +9,10 @@ import { runSql } from "@/lib/db/pg/pool";
  * match but orders by `ts_rank` DESC, so the capped window is the *best* N, not an arbitrary N (Gap
  * #2 from the multi-channel adversarial suite). Postgres-only, same raw-SQL precedent as dense-search.
  *
- * `rank` is returned so callers can reason about match strength. Tier is enforced in-DB on the live
- * `items.access` (external callers never get team content) — the sole enforcement, no RLS backstop.
+ * `rank` is returned so callers can reason about match strength. Access is the caller's
+ * membership-visible item set (`visibleIds`, the oracle set), applied IN-QUERY — the sole enforcement,
+ * no RLS backstop. There is no label (`items.access`) filter here (PRET-6 retired the posture wall;
+ * TIERRET-1 made membership the whole member read rule); `tier` is accepted but does not filter.
  */
 
 export interface FtsHit {
