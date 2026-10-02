@@ -16,9 +16,15 @@
  *
  * WHY IT SNAPSHOTS: the action awaits visibility reads between validating and minting, and an
  * in-process caller can hand both boundaries a live object. So the discriminant and list are read
- * ONCE, the list is copied index-by-index into a new dense array (a hole becomes `undefined` and is
- * refused — `.some`/`.every` would skip it), and only that validated, canonicalized copy is returned.
- * Callers must consume the returned value, never the raw input.
+ * ONCE, the list's length is read once and must be a genuine array length (a non-negative safe
+ * integer — a proxy answering `"0"` or `NaN` is refused, never coerced), every index must be an OWN
+ * element (a hole is refused — `.some`/`.every` would skip it, and a plain read would fall through to
+ * the prototype), and the list is copied index-by-index into a new dense array. Only that validated,
+ * canonicalized copy is returned. Callers must consume the returned value, never the raw input.
+ *
+ * WHY IT CATCHES: any read of an untrusted in-process object can throw — a getter, a proxy trap, a
+ * revoked proxy inside `Array.isArray`. Such a request is refused with the fixed invalid-request text;
+ * the thrown value is never inspected or echoed, because it can carry arbitrary (even secret) content.
  */
 
 /** Upper bound on a single token's scope list — a sanity cap, not a security control. */
@@ -49,7 +55,10 @@ export const SCOPE_ERRORS = {
   projectIdsDuplicate: "scope.projectIds must not repeat a project",
 } as const;
 
-/** A request must be a plain non-null, non-array object before ANY field of it is read. */
+/**
+ * A request must be a plain non-null, non-array object before ANY field of it is read. `Array.isArray`
+ * throws on a revoked proxy, so callers run this inside their capture stage's catch.
+ */
 export function isRequestObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -61,11 +70,22 @@ function refuse(error: string): ScopeParseResult {
 /** Copy, validate and canonicalize a `projects` list. `list` has been read exactly once. */
 function parseProjectIds(list: unknown): ScopeParseResult {
   if (!Array.isArray(list)) return refuse(SCOPE_ERRORS.projectIdsNotArray);
-  const length = list.length;
+  // Read ONCE and checked WITHOUT coercion before it sizes an allocation or bounds a loop: a genuine
+  // array's length is always a non-negative safe integer. A proxy answering "0" would otherwise slip
+  // past `=== 0` and `> 200`, drive both loops zero times and return an empty "valid" list.
+  const length: unknown = list.length;
+  if (typeof length !== "number" || !Number.isSafeInteger(length) || length < 0) {
+    return refuse(SCOPE_ERRORS.projectIdsNotArray);
+  }
   if (length === 0) return refuse(SCOPE_ERRORS.projectIdsEmpty);
   if (length > MAX_PROJECT_SCOPE) return refuse(SCOPE_ERRORS.projectIdsTooMany);
 
-  // Dense snapshot FIRST, by index — a hole reads as undefined and is refused below.
+  // Holes are refused BEFORE the copy: an index must be an own element, not something the prototype
+  // chain answers for (`hasOwn` reads no value, so each index value is still read exactly once below).
+  for (let i = 0; i < length; i++) {
+    if (!Object.hasOwn(list, i)) return refuse(SCOPE_ERRORS.projectIdsNotUuids);
+  }
+  // Dense snapshot, by index.
   const snapshot: unknown[] = new Array<unknown>(length);
   for (let i = 0; i < length; i++) snapshot[i] = list[i];
 
@@ -77,6 +97,8 @@ function parseProjectIds(list: unknown): ScopeParseResult {
   }
   // Duplicates are checked on the CANONICAL spelling and refused, never silently deduplicated.
   if (new Set(canonical).size !== canonical.length) return refuse(SCOPE_ERRORS.projectIdsDuplicate);
+  // A successful projects choice is never empty — the core stores this list as-is.
+  if (canonical.length === 0) return refuse(SCOPE_ERRORS.projectIdsEmpty);
   return { ok: true, scope: { kind: "projects", projectIds: canonical } };
 }
 
@@ -84,9 +106,18 @@ function parseProjectIds(list: unknown): ScopeParseResult {
  * Parse the scope choice of a mint request. Takes the WHOLE request because the legacy-key and
  * own-property rules are about the request itself: an own `projectScope` key is refused even when
  * its value is undefined/null and even beside a valid choice, and an inherited `scope` is not a
- * decision. Never throws on untrusted input; returns normalized data the caller must consume.
+ * decision. Never throws on untrusted input (see WHY IT CATCHES above); returns normalized data the
+ * caller must consume.
  */
 export function parseTokenMintScope(request: unknown): ScopeParseResult {
+  try {
+    return parseScopeOf(request);
+  } catch {
+    return refuse(INVALID_REQUEST);
+  }
+}
+
+function parseScopeOf(request: unknown): ScopeParseResult {
   if (!isRequestObject(request)) return refuse(INVALID_REQUEST);
   if (Object.hasOwn(request, "projectScope")) return refuse(SCOPE_ERRORS.legacyKey);
   if (!Object.hasOwn(request, "scope")) return refuse(SCOPE_ERRORS.required);

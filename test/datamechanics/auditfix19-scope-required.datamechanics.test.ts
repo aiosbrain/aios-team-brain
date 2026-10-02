@@ -9,6 +9,7 @@ import { mintAgentTokenAction } from "@/app/t/[team]/admin/agents/actions";
 import { mintAgentToken, type MintArgs, type MintResult } from "@/lib/access/agent-tokens";
 import type { MintRequest } from "@/lib/access/agent-token-policy";
 import { MAX_PROJECT_SCOPE, SCOPE_ERRORS } from "@/lib/access/agent-token-scope";
+import type { DbClient } from "@/lib/db/types";
 
 /**
  * AUDITFIX-19 (AIO-1050) — a mint request that says NOTHING about scope must be refused, at BOTH
@@ -491,4 +492,225 @@ describe("AUDITFIX-19 AC-02/AC-03 — public action refuses every malformed choi
       await expectRefusedWithoutWrite(redact(res), seed.teamId, tokensBefore, auditsBefore, reason);
     });
   }
+});
+
+/**
+ * Code review S1/S2 — adversarial IN-PROCESS objects (a browser cannot serialize these into a server
+ * action; both boundaries nonetheless promise a refusal for untrusted runtime input).
+ *
+ * S1: a proxy over an array passes `Array.isArray` while its `length` trap answers "0". Before the fix
+ * the parser returned a VALID EMPTY list and the core stored a live `project_scope = []` credential
+ * plus a mint audit (reproduced on real Postgres by the coordinator). A hole the prototype answers
+ * for is likewise not an explicit element.
+ * S2: a throwing getter or proxy trap made both boundaries REJECT instead of resolving a refusal.
+ *
+ * Every case must resolve (never reject) to its rule's refusal with no token, no row id, no row and
+ * no mint audit. The thrown text is a sentinel the refusal must never carry: refusals are compared by
+ * rule NAME, so an echoed sentinel would surface as reason "other".
+ */
+const S2_SENTINEL = "S2_SENTINEL_THROWN_TEXT";
+function boom(): never {
+  throw new Error(S2_SENTINEL);
+}
+
+function lengthLiar(length: unknown, target: unknown[]): unknown[] {
+  return new Proxy(target, {
+    get: (t, key, recv) => (key === "length" ? length : Reflect.get(t, key, recv)),
+  });
+}
+
+function withThrowingField(b: Base, field: "memberId" | "onBehalfOf" | "name" | "expiresAt"): unknown {
+  const req: Record<string, unknown> = { ...b, scope: ALL_REACHABLE };
+  delete req[field];
+  return Object.defineProperty(req, field, { enumerable: true, get: boom });
+}
+
+const MALFORMED_OBJECTS: [label: string, build: (base: Base) => unknown, reason: keyof typeof KNOWN_REASONS][] = [
+  ['proxied length "0" over an empty array (S1 reproduction)', (b) => ({ ...b, scope: { kind: "projects", projectIds: lengthLiar("0", []) } }), "projectIdsNotArray"],
+  ['proxied length "1" over a one-id array', (b) => ({ ...b, scope: { kind: "projects", projectIds: lengthLiar("1", [randomUUID()]) } }), "projectIdsNotArray"],
+  ["proxied length NaN", (b) => ({ ...b, scope: { kind: "projects", projectIds: lengthLiar(NaN, [randomUUID()]) } }), "projectIdsNotArray"],
+  ["proxied length -1", (b) => ({ ...b, scope: { kind: "projects", projectIds: lengthLiar(-1, [randomUUID()]) } }), "projectIdsNotArray"],
+  ["proxied length 1.5", (b) => ({ ...b, scope: { kind: "projects", projectIds: lengthLiar(1.5, [randomUUID()]) } }), "projectIdsNotArray"],
+  [
+    "a hole the prototype answers for with a valid distinct id",
+    (b) => {
+      const ids: unknown[] = new Array(2);
+      ids[0] = randomUUID();
+      Object.setPrototypeOf(ids, Object.assign(Object.create(Array.prototype), { 1: randomUUID() }));
+      return { ...b, scope: { kind: "projects", projectIds: ids } };
+    },
+    "projectIdsNotUuids",
+  ],
+  [
+    "a revoked whole-request proxy",
+    (b) => {
+      const r = Proxy.revocable({ ...b, scope: ALL_REACHABLE }, {});
+      r.revoke();
+      return r.proxy;
+    },
+    "invalidRequest",
+  ],
+  ["a throwing scope getter (S2 reproduction)", (b) => ({ ...b, get scope() { return boom(); } }), "invalidRequest"],
+  ["a throwing kind getter", (b) => ({ ...b, scope: { get kind() { return boom(); } } }), "invalidRequest"],
+  ["a scope proxy whose ownKeys trap throws", (b) => ({ ...b, scope: new Proxy({ kind: "all-reachable" }, { ownKeys: boom }) }), "invalidRequest"],
+  ["a throwing projectIds getter", (b) => ({ ...b, scope: { kind: "projects", get projectIds() { return boom(); } } }), "invalidRequest"],
+  [
+    "a throwing length trap",
+    (b) => ({ ...b, scope: { kind: "projects", projectIds: new Proxy([randomUUID()], { get: (t, k, r) => (k === "length" ? boom() : Reflect.get(t, k, r)) }) } }),
+    "invalidRequest",
+  ],
+  [
+    "a throwing index getter",
+    (b) => {
+      const ids: unknown[] = [];
+      Object.defineProperty(ids, 0, { enumerable: true, get: boom });
+      return { ...b, scope: { kind: "projects", projectIds: ids } };
+    },
+    "invalidRequest",
+  ],
+  ["a throwing memberId getter", (b) => withThrowingField(b, "memberId"), "invalidRequest"],
+  ["a throwing onBehalfOf getter", (b) => withThrowingField(b, "onBehalfOf"), "invalidRequest"],
+  ["a throwing name getter", (b) => withThrowingField(b, "name"), "invalidRequest"],
+  ["a throwing expiresAt getter", (b) => withThrowingField(b, "expiresAt"), "invalidRequest"],
+];
+
+/** Await a boundary call, reducing a rejection to a boolean so a thrown value is never printed. */
+async function settle(call: () => Promise<MintResult>): Promise<{ rejected: boolean; out: Outcome | null }> {
+  try {
+    return { rejected: false, out: redact(await call()) };
+  } catch {
+    return { rejected: true, out: null };
+  }
+}
+
+/** A real client whose `.from()` calls are counted — proves a refusal happened before any DB read. */
+function countingDb(): { client: DbClient; fromCalls: () => number } {
+  const real = db();
+  let calls = 0;
+  const client = new Proxy(real, {
+    get(t, key, recv) {
+      if (key !== "from") return Reflect.get(t, key, recv);
+      return (...args: Parameters<DbClient["from"]>) => {
+        calls += 1;
+        return t.from(...args);
+      };
+    },
+  });
+  return { client, fromCalls: () => calls };
+}
+
+describe("AUDITFIX-19 review S1/S2 — core writer refuses malformed runtime objects, resolving, before any DB read", () => {
+  for (const [label, build, reason] of MALFORMED_OBJECTS) {
+    it(`core refuses ${label} (${reason}) with no row and no mint audit`, async () => {
+      const seed = await seedTeam();
+      const launcher = await seedMember(seed, "agent");
+      const tokensBefore = await tokenCount(seed.teamId);
+      const auditsBefore = await mintAuditCount(seed.teamId);
+      const { client, fromCalls } = countingDb();
+
+      const settled = await settle(() =>
+        mintAgentToken(client, seed.teamId, build({ memberId: launcher, expiresAt: future(30) }) as MintArgs, seed.memberId)
+      );
+
+      expect(settled.rejected, "the core must resolve a refusal, not reject").toBe(false);
+      expect(fromCalls(), "refused before the first member read").toBe(0);
+      await expectRefusedWithoutWrite(settled.out!, seed.teamId, tokensBefore, auditsBefore, reason);
+    });
+  }
+
+  it("control: a LEGITIMATE proxied list with an honest length mints the canonical list on the same harness", async () => {
+    const seed = await seedTeam();
+    const launcher = await seedMember(seed, "agent");
+    const p = await bareProject(seed);
+    let lengthReads = 0;
+    const ids = new Proxy([p.toUpperCase()], {
+      get(t, key, recv) {
+        if (key === "length") lengthReads += 1;
+        return Reflect.get(t, key, recv);
+      },
+    });
+
+    const out = redact(await mintAgentToken(db(), seed.teamId, { memberId: launcher, scope: { kind: "projects", projectIds: ids } }, seed.memberId));
+
+    expect(out.ok, `reason=${out.reason}`).toBe(true);
+    expect(lengthReads, "length read once").toBe(1);
+    expect((await storedRow(out.tokenRowId!))!.project_scope).toEqual([p.toLowerCase()]);
+    const audit = await mintAuditFor(seed.teamId, out.tokenRowId!);
+    expect([audit.length, audit[0].meta.scoped, audit[0].meta.scope_size]).toEqual([1, true, 1]);
+  });
+});
+
+describe("AUDITFIX-19 review S1/S2 — public action refuses malformed runtime objects after its gate, resolving", () => {
+  beforeEach(() => vi.mocked(requireTeamAdmin).mockReset());
+
+  for (const [label, build, reason] of MALFORMED_OBJECTS) {
+    it(`action refuses ${label} (${reason}) with no row and no mint audit`, async () => {
+      const seed = await seedTeam();
+      await promoteToAdmin(seed);
+      const launcher = await seedMember(seed, "agent");
+      vi.mocked(requireTeamAdmin).mockResolvedValue({ teamId: seed.teamId, memberId: seed.memberId });
+      const tokensBefore = await tokenCount(seed.teamId);
+      const auditsBefore = await mintAuditCount(seed.teamId);
+
+      const settled = await settle(() =>
+        mintAgentTokenAction(ACTION_SLUG, build({ memberId: launcher, expiresAt: future(30) }) as MintRequest)
+      );
+
+      expect(settled.rejected, "the action must resolve a refusal, not reject").toBe(false);
+      expect(vi.mocked(requireTeamAdmin)).toHaveBeenCalledWith(ACTION_SLUG);
+      await expectRefusedWithoutWrite(settled.out!, seed.teamId, tokensBefore, auditsBefore, reason);
+    });
+  }
+
+  it("an UNAUTHORIZED caller is refused at the gate without a single read of the request's getters", async () => {
+    const seed = await seedTeam();
+    vi.mocked(requireTeamAdmin).mockResolvedValue(null);
+    let reads = 0;
+    const touch = (): never => {
+      reads += 1;
+      return boom();
+    };
+    const req = Object.defineProperties({} as Record<string, unknown>, {
+      memberId: { enumerable: true, get: touch },
+      scope: { enumerable: true, get: touch },
+      expiresAt: { enumerable: true, get: touch },
+    });
+    const tokensBefore = await tokenCount(seed.teamId);
+    const auditsBefore = await mintAuditCount(seed.teamId);
+
+    const settled = await settle(() => mintAgentTokenAction(ACTION_SLUG, req as unknown as MintRequest));
+
+    expect(settled.rejected).toBe(false);
+    expect(reads, "authorization runs before any field of the request is read").toBe(0);
+    await expectRefusedWithoutWrite(settled.out!, seed.teamId, tokensBefore, auditsBefore, "adminsOnly");
+  });
+
+  it("control: non-throwing getters are read ONCE and their first values mint on the same harness", async () => {
+    const seed = await seedTeam();
+    await promoteToAdmin(seed);
+    const launcher = await seedMember(seed, "agent");
+    vi.mocked(requireTeamAdmin).mockResolvedValue({ teamId: seed.teamId, memberId: seed.memberId });
+    const otherLauncher = await seedMember(seed, "agent");
+    const expiresAt = future(30);
+    const reads: Record<string, number> = {};
+    const once = (key: string, first: unknown, later: unknown) => () => {
+      reads[key] = (reads[key] ?? 0) + 1;
+      return reads[key] === 1 ? first : later;
+    };
+    const req = Object.defineProperties({} as Record<string, unknown>, {
+      memberId: { enumerable: true, get: once("memberId", launcher, otherLauncher) },
+      name: { enumerable: true, get: once("name", "getter control", "later") },
+      expiresAt: { enumerable: true, get: once("expiresAt", expiresAt, future(300)) },
+      scope: { enumerable: true, get: once("scope", { kind: "all-reachable" }, { kind: "projects", projectIds: [randomUUID()] }) },
+    });
+    const tokensBefore = await tokenCount(seed.teamId);
+    const auditsBefore = await mintAuditCount(seed.teamId);
+
+    const out = redact(await mintAgentTokenAction(ACTION_SLUG, req as unknown as MintRequest));
+
+    await expectAllReachableMinted(out, seed.teamId, launcher, seed.memberId, tokensBefore, auditsBefore);
+    expect(reads).toEqual({ memberId: 1, name: 1, expiresAt: 1, scope: 1 });
+    const row = await storedRow(out.tokenRowId!);
+    expect([row!.name, Date.parse(row!.expires_at!)]).toEqual(["getter control", Date.parse(expiresAt)]);
+  });
 });

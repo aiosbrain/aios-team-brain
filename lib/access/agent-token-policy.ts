@@ -27,6 +27,7 @@ import {
   UUID_RE,
   isRequestObject,
   parseTokenMintScope,
+  type ScopeParseResult,
   type TokenMintScope,
 } from "@/lib/access/agent-token-scope";
 
@@ -66,6 +67,30 @@ type CheckResult = { ok: true } | { ok: false; error: string };
 
 /** The request's scalar fields, each read exactly once from the caller's object. */
 type CapturedFields = { memberId: unknown; onBehalfOf: unknown; name: unknown; expiresAt: unknown };
+
+type Captured = { ok: true; fields: CapturedFields; scope: ScopeParseResult } | { ok: false; error: string };
+
+/**
+ * The ONLY stage that touches the caller's object: whole-request guard, one read of each scalar field,
+ * then the scope parse. Any synchronous throw from it (a getter, a proxy trap, a revoked proxy) is the
+ * fixed invalid-request refusal — the thrown value is never inspected or echoed. Everything after this
+ * works on the captured values, which cannot throw.
+ */
+function captureRequest(req: unknown): Captured {
+  try {
+    // A server action receives whatever the caller sends.
+    if (!isRequestObject(req)) return { ok: false, error: INVALID_REQUEST };
+    const fields: CapturedFields = {
+      memberId: req.memberId,
+      onBehalfOf: req.onBehalfOf,
+      name: req.name,
+      expiresAt: req.expiresAt,
+    };
+    return { ok: true, fields, scope: parseTokenMintScope(req) };
+  } catch {
+    return { ok: false, error: INVALID_REQUEST };
+  }
+}
 
 /** Identity legs: the launcher, and the acting-as leg v1 refuses outright. */
 function checkIdentity(req: CapturedFields): CheckResult {
@@ -115,18 +140,13 @@ function checkExpiry(req: CapturedFields, now: number): CheckResult {
  * AUDITFIX-19: the whole request is shape-guarded BEFORE any field is read; then the scalar fields
  * are captured once and the scope is parsed into its own copy (the legacy-key / inherited-scope rules
  * run against the real request object). Everything after this function consumes the returned
- * `request`, so a caller that mutates its object later cannot change what was validated.
+ * `request`, so a caller that mutates its object later cannot change what was validated. A request
+ * whose reads throw is refused, never rethrown (`captureRequest`).
  */
 export function validateMintRequest(req: unknown, now: number): PolicyResult {
-  // A server action receives whatever the caller sends.
-  if (!isRequestObject(req)) return { ok: false, error: INVALID_REQUEST };
-  const captured: CapturedFields = {
-    memberId: req.memberId,
-    onBehalfOf: req.onBehalfOf,
-    name: req.name,
-    expiresAt: req.expiresAt,
-  };
-  const scope = parseTokenMintScope(req);
+  const capture = captureRequest(req);
+  if (!capture.ok) return capture;
+  const { fields: captured, scope } = capture;
   const identity = checkIdentity(captured);
   if (!identity.ok) return identity;
   if (!scope.ok) return scope;

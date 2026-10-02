@@ -94,17 +94,25 @@ type CapturedMint = {
  * Read every request field ONCE, synchronously: the whole request is shape-guarded first, then the
  * scope is re-parsed into this module's own canonical copy — independently of any caller that already
  * validated it — and mapped to its stored form.
+ *
+ * Any synchronous throw while reading the caller's object (a getter, a proxy trap, a revoked proxy)
+ * is the fixed invalid-request refusal, never rethrown and never echoed. The catch covers ONLY this
+ * capture: member reads, the insert and the audit run after it, with their own error semantics.
  */
 function captureMintArgs(args: unknown): { ok: true; mint: CapturedMint } | { ok: false; error: string } {
-  if (!isRequestObject(args)) return { ok: false, error: INVALID_REQUEST };
-  const request = args as Partial<MintArgs>;
-  const memberId = request.memberId as string;
-  const onBehalfOf = request.onBehalfOf ?? null;
-  const name = request.name;
-  const expiresAt = request.expiresAt ?? null;
-  const parsed = parseTokenMintScope(args);
-  if (!parsed.ok) return parsed;
-  return { ok: true, mint: { memberId, onBehalfOf, name, expiresAt, projectScope: storedProjectScope(parsed.scope) } };
+  try {
+    if (!isRequestObject(args)) return { ok: false, error: INVALID_REQUEST };
+    const request = args as Partial<MintArgs>;
+    const memberId = request.memberId as string;
+    const onBehalfOf = request.onBehalfOf ?? null;
+    const name = request.name;
+    const expiresAt = request.expiresAt ?? null;
+    const parsed = parseTokenMintScope(args);
+    if (!parsed.ok) return parsed;
+    return { ok: true, mint: { memberId, onBehalfOf, name, expiresAt, projectScope: storedProjectScope(parsed.scope) } };
+  } catch {
+    return { ok: false, error: INVALID_REQUEST };
+  }
 }
 
 /**

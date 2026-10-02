@@ -46,6 +46,8 @@ import { mintAgentTokenAction } from "@/app/t/[team]/admin/agents/actions";
 import type { MintResult } from "@/lib/access/agent-tokens";
 import type { MintRequest } from "@/lib/access/agent-token-policy";
 import { addMemberToGroup, createGroup, grantProjectToGroup } from "@/lib/access/groups";
+import { visibleProjectRows } from "@/lib/access/enforce";
+import { SCOPE_ERRORS } from "@/lib/access/agent-token-scope";
 
 const SLUG = "auditfix19-seams";
 const LOOKUP_ERROR = "could not verify project visibility for scope.projectIds — try again";
@@ -218,4 +220,175 @@ describe("AUDITFIX-19 AC-04 — the action consumes its normalized snapshot, not
       1,
     ]);
   });
+});
+
+/**
+ * Code review F2 — the combined mutation above swaps in a project EVERYONE can see and flips the kind,
+ * so a regression in which a subset check re-read the caller's raw list after the await would still
+ * pass. These SCOPE-ONLY cases keep kind = projects and every scalar unchanged, and replace only the
+ * list element, during the paused visibility reads, with a project that exactly ONE leg can see:
+ *
+ *   · [shared] → [Q], Q visible to L only: a raw re-read in the ADMIN check would refuse;
+ *   · [shared] → [R], R visible to A only: a raw re-read in the LAUNCHER check would refuse.
+ *
+ * Each must still mint the original canonical [shared]. Preconditions come from the action's own
+ * writer predicate over genuine group grants; each case then submits the replacement directly to show
+ * that exact check really refuses it (so the success above is not vacuous).
+ */
+describe("AUDITFIX-19 AC-04 — a scope-only mutation during the paused reads reaches NEITHER subset check", () => {
+  beforeEach(() => {
+    resetSeam();
+    vi.mocked(requireTeamAdmin).mockReset();
+  });
+
+  /** The action's writer predicate, uninjected (the seam is reset before and after). */
+  async function issuanceVisible(seed: Seed, memberId: string): Promise<ReadonlySet<string>> {
+    resetSeam();
+    const rows = await visibleProjectRows(db(), { teamId: seed.teamId, memberId });
+    resetSeam();
+    if (rows.error) throw new Error("fixture: visibleProjectRows failed");
+    return rows.ids;
+  }
+
+  /** Mint [original]; while BOTH visibility reads are paused, replace only the list element. */
+  async function mintReplacingOnlyTheListElement(launcher: string, original: string, replacement: string, expiresAt: string): Promise<MintResult> {
+    const input = { memberId: launcher, name: "scope-only", expiresAt, scope: { kind: "projects" as const, projectIds: [original] } };
+    let release!: () => void;
+    seam.gate = new Promise<void>((r) => (release = r));
+    const reached = new Promise<void>((r) => (seam.onReached = r));
+    const pending = mintAgentTokenAction(SLUG, input);
+    await reached;
+    input.scope.projectIds[0] = replacement;
+    release();
+    return pending;
+  }
+
+  async function expectOriginalSharedMinted(seed: Seed, res: MintResult, admin: string, launcher: string, shared: string, expiresAt: string): Promise<void> {
+    expect(view(res), "the originally validated [shared] mints").toEqual({ ok: true, hasToken: true, hasRowId: true });
+    expect([...new Set(seam.calls)].sort(), "both subset checks were consulted").toEqual([admin, launcher].sort());
+
+    const { data: rowData } = await db()
+      .from("agent_tokens")
+      .select("member_id, name, expires_at, project_scope")
+      .eq("id", res.tokenRowId!)
+      .single();
+    const row = rowData as { member_id: string; name: string; expires_at: string; project_scope: string[] | null };
+    expect([row.member_id, row.name, Date.parse(row.expires_at)]).toEqual([launcher, "scope-only", Date.parse(expiresAt)]);
+    expect(row.project_scope, "the original canonical [shared] reaches storage").toEqual([shared]);
+
+    const { data: auditData } = await db()
+      .from("audit_log")
+      .select("member_id, meta")
+      .eq("team_id", seed.teamId)
+      .eq("action", "access.token_minted")
+      .eq("target_id", res.tokenRowId!);
+    const audits = (auditData ?? []) as { member_id: string; meta: Record<string, unknown> }[];
+    expect(audits.length).toBe(1);
+    expect([audits[0].member_id, audits[0].meta.member_id, audits[0].meta.on_behalf_of, audits[0].meta.scoped, audits[0].meta.scope_size]).toEqual([
+      admin,
+      launcher,
+      null,
+      true,
+      1,
+    ]);
+  }
+
+  it("[shared] → [Q] (L-only): the ADMIN check consumed the captured list, and the original mints", async () => {
+    const { seed, admin, launcher } = await harness();
+    const shared = await projectGrantedTo(seed, [admin, launcher]);
+    const q = await projectGrantedTo(seed, [launcher]);
+    const adminSet = await issuanceVisible(seed, admin);
+    const launcherSet = await issuanceVisible(seed, launcher);
+    expect(adminSet.has(shared) && launcherSet.has(shared), "precondition: A and L both see shared").toBe(true);
+    expect(launcherSet.has(q), "precondition: L sees Q — the launcher check alone would pass a raw re-read").toBe(true);
+    expect(adminSet.has(q), "precondition: A does not see Q").toBe(false);
+    const expiresAt = future(21);
+
+    const before = await counts(seed.teamId);
+    const res = await mintReplacingOnlyTheListElement(launcher, shared, q, expiresAt);
+    await expectOriginalSharedMinted(seed, res, admin, launcher, shared, expiresAt);
+    expect(await counts(seed.teamId)).toEqual({ tokens: before.tokens + 1, audits: before.audits + 1 });
+
+    // Non-vacuity: the replacement, actually submitted, is refused by the ADMIN check specifically.
+    resetSeam();
+    const direct = await mintAgentTokenAction(SLUG, { memberId: launcher, scope: { kind: "projects", projectIds: [q] }, expiresAt });
+    expect(view(direct)).toEqual({ ok: false, hasToken: false, hasRowId: false });
+    expect(direct.error === "scope.projectIds names project(s) you cannot see", "the admin-specific refusal").toBe(true);
+    expect(await counts(seed.teamId)).toEqual({ tokens: before.tokens + 1, audits: before.audits + 1 });
+  });
+
+  it("[shared] → [R] (A-only): the LAUNCHER check consumed the captured list, and the original mints", async () => {
+    const { seed, admin, launcher } = await harness();
+    const shared = await projectGrantedTo(seed, [admin, launcher]);
+    const r = await projectGrantedTo(seed, [admin]);
+    const adminSet = await issuanceVisible(seed, admin);
+    const launcherSet = await issuanceVisible(seed, launcher);
+    expect(adminSet.has(shared) && launcherSet.has(shared), "precondition: A and L both see shared").toBe(true);
+    expect(adminSet.has(r), "precondition: A sees R — the admin check alone would pass a raw re-read").toBe(true);
+    expect(launcherSet.has(r), "precondition: L does not see R").toBe(false);
+    const expiresAt = future(22);
+
+    const before = await counts(seed.teamId);
+    const res = await mintReplacingOnlyTheListElement(launcher, shared, r, expiresAt);
+    await expectOriginalSharedMinted(seed, res, admin, launcher, shared, expiresAt);
+    expect(await counts(seed.teamId)).toEqual({ tokens: before.tokens + 1, audits: before.audits + 1 });
+
+    // Non-vacuity: the replacement, actually submitted, is refused by the LAUNCHER check specifically.
+    resetSeam();
+    const direct = await mintAgentTokenAction(SLUG, { memberId: launcher, scope: { kind: "projects", projectIds: [r] }, expiresAt });
+    expect(view(direct)).toEqual({ ok: false, hasToken: false, hasRowId: false });
+    expect(direct.error === "scope.projectIds names project(s) the launching member cannot see", "the launcher-specific refusal").toBe(true);
+    expect(await counts(seed.teamId)).toEqual({ tokens: before.tokens + 1, audits: before.audits + 1 });
+  });
+});
+
+/**
+ * Code review S1/S2 at the action — a malformed in-process list is refused by the action's own
+ * synchronous validation, BEFORE any visibility lookup (the seam records every lookup). Pre-fix, the
+ * action already avoided the write for S1 because the core re-parsed its ordinary `[]`; what these pin
+ * is the earlier refusal and that a throwing read resolves rather than rejects.
+ */
+describe("AUDITFIX-19 review S1/S2 — the action refuses malformed runtime lists before any visibility lookup", () => {
+  beforeEach(() => {
+    resetSeam();
+    vi.mocked(requireTeamAdmin).mockReset();
+  });
+
+  const CASES: [label: string, projectIds: () => unknown, error: string][] = [
+    [
+      'a proxied length "0"',
+      () => new Proxy([], { get: (t, k, r) => (k === "length" ? "0" : Reflect.get(t, k, r)) }),
+      SCOPE_ERRORS.projectIdsNotArray,
+    ],
+    [
+      "a throwing length trap",
+      () =>
+        new Proxy([randomUUID()], {
+          get: (t, k, r) => {
+            if (k === "length") throw new Error("S2_SENTINEL_THROWN_TEXT");
+            return Reflect.get(t, k, r);
+          },
+        }),
+      "invalid request",
+    ],
+  ];
+
+  for (const [label, projectIds, error] of CASES) {
+    it(`${label} is refused with no lookup, no token/id/row/audit`, async () => {
+      const { seed, launcher } = await harness();
+      const before = await counts(seed.teamId);
+      let rejected = false;
+      let res: MintResult | null = null;
+      try {
+        res = await mintAgentTokenAction(SLUG, { memberId: launcher, scope: { kind: "projects", projectIds: projectIds() }, expiresAt: future(30) } as unknown as MintRequest);
+      } catch {
+        rejected = true;
+      }
+      expect(rejected, "the action must resolve a refusal, not reject").toBe(false);
+      expect(view(res!)).toEqual({ ok: false, hasToken: false, hasRowId: false });
+      expect(res!.error === error, "the expected fixed refusal, never the thrown text").toBe(true);
+      expect(seam.calls.length, "refused before any visibility lookup").toBe(0);
+      expect(await counts(seed.teamId)).toEqual(before);
+    });
+  }
 });

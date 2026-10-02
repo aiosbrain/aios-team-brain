@@ -518,6 +518,176 @@ describe("explicit scope parser (AUDITFIX-19)", () => {
       expect(r).toEqual({ ok: true, scope: { kind: "projects", projectIds: [P1] } });
       expect(r.ok && r.scope.kind === "projects" && r.scope.projectIds).not.toBe(list);
     });
+
+    it("a hole the PROTOTYPE answers for is still a hole — an inherited index is not an own element", () => {
+      const P3 = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+      const sparse: unknown[] = new Array(3);
+      sparse[0] = P1;
+      sparse[2] = P2;
+      Object.setPrototypeOf(sparse, Object.assign(Object.create(Array.prototype), { 1: P3 }));
+      expect(Array.isArray(sparse), "fixture is still a genuine array").toBe(true);
+      expect(Object.hasOwn(sparse, 1), "fixture really has a hole at 1").toBe(false);
+      expect(sparse[1], "a plain indexed read falls through to the inherited, distinct, valid uuid").toBe(P3);
+      expect(reason(parse({ kind: "projects", projectIds: sparse }))).toBe(SCOPE_ERRORS.projectIdsNotUuids);
+    });
+
+    it("holes are refused BEFORE the copy — no element of a holed list is read", () => {
+      let reads = 0;
+      const ids: unknown[] = [];
+      Object.defineProperty(ids, 0, {
+        enumerable: true,
+        get() {
+          reads += 1;
+          return P1;
+        },
+      });
+      ids.length = 2; // index 1 is a hole
+      expect(reason(parse({ kind: "projects", projectIds: ids }))).toBe(SCOPE_ERRORS.projectIdsNotUuids);
+      expect(reads, "the own element before the hole was never read").toBe(0);
+    });
+  });
+
+  /**
+   * Review S1 — `length` is read once and must be a genuine array length. A proxy over an array passes
+   * `Array.isArray`, so its `length` trap can answer anything; before the fix "0" slipped past `=== 0`
+   * and `> 200`, drove both loops zero times and parsed as a VALID EMPTY list (which the core stored).
+   */
+  describe("a proxied list's length is validated without coercion (S1)", () => {
+    function lengthLiar(length: unknown, target: unknown[]): { list: unknown[]; lengthReads: () => number } {
+      let reads = 0;
+      const list = new Proxy(target, {
+        get(t, key, recv) {
+          if (key === "length") {
+            reads += 1;
+            return length;
+          }
+          return Reflect.get(t, key, recv);
+        },
+      });
+      return { list, lengthReads: () => reads };
+    }
+
+    const MALFORMED_LENGTHS: [label: string, length: unknown, target: () => unknown[]][] = [
+      ['string "0" over an empty array', "0", () => []],
+      ['string "1" over a one-uuid array', "1", () => [P1]],
+      ['string "NaN"', "NaN", () => [P1]],
+      ["numeric NaN", NaN, () => [P1]],
+      ["negative", -1, () => [P1]],
+      ["fractional", 1.5, () => [P1, P2]],
+      ["Infinity", Infinity, () => [P1]],
+      ["-Infinity", -Infinity, () => [P1]],
+      ["beyond safe integers", 2 ** 53, () => [P1]],
+      ["an object", { valueOf: () => 1 }, () => [P1]],
+      ["a Symbol", Symbol("length"), () => [P1]],
+    ];
+
+    for (const [label, length, target] of MALFORMED_LENGTHS) {
+      it(`refuses a proxied length of ${label}, read once, without throwing`, () => {
+        const { list, lengthReads } = lengthLiar(length, target());
+        expect(reason(parse({ kind: "projects", projectIds: list }))).toBe(SCOPE_ERRORS.projectIdsNotArray);
+        expect(lengthReads()).toBe(1);
+      });
+    }
+
+    it("a LEGITIMATE proxy with an honest numeric length still parses, reading length and each index once", () => {
+      const reads = new Map<PropertyKey, number>();
+      const list = new Proxy([P2.toUpperCase(), P1], {
+        get(t, key, recv) {
+          reads.set(key, (reads.get(key) ?? 0) + 1);
+          return Reflect.get(t, key, recv);
+        },
+      });
+      expect(parse({ kind: "projects", projectIds: list })).toEqual({ ok: true, scope: { kind: "projects", projectIds: [P2, P1] } });
+      expect([reads.get("length"), reads.get("0"), reads.get("1")]).toEqual([1, 1, 1]);
+    });
+
+    it("ordinary arrays keep their own reasons: empty, beyond the cap, and exactly the cap (non-vacuity)", () => {
+      const ids = Array.from({ length: MAX_PROJECT_SCOPE + 1 }, (_, i) => `${i}`.padStart(8, "0") + "-2222-4222-8222-222222222222");
+      expect(reason(parse({ kind: "projects", projectIds: [] }))).toBe(SCOPE_ERRORS.projectIdsEmpty);
+      expect(reason(parse({ kind: "projects", projectIds: ids }))).toBe(SCOPE_ERRORS.projectIdsTooMany);
+      const atCap = parse({ kind: "projects", projectIds: ids.slice(0, MAX_PROJECT_SCOPE) });
+      expect(atCap.ok && atCap.scope.kind === "projects" && atCap.scope.projectIds.length).toBe(MAX_PROJECT_SCOPE);
+    });
+  });
+
+  /**
+   * Review S2 — any read of an untrusted object can throw. The parser and the policy return the FIXED
+   * invalid-request refusal instead, and never echo the thrown text (asserted by exact equality).
+   */
+  describe("a request whose reads throw is refused, never rethrown or echoed (S2)", () => {
+    const SENTINEL = "S2_SENTINEL_THROWN_TEXT";
+    const boom = (): never => {
+      throw new Error(SENTINEL);
+    };
+    const INVALID = { ok: false, error: "invalid request" };
+    const revoked = (target: object): object => {
+      const r = Proxy.revocable(target, {});
+      r.revoke();
+      return r.proxy;
+    };
+    const exp = new Date(NOW + 30 * 24 * 60 * 60 * 1000).toISOString();
+    /** Legal scalars, so the policy's refusal can only come from the throwing read under test. */
+    const base = () => ({ memberId: MEMBER, expiresAt: exp });
+
+    const THROWING: [label: string, request: () => unknown][] = [
+      ["a revoked whole-request proxy (throws inside Array.isArray)", () => revoked({ ...base(), scope: ALL_REACHABLE })],
+      ["a whole-request proxy whose own-key check throws", () => new Proxy({ ...base(), scope: ALL_REACHABLE }, { getOwnPropertyDescriptor: boom })],
+      ["a throwing scope getter", () => ({ ...base(), get scope() { return boom(); } })],
+      ["a revoked scope proxy", () => ({ ...base(), scope: revoked({ kind: "all-reachable" }) })],
+      ["a scope proxy whose ownKeys trap throws", () => ({ ...base(), scope: new Proxy({ kind: "all-reachable" }, { ownKeys: boom }) })],
+      ["a throwing kind getter", () => ({ ...base(), scope: { get kind() { return boom(); } } })],
+      ["a throwing projectIds getter", () => ({ ...base(), scope: { kind: "projects", get projectIds() { return boom(); } } })],
+      ["a revoked projectIds proxy", () => ({ ...base(), scope: { kind: "projects", projectIds: revoked([P1]) } })],
+      [
+        "a throwing length trap",
+        () => ({ ...base(), scope: { kind: "projects", projectIds: new Proxy([P1], { get: (t, k, r) => (k === "length" ? boom() : Reflect.get(t, k, r)) }) } }),
+      ],
+      ["a throwing own-index check", () => ({ ...base(), scope: { kind: "projects", projectIds: new Proxy([P1], { getOwnPropertyDescriptor: boom }) } })],
+      [
+        "a throwing index getter",
+        () => {
+          const ids: unknown[] = [];
+          Object.defineProperty(ids, 0, { enumerable: true, get: boom });
+          return { ...base(), scope: { kind: "projects", projectIds: ids } };
+        },
+      ],
+    ];
+
+    for (const [label, request] of THROWING) {
+      it(`parser and policy refuse ${label}`, () => {
+        expect(parseTokenMintScope(request())).toEqual(INVALID);
+        expect(validateMintRequest(request(), NOW)).toEqual(INVALID);
+      });
+    }
+
+    for (const field of ["memberId", "onBehalfOf", "name", "expiresAt"] as const) {
+      it(`policy refuses a throwing ${field} getter, before any field rule`, () => {
+        const req: Record<string, unknown> = { memberId: MEMBER, scope: ALL_REACHABLE, expiresAt: exp };
+        delete req[field];
+        Object.defineProperty(req, field, { enumerable: true, get: boom });
+        expect(validateMintRequest(req, NOW)).toEqual(INVALID);
+      });
+    }
+
+    it("non-throwing getters are still read ONCE and their first values are what the policy returns (control)", () => {
+      const reads: Record<string, number> = {};
+      const once = <T>(key: string, first: T, later: unknown) => () => {
+        reads[key] = (reads[key] ?? 0) + 1;
+        return reads[key] === 1 ? first : later;
+      };
+      const req = Object.defineProperties({} as Record<string, unknown>, {
+        memberId: { enumerable: true, get: once("memberId", MEMBER, "not-a-uuid") },
+        onBehalfOf: { enumerable: true, get: once("onBehalfOf", null, MEMBER) },
+        name: { enumerable: true, get: once("name", "first", 5) },
+        expiresAt: { enumerable: true, get: once("expiresAt", exp, "never") },
+        scope: { enumerable: true, get: once("scope", { kind: "projects", projectIds: [P1] }, ALL_REACHABLE) },
+      });
+      expect(validateMintRequest(req, NOW)).toEqual({
+        ok: true,
+        request: { memberId: MEMBER, onBehalfOf: null, scope: { kind: "projects", projectIds: [P1] }, name: "first", expiresAt: exp },
+      });
+      expect(reads).toEqual({ memberId: 1, onBehalfOf: 1, name: 1, expiresAt: 1, scope: 1 });
+    });
   });
 
   it("policy returns the same normalized copy (not the raw input) for the action to consume", () => {
