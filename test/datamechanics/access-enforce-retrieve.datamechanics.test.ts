@@ -240,7 +240,7 @@ describe("ENFB-1 AC5 — the grounding existence-oracle closes", () => {
     // §2.6 error contract, direct: a statistic failure yields the conservative shape, so
     // grounding falls to the (vis-scoped) fts evidence — never the whole corpus.
     const { analyzeTermSpecificity } = await import("@/lib/query/grounding");
-    const broken = await analyzeTermSpecificity(seed.teamId, "team", ["zephyrquill"], ["not-a-uuid"]);
+    const broken = await analyzeTermSpecificity(seed.teamId, false, ["zephyrquill"], ["not-a-uuid"]);
     expect(broken, "a failing statistic degrades conservative").toEqual({ specificMatching: false, allCommon: true });
   });
 });

@@ -146,13 +146,13 @@ describe("decision writeback — what aios pull receives (real Postgres, no RLS)
   it("tier isolation: an external key gets only audience='external' SYNCED rows; hand-typed rows are team-only (PRET-5 H2, re-specified for ENFB-2)", async () => {
     const seed = await seedTeam();
     const projectId = await makeProject(seed, "acme");
-    // Hand-typed rows: the audience wall on the null-source branch is TEAM POSTURE (ENFB-1
-    // §2.7 / the enfb-decision-create pin) — an external principal never receives them, even
-    // audience='external' ones (no membership axis exists for a hand-typed row).
+    // Hand-typed rows: TIERRET-1 — a non-Everyone member receives a hand-typed row only in a
+    // project the oracle GRANTED them. This external member's only grant is external-shared (the
+    // invite floor), so neither `acme` row reaches them, whatever its audience label.
     await insertUiDecision(seed, projectId, { row_key: "ui-team0001", audience: "team" });
     await insertUiDecision(seed, projectId, { row_key: "ui-ext00001", audience: "external" });
-    // Synced rows: the external tier-isolation property lives here — an external-shared
-    // sourced row serves the external principal, the team-audience one never does.
+    // Synced rows: the external-shared sourced row serves the external principal; the team row's
+    // source lives in General, which they are not granted — MEMBERSHIP hides it, not its label.
     // Distinct paths: same-path ingests would upsert ONE source item (the second write wins)
     // and the tier arms would collapse onto one access value.
     const extDec = await ingestSyncedDecision(seed, "D-EXT", "external", "3-log/decision-log-ext.md");
