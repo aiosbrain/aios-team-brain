@@ -146,8 +146,24 @@ async function fixture(): Promise<Fx> {
   };
 }
 
+// Every request in this file is confined to the loopback test server (server-url.ts stays the
+// authority for the address both server and client use). The URL is resolved and checked BEFORE
+// fetch: only a relative /api/v1/ path, never an absolute, protocol-relative or backslash form.
+const SERVER = new URL(BASE_URL);
+if (SERVER.protocol !== "http:" || SERVER.hostname !== "127.0.0.1" || !/^\d+$/.test(SERVER.port)) {
+  throw new Error(`HTTP tier base is not a numeric loopback origin: ${BASE_URL}`);
+}
+function serverUrl(path: string): URL {
+  if (!/^\/api\/v1\/[^\\]*$/.test(path)) throw new Error(`test request path outside /api/v1/: ${path}`);
+  const url = new URL(path, SERVER);
+  if (url.origin !== SERVER.origin || url.protocol !== SERVER.protocol || url.hostname !== SERVER.hostname) {
+    throw new Error(`test request escaped the loopback server: ${path}`);
+  }
+  return url;
+}
+const request = (path: string, init?: RequestInit) => fetch(serverUrl(path), init);
 const get = (F: Fx, path: string, key: string, teamSlug = F.seed.teamSlug) =>
-  fetch(`${BASE_URL}${path}`, { headers: keyHeaders(key, teamSlug) });
+  request(path, { headers: keyHeaders(key, teamSlug) });
 
 async function taskKeys(F: Fx, key: string): Promise<string[]> {
   const res = await get(F, "/api/v1/tasks?mode=table", key);
@@ -272,11 +288,11 @@ describe("TIERRET-1 over HTTP — the membership-only member read rule", () => {
     ];
     for (const path of surfaces) {
       expect((await get(F, path, "aios_not_a_real_key")).status, `${path}: invalid key`).toBe(401);
-      expect((await fetch(`${BASE_URL}${path}`)).status, `${path}: no credentials`).toBe(401);
+      expect((await request(path)).status, `${path}: no credentials`).toBe(401);
       expect((await get(F, path, F.externalKey, other.teamSlug)).status, `${path}: a valid key presented for another team`).toBe(401);
     }
     // The query route refuses BEFORE any retrieval or model work — no answer is ever requested here.
-    const q = await fetch(`${BASE_URL}/api/v1/query`, { method: "POST", headers: keyHeaders("aios_not_a_real_key", F.seed.teamSlug), body: JSON.stringify({ question: "anything" }) });
+    const q = await request("/api/v1/query", { method: "POST", headers: keyHeaders("aios_not_a_real_key", F.seed.teamSlug), body: JSON.stringify({ question: "anything" }) });
     expect(q.status).toBe(401);
 
     // A key whose member is no longer active reads nothing — it is refused, never demoted to a
@@ -286,5 +302,12 @@ describe("TIERRET-1 over HTTP — the membership-only member read rule", () => {
     for (const path of surfaces) {
       expect((await get(F, path, F.externalKey)).status, `${path}: inactive member's key`).toBe(401);
     }
+  });
+
+  it("the request helper refuses any path that could leave the loopback server, before fetching", () => {
+    for (const path of ["//evil.example/api/v1/items", "http://evil.example/api/v1/items", "/\\evil.example/api/v1/items", "/api/v1/\\..\\x", "api/v1/items", "/api/v2/items"]) {
+      expect(() => serverUrl(path), path).toThrow();
+    }
+    expect(serverUrl("/api/v1/items").origin).toBe(SERVER.origin);
   });
 });

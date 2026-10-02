@@ -52,8 +52,8 @@ const KEEP = new Set(["AUTH_SECRET", "SECRETS_KEY", "DATABASE_URL", "DATABASE_TE
 const SECRET_SHAPED = /(API_KEY|_TOKEN|_SECRET|PASSWORD)$/;
 
 export function scrubbedEnv(base: NodeJS.ProcessEnv): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const k of SCRUBBED) out[k] = "";
-  for (const k of Object.keys(base)) if (SECRET_SHAPED.test(k) && !KEEP.has(k)) out[k] = "";
-  return out;
+  const keys = new Set(SCRUBBED);
+  for (const k of Object.keys(base)) if (SECRET_SHAPED.test(k) && !KEEP.has(k)) keys.add(k);
+  // Object.fromEntries defines own properties (no computed-key writes, no __proto__ setter).
+  return Object.fromEntries([...keys].map((k) => [k, ""]));
 }

@@ -29,7 +29,9 @@ for (const route of ["app/api/v1/query/route.ts", "app/api/dashboard/query/route
       // Exactly ONE resolver-built assignment, and it is not under any `if (<flag/mode>)`: the line
       // immediately governing it is either the try body (dashboard) or the token branch's `else`
       // (v1). A wrapping conditional would have to appear between that opener and the call.
-      expect(src.match(new RegExp(call.source, "g")) ?? []).toHaveLength(1);
+      // split() cuts at EVERY non-overlapping match regardless of flags; `call` is capture-free and
+      // never matches empty, so exactly one occurrence yields exactly two pieces.
+      expect(src.split(call)).toHaveLength(2);
       const at = src.search(call);
       const opener = Math.max(src.lastIndexOf("try {", at), src.lastIndexOf("} else {", at));
       expect(opener, "the resolver call sits directly in the try body or the token branch's else").toBeGreaterThan(-1);
