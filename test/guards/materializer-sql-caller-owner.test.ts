@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
+import ts from "typescript";
 import { PgClient } from "@/lib/db/pg/client";
 import type { SqlExecutor } from "@/lib/db/types";
 
@@ -28,6 +29,8 @@ import type { SqlExecutor } from "@/lib/db/types";
  *
  * SCOPE, stated honestly: this is the bounded LITERAL regression guard the spec asks for, not a
  * whole-program alias proof. A name assembled at runtime ("materialize_" + "builtin…") passes it.
+ * The service's extent is the TypeScript parser's declaration span (through its own closing
+ * brace), so a non-exported helper placed after it is outside the owner, not inside it.
  */
 
 const ROOT = join(import.meta.dirname, "..", "..");
@@ -49,8 +52,11 @@ const REGEX_AFTER_WORD = new Set(["return", "typeof", "instanceof", "in", "of", 
  * Replace every JS/TS comment with spaces (newlines kept, so line numbers survive) while leaving
  * string, template and regex literal text intact: a commented-out mention is not a caller, and a
  * `//` or `/*` INSIDE a literal cannot hide the code that follows it. Lexical, not a parser — `//`
- * in JSX text or an unusual regex-vs-division context can still mis-scan; such a mis-scan can only
- * hide code on that line, and the controls below pin the literal shapes that matter.
+ * or `/*` in JSX text, an apostrophe in JSX text, or an unusual regex-vs-division context can still
+ * mis-scan. A mis-scan is NOT confined to one line: a stray `/*` blanks everything through the next
+ * block-comment terminator, possibly many lines later, so it can hide a real caller (false
+ * negative); a misread literal can also leave comment text unblanked (false positive). The
+ * controls below pin the literal shapes that matter; they do not make this a whole-program proof.
  */
 function stripComments(source: string): string {
   let out = "";
@@ -194,13 +200,28 @@ function runtimeSources(): Map<string, string> {
   return files;
 }
 
+/**
+ * [start, end) of the exported service declaration in comment-stripped `code`, from the TypeScript
+ * parser: `end` is the service's own closing brace, NOT the next export, so a private helper placed
+ * between the two is outside the span. Stripping keeps offsets, and blanked comments still parse.
+ */
+function serviceSpan(code: string): { start: number; end: number } | undefined {
+  const file = ts.createSourceFile(OWNER, code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const service = file.statements.find(
+    (s): s is ts.FunctionDeclaration =>
+      ts.isFunctionDeclaration(s) && s.name?.text === "materializeBuiltinMembershipOnce" && s.body !== undefined
+  );
+  if (service === undefined) return undefined;
+  const start = service.getStart(file);
+  return code.startsWith(OWNER_FUNCTION, start) ? { start, end: service.end } : undefined;
+}
+
 /** Every reason the owner file is not exactly "one owned invocation (+ its diagnostic) inside the service". */
 function ownerOffences(source: string): string[] {
   const code = stripComments(source);
-  const start = code.indexOf(OWNER_FUNCTION);
-  if (start === -1) return [`${OWNER}: the owning service materializeBuiltinMembershipOnce is missing`];
-  const nextExport = code.indexOf("\nexport ", start + OWNER_FUNCTION.length);
-  const end = nextExport === -1 ? code.length : nextExport;
+  const span = serviceSpan(code);
+  if (span === undefined) return [`${OWNER}: the owning service materializeBuiltinMembershipOnce is missing`];
+  const { start, end } = span;
   const body = code.slice(start, end);
   const offences: string[] = [];
   for (const at of nameHits(code)) {
@@ -361,6 +382,44 @@ describe("STAGINGMARK-5 AC-03 — the frozen SQL materializer has exactly one ru
         `${OWNER}: expected exactly one owned session.executeSql invocation, found 0`,
         `${OWNER}: 2 name occurrences inside the service; only the owned invocation and its diagnostic are allowed`,
       ]);
+    });
+
+    it("the owner itself: the sole invocation moved to a private helper after the service, before the next export", () => {
+      const original = sources.get(OWNER)!;
+      const call = `session.executeSql<{ result?: unknown }>(\n        "SELECT materialize_builtin_membership_once() AS result"\n      )`;
+      const delegated = original.replace(call, "selectMaterializer(session)");
+      expect(delegated).not.toBe(original);
+      const lines = delegated.split("\n");
+      const nextExport = lines.findIndex((l) => l.startsWith("export async function createGroup("));
+      expect(nextExport, "next export after the service").toBeGreaterThan(-1);
+      const before = lines[nextExport - 1].startsWith("/**") ? nextExport - 1 : nextExport;
+      lines.splice(
+        before,
+        0,
+        "async function selectMaterializer(session: MaterializeSession) {",
+        '  return session.executeSql<{ result?: unknown }>("SELECT materialize_builtin_membership_once() AS result");',
+        "}",
+        ""
+      );
+      const text = lines.join("\n");
+      const helperLine = before + 2;
+
+      // Non-vacuous: the helper sits after the service's closing brace yet before the next export —
+      // exactly the gap a next-export bound would have counted as service body, where its one owned
+      // invocation plus the diagnostic would have satisfied every count.
+      const code = stripComments(text);
+      const span = serviceSpan(code)!;
+      const helperAt = code.indexOf("async function selectMaterializer(");
+      expect(helperAt).toBeGreaterThanOrEqual(span.end);
+      expect(helperAt).toBeLessThan(code.indexOf("\nexport ", span.start + OWNER_FUNCTION.length));
+      expect([...code.slice(span.start, helperAt).matchAll(OWNED_INVOCATION)]).toHaveLength(0);
+      expect([...code.slice(span.start, code.indexOf("\nexport ", helperAt)).matchAll(OWNED_INVOCATION)]).toHaveLength(1);
+
+      expect(ownerOffences(text)).toEqual([
+        `${OWNER}:${helperLine} names the materializer outside materializeBuiltinMembershipOnce`,
+        `${OWNER}: expected exactly one owned session.executeSql invocation, found 0`,
+      ]);
+      expect(callerOffences(mutated(OWNER, text))).toEqual(ownerOffences(text));
     });
 
     it("comments never count, but a `//` or `/*` inside a literal never hides the call after it", () => {

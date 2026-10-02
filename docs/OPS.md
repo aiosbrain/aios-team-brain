@@ -998,19 +998,66 @@ Reconciliation, marker and column drops roll back together. Earlier schema/migra
 already committed: the loader has no transaction around the entire replay. Resolve the reported
 failure and retry; permissive teams still require the prior release's readiness/flip path.
 
-On a marker miss the function locks `teams`, `members`, `groups`, `group_members`, then
-`migration_markers` in SHARE ROW EXCLUSIVE mode and re-reads the marker. **The migration sets no
-`lock_timeout` of its own** — deliberately, so your knob keeps its meaning: five locks plus the
-ACCESS EXCLUSIVE column-drop upgrade each wait under the loader's **per-statement** `lock_timeout`
-(`PG_MIGRATION_LOCK_TIMEOUT_MS`, default 15 s). The waiting statement count is data-dependent, so no
-total bound — and certainly no fleet-size or runtime guarantee — is claimed.
-The deadlock-freedom premise is that no current application transaction spans two of those
-five tables; a future `members` → `group_members` transaction would invalidate it. An older
-release's multi-statement TypeScript materializer is not retroactively serialized by these locks.
+On a marker miss the frozen function locks `teams`, `members`, `groups`, `group_members`, then
+`migration_markers` in SHARE ROW EXCLUSIVE mode and re-reads the marker and substrate gate after
+locking. This serializes participating materializer calls. Existing governed authority
+transactions take SHARE locks in the same relative table order and can contend with it; ordinary
+row/FK writers can also wait. This is not a universal deadlock-freedom claim. PRET-6 keeps its
+inherited loader settings: **the migration sets no `lock_timeout` of its own**, and each lock
+acquisition, including the ACCESS EXCLUSIVE column-drop upgrade, is subject to
+`PG_MIGRATION_LOCK_TIMEOUT_MS` (default 15 s). That is not a deadline for the whole replay, and no
+fleet-size or runtime guarantee is claimed for it. An older release's multi-statement TypeScript
+materializer is outside this protocol and is not retroactively serialized by these locks.
 
 **Never delete the marker as a repair recipe.** Marker loss cannot be distinguished from first
 materialization and can restore deliberately removed memberships. Boot/tick already had this
 behavior; preDeploy now performs it earlier.
+
+### Runtime recovery limits (STAGINGMARK-5)
+
+Boot, scheduler retry and confirmed attended recovery call the same frozen SQL through one
+service-owned transaction (`materializeBuiltinMembershipOnce`, `lib/access/groups.ts`); no SQL
+rewrite, public RPC, schema change or new setting is involved. The runtime pins READ COMMITTED
+before taking a snapshot, then sets transaction-local `statement_timeout = 120000` and
+`lock_timeout = 2000`. The first is a server limit for each statement; the second limits each lock
+acquisition. Neither is a total transaction, transport or recovery deadline. A contending
+invocation may fail at 2 s; after the winner commits, a fresh invocation returns `ran:false`
+without materialization writes or audits. Runtime settings do not replace PRET-6 loader settings.
+
+Known transaction failures roll back membership and marker together. Work is reported only after
+an acknowledged COMMIT. If COMMIT was sent but its acknowledgement was lost, the result reports an
+unknown outcome (`outcomeUnknown`) and is not replayed within that invocation. Inspect the marker
+and membership state through a fresh connection before deciding what to do next. An orphan
+executing statement can retain locks until cancellation or completion. Once idle, the existing
+`PG_IDLE_TX_TIMEOUT_MS` applies: its default is 60 s, and 0 disables it. With 0, a completed SELECT
+whose client never sends COMMIT may retain locks until disconnect detection or other server
+cleanup. No new required PostgreSQL connection-check setting is introduced.
+
+Before attended markerless recovery, drain every older replica and its in-flight boot, tick and
+CLI materializers, and prevent those older owners (and queued manual invocations) from restarting.
+Verify the serving processes run the intended version. Avoid concurrent deploy/schema DDL and
+authority or membership administration during the recovery window. Materializer locks can refuse
+governed writes; a queued ACCESS EXCLUSIVE DDL request can also stall later plain member/auth
+reads until the DDL wait ends, even though the materializer's own locks admit plain reads. These
+constraints do not add an automatic drain mechanism.
+
+The substrate check remains fleet-wide and is observed initially and after the locks; it is not a
+per-team completeness or at-COMMIT guarantee. An unfenced item purge after the post-lock check can
+delete the sole partitioned item in team B while unpartitioned content survives in team A, and the
+marker can still be stamped. Quiesce destructive corpus writers when at-COMMIT assurance is needed.
+The SQL algorithm and its frozen comments remain unchanged, including best-effort audit handling:
+an ordinary audit-only failure, including a `55P03` lock refusal, can be swallowed and the marker
+committed without that audit row. A statement cancellation (`57014`, e.g. the 120 s cap firing
+during the audit insert) is not caught by the function's `WHEN OTHERS` handler and rolls the whole
+invocation back.
+
+Local durable PostgreSQL measurements covered six fresh 100,000-member fixtures across
+100 teams × 1,000 members and 1 team × 100,000 members; SELECT through acknowledged COMMIT took
+1.286–1.872 s. A local production Next startup with the marker absent immediately before boot
+observed `ran:true`, matched the health commit and verified the resulting state in 3.139 s; the
+marked startup took 0.801 s. These are measured synthetic profiles, not a live-fleet sizing,
+Railway availability or SLA guarantee. The resource/runtime profile and interference measurements
+are in `docs/design/stagingmark5-runtime-owner-verification.md`.
 
 ### The marker-class refusal that REMAINS, and why you should not route around it
 
@@ -1075,10 +1122,20 @@ matches both databases equally.
 The command is a **no-op when the marker is already present** — it reads and exits without writing —
 so running it against a healthy fleet is harmless.
 
+Dry-run state reads are advisory; the confirmed transaction rechecks the substrate under the SQL
+locks. A failure with an unknown outcome must not be described as proof that no marker was
+written — re-run the dry run to read the marker. Rolling runtime code back restores the older
+writer and its residual races; it does not undo a successful committed reconciliation or its
+membership changes. A missing marker is replayed as first materialization and can regrant
+deliberately removed memberships. Never delete the marker to retry.
+
 **The alternative, if you would rather not run a command against the database:** roll back to the
 previous release in the Railway dashboard (never `railway up` — the Railway CLI is read-only here;
 see §4 "Railway deploy safety"). That release boots, its startup materialization stamps the marker, and the blocked deploy then applies. This
 is an older-release recovery option; current STAGINGMARK-2 deployments perform marker repair themselves.
+Do not run older-release and current-release repair concurrently: the older release's materializer
+is outside the SQL lock protocol, so drain it first (see "Runtime recovery limits" above). Rolling
+back code does not reverse database state.
 
 ---
 
