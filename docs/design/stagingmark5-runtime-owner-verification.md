@@ -5,8 +5,11 @@ Companion to the accepted design [`stagingmark5-runtime-owner.md`](./stagingmark
 Measurements were taken on 2026-10-02. This note records what was measured and on which profile.
 Operational limits and residuals are in [`docs/OPS.md` §11](../OPS.md) ("Runtime recovery limits").
 
-**Status: partial.** Final acceptance checks and the final code/security reviews are still
-pending, so this note does not claim acceptance is complete.
+**Status: final acceptance pending.** The final independent code and security reviews have been
+returned and their accepted findings fixed (see [Final reviews](#final-reviews)). A focused review
+of the follow-up fixes and the final acceptance decision are still pending. The pull request
+records the final review and acceptance disposition. This note does not claim acceptance is
+complete.
 
 ## What is being verified
 
@@ -79,8 +82,8 @@ contended with it. This is an interference witness, not one of the six capacity 
 
 The winner's lock hold, measured through its acknowledged COMMIT, was at most 20.312 s. Afterwards
 every proxy retried successfully and no proxy row leaked. The 2 s cap was a measurement device. It
-is not a production writer setting: ordinary pool writers have a 30 s statement cap and no lock cap,
-so a real writer may wait longer than 2 s.
+is not a production writer setting: ordinary pool writers have a 30 s statement cap by default
+(configurable) and no lock cap, so a real writer may wait longer than 2 s.
 
 ## Startup (AC-12b)
 
@@ -95,7 +98,9 @@ and after each startup:
 
 The exact membership and audit sets were also read back. Both task servers were stopped
 afterwards. This is evidence from local production Next. It is not proof of Railway healthcheck
-or restart behavior, or of the deployment wrapper.
+or restart behavior, or of the deployment wrapper. Socket readiness or a healthy health response
+is not, by itself, treated as proof that boot registration completed; the evidence is the observed
+`ran:true` together with the exact state readback.
 
 ## Repository tests
 
@@ -106,13 +111,25 @@ Two portable test files live in the repository. They are run by the ordinary sui
 - `test/guards/materializer-sql-caller-owner.test.ts` covers AC-03. It is a bounded literal guard,
   not a whole-program proof.
 
+To run them, together with the repository-wide checks:
+
+```bash
+npx vitest run test/guards/materializer-sql-caller-owner.test.ts
+npm run test:datamechanics:iso -- test/datamechanics/stagingmark5-runtime-owner.datamechanics.test.ts
+npm run typecheck
+npm run lint
+npm run check:docs
+```
+
 The durable-PostgreSQL capacity runner and the startup harness are ignored, coordinator-local
 tools. They are not in the repository and should not be treated as portable recipes.
 
 ## Validation recorded so far
 
 These results were verified by the coordinator. According to the coordinator's checkpoint reviews,
-the runtime source has been `22560991` since conversion; the later checkpoints changed tests only.
+the runtime source has been `22560991` since conversion. Later checkpoints changed tests and docs.
+The only production-source change in the latest checkpoint `ede72d2c` is to comments, so runtime
+behavior is unchanged. Failures and retries are listed as they happened; none is waived.
 
 | Check | Snapshot | Result |
 |---|---|---|
@@ -122,10 +139,30 @@ the runtime source has been `22560991` since conversion; the later checkpoints c
 | Stage 5 mutants | same | Killed: bounded in-call replay (2 connects), dropped `outcomeUnknown` flag (CLI case), and bare boot / `.mjs` / `.cjs` / `.js` callers. Canonical reruns pass: guard 10/10 and AC-10 3/3. |
 | Capacity and interference | `2a633d6e` (pre-conversion) | Six trials pass (≤ 60 s); interference measured as above |
 | Startup | `22560991` | Markerless and marked startups pass |
+| AC-03 guard span correction and private-helper control | up to `a4815204` | First run: 10 pass, 1 failed on the default 5 s test timeout. Retry: 11/11 pass. Both results retained. `check:docs`, typecheck and lint pass. |
+| AC-07 negative harness correction | up to `a4815204` | The original negative case failed its client-side bound (37,010 ms observed against a bound of < 31,000 ms). It was replaced by a finite 45 s negative harness that asserts the exact 30 s settings, `57014`, ROLLBACK and no effects; the positive case (31 s statement under the local 120 s) passed. This is not a waiver of the product timeout, and no cause is inferred for the delay. |
+| Existing item-context suites | up to `a4815204` | 2 files / 62 cases: 61 pass, 1 existing timing case failed on its unchanged 16 s harness bound. The exact unchanged held-lock case then passed in isolation in 10.57 s. Both results retained; no cause is inferred. |
+| Existing disposal units | up to `a4815204` | 3 files / 15 tests pass |
+| Unit/guard suites after the final follow-up fixes | `ede72d2c` | 10 files / 99 tests pass, including 13 AC-03 guard cases, under the unchanged default 5 s test timeout. Typecheck, lint and `check:docs` pass. The guard's baseline cache is an efficiency fix; it is not claimed as the exclusive cause of the earlier timeout. |
+| Runtime-owner dm suite, first run after the follow-up fixes | `ede72d2c` | 31 pass, 3 timing failures, 1,071.87 s total: one `beforeEach` hook timeout (30 s), one 30 s case timeout (AC-05 slow contender), and the AC-07 bare-default case, whose client-side measurement was 11.684 s against its ≥ 29.95 s bound although the server canceled at its 30 s default. No code cause is assumed and no test bound is waived. |
+| Runtime-owner dm suite, rerun with the machine kept awake | `ede72d2c` | 34/34 real-PG tests pass in 99.52 s. The coordinator independently confirmed that the run exited with status 0. The earlier failed run above is retained, not superseded. |
 
-**Pending:** the AC-03 guard span correction and its new private-helper control, `check:docs`,
-typecheck and lint on the final snapshot, the full acceptance matrix, and fresh final Opus code
-review and Astra security review.
+## Final reviews
+
+Independent final reviews were run on `a4815204`:
+
+- **Code review (Opus):** no correctness, privacy or permission blocker.
+- **Security review (Astra):** pass, with no actionable security findings.
+
+Adjudicated findings: two MEDIUM items were accepted. The AC-03 guard's repeated full-surface
+scanning (F2) was fixed in `ede72d2c`; this note's reconciliation (F1) is this update. LOW items
+were also accepted and fixed in `ede72d2c`: monotonic elapsed timing in the new PostgreSQL tests
+(F3), the `outcomeUnknown` comment and OPS wording (F5), and historical documentation (F6). An
+inherited scheduler failure-ledger recovery item (F4) is deferred outside this slice as a
+follow-up. The startup-evidence and runtime-profile limits (F7, F8) are retained above.
+
+**Pending:** a focused review of the follow-up fixes in `ede72d2c` and the final acceptance
+decision. Node 20 CI results will be reported only once they have actually run.
 
 ## Evidence provenance
 
