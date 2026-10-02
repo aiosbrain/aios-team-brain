@@ -253,25 +253,72 @@ describe("TIERRET-1 AC-05 — capped windows rank over the SERVED set", () => {
 });
 
 describe("TIERRET-1 AC-07 — Social member reads are the EVERY-evidence rule at either posture; ceilings stay", () => {
-  it("an external-posture member's oracle set admits an all-granted opportunity, denies one with a hidden item, and the chain inherits it", async () => {
+  it("production admission adapter + store composition: both member postures get the EVERY-evidence rule; legacy keys, inactive rows and hidden/missing evidence get nothing", async () => {
     const F = await fixture();
     const { createOpportunity, createPlan, addVariant, listOpportunities, actorSeesChain, listVariants } = await import("@/lib/social/store");
     const granted = await createOpportunity(db(), F.seed.teamId, { access: "team", sourceType: "arc", title: "granted story", evidence: [{ itemId: F.x }] }, { memberId: F.seed.memberId });
     const mixed = await createOpportunity(db(), F.seed.teamId, { access: "team", sourceType: "arc", title: "mixed story", evidence: [{ itemId: F.x }, { itemId: F.y }] }, { memberId: F.seed.memberId });
+    // Missing evidence: one cited item resolves to no row (the store's tier rule treats it as restrictive).
+    await createOpportunity(db(), F.seed.teamId, { access: "team", sourceType: "arc", title: "dangling story", evidence: [{ itemId: F.x }, { itemId: randomUUID() }] }, { memberId: F.seed.memberId });
     const plan = await createPlan(db(), F.seed.teamId, mixed.id, {}, { memberId: F.seed.memberId });
     const variant = await addVariant(db(), F.seed.teamId, plan.id, { platform: "x", format: "text", tone: "punchy", body: "mixed variant body" });
 
-    const view = await resolveContentView(db(), F.seed.teamId, F.external);
-    expect(view.admission.posture).toBe("external");
-    // HELPER-LEVEL store policy proof only: the store's member read applies no label veto when
-    // handed the oracle set, and admits by EVERY evidence regardless of the tier argument. It does
-    // NOT show an external-posture user reaching the social admin page — that page and the media
-    // route keep their unchanged `canAccessAdmin` role/posture gate.
-    const titles = (await listOpportunities(db(), F.seed.teamId, "team", 100, view.ids)).map((o) => o.title);
-    expect(titles, "all evidence granted → served at external posture").toContain("granted story");
-    expect(titles, "one hidden evidence item denies the whole opportunity").not.toContain("mixed story");
-    expect(await actorSeesChain(db(), F.seed.teamId, { variantId: variant.id }, view.ids), "a variant inherits its parent's denial").toBe(false);
-    expect(await actorSeesChain(db(), F.seed.teamId, { opportunityId: granted.id }, view.ids)).toBe(true);
+    // A team-posture human (builtin Everyone) with the SAME custom X grant as the external member.
+    const peer = await createMember(db(), F.seed.teamId, { email: `${randomUUID()}@test.local`, displayName: "Peer", actorHandle: `p-${randomUUID().slice(0, 8)}`, role: "member", tier: "team" });
+    await db().from("members").update({ status: "active" }).eq("id", peer.id);
+    expect((await addMemberToGroup(db(), F.seed.teamId, F.group, peer.id, F.seed.memberId)).ok).toBe(true);
+
+    // The production ADAPTER, composed exactly as a member read surface does it: the ONE resolver
+    // picks the label ceiling (`contentLabelTier`) and supplies the oracle set — no literal tier.
+    // This is adapter + store composition only. It does NOT show an external-posture user reaching
+    // the Social admin page: that page and the media route keep their unchanged admin role/posture
+    // gate, and generation/publication policy is untouched.
+    const socialRead = async (memberId: string) => {
+      const view = await resolveContentView(db(), F.seed.teamId, memberId);
+      const ceiling = contentLabelTier(view.admission);
+      const titles = (await listOpportunities(db(), F.seed.teamId, ceiling, 100, view.ids)).map((o) => o.title);
+      return { view, ceiling, titles };
+    };
+
+    for (const [label, memberId, posture] of [
+      ["external-posture member", F.external, "external"],
+      ["team-posture member", peer.id, "team"],
+    ] as const) {
+      const r = await socialRead(memberId);
+      expect(r.view.admission, label).toMatchObject({ kind: "member", posture });
+      expect(r.ceiling, `${label}: the resolver gives an admitted member no label ceiling`).toBe("team");
+      expect(r.titles, `${label}: all evidence granted → served`).toContain("granted story");
+      expect(r.titles, `${label}: one hidden evidence item denies the whole opportunity`).not.toContain("mixed story");
+      expect(r.titles, `${label}: one missing evidence item denies the whole opportunity`).not.toContain("dangling story");
+      expect(await actorSeesChain(db(), F.seed.teamId, { variantId: variant.id }, r.view.ids), `${label}: a variant inherits its parent's denial`).toBe(false);
+      expect(await actorSeesChain(db(), F.seed.teamId, { opportunityId: granted.id }, r.view.ids), label).toBe(true);
+    }
+
+    // The store DOES apply its tier argument: composing the external member's oracle set with its raw
+    // POSTURE (instead of the adapter's ceiling) hides the all-granted team-access opportunity. So the
+    // ceiling selection above is load-bearing, not decorative.
+    const ext = await resolveContentView(db(), F.seed.teamId, F.external);
+    expect((await listOpportunities(db(), F.seed.teamId, ext.admission.posture, 100, ext.ids)).map((o) => o.title)).not.toContain("granted story");
+
+    // Legacy negative controls: the resolver keeps each key's baseline posture ceiling, and an empty
+    // oracle set means the EVERY rule admits nothing — no gain at either ceiling.
+    for (const [label, tier, slug, ceiling] of [
+      ["external-posture connector", "external", "external", "external"],
+      ["Everyone-planted connector", "team", "everyone", "team"],
+    ] as const) {
+      const id = await rawMember(F.seed, { is_connector: true, tier });
+      await plantBuiltin(F.seed, id, slug);
+      const r = await socialRead(id);
+      expect(r.view.admission.kind, label).toBe("legacy");
+      expect(r.ceiling, `${label}: baseline posture ceiling from the resolver`).toBe(ceiling);
+      expect(r.titles, `${label}: gains no Social content`).toEqual([]);
+    }
+
+    // Positive-admission failure: an inactive human's read throws before it reaches the store.
+    const inactive = await rawMember(F.seed, { tier: "external", status: "disabled" });
+    await plantBuiltin(F.seed, inactive, "external");
+    await expect(socialRead(inactive)).rejects.toBeInstanceOf(ContentAdmissionError);
+
     // Generation/publication ceilings are untouched (negative control): a team-labelled variant is
     // never part of an EXTERNAL-ceiling listing.
     expect((await listVariants(db(), F.seed.teamId, plan.id, "external")).map((v) => v.id)).not.toContain(variant.id);

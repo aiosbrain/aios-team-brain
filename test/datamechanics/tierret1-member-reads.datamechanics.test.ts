@@ -568,7 +568,13 @@ describe("TIERRET-1 AC-12 — timeline via the production cache path", () => {
  *     `last_tasks_pull` → tasks writeback, `last_sync_tasks_pull` → tasks sync-origin,
  *     `last_decisions_pull` → decisions;
  *   - every received row MERGED BY ROW KEY into a local store, each cursor advanced to the pull's
- *     start time.
+ *     start time;
+ *   - like the installed CLI (accepted spec: it "merges task/decision feeds only for cfg.project"),
+ *     BOTH task legs and the decisions feed are merged only for groups whose returned `project` slug
+ *     is the workspace's configured project. The items feed is merged unfiltered, as the CLI does.
+ *     Rows the server returns for ANOTHER project are recorded (to prove the filter, not the
+ *     server, excluded them) and never merged — so recovery is per workspace project, and this
+ *     fixture makes no cross-project recovery claim.
  * The OKF bundle is NOT one of those four keys: an OKF consumer keeps its OWN cursor, held here in a
  * separate consumer state file outside `.aios/state.json`, and the release notes tell it to discard
  * that cursor separately. What this proves is the SERVER half plus the merge contract the release note
@@ -600,7 +606,10 @@ class DisposableClient {
     await mkdir(join(this.dir, ".aios"), { recursive: true });
     await writeFile(this.statePath, JSON.stringify(s, null, 2));
   }
-  /** One `pull` over the four CLI feeds: returns the row keys DELIVERED in this pull (duplicates included). */
+  /** Row keys the server returned in the LAST pull for a project other than the configured one,
+   *  as `<feed>:<row_key>@<returned project slug>` — returned, never merged. */
+  foreign: string[] = [];
+  /** One `pull` over the four CLI feeds: returns the row keys MERGED in this pull (duplicates included). */
   async pull(): Promise<string[]> {
     const s = await this.state();
     const startedAt = new Date().toISOString();
@@ -611,7 +620,18 @@ class DisposableClient {
     if (typeof project !== "string" || !project) throw new Error("fixture state.json has no workspace project");
     const delivered: string[] = [];
     const merge = merger(this.store, delivered);
-    // `last_pull` → the items feed (the CLI's own cursor for item bodies), paged by next_cursor.
+    const foreign: string[] = [];
+    this.foreign = foreign;
+    // cfg.project filter for the structured feeds: merge the configured project's group only.
+    const mergeGroups = (prefix: string, groups: { project: string; rows: { row_key: string; title: string }[] }[]) => {
+      for (const g of groups) {
+        for (const r of g.rows) {
+          if (g.project === project) merge(`${prefix}:${r.row_key}`, r.title);
+          else foreign.push(`${prefix}:${r.row_key}@${g.project}`);
+        }
+      }
+    };
+    // `last_pull` → the items feed (the CLI's own cursor for item bodies), paged by next_cursor. Unfiltered.
     let itemsQuery = `?since=${since("last_pull")}`;
     for (let page = 0; page < 50; page++) {
       const ires = await itemsGET(req(`/api/v1/items${itemsQuery}`, this.key));
@@ -627,15 +647,11 @@ class DisposableClient {
     ] as const) {
       const res = await tasksGET(req(path, this.key));
       expect(res.status).toBe(200);
-      for (const p of ((await res.json()) as { tasks: { rows: { row_key: string; title: string }[] }[] }).tasks) {
-        for (const r of p.rows) merge(`${prefix}:${r.row_key}`, r.title);
-      }
+      mergeGroups(prefix, ((await res.json()) as { tasks: { project: string; rows: { row_key: string; title: string }[] }[] }).tasks);
     }
     const dres = await decisionsGET(req(`/api/v1/decisions?since=${since("last_decisions_pull")}`, this.key));
     expect(dres.status).toBe(200);
-    for (const p of ((await dres.json()) as { decisions: { rows: { row_key: string; title: string }[] }[] }).decisions) {
-      for (const r of p.rows) merge(`decision:${r.row_key}`, r.title);
-    }
+    mergeGroups("decision", ((await dres.json()) as { decisions: { project: string; rows: { row_key: string; title: string }[] }[] }).decisions);
     // Advance ONLY the four cursor keys; every other key is written back untouched.
     const next = { ...s };
     for (const k of CURSOR_KEYS) next[k] = startedAt;
@@ -677,7 +693,7 @@ class OkfConsumer {
 }
 
 describe("TIERRET-1 AC-14 — a full re-pull recovers older newly admitted rows without duplicates", () => {
-  it("a disposable client fixture: advanced cursors miss the older admitted rows; backup + resetting exactly the four CLI keys recovers items/tasks/decisions once; the OKF consumer's own cursor reset recovers OKF; repeat pulls never duplicate", async () => {
+  it("disposable client fixtures (src and X workspaces): advanced cursors miss the older admitted rows; backup + resetting exactly the four CLI keys recovers each workspace's OWN project rows once, never another project's; the OKF consumer's own cursor reset recovers OKF; repeat pulls never duplicate", async () => {
     const F = await buildFixture();
     // Every row predates the client's cursors (access changes do not move timestamps): items synced
     // two hours ago, structured rows last touched an hour ago — after their source synced, so the
@@ -688,73 +704,116 @@ describe("TIERRET-1 AC-14 — a full re-pull recovers older newly admitted rows 
     await db().from("tasks").update({ updated_at: hourAgo }).eq("team_id", F.seed.teamId);
     await db().from("decisions").update({ updated_at: hourAgo }).eq("team_id", F.seed.teamId);
 
+    // The workspaces' configured projects are the ACTUAL slugs the feeds return, read from the DB.
+    const slugOf = async (id: string) => ((await db().from("projects").select("slug").eq("id", id).single()).data as { slug: string }).slug;
+    const srcSlug = await slugOf(F.srcId);
+    const xSlug = await slugOf(F.X);
+    expect(srcSlug).not.toBe(xSlug);
+
     // Before the grant applies to this member (the pre-TIERRET world, from the client's view).
     expect((await removeMemberFromGroup(db(), F.seed.teamId, F.clientsGroup, F.external, F.seed.memberId)).ok).toBe(true);
 
-    const dir = await mkdtemp(join(tmpdir(), "tierret1-client-"));
+    const srcDir = await mkdtemp(join(tmpdir(), "tierret1-client-src-"));
+    const xDir = await mkdtemp(join(tmpdir(), "tierret1-client-x-"));
     try {
-      const client = new DisposableClient(dir, F.externalKey);
-      const okf = new OkfConsumer(dir, F.externalKey);
-      const unrelated = {
-        project: "src",
+      // Two workspaces on the SAME key, each configured for one project, each with its own state file.
+      const ws = {
+        src: { client: new DisposableClient(srcDir, F.externalKey), slug: srcSlug },
+        x: { client: new DisposableClient(xDir, F.externalKey), slug: xSlug },
+      } as const;
+      const okf = new OkfConsumer(srcDir, F.externalKey);
+      const unrelatedFor = (project: string) => ({
+        project,
         push_hashes: { "notes/a.md": "sha-a", "notes/b.md": "sha-b" },
         last_push: "2026-09-01T00:00:00.000Z",
         team: F.seed.teamId,
-      };
-      await client.writeState({ ...unrelated, ...Object.fromEntries(CURSOR_KEYS.map((k) => [k, EPOCH])) });
+      });
+      for (const w of Object.values(ws)) {
+        await w.client.writeState({ ...unrelatedFor(w.slug), ...Object.fromEntries(CURSOR_KEYS.map((k) => [k, EPOCH])) });
+      }
       await okf.writeCursor(EPOCH);
 
-      // The four CLI feeds (items via last_pull, tasks ×2, decisions) and the separate OKF consumer.
-      const ADMITTED = ["item:x.md", "item:x2.md", "task:HTX-1", "task:LX-1", "decision:DX-1", "decision:HDX-1"];
+      // Per workspace: items are merged unfiltered; tasks/decisions only for the configured project.
+      // src holds the SOURCED rows (LX-1, DX-1); X holds the HAND-ENTERED ones (HTX-1, HDX-1).
+      const ADMITTED = {
+        src: ["item:x.md", "item:x2.md", "task:LX-1", "decision:DX-1"],
+        x: ["item:x.md", "item:x2.md", "task:HTX-1", "decision:HDX-1"],
+      } as const;
+      // Visible to this key, but they belong to the OTHER workspace's project — never merged here.
+      const OTHER_PROJECT = {
+        src: ["task:HTX-1", "decision:HDX-1"],
+        x: ["task:LX-1", "decision:DX-1"],
+      } as const;
+      // Non-vacuity: rows the server provably RETURNED for the other project in the recovery pull.
+      const RETURNED_FOREIGN = {
+        src: [`task:HTX-1@${xSlug}`, `decision:HDX-1@${xSlug}`],
+        x: [`decision:DX-1@${srcSlug}`],
+      } as const;
       const NEVER = ["item:y.md", "task:LY-9", "task:HTS-1", "decision:DY-1"];
       const OKF_ADMITTED = ["okf:x.md", "okf:x2.md"];
       const OKF_NEVER = ["okf:y.md"];
+      type Ws = keyof typeof ws;
+      const names = Object.keys(ws) as Ws[];
 
-      const p1 = await client.pull();
+      for (const n of names) {
+        const p1 = await ws[n].client.pull();
+        for (const k of ADMITTED[n]) expect(p1, `${n} ${k}: not yet admitted`).not.toContain(k);
+      }
       const o1 = await okf.pull();
-      for (const k of ADMITTED) expect(p1, `${k}: not yet admitted`).not.toContain(k);
       for (const k of OKF_ADMITTED) expect(o1, `${k}: not yet admitted`).not.toContain(k);
 
       // The grant now applies (what deploying TIERRET-1 does for an existing grant).
       expect((await addMemberToGroup(db(), F.seed.teamId, F.clientsGroup, F.external, F.seed.memberId)).ok).toBe(true);
 
-      const p2 = await client.pull();
+      for (const n of names) {
+        const p2 = await ws[n].client.pull();
+        for (const k of ADMITTED[n]) expect(p2, `${n} ${k}: older than the advanced cursors, so an ordinary pull misses it`).not.toContain(k);
+        for (const k of ADMITTED[n]) expect(ws[n].client.store.has(k)).toBe(false);
+      }
       const o2 = await okf.pull();
-      for (const k of ADMITTED) expect(p2, `${k}: older than the advanced cursors, so an ordinary pull misses it`).not.toContain(k);
-      for (const k of ADMITTED) expect(client.store.has(k)).toBe(false);
       for (const k of OKF_ADMITTED) expect(o2, `${k}: older than the consumer's own advanced cursor`).not.toContain(k);
 
-      // Release-note step 1: back up the state file — byte-identical copy.
-      const before = await readFile(client.statePath, "utf8");
-      const backup = `${client.statePath}.bak`;
-      await copyFile(client.statePath, backup);
-      expect(await readFile(backup, "utf8")).toBe(before);
       const okfCursorBefore = await readFile(okf.cursorPath, "utf8");
+      const backups = {} as Record<Ws, string>;
+      const p3 = {} as Record<Ws, string[]>;
+      const sizeAfterRecovery = {} as Record<Ws, number>;
+      for (const n of names) {
+        const client = ws[n].client;
+        const unrelated = unrelatedFor(ws[n].slug);
+        // Release-note step 1: back up the state file — byte-identical copy.
+        const before = await readFile(client.statePath, "utf8");
+        backups[n] = `${client.statePath}.bak`;
+        await copyFile(client.statePath, backups[n]);
+        expect(await readFile(backups[n], "utf8")).toBe(before);
 
-      // Step 2: reset EXACTLY the four cursor keys; every other key is preserved verbatim.
-      const s = await client.state();
-      const reset = { ...s, ...Object.fromEntries(CURSOR_KEYS.map((k) => [k, EPOCH])) };
-      await client.writeState(reset);
-      const after = await client.state();
-      expect(Object.keys(after).sort()).toEqual(Object.keys(s).sort());
-      for (const k of Object.keys(s)) {
-        if ((CURSOR_KEYS as readonly string[]).includes(k)) expect(after[k], k).toBe(EPOCH);
-        else expect(after[k], `${k} must survive the reset`).toEqual(s[k]);
+        // Step 2: reset EXACTLY the four cursor keys; every other key is preserved verbatim.
+        const s = await client.state();
+        await client.writeState({ ...s, ...Object.fromEntries(CURSOR_KEYS.map((k) => [k, EPOCH])) });
+        const after = await client.state();
+        expect(Object.keys(after).sort()).toEqual(Object.keys(s).sort());
+        for (const k of Object.keys(s)) {
+          if ((CURSOR_KEYS as readonly string[]).includes(k)) expect(after[k], `${n} ${k}`).toBe(EPOCH);
+          else expect(after[k], `${n} ${k} must survive the reset`).toEqual(s[k]);
+        }
+        expect(after).toMatchObject(unrelated);
+
+        // Step 3: pull — the workspace's own older newly admitted rows arrive, once each; nothing
+        // hidden arrives; another project's rows are returned by the server but NOT merged.
+        p3[n] = await client.pull();
+        for (const k of ADMITTED[n]) expect(client.store.has(k), `${n}: ${k} recovered by the epoch re-pull`).toBe(true);
+        for (const k of NEVER) expect(client.store.has(k), `${n}: ${k} is never delivered`).toBe(false);
+        for (const k of NEVER) expect(p3[n]).not.toContain(k);
+        for (const k of OTHER_PROJECT[n]) expect(client.store.has(k), `${n}: ${k} belongs to another configured project`).toBe(false);
+        expect(client.foreign, `${n}: the server did return the other project's visible rows`).toEqual(expect.arrayContaining([...RETURNED_FOREIGN[n]]));
+        for (const f of client.foreign) expect(client.store.has(f.slice(0, f.lastIndexOf("@"))), `${n}: returned-for-another-project ${f} is never merged`).toBe(false);
+        const feedDupes = p3[n].filter((k, i) => p3[n].indexOf(k) !== i && !k.startsWith("task:"));
+        expect(feedDupes, `${n}: within one pull, an item/decision row is delivered at most once`).toEqual([]);
+        sizeAfterRecovery[n] = client.store.size;
       }
-      expect(after).toMatchObject(unrelated);
-      expect(await readFile(okf.cursorPath, "utf8"), "the CLI reset does not touch the OKF consumer's own cursor").toBe(okfCursorBefore);
-
-      // Step 3: pull — the older newly admitted items/tasks/decisions arrive, once each; nothing hidden arrives.
-      const p3 = await client.pull();
-      for (const k of ADMITTED) expect(client.store.has(k), `${k} recovered by the epoch re-pull`).toBe(true);
-      for (const k of NEVER) expect(client.store.has(k), `${k} is never delivered`).toBe(false);
-      for (const k of NEVER) expect(p3).not.toContain(k);
-      const feedDupes = p3.filter((k, i) => p3.indexOf(k) !== i && !k.startsWith("task:"));
-      expect(feedDupes, "within one pull, an item/decision row is delivered at most once").toEqual([]);
-      const sizeAfterRecovery = client.store.size;
+      expect(await readFile(okf.cursorPath, "utf8"), "the CLI resets do not touch the OKF consumer's own cursor").toBe(okfCursorBefore);
 
       // The OKF consumer's cursor is NOT a CLI key, so the CLI reset alone does not recover OKF —
-      // the release note's SEPARATE OKF step is required.
+      // the release note's SEPARATE OKF step is required. OKF is not project-filtered by a workspace.
       const o3 = await okf.pull();
       for (const k of OKF_ADMITTED) expect(o3, `${k}: still behind the consumer's own cursor`).not.toContain(k);
       await okf.writeCursor(EPOCH);
@@ -766,24 +825,28 @@ describe("TIERRET-1 AC-14 — a full re-pull recovers older newly admitted rows 
 
       // A second pull (cursors advanced again) and a SECOND full reset + pull: the merge keeps one
       // entry per row key — re-delivery replaces, it never duplicates.
-      await client.pull();
-      await client.writeState({ ...(await client.state()), ...Object.fromEntries(CURSOR_KEYS.map((k) => [k, EPOCH])) });
-      const p5 = await client.pull();
-      expect(new Set(p5), "the repeated epoch pull re-delivers the same row-key set").toEqual(new Set(p3));
-      expect(client.store.size, "…and the merged store does not grow").toBe(sizeAfterRecovery);
-      expect(await client.state(), "unrelated push state survives every pull").toMatchObject(unrelated);
+      for (const n of names) {
+        const client = ws[n].client;
+        await client.pull();
+        await client.writeState({ ...(await client.state()), ...Object.fromEntries(CURSOR_KEYS.map((k) => [k, EPOCH])) });
+        const p5 = await client.pull();
+        expect(new Set(p5), `${n}: the repeated epoch pull re-delivers the same row-key set`).toEqual(new Set(p3[n]));
+        expect(client.store.size, `${n}: …and the merged store does not grow`).toBe(sizeAfterRecovery[n]);
+        expect(await client.state(), `${n}: unrelated push state survives every pull`).toMatchObject(unrelatedFor(ws[n].slug));
+        // The pre-reset backup still holds the advanced cursors an operator could restore.
+        const bak = JSON.parse(await readFile(backups[n], "utf8")) as Record<string, unknown>;
+        for (const k of CURSOR_KEYS) expect(bak[k], `${n} ${k}`).not.toBe(EPOCH);
+        expect(Object.keys(bak).sort(), `${n}: the state file holds exactly the four CLI cursors plus push state — no OKF cursor`).toEqual(
+          [...CURSOR_KEYS, ...Object.keys(unrelatedFor(ws[n].slug))].sort()
+        );
+      }
       await okf.writeCursor(EPOCH);
       const o5 = await okf.pull();
       expect(new Set(o5), "the repeated OKF epoch pull re-delivers the same node set").toEqual(new Set(o4));
       expect(okf.store.size, "…and the OKF store does not grow").toBe(okfSizeAfterRecovery);
-      // The pre-reset backup still holds the advanced cursors an operator could restore.
-      const bak = JSON.parse(await readFile(backup, "utf8")) as Record<string, unknown>;
-      for (const k of CURSOR_KEYS) expect(bak[k]).not.toBe(EPOCH);
-      expect(Object.keys(bak).sort(), "the state file holds exactly the four CLI cursors plus push state — no OKF cursor").toEqual(
-        [...CURSOR_KEYS, ...Object.keys(unrelated)].sort()
-      );
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(srcDir, { recursive: true, force: true });
+      await rm(xDir, { recursive: true, force: true });
     }
   });
 });
