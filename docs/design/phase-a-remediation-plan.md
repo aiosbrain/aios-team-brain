@@ -62,6 +62,19 @@ the same predicate and it should be rewritten once.
 **Wave 2 — TIERRET-1**, after Lane A and -3. It then deletes `noWideningGate`, one of -10's fail-opens,
 and part of -7's predicate.
 
+> **Status (TIERRET-1 / AIO-1045 implementation, spec `docs/design/tierret1-membership-only.md`).**
+> Both dependencies were verified PRESENT at the inspected staging base: AUDITFIX-3 (grant + adoption
+> refusal, with AUDITFIX-23's census and AUDITFIX-21's sanctioned repair) and AUDITFIX-13/item 12 (the
+> serialization protocol). What actually happened differs from the line above in two stated ways:
+> (1) `noWideningGate` was **REPLACED, not deleted** — by `systemIntegrityGate`, which keeps the gate's
+> position in the AUDITFIX-13 protocol but drops the label veto on ordinary/initiative targets and
+> instead enforces exact routing + sanctioned-only grants on protected targets, in both directions; the
+> "-13 justification" row above (`noWideningGate` as concurrency backstop) is superseded — the
+> serialization protocol, not the gate, is what coordinates the moves. (2) -7's predicate was
+> EXTENDED, not shrunk: the member hand-entered arm is now Everyone-or-granted-projects, and the token
+> arm is unchanged. The release notes are `docs/RELEASE-NOTES-tierret1.md`; the per-AC evidence lives
+> in the PR. This status note records facts; the historical rows above are left as written.
+
 **Wave 3 — re-triage** `5`, `6`, `16` against the smaller codebase.
 
 **Wave 3 also owns the cross-route request-admission follow-up — UNFILED, no key.** AUDITFIX-17

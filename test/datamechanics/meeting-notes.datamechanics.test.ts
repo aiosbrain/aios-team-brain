@@ -11,9 +11,9 @@ import { db, seedTeam } from "./helpers";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
 
 /**
- * Spec for the meeting-notes single writer on REAL Postgres — the tier isolation (team-tier ONLY,
- * see lib/meetings/notes.ts's canSeeMeetingNotes) has no RLS backstop, so it must be proven against
- * the real DB, not just read from the impl.
+ * Spec for the meeting-notes single writer on REAL Postgres — read access (the source transcript's
+ * membership, TIERRET-1; the posture `canSeeMeetingNotes` now gates WRITES only) has no RLS
+ * backstop, so it must be proven against the real DB, not just read from the impl.
  */
 
 async function addAttendee(teamId: string, displayName: string): Promise<string> {
@@ -83,7 +83,7 @@ describe("meeting notes (real Postgres)", () => {
     expect(item.path).toBe(`meetings/${noteId}.md`);
   });
 
-  it("is team-tier only: an external viewer gets [] / null even though the rows exist", async () => {
+  it("membership decides the READ (TIERRET-1 AC-07): an ungranted external member gets [] / null; a caller-supplied tier never does", async () => {
     const seed = await seedTeam();
     await backfillTeamContext(db(), seed.teamId); // ENFB-3: the gate needs a context-bootstrapped team (prod guarantee: bootstrap/scheduler)
     const { noteId: noteId } = await createMeetingNote(db(), seed.teamId, {
@@ -91,15 +91,21 @@ describe("meeting notes (real Postgres)", () => {
       rawText: "sensitive discussion",
       submittedByMemberId: seed.memberId,
     });
+    await backfillTeamContext(db(), seed.teamId); // the transcript lands in General
 
     const teamView = await listMeetingNotesForTeam(db(), seed.teamId, { memberId: seed.memberId, tier: "team" });
     expect(teamView.map((n) => n.id)).toContain(noteId);
 
-    const externalList = await listMeetingNotesForTeam(db(), seed.teamId, { memberId: seed.memberId, tier: "external" });
-    expect(externalList).toEqual([]);
+    // An external-posture member with no grant reaching General: denied by MEMBERSHIP.
+    const { externalMember } = await import("./helpers");
+    const outsider = await externalMember(seed);
+    expect(await listMeetingNotesForTeam(db(), seed.teamId, { memberId: outsider, tier: "external" })).toEqual([]);
+    expect(await getMeetingNote(db(), seed.teamId, noteId, { memberId: outsider, tier: "external" })).toBeNull();
 
-    const externalDetail = await getMeetingNote(db(), seed.teamId, noteId, { memberId: seed.memberId, tier: "external" });
-    expect(externalDetail).toBeNull();
+    // The `tier` a caller passes is no longer a read gate (it was a constant away from bypass and,
+    // since TIERRET-1, a label veto over a valid grant): the entitled member's answer is unchanged.
+    const sameMemberOtherTier = await listMeetingNotesForTeam(db(), seed.teamId, { memberId: seed.memberId, tier: "external" });
+    expect(sameMemberOtherTier.map((n) => n.id)).toContain(noteId);
 
     const teamDetail = await getMeetingNote(db(), seed.teamId, noteId, { memberId: seed.memberId, tier: "team" });
     expect(teamDetail?.title).toBe("Internal-only note");
