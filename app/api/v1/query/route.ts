@@ -161,6 +161,7 @@ export async function POST(req: NextRequest) {
       // here, which would be a second oracle read free to disagree with the first.
       enforce = { visibleItemIds: ids, principal: "token", tokenProjectIds: projectIds };
     } else {
+      // PRET-6: enforcing is the only behavior — the member arm is unconditional.
       // TIERRET-1: an ordinary `aios_` key is NOT automatically a member. The ONE admission
       // resolver decides: an admitted member (active human/standing agent) gets its oracle item
       // set, its hand-entered authority and its graph partitions (PCCC-6/PRET-4 ruling 2 — exactly

@@ -209,6 +209,29 @@ describe("TIERRET-1 AC-05 — capped windows rank over the SERVED set", () => {
   });
 });
 
+describe("TIERRET-1 AC-07 — Social member reads are the EVERY-evidence rule at either posture; ceilings stay", () => {
+  it("an external-posture member's oracle set admits an all-granted opportunity, denies one with a hidden item, and the chain inherits it", async () => {
+    const F = await fixture();
+    const { createOpportunity, createPlan, addVariant, listOpportunities, actorSeesChain, listVariants } = await import("@/lib/social/store");
+    const granted = await createOpportunity(db(), F.seed.teamId, { access: "team", sourceType: "arc", title: "granted story", evidence: [{ itemId: F.x }] }, { memberId: F.seed.memberId });
+    const mixed = await createOpportunity(db(), F.seed.teamId, { access: "team", sourceType: "arc", title: "mixed story", evidence: [{ itemId: F.x }, { itemId: F.y }] }, { memberId: F.seed.memberId });
+    const plan = await createPlan(db(), F.seed.teamId, mixed.id, {}, { memberId: F.seed.memberId });
+    const variant = await addVariant(db(), F.seed.teamId, plan.id, { platform: "x", format: "text", tone: "punchy", body: "mixed variant body" });
+
+    const view = await resolveContentView(db(), F.seed.teamId, F.external);
+    expect(view.admission.posture).toBe("external");
+    // The page's member read: no label veto (the page passes its label-free arm), EVERY evidence.
+    const titles = (await listOpportunities(db(), F.seed.teamId, "team", 100, view.ids)).map((o) => o.title);
+    expect(titles, "all evidence granted → served at external posture").toContain("granted story");
+    expect(titles, "one hidden evidence item denies the whole opportunity").not.toContain("mixed story");
+    expect(await actorSeesChain(db(), F.seed.teamId, { variantId: variant.id }, view.ids), "a variant inherits its parent's denial").toBe(false);
+    expect(await actorSeesChain(db(), F.seed.teamId, { opportunityId: granted.id }, view.ids)).toBe(true);
+    // Generation/publication ceilings are untouched (negative control): a team-labelled variant is
+    // never part of an EXTERNAL-ceiling listing.
+    expect((await listVariants(db(), F.seed.teamId, plan.id, "external")).map((v) => v.id)).not.toContain(variant.id);
+  });
+});
+
 describe("TIERRET-1 AC-12 — timeline cache: new namespace, v16, admission-separated, revocation, purge, rollback", () => {
   async function timelineFixture() {
     const F = await fixture();
