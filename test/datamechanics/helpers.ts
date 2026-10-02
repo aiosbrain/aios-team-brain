@@ -64,6 +64,37 @@ export function sha(body: string): string {
   return createHash("sha256").update(body).digest("hex");
 }
 
+/**
+ * AUDITFIX-19 TEST-ONLY SUBSTRATE: give an already-minted token the LEGACY stored scope `[]`.
+ *
+ * New mints can no longer REQUEST an empty scope (the writer refuses it), but rows minted before
+ * that rule still exist and must keep reading NOTHING — `[]` is never normalized to NULL. Tests prove
+ * that read contract by rewriting a freshly minted explicit token's `project_scope` here, before any
+ * read, then reading the row back. Test files sit outside the application single-writer scan
+ * (`test/guards/access-single-writer.test.ts` covers app/lib/scripts); there is deliberately no
+ * application path or production mint mode that does this.
+ */
+export async function persistLegacyEmptyScopeForTest(teamId: string, tokenRowId: string): Promise<void> {
+  const admin = db();
+  const { error } = await admin
+    .from("agent_tokens")
+    .update({ project_scope: [] })
+    .eq("team_id", teamId)
+    .eq("id", tokenRowId);
+  if (error) throw new Error(`legacy-empty scope fixture write failed: ${error.message}`);
+  const { data, error: readErr } = await admin
+    .from("agent_tokens")
+    .select("project_scope")
+    .eq("team_id", teamId)
+    .eq("id", tokenRowId)
+    .single();
+  if (readErr) throw new Error(`legacy-empty scope fixture readback failed: ${readErr.message}`);
+  const stored = (data as { project_scope: string[] | null }).project_scope;
+  if (!Array.isArray(stored) || stored.length !== 0) {
+    throw new Error(`legacy-empty scope fixture did not persist []: got ${JSON.stringify(stored)}`);
+  }
+}
+
 export type Seed = { teamId: string; teamSlug: string; memberId: string };
 
 /** Seed a real team + active member (FK targets the ingest/read paths require). */

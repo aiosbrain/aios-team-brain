@@ -163,7 +163,9 @@ describe("the enforced items read (one mode, post-PRET-6)", () => {
     const forbidden = await grantProjectToGroup(db(), seed.teamId, gen!.id, g2.groupId!, seed.memberId);
     expect(forbidden.ok, "General may not be granted to an ordinary group (AUDITFIX-3)").toBe(false);
     expect(forbidden.error, "refused BY THE GUARD, not by a missing fixture").toMatch(/system|substrate|sanctioned/i);
-    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent }, seed.memberId);
+    // AUDITFIX-19: a deliberate all-reachable choice (stored NULL) — what the omitted scope used to mean.
+    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent, scope: { kind: "all-reachable" } }, seed.memberId);
+    expect(minted.ok, minted.error).toBe(true);
 
     const got = await paths(minted.token!);
     expect(got, "the agent sees General content").toContain("ag-shared.md");

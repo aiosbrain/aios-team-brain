@@ -14,9 +14,11 @@ import { EVERYONE_SLUG, EXTERNAL_SLUG } from "@/lib/access/groups";
  * Eligibility is applied READ-side here even though the groups writer already refuses
  * ineligible memberships — a flag flipped after a row snuck in must still resolve to nothing.
  *
- * `projectScope` is token attenuation (spec §10): `null`/`undefined` = unattenuated (the spawn
- * default — the ONE access-input where null opens rather than closes, deliberate and named in
- * the spec); `[]` = sees nothing. The two must never be conflated.
+ * `projectScope` is token attenuation (spec §10): `null`/`undefined` = unattenuated (the ONE
+ * access-input where null opens rather than closes, deliberate and named in the spec); `[]` = sees
+ * nothing. The two must never be conflated. This is the STORED read meaning only: since AUDITFIX-19
+ * a new mint stores NULL solely for an explicit all-reachable choice — omission is refused at
+ * issuance — while every existing NULL/`[]`/list token keeps exactly this read behaviour.
  *
  * Authorship is never an access input: nothing in this module reads the items table or any
  * authorship column (guarded by the oracle-no-authorship check in

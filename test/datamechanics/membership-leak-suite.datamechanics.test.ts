@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { NextRequest } from "next/server";
-import { db, ingest, seedTeam, sha, type Seed } from "./helpers";
+import { db, ingest, persistLegacyEmptyScopeForTest, seedTeam, sha, type Seed } from "./helpers";
 import { GET as itemsGET } from "@/app/api/v1/items/route";
 import { GET as membersGET } from "@/app/api/v1/members/route";
 import { issueApiKey } from "@/lib/admin/keys";
@@ -397,10 +397,13 @@ describe("PRET-5 A6 — the timeline wall drop (the §1 change), completed by TI
 describe("PRET-5 A7 — token semantics, byte-unchanged", () => {
   it("(a) a team-launcher token with empty scope reads NOTHING of X or Y; (b) minting for the external member is REFUSED", async () => {
     const F: Fixture = await buildFixture();
-    const minted = await mintAgentToken(db(), F.seed.teamId, { memberId: F.seed.memberId, projectScope: [] }, F.seed.memberId);
+    // AUDITFIX-19: a new mint cannot request [] — the LEGACY empty token is a test-only persisted
+    // row on a fresh explicit token, written before any read; its read contract is unchanged.
+    const minted = await mintAgentToken(db(), F.seed.teamId, { memberId: F.seed.memberId, scope: { kind: "all-reachable" } }, F.seed.memberId);
     expect(minted.ok, (minted as { error?: string }).error).toBe(true);
+    await persistLegacyEmptyScopeForTest(F.seed.teamId, minted.tokenRowId!);
     // The claims→scope round-trip (diff-review L2): the token VERIFIES and its principal
-    // carries the empty scope the mint bound.
+    // carries the stored empty scope.
     const { verifyAgentToken } = await import("@/lib/access/agent-tokens");
     const principal = await verifyAgentToken(db(), minted.token!);
     expect(principal, "the minted token verifies").not.toBeNull();
@@ -413,7 +416,8 @@ describe("PRET-5 A7 — token semantics, byte-unchanged", () => {
     });
     expect(effective.size, "an empty scope sees nothing — the attenuation proof").toBe(0);
 
-    const refused = await mintAgentToken(db(), F.seed.teamId, { memberId: F.external, projectScope: null }, F.seed.memberId);
+    // Valid scope, so the refusal is the external-tier rule and not a missing scope choice.
+    const refused = await mintAgentToken(db(), F.seed.teamId, { memberId: F.external, scope: { kind: "all-reachable" } }, F.seed.memberId);
     expect(refused.ok).toBe(false);
     expect((refused as { error?: string }).error).toMatch(/external-tier delegation/);
   });
