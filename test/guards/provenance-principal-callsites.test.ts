@@ -425,14 +425,73 @@ describe("guard: a token can never acquire member provenance semantics", () => {
 
   it("TIERRET-1: the admission resolver emits the member arm ONLY after isPrincipal", () => {
     const adm = codeOnly(read("lib/access/admission.ts"));
-    const principalCheck = adm.indexOf("if (!isPrincipal(member)) return { kind: \"legacy\"");
+    const activeCheck = adm.indexOf('if (member.status !== "active") throw new ContentAdmissionError');
+    const kindCheck = adm.indexOf("!KNOWN_KINDS.has(member.kind as string)");
+    const principalCheck = adm.indexOf("if (!isPrincipal(eligibility)) return { kind: \"legacy\"");
     const memberReturn = adm.indexOf('kind: "member",');
-    expect(principalCheck, "the positive eligibility check must exist").toBeGreaterThan(-1);
-    expect(memberReturn, "and precede the member arm").toBeGreaterThan(principalCheck);
+    expect(activeCheck, "an inactive row is refused (throws) …").toBeGreaterThan(-1);
+    expect(kindCheck, "… as is an unknown kind …").toBeGreaterThan(activeCheck);
+    expect(principalCheck, "… BEFORE the eligibility split chooses legacy or member").toBeGreaterThan(kindCheck);
+    expect(memberReturn, "and the positive check precedes the member arm").toBeGreaterThan(principalCheck);
+    // The member literal this file owns is the one inventoried in MEMBER_BOUNDARIES, and it is only
+    // ever emitted through `contentReaderFor` on a `kind: "member"` admission.
+    expect(adm).toMatch(/const MEMBER_ARM: MemberTag = "member";/);
+    expect(adm).toMatch(/case "member":\s*return \{ principal: MEMBER_ARM,/);
     // Errors throw (fail closed) rather than default to either arm.
     expect(adm).toMatch(/if \(error\) throw new ContentAdmissionError/);
     expect(adm).toMatch(/if \(!data\) throw new ContentAdmissionError/);
     expect(adm).toMatch(/if \(oracleError\) throw new ContentAdmissionError/);
+  });
+
+  it("TIERRET-1: every file that LEFT the member allow-list now takes its reader from the resolver and forwards it", () => {
+    // These files spelled "member" themselves before TIERRET-1 (see the base allow-list in git
+    // history). Leaving the list is only honest if each now (a) calls the admission resolver and
+    // (b) forwards the resolver's reader/ctx rather than rebuilding one — otherwise removing the
+    // literal silently closed (or opened) that surface's hand-typed arm.
+    const VIEW_CTX: [string, RegExp][] = [
+      ["app/api/v1/tasks/route.ts", /resolveContentView\(db,\s*auth\.teamId,\s*auth\.memberId\)/],
+      ["app/api/v1/decisions/route.ts", /resolveContentView\(db,\s*auth\.teamId,\s*auth\.memberId\)/],
+      ["app/t/[team]/page.tsx", /resolveContentView\(adminClient\(\),\s*team\.id,\s*memberId\)/],
+      ["app/t/[team]/tasks/page.tsx", /resolveContentView\(adminClient\(\),\s*team\.id,\s*viewer\.id\)/],
+      ["app/t/[team]/decisions/page.tsx", /resolveContentView\(adminClient\(\),\s*team\.id,/],
+      ["app/t/[team]/projects/[project]/page.tsx", /resolveContentView\(/],
+    ];
+    for (const [rel, call] of VIEW_CTX) {
+      const src = codeOnly(read(rel));
+      expect(src, `${rel} must resolve its reader through the admission resolver`).toMatch(call);
+      expect(src, `${rel} must forward the resolver's ctx (provenanceCtxFor(vis)), not build one`).toMatch(/provenanceCtxFor\(vis\)/);
+    }
+    // Both query routes: the resolver builds the whole enforcement (incl. the discriminator).
+    expect(codeOnly(read("app/api/v1/query/route.ts"))).toMatch(/enforce = retrieveEnforceFor\(await resolveContentView\(db, teamId, auth!\.memberId\)\)/);
+    expect(codeOnly(read("app/api/dashboard/query/route.ts"))).toMatch(/enforce = retrieveEnforceFor\(await resolveContentView\(db, team\.id, me\.id\)\)/);
+    // The timeline library no longer hard-codes member: it forwards the caller's reader, and the
+    // cache layer obtains that reader from the resolver.
+    const wt = codeOnly(read("lib/dashboard/work-timeline.ts"));
+    expect(wt).toMatch(/provenanceCtxForReader\(reader,/);
+    const tc = codeOnly(read("lib/dashboard/timeline-cache.ts"));
+    expect(tc).toMatch(/await resolveContentAdmission\(db, teamId, memberId\)/);
+    expect(tc).toMatch(/contentReaderFor\(view\.admission\)/);
+    // enforce.ts: the READ rows come from the resolver; the WRITER rule is the explicit legacy arm.
+    const en = codeOnly(read("lib/access/enforce.ts"));
+    expect(en).toMatch(/await resolveContentAdmission\(db, principal\.teamId, principal\.memberId\)/);
+    expect(en).toMatch(/principal: LEGACY_WRITER_RULE/);
+    // The resolver forwards its reader's discriminator into every ctx it builds (never a literal).
+    const adm = codeOnly(read("lib/access/admission.ts"));
+    expect((adm.match(/principal: reader\.principal/g) ?? []).length, "member ctx, legacy ctx, member enforce, legacy enforce").toBeGreaterThanOrEqual(4);
+  });
+
+  it("TIERRET-1: delegation is unchanged — the token arm never touches the admission resolver", () => {
+    const q = codeOnly(read("app/api/v1/query/route.ts"));
+    const agentBranch = q.indexOf("if (agent) {");
+    const tokenEnforce = q.indexOf('enforce = { visibleItemIds: ids, principal: "token", tokenProjectIds: projectIds };');
+    const elseBranch = q.indexOf("} else {", tokenEnforce);
+    const resolverCall = q.indexOf("resolveContentView(", agentBranch);
+    expect(agentBranch).toBeGreaterThan(-1);
+    expect(tokenEnforce, "the token arm keeps its own forwarded effective-project set").toBeGreaterThan(agentBranch);
+    expect(resolverCall, "the resolver is reached only in the non-token else").toBeGreaterThan(elseBranch);
+    expect(elseBranch).toBeGreaterThan(tokenEnforce);
+    // The resolver itself never manufactures the token arm (tokens are not relabelled members).
+    expect(read("lib/access/admission.ts")).not.toMatch(/principal:\s*["'`]token["'`]/);
   });
 
   it("the allow-list is honest — every listed boundary really does assert memberhood", () => {

@@ -50,8 +50,9 @@ export function newSqlParams(initial: readonly unknown[] = []): SqlParams {
  * admitted member" were never the same fact (`authenticateApiKey` does not select kind/is_connector):
  *   · `"member"` — ONLY from `lib/access/admission.ts`, after the members row passed `isPrincipal`
  *     (active human or standing agent). Membership is its whole read rule: no label ceiling.
- *   · `"legacy"` — a valid key/session whose member is NOT a principal (connector, offroster,
- *     inactive). Keeps the pre-TIERRET posture rule byte-for-byte: no gain, no loss.
+ *   · `"legacy"` — a valid key/session whose ACTIVE member is NOT a principal (connector or
+ *     offroster). Keeps the pre-TIERRET posture rule byte-for-byte: no gain, no loss. Inactive rows
+ *     never reach either arm — the resolver throws.
  */
 export type ProvenancePrincipal = "member" | "legacy" | "token" | undefined;
 
@@ -116,7 +117,7 @@ export function unsourcedAdmission(ctx: {
     if (ids === undefined || ids.length === 0) return { kind: "closed" };
     return { kind: "projects", projectIds: ids };
   }
-  // LEGACY (connector / offroster / inactive) — the pre-TIERRET member rule verbatim. AC-03 requires
+  // LEGACY (active connector / offroster) — the pre-TIERRET member rule verbatim. AC-03 requires
   // that these principals GAIN nothing; it does not revoke what they already had.
   if (ctx.principal === "legacy") return ctx.teamPosture === true ? { kind: "all" } : { kind: "closed" };
   if (ctx.principal === "token") {

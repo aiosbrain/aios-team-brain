@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { NextRequest } from "next/server";
 import { db, ingest, seedTeam, sha, type Seed } from "./helpers";
 import { GET as itemsGET } from "@/app/api/v1/items/route";
@@ -20,6 +20,7 @@ import { assessAccessHealth } from "@/lib/admin/access-health";
 import { formatAccessHealth } from "@/lib/admin/access-health-format";
 import { ingestItem } from "@/lib/ingest";
 import { TierViolationError } from "@/lib/api/schemas";
+import { settleTimelineRefreshes } from "@/lib/dashboard/timeline-cache";
 
 /**
  * TIERRET-1 / AIO-1045 — membership is the ONLY member content read rule (accepted spec
@@ -459,6 +460,13 @@ describe("TIERRET-1 AC-08 — authenticated OKF export", () => {
 });
 
 describe("TIERRET-1 AC-12 — timeline via the production cache path", () => {
+  // Fixture TEARDOWN, not an assertion: a cold miss schedules a background synopsis pass that writes
+  // `work_timeline_cache` for this team. Unsettled, it races the next test's per-test TRUNCATE and logs
+  // a team FK violation (seen in the baseline run) — noise that must never be read as a product result.
+  afterEach(async () => {
+    await settleTimelineRefreshes();
+  });
+
   it("the external member's timeline variant serves X evidence, the X meeting and the granted hand-typed task header; never Y", async () => {
     const F = await buildFixture();
     // Timeline-eligible evidence in X (attributed + source-dated), citing HT-X and LX-1.

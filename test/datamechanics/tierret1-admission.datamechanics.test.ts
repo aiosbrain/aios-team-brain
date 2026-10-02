@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { db, ingest, seedTeam, sha, type Seed } from "./helpers";
 import { ingestItem } from "@/lib/ingest";
 import { createMember } from "@/lib/admin/members";
@@ -88,7 +88,7 @@ async function fixture(): Promise<Fx> {
 }
 
 describe("TIERRET-1 AC-03 — positive admission: who enters the member arm", () => {
-  it("active humans and standing agents are members; connector, offroster and inactive rows are legacy", async () => {
+  it("active humans and standing agents are members; ACTIVE connector and offroster rows are legacy", async () => {
     const F = await fixture();
     const everyoneHuman = await resolveContentAdmission(db(), F.seed.teamId, F.seed.memberId);
     expect(everyoneHuman).toMatchObject({ kind: "member", everyone: true });
@@ -105,13 +105,56 @@ describe("TIERRET-1 AC-03 — positive admission: who enters the member arm", ()
     for (const [label, over] of [
       ["connector", { is_connector: true }],
       ["offroster", { kind: "offroster" }],
-      ["invited (inactive) human", { status: "invited" }],
     ] as const) {
       const id = await rawMember(F.seed, over);
       await plantBuiltin(F.seed, id, "everyone");
       const r = await resolveContentAdmission(db(), F.seed.teamId, id);
       expect(r.kind, `${label} never enters the member arm`).toBe("legacy");
     }
+  });
+
+  it("inactive rows are rejected BEFORE either arm — neither member nor legacy — through both resolver entrypoints", async () => {
+    const F = await fixture();
+    for (const [label, over] of [
+      ["invited human", { status: "invited" }],
+      ["disabled human", { status: "disabled" }],
+      ["disabled standing agent", { status: "disabled", kind: "agent" }],
+      ["invited connector", { status: "invited", is_connector: true }],
+      ["disabled offroster", { status: "disabled", kind: "offroster" }],
+    ] as const) {
+      const id = await rawMember(F.seed, over);
+      // A planted builtin Everyone row must not resurrect an inactive row into ANY arm.
+      await plantBuiltin(F.seed, id, "everyone");
+      await expect(resolveContentAdmission(db(), F.seed.teamId, id), `${label}: admission`).rejects.toBeInstanceOf(ContentAdmissionError);
+      await expect(resolveContentView(db(), F.seed.teamId, id), `${label}: view`).rejects.toBeInstanceOf(ContentAdmissionError);
+    }
+    // The fixture's own active external member, deactivated: the same member that read X a moment
+    // ago now reads nothing — the resolver throws rather than demoting it to legacy.
+    expect((await resolveContentAdmission(db(), F.seed.teamId, F.external)).kind).toBe("member");
+    await db().from("members").update({ status: "disabled" }).eq("id", F.external);
+    await expect(resolveContentAdmission(db(), F.seed.teamId, F.external)).rejects.toBeInstanceOf(ContentAdmissionError);
+    await expect(resolveContentView(db(), F.seed.teamId, F.external)).rejects.toBeInstanceOf(ContentAdmissionError);
+  });
+
+  it("an unrecognised member kind does not manufacture legacy (fail closed)", async () => {
+    const F = await fixture();
+    // `members_kind_check` refuses unknown kinds at the DB, so drive the resolver with a row the
+    // constraint would reject — the resolver must not rely on the constraint alone.
+    const real = db();
+    const forged = {
+      from: (t: string) => {
+        if (t !== "members") return real.from(t);
+        const b = {
+          select: () => b,
+          eq: () => b,
+          maybeSingle: () => Promise.resolve({ data: { id: F.external, kind: "robot", is_connector: false, status: "active" }, error: null }),
+        };
+        return b;
+      },
+      rpc: real.rpc.bind(real),
+    } as unknown as ReturnType<typeof db>;
+    await expect(resolveContentAdmission(forged, F.seed.teamId, F.external)).rejects.toBeInstanceOf(ContentAdmissionError);
+    await expect(resolveContentView(forged, F.seed.teamId, F.external)).rejects.toBeInstanceOf(ContentAdmissionError);
   });
 
   it("missing, foreign-team and unreadable members fail CLOSED (throw), never manufacture memberhood", async () => {
@@ -233,6 +276,11 @@ describe("TIERRET-1 AC-07 — Social member reads are the EVERY-evidence rule at
 });
 
 describe("TIERRET-1 AC-12 — timeline cache: new namespace, v16, admission-separated, revocation, purge, rollback", () => {
+  // Fixture teardown (not an assertion): settle background synopsis passes before the next test's
+  // TRUNCATE, so a late cache write can't surface as an FK error mistaken for a product failure.
+  afterEach(async () => {
+    await settleTimelineRefreshes();
+  });
   async function timelineFixture() {
     const F = await fixture();
     const now = new Date().toISOString();

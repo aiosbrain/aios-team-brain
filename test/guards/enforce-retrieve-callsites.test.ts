@@ -16,13 +16,32 @@ for (const route of ["app/api/v1/query/route.ts", "app/api/dashboard/query/route
   describe(`enforcement wired in ${route}`, () => {
     const src = read(route);
     it("PRET-6 (the anti-zombie inverted pin): enforcement is constructed UNCONDITIONALLY — no flag read, no mode branch, no permissive null arm", () => {
-      // AC1's greps cannot catch a renamed mode source; this call-site pin can. The member arm
+      // AC1's greps cannot catch a renamed mode source; this call-site pin can. The non-token arm
       // must build enforce with no conditional guarding it.
+      // (Was a pin on the comment text 'PRET-6: enforcing is the only behavior' — prose proves
+      // nothing about control flow, so it is replaced by structural pins on the code itself.)
       expect(src).not.toMatch(/teamEnforcesAccess/);
-      expect(src).toContain('PRET-6: enforcing is the only behavior');
-      // TIERRET-1: the member arm is built by the ONE admission resolver (member vs legacy is its
+      expect(src).not.toMatch(/access_enforcement|accessEnforcement|ACCESS_ENFORCEMENT/);
+      // TIERRET-1: the non-token arm is built by the ONE admission resolver (member vs legacy is its
       // decision, never the route's) — an ordinary key is not assumed to be a member.
-      expect(src).toMatch(/enforce\s*=\s*retrieveEnforceFor\(\s*await\s+resolveContentView\(/);
+      const call = /enforce\s*=\s*retrieveEnforceFor\(\s*await\s+resolveContentView\(/;
+      expect(src).toMatch(call);
+      // Exactly ONE resolver-built assignment, and it is not under any `if (<flag/mode>)`: the line
+      // immediately governing it is either the try body (dashboard) or the token branch's `else`
+      // (v1). A wrapping conditional would have to appear between that opener and the call.
+      expect(src.match(new RegExp(call.source, "g")) ?? []).toHaveLength(1);
+      const at = src.search(call);
+      const opener = Math.max(src.lastIndexOf("try {", at), src.lastIndexOf("} else {", at));
+      expect(opener, "the resolver call sits directly in the try body or the token branch's else").toBeGreaterThan(-1);
+      const between = src
+        .slice(opener + 1, at)
+        .split("\n")
+        .filter((l) => !l.trim().startsWith("//"))
+        .join("\n");
+      expect(between, "no conditional wraps the resolver call (no feature-flag opt-out)").not.toMatch(/\bif\s*\(|\bswitch\s*\(|&&|\|\||\?\?|\?\s/);
+      // …and the resolver itself has no opt-out: it never reads a flag or mode before choosing an arm.
+      const adm = read("lib/access/admission.ts");
+      expect(adm).not.toMatch(/process\.env|teamEnforcesAccess|access_enforcement/);
     });
     it("resolves the member's visible items and passes enforce to retrieve", () => {
       expect(src).toMatch(/resolveContentView\s*\(/);
@@ -141,8 +160,12 @@ describe("delegated query wiring in app/api/v1/query/route.ts (Phase B slice 3)"
     );
     // Legacy arm: no graph scope, no member authority — the baseline shape only.
     expect(adm).toMatch(/return \{ visibleItemIds: view\.ids, principal: reader\.principal \};/);
-    // Positive admission is `isPrincipal` on a same-team members row, read by the resolver itself.
-    expect(adm).toMatch(/if \(!isPrincipal\(member\)\) return \{ kind: "legacy"/);
+    // Positive admission is `isPrincipal` on a same-team members row, read by the resolver itself —
+    // and an inactive row is refused BEFORE either arm (never demoted to legacy).
+    expect(adm).toMatch(/if \(!isPrincipal\(eligibility\)\) return \{ kind: "legacy"/);
+    expect(adm.indexOf('if (member.status !== "active") throw new ContentAdmissionError')).toBeLessThan(
+      adm.indexOf('if (!isPrincipal(eligibility)) return { kind: "legacy"')
+    );
   });
   it("the Phase A 403 refusal is gone — delegated tokens authenticate instead", () => {
     expect(src).not.toMatch(/delegation_not_supported/);

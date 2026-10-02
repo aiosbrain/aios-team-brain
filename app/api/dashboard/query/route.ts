@@ -210,8 +210,8 @@ export async function POST(req: NextRequest) {
   }
   if (conversationId) await appendMessage(db, owner, conversationId, "user", question);
 
-  // Access enforcement (Phase B slice 2): same as the API query route — filter retrieval to the
-  // member's membership-visible items on an 'enforcing' team; permissive → null → byte-identical.
+  // Access enforcement (Phase B slice 2; TIERRET-1): same as the API query route — retrieval is
+  // filtered by the admission resolver's arm for this session member, unconditionally.
   let enforce: import("@/lib/query/retrieve").RetrieveEnforce | null = null;
   try {
     // PRET-6: enforcing is the only behavior — enforcement is always constructed.

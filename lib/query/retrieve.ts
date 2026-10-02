@@ -188,7 +188,7 @@ export type RetrieveEnforce =
       tokenProjectIds?: undefined;
     }
   | {
-      // TIERRET-1: a valid key/session whose member is NOT a principal (connector/offroster/inactive).
+      // TIERRET-1: a valid key/session whose ACTIVE member is NOT a principal (connector/offroster).
       // Baseline-preserving: posture rule for hand-entered rows (from the route's tier), the
       // org-structural legs it already had, and NO graph scope.
       visibleItemIds: ReadonlySet<string>;

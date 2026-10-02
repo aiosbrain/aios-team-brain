@@ -201,9 +201,9 @@ read path:
 > ✅ **Enforced:** every member content read resolves WHO is asking through the ONE admission resolver,
 > **`lib/access/admission.ts`** (`resolveContentAdmission`/`resolveContentView`): a same-team active
 > human or standing agent (`isPrincipal`) is a **member** — membership is its whole read rule, sourced
-> rows follow their source item, hand-entered rows follow Everyone-or-grants; any other authenticated
-> member row (connector/offroster/inactive) is the explicit **legacy** arm and keeps its old posture
-> rule (no gain). A valid API key is NOT memberhood. Tokens keep their effective-project attenuation.
+> rows follow their source item, hand-entered rows follow Everyone-or-grants; an ACTIVE connector or
+> offroster row is the explicit **legacy** arm and keeps its old posture rule (no gain). An inactive
+> row, an unknown kind, a missing/foreign row or a read error enters NEITHER arm (fail closed). A valid API key is NOT memberhood. Tokens keep their effective-project attenuation.
 > Dashboard reads still route through the **`lib/auth/visibility` choke-points**
 > (`visibleItems`/`visibleDecisions`/`canSeeAccess`), now fed the reader's LABEL ceiling
 > (`contentLabelTier` — none for a member) on top of the oracle intersect — guarded by

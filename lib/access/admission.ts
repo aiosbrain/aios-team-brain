@@ -19,10 +19,13 @@ import type { RetrieveEnforce } from "@/lib/query/retrieve";
  * Positive member admission requires a CURRENT same-team `members` row that passes `isPrincipal`
  * (active human or standing agent). That is a different fact from "the API key is valid":
  * `authenticateApiKey` checks status but never selects kind/is_connector, so inferring memberhood from
- * a key would have opened unsourced content to connectors. Anything else that authenticated is the
+ * a key would have opened unsourced content to connectors. An ACTIVE connector or offroster row is the
  * explicit LEGACY arm, which keeps the pre-TIERRET posture rule byte-for-byte (AC-03: no gain, no
- * revocation). A missing row, a foreign team, or ANY read error throws `ContentAdmissionError` — the
- * boundary's existing error handling fails the request closed; nothing here manufactures memberhood.
+ * revocation). An inactive row (invited/deactivated/any status other than active) is neither: API
+ * auth and the session guard already refuse it, so there is no inactive legacy access to preserve, and
+ * it throws. So does an unknown kind, a missing row, a foreign team, or ANY read error —
+ * `ContentAdmissionError`, which the boundary's existing error handling turns into a closed request;
+ * nothing here manufactures memberhood OR legacy.
  *
  * Source of truth: `members` (eligibility), the oracle (`visibleProjectsWithError` — grants and the
  * oracle-ACCEPTED Everyone bit), posture (`lib/access/posture`, used by the legacy arm and preserved
@@ -62,6 +65,8 @@ export type ContentReader =
  *  positive admission boundary — the value is only ever emitted after `isPrincipal` passed. */
 const MEMBER_ARM: MemberTag = "member";
 const LEGACY_ARM: LegacyTag = "legacy";
+/** `MemberKind` (lib/access/eligibility). Anything else is unknown and admits nothing. */
+const KNOWN_KINDS: ReadonlySet<string> = new Set(["human", "agent", "offroster"]);
 
 export async function resolveContentAdmission(
   db: DbClient,
@@ -77,6 +82,14 @@ export async function resolveContentAdmission(
   if (error) throw new ContentAdmissionError(`member read failed: ${error.message}`);
   if (!data) throw new ContentAdmissionError("no such member in this team");
 
+  // Checked BEFORE either arm: an inactive row is not a legacy key, it is no reader at all.
+  const member = data as { kind: unknown; is_connector: unknown; status: unknown };
+  if (member.status !== "active") throw new ContentAdmissionError("member is not active");
+  if (typeof member.is_connector !== "boolean" || !KNOWN_KINDS.has(member.kind as string)) {
+    throw new ContentAdmissionError("unrecognised member kind");
+  }
+  const eligibility = member as { kind: string; is_connector: boolean; status: string };
+
   let posture: ViewerPosture;
   try {
     posture = await resolveViewerPosture(db, teamId, memberId);
@@ -84,8 +97,9 @@ export async function resolveContentAdmission(
     throw new ContentAdmissionError(e instanceof Error ? e.message : "posture read failed");
   }
 
-  const member = data as { kind: string; is_connector: boolean; status: string };
-  if (!isPrincipal(member)) return { kind: "legacy", teamId, memberId, posture };
+  // Active + known kind: a principal is a member; the remainder is exactly an active connector or
+  // offroster row — the legacy arm.
+  if (!isPrincipal(eligibility)) return { kind: "legacy", teamId, memberId, posture };
 
   const { set, error: oracleError, everyone } = await visibleProjectsWithError(db, { teamId, memberId });
   if (oracleError) throw new ContentAdmissionError("oracle read failed");

@@ -378,10 +378,11 @@ this paragraph as the current contract; the row text is the history it supersede
 - **Admission (the one resolver):** `lib/access/admission.ts#resolveContentAdmission` reads the
   same-team `members` row and applies `isPrincipal`. An active human/standing agent is a **member**
   (`everyone` = the ORACLE-accepted builtin Everyone bit from `lib/access/oracle.visibleProjectsWithError`,
-  never raw posture; `grantedProjectIds` = the oracle set). Any other authenticated member row
-  (connector, offroster, inactive) is the explicit **legacy** arm, which keeps the pre-TIERRET posture
-  rule byte-for-byte (no gain, no revocation — including its existing org-structure legs). Missing,
-  foreign-team or unreadable → throws (fail closed). A valid `aios_` key is NOT memberhood.
+  never raw posture; `grantedProjectIds` = the oracle set). An ACTIVE connector or offroster row is
+  the explicit **legacy** arm, which keeps the pre-TIERRET posture rule byte-for-byte (no gain, no
+  revocation — including its existing org-structure legs). Inactive (any status other than active —
+  API auth and the session guard already refuse it), unknown kind, missing, foreign-team or unreadable
+  → throws before either arm (fail closed). A valid `aios_` key is NOT memberhood.
 - **Member reads:** no label ceiling (`labelCeilingApplies`/`contentLabelTier`); sourced tasks/decisions
   follow their source item; hand-entered (`created_by`, null source) rows: Everyone member → all, other
   members → their GRANTED projects only (`memberProjectIds`, forward-only like `tokenProjectIds`),
