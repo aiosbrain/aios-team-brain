@@ -484,9 +484,9 @@ async function holdTeamDeletion(teamId: string) {
  * first — the barrier was never observed, so the case must fail rather than pass on an outcome alone.
  */
 async function awaitServiceBlockedBehind(holderPid: number, settled: () => boolean) {
-  const deadline = Date.now() + 5_000;
+  const deadline = performance.now() + 5_000;
   let last = { count: 0, pid: null as number | null, blockers: [] as number[], waiting: null as string | null };
-  while (Date.now() < deadline) {
+  while (performance.now() < deadline) {
     if (settled()) return { ...last, premature: true };
     const { rows } = await query(
       `select pid, pg_blocking_pids(pid) as blockers, wait_event_type as waiting
@@ -1036,7 +1036,7 @@ function heldWinner() {
                 (select count(*)::int from group_members gm join groups g on g.id = gm.group_id where g.is_builtin) as "builtinEdges"`,
         [MARKER]
       );
-      atCommit.resolve({ marker: rows[0].marker, builtinEdges: rows[0].builtinEdges, heldAt: Date.now() });
+      atCommit.resolve({ marker: rows[0].marker, builtinEdges: rows[0].builtinEdges, heldAt: performance.now() });
       await within(gate.promise, 20_000, "held winner");
     },
   });
@@ -1079,13 +1079,13 @@ describe("STAGINGMARK-5 AC-05 — racing owners: at most one invocation reconcil
       // Non-vacuity: the winner's own open transaction already holds every effect and the marker.
       expect(inside).toMatchObject({ marker: 1, builtinEdges: fx.expectedEdges.length });
 
-      const loserStart = Date.now();
+      const loserStart = performance.now();
       loserRun = materializeBuiltinMembershipOnce(loserClient).finally(() => {
         loserSettled = true;
       });
       const observed = await awaitServiceBlockedBehind(winner.pid()!, () => loserSettled);
       const waitingOn = await ungrantedLocks(observed.pid);
-      const releasedAfter = Date.now() - loserStart;
+      const releasedAfter = performance.now() - loserStart;
       expect(observed).toMatchObject({ premature: false, count: 1, waiting: "Lock" });
       expect(observed.blockers).toContain(winner.pid());
       expect(waitingOn).toEqual([{ relation: "teams", mode: "ShareRowExclusiveLock" }]);
@@ -1129,7 +1129,7 @@ describe("STAGINGMARK-5 AC-05 — racing owners: at most one invocation reconcil
       const inside = await within(winner.atCommit, 10_000, "winner reaching COMMIT");
       expect(inside).toMatchObject({ marker: 1, builtinEdges: fx.expectedEdges.length });
 
-      const loserStart = Date.now();
+      const loserStart = performance.now();
       loserRun = materializeBuiltinMembershipOnce(loserClient).finally(() => {
         loserSettled = true;
       });
@@ -1139,9 +1139,9 @@ describe("STAGINGMARK-5 AC-05 — racing owners: at most one invocation reconcil
 
       // The winner stays held while the loser's own 2s lock cap expires.
       const l = await within(loserRun, 10_000, "loser lock timeout");
-      const loserElapsed = Date.now() - loserStart;
+      const loserElapsed = performance.now() - loserStart;
       const midway = await postureState();
-      const heldMs = Date.now() - inside.heldAt;
+      const heldMs = performance.now() - inside.heldAt;
 
       expect(l).toEqual({ ok: false, error: `transaction SQL failed: ${LOCK_TIMEOUT_MESSAGE}` });
       expect(failures).toEqual([{ code: "55P03", message: LOCK_TIMEOUT_MESSAGE }]);
@@ -1362,12 +1362,12 @@ function ownedDb(decorateExecutor?: (executor: SqlExecutor) => SqlExecutor) {
         query: async (text: string, params: unknown[] = []) => {
           const entry = { pid, sql: text, params, ms: -1 };
           statements.push(entry);
-          const started = Date.now();
+          const started = performance.now();
           let result: unknown;
           try {
             result = await real.query(text, params);
           } finally {
-            entry.ms = Date.now() - started;
+            entry.ms = performance.now() - started;
           }
           // Reached only on success: a failed statement has already propagated, so its aborted
           // transaction is never queried.
@@ -1970,9 +1970,9 @@ function expectUncertainCall(lost: LostAckDb, fx: PostureFleet, commitSent: bool
 
 /** Bounded poll until the destroyed backend has left the server: no session and no lock of any kind. */
 async function awaitBackendGone(pid: number) {
-  const deadline = Date.now() + 5_000;
+  const deadline = performance.now() + 5_000;
   let last = { sessions: -1, locks: -1 };
-  while (Date.now() < deadline) {
+  while (performance.now() < deadline) {
     last = (await query(
       `select (select count(*)::int from pg_stat_activity where pid = $1) as sessions,
               (select count(*)::int from pg_locks where pid = $1) as locks`,

@@ -172,6 +172,12 @@ function stripComments(source: string): string {
 const lineOf = (code: string, index: number) => code.slice(0, index).split("\n").length;
 const nameHits = (code: string) => [...code.matchAll(FUNCTION_NAME)].map((m) => m.index ?? -1);
 
+type Scan = { readonly code: string; readonly hits: readonly number[] };
+const scan = (source: string): Scan => {
+  const code = stripComments(source);
+  return { code, hits: nameHits(code) };
+};
+
 function walk(dir: string, out: string[] = []): string[] {
   let entries: string[];
   try {
@@ -218,13 +224,13 @@ function serviceSpan(code: string): { start: number; end: number } | undefined {
 
 /** Every reason the owner file is not exactly "one owned invocation (+ its diagnostic) inside the service". */
 function ownerOffences(source: string): string[] {
-  const code = stripComments(source);
+  const { code, hits } = scanOf(OWNER, source);
   const span = serviceSpan(code);
   if (span === undefined) return [`${OWNER}: the owning service materializeBuiltinMembershipOnce is missing`];
   const { start, end } = span;
   const body = code.slice(start, end);
   const offences: string[] = [];
-  for (const at of nameHits(code)) {
+  for (const at of hits) {
     if (at < start || at >= end) offences.push(`${OWNER}:${lineOf(code, at)} names the materializer outside materializeBuiltinMembershipOnce`);
   }
   const invocations = [...body.matchAll(OWNED_INVOCATION)].length;
@@ -243,8 +249,8 @@ function callerOffences(files: ReadonlyMap<string, string>): string[] {
   const offences: string[] = [];
   for (const [rel, source] of files) {
     if (rel === OWNER) continue;
-    const code = stripComments(source);
-    for (const at of nameHits(code)) offences.push(`${rel}:${lineOf(code, at)} names the materializer outside its owner`);
+    const { code, hits } = scanOf(rel, source);
+    for (const at of hits) offences.push(`${rel}:${lineOf(code, at)} names the materializer outside its owner`);
   }
   const owner = files.get(OWNER);
   offences.push(...(owner === undefined ? [`${OWNER}: missing from the scanned surface`] : ownerOffences(owner)));
@@ -253,6 +259,22 @@ function callerOffences(files: ReadonlyMap<string, string>): string[] {
 
 const sources = runtimeSources();
 const mutated = (rel: string, source: string) => new Map([...sources, [rel, source]]);
+
+/**
+ * The real tree's scans, computed once: every reactive control below swaps ONE file into a copy of
+ * the tree, so re-stripping the whole unchanged surface for each variant is repeated work inside the
+ * default 5s test budget. Built only from runtimeSources() and never written afterwards, so a
+ * mutation is never cached.
+ */
+const baseline: ReadonlyMap<string, { readonly source: string; readonly scan: Scan }> = new Map(
+  [...sources].map(([rel, source]) => [rel, { source, scan: scan(source) }] as const)
+);
+
+/** Reuse the baseline scan only for the exact baseline path AND exact source; anything else is scanned afresh. */
+function scanOf(rel: string, source: string): Scan {
+  const cached = baseline.get(rel);
+  return cached !== undefined && cached.source === source ? cached.scan : scan(source);
+}
 
 /** Insert `line` immediately after the first line containing `anchor`, asserting the anchor exists. */
 function insertAfter(source: string, anchor: string, line: string): { text: string; line: number } {
@@ -289,6 +311,31 @@ describe("STAGINGMARK-5 AC-03 — the frozen SQL materializer has exactly one ru
     // Non-vacuous: the owner really carries the invocation this guard protects.
     const body = stripComments(sources.get(OWNER)!);
     expect([...body.matchAll(OWNED_INVOCATION)]).toHaveLength(1);
+  });
+
+  it("the cached baseline equals a fresh scan, and is reused only for the exact baseline path and source", () => {
+    expect([...baseline.keys()]).toEqual([...sources.keys()]);
+    for (const [rel, source] of sources) {
+      const cached = baseline.get(rel)!;
+      const fresh = stripComments(source);
+      expect(cached.source, rel).toBe(source);
+      expect(cached.scan.code, rel).toBe(fresh);
+      expect(cached.scan.hits, rel).toEqual(nameHits(fresh));
+      expect(scanOf(rel, source), rel).toBe(cached.scan);
+    }
+
+    // Inverse: a changed source at a baseline path is scanned afresh, never served the stale scan.
+    // (The reactive controls below are the behavioural form: a path-only cache turns them green.)
+    const rel = "instrumentation.ts";
+    const cached = baseline.get(rel)!.scan;
+    expect(cached.hits).toEqual([]);
+    const changed = scanOf(rel, `${sources.get(rel)!}\nawait runSql("select materialize_builtin_membership_once()");\n`);
+    expect(changed).not.toBe(cached);
+    expect(changed.hits).toHaveLength(1);
+    // Nor is the cache keyed by source alone: the same text under a new path is scanned afresh too.
+    const moved = scanOf("scripts/sm5-copy.ts", sources.get(rel)!);
+    expect(moved).not.toBe(cached);
+    expect(moved).toEqual(cached);
   });
 
   it("the sanctioned surfaces stay what they are: canonical SQL defines it, PRET-6 calls it, the loader loads files, bootstrap runs the loader", () => {
@@ -361,6 +408,12 @@ describe("STAGINGMARK-5 AC-03 — the frozen SQL materializer has exactly one ru
       const rel = "lib/access/materialize-command.ts";
       const text = `${sources.get(rel)!}\nexport const bare = (db: { rpc: (fn: string) => unknown }) => db.rpc("materialize_builtin_membership_once");\n`;
       expect(callerOffences(mutated(rel, text))).toEqual([`${rel}:${text.split("\n").length - 1} names the materializer outside its owner`]);
+    });
+
+    it("the owner removed from the scanned surface", () => {
+      const without = new Map(sources);
+      expect(without.delete(OWNER)).toBe(true);
+      expect(callerOffences(without)).toEqual([`${OWNER}: missing from the scanned surface`]);
     });
 
     it("the owner itself: a second invocation, a call outside the service, or a missing invocation", () => {

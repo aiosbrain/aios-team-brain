@@ -45,7 +45,10 @@ export type FleetState = {
   contentWithoutSubstrate: boolean;
 };
 
-/** `outcomeUnknown`: COMMIT was sent but never acknowledged — the stamp may or may not have landed. */
+/**
+ * `outcomeUnknown`: the COMMIT call did not complete with an acknowledgement (including a failure
+ * before COMMIT was transmitted); the transaction may or may not have committed the stamp.
+ */
 export type MaterializeResult = { ok: boolean; ran?: boolean; error?: string; outcomeUnknown?: true };
 
 export type MaterializeDeps = {

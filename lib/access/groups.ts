@@ -198,7 +198,10 @@ const MATERIALIZE_LOCK_TIMEOUT = "2000ms";
 
 export type MaterializeOnceResult = WriteResult & {
   ran?: boolean;
-  /** COMMIT was sent but never acknowledged: the marker and membership may or may not be committed. */
+  /**
+   * The COMMIT call did not complete with an acknowledgement (including a failure before COMMIT was
+   * transmitted); the transaction may or may not have committed the marker and membership.
+   */
   outcomeUnknown?: true;
 };
 

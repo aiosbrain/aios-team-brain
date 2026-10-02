@@ -1025,8 +1025,10 @@ invocation may fail at 2 s; after the winner commits, a fresh invocation returns
 without materialization writes or audits. Runtime settings do not replace PRET-6 loader settings.
 
 Known transaction failures roll back membership and marker together. Work is reported only after
-an acknowledged COMMIT. If COMMIT was sent but its acknowledgement was lost, the result reports an
-unknown outcome (`outcomeUnknown`) and is not replayed within that invocation. Inspect the marker
+an acknowledged COMMIT. If the COMMIT call does not complete with an acknowledgement — whether the
+acknowledgement was lost or the call failed before COMMIT was transmitted — the transaction may or
+may not have committed. The result reports an unknown outcome (`outcomeUnknown`), the connection is
+discarded, and the call is not replayed within that invocation. Inspect the marker
 and membership state through a fresh connection before deciding what to do next. An orphan
 executing statement can retain locks until cancellation or completion. Once idle, the existing
 `PG_IDLE_TX_TIMEOUT_MS` applies: its default is 60 s, and 0 disables it. With 0, a completed SELECT
@@ -1042,9 +1044,10 @@ reads until the DDL wait ends, even though the materializer's own locks admit pl
 constraints do not add an automatic drain mechanism.
 
 The substrate check remains fleet-wide and is observed initially and after the locks; it is not a
-per-team completeness or at-COMMIT guarantee. An unfenced item purge after the post-lock check can
-delete the sole partitioned item in team B while unpartitioned content survives in team A, and the
-marker can still be stamped. Quiesce destructive corpus writers when at-COMMIT assurance is needed.
+per-team completeness or at-COMMIT guarantee. Independent item, project and context deletion is not
+fenced by the materializer's locks. For example, an item purge after the post-lock check can delete
+the sole partitioned item in team B while unpartitioned content survives in team A, and the marker
+can still be stamped. Quiesce destructive corpus writers when at-COMMIT assurance is needed.
 The SQL algorithm and its frozen comments remain unchanged, including best-effort audit handling:
 an ordinary audit-only failure, including a `55P03` lock refusal, can be swallowed and the marker
 committed without that audit row. A statement cancellation (`57014`, e.g. the 120 s cap firing
