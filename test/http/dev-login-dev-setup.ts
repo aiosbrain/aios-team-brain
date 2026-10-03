@@ -23,8 +23,10 @@ import { scrubbedEnv } from "../../scripts/test-env-scrub";
  *     NODE_OPTIONS cannot reach a child. The recorder's build child is given the same construction.
  *   - the child LIFECYCLE: one owned, loopback-bound `next start` / `next dev` process group on an
  *     allocated port, with a finite readiness deadline and a bounded stop on every outcome — a
- *     SIGINT/SIGTERM sent to this process included: the owned groups are stopped first, then the
- *     signal takes its usual effect.
+ *     SIGINT/SIGTERM sent to THIS process included: the owned groups are stopped first, then the
+ *     signal takes its usual effect. "This process" is whichever one called `startNextChild` — in
+ *     the carrier a Vitest forks worker, never the Vitest main process, which owns no group. A stop
+ *     is finished only when the owned GROUP is established gone; a closed port alone is not that.
  *   - the SOURCE INVENTORY: every regular file under the project's source roots plus the root
  *     build/config/package/lock inputs, read from the filesystem (no Git), so a build record binds
  *     the artifact to all of them — edited, added or deleted — and not to a short list of paths.
@@ -465,6 +467,8 @@ export interface CleanupRecord {
   signal: NodeJS.Signals | null;
   /** True when SIGTERM was not enough and the owned process group was killed. */
   forced: boolean;
+  /** The owned group was established without a member (ESRCH) — observed, never inferred from the port. */
+  groupGone: boolean;
   portClosed: boolean;
 }
 
@@ -509,7 +513,15 @@ const OUTPUT_CAP_BYTES = 1024 * 1024;
 const ANSI = new RegExp(`${String.fromCharCode(27)}\\[[0-9;?]*[ -/]*[@-~]`, "g");
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-/** One detached process group this module started and has not yet confirmed gone. */
+/**
+ * What asking or signalling a process group says about it. Only ESRCH establishes absence: any other
+ * refusal (EPERM included) is "unknown", never read as gone. "present" means a member accepted the
+ * signal — which, depending on the platform, includes one that has exited and is not yet reaped. So
+ * presence is not evidence that anything is still serving; only "gone" is a conclusion.
+ */
+type GroupPresence = "present" | "gone" | "unknown";
+
+/** One detached process group this module started and has not yet established gone. */
 interface OwnedGroup {
   label: string;
   child: ChildProcess;
@@ -517,66 +529,60 @@ interface OwnedGroup {
   pid: number;
   port: number;
   /**
-   * Whether the group still held a member (`next dev`'s forked server) when its leader was reaped.
-   * While one lives the group id stays reserved for this group, so it can still be signalled as ours;
-   * a group seen empty at that moment is never signalled again.
+   * The group, asked now. While its leader is unreaped or a member lives, the id stays reserved for
+   * this group, so it can be asked and signalled as ours. "gone" is latched: once the group was seen
+   * without a member its id can be reused by a stranger, and it is never asked or signalled again.
    */
-  hasOrphans(): boolean;
+  presence(): GroupPresence;
   /** The shared, idempotent stop: every caller gets the same cleanup. */
   stop(): Promise<CleanupRecord>;
 }
 
-/** Groups this process started, kept until their own stop() has seen the leader gone AND the port closed. */
+/**
+ * Groups this process started, kept until their own stop() has established the GROUP gone. A closed
+ * port never releases one: a member that stopped listening and kept running is still owned.
+ */
 const owned = new Set<OwnedGroup>();
 
 const TERMINATION_SIGNALS = ["SIGINT", "SIGTERM"] as const;
-/** Past one stop()'s own worst case (10s + 5s + 5s + 5s): only then does the last resort run alone. */
+/** Past one stop()'s own worst case (10s + 5s for the group, then 5s for the port): the last resort runs alone only then. */
 const SIGNAL_CLEANUP_DEADLINE_MS = 30_000;
 let exitHookInstalled = false;
 let signalHooksInstalled = false;
 let terminating: NodeJS.Signals | null = null;
 
-function signalGroup(pid: number, signal: NodeJS.Signals): void {
+/** Signal a group — or, with signal 0, only ask. Never throws: the answer is what it returns. */
+function signalGroup(pid: number, signal: NodeJS.Signals | 0): GroupPresence {
   try {
     process.kill(-pid, signal);
+    return "present";
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
-  }
-}
-
-function groupHasMember(pid: number): boolean {
-  try {
-    process.kill(-pid, 0);
-    return true;
-  } catch {
-    return false;
+    return (err as NodeJS.ErrnoException).code === "ESRCH" ? "gone" : "unknown";
   }
 }
 
 /**
- * Synchronous last resort, owned groups only: SIGKILL what the bounded stop() did not confirm gone.
- * An unreaped leader is ours by construction (its pid cannot have been reused). A reaped leader's
- * group is signalled only if it was seen to outlive the leader — never by name, port or pid guess.
- * SIGKILL of this process itself cannot be handled; nothing here pretends otherwise.
+ * Synchronous last resort, owned groups only: SIGKILL what the bounded stop() did not establish
+ * gone. A group still registered is one whose absence was never observed — its leader is unreaped
+ * (the pid cannot have been reused) or a member outlived the leader (the id stays reserved while one
+ * lives). One seen empty is skipped: never signalled by name, port or pid guess. Sending SIGKILL is
+ * not verification, so nothing is reported from here. SIGKILL of this process itself cannot be
+ * handled; nothing here pretends otherwise.
  */
 function killOwnedGroupsNow(): void {
   for (const group of owned) {
-    const leaderReaped = group.child.exitCode !== null || group.child.signalCode !== null;
-    if (leaderReaped && !group.hasOrphans()) continue;
-    try {
-      process.kill(-group.pid, "SIGKILL");
-    } catch {
-      // already gone
-    }
+    if (group.presence() === "gone") continue;
+    signalGroup(group.pid, "SIGKILL");
   }
 }
 
 /**
  * SIGINT/SIGTERM: the default action would end this process without running its `exit` hook and
  * leave a detached, possibly opted-in dev server behind. Instead: stop every owned group through
- * its own stop() (so a forked listener that outlived its leader is accounted for by the port, not
- * skipped), then hand the SAME signal back so the process still terminates by it. A repeated signal
- * while that is in flight is absorbed — it neither restarts the cleanup nor cuts it short.
+ * its own stop() (so a forked listener that outlived its leader is accounted for by its group —
+ * neither skipped, nor released because its port closed), then hand the SAME signal back so the
+ * process still terminates by it. A repeated signal while that is in flight is absorbed — it
+ * neither restarts the cleanup nor cuts it short.
  */
 function onTerminationSignal(signal: NodeJS.Signals): void {
   if (terminating) return;
@@ -665,11 +671,19 @@ export async function startNextChild(opts: StartChildOptions): Promise<OwnedChil
     spawnError = err;
   });
   let exited = false;
-  let orphans = false;
+  let groupGone = false;
+  /** Ask the owned group (signal 0) or signal it. Once it was seen gone its id is never touched again. */
+  const ownedGroup = (signal: NodeJS.Signals | 0): GroupPresence => {
+    if (groupGone || child.pid === undefined) return "gone";
+    const presence = signalGroup(child.pid, signal);
+    if (presence === "gone") groupGone = true;
+    return presence;
+  };
   child.once("exit", () => {
     exited = true;
-    // Asked once, as the leader is reaped: is anything of this group still running?
-    orphans = child.pid !== undefined && groupHasMember(child.pid);
+    // Asked as the leader is reaped, before its pid can be reused: a group empty NOW is latched gone,
+    // and one that still has a member keeps the id reserved for as long as that member lives.
+    ownedGroup(0);
   });
 
   const secrets = [env.AUTH_SECRET, env.DATABASE_URL].filter((s): s is string => typeof s === "string" && s !== "");
@@ -687,49 +701,54 @@ export async function startNextChild(opts: StartChildOptions): Promise<OwnedChil
       const pid = child.pid;
       if (pid === undefined) {
         // The spawn itself failed: no process, no group, nothing was ever owned.
-        return { label, pid: -1, exitCode: null, signal: null, forced: false, portClosed: true };
+        return { label, pid: -1, exitCode: null, signal: null, forced: false, groupGone: true, portClosed: true };
       }
+      // Three separate observations: the leader reaped, the owned group without a member, the owned
+      // port closed. `next dev` serves from a forked worker in the leader's group, and Next closes its
+      // listener BEFORE the rest of its shutdown (installed start-server.js: `server.close`, then the
+      // awaited cleanup, then exit). So neither the leader's exit nor a closed port says the group is
+      // gone — only the group does, and it is asked whether or not the leader went first.
+      let seen = "present" as GroupPresence;
+      const groupStopped = (): boolean => {
+        seen = ownedGroup(0);
+        return exited && seen === "gone";
+      };
       let forced = false;
-      if (!exited) {
-        signalGroup(pid, "SIGTERM");
-        if (!(await waitUntil(() => exited, 10_000))) {
-          forced = true;
-          signalGroup(pid, "SIGKILL");
-          if (!(await waitUntil(() => exited, 5_000))) {
-            throw new DevLoginSetupFailure("cleanup-failed", `${label}: owned child ${pid} did not exit after SIGKILL`);
-          }
-        }
-      } else if (orphans) {
-        // The leader went first, on its own, and left members of its group running: ask them too.
-        signalGroup(pid, "SIGTERM");
-      }
-      // `next dev` serves from a forked worker in the same group: the port, not the parent's exit, is
-      // the evidence that the listener is gone.
-      let portClosed = await waitUntil(async () => !(await loopbackPortAccepts(port, 500)), 5_000, 200);
-      if (!portClosed && orphans) {
+      ownedGroup("SIGTERM");
+      if (!(await waitUntil(groupStopped, 10_000))) {
+        // Whatever the port says by now: a member that closed its listener and kept running is ours.
         forced = true;
-        signalGroup(pid, "SIGKILL");
-        portClosed = await waitUntil(async () => !(await loopbackPortAccepts(port, 500)), 5_000, 200);
+        ownedGroup("SIGKILL");
+        if (!(await waitUntil(groupStopped, 5_000))) {
+          // Sending SIGKILL is not seeing it work. The group stays registered for the last resort and
+          // no cleanup is reported.
+          throw new DevLoginSetupFailure(
+            "cleanup-failed",
+            seen === "unknown"
+              ? `${label}: whether owned process group ${pid} is gone could not be established (the probe was refused)`
+              : !exited
+                ? `${label}: owned child ${pid} did not exit after SIGKILL`
+                : `${label}: owned process group ${pid} still has a member after SIGKILL (one not yet reaped counts)`
+          );
+        }
       }
+      // Established gone: nothing is left to own, and that group id is not signalled again.
+      if (group) owned.delete(group);
+      const portClosed = await waitUntil(async () => !(await loopbackPortAccepts(port, 500)), 5_000, 200);
       if (!portClosed) {
-        // A group that outlived its leader stays registered for the last resort rather than being
-        // forgotten; one seen empty when its leader was reaped has nothing left to own.
-        if (group && !orphans) owned.delete(group);
         throw new DevLoginSetupFailure(
           "cleanup-failed",
-          orphans
-            ? `${label}: owned port ${port} is still accepting connections after the process group was killed`
-            : `${label}: port ${port} is still accepting connections although the owned group is gone — ` +
-              "that listener is not this carrier's and was not signalled"
+          `${label}: port ${port} is still accepting connections although the owned group is gone — ` +
+            "that listener is not this carrier's and was not signalled"
         );
       }
-      if (group) owned.delete(group);
       const cleanup: CleanupRecord = {
         label,
         pid,
         exitCode: child.exitCode,
         signal: child.signalCode,
         forced,
+        groupGone,
         portClosed,
       };
       console.log(`DEV_LOGIN_CHILD_CLEANUP_OK ${JSON.stringify(cleanup)}`);
@@ -739,7 +758,7 @@ export async function startNextChild(opts: StartChildOptions): Promise<OwnedChil
   };
   // Registered in the same tick as the spawn (nothing above awaits), and only when a process exists.
   if (child.pid !== undefined) {
-    group = { label, child, pid: child.pid, port, hasOrphans: () => orphans, stop };
+    group = { label, child, pid: child.pid, port, presence: () => ownedGroup(0), stop };
     owned.add(group);
   }
 
