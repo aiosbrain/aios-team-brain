@@ -27,7 +27,7 @@ Edit `.env.local` and set, at minimum:
 ```bash
 DATABASE_URL=postgres://app:app@localhost:5434/app_test   # see "Where do I get a DATABASE_URL?"
 AUTH_SECRET=<paste 32 random bytes — command below>
-APP_URL=http://localhost:3000
+APP_URL=http://127.0.0.1:3000
 # ANTHROPIC_API_KEY=sk-ant-...   # optional; only for live queries
 ```
 
@@ -37,19 +37,32 @@ Generate `AUTH_SECRET` (signs the session cookie):
 node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 ```
 
-Then load the schema, seed demo data, and start the dev server:
+Then load the schema, seed demo data, and start ONE dev server:
 
 ```bash
 npm run pg:schema     # load postgres/schema.sql (canonical, idempotent) into DATABASE_URL
 npm run dev:seed      # demo team (aios) + Northwind + Veridian graph
-npm run dev           # http://localhost:3000
+npm run dev:login     # the dev server, in the foreground, on http://127.0.0.1:3000 — local dev-login ON
 ```
 
-Login is invite-only (magic link). For local dev, mint a session without email:
+Login is invite-only. `npm run dev:login` **is** the dev server (`AIOS_DEV_LOGIN=1 next dev --hostname
+127.0.0.1`): it stays in the foreground, prints no link and mints nothing by itself. With it running,
+open this in a browser on the same machine to be signed in as the seeded admin — no email needed:
 
-```bash
-npm run dev:login     # prints a login link for the seeded admin
 ```
+http://127.0.0.1:3000/auth/dev-login?email=alex@demo.aios.local&next=/t/demo
+```
+
+The bypass signs in as *any* email with no credential check, so it is off unless the server was
+started this way, answers only local requests (`127.0.0.1` / `localhost` on the server's own port)
+and never exists in a production build. Keep it on loopback, don't persist `AIOS_DEV_LOGIN=1` in
+`.env.local`, and never point it at a shared, staging or production database or `AUTH_SECRET` — the
+full list of caveats is in [`README.md`](README.md) §2.7.
+For another port: `npm run dev:login -- --port 4000`, and use that port in the URL.
+
+Prefer not to enable it? Run plain `npm run dev` **instead** (not alongside — one server) and sign
+in with the password `npm run admin -- create-member` prints; under plain `npm run dev` the URL above
+is a `404`.
 
 > **Where do I get a `DATABASE_URL`?** Easiest: reuse the test Postgres container —
 > `npm run db:test:up` starts one on `localhost:5434` (user/pass/db = `app`/`app`/`app_test`) and
@@ -77,6 +90,59 @@ Notes:
   `test:datamechanics` unless the env var is already set.
 - `npm run db:test:down` tears the container down. The container can stop between sessions — if a
   data-mechanics run prints `ECONNREFUSED ...:5434`, just re-run `npm run db:test:up`.
+- **The dev-login wire carrier** (`npm run test:http:dev-login`, AIO-1210) proves `/auth/dev-login`
+  over a real loopback socket: the production build refuses under both runtime modes, then real
+  `next dev` children with the opt-in off and on. Run it from CI or a **clean** checkout only — it
+  refuses (never deletes) a checkout holding any Next-loaded env file such as `.env.local`, so use a
+  separate clean copy rather than your configured one:
+  ```bash
+  npm run db:test:up
+  npm run test:http:dev-login:build    # the ordinary `npm run build`, recorded against the current sources
+  DATABASE_TEST_URL=postgres://app:app@localhost:5434/app_test npm run test:http:dev-login
+  ```
+  The recorded build is the ordinary `npm run build`, run once, but **not** under your shell's
+  environment: the recorder gives it a sanitized one (a short OS allowlist plus synthetic production
+  values, with Sentry/provider/graph/mail settings blank and no `NODE_OPTIONS`), and prints its mode
+  and which variables are set — never their values. It passes `DATABASE_TEST_URL` to the build only
+  if that is a loopback `_test` URL (an unsafe one is refused), never `DATABASE_URL`; with none set
+  the build gets a non-serving placeholder, which is not a database. This governs the build it
+  starts — it cannot undo anything already loaded into the recorder process itself.
+  The carrier never builds: it consumes that build and refuses if its record is missing or stale.
+  "Stale" is judged against the runtime source inventory: the eligible regular files under eight
+  source roots (`app/`, `components/`, `config/`, `lib/`, `postgres/`, `public/`, `scripts/` and
+  `styles/`; a root that does not exist contributes nothing) plus the root-level config, package
+  and lock inputs it supports — edited, added or deleted, read from disk, so untracked files count
+  and no Git is needed. Rebuild with the same command after any such change. The inventory is
+  bounded and has explicit exclusions: env/key/certificate-named entries and `node_modules`,
+  `.git`, `.next`, `.context` and `.claude` are skipped by name; a symbolic link, a `pages/` or
+  `src/` directory, or a tree past its file/depth limits is refused rather than followed or
+  truncated; `test/`, `docs/`, the Python sidecar and installed dependencies are outside it (the
+  dependency boundary is `package.json` + `package-lock.json`). It ties one build to those
+  sources — it is not deployment-wide provenance, a secret scanner or an import resolver.
+  The carrier accepts only a loopback `_test` database, starts and stops its own servers on its own
+  ports, and reports a held `next dev` lock or a failed start as a named `SETUP_FAILURE` — stop
+  your own dev server first; it will not.
+  **Interrupting a run.** Those servers belong to the process that started them: the Vitest
+  *worker* running the test file, not the Vitest main process. A SIGINT/SIGTERM that reaches that
+  worker stops them before it takes effect, and a stop counts only once the server's whole process
+  group is gone — a closed port alone is not that. Ctrl-C in a terminal, or a signal to the
+  command's whole process group, reaches the worker. `test/dev-login-child-lifecycle.test.ts`
+  covers this at two separate levels: a process that owns the servers, signalled directly; and a
+  real `vitest run` in the installed default (forks) topology, signalled as a group. Both levels
+  have been executed green against the frozen lifecycle sources (all nine cases, installed Vitest
+  4.1.9), with stand-in listeners in place of `next dev` — this is the lifecycle suite, not a run
+  of the carrier itself. What that run measured: an ordinary stop and a directly signalled owner,
+  including repeated signals, end with the owned group gone; a listener that closed its port but
+  kept running is still treated as owned and is not reported clean; and for SIGINT and for SIGTERM
+  sent to the command's whole process group, the worker and its owned listener were asserted gone
+  before the test's own fallback removal ran, while an unrelated listener stayed up. It is evidence
+  for that version and topology, not a guarantee for every pool, runner or platform.
+  Not covered and not promised: a signal sent to the Vitest main process alone, a worker
+  force-killed by Vitest, and SIGKILL. The first is measured, not assumed: on SIGTERM to the main
+  process alone it exited 143 without waiting for its worker, and five seconds later the worker and
+  its listener were both still running — nothing had cleaned them up, and the test removed them
+  itself by verified identity. That removal is the test tidying its fixtures, not the carrier
+  cleaning up. After any of those, check for a leftover `next dev` on the port the run printed.
 - **`npm run db:test:up` always starts FROM ZERO** (`scripts/db-test-up.sh`: `down -v`, then `up`,
   then load the schema). It is therefore safe to re-run against any prior state — you no longer
   have to remember `db:test:down` first. Two consequences worth knowing:

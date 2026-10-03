@@ -75,7 +75,8 @@ async function deliver(to: string, subject: string, body: { text: string; html?:
   }
 
   // No provider configured. NEVER log the body/link — it carries a one-time token.
-  // For local sign-in without email, use /auth/dev-login (dev only).
+  // For local sign-in without email, use a password, or the deliberately enabled local bypass:
+  // /auth/dev-login on a server started with `npm run dev:login` (off by default, loopback only).
   if (process.env.NODE_ENV !== "production") {
     console.info(`[mailer] (dev, no provider) would send "${subject}" → ${to}; set RESEND_API_KEY to deliver.`);
   } else {

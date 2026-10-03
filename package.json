@@ -5,6 +5,7 @@
   "license": "AGPL-3.0-only",
   "scripts": {
     "dev": "next dev",
+    "dev:login": "AIOS_DEV_LOGIN=1 next dev --hostname 127.0.0.1",
     "build": "next build",
     "start": "next start",
     "doctor": "node scripts/doctor.mjs",
@@ -49,6 +50,8 @@
     "test:http": "vitest run --config vitest.http.config.ts",
     "test:http:gateway-approval": "AIOS_GATEWAY_INTERNAL_ENABLED=true vitest run --config vitest.http.config.ts gateway-approval-enabled",
     "test:http:tierret1-query": "vitest run --config vitest.tierret1-query.config.ts",
+    "test:http:dev-login:build": "npx tsx test/http/dev-login-build-cli.ts",
+    "test:http:dev-login": "vitest run --config vitest.dev-login.config.ts",
     "test:gateway-contracts": "vitest run test/gateway/gateway-contracts.test.ts",
     "test:gateway-approval-contracts": "vitest run test/gateway/gateway-approval-contracts.test.ts",
     "test:gateway-api": "vitest run test/gateway test/guards/gateway-writers.test.ts",

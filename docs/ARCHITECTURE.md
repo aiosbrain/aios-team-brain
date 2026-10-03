@@ -777,6 +777,26 @@ Two principals, one tier model:
     work without a stable domain to build it against or anything to deliver it with; the route itself
     stays reachable regardless. `issueMagicToken`/`redeemMagicToken` also back the admin-CLI
     one-time-login-link tool (`scripts/admin.ts login-link`).
+  - **Local dev-login (developer tooling, default OFF — AIO-1210).** `GET /auth/dev-login`
+    (`app/auth/dev-login/route.ts`, its single owner) signs a session for *any* email with no
+    credential check, so it is admitted only when ALL of these hold, checked in this order before any
+    identity write or signing: the build is not production (the literal `NODE_ENV` check, which
+    `next build` substitutes — the production artifact refuses under any runtime mode); the
+    request-time opt-in is exactly `AIOS_DEV_LOGIN=1`; the raw `Host` is `localhost` / `127.0.0.1` /
+    `[::1]` with an optional canonical port, the request URL is local http(s) without credentials on
+    the same effective port, and any `x-forwarded-host` / `x-forwarded-proto` present agree with them;
+    the destination (`safeNextPath`) stays on the origin built from that validated Host and scheme.
+    Every refusal is the same inert `no-store` 404, issued before `ensureAuthUser` /
+    `linkMemberByEmail` / `signSession`. An admitted login reuses those writers and the existing
+    cookie options unchanged — no membership, role or tier is created, and an `invited` row stays
+    invited (the route supplies no team). `npm run dev:login` is the coupled launch
+    (`AIOS_DEV_LOGIN=1 next dev --hostname 127.0.0.1`); plain `npm run dev` leaves it off. **A `Host`
+    header is not peer identity:** an enabled listener that is exposed or proxied can be reached with
+    a spoofed local Host, so the loopback bind is a required operator practice, and the bypass must
+    never run against a shared, staging or production database or `AUTH_SECRET` (the signer has no
+    environment audience). Pinned by `test/dev-login-route.test.ts`,
+    `test/datamechanics/dev-login.datamechanics.test.ts` and the wire carrier
+    `npm run test:http:dev-login` (production artifact, then real `next dev` off/on).
   - Either mechanism's **first** successful login (an invite's first activation) routes through
     `/auth/welcome` — name, team, and inviter (resolved from the append-only `audit_log`, no
     `invited_by` column needed) — before landing on the dashboard; magic-link-only accounts can
