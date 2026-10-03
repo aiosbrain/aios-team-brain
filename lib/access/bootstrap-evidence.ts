@@ -82,7 +82,7 @@ const CENSUS_LABEL = "census: ";
 const CONVERGENCE_LABEL = "convergence: ";
 const ARM_SEPARATOR = "; ";
 const ELLIPSIS = "…";
-const REPLACEMENT = "�";
+const REPLACEMENT = "\uFFFD";
 
 const isHighSurrogate = (unit: number) => unit >= 0xd800 && unit <= 0xdbff;
 const isLowSurrogate = (unit: number) => unit >= 0xdc00 && unit <= 0xdfff;
@@ -366,10 +366,15 @@ const isCount = (value: unknown): value is number => typeof value === "number" &
 const fitsBytes = (value: unknown, maxBytes: number): value is string =>
   typeof value === "string" && value.length <= maxBytes && utf8Bytes(value) <= maxBytes;
 
+/**
+ * A failing phase always names a reason: the producer never emits an empty one (a missing or empty
+ * message becomes a fixed fallback), so an empty `message` is a fabricated envelope and is refused
+ * rather than rendered as `failed — `. Empty only — the text is not trimmed and not otherwise judged.
+ */
 function decodePhaseError(value: unknown): BootstrapPhaseError | null {
   if (!isRecord(value)) return null;
   const { message, truncated } = value;
-  if (!fitsBytes(message, MAX_COMPOUND_BYTES) || typeof truncated !== "boolean") return null;
+  if (!fitsBytes(message, MAX_COMPOUND_BYTES) || message.length === 0 || typeof truncated !== "boolean") return null;
   return { message, truncated };
 }
 

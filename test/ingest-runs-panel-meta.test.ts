@@ -98,6 +98,12 @@ function render(runs: IngestRunRow[]) {
 const escapeHtml = (s: string) =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#x27;");
 
+/** Tag-stripped text with its whitespace collapsed, so a phrase can be matched across elements. */
+const squash = (text: string) => text.replace(/\s+/g, " ").trim();
+/** The panel's OWN census statement: what follows its `Census:` label, up to the stored reason. The
+ *  reason repeats the count head (`23 unsanctioned edge(s) …`) and must not stand in for a label. */
+const censusStatement = (text: string) => /Census:\s*(.*?)(?:\s—\s|$)/.exec(squash(text))?.[1] ?? "";
+
 /** The pre-existing failed-row presentation: pill, 120-character preview, full error as the title. */
 function expectLegacyErrorPresentation(html: string, error: string): void {
   expect(html).toContain("failed (1)");
@@ -163,6 +169,86 @@ describe("AUDITFIX-25 AC08: a failed access_bootstrap row discloses its typed ev
     expect(errorFlagged[0].html, "a shortened phase error carries an indicator").not.toBe(errorUnflagged[0].html);
   });
 
+  it("says a sample is every finding of the tick ONLY when nothing was omitted", () => {
+    const TWO = "2 unsanctioned edge(s) on system projects: general→vendors, legacy-system→contractors";
+    const complete = render([evidenceRun({ census: { status: "complete", total: 2, error: { message: TWO, truncated: false } }, omitted: 0 })]).blocks;
+    const partial = render([evidenceRun()]).blocks;
+    for (const b of [complete, partial]) expect(b).toHaveLength(1);
+
+    // omitted = 0: the two sampled findings ARE the tick's findings. "Not the complete set" was false here.
+    expect(squash(complete[0].text)).toMatch(/Sample — 2 of 2, all findings for this tick/);
+    expect(complete[0].text, "a complete sample is not called partial").not.toMatch(/not the complete set/i);
+    expect(censusStatement(complete[0].text), "the total, on its own label").toMatch(/\b2 unsanctioned edges\b/);
+    expect(censusStatement(complete[0].text), "the sampled count, on its own label").toMatch(/\b2 sampled\b/);
+    expect(censusStatement(complete[0].text), "and nothing omitted, on its own label").toMatch(/\b0 omitted\b/);
+
+    // omitted > 0: the same two samples beside 21 more findings are NOT everything.
+    expect(squash(partial[0].text)).toMatch(/Sample — 2 of 23, not the complete set/);
+    expect(partial[0].text, "a partial sample never claims completeness").not.toMatch(/all findings/i);
+    expect(censusStatement(partial[0].text)).toMatch(/\b23 unsanctioned edges\b/);
+    expect(censusStatement(partial[0].text)).toMatch(/\b2 sampled\b/);
+    expect(censusStatement(partial[0].text)).toMatch(/\b21 omitted\b/);
+  });
+
+  it("a sample trimmed to nothing makes neither claim: the counts alone say what was left out", () => {
+    const { blocks } = render([evidenceRun({ sample: [], omitted: 23 })]);
+
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].text).not.toMatch(/all findings|not the complete set/i);
+    expect(censusStatement(blocks[0].text)).toMatch(/\b23 unsanctioned edges\b/);
+    expect(censusStatement(blocks[0].text)).toMatch(/\b0 sampled\b/);
+    expect(censusStatement(blocks[0].text)).toMatch(/\b23 omitted\b/);
+  });
+
+  it("puts the table in ONE labelled, keyboard-focusable region, ahead of the native Evidence toggle", () => {
+    const { html } = render([evidenceRun(), run({ id: 2, source: "pm_sync", ok: true, error_count: 0, errors: [], meta: { provider: "linear" } })]);
+
+    // Semantics a keyboard and a screen reader depend on. Whether the region actually scrolls and
+    // the content actually fits is a BROWSER observation (AC11), not something markup can prove.
+    const regions = [...html.matchAll(/<div\b([^>]*\brole="region"[^>]*)>/g)];
+    expect(regions, "one region for the whole table, not one per row").toHaveLength(1);
+    expect(regions[0].index, "the region is the panel's root").toBe(0);
+    expect(regions[0][1]).toContain('aria-label="Recent runs"');
+    expect(regions[0][1], "a tab stop, so the keyboard can scroll what does not fit").toContain('tabindex="0"');
+    expect(html.endsWith("</table></div>"), "the table is the region's content").toBe(true);
+
+    const summary = /<summary\b([^>]*)>/.exec(html);
+    expect(summary, "the disclosure toggle is still a native summary").not.toBeNull();
+    expect(summary!.index, "reached after the region, in document order").toBeGreaterThan(html.indexOf("<table"));
+    expect(summary![1], "with the browser's own focus and Enter/Space handling").not.toMatch(/tabindex|role=/);
+    expect((html.match(/tabindex=/g) ?? []).length, "and no other tab stop is added").toBe(1);
+  });
+
+  it("renders every validated label and reason IN FULL — long unbroken text is left to wrap, never cut here", () => {
+    const LABEL = `${"x".repeat(93)}…`; // a 96-byte display label with no break opportunity
+    const REASON = `general:${"w".repeat(213)}`; // a 221-byte reason with none either
+    const { blocks } = render([
+      evidenceRun({
+        convergence: { status: "failed", error: { message: REASON, truncated: false } },
+        sample: [{ projectId: P1, groupId: G1, projectSlug: LABEL, groupSlug: LABEL, projectSlugTruncated: true, groupSlugTruncated: true }],
+        omitted: 22,
+      }),
+    ]);
+
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].text, "the whole reason").toContain(REASON);
+    expect(blocks[0].text.split(LABEL), "both whole labels").toHaveLength(3);
+    expect(blocks[0].text, "the whole project UUID").toContain(P1);
+    expect(blocks[0].text, "the whole group UUID").toContain(G1);
+    expect(censusStatement(blocks[0].text), "and the counts").toMatch(/\b23 unsanctioned edges\b.*\b1 sampled\b.*\b22 omitted\b/);
+  });
+
+  it("an error longer than the preview keeps its 120-character preview, its cue and its full title", () => {
+    const long = `linear 500: ${"e".repeat(300)}`;
+    const { html, blocks } = render([run({ source: "pm_sync", trigger: "manual", errors: [long, "second error"], error_count: 2, meta: { provider: "linear" } })]);
+
+    expect(blocks).toEqual([]);
+    expect(html).toContain("failed (2)");
+    expect(html, "exactly the first 120 characters, then the cue").toMatch(new RegExp(`>${long.slice(0, 120)}(<!-- -->)?…</span>`));
+    expect(html, "every error, in full, as the title").toContain(`title="${long}\nsecond error"`);
+    expect(html.split(long), "the full text is the title ONLY — the cell shows the preview").toHaveLength(2);
+  });
+
   it("says UNAVAILABLE for a failed census — an unknown count is never shown as zero", () => {
     const { html, blocks } = render([
       run({
@@ -195,7 +281,9 @@ describe("AUDITFIX-25 AC08: a failed access_bootstrap row discloses its typed ev
     const fromString = render([run({ meta: JSON.stringify(meta) })]);
 
     expect(fromObject.blocks).toHaveLength(1);
-    expect(fromString.blocks, "jsonb arrives as a string under some adapter paths").toHaveLength(1);
+    // An explicit legacy JSON-string FIXTURE: it exercises the decoder's compatibility branch, and
+    // claims nothing about what the current adapter returns.
+    expect(fromString.blocks, "the legacy JSON-string fixture is recognized too").toHaveLength(1);
     expect(fromString.html).toBe(fromObject.html);
   });
 

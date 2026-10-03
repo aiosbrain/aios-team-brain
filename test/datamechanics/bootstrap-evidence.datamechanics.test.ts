@@ -395,7 +395,8 @@ type LedgerRow = {
 };
 const COLS = "id, team_id, source, trigger, ok, error_count, errors, meta";
 
-/** jsonb arrives as a string under some adapter paths and a value under others. */
+/** Reads a jsonb column in either form: the parsed value, or a legacy JSON string. The string
+ *  branch is compatibility only — it is not a claim that the current adapter returns text. */
 const jsonOf = <T>(v: unknown, empty: T): T => (typeof v === "string" ? (JSON.parse(v) as T) : ((v ?? empty) as T));
 const errorsOf = (row: LedgerRow) => jsonOf<string[]>(row.errors, []);
 const metaOf = (row: LedgerRow) => jsonOf<Record<string, unknown>>(row.meta, {});
@@ -500,6 +501,14 @@ function expectTransport(t: Tick, teamId: string, want: { error: string; evidenc
 
 const escapeHtml = (s: string) =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#x27;");
+
+/**
+ * The panel's OWN census statement: the tag-stripped, whitespace-collapsed text after its `Census:`
+ * label, up to the stored reason (` — `). The reason repeats the count head (`1 unsanctioned edge(s)
+ * …`), and `1 sampled` / `0 omitted` contain small numbers of their own — so a count is only proven
+ * rendered when it is read HERE, next to its own label.
+ */
+const censusStatement = (text: string) => /Census:\s*(.*?)(?:\s—\s|$)/.exec(text.replace(/\s+/g, " ").trim())?.[1] ?? "";
 
 /** The actual panel, fed by the actual reader. Returns each `<details>` block as tag + plain text. */
 async function panelFor(teamId: string) {
@@ -1529,12 +1538,17 @@ describe("AUDITFIX-25 AC08: every normal state round-trips producer → jsonb �
     expect(blocks[0].summary, "a concise Evidence summary").toMatch(/evidence/i);
     expect(blocks[0].text).toMatch(/convergence/i);
     expect(blocks[0].text).toMatch(/census/i);
+    // Each count is matched WITH its label, in the panel's own census statement, against the stored
+    // envelope read back above. A bare `\b1\b` was satisfied by `1 sampled`, and `\b0\b` by `0 omitted`.
+    const statement = censusStatement(blocks[0].text);
     if (unavailable) {
       expect(e.census.total).toBeNull();
       expect(blocks[0].text, "an unavailable count is SAID, never shown as zero").toMatch(/unavailable/i);
+      expect(statement, "and no count is rendered beside any count label").not.toMatch(/\d+\s+(unsanctioned|sampled|omitted)/);
     } else {
-      expect(blocks[0].text, "the exact total").toMatch(new RegExp(`\\b${e.census.total}\\b`));
-      expect(blocks[0].text, "and the omitted count").toMatch(new RegExp(`\\b${e.omitted}\\b`));
+      expect(statement, "the exact total, on its own label").toMatch(new RegExp(`\\b${e.census.total} unsanctioned edges?\\b`));
+      expect(statement, "the sampled count, on its own label").toMatch(new RegExp(`\\b${e.sample.length} sampled\\b`));
+      expect(statement, "and the omitted count, on its own label").toMatch(new RegExp(`\\b${e.omitted} omitted\\b`));
       expect(blocks[0].text).not.toMatch(/unavailable/i);
     }
     for (const id of ids) expect(blocks[0].text, "sampled identities are exact UUIDs").toContain(id);
@@ -1563,7 +1577,8 @@ describe("AUDITFIX-25 AC08: every normal state round-trips producer → jsonb �
     const decoded = decodeBootstrapEvidence(own[0]);
     expect(decoded, "producer → jsonb → reader → decoder is an identity on the envelope").toStrictEqual(stored);
     expect(decoded, "and it is what the producer handed its callback").toEqual(t.outcome!.evidence);
-    // The legacy JSON-string form of the SAME stored metadata decodes identically.
+    // An explicit legacy JSON-string FIXTURE of the same stored metadata decodes identically. It is
+    // built here; whatever form the reader returned, this exercises the compatibility branch.
     const asString = typeof own[0].meta === "string" ? own[0].meta : JSON.stringify(own[0].meta);
     expect(decodeBootstrapEvidence({ ...own[0], meta: asString })).toStrictEqual(stored);
 

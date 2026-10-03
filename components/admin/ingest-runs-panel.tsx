@@ -20,7 +20,18 @@ export function IngestRunsPanel({ runs }: { runs: IngestRunRow[] }) {
   }
 
   return (
-    <div className="overflow-hidden rounded-lg border border-border-subtle">
+    // A horizontal SCROLL region, not a clip: six columns do not fit a narrow viewport, and clipping
+    // them put the Details column (and its Evidence toggle) out of reach. It is labelled and
+    // focusable so a keyboard can scroll it too — one extra tab stop, before the first summary.
+    // It is also the inline-size query container the Details box below is capped against: the
+    // region's real width comes from its parent (a fixed sidebar leaves far less than the viewport).
+    // `outline-hidden`, not `outline-none`: the ring is a box-shadow, which forced colors drops.
+    <div
+      role="region"
+      aria-label="Recent runs"
+      tabIndex={0}
+      className="min-w-0 max-w-full overflow-x-auto rounded-lg border border-border-subtle outline-hidden [container-type:inline-size] focus-visible:border-violet focus-visible:ring-2 focus-visible:ring-violet/40"
+    >
       <table className="w-full text-sm">
         <thead className="bg-surface-raised text-left text-xs uppercase tracking-wide text-ink-tertiary">
           <tr>
@@ -61,18 +72,25 @@ export function IngestRunsPanel({ runs }: { runs: IngestRunRow[] }) {
                   {relativeAge(when)}
                 </td>
                 <td className="px-3 py-2 text-ink-tertiary">
-                  {r.errors.length > 0 ? (
-                    <span className="text-red" title={r.errors.join("\n")}>
-                      {r.errors[0].slice(0, 120)}
-                      {r.errors[0].length > 120 ? "…" : ""}
-                    </span>
-                  ) : (
-                    <RunMeta meta={r.meta} />
-                  )}
-                  {/* BESIDE the error, not instead of it: a failed row's metadata is otherwise never
-                      rendered (the ternary above), which is right for arbitrary meta and was the
-                      reason the one row with something to disclose showed none of it. */}
-                  {evidence ? <BootstrapEvidenceDisclosure evidence={evidence} /> : null}
+                  {/* One BOUNDED box for everything in this cell. An unbroken label, reason or JSON
+                      value otherwise sets the column's minimum width and the table grows with it;
+                      here it wraps anywhere instead — the text is all still there, never cut. 20rem
+                      where there is room, capped by the scroll region's own width (`cqw`), not the
+                      viewport's: a 20rem summary inside a narrower region scrolls its own label away. */}
+                  <div className="w-80 min-w-0 max-w-[calc(100cqw-1rem)] [overflow-wrap:anywhere]">
+                    {r.errors.length > 0 ? (
+                      <span className="text-red" title={r.errors.join("\n")}>
+                        {r.errors[0].slice(0, 120)}
+                        {r.errors[0].length > 120 ? "…" : ""}
+                      </span>
+                    ) : (
+                      <RunMeta meta={r.meta} />
+                    )}
+                    {/* BESIDE the error, not instead of it: a failed row's metadata is otherwise never
+                        rendered (the ternary above), which is right for arbitrary meta and was the
+                        reason the one row with something to disclose showed none of it. */}
+                    {evidence ? <BootstrapEvidenceDisclosure evidence={evidence} /> : null}
+                  </div>
                 </td>
               </tr>
             );
@@ -108,14 +126,19 @@ function RunMeta({ meta }: { meta: Record<string, unknown> }) {
  * direction override inside a label cannot reorder the UUID beside it.
  *
  * What it must keep saying: the count is exact but the list is a SAMPLE; an unreadable census is
- * unavailable, never zero; and a shortened label or message is marked as shortened.
+ * unavailable, never zero; and a shortened label or message is marked as shortened. The sample
+ * heading is truthful both ways: with nothing omitted it IS every finding of that tick (not of the
+ * current state — a later read sees a newer snapshot), otherwise it is not the complete set.
+ *
+ * Long labels and reasons WRAP (`overflow-wrap: anywhere`, every level shrinkable); nothing here is
+ * clamped, ellipsized or hidden to make it fit.
  */
 function BootstrapEvidenceDisclosure({ evidence }: { evidence: AccessBootstrapEvidence }) {
   const { convergence, census, sample, omitted } = evidence;
   return (
-    <details className="mt-1 text-xs text-ink-secondary">
+    <details className="mt-1 min-w-0 max-w-full text-xs text-ink-secondary">
       <summary className="cursor-pointer text-ink-tertiary">Evidence</summary>
-      <div className="mt-1 flex flex-col gap-1 break-words">
+      <div className="mt-1 flex min-w-0 max-w-full flex-col gap-1 [overflow-wrap:anywhere]">
         <p>
           <span className="font-medium text-ink">Convergence:</span> {convergence.status}
           {convergence.error ? <PhaseErrorText error={convergence.error} /> : null}
@@ -128,14 +151,14 @@ function BootstrapEvidenceDisclosure({ evidence }: { evidence: AccessBootstrapEv
           {census.error ? <PhaseErrorText error={census.error} /> : null}
         </p>
         {sample.length > 0 ? (
-          <div>
+          <div className="min-w-0">
             <p className="font-medium text-ink">
-              Sample — {sample.length} of {census.total}, not the complete set
+              {`Sample — ${sample.length} of ${census.total}, ${omitted === 0 ? "all findings for this tick" : "not the complete set"}`}
             </p>
-            <ul className="mt-0.5 flex flex-col gap-1">
+            <ul className="mt-0.5 flex min-w-0 flex-col gap-1">
               {sample.map((s, i) => (
                 // Index key: findings are not deduplicated, so two samples can share both ids.
-                <li key={i} className="flex flex-col">
+                <li key={i} className="flex min-w-0 flex-col">
                   <SampleIdentity kind="project" slug={s.projectSlug} truncated={s.projectSlugTruncated} id={s.projectId} />
                   <SampleIdentity kind="group" slug={s.groupSlug} truncated={s.groupSlugTruncated} id={s.groupId} />
                 </li>
@@ -161,7 +184,7 @@ function PhaseErrorText({ error }: { error: BootstrapPhaseError }) {
 
 function SampleIdentity({ kind, slug, truncated, id }: { kind: "project" | "group"; slug: string; truncated: boolean; id: string }) {
   return (
-    <span>
+    <span className="min-w-0">
       {kind} <bdi className="text-ink">{slug}</bdi>
       {truncated ? <span className="text-ink-tertiary"> (label shortened)</span> : null}{" "}
       <code className="break-all font-mono text-ink-tertiary">{id}</code>

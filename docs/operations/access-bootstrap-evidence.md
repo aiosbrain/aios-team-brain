@@ -9,11 +9,12 @@ this file describes the implementation and how an operator uses it.
 
 | Statement kind | Status |
 | --- | --- |
-| Behaviour described under "What is implemented" | **Implemented in source** on `codex/auditfix-25-bootstrap-evidence`. Reconciled against the code by reading it. **Not yet verified by execution** — see "Verification status". |
+| Behaviour described under "What is implemented" | **Implemented in source** on `codex/auditfix-25-bootstrap-evidence`. Reconciled against the code by reading it. The automated checks recorded under "Verification status" passed on the **initial snapshot**; the review follow-up applied after it (also listed there) is **not yet verified by execution**. |
 | The SQL and CLI command below | Checked against the current schema, census and CLI source by reading them. **Never executed** for this document, against any database. |
-| Acceptance criteria AC01–AC13 | **All pending.** Nothing here attests a passing test, a build, a browser observation, a review or a rollout. |
+| Acceptance criteria AC01–AC13 | **All pending final adjudication.** The manual narrow-width check (AC11) **failed** on the initial snapshot. The re-runs after the follow-up, the mutation controls, the repeated manual check and the remaining reviews are outstanding. Nothing here attests acceptance, a rollout or production capacity. |
 
-Replace a "pending" with a result only when the coordinator has recorded that result.
+Replace a "pending" with a result only when the coordinator has recorded that result, and say which
+snapshot it was recorded on. A result recorded on the initial snapshot does not attest later bytes.
 
 ## What is implemented
 
@@ -31,14 +32,24 @@ The disclosure shows, for that one tick:
 - **Census** — `complete` with the exact number of unsanctioned edges, how many are sampled and how
   many are omitted; or `failed` with **finding count unavailable**.
 - **Sample** — up to sixteen findings, each a project label + project UUID and a group label + group
-  UUID, headed "not the complete set".
+  UUID. The heading is "Sample — N of M", followed by "all findings for this tick" when nothing was
+  omitted and by "not the complete set" when anything was. "All findings for this tick" describes
+  that tick's census only; it is not a statement about the current state.
 - A `(shortened)` marker on any reason that was cut, and `(label shortened)` on any display label
   that was cut.
 
 Only rows the decoder recognizes get a disclosure. Older failed rows, rows from other sources,
 instance-wide (`team_id is null`) rows, and rows whose metadata is malformed, oversized, of another
-version, healthy-shaped or naming a different team keep their existing presentation with no
-disclosure. A healthy tick writes no evidence at all.
+version, healthy-shaped, naming a different team or carrying a failing phase with an empty reason
+keep their existing presentation with no disclosure. A healthy tick writes no evidence at all.
+
+The runs table sits in a horizontally scrollable region labelled "Recent ingestion runs". The region
+is a keyboard tab stop — one, ahead of the first Evidence toggle — so a table wider than the page can
+be scrolled without a pointer. The Details column has a bounded width, and long labels, reasons and
+metadata values wrap inside it instead of widening the table. Wrapping is the only fitting applied:
+the 120-character error preview and its tooltip are as before, and no evidence text is cut or hidden
+to fit. **This layout is implemented in source and has not been observed in a browser.** The layout
+before it failed the narrow-width check — see "Verification status".
 
 ### What the evidence means
 
@@ -79,6 +90,16 @@ trim; it may end inside a name and never says "+N more". `total` and `omitted` a
 
 Display labels are **not** command arguments. A shortened label cannot identify a group or project;
 use the exact UUID to look up the complete slug.
+
+**Reading limit for legacy JSON-string metadata.** The decoder accepts `meta` as an object or as a
+legacy JSON string. A string is bounded at 8,192 bytes of its *actual* text **before** it is parsed,
+whitespace included. PostgreSQL's `jsonb::text` form puts a space after every `:` and `,`, and
+pretty-printed JSON adds more, so a string can exceed the bound even though its compact known-field
+projection fits. Such a row is refused unparsed: it keeps the existing error presentation and shows
+no disclosure. That is the fail-closed direction, and the evidence is still in the stored row. The
+current `pg` reader normally returns object metadata, for which the bound is measured on the compact
+projection; no current path that hands the decoder adapter-returned text was demonstrated. The limit
+is not raised and the string is not compacted before the check.
 
 ### When a reason or the evidence cannot be produced
 
@@ -244,19 +265,47 @@ scheduler ticks. `access-health <team-slug>` gives a short human diagnosis, not 
 
 ## Verification status
 
-Recorded by the implementer; no command was run by the implementer.
+Two states of the branch are kept apart here.
 
-| Check | Status |
-| --- | --- |
-| Pure unit suite (`test/bootstrap-evidence.test.ts`) | **Pending.** Previously failed at collection because the module did not exist; that run executed no case and proved no expectation |
-| Page-gate and panel unit suites | **Pending** re-run. 27 behavioural failures were recorded before implementation |
-| Real-ledger suite (`test/datamechanics/bootstrap-evidence.datamechanics.test.ts`) | **Pending** re-run. 47 behavioural failures were recorded before implementation. The builder-fault and decoder round-trip cases added with the implementation have never been executed |
-| Production HTTP / RSC suite | **Pending.** 6 behavioural failures were recorded before implementation |
-| Mutation controls (each page gate, third guard, budgets, preclamp, row scope, getter, panel) | **Pending** |
-| Typecheck, changed-file lint, docs check, production build | **Pending** |
-| Manual browser check of the disclosure (keyboard, desktop and narrow widths) | **Pending** |
-| Independent code reviews | **Pending** |
-| The SQL and CLI command in this document | **Not executed** |
+- **Initial snapshot** — the implementation before the review follow-up; the coordinator's checkpoint
+  of it is commit `17a5c420ebb80fa27c97da1a571f00036204836c`. Every result in the middle column was
+  recorded by the coordinator on that state. The implementers ran no command.
+- **Follow-up** — the accepted review corrections applied afterwards, listed below the table. They
+  change source, tests and this document, so no initial-snapshot result attests them. Their column
+  stays "Pending" until the coordinator records a re-run on the final bytes.
+
+| Check | Initial snapshot (recorded by the coordinator) | After the follow-up |
+| --- | --- | --- |
+| Pure unit suite (`test/bootstrap-evidence.test.ts`) | **261 passed.** Before the implementation it failed at collection because the module did not exist; that run executed no case and proved no expectation | **Pending.** Empty-reason decoder cases were added |
+| Page-gate and panel unit suites | **70 passed.** 27 behavioural failures were recorded before implementation | **Pending.** Panel cases were added |
+| Real-ledger evidence suite (`test/datamechanics/bootstrap-evidence.datamechanics.test.ts`), real PostgreSQL | **57 passed.** 47 behavioural failures were recorded before implementation | **Pending.** Its panel count assertions were strengthened |
+| Existing policy and ledger suites, real PostgreSQL | **70 passed** | **Pending** |
+| Production HTTP / RSC suite for this change | **12 passed.** 6 behavioural failures were recorded before implementation | **Pending** |
+| Shared production HTTP suite | **101 passed, 2 skipped** — the two skips are pre-existing optional gateway cases | **Pending** |
+| Typecheck and changed-file lint | **Passed** | **Pending** |
+| Production build | **Passed**: the default (Turbopack) build from a clean cache exited 0. Two earlier Turbopack attempts failed with `EPERM`, and a Webpack build failed route-type validation on pre-existing exports outside this change. Those are retained as failures, not passes, and no common cause is claimed | **Pending.** The panel's styles changed, so the compiled CSS must be rebuilt |
+| Docs check | No result recorded for this document | **Pending** |
+| Manual browser check of the disclosure (keyboard, desktop and narrow widths) | **Failed at narrow width.** Desktop 1280 px: closed by default, Tab reached the summary, Enter expanded and Space collapsed it, but long expanded labels were visually clipped. Narrow 390 px: the container was 358 px wide and clipped a table of 934 px closed and about 1,971 px expanded; the summary sat at about 489 px, outside the viewport. The keyboard toggle still worked | **Pending.** To be repeated at both widths against the rebuilt CSS |
+| Mutation controls (each page gate, third guard, budgets, preclamp, row scope, getter, panel) | **Pending** | **Pending** |
+| Independent code reviews | One review of the initial snapshot found no high-severity and no runtime-code defect. It was **not** an acceptance verdict: it reported this document's then-stale statuses and eight lower findings, and listed surfaces it had not been given | **Pending**: review of the follow-up, the remaining review coverage and the final review |
+| The SQL and CLI command in this document | **Not executed** — checked against source only | **Not executed** |
+
+### The review follow-up (in source, not yet verified by execution)
+
+- **Panel layout** — the scroll region, bounded Details column and wrapping described under "The
+  operator surface". This is the correction for the failed narrow-width check; the failed
+  observation above stands until a repeated check is recorded.
+- **Sample heading** — it used to say "not the complete set" even when nothing was omitted.
+- **Decoder** — a failing phase with an empty reason is now refused. The producer never writes one.
+- **Source clarity** — the replacement character U+FFFD is written as an escape in the evidence
+  module instead of a literal. The value is meant to be identical; the pure normalization cases have
+  to be re-run to confirm it.
+- **Tests** — the real-ledger panel checks now match each count next to its own label; direct decoder
+  cases cover an empty reason in object and legacy-string form; panel cases cover the two sample
+  headings, the labelled region and full-text rendering. The panel cases check markup and text. They
+  do not prove that anything scrolls or fits — that is the manual browser check.
+- **This document** — the statuses above, the sample-heading wording and the legacy JSON-string
+  reading limit.
 
 ## Where the behaviour lives
 

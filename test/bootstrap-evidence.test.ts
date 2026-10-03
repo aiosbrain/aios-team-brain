@@ -1400,6 +1400,15 @@ describe("AUDITFIX-25 AC07/AC08 (pure): the decoder recognizes exactly a valid v
     { name: "an error with no message", row: () => row(meta(findings({ convergence: { status: "failed", error: { truncated: false } } }))) },
     { name: "an error truncation flag of the wrong type", row: () => row(meta(findings({ convergence: { status: "failed", error: { message: "x", truncated: "false" } } }))) },
     { name: "an error with no truncation flag", row: () => row(meta(findings({ convergence: { status: "failed", error: { message: "x" } } }))) },
+    // A failing phase always names a reason: the producer substitutes a fixed fallback for a missing
+    // or empty message, so an EMPTY one is fabricated — valid in every other respect, and refused.
+    { name: "a lone failed convergence whose reason is EMPTY", row: () => row(meta(lone(""))) },
+    { name: "a lone failed (unavailable) census whose reason is EMPTY", row: () => row(meta(unavailable(""))) },
+    { name: "lone findings whose census summary is EMPTY", row: () => row(meta(findings({ convergence: { status: "ok" }, census: censusFound({ error: { message: "", truncated: false } }) }))) },
+    { name: "both phases failing, the convergence reason EMPTY", row: () => row(meta(findings({ convergence: convergenceFailed("") }))) },
+    { name: "both phases failing, the census reason EMPTY", row: () => row(meta(dual(0, 15))) },
+    { name: "both phases failing, both reasons EMPTY", row: () => row(meta(dual(0, 0))) },
+    { name: "an EMPTY reason flagged truncated", row: () => row(meta(findings({ convergence: { status: "failed", error: { message: "", truncated: true } } }))) },
     { name: "no census phase", row: () => row(meta(findings({ census: undefined }))) },
     { name: "an unknown census status", row: () => row(meta(findings({ census: censusFound({ status: "partial" }) }))) },
     { name: "findings with no census error object", row: () => row(meta(findings({ census: { status: "complete", total: 23 } }))) },
@@ -1477,6 +1486,28 @@ describe("AUDITFIX-25 AC07/AC08 (pure): the decoder recognizes exactly a valid v
   it("refuses the same malformed envelopes when they arrive as a legacy string", () => {
     for (const envelope of [findings({ version: 2 }), findings({ teamId: OTHER_TEAM }), findings({ omitted: 0 }), dual(234, 224), findings({ sample: [sampleA(), { ...sampleB(), groupSlug: "g".repeat(97) }] })]) {
       expect(decode(row(JSON.stringify(meta(envelope))))).toBeNull();
+    }
+  });
+
+  it("refuses an EMPTY phase reason on the object and the legacy-string path alike — and ONLY the empty one", () => {
+    // The decoder itself, on a matching failed own-team row. Each envelope is valid with a nonempty
+    // reason and differs from the refused one in that reason alone.
+    const cases: { name: string; make: (reason: string) => Record<string, unknown> }[] = [
+      { name: "lone convergence", make: (reason) => lone(reason) },
+      { name: "lone census, unavailable", make: (reason) => unavailable(reason) },
+      { name: "lone census, findings", make: (reason) => findings({ convergence: { status: "ok" }, census: censusFound({ error: { message: reason, truncated: false } }) }) },
+      { name: "dual, convergence arm", make: (reason) => findings({ convergence: convergenceFailed(reason) }) },
+      { name: "dual, census arm", make: (reason) => findings({ census: censusFailed(reason), sample: [], omitted: null }) },
+    ];
+
+    for (const { name, make } of cases) {
+      // A single space is a reason too: nothing is trimmed.
+      for (const kept of ["x", " "]) {
+        expect(decode(row(meta(make(kept)))), `${name}: a nonempty reason is kept (object)`).toStrictEqual(make(kept));
+        expect(decode(row(JSON.stringify(meta(make(kept))))), `${name}: a nonempty reason is kept (legacy string)`).toStrictEqual(make(kept));
+      }
+      expect(decode(row(meta(make("")))), `${name}: an empty reason is refused (object)`).toBeNull();
+      expect(decode(row(JSON.stringify(meta(make(""))))), `${name}: an empty reason is refused (legacy string)`).toBeNull();
     }
   });
 
