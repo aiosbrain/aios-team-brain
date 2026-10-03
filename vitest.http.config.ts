@@ -37,6 +37,14 @@ process.env.APP_URL ??= `http://127.0.0.1:${process.env.HTTP_TEST_PORT ?? "3010"
 // the URL both the server and clients use). We avoid process.env.BASE_URL: Vite
 // reserves that name and pins it to "/".
 process.env.HTTP_TEST_PORT ??= "3010";
+// AUDITFIX-25: no autonomous poller in the http tier. `next start` inherits this environment through
+// spawn (test/http/global-setup.ts), and a scheduler tick would write its own `ingest_runs` rows over
+// the ledger fixtures the HTML/RSC cases seed. Pinned (not `??=`) so a dev shell exporting any of
+// these cannot re-enable one: instrumentation.ts starts the ingest poller unless the value is exactly
+// "false", lib/graph/scheduler returns on "false", and lib/jobs/scheduler runs only on "true".
+process.env.INGEST_POLL_ENABLED = "false";
+process.env.GRAPH_PROJECT_ENABLED = "false";
+process.env.SOCIAL_JOBS_ENABLED = "false";
 
 export default defineConfig({
   test: {
