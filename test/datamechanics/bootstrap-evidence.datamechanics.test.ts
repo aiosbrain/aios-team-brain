@@ -19,13 +19,27 @@ import type { DbClient } from "@/lib/db/types";
  * Everything here goes producer → real jsonb → reader. Nothing is a fabricated envelope: that is the
  * panel unit file's job (malformed/future/legacy), and the pure builder's budgets get their own file.
  *
- * ⚠️ `lib/access/bootstrap-evidence` does not exist yet and is deliberately NOT imported, statically
- * or otherwise — a missing-module failure would take every existing-behaviour criterion below down
- * with it and hide the substantive reds behind a collection error. The reference shapes and the
- * budget oracle are declared locally from the spec's tables.
+ * The reference shapes and the budget oracle are declared LOCALLY from the spec's tables: expected
+ * values never come from `lib/access/bootstrap-evidence`. That module is imported for exactly two
+ * things, both added once it existed (the checkpointed behavioural reds above predate it and did not
+ * import it, so a missing module could not hide them behind a collection error):
+ *   - its ordinary `buildBootstrapEvidence` export, wrapped PASS-THROUGH, so one criterion can make
+ *     the real builder genuinely throw and pin the caller's third guard — no production fault flag;
+ *   - its real `decodeBootstrapEvidence`, applied to rows the real reader returned.
  */
 
-const real = vi.hoisted(() => ({ groups: null as null | typeof import("@/lib/access/groups") }));
+const real = vi.hoisted(() => ({
+  groups: null as null | typeof import("@/lib/access/groups"),
+  evidence: null as null | typeof import("@/lib/access/bootstrap-evidence"),
+}));
+
+// PASS-THROUGH as well: the REAL builder runs for every team unless the builder-fault criteria
+// override it. The extractor and the decoder are never replaced.
+vi.mock("@/lib/access/bootstrap-evidence", async (orig) => {
+  const actual = await orig<typeof import("@/lib/access/bootstrap-evidence")>();
+  real.evidence = actual;
+  return { ...actual, buildBootstrapEvidence: vi.fn(actual.buildBootstrapEvidence) };
+});
 
 // PASS-THROUGH wrappers, not stubs: both run the real implementation unless one criterion overrides
 // them for ONE team. They exist for the two shapes no database fault can produce — a returned result
@@ -47,12 +61,15 @@ import { listRecentIngestRuns } from "@/lib/ingest/runs";
 import { getPipelineHealth } from "@/lib/ingest/pipeline-health";
 import { legDetail, RAW_ERROR_CLIP } from "@/lib/ingest/leg-detail";
 import { IngestRunsPanel } from "@/components/admin/ingest-runs-panel";
+import { buildBootstrapEvidence, decodeBootstrapEvidence } from "@/lib/access/bootstrap-evidence";
 
 afterEach(() => {
   vi.mocked(ensureBuiltins).mockReset();
   vi.mocked(ensureBuiltins).mockImplementation(real.groups!.ensureBuiltins);
   vi.mocked(censusTeamSystemEdges).mockReset();
   vi.mocked(censusTeamSystemEdges).mockImplementation(real.groups!.censusTeamSystemEdges);
+  vi.mocked(buildBootstrapEvidence).mockReset();
+  vi.mocked(buildBootstrapEvidence).mockImplementation(real.evidence!.buildBootstrapEvidence);
 });
 
 // ── Reference contract (spec §Typed contract and budgets) ────────────────────────────────────────
@@ -1231,6 +1248,169 @@ describe("AUDITFIX-25 AC06: ledger compatibility and the NULL-team privacy bound
   });
 });
 
+// ── AC06: the caller's THIRD guard ───────────────────────────────────────────────────────────────
+//
+// A GENUINE builder fault: the module's ordinary `buildBootstrapEvidence` export throws, through a
+// normal module mock — no production fault flag, no injected callback. This is not safe extraction
+// (above), which keeps normal evidence; here there is NO evidence, and what must survive is the
+// phase/count failure itself, the healthy teams' green, and every team after the faulted one.
+// Removing the guard around the builder in `ensureAccessBootstrapAllTeams` lets the throw escape the
+// team loop: the leg rejects, the remaining teams never report, and one fleet-level row is written.
+
+describe("AUDITFIX-25 AC06: a genuine evidence-builder fault keeps the failure, drops the evidence, and aborts nothing", () => {
+  const BUILDER_FAULT = "BUILDER-FAULT-TEXT";
+  const ASCII = /^[\x20-\x7e]+$/;
+
+  /** The real builder for everyone except `teamIds` (or for no one, when `teamIds` is "every"). */
+  function faultBuilder(teamIds: readonly string[] | "every"): void {
+    vi.mocked(buildBootstrapEvidence).mockImplementation((input) => {
+      if (teamIds === "every" || teamIds.includes(input.teamId)) throw new TypeError(BUILDER_FAULT);
+      return real.evidence!.buildBootstrapEvidence(input);
+    });
+  }
+
+  /** The capture pass and the leg pass of one tick, over the WHOLE fleet. */
+  async function fleetTick(client: DbClient) {
+    const outcomes: Outcome[] = [];
+    const summary = await ensureAccessBootstrapAllTeams(client, {
+      onOutcome: (o) => {
+        outcomes.push(o as Outcome);
+      },
+    });
+    vi.mocked(ensureBuiltins).mockClear();
+    const since = await watermark();
+    await expect(runAccessBootstrapLeg(client), "a builder fault is never a fleet throw").resolves.toBeUndefined();
+    const globals = await globalRowsSince(since);
+    const order = vi.mocked(ensureBuiltins).mock.calls.map((c) => c[1]);
+    return { outcomes, summary, globals, order };
+  }
+
+  it("both phases failing with findings: the fixed phase/count error, NO evidence, and a later team still lands its own evidence", async () => {
+    const before = await bareTeam();
+    const target = await bareTeam();
+    const after = await bareTeam();
+    const externalShared = await projectId(target, EXTERNAL_SHARED_SLUG);
+    for (const slug of ["fault-marker-a", "fault-marker-b", "fault-marker-c"]) {
+      await plant(target, externalShared, await ordinaryGroup(target, slug));
+    }
+    await wedgeGeneral(target);
+    const vendors = await ordinaryGroup(after, "vendors");
+    await plant(after, await projectId(after, GENERAL_SLUG), vendors);
+    const FALLBACK =
+      "census: 3 unsanctioned edge(s) on system projects (evidence unavailable); convergence: failed (evidence unavailable)";
+    faultBuilder([target.teamId]);
+
+    const { outcomes, summary, globals, order } = await fleetTick(db());
+
+    // The fault was genuine and was reached: the real export was called for this team, with the RAW
+    // phase results, and threw.
+    const faulted = vi.mocked(buildBootstrapEvidence).mock.calls.map((c) => c[0]).filter((i) => i.teamId === target.teamId);
+    expect(faulted.length, "the builder was called for the faulted team on both passes").toBe(2);
+    expect(faulted[0].convergence, "with the full, unlabelled convergence message").toEqual({ status: "failed", message: WEDGE_ERROR });
+    expect(faulted[0].census.status).toBe("complete");
+    expect((faulted[0].census as { edges: RawEdge[] }).edges, "and the raw findings — not a summary").toHaveLength(3);
+
+    // The OUTCOME: failed, the fixed named phases and the exact count, and no evidence key at all.
+    const outcome = outcomes.find((o) => o.teamId === target.teamId);
+    expect(outcome).toStrictEqual({ teamId: target.teamId, ok: false, error: FALLBACK });
+    expect(summary.failed.find((f) => f.teamId === target.teamId)?.error).toBe(FALLBACK);
+    expect(FALLBACK, "fixed ASCII").toMatch(ASCII);
+    expect(bytes(FALLBACK)).toBeLessThanOrEqual(BUDGET.compoundBytes);
+
+    // The ROW: one failed scheduler row, one error contribution, no metadata.
+    const rows = await teamRows(target.teamId);
+    expect(rows, "the faulted team still lands exactly one row").toHaveLength(1);
+    expect(rows[0].ok).toBe(false);
+    expect(rows[0].trigger).toBe("scheduler");
+    expect(rows[0].error_count).toBe(1);
+    expect(errorsOf(rows[0])).toEqual([FALLBACK]);
+    expect(metaOf(rows[0]), "no envelope — not a malformed one").toEqual({});
+    const stored = JSON.stringify({ errors: errorsOf(rows[0]), meta: metaOf(rows[0]), globals: globals.map((r) => ({ errors: errorsOf(r), meta: metaOf(r) })) });
+    for (const leak of [BUILDER_FAULT, "fault-marker", "refusing to adopt"]) {
+      expect(stored, `the fallback formats nothing: '${leak}'`).not.toContain(leak);
+    }
+
+    // The fleet went on: the clean team is green, and the failing one AFTER it has normal evidence.
+    const cleanRows = await teamRows(before.teamId);
+    expect(cleanRows).toHaveLength(1);
+    expect(cleanRows[0].ok).toBe(true);
+    expect(metaOf(cleanRows[0])).toEqual({});
+    const laterRows = await teamRows(after.teamId);
+    expect(laterRows, "the other failing team lands its own row").toHaveLength(1);
+    expect(expectEnvelopeInvariants(laterRows[0], after.teamId).sample.map((s) => s.groupId)).toEqual([vendors]);
+    expect(globals.map((r) => r.source), "and nothing is promoted to a fleet-level failure").toEqual(["access_bootstrap_all"]);
+    expect(globals[0].ok).toBe(true);
+
+    // Legacy-readable: the actual reader, decoder and panel show the error and no disclosure.
+    const { runs, html, blocks } = await panelFor(target.teamId);
+    const own = runs.filter((r) => r.source === "access_bootstrap" && r.team_id === target.teamId);
+    expect(own).toHaveLength(1);
+    expect(decodeBootstrapEvidence(own[0]), "there is nothing to decode").toBeNull();
+    expect(blocks, "and nothing to disclose").toEqual([]);
+    expect(html).toContain("failed (1)");
+    expect(html).toContain(escapeHtml(FALLBACK.slice(0, 120)));
+    expect(html).toContain(`title="${escapeHtml(FALLBACK)}"`);
+
+    // Fixture precondition, checked LAST (as the extraction criteria do): "later progress" needs a
+    // team converged after the faulted one.
+    expect(order.indexOf(target.teamId), "fixture: a team is converged after the faulted one").toBeLessThan(order.length - 1);
+  });
+
+  it("the builder faulting for EVERY team: a healthy team stays green, and each failing phase keeps its fixed name", async () => {
+    const healthy = await bareTeam();
+    const unread = await bareTeam();
+    const wedged = await bareTeam();
+    await wedgeGeneral(wedged);
+    faultBuilder("every");
+
+    const { outcomes, summary, globals } = await fleetTick(intercept([censusReturns(unread.teamId, "census exploded")]));
+
+    // A formatting fault must not convert a healthy result into a failure.
+    expect(outcomes.find((o) => o.teamId === healthy.teamId), "exactly the clean outcome").toStrictEqual({ teamId: healthy.teamId, ok: true });
+    expect(summary.failed.some((f) => f.teamId === healthy.teamId)).toBe(false);
+    const healthyRows = await teamRows(healthy.teamId);
+    expect(healthyRows).toHaveLength(1);
+    expect(healthyRows[0].ok, "a healthy team is not reddened by the formatter").toBe(true);
+    expect(healthyRows[0].error_count).toBe(0);
+    expect(errorsOf(healthyRows[0])).toEqual([]);
+    expect(metaOf(healthyRows[0])).toEqual({});
+
+    // An unreadable census is UNAVAILABLE in the fallback too — never a count, never zero.
+    expect(outcomes.find((o) => o.teamId === unread.teamId)).toStrictEqual({
+      teamId: unread.teamId,
+      ok: false,
+      error: "census: unavailable (evidence unavailable)",
+    });
+    const unreadRows = await teamRows(unread.teamId);
+    expect(unreadRows).toHaveLength(1);
+    expect(unreadRows[0].ok).toBe(false);
+    expect(errorsOf(unreadRows[0])).toEqual(["census: unavailable (evidence unavailable)"]);
+    expect(metaOf(unreadRows[0])).toEqual({});
+
+    // A lone convergence failure with a clean census names convergence alone.
+    expect(outcomes.find((o) => o.teamId === wedged.teamId)).toStrictEqual({
+      teamId: wedged.teamId,
+      ok: false,
+      error: "convergence: failed (evidence unavailable)",
+    });
+    const wedgedRows = await teamRows(wedged.teamId);
+    expect(wedgedRows).toHaveLength(1);
+    expect(wedgedRows[0].ok).toBe(false);
+    expect(errorsOf(wedgedRows[0])).toEqual(["convergence: failed (evidence unavailable)"]);
+    expect(metaOf(wedgedRows[0])).toEqual({});
+
+    // Every team faulted and every team still reported, so the loop survived each fault — whatever
+    // order the teams were read in.
+    const called = new Set(vi.mocked(buildBootstrapEvidence).mock.calls.map((c) => c[0].teamId));
+    for (const seed of [healthy, unread, wedged]) expect(called.has(seed.teamId), "the builder was reached for every team").toBe(true);
+    expect(globals.map((r) => r.source), "and no fleet-level failure was written").toEqual(["access_bootstrap_all"]);
+    const stored = JSON.stringify([...healthyRows, ...unreadRows, ...wedgedRows].map((r) => ({ errors: errorsOf(r), meta: metaOf(r) })));
+    for (const leak of [BUILDER_FAULT, "census exploded", "refusing to adopt"]) {
+      expect(stored, `the fallback formats nothing: '${leak}'`).not.toContain(leak);
+    }
+  });
+});
+
 // ── AC07 / AC08 ──────────────────────────────────────────────────────────────────────────────────
 
 describe("AUDITFIX-25 AC07: the real own-team-plus-NULL reader isolates evidence by team", () => {
@@ -1364,6 +1544,50 @@ describe("AUDITFIX-25 AC08: every normal state round-trips producer → jsonb �
     if (ids.length > 0 && e.sample.some((s) => s.groupSlug.includes("<img"))) {
       expect(blocks[0].html, "the hostile label is present, escaped").toContain("&lt;img src=x onerror=");
     }
+  });
+
+  // The DECODER, directly: the panel assertions above would also pass for a decoder that returned a
+  // differently-shaped projection the panel happened to render. This pins identity — what the real
+  // producer stored is exactly what the real decoder returns for the real reader's row — and the
+  // row-scope refusals on those same produced rows, rather than on fabricated envelopes.
+  it.each(states)("$name — the ACTUAL decoder returns exactly the stored envelope for the reader's row", async ({ build }) => {
+    const { seed, client } = await build();
+    const stranger = await bareTeam();
+    const t = await tick(client, seed.teamId);
+    const stored = expectEnvelopeInvariants(t.row, seed.teamId);
+
+    const runs = await listRecentIngestRuns(db(), seed.teamId, 30);
+    const own = runs.filter((r) => r.source === "access_bootstrap" && r.team_id === seed.teamId);
+    expect(own, "the reader returns this team's one failed row").toHaveLength(1);
+
+    const decoded = decodeBootstrapEvidence(own[0]);
+    expect(decoded, "producer → jsonb → reader → decoder is an identity on the envelope").toStrictEqual(stored);
+    expect(decoded, "and it is what the producer handed its callback").toEqual(t.outcome!.evidence);
+    // The legacy JSON-string form of the SAME stored metadata decodes identically.
+    const asString = typeof own[0].meta === "string" ? own[0].meta : JSON.stringify(own[0].meta);
+    expect(decodeBootstrapEvidence({ ...own[0], meta: asString })).toStrictEqual(stored);
+
+    // Row scope, on the real row: the same metadata is not evidence anywhere else.
+    expect(decodeBootstrapEvidence({ ...own[0], team_id: stranger.teamId }), "another team's row").toBeNull();
+    expect(decodeBootstrapEvidence({ ...own[0], team_id: null }), "a NULL-team row").toBeNull();
+    expect(decodeBootstrapEvidence({ ...own[0], ok: true }), "an ok row").toBeNull();
+    expect(decodeBootstrapEvidence({ ...own[0], source: "access_bootstrap_all" }), "the liveness source").toBeNull();
+    // …and no other row the reader merged in decodes to anything.
+    for (const other of runs.filter((r) => r !== own[0])) {
+      expect(decodeBootstrapEvidence(other), `row ${other.id} (${other.source}) carries no evidence`).toBeNull();
+    }
+  });
+
+  it("a clean team's row carries nothing for the decoder or the panel", async () => {
+    const seed = await bareTeam();
+    await tick(db(), seed.teamId);
+
+    const { runs, blocks } = await panelFor(seed.teamId);
+    const own = runs.filter((r) => r.source === "access_bootstrap" && r.team_id === seed.teamId);
+    expect(own).toHaveLength(1);
+    expect(own[0].ok).toBe(true);
+    expect(decodeBootstrapEvidence(own[0]), "healthy means no evidence").toBeNull();
+    expect(blocks).toEqual([]);
   });
 });
 

@@ -5,10 +5,10 @@ import { buildBootstrapEvidence, decodeBootstrapEvidence, extractBootstrapFailur
  * AUDITFIX-25 (AIO-1062) — accepted spec v3.2, the PURE half: the typed builder, the guarded message
  * extraction and the fail-closed decoder. No database, no ledger, no panel.
  *
- * ⚠️ `lib/access/bootstrap-evidence` does not exist yet and this file imports it STATICALLY, on
- * purpose. Until the module lands the whole file is a missing-module COLLECTION red. That red is
- * recorded separately from the behavioural reds the page/panel unit files and the real-ledger file
- * already produce — those deliberately do not import the module, so this file cannot take them down.
+ * ⚠️ This file imports `lib/access/bootstrap-evidence` STATICALLY, on purpose, and was written
+ * before that module existed: until it landed the whole file was a missing-module COLLECTION red.
+ * That red was recorded separately from the behavioural reds of the page/panel unit files and the
+ * real-ledger file — and it executed no case, so it is not evidence that any expectation below held.
  *
  * Expected values are the spec's literal contracts: spelled-out strings, byte counts from its budget
  * list, and tables transcribed from its state/extraction tables. The helpers below only MEASURE (UTF-8
@@ -426,6 +426,49 @@ describe("AUDITFIX-25 AC05 (pure): the sample is the first 16 by FULL normalized
       "zz-groups→a",
       "zz-groups→b",
     ]);
+  });
+
+  it("orders by UTF-16 CODE UNITS — JavaScript's own string comparison — not by Unicode scalar value", () => {
+    // U+10000 is the surrogate pair D800 DC00; U+E000 is the single unit E000. JavaScript's `<`
+    // compares code units, so the ASTRAL character sorts FIRST (0xD800 < 0xE000); a code-point (or
+    // UTF-8 byte) comparison puts U+E000 first. The ASCII and U+FFFD fixtures around this one cannot
+    // tell the two apart. Built from code points so the source carries neither character literally.
+    const ASTRAL = String.fromCodePoint(0x10000);
+    const BMP = String.fromCodePoint(0xe000);
+    expect(ASTRAL < BMP, "fixture: JavaScript orders the pair before U+E000").toBe(true);
+    expect(ASTRAL.codePointAt(0)! > BMP.codePointAt(0)!, "fixture: scalar-value order is the reverse").toBe(true);
+    expect(ASTRAL.isWellFormed() && BMP.isWellFormed(), "fixture: normalization touches neither").toBe(true);
+    // IDs ascend AGAINST the wanted order, so neither arrival order nor an ID-first comparison passes.
+    const edges: Edge[] = [
+      { projectId: pid(1), projectSlug: `sys-${BMP}`, groupId: gid(1), groupSlug: "g" },
+      { projectId: pid(2), projectSlug: `sys-${ASTRAL}`, groupId: gid(2), groupSlug: "g" },
+      { projectId: pid(3), projectSlug: "zz", groupId: gid(3), groupSlug: `grp-${BMP}` },
+      { projectId: pid(4), projectSlug: "zz", groupId: gid(4), groupSlug: `grp-${ASTRAL}` },
+    ];
+    const want = [
+      [pid(2), gid(2)],
+      [pid(1), gid(1)],
+      [pid(4), gid(4)],
+      [pid(3), gid(3)],
+    ];
+
+    const forward = failed(loneCensus(edges));
+    const reversed = failed(loneCensus([...edges].reverse()));
+
+    expect(forward.evidence.sample.map((s) => [s.projectId, s.groupId]), "the project slug decides, by code unit").toEqual(want);
+    expect(reversed.evidence.sample.map((s) => [s.projectId, s.groupId]), "whatever order the edges arrive in").toEqual(want);
+    expect(reversed).toStrictEqual(forward);
+    // The valid pair is preserved — ordered by its units, never split or replaced — and the summary
+    // names the pairs in that same order.
+    expect(forward.evidence.sample.map((s) => `${s.projectSlug}→${s.groupSlug}`)).toEqual([
+      `sys-${ASTRAL}→g`,
+      `sys-${BMP}→g`,
+      `zz→grp-${ASTRAL}`,
+      `zz→grp-${BMP}`,
+    ]);
+    expect(forward.error).toBe(
+      `census: 4 unsanctioned edge(s) on system projects: sys-${ASTRAL}→g, sys-${BMP}→g, zz→grp-${ASTRAL}, zz→grp-${BMP}`
+    );
   });
 
   it("slugs are normalized BEFORE they are ordered", () => {

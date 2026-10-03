@@ -3,6 +3,11 @@ import type { DbClient } from "@/lib/db/types";
 import { recordIngestRun } from "@/lib/ingest/runs";
 import { ensureAccessBootstrapAllTeams } from "@/lib/access/bootstrap";
 
+/** AUDITFIX-25: the only failure text this leg writes to a `team_id is null` row — see the two
+ *  fleet-level writes below for why it is fixed rather than forwarded. */
+const GLOBAL_READ_FAILURE = "teams read failed";
+const GLOBAL_THROW = "bootstrap threw";
+
 /**
  * AUDITFIX-22 — the `access_bootstrap` ingest leg, extracted from the scheduler closure so the
  * ledger contract is testable against a real Postgres instead of only reachable by starting a
@@ -63,6 +68,12 @@ export async function runAccessBootstrapLeg(
     // The per-team row is written by this callback as each team COMPLETES, not from the returned
     // summary after the loop: a summary cannot be recorded until the last team finishes, so one slow
     // team would delay every team's row and a process death would lose all of them.
+    //
+    // AUDITFIX-25: a failed outcome's typed evidence rides on that SAME row, under its one namespaced
+    // key and nothing else — the outcome's evidence is already bounded (≤ 8,192 serialized bytes) and
+    // JSON-safe, and its labelled error (≤ 480 bytes) sits inside the writer's 500-character clamp, so
+    // neither is cut or re-bounded here. A clean team, and a failed one whose evidence could not be
+    // built, write no metadata at all.
     const r = await ensureAccessBootstrapAllTeams(db, {
       onOutcome: async (o) => {
         await recordIngestRun(db, {
@@ -72,6 +83,7 @@ export async function runAccessBootstrapLeg(
           ok: o.ok,
           created: 0,
           errors: o.ok ? undefined : [o.error ?? "unknown"],
+          meta: o.evidence ? { accessBootstrapEvidence: o.evidence } : undefined,
           startedAt,
         });
       },
@@ -110,7 +122,11 @@ export async function runAccessBootstrapLeg(
         trigger: "scheduler",
         ok: !globalFailure,
         created: 0,
-        errors: globalFailure ? [globalFailure.error] : undefined,
+        // AUDITFIX-25: the FIXED reason, not `globalFailure.error`. A `team_id is null` row is merged
+        // into EVERY team's Recent-runs reader (`listRecentIngestRuns`), and the adapter text the
+        // wrapper returns can name another tenant — so these rows carry aggregate counts and a fixed
+        // named reason only. The detail stays in the server-side diagnostics.
+        errors: globalFailure ? [GLOBAL_READ_FAILURE] : undefined,
         meta: { teams: r.teams, failedTeams: r.failed.length },
         startedAt,
       });
@@ -124,13 +140,18 @@ export async function runAccessBootstrapLeg(
       // reached this stage (LIVENESS — `ok:true` for the same no-double-count reason as above, with
       // the throw in `meta`), and the source-`access_bootstrap` row is the fleet-level FAILURE that
       // AUDITFIX-22's AC5 depends on.
+      //
+      // AUDITFIX-25: neither carries `err.message`. Both are `team_id is null` rows every team's
+      // reader merges in, and a thrown message is arbitrary text (it can name a tenant), so each
+      // records the fixed reason. The throw itself is still rethrown below, untouched, for the
+      // scheduler's own console line.
       await recordIngestRun(db, {
         teamId: null,
         source: "access_bootstrap_all",
         trigger: "scheduler",
         ok: true,
         created: 0,
-        meta: { fleetOk: false, threw: err instanceof Error ? err.message : "bootstrap threw" },
+        meta: { fleetOk: false, threw: GLOBAL_THROW },
         startedAt,
       });
       await recordIngestRun(db, {
@@ -139,7 +160,7 @@ export async function runAccessBootstrapLeg(
         trigger: "scheduler",
         ok: false,
         created: 0,
-        errors: [err instanceof Error ? err.message : "bootstrap threw"],
+        errors: [GLOBAL_THROW],
         startedAt,
       });
     } catch {
