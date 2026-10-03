@@ -11,7 +11,14 @@ import {
   grantProjectToGroup,
   type WriteResult,
 } from "@/lib/access/groups";
-import { describeUnsanctionedEdges } from "@/lib/access/system-projects";
+import {
+  buildBootstrapEvidence,
+  extractBootstrapFailureMessage,
+  type AccessBootstrapEvidence,
+  type BuiltBootstrapEvidence,
+  type CapturedCensus,
+  type CapturedConvergence,
+} from "@/lib/access/bootstrap-evidence";
 
 
 /**
@@ -155,7 +162,33 @@ export async function ensureAccessBootstrap(db: DbClient, teamId: string): Promi
 export interface TeamBootstrapOutcome {
   teamId: string;
   ok: boolean;
+  /** AUDITFIX-25: on failure, the labelled compound `census: …; convergence: …` — only the failing
+   *  arms, census first, at most 480 UTF-8 bytes. */
   error?: string;
+  /** AUDITFIX-25: the typed, bounded evidence behind `error`. Present on a failed outcome unless the
+   *  evidence BUILDER itself faulted; never present on an ok one. */
+  evidence?: AccessBootstrapEvidence;
+}
+
+/**
+ * AUDITFIX-25 — what a team's outcome says when the evidence builder ITSELF threw. Fixed ASCII, no
+ * evidence, and built from nothing but the captured phase states: which phases failed and, for a
+ * completed census, how many findings. It must stay this dumb — it runs exactly when formatting is
+ * what broke, so it may not format anything.
+ *
+ * A wholly clean state stays `ok`: a formatting fault must never turn a healthy team red.
+ */
+function evidenceUnavailable(
+  convergence: CapturedConvergence,
+  census: CapturedCensus
+): { ok: true } | { ok: false; error: string } {
+  const arms: string[] = [];
+  if (census.status === "failed") arms.push("census: unavailable (evidence unavailable)");
+  else if (census.edges.length > 0) {
+    arms.push(`census: ${census.edges.length} unsanctioned edge(s) on system projects (evidence unavailable)`);
+  }
+  if (convergence.status === "failed") arms.push("convergence: failed (evidence unavailable)");
+  return arms.length > 0 ? { ok: false, error: arms.join("; ") } : { ok: true };
 }
 
 /**
@@ -190,36 +223,52 @@ export async function ensureAccessBootstrapAllTeams(
     // skip the census on a throw, which is the loudest case going silent. The census has its own guard
     // for the same reason — the adapter can throw (an unknown embed does), and a throw escaping here
     // would abort every REMAINING team and land as one fleet-level row.
-    let convergenceError: string | null = null;
+    //
+    // AUDITFIX-25: each phase is CAPTURED RAW — its status, plus the full message or the full finding
+    // list — and nothing is summarized, merged or truncated here; the evidence builder owns every
+    // bound. The WHOLE returned result / thrown value goes to the extractor rather than a `.error` /
+    // `.message` read in place: those can be throwing accessors, and a read inside these `catch`
+    // blocks would escape the team's guard and abort every team after it. An unusable message becomes
+    // a fixed fallback, never an empty string (which is falsy and used to turn a failed phase green).
+    let convergence: CapturedConvergence = { status: "ok" };
     try {
       const r = await ensureAccessBootstrap(db, t.id);
-      if (!r.ok) convergenceError = r.error ?? "unknown";
+      if (!r.ok) {
+        convergence = { status: "failed", message: extractBootstrapFailureMessage("convergence", { kind: "returned", result: r }) };
+      }
     } catch (e) {
-      convergenceError = e instanceof Error ? e.message : "threw";
+      convergence = { status: "failed", message: extractBootstrapFailureMessage("convergence", { kind: "thrown", value: e }) };
     }
 
-    let censusError: string | null = null;
+    let census: CapturedCensus;
     try {
-      const census = await censusTeamSystemEdges(db, t.id);
-      // The writer already prefixes its own read failures; do not double-prefix them below.
-      if (!census.ok) censusError = (census.error ?? "system-edge census failed").replace(/^system-edge census /, "");
-      else if (census.edges.length > 0) censusError = describeUnsanctionedEdges(census.edges);
+      const result = await censusTeamSystemEdges(db, t.id);
+      // A result that is not ok — or claims ok without an edge list — determined nothing. That is
+      // UNAVAILABLE, never "zero findings".
+      census =
+        result.ok && Array.isArray(result.edges)
+          ? { status: "complete", edges: result.edges }
+          : { status: "failed", message: extractBootstrapFailureMessage("census", { kind: "returned", result }) };
     } catch (e) {
-      censusError = `system-edge census threw: ${e instanceof Error ? e.message : "threw"}`;
+      census = { status: "failed", message: extractBootstrapFailureMessage("census", { kind: "thrown", value: e }) };
     }
 
-    // The census finding goes FIRST when both are present: it is the fact no other surface reports,
-    // while a wedged team also reds its `context_backfill` leg (backfillTeamContext re-runs bootstrap
-    // and returns before any item). The labelled compound that carries BOTH is AUDITFIX-25 — its seam
-    // is untestable until the census truncation moves into the formatter (spec round 3 B1).
-    const error = censusError ? `census: ${censusError}` : convergenceError;
-    let outcome: TeamBootstrapOutcome;
-    if (error) {
-      failed.push({ teamId: t.id, error });
-      outcome = { teamId: t.id, ok: false, error };
-    } else {
-      outcome = { teamId: t.id, ok: true };
+    // BOTH arms survive: the labelled compound is `census: …; convergence: …`, each arm with its own
+    // budget, where a census finding used to REPLACE a simultaneous convergence failure. The census
+    // arm still goes first — it is the fact no other surface reports, while a wedged team also reds
+    // its `context_backfill` leg (backfillTeamContext re-runs bootstrap and returns before any item).
+    //
+    // The THIRD guard, separate from both phases above. Building the evidence is formatting; a fault
+    // in it may not abort the remaining teams, may not turn a healthy team red, and may not erase a
+    // failure either — so the fallback keeps the failing phases and the finding count, without evidence.
+    let built: BuiltBootstrapEvidence | { ok: false; error: string };
+    try {
+      built = buildBootstrapEvidence({ teamId: t.id, convergence, census });
+    } catch {
+      built = evidenceUnavailable(convergence, census);
     }
+    const outcome: TeamBootstrapOutcome = { teamId: t.id, ...built };
+    if (!built.ok) failed.push({ teamId: t.id, error: built.error });
     if (opts.onOutcome) {
       try {
         await opts.onOutcome(outcome);

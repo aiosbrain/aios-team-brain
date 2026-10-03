@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { adminClient } from "@/lib/db/admin";
 import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
+import { canAccessAdmin } from "@/lib/auth/admin-access";
 import { listIntegrations } from "@/lib/integrations/read";
 import { IntegrationsManager, type IntegrationRow } from "@/components/admin/integrations-manager";
 import { GithubReposPanel } from "@/components/admin/github-repos-panel";
@@ -24,16 +25,18 @@ export const metadata: Metadata = { title: "Integrations" };
 
 /**
  * Admin → Integrations. Manage ingestion integrations (type + non-secret selection + an
- * encrypted secret). The /admin subtree is admin-gated by the layout; this page ALSO resolves the
- * viewer's role and passes it to `listIntegrations`, which gates on it — the read is admin-tier
- * and there is no RLS backstop on postgres (CLAUDE.md §5), so the gate is defense-in-depth here
- * and the sole enforcement in the helper. The secret value is never sent to the browser (only
- * `hasSecret`). The sidecar pulls enabled selections via GET /api/v1/integrations.
+ * encrypted secret). The /admin subtree is admin-gated by the layout, but a layout is not a
+ * boundary for its nested segments, so this page admits the viewer itself (`canAccessAdmin` on the
+ * membership-derived posture) BEFORE any elevated read. It ALSO passes the viewer's role to
+ * `listIntegrations`, which gates on it — the read is admin-tier and there is no RLS backstop on
+ * postgres (CLAUDE.md §5), so that gate is defense-in-depth here and the sole enforcement in the
+ * helper. The secret value is never sent to the browser (only `hasSecret`). The sidecar pulls
+ * enabled selections via GET /api/v1/integrations.
  */
 export default async function IntegrationsPage({ params }: { params: Promise<{ team: string }> }) {
   const { team: teamSlug } = await params;
 
-  // Resolve the viewer's role on this team for the read gate (the layout already blocks non-admins).
+  // Resolve the viewer's ACTIVE membership on this team for the page gate and the read gate.
   const sessionDb = await serverClient();
   const user = await getSessionUser();
   const { data: team } = await sessionDb
@@ -55,18 +58,27 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
     : { data: null };
 
   const db = adminClient();
+  // PRET-4 §1a: posture, membership-derived — never the stored `members.tier`. Resolved ONCE, ahead
+  // of every read below, and shared by the gate and the freshness read.
+  const posture = me
+    ? await (await import("@/lib/access/posture")).resolveViewerPosture(db, team.id, (me as { id: string }).id)
+    : "external";
+
+  // AUDITFIX-25: the page admits the viewer ITSELF, before any elevated read starts. The layout's
+  // "Admins only" swap is not a boundary — a layout that hides its children does not stop this segment
+  // from running or from appearing in the RSC payload (a targeted segment request skips the layout
+  // entirely) — and the ledger rows read below carry a team's structured bootstrap evidence. Same gate
+  // as the layout (admin role AND unrestricted posture, failing closed on a missing membership or an
+  // unknown posture). Denial is the bare `null` leaf: the layout's copy stays the only denial UX.
+  if (!canAccessAdmin({ role: (me as { role?: string | null } | null)?.role, tier: posture })) return null;
+
   const [integrations, ingestRuns, pipelineHealth, freshness, retrievalHealth] = await Promise.all([
     listIntegrations(db, team.id, { role: me?.role as string | undefined }) as Promise<IntegrationRow[]>,
     listRecentIngestRuns(db, team.id, 30),
     getPipelineHealth(team.id),
     // Already-scanned repos (from codebase scans) → offered as one-click link suggestions. Read
     // through the tier-gated codebases choke point (CLAUDE.md §5), never the table directly.
-    getCodebaseFreshness(
-      db,
-      team.id,
-      // PRET-4 §1a: posture, membership-derived.
-      me ? await (await import("@/lib/access/posture")).resolveViewerPosture(db, team.id, (me as { id: string }).id) : "external"
-    ),
+    getCodebaseFreshness(db, team.id, posture),
     getRetrievalHealth(team.id),
   ]);
   const githubIntegration = integrations.find((i) => i.type === "github") ?? null;
