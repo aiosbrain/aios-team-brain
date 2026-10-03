@@ -6,7 +6,7 @@ safety: true
 ---
 # AUDITFIX-25 — bounded bootstrap evidence and admin disclosure
 
-Version: v2.1, proposed; readiness wording clarified after v2.0 adjudication, not implementation or acceptance.
+Version: v3.1, proposed; round-2 adjudication wording aligned, not implementation or acceptance.
 Brain row: AUDITFIX-25. Linear: AIO-1062, read-back verified In Progress.
 Ticket: https://linear.app/je4light/issue/AIO-1062/split-out-of-auditfix-23-on-2026-08-24-at-spec-round-3s-high-5-the
 Base: origin/staging `283e68bc10f668df3123513583afce9c2de8713a`.
@@ -26,6 +26,9 @@ bounded, explicitly sampled finding envelope. Show that envelope alongside the e
 Integrations → Recent ingestion runs panel. This is a diagnostic read surface, without repair actions.
 The old ticket's lost-row-at-cardinality claim is a hypothesis, not a reproduced production incident.
 This change bounds its own serialized metadata before the best-effort writer receives it.
+Literal exhaustive ledger names are deliberately replaced by bounded structured samples plus exact full
+counts, the ticket's expressly allowed bounding alternative. Complete enumeration remains an authorized
+read-only administrative procedure documented below; no unbounded ledger/export endpoint is promised.
 
 ## Dependencies and build-with
 
@@ -72,6 +75,20 @@ sample: [{ projectId: UUID, groupId: UUID, projectSlug: string, groupSlug: strin
 omitted: integer | null
 ```
 
+| Convergence | Census | Outcome/evidence | Required errors |
+| --- | --- | --- | --- |
+| ok | complete, total=0 | ok, no evidence | none |
+| failed | complete, total=0 | failed, evidence, omitted=0/sample=[] | convergence only |
+| ok | complete, total>0 | failed, evidence, omitted=total-sample.length | census summary only |
+| failed | complete, total>0 | failed, evidence, omitted=total-sample.length | convergence and census summary |
+| either | failed, total=null | failed, evidence, omitted=null/sample=[] | census reason; convergence iff failed |
+
+Each emitted failing phase requires its error object, including census.status=complete with findings.
+Clean phases omit error. The byte wrapper is exactly `{"accessBootstrapEvidence": envelope}`, including
+key/braces, not only its value. Metadata can arrive as an object or legacy JSON string: reject a string
+above 8,192 UTF-8 bytes before parsing; bounded parse failures fail closed. Project only known validated
+fields from objects, with array/type/length checks before iteration; do not serialize arbitrary unknown meta.
+
 A completed census reports the exact full finding count, including zero. Its omitted count equals
 total minus sample.length. A returned census read failure or census throw reports total/omitted null,
 sample empty, and a named bounded error: unavailable evidence is never represented as zero findings.
@@ -83,7 +100,8 @@ Budgets are finite application presentation budgets, not database capacity estim
 
 - Maximum recorded metadata: **8,192 UTF-8 bytes of actual JSON.stringify of the entire namespace object**.
 - Maximum sample: **16 edges**; every display slug: **96 UTF-8 bytes**, including any truncation cue.
-- Both failing phases: **224 UTF-8 bytes per arm**, including its truncation cue.
+- Both failing phases: **reserve 224 UTF-8 bytes per arm**, including its truncation cue; unused budget
+  is redistributed below, without letting a long arm erase the other's reservation.
 - A lone failing phase uses the **480-byte total minus its label**: census 472, convergence 467 bytes.
 - The single compound ledger error: **480 UTF-8 bytes**, including reserved labels/separators.
 
@@ -111,15 +129,23 @@ their named phase reason. Reserve labels and
 independent arm budgets before assembling `census: …; convergence: …` when both fail. A single failure
 also stays named and can use its otherwise unused compound budget; persist that same contextual message
 and truncation flag in evidence. Real adoption-refusal guidance that fits a lone arm remains untruncated.
-The census arm remains first; neither arm consumes the other's guaranteed dual-failure budget. The final string
+The census arm remains first; neither arm consumes the other's guaranteed dual-failure budget. For dual
+failures, start allocations at min(normalized full-message bytes,224); from the remaining 457 message
+bytes, extend census toward its full length first, then convergence. Truncation cues count within these
+allocations. A short census leaves room for the realistic adoption-refusal repair suffix. The final string
 fits the existing 500-JavaScript-character writer clamp, and remains one error/error_count contribution.
-Two 224-byte arms plus 23 ASCII label/separator bytes occupy 471 bytes, below the 480-byte total.
+Two guaranteed 224-byte allocations plus 23 label/separator bytes occupy471; redistributed total≤480.
 Unlike a 192-byte arm, this leaves a testable diagnostic region beyond the old 200-character preclamp.
 
 ## Flow and privacy boundary
 
 1. Run convergence, then the census, in their existing separate guards even if convergence throws.
-2. Build bounded evidence/error before creating the failed summary and completion callback outcome.
+2. Safely extract only string messages (guard property access; non-string/throwing getters use fixed
+   failed/threw fallback, never String(arbitraryObject)). Build evidence/error in its own third guard
+   before the summary/callback. On builder failure, preserve phase/count failure in a fixed ASCII named
+   error, omit evidence and continue later teams: census finding count/unavailable and convergence failed
+   stay explicit. Formatting failure must not convert a healthy result into failure or abort the fleet.
+   Pin an injected module-builder fault through test mocking, without a production test hook.
 3. Write exactly one per-team scheduler access_bootstrap row as that team completes. A callback throw
    remains observability failure, cannot become a convergence failure, and cannot abort later teams.
 4. Keep access_bootstrap_all as a distinct ok:true liveness row and existing zero-team/global-failure
@@ -127,6 +153,7 @@ Unlike a 192-byte arm, this leaves a testable diagnostic region beyond the old 2
    never a team's IDs, slugs, evidence or arbitrary returned/thrown error text. Preserve rethrow behavior.
    Narrowly sanitize the current global throw/meta.threw and global read-error forwarding in this leg;
    this is necessary because listRecentIngestRuns merges own-team rows with NULL-team rows.
+   Fixed global read reason: `teams read failed`; fixed throw reason/meta.threw: `bootstrap threw`.
 5. In the integrations page, resolve the active session membership and membership-derived viewer posture.
    Apply existing canAccessAdmin({role, tier: resolvedPosture}) before elevated Promise.all/ledger reads.
    Missing membership, non-admin, external/unknown posture and resolution failures fail closed.
@@ -148,6 +175,11 @@ No new permission policy, RLS architecture, API/export endpoint, logging sink or
 Fixed global reasons deliberately omit arbitrary fleet error text. Existing adapter/scheduler diagnostics
 may retain details; no complete raw-diagnostic promise is added. Sibling context_backfill_all's pre-existing
 raw-text behavior is an adjacent residual, outside the bootstrap-envelope producer/consumer scope.
+Other existing NULL producers (graph_project sample/detail and pret3_sweep/pret4_materialize raw errors)
+and successful generic RunMeta are residuals; this is bootstrap-owned privacy, not an all-ledger audit.
+Home LLM health stays role-only and invited activation follows existing team context. Banner dismissal
+already persists its error-containing signature in localStorage; the gate prevents new disclosure,
+not historical browser-state erasure. No client-storage purge or unrelated policy change is included.
 
 ## UI behavior
 
@@ -155,6 +187,7 @@ Keep the current table, status, short error preview and useful error title. A re
 row additionally shows native `<details>` with a concise Evidence summary, closed by default.
 Inside show phase status, exact total/omitted or evidence unavailable, sampled names/UUIDs, and shortening
 indicators. Render strings as React text; no raw HTML, command generation, automatic repair or provider data.
+Use bidi isolation for each new display label next to its UUID; do not interpolate names as commands.
 The UI labels samples as samples and shortened slugs as display labels, without claiming exhaustive names.
 Truncated labels cannot form repair CLI commands: operators must use the exact IDs in an authorized
 administrative/DB lookup for complete slugs, then use the existing repair-system-edge CLI. No new lookup UI.
@@ -170,11 +203,13 @@ Use current styles; allow wrapping within the existing table and verify narrow-v
   census; returned/throw census failure records unavailable counts, while clean census records zero.
   Both failure arms survive in outcomes and actual stored errors. Control: restore census-wins merge/skip census on throw.
 - **AC03 — independent error budgets:** Test long convergence/short census and long census read/throw
-  error/short convergence using raw results; both named arms survive within dual 224/total 480-byte bounds and the
+  error/short convergence using raw results; both named arms survive with independent 224-byte reservations,
+  contextual redistributed caps, and a total 480-byte bound, including the
   actual 500-character ledger clamp. Include many raw findings without the old 200-character preclamp.
   Pin a raw-finding diagnostic sentinel after the legacy 200-character pre-label summary boundary but
   inside the new arm, using multiple pairs (the old enormous-first-pair fallback can exceed 200).
   A real lone adoption refusal with clean census round-trips its repair suffix within the larger lone cap.
+  A realistic short-census/dual-refusal also retains the suffix through unused-budget redistribution.
   Controls: whole-compound clamping or restoring the legacy finding preformatter loses a required arm/sentinel.
 - **AC04 — serialized bound:** Quote/backslash/control-character and non-BMP slugs, including an enormous
   first slug, produce actual serialized namespace JSON at most 8,192 bytes, at most 16 samples and
@@ -189,6 +224,8 @@ Use current styles; allow wrapping within the existing table and verify narrow-v
   writes, one row per team per tick, one error contribution, separate fleet liveness, and existing zero-team/
   fleet-failure behavior. Callback throw does not abort/misattribute. Inject a tenant-marked global read/throw
   and prove NULL rows contain only safe reasons/counts. Controls: duplicate summary writes or global text forwarding.
+  Non-string/getter-fault messages and an injected builder fault preserve bounded named phase/count
+  failure without evidence, and later teams still complete. Removing the third guard must fail this test.
 - **AC07 — reader isolation:** Real own-team-plus-NULL reader returns team A evidence and safe global
   rows while excluding team B evidence. Unknown/invalid/mismatched envelopes are not rendered as evidence.
   Controls: remove reader team filter or accept a mismatched envelope; marker assertions fail.
@@ -197,6 +234,9 @@ Use current styles; allow wrapping within the existing table and verify narrow-v
   are escaped; unrelated/legacy rows keep existing presentation. Existing access-health short-format and
   diagnosis remains useful; include unrelated pm_sync rows from the shared panel consumer. Controls:
   restore error-versus-meta ternary or dump arbitrary failed metadata.
+  All five state-table cases round-trip through actual producer→real JSONB→recent reader→decoder→actual
+  panel; fabricated envelopes alone are insufficient. Include boundary trim, legacy-string meta and malformed
+  rejection. Assert exact wrapper measurement/last fitting sample, not accidental sample sizes.
 - **AC09 — HTML/RSC authorization:** Real authenticated unrestricted admin can retrieve a seeded evidence
   marker through HTML and an actual RSC response. Anonymous, internal non-admin, external-posture admin,
   disabled member (login before disabling) and foreign-team/nonmember cannot retrieve that marker.
@@ -205,6 +245,9 @@ Use current styles; allow wrapping within the existing table and verify narrow-v
   nonsecret denial/route protocol, not redirect/HTML absence. Anonymous separately asserts proxy login
   redirect/destination. At most follow a same-origin _rsc correction preserving headers/cookie; never count
   its 307 as authorization evidence. Positive controls must contain the marker in each actual RSC profile.
+  Record the tree and prove targeted skips the admin layout: full response has its proper Admin shell/
+  Admins only sentinel, targeted does not, for admitted and denied membership personas; mismatch-driven
+  full payload is not targeted proof. Marker-bearing HTML/RSC responses assert private/no-store directives.
   Include populated Pulse fixtures: unrestricted admin receives both markers, one beyond the 160-character
   preview; external admin/nonadmin/disabled/nonmember do not. Page-unit spies deny protected elevated
   integrations reads after posture resolution and deny home getPipelineHealth on restricted/faulted posture.
@@ -221,9 +264,21 @@ Use current styles; allow wrapping within the existing table and verify narrow-v
 - **AC12 — operational documentation:** Document version/budgets, sampled/not-exhaustive evidence,
   unknown counts, existing repair workflow, own-team/NULL privacy and page-local gate. State unchanged
   best-effort writes/retention and existing full-census memory behavior; no unverified production capacity claim.
+  Document literal exhaustive-name deviation and a team-bound read-only SQL join of project_groups to
+  projects/groups selecting complete IDs/slugs/kind/is_builtin. Enumerate all system-project candidates,
+  join both tables on team_id and ID. Only kind=system is the census domain (reserved source adoption
+  is a separate guard); unresolved project/group is a finding. Sanctioned requires is_builtin plus one
+  exact pair: general→everyone, external-shared→everyone, external-shared→external; general→external
+  is forbidden. Identify unsanctioned candidates, then use complete slugs with the
+  authorized repair-system-edge CLI. This is administrative retrieval, not a new runtime predicate/API.
+  Actual repair argument order is group-slug then project-slug, with --actor and optional --team.
 - **AC13 — verification/review:** Run appropriate unit, real-PG and production HTTP suites plus typecheck,
   changed-file lint and docs checks. Retain baseline/new RED, canonical GREEN and intended mutation failures
   with exact source/spec provenance. Fresh Opus/Astra reviews have no unresolved HIGH/blocker before publication.
+  HTTP runs record effective non-secret poller settings, source/diff fingerprint and .next/BUILD_ID;
+  fresh canonical build is mandatory. INGEST_POLL_ENABLED=false prevents ingestion overwriting fixtures;
+  GRAPH_PROJECT_ENABLED=false/no GRAPHITI_URL and SOCIAL_JOBS_ENABLED not true keep other pollers inert.
+  Verify actual controls, not unrelated SOCIAL_AUTORUN naming. Production policy is unchanged for tests.
 
 ## Implementation sequence and verification tiers
 
@@ -254,6 +309,8 @@ Additive optional metadata requires no migration; old rows remain readable and f
 Create-time API-trigger bootstrap rows from lib/admin/teams.ts remain unenriched/legacy-compatible;
 up to 8 KiB metadata per failing team per tick plus existing row/error overhead accumulates under unchanged
 retention. This slice adds no pruning guarantee.
+The existing source-diversity cap can fill remaining slots, so a 30-row panel can contain more than15
+bootstrap rows; collapsed evidence is still transmitted. No lazy-fetch/page-weight reduction is claimed.
 Mixed application versions can omit evidence or retain old page behavior, so do not claim rollout-complete
 privacy until serving replicas carry both reviewed page gates. Existing census/repair permissions are unchanged.
 Sample omission and error shortening are explicit; this is not an exhaustive evidence export or audit archive.
