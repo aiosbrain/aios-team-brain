@@ -230,6 +230,13 @@ jobs:
       # ordinary tier's no-model server contract is untouched. No skip path: a missing build, fake
       # setup, capture or assertion fails the step.
       - run: npm run test:http:tierret1-query
+      # AIO-1210: /auth/dev-login over a real loopback socket, with its OWN owned children — the
+      # production build from this job under NODE_ENV=production and under NODE_ENV=development
+      # (hard-off even with AIOS_DEV_LOGIN=1), then `next dev` with the opt-in off and on. Sequential
+      # and last: it consumes the build above (never rebuilds or copies one), allocates its own
+      # loopback ports, gives each child an allowlisted synthetic environment, and re-checks BUILD_ID
+      # after the dev servers. No skip path: a held lock or failed start is a named SETUP_FAILURE.
+      - run: npm run test:http:dev-login
 
   # The real-Neo4j tier — the ONLY behavioural proof that graph tier isolation holds (group_id is
   # the sole enforcement, no RLS backstop) and, since GRAPHSAT-1, of the per-item episode lookup

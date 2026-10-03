@@ -49,6 +49,7 @@
     "test:http": "vitest run --config vitest.http.config.ts",
     "test:http:gateway-approval": "AIOS_GATEWAY_INTERNAL_ENABLED=true vitest run --config vitest.http.config.ts gateway-approval-enabled",
     "test:http:tierret1-query": "vitest run --config vitest.tierret1-query.config.ts",
+    "test:http:dev-login": "vitest run --config vitest.dev-login.config.ts",
     "test:gateway-contracts": "vitest run test/gateway/gateway-contracts.test.ts",
     "test:gateway-approval-contracts": "vitest run test/gateway/gateway-approval-contracts.test.ts",
     "test:gateway-api": "vitest run test/gateway test/guards/gateway-writers.test.ts",
