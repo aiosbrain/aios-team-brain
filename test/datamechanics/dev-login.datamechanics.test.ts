@@ -91,10 +91,18 @@ function request(sent: Sent = {}): NextRequest {
   return req;
 }
 
-/** Call the real handler under an explicit runtime mode / opt-in, set only for the call. */
+/**
+ * Call the real handler under an explicit runtime mode / opt-in, set only for the call. An omitted
+ * `nodeEnv` means `development` here: this wrapper has no unset-NODE_ENV case (the direct-handler
+ * tier owns that one). An opt-in requested as `undefined` is a genuinely absent variable, which is
+ * asserted before the GET rather than assumed.
+ */
 async function login(sent: Sent, mode: { nodeEnv?: string; optIn?: string | undefined } = {}): Promise<Response> {
+  const optIn = "optIn" in mode ? mode.optIn : "1";
   vi.stubEnv("NODE_ENV", mode.nodeEnv ?? "development");
-  vi.stubEnv("AIOS_DEV_LOGIN", "optIn" in mode ? mode.optIn : "1");
+  vi.stubEnv("AIOS_DEV_LOGIN", optIn);
+  if (optIn === undefined) expect("AIOS_DEV_LOGIN" in process.env, "AIOS_DEV_LOGIN must be absent").toBe(false);
+  else expect(process.env.AIOS_DEV_LOGIN).toBe(optIn);
   return GET(request(sent));
 }
 
@@ -163,14 +171,18 @@ describe("GET /auth/dev-login — admitted auth outcome (real Postgres, AC06)", 
     expect("domain" in cookie.attributes).toBe(false);
     expect("secure" in cookie.attributes).toBe(false);
 
-    // The signer's own expiry is unchanged: exactly the session max age after issuance.
+    // The signer's own expiry is unchanged: the session max age after issuance. `iat` and `exp` are
+    // two consecutive whole-second clock readings in the signer (jose: setIssuedAt(), then
+    // setExpirationTime("<max>s")), so a second boundary between them makes the difference MAX + 1 —
+    // never less than MAX, never more than MAX + 1. The cookie's own Max-Age above is exact.
     const claims = JSON.parse(Buffer.from(cookie.value.split(".")[1], "base64url").toString("utf8")) as {
       sub: string;
       email: string;
       iat: number;
       exp: number;
     };
-    expect(claims.exp - claims.iat).toBe(SESSION_MAX_AGE_S);
+    expect(claims.exp - claims.iat).toBeGreaterThanOrEqual(SESSION_MAX_AGE_S);
+    expect(claims.exp - claims.iat).toBeLessThanOrEqual(SESSION_MAX_AGE_S + 1);
     expect(claims.email).toBe(email);
     expect(await verifySession(cookie.value)).toEqual({ id: claims.sub, email });
 

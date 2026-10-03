@@ -69,6 +69,16 @@ function runtime(nodeEnv: string | undefined, optIn: string | undefined, obsolet
   vi.stubEnv("NODE_ENV", nodeEnv);
   vi.stubEnv("AIOS_DEV_LOGIN", optIn);
   vi.stubEnv("ALLOW_DEV_LOGIN", obsoleteOptIn);
+  // The fixture itself, checked before any GET: a requested `undefined` is a genuinely ABSENT
+  // variable (not the string "undefined", not a leftover value), so the "unset" and "missing" cases
+  // below test what they say they test.
+  for (const [name, value] of [
+    ["NODE_ENV", nodeEnv],
+    ["AIOS_DEV_LOGIN", optIn],
+  ] as const) {
+    if (value === undefined) expect(name in process.env, `${name} must be absent`).toBe(false);
+    else expect(process.env[name]).toBe(value);
+  }
 }
 /** The deliberate local configuration: a non-production mode with the exact opt-in. */
 const enabled = (): void => runtime("development", "1");

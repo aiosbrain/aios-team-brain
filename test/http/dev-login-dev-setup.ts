@@ -1,9 +1,9 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { request as httpRequest, type IncomingHttpHeaders } from "node:http";
 import { connect, createServer, type AddressInfo } from "node:net";
-import { extname, join, sep } from "node:path";
+import { extname, join } from "node:path";
 import { scrubbedEnv } from "../../scripts/test-env-scrub";
 
 /**
@@ -712,7 +712,9 @@ export async function startNextChild(opts: StartChildOptions): Promise<OwnedChil
         portClosed = await waitUntil(async () => !(await loopbackPortAccepts(port, 500)), 5_000, 200);
       }
       if (!portClosed) {
-        // Still owned: the group stays registered for the last resort rather than being forgotten.
+        // A group that outlived its leader stays registered for the last resort rather than being
+        // forgotten; one seen empty when its leader was reaped has nothing left to own.
+        if (group && !orphans) owned.delete(group);
         throw new DevLoginSetupFailure(
           "cleanup-failed",
           orphans
@@ -999,19 +1001,26 @@ const ROOT_SOURCE_EXTENSIONS = new Set([
 /** Files Next generates on `dev`/`build`; reported separately, never folded into the source record. */
 export const GENERATED_FILES = ["next-env.d.ts"] as const;
 
-/** Never descended into, wherever they sit: dependencies, VCS data, build output, handoff/agent trees. */
+/** Never entered, wherever they sit: dependencies, VCS data, build output, handoff/agent trees. */
 const SKIPPED_DIRECTORIES = new Set(["node_modules", ".git", ".next", ".context", ".claude"]);
 
 const PRIVATE_EXTENSIONS = new Set([".pem", ".key", ".crt", ".cer", ".der", ".p8", ".p12", ".pfx", ".jks", ".keystore"]);
 const PRIVATE_NAMES = new Set([".npmrc", ".netrc", ".aios-demo-key"]);
 
-/** Env, key, certificate and local credential files, decided by NAME: never opened, never keyed. */
+/**
+ * Env, key, certificate and local credential entries, decided by NAME: never opened, never keyed —
+ * and, when the name is a directory's or a link's, never listed or resolved either. A naming policy,
+ * not secret detection: a secret kept in an ordinarily named source file is hashed like any source.
+ */
 function isPrivateName(name: string): boolean {
   const lower = name.toLowerCase();
   return (
     lower.startsWith(".env") || lower.endsWith(".env") || PRIVATE_NAMES.has(lower) || PRIVATE_EXTENSIONS.has(extname(lower))
   );
 }
+
+/** The one name policy, asked of every entry at every depth BEFORE its type is looked at. */
+const isExcludedName = (name: string): boolean => SKIPPED_DIRECTORIES.has(name) || isPrivateName(name);
 
 const MAX_SOURCE_FILES = 20_000;
 const MAX_SOURCE_DEPTH = 32;
@@ -1026,10 +1035,15 @@ const MAX_SOURCE_DEPTH = 32;
  * copy without `.git` inventories the same way. Deterministic: keys are sorted by code unit whatever
  * order a directory lists them in. Bounded: explicit roots, a depth limit and a file limit.
  *
- * Fail closed: an entry under a source root that is neither a directory nor a regular file is a
- * `source-unsupported` SETUP_FAILURE rather than a silently incomplete inventory. A symbolic link is
- * taken only as the regular, non-private file it names INSIDE this checkout; one that leaves the
- * checkout, dangles, or names a directory is refused and never followed.
+ * Excluded by NAME first (`isExcludedName`), at the checkout root and at every depth: such an entry —
+ * file, directory or link — is not listed, resolved, opened or keyed, so nothing beneath an excluded
+ * directory is ever seen.
+ *
+ * Fail closed: any other entry under a source root that is neither a directory nor a regular file is
+ * a `source-unsupported` SETUP_FAILURE rather than a silently incomplete inventory. That includes
+ * EVERY symbolic link among the inventoried inputs — under a source root, a root-level file of a
+ * source form, or a source root itself — wherever it points. It is refused on the entry, before its
+ * target is resolved or read, so no bytes from outside the roots enter through a link.
  *
  * Not covered, by design: installed dependencies (the boundary is package.json + package-lock.json,
  * not a node_modules tamper detector), generated output, and private configuration — see
@@ -1041,7 +1055,7 @@ export function inventoryRuntimeSources(cwd: string = process.cwd()): Record<str
       "source-unsupported",
       `${rel} ${why}. The runtime source inventory would not be complete, so no build is credited against it.`
     );
-  const realRoot = realpathSync(cwd);
+  const linked = (rel: string) => unsupported(rel, "is a symbolic link, which this inventory never resolves or reads");
   const found: [string, string][] = [];
 
   const add = (rel: string, path: string): void => {
@@ -1054,33 +1068,18 @@ export function inventoryRuntimeSources(cwd: string = process.cwd()): Record<str
     }
     found.push([rel, sha256(data)]);
   };
-  const addLink = (rel: string): void => {
-    let target: string;
-    try {
-      target = realpathSync(join(cwd, rel));
-    } catch {
-      throw unsupported(rel, "is a symbolic link that does not resolve");
-    }
-    if (!target.startsWith(realRoot + sep)) throw unsupported(rel, "is a symbolic link out of the checkout");
-    const parts = target.slice(realRoot.length + 1).split(sep);
-    const regular = !parts.some((part) => SKIPPED_DIRECTORIES.has(part)) && !isPrivateName(parts[parts.length - 1]);
-    if (!regular || !statSync(target).isFile()) {
-      throw unsupported(rel, "is a symbolic link to something other than an inventoried regular file");
-    }
-    add(rel, target);
-  };
   const walk = (rel: string, depth: number): void => {
     if (depth > MAX_SOURCE_DEPTH) throw unsupported(rel, `is nested deeper than ${MAX_SOURCE_DEPTH} directories`);
     for (const entry of readdirSync(join(cwd, rel), { withFileTypes: true })) {
+      // The name decides first, whatever the entry is: an excluded one is not looked at again.
+      if (isExcludedName(entry.name)) continue;
       const child = `${rel}/${entry.name}`;
-      if (entry.isDirectory()) {
-        if (!SKIPPED_DIRECTORIES.has(entry.name)) walk(child, depth + 1);
-      } else if (isPrivateName(entry.name)) {
-        continue;
+      if (entry.isSymbolicLink()) {
+        throw linked(child);
+      } else if (entry.isDirectory()) {
+        walk(child, depth + 1);
       } else if (entry.isFile()) {
         add(child, join(cwd, child));
-      } else if (entry.isSymbolicLink()) {
-        addLink(child);
       } else {
         throw unsupported(child, "is neither a regular file nor a directory");
       }
@@ -1091,22 +1090,19 @@ export function inventoryRuntimeSources(cwd: string = process.cwd()): Record<str
   const generated = new Set<string>(GENERATED_FILES);
   for (const entry of readdirSync(cwd, { withFileTypes: true })) {
     const name = entry.name;
+    // The same name policy as inside a root, and as early: before the entry's type or form matters.
+    if (isExcludedName(name)) continue;
     if (roots.has(name)) {
       if (!entry.isDirectory()) throw unsupported(name, "is a source root that is not a plain directory");
       walk(name, 1);
     } else if (UNCOVERED_SOURCE_ROOTS.has(name)) {
       throw unsupported(name, "is a Next application directory this inventory does not cover");
-    } else if (
-      entry.isDirectory() ||
-      isPrivateName(name) ||
-      generated.has(name) ||
-      !ROOT_SOURCE_EXTENSIONS.has(extname(name).toLowerCase())
-    ) {
+    } else if (entry.isDirectory() || generated.has(name) || !ROOT_SOURCE_EXTENSIONS.has(extname(name).toLowerCase())) {
       continue;
+    } else if (entry.isSymbolicLink()) {
+      throw linked(name);
     } else if (entry.isFile()) {
       add(name, join(cwd, name));
-    } else if (entry.isSymbolicLink()) {
-      addLink(name);
     } else {
       throw unsupported(name, "is neither a regular file nor a directory");
     }

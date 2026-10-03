@@ -100,10 +100,21 @@ Notes:
   npm run test:http:dev-login:build    # the ordinary `npm run build`, recorded against the current sources
   DATABASE_TEST_URL=postgres://app:app@localhost:5434/app_test npm run test:http:dev-login
   ```
-  The carrier never builds: it consumes that build and refuses if its record is missing or stale
-  (rebuild with the same command after any source change). It accepts only a loopback `_test`
-  database, starts and stops its own servers on its own ports, and reports a held `next dev` lock or
-  a failed start as a named `SETUP_FAILURE` — stop your own dev server first; it will not.
+  The recorded build is the ordinary `npm run build`, run once, but **not** under your shell's
+  environment: the recorder gives it a sanitized one (a short OS allowlist plus synthetic production
+  values, with Sentry/provider/graph/mail settings blank and no `NODE_OPTIONS`), and prints its mode
+  and which variables are set — never their values. It passes `DATABASE_TEST_URL` to the build only
+  if that is a loopback `_test` URL (an unsafe one is refused), never `DATABASE_URL`; with none set
+  the build gets a non-serving placeholder, which is not a database. This governs the build it
+  starts — it cannot undo anything already loaded into the recorder process itself.
+  The carrier never builds: it consumes that build and refuses if its record is missing or stale.
+  "Stale" covers the whole runtime source inventory — every file under `app/`, `lib/`,
+  `components/`, `config/`, `scripts/`, `postgres/` and `public/` plus the root config, package and
+  lock files, whether edited, added or deleted (read from disk, so untracked files count and no Git
+  is needed) — so rebuild with the same command after any such change. It accepts only a loopback
+  `_test` database, starts and stops its own servers on its own ports (also when the run is
+  interrupted with Ctrl-C or SIGTERM), and reports a held `next dev` lock or a failed start as a
+  named `SETUP_FAILURE` — stop your own dev server first; it will not.
 - **`npm run db:test:up` always starts FROM ZERO** (`scripts/db-test-up.sh`: `down -v`, then `up`,
   then load the schema). It is therefore safe to re-run against any prior state — you no longer
   have to remember `db:test:down` first. Two consequences worth knowing:

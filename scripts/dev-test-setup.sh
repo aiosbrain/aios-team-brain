@@ -23,7 +23,8 @@
 #        API availability. It is never used to build the login link.
 #      DEV_LOGIN_PORT (default 3000) — this helper only: the port of the local dev server, printed in
 #        the login link and its launch command. For another port start the server with
-#        `npm run dev:login -- --port <port>` and point APP_URL at the same port.
+#        `npm run dev:login -- --port <port>` and point APP_URL at the same port: the two are
+#        independent, and the banner says so (it never rewrites APP_URL) when they differ.
 
 set -euo pipefail
 BRAIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -66,7 +67,8 @@ echo "   spoke ready (content across team / external / admin tiers)."
 # Stable, re-usable local login (mints+verifies per request). Always the literal loopback address
 # and the explicit local port — never APP_URL or a forwarded header: the route admits only a local
 # authority on the server's own port.
-LOGIN_URL="http://127.0.0.1:${DEV_LOGIN_PORT}/auth/dev-login?email=alex@demo.aios.local&next=/t/demo"
+LOGIN_ORIGIN="http://127.0.0.1:${DEV_LOGIN_PORT}"
+LOGIN_URL="${LOGIN_ORIGIN}/auth/dev-login?email=alex@demo.aios.local&next=/t/demo"
 LOGIN_SERVER="npm run dev:login"
 [[ "$DEV_LOGIN_PORT" == "3000" ]] || LOGIN_SERVER="npm run dev:login -- --port $DEV_LOGIN_PORT"
 
@@ -98,6 +100,15 @@ cat <<BANNER
     aios graph          # traverse the local link graph (offline)
 
 BANNER
+
+# DEV_LOGIN_PORT only names the login server; the spoke above and the API check were wired with
+# APP_URL. On a non-default port say so when the two differ — a hint, never a rewrite of either.
+if [[ "$DEV_LOGIN_PORT" != "3000" && "$APP_URL" != "$LOGIN_ORIGIN" ]]; then
+  echo "  note: DEV_LOGIN_PORT=$DEV_LOGIN_PORT names the dev server for the login link only."
+  echo "        The spoke and the API check use APP_URL, which is $APP_URL."
+  echo "        To point them at that dev server too, re-run with:   APP_URL=$LOGIN_ORIGIN"
+  echo ""
+fi
 
 if [[ "$DEV_UP" != "1" ]]; then
   echo "  ⚠ no server detected on $APP_URL — run '$LOGIN_SERVER' before login/push/query/pull-bundle."

@@ -221,11 +221,16 @@ jobs:
       - run: npm ci
       - run: DATABASE_URL="$DATABASE_TEST_URL" npm run pg:schema
       # Production build first; global-setup spawns `next start` against .next.
-      # AIO-1210: the build is still the ordinary `npm run build`, with this job's environment and
-      # output unchanged — run by the dev-login carrier's recorder so that a later step can tell the
-      # artifact was built from these sources. Before the build it refuses a checkout holding any of
-      # the eight Next-loaded env files; after it, and only when the command exited 0 with the tracked
-      # runtime sources byte-identical, it writes the build record the dev-login step below requires.
+      # AIO-1210: the build is still the ordinary `npm run build`, run ONCE and with its output
+      # unchanged — by the dev-login carrier's recorder, so that a later step can tell the artifact
+      # was built from these sources. The recorder does NOT hand the build this job's environment: it
+      # constructs a sanitized one (a finite OS allowlist plus synthetic production values; Sentry,
+      # provider, graph and mail settings blank; no NODE_OPTIONS) and passes only this job's validated
+      # loopback DATABASE_TEST_URL as the database, never DATABASE_URL. Before the build it refuses a
+      # checkout holding any of the eight Next-loaded env files; after it, and only when the command
+      # exited 0 with the runtime source inventory identical (every file under app/, lib/,
+      # components/, config/, scripts/, postgres/, public/ plus the root config/package/lock files —
+      # none edited, added or removed), it writes the build record the dev-login step below requires.
       # The step fails exactly when the build fails or that record cannot be written honestly.
       - run: npm run test:http:dev-login:build
       - run: npm run test:http
@@ -240,8 +245,10 @@ jobs:
       # production build from this job under NODE_ENV=production and under NODE_ENV=development
       # (hard-off even with AIOS_DEV_LOGIN=1), then `next dev` with the opt-in off and on. Sequential
       # and last: it consumes the build above (never rebuilds or copies one) and first checks that
-      # build's record is current, allocates its own loopback ports, gives each child an allowlisted
-      # synthetic environment, and re-checks BUILD_ID and the emitted server JS after the dev servers.
+      # build's record is current (source inventory, BUILD_ID, emitted server JS), allocates its own
+      # loopback ports, gives each child an allowlisted synthetic environment, stops its children on
+      # every outcome (a SIGINT/SIGTERM to the run included), and re-checks the sources, BUILD_ID and
+      # the emitted server JS after the dev servers.
       # No skip path: a held lock, failed start or stale build record is a named SETUP_FAILURE.
       - run: npm run test:http:dev-login
 

@@ -38,6 +38,26 @@ import {
   type SetupFailureKind,
 } from "./http/dev-login-dev-setup";
 
+// A read intercept, not a stub: the filesystem calls an inventory can list, resolve or open an entry
+// with are recorded by path and passed straight through to the real ones. It is what lets a case say
+// an entry was never touched, rather than infer it from an output that happens not to mention it.
+const fsCalls = vi.hoisted(() => [] as { op: string; path: string }[]);
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  const seen = <A extends unknown[], R>(op: string, fn: (...args: A) => R) =>
+    Object.assign((...args: A): R => {
+      fsCalls.push({ op, path: String(args[0]) });
+      return fn(...args);
+    }, fn);
+  return {
+    ...actual,
+    readdirSync: seen("readdirSync", actual.readdirSync),
+    readFileSync: seen("readFileSync", actual.readFileSync),
+    realpathSync: seen("realpathSync", actual.realpathSync),
+    statSync: seen("statSync", actual.statSync),
+  };
+});
+
 // Spec (AIO-1210 AC08/AC10, docs/design/aio1210-dev-login.md): the dev-login wire carrier consumes a
 // production build it did not make, so it may credit that build only when something OBSERVED it
 // being built from the current sources — "a stale/copied build is not proof". These cases pin both
@@ -49,7 +69,8 @@ import {
 //     arbitrary provider/telemetry credentials or NODE_OPTIONS hooks");
 //   - "the sources" are the whole inventory — every file under the source roots plus the root
 //     config/package/lock inputs, read from the filesystem with no Git — so an edit, an addition or
-//     a deletion anywhere in it makes a record stale;
+//     a deletion anywhere in it makes a record stale; nothing under a private or skipped name is
+//     entered, and no symbolic link among those inputs is resolved or read;
 //   - the carrier-side check refuses a build with no record, a record whose own claims do not hold,
 //     and a record the checkout or the artifact has since moved away from.
 //
@@ -68,12 +89,15 @@ afterAll(() => {
 beforeEach(() => {
   vi.stubEnv("DATABASE_TEST_URL", undefined);
   vi.spyOn(console, "log").mockImplementation(() => {});
+  fsCalls.length = 0;
 });
 afterEach(() => {
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
 const loggedLines = (): string[] => vi.mocked(console.log).mock.calls.map((args) => String(args[0]));
+/** Recorded filesystem calls on `rel` of some checkout — by the path as given or as resolved. */
+const callsOn = (rel: string) => fsCalls.filter((call) => call.path.endsWith(sep + rel.split("/").join(sep)));
 
 const sha256 = (text: string): string => createHash("sha256").update(text).digest("hex");
 
@@ -444,11 +468,75 @@ describe("runtime source inventory (pure, portable, no Git)", () => {
     for (const rel of [...outside, ...privateFiles]) expect(rel in after).toBe(false);
   });
 
-  it("a symbolic link is taken only as the regular file it names inside the checkout", () => {
+  it("a private-named directory under a source root is excluded before it is entered: nothing in it is listed, read or keyed", () => {
     const dir = richCheckout();
-    symlinkSync(join(dir, POOL), join(dir, "lib", "db", "pg", "pool-link.ts"));
-    const inventory = inventoryRuntimeSources(dir);
-    expect(inventory["lib/db/pg/pool-link.ts"]).toBe(inventory[POOL]);
+    const MARKER = "private-subtree-marker";
+    const PRIVATE_DIR = "lib/.env.private";
+    const NEARBY = "lib/nearby.json";
+    const inside = [`${PRIVATE_DIR}/marker.json`, `${PRIVATE_DIR}/nested/deeper.json`];
+    // Ordinary JSON names: only the directory's name can keep them out.
+    for (const rel of inside) write(dir, rel, JSON.stringify({ marker: MARKER }));
+    write(dir, NEARBY, '{"ordinary":true}\n');
+
+    fsCalls.length = 0;
+    const before = inventoryRuntimeSources(dir);
+    const touched = fsCalls.filter((call) => call.path.includes(".env.private"));
+    // The intercept is live — the ordinary neighbour was read through it — and saw nothing private.
+    expect(callsOn(NEARBY).map((call) => call.op)).toContain("readFileSync");
+    expect(touched).toEqual([]);
+    expect(before[NEARBY]).toBe(sha256('{"ordinary":true}\n'));
+    expect(Object.keys(before).filter((rel) => rel.includes(".env.private"))).toEqual([]);
+
+    // Only the private subtree moves — a marker edited, a file added: the inventory does not.
+    write(dir, inside[0], JSON.stringify({ marker: `${MARKER}-changed` }));
+    write(dir, `${PRIVATE_DIR}/added.json`, "{}\n");
+    expect(inventoryRuntimeSources(dir)).toEqual(before);
+    // The ordinary file beside it still does.
+    appendFileSync(join(dir, NEARBY), "\n");
+    expect(changedKeys(before, inventoryRuntimeSources(dir))).toEqual([NEARBY]);
+  });
+
+  it("a link under an excluded name is not an inventory input: it is neither refused nor resolved", () => {
+    const dir = richCheckout();
+    const before = inventoryRuntimeSources(dir);
+    write(dir, "lib/.env.private/marker.json", "{}\n");
+    write(dir, "lib/node_modules/vendored/index.js", "// vendored\n");
+    symlinkSync(join(dir, "lib", "no-such-file.ts"), join(dir, "lib", ".env.private", "dangling.ts"));
+    symlinkSync(join(dir, "lib", "db"), join(dir, "lib", "node_modules", "vendored", "db-link"));
+    symlinkSync(join(dir, POOL), join(dir, "lib", ".env.linked"));
+
+    fsCalls.length = 0;
+    expect(inventoryRuntimeSources(dir)).toEqual(before);
+    for (const rel of ["lib/.env.private/dangling.ts", "lib/node_modules/vendored/db-link", "lib/.env.linked"]) {
+      expect(callsOn(rel), rel).toEqual([]);
+    }
+  });
+
+  // Every link among the inventoried inputs is refused on the entry itself, wherever it points. Each
+  // target here is a readable regular file INSIDE the checkout — the case a path or basename check
+  // would let through. The last column is what must show no filesystem call at all: the link always,
+  // and its target too whenever that target is not an inventoried file in its own right.
+  it.each<[string, string, string, string[]]>([
+    ["an ordinary inventoried source file", "lib/db/pg/pool-link.ts", POOL, ["lib/db/pg/pool-link.ts"]],
+    [
+      "a file in a checkout directory outside the source roots",
+      "lib/private-link.json",
+      "private/credentials.json",
+      ["lib/private-link.json", "private/credentials.json"],
+    ],
+    ["an excluded test file", "lib/fixture-link.ts", "test/fixtures/sample.ts", ["lib/fixture-link.ts", "test/fixtures/sample.ts"]],
+    ["an inventoried root config, from a root-level source name", "linked.config.mjs", "postcss.config.mjs", ["linked.config.mjs"]],
+  ])("a symbolic link to %s is refused by name: the link is not resolved and its target is not read through it", (_name, link, target, untouched) => {
+    const dir = richCheckout();
+    const MARKER = "link-target-marker";
+    write(dir, target, `// ${MARKER}\n`);
+    symlinkSync(join(dir, target), join(dir, link));
+
+    fsCalls.length = 0;
+    const failure = expectFailure(() => inventoryRuntimeSources(dir), "source-unsupported");
+    expect(failure.message).toContain(`${link} is a symbolic link`);
+    expect(failure.message).not.toContain(MARKER);
+    for (const rel of untouched) expect(callsOn(rel), rel).toEqual([]);
   });
 
   it.each<[string, string, (dir: string, elsewhere: string) => void]>([
@@ -673,7 +761,7 @@ describe("dev-login build recorder (real child process, synthetic checkout)", ()
     expect(existsSync(recordFile(dir))).toBe(false);
   });
 
-  it("a tracked source edited while the build ran is refused: the artifact cannot be attributed to either version", () => {
+  it("a source edited while the build ran is refused: the artifact cannot be attributed to either version", () => {
     const dir = checkout();
     const failure = expectFailure(() => runRecordedBuild(dir, fakeBuild(dir, { editSource: true })), "build-source-changed");
     expect(failure.message).toContain("app/auth/dev-login/route.ts");
@@ -765,8 +853,8 @@ describe("dev-login carrier build-record check (read-only, synthetic checkout)",
   });
 
   it.each<[string, (dir: string) => void, string]>([
-    ["a tracked source edited since the build", (dir) => appendFileSync(join(dir, ROUTE), "// edited later\n"), "app/auth/dev-login/route.ts"],
-    ["a tracked source deleted since the build", (dir) => rmSync(join(dir, "package.json")), "package.json"],
+    ["a source edited since the build", (dir) => appendFileSync(join(dir, ROUTE), "// edited later\n"), "app/auth/dev-login/route.ts"],
+    ["a source deleted since the build", (dir) => rmSync(join(dir, "package.json")), "package.json"],
     ["a different BUILD_ID", (dir) => write(dir, ".next/BUILD_ID", "synthetic-build-2"), "BUILD_ID"],
     ["a changed route entry", (dir) => write(dir, ".next/server/app/auth/dev-login/route.js", "// other entry\n"), "entry"],
     ["a changed server chunk", (dir) => write(dir, ".next/server/chunks/handler.js", "// other chunk\n"), "server JS inventory"],
@@ -779,12 +867,78 @@ describe("dev-login carrier build-record check (read-only, synthetic checkout)",
     expect(expectFailure(() => assertBuildRecordCurrent(dir, command), "build-record-stale").message).toContain(names);
   });
 
+  // The emitted JS and BUILD_ID are untouched in every case below — exactly what a source edited
+  // after a build looks like. Only the source inventory can see it, and only if it covers the file:
+  // the pool case is the one a short fixed list of paths (route, session, config…) lets through.
+  it.each<[string, (dir: string) => void, string]>([
+    ["the pg pool edited after the build", (dir) => appendFileSync(join(dir, POOL), "// edited later\n"), POOL],
+    ["readiness edited after the build", (dir) => appendFileSync(join(dir, READINESS), "// edited later\n"), READINESS],
+    ["an imported script edited after the build", (dir) => appendFileSync(join(dir, BUILD_IDENTITY), "// edited later\n"), BUILD_IDENTITY],
+    ["a new source file added after the build", (dir) => write(dir, "lib/db/pg/added.ts", "// added later\n"), "lib/db/pg/added.ts"],
+    ["a source file deleted after the build", (dir) => rmSync(join(dir, READINESS)), READINESS],
+    ["lockfile drift after the build", (dir) => appendFileSync(join(dir, "package-lock.json"), "\n"), "package-lock.json"],
+    ["the Sentry configuration edited after the build", (dir) => appendFileSync(join(dir, "sentry.server.config.ts"), "// edited later\n"), "sentry.server.config.ts"],
+    ["the PostCSS configuration edited after the build", (dir) => appendFileSync(join(dir, "postcss.config.mjs"), "// edited later\n"), "postcss.config.mjs"],
+    ["a new root config added after the build", (dir) => write(dir, "added.config.mjs", "// added later\n"), "added.config.mjs"],
+  ])("a record is stale after %s, although the emitted JS and BUILD_ID are unchanged", (_name, mutate, path) => {
+    const { dir, command, record } = recorded(richCheckout());
+    expect(assertBuildRecordCurrent(dir, command).record).toEqual(record);
+    mutate(dir);
+
+    const failure = expectFailure(() => assertBuildRecordCurrent(dir, command), "build-record-stale");
+    expect(failure.message).toContain(path);
+    // The old output is all still there and still matches what was recorded.
+    expect(readFileSync(join(dir, ".next", "BUILD_ID"), "utf8")).toBe(record.buildId);
+    expect(inventoryServerJs(dir).hash).toBe(record.serverJs.hash);
+  });
+
+  it("a record written when the source maps held nine fixed paths is stale: it needs a new recorded build", () => {
+    const { dir, command, record } = recorded(richCheckout());
+    const nine = fingerprintFiles(dir, [
+      "app/auth/dev-login/route.ts",
+      "lib/auth/pg-login.ts",
+      "lib/auth/pg-session.ts",
+      "lib/auth/next-path.ts",
+      "proxy.ts",
+      "instrumentation.ts",
+      "next.config.ts",
+      "tsconfig.json",
+      "package.json",
+    ]);
+    writeFileSync(recordFile(dir), JSON.stringify({ ...record, sourcesBefore: nine, sourcesAfter: nine }));
+    const failure = expectFailure(() => assertBuildRecordCurrent(dir, command), "build-record-stale");
+    expect(failure.message).toContain(POOL);
+  });
+
   it("a record stays current across changes it does not cover: a source map, dev output, a generated file", () => {
     const { dir, command, record } = recorded();
     write(dir, ".next/server/chunks/handler.js.map", '{"changed":true}');
     write(dir, ".next/dev/server/chunks/handler.js", "// dev output\n");
     write(dir, "next-env.d.ts", "// generated\n");
     expect(assertBuildRecordCurrent(dir, command).record).toEqual(record);
+  });
+
+  it("a record stays current across handoff, test, docs and private files, and holds none of their names or content", () => {
+    const { dir, command, record } = recorded(richCheckout());
+    const MARKER = "private-content-marker";
+    const uncovered = [
+      ".context/aio1210-handoff/review.md",
+      ".context/aio1210-mutation-1/lib/db/pg/pool.ts",
+      "test/dev-login-route.test.ts",
+      "docs/design/aio1210-dev-login.md",
+      "config/private.env",
+      "lib/tls/server.key",
+      "tsconfig.tsbuildinfo",
+    ];
+    for (const rel of uncovered) write(dir, rel, `${MARKER} ${rel}\n`);
+
+    expect(assertBuildRecordCurrent(dir, command).record).toEqual(record);
+    // And a rebuild over them records the same sources as before: none of them is a key.
+    const rebuilt = runRecordedBuild(dir, command);
+    expect(rebuilt.sourcesAfter).toEqual(record.sourcesAfter);
+    const onDisk = readFileSync(recordFile(dir), "utf8");
+    expect(onDisk).not.toContain(MARKER);
+    for (const rel of uncovered) expect(onDisk).not.toContain(rel);
   });
 
   it.each<[string, (record: BuildRecord) => unknown]>([

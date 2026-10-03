@@ -9,7 +9,8 @@ import { afterAll, describe, expect, it } from "vitest";
 // local port (DEV_LOGIN_PORT, default 3000, canonical 1–65535), must never be derived from APP_URL,
 // and must always come with the coupled launch (`npm run dev:login`) as its prerequisite — a server
 // that merely answers is not a server with the bypass enabled. The script never requests the
-// session-minting route to find out.
+// session-minting route to find out. APP_URL keeps its separate spoke/API purpose: on a non-default
+// port the script only SAYS which loopback APP_URL would match, and changes neither value.
 //
 // The REAL script runs, copied into a disposable fake repository outside this checkout, so its own
 // `cd "$BRAIN_DIR"` lands in the copy: the `.env.local` it sources is a harmless stub written there,
@@ -190,6 +191,35 @@ describe("scripts/dev-test-setup.sh — local dev-login link (AC09)", () => {
     const curl = calls.filter((call) => call.tool === "curl");
     expect(curl).toHaveLength(1);
     expect(curl[0].args.endsWith(` ${APP_URL_MARKER}/api/v1/items`)).toBe(true);
+  });
+
+  it("a non-default DEV_LOGIN_PORT with APP_URL elsewhere prints the literal loopback APP_URL to match — and rewrites nothing", () => {
+    const { status, stdout, calls } = run(fixture(), { DEV_LOGIN_PORT: "4321" });
+    expect(status).toBe(0);
+
+    // The hint names both values and the exact loopback URL to use.
+    expect(stdout).toContain("DEV_LOGIN_PORT=4321 names the dev server for the login link only.");
+    expect(stdout).toContain("APP_URL, which is http://127.0.0.1:3000.");
+    expect(stdout).toContain("re-run with:   APP_URL=http://127.0.0.1:4321\n");
+    expect(loginUrls(stdout).map((url) => url.origin)).toEqual(["http://127.0.0.1:4321"]);
+
+    // APP_URL itself, the spoke and the API check are exactly as without the hint, in the same order.
+    expect(calls.map((call) => call.tool)).toEqual(["npm", "npx", "spoke", "curl"]);
+    expect(calls[2].args).toContain("--brain-url http://127.0.0.1:3000 ");
+    expect(calls[3].args.endsWith(" http://127.0.0.1:3000/api/v1/items")).toBe(true);
+    for (const call of calls) expect(call.args).not.toContain("dev-login");
+  });
+
+  it.each<[string, Record<string, string>, string]>([
+    ["APP_URL already names that dev server", { DEV_LOGIN_PORT: "4321", APP_URL: "http://127.0.0.1:4321" }, "http://127.0.0.1:4321"],
+    ["the port is the default, whatever APP_URL is", { APP_URL: APP_URL_MARKER }, APP_URL_MARKER],
+    ["everything is the default", {}, "http://127.0.0.1:3000"],
+  ])("no APP_URL hint when %s", (_name, env, appUrl) => {
+    const { status, stdout, calls } = run(fixture(), env);
+    expect(status).toBe(0);
+    expect(stdout).not.toContain("re-run with:");
+    expect(stdout).not.toContain("names the dev server for the login link only");
+    expect(calls.filter((call) => call.tool === "spoke")[0].args).toContain(`--brain-url ${appUrl} `);
   });
 
   it("never requests the session-minting route: the only probe is the API availability check", () => {
