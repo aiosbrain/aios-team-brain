@@ -207,7 +207,7 @@ There is no `.nvmrc` or `.node-version` in the repo.
 | **A host for the app** | **Required** | Railway is what we run and the best-supported path. Render, Fly, a VPS with Docker, or Kubernetes all work — it's a plain Next.js app with no platform-specific APIs. |
 | **Postgres 16 or newer** | **Required** | Managed (Railway, Neon, RDS…) or your own. Plain SQL schema, no vendor lock-in. 16 is what CI and `compose.yml` run; the Railway template provisions Railway's own current Postgres image, which is newer. No version is enforced at runtime. |
 | **Neo4j 5.26.2** + **Graphiti** | **Required** | The context engine. Powers narrative arcs, the "what the brain is learning" panel, and graph-grounded answers. The app degrades gracefully rather than crashing if it's absent — everything else keeps working — but a graph-less instance is an incomplete one, not a supported configuration. Self-hosted via `graphiti/docker-compose.yml`. **Neo4j Aura is untested** — no code path references `neo4j+s://`, so treat cloud Aura as unverified. |
-| **Email (Resend or SMTP)** | Recommended | Magic links and invites. Without it the mail is **dropped in every environment** — logged server-side as `[mailer] no provider` (production) or `[mailer] (dev, no provider) would send …` (development), and nowhere else. The link itself is **never** printed: it carries a one-time token, so `mailer.ts` deliberately logs only the subject and recipient. To sign in locally without email, use `/auth/dev-login` (dev only) or the password from `npm run admin -- create-member`. |
+| **Email (Resend or SMTP)** | Recommended | Magic links and invites. Without it the mail is **dropped in every environment** — logged server-side as `[mailer] no provider` (production) or `[mailer] (dev, no provider) would send …` (development), and nowhere else. The link itself is **never** printed: it carries a one-time token, so `mailer.ts` deliberately logs only the subject and recipient. To sign in locally without email, use the password from `npm run admin -- create-member`, or the deliberately enabled local dev-login (`npm run dev:login` — off by default, loopback only, never in production; see §2.7). |
 
 There is no Supabase dependency. It was removed — if you see Supabase env vars anywhere in your
 notes or in a stale `.env.local`, they are read by nothing.
@@ -488,7 +488,7 @@ and run `aios push`. **Entirely optional** — the connectors above feed the bra
 For a disposable instance with nothing to configure, use the Docker stack from
 [Try it in two minutes](#try-it-in-two-minutes) — it brings up Postgres, loads the schema, seeds
 the demo, and prints a login. Use the native setup below when you're editing code and want hot
-reload, the debugger, and the dev-login route.
+reload, the debugger, and the opt-in local dev-login route.
 
 If you're changing the brain itself:
 
@@ -500,11 +500,46 @@ cp .env.example .env.local  # then fill in DATABASE_URL, AUTH_SECRET, SECRETS_KE
 set -a; . ./.env.local; set +a   # required — see the warning below
 npm run pg:schema
 npm run dev:seed            # optional: demo team, fixtures pushed through the REAL ingest path
-npm run dev
+npm run dev                 # dev-login bypass OFF — sign in with a password
 ```
 
-In development only, `http://localhost:3000/auth/dev-login?email=you@acme.com` signs you straight in;
-the route 404s when `NODE_ENV=production`.
+`npm run dev` leaves the dev-login bypass **off** (`AIOS_DEV_LOGIN=0`, the `.env.example` default):
+sign in with the password `npm run admin -- create-member` prints. To be signed straight in without
+one, start the server with the coupled launch **instead** — one server, never a second one beside
+`npm run dev`:
+
+```bash
+npm run dev:login           # = AIOS_DEV_LOGIN=1 next dev --hostname 127.0.0.1   (loopback only)
+# another port:  npm run dev:login -- --port 4000
+```
+
+then open `http://127.0.0.1:3000/auth/dev-login?email=you@acme.com` in a browser on the same machine
+(the port must be the one the server listens on). The route answers only when all of these hold, and
+is an identical `404` otherwise:
+
+- the server is **not a production build** — production always refuses, whatever the environment says;
+- `AIOS_DEV_LOGIN` is **exactly `1`** when the request arrives (`true`, ` 1`, empty and unset are off);
+- the request names a **strictly local authority**: `Host` is `localhost`, `127.0.0.1` or `[::1]` on
+  the server's own port, and any forwarding headers agree with it. A remapped or published port (SSH
+  forward, devcontainer) is refused — open the server directly on its own port.
+
+> ⚠️ **This is a deliberate local bypass, not an authentication method.** It signs in as *any* email
+> with no credential check.
+>
+> - **A `Host` header is not the peer.** Anything that can reach the port can send `Host: localhost`.
+>   The protection is the loopback bind, so use `npm run dev:login` (or an equivalent explicit
+>   `--hostname 127.0.0.1`) and never enable the bypass on an exposed, tunnelled or proxied listener.
+> - **Don't persist `AIOS_DEV_LOGIN=1`** in `.env.local` or your shell profile: plain `npm run dev`
+>   listens on **all interfaces**, so a persistent `1` exposes the bypass to your network.
+> - **Never against a shared, staging or production `DATABASE_URL` or `AUTH_SECRET`.** A session signed
+>   here is valid on every instance that accepts the same secret.
+> - While it is on, a web page you visit can make your browser issue that `GET`: loopback binding is
+>   not per-request approval.
+> - The switch is **not a secret**, and turning it off does **not** revoke sessions already issued
+>   (they expire as usual, 30 days). There is nothing to migrate.
+>
+> To change the setting, stop the server and start it again with the launch you want — that is the
+> deterministic way to change what a running process was started with.
 
 > ⚠️ **`.env.local` is only auto-loaded by `next dev`.** This repo has **no `dotenv` dependency**, so
 > `npm run pg:schema`, `npm run admin` and `npm run embed:backfill` read the *shell* environment and
@@ -729,6 +764,7 @@ shipping app code ahead of its database.
 | `PGSSL` / `PGSSLMODE` | unset | Set to `require` for managed Postgres |
 | `SENTRY_DSN`, `NEXT_PUBLIC_SENTRY_DSN`, … | unset | Fully inert when unset |
 | `DOC_TASK_INFER_INTERVAL_HOURS` | `12` | Cooldown on the paid doc→task inference pass |
+| `AIOS_DEV_LOGIN` | `0` → off | **Local development only.** Exactly `1` enables the `/auth/dev-login` bypass on a non-production server for strictly local requests; production always refuses. Don't persist `1` — use `npm run dev:login` (§2.7). Not a secret. |
 
 Also read but rarely needed: `PG_POOL_MAX`, `PG_STATEMENT_TIMEOUT_MS`, `PG_IDLE_TX_TIMEOUT_MS`,
 `PG_CONNECT_TIMEOUT_MS`, `PG_MIGRATION_LOCK_TIMEOUT_MS`, `FTS_CANDIDATE_LIMIT`,
@@ -931,8 +967,9 @@ which distinguishes a scope failure from the far more common "ran fine, nothing 
 
 No email transport configured. **The link is never printed to the console** — it is a one-time
 credential, so the mailer logs only the subject and recipient (`[mailer] (dev, no provider) would
-send …`). In development, sign in via `/auth/dev-login` or with the password `npm run admin --
-create-member` prints. In production, set `RESEND_API_KEY` + `RESEND_FROM` (a verified domain —
+send …`). In development, sign in with the password `npm run admin -- create-member` prints, or
+start the server with `npm run dev:login` and open `/auth/dev-login` on `127.0.0.1` (off by default
+and loopback only — §2.7). In production, set `RESEND_API_KEY` + `RESEND_FROM` (a verified domain —
 Resend's `onboarding@resend.dev` only delivers to the account owner) or `SMTP_URL` + `SMTP_FROM`.
 Also confirm `APP_URL` is set, or links are built against nothing. Note that
 `POST /api/auth/request-magic-link` returns `200` whether or not the mail went anywhere, so a

@@ -12,11 +12,14 @@ import {
   NEXT_LOADED_ENV_FILES,
   RUNTIME_SOURCE_FILES,
   allocateLoopbackPort,
+  assertBuildRecordCurrent,
   assertNoNextEnvFiles,
   buildChildEnv,
   cacheControlDirectives,
+  changedKeys,
   findNextEnvFiles,
   fingerprintFiles,
+  inventoryServerJs,
   parseSetCookie,
   rawGet,
   readProductionArtifact,
@@ -63,12 +66,31 @@ const DEV_REQUEST_TIMEOUT_MS = 120_000;
 const email = (label: string): string => `${label}-${randomUUID().slice(0, 8)}@${DOMAIN}`;
 const evidence = (name: string, data: unknown): void => console.log(`DEV_LOGIN_EVIDENCE ${name} ${JSON.stringify(data)}`);
 
-// Recorded before any child exists; compared again after the last one is gone.
+// Recorded before any child exists; compared again after the last one is gone. The build record is
+// checked CURRENT at the same moment: the artifact the production children serve is the one the
+// recorder watched `npm run build` produce, exit 0, from the tracked sources as they are now.
+const current = assertBuildRecordCurrent(CWD);
 const baseline = {
-  artifact: readProductionArtifact(CWD),
-  sources: fingerprintFiles(CWD, RUNTIME_SOURCE_FILES),
+  artifact: current.artifact,
+  serverJs: current.serverJs,
+  record: current.record,
+  sources: current.sources,
   generated: fingerprintFiles(CWD, GENERATED_FILES),
 };
+const serverJsSummary = (inventory: { files: number; bytes: number; nonRegular: number; hash: string }) => ({
+  files: inventory.files,
+  bytes: inventory.bytes,
+  nonRegular: inventory.nonRegular,
+  hash: inventory.hash,
+});
+
+/** The emitted server JS — entries, runtime and every chunk — is byte-for-byte what was recorded. */
+function expectServerJsUnchanged(): void {
+  const now = inventoryServerJs(CWD);
+  expect(changedKeys(baseline.serverJs.entries, now.entries)).toEqual([]);
+  expect(now.hash).toBe(baseline.serverJs.hash);
+  expect(now.hash).toBe(baseline.record.serverJs.hash);
+}
 
 // ── synthetic database fixtures (this route's effects only) ─────────────────────────────────────
 
@@ -321,6 +343,7 @@ describe("dev-login carrier preflight and environment (pure)", () => {
     return dir;
   };
   afterEach(() => {
+    vi.unstubAllEnvs();
     for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
 
@@ -471,11 +494,12 @@ describe("dev-login carrier preflight and environment (pure)", () => {
   });
 
   it("an absent DATABASE_TEST_URL is a named setup failure, never a fallback to DATABASE_URL", () => {
-    const ambient = { DATABASE_URL: "postgres://app:app@127.0.0.1:5432/app_test" };
+    // A usable-looking DATABASE_URL is set in this very process, and is never consulted.
+    vi.stubEnv("DATABASE_URL", "postgres://app:app@127.0.0.1:5432/app_test");
     for (const raw of [undefined, ""]) {
       let thrown: unknown;
       try {
-        validateSyntheticDatabaseUrl(raw, ambient);
+        validateSyntheticDatabaseUrl(raw);
       } catch (err) {
         thrown = err;
       }
@@ -484,24 +508,30 @@ describe("dev-login carrier preflight and environment (pure)", () => {
     }
   });
 
+  // Loopback ONLY. The data-mechanics job's `postgres:5432` service hostname is that tier's contract,
+  // not this carrier's: the HTTP job that runs the wire cases publishes its service on localhost:5434.
   it.each([
-    ["a remote host", "postgres://app:credential-marker@db.example.com:5432/app_test", {}],
-    ["a non-test database on loopback", "postgres://app:credential-marker@127.0.0.1:5432/app", {}],
-    ["a development database on loopback", "postgres://app:credential-marker@localhost:5432/aios_dev", {}],
-    ["the CI service hostname outside CI", "postgres://app:credential-marker@postgres:5432/app_test", {}],
-    ["a non-postgres URL", "https://app:credential-marker@127.0.0.1:5432/app_test", {}],
-    ["an unparseable value", "credential-marker not a url", {}],
-    ["an unparseable value with no whitespace", "credential-marker-not-a-url", {}],
-  ])("an unsafe DATABASE_TEST_URL (%s) is refused without echoing it", (_name, raw, ambient) => {
-    let thrown: unknown;
-    try {
-      validateSyntheticDatabaseUrl(raw, ambient);
-    } catch (err) {
-      thrown = err;
+    ["a remote host", "postgres://app:credential-marker@db.example.com:5432/app_test"],
+    ["a non-test database on loopback", "postgres://app:credential-marker@127.0.0.1:5432/app"],
+    ["a development database on loopback", "postgres://app:credential-marker@localhost:5432/aios_dev"],
+    ["the data-mechanics CI service hostname", "postgres://app:credential-marker@postgres:5432/app_test"],
+    ["a non-postgres URL", "https://app:credential-marker@127.0.0.1:5432/app_test"],
+    ["an unparseable value", "credential-marker not a url"],
+    ["an unparseable value with no whitespace", "credential-marker-not-a-url"],
+  ])("an unsafe DATABASE_TEST_URL (%s) is refused without echoing it", (_name, raw) => {
+    // Refused wherever it runs: being inside GitHub Actions unlocks no non-loopback host.
+    for (const githubActions of [undefined, "true"]) {
+      vi.stubEnv("GITHUB_ACTIONS", githubActions);
+      let thrown: unknown;
+      try {
+        validateSyntheticDatabaseUrl(raw);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(DevLoginSetupFailure);
+      expect((thrown as DevLoginSetupFailure).kind).toBe("database-url-unsafe");
+      expect((thrown as DevLoginSetupFailure).message).not.toContain("credential-marker");
     }
-    expect(thrown).toBeInstanceOf(DevLoginSetupFailure);
-    expect((thrown as DevLoginSetupFailure).kind).toBe("database-url-unsafe");
-    expect((thrown as DevLoginSetupFailure).message).not.toContain("credential-marker");
   });
 
   // The validated value is handed RAW to pg, whose installed connection-string parser lets a query
@@ -523,17 +553,17 @@ describe("dev-login carrier preflight and environment (pure)", () => {
     ["a fragment", "#override-marker"],
     ["a query behind a fragment", "#?host=override-marker.example"],
   ])("a DATABASE_TEST_URL carrying %s is refused whole, while the same URL without it is accepted", (_name, suffix) => {
-    for (const { plain, ambient } of [
-      { plain: "postgres://app:credential-marker@127.0.0.1:58479/app_test", ambient: {} },
-      { plain: "postgres://app:credential-marker@localhost:5434/app_test", ambient: {} },
-      { plain: "postgres://app:credential-marker@postgres:5432/app_test", ambient: { GITHUB_ACTIONS: "true" } },
+    for (const plain of [
+      "postgres://app:credential-marker@127.0.0.1:58479/app_test",
+      "postgres://app:credential-marker@localhost:5434/app_test",
+      "postgres://app:credential-marker@[::1]:5434/app_test",
     ]) {
       // Paired control: only the suffix differs, and the accepted value is returned byte-for-byte.
-      expect(validateSyntheticDatabaseUrl(plain, ambient).url).toBe(plain);
+      expect(validateSyntheticDatabaseUrl(plain).url).toBe(plain);
 
       let thrown: unknown;
       try {
-        validateSyntheticDatabaseUrl(`${plain}${suffix}`, ambient);
+        validateSyntheticDatabaseUrl(`${plain}${suffix}`);
       } catch (err) {
         thrown = err;
       }
@@ -565,20 +595,20 @@ describe("dev-login carrier preflight and environment (pure)", () => {
     { name: "a trailing NUL", mutate: (plain) => `${plain}\u0000` },
     { name: "a DEL inside the database name", mutate: (plain) => plain.replace("/app_test", "/app\u007f_test") },
   ])("a DATABASE_TEST_URL holding $name is refused raw, while the same URL without it is accepted", ({ mutate }) => {
-    for (const { plain, ambient } of [
-      { plain: "postgres://app:credential-marker@127.0.0.1:58479/app_test", ambient: {} },
-      { plain: "postgres://app:credential-marker@localhost:5434/app_test", ambient: {} },
-      { plain: "postgres://app:credential-marker@postgres:5432/app_test", ambient: { GITHUB_ACTIONS: "true" } },
+    for (const plain of [
+      "postgres://app:credential-marker@127.0.0.1:58479/app_test",
+      "postgres://app:credential-marker@localhost:5434/app_test",
+      "postgres://app:credential-marker@[::1]:5434/app_test",
     ]) {
       // Paired control: only the one raw character differs.
-      expect(validateSyntheticDatabaseUrl(plain, ambient).url).toBe(plain);
+      expect(validateSyntheticDatabaseUrl(plain).url).toBe(plain);
       const raw = mutate(plain);
       expect(raw).not.toBe(plain);
       expect(raw.length).toBeGreaterThan(plain.length);
 
       let thrown: unknown;
       try {
-        validateSyntheticDatabaseUrl(raw, ambient);
+        validateSyntheticDatabaseUrl(raw);
       } catch (err) {
         thrown = err;
       }
@@ -596,16 +626,19 @@ describe("dev-login carrier preflight and environment (pure)", () => {
       "postgres://app:p%20ss%09w%0Aor%7Fd@127.0.0.1:58479/app_test",
       "postgres://us%20er:p%00ss@localhost:5434/app_test",
     ]) {
-      expect(validateSyntheticDatabaseUrl(plain, {})).toEqual({ url: plain, hostClass: "loopback", database: "app_test" });
+      expect(validateSyntheticDatabaseUrl(plain)).toEqual({ url: plain, hostClass: "loopback", database: "app_test" });
     }
   });
 
-  it("an owned loopback test database and the CI job's isolated service are accepted", () => {
-    expect(validateSyntheticDatabaseUrl("postgres://app:app@127.0.0.1:58479/app_test", {}).hostClass).toBe("loopback");
-    expect(validateSyntheticDatabaseUrl("postgres://app:app@localhost:5434/app_test", {}).hostClass).toBe("loopback");
-    expect(
-      validateSyntheticDatabaseUrl("postgres://app:app@postgres:5432/app_test", { GITHUB_ACTIONS: "true" }).hostClass
-    ).toBe("ci-service");
+  it("an owned loopback test database is accepted — the CI HTTP job's published localhost:5434 included — and nothing else", () => {
+    expect(validateSyntheticDatabaseUrl("postgres://app:app@127.0.0.1:58479/app_test").hostClass).toBe("loopback");
+    expect(validateSyntheticDatabaseUrl("postgres://app:app@localhost:5434/app_test").hostClass).toBe("loopback");
+    expect(validateSyntheticDatabaseUrl("postgres://app:app@[::1]:5434/app_test").hostClass).toBe("loopback");
+    // The service hostname the data-mechanics job uses is not a wire-carrier database, in CI or out.
+    vi.stubEnv("GITHUB_ACTIONS", "true");
+    expect(() => validateSyntheticDatabaseUrl("postgres://app:app@postgres:5432/app_test")).toThrow(
+      /SETUP_FAILURE\[database-url-unsafe\]/
+    );
   });
 
   it("Cache-Control is compared by directive token, not by substring", () => {
@@ -638,9 +671,27 @@ describe.each([
     // Next's own startup warning is the child's testimony about its runtime mode: `next start` under
     // NODE_ENV=development is non-standard; under NODE_ENV=production it is not.
     expect(child.output().includes('non-standard "NODE_ENV"')).toBe(nonStandardWarning);
-    // The artifact being served is the one recorded before any child started.
+    // The artifact being served is the one recorded before any child started — and the one the build
+    // recorder observed: the ordinary build command, exit 0, bound to the sources as they are now.
     expect(readProductionArtifact(CWD).buildId).toBe(baseline.artifact.buildId);
-    evidence("production-child", { ...record, buildId: baseline.artifact.buildId, routeEntry: baseline.artifact.routeEntry });
+    expect(baseline.record.command).toEqual(["npm", "run", "build"]);
+    expect(baseline.record.exitCode).toBe(0);
+    expect(baseline.record.buildId).toBe(baseline.artifact.buildId);
+    expect(baseline.record.sourcesBefore).toEqual(baseline.record.sourcesAfter);
+    expect(fingerprintFiles(CWD, RUNTIME_SOURCE_FILES)).toEqual(baseline.record.sourcesAfter);
+    expectServerJsUnchanged();
+    evidence("production-child", {
+      ...record,
+      buildId: baseline.artifact.buildId,
+      routeEntry: baseline.artifact.routeEntry,
+      serverJs: serverJsSummary(baseline.serverJs),
+      buildRecord: {
+        command: baseline.record.command,
+        exitCode: baseline.record.exitCode,
+        startedAt: baseline.record.startedAt,
+        finishedAt: baseline.record.finishedAt,
+      },
+    });
   });
 
   it("production denies a valid local authority with the handler's own 404: no cookie, no Location, no auth rows", async () => {
@@ -678,6 +729,7 @@ describe.each([
     expect(now.buildId).toBe(baseline.artifact.buildId);
     expect(now.buildIdMtimeMs).toBe(baseline.artifact.buildIdMtimeMs);
     expect(now.fingerprint).toBe(baseline.artifact.fingerprint);
+    expectServerJsUnchanged();
   });
 });
 
@@ -971,7 +1023,16 @@ describe("after the development children", () => {
     expect(now.buildIdMtimeMs).toBe(baseline.artifact.buildIdMtimeMs);
     expect(now.fingerprint).toBe(baseline.artifact.fingerprint);
     expect(existsSync(join(CWD, ".next", "dev"))).toBe(true);
-    evidence("artifact-after-dev", { buildId: now.buildId, fingerprint: now.fingerprint, devDistDir: ".next/dev" });
+    // Every emitted server JS file — not only the route's entry — is what it was before the first
+    // production child, and the build record still describes the artifact and the checkout.
+    expectServerJsUnchanged();
+    expect(assertBuildRecordCurrent(CWD).record).toEqual(baseline.record);
+    evidence("artifact-after-dev", {
+      buildId: now.buildId,
+      fingerprint: now.fingerprint,
+      serverJs: { before: serverJsSummary(baseline.serverJs), after: serverJsSummary(inventoryServerJs(CWD)) },
+      devDistDir: ".next/dev",
+    });
   });
 
   it("no tracked runtime source changed while the children ran (generated files are reported separately)", () => {

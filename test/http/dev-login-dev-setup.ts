@@ -14,8 +14,10 @@ import { scrubbedEnv } from "../../scripts/test-env-scrub";
  *
  * What lives here:
  *   - the PREFLIGHT (default export, run as the carrier's global setup): refuse before any spawn when
- *     the checkout holds a Next-loaded env file, the synthetic database URL is absent/unsafe, or there
- *     is no production build to consume. The carrier never builds, copies or reuses an artifact itself.
+ *     the checkout holds a Next-loaded env file, the synthetic database URL is absent/unsafe, there is
+ *     no production build to consume, or that build has no CURRENT build record. The carrier never
+ *     builds, copies or reuses an artifact itself: the record is written by the separate recorder
+ *     (`dev-login-build-record.ts`, `npm run test:http:dev-login:build`) and only READ here.
  *   - the child ENVIRONMENT: a finite OS allowlist plus explicit synthetic values. Nothing ambient is
  *     inherited, so a developer shell exporting a provider key, a scheduler switch, an opt-in or
  *     NODE_OPTIONS cannot reach a child.
@@ -38,6 +40,11 @@ export type SetupFailureKind =
   | "database-url-missing"
   | "database-url-unsafe"
   | "build-missing"
+  | "build-failed"
+  | "build-source-changed"
+  | "build-record-missing"
+  | "build-record-invalid"
+  | "build-record-stale"
   | "port-in-use"
   | "held-lock"
   | "child-exited"
@@ -100,12 +107,10 @@ export function assertNoNextEnvFiles(dir: string): void {
 // ── synthetic database URL ──────────────────────────────────────────────────────────────────────
 
 const LOOPBACK_DATABASE_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
-/** The isolated PostgreSQL service hostname of a containerised CI job (the data-mechanics job). */
-const CI_SERVICE_DATABASE_HOST = "postgres";
 
 export interface SyntheticDatabase {
   url: string;
-  hostClass: "loopback" | "ci-service";
+  hostClass: "loopback";
   database: string;
 }
 
@@ -120,9 +125,13 @@ function hasRawAsciiControlOrSpace(value: string): boolean {
 
 /**
  * The carrier's ONLY database source is DATABASE_TEST_URL. It never falls back to DATABASE_URL, and
- * it accepts only an owned loopback Postgres (or, inside GitHub Actions, the job's isolated service
- * hostname) whose database name ends in `_test`. Refusal messages never echo the URL: it carries
- * credentials.
+ * it accepts only an owned LOOPBACK Postgres whose database name ends in `_test`. Refusal messages
+ * never echo the URL: it carries credentials.
+ *
+ * Loopback only, in CI too, and whatever the ambient environment says: the HTTP job that runs this
+ * carrier publishes its service on localhost:5434, so no service-hostname exception is needed here.
+ * The data-mechanics tier's `postgres:5432` service contract belongs to that tier's own config
+ * (vitest.datamechanics.config.ts) and is untouched; it is simply not a wire-carrier database.
  *
  * The URL must be PLAIN — no query string and no fragment. The value returned here is handed raw to
  * `pg` (the fixture client and, as DATABASE_URL, every child's pool), and the installed
@@ -140,10 +149,7 @@ function hasRawAsciiControlOrSpace(value: string): boolean {
  * `pg` as host `base`, and a trailing space names a different database than the one checked.
  * Percent-encoded bytes (`%20` in a credential) are untouched by both parsers and stay supported.
  */
-export function validateSyntheticDatabaseUrl(
-  raw: string | undefined,
-  ambient: NodeJS.ProcessEnv = process.env
-): SyntheticDatabase {
+export function validateSyntheticDatabaseUrl(raw: string | undefined): SyntheticDatabase {
   if (!raw) {
     throw new DevLoginSetupFailure(
       "database-url-missing",
@@ -175,14 +181,8 @@ export function validateSyntheticDatabaseUrl(
         "after the database name are not allowed)"
     );
   }
-  const inCi = ambient.GITHUB_ACTIONS === "true";
-  const hostClass = LOOPBACK_DATABASE_HOSTS.has(parsed.hostname)
-    ? "loopback"
-    : inCi && parsed.hostname === CI_SERVICE_DATABASE_HOST
-      ? "ci-service"
-      : null;
-  if (!hostClass) {
-    throw unsafe("does not point at an owned loopback Postgres (or the CI job's isolated service)");
+  if (!LOOPBACK_DATABASE_HOSTS.has(parsed.hostname)) {
+    throw unsafe("does not point at an owned loopback Postgres");
   }
   let database: string;
   try {
@@ -193,7 +193,7 @@ export function validateSyntheticDatabaseUrl(
   if (!/_test$/.test(database)) {
     throw unsafe("does not name a dedicated test database (the name must end in `_test`)");
   }
-  return { url: raw, hostClass, database };
+  return { url: raw, hostClass: "loopback", database };
 }
 
 // ── child environment ───────────────────────────────────────────────────────────────────────────
@@ -752,17 +752,25 @@ export interface ProductionArtifact {
 
 const DEV_LOGIN_APP_PATH = "/auth/dev-login/route";
 
+/** The package's ordinary build, exactly as CI runs it — the only command a build record may name. */
+export const BUILD_RECORD_COMMAND: readonly string[] = ["npm", "run", "build"];
+/** Inside `.next`, which `next build` clears first: a rebuild by any route removes the old record. */
+export const BUILD_RECORD_FILE = join(".next", "aio1210-dev-login-build-record.json");
+const BUILD_RECORDER = "npm run test:http:dev-login:build";
+
+const missingBuild = (what: string) =>
+  new DevLoginSetupFailure(
+    "build-missing",
+    `${what}. Run a successful \`${BUILD_RECORDER}\` from canonical bytes first; this carrier never builds or copies one.`
+  );
+
 /**
  * Read (never write) the production build this carrier consumes. A missing or incomplete build is
  * a SETUP_FAILURE: the carrier does not build, copy or reuse an artifact on its own.
  */
 export function readProductionArtifact(cwd: string = process.cwd()): ProductionArtifact {
   const dist = join(cwd, ".next");
-  const missing = (what: string) =>
-    new DevLoginSetupFailure(
-      "build-missing",
-      `${what}. Run a successful \`npm run build\` from canonical bytes first; this carrier never builds or copies one.`
-    );
+  const missing = missingBuild;
   const buildIdPath = join(dist, "BUILD_ID");
   if (!existsSync(buildIdPath)) throw missing("no production build (.next/BUILD_ID)");
   const buildId = readFileSync(buildIdPath, "utf8").trim();
@@ -793,6 +801,66 @@ export function readProductionArtifact(cwd: string = process.cwd()): ProductionA
   };
 }
 
+export interface ServerJsInventory {
+  /** Regular `.js` files under `.next/server`. */
+  files: number;
+  bytes: number;
+  /** Entries that are neither a directory nor a regular file: named, never followed or read. */
+  nonRegular: number;
+  /** sha256 over the sorted `<path>\0<content sha256>` lines. */
+  hash: string;
+  /** Content hash per POSIX path relative to `.next/server`. */
+  entries: Record<string, string>;
+}
+
+const NON_REGULAR = "<non-regular>";
+
+/**
+ * Every JavaScript file the production build emitted for the server — route entries, the runtime
+ * and all chunks — with a content hash each. The route's own entry can be a thin loader whose
+ * handler lives in shared chunks, so the entry hash in `readProductionArtifact` does not pin the
+ * handler's bytes on its own; this does. Deterministic: paths are sorted by code unit, whatever
+ * order the directory lists them in. Source maps are not read (`*.js.map` is not `*.js`), and a dev
+ * server's output is under `.next/dev`, outside `.next/server`, so it can never enter. Read-only.
+ */
+export function inventoryServerJs(cwd: string = process.cwd()): ServerJsInventory {
+  const root = join(cwd, ".next", "server");
+  if (!existsSync(root)) throw missingBuild("no production server output (.next/server)");
+  const found: [string, string][] = [];
+  let files = 0;
+  let bytes = 0;
+  let nonRegular = 0;
+  const walk = (rel: string): void => {
+    for (const entry of readdirSync(rel === "" ? root : join(root, rel), { withFileTypes: true })) {
+      const child = rel === "" ? entry.name : `${rel}/${entry.name}`;
+      if (entry.isDirectory()) {
+        walk(child);
+      } else if (!entry.isFile()) {
+        nonRegular += 1;
+        found.push([child, NON_REGULAR]);
+      } else if (entry.name.endsWith(".js")) {
+        const data = readFileSync(join(root, child));
+        files += 1;
+        bytes += data.length;
+        found.push([child, sha256(data)]);
+      }
+    }
+  };
+  walk("");
+  found.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  const hash = createHash("sha256");
+  for (const [rel, digest] of found) hash.update(`${rel}\0${digest}\n`);
+  return { files, bytes, nonRegular, hash: hash.digest("hex"), entries: Object.fromEntries(found) };
+}
+
+/** Keys whose value differs between two hash maps (changed, added or removed), sorted and bounded. */
+export function changedKeys(before: Record<string, string>, after: Record<string, string>, limit = 20): string[] {
+  return [...new Set([...Object.keys(before), ...Object.keys(after)])]
+    .filter((key) => before[key] !== after[key])
+    .sort()
+    .slice(0, limit);
+}
+
 /** Tracked sources whose bytes decide what the children run. Recorded before and after the run. */
 export const RUNTIME_SOURCE_FILES = [
   "app/auth/dev-login/route.ts",
@@ -818,6 +886,123 @@ export function fingerprintFiles(cwd: string, files: readonly string[]): Record<
   );
 }
 
+export function assertTaskRoot(cwd: string): void {
+  if (!existsSync(join(cwd, "app", "auth", "dev-login", "route.ts"))) {
+    throw new DevLoginSetupFailure("wrong-cwd", "run the carrier with cwd set to the task worktree root");
+  }
+}
+
+// ── build record (read-only here; written by dev-login-build-record.ts) ─────────────────────────
+
+/**
+ * What the recorder OBSERVED around one run of the build command — not a success flag. It is written
+ * only after that command exited 0 with the tracked runtime sources byte-identical before and after,
+ * and it binds those source hashes to the BUILD_ID and server output the command left behind.
+ */
+export interface BuildRecord {
+  schema: 1;
+  /** The command the recorder ran, verbatim. */
+  command: string[];
+  /** The exit status the recorder observed from that command. */
+  exitCode: number;
+  startedAt: string;
+  finishedAt: string;
+  sourcesBefore: Record<string, string>;
+  sourcesAfter: Record<string, string>;
+  generatedBefore: Record<string, string>;
+  generatedAfter: Record<string, string>;
+  buildId: string;
+  routeEntry: string;
+  artifactFingerprint: string;
+  serverJs: { files: number; bytes: number; nonRegular: number; hash: string };
+}
+
+const isHashMap = (value: unknown): value is Record<string, string> =>
+  typeof value === "object" &&
+  value !== null &&
+  !Array.isArray(value) &&
+  Object.values(value).every((entry) => typeof entry === "string");
+
+function parseBuildRecord(text: string): BuildRecord | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (typeof value !== "object" || value === null) return null;
+  const record = value as Partial<BuildRecord>;
+  const serverJs: unknown = record.serverJs;
+  const wellFormed =
+    record.schema === 1 &&
+    Array.isArray(record.command) &&
+    record.command.every((part) => typeof part === "string") &&
+    typeof record.exitCode === "number" &&
+    isHashMap(record.sourcesBefore) &&
+    isHashMap(record.sourcesAfter) &&
+    typeof record.buildId === "string" &&
+    typeof record.routeEntry === "string" &&
+    typeof record.artifactFingerprint === "string" &&
+    typeof serverJs === "object" &&
+    serverJs !== null &&
+    typeof (serverJs as { hash?: unknown }).hash === "string";
+  return wellFormed ? (value as BuildRecord) : null;
+}
+
+export interface CurrentBuild {
+  record: BuildRecord;
+  artifact: ProductionArtifact;
+  serverJs: ServerJsInventory;
+  sources: Record<string, string>;
+}
+
+/**
+ * Refuse unless the production build in `cwd` carries a build record that still describes it AND
+ * the checkout: the record's own claims are re-checked (the ordinary build command, exit 0, sources
+ * identical across the build), then compared with the tracked sources, BUILD_ID, route artifact and
+ * server JS inventory as they are NOW. Read-only; `expectedCommand` exists for the recorder's own
+ * stand-in tests and is never passed by the carrier.
+ */
+export function assertBuildRecordCurrent(
+  cwd: string = process.cwd(),
+  expectedCommand: readonly string[] = BUILD_RECORD_COMMAND
+): CurrentBuild {
+  const artifact = readProductionArtifact(cwd);
+  const rebuild = `Rebuild with \`${BUILD_RECORDER}\`; this carrier never builds or copies one.`;
+  const path = join(cwd, BUILD_RECORD_FILE);
+  if (!existsSync(path)) {
+    throw new DevLoginSetupFailure(
+      "build-record-missing",
+      `the production build has no build record (${BUILD_RECORD_FILE}), so nothing ties it to the current sources. ${rebuild}`
+    );
+  }
+  const invalid = (why: string) =>
+    new DevLoginSetupFailure("build-record-invalid", `the build record ${why}. ${rebuild}`);
+  const record = parseBuildRecord(readFileSync(path, "utf8"));
+  if (!record) throw invalid("is not a readable schema-1 record");
+  if (record.command.join("\0") !== expectedCommand.join("\0")) {
+    throw invalid(`is not for the ordinary build command \`${expectedCommand.join(" ")}\``);
+  }
+  if (record.exitCode !== 0) throw invalid(`reports exit status ${record.exitCode}, not 0`);
+  const duringBuild = changedKeys(record.sourcesBefore, record.sourcesAfter);
+  if (duringBuild.length > 0) throw invalid(`reports sources that changed during the build: ${duringBuild.join(", ")}`);
+
+  const stale = (why: string) =>
+    new DevLoginSetupFailure("build-record-stale", `the build record no longer describes this checkout: ${why}. ${rebuild}`);
+  const sources = fingerprintFiles(cwd, RUNTIME_SOURCE_FILES);
+  const sinceBuild = changedKeys(record.sourcesAfter, sources);
+  if (sinceBuild.length > 0) throw stale(`source(s) changed since the build: ${sinceBuild.join(", ")}`);
+  if (artifact.buildId !== record.buildId) throw stale("BUILD_ID differs from the recorded build");
+  if (artifact.fingerprint !== record.artifactFingerprint) throw stale("the route's manifests or entry differ from the recorded build");
+  const serverJs = inventoryServerJs(cwd);
+  if (serverJs.hash !== record.serverJs.hash) {
+    throw stale(
+      `the server JS inventory differs from the recorded build (${serverJs.files} files now, ${record.serverJs.files} recorded)`
+    );
+  }
+  return { record, artifact, serverJs, sources };
+}
+
 // ── global setup: the preflight ─────────────────────────────────────────────────────────────────
 
 /**
@@ -826,12 +1011,10 @@ export function fingerprintFiles(cwd: string, files: readonly string[]): Record<
  */
 export default async function devLoginCarrierPreflight(): Promise<() => Promise<void>> {
   const cwd = process.cwd();
-  if (!existsSync(join(cwd, "app", "auth", "dev-login", "route.ts"))) {
-    throw new DevLoginSetupFailure("wrong-cwd", "run the carrier with cwd set to the task worktree root");
-  }
+  assertTaskRoot(cwd);
   assertNoNextEnvFiles(cwd);
   const database = validateSyntheticDatabaseUrl(process.env.DATABASE_TEST_URL);
-  const artifact = readProductionArtifact(cwd);
+  const { record, artifact, serverJs, sources } = assertBuildRecordCurrent(cwd);
   console.log(
     `DEV_LOGIN_CARRIER_PREFLIGHT_OK ${JSON.stringify({
       envFilesPresent: [],
@@ -839,7 +1022,14 @@ export default async function devLoginCarrierPreflight(): Promise<() => Promise<
       buildId: artifact.buildId,
       routeEntry: artifact.routeEntry,
       artifactFingerprint: artifact.fingerprint,
-      sources: fingerprintFiles(cwd, RUNTIME_SOURCE_FILES),
+      serverJs: { files: serverJs.files, bytes: serverJs.bytes, nonRegular: serverJs.nonRegular, hash: serverJs.hash },
+      buildRecord: {
+        command: record.command,
+        exitCode: record.exitCode,
+        startedAt: record.startedAt,
+        finishedAt: record.finishedAt,
+      },
+      sources,
       generated: fingerprintFiles(cwd, GENERATED_FILES),
     })}`
   );

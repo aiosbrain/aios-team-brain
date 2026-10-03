@@ -221,7 +221,13 @@ jobs:
       - run: npm ci
       - run: DATABASE_URL="$DATABASE_TEST_URL" npm run pg:schema
       # Production build first; global-setup spawns `next start` against .next.
-      - run: npm run build
+      # AIO-1210: the build is still the ordinary `npm run build`, with this job's environment and
+      # output unchanged — run by the dev-login carrier's recorder so that a later step can tell the
+      # artifact was built from these sources. Before the build it refuses a checkout holding any of
+      # the eight Next-loaded env files; after it, and only when the command exited 0 with the tracked
+      # runtime sources byte-identical, it writes the build record the dev-login step below requires.
+      # The step fails exactly when the build fails or that record cannot be written honestly.
+      - run: npm run test:http:dev-login:build
       - run: npm run test:http
       - run: npm run test:http:gateway-approval
       # TIERRET-1 (AC-03/05/11): the real /api/v1/query route against loopback fake answering +
@@ -233,9 +239,10 @@ jobs:
       # AIO-1210: /auth/dev-login over a real loopback socket, with its OWN owned children — the
       # production build from this job under NODE_ENV=production and under NODE_ENV=development
       # (hard-off even with AIOS_DEV_LOGIN=1), then `next dev` with the opt-in off and on. Sequential
-      # and last: it consumes the build above (never rebuilds or copies one), allocates its own
-      # loopback ports, gives each child an allowlisted synthetic environment, and re-checks BUILD_ID
-      # after the dev servers. No skip path: a held lock or failed start is a named SETUP_FAILURE.
+      # and last: it consumes the build above (never rebuilds or copies one) and first checks that
+      # build's record is current, allocates its own loopback ports, gives each child an allowlisted
+      # synthetic environment, and re-checks BUILD_ID and the emitted server JS after the dev servers.
+      # No skip path: a held lock, failed start or stale build record is a named SETUP_FAILURE.
       - run: npm run test:http:dev-login
 
   # The real-Neo4j tier — the ONLY behavioural proof that graph tier isolation holds (group_id is

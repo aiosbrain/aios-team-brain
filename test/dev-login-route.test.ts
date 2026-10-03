@@ -430,6 +430,9 @@ describe("GET /auth/dev-login — URL and forwarded consistency (AC04)", () => {
     { label: "URL upper-case LOCALHOST", url: `http://LOCALHOST:3000${PATH}`, host: "localhost:3000", origin: "http://localhost:3000" },
     { label: "https URL 127.0.0.1, Host localhost", url: `https://127.0.0.1:3000${PATH}`, host: "localhost:3000", origin: "https://localhost:3000" },
     { label: "https default port, Host :443", url: `https://localhost${PATH}`, host: "localhost:443", origin: "https://localhost" },
+    // The URL rule reads the PARSED hostname (the parser canonicalises 127.1 to 127.0.0.1); the Host
+    // rule is lexical, so the same spelling as a raw Host is refused above ("the short numeric form").
+    { label: "URL short numeric 127.1, canonical Host 127.0.0.1", url: `http://127.1:3000${PATH}`, host: "127.0.0.1:3000", origin: "http://127.0.0.1:3000" },
   ];
 
   it.each(URL_ALIASES)("local URL aliases with an equal effective port admit on the raw Host: $label", async ({ url, host, origin }) => {

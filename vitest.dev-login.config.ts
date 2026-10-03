@@ -9,11 +9,13 @@ import { scrubbedEnv } from "./scripts/test-env-scrub";
 // `dev-login.dev-http.test.ts`, the unit config excludes `test/http/**`, and nothing here touches the
 // shared `next start` server, its port or its global setup.
 //
-// Run by `npm run test:http:dev-login`, AFTER a successful `npm run build` and never concurrently with
-// another suite on the same test database. The global setup (test/http/dev-login-dev-setup.ts) is the
-// preflight: it refuses a checkout holding a Next-loaded env file, an absent/unsafe DATABASE_TEST_URL,
-// or a missing build — before any child is spawned. This file may not import from `test/` at runtime
-// (AC18-07), so the setup is referenced by path and the shared scrub comes from `scripts/`.
+// Run by `npm run test:http:dev-login`, AFTER `npm run test:http:dev-login:build` (the ordinary
+// `npm run build`, run by the recorder that binds it to the current sources) and never concurrently
+// with another suite on the same test database. The global setup (test/http/dev-login-dev-setup.ts)
+// is the preflight: it refuses a checkout holding a Next-loaded env file, an absent/unsafe/non-loopback
+// DATABASE_TEST_URL, a missing build, or a build whose record is absent or no longer current — before
+// any child is spawned. The carrier itself never builds. This file may not import from `test/` at
+// runtime (AC18-07), so the setup is referenced by path and the shared scrub comes from `scripts/`.
 
 // No-prod-fallback guard (same contract as the other real-database tiers).
 const databaseTestUrl = process.env.DATABASE_TEST_URL;
