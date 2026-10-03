@@ -195,9 +195,11 @@ jobs:
   http-tests:
     name: Integration tests (HTTP)
     runs-on: ubuntu-latest
-    # Now a blocking gate: the job was green on >5 consecutive `main` runs (the documented
-    # promotion bar — see docs/CI-ARCHITECTURE.md). To finish the promotion, add the
-    # "Integration tests (HTTP)" check to branch protection on `main` (repo Settings → Branches).
+    # A blocking gate: no continue-on-error here, and "Integration tests (HTTP)" is a REQUIRED status
+    # check on both `main` and `staging` (classic branch protection, read back from the live API
+    # during AIO-1210; `main` also requires an up-to-date branch, `staging` does not). It is one of
+    # the contexts in the desired release contract too (scripts/staging-ops/main-policy.mjs).
+    # Re-verify against the protection API, not this comment, before relying on it.
     services:
       postgres:
         image: postgres:16
@@ -228,9 +230,12 @@ jobs:
       # provider, graph and mail settings blank; no NODE_OPTIONS) and passes only this job's validated
       # loopback DATABASE_TEST_URL as the database, never DATABASE_URL. Before the build it refuses a
       # checkout holding any of the eight Next-loaded env files; after it, and only when the command
-      # exited 0 with the runtime source inventory identical (every file under app/, lib/,
-      # components/, config/, scripts/, postgres/, public/ plus the root config/package/lock files —
-      # none edited, added or removed), it writes the build record the dev-login step below requires.
+      # exited 0 with the runtime source inventory identical (the eligible regular files under eight
+      # source roots — app/, components/, config/, lib/, postgres/, public/, scripts/, and styles/
+      # where present — plus the supported root config/package/lock inputs, none edited, added or
+      # removed; env/key-named entries and the dependency, VCS, build-output and agent trees are
+      # excluded by name, and a link or unsupported structure is refused), it writes the build record
+      # the dev-login step below requires. Still the same ONE sanitized build.
       # The step fails exactly when the build fails or that record cannot be written honestly.
       - run: npm run test:http:dev-login:build
       - run: npm run test:http
@@ -247,8 +252,12 @@ jobs:
       # and last: it consumes the build above (never rebuilds or copies one) and first checks that
       # build's record is current (source inventory, BUILD_ID, emitted server JS), allocates its own
       # loopback ports, gives each child an allowlisted synthetic environment, stops its children on
-      # every outcome (a SIGINT/SIGTERM to the run included), and re-checks the sources, BUILD_ID and
-      # the emitted server JS after the dev servers.
+      # every outcome, and re-checks the sources, BUILD_ID and the emitted server JS after the dev
+      # servers. On interruption the children are stopped by the process that started them — the
+      # Vitest forks worker — when a SIGINT/SIGTERM reaches it, as a signal to this step's whole
+      # process group does. A signal to the Vitest main process alone, a worker force-killed by
+      # Vitest and SIGKILL are not covered (test/dev-login-child-lifecycle.test.ts holds the
+      # owner-signalled cases and the real-Vitest group case).
       # No skip path: a held lock, failed start or stale build record is a named SETUP_FAILURE.
       - run: npm run test:http:dev-login
 

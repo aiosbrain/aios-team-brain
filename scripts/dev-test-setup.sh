@@ -110,7 +110,10 @@ if [[ "$DEV_LOGIN_PORT" != "3000" && "$APP_URL" != "$LOGIN_ORIGIN" ]]; then
   echo ""
 fi
 
+# Two separate facts, never merged: the API check asked APP_URL, and the login link needs the
+# login server. Starting the one is not said to serve the other — on another port it does not.
 if [[ "$DEV_UP" != "1" ]]; then
-  echo "  ⚠ no server detected on $APP_URL — run '$LOGIN_SERVER' before login/push/query/pull-bundle."
+  echo "  ⚠ no server answered the API check on $APP_URL (APP_URL) — push/query/pull-bundle need one there."
+  echo "    The login link is separate: it needs '$LOGIN_SERVER' running on $LOGIN_ORIGIN."
   echo ""
 fi

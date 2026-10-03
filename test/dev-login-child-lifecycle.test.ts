@@ -377,7 +377,7 @@ async function vitestRun(fx: Fixture, groups: GroupSpec[]): Promise<VitestRun> {
 
   const sawReady = await eventually(() => existsSync(readyFile) || finished !== null, 60_000);
   if (!sawReady || !existsSync(readyFile)) {
-    if (finished === null && proc.pid !== undefined) {
+    if (proc.exitCode === null && proc.signalCode === null && proc.pid !== undefined) {
       // Still running, so the group it leads is this file's: ask the whole run to stop, then insist.
       signal(-proc.pid, "SIGTERM");
       if ((await within(ended, 15_000)) === null) signal(-proc.pid, "SIGKILL");

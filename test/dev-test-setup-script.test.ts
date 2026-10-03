@@ -16,6 +16,9 @@ import { afterAll, describe, expect, it } from "vitest";
 // `cd "$BRAIN_DIR"` lands in the copy: the `.env.local` it sources is a harmless stub written there,
 // `npm` / `npx` / `curl` are PATH stubs that only record how they were called, and the spoke builder
 // is a fake. Nothing here resets or seeds a database, contacts a provider, or opens a socket.
+//
+// The last block reads the two owners that advice depends on — package.json's `dev:login` script and
+// .env.example's active assignments — from this checkout, as parsed data.
 
 const SCRIPT = join(process.cwd(), "scripts", "dev-test-setup.sh");
 const APP_URL_MARKER = "https://app-url-marker.invalid:8443";
@@ -169,8 +172,34 @@ describe("scripts/dev-test-setup.sh — local dev-login link (AC09)", () => {
       expect(stdout).toContain("under plain 'npm run dev' this link is a 404");
       expect(loginUrls(stdout)).toHaveLength(1);
     }
-    expect(up.stdout).not.toContain("no server detected");
-    expect(down.stdout).toContain("no server detected on http://127.0.0.1:3000 — run 'npm run dev:login' before");
+    expect(up.stdout).not.toContain("no server answered the API check");
+    expect(down.stdout).toContain(
+      "no server answered the API check on http://127.0.0.1:3000 (APP_URL) — push/query/pull-bundle need one there.\n"
+    );
+    expect(down.stdout).toContain("The login link is separate: it needs 'npm run dev:login' running on http://127.0.0.1:3000.\n");
+  });
+
+  it("an unanswered API check names APP_URL and the login server separately, and never says the login server serves APP_URL", () => {
+    const { status, stdout, calls } = run(fixture(), { DEV_LOGIN_PORT: "4321", STUB_CURL_EXIT: "7" });
+    expect(status).toBe(0);
+
+    // The check asked APP_URL (port 3000); the login server is the other one (port 4321).
+    expect(stdout).toContain(
+      "no server answered the API check on http://127.0.0.1:3000 (APP_URL) — push/query/pull-bundle need one there.\n"
+    );
+    expect(stdout).toContain(
+      "The login link is separate: it needs 'npm run dev:login -- --port 4321' running on http://127.0.0.1:4321.\n"
+    );
+    // Starting the login server on 4321 does not make APP_URL answer: no line may offer it as the fix.
+    for (const line of stdout.split("\n").filter((text) => text.includes("no server answered"))) {
+      expect(line).not.toContain("dev:login");
+    }
+    expect(stdout).not.toContain("before login/push/query/pull-bundle");
+
+    // Only the wording changed: the same probe of APP_URL, the same order, no request to the minting route.
+    expect(calls.map((call) => call.tool)).toEqual(["npm", "npx", "spoke", "curl"]);
+    expect(calls[3].args.endsWith(" http://127.0.0.1:3000/api/v1/items")).toBe(true);
+    for (const call of calls) expect(call.args).not.toContain("dev-login");
   });
 
   it.each([
@@ -243,5 +272,42 @@ describe("scripts/dev-test-setup.sh — local dev-login link (AC09)", () => {
     // The key the fake spoke was wired with is the one the stubbed seed wrote into the copy.
     expect(readFileSync(join(fx.repo, ".aios-demo-key"), "utf8").trim()).toBe("fixture-demo-key");
     expect(calls[2].args).toContain("--api-key fixture-demo-key ");
+  });
+});
+
+// The two configuration owners the advice above points at, read as DATA and not as printed text: the
+// coupled launch really is the opt-in bound to loopback, and the env template really leaves the bypass
+// off. Parsed — the package script by its words, the env file by its ACTIVE assignments — so a comment
+// or a banner that merely mentions the same strings satisfies neither. Read-only; nothing is spawned.
+describe("the coupled launch and the default-off env template (AC09)", () => {
+  const read = (name: string): string => readFileSync(join(process.cwd(), name), "utf8");
+
+  it("package.json `dev:login` is exactly the opt-in coupled to a loopback-bound next dev, and no other script sets the opt-in", () => {
+    const { scripts } = JSON.parse(read("package.json")) as { scripts: Record<string, string> };
+    const words = (script: string): string[] => script.trim().split(/\s+/);
+
+    expect(words(scripts["dev:login"])).toEqual(["AIOS_DEV_LOGIN=1", "next", "dev", "--hostname", "127.0.0.1"]);
+    // Plain `npm run dev` stays the default-off server, and the opt-in exists in the coupled launch only.
+    expect(words(scripts.dev).slice(0, 2)).toEqual(["next", "dev"]);
+    expect(
+      Object.entries(scripts)
+        .filter(([, script]) => /\bAIOS_DEV_LOGIN=/.test(script))
+        .map(([name]) => name)
+    ).toEqual(["dev:login"]);
+  });
+
+  it(".env.example has exactly one active AIOS_DEV_LOGIN assignment, it is 0, and the obsolete escape is not offered", () => {
+    const active = read(".env.example")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line !== "" && !line.startsWith("#"))
+      .map((line) => /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$/.exec(line))
+      .filter((match): match is RegExpExecArray => match !== null)
+      .map((match) => ({ name: match[1], value: match[2].trim() }));
+
+    // The parse really found the file's assignments: a guard that reads nothing proves nothing.
+    expect(active.length).toBeGreaterThan(1);
+    expect(active.filter((entry) => entry.name === "AIOS_DEV_LOGIN")).toEqual([{ name: "AIOS_DEV_LOGIN", value: "0" }]);
+    expect(active.filter((entry) => entry.name === "ALLOW_DEV_LOGIN")).toEqual([]);
   });
 });

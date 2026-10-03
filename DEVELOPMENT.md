@@ -108,13 +108,41 @@ Notes:
   the build gets a non-serving placeholder, which is not a database. This governs the build it
   starts — it cannot undo anything already loaded into the recorder process itself.
   The carrier never builds: it consumes that build and refuses if its record is missing or stale.
-  "Stale" covers the whole runtime source inventory — every file under `app/`, `lib/`,
-  `components/`, `config/`, `scripts/`, `postgres/` and `public/` plus the root config, package and
-  lock files, whether edited, added or deleted (read from disk, so untracked files count and no Git
-  is needed) — so rebuild with the same command after any such change. It accepts only a loopback
-  `_test` database, starts and stops its own servers on its own ports (also when the run is
-  interrupted with Ctrl-C or SIGTERM), and reports a held `next dev` lock or a failed start as a
-  named `SETUP_FAILURE` — stop your own dev server first; it will not.
+  "Stale" is judged against the runtime source inventory: the eligible regular files under eight
+  source roots (`app/`, `components/`, `config/`, `lib/`, `postgres/`, `public/`, `scripts/` and
+  `styles/`; a root that does not exist contributes nothing) plus the root-level config, package
+  and lock inputs it supports — edited, added or deleted, read from disk, so untracked files count
+  and no Git is needed. Rebuild with the same command after any such change. The inventory is
+  bounded and has explicit exclusions: env/key/certificate-named entries and `node_modules`,
+  `.git`, `.next`, `.context` and `.claude` are skipped by name; a symbolic link, a `pages/` or
+  `src/` directory, or a tree past its file/depth limits is refused rather than followed or
+  truncated; `test/`, `docs/`, the Python sidecar and installed dependencies are outside it (the
+  dependency boundary is `package.json` + `package-lock.json`). It ties one build to those
+  sources — it is not deployment-wide provenance, a secret scanner or an import resolver.
+  The carrier accepts only a loopback `_test` database, starts and stops its own servers on its own
+  ports, and reports a held `next dev` lock or a failed start as a named `SETUP_FAILURE` — stop
+  your own dev server first; it will not.
+  **Interrupting a run.** Those servers belong to the process that started them: the Vitest
+  *worker* running the test file, not the Vitest main process. A SIGINT/SIGTERM that reaches that
+  worker stops them before it takes effect, and a stop counts only once the server's whole process
+  group is gone — a closed port alone is not that. Ctrl-C in a terminal, or a signal to the
+  command's whole process group, reaches the worker. `test/dev-login-child-lifecycle.test.ts`
+  covers this at two separate levels: a process that owns the servers, signalled directly; and a
+  real `vitest run` in the installed default (forks) topology, signalled as a group. Both levels
+  have been executed green against the frozen lifecycle sources (all nine cases, installed Vitest
+  4.1.9), with stand-in listeners in place of `next dev` — this is the lifecycle suite, not a run
+  of the carrier itself. What that run measured: an ordinary stop and a directly signalled owner,
+  including repeated signals, end with the owned group gone; a listener that closed its port but
+  kept running is still treated as owned and is not reported clean; and for SIGINT and for SIGTERM
+  sent to the command's whole process group, the worker and its owned listener were asserted gone
+  before the test's own fallback removal ran, while an unrelated listener stayed up. It is evidence
+  for that version and topology, not a guarantee for every pool, runner or platform.
+  Not covered and not promised: a signal sent to the Vitest main process alone, a worker
+  force-killed by Vitest, and SIGKILL. The first is measured, not assumed: on SIGTERM to the main
+  process alone it exited 143 without waiting for its worker, and five seconds later the worker and
+  its listener were both still running — nothing had cleaned them up, and the test removed them
+  itself by verified identity. That removal is the test tidying its fixtures, not the carrier
+  cleaning up. After any of those, check for a leftover `next dev` on the port the run printed.
 - **`npm run db:test:up` always starts FROM ZERO** (`scripts/db-test-up.sh`: `down -v`, then `up`,
   then load the schema). It is therefore safe to re-run against any prior state — you no longer
   have to remember `db:test:down` first. Two consequences worth knowing:
