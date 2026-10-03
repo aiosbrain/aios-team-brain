@@ -13,7 +13,7 @@ implementation and how an operator uses it.
 | Behaviour described under "What is implemented" | **Implemented in source** on `codex/auditfix-25-bootstrap-evidence`, checkpoint commit `8a07f5c3d2e097a1f2b503281df05980e22a4789`. Reconciled against the code by reading it. The automated results under "Verification status" were recorded by the coordinator on that source. |
 | The SQL and CLI command below | Checked against the current schema, census, CLI and tokenizer source by reading them. **Never executed** for this document, against any database. |
 | Acceptance criteria AC01–AC12 | **Observable evidence recorded**, with the limits stated per criterion under "Acceptance criteria". |
-| Acceptance criterion AC13, and acceptance as a whole | **Pending.** Outstanding: the last focused review (the four raw ledger readers' context and this updated document), the docs check on this update, and the independent inspection record for the twenty-first mutation control. Nothing here attests final acceptance, publication, a rollout or production capacity. |
+| Acceptance criterion AC13, and acceptance as a whole | **Pending.** Outstanding: the last focused review, of the published source (the four raw ledger readers' context and this updated document), the coordinator's checks on wording changed after its docs run, and final acceptance and publication. Nothing here attests final acceptance, publication, a rollout or production capacity. |
 
 The documentation writer ran no command. Every result below was run and recorded by the coordinator
 and is quoted from its retained result records and log summaries. A result attests only the bytes it
@@ -378,7 +378,7 @@ or capacity claim.
 | Shared production HTTP suite | **First attempt: 100 passed, 1 failed, 2 skipped.** The failure was a PostgreSQL `deadlock detected` in the fixture's per-test table reset, before the body of an unrelated items test ran; server cleanup succeeded. **Retry, run serially after the unit runs had finished: 101 passed, 2 skipped**, cleanup succeeded. The two skips are pre-existing optional gateway cases | Which sessions took part in the deadlock is unknown: the log names no blocking statement. It is not shown to have been caused by the broader unit run, and no change was made to the fixture, the tests or the configuration. 101 passed with the same 2 skips on the initial snapshot and on the follow-up |
 | Typecheck and changed-file lint | **Passed** | Passed on the initial snapshot and on the follow-up |
 | Production build | **Passed** (default build) | On the initial snapshot two Turbopack attempts failed with `EPERM`, and a Webpack build failed route-type validation on pre-existing exports outside this change. Those are retained as failures, not passes, and no common cause is claimed. The default Turbopack build from a clean cache then passed, and the default build passed again on the follow-up |
-| Docs check | **Passed** before this document update | **Pending** for this update, until the coordinator runs it |
+| Docs check | **Passed** before the documentation reconciliation, and again (exit 0) on the reconciled documents | **Pending** for wording changed after that run, until the coordinator reruns it |
 | Broader unit run (the whole default unit selection, guards included) | **Not green as a single run** — see below | See below |
 | Manual browser check of the disclosure | **Passed for the bounded scope** described under "What was observed in a browser"; forced colors not activated | Initial snapshot, standalone: **failed at narrow width** — at 390 px the container was 358 px and clipped a table of 934 px closed and about 1,971 px expanded, with the summary at about 489 px, outside the viewport; at 1280 px long expanded labels were visually clipped. After the follow-up the standalone preview passed, but in the actual team layout it **failed again**: region 84 px, Details box still 320 px, the focused summary spanning about 155–475 px, label and text clipped. The container-relative cap is the correction for that |
 | The SQL and CLI command in this document | **Not executed** — checked against source only | Not executed at any state |
@@ -423,7 +423,7 @@ for the restoration.
 | P01 | AC03 | Whole-compound clamp | The convergence arm was lost behind a long census reason |
 | T04 | AC03 | Legacy 200-character pre-clamp restored | Later raw pairs and the sentinel were absent |
 | P02 | AC04 | Size accounted on raw, unescaped text — an approximation | Too many samples kept at the exact 8,192-byte fixture: `omitted` 4, not 14 |
-| P10 | AC04 | The final serialized-JSON measurement removed — distinct from P02 | All sixteen samples kept past 8,192 bytes: `omitted` 4, not 14. 3 selected cases failed; the same 3 passed after restoration |
+| P10 | AC04 | The final serialized-JSON measurement removed — distinct from P02 | All sixteen samples kept past 8,192 bytes: `omitted` 4, not 14. 3 selected cases failed, each at a strict DTO assertion; the same 3 passed after restoration. See the note below |
 | P03 | AC04 | `omitted` not recomputed after the trim | `omitted` 4, not 14 |
 | P04 | AC04 | Normalization removed | Real PostgreSQL rejected the row; own-row count 0, expected 1 |
 | P05 | AC05 | Sampling in input order | Sampled identities differed |
@@ -445,9 +445,11 @@ for the restoration.
   expose; it is not a failed assertion of a particular form and not a setup failure. Because those
   later assertions were never reached in the mutant run, nothing is claimed about them from it. The
   restored run of the same two cases passes, which is where they execute.
-- **P10.** The independent adjudication covered the first twenty controls. Its inspection record for
-  P10 is **pending** as a coordinator artifact; the retained run shows the 3 failures and the 3
-  restored passes above.
+- **P10.** The independent adjudication covers all twenty-one controls; its inspection of P10 is
+  complete, as recorded by the coordinator. The 3 failures in the mutant run are strict DTO assertion
+  failures, and the same 3 cases passed after restoration, followed by the pure suite's 269 passing on
+  its own. The byte assertions that come later in those cases were never reached in the mutant run, so
+  nothing is claimed about them, and no measured size is claimed, from it.
 - Two further optional controls (the reader's team filter removed; arbitrary failed metadata dumped)
   were prepared and **not run**. No kill is claimed for them.
 - A stale build manifest was refused before any server or test started. That is a provenance control,
@@ -468,8 +470,9 @@ for the restoration.
   are recorded in this document: the query-container parent, invited members on Pulse, the silent
   builder fallback, the UTF-16 previews, the diagnosis heuristic, the narrow-width height and the
   harness provenance.
-- **Pending:** the last focused review, covering the four raw ledger readers' context and this
-  updated document. This update was made after the reviews above, and none of them covers it.
+- **Pending:** the last focused review, of the published source, covering the four raw ledger
+  readers' context and this updated document. This update was made after the reviews above, and none
+  of them covers it.
 
 No pull request exists. No final publication, acceptance or rollout is claimed until the coordinator
 closes the pending items.
@@ -485,7 +488,7 @@ controls".
 | AC01 structured transport | Real-ledger suite: a real forbidden edge gives one failed row with matching evidence, exact IDs and the full count; a clean team has none. Control T01 | — |
 | AC02 independent phases | Pure and real-ledger suites: returned and thrown convergence still run the census; an unreadable census is unavailable, not zero. Controls T02, T03 | Phase failures at the seams are injected; the edges, writer, JSONB and reader are real |
 | AC03 independent error budgets | Pure and real-ledger suites, through the real 500-character writer clamp, both long-arm directions, the post-200 sentinel and the repair suffix. Controls P01, T04 | — |
-| AC04 serialized bound | Pure suite at exactly 8,192 and 8,193 bytes; real JSONB persistence of hostile text. Controls P02, P10, P03, P04 | Presentation budget only. P10's independent inspection record is pending |
+| AC04 serialized bound | Pure suite at exactly 8,192 and 8,193 bytes; real JSONB persistence of hostile text. Controls P02, P10, P03, P04 | Presentation budget only. P10's mutant run shows the strict DTO failures, not the later byte assertions |
 | AC05 deterministic samples | Pure suite: permutations and ID ties. Controls P05, P06 | Bounded selection was confirmed by reading; no measurement of census memory |
 | AC06 ledger compatibility and privacy | Real-ledger and existing ledger suites: one row per team per tick, a separate liveness beat, fixed global reasons, safe extraction in each arm, builder-fault fallback. Controls T05, T06, T06b, P07, T08 | T08 shows the escape, not the later assertions. The fallback does not record its cause |
 | AC07 reader isolation | Real own-team-plus-instance-wide reader with two teams; decoder refusals. Controls P08, P09 | The control that removes the reader's team filter was not run |
@@ -493,8 +496,8 @@ controls".
 | AC09 HTML and RSC authorization | Page-gate units; production HTML, full RSC and targeted RSC for admitted and denied personas, with the layout discriminator and cache directives. Controls H01, H02 | Test-environment personas and synthetic data. Invited members on Pulse follow the existing policy |
 | AC10 health and detector compatibility | The six existing suites; two-tick health with a healthy second team; short and long previews. Control T05 | The long preview does not show both arms. Preview boundaries and the diagnosis heuristic are unchanged |
 | AC11 bounded display smoke | Manual observation in the actual team layout at 1280 px and 390 px | 68 px column and 7,452 px height at narrow width. Forced colors not activated; no focus-cue result. One layout, synthetic data |
-| AC12 operational documentation | This document, reconciled against the source by reading | The SQL and the CLI command were not executed. This update awaits its docs check and the pending review |
-| AC13 verification and review | Baseline failures, the final results, the twenty-one controls and the reviews above are retained with their source identities | **Pending:** the last focused review, the docs check on this update, P10's inspection record. The broader unit run is not green as a single run. No publication or rollout acceptance |
+| AC12 operational documentation | This document, reconciled against the source by reading | The SQL and the CLI command were not executed. The docs check passed (exit 0) on the reconciled documents; wording changed after that run awaits the coordinator's re-check and the pending review |
+| AC13 verification and review | Baseline failures, the final results, the twenty-one controls and the reviews above are retained with their source identities | **Pending:** the last focused review, of the published source; the coordinator's checks on wording changed after its docs run; final acceptance and publication. The broader unit run is not green as a single run. No publication or rollout acceptance |
 
 ## Where the behaviour lives
 

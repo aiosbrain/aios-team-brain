@@ -110,7 +110,7 @@ All were run and recorded by the coordinator. The documentation writer ran nothi
 | Six existing policy, ledger and repair suites, real PostgreSQL | 70 passed |
 | Evidence HTTP / RSC suite | 12 passed |
 | Shared HTTP suite | First attempt: 100 passed, 1 failed, 2 skipped, cleanup succeeded. Serial retry: 101 passed, 2 pre-existing optional skips, cleanup succeeded |
-| Typecheck, changed-file lint, production build, docs check | Passed, before this documentation update. The docs check on this update is pending |
+| Typecheck, changed-file lint, production build, docs check | Passed, before the documentation reconciliation. The docs check passed again (exit 0) on the reconciled documents; the check on wording changed after that run is pending |
 | Broader unit run | **Not green as a single run** — below |
 
 - **Shared HTTP first attempt.** The one failure was a PostgreSQL deadlock in the fixture's per-test
@@ -143,8 +143,10 @@ pass of the same selected cases: T01–T06, T06b, T08, P01–P10, U01, H01 and H
 
 - P02 is approximate accounting on raw unescaped text. P10 is the distinct removal of the final
   serialized-JSON measurement: 3 selected cases failed and the same 3 passed after restoration.
-- The independent adjudication covers the first twenty. Its inspection record for P10 is **pending**
-  as a coordinator artifact.
+- The independent adjudication covers all twenty-one. Its inspection of P10 is complete: the 3
+  failures are strict DTO assertion failures, the same 3 cases passed after restoration, and the pure
+  suite's 269 then passed on its own. The byte assertions later in those cases were never reached in
+  the mutant run, and no claim is made about them from it.
 - T08: the injected builder fault escapes as a `TypeError` from the first fleet-bootstrap call, before
   the later leg run and its assertions. That is the containment failure, not a failed assertion form
   and not a setup failure. No claim is made about assertions the mutant run never reached.
@@ -185,10 +187,11 @@ closing note.
 AC01–AC12 have recorded observable evidence, with limits, in the operations companion's matrix. AC13
 and acceptance as a whole are pending:
 
-1. The last focused review: the four raw ledger readers' context and the updated documents.
-2. The docs check and diff check on this documentation update.
-3. The independent inspection record for P10.
-4. The checkpoint and remote push of this update, then final publication to staging — a pull request
-   has not been opened.
+1. The last focused review, of the published source: the four raw ledger readers' context and the
+   updated documents.
+2. The docs check and diff check on wording changed after the coordinator's docs run on the
+   documentation reconciliation, which completed with exit 0.
+3. The checkpoint and remote push of this update, then final acceptance and final publication to
+   staging — a pull request has not been opened.
 
 No final acceptance, publication or rollout is claimed until the coordinator closes these.
