@@ -79,8 +79,14 @@ transcripts, credentials and local paths.
   `codex/auditfix-25-bootstrap-evidence`, verified present on the remote at 07:35:10 UTC. Base and
   target: staging at `283e68bc10f668df3123513583afce9c2de8713a`. The next remote checkpoint was due
   by 08:05:10 UTC.
-- **This update** changes only `docs/operations/access-bootstrap-evidence.md` and this file. It is
-  uncommitted at the time of writing; the coordinator owns its checkpoint and push.
+- **Documentation-only checkpoints on 2026-10-03:** `80386a35` recorded verification reconciliation
+  and `936e5f85` recorded its status corrections, on unchanged runtime checkpoint `8a07f5c3`. Final
+  publication identity is recorded in the PR/coordinator handoff; this document does not identify its
+  own future commit. The operations companion's "Status of this document" carries the matching
+  as-of-writing status.
+- **Historical — true only when the reconciliation was first written, before `80386a35`:** "This
+  update changes only `docs/operations/access-bootstrap-evidence.md` and this file. It is uncommitted
+  at the time of writing; the coordinator owns its checkpoint and push." It is not the present state.
 - **No pull request exists.** Publication is to staging only and waits on documentation closure.
   Nothing here authorizes a merge or a deployment. PR 738 remains independent.
 
@@ -158,7 +164,8 @@ pass of the same selected cases: T01–T06, T06b, T08, P01–P10, U01, H01 and H
 
 Accepted for the bounded display-smoke scope, in the actual exported team layout with synthetic
 collaborators and data, not a standalone preview. At 1280 px: region 974 px, Details box 320 px. At
-390 px: region 84 px, Details box 68 px, the summary entirely inside the region; native keyboard
+390 px: region client width 84 px; its bounding rectangle spans 272–358 px (86 px); Details box
+68 px. These are distinct measurements. The summary was entirely inside the region; native keyboard
 open, close and horizontal scrolling, and pointer vertical scrolling to the last exact UUID and
 closing note.
 
@@ -193,5 +200,11 @@ and acceptance as a whole are pending:
    documentation reconciliation, which completed with exit 0.
 3. The checkpoint and remote push of this update, then final acceptance and final publication to
    staging — a pull request has not been opened.
+
+As of this writing, the focused review in item 1 — a fresh Opus review of the published source and
+its reader context, which executed nothing and verified no hash or test count — has completed with
+no high- or medium-severity finding, and its accepted documentation clarifications are applied in
+both documents; the coordinator's docs check, diff check and factual read-back of that wording, and
+final acceptance and publication, remain pending.
 
 No final acceptance, publication or rollout is claimed until the coordinator closes these.

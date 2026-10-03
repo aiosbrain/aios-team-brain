@@ -19,6 +19,13 @@ The documentation writer ran no command. Every result below was run and recorded
 and is quoted from its retained result records and log summaries. A result attests only the bytes it
 ran on: this update changes this file after those runs and after the reviews listed below.
 
+As of this writing, the last focused review — a fresh Opus review of the published source and its
+reader context, which executed nothing and verified no hash or test count — has completed with no
+high- or medium-severity finding, and its accepted documentation clarifications are applied in this
+file; wherever this document still lists that review as pending, this sentence is the newer record,
+and the coordinator's docs check, diff check and factual read-back of this wording, and final
+acceptance and publication, remain pending.
+
 ## What is implemented
 
 ### The operator surface
@@ -70,7 +77,7 @@ standalone preview, and it used synthetic data.
 | Viewport | Measured | Interaction observed |
 | --- | --- | --- |
 | Desktop, 1280 px | Region 974 px; Details box 320 px; the Evidence summary spans about 855–1,175 px | Enter opens the disclosure with native keyboard handling |
-| Narrow, 390 px | Main column 150 px; region 84 px (272–358 px); Details box 68 px; the summary spans about 281–349 px, entirely inside the region; every measured paragraph and list is 68 px wide with nothing overflowing; every label and UUID sits inside the region | Tab reaches the summary and Enter opens it; Space closes it; Shift+Tab returns to the region; the left arrow key scrolls the region horizontally; vertical pointer scrolling reaches all of the long text, the last exact UUID and the closing "display labels" note |
+| Narrow, 390 px | Main column 150 px. Region client width 84 px; its bounding rectangle spans 272–358 px (86 px); Details box 68 px. These are distinct measurements. The summary spans about 281–349 px, entirely inside the region; every measured paragraph and list is 68 px wide with nothing overflowing; every label and UUID sits inside the region | Tab reaches the summary and Enter opens it; Space closes it; Shift+Tab returns to the region; the left arrow key scrolls the region horizontally; vertical pointer scrolling reaches all of the long text, the last exact UUID and the closing "display labels" note |
 
 **Severe limitation at narrow width.** The existing fixed sidebar leaves a text column 68 px wide,
 and the expanded disclosure measured **7,452 px tall**. Everything is reachable and nothing is cut,
@@ -264,8 +271,10 @@ were confirmed by reading the command and tokenizer source.
   in the panel: a shortened label is not an identity, and this document gives no command form for one.
 - `--actor` is required and must name the authorizing admin. Pass `--team` explicitly; the CLI
   otherwise defaults to `demo`.
-- Each value flag takes its value as the **next, separate** argument. `--actor=value` is not a
-  supported form.
+- Each value flag takes its value as the **next, separate** argument. No `--flag=value` form is
+  supported. In particular, `--team=<id>` does not set the team and, without a separate valid
+  `--team <id|slug>`, the CLI falls back to `demo`. Always supply the intended team as
+  `--team <id|slug>` and the actor as `--actor <admin-email>`; never use equals syntax.
 - Quote real arguments, and never paste attacker-influenced text into a generated command line.
 - The CLI tokenizer treats any token beginning `--` as a flag and has no positional terminator, so a
   slug that begins with `--` cannot be passed this way. Such an identity needs a maintainer-reviewed
@@ -276,6 +285,9 @@ were confirmed by reading the command and tokenizer source.
 
 After a repair, a historical failed row stays as it was. Re-read the current state and watch later
 scheduler ticks. `access-health <team-slug>` gives a short human diagnosis, not the complete list.
+Its inherited wording about a future AUDITFIX-21 repair and the `access-health` source header's
+inspector-route claim are stale: the repair CLI above already exists, and this diagnosis is called
+from the admin CLI. Those strings are not current operational instructions.
 
 ## Access and privacy boundary
 
@@ -300,10 +312,14 @@ Where bootstrap rows and leg errors are read, by source inspection during review
 are the only consumers of pipeline health and its banner; Integrations is the only web consumer of
 the recent-runs reader; the scheduler leg is the only caller of the fleet bootstrap. The PM-sync
 page, the data browser and the alert e-mails were each traced and do not receive bootstrap rows or
-errors. Four other direct ledger readers — LLM health, graph efficiency, the context-backfill cursor
-and the doc-task inference run — were found to filter on their own source and team; the focused
-reviewer's read-back of those four is one of the pending items. The `access-health` diagnosis is
-called only from the admin CLI.
+errors. The four team-scoped ledger readers reviewed here — LLM health, graph efficiency, the
+context-backfill cursor and the doc-task inference run — were found to filter on their own source and
+team; the focused reviewer's read-back of those four is one of the pending items. Other reviewed
+direct readers are source-pinned: auth-cleanup bookkeeping (`auth_cleanup`, `started_at` only),
+retrieval health and retrieval alert (`dense`, `ok` only), and extraction alert (`graph_health`).
+They do not select `access_bootstrap`; this is a reviewed subset, not an exhaustive inventory or a
+claim that every reader has a team filter. The `access-health` diagnosis is called only from the
+admin CLI.
 
 ## Unchanged, and limits to keep in mind
 
