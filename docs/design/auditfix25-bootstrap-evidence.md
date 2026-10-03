@@ -6,7 +6,7 @@ safety: true
 ---
 # AUDITFIX-25 — bounded bootstrap evidence and admin disclosure
 
-Version: v3.1, proposed; round-2 adjudication wording aligned, not implementation or acceptance.
+Version: v3.2, proposed; final-round specific contracts resolved, not implementation or acceptance.
 Brain row: AUDITFIX-25. Linear: AIO-1062, read-back verified In Progress.
 Ticket: https://linear.app/je4light/issue/AIO-1062/split-out-of-auditfix-23-on-2026-08-24-at-spec-round-3s-high-5-the
 Base: origin/staging `283e68bc10f668df3123513583afce9c2de8713a`.
@@ -48,6 +48,10 @@ Existing production owners: `lib/access/bootstrap.ts`;
 Existing `lib/ingest/runs.ts` remains the ledger writer/reader. Its generic arbitrary-meta behavior and
 unrelated callers remain unchanged contracts: caller-owned bounds fully satisfy this slice, so no generic
 clamp work is required, deferred or scheduled; this fence excludes no required task or hidden follow-up.
+Test-only carrier: existing `vitest.http.config.ts` pins INGEST_POLL_ENABLED, GRAPH_PROJECT_ENABLED and
+SOCIAL_JOBS_ENABLED to literal "false" before shared next-start inherits the environment. New HTTP cases
+hard-assert all three effective controls on each test; no skip. Verify the full shared HTTP suite still passes.
+No production instrumentation change, dedicated CI lane or next.config build-ID policy is required.
 Existing `censusTeamSystemEdges`, sanctioned pairs, SQL, schema, permission predicates, membership
 ownership, bootstrap repair order, scheduler triggers, source names, confirmation thresholds and retention
 remain the already implemented authoritative contracts. No changes to them are required to deliver this
@@ -82,10 +86,13 @@ omitted: integer | null
 | ok | complete, total>0 | failed, evidence, omitted=total-sample.length | census summary only |
 | failed | complete, total>0 | failed, evidence, omitted=total-sample.length | convergence and census summary |
 | either | failed, total=null | failed, evidence, omitted=null/sample=[] | census reason; convergence iff failed |
+| any failing phase, builder fault | captured count/status unchanged | failed, no evidence | fixed phase/count fallback below |
 
 Each emitted failing phase requires its error object, including census.status=complete with findings.
-Clean phases omit error. The byte wrapper is exactly `{"accessBootstrapEvidence": envelope}`, including
-key/braces, not only its value. Metadata can arrive as an object or legacy JSON string: reject a string
+Clean phases omit error; decoder rejects an envelope for the wholly healthy complete-zero state. Builder
+fault is the explicit no-evidence exception, not a malformed envelope. The measured wrapper is exactly
+JSON.stringify({accessBootstrapEvidence: envelope}), with no inserted whitespace and including its key/braces,
+not only its value. Metadata can arrive as an object or legacy JSON string: reject a string
 above 8,192 UTF-8 bytes before parsing; bounded parse failures fail closed. Project only known validated
 fields from objects, with array/type/length checks before iteration; do not serialize arbitrary unknown meta.
 
@@ -121,7 +128,8 @@ The fixed count/status/error envelope with an empty sample fits the same budget;
 dropping the failure or pretending completeness. Fixed known fields and bounded strings avoid cycles.
 
 Build both error arms from raw phase results. Census grammar is `N unsanctioned edge(s) on system
-projects: ` plus the ordered raw sample's `projectSlug→groupSlug` pairs joined by `, `. Reserve the exact
+projects: ` plus the first ≤16 ordered full normalized pairs BEFORE metadata byte trimming,
+`projectSlug→groupSlug` joined by `, `. Reserve the exact
 count head; truncate the diagnostic prefix with a visible ellipsis within the contextual arm budget.
 This text may end within a display name; its typed truncation flag is explicit. It promises no complete
 pair list or '+N more' text; structured total/omitted remain authoritative. Returned/throw failures retain
@@ -130,8 +138,8 @@ independent arm budgets before assembling `census: …; convergence: …` when b
 also stays named and can use its otherwise unused compound budget; persist that same contextual message
 and truncation flag in evidence. Real adoption-refusal guidance that fits a lone arm remains untruncated.
 The census arm remains first; neither arm consumes the other's guaranteed dual-failure budget. For dual
-failures, start allocations at min(normalized full-message bytes,224); from the remaining 457 message
-bytes, extend census toward its full length first, then convergence. Truncation cues count within these
+failures, start allocations at min(normalized full-message bytes,224); the total message pool is457 bytes.
+From pool minus initial allocations, extend census toward its full length first, then convergence. Truncation cues count within these
 allocations. A short census leaves room for the realistic adoption-refusal repair suffix. The final string
 fits the existing 500-JavaScript-character writer clamp, and remains one error/error_count contribution.
 Two guaranteed 224-byte allocations plus 23 label/separator bytes occupy471; redistributed total≤480.
@@ -158,15 +166,36 @@ Unlike a 192-byte arm, this leaves a testable diagnostic region beyond the old 2
    Apply existing canAccessAdmin({role, tier: resolvedPosture}) before elevated Promise.all/ledger reads.
    Missing membership, non-admin, external/unknown posture and resolution failures fail closed.
    Reuse the resolved posture for existing freshness reads. Do not substitute stored members.tier.
-   Preserve layout/listIntegrations defenses and denial UX; the page can return a closed leaf on denial.
+   Preserve layout/listIntegrations defenses and denial UX: authenticated denial leaf is return null,
+   HTTP200, no redirect/notFound and no duplicated Admins only/layout sentinel in this leaf.
 6. Pulse/home also receives the changed compound via client PipelineHealthBanner props. Gate only its
-   getPipelineHealth fetch with a distinct canReadPipelineHealth using existing canAccessAdmin(role,
-   membership-derived me.tier from resolveTeamContext). Keep isAdmin unchanged for onboarding,
+   getPipelineHealth fetch with a distinct canReadPipelineHealth using existing
+   canAccessAdmin({role:me.role,tier:me.tier}), with me.tier derived by resolveTeamContext. Keep isAdmin unchanged for onboarding,
    usage/spend, metrics and LLM health. Visual 160-character clipping/dismissal does not protect full props.
 7. The server panel decodes only known version-1 evidence on non-NULL access_bootstrap rows, requiring
    evidence.teamId to equal row.team_id. Validate types, UUIDs, status/count relationships and budgets;
    project only known fields. Malformed, oversized, mismatched, future-version and legacy rows fall back
    to their existing error presentation. Do not recursively dump arbitrary failed-row metadata.
+
+Extraction table (normalize string text only after this guarded classification):
+
+| Input | Message before byte allocation |
+| --- | --- |
+| convergence returned !ok, nonempty string error | that string |
+| convergence returned !ok, missing/empty/non-string/accessor fault | unknown |
+| convergence threw Error with nonempty string message | that message |
+| convergence threw any other value, empty/non-string/faulting Error.message | threw |
+| census returned !ok, nonempty string error | strip one leading `system-edge census `; empty result → failed |
+| census returned !ok, missing/empty/non-string/accessor fault | failed |
+| census threw Error with nonempty string message | `system-edge census threw: MESSAGE` |
+| census threw other value or empty/non-string/faulting Error.message | `system-edge census threw: threw` |
+
+Non-Error thrown objects are never mined for .message, even if it is a string. Empty false-result errors
+must not make failure green. Safe extraction emits normal evidence with fallback message/truncated=false.
+Only a genuine builder fault omits evidence: census findings use `census: N unsanctioned edge(s) on system
+projects (evidence unavailable)`; failed census uses `census: unavailable (evidence unavailable)`;
+failed convergence uses `convergence: failed (evidence unavailable)`. Include only failing phases,
+census first joined by `; `, all ASCII and ≤480 bytes. Wholly clean phase state remains ok/no evidence.
 
 The bundled authentication guide explicitly says a layout hiding/swapping children does not stop nested
 segments or their RSC payloads. Admin-layout markup alone is not the privacy boundary for enriched reads.
@@ -224,8 +253,10 @@ Use current styles; allow wrapping within the existing table and verify narrow-v
   writes, one row per team per tick, one error contribution, separate fleet liveness, and existing zero-team/
   fleet-failure behavior. Callback throw does not abort/misattribute. Inject a tenant-marked global read/throw
   and prove NULL rows contain only safe reasons/counts. Controls: duplicate summary writes or global text forwarding.
-  Non-string/getter-fault messages and an injected builder fault preserve bounded named phase/count
-  failure without evidence, and later teams still complete. Removing the third guard must fail this test.
+  Safe extraction cases in EACH arm (non-string, empty and throwing Error.message/returned-error getter)
+  preserve evidence with the pinned fallback and truncated=false; a later clean team lands its own row.
+  Restoring direct .message extraction must fail the getter control. Separately, injected builder fault
+  yields fixed named phase/count failure without evidence and later progress; removing third guard fails it.
 - **AC07 — reader isolation:** Real own-team-plus-NULL reader returns team A evidence and safe global
   rows while excluding team B evidence. Unknown/invalid/mismatched envelopes are not rendered as evidence.
   Controls: remove reader team filter or accept a mismatched envelope; marker assertions fail.
@@ -234,9 +265,10 @@ Use current styles; allow wrapping within the existing table and verify narrow-v
   are escaped; unrelated/legacy rows keep existing presentation. Existing access-health short-format and
   diagnosis remains useful; include unrelated pm_sync rows from the shared panel consumer. Controls:
   restore error-versus-meta ternary or dump arbitrary failed metadata.
-  All five state-table cases round-trip through actual producer→real JSONB→recent reader→decoder→actual
+  All normal state-table cases round-trip through actual producer→real JSONB→recent reader→decoder→actual
   panel; fabricated envelopes alone are insufficient. Include boundary trim, legacy-string meta and malformed
   rejection. Assert exact wrapper measurement/last fitting sample, not accidental sample sizes.
+  Builder-fault no-evidence fallback stays legacy-readable; reject a fabricated healthy complete-zero envelope.
 - **AC09 — HTML/RSC authorization:** Real authenticated unrestricted admin can retrieve a seeded evidence
   marker through HTML and an actual RSC response. Anonymous, internal non-admin, external-posture admin,
   disabled member (login before disabling) and foreign-team/nonmember cannot retrieve that marker.
@@ -245,12 +277,14 @@ Use current styles; allow wrapping within the existing table and verify narrow-v
   nonsecret denial/route protocol, not redirect/HTML absence. Anonymous separately asserts proxy login
   redirect/destination. At most follow a same-origin _rsc correction preserving headers/cookie; never count
   its 307 as authorization evidence. Positive controls must contain the marker in each actual RSC profile.
-  Record the tree and prove targeted skips the admin layout: full response has its proper Admin shell/
+  Record the tree and prove targeted skips the admin layout: full response has its rendered Admin shell/
   Admins only sentinel, targeted does not, for admitted and denied membership personas; mismatch-driven
-  full payload is not targeted proof. Marker-bearing HTML/RSC responses assert private/no-store directives.
+  full payload is not targeted proof. Sentinel is actual layout-rendered text/content, not the router
+  segment name 'admin'. Marker-bearing HTML/RSC responses assert private/no-store directives.
   Include populated Pulse fixtures: unrestricted admin receives both markers, one beyond the 160-character
   preview; external admin/nonadmin/disabled/nonmember do not. Page-unit spies deny protected elevated
   integrations reads after posture resolution and deny home getPipelineHealth on restricted/faulted posture.
+  Home restricted-posture is mutation-sensitive; resolution-throw read absence is a non-mutation assertion.
   Capture actual baseline/mutant transport RED; independently remove each page gate. Verify home isAdmin
   metrics/onboarding/LLM semantics unchanged. Missing genuine RSC RED is a gap, never an inferred pass.
 - **AC10 — health/detector compatibility:** Existing sanctioned-edge, repair, bootstrap, ledger and
@@ -264,10 +298,11 @@ Use current styles; allow wrapping within the existing table and verify narrow-v
 - **AC12 — operational documentation:** Document version/budgets, sampled/not-exhaustive evidence,
   unknown counts, existing repair workflow, own-team/NULL privacy and page-local gate. State unchanged
   best-effort writes/retention and existing full-census memory behavior; no unverified production capacity claim.
-  Document literal exhaustive-name deviation and a team-bound read-only SQL join of project_groups to
+  Document literal exhaustive-name deviation and a team-bound read-only SQL LEFT JOIN of project_groups to
   projects/groups selecting complete IDs/slugs/kind/is_builtin. Enumerate all system-project candidates,
-  join both tables on team_id and ID. Only kind=system is the census domain (reserved source adoption
-  is a separate guard); unresolved project/group is a finding. Sanctioned requires is_builtin plus one
+  join both tables on team_id and ID; include p.id IS NULL OR p.kind='system' (unresolved projects are
+  currently FK-unreachable, but the query matches fail-closed census semantics). Reserved source adoption
+  is a separate guard; unresolved project/group is a finding. Sanctioned requires is_builtin plus one
   exact pair: general→everyone, external-shared→everyone, external-shared→external; general→external
   is forbidden. Identify unsanctioned candidates, then use complete slugs with the
   authorized repair-system-edge CLI. This is administrative retrieval, not a new runtime predicate/API.
@@ -279,6 +314,10 @@ Use current styles; allow wrapping within the existing table and verify narrow-v
   fresh canonical build is mandatory. INGEST_POLL_ENABLED=false prevents ingestion overwriting fixtures;
   GRAPH_PROJECT_ENABLED=false/no GRAPHITI_URL and SOCIAL_JOBS_ENABLED not true keep other pollers inert.
   Verify actual controls, not unrelated SOCIAL_AUTORUN naming. Production policy is unchanged for tests.
+  Each baseline/canonical/source-mutant HTTP run is an attributable sequence: freeze/fingerprint source,
+  execute npm run build successfully and retain its command/exit/log, bind resulting BUILD_ID to that
+  fingerprint, then test the same build and recheck unchanged source. Repeat on every mutation/restoration;
+  a stale source/build manifest must refuse the run. Random BUILD_ID alone never attests source identity.
 
 ## Implementation sequence and verification tiers
 
@@ -293,10 +332,12 @@ New files to create:
 - New file to create: `test/http/bootstrap-evidence.http.test.ts` (production HTML/full/targeted RSC).
 - New file to create: `test/integrations-page-access.test.ts` (protected read ordering).
 - New file to create: `test/home-pipeline-access.test.ts` (narrow home health admission).
-- New file to create: `docs/design/auditfix25-bootstrap-evidence.md` (durable accepted design).
+- Existing checkpoint spec copy to update: `docs/design/auditfix25-bootstrap-evidence.md` (accepted design/operations).
 
 Extend `test/ingest-runs-panel-meta.test.ts`; reuse datamechanics helpers, real HTTP login/session fixtures
 and existing census/bootstrap-ledger/ingest-runs/system-edge-repair/access-health cases.
+The historical checkpoint design copy does not satisfy AC12; accepted contracts, enumeration and actual
+verification/limitations must be reconciled after implementation. Test-config changes are harness-only.
 Safety tier: permission/privacy change; real PG is required for ledger/isolation/counts and production
 HTTP for HTML/RSC. Mock-only success is insufficient. Functional local PG may use fsync off, disclosed
 without durability/performance claims. No capacity benchmark or live production query is required.
