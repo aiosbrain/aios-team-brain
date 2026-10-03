@@ -1,9 +1,11 @@
-import { BUILD_RECORD_FILE, DevLoginSetupFailure } from "./dev-login-dev-setup";
+import { BUILD_RECORD_FILE, DevLoginSetupFailure, summarizeSources } from "./dev-login-dev-setup";
 import { runRecordedBuild } from "./dev-login-build-record";
 
 // Entry for `npm run test:http:dev-login:build` (CI's HTTP job and a clean task-owned checkout).
 // TEST-ONLY. It takes NO arguments: the command is always the ordinary `npm run build`, and nothing
-// on the command line can claim a build succeeded or point the record at another artifact.
+// on the command line can claim a build succeeded or point the record at another artifact. The
+// build's environment is not this process's: the recorder constructs a sanitized one (and prints its
+// mode/presence as DEV_LOGIN_BUILD_ENV), whatever shell or CI step started this entry.
 if (process.argv.length > 2) {
   console.error("SETUP_FAILURE[build-failed]: the dev-login build recorder takes no arguments.");
   process.exit(2);
@@ -22,7 +24,7 @@ try {
       routeEntry: record.routeEntry,
       artifactFingerprint: record.artifactFingerprint,
       serverJs: record.serverJs,
-      sources: record.sourcesAfter,
+      sources: summarizeSources(record.sourcesAfter),
       generated: { before: record.generatedBefore, after: record.generatedAfter },
     })}`
   );

@@ -10,7 +10,6 @@ import {
   DevLoginSetupFailure,
   GENERATED_FILES,
   NEXT_LOADED_ENV_FILES,
-  RUNTIME_SOURCE_FILES,
   allocateLoopbackPort,
   assertBuildRecordCurrent,
   assertNoNextEnvFiles,
@@ -19,11 +18,13 @@ import {
   changedKeys,
   findNextEnvFiles,
   fingerprintFiles,
+  inventoryRuntimeSources,
   inventoryServerJs,
   parseSetCookie,
   rawGet,
   readProductionArtifact,
   startNextChild,
+  summarizeSources,
   validateSyntheticDatabaseUrl,
   type OwnedChild,
   type WireResponse,
@@ -68,7 +69,8 @@ const evidence = (name: string, data: unknown): void => console.log(`DEV_LOGIN_E
 
 // Recorded before any child exists; compared again after the last one is gone. The build record is
 // checked CURRENT at the same moment: the artifact the production children serve is the one the
-// recorder watched `npm run build` produce, exit 0, from the tracked sources as they are now.
+// recorder watched `npm run build` produce, exit 0, from the runtime source inventory as it is now
+// (`current.sources`: every file under the source roots plus the root config/package/lock inputs).
 const current = assertBuildRecordCurrent(CWD);
 const baseline = {
   artifact: current.artifact,
@@ -677,8 +679,8 @@ describe.each([
     expect(baseline.record.command).toEqual(["npm", "run", "build"]);
     expect(baseline.record.exitCode).toBe(0);
     expect(baseline.record.buildId).toBe(baseline.artifact.buildId);
-    expect(baseline.record.sourcesBefore).toEqual(baseline.record.sourcesAfter);
-    expect(fingerprintFiles(CWD, RUNTIME_SOURCE_FILES)).toEqual(baseline.record.sourcesAfter);
+    expect(changedKeys(baseline.record.sourcesBefore, baseline.record.sourcesAfter)).toEqual([]);
+    expect(changedKeys(baseline.record.sourcesAfter, inventoryRuntimeSources(CWD))).toEqual([]);
     expectServerJsUnchanged();
     evidence("production-child", {
       ...record,
@@ -1035,10 +1037,13 @@ describe("after the development children", () => {
     });
   });
 
-  it("no tracked runtime source changed while the children ran (generated files are reported separately)", () => {
-    const sources = fingerprintFiles(CWD, RUNTIME_SOURCE_FILES);
-    expect(sources).toEqual(baseline.sources);
-    evidence("sources", { before: baseline.sources, after: sources });
+  it("no runtime source changed, appeared or disappeared while the children ran (generated files are reported separately)", () => {
+    const sources = inventoryRuntimeSources(CWD);
+    // Named paths on failure; the summary pins the whole path set and every file's bytes.
+    expect(changedKeys(baseline.sources, sources)).toEqual([]);
+    expect(summarizeSources(sources)).toEqual(summarizeSources(baseline.sources));
+    expect(summarizeSources(sources)).toEqual(summarizeSources(baseline.record.sourcesAfter));
+    evidence("sources", { before: summarizeSources(baseline.sources), after: summarizeSources(sources) });
     evidence("generated", { before: baseline.generated, after: fingerprintFiles(CWD, GENERATED_FILES) });
   });
 });
