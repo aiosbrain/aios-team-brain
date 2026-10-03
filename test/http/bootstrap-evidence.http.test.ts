@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -67,10 +67,17 @@ type PersonaKey = "admin" | "member" | "extadmin" | "disabled" | "foreign";
 const PAGES: readonly PageKey[] = ["integrations", "pulse"];
 const PROFILES: readonly Profile[] = ["html", "rsc-full", "rsc-targeted"];
 
-const PAGE_PATH: Record<PageKey, (slug: string) => string> = {
-  integrations: (slug) => `/t/${slug}/admin/integrations`,
-  pulse: (slug) => `/t/${slug}`,
-};
+/** Each page's path for a team slug. A closed switch, not a keyed lookup: any other key throws. */
+function pagePath(page: PageKey, slug: string): string {
+  switch (page) {
+    case "integrations":
+      return `/t/${slug}/admin/integrations`;
+    case "pulse":
+      return `/t/${slug}`;
+    default:
+      throw new Error(`unsupported page '${String(page)}'`);
+  }
+}
 
 /** Text only the PAGE LEAF renders — never a layout, the head, or the router state. */
 const PAGE_LEAF: Record<PageKey, string> = {
@@ -266,11 +273,17 @@ async function seedFailedBootstrap(seed: Seed, tag: "a" | "b", base: number): Pr
   return { errorHead, errorTail, groupSlug, evidence: group.groupId };
 }
 
+/**
+ * Signs in through the same loopback guard as every page request. The route answers a successful
+ * sign-in with a JSON 200 carrying the session cookie — never an HTTP redirect — so redirects stay
+ * manual: a 3xx here is a failed login, not a second request to wherever it points.
+ */
 async function login(email: string, password: string): Promise<string> {
-  const res = await fetch(`${BASE_URL}/api/auth/login`, {
+  const res = await fetchLoopback(new URL("/api/auth/login", BASE_URL), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ email, password }),
+    redirect: "manual",
   });
   if (res.status !== 200) throw new Error(`login failed: ${res.status}`);
   const setCookie = res.headers.get("set-cookie") ?? "";
@@ -432,6 +445,45 @@ function inlineFlight(html: string): string {
   return Buffer.concat(parts).toString("utf8");
 }
 
+/** The one origin this suite may talk to: the loopback server `test/http/server-url` allocated. */
+const ALLOCATED_ORIGIN = new URL(BASE_URL).origin;
+
+/**
+ * Why a request must NOT be sent — or null when it stays on the allocated loopback server. Read off
+ * the parsed URL itself, so a host that arrived through a path, a redirect or userinfo is refused
+ * whatever string it was built from. `redirect: "manual"` is required, not assumed: a followed
+ * redirect is a second request that this check never saw.
+ */
+function loopbackRefusal(url: URL, init: RequestInit): string | null {
+  if (url.protocol !== "http:") return `protocol '${url.protocol}' is not http:`;
+  if (url.hostname !== "127.0.0.1") return `host '${url.hostname}' is not 127.0.0.1`;
+  if (url.origin !== ALLOCATED_ORIGIN) return `origin '${url.origin}' is not the allocated ${ALLOCATED_ORIGIN}`;
+  if (url.username !== "" || url.password !== "") return "the URL carries userinfo";
+  if (init.redirect !== "manual") return "redirects are not manual";
+  return null;
+}
+
+/** `fetch`, for the allocated loopback origin only. A refusal is thrown BEFORE any network I/O. */
+async function fetchLoopback(url: URL, init: RequestInit): Promise<Response> {
+  const refusal = loopbackRefusal(url, init);
+  if (refusal !== null) throw new Error(`fetchLoopback refused: ${refusal}`);
+  return fetch(url, init);
+}
+
+/**
+ * The ONLY place an anonymous redirect is followed to: `/login` on the allocated origin, carrying the
+ * redirect's own query — or null, and then nothing is requested. The host the redirect names is
+ * dropped on purpose (it need not be this loopback port). The target is built from the literal path
+ * and the query is assigned as a property; a response's pathname is never parsed again, because
+ * `//host/…` read as a relative reference is another HOST.
+ */
+function loginFollowTarget(destination: URL | null): URL | null {
+  if (destination === null || destination.pathname !== "/login") return null;
+  const target = new URL("/login", BASE_URL);
+  target.search = destination.search;
+  return target;
+}
+
 async function request(
   world: World,
   page: PageKey,
@@ -439,7 +491,7 @@ async function request(
   persona: PersonaKey | "anonymous"
 ): Promise<Wire> {
   const slug = world.own.seed.teamSlug;
-  const url = new URL(PAGE_PATH[page](slug), BASE_URL);
+  const url = new URL(pagePath(page, slug), BASE_URL);
   const flight: Record<string, string> = {};
   let tree: RouterState | null = null;
   let rsc: string | null = null;
@@ -457,7 +509,7 @@ async function request(
   if (persona !== "anonymous" && !cookie) throw new Error(`no session seeded for persona '${persona}'`);
   const init: RequestInit = { headers: cookie ? { ...flight, cookie } : flight, redirect: "manual", cache: "no-store" };
 
-  let res = await fetch(url, init);
+  let res = await fetchLoopback(url, init);
   let corrected = false;
   if (profile !== "html" && res.status === 307) {
     // Only a cache-busting correction is followed: same origin, same path, `_rsc` set. Once, with the
@@ -466,7 +518,7 @@ async function request(
     const next = location ? new URL(location, url) : null;
     if (next && next.origin === url.origin && next.pathname === url.pathname && next.searchParams.has(NEXT_RSC_UNION_QUERY)) {
       await res.arrayBuffer();
-      res = await fetch(next, init);
+      res = await fetchLoopback(next, init);
       corrected = true;
     }
   }
@@ -703,7 +755,7 @@ describe("AUDITFIX-25 AC09 — anonymous requests (HTTP)", () => {
     const secrets = [...tokensOf(world.own.markers), ...tokensOf(world.second.markers)];
     const violations: string[] = [];
     for (const page of PAGES) {
-      const path = PAGE_PATH[page](world.own.seed.teamSlug);
+      const path = pagePath(page, world.own.seed.teamSlug);
       for (const profile of PROFILES) {
         const w = await request(world, page, profile, "anonymous");
         const destination = w.location ? new URL(w.location, BASE_URL) : null;
@@ -712,9 +764,11 @@ describe("AUDITFIX-25 AC09 — anonymous requests (HTTP)", () => {
         if (destination?.pathname !== "/login") violations.push(`${at(w)}: redirected to '${w.location}' — expected /login`);
         if (destination?.searchParams.get("next") !== path) violations.push(`${at(w)}: login 'next' is not ${path}`);
         if (secrets.some((s) => w.text.includes(s))) violations.push(`${at(w)}: LEAK in the redirect response`);
-        if (destination) {
-          // Same loopback origin the suite was allocated, whatever host the redirect names.
-          const followed = await fetch(new URL(`${destination.pathname}${destination.search}`, BASE_URL), { redirect: "manual" });
+        // Same loopback origin the suite was allocated, whatever host the redirect names — and only
+        // `/login` is followed: any other path is the violation above and is never requested.
+        const target = loginFollowTarget(destination);
+        if (target) {
+          const followed = await fetchLoopback(target, { redirect: "manual" });
           const html = await followed.text();
           if (secrets.some((s) => html.includes(s))) violations.push(`${at(w)}: LEAK on the login destination`);
         }
@@ -723,4 +777,151 @@ describe("AUDITFIX-25 AC09 — anonymous requests (HTTP)", () => {
     await expectLedgerUntouched(world);
     expect(violations).toEqual([]);
   }, TIMEOUT);
+});
+
+// ── Containment controls ─────────────────────────────────────────────────────────────────────────
+//
+// No case below sends a request. They pin the four helpers the cases above actually call — the
+// closed page dispatch, the anonymous follow target, the pre-network fetch guard and the session
+// login — so a suite that only ever met a well-behaved server still proves what it would do with a
+// hostile redirect.
+
+describe("AUDITFIX-25 AC09 — test-network containment controls (no request is sent)", () => {
+  const NEXT = "?next=%2Ft%2Facme%2Fadmin%2Fintegrations";
+  const parsed = (location: string) => new URL(location, BASE_URL);
+
+  it("pagePath is a closed dispatch: the two pages' paths, and a throw for any other key", () => {
+    expect(pagePath("integrations", "acme")).toBe("/t/acme/admin/integrations");
+    expect(pagePath("pulse", "acme")).toBe("/t/acme");
+    // Inherited object keys are what a keyed function lookup would have resolved and called.
+    for (const key of ["constructor", "toString", "__proto__", "other"]) {
+      expect(() => pagePath(key as PageKey, "acme"), `'${key}' is not a page`).toThrow("unsupported page");
+    }
+  });
+
+  it("an anonymous redirect is followed only to /login on the allocated origin: a hostile or wrong path has no target", () => {
+    // The hazard, as a fixture: a redirect that stays on the allocated origin but carries a host in its
+    // PATH. Parsed again as a reference, that path names the foreign host — which is why it never is.
+    const smuggled = parsed(`${BASE_URL}//foreign.invalid/probe`);
+    expect(smuggled.origin, "fixture: it arrives on the allocated origin").toBe(ALLOCATED_ORIGIN);
+    expect(smuggled.pathname, "fixture: with the host in its path").toBe("//foreign.invalid/probe");
+    expect(
+      new URL(`${smuggled.pathname}${smuggled.search}`, BASE_URL).hostname,
+      "fixture: re-parsed as a reference, that path is a foreign host"
+    ).toBe("foreign.invalid");
+    expect(loginFollowTarget(smuggled), "so it is not followed").toBeNull();
+
+    expect(loginFollowTarget(null), "no Location, no target").toBeNull();
+    for (const location of [
+      "//foreign.invalid/probe",
+      `${BASE_URL}//foreign.invalid/login${NEXT}`,
+      "/login/",
+      "/Login",
+      `/t/acme${NEXT}`,
+      "/",
+    ]) {
+      expect(loginFollowTarget(parsed(location)), `'${location}' is not /login and must not be followed`).toBeNull();
+    }
+
+    // `/login`, relative or absolute, on this origin or another: always the allocated origin's
+    // `/login` with the redirect's own query — the named host, port, userinfo and fragment are dropped.
+    for (const location of [
+      `/login${NEXT}`,
+      `${BASE_URL}/login${NEXT}`,
+      `http://app.invalid/login${NEXT}`,
+      `//foreign.invalid/login${NEXT}`,
+      `https://user:secret@foreign.invalid:8443/login${NEXT}#fragment`,
+    ]) {
+      const target = loginFollowTarget(parsed(location));
+      expect(target?.href, `'${location}' is followed on the allocated origin, exactly`).toBe(`${ALLOCATED_ORIGIN}/login${NEXT}`);
+      expect(target?.origin).toBe(ALLOCATED_ORIGIN);
+      expect(target?.searchParams.get("next"), "the query is the redirect's own").toBe("/t/acme/admin/integrations");
+      expect(loopbackRefusal(target as URL, { redirect: "manual" }), "and the fetch guard admits it").toBeNull();
+    }
+    // A host-shaped QUERY stays a query: assigning `search` cannot move the origin.
+    expect(loginFollowTarget(parsed("/login?next=//foreign.invalid/probe"))?.href).toBe(
+      `${ALLOCATED_ORIGIN}/login?next=//foreign.invalid/probe`
+    );
+  });
+
+  it("fetchLoopback refuses a foreign host, protocol, port, userinfo or followed redirect BEFORE fetch is reached", async () => {
+    const manual: RequestInit = { redirect: "manual" };
+    const variant = (mutate: (url: URL) => void): URL => {
+      const url = new URL("/login", BASE_URL);
+      mutate(url);
+      return url;
+    };
+    const refused: { name: string; url: URL; init: RequestInit; reason: string }[] = [
+      { name: "a foreign host", url: variant((u) => { u.hostname = "foreign.invalid"; }), init: manual, reason: "is not 127.0.0.1" },
+      { name: "a loopback NAME", url: variant((u) => { u.hostname = "localhost"; }), init: manual, reason: "is not 127.0.0.1" },
+      { name: "another protocol", url: variant((u) => { u.protocol = "https:"; }), init: manual, reason: "is not http:" },
+      { name: "another port", url: variant((u) => { u.port = u.port === "1" ? "2" : "1"; }), init: manual, reason: "is not the allocated" },
+      { name: "a username", url: variant((u) => { u.username = "user"; }), init: manual, reason: "userinfo" },
+      { name: "a password", url: variant((u) => { u.password = "secret"; }), init: manual, reason: "userinfo" },
+      { name: "a followed redirect", url: new URL("/login", BASE_URL), init: { redirect: "follow" }, reason: "redirects are not manual" },
+      { name: "an unstated redirect mode", url: new URL("/login", BASE_URL), init: {}, reason: "redirects are not manual" },
+    ];
+
+    // A stand-in for the duration of this case only, so nothing here can reach a network — foreign or
+    // loopback — and "before fetch" is observed rather than inferred.
+    const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response("stub"));
+    try {
+      for (const { name, url, init, reason } of refused) {
+        await expect(fetchLoopback(url, init), name).rejects.toThrow(reason);
+        expect(spy, `${name}: fetch was reached`).not.toHaveBeenCalled();
+      }
+      // Not a refuse-everything guard: the allocated origin goes through once, URL and init untouched.
+      const allowed = new URL(`/login${NEXT}`, BASE_URL);
+      const res = await fetchLoopback(allowed, manual);
+      expect(await res.text()).toBe("stub");
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy.mock.calls[0][0]).toBe(allowed);
+      expect(spy.mock.calls[0][1]).toBe(manual);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("login posts once to /api/auth/login on the allocated origin with manual redirects, and a 307 fails its status check unfollowed", async () => {
+    const email = "af25-login-control@test.local";
+    const password = "af25-login-control-password";
+    const session = "aios_session=af25-synthetic-session";
+    const setCookie = `${session}; Path=/; HttpOnly; SameSite=Lax`;
+
+    // The same stand-in as above: the real `login()` runs, and whatever it hands to fetch is observed
+    // instead of sent. Every call is answered, so a second request would be counted, never made.
+    const spy = vi.spyOn(globalThis, "fetch").mockImplementation(
+      async () => new Response(JSON.stringify({ ok: true, redirect: "/" }), { status: 200, headers: { "set-cookie": setCookie } })
+    );
+    try {
+      expect(await login(email, password), "the route's JSON 200 yields its session cookie").toBe(session);
+      expect(spy, "one request per sign-in").toHaveBeenCalledTimes(1);
+      const [url, init] = spy.mock.calls[0];
+      expect(url, "a parsed URL, as the guard requires").toBeInstanceOf(URL);
+      expect((url as URL).href, "the allocated origin's login route, exactly").toBe(`${ALLOCATED_ORIGIN}/api/auth/login`);
+      expect(init).toEqual({
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password }),
+        redirect: "manual",
+      });
+      expect(loopbackRefusal(url as URL, init as RequestInit), "and the fetch guard admits it").toBeNull();
+
+      // An unexpected redirect, as hostile as it can be: a foreign Location AND a well-formed session
+      // cookie. The status check rejects it before the cookie is read, and nothing follows it.
+      spy.mockClear();
+      spy.mockImplementation(
+        async () =>
+          new Response(null, {
+            status: 307,
+            headers: { location: "http://foreign.invalid/api/auth/login", "set-cookie": setCookie },
+          })
+      );
+      await expect(login(email, password), "a 307 is a failed login").rejects.toThrow("login failed: 307");
+      expect(spy, "the 307 was not followed").toHaveBeenCalledTimes(1);
+      expect(spy.mock.calls[0][1]?.redirect, "and was never eligible to be").toBe("manual");
+    } finally {
+      spy.mockRestore();
+    }
+  });
 });

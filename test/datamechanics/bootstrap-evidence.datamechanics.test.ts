@@ -510,6 +510,23 @@ const escapeHtml = (s: string) =>
  */
 const censusStatement = (text: string) => /Census:\s*(.*?)(?:\s—\s|$)/.exec(text.replace(/\s+/g, " ").trim())?.[1] ?? "";
 
+/**
+ * Each count of that statement, read beside its OWN label and compared as the decimal text the panel
+ * printed against the stored envelope: `01` is not `1`, and the `1` inside `11` is not a count. One
+ * diagnostic per label, so a failure names the count that is wrong.
+ */
+function expectCensusCounts(statement: string, e: Evidence): void {
+  const total = /\b(\d+) unsanctioned edges?\b/.exec(statement);
+  const sampled = /\b(\d+) sampled\b/.exec(statement);
+  const omitted = /\b(\d+) omitted\b/.exec(statement);
+  expect(total, "the exact total, on its own label").not.toBeNull();
+  expect(total![1], "the exact total, on its own label").toBe(String(e.census.total));
+  expect(sampled, "the sampled count, on its own label").not.toBeNull();
+  expect(sampled![1], "the sampled count, on its own label").toBe(String(e.sample.length));
+  expect(omitted, "and the omitted count, on its own label").not.toBeNull();
+  expect(omitted![1], "and the omitted count, on its own label").toBe(String(e.omitted));
+}
+
 /** The actual panel, fed by the actual reader. Returns each `<details>` block as tag + plain text. */
 async function panelFor(teamId: string) {
   const runs = await listRecentIngestRuns(db(), teamId, 30);
@@ -1546,9 +1563,15 @@ describe("AUDITFIX-25 AC08: every normal state round-trips producer → jsonb �
       expect(blocks[0].text, "an unavailable count is SAID, never shown as zero").toMatch(/unavailable/i);
       expect(statement, "and no count is rendered beside any count label").not.toMatch(/\d+\s+(unsanctioned|sampled|omitted)/);
     } else {
-      expect(statement, "the exact total, on its own label").toMatch(new RegExp(`\\b${e.census.total} unsanctioned edges?\\b`));
-      expect(statement, "the sampled count, on its own label").toMatch(new RegExp(`\\b${e.sample.length} sampled\\b`));
-      expect(statement, "and the omitted count, on its own label").toMatch(new RegExp(`\\b${e.omitted} omitted\\b`));
+      expectCensusCounts(statement, e);
+      // Controls, on this same rendered statement and through the same assertions: a total that is off
+      // by one, and the right total zero-padded, are both refused on the total's own label. The count
+      // is compared as text — finding the digits somewhere is not enough.
+      const offByOne: Evidence = { ...e, census: { ...e.census, total: (e.census.total as number) + 1 } };
+      expect(() => expectCensusCounts(statement, offByOne), "a wrong total is refused").toThrow("the exact total, on its own label");
+      const padded = statement.replace(/\b(\d+) unsanctioned\b/, "0$1 unsanctioned");
+      expect(padded, "control fixture: the rendered total was zero-padded").not.toBe(statement);
+      expect(() => expectCensusCounts(padded, e), "a zero-padded total is refused").toThrow("the exact total, on its own label");
       expect(blocks[0].text).not.toMatch(/unavailable/i);
     }
     for (const id of ids) expect(blocks[0].text, "sampled identities are exact UUIDs").toContain(id);

@@ -244,7 +244,9 @@ describe("AUDITFIX-25 AC08: a failed access_bootstrap row discloses its typed ev
 
     expect(blocks).toEqual([]);
     expect(html).toContain("failed (2)");
-    expect(html, "exactly the first 120 characters, then the cue").toMatch(new RegExp(`>${long.slice(0, 120)}(<!-- -->)?…</span>`));
+    const preview = />(linear 500: e+)(?:<!-- -->)?…<\/span>/.exec(html);
+    expect(preview, "exactly the first 120 characters, then the cue").not.toBeNull();
+    expect(preview![1], "exactly the first 120 characters, then the cue").toBe(long.slice(0, 120));
     expect(html, "every error, in full, as the title").toContain(`title="${long}\nsecond error"`);
     expect(html.split(long), "the full text is the title ONLY — the cell shows the preview").toHaveLength(2);
   });
