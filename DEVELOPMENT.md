@@ -27,7 +27,7 @@ Edit `.env.local` and set, at minimum:
 ```bash
 DATABASE_URL=postgres://app:app@localhost:5434/app_test   # see "Where do I get a DATABASE_URL?"
 AUTH_SECRET=<paste 32 random bytes — command below>
-APP_URL=http://localhost:3000
+APP_URL=http://127.0.0.1:3000
 # ANTHROPIC_API_KEY=sk-ant-...   # optional; only for live queries
 ```
 

@@ -39,6 +39,11 @@ export default defineConfig({
     environment: "node",
     include: ["test/http/dev-login.dev-http.test.ts"],
     globalSetup: ["test/http/dev-login-dev-setup.ts"],
+    // The owned children belong to the worker that runs the test file, and what a SIGINT/SIGTERM does
+    // to them is measured for a FORKED worker only (test/dev-login-child-lifecycle.test.ts). Pinned
+    // rather than left to the installed default, which is also forks. A command-line `--pool=threads`
+    // still overrides this and is unsupported.
+    pool: "forks",
     // One file, one owned child at a time (production children first, then dev off, then dev on).
     fileParallelism: false,
     // A test may start a child (finite readiness deadline inside) and wait for a first dev compile.

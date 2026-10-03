@@ -135,13 +135,16 @@ const SUPERVISOR = [
 ].join("\n");
 
 // The carrier's process shape with nothing of the carrier's in it: the INSTALLED Vitest, run for real
-// over one generated test file in the disposable directory. The config names no pool — neither does
-// vitest.dev-login.config.ts — so the test file runs in whatever this Vitest uses by default, and the
-// cases below MEASURE that it is a forked child of the main process before relying on it.
+// over one generated test file in the disposable directory. The config pins `pool: "forks"`, exactly
+// as vitest.dev-login.config.ts does (it is also what this installed Vitest resolves an absent pool
+// to). The pin is not taken on trust: the cases below independently MEASURE that the test file ran in
+// a forked child of the main process before relying on it. A command-line `--pool=threads` override
+// is outside both configs and unsupported — nothing here says those signals clean up a thread worker.
 const TOPOLOGY_CONFIG = [
   "export default {",
   "  test: {",
   '    environment: "node",',
+  '    pool: "forks",',
   "    globals: true,",
   '    include: ["topology.test.mjs"],',
   "    fileParallelism: false,",
