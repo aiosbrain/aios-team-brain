@@ -113,13 +113,18 @@ export interface RoutingTree {
   nextConfigs: ReadonlyMap<string, string>;
 }
 
-/** Walk the real filesystem (so untracked source is included) — reads only. */
+/**
+ * Walk the real filesystem (so untracked source is included) — reads only. No directory name is
+ * skipped: Next's own app walk (installed `next/dist/build/route-discovery.js:collectAppFiles`)
+ * ignores only `_`-prefixed parts, so `app/api/node_modules/route.ts` and `app/api/.next/route.ts`
+ * are served handlers. The repository-root `node_modules/` and `.next/` sit outside TREE_ROOTS and
+ * are never entered.
+ */
 export function readRoutingTree(root: string = REPO_ROOT): RoutingTree {
   const files: string[] = [];
   const directories: string[] = [];
   const walk = (rel: string) => {
     for (const name of readdirSync(join(root, rel))) {
-      if (name === "node_modules" || name === ".next") continue;
       const child = `${rel}/${name}`;
       if (statSync(join(root, child)).isDirectory()) {
         directories.push(child);

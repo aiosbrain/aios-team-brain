@@ -153,6 +153,37 @@ describe("route-auth inventory: filesystem discovery (AC-01)", () => {
     ]);
   });
 
+  // Next's app walk ignores only `_`-prefixed parts, so these segments are served like any other.
+  it.each(["node_modules", ".next"])("discovers a route file under an app/ segment named %s", (segment) => {
+    const path = `app/api/${segment}/route.ts`;
+    const control = "app/api/control/route.ts";
+    const root = tree({
+      [path]: guardedGet,
+      [control]: guardedGet,
+      // Dependency and build output at the root stay outside the walk: it starts at app/, pages/, src/.
+      "node_modules/dep/app/api/dep/route.ts": bareHandler("GET"),
+      ".next/server/app/api/built/route.ts": bareHandler("GET"),
+    });
+    const walked = readRoutingTree(root);
+    expect(walked.directories).toContain(`app/api/${segment}`);
+    expect(walked.files).toContain(path);
+    expect(walked.files.filter((file) => !file.startsWith("app/"))).toEqual([]);
+
+    const { repo, treeProblems } = loadRepoView(root);
+    expect(treeProblems).toEqual([]);
+    expect([...repo.routeSources.keys()]).toEqual([path, control].sort());
+    expect(repo.routeSources.get(path)).toBe(guardedGet);
+
+    // The file is read and analyzed, not skipped: its guarded GET fails only for want of a registry row.
+    const routes = Object.fromEntries(repo.routeSources);
+    const controlRow = protect(control, "GET", "authenticateApiKey");
+    expect(check(routes, [controlRow])).toEqual([
+      `${path} GET: unclassified handler invoking authenticateApiKey — add an expected-guard row`,
+    ]);
+    // Admitted control: the same path with its row passes, so the segment is not refused outright.
+    expect(check(routes, [controlRow, protect(path, "GET", "authenticateApiKey")])).toEqual([]);
+  });
+
   it.each(["tsx", "js", "jsx"])("fails a route.%s Next would serve instead of ignoring it", (extension) => {
     const root = tree({ [`app/api/alt/route.${extension}`]: "export function GET() {}" });
     const { repo, treeProblems } = loadRepoView(root);
