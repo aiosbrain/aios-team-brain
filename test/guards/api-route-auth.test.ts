@@ -9,6 +9,7 @@ import {
   loadRepoView,
   PROTECTED_ROUTES,
   PUBLIC_EXCEPTIONS,
+  readRoutingTree,
   REGISTERED_GUARDS,
   REPO_ROOT,
   ROUTE_AUTH_POLICY,
@@ -193,6 +194,256 @@ describe("route-auth inventory: filesystem discovery (AC-01)", () => {
     expect(loadRepoView(prose).treeProblems).toEqual([]);
   });
 
+  const unreviewed = (shape: string) =>
+    `next.config.ts: unreviewed routing-config composition (${shape}) — pageExtensions could be set where this checker cannot see it; update the route discovery contract first`;
+  const configProblems = (source: string, extra: Record<string, string> = {}) =>
+    loadRepoView(tree({ "app/api/a/route.ts": bareHandler("GET"), "next.config.ts": source, ...extra })).treeProblems;
+
+  it("fails closed when an imported config could introduce pageExtensions — the import is never followed", () => {
+    // The customization lives ONLY in the imported module, where the local mention scan cannot see it.
+    const hidden = {
+      "config/routing.ts": `export default { pageExtensions: ["api.ts"] };\nexport const withRouting = (config: object) => ({ ...config, pageExtensions: ["api.ts"] });\n`,
+    };
+    const imported = [unreviewed(`imported binding "base"`)];
+    expect(configProblems(`import base from "./config/routing";\nexport default base;\n`, hidden)).toEqual(imported);
+    expect(configProblems(`import base from "./config/routing";\nexport default { ...base };\n`, hidden)).toEqual(imported);
+    expect(
+      configProblems(
+        `import base from "./config/routing";\nconst nextConfig = { reactStrictMode: true, ...(base ? base : {}) };\nexport default nextConfig;\n`,
+        hidden,
+      ),
+    ).toEqual(imported);
+    expect(
+      configProblems(`import { withRouting } from "./config/routing";\nexport default withRouting({});\n`, hidden),
+    ).toEqual([unreviewed("unreviewed wrapper call")]);
+  });
+
+  it.each([
+    [
+      "a wrapper that only shares the reviewed wrapper's spelling",
+      `import { withSentryConfig } from "./config/sentry";\nexport default withSentryConfig({});\n`,
+      "unreviewed wrapper call",
+    ],
+    ["a function config", `export default () => ({});\n`, "not an object literal"],
+    [
+      "a computed key",
+      `const key = ["page", "Extensions"].join("");\nexport default { [key]: ["api.ts"] };\n`,
+      "computed property key",
+    ],
+    ["a mutable binding", `let nextConfig = {};\nexport default nextConfig;\n`, `"nextConfig" is not a single top-level const`],
+    ["a CommonJS assignment", `module.exports = {};\n`, "no single `export default` expression"],
+  ])("fails closed on %s in the routing config", (_name, source, shape) => {
+    expect(configProblems(source)).toEqual([unreviewed(shape)]);
+  });
+
+  it("admits locally composed configs, including the reviewed Sentry wrapper", () => {
+    expect(configProblems(`export default {};\n`)).toEqual([]);
+    expect(
+      configProblems(`import type { NextConfig } from "next";\nexport default { reactStrictMode: true } satisfies NextConfig;\n`),
+    ).toEqual([]);
+    expect(
+      configProblems(`import type { NextConfig } from "next";
+import { withSentryConfig } from "@sentry/nextjs";
+const root: string | null = null;
+const nextConfig: NextConfig = {
+  allowedDevOrigins: ["localhost"],
+  ...(root ? { turbopack: { root } } : {}),
+};
+export default withSentryConfig(nextConfig, { silent: true });
+`),
+    ).toEqual([]);
+  });
+
+  // A computed write of the option: no identifier or string in it spells `pageExtensions`.
+  const MUTATION = `["page" + "Extensions"] = ["api.ts"]`;
+  const strayBinding = (name: string) => unreviewed(`config binding "${name}" is used outside its supported composition`);
+
+  it("fails closed on a later computed-key mutation the pageExtensions word scan cannot see", () => {
+    // Next would receive customized extensions, and the default export is still a supported const.
+    const source = `const cfg = {};\ncfg${MUTATION};\nexport default cfg;\n`;
+    expect(source).not.toContain("pageExtensions");
+    expect(configProblems(source)).toEqual([strayBinding("cfg")]);
+    // Control: only the mutation statement makes the difference.
+    expect(configProblems(`const cfg = {};\nexport default cfg;\n`)).toEqual([]);
+  });
+
+  it.each([
+    ["a mutation through an alias", `const cfg = {};\nconst alias = cfg;\nalias${MUTATION};\nexport default cfg;\n`, "cfg"],
+    [
+      "a mutation of an exported alias",
+      `const cfg = {};\nconst alias = cfg;\nalias${MUTATION};\nexport default alias;\n`,
+      "alias",
+    ],
+    [
+      "a mutation of a spread dependency",
+      `const base = {};\nbase${MUTATION};\nconst cfg = { ...base };\nexport default cfg;\n`,
+      "base",
+    ],
+    ["a plain property write", `const cfg = {};\ncfg.reactStrictMode = true;\nexport default cfg;\n`, "cfg"],
+    [
+      "an escape to an unknown callee statement",
+      `import { tweak } from "./config/tweak";\nconst cfg = {};\ntweak(cfg);\nexport default cfg;\n`,
+      "cfg",
+    ],
+    [
+      "an escape to an unknown callee in an initializer",
+      `import { tweak } from "./config/tweak";\nconst cfg = {};\nconst applied = tweak(cfg);\nexport default cfg;\n`,
+      "cfg",
+    ],
+    [
+      "an escape to Object.assign",
+      `const cfg = {};\nObject.assign(cfg, { ["page" + "Extensions"]: ["api.ts"] });\nexport default cfg;\n`,
+      "cfg",
+    ],
+    [
+      "a closure that captures the config",
+      `const cfg = {};\nfunction patch() {\n  cfg${MUTATION};\n}\nexport default cfg;\n`,
+      "cfg",
+    ],
+    [
+      "the config leaked into its own wrapper options",
+      `import { withSentryConfig } from "@sentry/nextjs";\nconst cfg = {};\nexport default withSentryConfig(cfg, { hooks: cfg });\n`,
+      "cfg",
+    ],
+  ])("fails closed on %s of a config binding", (_name, source, name) => {
+    expect(source).not.toContain("pageExtensions");
+    expect(configProblems(source)).toEqual([strayBinding(name)]);
+  });
+
+  it.each([
+    ["mutates the exported object", `const cfg = {};\nexport default (cfg${MUTATION}) ? cfg : cfg;\n`, "assignment"],
+    [
+      "mutates it inside a spread",
+      `const cfg = {};\nexport default { ...((cfg${MUTATION}) ? cfg : {}) };\n`,
+      "assignment",
+    ],
+    [
+      "calls an unknown function",
+      `import { ready } from "./config/ready";\nexport default { ...(ready() ? { reactStrictMode: true } : {}) };\n`,
+      "call",
+    ],
+  ])("fails closed on a conditional whose condition %s", (_name, source, effect) => {
+    expect(configProblems(source)).toEqual([unreviewed(`conditional condition is not static: ${effect}`)]);
+  });
+
+  it.each([
+    [
+      "a top-level unknown call",
+      `import { setup } from "./config/setup";\nsetup();\nexport default {};\n`,
+      "unsupported top-level statement (ExpressionStatement)",
+    ],
+    ["a top-level branch", `if (process.env.CI) {\n}\nexport default {};\n`, "unsupported top-level statement (IfStatement)"],
+    ["a side-effect import", `import "./config/patch";\nexport default {};\n`, "side-effect import"],
+    ["an unused mutable binding", `let flag = true;\nexport default {};\n`, "mutable top-level binding"],
+    [
+      "an unreviewed top-level IIFE",
+      `const flag = (() => true)();\nexport default { reactStrictMode: flag };\n`,
+      `top-level const "flag" is neither static nor reviewed scaffolding: call`,
+    ],
+    [
+      "an unreviewed top-level helper",
+      `function flag() {\n  return true;\n}\nexport default {};\n`,
+      `top-level function "flag" is not reviewed scaffolding`,
+    ],
+    [
+      "a call nested in a config value",
+      `import { enable } from "./config/flags";\nexport default { reactStrictMode: enable() };\n`,
+      "config value is not static: call",
+    ],
+    [
+      "an assignment nested in a config value",
+      `const seen = { count: 0 };\nexport default { reactStrictMode: (seen.count = 1) };\n`,
+      "config value is not static: assignment",
+    ],
+    [
+      "a function-valued config option",
+      `export default { headers: async () => [] };\n`,
+      "config value is not static: function or class expression",
+    ],
+    [
+      "an imported value under a static key",
+      `import { origins } from "./config/origins";\nexport default { allowedDevOrigins: origins };\n`,
+      `config value is not static: "origins" is not a same-file top-level const`,
+    ],
+    [
+      "an effect in a reviewed wrapper's options",
+      `import { withSentryConfig } from "@sentry/nextjs";\nexport default withSentryConfig({}, { silent: quiet() });\n`,
+      "wrapper option is not static: call",
+    ],
+  ])("fails closed on %s in the routing config module", (_name, source, shape) => {
+    expect(configProblems(source)).toEqual([unreviewed(shape)]);
+  });
+
+  it("admits static consts, static spread dependencies and the reviewed wrapper with static options", () => {
+    expect(configProblems(`const cfg = { reactStrictMode: true };\nexport default cfg;\n`)).toEqual([]);
+    expect(
+      configProblems(`type Flag = boolean;
+const strict: Flag = !process.env.CI;
+const base = { reactStrictMode: strict, allowedDevOrigins: ["127.0.0.1", "localhost"] };
+const cfg = { ...base, ...(strict ? { poweredByHeader: false } : {}), experimental: { staleTimes: { dynamic: 30 } } };
+export default cfg;
+`),
+    ).toEqual([]);
+    expect(
+      configProblems(`import type { NextConfig } from "next";
+import { withSentryConfig } from "@sentry/nextjs";
+const nextConfig: NextConfig = { reactStrictMode: true };
+export default withSentryConfig(nextConfig, { org: process.env.SENTRY_ORG, silent: !process.env.CI, telemetry: false });
+`),
+    ).toEqual([]);
+  });
+
+  it("admits the real next.config.ts, and refuses in-memory mutants of it", () => {
+    const { nextConfigs } = readRoutingTree();
+    expect([...nextConfigs.keys()]).toEqual(["next.config.ts"]);
+    const source = nextConfigs.get("next.config.ts") ?? "";
+    const problems = (mutated: string) =>
+      inspectRoutingTree({ files: [], directories: [], nextConfigs: new Map([["next.config.ts", mutated]]) }).problems;
+    expect(problems(source)).toEqual([]);
+
+    // The Turbopack-root scaffolding passes only as the reviewed statements bound to node builtins —
+    // never as a general allowance for an IIFE, a helper or a later statement.
+    const guardLine = `if (!lstatSync(nm).isSymbolicLink()) return null;`;
+    const returnLine = `return commonAncestor(realpathSync(here), realpathSync(nm));`;
+    const fsImport = `import { lstatSync, realpathSync } from "node:fs";`;
+    const spreadCondition = `...(turbopackRoot ? {`;
+    for (const needle of [`const turbopackRoot = (() => {`, guardLine, returnLine, fsImport, spreadCondition])
+      expect(source).toContain(needle);
+    const editedScaffolding = [
+      unreviewed(`top-level const "turbopackRoot" is neither static nor reviewed scaffolding: call`),
+    ];
+    // Comments and layout are not part of the review.
+    expect(problems(source.replace(guardLine, `// still the reviewed statement\n    ${guardLine}`))).toEqual([]);
+    expect(problems(source.replace(guardLine, `if (!lstatSync(nm).isSymbolicLink()) return here;`))).toEqual(
+      editedScaffolding,
+    );
+    // Same tokens, different program: a line break after `return` discards the returned value.
+    expect(problems(source.replace(returnLine, returnLine.replace("return ", "return\n    ")))).toEqual(
+      editedScaffolding,
+    );
+    expect(problems(source.replace(fsImport, `import { lstatSync, realpathSync } from "./config/fs";`))).toEqual([
+      unreviewed(`reviewed scaffolding "turbopackRoot" no longer binds lstatSync to node:fs#lstatSync`),
+    ]);
+    expect(problems(source.replace(spreadCondition, `...(prepare() ? {`))).toEqual([
+      unreviewed("conditional condition is not static: call"),
+    ]);
+    expect(problems(`${source}\nnextConfig${MUTATION};\n`)).toEqual([strayBinding("nextConfig")]);
+    expect(problems(`${source}\nwarmUp();\n`)).toEqual([
+      unreviewed("unsupported top-level statement (ExpressionStatement)"),
+    ]);
+
+    const wrapperImport = `import { withSentryConfig } from "@sentry/nextjs";`;
+    const literal = `const nextConfig: NextConfig = {`;
+    expect(source).toContain(wrapperImport);
+    expect(source).toContain(literal);
+    expect(problems(source.replace(wrapperImport, `import { withSentryConfig } from "./config/sentry";`))).toEqual([
+      unreviewed("unreviewed wrapper call"),
+    ]);
+    expect(problems(source.replace(literal, `import shared from "./config/shared";\n${literal}\n  ...shared,`))).toEqual([
+      unreviewed(`imported binding "shared"`),
+    ]);
+  });
+
   it("refuses an empty inventory", () => {
     expect(check({}, [])).toEqual(["no App Router route files discovered — the inventory must be non-empty"]);
   });
@@ -301,6 +552,42 @@ export async function GET(req: Request) {
       unsupported("GET", "overload signature"),
     ]);
     expect(shape(`export class DELETE {}\n`)).toEqual([unsupported("DELETE", "not a function")]);
+  });
+
+  const guarded = (declaration: string) => `${declaration} (req: Request) => {
+  if (!(await authenticateApiKey(req))) return new Response(null, { status: 401 });
+  return new Response();
+};
+`;
+  const constPost = guarded("export const POST = async");
+  const postRow = protect(P, "POST", "authenticateApiKey");
+
+  it.each([
+    ["a namespace member", `import * as ns from "./handlers";\nexport import GET = ns.GET;\n`],
+    ["a required module", `export import GET = require("./handlers");\n`],
+  ])("fails an exported import-equals alias of %s, even beside a classifiable handler", (_name, alias) => {
+    // POST is valid and registered, so only the alias can produce the failure.
+    expect(check({ [P]: KEY_IMPORT + alias + constPost }, [postRow])).toEqual([unsupported("GET", "import-equals alias")]);
+  });
+
+  it("leaves an import-equals export that is not an HTTP method alone", () => {
+    const source = `${KEY_IMPORT}import * as ns from "./handlers";\nexport import helper = ns.helper;\n${constPost}`;
+    expect(check({ [P]: source }, [postRow])).toEqual([]);
+  });
+
+  it.each(["let", "var"])("fails a mutable `export %s` handler even when it calls its guard", (keyword) => {
+    const source = KEY_IMPORT + guarded(`export ${keyword} GET = async`) + constPost;
+    expect(check({ [P]: source }, [postRow])).toEqual([unsupported("GET", "exported binding is not const")]);
+    // A registry row cannot rescue it: the mutable binding is never inventoried as a handler.
+    expect(check({ [P]: source }, [protect(P, "GET", "authenticateApiKey"), postRow])).toEqual([
+      unsupported("GET", "exported binding is not const"),
+      `${P} GET: stale registry row — no such exported handler`,
+    ]);
+  });
+
+  it("admitted control: the same handlers as exported const pass", () => {
+    const source = KEY_IMPORT + guarded("export const GET = async") + constPost;
+    expect(check({ [P]: source }, [protect(P, "GET", "authenticateApiKey"), postRow])).toEqual([]);
   });
 
   it("refuses a source that does not parse", () => {

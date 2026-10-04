@@ -24,11 +24,20 @@ import ts from "typescript";
  * This pins WHICH registered entry points a handler calls. It does not prove that every branch is
  * dominated by the guard, that the guard's verdict is honoured, or that a registered owner cannot
  * become permissive — the runtime denial tests named in each registration's `evidence` carry that.
- * Only syntactically obvious dead code is rejected (`if (false) …`, a statement after an
- * unconditional `return`/`throw`); arbitrary path feasibility is out of scope. The seven
- * `getSessionUser` routes' inline active-same-team membership predicate is NOT proven here.
- * Pages, framework metadata endpoints and Server Actions are not route-file handlers and are not
- * scanned.
+ * Dead code is pruned for a small syntactic subset only: an `if`/`while`/ternary/`&&`/`||` whose
+ * condition is a literal constant, and statements after an unconditional `return`/`throw` in the
+ * same block. That is not reachability analysis — loops, `switch`, `??` and every non-literal
+ * condition are treated as executed. The seven `getSessionUser` routes' inline active-same-team
+ * membership predicate is NOT proven here. Pages, framework metadata endpoints and Server Actions
+ * are not route-file handlers and are not scanned.
+ *
+ * Discovery assumes Next's default `pageExtensions`. The routing config is read by SYNTAX, never
+ * evaluated and never followed across imports: a `next.config.*` passes only as the finite module
+ * shape listed at `unreviewedConfigShape` — static config forms, the reviewed Sentry wrapper, the
+ * pinned Turbopack-root scaffolding, and no other top-level statement or mention of a config
+ * binding. That is a contract on admitted syntax, not an effect analysis: what an imported module
+ * does when it loads, a getter behind a property read, and the reviewed wrapper's internals are
+ * trusted by review, not proven.
  */
 
 export const REPO_ROOT = join(import.meta.dirname, "..", "..", "..");
@@ -143,6 +152,360 @@ function mentionsPageExtensions(name: string, source: string): boolean {
 }
 
 /**
+ * Config wrappers reviewed as leaving `pageExtensions` alone, by `module#export` identity. Sentry's
+ * build wrapper reads the option to locate page files; it does not set it.
+ */
+const REVIEWED_CONFIG_WRAPPERS: ReadonlySet<string> = new Set(["@sentry/nextjs#withSentryConfig"]);
+
+/** Globals a static config value may read (`process.env.X`); every other free name is refused. */
+const AMBIENT_CONFIG_VALUES: ReadonlySet<string> = new Set(["process", "undefined"]);
+
+interface ReviewedScaffolding {
+  /** The top-level name the statement declares. */
+  name: string;
+  source: string;
+  /** `module#export` identities its free names must still be imported as, un-aliased. */
+  imports: readonly string[];
+  /** Other reviewed scaffolding statements it calls or reads. */
+  scaffolding: readonly string[];
+}
+
+/**
+ * The ONLY executable top-level code a routing config may carry: the worktree Turbopack-root
+ * scaffolding of the current `next.config.ts`, reviewed as never receiving the config object. A
+ * statement is admitted when it is token-for-token and node-for-node this text (comments and layout
+ * aside) AND every listed name still binds to the listed import or reviewed statement. Editing the
+ * scaffolding means re-reviewing it here; this is not an allowance for any other IIFE or helper.
+ */
+const REVIEWED_CONFIG_SCAFFOLDING: readonly ReviewedScaffolding[] = [
+  {
+    name: "here",
+    source: `const here = dirname(fileURLToPath(import.meta.url));`,
+    imports: ["node:path#dirname", "node:url#fileURLToPath"],
+    scaffolding: [],
+  },
+  {
+    name: "commonAncestor",
+    source: `function commonAncestor(a: string, b: string): string {
+  const as = a.split(sep);
+  const bs = b.split(sep);
+  const out: string[] = [];
+  for (let i = 0; i < Math.min(as.length, bs.length) && as[i] === bs[i]; i++) out.push(as[i]);
+  return out.join(sep) || sep;
+}`,
+    imports: ["node:path#sep"],
+    scaffolding: [],
+  },
+  {
+    name: "turbopackRoot",
+    source: `const turbopackRoot = (() => {
+  try {
+    const nm = resolve(here, "node_modules");
+    if (!lstatSync(nm).isSymbolicLink()) return null;
+    return commonAncestor(realpathSync(here), realpathSync(nm));
+  } catch {
+    return null;
+  }
+})();`,
+    imports: ["node:path#resolve", "node:fs#lstatSync", "node:fs#realpathSync"],
+    scaffolding: ["here", "commonAncestor"],
+  },
+];
+
+/** The token texts of `text`, comments and whitespace dropped. */
+function tokensOf(text: string): string {
+  const scanner = ts.createScanner(ts.ScriptTarget.Latest, true, ts.LanguageVariant.Standard, text);
+  const tokens: string[] = [];
+  while (scanner.scan() !== ts.SyntaxKind.EndOfFileToken) tokens.push(scanner.getTokenText());
+  return tokens.join("\u0000");
+}
+
+/** The node-kind tree of `node`: equal tokens can still parse differently across a line break. */
+function kindsOf(node: ts.Node): string {
+  const kinds: number[] = [];
+  const visit = (child: ts.Node) => {
+    kinds.push(child.kind);
+    ts.forEachChild(child, visit);
+    kinds.push(ts.SyntaxKind.Unknown);
+  };
+  visit(node);
+  return kinds.join(",");
+}
+
+function reviewedScaffoldingFor(statement: ts.Statement, source: string): ReviewedScaffolding | undefined {
+  const tokens = tokensOf(source.slice(statement.pos, statement.end));
+  const kinds = kindsOf(statement);
+  return REVIEWED_CONFIG_SCAFFOLDING.find((pin) => {
+    if (tokensOf(pin.source) !== tokens) return false;
+    const [reviewed] = ts.createSourceFile("reviewed.ts", pin.source, ts.ScriptTarget.Latest, false).statements;
+    return kindsOf(reviewed) === kinds;
+  });
+}
+
+/**
+ * `mentionsPageExtensions` only sees spellings, so a config module passes only when the exported
+ * object can get no key that is not spelled, statically, in this file. By syntax alone:
+ *
+ * The single `export default` expression is a CONFIG FORM:
+ *   - an object literal — non-computed keys, static values, spreads only over config forms;
+ *   - or a same-file top-level `const` initialised to a config form (a "config binding");
+ *   - or a conditional between two config forms, on a static condition;
+ *   - or a call of a REVIEWED_CONFIG_WRAPPERS import — first argument a config form, the rest static.
+ *
+ * A STATIC VALUE is a literal, `process.…`, another same-file top-level const, or a `!`/binary/
+ * ternary/array/object of static values. A call, an assignment, a function, a computed key and an
+ * imported binding are not static.
+ *
+ * The MODULE around it:
+ *   - a config binding's name appears ONLY at its declaration and in the config-form positions
+ *     above; any other spelling of it (property write, alias, argument, closure) is refused;
+ *   - top-level statements are imports with bindings, type declarations, `const`s of static values,
+ *     the one `export default`, and REVIEWED_CONFIG_SCAFFOLDING. Nothing else may execute.
+ *
+ * Returns the first unsupported shape, or undefined. Nothing is opened, evaluated or followed.
+ */
+function unreviewedConfigShape(name: string, source: string): string | undefined {
+  const file = ts.createSourceFile(name, source, ts.ScriptTarget.Latest, false);
+  const parseDiagnostics = (file as unknown as { parseDiagnostics?: readonly unknown[] }).parseDiagnostics;
+  if (!Array.isArray(parseDiagnostics) || parseDiagnostics.length > 0) return "parse error";
+
+  type Binding = { imported: string } | { value: ts.Expression } | { opaque: true };
+  const bindingsOf = (id: string): Binding[] => {
+    const found: Binding[] = [];
+    for (const statement of file.statements) {
+      if (ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier)) {
+        const specifier = statement.moduleSpecifier.text;
+        const clause = statement.importClause;
+        if (clause?.name?.text === id) found.push({ imported: `${specifier}#default` });
+        const bindings = clause?.namedBindings;
+        if (bindings && ts.isNamespaceImport(bindings) && bindings.name.text === id)
+          found.push({ imported: `${specifier}#*` });
+        if (bindings && ts.isNamedImports(bindings)) {
+          for (const element of bindings.elements)
+            if (element.name.text === id)
+              found.push({ imported: `${specifier}#${(element.propertyName ?? element.name).text}` });
+        }
+      } else if (ts.isVariableStatement(statement)) {
+        const list = statement.declarationList;
+        const isConst = (list.flags & ts.NodeFlags.BlockScoped) === ts.NodeFlags.Const;
+        for (const declaration of list.declarations) {
+          if (!bindingNames(declaration.name).includes(id)) continue;
+          found.push(
+            isConst && ts.isIdentifier(declaration.name) && declaration.initializer
+              ? { value: declaration.initializer }
+              : { opaque: true },
+          );
+        }
+      } else if (
+        (ts.isFunctionDeclaration(statement) ||
+          ts.isClassDeclaration(statement) ||
+          ts.isEnumDeclaration(statement) ||
+          ts.isModuleDeclaration(statement) ||
+          ts.isImportEqualsDeclaration(statement)) &&
+        statement.name &&
+        ts.isIdentifier(statement.name) &&
+        statement.name.text === id
+      )
+        found.push({ opaque: true });
+    }
+    return found;
+  };
+
+  /** Identifier nodes standing in a config-form position, and the top-level consts they name. */
+  const composed = new Set<ts.Node>();
+  const configBindings = new Set<string>();
+
+  const unwrap = (expression: ts.Expression): ts.Expression => {
+    let node = expression;
+    while (
+      ts.isParenthesizedExpression(node) ||
+      ts.isAsExpression(node) ||
+      ts.isSatisfiesExpression(node) ||
+      ts.isNonNullExpression(node)
+    )
+      node = node.expression;
+    return node;
+  };
+
+  const propertiesShape = (
+    literal: ts.ObjectLiteralExpression,
+    spread: (expression: ts.Expression) => string | undefined,
+    value: (expression: ts.Expression) => string | undefined,
+  ): string | undefined => {
+    for (const property of literal.properties) {
+      let problem: string | undefined;
+      if (ts.isSpreadAssignment(property)) problem = spread(property.expression);
+      else if (ts.isComputedPropertyName(property.name)) problem = "computed property key";
+      else if (ts.isShorthandPropertyAssignment(property)) problem = value(property.name);
+      else if (ts.isPropertyAssignment(property)) problem = value(property.initializer);
+      else problem = "method or accessor property";
+      if (problem) return problem;
+    }
+    return undefined;
+  };
+
+  /** The first construct that makes `expression` more than a static value, or undefined. */
+  const staticValue = (expression: ts.Expression): string | undefined => {
+    const node = unwrap(expression);
+    if (ts.isStringLiteralLike(node) || ts.isNumericLiteral(node)) return undefined;
+    if (
+      node.kind === ts.SyntaxKind.TrueKeyword ||
+      node.kind === ts.SyntaxKind.FalseKeyword ||
+      node.kind === ts.SyntaxKind.NullKeyword
+    )
+      return undefined;
+    if (ts.isIdentifier(node)) {
+      const found = bindingsOf(node.text);
+      if (found.length === 0 && AMBIENT_CONFIG_VALUES.has(node.text)) return undefined;
+      const binding = found.length === 1 ? found[0] : undefined;
+      return binding && "value" in binding ? undefined : `"${node.text}" is not a same-file top-level const`;
+    }
+    if (ts.isPropertyAccessExpression(node)) return staticValue(node.expression);
+    if (ts.isPrefixUnaryExpression(node))
+      return node.operator === ts.SyntaxKind.PlusPlusToken || node.operator === ts.SyntaxKind.MinusMinusToken
+        ? "update"
+        : staticValue(node.operand);
+    if (ts.isBinaryExpression(node)) {
+      const operator = node.operatorToken.kind;
+      if (operator >= ts.SyntaxKind.FirstAssignment && operator <= ts.SyntaxKind.LastAssignment) return "assignment";
+      return staticValue(node.left) ?? staticValue(node.right);
+    }
+    if (ts.isConditionalExpression(node))
+      return staticValue(node.condition) ?? staticValue(node.whenTrue) ?? staticValue(node.whenFalse);
+    if (ts.isArrayLiteralExpression(node)) {
+      for (const element of node.elements) {
+        if (ts.isOmittedExpression(element)) continue;
+        const problem = staticValue(ts.isSpreadElement(element) ? element.expression : element);
+        if (problem) return problem;
+      }
+      return undefined;
+    }
+    if (ts.isObjectLiteralExpression(node)) return propertiesShape(node, staticValue, staticValue);
+    if (ts.isCallExpression(node) || ts.isNewExpression(node) || ts.isTaggedTemplateExpression(node)) return "call";
+    if (ts.isArrowFunction(node) || ts.isFunctionExpression(node) || ts.isClassExpression(node))
+      return "function or class expression";
+    return ts.SyntaxKind[node.kind];
+  };
+  const staticIn = (where: string, expression: ts.Expression): string | undefined => {
+    const problem = staticValue(expression);
+    return problem && `${where} is not static: ${problem}`;
+  };
+
+  const shapeOf = (expression: ts.Expression, resolving: ReadonlySet<string>): string | undefined => {
+    const node = unwrap(expression);
+    if (ts.isObjectLiteralExpression(node))
+      return propertiesShape(
+        node,
+        (spread) => shapeOf(spread, resolving),
+        (value) => staticIn("config value", value),
+      );
+    if (ts.isConditionalExpression(node))
+      return (
+        shapeOf(node.whenTrue, resolving) ??
+        shapeOf(node.whenFalse, resolving) ??
+        staticIn("conditional condition", node.condition)
+      );
+    if (ts.isIdentifier(node)) {
+      const found = bindingsOf(node.text);
+      const binding = found.length === 1 ? found[0] : undefined;
+      if (binding && "imported" in binding) return `imported binding "${node.text}"`;
+      if (!binding || !("value" in binding) || resolving.has(node.text))
+        return `"${node.text}" is not a single top-level const`;
+      composed.add(node);
+      configBindings.add(node.text);
+      return shapeOf(binding.value, new Set(resolving).add(node.text));
+    }
+    if (ts.isCallExpression(node)) {
+      const found = ts.isIdentifier(node.expression) ? bindingsOf(node.expression.text) : [];
+      const binding = found.length === 1 ? found[0] : undefined;
+      if (!binding || !("imported" in binding) || !REVIEWED_CONFIG_WRAPPERS.has(binding.imported))
+        return "unreviewed wrapper call";
+      const [config, ...options] = node.arguments;
+      if (!config || ts.isSpreadElement(config)) return "unreviewed wrapper call";
+      const wrapped = shapeOf(config, resolving);
+      if (wrapped) return wrapped;
+      for (const option of options) {
+        const problem = staticIn("wrapper option", option);
+        if (problem) return problem;
+      }
+      return undefined;
+    }
+    return "not an object literal";
+  };
+
+  const defaults = file.statements.filter(ts.isExportAssignment);
+  if (defaults.length !== 1) return "no single `export default` expression";
+  const shape = shapeOf(defaults[0].expression, new Set());
+  if (shape) return shape;
+
+  // A config binding is spelled only where it was composed: any other mention can mutate or leak it.
+  for (const statement of file.statements) {
+    if (!ts.isVariableStatement(statement)) continue;
+    for (const declaration of statement.declarationList.declarations)
+      if (ts.isIdentifier(declaration.name) && configBindings.has(declaration.name.text))
+        composed.add(declaration.name);
+  }
+  const strays: string[] = [];
+  const findStray = (node: ts.Node) => {
+    if (strays.length > 0) return;
+    if (ts.isIdentifier(node) && configBindings.has(node.text) && !composed.has(node)) strays.push(node.text);
+    else ts.forEachChild(node, findStray);
+  };
+  findStray(file);
+  if (strays.length > 0) return `config binding "${strays[0]}" is used outside its supported composition`;
+
+  // Nothing else may execute at module scope.
+  const pins = new Map<ts.Statement, ReviewedScaffolding>();
+  for (const statement of file.statements) {
+    if (!ts.isVariableStatement(statement) && !ts.isFunctionDeclaration(statement)) continue;
+    const pin = reviewedScaffoldingFor(statement, source);
+    if (pin) pins.set(statement, pin);
+  }
+  const pinned = new Set([...pins.values()].map((pin) => pin.name));
+  for (const statement of file.statements) {
+    if (ts.isImportDeclaration(statement)) {
+      if (!statement.importClause) return "side-effect import";
+      continue;
+    }
+    if (
+      ts.isExportAssignment(statement) ||
+      ts.isInterfaceDeclaration(statement) ||
+      ts.isTypeAliasDeclaration(statement) ||
+      ts.isEmptyStatement(statement)
+    )
+      continue;
+    const pin = pins.get(statement);
+    if (pin) {
+      for (const identity of pin.imports) {
+        const local = identity.slice(identity.indexOf("#") + 1);
+        const found = bindingsOf(local);
+        const binding = found.length === 1 ? found[0] : undefined;
+        if (!binding || !("imported" in binding) || binding.imported !== identity)
+          return `reviewed scaffolding "${pin.name}" no longer binds ${local} to ${identity}`;
+      }
+      for (const local of pin.scaffolding)
+        if (bindingsOf(local).length !== 1 || !pinned.has(local))
+          return `reviewed scaffolding "${pin.name}" no longer binds ${local} to reviewed scaffolding`;
+      continue;
+    }
+    if (ts.isFunctionDeclaration(statement))
+      return `top-level function "${statement.name?.text ?? "default"}" is not reviewed scaffolding`;
+    if (!ts.isVariableStatement(statement)) return `unsupported top-level statement (${ts.SyntaxKind[statement.kind]})`;
+    if ((statement.declarationList.flags & ts.NodeFlags.BlockScoped) !== ts.NodeFlags.Const)
+      return "mutable top-level binding";
+    for (const declaration of statement.declarationList.declarations) {
+      if (!ts.isIdentifier(declaration.name) || !declaration.initializer)
+        return "destructured or uninitialised top-level binding";
+      if (configBindings.has(declaration.name.text)) continue;
+      const problem = staticValue(declaration.initializer);
+      if (problem)
+        return `top-level const "${declaration.name.text}" is neither static nor reviewed scaffolding: ${problem}`;
+    }
+  }
+  return undefined;
+}
+
+/**
  * Decide which files are route handlers under THIS repository's contract (`route.ts` under `app/`),
  * and refuse every shape that would let a handler exist outside it.
  */
@@ -174,6 +537,11 @@ export function inspectRoutingTree(tree: RoutingTree): { routeFiles: string[]; p
   for (const [name, source] of tree.nextConfigs) {
     if (mentionsPageExtensions(name, source))
       problems.push(`${name}: pageExtensions is customized — update the route discovery contract first`);
+    const shape = unreviewedConfigShape(name, source);
+    if (shape)
+      problems.push(
+        `${name}: unreviewed routing-config composition (${shape}) — pageExtensions could be set where this checker cannot see it; update the route discovery contract first`,
+      );
   }
   return { routeFiles, problems };
 }
@@ -508,6 +876,7 @@ export function analyzeRouteSource(path: string, source: string): RouteAnalysis 
       if (statement.body) declare(name, statement);
       else unsupported(name, "overload signature");
     } else if (ts.isVariableStatement(statement)) {
+      const isConst = (statement.declarationList.flags & ts.NodeFlags.BlockScoped) === ts.NodeFlags.Const;
       for (const declaration of statement.declarationList.declarations) {
         if (!ts.isIdentifier(declaration.name)) {
           for (const name of bindingNames(declaration.name))
@@ -517,10 +886,15 @@ export function analyzeRouteSource(path: string, source: string): RouteAnalysis 
         const name = declaration.name.text;
         if (!isHttpMethod(name)) continue;
         const initializer = declaration.initializer;
-        if (initializer && (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer)))
+        // A `let`/`var` export can be reassigned after the body inspected here was written.
+        if (!isConst) unsupported(name, "exported binding is not const");
+        else if (initializer && (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer)))
           declare(name, initializer);
         else unsupported(name, "exported binding is not a function literal");
       }
+    } else if (ts.isImportEqualsDeclaration(statement)) {
+      // `export import GET = ns.GET` — an alias with no body to inspect.
+      if (isHttpMethod(statement.name.text)) unsupported(statement.name.text, "import-equals alias");
     } else if (
       (ts.isClassDeclaration(statement) || ts.isEnumDeclaration(statement) || ts.isModuleDeclaration(statement)) &&
       statement.name &&

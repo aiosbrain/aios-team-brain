@@ -34,6 +34,10 @@ const h = vi.hoisted(() => ({
   markAgentTokenUsed: vi.fn(),
   verifyGatewayCredential: vi.fn(),
   actualVerifyGatewayCredential: null as null | ((authorization: string | null) => Promise<unknown>),
+  withTransaction: vi.fn(),
+  getPool: vi.fn(),
+  actualWithTransaction: null as null | ((fn: never) => Promise<unknown>),
+  actualGetPool: null as null | (() => unknown),
 }));
 
 /** PostgREST-shaped reads over `h.tables`, honouring every `.eq` the owner applies. */
@@ -87,6 +91,20 @@ vi.mock("@/lib/access/agent-tokens", async (importOriginal) => ({
   verifyAgentToken: h.verifyAgentToken,
   markAgentTokenUsed: h.markAgentTokenUsed,
 }));
+// The two entries to Postgres under the real gateway verifier: its lookup opens `withTransaction`,
+// which checks a client out of `getPool()`. Both stay the ACTUAL functions behind a counting
+// pass-through (restored before every test), so a test can arm them to throw and assert zero calls
+// without depending on whether a database happens to be configured.
+vi.mock("@/lib/db/pg/pool", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/db/pg/pool")>();
+  h.actualGetPool = actual.getPool;
+  return { ...actual, getPool: () => h.getPool() };
+});
+vi.mock("@/lib/db/pg/tx", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/db/pg/tx")>();
+  h.actualWithTransaction = actual.withTransaction;
+  return { ...actual, withTransaction: (fn: never) => h.withTransaction(fn) };
+});
 vi.mock("@/lib/gateway/persistence", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/gateway/persistence")>();
   h.actualVerifyGatewayCredential = actual.authenticateGatewayServiceCredential;
@@ -158,6 +176,8 @@ beforeEach(async () => {
   h.verifyGatewayCredential
     .mockReset()
     .mockImplementation((authorization: string | null) => h.actualVerifyGatewayCredential!(authorization));
+  h.withTransaction.mockReset().mockImplementation((fn: never) => h.actualWithTransaction!(fn));
+  h.getPool.mockReset().mockImplementation(() => h.actualGetPool!());
 });
 
 describe("getSessionUser — actual cookie wrapper over real session verification", () => {
@@ -425,13 +445,47 @@ describe("authenticateGatewayRequest — actual wrapper over the service credent
     return ((await (response as Response).json()) as { error: { code: string } }).error.code;
   };
 
+  // Synthetic, canonically encoded credential parts (16 and 32 bytes) — registered nowhere.
+  const CREDENTIAL_ID = Buffer.alloc(16, 1).toString("base64url");
+  const SECRET = Buffer.alloc(32, 2).toString("base64url");
+  const bearer = (credentialId: string, secret: string) => `Bearer aios_gw_${credentialId}_${secret}`;
+  const prohibit = (entry: typeof h.getPool, name: string) =>
+    entry.mockImplementation(() => {
+      throw new Error(`lookup prohibited: ${name} was reached`);
+    });
+
   it("refuses a missing or malformed credential through the REAL verifier, before any lookup", async () => {
-    for (const headers of [VERSIONS, { ...VERSIONS, authorization: "Bearer deliberately-invalid" }]) {
+    // A lookup attempt would throw here and surface as the fixed 500, never as this 401.
+    prohibit(h.withTransaction, "withTransaction");
+    prohibit(h.getPool, "getPool");
+    const refused = {
+      "no authorization header": VERSIONS,
+      "not a gateway bearer": { ...VERSIONS, authorization: "Bearer deliberately-invalid" },
+      // Right length and alphabet, but the last character carries bits no 16/32-byte value encodes.
+      "non-canonical credential id": { ...VERSIONS, authorization: bearer(`${CREDENTIAL_ID.slice(0, -1)}R`, SECRET) },
+      "non-canonical secret": { ...VERSIONS, authorization: bearer(CREDENTIAL_ID, `${SECRET.slice(0, -1)}J`) },
+    };
+    for (const [name, headers] of Object.entries(refused)) {
       const result = await authenticateGatewayRequest(request(headers));
-      expect((result as Response).status).toBe(401);
-      await expect(errorCode(result)).resolves.toBe("gateway_unauthorized");
+      expect(h.withTransaction, name).toHaveBeenCalledTimes(0);
+      expect(h.getPool, name).toHaveBeenCalledTimes(0);
+      expect((result as Response).status, name).toBe(401);
+      await expect(errorCode(result), name).resolves.toBe("gateway_unauthorized");
     }
-    expect(h.verifyGatewayCredential).toHaveBeenCalledTimes(2);
+    expect(h.verifyGatewayCredential).toHaveBeenCalledTimes(4);
+  });
+
+  it("seam control: a well-formed credential takes the same REAL verifier into withTransaction and on to getPool", async () => {
+    // Only the pool entry is armed: the actual withTransaction runs and must be what reaches it.
+    // Without this, the zero-call assertions above could be watching functions the verifier never uses.
+    prohibit(h.getPool, "getPool");
+    const result = await authenticateGatewayRequest(
+      request({ ...VERSIONS, authorization: bearer(CREDENTIAL_ID, SECRET) }),
+    );
+    expect(h.withTransaction).toHaveBeenCalledTimes(1);
+    expect(h.getPool).toHaveBeenCalledTimes(1);
+    expect((result as Response).status).toBe(500);
+    await expect(errorCode(result)).resolves.toBe("gateway_internal");
   });
 
   it("refuses when the credential verifier rejects, returning no service principal", async () => {

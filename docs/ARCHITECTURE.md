@@ -574,12 +574,41 @@ included — has a per-method registry row and either:
   public readiness, and the local-only dev login.
 
 A new handler therefore needs a reviewed row; an unsupported export shape (`export *`,
-`export { h as GET }`, a destructured export), a non-`.ts` route file, a `pages/api` or `src/app`
-tree, or a customized `pageExtensions` fails rather than disappearing from the inventory.
+`export { h as GET }`, a destructured export, `export import GET = …`, an `export let`/`var`
+handler), a non-`.ts` route file, a `pages/api` or `src/app` tree, or a customized
+`pageExtensions` fails rather than disappearing from the inventory.
+
+**Discovery assumes Next's default `pageExtensions`, so the routing config has a syntactic
+contract.** `next.config.*` is parsed, never evaluated and never followed across imports. It passes
+only as this finite module shape; everything else fails `unreviewed routing-config composition`:
+
+- the single `export default` is a _config form_: an object literal (non-computed keys, static
+  values, spreads only over config forms), a same-file top-level `const` holding one, a conditional
+  between two on a static condition, or `withSentryConfig` imported from `@sentry/nextjs` with a
+  config form as its first argument and static options;
+- a _static value_ is a literal, `process.…`, another same-file top-level `const`, or a
+  `!`/binary/ternary/array/object of those — no call, assignment, function, computed key or
+  imported binding (so `headers()`/`redirects()`/`webpack` hooks are refused until reviewed);
+- a const that holds a config form may be spelled only at its declaration and in those
+  composition positions: a later property write, an alias, a hand-off to any call, or a closure
+  over it is refused, whatever key it would set;
+- top-level statements are imports with bindings, type declarations, `const`s of static values and
+  the one `export default`. The only other executable code admitted is the current Turbopack-root
+  scaffolding (`here`, `commonAncestor`, `turbopackRoot`), pinned statement-for-statement in the
+  checker and bound to its `node:fs`/`node:path`/`node:url` imports — editing it means
+  re-reviewing the pin, and it is not an allowance for any other IIFE, helper or statement.
+
+This is a contract on admitted syntax, not an effect analysis or a config evaluator: what an
+imported module does at load time, a getter behind a property read, and the internals of the
+reviewed Sentry wrapper are trusted by review, not proven.
 
 **What this does not prove.** It pins which registered entry points a handler calls — not that
 every branch is dominated by the guard, and not content authorization, revocation or peer
-identity. The seven `getSessionUser` routes (`brain/arcs`, `brain/arcs/recompute`, `brain/events`,
+identity. Dead code is discounted for a small syntactic subset only: an `if`/`while`/ternary/
+`&&`/`||` whose condition is a literal constant (`true`, `false`, `null`, a number, `!` of those),
+and statements after an unconditional `return`/`throw` in the same block. Loops, `switch`, `??`
+and every non-literal condition are treated as executed — there is no general path-feasibility or
+authorization-dominance proof. The seven `getSessionUser` routes (`brain/arcs`, `brain/arcs/recompute`, `brain/events`,
 `brain/facts`, `dashboard/query`, `dashboard/team-work`, `dashboard/timeline`) do their active
 same-team membership check inline; the scanner does not prove that predicate. Each registered
 owner's refusal is proved separately by the runtime tests its registration names
@@ -1775,6 +1804,10 @@ guard enforces it, it's named.
   `test/guards/helpers/api-route-auth.ts` (expected guard set, or a public exception with a reason
   and evidence). `npm test` names the exact `path METHOD` otherwise. Registering a new guard or
   wrapper is a trust decision: it needs an owner, a reason and a test that proves its denial.
+- **Edit `next.config.ts`** → the route inventory admits only a reviewed config shape (see
+  "Route-file authentication inventory"). A new call, function-valued option, top-level statement
+  or change to the Turbopack-root scaffolding fails `npm test` until the contract in
+  `test/guards/helpers/api-route-auth.ts` is re-reviewed.
 - **Write to `items`/`item_versions`** → it must live in `lib/ingest` (single-writer guard).
 - **Read tiered content on the dashboard** → apply the `access`/tier filter explicitly; there is
   no RLS backstop.
