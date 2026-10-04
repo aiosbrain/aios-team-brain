@@ -105,6 +105,55 @@ recently added:
   before the await is what made a dead worker read as a busy one. A dropped episode is re-pushed by
   `lib/graph/reconcile.ts`, so nothing is lost permanently.
 
+## Keyless staging mode (AIO-997)
+
+The image's `CMD` is no longer `graph_service.main:app` — it is **`graph_service.staging_entry:app`**,
+a mode selector (`staging-entry.py`, copied to `/app/graph_service/staging_entry.py`). It exists
+because upstream's `Settings` requires `openai_api_key` and the lifespan constructs the Graphiti and
+provider clients, so a sidecar with the key removed — which copied staging REQUIRES — cannot start at
+all.
+
+- **Ordinary/production is unchanged.** With no `STAGING_OPS_ENVIRONMENT_ID` and no copy claim, the
+  entry re-exports `graph_service.main.app` itself: same object, same lifespan, same routes, same
+  missing-key failure. Nothing about production behaviour depends on this file being in the path.
+- **Pinned staging is keyless.** When `STAGING_OPS_ENVIRONMENT_ID` equals `RAILWAY_ENVIRONMENT_ID`,
+  it builds a minimal FastAPI app that imports none of `graph_service.main`, the routers,
+  `zep_graphiti`, `graphiti_core`, `openai` or `neo4j`. `GET`/`HEAD /healthcheck` → `200 {"status":
+  "healthy", "mode": "staging-no-model"}`; **everything else** → `403 staging_graphiti_no_model`,
+  including `/messages`, `/search`, `/clear`, `/docs` and any path nothing defines. That health is
+  process liveness in no-model mode, not graph or database readiness.
+- **Contradictions refuse startup, they never fall through to production.** A pin that does not match
+  the actual environment, a pin with no actual environment ID, a copy claim (`copy-ready` or
+  `STAGING_COPY_MODE_ACTIVATED=true`) with no pin, or an unrecognised `STAGING_DATA_MODE` inside
+  pinned scope each raise and exit. Railway supplies an environment ID everywhere, so its presence
+  alone never selects staging.
+
+Verify a change to it the way the build does, plus the part the build cannot reach:
+
+```bash
+python3 graphiti/verify-staging-entry.py --selector-only graphiti/staging-entry.py  # scope matrix
+bash graphiti/keyless-image-check.sh    # fresh image + CMD + behavioural diagnostic, network off
+```
+
+`staging-keyless-diagnostic.py` and `staging-keyless-tripwire.py` are **test-only and never copied
+into the image** — the diagnostic is bind-mounted for the run, and the tripwire is installed as a
+`sitecustomize` hook on the server subprocess only. `--network none` proves no outbound call
+succeeded; the tripwire is what shows whether one was ATTEMPTED along the paths it hooks — which is
+not the same as intercepting all egress. It records and refuses **non-loopback name resolution as
+well as** `connect`/`connect_ex`, and leaves `bind`/`listen`/`accept` alone: hooking only the connect
+verbs left a real blind spot, because every HTTP client resolves first and a resolution that fails in
+a no-network container leaves no trace at all if the caller swallows it.
+Loopback resolution stays permitted, or the health server could not bind and the resulting silence
+would prove nothing. The diagnostic's first scenario is the negative control for all of that — a
+DNS-first attempt and a direct-IP attempt, both swallowed by their caller, must still appear in the
+report, and the hooks are only valid while the server runs on Python's asyncio (a `uvloop` server
+resolves inside libuv, where these hooks cannot see, so the diagnostic fails if it is loaded).
+Connectionless UDP (`sendto`/`sendmsg`) and reverse resolution
+(`gethostbyaddr`/`getnameinfo`/`getfqdn`) are outside the hooks as well; the report names them in
+`hooks_blind_to` rather than letting an empty list read as universal coverage.
+Commissioning a live staging sidecar — including clearing the Railway custom start command, which
+otherwise bypasses this `CMD` entirely — is `docs/OPS.md` §11.
+
 ## Status
 Phase 2: ALL content-bearing item kinds (transcript/deliverable/decision/task/artifact) → episodes,
 projected on a schedule, and blended into the main query box. Bounded per run (`GRAPH_PROJECT_LIMIT`);
