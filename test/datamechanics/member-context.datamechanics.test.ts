@@ -50,7 +50,7 @@ describe("getMemberContext fold (real Postgres)", () => {
       bio: "hi",
     });
     await addTimeOff(db(), seed.teamId, seed.memberId, { startsOn: "2026-08-01", endsOn: "2026-08-07" });
-    await setMemberGoal(db(), seed.teamId, seed.memberId, { title: "ship phase 2", kind: "okr" });
+    await setMemberGoal(db(), seed.teamId, seed.memberId, { title: "ship phase 2", kind: "okr" }, { mode: "browser_member" });
 
     const ctx = await getMemberContext(db(), seed.teamId, seed.memberId, "team");
     expect(ctx).not.toBeNull();
@@ -81,7 +81,7 @@ describe("getMemberContext fold (real Postgres)", () => {
 
   it("returns null for an external-tier viewer (the sole tier gate)", async () => {
     const seed = await seedTeam();
-    await setMemberGoal(db(), seed.teamId, seed.memberId, { title: "secret OKR", kind: "okr" });
+    await setMemberGoal(db(), seed.teamId, seed.memberId, { title: "secret OKR", kind: "okr" }, { mode: "browser_member" });
     const ctx = await getMemberContext(db(), seed.teamId, seed.memberId, "external");
     expect(ctx).toBeNull();
   });

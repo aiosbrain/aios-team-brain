@@ -605,6 +605,9 @@ describe("AIO-1217 B1 · People context actions bind the target member to the re
       const after = await contextState();
       const revalidated = revalidatedPaths();
       const absentTargetResult = await run(a.teamSlug, randomUUID());
+      // The absent-target call is observed on its own, against the state captured after the first
+      // call: zero incremental rows, audit or revalidation, whatever the first call did.
+      const absentTargetEffects = { ...(await contextState()), revalidated: revalidatedPaths() };
 
       expect({
         result,
@@ -614,6 +617,7 @@ describe("AIO-1217 B1 · People context actions bind the target member to the re
         goals: after.goals,
         audit: after.audit,
         revalidated,
+        absentTargetEffects,
       }).toEqual({
         result: NOT_ALLOWED,
         absentTargetResult: NOT_ALLOWED,
@@ -622,6 +626,7 @@ describe("AIO-1217 B1 · People context actions bind the target member to the re
         goals: before.goals,
         audit: before.audit,
         revalidated: [],
+        absentTargetEffects: { ...after, revalidated },
       });
     },
   );
@@ -884,12 +889,15 @@ describe("AIO-1217 B2 · People child resources are bound to the authorized targ
     const after = await contextState();
     const revalidated = revalidatedPaths();
     const absentIdResult = await deleteMemberTimeOff(team.teamSlug, alice, randomUUID());
+    // The absent-id call on its own, against the state captured after the first call.
+    const absentIdEffects = { ...(await contextState()), revalidated: revalidatedPaths() };
 
-    expect({ result, absentIdResult, ...after, revalidated }).toEqual({
+    expect({ result, absentIdResult, ...after, revalidated, absentIdEffects }).toEqual({
       result: NOT_ALLOWED,
       absentIdResult: NOT_ALLOWED,
       ...before,
       revalidated: [],
+      absentIdEffects: { ...after, revalidated },
     });
   });
 
@@ -901,12 +909,15 @@ describe("AIO-1217 B2 · People child resources are bound to the authorized targ
     const after = await contextState();
     const revalidated = revalidatedPaths();
     const absentIdResult = await deleteMemberGoal(team.teamSlug, alice, randomUUID());
+    // The absent-id call on its own, against the state captured after the first call.
+    const absentIdEffects = { ...(await contextState()), revalidated: revalidatedPaths() };
 
-    expect({ result, absentIdResult, ...after, revalidated }).toEqual({
+    expect({ result, absentIdResult, ...after, revalidated, absentIdEffects }).toEqual({
       result: NOT_ALLOWED,
       absentIdResult: NOT_ALLOWED,
       ...before,
       revalidated: [],
+      absentIdEffects: { ...after, revalidated },
     });
   });
 
@@ -921,12 +932,15 @@ describe("AIO-1217 B2 · People child resources are bound to the authorized targ
       id: randomUUID(),
       title: "synthetic replacement title",
     });
+    // The absent-id call on its own, against the state captured after the first call.
+    const absentIdEffects = { ...(await contextState()), revalidated: revalidatedPaths() };
 
-    expect({ result, absentIdResult, ...after, revalidated }).toEqual({
+    expect({ result, absentIdResult, ...after, revalidated, absentIdEffects }).toEqual({
       result: NOT_ALLOWED,
       absentIdResult: NOT_ALLOWED,
       ...before,
       revalidated: [],
+      absentIdEffects: { ...after, revalidated },
     });
   });
 

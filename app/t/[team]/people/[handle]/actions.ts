@@ -12,6 +12,7 @@ import {
   setMemberGoal,
   removeMemberGoal,
   setMemberAvatar,
+  ProfileScopeRefusal,
   type ProfileInput,
   type TimeOffInput,
   type GoalInput,
@@ -21,28 +22,45 @@ import { issueApiKey, revokeOwnApiKey } from "@/lib/admin/keys";
 /**
  * Server actions for the per-member identity context editor. The security boundary is
  * `gate()`: a caller may edit a member's context only if they ARE that member or an admin —
- * so no one can edit a teammate's profile/goals. Writes go through the single writer
- * (lib/identity/profile), which validates + audits; the actor is the signed-in member.
+ * so no one can edit a teammate's profile/goals — and only for a member that exists in THIS
+ * team. Writes go through the single writer (lib/identity/profile), which validates + audits
+ * and binds every child row to that target member; the actor is the signed-in member.
  */
 
 interface Gate {
   teamId: string;
   actorMemberId: string;
+  /** The supplied member id, as resolved from this team's roster (never the raw argument). */
+  targetMemberId: string;
 }
 
 async function gate(teamSlug: string, targetMemberId: string): Promise<Gate | null> {
   const db = await serverClient();
   const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
-  const me = await currentMember((team as { id: string }).id);
+  const teamId = (team as { id: string }).id;
+  const me = await currentMember(teamId);
   if (!me) return null;
   if (!canEditMemberContext(me, targetMemberId)) return null;
-  return { teamId: (team as { id: string }).id, actorMemberId: me.id };
+  // The admin arm above accepts ANY id, so prove the target is a member of the resolved team.
+  // No status/kind filter: an admin still edits an invited/disabled/non-human teammate. An
+  // absent, foreign or unreadable target fails closed — a lookup error is never an admission.
+  const { data: target, error } = await db
+    .from("members")
+    .select("id")
+    .eq("team_id", teamId)
+    .eq("id", targetMemberId)
+    .maybeSingle();
+  if (error || !target) return null;
+  return { teamId, actorMemberId: me.id, targetMemberId: (target as { id: string }).id };
 }
 
 type Result = { ok: boolean; error?: string; id?: string };
 
 function fail(e: unknown): Result {
+  // The writer refused a row outside the authorized (team, member) scope: answer exactly like a
+  // refused gate, so a peer's / foreign / absent resource id is indistinguishable from each other.
+  if (e instanceof ProfileScopeRefusal) return { ok: false, error: "not allowed" };
   return { ok: false, error: e instanceof Error ? e.message : "could not save" };
 }
 
@@ -54,7 +72,7 @@ export async function saveProfile(
   const ctx = await gate(teamSlug, memberId);
   if (!ctx) return { ok: false, error: "not allowed" };
   try {
-    await setMemberProfile(adminClient(), ctx.teamId, memberId, input, {
+    await setMemberProfile(adminClient(), ctx.teamId, ctx.targetMemberId, input, {
       actor: { kind: "member", memberId: ctx.actorMemberId },
     });
     revalidatePath(`/t/${teamSlug}/people/${memberId}`);
@@ -72,7 +90,7 @@ export async function addMemberTimeOff(
   const ctx = await gate(teamSlug, memberId);
   if (!ctx) return { ok: false, error: "not allowed" };
   try {
-    const id = await addTimeOff(adminClient(), ctx.teamId, memberId, input, {
+    const id = await addTimeOff(adminClient(), ctx.teamId, ctx.targetMemberId, input, {
       actor: { kind: "member", memberId: ctx.actorMemberId },
     });
     revalidatePath(`/t/${teamSlug}/people/${memberId}`);
@@ -90,7 +108,7 @@ export async function deleteMemberTimeOff(
   const ctx = await gate(teamSlug, memberId);
   if (!ctx) return { ok: false, error: "not allowed" };
   try {
-    await removeTimeOff(adminClient(), ctx.teamId, id, {
+    await removeTimeOff(adminClient(), ctx.teamId, ctx.targetMemberId, id, {
       actor: { kind: "member", memberId: ctx.actorMemberId },
     });
     revalidatePath(`/t/${teamSlug}/people/${memberId}`);
@@ -108,9 +126,15 @@ export async function saveMemberGoal(
   const ctx = await gate(teamSlug, memberId);
   if (!ctx) return { ok: false, error: "not allowed" };
   try {
-    const id = await setMemberGoal(adminClient(), ctx.teamId, memberId, input, {
-      actor: { kind: "member", memberId: ctx.actorMemberId },
-    });
+    // The mode is fixed here, never read from `input`: a browser write is always member-bound.
+    const id = await setMemberGoal(
+      adminClient(),
+      ctx.teamId,
+      ctx.targetMemberId,
+      input,
+      { mode: "browser_member" },
+      { actor: { kind: "member", memberId: ctx.actorMemberId } }
+    );
     revalidatePath(`/t/${teamSlug}/people/${memberId}`);
     return { ok: true, id };
   } catch (e) {
@@ -126,7 +150,7 @@ export async function deleteMemberGoal(
   const ctx = await gate(teamSlug, memberId);
   if (!ctx) return { ok: false, error: "not allowed" };
   try {
-    await removeMemberGoal(adminClient(), ctx.teamId, id, {
+    await removeMemberGoal(adminClient(), ctx.teamId, ctx.targetMemberId, id, {
       actor: { kind: "member", memberId: ctx.actorMemberId },
     });
     revalidatePath(`/t/${teamSlug}/people/${memberId}`);
@@ -145,7 +169,7 @@ export async function saveAvatar(teamSlug: string, memberId: string, dataUrl: st
   const ctx = await gate(teamSlug, memberId);
   if (!ctx) return { ok: false, error: "not allowed" };
   try {
-    await setMemberAvatar(adminClient(), ctx.teamId, memberId, dataUrl, {
+    await setMemberAvatar(adminClient(), ctx.teamId, ctx.targetMemberId, dataUrl, {
       actor: { kind: "member", memberId: ctx.actorMemberId },
     });
     revalidatePath(`/t/${teamSlug}/people/${memberId}`);
