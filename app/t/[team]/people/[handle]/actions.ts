@@ -27,9 +27,13 @@ import { issueApiKey, revokeOwnApiKey } from "@/lib/admin/keys";
  * and binds every child row to that target member; the actor is the signed-in member.
  */
 
-interface Gate {
+interface AuthenticatedContext {
   teamId: string;
+  /** The signed-in member of the resolved team — no browser-supplied target is involved. */
   actorMemberId: string;
+}
+
+interface Gate extends AuthenticatedContext {
   /** The supplied member id, as resolved from this team's roster (never the raw argument). */
   targetMemberId: string;
 }
@@ -185,7 +189,7 @@ export async function saveAvatar(teamSlug: string, memberId: string, dataUrl: st
  * secret on someone else's behalf has no safe way to hand it over (that's the whole gap this
  * closes); admins keep member-picker issuance for exceptional cases via /admin/keys.
  */
-async function selfGate(teamSlug: string): Promise<Gate | null> {
+async function selfGate(teamSlug: string): Promise<AuthenticatedContext | null> {
   const db = await serverClient();
   const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
