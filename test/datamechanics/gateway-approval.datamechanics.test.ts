@@ -156,6 +156,54 @@ describe("gateway durable approval and resume", () => {
     });
   });
 
+  // AIO-1208 AC-09: browser gateway-admin authority follows deliberate Everyone membership, not
+  // the legacy members.tier column. Only the membership row changes here; tier stays 'team'.
+  it("denies an active legacy tier='team' admin who holds no Everyone membership (AIO-1208)", async () => {
+    const seed = await seedGateway();
+    const authUserId = randomUUID();
+    await getPool().query(`insert into auth_users(id,email) values($1,$2)`, [
+      authUserId,
+      `${randomUUID()}@test.local`,
+    ]);
+    await getPool().query(
+      `update members set auth_user_id=$1,role='admin',tier='team',status='active'
+        where id=$2 and team_id=$3`,
+      [authUserId, seed.memberId, seed.teamId],
+    );
+    // Control: the same row is admitted while it still holds the builtin Everyone membership.
+    await expect(authorizeGatewayAdmin(seed.teamSlug, authUserId)).resolves.toMatchObject({
+      teamId: seed.teamId,
+      memberId: seed.memberId,
+    });
+    const removed = await getPool().query(
+      `delete from group_members gm using groups g
+        where g.team_id=gm.team_id and g.id=gm.group_id
+          and g.slug='everyone' and g.is_builtin
+          and gm.team_id=$1 and gm.member_id=$2`,
+      [seed.teamId, seed.memberId],
+    );
+    expect(removed.rowCount).toBe(1);
+    const stale = await getPool().query(
+      `select m.role::text,m.tier::text,m.status::text,
+         (select count(*)::int from group_members gm
+            join groups g on g.team_id=gm.team_id and g.id=gm.group_id
+           where gm.team_id=m.team_id and gm.member_id=m.id
+             and g.slug='everyone' and g.is_builtin) everyone_rows
+       from members m where m.id=$1 and m.team_id=$2`,
+      [seed.memberId, seed.teamId],
+    );
+    expect(stale.rows[0]).toEqual({
+      role: "admin",
+      tier: "team",
+      status: "active",
+      everyone_rows: 0,
+    });
+    await expect(authorizeGatewayAdmin(seed.teamSlug, authUserId)).rejects.toMatchObject({
+      code: "gateway_scope_not_found",
+      status: 422,
+    });
+  });
+
   it("returns one credential-bearing winner and credential-free identical retries", async () => {
     const { seed, service, executionId } = await approvedExecution();
     const idempotencyKey = randomUUID();
