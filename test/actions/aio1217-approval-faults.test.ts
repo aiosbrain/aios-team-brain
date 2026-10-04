@@ -1156,6 +1156,8 @@ describe("AIO-1217 R · POST /api/v1/actions (exported handler, unchanged): chec
     async ({ effect, sandbox, status, outcome, decision, runs }) => {
       const fake = new FakeSupabase();
       seedPolicy(fake, effect);
+      // The sole seeded rule (priority 1), read off the fixture before the request: a denial names it.
+      const policyId = String(fake.tables.policies[0].id);
       h.sandboxRun.mockImplementation(SANDBOX[sandbox]);
       const client = admit(recordingDb(fake));
 
@@ -1166,13 +1168,14 @@ describe("AIO-1217 R · POST /api/v1/actions (exported handler, unchanged): chec
       premise("exactly one action was recorded", after.actions.length, 1);
       const terminal = outcome === "succeeded" || outcome === "failed";
       expect({ status: seen.status, json: /^application\/json\b/.test(seen.contentType ?? "") }).toEqual({ status, json: true });
-      expect(seen.body).toMatchObject({
-        actionId: after.actions[0].id,
-        status: outcome,
-        decision,
-        ...(outcome === "pending_approval" ? { approvalRequestId: after.approvals[0]?.id } : {}),
-        ...(terminal ? { result: { stdout: SANDBOX_STDOUT } } : {}),
-      });
+      // The whole body, strictly: nothing beyond these fields, and no `error` on a success.
+      const settled = {
+        succeeded: { result: { exitCode: 0, stdout: SANDBOX_STDOUT, stderr: "" } },
+        pending_approval: { approvalRequestId: after.approvals[0]?.id },
+        denied: { error: `matched policy ${policyId} (priority 1, deny)` },
+        failed: { result: { exitCode: 1, stdout: SANDBOX_STDOUT, stderr: SANDBOX_ERROR }, error: "exit 1" },
+      }[outcome];
+      expect(seen.body).toStrictEqual({ actionId: after.actions[0].id, status: outcome, decision, ...settled });
       expect({
         action: after.actions.map((row) => ({ team_id: row.team_id, member_id: row.member_id, actor: row.actor, status: row.status })),
         approvals: after.approvals.map((row) => ({ team_id: row.team_id, status: row.status, linked: row.id === after.actions[0].approval_request_id })),
