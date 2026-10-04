@@ -365,9 +365,51 @@ record as metadata, not an access input; unchanged), `app/t/[team]/layout.tsx` (
 record — display, not access), `lib/admin/access-enforcement.ts` (`BlindPrincipal.tier` — a
 DIAGNOSTIC payload field in the readiness report; the scan's floor derivation moves to
 explicit membership per §1c), and the token/gateway layer (`lib/access/agent-tokens.ts`
-mint/verify, `lib/gateway/persistence.ts:988`, `lib/gateway/admin-persistence.ts`,
-`lib/gateway/policy.ts`, `gateway_executions.tier_snapshot` — delegated-token semantics,
-program §8 out of scope, UNTOUCHED). Everything else is a guard violation (§4 AC4/AC5).
+mint/verify, `lib/gateway/persistence.ts:988`, `lib/gateway/policy.ts`,
+`gateway_executions.tier_snapshot` — delegated-token semantics, program §8 out of scope,
+UNTOUCHED; `lib/gateway/admin-persistence.ts` stood in this list until the AIO-1208 amendment
+below removed it). Everything else is a guard violation (§4 AC4/AC5).
+
+> **Amendment — AIO-1208 (2026-10-04): the gateway exclusion is narrowed; browser gateway
+> administration follows posture.** This is a NEW bounded policy decision, not a description of
+> what the slice above shipped. The original sentence excluded `lib/gateway/admin-persistence.ts`
+> as a whole file under "delegated-token semantics", and that file also held
+> `authorizeGatewayAdmin` — the HUMAN, browser-session gate for the nine managed-gateway admin
+> routes, the managed approval Server Action and the Approvals page's managed queue. It read
+> `members.tier` directly, so it disagreed with §1d in both directions: an active admin with a
+> stale `tier='team'` record and no `everyone` membership was admitted to gateway
+> administration while every other admin gate refused them, and an enrolled admin with a stale
+> `tier='external'` record was refused. Program §8 names delegated-TOKEN semantics; it never
+> named browser gateway administration, so the file-level exclusion did not actually decide this
+> boundary.
+>
+> From AIO-1208, `authorizeGatewayAdmin` is §1d like every other admin gate:
+> `role === 'admin' && posture === 'team'`, posture from `resolveViewerPosture` (the `everyone`
+> builtin row), decided through the shared `canAccessAdmin`. All three reads — team, member,
+> posture — run on the one connection of the supplied/default `db.transaction` factory; a
+> posture read error throws to the caller's fixed 500 and never falls back to the record.
+> Refusal order is unchanged in shape: unknown team/member 404 · inactive 422 (before any
+> posture read) · non-`team` posture 422 · team-posture member/lead 403.
+>
+> What stays excluded and UNCHANGED, exactly as the original sentence intended: the delegated
+> token layer, the gateway lease predicate, policy evaluation, `tier_snapshot`, and the policy
+> SUBJECT-selector tier in this same file (`input.subject.tier` → `policies.subject_tier`). Those
+> are persisted subject semantics, not a `members.tier` record read. The two meanings are
+> deliberately distinct: an enrolled admin with a stale `external` record now administers the
+> gateway while a `tier`-subject policy still evaluates them as `external`.
+>
+> Consequence for the sanctioned-consumer list: `lib/gateway/admin-persistence.ts` no longer
+> reads the record at all and is REMOVED from the AC4 allowlist
+> (`test/guards/tier-no-access-reads.test.ts`). That guard's raw-SQL shape needs a qualified
+> `m.tier`/`members.tier`, so it would not have caught the old unqualified
+> `select …,tier::text` — removing the row is housekeeping, not the regression pin. The pins are
+> the real-Postgres stale-record arms in
+> `test/datamechanics/gateway-approval.datamechanics.test.ts` and the enabled wire carrier
+> (`test/http/gateway-approval-enabled.http.test.ts`). A NEW record consumer in this module goes
+> back through specification; it never re-acquires the file-level exemption silently. Rollout:
+> no schema or data step; an admin lacking `everyone` membership loses gateway administration
+> until deliberately enrolled (never by a raw tier edit). Spec:
+> `docs/design/aio1208-route-auth-inventory.md`.
 
 ## 4. Acceptance criteria (spec-first; exact files and commands)
 

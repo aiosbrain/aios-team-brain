@@ -1,12 +1,18 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { POST as createPolicyRoute } from "@/app/api/internal/executor-gateway/v1/admin/[teamSlug]/policies/route";
+import { getSessionUser } from "@/lib/auth/session";
+import { PgClient, pgClient } from "@/lib/db/pg/client";
 import { getPool } from "@/lib/db/pg/pool";
+import type { SqlExecutor } from "@/lib/db/types";
+import { gatewayAdminContext } from "@/lib/gateway/admin-http";
 import { canonicalize } from "@/lib/gateway/canonical";
 import {
   authorizeGatewayAdmin,
   createGatewayAdminPolicy,
   deleteGatewayAdminPolicy,
   decideGatewayApproval,
+  GatewayAdminError,
   listGatewayCredentials,
   listGatewayApprovals,
   listGatewayAdminPolicies,
@@ -23,8 +29,12 @@ import {
   resumeClaimGatewayExecution,
 } from "@/lib/gateway/persistence";
 import { gatewayScope, seedGateway, type GatewaySeed } from "./gateway-helpers";
-import { db } from "./helpers";
+import { db, placeMemberByTier } from "./helpers";
 import { createPolicy, listAllPolicies, updatePolicy } from "@/lib/policy/manage";
+
+// The request-level arms below need "who is signed in" without a request scope. Only the session
+// identity is stubbed; the authority (team, member, Everyone posture) is real Postgres throughout.
+vi.mock("@/lib/auth/session", () => ({ getSessionUser: vi.fn() }));
 
 const KEY = Buffer.alloc(32, 19);
 const REQUEST_HASH = "4b18a1b9c0f093f7e46b4410e245fd88f011e6d820b34ef9446296ff9386f310";
@@ -113,8 +123,356 @@ const claimInput = (
   },
 });
 
+// ---------------------------------------------------------------------------------------------
+// AIO-1208 — browser gateway-admin authority (docs/design/aio1208-route-auth-inventory.md).
+// Authority is role ∧ POSTURE, where posture is the member's row in the team's builtin `everyone`
+// group. `members.tier` is the invite-default record: every arm below writes it deliberately so a
+// stale record on EITHER side of the membership is observable, and reads the state back.
+// ---------------------------------------------------------------------------------------------
+
+type AuthorityFixture = {
+  role?: "admin" | "lead" | "member";
+  /** The legacy record. Never an authority input. */
+  tier?: "team" | "external";
+  status?: "active" | "disabled" | "invited";
+  /** Whether the member holds the builtin Everyone membership. */
+  everyone?: boolean;
+};
+
+const SCOPE_NOT_FOUND = { code: "gateway_scope_not_found", status: 422 } as const;
+const FORBIDDEN = { code: "gateway_forbidden", status: 403 } as const;
+const NOT_FOUND = { code: "gateway_not_found", status: 404 } as const;
+
+async function removeEveryoneMembership(seed: { teamId: string; memberId: string }) {
+  const removed = await getPool().query(
+    `delete from group_members gm using groups g
+      where g.team_id=gm.team_id and g.id=gm.group_id
+        and g.slug='everyone' and g.is_builtin
+        and gm.team_id=$1 and gm.member_id=$2`,
+    [seed.teamId, seed.memberId],
+  );
+  expect(removed.rowCount).toBe(1);
+}
+
+/** Bind the seeded member to a fresh auth user and put it in exactly the requested authority state. */
+async function authorityFixture(seed: GatewaySeed, fixture: AuthorityFixture = {}) {
+  const authUserId = randomUUID();
+  await getPool().query(`insert into auth_users(id,email) values($1,$2)`, [
+    authUserId,
+    `${randomUUID()}@test.local`,
+  ]);
+  await getPool().query(
+    `update members set auth_user_id=$1,role=$2,tier=$3,status=$4 where id=$5 and team_id=$6`,
+    [
+      authUserId,
+      fixture.role ?? "admin",
+      fixture.tier ?? "team",
+      fixture.status ?? "active",
+      seed.memberId,
+      seed.teamId,
+    ],
+  );
+  if (fixture.everyone === false) await removeEveryoneMembership(seed);
+  return authUserId;
+}
+
+async function authorityState(seed: { teamId: string; memberId: string }) {
+  const state = await getPool().query(
+    `select m.role::text,m.tier::text,m.status::text,
+       (select count(*)::int from group_members gm
+          join groups g on g.team_id=gm.team_id and g.id=gm.group_id
+         where gm.team_id=m.team_id and gm.member_id=m.id
+           and g.slug='everyone' and g.is_builtin) everyone_rows
+     from members m where m.id=$1 and m.team_id=$2`,
+    [seed.memberId, seed.teamId],
+  );
+  return state.rows[0] as { role: string; tier: string; status: string; everyone_rows: number };
+}
+
+const boundTable = (sql: string) =>
+  /\bfrom\s+group_members\b/i.test(sql)
+    ? "group_members"
+    : /\bfrom\s+members\b/i.test(sql)
+      ? "members"
+      : /\bfrom\s+teams\b/i.test(sql)
+        ? "teams"
+        : "other";
+
+const INJECTED_POSTURE_FAULT = "injected bound posture failure";
+
+/**
+ * A real PgClient whose transaction-session executor is instrumented: every bound statement is
+ * recorded with the backend pid and transaction timestamp it ran under, and — when asked — ONLY
+ * the bound `group_members` read is failed. A read that bypasses the session never reaches this
+ * decorator, so it would neither be recorded nor fault.
+ */
+function observedClient(options: { failPosture?: boolean } = {}) {
+  const statements: Array<{ table: string; pid: number; tx: string }> = [];
+  const decorate = (executor: SqlExecutor): SqlExecutor =>
+    async <T>(text: string, params?: unknown[]) => {
+      const where = await executor<{ pid: number; tx: string }>(
+        `select pg_backend_pid() pid, transaction_timestamp()::text tx`,
+      );
+      const table = boundTable(text);
+      statements.push({ table, ...where.rows[0] });
+      if (options.failPosture && table === "group_members") throw new Error(INJECTED_POSTURE_FAULT);
+      return executor<T>(text, params);
+    };
+  return { client: new PgClient({ decorateSessionExecutor: decorate }), statements };
+}
+
+/** The authority reads (if any) that went through the process pool instead of a bound session. */
+async function unboundAuthorityReads(run: () => Promise<unknown>): Promise<string[]> {
+  const poolQuery = vi.spyOn(getPool(), "query");
+  try {
+    await run();
+    return poolQuery.mock.calls
+      .map(([first]) => (typeof first === "string" ? first : String((first as { text?: unknown })?.text ?? "")))
+      .map(boundTable)
+      .filter((table) => table !== "other");
+  } finally {
+    poolQuery.mockRestore();
+  }
+}
+
+const policyRequest = (teamSlug: string) =>
+  new Request(`http://local/api/internal/executor-gateway/v1/admin/${teamSlug}/policies`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      subject: { type: "team" },
+      tool: "github.repository.get",
+      resource: "github.repository:octo/project",
+      effect: "require_approval",
+      priority: 5,
+      enabled: true,
+      correlationId: randomUUID(),
+    }),
+  });
+
+const gatewayPolicyRows = async (teamId: string) =>
+  (
+    await getPool().query<{ policies: number; audits: number }>(
+      `select
+         (select count(*)::int from policies where team_id=$1
+            and action like 'gateway.aios-github-readonly.%') policies,
+         (select count(*)::int from gateway_audit_log where team_id=$1
+            and event='policy_created') audits`,
+      [teamId],
+    )
+  ).rows[0];
+
+describe("gateway admin authority follows Everyone membership (AIO-1208)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    vi.mocked(getSessionUser).mockReset();
+  });
+
+  const ARMS: Array<{
+    name: string;
+    fixture: AuthorityFixture;
+    outcome: "admitted" | typeof SCOPE_NOT_FOUND | typeof FORBIDDEN;
+  }> = [
+    { name: "active admin · Everyone · legacy tier team", fixture: {}, outcome: "admitted" },
+    { name: "active admin · Everyone · STALE legacy tier external", fixture: { tier: "external" }, outcome: "admitted" },
+    { name: "active admin · no Everyone · STALE legacy tier team", fixture: { everyone: false }, outcome: SCOPE_NOT_FOUND },
+    { name: "active admin · no Everyone · legacy tier external", fixture: { tier: "external", everyone: false }, outcome: SCOPE_NOT_FOUND },
+    { name: "active member · Everyone", fixture: { role: "member" }, outcome: FORBIDDEN },
+    { name: "active lead · Everyone", fixture: { role: "lead" }, outcome: FORBIDDEN },
+    { name: "active member · no Everyone (422 precedes 403)", fixture: { role: "member", everyone: false }, outcome: SCOPE_NOT_FOUND },
+    { name: "active lead · no Everyone (422 precedes 403)", fixture: { role: "lead", everyone: false }, outcome: SCOPE_NOT_FOUND },
+    { name: "disabled admin · Everyone", fixture: { status: "disabled" }, outcome: SCOPE_NOT_FOUND },
+    { name: "invited admin · Everyone", fixture: { status: "invited" }, outcome: SCOPE_NOT_FOUND },
+    { name: "disabled member · Everyone (inactive precedes role)", fixture: { role: "member", status: "disabled" }, outcome: SCOPE_NOT_FOUND },
+  ];
+
+  it.each(ARMS)("$name → $outcome", async ({ fixture, outcome }) => {
+    const seed = await seedGateway();
+    const authUserId = await authorityFixture(seed, fixture);
+    // The arm's premise, read back: the record and the membership really are in this state.
+    expect(await authorityState(seed)).toEqual({
+      role: fixture.role ?? "admin",
+      tier: fixture.tier ?? "team",
+      status: fixture.status ?? "active",
+      everyone_rows: fixture.everyone === false ? 0 : 1,
+    });
+    const verdict = authorizeGatewayAdmin(seed.teamSlug, authUserId);
+    if (outcome === "admitted")
+      await expect(verdict).resolves.toEqual({
+        teamId: seed.teamId,
+        teamSlug: seed.teamSlug,
+        memberId: seed.memberId,
+      });
+    else await expect(verdict).rejects.toMatchObject(outcome);
+  });
+
+  it("keeps unknown teams, foreign teams and unknown users at 404", async () => {
+    const seed = await seedGateway();
+    const authUserId = await authorityFixture(seed);
+    await expect(authorizeGatewayAdmin(seed.teamSlug, authUserId)).resolves.toMatchObject({ memberId: seed.memberId });
+    await expect(authorizeGatewayAdmin("unknown-team", authUserId)).rejects.toMatchObject(NOT_FOUND);
+    const foreign = await seedGateway();
+    await expect(authorizeGatewayAdmin(foreign.teamSlug, authUserId)).rejects.toMatchObject(NOT_FOUND);
+    await expect(authorizeGatewayAdmin(seed.teamSlug, randomUUID())).rejects.toMatchObject(NOT_FOUND);
+  });
+
+  it("never lets Everyone membership in ANOTHER team grant posture here", async () => {
+    const seed = await seedGateway();
+    const authUserId = await authorityFixture(seed, { everyone: false });
+    // The same person is an enrolled, active admin of a second team.
+    const foreign = await seedGateway();
+    const other = await getPool().query<{ id: string }>(
+      `insert into members(team_id,email,display_name,actor_handle,role,tier,status,auth_user_id)
+       values($1,$2,'Elsewhere',$3,'admin','team','active',$4) returning id`,
+      [foreign.teamId, `${randomUUID()}@test.local`, `elsewhere-${randomUUID().slice(0, 8)}`, authUserId],
+    );
+    await placeMemberByTier(foreign.teamId, other.rows[0].id, "team");
+    expect(await authorityState({ teamId: foreign.teamId, memberId: other.rows[0].id })).toMatchObject({
+      role: "admin",
+      status: "active",
+      everyone_rows: 1,
+    });
+
+    await expect(authorizeGatewayAdmin(seed.teamSlug, authUserId)).rejects.toMatchObject(SCOPE_NOT_FOUND);
+    // Control: that membership does authorize the team it belongs to — and only as its own member.
+    await expect(authorizeGatewayAdmin(foreign.teamSlug, authUserId)).resolves.toEqual({
+      teamId: foreign.teamId,
+      teamSlug: foreign.teamSlug,
+      memberId: other.rows[0].id,
+    });
+  });
+
+  it("restores authority on deliberate re-enrollment, never on a raw tier edit", async () => {
+    const seed = await seedGateway();
+    const authUserId = await authorityFixture(seed, { everyone: false, tier: "external" });
+    await expect(authorizeGatewayAdmin(seed.teamSlug, authUserId)).rejects.toMatchObject(SCOPE_NOT_FOUND);
+    await getPool().query(`update members set tier='team' where id=$1 and team_id=$2`, [seed.memberId, seed.teamId]);
+    await expect(authorizeGatewayAdmin(seed.teamSlug, authUserId)).rejects.toMatchObject(SCOPE_NOT_FOUND);
+    await placeMemberByTier(seed.teamId, seed.memberId, "team");
+    await expect(authorizeGatewayAdmin(seed.teamSlug, authUserId)).resolves.toMatchObject({ memberId: seed.memberId });
+  });
+
+  it("the next REQUEST after a committed Everyone removal is refused (AC-10)", async () => {
+    const seed = await seedGateway();
+    const authUserId = await authorityFixture(seed);
+    vi.mocked(getSessionUser).mockResolvedValue({ id: authUserId, email: "admin@test.local" });
+    await expect(gatewayAdminContext(seed.teamSlug)).resolves.toEqual({
+      teamId: seed.teamId,
+      teamSlug: seed.teamSlug,
+      memberId: seed.memberId,
+    });
+    await removeEveryoneMembership(seed);
+    const refused = await gatewayAdminContext(seed.teamSlug);
+    expect(refused).toBeInstanceOf(Response);
+    expect((refused as Response).status).toBe(422);
+    expect((await (refused as Response).json()).error.code).toBe("gateway_scope_not_found");
+    // No session at all is still the 401 it always was.
+    vi.mocked(getSessionUser).mockResolvedValue(null);
+    expect(((await gatewayAdminContext(seed.teamSlug)) as Response).status).toBe(401);
+  });
+
+  it("reads teams → members → group_members on ONE bound connection in one transaction (AC-10)", async () => {
+    const seed = await seedGateway();
+    const authUserId = await authorityFixture(seed);
+    const observed = observedClient();
+    const unbound = await unboundAuthorityReads(async () => {
+      await expect(authorizeGatewayAdmin(seed.teamSlug, authUserId, observed.client)).resolves.toEqual({
+        teamId: seed.teamId,
+        teamSlug: seed.teamSlug,
+        memberId: seed.memberId,
+      });
+    });
+    expect(observed.statements.map((statement) => statement.table)).toEqual(["teams", "members", "group_members"]);
+    expect(new Set(observed.statements.map((statement) => statement.pid)).size).toBe(1);
+    expect(new Set(observed.statements.map((statement) => statement.tx)).size).toBe(1);
+    expect(unbound).toEqual([]);
+  });
+
+  it.each(["disabled", "invited"] as const)("performs NO posture read for a %s member (AC-10)", async (status) => {
+    const seed = await seedGateway();
+    const authUserId = await authorityFixture(seed, { status });
+    const observed = observedClient({ failPosture: true });
+    const unbound = await unboundAuthorityReads(async () => {
+      await expect(authorizeGatewayAdmin(seed.teamSlug, authUserId, observed.client)).rejects.toMatchObject(
+        SCOPE_NOT_FOUND,
+      );
+    });
+    expect(observed.statements.map((statement) => statement.table)).toEqual(["teams", "members"]);
+    expect(unbound).toEqual([]);
+  });
+
+  it("a bound posture failure throws — no legacy-tier fallback, no unbound re-read (AC-10)", async () => {
+    // Every fallback would ADMIT this caller: active admin, Everyone member, legacy tier 'team'.
+    const seed = await seedGateway();
+    const authUserId = await authorityFixture(seed);
+    expect(await authorityState(seed)).toEqual({ role: "admin", tier: "team", status: "active", everyone_rows: 1 });
+    const failing = observedClient({ failPosture: true });
+    let thrown: unknown;
+    const unbound = await unboundAuthorityReads(async () => {
+      thrown = await authorizeGatewayAdmin(seed.teamSlug, authUserId, failing.client).then(
+        () => null,
+        (error: unknown) => error,
+      );
+    });
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown).not.toBeInstanceOf(GatewayAdminError);
+    expect((thrown as Error).message).toContain(INJECTED_POSTURE_FAULT);
+    // The fault was exercised on the bound session, as the third read.
+    expect(failing.statements.map((statement) => statement.table)).toEqual(["teams", "members", "group_members"]);
+    expect(new Set(failing.statements.map((statement) => statement.pid)).size).toBe(1);
+    expect(unbound).toEqual([]);
+    // Control: the same caller on an unfaulted bound client is admitted.
+    await expect(authorizeGatewayAdmin(seed.teamSlug, authUserId, observedClient().client)).resolves.toMatchObject({
+      memberId: seed.memberId,
+    });
+  });
+
+  it("a bound posture failure is a generic 500 with no privileged dispatch (AC-10)", async () => {
+    const seed = await seedGateway();
+    const authUserId = await authorityFixture(seed);
+    vi.mocked(getSessionUser).mockResolvedValue({ id: authUserId, email: "admin@test.local" });
+    vi.stubEnv("AIOS_GATEWAY_INTERNAL_ENABLED", "true");
+    const context = { params: Promise.resolve({ teamSlug: seed.teamSlug }) };
+    const baseline = await gatewayPolicyRows(seed.teamId);
+
+    // Route the helper's DEFAULT factory through the faulted bound client.
+    const failing = observedClient({ failPosture: true });
+    const factory = vi
+      .spyOn(pgClient(), "transaction")
+      .mockImplementation(((fn: never) => failing.client.transaction(fn)) as never);
+    try {
+      const wrapped = await gatewayAdminContext(seed.teamSlug);
+      expect(wrapped).toBeInstanceOf(Response);
+      expect((wrapped as Response).status).toBe(500);
+      const wrappedBody = await (wrapped as Response).text();
+      expect(JSON.parse(wrappedBody).error.code).toBe("gateway_internal");
+      expect(wrappedBody).not.toContain(INJECTED_POSTURE_FAULT);
+
+      const response = await createPolicyRoute(policyRequest(seed.teamSlug), context);
+      expect(response.status).toBe(500);
+      expect((await response.json()).error.code).toBe("gateway_internal");
+      expect(factory).toHaveBeenCalledTimes(2);
+      expect(failing.statements.filter((statement) => statement.table === "group_members")).toHaveLength(2);
+      expect(await gatewayPolicyRows(seed.teamId)).toEqual(baseline);
+    } finally {
+      factory.mockRestore();
+    }
+
+    // Control: the identical request is otherwise valid — unfaulted, it creates and audits the policy.
+    const created = await createPolicyRoute(policyRequest(seed.teamSlug), context);
+    expect(created.status).toBe(201);
+    expect(await gatewayPolicyRows(seed.teamId)).toEqual({
+      policies: baseline.policies + 1,
+      audits: baseline.audits + 1,
+    });
+  });
+});
+
 describe("gateway durable approval and resume", () => {
-  it("enforces the admin/member/lead/external authorization matrix", async () => {
+  // AIO-1208 AC-09: browser gateway-admin authority follows deliberate Everyone membership, not
+  // the legacy members.tier column. Only the membership row changes here; tier stays 'team'.
+  it("denies an active legacy tier='team' admin who holds no Everyone membership (AIO-1208)", async () => {
     const seed = await seedGateway();
     const authUserId = randomUUID();
     await getPool().query(`insert into auth_users(id,email) values($1,$2)`, [
@@ -126,33 +484,37 @@ describe("gateway durable approval and resume", () => {
         where id=$2 and team_id=$3`,
       [authUserId, seed.memberId, seed.teamId],
     );
+    // Control: the same row is admitted while it still holds the builtin Everyone membership.
     await expect(authorizeGatewayAdmin(seed.teamSlug, authUserId)).resolves.toMatchObject({
       teamId: seed.teamId,
       memberId: seed.memberId,
     });
-    for (const role of ["member", "lead"] as const) {
-      await getPool().query(`update members set role=$1 where id=$2`, [role, seed.memberId]);
-      await expect(authorizeGatewayAdmin(seed.teamSlug, authUserId)).rejects.toMatchObject({
-        code: "gateway_forbidden",
-        status: 403,
-      });
-    }
-    await getPool().query(
-      `update members set role='admin',tier='external' where id=$1`,
-      [seed.memberId],
+    const removed = await getPool().query(
+      `delete from group_members gm using groups g
+        where g.team_id=gm.team_id and g.id=gm.group_id
+          and g.slug='everyone' and g.is_builtin
+          and gm.team_id=$1 and gm.member_id=$2`,
+      [seed.teamId, seed.memberId],
     );
+    expect(removed.rowCount).toBe(1);
+    const stale = await getPool().query(
+      `select m.role::text,m.tier::text,m.status::text,
+         (select count(*)::int from group_members gm
+            join groups g on g.team_id=gm.team_id and g.id=gm.group_id
+           where gm.team_id=m.team_id and gm.member_id=m.id
+             and g.slug='everyone' and g.is_builtin) everyone_rows
+       from members m where m.id=$1 and m.team_id=$2`,
+      [seed.memberId, seed.teamId],
+    );
+    expect(stale.rows[0]).toEqual({
+      role: "admin",
+      tier: "team",
+      status: "active",
+      everyone_rows: 0,
+    });
     await expect(authorizeGatewayAdmin(seed.teamSlug, authUserId)).rejects.toMatchObject({
       code: "gateway_scope_not_found",
       status: 422,
-    });
-    await expect(authorizeGatewayAdmin("unknown-team", authUserId)).rejects.toMatchObject({
-      code: "gateway_not_found",
-      status: 404,
-    });
-    const foreign = await seedGateway();
-    await expect(authorizeGatewayAdmin(foreign.teamSlug, authUserId)).rejects.toMatchObject({
-      code: "gateway_not_found",
-      status: 404,
     });
   });
 
