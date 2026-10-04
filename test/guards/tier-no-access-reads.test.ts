@@ -34,7 +34,6 @@ const ALLOWLIST: Record<string, string> = {
   "lib/provisioning/linear.ts": "external-system seat mapping (Linear guest/user) — non-access",
   "lib/access/agent-tokens.ts": "token mint/verify semantics — program §8, untouched",
   "lib/gateway/persistence.ts": "gateway lease predicate — delegated-token semantics, program §8",
-  "lib/gateway/admin-persistence.ts": "gateway policy persistence — program §8",
   "lib/gateway/policy.ts": "gateway policy evaluation — program §8",
   "lib/graph/company-actors.ts": "actor attrs mirror the roster record — metadata, not an access input",
   "lib/metrics/codebases.ts": "roster-metadata read (display fields incl. the record)",

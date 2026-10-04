@@ -1,7 +1,11 @@
 import "server-only";
 import { createHash, randomUUID } from "node:crypto";
+import { resolveViewerPosture } from "@/lib/access/posture";
+import { canAccessAdmin } from "@/lib/auth/admin-access";
+import { pgClient } from "@/lib/db/pg/client";
 import { getPool } from "@/lib/db/pg/pool";
 import { withTransaction } from "@/lib/db/pg/tx";
+import type { TransactionCapableDbClient } from "@/lib/db/types";
 import { GATEWAY_TOOLS, normalizeGatewayArgs } from "./normalize";
 
 const sha256 = (value: Buffer) => createHash("sha256").update(value).digest("hex");
@@ -28,31 +32,43 @@ export type GatewayAdminContext = {
   memberId: string;
 };
 
+/**
+ * Browser/admin-session authority for managed gateway administration (AIO-1208; PRET-4 §3.3
+ * amendment): shared role ∧ POSTURE, where posture is deliberate membership in the team's
+ * `everyone` builtin — never the `members.tier` record. `db` is a server-only composition/test
+ * capability (never a route or action input); its transaction factory owns all three reads, so
+ * team, member and posture resolve on one managed connection. A posture read error throws — the
+ * caller's fixed 500 — and never falls back to the legacy record or to success.
+ */
 export async function authorizeGatewayAdmin(
   teamSlug: string,
   authUserId: string,
+  db: TransactionCapableDbClient = pgClient(),
 ): Promise<GatewayAdminContext> {
-  return withTransaction(async (client) => {
-    const team = await client.query<{ id: string }>(
+  return db.transaction(async (session) => {
+    const team = await session.executeSql<{ id: string }>(
       `select id from teams where slug=$1`,
       [teamSlug],
     );
     if (!team.rows[0]) throw new GatewayAdminError("gateway_not_found", 404);
-    const member = await client.query<{
+    const member = await session.executeSql<{
       id: string;
       role: string;
-      tier: string;
       status: string;
     }>(
-      `select id,role::text,tier::text,status::text
+      `select id,role::text,status::text
          from members where team_id=$1 and auth_user_id=$2`,
       [team.rows[0].id, authUserId],
     );
     const row = member.rows[0];
     if (!row) throw new GatewayAdminError("gateway_not_found", 404);
-    if (row.status !== "active" || row.tier !== "team")
+    // Inactive refuses BEFORE any posture read.
+    if (row.status !== "active")
       throw new GatewayAdminError("gateway_scope_not_found", 422);
-    if (row.role !== "admin")
+    const posture = await resolveViewerPosture(session.db, team.rows[0].id, row.id);
+    if (posture !== "team")
+      throw new GatewayAdminError("gateway_scope_not_found", 422);
+    if (!canAccessAdmin({ role: row.role, tier: posture }))
       throw new GatewayAdminError("gateway_forbidden", 403);
     return { teamId: team.rows[0].id, teamSlug, memberId: row.id };
   });
