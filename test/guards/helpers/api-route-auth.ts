@@ -19,6 +19,17 @@ import ts from "typescript";
  * same-spelled local, a shadowing parameter, an import that is never called, a comment, a string,
  * a type reference, and a nested function that is merely defined all count for nothing.
  *
+ * The owner MODULE is identified by its canonical specifier, by syntax — no import is resolved or
+ * followed. Two spellings name a registered `<module>` (the repo-relative path of `<module>.ts`,
+ * extensionless): the root alias `@/<module>`, and an extensionless relative path that normalises
+ * to `<module>` from the importing route. `@/` is trusted as tsconfig's `paths` alias for the
+ * repository root; tsconfig is not read. Every other spelling is a different identity and counts
+ * for nothing: an explicit extension (`@/lib/api/auth.tsx`), an `/index` or directory reference
+ * (`@/lib/api/auth/index`), and a bare specifier (`lib/api/auth` is a package, kept apart as
+ * `external:lib/api/auth`) — refused even where the toolchain would resolve it to the same file.
+ * That the canonical spelling resolves to `<module>.ts`, and not to a same-named sibling file or
+ * directory the toolchain prefers, is trusted by review, not proven.
+ *
  * ## The bound (do not read more into a green run than this)
  *
  * This pins WHICH registered entry points a handler calls. It does not prove that every branch is
@@ -57,7 +68,10 @@ const TREE_ROOTS = ["app", "pages", "src"];
 // ---------------------------------------------------------------------------------------------
 
 export interface GuardRegistration {
-  /** Owner module, repo-relative without extension — the identity half a spelling cannot fake. */
+  /**
+   * Owner module: the repo-relative path of `<module>.ts`, without the extension — the identity half
+   * a spelling cannot fake. Matched only by `@/<module>` or an extensionless relative path to it.
+   */
   module: string;
   exportName: string;
   /** For `owner.member(...)` entries such as `governedActionHttp.status`. */
@@ -115,10 +129,11 @@ export interface RoutingTree {
 
 /**
  * Walk the real filesystem (so untracked source is included) — reads only. No directory name is
- * skipped: Next's own app walk (installed `next/dist/build/route-discovery.js:collectAppFiles`)
- * ignores only `_`-prefixed parts, so `app/api/node_modules/route.ts` and `app/api/.next/route.ts`
- * are served handlers. The repository-root `node_modules/` and `.next/` sit outside TREE_ROOTS and
- * are never entered.
+ * skipped: the installed Next's app file collection (`next/dist/build/route-discovery.js:
+ * collectAppFiles`) lists `app/api/node_modules/route.ts` and `app/api/.next/route.ts`. Whether Next
+ * then bundles such a file and answers a request for it was NOT tested — no synthetic build or wire
+ * request was run — so the inventory conservatively includes them as potential handlers. The
+ * repository-root `node_modules/` and `.next/` sit outside TREE_ROOTS and are never entered.
  */
 export function readRoutingTree(root: string = REPO_ROOT): RoutingTree {
   const files: string[] = [];
@@ -581,12 +596,24 @@ export interface RouteAnalysis {
   problems: string[];
 }
 
+/**
+ * The identity of the module an import specifier names — by SYNTAX; nothing is resolved or opened.
+ *
+ *   - `@/x/y` is `x/y`: `@/` is trusted as tsconfig's `paths` alias for the repository root.
+ *   - `./x` and `../x` are the path from the importing file, normalised. A directory reference (a
+ *     trailing `/`, `.` or `..`) keeps its trailing `/`: it names that directory's index, not `x.ts`.
+ *   - anything else is a package or builtin, kept apart as `external:<specifier>` so that a bare
+ *     `lib/api/auth` can never equal the repo-relative owner `lib/api/auth`.
+ *
+ * Nothing is stripped: `x/index`, `x.ts` and `x.tsx` are identities distinct from `x`, so only the
+ * extensionless spelling matches a registration. A spelling the toolchain would resolve to the same
+ * file is refused here rather than resolved.
+ */
 export function normalizeModuleSpecifier(specifier: string, fromPath: string): string {
-  let resolved: string;
-  if (specifier.startsWith("@/")) resolved = specifier.slice(2);
-  else if (specifier.startsWith(".")) resolved = posix.normalize(posix.join(posix.dirname(fromPath), specifier));
-  else return specifier;
-  return resolved.replace(/\.(ts|tsx|js|jsx|mjs|cjs)$/, "").replace(/\/index$/, "");
+  if (specifier.startsWith("@/")) return specifier.slice(2);
+  if (!/^\.\.?(\/|$)/.test(specifier)) return `external:${specifier}`;
+  const resolved = posix.normalize(posix.join(posix.dirname(fromPath), specifier));
+  return /(^|\/)\.\.?$/.test(specifier) && !resolved.endsWith("/") ? `${resolved}/` : resolved;
 }
 
 const identityOf = (module: string, exportName: string, member?: string) =>

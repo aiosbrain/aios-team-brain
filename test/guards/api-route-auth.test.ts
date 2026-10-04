@@ -153,7 +153,9 @@ describe("route-auth inventory: filesystem discovery (AC-01)", () => {
     ]);
   });
 
-  // Next's app walk ignores only `_`-prefixed parts, so these segments are served like any other.
+  // The installed Next's app file collection lists these paths. Whether Next then bundles such a file
+  // and answers a request for it was NOT tested (no synthetic build or wire request), so the
+  // inventory conservatively includes them as potential handlers.
   it.each(["node_modules", ".next"])("discovers a route file under an app/ segment named %s", (segment) => {
     const path = `app/api/${segment}/route.ts`;
     const control = "app/api/control/route.ts";
@@ -722,6 +724,42 @@ export async function GET(req: Request) {
     expect(check({ [P]: source }, rows)).toEqual([]);
   });
 
+  // A same-spelled export that admits everyone, at each file a non-canonical spelling could name.
+  // In memory only; the registered owner stays the real lib/api/auth.ts.
+  const ADMIT_ALL = `export async function authenticateApiKey() {\n  return { teamId: "t", memberId: "m" };\n}\n`;
+  const fakeOwners = {
+    "lib/api/auth/index.ts": ADMIT_ALL,
+    "lib/api/auth.tsx": ADMIT_ALL,
+    "app/lib/api/auth.ts": ADMIT_ALL,
+    "node_modules/lib/api/auth.js": ADMIT_ALL,
+  };
+  const calledFrom = (specifier: string) =>
+    handler(
+      `  const auth = await authenticateApiKey(req);\n  if (!auth) return new Response(null, { status: 401 });`,
+      `import { authenticateApiKey } from "${specifier}";\n`,
+    );
+
+  it.each([
+    ["the root alias with /index", "@/lib/api/auth/index"],
+    ["a relative path with /index", "../../../lib/api/auth/index"],
+    ["a relative directory reference", "../../../lib/api/auth/"],
+    ["a relative directory reference ending in a dot segment", "../../../lib/api/auth/."],
+    ["the .tsx sibling through the root alias", "@/lib/api/auth.tsx"],
+    ["the .tsx sibling through a relative path", "../../../lib/api/auth.tsx"],
+    ["a relative path one level short of the repository root", "../../lib/api/auth"],
+    ["a bare package spelled like the owner's repo path", "lib/api/auth"],
+  ])("does not count the guard's export imported from %s", (_name, specifier) => {
+    expect(check({ [P]: calledFrom(specifier) }, rows, { files: fakeOwners })).toEqual(refused);
+  });
+
+  it.each([
+    ["the root alias", "@/lib/api/auth"],
+    ["an extensionless relative path", "../../../lib/api/auth"],
+    ["an extensionless relative path with a leading ./", "./../../../lib/api/auth"],
+  ])("admitted control: counts the guard imported from the canonical owner by %s", (_name, specifier) => {
+    expect(check({ [P]: calledFrom(specifier) }, rows)).toEqual([]);
+  });
+
   it("counts a guard called inside try, a live branch and a ternary", () => {
     const source = `import { authenticateApiKey, authenticateAgentToken, isAgentBearer } from "@/lib/api/auth";
 export async function POST(req: Request) {
@@ -809,6 +847,40 @@ export async function GET() {
     expect(check({ [P]: media(`const { canAccessAdmin } = { canAccessAdmin: () => true };`) }, rowsFor)).toEqual([
       `${P} GET: missing expected guard invocation: canAccessAdmin`,
     ]);
+  });
+
+  describe("the destructured dynamic import is held to the same canonical owner", () => {
+    const media = (specifier: string) => `import { currentMember } from "@/lib/auth/guard";
+export async function GET() {
+  const member = await currentMember("team");
+  const { canAccessAdmin } = await import("${specifier}");
+  if (!member || !canAccessAdmin(member)) return new Response("not found", { status: 404 });
+  return new Response("ok");
+}
+`;
+    const rowsFor = [protect(P, "GET", "currentMember", "canAccessAdmin")];
+    // Same-spelled predicates that allow everyone, in memory only; the owner stays lib/auth/admin-access.ts.
+    const ALLOW_ALL = `export const canAccessAdmin = () => true;\n`;
+    const fakeAdminOwners = {
+      "lib/auth/admin-access/index.ts": ALLOW_ALL,
+      "lib/auth/admin-access.tsx": ALLOW_ALL,
+      "node_modules/lib/auth/admin-access.js": ALLOW_ALL,
+    };
+
+    it.each([
+      ["the root alias with /index", "@/lib/auth/admin-access/index"],
+      ["a relative path with /index", "../../../lib/auth/admin-access/index"],
+      ["the .tsx sibling", "@/lib/auth/admin-access.tsx"],
+      ["a bare package spelled like the owner's repo path", "lib/auth/admin-access"],
+    ])("does not count canAccessAdmin destructured from %s", (_name, specifier) => {
+      expect(check({ [P]: media(specifier) }, rowsFor, { files: fakeAdminOwners })).toEqual([
+        `${P} GET: missing expected guard invocation: canAccessAdmin`,
+      ]);
+    });
+
+    it("admitted control: counts it from an extensionless relative path to the owner", () => {
+      expect(check({ [P]: media("../../../lib/auth/admin-access") }, rowsFor)).toEqual([]);
+    });
   });
 });
 
