@@ -4,6 +4,7 @@ import type { Metadata } from "next";
 import { Rocket, ChevronRight, Loader2 } from "lucide-react";
 import { serverClient } from "@/lib/db/server";
 import { resolveTeamContext } from "@/lib/auth/team-context";
+import { canAccessAdmin } from "@/lib/auth/admin-access";
 import { getPipelineHealth } from "@/lib/ingest/pipeline-health";
 import { getLlmHealth } from "@/lib/query/llm-health";
 import { PipelineHealthBanner } from "@/components/admin/pipeline-health-banner";
@@ -131,6 +132,12 @@ export default async function TeamHome({
   if (!ctx) return null; // layout already rendered the no-team screen
   const { team, me } = ctx;
   const isAdmin = me.role === "admin";
+  // AUDITFIX-25: pipeline health ALONE needs the full admin gate (role AND unrestricted posture —
+  // `me.tier` is the membership-derived posture, PRET-4). Its leg errors now name a team's forbidden
+  // project→group edges and reach the browser whole as client-banner props; the banner's 160-char
+  // clip and dismissal happen after serialization. Deliberately NOT folded into `isAdmin`, which
+  // keeps driving onboarding, usage/spend scope, metrics and LLM health by role alone.
+  const canReadPipelineHealth = canAccessAdmin({ role: me.role, tier: me.tier });
   const tier = me.tier;
   const memberId = me.id;
   const firstName = me.displayName.trim().split(/\s+/)[0] || "there";
@@ -201,8 +208,9 @@ export default async function TeamHome({
     getPulseMetrics(db, team.id, range, { isAdmin, memberId, tier, provCtx }),
     decisionsCardP,
     // Admins see a loud banner here (the landing page) if any ingestion leg is broken — so a wedged
-    // pipeline surfaces without digging into Admin. Non-admins don't fetch it.
-    isAdmin ? getPipelineHealth(team.id) : Promise.resolve(null),
+    // pipeline surfaces without digging into Admin. Everyone else — including a restricted-posture
+    // admin (see `canReadPipelineHealth`) — doesn't fetch it.
+    canReadPipelineHealth ? getPipelineHealth(team.id) : Promise.resolve(null),
     // GENERATION health, separately (LLMOBS-1). `llm` used to be a leg on the pipeline banner above,
     // which says "the brain isn't getting fresh data" — false for a model failure, and it
     // double-counted every arcs failure. It now gets its own banner that can name the failing feature,
