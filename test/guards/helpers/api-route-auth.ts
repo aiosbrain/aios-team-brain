@@ -19,6 +19,10 @@ import ts from "typescript";
  * same-spelled local, a shadowing parameter, an import that is never called, a comment, a string,
  * a type reference, and a nested function that is merely defined all count for nothing.
  *
+ * A generator (`function*`, sync or async) is never credited, called or not: the call only creates
+ * an iterator, and nothing here models what later drives it. An exported generator handler is
+ * refused as an unsupported export shape, on a protected row and on a public exception row alike.
+ *
  * The owner MODULE is identified by its canonical specifier, by syntax — no import is resolved or
  * followed. Two spellings name a registered `<module>` (the repo-relative path of `<module>.ts`,
  * extensionless): the root alias `@/<module>`, and an extensionless relative path that normalises
@@ -808,6 +812,8 @@ export function analyzeRouteSource(path: string, source: string): RouteAnalysis 
   // ---- executed-body traversal --------------------------------------------------------------
 
   const collect = (fn: ts.FunctionLikeDeclaration, invoked: Set<string>, followed: Set<ts.Node>) => {
+    // Calling a generator runs none of its body — it only creates an iterator — so nothing in it is credited.
+    if (fn.asteriskToken) return;
     if (followed.has(fn)) return; // cycle protection
     followed.add(fn);
 
@@ -905,7 +911,9 @@ export function analyzeRouteSource(path: string, source: string): RouteAnalysis 
     if (ts.isFunctionDeclaration(statement)) {
       const name = statement.name?.text;
       if (!name || !isHttpMethod(name)) continue;
-      if (statement.body) declare(name, statement);
+      // Calling a generator handler yields an iterator: none of its body, guard included, has run.
+      if (statement.asteriskToken) unsupported(name, "generator handler");
+      else if (statement.body) declare(name, statement);
       else unsupported(name, "overload signature");
     } else if (ts.isVariableStatement(statement)) {
       const isConst = (statement.declarationList.flags & ts.NodeFlags.BlockScoped) === ts.NodeFlags.Const;
@@ -920,6 +928,8 @@ export function analyzeRouteSource(path: string, source: string): RouteAnalysis 
         const initializer = declaration.initializer;
         // A `let`/`var` export can be reassigned after the body inspected here was written.
         if (!isConst) unsupported(name, "exported binding is not const");
+        else if (initializer && ts.isFunctionExpression(initializer) && initializer.asteriskToken)
+          unsupported(name, "generator handler");
         else if (initializer && (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer)))
           declare(name, initializer);
         else unsupported(name, "exported binding is not a function literal");

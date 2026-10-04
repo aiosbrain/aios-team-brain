@@ -1122,11 +1122,18 @@ describe("route-auth checker: real-source mutants, in memory only (AC-03, AC-04)
     routeSources.set(path, source.slice(0, at) + replacement + source.slice(at + needle.length));
     return { ...REAL, routeSources };
   }
+  /** A copy of the real inventory with the WHOLE of `path` substituted; every other route and the registry stay real. */
+  function substituted(path: string, source: string): RepoView {
+    if (!REAL.routeSources.has(path)) throw new Error(`mutant target is not in the inventory: ${path}`);
+    return { ...REAL, routeSources: new Map(REAL.routeSources).set(path, source) };
+  }
   const run = (repo: RepoView) => checkRouteAuth(repo, ROUTE_AUTH_POLICY);
 
   const ADMIN = "app/api/internal/executor-gateway/v1/admin/[teamSlug]";
   const INSPECT = "app/api/dashboard/access/inspect/route.ts";
   const MEDIA = "app/api/dashboard/social/media/[id]/route.ts";
+  const ME = "app/api/v1/me/route.ts";
+  const HEALTH = "app/api/health/route.ts";
 
   it("passes an unchanged in-memory copy of the real inventory", () => {
     expect(run({ ...REAL, routeSources: new Map(REAL.routeSources) })).toEqual([]);
@@ -1171,6 +1178,74 @@ describe("route-auth checker: real-source mutants, in memory only (AC-03, AC-04)
     expect(run(mutant(path, "await authenticateAgentToken(req)", "null"))).toEqual([
       `${path} ${method}: missing expected guard invocation: authenticateAgentToken`,
     ]);
+  });
+
+  // Calling a generator runs none of its body: `check(req)` is an iterator — always truthy — so this
+  // handler would answer 200 with the guard never invoked. The same handler over an ordinary helper
+  // receives the guard's verdict.
+  const meVia = (helper: string, verdict = "await check(req)") => `${KEY_IMPORT}
+${helper}
+
+export async function GET(req: Request) {
+  const auth = ${verdict};
+  if (!auth) return new Response(null, { status: 401 });
+  return Response.json({ ok: true });
+}
+`;
+  const YIELDS = `(req: Request) {\n  yield authenticateApiKey(req);\n}`;
+  const RETURNS = `(req: Request) {\n  return authenticateApiKey(req);\n}`;
+  const meRefused = [NO_INVOCATION(`${ME} GET`, "authenticateApiKey")];
+
+  it.each([
+    ["a sync generator declaration", `function* check${YIELDS}`],
+    ["an async generator declaration", `async function* check${YIELDS}`],
+    ["a const sync generator expression", `const check = function* ${YIELDS};`],
+    ["a const async generator expression", `const check = async function* ${YIELDS};`],
+  ])("fails v1/me when its only guard call sits in %s the handler calls", (_name, helper) => {
+    const repo = substituted(ME, meVia(helper));
+    expect(repo.routeSources.get(ME)).toContain(`import { authenticateApiKey } from "@/lib/api/auth"`);
+    expect(run(repo)).toEqual(meRefused);
+  });
+
+  it("still fails a generator helper the handler drives — iteration is not modelled, so it fails closed", () => {
+    expect(run(substituted(ME, meVia(`function* check${YIELDS}`, "await check(req).next().value")))).toEqual(meRefused);
+  });
+
+  it.each([
+    ["a sync function declaration", `function check${RETURNS}`],
+    ["an async function declaration", `async function check${RETURNS}`],
+    ["a const sync function expression", `const check = function ${RETURNS};`],
+    ["a const async function expression", `const check = async function ${RETURNS};`],
+    ["a const async arrow", `const check = async (req: Request) => authenticateApiKey(req);`],
+  ])("admitted control: follows %s the v1/me handler calls to the real guard", (_name, helper) => {
+    expect(run(substituted(ME, meVia(helper)))).toEqual([]);
+  });
+
+  it.each([
+    ["a sync generator declaration", "export function* GET", ""],
+    ["an async generator declaration", "export async function* GET", ""],
+    ["a const sync generator expression", "export const GET = function* ", ";"],
+    ["a const async generator expression", "export const GET = async function* ", ";"],
+  ])("refuses %s exported as a handler, on a protected row and on a public exception row", (_name, head, tail) => {
+    const handler = (call: string) => `${head}(req: Request) {\n  yield ${call};\n}${tail}\n`;
+    const generatorHandler = (key: string) =>
+      `${key}: unsupported export shape (generator handler) — export the handler as a function`;
+    // The guard call is really there; a registry row cannot rescue a body that never runs.
+    const guarded = KEY_IMPORT + handler("authenticateApiKey(req)");
+    expect(run(substituted(ME, guarded))).toEqual([
+      generatorHandler(`${ME} GET`),
+      `${ME} GET: stale registry row — no such exported handler`,
+    ]);
+    // Nor can a public exception: the shape is refused before any classification.
+    const open = `import { healthResponse } from "@/lib/staging/health";\n${handler("healthResponse(req)")}`;
+    expect(run(substituted(HEALTH, open))).toEqual([
+      generatorHandler(`${HEALTH} GET`),
+      `${HEALTH} GET: stale public exception — no such exported handler`,
+    ]);
+    // Admitted controls: the same sources as ordinary functions pass, so only the generator shape differs.
+    const ordinary = (source: string) => source.replace("function*", "function").replace("yield", "return");
+    expect(run(substituted(ME, ordinary(guarded)))).toEqual([]);
+    expect(run(substituted(HEALTH, ordinary(open)))).toEqual([]);
   });
 
   it("left every product file on disk untouched", () => {
