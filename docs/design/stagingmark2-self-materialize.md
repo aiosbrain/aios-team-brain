@@ -198,6 +198,13 @@ window — and a false refusal is exactly the failure this slice exists to remov
 slice's whole benefit is an unattended upgrade, and an upgrade that silently hides your content is
 not one.
 
+**Status update — STAGINGMARK-5, 2026-10-02:** The boot/tick substrate bypass and attended CLI
+team-cascade TOCTOU described below are closed by routing those callers through the existing SQL
+initial/post-lock gate in one READ COMMITTED runtime transaction. The paragraphs remain the
+historical STAGINGMARK-2 findings. This does not provide an at-COMMIT substrate guarantee against
+unfenced item purges, per-team completeness, or fencing of older TypeScript writers; see
+`docs/OPS.md` §11.
+
 **Second residual: the CLI carries the same cascade TOCTOU the SQL now guards.** `readState` is four
 autocommit reads with no lock, and the TS materializer it then calls re-reads only the marker — so a
 team deletion committing between the substrate read and the stamp reproduces, attended, exactly the
@@ -235,18 +242,21 @@ exactly TWO call sites"), which is **already false today** — `:116` in that sa
 site — and becomes doubly false with a second marker writer.
 
 **Cut, each with a home:**
-- **Slice B — the `.rpc()` wrapper** (`materializeBuiltinMembershipOnce` becomes a thin RPC call, plus
-  the `lib/db/pg/client.ts` allowlist entry). **Deferred to its own PR, and dropping it is
-  acceptable**, because D3 freezes the algorithm. It is also the riskiest edit available here — it
-  rewrites a function every fleet runs at every boot — and it introduces a real regression the first
-  draft understated: today the TS loop is N short autocommit statements, none of which can hit the
-  pool's 30 s `statement_timeout`; as one RPC it is a single statement, so on a large markerless fleet
-  every boot and tick would cancel identically and never converge. Recorded as **STAGINGMARK-5** when
-  opened; not filed yet.
+- **Slice B — resolved by STAGINGMARK-5 (AIO-1132).** The accepted implementation uses a
+  service-owned `session.executeSql` transaction to call the frozen function; it adds no public
+  `.rpc()` allowlist entry. The original single-statement 30 s pool limit remained a real capacity
+  concern. Runtime now applies finite transaction-local 120 s statement and 2 s lock limits. Six
+  durable local 100,000-member trials across balanced and concentrated shapes completed within the
+  required 60 s envelope; local markerless startup was measured after conversion. These
+  measurements justify the tested profile, not an arbitrary fleet size or deployment SLA. The
+  original frozen algorithm remains unchanged
+  (`docs/design/stagingmark5-runtime-owner-verification.md`).
 - **A broader mixed-version repair protocol.** Locks serialize new callers; they cannot retroactively
   serialize an *old* release's multi-statement TypeScript materializer, which may read before the lock
   and write after it commits. That is a pre-existing materializer race, not one this creates, and the
-  never-booted case has no such writer. Stated, not solved.
+  never-booted case has no such writer. Stated, not solved. Current operational mitigation: drain
+  older replicas and their in-flight materializers before attended markerless recovery; no
+  automatic mixed-version repair protocol is added.
 - **Marker-loss semantics.** A missing marker does not distinguish "never materialized" from "marker
   deleted after deliberate membership edits"; automatic replay would regrant a deliberately removed
   membership in the latter case. Boot and tick already have that consequence — this moves it earlier.
