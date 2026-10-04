@@ -184,6 +184,39 @@ function premise(label: string, actual: unknown, expected: unknown): void {
 const isRow = (value: unknown): value is Row => typeof value === "object" && value !== null && !Array.isArray(value);
 const recordingSandbox = (): SandboxRunner => ({ configured: true, run: h.sandboxRun });
 
+/** Postgres timestamptz wire text: `YYYY-MM-DD HH:mm:ss[.ffffff]±HH[:MM]` (the short `+00` included). */
+const PG_TIMESTAMPTZ = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(\.\d{1,6})?([+-])(\d{2})(?::(\d{2}))?$/;
+
+/**
+ * The pool keeps timestamptz as the wire string (`lib/db/pg/pool.ts`), so a readback is never a
+ * `Date`. True only for that exact text naming a real instant: every component is range-checked and
+ * the day must exist in its month — nothing is left to `Date.parse` coercion.
+ */
+function isPgTimestamptz(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const match = PG_TIMESTAMPTZ.exec(value);
+  if (!match) return false;
+  const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number);
+  const offsetHour = Number(match[9]);
+  const offsetMinute = Number(match[10] ?? "00");
+  if (month < 1 || month > 12 || day < 1 || hour > 23 || minute > 59 || second > 59) return false;
+  if (offsetHour > 15 || offsetMinute > 59) return false;
+  // A day that does not exist (Feb 30) rolls over; it must come back as the same calendar day.
+  const calendar = new Date(Date.UTC(year, month - 1, day));
+  if (calendar.getUTCFullYear() !== year || calendar.getUTCMonth() !== month - 1 || calendar.getUTCDate() !== day) return false;
+  // Normalized for parsing only: `T` separator, millisecond fraction, full `±HH:MM` offset.
+  const millis = (match[7] ?? ".").slice(1, 4).padEnd(3, "0");
+  const iso = `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}.${millis}${match[8]}${match[9]}:${match[10] ?? "00"}`;
+  return Number.isFinite(Date.parse(iso));
+}
+
+/** Asymmetric matcher for one column of a full-row comparison: a valid timestamptz string, whatever its instant. */
+const pgTimestamptz = {
+  $$typeof: Symbol.for("jest.asymmetricMatcher"),
+  asymmetricMatch: (value: unknown) => isPgTimestamptz(value),
+  toAsymmetricMatcher: () => "PgTimestamptz",
+};
+
 /** Fresh readbacks straight from the pool: the standing rows, whatever any adapter reported. */
 async function durableState() {
   return {
@@ -830,7 +863,7 @@ describe("AIO-1217 F2 · after a won claim, a prepare or deny that cannot be con
         standing(fault, displaced.row, before.actions[0], {
           ...before.actions[0],
           status: decision === "approved" ? "running" : "denied",
-          updated_at: expect.any(Date),
+          updated_at: pgTimestamptz,
         }),
       ]);
       expect({ dispatched: handler.execute.mock.calls.length, sandboxRuns: h.sandboxRun.mock.calls.length }).toEqual({
@@ -981,7 +1014,7 @@ describe("AIO-1217 F4 · a terminal write that cannot be confirmed is uncertain 
         standing(
           fault,
           displaced.row,
-          { ...before.actions[0], status: "running", updated_at: expect.any(Date) },
+          { ...before.actions[0], status: "running", updated_at: pgTimestamptz },
           expect.objectContaining({ id: own.actionId, team_id: a.teamId, status: TERMINAL[kind], approval_request_id: own.approvalId }),
         ),
       ]);
