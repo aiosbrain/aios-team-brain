@@ -13,6 +13,16 @@ it("serves an uncached public database readiness response", async () => {
     commit: process.env.RAILWAY_GIT_COMMIT_SHA ?? null,
   });
 });
+// AIO-1208 AC-11: public readiness is the ONLY unauthenticated answer. Presenting a token that
+// does not verify is refused with exactly `{ ok: false }` — never the public body, never detail.
+it("refuses a wrong staging health token with 401 and no readiness detail", async () => {
+  const r = await fetch(`${BASE_URL}/api/health`, {
+    headers: { "x-aios-staging-health-token": "w".repeat(40) },
+  });
+  expect(r.status).toBe(401);
+  expect(r.headers.get("cache-control")).toBe("no-store");
+  expect(await r.json()).toEqual({ ok: false });
+});
 it("real HTTP returns bounded safe503 with an unreachable database", async () => {
   const port = String(Number(HTTP_TEST_PORT) + 1);
   const server = spawn(

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
-import { issueMagicToken } from "@/lib/auth/pg-login";
+import { adminSetPassword, issueMagicToken } from "@/lib/auth/pg-login";
 import { BASE_URL, db, issueKeyFor, keyHeaders, seedMemberEmail, seedTeam } from "./http-helpers";
 
 // HTTP auth edges that the in-process tier can't reach: cookie-setting routes need a
@@ -23,6 +23,7 @@ describe("POST /api/auth/login (HTTP)", () => {
     });
     expect(res.status).toBe(401);
     expect((await res.json()).error).toBe("invalid_credentials");
+    expect(res.headers.get("set-cookie")).toBeNull();
   });
 
   it("rejects a recognized email with the wrong password — same 401 shape as an unknown email", async () => {
@@ -36,6 +37,42 @@ describe("POST /api/auth/login (HTTP)", () => {
     });
     expect(res.status).toBe(401);
     expect((await res.json()).error).toBe("invalid_credentials");
+    expect(res.headers.get("set-cookie")).toBeNull();
+  });
+
+  // AIO-1208 AC-11: existing normative behaviour (lib/auth/pg-login emailHasMember) at the wire.
+  // The email is unique to this test, so its ONLY membership is the disabled one — no other
+  // fixture row can make the premise false.
+  it("rejects the CORRECT password when every membership of the email is disabled: 401, no session", async () => {
+    const seed = await seedTeam();
+    const email = `all-disabled-${randomUUID()}@test.local`;
+    const password = `correct-password-${randomUUID().slice(0, 12)}`;
+    const inserted = await db().from("members").insert({
+      team_id: seed.teamId,
+      email,
+      display_name: "Disabled Member",
+      actor_handle: `disabled-${randomUUID().slice(0, 8)}`,
+      role: "admin",
+      tier: "team",
+      status: "disabled",
+    });
+    expect(inserted.error).toBeNull();
+    await adminSetPassword(email, password);
+    const { data: memberships } = await db().from("members").select("status").eq("email", email);
+    expect(memberships).toEqual([{ status: "disabled" }]);
+
+    const res = await fetch(`${BASE_URL}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    expect(res.status).toBe(401);
+    expect((await res.json()).error).toBe("invalid_credentials");
+    expect(res.headers.get("set-cookie")).toBeNull();
+
+    // Refusal linked nothing: the disabled row stays disabled and unbound.
+    const { data: after } = await db().from("members").select("status, auth_user_id").eq("email", email);
+    expect(after).toEqual([{ status: "disabled", auth_user_id: null }]);
   });
 
   it("signs in a known member with the correct password: 200 + a session cookie", async () => {
@@ -154,6 +191,45 @@ describe("GET /auth/confirm (HTTP) — full magic-link round trip", () => {
     expect(res.status).toBe(307);
     expect(res.headers.get("location")).toContain("/login?error=invalid_link");
     expect(res.headers.get("set-cookie")).toBeNull();
+  });
+
+  // AIO-1208 AC-11: the token is single-use and time-bound AT THE WIRE — a second redemption and
+  // an expired token both end at the login error with no session cookie.
+  it("sets no session cookie when a redeemed token is replayed", async () => {
+    const seed = await seedTeam();
+    const { email } = await seedMemberEmail(seed);
+    const raw = await issueMagicToken(email, `/t/${seed.teamSlug}`);
+    expect(raw).not.toBeNull();
+
+    const first = await fetch(`${BASE_URL}/auth/confirm?token=${raw}`, { redirect: "manual" });
+    expect(first.status).toBe(307);
+    expect(first.headers.get("set-cookie") ?? "").toContain("aios_session");
+
+    const replay = await fetch(`${BASE_URL}/auth/confirm?token=${raw}`, { redirect: "manual" });
+    expect(replay.status).toBe(307);
+    expect(replay.headers.get("location")).toContain("/login?error=invalid_link");
+    expect(replay.headers.get("set-cookie")).toBeNull();
+  });
+
+  it("sets no session cookie for an expired token, and never consumes it", async () => {
+    const seed = await seedTeam();
+    const { email } = await seedMemberEmail(seed);
+    const raw = await issueMagicToken(email, `/t/${seed.teamSlug}`);
+    expect(raw).not.toBeNull();
+    const expired = await db()
+      .from("auth_tokens")
+      .update({ expires_at: new Date(Date.now() - 60_000).toISOString() })
+      .eq("email", email);
+    expect(expired.error).toBeNull();
+
+    const res = await fetch(`${BASE_URL}/auth/confirm?token=${raw}`, { redirect: "manual" });
+    expect(res.status).toBe(307);
+    expect(res.headers.get("location")).toContain("/login?error=invalid_link");
+    expect(res.headers.get("set-cookie")).toBeNull();
+    // Opportunistic cleanup may already have swept the expired row; what must never exist is a
+    // redemption of it.
+    const { data } = await db().from("auth_tokens").select("used_at").eq("email", email);
+    expect(((data ?? []) as { used_at: string | null }[]).filter((row) => row.used_at !== null)).toEqual([]);
   });
 });
 

@@ -553,6 +553,54 @@ flowchart LR
 
 ## Auth & access tiers
 
+### Route-file authentication inventory (AIO-1208)
+
+`proxy.ts` excludes `/api/` and protects only `/t/` pages, and there is no RLS, so authentication
+belongs to each route handler or the owner it calls. `test/guards/api-route-auth.test.ts` (checker
+and registry: `test/guards/helpers/api-route-auth.ts`; spec:
+`docs/design/aio1208-route-auth-inventory.md`) fails `npm test` unless **every explicitly exported
+HTTP method of every `route.ts` under `app/`** — discovered from the filesystem, `/auth` routes
+included — has a per-method registry row and either:
+
+- **invokes exactly its expected set of registered guards** (`authenticateApiKey`,
+  `authenticateAgentToken`, `getSessionUser`, `currentMember`, `resolveChatOwner`,
+  `gatewayAdminContext`, `authenticateGatewayRequest`, `authorizeGraphProxy`,
+  `governedActionHttp.submit`/`.status`, `stagingBuildMetadataResponse`, plus `canAccessAdmin` as an
+  authorization co-guard that is never sufficient alone). A guard counts only as a real call that
+  resolves, lexically, to the import of its owner module — an unused import, a comment, a
+  same-spelled local, a shadowing parameter or an uncalled nested helper does not; or
+- is one of six **public protocol exceptions**, each an exact path + method with a reason and
+  evidence: password login, magic-link request, magic-link confirm, the Slack OAuth callback,
+  public readiness, and the local-only dev login.
+
+A new handler therefore needs a reviewed row; an unsupported export shape (`export *`,
+`export { h as GET }`, a destructured export), a non-`.ts` route file, a `pages/api` or `src/app`
+tree, or a customized `pageExtensions` fails rather than disappearing from the inventory.
+
+**What this does not prove.** It pins which registered entry points a handler calls — not that
+every branch is dominated by the guard, and not content authorization, revocation or peer
+identity. The seven `getSessionUser` routes (`brain/arcs`, `brain/arcs/recompute`, `brain/events`,
+`brain/facts`, `dashboard/query`, `dashboard/team-work`, `dashboard/timeline`) do their active
+same-team membership check inline; the scanner does not prove that predicate. Each registered
+owner's refusal is proved separately by the runtime tests its registration names
+(`test/auth-wrapper-evidence.test.ts` and the tier tests beside it). **Not covered at all:** page
+endpoints, framework metadata endpoints, and **Server Actions** — the 20 `"use server"` modules are
+separate public POST endpoints whose general inventory is follow-up AIO-1217. One known asymmetry
+is left as designed: a valid magic-link token still issues an identity session when every
+membership of that email is disabled (password login refuses); protected team helpers reject the
+inactive membership afterwards.
+
+**Managed-gateway browser administration is role ∧ posture.**
+`lib/gateway/admin-persistence.ts:authorizeGatewayAdmin` is the one authority for its three
+consumers — `gatewayAdminContext` (the nine admin route methods), the managed approval Server
+Action, and the Approvals page's managed queue. It admits an **active admin holding the team's
+`everyone` builtin membership** (`resolveViewerPosture` + `canAccessAdmin`), reading team, member
+and posture on one transaction connection; `members.tier` is not consulted (PRET-4 §3.3, AIO-1208
+amendment). Refusals: unknown team/member 404 · inactive 422 · no Everyone membership 422 ·
+member/lead 403 · posture read failure a fixed 500, never a fallback. Authority is resolved per
+request with no cache, so a committed membership removal refuses the next request. Gateway policy
+`subject_tier` selectors and delegated-token semantics are separate and unchanged.
+
 **Freshness contract (R2/M6).** Any surface served out of a cache table reports `{ as_of, stale, degraded }`
 built by **`lib/freshness.ts`** — `as_of` is the cache row's real `computed_at`, `stale` means past TTL and
 served anyway (SWR), `degraded` means a leg the payload's computation depended on failed, and is
@@ -1723,6 +1771,10 @@ guard enforces it, it's named.
 
 - **Add/remove an API route, DB table, or ingestion source** → update the `<!-- drift:* -->`
   inventories below (machine-guarded; CI + pre-push will fail otherwise).
+- **Add/remove a route handler METHOD, or change which guard it calls** → update its row in
+  `test/guards/helpers/api-route-auth.ts` (expected guard set, or a public exception with a reason
+  and evidence). `npm test` names the exact `path METHOD` otherwise. Registering a new guard or
+  wrapper is a trust decision: it needs an owner, a reason and a test that proves its denial.
 - **Write to `items`/`item_versions`** → it must live in `lib/ingest` (single-writer guard).
 - **Read tiered content on the dashboard** → apply the `access`/tier filter explicitly; there is
   no RLS backstop.

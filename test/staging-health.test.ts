@@ -45,6 +45,27 @@ describe("deployment health", () => {
     });
     expect(response.headers.get("cache-control")).toBe("no-store");
     expect(response.status).toBe(401);
+    // AIO-1208 AC-11: exactly `{ ok: false }` — no commit, mode, run identity or graph state.
+    await expect(response.json()).resolves.toEqual({ ok: false });
+  });
+
+  it("refuses a wrong token BEFORE reading any runtime state or probing the graph", async () => {
+    const readRuntimeState = vi.fn();
+    const probeNeo4j = vi.fn();
+    const response = await healthResponse(new Request("http://brain/api/health", {
+      headers: { "x-aios-staging-health-token": "y".repeat(32) },
+    }), {
+      probePostgres: vi.fn().mockResolvedValue(true),
+      readRuntimeState,
+      probeNeo4j,
+      env: { STAGING_HEALTH_TOKEN: "x".repeat(32), RAILWAY_GIT_COMMIT_SHA: "candidate-sha" },
+    });
+    expect(response.status).toBe(401);
+    const text = await response.text();
+    expect(JSON.parse(text)).toEqual({ ok: false });
+    expect(text).not.toContain("candidate-sha");
+    expect(readRuntimeState).not.toHaveBeenCalled();
+    expect(probeNeo4j).not.toHaveBeenCalled();
   });
 
   it("copy-ready reports the exact ready run and proves Neo4j is readable", async () => {

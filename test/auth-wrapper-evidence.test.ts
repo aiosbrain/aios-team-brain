@@ -17,6 +17,12 @@ import { SignJWT } from "jose";
 
 type Row = Record<string, unknown>;
 type Envelope = { data: unknown; error: { message: string } | null };
+interface Chain extends PromiseLike<Envelope> {
+  select(spec?: string): Chain;
+  update(values: unknown): Chain;
+  eq(column: string, value: unknown): Chain;
+  maybeSingle(): Promise<Envelope>;
+}
 
 const h = vi.hoisted(() => ({
   cookie: null as string | null,
@@ -39,18 +45,18 @@ const db = {
       h.failing.has(table) ? { data: null, error: { message: `${table} unavailable` } } : null;
     const matches = (): Row[] =>
       (h.tables[table] ?? []).filter((candidate) => filters.every(([column, value]) => candidate[column] === value));
-    const chain = {
+    const chain: Chain = {
       select: () => chain,
       update: () => {
         write = true;
         h.writes.push(table);
         return chain;
       },
-      eq: (column: string, value: unknown) => {
+      eq: (column, value) => {
         filters.push([column, value]);
         return chain;
       },
-      maybeSingle: async (): Promise<Envelope> => {
+      maybeSingle: async () => {
         const failed = failure();
         if (failed) return failed;
         const found = matches();
@@ -58,8 +64,11 @@ const db = {
           ? { data: null, error: { message: "multiple rows" } }
           : { data: found[0] ?? null, error: null };
       },
-      then: <T>(resolve: (value: Envelope) => T) =>
-        Promise.resolve(failure() ?? { data: write ? null : matches(), error: null }).then(resolve),
+      then: (onfulfilled, onrejected) =>
+        Promise.resolve<Envelope>(failure() ?? { data: write ? null : matches(), error: null }).then(
+          onfulfilled,
+          onrejected,
+        ),
     };
     return chain;
   },
