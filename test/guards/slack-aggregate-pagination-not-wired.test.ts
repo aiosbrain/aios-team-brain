@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, normalize, relative } from "node:path";
+import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
 import { PR743_PINNED_HEAD, PR743_PINNED_PATHS } from "./slack-aggregate-pagination-pr743-paths";
@@ -94,67 +95,119 @@ function packetChangedPaths(base: string): string[] {
 // ── import reachability ──────────────────────────────────────────────────────
 
 /**
- * The four import spellings. NONE is anchored to a line start: `import a from "./a"; import b from "./b";`
- * is two imports, and a line-anchored pattern sees only the first (red review, finding 2).
+ * Imports are read from the SYNTAX TREE the installed TypeScript compiler builds, and resolved by the
+ * installed TypeScript module resolver under this repository's own compiler options.
  *
- * The scan is deliberately over the RAW source and therefore fails closed: a commented-out import of
- * a guarded module counts as an edge. Blanking comments first would need a real tokenizer — a regular
- * expression literal that contains a slash followed by an asterisk reads as a comment opener to
- * anything simpler, and would hide every import after it. An unwired capability that is "one uncomment away" from a route is worth a
- * failing guard; a silently missed import is not an acceptable price for tidier output.
- *
- * The static form may not cross a quote, backtick or semicolon between its keyword and `from`, so it
- * can never swallow another statement's string — in particular a dynamic `import("…")` in between.
+ * Two review rounds each found VALID imports that a text pattern missed: a second import on one
+ * line, a `.js` specifier naming a `.ts` module, a comment between `import(` and its string, a quoted
+ * comment before `from`. A parser has none of those cases. A comment is trivia wherever it sits, so
+ * it can neither hide an import nor be mistaken for one; a string that merely contains the word
+ * `import` is a string. What the compiler would load is what this guard follows.
  */
-const SPECIFIER =
-  /\b(?:import|export)\b[^'"`;]*?\bfrom\s*['"]([^'"]+)['"]|\bimport\s*['"]([^'"]+)['"]|\bimport\s*\(\s*['"`]([^'"`$]+)['"`]\s*\)|\brequire\s*\(\s*['"`]([^'"`$]+)['"`]\s*\)/g;
-
-/** Every module specifier a source file names, in any of the import spellings, in source order. */
-function importSpecifiers(source: string): string[] {
-  return [...source.matchAll(SPECIFIER)].map((m) => m[1] ?? m[2] ?? m[3] ?? m[4]);
+function importSpecifiers(file: string, source: string): string[] {
+  // The file name selects the grammar (TSX for `.tsx`, JavaScript for `.mjs`), exactly as the compiler does.
+  const syntax = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, false);
+  const found: string[] = [];
+  const add = (node: ts.Node | undefined): void => {
+    if (node && (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node))) found.push(node.text);
+  };
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+      add(node.moduleSpecifier); // static, side-effect, type-only, `export … from`, `export * from`
+    } else if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) {
+      add(node.moduleReference.expression); // `import x = require("…")`
+    } else if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument)) {
+      add(node.argument.literal); // `typeof import("…")` in a type position: still a dependency edge
+    } else if (ts.isCallExpression(node)) {
+      const callee = node.expression;
+      const dynamicImport = callee.kind === ts.SyntaxKind.ImportKeyword;
+      const requireCall = ts.isIdentifier(callee) && callee.text === "require";
+      const requireMember = ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression) && callee.expression.text === "require";
+      if (dynamicImport || requireCall || requireMember) add(node.arguments[0]);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(syntax);
+  return found; // in source order
 }
 
 /** Every module file extension the tree scan reads and the resolver can land on. */
 const SOURCE_FILE = /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
 
-/** What TypeScript's `bundler` resolution loads for a JavaScript-extension specifier. */
-const TS_FOR_JS: Readonly<Record<string, readonly string[]>> = {
-  ".js": [".ts", ".tsx"],
-  ".jsx": [".tsx"],
-  ".mjs": [".mts"],
-  ".cjs": [".cts"],
-};
-
 /**
- * Resolve a `@/…` or relative specifier to a repo-relative file, or null for a package / unresolvable
- * one. `./drain.js` names `./drain.ts` when that is the file that exists — the spelling ESM-style
- * TypeScript uses, and one an extension-appending resolver never matches (red review, finding 2).
+ * This repository's compiler options, converted by the installed compiler from `tsconfig.json`
+ * itself: `moduleResolution: "bundler"`, the `@/*` path mapping, `allowJs`. Only the options are
+ * read — no file list is expanded — so the guard resolves the way `tsc --noEmit` does here.
  */
-function resolveSpecifier(fromRel: string, spec: string, isFile: (rel: string) => boolean): string | null {
-  const base = spec.startsWith("@/") ? normalize(spec.slice(2)) : spec.startsWith(".") ? join(dirname(fromRel), spec) : null;
-  if (base === null) return null;
-  const jsExtension = /\.(?:js|jsx|mjs|cjs)$/.exec(base)?.[0];
-  const rewritten = jsExtension ? TS_FOR_JS[jsExtension].map((to) => `${base.slice(0, -jsExtension.length)}${to}`) : [];
-  const candidates = [
-    base, ...rewritten,
-    `${base}.ts`, `${base}.tsx`, `${base}.mts`, `${base}.cts`, `${base}.mjs`, `${base}.cjs`, `${base}.js`, `${base}.jsx`,
-    `${base}/index.ts`, `${base}/index.tsx`, `${base}/index.mjs`, `${base}/index.js`,
-  ];
-  return candidates.find(isFile) ?? null;
+const COMPILER_OPTIONS: ts.CompilerOptions = (() => {
+  const read = ts.readConfigFile(join(ROOT, "tsconfig.json"), (path) => readFileSync(path, "utf8"));
+  if (read.error || !read.config) throw new Error("activation guard: tsconfig.json could not be read");
+  const converted = ts.convertCompilerOptionsFromJson(read.config.compilerOptions ?? {}, ROOT, join(ROOT, "tsconfig.json"));
+  if (converted.errors.length > 0) throw new Error("activation guard: tsconfig.json compiler options are invalid");
+  // `paths` is relative to the directory of tsconfig.json, which is the repository root.
+  return { ...converted.options, pathsBasePath: ROOT } as ts.CompilerOptions;
+})();
+
+/** The compiler's view of an in-memory `{ repo-relative path: source }` tree rooted at the repository. */
+function resolutionHost(tree: ReadonlyMap<string, string>): ts.ModuleResolutionHost {
+  const directories = new Set<string>();
+  for (const file of tree.keys()) {
+    for (let dir = dirname(file); dir !== "." && dir !== "" && !directories.has(dir); dir = dirname(dir)) directories.add(dir);
+  }
+  const rel = (path: string): string => relative(ROOT, path);
+  return {
+    fileExists: (path) => tree.has(rel(path)),
+    readFile: (path) => tree.get(rel(path)),
+    directoryExists: (path) => rel(path) === "" || directories.has(rel(path)),
+    getCurrentDirectory: () => ROOT,
+    realpath: (path) => path,
+    useCaseSensitiveFileNames: () => true,
+  };
 }
 
-/** file → the files it imports, for an in-memory `{ repo-relative path: source }` tree. */
+interface Resolver { tree: ReadonlyMap<string, string>; host: ts.ModuleResolutionHost; cache: ts.ModuleResolutionCache }
+
+function resolverFor(tree: ReadonlyMap<string, string>): Resolver {
+  return { tree, host: resolutionHost(tree), cache: ts.createModuleResolutionCache(ROOT, (name) => name, COMPILER_OPTIONS) };
+}
+
+/**
+ * Every file of the tree a specifier can name, or none for a package / unresolvable one.
+ *
+ * The first answer is the installed compiler's own: under this repository's `bundler` resolution
+ * `./drain.js` names `./drain.ts`, and it names `./drain.ts` EVEN WHEN a `./drain.js` also exists.
+ * The second answer is the file the specifier literally spells, when that file exists too: a runtime
+ * bundler may load it instead. Both edges are kept. Reachability can only gain from the extra edge,
+ * and the TypeScript edge — the one that can lead to a guarded module — is never dropped for it.
+ */
+function resolveSpecifier(resolver: Resolver, fromRel: string, spec: string): string[] {
+  const targets = new Set<string>();
+  const resolved = ts.resolveModuleName(spec, join(ROOT, fromRel), COMPILER_OPTIONS, resolver.host, resolver.cache).resolvedModule;
+  if (resolved) {
+    const file = relative(ROOT, resolved.resolvedFileName);
+    if (resolver.tree.has(file)) targets.add(file);
+  }
+  const literal = spec.startsWith("@/") ? normalize(spec.slice(2)) : spec.startsWith(".") ? join(dirname(fromRel), spec) : null;
+  if (literal !== null && resolver.tree.has(literal)) targets.add(literal);
+  return [...targets].sort();
+}
+
+const GRAPHS = new WeakMap<ReadonlyMap<string, string>, Map<string, Set<string>>>();
+
+/** file → the files it imports, for an in-memory `{ repo-relative path: source }` tree. Computed once per tree. */
 function importGraph(tree: ReadonlyMap<string, string>): Map<string, Set<string>> {
-  const isFile = (rel: string): boolean => tree.has(rel);
+  const known = GRAPHS.get(tree);
+  if (known) return known;
+  const resolver = resolverFor(tree);
   const graph = new Map<string, Set<string>>();
   for (const [file, source] of tree) {
     const targets = new Set<string>();
-    for (const spec of importSpecifiers(source)) {
-      const resolved = resolveSpecifier(file, spec, isFile);
-      if (resolved) targets.add(resolved);
+    for (const spec of importSpecifiers(file, source)) {
+      for (const target of resolveSpecifier(resolver, file, spec)) targets.add(target);
     }
     graph.set(file, targets);
   }
+  GRAPHS.set(tree, graph);
   return graph;
 }
 
@@ -200,7 +253,11 @@ function outsideImporters(tree: ReadonlyMap<string, string>): string[] {
   return edges.sort();
 }
 
+let REAL_TREE: Map<string, string> | null = null;
+
+/** The repository's real source tree, read once: every real-tree test shares it and its import graph. */
 function readTree(): Map<string, string> {
+  if (REAL_TREE) return REAL_TREE;
   const tree = new Map<string, string>();
   const walk = (dir: string): void => {
     let names: string[];
@@ -221,8 +278,12 @@ function readTree(): Map<string, string> {
     const p = join(ROOT, name);
     if (SOURCE_FILE.test(name) && !name.startsWith(".") && statSync(p).isFile()) tree.set(name, readFileSync(p, "utf8"));
   }
+  REAL_TREE = tree;
   return tree;
 }
+
+/** Parsing and resolving the whole repository with the compiler takes seconds, not milliseconds. */
+const REAL_TREE_TIMEOUT = { timeout: 120_000 };
 
 const stubs = (): [string, string][] => GUARDED.map((g): [string, string] => [g, ""]);
 
@@ -353,7 +414,7 @@ describe("the aggregate Slack pagination packet is not wired to anything", () =>
       const spec = `@/${guarded.replace(/\.ts$/, "")}`;
       // The exact shape the review ran: an innocent import, then the guarded one, on ONE line.
       const line = `import { a } from "@/lib/innocent"; import { b } from "${spec}";`;
-      expect(importSpecifiers(line)).toEqual(["@/lib/innocent", spec]);
+      expect(importSpecifiers(entry, line)).toEqual(["@/lib/innocent", spec]);
       const tree = new Map<string, string>([...stubs(), ["lib/innocent.ts", ""], [entry, line]]);
       expect(reachedGuarded(tree), guarded).toEqual([`${entry} → ${guarded}`]);
       expect(outsideImporters(tree), guarded).toEqual([`${entry} → ${guarded}`]);
@@ -363,9 +424,9 @@ describe("the aggregate Slack pagination packet is not wired to anything", () =>
       `const first = 1; import one from "./one"; export { two } from "./two"; import "./three"; const four = await import("./four"); const five = require("./five");`,
       `export const x = 1; import six from "./six"`,
     ].join("\n");
-    expect(importSpecifiers(crowded)).toEqual(["./one", "./two", "./three", "./four", "./five", "./six"]);
-    // A static form never swallows a dynamic import that sits between its keyword and a later `from`.
-    expect(importSpecifiers('export function load() { return import(`./lazy`) }\nimport late from "./late";')).toEqual(["./lazy", "./late"]);
+    expect(importSpecifiers("lib/crowded.ts", crowded)).toEqual(["./one", "./two", "./three", "./four", "./five", "./six"]);
+    // A dynamic import inside a declaration, before a later static import: both, in source order.
+    expect(importSpecifiers("lib/lazy.ts", 'export function load() { return import(`./lazy`) }\nimport late from "./late";')).toEqual(["./lazy", "./late"]);
     // Transitively as well: the same-line import is in a module the route reaches.
     const transitive = new Map<string, string>([
       ...stubs(),
@@ -401,15 +462,19 @@ describe("the aggregate Slack pagination packet is not wired to anything", () =>
         expect(outsideImporters(tree), `${label}: ${guarded}`).toEqual([`app/t/[team]/timeline/page.tsx → ${guarded}`]);
       }
     }
-    // The other JavaScript extensions map the way TypeScript maps them, and a real .js file still wins.
-    const isFile = (files: string[]) => (rel: string): boolean => files.includes(rel);
-    expect(resolveSpecifier("lib/a.ts", "./b.js", isFile(["lib/b.tsx"]))).toBe("lib/b.tsx");
-    expect(resolveSpecifier("lib/a.ts", "./b.jsx", isFile(["lib/b.tsx"]))).toBe("lib/b.tsx");
-    expect(resolveSpecifier("lib/a.ts", "./b.mjs", isFile(["lib/b.mts"]))).toBe("lib/b.mts");
-    expect(resolveSpecifier("lib/a.ts", "./b.cjs", isFile(["lib/b.cts"]))).toBe("lib/b.cts");
-    expect(resolveSpecifier("lib/a.ts", "./b.js", isFile(["lib/b.js", "lib/b.ts"]))).toBe("lib/b.js");
-    expect(resolveSpecifier("lib/a.ts", "./b.js", isFile(["lib/c.ts"]))).toBeNull();
-    expect(resolveSpecifier("lib/a.ts", "pg", isFile(["pg.ts"]))).toBeNull();
+    // The other JavaScript extensions map the way the installed compiler maps them.
+    const resolve = (files: string[], spec: string): string[] =>
+      resolveSpecifier(resolverFor(new Map(["lib/a.ts", ...files].map((file): [string, string] => [file, ""]))), "lib/a.ts", spec);
+    expect(resolve(["lib/b.tsx"], "./b.js")).toEqual(["lib/b.tsx"]);
+    expect(resolve(["lib/b.tsx"], "./b.jsx")).toEqual(["lib/b.tsx"]);
+    expect(resolve(["lib/b.mts"], "./b.mjs")).toEqual(["lib/b.mts"]);
+    expect(resolve(["lib/b.cts"], "./b.cjs")).toEqual(["lib/b.cts"]);
+    expect(resolve(["lib/b.ts"], "./b")).toEqual(["lib/b.ts"]);
+    expect(resolve(["lib/b/index.ts"], "./b")).toEqual(["lib/b/index.ts"]);
+    expect(resolve(["lib/c.ts"], "./b.js")).toEqual([]);
+    // A bare package name is not a path, even beside a same-named root file; an unmapped alias is nothing.
+    expect(resolve(["pg.ts"], "pg")).toEqual([]);
+    expect(resolve(["lib/b.ts"], "~/lib/b")).toEqual([]);
     // Both counterexamples at once, through a chain.
     const both = new Map<string, string>([
       ...stubs(),
@@ -421,18 +486,96 @@ describe("the aggregate Slack pagination packet is not wired to anything", () =>
     expect(outsideImporters(both)).toEqual([`lib/dashboard/loader.ts → ${PAGE_READ}`]);
   });
 
-  it("fails closed on a commented-out import of a guarded module, and ignores what it cannot resolve", () => {
+  it("keeps the TypeScript edge when a .js file sits beside the .ts module (installed bundler resolution)", () => {
+    // Under this repository's `moduleResolution: "bundler"`, `./b.js` names `./b.ts` even when
+    // `./b.js` exists as well. An earlier version of this guard asserted the opposite ("a real .js
+    // file still wins") and so could drop exactly the edge that leads to a guarded module.
+    const resolver = resolverFor(new Map([["lib/a.ts", ""], ["lib/b.js", ""], ["lib/b.ts", ""]]));
+    const direct = ts.resolveModuleName("./b.js", join(ROOT, "lib/a.ts"), COMPILER_OPTIONS, resolver.host).resolvedModule;
+    expect(direct && relative(ROOT, direct.resolvedFileName), "what the installed compiler itself resolves").toBe("lib/b.ts");
+    // The guard keeps that edge, and conservatively the literally-named file too.
+    expect(resolveSpecifier(resolver, "lib/a.ts", "./b.js")).toEqual(["lib/b.js", "lib/b.ts"]);
+    expect(resolveSpecifier(resolver, "lib/a.ts", "./b")).toContain("lib/b.ts");
+
+    // The control that matters: a stray compiled `.js` beside EACH guarded module hides nothing.
+    const entry = "app/api/v1/timeline/route.ts";
+    for (const guarded of GUARDED) {
+      const shadow = guarded.replace(/\.ts$/, ".js");
+      for (const spec of [`@/${shadow}`, `@/${guarded.replace(/\.ts$/, "")}`, `../../../../${shadow}`]) {
+        const tree = new Map<string, string>([...stubs(), [shadow, ""], [entry, `import { x } from "${spec}";`]]);
+        expect(reachedGuarded(tree), spec).toEqual([`${entry} → ${guarded}`]);
+        expect(outsideImporters(tree), spec).toEqual([`${entry} → ${guarded}`]);
+        expect([...(importGraph(tree).get(entry) ?? [])], spec).toContain(guarded);
+      }
+    }
+    // And transitively through the shadow file itself: the `.js` twin that re-exports is followed too.
+    const viaShadow = new Map<string, string>([
+      ...stubs(),
+      ["lib/dashboard/loader.js", `export * from "./slack-timeline-drain.js";`],
+      ["lib/dashboard/loader.ts", `export const nothing = 1;`],
+      [entry, `import { x } from "@/lib/dashboard/loader.js";`],
+    ]);
+    expect(reachedGuarded(viaShadow)).toEqual([`${entry} → lib/dashboard/loader.js → ${DRAIN}`]);
+  });
+
+  it("sees a valid import whatever comments sit inside it (red rereview counterexamples)", () => {
+    const entry = "app/api/v1/timeline/route.ts";
+    // The exact two shapes the rereview ran, which a text pattern reported as zero imports.
+    const chunkName = `const m = await import(/* webpackChunkName: "slack" */ "@/lib/dashboard/slack-timeline-drain");`;
+    const quotedBeforeFrom = `import { drainSlackTimeline } /* "quoted" comment */ from "@/lib/dashboard/slack-timeline-drain";`;
+    for (const source of [chunkName, quotedBeforeFrom]) {
+      expect(importSpecifiers(entry, source), source).toEqual(["@/lib/dashboard/slack-timeline-drain"]);
+      const tree = new Map<string, string>([...stubs(), [entry, source]]);
+      expect(reachedGuarded(tree), source).toEqual([`${entry} → ${DRAIN}`]);
+      expect(outsideImporters(tree), source).toEqual([`${entry} → ${DRAIN}`]);
+    }
+
+    const commented: [string, (spec: string) => string][] = [
+      ["a magic comment in a dynamic import", (s) => `const m = await import(/* webpackChunkName: "slack" */ "${s}");`],
+      ["line comments around a dynamic import's argument", (s) => `const m = await import(\n  // "not/this"\n  "${s}" // 'nor this'\n);`],
+      ["a quoted comment before from", (s) => `import { x } /* "quoted" comment */ from "${s}";`],
+      ["quoted comments in every gap of a static import", (s) => `import /* 'a' */ { x /* "b"; */ } /* from "./decoy" */ from /* 'c' */ "${s}" /* "d" */;`],
+      ["a quoted trailing comment inside a multi-line import", (s) => `import {\n  x, // "quoted"; from './decoy'\n  y,\n} from "${s}";`],
+      ["a quoted comment in a re-export", (s) => `export * /* "from" './decoy' */ from "${s}";`],
+      ["a quoted comment in a named re-export", (s) => `export { x /* "y" */ } /* ; */ from "${s}";`],
+      ["a comment in a side-effect import", (s) => `import /* "./decoy" */ "${s}";`],
+      ["a comment in a require call", (s) => `const m = require(/* "./decoy" */ "${s}");`],
+      ["a comment in a type-only import", (s) => `import type /* "t" */ { T } /* 'u' */ from "${s}";`],
+      ["a comment between import and its parenthesis", (s) => `const m = await import /* "x" */ ("${s}");`],
+    ];
+    for (const [label, spell] of commented) {
+      for (const guarded of GUARDED) {
+        const spec = `@/${guarded.replace(/\.ts$/, "")}`;
+        const source = spell(spec);
+        // Only the real specifier: nothing quoted inside a comment is taken for one.
+        expect(importSpecifiers(entry, source), `${label}: ${guarded}`).toEqual([spec]);
+        const tree = new Map<string, string>([...stubs(), ["lib/decoy.ts", ""], [entry, source]]);
+        expect(reachedGuarded(tree), `${label}: ${guarded}`).toEqual([`${entry} → ${guarded}`]);
+        expect(outsideImporters(tree), `${label}: ${guarded}`).toEqual([`${entry} → ${guarded}`]);
+      }
+    }
+  });
+
+  it("does not mistake comments, strings or unresolvable names for imports", () => {
     const entry = "scripts/drain-slack.ts";
-    for (const comment of [
+    const notImports = [
       `// import { drainSlackTimeline } from "@/lib/dashboard/slack-timeline-drain";`,
       `/* const d = await import("@/lib/dashboard/slack-timeline-drain"); */`,
+      `/**\n * import "@/lib/dashboard/slack-timeline-drain";\n */\nexport const documented = 1;`,
       `const url = "https://example.com"; // import "@/lib/dashboard/slack-timeline-drain.js";`,
-    ]) {
-      const tree = new Map<string, string>([...stubs(), [entry, comment]]);
-      // One uncomment away from wired is reported, not waved through.
-      expect(reachedGuarded(tree), comment).toEqual([`${entry} → ${DRAIN}`]);
+      `const text = 'import { x } from "@/lib/dashboard/slack-timeline-drain"';`,
+      "const text = `import(\"@/lib/dashboard/slack-timeline-drain\")`;",
+      `const pattern = /import\\("@\\/lib\\/dashboard\\/slack-timeline-drain"\\)/;`,
+      `const o = { import: "@/lib/dashboard/slack-timeline-drain", from: "@/lib/dashboard/slack-timeline-drain" };`,
+      `notRequire("@/lib/dashboard/slack-timeline-drain"); loader.load("@/lib/dashboard/slack-timeline-drain");`,
+    ];
+    for (const source of notImports) {
+      expect(importSpecifiers(entry, source), source).toEqual([]);
+      const tree = new Map<string, string>([...stubs(), [entry, source]]);
+      expect(reachedGuarded(tree), source).toEqual([]);
+      expect(outsideImporters(tree), source).toEqual([]);
     }
-    // Prose, packages, unresolvable paths and non-literal specifiers are not edges.
+    // Packages, unresolvable paths and non-literal specifiers are imports that lead nowhere in the tree.
     const inert = new Map<string, string>([
       ...stubs(),
       [entry, [
@@ -443,8 +586,15 @@ describe("the aggregate Slack pagination packet is not wired to anything", () =>
         "const n = await import(`@/lib/dashboard/${name}`);",
       ].join("\n")],
     ]);
+    expect(importSpecifiers(entry, inert.get(entry) ?? "")).toEqual(["pg", "./slack-timeline-drain"]);
     expect(reachedGuarded(inert)).toEqual([]);
     expect(outsideImporters(inert)).toEqual([]);
+    // A real import on the same line as a comment that also names one is still exactly one edge.
+    const mixed = new Map<string, string>([
+      ...stubs(),
+      [entry, `import "@/lib/dashboard/slack-timeline-page-contract"; // import "@/lib/dashboard/slack-timeline-drain";`],
+    ]);
+    expect(reachedGuarded(mixed)).toEqual([`${entry} → ${CONTRACT}`]);
   });
 
   it("treats the packet's own modules importing each other, and tests importing them, as not wiring (control)", () => {
@@ -517,7 +667,7 @@ describe("the aggregate Slack pagination packet is not wired to anything", () =>
     expect(reachedGuarded(viaComponent)).toEqual([`app/t/[team]/page.tsx → components/dashboard/panel.tsx → ${CONTRACT}`]);
   });
 
-  it("is not vacuous over the real tree: the traversal reaches what is known to be reachable", () => {
+  it("is not vacuous over the real tree: the traversal reaches what is known to be reachable", REAL_TREE_TIMEOUT, () => {
     const tree = readTree();
     const roots = entryPoints(tree);
     const via = reach(importGraph(tree), roots);
@@ -534,15 +684,15 @@ describe("the aggregate Slack pagination packet is not wired to anything", () =>
     for (const guarded of GUARDED) expect(tree.has(guarded), `${guarded} exists`).toBe(true);
   });
 
-  it("is reachable from no route, page, action, script or instrumentation entry point", () => {
+  it("is reachable from no route, page, action, script or instrumentation entry point", REAL_TREE_TIMEOUT, () => {
     expect(reachedGuarded(readTree())).toEqual([]);
   });
 
-  it("is imported by nothing outside the packet — not the builder, the cache, the UI, v1 or the Slack source", () => {
+  it("is imported by nothing outside the packet — not the builder, the cache, the UI, v1 or the Slack source", REAL_TREE_TIMEOUT, () => {
     expect(outsideImporters(readTree())).toEqual([]);
   });
 
-  it("keeps the packet's own imports inside its inactive boundary", () => {
+  it("keeps the packet's own imports inside its inactive boundary", REAL_TREE_TIMEOUT, () => {
     const tree = readTree();
     const graph = importGraph(tree);
     for (const guarded of GUARDED) expect(tree.has(guarded), `${guarded} exists`).toBe(true);
@@ -552,7 +702,7 @@ describe("the aggregate Slack pagination packet is not wired to anything", () =>
     expect(contractImports).not.toContain(DRAIN);
     for (const pure of [CONTRACT, DRAIN]) {
       const source = tree.get(pure) ?? "";
-      expect(importSpecifiers(source).filter((spec) => /^(@\/lib\/db|@\/lib\/ingest|@\/lib\/access|server-only$|pg$)/.test(spec)), pure).toEqual([]);
+      expect(importSpecifiers(pure, source).filter((spec) => /^(@\/lib\/db|@\/lib\/ingest|@\/lib\/access|server-only$|pg$)/.test(spec)), pure).toEqual([]);
       expect(source, `${pure} reads no environment`).not.toMatch(/process\.env/);
     }
     // No module of the packet imports the ACTIVE builder, cache, HTTP Slack client, runner or scheduler.

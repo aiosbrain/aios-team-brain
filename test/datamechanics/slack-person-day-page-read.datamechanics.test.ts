@@ -1886,15 +1886,45 @@ describe("aggregate Slack page — pending work, cancellation and statement time
 
   type Settled = { state: "pending" } | { state: "fulfilled"; value: unknown } | { state: "rejected"; error: Json };
 
-  /** A promise's state after a bounded number of event-loop turns. No timer, no sleep. */
-  async function settled(promise: Promise<unknown>, turns = 25): Promise<Settled> {
+  interface Watched { state: () => Settled; done: Promise<Settled> }
+
+  /**
+   * Take ownership of a promise the moment it exists. Both handlers are attached synchronously, so
+   * its rejection is always handled — it cannot surface as an unhandled rejection however early it
+   * fails — and `done` itself never rejects, so it is safe to race and to await in a `finally`.
+   */
+  function watch(promise: Promise<unknown>): Watched {
     let outcome: Settled = { state: "pending" };
-    promise.then(
-      (value) => { outcome = { state: "fulfilled", value }; },
-      (error) => { outcome = { state: "rejected", error: error as Json }; }
+    const done = promise.then(
+      (value): Settled => (outcome = { state: "fulfilled", value }),
+      (error): Settled => (outcome = { state: "rejected", error: error as Json })
     );
-    for (let n = 0; n < turns && outcome.state === "pending"; n++) await new Promise<void>((resolve) => setImmediate(resolve));
-    return outcome;
+    return { state: () => outcome, done };
+  }
+
+  const turn = (): Promise<void> => new Promise<void>((resolve) => setImmediate(resolve));
+
+  /**
+   * The state after the event loop AND the database have each had a bounded chance to move it: a
+   * fixed number of loop turns and real round trips. Used to show a run is still pending. No sleep.
+   */
+  async function idle(run: Watched, turns = 25, roundTrips = 5): Promise<Settled> {
+    for (let n = 0; n < turns && run.state().state === "pending"; n++) await turn();
+    for (let n = 0; n < roundTrips && run.state().state === "pending"; n++) await runSql(`select 1`).catch(() => undefined);
+    return run.state();
+  }
+
+  /**
+   * Wait for a run that is EXPECTED to settle, for at most a fixed number of database round trips
+   * (each is real I/O time for a rollback and a connection release, and none is a sleep). Never
+   * throws and never waits unboundedly: a run that is still pending is returned as pending.
+   */
+  async function settlesWithin(run: Watched, roundTrips = 400): Promise<Settled> {
+    for (let n = 0; n < roundTrips && run.state().state === "pending"; n++) {
+      await runSql(`select 1`).catch(() => undefined);
+      await turn();
+    }
+    return run.state();
   }
 
   /** Sessions other than this one still inside a transaction, after a bounded number of round trips. */
@@ -1960,38 +1990,61 @@ describe("aggregate Slack page — pending work, cancellation and statement time
     else options.afterEvidence = () => { pending.enter(); return pending.work; };
 
     s.w.mono = 1_000;
-    const run = page(s.w, {}, options, deps);
-    await pending.entered; // the reader reached the work that will never finish
-    expect((await settled(run)).state, "nothing ends the page before its deadline").toBe("pending");
+    // The run is observed in the SAME tick it is created: it can never become an unhandled rejection,
+    // whether it fails before reaching the held work (a missing module does), during it, or after.
+    const run = watch(page(s.w, {}, options, deps));
+    try {
+      // Either the reader reaches the work that will never finish, or the run ended first. An early
+      // end is reported at once — as its own failure — instead of waiting on an entry that cannot come.
+      const first = await Promise.race([pending.entered.then(() => "entered" as const), run.done]);
+      if (first !== "entered") {
+        if (first.state === "rejected") throw first.error;
+        throw new Error("the page completed without reaching the work that never settles");
+      }
+      expect((await idle(run)).state, "nothing ends the page before its deadline").toBe("pending");
 
-    // The pending work is guarded by a live deadline no longer than the remaining 30-second budget.
-    const armed = clock.timers.filter((t) => !t.cancelled && !t.fired);
-    expect(armed.length, "a deadline is armed while work is pending").toBeGreaterThan(0);
-    for (const t of clock.timers) {
-      expect(Number.isFinite(t.delayMs) && t.delayMs > 0, "a deadline is a positive finite delay").toBe(true);
-      expect(t.delayMs).toBeLessThanOrEqual(30_000);
+      // The pending work is guarded by a live deadline no longer than the remaining 30-second budget.
+      const armed = clock.timers.filter((t) => !t.cancelled && !t.fired);
+      expect(armed.length, "a deadline is armed while work is pending").toBeGreaterThan(0);
+      for (const t of clock.timers) {
+        expect(Number.isFinite(t.delayMs) && t.delayMs > 0, "a deadline is a positive finite delay").toBe(true);
+        expect(t.delayMs).toBeLessThanOrEqual(30_000);
+      }
+      if (name.startsWith("load")) {
+        expect(signal, "the loader was handed an AbortSignal").toBeInstanceOf(AbortSignal);
+        expect(signal?.aborted).toBe(false);
+      }
+
+      // The monotonic clock passes the budget and the deadline fires. The work is STILL pending:
+      // the test has not let go of it, so only the deadline can end the page.
+      s.w.mono = 1_000 + 30_001;
+      clock.fireAll();
+      const after = await settlesWithin(run);
+      expect(after.state, "the page ends on its deadline without waiting for the abandoned work").toBe("rejected");
+      const failure = (after as { error: Json }).error;
+      expect(failure).toMatchObject({ name: "SlackTimelineError", code: "budget_exhausted" });
+      for (const partial of ["days", "aggregates", "binding", "nextSlackCursor", "slackComplete"]) expect(failure).not.toHaveProperty(partial);
+      if (name.startsWith("load")) expect(signal?.aborted, "the abandoned loader was told to stop").toBe(true);
+      expect(clock.timers.filter((t) => !t.cancelled && !t.fired), "no deadline is left armed").toEqual([]);
+
+      // The transaction was rolled back and its connection released although the work never returned.
+      expect(await openTransactionsSettleToZero()).toBe(0);
+      // Abandoned work finishing late changes nothing and poisons nothing.
+      pending.finishLate();
+      expect((await idle(run)).state).toBe("rejected");
+      expect(run.state()).toBe(after);
+      s.w.mono = 0;
+      expect((await page(s.w)).aggregates).toHaveLength(1);
+    } finally {
+      // Whatever happened above — an early failure, a failed assertion, or success — nothing this
+      // test started is left running: the budget is spent, every armed deadline is fired down, the
+      // held work is released, and the run is given a bounded number of round trips to settle.
+      s.w.mono = 1_000 + 30_001;
+      clock.fireAll();
+      pending.finishLate();
+      await settlesWithin(run);
+      for (const t of clock.timers) t.cancelled = true;
     }
-    if (name.startsWith("load")) {
-      expect(signal, "the loader was handed an AbortSignal").toBeInstanceOf(AbortSignal);
-      expect(signal?.aborted).toBe(false);
-    }
-
-    // The monotonic clock passes the budget and the deadline fires. The work is STILL pending.
-    s.w.mono = 1_000 + 30_001;
-    clock.fireAll();
-    const after = await failureOf(() => run);
-    expect(after).toMatchObject({ name: "SlackTimelineError", code: "budget_exhausted" });
-    for (const partial of ["days", "aggregates", "binding", "nextSlackCursor", "slackComplete"]) expect(after).not.toHaveProperty(partial);
-    if (name.startsWith("load")) expect(signal?.aborted, "the abandoned loader was told to stop").toBe(true);
-    expect(clock.timers.filter((t) => !t.cancelled && !t.fired), "no deadline is left armed").toEqual([]);
-
-    // The transaction was rolled back and its connection released although the work never returned.
-    expect(await openTransactionsSettleToZero()).toBe(0);
-    // Abandoned work finishing late changes nothing and poisons nothing.
-    pending.finishLate();
-    expect((await settled(run)).state).toBe("rejected");
-    s.w.mono = 0;
-    expect((await page(s.w)).aggregates).toHaveLength(1);
   });
 
   it("cancels its deadlines and aborts nothing on a page that completes normally", async () => {
