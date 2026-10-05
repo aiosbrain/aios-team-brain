@@ -6,6 +6,7 @@ import type { TransactionSession } from "@/lib/db/types";
 import { transactionCapability } from "@/lib/projects/context/transaction";
 import {
   checkpointSlackThread,
+  claimDueSlackThread,
   claimSlackThread,
   enqueueSlackThread,
   releaseSlackThreadForRetry,
@@ -368,6 +369,461 @@ describe("inactive replies staging — resume, fencing and retention", () => {
     expect(requestedCursor).toBeNull();
     expect((await staged(scope))?.messages.map((m) => m.ts)).toEqual([ROOT, replyTwo.ts]);
     expect((await row(scope)).snapshot_generation).toBe("3");
+  });
+});
+
+// AIO-1170 replies transient backoff: five-minute-capped, jittered, driven by the PERSISTED lifetime
+// claim ordinal. Everything here runs the real hydrator, the real `slackReservedRequest`, the real
+// method reservation and the real queue against a stub `fetchImpl`; the sampler is injected through
+// `options.random` so each case names its sample. The application clock chooses `due_at` (bracketed
+// by a reading before and after the call); the DATABASE clock alone decides due-ness and lease
+// expiry, and every temporal transition below is arranged in SQL — no sleeps, no clock bypass.
+describe("inactive replies hydrator — transient backoff on the durable queue (TB-01…TB-08)", () => {
+  const rootMessage = { ts: ROOT, text: "root" };
+  const replyOne = { ts: "1718900001.000200", text: "one" };
+  const replyTwo = { ts: "1718900002.000300", text: "two" };
+  const NEAR_ONE = 1 - 2 ** -53; // the largest double below 1
+  const FIVE_MINUTES = 300_000;
+  const UNKNOWN = "synthetic_unrecognised_provider_text";
+
+  /** A stub provider answer. A string body is sent verbatim, so an exact wire body can be pinned. */
+  const respond = (body: unknown, status = 200): typeof fetch =>
+    (async () => new Response(typeof body === "string" ? body : JSON.stringify(body), { status })) as typeof fetch;
+  const page = (messages: unknown[], hasMore: boolean, nextCursor: string | null = null): typeof fetch =>
+    respond({ ok: true, messages, has_more: hasMore, response_metadata: { next_cursor: nextCursor ?? "" } });
+  const rejecting = (error: Error): typeof fetch => (async () => { throw error; }) as typeof fetch;
+  const mustNotFetch = rejecting(new Error("fixture: this invocation must not reach HTTP"));
+  const input = (teamId: string) => ({ db: db(), teamId, token: "synthetic-test-token",
+    methodScope: { kind: "verified" as const, teamId, workspaceId: WORKSPACE, appId: "A0THREADS" } });
+
+  /** The WHOLE staged row, so "preserved" compares every column — expiry and timestamps included. */
+  async function snapshotRow(scope: SlackThreadScope): Promise<ThreadRow | null> {
+    const c = await sql();
+    const { rows } = await c.query<ThreadRow>(
+      `select * from slack_thread_snapshots where team_id=$1 and workspace_id=$2 and channel_id=$3 and root_ts=$4`,
+      [scope.teamId, scope.workspaceId, scope.channelId, scope.rootTs]
+    );
+    return rows[0] ?? null;
+  }
+  async function freeMethod(teamId: string) {
+    const c = await sql();
+    await c.query(`update slack_method_budgets set next_permitted_at=clock_timestamp()-interval '1 second' where team_id=$1`, [teamId]);
+  }
+  const makeDue = (scope: SlackThreadScope) => setColumn(scope, "due_at", "clock_timestamp() - interval '1 second'");
+  const claimDue = (teamId: string) =>
+    tx((s) => claimDueSlackThread(s, teamId, { leaseMs: LEASE_MS, workspaceId: WORKSPACE }));
+  const instant = (value: unknown): number => new Date(value as string).getTime();
+  const stagedTs = async (scope: SlackThreadScope): Promise<string[] | null> =>
+    ((await snapshotRow(scope))?.messages as { ts: string }[] | undefined)?.map((m) => m.ts) ?? null;
+
+  interface Attempt {
+    result: unknown;
+    /** Application-clock readings around the call: the chosen `due_at` is app-now + delay, between them. */
+    before: number;
+    after: number;
+    http: number;
+    samples: number;
+  }
+
+  /** One real hydrator invocation with a fixed sample, counting HTTP calls and sampler calls. */
+  async function run(teamId: string, fetchImpl: typeof fetch, sample: number, options: Record<string, unknown> = {}): Promise<Attempt> {
+    let http = 0;
+    let samples = 0;
+    const counted = (async (...args: Parameters<typeof fetch>) => { http += 1; return fetchImpl(...args); }) as typeof fetch;
+    const random = (): number => { samples += 1; return sample; };
+    const before = Date.now();
+    const result = await hydrateOneSlackThread(input(teamId), { fetchImpl: counted, random, ...options } as never);
+    return { result, before, after: Date.now(), http, samples };
+  }
+
+  /** `due_at` is exactly app-now + `delayMs` for some app-now inside the bracket. */
+  function expectDue(state: ThreadRow, attempt: Attempt, delayMs: number, label = ""): void {
+    expect(instant(state.due_at), `${label} due_at lower bound`).toBeGreaterThanOrEqual(attempt.before + delayMs);
+    expect(instant(state.due_at), `${label} due_at upper bound`).toBeLessThanOrEqual(attempt.after + delayMs);
+  }
+
+  /** Not due by the DATABASE clock: the stored deadline is ahead of it and no claim path yields work. */
+  async function expectNotYetDue(seed: Seed, scope: SlackThreadScope): Promise<void> {
+    const c = await sql();
+    const { rows } = await c.query<{ pending: boolean }>(
+      `select due_at > clock_timestamp() as pending from slack_sync_threads
+        where team_id=$1 and workspace_id=$2 and channel_id=$3 and root_ts=$4`,
+      [scope.teamId, scope.workspaceId, scope.channelId, scope.rootTs]
+    );
+    expect(rows).toEqual([{ pending: true }]);
+    const untouched = await row(scope);
+    expect(await claimDue(seed.teamId)).toBeNull();
+    expect(await claim(scope)).toBeNull();
+    const idle = await run(seed.teamId, mustNotFetch, 0.5);
+    expect(idle).toMatchObject({ result: { outcome: "idle" }, http: 0, samples: 0 });
+    expect(await row(scope)).toEqual(untouched);
+  }
+
+  // ── TB-01: the real transport matrix ───────────────────────────────────────
+
+  const timeoutError = (): Error => Object.assign(new Error("fixture: the request timed out"), { name: "TimeoutError" });
+  const TRANSIENT: [string, () => typeof fetch, "provider_error" | "transport_error"][] = [
+    ["JSON HTTP 500", () => respond({ ok: false }, 500), "provider_error"],
+    ["JSON HTTP 503", () => respond({ ok: false, error: "service_unavailable" }, 503), "provider_error"],
+    ["JSON HTTP 599", () => respond({ ok: false, error: UNKNOWN }, 599), "provider_error"],
+    ["a 5xx body that claims ok:true", () => respond({ ok: true, messages: [rootMessage], has_more: false }, 502), "provider_error"],
+    ["a 5xx body that carries invalid_auth", () => respond({ ok: false, error: "invalid_auth" }, 500), "provider_error"],
+    ["a non-JSON 5xx", () => respond("<html>bad gateway</html>", 502), "transport_error"],
+    ["a rejected fetch", () => rejecting(new Error("socket closed")), "transport_error"],
+    ["a rejected fetch named TimeoutError", () => rejecting(timeoutError()), "transport_error"],
+    ["HTTP 200 ratelimited", () => respond({ ok: false, error: "ratelimited" }), "provider_error"],
+    ["HTTP 200 internal_error", () => respond({ ok: false, error: "internal_error" }), "provider_error"],
+    ["HTTP 200 service_unavailable", () => respond({ ok: false, error: "service_unavailable" }), "provider_error"],
+    ["HTTP 200 fatal_error", () => respond({ ok: false, error: "fatal_error" }), "provider_error"],
+    ["HTTP 200 request_timeout", () => respond({ ok: false, error: "request_timeout" }), "provider_error"],
+  ];
+
+  it.each(TRANSIENT)("TB-01 %s takes the jittered transient path and stages nothing", async (_name, make, coarse) => {
+    const seed = await seedTeam(); const scope = scopeFor(seed);
+    await enqueue(scope);
+    // First lifetime claim, sample 0.25: 60_000 + floor(0.25 * 60_001) = 75_000 ms — an interior value
+    // that is neither the old deterministic minute, nor the flat five minutes, nor the 24-hour auth hold.
+    const attempt = await run(seed.teamId, make(), 0.25);
+    expect(attempt.http).toBe(1);
+    expect(attempt.result).toEqual({ outcome: "failed", category: coarse });
+    expect(attempt.samples).toBe(1);
+    const state = await row(scope);
+    expect(state).toMatchObject({
+      status: "queued", last_error_code: coarse, attempts: 1, lease_generation: "1",
+      lease_owner: null, lease_expires_at: null, page_cursor: null, snapshot_generation: "0",
+    });
+    expectDue(state, attempt, 75_000);
+    // A transient response never stages a page — not even a 5xx body that says ok:true.
+    expect(await snapshotRow(scope)).toBeNull();
+    await expectNotYetDue(seed, scope);
+  });
+
+  const FLAT: [string, () => typeof fetch][] = [
+    // The exact wire body: ok:false and NO `error` field, so the transport reports `http_499` / `http_404`.
+    ["JSON HTTP 499 with no error field", () => respond('{"ok": false}', 499)],
+    ["JSON HTTP 404 with no error field", () => respond('{"ok": false}', 404)],
+    ["HTTP 200 with an unrecognised error", () => respond({ ok: false, error: UNKNOWN })],
+    ["HTTP 200 channel_not_found", () => respond({ ok: false, error: "channel_not_found" })],
+    ["HTTP 200 thread_not_found", () => respond({ ok: false, error: "thread_not_found" })],
+  ];
+
+  it.each(FLAT)("TB-01 %s keeps the flat five minutes and never samples (negative control)", async (_name, make) => {
+    const seed = await seedTeam(); const scope = scopeFor(seed);
+    await enqueue(scope);
+    const attempt = await run(seed.teamId, make(), 0.25);
+    expect(attempt.http).toBe(1);
+    expect(attempt.result).toEqual({ outcome: "failed", category: "provider_error" });
+    expect(attempt.samples).toBe(0);
+    const state = await row(scope);
+    expect(state).toMatchObject({ status: "queued", last_error_code: "provider_error", attempts: 1, lease_owner: null, page_cursor: null });
+    expectDue(state, attempt, FIVE_MINUTES);
+    expect(await snapshotRow(scope)).toBeNull();
+    // Arbitrary remote text reaches neither the stored nor the returned category.
+    expect(JSON.stringify([attempt.result, state.last_error_code])).not.toContain(UNKNOWN);
+  });
+
+  // ── TB-03: the persisted ordinal ───────────────────────────────────────────
+
+  it("TB-03 takes the ordinal from the claim the database returned, not from how often this process ran", async () => {
+    const seed = await seedTeam(); const scope = scopeFor(seed);
+    // Another actor claims the row once and hands it back, in its own committed transactions, before the
+    // hydrator has ever been invoked for it: stored attempts = 1, in-process hydrator invocations = 0.
+    const earlier = await claimed(scope);
+    expect(await tx((s) => releaseSlackThreadForRetry(s, earlier, { nextDueAt: new Date(Date.now() - 1_000) })))
+      .toMatchObject({ outcome: "released" });
+    expect(await row(scope)).toMatchObject({ status: "queued", attempts: 1, lease_generation: "1" });
+
+    // The hydrator's FIRST invocation is the row's SECOND claim: sample 0 → 120_000, not a first-call 60_000.
+    const first = await run(seed.teamId, respond({ ok: false }, 503), 0);
+    expect(first).toMatchObject({ result: { outcome: "failed", category: "provider_error" }, http: 1, samples: 1 });
+    const second = await row(scope);
+    expect(second).toMatchObject({ status: "queued", attempts: 2, lease_generation: "2", last_error_code: "provider_error", lease_owner: null });
+    expectDue(second, first, 120_000, "second lifetime claim");
+    await expectNotYetDue(seed, scope);
+
+    // Due by the database clock, budget free: the third lifetime claim is at the cap's lower bound.
+    await makeDue(scope); await freeMethod(seed.teamId);
+    const next = await run(seed.teamId, rejecting(new Error("socket closed")), 0);
+    expect(next).toMatchObject({ result: { outcome: "failed", category: "transport_error" }, http: 1, samples: 1 });
+    const third = await row(scope);
+    expect(third).toMatchObject({ status: "queued", attempts: 3, lease_generation: "3", last_error_code: "transport_error", lease_owner: null });
+    expectDue(third, next, 150_000, "third lifetime claim");
+
+    // A different row whose stored ordinal is far past anything this process did: the cap, from the row.
+    const other = await seedTeam(); const otherScope = scopeFor(other);
+    await enqueue(otherScope);
+    await setColumn(otherScope, "attempts", "1000000");
+    const capped = await run(other.teamId, respond({ ok: false, error: "internal_error" }), 0);
+    expect(capped).toMatchObject({ result: { outcome: "failed", category: "provider_error" }, http: 1, samples: 1 });
+    const cappedRow = await row(otherScope);
+    expect(cappedRow).toMatchObject({ status: "queued", attempts: 1_000_001, lease_generation: "1", last_error_code: "provider_error" });
+    expectDue(cappedRow, capped, 150_000, "high stored ordinal");
+  });
+
+  // ── TB-04: partial state and due-ness ──────────────────────────────────────
+
+  it("TB-04 a transient retry from a live partial snapshot preserves the staged page and resumes its cursor", async () => {
+    const seed = await seedTeam(); const scope = scopeFor(seed);
+    await enqueue(scope);
+    expect((await run(seed.teamId, page([rootMessage, replyOne], true, "page-2"), 0.5)).result).toEqual({ outcome: "progressed" });
+    await expireLease(scope); await freeMethod(seed.teamId);
+    const stagedBefore = await snapshotRow(scope);
+    const queueBefore = await row(scope);
+    expect(stagedBefore).toMatchObject({ snapshot_generation: "1", complete: false });
+    expect(queueBefore).toMatchObject({ attempts: 1, page_cursor: "page-2", snapshot_generation: "1" });
+
+    // Second lifetime claim, sample 0.5: 120_000 + floor(0.5 * 120_001) = 180_000.
+    const failure = await run(seed.teamId, respond({ ok: false, error: "fatal_error" }, 503), 0.5);
+    expect(failure).toMatchObject({ result: { outcome: "failed", category: "provider_error" }, http: 1, samples: 1 });
+
+    // The ENTIRE staged row: messages, seen cursors, complete flag, stored bytes, expiry and timestamps.
+    expect(await snapshotRow(scope)).toEqual(stagedBefore);
+    const released = await row(scope);
+    expect(released).toMatchObject({
+      id: queueBefore.id, team_id: scope.teamId, workspace_id: scope.workspaceId, channel_id: scope.channelId, root_ts: scope.rootTs,
+      status: "queued", lease_owner: null, lease_expires_at: null, last_error_code: "provider_error",
+      attempts: 2, page_cursor: "page-2", snapshot_generation: "1",
+    });
+    expect(released.lease_generation).toBe(String(Number(queueBefore.lease_generation) + 1));
+    expect(released.checkpointed_at).toEqual(queueBefore.checkpointed_at);
+    expect(released.created_at).toEqual(queueBefore.created_at);
+    expectDue(released, failure, 180_000);
+    await expectNotYetDue(seed, scope);
+    expect(await snapshotRow(scope)).toEqual(stagedBefore);
+
+    // Due by the database clock: the continuation sends the RETAINED cursor and assembles the whole body.
+    await makeDue(scope); await freeMethod(seed.teamId);
+    let requestedCursor: string | null = "unset";
+    const continuation = (async (url: string) => { requestedCursor = new URL(url).searchParams.get("cursor");
+      return page([replyOne, replyTwo], false)(url); }) as typeof fetch;
+    expect((await run(seed.teamId, continuation, 0.5)).result).toEqual({ outcome: "progressed" });
+    expect(requestedCursor).toBe("page-2");
+    expect(await stagedTs(scope)).toEqual([ROOT, replyOne.ts, replyTwo.ts]);
+    expect(await snapshotRow(scope)).toMatchObject({ complete: true, snapshot_generation: "2" });
+    expect(await row(scope)).toMatchObject({ attempts: 3, page_cursor: null, snapshot_generation: "2" });
+  });
+
+  // ── TB-05: the hydrator's own fence on the transient path ──────────────────
+
+  it("TB-05 a lease that expires before the transient release is refused, and the row is left exactly as it was", async () => {
+    const seed = await seedTeam(); const scope = scopeFor(seed);
+    await enqueue(scope);
+    let captured: ThreadRow | null = null;
+    const expiresDuringFetch = (async () => {
+      await expireLease(scope);
+      captured = await row(scope);
+      return new Response(JSON.stringify({ ok: false }), { status: 503 });
+    }) as typeof fetch;
+    const attempt = await run(seed.teamId, expiresDuringFetch, 0.5);
+    // Never `failed`: an expired claim has no authority to postpone or requeue anything.
+    expect(attempt.result).toEqual({ outcome: "refused", category: "stale_lease" });
+    expect(attempt.http).toBe(1);
+    expect(attempt.samples).toBe(1);
+    expect(captured).toMatchObject({ status: "running", attempts: 1, lease_generation: "1", last_error_code: null });
+    expect(await row(scope)).toEqual(captured);
+    expect(await snapshotRow(scope)).toBeNull();
+  });
+
+  it("TB-05 a replaced lease cannot be postponed or released by the stale hydrator's transient retry", async () => {
+    const seed = await seedTeam(); const scope = scopeFor(seed);
+    await enqueue(scope);
+    expect((await run(seed.teamId, page([rootMessage, replyOne], true, "page-2"), 0.5)).result).toEqual({ outcome: "progressed" });
+    await expireLease(scope); await freeMethod(seed.teamId);
+
+    let replacement: SlackThreadClaim | null = null;
+    let capturedQueue: ThreadRow | null = null;
+    let capturedStaged: ThreadRow | null = null;
+    const replacedDuringFetch = (async () => {
+      await expireLease(scope);
+      replacement = await claim(scope); // another worker, in its own committed transaction
+      capturedQueue = await row(scope);
+      capturedStaged = await snapshotRow(scope);
+      return new Response(JSON.stringify({ ok: false, error: "service_unavailable" }), { status: 503 });
+    }) as typeof fetch;
+    const attempt = await run(seed.teamId, replacedDuringFetch, 0.5);
+    expect(attempt.result).toEqual({ outcome: "refused", category: "stale_lease" });
+    expect(attempt.http).toBe(1);
+    expect(attempt.samples).toBe(1);
+
+    expect(replacement).not.toBeNull();
+    const live = replacement as unknown as SlackThreadClaim;
+    expect(capturedQueue).toMatchObject({
+      status: "running", lease_owner: live.leaseOwner, lease_generation: String(live.leaseGeneration),
+      attempts: 3, page_cursor: "page-2", snapshot_generation: "1", last_error_code: null,
+    });
+    // Whole rows: due_at, category, owner, fence, attempts, cursor, generation, status and timestamps.
+    expect(await row(scope)).toEqual(capturedQueue);
+    expect(await snapshotRow(scope)).toEqual(capturedStaged);
+    // The replacement's authority is intact: it can still read its staged page under its own fence.
+    expect((await tx((s) => readSlackThreadSnapshot(s, live)))?.messages.map((m) => m.ts)).toEqual([ROOT, replyOne.ts]);
+  });
+
+  // ── TB-06: preservation controls on the real transport ─────────────────────
+
+  it("TB-06 a provider cooldown, an auth refusal, a budget deferral, success and idle never consult the sampler", async () => {
+    // 429 with a ten-minute Retry-After: the provider deadline wins over the five-minute transient cap.
+    const limited = await seedTeam(); const limitedScope = scopeFor(limited);
+    await enqueue(limitedScope);
+    const cooled = await run(limited.teamId, (async () => new Response("rate limited", { status: 429, headers: { "retry-after": "600" } })) as typeof fetch, 0);
+    expect(cooled).toMatchObject({ result: { outcome: "deferred", category: "rate_limited" }, http: 1, samples: 0 });
+    const cooledRow = await row(limitedScope);
+    expect(cooledRow).toMatchObject({ status: "queued", last_error_code: "rate_limited" });
+    expect(instant(cooledRow.due_at) - cooled.before).toBeGreaterThan(590_000);
+
+    // A credential refusal keeps the 24-hour hold.
+    const refused = await seedTeam(); const refusedScope = scopeFor(refused);
+    await enqueue(refusedScope);
+    const auth = await run(refused.teamId, respond({ ok: false, error: "invalid_auth" }), 0);
+    expect(auth).toMatchObject({ result: { outcome: "failed", category: "auth_error" }, http: 1, samples: 0 });
+    expect(instant((await row(refusedScope)).due_at) - auth.before).toBeGreaterThanOrEqual(24 * 60 * 60_000);
+
+    // Success, then a budget deferral (zero HTTP) released at the reservation's own deadline, then idle.
+    const seed = await seedTeam(); const scope = scopeFor(seed);
+    await enqueue(scope);
+    const progressed = await run(seed.teamId, page([rootMessage], true, "page-2"), 0);
+    expect(progressed).toMatchObject({ result: { outcome: "progressed" }, http: 1, samples: 0 });
+    await expireLease(scope);
+    const deferred = await run(seed.teamId, mustNotFetch, 0);
+    expect(deferred).toMatchObject({ result: { outcome: "deferred", category: "deferred" }, http: 0, samples: 0 });
+    expect(await row(scope)).toMatchObject({ status: "queued", last_error_code: "deferred", page_cursor: "page-2", attempts: 2 });
+    const idle = await run(seed.teamId, mustNotFetch, 0);
+    expect(idle).toMatchObject({ result: { outcome: "idle" }, http: 0, samples: 0 });
+  });
+
+  // ── TB-07: an invalid sample ───────────────────────────────────────────────
+
+  it("TB-07 an invalid sample throws before any release: the claimed row stays exactly as it was after the claim", async () => {
+    const seed = await seedTeam(); const scope = scopeFor(seed);
+    await enqueue(scope);
+    // No cursor and no staging, so nothing is restarted: the only writes before HTTP are the claim itself
+    // and the method reservation. The row captured inside `fetchImpl` is therefore the post-claim row.
+    let postClaim: ThreadRow | null = null;
+    let http = 0;
+    let samples = 0;
+    const transient = (async () => {
+      http += 1;
+      postClaim = await row(scope);
+      return new Response(JSON.stringify({ ok: false }), { status: 503 });
+    }) as typeof fetch;
+    const random = (): number => { samples += 1; return Number.NaN; };
+    await expect(hydrateOneSlackThread(input(seed.teamId), { fetchImpl: transient, random } as never))
+      .rejects.toBeInstanceOf(TypeError);
+    expect(http).toBe(1);
+    expect(samples).toBe(1);
+
+    expect(postClaim).toMatchObject({ status: "running", attempts: 1, lease_generation: "1", last_error_code: null, page_cursor: null });
+    expect((postClaim as unknown as ThreadRow).lease_owner).toEqual(expect.any(String));
+    // Byte for byte: no release, no postponement, no error code, no cleanup.
+    expect(await row(scope)).toEqual(postClaim);
+    expect(await snapshotRow(scope)).toBeNull();
+
+    // The method reservation it consumed is not refunded.
+    const c = await sql();
+    const budget = await c.query<{ held: boolean }>(
+      `select next_permitted_at > clock_timestamp() as held from slack_method_budgets where team_id=$1`, [seed.teamId]);
+    expect(budget.rows.length).toBeGreaterThanOrEqual(1);
+    expect(budget.rows.every((r) => r.held)).toBe(true);
+
+    // The lease is still live, so nobody else can take the row…
+    expect(await claim(scope)).toBeNull();
+    expect(await claimDue(seed.teamId)).toBeNull();
+    expect(await row(scope)).toEqual(postClaim);
+    // …until it expires, by the database clock, through the ordinary reclaim path.
+    await expireLease(scope);
+    const reclaimed = await claim(scope);
+    expect(reclaimed).not.toBeNull();
+    expect(reclaimed?.leaseOwner).not.toBe((postClaim as unknown as ThreadRow).lease_owner);
+    expect(reclaimed).toMatchObject({ leaseGeneration: 2, attempts: 2, pageCursor: null, snapshotGeneration: 0 });
+  });
+
+  // ── TB-08: the five-minute cap against the snapshot TTL ────────────────────
+
+  it("TB-08 a high lifetime ordinal still retries within five minutes, so fresh staging outlives the retry", async () => {
+    const seed = await seedTeam(); const scope = scopeFor(seed);
+    await enqueue(scope);
+    expect((await run(seed.teamId, page([rootMessage, replyOne], true, "page-2"), 0.5)).result).toEqual({ outcome: "progressed" });
+    // Forty lifetime claims of routine pagination and budget deferrals — none of them a transient failure.
+    await setColumn(scope, "attempts", "40");
+    await expireLease(scope); await freeMethod(seed.teamId);
+    const stagedBefore = await snapshotRow(scope);
+
+    // The top of the sampler's range at the cap: exactly five minutes, never the old 30–60 minutes.
+    const failure = await run(seed.teamId, rejecting(new Error("socket closed")), NEAR_ONE);
+    expect(failure).toMatchObject({ result: { outcome: "failed", category: "transport_error" }, http: 1, samples: 1 });
+    const released = await row(scope);
+    expect(released).toMatchObject({ status: "queued", attempts: 41, last_error_code: "transport_error", page_cursor: "page-2", snapshot_generation: "1" });
+    expectDue(released, failure, FIVE_MINUTES);
+    // No TTL renewal on failure, and — before any temporal fixture SQL — the retry lands inside the TTL.
+    const stagedAfter = await snapshotRow(scope);
+    expect(stagedAfter).toEqual(stagedBefore);
+    expect(instant(released.due_at)).toBeLessThan(instant(stagedAfter?.expires_at));
+    await expectNotYetDue(seed, scope);
+
+    // Still live when the retry comes due: resume from the stored cursor, complete the body.
+    await makeDue(scope); await freeMethod(seed.teamId);
+    let requestedCursor: string | null = "unset";
+    const continuation = (async (url: string) => { requestedCursor = new URL(url).searchParams.get("cursor");
+      return page([replyTwo], false)(url); }) as typeof fetch;
+    expect((await run(seed.teamId, continuation, 0.5)).result).toEqual({ outcome: "progressed" });
+    expect(requestedCursor).toBe("page-2");
+    expect(await stagedTs(scope)).toEqual([ROOT, replyOne.ts, replyTwo.ts]);
+    expect(await snapshotRow(scope)).toMatchObject({ complete: true });
+  });
+
+  it("TB-08 staging that expires before the retry is due restarts safely at page one, with no resurrected messages", async () => {
+    const seed = await seedTeam(); const scope = scopeFor(seed);
+    await enqueue(scope);
+    const expiredReply = { ts: "1718900009.000900", text: "staged before expiry" };
+    const freshOne = { ts: "1718900011.000100", text: "fresh one" };
+    const freshTwo = { ts: "1718900012.000200", text: "fresh two" };
+    // Near-expiry staging: a thirty-second TTL, far shorter than any transient retry.
+    expect((await run(seed.teamId, page([rootMessage, expiredReply], true, "old-2"), 0.5, { snapshotTtlMs: 30_000 })).result)
+      .toEqual({ outcome: "progressed" });
+    await expireLease(scope); await freeMethod(seed.teamId);
+    const stagedBefore = await snapshotRow(scope);
+
+    // Second lifetime claim, sample 0: 120_000 ms.
+    const failure = await run(seed.teamId, respond({ ok: false }, 500), 0, { snapshotTtlMs: 30_000 });
+    expect(failure).toMatchObject({ result: { outcome: "failed", category: "provider_error" }, http: 1, samples: 1 });
+    const released = await row(scope);
+    expect(released).toMatchObject({ status: "queued", attempts: 2, page_cursor: "old-2", snapshot_generation: "1", last_error_code: "provider_error" });
+    expectDue(released, failure, 120_000);
+    // The failure did not renew the TTL, and — before any temporal fixture SQL — staging expires first.
+    const stagedAfter = await snapshotRow(scope);
+    expect(stagedAfter).toEqual(stagedBefore);
+    expect(instant(stagedAfter?.expires_at)).toBeLessThan(instant(released.due_at));
+
+    // Both transitions arranged in SQL: the staging has expired AND the retry is due.
+    const c = await sql();
+    await c.query(`update slack_thread_snapshots set expires_at=clock_timestamp()-interval '1 second' where team_id=$1`, [seed.teamId]);
+    await makeDue(scope); await freeMethod(seed.teamId);
+    let requestedCursor: string | null = "unset";
+    const freshFirstPage = (async (url: string) => { requestedCursor = new URL(url).searchParams.get("cursor");
+      return page([rootMessage, freshOne], true, "fresh-2")(url); }) as typeof fetch;
+    expect((await run(seed.teamId, freshFirstPage, 0.5)).result).toEqual({ outcome: "progressed" });
+    // Page one again, under a new generation, holding exactly the fresh page.
+    expect(requestedCursor).toBeNull();
+    const restarted = await snapshotRow(scope);
+    expect(Number(restarted?.snapshot_generation)).toBeGreaterThan(1);
+    expect(restarted).toMatchObject({ complete: false });
+    expect(await stagedTs(scope)).toEqual([ROOT, freshOne.ts]);
+    // The root is still pending — not lost, not completed, not published.
+    const pending = await row(scope);
+    expect(pending).toMatchObject({ status: "running", attempts: 3, page_cursor: "fresh-2", snapshot_generation: restarted?.snapshot_generation });
+    expect(await rowCount(seed.teamId)).toBe(1);
+    const published = await c.query<{ n: string }>(`select count(*)::text as n from items where team_id=$1`, [seed.teamId]);
+    expect(published.rows[0].n).toBe("0");
+
+    // The terminal continuation completes the FRESH body: root and fresh replies, nothing from the expired stage.
+    await expireLease(scope); await freeMethod(seed.teamId);
+    const terminal = (async (url: string) => { requestedCursor = new URL(url).searchParams.get("cursor");
+      return page([freshTwo], false)(url); }) as typeof fetch;
+    expect((await run(seed.teamId, terminal, 0.5)).result).toEqual({ outcome: "progressed" });
+    expect(requestedCursor).toBe("fresh-2");
+    expect(await stagedTs(scope)).toEqual([ROOT, freshOne.ts, freshTwo.ts]);
+    expect(await stagedTs(scope)).not.toContain(expiredReply.ts);
+    expect(await snapshotRow(scope)).toMatchObject({ complete: true });
+    expect(await rowCount(seed.teamId)).toBe(1);
   });
 });
 
