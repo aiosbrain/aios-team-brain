@@ -1158,8 +1158,36 @@ describe("slack repair census: stored source, queue and gate observations (real 
     expect(open).toMatchObject({ applyReady: false, historicalCensusComplete: false });
     expect(entryOf(open, id(1))).toMatchObject({ relationship: "channel_candidate", provenance: "unproven" });
 
-    // Storable (the CHECK counts workspaces, it does not read them) and not reportable.
-    await committed(ready, [seed.teamId, CHANNEL, ["not a workspace!"], repair]);
+    // A ready row the schema ACCEPTS and the decoder must not report. Every CHECK holds — the two
+    // revisions agree, the workspaces are provider ids, the repair id is set, no blocking reason — but
+    // the revision is 2^53 + 1, which no JavaScript number holds: reading it would silently report a
+    // different revision. (A malformed workspace id is not storable here: the table's
+    // `slack_channel_migration_gates_workspace_syntax` CHECK refuses it, so that arm of the codec is
+    // pinned on the pure decoder instead.)
+    const UNSAFE_REVISION = "9007199254740993";
+    expect(Number.isSafeInteger(Number(UNSAFE_REVISION)), "fixture: the revision is past the safe range").toBe(false);
+    expect(
+      await committed(
+        `update slack_channel_migration_gates
+            set revision = $3::bigint, ready_revision = $3::bigint
+          where team_id = $1 and raw_channel_id = $2 and state = 'ready'`,
+        [seed.teamId, CHANNEL, UNSAFE_REVISION]
+      ),
+      "fixture: the corrupt-for-decoder gate was stored"
+    ).toBe(1);
+    const storedGate = await (await rawSql()).query(
+      `select state, revision::text as revision, ready_revision::text as ready_revision, resolved_workspace_ids
+         from slack_channel_migration_gates where team_id = $1 and raw_channel_id = $2`,
+      [seed.teamId, CHANNEL]
+    );
+    expect(storedGate.rows).toEqual([
+      {
+        state: "ready",
+        revision: UNSAFE_REVISION,
+        ready_revision: UNSAFE_REVISION,
+        resolved_workspace_ids: [WORKSPACE, "T0SECOND"],
+      },
+    ]);
     const before = await tables();
     const failure = await read({ scope }).then(
       (value) => ({ returned: value }),
@@ -1167,7 +1195,11 @@ describe("slack repair census: stored source, queue and gate observations (real 
     );
     expect(failure).not.toHaveProperty("returned");
     expect((failure as { error: Loose }).error).toBeInstanceOf(Error);
-    expect(String((failure as { error: Loose }).error.message)).not.toContain("not a workspace!");
+    // The stored value that failed the codec is not quoted — neither exactly nor as its rounded float.
+    const message = String((failure as { error: Loose }).error.message);
+    expect(message).not.toContain(UNSAFE_REVISION);
+    expect(message).not.toContain(String(Number(UNSAFE_REVISION)));
+    expect(message).not.toMatch(/[0-9]{6,}/);
     expect(await tables()).toEqual(before);
   });
 });
