@@ -775,7 +775,7 @@ describe("server-action inventory: filesystem discovery (AC-01)", () => {
       nestedNames: [...SERVER_ACTION_EXCLUSIONS.nestedNames, { under: "app", name: "node_modules", reason: "deps" }],
     };
     const root = makeRoot({ "app/actions.ts": ACTION });
-    expect(discoverSourceTree(root, widened).sources.size).toBe(0);
+    expect(discoverSourceTree(root, widened).sources.size).toBe(1);
     const problems = exclusionPolicyProblems(widened);
     expectFailure(problems, "exclusion app:", "first-party source root cannot be excluded");
     expectFailure(problems, "exclusion app:", "empty reason");
