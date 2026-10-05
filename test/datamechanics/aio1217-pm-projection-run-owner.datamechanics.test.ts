@@ -28,6 +28,8 @@ import { db, seedTeam, type Seed } from "./helpers";
  *   4 — OBSERVED: the delegated writer's caps on the stored error lines.
  *   5 — no reports: with a provider, without one, and without one WITH a reason.
  *   6 — two teams and one team-less run: each row holds the team id it was handed; readers per team.
+ *   7 — OBSERVED: a SUPPLIED `no_primary_provider` report, in the shape `projectTask` returns one.
+ *   8 — three runs stored in an order that is not their finish order: what the readers then answer.
  *   Z — what this file does not supply, as executable TODOs naming the owner.
  *
  * What is real, and never mocked: the owner, the roll-up, the `ingest_runs` writer, the two readers
@@ -41,7 +43,10 @@ import { db, seedTeam, type Seed } from "./helpers";
  * `ProjectionReport` — row key, provider, status, provider resource id, error — written out by this
  * file and handed to the owner as its callers hand theirs. The two instants of a run are the test's
  * own too, so `started_at`, `finished_at` and `duration_ms` are compared exactly; case 1 also hands a
- * start and no finish, as the owner's callers in app/, lib/ and scripts/ do today.
+ * start and no finish, as the owner's callers in app/, lib/ and scripts/ do today. Case 7's one report
+ * differs in shape only: it is written as `lib/pm-sync/project.ts#projectTask` returns a report for an
+ * unresolved primary — no provider, no provider resource id key, the resolution's reason as its error —
+ * and is as much this file's own input as every other.
  *
  * NOTHING HERE IS A CREDENTIAL. No integration row, secret, token or provider account is created or
  * read; `provider` is a label on the input. Row keys, resource ids and error texts are fixed synthetic
@@ -60,13 +65,21 @@ import { db, seedTeam, type Seed } from "./helpers";
  *     `resolvePrimaryProvider`, `reconcileProviderState`, the Plane and Linear adapters, their network
  *     and every `task_pm_links` write are other owners and are not exercised. The empty difference of
  *     `tasks` and `task_pm_links` is this call's: it says the run log writes neither, and nothing
- *     about the owners that do.
- *   - CASES 3, 4 AND PART OF 5 ARE OBSERVATIONS. A not-ok run with no error line, a run turned not-ok
- *     by a line on a row that did not fail, the caps of 25 lines and 500 characters, and an empty
- *     report set recorded `ok` are recorded as the source has them. None is declared correct.
- *   - THE READERS ARE READ, NOT EVIDENCED. `listRecentProjectionRuns` and `getProjectionHealth` are
- *     called as the owner's consumers and reduced to run ids and the health status. Staleness, the
- *     backstop probe, `ageMs`, the Admin panels and `GET /api/v1/pm-sync/health` are not claimed.
+ *     about the owners that do. Case 7 SUPPLIES a `no_primary_provider` report; it is not a run of
+ *     `projectTask` or of provider resolution, and says nothing of whether, when or through which
+ *     caller such a report reaches the owner.
+ *   - CASES 3, 4, 7 AND PART OF 5 ARE OBSERVATIONS. A not-ok run with no error line, a run turned
+ *     not-ok by a line on a row that did not fail, the caps of 25 lines and 500 characters, an empty
+ *     report set recorded `ok`, and a `no_primary_provider` row counted `unchanged` yet stored not-ok
+ *     by its line are recorded as the source has them. None is declared correct.
+ *   - THE READERS ARE EVIDENCED ONLY AS ASSERTED. `listRecentProjectionRuns` and `getProjectionHealth`
+ *     are called as the owner's consumers and reduced to run ids and the health status. Evidenced of
+ *     them is what a case explicitly asserts and no more: which run ids each answers for the team id
+ *     it is handed and in what order (the other team's and the team-less run absent where cases 1, 2,
+ *     5, 6 and 7 assert it; newest `finished_at` first where case 8 does), and the statuses
+ *     `never_run`, `ok` and `failed` where one is asserted. Every run here is a `pm_sync` row, so the
+ *     `source` filter is not evidenced; nor are `stale`, the 24-hour rule, the backstop probe,
+ *     `ageMs`, the list limit, the Admin panels and `GET /api/v1/pm-sync/health`.
  *   - ONLY THE WRITE'S SUCCESS IS OBSERVED. The writer is best-effort and never throws; an insert
  *     Postgres refuses would show here as a missing row. No write failure is exercised.
  *   - `ingest_runs` is not in the tier's truncate list; it is emptied before each test by the
@@ -74,9 +87,13 @@ import { db, seedTeam, type Seed } from "./helpers";
  *   - Nothing about API keys. AIO-1226 and the zero-row revoke residual are other files' and are
  *     neither touched nor supplied here.
  *
- * Run status at authoring: NOT RUN. This file was written without executing vitest, tsc or any other
- * command. Its expectations come from reading the sources above, not from an observed run; replace
- * this paragraph with the observed result once it has been executed.
+ * Run status. RECORDED FOR THE STAGE AT `f8c81fbf`, before cases 7 and 8 existed: 13 PASS / 18 TODO
+ * combined for that stage, of which this file 6 PASS / 10 TODO; lint PASS. Those figures are that
+ * commit's, carried here as recorded and not re-observed. THIS REVISION IS NOT RUN: cases 7 and 8 and
+ * the prose revised with them were written without executing vitest, tsc, lint or any other command,
+ * and their expectations come from reading the sources above, not from an observed run. The recorded
+ * figures cover neither new case; replace this paragraph with the observed result once this revision
+ * has been executed.
  */
 
 const FIXTURE = "FIXTURE PREMISE FAILED (setup, not an owner observation):";
@@ -90,7 +107,10 @@ const ROOMY = 30_000;
 /** The prefix of every synthetic provider resource id a report carries; no stored row may hold it. */
 const RESOURCE = "aio1217-synthetic-issue";
 
-/** The one reason text this file hands the owner: `resolvePrimaryProvider`'s own, used as a label. */
+/**
+ * The one resolution reason this file uses, as case 5's `reason` and as case 7's report error:
+ * `resolvePrimaryProvider`'s own text, used as a label.
+ */
 const NO_PROVIDER_REASON = "no enabled PM integration";
 
 interface World {
@@ -389,7 +409,7 @@ describe("AIO-1217 native PM projection-run owner — lib/pm-sync/runs recordPro
   );
 
   it(
-    "2 — a report set containing failing rows: after an ok control of the same set without them, one synced, one skipped and one each of failed, missing_integration, missing_parent and cycle — each failing row carrying an error text — is stored as exactly one row with `ok: false`, `created: 1`, `unchanged: 1`, `error_count: 4`, the four lines `<row key>: <error>` in report order, and `meta` counting every status; the control row is not rewritten; team A's readers then answer `failed` naming that run, with the control listed beneath it",
+    "2 — a report set containing failing rows: after an ok control of the same set without them, one synced, one skipped and one each of failed, missing_integration, missing_parent and cycle — each failing row carrying an error text — is stored as exactly one row with `ok: false`, `created: 1`, `unchanged: 1`, `error_count: 4`, the four lines `<row key>: <error>` in report order, and `meta` counting each of the six statuses SUPPLIED (supplied-status coverage: six of the nine a report can carry, not every status, and no projection chose them); the control row is not rewritten; team A's readers then answer `failed` naming that run, with the control listed beneath it",
     async () => {
       const world = await seedWorld();
 
@@ -746,12 +766,127 @@ describe("AIO-1217 native PM projection-run owner — lib/pm-sync/runs recordPro
     },
     ROOMY,
   );
+
+  it(
+    "7 — OBSERVED, a SUPPLIED report and not a projection: one synthetic `no_primary_provider` report written in the shape `projectTask` returns for an unresolved primary (`provider: null`, no provider resource id key, the reason `no enabled PM integration` as its error), handed with `provider: null` and NO reason, is stored as exactly one row `ok: false`, `created: 0`, `unchanged: 1`, `error_count: 1` with the one line `<row key>: <error>`, and `meta` of the null provider and `no_primary_provider: 1` — counted `unchanged`, not failed, and not-ok by its line alone; team A's readers answer `failed` naming it, team B's none (no `projectTask`, provider resolution, action wire, session, audit or caller composition is executed)",
+    async () => {
+      const world = await seedWorld();
+
+      // Written out here in the shape `projectTask` returns it: no `providerResourceId` key at all.
+      const unresolved: ProjectionReport = {
+        row_key: key(0),
+        provider: null,
+        status: "no_primary_provider",
+        error: NO_PROVIDER_REASON,
+      };
+
+      const at = ranAt(60_000, 300);
+      const seen = await observe({
+        teamId: world.a.teamId,
+        provider: null,
+        trigger: "api",
+        reports: [unresolved],
+        ...at,
+      });
+
+      // The roll-up counts no failure and one unchanged row; the writer derives `ok` to false from the line.
+      expect(seenOf(seen)).toEqual(
+        recorded(
+          runRow(world.a.teamId, {
+            trigger: "api",
+            ok: false,
+            created: 0,
+            unchanged: 1,
+            errors: [`AIO1217-P0: ${NO_PROVIDER_REASON}`],
+            meta: { provider: null, no_primary_provider: 1 },
+            at,
+          }),
+        ),
+      );
+
+      expect({ a: await read(world.a), b: await read(world.b) }).toEqual({
+        a: { listed: [idOf(seen)], health: "failed", lastRun: idOf(seen) },
+        b: NEVER_RUN,
+      });
+    },
+    ROOMY,
+  );
+
+  it(
+    "8 — three runs for team A stored in an order that is NOT their finish order — first the oldest finish, then the newest finish (a failed run, and the earliest START of the three), last the middle finish (an ok run): read back raw, the three ids stand in insertion order; team A's readers answer newest `finished_at` first — the run stored second, the run stored last, the run stored first — and `failed` naming the newest-finished run, not the ok run stored last (the instants are the test's own, a minute apart: no sleep, no staleness, no backstop, no route)",
+    async () => {
+      const world = await seedWorld();
+      premise("ingest_runs starts empty", await runsByTeam(), []);
+      const oneSynced = { ok: true, created: 1, unchanged: 0, errors: [], meta: { provider: "linear", synced: 1 } };
+
+      const oldestAt = ranAt(180_000, 2_000);
+      const oldest = await observe({
+        teamId: world.a.teamId,
+        provider: "linear",
+        trigger: "manual",
+        reports: [wrote(0, "linear")],
+        ...oldestAt,
+      });
+      expect(seenOf(oldest), "stored first: the oldest finish").toEqual(
+        recorded(runRow(world.a.teamId, { trigger: "manual", ...oneSynced, at: oldestAt })),
+      );
+
+      // Ten minutes long: the newest finish and the earliest start, so start order is not finish order either.
+      const newestAt = ranAt(60_000, 600_000);
+      const newest = await observe({
+        teamId: world.a.teamId,
+        provider: "linear",
+        trigger: "api",
+        reports: [failing(1, "linear", "failed", "aio1217 synthetic provider refusal")],
+        ...newestAt,
+      });
+      expect(seenOf(newest), "stored second: the newest finish, a failed run").toEqual(
+        recorded(
+          runRow(world.a.teamId, {
+            trigger: "api",
+            ok: false,
+            created: 0,
+            unchanged: 0,
+            errors: ["AIO1217-P1: aio1217 synthetic provider refusal"],
+            meta: { provider: "linear", failed: 1 },
+            at: newestAt,
+          }),
+        ),
+      );
+
+      const middleAt = ranAt(120_000, 1_000);
+      const middle = await observe({
+        teamId: world.a.teamId,
+        provider: "linear",
+        trigger: "cli",
+        reports: [wrote(2, "linear")],
+        ...middleAt,
+      });
+      expect(seenOf(middle), "stored last: the middle finish").toEqual(
+        recorded(runRow(world.a.teamId, { trigger: "cli", ...oneSynced, at: middleAt })),
+      );
+
+      premise(
+        "the runs stand in insertion order: oldest finish, newest finish, middle finish",
+        await runsByTeam(),
+        [oldest, newest, middle].map((seen) => ({ id: idOf(seen), team_id: world.a.teamId })),
+      );
+
+      // By id or by start the ok run stored last would lead; by `finished_at` the failed run does.
+      expect(await read(world.a)).toEqual({
+        listed: [idOf(newest), idOf(middle), idOf(oldest)],
+        health: "failed",
+        lastRun: idOf(newest),
+      });
+    },
+    ROOMY,
+  );
 });
 
 // Each TODO names the owner of evidence this slice was told not to supply.
 describe("Z — evidence this file does NOT supply (executable TODOs: none is run, none is passed)", () => {
   it.todo(
-    "NATIVE PROJECT OWNER · projectAllTasks, projectTask, projectRows and resolvePrimaryProvider — primary-provider resolution, the decrypting integrations read, the Plane and Linear adapters, their network, the task_pm_links writes and the reports they produce — are a different owner; every report here is a synthetic input written by this file, and no projection, provider or link is executed",
+    "NATIVE PROJECT OWNER · projectAllTasks, projectTask, projectRows and resolvePrimaryProvider — primary-provider resolution, the decrypting integrations read, the Plane and Linear adapters, their network, the task_pm_links writes and the reports they produce — are a different owner; every report here is a synthetic input written by this file — case 7's `no_primary_provider` report included, which copies the shape projectTask returns for an unresolved primary and is not returned by it — and no projection, provider resolution, provider or link is executed",
   );
   it.todo(
     "NATIVE RECONCILE OWNER · reconcileProviderState — the provider's current state, `provider_seen_status`, the divergence rows and their provider reads — is a different owner and is not called by this file",
@@ -760,22 +895,22 @@ describe("Z — evidence this file does NOT supply (executable TODOs: none is ru
     "ACTION AND GUARD WIRE · requireTeamAdmin admission and denial, the `team.project_board` and `team.reconcile_divergence` audit rows, revalidation and the action wire of app/t/[team]/admin/pm-sync/actions.ts#projectBoardAction and #reconcileDivergenceAction are aio1217-admin-guard-association.datamechanics.test.ts's evidence; this file calls the lib owner directly and proves nothing about the wrappers, the session, posture or the admin page that renders the runs",
   );
   it.todo(
-    "CALLER COMPOSITION · how projectBoardAction, lib/pm-sync/after-write.ts, app/actions/meeting-todos.ts and scripts/brain-tasks.ts compose the provider, reports, reason and trigger they hand the owner — including a reason withheld when a provider is known — is not exercised; cases 3 and 5 record what the owner stores for an input, not that any caller produces it",
+    "CALLER COMPOSITION · how projectBoardAction, lib/pm-sync/after-write.ts, app/actions/meeting-todos.ts and scripts/brain-tasks.ts compose the provider, reports, reason and trigger they hand the owner — including a reason withheld when a provider is known — is not exercised; cases 3, 5 and 7 record what the owner stores for an input, not that any caller produces it — case 7's input is written in the form lib/pm-sync/after-write.ts#projectTaskByIdAfterWrite is read to hand a lone report (the report's own provider, trigger `api`, no reason), with a finish instant of the test's own, and neither that caller nor any other is executed",
   );
   it.todo(
     "WRITE FAILURE · recordIngestRun is best-effort and never throws; a team id that does not exist, a refused insert and a failing client are not reached by this file, and whether a run that could not be recorded should stay silent is not specified by any source it reads",
   );
   it.todo(
-    "OBSERVED DERIVATIONS · a not-ok run with no error line, a run turned not-ok by a line on a row that did not fail, the 25-line and 500-character caps that let `error_count` fall below the failed rows, and an empty report set stored `ok: true` (cases 3, 4 and 5) are recorded as observed; no contract for any of them is declared here",
+    "OBSERVED DERIVATIONS · a not-ok run with no error line, a run turned not-ok by a line on a row that did not fail, the 25-line and 500-character caps that let `error_count` fall below the failed rows, an empty report set stored `ok: true`, and a `no_primary_provider` row counted `unchanged` yet stored `ok: false` by its line (cases 3, 4, 5 and 7) are recorded as observed; no contract for any of them is declared here",
   );
   it.todo(
     "REASON, REMAINDER · a reason handed together with a nonempty report set, and an empty-string reason, are not exercised; case 5 hands a reason with no reports and no provider only",
   );
   it.todo(
-    "READERS, REMAINDER · listRecentProjectionRuns and getProjectionHealth are reduced here to run ids and the health status; the 24-hour staleness rule, `ageMs`, the backstop probe, the list limit, listRecentIngestRuns and pipeline health, the Admin panels and the authentication of GET /api/v1/pm-sync/health are not evidenced",
+    "READERS, REMAINDER · listRecentProjectionRuns and getProjectionHealth are reduced here to run ids and the health status, and are evidenced only as a case explicitly asserts them: the run ids answered for the team id handed in, their `finished_at`-descending order and the run health names in case 8 alone, and the statuses `never_run`, `ok` and `failed`; `stale` and the 24-hour staleness rule, `ageMs`, the backstop probe, the list limit, the `source` filter, listRecentIngestRuns and pipeline health, the Admin panels and the authentication of GET /api/v1/pm-sync/health are not evidenced",
   );
   it.todo(
-    "COORDINATOR · MUTANTS (isolated-copy actual-import run): against this fixture, drop `adopted` from the synced sum, drop one failing status from the failed sum, drop the `reason` override of `errors`, hand the writer a fixed team id, and drop the `team_id` equality from listRecentProjectionRuns — cases 1, 2, 5 and 6 must then fail on the stored row or the readers' answer, not on a compile or fixture error; two further mutants are NOT killed by this fixture and are named so neither is counted: dropping the `reason` override of `ok` alone (the writer re-derives `ok: false` from the reason line) and dropping the `source` equality from listRecentProjectionRuns (every run this file writes is `pm_sync`); no mutation evidence is supplied here",
+    "COORDINATOR · MUTANTS (isolated-copy actual-import run; every expectation below is read from source and NO mutant has been run): against this fixture, drop `adopted` from the synced sum (case 1, `created` and `unchanged`); drop one status from the failed sum — `missing_integration`, `missing_parent` or `cycle` is caught by case 2 through `unchanged` ALONE (2 for 1), its `ok` staying false through the remaining failing rows and the writer's error lines, and only `failed` is also caught through `ok` (case 3's failed row with no line); add `no_primary_provider` to the failed sum (case 7, through `unchanged` alone, 0 for 1 — its `ok` is already false by the line); drop the `reason` override of `errors` (case 5); hand the writer a fixed team id (case 6); drop the `team_id` equality from listRecentProjectionRuns (cases 1, 2, 5, 6 and 7, the other team's answer); order listRecentProjectionRuns by `id` or by `started_at` instead of `finished_at` (case 8 alone — every other case stores its runs in finish order with their starts in the same order) — each must then fail on the stored row or the readers' answer, not on a compile or fixture error; NOT killed by this fixture, and named so none is counted: dropping the `reason` override of `ok` alone (the writer re-derives `ok: false` from the reason line); dropping the `source` equality from listRecentProjectionRuns (every run this file writes is `pm_sync`); making a `no_primary_provider` row turn the roll-up's `ok` false without entering the failed sum (case 7's line already stores `ok: false`); removing the `Math.max(0, …)` clamp on `duration_ms` (no run here is handed a finish before its start) or on `unchanged` (no report set here sums past its length); raising either reader's limit (no team here holds more than three runs); and dropping the order altogether, whose result Postgres does not specify and which is counted neither way; no mutation evidence is supplied here",
   );
   it.todo(
     "INVENTORY AND ACCEPTANCE · the complete AIO-1217 Server Action inventory, its acceptance criteria, documentation and full-suite checks are not supplied by this file, which evidences one lib owner's write to ingest_runs only",
