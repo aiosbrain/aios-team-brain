@@ -645,13 +645,67 @@ describe("bounded callers report `continuing`; they do not fail", () => {
       + "and re-attribution is continuing in the background.",
     );
 
-    // Whereas a run that never got the turn at all still says so.
+    // Whereas a run that never got the turn at all reports contention, and no counters.
     use({ turn: [false] });
     const refused = await repairAttributionNow(new PgClient(), TEAM, "acme", { maxBatches: 5, batchSize: 1 });
     expect(refused).toMatchObject({ status: "continuing", busy: true, scanned: 0, updated: 0 });
-    expect(describeManualRepair(refused, "manual")).toContain("so this run did nothing");
+    expect(describeManualRepair(refused, "manual")).toBe(
+      "Another re-attribution run holds this team's repair right now, so this run stopped and the repair is not complete. "
+      + "Progress is saved, but background continuation is disabled on this deployment: "
+      + "an admin must run Re-attribute content again once that run has finished.",
+    );
     expect(describeManualRepair(refused, "background"))
       .toBe("Re-attribution is already running for this team and is continuing in the background.");
+  });
+
+  it("BUSY AFTER A REVISION RESET: a batch committed at R, then R+1 arrives and its turn is lost — the counters are R+1's zeros, and the report makes no claim that the run did nothing", async () => {
+    // The turn is free for the first batch at revision R. A mapping change then commits R+1 (the
+    // row is reset: pending, no cursor). This run nominates itself at R+1 — it gets the turn for
+    // the snapshot — and another owner has the turn by the time it asks for the batch.
+    const row = { revision: REVISION, committedAtR: false };
+    const base = repository({ status: "running", candidates: [[ITEM_A]], turn: [true, true, true, false] });
+    const c = new ScriptedConnection((entry) => {
+      if (isCursorAdvance(entry)) row.committedAtR = true;
+      // The mutation lands between this run's batches: the next routing read is the first to see it.
+      if (isPeek(entry) && row.committedAtR) row.revision = REVISION + 1;
+      const revision = { revision: row.revision, repair_revision: row.revision };
+      if (isSnapshotRead(entry)) return [{ ...revision, repair_status: "pending", cursor_item_id: null }];
+      if (isOwnedReread(entry)) return [{ ...revision, repair_status: "pending", cursor_item_id: null, deferred: false }];
+      if (isRevisionRead(entry)) return [revision];
+      return base(entry);
+    });
+    h.connection = c;
+
+    const outcome = await repairAttributionNow(new PgClient(), TEAM, "acme", { maxBatches: 5, batchSize: 1 });
+    // What the outcome says: busy at the NEW revision, with that revision's counters — all zero.
+    expect(outcome).toMatchObject({
+      status: "continuing", busy: true, partial: true, revision: REVISION + 1,
+      scanned: 0, updated: 0, versionsUpdated: 0, contributionsUpdated: 0,
+    });
+    // What actually happened: this same invocation committed a batch, at revision R, before that.
+    const committed = c.log.filter(isCursorAdvance);
+    expect(committed).toHaveLength(1);
+    expect(committed[0].params.slice(0, 3)).toEqual([TEAM, REVISION, ITEM_A]);
+    expect(c.transactions.map((t) => t.end)).toEqual(["commit", "commit", "commit", "commit"]);
+    expect(c.transactions[1].work.some(isCursorAdvance)).toBe(true);
+    // The last transaction is the refused turn at R+1, and nothing was recorded as a failure.
+    expect(c.transactions[3].work.every(isTurnLock)).toBe(true);
+    expect(c.log.filter(isRetry)).toEqual([]);
+
+    // So neither message may say the run did nothing. Each still says, truthfully, that another
+    // run holds the repair — and what, on that deployment, happens next.
+    const manual = describeManualRepair(outcome, "manual");
+    const background = describeManualRepair(outcome, "background");
+    for (const message of [manual, background]) {
+      expect(message).not.toMatch(/did nothing|nothing was|no work|no progress|unchanged|not started|never started/i);
+      expect(message).not.toContain("to current identity mappings");
+    }
+    expect(manual).toBe(
+      "Another re-attribution run holds this team's repair right now, so this run stopped and the repair is not complete. "
+      + "Progress is saved, but background continuation is disabled on this deployment: "
+      + "an admin must run Re-attribute content again once that run has finished.",
+    );
+    expect(background).toBe("Re-attribution is already running for this team and is continuing in the background.");
   });
 
   it("scan then finalization converge inside one budget, and a completed revision is not kicked", async () => {

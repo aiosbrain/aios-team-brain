@@ -342,13 +342,14 @@ describe("AIO-1167 copied staging: the scheduler is suppressed and the manual ac
     });
     await stillFenced();
 
-    // CONTENTION: another run holds the team's repair. This one did nothing — and says exactly that.
+    // CONTENTION: another run holds the team's repair. This one stopped — and says exactly that,
+    // with no counters and no claim beyond it.
     const other = await holdTurn(seed);
     try {
       const contended = await manual();
       expect(contended.outcome).toMatchObject({ status: "continuing", busy: true, scanned: 0 });
       expect(contended.message).toBe(
-        "Another re-attribution run holds this team's repair right now, so this run did nothing and the repair is not complete. "
+        "Another re-attribution run holds this team's repair right now, so this run stopped and the repair is not complete. "
         + `${MANUAL_NEXT_STEP} once that run has finished.`,
       );
       expect(contended.message).not.toMatch(PROMISES_BACKGROUND);
@@ -487,7 +488,7 @@ describe("AIO-1167 copied staging: the scheduler is suppressed and the manual ac
     try {
       expect(await reattributeIdentitiesNow(seed.teamSlug)).toEqual({
         ok: true,
-        message: "Another re-attribution run holds this team's repair right now, so this run did nothing and the repair is not complete. "
+        message: "Another re-attribution run holds this team's repair right now, so this run stopped and the repair is not complete. "
           + `${MANUAL_NEXT_STEP} once that run has finished.`,
       });
       expect(await authority(seed)).toEqual(before);

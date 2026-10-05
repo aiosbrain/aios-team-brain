@@ -88,15 +88,32 @@ describe("the Admin button's message", () => {
   it("COPIED STAGING, busy: contention is told apart from progress and from completion, and still promises nothing", () => {
     const message = describeManualRepair(BUSY, "manual");
     expect(message).toBe(
-      "Another re-attribution run holds this team's repair right now, so this run did nothing and the repair is not complete. "
+      "Another re-attribution run holds this team's repair right now, so this run stopped and the repair is not complete. "
       + "Progress is saved, but background continuation is disabled on this deployment: "
       + "an admin must run Re-attribute content again once that run has finished.",
     );
     expect(message).not.toMatch(PROMISES_BACKGROUND);
-    // Not a progress report (it did nothing) and not a completion.
+    // Not a progress report (no progress is known) and not a completion.
     expect(message).not.toMatch(/Re-attributed \d/);
     expect(message).not.toContain("to current identity mappings");
     expect(message).not.toBe(describeManualRepair(PARTIAL, "manual"));
+  });
+
+  it("ZERO-COUNTER busy makes no claim about the whole run, in either mode: the counters restart with a new revision, so zero does not prove no work", () => {
+    // The outcome of a run that committed a batch at one revision, saw a newer revision replace it,
+    // and then lost the new revision's turn is exactly this: busy, every counter zero.
+    const afterReset = outcome({ busy: true, turn: "busy", revision: 8 });
+    for (const zero of [BUSY, afterReset]) {
+      for (const mode of ["manual", "background"] as const) {
+        const message = describeManualRepair(zero, mode);
+        expect(message, `${mode}: ${message}`).not.toMatch(/did nothing|nothing was|no work|no progress|unchanged|not started|never started/i);
+        // It is still plainly contention, and still not a completion.
+        expect(message).toMatch(/re-attribution (run holds this team's repair|is already running for this team)/i);
+        expect(message).not.toContain("to current identity mappings");
+      }
+      expect(describeManualRepair(zero, "manual")).not.toMatch(PROMISES_BACKGROUND);
+      expect(describeManualRepair(zero, "manual")).toContain("Progress is saved, but background continuation is disabled on this deployment");
+    }
   });
 
   it("BUSY AFTER PROGRESS, copied staging: the committed work is reported, not discarded as 'did nothing' — and still nothing is promised", () => {
@@ -111,8 +128,9 @@ describe("the Admin button's message", () => {
     expect(message).not.toContain("to current identity mappings");
     // Three distinct facts, three distinct messages.
     expect(new Set([message, describeManualRepair(BUSY, "manual"), describeManualRepair({ ...BUSY_AFTER_PROGRESS, busy: false }, "manual")]).size).toBe(3);
-    // The initial-contention wording is kept for a run that really did nothing.
-    expect(describeManualRepair(BUSY, "manual")).toContain("so this run did nothing");
+    // Contention with no KNOWN progress stays a contention message, and reports no counters.
+    expect(describeManualRepair(BUSY, "manual")).toContain("Another re-attribution run holds this team's repair right now");
+    expect(describeManualRepair(BUSY, "manual")).not.toMatch(/Re-attributed \d/);
   });
 
   it("BUSY AFTER PROGRESS, normal runtime: the committed work is reported and the repair is still said to continue in the background", () => {

@@ -38,25 +38,34 @@ function progress(outcome: AttributionRepairOutcome): string {
   return `Re-attributed ${outcome.updated} of ${outcome.scanned} item(s)${versions}`;
 }
 
-/** Whether THIS invocation committed any work before it returned. A bounded run takes the team's
- * turn batch by batch and lets go of it in between, so it can commit several batches and only then
- * find another owner on the turn: `busy` says how it ended, not that it did nothing. */
-function committedWork(outcome: AttributionRepairOutcome): boolean {
+/**
+ * Whether the outcome KNOWS of work this invocation committed. A bounded run takes the team's turn
+ * batch by batch and lets go of it in between, so it can commit several batches and only then find
+ * another owner on the turn: `busy` says how it ended, not what it did.
+ *
+ * The converse does not hold, and nothing here may be built on it. The counters describe ONE
+ * revision's repair and start again when a newer revision replaces it, so a run can commit a batch
+ * at revision R, see R+1 arrive, lose R+1's turn, and return `busy` with every counter at zero.
+ * Zero counters mean "no committed work is known at the current revision" — never "this run did
+ * nothing".
+ */
+function knownCommittedWork(outcome: AttributionRepairOutcome): boolean {
   return outcome.scanned > 0 || outcome.updated > 0 || outcome.versionsUpdated > 0 || outcome.contributionsUpdated > 0;
 }
 
 /**
  * The Admin button's message. Four different facts, never run together: the repair COMPLETED; it
  * made progress and stopped at its budget; it made progress and then another run took the team's
- * repair; or it did nothing because another run held the repair from the start. In the last three,
- * what happens next is said as it is for this deployment.
+ * repair; or it stopped because another run holds the repair, with no progress known at the current
+ * revision — which is said as contention and as nothing more: no claim is made about the whole
+ * run. In the last three, what happens next is said as it is for this deployment.
  */
 export function describeManualRepair(
   outcome: AttributionRepairOutcome,
   continuation: RepairContinuation = attributionRepairContinuation(),
 ): string {
   if (outcome.status === "complete") return `${progress(outcome)} to current identity mappings.`;
-  const worked = committedWork(outcome);
+  const worked = knownCommittedWork(outcome);
   if (continuation === "background") {
     if (!outcome.busy) return `${progress(outcome)} so far; re-attribution is continuing in the background.`;
     return worked
@@ -69,7 +78,7 @@ export function describeManualRepair(
   return worked
     ? `${progress(outcome)} so far; another re-attribution run then took over this team's repair, and the repair is not complete. `
       + `${disabled}: ${again} once that run has finished.`
-    : `Another re-attribution run holds this team's repair right now, so this run did nothing and the repair is not complete. `
+    : `Another re-attribution run holds this team's repair right now, so this run stopped and the repair is not complete. `
       + `${disabled}: ${again} once that run has finished.`;
 }
 
