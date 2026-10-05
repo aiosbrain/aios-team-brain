@@ -28,8 +28,10 @@ import {
  *     back to back, with no timer between them: healthy partial progress is continuation, never
  *     failure and never a wait. Each round asks the table again, so a team that became pending
  *     meanwhile is in the very next one, and a per-round cap only defers a team by a round.
- *   - A round with nothing to continue — no pending team, only turns owned elsewhere (`busy`), or
- *     only failures, which are in durable backoff and not rediscovered until due — waits the idle
+ *   - A team whose turn could not move it — owned elsewhere (`busy`), deferred, failed — is not
+ *     progress and is not asked for again by this loop for one idle interval. It is set aside by
+ *     name, so it can never stand in front of, or be mistaken for, a team that can be served.
+ *   - A round with nothing to continue — no pending team, only teams like those — waits the idle
  *     interval and asks again. That timer is the only one this poller arms.
  *   - A kick (an Admin hook, a caller whose budget ran out) only brings the next round forward.
  *     Nothing depends on one arriving.
@@ -56,12 +58,13 @@ export interface RepairRoundSummary {
 
 export interface AttributionRepairLoopDeps {
   /** Teams with durable unfinished repair whose retry deadline has passed, oldest-touched first:
-   * at most `limit` of them, after the first `skip` in that order. */
-  discover: (limit: number, skip: number) => Promise<PendingRepairTeam[]>;
+   * at most `limit` of them, never one of the teams named in `exclude`. */
+  discover: (limit: number, exclude: readonly string[]) => Promise<PendingRepairTeam[]>;
   /** One bounded turn. Throws when the turn FAILED (its durable retry state is already written). */
   runTurn: (team: PendingRepairTeam) => Promise<RepairTurnDisposition>;
   idleMs?: number;
   teamsPerRound?: number;
+  now?: () => number;
   setTimer?: (fn: () => void, ms: number) => unknown;
   clearTimer?: (handle: unknown) => void;
   onFailure?: (team: PendingRepairTeam | null, error: unknown) => void;
@@ -91,9 +94,11 @@ export function createAttributionRepairLoop(deps: AttributionRepairLoopDeps): At
   // In-process single flight: one round at a time. Ownership across processes is the repair turn.
   let running = false;
   let kicked = false;
-  // How far into the durable order the next page starts (see `runRound`). Position in a pass over
-  // the queue, nothing more: lost on restart, and nothing is wrong when it is.
-  let skip = 0;
+  const now = deps.now ?? (() => Date.now());
+  // Teams whose last turn here could not move them, and until when they sit out (see `runRound`).
+  // Named teams, never positions. Lost on restart, and nothing is wrong when it is.
+  const resting = new Map<string, number>();
+  const rest = (team: PendingRepairTeam) => resting.set(team.teamId, now() + idleMs);
   const takeKick = (): boolean => {
     const was = kicked;
     kicked = false;
@@ -113,25 +118,36 @@ export function createAttributionRepairLoop(deps: AttributionRepairLoopDeps): At
     const summary: RepairRoundSummary = {
       attempted: 0, continuing: 0, settled: 0, busy: 0, deferred: 0, failed: 0, capped: false,
     };
-    for (const team of await deps.discover(teamsPerRound, skip)) {
+    const at = now();
+    for (const [teamId, until] of resting) if (until <= at) resting.delete(teamId);
+    for (const team of await deps.discover(teamsPerRound, [...resting.keys()])) {
       summary.attempted++;
       try {
-        summary[await deps.runTurn(team)]++;
+        const disposition = await deps.runTurn(team);
+        summary[disposition]++;
+        if (disposition === "busy" || disposition === "deferred") rest(team);
       } catch (error) {
         // The failed turn rolled back and recorded its own retry deadline; the team is not
         // rediscovered until that passes. One team's failure never ends the round for the rest.
         summary.failed++;
+        rest(team);
         deps.onFailure?.(team, error);
       }
     }
     // THE CAP DEFERS, IT NEVER HIDES. A turn that did something touched its team's row and sent it
     // to the back of the durable order. A turn that could not — owned elsewhere, deferred, failed —
-    // touched nothing, so that team is still at the front; a page full of those would be handed
-    // back by every discovery, in front of everyone behind it. So a capped round is followed at
-    // once by the next page, past the teams that did not move, and the first page that comes back
-    // short ends the pass and starts the next one from the front again.
+    // touched nothing, so that team may still be at the front; a page full of those would be handed
+    // back by every discovery, in front of everyone behind it.
+    //
+    // So such a team RESTS: this loop does not ask for it again for one idle interval — exactly how
+    // long it would have waited had the loop gone idle — and a capped round is followed at once by
+    // the next page of everyone else. A resting team is excluded BY NAME. Never by position: the
+    // queue shifts under any offset — a failed team leaves it for its backoff, a served team goes
+    // to the back — and a count of "teams to skip" then lands on some unrelated team, which is
+    // skipped in its place for as long as the work in front of it lasts. Resting is bounded by the
+    // clock, not by the pass, so sustained work cannot keep a team out either; and a kick, which
+    // says a caller has just let go of a team, ends every rest at once.
     summary.capped = summary.attempted >= teamsPerRound;
-    skip = summary.capped ? skip + summary.busy + summary.deferred + summary.failed : 0;
     return summary;
   }
 
@@ -161,10 +177,9 @@ export function createAttributionRepairLoop(deps: AttributionRepairLoopDeps): At
           more = summary.continuing > 0 || summary.capped || kickedMeanwhile;
         } catch (error) {
           // Discovery itself failed (the database is unreachable): ask again at the idle interval,
-          // from the front, whatever was kicked meanwhile.
+          // whatever was kicked meanwhile.
           deps.onFailure?.(null, error);
           takeKick();
-          skip = 0;
           more = false;
         }
       }
@@ -182,6 +197,9 @@ export function createAttributionRepairLoop(deps: AttributionRepairLoopDeps): At
     },
     kick() {
       if (!active) return;
+      // A kick comes from a caller that has just stopped working a team — its budget ran out, or
+      // it found the turn busy. Whatever was resting because that caller owned it is free now.
+      resting.clear();
       if (running) kicked = true;
       else arm(0);
     },
@@ -205,7 +223,7 @@ export function startAttributionRepairScheduler(): void {
   started = true;
 
   const loop = createAttributionRepairLoop({
-    discover: (limit, skip) => discoverPendingAttributionRepairs(limit, { skip }),
+    discover: (limit, exclude) => discoverPendingAttributionRepairs(limit, { exclude }),
     runTurn: (team) => runScheduledAttributionRepairTurn(adminClient(), team),
     onFailure: (team, error) => {
       const message = error instanceof Error ? error.message : String(error);

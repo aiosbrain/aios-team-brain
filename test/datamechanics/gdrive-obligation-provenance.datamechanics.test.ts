@@ -340,7 +340,15 @@ describe("AIO-1167 the Drive identity obligation repairs only documents its pers
     expect(now.evidence).toEqual([{ member_id: alice.id, diagnostic: null }]);
   }, 90_000);
 
-  it("BARRIER: a document that stops being Drive-sourced between nomination and its lock is scanned past; its neighbour is repaired", async () => {
+  it.each([
+    // Not Drive-sourced any more in each of the ways a row can stop being: another source, no
+    // source at all, and a JSON null. The last two used to make the rule answer SQL NULL, which the
+    // reader — rightly — treats as a read that did not answer; a row that merely has no source is
+    // not a failed read. It is an ineligible row, and it is scanned past like the first.
+    ["its source becomes another source", `jsonb_set(frontmatter, '{source}', '"notion"')`, "notion"],
+    ["its source is REMOVED", `frontmatter - 'source'`, null],
+    ["its source is set to JSON null", `jsonb_set(frontmatter, '{source}', 'null')`, null],
+  ])("BARRIER: a document that stops being Drive-sourced between nomination and its lock (%s) is scanned past; its neighbour is repaired", async (_name, rewrite, sourceAfter) => {
     const seed = await adminSeed();
     const c = await driveConnection(seed);
     const alice = await member(seed, "Alice");
@@ -353,6 +361,7 @@ describe("AIO-1167 the Drive identity obligation repairs only documents its pers
     const changed: string[] = [];
     const stored = new Map<string, Awaited<ReturnType<typeof credit>>>();
     for (const doc of docs) stored.set(doc.id, await credit(doc.id));
+    const common = await commonCursor(seed);
     const result = await runIdentityRepairObligation(db(), obligationOf(seed, editor.key, linked.mappingRevision!), {
       batchSize: 10,
       hooks: {
@@ -360,11 +369,11 @@ describe("AIO-1167 the Drive identity obligation repairs only documents its pers
           if (changed.length) return;
           changed.push(itemId);
           // On the pool, not the repair's own transaction: another session's committed write.
-          await getPool().query(
-            `update items set frontmatter = jsonb_set(frontmatter, '{source}', '"notion"') where id=$1`, [itemId]);
+          await getPool().query(`update items set frontmatter = ${rewrite} where id=$1`, [itemId]);
         },
       },
     });
+    // The attempt did not fail: no error, no retry, no rollback of the neighbour's repair.
     expect(result).toEqual({ status: "complete", scanned: 2 });
     expect(changed).toHaveLength(1);
     const skipped = docs.find((doc) => doc.id === changed[0])!;
@@ -373,14 +382,22 @@ describe("AIO-1167 the Drive identity obligation repairs only documents its pers
     // The recheck read the row as it is under the lock, not as the nomination saw it: nothing of
     // this row — credit, version ledger, evidence — was rewritten.
     const untouched = await credit(skipped.id);
-    expect(untouched.item).toMatchObject({ member_id: null, source: "notion" });
+    expect(untouched.item).toMatchObject({ member_id: null, member_id_locked: false, source: sourceAfter });
     expect(untouched.versions).toEqual([null]);
     expect(untouched.evidence).toEqual(stored.get(skipped.id)!.evidence);
     expect(untouched.evidence.map((row) => row.member_id)).toEqual([null]);
     expect((await credit(kept.id)).item.member_id).toBe(alice.id);
     // Scanned past, not failed: the cursor covered both, one was updated, the obligation is done.
-    expect(await obligationRow(seed, editor.key, linked.mappingRevision!))
-      .toMatchObject({ status: "complete", items_scanned: 2, items_updated: 1, last_error: null });
+    const { rows: lastNominated } = await getPool().query<{ id: string }>(
+      "select id from items where id = any($1::uuid[]) order by id desc limit 1", [docs.map((doc) => doc.id)]);
+    expect(await obligationRow(seed, editor.key, linked.mappingRevision!)).toMatchObject({
+      status: "complete", cursor_item_id: lastNominated[0].id, items_scanned: 2, items_updated: 1, last_error: null,
+    });
+    // A later attempt has nothing left to do and changes nothing; the team cursor never moved.
+    expect(await runIdentityRepairObligation(db(), obligationOf(seed, editor.key, linked.mappingRevision!)))
+      .toMatchObject({ status: "obsolete", scanned: 0 });
+    expect(await credit(skipped.id)).toEqual(untouched);
+    expect(await commonCursor(seed)).toEqual(common);
   }, 90_000);
 
   it("FAIL CLOSED: a failed provenance read moves neither credit nor the obligation cursor; the retry heals", async () => {

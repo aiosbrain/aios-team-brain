@@ -24,7 +24,9 @@ import type { PendingRepairTeam, RepairTurnDisposition } from "@/lib/ingest/reco
  *   5. FAIRNESS: each round gives every pending team ONE turn, oldest-touched first, so a team with
  *      an enormous repair cannot starve another, and a team that becomes pending mid-way is served
  *      within one round. A per-round cap defers and never hides: a capped round is followed at once
- *      by the next page, past the teams whose turn could not move them.
+ *      by the next page. A team whose turn could not move it (busy, deferred, failed) is set aside
+ *      BY NAME for one idle interval — never by position, because the queue shifts under any
+ *      offset (a failed team leaves it for its backoff) and the offset then lands on a healthy team.
  *   6. BUSY is not progress and not failure: it waits for the next poll rather than spinning.
  *   7. A KICK only brings the next round forward; rounds never overlap; nothing depends on a kick.
  *   8. SUPPRESSION: it does not start on a copied-staging runtime or when opted out.
@@ -41,6 +43,8 @@ interface ModelTeam {
   /** Turn numbers (1-based, per team) on which the turn fails. */
   failOn?: number[];
   busyUntil?: number;
+  /** The turn finds a retry deadline that discovery was too early to see, until this time. */
+  deferredUntil?: number;
   turns: number;
 }
 
@@ -54,12 +58,13 @@ class Authority {
     this.teams.set(team, { remaining, touched: ++this.sequence, deadline: 0, turns: 0, ...over });
   }
 
-  discover = async (limit: number, skip = 0): Promise<PendingRepairTeam[]> => {
+  discover = async (limit: number, exclude: readonly string[] = []): Promise<PendingRepairTeam[]> => {
     this.discoveries.push(Date.now());
     return [...this.teams.entries()]
-      .filter(([, team]) => team.remaining > 0 && team.deadline <= Date.now())
+      // Exactly the production filter order: pending, deadline passed, not excluded — THEN the cap.
+      .filter(([teamId, team]) => team.remaining > 0 && team.deadline <= Date.now() && !exclude.includes(teamId))
       .sort(([, a], [, b]) => a.touched - b.touched)
-      .slice(skip, skip + limit)
+      .slice(0, limit)
       .map(([teamId]) => ({ teamId, teamSlug: teamId }));
   };
 
@@ -71,6 +76,10 @@ class Authority {
     if (team.busyUntil !== undefined && Date.now() < team.busyUntil) {
       record("busy");
       return "busy";
+    }
+    if (team.deferredUntil !== undefined && Date.now() < team.deferredUntil) {
+      record("deferred");
+      return "deferred";
     }
     team.turns++;
     if (team.failOn?.includes(team.turns)) {
@@ -303,6 +312,122 @@ describe("attribution-repair scheduler: deadline, fairness, busy", () => {
     expect(vi.getTimerCount()).toBe(1);
   });
 
+  it("CAPPED + a FAILURE: the failed team leaving the queue for its backoff does not push a small healthy team out of every page", async () => {
+    // The shape that starves under a positional skip: A fails and disappears into backoff, B and D
+    // have long repairs, C needs one turn. "Skip one" would then skip C — whoever is first once A
+    // is gone — on every page for as long as B and D keep working.
+    const authority = new Authority();
+    authority.pending("A", 1, { failOn: [1] });
+    authority.pending("B", 30);
+    authority.pending("C", 1);
+    authority.pending("D", 30);
+    start(authority, { teamsPerRound: 2 });
+    const boot = Date.now();
+    await vi.advanceTimersByTimeAsync(0);
+    // Round 1 is A (fails) and B; round 2 is the two teams that have not had a turn — C first.
+    expect(authority.order().slice(0, 4)).toEqual(["A", "B", "C", "D"]);
+    expect(authority.turns[2]).toEqual({ team: "C", at: boot, disposition: "settled" });
+    // B and D then take turn about to the end; nobody waited on the clock and A was tried once.
+    expect(authority.teams.get("B")!.remaining).toBe(0);
+    expect(authority.teams.get("D")!.remaining).toBe(0);
+    expect(authority.turns.every((turn) => turn.at === boot)).toBe(true);
+    expect(authority.order().filter((team) => team === "A")).toHaveLength(1);
+    expect(failures).toEqual([{ team: "A", message: "turn 1 failed for A" }]);
+    // A failure is not progress: with only A left the loop is idle, on its one timer.
+    expect(vi.getTimerCount()).toBe(1);
+  });
+
+  it("CAPPED at the production cap: 22 teams, the first fails, and the 21st — one turn of work — is served in the second round", async () => {
+    const authority = new Authority();
+    const names = Array.from({ length: 22 }, (_, index) => `t${String(index + 1).padStart(2, "0")}`);
+    for (const name of names) {
+      authority.pending(name, name === "t21" ? 1 : 3, name === "t01" ? { failOn: [1] } : {});
+    }
+    start(authority); // REPAIR_TEAMS_PER_ROUND, as production runs it
+    const boot = Date.now();
+    await vi.advanceTimersByTimeAsync(0);
+    const order = authority.order();
+    // Round 1 is t01..t20. Round 2 starts with the two teams the cap deferred.
+    expect(order.slice(0, 20)).toEqual(names.slice(0, 20));
+    expect(order.slice(20, 22)).toEqual(["t21", "t22"]);
+    expect(authority.turns[20]).toEqual({ team: "t21", at: boot, disposition: "settled" });
+    // Every healthy team converged in the same burst; each got exactly its own turns, in rotation.
+    for (const name of names.slice(1)) expect(authority.teams.get(name)!.remaining, name).toBe(0);
+    expect(order).toHaveLength(1 + 20 * 3 + 1);
+    expect(authority.turns.every((turn) => turn.at === boot)).toBe(true);
+    expect(failures.map((failure) => failure.team)).toEqual(["t01"]);
+  });
+
+  it("CAPPED + DEFERRED and BUSY at the front: each is tried once, rests, and the teams behind are served at once", async () => {
+    const authority = new Authority();
+    const boot = Date.now();
+    authority.pending("deferred", 1, { deferredUntil: boot + 60_000 });
+    authority.pending("owned", 1, { busyUntil: boot + 60_000 });
+    authority.pending("small", 1);
+    authority.pending("large", 9);
+    start(authority, { teamsPerRound: 2 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(authority.turns.slice(0, 4).map((turn) => [turn.team, turn.disposition])).toEqual([
+      ["deferred", "deferred"], ["owned", "busy"], ["small", "settled"], ["large", "continuing"],
+    ]);
+    expect(authority.teams.get("large")!.remaining).toBe(0);
+    // Neither stuck team was asked for again while the others worked: no spin, and no progress
+    // was ever attributed to them (the loop went idle the moment `large` finished).
+    expect(authority.turns.filter((turn) => turn.team === "deferred" || turn.team === "owned")).toHaveLength(2);
+    expect(authority.turns.every((turn) => turn.at === boot)).toBe(true);
+    expect(failures).toEqual([]);
+    expect(vi.getTimerCount()).toBe(1);
+    // They are asked for again at the idle interval, as if the loop had simply been idle.
+    await vi.advanceTimersByTimeAsync(REPAIR_IDLE_POLL_MS);
+    expect(authority.turns.slice(-2).map((turn) => [turn.team, turn.at - boot, turn.disposition])).toEqual([
+      ["deferred", REPAIR_IDLE_POLL_MS, "deferred"], ["owned", REPAIR_IDLE_POLL_MS, "busy"],
+    ]);
+  });
+
+  it("a rest is bounded by the CLOCK, not by the work: under sustained capped repairs a team that was busy is served one idle interval later", async () => {
+    // Driven round by round on an injected clock: each productive turn takes one second.
+    const clock = { t: 0 };
+    const teams = new Map([
+      ["x", { remaining: 1, touched: 1 }],
+      ["a", { remaining: 8, touched: 2 }],
+      ["b", { remaining: 8, touched: 3 }],
+    ]);
+    let sequence = 3;
+    const log: [number, string, string][] = [];
+    const manual = createAttributionRepairLoop({
+      teamsPerRound: 2,
+      now: () => clock.t,
+      discover: async (limit, exclude) => [...teams.entries()]
+        .filter(([teamId, team]) => team.remaining > 0 && !exclude.includes(teamId))
+        .sort(([, left], [, right]) => left.touched - right.touched)
+        .slice(0, limit)
+        .map(([teamId]) => ({ teamId, teamSlug: teamId })),
+      runTurn: async ({ teamId }) => {
+        const team = teams.get(teamId)!;
+        // `x` is owned by another process for the first three seconds, and is first in the queue.
+        if (teamId === "x" && clock.t < 3_000) {
+          log.push([clock.t, teamId, "busy"]);
+          return "busy";
+        }
+        team.remaining--;
+        team.touched = ++sequence;
+        const disposition = team.remaining > 0 ? "continuing" : "settled";
+        log.push([clock.t, teamId, disposition]);
+        clock.t += 1_000;
+        return disposition;
+      },
+    });
+    const rounds = [await manual.runRound(), await manual.runRound(), await manual.runRound(), await manual.runRound()];
+    // Every round filled its page with real work — the pass never "ended" — yet `x` was not kept
+    // out until it did, and was not asked for on every round either.
+    expect(rounds.map((summary) => summary.capped)).toEqual([true, true, true, true]);
+    expect(log.filter(([, team]) => team === "x")).toEqual([[0, "x", "busy"], [REPAIR_IDLE_POLL_MS, "x", "settled"]]);
+    expect(teams.get("a")!.remaining).toBeGreaterThan(0);
+    expect(teams.get("b")!.remaining).toBeGreaterThan(0);
+    // While it rested, the two long repairs alternated and nothing else was skipped.
+    expect(log.slice(1, 6).map(([, team]) => team)).toEqual(["a", "b", "a", "b", "a"]);
+  });
+
   it("a capped round of teams that all SETTLED is followed at once by the teams still waiting", async () => {
     const authority = new Authority();
     for (const team of ["a", "b", "c", "d", "e"]) authority.pending(team, 1);
@@ -333,12 +458,12 @@ describe("attribution-repair scheduler: deadline, fairness, busy", () => {
     authority.pending("a", 1);
     const discover = authority.discover;
     let outage = true;
-    authority.discover = async (limit, skip) => {
+    authority.discover = async (limit, exclude) => {
       if (outage) {
         authority.discoveries.push(Date.now());
         throw new Error("database unreachable");
       }
-      return discover(limit, skip);
+      return discover(limit, exclude);
     };
     start(authority);
     await vi.advanceTimersByTimeAsync(0);
@@ -366,6 +491,24 @@ describe("attribution-repair scheduler: kicks accelerate only", () => {
     expect(authority.discoveries).toEqual([boot, boot + 1_000]);
     await vi.advanceTimersByTimeAsync(1);
     expect(authority.discoveries).toEqual([boot, boot + 1_000, boot + 1_000 + REPAIR_IDLE_POLL_MS]);
+  });
+
+  it("a kick ends every rest: a team that was busy because the kicking caller owned it is taken up at once", async () => {
+    const authority = new Authority();
+    const boot = Date.now();
+    // Owned by a bounded caller for the first second; then that caller hands over and kicks.
+    authority.pending("handed-over", 2, { busyUntil: boot + 1_000 });
+    const running = start(authority);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(authority.turns).toEqual([{ team: "handed-over", at: boot, disposition: "busy" }]);
+    await vi.advanceTimersByTimeAsync(1_000);
+    running.kick();
+    await vi.advanceTimersByTimeAsync(0);
+    // Not four seconds later, when its rest would have run out by itself.
+    expect(authority.turns.slice(1)).toEqual([
+      { team: "handed-over", at: boot + 1_000, disposition: "continuing" },
+      { team: "handed-over", at: boot + 1_000, disposition: "settled" },
+    ]);
   });
 
   it("rounds never overlap: a kick during a round queues exactly one follow-up round", async () => {

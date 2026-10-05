@@ -213,18 +213,26 @@ export async function readOwnedIdentityRepairState(teamId: string): Promise<Owne
  * A REQUEST to repair the team again at its CURRENT revision — the explicit "re-apply the current
  * mappings to what is stored" of the manual button and the direct repair call. Every roster or
  * mapping change enqueues its own repair through the trigger; this is the only other way one is
- * enqueued, and it is just as durable: a revision whose scan has finished (`complete`, or
- * `awaiting_cache`) goes back to `pending` with its cursor and counters cleared, exactly as a new
- * revision starts, and that is COMMITTED before any row is scanned. Attribution-dependent reads are
- * fenced from that commit until the strict finalization, like any other repair.
+ * enqueued, and it is just as durable: the revision goes back to `pending` with its cursor and
+ * counters cleared, exactly as a new revision starts, and that is COMMITTED — in a transaction of
+ * its own, under the turn — before the snapshot is read or any row is scanned. Attribution-dependent
+ * reads are fenced from that commit until the strict finalization, like any other repair.
  *
- * It does not create a revision — no mapping changed, and nothing that validated the current one is
- * invalidated — and it does not touch a repair that is still pending, running or in retry: that
- * work is already durable, and restarting it would let repeated requests hold a long repair at its
- * first batch forever.
+ * What a request reopens is every state in which the stored cursor is NOT a promise that the rows
+ * behind it are right for this request:
+ *
+ *   complete, awaiting_cache   the scan finished before the request was made;
+ *   retry                      the last turn failed. Its cursor may be the end of a finished scan
+ *                              (a failed finalization) or anywhere before it, and nothing durable
+ *                              says which — so an explicit request starts over rather than trust it.
+ *                              It also retries now: a request is not held by a backoff.
+ *
+ * It does not touch a repair that is `pending` or `running`: that scan is in healthy progress under
+ * this same revision, and restarting it would let repeated requests hold a long repair at its first
+ * batch forever. And it creates no revision — no mapping changed, and nothing that validated the
+ * current one is invalidated.
  *
  * Without a request a finished revision is never reopened: a turn that finds one does nothing.
- * Called inside the owned transaction (the turn is held), before the snapshot is read.
  */
 export async function reopenIdentityRepair(teamId: string): Promise<boolean> {
   if (!ambientTransactionClient()) {
@@ -237,7 +245,8 @@ export async function reopenIdentityRepair(teamId: string): Promise<boolean> {
         set repair_status='pending',cursor_item_id=null,
             items_scanned=0,items_updated=0,versions_updated=0,contributions_updated=0,
             attempts=0,last_error=null,next_attempt_at=null,updated_at=now(),completed_at=null
-      where team_id=$1 and repair_revision=revision and repair_status in ('complete','awaiting_cache')`,
+      where team_id=$1 and repair_revision=revision
+        and repair_status in ('complete','awaiting_cache','retry')`,
     [teamId],
   );
   return rowCount > 0;

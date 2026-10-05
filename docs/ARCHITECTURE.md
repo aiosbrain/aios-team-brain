@@ -1130,17 +1130,24 @@ the row and a stale owner records nothing against it. A turn only CONTINUES dura
 finds complete is a no-op, whoever calls. A repair is enqueued in exactly two ways — by the roster
 trigger on a mapping change (which records the revision as already complete when the team has nothing
 stored to repair), and by an explicit REQUEST from the manual "Re-attribute content" button or the direct
-`reattributeItems`: under the turn, before the snapshot, a revision whose scan has finished is set back
-to pending with its cursor and counters cleared, and that commits before any row is scanned. A request
-creates no revision and does not restart a repair in progress. `lib/ingest/attribution-repair-scheduler.ts`,
+`reattributeItems`: under the turn, in a transaction of its own that commits before the strict snapshot
+read is attempted, the revision is set back to pending with its cursor and counters cleared. Because it
+is its own commit, the request outlives a failure (or a crash) of anything after it: a failed snapshot is
+recorded as `retry` on top of the cleared cursor, never on the finished scan's, so the retry revisits
+every row before it can finalize. A request reopens `complete`, `awaiting_cache` and `retry` — every
+state whose stored cursor is not a promise about the rows behind it — and leaves a scan in healthy
+progress (`pending`, `running`) alone; it creates no revision. `lib/ingest/attribution-repair-scheduler.ts`,
 started from `instrumentation.register()` on timers of its own (not a leg of the 30-minute ingest chain,
 and suppressed on a copied-staging runtime), continues these repairs promptly: the authority table is
 the only queue — it is asked at boot and every five seconds while idle for teams with unfinished work
 whose deadline has passed, oldest-touched first — each discovered team gets one turn per round, and a
 round that left work to do is followed by the next at once, back to back with no timer between them
 (the idle poll is the only timer it arms). The per-round cap defers and never hides: a round that
-filled its page is followed at once by the next page, past the teams whose turn could not move them
-(busy, deferred, failed), and the first short page starts the pass again from the front. A bounded
+filled its page is followed at once by the next page. A team whose turn could not move it (busy,
+deferred, failed) is not progress; it rests for one idle interval, excluded from discovery BY NAME —
+never by a positional offset, because the queue shifts under any offset (a failed team leaves it for
+its backoff, a served team goes to the back) and the offset then lands on an unrelated healthy team. A
+rest is bounded by the clock, so sustained work cannot keep a team out, and a kick ends every rest. A bounded
 Admin budget that ends reports
 `continuing`; kicks from those callers are post-commit and only bring the next round forward.
 Team repair eligibility is one rule, applied in the bounded candidate selection and again per item

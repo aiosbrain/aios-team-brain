@@ -249,15 +249,19 @@ export interface PendingRepairTeam {
  */
 export async function discoverPendingAttributionRepairs(
   limit: number,
-  opts: { skip?: number } = {},
+  opts: { exclude?: readonly string[] } = {},
 ): Promise<PendingRepairTeam[]> {
+  // `exclude` names teams. There is deliberately no offset: the set this query ranges over changes
+  // between any two calls (a deadline passes or is set, a turn sends its team to the back), so a
+  // position means a different team every time it is used.
   const { rows } = await runSql<{ team_id: string; slug: string }>(
     `select a.team_id,t.slug from team_identity_authority a
        join teams t on t.id=a.team_id
       where a.repair_status in ('pending','running','retry','awaiting_cache')
         and (a.next_attempt_at is null or a.next_attempt_at<=now())
-      order by a.updated_at,a.team_id limit $1 offset $2`,
-    [Math.max(1, Math.min(100, limit)), Math.max(0, Math.floor(opts.skip ?? 0))],
+        and not (a.team_id = any($2::uuid[]))
+      order by a.updated_at,a.team_id limit $1`,
+    [Math.max(1, Math.min(100, limit)), [...(opts.exclude ?? [])]],
   );
   return rows.map((row) => ({ teamId: row.team_id, teamSlug: row.slug }));
 }

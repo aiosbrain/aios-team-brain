@@ -20,9 +20,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  *   6. A bounded caller whose budget ends, or who finds the turn busy, reports `continuing` and
  *      kicks the scheduler — after commit, never as a failure.
  *   7. A turn only CONTINUES durable work. A REQUEST — the direct `reattributeItems`, the manual
- *      button — is a durable step of its own: under the turn, before the snapshot, a revision whose
- *      scan has finished is set back to pending with its cursor cleared, and that commits before
- *      anything is scanned. It creates no revision and leaves a repair in progress alone.
+ *      button — is a durable step of its own: under the turn, in a transaction of ITS OWN that
+ *      commits before the strict snapshot read is attempted, the revision is set back to pending
+ *      with its cursor cleared. So a snapshot failure (or a crash) after it cannot take the reset
+ *      back: the failure is recorded on top of the cleared cursor and the retry scans from the
+ *      start. A request reopens `complete`, `awaiting_cache` and `retry`; it leaves a scan in
+ *      healthy progress alone, creates no revision, and — if it fails itself — records nothing.
  *
  * The connection below records each statement and answers from a script; the real-PostgreSQL
  * counterpart is `test/datamechanics/attribution-repair-continuation.datamechanics.test.ts`.
@@ -289,16 +292,23 @@ describe("scan turn: owned, atomic, and never waits for ownership", () => {
 
 describe("a request is a durable step; a turn alone only continues", () => {
   /** A team whose revision is `complete` until a reopen statement reaches the database. */
-  function completedTeam(stored: { status: string; cursor: string | null }) {
+  function completedTeam(
+    stored: { status: string; cursor: string | null },
+    fail?: (entry: Entry) => Error | undefined,
+  ) {
     const base = repository({ candidates: [[ITEM_A]] });
     const connection = new ScriptedConnection((entry) => {
+      const failure = fail?.(entry);
+      if (failure) return failure;
       if (isReopen(entry)) {
-        // The statement's own WHERE: only a revision whose scan has finished is reopened.
-        if (stored.status !== "complete" && stored.status !== "awaiting_cache") return [];
+        // The statement's own WHERE: a scan in healthy progress is not reopened.
+        if (stored.status === "pending" || stored.status === "running") return [];
         stored.status = "pending";
         stored.cursor = null;
         return [{}];
       }
+      // A recorded failure changes the status and nothing else: it keeps whatever cursor is stored.
+      if (isRetry(entry)) stored.status = "retry";
       if (isAwaitingCache(entry)) stored.status = "awaiting_cache";
       if (isComplete(entry)) stored.status = "complete";
       if (isPeek(entry)) return [{ repair_status: stored.status }];
@@ -327,25 +337,31 @@ describe("a request is a durable step; a turn alone only continues", () => {
     expect(stored).toEqual({ status: "complete", cursor: ITEM_B });
   });
 
-  it("the DIRECT call is a request: the reopen is taken under the turn, before the snapshot, and COMMITTED before the scan", async () => {
+  it("the DIRECT call is a request: the reopen is taken under the turn and COMMITTED on its own, before the snapshot and the scan", async () => {
     const stored = { status: "complete", cursor: ITEM_B };
     const c = completedTeam(stored);
     await expect(reattributeItems(new PgClient(), TEAM, { batchSize: 25 }))
       .resolves.toMatchObject({ turn: "scanned", scanned: 1, partial: false, revision: REVISION });
 
-    const [request, batch] = c.transactions;
-    expect(request.end).toBe("commit");
+    const [request, snapshot, batch] = c.transactions;
+    expect(c.transactions.map((t) => t.end)).toEqual(["commit", "commit", "commit"]);
     const order = [
       indexOf(request.work, isTurnLock),
       indexOf(request.work, isIdentityLock),
       indexOf(request.work, isReopen),
-      indexOf(request.work, isSnapshotRead),
     ];
     expect(order[0]).toBe(0);
     expect(order.every((index) => index >= 0), `missing a step: ${order}`).toBe(true);
     expect(order).toEqual([...order].sort((a, b) => a - b));
+    // The request transaction is ONLY the request: the strict snapshot read — which can fail — is
+    // not in it, so nothing after this commit can take the reset back.
+    expect(request.work.filter((e) => isSnapshotRead(e) || isCandidateRead(e) || isRunning(e) || isCursorAdvance(e))).toEqual([]);
+    // Each later transaction takes the turn again, first.
+    expect(isTurnLock(snapshot.work[0])).toBe(true);
+    expect(indexOf(snapshot.work, isSnapshotRead)).toBeGreaterThan(0);
+    expect(snapshot.work.filter(isReopen)).toEqual([]);
+    expect(isTurnLock(batch.work[0])).toBe(true);
     // The scan is a later transaction: it never runs against a revision that still says complete.
-    expect(request.work.filter((e) => isCandidateRead(e) || isRunning(e) || isCursorAdvance(e))).toEqual([]);
     expect(batch.work.filter(isReopen)).toEqual([]);
     // From the start: the stored cursor of the finished scan was cleared with the status.
     expect(batch.work.find(isCandidateRead)!.params).toEqual([TEAM, null, 25]);
@@ -357,9 +373,59 @@ describe("a request is a durable step; a turn alone only continues", () => {
     expect(assignments).toContain("attempts=0,last_error=null,next_attempt_at=null");
     // No new revision: nothing that validated the current mappings is invalidated by a request.
     expect(assignments).not.toMatch(/\brevision=/);
-    // Only a finished scan is reopened; pending, running and retry are continued, never restarted.
-    expect(where).toBe("team_id=$1 and repair_revision=revision and repair_status in ('complete','awaiting_cache')");
+    // A finished scan and a failed one are reopened; a scan in healthy progress is never restarted.
+    expect(where).toBe("team_id=$1 and repair_revision=revision and repair_status in ('complete','awaiting_cache','retry')");
     expect(reopen.params).toEqual([TEAM]);
+  });
+
+  it("the request OUTLIVES a failed snapshot: the reset stays committed, the failure is recorded on top of it, and the retry scans from the beginning", async () => {
+    const stored = { status: "complete", cursor: ITEM_B as string | null };
+    let outage = true;
+    const c = completedTeam(stored, (entry) => (
+      outage && isSnapshotRead(entry) ? injected("identity authority read unavailable") : undefined
+    ));
+    await expect(reattributeItems(new PgClient(), TEAM, { batchSize: 25 })).rejects.toThrow(/read unavailable/);
+
+    // request (committed) → snapshot (rolled back) → the failure record (committed).
+    expect(c.transactions.map((t) => t.end)).toEqual(["commit", "rollback", "commit"]);
+    const [request, snapshot, record] = c.transactions;
+    expect(request.work.filter(isReopen)).toHaveLength(1);
+    expect(snapshot.work.filter(isReopen)).toEqual([]);
+    expect(record.work.filter(isRetry)).toHaveLength(1);
+    // What is durable now: a failed repair whose cursor is the request's, not the finished scan's.
+    expect(stored).toEqual({ status: "retry", cursor: null });
+
+    // The scheduler's turn — which requests nothing — therefore scans from the start.
+    outage = false;
+    const before = c.log.length;
+    await expect(runScheduledAttributionRepairTurn(new PgClient(), { teamId: TEAM, teamSlug: "acme" }, { batchSize: 25 }))
+      .resolves.toBe("continuing");
+    const turn = c.log.slice(before);
+    expect(turn.filter(isReopen)).toEqual([]);
+    expect(turn.find(isCandidateRead)!.params).toEqual([TEAM, null, 25]);
+  });
+
+  it("a request made during RETRY starts over: a failed turn's cursor is not trusted to mean the rows behind it are right", async () => {
+    // A failed finalization leaves `retry` with the cursor at the END of a finished scan.
+    const stored = { status: "retry", cursor: ITEM_B as string | null };
+    const c = completedTeam(stored);
+    await expect(reattributeItems(new PgClient(), TEAM, { batchSize: 25 })).resolves.toMatchObject({ turn: "scanned", scanned: 1 });
+    expect(c.log.find(isCandidateRead)!.params).toEqual([TEAM, null, 25]);
+    // Whereas a turn that only continues keeps that cursor, as it must.
+    const continued = { status: "retry", cursor: ITEM_B as string | null };
+    const d = completedTeam(continued);
+    await takeRepairScanTurn(new PgClient(), TEAM, { batchSize: 25 });
+    expect(d.log.filter(isReopen)).toEqual([]);
+    expect(d.log.find(isCandidateRead)!.params).toEqual([TEAM, ITEM_B, 25]);
+  });
+
+  it("a request that itself fails enqueued nothing and records nothing: it is only reported", async () => {
+    const stored = { status: "complete", cursor: ITEM_B as string | null };
+    const c = completedTeam(stored, (entry) => (isReopen(entry) ? injected("authority write unavailable") : undefined));
+    await expect(reattributeItems(new PgClient(), TEAM)).rejects.toThrow(/write unavailable/);
+    expect(c.transactions.map((t) => t.end)).toEqual(["rollback"]);
+    expect(c.log.filter(isRetry)).toEqual([]);
+    expect(stored).toEqual({ status: "complete", cursor: ITEM_B });
   });
 
   it("a request does not restart a repair in progress: it continues from the committed cursor", async () => {
