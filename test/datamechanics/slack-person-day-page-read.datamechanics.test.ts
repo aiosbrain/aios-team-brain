@@ -1045,6 +1045,79 @@ describe("aggregate Slack page — two-way SQL/projector equality (N4)", () => {
     }
   });
 
+  /**
+   * Eight groups that an internal fetch of two splits into at least four batches (red review, 4):
+   *
+   *   1 x·A 06-20 .900   2 y·B 06-20 .800 | 3 y·C 06-20 .700   4 y·B 06-19 .800 | … only y … | (later x)
+   *
+   * X is loaded in the FIRST batch. Its one later group sits either between y's groups ("middle") or
+   * after all of them ("tail"). Every batch after the first holds only y once that group is omitted,
+   * so a comparison that looks only at the items of the CURRENT batch never looks at X again.
+   */
+  async function interleaved(position: "middle" | "tail"): Promise<Scene & { x: string; y: string; omitted: string; laterDay: string }> {
+    const s = await scene();
+    const team = s.team.teamId;
+    const xRoot = ts(D20, 900);
+    const yRoot = ts(D20, 800);
+    const x = await thread(s, "x", xRoot, "U1");
+    const y = await thread(s, "y", yRoot, "U2");
+    await message(team, y, ts(D20, 700), { root: yRoot, user: "U3" });
+    await message(team, y, ts(D19, 800), { root: yRoot, user: "U2" });
+    await message(team, y, ts(D19, 700), { root: yRoot, user: "U3" });
+    await message(team, y, ts(D18, 800), { root: yRoot, user: "U2" });
+    await message(team, y, ts(D18, 700), { root: yRoot, user: "U3" });
+    const later = position === "middle"
+      ? { stamp: ts(D19, 750), user: "U2", member: s.b.id, day: "2024-06-19" }
+      : { stamp: ts("2024-06-17T16:13:20", 500), user: "U3", member: s.c.id, day: "2024-06-17" };
+    await message(team, x, later.stamp, { root: xRoot, user: later.user });
+    await converge(s.team);
+    return { ...s, x, y, omitted: groupId(x, later.member, later.day), laterDay: later.day };
+  }
+
+  it.each(["middle", "tail"] as const)(
+    "retains a loaded item across internal fetch batches: a later X group omitted at the %s is found although every remaining batch holds only Y",
+    async (position) => {
+      const s = await interleaved(position);
+      const small = { budgets: { candidateFetchSize: 2 } };
+
+      // Control: the same forced batching with nothing omitted is one complete page of eight groups,
+      // read in at least four internal batches of at most two candidates.
+      const batches: string[][] = [];
+      const clean = await page(s.w, {}, {
+        corruptCandidates: (rows: Json[]) => { batches.push(rows.map((r) => String(r.itemId))); return rows; },
+      }, small);
+      expect(clean.aggregates).toHaveLength(8);
+      expect(clean.slackComplete).toBe(true);
+      expect(clean.aggregates.map((a: Json) => a.id)).toContain(s.omitted);
+      expect(batches.filter((batch) => batch.length > 0).length).toBeGreaterThanOrEqual(4);
+      for (const batch of batches) expect(batch.length).toBeLessThanOrEqual(2);
+      expect(batches[0]).toEqual([s.x, s.y]);
+
+      // Now omit X's later group from the one batch that carries it.
+      const seen: string[][] = [];
+      let dropped = 0;
+      const failure = await expectFailure(() => page(s.w, {}, {
+        corruptCandidates: (rows: Json[]) => {
+          const out = rows.filter((r) => !(r.itemId === s.x && r.day === s.laterDay));
+          dropped += rows.length - out.length;
+          seen.push(out.map((r) => String(r.itemId)));
+          return out;
+        },
+      }, small), "unavailable");
+      expect(dropped, "exactly the later X group was omitted").toBe(1);
+      // X was loaded in batch one, and after that the reader never saw X in a batch again: at least
+      // two later batches held only Y. The omission can therefore only be found from RETAINED state —
+      // when the scan frontier passes the missing tuple, or at the latest when SQL exhaustion is claimed.
+      expect(seen[0]).toEqual([s.x, s.y]);
+      const afterFirst = seen.slice(1);
+      expect(afterFirst.flat()).not.toContain(s.x);
+      expect(afterFirst.filter((batch) => batch.length > 0 && batch.every((id) => id === s.y)).length).toBeGreaterThanOrEqual(2);
+      // Not a short "complete" page of seven, and not a restart: an unexplained missing candidate.
+      expect(failure).not.toHaveProperty("aggregates");
+      expect(s.w.seen.aggregates.at(-1)?.map((g) => g.id) ?? [], "the seven-group page was never composed").not.toHaveLength(7);
+    }
+  );
+
   it("is unavailable when the SQL account relation omits one of a member's accounts", async () => {
     const s = await twoDays();
     let omitted = 0;
@@ -1430,6 +1503,122 @@ describe("aggregate Slack page — initial non-Slack evidence (N1) and presentat
     }
   });
 
+  /**
+   * A frozen initial snapshot that depends on source items in every way a timeline day can:
+   *   g — an evidence row whose own `id` is a same-team item;
+   *   h — an item a row CITES through `/library/<id>` while its own id is not an item;
+   *   k — a row nested under a task;
+   *   d — an item a decision signal cites;
+   *   m — the capped third GitHub row and the synopsis: counted and summarized, rendered nowhere.
+   * All five are real items the real oracle shows. The declared list must be exactly this set: a
+   * list that is well-formed and a subset of the visible set can still be INCOMPLETE, and then the
+   * publication and final subset checks have nothing to notice a revocation with (red review, 3).
+   */
+  type Backing = Record<"g" | "h" | "k" | "d" | "m", string>;
+  async function sourcedInitial(): Promise<Scene & { x: string; ids: Backing; result: () => Json }> {
+    const s = await scene();
+    const x = await thread(s, "x", ts(D20, 1), "U1");
+    const ids: Backing = {
+      g: await githubItem(s.team, "row"), h: await githubItem(s.team, "cited"), k: await githubItem(s.team, "task-row"),
+      d: await githubItem(s.team, "decision"), m: await githubItem(s.team, "capped"),
+    };
+    await converge(s.team);
+    const result = (): Json => ({
+      sourceItemIds: [ids.g, ids.h, ids.k, ids.d, ids.m],
+      days: [{
+        date: "2024-06-20", label: labelFor("2024-06-20", new Date(s.w.nowMs)),
+        people: [{
+          memberId: s.team.memberId, name: "Tester", handle: "tester", avatarUrl: null, total: 4, unlinked: 3,
+          summary: "Opened a pull request and recorded a decision.",
+          tasks: [{
+            taskId: "T9", title: "Tracked task", status: "in_progress", source: "linear", evidenceCount: 1,
+            sources: [{ source: "github", count: 1, items: [{ id: ids.k, title: "Task commit", source: "github", kind: "commit", at: "2024-06-20T08:00:00Z" }] }],
+          }],
+          other: [{
+            source: "github", count: 3, // capped: the third row (m) is counted and summarized, not rendered
+            items: [
+              { id: ids.g, title: "PR one", source: "github", kind: "pr", at: "2024-06-20T09:00:00Z", url: "https://github.com/acme/repo/pull/1" },
+              { id: "commit:abc123", title: "Cited commit", source: "github", kind: "commit", at: "2024-06-20T08:30:00Z", url: `/library/${ids.h}` },
+            ],
+          }],
+          signals: [{ kind: "decision", count: 1, items: [{ id: "decision-1", kind: "decision", title: "Decided X", at: "2024-06-20", url: `/library/${ids.d}` }] }],
+        }],
+      }],
+    });
+    s.w.override.initial = () => result();
+    return { ...s, x, ids, result };
+  }
+  const RENDERED = ["PR one", "Cited commit", "Task commit", "Decided X", "Opened a pull request"];
+
+  it("accepts an initial snapshot whose declared backing IDs are exactly its dependency set", async () => {
+    const s = await sourcedInitial();
+    const all = Object.values(s.ids).sort();
+    const one = await page(s.w);
+    for (const title of RENDERED) expect(JSON.stringify(one.days)).toContain(title);
+    expect([...one.initialNonSlackSourceItemIds].sort()).toEqual(all);
+    // Order carries no meaning; the set does.
+    s.w.override.initial = () => ({ ...s.result(), sourceItemIds: [...all].reverse() });
+    expect([...(await page(s.w)).initialNonSlackSourceItemIds].sort()).toEqual(all);
+    // A genuinely unsourced row — its id is no item and it cites none — needs no backing ID.
+    s.w.override.initial = () => {
+      const r = s.result();
+      (r.days as TimelineDay[])[0].people[0].other.push({
+        source: "meetings", count: 1, items: [{ id: randomUUID(), title: "Standup", source: "meetings", kind: "meeting", at: "2024-06-20" }],
+      });
+      return r;
+    };
+    const withMeeting = await page(s.w);
+    expect(JSON.stringify(withMeeting.days)).toContain("Standup");
+    expect([...withMeeting.initialNonSlackSourceItemIds].sort()).toEqual(all);
+  });
+
+  it.each([
+    ["everything: G is rendered and nothing is declared (the review counterexample)", (): string[] => [], "g"],
+    ["an evidence row whose own id is a same-team item", (ids: Backing): string[] => [ids.h, ids.k, ids.d, ids.m], "g"],
+    ["an item a row cites through its /library link", (ids: Backing): string[] => [ids.g, ids.k, ids.d, ids.m], "h"],
+    ["a row nested under a task", (ids: Backing): string[] => [ids.g, ids.h, ids.d, ids.m], "k"],
+    ["an item a decision signal cites", (ids: Backing): string[] => [ids.g, ids.h, ids.k, ids.m], "d"],
+    ["every rendered dependency, declaring only an unrelated visible item instead", (_ids: Backing, unrelated: string): string[] => [unrelated], "g"],
+    ["the synopsis's rendered evidence, declaring only the unrendered capped row", (ids: Backing): string[] => [ids.m], "g"],
+  ] as const)("refuses a VALID, visible backing-ID list that omits %s, and never publishes it stale", async (_label, listOf, omitted) => {
+    const s = await sourcedInitial();
+    const unrelated = await githubItem(s.team, "unrelated");
+    await converge(s.team);
+    const declared = listOf(s.ids, unrelated);
+    s.w.override.initial = () => ({ ...s.result(), sourceItemIds: declared });
+    // The list is a well-formed, duplicate-free subset of what the real oracle shows right now, so a
+    // shape-and-subset check alone would publish this page. It is an incomplete dependency result.
+    const visibleNow = (await runSql<{ id: string }>(
+      `select u.source_item_id as id from project_context_memberships m
+         join project_context_units u on u.id = m.context_unit_id
+        where m.team_id = $1 and m.valid_to is null and u.source_item_id = any($2::uuid[])`, [s.team.teamId, declared]
+    )).rows.map((row) => row.id);
+    expect([...new Set(visibleNow)].sort()).toEqual([...declared].sort());
+    const complete = await expectFailure(() => page(s.w), "unavailable");
+    // The stale-publication half of the counterexample: the omitted item is revoked after the
+    // evidence read. Nothing declared would have caught it; the page must still not exist.
+    const stale = await expectFailure(() => page(s.w, {}, { afterEvidence: () => revokeMembership(s.ids[omitted]) }), "unavailable");
+    for (const failure of [complete, stale]) {
+      for (const title of RENDERED) expect(JSON.stringify(failure)).not.toContain(title);
+    }
+  });
+
+  it("enforces a declared dependency no rendered row shows: the synopsis and capped count depend on it", async () => {
+    const s = await sourcedInitial();
+    expect(JSON.stringify(s.result().days), "m is rendered nowhere").not.toContain(s.ids.m);
+    // Revoked between the evidence read and publication: the first page restarts.
+    await expectFailure(() => page(s.w, {}, { afterEvidence: () => revokeMembership(s.ids.m) }), "restart_required");
+
+    // Revoked after a published first page: only the final real-oracle subset check can see it.
+    const later = await sourcedInitial();
+    const r = await reader();
+    const one = await page(later.w);
+    const input = { ...request(later.w), binding: one.binding, initialNonSlackSourceItemIds: one.initialNonSlackSourceItemIds };
+    await expect(r.validateSlackPersonDayFinal(input, dependencies(later.w))).resolves.toBeUndefined();
+    await revokeMembership(later.ids.m);
+    await expectFailure(() => r.validateSlackPersonDayFinal(input, dependencies(later.w)), "restart_required");
+  });
+
   it("hands the presentation loader the actual principal and the evidence-snapshot admission", async () => {
     const s = await withGithub();
     await page(s.w);
@@ -1613,13 +1802,23 @@ describe("aggregate Slack page — deterministic budgets (D1)", () => {
 
   it("enforces elapsed time on the injected monotonic clock: the exact limit passes, one more fails", async () => {
     const s = await rejectedRun(1);
+    // The boundary is placed at the reader's LAST clock reading, the check before it returns: no
+    // statement follows it, so "exactly the budget" does not also mean "a transaction with no time
+    // left to run in". The number of readings for this unchanged fixture is learned from a first run.
+    let readings = 0;
+    expect((await page(s.w, {}, {}, { monotonicNow: () => { readings++; return 5_000; } })).aggregates).toHaveLength(1);
+    expect(readings, "the reader consults the monotonic clock").toBeGreaterThan(1);
     for (const [elapsed, ok] of [[30_000, true], [30_001, false]] as const) {
-      s.w.mono = 5_000;
-      const run = () => page(s.w, {}, { afterEvidence: async () => { s.w.mono = 5_000 + elapsed; } });
+      let n = 0;
+      const run = () => page(s.w, {}, {}, { monotonicNow: () => (++n >= readings ? 5_000 + elapsed : 5_000) });
       if (ok) expect((await run()).aggregates).toHaveLength(1);
       else await expectFailure(run, "budget_exhausted");
+      expect(n, "the same number of clock readings as the learning run").toBe(readings);
     }
-    // The wall clock is independent: it can stand still while the monotonic budget runs out.
+    // Running out part-way is refused wherever it is noticed: after the evidence read…
+    s.w.mono = 5_000;
+    await expectFailure(() => page(s.w, {}, { afterEvidence: async () => { s.w.mono = 5_000 + 30_001; } }), "budget_exhausted");
+    // …or during it. The wall clock is independent: it stands still while the monotonic budget runs out.
     s.w.mono = 0;
     await expectFailure(() => page(s.w, {}, { afterDiscovery: async () => { s.w.mono = 31_000; } }), "budget_exhausted");
   });
@@ -1643,4 +1842,253 @@ describe("aggregate Slack page — deterministic budgets (D1)", () => {
       await expectFailure(() => page(s.w, {}, {}, { [missing]: undefined }), "unavailable");
     }
   );
+});
+
+/**
+ * Red review, finding 5. The elapsed-time tests above advance a clock inside callbacks that then
+ * RETURN, so they prove a check after the fact. A page budget must also end work that never returns:
+ *
+ *  - Every opaque loader is handed `signal: AbortSignal` in its context object.
+ *  - While any awaited work is pending the reader holds a deadline through the injectable
+ *    `scheduleDeadline(callback, delayMs) => cancel` (default: the platform timer), with a delay no
+ *    longer than the remaining elapsed budget. When it fires, the reader aborts that signal, rolls
+ *    its transaction back, releases the connection and rejects `budget_exhausted` — without waiting
+ *    for the abandoned work, and never with a partial page.
+ *  - Both transactions run under a transaction-local `statement_timeout` no longer than the
+ *    remaining budget (and never 0, which PostgreSQL reads as "no timeout"), so a statement that
+ *    never returns is cancelled by the server.
+ *
+ * Nothing here sleeps: fake timers are fired by hand, pending work is a promise the test holds, and
+ * the one real wait is PostgreSQL cancelling its own statement.
+ */
+describe("aggregate Slack page — pending work, cancellation and statement timeouts", () => {
+  interface FakeTimer { fire: () => void; delayMs: number; cancelled: boolean; fired: boolean }
+
+  function fakeTimers(): { timers: FakeTimer[]; scheduleDeadline: (callback: () => void, delayMs: number) => () => void; fireAll: () => void } {
+    const timers: FakeTimer[] = [];
+    return {
+      timers,
+      scheduleDeadline: (callback, delayMs) => {
+        const timer: FakeTimer = { fire: callback, delayMs, cancelled: false, fired: false };
+        timers.push(timer);
+        return () => { timer.cancelled = true; };
+      },
+      // Fire every armed timer, including any re-armed by a callback, a bounded number of rounds.
+      fireAll: () => {
+        for (let round = 0; round < 8; round++) {
+          const armed = timers.filter((t) => !t.cancelled && !t.fired);
+          if (armed.length === 0) return;
+          for (const t of armed) { t.fired = true; t.fire(); }
+        }
+      },
+    };
+  }
+
+  type Settled = { state: "pending" } | { state: "fulfilled"; value: unknown } | { state: "rejected"; error: Json };
+
+  /** A promise's state after a bounded number of event-loop turns. No timer, no sleep. */
+  async function settled(promise: Promise<unknown>, turns = 25): Promise<Settled> {
+    let outcome: Settled = { state: "pending" };
+    promise.then(
+      (value) => { outcome = { state: "fulfilled", value }; },
+      (error) => { outcome = { state: "rejected", error: error as Json }; }
+    );
+    for (let n = 0; n < turns && outcome.state === "pending"; n++) await new Promise<void>((resolve) => setImmediate(resolve));
+    return outcome;
+  }
+
+  /** Sessions other than this one still inside a transaction, after a bounded number of round trips. */
+  async function openTransactionsSettleToZero(): Promise<number> {
+    let open = -1;
+    for (let n = 0; n < 60; n++) {
+      open = (await runSql<{ n: number }>(
+        `select count(*)::int as n from pg_stat_activity
+          where datname = current_database() and pid <> pg_backend_pid() and state like 'idle in transaction%'`
+      )).rows[0].n;
+      if (open === 0) return 0;
+    }
+    return open;
+  }
+
+  /** Work that never settles until the test lets go of it, and a signal for "the reader got here". */
+  function neverSettles(): { work: Promise<never>; entered: Promise<void>; enter: () => void; finishLate: () => void } {
+    let enter = (): void => undefined;
+    let finishLate = (): void => undefined;
+    const entered = new Promise<void>((resolve) => { enter = resolve; });
+    const work = new Promise<never>((_resolve, reject) => { finishLate = () => reject(new Error("abandoned work finished late")); });
+    work.catch(() => undefined); // the test owns this promise; the reader must not need it to settle
+    return { work, entered, enter, finishLate };
+  }
+
+  async function oneThread(): Promise<Scene> {
+    const s = await scene();
+    await thread(s, "x", ts(D20, 1), "U1");
+    s.w.nonSlack.push({ itemId: await githubItem(s.team, "pr"), title: "PR one", memberId: s.team.memberId });
+    await converge(s.team);
+    return s;
+  }
+
+  type PendingPoint =
+    | "loadAdmission" | "loadPresentation" | "loadInitialNonSlack"
+    | "loadAdmission (validation transaction)" | "loadPresentation (validation transaction)"
+    | "in-transaction work after discovery" | "work between the two transactions";
+
+  it.each<PendingPoint>([
+    "loadAdmission", "loadPresentation", "loadInitialNonSlack",
+    "loadAdmission (validation transaction)", "loadPresentation (validation transaction)",
+    "in-transaction work after discovery", "work between the two transactions",
+  ])("ends a page whose %s never settles: abort, rollback, budget_exhausted, no partial page", async (point) => {
+    const s = await oneThread();
+    const clock = fakeTimers();
+    const pending = neverSettles();
+    const real = dependencies(s.w);
+    let signal: AbortSignal | undefined;
+    const calls: Record<string, number> = {};
+    /** A loader that hangs on its `hangOn`-th call and otherwise behaves exactly like the real fixture. */
+    const hanging = (name: string, hangOn: number) => (query: SqlExecutor, context: Json): unknown => {
+      calls[name] = (calls[name] ?? 0) + 1;
+      if (calls[name] !== hangOn) return (real[name] as (q: SqlExecutor, c: Json) => unknown)(query, context);
+      signal = context.signal as AbortSignal;
+      pending.enter();
+      return pending.work;
+    };
+    const deps: Json = { scheduleDeadline: clock.scheduleDeadline, monotonicNow: () => s.w.mono };
+    const options: Json = {};
+    const [name, phase] = point.split(" (");
+    if (name.startsWith("load")) deps[name] = hanging(name, phase ? 2 : 1);
+    else if (point === "in-transaction work after discovery") options.afterDiscovery = () => { pending.enter(); return pending.work; };
+    else options.afterEvidence = () => { pending.enter(); return pending.work; };
+
+    s.w.mono = 1_000;
+    const run = page(s.w, {}, options, deps);
+    await pending.entered; // the reader reached the work that will never finish
+    expect((await settled(run)).state, "nothing ends the page before its deadline").toBe("pending");
+
+    // The pending work is guarded by a live deadline no longer than the remaining 30-second budget.
+    const armed = clock.timers.filter((t) => !t.cancelled && !t.fired);
+    expect(armed.length, "a deadline is armed while work is pending").toBeGreaterThan(0);
+    for (const t of clock.timers) {
+      expect(Number.isFinite(t.delayMs) && t.delayMs > 0, "a deadline is a positive finite delay").toBe(true);
+      expect(t.delayMs).toBeLessThanOrEqual(30_000);
+    }
+    if (name.startsWith("load")) {
+      expect(signal, "the loader was handed an AbortSignal").toBeInstanceOf(AbortSignal);
+      expect(signal?.aborted).toBe(false);
+    }
+
+    // The monotonic clock passes the budget and the deadline fires. The work is STILL pending.
+    s.w.mono = 1_000 + 30_001;
+    clock.fireAll();
+    const after = await failureOf(() => run);
+    expect(after).toMatchObject({ name: "SlackTimelineError", code: "budget_exhausted" });
+    for (const partial of ["days", "aggregates", "binding", "nextSlackCursor", "slackComplete"]) expect(after).not.toHaveProperty(partial);
+    if (name.startsWith("load")) expect(signal?.aborted, "the abandoned loader was told to stop").toBe(true);
+    expect(clock.timers.filter((t) => !t.cancelled && !t.fired), "no deadline is left armed").toEqual([]);
+
+    // The transaction was rolled back and its connection released although the work never returned.
+    expect(await openTransactionsSettleToZero()).toBe(0);
+    // Abandoned work finishing late changes nothing and poisons nothing.
+    pending.finishLate();
+    expect((await settled(run)).state).toBe("rejected");
+    s.w.mono = 0;
+    expect((await page(s.w)).aggregates).toHaveLength(1);
+  });
+
+  it("cancels its deadlines and aborts nothing on a page that completes normally", async () => {
+    const s = await oneThread();
+    const clock = fakeTimers();
+    const real = dependencies(s.w);
+    const signals: AbortSignal[] = [];
+    const recording = (name: string) => (query: SqlExecutor, context: Json): unknown => {
+      signals.push(context.signal as AbortSignal);
+      return (real[name] as (q: SqlExecutor, c: Json) => unknown)(query, context);
+    };
+    const p = await page(s.w, {}, {}, {
+      scheduleDeadline: clock.scheduleDeadline,
+      loadAdmission: recording("loadAdmission"), loadPresentation: recording("loadPresentation"), loadInitialNonSlack: recording("loadInitialNonSlack"),
+    });
+    expect(p.aggregates).toHaveLength(1);
+    expect(clock.timers.length, "the page armed a deadline").toBeGreaterThan(0);
+    expect(clock.timers.filter((t) => !t.cancelled), "every deadline was cancelled").toEqual([]);
+    // Admission and presentation are each read twice (evidence, validation); the initial loader once.
+    expect(signals).toHaveLength(5);
+    for (const signal of signals) {
+      expect(signal).toBeInstanceOf(AbortSignal);
+      expect(signal.aborted).toBe(false);
+    }
+    // A deadline that fires after the page was returned is inert.
+    for (const t of clock.timers) t.fire();
+    expect(signals.every((signal) => !signal.aborted)).toBe(true);
+    expect(await openTransactionsSettleToZero()).toBe(0);
+  });
+
+  it.each([
+    ["a non-function", 42],
+    ["a scheduler that returns no cancel function", () => undefined],
+  ])("refuses %s as its deadline scheduler: unavailable, with no transaction left open", async (_label, scheduleDeadline) => {
+    const s = await oneThread();
+    await expectFailure(() => page(s.w, {}, {}, { scheduleDeadline }), "unavailable");
+    expect(await openTransactionsSettleToZero()).toBe(0);
+  });
+
+  it("runs both transactions under a local statement timeout no longer than the remaining budget, and never zero", async () => {
+    const timeoutMs = async (query: SqlExecutor): Promise<number> =>
+      (await query<{ ms: number }>(`select setting::int as ms from pg_settings where name = 'statement_timeout'`)).rows[0].ms;
+    for (const [budgets, spentBetween] of [[{}, 0], [{ maxElapsedMs: 5_000 }, 0], [{ maxElapsedMs: 5_000 }, 2_000], [{}, 12_345]] as const) {
+      const s = await oneThread();
+      const limit = (budgets as { maxElapsedMs?: number }).maxElapsedMs ?? 30_000;
+      const real = dependencies(s.w);
+      const seen: { phase: string; ms: number }[] = [];
+      let admissions = 0;
+      s.w.mono = 0;
+      await page(s.w, {}, {
+        afterTransactionConfigured: async (query: SqlExecutor) => { seen.push({ phase: "evidence", ms: await timeoutMs(query) }); },
+        afterEvidence: async () => { s.w.mono = spentBetween; },
+      }, {
+        budgets,
+        loadAdmission: async (query: SqlExecutor, context: Json) => {
+          if (++admissions === 2) seen.push({ phase: "validation", ms: await timeoutMs(query) });
+          return (real.loadAdmission as (q: SqlExecutor, c: Json) => unknown)(query, context);
+        },
+      });
+      expect(seen.map((row) => row.phase)).toEqual(["evidence", "validation"]);
+      const [evidence, validation] = seen;
+      expect(evidence.ms).toBeGreaterThan(0);
+      expect(evidence.ms).toBeLessThanOrEqual(limit);
+      // Zero would mean "no timeout" to PostgreSQL: the bound is always positive, and it SHRINKS with
+      // the budget already spent — a timeout fixed at the whole budget is not the remaining runtime.
+      expect(validation.ms).toBeGreaterThan(0);
+      expect(validation.ms).toBeLessThanOrEqual(limit - spentBetween);
+      // Transaction-local: a pooled connection is not left with the page's timeout.
+      const outside = (await runSql<{ ms: number }>(`select setting::int as ms from pg_settings where name = 'statement_timeout'`)).rows[0].ms;
+      const baseline = (await runSql<{ ms: number }>(`select reset_val::int as ms from pg_settings where name = 'statement_timeout'`)).rows[0].ms;
+      expect(outside).toBe(baseline);
+    }
+  });
+
+  it("lets PostgreSQL cancel a statement that outlives the budget, and reports budget_exhausted", { timeout: 20_000 }, async () => {
+    const s = await oneThread();
+    let cancelled: Json | null = null;
+    // The reader's own deadline timer is replaced by one that never fires, so only the SERVER can
+    // end the statement: this isolates the statement timeout from the client-side deadline.
+    const inert = fakeTimers();
+    const failure = await expectFailure(() => page(s.w, {}, {
+      afterDiscovery: async (query: SqlExecutor) => {
+        try {
+          // Five seconds of server-side work against a one-second budget. Nothing in this test waits:
+          // the server ends the statement, or the assertion below fails when it returns normally.
+          await query(`select pg_sleep(5)`);
+        } catch (error) {
+          cancelled = error as Json;
+          throw error;
+        }
+      },
+    }, { budgets: { maxElapsedMs: 1_000 }, scheduleDeadline: inert.scheduleDeadline }), "budget_exhausted");
+    expect(inert.timers.every((t) => !t.fired), "no client-side deadline fired").toBe(true);
+    expect(cancelled, "the statement was ended by the server, not allowed to finish").not.toBeNull();
+    expect(cancelled).toMatchObject({ code: "57014" }); // query_canceled: statement timeout
+    expect(String(failure.message)).not.toContain("pg_sleep");
+    expect(await openTransactionsSettleToZero()).toBe(0);
+    expect((await page(s.w)).aggregates).toHaveLength(1);
+  });
 });

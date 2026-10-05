@@ -819,3 +819,200 @@ describe("Slack timeline drain — shared budgets (D1)", () => {
     expect(w.calls.start).toEqual([]);
   });
 });
+
+/**
+ * Red review, finding 5. The elapsed tests above advance a clock inside callbacks that then RETURN,
+ * so they prove a check made afterwards. A drain must also end a page request or a final validation
+ * that never returns at all:
+ *
+ *  - `startPage(input, { signal })`, `nextPage(cursor, { signal })` and `validateFinal(input, { signal })`
+ *    each receive an AbortSignal as a SECOND argument (the first arguments are unchanged).
+ *  - While a call is pending the drain holds a deadline through the injectable
+ *    `scheduleDeadline(callback, delayMs) => cancel` (default: the platform timer), never longer than
+ *    the remaining shared elapsed budget. When it fires, the drain aborts that signal and rejects
+ *    `budget_exhausted` at once — it does not wait for the abandoned call, does not restart, does not
+ *    validate, and returns nothing accumulated.
+ *
+ * Deterministic and bounded: timers are fakes fired by hand, pending work is a promise the test
+ * holds, and "still pending" is observed over a fixed number of event-loop turns. Nothing sleeps.
+ */
+describe("Slack timeline drain — pending work and the shared deadline", () => {
+  interface FakeTimer { fire: () => void; delayMs: number; cancelled: boolean; fired: boolean }
+  type Call = "start" | "next" | "final";
+  type Settled = { state: "pending" } | { state: "fulfilled"; value: unknown } | { state: "rejected"; error: Json };
+
+  /** A promise's state after a bounded number of event-loop turns. No timer, no sleep. */
+  async function settled(promise: Promise<unknown>, turns = 25): Promise<Settled> {
+    let outcome: Settled = { state: "pending" };
+    promise.then(
+      (value) => { outcome = { state: "fulfilled", value }; },
+      (error) => { outcome = { state: "rejected", error: error as Json }; }
+    );
+    for (let n = 0; n < turns && outcome.state === "pending"; n++) await new Promise<void>((resolve) => setImmediate(resolve));
+    return outcome;
+  }
+
+  /**
+   * The fake page service with a controllable clock and timers. Every page request costs ten seconds
+   * of monotonic time; the call named `hang` (its `hangOn`-th occurrence) never settles.
+   */
+  function harness(hang: Call | null, hangOn = 1, attempts: AttemptSpec[] = [stable(), stable({ asOfMs: AS_OF_2 })]) {
+    const clock = { now: 50_000 };
+    const w = world(attempts, 2, { before: () => { clock.now += 10_000; } });
+    const timers: FakeTimer[] = [];
+    const signals: { call: Call; signal: unknown }[] = [];
+    const count: Record<Call, number> = { start: 0, next: 0, final: 0 };
+    let finishLate = (): void => undefined;
+    let pendingSignal: AbortSignal | undefined;
+    const real: Record<Call, (input: never) => Promise<unknown>> = {
+      start: w.deps.startPage as never, next: w.deps.nextPage as never, final: w.deps.validateFinal as never,
+    };
+    const wrap = (call: Call) => (input: unknown, context?: { signal?: AbortSignal }): Promise<unknown> => {
+      count[call]++;
+      signals.push({ call, signal: context?.signal });
+      if (call === hang && count[call] === hangOn) {
+        pendingSignal = context?.signal;
+        const work = new Promise<never>((_resolve, reject) => { finishLate = () => reject(new Error("abandoned work finished late")); });
+        work.catch(() => undefined); // the test owns this promise; the drain must not need it to settle
+        return work;
+      }
+      return real[call](input as never);
+    };
+    return {
+      w, clock, timers, signals, count,
+      pendingSignal: () => pendingSignal,
+      finishLate: () => finishLate(),
+      fireAll: () => {
+        for (let round = 0; round < 8; round++) {
+          const armed = timers.filter((t) => !t.cancelled && !t.fired);
+          if (armed.length === 0) return;
+          for (const t of armed) { t.fired = true; t.fire(); }
+        }
+      },
+      deps: {
+        ...w.deps,
+        startPage: wrap("start"), nextPage: wrap("next"), validateFinal: wrap("final"),
+        monotonicNow: () => clock.now,
+        scheduleDeadline: (callback: () => void, delayMs: number) => {
+          const timer: FakeTimer = { fire: callback, delayMs, cancelled: false, fired: false };
+          timers.push(timer);
+          return () => { timer.cancelled = true; };
+        },
+      },
+    };
+  }
+
+  it.each([
+    ["the first page request", "start", 1, 0],
+    ["a continuation request", "next", 1, 10_000],
+    ["a later continuation request", "next", 2, 20_000],
+    ["final validation", "final", 1, 30_000],
+  ] as const)("ends a drain whose %s never settles: abort, budget_exhausted, nothing accumulated", async (_label, call, hangOn, spent) => {
+    const d = await drainModule();
+    const h = harness(call, hangOn);
+    const run: Promise<unknown> = d.drainSlackTimeline(h.deps);
+    run.catch(() => undefined);
+
+    // Before the deadline: the drain is simply waiting. Nothing times out early.
+    expect((await settled(run)).state, "the drain waits while its budget lasts").toBe("pending");
+    expect(h.count[call], "the hanging call was reached").toBe(hangOn);
+    const signal = h.pendingSignal();
+    expect(signal, "the pending call was handed an AbortSignal").toBeInstanceOf(AbortSignal);
+    expect(signal?.aborted).toBe(false);
+    // The pending call is guarded by a live deadline no longer than what is left of 120 seconds.
+    const armed = h.timers.filter((t) => !t.cancelled && !t.fired);
+    expect(armed.length, "a deadline is armed while the call is pending").toBeGreaterThan(0);
+    for (const t of h.timers) expect(Number.isFinite(t.delayMs) && t.delayMs > 0, "a deadline is a positive finite delay").toBe(true);
+    for (const t of armed) expect(t.delayMs).toBeLessThanOrEqual(120_000 - spent);
+
+    // The shared budget runs out and the deadline fires. The call is STILL pending.
+    h.clock.now += 120_001;
+    h.fireAll();
+    const after = await settled(run);
+    expect(after.state, "the drain rejects without waiting for the abandoned call").toBe("rejected");
+    const failure = (after as { error: Json }).error;
+    expect(failure).toMatchObject({ name: "SlackTimelineError", code: "budget_exhausted" });
+    for (const partial of ["days", "window_days", "binding", "aggregates"]) expect(failure).not.toHaveProperty(partial);
+    expect(signal?.aborted, "the abandoned call was told to stop").toBe(true);
+
+    // A timeout is not an overtake: no restart, no further page, no final validation after the fact.
+    const frozen = { ...h.count };
+    expect(frozen.start).toBe(1);
+    if (call !== "final") expect(frozen.final).toBe(0);
+    expect(h.timers.filter((t) => !t.cancelled && !t.fired), "no deadline is left armed").toEqual([]);
+
+    // The abandoned call settling late changes nothing: no late result, no late request.
+    h.finishLate();
+    expect((await settled(run)).state).toBe("rejected");
+    expect(h.count).toEqual(frozen);
+  });
+
+  it("does not grant a restarted attempt a fresh deadline: the second attempt's pending page ends on the shared budget", async () => {
+    const d = await drainModule();
+    // Attempt one: two completed requests (20 s), overtaken on the third. Attempt two hangs on its first page.
+    const h = harness("start", 2);
+    const overtaken = h.deps.nextPage;
+    let nexts = 0;
+    h.deps.nextPage = (input: unknown, context?: { signal?: AbortSignal }) => {
+      if (++nexts === 2) return Promise.reject(failWith("restart_required"));
+      return overtaken(input, context);
+    };
+    const run: Promise<unknown> = d.drainSlackTimeline(h.deps);
+    run.catch(() => undefined);
+    expect((await settled(run)).state).toBe("pending");
+    expect(h.count.start).toBe(2);
+    // Two page requests cost twenty seconds before the overtake: at most a hundred remain.
+    for (const t of h.timers.filter((timer) => !timer.cancelled && !timer.fired)) expect(t.delayMs).toBeLessThanOrEqual(100_000);
+    h.clock.now += 100_001;
+    h.fireAll();
+    const after = await settled(run);
+    expect(after.state).toBe("rejected");
+    expect((after as { error: Json }).error).toMatchObject({ name: "SlackTimelineError", code: "budget_exhausted" });
+    expect(h.pendingSignal()?.aborted).toBe(true);
+    expect(h.count.final).toBe(0);
+  });
+
+  it("cancels every deadline and aborts nothing on a drain that completes", async () => {
+    const d = await drainModule();
+    const h = harness(null);
+    const result = await d.drainSlackTimeline(h.deps);
+    expect(result).toEqual({ window_days: 7, days: expected(stable()) });
+    // Three page requests and one final validation, each with its own live signal.
+    expect(h.signals.map((entry) => entry.call)).toEqual(["start", "next", "next", "final"]);
+    for (const entry of h.signals) {
+      expect(entry.signal, `${entry.call} was handed an AbortSignal`).toBeInstanceOf(AbortSignal);
+      expect((entry.signal as AbortSignal).aborted).toBe(false);
+    }
+    expect(h.timers.length, "the drain armed a deadline").toBeGreaterThan(0);
+    expect(h.timers.filter((t) => !t.cancelled), "every deadline was cancelled").toEqual([]);
+    // The first arguments are exactly what they were: the signal is a second argument, not a new field.
+    expect(h.w.calls.start).toEqual([{ windowDays: 7, pageSize: 2 }]);
+    expect(h.w.calls.next).toEqual(["cursor:0:2", "cursor:0:4"]);
+    expect(h.w.calls.final).toEqual([{ binding: binding(AS_OF_1, 2), initialNonSlackSourceItemIds: [GITHUB_ITEM] }]);
+    // A deadline that fires after the result was returned is inert.
+    for (const t of h.timers) t.fire();
+    expect(h.signals.every((entry) => !(entry.signal as AbortSignal).aborted)).toBe(true);
+  });
+
+  it("leaves no deadline armed when a page fails outright", async () => {
+    const d = await drainModule();
+    // Nothing is pending here: the first continuation simply rejects. No timer may outlive the drain.
+    const h = harness(null);
+    h.deps.nextPage = () => Promise.reject(failWith("unavailable"));
+    expect(await failureOf(() => d.drainSlackTimeline(h.deps))).toMatchObject({ name: "SlackTimelineError", code: "unavailable" });
+    expect(h.timers.length, "the drain armed a deadline").toBeGreaterThan(0);
+    expect(h.timers.filter((t) => !t.cancelled && !t.fired), "no deadline outlives the failed drain").toEqual([]);
+  });
+
+  it.each([
+    ["a non-function", 42],
+    ["a scheduler that returns no cancel function", () => undefined],
+  ])("refuses %s as its deadline scheduler: unavailable, and nothing is left pending", async (_label, scheduleDeadline) => {
+    const d = await drainModule();
+    const w = world([stable()], 2);
+    const failure = await failureOf(() => d.drainSlackTimeline({ ...w.deps, scheduleDeadline }));
+    expect(failure).toMatchObject({ name: "SlackTimelineError", code: "unavailable" });
+    expect(failure).not.toHaveProperty("days");
+    expect(w.calls.final).toEqual([]);
+  });
+});

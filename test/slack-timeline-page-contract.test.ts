@@ -47,8 +47,11 @@ async function expectFailure(run: () => unknown, code: FailureCode): Promise<voi
   expect(await failureOf(run)).toMatchObject({ name: "SlackTimelineError", code });
 }
 
-const TEAM = "11111111-1111-4111-8111-111111111111";
-const OTHER_TEAM = "99999999-9999-4999-8999-999999999999";
+// Every fixture UUID carries hexadecimal LETTERS, so an "uppercase" mutation is a different string.
+// A digits-only UUID would make the uppercase negative identical to the valid payload (red review,
+// finding 1); the fixture control beside the malformed-payload table asserts this for all of them.
+const TEAM = "1a1b1c1d-1111-4111-8111-1111abcdef11";
+const OTHER_TEAM = "9f9e9d9c-9999-4999-8999-9999fedcba99";
 const ITEM_A = "0a000000-0000-4000-8000-000000000001";
 const ITEM_B = "0b000000-0000-4000-8000-000000000002";
 const MEMBER_A = "a0000000-0000-4000-8000-00000000000a";
@@ -450,8 +453,39 @@ describe("Slack timeline page contract — authenticated cursor", () => {
     ["a tuple that is an array", payload({ lastAggregateTuple: ["2024-06-20"] })],
   ];
 
+  // A fixture control, deliberately independent of the module under test: it passes or fails on the
+  // table alone. Without it a "malformed" row can be byte-identical to the valid payload, and the
+  // decoder is then asked to accept and reject the same authenticated plaintext.
+  it("fixture control: every malformed payload is a different plaintext from the valid one, and from each other", () => {
+    const plaintext = (value: unknown): string => (typeof value === "string" ? value : JSON.stringify(value));
+    const valid = plaintext(payload());
+    const seen = new Map<string, string>();
+    for (const [label, value] of MALFORMED) {
+      const text = plaintext(value);
+      expect(text, `"${label}" must differ from the valid payload`).not.toBe(valid);
+      expect(seen.get(text), `"${label}" duplicates another malformed fixture`).toBeUndefined();
+      seen.set(text, label);
+    }
+    // The case-mutation rows specifically: each source value really has a letter to change.
+    const uppercased: [string, string][] = [
+      ["team UUID", TEAM], ["other team UUID", OTHER_TEAM], ["item UUID", ITEM_A], ["second item UUID", ITEM_B],
+      ["member UUID", MEMBER_A], ["second member UUID", MEMBER_B], ["admission digest", hex("admission")],
+    ];
+    for (const [label, value] of uppercased) {
+      expect(value.toUpperCase(), `${label} has no hexadecimal letter to uppercase`).not.toBe(value);
+      expect(value, `${label} is canonical lowercase`).toBe(value.toLowerCase());
+    }
+    const byLabel = new Map(MALFORMED);
+    expect((byLabel.get("an uppercase team UUID") as Json).teamId).toBe(TEAM.toUpperCase());
+    expect((byLabel.get("an uppercase team UUID") as Json).teamId).not.toBe(payload().teamId);
+    expect(((byLabel.get("a tuple with an uppercase item UUID") as Json).lastAggregateTuple as Json).itemId).not.toBe(ITEM_A);
+    expect((byLabel.get("an uppercase digest") as Json).admissionBindingDigest).not.toBe(payload().admissionBindingDigest);
+  });
+
   it.each(MALFORMED)("refuses an authentic token whose payload has %s", async (_label, value) => {
     const c = await contract();
+    // The valid payload authenticates and decodes; this row differs from it only by its defect.
+    expect(c.decodeSlackTimelineCursor(seal(payload()), KEY)).toEqual(payload());
     await expectFailure(() => c.decodeSlackTimelineCursor(seal(value), KEY), "invalid_request");
   });
 
