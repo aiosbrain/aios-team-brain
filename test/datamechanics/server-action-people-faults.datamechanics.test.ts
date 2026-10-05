@@ -30,7 +30,13 @@ import { placeMemberByTier, seedTeam } from "./helpers";
  *          repeating every combination; both have an admitted control here.
  *   gate — the target-member lookup of the real `gate`, for all six exports: an injected returned
  *          error, and a valid id no member holds (a native zero-row read). Both refuse not allowed
- *          with no statement issued through the writer client.
+ *          with no statement issued through the writer client. The injection identifies that
+ *          lookup by the target's id alone — never by the tenant predicate these cases assert — so
+ *          a lookup whose team binding were missing or wrong is still faulted and then fails the
+ *          trace assertion, not the fixture's "did not fire" premise. A fixture regression pins
+ *          that reachability: the real `currentMember` read, then a FIXTURE-BUILT target read
+ *          carrying the correct, no, or a foreign team predicate. It executes no People export and
+ *          is not a product denial.
  *   T    — direct `setMemberGoal` under an explicit `system_import` scope: a competing native insert
  *          wins the imported key and the importer converges on / reassigns that row within its team;
  *          a row re-homed to another team is refused; another team's identical key is not converged
@@ -118,6 +124,7 @@ import {
   saveMemberGoal,
   saveProfile,
 } from "@/app/t/[team]/people/[handle]/actions";
+import { currentMember } from "@/lib/auth/guard";
 import {
   ProfileScopeRefusal,
   addTimeOff,
@@ -477,15 +484,20 @@ const at = (table: string, operation: Operation, identity: Row = {}): Matcher =>
 };
 
 /**
- * The gate's target-member lookup and nothing else: a `members` read bound to EXACTLY (team, id).
+ * The gate's target-member lookup, identified WITHOUT the tenant predicate it is used to observe: a
+ * `members` read carrying the target's exact `id` equality and no `auth_user_id` equality.
  * `currentMember`'s own lookup is bound to the session's auth-user id and carries no `id`
  * predicate, so it can never be the statement this identifies — even when actor and target match.
+ * Neither a `team_id` predicate nor a predicate count is required: a lookup whose team binding is
+ * missing, wrong or accompanied by a further predicate is still faulted, and is then judged by the
+ * case's own trace assertion rather than as an injection that never fired. This identifies one
+ * operation and proves no predicate: a lookup with a missing or wrong target `id` is outside it.
  */
-const targetLookupOf = (teamId: string, memberId: string): Matcher => (built) => {
-  if (built.table !== "members" || built.operation !== "select") return false;
-  const bound = boundOf(built);
-  return Object.keys(bound).length === 2 && bound.team_id === teamId && bound.id === memberId;
-};
+const targetLookupOf = (memberId: string): Matcher => (built) =>
+  built.table === "members" &&
+  built.operation === "select" &&
+  built.filters.some(([column, value]) => column === "id" && value === memberId) &&
+  !built.filters.some(([column]) => column === "auth_user_id");
 
 /**
  * A real pg adapter whose builders are observed, held and — for at most one statement — faulted.
@@ -1217,7 +1229,8 @@ describe("AIO-1217 gate · the target-member lookup fails closed after the actor
       const { team, target, session } = ids;
       const invoke = await arrange(ids);
       const before = await contextState();
-      const injection = fault("the gate's target-member lookup", targetLookupOf(team.teamId, target), RETURNED);
+      // Armed by the target id alone: the lookup's team binding is asserted below, not assumed here.
+      const injection = fault("the gate's target-member lookup", targetLookupOf(target), RETURNED);
       const gateTap = tappedDb({ fault: injection });
       const writer = tappedDb();
 
@@ -1269,6 +1282,149 @@ describe("AIO-1217 gate · the target-member lookup fails closed after the actor
         ...before,
         revalidated: [],
       });
+    },
+  );
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// gate fixture — the target-lookup injection does not depend on the tenant predicate it observes
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+describe("AIO-1217 gate fixture · the target-lookup injection is reached whatever team predicate the lookup carries (fixture regression: no People export runs, nothing here is a product denial)", () => {
+  const TEAM = randomUUID();
+  const FOREIGN_TEAM = randomUUID();
+  const TARGET = randomUUID();
+  const AUTH_USER = randomUUID();
+  const membersRead = (filters: Built["filters"]): Built => ({ table: "members", operation: "select", payload: undefined, filters });
+
+  /** What identifies the target lookup: its table, its operation, the target id, and no auth user. */
+  const SHAPES: Array<{ shape: string; statement: Built; identified: boolean }> = [
+    {
+      shape: "the target id under the correct team (the real gate's lookup)",
+      statement: membersRead([["team_id", TEAM], ["id", TARGET]]),
+      identified: true,
+    },
+    { shape: "the target id with NO team predicate", statement: membersRead([["id", TARGET]]), identified: true },
+    {
+      shape: "the target id under a FOREIGN team",
+      statement: membersRead([["team_id", FOREIGN_TEAM], ["id", TARGET]]),
+      identified: true,
+    },
+    {
+      shape: "the target id under the correct team with one further predicate",
+      statement: membersRead([["team_id", TEAM], ["id", TARGET], ["status", "active"]]),
+      identified: true,
+    },
+    {
+      shape: "currentMember's lookup (team, auth user, status)",
+      statement: membersRead([["team_id", TEAM], ["auth_user_id", AUTH_USER], ["status", "active"]]),
+      identified: false,
+    },
+    {
+      shape: "currentMember's lookup whose auth-user id is the target's own UUID",
+      statement: membersRead([["team_id", TEAM], ["auth_user_id", TARGET], ["status", "active"]]),
+      identified: false,
+    },
+    {
+      shape: "a members read naming the target id AND an auth user",
+      statement: membersRead([["team_id", TEAM], ["auth_user_id", AUTH_USER], ["id", TARGET]]),
+      identified: false,
+    },
+    {
+      shape: "another member's id under the correct team",
+      statement: membersRead([["team_id", TEAM], ["id", randomUUID()]]),
+      identified: false,
+    },
+    {
+      shape: "the target id read from another table",
+      statement: { ...membersRead([["team_id", TEAM], ["id", TARGET]]), table: "member_profiles" },
+      identified: false,
+    },
+    {
+      shape: "an UPDATE of the target member",
+      statement: { ...membersRead([["team_id", TEAM], ["id", TARGET]]), operation: "update", payload: { role: "admin" } },
+      identified: false,
+    },
+    {
+      shape: "a DELETE of the target member",
+      statement: { ...membersRead([["team_id", TEAM], ["id", TARGET]]), operation: "delete" },
+      identified: false,
+    },
+    {
+      shape: "an INSERT writing the target's (team, id)",
+      statement: { ...membersRead([]), operation: "insert", payload: { team_id: TEAM, id: TARGET } },
+      identified: false,
+    },
+  ];
+
+  it.each(SHAPES)("[fixture] targetLookupOf · $shape → identified: $identified", ({ statement, identified }) => {
+    expect(targetLookupOf(TARGET)(statement)).toBe(identified);
+  });
+
+  /** The team predicate the fixture-built target read carries; only the first is the real gate's. */
+  const TEAM_PREDICATES: Array<{ predicate: string; canonical: boolean; teamOf: (own: string, foreign: string) => string | null }> = [
+    { predicate: "the correct team predicate", canonical: true, teamOf: (own) => own },
+    { predicate: "NO team predicate", canonical: false, teamOf: () => null },
+    { predicate: "a FOREIGN team's predicate", canonical: false, teamOf: (_own, foreign) => foreign },
+  ];
+
+  it.each(TEAM_PREDICATES)(
+    "[fixture] gate injection · a target read built with $predicate: the real currentMember read first admits the admin actor and is not faulted, then the fixture's read of the real target by id is the one statement identified and replaced by a returned error before it is sent — the injection fires exactly once on the bound actually built, the caller receives the error and no member row, with no writer statement, no context row, no audit and no revalidation; only the correct predicate is the trace the action cases require",
+    async ({ canonical, teamOf }) => {
+      const { team, actor, target, session } = await people("admin-other");
+      const foreign = await seedTeam();
+      const before = await contextState();
+      const boundTeam = teamOf(team.teamId, foreign.teamId);
+      const built: Row = boundTeam ? { team_id: boundTeam, id: target } : { id: target };
+      const injection = fault("the fixture-built target-member read", targetLookupOf(target), RETURNED);
+      const gateTap = tappedDb({ fault: injection });
+      const writer = tappedDb();
+
+      // NOT a People export. The owner's real actor read runs through the `serverClient()` seam,
+      // then a read shaped like the gate's target lookup is built on that same tapped client with
+      // this parameter's team predicate. The caller honors the envelope and issues no writer.
+      const outcome = await runAction(writer, gateTap, async () => {
+        const me = await currentMember(team.teamId);
+        const read = gateTap.db.from("members").select("id");
+        const { data, error } = await (boundTeam ? read.eq("team_id", boundTeam) : read).eq("id", target).maybeSingle();
+        return { actor: me, target: data as unknown, error: error?.message ?? null };
+      });
+
+      const after = await contextState();
+      const reads = traceOf(gateTap, "members");
+      expect({
+        outcome,
+        matched: injection.matched,
+        fired: injection.fired,
+        gate: reads,
+        writer: writer.statements,
+        ...after,
+        revalidated: revalidatedPaths(),
+      }).toEqual({
+        outcome: {
+          returned: {
+            actor: { id: actor, role: "admin", tier: "team", userId: session.id },
+            target: null,
+            error: injection.message,
+          },
+        },
+        // The actor's read was never identified: the target read is the matcher's first and only hit.
+        matched: 1,
+        fired: [{ table: "members", operation: "select", bound: built, outcome: FAULT_OUTCOME[RETURNED] }],
+        gate: [
+          { operation: "select", bound: { team_id: team.teamId, auth_user_id: session.id }, outcome: ONE_ROW },
+          { operation: "select", bound: built, outcome: FAULT_OUTCOME[RETURNED] },
+        ],
+        writer: [],
+        ...before,
+        revalidated: [],
+      });
+
+      // The action cases' own discriminator is not relaxed: a faulted lookup with a missing or
+      // foreign team predicate is NOT the gate trace they require, so it fails there — as a scope
+      // observation, with the injection fired — rather than as an unfired-injection premise.
+      const required = expect(reads, "the canonical (authenticated team, target id) gate trace");
+      (canonical ? required : required.not).toEqual(gateTrace(team.teamId, session.id, target, FAULT_OUTCOME[RETURNED]));
     },
   );
 });
