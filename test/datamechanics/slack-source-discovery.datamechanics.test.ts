@@ -40,6 +40,10 @@ import {
  *     `for update nowait` on a separate connection: an app-held row lock would raise 55P03 there.
  *  4. PROGRESS IS NOT CERTIFICATION. A partial page moves a cursor; only a genuinely terminal page
  *     moves the completed interval. Nothing about that distinction is visible from a call site.
+ *  5. THE NEWEST-LANE SEAM HAS A MARGIN (pre-activation correction PA-3). The anchor a scan freezes
+ *     is the DATABASE's clock and a message's `ts` is the PROVIDER's, so a catch-up that starts
+ *     exactly on the previous anchor is one message wide against a clock that is not ours. Only a
+ *     provider that serves by the request's own bounds can show what that loses.
  */
 
 const WORKSPACE = "T0SOURCE1";
@@ -54,11 +58,16 @@ function discover(
   seed: Seed,
   integrationId: string,
   fake: SlackFake,
-  over: { client?: ReturnType<typeof db>; maxRequests?: number } = {}
+  over: { client?: ReturnType<typeof db>; maxRequests?: number; skewAllowanceMs?: number } = {}
 ): Promise<SlackSourceDiscoveryResult> {
   return discoverSlackSource(
     { db: over.client ?? db(), teamId: seed.teamId, integrationId },
-    { fetchImpl: fake.impl, envToken: () => null, maxRequests: over.maxRequests }
+    {
+      fetchImpl: fake.impl,
+      envToken: () => null,
+      maxRequests: over.maxRequests,
+      skewAllowanceMs: over.skewAllowanceMs,
+    }
   );
 }
 
@@ -92,6 +101,33 @@ function tx<T>(fn: (session: TransactionSession) => Promise<T>): Promise<T> {
 
 async function setup(seed: Seed, channelIds: readonly string[] = [CHANNEL]): Promise<string> {
   return seedSlackIntegration(seed, { channelIds, token: TOKEN });
+}
+
+/** The newest-lane skew allowance's default, STATED rather than imported: a changed constant must fail here. */
+const DEFAULT_SKEW_ALLOWANCE_MS = 60_000;
+const SIX_DIGIT_TS = /^[0-9]+[.][0-9]{6}$/;
+const MICROS_PER_SECOND = BigInt(1_000_000);
+
+function msToMicros(ms: number): bigint {
+  return BigInt(ms) * BigInt(1_000);
+}
+
+/** A six-digit Slack `ts` as whole microseconds. Integers only — a float cannot hold one exactly. */
+function tsMicros(ts: string): bigint {
+  const match = /^([0-9]+)[.]([0-9]{6})$/.exec(ts);
+  if (!match) throw new Error(`fixture: ${JSON.stringify(ts)} is not a six-digit Slack timestamp`);
+  return BigInt(match[1]) * MICROS_PER_SECOND + BigInt(match[2]);
+}
+
+/**
+ * The test's OWN arithmetic for "this instant, moved by that much": six digits, clamped at zero. It
+ * is deliberately not the product's helper — an oracle borrowed from the code under test agrees
+ * with it by construction.
+ */
+function shiftTs(ts: string, deltaMicros: bigint): string {
+  const shifted = tsMicros(ts) + deltaMicros;
+  const clamped = shifted < BigInt(0) ? BigInt(0) : shifted;
+  return `${clamped / MICROS_PER_SECOND}.${String(clamped % MICROS_PER_SECOND).padStart(6, "0")}`;
 }
 
 // ── the first page ───────────────────────────────────────────────────────────
@@ -564,7 +600,11 @@ describe("replay and overlap", () => {
     expect(after).toEqual(before);
   });
 
-  it("overlaps the certified boundary rather than skipping past it", async () => {
+  // ⚠️ CHANGED ON PURPOSE (pre-activation correction PA-3, AC-PA-08). This test used to assert that
+  // the catch-up's `oldest` EQUALS the previous certified top — an overlap exactly one message wide,
+  // which is no overlap at all against a provider whose clock is not the database's. The lower
+  // bound sent is now that top MINUS the skew allowance; what is stored is unchanged.
+  it("overlaps the certified boundary by the skew allowance, not by one message (AC-PA-08)", async () => {
     const seed = await seedTeam();
     const integrationId = await setup(seed);
     const fake = pass((call) =>
@@ -578,9 +618,305 @@ describe("replay and overlap", () => {
 
     const catchUp = fake.calls.filter((c) => c.method === "conversations.history" && isCatchUp(c));
     expect(catchUp).toHaveLength(1);
-    // The lower bound is the previous certified top, and it is INCLUSIVE — the boundary message is
-    // read again, and the exact-key enqueue is what makes that harmless.
-    expect(catchUp[0].params.get("oldest")).toBe(seeded?.completed_upper_ts);
+    // The lower bound is the previous certified top less the DEFAULT allowance of sixty seconds, in
+    // the six-digit microsecond form Slack expects, and it is still INCLUSIVE — everything in the
+    // margin is read again, and the exact-key enqueue is what makes that harmless.
+    expect(catchUp[0].params.get("oldest")).toBe(
+      shiftTs(String(seeded?.completed_upper_ts), -msToMicros(DEFAULT_SKEW_ALLOWANCE_MS))
+    );
+    expect(catchUp[0].params.get("oldest")).toMatch(SIX_DIGIT_TS);
     expect(catchUp[0].params.get("inclusive")).toBe("true");
+
+    // Only the REQUEST moved. The interval that is certified still ends exactly where each scan was
+    // anchored, and still starts where it did.
+    const after = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    expect(after?.completed_upper_ts).toBe(catchUp[0].params.get("latest"));
+    expect(after?.completed_lower_ts).toBe(seeded?.completed_lower_ts);
+  });
+});
+
+// ── the newest-lane seam ─────────────────────────────────────────────────────
+
+/** The database's clock as a Slack `ts`: the clock every scan anchor is frozen from. */
+async function dbClockTs(): Promise<string> {
+  const c = await rawSql();
+  const { rows } = await c.query<{ ts: string }>(
+    `select to_char(extract(epoch from clock_timestamp()), 'FM9999999999.000000') as ts`
+  );
+  return rows[0].ts;
+}
+
+/**
+ * A provider-side channel that SERVES BY THE REQUEST'S OWN BOUNDS: `latest`, `oldest`, `inclusive`,
+ * `limit` and a cursor, newest first, exactly as `conversations.history` does.
+ *
+ * ⚠️ A scripted handler cannot test a seam. It returns whatever the test told it to whatever was
+ * asked, so a lower bound that excludes a message and one that includes it look identical. This one
+ * forgets nothing and filters on what it is sent — which is the only way "was that root inside the
+ * range we asked for?" has an answer.
+ *
+ * `lagMs` is the provider's clock running BEHIND the database's: a message posted at a database
+ * instant is stamped that much earlier, which is how a root comes to carry a `ts` below an anchor
+ * that was frozen before the root existed.
+ */
+function providerChannel(opts: { lagMs?: number } = {}): {
+  history: SlackHandler;
+  pages: { params: URLSearchParams; served: string[] }[];
+  post(ts: string): string;
+  postAt(dbInstant: string): string;
+} {
+  const roots: string[] = [];
+  const pages: { params: URLSearchParams; served: string[] }[] = [];
+  const history: SlackHandler = (call) => {
+    const latest = call.params.get("latest");
+    const oldest = call.params.get("oldest");
+    const inclusive = call.params.get("inclusive") === "true";
+    const limit = Number(call.params.get("limit"));
+    const offset = Number((call.params.get("cursor") ?? "offset:0").replace("offset:", ""));
+    if (latest === null || !Number.isSafeInteger(limit) || limit <= 0 || !Number.isSafeInteger(offset)) {
+      throw new Error("fixture: a history request this provider cannot serve");
+    }
+    const upper = tsMicros(latest);
+    const lower = oldest === null ? null : tsMicros(oldest);
+    const inRange = roots
+      .filter((ts) => {
+        const at = tsMicros(ts);
+        if (inclusive ? at > upper : at >= upper) return false;
+        return lower === null || (inclusive ? at >= lower : at > lower);
+      })
+      .sort((a, b) => (tsMicros(a) < tsMicros(b) ? 1 : -1));
+    const served = inRange.slice(offset, offset + limit);
+    const more = offset + limit < inRange.length;
+    pages.push({ params: call.params, served });
+    return slackJson(
+      historyBody({
+        messages: served.map((ts) => rootMessage(ts)),
+        hasMore: more,
+        nextCursor: more ? `offset:${offset + limit}` : null,
+      })
+    );
+  };
+  return {
+    history,
+    pages,
+    post(ts) {
+      roots.push(ts);
+      return ts;
+    },
+    postAt(dbInstant) {
+      const ts = shiftTs(dbInstant, -msToMicros(opts.lagMs ?? 0));
+      roots.push(ts);
+      return ts;
+    },
+  };
+}
+
+describe("the newest-lane seam has a margin (PA-3)", () => {
+  const OLD_ROOT = "1718900000.000100";
+
+  /**
+   * THE MISSED ROOT, with no real clock involved. The seed scan is served and certifies up to its
+   * anchor. A provider running two seconds behind the database then takes a message one second
+   * AFTER that anchor and stamps it one second BELOW it — inside the interval already certified,
+   * and on no page that was ever served.
+   */
+  async function lateRootBelowTheAnchor(): Promise<{
+    seed: Seed;
+    integrationId: string;
+    channel: ReturnType<typeof providerChannel>;
+    fake: SlackFake;
+    anchor: string;
+    late: string;
+  }> {
+    const seed = await seedTeam();
+    const integrationId = await setup(seed);
+    const channel = providerChannel({ lagMs: 2_000 });
+    channel.post(OLD_ROOT);
+    const fake = pass(channel.history);
+
+    await discover(seed, integrationId, fake);
+    const anchor = String((await channelRow(seed.teamId, WORKSPACE, CHANNEL))?.completed_upper_ts);
+    // The prior top page was served WITHOUT it: the root did not exist yet.
+    expect(channel.pages.map((page) => page.served)).toEqual([[OLD_ROOT]]);
+
+    const late = channel.postAt(shiftTs(anchor, msToMicros(1_000)));
+    expect(late).toBe(shiftTs(anchor, -msToMicros(1_000)));
+    return { seed, integrationId, channel, fake, anchor, late };
+  }
+
+  it("discovers a root a lagging provider stamped BELOW the previous anchor (AC-PA-07)", async () => {
+    const { seed, integrationId, channel, fake, late } = await lateRootBelowTheAnchor();
+
+    await elapse(seed.teamId);
+    await discover(seed, integrationId, fake);
+
+    expect(channel.pages).toHaveLength(2);
+    // The catch-up asked far enough below the anchor to be served the root it would have skipped…
+    expect(channel.pages[1].served).toEqual([late]);
+    expect(await threadRootTs(seed.teamId)).toEqual([OLD_ROOT, late]);
+    // …which matters because the interval is now certified up to this scan's anchor with that root
+    // INSIDE it: a root missed here is never looked for again, and its absence later reads as a
+    // deletion.
+    const after = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    expect(after?.completed_upper_ts).toBe(channel.pages[1].params.get("latest"));
+    expect(tsMicros(late) < tsMicros(String(after?.completed_upper_ts))).toBe(true);
+  });
+
+  /**
+   * THE CONTROL for the test above, on the same fixture with one thing changed: an allowance
+   * configured BELOW the skew. The root is missed again — so it is the margin that found it, not a
+   * provider that hands everything back whatever `oldest` says, and the allowance is a real setting
+   * rather than a constant.
+   */
+  it("misses that root when the allowance is configured below the skew (AC-PA-07 control)", async () => {
+    const { seed, integrationId, channel, fake, anchor } = await lateRootBelowTheAnchor();
+
+    await elapse(seed.teamId);
+    await discover(seed, integrationId, fake, { skewAllowanceMs: 500 });
+
+    expect(channel.pages).toHaveLength(2);
+    expect(channel.pages[1].params.get("oldest")).toBe(shiftTs(anchor, -msToMicros(500)));
+    expect(channel.pages[1].served).toEqual([]);
+    expect(await threadRootTs(seed.teamId)).toEqual([OLD_ROOT]);
+  });
+
+  /**
+   * ONE SCAN, ONE LOWER BOUND. A catch-up that needs two pages is two wakes and two claims of the
+   * same anchored scan. The allowance is taken off the STORED bound when the request is built and
+   * never written back — a bound persisted after the subtraction would be subtracted from again on
+   * the next page, sliding the window sixty seconds further down every wake.
+   */
+  it("sends every page of one scan the same lower bound, and stores none of it (AC-PA-08)", async () => {
+    const seed = await seedTeam();
+    const integrationId = await setup(seed);
+    const channel = providerChannel();
+    channel.post(OLD_ROOT);
+    const fake = pass(channel.history);
+
+    await discover(seed, integrationId, fake);
+    const seeded = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    const anchor = String(seeded?.completed_upper_ts);
+    // More new roots than one page holds, all posted just above the certified top.
+    const limit = Number(channel.pages[0].params.get("limit"));
+    const fresh = Array.from({ length: limit + 5 }, (_, i) => channel.post(shiftTs(anchor, BigInt(i + 1))));
+
+    await elapse(seed.teamId);
+    await discover(seed, integrationId, fake); // catch-up, page 1 of 2
+    const midScan = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    await elapse(seed.teamId);
+    await discover(seed, integrationId, fake); // catch-up, page 2 of 2
+    const after = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+
+    expect(channel.pages).toHaveLength(3);
+    const [, first, second] = channel.pages;
+    expect(first.served).toHaveLength(limit);
+    expect(second.served).toHaveLength(5);
+    expect(second.params.get("cursor")).toBe(midScan?.newest_cursor);
+
+    // The same margin on both pages, under the same frozen anchor.
+    const lowerBound = shiftTs(anchor, -msToMicros(DEFAULT_SKEW_ALLOWANCE_MS));
+    expect(first.params.get("oldest")).toBe(lowerBound);
+    expect(second.params.get("oldest")).toBe(lowerBound);
+    expect(lowerBound).toMatch(SIX_DIGIT_TS);
+    expect(second.params.get("latest")).toBe(first.params.get("latest"));
+
+    // Between the pages the row holds the scan's bookkeeping EXACTLY as before: the lower bound is
+    // the certified top itself, the anchor is the one the scan froze, and nothing is certified yet.
+    expect(midScan?.newest_lower_ts).toBe(anchor);
+    expect(midScan?.newest_anchor_ts).toBe(first.params.get("latest"));
+    expect(midScan?.completed_upper_ts).toBe(anchor);
+
+    // …and the finished scan certifies to its anchor, with every root queued once.
+    expect(after).toMatchObject({ newest_cursor: null, newest_anchor_ts: null, newest_lower_ts: null });
+    expect(after?.completed_upper_ts).toBe(first.params.get("latest"));
+    expect(after?.completed_lower_ts).toBe(seeded?.completed_lower_ts);
+    const queued = await threadRootTs(seed.teamId);
+    expect(queued).toHaveLength(fresh.length + 1);
+    expect(new Set(queued)).toEqual(new Set([OLD_ROOT, ...fresh]));
+  });
+
+  it.each([
+    {
+      name: "a sub-second allowance, borrowing across the second when it has to",
+      allowanceMs: 1_999,
+      expected: (lower: string) => shiftTs(lower, -msToMicros(1_999)),
+    },
+    {
+      // A century: longer than the epoch is old, so the subtraction goes below zero.
+      name: "an allowance larger than the bound itself, clamped at zero",
+      allowanceMs: 100 * 365 * 24 * 60 * 60 * 1000,
+      expected: () => "0.000000",
+    },
+  ])("sends the CONFIGURED lower bound in six-digit form: $name (AC-PA-08)", async ({ allowanceMs, expected }) => {
+    const seed = await seedTeam();
+    const integrationId = await setup(seed);
+    const fake = pass((call) =>
+      slackJson(historyBody({ messages: isCatchUp(call) ? [] : [rootMessage(OLD_ROOT)] }))
+    );
+
+    await discover(seed, integrationId, fake);
+    const seeded = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    await elapse(seed.teamId);
+    await discover(seed, integrationId, fake, { skewAllowanceMs: allowanceMs });
+
+    const catchUp = fake.calls.filter((c) => c.method === "conversations.history" && isCatchUp(c));
+    expect(catchUp).toHaveLength(1);
+    expect(catchUp[0].params.get("oldest")).toBe(expected(String(seeded?.completed_upper_ts)));
+    expect(catchUp[0].params.get("oldest")).toMatch(SIX_DIGIT_TS);
+    // Zero is the ONLY floor: the certified interval is untouched by how far down the request went.
+    const after = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    expect(after?.completed_upper_ts).toBe(catchUp[0].params.get("latest"));
+    expect(after?.completed_lower_ts).toBe(seeded?.completed_lower_ts);
+  });
+
+  /** A quiet channel whose only root is ten seconds old on the database's clock when it is seeded. */
+  async function quietChannelWithOneRecentRoot(): Promise<{
+    seed: Seed;
+    integrationId: string;
+    channel: ReturnType<typeof providerChannel>;
+    fake: SlackFake;
+    recent: string;
+  }> {
+    const seed = await seedTeam();
+    const integrationId = await setup(seed);
+    const channel = providerChannel();
+    // Below the anchor the seed scan is about to freeze, and well inside the allowance beneath it.
+    const recent = channel.post(shiftTs(await dbClockTs(), -msToMicros(10_000)));
+    const fake = pass(channel.history);
+
+    await discover(seed, integrationId, fake);
+    expect(channel.pages.map((page) => page.served)).toEqual([[recent]]);
+    return { seed, integrationId, channel, fake, recent };
+  }
+
+  it("queues a root ONCE when the overlap reads it a second time (AC-PA-09)", async () => {
+    const { seed, integrationId, channel, fake, recent } = await quietChannelWithOneRecentRoot();
+    const queued = await threadRows(seed.teamId);
+    expect(queued.map((row) => row.root_ts)).toEqual([recent]);
+
+    await elapse(seed.teamId);
+    await discover(seed, integrationId, fake);
+
+    // The root really was served twice — by the seed scan, then again inside the catch-up's margin…
+    expect(channel.pages.map((page) => page.served)).toEqual([[recent], [recent]]);
+    // …and it is still one row, and the same row: the exact-key enqueue did nothing the second time.
+    expect(await threadRows(seed.teamId)).toEqual(queued);
+  });
+
+  it("spends ONE history request on a quiet channel whose overlap holds one message (AC-PA-09b)", async () => {
+    const { seed, integrationId, channel, fake, recent } = await quietChannelWithOneRecentRoot();
+    const before = fake.countOf("conversations.history");
+
+    await elapse(seed.teamId);
+    const result = await discover(seed, integrationId, fake);
+
+    // The margin is not free in general — it is re-read on a shared budget — but here it holds one
+    // message, and one page carries it: the catch-up costs what it cost before there was a margin.
+    expect(channel.pages[1]?.served).toEqual([recent]);
+    expect(fake.countOf("conversations.history") - before).toBe(1);
+    expect(result.steps.filter((s) => s.stage === "history").map((s) => s.result)).toEqual(["ok"]);
+    const after = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    expect(after).toMatchObject({ newest_cursor: null, newest_anchor_ts: null, newest_lower_ts: null });
+    expect(after?.completed_upper_ts).toBe(channel.pages[1]?.params.get("latest"));
   });
 });
