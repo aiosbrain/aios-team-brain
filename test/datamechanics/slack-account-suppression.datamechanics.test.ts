@@ -25,6 +25,14 @@ async function mapping(teamId: string, externalId: string): Promise<{ id: string
   return rows[0] ?? null;
 }
 
+/** The stored handle of one exact Slack key — what an in-place metadata refresh changes. */
+async function handleOf(teamId: string, externalId: string): Promise<string | null> {
+  const { rows } = await runSql<{ handle: string }>(
+    `select handle from member_identities
+       where team_id = $1 and provider = 'slack' and external_id = $2`, [teamId, externalId]);
+  return rows[0]?.handle ?? null;
+}
+
 async function suppressed(teamId: string, externalId: string): Promise<boolean> {
   const { rows } = await runSql(
     `select 1 from member_identity_suppressions
@@ -95,7 +103,8 @@ describe("Slack account suppression (real Postgres)", () => {
     expect(await mapping(teamId, "UCONSENT")).toBeNull();
     expect(await suppressed(teamId, "UCONSENT")).toBe(true);
     expect(await generation(teamId)).toBe("2");
-    expect(await syncSlackIdentities(db(), teamId, [{ id: "UCONSENT", displayName: "Again", email }]))
+    expect(await syncSlackIdentities(db(), teamId,
+      [{ id: "UCONSENT", displayName: "Again", email, isBot: false, isAppUser: false }]))
       .toMatchObject({ scanned: 1, mapped: 0, skipped: 1 });
     expect(await mapping(teamId, "UCONSENT")).toBeNull();
     expect(await generation(teamId)).toBe("2");
@@ -106,7 +115,14 @@ describe("Slack account suppression (real Postgres)", () => {
     expect(await mapping(teamId, "UCONSENT")).toMatchObject({ member_id: memberId });
     expect(await suppressed(teamId, "UCONSENT")).toBe(false);
     expect(await generation(teamId)).toBe("3");
-    await syncSlackIdentities(db(), teamId, [{ id: "UCONSENT", displayName: "Again", email }]);
+    const repeat = await syncSlackIdentities(db(), teamId,
+      [{ id: "UCONSENT", displayName: "Again", email, isBot: false, isAppUser: false }]);
+    // An unchanged generation is also what a filtered no-op looks like, so pin that the repeat RAN: the
+    // record was considered, the authorized mapping stands and its handle was refreshed in place.
+    expect(repeat).toEqual({ scanned: 1, mapped: 1, skipped: 0 });
+    expect(await mapping(teamId, "UCONSENT")).toMatchObject({ member_id: memberId });
+    expect(await handleOf(teamId, "UCONSENT")).toBe("Again");
+    expect(await suppressed(teamId, "UCONSENT")).toBe(false);
     expect(await generation(teamId)).toBe("3");
   });
 
@@ -162,14 +178,15 @@ describe("Slack account suppression (real Postgres)", () => {
   it("serializes sync before unlink and unlink before sync through the shared identity lock", async () => {
     const { teamId, memberId } = await seedTeam();
     const email = await rosterEmail(teamId, memberId);
-    const user = [{ id: "UORDER", displayName: "Ordered", email }];
+    const user = [{ id: "UORDER", displayName: "Ordered", email, isBot: false, isAppUser: false }];
 
     const first = holdAfterTeamLock();
     const sync = syncSlackIdentities(first.client, teamId, user);
     await first.locked;
     const unlink = removeMemberIdentity(db(), teamId, { provider: "slack", externalId: "UORDER" });
     first.release();
-    expect(await sync).toMatchObject({ mapped: 1 });
+    // `scanned: 1` is the proof the record reached the writer (and so the lock) rather than being filtered.
+    expect(await sync).toMatchObject({ scanned: 1, mapped: 1, skipped: 0 });
     expect(await unlink).toEqual({ removed: true });
     expect(await mapping(teamId, "UORDER")).toBeNull();
     expect(await suppressed(teamId, "UORDER")).toBe(true);
@@ -183,7 +200,7 @@ describe("Slack account suppression (real Postgres)", () => {
     const laterSync = syncSlackIdentities(db(), teamId, user);
     second.release();
     expect(await heldUnlink).toEqual({ removed: true });
-    expect(await laterSync).toMatchObject({ mapped: 0, skipped: 1 });
+    expect(await laterSync).toMatchObject({ scanned: 1, mapped: 0, skipped: 1 });
     expect(await mapping(teamId, "UORDER")).toBeNull();
     expect(await suppressed(teamId, "UORDER")).toBe(true);
   });
@@ -204,7 +221,11 @@ describe("Slack account suppression (real Postgres)", () => {
     await expect(removeMemberIdentity(db(), teamId,
       { provider: "slack", externalId: "UOLD" })).rejects.toThrow("unlink that exact key");
     expect(await syncSlackIdentities(db(), teamId, [{ id: "TSPACE:UOLD", displayName: "Linked",
-      email: await rosterEmail(teamId, memberId) }])).toMatchObject({ mapped: 1, skipped: 0 });
+      email: await rosterEmail(teamId, memberId), isBot: false, isAppUser: false }]))
+      .toMatchObject({ scanned: 1, mapped: 1, skipped: 0 });
+    // The refresh landed on the SAME authorized qualified row: same id, same owner, new handle.
+    expect(await mapping(teamId, "TSPACE:UOLD")).toEqual(qualified);
+    expect(await handleOf(teamId, "TSPACE:UOLD")).toBe("Linked");
     expect((await setMemberIdentity(db(), teamId, memberId,
       { provider: "slack", externalId: "UOLD" }, { explicit: true })).conflict).toBe(true);
     expect(await suppressed(teamId, "UOLD")).toBe(true);
@@ -229,8 +250,8 @@ describe("Slack account suppression (real Postgres)", () => {
     expect(await mapping(teamId, key)).toBeNull();
     expect(await suppressed(teamId, key)).toBe(true);
     expect(await syncSlackIdentities(db(), teamId,
-      [{ id: providerKey, displayName: "Again", email }]))
-      .toMatchObject({ mapped: 0, skipped: 1 });
+      [{ id: providerKey, displayName: "Again", email, isBot: false, isAppUser: false }]))
+      .toMatchObject({ scanned: 1, mapped: 0, skipped: 1 });
     expect(await mapping(teamId, providerKey)).toBeNull();
     expect(await generation(teamId)).toBe("2");
 
@@ -241,8 +262,11 @@ describe("Slack account suppression (real Postgres)", () => {
     expect(await mapping(teamId, providerKey)).toMatchObject({ member_id: memberId });
     expect(await generation(teamId)).toBe("3");
     expect(await syncSlackIdentities(db(), teamId,
-      [{ id: providerKey, displayName: "Again", email }]))
-      .toMatchObject({ mapped: 1, skipped: 0 });
+      [{ id: providerKey, displayName: "Again", email, isBot: false, isAppUser: false }]))
+      .toMatchObject({ scanned: 1, mapped: 1, skipped: 0 });
+    // The repeat ran against the relinked row: same owner, handle refreshed, no identity change.
+    expect(await mapping(teamId, providerKey)).toMatchObject({ member_id: memberId });
+    expect(await handleOf(teamId, providerKey)).toBe("Again");
     expect(await generation(teamId)).toBe("3");
   });
 
@@ -372,8 +396,8 @@ describe("Slack case-variant unlink (PA-5, real Postgres)", () => {
 
     // The unlink now holds against BOTH spellings: neither comes back on its own.
     expect(await syncSlackIdentities(db(), teamId, [
-      { id: "U0ABC", displayName: "Again", email },
-      { id: "u0abc", displayName: "Again", email },
+      { id: "U0ABC", displayName: "Again", email, isBot: false, isAppUser: false },
+      { id: "u0abc", displayName: "Again", email, isBot: false, isAppUser: false },
     ])).toMatchObject({ scanned: 2, mapped: 0, skipped: 2 });
     expect(await liveSpellings(teamId)).toEqual([]);
     expect(Number(await generation(teamId))).toBe(Number(before) + 2);
@@ -391,7 +415,8 @@ describe("Slack case-variant unlink (PA-5, real Postgres)", () => {
     const afterUnlink = await generation(teamId);
 
     // The survivor is an ordinary live mapping again: auto-sync refreshes its metadata in place.
-    expect(await syncSlackIdentities(db(), teamId, [{ id: "U0ABC", displayName: "Fresh", email }]))
+    expect(await syncSlackIdentities(db(), teamId,
+      [{ id: "U0ABC", displayName: "Fresh", email, isBot: false, isAppUser: false }]))
       .toMatchObject({ scanned: 1, mapped: 1, skipped: 0 });
     expect(await mapping(teamId, "U0ABC")).toEqual(survivor);
     const { rows } = await runSql<{ handle: string }>(
@@ -412,7 +437,8 @@ describe("Slack case-variant unlink (PA-5, real Postgres)", () => {
       `insert into member_identity_suppressions (team_id, provider, external_id) values ($1, 'slack', 'u0abc')`,
       [teamId]);
 
-    expect(await syncSlackIdentities(db(), teamId, [{ id: "U0ABC", displayName: "Fresh", email }]))
+    expect(await syncSlackIdentities(db(), teamId,
+      [{ id: "U0ABC", displayName: "Fresh", email, isBot: false, isAppUser: false }]))
       .toMatchObject({ scanned: 1, mapped: 0, skipped: 1 });
     const { rows } = await runSql<{ handle: string }>(
       `select handle from member_identities where id = $1`, [survivor.id]);
@@ -440,5 +466,102 @@ describe("Slack case-variant unlink (PA-5, real Postgres)", () => {
     expect(linked).toMatchObject({ conflict: false, updated: true });
     expect(await mapping(teamId, "U0ABC")).toEqual(survivor);
     expect(await liveSpellings(teamId)).toEqual(["U0ABC"]);
+  });
+});
+
+/**
+ * AIO-1170 AC-07 — directory classification is an ADMISSION rule for future automatic writes.
+ *
+ * Excluding a bot, an app user or an unclassified account must change nothing that is already
+ * stored: it does not clear an unlink fence, recreate a mapping, refresh one, or bump the identity
+ * generation. And because an excluded account is omitted before the shared writer, it cannot reach —
+ * or be failed by — a read that the writer would have made.
+ */
+describe("Slack directory classification preserves suppression and explicit state (AC-07, real Postgres)", () => {
+  // [label, the classification the directory record carries]
+  const EXCLUDED: [string, Record<string, unknown>][] = [
+    ["a bot", { isBot: true, isAppUser: false }],
+    ["an app user", { isBot: false, isAppUser: true }],
+    ["an unclassified account", {}],
+    ["a half-classified account", { isBot: false }],
+  ];
+
+  it("DIR-05 an excluded account neither lifts an unlink fence nor recreates the mapping behind it", async () => {
+    const { teamId, memberId } = await seedTeam();
+    const email = await rosterEmail(teamId, memberId);
+    await setMemberIdentity(db(), teamId, memberId, { provider: "slack", externalId: "UFENCED" }, { explicit: true });
+    expect(await removeMemberIdentity(db(), teamId, { provider: "slack", externalId: "UFENCED" })).toEqual({ removed: true });
+    expect(await fences(teamId)).toEqual(["UFENCED"]);
+    const before = await generation(teamId);
+
+    for (const [label, flags] of EXCLUDED) {
+      // Both the fenced spelling and a case variant of it, each with the exact roster email.
+      for (const id of ["UFENCED", "ufenced"]) {
+        expect(await syncSlackIdentities(db(), teamId, [{ id, displayName: "Again", email, ...flags }] as never), `${label} as ${id}`)
+          .toEqual({ scanned: 0, mapped: 0, skipped: 0 });
+      }
+    }
+    expect(await liveSpellings(teamId)).toEqual([]);
+    expect(await fences(teamId)).toEqual(["UFENCED"]);
+    expect(await generation(teamId)).toBe(before);
+
+    // Control: an explicit HUMAN for the same key IS considered, and is what the fence refuses.
+    expect(await syncSlackIdentities(db(), teamId,
+      [{ id: "UFENCED", displayName: "Again", email, isBot: false, isAppUser: false }]))
+      .toEqual({ scanned: 1, mapped: 0, skipped: 1 });
+    expect(await liveSpellings(teamId)).toEqual([]);
+    expect(await fences(teamId)).toEqual(["UFENCED"]);
+    expect(await generation(teamId)).toBe(before);
+  });
+
+  it("DIR-05 an excluded account leaves an explicit mapping, its handle and its unfenced state alone", async () => {
+    const { teamId, memberId } = await seedTeam();
+    const email = await rosterEmail(teamId, memberId);
+    await setMemberIdentity(db(), teamId, memberId,
+      { provider: "slack", externalId: "UEXPLICIT", handle: "Stored" }, { explicit: true });
+    const stored = await mapping(teamId, "UEXPLICIT");
+    const before = await generation(teamId);
+    expect(stored).toMatchObject({ member_id: memberId });
+
+    for (const [label, flags] of EXCLUDED) {
+      expect(await syncSlackIdentities(db(), teamId, [{ id: "UEXPLICIT", displayName: "Changed", email, ...flags }] as never), label)
+        .toEqual({ scanned: 0, mapped: 0, skipped: 0 });
+    }
+    expect(await mapping(teamId, "UEXPLICIT")).toEqual(stored);
+    expect(await handleOf(teamId, "UEXPLICIT")).toBe("Stored");
+    expect(await suppressed(teamId, "UEXPLICIT")).toBe(false);
+    expect(await fences(teamId)).toEqual([]);
+    expect(await generation(teamId)).toBe(before);
+
+    // Control: the same record classified human is an ordinary in-place refresh of that same row.
+    expect(await syncSlackIdentities(db(), teamId,
+      [{ id: "UEXPLICIT", displayName: "Changed", email, isBot: false, isAppUser: false }]))
+      .toEqual({ scanned: 1, mapped: 1, skipped: 0 });
+    expect(await mapping(teamId, "UEXPLICIT")).toEqual(stored);
+    expect(await handleOf(teamId, "UEXPLICIT")).toBe("Changed");
+    expect(await generation(teamId)).toBe(before);
+  });
+
+  it("DIR-06 a shared-writer failure still fails a human's sync, and an excluded account never reaches the failing read", async () => {
+    const { teamId, memberId } = await seedTeam();
+    const email = await rosterEmail(teamId, memberId);
+    const before = await generation(teamId);
+
+    // The fence read is unavailable: an admitted human's sync fails closed and reports no mapping.
+    await expect(syncSlackIdentities(suppressionFault("select"), teamId,
+      [{ id: "UFAULT", displayName: "Person", email, isBot: false, isAppUser: false }]))
+      .rejects.toThrow("suppression select unavailable");
+    expect(await mapping(teamId, "UFAULT")).toBeNull();
+    expect(await generation(teamId)).toBe(before);
+
+    // The same failing client, the same key and email, but an account that is omitted before the
+    // writer: there is nothing to read, so there is nothing to fail.
+    for (const [label, flags] of EXCLUDED) {
+      expect(await syncSlackIdentities(suppressionFault("select"), teamId,
+        [{ id: "UFAULT", displayName: "Excluded", email, ...flags }] as never), label)
+        .toEqual({ scanned: 0, mapped: 0, skipped: 0 });
+    }
+    expect(await liveSpellings(teamId)).toEqual([]);
+    expect(await generation(teamId)).toBe(before);
   });
 });

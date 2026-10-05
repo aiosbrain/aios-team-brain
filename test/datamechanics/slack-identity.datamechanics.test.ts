@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { setMemberIdentity, removeMemberIdentity } from "@/lib/identity/member-identities";
+import { SlackClient } from "@/lib/ingest/sources/slack";
 import { syncSlackIdentities } from "@/lib/ingest/sources/slack-identity";
 import { syncProviderIdentities } from "@/lib/identity/provider-sync";
 import { buildIdentityMap, resolveByProviderId } from "@/lib/identity/resolve";
@@ -201,8 +202,8 @@ describe("syncSlackIdentities (real Postgres)", () => {
     const alexId = (alex as { id: string }).id;
 
     const res = await syncSlackIdentities(db(), seed.teamId, [
-      { id: "U0GUESS1", displayName: "A Different Alex", email: "alex@corp.com" }, // local part == handle, NOT the member's email
-      { id: "U0EXACT1", displayName: "Alex Smith", email: "alex.smith@corp.com" }, // exact roster email
+      { id: "U0GUESS1", displayName: "A Different Alex", email: "alex@corp.com", isBot: false, isAppUser: false }, // local part == handle, NOT the member's email
+      { id: "U0EXACT1", displayName: "Alex Smith", email: "alex.smith@corp.com", isBot: false, isAppUser: false }, // exact roster email
     ]);
     expect(res).toMatchObject({ scanned: 2, mapped: 1, skipped: 1 });
     const map = await buildIdentityMap(db(), seed.teamId);
@@ -231,7 +232,8 @@ describe("syncSlackIdentities (real Postgres)", () => {
     };
     const alexId = await insertMember("alex.smith@corp.com", "alex");
     await syncProviderIdentities(db(), seed.teamId, "plane", [{ id: "P0LAUNDER", displayName: "x", email: "alex@corp.com" }]);
-    const laundered = await syncSlackIdentities(db(), seed.teamId, [{ id: "U0LAUNDER", displayName: "A Different Alex", email: "alex@corp.com" }]);
+    const laundered = await syncSlackIdentities(db(), seed.teamId,
+      [{ id: "U0LAUNDER", displayName: "A Different Alex", email: "alex@corp.com", isBot: false, isAppUser: false }]);
     expect(laundered).toMatchObject({ scanned: 1, mapped: 0, skipped: 1 });
     expect(resolveByProviderId(await buildIdentityMap(db(), seed.teamId), "slack", "U0LAUNDER")).toBeNull();
 
@@ -243,9 +245,9 @@ describe("syncSlackIdentities (real Postgres)", () => {
       { team_id: seed.teamId, member_id: bId, email: "solo@corp.com" },
     ]);
     const res = await syncSlackIdentities(db(), seed.teamId, [
-      { id: "U0AMBIG", displayName: "Shared", email: "shared@corp.com" }, // A's email AND B's alias: two candidates
-      { id: "U0ONE", displayName: "Solo", email: "solo@corp.com" },        // exactly one candidate (B's alias)
-      { id: "U0EXACT", displayName: "Alex", email: "alex.smith@corp.com" }, // exactly one candidate (alex's email)
+      { id: "U0AMBIG", displayName: "Shared", email: "shared@corp.com", isBot: false, isAppUser: false }, // A's email AND B's alias: two candidates
+      { id: "U0ONE", displayName: "Solo", email: "solo@corp.com", isBot: false, isAppUser: false },        // exactly one candidate (B's alias)
+      { id: "U0EXACT", displayName: "Alex", email: "alex.smith@corp.com", isBot: false, isAppUser: false }, // exactly one candidate (alex's email)
     ]);
     expect(res).toMatchObject({ scanned: 3, mapped: 2, skipped: 1 });
     const map = await buildIdentityMap(db(), seed.teamId);
@@ -264,9 +266,9 @@ describe("syncSlackIdentities (real Postgres)", () => {
     await setMemberIdentity(db(), seed.teamId, other, { provider: "slack", externalId: "U7", handle: "manual" }, { force: true });
 
     const res = await syncSlackIdentities(db(), seed.teamId, [
-      { id: "U9", displayName: "Alice", email: "alice@corp.com" }, // resolves → A
-      { id: "U8", displayName: "Ext", email: "nobody@elsewhere.io" }, // no member → skip
-      { id: "U7", displayName: "Alice Alt", email: "alice@corp.com" }, // resolves → A but U7 manually → B
+      { id: "U9", displayName: "Alice", email: "alice@corp.com", isBot: false, isAppUser: false }, // resolves → A
+      { id: "U8", displayName: "Ext", email: "nobody@elsewhere.io", isBot: false, isAppUser: false }, // no member → skip
+      { id: "U7", displayName: "Alice Alt", email: "alice@corp.com", isBot: false, isAppUser: false }, // resolves → A but U7 manually → B
     ]);
     expect(res).toMatchObject({ scanned: 3, mapped: 1, skipped: 2 });
 
@@ -275,10 +277,240 @@ describe("syncSlackIdentities (real Postgres)", () => {
     expect(resolveByProviderId(map, "slack", "U7")).toBe(other); // manual mapping preserved
     expect(resolveByProviderId(map, "slack", "U8")).toBeNull(); // never mapped
     expect(await generation(seed.teamId)).toBe("2"); // manual U7 + newly mapped U9
-    await syncSlackIdentities(db(), seed.teamId, [
-      { id: "U9", displayName: "Alice renamed", email: "alice@corp.com" },
-      { id: "U7", displayName: "Alice Alt", email: "alice@corp.com" },
+    const repeat = await syncSlackIdentities(db(), seed.teamId, [
+      { id: "U9", displayName: "Alice renamed", email: "alice@corp.com", isBot: false, isAppUser: false },
+      { id: "U7", displayName: "Alice Alt", email: "alice@corp.com", isBot: false, isAppUser: false },
     ]);
+    // An unchanged generation alone would also be what a FILTERED no-op looks like. The repeat really
+    // ran: both records were considered, U9's metadata was refreshed in place and U7's manual owner held.
+    expect(repeat).toEqual({ scanned: 2, mapped: 1, skipped: 1 });
+    expect(await slackIdentity(seed.teamId, "U9")).toMatchObject({ member_id: seed.memberId, handle: "Alice renamed" });
+    expect(await slackIdentity(seed.teamId, "U7")).toMatchObject({ member_id: other });
     expect(await generation(seed.teamId)).toBe("2"); // display edit and collision are not remaps
+  });
+});
+
+// ── AIO-1170 AC-07: directory classification decides who may be linked automatically ─────────────
+
+interface SlackIdentityRow {
+  external_id: string;
+  member_id: string;
+  handle: string;
+  email: string;
+}
+
+/** Every live Slack identity row the team holds, in id order. */
+async function slackIdentities(teamId: string): Promise<SlackIdentityRow[]> {
+  const { data, error } = await db().from("member_identities")
+    .select("external_id, member_id, handle, email").eq("team_id", teamId).eq("provider", "slack");
+  if (error) throw new Error(`fixture: identity readback failed: ${error.message}`);
+  return ((data ?? []) as SlackIdentityRow[]).sort((a, b) => (a.external_id < b.external_id ? -1 : a.external_id > b.external_id ? 1 : 0));
+}
+
+async function slackIdentity(teamId: string, externalId: string): Promise<SlackIdentityRow | null> {
+  return (await slackIdentities(teamId)).find((row) => row.external_id === externalId) ?? null;
+}
+
+/** A fresh alias email that exactly ONE roster member claims — the condition for an automatic link. */
+async function aliasFor(teamId: string, memberId: string, label: string): Promise<string> {
+  const email = `${label}-${randomUUID()}@roster.test`;
+  const { error } = await db().from("member_emails").insert({ team_id: teamId, member_id: memberId, email });
+  if (error) throw new Error(`fixture: alias insert failed: ${error.message}`);
+  return email;
+}
+
+describe("Slack directory classification gates automatic linking (AC-07, real Postgres)", () => {
+  it("DIR-03 links no bot, app user, unclassified account or service account, even on an exact roster/alias email", async () => {
+    const seed = await seedTeam();
+    const rosterEmail = (await db().from("members").select("email").eq("id", seed.memberId).single()).data.email as string;
+    // Each excluded account carries an email that exactly one member claims: nothing but its
+    // classification stands between it and an automatic link.
+    const excluded: Record<string, unknown>[] = [
+      { id: "U0DIRBOT", displayName: "Deploy Bot", email: rosterEmail, isBot: true, isAppUser: false },
+      { id: "U0DIRAPP", displayName: "Connected App", email: await aliasFor(seed.teamId, seed.memberId, "app"), isBot: false, isAppUser: true },
+      { id: "U0DIRBOTH", displayName: "Bot App", email: await aliasFor(seed.teamId, seed.memberId, "both"), isBot: true, isAppUser: true },
+      { id: "U0DIRUNKNOWN", displayName: "Unclassified", email: await aliasFor(seed.teamId, seed.memberId, "unknown") },
+      { id: "U0DIRPARTIAL", displayName: "Half classified", email: await aliasFor(seed.teamId, seed.memberId, "partial"), isBot: false },
+      { id: "U0DIRTYPED", displayName: "Wrongly typed", email: await aliasFor(seed.teamId, seed.memberId, "typed"), isBot: "false", isAppUser: "false" },
+      { id: "U0DIRNULL", displayName: "Null flags", email: await aliasFor(seed.teamId, seed.memberId, "null"), isBot: null, isAppUser: null },
+      { id: "USLACKBOT", displayName: "Slackbot", email: await aliasFor(seed.teamId, seed.memberId, "service"), isBot: false, isAppUser: false },
+    ];
+    const before = await generation(seed.teamId);
+
+    // Together, and one at a time, so no excluded class can hide behind another.
+    expect(await syncSlackIdentities(db(), seed.teamId, excluded as never)).toEqual({ scanned: 0, mapped: 0, skipped: 0 });
+    for (const account of excluded) {
+      expect(await syncSlackIdentities(db(), seed.teamId, [account] as never), String(account.id))
+        .toEqual({ scanned: 0, mapped: 0, skipped: 0 });
+    }
+    expect(await slackIdentities(seed.teamId)).toEqual([]);
+    const map = await buildIdentityMap(db(), seed.teamId);
+    for (const account of excluded) expect(resolveByProviderId(map, "slack", account.id as string), String(account.id)).toBeNull();
+    expect(await generation(seed.teamId)).toBe(before);
+
+    // Control, under the SAME matching conditions: an explicit human carrying each of those exact
+    // emails does link. So every email above was a real exactly-one-candidate match.
+    const humans = excluded.map((account, index) => ({
+      id: `U0DIRHUMAN${index}`, displayName: `Person ${index}`, email: account.email as string, isBot: false, isAppUser: false,
+    }));
+    expect(await syncSlackIdentities(db(), seed.teamId, humans)).toEqual({ scanned: humans.length, mapped: humans.length, skipped: 0 });
+    const rows = await slackIdentities(seed.teamId);
+    expect(rows.map((row) => row.external_id)).toEqual(humans.map((person) => person.id).sort());
+    expect(rows.every((row) => row.member_id === seed.memberId)).toBe(true);
+    expect(Number(await generation(seed.teamId))).toBe(Number(before) + humans.length);
+  });
+
+  it("DIR-04 still links an ordinary human, a guest, a single-channel guest and a deactivated human by exact email", async () => {
+    const seed = await seedTeam();
+    const other = await addMember(seed.teamId);
+    const people = [
+      { id: "U0DIRORDINARY", displayName: "Ordinary", email: await aliasFor(seed.teamId, seed.memberId, "ordinary"), isBot: false, isAppUser: false },
+      { id: "U0DIRGUEST", displayName: "Guest", email: await aliasFor(seed.teamId, seed.memberId, "guest"), isBot: false, isAppUser: false, isRestricted: true },
+      { id: "U0DIRSINGLE", displayName: "Single channel", email: await aliasFor(seed.teamId, other, "single"), isBot: false, isAppUser: false,
+        isRestricted: true, isUltraRestricted: true },
+      { id: "U0DIRDELETED", displayName: "Deactivated", email: await aliasFor(seed.teamId, other, "deleted"), isBot: false, isAppUser: false, deleted: true },
+    ];
+    const before = await generation(seed.teamId);
+    expect(await syncSlackIdentities(db(), seed.teamId, [
+      ...people,
+      // A known human with no email stays unlinked (and available for an explicit manual link)…
+      { id: "U0DIRNOEMAIL", displayName: "No email", isBot: false, isAppUser: false },
+      // …and one whose email no member claims is considered and skipped.
+      { id: "U0DIRSTRANGER", displayName: "Stranger", email: `stranger-${randomUUID()}@elsewhere.test`, isBot: false, isAppUser: false, deleted: true },
+    ])).toEqual({ scanned: 5, mapped: 4, skipped: 1 });
+
+    const rows = await slackIdentities(seed.teamId);
+    expect(rows.map(({ external_id, member_id, handle }) => ({ external_id, member_id, handle }))).toEqual([
+      { external_id: "U0DIRDELETED", member_id: other, handle: "Deactivated" },
+      { external_id: "U0DIRGUEST", member_id: seed.memberId, handle: "Guest" },
+      { external_id: "U0DIRORDINARY", member_id: seed.memberId, handle: "Ordinary" },
+      { external_id: "U0DIRSINGLE", member_id: other, handle: "Single channel" },
+    ]);
+    expect(Number(await generation(seed.teamId))).toBe(Number(before) + 4);
+  });
+
+  it("DIR-05 leaves an existing mapping exactly as stored when its account is now a bot, app, unclassified or the service account", async () => {
+    const seed = await seedTeam();
+    const storedEmail = await aliasFor(seed.teamId, seed.memberId, "stored");
+    // A DIFFERENT email than the stored one, and an exact match to the SAME owner: a refresh the
+    // shared writer would happily apply if the record reached it.
+    const incomingEmail = await aliasFor(seed.teamId, seed.memberId, "incoming");
+    const classifications: [string, Record<string, unknown>][] = [
+      ["U0KEEPBOT", { isBot: true, isAppUser: false }],
+      ["U0KEEPAPP", { isBot: false, isAppUser: true }],
+      ["U0KEEPUNKNOWN", {}],
+      ["USLACKBOT", { isBot: false, isAppUser: false }],
+      ["U0KEEPHUMAN", { isBot: false, isAppUser: false }],
+    ];
+    for (const [externalId] of classifications) {
+      const linked = await setMemberIdentity(db(), seed.teamId, seed.memberId,
+        { provider: "slack", externalId, handle: "Stored handle", email: storedEmail }, { explicit: true });
+      expect(linked.created, externalId).toBe(true);
+    }
+    const before = await slackIdentities(seed.teamId);
+    const generationBefore = await generation(seed.teamId);
+    expect(before).toHaveLength(classifications.length);
+    expect(before.every((row) => row.handle === "Stored handle" && row.email === storedEmail && row.member_id === seed.memberId)).toBe(true);
+
+    const excluded = classifications.filter(([externalId]) => externalId !== "U0KEEPHUMAN")
+      .map(([id, flags]) => ({ id, displayName: "Changed display name", email: incomingEmail, ...flags }));
+    expect(await syncSlackIdentities(db(), seed.teamId, excluded as never)).toEqual({ scanned: 0, mapped: 0, skipped: 0 });
+    // Ownership, handle and email are byte for byte what was stored; nothing was refreshed or removed.
+    expect(await slackIdentities(seed.teamId)).toEqual(before);
+    expect(await generation(seed.teamId)).toBe(generationBefore);
+
+    // Control: the same incoming change on the explicit HUMAN's mapping is an ordinary in-place refresh.
+    expect(await syncSlackIdentities(db(), seed.teamId, [
+      { id: "U0KEEPHUMAN", displayName: "Changed display name", email: incomingEmail, isBot: false, isAppUser: false },
+    ])).toEqual({ scanned: 1, mapped: 1, skipped: 0 });
+    expect(await slackIdentity(seed.teamId, "U0KEEPHUMAN")).toMatchObject({
+      member_id: seed.memberId, handle: "Changed display name", email: incomingEmail,
+    });
+    const untouched = (await slackIdentities(seed.teamId)).filter((row) => row.external_id !== "U0KEEPHUMAN");
+    expect(untouched).toEqual(before.filter((row) => row.external_id !== "U0KEEPHUMAN"));
+    // A metadata refresh is not an identity change.
+    expect(await generation(seed.teamId)).toBe(generationBefore);
+  });
+
+  it("integrates the actual users.list projection with the actual adapter: only the classified humans link", async () => {
+    const seed = await seedTeam();
+    const email = {
+      bot: await aliasFor(seed.teamId, seed.memberId, "bot"),
+      app: await aliasFor(seed.teamId, seed.memberId, "app"),
+      unknown: await aliasFor(seed.teamId, seed.memberId, "unknown"),
+      service: await aliasFor(seed.teamId, seed.memberId, "service"),
+      human: await aliasFor(seed.teamId, seed.memberId, "human"),
+      guest: await aliasFor(seed.teamId, seed.memberId, "guest"),
+    };
+    const before = await generation(seed.teamId);
+    const human = { is_bot: false, is_app_user: false };
+    // A synthetic two-page `users.list`: the excluded group first, the human controls on the second page.
+    const pages: { members: Record<string, unknown>[]; cursor?: string }[] = [
+      { cursor: "directory-page-2", members: [
+        { id: "U0INTBOT", name: "deploybot", profile: { real_name: "Deploy Bot", email: email.bot }, is_bot: true, is_app_user: false },
+        { id: "U0INTAPP", name: "connected", profile: { real_name: "Connected App", email: email.app }, is_bot: false, is_app_user: true },
+        { id: "U0INTUNKNOWN", name: "unclassified", profile: { real_name: "Unclassified", email: email.unknown } },
+      ] },
+      { members: [
+        { id: "USLACKBOT", name: "slackbot", profile: { real_name: "Slackbot", email: email.service }, ...human },
+        { id: "U0INTHUMAN", name: "person", profile: { display_name: "Person", email: email.human }, ...human },
+        { id: "U0INTGUEST", name: "guest", profile: { display_name: "Guest", email: email.guest }, ...human, is_restricted: true, deleted: false },
+      ] },
+    ];
+
+    // Only Slack HTTP is stubbed; the database is the real pool and does not go through fetch. Anything
+    // that is not the expected `users.list` call fails here instead of reaching a network.
+    const requests: URL[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: unknown) => {
+      const url = new URL(String(input));
+      requests.push(url);
+      if (url.origin !== "https://slack.com" || url.pathname !== "/api/users.list") {
+        throw new Error(`fixture: unexpected request to ${url.origin}${url.pathname}`);
+      }
+      const page = pages[requests.length - 1];
+      if (!page) throw new Error("fixture: more users.list pages were requested than the provider has");
+      return {
+        ok: true, status: 200,
+        json: async () => ({ ok: true, members: page.members, response_metadata: page.cursor ? { next_cursor: page.cursor } : {} }),
+      };
+    }) as unknown as typeof fetch;
+    let directory: Awaited<ReturnType<SlackClient["usersDetailed"]>>;
+    let result: Awaited<ReturnType<typeof syncSlackIdentities>>;
+    try {
+      // The client's return value goes STRAIGHT into the adapter: nothing is renamed or added between.
+      directory = await new SlackClient("xoxb-synthetic-directory-token").usersDetailed();
+      result = await syncSlackIdentities(db(), seed.teamId, directory);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+
+    expect(requests.map((url) => url.pathname)).toEqual(["/api/users.list", "/api/users.list"]);
+    expect(requests.map((url) => url.searchParams.get("cursor"))).toEqual([null, "directory-page-2"]);
+
+    // The directory keeps every record — bots and apps included — with what Slack said about each.
+    const projected = directory as unknown as Record<string, unknown>[];
+    expect(projected.map(({ id, displayName, email: address, isBot, isAppUser }) => ({ id, displayName, email: address, isBot, isAppUser }))).toEqual([
+      { id: "U0INTBOT", displayName: "Deploy Bot", email: email.bot, isBot: true, isAppUser: false },
+      { id: "U0INTAPP", displayName: "Connected App", email: email.app, isBot: false, isAppUser: true },
+      { id: "U0INTUNKNOWN", displayName: "Unclassified", email: email.unknown, isBot: undefined, isAppUser: undefined },
+      { id: "USLACKBOT", displayName: "Slackbot", email: email.service, isBot: false, isAppUser: false },
+      { id: "U0INTHUMAN", displayName: "Person", email: email.human, isBot: false, isAppUser: false },
+      { id: "U0INTGUEST", displayName: "Guest", email: email.guest, isBot: false, isAppUser: false },
+    ]);
+    expect(projected.find((user) => user.id === "U0INTGUEST")).toMatchObject({ isRestricted: true, deleted: false });
+
+    // Only the two classified humans were considered, and both linked: a field-name drift between the
+    // projection and the adapter would leave them unclassified and fail right here.
+    expect(result).toEqual({ scanned: 2, mapped: 2, skipped: 0 });
+    expect((await slackIdentities(seed.teamId)).map(({ external_id, member_id, handle }) => ({ external_id, member_id, handle }))).toEqual([
+      { external_id: "U0INTGUEST", member_id: seed.memberId, handle: "Guest" },
+      { external_id: "U0INTHUMAN", member_id: seed.memberId, handle: "Person" },
+    ]);
+    const map = await buildIdentityMap(db(), seed.teamId);
+    for (const excludedId of ["U0INTBOT", "U0INTAPP", "U0INTUNKNOWN", "USLACKBOT"]) {
+      expect(resolveByProviderId(map, "slack", excludedId), excludedId).toBeNull();
+    }
+    expect(Number(await generation(seed.teamId))).toBe(Number(before) + 2);
   });
 });
