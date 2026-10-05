@@ -1689,6 +1689,155 @@ describe("slack repair census: contradiction precedence on stored rows (real Pos
     }
   });
 
+  it("treats two stored ledger workspaces that differ only by case as a contradiction, not as one other workspace", async () => {
+    const seed = await seedTeam();
+    const scope = await verifiedScope(seed);
+    const p = await project(seed.teamId);
+    // Requested scope T1/C0ABC. Every path says workspace t2, channel c0abc, and every item's retained
+    // metadata agrees with its path — so the item's own ledger alone decides each row.
+    const agreeing = { frontmatter: { source: "slack", channel_id: CHANNEL } };
+    const reply = (n: number): string => `1718900000.${String(n * 1000 + 1).padStart(6, "0")}`;
+    for (const n of [1, 2, 3]) await item(seed.teamId, p, id(n), `slack/t2/c0abc/${root(n)}.md`, agreeing);
+    // 1: rows under `T2` AND under `t2` — two stored workspace identities, byte-different.
+    await message(seed.teamId, id(1), root(1), { workspace: "T2" });
+    await message(seed.teamId, id(1), reply(1), { workspace: "t2", rootTs: root(1) });
+    // 2 (control): one identity that folds to the path — the other workspace's own ledger.
+    await message(seed.teamId, id(2), root(2), { workspace: "T2" });
+    await message(seed.teamId, id(2), reply(2), { workspace: "T2", rootTs: root(2) });
+    // 3 (control): an identity that does not fold to the path was already a contradiction.
+    await message(seed.teamId, id(3), root(3), { workspace: "T2" });
+    await message(seed.teamId, id(3), reply(3), { workspace: "T3", rootTs: root(3) });
+    const stored = await runSql<{ item_id: string; workspaces: string[] }>(
+      `select item_id::text as item_id,
+              array_agg(distinct workspace_id collate "C" order by workspace_id collate "C") as workspaces
+         from slack_messages where team_id = $1 group by item_id order by item_id`,
+      [seed.teamId]
+    );
+    expect(stored.rows, "fixture: the exact stored workspace identities per item").toEqual([
+      { item_id: id(1), workspaces: ["T2", "t2"] },
+      { item_id: id(2), workspaces: ["T2"] },
+      { item_id: id(3), workspaces: ["T2", "T3"] },
+    ]);
+
+    const before = await tables();
+    const result = await page(scope, { pageSize: 50 });
+    // Closed accounting: three scanned rows, each in exactly one bucket.
+    expect(result).toMatchObject({
+      scannedItems: 3, unrelatedItems: 0, otherWorkspaceItems: 1, gateNoncanonicalItems: 0,
+      otherWorkspaceObservationsTruncated: false,
+    });
+    expect(entryIds(result)).toEqual([id(1), id(3)]);
+    expect(result.otherWorkspaceObservations).toEqual([
+      { kind: "scanned_scoped_path", workspaceId: "t2", sourceId: id(2) },
+    ]);
+    expect(result.counts.byRelationship).toEqual({
+      channel_candidate: 0, scoped_channel_match: 0, unresolved_channel: 0, conflicting_evidence: 2,
+    });
+    for (const contradicted of [entryOf(result, id(1)), entryOf(result, id(3))]) {
+      expect(contradicted).toMatchObject({
+        relationship: "conflicting_evidence",
+        provenance: "conflicting",
+        path: { kind: "scoped", workspaceSegment: "t2", channelSegment: "c0abc" },
+        retainedChannelMetadata: "valid",
+        hypotheticalTarget: null,
+        exactTargetItemId: null,
+        queueStatus: "not_applicable",
+        // Neither row is the requested source's: both are reported apart and none is counted in.
+        ledger: { present: false, totalMessages: "0", eligibleNondeletedMessages: "0", conflictingSourceMessages: "2" },
+      });
+      expect(contradicted.evidence).not.toContain("source_ledger");
+      expect(contradicted.pending).toContain("provenance_review_required");
+      expect(Object.values(contradicted.authorMapping as Record<string, number>).reduce((a, b) => a + b, 0)).toBe(0);
+    }
+    expect(await tables()).toEqual(before);
+
+    // One row per page: the case-variant row occupies the entries bucket and nothing else.
+    const pages = await traverse(scope, 1);
+    expect(pages).toHaveLength(3);
+    expect(pages[0]).toMatchObject({
+      scannedItems: 1, unrelatedItems: 0, otherWorkspaceItems: 0, otherWorkspaceObservations: [],
+    });
+    expect(entryIds(pages[0])).toEqual([id(1)]);
+    expect(pages[1]).toMatchObject({ scannedItems: 1, entries: [], otherWorkspaceItems: 1 });
+    expect(pages[2]).toMatchObject({ scannedItems: 1, otherWorkspaceItems: 0, otherWorkspaceObservations: [] });
+    expect(entryIds(pages[2])).toEqual([id(3)]);
+  });
+
+  it("keeps a present non-string participant author visible to the author diagnostics as invalid input", async () => {
+    const seed = await seedTeam();
+    const scope = await verifiedScope(seed);
+    const p = await project(seed.teamId);
+    const VALID = {
+      author_id: "U1", display_name: "One", message_count: 2,
+      first_ts: "2024-06-01T09:00:00.000000Z", last_ts: "2024-06-20T17:00:00.000000Z",
+    };
+    const endpoints = { first_ts: VALID.first_ts, last_ts: VALID.last_ts };
+    // Legacy candidates with NO ledger, so retained participants are the only author evidence.
+    const withParticipants = (n: number, participants: unknown[]): Promise<string> =>
+      item(seed.teamId, p, id(n), `slack/c0abc/${root(n)}.md`, { frontmatter: { source: "slack", participants } });
+    await withParticipants(1, [VALID, { ...VALID, author_id: 7 }, { ...VALID, author_id: null }]);
+    await withParticipants(2, [{ ...VALID, author_id: 7 }]);
+    await withParticipants(3, [{ ...VALID, author_id: null }]);
+    // Controls: a participant with no `author_id` key at all, alone and beside a valid one; two valid strings.
+    await withParticipants(4, [VALID, endpoints]);
+    await withParticipants(5, [endpoints]);
+    await withParticipants(6, [VALID, { ...VALID, author_id: "T1:U2" }]);
+    const stored = await runSql<{ id: string; kinds: (string | null)[] }>(
+      `select i.id::text as id,
+              array(select case when jsonb_exists(e, 'author_id') then jsonb_typeof(e->'author_id') end
+                      from jsonb_array_elements(i.frontmatter->'participants') with ordinality as t(e, n)
+                     order by n) as kinds
+         from items i where i.team_id = $1 order by i.id`,
+      [seed.teamId]
+    );
+    expect(stored.rows, "fixture: what is stored under each participant's author_id").toEqual([
+      { id: id(1), kinds: ["string", "number", "null"] },
+      { id: id(2), kinds: ["number"] },
+      { id: id(3), kinds: ["null"] },
+      { id: id(4), kinds: ["string", null] },
+      { id: id(5), kinds: [null] },
+      { id: id(6), kinds: ["string", "string"] },
+    ]);
+
+    const result = await page(scope);
+    const attested = { earliestAttestedTs: VALID.first_ts, latestAttestedTs: VALID.last_ts };
+    const notAttested = { status: "present_malformed", validCount: 0, earliestAttestedTs: null, latestAttestedTs: null };
+    const authorTotal = (entry: Loose): number =>
+      Object.values(entry.authorMapping as Record<string, number>).reduce((a, b) => a + b, 0);
+    for (const n of [1, 2, 3, 4, 5, 6]) {
+      expect(entryOf(result, id(n))).toMatchObject({ relationship: "channel_candidate", ledger: { present: false } });
+    }
+
+    // Present and not a string: a malformed participant AND an invalid-input author, one per value.
+    const mixed = entryOf(result, id(1));
+    expect(mixed.participants).toEqual({ status: "present_malformed", validCount: 1, ...attested });
+    expect(mixed.authorMapping).toMatchObject({ incomplete_provenance: 1, invalid_input: 2, resolved: 0 });
+    expect(authorTotal(mixed)).toBe(3);
+    for (const n of [2, 3]) {
+      const lone = entryOf(result, id(n));
+      expect(lone.participants, `item ${n}`).toEqual(notAttested);
+      expect(lone.authorMapping, `item ${n}`).toMatchObject({ invalid_input: 1, incomplete_provenance: 0, resolved: 0 });
+      expect(authorTotal(lone), `item ${n}`).toBe(1);
+      // Its only author evidence is invalid: that is still author evidence needing review.
+      expect(lone.pending, `item ${n}`).toContain("mapping_review_required");
+    }
+
+    // Absence is not an author: the participant is malformed, and there is nothing to diagnose.
+    const besideValid = entryOf(result, id(4));
+    expect(besideValid.participants).toEqual({ status: "present_malformed", validCount: 1, ...attested });
+    expect(besideValid.authorMapping).toMatchObject({ incomplete_provenance: 1, invalid_input: 0 });
+    expect(authorTotal(besideValid)).toBe(1);
+    const absent = entryOf(result, id(5));
+    expect(absent.participants).toEqual(notAttested);
+    expect(authorTotal(absent)).toBe(0);
+    expect(absent.pending).not.toContain("mapping_review_required");
+    // Valid strings are as they were.
+    const valid = entryOf(result, id(6));
+    expect(valid.participants).toEqual({ status: "present_valid", validCount: 2, ...attested });
+    expect(valid.authorMapping).toMatchObject({ incomplete_provenance: 2, invalid_input: 0, resolved: 0 });
+    expect(result.counts.byPendingCategory.mapping_review_required).toBe(5);
+  });
+
   it("does not attest a calendar-invalid endpoint or count a malformed participant author", async () => {
     const seed = await seedTeam();
     const scope = await verifiedScope(seed);

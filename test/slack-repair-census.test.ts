@@ -973,6 +973,37 @@ describe("slack repair census: a contradiction outranks an other-workspace obser
     for (const stored of ["T3", "COTHER"]) expect(JSON.stringify(mixed)).not.toContain(stored);
   });
 
+  it("two ledger workspaces that differ only by case contradict each other, even though each folds to the path", async () => {
+    // Retained metadata agrees with the path, so the ledger alone decides this row.
+    const item = { path: elsewhere, frontmatter: { source: "slack", channel_id: CHANNEL } };
+    const upper = ledgerSource({ workspaceId: "T2" });
+    const lower = ledgerSource({ workspaceId: "t2" });
+
+    // Controls. One stored identity that folds to the path's segment is the other workspace's own
+    // ledger; an identity that does not fold to it was already a contradiction.
+    const sole = await classify({ item, ledgerSources: [upper] });
+    expect(sole).toMatchObject({
+      bucket: "other_workspace",
+      observation: { kind: "scanned_scoped_path", workspaceId: "t2", sourceId: ITEM },
+    });
+    expect(sole.entry).toBeUndefined();
+    exclusiveConflict(await classify({ item, ledgerSources: [upper, ledgerSource({ workspaceId: "T3" })] }));
+
+    // `T2` and `t2` are two stored workspace identities, byte-different. A case-only variant is never
+    // an alias: the path cannot be the path of both, so this is one conflicting entry — in either order.
+    for (const ledgerSources of [[upper, lower], [lower, upper]]) {
+      const result = await classify({ item, ledgerSources, queue: { status: "queued", errorObserved: false } });
+      const entry = exclusiveConflict(result);
+      expect(entry).toMatchObject({
+        retainedChannelMetadata: "valid",
+        // Neither row is the requested source's: both are reported apart, none is counted in.
+        ledger: { conflictingSourceMessages: "2" },
+      });
+      expect(entry.evidence).not.toContain("source_ledger");
+      expect(Object.values(entry.authorMapping as Record<string, number>).reduce((a, b) => a + b, 0)).toBe(0);
+    }
+  });
+
   it("metadata and ledger contradicting each other on a legacy slug is a conflict, not an unresolved row", async () => {
     const slug = { path: `slack/general/${ROOT}.md`, frontmatter: { source: "slack", channel_id: "COTHER" } };
     // Control: the slug with another channel's metadata and NO ledger is merely unresolved.
@@ -1107,6 +1138,55 @@ describe("slack repair census: participant metadata is validated, not trusted", 
       authorMapping: { incomplete_provenance: 1, invalid_input: 1, resolved: 0 },
     });
     for (const fragment of ["<script>", "bad<", "bad id"]) expect(JSON.stringify(entry)).not.toContain(fragment);
+  });
+
+  it("a present non-string author is invalid input to the author diagnostics, and absence is not an author (control)", async () => {
+    // The pure half of this rule already holds; the reader's own filter is pinned on real rows in
+    // `test/datamechanics/slack-repair-census.datamechanics.test.ts`, where the stored JSON is read.
+    const { classifySlackRepairAuthor } = await census();
+    for (const externalId of [7, 0, null, false, true, {}, ["U1"], { id: "U1" }]) {
+      expect(
+        classifySlackRepairAuthor({
+          teamId: TEAM, externalId, origin: "participant_metadata", mappings: [],
+          mappingCandidatesOverflow: false, humanMemberIds: [],
+        }),
+        JSON.stringify(externalId)
+      ).toBe("invalid_input");
+    }
+    // Present and not a string: the participant is malformed, whatever else it carries.
+    const mixed = await entryOf({
+      item: {
+        frontmatter: {
+          source: "slack",
+          participants: [VALID, { ...VALID, author_id: 7 }, { ...VALID, author_id: null }],
+        },
+      },
+      authorStatuses: ["incomplete_provenance", "invalid_input", "invalid_input"],
+    });
+    expect(mixed).toMatchObject({
+      participants: {
+        status: "present_malformed", validCount: 1, earliestAttestedTs: VALID.first_ts, latestAttestedTs: VALID.last_ts,
+      },
+      authorMapping: { incomplete_provenance: 1, invalid_input: 2, resolved: 0 },
+    });
+    // A no-ledger legacy candidate whose ONLY author evidence is invalid still needs mapping review.
+    const lone = await entryOf({
+      item: { frontmatter: { source: "slack", participants: [{ ...VALID, author_id: 7 }] } },
+      authorStatuses: ["invalid_input"],
+    });
+    expect(lone).toMatchObject({
+      relationship: "channel_candidate",
+      participants: NOT_ATTESTED,
+      ledger: { present: false },
+      authorMapping: { invalid_input: 1, incomplete_provenance: 0 },
+    });
+    expect(lone.pending).toContain("mapping_review_required");
+    // No `author_id` key at all is a malformed participant and no author: nothing to diagnose.
+    const absent = await entryOf({
+      item: { frontmatter: { source: "slack", participants: [{ first_ts: VALID.first_ts, last_ts: VALID.last_ts }] } },
+    });
+    expect(absent.participants).toEqual(NOT_ATTESTED);
+    expect(absent.pending).not.toContain("mapping_review_required");
   });
 
   it("valid alphanumeric legacy participant ids stay valid participants (control)", async () => {
