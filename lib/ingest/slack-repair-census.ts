@@ -512,7 +512,7 @@ export function classifySlackRepairRelationship(input: SlackRepairRelationshipFa
       if (ledgerRequested) return entry("conflicting_evidence", [metadataLabel, ledgerLabel]);
       return notAnEntry("other_workspace", parsed.workspaceSegment);
     }
-    const labels = ["scoped_path_segments" as const, metadataLabel, ledgerLabel];
+    const labels: readonly (SlackRepairEvidenceLabel | false)[] = ["scoped_path_segments", metadataLabel, ledgerLabel];
     if (ledgerForeign || metadataDiffers) return entry("conflicting_evidence", labels);
     // Reports ledger facts. It is not migration authority.
     return entry("scoped_channel_match", labels, ledgerRequested ? "scoped_ledger_observed" : "unproven");
@@ -522,7 +522,7 @@ export function classifySlackRepairRelationship(input: SlackRepairRelationshipFa
   // display-name slug, indistinguishable here. A match is a candidate and stays unproven.
   const segmentMatches = parsed.channelSegment === scope.channelId.toLowerCase();
   if (segmentMatches) {
-    const labels = ["legacy_path_segment" as const, metadataLabel, ledgerLabel];
+    const labels: readonly (SlackRepairEvidenceLabel | false)[] = ["legacy_path_segment", metadataLabel, ledgerLabel];
     return entry(metadataDiffers || ledgerForeign ? "conflicting_evidence" : "channel_candidate", labels);
   }
   if (metadataMatches) {
