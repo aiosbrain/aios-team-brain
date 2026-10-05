@@ -1044,7 +1044,79 @@ const BANNED_MODULES = [
   /slack-publication$/,
   /integrations\/manage$/,
   /dashboard\/timeline-cache$/,
+  // The hydration queue and its snapshots, the message ledger and team generations, thread cleanup.
+  /slack-thread-state$/,
+  /slack-message-ledger$/,
+  /slack-cleanup$/,
+  // Durable caches. A stale-mark or purge that happens to match no row is still a write the census made.
+  /graph\/arc-cache$/,
+  // Identity writers, and the shared ingest writer in each spelling the census could reach it by.
+  /identity\/member-identities$/,
+  /^@\/lib\/ingest(\/index)?$/,
+  /^\.(\/index)?$/,
+  /(^|\/)ingest\/run$/,
+  /^\.\/run$/,
+  // The unbound admin adapter every one of those writers takes. The census reads on the transaction it
+  // opened itself; a second, pool-level client is outside the snapshot by construction.
+  /db\/admin$/,
 ];
+
+/**
+ * The same ban by NAME, so a prohibited export cannot arrive through a module that is not itself on the
+ * list (a local helper, a barrel, a re-export). These are the modules' actual exports — a control below
+ * reads each one back from its source file — and the census has no reason to mention any of them.
+ */
+const PROHIBITED_EXPORTS: Record<string, readonly string[]> = {
+  "lib/graph/arc-cache.ts": [
+    "readArcCache", "staleArcCache", "purgeArcCacheKey", "purgePartitionArcCache", "sweepStaleScopedArcCache",
+    "sweepOrphanedPartitionArcCache", "writeArcCache", "purgeExternalShapedPartitionRows",
+  ],
+  "lib/dashboard/timeline-cache.ts": [
+    "timelineViewKey", "resolveTimelineVariant", "readTimelineCache", "writeTimelineCache", "bustTeamTimeline",
+    "purgeTimelineCacheTier", "purgeAdmissionTimelineNamespace", "settleTimelineRefreshes", "getCachedWorkTimeline",
+  ],
+  "lib/ingest/slack-thread-state.ts": [
+    "enqueueSlackThread", "claimSlackThread", "claimDueSlackThread", "readSlackThreadSnapshot",
+    "writeSlackThreadSnapshot", "restartSlackThreadSnapshot", "purgeExpiredSlackThreadSnapshots",
+    "checkpointSlackThread", "releaseSlackThreadForRetry",
+  ],
+  "lib/ingest/slack-message-ledger.ts": [
+    "readSlackTeamGenerations", "bumpSlackIdentityGeneration", "bumpSlackIdentityGenerationIfCurrent",
+    "bumpSlackPresentationIfChanged", "reconcileCompleteSlackThreadEvidence",
+  ],
+  "lib/ingest/slack-channel-state.ts": [
+    "ensureSlackChannel", "dueSlackChannels", "beginSlackChannelMetadata", "recordSlackChannelPublicState",
+    "delaySlackChannel", "claimSlackChannelPage", "lockSlackChannelForAcceptance", "acceptSlackChannelPage",
+    "restartSlackChannelScan", "releaseSlackChannelForRetry",
+  ],
+  "lib/ingest/slack-method-budget.ts": ["reserveSlackMethodSlot", "extendSlackMethodBackoff", "markSlackMethodBlocked"],
+  "lib/ingest/slack-namespace-gate.ts": [
+    "ensureBlockedSlackNamespaceGate", "prepareNewSlackChannelNamespace", "invalidateSlackNamespaceGate",
+    "lockReadySlackNamespaceGate",
+  ],
+  "lib/ingest/slack-publication.ts": ["prepareSlackPublication", "finishSlackPublication"],
+  // Every export of the binding module EXCEPT the one permitted canonicalizer.
+  "lib/ingest/slack-source-binding.ts": [
+    "slackTokenFingerprint", "resolveEnvSlackToken", "slackConfigRevision", "lockSlackSelection", "slackBindingRef",
+    "teamHasCurrentSlackSource", "isSlackBinderValid", "bindSlackSelection", "recordSlackWorkspaceIdentity",
+    "recordSlackAppIdentity", "blockSlackBinding", "delaySlackBinding", "readSlackBinding",
+  ],
+  "lib/ingest/slack-thread-hydrator.ts": ["hydrateOneSlackThread"],
+  "lib/ingest/slack-source-discovery.ts": ["discoverSlackSource"],
+  "lib/ingest/sources/slack-page-request.ts": ["slackReservedRequest"],
+  "lib/ingest/slack-cleanup.ts": ["purgeDeletedSlackThreads"],
+  "lib/identity/member-identities.ts": [
+    "setMemberIdentity", "removeMemberIdentity", "deleteMemberWithIdentityRevision", "disableMemberWithIdentityRevision",
+  ],
+  "lib/integrations/manage.ts": [
+    "upsertIntegration", "setIntegrationStatus", "deleteIntegration", "setIntegrationSecret",
+    "getEnabledIntegrationsWithSecrets", "getProviderKey",
+  ],
+  "lib/secrets/crypto.ts": ["encryptSecret", "decryptSecret", "decryptSecretBytes"],
+  "lib/ingest/index.ts": ["ingestItem"],
+  "lib/db/admin.ts": ["adminClient"],
+};
+const PROHIBITED_REFERENCE = new RegExp(`\\b(${Object.values(PROHIBITED_EXPORTS).flat().join("|")})\\b`, "g");
 // Statement-anchored like the not-wired guard's own matcher, so one import cannot swallow the next.
 const IMPORT_FORMS =
   /(?:^|\n)\s*(?:import|export)\b[^'";]*?\bfrom\s*['"]([^'"]+)['"]|(?:^|\n)\s*import\s*['"]([^'"]+)['"]|\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)|\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
@@ -1054,12 +1126,14 @@ function censusImportViolations(source: string): string[] {
   for (const match of source.matchAll(IMPORT_FORMS)) {
     const specifier = match[1] ?? match[2] ?? match[3] ?? match[4];
     const statement = match[0].replace(/\s+/g, " ").trim();
-    if (BANNED_MODULES.some((banned) => banned.test(specifier))) violations.push(statement);
+    const bare = specifier.replace(/\.(?:ts|tsx|mjs|js)$/, "");
+    if (BANNED_MODULES.some((banned) => banned.test(bare))) violations.push(statement);
     if (BINDING.test(specifier) && !/^import \{ canonicalSlackChannelIds \} from ['"][^'"]+['"]$/.test(statement)) {
       violations.push(statement);
     }
   }
   if (/\bfetch\s*\(/.test(source)) violations.push("fetch(");
+  for (const match of source.matchAll(PROHIBITED_REFERENCE)) violations.push(`prohibited export ${match[1]}`);
   return violations;
 }
 
@@ -1093,8 +1167,71 @@ describe("slack repair census: import allowlist", () => {
     ["the provider transport", `import { requestSlackPage } from "./sources/slack-page-request";`],
     ["the timeline cache", `import { bustTimelineCache } from "@/lib/dashboard/timeline-cache";`],
     ["a provider request", `const r = await fetch("https://slack.com/api/auth.test");`],
+    ["the thread queue", `import { enqueueSlackThread } from "./slack-thread-state";`],
+    ["the thread queue, by alias and extension", `import * as queue from "@/lib/ingest/slack-thread-state.ts";`],
+    ["the message ledger", `import { readSlackTeamGenerations } from "./slack-message-ledger";`],
+    ["the message ledger, dynamically", `const ledger = await import("@/lib/ingest/slack-message-ledger");`],
+    ["thread cleanup", `import { purgeDeletedSlackThreads } from "./slack-cleanup";`],
+    ["the arc cache", `import { staleArcCache } from "@/lib/graph/arc-cache";`],
+    ["the arc cache, relatively", `import { readArcCache } from "../graph/arc-cache";`],
+    ["the identity writers", `import { setMemberIdentity } from "@/lib/identity/member-identities";`],
+    ["the shared ingest writer", `import { ingestItem } from "@/lib/ingest";`],
+    ["the shared ingest writer, relatively", `import { ingestItem } from "./index";`],
+    ["the ingest runner", `import { runSlackIngestion } from "./run";`],
+    ["the unbound admin adapter", `import { adminClient } from "@/lib/db/admin";`],
   ])("flags %s (negative control)", (_label, source) => {
     expect(censusImportViolations(source)).not.toEqual([]);
+  });
+
+  it("flags a prohibited export by NAME, however it was imported (negative control)", () => {
+    // The reviewed counterexample: a best-effort cache stale-mark that matches no fixture row.
+    const reviewed = [
+      `import { adminClient } from "@/lib/db/admin";`,
+      `import { staleArcCache } from "@/lib/graph/arc-cache";`,
+      `await staleArcCache(adminClient(), scope.teamId);`,
+    ].join("\n");
+    expect(censusImportViolations(reviewed)).toEqual(
+      expect.arrayContaining([
+        `import { adminClient } from "@/lib/db/admin"`,
+        `import { staleArcCache } from "@/lib/graph/arc-cache"`,
+        "prohibited export staleArcCache",
+        "prohibited export adminClient",
+      ])
+    );
+    // Laundered through a module that is not on the list: the import passes, the name does not.
+    const laundered = `import { staleArcCache as refresh } from "./census-support";\nawait refresh(client, teamId);`;
+    expect(censusImportViolations(laundered)).toEqual(["prohibited export staleArcCache"]);
+    for (const name of Object.values(PROHIBITED_EXPORTS).flat()) {
+      expect(censusImportViolations(`const result = await ${name}(session, scope);`), name).toEqual([
+        `prohibited export ${name}`,
+      ]);
+      expect(censusImportViolations(`const call = support.${name};`), name).toEqual([`prohibited export ${name}`]);
+    }
+    // The one permitted name stays permitted, and a longer identifier that merely contains one is not a hit.
+    expect(censusImportViolations(`const ids = canonicalSlackChannelIds({ channelIds }).selected;`)).toEqual([]);
+    expect(censusImportViolations(`const bindingConfigRevisionText = row.config_revision;`)).toEqual([]);
+  });
+
+  it("bans only names that are real exports of the modules it bans (control)", () => {
+    for (const [file, names] of Object.entries(PROHIBITED_EXPORTS)) {
+      const source = readFileSync(join(REPO, file), "utf8");
+      for (const name of names) {
+        expect(source, `${file} exports ${name}`).toMatch(new RegExp(`^export (?:async )?function ${name}\\b`, "m"));
+      }
+    }
+    // The reviewer-named modules are covered export for export, so a writer added to one of them
+    // later fails here instead of slipping past the name list.
+    const everyFunction = (file: string): string[] =>
+      [...readFileSync(join(REPO, file), "utf8").matchAll(/^export (?:async )?function (\w+)/gm)].map((m) => m[1]);
+    for (const file of ["lib/ingest/slack-thread-state.ts", "lib/ingest/slack-message-ledger.ts"]) {
+      expect([...PROHIBITED_EXPORTS[file]].sort(), file).toEqual(everyFunction(file).sort());
+    }
+    expect(everyFunction("lib/graph/arc-cache.ts").filter((name) => !PROHIBITED_EXPORTS["lib/graph/arc-cache.ts"].includes(name))).toEqual([
+      "arcTtlMs",
+    ]);
+    expect(everyFunction("lib/ingest/slack-source-binding.ts").filter((name) => !PROHIBITED_EXPORTS["lib/ingest/slack-source-binding.ts"].includes(name))).toEqual([
+      "canonicalSlackChannelIds",
+    ]);
   });
 
   it("holds for both census modules, and neither is re-exported from the ingest index", () => {

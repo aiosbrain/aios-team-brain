@@ -1,11 +1,28 @@
 import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { Client } from "pg";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, onTestFinished, vi } from "vitest";
 
+import * as timelineCache from "@/lib/dashboard/timeline-cache";
+import * as admin from "@/lib/db/admin";
 import { getPool, runSql } from "@/lib/db/pg/pool";
 import type { SqlExecutor } from "@/lib/db/types";
+import * as arcCache from "@/lib/graph/arc-cache";
+import * as identities from "@/lib/identity/member-identities";
+import * as sharedIngest from "@/lib/ingest";
+import * as channelState from "@/lib/ingest/slack-channel-state";
+import * as cleanup from "@/lib/ingest/slack-cleanup";
+import * as messageLedger from "@/lib/ingest/slack-message-ledger";
+import * as methodBudget from "@/lib/ingest/slack-method-budget";
+import * as namespaceGate from "@/lib/ingest/slack-namespace-gate";
+import * as publication from "@/lib/ingest/slack-publication";
+import * as binding from "@/lib/ingest/slack-source-binding";
+import * as discovery from "@/lib/ingest/slack-source-discovery";
 import { discoverSlackSource } from "@/lib/ingest/slack-source-discovery";
+import * as hydrator from "@/lib/ingest/slack-thread-hydrator";
+import * as threadState from "@/lib/ingest/slack-thread-state";
+import * as transport from "@/lib/ingest/sources/slack-page-request";
+import * as integrations from "@/lib/integrations/manage";
 import * as secrets from "@/lib/secrets/crypto";
 import { db, seedTeam, type Seed } from "./helpers";
 import {
@@ -298,6 +315,98 @@ function entryIds(pages: Loose | Loose[]): string[] {
 }
 
 const REFUSED = (reason: string): Json => ({ outcome: "refused", mode: "dry_run", reason });
+
+/**
+ * RUNTIME ZERO-CALL GUARD. "No table changed" cannot prove that no writer RAN: a best-effort cache
+ * stale-mark (`staleArcCache(adminClient(), teamId)`), a purge or a due-work read that matches no
+ * fixture row leaves every watched table identical. So the queue, ledger, state, identity, ingest and
+ * cache exports the census may not call are replaced, AFTER the fixtures, by spies that record the call
+ * and throw instead of running — a prohibited call is counted even if the caller swallows the error,
+ * and no real writer executes while the guard is up. The secret store keeps its own call-through spies
+ * in the test below. `canonicalSlackChannelIds` is deliberately absent: it is the one permitted import.
+ */
+const PROHIBITED_APIS: readonly [string, Loose, readonly string[]][] = [
+  ["@/lib/graph/arc-cache", arcCache, [
+    "readArcCache", "staleArcCache", "purgeArcCacheKey", "purgePartitionArcCache", "sweepStaleScopedArcCache",
+    "sweepOrphanedPartitionArcCache", "writeArcCache", "purgeExternalShapedPartitionRows",
+  ]],
+  ["@/lib/dashboard/timeline-cache", timelineCache, [
+    "timelineViewKey", "resolveTimelineVariant", "readTimelineCache", "writeTimelineCache", "bustTeamTimeline",
+    "purgeTimelineCacheTier", "purgeAdmissionTimelineNamespace", "settleTimelineRefreshes", "getCachedWorkTimeline",
+  ]],
+  ["@/lib/ingest/slack-thread-state", threadState, [
+    "enqueueSlackThread", "claimSlackThread", "claimDueSlackThread", "readSlackThreadSnapshot",
+    "writeSlackThreadSnapshot", "restartSlackThreadSnapshot", "purgeExpiredSlackThreadSnapshots",
+    "checkpointSlackThread", "releaseSlackThreadForRetry",
+  ]],
+  ["@/lib/ingest/slack-message-ledger", messageLedger, [
+    "readSlackTeamGenerations", "bumpSlackIdentityGeneration", "bumpSlackIdentityGenerationIfCurrent",
+    "bumpSlackPresentationIfChanged", "reconcileCompleteSlackThreadEvidence",
+  ]],
+  ["@/lib/ingest/slack-channel-state", channelState, [
+    "ensureSlackChannel", "dueSlackChannels", "beginSlackChannelMetadata", "recordSlackChannelPublicState",
+    "delaySlackChannel", "claimSlackChannelPage", "lockSlackChannelForAcceptance", "acceptSlackChannelPage",
+    "restartSlackChannelScan", "releaseSlackChannelForRetry",
+  ]],
+  ["@/lib/ingest/slack-method-budget", methodBudget, [
+    "reserveSlackMethodSlot", "extendSlackMethodBackoff", "markSlackMethodBlocked",
+  ]],
+  ["@/lib/ingest/slack-namespace-gate", namespaceGate, [
+    "ensureBlockedSlackNamespaceGate", "prepareNewSlackChannelNamespace", "invalidateSlackNamespaceGate",
+    "lockReadySlackNamespaceGate",
+  ]],
+  ["@/lib/ingest/slack-publication", publication, ["prepareSlackPublication", "finishSlackPublication"]],
+  ["@/lib/ingest/slack-source-binding", binding, [
+    "slackTokenFingerprint", "resolveEnvSlackToken", "slackConfigRevision", "lockSlackSelection", "slackBindingRef",
+    "teamHasCurrentSlackSource", "isSlackBinderValid", "bindSlackSelection", "recordSlackWorkspaceIdentity",
+    "recordSlackAppIdentity", "blockSlackBinding", "delaySlackBinding", "readSlackBinding",
+  ]],
+  ["@/lib/ingest/slack-thread-hydrator", hydrator, ["hydrateOneSlackThread"]],
+  ["@/lib/ingest/slack-source-discovery", discovery, ["discoverSlackSource"]],
+  ["@/lib/ingest/sources/slack-page-request", transport, ["slackReservedRequest"]],
+  ["@/lib/ingest/slack-cleanup", cleanup, ["purgeDeletedSlackThreads"]],
+  ["@/lib/identity/member-identities", identities, [
+    "setMemberIdentity", "removeMemberIdentity", "deleteMemberWithIdentityRevision", "disableMemberWithIdentityRevision",
+  ]],
+  ["@/lib/integrations/manage", integrations, [
+    "upsertIntegration", "setIntegrationStatus", "deleteIntegration", "setIntegrationSecret",
+    "getEnabledIntegrationsWithSecrets", "getProviderKey",
+  ]],
+  ["@/lib/ingest", sharedIngest, ["ingestItem"]],
+  ["@/lib/db/admin", admin, ["adminClient"]],
+];
+
+interface ProhibitedApi {
+  label: string;
+  namespace: Loose;
+  name: string;
+  spy: { mock: { calls: unknown[][] }; mockClear: () => unknown; mockRestore: () => void };
+}
+
+/** Install the guard. Call only once the fixtures exist: the fixtures themselves use these modules. */
+function forbidProhibitedApis(): {
+  apis: ProhibitedApi[];
+  calls: () => string[];
+  clear: () => void;
+  restore: () => void;
+} {
+  const apis = PROHIBITED_APIS.flatMap(([module, namespace, names]) =>
+    names.map((name): ProhibitedApi => {
+      const label = `${module}#${name}`;
+      expect(typeof namespace[name], `fixture: ${label} is a real export`).toBe("function");
+      const spy = vi.spyOn(namespace, name).mockImplementation(() => {
+        throw new Error(`census fixture: prohibited call to ${label}`);
+      });
+      return { label, namespace, name, spy };
+    })
+  );
+  return {
+    apis,
+    calls: () => apis.filter(({ spy }) => spy.mock.calls.length > 0).map(({ label }) => label),
+    clear: () => apis.forEach(({ spy }) => spy.mockClear()),
+    restore: () => apis.forEach(({ spy }) => spy.mockRestore()),
+  };
+}
 
 /** Page 1 of a two-item inventory, so there is a real cursor to carry across a change. */
 async function midTraversal(): Promise<{ seed: Seed; scope: Scope; projectId: string; first: Loose; cursor: string }> {
@@ -1165,6 +1274,10 @@ describe("slack repair census: one read-only snapshot per invocation (real Postg
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     const decrypt = vi.spyOn(secrets, "decryptSecret");
     const decryptBytes = vi.spyOn(secrets, "decryptSecretBytes");
+    // After the fixtures (which legitimately run discovery, the budget and the binding writers), and
+    // restored on every outcome so a failure here cannot leave a throwing export behind.
+    const prohibited = forbidProhibitedApis();
+    onTestFinished(() => prohibited.restore());
     const before = await tables();
 
     for (const current of await traverse(scope, 1)) expect(current.outcome).toBe("page");
@@ -1180,6 +1293,60 @@ describe("slack repair census: one read-only snapshot per invocation (real Postg
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(decrypt).not.toHaveBeenCalled();
     expect(decryptBytes).not.toHaveBeenCalled();
+    // Across every path above — pages, both refusals, the validation rejection and the aborted read —
+    // no queue, ledger, state, identity, ingest or cache export was called, whether or not it would
+    // have changed a row.
+    expect(prohibited.calls()).toEqual([]);
+  });
+
+  it("the prohibited-API guard detects a call to every export it covers, without running one (positive control)", async () => {
+    const teamId = randomUUID();
+    const before = await tables();
+    const prohibited = forbidProhibitedApis();
+    onTestFinished(() => prohibited.restore());
+    expect(prohibited.apis.map((api) => api.label)).toEqual(
+      expect.arrayContaining([
+        "@/lib/graph/arc-cache#staleArcCache",
+        "@/lib/ingest/slack-thread-state#enqueueSlackThread",
+        "@/lib/ingest/slack-message-ledger#readSlackTeamGenerations",
+        "@/lib/dashboard/timeline-cache#bustTeamTimeline",
+        "@/lib/db/admin#adminClient",
+      ])
+    );
+    expect(prohibited.calls()).toEqual([]);
+
+    // Each export, called the way an importing module calls it — through the module namespace. The
+    // replacement throws before any real code runs, so nothing here reaches a writer.
+    for (const api of prohibited.apis) {
+      expect(() => api.namespace[api.name](), api.label).toThrow(`prohibited call to ${api.label}`);
+      expect(prohibited.calls(), api.label).toEqual([api.label]);
+      prohibited.clear();
+      expect(prohibited.calls()).toEqual([]);
+    }
+
+    // The reviewed counterexample, spelled as a census would spell it and swallowed as a best-effort
+    // call would be: the guard still counts it, at the first prohibited export it touches…
+    const bestEffort = async (run: () => unknown): Promise<void> => {
+      try {
+        await run();
+      } catch {
+        // a best-effort caller hides the failure; the guard must not depend on seeing it
+      }
+    };
+    await bestEffort(() => arcCache.staleArcCache(admin.adminClient(), teamId));
+    expect(prohibited.calls()).toEqual(["@/lib/db/admin#adminClient"]);
+    prohibited.clear();
+    // …and at the cache writer itself when the client came from somewhere the guard does not cover.
+    await bestEffort(() => arcCache.staleArcCache({} as never, teamId));
+    expect(prohibited.calls()).toEqual(["@/lib/graph/arc-cache#staleArcCache"]);
+
+    // Nothing real ran, and the guard comes off cleanly.
+    expect(await tables()).toEqual(before);
+    prohibited.restore();
+    for (const api of prohibited.apis) {
+      expect(vi.isMockFunction(api.namespace[api.name]), `${api.label} restored`).toBe(false);
+    }
+    expect(typeof admin.adminClient().from).toBe("function");
   });
 });
 
