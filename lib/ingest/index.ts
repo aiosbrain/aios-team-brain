@@ -43,11 +43,21 @@ import { systemIntegrityGate } from "@/lib/projects/context/memberships";
 import { mergeGdriveContributions } from "@/lib/ingest/gdrive-ledger";
 import { syncGdriveContributionEvidence } from "@/lib/ingest/gdrive-contribution-store";
 import { validateIdentityAuthorityRevision } from "@/lib/identity/authority";
-import { lockGdriveProvider, recordGdriveItemClaim } from "@/lib/projects/context/gdrive-claims";
+import { recordGdriveItemClaim } from "@/lib/projects/context/gdrive-claims";
 import type { ApiAuth } from "@/lib/api/auth";
-import { afterTransactionCommit, runSql, withTransaction } from "@/lib/db/pg/pool";
+import { withBoundedLockWaits } from "@/lib/db/pg/bounded-lock";
+import { afterTransactionCommit, ambientTransactionClient, runSql, withTransaction } from "@/lib/db/pg/pool";
 import { isPgClient } from "@/lib/db/pg/client";
 import { lockItemAttribution } from "@/lib/ingest/item-attribution-lock";
+import {
+  driveCollisionSafePath,
+  drivePathIdentityKey,
+  driveRequestPathIdentities,
+  GdriveIngestStateChangedError,
+  lockGdriveIngestIdentities,
+  runGdriveIngestAttempts,
+  type GdriveIngestLocks,
+} from "@/lib/ingest/gdrive-commit-locks";
 import {
   GdriveAuthorityError,
   type GdriveExecutionRef,
@@ -95,9 +105,26 @@ export interface IngestConcurrencyHooks {
   afterAttributionRead?: (itemId: string) => Promise<void>;
 }
 
+/** A Drive commit: the connection claim to publish, and the locks `ingestGdriveApiItem` already holds. */
+interface GdriveIngestCommit {
+  claim: {
+    integrationId: string;
+    providerId: string;
+    generation: number;
+    audienceProjectIds: readonly string[];
+  };
+  storageProjectId: string;
+  locks: GdriveIngestLocks;
+}
+
 interface IngestInternalOptions {
   transactionBound?: boolean;
   concurrencyHooks?: IngestConcurrencyHooks;
+  /** Set only by `ingestGdriveApiItem`. Named, so it never competes for a positional slot. */
+  gdrive?: GdriveIngestCommit;
+  /** Set only by `ingestApiItem` for a payload that is not Drive-sourced: the refusal to raise when
+   * the row this ingest locks turns out to be Drive-owned. */
+  refuseDriveOwnedTarget?: () => Error;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -128,10 +155,17 @@ export function contentHash(body: string): string {
   return createHash("sha256").update(body, "utf8").digest("hex");
 }
 
+/** A payload that is not Drive-sourced may never write an item Drive owns. */
+function driveOwnedTargetRefusal(execution: GdriveExecutionRef | undefined): GdriveAuthorityError {
+  return execution
+    ? new GdriveAuthorityError("wrong_connection", "Google Drive payload is not bound to this authorized connection", 403)
+    : new GdriveAuthorityError("connector_principal_required", "current Google Drive execution authority is required for this stored item", 403);
+}
+
 /**
- * Public-ingest owner. Locks both candidate identities before deciding whether the stored target is
- * Drive-owned, so omitting/relabeling incoming provenance and concurrent first creation cannot skip
- * the immutable connection fence.
+ * Public-ingest owner. A Drive-sourced payload commits only under its connection's execution fence
+ * (`ingestGdriveApiItem`); any other payload is refused if the item at its path is Drive-owned, so
+ * omitting or relabeling incoming provenance cannot skip the immutable connection fence.
  */
 export async function ingestApiItem(
   db: DbClient,
@@ -143,108 +177,162 @@ export async function ingestApiItem(
   execution?: GdriveExecutionRef,
   concurrencyHooks: IngestConcurrencyHooks = {},
 ): Promise<IngestResult> {
+  if (rawPayload.frontmatter?.source === "gdrive") {
+    return ingestGdriveApiItem(db, auth, rawPayload, opts, pusherTier, execution, concurrencyHooks);
+  }
   return withTransaction(async () => {
-    // Global lock order: team identity authority -> path/provider identity -> canonical item.
+    // Lock order: team identity authority -> path identity -> canonical item.
     if (opts?.mappingRevision !== undefined) {
       await validateIdentityAuthorityRevision(auth.teamId,opts.mappingRevision);
     }
-    const incomingSourceId = rawPayload.frontmatter?.source === "gdrive"
-      && typeof rawPayload.frontmatter.source_id === "string"
-      ? rawPayload.frontmatter.source_id.trim() : "";
-    // Transaction-scoped identity locks close both path-vs-provider and two-new-writer races.
+    // Transaction-scoped identity lock closes the two-new-writer race.
     await runSql(`select pg_advisory_xact_lock(hashtextextended($1, 0))`, [
       `${auth.teamId}:item:${rawPayload.project}:${rawPayload.path}`,
     ]);
-    if (incomingSourceId) {
-      await lockGdriveProvider(auth.teamId, incomingSourceId);
-    }
-    // Resolve candidate immutable ids without taking row locks, then acquire the canonical item
-    // advisory locks in sorted order before any `for update`. Correction/repair take item advisory ->
-    // item row too; doing the inverse here would permit the classic ingest-vs-correction deadlock.
-    // The path and provider locks above keep these candidate identities stable until the locked reread.
-    const {rows:candidates}=await runSql<{target_id:string|null;incoming_id:string|null}>(
-      `select (
-         select i.id from items i join projects p on p.id=i.project_id and p.team_id=i.team_id
-          where i.team_id=$1 and p.slug=$2 and i.path=$3
-       ) as target_id, (
-         select m.item_id from source_item_mappings m
-          where m.team_id=$1 and m.source='gdrive' and m.provider_id=nullif($4,'')
-       ) as incoming_id`,
-      [auth.teamId,rawPayload.project,rawPayload.path,incomingSourceId],
+    // Resolve the candidate immutable id without taking a row lock, then acquire the canonical item
+    // advisory lock before any `for update`. Correction/repair take item advisory -> item row too;
+    // doing the inverse here would permit the classic ingest-vs-correction deadlock.
+    const {rows:candidates}=await runSql<{target_id:string|null}>(
+      `select i.id as target_id from items i join projects p on p.id=i.project_id and p.team_id=i.team_id
+        where i.team_id=$1 and p.slug=$2 and i.path=$3`,
+      [auth.teamId,rawPayload.project,rawPayload.path],
     );
-    const candidateIds=[...new Set([candidates[0]?.target_id,candidates[0]?.incoming_id]
-      .filter((id):id is string=>Boolean(id)))].sort();
-    for(const itemId of candidateIds){
+    for(const itemId of candidates.map((row)=>row.target_id).filter((id):id is string=>Boolean(id))){
       await concurrencyHooks.beforeAttributionLock?.(itemId);
       await lockItemAttribution(auth.teamId,itemId);
       await concurrencyHooks.afterAttributionLock?.(itemId);
     }
+    // The mapping is READ, never locked, here: a Drive mapping row is a provider identity, taken
+    // only under its provider key and before item rows (Drive ingest, reconciliation). Locking it
+    // after the item row above would invert that order.
     const { rows } = await runSql<{
       item_id: string | null;
       item_source: string | null;
-      item_connection: string | null;
       mapping_connection: string | null;
-      incoming_mapping_item: string | null;
-      incoming_mapping_connection: string | null;
     }>(
       `with target as (
-         select i.id, i.frontmatter->>'source' as source, i.frontmatter->>'connection_id' as connection_id
+         select i.id, i.frontmatter->>'source' as source
            from items i join projects p on p.id=i.project_id and p.team_id=i.team_id
           where i.team_id=$1 and p.slug=$2 and i.path=$3
           for update of i
-       ), target_mapping as (
-         select m.item_id, m.connection_id from source_item_mappings m
-          where m.team_id=$1 and m.source='gdrive' and m.item_id=(select id from target)
-          for update
-       ), incoming_mapping as (
-         select m.item_id, m.connection_id from source_item_mappings m
-          where m.team_id=$1 and m.source='gdrive' and m.provider_id=nullif($4,'')
-          for update
        )
-       select t.id as item_id, t.source as item_source, t.connection_id as item_connection,
-              tm.connection_id as mapping_connection, im.item_id as incoming_mapping_item,
-              im.connection_id as incoming_mapping_connection
-         from (select 1) seed left join target t on true
-         left join target_mapping tm on true left join incoming_mapping im on true`,
-      [auth.teamId, rawPayload.project, rawPayload.path, incomingSourceId],
+       select t.id as item_id, t.source as item_source,
+              (select m.connection_id from source_item_mappings m
+                where m.team_id=$1 and m.source='gdrive' and m.item_id=t.id) as mapping_connection
+         from (select 1) seed left join target t on true`,
+      [auth.teamId, rawPayload.project, rawPayload.path],
     );
     const stored = rows[0];
-    const incomingConnection = rawPayload.frontmatter?.source === "gdrive"
-      && typeof rawPayload.frontmatter.connection_id === "string"
-      ? rawPayload.frontmatter.connection_id.trim() : "";
-    const requiresDriveAuthority = rawPayload.frontmatter?.source === "gdrive"
-      || stored?.item_source === "gdrive"
-      || Boolean(stored?.mapping_connection)
-      || Boolean(stored?.incoming_mapping_item);
-    const commit = () => ingestItem(
-      db,auth,rawPayload,access,opts,pusherTier,undefined,{transactionBound:true},
-    );
-    if (!requiresDriveAuthority) return commit();
-    if (!execution) {
-      throw new GdriveAuthorityError("connector_principal_required", "current Google Drive execution authority is required for this stored item", 403);
+    if (stored?.item_source === "gdrive" || Boolean(stored?.mapping_connection)) {
+      throw driveOwnedTargetRefusal(execution);
     }
-    if (!incomingSourceId || incomingConnection !== execution.integrationId) {
-      throw new GdriveAuthorityError("wrong_connection", "Google Drive payload is not bound to this authorized connection", 403);
-    }
-    return withGdriveExecutionCommit(auth, execution, (audience) => ingestItem(
-      db,
-      auth,
-      rawPayload,
-      // Context memberships are the authority. External is the conservative inherited unit tier:
-      // it may enter either a restricted team project or an external-visible project without the
-      // no-widening gate ever laundering a team unit into an external grant.
-      "external",
-      opts,
-      pusherTier,
-      {
-        integrationId: execution.integrationId,
-        providerId: incomingSourceId,
-        generation: execution.generation,
-        audienceProjectIds: audience.projectIds,
-      },
-      {transactionBound:true},
-    ));
+    // A Drive ingest serializes with this one on the storage project row and the in-session path
+    // identity, both taken below — after the check above. The session therefore repeats the
+    // ownership check on the row it actually locks.
+    return ingestItem(db,auth,rawPayload,access,opts,pusherTier,undefined,{
+      transactionBound:true,
+      refuseDriveOwnedTarget:()=>driveOwnedTargetRefusal(execution),
+    });
   });
+}
+
+/**
+ * Create the storage project a Drive ingest names when it does not exist yet, or return its id.
+ * Runs after the connection authority is held and before any project row is locked. A project that
+ * appears between the read and the insert is not adopted here — its row would be locked out of id
+ * order — so the attempt is abandoned and the retry finds it by the read.
+ */
+async function resolveDriveStorageProject(teamId: string, slug: string): Promise<string> {
+  const { rows: existing } = await runSql<{ id: string }>(
+    `select id from projects where team_id=$1 and slug=$2`,
+    [teamId, slug],
+  );
+  if (existing[0]) return existing[0].id;
+  const { rows: created } = await runSql<{ id: string }>(
+    `insert into projects(team_id,slug,last_synced_at) values ($1,$2,now())
+     on conflict (team_id,slug) do nothing returning id`,
+    [teamId, slug],
+  );
+  if (!created[0]) throw new GdriveIngestStateChangedError("the storage project was created concurrently");
+  return created[0].id;
+}
+
+/**
+ * Drive-sourced public ingest, in the Drive commit lock order (`lib/ingest/gdrive-commit-locks`):
+ * identity authority/revision → connection authority → project rows → provider identity → path
+ * identities → item-attribution advisories → item rows → dependent rows. Source reconciliation
+ * takes the same connection → provider prefix, so the two cannot hold each other's next lock.
+ *
+ * Every outer wait is bounded (10s; 55P03 is not retried). A discovery that does not survive its
+ * locks abandons the whole attempt, which is retried once.
+ */
+async function ingestGdriveApiItem(
+  db: DbClient,
+  auth: ApiAuth,
+  rawPayload: ItemPayload,
+  opts: AttributionOverride | undefined,
+  pusherTier: "team" | "external",
+  execution: GdriveExecutionRef | undefined,
+  concurrencyHooks: IngestConcurrencyHooks,
+): Promise<IngestResult> {
+  const frontmatter: Record<string, unknown> = rawPayload.frontmatter ?? {};
+  const providerId = typeof frontmatter.source_id === "string" ? frontmatter.source_id.trim() : "";
+  const connectionId = typeof frontmatter.connection_id === "string" ? frontmatter.connection_id.trim() : "";
+  if (!execution) {
+    throw new GdriveAuthorityError("connector_principal_required", "current Google Drive execution authority is required for this stored item", 403);
+  }
+  if (!providerId || connectionId !== execution.integrationId) {
+    throw new GdriveAuthorityError("wrong_connection", "Google Drive payload is not bound to this authorized connection", 403);
+  }
+  const ref: GdriveExecutionRef = execution;
+  const mappingRevision = opts?.mappingRevision;
+  const attempt = () => withTransaction(async () => {
+    if (mappingRevision !== undefined) {
+      await withBoundedLockWaits(() => validateIdentityAuthorityRevision(auth.teamId, mappingRevision));
+    }
+    return withGdriveExecutionCommit(auth, ref, async (audience) => {
+      const storageProjectId = audience.storageProjectId;
+      if (!storageProjectId) {
+        throw new GdriveIngestStateChangedError("the storage project was removed before its row lock");
+      }
+      const locks = await lockGdriveIngestIdentities({
+        teamId: auth.teamId,
+        storageProjectId,
+        requestedPath: rawPayload.path,
+        providerId,
+        hooks: concurrencyHooks,
+      });
+      return ingestItem(
+        db,
+        auth,
+        rawPayload,
+        // Context memberships are the authority. External is the conservative inherited unit tier:
+        // it may enter either a restricted team project or an external-visible project without the
+        // no-widening gate ever laundering a team unit into an external grant.
+        "external",
+        opts,
+        pusherTier,
+        undefined,
+        {
+          transactionBound: true,
+          concurrencyHooks: { afterAttributionRead: concurrencyHooks.afterAttributionRead },
+          gdrive: {
+            claim: {
+              integrationId: ref.integrationId,
+              providerId,
+              generation: ref.generation,
+              audienceProjectIds: audience.projectIds,
+            },
+            storageProjectId,
+            locks,
+          },
+        },
+      );
+    }, { storageProject: () => resolveDriveStorageProject(auth.teamId, rawPayload.project) });
+  });
+  // A retry is a WHOLE attempt only when this call owns the transaction. Joined to a caller's, the
+  // locks would survive the "retry"; that caller owns the transaction and so owns any retry.
+  return ambientTransactionClient() ? attempt() : runGdriveIngestAttempts(attempt);
 }
 
 function canonicalJson(value: unknown): string {
@@ -287,21 +375,20 @@ export async function ingestItem(
   // because every INTERNAL caller (connectors, scanner, meetings) is trusted; ONLY the public
   // `/api/v1/items` route passes the real key tier, so an untrusted external key is gated out.
   pusherTier: "team" | "external" = "team",
-  gdriveClaim?: {
-    integrationId: string;
-    providerId: string;
-    generation: number;
-    audienceProjectIds: readonly string[];
-  },
+  // The seventh positional slot is deliberately EMPTY on this branch. The Slack publication option
+  // (PR 714) lands here; nothing else may. Source-specific extensions of this branch are named
+  // fields of `_internal` instead, so the two can never be mistaken for one another.
+  _reserved?: undefined,
   _internal: IngestInternalOptions = {},
 ): Promise<IngestResult> {
   const mappingRevision=opts?.mappingRevision;
+  const gdriveCommit = _internal.gdrive;
   // Every production caller receives one transaction. It is the lifetime of both the canonical item
   // attribution lock and all item/version/contribution writes. Unit DbClient fakes deliberately skip
   // PostgreSQL-only mechanics; every runtime DbClient is a PgClient (lib/db/types.ts).
   if (!_internal.transactionBound && isPgClient(db)) {
     return withTransaction(() => ingestItem(
-      db, auth, rawPayload, access, opts, pusherTier, gdriveClaim,
+      db, auth, rawPayload, access, opts, pusherTier, undefined,
       {..._internal,transactionBound:true},
     ));
   }
@@ -320,7 +407,14 @@ export async function ingestItem(
   // Fail before project/pointer writes when a legacy wrapper forgot to delegate transactions.
   transactionCapability(db);
   const requestedPayload = parsedPayload.data;
-  if (_internal.transactionBound) {
+  // A Drive document's path identity has ONE key: the in-session ingest identity taken below, by
+  // project id. The slug-keyed advisory here would be a second key for the same identity, taken
+  // before the project row — the inverse of the Drive commit order — so a Drive payload skips it.
+  const requestedDriveSourceId =
+    requestedPayload.frontmatter?.source === "gdrive" && typeof requestedPayload.frontmatter.source_id === "string"
+      ? requestedPayload.frontmatter.source_id.trim()
+      : "";
+  if (_internal.transactionBound && !requestedDriveSourceId) {
     // Creation identity precedes canonical item identity. This closes two-new-writer races for direct
     // internal callers; API ingestion already holds the same key, and advisory locks are re-entrant.
     await runSql(`select pg_advisory_xact_lock(hashtextextended($1,0))`, [
@@ -349,6 +443,10 @@ export async function ingestItem(
   if (projectError || !project) {
     throw new Error(`project upsert failed: ${projectError?.message}`);
   }
+  if (gdriveCommit && project.id !== gdriveCommit.storageProjectId) {
+    // The row written above must be the one the commit locked for write before its path identities.
+    throw new GdriveIngestStateChangedError("the storage project changed after its row lock");
+  }
   // PCCC-4: a freshly upserted source project records its graph partition pointer; the null-guarded
   // write makes the re-sync case (project already pointed) a no-op.
   const ptr = await ensureProjectGraphPointer(db, { teamId: auth.teamId, projectId: project.id as string });
@@ -365,18 +463,24 @@ export async function ingestItem(
     const projectId = project.id as string;
     // Per attempt: Drive identity resolution may move the path, and a retry must start from the push.
     let payload = requestedPayload;
-    await lockIngestIdentity(session, auth.teamId, projectId, payload.path);
+    // Google document identity is its exact provider id, not the normalized path. Historical gdrive
+    // paths lower-cased/sanitized that id, so rename/move/reconnect must first recover the established
+    // row through retained provenance. More than one match is an old collision: fail visibly rather
+    // than guessing and overwriting an unrelated document.
+    const gdriveSourceId = requestedDriveSourceId;
+    if (gdriveSourceId) {
+      // Both paths this document can be created at here — the requested one and its collision-safe
+      // alternative — in the one order every Drive writer takes them, held from before the
+      // existence checks below to after the insert. A Drive commit already holds them (re-entrant).
+      for (const identity of driveRequestPathIdentities(auth.teamId, projectId, payload.path, gdriveSourceId)) {
+        await lockIngestIdentity(session, auth.teamId, identity.projectId, identity.path);
+      }
+    } else {
+      await lockIngestIdentity(session, auth.teamId, projectId, payload.path);
+    }
     // Pre-lock identity candidate only. It is replaced by the freshly locked authority row below.
     let existing: ExistingItem | null = null;
 
-  // Google document identity is its exact provider id, not the normalized path. Historical gdrive
-  // paths lower-cased/sanitized that id, so rename/move/reconnect must first recover the established
-  // row through retained provenance. More than one match is an old collision: fail visibly rather
-  // than guessing and overwriting an unrelated document.
-  const gdriveSourceId =
-    payload.frontmatter?.source === "gdrive" && typeof payload.frontmatter.source_id === "string"
-      ? payload.frontmatter.source_id.trim()
-      : "";
   let mappedItemId = "";
   let mappedProjectId: string | null = null;
   let mappedCanonicalPath: string | null = null;
@@ -464,11 +568,7 @@ export async function ingestItem(
       if (fm.source === "gdrive" && fm.source_id === gdriveSourceId) {
         existing = pathMatch;
       } else {
-        const dot = payload.path.lastIndexOf(".");
-        const suffix = createHash("sha256").update(gdriveSourceId).digest("hex").slice(0, 10);
-        const safePath = dot > payload.path.lastIndexOf("/")
-          ? `${payload.path.slice(0, dot)}--drive-${suffix}${payload.path.slice(dot)}`
-          : `${payload.path}--drive-${suffix}`;
+        const safePath = driveCollisionSafePath(payload.path, gdriveSourceId);
         payload = { ...payload, path: safePath };
         const { data: safeMatch, error: safeError } = await db
           .from("items").select(existingFields).eq("team_id", auth.teamId)
@@ -486,8 +586,12 @@ export async function ingestItem(
     }
   }
 
+  // The id this session mints for a document with no item and no mapping yet. Nothing else can
+  // know it, so it is the one canonical id a Drive commit may use without having locked it.
+  let mintedDriveItemId: string | null = null;
   if (gdriveSourceId) {
-    const proposedItemId = existing?.id ?? (mappedItemId || randomUUID());
+    const minted = existing || mappedItemId ? null : randomUUID();
+    const proposedItemId = existing?.id ?? (mappedItemId || minted!);
     const proposedProjectId = existing?.project_id ?? mappedProjectId ?? (project.id as string);
     const proposedCanonicalPath = existing?.path ?? mappedCanonicalPath ?? payload.path;
     const { error: mappingWriteError } = await db
@@ -524,6 +628,7 @@ export async function ingestItem(
         `ambiguous historical gdrive identity '${gdriveSourceId}'; mapping and item disagree`,
       );
     }
+    if (authoritativeId === minted) mintedDriveItemId = minted;
     mappedItemId = authoritativeId;
     mappedProjectId = existing?.project_id ?? authoritative.project_id ?? proposedProjectId;
     mappedCanonicalPath = existing?.path ?? authoritative.canonical_path ?? proposedCanonicalPath;
@@ -553,8 +658,16 @@ export async function ingestItem(
   // lock. This lock is held by the surrounding transaction through item, version and contribution
   // writes, so a manual credit-nobody or named correction cannot be overwritten by a stale ingest.
   const canonicalItemId = existing?.id ?? (mappedItemId || randomUUID());
+  if (gdriveCommit && canonicalItemId !== mintedDriveItemId
+      && !gdriveCommit.locks.itemIds.has(canonicalItemId)) {
+    // The commit took its item advisories and rows before this session read anything. An identity
+    // resolved here that it does not hold was not there to lock: taking its advisory now would come
+    // after item rows, so the attempt is abandoned instead.
+    throw new GdriveIngestStateChangedError("the canonical item was not among the locked candidates");
+  }
   if (_internal.transactionBound) {
     await _internal.concurrencyHooks?.beforeAttributionLock?.(canonicalItemId);
+    // Re-entrant for a Drive commit; for a newly minted id the key is uncontended by construction.
     await lockItemAttribution(auth.teamId,canonicalItemId);
     await _internal.concurrencyHooks?.afterAttributionLock?.(canonicalItemId);
   }
@@ -563,11 +676,36 @@ export async function ingestItem(
   // lock — correction and repair take advisory → row, and the inverse order would deadlock them.
   const locked = await lockItemContext(session, auth.teamId, canonicalItemId);
   if (existing && !locked) {
+    // Never fall through to a create with the pre-lock snapshot: the removal won. For a Drive
+    // document the whole attempt is abandoned by name (and, through the API owner, retried once).
+    if (gdriveSourceId) {
+      throw new GdriveIngestStateChangedError("the canonical item was removed before its row lock");
+    }
     throw new Error("canonical item disappeared before attribution serialization");
   }
   if (locked) existing = locked.item as ExistingItem;
   if (_internal.transactionBound) {
     await _internal.concurrencyHooks?.afterAttributionRead?.(canonicalItemId);
+  }
+  if (existing && _internal.refuseDriveOwnedTarget) {
+    // Authoritative form of the public owner's pre-check, on the row this ingest actually locked.
+    const lockedFrontmatter = isRecord(existing.frontmatter) ? existing.frontmatter : {};
+    let driveOwned = lockedFrontmatter.source === "gdrive";
+    if (!driveOwned) {
+      const { rows: owners } = await session.executeSql<{ connection_id: string | null }>(
+        `select connection_id from source_item_mappings
+          where team_id=$1 and source='gdrive' and item_id=$2`,
+        [auth.teamId, existing.id],
+      );
+      driveOwned = Boolean(owners[0]?.connection_id);
+    }
+    if (driveOwned) throw _internal.refuseDriveOwnedTarget();
+  }
+  if (gdriveCommit && !existing
+      && !gdriveCommit.locks.pathKeys.has(
+        drivePathIdentityKey(auth.teamId, { projectId: itemProjectId, path: itemPath }))) {
+    // The identity about to be created must be one the commit has held since before it was checked.
+    throw new GdriveIngestStateChangedError("the creation path was not among the locked identities");
   }
 
   const storedFrontmatter = isRecord(existing?.frontmatter) ? existing.frontmatter : {};
@@ -831,11 +969,11 @@ export async function ingestItem(
       }
     }
     // No projection on an unchanged push (the route also guards status !== "unchanged").
-    if (gdriveClaim) {
+    if (gdriveCommit) {
       await recordGdriveItemClaim(rootDb, {
         teamId: auth.teamId,
         itemId: existing.id,
-        ...gdriveClaim,
+        ...gdriveCommit.claim,
       });
     }
     if (gdriveSourceId) {
@@ -1083,8 +1221,8 @@ export async function ingestItem(
     }
   }
 
-  if (gdriveClaim) {
-    await recordGdriveItemClaim(rootDb, { teamId: auth.teamId, itemId, ...gdriveClaim });
+  if (gdriveCommit) {
+    await recordGdriveItemClaim(rootDb, { teamId: auth.teamId, itemId, ...gdriveCommit.claim });
   }
   if (gdriveSourceId) {
     await syncGdriveContributionEvidence(db, auth.teamId, itemId, persistedFrontmatter, undefined, {

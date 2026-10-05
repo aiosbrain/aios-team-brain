@@ -5,6 +5,7 @@ import { ensureBuiltins, writeInviteDefaultMembership } from "@/lib/access/group
 import { audit } from "@/lib/api/audit";
 import type { ApiAuth } from "@/lib/api/auth";
 import { adminClient } from "@/lib/db/admin";
+import { withBoundedLockWaits } from "@/lib/db/pg/bounded-lock";
 import { runSql, withTransaction } from "@/lib/db/pg/pool";
 import { lockIdentityMutationAuthorities } from "@/lib/identity/authority";
 import { decryptSecret } from "@/lib/secrets/crypto";
@@ -45,6 +46,17 @@ export interface GdriveExecutionRef {
 
 export interface GdriveApprovedAudience {
   projectIds: string[];
+  /** The project this commit writes, when the caller named one and its row is now locked for write. */
+  storageProjectId?: string;
+}
+
+export interface GdriveCommitScope {
+  /**
+   * Resolves the id of the project the commit is about to WRITE (an ingest's storage project).
+   * Called after the connection authority is held and before any project row is locked, so that
+   * row joins the audience rows in the one ordered pass below. Reconciliation writes no project.
+   */
+  storageProject?: () => Promise<string>;
 }
 
 /** Admin-save validation lives in the integration domain, not the app route. */
@@ -66,7 +78,44 @@ export async function validateGdriveAudienceProjects(
   return rows.length === projectIds.length && rows.every((project) => project.granted);
 }
 
-async function approvedAudience(row: AuthorityRow): Promise<GdriveApprovedAudience> {
+/**
+ * Project rows for one Drive commit, in ONE ascending-id pass. Each row is locked exactly once, in
+ * the strongest mode this transaction will need: the storage project `for no key update` (the
+ * ingest updates it), every other audience row `for share`. Taking an audience row `for share` and
+ * writing it afterwards is the upgrade two concurrent commits deadlock on, and taking the two kinds
+ * in separate passes orders them by kind rather than by id — so a storage project that is also an
+ * audience project is write-locked here and never share-locked at all.
+ */
+async function lockCommitProjects(
+  teamId: string,
+  audienceProjectIds: readonly string[],
+  storageProjectId: string | undefined,
+): Promise<Set<string>> {
+  const storage = storageProjectId?.toLowerCase();
+  const ordered = [...new Set([...audienceProjectIds.map((id) => id.toLowerCase()), ...(storage ? [storage] : [])])]
+    .sort();
+  const locked = new Set<string>();
+  const lock = async (ids: string[], mode: "share" | "no key update") => {
+    if (ids.length === 0) return;
+    // `order by` precedes the row lock in the plan, so a run is locked in ascending id order.
+    const { rows } = await runSql<{ id: string }>(
+      `select id from projects where team_id=$1 and id=any($2::uuid[]) order by id for ${mode}`,
+      [teamId, ids],
+    );
+    for (const project of rows) locked.add(project.id.toLowerCase());
+  };
+  const at = storage ? ordered.indexOf(storage) : -1;
+  if (at < 0) {
+    await lock(ordered, "share");
+  } else {
+    await lock(ordered.slice(0, at), "share");
+    await lock([ordered[at]], "no key update");
+    await lock(ordered.slice(at + 1), "share");
+  }
+  return locked;
+}
+
+async function approvedAudience(row: AuthorityRow, storageProjectId?: string): Promise<GdriveApprovedAudience> {
   const raw = row.config.audienceProjectIds;
   const projectIds = Array.isArray(raw)
     ? [...new Set(raw.filter((id): id is string => typeof id === "string" && /^[0-9a-f-]{36}$/i.test(id)))]
@@ -74,16 +123,21 @@ async function approvedAudience(row: AuthorityRow): Promise<GdriveApprovedAudien
   if (projectIds.length === 0) {
     throw new GdriveAuthorityError("connection_unavailable", "Google Drive audience is not resolved", 409);
   }
+  const locked = await lockCommitProjects(row.team_id, projectIds, storageProjectId);
+  // Read the grants only after every audience row is held, so the answer is about locked rows.
   const { rows } = await runSql<{ id: string; granted: boolean }>(
     `select p.id, exists(select 1 from project_groups pg
                          where pg.team_id=p.team_id and pg.project_id=p.id) as granted
-       from projects p where p.team_id=$1 and p.id=any($2::uuid[]) for share`,
+       from projects p where p.team_id=$1 and p.id=any($2::uuid[])`,
     [row.team_id, projectIds],
   );
-  if (rows.length !== projectIds.length || rows.some((project) => !project.granted)) {
+  if (rows.length !== projectIds.length || rows.some((project) => !project.granted)
+      || projectIds.some((id) => !locked.has(id.toLowerCase()))) {
     throw new GdriveAuthorityError("connection_unavailable", "Google Drive audience grant is missing or no longer valid", 409);
   }
-  return { projectIds };
+  return storageProjectId && locked.has(storageProjectId.toLowerCase())
+    ? { projectIds, storageProjectId }
+    : { projectIds };
 }
 
 interface AuthorityRow {
@@ -419,15 +473,27 @@ async function assertLockedExecution(auth: ApiAuth, ref: GdriveExecutionRef): Pr
   return row;
 }
 
-/** Hold integration + authority row locks through an ingest-owner mutation. */
+/**
+ * Hold integration + authority row locks through an ingest-owner mutation.
+ *
+ * This is the head of the Drive commit lock order, shared by ingest and source reconciliation:
+ * connection authority, then project rows, then whatever `fn` takes (provider and path identities,
+ * item-attribution advisories, item rows, dependent rows). A caller that validates an identity
+ * revision does so before entering. Both waits here are bounded; past the bound PostgreSQL raises
+ * 55P03 and the commit fails without retry.
+ */
 export async function withGdriveExecutionCommit<T>(
   auth: ApiAuth,
   ref: GdriveExecutionRef,
   fn: (audience: GdriveApprovedAudience) => Promise<T>,
+  scope: GdriveCommitScope = {},
 ): Promise<T> {
   return withTransaction(async () => {
-    const row = await assertLockedExecution(auth, ref);
-    return fn(await approvedAudience(row));
+    const audience = await withBoundedLockWaits(async () => {
+      const row = await assertLockedExecution(auth, ref);
+      return approvedAudience(row, await scope.storageProject?.());
+    });
+    return fn(audience);
   });
 }
 
