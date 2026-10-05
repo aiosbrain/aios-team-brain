@@ -26,6 +26,20 @@ import { db, placeMemberByTier, seedTeam, type Seed } from "./helpers";
  *       again, records nothing (`seenUpdated: 0`, no link statement but the read) and still surfaces
  *       the divergence.
  *   3 — four refusals by real session and row state, after an admitted control.
+ *   4 — F4, six cells (`linear` and `plane` named; the named integration missing, disabled or
+ *       secret-less): the real owner answers the named provider marked `notRunReason:
+ *       "integration_unavailable"` and the action returns exactly `{ ok: false, error: "primary PM
+ *       integration is unavailable" }` — no link read, no provider request, no audit row, no
+ *       revalidation, no durable difference — and the same again on a repeat, while a usable
+ *       same-provider integration of the OTHER team and a usable other-provider integration of the
+ *       ACTING team rescue nothing; a non-admin of that team is still refused as `admins only` first.
+ *   5 — a resolved `linear` pass with no link holding a resource id: an unmarked success.
+ *   6 — a usable `plane` integration, with and without links: the owner's unsupported-adapter answer,
+ *       unmarked, reported, audited and revalidated as before (pinned as current, not endorsed).
+ *   7 — no resolvable provider (none enabled; two enabled with no primary named): the action's
+ *       existing refusal carrying the owner's reason, unmarked.
+ *   8 — no primary named and ONE PM integration enabled (the sole-enabled fallback): `linear` passes
+ *       as case 1 does, `plane` as case 6 does.
  *   Z — what this file does not supply, as executable TODOs naming the owner.
  *
  * SOURCE FACTS the expectations are read from:
@@ -33,21 +47,30 @@ import { db, placeMemberByTier, seedTeam, type Seed } from "./helpers";
  *     :88-89  `requireAdmin(teamSlug)`; a null verdict returns `{ ok: false, error: "admins only" }`.
  *     :91-92  only then `adminClient()` and `reconcileProviderState(db, ctx.teamId)` — two arguments,
  *             so no `fetchImpl` is handed down.
- *     :93     a null provider returns before the audit write. Not reached here.
- *     :95-103 the `team.reconcile_divergence` audit write, `meta` of the provider, `seenUpdated` and
- *             the NUMBER of divergences.
- *     :105-106 `revalidatePath` of `/t/<slug>/admin/pm-sync`, then the `ok: true` return.
+ *     :93     a null provider returns `result.reason`, before the audit write.
+ *     :94-98  F4: `notRunReason === "integration_unavailable"` returns the two-key failure, before
+ *             the audit write.
+ *     :100-108 the `team.reconcile_divergence` audit write, `meta` of the provider, `seenUpdated`
+ *             and the NUMBER of divergences.
+ *     :110-111 `revalidatePath` of `/t/<slug>/admin/pm-sync`, then the `ok: true` return.
  *   lib/pm-sync/reconcile.ts
- *     :76-83  `resolvePrimaryProvider`, then the adapter's `fetchSeenStates`.
- *     :85-92  the link read: `task_pm_links` by `team_id` and `provider`, resource id not null; no
+ *     :79-97  `resolvePrimaryProvider`; a null provider returns its reason, unmarked; a named
+ *             provider with a null integration returns its reason MARKED `integration_unavailable`;
+ *             an adapter with no `fetchSeenStates` (plane) returns its own reason, unmarked — all
+ *             three before the link read.
+ *     :99-106 the link read: `task_pm_links` by `team_id` and `provider`, resource id not null; no
  *             link returns before any provider read.
- *     :95     ONE `fetchSeenStates`, handed the resolved integration.
- *     :99-121 per link: no state for its resource id leaves it as it is; the state NAME is written
+ *     :109    ONE `fetchSeenStates`, handed the resolved integration.
+ *     :113-135 per link: no state for its resource id leaves it as it is; the state NAME is written
  *             to `provider_seen_status`, by link `id`, only when it differs from the stored one; a
  *             divergence is pushed when that name differs from a non-empty `last_projected_status`.
- *   lib/pm-sync/project.ts:114-136  `resolvePrimaryProvider`: `getEnabledIntegrationsWithSecrets(db,
+ *   lib/pm-sync/project.ts:114-144  `resolvePrimaryProvider`: `getEnabledIntegrationsWithSecrets(db,
  *             teamId)`, then the team's `primary_pm_provider` by id; the configured provider's
- *             same-type row holding a secret is the integration.
+ *             same-type row holding a secret is the integration, and with none the provider is
+ *             still NAMED, its integration null; with no primary named, exactly one provider with
+ *             such a row resolves, none or two do not.
+ *   lib/pm-sync/plane.ts:188-294  `planeAdapter` defines `prepare`, `upsertWorkItem` and
+ *             `moveToDone`, and no `fetchSeenStates`.
  *   lib/integrations/manage.ts:254-271  the read is `integrations` by `team_id` and `status =
  *             "enabled"`; `decryptSecret` is applied to each answered non-null `secret_ciphertext`.
  *   lib/pm-sync/linear.ts
@@ -104,7 +127,11 @@ import { db, placeMemberByTier, seedTeam, type Seed } from "./helpers";
  * `reconcile-divergence` file parses `query` out of `init.body`; `variables` is the argument
  * linear.ts hands it), and that it accepts a `Response.json({ data })` answer (the shape that file
  * answers with). The endpoint URL, the HTTP method, the header the key travels in, and its error,
- * retry and rate-limit handling were not read and are NOT asserted.
+ * retry and rate-limit handling were not read and are NOT asserted. Likewise outside the read list,
+ * and read back from the pool as fixture premises wherever cases 4 to 8 lean on them: that
+ * `integrations.status` takes the value `disabled`, that `secret_ciphertext` may be set null on an
+ * enabled row, and that `upsertIntegration` takes a `plane` row with an invented workspace and
+ * project id.
  *
  * Every request is: whole-rowset snapshots of ten tables read from the pool by raw SQL immediately
  * before and after; how the call settled and the key list of what it returned; ONE ORDERED TRACE of
@@ -116,10 +143,14 @@ import { db, placeMemberByTier, seedTeam, type Seed } from "./helpers";
  * request is asserted WHOLE.
  *
  * Bounds of what is claimed.
- *   - ONE EXPORT, ONE BRANCH. Only `reconcileDivergenceAction`, and of it only the refusal and the
- *     resolved-primary pass with linked rows. `projectBoardAction` is not called. This is not an
- *     AC-04 pass, not full action authorization, not an action inventory and not acceptance of any
- *     AIO-1217 criterion.
+ *   - ONE EXPORT. Only `reconcileDivergenceAction`: its refusal, the resolved `linear` pass with and
+ *     without linked rows, the F4 unavailable-integration refusal, the unsupported `plane` outcome
+ *     and the null-provider refusal. `projectBoardAction` is not called. This is not an AC-04 pass,
+ *     not full action authorization, not an action inventory and not acceptance of any AIO-1217
+ *     criterion.
+ *   - PLANE IS NEVER RECONCILED. Cases 6 and 8 pin what the action does today with a usable `plane`
+ *     integration — success, an audit row and a revalidation over a board nobody read. That is
+ *     preserved, not endorsed, and is not evidence of Plane inbound reconciliation.
  *   - THE PROVIDER IS A VALUE IN THIS FILE. The responder is evidence of what the owner and the action
  *     ASK and what they do with a given answer. It is not evidence of Linear's service behavior, its
  *     schema, its authorization of any key, or any provider-side effect.
@@ -140,7 +171,7 @@ import { db, placeMemberByTier, seedTeam, type Seed } from "./helpers";
  *     refused at team A's slug.
  *   - Direct calls of the exported function: not Next action-wire, POST dispatch, origin, encryption
  *     or cache-invalidation proof. Membership is read per request: no revocation claim is made.
- *   - Nothing about the missing-integration composition, reconcile error policy, AIO-1226 or PR714.
+ *   - Nothing about reconcile error policy, AIO-1226 or PR714.
  *
  * NOTHING HERE IS A CREDENTIAL. The two integration secrets are random marker strings that are not
  * in any provider's key format and belong to no account; they are encrypted and decrypted under a
@@ -149,7 +180,10 @@ import { db, placeMemberByTier, seedTeam, type Seed } from "./helpers";
  *
  * Run status. NOT RUN. This file was written without executing vitest, tsc, lint or any other
  * command; every expectation comes from reading the sources named above, not from an observed run.
- * Replace this paragraph with the observed result once the file has been executed.
+ * Replace this paragraph with the observed result once the file has been executed. Cases 4 to 8 and
+ * the owner key-list assertion of cases 1 to 3 were added with the F4 marker by a later writer under
+ * the same condition: NOT RUN — against the F4 sources, and against the sources before them, so no
+ * RED was observed either.
  */
 
 const FIXTURE = "FIXTURE PREMISE FAILED (setup, not a security observation):";
@@ -243,18 +277,28 @@ const ROOMY = 30_000;
 /** Cases 2 and 3 make up to five requests. */
 const ROOMIER = 60_000;
 
-/** The one provider type this file configures: every primary, integration row and link. */
+/** The provider cases 1 to 3 configure throughout: every primary, integration row and link. */
 const PROVIDER = "linear";
+/** The two PM providers a team can name as its primary; cases 4 to 8 configure either. */
+type PmKind = "linear" | "plane";
+/** The other provider: what a non-rescue control enables in the acting team. */
+const ALTERNATE: Record<PmKind, PmKind> = { linear: "plane", plane: "linear" };
 
 const OWNER = "reconcileProviderState";
 const AUDIT_ACTION = "team.reconcile_divergence";
 
 const ADMINS_ONLY = { ok: false, error: "admins only" };
+/** F4: the action's refusal of a named primary whose integration is missing, disabled or secret-less. */
+const UNAVAILABLE = { ok: false, error: "primary PM integration is unavailable" };
+/** The owner's internal marker for that state: never a key of anything the action returns. */
+const NOT_RUN = "integration_unavailable";
 
 /** The key list of a refusal: no provider, seenUpdated or divergences key. */
 const REFUSED_KEYS = ["error", "ok"];
 /** The key list of the action's `ok: true` return: no error key. */
 const RECONCILED_KEYS = ["divergences", "ok", "provider", "seenUpdated"];
+/** The key list of what the real owner answers for a pass that ran: no reason and no marker key. */
+const RESOLVED_KEYS = ["divergences", "provider", "seenUpdated"];
 
 /** What the pass-through recorder notes when it was handed the service client of the request in flight. */
 const REQUEST_SERVICE_CLIENT = "the service client of this request";
@@ -267,6 +311,7 @@ const NATIVE_ERROR = "native error:";
 
 /** The labels the decrypt recorder answers with: which synthetic secret came back, never the value. */
 const A_SECRET = "team A's synthetic secret";
+const A_ALT_SECRET = "team A's other-provider synthetic secret";
 const B_SECRET = "team B's synthetic secret";
 const UNKNOWN_SECRET = "a value this file did not write";
 
@@ -378,12 +423,32 @@ interface World {
   provider: Provider;
 }
 
+/**
+ * The two teams, their admins and the secret labels alone: no primary named, no integration and no
+ * link. What cases 4 to 8 start from and arrange for themselves.
+ */
+type Stage = Pick<World, "a" | "b" | "alice" | "bob" | "markers">;
+
 /** What one pass of the real owner is expected to do with the board as it stands. */
 interface Pass {
   /** The links whose `provider_seen_status` this pass rewrites, with the state name each is given. */
   rewritten: Array<{ link: Linked; state: string }>;
   /** The divergences the pass surfaces. */
   divergences: Row[];
+}
+
+/** What an admitted invocation whose pass never reaches the provider is expected to do. */
+interface Late {
+  /** What the real owner answers: these keys and no other. */
+  answered: Row;
+  /** The statements the owner issues beneath the pass-through call, in order. */
+  statements: Step[];
+  /** Which synthetic secrets the resolution decrypts, by label, sorted. */
+  decrypted: string[];
+  /** What the action returns: these keys and no other. */
+  returned: Row;
+  /** The `meta` of the audit row the action writes after the owner returns; null when it refuses first. */
+  audited: Row | null;
 }
 
 let authSecret = "";
@@ -722,31 +787,51 @@ async function seedProject(board: Board): Promise<void> {
   board.projectIds.push(id);
 }
 
-/** SETUP WRITE: the team names `PROVIDER` as its primary PM provider, read back from the pool. */
-async function namePrimary(team: Seed): Promise<void> {
+/** SETUP WRITE: the team names `provider` as its primary PM provider, read back from the pool. */
+async function namePrimary(team: Seed, provider: PmKind = PROVIDER): Promise<void> {
   const named = await fxOne<{ provider: string | null }>(
     "primary provider update",
     `update teams set primary_pm_provider = $2 where id = $1 returning primary_pm_provider::text as provider`,
-    [team.teamId, PROVIDER],
+    [team.teamId, provider],
   );
-  premise("the team names the primary PM provider it was given", named.provider, PROVIDER);
+  premise("the team names the primary PM provider it was given", named.provider, provider);
 }
+
+/** The primary PM provider a team names, read back from the pool; null when it names none. */
+const primaryOf = async (team: Seed): Promise<string | null> =>
+  (
+    await fxOne<{ provider: string | null }>(
+      "primary provider readback",
+      `select primary_pm_provider::text as provider from teams where id = $1`,
+      [team.teamId],
+    )
+  ).provider;
 
 /** A random marker for an integration secret: in no provider's key format, and no account's key. */
 const syntheticSecret = (tag: string): string => `aio1217-synthetic-not-a-provider-key-${tag}-${randomUUID()}`;
 
+/** An invented provider resource id: it names no issue and no work item anywhere. */
+const syntheticResource = (name: string): string => `aio1217-syn-issue-${name}-${randomUUID().slice(0, 8)}`;
+
+/** The invented Plane workspace and project of a board's team: ids that name nothing, and no URL. */
+const planeConfigOf = (board: Board): Row => ({
+  workspaceSlug: board.linearTeam.replace("linear-team", "plane-workspace"),
+  projectId: board.linearTeam.replace("linear-team", "plane-project"),
+});
+
 /**
  * SETUP WRITE, through the table's own writers as the existing native reconcile file does: one
- * ENABLED `PROVIDER` integration of the board's team configured with its invented Linear team id,
- * then its synthetic secret, encrypted by the real `encryptSecret` under this test's SECRETS_KEY.
- * Read back: the stored ciphertext decrypts, under the real `decryptSecret`, to that secret.
+ * ENABLED `type` integration of the board's team configured with its invented Linear team id (or
+ * its invented Plane workspace and project), then its synthetic secret, encrypted by the real
+ * `encryptSecret` under this test's SECRETS_KEY. Read back: the stored ciphertext decrypts, under
+ * the real `decryptSecret`, to that secret. Answers the row's id.
  */
-async function seedIntegration(board: Board, creator: Cast, secret: string): Promise<void> {
+async function seedIntegration(board: Board, creator: Cast, secret: string, type: PmKind = PROVIDER): Promise<string> {
   const auth = { teamId: board.team.teamId, memberId: creator.memberId };
   const { id } = await upsertIntegration(db(), auth, {
-    type: PROVIDER,
-    name: "aio1217-synthetic-linear",
-    config: { teamId: board.linearTeam },
+    type,
+    name: `aio1217-synthetic-${type}`,
+    config: type === "linear" ? { teamId: board.linearTeam } : planeConfigOf(board),
   });
   await setIntegrationSecret(db(), auth, id, secret);
   board.integrationIds.push(id);
@@ -763,17 +848,78 @@ async function seedIntegration(board: Board, creator: Cast, secret: string): Pro
     ],
     [true, true],
   );
+  return id;
+}
+
+/** How one integration row stands, read back from the pool by the statement that rearranged it. */
+const STANDING = `returning status::text as status, (secret_ciphertext is not null) as has_ciphertext`;
+
+/** SETUP WRITE, raw SQL: the row leaves `enabled` and keeps its ciphertext. Read back. */
+async function disableIntegration(board: Board, id: string): Promise<void> {
+  premise(
+    "the integration is disabled and still holds its ciphertext",
+    await fxOne(
+      "integration disable",
+      `update integrations set status = 'disabled' where id = $1 and team_id = $2 ${STANDING}`,
+      [id, board.team.teamId],
+    ),
+    { status: "disabled", has_ciphertext: true },
+  );
+}
+
+/** SETUP WRITE, raw SQL: the row stays `enabled` and loses its ciphertext. Read back. */
+async function stripSecret(board: Board, id: string): Promise<void> {
+  premise(
+    "the integration is enabled and holds no ciphertext",
+    await fxOne(
+      "integration secret removal",
+      `update integrations set secret_ciphertext = null where id = $1 and team_id = $2 ${STANDING}`,
+      [id, board.team.teamId],
+    ),
+    { status: "enabled", has_ciphertext: false },
+  );
 }
 
 /**
- * SETUP WRITE, raw SQL: one keyed task of the board's project, origin `ui`, and its `PROVIDER` link.
- * `resourceId` null is a link that was never projected. No provider URL is written, and no seen
- * status: every link starts with `provider_seen_status` null.
+ * SETUP WRITE: an enabled `type` integration of the board's team under a fresh synthetic secret,
+ * which the decrypt recorder then knows by `label`. Answers the row's id.
+ */
+async function hold(stage: Stage, board: Board, creator: Cast, label: string, type: PmKind): Promise<string> {
+  stage.markers[label] = syntheticSecret(type);
+  return seedIntegration(board, creator, stage.markers[label], type);
+}
+
+/** One integration row as `integrationsHeld` reads it back. */
+const integrationRow = (board: Board, type: PmKind, status: string, hasCiphertext: boolean): Row => ({
+  team_id: board.team.teamId,
+  type,
+  status,
+  has_ciphertext: hasCiphertext,
+  linear_team: type === "linear" ? board.linearTeam : null,
+});
+
+/**
+ * Arms the synthetic provider for a stage: it would answer the three state reads for team A's
+ * invented Linear team with the listed states, so a pass that did reach it would be served and
+ * counted. It still refuses anything carrying team B's secret or Linear team id.
+ */
+function armBoard(stage: Stage, listed: Array<{ link: Linked; state: string }>): void {
+  synthetic = {
+    linearTeam: stage.a.linearTeam,
+    issues: listed.map(({ link, state }) => ({ id: resourceOf(link), state: stateNamed(state) })),
+    forbidden: { [B_SECRET]: stage.markers[B_SECRET], "team B's Linear team id": stage.b.linearTeam },
+  };
+}
+
+/**
+ * SETUP WRITE, raw SQL: one keyed task of the board's project, origin `ui`, and its link — to
+ * `PROVIDER` unless `provider` says otherwise. `resourceId` null is a link that was never projected.
+ * No provider URL is written, and no seen status: every link starts with `provider_seen_status` null.
  */
 async function seedLinked(
   board: Board,
   tag: string,
-  placed: { resourceId: string | null; lastProjected: string | null; status: string },
+  placed: { resourceId: string | null; lastProjected: string | null; status: string; provider?: PmKind },
 ): Promise<Linked> {
   const rowKey = `AIO1217-RCN-${tag}`;
   const task = await fxOne<{ id: string }>(
@@ -793,7 +939,7 @@ async function seedLinked(
       board.projectIds[0],
       task.id,
       rowKey,
-      PROVIDER,
+      placed.provider ?? PROVIDER,
       rowKey,
       placed.resourceId,
       placed.lastProjected,
@@ -853,44 +999,25 @@ const resourceOf = (link: Linked): string => {
  * Read back, before any request: exactly those integration rows; what each asserted read would be
  * answered with as written and WITHOUT its team equality, so each asserted row count is known to
  * discriminate; every link's seen status null; every task's brain status; and no reconcile audit row.
+ *
+ * `primary: "unset"` leaves team A naming NO primary, so its one enabled PM integration is what the
+ * sole-enabled fallback resolves (project.ts:138-141); team B names `PROVIDER` either way.
  */
-async function seedWorld(): Promise<World> {
-  premise(
-    "integrations starts empty",
-    await countOf("integrations readback", `select count(*)::int as n from integrations`),
-    0,
-  );
-
-  const tag = randomUUID().slice(0, 8);
-  const a: Board = {
-    team: await seedTeam(),
-    projectIds: [],
-    integrationIds: [],
-    links: [],
-    linearTeam: `aio1217-syn-linear-team-a-${tag}`,
-  };
-  const b: Board = {
-    team: await seedTeam(),
-    projectIds: [],
-    integrationIds: [],
-    links: [],
-    linearTeam: `aio1217-syn-linear-team-b-${tag}`,
-  };
-  premise("the two teams are distinct", [a.team.teamId === b.team.teamId, a.team.teamSlug === b.team.teamSlug], [
-    false,
-    false,
-  ]);
-  const alice = await seedCast(a.team, "alice");
-  const bob = await seedCast(b.team, "bob");
-  await seedProject(a);
-  await seedProject(b);
-  await namePrimary(a.team);
+async function seedWorld(placed: { primary?: "named" | "unset" } = {}): Promise<World> {
+  const { a, b, alice, bob } = await seedStage();
+  if (placed.primary !== "unset") await namePrimary(a.team);
   await namePrimary(b.team);
+  premise(
+    "team A names the primary this world was asked for",
+    await primaryOf(a.team),
+    placed.primary === "unset" ? null : PROVIDER,
+  );
 
   markers = { [A_SECRET]: syntheticSecret("a"), [B_SECRET]: syntheticSecret("b") };
   await seedIntegration(a, alice, markers[A_SECRET]);
   await seedIntegration(b, bob, markers[B_SECRET]);
 
+  const tag = randomUUID().slice(0, 8);
   const issue = (name: string) => `aio1217-syn-issue-${name}-${tag}`;
   const diverged = await seedLinked(a, "A-1", { resourceId: issue("a1"), lastProjected: "Backlog", status: "backlog" });
   const inSync = await seedLinked(a, "A-2", {
@@ -953,6 +1080,45 @@ async function seedWorld(): Promise<World> {
   premise("every task holds the brain status it was given", await tasksHeld(), tasksOf(world));
   premise("no reconcile audit row exists", await reconcileAudits(), []);
   return world;
+}
+
+/**
+ * Two teams, each with one admitted admin and a signed session and one project — and no primary
+ * named, no integration, no link and no synthetic secret yet. The secrets a case then encrypts go
+ * into `markers`, the object the decrypt recorder reads its labels from.
+ */
+async function seedStage(): Promise<Stage> {
+  premise(
+    "integrations starts empty",
+    await countOf("integrations readback", `select count(*)::int as n from integrations`),
+    0,
+  );
+
+  const tag = randomUUID().slice(0, 8);
+  const a: Board = {
+    team: await seedTeam(),
+    projectIds: [],
+    integrationIds: [],
+    links: [],
+    linearTeam: `aio1217-syn-linear-team-a-${tag}`,
+  };
+  const b: Board = {
+    team: await seedTeam(),
+    projectIds: [],
+    integrationIds: [],
+    links: [],
+    linearTeam: `aio1217-syn-linear-team-b-${tag}`,
+  };
+  premise("the two teams are distinct", [a.team.teamId === b.team.teamId, a.team.teamSlug === b.team.teamSlug], [
+    false,
+    false,
+  ]);
+  const alice = await seedCast(a.team, "alice");
+  const bob = await seedCast(b.team, "bob");
+  await seedProject(a);
+  await seedProject(b);
+  markers = {};
+  return { a, b, alice, bob, markers };
 }
 
 /** The integration rows a world holds: each team's one enabled, ciphertext-bearing `PROVIDER` row. */
@@ -1174,13 +1340,27 @@ const boundOf = (seen: Seen, identifiers: Record<string, string>): string[] =>
  * statements or any durable row it left, sorted. The stored ciphertexts are in those rows; a
  * plaintext is not.
  */
-function surfaced(seen: Seen, world: World): string[] {
+function surfaced(seen: Seen, world: Pick<World, "markers">): string[] {
   const said = searchable("", [seen.outcome, seen.trace, seen.bound, seen.after]);
   return Object.entries(world.markers)
     .filter(([, value]) => said.includes(value))
     .map(([label]) => label)
     .sort();
 }
+
+/**
+ * The key list of what the real owner answered each pass-through call with. A key list, because
+ * `toEqual` reads a key holding `undefined` as absent: a marker set on every return would show here.
+ */
+const answeredKeys = (seen: Seen): string[][] =>
+  seen.trace.filter((step) => step.step === "lower").map((step) => Object.keys(step.answered as Row).sort());
+
+/** Which synthetic secrets a request decrypted, by label, sorted. */
+const decryptedBy = (seen: Seen): string[] =>
+  seen.trace
+    .filter((step) => step.step === "decrypt")
+    .map((step) => String(step.yielded))
+    .sort();
 
 // ── what a request puts in its trace ─────────────────────────────────────────────────────────────
 
@@ -1247,6 +1427,19 @@ const stateReads = (board: Provider): Step[] => [
 
 /** Every provider read of a request, in order. */
 const readsOf = (seen: Seen): Step[] => seen.trace.filter((step) => step.step === "transport");
+
+/**
+ * The resolution's two statements, in the order lib/pm-sync/project.ts:124-125 issues them: the
+ * team's ENABLED integrations — answered with `enabledRows` — then the team's primary.
+ */
+const resolution = (team: Seed, enabledRows: number): Step[] => [
+  statement("admin", "integrations", { team_id: team.teamId, status: "enabled" }, enabledRows),
+  statement("admin", "teams", { id: team.teamId }, 1),
+];
+
+/** The owner's link read (lib/pm-sync/reconcile.ts:99-104): by team and provider, resource id not null. */
+const linkRead = (team: Seed, provider: PmKind, rows: number): Step =>
+  statement("admin", "task_pm_links", { team_id: team.teamId, provider }, rows);
 
 /** The link each `task_pm_links` update named and the row count Postgres answered, by link id. */
 const rewrites = (seen: Seen): Row[] =>
@@ -1337,6 +1530,7 @@ async function admit(world: World, label: string, pass: Pass): Promise<Seen> {
       ...observed(seen),
       guard: seen.trace.slice(0, guard.length),
       ledger: ledger(seen, guard.length),
+      answeredKeys: answeredKeys(seen),
       rewrites: rewrites(seen),
       foreign: boundOf(seen, identifiersOf("B", world.b, world.bob)),
       surfaced: surfaced(seen, world),
@@ -1346,6 +1540,8 @@ async function admit(world: World, label: string, pass: Pass): Promise<Seen> {
   ).toEqual({
     outcome: { returned: { ok: true, ...settled } },
     shape: RECONCILED_KEYS,
+    // A pass that ran is unmarked: no `reason` and no `notRunReason` key, not even holding undefined.
+    answeredKeys: [RESOLVED_KEYS],
     acquired: { server: 1, admin: 1 },
     // One decrypt although two ciphertexts are stored; three reads; no `headers`.
     seams: { reconcileProviderState: 1, decryptSecret: 1, fetch: READS.length, revalidatePath: 1 },
@@ -1394,7 +1590,7 @@ async function admit(world: World, label: string, pass: Pass): Promise<Seen> {
       { step: "decrypt", yielded: A_SECRET },
       // lib/pm-sync/project.ts:125, the team's primary.
       statement("admin", "teams", { id: team.teamId }, 1),
-      // lib/pm-sync/reconcile.ts:85-90: team A's three links holding a resource id; never team B's.
+      // lib/pm-sync/reconcile.ts:99-104: team A's three links holding a resource id; never team B's.
       statement("admin", "task_pm_links", { team_id: team.teamId, provider: PROVIDER }, 3),
       ...stateReads(world.provider),
       // The order the unordered link read answered in is not asserted: `rewrites` holds the set.
@@ -1443,6 +1639,142 @@ async function refuse(label: string, refusal: Refusal): Promise<Seen> {
   });
   return seen;
 }
+
+/**
+ * A new invocation under Alice's session for team A that the gate ADMITS and whose pass never
+ * reaches the provider: the guard's real reads; the service client; the real owner handed the
+ * server-resolved team and no options; beneath it exactly `late.statements`, each bound to team A,
+ * and the named decrypts; the owner's answer with exactly its keys; then EITHER the one audit row
+ * and the one revalidation (`late.audited`) OR nothing at all — no statement, no write, no
+ * revalidation — before the return. No provider request, no `tasks` statement, no run, no secret
+ * anywhere, no identifier of team B bound by any statement, and no durable difference in any table
+ * of either team but that audit row.
+ */
+async function reach(stage: Stage, label: string, late: Late): Promise<Seen> {
+  const who = stage.alice;
+  const team = stage.a.team;
+  const guard = guardChain(who, await groupRows(who));
+  const path = `/t/${team.teamSlug}/admin/pm-sync`;
+
+  const seen = await request(who.session, () => reconcileDivergenceAction(team.teamSlug));
+
+  expect(
+    {
+      ...observed(seen),
+      guard: seen.trace.slice(0, guard.length),
+      // The decrypts are `decrypted`'s: two enabled rows are answered in no asserted order.
+      ledger: ledger(seen, guard.length).filter((step) => step.step !== "decrypt"),
+      answeredKeys: answeredKeys(seen),
+      decrypted: decryptedBy(seen),
+      foreign: boundOf(seen, identifiersOf("B", stage.b, stage.bob)),
+      surfaced: surfaced(seen, stage),
+    },
+    label,
+  ).toEqual({
+    outcome: { returned: late.returned },
+    shape: Object.keys(late.returned).sort(),
+    acquired: { server: 1, admin: 1 },
+    // No `fetch` and no `headers`: nothing is asked of the provider, though the board is armed to answer.
+    seams: {
+      reconcileProviderState: 1,
+      ...(late.decrypted.length > 0 ? { decryptSecret: late.decrypted.length } : {}),
+      ...(late.audited ? { revalidatePath: 1 } : {}),
+    },
+    revalidated: late.audited ? [[path]] : [],
+    // No `task_pm_links`, `tasks`, `integrations`, `teams` or `ingest_runs` key on any of these branches.
+    changed: late.audited ? { audit_log: { added: [auditRow(who, late.audited)], removed: [] } } : {},
+    guard,
+    ledger: [
+      SERVICE_CLIENT,
+      {
+        step: "lower",
+        owner: OWNER,
+        client: REQUEST_SERVICE_CLIENT,
+        args: { teamId: team.teamId, opts: null },
+        answered: late.answered,
+      },
+      ...late.statements,
+      { step: "returned", owner: OWNER },
+      // Only an outcome the action reports as a success is followed by anything.
+      ...(late.audited ? [wrote("insert", "audit_log"), { step: "revalidate", path }] : []),
+    ],
+    answeredKeys: [Object.keys(late.answered).sort()],
+    decrypted: late.decrypted,
+    foreign: [],
+    surfaced: [],
+  });
+  return seen;
+}
+
+/**
+ * A stage on which each team holds a usable `plane` integration — team A's the only PM integration
+ * it has, named as its primary or left to the sole-enabled fallback — with, if asked, two `plane`
+ * links of team A holding a resource id; and what the owner and the action owe it today:
+ * `planeAdapter` has no `fetchSeenStates`, so the owner answers its unsupported reason UNMARKED
+ * before the link read, and the action drops that reason, audits and revalidates.
+ */
+async function planeUnsupported(placed: { primary: "named" | "unset"; linked: boolean }): Promise<{
+  stage: Stage;
+  late: Late;
+}> {
+  const stage = await seedStage();
+  const { a, b, alice, bob } = stage;
+  if (placed.primary === "named") await namePrimary(a.team, "plane");
+  await namePrimary(b.team, "plane");
+  await hold(stage, a, alice, A_SECRET, "plane");
+  await hold(stage, b, bob, B_SECRET, "plane");
+  if (placed.linked) {
+    for (const tag of ["A-1", "A-2"]) {
+      await seedLinked(a, tag, {
+        resourceId: syntheticResource(tag.toLowerCase()),
+        lastProjected: "Backlog",
+        status: "backlog",
+        provider: "plane",
+      });
+    }
+  }
+  armBoard(stage, []);
+
+  premise(
+    "each team holds one enabled, ciphertext-bearing `plane` row and nothing else",
+    await integrationsHeld(),
+    byContent([integrationRow(a, "plane", "enabled", true), integrationRow(b, "plane", "enabled", true)]),
+  );
+  premise(
+    "team A names the primary this stage was asked for, and holds the eligible `plane` links it was asked for",
+    [
+      await primaryOf(a.team),
+      await countOf(
+        "scoped link read",
+        `select count(*)::int as n from task_pm_links
+          where team_id = $1 and provider = $2 and provider_resource_id is not null`,
+        [a.team.teamId, "plane"],
+      ),
+    ],
+    [placed.primary === "named" ? "plane" : null, placed.linked ? 2 : 0],
+  );
+
+  return {
+    stage,
+    late: {
+      answered: { provider: "plane", seenUpdated: 0, divergences: [], reason: "plane has no inbound reconcile support" },
+      // The resolution alone: the owner returns before the link read, links or no links.
+      statements: resolution(a.team, 1),
+      decrypted: [A_SECRET],
+      returned: { ok: true, provider: "plane", seenUpdated: 0, divergences: [] },
+      audited: { provider: "plane", seenUpdated: 0, divergences: 0 },
+    },
+  };
+}
+
+/** The reconcile audit rows of team A's admitted admin, as `reconcileAudits` reads them back, one per `meta`. */
+const auditsOf = (stage: Stage, metas: Row[]): Row[] =>
+  metas.map((meta) => ({
+    team_id: stage.a.team.teamId,
+    member_id: stage.alice.memberId,
+    action: AUDIT_ACTION,
+    meta,
+  }));
 
 describe("AIO-1217 real PM admin action — app/t/[team]/admin/pm-sync/actions.ts#reconcileDivergenceAction over real Postgres, real guard and real reconcileProviderState, primary PM provider `linear` with an enabled integration holding a decryptable synthetic secret (direct calls; cookies, revalidatePath, transport recording, pass-through observation, the decrypt recorder, the synthetic read-only provider responder and a tripwire are the only seams)", () => {
   it(
@@ -1566,6 +1898,302 @@ describe("AIO-1217 real PM admin action — app/t/[team]/admin/pm-sync/actions.t
   );
 });
 
+/** F4's six cells: each provider a team can name, by each way its integration can be unusable. */
+const UNAVAILABLE_CELLS = (["linear", "plane"] as const).flatMap((named) =>
+  (["missing", "disabled", "secret-less"] as const).map((state) => ({ named, state })),
+);
+
+describe("AIO-1217 F4 — app/t/[team]/admin/pm-sync/actions.ts#reconcileDivergenceAction over real Postgres, real guard, real resolution and real reconcileProviderState when the pass never reaches the provider: the unavailable-integration refusal, and the branches it must leave as they were (direct calls; the same seams, the synthetic board armed to answer throughout)", () => {
+  it.each(UNAVAILABLE_CELLS)(
+    "4 — F4, `$named` named as team A's primary and team A's `$named` integration $state, while team A holds an ENABLED usable integration of the OTHER provider, team B an ENABLED usable `$named` integration, and team A two `$named` links holding a resource id: a role-member of team A is still refused as `admins only` before the service client; then team A's admitted admin's call resolves over team A's enabled rows alone, decrypts only team A's other-provider secret, and the real owner answers `{ provider: \"$named\", seenUpdated: 0, divergences: [], reason, notRunReason: \"integration_unavailable\" }` — those five keys — with NO link read; the action returns exactly `{ ok: false, error: \"primary PM integration is unavailable\" }` — two keys — with no provider request, no audit row, no revalidation, no run and no durable difference in any table of either team; nothing of team B's is bound or decrypted and neither usable integration rescues the named primary; and the SAME call again, nothing changed, issues the identical trace and leaves every row as it was",
+    async ({ named, state }) => {
+      const stage = await seedStage();
+      const { a, b, alice, bob } = stage;
+      await namePrimary(a.team, named);
+      await namePrimary(b.team, named);
+
+      if (state !== "missing") {
+        const id = await hold(stage, a, alice, A_SECRET, named);
+        if (state === "disabled") await disableIntegration(a, id);
+        else await stripSecret(a, id);
+      }
+      // The two non-rescue controls: a fallback to another provider would resolve the first, and a
+      // resolution that lost its team equality the second.
+      await hold(stage, a, alice, A_ALT_SECRET, ALTERNATE[named]);
+      await hold(stage, b, bob, B_SECRET, named);
+
+      // Eligible links: what a pass that ran would have read, and for `linear` rewritten.
+      const moved = await seedLinked(a, "A-1", {
+        resourceId: syntheticResource("a1"),
+        lastProjected: "Backlog",
+        status: "backlog",
+        provider: named,
+      });
+      const kept = await seedLinked(a, "A-2", {
+        resourceId: syntheticResource("a2"),
+        lastProjected: "In Progress",
+        status: "in_progress",
+        provider: named,
+      });
+      const foreign = await seedLinked(b, "B-1", {
+        resourceId: syntheticResource("b1"),
+        lastProjected: "Backlog",
+        status: "backlog",
+        provider: named,
+      });
+      armBoard(stage, [
+        { link: moved, state: "Done" },
+        { link: kept, state: "In Progress" },
+        { link: foreign, state: "Done" },
+      ]);
+
+      const arranged = byContent([
+        // Disabled keeps its ciphertext; secret-less stays enabled.
+        ...(state === "missing"
+          ? []
+          : [integrationRow(a, named, state === "disabled" ? "disabled" : "enabled", state === "disabled")]),
+        integrationRow(a, ALTERNATE[named], "enabled", true),
+        integrationRow(b, named, "enabled", true),
+      ]);
+      const usable = `select count(*)::int as n from integrations
+                       where type::text = $1 and status = 'enabled' and secret_ciphertext is not null`;
+      premise("the integration rows of both teams are as this cell arranges them", await integrationsHeld(), arranged);
+      premise(
+        "what a read of usable integrations is answered with — the named provider's for team A and without its team equality, and team A's of the other provider — and team A's eligible links",
+        {
+          named: await countOf("scoped usable read", `${usable} and team_id = $2`, [named, a.team.teamId]),
+          namedWithoutTeam: await countOf("unscoped usable read", usable, [named]),
+          otherProvider: await countOf("other-provider usable read", `${usable} and team_id = $2`, [
+            ALTERNATE[named],
+            a.team.teamId,
+          ]),
+          links: await countOf(
+            "scoped link read",
+            `select count(*)::int as n from task_pm_links
+              where team_id = $1 and provider = $2 and provider_resource_id is not null`,
+            [a.team.teamId, named],
+          ),
+        },
+        // Team B's row is the one a team-less resolution would rescue with; team A's other row, a fallback.
+        { named: 0, namedWithoutTeam: 1, otherProvider: 1, links: 2 },
+      );
+      premise("both teams name the provider", [await primaryOf(a.team), await primaryOf(b.team)], [named, named]);
+
+      // ADM answers first: the F4 failure is never what a caller the gate refuses is told.
+      const member = await seedCast(a.team, "member", { role: "member" });
+      await refuse("an active role-member of the team whose named integration is unavailable", {
+        session: member.session,
+        slug: a.team.teamSlug,
+        guard: guardChain(member, await groupRows(member)),
+        server: 1,
+      });
+
+      const unavailable: Late = {
+        answered: {
+          provider: named,
+          seenUpdated: 0,
+          divergences: [],
+          reason: `${named} integration is not enabled or has no secret`,
+          notRunReason: NOT_RUN,
+        },
+        // Missing or disabled, the enabled read answers the other-provider row alone; secret-less,
+        // the named row too. Then the team's primary — and no link read.
+        statements: resolution(a.team, state === "secret-less" ? 2 : 1),
+        // Never team A's named-provider secret (disabled: not read; secret-less: gone), never team B's.
+        decrypted: [A_ALT_SECRET],
+        returned: UNAVAILABLE,
+        audited: null,
+      };
+      const once = await reach(stage, "Alice on team A", unavailable);
+      const again = await reach(stage, "Alice on team A, the same call again with nothing changed", unavailable);
+
+      expect(again.trace, "the repeat issued exactly what the first invocation did").toEqual(once.trace);
+      expect(
+        [once.after, again.before, again.after],
+        "every row of the ten tables, both teams, every column, across both invocations",
+      ).toEqual([once.before, once.before, once.before]);
+      expect(await reconcileAudits()).toEqual([]);
+      // The configured decision stands: no provider switch, no integration or secret rewrite.
+      expect(await integrationsHeld()).toEqual(arranged);
+      expect([await primaryOf(a.team), await primaryOf(b.team)]).toEqual([named, named]);
+    },
+    ROOMIER,
+  );
+
+  it(
+    "5 — resolved `linear`, no link of team A holding a resource id (its one link was never projected; team B's projected link is listed `Done` on the board): admitted, resolved and decrypted as case 1, the link read bound to team A and `linear` is answered with ZERO rows, and the owner answers `{ provider: \"linear\", seenUpdated: 0, divergences: [] }` — three keys, no reason, no marker — before any provider read; the action reports it as before: `{ ok: true, provider: \"linear\", seenUpdated: 0, divergences: [] }`, one audit row whose `meta` reads `seenUpdated: 0`, `divergences: 0`, then the revalidation — a zero-work success, not the F4 refusal",
+    async () => {
+      const stage = await seedStage();
+      const { a, b, alice, bob } = stage;
+      await namePrimary(a.team);
+      await namePrimary(b.team);
+      await hold(stage, a, alice, A_SECRET, PROVIDER);
+      await hold(stage, b, bob, B_SECRET, PROVIDER);
+      await seedLinked(a, "A-1", { resourceId: null, lastProjected: null, status: "backlog" });
+      const foreign = await seedLinked(b, "B-1", {
+        resourceId: syntheticResource("b1"),
+        lastProjected: "Backlog",
+        status: "backlog",
+      });
+      armBoard(stage, [{ link: foreign, state: "Done" }]);
+      premise(
+        "what the link read is answered with as written, and without its team equality",
+        [
+          await countOf(
+            "scoped link read",
+            `select count(*)::int as n from task_pm_links
+              where team_id = $1 and provider = $2 and provider_resource_id is not null`,
+            [a.team.teamId, PROVIDER],
+          ),
+          await countOf(
+            "provider-only link read",
+            `select count(*)::int as n from task_pm_links where provider = $1 and provider_resource_id is not null`,
+            [PROVIDER],
+          ),
+        ],
+        [0, 1],
+      );
+
+      const meta = { provider: PROVIDER, seenUpdated: 0, divergences: 0 };
+      await reach(stage, "Alice on team A", {
+        answered: { provider: PROVIDER, seenUpdated: 0, divergences: [] },
+        statements: [...resolution(a.team, 1), linkRead(a.team, PROVIDER, 0)],
+        decrypted: [A_SECRET],
+        returned: { ok: true, provider: PROVIDER, seenUpdated: 0, divergences: [] },
+        audited: meta,
+      });
+
+      expect(await reconcileAudits()).toEqual(auditsOf(stage, [meta]));
+    },
+    ROOMY,
+  );
+
+  it.each([
+    { links: "two `plane` links holding a resource id", linked: true },
+    { links: "no link at all", linked: false },
+  ])(
+    "6 — `plane` named, an ENABLED usable `plane` integration, team A holding $links (PINNED AS CURRENT, NOT ENDORSED — residual R1): the adapter has no inbound support, so the owner answers `{ provider: \"plane\", seenUpdated: 0, divergences: [], reason: \"plane has no inbound reconcile support\" }` — four keys, NO marker — after the resolution alone, with no link read and no provider request; the action drops the reason and reports `{ ok: true, provider: \"plane\", seenUpdated: 0, divergences: [] }`, one audit row and the revalidation, as it did before F4; repeated, the trace is identical, no link row differs and the only durable difference per call is its audit row — none of which is evidence that a Plane board was read",
+    async ({ linked }) => {
+      const { stage, late } = await planeUnsupported({ primary: "named", linked });
+
+      const once = await reach(stage, "Alice on team A", late);
+      const again = await reach(stage, "Alice on team A, the same call again", late);
+
+      expect(again.trace, "the repeat issued exactly what the first invocation did").toEqual(once.trace);
+      expect(again.after.task_pm_links, "every link row, every column, across both invocations").toEqual(
+        once.before.task_pm_links,
+      );
+      const meta = { provider: "plane", seenUpdated: 0, divergences: 0 };
+      expect(await reconcileAudits()).toEqual(auditsOf(stage, [meta, meta]));
+    },
+    ROOMIER,
+  );
+
+  it(
+    "7 — no provider resolved, none enabled: team A names no primary and its one `linear` integration is DISABLED, while team B's is enabled and usable and both hold a projected link the board lists: the enabled read bound to team A is answered with ZERO rows, nothing is decrypted, and the owner answers `{ provider: null, seenUpdated: 0, divergences: [], reason: \"no enabled PM integration\" }` — four keys, NO marker; the action returns its existing `{ ok: false, error: \"no enabled PM integration\" }` — the owner's reason, not the F4 message — with no link read, provider request, audit row, revalidation or durable difference",
+    async () => {
+      const stage = await seedStage();
+      const { a, b, alice, bob } = stage;
+      await namePrimary(b.team);
+      await disableIntegration(a, await hold(stage, a, alice, A_SECRET, PROVIDER));
+      await hold(stage, b, bob, B_SECRET, PROVIDER);
+      const own = await seedLinked(a, "A-1", {
+        resourceId: syntheticResource("a1"),
+        lastProjected: "Backlog",
+        status: "backlog",
+      });
+      const foreign = await seedLinked(b, "B-1", {
+        resourceId: syntheticResource("b1"),
+        lastProjected: "Backlog",
+        status: "backlog",
+      });
+      armBoard(stage, [
+        { link: own, state: "Done" },
+        { link: foreign, state: "Done" },
+      ]);
+      premise(
+        "team A names no primary and holds only a disabled row; team B's row is enabled and usable",
+        [await primaryOf(a.team), await integrationsHeld()],
+        [
+          null,
+          byContent([integrationRow(a, PROVIDER, "disabled", true), integrationRow(b, PROVIDER, "enabled", true)]),
+        ],
+      );
+
+      const reason = "no enabled PM integration";
+      await reach(stage, "Alice on team A", {
+        answered: { provider: null, seenUpdated: 0, divergences: [], reason },
+        statements: resolution(a.team, 0),
+        decrypted: [],
+        returned: { ok: false, error: reason },
+        audited: null,
+      });
+
+      expect(await reconcileAudits()).toEqual([]);
+    },
+    ROOMY,
+  );
+
+  it(
+    "7 — no provider resolved, two enabled: team A names no primary and holds an ENABLED usable `linear` AND an ENABLED usable `plane` integration: the enabled read is answered with both rows, both of team A's secrets are decrypted and neither of anyone else's, and the owner answers `{ provider: null, …, reason: \"multiple PM integrations enabled but teams.primary_pm_provider is unset\" }` — four keys, NO marker; the action returns that reason as its existing refusal, with no link read, provider request, audit row, revalidation or durable difference",
+    async () => {
+      const stage = await seedStage();
+      const { a, b, alice, bob } = stage;
+      await namePrimary(b.team);
+      await hold(stage, a, alice, A_SECRET, PROVIDER);
+      await hold(stage, a, alice, A_ALT_SECRET, ALTERNATE[PROVIDER]);
+      await hold(stage, b, bob, B_SECRET, PROVIDER);
+      const own = await seedLinked(a, "A-1", {
+        resourceId: syntheticResource("a1"),
+        lastProjected: "Backlog",
+        status: "backlog",
+      });
+      armBoard(stage, [{ link: own, state: "Done" }]);
+      premise("team A names no primary", await primaryOf(a.team), null);
+
+      const reason = "multiple PM integrations enabled but teams.primary_pm_provider is unset";
+      await reach(stage, "Alice on team A", {
+        answered: { provider: null, seenUpdated: 0, divergences: [], reason },
+        statements: resolution(a.team, 2),
+        decrypted: [A_ALT_SECRET, A_SECRET].sort(),
+        returned: { ok: false, error: reason },
+        audited: null,
+      });
+
+      expect(await reconcileAudits()).toEqual([]);
+    },
+    ROOMY,
+  );
+
+  it(
+    "8 — sole-enabled fallback, `linear`: team A names NO primary and its one enabled PM integration is the usable `linear` one of case 1: the same call is admitted, resolves `linear`, reads the three links and the board, records two seen statuses, and is audited, revalidated and returned exactly as case 1 is — an unset primary is not a refusal, and the owner's answer is unmarked; team A still names no primary afterwards",
+    async () => {
+      const world = await seedWorld({ primary: "unset" });
+
+      await admit(world, "Alice on team A, no primary named", firstPass(world));
+
+      expect(await primaryOf(world.a.team)).toBeNull();
+      expect(await reconcileAudits()).toEqual(
+        auditsOf(world, [{ provider: PROVIDER, seenUpdated: 2, divergences: 1 }]),
+      );
+    },
+    ROOMY,
+  );
+
+  it(
+    "8 — sole-enabled fallback, `plane` (PINNED AS CURRENT, NOT ENDORSED — residual R1): team A names NO primary and its one enabled PM integration is a usable `plane` one, with two `plane` links holding a resource id: resolved to `plane`, the owner answers the unsupported reason UNMARKED with no link read and no provider request, and the action reports `{ ok: true, provider: \"plane\", seenUpdated: 0, divergences: [] }`, audits and revalidates exactly as case 6; team A still names no primary afterwards",
+    async () => {
+      const { stage, late } = await planeUnsupported({ primary: "unset", linked: true });
+
+      await reach(stage, "Alice on team A, no primary named", late);
+
+      expect(await primaryOf(stage.a.team)).toBeNull();
+      expect(await reconcileAudits()).toEqual(auditsOf(stage, [{ provider: "plane", seenUpdated: 0, divergences: 0 }]));
+    },
+    ROOMY,
+  );
+});
+
 // Each TODO names evidence this slice was told not to supply, or could not.
 describe("Z — evidence this file does NOT supply (executable TODOs: none is run, none is passed)", () => {
   it.todo(
@@ -1581,13 +2209,13 @@ describe("Z — evidence this file does NOT supply (executable TODOs: none is ru
     "ACTION WIRE AND NEXT CACHE · the export is called directly: the Next Server Action transport, POST dispatch, action id encryption, origin and CSRF checks, argument deserialization and what a non-string `teamSlug` would do are not exercised; `revalidatePath` is a recording seam showing only that the action ASKED for `/t/<slug>/admin/pm-sync`, with no `type`, after the owner returned and the audit insert was issued — that Next invalidates anything is not evidenced",
   );
   it.todo(
-    "COORDINATOR · MISSING-INTEGRATION F4 RUN/AUDIT DECISION (not reached, not ruled on): a team with no resolvable provider (`provider: null`, the action's `ok: false` return at actions.ts:93 with no audit row), and a configured primary whose integration is disabled or secret-less (`integration: null` with a provider NAMED, which by source reading passes :93, writes an audit row with `seenUpdated: 0` and returns `ok: true` while dropping the owner's reason) are not exercised here; this action records no `ingest_runs` row on any branch, and whether it should is not specified by any source this file reads",
+    "COORDINATOR · F4 RED AND MUTANTS (isolated-copy actual-import run; cases 4 to 8 are read from source and NEITHER a RED run NOR any mutant has been observed): against the sources BEFORE the marker, each of case 4's six cells must fail on the outcome (`ok: true`), the answered key list, the ledger (an audit insert and a revalidation after the owner's return) and the durable difference, with its admitted controls passing — that RED is not recorded by this file; then, on isolated copies of the candidate: omit `notRunReason` from the owner's named-unavailable return (case 4: answered keys, outcome, ledger); ignore the marker in the action (case 4: outcome, ledger, durable difference); move the audit write, `revalidatePath`, or both above the marker check (case 4: ledger, `revalidated`, durable difference); set the marker on the no-link, unsupported or null-provider return, or on every return even as `undefined` (cases 1, 2, 5, 6, 7, 8: answered keys, and the outcome where the action then refuses); refuse on `seenUpdated === 0`, an empty divergence list or a present `reason` (cases 2, 5, 6, 8); resolve the named primary through another provider or another team's row (case 4: outcome, decrypts, foreign bindings) — each must fail on those, not on a compile or fixture error; this action records no `ingest_runs` row on any branch",
   );
   it.todo(
-    "RECONCILE ERROR POLICY · a provider read that throws or answers an error (thrown out of `reconcileProviderState` and so out of this action, with no audit row by source reading, possibly after some links were rewritten), a `decryptSecret` that throws on a stored value, a refused `integrations` read, a refused link read or link update (reconcile.ts:85-90 and :105-108 read no `error`), a refused `teams` read beneath the resolution, and a refused `audit_log` insert (swallowed) are not reached; every request here holds as a premise that Postgres refused no statement and that the responder refused no request",
+    "RECONCILE ERROR POLICY · a provider read that throws or answers an error (thrown out of `reconcileProviderState` and so out of this action, with no audit row by source reading, possibly after some links were rewritten), a `decryptSecret` that throws on a stored value, a refused `integrations` read, a refused link read or link update (reconcile.ts:99-104 and :119-122 read no `error`), a refused `teams` read beneath the resolution, and a refused `audit_log` insert (swallowed) are not reached; every request here holds as a premise that Postgres refused no statement and that the responder refused no request",
   );
   it.todo(
-    "OTHER OWNER BRANCHES · a team with no link holding a resource id (the owner returns before any provider read), a `plane` primary and its adapter, the sole-enabled fallback with `primary_pm_provider` unset, a link whose stored seen status differs from a changed board on a LATER pass (a moved board after the first pass is not constructed: the rerun holds the board fixed), and a link with an empty `last_projected_status` are not exercised",
+    "OTHER OWNER BRANCHES · a link whose stored seen status differs from a changed board on a LATER pass (a moved board after the first pass is not constructed: the rerun holds the board fixed) and a link with an empty `last_projected_status` are not exercised; PLANE INBOUND RECONCILIATION does not exist on this snapshot (`planeAdapter` has no `fetchSeenStates`): cases 6 and 8 pin the unsupported-adapter success, audit row and revalidation as current behavior (residual R1, pending separate intake) and are not evidence that a Plane board was read, that it holds no divergence, or of any Plane no-link, changed-state or unchanged-board pass; F4's cells are `missing`, `disabled` and `secret-less` by row state only — a `decryptSecret` that throws on a stored value is the error policy's, above, and is not an F4 state",
   );
   it.todo(
     "ADMITTED TEAM-B INVOCATION · team B's admin is seeded and is only ever refused at team A's slug: the reverse direction — that team B's own call decrypts team B's secret alone, reads team B's Linear team and rewrites team B's link alone — is not evidenced; the responder answers for team A's Linear team only and would refuse that call",

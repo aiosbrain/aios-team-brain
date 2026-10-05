@@ -15,6 +15,10 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
  *   A — each export: an admitted control, the binding of the lower effect's team and actor to what
  *       the server resolved, every refusal, and the posture read fault.
  *   S — the two refusal shapes side by side.
+ *   R — what the two PM actions do with their owner's result once admitted: the F4
+ *       unavailable-integration refusal of reconcileDivergenceAction (the owner's `notRunReason`
+ *       marker → exactly `{ ok: false, error: "primary PM integration is unavailable" }`, before
+ *       the audit row and the revalidation) and the owner results it must leave as they were.
  *   L — two client-supplied ids, recorded as current limits (pinned, not endorsed, not a pass).
  *   M — app/actions/projects.ts#createProjectAction (continuation; see TWO MEMBER-TIER EXPORTS).
  *   F — app/t/[team]/codebases/[slug]/actions.ts#recordFindingDecision (continuation; likewise).
@@ -246,7 +250,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
  * and the member-lower seam were added by a later writer under the same condition: NOT RUN. That
  * writer left the header, the mocks and the imports of M and F without their bodies; a further
  * continuation supplied the desk doubles, Dana, the M, F and second X groups and the batch owners
- * named in Z, also without executing anything: NOT RUN.
+ * named in Z, also without executing anything: NOT RUN. Group R was added with the F4 marker by a
+ * later writer under the same condition — NOT RUN, against neither the pre-F4 nor the F4 sources.
  */
 
 const FIXTURE = "FIXTURE PREMISE FAILED (setup, not a security observation):";
@@ -1799,6 +1804,156 @@ describe("S — the two refusal shapes, side by side", () => {
   });
 });
 
+// ── R: what the PM actions do with their owner's result ──────────────────────────────────────────
+
+const UNAVAILABLE = { ok: false, error: "primary PM integration is unavailable" };
+/** The reason `resolvePrimaryProvider` gives a named primary with no usable integration. */
+const unusable = (provider: string) => `${provider} integration is not enabled or has no secret`;
+
+/** Arms the reconcile double to answer its next call with `result`, recorded as every call is. */
+function reconcileAnswers(result: ReconcileResult): void {
+  h.reconcileProviderState.mockImplementationOnce(async (_db: unknown, teamId: string) => {
+    ledger.push(reconciled(teamId));
+    return result;
+  });
+}
+
+/** An admitted reconcile the action refuses after its owner returned: no audit row and no revalidation follow. */
+const REFUSED_AFTER_OWNER = [...admittedReads(ALICE_ADMIN), ADMIN_CLIENT, reconciled(TEAM.id)];
+/** An admitted reconcile the action reports as a success: the audit row, then the revalidation. */
+const REPORTED_AS_SUCCESS = [
+  ...REFUSED_AFTER_OWNER,
+  audited("team.reconcile_divergence"),
+  revalidated(pmSyncPath(TEAM.slug)),
+];
+
+/** Owner results that carry NO marker: each is reported exactly as it was before F4. */
+const UNMARKED: Array<{ name: string; answered: ReconcileResult }> = [
+  {
+    name: "a resolved `linear` pass with nothing to record (zero work is not a refusal)",
+    answered: { provider: "linear", seenUpdated: 0, divergences: [] },
+  },
+  {
+    name: "a usable `plane` integration's unsupported-adapter result — a reason, no marker (pinned as current, not endorsed: no board was read)",
+    answered: { provider: "plane", seenUpdated: 0, divergences: [], reason: "plane has no inbound reconcile support" },
+  },
+  {
+    name: "a named provider with the unusable-integration reason but WITHOUT the marker (the refusal is read off the marker, never the reason text)",
+    answered: { provider: "linear", seenUpdated: 0, divergences: [], reason: unusable("linear") },
+  },
+];
+
+describe("R — app/t/[team]/admin/pm-sync/actions.ts: what each PM action does with its owner's result once admitted (F4 marker; unit and recording only)", () => {
+  it.each([{ provider: "linear" as const }, { provider: "plane" as const }])(
+    "reconcileDivergenceAction — `$provider` named and marked `integration_unavailable` → refused as exactly `{ ok: false, error: \"primary PM integration is unavailable\" }` after the owner returned: no audit row, no revalidation, and none of the owner's fields in the result",
+    async ({ provider }) => {
+      reconcileAnswers({
+        provider,
+        seenUpdated: 0,
+        divergences: [],
+        reason: unusable(provider),
+        notRunReason: "integration_unavailable",
+      });
+      beginRequest(tokens.alice);
+
+      const result = await reconcileDivergenceAction(TEAM.slug);
+
+      // Two keys: no provider, seenUpdated, divergences, reason or marker — not even as undefined.
+      expect(result).toStrictEqual(UNAVAILABLE);
+      expect(Object.keys(result).sort()).toEqual(["error", "ok"]);
+      // The guard admitted, the owner was handed the resolved team, and nothing followed its return.
+      expect(ledger).toEqual(REFUSED_AFTER_OWNER);
+      expect(h.reconcileProviderState.mock.calls).toEqual([[privileged, TEAM.id]]);
+      expect(h.revalidatePath).not.toHaveBeenCalled();
+      expect(vault).toEqual(standingVault());
+      for (const tripwire of TRIPWIRES) expect(tripwire).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(UNMARKED)(
+    "reconcileDivergenceAction — $name → reported as before: `{ ok: true, provider, seenUpdated, divergences }` and nothing else, one audit row, then the revalidation",
+    async ({ answered }) => {
+      reconcileAnswers(answered);
+      beginRequest(tokens.alice);
+
+      const result = await reconcileDivergenceAction(TEAM.slug);
+
+      // The owner object is not spread into the result: its reason never leaves the server.
+      expect(result).toStrictEqual({ ok: true, provider: answered.provider, seenUpdated: 0, divergences: [] });
+      expect(Object.keys(result).sort()).toEqual(["divergences", "ok", "provider", "seenUpdated"]);
+      expect(ledger).toEqual(REPORTED_AS_SUCCESS);
+      expect(vault.audit_log).toEqual([
+        auditRow(ALICE_ADMIN, {
+          action: "team.reconcile_divergence",
+          target_type: "team",
+          target_id: TEAM.id,
+          meta: { provider: answered.provider, seenUpdated: 0, divergences: 0 },
+        }),
+      ]);
+    },
+  );
+
+  it.each([
+    { reason: "no enabled PM integration", error: "no enabled PM integration" },
+    { reason: undefined, error: "no primary PM provider configured" },
+  ])(
+    "reconcileDivergenceAction — no provider resolved (owner reason: $reason) → the existing refusal `$error`, not the F4 one: no audit row, no revalidation",
+    async ({ reason, error }) => {
+      reconcileAnswers({ provider: null, seenUpdated: 0, divergences: [], ...(reason ? { reason } : {}) });
+      beginRequest(tokens.alice);
+
+      await expect(reconcileDivergenceAction(TEAM.slug)).resolves.toStrictEqual({ ok: false, error });
+
+      expect(ledger).toEqual(REFUSED_AFTER_OWNER);
+      expect(h.revalidatePath).not.toHaveBeenCalled();
+      expect(vault).toEqual(standingVault());
+    },
+  );
+
+  it("projectBoardAction is untouched by F4 (residual R2 — pinned as current, not endorsed): a named provider with no usable integration still projects nothing, records a run with no reason, audits, revalidates and returns `ok: true`", async () => {
+    h.projectAllTasks.mockImplementation(async (_db: unknown, teamId: string, projectId: string) => {
+      ledger.push(projected(teamId, projectId));
+      return { provider: PROVIDER, reports: [], reason: unusable(PROVIDER) };
+    });
+    beginRequest(tokens.alice);
+
+    const result = await projectBoardAction(TEAM.slug);
+
+    expect(result).toStrictEqual({ ok: true, provider: PROVIDER, counts: {}, reports: [] });
+    expect(ledger).toEqual([
+      ...admittedReads(ALICE_ADMIN),
+      ADMIN_CLIENT,
+      ownedProjectsRead(TEAM.id),
+      ...ALICE_REALM.projects.map((projectId) => projected(TEAM.id, projectId)),
+      projectionRecorded(TEAM.id),
+      audited("team.project_board"),
+      revalidated(pmSyncPath(TEAM.slug)),
+    ]);
+    // The provider is named, so the owner's reason is dropped before the run is recorded.
+    expect(h.recordProjectionRun.mock.calls).toEqual([
+      [
+        privileged,
+        {
+          teamId: TEAM.id,
+          provider: PROVIDER,
+          trigger: "manual",
+          reports: [],
+          reason: undefined,
+          startedAt: expect.any(Number),
+        },
+      ],
+    ]);
+    expect(vault.audit_log).toEqual([
+      auditRow(ALICE_ADMIN, {
+        action: "team.project_board",
+        target_type: "team",
+        target_id: TEAM.id,
+        meta: { provider: PROVIDER, counts: {} },
+      }),
+    ]);
+  });
+});
+
 describe("L — client-supplied ids: CURRENT LIMITS, pinned not endorsed, not a pass of any target boundary", () => {
   it("app/t/[team]/admin/actions.ts#issueApiKey — `memberId` is not bound (desired refusal DEFERRED AIO-1226): an admin supplying another team's member id gets a key row carrying it, and nothing looks that member up", async () => {
     beginRequest(tokens.alice);
@@ -2657,6 +2812,9 @@ describe("Z — follow-up evidence this file does NOT supply (executable TODOs: 
   );
   it.todo(
     "MUTANTS · swap the refusal shapes (availability returns the admins-only object; another ADM export returns []) — S and the per-export refusal cases must fail",
+  );
+  it.todo(
+    "MUTANTS · F4 (isolated copy, actual import; no RED and no mutant has been observed): in reconcileDivergenceAction ignore `notRunReason`, then move the audit write, then `revalidatePath`, above the marker check — R's two marked cases must fail on the result, the ledger and the standing vault; refuse instead on `seenUpdated === 0`, on a present `reason`, or on the reason text — R's three unmarked cases must fail on the result and the ledger; spread the owner object into the result — R's key lists must fail; none on a compile or fixture error",
   );
   it.todo(
     "MUTANTS · drop the team filter from projectBoardAction's own projects read — the admitted control must fail on the third, foreign projection; and (test-time substitution of lib/metrics/codebases) drop the team predicate from getCodebaseIdentity's read — F's `codebase not found` case must fail",

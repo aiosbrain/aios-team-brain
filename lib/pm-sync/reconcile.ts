@@ -53,6 +53,9 @@ export interface ReconcileResult {
   seenUpdated: number;
   divergences: DivergenceRow[];
   reason?: string;
+  // Internal provenance, never a public field: set ONLY when a primary is named but has no usable
+  // integration, so the pass did not run. Absent on a null provider and on every resolved pass.
+  notRunReason?: "integration_unavailable";
 }
 
 // Pure: a link is diverged when both sides are known and the provider's current state differs from
@@ -74,8 +77,19 @@ export async function reconcileProviderState(
   opts: { fetchImpl?: typeof fetch } = {}
 ): Promise<ReconcileResult> {
   const primary = await resolvePrimaryProvider(db, teamId);
-  if (primary.provider === null || primary.integration === null) {
+  if (primary.provider === null) {
     return { provider: primary.provider, seenUpdated: 0, divergences: [], reason: primary.reason };
+  }
+  if (primary.integration === null) {
+    // Named but unusable (missing, disabled or secret-less): read off the resolution's structure,
+    // never its reason text. The caller refuses on the marker instead of reporting an empty pass.
+    return {
+      provider: primary.provider,
+      seenUpdated: 0,
+      divergences: [],
+      reason: primary.reason,
+      notRunReason: "integration_unavailable",
+    };
   }
   const adapter = ADAPTERS[primary.provider];
   if (!adapter.fetchSeenStates) {
