@@ -766,3 +766,43 @@ Astra then returned **READY / PASS** for the exact candidate, with no remaining 
 Remote backup at the time of this record: the remote branch is still at `9a0638f2`. The push of this candidate, its remote attestation and CI have not yet occurred. The first source edit of this final correction was at 2026-10-05T15:00:18Z and its 30-minute remote deadline was 15:30:18Z.
 
 Not done and not authorized, unchanged: activation, wiring, deletion of the not-wired guard, the identity cutover and repair, merge, deployment, and any push to main, production or by force. This update changes no source or test.
+
+### Inactive Slack replies transient backoff — implementation packet, recorded October 6
+
+This packet gives the inactive replies hydrator a bounded, jittered retry for transient failures and nothing else. The accepted final Astra specification is the ignored local artifact `.context/aio-1170-resume/slack-replies-transient-backoff-astra-spec.md`, 29,836 bytes, SHA-256 `1a48a11991cf614f57850800791e5518098ca9b73681c59dcafd7adb86a9124f`. It is attached to Linear AIO-1170, and the final service readback is byte-identical within the 197,365-byte export of SHA-256 `f8a71132ab9cdf0256d49289c3cd207dca471c2aa532f4e597822fd570e07c64`. Specification review round 1 returned NOT READY with three MAJOR findings, which Astra corrected; a fresh round 2 returned READY with no blocker or major, its wording-only findings were folded, and no third round was needed.
+
+The claim this packet supports is exact: **five-minute-capped, jittered backoff based on the persisted lifetime claim ordinal, with safe expiry restart.** The ordinal is the queue row's total claims, not a count of consecutive failures, and it is not reset by progress. For any row past its second lifetime claim the policy is uniform jitter in `[150_000, 300_000]` ms; repeated failures do not lengthen it; request pressure during a sustained outage is bounded by the method budget, not by this delay. This does not by itself certify all of AC-03 or live Slack reliability.
+
+The sole source writer was subscription-authenticated `claude-opus-5-5` at high effort, session `b1767100-da84-4808-818f-6b0107480c68`; the coordinator ran the checks and owns the commits. Red checkpoint `9c5d4069a1878327820af36cb1539ebcd1134c1c`, backed up remotely, changed tests only. It is behavioural red proof against existing production code: unit **58 failed / 37 controls passed** of 95, and isolated PostgreSQL **20 failed / 48 controls passed** of 68. Every failure was the then-current deterministic, sampler-less behaviour with no ordinal validation; none was a missing-module failure.
+
+Source checkpoint `a3e248b4338c39598b4cf29846556660577c3385`, verified on `origin/codex/aio-1170-slack-timeline`. The only production file changed is `lib/ingest/slack-thread-hydrator.ts`:
+
+- a private, closed transient classifier — every `transport_error`, a `provider_error` the transport reported as `http_500` through `http_599`, and the five transient provider codes — which decides the delay only;
+- stored and returned categories stay coarse (`transport_error` or `provider_error`);
+- the durable claim ordinal is validated as a positive safe integer wherever a delay depends on it, including the deterministic rate-limit fallback;
+- an optional `random` sampler, defaulting to the platform sampler looked up at call time, consulted exactly once per transient decision; an invalid sample is rejected with a static error before any release;
+- inclusive bands of `[60s, 120s]`, `[120s, 240s]` and, from the third claim, `[150s, 300s]`;
+- provider deadlines for `rate_limited` and `deferred` keep their precedence and minimums, and the existing fenced requeue, staged-page preservation and method-budget behaviour are unchanged.
+
+One test-precision correction was made in `test/slack-thread-hydrator-flow.test.ts`. There is no schema, state-primitive, caller, wiring, shared-identity, repair or liveness change.
+
+Verification on `a3e248b4`, as run by the coordinator: focused unit and guard **107/107**; isolated real-PostgreSQL state suite **68/68**; typecheck, targeted ESLint, docs drift and the pre-push runtime sync. The blind final Sol reviewer independently ran the broader relevant unit, transport and guard coverage at **163/163**. The broad `npm test` was not rerun and is **not claimed green**: the unrelated lifecycle failures and the hang recorded under PA-1 remain.
+
+Reviews: a fresh independent Opus high-effort first code review returned **PASS WITH LOWS**, explicitly with no blocker, major or medium. The mandatory fresh Astra-high final review returned **PASS**, and the blind GPT-6.1 Sol-high final review returned **PASS**, with no actionable source finding.
+
+Mutation evidence is in the ignored directory `.context/aio-1170-resume/slack-replies-backoff-mutations/`. Each mutant killed its intended cases:
+
+- **M1** — the inclusive `+ 1` removed from the sample mapping;
+- **M2** — the 5xx rule widened to admit 4xx;
+- **M3** — the allowlisted `ratelimited` code removed;
+- **M4** — a fixed or local attempt count used instead of the durable ordinal;
+- **M5** — the five-minute cap removed;
+- **M6a** — a refused release mishandled as another result;
+- **M6b** — the hydrator's fenced release bypassed with a scope-only update;
+- **M7** — a false `progressed` result with no release.
+
+The baseline and post-M6b restored fingerprints match, and the restored source reran at 107/107 unit and guard and 68/68 PostgreSQL. No mutant was committed or pushed. Both final reviewers read this evidence back and returned READY / PASS after M6b.
+
+Ownership: PR 743 remains unmerged and separate. Its currently reported checkpoint changes shared transaction internals. Before any combined publication or integration, this branch is reconciled after PR 743 lands, or on an explicit integration, and both branches' relevant transaction, reservation and commit-before-fetch contract checks are rerun. This slice is path-disjoint from PR 743 and introduces no other broad-integration requirement.
+
+Not done and not authorized: the hydrator stays unwired and inactive. No activation, live Slack request, apply or repair, identity cutover, merge or deployment. This entry follows the reviewed source and changes no source or test; it does not mark activation, live acceptance or the full task complete.
