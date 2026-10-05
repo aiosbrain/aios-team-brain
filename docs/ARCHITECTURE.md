@@ -1153,6 +1153,20 @@ automatic exclude) so that retiring the claim can find and close the row. Destin
 all-or-nothing within the surrounding transaction; a destination named only by a superseded-generation
 or paused connection keeps an existing placement but is never newly opened.
 
+Every Drive commit takes its locks in one order: identity authority/revision → connection authority →
+project rows → provider identity (and its mapping row) → path identities → item-attribution advisories
+→ item rows → dependent rows. Drive ingest (`ingestApiItem` → `lib/ingest/gdrive-commit-locks.ts`) and
+source reconciliation share the connection → provider prefix, and reconciliation takes all of its
+provider identities before its first item row. Project rows are locked in one ascending-id pass, the
+storage project for write and audience-only projects for share, so no commit upgrades a share lock. A
+Drive path identity has one key — the ingest session's identity key — covering the requested path, its
+collision-safe alternative and a tombstone's restore path from before the existence check to after the
+insert. Each of these waits is bounded at 10 seconds (`lib/db/pg/bounded-lock.ts`; a timeout is not
+retried). Candidates discovered before the item locks are re-read under them: one that vanished or
+appeared abandons the whole attempt, which is retried once and then fails as
+`GdriveIngestStateChangedError`. A payload that is not Drive-sourced never takes these locks; it is
+refused when the item at its path is Drive-owned, checked again on the row it locks.
+
 `team_authorization_epochs` is the durable revocation barrier shared by Drive claim changes and the
 Timeline/arc cache owners. Final-claim retirement commits context suppression, the epoch advance, and
 a `gdrive_cleanup_obligations` row under the canonical team/provider lock before reporting success;

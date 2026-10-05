@@ -1,6 +1,7 @@
 import "server-only";
 
 import type { DbClient } from "@/lib/db/types";
+import { acquireWithLockTimeout, withBoundedLockWaits } from "@/lib/db/pg/bounded-lock";
 import { runSql, withTransaction } from "@/lib/db/pg/pool";
 import { reconcileItemUnit, retractItemUnit } from "@/lib/projects/context/units";
 import {
@@ -18,11 +19,29 @@ export interface GdriveClaimInput {
   audienceProjectIds: readonly string[];
 }
 
-/** One serialization key for every mutation of a team's exact Drive provider identity. */
+const PROVIDER_LOCK = `select pg_advisory_xact_lock(hashtextextended($1, 0))`;
+const providerLockKey = (teamId: string, providerId: string) => `${teamId}:gdrive:${providerId}`;
+
+/**
+ * One serialization key for every mutation of a team's exact Drive provider identity. The wait is
+ * bounded. In the Drive commit order it follows the connection authority and the project rows, and
+ * precedes every item-attribution advisory and item row.
+ */
 export async function lockGdriveProvider(teamId: string, providerId: string): Promise<void> {
-  await runSql(`select pg_advisory_xact_lock(hashtextextended($1, 0))`, [
-    `${teamId}:gdrive:${providerId}`,
-  ]);
+  await acquireWithLockTimeout(PROVIDER_LOCK, [providerLockKey(teamId, providerId)]);
+}
+
+/**
+ * Every provider identity one transaction will mutate, up front and in one deterministic order —
+ * for a writer that touches several (source reconciliation). Taking them one at a time between
+ * item-row work would put a provider wait behind held item rows, the inverse of ingest.
+ */
+export async function lockGdriveProviders(teamId: string, providerIds: readonly string[]): Promise<void> {
+  const ordered = [...new Set(providerIds)].sort();
+  if (ordered.length === 0) return;
+  await withBoundedLockWaits(async () => {
+    for (const providerId of ordered) await runSql(PROVIDER_LOCK, [providerLockKey(teamId, providerId)]);
+  });
 }
 
 async function canonicalMappedItem(teamId: string, providerId: string): Promise<string | null> {

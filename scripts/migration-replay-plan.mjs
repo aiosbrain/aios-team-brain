@@ -71,7 +71,6 @@ const PCM_METHOD_OWNER = "20260922130000_gdrive_audience_claims.sql";
  * @property {string} migration     the shipped, immutable migration file
  * @property {string} gitBlob       its git blob id — the content pin (`git rev-parse <rev>:<path>`)
  * @property {string} constraint    the enumerated CHECK whose definition here is obsolete
- * @property {string} table         the table that constraint belongs to
  * @property {string} obsoleteSql   the exact statements omitted from replay (must occur exactly once)
  * @property {string} supersededBy  the later migration that owns the constraint
  */
@@ -82,7 +81,6 @@ export const REPLAY_SUPERSESSIONS = Object.freeze([
     migration: "20260624120000_ai_provider_integration_types.sql",
     gitBlob: "3ea048a1d704be9e1a498497664140e39b664478",
     constraint: "integrations_type_check",
-    table: "integrations",
     obsoleteSql: INTEGRATIONS_TYPE_CHECK_PRE_GDRIVE,
     supersededBy: INTEGRATIONS_TYPE_OWNER,
   },
@@ -90,7 +88,6 @@ export const REPLAY_SUPERSESSIONS = Object.freeze([
     migration: "20260710140000_integrations_openrouter_type.sql",
     gitBlob: "9969210286f77337874392f5bfc997b9e6c381ca",
     constraint: "integrations_type_check",
-    table: "integrations",
     obsoleteSql: INTEGRATIONS_TYPE_CHECK_PRE_GDRIVE,
     supersededBy: INTEGRATIONS_TYPE_OWNER,
   },
@@ -98,7 +95,6 @@ export const REPLAY_SUPERSESSIONS = Object.freeze([
     migration: "20260711160000_publishing.sql",
     gitBlob: "df904104accb01a48688a40b22f1dc6922e054b4",
     constraint: "integrations_type_check",
-    table: "integrations",
     obsoleteSql: INTEGRATIONS_TYPE_CHECK_PRE_GDRIVE,
     supersededBy: INTEGRATIONS_TYPE_OWNER,
   },
@@ -106,7 +102,6 @@ export const REPLAY_SUPERSESSIONS = Object.freeze([
     migration: "20260725160000_integrations_notion_type.sql",
     gitBlob: "9210c61e92cce6d8e24c90cb7bc9e16624639087",
     constraint: "integrations_type_check",
-    table: "integrations",
     obsoleteSql: INTEGRATIONS_TYPE_CHECK_PRE_GDRIVE,
     supersededBy: INTEGRATIONS_TYPE_OWNER,
   },
@@ -114,7 +109,6 @@ export const REPLAY_SUPERSESSIONS = Object.freeze([
     migration: "20260817090000_integrations_clickup_type.sql",
     gitBlob: "8a35a8befbd9062c99a63a77b871aa64561bdf21",
     constraint: "integrations_type_check",
-    table: "integrations",
     obsoleteSql: INTEGRATIONS_TYPE_CHECK_PRE_GDRIVE,
     supersededBy: INTEGRATIONS_TYPE_OWNER,
   },
@@ -122,7 +116,6 @@ export const REPLAY_SUPERSESSIONS = Object.freeze([
     migration: "20260820150000_pcm_method_exclude_shadow_repair.sql",
     gitBlob: "903eb2afd4ccc5470f67d40b5de117c0520d2801",
     constraint: "project_context_memberships_method_check",
-    table: "project_context_memberships",
     obsoleteSql: PCM_METHOD_CHECK_PRE_GDRIVE_CLAIM,
     supersededBy: PCM_METHOD_OWNER,
   },
