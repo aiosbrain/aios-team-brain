@@ -92,7 +92,7 @@ jobs:
           # Railway reports no deployment domain the evidence is unmeasured and the controller
           # refuses; it does not accept a claim in its place.
         run: node scripts/staging-ops/release-controller.mjs --run
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: release-audit-${{ github.run_id }}
@@ -134,7 +134,7 @@ jobs:
           RAILWAY_PRODUCTION_ENVIRONMENT_ID: ${{ vars.RAILWAY_PRODUCTION_ENVIRONMENT_ID }}
           RAILWAY_PRODUCTION_APP_SERVICE_ID: ${{ vars.RAILWAY_PRODUCTION_APP_SERVICE_ID }}
         run: node scripts/staging-ops/release-controller.mjs --run
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: emergency-release-audit-${{ github.run_id }}

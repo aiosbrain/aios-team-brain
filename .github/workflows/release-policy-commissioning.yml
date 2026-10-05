@@ -159,7 +159,7 @@ jobs:
           --run-id "$GITHUB_RUN_ID"
           --attempt "$GITHUB_RUN_ATTEMPT"
           --evidence-dir "$RUNNER_TEMP/policy-commissioning"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: policy-commissioning-intent-${{ github.run_id }}-${{ github.run_attempt }}
@@ -215,7 +215,7 @@ jobs:
           COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
         run: >-
           node --input-type=module -e 'import { runFixtureChecks } from "./scripts/staging-ops/policy-commissioning.mjs"; await runFixtureChecks(process.env);'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: policy-commissioning-fixture-${{ github.run_id }}-${{ github.run_attempt }}
@@ -292,7 +292,7 @@ jobs:
           node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runCaseStage({ stage: "prepare", caseId: "normal-update-missing-check" });'
       - name: Case 01 normal-update-missing-check — 2/5 publish the pre challenge
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-01-pre
           path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-01-pre.json
@@ -316,7 +316,7 @@ jobs:
           node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runCaseStage({ stage: "await-and-execute", caseId: "normal-update-missing-check" });'
       - name: Case 01 normal-update-missing-check — 4/5 publish the post challenge
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-01-post
           path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-01-post.json
@@ -355,7 +355,7 @@ jobs:
           node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runCaseStage({ stage: "prepare", caseId: "normal-update-failed-check" });'
       - name: Case 02 normal-update-failed-check — 2/5 publish the pre challenge
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-02-pre
           path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-02-pre.json
@@ -379,7 +379,7 @@ jobs:
           node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runCaseStage({ stage: "await-and-execute", caseId: "normal-update-failed-check" });'
       - name: Case 02 normal-update-failed-check — 4/5 publish the post challenge
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-02-post
           path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-02-post.json
@@ -418,7 +418,7 @@ jobs:
           node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runCaseStage({ stage: "prepare", caseId: "normal-update-wrong-producer" });'
       - name: Case 03 normal-update-wrong-producer — 2/5 publish the pre challenge
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-03-pre
           path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-03-pre.json
@@ -442,7 +442,7 @@ jobs:
           node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runCaseStage({ stage: "await-and-execute", caseId: "normal-update-wrong-producer" });'
       - name: Case 03 normal-update-wrong-producer — 4/5 publish the post challenge
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-03-post
           path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-03-post.json
@@ -481,7 +481,7 @@ jobs:
           node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runCaseStage({ stage: "prepare", caseId: "normal-update-all-green" });'
       - name: Case 04 normal-update-all-green — 2/5 publish the pre challenge
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-04-pre
           path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-04-pre.json
@@ -505,7 +505,7 @@ jobs:
           node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runCaseStage({ stage: "await-and-execute", caseId: "normal-update-all-green" });'
       - name: Case 04 normal-update-all-green — 4/5 publish the post challenge
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-04-post
           path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-04-post.json
@@ -544,7 +544,7 @@ jobs:
           node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runCaseStage({ stage: "prepare", caseId: "normal-force-rewind" });'
       - name: Case 05 normal-force-rewind — 2/5 publish the pre challenge
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-05-pre
           path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-05-pre.json
@@ -568,7 +568,7 @@ jobs:
           node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runCaseStage({ stage: "await-and-execute", caseId: "normal-force-rewind" });'
       - name: Case 05 normal-force-rewind — 4/5 publish the post challenge
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-05-post
           path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-05-post.json
@@ -607,7 +607,7 @@ jobs:
           node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runCaseStage({ stage: "prepare", caseId: "normal-force-divergent" });'
       - name: Case 06 normal-force-divergent — 2/5 publish the pre challenge
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-06-pre
           path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-06-pre.json
@@ -631,7 +631,7 @@ jobs:
           node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runCaseStage({ stage: "await-and-execute", caseId: "normal-force-divergent" });'
       - name: Case 06 normal-force-divergent — 4/5 publish the post challenge
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-06-post
           path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-06-post.json
@@ -670,7 +670,7 @@ jobs:
           node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runCaseStage({ stage: "prepare", caseId: "normal-delete" });'
       - name: Case 07 normal-delete — 2/5 publish the pre challenge
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-07-pre
           path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-07-pre.json
@@ -694,7 +694,7 @@ jobs:
           node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runCaseStage({ stage: "await-and-execute", caseId: "normal-delete" });'
       - name: Case 07 normal-delete — 4/5 publish the post challenge
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-07-post
           path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-normal-07-post.json
@@ -736,7 +736,7 @@ jobs:
           --run-id "$GITHUB_RUN_ID"
           --attempt "$GITHUB_RUN_ATTEMPT"
           --evidence-dir "$RUNNER_TEMP/policy-commissioning"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: policy-commissioning-normal-${{ github.run_id }}-${{ github.run_attempt }}
@@ -786,7 +786,7 @@ jobs:
           node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runCaseStage({ stage: "prepare", caseId: "emergency-update-no-checks" });'
       - name: Case 01 emergency-update-no-checks — 2/5 publish the pre challenge
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-01-pre
           path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-01-pre.json
@@ -810,7 +810,7 @@ jobs:
           node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runCaseStage({ stage: "await-and-execute", caseId: "emergency-update-no-checks" });'
       - name: Case 01 emergency-update-no-checks — 4/5 publish the post challenge
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-01-post
           path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-01-post.json
@@ -849,7 +849,7 @@ jobs:
           node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runCaseStage({ stage: "prepare", caseId: "emergency-force-rewind" });'
       - name: Case 02 emergency-force-rewind — 2/5 publish the pre challenge
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-02-pre
           path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-02-pre.json
@@ -873,7 +873,7 @@ jobs:
           node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runCaseStage({ stage: "await-and-execute", caseId: "emergency-force-rewind" });'
       - name: Case 02 emergency-force-rewind — 4/5 publish the post challenge
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-02-post
           path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-02-post.json
@@ -912,7 +912,7 @@ jobs:
           node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runCaseStage({ stage: "prepare", caseId: "emergency-force-divergent" });'
       - name: Case 03 emergency-force-divergent — 2/5 publish the pre challenge
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-03-pre
           path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-03-pre.json
@@ -936,7 +936,7 @@ jobs:
           node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runCaseStage({ stage: "await-and-execute", caseId: "emergency-force-divergent" });'
       - name: Case 03 emergency-force-divergent — 4/5 publish the post challenge
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-03-post
           path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-03-post.json
@@ -975,7 +975,7 @@ jobs:
           node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runCaseStage({ stage: "prepare", caseId: "emergency-delete" });'
       - name: Case 04 emergency-delete — 2/5 publish the pre challenge
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-04-pre
           path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-04-pre.json
@@ -999,7 +999,7 @@ jobs:
           node --input-type=module -e 'import { runCaseStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runCaseStage({ stage: "await-and-execute", caseId: "emergency-delete" });'
       - name: Case 04 emergency-delete — 4/5 publish the post challenge
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-04-post
           path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-emergency-04-post.json
@@ -1038,7 +1038,7 @@ jobs:
           --run-id "$GITHUB_RUN_ID"
           --attempt "$GITHUB_RUN_ATTEMPT"
           --evidence-dir "$RUNNER_TEMP/policy-commissioning"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: policy-commissioning-emergency-${{ github.run_id }}-${{ github.run_attempt }}
@@ -1085,7 +1085,7 @@ jobs:
       # The artifact NAME is derived by reviewed code from validated envelope fields and handed to
       # this fixed step as a step output. There is nothing here for a caller to choose, and a name is
       # never taken from the dispatch input.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.publish.outputs.artifact_name }}
           path: ${{ runner.temp }}/policy-commissioning/witness/witness.json
@@ -1129,7 +1129,7 @@ jobs:
           node --input-type=module -e 'import { runRehearsalStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runRehearsalStage({ stage: "challenge" });'
       - name: Rehearsal 2/3 publish the inert challenge
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-rehearsal-00-pre
           path: ${{ runner.temp }}/policy-commissioning/challenges/commissioning-challenge-${{ github.run_id }}-${{ github.run_attempt }}-rehearsal-00-pre.json
@@ -1144,7 +1144,7 @@ jobs:
         run: >-
           node --input-type=module -e 'import { runRehearsalStage } from "./scripts/staging-ops/policy-commissioning.mjs";
           await runRehearsalStage({ stage: "consume" });'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: policy-commissioning-rehearsal-${{ github.run_id }}-${{ github.run_attempt }}
