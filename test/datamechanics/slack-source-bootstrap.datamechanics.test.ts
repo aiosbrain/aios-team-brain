@@ -613,6 +613,191 @@ describe("channel state is scoped, and shared where the provider shares it", () 
   });
 });
 
+// ── an HTTP 5xx is a blip, whatever its body says ────────────────────────────
+
+/**
+ * AIO-1170 final full-contract review. A 5xx is the PROVIDER failing, so nothing its body says about
+ * this request is a verdict — not a missing error, not an unrecognised one, not a claim of `ok`, not
+ * even a credential or reachability error NAME. Read through the real transport, such a response was
+ * a stated refusal: bootstrap blocked until somebody edited the config, and an aged metadata recheck
+ * wrote `unverifiable` over a valid public proof, revoking the lease with it.
+ *
+ * The four shapes are the four ways a readable 5xx body can mislead, spread over 500/502/503.
+ */
+const READABLE_5XX = [
+  { status: 500, shape: "no error field", body: { ok: false } },
+  { status: 502, shape: "an unrecognised error name", body: { ok: false, error: "upstream_gateway_fault" } },
+  { status: 503, shape: "a body that claims ok", body: { ok: true } },
+  { status: 500, shape: "a credential error name", body: { ok: false, error: "invalid_auth" } },
+] as const;
+
+describe("an HTTP 5xx is transient through the real transport, whatever its body says", () => {
+  it.each(READABLE_5XX)("keeps bootstrap retryable after auth.test answers HTTP $status with $shape, and recovers with no config edit", async ({ status, body }) => {
+    const seed = await seedTeam();
+    const integrationId = await seedSlackIntegration(seed, { channelIds: [CHANNEL], token: TOKEN });
+    const saved = await integrationRow(integrationId);
+
+    const failing = fakeSlack({ "auth.test": () => slackJson(body, status) });
+    const result = await discover(seed, integrationId, failing);
+
+    // A delay, not a blocked configuration: nothing here needs an operator.
+    expect(result.steps.filter((s) => s.stage === "auth").map((s) => s.result)).toEqual(["delayed"]);
+    expect(result.outcome).toBe("deferred");
+    expect(await bindingRow(seed.teamId, integrationId)).toMatchObject({ state: "pending_auth", workspace_id: null });
+    expect(failing.calls.map((call) => call.method)).toEqual(["auth.test"]);
+    expect(await channelRows(seed.teamId)).toEqual([]);
+
+    // The next wake with budget simply tries again and succeeds — and nobody touched the config.
+    await elapse(seed.teamId);
+    const recovered = fullPass();
+    await discover(seed, integrationId, recovered);
+    expect(recovered.countOf("auth.test")).toBe(1);
+    expect(await bindingRow(seed.teamId, integrationId)).toMatchObject({
+      state: "verified",
+      workspace_id: WORKSPACE,
+      app_id: APP,
+      error_code: null,
+    });
+    expect((await integrationRow(integrationId))?.updated_at).toEqual(saved?.updated_at);
+  });
+
+  it("keeps a `pending_app` bootstrap resumable after bots.info answers a readable HTTP 502", async () => {
+    const seed = await seedTeam();
+    const integrationId = await seedSlackIntegration(seed, { channelIds: [CHANNEL], token: TOKEN });
+    const failing = fakeSlack({
+      "auth.test": () => slackJson(authTestBody()),
+      "bots.info": () => slackJson({ ok: false, error: "upstream_gateway_fault" }, 502),
+    });
+
+    const result = await discover(seed, integrationId, failing);
+
+    expect(result.steps.filter((s) => s.stage === "app").map((s) => s.result)).toEqual(["delayed"]);
+    expect(await bindingRow(seed.teamId, integrationId)).toMatchObject({ state: "pending_app", bot_id: BOT });
+
+    await elapse(seed.teamId);
+    const resumed = fullPass({
+      "auth.test": () => {
+        throw new Error("`pending_app` resumes at bots.info; auth.test must not repeat");
+      },
+      "bots.info": () => slackJson(botsInfoBody()),
+    });
+    await discover(seed, integrationId, resumed);
+    expect(resumed.countOf("bots.info")).toBe(1);
+    expect(await bindingRow(seed.teamId, integrationId)).toMatchObject({ state: "verified", app_id: APP });
+  });
+
+  it.each(READABLE_5XX)("keeps a valid public proof and its frontier when the aged recheck answers HTTP $status with $shape", async ({ status, body }) => {
+    const seed = await seedTeam();
+    const integrationId = await seedSlackIntegration(seed, { channelIds: [CHANNEL], token: TOKEN });
+    // A proved channel with a scan left mid-page: a proof AND a frontier to lose.
+    await discover(
+      seed,
+      integrationId,
+      fullPass({
+        "conversations.history": () =>
+          slackJson(historyBody({ messages: [rootMessage("1718900000.000900")], hasMore: true, nextCursor: "cursor-1" })),
+      })
+    );
+    // BASELINE AFTER THE FIXTURE, never before it: ageing moves the very column under assertion.
+    await agePublicProof(seed.teamId, CHANNEL);
+    await elapse(seed.teamId);
+    const proved = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    expect(proved).toMatchObject({ public_state: "public", historical_cursor: "cursor-1", lease_owner: null });
+
+    const flaky = fullPass({
+      "auth.test": () => {
+        throw new Error("the binding is verified; auth.test must not repeat");
+      },
+      "conversations.info": () => slackJson(body, status),
+      "conversations.history": () => slackJson(historyBody({ messages: [] })),
+    });
+    const result = await discover(seed, integrationId, flaky);
+
+    // The recheck really went out, and it is reported as a delay — not as a verdict on the channel.
+    expect(flaky.countOf("conversations.info")).toBe(1);
+    expect(result.steps.filter((s) => s.stage === "metadata").map((s) => s.result)).toEqual(["delayed"]);
+    const after = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    // The proof is not evidence that expired: neither the verdict, nor its time, nor its binding moved…
+    expect(after?.public_state).toBe("public");
+    expect(after?.public_checked_at).toEqual(proved?.public_checked_at);
+    expect(after?.binding_integration_id).toBe(proved?.binding_integration_id);
+    expect(after?.binding_config_revision).toBe(proved?.binding_config_revision);
+    // …the channel is still READABLE under it, in this same wake…
+    expect(flaky.countOf("conversations.history")).toBe(1);
+    expect(result.steps.filter((s) => s.stage === "history").map((s) => s.result)).toEqual(["ok"]);
+    // …and the historical scan it had begun is exactly where it was.
+    expect(after?.historical_cursor).toBe(proved?.historical_cursor);
+    expect(after?.historical_anchor_ts).toBe(proved?.historical_anchor_ts);
+    expect(after?.historical_scan_generation).toBe(proved?.historical_scan_generation);
+  });
+
+  it("leaves a never-proved channel closed and unjudged after a readable HTTP 503, and proves it on the next wake", async () => {
+    const seed = await seedTeam();
+    const integrationId = await seedSlackIntegration(seed, { channelIds: [CHANNEL], token: TOKEN });
+    const flaky = fullPass({ "conversations.info": () => slackJson({ ok: false }, 503) });
+
+    const result = await discover(seed, integrationId, flaky);
+
+    expect(result.steps.filter((s) => s.stage === "metadata").map((s) => s.result)).toEqual(["delayed"]);
+    // Still closed — and still UNKNOWN: a blip never invents a verdict in either direction.
+    expect(flaky.countOf("conversations.history")).toBe(0);
+    const unjudged = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    expect(unjudged).toMatchObject({ public_state: "unknown", public_checked_at: null, binding_integration_id: null });
+
+    // Unknown is re-observed on the very next wake with budget; a written verdict would have waited
+    // out a whole observation interval first.
+    await elapse(seed.teamId);
+    const next = fullPass({
+      "auth.test": () => {
+        throw new Error("the binding is verified; auth.test must not repeat");
+      },
+    });
+    await discover(seed, integrationId, next);
+    expect(next.paramsOf("conversations.info").map((p) => p.get("channel"))).toEqual([CHANNEL]);
+    expect(await channelRow(seed.teamId, WORKSPACE, CHANNEL)).toMatchObject({ public_state: "public" });
+  });
+
+  // THE CONTROLS. Below 500 the provider ANSWERED, and a credential refusal still needs an operator:
+  // it blocks, and a later wake with budget does not retry it. Without these, "every failure is a
+  // blip" would satisfy everything above.
+  it.each([
+    { status: 200, error: "invalid_auth" },
+    { status: 401, error: "token_revoked" },
+    { status: 403, error: "missing_scope" },
+  ])("still BLOCKS bootstrap on $error at HTTP $status, and does not retry it on a timer (control)", async ({ status, error }) => {
+    const seed = await seedTeam();
+    const integrationId = await seedSlackIntegration(seed, { channelIds: [CHANNEL], token: TOKEN });
+
+    const refused = await discover(seed, integrationId, fakeSlack({ "auth.test": () => slackJson({ ok: false, error }, status) }));
+
+    expect(categories(refused, "auth")).toEqual([`blocked:${error}`]);
+    expect(refused.outcome).toBe("blocked");
+    expect(await bindingRow(seed.teamId, integrationId)).toMatchObject({ state: "blocked", error_code: error });
+
+    await elapse(seed.teamId);
+    const later = fullPass();
+    const again = await discover(seed, integrationId, later);
+    expect(later.calls).toEqual([]);
+    expect(again.outcome).toBe("blocked");
+    expect(await bindingRow(seed.teamId, integrationId)).toMatchObject({ state: "blocked", error_code: error });
+  });
+
+  it("still records a definitive `unverifiable` when the provider ANSWERS that it cannot describe the channel (control)", async () => {
+    const seed = await seedTeam();
+    const integrationId = await seedSlackIntegration(seed, { channelIds: [CHANNEL], token: TOKEN });
+    const refusing = fullPass({ "conversations.info": () => slackJson({ ok: false, error: "channel_not_found" }) });
+
+    const result = await discover(seed, integrationId, refusing);
+
+    expect(categories(result, "metadata")).toEqual(["blocked:channel_not_found"]);
+    expect(await channelRow(seed.teamId, WORKSPACE, CHANNEL)).toMatchObject({
+      public_state: "unverifiable",
+      last_error_code: "channel_not_found",
+    });
+    expect(refusing.countOf("conversations.history")).toBe(0);
+  });
+});
+
 // ── a coalesced channel is read only by its binder ───────────────────────────
 
 /**

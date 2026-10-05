@@ -920,3 +920,115 @@ describe("the newest-lane seam has a margin (PA-3)", () => {
     expect(after?.completed_upper_ts).toBe(channel.pages[1]?.params.get("latest"));
   });
 });
+
+// ── request slots, under a budget that says "not yet" ────────────────────────
+
+/**
+ * AIO-1170 final full-contract review — the two lanes alternate REQUEST SLOTS, not wakes.
+ *
+ * A wake is cheap and frequent; a request slot is one per minute. After a historical page is read
+ * the turn belongs to the newest lane, but the wake that would take it usually arrives inside that
+ * minute, claims the newest lane, and is DEFERRED by the method budget: zero HTTP. Handing the lane
+ * back used to pass the turn on anyway — so the next real slot went to the historical lane again,
+ * and again, and a long backfill starved the newest lane of every request until it was finished.
+ * Nothing new in the channel was discovered for as long as the backlog lasted.
+ *
+ * (A wake that stops at its own INVOCATION ceiling is a different, separately pinned case: there the
+ * claim/release bookkeeping, turn included, is the accepted PA-2 contract. This is about the budget.)
+ */
+describe("history request slots alternate when a wake is deferred by the method budget", () => {
+  /** What has been read, and where each scan stands: none of it may move on a wake that sent nothing. */
+  const FRONTIER = [
+    "historical_cursor",
+    "newest_cursor",
+    "historical_scan_generation",
+    "newest_scan_generation",
+    "historical_anchor_ts",
+    "historical_oldest_seen_ts",
+    "historical_floor_reached",
+    "completed_lower_ts",
+    "completed_upper_ts",
+    "newest_catchup_upper_ts",
+    "last_read_at",
+  ] as const;
+
+  it("gives the newest lane the next real slot after a deferred wake, so a new root is found mid-backfill", async () => {
+    const seed = await seedTeam();
+    const integrationId = await setup(seed);
+    const channel = providerChannel();
+    // A backlog three pages deep: the historical scan needs three request slots to drain it.
+    for (let i = 0; i < 40; i++) channel.post(`17189${10_000 + i}.000100`);
+    const fake = pass(channel.history);
+    const sentLanes = () =>
+      fake.calls
+        .filter((call) => call.method === "conversations.history")
+        .map((call) => (isCatchUp(call) ? "newest" : "historical"));
+
+    /**
+     * ONE EARLY WAKE, inside the minute the last request spent. It is genuinely deferred by the
+     * stored method budget — no clock is moved to stage it — so it sends nothing, and it must take
+     * nothing either: the turn it could not use is still the same lane's, and the frontier is where
+     * the last accepted page left it.
+     */
+    async function deferredWake(): Promise<void> {
+      const before = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+      const requests = fake.calls.length;
+
+      const result = await discover(seed, integrationId, fake);
+
+      expect(fake.calls.length).toBe(requests);
+      expect(
+        result.steps.filter((s) => s.stage === "history").map((s) => `${s.result}:${s.category ?? ""}`)
+      ).toEqual(["deferred:budget_deferred"]);
+      const after = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+      // THE TURN IS NOT SPENT: no request was sent, so no request slot was used.
+      expect(after?.next_lane).toBe(before?.next_lane);
+      for (const column of FRONTIER) expect(after?.[column], column).toEqual(before?.[column]);
+      expect(after?.lease_owner).toBeNull();
+    }
+    /** One wake with budget: the minute has passed, so exactly one history request goes out. */
+    async function slot(): Promise<void> {
+      await elapse(seed.teamId);
+      const requests = fake.countOf("conversations.history");
+      await discover(seed, integrationId, fake);
+      expect(fake.countOf("conversations.history")).toBe(requests + 1);
+    }
+
+    // SLOT 1 — the anchored historical scan starts: first page of three, and the turn passes on.
+    await discover(seed, integrationId, fake);
+    const seeded = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    expect(seeded).toMatchObject({ historical_cursor: "offset:15", next_lane: "newest", historical_floor_reached: false });
+    // Somebody posts in the channel just after that anchor. Only the newest lane can ever see it.
+    const fresh = channel.post(shiftTs(String(seeded?.historical_anchor_ts), BigInt(1)));
+
+    await deferredWake();
+
+    // SLOT 2 belongs to the NEWEST lane — the wake in between sent nothing and changes nothing.
+    await slot();
+    expect(sentLanes()).toEqual(["historical", "newest"]);
+    // The new root is queued while the backfill is still two pages from done.
+    expect(await threadRootTs(seed.teamId)).toContain(fresh);
+    expect(await channelRow(seed.teamId, WORKSPACE, CHANNEL)).toMatchObject({
+      historical_cursor: "offset:15",
+      historical_floor_reached: false,
+    });
+
+    await deferredWake();
+
+    // SLOT 3 — the historical scan resumes exactly where it stopped, under its frozen anchor.
+    await slot();
+    const resumed = fake.paramsOf("conversations.history")[2];
+    expect(resumed?.get("cursor")).toBe("offset:15");
+    expect(resumed?.get("latest")).toBe(seeded?.historical_anchor_ts);
+
+    await deferredWake();
+
+    // SLOT 4 — and the newest lane again. Slots alternate for as long as both lanes have work.
+    await slot();
+    expect(sentLanes()).toEqual(["historical", "newest", "historical", "newest"]);
+    expect(await channelRow(seed.teamId, WORKSPACE, CHANNEL)).toMatchObject({
+      historical_cursor: "offset:30",
+      historical_floor_reached: false,
+    });
+  }, 30_000);
+});

@@ -45,6 +45,7 @@ vi.mock("@/lib/ingest/slack-method-budget", async (importOriginal) => {
 // already sees the stubbed budget functions.
 import * as pageRequestModule from "@/lib/ingest/sources/slack-page-request";
 import { slackReservedRequest } from "@/lib/ingest/sources/slack-page-request";
+import { classifySlackCall } from "@/lib/ingest/slack-source-discovery";
 
 const TEAM = "3f1a0b2c-4d5e-4f60-8a7b-9c0d1e2f3a4b";
 const SCOPE: SlackMethodScope = {
@@ -842,6 +843,67 @@ describe("slackReservedRequest — 429 before JSON, and sanitized categories", (
     }
     expect(calls).toHaveLength(0);
     expect(reserveSlackMethodSlot).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * AIO-1170 final full-contract review — the transport and the classifier, COMPOSED.
+ *
+ * Each half is right on its own terms and wrong together. The transport reports a failed HTTP status
+ * by the body's error name when it recognises one, and by `http_<status>` when it does not; the
+ * classifier treats a provider error as a passing fault only if its NAME is on a short list. So a
+ * readable 500/502/503 whose body carries no error, an unrecognised one, a claim of `ok`, or even a
+ * credential error name comes out as a stated refusal — and a source acts on refusals: bootstrap
+ * blocks until someone edits the config, and a metadata recheck writes `unverifiable` over a valid
+ * public proof. The contract is the other way round: a 5xx is the PROVIDER failing, so nothing its
+ * body says about this request is a verdict.
+ *
+ * `classifySlackCall` is imported from the discovery module on purpose: this is the pairing a
+ * source actually runs, and neither unit suite alone can see it.
+ */
+describe("slackReservedRequest × classifySlackCall — an HTTP 5xx is a blip, whatever its body says", () => {
+  const ask = async (status: number, body: unknown) => {
+    granted();
+    const { impl } = fetchStub(() => json(body, status));
+    const result = await slackReservedRequest(
+      { db: fakeDb(), scope: SCOPE, token: TOKEN },
+      "conversations.info",
+      { channel: "C0UNIT001" },
+      { fetchImpl: impl }
+    );
+    return { result, disposition: classifySlackCall(result) };
+  };
+
+  it.each([
+    { status: 500, shape: "no error field", body: { ok: false } },
+    { status: 502, shape: "an unrecognised error name", body: { ok: false, error: "upstream_gateway_fault" } },
+    { status: 503, shape: "a body that claims ok", body: { ok: true, channel: { id: "C0UNIT001" } } },
+    { status: 500, shape: "a credential error name", body: { ok: false, error: "invalid_auth" } },
+    { status: 503, shape: "a reachability error name", body: { ok: false, error: "channel_not_found" } },
+  ])("treats HTTP $status with $shape as transient", async ({ status, body }) => {
+    const { result, disposition } = await ask(status, body);
+
+    // Worth trying again later — not a refusal about this request, and not a blocked credential.
+    expect(disposition.kind).toBe("transient");
+    // …and still never a success: a 5xx carries no page and no body, whatever it claimed.
+    expect(result.outcome).not.toBe("ok");
+    expect("page" in result).toBe(false);
+    // The category stays a sanitized code: remote text is not echoed on the way through.
+    expect(JSON.stringify(disposition)).not.toContain("upstream_gateway_fault");
+  });
+
+  // THE CONTROLS. Below 500 the provider ANSWERED, and what it said about this request stands: a
+  // credential refusal still needs an operator and a stated refusal is still a refusal. Without
+  // these, "everything that fails is transient" would satisfy the block above.
+  it.each([
+    { status: 200, body: { ok: false, error: "invalid_auth" }, kind: "blocked", category: "invalid_auth" },
+    { status: 401, body: { ok: false, error: "token_revoked" }, kind: "blocked", category: "token_revoked" },
+    { status: 403, body: { ok: false, error: "missing_scope" }, kind: "blocked", category: "missing_scope" },
+    { status: 200, body: { ok: false, error: "channel_not_found" }, kind: "refused", category: "channel_not_found" },
+    { status: 404, body: { ok: true }, kind: "refused", category: "http_404" },
+  ])("still classifies HTTP $status $category as $kind (control)", async ({ status, body, kind, category }) => {
+    const { disposition } = await ask(status, body);
+    expect(disposition).toMatchObject({ kind, category });
   });
 });
 
