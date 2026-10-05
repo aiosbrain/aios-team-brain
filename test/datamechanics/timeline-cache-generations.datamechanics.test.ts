@@ -100,7 +100,9 @@ function observing(real: DbClient, onGenerationRead: (n: number) => Promise<void
   return { client, count: () => count };
 }
 
-function failedOracleRead(real: DbClient, table: "members" | "group_members" | "project_groups"): DbClient {
+function failedOracleRead(
+  real: DbClient, table: "members" | "group_members" | "project_groups" | "work_timeline_cache"
+): DbClient {
   const denied = new Proxy({} as PgBuilder, {
     get(_target, prop) {
       if (prop === "then") return (resolve: (value: unknown) => void) =>
@@ -1141,5 +1143,163 @@ describe("timeline cache generation lag (PA-4, real Postgres)", () => {
     await next.settleTimelineRefreshes();
     expect((await rowOf(seed)).payload.generations).toEqual(await live(seed.teamId));
     expect((await read(next, seed)).freshness.stale).toBe(false);
+  }, LONG);
+
+  // ── independent review of 70aa180b..6062e81d: how the lag branch meets bust and purge ─────────
+
+  /**
+   * Review M1. `bustTeamTimeline` is the backstop behind a re-attribution or a tier reclassification
+   * that bumps NO Slack generation: it marks the team's rows stale so the next view rebuilds. A row
+   * that is busted while it also LAGS goes down the lag branch, and that branch refreshes only when
+   * the key's spacing slot is free — so a correction made inside the spacing was served unrefreshed.
+   */
+  it("refreshes a busted row on the next read even inside the lag-refresh spacing, exactly once (review M1)", async () => {
+    const { seed, item } = await warmed();
+    const { worker, admin } = await workerWithAdmin();
+    await read(worker, seed);
+    const refreshes = vi.spyOn(admin, "adminClient");
+    try {
+      // The key's lag-refresh slot is spent…
+      await retitle(seed.teamId, item.id, RENAMED);
+      await bump(seed.teamId, "data_generation");
+      expect((await read(worker, seed)).freshness.stale).toBe(true);
+      await worker.settleTimelineRefreshes();
+      expect(refreshes).toHaveBeenCalledTimes(1);
+      // …and ingestion has moved on, so the row lags again. THE CONTROL: with no bust, a read here is
+      // served stale and buys nothing. The spacing is in force, and it is what the bust has to beat.
+      await bump(seed.teamId, "data_generation");
+      expect((await read(worker, seed)).freshness.stale).toBe(true);
+      await worker.settleTimelineRefreshes();
+      expect(refreshes).toHaveBeenCalledTimes(1);
+
+      // A correction lands that no Slack generation records, and its owner busts the team's rows.
+      await retitle(seed.teamId, item.id, OVERTAKING);
+      await worker.bustTeamTimeline(db(), seed.teamId);
+      const afterBust = await Promise.all([1, 2, 3].map(() => read(worker, seed)));
+      await worker.settleTimelineRefreshes();
+
+      // The bust is honoured on the NEXT read, recent lag refresh or not — and three concurrent
+      // readers still buy one rebuild between them.
+      expect(refreshes).toHaveBeenCalledTimes(2);
+      // Whatever those readers were handed, the pre-correction ledger was never called fresh.
+      for (const served of afterBust) {
+        if (titles(served.days).includes(RENAMED)) expect(served.freshness.stale).toBe(true);
+      }
+    } finally {
+      refreshes.mockRestore();
+    }
+
+    // …and the correction is what the reader has from then on.
+    const corrected = await read(worker, seed);
+    expect(titles(corrected.days)).toContain(OVERTAKING);
+    expect(titles(corrected.days)).not.toContain(RENAMED);
+    expect(corrected.freshness.stale).toBe(false);
+    expect((await rowOf(seed)).payload.generations).toEqual(await live(seed.teamId));
+  }, LONG);
+
+  /**
+   * Review M2. The maximum stale age is measured from the row's `computed_at`, on the premise that
+   * only a build moves it. A bust writes `computed_at` too — to "just past the TTL" — and for a row
+   * already older than that, that is FORWARD: a fourteen-minute-old build became a six-minute-old
+   * one, reusable for nine more minutes, on every worker, again at every further bust.
+   */
+  it("never lets a bust make an old build younger: the maximum stale age still counts from the build (review M2)", async () => {
+    const { seed, item } = await warmed();
+    const computedAt = async () => Date.parse(String((await rowOf(seed)).computed_at));
+
+    // THE CONTROL: a FRESH row is moved BACK to the stale mark. That is what a bust is for.
+    const fresh = await computedAt();
+    await cache.bustTeamTimeline(db(), seed.teamId);
+    const marked = await computedAt();
+    expect(marked).toBeLessThan(fresh);
+    expect(Date.now() - marked).toBeGreaterThanOrEqual(cache.TIMELINE_TTL_MS);
+
+    // An OLD build that lags: fourteen minutes, still inside the fifteen-minute bound.
+    await retitle(seed.teamId, item.id, RENAMED);
+    await bump(seed.teamId, "data_generation");
+    await ageRow(seed.teamId, 14 * 60_000);
+    const built = await computedAt();
+    await cache.bustTeamTimeline(db(), seed.teamId);
+    // A bust may leave that stamp alone or push it further back. It may not re-date the build as newer.
+    expect(await computedAt()).toBeLessThanOrEqual(built);
+
+    // Three minutes on the build is seventeen minutes old, bust or no bust: it is not reused.
+    advanceClock(3 * 60_000);
+    const served = await read(await secondWorker(), seed);
+    expect(titles(served.days)).toContain(RENAMED);
+    expect(titles(served.days)).not.toContain(FIRST);
+  }, LONG);
+
+  /**
+   * A worker HOLDING a lagging entry in memory that nothing will replace: the source is current, the
+   * reader's visible items are unchanged, and every refresh this worker starts fails.
+   */
+  async function holdingLaggingEntry() {
+    const base = await warmed();
+    const { worker, admin } = await workerWithAdmin();
+    await read(worker, base.seed);
+    await retitle(base.seed.teamId, base.item.id, RENAMED);
+    await bump(base.seed.teamId, "data_generation");
+    const noRefresh = observing(db(), () => { throw new Error("refresh held off for this test"); });
+    const spy = vi.spyOn(admin, "adminClient").mockReturnValue(noRefresh.client);
+    return { ...base, worker, spy };
+  }
+
+  /**
+   * Review M3. A purge hard-deletes a row because its payload is no longer ALLOWED to be served, and
+   * it can only evict the memory of the process it runs in. Another replica's copy was bounded by its
+   * own TTL — until the lag branch began falling back to the held entry whenever no row came back,
+   * which stretched that to the maximum stale age. Nothing this reader can see has changed here (same
+   * visible items, same identity), which is the position a legacy reader is ALWAYS in: its
+   * fingerprint is the empty set whatever is purged.
+   */
+  it("does not serve a held memory entry once its persisted row is CONFIRMED gone (review M3)", async () => {
+    const { seed, worker, spy } = await holdingLaggingEntry();
+    try {
+      // THE CONTROL: while the row exists, this worker is served the lagging build as stale.
+      const standing = await read(worker, seed);
+      expect(standing.freshness.stale).toBe(true);
+      expect(titles(standing.days)).toContain(FIRST);
+      await worker.settleTimelineRefreshes();
+
+      // ANOTHER replica withdraws the payload through the production purge. This worker's memory is
+      // not that replica's to evict.
+      const key = await cache.timelineViewKey(db(), seed.teamId, "team", seed.memberId);
+      await cache.purgeTimelineCacheTier(db(), seed.teamId, "team");
+      const { data: remaining } = await db().from("work_timeline_cache").select("group_key")
+        .eq("team_id", seed.teamId).eq("group_key", key);
+      expect(remaining).toEqual([]);
+
+      // The row was READ and is not there. That is not a reason to fall back on the copy in memory.
+      const served = await read(worker, seed);
+      expect(titles(served.days)).not.toContain(FIRST);
+      expect(titles(served.days)).toContain(RENAMED);
+      expect(served.freshness.stale).toBe(false);
+      await worker.settleTimelineRefreshes();
+    } finally {
+      spy.mockRestore();
+    }
+  }, LONG);
+
+  // THE OTHER HALF of M3, and the memory layer's own evidence: a row that cannot be READ is not a
+  // row that was withdrawn. A cache-row read is best-effort, so the held entry still answers — under
+  // the same maximum stale age, counted from its build.
+  it("still reuses a held memory entry when the row is UNREADABLE, and only inside the maximum stale age (review M3 control)", async () => {
+    const { seed, worker, spy } = await holdingLaggingEntry();
+    const unreadableRow = failedOracleRead(db(), "work_timeline_cache");
+    try {
+      const held = await read(worker, seed, unreadableRow);
+      expect(held.freshness.stale).toBe(true);
+      expect(titles(held.days)).toContain(FIRST);
+      await worker.settleTimelineRefreshes();
+
+      advanceClock(16 * 60_000);
+      const cold = await read(worker, seed, unreadableRow);
+      expect(titles(cold.days)).toContain(RENAMED);
+      expect(titles(cold.days)).not.toContain(FIRST);
+      await worker.settleTimelineRefreshes();
+    } finally {
+      spy.mockRestore();
+    }
   }, LONG);
 });
