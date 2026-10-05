@@ -27,7 +27,13 @@ function scheduleIdentityEffects(db: ReturnType<typeof adminClient>, teamId: str
       // The provider obligation repairs retained Drive evidence; the team-wide obligation is the
       // common authority for items, versions, code contributions, and cache publication. A Drive
       // mapping is not healthy-complete until both converge at the same current revision.
-      await repairAttributionNow(db, teamId, teamSlug, { maxBatches: 20 });
+      //
+      // This only accelerates. The mapping change already made both repairs durable; a budget that
+      // ends `continuing` (or a turn another owner holds) is carried on by the repair scheduler.
+      const outcome = await repairAttributionNow(db, teamId, teamSlug, { maxBatches: 20 });
+      if (outcome.status === "continuing") {
+        console.info(`[attribution] repair for team ${teamId} is continuing in the background`);
+      }
     });
     return;
   }
@@ -199,12 +205,22 @@ export async function reattributeIdentitiesNow(
     // Inline (returns a summary the button shows). Bust arcs too so this recovery path ALSO clears the
     // 10-min arc lag — matching the auto-reconcile hooks (the correction lock protects it from the same
     // TOCTOU race a concurrent auto-reconcile might hit).
-    const s = await repairAttributionNow(adminClient(), ctx.teamId, teamSlug, { maxBatches: 100 });
+    // `request`: this button asks for the repair. It is not following a mutation that enqueued one,
+    // so a revision already marked complete is durably reopened and scanned again from the start.
+    const s = await repairAttributionNow(adminClient(), ctx.teamId, teamSlug, { maxBatches: 100, request: true });
     revalidatePath(`/t/${teamSlug}/admin/members`);
-    return {
-      ok: true,
-      message: `Re-attributed ${s.updated} of ${s.scanned} item(s)${s.versionsUpdated ? ` + ${s.versionsUpdated} version(s)` : ""} to current identity mappings.`,
-    };
+    const done = `Re-attributed ${s.updated} of ${s.scanned} item(s)${s.versionsUpdated ? ` + ${s.versionsUpdated} version(s)` : ""}`;
+    // A spent budget or a turn another worker holds is not an error: the repair is durable and
+    // continues from where this left it. Say so rather than reporting a completion or a failure.
+    if (s.status === "continuing") {
+      return {
+        ok: true,
+        message: s.busy
+          ? "Re-attribution is already running for this team and is continuing in the background."
+          : `${done} so far; re-attribution is continuing in the background.`,
+      };
+    }
+    return { ok: true, message: `${done} to current identity mappings.` };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "re-attribution failed" };
   }

@@ -492,10 +492,16 @@ export function startIngestScheduler(): void {
           `[ingest] identity-repair: ${result.complete} complete, ${result.partial} partial, ${result.failed} failed`,
         );
       }
+      // The team-wide repair is continued promptly by its own scheduler
+      // (lib/ingest/attribution-repair-scheduler). This bounded pass is only the backstop for a
+      // deployment that runs without it; it takes the same per-team turn, so the two never overlap,
+      // and a team it leaves `continuing` or finds busy is not a failure.
       const { drainPendingAttributionRepairs } = await import("@/lib/ingest/reconcile-attribution");
       const shared = await drainPendingAttributionRepairs(db);
       if (shared.attempted) {
-        console.info(`[ingest] attribution-repair: ${shared.complete} complete, ${shared.failed} pending/failed`);
+        console.info(
+          `[ingest] attribution-repair: ${shared.complete} complete, ${shared.continuing} continuing, ${shared.failed} failed`,
+        );
       }
     } catch (err) {
       console.error("[ingest] identity repair tick failed:", err instanceof Error ? err.message : err);

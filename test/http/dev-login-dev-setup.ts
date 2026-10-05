@@ -271,8 +271,9 @@ export function buildChildEnv(spec: ChildEnvSpec, ambient: NodeJS.ProcessEnv = p
     SECRETS_KEY: SYNTHETIC_SECRETS_KEY,
     APP_URL: `http://${LOOPBACK}:${spec.port}`,
     NEXT_TELEMETRY_DISABLED: "1",
-    // All three in-process schedulers off (instrumentation.ts): the children must not poll or project.
+    // Every in-process scheduler off (instrumentation.ts): the children must not poll or project.
     INGEST_POLL_ENABLED: "false",
+    ATTRIBUTION_REPAIR_POLL_ENABLED: "false",
     GRAPH_PROJECT_ENABLED: "false",
     SOCIAL_JOBS_ENABLED: "false",
   });

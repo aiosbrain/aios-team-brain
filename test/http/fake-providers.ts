@@ -160,6 +160,7 @@ export function queryServerEnv(base: NodeJS.ProcessEnv, fakes: { llmUrl: string;
     GRAPHITI_URL: fakes.graphitiUrl,
     GRAPH_PROJECT_ENABLED: "false",
     INGEST_POLL_ENABLED: "false",
+    ATTRIBUTION_REPAIR_POLL_ENABLED: "false",
     SOCIAL_JOBS_ENABLED: "false",
     CONTEXT_PROVIDER: "native",
   };

@@ -12,6 +12,10 @@ import {
   validateIdentityAuthorityRevision,
 } from "@/lib/identity/authority";
 import { lockItemAttribution } from "@/lib/ingest/item-attribution-lock";
+import {
+  DRIVE_OBLIGATION_PROVENANCE,
+  readDriveObligationProvenance,
+} from "@/lib/ingest/repair-eligibility";
 
 const DEFAULT_BATCH = 100;
 
@@ -56,6 +60,15 @@ async function mappingStillCurrent(obligation: Obligation): Promise<boolean> {
   return Number(rows[0]?.revision) === Number(obligation.mapping_revision);
 }
 
+export interface IdentityRepairHooks {
+  /** Test-only scheduling point: the snapshot is built and NOTHING is held. */
+  afterSnapshot?: () => Promise<void>;
+  /** Test-only scheduling point: the item is nominated, its attribution advisory not yet taken. */
+  beforeItemLock?: (itemId: string) => Promise<void>;
+  /** Test-only scheduling point: the item's attribution advisory is held, its row not yet read. */
+  afterItemLock?: (itemId: string) => Promise<void>;
+}
+
 async function repairOneItem(
   db: DbClient,
   teamId: string,
@@ -63,8 +76,11 @@ async function repairOneItem(
   map: IdentityMap,
   connectors: ReadonlySet<string>,
   authorityRevision: number,
+  hooks: IdentityRepairHooks,
 ): Promise<{ item: number; versions: number; contributions: number }> {
+  await hooks.beforeItemLock?.(itemId);
   await lockItemAttribution(teamId,itemId);
+  await hooks.afterItemLock?.(itemId);
   const { rows } = await runSql<{
     id: string;
     member_id: string | null;
@@ -77,6 +93,15 @@ async function repairOneItem(
   );
   const item = rows[0];
   if (!item) return { item: 0, versions: 0, contributions: 0 };
+  // The candidate read nominated this item; it did not admit it. Provenance is decided here, by a
+  // statement of its own issued AFTER the attribution advisory and the row lock: the persisted
+  // same-team Drive mapping, and Drive source evidence on the row as it is now. A row that is not a
+  // Drive document — unmapped, mapped only in another team or from another source, or no longer
+  // Drive-sourced — is scanned past with nothing written. A read that fails or answers nothing
+  // throws: the batch rolls back, and the obligation's cursor with it.
+  if (!await readDriveObligationProvenance(teamId, itemId)) {
+    return { item: 0, versions: 0, contributions: 0 };
+  }
   let itemUpdates = 0;
   let versionUpdates = 0;
   if (!item.member_id_locked) {
@@ -135,18 +160,29 @@ async function markRetry(obligation: Obligation, error: unknown): Promise<void> 
   );
 }
 
-/** Drain one revision-fenced repair in bounded item batches. Every batch serializes with the mapping
- * writer, and every item rechecks its correction lock under the item lock before credit changes. */
+/**
+ * Drain one revision-fenced repair in bounded item batches. Every batch serializes with the mapping
+ * writer, and every item rechecks its Drive provenance and its correction lock under the item lock
+ * before credit changes.
+ *
+ * This drain keeps its own cursor, on the obligation. It never moves the team-wide repair's cursor
+ * and never runs the team-wide per-item repair: that one admits by the common eligibility rule and
+ * records its progress on the team authority row, and neither belongs to an identity obligation.
+ * What the two share is the trust root — the persisted same-team Drive mapping
+ * (`lib/ingest/repair-eligibility`).
+ */
 export async function runIdentityRepairObligation(
   db: DbClient,
   obligation: Obligation,
-  opts: { batchSize?: number } = {},
+  opts: { batchSize?: number; hooks?: IdentityRepairHooks } = {},
 ): Promise<{ status: "partial" | "complete" | "obsolete"; scanned: number }> {
   const batchSize = Math.max(1, Math.min(500, opts.batchSize ?? DEFAULT_BATCH));
+  const hooks = opts.hooks ?? {};
   try {
     const snapshot = await buildIdentityAuthoritySnapshot(db, obligation.team_id);
     const map = snapshot.map;
     const connectors = snapshot.connectorIds;
+    await hooks.afterSnapshot?.();
     const batch = await withTransaction(async () => {
       // Team-wide snapshot lock/revision always precedes the exact-identity lock.
       await validateIdentityAuthorityRevision(obligation.team_id, snapshot.revision);
@@ -169,9 +205,12 @@ export async function runIdentityRepairObligation(
           where team_id=$1 and provider=$2 and external_id=$3 and mapping_revision=$4`,
         [current.team_id, current.provider, current.external_id, current.mapping_revision],
       );
+      // Nomination, bounded by the obligation's cursor: Drive documents by the provenance rule —
+      // the persisted same-team mapping and current Drive source evidence — that name this
+      // identity among their authors or contributions.
       const { rows: candidates } = await runSql<{ id: string }>(
         `select i.id from items i
-          where i.team_id=$1 and i.frontmatter->>'source'='gdrive'
+          where i.team_id=$1 and ${DRIVE_OBLIGATION_PROVENANCE}
             and ($3::uuid is null or i.id>$3::uuid)
             and (
               exists (select 1 from jsonb_array_elements(
@@ -198,7 +237,7 @@ export async function runIdentityRepairObligation(
       let contributionUpdates = 0;
       for (const candidate of candidates) {
         const result = await repairOneItem(
-          db,current.team_id,candidate.id,map,connectors,snapshot.revision,
+          db,current.team_id,candidate.id,map,connectors,snapshot.revision,hooks,
         );
         itemUpdates += result.item;
         versionUpdates += result.versions;
@@ -266,7 +305,7 @@ export async function runIdentityRepairObligation(
 /** Scheduler/manual drain. Fair by oldest update and bounded by obligations + items per invocation. */
 export async function drainIdentityRepairs(
   db: DbClient,
-  opts: { maxObligations?: number; batchSize?: number } = {},
+  opts: { maxObligations?: number; batchSize?: number; hooks?: IdentityRepairHooks } = {},
 ): Promise<{ attempted: number; complete: number; partial: number; failed: number }> {
   const max = Math.max(1, Math.min(100, opts.maxObligations ?? 20));
   const { rows } = await runSql<Obligation>(
@@ -283,7 +322,9 @@ export async function drainIdentityRepairs(
   for (const obligation of rows) {
     summary.attempted++;
     try {
-      const result = await runIdentityRepairObligation(db, obligation, { batchSize: opts.batchSize });
+      const result = await runIdentityRepairObligation(db, obligation, {
+        batchSize: opts.batchSize, hooks: opts.hooks,
+      });
       if (result.status === "complete" || result.status === "obsolete") summary.complete++;
       else summary.partial++;
     } catch {

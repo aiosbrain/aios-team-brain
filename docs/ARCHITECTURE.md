@@ -1086,7 +1086,16 @@ survives unlink. Every link/remap/unlink serializes on the exact team/provider/i
 current active non-connector member and expected revision, audits the mutation, and enqueues an
 `identity_repair_obligations` row for that revision. Repair is bounded and restartable by item cursor;
 each item is locked and the mapping revision plus `member_id_locked` correction policy is rechecked at
-write time, so a stale worker cannot restore old credit. Item/version ownership is recomputed from its
+write time, so a stale worker cannot restore old credit. The obligation only ever touches a Drive
+document, and what makes a row one is the persisted same-team `gdrive` row in `source_item_mappings`
+together with current Drive source evidence on the row (`lib/ingest/repair-eligibility.ts`): that rule
+bounds candidate nomination alongside the author and cursor bounds, and is rechecked by its own
+statement after the item's attribution advisory and row lock, before any item, version or evidence
+write. Frontmatter alone — which a pusher writes — a mapping in another team or from another source,
+claims, connection state and leases establish nothing, so forged provenance cannot have a stored
+credit rewritten on link or erased on unlink. An ineligible candidate is scanned past; a failed or
+malformed provenance read rolls the batch and the obligation's cursor back. This drain keeps its own
+cursor and never runs the team-wide per-item repair or moves its cursor. Item/version ownership is recomputed from its
 own retained provenance. `gdrive_contribution_evidence` retains independent immutable role/time/source
 observations while its derived member/revision is repaired; an explicit credit-nobody correction is
 persisted and honored rather than re-resolved. Completion follows strict derived Timeline/arc/cache
@@ -1106,6 +1115,34 @@ cursor and leaves a pending repair instead of allowing an older snapshot to publ
 an `email-alias:` mapping tombstone, so successful unlink clears unlocked stale credit while ordinary
 never-resolved evidence remains conservative. Manual repair propagates read failures; background repair
 records retry state and the scheduler resumes it. Completion is published only after strict cache purge.
+The team-wide repair is taken in TURNS, and a turn has one owner. Every entry point — the dedicated
+scheduler, the ingest-chain backstop, the Admin hooks and the manual button — begins each of its
+transactions with a transaction-scoped try-advisory lock on the team's repair turn, BEFORE the
+identity-authority lock; a turn it cannot take is `busy`, which is an answer and not a failure. A scan
+turn is one transaction: under ownership it rereads revision, status, cursor and retry deadline (the
+resolver snapshot it built beforehand was only a nomination), then commits one bounded batch — every
+item, version and evidence write, the cursor and the status together. Finalization is a turn of its own:
+validate the revision, strictly purge the caches, mark it complete and advance the authorization epoch,
+atomically. A crash releases the turn with its connection and leaves exactly the last committed batch; a
+real failure rolls its batch back and only then records `retry` with exponential backoff, in its own
+transaction; a healthy partial batch or a busy turn never counts as an attempt; a newer revision resets
+the row and a stale owner records nothing against it. A turn only CONTINUES durable work: a revision it
+finds complete is a no-op, whoever calls. A repair is enqueued in exactly two ways — by the roster
+trigger on a mapping change (which records the revision as already complete when the team has nothing
+stored to repair), and by an explicit REQUEST from the manual "Re-attribute content" button or the direct
+`reattributeItems`: under the turn, before the snapshot, a revision whose scan has finished is set back
+to pending with its cursor and counters cleared, and that commits before any row is scanned. A request
+creates no revision and does not restart a repair in progress. `lib/ingest/attribution-repair-scheduler.ts`,
+started from `instrumentation.register()` on timers of its own (not a leg of the 30-minute ingest chain,
+and suppressed on a copied-staging runtime), continues these repairs promptly: the authority table is
+the only queue — it is asked at boot and every five seconds while idle for teams with unfinished work
+whose deadline has passed, oldest-touched first — each discovered team gets one turn per round, and a
+round that left work to do is followed by the next at once, back to back with no timer between them
+(the idle poll is the only timer it arms). The per-round cap defers and never hides: a round that
+filled its page is followed at once by the next page, past the teams whose turn could not move them
+(busy, deferred, failed), and the first short page starts the pass again from the front. A bounded
+Admin budget that ends reports
+`continuing`; kicks from those callers are post-commit and only bring the next round forward.
 Team repair eligibility is one rule, applied in the bounded candidate selection and again per item
 under its attribution advisory and row lock (`lib/ingest/reattribute.ts`): a non-`external` row, or an
 `external` row with a persisted same-team `gdrive` row in `source_item_mappings`. Drive documents are

@@ -5,11 +5,13 @@ import { join, relative } from "node:path";
 /**
  * A provider mapping, once it names an item, keeps naming it (AIO-1167).
  *
- * `source_item_mappings` is the trust root for one access decision that is made WITHOUT locking the
- * mapping: the common attribution repair (`lib/ingest/reattribute.ts`) admits an `external` row
- * only when a same-team `gdrive` mapping exists for it, rechecks that under the item lock, and then
- * relies on it staying true until its transaction commits. It cannot lock the mapping or the
- * provider there — both come BEFORE the item in the ingest order.
+ * `source_item_mappings` is the trust root for a decision both repair drains make WITHOUT locking
+ * the mapping (`lib/ingest/repair-eligibility.ts`): the common attribution repair
+ * (`lib/ingest/reattribute.ts`) admits an `external` row only when a same-team `gdrive` mapping
+ * exists for it, and the Google identity obligation repair (`lib/ingest/identity-repair.ts`) touches
+ * a row only when one does. Each rechecks that under the item lock and then relies on it staying
+ * true until its transaction commits. Neither can lock the mapping or the provider there — both
+ * come BEFORE the item in the ingest order.
  *
  * That is sound only while no application path can take a mapping away from its item:
  *
@@ -111,6 +113,29 @@ describe("source_item_mappings: a mapping never leaves its item", () => {
       }
     }
     expect(offenders, `SQL that takes a mapping away from its item:\n${offenders.join("\n")}`).toEqual([]);
+  });
+
+  it("the mapping rule is written once, and both repair drains recheck it through that one reader", () => {
+    // The exact same-team Drive mapping predicate over `items i`.
+    const rule = /exists\s*\(\s*select 1 from source_item_mappings m\s+where m\.team_id = i\.team_id and m\.item_id = i\.id and m\.source = 'gdrive'\)/;
+    const definers = walk(join(ROOT, "lib"), /\.ts$/)
+      .filter((file) => rule.test(readFileSync(file, "utf8")))
+      .map((file) => relative(ROOT, file));
+    expect(definers).toEqual([join("lib", "ingest", "repair-eligibility.ts")]);
+
+    const shared = readFileSync(join(ROOT, "lib", "ingest", "repair-eligibility.ts"), "utf8");
+    // Both rules are built on that one predicate; neither restates the mapping.
+    expect(shared).toMatch(/COMMON_REPAIR_ELIGIBLE = `\(i\.access::text <> 'external' or \$\{DRIVE_MAPPING\}\)`/);
+    expect(shared).toMatch(/DRIVE_OBLIGATION_PROVENANCE = `\(i\.frontmatter->>'source' = 'gdrive' and \$\{DRIVE_MAPPING\}\)`/);
+
+    const common = readFileSync(join(ROOT, "lib", "ingest", "reattribute.ts"), "utf8");
+    expect(common).toContain("${COMMON_REPAIR_ELIGIBLE}");
+    expect(common).toContain("readCommonRepairEligibility(");
+    const obligation = readFileSync(join(ROOT, "lib", "ingest", "identity-repair.ts"), "utf8");
+    expect(obligation).toContain("${DRIVE_OBLIGATION_PROVENANCE}");
+    expect(obligation).toContain("readDriveObligationProvenance(");
+    // Source evidence alone no longer nominates a row for the obligation drain.
+    expect(obligation).not.toMatch(/frontmatter->>'source'\s*=\s*'gdrive'/);
   });
 
   it("the matchers discriminate", () => {
