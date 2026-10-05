@@ -7,7 +7,9 @@ import { db, ingest, placeMemberByTier, seedTeam, type Seed } from "./helpers";
 
 /**
  * AIO-1217 — Server Action SCOPE CONNECTIONS against real Postgres (AC-04, the scope-connection
- * half): the first TWO of the fifteen finite connections, and only those two.
+ * half): the first TWO of the fifteen finite connections, and for scope confinement only those two.
+ * Section C adds one lookup-error case at the chain gate the Social exports share; it is not that
+ * gate's connection evidence.
  *
  *   S — app/actions/meeting-todos.ts scanMeetingTodosAction
  *         visibleItemIds(team.id, auth.memberId) → scanMeetingTodosForTeam options.visibleItemIds
@@ -24,23 +26,30 @@ import { db, ingest, placeMemberByTier, seedTeam, type Seed } from "./helpers";
  *   1  partial scope   the signed-in principal's own set is the consumer's only source: the shared
  *                      item is served, the restricted and the foreign-team item are never loaded;
  *                      the grantee's session on the same fixture reaches the restricted item too.
- *   2  empty scope     an admitted principal whose set is genuinely empty gets a successful empty
- *                      answer while the same team holds content its grantee can reach.
- *   3  resolver error  the resolver's flagged read error refuses, and the faulted statement is the
- *                      LAST statement the action issues: the consumer never starts.
- *   4  no widening     a failed read on each of the resolver's three oracle legs loads nothing.
+ *   2  empty scope     an admitted principal who keeps a project grant but holds no item membership
+ *                      gets a successful empty answer while the same team holds content its grantee
+ *                      can reach.
+ *   3  resolver error  a failed read on EACH of the resolver's four legs (`members`,
+ *                      `group_members`, `project_groups`, `project_context_memberships`) refuses with
+ *                      the exact visibility refusal: the fault lands on the resolver's own read after
+ *                      the guard admitted the principal, it is the LAST statement the action issues,
+ *                      and the consumer is never entered. Eight cases: two exports × four legs.
+ *   4  no project      an admitted principal the oracle resolves to NO project, with no read error,
+ *                      gets a successful empty answer: the resolver ends before its grant and
+ *                      item-membership reads and the consumer still runs. Emptiness is not refusal.
  *   5  wrong principal another team's principal, this team's principal against the other team, a
  *                      same-team non-admin (D) and no session at all are refused before the
  *                      resolver; the foreign team's own principal reaches only its own item.
  *
  * What is real: the two exports; `currentMember` / `requireTeamAdmin` → `resolveIntegrationsAdmin`
  * → `canAccessAdmin`; `getSessionUser` and `verifySession` (jose HS256 against AUTH_SECRET); the
- * posture resolver; the PRODUCER `visibleItemIds` → `visibleProjects` → `visibleItemIdsForProjects`
- * over real group, grant, context-unit and membership rows; the CONSUMERS `scanMeetingTodosForTeam`
- * (with its real todo extraction) and `discoverOpportunities` → `createOpportunity` → the
- * evidence-tier check; the query builder, the pg pool and the task's data-mechanics Postgres. No
- * resolver, consumer, guard, predicate or verdict is stubbed, and no boolean stands in for a scope.
- * Discovery is deterministic scoring: there is no model call on this path and none is claimed.
+ * posture resolver; the PRODUCER `visibleItemIds` → `visibleProjectsWithError` →
+ * `visibleItemIdsForProjects` over real group, grant, context-unit and membership rows; the
+ * CONSUMERS `scanMeetingTodosForTeam` (with its real todo extraction) and `discoverOpportunities` →
+ * `createOpportunity` → the evidence-tier check; the query builder, the pg pool and the task's
+ * data-mechanics Postgres. No resolver, consumer, guard, predicate or verdict is stubbed, and no
+ * boolean stands in for a scope. Discovery is deterministic scoring: there is no model call on this
+ * path and none is claimed.
  *
  * The synthetic seams, all of them:
  *   SEAM cookies     `next/headers` `cookies` — resolves the jar of the one request in flight. The
@@ -56,37 +65,52 @@ import { db, ingest, placeMemberByTier, seedTeam, type Seed } from "./helpers";
  *                    statement, and Postgres itself. This seam exists because the bodies a consumer
  *                    LOADS are not visible in an action's return value — a scan that read a
  *                    restricted transcript and then dropped it would return the same candidates.
+ *   SEAM consumer    `scanMeetingTodosForTeam` and `discoverOpportunities` are entered through a
+ *                    recorder that notes the call — its team, the scope option it was handed and
+ *                    its actor — and then runs the REAL function with the same arguments. It is a
+ *                    call boundary, not a stub: without it "the consumer was never entered" is only
+ *                    inferred from the statements a consumer happens to issue.
  *
  * THE FAULT IS SYNTHETIC. At most one fault is armed per request, for the first SELECT a named
  * client issues against a named table. That statement is NOT sent: the executor rejects, and the
  * real adapter turns the rejection into its own returned `{ error }` envelope (it never rejects).
  * It is not a native driver failure. Each fault case asserts the fault fired exactly once and that
- * the adapter surfaced it.
+ * the adapter surfaced it. Every fault is armed on the SERVICE client. The guards read through the
+ * server client only, so a fault there cannot land on an authentication read, and each case shows
+ * where it did land: the guard issued the statements it issues in the paired admitted request and
+ * its own `members` read answered with the actor's row; the service client's statements are the
+ * resolver's earlier legs, answered in order, and then the one that was not sent.
  *
  * Expected truth is the fixture's, not the producer's. Each world states who holds a current
  * membership path to each item, and that statement is checked once, as a premise, against one raw
  * SQL join over the substrate tables — never against `visibleItemIds`. Ids are compared as fixture
- * labels (`shared`, `restricted`, `foreign`; `actor`, `grantee`, `teammate`, `foreigner`; `A`, `B`)
- * and content as sentinel tokens, one per item, that appear in its path and body (and title, D).
+ * labels (`shared`, `restricted`, `foreign`; `actor`, `grantee`, `teammate`, `grantless`,
+ * `foreigner`; `A`, `B`) and content as sentinel tokens, one per item, that appear in its path and
+ * body (and title, D).
  *
- * Every request is one grouped assertion over: the result; the wire observations (the consumer's
- * body-bearing `items` statements with the team, the exact item-id set bound into them and the
- * items whose bodies came back; every fixture item, member and team id bound into ANY statement;
- * every sentinel in ANY returned row; every non-SELECT statement); the durable rowsets, read from
- * the pool before and after; and the revalidation trace. A wrong return value cannot hide a private
+ * Every request is one grouped assertion over: the result; the two call boundaries (the resolver's
+ * reads in order with what became of each, and every entry into the consumer with the scope option
+ * and actor it was handed); the wire observations (the consumer's body-bearing `items` statements
+ * with the team, the exact item-id set bound into them and the items whose bodies came back; every
+ * fixture item, member and team id bound into ANY statement; every sentinel in ANY returned row;
+ * every non-SELECT statement); the durable rowsets, read from the pool before and after; and the
+ * revalidation trace. A wrong return value cannot hide a private
  * load or a write, and a right one cannot excuse it. Fixture premises fail with the `FIXTURE`
  * prefix and are never a security observation; a failed admitted control says `CONTROL`.
  *
  * Which observation each applicable source mutant is built to break (stated by construction — this
  * file executes no mutant):
- *   S option omitted / widened ids      case 1 `loaded` and candidates; case 2 `loaded`
+ *   S option omitted / widened ids      case 1 `consumers`, `loaded` and candidates; case 2 `loaded`
  *   S empty set treated as absent       case 2 `loaded` (the team's content the grantee reaches)
  *   D option omitted (fail-closed)      case 1 admitted control: nothing is scanned or minted
- *   D widened ids                       case 1 `loaded`, the minted rows and their sentinels
+ *   D widened ids                       case 1 `consumers`, `loaded`, the minted rows and sentinels
  *   wrong-principal resolution, S or D  case 1 `principals`, and the actor/grantee difference in
  *                                       both directions on one fixture
  *   D actor substituted at the writer   case 1 `createdBy`
- *   error branch dropped, S or D        case 3 result and `afterFault`
+ *   error branch dropped, S or D        case 3 result, `consumers` and `afterFault`, all four legs
+ *   oracle error discarded before the   case 3 on the three oracle legs: result, `consumers`,
+ *   materializer's result               `afterFault` and, for D, the revalidation trace
+ *   empty project set made an error     case 4 result and `consumers`; case 2 likewise
  *
  * Bounds of what is claimed.
  *   - Two connections of fifteen. The other thirteen, the remaining action rows, their independent
@@ -96,13 +120,20 @@ import { db, ingest, placeMemberByTier, seedTeam, type Seed } from "./helpers";
  *     commit the guard, posture, oracle, resolver, scanner, discovery and store modules on these
  *     two paths issue no statement any other way; that is a source reading, not a tested property.
  *     Durable effects do not depend on it: they are read back from the pool.
- *   - Case 3 faults the ONE read the resolver reports as an error (`project_context_memberships`).
- *     The resolver's three oracle reads (`members`, `group_members`, `project_groups`) are, in the
- *     current product, collapsed into the same empty set a grantless member gets, so the action
- *     proceeds with an empty scope instead of refusing. Case 4 therefore asserts ONLY that nothing
- *     is loaded, returned or written under those faults. It deliberately does not assert a refusal,
- *     the result shape, that the consumer stayed uncalled, or the revalidation trace for those
- *     three legs, and it is not evidence for the specification's lookup-error refusal row there.
+ *   - "The resolver's reads" are the service-client statements issued before the consumer was
+ *     entered. That the guards use the server client only, and that nothing but the resolver uses
+ *     the service client before the consumer on these paths, is likewise a source reading.
+ *   - Case 3 is the specification's lookup-error refusal row for these two exports, on all four
+ *     legs. The three oracle legs (`members`, `group_members`, `project_groups`) refuse only because
+ *     `visibleItemIds` now carries the error-aware oracle's flag; while the materializer read the
+ *     flag-discarding `visibleProjects` wrapper they collapsed into case 4's empty set and the
+ *     consumer ran. The `project_context_memberships` leg was flagged, and refused, before that too.
+ *   - Case 4's principal is an active agent holding only a planted builtin Everyone row: posture for
+ *     the guards, grant-inert at the oracle, which therefore ends at "no accepted group". That is
+ *     one no-error zero-project path; a principal whose groups hold no grant at all is not run.
+ *   - Section C runs ONE oracle leg through ONE chain-gated export (`planNow`): the gate's refusal
+ *     text and zero effects on a resolver error. The gate's six other exports, its scope
+ *     confinement and the second draft scope of `generateDrafts` are not exercised.
  *   - Membership is read per request: no revocation or linearizability claim is made.
  *   - `createMeetingTodosAction` and the deferred AIO-1225 boundary are not exercised.
  */
@@ -119,6 +150,10 @@ const h = vi.hoisted(() => ({
   adminDb: null as import("@/lib/db/types").DbClient | null,
   /** When set, the client `serverClient()` hands out: another, sharing the same trace. */
   serverDb: null as import("@/lib/db/types").DbClient | null,
+  /** SEAM consumer: when set, told each time the action enters one of the two real consumers. */
+  enterConsumer: null as
+    | ((consumer: "scan" | "discover", teamId: string, scope: Iterable<string> | undefined, actorId: string | null) => void)
+    | null,
 }));
 
 vi.mock("next/headers", () => ({ cookies: h.cookies }));
@@ -133,9 +168,27 @@ vi.mock("@/lib/db/server", async (importOriginal) => {
   const original = await importOriginal<typeof import("@/lib/db/server")>();
   return { ...original, serverClient: async () => h.serverDb ?? original.serverClient() };
 });
+// The real scanner, entered through a recorder.
+vi.mock("@/lib/meetings/extract-todos", async (importOriginal) => {
+  const original = await importOriginal<typeof import("@/lib/meetings/extract-todos")>();
+  const scanMeetingTodosForTeam: typeof original.scanMeetingTodosForTeam = (client, teamId, opts) => {
+    h.enterConsumer?.("scan", teamId, opts?.visibleItemIds, null);
+    return original.scanMeetingTodosForTeam(client, teamId, opts);
+  };
+  return { ...original, scanMeetingTodosForTeam };
+});
+// The real discovery, entered through a recorder.
+vi.mock("@/lib/social/discover", async (importOriginal) => {
+  const original = await importOriginal<typeof import("@/lib/social/discover")>();
+  const discoverOpportunities: typeof original.discoverOpportunities = (client, teamId, opts) => {
+    h.enterConsumer?.("discover", teamId, opts?.visibleItemIds, opts?.actor?.memberId ?? null);
+    return original.discoverOpportunities(client, teamId, opts);
+  };
+  return { ...original, discoverOpportunities };
+});
 
 import { scanMeetingTodosAction } from "@/app/actions/meeting-todos";
-import { discoverNow } from "@/app/t/[team]/social/actions";
+import { discoverNow, planNow } from "@/app/t/[team]/social/actions";
 import { addMemberToGroup, createGroup, grantProjectToGroup } from "@/lib/access/groups";
 import { SESSION_COOKIE, signSession } from "@/lib/auth/pg-session";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
@@ -143,6 +196,7 @@ import { backfillTeamContext } from "@/lib/projects/context/backfill";
 type Row = Record<string, unknown>;
 type Family = "scan" | "discover";
 type Role = "admin" | "member";
+type Kind = "human" | "agent";
 type ItemLabel = "shared" | "restricted" | "foreign";
 type TeamLabel = "A" | "B";
 type Via = "admin" | "server";
@@ -169,9 +223,8 @@ const VISIBILITY_FAILED = { ok: false, error: "visibility resolution failed" };
 const NOT_A_MEMBER = { ok: false, error: "not a member of this team" };
 const ADMINS_ONLY = { ok: false, error: "admins only" };
 
-/** The one read the resolver reports as an error, and the three oracle reads it does not. */
-const FLAGGED_LEG = "project_context_memberships";
-const ORACLE_LEGS = ["members", "group_members", "project_groups"] as const;
+/** The resolver's four reads in the order it issues them: the oracle's three, then the materializer's. */
+const RESOLVER_LEGS = ["members", "group_members", "project_groups", "project_context_memberships"] as const;
 
 const FAULT_MESSAGE = "aio1217 synthetic resolver read fault";
 
@@ -181,6 +234,21 @@ const ANSWERED = "answered";
 const FAULTED = "injected rejection: statement not sent";
 const NATIVE_ERROR = "native error:";
 const UNCLASSIFIED = "unclassified";
+
+// What became of the resolver's reads, as `boundaries` reports them.
+const answered = (tables: readonly string[]): string[] => tables.map((table) => `select ${table}: ${ANSWERED}`);
+/** A resolution that ran to its end: all four reads answered. */
+const RESOLVED = answered(RESOLVER_LEGS);
+/** A resolution the oracle ended at "no accepted group": no grant read and no item-membership read. */
+const NO_ACCEPTED_GROUP = answered(RESOLVER_LEGS.slice(0, 2));
+/** A resolution stopped at `leg`: the reads before it answered, and it was not sent. */
+const stoppedAt = (leg: string): string[] => [
+  ...answered(RESOLVER_LEGS.slice(0, (RESOLVER_LEGS as readonly string[]).indexOf(leg))),
+  `select ${leg}: ${FAULTED}`,
+];
+
+/** What `boundaries` reports as the scope of a consumer entered without its scope option. */
+const OMITTED = "option omitted";
 
 interface Statement {
   via: Via;
@@ -195,9 +263,21 @@ interface Statement {
   outcome: string;
 }
 
+/** One entry into a consumer, as its recorder saw it. */
+interface ConsumerCall {
+  consumer: Family;
+  /** How many statements the action had issued when the consumer was entered. */
+  at: number;
+  teamId: string;
+  /** The scope option it was handed; null when the option was absent. */
+  scope: string[] | null;
+  actorId: string | null;
+}
+
 interface Flight {
   jar: Map<string, string>;
   statements: Statement[];
+  consumers: ConsumerCall[];
   fault: { via: Via; table: string; fired: number; at: number } | null;
 }
 
@@ -206,6 +286,7 @@ interface Seen<T> {
   before: Durable;
   after: Durable;
   statements: Statement[];
+  consumers: ConsumerCall[];
   /** What the action issued after the faulted statement; empty when no fault was armed. */
   afterFault: string[];
   revalidated: unknown[];
@@ -232,6 +313,8 @@ interface World {
   grantee: Cast;
   /** Team A, Everyone only, always an ordinary member. */
   teammate: Cast;
+  /** Team A, an active agent holding only a planted Everyone row: admitted, and granted nothing. */
+  grantless: Cast;
   /** Team B, Everyone only. */
   foreigner: Cast;
   shared: Item;
@@ -253,6 +336,7 @@ beforeEach(() => {
   inFlight = null;
   h.adminDb = null;
   h.serverDb = null;
+  h.enterConsumer = null;
   h.revalidatePath.mockReset();
   h.cookies.mockReset();
   h.cookies.mockImplementation(async () => {
@@ -271,6 +355,7 @@ beforeEach(() => {
 afterEach(() => {
   h.adminDb = null;
   h.serverDb = null;
+  h.enterConsumer = null;
   vi.unstubAllEnvs();
 });
 
@@ -340,8 +425,11 @@ async function authority(memberId: string) {
        where gm.team_id = m.team_id and gm.member_id = m.id and g.slug = '${slug}' and g.is_builtin)`;
   return fxOne(
     "authority readback",
-    `select m.team_id, m.role::text as role, m.status::text as status, m.auth_user_id,
-            ${builtinRows("everyone")} as everyone_rows, ${builtinRows("external")} as external_rows
+    `select m.team_id, m.role::text as role, m.kind, m.status::text as status, m.auth_user_id,
+            ${builtinRows("everyone")} as everyone_rows, ${builtinRows("external")} as external_rows,
+            (select count(*)::int from group_members gm
+               join groups g on g.team_id = gm.team_id and g.id = gm.group_id
+              where gm.team_id = m.team_id and gm.member_id = m.id and not g.is_builtin) as other_group_rows
        from members m where m.id = $1`,
     [memberId],
   );
@@ -349,25 +437,29 @@ async function authority(memberId: string) {
 
 /**
  * A distinct active member with the real builtin Everyone row, bound to a fresh auth user, and a
- * real session signed for that auth user. Nothing about any guard is stubbed to success.
+ * real session signed for that auth user. Nothing about any guard is stubbed to success. For an
+ * `agent` the Everyone row is a planted one — the groups writer never admits a non-human to a
+ * builtin — and is posture only: the oracle accepts a builtin row from an active human alone.
  */
-async function seedCast(team: Seed, label: string, role: Role): Promise<Cast> {
+async function seedCast(team: Seed, label: string, role: Role, kind: Kind = "human"): Promise<Cast> {
   const user = { id: randomUUID(), email: `${label}-${randomUUID().slice(0, 8)}@aio1217.fixture.test` };
   await fxOne("auth user insert", `insert into auth_users(id, email) values($1, $2) returning id`, [user.id, user.email]);
   const { id } = await fxOne<{ id: string }>(
     "member insert",
-    `insert into members(team_id, email, display_name, actor_handle, role, tier, status, auth_user_id)
-     values($1, $2, $3, $4, $5, 'team', 'active', $6) returning id`,
-    [team.teamId, user.email, `AIO1217 ${label}`, `${label}-${randomUUID().slice(0, 8)}`, role, user.id],
+    `insert into members(team_id, email, display_name, actor_handle, role, kind, tier, status, auth_user_id)
+     values($1, $2, $3, $4, $5, $6, 'team', 'active', $7) returning id`,
+    [team.teamId, user.email, `AIO1217 ${label}`, `${label}-${randomUUID().slice(0, 8)}`, role, kind, user.id],
   );
   await placeMemberByTier(team.teamId, id, "team");
   premise(`${label}'s authority`, await authority(id), {
     team_id: team.teamId,
     role,
+    kind,
     status: "active",
     auth_user_id: user.id,
     everyone_rows: 1,
     external_rows: 0,
+    other_group_rows: 0,
   });
   return { label, memberId: id, session: await signSession(user) };
 }
@@ -472,7 +564,8 @@ async function reach(world: Pick<World, "items" | "members">, cast: Cast[]): Pro
  * Team A holds a `shared` and a `restricted` item of the family's kind; team B holds a `foreign`
  * one. `restricted` is reachable by the grantee alone. `shared` is reachable by all of team A when
  * `sharedWithEveryone`, and otherwise is restricted to the grantee as well — the world in which the
- * actor's scope is genuinely empty while the team still holds content.
+ * actor's scope is genuinely empty while the team still holds content. Team A also holds a
+ * `grantless` principal the guards admit and the oracle grants no project in either world.
  */
 async function seedWorld(family: Family, opts: { sharedWithEveryone: boolean }): Promise<World> {
   const a = await seedTeam();
@@ -481,6 +574,7 @@ async function seedWorld(family: Family, opts: { sharedWithEveryone: boolean }):
   const actor = await seedCast(a, "actor", privileged);
   const grantee = await seedCast(a, "grantee", privileged);
   const teammate = await seedCast(a, "teammate", "member");
+  const grantless = await seedCast(a, "grantless", privileged, "agent");
   const foreigner = await seedCast(b, "foreigner", privileged);
 
   const shared = await ingestSource(a, family, "shared");
@@ -492,12 +586,14 @@ async function seedWorld(family: Family, opts: { sharedWithEveryone: boolean }):
   }
   await restrictTo(a, grantee, opts.sharedWithEveryone ? [restricted] : [shared, restricted]);
 
+  // The principals a membership path can serve. `grantless` is not one of them: its only group row
+  // is the planted builtin one, which the raw join below would follow and the oracle does not.
   const cast = [actor, grantee, teammate, foreigner];
   const items = new Map<string, string>(
     [shared, restricted, foreign].map((item): [string, string] => [item.id, item.label]),
   );
   const members = new Map<string, string>([
-    ...cast.map((member): [string, string] => [member.memberId, member.label]),
+    ...[...cast, grantless].map((member): [string, string] => [member.memberId, member.label]),
     [a.memberId, "ownerA"],
     [b.memberId, "ownerB"],
   ]);
@@ -511,6 +607,7 @@ async function seedWorld(family: Family, opts: { sharedWithEveryone: boolean }):
     actor,
     grantee,
     teammate,
+    grantless,
     foreigner,
     shared,
     restricted,
@@ -527,6 +624,18 @@ async function seedWorld(family: Family, opts: { sharedWithEveryone: boolean }):
     restricted: ["grantee"],
     foreign: ["foreigner"],
   });
+  const standing = await authority(grantless.memberId);
+  premise(
+    "the grantless principal is an active agent whose only group row is the builtin Everyone one",
+    {
+      kind: standing.kind,
+      status: standing.status,
+      everyone_rows: standing.everyone_rows,
+      external_rows: standing.external_rows,
+      other_group_rows: standing.other_group_rows,
+    },
+    { kind: "agent", status: "active", everyone_rows: 1, external_rows: 0, other_group_rows: 0 },
+  );
   premise("no opportunity exists before the first request", await opportunities(world), []);
   return world;
 }
@@ -594,7 +703,7 @@ async function request<T>(
 ): Promise<Seen<T>> {
   const jar = new Map<string, string>();
   if (session !== null) jar.set(SESSION_COOKIE, session);
-  const flight: Flight = { jar, statements: [], fault: fault ? { ...fault, fired: 0, at: -1 } : null };
+  const flight: Flight = { jar, statements: [], consumers: [], fault: fault ? { ...fault, fired: 0, at: -1 } : null };
   h.revalidatePath.mockClear();
   // The real adapter logs the failure it converts; captured so the fault can be shown to surface there.
   const adapterLog = fault ? vi.spyOn(console, "error").mockImplementation(() => {}) : null;
@@ -604,6 +713,15 @@ async function request<T>(
   inFlight = flight;
   h.adminDb = recordingClient("admin", flight);
   h.serverDb = recordingClient("server", flight);
+  h.enterConsumer = (consumer, teamId, scope, actorId) => {
+    flight.consumers.push({
+      consumer,
+      at: flight.statements.length,
+      teamId,
+      scope: scope === undefined ? null : [...scope],
+      actorId,
+    });
+  };
   let result: T;
   try {
     result = await action();
@@ -611,6 +729,7 @@ async function request<T>(
     inFlight = null;
     h.adminDb = null;
     h.serverDb = null;
+    h.enterConsumer = null;
     logged = adapterLog ? adapterLog.mock.calls.map((call) => String(call[0])) : [];
     adapterLog?.mockRestore();
   }
@@ -637,6 +756,7 @@ async function request<T>(
     before,
     after,
     statements: flight.statements,
+    consumers: flight.consumers,
     afterFault: flight.fault
       ? flight.statements.slice(flight.fault.at + 1).map((statement) => `${statement.via} ${describeStatement(statement)}`)
       : [],
@@ -681,6 +801,49 @@ function wire(world: World, seen: Seen<unknown>) {
   };
 }
 
+/**
+ * What crossed the two recorded call boundaries, in fixture labels.
+ *   resolver   the service-client statements issued before the consumer was entered — all of them
+ *              when it never was — in order, each with what became of it.
+ *   consumers  each entry into a consumer: its team, the scope option it was handed (`OMITTED` when
+ *              absent), how many ids in that scope are no fixture item, and its actor.
+ */
+function boundaries(world: World, seen: Seen<unknown>) {
+  const entered = seen.consumers.length ? seen.consumers[0].at : seen.statements.length;
+  return {
+    resolver: seen.statements
+      .slice(0, entered)
+      .filter((statement) => statement.via === "admin")
+      .map((statement) => `${describeStatement(statement)}: ${statement.outcome}`),
+    consumers: seen.consumers.map((call) => ({
+      consumer: call.consumer,
+      team: world.teams.get(call.teamId) ?? call.teamId,
+      scope: call.scope === null ? OMITTED : pick(world.items, call.scope),
+      strangers: (call.scope ?? []).filter((id) => !world.items.has(id)).length,
+      actor: call.actorId === null ? null : (world.members.get(call.actorId) ?? call.actorId),
+    })),
+  };
+}
+
+/** The boundaries of a request refused before the resolver: neither was reached. */
+const UNREACHED = { resolver: [], consumers: [] };
+
+/**
+ * What the guard did before the resolver's first read: the statements it issued, each with what
+ * became of it, and the member its own `members` read answered with.
+ */
+function guard(world: World, seen: Seen<unknown>) {
+  const first = seen.statements.findIndex((statement) => statement.via === "admin");
+  const issued = seen.statements.slice(0, first < 0 ? seen.statements.length : first);
+  return {
+    statements: issued.map((statement) => `${statement.via} ${describeStatement(statement)}: ${statement.outcome}`),
+    member: pick(
+      world.members,
+      issued.filter((statement) => statement.table === "members").flatMap((statement) => statement.rows.map((row) => row.id)),
+    ),
+  };
+}
+
 /** The wire of a request refused before the resolver: nothing through the service client at all. */
 function quiet(world: World, seen: Seen<unknown>) {
   const { bodyReads, itemsBound, tokensLoaded, writes } = wire(world, seen);
@@ -719,6 +882,7 @@ function scanResult(world: World, result: ScanResult) {
 function scanOutcome(world: World, seen: Seen<ScanResult>) {
   return {
     result: scanResult(world, seen.result),
+    boundaries: boundaries(world, seen),
     wire: wire(world, seen),
     durable: seen.after,
     revalidated: seen.revalidated,
@@ -726,11 +890,18 @@ function scanOutcome(world: World, seen: Seen<ScanResult>) {
 }
 
 /**
- * An admitted scan by `principal` of `team`, confined to `sources`: one candidate per source and no
- * other, the scanner's one `items` statement bound to exactly those ids and answered with exactly
- * those bodies, no other fixture item named anywhere, nothing written, nothing revalidated.
+ * An admitted scan by `principal` of `team`, confined to `sources`: the resolver's reads ended as
+ * `resolver` says, the scanner was entered once and handed exactly those ids, one candidate per
+ * source and no other, the scanner's one `items` statement bound to exactly those ids and answered
+ * with exactly those bodies, no other fixture item named anywhere, nothing written, nothing
+ * revalidated.
  */
-function scanAdmitted(seen: Seen<ScanResult>, by: { principal: string; team: TeamLabel }, sources: ItemLabel[]) {
+function scanAdmitted(
+  seen: Seen<ScanResult>,
+  by: { principal: string; team: TeamLabel },
+  sources: ItemLabel[],
+  resolver: string[] = RESOLVED,
+) {
   const visible = [...sources].sort();
   return {
     result: {
@@ -742,6 +913,10 @@ function scanAdmitted(seen: Seen<ScanResult>, by: { principal: string; team: Tea
         audience: "team",
         existingTaskId: null,
       })),
+    },
+    boundaries: {
+      resolver,
+      consumers: [{ consumer: "scan", team: by.team, scope: visible, strangers: 0, actor: null }],
     },
     wire: {
       bodyReads: [{ via: "server", teams: [by.team], scope: visible, strangers: 0, loaded: visible }],
@@ -791,22 +966,24 @@ describe("S — scanMeetingTodosAction: visibleItemIds(team.id, auth.memberId) �
     ROOMY,
   );
 
-  it(
-    "S3 resolver error: a failed membership read inside visibleItemIds refuses with visibility resolution failed, and the faulted statement is the last one the action issues — the scanner never starts and no body is loaded",
-    async () => {
+  it.each(RESOLVER_LEGS)(
+    "S3 resolver error: a failed %s read inside visibleItemIds refuses with visibility resolution failed — the fault lands on the resolver's own read after the guard admitted the member, it is the last statement the action issues, the scanner is never entered and no body is loaded",
+    async (leg) => {
       const world = await seedWorld("scan", { sharedWithEveryone: true });
 
-      const refused = await request(world.actor.session, scan(world.a.teamSlug), { via: "admin", table: FLAGGED_LEG });
-      expect({ ...scanOutcome(world, refused), afterFault: refused.afterFault }).toEqual({
+      const refused = await request(world.actor.session, scan(world.a.teamSlug), { via: "admin", table: leg });
+      // Only the fault differs: the same session, slug and input are admitted and confined.
+      const admitted = await request(world.actor.session, scan(world.a.teamSlug));
+
+      expect({ ...scanOutcome(world, refused), guard: guard(world, refused), afterFault: refused.afterFault }).toEqual({
         result: VISIBILITY_FAILED,
+        boundaries: { resolver: stoppedAt(leg), consumers: [] },
         wire: { bodyReads: [], itemsBound: [], principals: ["actor"], teams: ["A"], tokensLoaded: [], writes: [] },
         durable: refused.before,
         revalidated: [],
+        guard: { statements: guard(world, admitted).statements, member: ["actor"] },
         afterFault: [],
       });
-
-      // Only the fault differed: the same session, slug and input are admitted and confined.
-      const admitted = await request(world.actor.session, scan(world.a.teamSlug));
       expect(scanOutcome(world, admitted), CONTROL).toEqual(
         scanAdmitted(admitted, { principal: "actor", team: "A" }, ["shared"]),
       );
@@ -814,34 +991,20 @@ describe("S — scanMeetingTodosAction: visibleItemIds(team.id, auth.memberId) �
     ROOMY,
   );
 
-  it.each(ORACLE_LEGS)(
-    "S4 no widening: a failed %s read inside visibleItemIds loads no transcript body, returns no candidate and writes nothing (refusal is deliberately not asserted for this leg)",
-    async (table) => {
+  it(
+    "S4 no project: an admitted principal the oracle resolves to no project, with no read error, gets a successful empty scan — the resolver ends before its grant and item-membership reads, the scanner is entered once with an empty scope and loads no body — while the member on the same fixture scans the shared transcript",
+    async () => {
       const world = await seedWorld("scan", { sharedWithEveryone: true });
 
-      const faulted = await request(world.actor.session, scan(world.a.teamSlug), { via: "admin", table });
-      const onWire = wire(world, faulted);
-      expect({
-        candidates: faulted.result.candidates ?? [],
-        scanned: faulted.result.scanned ?? 0,
-        loaded: onWire.bodyReads.flatMap((read) => read.loaded),
-        itemsBound: onWire.itemsBound,
-        tokensLoaded: onWire.tokensLoaded,
-        writes: onWire.writes,
-        durable: faulted.after,
-      }).toEqual({
-        candidates: [],
-        scanned: 0,
-        loaded: [],
-        itemsBound: [],
-        tokensLoaded: [],
-        writes: [],
-        durable: faulted.before,
-      });
+      const asGrantless = await request(world.grantless.session, scan(world.a.teamSlug));
+      expect(scanOutcome(world, asGrantless)).toEqual(
+        scanAdmitted(asGrantless, { principal: "grantless", team: "A" }, [], NO_ACCEPTED_GROUP),
+      );
 
-      const admitted = await request(world.actor.session, scan(world.a.teamSlug));
-      expect(scanOutcome(world, admitted), CONTROL).toEqual(
-        scanAdmitted(admitted, { principal: "actor", team: "A" }, ["shared"]),
+      // The team does hold scannable content: the empty answer is the principal's grants, not the corpus.
+      const asActor = await request(world.actor.session, scan(world.a.teamSlug));
+      expect(scanOutcome(world, asActor), CONTROL).toEqual(
+        scanAdmitted(asActor, { principal: "actor", team: "A" }, ["shared"]),
       );
     },
     ROOMY,
@@ -863,12 +1026,13 @@ describe("S — scanMeetingTodosAction: visibleItemIds(team.id, auth.memberId) �
         expect(
           {
             result: scanResult(world, refused.result),
+            boundaries: boundaries(world, refused),
             wire: quiet(world, refused),
             durable: refused.after,
             revalidated: refused.revalidated,
           },
           label,
-        ).toEqual({ result: NOT_A_MEMBER, wire: QUIET, durable: refused.before, revalidated: [] });
+        ).toEqual({ result: NOT_A_MEMBER, boundaries: UNREACHED, wire: QUIET, durable: refused.before, revalidated: [] });
       }
 
       // Only the slug differed: each principal is admitted in its own team and confined to it.
@@ -926,6 +1090,7 @@ function minted(team: TeamLabel, source: ItemLabel, createdBy: string) {
 async function discoverOutcome(world: World, seen: Seen<DiscoverResult>) {
   return {
     result: seen.result,
+    boundaries: boundaries(world, seen),
     wire: wire(world, seen),
     opportunities: await opportunities(world),
     elsewhere: withoutOpportunities(seen.after),
@@ -934,20 +1099,27 @@ async function discoverOutcome(world: World, seen: Seen<DiscoverResult>) {
 }
 
 /**
- * An admitted discovery by `principal` of `team`, confined to `scope`: discovery's one body-bearing
- * `items` statement is bound to exactly those ids and answered with exactly those bodies, one
- * opportunity is inserted per item in `mints` (the rest of `scope` was already minted), no other
- * fixture item is named anywhere, no other durable table changes, and the social page revalidates.
+ * An admitted discovery by `principal` of `team`, confined to `scope`: the resolver's reads ended as
+ * `resolver` says, discovery was entered once and handed exactly those ids and that actor, its one
+ * body-bearing `items` statement is bound to exactly those ids and answered with exactly those
+ * bodies, one opportunity is inserted per item in `mints` (the rest of `scope` was already minted),
+ * no other fixture item is named anywhere, no other durable table changes, and the social page
+ * revalidates.
  */
 function discoverAdmitted(
   seen: Seen<DiscoverResult>,
   by: { principal: string; team: TeamLabel; slug: string },
   scope: ItemLabel[],
   mints: ItemLabel[],
+  resolver: string[] = RESOLVED,
 ) {
   const visible = [...scope].sort();
   return {
     result: { ok: true, created: mints.length, skipped: visible.length - mints.length, scanned: visible.length },
+    boundaries: {
+      resolver,
+      consumers: [{ consumer: "discover", team: by.team, scope: visible, strangers: 0, actor: by.principal }],
+    },
     wire: {
       bodyReads: [{ via: "admin", teams: [by.team], scope: visible, strangers: 0, loaded: visible }],
       itemsBound: visible,
@@ -1007,25 +1179,35 @@ describe("D — discoverNow: visibleItemIds(ctx.teamId, ctx.memberId) → discov
     ROOMY,
   );
 
-  it(
-    "D3 lookup error: a failed membership read inside visibleItemIds refuses with visibility resolution failed, and the faulted statement is the last one the action issues — discovery never starts, no opportunity is written and nothing revalidates",
-    async () => {
+  it.each(RESOLVER_LEGS)(
+    "D3 resolver error: a failed %s read inside visibleItemIds refuses with visibility resolution failed — the fault lands on the resolver's own read after the guard admitted the admin, it is the last statement the action issues, discovery is never entered, no opportunity is written and nothing revalidates",
+    async (leg) => {
       const world = await seedWorld("discover", { sharedWithEveryone: true });
       const asA = { team: "A", slug: world.a.teamSlug } as const;
 
-      const refused = await request(world.actor.session, discover(world.a.teamSlug), { via: "admin", table: FLAGGED_LEG });
-      expect({ ...(await discoverOutcome(world, refused)), afterFault: refused.afterFault }).toEqual({
+      const refused = await request(world.actor.session, discover(world.a.teamSlug), { via: "admin", table: leg });
+      const afterRefusal = await discoverOutcome(world, refused);
+      // Only the fault differs: the same session and slug are admitted and confined.
+      const admitted = await request(world.actor.session, discover(world.a.teamSlug));
+      const afterAdmission = await discoverOutcome(world, admitted);
+
+      expect({
+        ...afterRefusal,
+        durable: refused.after,
+        guard: guard(world, refused),
+        afterFault: refused.afterFault,
+      }).toEqual({
         result: VISIBILITY_FAILED,
+        boundaries: { resolver: stoppedAt(leg), consumers: [] },
         wire: { bodyReads: [], itemsBound: [], principals: ["actor"], teams: ["A"], tokensLoaded: [], writes: [] },
         opportunities: [],
         elsewhere: withoutOpportunities(refused.before),
         revalidated: [],
+        durable: refused.before,
+        guard: { statements: guard(world, admitted).statements, member: ["actor"] },
         afterFault: [],
       });
-
-      // Only the fault differed: the same session and slug are admitted and confined.
-      const admitted = await request(world.actor.session, discover(world.a.teamSlug));
-      expect(await discoverOutcome(world, admitted), CONTROL).toEqual({
+      expect(afterAdmission, CONTROL).toEqual({
         ...discoverAdmitted(admitted, { principal: "actor", ...asA }, ["shared"], ["shared"]),
         opportunities: [minted("A", "shared", "actor")],
       });
@@ -1033,35 +1215,22 @@ describe("D — discoverNow: visibleItemIds(ctx.teamId, ctx.memberId) → discov
     ROOMY,
   );
 
-  it.each(ORACLE_LEGS)(
-    "D4 no widening: a failed %s read inside visibleItemIds loads no item body, mints no opportunity and writes nothing (refusal and revalidation are deliberately not asserted for this leg)",
-    async (table) => {
+  it(
+    "D4 no project: an admitted admin the oracle resolves to no project, with no read error, gets a successful empty discovery — the resolver ends before its grant and item-membership reads, discovery is entered once with an empty scope, loads no body, mints nothing and the social page still revalidates — while the admin on the same fixture mints the shared item",
+    async () => {
       const world = await seedWorld("discover", { sharedWithEveryone: true });
       const asA = { team: "A", slug: world.a.teamSlug } as const;
 
-      const faulted = await request(world.actor.session, discover(world.a.teamSlug), { via: "admin", table });
-      const onWire = wire(world, faulted);
-      expect({
-        created: faulted.result.created ?? 0,
-        loaded: onWire.bodyReads.flatMap((read) => read.loaded),
-        itemsBound: onWire.itemsBound,
-        tokensLoaded: onWire.tokensLoaded,
-        writes: onWire.writes,
-        opportunities: await opportunities(world),
-        durable: faulted.after,
-      }).toEqual({
-        created: 0,
-        loaded: [],
-        itemsBound: [],
-        tokensLoaded: [],
-        writes: [],
+      const asGrantless = await request(world.grantless.session, discover(world.a.teamSlug));
+      expect(await discoverOutcome(world, asGrantless)).toEqual({
+        ...discoverAdmitted(asGrantless, { principal: "grantless", ...asA }, [], [], NO_ACCEPTED_GROUP),
         opportunities: [],
-        durable: faulted.before,
       });
 
-      const admitted = await request(world.actor.session, discover(world.a.teamSlug));
-      expect(await discoverOutcome(world, admitted), CONTROL).toEqual({
-        ...discoverAdmitted(admitted, { principal: "actor", ...asA }, ["shared"], ["shared"]),
+      // The team does hold discoverable content: the empty answer is the principal's grants, not the corpus.
+      const asActor = await request(world.actor.session, discover(world.a.teamSlug));
+      expect(await discoverOutcome(world, asActor), CONTROL).toEqual({
+        ...discoverAdmitted(asActor, { principal: "actor", ...asA }, ["shared"], ["shared"]),
         opportunities: [minted("A", "shared", "actor")],
       });
     },
@@ -1084,9 +1253,15 @@ describe("D — discoverNow: visibleItemIds(ctx.teamId, ctx.memberId) → discov
         ["no session", anonymous],
       ] as const) {
         expect(
-          { result: refused.result, wire: quiet(world, refused), durable: refused.after, revalidated: refused.revalidated },
+          {
+            result: refused.result,
+            boundaries: boundaries(world, refused),
+            wire: quiet(world, refused),
+            durable: refused.after,
+            revalidated: refused.revalidated,
+          },
           label,
-        ).toEqual({ result: ADMINS_ONLY, wire: QUIET, durable: refused.before, revalidated: [] });
+        ).toEqual({ result: ADMINS_ONLY, boundaries: UNREACHED, wire: QUIET, durable: refused.before, revalidated: [] });
       }
       expect(await opportunities(world)).toEqual([]);
 
@@ -1101,6 +1276,60 @@ describe("D — discoverNow: visibleItemIds(ctx.teamId, ctx.memberId) → discov
         ...discoverAdmitted(actorOnA, { principal: "actor", team: "A", slug: world.a.teamSlug }, ["shared"], ["shared"]),
         opportunities: [minted("A", "shared", "actor"), minted("B", "foreign", "foreigner")],
       });
+    },
+    ROOMY,
+  );
+});
+
+// ── C: the chain gate's lookup-error arm ─────────────────────────────────────────────────────────
+
+const plan = (teamSlug: string, opportunityId: string) => () => planNow(teamSlug, opportunityId);
+
+describe("C — actorChainGate: a resolver read error at the gate the chain-gated Social exports share (real Postgres)", () => {
+  it(
+    "C1 lookup error at the chain gate: a failed group_members read inside visibleItemIds refuses planNow with visibility resolution failed, not the gate's not-found shape, and the faulted statement is the last one the action issues — no chain read, no plan, no revalidation; without the fault the same admin plans the same opportunity",
+    async () => {
+      const world = await seedWorld("discover", { sharedWithEveryone: true });
+      const slug = world.a.teamSlug;
+      await request(world.actor.session, discover(slug));
+      premise("discovery minted the one opportunity the gate is asked about", await opportunities(world), [
+        minted("A", "shared", "actor"),
+      ]);
+      const { id: opportunityId } = await fxOne<{ id: string }>(
+        "opportunity lookup",
+        `select id from social_opportunities where team_id = $1`,
+        [world.a.teamId],
+      );
+
+      const refused = await request(world.actor.session, plan(slug, opportunityId), { via: "admin", table: "group_members" });
+      // Only the fault differs: the same session, slug and opportunity pass the gate and are planned.
+      const admitted = await request(world.actor.session, plan(slug, opportunityId));
+
+      expect({
+        result: refused.result,
+        resolver: boundaries(world, refused).resolver,
+        guard: guard(world, refused),
+        afterFault: refused.afterFault,
+        writes: wire(world, refused).writes,
+        durable: refused.after,
+        revalidated: refused.revalidated,
+      }).toEqual({
+        result: VISIBILITY_FAILED,
+        resolver: stoppedAt("group_members"),
+        guard: { statements: guard(world, admitted).statements, member: ["actor"] },
+        afterFault: [],
+        writes: [],
+        durable: refused.before,
+        revalidated: [],
+      });
+      expect(
+        {
+          result: admitted.result,
+          plans: admitted.after.content_plans.length - admitted.before.content_plans.length,
+          revalidated: admitted.revalidated,
+        },
+        CONTROL,
+      ).toEqual({ result: { ok: true, variants: 2, created: true }, plans: 1, revalidated: [`/t/${slug}/social`] });
     },
     ROOMY,
   );
