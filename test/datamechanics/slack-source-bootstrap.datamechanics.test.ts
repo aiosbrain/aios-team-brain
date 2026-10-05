@@ -870,6 +870,111 @@ describe("a coalesced channel is read only by its binder (PA-2)", () => {
     });
   });
 
+  /**
+   * THE BOUNDARY the two-channel case above cannot reach. Standing down does not move a channel in
+   * the due order, so a candidate read that stops at a fixed page would return the SAME page of
+   * valid foreign-bound channels on every wake, and a channel behind it would never be examined —
+   * not on this pass, and not on any later one. Fifty is the reader's default page; an integration's
+   * config may select two hundred channels.
+   */
+  it("examines an eligible channel behind fifty validly foreign-bound ones, on the same pass (AC-PA-04c)", async () => {
+    const seed = await seedTeam();
+    const foreignBound = Array.from({ length: 50 }, (_, i) => `C0BULK${String(i + 1).padStart(2, "0")}`);
+    const eligible = "C0BULK51";
+    const binder = await seedSlackIntegration(seed, { channelIds: foreignBound, token: TOKEN, name: "slack-a" });
+    const sibling = await seedSlackIntegration(seed, {
+      channelIds: [...foreignBound, eligible],
+      token: TOKEN,
+      name: "slack-b",
+    });
+
+    // Every one of the fifty is EARNED: one wake proves one channel, so the binder runs fifty wakes.
+    const quiet = { "conversations.history": () => slackJson(historyBody({ messages: [] })) };
+    for (let wake = 0; wake < foreignBound.length; wake++) {
+      await discover(seed, binder, fullPass(quiet));
+      await elapse(seed.teamId);
+    }
+    // The sibling's first pass comes LAST, so the one channel only it selects is the newest row.
+    await discover(seed, sibling, identityOnly(), { maxRequests: 1 });
+    await elapse(seed.teamId);
+
+    const before = new Map<string, Row | null>();
+    for (const channelId of foreignBound) {
+      const row = await channelRow(seed.teamId, WORKSPACE, channelId);
+      expect(row, channelId).toMatchObject({ public_state: "public", binding_integration_id: binder });
+      before.set(channelId, row);
+    }
+    // The fixture is only meaningful if the eligible channel really sits BEHIND a full default page
+    // of them: it is last of fifty-one, and absent from the first fifty.
+    const selected = { teamId: seed.teamId, workspaceId: WORKSPACE, channelIds: [...foreignBound, eligible] };
+    const everyone = await tx((session) => dueSlackChannels(session, { ...selected, limit: 51 }));
+    expect(everyone.map((state) => state.scope.channelId).at(-1)).toBe(eligible);
+    const defaultPage = await tx((session) => dueSlackChannels(session, selected));
+    expect(defaultPage).toHaveLength(50);
+    expect(defaultPage.map((state) => state.scope.channelId)).not.toContain(eligible);
+
+    const proof = fullPass({
+      "auth.test": () => {
+        throw new Error("the sibling is already verified; auth.test must not repeat");
+      },
+    });
+    const result = await discover(seed, sibling, proof, { maxRequests: 1 });
+
+    // Fifty stand-downs cost nothing: the pass's ONE request still went out, to the channel it may prove.
+    expect(proof.calls.map((call) => `${call.method}:${call.params.get("channel")}`)).toEqual([
+      `conversations.info:${eligible}`,
+    ]);
+    const metadata = result.steps.filter((s) => s.stage === "metadata");
+    expect(metadata.slice(0, -1)).toHaveLength(50);
+    for (const stoodDown of metadata.slice(0, -1)) {
+      expect(stoodDown).toStrictEqual(standDown(String(stoodDown.channelId)));
+    }
+    expect(new Set(metadata.slice(0, -1).map((s) => s.channelId))).toEqual(new Set(foreignBound));
+    expect(metadata.at(-1)).toMatchObject({ result: "ok", method: "conversations.info", channelId: eligible });
+    // Not one of the fifty moved, and the fifty-first is the sibling's.
+    for (const channelId of foreignBound) {
+      expect(await channelRow(seed.teamId, WORKSPACE, channelId), channelId).toEqual(before.get(channelId));
+    }
+    expect(await channelRow(seed.teamId, WORKSPACE, eligible)).toMatchObject({
+      public_state: "public",
+      binding_integration_id: sibling,
+    });
+
+    // THE HISTORY LANE HAS THE SAME WINDOW. The sibling's one readable channel was proved a moment
+    // ago, so it is the NEWEST row again: a history candidate read that stops at the default page
+    // returns fifty rows this integration can never claim, on this wake and on every later one,
+    // because their valid binder keeps them.
+    await elapse(seed.teamId);
+    for (const channelId of foreignBound) before.set(channelId, await channelRow(seed.teamId, WORKSPACE, channelId));
+    const historyPage = await tx((session) => dueSlackChannels(session, selected));
+    expect(historyPage).toHaveLength(50);
+    expect(historyPage.map((state) => state.scope.channelId)).not.toContain(eligible);
+
+    const reading = fullPass({
+      "auth.test": () => {
+        throw new Error("the sibling is already verified; auth.test must not repeat");
+      },
+      "conversations.history": () => slackJson(historyBody({ messages: [rootMessage("1718900000.000700")] })),
+    });
+    const read = await discover(seed, sibling, reading);
+
+    // With history allowance, the page that is sent is the eligible channel's — and nobody else's.
+    expect(reading.calls.map((call) => `${call.method}:${call.params.get("channel")}`)).toEqual([
+      `conversations.history:${eligible}`,
+    ]);
+    expect(categories(read, "history")).toEqual(["ok:"]);
+    expect(read.steps.filter((s) => s.stage === "metadata")).toHaveLength(50);
+    expect(await threadRootTs(seed.teamId)).toEqual(["1718900000.000700"]);
+    // The fifty foreign-bound rows are still exactly as their binder left them.
+    for (const channelId of foreignBound) {
+      expect(await channelRow(seed.teamId, WORKSPACE, channelId), channelId).toEqual(before.get(channelId));
+    }
+    // Which lane took the page is the lane rule's business; that a page was ACCEPTED is the point.
+    const readRow = await channelRow(seed.teamId, WORKSPACE, eligible);
+    expect(readRow).toMatchObject({ binding_integration_id: sibling, lease_owner: null, last_error_code: null });
+    expect(readRow?.last_read_at).not.toBeNull();
+  }, 120_000);
+
   it("lets the binder re-prove once after its own config change; the sibling asks nothing and does not rebind (AC-PA-05)", async () => {
     const { seed, binder, sibling } = await coalesced();
     const boundAt = (await bindingRow(seed.teamId, binder))?.config_revision;

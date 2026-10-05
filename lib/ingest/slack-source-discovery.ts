@@ -585,6 +585,12 @@ async function proveChannel(
       teamId: selection.teamId,
       workspaceId: bound.workspaceId,
       channelIds: selection.channelIds,
+      // EVERY selected channel, not the reader's default page. The loop below can stand down on a
+      // candidate without changing its place in the due order, so a window of valid foreign-bound
+      // channels would be the same window on every wake and a channel behind it would never be
+      // looked at. The selection is bounded by the integration config (at most 200 ids); `1` only
+      // keeps the reader's own positive-limit check satisfied for an empty selection.
+      limit: Math.max(selection.channelIds.length, 1),
     });
   });
 
@@ -835,6 +841,11 @@ async function readOnePage(
       teamId: selection.teamId,
       workspaceId: bound.workspaceId,
       channelIds: selection.channelIds,
+      // EVERY selected channel, for the same reason as the metadata stage. A channel bound to another
+      // integration is skipped below without moving in the due order, and a valid binder keeps it —
+      // so a default page filled with such rows would hide this integration's own readable channel
+      // behind it for as long as those binders stay valid. Bounded by the config's 200 ids.
+      limit: Math.max(selection.channelIds.length, 1),
     })
   );
 
