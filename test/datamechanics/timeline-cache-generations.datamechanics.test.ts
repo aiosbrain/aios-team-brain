@@ -20,15 +20,23 @@ import {
 import * as cache from "@/lib/dashboard/timeline-cache";
 
 const cacheWorkers: (typeof cache)[] = [cache];
+// Each reset module graph owns its OWN pg pool, opened the first time that worker's background
+// refresh constructs an admin client. Nothing closed them, so their idle connections piled up across
+// tests until Postgres refused new ones ("too many clients already"). They are closed with the test.
+const workerPools: { getPool(): { end(): Promise<void> } }[] = [];
 async function secondWorker(): Promise<typeof cache> {
   vi.resetModules();
   const other = await import("@/lib/dashboard/timeline-cache");
   cacheWorkers.push(other);
+  workerPools.push(await import("@/lib/db/pg/pool"));
   return other;
 }
 afterEach(async () => {
   await Promise.all(cacheWorkers.map((worker) => worker.settleTimelineRefreshes()));
   cacheWorkers.length = 1;
+  await Promise.all(workerPools.splice(0).map((worker) => worker.getPool().end()));
+  // A later dynamic import must not resolve to a graph whose pool was just closed.
+  vi.resetModules();
   // PA-4's spacing and maximum-age cases move the JS clock; no other test may inherit it.
   vi.useRealTimers();
 });
@@ -554,6 +562,18 @@ async function rewritePayload(seed: SeededTeam, change: (payload: StampedPayload
 const plantSummary = (seed: SeededTeam, text: string) =>
   rewritePayload(seed, (payload) => { payload.days[0].people[0].summary = text; });
 
+/**
+ * ⚠️ CLOCK FIXTURE: the Slack method budgets' minute has passed. `sourced()` spent this
+ * integration's one `auth.test` slot moments earlier, so a second identity pass inside that minute
+ * is DEFERRED by the budget and never reaches the provider — the binding is then left `pending_auth`
+ * with nothing refused. It moves stored deadlines backwards, which no application path may do.
+ */
+async function elapseSlackBudgets(teamId: string) {
+  await tx((s) => s.executeSql(
+    `update slack_method_budgets set next_permitted_at = next_permitted_at - interval '2 minutes'
+      where team_id = $1`, [teamId]));
+}
+
 /** ⚠️ CLOCK FIXTURE: make the persisted row `ms` old on the database's clock. */
 async function ageRow(teamId: string, ms: number) {
   await tx((s) => s.executeSql(
@@ -658,6 +678,7 @@ describe("timeline cache generation lag (PA-4, real Postgres)", () => {
     { field: "data_generation" as const, layer: "a warm memory entry", warm: true, ac: "AC-PA-10" },
     { field: "data_generation" as const, layer: "a second worker's persisted row", warm: false, ac: "AC-PA-10" },
     { field: "presentation_generation" as const, layer: "a warm memory entry", warm: true, ac: "AC-PA-10b" },
+    { field: "presentation_generation" as const, layer: "a second worker's persisted row", warm: false, ac: "AC-PA-10b" },
   ])("serves $layer STALE and without prose after a $field bump, and refreshes once ($ac)", async ({ field, warm }) => {
     const { seed, item } = await warmed();
     await plantSummary(seed, "Shipped the first thing.");
@@ -782,9 +803,15 @@ describe("timeline cache generation lag (PA-4, real Postgres)", () => {
       lose: (seed: SeededTeam, id: string) => disableSlackIntegration(seed, id) },
     { how: "its binding is no longer verified",
       lose: async (seed: SeededTeam, id: string) => {
+        // The saved token is replaced, which invalidates the proved identity and makes the next pass
+        // re-run `auth.test` — and the provider refuses the new credential. The budget's minute has
+        // to have passed first, or that request is deferred and never sent (see the clock fixture).
         await rotateSlackSecret(seed, id, "xoxb-synthetic-rotated-token");
+        await elapseSlackBudgets(seed.teamId);
         const refused = await authPass(seed, id, () => slackJson({ ok: false, error: "invalid_auth" }));
-        if (refused.binding?.state !== "blocked") throw new Error("fixture: the binding should be blocked");
+        if (refused.binding?.state !== "blocked" || refused.binding.errorCode !== "invalid_auth") {
+          throw new Error(`fixture: the binding should be blocked by invalid_auth (got ${refused.binding?.state})`);
+        }
       } },
     { how: "the integration is gone",
       lose: async (seed: SeededTeam, id: string) => {
@@ -925,12 +952,27 @@ describe("timeline cache generation lag (PA-4, real Postgres)", () => {
     try {
       expect((await read(worker, seed)).freshness.stale).toBe(true);
       await worker.settleTimelineRefreshes();
+      // ONE refresh was started, and it failed. A failure is not a reason to try again on the next
+      // read: retrying on every hit inside the spacing is the per-read build this spacing exists to
+      // prevent, and a broken source is exactly when it would be paid for nothing.
+      expect(spy).toHaveBeenCalledTimes(1);
+      for (let poll = 0; poll < 3; poll++) {
+        expect((await read(worker, seed)).freshness.stale).toBe(true);
+        await worker.settleTimelineRefreshes();
+      }
+      expect(spy).toHaveBeenCalledTimes(1);
 
       advanceClock(14 * 60_000);
       const hit = await read(worker, seed);
       expect(hit.freshness.stale).toBe(true);
       expect(titles(hit.days)).toContain(FIRST);
       await worker.settleTimelineRefreshes();
+      // The spacing has long passed, so that read bought exactly one more attempt — which failed too,
+      // and again the read after it buys none.
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect((await read(worker, seed)).freshness.stale).toBe(true);
+      await worker.settleTimelineRefreshes();
+      expect(spy).toHaveBeenCalledTimes(2);
 
       // Two minutes after that hit, sixteen after the build: the age is the BUILD's, and it is over.
       vi.setSystemTime(Date.now() + 2 * 60_000);
@@ -1014,20 +1056,32 @@ describe("timeline cache generation lag (PA-4, real Postgres)", () => {
     await setMemberIdentity(db(), seed.teamId, newOwner,
       { provider: "slack", externalId: "U_TIMELINE" }, { force: true });
 
-    // Every generation read this request makes finds the counter moved again. It used to give up
-    // after two attempts; a backfill is not a reason to fail a correction.
-    const served = await read(cache, seed, backfilling(db(), seed.teamId));
+    // FIXTURE CORRECTION (implementation turn): a cold build is followed by a background refresh that
+    // republishes the row. Left running, it races the row assertions below and can replace the
+    // overtaken build's honest stamps before they are read — so this worker's refresh is made to fail,
+    // and the row under test is the one the cold path wrote.
+    const { worker, admin } = await workerWithAdmin();
+    const noRefresh = observing(db(), () => { throw new Error("refresh held off for this test"); });
+    const spy = vi.spyOn(admin, "adminClient").mockReturnValue(noRefresh.client);
+    try {
+      // Every generation read this request makes finds the counter moved again. It used to give up
+      // after two attempts; a backfill is not a reason to fail a correction.
+      const served = await read(worker, seed, backfilling(db(), seed.teamId));
+      await worker.settleTimelineRefreshes();
 
-    expect(credited(served.days)).toContain(newOwner);
-    expect(credited(served.days)).not.toContain(seed.memberId);
-    // Correct about identity, honest about the rest: it was overtaken, so it is stale and prose-free.
-    expect(served.freshness.stale).toBe(true);
-    expect(hasProse(served.days)).toBe(false);
-    const row = await rowOf(seed);
-    const now = await live(seed.teamId);
-    expect(row.payload.generations.identityGeneration).toBe(now.identityGeneration);
-    expect(BigInt(row.payload.generations.presentationGeneration))
-      .toBeLessThan(BigInt(now.presentationGeneration));
+      expect(credited(served.days)).toContain(newOwner);
+      expect(credited(served.days)).not.toContain(seed.memberId);
+      // Correct about identity, honest about the rest: it was overtaken, so it is stale and prose-free.
+      expect(served.freshness.stale).toBe(true);
+      expect(hasProse(served.days)).toBe(false);
+      const row = await rowOf(seed);
+      const now = await live(seed.teamId);
+      expect(row.payload.generations.identityGeneration).toBe(now.identityGeneration);
+      expect(BigInt(row.payload.generations.presentationGeneration))
+        .toBeLessThan(BigInt(now.presentationGeneration));
+    } finally {
+      spy.mockRestore();
+    }
   }, LONG);
 
   /** A row that reads as a version MISS and whose prose is otherwise salvageable into the rebuild. */
@@ -1052,26 +1106,40 @@ describe("timeline cache generation lag (PA-4, real Postgres)", () => {
     const { seed } = await versionMissWithProse();
     const earlier = await live(seed.teamId);
     const held = holdBeforePublish(db());
-    const worker = await secondWorker();
-
-    const pending = read(worker, seed, held.client);
+    // FIXTURE CORRECTION (implementation turn): as in the AC-PA-14c case, the cold path's own
+    // follow-up refresh would republish the row and race both assertions on it, so it is made to fail.
+    const { worker, admin } = await workerWithAdmin();
+    const noRefresh = observing(db(), () => { throw new Error("refresh held off for this test"); });
+    const spy = vi.spyOn(admin, "adminClient").mockReturnValue(noRefresh.client);
     try {
-      await Promise.race([held.reached, pending.then(() => {
-        throw new Error("fixture: the cold read finished without reaching publication");
-      })]);
-      await bump(seed.teamId, "data_generation");
-    } finally {
-      held.release();
-    }
-    const served = await pending;
+      const pending = read(worker, seed, held.client);
+      try {
+        await Promise.race([held.reached, pending.then(() => {
+          throw new Error("fixture: the cold read finished without reaching publication");
+        })]);
+        await bump(seed.teamId, "data_generation");
+      } finally {
+        held.release();
+      }
+      const served = await pending;
+      await worker.settleTimelineRefreshes();
 
-    // Permission to PUBLISH is not permission to call it fresh, or to keep prose it cannot vouch for.
-    expect(served.freshness.stale).toBe(true);
-    expect(hasProse(served.days)).toBe(false);
-    expect((await rowOf(seed)).payload.generations).toEqual(earlier);
+      // Permission to PUBLISH is not permission to call it fresh, or to keep prose it cannot vouch for.
+      expect(served.freshness.stale).toBe(true);
+      expect(hasProse(served.days)).toBe(false);
+      expect((await rowOf(seed)).payload.generations).toEqual(earlier);
+    } finally {
+      spy.mockRestore();
+    }
     // The next reader of that row, in another process, is told the same.
-    const later = await read(await secondWorker(), seed);
+    const next = await secondWorker();
+    const later = await read(next, seed);
     expect(later.freshness.stale).toBe(true);
     expect(hasProse(later.days)).toBe(false);
+    // CONVERGENCE, kept apart from the transient assertions above: this reader's refresh is real and
+    // nothing overtakes it, so the row it leaves carries the live stamps and is a fresh hit.
+    await next.settleTimelineRefreshes();
+    expect((await rowOf(seed)).payload.generations).toEqual(await live(seed.teamId));
+    expect((await read(next, seed)).freshness.stale).toBe(false);
   }, LONG);
 });

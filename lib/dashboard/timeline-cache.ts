@@ -8,6 +8,7 @@ import { attachPersonDaySummaries, type SummaryPassResult } from "./timeline-sum
 import type { TimelineDay } from "./timeline-group";
 import { freshness, type Freshness } from "@/lib/freshness";
 import { readSlackTeamGenerations, type SlackTeamGenerations } from "@/lib/ingest/slack-message-ledger";
+import { teamHasCurrentSlackSource } from "@/lib/ingest/slack-source-binding";
 import { runContextTransaction } from "@/lib/projects/context/transaction";
 import { TransactionExecutionError } from "@/lib/db/pg/tx";
 import { visibleItemIdsForProjects } from "@/lib/access/enforce";
@@ -21,8 +22,13 @@ import { resolveContentAdmission, contentReaderFor, type ContentAdmission, type 
  * instead of each recomputing it. Sole writer of `work_timeline_cache`.
  *
  * Serve-stale-while-revalidate (mirrors lib/graph/arc-cache) when durable source revisions MATCH:
- * fresh → return; TTL-stale → return stale NOW + refresh behind the request. Any Slack revision
- * mismatch is a cold inline rebuild, because the old evidence/prose cannot yet be reauthorized.
+ * fresh → return; TTL-stale → return stale NOW + refresh behind the request.
+ *
+ * IDENTITY IS THE ONLY COLD MISS among the Slack revisions (AIO-1170 pre-activation correction
+ * PA-4). A row whose DATA or PRESENTATION generation lags is still served — marked stale, with its
+ * model prose removed, behind one spaced background refresh — but only while the team has a current
+ * Slack source and the row is inside the maximum stale age. An identity mismatch, a changed item
+ * fingerprint, a missing source or an over-age row is a cold inline rebuild, exactly as before.
  * Deliberately NO 48h empty-clobber guard
  * (unlike arcs): the timeline is a FACTUAL ledger built from Postgres (no flaky LLM), so an empty
  * result is the truth of a quiet week — pinning last week's work would be misleading. A stale row is
@@ -113,6 +119,26 @@ const TTL_MS = 5 * 60_000; // 5-min freshness; the ledger is cheap, so refresh o
 /** The same TTL, exported: it's the threshold that decides `freshness.stale`, so a consumer reasoning
  *  about staleness must be able to read the number rather than re-declare it (H6's drift shape). */
 export const TIMELINE_TTL_MS = TTL_MS;
+
+/** A positive whole number of milliseconds from the environment, or the fallback. */
+function positiveMs(raw: string | undefined, fallback: number): number {
+  const parsed = Number(raw);
+  return raw !== undefined && raw.trim() !== "" && Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+/**
+ * How often ONE cache key may start a background refresh because its row LAGS a Slack generation.
+ * Under sustained ingestion every read of a polling dashboard finds the row lagging again; without
+ * this each of them would buy a rebuild and a model summary pass. Defaults to the TTL, which is how
+ * often the age-stale branch already fires.
+ */
+export const TIMELINE_REFRESH_SPACING_MS = positiveMs(process.env.TIMELINE_REFRESH_SPACING_MS, TTL_MS);
+/**
+ * The oldest BUILD a generation-lagging read may reuse; past it the read rebuilds cold. It bounds
+ * reuse of an old cached build under ingestion that never pauses — it is not a claim about how far
+ * behind the source the ingestion itself is. Measured from the row's `computed_at`, which a hit or a
+ * failed refresh never moves.
+ */
+export const TIMELINE_MAX_STALE_AGE_MS = positiveMs(process.env.TIMELINE_MAX_STALE_AGE_MS, 15 * 60_000);
 // Bump when the TimelineDay[] SHAPE changes: a cached row from an older deploy is then treated as a
 // cache MISS (rebuilt), so the panel never renders a stale wrong shape. `summary` was ADDITIVE + optional
 // (no bump — a v3 row renders fine). v4 adds a REQUIRED `PersonDay.signals[]` (the Context lane): an old
@@ -247,9 +273,50 @@ const SALVAGE_MAX_AGE_MS = 48 * 3_600_000;
  */
 export const MIN_SALVAGEABLE_VERSION = 17;
 
+/** EXACT equality of all three stamps. This is the synopsis salvage's rule and the fresh hit's. It
+ *  is deliberately NOT what publication or generation-lag reuse ask (`sameIdentity` below): loosening
+ *  those must never loosen which prose may be carried forward. */
 const sameGenerations = (a: SlackTeamGenerations, b: SlackTeamGenerations): boolean =>
   a.dataGeneration === b.dataGeneration && a.identityGeneration === b.identityGeneration &&
   a.presentationGeneration === b.presentationGeneration;
+
+/** The one Slack revision that is a hard boundary everywhere: who a message is credited to. */
+const sameIdentity = (a: SlackTeamGenerations, b: SlackTeamGenerations): boolean =>
+  a.identityGeneration === b.identityGeneration;
+
+/**
+ * Where a stamped entry stands against the LIVE authorities, both of which the caller read
+ * successfully a moment ago:
+ *   · `refused`  — identity moved, or the reader's current item visibility differs. Never served.
+ *   · `exact`    — every stamp matches. An ordinary hit.
+ *   · `lagging`  — only data and/or presentation moved. Reusable as STALE, and only under the
+ *                  source and age guards in `getCachedWorkTimeline`.
+ */
+type Standing = "refused" | "exact" | "lagging";
+function standingOf(
+  stamped: SlackTeamGenerations, stampedItems: string | null,
+  current: SlackTeamGenerations, currentItems: string
+): Standing {
+  if (stampedItems !== currentItems || !sameIdentity(stamped, current)) return "refused";
+  return sameGenerations(stamped, current) ? "exact" : "lagging";
+}
+
+/**
+ * The same days with every model `summary` OMITTED (the key absent, as the payload shape requires).
+ * Prose was written about the ledger as it stood at the row's own generations; once data or
+ * presentation has moved it cannot be vouched for, so a lagging response carries facts only.
+ */
+function withoutSummaries(days: TimelineDay[]): TimelineDay[] {
+  return days.map((day) => ({
+    ...day,
+    people: day.people.map((person) => {
+      if (!("summary" in person)) return person;
+      const facts = { ...person };
+      delete facts.summary;
+      return facts;
+    }),
+  }));
+}
 
 /** Membership can close without changing either the project-set key or a Slack generation. */
 const fingerprintItems = (ids: ReadonlySet<string>): string =>
@@ -276,6 +343,11 @@ function payloadGenerations(payload: unknown): SlackTeamGenerations | null {
 const currentGenerations = (db: DbClient, teamId: string): Promise<SlackTeamGenerations> =>
   runContextTransaction(db, (session) => readSlackTeamGenerations(session, teamId));
 
+/** The prerequisite for reusing a generation-lagging build: a successful, live read showing an
+ *  enabled integration with a verified binding. A read failure REJECTS — it is never `true`. */
+const sourceIsCurrent = (db: DbClient, teamId: string): Promise<boolean> =>
+  runContextTransaction(db, (session) => teamHasCurrentSlackSource(session, teamId));
+
 /** `${date}|${memberId}` → that person-day's synopsis. */
 export type SalvagedSummaries = Map<string, string>;
 
@@ -297,13 +369,17 @@ const salvageKey = (date: string, memberId: string): string => `${date}|${member
  */
 export function salvageSummaries(
   payload: unknown, computedAtMs: number, nowMs: number, generations: SlackTeamGenerations,
-  itemFingerprint?: string
+  itemFingerprint: string
 ): SalvagedSummaries {
   const out: SalvagedSummaries = new Map();
   if (!Number.isFinite(computedAtMs) || nowMs - computedAtMs > SALVAGE_MAX_AGE_MS) return out;
+  // STRICT, and it stays strict: all three generations must match exactly. Publication and
+  // generation-lag reuse tolerate a data or presentation lag; carried prose never does.
   const stamped = payloadGenerations(payload);
   if (!stamped || !sameGenerations(stamped, generations)) return out;
-  if (itemFingerprint !== undefined && payloadItemFingerprint(payload) !== itemFingerprint) return out;
+  // REQUIRED. It was once an optional trailing argument, so a caller that left it off salvaged
+  // prose with no access check at all; an absent, empty or unstamped fingerprint now salvages nothing.
+  if (!itemFingerprint || payloadItemFingerprint(payload) !== itemFingerprint) return out;
   // A payload with no readable `v` predates versioning (or is corrupt) — treat it as too old to trust,
   // the same direction as every other unprovable case in this change.
   // `Number.isFinite`, not `typeof === "number"`: `NaN < 11` is false, so a NaN version would sail
@@ -376,6 +452,10 @@ const refreshing = new Map<string, Promise<void>>();
 // Keys whose inputs changed WHILE a rebuild was in flight — that rebuild's result is already stale, so
 // one more pass runs when it finishes (trailing edge). Without this a mid-rebuild bust is lost.
 const dirty = new Set<string>();
+// When each key last STARTED a refresh because its row lagged a Slack generation (epoch ms). Only
+// that branch reads or writes it: the age-stale branch and a cold miss keep their own cadence, so a
+// re-attribution bust is never held back by a refresh that ran for a different reason.
+const lastLagRefresh = new Map<string, number>();
 
 const memKey = (teamId: string, groupKey: string): string => `${teamId}:${groupKey}`;
 
@@ -441,6 +521,25 @@ async function readTimelineCacheAtSnapshot(
   current: SlackTeamGenerations,
   currentItems: string
 ): Promise<CacheEntry | null> {
+  // EXACT stamps only. A lagging row is a different question with its own guards, and this is also
+  // what the public `readTimelineCache` answers.
+  const row = await readStampedRowAtSnapshot(db, teamId, variant, current, currentItems);
+  return row && !row.lagging ? row.entry : null;
+}
+
+/**
+ * The persisted row for one variant, with where it stands against the live snapshot: an EXACT row,
+ * or one LAGGING only in data/presentation. A row whose identity generation or item fingerprint
+ * differs, an unstamped row and a foreign version are all `null` — never returned for reuse.
+ * Whether a lagging row may actually be served is NOT decided here (source and age guards).
+ */
+async function readStampedRowAtSnapshot(
+  db: DbClient,
+  teamId: string,
+  variant: TimelineVariant,
+  current: SlackTeamGenerations,
+  currentItems: string
+): Promise<{ entry: CacheEntry; lagging: boolean } | null> {
   try {
     const row = await readTimelineCacheRow(db, teamId, viewKey(variant));
     if (!row) return null;
@@ -448,16 +547,19 @@ async function readTimelineCacheAtSnapshot(
     // MISS so the caller rebuilds (never render a stale wrong shape).
     const p = row.payload as { v?: number; days?: unknown } | null;
     const stamped = payloadGenerations(p);
-    if (!p || p.v !== PAYLOAD_VERSION || !Array.isArray(p.days) ||
-        !stamped || !sameGenerations(stamped, current) ||
-        payloadItemFingerprint(p) !== currentItems) return null;
+    if (!p || p.v !== PAYLOAD_VERSION || !Array.isArray(p.days) || !stamped) return null;
+    const standing = standingOf(stamped, payloadItemFingerprint(p), current, currentItems);
+    if (standing === "refused") return null;
     const days = p.days as TimelineDay[];
     const at =
       typeof row.computed_at === "string" ? Date.parse(row.computed_at) : new Date(row.computed_at).getTime();
     // `=== true` so a row written before the column existed reads false — "no evidence of degradation",
     // not "verified good". Defaulting the other way would mark every pre-migration team's ledger bad.
-    return { days, at: Number.isFinite(at) ? at : 0, degraded: row.degraded === true,
-      generations: stamped, itemFingerprint: currentItems };
+    return {
+      entry: { days, at: Number.isFinite(at) ? at : 0, degraded: row.degraded === true,
+        generations: stamped, itemFingerprint: currentItems },
+      lagging: standing === "lagging",
+    };
   } catch {
     return null;
   }
@@ -510,6 +612,35 @@ export async function writeTimelineCache(
   }
   const expected = generations ?? await currentGenerations(db, teamId);
   const expectedItems = itemFingerprint ?? await currentItemFingerprint(db, teamId, variant);
+  // STRICT for this exported writer, as it always was: any moved revision refuses the write. Only
+  // the cache's own two build paths pass `tolerateLag`.
+  const published = await publishUnderGenerationLock(db, teamId, days, degraded, variant, expected,
+    expectedItems, false);
+  return published === null ? null : published.at;
+}
+
+/**
+ * The ONE compare-and-set every publication goes through, under the generation row lock.
+ *
+ * IDENTITY AND THE ITEM FINGERPRINT ARE STRICT for every caller: an overtake by either refuses the
+ * write (`null`), because the build credits or names something the reader may no longer be shown.
+ *
+ * With `tolerateLag`, a build overtaken ONLY in data and/or presentation IS written — stamped with
+ * `expected`, the generations it actually read, never the later ones. That stamp is what keeps the
+ * tolerance honest: every reader compares it with a live read and can serve the row only as stale.
+ * `lagging` reports that the overtake was observed here, so the build path that asked can treat its
+ * own result the same way instead of handing it back as fresh.
+ */
+async function publishUnderGenerationLock(
+  db: DbClient,
+  teamId: string,
+  days: TimelineDay[],
+  degraded: boolean,
+  variant: TimelineVariant,
+  expected: SlackTeamGenerations,
+  expectedItems: string,
+  tolerateLag: boolean
+): Promise<{ at: number; lagging: boolean } | null> {
   return runContextTransaction(db, async (session) => {
     await session.executeSql(
       `insert into slack_team_state (team_id) values ($1) on conflict (team_id) do nothing`,
@@ -528,7 +659,9 @@ export async function writeTimelineCache(
       dataGeneration: row.data_generation, identityGeneration: row.identity_generation,
       presentationGeneration: row.presentation_generation,
     };
-    if (!sameGenerations(expected, current)) return null;
+    if (!sameIdentity(expected, current)) return null;
+    const lagging = !sameGenerations(expected, current);
+    if (lagging && !tolerateLag) return null;
     if (await currentItemFingerprint(session.db, teamId, variant) !== expectedItems) return null;
     let result: { rows: { computed_at: string | Date }[] };
     try {
@@ -546,7 +679,7 @@ export async function writeTimelineCache(
     }
     const at = result.rows[0]?.computed_at;
     if (!at) throw new CachePublicationError(new Error("timeline cache publication returned no row"));
-    return at instanceof Date ? at.getTime() : Date.parse(at);
+    return { at: at instanceof Date ? at.getTime() : Date.parse(at), lagging };
   });
 }
 
@@ -685,17 +818,23 @@ function refreshInBackground(teamId: string, view: TimelineView): void {
           const before = await currentGenerations(bg, teamId);
           const built = await buildTimeline(bg, teamId, view);
           const after = await currentGenerations(bg, teamId);
-          if (!sameGenerations(before, after) ||
+          // STRICT: a build overtaken by an identity change or by the reader's item visibility is
+          // discarded and rebuilt. A build overtaken ONLY by data or presentation is not — under
+          // sustained ingestion that would be every build — and goes on to be published below.
+          if (!sameIdentity(before, after) ||
               await currentItemFingerprint(bg, teamId, view) !== built.itemFingerprint) continue;
-          const at = await writeTimelineCache(bg, teamId, view.admission.posture, built.days, built.degraded,
-            view, before, built.itemFingerprint);
-          if (at === null) continue;
+          // Stamped with `before`, the generations this build READ. If it was overtaken, the row
+          // says so by lagging, the next read serves it as stale and refreshes again, and the
+          // sequence converges on the first build that nothing overtakes.
+          const publication = await publishUnderGenerationLock(bg, teamId, built.days, built.degraded,
+            view, before, built.itemFingerprint, true);
+          if (publication === null) continue;
           // A close committed after publication is still rejected by the next hit's live fingerprint.
-          mem.set(key, { days: built.days, at, degraded: built.degraded, generations: before,
+          mem.set(key, { days: built.days, at: publication.at, degraded: built.degraded, generations: before,
             itemFingerprint: built.itemFingerprint });
           published = true;
         }
-        if (!published) throw new Error("timeline background build overtaken by source or item visibility twice");
+        if (!published) throw new Error("timeline background build overtaken by identity or item visibility twice");
       } while (dirty.has(key));
     } catch (err) {
       console.error("[timeline] background refresh failed:", err instanceof Error ? err.message : err);
@@ -735,8 +874,15 @@ export interface CachedTimeline {
  *   1. matching fresh in-memory → return instantly;
  *   2. Postgres `work_timeline_cache` — matching fresh → return; matching TTL-stale → return stale NOW
  *      + rebuild behind the request;
- *   3. cold miss (incl. a revision mismatch or an unstamped row) → build inline, then publish under
- *      the generation row lock.
+ *   3. GENERATION LAG (PA-4) — a row, persisted or held in memory, whose identity generation and item
+ *      fingerprint match but whose data and/or presentation generation is behind → return it marked
+ *      stale, WITHOUT model prose, and start at most one refresh per refresh spacing — but only while
+ *      the team has a current Slack source and the build is inside the maximum stale age;
+ *   4. cold miss (an identity or item-visibility mismatch, an unstamped row, a lagging row that fails
+ *      either guard above) → build inline, then publish under the generation row lock.
+ * The staleness in (3) is on the freshness envelope. Only the team-work route puts that envelope on
+ * the wire; the timeline route, the v1 route and the panel drop it, so nothing here makes a lagging
+ * row LOOK stale to a person.
  * The one reader every surface calls (panel, `/api/v1/timeline`). Access is enforced inside the
  * builder (membership filters + the reader's provenance ctx), so this is safe with `adminClient`.
  *
@@ -767,38 +913,70 @@ export async function getCachedWorkTimeline(
   const generations = await currentGenerations(db, teamId);
   const itemFingerprint = await currentItemFingerprint(db, teamId, view);
 
+  // A memory entry is judged against the SAME live snapshot as the row. Identity or item visibility
+  // moved → gone. Data/presentation moved → kept aside as a lagging candidate, never returned here.
+  let heldLagging: CacheEntry | null = null;
   const cached = mem.get(key);
-  if (cached && sameGenerations(cached.generations, generations) &&
-      cached.itemFingerprint === itemFingerprint && now - cached.at < TTL_MS) {
-    return { days: cached.days, freshness: freshness(cached.at, TTL_MS, { now, degraded: cached.degraded }) };
+  if (cached) {
+    const standing = standingOf(cached.generations, cached.itemFingerprint, generations, itemFingerprint);
+    if (standing === "exact" && now - cached.at < TTL_MS) {
+      return { days: cached.days, freshness: freshness(cached.at, TTL_MS, { now, degraded: cached.degraded }) };
+    }
+    if (standing === "refused") mem.delete(key);
+    else if (standing === "lagging") heldLagging = cached;
   }
-  if (cached && (!sameGenerations(cached.generations, generations) ||
-      cached.itemFingerprint !== itemFingerprint)) mem.delete(key);
 
   // The SNAPSHOT reader, not the public `readTimelineCache`: the two live authorities were already
   // read above for the memory hit, and re-reading them here could validate the row against a newer
   // snapshot than the one the memory branch rejected.
-  const persisted = await readTimelineCacheAtSnapshot(db, teamId, view, generations, itemFingerprint);
-  if (persisted) {
-    mem.set(key, persisted);
+  const persisted = await readStampedRowAtSnapshot(db, teamId, view, generations, itemFingerprint);
+  if (persisted && !persisted.lagging) {
+    mem.set(key, persisted.entry);
     // ONE envelope for both the fresh and the stale branch — `freshness()` derives `stale` from the same
     // age comparison the branch below makes, so the reported staleness cannot disagree with the decision
     // actually taken (they were two separate readings of the clock in every earlier draft of this).
     // The PERSISTED verdict — so a reader who didn't do the work still learns the prose is missing.
-    const f = freshness(persisted.at, TTL_MS, { now, degraded: persisted.degraded });
-    if (!f.stale) return { days: persisted.days, freshness: f };
+    const f = freshness(persisted.entry.at, TTL_MS, { now, degraded: persisted.entry.degraded });
+    if (!f.stale) return { days: persisted.entry.days, freshness: f };
     refreshInBackground(teamId, view); // stale → serve stale, rebuild behind the request
-    return { days: persisted.days, freshness: f };
+    return { days: persisted.entry.days, freshness: f };
   }
+
+  // GENERATION LAG. Identity and the reader's item visibility already matched the live snapshot, or
+  // neither candidate would be here; only data and/or presentation is behind. The persisted row is
+  // preferred (another process may have published a newer build); the entry this process holds is
+  // the fallback. Reuse needs BOTH guards:
+  //   · AGE — the build itself is no older than the maximum stale age. `at` is the row's
+  //     `computed_at`, which no hit and no failed refresh ever moves.
+  //   · SOURCE — a successful live read shows an enabled integration with a verified binding. It is
+  //     read only here, so an exact hit never pays for it; a failed read rejects rather than passing.
+  const lagging = persisted?.entry ?? heldLagging;
+  if (lagging && now - lagging.at <= TIMELINE_MAX_STALE_AGE_MS && await sourceIsCurrent(db, teamId)) {
+    mem.set(key, lagging);
+    // SPACED: one refresh per key per spacing, however many readers find the row lagging. Decided and
+    // recorded with no await in between, so concurrent lagging reads start exactly one.
+    if (now - (lastLagRefresh.get(key) ?? Number.NEGATIVE_INFINITY) >= TIMELINE_REFRESH_SPACING_MS) {
+      lastLagRefresh.set(key, now);
+      refreshInBackground(teamId, view);
+    }
+    // `stale` is stated, not derived: the row may be seconds old. Prose is dropped on EVERY lagging
+    // response; the refreshed build restores it.
+    return {
+      days: withoutSummaries(lagging.days),
+      freshness: freshness(lagging.at, TTL_MS, { now, degraded: lagging.degraded, stale: true }),
+    };
+  }
+  // Too old, or no current source: not reusable from either layer.
+  if (heldLagging) mem.delete(key);
 
   // Cold miss — return the PURE ledger FAST (no inline LLM), persist it so there's always a row, then
   // add the per-person-day synopsis in the background. The first viewer sees the timeline immediately;
   // summaries appear on the next view once the background pass writes them (kept off the request path so
   // a big team's fan-out can't blow the page / route budget).
-  // A Slack revision or item-fingerprint mismatch also comes here. Until the source-status and
-  // per-item reauthorization path can prove stale Slack evidence safe, rebuild inline instead of
-  // serving the old row through SWR. One retry handles a concurrent publisher/remap; repeated
-  // movement is an actionable error.
+  // An identity or item-fingerprint mismatch also comes here, as does a lagging row that failed the
+  // source or age guard. One retry handles a concurrent remap or visibility change; repeated movement
+  // of EITHER is an actionable error. A build overtaken only by data or presentation is not retried
+  // for that — see below — so an identity correction no longer fails because a backfill is running.
   for (let attempt = 0; attempt < 2; attempt++) {
     const before = attempt === 0 ? generations : await currentGenerations(db, teamId);
     const enforcement = await buildEnforcement(db, teamId, view);
@@ -820,34 +998,67 @@ export async function getCachedWorkTimeline(
       built, await readSalvageableSummaries(db, teamId, viewKey(view), before, builtItems)
     );
     const after = await currentGenerations(db, teamId);
-    if (!sameGenerations(before, after) ||
+    // STRICT: identity or the reader's item visibility moved under this build → discard and retry.
+    if (!sameIdentity(before, after) ||
         await currentItemFingerprint(db, teamId, view) !== builtItems) continue;
-    let at: number | null;
+    // TOLERATED, under the same guard as any other lagging payload: only data and/or presentation
+    // moved. With a current source this build may be published under its own `before` stamps and
+    // returned as STALE; without one there is nothing that makes a lagging payload reusable, so it is
+    // rebuilt like before. Permission to publish is never permission to call the result fresh.
+    let overtaken = !sameGenerations(before, after);
+    if (overtaken && !(await sourceIsCurrent(db, teamId))) continue;
+    // What is stored: no prose at all once an overtake is already known.
+    const stored = overtaken ? withoutSummaries(days) : days;
+    let publication: { at: number; lagging: boolean } | null;
     try {
       // PERSISTED as degraded, not just reported. The row this writes is what the next reader gets,
       // and its prose is either absent or salvaged — so the flag has to live on the row or the very
       // next request hands the same partial ledger over as healthy. Self-healing: the background pass
       // below rewrites the row with the real verdict once summaries land.
-      at = await writeTimelineCache(db, teamId, posture, days, true, view, before, builtItems);
+      publication = await publishUnderGenerationLock(db, teamId, stored, true, view, before, builtItems, true);
     } catch (error) {
       if (!cachePayloadWriteFailed(error)) throw error;
       // Only cache publication is optional. Re-read both authorities after the failed write;
       // a true concurrent change still needs the retry instead of an obsolete response.
-      if (!sameGenerations(before, await currentGenerations(db, teamId)) ||
+      const latest = await currentGenerations(db, teamId);
+      if (!sameIdentity(before, latest) ||
           await currentItemFingerprint(db, teamId, view) !== builtItems) continue;
+      if (!overtaken && !sameGenerations(before, latest)) {
+        overtaken = true;
+        if (!(await sourceIsCurrent(db, teamId))) continue;
+      }
       console.warn("[timeline] cache publication skipped:", error instanceof Error ? error.message : error);
-      return { days, freshness: freshness(Date.now(), TTL_MS, { degraded: true }) };
+      return {
+        days: overtaken ? withoutSummaries(days) : days,
+        freshness: freshness(Date.now(), TTL_MS, { degraded: true, stale: overtaken }),
+      };
     }
-    if (at === null) continue;
-    mem.set(key, { days, at, degraded: true, generations: before, itemFingerprint: builtItems });
+    if (publication === null) continue; // identity or item visibility moved before the row lock
+    if (publication.lagging && !overtaken) {
+      // The overtake landed between the check above and the row lock. The row is written, honestly
+      // stamped; whether THIS response may be that lagging payload is still the source guard's call.
+      overtaken = true;
+      if (!(await sourceIsCurrent(db, teamId))) continue;
+    }
+    const at = publication.at;
+    mem.set(key, { days: stored, at, degraded: true, generations: before, itemFingerprint: builtItems });
+    // An overtaken build's follow-up IS this key's lag refresh, so it takes the spacing slot.
+    if (overtaken) lastLagRefresh.set(key, Date.now());
     refreshInBackground(teamId, view);
     // DEGRADED, deliberately. A cold miss returns the pure ledger: its per-person-day synopses are
     // either absent (the background pass hasn't run) or SALVAGED from an older payload version. Both
     // are "this is real work data with prose that wasn't computed for it", which is precisely the
-    // plausible-but-partial state R2 exists to name. Freshly computed, so `stale` is false — the two
-    // flags are independent, and this is the case that proves it: newest possible payload, least
-    // trustworthy prose.
-    return { days, freshness: freshness(at, TTL_MS, { now: at, degraded: true }) };
+    // plausible-but-partial state R2 exists to name. `stale` is false for a build nothing overtook —
+    // the two flags are independent, and this is the case that proves it: newest possible payload,
+    // least trustworthy prose. An OVERTAKEN build is stale by statement and carries no prose at all,
+    // exactly as the next reader of the row it just wrote will be told.
+    return {
+      days: overtaken ? withoutSummaries(days) : days,
+      freshness: freshness(at, TTL_MS, { now: at, degraded: true, stale: overtaken }),
+    };
   }
-  throw new Error("timeline build overtaken by source or item visibility twice; retry the request");
+  throw new Error(
+    "timeline build overtaken twice by an identity or item-visibility change (or, with no current " +
+      "Slack source, a data change); retry the request"
+  );
 }

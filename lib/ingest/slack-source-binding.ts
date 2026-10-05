@@ -279,6 +279,37 @@ export function slackBindingRef(selection: SlackSelection): SlackBindingRef {
   };
 }
 
+/**
+ * Whether the team has a CURRENT Slack source: at least one integration that is enabled AND whose
+ * binding is verified (AIO-1170 pre-activation correction PA-4).
+ *
+ * ⚠️ WHAT IT IS FOR, AND WHAT IT IS NOT. It is the timeline cache's prerequisite for reusing a row
+ * whose Slack data or presentation generation lags: with no live source there is nothing coming to
+ * refresh that row, so it must not be served on the promise of one. It is an aggregate fact about
+ * the team — not authorization for any evidence row, and not a substitute for item access, public
+ * state or deletion checks, all of which stay where they are.
+ *
+ * LOCK-FREE AND TOKEN-FREE, unlike `lockSlackSelection`: no `for update` (a cache read must not
+ * serialize against an integration edit) and no secret column (nothing here needs a credential).
+ * A SQL failure rejects, and `false` can only mean the read succeeded and found none — an
+ * unreadable source must never pass as a current one.
+ */
+export async function teamHasCurrentSlackSource(session: TransactionSession, teamId: string): Promise<boolean> {
+  assertUuid("teamId", teamId);
+  const { rows } = await session.executeSql<{ has_source: boolean }>(
+    `select exists (
+              select 1
+                from integrations i
+                join slack_integration_bindings b
+                  on b.team_id = i.team_id and b.integration_id = i.id
+               where i.team_id = $1 and i.type = 'slack' and i.status = 'enabled'
+                 and b.state = 'verified'
+            ) as has_source`,
+    [teamId]
+  );
+  return rows[0]?.has_source === true;
+}
+
 // ── the writes ───────────────────────────────────────────────────────────────
 
 /**
