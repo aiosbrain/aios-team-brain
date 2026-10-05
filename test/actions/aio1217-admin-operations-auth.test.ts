@@ -215,9 +215,9 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
  * one sequence, so "nothing else happened" is an equality, not missing spies.
  *
  * Each refusal first runs the admitted control in the same test, then clears the ledger and every
- * recording and restores the healthy rows and vault. A refusal then removes ONE conjunct — from the
- * request's session or from the healthy rows — and keeps every lower owner armed to succeed: had the
- * gate admitted the call, the ledger and the vault would show it.
+ * recording and restores the healthy rows, vault and desk. A refusal then removes ONE conjunct — from
+ * the request's session or from the healthy rows — and keeps every lower owner armed to succeed: had
+ * the gate admitted the call, the ledger, the vault and the desk would show it.
  *
  * Bounds of what is claimed.
  *   - Seven selected exports only (five ADM, two member-tier). Not a census, not final acceptance of
