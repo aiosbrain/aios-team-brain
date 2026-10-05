@@ -452,10 +452,18 @@ const refreshing = new Map<string, Promise<void>>();
 // Keys whose inputs changed WHILE a rebuild was in flight — that rebuild's result is already stale, so
 // one more pass runs when it finishes (trailing edge). Without this a mid-rebuild bust is lost.
 const dirty = new Set<string>();
-// When each key last STARTED a refresh because its row lagged a Slack generation (epoch ms). Only
-// that branch reads or writes it: the age-stale branch and a cold miss keep their own cadence, so a
-// re-attribution bust is never held back by a refresh that ran for a different reason.
-const lastLagRefresh = new Map<string, number>();
+// Each key's LAG-REFRESH SLOT: when it last started a refresh because its row lagged a Slack
+// generation (`startedAt`, epoch ms), and the newest build this process has seen for it since
+// (`newestAt`, the row's `computed_at`). The age-stale branch and a cold miss keep their own cadence.
+//
+// ⚠️ A BUST MUST BEAT THE SLOT. `bustTeamTimeline` is the backstop behind a re-attribution or a tier
+// reclassification that bumps no Slack generation; a busted row that also lags comes down the lag
+// branch, and a slot spent moments earlier would hold the correction back for a whole spacing. Two
+// things void it: the bust itself clears this process's slots for the team, and — for a bust that
+// ran in ANOTHER process — a row whose `computed_at` is OLDER than one already seen here can only
+// have been re-dated by a bust (a build only ever moves it forward). What that cannot see is a bust
+// of a row already past the stale mark, which leaves the stamp untouched; that case waits one spacing.
+const lagRefresh = new Map<string, { startedAt: number; newestAt: number }>();
 
 const memKey = (teamId: string, groupKey: string): string => `${teamId}:${groupKey}`;
 
@@ -468,12 +476,16 @@ async function readTimelineCacheRow(
   teamId: string,
   groupKey: string
 ): Promise<{ payload: unknown; computed_at: string | Date; degraded?: boolean | null } | null> {
-  const { data } = await db
+  const { data, error } = await db
     .from("work_timeline_cache")
     .select("payload, computed_at, degraded")
     .eq("team_id", teamId)
     .eq("group_key", groupKey)
     .maybeSingle();
+  // THROWN, so `null` means exactly one thing: the read succeeded and there is no row. A failed read
+  // and a withdrawn row call for different answers (see `readStampedRowAtSnapshot`), and both callers
+  // already treat a throw as "no usable row".
+  if (error) throw new Error(`timeline cache row read failed: ${error.message}`);
   return (data as { payload: unknown; computed_at: string | Date; degraded?: boolean | null } | null) ?? null;
 }
 
@@ -524,44 +536,56 @@ async function readTimelineCacheAtSnapshot(
   // EXACT stamps only. A lagging row is a different question with its own guards, and this is also
   // what the public `readTimelineCache` answers.
   const row = await readStampedRowAtSnapshot(db, teamId, variant, current, currentItems);
-  return row && !row.lagging ? row.entry : null;
+  return row.state === "row" && !row.lagging ? row.entry : null;
 }
 
 /**
- * The persisted row for one variant, with where it stands against the live snapshot: an EXACT row,
- * or one LAGGING only in data/presentation. A row whose identity generation or item fingerprint
- * differs, an unstamped row and a foreign version are all `null` — never returned for reuse.
- * Whether a lagging row may actually be served is NOT decided here (source and age guards).
+ * What the persisted row for one variant is, against the live snapshot:
+ *   · `row`      — usable: EXACT, or LAGGING only in data/presentation. Whether a lagging row may
+ *                  actually be served is NOT decided here (source and age guards).
+ *   · `absent`   — the read SUCCEEDED and there is no row. A row is hard-deleted because its payload
+ *                  is no longer allowed to be served, so this is the one answer that also withdraws
+ *                  a copy of it held in another process's memory.
+ *   · `unusable` — everything else: the read failed, or the row is there but may not be reused (a
+ *                  foreign version, unstamped, or refused on identity/item visibility). A cache-row
+ *                  read is best-effort, so this is a miss — and, unlike `absent`, says nothing about
+ *                  an entry the caller already validated itself.
  */
+type StampedRow =
+  | { state: "row"; entry: CacheEntry; lagging: boolean }
+  | { state: "absent" }
+  | { state: "unusable" };
+
 async function readStampedRowAtSnapshot(
   db: DbClient,
   teamId: string,
   variant: TimelineVariant,
   current: SlackTeamGenerations,
   currentItems: string
-): Promise<{ entry: CacheEntry; lagging: boolean } | null> {
+): Promise<StampedRow> {
   try {
     const row = await readTimelineCacheRow(db, teamId, viewKey(variant));
-    if (!row) return null;
+    if (!row) return { state: "absent" };
     // Payload is `{ v, days }`. A missing/older version = a shape from a previous deploy → treat as a
     // MISS so the caller rebuilds (never render a stale wrong shape).
     const p = row.payload as { v?: number; days?: unknown } | null;
     const stamped = payloadGenerations(p);
-    if (!p || p.v !== PAYLOAD_VERSION || !Array.isArray(p.days) || !stamped) return null;
+    if (!p || p.v !== PAYLOAD_VERSION || !Array.isArray(p.days) || !stamped) return { state: "unusable" };
     const standing = standingOf(stamped, payloadItemFingerprint(p), current, currentItems);
-    if (standing === "refused") return null;
+    if (standing === "refused") return { state: "unusable" };
     const days = p.days as TimelineDay[];
     const at =
       typeof row.computed_at === "string" ? Date.parse(row.computed_at) : new Date(row.computed_at).getTime();
     // `=== true` so a row written before the column existed reads false — "no evidence of degradation",
     // not "verified good". Defaulting the other way would mark every pre-migration team's ledger bad.
     return {
+      state: "row",
       entry: { days, at: Number.isFinite(at) ? at : 0, degraded: row.degraded === true,
         generations: stamped, itemFingerprint: currentItems },
       lagging: standing === "lagging",
     };
   } catch {
-    return null;
+    return { state: "unusable" };
   }
 }
 
@@ -689,12 +713,20 @@ async function publishUnderGenerationLock(
  * re-attribution (which changes who owns items → the timeline changes) alongside the arc bust. Stale =
  * `computed_at` just past the TTL (never epoch — same rationale as staleArcCache, though this layer has
  * no empty-clobber cap). Best-effort.
+ *
+ * ⚠️ IT ONLY EVER MOVES `computed_at` BACKWARDS. The maximum stale age is counted from that stamp, so
+ * re-dating a row that is ALREADY older than the stale mark would make an old build younger and
+ * reusable again, on every worker, at every bust. A row past the mark is already stale; it is left
+ * exactly as old as it is.
  */
 export async function bustTeamTimeline(db: DbClient, teamId: string): Promise<void> {
   // EVERY view of the team — the two tier rows AND all §5.8 visibility variants (their keys are not
   // enumerable from here, so sweep by prefix). The DB update below is already team-wide.
   const prefix = `${teamId}:`;
   for (const key of [...mem.keys()]) if (key.startsWith(prefix)) mem.delete(key);
+  // A bust beats the lag-refresh spacing: the next lagging read of any of this team's keys starts a
+  // refresh, whatever was started for them a moment ago (see `lagRefresh`).
+  for (const key of [...lagRefresh.keys()]) if (key.startsWith(prefix)) lagRefresh.delete(key);
   // Invalidate an ALREADY-RUNNING rebuild too. It read its inputs before this bust, so its result is
   // wrong the moment it lands — and it lands stamped `computed_at = now`, which would make the stale
   // payload look FRESH and suppress the next read's refresh entirely (the re-attribution would then be
@@ -702,7 +734,10 @@ export async function bustTeamTimeline(db: DbClient, teamId: string): Promise<vo
   for (const key of refreshing.keys()) if (key.startsWith(prefix)) dirty.add(key);
   try {
     const staleAt = new Date(Date.now() - TTL_MS - 60_000).toISOString();
-    await db.from("work_timeline_cache").update({ computed_at: staleAt }).eq("team_id", teamId);
+    // The comparison is the DATABASE's, in the same statement as the write: only a row YOUNGER than
+    // the mark is moved, so two workers busting at once still cannot move any row forward.
+    await db.from("work_timeline_cache").update({ computed_at: staleAt })
+      .eq("team_id", teamId).gt("computed_at", staleAt);
   } catch {
     // best-effort — the ledger still refreshes on its normal TTL if this fails
   }
@@ -747,6 +782,12 @@ export async function purgeTimelineCacheTier(
     const group = key.slice(teamId.length + 1);
     if (shapes.some((s) => ("exact" in s ? group === s.exact : group.startsWith(s.prefix)))) mem.delete(key);
   }
+  // …and their lag-refresh slots: a slot belongs to a row that no longer exists.
+  for (const key of [...lagRefresh.keys()]) {
+    if (!key.startsWith(`${teamId}:`)) continue;
+    const group = key.slice(teamId.length + 1);
+    if (shapes.some((s) => ("exact" in s ? group === s.exact : group.startsWith(s.prefix)))) lagRefresh.delete(key);
+  }
   // An in-flight rebuild of a purged key read pre-narrowing inputs: re-run it (trailing edge).
   for (const key of refreshing.keys()) {
     if (!key.startsWith(`${teamId}:`)) continue;
@@ -776,6 +817,7 @@ export async function purgeTimelineCacheTier(
 export async function purgeAdmissionTimelineNamespace(db: DbClient): Promise<{ ok: boolean; error?: string }> {
   const marker = `:${ADMISSION_NAMESPACE}:`;
   for (const key of [...mem.keys()]) if (key.includes(marker)) mem.delete(key);
+  for (const key of [...lagRefresh.keys()]) if (key.includes(marker)) lagRefresh.delete(key);
   for (const key of refreshing.keys()) if (key.includes(marker)) dirty.add(key);
   try {
     const { error } = await db.from("work_timeline_cache").delete().like("group_key", `${ADMISSION_NAMESPACE}:%`);
@@ -930,7 +972,7 @@ export async function getCachedWorkTimeline(
   // read above for the memory hit, and re-reading them here could validate the row against a newer
   // snapshot than the one the memory branch rejected.
   const persisted = await readStampedRowAtSnapshot(db, teamId, view, generations, itemFingerprint);
-  if (persisted && !persisted.lagging) {
+  if (persisted.state === "row" && !persisted.lagging) {
     mem.set(key, persisted.entry);
     // ONE envelope for both the fresh and the stale branch — `freshness()` derives `stale` from the same
     // age comparison the branch below makes, so the reported staleness cannot disagree with the decision
@@ -942,22 +984,39 @@ export async function getCachedWorkTimeline(
     return { days: persisted.entry.days, freshness: f };
   }
 
+  // A CONFIRMED-ABSENT row withdraws the copy held here. Rows are hard-deleted (the purges) because
+  // their payload may no longer be served, and a purge can only evict the memory of the process it
+  // runs in; the item fingerprint does not always notice (a legacy reader's is the empty set whatever
+  // is purged). So the held entry is the lag fallback ONLY when the row could not be read or used —
+  // never when the read succeeded and found nothing.
+  if (persisted.state === "absent" && heldLagging) {
+    mem.delete(key);
+    heldLagging = null;
+  }
+
   // GENERATION LAG. Identity and the reader's item visibility already matched the live snapshot, or
   // neither candidate would be here; only data and/or presentation is behind. The persisted row is
   // preferred (another process may have published a newer build); the entry this process holds is
   // the fallback. Reuse needs BOTH guards:
   //   · AGE — the build itself is no older than the maximum stale age. `at` is the row's
-  //     `computed_at`, which no hit and no failed refresh ever moves.
+  //     `computed_at`, which a build sets and a bust can only move BACKWARDS; no hit and no failed
+  //     refresh moves it at all.
   //   · SOURCE — a successful live read shows an enabled integration with a verified binding. It is
   //     read only here, so an exact hit never pays for it; a failed read rejects rather than passing.
-  const lagging = persisted?.entry ?? heldLagging;
+  const lagging = persisted.state === "row" ? persisted.entry : heldLagging;
   if (lagging && now - lagging.at <= TIMELINE_MAX_STALE_AGE_MS && await sourceIsCurrent(db, teamId)) {
     mem.set(key, lagging);
-    // SPACED: one refresh per key per spacing, however many readers find the row lagging. Decided and
-    // recorded with no await in between, so concurrent lagging reads start exactly one.
-    if (now - (lastLagRefresh.get(key) ?? Number.NEGATIVE_INFINITY) >= TIMELINE_REFRESH_SPACING_MS) {
-      lastLagRefresh.set(key, now);
+    // SPACED: one refresh per key per spacing, however many readers find the row lagging — unless
+    // the row was BUSTED since the slot was taken (a `computed_at` older than one already seen here;
+    // see `lagRefresh`), in which case the correction behind that bust is refreshed for now. Decided
+    // and recorded with no await in between, so concurrent lagging reads start exactly one either way.
+    const slot = lagRefresh.get(key);
+    const busted = slot !== undefined && lagging.at < slot.newestAt;
+    if (slot === undefined || busted || now - slot.startedAt >= TIMELINE_REFRESH_SPACING_MS) {
+      lagRefresh.set(key, { startedAt: now, newestAt: lagging.at });
       refreshInBackground(teamId, view);
+    } else if (lagging.at > slot.newestAt) {
+      slot.newestAt = lagging.at;
     }
     // `stale` is stated, not derived: the row may be seconds old. Prose is dropped on EVERY lagging
     // response; the refreshed build restores it.
@@ -1043,7 +1102,7 @@ export async function getCachedWorkTimeline(
     const at = publication.at;
     mem.set(key, { days: stored, at, degraded: true, generations: before, itemFingerprint: builtItems });
     // An overtaken build's follow-up IS this key's lag refresh, so it takes the spacing slot.
-    if (overtaken) lastLagRefresh.set(key, Date.now());
+    if (overtaken) lagRefresh.set(key, { startedAt: Date.now(), newestAt: at });
     refreshInBackground(teamId, view);
     // DEGRADED, deliberately. A cold miss returns the pure ledger: its per-person-day synopses are
     // either absent (the background pass hasn't run) or SALVAGED from an older payload version. Both
