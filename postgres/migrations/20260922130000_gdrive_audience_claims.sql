@@ -115,8 +115,12 @@ delete from project_context_units u
 where u.id in (select unit_id from gdrive_suppressed_units);
 
 -- External is the conservative inherited tier; approved project memberships remain the authority.
+-- Replay-idempotent: this file runs on every deploy, so only a row whose tier actually differs is
+-- written. An already-external claimed item keeps its `updated_at` and its row version — rewriting
+-- it would re-date unchanged content and hand it to every `updated_at`-based incremental pull.
 update items i set access='external', updated_at=now()
-where exists (select 1 from gdrive_item_claims c where c.team_id=i.team_id and c.item_id=i.id and c.active);
+where i.access is distinct from 'external'
+  and exists (select 1 from gdrive_item_claims c where c.team_id=i.team_id and c.item_id=i.id and c.active);
 
 update team_authorization_epochs e set epoch=e.epoch+1,updated_at=now()
 where e.team_id in (select team_id from gdrive_suppressed_teams);

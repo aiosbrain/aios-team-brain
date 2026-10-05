@@ -4,6 +4,7 @@ import { revalidatePath } from "next/cache";
 import { after } from "next/server";
 import { adminClient } from "@/lib/db/admin";
 import { reconcileAttribution, repairAttributionNow } from "@/lib/ingest/reconcile-attribution";
+import { describeManualRepair, reportRepairHandover } from "@/lib/ingest/attribution-repair-report";
 import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { linkGithub } from "@/lib/codebases/github";
 import { setMemberIdentity, removeMemberIdentity } from "@/lib/identity/member-identities";
@@ -29,11 +30,11 @@ function scheduleIdentityEffects(db: ReturnType<typeof adminClient>, teamId: str
       // mapping is not healthy-complete until both converge at the same current revision.
       //
       // This only accelerates. The mapping change already made both repairs durable; a budget that
-      // ends `continuing` (or a turn another owner holds) is carried on by the repair scheduler.
+      // ends `continuing` (or a turn another owner holds) is carried on by the repair scheduler —
+      // where one runs. The log line says which: on a copied-staging runtime nothing continues in
+      // the background, and an admin has to run the manual repair.
       const outcome = await repairAttributionNow(db, teamId, teamSlug, { maxBatches: 20 });
-      if (outcome.status === "continuing") {
-        console.info(`[attribution] repair for team ${teamId} is continuing in the background`);
-      }
+      reportRepairHandover(teamId, outcome);
     });
     return;
   }
@@ -209,18 +210,11 @@ export async function reattributeIdentitiesNow(
     // so a revision already marked complete is durably reopened and scanned again from the start.
     const s = await repairAttributionNow(adminClient(), ctx.teamId, teamSlug, { maxBatches: 100, request: true });
     revalidatePath(`/t/${teamSlug}/admin/members`);
-    const done = `Re-attributed ${s.updated} of ${s.scanned} item(s)${s.versionsUpdated ? ` + ${s.versionsUpdated} version(s)` : ""}`;
     // A spent budget or a turn another worker holds is not an error: the repair is durable and
-    // continues from where this left it. Say so rather than reporting a completion or a failure.
-    if (s.status === "continuing") {
-      return {
-        ok: true,
-        message: s.busy
-          ? "Re-attribution is already running for this team and is continuing in the background."
-          : `${done} so far; re-attribution is continuing in the background.`,
-      };
-    }
-    return { ok: true, message: `${done} to current identity mappings.` };
+    // resumes from where this left it. The message says so rather than reporting a completion or a
+    // failure — and says truthfully what resumes it: the background scheduler, or, where every
+    // in-process scheduler is suppressed (a copied-staging runtime), an admin running this again.
+    return { ok: true, message: describeManualRepair(s) };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "re-attribution failed" };
   }

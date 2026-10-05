@@ -276,6 +276,21 @@ describe("replay plan: a superseded data step", () => {
     expect(sql).not.toContain("insert into gdrive_suppressed_units");
   });
 
+  it("its claimed-tier update is replay-idempotent: only a row whose tier DIFFERS is written, under the unchanged active same-team claim condition", () => {
+    // This file replays on every deploy. Unpredicated, the update rewrote every claimed item each
+    // time — a new `updated_at` and row version for unchanged content, which every
+    // `updated_at`-based incremental pull then re-emits.
+    const tierUpdate = "update items i set access='external', updated_at=now() "
+      + "where i.access is distinct from 'external' "
+      + "and exists (select 1 from gdrive_item_claims c where c.team_id=i.team_id and c.item_id=i.id and c.active)";
+    const itemUpdates = (sql: string) => statements(sql).filter((s) => /^update (public\.)?items\b/.test(s));
+    expect(itemUpdates(raw())).toEqual([tierUpdate]);
+    // The supersession removes the legacy selection and nothing of this statement.
+    expect(itemUpdates(effectiveMigrationSql(entry.migration, raw()).sql)).toEqual([tierUpdate]);
+    // No other statement of the file writes `items`, so nothing else can re-date a claimed row.
+    expect(statements(raw()).filter((s) => /\b(insert into|delete from)\s+(public\.)?items\b/.test(s))).toEqual([]);
+  });
+
   it("the owner declares the step, replays after it, and never reads a claim table", () => {
     const names = rawMigrations().map((m) => m.name);
     expect(names.indexOf(entry.supersededBy)).toBeGreaterThan(names.indexOf(entry.migration));
