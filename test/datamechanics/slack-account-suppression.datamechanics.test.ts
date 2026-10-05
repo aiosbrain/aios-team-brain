@@ -274,3 +274,171 @@ describe("Slack account suppression (real Postgres)", () => {
     expect(rows.map((row) => row.external_id).sort()).toEqual(["TOTHER:UABC", "tspace:uabc"]);
   });
 });
+
+/**
+ * AIO-1170 pre-activation correction PA-5 — legacy CASE VARIANTS of one Slack account.
+ *
+ * The unique key is case-sensitive and the writer once matched exactly, so a team can hold `U0ABC`
+ * and `u0abc` as two live rows. Today's writer folds case and will not create that state, which is
+ * why these fixtures insert the rows directly: it is the only way to stand where such a team stands.
+ * From there unlinking either row threw and linking returned a conflict — no way out except SQL.
+ */
+async function legacyVariant(
+  teamId: string, memberId: string, externalId: string, handle = ""
+): Promise<{ id: string; member_id: string }> {
+  const { rows } = await runSql<{ id: string; member_id: string }>(
+    `insert into member_identities (team_id, member_id, provider, external_id, handle)
+          values ($1, $2, 'slack', $3, $4) returning id, member_id`,
+    [teamId, memberId, externalId, handle]);
+  return rows[0];
+}
+
+/** Every live Slack spelling the team holds, in byte order (`U0ABC` before `u0abc`). */
+async function liveSpellings(teamId: string): Promise<string[]> {
+  const { rows } = await runSql<{ external_id: string }>(
+    `select external_id from member_identities
+       where team_id = $1 and provider = 'slack' order by external_id collate "C"`, [teamId]);
+  return rows.map((row) => row.external_id);
+}
+
+/** Every Slack unlink fence the team holds, whatever its spelling. */
+async function fences(teamId: string): Promise<string[]> {
+  const { rows } = await runSql<{ external_id: string }>(
+    `select external_id from member_identity_suppressions
+       where team_id = $1 and provider = 'slack' order by external_id collate "C"`, [teamId]);
+  return rows.map((row) => row.external_id);
+}
+
+async function otherMember(teamId: string): Promise<string> {
+  return (await db().from("members").insert({ team_id: teamId, email: `other-${randomUUID()}@test.local`,
+    display_name: "Other", actor_handle: `other-${randomUUID().slice(0, 8)}`,
+    role: "member", tier: "team", status: "active" }).select("id").single()).data.id as string;
+}
+
+describe("Slack case-variant unlink (PA-5, real Postgres)", () => {
+  it.each([
+    { remove: "u0abc", keep: "U0ABC" },
+    { remove: "U0ABC", keep: "u0abc" },
+  ])("removes only the row spelled $remove and bumps the identity generation once (AC-PA-15)", async ({ remove, keep }) => {
+    const { teamId, memberId } = await seedTeam();
+    // Two DIFFERENT members, so "the right row went" is visible as whose mapping survived.
+    const rows: Record<string, { id: string; member_id: string }> = {
+      U0ABC: await legacyVariant(teamId, memberId, "U0ABC"),
+      u0abc: await legacyVariant(teamId, await otherMember(teamId), "u0abc"),
+    };
+    const before = await generation(teamId);
+
+    expect(await removeMemberIdentity(db(), teamId, { provider: "slack", externalId: remove }))
+      .toEqual({ removed: true });
+
+    expect(await liveSpellings(teamId)).toEqual([keep]);
+    // The survivor is the SAME row, still mapped to the member it was mapped to.
+    expect(await mapping(teamId, keep)).toEqual(rows[keep]);
+    expect(Number(await generation(teamId))).toBe(Number(before) + 1);
+  });
+
+  // NEGATIVE CONTROL, and a behavior kept on purpose: the exact-spelling rule is what makes the
+  // removal above safe, so a spelling that names NEITHER row must not be resolved by guessing.
+  it("still refuses a spelling that matches no row exactly, and changes nothing (AC-PA-16)", async () => {
+    const { teamId, memberId } = await seedTeam();
+    await legacyVariant(teamId, memberId, "U0ABC");
+    await legacyVariant(teamId, memberId, "u0abc");
+    const before = await generation(teamId);
+
+    await expect(removeMemberIdentity(db(), teamId, { provider: "slack", externalId: "U0abc" }))
+      .rejects.toThrow("multiple live case variants");
+
+    expect(await liveSpellings(teamId)).toEqual(["U0ABC", "u0abc"]);
+    expect(await fences(teamId)).toEqual([]);
+    expect(await generation(teamId)).toBe(before);
+  });
+
+  it("writes the fence when the LAST variant goes, and auto-sync recreates neither spelling (AC-PA-17a)", async () => {
+    const { teamId, memberId } = await seedTeam();
+    const email = await rosterEmail(teamId, memberId);
+    await legacyVariant(teamId, memberId, "U0ABC");
+    await legacyVariant(teamId, memberId, "u0abc");
+    const before = await generation(teamId);
+
+    expect(await removeMemberIdentity(db(), teamId, { provider: "slack", externalId: "u0abc" }))
+      .toEqual({ removed: true });
+    expect(await removeMemberIdentity(db(), teamId, { provider: "slack", externalId: "U0ABC" }))
+      .toEqual({ removed: true });
+
+    expect(await liveSpellings(teamId)).toEqual([]);
+    // ONE fence for the account, written by the removal that left nothing live.
+    expect(await fences(teamId)).toEqual(["U0ABC"]);
+    expect(Number(await generation(teamId))).toBe(Number(before) + 2);
+
+    // The unlink now holds against BOTH spellings: neither comes back on its own.
+    expect(await syncSlackIdentities(db(), teamId, [
+      { id: "U0ABC", displayName: "Again", email },
+      { id: "u0abc", displayName: "Again", email },
+    ])).toMatchObject({ scanned: 2, mapped: 0, skipped: 2 });
+    expect(await liveSpellings(teamId)).toEqual([]);
+    expect(Number(await generation(teamId))).toBe(Number(before) + 2);
+  });
+
+  it("writes NO fence while a variant is still live, so the survivor's refresh is not a conflict (AC-PA-17b)", async () => {
+    const { teamId, memberId } = await seedTeam();
+    const email = await rosterEmail(teamId, memberId);
+    const survivor = await legacyVariant(teamId, memberId, "U0ABC", "Stale");
+    await legacyVariant(teamId, memberId, "u0abc");
+
+    expect(await removeMemberIdentity(db(), teamId, { provider: "slack", externalId: "u0abc" }))
+      .toEqual({ removed: true });
+    expect(await fences(teamId)).toEqual([]);
+    const afterUnlink = await generation(teamId);
+
+    // The survivor is an ordinary live mapping again: auto-sync refreshes its metadata in place.
+    expect(await syncSlackIdentities(db(), teamId, [{ id: "U0ABC", displayName: "Fresh", email }]))
+      .toMatchObject({ scanned: 1, mapped: 1, skipped: 0 });
+    expect(await mapping(teamId, "U0ABC")).toEqual(survivor);
+    const { rows } = await runSql<{ handle: string }>(
+      `select handle from member_identities where id = $1`, [survivor.id]);
+    expect(rows[0]?.handle).toBe("Fresh");
+    // A metadata refresh is not an identity change.
+    expect(await generation(teamId)).toBe(afterUnlink);
+  });
+
+  // THE CONTROL for the test above: the same surviving row with a fence beside it. This is the
+  // state a fence written during that unlink would leave, and it is why none may be: the suppression
+  // check runs before the existing-row branch, so the survivor's own refresh is refused every time.
+  it("would refuse the survivor's refresh forever if a fence sat beside it (AC-PA-17b control)", async () => {
+    const { teamId, memberId } = await seedTeam();
+    const email = await rosterEmail(teamId, memberId);
+    const survivor = await legacyVariant(teamId, memberId, "U0ABC", "Stale");
+    await runSql(
+      `insert into member_identity_suppressions (team_id, provider, external_id) values ($1, 'slack', 'u0abc')`,
+      [teamId]);
+
+    expect(await syncSlackIdentities(db(), teamId, [{ id: "U0ABC", displayName: "Fresh", email }]))
+      .toMatchObject({ scanned: 1, mapped: 0, skipped: 1 });
+    const { rows } = await runSql<{ handle: string }>(
+      `select handle from member_identities where id = $1`, [survivor.id]);
+    expect(rows[0]?.handle).toBe("Stale");
+  });
+
+  it("leaves linking unchanged: refused while variants are live, possible once the extra one is unlinked", async () => {
+    const { teamId, memberId } = await seedTeam();
+    const survivor = await legacyVariant(teamId, memberId, "U0ABC");
+    await legacyVariant(teamId, memberId, "u0abc");
+    const before = await generation(teamId);
+
+    // `setMemberIdentity` does not pick a variant, even for an explicit admin link.
+    const refused = await setMemberIdentity(db(), teamId, memberId,
+      { provider: "slack", externalId: "U0ABC", handle: "Named" }, { explicit: true });
+    expect(refused).toMatchObject({ conflict: true, created: false, updated: false });
+    expect(refused.note).toContain("multiple live case variants");
+    expect(await liveSpellings(teamId)).toEqual(["U0ABC", "u0abc"]);
+    expect(await generation(teamId)).toBe(before);
+
+    // The way out is the unlink, by exact spelling — after which the same link is an ordinary one.
+    await removeMemberIdentity(db(), teamId, { provider: "slack", externalId: "u0abc" });
+    const linked = await setMemberIdentity(db(), teamId, memberId,
+      { provider: "slack", externalId: "U0ABC", handle: "Named" }, { explicit: true });
+    expect(linked).toMatchObject({ conflict: false, updated: true });
+    expect(await mapping(teamId, "U0ABC")).toEqual(survivor);
+    expect(await liveSpellings(teamId)).toEqual(["U0ABC"]);
+  });
+});
