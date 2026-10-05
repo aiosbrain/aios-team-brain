@@ -1,7 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+import type { DbClient } from "@/lib/db/types";
 import {
   classifySlackCall,
+  discoverSlackSource,
   needsSlackPublicProof,
   slackWorkspaceUrl,
   validateSlackHistoryPage,
@@ -325,5 +327,93 @@ describe("needsSlackPublicProof", () => {
         SLACK_METADATA_INTERVAL_MS
       )
     ).toBe(true);
+  });
+});
+
+/**
+ * AIO-1170 pre-activation correction PA-3 — the skew allowance is refused BEFORE anything is touched.
+ *
+ * The allowance is how far below its stored bound a newest catch-up asks. Zero puts the scan back
+ * exactly on the bound, and a negative value starts it ABOVE the bound and leaves a gap inside an
+ * interval that is later certified — so a bad value must stop the pass, not narrow the seam quietly.
+ *
+ * Still no database and no provider: the client below is one that cannot be used at all, which is
+ * what turns "rejected first" into an observation rather than a reading of the source.
+ */
+describe("discoverSlackSource — the skew allowance guard", () => {
+  const TEAM = "3f1a0b2c-4d5e-4f60-8a7b-9c0d1e2f3a4b";
+  const INTEGRATION = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+
+  class DatabaseReached extends Error {}
+
+  /** A client whose every member — read or merely probed for — is recorded and then throws. */
+  function untouchable(): { db: DbClient; touched: string[] } {
+    const touched: string[] = [];
+    const reach = (property: string | symbol): never => {
+      touched.push(String(property));
+      throw new DatabaseReached(`the pass reached the database (${String(property)})`);
+    };
+    const db = new Proxy(
+      {},
+      { get: (_target, property) => reach(property), has: (_target, property) => reach(property) }
+    ) as unknown as DbClient;
+    return { db, touched };
+  }
+
+  function attempt(skewAllowanceMs: number | undefined) {
+    const { db, touched } = untouchable();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error("no provider request may be made in this test");
+    });
+    const envToken = vi.fn(() => null);
+    const outcome = discoverSlackSource(
+      { db, teamId: TEAM, integrationId: INTEGRATION },
+      { fetchImpl: fetchImpl as unknown as typeof fetch, envToken, skewAllowanceMs }
+    ).then(
+      () => ({ rejected: false as const, error: undefined }),
+      (error: unknown) => ({ rejected: true as const, error })
+    );
+    return { outcome, touched, fetchImpl, envToken };
+  }
+
+  it.each([0, -1, -60_000, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "refuses an allowance of %s with a TypeError, before any database or provider activity",
+    async (skewAllowanceMs) => {
+      const { outcome, touched, fetchImpl, envToken } = attempt(skewAllowanceMs);
+      const { rejected, error } = await outcome;
+
+      expect(rejected).toBe(true);
+      expect(error).toBeInstanceOf(TypeError);
+      // THIS guard, not some other TypeError the unusable client might have provoked.
+      expect((error as Error).message).toBe(
+        "slack source discovery: skewAllowanceMs must be a positive whole number"
+      );
+      // Nothing was read off the client, no token was resolved, and nothing left the process.
+      expect(touched).toEqual([]);
+      expect(envToken).not.toHaveBeenCalled();
+      expect(fetchImpl).not.toHaveBeenCalled();
+    }
+  );
+
+  /**
+   * THE POSITIVE CONTROL. A usable allowance gets PAST the guard and into the pass's first
+   * transaction, where this client stops it — so the guard is not refusing everything, and the
+   * client really does notice when it is touched. Without this, "touched nothing" above would be
+   * satisfied by a harness that cannot see a touch at all.
+   */
+  it.each([
+    { name: "the default, when none is given", skewAllowanceMs: undefined },
+    { name: "the smallest whole allowance", skewAllowanceMs: 1 },
+    { name: "sixty seconds, stated", skewAllowanceMs: 60_000 },
+  ])("lets $name through to the database", async ({ skewAllowanceMs }) => {
+    const { outcome, touched, fetchImpl } = attempt(skewAllowanceMs);
+    const { rejected, error } = await outcome;
+
+    expect(rejected).toBe(true);
+    expect(error).toBeInstanceOf(DatabaseReached);
+    expect(error).not.toBeInstanceOf(TypeError);
+    expect(touched.length).toBeGreaterThan(0);
+    // The provider is reached only through the database, and this pass never got that far.
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
