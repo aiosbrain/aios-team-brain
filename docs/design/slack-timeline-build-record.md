@@ -806,3 +806,67 @@ The baseline and post-M6b restored fingerprints match, and the restored source r
 Ownership: PR 743 remains unmerged and separate. Its currently reported checkpoint changes shared transaction internals. Before any combined publication or integration, this branch is reconciled after PR 743 lands, or on an explicit integration, and both branches' relevant transaction, reservation and commit-before-fetch contract checks are rerun. This slice is path-disjoint from PR 743 and introduces no other broad-integration requirement.
 
 Not done and not authorized: the hydrator stays unwired and inactive. No activation, live Slack request, apply or repair, identity cutover, merge or deployment. This entry follows the reviewed source and changes no source or test; it does not mark activation, live acceptance or the full task complete.
+
+### AC-07 Slack directory classification — implementation packet, recorded October 6
+
+This packet makes the Slack identity adapter the admission boundary for automatic email linking and nothing else: only an account Slack positively classified as human reaches the shared writer. The accepted final Astra v1.2 specification is the ignored local artifact `.context/aio-1170-resume/slack-directory-classification-astra-spec.md`, 31,447 bytes, SHA-256 `ca3cfe4920c314ef377e7500001b97094f79ce28a5bf0f7f6c3d855e42fa6e44`. An independent Opus round-2 specification review returned READY with no blocker, major or medium. The canonical Linear AIO-1170 attachment and its readback are 228,938 bytes, SHA-256 `ed13d8c95167a951cb1b486f74dd55960512b645cd95b49f94886cd385e986fe`; the ticket is In Progress.
+
+The sole source writer was subscription-authenticated `claude-opus-5-5` at high effort, session `b1767100-da84-4808-818f-6b0107480c68`; the coordinator ran the checks and owns the commits. Red checkpoint `697547e7` changed tests only; final source checkpoint `5e227c94`. Exactly six paths changed, two source and four test:
+
+- `lib/ingest/sources/slack.ts`
+- `lib/ingest/sources/slack-identity.ts`
+- `test/slack-directory-classification.test.ts`
+- `test/ingest-slack-resilience.test.ts`
+- `test/datamechanics/slack-identity.datamechanics.test.ts`
+- `test/datamechanics/slack-account-suppression.datamechanics.test.ts`
+
+What the source now does:
+
+- `SlackClient.usersDetailed()` returns the one exported `SlackUser` type, imported type-only, and projects `is_bot`, `is_app_user`, `deleted`, `is_restricted` and `is_ultra_restricted` only when Slack sent a literal boolean. Anything else is unknown, never false. A null or non-object entry, or an ID that is missing, not a string or blank, is skipped without coercion. Bot, app and unknown records stay in this result, so transcript names are unaffected; only the adapter filters. Pagination, the missing-scope partial result and transient failures are unchanged.
+- `syncSlackIdentities()` forwards a record only when `isBot` and `isAppUser` are both the literal `false`. A true flag, or a missing, partial, null or wrongly typed one, is refused. Guest and deactivation flags are descriptive and are not consulted.
+- The service account `USLACKBOT` is always refused, as a raw ID or as the user component of a workspace-qualified ID, even with both flags false.
+- The comparison key is the full ID, trimmed, with ASCII letters upper-cased and nothing else changed. When any occurrence of a key is refused, every occurrence of that key is omitted from the call. A raw ID, a qualified ID and the same user ID in two workspaces stay distinct. Forwarded IDs are never rewritten.
+- The admitted records go to the existing shared writer for provider `slack` with `{ exactEmailOnly: true }`, and its result is returned unchanged. An all-excluded directory hands it nothing, which is its existing no-op.
+
+There is no schema, shared-writer, runner, scheduler, guard, request, scope, log or statistics change, and no second resolver or transaction. In the tests, the fifteen existing adapter call sites now pass explicit human flags, and an integrated fixture runs the real `usersDetailed()` output through the real adapter into isolated PostgreSQL.
+
+Red evidence on `697547e7`, recorded in `.context/aio-1170-resume/slack-directory-classification-red-evidence.md`: focused unit and guard **75 failed / 106 passed** of 181; isolated PostgreSQL **6 failed / 34 passed** of 40. Every failure was behavioural — flags lost in projection, excluded records forwarded, mapped or refreshed — and none was a missing-module, type-only or setup failure. A fresh GPT-6.1 Sol-high review of the red tests returned **PASS**.
+
+Verification on `5e227c94`, as run by the coordinator: focused unit and guard **181/181**; isolated PostgreSQL **40/40**; typecheck, ESLint on the changed paths, the diff check and the pre-push docs and skill gates all passed.
+
+An independent Opus 5.5 high-effort source review returned no blocker, HIGH or MEDIUM. Its one accepted LOW was fixed: an invented fallback that turned a wrong-shaped `users` container into an empty directory was removed, so such a call now fails as an ordinary error, and the checks above were rerun on the result. It also recorded two observations, neither claimed as a defect: one optional redundant condition, and the assumption — mandated by the specification — that provider IDs are compared under an ASCII-only fold.
+
+Mutation evidence is in the ignored directory `.context/aio-1170-resume/slack-directory-classification-mutations/` (`summary.txt`, `summary.json` and per-case logs). All fourteen encoded cases were killed, each by a named behavioural test:
+
+- **M-a** — the projected `isBot` dropped;
+- **M-b-http-default** — the HTTP projection defaults a missing `is_bot` to false;
+- **M-b-http-coerce** — the HTTP projection uses `Boolean()` instead of a literal-boolean check;
+- **M-b-adapter-default** — the adapter treats a missing `isBot` as false;
+- **M-b-adapter-loose** — the adapter compares with `==` instead of `===`;
+- **M-c** — the admission filter bypassed;
+- **M-d** — guests and deactivated humans rejected;
+- **M-e** — exact-email mode removed;
+- **M-f** — the `USLACKBOT` exclusion removed;
+- **M-g** — no per-key omission of conflicting duplicates;
+- **M-g-key** — the collision key is the raw ID, with no trim and no ASCII fold;
+- **M-h-identity** and **M-h-suppression** — one human flag removed from the repeat fixture in each of the two PostgreSQL test files, killed in isolated PostgreSQL;
+- **M-id** — the adapter's ID guard bypassed before string operations.
+
+Every mutation restored the four touched files byte for byte. Their final SHA-256 fingerprints, each matching the harness's embedded baseline:
+
+- `lib/ingest/sources/slack-identity.ts` — `93b13cd222706d46f96705b93e820582a25398121ca009c89e8ec33aee7dca1c`
+- `lib/ingest/sources/slack.ts` — `113accd6474a7ff12663e8b44b1802e0a0f24a8458a653dd2ebac23730fb8a97`
+- `test/datamechanics/slack-identity.datamechanics.test.ts` — `7ae17e0ebd786673ec7c3004ec3e5a2bae2f488381ddd604b256dab72024694e`
+- `test/datamechanics/slack-account-suppression.datamechanics.test.ts` — `2fef1054d035efcd2d450a1eba28e7a15bd51fb435fa24fa99ff4cbfb2f1233d`
+
+Limitations the specification accepts and this packet does not remove:
+
+- Excluding `is_app_user` accounts is a fail-closed posture with a known false-negative risk: a human authorized through the app may be excluded from automatic linking. Before any activation, certification or deployment of the legacy runner path, the specification requires a sanitized live-installation observation of both flags for an OAuth-connected known human, beside an ordinary human and a bot control; it has not been performed, and an excluded connected human would need a separately adjudicated policy change.
+- The adapter is already called by the wired legacy runner, so once this branch is eventually deployed, accounts lacking both explicit false flags stop receiving new automatic links and metadata refreshes. This packet does not authorize that deployment.
+- The filter is admission only. It does not delete, remap, suppress or refresh any existing mapping; historical mislinks need separately authorized diagnosis and correction.
+
+Ownership: the local head, the remote head and the PR 714 head are all exactly `5e227c94e7b019133b007dea335ca1c1288be4a8`; PR 714 is open, draft, with base `staging`. PR 743 remains separately owned and unmerged at `4689d686ca605301c2603359103f211645b068f5`. Its `syncProviderIdentities` signature differs from this branch's exact-email call, so a clean merge is not acceptance proof: a future integration must reconcile that shared writer call, keeping both the Slack pre-writer filter and PR 743's atomic identity mutation contract, and rerun the specification's named obligations on the integrated snapshot — DIR-02 through DIR-06 including the integrated HTTP-to-adapter-to-PostgreSQL fixture, the suppression concurrency, generation and error tests, `test/guards/identity-mutation-boundary.test.ts`, and PR 743's affected shared-writer obligations. No such integration has been done.
+
+Still pending: the broad `npm test` and the docs and skills gates are still to be run on the new documentation snapshot this entry creates; the fresh Astra-high and blind GPT-6.1 Sol-high final reviews have not run; the PR body, PR checks and CI are pending. The broad suite is not claimed green.
+
+Not done and not authorized: live provider observation, activation or certification, publisher or runner wiring, deletion of the not-wired guard, the attended identity cutover, repair apply, merge, deployment, any production or main write, and the soak. This entry follows the reviewed source and changes no source or test; it does not mark AC-07 live-validated, the PR 743 integration done, or the full task complete.
