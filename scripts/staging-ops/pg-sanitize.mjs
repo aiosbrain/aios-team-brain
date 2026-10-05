@@ -11,6 +11,14 @@ export const EXCLUDED_PAIRED_TABLE_DATA = Object.freeze([
   "gateway_resolution_leases",
   "gateway_service_credentials",
   "gateway_service_identities",
+  // Google Drive connection state is bound by foreign key to excluded `integrations` and `api_keys`
+  // rows, and its claims to that state: none of it can be restored without them. The same five
+  // tables the legacy refresh policy excludes (`scripts/staging-refresh-decision.mjs`).
+  "gdrive_cleanup_obligations",
+  "gdrive_connection_authority",
+  "gdrive_item_claim_projects",
+  "gdrive_item_claims",
+  "gdrive_run_requests",
   // Execution history is bound to excluded API keys; identities must not outlive copied attempts.
   "governed_action_identities",
   "governed_actions",
