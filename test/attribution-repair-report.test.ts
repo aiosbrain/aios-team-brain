@@ -32,6 +32,8 @@ const outcome = (over: Partial<AttributionRepairOutcome>): AttributionRepairOutc
 });
 const PARTIAL = outcome({ scanned: 10_000, updated: 9_400, versionsUpdated: 12 });
 const BUSY = outcome({ busy: true, turn: "busy", revision: 0 });
+/** A run that committed three batches, let go of the turn between them, and then found another owner. */
+const BUSY_AFTER_PROGRESS = outcome({ scanned: 300, updated: 240, busy: true, turn: "busy" });
 const COMPLETE = outcome({ scanned: 150, updated: 150, status: "complete", partial: false, turn: "complete" });
 
 /** Anything that would read as "this will finish by itself". */
@@ -95,6 +97,43 @@ describe("the Admin button's message", () => {
     expect(message).not.toMatch(/Re-attributed \d/);
     expect(message).not.toContain("to current identity mappings");
     expect(message).not.toBe(describeManualRepair(PARTIAL, "manual"));
+  });
+
+  it("BUSY AFTER PROGRESS, copied staging: the committed work is reported, not discarded as 'did nothing' — and still nothing is promised", () => {
+    const message = describeManualRepair(BUSY_AFTER_PROGRESS, "manual");
+    expect(message).toBe(
+      "Re-attributed 240 of 300 item(s) so far; another re-attribution run then took over this team's repair, and the repair is not complete. "
+      + "Progress is saved, but background continuation is disabled on this deployment: "
+      + "an admin must run Re-attribute content again once that run has finished.",
+    );
+    expect(message).not.toContain("did nothing");
+    expect(message).not.toMatch(PROMISES_BACKGROUND);
+    expect(message).not.toContain("to current identity mappings");
+    // Three distinct facts, three distinct messages.
+    expect(new Set([message, describeManualRepair(BUSY, "manual"), describeManualRepair({ ...BUSY_AFTER_PROGRESS, busy: false }, "manual")]).size).toBe(3);
+    // The initial-contention wording is kept for a run that really did nothing.
+    expect(describeManualRepair(BUSY, "manual")).toContain("so this run did nothing");
+  });
+
+  it("BUSY AFTER PROGRESS, normal runtime: the committed work is reported and the repair is still said to continue in the background", () => {
+    const message = describeManualRepair(BUSY_AFTER_PROGRESS, "background");
+    expect(message).toBe(
+      "Re-attributed 240 of 300 item(s) so far; another re-attribution run then took over this team's repair, "
+      + "and re-attribution is continuing in the background.",
+    );
+    expect(message).not.toContain("did nothing");
+    expect(message).not.toContain("disabled");
+    expect(message).not.toContain(MANUAL_REPAIR_CONTROL);
+    expect(new Set([message, describeManualRepair(BUSY, "background"), describeManualRepair({ ...BUSY_AFTER_PROGRESS, busy: false }, "background")]).size).toBe(3);
+  });
+
+  it("any committed counter counts as progress — a run that only revisited rows, or only healed versions, did not 'do nothing'", () => {
+    for (const counters of [{ scanned: 5 }, { updated: 1 }, { versionsUpdated: 2 }, { contributionsUpdated: 3 }]) {
+      const busy = outcome({ ...counters, busy: true, turn: "busy" });
+      expect(describeManualRepair(busy, "manual"), JSON.stringify(counters)).not.toContain("did nothing");
+      expect(describeManualRepair(busy, "manual")).toContain("then took over this team's repair");
+      expect(describeManualRepair(busy, "background")).toContain("then took over this team's repair");
+    }
   });
 
   it("NORMAL runtime: partial and busy still say the repair continues in the background", () => {
