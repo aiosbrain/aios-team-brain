@@ -278,29 +278,29 @@ describe("inactive hydration transient backoff — exact jitter, taxonomy and sa
     0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 2 ** 53, "2", null, undefined,
   ];
 
-  /** Every way a rejected value could have been rendered into an error message. */
-  function renderings(value: unknown): string[] {
-    const out = new Set<string>([String(value)]);
-    const json = JSON.stringify(value);
-    if (typeof json === "string") out.add(json);
-    return [...out].filter((rendering) => rendering.length > 0);
-  }
-
   /**
    * STATIC means one message for the whole invalid matrix, not one per input. Comparing messages only
    * within a single input lets `Invalid ordinal: 2` pass for the string "2"; collecting them across
-   * every rejected value cannot, because a message that names its input differs between inputs.
+   * every rejected value cannot, because a message that names its input differs between inputs. That
+   * equality is the decisive assertion.
+   *
+   * It deliberately does NOT ban the rejected values' text in general: `0`, `1`, `NaN` and `Infinity`
+   * are ordinary words for describing a domain, and `must be finite and in [0, 1)` is a perfectly good
+   * static message. The only renderings checked are ones already in the invalid matrix that no domain
+   * description would contain, so their presence could only be an interpolated input.
    */
-  function expectOneStaticMessage(messages: ReadonlySet<string>, rejected: readonly unknown[]): void {
+  function expectOneStaticMessage(messages: ReadonlySet<string>, interpolationOnly: readonly string[]): void {
     expect([...messages], "one message for every rejected value").toHaveLength(1);
     const [message] = [...messages];
     expect(message.length).toBeGreaterThan(0);
-    for (const value of rejected) {
-      for (const rendering of renderings(value)) {
-        expect(message, `echoes ${JSON.stringify(rendering)}`).not.toContain(rendering);
-      }
+    for (const rendering of interpolationOnly) {
+      expect(message, `echoes ${JSON.stringify(rendering)}`).not.toContain(rendering);
     }
   }
+  /** `String(2 ** 53)`: the unsafe-integer ordinal, a number no domain description spells out. */
+  const ORDINAL_INTERPOLATION_ONLY = ["9007199254740992"];
+  /** The negative sample's own digits, and what an interpolated object sample prints as. */
+  const SAMPLE_INTERPOLATION_ONLY = ["-0.000001", "[object Object]"];
 
   it("TB-02 rejects every invalid claim ordinal with ONE static message that echoes none of them", async () => {
     const messages = new Set<string>();
@@ -312,7 +312,7 @@ describe("inactive hydration transient backoff — exact jitter, taxonomy and sa
         messages.add(String((decision.error as Error).message));
       }
     }
-    expectOneStaticMessage(messages, INVALID_ORDINALS);
+    expectOneStaticMessage(messages, ORDINAL_INTERPOLATION_ONLY);
   });
 
   it.each(INVALID_ORDINALS.map((attempts) => [attempts]))(
@@ -331,7 +331,7 @@ describe("inactive hydration transient backoff — exact jitter, taxonomy and sa
       }
       // A static message: the rejected value is not clamped into a delay and not echoed into the error.
       expect(messages.size).toBe(1);
-      for (const echoed of ["1.5", "-1", "Infinity", "NaN", "9007199254740992"]) expect([...messages][0]).not.toContain(echoed);
+      for (const echoed of ORDINAL_INTERPOLATION_ONLY) expect([...messages][0]).not.toContain(echoed);
     }
   );
 
@@ -435,7 +435,7 @@ describe("inactive hydration transient backoff — exact jitter, taxonomy and sa
         messages.add(String((decision.error as Error).message));
       }
     }
-    expectOneStaticMessage(messages, INVALID_ORDINALS);
+    expectOneStaticMessage(messages, ORDINAL_INTERPOLATION_ONLY);
   });
 
   it.each([[0], [-1], [1.5], [Number.NaN], [Number.POSITIVE_INFINITY], [2 ** 53], ["2"]])(
@@ -526,7 +526,7 @@ describe("inactive hydration transient backoff — exact jitter, taxonomy and sa
         }
       }
     }
-    expectOneStaticMessage(messages, INVALID_SAMPLES.map(([, sample]) => sample));
+    expectOneStaticMessage(messages, SAMPLE_INTERPOLATION_ONLY);
   });
 
   it.each(INVALID_SAMPLES)("TB-07 rejects a sample of %s without coercion, release or any later mutation", async (_name, sample) => {
@@ -546,7 +546,7 @@ describe("inactive hydration transient backoff — exact jitter, taxonomy and sa
       }
     }
     expect(messages.size).toBe(1);
-    for (const echoed of ["1.5", "-0.000001", "Infinity", "NaN"]) expect([...messages][0]).not.toContain(echoed);
+    for (const echoed of SAMPLE_INTERPOLATION_ONLY) expect([...messages][0]).not.toContain(echoed);
   });
 
   it("TB-07 propagates a throwing sampler without releasing the claim", async () => {
