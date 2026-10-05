@@ -107,10 +107,17 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
  *                        revalidation is this action's own.
  *     client ids         `teamId` — the team is the client's, admitted only by the caller's own
  *                        active membership read under that id; nothing else is supplied.
+ *     caller             Dana: an active ordinary member of TEAM (role member, builtin everyone
+ *                        row) with her own signed session. The role and posture variants and the
+ *                        refusals rearrange her rows.
  *     cases (group M)    "admitted control: …"   "<role or posture> → admitted identically: …" (4)
- *                        "binding: …"   "<removed conjunct> → refused as `not a member of this
- *                        team`: …" (6)   "<fault form> after the session and active membership are
- *                        admitted: …" (2)   "an empty or unsluggable name …"
+ *                        "binding: …" (two teams, then a team id the caller holds no membership
+ *                        under)   "<removed conjunct> → refused as `not a member of this team`: …"
+ *                        (6)   "<fault form> after the session and active membership are admitted:
+ *                        …" (2)   "<an empty, blank or unsluggable name> is refused by the action's
+ *                        own validation before any identity read …" (3)
+ *     posture fault      posture is resolved but is not a conjunct; its read fault still rejects the
+ *                        call before the insert (fail closed). Pinned as current.
  *
  *   app/t/[team]/codebases/[slug]/actions.ts#recordFindingDecision
  *     guard              LEAD (tier=team): session + active same-team membership + role admin OR
@@ -132,11 +139,17 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
  *                        `codebase not found`). `findingId`, `ownerMemberId` — forwarded as given;
  *                        their binding is the SQL function's own and is NOT exercised here (the rpc
  *                        double implements none of its predicates). See the Postgres fixture.
- *     cases (group F)    "admitted control: …" (2)   "binding: …"   "<removed membership conjunct>
- *                        → refused as `team leads or admins only`: …" (6)   "<removed role or
- *                        posture conjunct> → refused …" (6)   "<fault form> after the session and
- *                        active membership are admitted: …" (2)   "after admission, a codebase slug
- *                        only the other team holds …"   "before any identity read: …"
+ *     cases (group F)    "admitted control: …" (2: admin, lead)   "binding: …"   "<removed
+ *                        membership conjunct> → refused as `team leads or admins only`: …" (6)
+ *                        "<removed role or posture conjunct> → refused as `team leads or admins
+ *                        only` with the session and active membership admitted: …" (6: one role,
+ *                        five posture)   "<fault form> after the session and active membership are
+ *                        admitted: …" (2)   "after admission, a codebase slug only the other team
+ *                        holds …"   "before any identity read: …" (2: a schema-rejected decision;
+ *                        an unknown team slug with no session)
+ *
+ * The fixture contract of this continuation — Dana, the desk's three statements and both exports'
+ * inputs — is its own group, "X — fixture contract of the member-tier continuation …" (2 cases).
  *
  * What is real, and never mocked or handed a verdict: the five exports; `lib/auth/guard`
  * `requireTeamAdmin`; `lib/auth/session` `getSessionUser`; `lib/auth/pg-session`
@@ -230,7 +243,10 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
  * Run status at authoring: NOT RUN. This file was written without executing vitest, tsc or any other
  * command. Its expectations come from reading the sources above, not from an observed run; replace
  * this paragraph with the observed result once it has been executed. The M and F groups, the desk
- * and the member-lower seam were added by a later writer under the same condition: NOT RUN.
+ * and the member-lower seam were added by a later writer under the same condition: NOT RUN. That
+ * writer left the header, the mocks and the imports of M and F without their bodies; a further
+ * continuation supplied the desk doubles, Dana, the M, F and second X groups and the batch owners
+ * named in Z, also without executing anything: NOT RUN.
  */
 
 const FIXTURE = "FIXTURE PREMISE FAILED (setup, not a security observation):";
@@ -352,6 +368,22 @@ const PROJECT_TWO = "12170000-0000-4000-8000-0000000002c2";
 const OWNED_KEY = "12170000-0000-4000-8000-0000000002c3";
 const OTHER_PROJECT = "12170000-0000-4000-8000-0000000002d1";
 const OTHER_KEY = "12170000-0000-4000-8000-0000000002d2";
+
+/** An ordinary active member of TEAM holding its builtin everyone row: the caller of group M. */
+const DANA: SessionUser = { id: "12170000-0000-4000-8000-0000000002a8", email: "dana.aio1217.ops@fixture.test" };
+const DANA_MEMBER = "12170000-0000-4000-8000-0000000002a9";
+
+/** Synthetic rows the desk designates as owned by TEAM, and by OTHER_TEAM (group F). */
+const CODEBASE = "12170000-0000-4000-8000-0000000002e1";
+const FINDING = "12170000-0000-4000-8000-0000000002e2";
+const OTHER_CODEBASE = "12170000-0000-4000-8000-0000000002f1";
+const OTHER_FINDING = "12170000-0000-4000-8000-0000000002f2";
+const CODEBASE_SLUG = "aio1217-fixture-codebase";
+const OTHER_CODEBASE_SLUG = "aio1217-other-codebase";
+
+/** The id the desk's insert double mints for the nth project a request creates. */
+const mintedProjectId = (n: number) => `12170000-0000-4000-8000-0000000003${String(n).padStart(2, "0")}`;
+const FIRST_PROJECT = mintedProjectId(1);
 
 const KEY_NAME = "Fixture key";
 /** `aios_<12 hex key id>_<43 base64url secret>` — the shape lib/admin/keys documents and returns once. */
@@ -495,6 +527,23 @@ const revalidated = (path: string) => `effect:revalidatePath ${path}`;
 const pmSyncPath = (teamSlug: string) => `/t/${teamSlug}/admin/pm-sync`;
 const keysPath = (teamSlug: string) => `/t/${teamSlug}/admin/keys`;
 
+// The desk's three statements and the member-lower seam (groups M and F): effects, never reads.
+const projectInserted = (teamId: string, slug: string) =>
+  `effect:serverClient projects.insert team_id=${teamId} slug=${slug}`;
+const codebaseRead = (teamId: string, slug: string) => `effect:serverClient codebases.select team_id=${teamId} slug=${slug}`;
+const findingDecided = (teamId: string, codebaseId: string, findingId: string, actorMemberId: string) =>
+  `effect:privileged.rpc decide_codebase_finding team_id=${teamId} codebase_id=${codebaseId} finding_id=${findingId} actor_member_id=${actorMemberId}`;
+const singletonEnsured = (teamId: string, memberId: string) =>
+  `effect:lower ensurePersonSingleton team_id=${teamId} member_id=${memberId}`;
+const projectGranted = (teamId: string, projectId: string, groupId: string) =>
+  `effect:lower grantProjectToGroup team_id=${teamId} project_id=${projectId} group_id=${groupId}`;
+const pointerEnsured = (teamId: string, projectId: string) =>
+  `effect:lower ensureProjectGraphPointer team_id=${teamId} project_id=${projectId}`;
+
+const codebasePath = (teamSlug: string, codebaseSlug: string) => `/t/${teamSlug}/codebases/${codebaseSlug}`;
+/** The group id the singleton double hands back for a member. */
+const singletonOf = (memberId: string) => `fixture-person-singleton-${memberId}`;
+
 // ── the guard substrate ──────────────────────────────────────────────────────────────────────────
 
 interface World {
@@ -504,13 +553,17 @@ interface World {
   group_members: Row[];
 }
 
-/** Alice is an active admin of TEAM holding its builtin everyone row; Bob is the same in OTHER_TEAM. */
+/**
+ * Alice is an active admin of TEAM holding its builtin everyone row; Bob is the same in OTHER_TEAM.
+ * Dana (group M) is an active ordinary member of TEAM holding the same everyone row.
+ */
 function healthyWorld(): World {
   return {
     teams: [{ ...TEAM }, { ...OTHER_TEAM }],
     members: [
       { id: ALICE_MEMBER, team_id: TEAM.id, auth_user_id: ALICE.id, role: "admin", status: "active" },
       { id: CAROL_MEMBER, team_id: TEAM.id, auth_user_id: CAROL_USER, role: "member", status: "active" },
+      { id: DANA_MEMBER, team_id: TEAM.id, auth_user_id: DANA.id, role: "member", status: "active" },
       { id: BOB_MEMBER, team_id: OTHER_TEAM.id, auth_user_id: BOB.id, role: "admin", status: "active" },
     ],
     groups: [
@@ -520,6 +573,7 @@ function healthyWorld(): World {
     ],
     group_members: [
       { team_id: TEAM.id, group_id: TEAM_EVERYONE, member_id: ALICE_MEMBER },
+      { team_id: TEAM.id, group_id: TEAM_EVERYONE, member_id: DANA_MEMBER },
       { team_id: OTHER_TEAM.id, group_id: OTHER_EVERYONE, member_id: BOB_MEMBER },
     ],
   };
@@ -580,6 +634,96 @@ interface GuardChain extends PromiseLike<Envelope> {
   update(values: unknown): never;
   upsert(values: unknown): never;
   delete(): never;
+}
+
+// ── the desk (groups M and F) ────────────────────────────────────────────────────────────────────
+
+interface Desk {
+  /** The rows the project action's own insert landed, in order. */
+  projects: Row[];
+  codebases: Row[];
+  findings: Row[];
+  /** Every argument set the decision rpc was handed, in order. */
+  decisions: Row[];
+}
+
+/** TEAM owns one codebase with one open finding; OTHER_TEAM owns one of each; nothing is created or decided yet. */
+function standingDesk(): Desk {
+  return {
+    projects: [],
+    codebases: [
+      { id: CODEBASE, team_id: TEAM.id, slug: CODEBASE_SLUG },
+      { id: OTHER_CODEBASE, team_id: OTHER_TEAM.id, slug: OTHER_CODEBASE_SLUG },
+    ],
+    findings: [
+      { id: FINDING, team_id: TEAM.id, codebase_id: CODEBASE, status: "open" },
+      { id: OTHER_FINDING, team_id: OTHER_TEAM.id, codebase_id: OTHER_CODEBASE, status: "open" },
+    ],
+    decisions: [],
+  };
+}
+
+let desk: Desk = standingDesk();
+
+/**
+ * The project action's own insert, as read from app/actions/projects.ts: one row, returning
+ * `id, slug, name` through `.single()`. The row lands with a minted id. No unique constraint is
+ * modelled, so the action's duplicate-name arm is unreachable here.
+ */
+function projectInsert(values: unknown): ProjectInsert {
+  const written = values as Row;
+  let returning: string | null = null;
+  const chain: ProjectInsert = {
+    select: (spec) => {
+      returning = spec ?? "*";
+      return chain;
+    },
+    single: async () => {
+      if (returning !== "id, slug, name") {
+        throw new Error(`${FIXTURE} unmodelled statement on projects: insert returning(${String(returning)}) single`);
+      }
+      ledger.push(projectInserted(String(written.team_id), String(written.slug)));
+      const row = { id: mintedProjectId(desk.projects.length + 1), ...written };
+      desk.projects.push(row);
+      return { data: { id: row.id, slug: row.slug, name: row.name }, error: null, count: null };
+    },
+  };
+  return chain;
+}
+
+/** `getCodebaseIdentity`'s read, as read from lib/metrics/codebases: the id of the (team, slug) codebase. */
+function codebaseIdentity(bound: Map<string, unknown>): Envelope {
+  ledger.push(codebaseRead(String(bound.get("team_id")), String(bound.get("slug"))));
+  const matched = desk.codebases.filter((row) => row.team_id === bound.get("team_id") && row.slug === bound.get("slug"));
+  if (matched.length > 1) throw new Error(`${FIXTURE} ${matched.length} codebases rows match a single-row read`);
+  return { data: matched[0] ? { id: matched[0].id } : null, error: null, count: null };
+}
+
+/**
+ * The `decide_codebase_finding` rpc, as lib/codebases/finding-ledger calls it. The finding is bound
+ * by (id, team, codebase) and nothing else: none of the SQL function's actor, owner, status, reason
+ * or expiry predicates is implemented, so this double says nothing about them.
+ */
+async function decisionRpc(args: Row): Promise<Envelope> {
+  ledger.push(
+    findingDecided(
+      String(args.p_team_id),
+      String(args.p_codebase_id),
+      String(args.p_finding_id),
+      String(args.p_actor_member_id),
+    ),
+  );
+  desk.decisions.push({ ...args });
+  const finding = desk.findings.find(
+    (row) => row.id === args.p_finding_id && row.team_id === args.p_team_id && row.codebase_id === args.p_codebase_id,
+  );
+  if (!finding) return { data: null, error: { message: "finding not found" }, count: null };
+  Object.assign(finding, {
+    status: args.p_decision_status,
+    decision_owner_member_id: args.p_owner_member_id,
+    decision_by_member_id: args.p_actor_member_id,
+  });
+  return { data: { finding_id: args.p_finding_id, status: args.p_decision_status }, error: null, count: null };
 }
 
 /** SEAM server db: PostgREST-shaped reads over `world`, honouring every `.eq` the owners apply. */
@@ -809,7 +953,9 @@ const privileged = {
     };
     return chain;
   },
-  rpc(fn: string): never {
+  // Not async: an unmodelled function is refused where it is called, as it was before the desk.
+  rpc(fn: string, args: Row = {}): Promise<Envelope> {
+    if (fn === "decide_codebase_finding") return decisionRpc(args);
     ledger.push(`effect:privileged.rpc ${fn}`);
     throw new Error(`${FIXTURE} the privileged client was asked to call ${fn}`);
   },
@@ -832,7 +978,7 @@ const auditRow = (
 
 // ── the request ──────────────────────────────────────────────────────────────────────────────────
 
-let tokens: { alice: string; bob: string };
+let tokens: { alice: string; bob: string; dana: string };
 
 /** The cookies of the request in flight; null until a case admits one. */
 let jar: Map<string, string> | null = null;
@@ -868,12 +1014,14 @@ function beginRequest(sessionCookie: string | null): void {
   jar = new Map(sessionCookie === null ? [] : [[SESSION_COOKIE, sessionCookie]]);
 }
 
-type Session = "alice" | "bob" | "none";
+type Session = "alice" | "bob" | "dana" | "none";
 const sessionCookie = (session: Session): string | null => (session === "none" ? null : tokens[session]);
 
 // ── the five exports ─────────────────────────────────────────────────────────────────────────────
 
 const LOWER = [h.projectAllTasks, h.recordProjectionRun, h.reconcileProviderState, h.getProvisioningAvailability];
+/** SEAM member lower: reached only by createProjectAction (group M). */
+const MEMBER_LOWER = [h.ensurePersonSingleton, h.grantProjectToGroup, h.ensureProjectGraphPointer];
 const TRIPWIRES = [h.after, h.headers, h.fetch, h.inviteFamily];
 
 interface Surface {
@@ -1057,26 +1205,40 @@ async function admittedAliceControl(surface: Surface): Promise<void> {
   expect(ledger, CONTROL).toEqual([...admittedReads(ALICE_ADMIN), ...surface.effects(ALICE_REALM)]);
 }
 
-const RECORDERS = [h.cookies, h.serverClient, h.adminClient, h.revalidatePath, ...LOWER, ...TRIPWIRES];
+const RECORDERS = [
+  h.cookies,
+  h.serverClient,
+  h.adminClient,
+  h.revalidatePath,
+  ...LOWER,
+  ...MEMBER_LOWER,
+  ...TRIPWIRES,
+];
 
-/** Clears the ledger and every recording and restores the healthy rows and vault; implementations stay armed. */
+/** Clears the ledger and every recording and restores the healthy rows, vault and desk; implementations stay armed. */
 function resetBetween(): void {
   ledger.length = 0;
   for (const recorder of RECORDERS) recorder.mockClear();
   world = healthyWorld();
   vault = standingVault();
+  desk = standingDesk();
   postureFault = null;
   jar = null;
 }
 
-/** No privileged client, vault statement or row change, lower owner, revalidation, tripwire or cookie mutation. */
+/**
+ * No privileged client, vault or desk statement or row change, lower owner, revalidation, tripwire
+ * or cookie mutation.
+ */
 function expectNoProtectedEffect(): void {
   expect(effects()).toEqual([]);
   expect(h.adminClient).not.toHaveBeenCalled();
   for (const owner of LOWER) expect(owner).not.toHaveBeenCalled();
+  for (const owner of MEMBER_LOWER) expect(owner).not.toHaveBeenCalled();
   expect(h.revalidatePath).not.toHaveBeenCalled();
   for (const tripwire of TRIPWIRES) expect(tripwire).not.toHaveBeenCalled();
   expect(vault).toEqual(standingVault());
+  expect(desk).toEqual(standingDesk());
 }
 
 type Settled<T> = { value?: T; thrown?: unknown };
@@ -1238,7 +1400,7 @@ const POSTURE_FAULTS = [
 beforeAll(async () => {
   vi.stubEnv("AUTH_SECRET", AUTH_SECRET);
   vi.stubGlobal("fetch", h.fetch);
-  tokens = { alice: await signSession(ALICE), bob: await signSession(BOB) };
+  tokens = { alice: await signSession(ALICE), bob: await signSession(BOB), dana: await signSession(DANA) };
 });
 afterAll(() => {
   vi.unstubAllGlobals();
@@ -1321,6 +1483,31 @@ beforeEach(() => {
     ledger.push(`effect:invite-family ${name}`);
     throw new Error(`${FIXTURE} the invite family's ${name} was reached`);
   });
+});
+
+// The member-tier continuation's own state and doubles (groups M and F).
+beforeEach(() => {
+  desk = standingDesk();
+
+  h.ensurePersonSingleton.mockReset();
+  h.ensurePersonSingleton.mockImplementation(async (_db: unknown, teamId: string, memberId: string) => {
+    ledger.push(singletonEnsured(teamId, memberId));
+    return { ok: true, groupId: singletonOf(memberId) };
+  });
+  h.grantProjectToGroup.mockReset();
+  h.grantProjectToGroup.mockImplementation(
+    async (_db: unknown, teamId: string, projectId: string, groupId: string) => {
+      ledger.push(projectGranted(teamId, projectId, groupId));
+      return { ok: true, created: true };
+    },
+  );
+  h.ensureProjectGraphPointer.mockReset();
+  h.ensureProjectGraphPointer.mockImplementation(
+    async (_db: unknown, args: { teamId: string; projectId: string }) => {
+      ledger.push(pointerEnsured(args.teamId, args.projectId));
+      return { ok: true };
+    },
+  );
 });
 
 describe("X — fixture contract", () => {
@@ -1654,44 +1841,824 @@ describe("L — client-supplied ids: CURRENT LIMITS, pinned not endorsed, not a 
   });
 });
 
+// ── the two member-tier exports (M, F) ───────────────────────────────────────────────────────────
+
+const PROJECT_KEY = "app/actions/projects.ts#createProjectAction";
+const FINDING_KEY = "app/t/[team]/codebases/[slug]/actions.ts#recordFindingDecision";
+
+const NOT_A_MEMBER = { ok: false, error: "not a member of this team" };
+const LEADS_OR_ADMINS_ONLY = { ok: false, error: "team leads or admins only" };
+
+const DANA_MEMBERSHIP: Principal = { user: DANA, memberId: DANA_MEMBER, team: TEAM };
+const danaMembership = () => standing("members", (row) => row.id === DANA_MEMBER);
+const danaEveryoneRow = () => standing("group_members", (row) => row.member_id === DANA_MEMBER);
+
+/** The reads `currentMember` issues for the team id it was handed, in order, as far as it admits. */
+const memberAdmission = (who: Principal) => [
+  SESSION_READ,
+  SERVER_CLIENT,
+  readMember(who.team.id, who.user.id),
+  readPosture(who.team.id, who.memberId),
+];
+
+/** A refusal of the membership chain: one conjunct removed, every lower owner still armed to succeed. */
+interface MemberTierRefusal {
+  name: string;
+  session: Session;
+  /** Removes one conjunct from the healthy world. */
+  arrange(): void;
+  /** The reads `currentMember` issues before it answers, in order. */
+  chain: string[];
+  postures: PosturePremise[];
+}
+
+/** The six ways `caller` fails to be an active member of TEAM, with their posture row left standing. */
+function membershipRefusals(caller: Principal, session: Session): MemberTierRefusal[] {
+  const membership = () => standing("members", (row) => row.id === caller.memberId);
+  const upTo = (user: SessionUser) => [SESSION_READ, SERVER_CLIENT, readMember(TEAM.id, user.id)];
+  const standingPosture: PosturePremise[] = [{ teamId: TEAM.id, memberId: caller.memberId, is: "team" }];
+  return [
+    {
+      name: "no session cookie, with the membership and everyone row standing",
+      session: "none",
+      arrange: () => undefined,
+      chain: [SESSION_READ],
+      postures: standingPosture,
+    },
+    {
+      name: "a signed-in user with no membership row, the everyone row still standing",
+      session,
+      arrange: () => {
+        world.members = world.members.filter((row) => row.id !== caller.memberId);
+      },
+      chain: upTo(caller.user),
+      postures: standingPosture,
+    },
+    {
+      name: "an active membership that belongs to another team, the everyone row still standing",
+      session,
+      arrange: () => {
+        membership().team_id = OTHER_TEAM.id;
+      },
+      chain: upTo(caller.user),
+      postures: standingPosture,
+    },
+    {
+      name: "a healthy member of another team (Bob) naming this team",
+      session: "bob",
+      arrange: () => undefined,
+      chain: upTo(BOB),
+      postures: [{ teamId: OTHER_TEAM.id, memberId: BOB_MEMBER, is: "team" }],
+    },
+    {
+      name: "a disabled same-team membership, the everyone row still standing",
+      session,
+      arrange: () => {
+        membership().status = "disabled";
+      },
+      chain: upTo(caller.user),
+      postures: standingPosture,
+    },
+    {
+      name: "an invited same-team membership, the everyone row still standing",
+      session,
+      arrange: () => {
+        membership().status = "invited";
+      },
+      chain: upTo(caller.user),
+      postures: standingPosture,
+    },
+  ];
+}
+
+// ── M: createProjectAction ───────────────────────────────────────────────────────────────────────
+
+const PROJECT_NAME = "Fixture Initiative";
+/** `slugify(PROJECT_NAME)`, written out by hand; the fixture contract holds the real slugifier to it. */
+const PROJECT_SLUG = "fixture-initiative";
+
+/** The actual export, with the team id a client of `who`'s team would supply and a valid name. */
+const createProject = (who: Principal) => createProjectAction({ teamId: who.team.id, name: PROJECT_NAME });
+
+/** An admitted creation's whole ledger: admission, the action's own client, then its three lower effects. */
+const projectLedger = (who: Principal) => [
+  ...memberAdmission(who),
+  SERVER_CLIENT,
+  projectInserted(who.team.id, PROJECT_SLUG),
+  singletonEnsured(who.team.id, who.memberId),
+  projectGranted(who.team.id, FIRST_PROJECT, singletonOf(who.memberId)),
+  pointerEnsured(who.team.id, FIRST_PROJECT),
+];
+
+/** The project row, the creator grant and the pointer write of one admitted creation by `who`, and nothing else. */
+function expectProjectCreated(who: Principal, result: unknown, label?: string): void {
+  expect(result, label).toStrictEqual({
+    ok: true,
+    project: { id: FIRST_PROJECT, slug: PROJECT_SLUG, name: PROJECT_NAME },
+  });
+  // Admission precedes the action's own client; the insert precedes the grant; the grant precedes the pointer.
+  expect(ledger, label).toEqual(projectLedger(who));
+  expect(desk.projects, label).toEqual([
+    { id: FIRST_PROJECT, team_id: who.team.id, slug: PROJECT_SLUG, name: PROJECT_NAME, kind: "initiative" },
+  ]);
+  // The creator is the server-resolved member, as grantee and as actor; the client supplied neither.
+  expect(h.ensurePersonSingleton.mock.calls, label).toEqual([[serverDb, who.team.id, who.memberId, who.memberId]]);
+  expect(h.grantProjectToGroup.mock.calls, label).toEqual([
+    [serverDb, who.team.id, FIRST_PROJECT, singletonOf(who.memberId), who.memberId],
+  ]);
+  expect(h.ensureProjectGraphPointer.mock.calls, label).toEqual([
+    [serverDb, { teamId: who.team.id, projectId: FIRST_PROJECT }],
+  ]);
+}
+
+/** Signed Dana against the healthy world: the export must create, grant and point for her and her team. */
+async function admittedProjectControl(): Promise<void> {
+  beginRequest(tokens.dana);
+  expectProjectCreated(DANA_MEMBERSHIP, await createProject(DANA_MEMBERSHIP), CONTROL);
+}
+
+/** Everything an admitted creation carried downstream: its effects, its row and its lower owners' arguments. */
+const projectTrace = () =>
+  JSON.stringify([effects(), desk.projects, MEMBER_LOWER.map((owner) => owner.mock.calls.map((call) => call.slice(1)))]);
+
+/** Role and posture are not conjuncts of this export: each of these callers is admitted like Dana. */
+const ROLE_OR_POSTURE_VARIANTS: Array<{ name: string; arrange(): void; posture: ViewerPosture }> = [
+  {
+    name: "an active lead holding the team's builtin everyone row",
+    arrange: () => {
+      danaMembership().role = "lead";
+    },
+    posture: "team",
+  },
+  {
+    name: "an active admin holding the team's builtin everyone row",
+    arrange: () => {
+      danaMembership().role = "admin";
+    },
+    posture: "team",
+  },
+  {
+    name: "an active member with no group membership at all (external posture)",
+    arrange: () => {
+      world.group_members = world.group_members.filter((row) => row.member_id !== DANA_MEMBER);
+    },
+    posture: "external",
+  },
+  {
+    name: "an active member holding only the team's builtin external group (external posture)",
+    arrange: () => {
+      danaEveryoneRow().group_id = TEAM_EXTERNAL;
+    },
+    posture: "external",
+  },
+];
+
+// ── F: recordFindingDecision ─────────────────────────────────────────────────────────────────────
+
+/** A lead or admin together with the codebase and finding the desk holds for their team. */
+interface FindingRealm {
+  who: Principal;
+  codebaseSlug: string;
+  codebaseId: string;
+  findingId: string;
+  /** A member of this team to own the decision. */
+  owner: string;
+}
+const ALICE_FINDINGS: FindingRealm = {
+  who: ALICE_ADMIN,
+  codebaseSlug: CODEBASE_SLUG,
+  codebaseId: CODEBASE,
+  findingId: FINDING,
+  owner: CAROL_MEMBER,
+};
+const BOB_FINDINGS: FindingRealm = {
+  who: BOB_ADMIN,
+  codebaseSlug: OTHER_CODEBASE_SLUG,
+  codebaseId: OTHER_CODEBASE,
+  findingId: OTHER_FINDING,
+  owner: BOB_MEMBER,
+};
+const findingIds = (realm: FindingRealm) => [
+  realm.who.team.id,
+  realm.who.memberId,
+  realm.codebaseId,
+  realm.findingId,
+  realm.owner,
+];
+
+const DECISION_STATUS = "accepted";
+const DECISION_REASON = "Synthetic accepted reason for the fixture";
+/** Thirty days out: inside the window the SQL function accepts, though no double here checks it. */
+const DECISION_EXPIRES_AT = new Date(Date.now() + 30 * 86_400_000).toISOString();
+
+const decisionFor = (realm: FindingRealm): FindingDecision => ({
+  findingId: realm.findingId,
+  ownerMemberId: realm.owner,
+  status: DECISION_STATUS,
+  reason: DECISION_REASON,
+  expiresAt: DECISION_EXPIRES_AT,
+});
+
+/** The actual export, with the slugs and decision a lead or admin of the realm's team would supply. */
+const recordDecision = (realm: FindingRealm) =>
+  recordFindingDecision(realm.who.team.slug, realm.codebaseSlug, decisionFor(realm));
+
+/** The two reads the action issues before the caller is identified. */
+const findingTeamReads = (teamSlug: string) => [SERVER_CLIENT, readTeam(teamSlug)];
+const findingAdmission = (who: Principal) => [...findingTeamReads(who.team.slug), ...memberAdmission(who)];
+const findingEffects = (realm: FindingRealm) => [
+  codebaseRead(realm.who.team.id, realm.codebaseSlug),
+  ADMIN_CLIENT,
+  findingDecided(realm.who.team.id, realm.codebaseId, realm.findingId, realm.who.memberId),
+  audited("codebase_finding.decision"),
+  revalidated(codebasePath(realm.who.team.slug, realm.codebaseSlug)),
+];
+
+/** The identity read, the one rpc, the audit row and the revalidation of one admitted decision, and nothing else. */
+function expectFindingDecided(realm: FindingRealm, result: unknown, label?: string): void {
+  const { who } = realm;
+  expect(result, label).toStrictEqual({ ok: true });
+  // The team read precedes identification; every prerequisite read precedes the codebase identity read.
+  expect(ledger, label).toEqual([...findingAdmission(who), ...findingEffects(realm)]);
+  // Team, codebase and actor are the server's; finding, owner, status, reason and expiry are forwarded.
+  expect(desk.decisions, label).toEqual([
+    {
+      p_team_id: who.team.id,
+      p_codebase_id: realm.codebaseId,
+      p_finding_id: realm.findingId,
+      p_actor_member_id: who.memberId,
+      p_owner_member_id: realm.owner,
+      p_decision_status: DECISION_STATUS,
+      p_reason: DECISION_REASON,
+      p_expires_at: DECISION_EXPIRES_AT,
+    },
+  ]);
+  // Exactly the bound finding moved; every other desk row is as it stood.
+  expect(desk, label).toEqual({
+    ...standingDesk(),
+    findings: standingDesk().findings.map((row) =>
+      row.id === realm.findingId
+        ? {
+            ...row,
+            status: DECISION_STATUS,
+            decision_owner_member_id: realm.owner,
+            decision_by_member_id: who.memberId,
+          }
+        : row,
+    ),
+    decisions: desk.decisions,
+  });
+  expect(vault.audit_log, label).toEqual([
+    auditRow(who, {
+      action: "codebase_finding.decision",
+      target_type: "codebase_finding",
+      target_id: realm.findingId,
+      meta: { status: DECISION_STATUS, owner_member_id: realm.owner, expires_at: DECISION_EXPIRES_AT },
+    }),
+  ]);
+  expect(h.adminClient, label).toHaveBeenCalledTimes(1);
+}
+
+/** Signed Alice against the healthy world: the export must decide her team's finding as her. */
+async function admittedFindingControl(): Promise<void> {
+  beginRequest(tokens.alice);
+  expectFindingDecided(ALICE_FINDINGS, await recordDecision(ALICE_FINDINGS), CONTROL);
+}
+
+/** Everything an admitted decision carried downstream: its effects, its rpc arguments and its audit row. */
+const findingTrace = () => JSON.stringify([effects(), desk.decisions, vault.audit_log]);
+
+/** The membership admits; the inline role arm or the inline team-posture arm does not. */
+const ROLE_OR_POSTURE_REFUSALS: Array<{ name: string; arrange(): void; postures: PosturePremise[] }> = [
+  {
+    name: "an active member holding the team's builtin everyone row (role)",
+    arrange: () => {
+      aliceMembership().role = "member";
+    },
+    postures: [aliceHere("team")],
+  },
+  {
+    name: "an active admin with no group membership at all (posture)",
+    arrange: () => {
+      world.group_members = world.group_members.filter((row) => row.member_id !== ALICE_MEMBER);
+    },
+    postures: [aliceHere("external")],
+  },
+  {
+    name: "an active admin holding only the team's builtin external group (posture)",
+    arrange: () => {
+      aliceEveryoneRow().group_id = TEAM_EXTERNAL;
+    },
+    postures: [aliceHere("external")],
+  },
+  {
+    name: "an active lead holding only the team's builtin external group (posture)",
+    arrange: () => {
+      aliceMembership().role = "lead";
+      aliceEveryoneRow().group_id = TEAM_EXTERNAL;
+    },
+    postures: [aliceHere("external")],
+  },
+  {
+    name: "an active admin whose team's everyone-slug group is not builtin (posture)",
+    arrange: () => {
+      standing("groups", (row) => row.id === TEAM_EVERYONE).is_builtin = false;
+    },
+    postures: [aliceHere("external")],
+  },
+  {
+    name: "an active admin whose only builtin everyone row is bound to another team (posture)",
+    arrange: () => {
+      Object.assign(aliceEveryoneRow(), { team_id: OTHER_TEAM.id, group_id: OTHER_EVERYONE });
+    },
+    // The row is a real builtin everyone row — for the other team only.
+    postures: [aliceHere("external"), { teamId: OTHER_TEAM.id, memberId: ALICE_MEMBER, is: "team" }],
+  },
+];
+
+describe("X — fixture contract of the member-tier continuation (Dana, the desk, the inputs of M and F)", () => {
+  it("identities, the token, the realms and both exports' inputs are what the cases call them", async () => {
+    const ids = [
+      TEAM.id,
+      OTHER_TEAM.id,
+      ALICE.id,
+      BOB.id,
+      CAROL_USER,
+      DANA.id,
+      ALICE_MEMBER,
+      BOB_MEMBER,
+      CAROL_MEMBER,
+      DANA_MEMBER,
+      CODEBASE,
+      FINDING,
+      OTHER_CODEBASE,
+      OTHER_FINDING,
+      FIRST_PROJECT,
+      mintedProjectId(2),
+    ];
+    expect(new Set(ids).size, FIXTURE).toBe(ids.length);
+    for (const id of ids) expect(id, FIXTURE).toMatch(UUID_V4);
+    expect(CODEBASE_SLUG, FIXTURE).not.toBe(OTHER_CODEBASE_SLUG);
+
+    await expect(verifySession(tokens.dana), FIXTURE).resolves.toStrictEqual(DANA);
+    // Dana is what M calls her: an active ordinary member of TEAM in team posture.
+    expect(healthyWorld().members.find((row) => row.id === DANA_MEMBER), FIXTURE).toEqual({
+      id: DANA_MEMBER,
+      team_id: TEAM.id,
+      auth_user_id: DANA.id,
+      role: "member",
+      status: "active",
+    });
+    await expect(resolveViewerPosture(guardDb, TEAM.id, DANA_MEMBER), FIXTURE).resolves.toBe("team");
+
+    // M's input passes the action's own validation, and the two refused names really are unsluggable.
+    expect(PROJECT_NAME.trim(), FIXTURE).toBe(PROJECT_NAME);
+    expect(slugify(PROJECT_NAME), FIXTURE).toBe(PROJECT_SLUG);
+    expect([slugify("   "), slugify("!!!")], FIXTURE).toEqual(["", ""]);
+
+    // F's input passes the real schema unchanged, and each realm names what the desk holds for its team.
+    for (const realm of [ALICE_FINDINGS, BOB_FINDINGS]) {
+      const parsed = findingDecisionSchema.safeParse(decisionFor(realm));
+      expect(parsed.success && parsed.data, FIXTURE).toEqual(decisionFor(realm));
+      expect(
+        standingDesk().codebases.filter((row) => row.team_id === realm.who.team.id),
+        FIXTURE,
+      ).toEqual([{ id: realm.codebaseId, team_id: realm.who.team.id, slug: realm.codebaseSlug }]);
+      expect(
+        standingDesk().findings.filter((row) => row.team_id === realm.who.team.id),
+        FIXTURE,
+      ).toEqual([{ id: realm.findingId, team_id: realm.who.team.id, codebase_id: realm.codebaseId, status: "open" }]);
+      expect(
+        healthyWorld()
+          .members.filter((row) => row.team_id === realm.who.team.id)
+          .map((row) => row.id),
+        FIXTURE,
+      ).toContain(realm.owner);
+    }
+    expect(Date.parse(DECISION_EXPIRES_AT), FIXTURE).toBeGreaterThan(Date.now());
+  });
+
+  it("the desk answers its three statements, really applies their bindings, records each as an effect, and refuses anything else", async () => {
+    const own = await guardDb.from("codebases").select("id").eq("team_id", TEAM.id).eq("slug", CODEBASE_SLUG).maybeSingle();
+    const foreign = await guardDb
+      .from("codebases")
+      .select("id")
+      .eq("team_id", TEAM.id)
+      .eq("slug", OTHER_CODEBASE_SLUG)
+      .maybeSingle();
+    const inserted = await guardDb
+      .from("projects")
+      .insert({ team_id: TEAM.id, slug: "fixture-contract", name: "Fixture contract", kind: "initiative" })
+      .select("id, slug, name")
+      .single();
+
+    expect({ own, foreign, inserted }, FIXTURE).toEqual({
+      own: { data: { id: CODEBASE }, error: null, count: null },
+      foreign: { data: null, error: null, count: null },
+      inserted: {
+        data: { id: FIRST_PROJECT, slug: "fixture-contract", name: "Fixture contract" },
+        error: null,
+        count: null,
+      },
+    });
+    expect(desk.projects, FIXTURE).toEqual([
+      { id: FIRST_PROJECT, team_id: TEAM.id, slug: "fixture-contract", name: "Fixture contract", kind: "initiative" },
+    ]);
+
+    // The rpc double binds the finding by (id, team, codebase): another team's finding is not found
+    // and stays as it stood. It checks nothing else.
+    const args = (findingId: string) => ({
+      p_team_id: TEAM.id,
+      p_codebase_id: CODEBASE,
+      p_finding_id: findingId,
+      p_actor_member_id: ALICE_MEMBER,
+      p_owner_member_id: CAROL_MEMBER,
+      p_decision_status: DECISION_STATUS,
+      p_reason: DECISION_REASON,
+      p_expires_at: DECISION_EXPIRES_AT,
+    });
+    const crossed = await vaultDb.rpc("decide_codebase_finding", args(OTHER_FINDING));
+    expect(crossed, FIXTURE).toEqual({ data: null, error: { message: "finding not found" }, count: null });
+    expect(desk.findings, FIXTURE).toEqual(standingDesk().findings);
+    const decided = await vaultDb.rpc("decide_codebase_finding", args(FINDING));
+    expect(decided, FIXTURE).toEqual({
+      data: { finding_id: FINDING, status: DECISION_STATUS },
+      error: null,
+      count: null,
+    });
+    expect(
+      desk.findings.map((row) => row.status),
+      FIXTURE,
+    ).toEqual([DECISION_STATUS, "open"]);
+
+    // Every one of them is an effect: none can hide among the permission prerequisites.
+    expect(reads(), FIXTURE).toEqual([]);
+    expect(ledger, FIXTURE).toEqual([
+      codebaseRead(TEAM.id, CODEBASE_SLUG),
+      codebaseRead(TEAM.id, OTHER_CODEBASE_SLUG),
+      projectInserted(TEAM.id, "fixture-contract"),
+      findingDecided(TEAM.id, CODEBASE, OTHER_FINDING, ALICE_MEMBER),
+      findingDecided(TEAM.id, CODEBASE, FINDING, ALICE_MEMBER),
+    ]);
+    ledger.length = 0;
+
+    // A different select list, a missing filter, a projects read, another returning list and any
+    // other write through the server client are all still refused.
+    const unmodelled = [
+      () => guardDb.from("codebases").select("*").eq("team_id", TEAM.id).eq("slug", CODEBASE_SLUG).maybeSingle(),
+      () => guardDb.from("codebases").select("id").eq("slug", CODEBASE_SLUG).maybeSingle(),
+      () => guardDb.from("projects").select("id").eq("team_id", TEAM.id).eq("slug", "fixture-contract").maybeSingle(),
+      () => guardDb.from("projects").insert({ team_id: TEAM.id, slug: "x", name: "x" }).select("id").single(),
+    ];
+    for (const issue of unmodelled) {
+      await expect(Promise.resolve().then(issue), FIXTURE).rejects.toThrow(/unmodelled statement/);
+    }
+    expect(() => guardDb.from("codebases").insert({ team_id: TEAM.id }), FIXTURE).toThrow(/asked to insert codebases/);
+    expect(effects(), FIXTURE).toEqual(["effect:serverClient.insert codebases"]);
+    expect(desk.projects, FIXTURE).toHaveLength(1);
+  });
+});
+
+describe(`M — ${PROJECT_KEY} (active same-team member; no role and no posture conjunct)`, () => {
+  it("admitted control: an ordinary member (role member, builtin everyone row) creates the project for the requested team, is then granted it, and its graph pointer is then written — in that order, for the server-resolved member", async () => {
+    beginRequest(tokens.dana);
+
+    const result = await createProject(DANA_MEMBERSHIP);
+    expectProjectCreated(DANA_MEMBERSHIP, result);
+
+    // The identity came from this request's cookie; membership and posture were each read once, and
+    // the action's own client is the second acquisition.
+    expect(reads()).toEqual([...memberAdmission(DANA_MEMBERSHIP), SERVER_CLIENT]);
+    expect(h.serverClient).toHaveBeenCalledTimes(2);
+    // No privileged client, audit row or revalidation is this action's own.
+    expect(h.adminClient).not.toHaveBeenCalled();
+    expect(h.revalidatePath).not.toHaveBeenCalled();
+    expect(vault).toEqual(standingVault());
+    for (const owner of LOWER) expect(owner).not.toHaveBeenCalled();
+    for (const tripwire of TRIPWIRES) expect(tripwire).not.toHaveBeenCalled();
+  });
+
+  it.each(ROLE_OR_POSTURE_VARIANTS)(
+    "$name → admitted identically: neither role nor posture is a conjunct of this export, and the same row, creator grant and pointer write follow for the server-resolved member",
+    async ({ arrange, posture }) => {
+      arrange();
+      beginRequest(tokens.dana);
+
+      expectProjectCreated(DANA_MEMBERSHIP, await createProject(DANA_MEMBERSHIP));
+
+      // Which row the case rearranged, in the real resolver's own words.
+      await expect(resolveViewerPosture(guardDb, TEAM.id, DANA_MEMBER), FIXTURE).resolves.toBe(posture);
+    },
+  );
+
+  it("binding: Dana's session creates in her team and Bob's in his, neither downstream trace carries the other's ids, and a team id the caller holds no membership under is refused", async () => {
+    beginRequest(tokens.dana);
+    expectProjectCreated(DANA_MEMBERSHIP, await createProject(DANA_MEMBERSHIP));
+    const danaTrace = projectTrace();
+    for (const foreign of [OTHER_TEAM.id, BOB_MEMBER, BOB.id]) expect(danaTrace).not.toContain(foreign);
+
+    resetBetween();
+
+    // Bob is an admin of his team: admitted as a member of it, like anyone else.
+    beginRequest(tokens.bob);
+    expectProjectCreated(BOB_ADMIN, await createProject(BOB_ADMIN));
+    const bobTrace = projectTrace();
+    for (const foreign of [TEAM.id, DANA_MEMBER, DANA.id]) expect(bobTrace).not.toContain(foreign);
+
+    resetBetween();
+
+    // The team id is the client's. It admits nothing by itself: the membership read is bound to it
+    // and to the session's user, and Dana holds none under the other team.
+    beginRequest(tokens.dana);
+    await expect(createProjectAction({ teamId: OTHER_TEAM.id, name: PROJECT_NAME })).resolves.toStrictEqual(
+      NOT_A_MEMBER,
+    );
+    expect(ledger).toEqual([SESSION_READ, SERVER_CLIENT, readMember(OTHER_TEAM.id, DANA.id)]);
+    expectNoProtectedEffect();
+  });
+
+  it.each(membershipRefusals(DANA_MEMBERSHIP, "dana"))(
+    "$name → refused as `not a member of this team`: only the prerequisite reads ran, and no second server client, projects insert, creator grant or graph pointer followed",
+    async ({ session, arrange, chain, postures }) => {
+      await admittedProjectControl();
+      resetBetween();
+
+      arrange();
+      beginRequest(sessionCookie(session));
+
+      await expect(createProject(DANA_MEMBERSHIP)).resolves.toStrictEqual(NOT_A_MEMBER);
+
+      // The chain holds at most one server client: the action's own, its second, was never acquired.
+      expect(reads()).toEqual(chain);
+      expect(ledger).toEqual(chain);
+      expectNoProtectedEffect();
+
+      // Which conjunct the case removed: the posture row is as the case says it is.
+      for (const { teamId, memberId, is } of postures) {
+        await expect(resolveViewerPosture(guardDb, teamId, memberId), FIXTURE).resolves.toBe(is);
+      }
+    },
+  );
+
+  it.each(POSTURE_FAULTS)(
+    "$name after the session and active membership are admitted: the export rejects with the owner's fault — never a refusal, never a result — and no insert, creator grant or graph pointer followed, though posture is not a conjunct of this export",
+    async ({ form }) => {
+      await admittedProjectControl();
+      resetBetween();
+
+      postureFault = form;
+      beginRequest(tokens.dana);
+
+      const settled = await settle(createProject(DANA_MEMBERSHIP));
+
+      expect(settled).not.toHaveProperty("value");
+      if (form === "rejected read") {
+        expect(settled.thrown).toBe(postureRejection);
+      } else {
+        expect(settled.thrown).toBeInstanceOf(Error);
+        expect((settled.thrown as Error).message).toBe(`posture read failed: ${POSTURE_FAULT}`);
+      }
+
+      // The fault came from the posture statement itself, issued for the supplied team and resolved member.
+      expect(reads()).toEqual(memberAdmission(DANA_MEMBERSHIP));
+      expect(ledger).toEqual(memberAdmission(DANA_MEMBERSHIP));
+      expectNoProtectedEffect();
+    },
+  );
+
+  it.each([
+    { name: "", label: "an empty name" },
+    { name: "   ", label: "a blank name" },
+    { name: "!!!", label: "an unsluggable name" },
+  ])(
+    "$label is refused by the action's own validation before any identity read (not an authorization refusal): nothing is read and nothing follows",
+    async ({ name }) => {
+      beginRequest(tokens.dana);
+
+      await expect(createProjectAction({ teamId: TEAM.id, name })).resolves.toStrictEqual({
+        ok: false,
+        error: "a project name is required",
+      });
+
+      expect(ledger).toEqual([]);
+      expect(h.cookies).not.toHaveBeenCalled();
+      expectNoProtectedEffect();
+    },
+  );
+});
+
+describe(`F — ${FINDING_KEY} (active same-team admin or lead, in team posture)`, () => {
+  it.each([{ role: "admin" }, { role: "lead" }])(
+    "admitted control: an active $role holding the team's builtin everyone row reaches the codebase identity read for the server-resolved team, then one decision rpc carrying the resolved team, codebase and actor, one audit row and the revalidation",
+    async ({ role }) => {
+      aliceMembership().role = role;
+      beginRequest(tokens.alice);
+
+      const result = await recordDecision(ALICE_FINDINGS);
+      expectFindingDecided(ALICE_FINDINGS, result);
+
+      // The team was read by slug before the caller was identified; membership and posture once each.
+      expect(reads()).toEqual(findingAdmission(ALICE_ADMIN));
+      expect(effects()).toEqual(findingEffects(ALICE_FINDINGS));
+      expect(h.revalidatePath.mock.calls).toEqual([[codebasePath(TEAM.slug, CODEBASE_SLUG)]]);
+      for (const owner of [...LOWER, ...MEMBER_LOWER]) expect(owner).not.toHaveBeenCalled();
+      for (const tripwire of TRIPWIRES) expect(tripwire).not.toHaveBeenCalled();
+    },
+  );
+
+  it("binding: Alice's session decides her team's finding and Bob's decides his, and neither downstream trace carries the other's ids", async () => {
+    beginRequest(tokens.alice);
+    expectFindingDecided(ALICE_FINDINGS, await recordDecision(ALICE_FINDINGS));
+    const aliceTrace = findingTrace();
+    for (const foreign of findingIds(BOB_FINDINGS)) expect(aliceTrace).not.toContain(foreign);
+
+    resetBetween();
+
+    beginRequest(tokens.bob);
+    expectFindingDecided(BOB_FINDINGS, await recordDecision(BOB_FINDINGS));
+    const bobTrace = findingTrace();
+    for (const foreign of findingIds(ALICE_FINDINGS)) expect(bobTrace).not.toContain(foreign);
+  });
+
+  it.each(membershipRefusals(ALICE_ADMIN, "alice"))(
+    "$name → refused as `team leads or admins only`: only the team read and the membership chain ran, and no codebase identity read, privileged client, decision rpc, audit row or revalidation followed",
+    async ({ session, arrange, chain, postures }) => {
+      await admittedFindingControl();
+      resetBetween();
+
+      arrange();
+      beginRequest(sessionCookie(session));
+
+      await expect(recordDecision(ALICE_FINDINGS)).resolves.toStrictEqual(LEADS_OR_ADMINS_ONLY);
+
+      const prerequisites = [...findingTeamReads(TEAM.slug), ...chain];
+      expect(reads()).toEqual(prerequisites);
+      expect(ledger).toEqual(prerequisites);
+      expectNoProtectedEffect();
+
+      for (const { teamId, memberId, is } of postures) {
+        await expect(resolveViewerPosture(guardDb, teamId, memberId), FIXTURE).resolves.toBe(is);
+      }
+    },
+  );
+
+  it.each(ROLE_OR_POSTURE_REFUSALS)(
+    "$name → refused as `team leads or admins only` with the session and active membership admitted: no codebase identity read, privileged client, decision rpc, audit row or revalidation followed",
+    async ({ arrange, postures }) => {
+      await admittedFindingControl();
+      resetBetween();
+
+      arrange();
+      beginRequest(tokens.alice);
+
+      await expect(recordDecision(ALICE_FINDINGS)).resolves.toStrictEqual(LEADS_OR_ADMINS_ONLY);
+
+      // The whole chain ran: the refusal is the action's own inline role or posture arm.
+      expect(reads()).toEqual(findingAdmission(ALICE_ADMIN));
+      expect(ledger).toEqual(findingAdmission(ALICE_ADMIN));
+      expectNoProtectedEffect();
+
+      // Which conjunct the case removed, in the real resolver's own words.
+      for (const { teamId, memberId, is } of postures) {
+        await expect(resolveViewerPosture(guardDb, teamId, memberId), FIXTURE).resolves.toBe(is);
+      }
+    },
+  );
+
+  it.each(POSTURE_FAULTS)(
+    "$name after the session and active membership are admitted: the export rejects with the owner's fault — never a refusal, never a result — and no codebase identity read or anything after it followed",
+    async ({ form }) => {
+      await admittedFindingControl();
+      resetBetween();
+
+      postureFault = form;
+      beginRequest(tokens.alice);
+
+      const settled = await settle(recordDecision(ALICE_FINDINGS));
+
+      expect(settled).not.toHaveProperty("value");
+      if (form === "rejected read") {
+        expect(settled.thrown).toBe(postureRejection);
+      } else {
+        expect(settled.thrown).toBeInstanceOf(Error);
+        expect((settled.thrown as Error).message).toBe(`posture read failed: ${POSTURE_FAULT}`);
+      }
+
+      expect(reads()).toEqual(findingAdmission(ALICE_ADMIN));
+      expect(ledger).toEqual(findingAdmission(ALICE_ADMIN));
+      expectNoProtectedEffect();
+    },
+  );
+
+  it("after admission, a codebase slug only the other team holds is `codebase not found`: the identity read is bound to the server-resolved team, and no privileged client, decision rpc, audit row or revalidation followed", async () => {
+    await admittedFindingControl();
+    resetBetween();
+
+    beginRequest(tokens.alice);
+
+    const result = await recordFindingDecision(TEAM.slug, OTHER_CODEBASE_SLUG, {
+      ...decisionFor(ALICE_FINDINGS),
+      findingId: OTHER_FINDING,
+    });
+
+    expect(result).toStrictEqual({ ok: false, error: "codebase not found" });
+    // The one effect is the identity read itself, for Alice's team and the supplied slug.
+    expect(ledger).toEqual([...findingAdmission(ALICE_ADMIN), codebaseRead(TEAM.id, OTHER_CODEBASE_SLUG)]);
+    expect(h.adminClient).not.toHaveBeenCalled();
+    expect(h.revalidatePath).not.toHaveBeenCalled();
+    expect(vault).toEqual(standingVault());
+    expect(desk).toEqual(standingDesk());
+    // The slug is real — for the other team only.
+    expect(standingDesk().codebases.find((row) => row.slug === OTHER_CODEBASE_SLUG)?.team_id, FIXTURE).toBe(
+      OTHER_TEAM.id,
+    );
+  });
+
+  it("before any identity read: a decision the real schema rejects is refused with the schema's own message, and nothing at all is read", async () => {
+    const invalid = { ...decisionFor(ALICE_FINDINGS), reason: "too short" };
+    const parsed = findingDecisionSchema.safeParse(invalid);
+    if (parsed.success) throw new Error(`${FIXTURE} the real schema accepted the invalid decision`);
+    beginRequest(tokens.alice);
+
+    await expect(recordFindingDecision(TEAM.slug, CODEBASE_SLUG, invalid)).resolves.toStrictEqual({
+      ok: false,
+      error: parsed.error.issues[0]?.message ?? "invalid decision",
+    });
+
+    expect(ledger).toEqual([]);
+    expect(h.cookies).not.toHaveBeenCalled();
+    expectNoProtectedEffect();
+  });
+
+  it("before any identity read: with no session, an unknown team slug is `team not found` and a real one is the refusal — the slug's existence is distinguishable without identity (pinned as current, not endorsed)", async () => {
+    const unknownSlug = "aio1217-no-such-team";
+    beginRequest(null);
+
+    await expect(recordFindingDecision(unknownSlug, CODEBASE_SLUG, decisionFor(ALICE_FINDINGS))).resolves.toStrictEqual({
+      ok: false,
+      error: "team not found",
+    });
+    // The team read ran and the cookie was never read.
+    expect(ledger).toEqual(findingTeamReads(unknownSlug));
+    expect(h.cookies).not.toHaveBeenCalled();
+    expectNoProtectedEffect();
+
+    resetBetween();
+    beginRequest(null);
+
+    await expect(recordDecision(ALICE_FINDINGS)).resolves.toStrictEqual(LEADS_OR_ADMINS_ONLY);
+    expect(ledger).toEqual([...findingTeamReads(TEAM.slug), SESSION_READ]);
+    expectNoProtectedEffect();
+  });
+});
+
+// Each TODO names the later batch that owns it, in the terms of the two plans this slice follows:
+//   PG-GUARD   Phase-2 Batch 4, real-PG guard and posture association (next7 Sequence step 2).
+//   PG-OWNERS  Phase-2 Batch 4, the PM and admin-root/key native-owner files (next7 Sequence step 3).
+//   BATCH 5    Phase-2 Batch 5, admin integration/member families.
+//   MUTANTS    Phase-2 Batch 4, the coordinator's isolated-copy actual-import run after a clean
+//              baseline (next7 "Finite first-batch executing mutants"); outcomes are recorded for
+//              AC-12 in Batch 7. A compile, fixture or timeout failure is not a kill.
+// The real-Postgres complement of M and F is not a TODO here: it is the paired fixture
+// test/datamechanics/aio1217-project-finding-auth.datamechanics.test.ts, which carries its own.
 describe("Z — follow-up evidence this file does NOT supply (executable TODOs: none is run, none is passed)", () => {
   it.todo(
-    "REAL-PG (test/datamechanics): the five exports over real session, member and group rows through the pg adapter, with both stale legacy-tier directions — role admin with tier=team and no builtin everyone denies; role admin with tier=external and builtin everyone admits",
+    "PG-GUARD · REAL-PG (test/datamechanics): the five ADM exports over real session, member and group rows through the pg adapter, with both stale legacy-tier directions — role admin with tier=team and no builtin everyone denies; role admin with tier=external and builtin everyone admits",
   );
   it.todo(
-    "REAL-PG: a prior admitted fixture, then removal of the builtin everyone row, denies on a NEW invocation of each export; re-adding it admits again",
+    "PG-GUARD · REAL-PG: a prior admitted fixture, then removal of the builtin everyone row, denies on a NEW invocation of each of the five ADM exports; re-adding it admits again",
   );
   it.todo(
-    "REAL-PG native owner: lib/admin/keys issueApiKey and revokeApiKey over real api_keys and audit_log rows — hash-only storage, the (id, team) revoke predicate and the table's foreign keys",
+    "PG-OWNERS · REAL-PG native owner: lib/admin/keys issueApiKey and revokeApiKey over real api_keys and audit_log rows — hash-only storage, the (id, team) revoke predicate and the table's foreign keys",
   );
   it.todo(
-    "REAL-PG native owner: projectAllTasks, recordProjectionRun and reconcileProviderState over real projects, tasks, task_pm_links and ingest_runs rows with a recording provider transport (no live board)",
+    "PG-OWNERS · REAL-PG native owner: projectAllTasks, recordProjectionRun and reconcileProviderState over real projects, tasks, task_pm_links and ingest_runs rows with a recording provider transport (no live board)",
   );
   it.todo(
-    "REAL-PG native owner: getProvisioningAvailability over real integrations rows, including the secret resolution beneath this file's seam",
+    "BATCH 5 · REAL-PG native owner: getProvisioningAvailability over real integrations rows, including the secret resolution beneath this file's seam",
   );
   it.todo(
     "DEFERRED AIO-1226: the desired same-team member-target refusal for admin issueApiKey — owned by that ticket; not specified, asserted or implemented by this file",
   );
   it.todo(
-    "MUTANT (isolated copy, actual import): remove the requireAdmin call from each of the five exports — the 13 refusal cases must fail on the result and on the ledger",
+    "MUTANTS · isolated copy, actual import: remove the requireAdmin call from each of the five ADM exports, and substitute an admitted constant for the currentMember verdict in createProjectAction and recordFindingDecision — the 13 ADM refusals, M's 6 and F's 12 must fail on the result and on the ledger",
   );
   it.todo(
-    "MUTANT: keep the requireAdmin call but ignore its null verdict in each export — the refusal cases must fail, not a compile or fixture error",
+    "MUTANTS · keep the guard call but ignore its null verdict in each of the seven exports — the refusal cases must fail, not a compile or fixture error",
   );
   it.todo(
-    "MUTANT: replace requireTeamAdmin with a session-only or currentMember check — the lead, member and three external-posture cases must fail",
+    "MUTANTS · replace requireTeamAdmin with a session-only or currentMember check — the ADM lead, member and three external-posture cases must fail; and in recordFindingDecision drop the inline role arm, then the inline tier arm — F's member-role case, then its five posture cases, must fail",
   );
   it.todo(
-    "MUTANT (test-time substitution of lib/integrations/read, no on-disk edit): drop the role conjunct, then the posture conjunct, of canAccessAdmin — the matching role and posture cases must fail",
+    "MUTANTS · test-time substitution of lib/integrations/read, no on-disk edit: drop the role conjunct, then the posture conjunct, of canAccessAdmin — the matching ADM role and posture cases must fail",
   );
   it.todo(
-    "MUTANT: move each export's lower effect above its admission — the refusal ledgers and the standing-vault comparison must fail",
+    "MUTANTS · move each of the seven exports' lower effect above its admission — the refusal ledgers and the standing vault and desk comparisons must fail",
   );
   it.todo(
-    "MUTANT: swap the refusal shapes (availability returns the admins-only object; another export returns []) — S and the per-export refusal cases must fail",
+    "MUTANTS · swap the refusal shapes (availability returns the admins-only object; another ADM export returns []) — S and the per-export refusal cases must fail",
   );
   it.todo(
-    "MUTANT: drop the team filter from projectBoardAction's own projects read — the admitted control must fail on the third, foreign projection",
+    "MUTANTS · drop the team filter from projectBoardAction's own projects read — the admitted control must fail on the third, foreign projection; and (test-time substitution of lib/metrics/codebases) drop the team predicate from getCodebaseIdentity's read — F's `codebase not found` case must fail",
   );
 });
