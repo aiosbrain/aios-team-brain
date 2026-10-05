@@ -324,16 +324,25 @@ function projectedFrontmatter(row: {
   return frontmatter;
 }
 
-/** Distinct retained participant ids. They are counted, never resolved and never echoed. */
-function participantAuthorIds(participants: unknown): string[] {
+/**
+ * The distinct author evidence retained participants carry: whatever is stored under a PRESENT
+ * `author_id` key, string or not. A number or a null there is not an account id, but it is author
+ * evidence somebody stored, and dropping it here would hide it from the diagnostics — the classifier
+ * reports it as invalid input. A participant with no `author_id` key carries no author evidence.
+ * These values are counted by status only: never resolved, never echoed.
+ */
+function participantAuthorEvidence(participants: unknown): unknown[] {
   if (!Array.isArray(participants)) return [];
-  const ids = new Set<string>();
+  const evidence = new Map<string, unknown>();
   for (const participant of participants as unknown[]) {
     if (typeof participant !== "object" || participant === null || Array.isArray(participant)) continue;
+    if (!Object.prototype.hasOwnProperty.call(participant, "author_id")) continue;
     const authorId = (participant as { author_id?: unknown }).author_id;
-    if (typeof authorId === "string") ids.add(authorId);
+    // Distinct by stored value. The prefix keeps the string "7" apart from the number 7.
+    const key = typeof authorId === "string" ? `string:${authorId}` : `json:${JSON.stringify(authorId)}`;
+    evidence.set(key, authorId);
   }
-  return [...ids];
+  return [...evidence.values()];
 }
 
 function pushGrouped<K, V>(groups: Map<K, V[]>, key: K, value: V): void {
@@ -703,7 +712,7 @@ async function readAuthorStatuses(
     if (!row.has_participants) continue;
     statuses.set(
       row.id,
-      participantAuthorIds(row.participants).map((externalId) =>
+      participantAuthorEvidence(row.participants).map((externalId) =>
         classifySlackRepairAuthor({
           teamId: scope.teamId,
           externalId,

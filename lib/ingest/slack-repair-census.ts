@@ -549,10 +549,18 @@ export function classifySlackRepairRelationship(input: SlackRepairRelationshipFa
       // source's own rows included), makes the row one conflicting entry instead — never both. A path
       // segment is lower-case on disk, so the stored workspace is compared to it case-folded; the
       // channel stays byte-exact.
+      //
+      // That fold is for comparing against the canonical path only. It never makes two stored ids one:
+      // `T2` and `t2` are two workspace identities, the path cannot be the path of both, and a ledger
+      // holding both contradicts itself. So the path may be supported by ONE byte-exact stored
+      // workspace identity, and more than one is a contradiction even when each folds to the segment.
       const pathWorkspace = parsed.workspaceSegment.toLowerCase();
-      const ledgerContradictsPath = input.ledgerSources.some(
-        (source) => source.workspaceId.toLowerCase() !== pathWorkspace || source.channelId !== scope.channelId
-      );
+      const ledgerWorkspaces = new Set(input.ledgerSources.map((source) => source.workspaceId));
+      const ledgerContradictsPath =
+        ledgerWorkspaces.size > 1 ||
+        input.ledgerSources.some(
+          (source) => source.workspaceId.toLowerCase() !== pathWorkspace || source.channelId !== scope.channelId
+        );
       if (metadataDiffers || ledgerContradictsPath) return entry("conflicting_evidence", [metadataLabel, ledgerLabel]);
       return notAnEntry("other_workspace", parsed.workspaceSegment);
     }
