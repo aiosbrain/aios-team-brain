@@ -29,6 +29,7 @@ import {
   bindSlackSelection,
   blockSlackBinding,
   delaySlackBinding,
+  isSlackBinderValid,
   lockSlackSelection,
   recordSlackAppIdentity,
   recordSlackWorkspaceIdentity,
@@ -556,6 +557,15 @@ class SlackChannelGoneAbort extends Error {
   }
 }
 
+/**
+ * The stand-down diagnostic: this channel is bound to another integration that is still a valid
+ * binder, so this pass asked nothing about it. STATIC — no part of it comes from a provider or a row.
+ * It is the one `skipped` step that is NOT deferred work (see `finish`): nothing is owed.
+ */
+const BOUND_TO_VALID_INTEGRATION = "bound_to_valid_integration";
+const BOUND_TO_VALID_INTEGRATION_DETAIL =
+  "Another enabled, verified Slack integration selects this channel in this workspace.";
+
 /** Prove at most ONE due channel public per pass; the shared `conversations.info` budget is 1/min. */
 async function proveChannel(
   pass: Pass,
@@ -579,10 +589,46 @@ async function proveChannel(
   });
 
   const now = Date.now();
-  const target = states.find((state) =>
-    needsSlackPublicProof(state, ref, now, pass.options.metadataIntervalMs ?? SLACK_METADATA_INTERVAL_MS)
-  );
-  if (!target) return;
+  const intervalMs = pass.options.metadataIntervalMs ?? SLACK_METADATA_INTERVAL_MS;
+  // ⚠️ A CHANNEL BOUND TO A VALID BINDER IS NOT THIS INTEGRATION'S TO PROVE. Two integrations selecting
+  // one channel share one frontier row; `needsSlackPublicProof` reads a binding that is not ours as
+  // "needs proof", and acting on that alone re-proved the channel and flipped its owner on every
+  // wake of the non-binder. So that predicate stays pure, and the question of WHOSE the channel is is
+  // asked separately: one lock-free, token-free read of the recorded binder's stored facts.
+  //   · valid   → stand down: no reservation, no attempt, no request, no rebind — and CONTINUE, so a
+  //               coalesced channel cannot block the next candidate. It costs no request allowance.
+  //   · invalid → the ordinary proof path below, at once (no proof-age delay): first proof/takeover.
+  //   · a failed read REJECTS the pass. It is never read as "invalid", which is what takes a channel.
+  // A channel bound to nobody, or to this integration, is not asked about at all.
+  let candidate: SlackChannelState | undefined;
+  for (const state of states) {
+    if (!needsSlackPublicProof(state, ref, now, intervalMs)) continue;
+    const binderId = state.bindingIntegrationId;
+    if (binderId !== null && binderId !== ref.integrationId) {
+      const valid = await runContextTransaction(pass.input.db, (session) =>
+        isSlackBinderValid(session, {
+          teamId: state.scope.teamId,
+          integrationId: binderId,
+          workspaceId: state.scope.workspaceId,
+          channelId: state.scope.channelId,
+        })
+      );
+      if (valid) {
+        step(pass, {
+          stage: "metadata",
+          result: "skipped",
+          category: BOUND_TO_VALID_INTEGRATION,
+          detail: BOUND_TO_VALID_INTEGRATION_DETAIL,
+          channelId: state.scope.channelId,
+        });
+        continue;
+      }
+    }
+    candidate = state;
+    break;
+  }
+  if (!candidate) return;
+  const target = candidate;
 
   const scope = verifiedScope(selection, bound);
   const channelId = target.scope.channelId;
@@ -1144,7 +1190,12 @@ function finish(pass: Pass, binding: SlackSourceBinding | null): SlackSourceDisc
       ? "blocked"
       : has("ok")
         ? "progressed"
-        : has("deferred") || has("delayed") || has("refused") || has("skipped")
+        : // Standing down behind a valid binder is the ONE skip that defers nothing: that channel is
+          // not this integration's work. Every other skipped step still means work left for a later wake.
+          has("deferred") ||
+            has("delayed") ||
+            has("refused") ||
+            pass.steps.some((s) => s.result === "skipped" && s.category !== BOUND_TO_VALID_INTEGRATION)
           ? "deferred"
           : "idle";
   return {

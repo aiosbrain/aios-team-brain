@@ -310,6 +310,62 @@ export async function teamHasCurrentSlackSource(session: TransactionSession, tea
   return rows[0]?.has_source === true;
 }
 
+/** One channel row, and the integration recorded as its binder. */
+export interface SlackBinderScope {
+  readonly teamId: string;
+  /** The row's `binding_integration_id` — an id somebody else recorded, not a trusted reference. */
+  readonly integrationId: string;
+  readonly workspaceId: string;
+  readonly channelId: string;
+}
+
+/**
+ * Whether the integration recorded as a channel's BINDER is still a valid one (AIO-1170
+ * pre-activation correction PA-2). Asked by a DIFFERENT integration before it would prove a channel
+ * that is bound to somebody else: while this is true it stands down, and the moment it is false it
+ * proves the channel and takes the binding.
+ *
+ * Valid means all FOUR stored facts hold, and nothing else is consulted:
+ *   1. the binder's integration row is `enabled` (disabling leaves its binding row verified forever);
+ *   2. its binding is `verified` (a binder mid-bootstrap, or blocked, is not);
+ *   3. its CURRENT `integrations.config` still selects the channel, canonicalized exactly as a pass
+ *      canonicalizes its own selection — never the binding's cached `selected_channel_ids`, which is
+ *      only refreshed when the binder next runs;
+ *   4. its binding's workspace is the channel row's workspace (the same channel id elsewhere is a
+ *      different frontier).
+ * Public status, proof age, the stored revision and `last_error_code` are NOT inputs.
+ *
+ * ⚠️ IT IS A QUESTION ABOUT SOMEBODY ELSE'S INTEGRATION, so it does none of what `lockSlackSelection`
+ * does for a pass's own row: no row lock (it would serialize the two integrations), no secret and no
+ * fingerprint column, no environment token, no decryption, no revision. One statement, scoped to the
+ * channel's team AND the recorded id AND the Slack type, with the binding joined on both halves of
+ * its key — so a binder id from another team, or one that is not a Slack integration, simply matches
+ * no row. There is no second, unscoped lookup to tell those absences apart: no row is invalid.
+ *
+ * A SQL failure REJECTS. `false` can only mean the read succeeded; an unreadable binder must never be
+ * mistaken for an invalid one, because invalid is what hands the channel to whoever asked.
+ */
+export async function isSlackBinderValid(session: TransactionSession, scope: SlackBinderScope): Promise<boolean> {
+  assertUuid("teamId", scope.teamId);
+  assertUuid("integrationId", scope.integrationId);
+  assertProviderId("workspaceId", scope.workspaceId);
+  assertProviderId("channelId", scope.channelId);
+  const result = await session.executeSql<{ config: unknown }>(
+    `select i.config
+       from integrations i
+       join slack_integration_bindings b
+         on b.team_id = i.team_id and b.integration_id = i.id
+      where i.team_id = $1 and i.id = $2::uuid and i.type = 'slack'
+        and i.status = 'enabled'
+        and b.state = 'verified'
+        and b.workspace_id = $3`,
+    [scope.teamId, scope.integrationId, scope.workspaceId]
+  );
+  const row = single(result);
+  if (!row) return false;
+  return canonicalSlackChannelIds(row.config).selected.includes(scope.channelId);
+}
+
 // ── the writes ───────────────────────────────────────────────────────────────
 
 /**
