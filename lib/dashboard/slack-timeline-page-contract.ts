@@ -485,7 +485,7 @@ export function assertSlackTimelineBindingUnchanged(expected: unknown, actual: u
   const b = strip(actual);
   if (!isBinding(a) || !isBinding(b)) fail("unavailable", "incomplete or malformed snapshot binding");
   for (const key of BINDING_KEYS) {
-    if ((a as Record<string, unknown>)[key] !== (b as Record<string, unknown>)[key]) {
+    if (a[key] !== b[key]) {
       fail("restart_required", "bound snapshot state changed");
     }
   }
