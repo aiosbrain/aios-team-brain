@@ -274,7 +274,48 @@ describe("inactive hydration transient backoff — exact jitter, taxonomy and sa
     nothingStagedOrAdvanced();
   });
 
-  it.each([[0], [-1], [1.5], [Number.NaN], [Number.POSITIVE_INFINITY], [Number.NEGATIVE_INFINITY], [2 ** 53], ["2"], [null], [undefined]])(
+  const INVALID_ORDINALS: unknown[] = [
+    0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 2 ** 53, "2", null, undefined,
+  ];
+
+  /** Every way a rejected value could have been rendered into an error message. */
+  function renderings(value: unknown): string[] {
+    const out = new Set<string>([String(value)]);
+    const json = JSON.stringify(value);
+    if (typeof json === "string") out.add(json);
+    return [...out].filter((rendering) => rendering.length > 0);
+  }
+
+  /**
+   * STATIC means one message for the whole invalid matrix, not one per input. Comparing messages only
+   * within a single input lets `Invalid ordinal: 2` pass for the string "2"; collecting them across
+   * every rejected value cannot, because a message that names its input differs between inputs.
+   */
+  function expectOneStaticMessage(messages: ReadonlySet<string>, rejected: readonly unknown[]): void {
+    expect([...messages], "one message for every rejected value").toHaveLength(1);
+    const [message] = [...messages];
+    expect(message.length).toBeGreaterThan(0);
+    for (const value of rejected) {
+      for (const rendering of renderings(value)) {
+        expect(message, `echoes ${JSON.stringify(rendering)}`).not.toContain(rendering);
+      }
+    }
+  }
+
+  it("TB-02 rejects every invalid claim ordinal with ONE static message that echoes none of them", async () => {
+    const messages = new Set<string>();
+    for (const attempts of INVALID_ORDINALS) {
+      for (const call of [transport("network_error"), provider("http_503"), provider("service_unavailable")]) {
+        stubs.releaseSlackThreadForRetry.mockClear();
+        const decision = await decide(call, { attempts, sample: 0.5 });
+        expect(decision.error, `ordinal ${String(attempts)}`).toBeInstanceOf(TypeError);
+        messages.add(String((decision.error as Error).message));
+      }
+    }
+    expectOneStaticMessage(messages, INVALID_ORDINALS);
+  });
+
+  it.each(INVALID_ORDINALS.map((attempts) => [attempts]))(
     "TB-02 rejects claim ordinal %s before sampling or releasing",
     async (attempts) => {
       const messages = new Set<string>();
@@ -382,6 +423,21 @@ describe("inactive hydration transient backoff — exact jitter, taxonomy and sa
     expect(outcome.sampler).not.toHaveBeenCalled();
   });
 
+  it("TB-06 the rate-limit fallback rejects every invalid ordinal with ONE static message that echoes none of them", async () => {
+    const messages = new Set<string>();
+    for (const attempts of INVALID_ORDINALS) {
+      for (const nextPermittedAt of [undefined, "", "not-a-date"]) {
+        stubs.releaseSlackThreadForRetry.mockClear();
+        const decision = await decide({ outcome: "rate_limited", category: "rate_limited", nextPermittedAt }, { attempts, sample: 0.25 });
+        expect(decision.error, `ordinal ${String(attempts)}`).toBeInstanceOf(TypeError);
+        expect(decision.sampler).not.toHaveBeenCalled();
+        expect(stubs.releaseSlackThreadForRetry).not.toHaveBeenCalled();
+        messages.add(String((decision.error as Error).message));
+      }
+    }
+    expectOneStaticMessage(messages, INVALID_ORDINALS);
+  });
+
   it.each([[0], [-1], [1.5], [Number.NaN], [Number.POSITIVE_INFINITY], [2 ** 53], ["2"]])(
     "TB-06 validates ordinal %s on the deterministic rate-limit fallback too",
     async (attempts) => {
@@ -443,7 +499,7 @@ describe("inactive hydration transient backoff — exact jitter, taxonomy and sa
     }
   });
 
-  it.each([
+  const INVALID_SAMPLES: [string, unknown][] = [
     ["NaN", Number.NaN],
     ["+Infinity", Number.POSITIVE_INFINITY],
     ["-Infinity", Number.NEGATIVE_INFINITY],
@@ -455,7 +511,25 @@ describe("inactive hydration transient backoff — exact jitter, taxonomy and sa
     ["undefined", undefined],
     ["an object", { valueOf: () => 0.5 }],
     ["a boolean", true],
-  ])("TB-07 rejects a sample of %s without coercion, release or any later mutation", async (_name, sample) => {
+  ];
+
+  it("TB-07 rejects every invalid sample with ONE static message that echoes none of them", async () => {
+    const messages = new Set<string>();
+    for (const [name, sample] of INVALID_SAMPLES) {
+      for (const call of [transport("network_error"), provider("http_503"), provider("request_timeout")]) {
+        for (const attempts of [1, 2, 9]) {
+          stubs.releaseSlackThreadForRetry.mockClear();
+          const decision = await decide(call, { attempts, sample });
+          expect(decision.error, `sample ${name}`).toBeInstanceOf(TypeError);
+          expect(stubs.releaseSlackThreadForRetry).not.toHaveBeenCalled();
+          messages.add(String((decision.error as Error).message));
+        }
+      }
+    }
+    expectOneStaticMessage(messages, INVALID_SAMPLES.map(([, sample]) => sample));
+  });
+
+  it.each(INVALID_SAMPLES)("TB-07 rejects a sample of %s without coercion, release or any later mutation", async (_name, sample) => {
     const messages = new Set<string>();
     for (const call of [transport("network_error"), provider("http_503"), provider("request_timeout")]) {
       for (const attempts of [1, 2, 9]) {
