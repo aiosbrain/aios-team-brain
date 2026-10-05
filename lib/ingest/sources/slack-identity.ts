@@ -101,7 +101,7 @@ export async function syncSlackIdentities(
 ): Promise<SlackIdentitySyncResult> {
   // Omitted BEFORE the shared writer: it would link an excluded account by email all the same. An
   // all-excluded directory hands it nothing, which is its existing no-op — zeros and no database work.
-  const admitted = admittedHumans(Array.isArray(users) ? users : []);
+  const admitted = admittedHumans(users);
   // Exact email only: Slack attribution must never rest on the local-part → handle guess (spec AC-07).
   return syncProviderIdentities(admin, teamId, "slack", admitted, { exactEmailOnly: true });
 }
