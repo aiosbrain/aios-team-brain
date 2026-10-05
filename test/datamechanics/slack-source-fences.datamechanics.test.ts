@@ -105,31 +105,35 @@ function partialPage(rootTs: string, cursor: string): () => Response {
 // ── 1. the metadata observation fence ────────────────────────────────────────
 
 describe("a channel's public verdict is fenced by the attempt that asked for it", () => {
+  // ⚠️ FIXTURE CHANGED ON PURPOSE (pre-activation correction PA-2); every assertion is the original.
+  // This used two integrations on two apps racing over one BOUND channel. Under PA-2 the second of
+  // those stands down while the first is a valid binder, so that overlap can no longer be staged that
+  // way. The same two observations are now two passes of the SAME binder: the first response is held,
+  // the shared `conversations.info` budget is aged while it is held so the second pass can really
+  // reserve, and the two answers are told apart by CALL ORDER — there is only one token now.
+  // (Two integrations racing over an UNBOUND channel is still covered, by the PA-1 block below.)
   it("refuses a LATE public response that a newer private observation has already superseded", async () => {
     const seed = await seedTeam();
-    // Two REAL bindings: two integrations, two tokens, two apps, one workspace, one channel. Their
-    // `conversations.info` budgets are per-app, so both may legitimately be in flight at once.
-    const first = await seedSlackIntegration(seed, { channelIds: [CHANNEL], token: TOKEN, name: "slack-a" });
-    const second = await seedSlackIntegration(seed, { channelIds: [CHANNEL], token: ROTATED, name: "slack-b" });
+    const binder = await seedSlackIntegration(seed, { channelIds: [CHANNEL], token: TOKEN });
 
-    await discover(seed, first, warmUp(APP_A));
-    await elapse(seed.teamId);
-    await discover(seed, second, warmUp(APP_B));
+    await discover(seed, binder, warmUp(APP_A));
     expect(await channelRow(seed.teamId, WORKSPACE, CHANNEL)).toMatchObject({ public_state: "public" });
 
-    // Both bindings are now due to RE-OBSERVE, which is what makes the overlap reachable at all.
+    // The proof is now due to be RE-OBSERVED, which is what makes the overlap reachable at all.
     await agePublicProof(seed.teamId, CHANNEL);
     await elapse(seed.teamId);
     const before = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
 
     const started = deferred();
     const release = deferred();
+    let observations = 0;
     const contested = fakeSlack({
       "auth.test": () => {
-        throw new Error("both bindings are verified; auth.test must not repeat");
+        throw new Error("the binding is verified; auth.test must not repeat");
       },
-      "conversations.info": async (call) => {
-        if (call.authorization === `Bearer ${TOKEN}`) {
+      "conversations.info": async () => {
+        observations += 1;
+        if (observations === 1) {
           // The OLD observation: it started first, and it comes back last.
           started.resolve();
           await release.promise;
@@ -142,14 +146,20 @@ describe("a channel's public verdict is fenced by the attempt that asked for it"
       },
     });
 
-    // Deterministic interleaving, not a race: A's attempt is committed before B's begins (its
-    // request is in flight), and B's whole pass completes before A's response is delivered.
-    const late = discover(seed, first, contested);
+    // Deterministic interleaving, not a race: the first attempt is committed before the second begins
+    // (its request is in flight), and the second pass completes before the first response is delivered.
+    const late = discover(seed, binder, contested);
     await started.promise;
-    const privatePass = await discover(seed, second, contested);
+    // ⚠️ CLOCK FIXTURE, while the first response is HELD: both passes meter against one allowance, so
+    // without this the second is deferred by the budget and never observes anything.
+    await elapse(seed.teamId);
+    const privatePass = await discover(seed, binder, contested);
     const afterPrivate = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
     release.resolve();
     const latePass = await late;
+
+    // The second pass really reserved and really asked — otherwise nothing below was contested.
+    expect(observations).toBe(2);
 
     expect(privatePass.steps.filter((s) => s.stage === "metadata").map((s) => s.category)).toEqual([
       "channel_private",
@@ -173,10 +183,14 @@ describe("a channel's public verdict is fenced by the attempt that asked for it"
     expect(await threadRootTs(seed.teamId)).toEqual([]);
   });
 
+  // ⚠️ FIXTURE CHANGED ON PURPOSE (pre-activation correction PA-2); every assertion is the original.
+  // The private observation used to come from a SECOND integration. Under PA-2 that integration stands
+  // down while the reader is a valid binder, so the overlapping metadata pass is now the reader's own.
+  // Its proof is aged INSIDE the held history handler — not before the outer pass, which must still
+  // start with a fresh proof and go straight to history — with the metadata budget available.
   it("refuses an in-flight history page whose channel was observed private during the request", async () => {
     const seed = await seedTeam();
-    const reader = await seedSlackIntegration(seed, { channelIds: [CHANNEL], token: TOKEN, name: "slack-a" });
-    const observer = await seedSlackIntegration(seed, { channelIds: [CHANNEL], token: ROTATED, name: "slack-b" });
+    const reader = await seedSlackIntegration(seed, { channelIds: [CHANNEL], token: TOKEN });
 
     // A real first scan, left mid-page so the next claim has somewhere to continue from.
     await discover(
@@ -194,23 +208,24 @@ describe("a channel's public verdict is fenced by the attempt that asked for it"
     expect(rootsBefore).toEqual(["1718900000.000900"]);
     await elapse(seed.teamId);
 
-    // While THIS page is in flight, the other integration observes the channel private — through the
-    // real entrypoint answering a real `conversations.info`, not by writing the verdict directly.
+    // While THIS page is in flight, an overlapping metadata pass observes the channel private —
+    // through the real entrypoint answering a real `conversations.info`, not by writing the verdict
+    // directly.
     let revokedWhileInFlight = false;
+    const observing = fakeSlack({
+      "conversations.info": () => slackJson(channelInfoBody(CHANNEL, { is_private: true })),
+    });
     const revoking = fakeSlack({
       "auth.test": () => {
         throw new Error("the reader binding is verified; auth.test must not repeat");
       },
-      "conversations.info": (call) => slackJson(channelInfoBody(call.params.get("channel") ?? "")),
+      "conversations.info": () => {
+        throw new Error("the proof is fresh when the outer pass starts; it must not re-observe");
+      },
       "conversations.history": async () => {
-        await discover(
-          seed,
-          observer,
-          fakeSlack({
-            "auth.test": () => slackJson(authTestBody({ app_id: APP_B })),
-            "conversations.info": () => slackJson(channelInfoBody(CHANNEL, { is_private: true })),
-          })
-        );
+        // ⚠️ CLOCK FIXTURE, inside the held handler: only now is the proof past its cadence.
+        await agePublicProof(seed.teamId, CHANNEL);
+        await discover(seed, reader, observing);
         revokedWhileInFlight =
           (await channelRow(seed.teamId, WORKSPACE, CHANNEL))?.public_state === "private";
         return slackJson(
@@ -221,7 +236,10 @@ describe("a channel's public verdict is fenced by the attempt that asked for it"
 
     const result = await discover(seed, reader, revoking);
 
-    // The fixture actually produced the revocation — otherwise this whole test is vacuous.
+    // The fixture actually produced the revocation — otherwise this whole test is vacuous: the outer
+    // pass went straight to history, and the nested one asked once and was told `private`.
+    expect(revoking.countOf("conversations.info")).toBe(0);
+    expect(observing.calls.map((call) => call.method)).toEqual(["conversations.info"]);
     expect(revokedWhileInFlight).toBe(true);
     expect(result.steps.some((s) => s.stage === "history" && s.result === "refused")).toBe(true);
     // Nothing from the page survived: no root was enqueued and no cursor moved.
@@ -239,7 +257,7 @@ describe("a channel's public verdict is fenced by the attempt that asked for it"
         session,
         { teamId: seed.teamId, workspaceId: WORKSPACE, channelId: CHANNEL },
         {
-          bindingIntegrationId: observer,
+          bindingIntegrationId: reader,
           bindingConfigRevision: String(after?.binding_config_revision),
         }
       )
@@ -251,6 +269,11 @@ describe("a channel's public verdict is fenced by the attempt that asked for it"
 // ── 2. deleting an integration ───────────────────────────────────────────────
 
 describe("deleting an integration unbinds the channel without losing it", () => {
+  // ⚠️ FIXTURE CHANGED ON PURPOSE (pre-activation correction PA-2); every assertion is the original.
+  // The integration that is deleted used to become the binder by REBINDING a row another integration
+  // had proved. Under PA-2 that rebind does not happen while the first binder is valid, so the deleted
+  // integration is now the binder from the start and earns both lanes' progress itself. The survivor
+  // is verified with a single request, so it has asked nothing about the channel before the delete.
   it("clears BOTH binding columns atomically, keeps every frontier, and refuses a stale claim", async () => {
     const seed = await seedTeam();
     // Two integrations coalesced onto ONE channel row, plus an unrelated channel that must not move.
@@ -263,12 +286,13 @@ describe("deleting an integration unbinds the channel without losing it", () => 
     });
 
     // The initial anchored scan, left mid-page…
-    await discover(seed, shared, warmUp(APP_A, { "conversations.history": partialPage("1718900000.000900", "cursor-1") }));
+    await discover(seed, bound, warmUp(APP_A, { "conversations.history": partialPage("1718900000.000900", "cursor-1") }));
     await elapse(seed.teamId);
-    // …then the OTHER integration rebinds the same coalesced row and leaves the catch-up lane
-    // mid-page too, so the delete below has both lanes' progress to preserve.
+    // …then the SAME binder's next wake leaves the catch-up lane mid-page too, so the delete below
+    // has both lanes' progress to preserve.
     await discover(seed, bound, warmUp(APP_A, { "conversations.history": partialPage("1718900000.000850", "cursor-2") }));
     await elapse(seed.teamId);
+    await discover(seed, shared, identityOnly(APP_A), { maxRequests: 1 });
     await discover(seed, untouched, warmUp(APP_A));
 
     const sharedBefore = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
