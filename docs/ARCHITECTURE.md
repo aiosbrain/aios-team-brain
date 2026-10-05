@@ -360,8 +360,8 @@ Reason from this table, not from a random call site.
 
 **AUDITFIX-13 item/context coordination.** `PgClient.transaction` constructs a dedicated-session
 adapter whose builder select/count/head/mutation/RETURNING/RPC legs and raw unit mirror all use the
-same executor. Ingest takes a namespaced `(team, source project, path)` transaction advisory lock,
-then the existing item row lock; standalone unit/membership/reconcile writers resolve and take that
+same executor. Ingest takes its project rows (below, "project-before-item"), then a namespaced
+`(team, source project, path)` transaction advisory lock, then the existing item row lock; standalone unit/membership/reconcile writers resolve and take that
 same row lock. An existing-item access change commits the item, inherited/social cascade, item unit,
 and directional system-project move together. Settled `system-integrity` refusals (TIERRET-1's
 replacement for the no-widening gate — see below) and database errors roll
@@ -1153,19 +1153,49 @@ automatic exclude) so that retiring the claim can find and close the row. Destin
 all-or-nothing within the surrounding transaction; a destination named only by a superseded-generation
 or paused connection keeps an existing placement but is never newly opened.
 
-Every Drive commit takes its locks in one order: identity authority/revision → connection authority →
-project rows → provider identity (and its mapping row) → path identities → item-attribution advisories
-→ item rows → dependent rows. Drive ingest (`ingestApiItem` → `lib/ingest/gdrive-commit-locks.ts`) and
-source reconciliation share the connection → provider prefix, and reconciliation takes all of its
-provider identities before its first item row. Project rows are locked in one ascending-id pass, the
-storage project for write and audience-only projects for share, so no commit upgrades a share lock. A
-Drive path identity has one key — the ingest session's identity key — covering the requested path, its
+Every ingest is **project-before-item**, and takes its locks in one order: identity
+authority/revision → connection authority → project rows → provider identity (and its mapping row) →
+path identities → item-attribution advisories → item rows → dependent rows, each writer taking only
+the levels it needs. Project work belongs to the publishing transaction: the project an ingest creates,
+the `last_synced_at` it advances and the graph pointer it sets commit with its item, version, evidence
+and context writes or not at all. An ordinary ingest (`ingestItem`) does it inside its context session
+(`lib/projects/project-row-locks.ts`): unlocked reads **plan** the source project by `(team, slug)` and
+the system projects a context move can place into; an absent source project is created there — a
+do-nothing insert, so a concurrent creator of the slug is waited for and then read, never
+conflict-updated; and the whole set is locked in one ascending-id pass (source `for no key update`,
+the rest `for key share`) before the path identity. A plan its locks do not confirm aborts the ingest
+(`ProjectPlanChangedError`); it is not one of the context engine's retryable causes. Ordinary ingests
+into one project therefore serialize at its row. The public wrapper (`ingestApiItem`) holds no lock of
+its own — its Drive-ownership read is unlocked and may only refuse, and the authoritative refusal is
+made by `ingestItem` on the item row it has locked, from the row's provenance or the existence of a
+provider mapping for it (whatever that mapping's nullable `connection_id`). A Drive ingest cannot know its projects from the request
+(the document may already live elsewhere, and its path may collide with another row), so once it holds
+the connection authority it **plans**: unlocked reads of the provider mapping and of every item it can
+adopt or collide with (`lib/ingest/gdrive-commit-locks.ts`). The complete project set is then locked in
+one ascending-id pass, each row once in its final mode — the storage project for write, audience
+projects for share, a canonical item's project by key — and no project row is acquired or strengthened
+afterwards. Under the provider, path, attribution and item locks the plan is re-read; a mapping that
+changed, or a candidate that was removed, moved or appeared, abandons the whole attempt, which is
+planned again once and then fails as `GdriveIngestStateChangedError`. A Drive path identity has one
+key — the ingest session's identity key, by project id — covering the requested path, its
 collision-safe alternative and a tombstone's restore path from before the existence check to after the
-insert. Each of these waits is bounded at 10 seconds (`lib/db/pg/bounded-lock.ts`; a timeout is not
-retried). Candidates discovered before the item locks are re-read under them: one that vanished or
-appeared abandons the whole attempt, which is retried once and then fails as
-`GdriveIngestStateChangedError`. A payload that is not Drive-sourced never takes these locks; it is
-refused when the item at its path is Drive-owned, checked again on the row it locks.
+insert. Source reconciliation shares the connection → project → provider prefix and takes all of its
+provider identities, their mapping rows, every item-attribution advisory and then the complete sorted
+set of item rows before its first write; physical cleanup stays a separate transaction per obligation.
+A retracted Drive unit is reactivated only by the claim owner re-deriving context from surviving claims
+(`reconcileItemUnit(…, { reactivate: true })`), never by the ordinary unit mirror. Each of these waits
+is bounded at 10 seconds (`lib/db/pg/bounded-lock.ts`; a timeout is not retried, and neither is an
+unconfirmed COMMIT).
+
+A paired staging refresh copies Drive documents and their authorization substrate (items, context
+units, `gdrive_claim` memberships) but not the connection: integrations, API keys and the five Drive
+tables that hang off them are excluded from the export. The schema replay that follows a restore
+therefore runs with no claim rows, and must not read their absence as "never claimed": the legacy
+context suppression is owned by `20260922135000`, whose predicate (an active Drive unit no claim ever
+placed) does not consult the claim tables, and the claim-dependent selection in `20260922130000` is
+omitted from replay (`REPLAY_STEP_SUPERSESSIONS` in `scripts/migration-replay-plan.mjs`). A copied
+active document stays visible to the members who could see it; a pending-cleanup document stays
+retracted.
 
 `team_authorization_epochs` is the durable revocation barrier shared by Drive claim changes and the
 Timeline/arc cache owners. Final-claim retirement commits context suppression, the epoch advance, and

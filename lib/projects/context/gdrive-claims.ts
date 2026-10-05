@@ -3,6 +3,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { acquireWithLockTimeout, withBoundedLockWaits } from "@/lib/db/pg/bounded-lock";
 import { runSql, withTransaction } from "@/lib/db/pg/pool";
+import { lockItemAttribution } from "@/lib/ingest/item-attribution-lock";
 import { reconcileItemUnit, retractItemUnit } from "@/lib/projects/context/units";
 import {
   closeGdriveManagedMembership,
@@ -41,6 +42,55 @@ export async function lockGdriveProviders(teamId: string, providerIds: readonly 
   if (ordered.length === 0) return;
   await withBoundedLockWaits(async () => {
     for (const providerId of ordered) await runSql(PROVIDER_LOCK, [providerLockKey(teamId, providerId)]);
+  });
+}
+
+/**
+ * Everything one reconciliation pass locks below its connection and project rows, taken before its
+ * first write and in the shared ingest order: every provider identity, their mapping rows, then for
+ * the COMPLETE set of items those providers name — this connection's claims and the canonical
+ * mappings — every item-attribution advisory in ascending id order, and only then the item rows in
+ * the same order. The per-provider retirement that follows only re-enters locks it already holds,
+ * so no provider, advisory or item wait ever sits behind a held item row.
+ *
+ * The advisories are part of the order, not of what reconciliation writes: every other writer of
+ * these rows takes advisory → row, and a pass that went straight to the rows would hold a row a
+ * correction or ingest is about to ask for while they hold the advisory it never took.
+ *
+ * The item set is read once the provider keys and mapping rows are held. This connection's claims
+ * are written only under their provider key and the mapping rows are locked, so the items the
+ * retirement goes on to touch cannot change between that read and their row locks.
+ */
+export async function lockGdriveReconciliationSet(
+  teamId: string,
+  integrationId: string,
+  providerIds: readonly string[],
+): Promise<void> {
+  const ordered = [...new Set(providerIds)].sort();
+  if (ordered.length === 0) return;
+  await lockGdriveProviders(teamId, ordered);
+  await withBoundedLockWaits(async () => {
+    await runSql(
+      `select provider_id from source_item_mappings
+        where team_id=$1 and source='gdrive' and provider_id=any($2::text[])
+        order by provider_id for update`,
+      [teamId, ordered],
+    );
+    const { rows: named } = await runSql<{ item_id: string }>(
+      `select c.item_id from gdrive_item_claims c
+        where c.team_id=$1 and c.integration_id=$2 and c.provider_id=any($3::text[])
+       union
+       select m.item_id from source_item_mappings m
+        where m.team_id=$1 and m.source='gdrive' and m.provider_id=any($3::text[])`,
+      [teamId, integrationId, ordered],
+    );
+    const itemIds = [...new Set(named.map((row) => row.item_id))].sort();
+    if (itemIds.length === 0) return;
+    for (const itemId of itemIds) await lockItemAttribution(teamId, itemId);
+    await runSql(
+      `select id from items where team_id=$1 and id=any($2::uuid[]) order by id for update`,
+      [teamId, itemIds],
+    );
   });
 }
 
@@ -157,7 +207,9 @@ export async function retireGdriveItemClaim(
 }
 
 export async function reconcileGdriveItemClaims(db: DbClient, teamId: string, itemId: string): Promise<void> {
-  const unit = await reconcileItemUnit(db, teamId, itemId);
+  // The one caller that may reverse a retraction: everything below re-derives this document's
+  // context from its surviving claims, and throws — rolling the reactivation back — if none survive.
+  const unit = await reconcileItemUnit(db, teamId, itemId, { reactivate: true });
   if (!unit.ok || !unit.unitId) throw new Error(`Drive context unit: ${unit.error ?? "missing"}`);
   // Every destination a surviving claim names, each with the claims behind it. `is_current` marks a
   // claim last recorded under its connection's CURRENT generation by an enabled connection — the

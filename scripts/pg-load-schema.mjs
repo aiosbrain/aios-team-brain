@@ -110,7 +110,7 @@ export async function loadSchema({
 
     for (const step of plan) {
       await client.query(step.sql);
-      const superseded = step.superseded.map((entry) => entry.constraint).join(", ");
+      const superseded = step.superseded.map((entry) => entry.constraint ?? entry.step).join(", ");
       logger.log(
         `✓ postgres/migrations/${step.name} applied` +
           (superseded ? ` (replay-superseded: ${superseded})` : ""),

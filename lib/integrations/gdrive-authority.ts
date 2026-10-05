@@ -8,6 +8,7 @@ import { adminClient } from "@/lib/db/admin";
 import { withBoundedLockWaits } from "@/lib/db/pg/bounded-lock";
 import { runSql, withTransaction } from "@/lib/db/pg/pool";
 import { lockIdentityMutationAuthorities } from "@/lib/identity/authority";
+import { lockProjectRows } from "@/lib/projects/project-row-locks";
 import { decryptSecret } from "@/lib/secrets/crypto";
 import { validateIntegrationConfig } from "@/lib/api/schemas";
 
@@ -46,17 +47,30 @@ export interface GdriveExecutionRef {
 
 export interface GdriveApprovedAudience {
   projectIds: string[];
-  /** The project this commit writes, when the caller named one and its row is now locked for write. */
-  storageProjectId?: string;
+  /**
+   * Every project row this commit now holds — the audience and the caller's plan — by lower-case
+   * id, with the slug read under the lock.
+   */
+  lockedProjects: ReadonlyMap<string, string>;
+}
+
+/** The project rows a commit needs beyond its audience, each named with what it will do to it. */
+export interface GdriveCommitProjectPlan {
+  /** Rows the commit UPDATES (an ingest's storage project). */
+  writeProjectIds: readonly string[];
+  /** Rows the commit only references by key (where a canonical item already lives). */
+  referenceProjectIds: readonly string[];
 }
 
 export interface GdriveCommitScope {
   /**
-   * Resolves the id of the project the commit is about to WRITE (an ingest's storage project).
-   * Called after the connection authority is held and before any project row is locked, so that
-   * row joins the audience rows in the one ordered pass below. Reconciliation writes no project.
+   * Plans the project rows the commit will touch besides its audience. Called after the connection
+   * authority is held and before any project row is locked, so the COMPLETE set is taken in the one
+   * ordered pass below and nothing is acquired or strengthened later. A plan row that is gone by the
+   * time it is locked is simply absent from `lockedProjects`; the caller decides what that means.
+   * Reconciliation plans nothing: it writes no project.
    */
-  storageProject?: () => Promise<string>;
+  projects?: () => Promise<GdriveCommitProjectPlan>;
 }
 
 /** Admin-save validation lives in the integration domain, not the app route. */
@@ -78,44 +92,19 @@ export async function validateGdriveAudienceProjects(
   return rows.length === projectIds.length && rows.every((project) => project.granted);
 }
 
-/**
- * Project rows for one Drive commit, in ONE ascending-id pass. Each row is locked exactly once, in
- * the strongest mode this transaction will need: the storage project `for no key update` (the
- * ingest updates it), every other audience row `for share`. Taking an audience row `for share` and
- * writing it afterwards is the upgrade two concurrent commits deadlock on, and taking the two kinds
- * in separate passes orders them by kind rather than by id — so a storage project that is also an
- * audience project is write-locked here and never share-locked at all.
- */
-async function lockCommitProjects(
-  teamId: string,
-  audienceProjectIds: readonly string[],
-  storageProjectId: string | undefined,
-): Promise<Set<string>> {
-  const storage = storageProjectId?.toLowerCase();
-  const ordered = [...new Set([...audienceProjectIds.map((id) => id.toLowerCase()), ...(storage ? [storage] : [])])]
-    .sort();
-  const locked = new Set<string>();
-  const lock = async (ids: string[], mode: "share" | "no key update") => {
-    if (ids.length === 0) return;
-    // `order by` precedes the row lock in the plan, so a run is locked in ascending id order.
-    const { rows } = await runSql<{ id: string }>(
-      `select id from projects where team_id=$1 and id=any($2::uuid[]) order by id for ${mode}`,
-      [teamId, ids],
-    );
-    for (const project of rows) locked.add(project.id.toLowerCase());
-  };
-  const at = storage ? ordered.indexOf(storage) : -1;
-  if (at < 0) {
-    await lock(ordered, "share");
-  } else {
-    await lock(ordered.slice(0, at), "share");
-    await lock([ordered[at]], "no key update");
-    await lock(ordered.slice(at + 1), "share");
-  }
-  return locked;
-}
+const NO_PROJECT_PLAN: GdriveCommitProjectPlan = { writeProjectIds: [], referenceProjectIds: [] };
 
-async function approvedAudience(row: AuthorityRow, storageProjectId?: string): Promise<GdriveApprovedAudience> {
+/**
+ * The audience of one Drive commit, with the commit's COMPLETE project set locked in the one
+ * ascending pass every ingest uses (`lockProjectRows`): a project the commit updates `for no key
+ * update` (an ingest's storage project), an audience project `for share`, a project it only
+ * references by key `for key share` (where a canonical item already lives). A storage project that
+ * is also an audience project is write-locked once and never share-locked at all.
+ */
+async function approvedAudience(
+  row: AuthorityRow,
+  plan: GdriveCommitProjectPlan = NO_PROJECT_PLAN,
+): Promise<GdriveApprovedAudience> {
   const raw = row.config.audienceProjectIds;
   const projectIds = Array.isArray(raw)
     ? [...new Set(raw.filter((id): id is string => typeof id === "string" && /^[0-9a-f-]{36}$/i.test(id)))]
@@ -123,7 +112,11 @@ async function approvedAudience(row: AuthorityRow, storageProjectId?: string): P
   if (projectIds.length === 0) {
     throw new GdriveAuthorityError("connection_unavailable", "Google Drive audience is not resolved", 409);
   }
-  const locked = await lockCommitProjects(row.team_id, projectIds, storageProjectId);
+  const locked = await lockProjectRows(runSql, row.team_id, {
+    write: plan.writeProjectIds,
+    share: projectIds,
+    reference: plan.referenceProjectIds,
+  });
   // Read the grants only after every audience row is held, so the answer is about locked rows.
   const { rows } = await runSql<{ id: string; granted: boolean }>(
     `select p.id, exists(select 1 from project_groups pg
@@ -135,9 +128,7 @@ async function approvedAudience(row: AuthorityRow, storageProjectId?: string): P
       || projectIds.some((id) => !locked.has(id.toLowerCase()))) {
     throw new GdriveAuthorityError("connection_unavailable", "Google Drive audience grant is missing or no longer valid", 409);
   }
-  return storageProjectId && locked.has(storageProjectId.toLowerCase())
-    ? { projectIds, storageProjectId }
-    : { projectIds };
+  return { projectIds, lockedProjects: locked };
 }
 
 interface AuthorityRow {
@@ -477,10 +468,11 @@ async function assertLockedExecution(auth: ApiAuth, ref: GdriveExecutionRef): Pr
  * Hold integration + authority row locks through an ingest-owner mutation.
  *
  * This is the head of the Drive commit lock order, shared by ingest and source reconciliation:
- * connection authority, then project rows, then whatever `fn` takes (provider and path identities,
- * item-attribution advisories, item rows, dependent rows). A caller that validates an identity
- * revision does so before entering. Both waits here are bounded; past the bound PostgreSQL raises
- * 55P03 and the commit fails without retry.
+ * connection authority, then the COMPLETE project set (audience plus `scope.projects`), then
+ * whatever `fn` takes (provider and path identities, item-attribution advisories, item rows,
+ * dependent rows). No project row is acquired or strengthened inside `fn`. A caller that validates
+ * an identity revision does so before entering. Both waits here are bounded; past the bound
+ * PostgreSQL raises 55P03 and the commit fails without retry.
  */
 export async function withGdriveExecutionCommit<T>(
   auth: ApiAuth,
@@ -491,7 +483,7 @@ export async function withGdriveExecutionCommit<T>(
   return withTransaction(async () => {
     const audience = await withBoundedLockWaits(async () => {
       const row = await assertLockedExecution(auth, ref);
-      return approvedAudience(row, await scope.storageProject?.());
+      return approvedAudience(row, await scope.projects?.());
     });
     return fn(audience);
   });

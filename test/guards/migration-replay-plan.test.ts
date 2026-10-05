@@ -6,7 +6,9 @@ import {
   effectiveReplayPlan,
   gitBlobId,
   REPLAY_PLAN_VERSION,
+  REPLAY_STEP_SUPERSESSIONS,
   REPLAY_SUPERSESSIONS,
+  replayStepMarker,
   SUPERSESSION_MARKER,
 } from "../../scripts/migration-replay-plan.mjs";
 
@@ -124,12 +126,12 @@ describe("replay plan: the omission is exact", () => {
     expect(superseded).toEqual([]);
   });
 
-  it("the real plan changes exactly the six files and leaves each constraint with one definer", () => {
+  it("the real plan changes exactly the six files (and the one data-step file) and leaves each constraint with one definer", () => {
     const raw = rawMigrations();
     const plan = effectiveReplayPlan(raw);
     expect(plan.map((step) => step.name)).toEqual(raw.map((m) => m.name)); // nothing skipped, order kept
     const changed = plan.filter((step, i) => step.sql !== raw[i].sql).map((step) => step.name);
-    expect(changed).toEqual(SHIPPED.map(([name]) => name));
+    expect(changed).toEqual([...SHIPPED.map(([name]) => name), ...REPLAY_STEP_SUPERSESSIONS.map((e) => e.migration)]);
     for (const constraint of ["integrations_type_check", "project_context_memberships_method_check"]) {
       const definers = plan.filter((step) => new RegExp(`add\\s+constraint\\s+${constraint}\\b`, "i").test(step.sql));
       expect(definers.map((step) => step.name), `${constraint} must replay from its owner alone`).toHaveLength(1);
@@ -223,6 +225,114 @@ describe("replay plan: fails closed (mutants)", () => {
   });
 });
 
+/**
+ * DATA-STEP supersession (AIO-1167, paired staging restore).
+ *
+ * Spec. `20260922130000_gdrive_audience_claims.sql` fails legacy Drive visibility closed by
+ * deleting "every Drive item's context unit whose item has no active claim". A sanitized staging
+ * restore does not carry the claim tables, so on that database the statement selects EVERY copied
+ * Drive unit and the schema replay deleted the claim-authorized memberships of every copied
+ * document. The replay plan omits that one selection (with nothing selected, the rest of the block
+ * is inert) and `20260922135000_gdrive_legacy_context_suppression.sql` owns the step with a
+ * predicate that:
+ *   · never reads a claim table — so it means the same thing with or without them;
+ *   · still selects every LEGACY unit (active, never placed by a claim) — fail-closed adoption;
+ *   · never selects a unit a claim placed, nor a retracted (pending-cleanup) one.
+ * The real-Postgres proof is the populated replay in `scripts/migrate-from-existing.mjs` and
+ * `test/datamechanics/gdrive-paired-restore.datamechanics.test.ts`.
+ */
+describe("replay plan: a superseded data step", () => {
+  const [entry] = REPLAY_STEP_SUPERSESSIONS;
+  const raw = () => read(entry.migration);
+  const owner = () => read(entry.supersededBy);
+
+  it("is exactly one step, pinned to the file as it stands", () => {
+    expect(REPLAY_STEP_SUPERSESSIONS).toHaveLength(1);
+    expect(entry).toMatchObject({
+      migration: "20260922130000_gdrive_audience_claims.sql",
+      step: "gdrive_legacy_context_suppression",
+      supersededBy: "20260922135000_gdrive_legacy_context_suppression.sql",
+    });
+    expect(gitBlobId(raw()), `${entry.migration} was edited — change the step in its owner instead`).toBe(entry.gitBlob);
+    expect(raw().split(entry.obsoleteSql)).toHaveLength(2);
+    // The obsolete statement is the claim-dependent selection, and nothing else.
+    expect(statements(entry.obsoleteSql)).toHaveLength(1);
+    expect(entry.obsoleteSql).toContain("gdrive_item_claims");
+    expect(entry.obsoleteSql).toMatch(/^insert into gdrive_suppressed_units/);
+  });
+
+  it("omits that one statement and replays every other statement of the file, CHECK included", () => {
+    const { sql, superseded } = effectiveMigrationSql(entry.migration, raw());
+    expect(superseded).toEqual([entry]);
+    const removed = statements(entry.obsoleteSql);
+    expect(statements(sql)).toEqual(statements(raw()).filter((s) => !removed.includes(s)));
+    expect(statements(raw()).length - statements(sql).length).toBe(1);
+    expect(sql).toContain(`${SUPERSESSION_MARKER} ${entry.step}`);
+    // It is still the owner of the widened method CHECK, and still creates its tables.
+    expect(sql).toContain("'exclude_shadow_repair','gdrive_claim'");
+    expect(sql).toContain("create table if not exists gdrive_item_claims");
+    // With nothing selected the destructive delete in that file has nothing to delete.
+    expect(sql).toContain("create temp table gdrive_suppressed_units");
+    expect(sql).not.toContain("insert into gdrive_suppressed_units");
+  });
+
+  it("the owner declares the step, replays after it, and never reads a claim table", () => {
+    const names = rawMigrations().map((m) => m.name);
+    expect(names.indexOf(entry.supersededBy)).toBeGreaterThan(names.indexOf(entry.migration));
+    expect(owner()).toContain(`-- ${replayStepMarker(entry.step)}`);
+    const executable = statements(owner()).join(";\n");
+    expect(executable).not.toMatch(/gdrive_item_claims|gdrive_item_claim_projects|gdrive_connection_authority|\bintegrations\b/);
+    // Legacy = an ACTIVE Drive unit no claim ever placed. Both halves are load-bearing.
+    expect(executable).toContain("i.frontmatter->>'source'='gdrive'");
+    expect(executable).toContain("u.state='active'");
+    expect(executable).toMatch(/not exists \( select 1 from project_context_memberships m where [^)]*m\.method='gdrive_claim' \)/);
+    expect(executable).toContain("delete from project_context_units u where u.id in (select unit_id from gdrive_legacy_units)");
+    // The suppression still owns the epoch/cache barrier for the teams it touched.
+    expect(executable).toContain("update team_authorization_epochs e set epoch=e.epoch+1");
+    expect(executable).toContain("delete from arc_cache");
+    expect(executable).toContain("delete from work_timeline_cache");
+  });
+
+  describe("fails closed (mutants)", () => {
+    const stepSql = `-- carrier\n${entry.obsoleteSql}\ncreate index if not exists keep_me on t (c);\n`;
+    const ownerSql = `-- ${replayStepMarker(entry.step)}\nselect 1;\n`;
+    const manifest = [{ ...entry, migration: "001_step.sql", gitBlob: gitBlobId(stepSql), supersededBy: "002_owner.sql" }];
+    const set = (carrier = stepSql, owned = ownerSql) => [
+      { name: "001_step.sql", sql: carrier },
+      { name: "002_owner.sql", sql: owned },
+    ];
+
+    it("the unmutated fixture is accepted", () => {
+      const plan = effectiveReplayPlan(set(), manifest);
+      expect(plan[0].sql).not.toContain("insert into gdrive_suppressed_units");
+      expect(plan[0].sql).toContain("create index if not exists keep_me");
+      expect(plan[1].sql).toBe(ownerSql);
+    });
+
+    it("an owner that does not declare the step is refused", () => {
+      expect(() => effectiveReplayPlan(set(stepSql, "select 1;\n"), manifest)).toThrow(/does not declare ownership of gdrive_legacy_context_suppression/);
+    });
+
+    it("an owner that sorts before the carrier is refused", () => {
+      const early = [{ ...manifest[0], supersededBy: "000_owner.sql" }];
+      expect(() => effectiveReplayPlan([{ name: "000_owner.sql", sql: ownerSql }, set()[0]], early)).toThrow(/must replay AFTER/);
+    });
+
+    it("an edited carrier is refused, and a carrier without the statement is refused", () => {
+      expect(() => effectiveReplayPlan(set(`${stepSql}-- touched\n`), manifest)).toThrow(/has changed .* immutable/);
+      const absent = "-- carrier\ncreate index if not exists keep_me on t (c);\n";
+      expect(() => effectiveReplayPlan(set(absent), [{ ...manifest[0], gitBlob: gitBlobId(absent) }])).toThrow(/exactly once \(found 0\)/);
+    });
+
+    it("a set WITHOUT the owner is a historical release state: the carrier replays verbatim", () => {
+      const historical = rawMigrations().filter((m) => m.name !== entry.supersededBy);
+      const step = effectiveReplayPlan(historical).find((s) => s.name === entry.migration)!;
+      expect(step.sql).toBe(raw());
+      expect(step.superseded).toEqual([]);
+    });
+  });
+});
+
 describe("replay plan: both replay paths execute it", () => {
   // Source pins, because a plan nothing calls is the failure this repo keeps re-learning: delete the
   // call from the loader and every assertion above stays green while the deploy replays raw history.
@@ -237,7 +347,7 @@ describe("replay plan: both replay paths execute it", () => {
   });
 
   it("migrate-from-existing.mjs builds currentSources from the same plan", () => {
-    expect(lane).toContain('import { effectiveReplayPlan, REPLAY_SUPERSESSIONS } from "./migration-replay-plan.mjs"');
+    expect(lane).toContain('import { effectiveReplayPlan, REPLAY_STEP_SUPERSESSIONS, REPLAY_SUPERSESSIONS } from "./migration-replay-plan.mjs"');
     expect(lane).toMatch(/export function currentSources\(\) \{\s*const raw = currentRawSources\(\);[\s\S]*?effectiveReplayPlan\(raw\.migrations\)/);
   });
 
@@ -250,6 +360,14 @@ describe("replay plan: both replay paths execute it", () => {
     const fixture = readFileSync(join(ROOT, "test", "fixtures", "migration-replay-populated.sql"), "utf8");
     expect(fixture).toMatch(/insert into integrations \(team_id, type, name\)\s+select id, 'gdrive'/);
     expect(fixture).toMatch(/insert into project_context_memberships[\s\S]*'gdrive_claim'/);
+    // …and the three Drive context shapes the data-step supersession is about, with no claim rows:
+    // a claim-placed unit, a legacy generic one, and a retracted pending-cleanup one.
+    expect(fixture.match(/"source":"gdrive"/g)).toHaveLength(3);
+    expect(fixture).toMatch(/'ingestion_project'/);
+    expect(fixture).toMatch(/'retracted'/);
+    expect(fixture).not.toMatch(/gdrive_item_claims/);
+    expect(lane).toMatch(/for \(const entry of REPLAY_STEP_SUPERSESSIONS\) \{[\s\S]*?await client\.query\(raw\.get\(entry\.migration\)\);[\s\S]*?await client\.query\("rollback"\)/);
+    expect(lane).toMatch(/drive\.claimed !== 1 \|\| drive\.legacy !== 0 \|\| drive\.retracted !== 1/);
   });
 
   it("the loader, given the real tree, sends the effective SQL to the database", async () => {
@@ -265,8 +383,13 @@ describe("replay plan: both replay paths execute it", () => {
       logger: { log: () => {} },
     });
     const replayed = sent.join("\n");
-    for (const e of REPLAY_SUPERSESSIONS) expect(replayed).not.toContain(e.obsoleteSql);
-    expect(sent.filter((sql) => sql.includes(SUPERSESSION_MARKER))).toHaveLength(6);
+    for (const e of [...REPLAY_SUPERSESSIONS, ...REPLAY_STEP_SUPERSESSIONS]) expect(replayed).not.toContain(e.obsoleteSql);
+    expect(sent.filter((sql) => sql.includes(SUPERSESSION_MARKER))).toHaveLength(6 + REPLAY_STEP_SUPERSESSIONS.length);
+    // The data step reached the database from its replay-safe owner, after the file it supersedes.
+    const superseding = sent.findIndex((sql) => sql.includes("insert into gdrive_legacy_units(unit_id,team_id)"));
+    const superseded = sent.findIndex((sql) => sql.includes("create temp table gdrive_suppressed_units"));
+    expect(superseded).toBeGreaterThan(-1);
+    expect(superseding).toBeGreaterThan(superseded);
     expect(replayed).toContain("'notion','gdrive','clickup'");
     expect(replayed).toContain("'exclude_shadow_repair','gdrive_claim'");
     // The mixed-purpose migration's other statements reached the database.

@@ -45,6 +45,17 @@ Rules:
 
   Rolling BACK across a widening is not covered: a release from before the supersession replays the
   old files verbatim and will refuse a database that already holds a row with the new value.
+- **A data statement must mean the same thing on every database it replays over — including a
+  sanitized staging restore.** Every file replays after `pg_restore` on a paired staging refresh,
+  over a database from which the export has deliberately removed whole tables (credentials,
+  operational queues, and their foreign-key dependents: `scripts/staging-ops/pg-sanitize.mjs`).
+  A cleanup phrased as "rows with no matching row in table X" selects *everything* there.
+  `20260922130000` deleted every Drive context unit "whose item has no active claim" and, on a
+  restore without the claim tables, removed the claim-authorized memberships of every copied Drive
+  document. The remedy is the same contract, second kind: `REPLAY_STEP_SUPERSESSIONS` pins the
+  file, omits exactly the unsafe statement, and names a later migration that owns the step — it
+  carries the line `-- [replay-step <name>]` — in a form that does not depend on the excluded
+  tables. Write new data steps that way from the start.
 - **Name as `YYYYMMDDHHMMSS_short_description.sql`.**
 - **Mirror the change into `postgres/schema.sql`** so a from-zero load still produces the
   same shape — the file here is only what an *existing* DB needs to catch up.
@@ -76,7 +87,11 @@ release (or `--populated-from <ref>` for an exact prior state, such as the stagi
 is based on), inserts a `gdrive` integration and a `gdrive_claim` context membership, replays the
 whole deploy twice more, and requires both rows and both complete constraints to survive. Its
 negative control then runs each superseded migration RAW and requires those rows to refuse it —
-so a fixture that stops exercising the constraints turns the lane red instead of vacuous.
+so a fixture that stops exercising the constraints turns the lane red instead of vacuous. The same
+fixture holds the three Drive context shapes with no claim rows behind them (a claim-placed unit, a
+legacy generic unit, a retracted pending-cleanup unit): the replays must keep the first, suppress
+the second and leave the third retracted, and the superseded data statement, run RAW inside a
+rolled-back transaction, must destroy them.
 
 ```bash
 DATABASE_TEST_URL=postgres://app:app@localhost:5434/app_test npm run test:migrate-from-existing

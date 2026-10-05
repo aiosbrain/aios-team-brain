@@ -63,7 +63,7 @@ import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import { fingerprint, diffFingerprints } from "./schema-fingerprint.mjs";
 import { assertServiceIdentity } from "./service-guard.mjs";
-import { effectiveReplayPlan, REPLAY_SUPERSESSIONS } from "./migration-replay-plan.mjs";
+import { effectiveReplayPlan, REPLAY_STEP_SUPERSESSIONS, REPLAY_SUPERSESSIONS } from "./migration-replay-plan.mjs";
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -487,6 +487,26 @@ async function readWidenedState(client) {
 }
 
 /**
+ * The fixture's three Google Drive context shapes (see the fixture header), counted: the unit a
+ * claim placed, the legacy generic unit, and the retracted pending-cleanup unit. None has a
+ * connection claim behind it — the state a sanitized staging restore replays the deploy over.
+ */
+async function readDriveContextState(client) {
+  const { rows } = await client.query(
+    `select count(*) filter (where u.state = 'active' and claimed.n > 0)::int as claimed,
+            count(*) filter (where u.state = 'active' and claimed.n = 0)::int as legacy,
+            count(*) filter (where u.state = 'retracted')::int as retracted
+       from project_context_units u
+       join items i on i.team_id = u.team_id and i.id = u.source_item_id
+       cross join lateral (
+         select count(*)::int as n from project_context_memberships m
+          where m.team_id = u.team_id and m.context_unit_id = u.id and m.method = 'gdrive_claim'
+       ) claimed
+      where i.frontmatter->>'source' = 'gdrive'`);
+  return rows[0];
+}
+
+/**
  * POPULATED REPLAY — the one data-dependent thing this lane does prove.
  *
  * The upgrade and idempotence checks above run against EMPTY databases, where a narrower CHECK
@@ -544,6 +564,39 @@ async function runPopulatedReplay(priorRef, opts) {
       }
     }
 
+    // DATA-STEP supersessions. The effective replays above must have kept the Drive context a claim
+    // placed, suppressed the legacy generic one, and left the pending-cleanup one retracted — with
+    // no claim row anywhere, which is what a sanitized staging restore replays the deploy over.
+    const drive = await withClient(url, readDriveContextState);
+    if (drive.claimed !== 1 || drive.legacy !== 0 || drive.retracted !== 1) {
+      failures.push(
+        `populated replay over ${from} mishandled Google Drive context with no connection claims ` +
+        `(claim-placed active units: ${drive.claimed}, expected 1; legacy active units: ${drive.legacy}, ` +
+        `expected 0; retracted units: ${drive.retracted}, expected 1).`,
+      );
+    }
+    // NEGATIVE CONTROL: the superseded statement, run RAW, really does destroy that context — so
+    // the survival above is the supersession's doing, not a fixture the statement never matched.
+    // Inside a transaction that is rolled back: unlike the CHECK controls, this one succeeds.
+    for (const entry of REPLAY_STEP_SUPERSESSIONS) {
+      const destroyed = await withClient(url, async (client) => {
+        await client.query("begin");
+        try {
+          await client.query(raw.get(entry.migration));
+          return await readDriveContextState(client);
+        } finally {
+          await client.query("rollback");
+        }
+      });
+      if (destroyed.claimed !== 0 || destroyed.retracted !== 0) {
+        failures.push(
+          `negative control: replaying ${entry.migration} RAW left Google Drive context intact ` +
+          `(claim-placed: ${destroyed.claimed}, retracted: ${destroyed.retracted}) — the populated ` +
+          `fixture no longer exercises the superseded ${entry.step} step.`,
+        );
+      }
+    }
+
     const state = await withClient(url, readWidenedState);
     if (state.gdrive !== 1 || state.gdrive_claim !== 1) {
       failures.push(
@@ -566,7 +619,8 @@ async function runPopulatedReplay(priorRef, opts) {
     failures,
     report: failures.length
       ? []
-      : [`  ✓ populated replay over ${from}: 'gdrive' + 'gdrive_claim' rows survive two replays; raw history refused (${ms(started)})`],
+      : [`  ✓ populated replay over ${from}: 'gdrive' + 'gdrive_claim' rows survive two replays; raw history refused; ` +
+          `claim-placed Drive context kept, legacy suppressed, pending cleanup still retracted (${ms(started)})`],
   };
 }
 

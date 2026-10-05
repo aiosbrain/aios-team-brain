@@ -22,7 +22,6 @@ type UnitRow = {
   audience: string;
   content_sha256: string;
   occurred_at: string;
-  state?: string | null;
 };
 
 /**
@@ -36,7 +35,7 @@ export async function reconcileItemUnitLocked(
   const item = context.item;
   const { data: existing, error: existingError } = await db
     .from("project_context_units")
-    .select("id, audience, content_sha256, occurred_at, state")
+    .select("id, audience, content_sha256, occurred_at")
     .eq("team_id", context.teamId)
     .eq("source_item_id", context.itemId)
     .eq("unit_kind", "item")
@@ -46,22 +45,19 @@ export async function reconcileItemUnitLocked(
   if (existing) {
     const row = existing as UnitRow;
     const workAtDrift = new Date(row.occurred_at).getTime() !== new Date(item.work_at).getTime();
-    // A retracted unit (Drive source revocation) is drift too: a reconcile under a surviving claim
-    // reactivates it in the same single-statement mirror. `state` is NOT NULL in Postgres; only an
-    // in-memory fixture can omit it, and an absent value is not a retraction.
-    const retracted = row.state != null && row.state !== "active";
+    // The mirror copies the item's audience, hash and work time. It never touches `state`: a unit a
+    // Drive revocation retracted stays retracted through any ordinary reconcile, and only the claim
+    // owner reverses it (`reconcileItemUnit` with `reactivate`).
     if (
       row.audience !== item.access ||
       row.content_sha256 !== item.content_sha256 ||
-      workAtDrift ||
-      retracted
+      workAtDrift
     ) {
       const mirrored = await context.session.executeSql<{ audience: "team" | "external" }>(
         `update project_context_units u
             set audience = i.access,
                 content_sha256 = i.content_sha256,
                 occurred_at = i.work_at,
-                state = 'active',
                 updated_at = now()
            from items i
           where u.id = $1 and u.team_id = $2 and i.id = $3 and i.team_id = $2
@@ -110,17 +106,34 @@ export async function reconcileItemUnitLocked(
   };
 }
 
-/** Standalone compatibility entry: takes the shared item lock and never recursively checks out. */
+/**
+ * Standalone compatibility entry: takes the shared item lock and never recursively checks out.
+ *
+ * `reactivate` is for the Drive claim owner alone (`reconcileGdriveItemClaims`), which calls it
+ * while it re-derives a document's context from its SURVIVING claims and fails the surrounding
+ * transaction when there are none. It reverses a retraction under the same item lock as the mirror.
+ * No other caller may pass it: an ordinary reconcile of a revoked document must leave it suppressed.
+ */
 export async function reconcileItemUnit(
   db: DbClient,
   teamId: string,
-  itemId: string
+  itemId: string,
+  opts: { reactivate?: boolean } = {}
 ): Promise<ReconcileResult> {
   try {
     return await runContextTransaction(db, async (session) => {
       const context = await lockItemContext(session, teamId, itemId);
       if (!context) return { ok: false, error: "item not found" };
-      return reconcileItemUnitLocked(context);
+      const reconciled = await reconcileItemUnitLocked(context);
+      if (!opts.reactivate || !reconciled.ok || !reconciled.unitId) return reconciled;
+      const { error } = await session.db
+        .from("project_context_units")
+        .update({ state: "active", updated_at: new Date().toISOString() })
+        .eq("team_id", teamId)
+        .eq("id", reconciled.unitId)
+        .eq("state", "retracted");
+      if (error) return { ok: false, error: `unit reactivation failed: ${error.message}` };
+      return reconciled;
     });
   } catch (error) {
     return { ok: false, error: contextFailureMessage(error) };
@@ -130,7 +143,7 @@ export async function reconcileItemUnit(
 /**
  * Durable visibility suppression used by source revocation. Retraction leaves membership history
  * intact but every enforced reader rejects the unit until a surviving claim reactivates it through
- * `reconcileItemUnit`.
+ * `reconcileItemUnit(…, { reactivate: true })`.
  */
 export async function retractItemUnit(
   db: DbClient,
