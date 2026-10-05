@@ -72,6 +72,15 @@ import { db, seedTeam, sha, type Seed } from "./helpers";
  *     writes, `member.provisioned` audit rows and provider delivery are a different owner and are not
  *     exercised. The empty durable difference is the availability call's; the fixture's own rows are
  *     the integration writer's and are not this file's evidence about that writer.
+ *   - THE UNAUDITED DECRYPTING READ IS A CURRENT SOURCE OBSERVATION. Each adapter's read is
+ *     `getEnabledIntegrationsWithSecrets`: by source reading it selects EVERY enabled row of the
+ *     team, whatever its type, and decrypts every stored secret in process — once per adapter, three
+ *     times a call — and no `audit_log` row is appended for it. What this file observes of that is
+ *     each trace's row count and the empty durable difference; the decryption itself is read from
+ *     the source. Neither is a compliance finding that such a read needs no audit record, and
+ *     neither is a no-write policy this owner is held to: a source that began auditing the read
+ *     would fail these cases on the difference, and that would be a behavior to re-observe, not a
+ *     regression this file rules on.
  *   - THE REASONS ARE THE SOURCE'S, NOT A POLICY. The GitHub adapter has no "no enabled integration"
  *     reason: an absent, a disabled and an org-less enabled row all answer `no GitHub org set`. That
  *     is recorded as it is and not declared correct.
@@ -84,12 +93,22 @@ import { db, seedTeam, sha, type Seed } from "./helpers";
  *     failure, an undecryptable stored ciphertext and the non-Error `check failed` fallback are not
  *     reached. The reason carries the read's error text verbatim; whether it should is not specified
  *     by any source this file reads, and is observed only.
+ *   - ONE UNREADABLE ROW IS NOT EXERCISED. Because that read decrypts every enabled row, by source
+ *     reading a single enabled row whose ciphertext cannot be decrypted — another tool's, or of a
+ *     type no adapter here reads — would reject all three adapters' reads at once. No case holds
+ *     such a row, or an enabled row of a fourth type: the coupling is a TODO below, not an
+ *     observation.
  *   - Nothing about API keys. AIO-1226 and the zero-row revoke residual are other files' and are
  *     neither touched nor supplied here.
  *
- * Run status at authoring: NOT RUN. This file was written without executing vitest, tsc or any other
- * command. Its expectations come from reading the sources above, not from an observed run; replace
- * this paragraph with the observed result once it has been executed.
+ * Run status. The seven cases were authored without executing anything. Per the coordinator's
+ * registered evidence, the file as committed at 9b150bde was then run on its own: stage
+ * `batch5-provisioning-availability-pg` exited 0 with 7 passed and 7 todo, and the scoped lint stage
+ * exited 0. That is one file's run — not the data-mechanics tier, not a mutation run and not a review
+ * verdict, and no review outcome is recorded in this file. The later edit of this header and the
+ * added eighth TODO changed no case, assertion or fixture and was itself written without executing
+ * vitest, tsc or any other command: the file as it now stands is NOT RUN until its next registered
+ * stage, and this paragraph is to be replaced with that result.
  */
 
 const FIXTURE = "FIXTURE PREMISE FAILED (setup, not an owner observation):";
@@ -783,6 +802,9 @@ describe("Z — evidence this file does NOT supply (executable TODOs: none is ru
   );
   it.todo(
     "READ FAILURE, REMAINDER · case 5 is a thrown executor error for the integrations read only; a native Postgres failure, a stored ciphertext that cannot be decrypted (for example after a SECRETS_KEY change) and the non-Error `check failed` fallback are not reached by this file, and whether the reason should carry the read's error text verbatim is not specified by any source it reads",
+  );
+  it.todo(
+    "CROSS-TYPE AND UNDECRYPTABLE-ROW COUPLING · each adapter's read decrypts EVERY enabled row of the team whatever its type, so by source reading one enabled row whose stored ciphertext cannot be decrypted — another tool's, or of a type no provisioning adapter reads — would reject all three adapters' reads and answer all three tools `configured: false` with the decryption error's text; no case here holds an undecryptable ciphertext or an enabled row of a fourth type, so neither the coupling nor what its reason discloses is observed, and whether one unreadable row should cost every tool is not specified by any source this file reads",
   );
   it.todo(
     "SEVERAL ENABLED ROWS OF ONE TYPE · enabledIntegration documents the earliest-created enabled row, but its read carries no ordering; which row answers when a team holds several enabled rows of one type is not exercised and no contract for it is declared here",
