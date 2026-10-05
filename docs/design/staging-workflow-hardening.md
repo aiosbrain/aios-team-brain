@@ -128,6 +128,7 @@ Credential/data policy for paired mode (legacy mode remains explicitly separate)
 | `auth_tokens`, `oauth_states`, `api_keys`, `agent_tokens` | Exclude table data |
 | `integrations`, `member_secrets` | Exclude table data |
 | `gateway_service_identities`, `gateway_service_credentials`, `gateway_connections`, `gateway_resolution_leases`, `gateway_executions`, `gateway_approvals`, `gateway_audit_log` | Exclude table data and full transitive FK dependent closure |
+| `gdrive_connection_authority`, `gdrive_item_claims`, `gdrive_item_claim_projects`, `gdrive_run_requests`, `gdrive_cleanup_obligations` | Exclude table data: bound by foreign key to excluded `integrations`/`api_keys` rows (and claims to that authority); same set as legacy mode |
 | `social_jobs`, `llm_usage`, `llm_failures`, `usage_costs` | Exclude data: no replay queue and no production spend attributed to staging |
 | `graph_episodes` | Include current ledger; sanitize completed pending-delete metadata as specified below, retain pending/deferred current projections truthfully |
 | `arc_cache`, `work_timeline_cache` | Exclude generated caches; avoid stale derivative content across sanitation |
