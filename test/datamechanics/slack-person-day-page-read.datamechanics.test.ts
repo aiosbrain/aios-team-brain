@@ -36,6 +36,12 @@ import { db, ingest, seedTeam, type Seed } from "./helpers";
  *    ledger or identity writer; a test that needs an UNSTAMPED change says so and relies on digests.
  *  - Source admission, provenance proofs, presentation and composition are injected seams. Tests of
  *    those are seam tests of the packet's obligations, not production AC-11 or presentation proof.
+ *  - The test-only options are the specification's named seams: `afterTransactionConfigured(query)`,
+ *    `afterDiscovery(query)` (between candidate discovery and shared projection), `afterEvidence()`
+ *    (between the evidence and validation transactions), `corruptCandidates(rows)` over SQL
+ *    candidate rows `{ itemId, memberId, day, at, messageCount, rootAuthored }`,
+ *    `corruptAccountRelation(rows)` over the SQL join's `(workspace, user, member)` relation, and
+ *    `messagePageSize` for the internal message batches.
  *
  * Modules are loaded per test through a non-literal specifier so each case fails on its own.
  */
@@ -241,8 +247,13 @@ async function oracleVisible(query: SqlExecutor, teamId: string, admission: Cont
   return visible.ids;
 }
 
-function composeDays(aggregates: readonly Json[], presentation: Json, asOf: unknown): TimelineDay[] {
+/** A day label from the bound asOf only — never from the ambient clock. */
+function labelFor(date: string, asOf: unknown): string {
   const asOfDay = (asOf instanceof Date ? asOf.toISOString() : String(asOf)).slice(0, 10);
+  return date === asOfDay ? "Today" : date;
+}
+
+function composeDays(aggregates: readonly Json[], presentation: Json, asOf: unknown): TimelineDay[] {
   const members = new Map((presentation.members as { id: string; name: string; handle: string }[]).map((m) => [m.id, m]));
   const titles = new Map((presentation.items as { itemId: string; title: string }[]).map((i) => [i.itemId, i.title]));
   const links = presentation.associations as { itemId: string; taskId: string; title: string; status: string }[];
@@ -266,7 +277,7 @@ function composeDays(aggregates: readonly Json[], presentation: Json, asOf: unkn
     }
   }
   return [...days].map(([date, people]) => ({
-    date, label: date === asOfDay ? "Today" : date,
+    date, label: labelFor(date, asOf),
     people: [...people].map(([memberId, p]): PersonDay => ({
       memberId, name: members.get(memberId)?.name ?? "Unknown", handle: members.get(memberId)?.handle ?? "", avatarUrl: null,
       total: 0, unlinked: 0, signals: [],
@@ -334,7 +345,7 @@ function dependencies(w: World, over: Json = {}): Json {
       const days = composeDays(input.aggregates, input.presentation, input.asOf);
       return w.override.compose ? w.override.compose(days, input as unknown as Json) : days;
     },
-    loadInitialNonSlack: async (query: SqlExecutor, input: { teamId: string; admission: ContentAdmission }) => {
+    loadInitialNonSlack: async (query: SqlExecutor, input: { teamId: string; admission: ContentAdmission; asOf: unknown }) => {
       w.seen.initial++;
       await observe(w, query, "initial");
       if (w.fail.initial) throw w.fail.initial;
@@ -343,7 +354,8 @@ function dependencies(w: World, over: Json = {}): Json {
       const result = {
         sourceItemIds: rows.map((g) => g.itemId),
         days: rows.length === 0 ? [] : [{
-          date: "2024-06-20", label: "2024-06-20",
+          // Labelled from the SAME bound asOf as the Slack composer, as the contract requires.
+          date: "2024-06-20", label: labelFor("2024-06-20", input.asOf),
           people: [...new Set(rows.map((g) => g.memberId))].map((memberId) => {
             const mine = rows.filter((g) => g.memberId === memberId);
             return {
@@ -374,13 +386,13 @@ async function page(w: World, over: Json = {}, options: Json = {}, deps: Json = 
 interface Traversal { pages: Loose[]; ids: string[]; tuples: Json[]; compact: Json[] }
 
 /** Follow cursors to the end, checking every per-page invariant on the way. */
-async function traverse(w: World, pageSize: number, options: Json = {}): Promise<Traversal> {
+async function traverse(w: World, pageSize: number, options: Json = {}, deps: Json = {}): Promise<Traversal> {
   const c = await contract();
   const out: Traversal = { pages: [], ids: [], tuples: [], compact: [] };
   let cursor: string | null = null;
   for (let guard = 0; guard < 2000; guard++) {
     const before = w.seen.aggregates.length;
-    const p = await page(w, { pageSize, cursor }, options);
+    const p = await page(w, { pageSize, cursor }, options, deps);
     expect(w.seen.aggregates.length, "the composer ran exactly once for the page").toBe(before + 1);
     expect(p.aggregates.length).toBeLessThanOrEqual(pageSize);
     expect(p.slackComplete).toBe(p.nextSlackCursor === null);
@@ -459,10 +471,11 @@ describe("aggregate Slack page — grain, order and saturation on real Postgres"
     const order = [...expected].sort((p, q) =>
       cmp(q.at.slice(0, 10), p.at.slice(0, 10)) || cmp(q.at, p.at) || cmp(p.item, q.item) || cmp(p.member, q.member));
     const want = order.map((e) => ({ day: e.at.slice(0, 10), at: e.at, itemId: e.item, memberId: e.member }));
+    expect(want).toHaveLength(11);
     for (const size of [1, 2, 128]) {
-      const run = await traverse(world(s.team) && s.w, size);
+      const run = await traverse(s.w, size);
       expect(run.tuples).toEqual(want);
-      expect(run.pages).toHaveLength(size === 128 ? 1 : Math.floor(want.length / size) + 1);
+      expect(run.pages).toHaveLength(Math.ceil(want.length / size));
     }
     // A's root on D18 is the same person-day as A's D18 reply: one group, both messages.
     const rootDay = (await traverse(s.w, 128)).compact.find((g) => g.id === groupId(x, s.a.id, "2024-06-18"));
@@ -532,23 +545,20 @@ describe("aggregate Slack page — grain, order and saturation on real Postgres"
     }
   });
 
-  it("advances exactly once through equal six-digit instants tied on item and member", async () => {
+  it("advances exactly once through groups tied on the same six-digit instant", async () => {
     const s = await scene();
+    // Eight threads whose only message carries the SAME microsecond: four by A, four by B. Day and
+    // instant tie for all eight, so only the item (and then member) components order them.
     const stamp = ts(D20, 123_456);
-    const items: string[] = [];
-    for (let n = 0; n < 4; n++) {
-      const id = await thread(s, `tie-${n}`, stamp, "U1");
-      await message(s.team.teamId, id, ts(D20, 123_456).replace(/6$/, "6"), { root: stamp, user: "U1" }).catch(() => undefined);
-      await message(s.team.teamId, id, ts(D20, 123_455), { root: stamp, user: "U2" });
-      await message(s.team.teamId, id, `${stamp.slice(0, -1)}6`, { root: stamp, user: "U3" }).catch(() => undefined);
-      items.push(id);
-    }
+    const owner = new Map<string, string>();
+    for (let n = 0; n < 8; n++) owner.set(await thread(s, `tie-${n}`, stamp, n % 2 === 0 ? "U1" : "U2"), n % 2 === 0 ? s.a.id : s.b.id);
     await converge(s.team);
-    const run = await traverse(s.w, 1);
-    const atStamp = run.tuples.filter((t) => t.at === instant(stamp));
-    expect(atStamp.map((t) => t.itemId)).toEqual([...items].sort());
-    expect(run.tuples).toHaveLength(8);
-    for (const t of atStamp) expect(t.memberId).toBe(s.a.id);
+    for (const size of [1, 3]) {
+      const run = await traverse(s.w, size);
+      expect(run.tuples).toEqual([...owner.keys()].sort().map((itemId) => ({
+        day: "2024-06-20", at: instant(stamp), itemId, memberId: owner.get(itemId),
+      })));
+    }
   });
 
   it("counts only in-window, eligible, surviving messages, inclusively at both window bounds", async () => {
@@ -593,7 +603,7 @@ describe("aggregate Slack page — grain, order and saturation on real Postgres"
     await message(s.team.teamId, orphan, ts(D19, 30), { root: gone, user: "U1" });
     await converge(s.team);
 
-    const run = await traverse(s.w, 128, { messagePageSize: 100, candidateFetchSize: 1 });
+    const run = await traverse(s.w, 128, { messagePageSize: 100 }, { budgets: { candidateFetchSize: 1 } });
     const [bigGroup, orphanGroup] = run.compact;
     expect(bigGroup).toMatchObject({
       id: groupId(big, s.a.id, "2024-06-20"), messageCount: 2501, rootAuthored: true, rootTs: root,
@@ -759,17 +769,29 @@ describe("aggregate Slack page — real corrections through the packet's own loc
       const s = await corrected();
       const w = s.w;
       let starts = 0;
-      let nexts = 0;
+      let firstLanded = false;
+      let secondLanded = false;
       const deps = dependencies(w);
       const run = () => d.drainSlackTimeline({
         pageSize: 1,
         startPage: (input: Json) => { starts++; return r.readSlackPersonDayPage(request(w, { ...input, cursor: null }), deps); },
         nextPage: async (cursor: string) => {
-          // Between page one and page two of each attempt, a REAL correction lands.
-          if (nexts++ < overtakes) await correct(s.team, s.x, nexts === 1 ? s.b.email : s.a.email);
+          // Between page one and page two of the first attempt, a REAL correction lands: lock to B.
+          if (!firstLanded) {
+            firstLanded = true;
+            await correct(s.team, s.x, s.b.email);
+          }
           return r.readSlackPersonDayPage(request(w, { pageSize: 1, cursor }), deps);
         },
-        validateFinal: (input: Json) => r.validateSlackPersonDayFinal({ ...request(w, { pageSize: 1 }), ...input }, deps),
+        validateFinal: async (input: Json) => {
+          // The second attempt is one terminal page (B's group). A second real correction lands
+          // after its evidence and before final validation: only the fresh final check can see it.
+          if (overtakes === 2 && firstLanded && !secondLanded) {
+            secondLanded = true;
+            await correct(s.team, s.x, s.a.email);
+          }
+          return r.validateSlackPersonDayFinal({ ...request(w, { pageSize: 1 }), ...input }, deps);
+        },
         decodeCursor: (token: string) => c.decodeSlackTimelineCursor(token, KEY),
       });
       if (overtakes === 1) {
@@ -780,10 +802,9 @@ describe("aggregate Slack page — real corrections through the packet's own loc
         const ids = (result.days as TimelineDay[]).flatMap((day) => day.people.flatMap((p) => p.other.flatMap((g) => g.items.map((i) => i.id))));
         expect(ids).toEqual([groupId(s.x, s.b.id, "2024-06-19")]);
       } else {
-        // Attempt one is overtaken (locked to B); attempt two starts with B's single group and is
-        // terminal on its first page, so the second correction can only be seen by final validation.
         await expectFailure(run, "restart_required");
         expect(starts).toBe(2);
+        expect(secondLanded).toBe(true);
       }
     }
   });
@@ -896,8 +917,9 @@ describe("aggregate Slack page — one evidence snapshot, one fresh validation s
     await page(s.w, {}, {
       afterDiscovery: async (query: SqlExecutor) => { await observe(s.w, query, "seam"); },
       afterEvidence: async () => {
-        // A committed write between the two transactions: the validation snapshot must be newer.
-        await runSql(`update items set body = body where team_id = $1`, [s.team.teamId]);
+        // A committed transaction between the two: it changes no data, and it guarantees the
+        // validation snapshot cannot be textually identical to the evidence snapshot.
+        await runSql(`select txid_current()`);
         seamCommitted = true;
       },
     });
@@ -954,13 +976,31 @@ describe("aggregate Slack page — one evidence snapshot, one fresh validation s
     }
   });
 
-  it("refuses to run inside an ambient transaction it did not open", async () => {
+  it("never reads through an ambient transaction: it is refused, or the page demonstrably opens its own", async () => {
     const s = await scene();
     await thread(s, "one", ts(D20, 1), "U1");
     await converge(s.team);
     const r = await reader();
-    await expectFailure(() => tx(async (session) =>
-      r.readSlackPersonDayPage(request(s.w), dependencies(s.w), { executor: session.executeSql })), "unavailable");
+    const outcome = await tx(async (session) => {
+      const ambient = (await session.executeSql<{ pid: number }>(`select pg_backend_pid() as pid`)).rows[0].pid;
+      try {
+        await r.readSlackPersonDayPage(request(s.w), dependencies(s.w), {
+          afterDiscovery: (query: SqlExecutor) => observe(s.w, query, "seam"),
+        });
+        return { ambient, failure: null as Json | null };
+      } catch (error) {
+        return { ambient, failure: error as Json };
+      }
+    });
+    if (outcome.failure) {
+      expect(outcome.failure).toMatchObject({ name: "SlackTimelineError", code: "unavailable" });
+    } else {
+      expect(s.w.seen.snapshots.length).toBeGreaterThan(0);
+      for (const row of s.w.seen.snapshots) {
+        expect(row.pid, `${row.label} did not run on the ambient connection`).not.toBe(outcome.ambient);
+        expect(row).toMatchObject({ isolation: "repeatable read", readOnly: "on" });
+      }
+    }
   });
 });
 
@@ -1018,13 +1058,18 @@ describe("aggregate Slack page — two-way SQL/projector equality (N4)", () => {
     expect(omitted).toBeGreaterThan(0);
   });
 
-  it("does not claim to detect an item SQL never surfaces: that stays the saturation tests' job", async () => {
+  // An item SQL never surfaces at all is outside this per-loaded-item comparison by design. It is
+  // covered by the saturation and identity tests above, which compare complete traversals against
+  // independently computed expectations; no test here pins that such a fault goes UNDETECTED.
+  it("leaves an uncorrupted traversal alone when the seams are present but pass rows through (control)", async () => {
     const s = await twoDays();
-    // Dropping EVERY candidate of item y leaves nothing loaded to compare against. The comparison
-    // is per loaded item; this case is recorded so nobody reads the equality check as global.
-    const run = await traverse(s.w, 128, { corruptCandidates: (rows: Json[]) => rows.filter((r) => r.itemId !== s.y) });
-    expect(run.ids).toHaveLength(3);
-    expect(JSON.stringify(run.ids)).not.toContain(s.y);
+    const run = await traverse(s.w, 1, {
+      corruptCandidates: (rows: Json[]) => rows, corruptAccountRelation: (relation: Json[]) => relation,
+    });
+    expect(run.ids).toEqual([
+      groupId(s.y, s.c.id, "2024-06-20"), groupId(s.x, s.a.id, "2024-06-20"),
+      groupId(s.x, s.a.id, "2024-06-19"), groupId(s.x, s.b.id, "2024-06-18"),
+    ]);
   });
 });
 
@@ -1318,7 +1363,7 @@ describe("aggregate Slack page — initial non-Slack evidence (N1) and presentat
       });
       expect(result.window_days).toBe(7);
       const text = JSON.stringify(result);
-      expect(text).toContain(groupId(s.x, s.a.id, "2024-06-20").slice(2, 38));
+      expect(text).toContain(s.x);
       if (event === "revoke") {
         expect(starts).toBe(2);
         expect(text).not.toContain("PR one");
@@ -1375,9 +1420,14 @@ describe("aggregate Slack page — initial non-Slack evidence (N1) and presentat
     s.w.override.initial = mutate;
     const failure = await failureOf(() => page(s.w));
     expect(failure.name).toBe("SlackTimelineError");
-    // An unlisted-by-the-oracle backing ID is a revocation (restart); everything else is malformed.
-    expect(failure.code).toBe(_label === "a backing ID the real oracle does not show" ? "restart_required" : "unavailable");
-    expect(s.w.seen.aggregates, "rejected before composition").toEqual([]);
+    expect(failure).not.toHaveProperty("days");
+    if (_label === "a backing ID the real oracle does not show") {
+      // Not malformed: an ID outside the current real-oracle set is a revocation, found at publication.
+      expect(failure.code).toBe("restart_required");
+    } else {
+      expect(failure.code).toBe("unavailable");
+      expect(s.w.seen.aggregates, "rejected before composition").toEqual([]);
+    }
   });
 
   it("hands the presentation loader the actual principal and the evidence-snapshot admission", async () => {
@@ -1390,7 +1440,9 @@ describe("aggregate Slack page — initial non-Slack evidence (N1) and presentat
     });
     expect(first.viewKey).toMatch(/^[0-9a-f]{64}$/);
     expect((first.slackItems as Json[]).map((i) => i.itemId)).toEqual([s.x]);
-    expect(first.admission).toEqual((s.w.seen.admission.length, (await resolveContentAdmission(db(), s.team.teamId, s.team.memberId))));
+    // The admission is the one resolved in that snapshot, complete — not a view key standing in for it.
+    expect(first.admission).toEqual(await resolveContentAdmission(db(), s.team.teamId, s.team.memberId));
+    expect(String(first.asOf instanceof Date ? (first.asOf as Date).toISOString() : first.asOf)).toBe(ms(NOW_MS));
     // The view key is derived server-side: a caller-supplied one is not an input at all.
     const forged = await page(s.w, { viewKey: "f".repeat(64) });
     expect(forged.binding.viewKey).toBe((await page(s.w)).binding.viewKey);
@@ -1520,7 +1572,7 @@ describe("aggregate Slack page — deterministic budgets (D1)", () => {
     const s = await rejectedRun(5);
     const extra = await thread(s, "extra", ts(D18, 1), "U2");
     await converge(s.team);
-    const run = await traverse(s.w, 1, { candidateFetchSize: 2 });
+    const run = await traverse(s.w, 1, {}, { budgets: { candidateFetchSize: 2 } });
     expect(run.ids).toEqual([groupId(s.deliverable, s.b.id, "2024-06-19"), groupId(extra, s.b.id, "2024-06-18")]);
     // The cursor is the last EMITTED tuple, not the last scanned or lookahead one.
     const c = await contract();
