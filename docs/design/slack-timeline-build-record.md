@@ -742,3 +742,27 @@ Ownership at this update: draft PR 743, remote checkpoint `4689d686ca605301c2603
 Remote backup at this update: the remote branch is still at `9a0638f2`. The first source edit of this final correction was at 2026-10-05T15:00:18Z, so its 30-minute remote deadline is 15:30:18Z. The mandatory final review and pre-push gates are under way; no push of `ea1ed05a` is recorded here.
 
 All earlier scope limits and every limitation in the census entry still apply. Unchanged and not authorized: the human, live and activation gates, wiring, deletion of the not-wired guard, merge, deployment, and any push to main, production or by force. This update changes no source or test.
+
+**Final focused reviews and mutation evidence — candidate `7c138c20ae73b22472acf401ec8210e41b8608b7`.** The reviews recorded as pending above then ran on this exact candidate. The blind fresh GPT-6.1 Sol-high final focused review returned **PASS**, with no blocker, HIGH or MEDIUM. It independently reran the pure and guard suite at 167/167, the typecheck, the targeted ESLint and the diff check; it inspected, but did not rerun, the recorded PostgreSQL evidence. The fresh Astra-high review returned **PASS** on source correctness, and initially withheld overall readiness for one reason: the specification's required behavioural mutation evidence had not been produced.
+
+That gap was then closed. The durable evidence is in the ignored directory `.context/aio-1170-resume/census-mutation-controls-7c138c20/`. Nine controlled mutants of the production modules were each run against the census tests, and each exited 1 on the intended behavioural assertion:
+
+- the read-only transaction setup removed;
+- the team predicate removed from the main scan — still valid SQL, with 2 rows expected and 7 received;
+- a missing gate ensured instead of reported absent;
+- a non-empty stale binding cache used in place of the current selection — the run reached the `C0CACHED` exclusion, where a refusal was expected and a page was received;
+- a lone current workspace accepted as legacy provenance;
+- the project ignored in the target-collision lookup;
+- the cross-page convergence lookup removed;
+- participant endpoints expanded into intervening days;
+- a reader-owned SQL error converted into an empty or refused success.
+
+The tenth control in the specification's list, reachability through a synthetic `app/` import, is covered by the direct and transitive synthetic controls already in the green guard suite. Only these runs are recorded as evidence.
+
+The harness restored the exact production bytes after every mutant. Final Git blob hashes: the pure classifier `24ba4ec739d9feefb4f1bacf8595e9c59826b5c8`, the reader `16bb2bdec25197c6e1b0c0763164152c4ef60a34`; the tracked tree was clean. The canonical rerun after the mutation controls was unit and guard **167/167** and fresh isolated PostgreSQL census **52/52**.
+
+Astra then returned **READY / PASS** for the exact candidate, with no remaining blocker, HIGH or MEDIUM. This establishes review readiness for the bounded, inactive, read-only census and nothing wider. The broad `npm test` remains **not green**, for the staging-owned lifecycle failures and the hang recorded under PA-1. The human, live and activation gates are unchanged. The obligation to reconcile with PR 743 and rerun both branches' contract suites once it lands, or on an explicit integration, is unchanged. Every limitation in the census entry still applies.
+
+Remote backup at the time of this record: the remote branch is still at `9a0638f2`. The push of this candidate, its remote attestation and CI have not yet occurred. The first source edit of this final correction was at 2026-10-05T15:00:18Z and its 30-minute remote deadline was 15:30:18Z.
+
+Not done and not authorized, unchanged: activation, wiring, deletion of the not-wired guard, the identity cutover and repair, merge, deployment, and any push to main, production or by force. This update changes no source or test.
