@@ -279,12 +279,22 @@ function validRequest(request: SlackPersonDayPageRequest): ValidRequest {
       pageSize > SLACK_TIMELINE_PAGE_SIZE.max) return invalidRequest("unsupported page size");
   const cursor = r.cursor === undefined || r.cursor === null ? null : r.cursor;
   if (cursor !== null && typeof cursor !== "string") return invalidRequest("cursor is malformed or cannot be verified");
+  // The filters are the one caller-owned object graph of the request. They are validated as
+  // JSON-safe and copied HERE, synchronously: a filter the view key cannot bind is refused before
+  // any database work, and a caller mutating its object later cannot change the view between the
+  // evidence and validation snapshots of one page.
+  let filters: Record<string, unknown>;
+  try {
+    filters = deepFreeze(JSON.parse(canonicalSlackTimelineJson(view.filters)) as Record<string, unknown>);
+  } catch {
+    return invalidRequest("invalid view");
+  }
   return {
     teamId,
     principal: { teamId, memberId: principal.memberId.toLowerCase() },
-    requestedView: {
-      mode: view.mode, filters: view.filters, locale: view.locale, presentationPolicyVersion: view.presentationPolicyVersion,
-    },
+    requestedView: Object.freeze({
+      mode: view.mode, filters, locale: view.locale, presentationPolicyVersion: view.presentationPolicyVersion,
+    }),
     windowDays: r.windowDays,
     pageSize,
     cursor,
@@ -401,8 +411,14 @@ class PageRun {
     this.detach = () => outer?.removeEventListener("abort", expire);
   }
 
+  /** One monotonic reading. A clock that throws or misreports is a failed dependency, never a raw error. */
   private clock(): number {
-    const value = this.deps.monotonicNow();
+    let value: unknown;
+    try {
+      value = this.deps.monotonicNow();
+    } catch {
+      return unavailable("monotonic clock failed");
+    }
     if (typeof value !== "number" || !Number.isFinite(value)) return unavailable("monotonic clock is misconfigured");
     return value;
   }
@@ -483,9 +499,9 @@ interface Snapshot {
 
 /**
  * One fresh `REPEATABLE READ, READ ONLY` transaction on its own pooled connection, demonstrably
- * configured before any read, with a transaction-local `statement_timeout` no longer than the
- * remaining budget (and never 0, which the server reads as "no timeout"). Every result row that
- * passes through its executor is metered.
+ * configured before any read. Its executor re-derives the transaction-local `statement_timeout`
+ * from the remaining budget before EVERY statement (never 0, which the server reads as "no
+ * timeout"), meters every result row, and refuses to run once the transaction has ended.
  */
 async function inSnapshot<T>(run: PageRun, body: (snapshot: Snapshot) => Promise<T>): Promise<T> {
   run.check();
@@ -499,9 +515,17 @@ async function inSnapshot<T>(run: PageRun, body: (snapshot: Snapshot) => Promise
       return unavailable("transaction is not a fresh read-only snapshot");
     }
 
+    // The executor belongs to THIS transaction only. Once the transaction's body has ended — by
+    // returning, failing or being abandoned on a deadline — the connection goes back to the pool,
+    // so a dependency that kept the executor must be refused, never run on someone else's session.
+    let open = true;
+    const ended = (): never => unavailable("snapshot transaction has ended");
+
     let applied = -1;
     const refreshTimeout = async (): Promise<void> => {
+      if (!open) return ended();
       const timeout = Math.max(1, Math.ceil(run.remaining()));
+      // Only an unchanged bound is skipped; any change in the remaining budget is sent to the server.
       if (timeout === applied) return;
       await client.query(`select set_config('statement_timeout', $1, true)`, [String(timeout)]);
       applied = timeout;
@@ -509,7 +533,11 @@ async function inSnapshot<T>(run: PageRun, body: (snapshot: Snapshot) => Promise
     await refreshTimeout();
 
     const query: SqlExecutor = async <R>(text: string, params: unknown[] = []) => {
-      run.check();
+      // Immediately before EVERY statement the transaction-local timeout is re-derived from the
+      // budget that actually remains (one clock reading, which also stops a spent budget). A later
+      // statement therefore never inherits the larger timeout an earlier statement was given.
+      await refreshTimeout();
+      if (!open) return ended();
       let result;
       try {
         result = await client.query(text, params);
@@ -522,7 +550,11 @@ async function inSnapshot<T>(run: PageRun, body: (snapshot: Snapshot) => Promise
       run.meterRows(rows);
       return { rows, rowCount: result.rowCount ?? 0 };
     };
-    return body({ query, refreshTimeout });
+    try {
+      return await body({ query, refreshTimeout });
+    } finally {
+      open = false;
+    }
   });
 }
 
@@ -772,6 +804,29 @@ interface InitialNonSlack {
 }
 
 /**
+ * True when any source group, or any row inside one, is Slack's. Deliberately tolerant of every
+ * other malformation — it runs on an unvalidated dependency result, and shape is judged afterwards.
+ */
+function carriesSlackEvidence(days: unknown): boolean {
+  if (!Array.isArray(days)) return false;
+  const isSlack = (group: unknown): boolean =>
+    isRecord(group) && (group.source === "slack" ||
+      (Array.isArray(group.items) && group.items.some((item) => isRecord(item) && item.source === "slack")));
+  for (const day of days) {
+    if (!isRecord(day) || !Array.isArray(day.people)) continue;
+    for (const person of day.people as unknown[]) {
+      if (!isRecord(person)) continue;
+      if (Array.isArray(person.other) && person.other.some(isSlack)) return true;
+      if (!Array.isArray(person.tasks)) continue;
+      for (const task of person.tasks as unknown[]) {
+        if (isRecord(task) && Array.isArray(task.sources) && task.sources.some(isSlack)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
  * Load, validate and freeze the non-Slack days of a first page. Two rules are this packet's own:
  * the days may hold no Slack group at all (legacy Slack rows from a reused builder are refused
  * before anything is merged), and the declared backing IDs must cover every source item the days
@@ -788,7 +843,11 @@ async function loadInitial(
   await snapshot.refreshTimeout();
   if (!isRecord(result)) return unavailable("initial non-Slack result is incomplete");
   const sourceItemIds = backingIdList(result.sourceItemIds);
-  // Shape first: the shared merger's own rules, with nothing merged in yet.
+  // Slack evidence is refused BEFORE the shared merger sees these days. The merger reconciles Slack
+  // rows, so two conflicting legacy Slack rows would otherwise surface as a merge conflict — a
+  // restart — when the truth is a malformed dependency result.
+  if (carriesSlackEvidence(result.days)) return unavailable("initial non-Slack days carry Slack evidence");
+  // Then shape: the shared merger's own rules, with nothing merged in yet.
   const days = mergeSlackTimelineDays(result.days as TimelineDay[], []);
   let json: string;
   try {

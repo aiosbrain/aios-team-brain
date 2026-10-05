@@ -825,6 +825,41 @@ describe("Slack timeline drain — shared budgets (D1)", () => {
     expect(await failureOf(() => d.drainSlackTimeline({ ...w.deps, budgets }))).toMatchObject({ name: "SlackTimelineError", code: "unavailable" });
     expect(w.calls.start).toEqual([]);
   });
+
+  it("reports a monotonic clock that throws as unavailable, on its first reading and on any later one", async () => {
+    const d = await drainModule();
+    // The first reading is taken before anything is requested: a raw error must not escape it.
+    const broken = world([stable()], 2);
+    const atStart = await failureOf(() => d.drainSlackTimeline({ ...broken.deps, monotonicNow: () => { throw new Error("clock device failed"); } }));
+    expect(atStart).toMatchObject({ name: "SlackTimelineError", code: "unavailable" });
+    expect(String(atStart.message)).not.toContain("clock device failed");
+    expect(broken.calls.start).toEqual([]);
+
+    // Learn how many readings a clean drain takes, then fail every one of them in turn.
+    let readings = 0;
+    const clean = world([stable()], 2);
+    await d.drainSlackTimeline({ ...clean.deps, monotonicNow: () => { readings++; return 0; } });
+    expect(readings).toBeGreaterThan(2);
+    for (let failAt = 2; failAt <= readings; failAt++) {
+      let n = 0;
+      const w = world([stable(), stable({ asOfMs: AS_OF_2 })], 2);
+      const failure = await failureOf(() => d.drainSlackTimeline({
+        ...w.deps, monotonicNow: () => { if (++n === failAt) throw new Error("clock device failed"); return 0; },
+      }));
+      expect(failure, `reading ${failAt}`).toMatchObject({ name: "SlackTimelineError", code: "unavailable" });
+      expect(failure).not.toHaveProperty("days");
+      // A failed clock is not an overtake: no second attempt is started on it.
+      expect(w.calls.start.length).toBeLessThanOrEqual(1);
+    }
+    // A clock that misreports is the same failed dependency.
+    for (const value of [Number.NaN, Number.POSITIVE_INFINITY, "0", null]) {
+      const w = world([stable()], 2);
+      expect(await failureOf(() => d.drainSlackTimeline({ ...w.deps, monotonicNow: () => value }))).toMatchObject({
+        name: "SlackTimelineError", code: "unavailable",
+      });
+      expect(w.calls.start).toEqual([]);
+    }
+  });
 });
 
 /**

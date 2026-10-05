@@ -951,6 +951,52 @@ describe("aggregate Slack page — one evidence snapshot, one fresh validation s
     expect((await runSql<{ body: string }>(`select body from items where id = $1`, [id])).rows[0].body).not.toBe("forbidden");
   });
 
+  it("fails its executor closed once the snapshot transaction has ended, for a page that returned and for one that failed", async () => {
+    // A dependency may keep the executor it was handed. After the transaction ends its connection is
+    // back in the pool: a late statement must be refused, not run on whatever session holds that
+    // connection next (source review, LOW 5).
+    for (const outcome of ["returned", "failed"] as const) {
+      const s = await scene();
+      await thread(s, "x", ts(D20, 1), "U1");
+      await converge(s.team);
+      const real = dependencies(s.w);
+      const kept: SqlExecutor[] = [];
+      const keep = (name: string) => (query: SqlExecutor, context: Json): unknown => {
+        kept.push(query);
+        return (real[name] as (q: SqlExecutor, c: Json) => unknown)(query, context);
+      };
+      const deps = { loadAdmission: keep("loadAdmission"), loadPresentation: keep("loadPresentation"), loadInitialNonSlack: keep("loadInitialNonSlack") };
+      let seamExecutor: SqlExecutor | null = null;
+      const options: Json = { afterDiscovery: async (query: SqlExecutor) => { seamExecutor = query; } };
+      if (outcome === "failed") options.afterEvidence = async () => { throw new Error("fails after the evidence transaction"); };
+
+      if (outcome === "returned") expect((await page(s.w, {}, options, deps)).aggregates).toHaveLength(1);
+      else await expectFailure(() => page(s.w, {}, options, deps), "unavailable");
+
+      // While its transaction was open each executor worked (the page above depended on it). Now:
+      expect(seamExecutor, "the seam was handed an executor").not.toBeNull();
+      const executors = [...new Set([...kept, seamExecutor as unknown as SqlExecutor])];
+      expect(executors.length).toBeGreaterThanOrEqual(outcome === "returned" ? 2 : 1);
+      const marker = `aio_1170_late_${randomUUID().replace(/-/g, "")}`;
+      for (const query of executors) {
+        const failure = await failureOf(() => query(`select '${marker}' as marker, pg_backend_pid() as pid`));
+        expect(failure).toMatchObject({ name: "SlackTimelineError", code: "unavailable" });
+        expect(failure).not.toHaveProperty("rows");
+        // A write would be refused the same way: before it reaches any connection at all.
+        expect(await failureOf(() => query(`update items set body = 'late' where team_id = $1`, [s.team.teamId]))).toMatchObject({
+          name: "SlackTimelineError", code: "unavailable",
+        });
+      }
+      // Nothing was sent: no session ran the marker statement, and no row was touched.
+      const ran = await runSql<{ n: number }>(
+        `select count(*)::int as n from pg_stat_activity where datname = current_database() and pid <> pg_backend_pid() and query like $1`,
+        [`%${marker}%`]
+      );
+      expect(ran.rows[0].n).toBe(0);
+      expect((await runSql<{ n: number }>(`select count(*)::int as n from items where team_id = $1 and body = 'late'`, [s.team.teamId])).rows[0].n).toBe(0);
+    }
+  });
+
   it("holds real ledger, mapping and correction writes committed mid-read out of the evidence, then detects the overtake", async () => {
     for (const write of ["ledger", "mapping", "correction"] as const) {
       const s = await scene();
@@ -1252,10 +1298,48 @@ describe("aggregate Slack page — authenticated continuation on the real servic
     ["page size 0", { pageSize: 0 }], ["page size 513", { pageSize: 513 }], ["a fractional page size", { pageSize: 1.5 }],
     ["window 8", { windowDays: 8 }], ["window 0", { windowDays: 0 }], ["a non-UUID team", { teamId: "team" }],
     ["no principal", { principal: null }], ["no view", { requestedView: null }],
+    // Filters the view key cannot bind are a malformed request, found before any read — not an
+    // unavailable dependency found after admission was already loaded (source review, LOW 4).
+    ["filters holding a Date", { requestedView: { mode: "timeline", filters: { since: new Date(0) }, locale: "en-US", presentationPolicyVersion: "1" } }],
+    ["filters holding NaN", { requestedView: { mode: "timeline", filters: { limit: Number.NaN }, locale: "en-US", presentationPolicyVersion: "1" } }],
+    ["filters holding a Set", { requestedView: { mode: "timeline", filters: { memberIds: new Set(["x"]) }, locale: "en-US", presentationPolicyVersion: "1" } }],
+    ["filters holding a function", { requestedView: { mode: "timeline", filters: { pick: () => true }, locale: "en-US", presentationPolicyVersion: "1" } }],
+    ["filters that are an array", { requestedView: { mode: "timeline", filters: [], locale: "en-US", presentationPolicyVersion: "1" } }],
   ])("refuses %s as an invalid request before any database work", async (_label, over) => {
     const s = await scene();
     await expectFailure(() => page(s.w, over), "invalid_request");
     expect(s.w.seen.admission).toEqual([]);
+  });
+
+  it("snapshots the request's filters before its first await: a caller mutating them mid-page changes nothing", async () => {
+    const s = await scene();
+    await thread(s, "x", ts(D20, 1), "U1");
+    await converge(s.team);
+    const view = (filters: Json): Json => ({ mode: "timeline", filters, locale: "en-US", presentationPolicyVersion: "1" });
+    const expected = (await page(s.w, { requestedView: view({ memberIds: ["a"], nested: { on: true } }) })).binding.viewKey;
+
+    // The caller keeps its object and rewrites it between the evidence and validation snapshots.
+    const filters: Json = { memberIds: ["a"], nested: { on: true } };
+    const seenBefore = s.w.seen.admission.length;
+    const p = await page(s.w, { requestedView: view(filters) }, {
+      afterEvidence: async () => {
+        (filters.memberIds as string[]).push("b");
+        (filters.nested as Json).on = false;
+        filters.added = "later";
+      },
+    });
+    // One view for the whole page: no restart, and the key is the ORIGINAL filters' key.
+    expect(p.aggregates).toHaveLength(1);
+    expect(p.binding.viewKey).toBe(expected);
+    expect(p.binding.viewKey).not.toBe((await page(s.w, { requestedView: view(filters) })).binding.viewKey);
+    // Both admission reads of that page saw the same copied, immutable filters — never the caller's object.
+    const [evidenceRead, validationRead] = s.w.seen.admission.slice(seenBefore, seenBefore + 2) as { requestedView: { filters: Json } }[];
+    for (const read of [evidenceRead, validationRead]) {
+      expect(read.requestedView.filters).toEqual({ memberIds: ["a"], nested: { on: true } });
+      expect(read.requestedView.filters).not.toBe(filters);
+      expect(Object.isFrozen(read.requestedView.filters)).toBe(true);
+      expect(Object.isFrozen(read.requestedView.filters.memberIds)).toBe(true);
+    }
   });
 
   it("accepts every allowed window on the page service; v1's seven-day rule belongs to the drain", async () => {
@@ -1479,6 +1563,26 @@ describe("aggregate Slack page — initial non-Slack evidence (N1) and presentat
       days[0].people[0].tasks.push({
         taskId: "T", title: "Task", status: "done", source: "linear", evidenceCount: 1,
         sources: [{ source: "slack", count: 1, items: [{ id: "legacy", title: "Old Slack row", source: "slack", kind: "thread", at: "2024-06-20T10:00:00Z" }] }],
+      });
+      return { ...r, days };
+    }],
+    // Two legacy Slack rows that DISAGREE (one evidence ID, two titles) are a valid-shape conflict
+    // to the shared merger. They must be refused as Slack evidence before any merge: reaching the
+    // merger would classify a malformed dependency as restart_required (source review, LOW 2).
+    ["conflicting legacy Slack rows the shared merger would call a merge conflict", (r: Json) => {
+      const days = structuredClone(r.days) as TimelineDay[];
+      const legacy = (title: string) => ({ id: "legacy", title, source: "slack", kind: "thread", at: "2024-06-20T10:00:00Z" });
+      days[0].people[0].other.push({ source: "slack", count: 1, items: [legacy("One title")] });
+      days[0].people[0].tasks.push({
+        taskId: "T", title: "Task", status: "done", source: "linear", evidenceCount: 1,
+        sources: [{ source: "slack", count: 1, items: [legacy("Another title")] }],
+      });
+      return { ...r, days };
+    }],
+    ["a Slack-sourced row hidden inside a group labelled with another source", (r: Json) => {
+      const days = structuredClone(r.days) as TimelineDay[];
+      days[0].people[0].other.push({
+        source: "github", count: 1, items: [{ id: "legacy", title: "Old Slack row", source: "slack", kind: "thread", at: "2024-06-20T10:00:00Z" }],
       });
       return { ...r, days };
     }],
@@ -1835,6 +1939,120 @@ describe("aggregate Slack page — deterministic budgets (D1)", () => {
     expect(s.w.seen.admission).toEqual([]);
   });
 
+  /**
+   * Exact-limit coverage for the three read/size ceilings (source review, LOW 6). The totals are not
+   * guessed and not searched for: a run that is refused only at PUBLICATION (a one-byte page budget)
+   * has finished every read, so its counters are the page's complete row and byte totals. The
+   * fixture's own snapshot probe is answered locally, because a backend pid or snapshot text of a
+   * different length would make the byte total differ between two otherwise identical runs.
+   */
+  function steadyDependencies(w: World): Json {
+    const real = dependencies(w);
+    const steady = (query: SqlExecutor): SqlExecutor => (async (text: string, params?: unknown[]) =>
+      text.includes("pg_backend_pid()")
+        ? { rows: [{ pid: 1, snapshot: "1:1:", isolation: "repeatable read", readOnly: "on" }], rowCount: 1 }
+        : query(text, params)) as SqlExecutor;
+    const wrap = (name: string) => (query: SqlExecutor, context: Json): unknown =>
+      (real[name] as (q: SqlExecutor, c: Json) => unknown)(steady(query), context);
+    return { loadAdmission: wrap("loadAdmission"), loadPresentation: wrap("loadPresentation"), loadInitialNonSlack: wrap("loadInitialNonSlack") };
+  }
+
+  it("allows exactly the rows and read bytes a page needs, and refuses one fewer of either", async () => {
+    const s = await rejectedRun(2);
+    s.w.nonSlack.push({ itemId: await githubItem(s.team, "pr"), title: "PR one", memberId: s.team.memberId });
+    await converge(s.team);
+    const deps = (budgets: Json): Json => ({ ...steadyDependencies(s.w), budgets });
+
+    const atPublication = await expectFailure(() => page(s.w, {}, {}, deps({ maxPageBytes: 1 })), "budget_exhausted");
+    const totals = atPublication.diagnostics as { rowsRead: number; bytesRead: number; candidatesExamined: number };
+    expect(Number.isSafeInteger(totals.rowsRead) && totals.rowsRead > 0).toBe(true);
+    expect(Number.isSafeInteger(totals.bytesRead) && totals.bytesRead > totals.rowsRead).toBe(true);
+    expect(totals.candidatesExamined).toBe(3); // two rejected groups and the deliverable one
+    // The totals are a property of the unchanged fixture, not of one run.
+    const again = await expectFailure(() => page(s.w, {}, {}, deps({ maxPageBytes: 1 })), "budget_exhausted");
+    expect(again.diagnostics).toEqual(totals);
+
+    // Rows: exactly the total passes; one fewer is refused, on the read that completes the total.
+    expect((await page(s.w, {}, {}, deps({ maxRows: totals.rowsRead }))).aggregates).toHaveLength(1);
+    const rowsShort = await expectFailure(() => page(s.w, {}, {}, deps({ maxRows: totals.rowsRead - 1 })), "budget_exhausted");
+    expect(rowsShort.diagnostics).toMatchObject({ rowsRead: totals.rowsRead });
+    expect(rowsShort).not.toHaveProperty("aggregates");
+
+    // Read bytes: the same boundary, on cumulative UTF-8 JSON bytes of rows and bundles.
+    expect((await page(s.w, {}, {}, deps({ maxReadBytes: totals.bytesRead }))).aggregates).toHaveLength(1);
+    const bytesShort = await expectFailure(() => page(s.w, {}, {}, deps({ maxReadBytes: totals.bytesRead - 1 })), "budget_exhausted");
+    expect(bytesShort.diagnostics).toMatchObject({ bytesRead: totals.bytesRead });
+    expect(bytesShort).not.toHaveProperty("aggregates");
+
+    // Both exact limits together still admit the page; neither budget borrows from the other.
+    expect((await page(s.w, {}, {}, deps({ maxRows: totals.rowsRead, maxReadBytes: totals.bytesRead }))).aggregates).toHaveLength(1);
+  });
+
+  it("allows a page of exactly its serialized size budget and refuses one byte fewer, terminal or not", async () => {
+    const s = await scene();
+    await thread(s, "x", ts(D20, 1), "U1");
+    await thread(s, "y", ts(D19, 1), "U2");
+    s.w.nonSlack.push({ itemId: await githubItem(s.team, "pr"), title: "PR one", memberId: s.team.memberId });
+    await converge(s.team);
+    // The measured quantity is pinned: UTF-8 bytes of the JSON of the complete page envelope.
+    const size = (p: Loose): number => Buffer.byteLength(JSON.stringify(p), "utf8");
+
+    // A terminal first page: both groups, the non-Slack snapshot, no cursor.
+    const terminal = await page(s.w);
+    expect(terminal).toMatchObject({ slackComplete: true, nextSlackCursor: null });
+    const exactTerminal = await page(s.w, {}, {}, { budgets: { maxPageBytes: size(terminal) } });
+    expect(exactTerminal).toEqual(terminal);
+    const terminalShort = await expectFailure(() => page(s.w, {}, {}, { budgets: { maxPageBytes: size(terminal) - 1 } }), "budget_exhausted");
+    expect(terminalShort).not.toHaveProperty("aggregates");
+
+    // A nonterminal first page: its opaque cursor is part of the envelope and of the budget. The
+    // token differs per encoding (fresh nonce) but its length does not.
+    const first = await page(s.w, { pageSize: 1 });
+    expect(first.slackComplete).toBe(false);
+    const exactFirst = await page(s.w, { pageSize: 1 }, {}, { budgets: { maxPageBytes: size(first) } });
+    expect(size(exactFirst)).toBe(size(first));
+    expect({ ...exactFirst, nextSlackCursor: null }).toEqual({ ...first, nextSlackCursor: null });
+    await expectFailure(() => page(s.w, { pageSize: 1 }, {}, { budgets: { maxPageBytes: size(first) - 1 } }), "budget_exhausted");
+
+    // And a continuation, which carries no non-Slack snapshot.
+    const second = await page(s.w, { pageSize: 1, cursor: first.nextSlackCursor });
+    expect((await page(s.w, { pageSize: 1, cursor: first.nextSlackCursor }, {}, { budgets: { maxPageBytes: size(second) } })).aggregates).toHaveLength(1);
+    await expectFailure(() => page(s.w, { pageSize: 1, cursor: first.nextSlackCursor }, {}, { budgets: { maxPageBytes: size(second) - 1 } }), "budget_exhausted");
+  });
+
+  it("reports a monotonic clock that throws as unavailable, on its first reading and on any later one", async () => {
+    const s = await rejectedRun(1);
+    // The first reading is taken before any transaction exists (source review, LOW 3).
+    const before = s.w.seen.admission.length;
+    await expectFailure(() => page(s.w, {}, {}, { monotonicNow: () => { throw new Error("clock device failed"); } }), "unavailable");
+    expect(s.w.seen.admission.length, "nothing was read").toBe(before);
+    // A later reading: learn how many a clean page takes, then fail each of a spread of them.
+    let readings = 0;
+    await page(s.w, {}, {}, { monotonicNow: () => { readings++; return 0; } });
+    expect(readings).toBeGreaterThan(3);
+    for (const failAt of [...new Set([2, 3, Math.ceil(readings / 2), readings - 1, readings])]) {
+      let n = 0;
+      const failure = await expectFailure(() => page(s.w, {}, {}, {
+        monotonicNow: () => { if (++n === failAt) throw new Error("clock device failed"); return 0; },
+      }), "unavailable");
+      expect(String(failure.message)).not.toContain("clock device failed");
+    }
+    // A clock that misreports is the same failed dependency.
+    for (const value of [Number.NaN, Number.POSITIVE_INFINITY, "0", null]) {
+      await expectFailure(() => page(s.w, {}, {}, { monotonicNow: () => value }), "unavailable");
+    }
+    // Final validation reads the same clock under the same contract.
+    const r = await reader();
+    const one = await page(s.w);
+    const input = { ...request(s.w), binding: one.binding, initialNonSlackSourceItemIds: one.initialNonSlackSourceItemIds };
+    await expectFailure(() => r.validateSlackPersonDayFinal(input, dependencies(s.w, { monotonicNow: () => { throw new Error("clock device failed"); } })), "unavailable");
+    // No transaction is left open by any of these.
+    expect((await runSql<{ n: number }>(
+      `select count(*)::int as n from pg_stat_activity
+        where datname = current_database() and pid <> pg_backend_pid() and state like 'idle in transaction%'`
+    )).rows[0].n).toBe(0);
+  });
+
   it.each(["now", "monotonicNow", "loadAdmission", "loadPresentation", "composeSlackPage", "loadInitialNonSlack"])(
     "is unavailable without its %s dependency",
     async (missing) => {
@@ -2117,6 +2335,92 @@ describe("aggregate Slack page — pending work, cancellation and statement time
       const baseline = (await runSql<{ ms: number }>(`select reset_val::int as ms from pg_settings where name = 'statement_timeout'`)).rows[0].ms;
       expect(outside).toBe(baseline);
     }
+  });
+
+  /**
+   * Source review, MEDIUM. A timeout applied once — at transaction start, or at a few points between
+   * phases — lets a LATER statement run under the larger bound an earlier statement was given. The
+   * executor must re-derive the transaction-local timeout from the budget that actually remains
+   * immediately before EVERY statement. Each case below spends budget on the monotonic clock between
+   * two consecutive statements of ONE callback, with no phase boundary in between, and then asks the
+   * server what bound the very next statement runs under.
+   */
+  it("re-derives the statement timeout before every statement: a later statement never inherits an older, larger one", { timeout: 20_000 }, async () => {
+    const timeoutMs = async (query: SqlExecutor): Promise<number> =>
+      (await query<{ ms: number }>(`select setting::int as ms from pg_settings where name = 'statement_timeout'`)).rows[0].ms;
+
+    // Evidence transaction, inside one seam call.
+    const s = await oneThread();
+    const inert = fakeTimers();
+    const evidence: number[] = [];
+    s.w.mono = 0;
+    await page(s.w, {}, {
+      afterDiscovery: async (query: SqlExecutor) => {
+        evidence.push(await timeoutMs(query));
+        s.w.mono = 10_000;
+        evidence.push(await timeoutMs(query));
+        s.w.mono = 25_000;
+        evidence.push(await timeoutMs(query));
+        s.w.mono = 0; // the budget is given back so the rest of the page can finish
+        evidence.push(await timeoutMs(query));
+      },
+    }, { scheduleDeadline: inert.scheduleDeadline });
+    expect(evidence[0]).toBeGreaterThan(20_000);
+    expect(evidence[0]).toBeLessThanOrEqual(30_000);
+    // Ten seconds later, the next statement runs under at most twenty; then at most five.
+    expect(evidence[1]).toBeGreaterThan(0);
+    expect(evidence[1]).toBeLessThanOrEqual(20_000);
+    expect(evidence[2]).toBeGreaterThan(0);
+    expect(evidence[2]).toBeLessThanOrEqual(5_000);
+    // The bound follows the remaining budget in both directions; it is not a ratchet either.
+    expect(evidence[3]).toBe(evidence[0]);
+
+    // Validation transaction, inside one loader call: consecutive statements of a dependency.
+    const v = await oneThread();
+    const real = dependencies(v.w);
+    const validation: number[] = [];
+    let admissions = 0;
+    v.w.mono = 0;
+    await page(v.w, {}, {}, {
+      scheduleDeadline: fakeTimers().scheduleDeadline,
+      loadAdmission: async (query: SqlExecutor, context: Json) => {
+        if (++admissions === 2) {
+          validation.push(await timeoutMs(query));
+          v.w.mono = 18_000;
+          validation.push(await timeoutMs(query));
+          v.w.mono = 0;
+        }
+        return (real.loadAdmission as (q: SqlExecutor, c: Json) => unknown)(query, context);
+      },
+    });
+    expect(validation[0]).toBeGreaterThan(20_000);
+    expect(validation[1]).toBeGreaterThan(0);
+    expect(validation[1]).toBeLessThanOrEqual(12_000);
+
+    // And the server ENFORCES the refreshed bound: after the budget shrinks to half a second, the
+    // very next statement — three seconds of server-side work — is cancelled by the server. Under an
+    // inherited thirty-second timeout it would simply finish, and this assertion would fail.
+    const c = await oneThread();
+    let cancelled: Json | null = null;
+    let finished = false;
+    c.w.mono = 0;
+    const failure = await expectFailure(() => page(c.w, {}, {
+      afterDiscovery: async (query: SqlExecutor) => {
+        expect(await timeoutMs(query)).toBeGreaterThan(20_000);
+        c.w.mono = 29_500;
+        try {
+          await query(`select pg_sleep(3)`);
+          finished = true;
+        } catch (error) {
+          cancelled = error as Json;
+          throw error;
+        }
+      },
+    }, { scheduleDeadline: fakeTimers().scheduleDeadline }), "budget_exhausted");
+    expect(finished, "the later statement did not run to completion under an older timeout").toBe(false);
+    expect(cancelled).toMatchObject({ code: "57014" }); // query_canceled: statement timeout
+    expect(String(failure.message)).not.toContain("pg_sleep");
+    expect(await openTransactionsSettleToZero()).toBe(0);
   });
 
   it("lets PostgreSQL cancel a statement that outlives the budget, and reports budget_exhausted", { timeout: 20_000 }, async () => {

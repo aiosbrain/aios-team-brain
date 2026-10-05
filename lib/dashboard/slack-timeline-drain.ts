@@ -132,15 +132,21 @@ export async function drainSlackTimeline(dependencies: SlackTimelineDrainDepende
     throw new SlackTimelineError("invalid_request", "unsupported page size");
   }
 
-  const startedAt = monotonicNow();
-  if (typeof startedAt !== "number" || !Number.isFinite(startedAt)) return unavailable("monotonic clock is misconfigured");
+  /** One monotonic reading. A clock that throws or misreports is a failed dependency, never a raw error. */
+  const readClock = (): number => {
+    let now: unknown;
+    try {
+      now = monotonicNow();
+    } catch {
+      return unavailable("monotonic clock failed");
+    }
+    if (typeof now !== "number" || !Number.isFinite(now)) return unavailable("monotonic clock is misconfigured");
+    return now;
+  };
+  const startedAt = readClock();
   let pageRequests = 0;
 
-  const elapsed = (): number => {
-    const now = monotonicNow();
-    if (typeof now !== "number" || !Number.isFinite(now)) return unavailable("monotonic clock is misconfigured");
-    return now - startedAt;
-  };
+  const elapsed = (): number => readClock() - startedAt;
   const exhausted = (reason: string): SlackTimelineError =>
     new SlackTimelineError("budget_exhausted", reason, { pageRequests, maxPageRequests: budgets.maxPageRequests });
 
