@@ -1014,9 +1014,10 @@ Two things leave a team pending on copied staging:
    run spent its budget (10,000 items). **Press the button again**; it resumes from the saved
    cursor. Repeat until step 2's message appears. Nothing is lost between presses, and reads stay
    fenced until the last one.
-4. `Another re-attribution run holds this team's repair right now …` means a second run (another
-   admin, or the bounded pass after a roster edit) is in flight. This press did nothing. Wait for
-   that run, then press again.
+4. `Another re-attribution run holds this team's repair right now …` — or `Re-attributed N of M
+   item(s) so far; another re-attribution run then took over this team's repair …` — means a second
+   run (another admin, or the bounded pass after a roster edit) is in flight and this press stopped.
+   Whatever it had already committed is saved. Wait for that run, then press again.
 5. An error (for example a cache purge failure) leaves the work durable. Press again; a request made
    after a failure rescans from the start before it finalizes.
 
