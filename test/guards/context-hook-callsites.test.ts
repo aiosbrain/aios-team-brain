@@ -81,6 +81,15 @@ const read = (rel: string) => readFileSync(join(ROOT, rel), "utf8");
 /** The one module that defines the writer. Everything resolves to this or is irrelevant. */
 const CANONICAL = "lib/ingest/index.ts";
 const WRITER = "ingestItem";
+/**
+ * EVERY name the canonical module exports that writes an item. `ingestApiItem` (AIO-1167) is the
+ * public-ingest owner: it takes the identity locks and the Drive execution fence and then calls
+ * `ingestItem` inside the canonical module — which this walk does not enter. A caller of it is a
+ * direct writer exactly as a caller of `ingestItem` is; recognising only the one name let
+ * POST /api/v1/items, the main push path, drop out of the inventory the moment it switched entry
+ * points. `WRITER` stays the name used in messages and by the synthetic controls.
+ */
+const WRITERS: ReadonlySet<string> = new Set([WRITER, "ingestApiItem"]);
 
 
 type Classification = "RECONCILES_AFTER_RESPONSE" | "RECONCILES_INLINE" | "SWEEP_COVERED";
@@ -102,6 +111,15 @@ interface Entry {
  * that is the whole point, and the failure message says so.
  */
 const INVENTORY: Record<string, Entry> = {
+  "app/api/v1/items/route.ts": {
+    sites: 1,
+    class: "RECONCILES_AFTER_RESPONSE",
+    reason:
+      "the workspace CLI push path, through ingestApiItem (the public-ingest owner). Reconciling in " +
+      "after() keeps the push from blocking on it. Google Drive pushes skip that hook on purpose: " +
+      "their placement comes from the connection's audience claims inside the ingest transaction",
+    latency: "measured 0.0 min median on prod — 41/41 items partitioned inside 60s (pre-Drive measurement)",
+  },
   "lib/meetings/notes.ts": {
     sites: 1,
     class: "RECONCILES_INLINE",
@@ -202,7 +220,7 @@ function resolveSpecifier(fromRel: string, spec: string, known: ReadonlySet<stri
  * exports that reach it** — the only form in which a consumer can actually import it.
  */
 function writerExports(files: { rel: string; code: string }[], known: ReadonlySet<string>): Map<string, Set<string>> {
-  const out = new Map<string, Set<string>>([[CANONICAL, new Set([WRITER])]]);
+  const out = new Map<string, Set<string>>([[CANONICAL, new Set(WRITERS)]]);
   const byRel = new Map(files.map((f) => [f.rel, f.code]));
   if (!byRel.has(CANONICAL)) byRel.set(CANONICAL, "");
   // Only files that RE-EXPORT anything can ever join the set, so the fixpoint iterates over those
@@ -362,7 +380,7 @@ function bindingsFor(rel: string, src: ts.SourceFile, modules: Map<string, Set<s
         // `= await import(…)` / `= require(…)`, OR a two-step through a known namespace identifier.
         const fromKnownNs = ts.isIdentifier(init) && namespaces.has(init.text);
         if (fromWriterModule || fromKnownNs) {
-          const exported = spec !== null ? exportedNames(spec) : new Set([WRITER]);
+          const exported = spec !== null ? exportedNames(spec) : new Set(WRITERS);
           if (ts.isObjectBindingPattern(node.name)) {
             for (const el of node.name.elements) {
               const orig = el.propertyName && ts.isIdentifier(el.propertyName) ? el.propertyName.text : undefined;
@@ -476,9 +494,9 @@ function usesOf(rel: string, src: ts.SourceFile, b: Bindings): { calls: string[]
             : ts.isStringLiteralLike(p.argumentExpression)
               ? p.argumentExpression.text
               : null;
-          if (member === WRITER) {
+          if (member !== null && WRITERS.has(member)) {
             if (ts.isCallExpression(p.parent) && p.parent.expression === p) calls.push(at(p.parent));
-            else refused.push(`${at(p)} \`${node.text}.${WRITER}\` referenced without calling it — the guard cannot follow where it goes`);
+            else refused.push(`${at(p)} \`${node.text}.${member}\` referenced without calling it — the guard cannot follow where it goes`);
           }
           /* any other member of the module is not our business */
         } else if (ts.isVariableDeclaration(p) && p.initializer === node) {
@@ -651,6 +669,7 @@ describe("§11 context-partition — the WRITER INVENTORY (AUDITFIX-2)", () => {
     // that makes the guard non-vacuous — and it is only as strong as the recognizer behind it,
     // which is why controls 4 and 5 pin canonical resolution.
     expect(sites).toEqual({
+      "app/api/v1/items/route.ts": 1,
       "lib/meetings/notes.ts": 1,
       "lib/meetings/merge.ts": 1,
       "lib/codebases/commits-to-items.ts": 1,

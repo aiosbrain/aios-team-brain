@@ -1350,9 +1350,11 @@ export const ENTRY_INVENTORY: Record<string, EntryRecord> = {
   "app/api/v1/items/route.ts": {
     class: "RECONCILES",
     reason:
-      "the workspace CLI push path — the one surface that calls ingestItem itself, and reconciles " +
-      "AFTER THE RESPONSE inside after(). A failure there is not surfaced to the pusher; the item " +
-      "waits for the sweep",
+      "the workspace CLI push path — the one HTTP surface that enters the writer itself (through " +
+      "ingestApiItem since AIO-1167), and reconciles AFTER THE RESPONSE inside after(). A failure " +
+      "there is not surfaced to the pusher; the item waits for the sweep. Google Drive pushes are " +
+      "the exception and skip that hook: their placement is derived from the connection's audience " +
+      "claims INSIDE the ingest transaction, so a failed placement fails the push instead of deferring",
   },
   "app/api/v1/codebases/route.ts": {
     class: "SWEEP_DEPENDENT",
@@ -1384,7 +1386,10 @@ export const ENTRY_INVENTORY: Record<string, EntryRecord> = {
       "manual context pass; a backlog larger than that pass reports pending, and with the poller off " +
       "repeated runs are the only progress there is. projectToGraphNow is in this file but is NOT " +
       "part of that: it awaits runGraphProjection and records the run, which pushes graph episodes " +
-      "and writes no item, so there is nothing for it to reconcile",
+      "and writes no item, so there is nothing for it to reconcile. The Google Drive actions " +
+      "(provisionGoogleDriveConnector / runGoogleDriveNow / testGoogleDriveConnection / " +
+      "saveGoogleDrivePickerSelection, AIO-1167) write no item either: they configure the connection " +
+      "and queue a run for the sidecar, whose pushes arrive through POST /api/v1/items",
   },
   "app/t/[team]/admin/approvals/actions.ts": {
     class: "SWEEP_DEPENDENT",
@@ -1439,9 +1444,12 @@ export const ENTRY_INVENTORY: Record<string, EntryRecord> = {
   "scripts/admin.ts": {
     class: "IMPORT_ONLY",
     reason:
-      "imports purgeItemIds from lib/ingest/purge — the REMOVAL path. It enters the closure only " +
-      "because purge dynamically imports bustTeamLearningCaches from lib/ingest/reconcile-attribution; " +
-      "nothing on this surface creates an item",
+      "imports purgeItemIds from lib/ingest/purge — the REMOVAL path, in the closure because purge " +
+      "dynamically imports bustTeamLearningCaches from lib/ingest/reconcile-attribution. Since " +
+      "AIO-1167 its member/alias/identity/password commands (lib/admin/members, lib/admin/aliases, " +
+      "lib/identity/member-identities, lib/auth/pg-login, lib/codebases/github) reach it a second " +
+      "way, through lib/identity/authority. Those edit identity and credentials; nothing on this " +
+      "surface creates an item",
   },
   "scripts/graph-window-battery/run-projection.ts": {
     class: "IMPORT_ONLY",
@@ -1502,6 +1510,175 @@ export const ENTRY_INVENTORY: Record<string, EntryRecord> = {
       "imports getMemberItems (lib/attribution/health) and bustTeamLearningCaches " +
       "(lib/ingest/reconcile-attribution): the correction preview/apply path edits attribution on " +
       "existing items — no item is created at this surface",
+  },
+
+  /* ── AIO-1167: the Google Drive connector's own HTTP surfaces ─────────────────────────────── */
+  "app/api/v1/integrations/gdrive/execution/route.ts": {
+    class: "IMPORT_ONLY",
+    reason:
+      "imports the execution-lease operations (acquire / authorize_provider / checkpoint / " +
+      "verify_service_account / release) from lib/integrations/gdrive-authority, which reaches the " +
+      "closure through lockIdentityMutationAuthorities in lib/identity/authority. It moves a " +
+      "connection's lease, fence and progress; the documents themselves arrive through POST /api/v1/items",
+  },
+  "app/api/v1/integrations/gdrive/token/route.ts": {
+    class: "IMPORT_ONLY",
+    reason:
+      "imports brokerGoogleAccessToken from lib/integrations/gdrive-authority (same edge as the " +
+      "execution route). It hands the fenced connector a short-lived Google access token and writes " +
+      "no item",
+  },
+  "app/api/v1/items/source-reconcile/route.ts": {
+    class: "IMPORT_ONLY",
+    reason:
+      "imports stageGdriveReconciliation / drainGdriveCleanupObligations from " +
+      "lib/ingest/source-reconcile (which imports purgeItemIds) and withGdriveExecutionCommit from " +
+      "lib/integrations/gdrive-authority. This is the Drive REMOVAL path: it retires a connection's " +
+      "claims, retracts or re-derives the affected units' placement INLINE in that fenced " +
+      "transaction, and purges documents no connection still claims. It never creates an item, so " +
+      "there is no ingest here to reconcile or sweep",
+  },
+  "app/api/auth/gdrive/callback/route.ts": {
+    class: "IMPORT_ONLY",
+    reason:
+      "imports publishGoogleDriveOAuthCredential from lib/integrations/gdrive-oauth, which links the " +
+      "connecting admin's Google identity through lib/identity/member-identities and " +
+      "lib/identity/provider-sync (both behind lib/identity/authority). It stores a credential and " +
+      "an identity link; no document is read or written here",
+  },
+
+  /* ── AIO-1167: account, login and membership surfaces behind the identity-mutation boundary ──
+   * Every record in this block is in the closure for ONE reason: lib/identity/authority — the new
+   * boundary every identity/credential mutation now runs inside — imports connectorMemberIds from
+   * lib/attribution/resolve-authors, which shares parseAuthorIdentity with the commit writer
+   * (lib/codebases/commits-to-items → lib/ingest). A mutation here can change who EXISTING items
+   * are attributed to (the durable identity repair does that, later and elsewhere); none of these
+   * surfaces creates an item. */
+  "app/api/auth/login/route.ts": {
+    class: "IMPORT_ONLY",
+    reason:
+      "imports loginWithPassword from lib/auth/pg-login. That module's member-linking helpers take " +
+      "the identity-mutation authority lock (lib/identity/authority), which is the closure edge. " +
+      "Password login; no item write",
+  },
+  "app/api/auth/request-magic-link/route.ts": {
+    class: "IMPORT_ONLY",
+    reason:
+      "imports issueMagicToken from lib/auth/pg-login (in the closure through lib/identity/authority). " +
+      "It mints a login token and sends mail; no item write",
+  },
+  "app/auth/confirm/route.ts": {
+    class: "IMPORT_ONLY",
+    reason:
+      "imports redeemMagicToken from lib/auth/pg-login (in the closure through lib/identity/authority). " +
+      "Redeems an emailed token into a session; no item write",
+  },
+  "app/auth/dev-login/route.ts": {
+    class: "IMPORT_ONLY",
+    reason:
+      "imports ensureAuthUser / linkMemberByEmail from lib/auth/pg-login (in the closure through " +
+      "lib/identity/authority). Local-development login only; no item write",
+  },
+  "app/auth/welcome/page.tsx": {
+    class: "IMPORT_ONLY",
+    reason:
+      "imports hasPasswordSet from lib/auth/pg-login and renders SetPasswordForm. A read of the " +
+      "signed-in user's own credential state; the write is the welcome action's",
+  },
+  "app/auth/welcome/actions.ts": {
+    class: "IMPORT_ONLY",
+    reason:
+      "imports setPasswordIfUnset from lib/auth/pg-login (in the closure through lib/identity/authority). " +
+      "Sets the invited user's first password; no item write",
+  },
+  "app/auth/welcome/set-password-form.tsx": {
+    class: "IMPORT_ONLY",
+    reason:
+      "a client component importing setInitialPassword from the welcome actions file. The credential " +
+      "write is that action's; this surface only submits the form",
+  },
+  "app/actions/account.ts": {
+    class: "IMPORT_ONLY",
+    reason:
+      "imports changePassword from lib/auth/pg-login (in the closure through lib/identity/authority). " +
+      "The signed-in member's own password change and sign-out; no item write",
+  },
+  "components/account/change-password-form.tsx": {
+    class: "IMPORT_ONLY",
+    reason: "imports changeMyPassword from app/actions/account — a credential write on that action, no ingest",
+  },
+  "components/account/sign-out-button.tsx": {
+    class: "IMPORT_ONLY",
+    reason:
+      "imports signOutAction from app/actions/account. It shares that module with the password " +
+      "change, which is the edge that puts a sign-out button in the closure at all",
+  },
+  "app/t/[team]/account/page.tsx": {
+    class: "IMPORT_ONLY",
+    reason:
+      "renders ChangePasswordForm and SignOutButton, both bound to app/actions/account. The page " +
+      "itself is static markup: it reads and writes nothing",
+  },
+  "app/t/[team]/layout.tsx": {
+    class: "IMPORT_ONLY",
+    reason:
+      "the team shell: imports activateInvitedMembership from lib/auth/pg-login (an invited member's " +
+      "first visit flips them active, inside the identity-mutation boundary) and renders " +
+      "SignOutButton. It wraps every team page, and ingests nothing",
+  },
+  "app/api/v1/members/invite/route.ts": {
+    class: "IMPORT_ONLY",
+    reason:
+      "imports createMember / rollbackMemberCreation from lib/admin/members and issueMemberInvite from " +
+      "lib/admin/invite (both in the closure through lib/identity/authority and lib/auth/pg-login). " +
+      "Creates a member and sends the invite; no item write",
+  },
+  "app/t/[team]/admin/actions.ts": {
+    class: "IMPORT_ONLY",
+    reason:
+      "the admin invite and API-key actions: createMember / rollbackMemberCreation (lib/admin/members) " +
+      "and issueMemberInvite (lib/admin/invite) are the closure edges; the key actions share the " +
+      "module. Roster and credential writes, never an item",
+  },
+  "components/admin/invite-member.tsx": {
+    class: "IMPORT_ONLY",
+    reason: "imports inviteMember from the admin actions file — the invite form; the member write is the action's",
+  },
+  "components/admin/issue-key.tsx": {
+    class: "IMPORT_ONLY",
+    reason:
+      "imports issueApiKey / revokeApiKey from the admin actions file. API-key management; it is in " +
+      "the closure only because those actions share a module with the member-creating ones",
+  },
+  "app/t/[team]/admin/keys/page.tsx": {
+    class: "IMPORT_ONLY",
+    reason: "renders IssueKey and RevokeKeyButton (components/admin/issue-key); the page lists keys and writes nothing itself",
+  },
+  "app/api/auth/slack/callback/route.ts": {
+    class: "IMPORT_ONLY",
+    reason:
+      "imports setMemberIdentity from lib/identity/member-identities (inside the identity-mutation " +
+      "boundary since AIO-1167). Links the member's Slack identity after OAuth; that can change " +
+      "future and repaired attribution, but writes no item",
+  },
+  "app/api/v1/me/slack-token/route.ts": {
+    class: "IMPORT_ONLY",
+    reason:
+      "imports setMemberIdentity from lib/identity/member-identities — the same identity link as the " +
+      "Slack OAuth callback, set from the member's own stored token. No item write",
+  },
+  "app/t/[team]/codebases/github/page.tsx": {
+    class: "IMPORT_ONLY",
+    reason:
+      "imports fetchRepoHeadSha from lib/codebases/github, a READ of the repository head. That module " +
+      "also exports linkGithub, which records author aliases through lib/admin/aliases (the closure " +
+      "edge); this page calls only the reader",
+  },
+  "scripts/staging-ops/reapply-testers.ts": {
+    class: "IMPORT_ONLY",
+    reason:
+      "imports adminSetPassword from lib/auth/pg-login to restore staging testers' credentials after " +
+      "a refresh. A credential write on existing members; no item write",
   },
 
   /* ── pages and layouts: server components that render closure readers ────────────────────── */

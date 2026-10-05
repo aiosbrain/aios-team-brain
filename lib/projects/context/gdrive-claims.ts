@@ -5,7 +5,7 @@ import { runSql, withTransaction } from "@/lib/db/pg/pool";
 import { reconcileItemUnit, retractItemUnit } from "@/lib/projects/context/units";
 import {
   closeGdriveManagedMembership,
-  ensureIncludeMembership,
+  ensureGdriveClaimMembership,
 } from "@/lib/projects/context/memberships";
 import { advanceAuthorizationEpoch } from "@/lib/access/authorization-epoch";
 
@@ -140,20 +140,47 @@ export async function retireGdriveItemClaim(
 export async function reconcileGdriveItemClaims(db: DbClient, teamId: string, itemId: string): Promise<void> {
   const unit = await reconcileItemUnit(db, teamId, itemId);
   if (!unit.ok || !unit.unitId) throw new Error(`Drive context unit: ${unit.error ?? "missing"}`);
-  const { rows } = await runSql<{ project_id: string }>(
-    `select distinct cp.project_id
-       from gdrive_item_claims c join gdrive_item_claim_projects cp
+  // Every destination a surviving claim names, each with the claims behind it. `is_current` marks a
+  // claim last recorded under its connection's CURRENT generation by an enabled connection — the
+  // only kind that can OPEN a placement (the membership writer re-verifies this itself; the flag
+  // here only decides which claim to present to it).
+  const { rows } = await runSql<{
+    project_id: string;
+    integration_id: string;
+    provider_id: string;
+    is_current: boolean;
+  }>(
+    `select cp.project_id, c.integration_id, c.provider_id,
+            (c.generation = a.generation and i.type = 'gdrive' and i.status = 'enabled') as is_current
+       from gdrive_item_claims c
+       join gdrive_item_claim_projects cp
          on cp.team_id=c.team_id and cp.integration_id=c.integration_id and cp.provider_id=c.provider_id
-      where c.team_id=$1 and c.item_id=$2 and c.active`,
+       join gdrive_connection_authority a
+         on a.team_id=c.team_id and a.integration_id=c.integration_id
+       join integrations i
+         on i.team_id=c.team_id and i.id=c.integration_id
+      where c.team_id=$1 and c.item_id=$2 and c.active
+      order by cp.project_id, c.integration_id, c.provider_id`,
     [teamId, itemId],
   );
   const desired = new Set(rows.map((row) => row.project_id));
   if (desired.size === 0) throw new Error("Drive item has no approved surviving audience claim");
+  const authorizing = new Map<string, { integration_id: string; provider_id: string }>();
+  for (const row of rows) {
+    if (row.is_current && !authorizing.has(row.project_id)) authorizing.set(row.project_id, row);
+  }
   for (const projectId of desired) {
-    const opened = await ensureIncludeMembership(db, teamId, {
+    const claim = authorizing.get(projectId);
+    // Named only by a superseded-generation or paused connection: the destination stays in
+    // `desired`, so an existing placement is not closed here, but nothing new is opened for it.
+    if (!claim) continue;
+    // All-or-nothing: one refused destination fails the whole reconcile, and with it the
+    // surrounding ingest/revocation transaction — a document is never placed in half its audience.
+    const opened = await ensureGdriveClaimMembership(db, teamId, {
       projectId,
       contextUnitId: unit.unitId,
-      method: "gdrive_claim",
+      integrationId: claim.integration_id,
+      providerId: claim.provider_id,
     });
     if (!opened.ok) throw new Error(`Drive audience membership: ${opened.error}`);
   }

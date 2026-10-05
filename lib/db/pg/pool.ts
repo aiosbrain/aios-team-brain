@@ -2,6 +2,7 @@ import "server-only";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { Pool, types, type PoolClient, type PoolConfig } from "pg";
 import type { SqlQueryResult } from "@/lib/db/types";
+import { commitRefusal, TransactionExecutionError } from "./tx-outcome";
 
 /**
  * Singleton pg Pool for DB_BACKEND=postgres. Reads DATABASE_URL (Railway/any
@@ -126,8 +127,9 @@ export function doomAmbientTransaction(cause: unknown): void {
 
 /**
  * Run a diagnostic/nonfatal effect only once the surrounding write is durable: after the enclosing
- * `withTransaction` commits, or immediately when there is none. A fault never rejects the committed
- * result, and nothing runs when the transaction rolls back.
+ * `withTransaction` has a CONFIRMED commit (the server's COMMIT tag), or immediately when there is
+ * none. A fault never rejects the committed result, and nothing runs when the transaction rolls
+ * back — including when the server resolves COMMIT as ROLLBACK or the outcome is unconfirmed.
  */
 export async function afterTransactionCommit(effect: () => Promise<void>): Promise<void> {
   const ambient = transactionClient.getStore();
@@ -158,21 +160,43 @@ export async function withTransaction<T>(fn: () => Promise<T>): Promise<T> {
   // session engine used to commit on its own connection, so it keeps that engine's disposal rule:
   // a connection whose transaction state is unknown is destroyed, never returned to the pool.
   let uncertain: { cause: unknown } | null = null;
+  // Set when the server answered COMMIT by rolling back: the transaction is over and known lost.
+  let resolvedRollback = false;
   try {
     await client.query("BEGIN");
     result = await transactionClient.run(ambient, fn);
     if (ambient.doomed) throw ambient.doomed.cause;
+    let reply: unknown;
     try {
-      await client.query("COMMIT");
+      reply = await client.query("COMMIT");
     } catch (error) {
-      uncertain = { cause: error };
-      throw error;
+      const unknown = new TransactionExecutionError(
+        `COMMIT failed; outcome unknown and will not be replayed: ${error instanceof Error ? error.message : String(error)}`,
+        {
+          cause: error,
+          code: typeof (error as { code?: unknown } | null)?.code === "string" ? (error as { code: string }).code : undefined,
+          unknownCommit: true,
+        }
+      );
+      uncertain = { cause: unknown };
+      throw unknown;
+    }
+    // The command tag, not the absence of an error, is what says the writes are durable. Every
+    // caller in here that swallows a failed statement (a best-effort audit on the unbound client is
+    // the common one) leaves the transaction aborted; PostgreSQL then answers COMMIT with ROLLBACK
+    // and no error, and returning `result` would report work that no longer exists.
+    const refusal = commitRefusal(reply);
+    if (refusal) {
+      if (refusal.unknownCommit) uncertain = { cause: refusal };
+      else resolvedRollback = true;
+      throw refusal;
     }
   } catch (error) {
-    if (!uncertain) {
+    if (!uncertain && !resolvedRollback) {
       try {
         await client.query("ROLLBACK");
       } catch (rollbackError) {
+        // The primary error is the one thrown; a failed cleanup only decides the connection's fate.
         uncertain = { cause: rollbackError };
       }
     }

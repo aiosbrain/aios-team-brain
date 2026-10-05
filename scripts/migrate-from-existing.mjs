@@ -24,9 +24,16 @@
  * seeding a fixture row set that satisfies 76 migrations' preconditions; it is a real piece of work
  * and deliberately not claimed here.
  *
+ * The ONE data-dependent case this lane does claim is the populated replay below: rows that use the
+ * values a widened enumerated CHECK admits, replayed over. That is the 2026-07-13 incident class,
+ * and it is what the replay-supersession contract (`scripts/migration-replay-plan.mjs`) exists for.
+ *
  * MODES
  *   (default)        upgrade every `--tags` release state forward; assert == from-zero. Also
- *                    asserts a second full replay is a no-op (idempotence).
+ *                    asserts a second full replay is a no-op (idempotence). Then the POPULATED
+ *                    REPLAY: deploy over the newest usable release (or `--populated-from <ref>`),
+ *                    insert a `gdrive` integration and a `gdrive_claim` membership, replay twice,
+ *                    and require each superseded migration, run RAW, to be refused by those rows.
  *   --mirror-check   assert `schema.sql` ALONE already produces the from-zero fingerprint, i.e.
  *                    every migration is mirrored into `schema.sql` as `postgres/migrations/README.md`
  *                    requires. Any object only a migration creates is a red build.
@@ -56,6 +63,7 @@ import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import { fingerprint, diffFingerprints } from "./schema-fingerprint.mjs";
 import { assertServiceIdentity } from "./service-guard.mjs";
+import { effectiveReplayPlan, REPLAY_SUPERSESSIONS } from "./migration-replay-plan.mjs";
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -225,8 +233,8 @@ function git(args) {
   return execFileSync("git", args, { cwd: ROOT, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
 }
 
-/** The current working-tree schema + migrations, in the order `pg-load-schema.mjs` applies them. */
-export function currentSources() {
+/** The current working-tree schema + migration FILES, verbatim, in lexical order. */
+export function currentRawSources() {
   const migDir = path.join(ROOT, "postgres", "migrations");
   const files = readdirSync(migDir).filter((f) => f.endsWith(".sql")).sort();
   return {
@@ -237,7 +245,25 @@ export function currentSources() {
   };
 }
 
-/** The same pair as of a released tag — a prior schema state, for free, out of git history. */
+/**
+ * The current working-tree schema + the EFFECTIVE replay plan — exactly what `pg-load-schema.mjs`
+ * applies. The plan is the same function the deploy calls (`scripts/migration-replay-plan.mjs`), so
+ * a shipped migration's superseded CHECK definition is omitted here precisely where the deploy
+ * omits it; this lane cannot pass on SQL the rollout would not run.
+ */
+export function currentSources() {
+  const raw = currentRawSources();
+  return {
+    schema: raw.schema,
+    migrations: effectiveReplayPlan(raw.migrations).map(({ name, sql }) => ({ name, sql })),
+  };
+}
+
+/**
+ * The same pair as of a released tag — a prior schema state, for free, out of git history. Applied
+ * RAW on purpose: this materializes a database as THAT release's loader left it, and that loader
+ * replayed these files verbatim. The replay plan describes the current tree, not history.
+ */
 export function sourcesAtTag(tag) {
   const listed = git(["ls-tree", "-r", "--name-only", tag, "postgres/migrations/"])
     .split("\n").filter((f) => f.endsWith(".sql")).sort();
@@ -430,6 +456,120 @@ async function runUpgrades(tags, baseline, opts) {
   return { failures, report };
 }
 
+/**
+ * Rows that use a value only the WIDENED constraints admit: a `gdrive` integration and a
+ * `gdrive_claim` context membership. Deliberately minimal — the point is what a replay does to a
+ * database that already holds them, not how the application creates them.
+ *
+ * The SQL lives in a TEST FIXTURE, not here, on purpose. The context-substrate tables have single
+ * writer modules and `test/guards/access-single-writer.test.ts` refuses raw DML against them
+ * anywhere under `scripts/`; test fixtures are that guard's stated boundary. This lane only ever
+ * runs the fixture against a scratch database it created and will drop.
+ */
+const POPULATED_REPLAY_FIXTURE = path.join(ROOT, "test", "fixtures", "migration-replay-populated.sql");
+
+async function seedWidenedRows(client) {
+  await client.query(readFileSync(POPULATED_REPLAY_FIXTURE, "utf8"));
+}
+
+/** How many of the widened-value rows are present, and what each superseded constraint allows now. */
+async function readWidenedState(client) {
+  const { rows } = await client.query(
+    `select (select count(*)::int from integrations where type = 'gdrive') as gdrive,
+            (select count(*)::int from project_context_memberships where method = 'gdrive_claim') as gdrive_claim`);
+  const constraints = {};
+  for (const name of new Set(REPLAY_SUPERSESSIONS.map((entry) => entry.constraint))) {
+    const found = await client.query(
+      `select pg_get_constraintdef(oid) as def from pg_constraint where conname = $1`, [name]);
+    constraints[name] = found.rows.map((row) => row.def);
+  }
+  return { gdrive: rows[0].gdrive, gdrive_claim: rows[0].gdrive_claim, constraints };
+}
+
+/**
+ * POPULATED REPLAY — the one data-dependent thing this lane does prove.
+ *
+ * The upgrade and idempotence checks above run against EMPTY databases, where a narrower CHECK
+ * re-add can never fail. This builds a prior release state, deploys the current tree over it, adds
+ * rows that use the widened values (`integrations.type = 'gdrive'`,
+ * `project_context_memberships.method = 'gdrive_claim'`), and then replays the whole deploy twice
+ * more — which is what every later release does to a database that has started using them.
+ *
+ * NEGATIVE CONTROL, because "the replay passed" proves nothing if the rows did not actually
+ * exercise the constraints: each superseded migration is then run RAW, exactly as shipped, and must
+ * be REFUSED by those rows (23514). A raw file that succeeds means the fixture went vacuous.
+ */
+async function runPopulatedReplay(priorRef, opts) {
+  const started = Date.now();
+  const failures = [];
+  const current = currentSources();
+  const raw = new Map(currentRawSources().migrations.map((m) => [m.name, m.sql]));
+  const from = priorRef ?? "from-zero";
+
+  await withScratchDb("populated", async (url) => {
+    if (priorRef) await applyPass(url, sourcesAtTag(priorRef));
+    await applyPass(url, current);
+    await withClient(url, seedWidenedRows);
+
+    for (const pass of [1, 2]) {
+      try {
+        await applyPass(url, current);
+      } catch (err) {
+        failures.push(
+          `populated replay ${pass} over ${from} failed once rows use 'gdrive' and 'gdrive_claim': ${err.message}`,
+        );
+        return;
+      }
+    }
+
+    for (const entry of REPLAY_SUPERSESSIONS) {
+      const refused = await withClient(url, async (client) => {
+        try {
+          await client.query(raw.get(entry.migration));
+          return null;
+        } catch (err) {
+          return err;
+        }
+      });
+      if (!refused) {
+        failures.push(
+          `negative control: replaying ${entry.migration} RAW succeeded against rows using the widened ` +
+          `${entry.constraint} values — the populated fixture no longer exercises that constraint.`,
+        );
+      } else if (refused.code !== "23514") {
+        failures.push(
+          `negative control: replaying ${entry.migration} RAW failed for the wrong reason ` +
+          `(${refused.code ?? "no sqlstate"}: ${refused.message}); expected a check violation (23514).`,
+        );
+      }
+    }
+
+    const state = await withClient(url, readWidenedState);
+    if (state.gdrive !== 1 || state.gdrive_claim !== 1) {
+      failures.push(
+        `populated replay over ${from} did not preserve the widened rows ` +
+        `(gdrive integrations: ${state.gdrive}, gdrive_claim memberships: ${state.gdrive_claim}; expected 1 each).`,
+      );
+    }
+    for (const [name, defs] of Object.entries(state.constraints)) {
+      const widened = name === "integrations_type_check" ? "gdrive" : "gdrive_claim";
+      if (defs.length !== 1 || !defs[0].includes(`'${widened}'`)) {
+        failures.push(
+          `after the populated replay ${name} is not the single complete definition ` +
+          `(found ${defs.length}: ${defs.join(" | ") || "none"}).`,
+        );
+      }
+    }
+  }, opts);
+
+  return {
+    failures,
+    report: failures.length
+      ? []
+      : [`  ✓ populated replay over ${from}: 'gdrive' + 'gdrive_claim' rows survive two replays; raw history refused (${ms(started)})`],
+  };
+}
+
 /** Cheap form of the deletion sweep: does `schema.sql` alone already produce the full shape? */
 async function runMirrorCheck(baseline, opts) {
   const started = Date.now();
@@ -534,6 +674,14 @@ export async function main(argv = process.argv.slice(2)) {
   // throwing (nextTagPolicy). Upgrading "from" a tag that does not exist is not a thing git can do.
   if (usableTags.length) {
     const r = await runUpgrades(usableTags, baseline, opts);
+    failures.push(...r.failures); report.push(...r.report);
+  }
+  // Populated replay runs with the upgrades (so, not under --mirror-only / --deletion-sweep-only).
+  // Its prior state is the newest usable release unless `--populated-from <ref>` names an exact
+  // one — e.g. the staging commit a branch is based on, to prove THAT upgrade rather than a tag's.
+  if (!flag("mirror-only") && !flag("deletion-sweep-only")) {
+    const priorRef = value("populated-from", usableTags[usableTags.length - 1] ?? null);
+    const r = await runPopulatedReplay(priorRef, opts);
     failures.push(...r.failures); report.push(...r.report);
   }
   if (flag("mirror-check") || flag("mirror-only")) {

@@ -1180,6 +1180,85 @@ describe("route-auth checker: real-source mutants, in memory only (AC-03, AC-04)
     ]);
   });
 
+  // AIO-1167: the seven Google Drive / source-reconcile handlers. Each is mutated against the REAL
+  // source, so a row that merely happens to exist cannot stand in for the invocation it pins.
+  const DRIVE = "app/api/v1/integrations/gdrive";
+  const DRIVE_START = "app/api/auth/gdrive/start/route.ts";
+  const DRIVE_CALLBACK = "app/api/auth/gdrive/callback/route.ts";
+
+  it("inventories exactly the seven Drive handlers: five key-guarded, one admin-session, one public protocol", () => {
+    const keyGuarded = PROTECTED_ROUTES.filter(
+      (entry) => entry.path.startsWith(`${DRIVE}/`) || entry.path === "app/api/v1/items/source-reconcile/route.ts",
+    );
+    expect(keyGuarded.map((entry) => `${entry.path} ${entry.method} ${entry.guards.join("+")}`).sort()).toEqual([
+      `${DRIVE}/execution/route.ts POST authenticateApiKey`,
+      `${DRIVE}/runs/route.ts GET authenticateApiKey`,
+      `${DRIVE}/runs/route.ts POST authenticateApiKey`,
+      `${DRIVE}/token/route.ts POST authenticateApiKey`,
+      "app/api/v1/items/source-reconcile/route.ts POST authenticateApiKey",
+    ]);
+    expect(PROTECTED_ROUTES.filter((entry) => entry.path === DRIVE_START)).toEqual([
+      { path: DRIVE_START, method: "GET", guards: ["requireTeamAdmin"] },
+    ]);
+    expect(PUBLIC_EXCEPTIONS.filter((entry) => entry.path === DRIVE_CALLBACK).map((entry) => entry.method)).toEqual(["GET"]);
+    // The callback is public ONLY as an OAuth redirect: it must not be protected-and-public at once.
+    expect(PROTECTED_ROUTES.some((entry) => entry.path === DRIVE_CALLBACK)).toBe(false);
+  });
+
+  it.each([
+    [`${DRIVE}/execution/route.ts`, "POST"],
+    [`${DRIVE}/token/route.ts`, "POST"],
+    ["app/api/v1/items/source-reconcile/route.ts", "POST"],
+  ])("fails %s %s when its authenticateApiKey invocation is removed", (path, method) => {
+    expect(run(mutant(path, "await authenticateApiKey(req)", "null"))).toEqual([
+      NO_INVOCATION(`${path} ${method}`, "authenticateApiKey"),
+    ]);
+  });
+
+  it("fails BOTH Drive run methods when the key check is removed from the called local connector()", () => {
+    const path = `${DRIVE}/runs/route.ts`;
+    expect(run(mutant(path, "await authenticateApiKey(req)", "null"))).toEqual([
+      NO_INVOCATION(`${path} GET`, "authenticateApiKey"),
+      NO_INVOCATION(`${path} POST`, "authenticateApiKey"),
+    ]);
+  });
+
+  it("fails only the mutated Drive run method when it stops calling connector()", () => {
+    // `connector` is a local name, not a registered authority: a handler that skips the call gets no
+    // credit for the guard still sitting in the helper its sibling uses.
+    const path = `${DRIVE}/runs/route.ts`;
+    expect(run(mutant(path, "await connector(req)", "null", "last"))).toEqual([
+      NO_INVOCATION(`${path} POST`, "authenticateApiKey"),
+    ]);
+  });
+
+  it("fails the Drive OAuth start when requireTeamAdmin is removed (its import stays)", () => {
+    const repo = mutant(DRIVE_START, "await requireTeamAdmin(teamSlug)", "null");
+    expect(repo.routeSources.get(DRIVE_START)).toContain(`import { requireTeamAdmin } from "@/lib/auth/guard"`);
+    expect(run(repo)).toEqual([NO_INVOCATION(`${DRIVE_START} GET`, "requireTeamAdmin")]);
+  });
+
+  it("the Drive OAuth callback is admitted ONLY by its public-protocol exception", () => {
+    // Non-vacuity for the row itself: without its exception the real callback is an unclassified
+    // handler — it invokes no registered guard, so nothing else in the registry is covering for it.
+    const withoutException = {
+      ...ROUTE_AUTH_POLICY,
+      publicExceptions: PUBLIC_EXCEPTIONS.filter((entry) => entry.path !== DRIVE_CALLBACK),
+    };
+    expect(checkRouteAuth(REAL, withoutException)).toEqual([
+      `${DRIVE_CALLBACK} GET: no registered authentication invocation — unclassified handler; add an expected-guard row or a public protocol exception`,
+    ]);
+  });
+
+  it("an unregistered eighth Drive handler is refused until it is reviewed", () => {
+    const path = `${DRIVE}/token/route.ts`;
+    const source = REAL.routeSources.get(path)!;
+    const extra = `${source}\nexport async function DELETE(req: NextRequest) {\n  const auth = await authenticateApiKey(req);\n  return auth ? Response.json({ ok: true }) : new Response(null, { status: 401 });\n}\n`;
+    expect(run(substituted(path, extra))).toEqual([
+      `${path} DELETE: unclassified handler invoking authenticateApiKey — add an expected-guard row`,
+    ]);
+  });
+
   // Calling a generator runs none of its body: `check(req)` is an iterator — always truthy — so this
   // handler would answer 200 with the guard never invoked. The same handler over an ordinary helper
   // receives the guard's verdict.

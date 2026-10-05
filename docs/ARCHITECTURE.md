@@ -1139,6 +1139,20 @@ reconciliation, and restricted Drive content is never defaulted into General. Th
 connection field in frontmatter or `source_item_mappings` is retained only as historical evidence and
 cannot widen access.
 
+Drive items are stored at the conservative `external` tier, and the ordinary membership writer routes a
+protected target by that tier (`systemIntegrityGate`: `external` → external-shared only). A connection
+whose approved audience is General is therefore placed through a separate **claim-authorized entry** in
+the same single writer (`ensureGdriveClaimMembership` in `lib/projects/context/memberships.ts`). It
+replaces exactly one check — the audience routing — and only after verifying, inside the writer and
+under the item lock, a live claim in the same team by that connection for that exact item and
+destination, recorded under the connection's current generation by an enabled connection. Everything
+else is unchanged: the unit must mirror the locked item, a protected target must hold only sanctioned
+grants, and an explicit exclusion is never overridden. The method name `gdrive_claim` authorizes
+nothing: the ordinary entry refuses it, and the claim entry writes it (including when it replaces an
+automatic exclude) so that retiring the claim can find and close the row. Destinations are placed
+all-or-nothing within the surrounding transaction; a destination named only by a superseded-generation
+or paused connection keeps an existing placement but is never newly opened.
+
 `team_authorization_epochs` is the durable revocation barrier shared by Drive claim changes and the
 Timeline/arc cache owners. Final-claim retirement commits context suppression, the epoch advance, and
 a `gdrive_cleanup_obligations` row under the canonical team/provider lock before reporting success;
