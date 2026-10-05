@@ -80,6 +80,14 @@ import {
 export const SLACK_DISCOVERY_MAX_REQUESTS = 4;
 /** Initial re-observation cadence; activation must measure provider capacity before changing it. */
 export const SLACK_METADATA_INTERVAL_MS = 30 * 60 * 1000;
+/**
+ * How far BELOW its stored lower bound a newest catch-up asks. The bound is an anchor frozen from the
+ * database clock and a message's `ts` is the provider's, so a scan that starts exactly on the bound
+ * misses a root the provider stamped just under it after the previous page was served. It must stay
+ * above the database-to-Slack skew plus request latency, and it is not free: the margin is re-read
+ * on the shared history budget every catch-up. The live soak measures the skew before this changes.
+ */
+export const SLACK_SKEW_ALLOWANCE_MS = 60 * 1000;
 
 export interface SlackSourceDiscoveryInput {
   readonly db: DbClient;
@@ -99,6 +107,8 @@ export interface SlackSourceDiscoveryOptions {
   readonly leaseMs?: number;
   /** Re-observation interval for channel metadata, in milliseconds. */
   readonly metadataIntervalMs?: number;
+  /** Skew allowance taken off a newest catch-up's lower bound, in milliseconds. */
+  readonly skewAllowanceMs?: number;
 }
 
 export type SlackDiscoveryStage = "selection" | "auth" | "app" | "metadata" | "history";
@@ -279,6 +289,12 @@ export async function discoverSlackSource(
   const metadataIntervalMs = options.metadataIntervalMs ?? SLACK_METADATA_INTERVAL_MS;
   if (!Number.isSafeInteger(metadataIntervalMs) || metadataIntervalMs <= 0) {
     throw new TypeError("slack source discovery: metadataIntervalMs must be a positive whole number");
+  }
+  // Positive, like the cadence above: zero would put the catch-up back exactly on its bound, and a
+  // negative value would start it ABOVE the bound and leave a gap inside a certified interval.
+  const skewAllowanceMs = options.skewAllowanceMs ?? SLACK_SKEW_ALLOWANCE_MS;
+  if (!Number.isSafeInteger(skewAllowanceMs) || skewAllowanceMs <= 0) {
+    throw new TypeError("slack source discovery: skewAllowanceMs must be a positive whole number");
   }
   const pass: Pass = {
     input,
@@ -802,6 +818,29 @@ async function readOnePage(
   }
 }
 
+/**
+ * An exact Slack `ts` moved EARLIER by a whole number of milliseconds, in the six-digit microsecond
+ * form Slack expects, clamped at zero — the only floor there is, since no "historical floor"
+ * timestamp exists. Seconds and microseconds stay separate integers throughout: a float cannot hold
+ * a current `ts` to the microsecond.
+ */
+function slackTsMinusMs(ts: string, ms: number): string {
+  const parsed = parseSlackTimestamp(ts);
+  if (!parsed) {
+    // Unreachable for a bound this module froze from the database clock. THROWN rather than sent
+    // unshifted: a silently narrower seam is the defect the margin exists to close.
+    throw new Error("slack source discovery: a newest lower bound is not an exact Slack timestamp");
+  }
+  let seconds = parsed.seconds - Math.floor(ms / 1000);
+  let micros = parsed.micros - (ms % 1000) * 1000;
+  if (micros < 0) {
+    micros += 1_000_000;
+    seconds -= 1;
+  }
+  if (seconds < 0) return "0.000000";
+  return `${seconds}.${String(micros).padStart(6, "0")}`;
+}
+
 async function fetchAndAccept(
   pass: Pass,
   selection: SlackSelection,
@@ -810,13 +849,22 @@ async function fetchAndAccept(
   claim: SlackChannelClaim
 ): Promise<void> {
   const channelId = claim.scope.channelId;
+  // ⚠️ THE SEAM'S MARGIN IS TAKEN OFF HERE AND NOWHERE ELSE. Only the REQUEST moves: `claim.lowerTs`
+  // is what the acceptance writes back, so the stored bound and every `completed_*` value are
+  // exactly what they were, and each page of one scan — a separate wake, a separate claim — derives
+  // the same `oldest` from the same stored bound. Writing the shifted value back would subtract the
+  // allowance again on every page. A historical scan has no lower bound, and gains none.
+  const oldest =
+    claim.lowerTs === null
+      ? null
+      : slackTsMinusMs(claim.lowerTs, pass.options.skewAllowanceMs ?? SLACK_SKEW_ALLOWANCE_MS);
   const params: Record<string, string> = {
     channel: channelId,
     latest: claim.anchorTs,
-    // INCLUSIVE, so a catch-up scan re-reads the message on its lower boundary. The duplicate root
+    // INCLUSIVE, so a catch-up scan re-reads everything down to its lower boundary. A duplicate root
     // is deduplicated by the exact-key thread enqueue; trimming the seam is what loses a thread.
     inclusive: "true",
-    ...(claim.lowerTs === null ? {} : { oldest: claim.lowerTs }),
+    ...(oldest === null ? {} : { oldest }),
     ...(claim.cursor === null ? {} : { cursor: claim.cursor }),
   };
   const scope = verifiedScope(selection, bound);
