@@ -344,6 +344,120 @@ describe("slackReservedRequest — reserve, commit, then exactly one request", (
   });
 });
 
+/**
+ * AIO-1170 pre-activation correction PA-1 — `beforeSend`, the one point between "the slot is
+ * granted" and "the request leaves".
+ *
+ * A caller that must commit something BECAUSE a request is going out (the metadata stage opens its
+ * ordering attempt there) cannot do it before the reservation, since a deferred or blocked
+ * reservation sends nothing; and it cannot do it after the fetch, since the write has to be durable
+ * before an answer can come back. The hook is that point, and its contract is three sentences: it
+ * runs only for a GRANTED reservation, it has FINISHED before the request leaves, and if it throws
+ * there is no request and no result — the promise rejects.
+ *
+ * WHAT THIS DOES NOT PROVE: that any stage passes one. The metadata call site is pinned against real
+ * Postgres in `test/datamechanics/slack-source-fences.datamechanics.test.ts`; this file can only say
+ * what the transport does with a hook it is given.
+ */
+describe("slackReservedRequest — beforeSend runs between the grant and the request", () => {
+  it("finishes the hook AFTER the reservation commits and BEFORE the request leaves", async () => {
+    granted();
+    const { impl, calls } = fetchStub(() => json({ ok: true, channel: { id: "C0UNIT001" } }));
+    const beforeSend = vi.fn(async () => {
+      events.push("hook:start");
+      // A real hook is a short transaction of its own, so it settles on a LATER turn of the event
+      // loop. A transport that called it without awaiting it would have fetched by then.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      events.push("hook:end");
+    });
+
+    const result = await slackReservedRequest(
+      { db: fakeDb(), scope: SCOPE, token: TOKEN },
+      "conversations.info",
+      { channel: "C0UNIT001" },
+      { fetchImpl: impl, beforeSend }
+    );
+
+    expect(events).toEqual(["commit", "hook:start", "hook:end", "fetch"]);
+    expect(beforeSend).toHaveBeenCalledTimes(1);
+    expect(calls).toHaveLength(1);
+    expect(result.outcome).toBe("ok");
+  });
+
+  it("sends nothing and REJECTS with the hook's own failure, leaving the slot consumed", async () => {
+    granted();
+    const abort = new Error("the row this request was about is gone");
+    const { impl, calls } = fetchStub(() => {
+      throw new Error("an aborted send must never reach the network");
+    });
+
+    // ⚠️ REJECTS, by identity. There is deliberately no `aborted` variant of `SlackRequestResult`:
+    // every variant is something a source may classify and carry on from, and a caller's own hook
+    // failing is not one of those — reported as a transport error it would read as a blip.
+    await expect(
+      slackReservedRequest(
+        { db: fakeDb(), scope: SCOPE, token: TOKEN },
+        "conversations.info",
+        { channel: "C0UNIT001" },
+        {
+          fetchImpl: impl,
+          beforeSend: async () => {
+            events.push("hook");
+            throw abort;
+          },
+        }
+      )
+    ).rejects.toBe(abort);
+
+    expect(calls).toHaveLength(0);
+    // ONE commit — the reservation's — and nothing after the hook: no second transaction that could
+    // hand the slot back, and no cooldown or block written for a request that was never made.
+    expect(events).toEqual(["commit", "hook"]);
+    expect(reserveSlackMethodSlot).toHaveBeenCalledTimes(1);
+    expect(extendSlackMethodBackoff).not.toHaveBeenCalled();
+    expect(markSlackMethodBlocked).not.toHaveBeenCalled();
+  });
+
+  it("runs the hook for a GRANTED reservation only", async () => {
+    const beforeSend = vi.fn(async () => {});
+    const { impl, calls } = fetchStub(() => json({ ok: true, channel: { id: "C0UNIT001" } }));
+    const send = () =>
+      slackReservedRequest(
+        { db: fakeDb(), scope: SCOPE, token: TOKEN },
+        "conversations.info",
+        { channel: "C0UNIT001" },
+        { fetchImpl: impl, beforeSend }
+      );
+
+    reserveSlackMethodSlot.mockResolvedValueOnce({
+      outcome: "deferred",
+      scope: SCOPE,
+      method: "conversations.info",
+      nextPermittedAt: NEXT,
+      retryAfterMs: 42_000,
+    });
+    expect((await send()).outcome).toBe("deferred");
+    reserveSlackMethodSlot.mockResolvedValueOnce({
+      outcome: "blocked",
+      scope: SCOPE,
+      method: "conversations.info",
+      reason: "retry_after_unrepresentable",
+    });
+    expect((await send()).outcome).toBe("blocked");
+
+    // Neither denial sends anything, so neither may let the caller commit anything on its behalf.
+    expect(beforeSend).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
+
+    // The positive control, on the SAME spy: "never called" above cannot be satisfied by a transport
+    // that simply ignores the hook.
+    granted();
+    expect((await send()).outcome).toBe("ok");
+    expect(beforeSend).toHaveBeenCalledTimes(1);
+    expect(calls).toHaveLength(1);
+  });
+});
+
 describe("slackReservedRequest — 429 before JSON, and sanitized categories", () => {
   it("recognises a 429 without requiring a readable body, and persists the cooldown first", async () => {
     granted();
