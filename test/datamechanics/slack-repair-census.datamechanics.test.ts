@@ -324,7 +324,12 @@ const REFUSED = (reason: string): Json => ({ outcome: "refused", mode: "dry_run"
  * and throw instead of running — a prohibited call is counted even if the caller swallows the error,
  * and no real writer executes while the guard is up. The secret store keeps its own call-through spies
  * in the test below. `canonicalSlackChannelIds` is deliberately absent: it is the one permitted import.
+ *
+ * So is `readSlackTeamGenerations`, and only it, from the message ledger: the spec permits optional
+ * team-generation diagnostics, and that helper is a team-scoped SELECT on the session it is handed.
+ * Every MUTATING ledger export stays guarded; a control below proves the split is exactly that.
  */
+const PERMITTED_LEDGER_READER = "readSlackTeamGenerations";
 const PROHIBITED_APIS: readonly [string, Loose, readonly string[]][] = [
   ["@/lib/graph/arc-cache", arcCache, [
     "readArcCache", "staleArcCache", "purgeArcCacheKey", "purgePartitionArcCache", "sweepStaleScopedArcCache",
@@ -340,8 +345,8 @@ const PROHIBITED_APIS: readonly [string, Loose, readonly string[]][] = [
     "checkpointSlackThread", "releaseSlackThreadForRetry",
   ]],
   ["@/lib/ingest/slack-message-ledger", messageLedger, [
-    "readSlackTeamGenerations", "bumpSlackIdentityGeneration", "bumpSlackIdentityGenerationIfCurrent",
-    "bumpSlackPresentationIfChanged", "reconcileCompleteSlackThreadEvidence",
+    "bumpSlackIdentityGeneration", "bumpSlackIdentityGenerationIfCurrent", "bumpSlackPresentationIfChanged",
+    "reconcileCompleteSlackThreadEvidence",
   ]],
   ["@/lib/ingest/slack-channel-state", channelState, [
     "ensureSlackChannel", "dueSlackChannels", "beginSlackChannelMetadata", "recordSlackChannelPublicState",
@@ -1308,7 +1313,7 @@ describe("slack repair census: one read-only snapshot per invocation (real Postg
       expect.arrayContaining([
         "@/lib/graph/arc-cache#staleArcCache",
         "@/lib/ingest/slack-thread-state#enqueueSlackThread",
-        "@/lib/ingest/slack-message-ledger#readSlackTeamGenerations",
+        "@/lib/ingest/slack-message-ledger#bumpSlackIdentityGeneration",
         "@/lib/dashboard/timeline-cache#bustTeamTimeline",
         "@/lib/db/admin#adminClient",
       ])
@@ -1347,6 +1352,71 @@ describe("slack repair census: one read-only snapshot per invocation (real Postg
       expect(vi.isMockFunction(api.namespace[api.name]), `${api.label} restored`).toBe(false);
     }
     expect(typeof admin.adminClient().from).toBe("function");
+  });
+
+  it("the guard leaves exactly one ledger export callable — the team-generation reader — and still counts every ledger writer", async () => {
+    const seed = await seedTeam();
+    await runSql(
+      `insert into slack_team_state (team_id, data_generation, identity_generation, presentation_generation)
+       values ($1, 7, 8, 9)`,
+      [seed.teamId]
+    );
+    const before = await tables();
+    const prohibited = forbidProhibitedApis();
+    onTestFinished(() => prohibited.restore());
+
+    // The split, read off the module itself: every function it exports is guarded except the reader.
+    const ledgerLabel = (name: string): string => `@/lib/ingest/slack-message-ledger#${name}`;
+    // (Its one exported Error class is a type to catch, not an API that touches the database.)
+    const exported = Object.keys(messageLedger).filter((name) => {
+      const value = (messageLedger as Loose)[name];
+      return typeof value === "function" && !(value.prototype instanceof Error);
+    });
+    const guarded = prohibited.apis.filter((api) => api.namespace === messageLedger).map((api) => api.name);
+    expect(guarded).not.toContain(PERMITTED_LEDGER_READER);
+    expect(exported.filter((name) => !guarded.includes(name))).toEqual([PERMITTED_LEDGER_READER]);
+    expect(vi.isMockFunction(messageLedger.readSlackTeamGenerations)).toBe(false);
+    for (const name of guarded) expect(vi.isMockFunction((messageLedger as Loose)[name]), name).toBe(true);
+    expect(guarded.sort()).toEqual([
+      "bumpSlackIdentityGeneration", "bumpSlackIdentityGenerationIfCurrent", "bumpSlackPresentationIfChanged",
+      "reconcileCompleteSlackThreadEvidence",
+    ]);
+
+    // The permitted call, made the way the census may make it: on a session bound to ONE read-only,
+    // repeatable-read transaction. It really runs, it reads the stored row, and the guard counts nothing.
+    const client = await getPool().connect();
+    try {
+      await client.query("begin transaction isolation level repeatable read read only");
+      const executeSql: SqlExecutor = async <T>(text: string, params: unknown[] = []) => {
+        const result = await client.query(text, params);
+        return { rows: result.rows as T[], rowCount: result.rowCount ?? 0 };
+      };
+      const session = { executeSql } as never;
+      expect(await messageLedger.readSlackTeamGenerations(session, seed.teamId)).toEqual({
+        dataGeneration: "7", identityGeneration: "8", presentationGeneration: "9",
+      });
+      // A team with no row reads as zero and creates nothing: there is no "ensure" arm to permit.
+      expect(await messageLedger.readSlackTeamGenerations(session, randomUUID())).toEqual({
+        dataGeneration: "0", identityGeneration: "0", presentationGeneration: "0",
+      });
+      expect(prohibited.calls()).toEqual([]);
+
+      // Every ledger writer on that SAME session is counted, and stopped before it issues a statement.
+      for (const name of guarded) {
+        expect(() => (messageLedger as Loose)[name](session, seed.teamId), name).toThrow(
+          `prohibited call to ${ledgerLabel(name)}`
+        );
+        expect(prohibited.calls(), name).toEqual([ledgerLabel(name)]);
+        prohibited.clear();
+      }
+      // The transaction is still usable: no writer reached PostgreSQL to abort it.
+      expect((await client.query("show transaction_read_only")).rows[0].transaction_read_only).toBe("on");
+    } finally {
+      await client.query("rollback").catch(() => {});
+      client.release();
+    }
+    expect(prohibited.calls()).toEqual([]);
+    expect(await tables()).toEqual(before);
   });
 });
 

@@ -1033,6 +1033,15 @@ describe("slack repair census: namespace gate observation", () => {
  * import. Everything that writes, reserves, claims, decrypts or calls the provider is banned outright.
  */
 const BINDING = /slack-source-binding(?:\.ts)?$/;
+/**
+ * The message ledger is the second module with exactly ONE permitted name. The spec allows optional
+ * team-generation diagnostics, and `readSlackTeamGenerations` is a team-scoped SELECT that runs on
+ * whatever session it is handed — the census reader's own read-only transaction. Everything else the
+ * module exports bumps a generation or reconciles evidence, so the module is not banned outright and
+ * not opened either: the same exact-named-import rule as the binding module applies.
+ */
+const LEDGER = /slack-message-ledger(?:\.ts)?$/;
+const LEDGER_READER = "readSlackTeamGenerations";
 const BANNED_MODULES = [
   /(^|\/)secrets(\/|$)/,
   /slack-namespace-gate$/,
@@ -1044,9 +1053,9 @@ const BANNED_MODULES = [
   /slack-publication$/,
   /integrations\/manage$/,
   /dashboard\/timeline-cache$/,
-  // The hydration queue and its snapshots, the message ledger and team generations, thread cleanup.
+  // The hydration queue and its snapshots, and thread cleanup. (The message ledger is NOT here: it has
+  // one permitted reader, so it is held to the named-import allowlist above instead.)
   /slack-thread-state$/,
-  /slack-message-ledger$/,
   /slack-cleanup$/,
   // Durable caches. A stale-mark or purge that happens to match no row is still a write the census made.
   /graph\/arc-cache$/,
@@ -1080,9 +1089,10 @@ const PROHIBITED_EXPORTS: Record<string, readonly string[]> = {
     "writeSlackThreadSnapshot", "restartSlackThreadSnapshot", "purgeExpiredSlackThreadSnapshots",
     "checkpointSlackThread", "releaseSlackThreadForRetry",
   ],
+  // Every export of the ledger module EXCEPT the one permitted reader, `readSlackTeamGenerations`.
   "lib/ingest/slack-message-ledger.ts": [
-    "readSlackTeamGenerations", "bumpSlackIdentityGeneration", "bumpSlackIdentityGenerationIfCurrent",
-    "bumpSlackPresentationIfChanged", "reconcileCompleteSlackThreadEvidence",
+    "bumpSlackIdentityGeneration", "bumpSlackIdentityGenerationIfCurrent", "bumpSlackPresentationIfChanged",
+    "reconcileCompleteSlackThreadEvidence",
   ],
   "lib/ingest/slack-channel-state.ts": [
     "ensureSlackChannel", "dueSlackChannels", "beginSlackChannelMetadata", "recordSlackChannelPublicState",
@@ -1131,6 +1141,9 @@ function censusImportViolations(source: string): string[] {
     if (BINDING.test(specifier) && !/^import \{ canonicalSlackChannelIds \} from ['"][^'"]+['"]$/.test(statement)) {
       violations.push(statement);
     }
+    if (LEDGER.test(specifier) && !new RegExp(`^import \\{ ${LEDGER_READER} \\} from ['"][^'"]+['"]$`).test(statement)) {
+      violations.push(statement);
+    }
   }
   if (/\bfetch\s*\(/.test(source)) violations.push("fetch(");
   for (const match of source.matchAll(PROHIBITED_REFERENCE)) violations.push(`prohibited export ${match[1]}`);
@@ -1146,6 +1159,36 @@ describe("slack repair census: import allowlist", () => {
       censusImportViolations(`import pg from "pg";\nimport {\n  canonicalSlackChannelIds\n} from "@/lib/ingest/slack-source-binding";`)
     ).toEqual([]);
     expect(censusImportViolations(`import { parseSlackItemPath } from "./sources/slack-namespace";`)).toEqual([]);
+  });
+
+  it("accepts exactly the named team-generation reader from the message ledger (positive control)", () => {
+    for (const specifier of ["./slack-message-ledger", "@/lib/ingest/slack-message-ledger"]) {
+      const source = [
+        `import { readSlackTeamGenerations } from "${specifier}";`,
+        `const generations = await readSlackTeamGenerations(session, scope.teamId);`,
+      ].join("\n");
+      expect(censusImportViolations(source), specifier).toEqual([]);
+    }
+    expect(Object.values(PROHIBITED_EXPORTS).flat()).not.toContain(LEDGER_READER);
+  });
+
+  it.each([
+    ["a ledger writer on its own", `import { bumpSlackIdentityGeneration } from "./slack-message-ledger";`],
+    ["the reader with a writer beside it", `import { readSlackTeamGenerations, bumpSlackPresentationIfChanged } from "./slack-message-ledger";`],
+    ["a writer with the reader beside it", `import { reconcileCompleteSlackThreadEvidence, readSlackTeamGenerations } from "./slack-message-ledger";`],
+    ["the reader aliased", `import { readSlackTeamGenerations as generations } from "./slack-message-ledger";`],
+    ["a writer aliased to the reader's name", `import { bumpSlackIdentityGeneration as readSlackTeamGenerations } from "./slack-message-ledger";`],
+    ["a namespace import", `import * as ledger from "./slack-message-ledger";`],
+    ["a default import", `import ledger from "@/lib/ingest/slack-message-ledger";`],
+    ["a dynamic import", `const { readSlackTeamGenerations } = await import("./slack-message-ledger");`],
+    ["a require", `const { readSlackTeamGenerations } = require("./slack-message-ledger");`],
+    ["a re-export of the reader", `export { readSlackTeamGenerations } from "./slack-message-ledger";`],
+    ["a star re-export", `export * from "@/lib/ingest/slack-message-ledger";`],
+    ["a side-effect import", `import "./slack-message-ledger";`],
+    ["a type import of another name", `import type { SlackTeamGenerations } from "./slack-message-ledger";`],
+    ["the reader by an extension spelling, with a writer", `import { readSlackTeamGenerations, bumpSlackIdentityGenerationIfCurrent } from "./slack-message-ledger.ts";`],
+  ])("the ledger exception does not admit %s (negative control)", (_label, source) => {
+    expect(censusImportViolations(source)).not.toEqual([]);
   });
 
   it.each([
@@ -1169,7 +1212,7 @@ describe("slack repair census: import allowlist", () => {
     ["a provider request", `const r = await fetch("https://slack.com/api/auth.test");`],
     ["the thread queue", `import { enqueueSlackThread } from "./slack-thread-state";`],
     ["the thread queue, by alias and extension", `import * as queue from "@/lib/ingest/slack-thread-state.ts";`],
-    ["the message ledger", `import { readSlackTeamGenerations } from "./slack-message-ledger";`],
+    ["a message-ledger writer", `import { reconcileCompleteSlackThreadEvidence } from "./slack-message-ledger";`],
     ["the message ledger, dynamically", `const ledger = await import("@/lib/ingest/slack-message-ledger");`],
     ["thread cleanup", `import { purgeDeletedSlackThreads } from "./slack-cleanup";`],
     ["the arc cache", `import { staleArcCache } from "@/lib/graph/arc-cache";`],
@@ -1223,9 +1266,25 @@ describe("slack repair census: import allowlist", () => {
     // later fails here instead of slipping past the name list.
     const everyFunction = (file: string): string[] =>
       [...readFileSync(join(REPO, file), "utf8").matchAll(/^export (?:async )?function (\w+)/gm)].map((m) => m[1]);
-    for (const file of ["lib/ingest/slack-thread-state.ts", "lib/ingest/slack-message-ledger.ts"]) {
+    for (const file of ["lib/ingest/slack-thread-state.ts"]) {
       expect([...PROHIBITED_EXPORTS[file]].sort(), file).toEqual(everyFunction(file).sort());
     }
+    // The ledger: every function export is banned by name except the single permitted reader — so a
+    // writer added to that module later is neither banned nor permitted, and fails here.
+    const LEDGER_FILE = "lib/ingest/slack-message-ledger.ts";
+    expect(everyFunction(LEDGER_FILE).filter((name) => !PROHIBITED_EXPORTS[LEDGER_FILE].includes(name))).toEqual([
+      LEDGER_READER,
+    ]);
+    // …and the permitted name must STAY a reader: one statement, a SELECT, no write and no row lock.
+    // If it ever grows an "ensure the row exists" arm, the exception is withdrawn by this assertion.
+    const reader = new RegExp(`^export async function ${LEDGER_READER}\\([\\s\\S]*?\\n}\\n`, "m").exec(
+      readFileSync(join(REPO, LEDGER_FILE), "utf8")
+    )?.[0];
+    expect(reader, `${LEDGER_READER} is declared in ${LEDGER_FILE}`).toEqual(expect.any(String));
+    expect(reader?.match(/\bexecuteSql\b/g)).toHaveLength(1);
+    expect(reader).toMatch(/`\s*select\b[\s\S]*\bfrom slack_team_state where team_id = \$1`/);
+    expect(reader).not.toMatch(/\b(?:insert|update|delete|truncate|merge|lock)\b|\bon conflict\b|\bfor\s+(?:no\s+key\s+)?(?:update|share)\b|\bfor\s+key\s+share\b/i);
+    expect(reader).not.toMatch(new RegExp(`\\b(?:${PROHIBITED_EXPORTS[LEDGER_FILE].join("|")}|bumpGeneration)\\b`));
     expect(everyFunction("lib/graph/arc-cache.ts").filter((name) => !PROHIBITED_EXPORTS["lib/graph/arc-cache.ts"].includes(name))).toEqual([
       "arcTtlMs",
     ]);
