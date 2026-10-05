@@ -211,7 +211,15 @@ export async function setMemberIdentity(
   });
 }
 
-/** Unlink an identity. Slack records an absent-key fence; repeating it is a no-op. */
+/**
+ * Unlink an identity. Slack records an absent-key fence; repeating it is a no-op.
+ *
+ * Legacy Slack CASE VARIANTS (`U0ABC` and `u0abc` both live, from when the writer matched exactly)
+ * are unlinked one row at a time, by the caller's exact stored spelling; a spelling that names none
+ * of them exactly is still refused rather than guessed. The fence is written only by the unlink that
+ * leaves no variant live: the suppression check in `setMemberIdentity` runs before its existing-row
+ * branch, so a fence beside a surviving variant would refuse that variant's own refresh forever.
+ */
 export async function removeMemberIdentity(
   admin: DbClient,
   teamId: string,
@@ -225,10 +233,19 @@ export async function removeMemberIdentity(
   return transactionCapability(admin).transaction(async (session) => {
     await session.executeSql("select pg_advisory_xact_lock(7341014, hashtext($1))", [teamId]);
     let ex: SlackIdentityRow | { id: string; member_id: string } | null;
+    // True when another case variant of this Slack account stays live after this unlink.
+    let variantRemains = false;
     if (provider === "slack") {
       const matches = await matchingSlackIdentities(session, teamId, externalId);
-      if (matches.length > 1) throw new Error(`Slack account ${externalId} has multiple live case variants`);
-      ex = matches[0] ?? null;
+      if (matches.length > 1) {
+        // The unique key is case-sensitive, so at most one row carries the caller's exact spelling.
+        const exact = matches.find((row) => row.external_id === externalId);
+        if (!exact) throw new Error(`Slack account ${externalId} has multiple live case variants`);
+        ex = exact;
+        variantRemains = true;
+      } else {
+        ex = matches[0] ?? null;
+      }
     } else {
       const { data, error } = await session.db.from("member_identities")
         .select("id, member_id").eq("team_id", teamId).eq("provider", provider)
@@ -253,7 +270,8 @@ export async function removeMemberIdentity(
       if (error) throw new Error(`identity delete failed: ${error.message}`);
     }
     if (provider === "slack") {
-      if (!suppressed) {
+      // No fence while a variant is still live: it would make that variant's refresh a conflict.
+      if (!suppressed && !variantRemains) {
         const { error } = await session.db.from("member_identity_suppressions")
           .insert({ team_id: teamId, provider,
             external_id: ex && "external_id" in ex ? ex.external_id : externalId });
@@ -268,7 +286,8 @@ export async function removeMemberIdentity(
       action: ex ? "identity.removed" : "identity.suppressed",
       target_type: ex ? "member" : "identity",
       target_id: ex?.member_id ?? null,
-      meta: { provider, external_id: externalId, suppressed: provider === "slack" },
+      meta: { provider, external_id: externalId,
+        suppressed: provider === "slack" && (suppressed || !variantRemains) },
     });
     return { removed: Boolean(ex) };
   });
