@@ -31,8 +31,41 @@ interface ItemRow {
   member_id: string | null;
   member_id_locked: boolean;
   frontmatter: Record<string, unknown>;
-  access: string;
 }
+
+/**
+ * COMMON REPAIR ELIGIBILITY — one rule, applied to the bounded candidate selection and again to
+ * each item once its attribution advisory and its row are held. `i` is the `items` row.
+ *
+ * A team-tier row is repairable. An `external` row is not — it is a client's content, and its
+ * stored credit is never rewritten from roster state — with ONE exception: a Google Drive document.
+ * Drive documents are stored `external` by construction (the unit tier is the conservative one;
+ * claim memberships are the authority), so the tier alone would exclude every one of them.
+ *
+ * What makes an external row a Drive document is the PERSISTED same-team provider mapping, and
+ * nothing else. Not its frontmatter, authors or contributions (a pusher writes those), not a
+ * connection id on the payload or on the mapping (the mapping's is NULL by design), not an active
+ * claim, a live lease or an enabled integration: the mapping is written only by the ingest owner
+ * for a provider identity it resolved, and it outlives disconnect and a paired staging restore.
+ *
+ * THROUGH COMMIT. The recheck takes no provider or mapping lock — either would come after the item
+ * row, the inverse of provider → path → attribution → item. It does not need one. `access` is read
+ * from the locked row. And a mapping, once it names an item, keeps naming it: `lib/ingest/index.ts`
+ * is the only writer, it only ever inserts a row for a provider identity (do-nothing on conflict)
+ * and afterwards updates that row's project/path by item id; no application path deletes a mapping
+ * or changes its `item_id`, `source` or `team_id`, and the row survives its item's purge as a
+ * tombstone (`test/guards/source-item-mapping-stability.test.ts` holds that line). So an
+ * eligibility read that is true under the item lock stays true until this transaction ends.
+ *
+ * The only transition is the other way — an unmapped row gaining a mapping when the ingest owner
+ * adopts it. A Drive commit does that under the item's attribution advisory, so it queues behind
+ * this repair or is seen by it. A row adopted after the cursor has passed it is not revisited at
+ * this revision: it was not a Drive document when the repair looked, and the adopting ingest
+ * attributes the current row itself.
+ */
+const REPAIR_ELIGIBLE = `(i.access::text <> 'external' or exists (
+  select 1 from source_item_mappings m
+   where m.team_id = i.team_id and m.item_id = i.id and m.source = 'gdrive'))`;
 
 interface VersionRow {
   id: string;
@@ -89,12 +122,29 @@ export async function repairAttributionItem(
     await lockItemAttribution(snapshot.teamId,itemId);
     await hooks.afterItemLock?.(itemId);
     const { rows: items } = await runSql<ItemRow>(
-      `select id,member_id,member_id_locked,frontmatter,access::text as access
+      `select id,member_id,member_id_locked,frontmatter
          from items where team_id=$1 and id=$2 for update`,
       [snapshot.teamId, itemId],
     );
     const item = items[0];
-    if (!item || item.access === "external") {
+    // The candidate read was unlocked: it nominated this item, it did not admit it. Eligibility is
+    // decided here, by a statement of its own issued AFTER the row lock was acquired — so it reads
+    // the tier of the locked row and whatever mapping is committed now, not what a statement that
+    // had to wait for the lock saw when it started. A failed read throws: the transaction rolls
+    // back and the cursor does not move.
+    let eligible = false;
+    if (item) {
+      const { rows: eligibility } = await runSql<{ eligible: boolean | null }>(
+        `select ${REPAIR_ELIGIBLE} as eligible from items i where i.team_id=$1 and i.id=$2`,
+        [snapshot.teamId, itemId],
+      );
+      const answer = eligibility[0]?.eligible;
+      if (eligibility.length !== 1 || typeof answer !== "boolean") {
+        throw new Error("repair eligibility could not be read for a locked item");
+      }
+      eligible = answer;
+    }
+    if (!item || !eligible) {
       await advanceIdentityRepairCursor({
         teamId: snapshot.teamId, revision: snapshot.revision, itemId,
         itemUpdated: 0, versionsUpdated: 0, contributionsUpdated: 0,
@@ -169,9 +219,9 @@ export async function reattributeItems(
     await markIdentityRepairRunning(teamId,snapshot.revision);
     await opts.afterSnapshot?.(snapshot.revision);
     const { rows: candidates } = await runSql<{ id: string }>(
-      `select id from items
-        where team_id=$1 and access::text<>'external' and ($2::uuid is null or id>$2::uuid)
-        order by id limit $3`,
+      `select i.id from items i
+        where i.team_id=$1 and ${REPAIR_ELIGIBLE} and ($2::uuid is null or i.id>$2::uuid)
+        order by i.id limit $3`,
       [teamId,snapshot.cursorItemId,batchSize],
     );
     let updated=0;

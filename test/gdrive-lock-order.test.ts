@@ -587,9 +587,10 @@ describe("the whole Drive ingest: identity → connection → the complete proje
     const firstRollback = c.log.findIndex((entry) => entry.sql === "rollback");
     const work = new Set(c.work);
     const second = c.log.slice(firstRollback + 1).filter((entry) => work.has(entry));
-    // Nothing is reused: the second attempt re-takes the connection authority, plans again, and
-    // re-takes every lock below it.
-    expect(indexOf(second, isAuthorityLock)).toBe(0);
+    // Nothing is reused: the second attempt re-takes the identity authority and then the connection
+    // authority, plans again, and re-takes every lock below it.
+    expect(indexOf(second, isIdentityLock)).toBe(0);
+    expect(indexOf(second, isAuthorityLock)).toBe(1);
     expect(indexOf(second, isMappingRead)).toBeGreaterThan(0);
     expect(indexOf(second, isProjectLock)).toBeGreaterThan(indexOf(second, isMappingRead));
     expect(indexOf(second, isProviderLock)).toBeGreaterThan(indexOf(second, isProjectLock));
@@ -795,6 +796,20 @@ describe("project rows: one ascending pass, each row once in its final mode, no 
     await withGdriveExecutionCommit(auth, execution, async (approved) => { seen = new Set(approved.lockedProjects.keys()); }, { projects: async () => writes(project(4)) });
     expect(seen).toEqual(new Set([project(1)]));
     expect(which(c.work, isProjectLock)).toHaveLength(2);
+  });
+
+  it("IDENTITY FIRST: a commit that validates no identity revision still takes the team identity authority before its connection rows, bounded", async () => {
+    // A commit locks its connection and then its bound connector MEMBER. A roster writer holds the
+    // identity authority before a member row, and a hard deletion's foreign-key actions then reach
+    // the connection — so the authority is the head of this order whether or not a revision is checked.
+    const c = use(new ScriptedConnection(driveDatabase()));
+    await withGdriveExecutionCommit(auth, execution, async () => undefined);
+    const work = c.work;
+    expect(isIdentityLock(work[0])).toBe(true);
+    expect(indexOf(work, isAuthorityLock)).toBe(1);
+    expect(indexOf(work, isPrincipalLock)).toBeGreaterThan(1);
+    expect(work[0].lockTimeout).toBe("10s");
+    expect(which(work, isIdentityLock)).toHaveLength(1);
   });
 
   it("the lock_timeout is back to the caller's value for the commit body", async () => {
@@ -1011,6 +1026,44 @@ describe("an ordinary ingest: project acquisition is inside the publishing trans
     expect(which(work.slice(order[6]), isProjectLock)).toEqual([]);
     // The timestamp is written only under the row lock.
     expect(order[5]).toBeGreaterThan(order[4]);
+
+    // BOUNDED ATTRIBUTION ADVISORY: the one wait between the path identity and the item row runs
+    // under the same 10s bound, exactly once, and the caller's value is restored by the very next
+    // statement — before the item row is asked for.
+    const attribution = which(work, isAttributionLock);
+    expect(attribution).toHaveLength(1);
+    expect(attribution[0].lockTimeout).toBe(LOCK_ACQUISITION_TIMEOUT);
+    const restore = c.log[c.log.indexOf(attribution[0]) + 1];
+    expect(restore.sql.startsWith("select set_config('lock_timeout'")).toBe(true);
+    expect(restore.params).toEqual(["0"]);
+    expect(c.log.indexOf(restore)).toBeLessThan(c.log.indexOf(work[order[8]]));
+  });
+
+  it("BOUNDED TIMEOUT: a held item-attribution advisory fails the ingest once (55P03) — after project and path, before the item row, with no retry", async () => {
+    const c = use(new ScriptedConnection((sql, params) =>
+      (isAttributionLock({ sql, params, lockTimeout: "" })
+        ? sqlError("canceling statement due to lock timeout", "55P03")
+        : ordinaryDatabase()(sql, params))));
+    const error = await run(c);
+    expect(error).toMatchObject({ code: "55P03" });
+
+    const work = c.work;
+    const timedOut = which(work, isAttributionLock);
+    // ONE attempt: the wait is not repeated, and no second context session is opened for it.
+    expect(timedOut).toHaveLength(1);
+    expect(c.log.filter((entry) => entry.sql.startsWith("savepoint "))).toHaveLength(1);
+    expect(c.count("begin")).toBe(1);
+    expect(timedOut[0].lockTimeout).toBe(LOCK_ACQUISITION_TIMEOUT);
+    // The order is unchanged: project rows, then the path identity, then this advisory …
+    const order = [lastIndexOf(work, isProjectLock), indexOf(work, isSessionPathLock), indexOf(work, isAttributionLock)];
+    expect(order.every((index) => index >= 0)).toBe(true);
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+    // … and nothing below it: no item row, and the whole publication rolled back with the project.
+    expect(which(work, isSessionItemLock)).toEqual([]);
+    expect(which(work.slice(order[2] + 1), isWrite)).toEqual([]);
+    expect(c.count("commit")).toBe(0);
+    expect(c.log.at(-1)!.sql).toBe("rollback");
+    expect(c.log.some((entry) => entry.sql.startsWith("rollback to savepoint"))).toBe(true);
   });
 
   it("ROLLBACK: a failure after the project setup takes the created project with it", async () => {

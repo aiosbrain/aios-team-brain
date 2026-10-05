@@ -1106,6 +1106,17 @@ cursor and leaves a pending repair instead of allowing an older snapshot to publ
 an `email-alias:` mapping tombstone, so successful unlink clears unlocked stale credit while ordinary
 never-resolved evidence remains conservative. Manual repair propagates read failures; background repair
 records retry state and the scheduler resumes it. Completion is published only after strict cache purge.
+Team repair eligibility is one rule, applied in the bounded candidate selection and again per item
+under its attribution advisory and row lock (`lib/ingest/reattribute.ts`): a non-`external` row, or an
+`external` row with a persisted same-team `gdrive` row in `source_item_mappings`. Drive documents are
+stored `external`, so without the second arm an alias or roster change would complete with every Drive
+document's credit stale. The mapping is the only trust root — not frontmatter, authors, a connection id
+(the mapping's is NULL by design), claims, leases or the integration's state — so it holds after
+disconnect and a paired restore, while generic external client rows stay excluded. The recheck takes no
+provider or mapping lock (both precede the item in the ingest order): a mapping is insert-only for its
+item and never deleted or re-pointed by application code, which a source guard enforces. Each
+historical version re-resolves from its own retained provenance, and a failed eligibility, provenance or
+evidence read fails the attempt without moving the cursor.
 The common ingest owner follows the same boundary: after path/provider identity resolves the canonical
 item UUID, it takes the shared item advisory lock, rereads `member_id`/`member_id_locked` under the row
 lock, and holds both through item, version, and contribution writes. Path/provider locks precede sorted
@@ -1185,7 +1196,22 @@ set of item rows before its first write; physical cleanup stays a separate trans
 A retracted Drive unit is reactivated only by the claim owner re-deriving context from surviving claims
 (`reconcileItemUnit(…, { reactivate: true })`), never by the ordinary unit mirror. Each of these waits
 is bounded at 10 seconds (`lib/db/pg/bounded-lock.ts`; a timeout is not retried, and neither is an
-unconfirmed COMMIT).
+unconfirmed COMMIT) — an ordinary ingest's item-attribution advisory included.
+
+Every path that locks a Drive **connection** takes the team identity authority first
+(`lockedAuthority` in `lib/integrations/gdrive-authority.ts`): identity authority → [named integration
+advisory, OAuth publication only] → integration and connection-authority rows → member / API-key rows.
+That covers OAuth publication, Admin test/config, connector provisioning/rotation and the
+bound-principal execution paths, including the ones that change no identity. Each of them locks a
+connection and then a member; a roster writer holds the identity authority before a member row, and a
+hard deletion's foreign-key actions then reach `integrations.created_by` and the connection
+authority's connector binding — so the authority is the one lock both sides can take first. An OAuth
+publication (`lib/integrations/gdrive-oauth.ts`) is one transaction in that order: an absent connection
+is reserved with `created_by = NULL` (create-or-read-winner, `reserveGdriveIntegration`), the rows are
+locked, the initiating Admin is validated, reusable config and credential are read from the locked
+row, and only then are the config, the encrypted credential and both verified identity mappings
+written. A lost Admin authorization, an incomplete credential or a mapping conflict rolls all of it
+back, the reservation included; nothing is retried.
 
 A paired staging refresh copies Drive documents and their authorization substrate (items, context
 units, `gdrive_claim` memberships) but not the connection: integrations, API keys and the five Drive

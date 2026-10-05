@@ -752,7 +752,11 @@ export async function ingestItem(
   if (_internal.transactionBound) {
     await _internal.concurrencyHooks?.beforeAttributionLock?.(canonicalItemId);
     // Re-entrant for a Drive commit; for a newly minted id the key is uncontended by construction.
-    await lockItemAttribution(auth.teamId,canonicalItemId);
+    // An existing item's key can be held by a correction, a repair or another ingest, so the wait
+    // carries the same 10-second bound as the project rows before it and the item row after it.
+    // The bracket holds only the acquisition: the caller's `lock_timeout` is back before the item
+    // row is asked for, and a timeout (55P03) is not one of the context engine's retryable causes.
+    await withBoundedLockWaits(() => lockItemAttribution(auth.teamId,canonicalItemId));
     await _internal.concurrencyHooks?.afterAttributionLock?.(canonicalItemId);
   }
   // ONE row lock and ONE fresh authority read for both owners: it is the attribution reread above

@@ -156,12 +156,24 @@ async function untilLockWaiters(expected: number): Promise<void> {
   throw new Error(`expected ${expected} backend(s) waiting on a lock, saw ${await lockWaiters()}`);
 }
 
-/** Backends holding at least one advisory lock — provider, path and item-attribution identities. */
+/**
+ * Backends holding at least one advisory lock BELOW the head of the order — a provider, path or
+ * item-attribution identity.
+ *
+ * The team identity authority is excluded by key. Every Drive connection path takes it first, before
+ * its connection rows (`lockedAuthority`), so a commit that is still waiting for its connection or
+ * its projects legitimately holds it — and holds nothing these assertions are about.
+ */
 async function advisoryHolders(): Promise<number> {
   const { rows } = await getPool().query<{ n: number }>(
     `select count(distinct l.pid)::int as n from pg_locks l
        join pg_database d on d.oid = l.database
-      where d.datname = current_database() and l.locktype = 'advisory' and l.granted`);
+      where d.datname = current_database() and l.locktype = 'advisory' and l.granted
+        and not exists (
+          select 1 from teams t
+           where l.objsubid = 1
+             and ((l.classid::bigint << 32) | l.objid::bigint)
+                 = hashtextextended(t.id::text || ':identity-authority', 0))`);
   return rows[0].n;
 }
 
@@ -199,7 +211,7 @@ describe("AIO-1167 Drive commit lock order (real Postgres)", () => {
         "select 1 from gdrive_connection_authority where integration_id=$1 for update", [c.integrationId]);
       const worker = push(c, drivePayload(c, "ordered", "ordered body"));
       await untilLockWaiters(1);
-      expect(await advisoryHolders(), "an identity lock was taken before the connection authority").toBe(0);
+      expect(await advisoryHolders(), "a provider, path or item lock was taken before the connection authority").toBe(0);
       await holder.query("rollback");
       await expect(worker).resolves.toMatchObject({ status: "created" });
     } finally {
@@ -208,7 +220,7 @@ describe("AIO-1167 Drive commit lock order (real Postgres)", () => {
     }
   }, 30_000);
 
-  it("ORDER: a reconciliation queued behind a running ingest waits at the connection authority; both finish", async () => {
+  it("ORDER: a reconciliation queued behind a running ingest waits at the head of the order, before its connection; both finish", async () => {
     const seed = await adminSeed();
     const c = await driveConnection(seed, [(await audienceProject(seed)).id]);
     await expect(push(c, drivePayload(c, "doc-b", "b"))).resolves.toMatchObject({ status: "created" });
@@ -272,7 +284,8 @@ describe("AIO-1167 Drive commit lock order (real Postgres)", () => {
     await held.at;
     const inB = push(b, drivePayload(b, "in-b", "b", { project: pb.slug }));
     await untilLockWaiters(1);
-    // B is waiting on a PROJECT row: it has taken no provider, path or item identity yet.
+    // B is queued above its project rows — two commits of one team meet at the identity authority
+    // first — and has taken no provider, path or item identity yet.
     expect(await advisoryHolders()).toBe(1);
     held.release();
     await expect(inA).resolves.toMatchObject({ status: "created" });
@@ -897,7 +910,8 @@ describe("AIO-1167 shared ingest order: project before item (real Postgres)", ()
       "select member_id, member_id_locked from items where id=$1", [created.id])).rows[0];
     const unlock = () => getPool().query("update items set member_id=$2, member_id_locked=false where id=$1", [created.id, seed.memberId]);
 
-    // Order 1 — the commit holds the advisory and the row; the correction waits at the advisory.
+    // Order 1 — the commit holds the identity authority, the advisory and the row; the correction
+    // queues behind it at the first of those it asks for, and can decide nothing meanwhile.
     const committing = pausedHoldingEverything();
     const commit1 = push(c, drivePayload(c, "credited", "v2"), committing.hooks);
     commit1.catch(() => undefined);
@@ -916,8 +930,8 @@ describe("AIO-1167 shared ingest order: project before item (real Postgres)", ()
     await expect(correction1).resolves.toMatchObject({ ok: true, updated: 1 });
     expect(await attribution()).toEqual({ member_id: null, member_id_locked: true });
 
-    // Order 2 — the correction holds the advisory (and not yet the row); the commit, already past
-    // its project, provider and path locks, waits there without having locked the item row.
+    // Order 2 — the correction holds the identity authority and the advisory (and not yet the row);
+    // the commit queues behind it at the head of its own order, without having locked the item row.
     await unlock();
     const correcting = gate();
     const probe = await getPool().connect();
