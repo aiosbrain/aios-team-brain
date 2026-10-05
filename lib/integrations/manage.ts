@@ -60,6 +60,58 @@ export async function upsertIntegration(
   return { id: data.id as string, status: data.status as string };
 }
 
+/**
+ * Reserve a named Google Drive connection that does not exist yet, so an OAuth publication has
+ * connection rows to lock BEFORE it locks its initiating Admin (`lib/integrations/gdrive-oauth.ts`).
+ *
+ * Transaction-local by contract: the caller is inside its publication transaction and follows this
+ * with `upsertIntegration` (which audits and sets `created_by`) or rolls back, so a reservation is
+ * never visible on its own and a failed publication leaves none. For that reason:
+ *   • `created_by` is NULL — inserting it would take the member's foreign-key lock ahead of the
+ *     connection, the wrong way round for the Drive acquisition order;
+ *   • it is CREATE-OR-READ-WINNER — a concurrent creator of the same name is waited for and then
+ *     read; an existing connection is never rewritten merely to reserve it;
+ *   • it writes no audit row of its own — the publication it precedes is the audited change.
+ */
+export async function reserveGdriveIntegration(
+  db: DbClient,
+  teamId: string,
+  name: string,
+  rawConfig: Record<string, unknown>,
+): Promise<{ id: string; reserved: boolean }> {
+  const config = validateIntegrationConfig("gdrive", rawConfig); // throws IntegrationConfigError → 400
+  const { data, error } = await db
+    .from("integrations")
+    .upsert(
+      {
+        team_id: teamId,
+        type: "gdrive",
+        name,
+        config,
+        status: "enabled",
+        created_by: null,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "team_id,type,name", ignoreDuplicates: true }
+    )
+    .select("id");
+  if (error) throw new Error(`integration reservation failed: ${error.message}`);
+  const created = ((data ?? []) as { id: string }[])[0];
+  if (created) return { id: created.id, reserved: true };
+
+  const { data: winner, error: winnerError } = await db
+    .from("integrations")
+    .select("id")
+    .eq("team_id", teamId)
+    .eq("type", "gdrive")
+    .eq("name", name)
+    .maybeSingle();
+  if (winnerError || !winner) {
+    throw new Error(`integration reservation failed: ${winnerError?.message ?? "the concurrent creator's row is gone"}`);
+  }
+  return { id: (winner as { id: string }).id, reserved: false };
+}
+
 export async function setIntegrationStatus(
   db: DbClient,
   auth: IntegrationAuth,

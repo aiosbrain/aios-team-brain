@@ -7,7 +7,7 @@ import type { ApiAuth } from "@/lib/api/auth";
 import { adminClient } from "@/lib/db/admin";
 import { withBoundedLockWaits } from "@/lib/db/pg/bounded-lock";
 import { runSql, withTransaction } from "@/lib/db/pg/pool";
-import { lockIdentityMutationAuthorities } from "@/lib/identity/authority";
+import { lockIdentityAuthority, lockIdentityMutationAuthorities } from "@/lib/identity/authority";
 import { lockProjectRows } from "@/lib/projects/project-row-locks";
 import { decryptSecret } from "@/lib/secrets/crypto";
 import { validateIntegrationConfig } from "@/lib/api/schemas";
@@ -158,7 +158,26 @@ function requireConnectorPrincipal(auth: ApiAuth): void {
   }
 }
 
+/**
+ * THE Drive connection acquisition boundary. Every path that locks a connection takes its locks in
+ * one order:
+ *
+ *   team identity authority → [named integration advisory: OAuth publication only]
+ *     → integration + connection-authority rows → member / API-key rows
+ *
+ * The identity authority comes first even for a path that changes no identity. Each of these paths
+ * is a connection → member compound: it holds the connection rows and then locks a member row (the
+ * acting Admin, or the bound connector principal). A roster writer runs the other way round — a
+ * hard member deletion holds the identity authority and the member row, and its foreign-key actions
+ * then update `integrations.created_by` and `gdrive_connection_authority.connector_member_id`. The
+ * identity authority is the one lock both sides can take before either row, so it is the head of
+ * the order here: the two then queue instead of each holding the row the other needs next.
+ *
+ * Transaction-scoped and re-entrant: a caller that already holds it (a validated identity revision,
+ * provisioning, an OAuth publication) simply passes through.
+ */
 async function lockedAuthority(integrationId: string, teamId: string): Promise<AuthorityRow> {
+  await lockIdentityAuthority(teamId);
   const { rows } = await runSql<AuthorityRow>(
     `select i.id as integration_id, i.team_id, i.status, i.config, i.secret_ciphertext,
             a.generation, a.scope_hash, a.credential_revision,
@@ -184,15 +203,45 @@ export interface GdriveAdminTestAuthority {
   credential: { clientId: string; clientSecret: string; refreshToken: string };
 }
 
+/** A connection as an OAuth publication reads it: under its row locks, credential still encrypted. */
+export interface LockedGdriveConnection {
+  integrationId: string;
+  status: string;
+  config: Record<string, unknown>;
+  secretCiphertext: string | null;
+}
+
+/**
+ * The acquisition boundary above, for the one owner outside this module that publishes a connection
+ * (`publishGoogleDriveOAuthCredential`). Must run inside that owner's transaction.
+ */
+export async function lockGdriveConnection(teamId: string, integrationId: string): Promise<LockedGdriveConnection> {
+  const row = await lockedAuthority(integrationId, teamId);
+  return {
+    integrationId: row.integration_id,
+    status: row.status,
+    config: row.config ?? {},
+    secretCiphertext: row.secret_ciphertext,
+  };
+}
+
+/**
+ * Lock the acting member's row and say whether they are, right now, an active Admin of this team.
+ * Always AFTER the connection rows (and so after the identity authority): see `lockedAuthority`.
+ */
+export async function lockActiveTeamAdmin(teamId: string, memberId: string): Promise<boolean> {
+  const { rows } = await runSql<{ role: string; status: string }>(
+    `select role,status from members where id=$1 and team_id=$2 for update`,
+    [memberId, teamId],
+  );
+  return rows[0]?.role === "admin" && rows[0]?.status === "active";
+}
+
 async function assertLiveAdminConnection(
   row: AuthorityRow,
   input: { teamId: string; memberId: string; generation?: number; credentialRevision?: number },
 ): Promise<void> {
-  const { rows } = await runSql<{ role: string; status: string }>(
-    `select role,status from members where id=$1 and team_id=$2 for update`,
-    [input.memberId, input.teamId],
-  );
-  const current = rows[0]?.role === "admin" && rows[0]?.status === "active"
+  const current = await lockActiveTeamAdmin(input.teamId, input.memberId)
     && row.status === "enabled"
     && (input.generation === undefined || Number(row.generation) === input.generation)
     && (input.credentialRevision === undefined
@@ -345,11 +394,7 @@ export async function provisionGdriveConnectorPrincipal(input: {
     // bookkeeping trigger is re-entrant under this application-owned boundary.
     await lockIdentityMutationAuthorities([input.teamId]);
     const row = await lockedAuthority(input.integrationId, input.teamId);
-    const { rows: actorRows } = await runSql<{ role: string; status: string }>(
-      `select role,status from members where id=$1 and team_id=$2 for update`,
-      [input.actorMemberId, input.teamId],
-    );
-    if (actorRows[0]?.status !== "active" || actorRows[0]?.role !== "admin") {
+    if (!await lockActiveTeamAdmin(input.teamId, input.actorMemberId)) {
       throw new GdriveAuthorityError("connector_principal_required", "active team Admin authorization is required", 403);
     }
     const db = adminClient();
@@ -468,11 +513,12 @@ async function assertLockedExecution(auth: ApiAuth, ref: GdriveExecutionRef): Pr
  * Hold integration + authority row locks through an ingest-owner mutation.
  *
  * This is the head of the Drive commit lock order, shared by ingest and source reconciliation:
- * connection authority, then the COMPLETE project set (audience plus `scope.projects`), then
- * whatever `fn` takes (provider and path identities, item-attribution advisories, item rows,
- * dependent rows). No project row is acquired or strengthened inside `fn`. A caller that validates
- * an identity revision does so before entering. Both waits here are bounded; past the bound
- * PostgreSQL raises 55P03 and the commit fails without retry.
+ * identity authority and connection authority (`lockedAuthority`), then the bound principal, then
+ * the COMPLETE project set (audience plus `scope.projects`), then whatever `fn` takes (provider and
+ * path identities, item-attribution advisories, item rows, dependent rows). No project row is
+ * acquired or strengthened inside `fn`. A caller that validates an identity revision does so before
+ * entering, and already holds the identity authority when it does. Every wait here is bounded; past
+ * the bound PostgreSQL raises 55P03 and the commit fails without retry.
  */
 export async function withGdriveExecutionCommit<T>(
   auth: ApiAuth,
