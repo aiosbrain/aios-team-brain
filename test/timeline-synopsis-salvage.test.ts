@@ -45,7 +45,7 @@ describe("salvageSummaries — a sentence about a day outlives the shape that he
     // The whole point: every other reader rejects a version mismatch, and that rejection is what
     // was deleting the synopsis on each deploy. This version is foreign AND above the content floor
     // (a row written by a newer build, then rolled back onto this one).
-    const got = salvageSummaries(payload(PAYLOAD_VERSION + 1, [{ memberId: "m1", summary: "Shipped X." }]), NOW - 1000, NOW, G);
+    const got = salvageSummaries(payload(PAYLOAD_VERSION + 1, [{ memberId: "m1", summary: "Shipped X." }]), NOW - 1000, NOW, G, ITEMS);
     expect(got.get("2026-07-27|m1")).toBe("Shipped X.");
   });
 
@@ -57,7 +57,8 @@ describe("salvageSummaries — a sentence about a day outlives the shape that he
       ]),
       NOW - 1000,
       NOW,
-      G
+      G,
+      ITEMS
     );
     expect(got.get("2026-07-27|m1")).toBe("Alice's day.");
     expect(got.get("2026-07-27|m2")).toBe("Bob's day.");
@@ -67,7 +68,7 @@ describe("salvageSummaries — a sentence about a day outlives the shape that he
   it("refuses an ancient row — a salvaged sentence is a bridge, not an archive", () => {
     // The foreign version is deliberately ABOVE the content floor so AGE is the only thing under test. With a
     // pre-floor version here this would go green for the wrong reason and stop testing age at all.
-    const old = salvageSummaries(payload(PAYLOAD_VERSION + 1, [{ memberId: "m1", summary: "Last week." }]), NOW - 8 * 24 * 3600_000, NOW, G);
+    const old = salvageSummaries(payload(PAYLOAD_VERSION + 1, [{ memberId: "m1", summary: "Last week." }]), NOW - 8 * 24 * 3600_000, NOW, G, ITEMS);
     expect(old.size).toBe(0);
   });
 
@@ -75,35 +76,51 @@ describe("salvageSummaries — a sentence about a day outlives the shape that he
     // The new contribution-day and attribution contract invalidates older sentences even if the
     // stored person/day key happens to match the rebuilt one. v17 is where that contract integrated
     // with TIERRET-1's v16, so the floor moved with it (v15 was reserved for it and never shipped).
-    const stale = salvageSummaries(payload(PAYLOAD_VERSION - 1, [{ memberId: "m1", summary: "Shared two sizzle reels." }]), NOW - 1000, NOW, G);
+    const stale = salvageSummaries(payload(PAYLOAD_VERSION - 1, [{ memberId: "m1", summary: "Shared two sizzle reels." }]), NOW - 1000, NOW, G, ITEMS);
     expect(stale.size).toBe(0);
     // …and the floor is a floor, not an equality check: the CURRENT version still salvages.
-    const current = salvageSummaries(payload(PAYLOAD_VERSION, [{ memberId: "m1", summary: "Reviewed the rollout." }]), NOW - 1000, NOW, G);
+    const current = salvageSummaries(payload(PAYLOAD_VERSION, [{ memberId: "m1", summary: "Reviewed the rollout." }]), NOW - 1000, NOW, G, ITEMS);
     expect(current.get("2026-07-27|m1")).toBe("Reviewed the rollout.");
   });
 
   it("refuses a payload with no readable version — unprovable prose is not carried", () => {
-    const noVersion = salvageSummaries({ days: [{ date: "2026-07-27", people: [{ memberId: "m1", summary: "?" }] }] }, NOW - 1000, NOW, G);
+    const noVersion = salvageSummaries({ days: [{ date: "2026-07-27", people: [{ memberId: "m1", summary: "?" }] }] }, NOW - 1000, NOW, G, ITEMS);
     expect(noVersion.size).toBe(0);
   });
 
   it("survives junk instead of throwing — a lost synopsis must never fail the panel", () => {
     for (const junk of [null, undefined, {}, { days: "nope" }, { days: [{ people: 3 }] }, { days: [{ date: 1 }] }, { v: NaN, days: [{ date: "2026-07-27", people: [{ memberId: "m1", summary: "x" }] }] }]) {
-      expect(salvageSummaries(junk, NOW - 1000, NOW, G).size).toBe(0);
+      expect(salvageSummaries(junk, NOW - 1000, NOW, G, ITEMS).size).toBe(0);
     }
     // A person-day with no summary contributes nothing rather than an empty string. The foreign version is
     // ABOVE the content floor on purpose: at a pre-floor version the gate rejects the payload first and
     // these two go green without ever reaching the empty-summary check they exist to cover.
-    expect(salvageSummaries(payload(PAYLOAD_VERSION + 1, [{ memberId: "m1" }]), NOW - 1000, NOW, G).size).toBe(0);
-    expect(salvageSummaries(payload(PAYLOAD_VERSION + 1, [{ memberId: "m1", summary: "" }]), NOW - 1000, NOW, G).size).toBe(0);
+    expect(salvageSummaries(payload(PAYLOAD_VERSION + 1, [{ memberId: "m1" }]), NOW - 1000, NOW, G, ITEMS).size).toBe(0);
+    expect(salvageSummaries(payload(PAYLOAD_VERSION + 1, [{ memberId: "m1", summary: "" }]), NOW - 1000, NOW, G, ITEMS).size).toBe(0);
   });
 
   it("refuses unstamped and changed data, identity or presentation revisions", () => {
     const stamped = payload(PAYLOAD_VERSION, [{ memberId: "m1", summary: "Old claim." }]);
-    expect(salvageSummaries({ ...stamped, generations: undefined }, NOW - 1000, NOW, G).size).toBe(0);
+    expect(salvageSummaries({ ...stamped, generations: undefined }, NOW - 1000, NOW, G, ITEMS).size).toBe(0);
     for (const field of ["dataGeneration", "identityGeneration", "presentationGeneration"] as const) {
-      expect(salvageSummaries(stamped, NOW - 1000, NOW, { ...G, [field]: "1" }).size).toBe(0);
+      expect(salvageSummaries(stamped, NOW - 1000, NOW, { ...G, [field]: "1" }, ITEMS).size).toBe(0);
     }
+    // The control: the SAME payload, generations and fingerprint all matching, does salvage — so
+    // each refusal above is the generation's doing.
+    expect(salvageSummaries(stamped, NOW - 1000, NOW, G, ITEMS).size).toBe(1);
+  });
+
+  // AIO-1170 pre-activation correction PA-4 (closing review finding P1-02). The item fingerprint
+  // used to be an OPTIONAL trailing argument, so a caller that left it off salvaged prose with no
+  // access check at all. Every other call in this file was changed on purpose to pass it.
+  it("salvages NOTHING when no item fingerprint is supplied — the gate is required, not optional", () => {
+    const stamped = payload(PAYLOAD_VERSION, [{ memberId: "m1", summary: "Unchecked claim." }]);
+    const unchecked = salvageSummaries as unknown as (...args: unknown[]) => Map<string, string>;
+    expect(unchecked(stamped, NOW - 1000, NOW, G).size).toBe(0);
+    expect(unchecked(stamped, NOW - 1000, NOW, G, undefined).size).toBe(0);
+    expect(unchecked(stamped, NOW - 1000, NOW, G, "").size).toBe(0);
+    // …and with the fingerprint the row was stamped with, the same call salvages.
+    expect(unchecked(stamped, NOW - 1000, NOW, G, ITEMS).size).toBe(1);
   });
 
   it("refuses a synopsis after same-project-set item visibility changes", () => {
