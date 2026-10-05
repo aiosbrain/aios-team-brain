@@ -222,9 +222,10 @@ export interface ReattributeOptions {
  * transaction. `busy`, a deferred deadline and a healthy partial batch write no failure state.
  *
  * By itself a turn only CONTINUES durable work: a revision it finds complete, or already scanned,
- * is left exactly as it is. With `request` the first transaction reopens such a revision before the
- * snapshot is read, so the scan that follows is a scan of durably pending work like any other —
- * a complete revision is never scanned as complete.
+ * is left exactly as it is. With `request` a transaction of its own, before those two, reopens such
+ * a revision and commits, so the scan that follows is a scan of durably pending work like any
+ * other — a complete revision is never scanned as complete, and the request outlives a failure of
+ * anything that comes after it.
  */
 export async function takeRepairScanTurn(
   db: DbClient,
@@ -235,13 +236,27 @@ export async function takeRepairScanTurn(
   const nothing = (turn: RepairTurn, revision: number, partial: boolean): ReattributeSummary => ({
     scanned:0,updated:0,versionsUpdated:0,contributionsUpdated:0,revision,partial,turn,
   });
+  if (opts.request) {
+    // THE REQUEST IS ITS OWN COMMIT. It is taken under the turn, like everything else here, and it
+    // is durable before the snapshot is even attempted — because the snapshot is a strict read
+    // that can fail, and a request that shared its transaction would be rolled back with it: the
+    // row would then be marked `retry` still carrying the finished scan's cursor, and the retry
+    // would scan nothing, finalize, and lift the fence over rows nobody revisited. Committed
+    // first, a failure anywhere after it — or a crash — leaves pending work that starts from the
+    // beginning, which the scheduler finds like any other. A failure of the request itself
+    // enqueued nothing and records nothing: it is simply reported.
+    const requested=await withTransaction(async () => {
+      if (!await tryLockAttributionRepairTurn(teamId)) return false;
+      await reopenIdentityRepair(teamId);
+      return true;
+    });
+    if (!requested) return nothing("busy",0,true);
+  }
   let nominated: IdentityAuthoritySnapshot | null;
   try {
-    nominated=await withTransaction(async () => {
-      if (!await tryLockAttributionRepairTurn(teamId)) return null;
-      if (opts.request) await reopenIdentityRepair(teamId);
-      return buildIdentityAuthoritySnapshot(db,teamId);
-    });
+    nominated=await withTransaction(async () => (
+      await tryLockAttributionRepairTurn(teamId) ? buildIdentityAuthoritySnapshot(db,teamId) : null
+    ));
   } catch (error) {
     await markCurrentIdentityRepairRetry(teamId,error).catch(()=>{});
     throw error;

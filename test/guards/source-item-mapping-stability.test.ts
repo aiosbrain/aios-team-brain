@@ -126,7 +126,7 @@ describe("source_item_mappings: a mapping never leaves its item", () => {
     const shared = readFileSync(join(ROOT, "lib", "ingest", "repair-eligibility.ts"), "utf8");
     // Both rules are built on that one predicate; neither restates the mapping.
     expect(shared).toMatch(/COMMON_REPAIR_ELIGIBLE = `\(i\.access::text <> 'external' or \$\{DRIVE_MAPPING\}\)`/);
-    expect(shared).toMatch(/DRIVE_OBLIGATION_PROVENANCE = `\(i\.frontmatter->>'source' = 'gdrive' and \$\{DRIVE_MAPPING\}\)`/);
+    expect(shared).toMatch(/DRIVE_OBLIGATION_PROVENANCE = `\(coalesce\(i\.frontmatter->>'source', ''\) = 'gdrive' and \$\{DRIVE_MAPPING\}\)`/);
 
     const common = readFileSync(join(ROOT, "lib", "ingest", "reattribute.ts"), "utf8");
     expect(common).toContain("${COMMON_REPAIR_ELIGIBLE}");

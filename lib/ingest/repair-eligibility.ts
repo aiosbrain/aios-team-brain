@@ -48,8 +48,13 @@ export const COMMON_REPAIR_ELIGIBLE = `(i.access::text <> 'external' or ${DRIVE_
  * it). Either alone is not enough — source evidence without a mapping is exactly what a pusher can
  * forge, and a mapped row whose current content is no longer Drive-sourced has no Drive credit for
  * this obligation to decide.
+ *
+ * The rule is TWO-VALUED. A row whose `source` is absent, or JSON null, is simply not Drive-sourced
+ * now: that is a definite `false` — an ineligible row the drain scans past — and must not surface
+ * as SQL NULL, which the reader below reserves for "the read did not answer" and treats as a
+ * failure. Hence the coalesce: only a read that actually failed, or answered nothing, fails closed.
  */
-export const DRIVE_OBLIGATION_PROVENANCE = `(i.frontmatter->>'source' = 'gdrive' and ${DRIVE_MAPPING})`;
+export const DRIVE_OBLIGATION_PROVENANCE = `(coalesce(i.frontmatter->>'source', '') = 'gdrive' and ${DRIVE_MAPPING})`;
 
 /**
  * One fail-closed predicate read over an item the caller has ALREADY locked. Issued as a statement

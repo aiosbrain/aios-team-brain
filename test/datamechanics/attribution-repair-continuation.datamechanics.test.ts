@@ -119,7 +119,7 @@ const fenced = (seed: Seed) => authorizationEpoch(db(), seed.teamId)
  */
 function bootedScheduler(batchSize?: number) {
   return createAttributionRepairLoop({
-    discover: (limit, skip) => discoverPendingAttributionRepairs(limit, { skip }),
+    discover: (limit, exclude) => discoverPendingAttributionRepairs(limit, { exclude }),
     runTurn: (team) => runScheduledAttributionRepairTurn(db(), team, { batchSize }),
   });
 }
@@ -158,6 +158,36 @@ function failingBuilder(table: string, operation: "upsert" | "delete", message: 
             return key === operation ? () => answer : Reflect.get(inner, key, innerReceiver);
           },
         });
+      };
+    },
+  }) as DbClient;
+}
+
+/** Inject one supporting-read failure while leaving writes backed by the real Postgres client. */
+function failingSelect(table: string, message: string): DbClient {
+  const real = db();
+  const injected = { data: null, error: { message } };
+  return new Proxy(real as object, {
+    get(target, prop, recv) {
+      if (prop !== "from") return Reflect.get(target, prop, recv);
+      return (name: string) => {
+        const query = (target as { from: (n: string) => unknown }).from(name);
+        if (name !== table) return query;
+        const wrap = (builder: object): unknown => new Proxy(builder, {
+          get(inner, key, receiver) {
+            if (key === "then") return (resolve: (value: unknown) => unknown) => resolve(injected);
+            const value = Reflect.get(inner, key, receiver);
+            if (typeof value !== "function") return value;
+            return (...args: unknown[]) => {
+              const result = (value as (...params: unknown[]) => unknown).apply(inner, args);
+              if (key === "single" || key === "maybeSingle") {
+                return { then: (resolve: (value: unknown) => unknown) => resolve(injected) };
+              }
+              return result === inner ? receiver : wrap(result as object);
+            };
+          },
+        });
+        return wrap(query as object);
       };
     },
   }) as DbClient;
@@ -210,13 +240,18 @@ describe("AIO-1167 attribution repair continues promptly from durable state (rea
     const untouched = await authority(empty);
     expect(untouched).toMatchObject({ repair_status: "complete", items_scanned: 0, attempts: 0 });
     expect(await fenced(empty)).toBe(false);
-    // The durable queue, as the scheduler pages it: one stable order, and the page after a capped
-    // one starts where it ended — no team is on both, none is on neither.
+    // The durable queue, as the scheduler reads it: one stable order, capped, and a team is left
+    // out of a page only by NAME — the rest keep their order and nobody else moves.
     const queue = (await discoverPendingAttributionRepairs(20)).map((team) => team.teamId);
     expect([...queue].sort()).toEqual([large.teamId, small.teamId, tiny.teamId].sort());
     const firstPage = (await discoverPendingAttributionRepairs(2)).map((team) => team.teamId);
-    const secondPage = (await discoverPendingAttributionRepairs(2, { skip: 2 })).map((team) => team.teamId);
-    expect([...firstPage, ...secondPage]).toEqual(queue);
+    expect(firstPage).toEqual(queue.slice(0, 2));
+    expect((await discoverPendingAttributionRepairs(2, { exclude: firstPage })).map((team) => team.teamId))
+      .toEqual(queue.slice(2));
+    expect((await discoverPendingAttributionRepairs(20, { exclude: [queue[0]] })).map((team) => team.teamId))
+      .toEqual(queue.slice(1));
+    expect((await discoverPendingAttributionRepairs(20, { exclude: [empty.teamId] })).map((team) => team.teamId))
+      .toEqual(queue);
 
     const scheduler = bootedScheduler(5);
     // Round 1: every pending team gets exactly one turn. `large` commits 5 of 12; the others finish
@@ -712,6 +747,165 @@ describe("AIO-1167 attribution repair continues promptly from durable state (rea
     expect(await authority(seed)).toMatchObject({ repair_status: "awaiting_cache", items_scanned: 12, items_updated: 0 });
     expect(await repairAttributionNow(db(), seed.teamId, seed.teamSlug)).toMatchObject({ status: "complete" });
   }, 60_000);
+
+  it("REQUEST + SNAPSHOT FAILURE: the full-rescan request survives its own first read failing — the scheduler alone revisits every row before the fence lifts", async () => {
+    const seed = await seedTeam();
+    const alice = await member(seed, "Alice");
+    const author = authorAddress();
+    await storedItems(seed, 12, author);
+    await addAuthorAlias(db(), seed.teamId, alice.id, author);
+    expect(await repairAttributionNow(db(), seed.teamId, seed.teamSlug, { batchSize: 5 }))
+      .toMatchObject({ status: "complete", scanned: 12 });
+    // The premise of the defect: a completed revision keeps the finished scan's cursor — the LAST row.
+    const { rows: last } = await getPool().query<{ id: string }>(
+      "select id from items where team_id=$1 order by id desc limit 1", [seed.teamId]);
+    const completed = await authority(seed);
+    expect(completed).toMatchObject({ repair_status: "complete", cursor_item_id: last[0].id, items_scanned: 12 });
+
+    // A legacy mismatch: stored credit that is wrong under the CURRENT mappings, with no mapping
+    // change to say so. The revision is unchanged and still complete.
+    await getPool().query(
+      `update items set member_id=$2
+        where id in (select id from items where team_id=$1 order by id limit 7)`, [seed.teamId, seed.memberId]);
+    expect(await authority(seed)).toEqual(completed);
+    expect(await credited(seed, alice.id)).toBe(5);
+
+    // The manual request, whose very first strict snapshot read fails.
+    await expect(repairAttributionNow(
+      failingSelect("members", "roster read unavailable"), seed.teamId, seed.teamSlug, { request: true, batchSize: 5 },
+    )).rejects.toThrow(/unavailable/);
+    // The failure is recorded — ON TOP OF the request, not instead of it. The row is in retry at the
+    // same revision with the cursor CLEARED: were it still the finished scan's, the retry would
+    // scan nothing, finalize, and lift the fence over the seven rows nobody revisited.
+    expect(await authority(seed)).toMatchObject({
+      repair_status: "retry", revision: completed.revision, cursor_item_id: null,
+      items_scanned: 0, items_updated: 0, attempts: 1, last_error: expect.stringContaining("unavailable"),
+    });
+    expect(await fenced(seed)).toBe(true);
+    expect(await credited(seed, alice.id)).toBe(5);
+    await holdDeadline(seed);
+    expect(await authority(seed)).toMatchObject({ repair_status: "retry", deferred: true });
+
+    // From here ONLY the scheduler acts — no request, no hook, no kick. In backoff it leaves the
+    // team alone; once due it revisits every row, and completes only after the last of them.
+    const scheduler = bootedScheduler(5);
+    expect(await scheduler.runRound()).toEqual(round({}));
+    await passDeadline(seed);
+    const seen: [string, number, number][] = [];
+    while (seen.length < 10) {
+      const summary = await scheduler.runRound();
+      const now = await authority(seed);
+      seen.push([now.repair_status, now.items_scanned, await credited(seed, alice.id)]);
+      if (now.repair_status === "complete") break;
+      expect(summary).toEqual(round({ attempted: 1, continuing: 1 }));
+      expect(await fenced(seed)).toBe(true);
+    }
+    // Status, rows revisited, rows correct — batch by batch. The 7 wrong rows are the first 7 by id.
+    expect(seen).toEqual([
+      ["running", 5, 10], ["running", 10, 12], ["awaiting_cache", 12, 12], ["complete", 12, 12],
+    ]);
+    expect(await authority(seed)).toMatchObject({
+      repair_status: "complete", revision: completed.revision, items_scanned: 12, items_updated: 7,
+      attempts: 1, last_error: null, deferred: false,
+    });
+    expect(await credited(seed, seed.memberId)).toBe(0);
+    expect(await fenced(seed)).toBe(false);
+  }, 60_000);
+
+  it("REQUEST during RETRY: a failed finalization leaves the cursor at the END of a finished scan — a request starts over instead of trusting it", async () => {
+    const seed = await seedTeam();
+    const alice = await member(seed, "Alice");
+    const author = authorAddress();
+    await storedItems(seed, 12, author);
+    await addAuthorAlias(db(), seed.teamId, alice.id, author);
+    // The scan finishes and its finalization fails: `retry`, with every row already behind the cursor.
+    await expect(repairAttributionNow(
+      failingBuilder("work_timeline_cache", "delete", "injected purge outage"), seed.teamId, seed.teamSlug, { batchSize: 50 },
+    )).rejects.toThrow(/injected purge outage/);
+    const { rows: last } = await getPool().query<{ id: string }>(
+      "select id from items where team_id=$1 order by id desc limit 1", [seed.teamId]);
+    const failed = await authority(seed);
+    expect(failed).toMatchObject({ repair_status: "retry", cursor_item_id: last[0].id, items_scanned: 12, attempts: 1 });
+    expect(await credited(seed, alice.id)).toBe(12);
+
+    // Rows go wrong while it waits (no mapping change), and the operator asks for a repair.
+    await getPool().query(
+      `update items set member_id=$2
+        where id in (select id from items where team_id=$1 order by id limit 7)`, [seed.teamId, seed.memberId]);
+    const outcome = await repairAttributionNow(db(), seed.teamId, seed.teamSlug, { request: true, batchSize: 5 });
+    // Every row was revisited — from the first — before the revision completed; the backoff did
+    // not hold an explicit request, and the request cleared the failure it superseded.
+    expect(outcome).toMatchObject({ status: "complete", scanned: 12, updated: 7, revision: failed.revision });
+    expect(await authority(seed)).toMatchObject({
+      repair_status: "complete", revision: failed.revision, items_scanned: 12, items_updated: 7,
+      attempts: 0, last_error: null, deferred: false,
+    });
+    expect(await credited(seed, alice.id)).toBe(12);
+    expect(await fenced(seed)).toBe(false);
+  }, 60_000);
+
+  it("CAPPED + FAILURE on the real queue: a team that leaves it for its backoff does not push a small healthy team out of the next page", async () => {
+    // Four pending teams in a known durable order (each made pending in turn by its own alias
+    // write): `failing` first, then a large repair, a one-row repair, and another large one. With a
+    // cap of two, round one is `failing` + `largeOne`. A positional skip of one — for the team that
+    // failed — would then drop whoever is first once that team is in backoff: `small`.
+    const seeds: Record<"failing" | "largeOne" | "small" | "largeTwo", Seed> = {
+      failing: await seedTeam(), largeOne: await seedTeam(), small: await seedTeam(), largeTwo: await seedTeam(),
+    };
+    const sizes = { failing: 2, largeOne: 12, small: 1, largeTwo: 12 } as const;
+    const owners: Record<string, string> = {};
+    for (const name of ["failing", "largeOne", "small", "largeTwo"] as const) {
+      const owner = await member(seeds[name], "Owner");
+      const author = authorAddress();
+      await storedItems(seeds[name], sizes[name], author);
+      owners[name] = owner.id;
+      expect(await addAuthorAlias(db(), seeds[name].teamId, owner.id, author)).toMatchObject({ aliased: true });
+    }
+    expect((await discoverPendingAttributionRepairs(20)).map((team) => team.teamId))
+      .toEqual([seeds.failing.teamId, seeds.largeOne.teamId, seeds.small.teamId, seeds.largeTwo.teamId]);
+
+    const turns: string[] = [];
+    const nameOf = (teamId: string) => Object.entries(seeds).find(([, seed]) => seed.teamId === teamId)![0];
+    const scheduler = createAttributionRepairLoop({
+      teamsPerRound: 2,
+      discover: (limit, exclude) => discoverPendingAttributionRepairs(limit, { exclude }),
+      runTurn: (team) => {
+        turns.push(nameOf(team.teamId));
+        // `failing`'s strict snapshot read fails: a real failed turn, with its durable retry state.
+        const client = team.teamId === seeds.failing.teamId ? failingSelect("members", "roster read unavailable") : db();
+        return runScheduledAttributionRepairTurn(client, team, { batchSize: 5 });
+      },
+    });
+
+    expect(await scheduler.runRound()).toEqual(round({ attempted: 2, continuing: 1, failed: 1, capped: true }));
+    expect(turns).toEqual(["failing", "largeOne"]);
+    expect(await authority(seeds.failing)).toMatchObject({ repair_status: "retry", attempts: 1, items_scanned: 0 });
+    await holdDeadline(seeds.failing); // in backoff for the rest of this test, whatever the machine's speed
+
+    // Round two is exactly the two teams that have not had a turn — and `small` finishes its scan.
+    expect(await scheduler.runRound()).toEqual(round({ attempted: 2, continuing: 2, capped: true }));
+    expect(turns.slice(2)).toEqual(["small", "largeTwo"]);
+    expect(await authority(seeds.small)).toMatchObject({ repair_status: "awaiting_cache", items_scanned: 1, items_updated: 1 });
+
+    // And it is finalized in the very next round, while both large repairs are still mid-scan.
+    await scheduler.runRound();
+    expect(await authority(seeds.small)).toMatchObject({ repair_status: "complete" });
+    expect(await fenced(seeds.small)).toBe(false);
+    expect(await credited(seeds.small, owners.small)).toBe(1);
+    expect(await authority(seeds.largeOne)).toMatchObject({ repair_status: "running" });
+    expect(await authority(seeds.largeTwo)).toMatchObject({ repair_status: "running" });
+
+    const rounds = await runUntilIdle(scheduler);
+    expect(rounds.reduce((n, summary) => n + summary.failed + summary.busy + summary.deferred, 0)).toBe(0);
+    for (const name of ["largeOne", "small", "largeTwo"] as const) {
+      expect(await authority(seeds[name])).toMatchObject({ repair_status: "complete", items_scanned: sizes[name], attempts: 0 });
+      expect(await credited(seeds[name], owners[name])).toBe(sizes[name]);
+    }
+    // The failed team was tried once and is exactly where its failure left it: durable, in backoff.
+    expect(turns.filter((name) => name === "failing")).toHaveLength(1);
+    expect(await authority(seeds.failing)).toMatchObject({ repair_status: "retry", attempts: 1, items_scanned: 0, deferred: true });
+    expect(await fenced(seeds.failing)).toBe(true);
+  }, 90_000);
 
   it("BEYOND THE OLD 5,000-ITEM CALLBACK BUDGET: the Admin hook hands over at its budget and the production scheduler converges the rest", async () => {
     const TOTAL = 5_200;

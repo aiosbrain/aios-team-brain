@@ -7,9 +7,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  * Spec. A `gdrive` identity obligation rewrites retained Drive credit. It may touch an item only
  * when that item IS a Drive document:
  *
- *     i.frontmatter->>'source' = 'gdrive'
+ *     COALESCE(i.frontmatter->>'source', '') = 'gdrive'
  *       AND EXISTS (SELECT 1 FROM source_item_mappings m
  *                    WHERE m.team_id = i.team_id AND m.item_id = i.id AND m.source = 'gdrive')
+ *
+ *   The rule is two-valued: a row with no `source`, or a JSON-null one, is not a Drive document —
+ *   a definite false, scanned past — and never the SQL NULL that the reader treats as a failed read.
  *
  *   1. That rule bounds candidate NOMINATION, together with the existing author and cursor bounds.
  *   2. It is applied AGAIN per item, by a statement of its own issued after the item-attribution
@@ -92,7 +95,7 @@ const MAPPING_REVISION = 3;
 const MAPPING = "exists ( select 1 from source_item_mappings m "
   + "where m.team_id = i.team_id and m.item_id = i.id and m.source = 'gdrive')";
 /** The accepted obligation rule, exactly, as one normalized SQL fragment over `items i`. */
-const RULE = `(i.frontmatter->>'source' = 'gdrive' and ${MAPPING})`;
+const RULE = `(coalesce(i.frontmatter->>'source', '') = 'gdrive' and ${MAPPING})`;
 
 const advisoryKey = (e: Entry) => (e.sql.includes("pg_advisory_xact_lock(hashtextextended(") ? String(e.params[0]) : "");
 const isAttributionLock = (e: Entry) => advisoryKey(e) === `${TEAM}:item:${ITEM}`;
@@ -270,5 +273,22 @@ describe("the two rules share one mapping reader and stay distinct", () => {
     expect(common.sql).toBe(`select (i.access::text <> 'external' or ${MAPPING}) as eligible from items i where i.team_id=$1 and i.id=$2`);
     // Frontmatter source is part of the OBLIGATION rule only; it never widens the common one.
     expect(common.sql).not.toContain("frontmatter");
+  });
+
+  it("the obligation rule cannot answer NULL for a missing source: absence is false, and only a read that did not answer fails", async () => {
+    // Every operand is two-valued — the coalesced comparison and EXISTS — so the conjunction is.
+    const c = use([{ drive_provenance: false }]);
+    await withTransaction(async () => {
+      await expect(readDriveObligationProvenance(TEAM, ITEM)).resolves.toBe(false);
+    });
+    const [read] = c.log.filter((e) => e.sql.startsWith("select ("));
+    expect(read.sql).toContain("coalesce(i.frontmatter->>'source', '') = 'gdrive'");
+    // No bare three-valued comparison of the source survives anywhere in the rule.
+    expect(read.sql.replace("coalesce(i.frontmatter->>'source', '') = 'gdrive'", "")).not.toContain("frontmatter");
+    // The reader's own guard is unchanged: a NULL or absent ANSWER is still a failed read.
+    use([{ drive_provenance: null }]);
+    await withTransaction(async () => {
+      await expect(readDriveObligationProvenance(TEAM, ITEM)).rejects.toThrow(/could not be read/);
+    });
   });
 });
