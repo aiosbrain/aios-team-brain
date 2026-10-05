@@ -1207,7 +1207,7 @@ export function checkServerActionAuth(view: ActionRepoView, policy: ServerAction
 }
 
 // ---------------------------------------------------------------------------------------------
-// Owner registrations (the accepted AIO-1217 owner table; action rows are a later, separate batch)
+// Owner registrations (the accepted AIO-1217 owner table)
 // ---------------------------------------------------------------------------------------------
 
 const asyncOwner = (module: string, exportName: string, owner: string, reason: string, coGuardOnly = false) =>
@@ -1318,3 +1318,168 @@ export const SERVER_ACTION_OWNERS = {
 } as const satisfies Record<string, OwnerRegistration>;
 
 export type ServerActionOwnerName = keyof typeof SERVER_ACTION_OWNERS;
+
+// ---------------------------------------------------------------------------------------------
+// Production authority registry (keys, classification, owner sets — evidence rows are a later batch)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The AUTHORITY slice of one production registry row: its `(path, export)` key, its classification
+ * and the exact set of registered owners the export must invoke. It stops there on purpose. The
+ * refusal, protected effects, client-ID binding and executing evidence that complete a
+ * `ProtectedAction` or `ProtocolException` are not recorded, so this list is not a
+ * `ServerActionPolicy`, never satisfies `checkServerActionAuth`, and says nothing about what an
+ * action refuses. Inline role/posture co-checks (a lead/admin role arm, `tier === "team"`) have no
+ * imported owner and so do not appear in `owners`.
+ */
+export interface ActionAuthority {
+  path: string;
+  exportName: string;
+  kind: "protected" | "protocol";
+  owners: readonly ServerActionOwnerName[];
+  /** Exact credited call-site counts, pinned where an owner is deliberately invoked more than once. */
+  callSites?: Readonly<Partial<Record<ServerActionOwnerName, number>>>;
+  /** `protocol` only: why the export may run without an identity. */
+  reason?: string;
+}
+
+const protectedBy = (
+  path: string,
+  owners: readonly ServerActionOwnerName[],
+  exportNames: readonly string[],
+  callSites?: ActionAuthority["callSites"],
+): ActionAuthority[] =>
+  exportNames.map(
+    (exportName): ActionAuthority => ({ path, exportName, kind: "protected", owners, ...(callSites ? { callSites } : {}) }),
+  );
+
+// Owner sets named after the accepted spec's guard codes, where a code maps to exactly one set.
+const ADM = ["requireTeamAdmin"] as const;
+const MEM = ["currentMember"] as const;
+const SELF = ["getSessionUser"] as const;
+const PEOPLE = ["currentMember", "canEditMemberContext"] as const;
+const WRITER = ["currentMember", "canWriteStructuredRow"] as const;
+const PROJECT = ["currentMember", "canSeeProjectRow"] as const;
+const NOTE = ["currentMember", "canSeeMeetingNotes", "getMeetingNote"] as const;
+const CHAIN = ["requireTeamAdmin", "visibleItemIds", "actorSeesChain"] as const;
+
+/**
+ * Every runtime export of every current `"use server"` module, grouped by module in discovery
+ * (path) order. `server-action-auth.test.ts` reconciles it against the real tree: the key set must
+ * equal the discovered exports, each owner set must equal what the analyzer credits, and the one
+ * `protocol` row must be the only export that completes no call to an authenticating owner.
+ */
+export const SERVER_ACTION_AUTHORITY: readonly ActionAuthority[] = [
+  ...protectedBy("app/actions/account.ts", SELF, ["changeMyPassword"]),
+  {
+    path: "app/actions/account.ts",
+    exportName: "signOutAction",
+    kind: "protocol",
+    owners: ["signOut"],
+    reason: "Deliberate public own-cookie protocol: it clears only the caller's browser session, so it cannot require an identity.",
+  },
+  ...protectedBy("app/actions/decisions.ts", PROJECT, ["createDecisionAction"]),
+  ...protectedBy("app/actions/decisions.ts", WRITER, ["setDecisionValidityAction"]),
+  ...protectedBy("app/actions/meeting-todos.ts", ["currentMember", "visibleItemIds"], ["scanMeetingTodosAction"]),
+  ...protectedBy("app/actions/meeting-todos.ts", MEM, ["createMeetingTodosAction"]),
+  ...protectedBy("app/actions/projects.ts", MEM, ["createProjectAction"]),
+  ...protectedBy("app/actions/tasks.ts", WRITER, ["moveTaskAction", "updateTaskAction"]),
+  ...protectedBy("app/actions/tasks.ts", PROJECT, ["createTaskAction"]),
+  ...protectedBy("app/auth/welcome/actions.ts", SELF, ["setInitialPassword"]),
+  ...protectedBy("app/t/[team]/admin/access/actions.ts", ADM, ["runContextBackfillAction"]),
+  ...protectedBy("app/t/[team]/admin/actions.ts", ADM, [
+    "inviteMember",
+    "getProvisioningAvailabilityAction",
+    "issueApiKey",
+    "revokeApiKey",
+  ]),
+  ...protectedBy("app/t/[team]/admin/agents/actions.ts", ["requireTeamAdmin", "visibleProjectRows"], ["mintAgentTokenAction"], {
+    visibleProjectRows: 2,
+  }),
+  ...protectedBy("app/t/[team]/admin/agents/actions.ts", ADM, ["revokeAgentTokenAction"]),
+  ...protectedBy("app/t/[team]/admin/approvals/actions.ts", ADM, ["decideApproval"]),
+  ...protectedBy("app/t/[team]/admin/approvals/actions.ts", ["getSessionUser", "authorizeGatewayAdmin"], [
+    "decideManagedGatewayApproval",
+  ]),
+  ...protectedBy("app/t/[team]/admin/attribution/actions.ts", ADM, [
+    "previewAttributionCorrectionAction",
+    "getMemberItemsAction",
+    "previewCorrectionPlanAction",
+    "applyAttributionCorrectionAction",
+  ]),
+  ...protectedBy("app/t/[team]/admin/brand/actions.ts", ADM, ["saveBrand", "addAsset", "removeAsset"]),
+  ...protectedBy("app/t/[team]/admin/integrations/actions.ts", ADM, [
+    "saveIntegration",
+    "toggleIntegration",
+    "rotateSecret",
+    "syncSlackNow",
+    "syncPlaneNow",
+    "syncLinearNow",
+    "syncGithubNow",
+    "addGithubRepo",
+    "removeGithubRepo",
+    "connectGithubToken",
+    "checkGithubAccess",
+    "estimateGithubImportAction",
+    "saveOpenrouter",
+    "projectToGraphNow",
+    "saveProvisioningSettings",
+    "saveProviderModel",
+    "setAnsweringProvider",
+    "setAnsweringModel",
+    "setExtractionModel",
+    "setExtractionSmallModel",
+    "setReasoningModel",
+    "setEmbeddingModel",
+    "removeIntegration",
+    "setMeetingTaskStatus",
+    "setPrimaryPmProvider",
+  ]),
+  ...protectedBy("app/t/[team]/admin/members/actions.ts", ADM, [
+    "linkMemberGithub",
+    "linkMemberIdentity",
+    "linkMemberSlack",
+    "unlinkMemberIdentity",
+    "addMemberEmail",
+    "reattributeIdentitiesNow",
+    "resetMemberPassword",
+    "setMemberRole",
+    "setMemberManager",
+    "removeMember",
+    "retryProvisioning",
+    "removeMemberEmail",
+  ]),
+  ...protectedBy("app/t/[team]/admin/pm-sync/actions.ts", ADM, ["projectBoardAction", "reconcileDivergenceAction"]),
+  ...protectedBy("app/t/[team]/admin/policies/actions.ts", ADM, ["savePolicy", "togglePolicy", "removePolicy"]),
+  ...protectedBy("app/t/[team]/codebases/[slug]/actions.ts", MEM, ["recordFindingDecision"]),
+  ...protectedBy("app/t/[team]/meetings/actions.ts", ["currentMember", "canSeeMeetingNotes"], ["uploadMeetingNoteAction"]),
+  ...protectedBy("app/t/[team]/meetings/actions.ts", ["currentMember", "canAccessAdmin"], ["importPushedMeetingsAction"]),
+  ...protectedBy("app/t/[team]/meetings/actions.ts", NOTE, ["extractMeetingActionItemsAction"], { getMeetingNote: 2 }),
+  ...protectedBy("app/t/[team]/meetings/actions.ts", NOTE, ["regenerateMeetingSummaryAction", "pushMeetingTasksAction"]),
+  ...protectedBy("app/t/[team]/people/[handle]/actions.ts", PEOPLE, [
+    "saveProfile",
+    "addMemberTimeOff",
+    "deleteMemberTimeOff",
+    "saveMemberGoal",
+    "deleteMemberGoal",
+    "saveAvatar",
+  ]),
+  ...protectedBy("app/t/[team]/people/[handle]/actions.ts", MEM, ["issueMyApiKey", "revokeMyApiKey"]),
+  ...protectedBy("app/t/[team]/social/actions.ts", ["requireTeamAdmin", "visibleItemIds"], ["discoverNow"]),
+  ...protectedBy("app/t/[team]/social/actions.ts", ["requireTeamAdmin", "resolveArcScope"], ["discoverFromArcsNow"]),
+  ...protectedBy("app/t/[team]/social/actions.ts", CHAIN, [
+    "planNow",
+    "submitApproval",
+    "decideContentApproval",
+    "scheduleVariantAction",
+    "cancelPublicationAction",
+    "generateImage",
+  ]),
+  ...protectedBy("app/t/[team]/social/actions.ts", CHAIN, ["generateDrafts"], { visibleItemIds: 2 }),
+  ...protectedBy("app/t/[team]/social/actions.ts", ADM, [
+    "setAutonomyLevel",
+    "connectTypefully",
+    "setDryRun",
+    "refreshAnalytics",
+  ]),
+];

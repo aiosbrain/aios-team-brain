@@ -17,10 +17,12 @@ import {
   ownerModes,
   ownerModuleCensusProblems,
   scanSource,
+  SERVER_ACTION_AUTHORITY,
   SERVER_ACTION_EXCLUSIONS,
   SERVER_ACTION_OWNERS,
   SERVER_ACTION_SOURCE_EXT,
   testCaseTitles,
+  type ActionInventory,
   type ActionRepoView,
   type CompletionMode,
   type ExclusionPolicy,
@@ -37,9 +39,11 @@ import {
  *
  * This file covers the analyzer itself — filesystem discovery, directive forms, export shapes, the
  * admitted and refused invocation/completion syntax, and the policy check over a small synthetic
- * registry — plus the current-source census and owner declarations. The reviewed 96-row production
- * registry and its executing evidence are a separate batch and are listed as `todo` at the end;
- * nothing here stands in for them.
+ * registry — plus the current-source census, the owner declarations, and the production authority
+ * registry's keys, classification and owner sets reconciled against unchanged source. The reviewed
+ * production rows' refusal, effects, client-ID binding and executing evidence — and so
+ * `checkServerActionAuth` over production — are a separate batch and are listed as `todo` at the
+ * end; nothing here stands in for them.
  *
  * Every fixture and mutant runs the REAL checker over in-memory source or an isolated temporary
  * root. Real-source mutants transform a copy of the source; no product file is ever written.
@@ -251,6 +255,142 @@ describe("server-action inventory: the real repository", () => {
     ],
   ])("real-source mutant: %s loses its credit", (_name, path, exportName, from, to, expected) => {
     expect(credit(mutate(realSource(path), from, to), exportName, path)).toEqual(expected);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// The production authority registry
+// ---------------------------------------------------------------------------------------------
+
+type Credited = Record<string, Record<string, number>>;
+
+const rowKey = (registration: { path: string; exportName: string }): string =>
+  `${registration.path} ${registration.exportName}`;
+
+/** `path export` → owner name → credited call sites, for every runtime export the analyzer discovers. */
+function creditedAuthority(inventory: ActionInventory): Credited {
+  const credited: Credited = {};
+  for (const [path, analysis] of inventory.modules)
+    for (const entry of analysis.runtimeExports)
+      credited[`${path} ${entry.name}`] = Object.fromEntries(
+        [...(analysis.invocations.get(entry.name) ?? new Map<string, number>())].map(([identity, count]) => [
+          OWNER_NAME.get(identity) ?? identity,
+          count,
+        ]),
+      );
+  return credited;
+}
+
+const ownerSets = (credited: Credited): Record<string, string[]> =>
+  Object.fromEntries(Object.entries(credited).map(([key, counts]) => [key, Object.keys(counts).sort()]));
+
+/** Owners that establish an identity; every other registration is a co-guard or the protocol call. */
+const AUTHENTICATING = new Set(
+  (Object.entries(SERVER_ACTION_OWNERS) as [string, OwnerRegistration][])
+    .filter(([, owner]) => !owner.coGuardOnly)
+    .map(([name]) => name),
+);
+
+/** Exports the analyzer credits with no completed call to an authenticating owner, in discovery order. */
+const identityFree = (credited: Credited): string[] =>
+  Object.entries(credited)
+    .filter(([, counts]) => !Object.keys(counts).some((name) => AUTHENTICATING.has(name)))
+    .map(([key]) => key);
+
+/** Registry rows whose pinned call-site counts the credited counts do not meet. */
+const unmetPins = (credited: Credited): string[] =>
+  SERVER_ACTION_AUTHORITY.filter((registration) =>
+    Object.entries(registration.callSites ?? {}).some(([name, count]) => credited[rowKey(registration)]?.[name] !== count),
+  ).map(rowKey);
+
+/** The real tree with one source replaced in memory, re-inventoried; no product file is written. */
+const mutantAuthority = (path: string, from: string, to: string): Credited =>
+  creditedAuthority(
+    inventoryServerActions(
+      { ...REAL, sources: new Map(REAL.sources).set(path, mutate(realSource(path), from, to)) },
+      OWNER_MODES,
+    ),
+  );
+
+const REAL_AUTHORITY = creditedAuthority(REAL_INVENTORY);
+const REGISTERED_OWNER_SETS: Record<string, string[]> = Object.fromEntries(
+  SERVER_ACTION_AUTHORITY.map((registration) => [rowKey(registration), [...registration.owners].sort()]),
+);
+const ACCOUNT = "app/actions/account.ts";
+const SIGN_OUT = `${ACCOUNT} signOutAction`;
+const POLICIES = "app/t/[team]/admin/policies/actions.ts";
+const AGENTS = "app/t/[team]/admin/agents/actions.ts";
+const PEOPLE = "app/t/[team]/people/[handle]/actions.ts";
+const PEOPLE_GATED = ["saveProfile", "addMemberTimeOff", "deleteMemberTimeOff", "saveMemberGoal", "deleteMemberGoal", "saveAvatar"].map(
+  (name) => `${PEOPLE} ${name}`,
+);
+
+describe("server-action inventory: the production authority registry (AC-02 keys and owner sets only)", () => {
+  it("registers every discovered runtime export exactly once — none missing, stale or duplicated", () => {
+    const registered = SERVER_ACTION_AUTHORITY.map(rowKey);
+    expect(registered.filter((key, index) => registered.indexOf(key) !== index)).toEqual([]);
+    expect([...registered].sort()).toEqual(Object.keys(REAL_AUTHORITY).sort());
+    expect(registered).toHaveLength(REAL_INVENTORY.census.runtimeExports);
+  });
+
+  it("pins each row's exact owner set, and every call-site pin, to what the analyzer credits on unchanged source", () => {
+    expect(REGISTERED_OWNER_SETS).toEqual(ownerSets(REAL_AUTHORITY));
+    expect(unmetPins(REAL_AUTHORITY)).toEqual([]);
+    expect([...new Set(SERVER_ACTION_AUTHORITY.flatMap((registration) => registration.owners))].sort()).toEqual(
+      Object.keys(SERVER_ACTION_OWNERS).sort(),
+    );
+  });
+
+  it("admits exactly one identity-free export: the own-cookie sign-out protocol exception", () => {
+    expect([...AUTHENTICATING].sort()).toEqual(["currentMember", "getSessionUser", "requireTeamAdmin"]);
+    expect(SERVER_ACTION_AUTHORITY.filter((registration) => registration.kind === "protocol")).toEqual([
+      { path: ACCOUNT, exportName: "signOutAction", kind: "protocol", owners: ["signOut"], reason: expect.stringMatching(/\S/) },
+    ]);
+    expect(identityFree(REAL_AUTHORITY)).toEqual([SIGN_OUT]);
+  });
+
+  // In-memory mutants of unchanged production source: a registry nothing is compared against cannot fail these.
+  it.each<[string, string, string, string, string, string[], string[]]>([
+    [
+      "a new unregistered export",
+      ACCOUNT,
+      "export async function signOutAction(",
+      "export async function extra(): Promise<void> {}\nexport async function signOutAction(",
+      `${ACCOUNT} extra`,
+      [],
+      [`${ACCOUNT} extra`, SIGN_OUT],
+    ],
+    [
+      "a removed admin guard",
+      POLICIES,
+      "const ctx = await requireAdmin(teamSlug);",
+      "const ctx = { teamId: teamSlug, memberId: teamSlug };",
+      `${POLICIES} savePolicy`,
+      [],
+      [SIGN_OUT, `${POLICIES} savePolicy`],
+    ],
+    [
+      "a member guard dropped from a helper, leaving only its co-predicate",
+      PEOPLE,
+      "const me = await currentMember(teamId);",
+      `const me = { id: targetMemberId, role: "member" };`,
+      `${PEOPLE} saveProfile`,
+      ["canEditMemberContext"],
+      [SIGN_OUT, ...PEOPLE_GATED],
+    ],
+    ["the sign-out protocol call removed", ACCOUNT, "  await signOut();\n", "", SIGN_OUT, [], [SIGN_OUT]],
+  ])("real-source mutant: %s no longer reconciles with the registry", (_name, path, from, to, key, owners, free) => {
+    const mutant = mutantAuthority(path, from, to);
+    expect(ownerSets(mutant)[key]).toEqual(owners);
+    expect(REGISTERED_OWNER_SETS[key]).not.toEqual(owners);
+    expect(ownerSets(mutant)).not.toEqual(REGISTERED_OWNER_SETS);
+    expect(identityFree(mutant)).toEqual(free);
+  });
+
+  it("real-source mutant: a dropped pinned principal keeps its owner set but no longer meets its call-site pin", () => {
+    const mutant = mutantAuthority(AGENTS, "visibleProjectRows(db, { teamId: ctx.teamId, memberId: request.memberId }),", "");
+    expect(ownerSets(mutant)).toEqual(REGISTERED_OWNER_SETS);
+    expect(unmetPins(mutant)).toEqual([`${AGENTS} mintAgentTokenAction`]);
   });
 });
 
