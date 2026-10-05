@@ -22,6 +22,7 @@ import {
   releaseSlackChannelForRetry,
   restartSlackChannelScan,
   type SlackChannelClaim,
+  type SlackChannelMetadataAttempt,
   type SlackChannelState,
 } from "@/lib/ingest/slack-channel-state";
 import {
@@ -527,6 +528,18 @@ function readBotsInfo(body: Record<string, unknown>, expectedBotId: string): App
 
 // ── channel metadata ─────────────────────────────────────────────────────────
 
+/**
+ * The metadata hook's one deliberate abort: the channel row was gone when the attempt was to be
+ * opened. TYPED so the call site can end the stage for exactly this and nothing else — every other
+ * failure inside the hook must keep propagating.
+ */
+class SlackChannelGoneAbort extends Error {
+  constructor() {
+    super("slack source discovery: the channel row is gone; no metadata request was sent");
+    this.name = "SlackChannelGoneAbort";
+  }
+}
+
 /** Prove at most ONE due channel public per pass; the shared `conversations.info` budget is 1/min. */
 async function proveChannel(
   pass: Pass,
@@ -557,20 +570,66 @@ async function proveChannel(
 
   const scope = verifiedScope(selection, bound);
   const channelId = target.scope.channelId;
-  if (pass.remaining <= 0) {
-    await request(pass, "metadata", selection, scope, "conversations.info", { channel: channelId });
-    return;
-  }
-  // This short transaction commits the channel's ordering generation BEFORE the HTTP request.
-  // A second integration may have a different app bucket and race this one legitimately.
-  const attempt = await runContextTransaction(pass.input.db, (session) =>
-    beginSlackChannelMetadata(session, target.scope)
-  );
-  if (!attempt) return;
-  const call = await request(pass, "metadata", selection, scope, "conversations.info", {
-    channel: channelId,
+  // ⚠️ RESERVE BEFORE YOU OWN. Opening an attempt is what supersedes the one before it, so it is
+  // opened only for a request that is actually going to be sent: inside the transport's `beforeSend`
+  // hook, which runs after the budget slot is granted and committed and finishes before the request
+  // leaves. Its short transaction still commits the channel's ordering generation BEFORE the HTTP
+  // request — a second integration may have a different app bucket and race this one legitimately —
+  // but a wake the budget refuses now takes nothing, where it used to overtake a real answer that
+  // was still in flight.
+  const opened: { attempt: SlackChannelMetadataAttempt | null } = { attempt: null };
+  const call = await request(
+    pass,
+    "metadata",
+    selection,
+    scope,
+    "conversations.info",
+    { channel: channelId },
+    {
+      beforeSend: async () => {
+        opened.attempt = await runContextTransaction(pass.input.db, (session) =>
+          beginSlackChannelMetadata(session, target.scope)
+        );
+        // The channel row is gone: there is nothing to order an answer by, so nothing is sent.
+        if (opened.attempt === null) throw new SlackChannelGoneAbort();
+      },
+    }
+  ).catch((error: unknown) => {
+    // ONLY the hook's own abort ends the stage quietly, as a missing row always has. Any other
+    // failure in the hook — a SQL error opening the attempt — propagates: nothing is swallowed.
+    if (error instanceof SlackChannelGoneAbort) return null;
+    throw error;
   });
   if (!call) return;
+
+  const attempt = opened.attempt;
+  if (attempt === null) {
+    // The hook never ran, so NO REQUEST WAS SENT: the reservation was deferred or the bucket is
+    // durably blocked. Both are facts about a shared provider allowance and say nothing about this
+    // channel, so nothing is written to it — no owner, no generation, no verdict, no error code. The
+    // step below (and the budget row) is where the refusal stays visible, and the channel stays due.
+    if (call.kind !== "deferred" && call.kind !== "blocked") {
+      // Unreachable while the transport runs the hook before every request it sends. THROWN rather
+      // than reported: an answer with no attempt to order it by must never be applied.
+      throw new Error("slack source discovery: a metadata request was answered without an open attempt");
+    }
+    step(pass, {
+      stage: "metadata",
+      method: "conversations.info",
+      result: call.kind === "deferred" ? "deferred" : "blocked",
+      category: call.category,
+      ...(call.kind === "blocked"
+        ? {
+            detail:
+              "The conversations.info budget for this app is blocked; no request was sent and the " +
+              "channel's stored state was left unchanged.",
+          }
+        : {}),
+      channelId,
+      ...(deadlineIso(call) ? { nextPermittedAt: deadlineIso(call) as string } : {}),
+    });
+    return;
+  }
 
   if (call.kind === "transient" || call.kind === "deferred") {
     // ⚠️ A BLIP IS NOT EVIDENCE. The last valid proof is the best information there is, so nothing
@@ -761,7 +820,7 @@ async function fetchAndAccept(
     ...(claim.cursor === null ? {} : { cursor: claim.cursor }),
   };
   const scope = verifiedScope(selection, bound);
-  const call = await request(pass, "history", selection, scope, "conversations.history", params, claim);
+  const call = await request(pass, "history", selection, scope, "conversations.history", params, { claim });
   if (!call) return;
 
   if (call.kind !== "ok") {
@@ -877,8 +936,14 @@ async function request(
   scope: SlackMethodScope,
   method: SlackBudgetedMethod,
   params: Record<string, string>,
-  claim?: SlackChannelClaim
+  extra: {
+    /** The history lease to hand back when the wake's own ceiling stops this request. */
+    readonly claim?: SlackChannelClaim;
+    /** Passed straight to the transport: runs for a granted slot only, before the request leaves. */
+    readonly beforeSend?: () => Promise<void>;
+  } = {}
 ): Promise<SlackCallDisposition | null> {
+  const { claim, beforeSend } = extra;
   if (pass.remaining <= 0) {
     step(pass, {
       stage,
@@ -899,7 +964,10 @@ async function request(
     { db: pass.input.db, scope, token: selection.token },
     method,
     params,
-    pass.options.fetchImpl === undefined ? {} : { fetchImpl: pass.options.fetchImpl }
+    {
+      ...(pass.options.fetchImpl === undefined ? {} : { fetchImpl: pass.options.fetchImpl }),
+      ...(beforeSend === undefined ? {} : { beforeSend }),
+    }
   );
   return classifySlackCall(result);
 }

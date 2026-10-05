@@ -46,6 +46,11 @@ import type { SlackMessage } from "./slack";
  *  6. A FAILED HTTP STATUS IS NEVER A SUCCESSFUL PAGE. `body.ok` is the provider's verdict on a
  *     request that arrived; it cannot vouch for a 500 or a 404, and a page read out of one would
  *     enter the pipeline as provider fact.
+ *  7. `beforeSend` RUNS FOR A GRANTED SLOT ONLY, AND FINISHES BEFORE THE FETCH. It is the one point
+ *     at which a caller may commit something BECAUSE a request is going out: after the reservation
+ *     has committed, before the request leaves. A denied reservation never reaches it. If it throws,
+ *     nothing is sent and this function REJECTS with that failure — it is not a transport outcome,
+ *     and the slot stays consumed like every other failure after a grant.
  *
  * DIAGNOSTICS CARRY CATEGORIES, NEVER CONTENT. No result, error or thrown value here contains the
  * token, a header, or the response body — a `category` is a short sanitized code, the same
@@ -177,6 +182,15 @@ export type SlackRequestResult =
 export interface SlackRequestOptions {
   /** Injectable transport, per the existing connector convention (`slack-validate.ts`). */
   readonly fetchImpl?: typeof fetch;
+  /**
+   * Called once the reservation is GRANTED and committed, and awaited to completion before the
+   * request leaves. Never called for a `deferred` or `blocked` reservation. A rejection sends
+   * nothing and rejects `slackReservedRequest` with the same value; the slot is not handed back.
+   *
+   * It runs between two transactions, so it must open its own short one — exactly as this module
+   * does — and must not perform the request itself.
+   */
+  readonly beforeSend?: () => Promise<void>;
 }
 
 /**
@@ -303,6 +317,13 @@ export async function slackReservedRequest(
     // the provider would accept a request again.
     return { outcome: "blocked", method, category: reservation.reason };
   }
+
+  // ── 1b. the caller's hook, for a GRANTED slot only ────────────────────────────────────────────
+  // Deliberately NOT wrapped: a hook failure is the caller's own failure, not something Slack or
+  // the network did, so it rejects out of here untouched rather than becoming a `transport_error`
+  // a source would classify as a blip. Nothing below runs, so no request is made — and nothing
+  // above is undone, so the slot stays consumed.
+  if (options.beforeSend) await options.beforeSend();
 
   // ── 2. exactly one request ────────────────────────────────────────────────────────────────────
   const query = new URLSearchParams(applyPageLimit(method, params)).toString();
