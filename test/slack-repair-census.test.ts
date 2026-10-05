@@ -904,6 +904,228 @@ describe("slack repair census: a present null channel_id is not an absent one", 
   });
 });
 
+describe("slack repair census: a contradiction outranks an other-workspace observation", () => {
+  // Requested scope T1/C0ABC; the path says workspace t2, channel c0abc.
+  const elsewhere = `slack/t2/c0abc/${ROOT}.md`;
+
+  /** The row is ONE conflicting entry: not an observation, not a requested-source count, no target. */
+  function exclusiveConflict(result: Json): Json {
+    expect(result.bucket).toBe("entry");
+    expect(result).not.toHaveProperty("observation");
+    const entry = result.entry as Json;
+    expect(entry).toMatchObject({
+      itemId: ITEM,
+      path: { kind: "scoped", workspaceSegment: "t2", channelSegment: "c0abc", rootTs: ROOT },
+      relationship: "conflicting_evidence",
+      provenance: "conflicting",
+      hypotheticalTarget: null,
+      exactTargetItemId: null,
+      queueStatus: "not_applicable",
+      ledger: { present: false, totalMessages: "0", eligibleNondeletedMessages: "0", eligibleNondeletedUtcDays: "0" },
+    });
+    expect(entry.pending).toContain("provenance_review_required");
+    expect(entry.pending).not.toContain("pending_queue_work");
+    return entry;
+  }
+
+  it("stays an observation only while nothing stored contradicts the path (controls)", async () => {
+    const observation = { kind: "scanned_scoped_path", workspaceId: "t2", sourceId: ITEM };
+    expect(await classify({ item: { path: elsewhere } })).toMatchObject({ bucket: "other_workspace", observation });
+    // Retained metadata that agrees with the path's channel, or that is not a channel id at all.
+    for (const channel_id of [CHANNEL, "C0 ABC!", null]) {
+      const result = await classify({ item: { path: elsewhere, frontmatter: { source: "slack", channel_id } } });
+      expect(result, JSON.stringify(channel_id)).toMatchObject({ bucket: "other_workspace", observation });
+      expect(result.entry).toBeUndefined();
+    }
+    // A ledger that agrees with the path: the other workspace's own rows, never the requested source's.
+    const agreeing = await classify({
+      item: { path: elsewhere },
+      ledgerSources: [ledgerSource({ workspaceId: "T2" })],
+    });
+    expect(agreeing).toMatchObject({ bucket: "other_workspace", observation });
+    expect(agreeing.entry).toBeUndefined();
+  });
+
+  it("valid retained metadata naming another channel makes it one conflicting entry", async () => {
+    const result = await classify({
+      item: { path: elsewhere, frontmatter: { source: "slack", channel_id: "COTHER" } },
+      queue: { status: "queued", errorObserved: true },
+    });
+    const entry = exclusiveConflict(result);
+    expect(entry).toMatchObject({ retainedChannelMetadata: "valid", ledger: { conflictingSourceMessages: "0" } });
+    expect(entry.evidence).not.toContain("source_ledger");
+    // The contradicting value is evidence, not output.
+    expect(JSON.stringify(result)).not.toContain("COTHER");
+  });
+
+  it.each([
+    ["another workspace than the path's", { workspaceId: "T3", channelId: CHANNEL }],
+    ["another channel than the path's", { workspaceId: "T2", channelId: "COTHER" }],
+  ])("a ledger row stored under %s makes it one conflicting entry", async (_label, source) => {
+    const alone = exclusiveConflict(await classify({ item: { path: elsewhere }, ledgerSources: [ledgerSource(source)] }));
+    expect(alone.ledger).toMatchObject({ conflictingSourceMessages: "1" });
+    // An agreeing row beside it does not rescue the observation.
+    const mixed = await classify({
+      item: { path: elsewhere },
+      ledgerSources: [ledgerSource({ workspaceId: "T2" }), ledgerSource(source)],
+    });
+    expect(exclusiveConflict(mixed).ledger).toMatchObject({ conflictingSourceMessages: "2" });
+    for (const stored of ["T3", "COTHER"]) expect(JSON.stringify(mixed)).not.toContain(stored);
+  });
+
+  it("metadata and ledger contradicting each other on a legacy slug is a conflict, not an unresolved row", async () => {
+    const slug = { path: `slack/general/${ROOT}.md`, frontmatter: { source: "slack", channel_id: "COTHER" } };
+    // Control: the slug with another channel's metadata and NO ledger is merely unresolved.
+    expect(await entryOf({ item: slug })).toMatchObject({ relationship: "unresolved_channel", provenance: "unproven" });
+
+    // The retained metadata says COTHER; this item's own ledger says the requested source wrote it.
+    const entry = await entryOf({ item: slug, ledgerSources: [ledgerSource()] });
+    expect(entry).toMatchObject({
+      path: { kind: "legacy", channelSegment: "general", rootTs: ROOT },
+      relationship: "conflicting_evidence",
+      provenance: "conflicting",
+      retainedChannelMetadata: "valid",
+      ledger: { present: true, totalMessages: "1", conflictingSourceMessages: "0" },
+      queueStatus: "not_applicable",
+    });
+    expect(entry.evidence).toContain("source_ledger");
+    expect(entry.pending).toEqual(
+      expect.arrayContaining(["source_refetch_required", "provenance_review_required"])
+    );
+    expect(JSON.stringify(entry)).not.toContain("COTHER");
+  });
+});
+
+describe("slack repair census: participant metadata is validated, not trusted", () => {
+  const participantsOf = async (participants: unknown): Promise<Json> =>
+    (await entryOf({ item: { frontmatter: { source: "slack", participants } } })).participants as Json;
+  const VALID = { author_id: "U1", first_ts: "2024-06-01T09:00:00.000000Z", last_ts: "2024-06-20T17:00:00.000000Z" };
+  const NOT_ATTESTED = { status: "present_malformed", validCount: 0, earliestAttestedTs: null, latestAttestedTs: null };
+
+  it.each([
+    ["30 February", "2024-02-30T12:00:00.000000Z", "2024-03-01"],
+    ["31 February", "2024-02-31T12:00:00.000000Z", "2024-03-02"],
+    ["29 February in a common year", "2023-02-29T12:00:00.000000Z", "2023-03-01"],
+    ["29 February 1900 (divisible by 100, not by 400)", "1900-02-29T12:00:00.000000Z", "1900-03-01"],
+    ["31 April", "2024-04-31T00:00:00.000000Z", "2024-05-01"],
+    ["31 June", "2024-06-31T23:59:59.999999Z", "2024-07-01"],
+    ["31 September", "2024-09-31T12:00:00Z", "2024-10-01"],
+    ["31 November", "2024-11-31T12:00:00.123Z", "2024-12-01"],
+  ])("a calendar-invalid endpoint (%s) is not attested, not echoed and not rolled over", async (_label, invalid, rolled) => {
+    for (const participant of [
+      { author_id: "U1", first_ts: invalid, last_ts: invalid },
+      { author_id: "U1", first_ts: invalid },
+      { author_id: "U1", last_ts: invalid },
+      { author_id: "U1", first_ts: "2024-01-15T09:00:00.000000Z", last_ts: invalid },
+    ]) {
+      expect(await participantsOf([participant]), JSON.stringify(participant)).toEqual(NOT_ATTESTED);
+    }
+    // Beside a valid participant it neither counts nor moves an endpoint.
+    const entry = await entryOf({
+      item: { frontmatter: { source: "slack", participants: [VALID, { author_id: "U2", first_ts: invalid, last_ts: invalid }] } },
+    });
+    expect(entry.participants).toEqual({
+      status: "present_malformed", validCount: 1, earliestAttestedTs: VALID.first_ts, latestAttestedTs: VALID.last_ts,
+    });
+    const text = JSON.stringify(entry);
+    expect(text).not.toContain(invalid);
+    expect(text).not.toContain(invalid.slice(0, 10));
+    expect(text).not.toContain(rolled);
+  });
+
+  it("keeps real calendar days and the accepted timestamp syntax (boundary controls)", async () => {
+    for (const valid of [
+      "2024-02-29T12:00:00.000000Z", // a real leap day
+      "2000-02-29T00:00:00.000000Z", // divisible by 400
+      "2023-02-28T23:59:59.999999Z",
+      "2024-01-31T00:00:00.000000Z",
+      "2024-12-31T23:59:59.999999Z",
+      "2024-02-29T12:00:00Z", // no fraction
+      "2024-02-29T12:00:00.5Z",
+      "2024-02-29T12:00:00.123Z",
+    ]) {
+      expect(await participantsOf([{ author_id: "U1", first_ts: valid, last_ts: valid }]), valid).toEqual({
+        status: "present_valid", validCount: 1, earliestAttestedTs: valid, latestAttestedTs: valid,
+      });
+    }
+    for (const invalid of [
+      "2024-13-01T12:00:00.000000Z",
+      "2024-00-10T12:00:00.000000Z",
+      "2024-06-00T12:00:00.000000Z",
+      "2024-06-32T12:00:00.000000Z",
+      "2024-06-20T25:00:00.000000Z",
+      "2024-06-20T12:60:00.000000Z",
+      "2024-06-20T12:00:60.000000Z",
+      "2024-06-20T12:00:00.0000001Z", // seven fractional digits
+      "2024-06-20T12:00:00.Z",
+      "2024-06-20T12:00:00.000000", // no zone
+      "2024-06-20T12:00:00.000000+00:00",
+      "2024-06-20t12:00:00.000000z",
+      "2024-06-20 12:00:00.000000Z",
+      "2024-06-20",
+      "24-06-20T12:00:00Z",
+      " 2024-06-20T12:00:00.000000Z",
+      "",
+      1718884800,
+      null,
+    ]) {
+      expect(await participantsOf([{ author_id: "U1", first_ts: invalid, last_ts: invalid }]), JSON.stringify(invalid)).toEqual(
+        NOT_ATTESTED
+      );
+    }
+  });
+
+  it("a malformed participant author is not a valid legacy participant", async () => {
+    const { classifySlackRepairAuthor } = await census();
+    const hostile = "bad<script>";
+    const stamped = (author_id: unknown): Json => ({ ...VALID, author_id });
+    // Control: the id itself already takes the invalid-input path, whatever is mapped.
+    expect(
+      classifySlackRepairAuthor({
+        teamId: TEAM, externalId: hostile, origin: "participant_metadata", mappings: [],
+        mappingCandidatesOverflow: false, humanMemberIds: [],
+      })
+    ).toBe("invalid_input");
+
+    // …so the participant carrying it is malformed too: not counted, and its endpoints not attested.
+    expect(await participantsOf([stamped(hostile)])).toEqual(NOT_ATTESTED);
+    for (const author_id of [hostile, "bad id!", "U1 ", "A:B:C", "T1:", ":U1", "U-1", "U_1", "U1\n"]) {
+      const beside = await participantsOf([
+        VALID,
+        { author_id, first_ts: "2023-01-01T00:00:00.000000Z", last_ts: "2025-01-01T00:00:00.000000Z" },
+      ]);
+      expect(beside, JSON.stringify(author_id)).toEqual({
+        status: "present_malformed", validCount: 1, earliestAttestedTs: VALID.first_ts, latestAttestedTs: VALID.last_ts,
+      });
+    }
+    const entry = await entryOf({
+      item: { frontmatter: { source: "slack", participants: [VALID, stamped(hostile)] } },
+      authorStatuses: ["incomplete_provenance", "invalid_input"],
+    });
+    expect(entry).toMatchObject({
+      participants: { status: "present_malformed", validCount: 1 },
+      authorMapping: { incomplete_provenance: 1, invalid_input: 1, resolved: 0 },
+    });
+    for (const fragment of ["<script>", "bad<", "bad id"]) expect(JSON.stringify(entry)).not.toContain(fragment);
+  });
+
+  it("valid alphanumeric legacy participant ids stay valid participants (control)", async () => {
+    const { classifySlackRepairAuthor } = await census();
+    const participants = [VALID, { ...VALID, author_id: "T1:U2" }, { ...VALID, author_id: "W0ENTERPRISE9" }];
+    expect(await participantsOf(participants)).toEqual({
+      status: "present_valid", validCount: 3, earliestAttestedTs: VALID.first_ts, latestAttestedTs: VALID.last_ts,
+    });
+    for (const { author_id } of participants) {
+      expect(
+        classifySlackRepairAuthor({
+          teamId: TEAM, externalId: author_id, origin: "participant_metadata", mappings: [],
+          mappingCandidatesOverflow: false, humanMemberIds: [],
+        })
+      ).toBe("incomplete_provenance");
+    }
+  });
+});
+
 describe("slack repair census: collisions, peers and their bounds", () => {
   const target = `slack/t1/c0abc/${ROOT}.md`;
 

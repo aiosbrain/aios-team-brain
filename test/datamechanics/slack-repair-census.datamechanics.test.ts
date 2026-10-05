@@ -1576,6 +1576,168 @@ describe("slack repair census: the hook's executor is revoked with its invocatio
   });
 });
 
+describe("slack repair census: contradiction precedence on stored rows (real Postgres)", () => {
+  const root = (n: number): string => `1718900000.${String(n).padStart(6, "0")}`;
+
+  it("makes a contradicted other-workspace path or legacy slug ONE conflicting entry, with closed accounting", async () => {
+    const seed = await seedTeam();
+    const scope = await verifiedScope(seed);
+    const p = await project(seed.teamId);
+    // Requested scope T1/C0ABC. These paths say workspace t2, channel c0abc.
+    const elsewhere = (n: number): string => `slack/t2/c0abc/${root(n)}.md`;
+    // 1: valid retained metadata names another channel; no ledger.
+    await item(seed.teamId, p, id(1), elsewhere(1), { frontmatter: { source: "slack", channel_id: "COTHER" } });
+    // 2: its own ledger row is stored under a THIRD workspace, contradicting the path's.
+    await item(seed.teamId, p, id(2), elsewhere(2));
+    await message(seed.teamId, id(2), root(2), { workspace: "T3" });
+    // 3: a legacy slug whose retained metadata says COTHER and whose ledger says the requested source.
+    await item(seed.teamId, p, id(3), `slack/general/${root(3)}.md`, {
+      frontmatter: { source: "slack", channel_id: "COTHER" },
+    });
+    await message(seed.teamId, id(3), root(3));
+    // Controls — nothing stored contradicts these: a bare path, and one whose metadata and own ledger
+    // both agree with it (the other workspace's rows, never the requested source's).
+    await item(seed.teamId, p, id(4), elsewhere(4));
+    await item(seed.teamId, p, id(5), elsewhere(5), { frontmatter: { source: "slack", channel_id: CHANNEL } });
+    await message(seed.teamId, id(5), root(5), { workspace: "T2" });
+    const ledger = await runSql<{ item_id: string; workspace_id: string; channel_id: string }>(
+      `select item_id::text as item_id, workspace_id, channel_id from slack_messages where team_id = $1 order by item_id`,
+      [seed.teamId]
+    );
+    expect(ledger.rows, "fixture: the stored ledger sources").toEqual([
+      { item_id: id(2), workspace_id: "T3", channel_id: CHANNEL },
+      { item_id: id(3), workspace_id: WORKSPACE, channel_id: CHANNEL },
+      { item_id: id(5), workspace_id: "T2", channel_id: CHANNEL },
+    ]);
+
+    const before = await tables();
+    const result = await page(scope, { pageSize: 50 });
+    // Closed accounting: five scanned rows, each in exactly one bucket.
+    expect(result).toMatchObject({
+      scannedItems: 5, unrelatedItems: 0, otherWorkspaceItems: 2, gateNoncanonicalItems: 1,
+      otherWorkspaceObservationsTruncated: false,
+    });
+    expect(entryIds(result)).toEqual([id(1), id(2), id(3)]);
+    // A contradicted row is NOT also an other-workspace observation.
+    expect(result.otherWorkspaceObservations).toEqual([
+      { kind: "scanned_scoped_path", workspaceId: "t2", sourceId: id(4) },
+      { kind: "scanned_scoped_path", workspaceId: "t2", sourceId: id(5) },
+    ]);
+    expect(result.counts.byRelationship).toEqual({
+      channel_candidate: 0, scoped_channel_match: 0, unresolved_channel: 0, conflicting_evidence: 3,
+    });
+    expect(result.counts.byPendingCategory.provenance_review_required).toBe(3);
+
+    const noRequestedMessages = { present: false, totalMessages: "0", eligibleNondeletedMessages: "0", eligibleNondeletedUtcDays: "0" };
+    const scopedConflict = {
+      relationship: "conflicting_evidence",
+      provenance: "conflicting",
+      path: { kind: "scoped", workspaceSegment: "t2", channelSegment: "c0abc" },
+      hypotheticalTarget: null,
+      exactTargetItemId: null,
+      sameProjectConvergingItemIds: [],
+      sameThreadOtherProjectItemIds: [],
+      queueStatus: "not_applicable",
+    };
+    expect(entryOf(result, id(1))).toMatchObject({
+      ...scopedConflict,
+      retainedChannelMetadata: "valid",
+      ledger: { ...noRequestedMessages, conflictingSourceMessages: "0" },
+    });
+    // Its only ledger row is another source's: reported apart, never as a requested-source message.
+    const second = entryOf(result, id(2));
+    expect(second).toMatchObject({
+      ...scopedConflict,
+      retainedChannelMetadata: "absent",
+      ledger: { ...noRequestedMessages, conflictingSourceMessages: "1" },
+    });
+    expect(Object.values(second.authorMapping as Record<string, number>).reduce((a, b) => a + b, 0)).toBe(0);
+    const third = entryOf(result, id(3));
+    expect(third).toMatchObject({
+      relationship: "conflicting_evidence",
+      provenance: "conflicting",
+      path: { kind: "legacy", channelSegment: "general", rootTs: root(3) },
+      retainedChannelMetadata: "valid",
+      ledger: { present: true, totalMessages: "1", conflictingSourceMessages: "0" },
+      queueStatus: "not_applicable",
+    });
+    expect(third.evidence).toContain("source_ledger");
+    for (const contradicted of [entryOf(result, id(1)), second, third]) {
+      expect(contradicted.pending).toContain("provenance_review_required");
+      expect(contradicted.pending).not.toContain("pending_queue_work");
+    }
+    // The contradicting stored values are evidence, not output.
+    const text = JSON.stringify(result.entries);
+    for (const stored of ["COTHER", "T3", "T2"]) expect(text).not.toContain(stored);
+    expect(await tables()).toEqual(before);
+
+    // One row per page: a contradicted row occupies the entries bucket and nothing else.
+    const pages = await traverse(scope, 1);
+    expect(pages).toHaveLength(5);
+    for (const index of [0, 1, 2]) {
+      expect(pages[index], `page ${index}`).toMatchObject({
+        scannedItems: 1, unrelatedItems: 0, otherWorkspaceItems: 0, otherWorkspaceObservations: [],
+      });
+      expect(pages[index].entries).toHaveLength(1);
+      expect(pages[index].entries[0].relationship).toBe("conflicting_evidence");
+    }
+    for (const index of [3, 4]) {
+      expect(pages[index], `page ${index}`).toMatchObject({ scannedItems: 1, unrelatedItems: 0, otherWorkspaceItems: 1, entries: [] });
+      expect(pages[index].otherWorkspaceObservations).toEqual([
+        { kind: "scanned_scoped_path", workspaceId: "t2", sourceId: id(index + 1) },
+      ]);
+    }
+  });
+
+  it("does not attest a calendar-invalid endpoint or count a malformed participant author", async () => {
+    const seed = await seedTeam();
+    const scope = await verifiedScope(seed);
+    const p = await project(seed.teamId);
+    const VALID = {
+      author_id: "U1", display_name: "One", message_count: 2,
+      first_ts: "2024-06-01T09:00:00.000000Z", last_ts: "2024-06-20T17:00:00.000000Z",
+    };
+    const withParticipants = (n: number, participants: unknown[]): Promise<string> =>
+      item(seed.teamId, p, id(n), `slack/c0abc/${root(n)}.md`, { frontmatter: { source: "slack", participants } });
+    // 1: 30 February does not exist. JavaScript's own parser would roll it over to 1 March.
+    await withParticipants(1, [VALID, { ...VALID, author_id: "U2", first_ts: "2024-02-30T12:00:00.000000Z", last_ts: "2024-02-30T12:00:00.000000Z" }]);
+    // 2: control — a real leap day.
+    await withParticipants(2, [{ ...VALID, first_ts: "2024-02-29T12:00:00.000000Z", last_ts: "2024-02-29T12:00:00.000000Z" }]);
+    // 3: an author that is not a Slack id.
+    await withParticipants(3, [VALID, { ...VALID, author_id: "bad<script>" }]);
+    // 4: control — two valid legacy ids, one of them qualified and even mapped.
+    await withParticipants(4, [VALID, { ...VALID, author_id: "T1:U2" }]);
+    await mapping(seed.teamId, seed.memberId, "T1:U2");
+    const stored = await runSql<{ author: string; endpoint: string }>(
+      `select (select frontmatter->'participants'->1->>'author_id' from items where id = $1) as author,
+              (select frontmatter->'participants'->1->>'first_ts' from items where id = $2) as endpoint`,
+      [id(3), id(1)]
+    );
+    expect(stored.rows, "fixture: the hostile author and the impossible date are really stored").toEqual([
+      { author: "bad<script>", endpoint: "2024-02-30T12:00:00.000000Z" },
+    ]);
+
+    const result = await page(scope);
+    const attested = { earliestAttestedTs: VALID.first_ts, latestAttestedTs: VALID.last_ts };
+    expect(entryOf(result, id(1)).participants).toEqual({ status: "present_malformed", validCount: 1, ...attested });
+    expect(entryOf(result, id(2)).participants).toEqual({
+      status: "present_valid", validCount: 1,
+      earliestAttestedTs: "2024-02-29T12:00:00.000000Z", latestAttestedTs: "2024-02-29T12:00:00.000000Z",
+    });
+    const third = entryOf(result, id(3));
+    expect(third.participants).toEqual({ status: "present_malformed", validCount: 1, ...attested });
+    // The valid id is still a legacy id lacking provenance; the malformed one takes the invalid-input path.
+    expect(third.authorMapping).toMatchObject({ incomplete_provenance: 1, invalid_input: 1, resolved: 0 });
+    expect(third.pending).toContain("mapping_review_required");
+    const fourth = entryOf(result, id(4));
+    expect(fourth.participants).toEqual({ status: "present_valid", validCount: 2, ...attested });
+    expect(fourth.authorMapping).toMatchObject({ incomplete_provenance: 2, invalid_input: 0, resolved: 0 });
+
+    const text = JSON.stringify(result);
+    for (const fragment of ["2024-02-30", "2024-03-01", "<script>", "bad<"]) expect(text).not.toContain(fragment);
+  });
+});
+
 describe("slack repair census: one read-only snapshot per invocation (real Postgres)", () => {
   async function census(): Promise<{ seed: Seed; scope: Scope; projectId: string }> {
     const seed = await seedTeam();
