@@ -91,6 +91,7 @@ vi.mock("pg", () => ({
 
 import { PgClient } from "@/lib/db/pg/client";
 import { reattributeItems, takeRepairScanTurn } from "@/lib/ingest/reattribute";
+import { describeManualRepair } from "@/lib/ingest/attribution-repair-report";
 import {
   onAttributionRepairKick,
   repairAttributionNow,
@@ -619,6 +620,38 @@ describe("bounded callers report `continuing`; they do not fail", () => {
     use({ turn: [false] });
     await expect(runScheduledAttributionRepairTurn(new PgClient(), { teamId: TEAM, teamSlug: "acme" }))
       .resolves.toBe("busy");
+  });
+
+  it("BUSY AFTER PROGRESS: a run that committed a batch and THEN found another owner keeps its counters, and is reported as progress — not as having done nothing", async () => {
+    // The turn is free for this run's first batch (its snapshot and its batch transaction), and
+    // another owner has it by the time the second batch is attempted.
+    const c = use({ status: "running", candidates: [[ITEM_A]], turn: [true, true, false] });
+    const outcome = await repairAttributionNow(new PgClient(), TEAM, "acme", { maxBatches: 5, batchSize: 1 });
+    expect(outcome).toMatchObject({ status: "continuing", busy: true, partial: true, scanned: 1, revision: REVISION });
+    // The batch really committed before the turn was lost, and losing it recorded no failure.
+    expect(c.log.filter(isCursorAdvance)).toHaveLength(1);
+    expect(c.transactions.map((t) => t.end)).toEqual(["commit", "commit", "commit"]);
+    expect(c.log.filter(isRetry)).toEqual([]);
+
+    const manual = describeManualRepair(outcome, "manual");
+    expect(manual).toBe(
+      "Re-attributed 0 of 1 item(s) so far; another re-attribution run then took over this team's repair, and the repair is not complete. "
+      + "Progress is saved, but background continuation is disabled on this deployment: "
+      + "an admin must run Re-attribute content again once that run has finished.",
+    );
+    expect(manual).not.toContain("did nothing");
+    expect(describeManualRepair(outcome, "background")).toBe(
+      "Re-attributed 0 of 1 item(s) so far; another re-attribution run then took over this team's repair, "
+      + "and re-attribution is continuing in the background.",
+    );
+
+    // Whereas a run that never got the turn at all still says so.
+    use({ turn: [false] });
+    const refused = await repairAttributionNow(new PgClient(), TEAM, "acme", { maxBatches: 5, batchSize: 1 });
+    expect(refused).toMatchObject({ status: "continuing", busy: true, scanned: 0, updated: 0 });
+    expect(describeManualRepair(refused, "manual")).toContain("so this run did nothing");
+    expect(describeManualRepair(refused, "background"))
+      .toBe("Re-attribution is already running for this team and is continuing in the background.");
   });
 
   it("scan then finalization converge inside one budget, and a completed revision is not kicked", async () => {
