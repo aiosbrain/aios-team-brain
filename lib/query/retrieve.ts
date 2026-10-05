@@ -1,10 +1,18 @@
+import { buildFtsQuery, significantTerms, toOrQuery, isSignificantTerm } from "./fts-query";
+export { buildFtsQuery, significantTerms, conjunctiveTerms, toOrQuery } from "./fts-query";
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient, type GraphFact } from "@/lib/graph/graphiti-client";
 import { selectEnforcedGraphPartitions } from "@/lib/graph/partition-read";
-import { isRestrictedTier } from "@/lib/auth/visibility";
 import { runSql } from "@/lib/db/pg/pool";
-import { newSqlParams, provenanceRowSqlFromIds, type MemberTag, type TokenTag } from "@/lib/access/provenance-sql";
+import {
+  newSqlParams,
+  provenanceRowSqlFromIds,
+  labelCeilingApplies,
+  type MemberTag,
+  type LegacyTag,
+  type TokenTag,
+} from "@/lib/access/provenance-sql";
 import {
   selectedProviderName,
   type RetrievalProvider,
@@ -208,6 +216,23 @@ export type RetrieveEnforce =
       visibleItemIds: ReadonlySet<string>;
       graphProjectIds?: readonly string[];
       principal: MemberTag;
+      /** TIERRET-1: oracle-accepted Everyone (the hand-entered `all` arm). REQUIRED — built only by
+       *  `lib/access/admission.ts#retrieveEnforceFor`; never raw posture. */
+      memberEveryone: boolean;
+      /** TIERRET-1: the member's oracle GRANTED project set — the hand-entered arm for a member that
+       *  is not Everyone. REQUIRED for the same M13 reason as `tokenProjectIds`. */
+      memberProjectIds: readonly string[];
+      tokenProjectIds?: undefined;
+    }
+  | {
+      // TIERRET-1: a valid key/session whose ACTIVE member is NOT a principal (connector/offroster).
+      // Baseline-preserving: posture rule for hand-entered rows (from the route's tier), the
+      // org-structural legs it already had, and NO graph scope.
+      visibleItemIds: ReadonlySet<string>;
+      graphProjectIds?: undefined;
+      principal: LegacyTag;
+      memberEveryone?: undefined;
+      memberProjectIds?: undefined;
       tokenProjectIds?: undefined;
     }
   | {
@@ -217,6 +242,8 @@ export type RetrieveEnforce =
       /** The token's effective project set. REQUIRED: an omitted forward looks exactly like the
        *  fail-closed default and so reddens nothing on its own (the M13 lesson). */
       tokenProjectIds: readonly string[];
+      memberEveryone?: undefined;
+      memberProjectIds?: undefined;
     };
 
 /** The wire half of the graph leg, injectable for tests (the client was previously constructed
@@ -233,91 +260,6 @@ export async function fetchGraphFactsForGroups(
   } catch {
     return [];
   }
-}
-
-// Question words + common stopwords dropped before building the FTS query — they carry no signal
-// and (under AND semantics) tanked recall (e.g. "what has john been posting to slack" required the
-// literal "posting"/"slack" in the body). We keep all other terms.
-const FTS_STOP = new Set([
-  "the", "a", "an", "of", "to", "in", "on", "for", "and", "or", "is", "are", "was", "were",
-  "be", "been", "being", "what", "who", "whom", "whose", "when", "where", "why", "how", "which",
-  "did", "do", "does", "has", "have", "had", "with", "about", "from", "by", "our", "we", "you",
-  "i", "me", "my", "your", "their", "this", "that", "these", "those", "it", "its", "as", "at",
-  "any", "all", "can", "could", "would", "should", "tell", "show", "give", "list", "get",
-  // Temporal/recency deictics: query INTENT, not content — they never match usefully as keywords
-  // and (df≈0) would otherwise poison the grounding signal (Gap #3). Recency is handled by the
-  // recency fallback + activity digests, not by matching the literal word.
-  "latest", "recent", "recently", "lately", "today", "yesterday", "tomorrow", "currently", "now", "soon", "upcoming",
-]);
-
-/**
- * Is this raw token (original case preserved) worth searching on?
- *   • never a stopword
- *   • ≥3 chars → yes
- *   • exactly 2 chars → only if it's a version/product token with a digit (v2, s3, k8) OR an
- *     acronym the user upper-cased (CI, QA, PR, DB) — NOT a lowercase common word (us, up, so, no).
- *   • 1 char → no (single letters are noise)
- * The 2-char rule is the fix for eng-heavy channels where CI/QA/PR/S3 are the load-bearing terms;
- * dropping them (the old `length >= 3` filter) meant a query ABOUT them searched on filler words.
- */
-function isSignificantTerm(original: string): boolean {
-  const t = original.toLowerCase();
-  if (FTS_STOP.has(t)) return false;
-  if (t.length >= 3) return true;
-  if (t.length === 2) return /\d/.test(t) || original === original.toUpperCase();
-  return false;
-}
-
-/**
- * Build a recall-friendly FTS query: significant terms OR-joined. `websearch_to_tsquery` treats the
- * word "or" as the OR operator, so this matches docs containing ANY significant term (then the LLM
- * filters relevance) instead of requiring ALL of them. Falls back to the raw question when nothing
- * significant remains. (Ranked/semantic retrieval — pgvector — is the durable fix at larger scale.)
- */
-export function significantTerms(question: string): string[] {
-  // Match on the ORIGINAL (case preserved) so `isSignificantTerm` can tell an upper-cased acronym
-  // (CI) from a lowercase common word (us); lowercase only after the keep/drop decision. De-duped.
-  const terms = (question.match(/[A-Za-z0-9][A-Za-z0-9'-]*/g) ?? [])
-    .filter(isSignificantTerm)
-    .map((t) => t.toLowerCase());
-  return [...new Set(terms)];
-}
-
-/**
- * Conjunctive intent (Gap: OR-semantics can't require BOTH topics). An explicit upper-cased `AND`
- * between topics is an opt-in precision operator (like a search engine's AND): narrow to docs that
- * contain ALL the named topics, instead of the OR default's recall bias. Returns the de-duped term
- * list when the operator is present with a real topic on each side, else null (→ OR path unchanged).
- *
- * Deliberately ONLY upper-cased `AND`, never lowercase "and": "and" is a ubiquitous stopword (it is
- * in FTS_STOP), so treating every "and" as a hard conjunction would gut recall on ordinary questions
- * ("what did john and mary decide"). Conservative, mirroring parseChannelScope (Gap #4) — no false
- * positives. Multi-word sides collapse to a flat AND of every significant term (websearch_to_tsquery
- * has no grouping), so "auth flow AND payments" requires auth+flow+payments; single-word sides (the
- * common "auth AND payments") are exact. Pure + unit-tested.
- */
-export function conjunctiveTerms(question: string): string[] | null {
-  if (!/\bAND\b/.test(question)) return null; // case-sensitive: only the upper-cased operator
-  const sides = question.split(/\bAND\b/).map(significantTerms);
-  if (sides.length < 2 || sides.some((s) => s.length === 0)) return null; // a real topic each side
-  const all = [...new Set(sides.flat())];
-  return all.length >= 2 ? all : null;
-}
-
-/**
- * The FTS query the retrieval leg runs. `websearch_to_tsquery('english', …)` reads the literal word
- * "or" as OR and space/"and" as AND, so the join word alone flips the operator — no SQL change. OR by
- * default (recall bias; the LLM filters relevance); AND only when `conjunctiveTerms` fires (precision).
- */
-export function buildFtsQuery(question: string): { query: string; terms: string[]; conjunctive: boolean } {
-  const conj = conjunctiveTerms(question);
-  if (conj) return { query: conj.join(" and "), terms: conj, conjunctive: true };
-  const terms = significantTerms(question);
-  return { query: terms.length ? terms.join(" or ") : question, terms, conjunctive: false };
-}
-
-export function toOrQuery(question: string): string {
-  return buildFtsQuery(question).query;
 }
 
 /**
@@ -567,7 +509,14 @@ async function nativeRetrieve(
   // surface); tokens and both default-deny arms (absent/foreign principal) do not. The POSITIVE
   // `=== "member"` test is the rule — a `!== "token"` negation would fail OPEN for a future
   // constructor that omits the field (guard-pinned).
-  const serveOrgStructural = enforce?.principal === "member";
+  // TIERRET-1: the explicit LEGACY arm (a valid ordinary key whose member is a connector/offroster)
+  // keeps these legs because it HAD them — the query route labelled every ordinary key "member"
+  // before admission existed. Preserved, not granted: a separate eligibility-hardening proposal may
+  // close it; this slice must not silently change it (spec "Legacy decision").
+  const serveOrgStructural = enforce?.principal === "member" || enforce?.principal === "legacy";
+  // TIERRET-1: the LABEL ceiling — lifted for an admitted member (membership is its read rule), kept
+  // for legacy, tokens and any unrecognised discriminator (`labelCeilingApplies`, fail closed).
+  const labelRestricted = labelCeilingApplies(enforce?.principal, tier);
   // In-query filter array (Codex fold): applied inside the item-leg SQL so LIMITs rank over
   // visible rows only. null = permissive. The visible() post-filter below stays as defense-in-depth.
   const visArr: string[] | null = visibleIds ? [...visibleIds] : null;
@@ -629,7 +578,9 @@ async function nativeRetrieve(
   const { query: ftsQuery, terms } = buildFtsQuery(q);
   const ftsP = rankedFtsSearch(teamId, tier, ftsQuery, FTS_CANDIDATE_LIMIT, channelScope, visArr);
   // Grounding specificity (Gap #3) — runs concurrently; combined with hadFtsHit below.
-  const specificityP = analyzeTermSpecificity(teamId, tier, terms, visArr ?? []); // ENFB-1: the visible corpus is the statistic's universe
+  // ENFB-1: the visible corpus is the statistic's universe — TIERRET-1: EXACTLY the corpus retrieval
+  // serves (no label conjunct for an admitted member, so a granted team-labelled item counts).
+  const specificityP = analyzeTermSpecificity(teamId, labelRestricted, terms, visArr ?? []);
   // Structured-context scaling (Gaps #5/#6): a FULL-corpus task count (aggregates survive the 80-row
   // cap) + a keyword search over ALL decisions (an old-but-relevant decision survives the 50-row
   // recency window). Both run concurrently; folded into the structured block below.
@@ -637,7 +588,9 @@ async function nativeRetrieve(
   const matchedDecisionsP = terms.length
     ? matchingDecisions(teamId, tier, ftsQuery, 10, {
         visibleItemIds: visibleIds ?? new Set(),
-        teamPosture: tier === "team",
+        // TIERRET-1: the member arm's hand-entered `all` is the ORACLE-accepted Everyone bit carried
+        // in the enforcement, never the route's posture; legacy/token keep the tier reading.
+        teamPosture: enforce?.principal === "member" ? enforce?.memberEveryone === true : tier === "team",
         // FORWARDED, never re-derived (AUDITFIX-1 §2a). This leg is token-reachable, and the
         // discriminator is the only thing standing between a scoped token and every hand-typed
         // decision in the team. Deriving it here from `tier` would say "member" for every token.
@@ -646,6 +599,8 @@ async function nativeRetrieve(
         // of the spec review found acceptance that seeded only a TASK — which would have gated the
         // task leg correctly and left THIS one open. Forwarded on the same terms.
         tokenProjectIds: enforce?.tokenProjectIds,
+        // TIERRET-1: a non-Everyone member's granted projects — forward-only, like the token set.
+        memberProjectIds: enforce?.memberProjectIds,
       })
     : Promise.resolve([]);
 
@@ -667,21 +622,25 @@ async function nativeRetrieve(
   // (before LIMIT), so the recency-50 and task-80 windows fill with rows THIS principal may
   // see — the ENFB-1 deferred starvation class (Codex M1) dies here. The id-array fragment is
   // the exact SQL twin of `rowVisibleByProvenance` (one contract, THREE owners, dm-pinned to
-  // fixture-level expected truth). Audience conjuncts preserved verbatim.
+  // fixture-level expected truth). TIERRET-1: the audience conjunct is the LABEL ceiling — lifted for
+  // an admitted member (sourced rows follow their source item), kept for legacy/token/unknown.
   // `principal` is FORWARDED from the caller's enforcement view — see AUDITFIX-1 §2a. Absent
   // enforcement yields `undefined`, which CLOSES the hand-typed arm; it must never become "member".
   const provCtx = {
     visibleItemIds: visibleIds ?? new Set<string>(),
-    teamPosture: tier === "team",
+    teamPosture: enforce?.principal === "member" ? enforce?.memberEveryone === true : tier === "team",
     principal: enforce?.principal,
     // AUDITFIX-7: FORWARDED, never derived. Absent closes the hand-typed arm for a token, which is
     // the fail-closed direction and also today's behaviour — so a deleted forward reddens nothing on
     // its own. That is why the guard requires this to be CARRIED alongside `principal`.
     tokenProjectIds: enforce?.tokenProjectIds,
+    // TIERRET-1: same discipline for a member's granted projects — an omitted forward would silently
+    // close a granted member's hand-entered rows, so the guard requires it carried too.
+    memberProjectIds: enforce?.memberProjectIds,
   };
   const dParams = newSqlParams();
   const dTeam = dParams.add(teamId);
-  const dAccess = isRestrictedTier(tier) ? `and d.audience = 'external'` : "";
+  const dAccess = labelRestricted ? `and d.audience = 'external'` : "";
   const decisionsB = runSql<{
     row_key: string; decided_at: string | Date | null; title: string; decided_by: string;
     still_valid: boolean; source_item_id: string | null; created_by: string | null; slug: string;
@@ -700,11 +659,11 @@ async function nativeRetrieve(
   // can ground on finished tasks. `tasks.updated_at` is bumped on every sync upsert (incl. a
   // status→done transition), so recency ordering surfaces today's completions. (Was active-only:
   // `in_progress/blocked/ready`, which structurally hid every completion from the brain.)
-  // Tasks carry `audience` (audit H1); an external principal sees only external-tier tasks. Without
-  // this filter the external query context leaked every internal task board.
+  // Tasks carry `audience` (audit H1). TIERRET-1: a non-member reader under the label ceiling still
+  // sees only external-audience tasks; an admitted member's rows are decided by provenance alone.
   const tParams = newSqlParams();
   const tTeam = tParams.add(teamId);
-  const tAccess = isRestrictedTier(tier) ? `and t.audience = 'external'` : "";
+  const tAccess = labelRestricted ? `and t.audience = 'external'` : "";
   const tasksB = runSql<{
     row_key: string; title: string; assignee: string | null; status: string; sprint: string | null;
     updated_at: string | Date | null; source_item_id: string | null; created_by: string | null; slug: string;

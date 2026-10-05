@@ -9,7 +9,8 @@ import { closeMembershipInto, ensureIncludeMembership } from "@/lib/projects/con
  * Why this is a separate TypeScript process rather than SQL in the `.mjs` fixture: those two tables
  * have single-writer owners (`lib/projects/context/units.ts`, `.../memberships.ts`), enforced by a
  * build-failing guard, and every invariant they carry — the audience inherited from the item, the
- * no-widening gate, the locked revalidation protocol — lives there. Hand-rolled parameterized SQL
+ * system-integrity gate (TIERRET-1's replacement for the no-widening gate: exact routing and
+ * sanctioned grants on protected targets), the locked revalidation protocol — lives there. Hand-rolled parameterized SQL
  * in the fixture would have seeded rows that no longer had to obey any of it, which is a strange
  * thing for a harness whose entire purpose is checking an access boundary. `reconcileItemUnit`
  * ALSO mirrors the item's hash and audience, so `mutate` needs no separate hash update.

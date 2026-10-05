@@ -64,6 +64,37 @@ export function sha(body: string): string {
   return createHash("sha256").update(body).digest("hex");
 }
 
+/**
+ * AUDITFIX-19 TEST-ONLY SUBSTRATE: give an already-minted token the LEGACY stored scope `[]`.
+ *
+ * New mints can no longer REQUEST an empty scope (the writer refuses it), but rows minted before
+ * that rule still exist and must keep reading NOTHING — `[]` is never normalized to NULL. Tests prove
+ * that read contract by rewriting a freshly minted explicit token's `project_scope` here, before any
+ * read, then reading the row back. Test files sit outside the application single-writer scan
+ * (`test/guards/access-single-writer.test.ts` covers app/lib/scripts); there is deliberately no
+ * application path or production mint mode that does this.
+ */
+export async function persistLegacyEmptyScopeForTest(teamId: string, tokenRowId: string): Promise<void> {
+  const admin = db();
+  const { error } = await admin
+    .from("agent_tokens")
+    .update({ project_scope: [] })
+    .eq("team_id", teamId)
+    .eq("id", tokenRowId);
+  if (error) throw new Error(`legacy-empty scope fixture write failed: ${error.message}`);
+  const { data, error: readErr } = await admin
+    .from("agent_tokens")
+    .select("project_scope")
+    .eq("team_id", teamId)
+    .eq("id", tokenRowId)
+    .single();
+  if (readErr) throw new Error(`legacy-empty scope fixture readback failed: ${readErr.message}`);
+  const stored = (data as { project_scope: string[] | null }).project_scope;
+  if (!Array.isArray(stored) || stored.length !== 0) {
+    throw new Error(`legacy-empty scope fixture did not persist []: got ${JSON.stringify(stored)}`);
+  }
+}
+
 export type Seed = { teamId: string; teamSlug: string; memberId: string };
 
 /** Seed a real team + active member (FK targets the ingest/read paths require). */
@@ -133,36 +164,49 @@ export async function placeMemberByTier(teamId: string, memberId: string, tier: 
 export async function viewFor(
   seed: Seed,
   tier: "team" | "external" = "team"
-): Promise<{ visibleItemIds: ReadonlySet<string>; visibleProjectIds: ReadonlySet<string> }> {
+) {
   const viewerId = tier === "external" ? await externalMember(seed) : seed.memberId;
   const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
   const r = await backfillTeamContext(db(), seed.teamId);
   if (!r.ok) throw new Error(`viewFor backfill failed: ${r.error}`);
-  const { memberEnforcement } = await import("@/lib/access/enforce");
-  const e = await memberEnforcement(db(), { teamId: seed.teamId, memberId: viewerId });
-  if (!e) throw new Error("viewFor: the viewer resolved no enforcement");
-  return e;
+  // TIERRET-1: the PRODUCTION timeline enforcement — item set + the reader from the one admission
+  // resolver (a builder call without a reader closes the hand-entered arm and the meeting leg).
+  const { contentTimelineEnforcement } = await import("@/lib/access/admission");
+  return contentTimelineEnforcement(db(), seed.teamId, viewerId);
 }
 
-/** A route-shaped MEMBER enforcement for retrieve(): vis-set + principal + graph scope — what
- *  both query routes construct (PRET-6: retrieve throws without one). Backfills first. */
-export async function memberRetrieveEnforce(
-  seed: Seed,
-  tier: "team" | "external" = "team"
-): Promise<{ visibleItemIds: ReadonlySet<string>; principal: "member"; graphProjectIds: string[] }> {
+/** A route-shaped enforcement for retrieve() — EXACTLY what both query routes construct
+ *  (`retrieveEnforceFor(resolveContentView(...))`; PRET-6: retrieve throws without one). Backfills first. */
+export async function memberRetrieveEnforce(seed: Seed, tier: "team" | "external" = "team") {
   const viewerId = tier === "external" ? await externalMember(seed) : seed.memberId;
   const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
   const r = await backfillTeamContext(db(), seed.teamId);
   if (!r.ok) throw new Error(`memberRetrieveEnforce backfill failed: ${r.error}`);
-  const { visibleItemIds } = await import("@/lib/access/enforce");
-  const { ids, projectIds } = await visibleItemIds(db(), { teamId: seed.teamId, memberId: viewerId });
-  return { visibleItemIds: ids, principal: "member", graphProjectIds: projectIds };
+  const { resolveContentView, retrieveEnforceFor } = await import("@/lib/access/admission");
+  return retrieveEnforceFor(await resolveContentView(db(), seed.teamId, viewerId));
 }
 
-/** The member's cheap §5.8 visibility (projects + hash) — what keys their vis-variant cache row. */
+/** The member's timeline cache VARIANT (admission class + project hash) — what keys their row. */
 export async function visOf(seed: Seed, memberId: string = seed.memberId) {
-  const { memberVisibility } = await import("@/lib/access/enforce");
-  return memberVisibility(db(), { teamId: seed.teamId, memberId });
+  const { resolveTimelineVariant } = await import("@/lib/dashboard/timeline-cache");
+  return resolveTimelineVariant(db(), seed.teamId, memberId);
+}
+
+/**
+ * The two stamps a `work_timeline_cache` payload must carry to be read at all — as a hit OR as a
+ * salvage source: the team's live Slack generations and the reader's current item fingerprint.
+ * Computed here, NOT lifted from a row the cache wrote, so a planted row carrying them can only be
+ * refused by the rule under test (its key, a purge) — an unstamped poison row is refused by the
+ * stamp check first and proves nothing about the key (merge review F1/F2).
+ */
+export async function liveTimelineStamps(teamId: string, memberId: string) {
+  const real = db();
+  if (!isTransactionCapableDbClient(real)) throw new Error("test fixture requires transaction capability");
+  const { readSlackTeamGenerations } = await import("@/lib/ingest/slack-message-ledger");
+  const generations = await real.transaction((session) => readSlackTeamGenerations(session, teamId));
+  const { contentTimelineEnforcement } = await import("@/lib/access/admission");
+  const { visibleItemIds } = await contentTimelineEnforcement(real, teamId, memberId);
+  return { generations, itemFingerprint: sha(JSON.stringify([...visibleItemIds].sort())) };
 }
 
 /** Mint an ACTIVE external-posture member (invite-default shape: the external builtin row). */

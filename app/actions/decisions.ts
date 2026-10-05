@@ -79,7 +79,10 @@ export async function createDecisionAction(
 
 /**
  * Toggle a decision's validity. Admins/leads only — enforced server-side
- * (replaces the decisions_lead_update RLS policy in postgres mode).
+ * (replaces the decisions_lead_update RLS policy in postgres mode). TIERRET-1 (code review 1
+ * HIGH-1): the role is not row authority — the decisions page now shows an external lead rows it
+ * could only READ, so the toggle also requires the pre-TIERRET row WRITER predicate and refuses
+ * exactly like an absent decision.
  */
 export async function setDecisionValidityAction(
   decisionId: string,
@@ -93,14 +96,21 @@ export async function setDecisionValidityAction(
     .maybeSingle();
   if (!decision) return { ok: false, error: "decision not found" };
 
-  const me = await currentMember((decision as { team_id: string }).team_id);
+  const teamId = (decision as { team_id: string }).team_id;
+  const me = await currentMember(teamId);
   if (!me || (me.role !== "admin" && me.role !== "lead")) {
     return { ok: false, error: "admins and leads only" };
+  }
+  const { canWriteStructuredRow } = await import("@/lib/access/enforce");
+  const { adminClient } = await import("@/lib/db/admin");
+  if (!(await canWriteStructuredRow(adminClient(), { teamId, memberId: me.id }, "decisions", decisionId))) {
+    return { ok: false, error: "decision not found" };
   }
 
   const { error } = await db
     .from("decisions")
     .update({ still_valid: stillValid, updated_at: new Date().toISOString() })
-    .eq("id", decisionId);
+    .eq("id", decisionId)
+    .eq("team_id", teamId);
   return error ? { ok: false, error: error.message } : { ok: true };
 }

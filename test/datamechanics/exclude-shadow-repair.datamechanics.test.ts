@@ -50,7 +50,7 @@ const visOf = async (seed: Seed) => {
 };
 
 describe("EXCLSHADOW-1 — the auto exclude-shadow repairs; explicit excludes survive every automatic run", () => {
-  it("round trip: auto shadow → item dark → one reconcile repairs close-first (method pinned) → item visible; idempotent; the FORCE shadow refuses loudly and stays; close-first is index-forced; no-widening still refuses first", async () => {
+  it("round trip: auto shadow → item dark → one reconcile repairs close-first (method pinned) → item visible; idempotent; the FORCE shadow refuses loudly and stays; close-first is index-forced; the system-integrity gate still refuses first", async () => {
     const seed = await seedTeam();
     const item = await ingest(seed, { path: "a.md", body: "shadowed body", access: "team", project: "src" });
     const forced = await ingest(seed, { path: "b.md", body: "forced body", access: "team", project: "src" });
@@ -97,12 +97,13 @@ describe("EXCLSHADOW-1 — the auto exclude-shadow repairs; explicit excludes su
     });
     expect(collision, "pcm_current_idx refuses a second current row").toBeTruthy();
 
-    // No-widening still gates FIRST: a team-audience unit refused from the external-visible
-    // project before any probe/repair could run.
+    // The target-integrity gate (TIERRET-1's replacement for no-widening) still gates FIRST: a
+    // team-audience unit is mis-routed for external-shared and refused before any probe/repair runs.
     const extShared = await systemProject(seed, EXTERNAL_SHARED_SLUG);
     const nw = await ensureIncludeMembership(db(), seed.teamId, { projectId: extShared, contextUnitId: unit });
     expect(nw.ok).toBe(false);
-    expect(nw.refused, "the tier gate refuses before the shadow machinery").toBe(true);
+    expect(nw.refused, "the integrity gate refuses before the shadow machinery").toBe(true);
+    expect(nw.refusalReason).toBe("system-integrity");
   });
 
   it("writer-direct arms: an initiative-project exclude is never repaired (kind scope); the race-loser converges only on an include", async () => {

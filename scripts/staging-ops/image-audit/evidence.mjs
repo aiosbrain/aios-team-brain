@@ -226,13 +226,15 @@ export function sanitizedFailure({ stage, error, counters = {} }) {
  * coverage-relevant settings of the invocation (PUB-03 requires the archive-traversal and file-size
  * settings to be documented alongside what was skipped).
  */
-export function scannerIdentity(scanner, configText, { settings, representation, canary } = {}) {
+export function scannerIdentity(scanner, configBytes, { settings, representation, canary } = {}) {
   return Object.freeze({
     name: scanner.name,
     version: scanner.version,
     sha256: scanner.sha256,
     configPath: scanner.configPath,
-    configSha256: createHash("sha256").update(String(configText ?? "")).digest("hex"),
+    // The config's BYTES, hashed as read — not a re-encoding of them. `runAudit` has already refused
+    // bytes that do not hash to the pinned `SCANNER.configSha256`, so this is that value, measured.
+    configSha256: createHash("sha256").update(Buffer.isBuffer(configBytes) ? configBytes : String(configBytes ?? "")).digest("hex"),
     ...(settings ? { settings } : {}),
     /**
      * WHAT THE SCANNER WAS ACTUALLY GIVEN. Not the member — a fixed printable header followed by the

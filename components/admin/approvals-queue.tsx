@@ -11,6 +11,7 @@ export interface ApprovalRow {
   action: string;
   resource: string;
   context: Record<string, unknown>;
+  proposed?: Record<string, string | null>;
   created_at: string;
 }
 
@@ -56,7 +57,21 @@ export function ApprovalsQueue({ teamSlug, pending, recent }: { teamSlug: string
                 <span className="font-mono text-xs text-ink-secondary">{a.resource}</span>
                 <span className="text-xs text-ink-tertiary">requested by <span className="font-mono">{a.requested_by_actor || "—"}</span> · {new Date(a.created_at).toLocaleString()}</span>
               </div>
-              {a.context && Object.keys(a.context).length ? (
+              {a.proposed ? (
+                <section aria-label="Proposed changes" className="rounded-lg bg-surface-overlay p-3">
+                  <p className="mb-2 text-sm font-medium">Proposed changes</p>
+                  <dl className="flex max-h-64 flex-col gap-2 overflow-auto text-sm">
+                    {Object.entries(a.proposed).map(([field, value]) => (
+                      <div key={field}>
+                        <dt className="font-medium capitalize">{field}</dt>
+                        <dd className="whitespace-pre-wrap break-words text-ink-secondary">{value ?? "None"}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                </section>
+              ) : a.context?.governed_action_id ? (
+                <p className="text-sm text-red">Proposal unavailable. Refresh before approving.</p>
+              ) : a.context && Object.keys(a.context).length ? (
                 <pre className="max-h-32 overflow-auto rounded-lg bg-surface-overlay p-2 text-xs text-ink-secondary">{JSON.stringify(a.context, null, 2)}</pre>
               ) : null}
               <div className="flex flex-wrap items-center gap-2">
@@ -66,7 +81,7 @@ export function ApprovalsQueue({ teamSlug, pending, recent }: { teamSlug: string
                   value={notes[a.id] ?? ""}
                   onChange={(e) => setNotes({ ...notes, [a.id]: e.target.value })}
                 />
-                <button onClick={() => decide(a.id, "approved")} disabled={pendingTx} className="flex items-center gap-1 rounded-lg border border-emerald/40 bg-emerald/10 px-3 py-1 text-xs font-medium text-emerald-700 disabled:opacity-50"><Check className="size-3.5" /> Approve</button>
+                <button onClick={() => decide(a.id, "approved")} disabled={pendingTx || Boolean(a.context?.governed_action_id && !a.proposed)} className="flex items-center gap-1 rounded-lg border border-emerald/40 bg-emerald/10 px-3 py-1 text-xs font-medium text-emerald-700 disabled:opacity-50"><Check className="size-3.5" /> Approve</button>
                 <button onClick={() => decide(a.id, "denied")} disabled={pendingTx} className="flex items-center gap-1 rounded-lg border border-red/40 bg-red/10 px-3 py-1 text-xs font-medium text-red disabled:opacity-50"><X className="size-3.5" /> Deny</button>
               </div>
             </div>

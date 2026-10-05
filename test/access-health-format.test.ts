@@ -13,6 +13,7 @@ const base: AccessHealth = {
   blindHumans: [],
   unplacedAgents: [],
   activeConnectors: [],
+  externalTierInEveryone: [],
 };
 
 describe("AUDITFIX-23 AC13: the CLI verdict says what blockers now MEAN", () => {
@@ -27,6 +28,18 @@ describe("AUDITFIX-23 AC13: the CLI verdict says what blockers now MEAN", () => 
     expect(lines[0]).toContain(HEALTH_VIOLATIONS);
     expect(lines[0], "the retired word must be gone, not merely joined").not.toContain("LOCKOUTS");
     expect(lines.some((l) => l.includes("general→vendors")), "the finding is printed").toBe(true);
+  });
+
+  it("TIERRET-1 AC-10: the external-tier-in-Everyone drift blocker prints each identity", () => {
+    const r: AccessHealth = {
+      ...base,
+      blockers: ["1 active external-tier human member(s) are in the builtin Everyone group — Everyone grants General"],
+      externalTierInEveryone: [{ memberId: "m-drift-1", email: "contractor@example.test", kind: "human", tier: "external" }],
+    };
+    const text = formatAccessHealth(r).join("\n");
+    expect(text).toContain(HEALTH_VIOLATIONS);
+    expect(text, "the member id an operator can act on").toContain("m-drift-1");
+    expect(text).toContain("contractor@example.test");
   });
 
   it("prints OK for a healthy team", () => {

@@ -13,7 +13,7 @@ import {
 import { UNSUPPORTED_FORMATS, unsupportedMagicFormat } from "../scripts/staging-ops/image-audit/export-walk.mjs";
 import { SCAN_HEADER } from "../scripts/staging-ops/image-audit/scan-surface.mjs";
 import { buildTar, syntheticSecret, ustarSplit } from "./helpers/tar-fixture";
-import { inspectSynthetic, scanFiles, scanSurface, scratchPool, synthesizeImage } from "./helpers/synthetic-image";
+import { inspectSynthetic, memberScanFiles, scanSurface, scratchPool, synthesizeImage } from "./helpers/synthetic-image";
 
 /**
  * PUB-07's hostile-archive row, against the reader that will read real image layers.
@@ -251,10 +251,24 @@ describe("tar reader: a corrupt or oversized archive FAILS (PUB-02)", () => {
     expect(() => [...readTarMembers(bufferSource(tar), { maxMembers: 2 })]).toThrow(/2-member limit/);
   });
 
-  it("stops at the end-of-archive marker rather than reading trailing bytes", () => {
+  /**
+   * INVERTED (AC-AUDIT-03). This test used to pin the reader IGNORING a secret-bearing trailer, which
+   * is exactly the independent reviewer's witness: bytes distributed with the layer that no scanner
+   * ever saw, under a complete-coverage claim. The trailer is now either reported as surface to scan
+   * or — where there is no surface to put it on — refused. It is never silently discarded.
+   */
+  it("reports trailing bytes after the end-of-archive marker instead of discarding them", () => {
     const secret = syntheticSecret();
     const tar = Buffer.concat([buildTar([{ name: "app/x", content: "y" }]), Buffer.from(secret)]);
-    expect(members(tar).map((m) => m.name)).toEqual(["app/x"]);
+    const surfaced: Buffer[] = [];
+    const parsed = [...readTarMembers(bufferSource(tar), {
+      nonzeroTrailer: "surface",
+      onNonzeroTrailer: () => undefined,
+      onSurface: ({ offset, length }: { offset: number; length: number }) => surfaced.push(tar.subarray(offset, offset + length)),
+    })];
+    expect(parsed.map((m) => m.name)).toEqual(["app/x"]);
+    expect(Buffer.concat(surfaced).toString("latin1")).toContain(secret);
+    expect(() => [...readTarMembers(bufferSource(tar), { nonzeroTrailer: "refuse" })]).toThrow(TarFormatError);
   });
 });
 
@@ -355,7 +369,7 @@ describe("an unsupported container is recognised by its MAGIC, at every depth", 
     // STAGING IS UNCHANGED by the recognition: the member is still staged through the same
     // byte-preserving representation, so a scanner rule that CAN read the container still sees it.
     // Recording a gap must not become a reason to stop staging the bytes.
-    const staged = scanFiles(`${result.scanDir}/L0`);
+    const staged = memberScanFiles(`${result.scanDir}/L0`);
     expect(staged).toHaveLength(1);
     expect(readFileSync(staged[0]).subarray(SCAN_HEADER.length).equals(zip)).toBe(true);
   });

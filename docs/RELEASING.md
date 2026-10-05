@@ -455,3 +455,149 @@ Two limits worth stating rather than discovering, both found in review:
 That rule is not a nuisance. Its own comment explains it: a hardcoded list *"rots SILENTLY — the lane
 would keep upgrading from an ever-staler state and stay green, which is the exact failure shape this
 file exists to remove."*
+
+---
+
+## 5. Before main's release policy is armed — the commissioning run (AIO-1124)
+
+`scripts/staging-ops/main-policy.mjs` builds main's three release rulesets, and
+`verifyEffectiveMainPolicy` evaluates them. Everything that has ever been said about what those
+rules DO, however, has been said by a test asserting a **model** of GitHub's rules. Nothing has
+measured what the provider actually does when the normal App, the emergency App and a human admin
+each push, force-push, delete and merge against that policy — so arming it on `main` would be the
+first time anyone found out.
+
+The commissioning harness is one bounded, manually dispatched, disposable experiment that measures
+it, and then deletes everything it made:
+
+| Piece | What it is |
+|---|---|
+| `.github/workflows/release-policy-commissioning.yml` | The manual protected workflow. A closed three-way `mode` input selects one of three reviewed job sets: `commission` (credential-free `intent`, the `fixture` check producer, and the two protected actor jobs), `policy-witness` (one non-protected publisher job, alone) or `transport-rehearsal` (one inert, no-secrets job, alone). |
+| `scripts/staging-ops/policy-commissioning.mjs` | The closed-CLI runner. Nine phases, three flags, no ref/repo/endpoint/actor override anywhere. |
+| `scripts/staging-ops/commissioning-witness.mjs` | The local policy witness's challenge/response contract, its narrow governed-policy projection, and its bounded single-entry archive reader. |
+| `scripts/staging-ops/commissioning-case.mjs` | The closed per-case stage enum and the private per-job state store that carries a case's nonce and fsynced mutation marker between steps. |
+| `scripts/staging-ops/commissioning-journal.mjs` | Two mode-0600 append-only hash-chained local journals — the resource journal and the witness journal — each with its own run-scoped lock. |
+
+**Why the actor jobs measure the policy through a LOCAL WITNESS.** GitHub documents that
+`GET /repos/{repo}/rulesets/{id}` returns `bypass_actors` only to a caller with **write access to the
+ruleset**, and the protected jobs hold `metadata: read` by design. A 200 with the bypass matrix absent
+is therefore the correct response to that credential — not a transient failure — so a protected job
+**cannot** measure the complete policy it is being tested against, and the emergency App's whole
+acceptance depends on that bypass matrix. The rejected alternatives are worth naming: granting the
+release Apps repository Administration would give a release identity power over the policy it is being
+tested against; granting them `actions: write` to self-dispatch would let the subject trigger its own
+examination; a third attestor App is a new credential the spec forbids.
+
+So the existing **local `johnellison` identity**, which already holds admin, is the complete-policy
+measurement authority. Per case: the actor job publishes a challenge carrying a fresh private 256-bit
+nonce; the local witness reads it, measures the full governed policy under admin, and dispatches this
+same reviewed workflow in `policy-witness` mode with a bounded response envelope; the one publisher job
+republishes those exact bytes as a single-entry artifact; the actor downloads it, binds it to its own
+nonce and source, runs the production verifier on the complete governed set, and only then mutates. The
+pair of observations (before and after the mutation) is what bounds the measurement.
+
+> ⚠️ **This is a bounded contemporaneous pre/post measurement under administrative quiescence, NOT an
+> atomic policy-at-mutation proof.** An undetected transient policy change followed by restoration is
+> outside the guarantee. Root must establish a quiet commissioning window; a known concurrent policy
+> writer interrupts the run. Every policy record in the packet carries that sentence, and
+> `check-evidence` refuses a packet that drops it or restates it as an atomicity claim.
+>
+> GitHub authenticates the publisher's actor, the immutable source it ran and the artifact bytes. It
+> does **not** attest that John's report is true. The nonce is a one-use CORRELATION value whose
+> artifact is readable — not a secret — and publication is an explicit narrow disclosure of the
+> commissioning policies' nonsecret governed fields, visible to anyone with Actions artifact access.
+
+**What it cannot do, by construction.** It never promotes `main`, never mutates `main`/`staging`
+protection, never cuts a tag, never deploys Railway and never accepts a release. Every mutable target
+is DERIVED inside the runner from the GitHub run ID and attempt
+(`refs/heads/aios-policy-commissioning/run-<runId>-<attempt>-{normal,emergency,human,pr-head}`), and
+an independent request boundary enforces a verb + endpoint + body allowlist, so routing a call through
+a helper cannot reach a target the guard would refuse. There is no input to type a target into.
+
+**Four things it measures rather than assumes**, because each was a place where a green result would
+otherwise have meant less than it appeared to:
+
+- **The App grants, before any credential is exercised.** Each protected job signs an App JWT from its
+  own private key and reads `GET /app` and `GET /app/installations/<id>`; the installation's granted
+  permissions must equal the closed set for that role exactly, and the installation must be
+  selected-repository and unsuspended. An extra grant refuses there, before the first write.
+- **The policy in force on its own ref, by BODY — from the local witness.** The job re-derives the plan
+  and requires the manifest to agree with that derivation, then runs the complete inverse-transformed
+  compatibility check on the witness's **full governed measurement** (bypass matrix included) plus its
+  measured classic-protection representation. A same-named ruleset whose rules were rewritten after the
+  human approved is refused, not accepted, and the pre/post pair must agree — a complete governed
+  policy that changed across the mutation window stops the case.
+- **The pull request's current target, immediately before the merge attempt.** Both repositories, both
+  refs, the state and the head SHA — and the merge itself carries that head SHA as a condition. A
+  retargeted pull request would otherwise put a real merge into a production ref under the local admin
+  credential, and the case's own readback of the disposable ref could not have detected it.
+- **Both `main` and `staging`**, resolved to complete ruleset definitions over complete pagination.
+  Staging is the dispatch branch and the contribution base; measuring only main and then reporting
+  "production unchanged" would be a claim about half of production.
+
+**The operator sequence.** Root dispatches the workflow, reads the exact run, and drives the local
+phases with the MEASURED run ID and attempt — never a guessed one:
+
+```sh
+# 0. THE TRANSPORT REHEARSAL, first and separately. Actions → Run workflow → branch `staging`,
+#    mode `transport-rehearsal`. It is inert: no App key, no ref, no policy, no enforcement
+#    verdict — it measures only whether the dispatch → publish → download → bind path works
+#    inside this harness's queue and clock bounds, BEFORE any protected approval exists. Serve it
+#    with the local witness below, using that rehearsal run's own ID. A failed rehearsal does not
+#    authorize broader infrastructure or relaxed bounds; its response can satisfy no actor case.
+
+# 1. Actions → "Release policy commissioning (AIO-1124)" → Run workflow → branch `staging`,
+#    mode `commission`. Then download the intent artifact into $COMMISSIONING_EVIDENCE_DIR
+#    (an absolute private 0700 dir).
+node scripts/staging-ops/policy-commissioning.mjs setup         --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --evidence-dir "$COMMISSIONING_EVIDENCE_DIR"
+
+# 2. START THE LOCAL WITNESS, in its own shell, BEFORE the approvals. It holds its own read-only
+#    journal lock, so it runs concurrently with `human-tests` rather than blocking on it, and it
+#    polls for work that does not exist yet — that is the normal beginning of a run. It serves
+#    READY WORK ACROSS BOTH ROLES: approving emergency before normal is a supported ordering, and
+#    a role with nothing published yet is skipped rather than waited on, so neither role's
+#    challenges can expire queued behind the other's. Its exit 0 means all 22 assigned cloud-case
+#    responses were published and reconciled; it is never a pass. If it is restarted, it reconciles
+#    any dispatch already in flight from its own journal and never re-sends a consumed nonce.
+node scripts/staging-ops/policy-commissioning.mjs witness       --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --evidence-dir "$COMMISSIONING_EVIDENCE_DIR" &
+
+# 3. Inspect the setup readback and the exact immutable runner code, THEN approve the two
+#    protected environments in the GitHub UI. That approval is the PC-06 evidence; nothing
+#    in the workflow can produce it.
+node scripts/staging-ops/policy-commissioning.mjs human-tests    --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --evidence-dir "$COMMISSIONING_EVIDENCE_DIR"
+
+# 4. Stop the witness once both actor jobs have finished, then collect and clean up. Every local
+#    phase — including cleanup and collect — re-measures the named operator (`johnellison`,
+#    #5806135, type User, repository admin) before it can reach the journal or the transport.
+node scripts/staging-ops/policy-commissioning.mjs collect        --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --evidence-dir "$COMMISSIONING_EVIDENCE_DIR"
+node scripts/staging-ops/policy-commissioning.mjs cleanup        --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --evidence-dir "$COMMISSIONING_EVIDENCE_DIR"
+node scripts/staging-ops/policy-commissioning.mjs check-evidence --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --evidence-dir "$COMMISSIONING_EVIDENCE_DIR"
+```
+
+**The witness is a prerequisite, not an optional extra.** Each cloud case blocks on its pre and post
+witness responses within a 180-second challenge lifetime that is never extended. If the witness is not
+running, every case times out as `incomplete` after two human approvals have already been spent — which
+is why step 0 exists and why step 2 comes before step 3.
+
+**Read each phase's exit code.** `0` is that phase's affirmative success, `1` a measured assertion
+failure, `2` an invalid invocation, `3` incomplete or ambiguous evidence. Do NOT chain these with
+`&&`/`;` and read the last line: `collect` before cleanup is *expected* to exit 3, and the difference
+between 1 and 3 is the difference between "the policy is wrong" and "we could not look".
+
+**`check-evidence` is the authoritative gate, it trusts nothing for its filename, and passing it is
+still not authorization.** It re-derives every case outcome from the run's own **frozen synthetic
+graph** — so a no-op recorded as a permitted write, or a force flag on a ref that never moved, is a
+blocker rather than a pass — re-classifies each recorded diagnostic against this build's closed table
+rather than reading the record's `policyDenial` boolean, recomputes each declared check expectation
+from its per-context measurement, counts a case only from its own actor's file, requires exactly 22
+distinct witness publications with distinct nonces and artifacts, recomputes cleanup drift from the two
+baselines the file carries rather than reading its `production_drift`, compares the reported resource
+inventory against the verified journal, requires the two App identities to be distinct and to be the
+ones the immutable intent configured, requires the human reviewer's numeric identity and a successful
+protected job in the exact attempt, and re-hashes each PC-06 environment proof from the artifact on
+disk — including that the artifact's own recorded observation is about that control, on that
+environment, with that measured value. And
+then: a complete actor matrix says the mechanics behave as designed on disposable refs. It does not say
+the twelve real production context producers ran, and it is not a decision to change main's policy —
+that remains a separate, root-owned step with its own gates. The runbook, the prerequisites, and what a
+DELIBERATELY-unverified PC-06 control looks like are in `docs/OPS.md` §14.

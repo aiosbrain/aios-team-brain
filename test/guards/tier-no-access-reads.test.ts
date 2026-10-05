@@ -27,11 +27,13 @@ const ALLOWLIST: Record<string, string> = {
   "lib/access/groups.ts": "the single writer: materialization's one-time read + the M3 tier mirror write",
   "lib/admin/members.ts": "createMember writes the invite default; upsert change-detection read",
   "lib/admin/invite.ts": "invite plumbing passes the invite-default through to provisioning",
-  "lib/admin/access-health.ts": "BlindPrincipal.tier — a DIAGNOSTIC payload field in the health report (PRET-6 re-home)",
+  "lib/admin/access-health.ts":
+    "BlindPrincipal.tier — a DIAGNOSTIC payload field in the health report (PRET-6 re-home); TIERRET-1's " +
+    "external-tier-in-Everyone DRIFT blocker compares the record to builtin membership — a read-only " +
+    "operator warning, never a read veto",
   "lib/provisioning/linear.ts": "external-system seat mapping (Linear guest/user) — non-access",
   "lib/access/agent-tokens.ts": "token mint/verify semantics — program §8, untouched",
   "lib/gateway/persistence.ts": "gateway lease predicate — delegated-token semantics, program §8",
-  "lib/gateway/admin-persistence.ts": "gateway policy persistence — program §8",
   "lib/gateway/policy.ts": "gateway policy evaluation — program §8",
   "lib/graph/company-actors.ts": "actor attrs mirror the roster record — metadata, not an access input",
   "lib/metrics/codebases.ts": "roster-metadata read (display fields incl. the record)",

@@ -52,7 +52,8 @@ async function seedAgentWithItem(seed: Seed): Promise<{ token: string; visiblePa
   await addMemberToGroup(db(), seed.teamId, g.groupId!, agent, seed.memberId);
   await grantProjectToGroup(db(), seed.teamId, bySlug.get("agentside")!, g.groupId!, seed.memberId);
 
-  const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent }, seed.memberId);
+  // AUDITFIX-19: an explicit all-reachable choice (stored NULL) — omission is refused at mint now.
+  const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent, scope: { kind: "all-reachable" } }, seed.memberId);
   if (!minted.ok || !minted.token) throw new Error(`mint failed: ${minted.error}`);
   return { token: minted.token, visiblePath: "agent/visible.md", hiddenPath: "agent/hidden.md" };
 }

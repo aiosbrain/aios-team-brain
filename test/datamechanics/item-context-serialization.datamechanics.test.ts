@@ -1837,10 +1837,12 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
       projectId: fixture.system.externalShared,
       contextUnitId: teamUnitId,
     });
+    // TIERRET-1 (N1): the replacement gate routes from the LOCKED item — a team item may enter only
+    // General — so the planted external mirror is refused as a settled system-integrity policy.
     expect.soft(teamResult).toMatchObject({
       ok: false,
       refused: true,
-      refusalReason: "no-widening",
+      refusalReason: "system-integrity",
     });
     const teamMembership = await db()
       .from("project_context_memberships")
@@ -1920,11 +1922,24 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
       )
     ).toBe(false);
 
+    // TIERRET-1 code review 1 LOW-2 (accepted spec §3: "otherwise a mismatching mirror is refused
+    // before membership mutation"): the REVERSE drift is refused too — the writer never mutates
+    // membership on a mirror that disagrees with the locked item, in either direction.
     const reverseResult = await ensureIncludeMembership(db(), fixture.seed.teamId, {
       projectId: fixture.system.externalShared,
       contextUnitId: reverseUnitId,
     });
-    expect.soft(reverseResult).toMatchObject({ ok: true, created: true });
+    expect.soft(reverseResult).toMatchObject({ ok: false, refused: true, refusalReason: "system-integrity" });
+    const reverseMembership = await db()
+      .from("project_context_memberships")
+      .select("id")
+      .eq("team_id", fixture.seed.teamId)
+      .eq("project_id", fixture.system.externalShared)
+      .eq("context_unit_id", reverseUnitId)
+      .eq("decision", "include")
+      .is("valid_to", null);
+    expect.soft(reverseMembership.error).toBeNull();
+    expect.soft(reverseMembership.data ?? [], "a mismatching mirror mutates no membership").toEqual([]);
     const reverseItem = await db()
       .from("items")
       .select("access")
@@ -1938,7 +1953,25 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
         { teamId: fixture.seed.teamId, memberId: fixture.externalViewerId },
         reverseCreated.id
       ),
-      "reverse stale mirror follows external item authority rather than a blanket refusal"
+      "the refused include serves nothing"
+    ).toBe(false);
+
+    // Matching control: once the unit writer re-copies the mirror FROM the locked item, the same
+    // include follows external item authority (the outcome this case asserted before LOW-2).
+    const refreshed = await reconcileItemUnit(db(), fixture.seed.teamId, reverseCreated.id);
+    expect.soft(refreshed.ok, refreshed.error).toBe(true);
+    const matchedResult = await ensureIncludeMembership(db(), fixture.seed.teamId, {
+      projectId: fixture.system.externalShared,
+      contextUnitId: reverseUnitId,
+    });
+    expect.soft(matchedResult).toMatchObject({ ok: true, created: true });
+    expect.soft(
+      await canSeeItem(
+        db(),
+        { teamId: fixture.seed.teamId, memberId: fixture.externalViewerId },
+        reverseCreated.id
+      ),
+      "with a matching mirror the include follows external item authority"
     ).toBe(true);
   });
 
@@ -3154,10 +3187,10 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
     { pathKind: "unchanged-body", changed: false },
     { pathKind: "changed-body", changed: true },
   ])(
-    "A13-08: settled no-widening refusal rolls back the $pathKind trusted narrowing",
+    "A13-08: settled system-integrity refusal (forbidden General edge) rolls back the $pathKind trusted narrowing",
     async ({ pathKind, changed }) => {
       const fixture = await seedConvergedExternalItem(
-        `auditfix13/no-widening-${pathKind}.md`
+        `auditfix13/system-integrity-${pathKind}.md`
       );
       await grantGeneralToExternal(fixture);
       const before = await storedState(fixture.seed, fixture.itemId);
@@ -3181,7 +3214,7 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
       ).toEqual(before);
       expect(outcome.result, "the ingest must not claim a refused narrowing succeeded").toBeNull();
       expect(outcome.error, "the refusal is named and distinguishable from a read outage").toMatch(
-        /(?:context|no-widening).*(?:gate|refus)|(?:gate|refus).*no-widening/i
+        /context gate refusal: system-integrity/i
       );
       expect(
         await canSeeItem(

@@ -3,7 +3,13 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { adminClient } from "@/lib/db/admin";
 import { audit } from "@/lib/api/audit";
 
+export class ApiAuthUnavailable extends Error {
+  constructor() { super("Authentication unavailable"); }
+}
+
 export type ApiAuth = {
+  /** Present for error-preserving governed authentication; never the bearer secret. */
+  credentialFingerprint?: string;
   teamId: string;
   memberId: string;
   memberTier: "team" | "external";
@@ -118,7 +124,7 @@ export async function markApiKeyUsed(apiKeyId: string): Promise<boolean> {
  */
 export async function authenticateApiKey(
   req: Request,
-  { recordUsage = true }: { recordUsage?: boolean } = {},
+  { recordUsage = true, preserveErrors = false }: { recordUsage?: boolean; preserveErrors?: boolean } = {},
 ): Promise<ApiAuth | null> {
   const header = req.headers.get("authorization") || "";
   const teamHeader = req.headers.get("x-aios-team") || "";
@@ -140,12 +146,14 @@ export async function authenticateApiKey(
   if (!m) return fail("malformed_bearer");
   const [, keyId, secret] = m;
 
-  const { data: key } = await db
+  const { data: key, error: keyError } = await db
     .from("api_keys")
     .select("id, team_id, member_id, key_hash, revoked_at, members(actor_handle, status, role, display_name, email), teams(slug)")
     .eq("key_id", keyId)
     .maybeSingle();
 
+  if (keyError && preserveErrors) throw new ApiAuthUnavailable();
+  if (preserveErrors && key && !key.teams) throw new ApiAuthUnavailable();
   if (!key || key.revoked_at) return fail("unknown_or_revoked_key");
 
   const candidate = createHash("sha256").update(secret).digest();
@@ -176,6 +184,7 @@ export async function authenticateApiKey(
     const { resolveViewerPosture } = await import("@/lib/access/posture");
     posture = await resolveViewerPosture(db, key.team_id, key.member_id);
   } catch (e) {
+    if (preserveErrors) throw new ApiAuthUnavailable();
     console.error("[auth] posture resolution failed:", e instanceof Error ? e.message : e);
     return fail("posture_unresolvable");
   }
@@ -186,6 +195,7 @@ export async function authenticateApiKey(
     memberTier: posture,
     memberRole: member.role,
     apiKeyId: key.id,
+    ...(preserveErrors ? { credentialFingerprint: key.key_hash } : {}),
     actorHandle: member.actor_handle,
     displayName: member.display_name,
     email: member.email,

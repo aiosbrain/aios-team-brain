@@ -71,9 +71,10 @@ describe("salvageSummaries — a sentence about a day outlives the shape that he
     expect(old.size).toBe(0);
   });
 
-  it("refuses pre-v15 prose even when fresh — those sentences can carry the Slack misattribution", () => {
+  it("refuses pre-v17 prose even when fresh — those sentences can carry the Slack misattribution", () => {
     // The new contribution-day and attribution contract invalidates older sentences even if the
-    // stored person/day key happens to match the rebuilt one.
+    // stored person/day key happens to match the rebuilt one. v17 is where that contract integrated
+    // with TIERRET-1's v16, so the floor moved with it (v15 was reserved for it and never shipped).
     const stale = salvageSummaries(payload(PAYLOAD_VERSION - 1, [{ memberId: "m1", summary: "Shared two sizzle reels." }]), NOW - 1000, NOW, G);
     expect(stale.size).toBe(0);
     // …and the floor is a floor, not an equality check: the CURRENT version still salvages.

@@ -20,6 +20,8 @@
 import { createHash } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 import { CONFIG_MEDIA_TYPES, LAYER_MEDIA_TYPES, isDigest } from "./subject.mjs";
+import { assertMemberPathBounded } from "./tar-reader.mjs";
+import { createRetainedStateBudget, createWorkBudget } from "./budgets.mjs";
 import { ACCEPTED_MEDIA_TYPES } from "../image-publication.mjs";
 
 export class AuditIdentityError extends Error {
@@ -190,11 +192,28 @@ const WHITEOUT = ".wh.";
 
 /** What a member name means in overlay terms. A whiteout DELETES; it is not a file called `.wh.x`. */
 export function whiteoutOf(name) {
-  const at = name.lastIndexOf("/");
-  const dir = at === -1 ? "" : name.slice(0, at + 1);
-  const base = at === -1 ? name : name.slice(at + 1);
+  /**
+   * The BASENAME after one trailing `/` is dropped (B6). Extractors test the cleaned basename whatever
+   * the entry's type, so a directory-typed `app/.wh.d/` is a whiteout of `app/d` to them. Reading the
+   * empty text after that slash as "no whiteout" left `app/d/x.js` visible. The inspector separately
+   * records any marker that is not an EMPTY REGULAR file — the only form OCI permits — as a gap.
+   */
+  const clean = name.endsWith("/") ? name.slice(0, -1) : name;
+  const at = clean.lastIndexOf("/");
+  const dir = at === -1 ? "" : clean.slice(0, at + 1);
+  const base = at === -1 ? clean : clean.slice(at + 1);
   if (base === OPAQUE) return { kind: "opaque", target: dir };
-  if (base.startsWith(WHITEOUT)) return { kind: "delete", target: `${dir}${base.slice(WHITEOUT.length)}` };
+  if (base.startsWith(WHITEOUT)) {
+    /**
+     * An ordinary whiteout naming NOTHING, the directory itself or its parent (`.wh.`, `.wh..`,
+     * `.wh...`) is malformed (L6): containerd refuses to unpack it, and applying it here would delete
+     * the root or a parent. It is reported as `malformed` and deletes nothing. (The exact
+     * `.wh..wh..opq` opaque marker is handled above, before this rule.)
+     */
+    const named = base.slice(WHITEOUT.length);
+    if (named === "" || named === "." || named === "..") return { kind: "malformed" };
+    return { kind: "delete", target: `${dir}${named}` };
+  }
   return { kind: "none" };
 }
 
@@ -206,29 +225,278 @@ export function whiteoutOf(name) {
  * Every layer's content is inspected regardless of this; the merged view is only used to REPORT that
  * a finding is invisible to anyone who inspects a started container.
  */
-export function mergedFilesystem(layerPaths) {
+/**
+ * Every PROPER ancestor directory key of `key` (`a/`, `a/b/` for `a/b/c`), found by walking the
+ * separators of the original string once — no repeated split/join (B9). `visit` may stop early by
+ * returning `true`. Callers bound the path first (`assertMemberPathBounded`), so this is at most
+ * `MEMBER_PATH_LIMITS.maxSegments` steps.
+ */
+export function forEachAncestor(key, visit) {
+  const end = key.endsWith("/") ? key.length - 1 : key.length;
+  for (let at = key.indexOf("/"); at !== -1 && at < end; at = key.indexOf("/", at + 1)) {
+    if (visit(key.slice(0, at + 1)) === true) return true;
+  }
+  return false;
+}
+
+/**
+ * The merged view, under the run's TWO authorities (B9-R): `retained` bounds the logical bytes of state
+ * this function keeps (visible, shadowed, the ancestor index, layer-local sets and the B10 ordering
+ * state), and `work` bounds CPU steps and consults the deadline. Direct callers get finite defaults.
+ */
+export function mergedFilesystem(layerPaths, {
+  deadline,
+  retained = createRetainedStateBudget(),
+  work = createWorkBudget({ deadline }),
+} = {}) {
   const visible = new Map();
   const shadowed = [];
+  /**
+   * Layers in which the merged view is AMBIGUOUS (B6, B8): a file and a directory of one name, a
+   * non-directory with entries beneath it, entries beneath a lower non-directory, or an ORDINARY
+   * whiteout that overlaps an entry of its own layer (OCI says whiteouts apply only to lower layers;
+   * containerd v2.1.4 removes the entry when the whiteout follows it). Extractors do not agree on these,
+   * so the inspector records each as a blocking gap rather than picking one outcome.
+   */
+  const conflicts = new Set();
+
+  const ancestors = (key, visit) => forEachAncestor(key, (ancestor) => { work.step("merged namespace"); return visit(ancestor); });
+
+  /**
+   * THE KEY MODEL. A directory key ends in `/` (canonical directory identity is type-driven, so `app`
+   * and `app/` written as directories are one key); every other key does not. `.` is the root.
+   *
+   * SEGMENT INDEX. `beneath` maps a directory key to the visible keys strictly under it, so a subtree
+   * removal is a lookup rather than a scan of every visible key.
+   */
+  const beneath = new Map();
+  const place = (key, layer) => {
+    assertMemberPathBounded(key);
+    work.step("merged namespace placement");
+    // The visible entry itself: its key string and the map membership, charged before the insertion.
+    if (!visible.has(key)) retained.path(key);
+    visible.set(key, layer);
+    ancestors(key, (ancestor) => {
+      let set = beneath.get(ancestor);
+      if (!set) {
+        // A new ancestor container is charged (and stays charged) even if every member later leaves.
+        retained.container(ancestor);
+        beneath.set(ancestor, (set = new Set()));
+      }
+      // A relation is only free when the exact membership is PROVEN to exist already.
+      retained.relation(ancestor, { alreadyMember: set.has(key) });
+      set.add(key);
+    });
+  };
+  const remove = (key, removedBy, reason) => {
+    work.step("merged namespace removal");
+    if (!visible.has(key)) return;
+    // The shadow record is retained for the whole run: charge it before pushing.
+    retained.record(2);
+    retained.string(key);
+    retained.string(reason);
+    shadowed.push({ path: key, layer: visible.get(key), removedBy, reason });
+    visible.delete(key);
+    ancestors(key, (ancestor) => { beneath.get(ancestor)?.delete(key); });
+  };
+  /**
+   * `target` itself, its directory spelling, and everything beneath it — on a segment boundary. The
+   * snapshot array is real retained state while it exists, so each member is charged before the copy.
+   */
+  const subtree = (target) => {
+    const out = [target, `${target}/`];
+    retained.membership(2);
+    for (const key of beneath.get(`${target}/`) ?? []) {
+      work.step("merged namespace subtree");
+      retained.membership();
+      out.push(key);
+    }
+    return out;
+  };
+  const isDirectoryKey = (key) => key.endsWith("/") || key === ".";
+
+  /**
+   * Is any proper ancestor this member needs RIGHT NOW an occupied non-directory? `visible` holds the
+   * layers below plus whatever this layer's earlier whiteouts have already removed, so a prior removal
+   * or an earlier explicit directory replacement makes the parent legitimate; anything later does not.
+   * Bounded by the shared work authority, one step per ancestor, and it follows no link.
+   */
+  const extractionParentConflict = (path, explicitDirsSeen, nonDirsSeenHere) => ancestors(path, (ancestor) => {
+    if (explicitDirsSeen.has(ancestor)) return false; // replaced by an explicit directory, before this event
+    const bare = ancestor.slice(0, -1);
+    if (nonDirsSeenHere.has(bare)) return true; // a non-directory this layer wrote earlier
+    return visible.has(bare) && !isDirectoryKey(bare); // a non-directory a lower layer left there
+  });
+
+  /**
+   * Does any EARLIER same-layer descendant of `target` depend on an intermediate directory that was not
+   * declared before this marker? Bounded: every candidate costs a step BEFORE the prefix test, so a
+   * layer full of unrelated markers cannot buy unchecked quadratic scanning, and no second transitive
+   * index is built — the per-layer set of declared directories plus this scan is the whole state.
+   */
+  const opaqueOrderAmbiguity = (target, earlierOrdinary, explicitDirsSeen) => {
+    for (const candidate of earlierOrdinary) {
+      work.step("opaque ordering candidate");
+      // `target` ends in `/`, or is `""` for the root marker — where every earlier entry is a candidate.
+      if (candidate === target || candidate === "." || !candidate.startsWith(target)) continue;
+      const missing = forEachAncestor(candidate, (ancestor) => {
+        work.step("opaque ordering ancestor");
+        // Only the directories strictly BETWEEN the marker's target and this descendant matter.
+        if (ancestor.length <= target.length) return false;
+        return !explicitDirsSeen.has(ancestor);
+      });
+      if (missing) return true;
+    }
+    return false;
+  };
+
   layerPaths.forEach((paths, index) => {
     for (const name of paths) {
-      const white = whiteoutOf(name);
-      if (white.kind === "delete") {
-        if (visible.has(white.target)) shadowed.push({ path: white.target, layer: visible.get(white.target), removedBy: index, reason: "deleted" });
-        visible.delete(white.target);
-        continue;
+      // Entry validation is charged work even for a root-level name with no ancestors at all.
+      work.step("merged namespace entry");
+      assertMemberPathBounded(name);
+    }
+    // This layer's ordinary entries, and every directory they sit beneath — computed ONCE, before
+    // either pass, so both passes and the conflict rules see the same sets whatever the tar order.
+    const entries = [];
+    for (const name of paths) {
+      work.step("merged namespace filter");
+      if (whiteoutOf(name).kind === "none") {
+        retained.membership();
+        entries.push(name);
       }
-      if (white.kind === "opaque") {
-        for (const existing of [...visible.keys()]) {
-          if (existing.startsWith(white.target) && existing !== white.target) {
-            shadowed.push({ path: existing, layer: visible.get(existing), removedBy: index, reason: "opaque-directory" });
-            visible.delete(existing);
-          }
+    }
+    const keys = new Set();
+    for (const key of entries) {
+      work.step("merged namespace key set");
+      if (!keys.has(key)) retained.membership();
+      keys.add(key);
+    }
+    const hasDescendantHere = new Set();
+    for (const key of entries) ancestors(key, (ancestor) => {
+      if (!hasDescendantHere.has(ancestor)) retained.relation(ancestor);
+      hasDescendantHere.add(ancestor);
+    });
+    /** Keys THIS layer placed. Anything else visible is lower — no per-layer copy of the whole map. */
+    const placedHere = new Set();
+    const rememberPlaced = (key) => { if (!placedHere.has(key)) retained.membership(); placedHere.add(key); };
+    const isLower = (key) => visible.has(key) && !placedHere.has(key);
+
+    /**
+     * B10 — THE OPAQUE MARKER'S ORDER MATTERS, so pass 1 walks the layer in TAR ORDER and remembers
+     * what came before each marker.
+     *
+     * The pinned runtime has two extraction paths. The overlay converter keeps a same-layer descendant
+     * written before an opaque marker; the non-overlay converter can REMOVE one whose intermediate
+     * directory it only created implicitly, because that directory is not in its unpacked set. Rather
+     * than pick a runtime, the audit records the existing `merged-type-conflict` for the ambiguous
+     * shape: an earlier descendant beneath the marker's directory with an intermediate directory that
+     * was never declared as its own entry before the marker.
+     *
+     * Supported, and deliberately NOT flagged: a marker that precedes its descendants, an earlier
+     * DIRECT child (no intermediate at all), an earlier deep descendant whose whole intermediate chain
+     * was declared before the marker (in any order relative to the descendant), and unrelated or
+     * merely prefix-sharing siblings. The root marker keeps its own behaviour (B7).
+     */
+    const explicitDirsSeen = new Set();
+    /** Ordinary NON-directory keys this layer has written so far, in tar order (round 10). */
+    const nonDirsSeenHere = new Set();
+    const earlierOrdinary = [];
+    for (const name of paths) {
+      const white = whiteoutOf(name);
+      work.step("merged namespace event");
+      /**
+       * THE ORDERED EXTRACTION-PARENT INVARIANT (round 11), applied to EVERY member event — ordinary
+       * entries and whiteout markers alike — BEFORE this event records any directory declaration or
+       * replacement of its own.
+       *
+       * The pinned extractor prepares a member's parents before it creates or interprets that member,
+       * and preparing a parent that is currently a regular file, a hardlink, a FIFO or a link fails
+       * with ENOTDIR. So a member written under such a parent never appears, whatever the layer does
+       * LATER: a directory entry further down the tar cannot repair an extraction that already failed.
+       * Checking the chain here, in tar order, is what makes "later" impossible to mistake for "before"
+       * — an earlier whiteout that removed the blocking ancestor, or an earlier explicit directory that
+       * replaced it, is respected because it has already been applied to this state.
+       *
+       * Directory members are checked too: a directory below a blocking ancestor is as impossible as a
+       * file. The gap is the existing sticky `merged-type-conflict`, every byte is still staged, and no
+       * link is followed.
+       */
+      if (extractionParentConflict(name, explicitDirsSeen, nonDirsSeenHere)) conflicts.add(index);
+      if (white.kind === "none") {
+        // Ordinary entries are remembered in order, so a later marker can ask what preceded it.
+        retained.membership();
+        earlierOrdinary.push(name);
+        if (isDirectoryKey(name)) {
+          if (!explicitDirsSeen.has(name)) retained.membership();
+          explicitDirsSeen.add(name);
+        } else if (!nonDirsSeenHere.has(name)) {
+          retained.membership();
+          nonDirsSeenHere.add(name);
         }
         continue;
       }
-      if (visible.has(name)) shadowed.push({ path: name, layer: visible.get(name), removedBy: index, reason: "overwritten" });
-      visible.set(name, index);
+      /**
+       * THE MARKER'S OWN PARENT CHAIN (round 10). The pinned extractor prepares a member's parents
+       * BEFORE it interprets a whiteout, and preparing a parent that is currently a regular file or a
+       * link fails with ENOTDIR — it does not silently replace it with a directory. So a marker under a
+       * non-directory cannot produce the filesystem this audit would otherwise report as complete. An
+       * explicit directory entry earlier in THIS layer does replace it, and is respected; a declaration
+       * after the marker does not retroactively make it valid.
+       */
+      /**
+       * B10 applies to the ROOT marker too (round 9). A root `.wh..wh..opq` after entries that created
+       * `app/` and `app/d/` implicitly is the same ambiguity one level up: the non-overlay converter can
+       * remove those undeclared directories and everything under them. Only the semantic root `.` is
+       * exempt — it is never an intermediate — and B7's lower-layer emptying is unchanged.
+       */
+      if (white.kind === "opaque" && opaqueOrderAmbiguity(white.target, earlierOrdinary, explicitDirsSeen)) {
+        conflicts.add(index);
+      }
+      if (white.kind === "delete") {
+        const target = white.target;
+        // B8: an ordinary whiteout overlapping this layer's own entry is order-dependent across
+        // extractors. A similar-prefix sibling (`app/d2` for `app/.wh.d`) is not an overlap.
+        if (keys.has(target) || keys.has(`${target}/`) || hasDescendantHere.has(`${target}/`)) conflicts.add(index);
+        for (const existing of subtree(target)) remove(existing, index, "deleted");
+      } else if (white.kind === "opaque") {
+        const source = white.target === "" ? visible.keys() : (beneath.get(white.target) ?? []);
+        const children = [];
+        for (const key of source) {
+          work.step("merged namespace opaque scan");
+          if (white.target === "" && key === ".") continue;
+          retained.membership();
+          children.push(key);
+        }
+        for (const existing of children) remove(existing, index, "opaque-directory");
+      }
+    }
+
+    /**
+     * PASS 2 — this layer's entries, with TYPE REPLACEMENT against the layers below (B6, OCI "changeset
+     * over existing files"): a non-directory at `P` replaces a lower directory `P/` and everything under
+     * it; a directory at `P/` replaces a lower non-directory `P`; a directory over a directory merges.
+     */
+    for (const key of entries) {
+      if (isDirectoryKey(key)) {
+        const bare = key.slice(0, -1);
+        if (keys.has(bare)) conflicts.add(index); // a file and a directory of one name in one layer
+        if (isLower(bare) && !isDirectoryKey(bare)) remove(bare, index, "replaced-by-directory");
+      } else {
+        if (keys.has(`${key}/`) || hasDescendantHere.has(`${key}/`)) conflicts.add(index);
+        for (const existing of subtree(key).slice(1)) {
+          if (isLower(existing)) remove(existing, index, "replaced-by-non-directory");
+        }
+      }
+      /**
+       * The old whole-layer check lived here and asked whether the layer declared the directory ANYWHERE
+       * (`keys.has(ancestor)`), which let a later declaration excuse an earlier member. The ordered
+       * invariant in pass 1 replaces it: it asks what existed when the member was actually written.
+       */
+      if (visible.has(key)) remove(key, index, "overwritten");
+      place(key, index);
+      rememberPlaced(key);
     }
   });
-  return { visible, shadowed };
+  return { visible, shadowed, conflicts: Object.freeze([...conflicts].sort((a, b) => a - b)) };
 }

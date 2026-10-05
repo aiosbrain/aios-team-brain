@@ -109,7 +109,9 @@
  */
 // 1.25 — closed health v3 configured-check census, persisted verbatim (AIO-1096).
 // 1.26 — strict append-only finding intake with candidate and run-summary finalization (AIO-1101).
-export const BRAIN_API_VERSION = "1.26";
+// 1.27 — POST /api/v1/evidence/search: bounded FTS source passages, no answer generation (AIO-1175).
+// 1.28 — durable governed action submit and initiating-member status routes (AIO-1186).
+export const BRAIN_API_VERSION = "1.28";
 
 /** Server-only Executor gateway negotiation; independent of the member API surface. */
 export const GATEWAY_CONTRACT_VERSION = "1.10";

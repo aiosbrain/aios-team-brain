@@ -5,6 +5,8 @@ import {
   type ManagedGatewayApprovalRow,
 } from "@/components/admin/managed-gateway-approvals";
 import { getSessionUser } from "@/lib/auth/session";
+import { requireTeamAdmin } from "@/lib/auth/guard";
+import { loadGovernedApprovalProposals } from "@/lib/actions/governed/approval-preview";
 import {
   authorizeGatewayAdmin,
   listGatewayApprovals,
@@ -12,6 +14,9 @@ import {
 
 export default async function ApprovalsAdminPage({ params }: { params: Promise<{ team: string }> }) {
   const { team: teamSlug } = await params;
+  // A layout can render concurrently: authorize before reading proposed content.
+  const admin = await requireTeamAdmin(teamSlug);
+  if (!admin) return null;
   const db = await serverClient();
 
   const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
@@ -46,8 +51,15 @@ export default async function ApprovalsAdminPage({ params }: { params: Promise<{
       }
     })(),
   ]);
-  const pending = pendingRes.data;
+  const pending = (pendingRes.data ?? []) as ApprovalRow[];
   const recent = recentRes.data;
+  const governedIds = pending.filter(row => row.context?.governed_action_id).map(row => row.id);
+  if (governedIds.length) {
+    const proposals = await loadGovernedApprovalProposals(admin.teamId, governedIds);
+    for (const row of pending) {
+      row.proposed = proposals.get(row.id);
+    }
+  }
 
   return (
     <div className="flex flex-col gap-4">
@@ -57,7 +69,7 @@ export default async function ApprovalsAdminPage({ params }: { params: Promise<{
       </p>
       <ApprovalsQueue
         teamSlug={teamSlug}
-        pending={(pending ?? []) as ApprovalRow[]}
+        pending={pending}
         recent={(recent ?? []) as DecidedRow[]}
       />
       {managed ? (

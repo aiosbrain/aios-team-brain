@@ -59,14 +59,15 @@ async function seedCommit(seed: Seed, title: string, whenIso: string) {
 
 const recentIso = () => new Date(Date.now() - 3_600_000).toISOString(); // 1h ago (in the 7-day window)
 
-/** PRET-6: every row is a vis-variant — read the VIEWER's row (`vis:<tier>:<hash>`). */
+/** PRET-6: every row is a variant — read the VIEWER's row. TIERRET-1: the key is the admission
+ *  variant `adm:<class>:<tier>:<hash>`, resolved by the SAME function a real read uses. */
 async function readRow(seed: Seed, tier: "team" | "external", memberId: string = seed.memberId) {
-  const vis = await visOf(seed, memberId);
+  const { timelineViewKey } = await import("@/lib/dashboard/timeline-cache");
   const { data } = await db()
     .from("work_timeline_cache")
     .select("group_key, payload, computed_at")
     .eq("team_id", seed.teamId)
-    .eq("group_key", `vis:${tier}:${vis!.visibilityHash}`)
+    .eq("group_key", await timelineViewKey(db(), seed.teamId, tier, memberId))
     .maybeSingle();
   return data as { group_key: string; payload: unknown; computed_at: string | Date } | null;
 }
@@ -85,7 +86,8 @@ describe("work-timeline cache layer (real Postgres)", () => {
     // It persisted the versioned payload { v, days } to the viewer's vis-variant row (PRET-6:
     // the plain tier row is never written), matching what was returned.
     const row = await readRow(seed, "team");
-    expect(row?.group_key).toMatch(/^vis:team:/);
+    // TIERRET-1: the seed admin is an oracle-accepted Everyone human → the `me` admission class.
+    expect(row?.group_key).toMatch(/^adm:me:team:/);
     // A LITERAL, deliberately: it forces a conscious edit every time the version moves, which is the
     // moment to ask "did the payload shape or meaning change?". v10 adds `TaskGroup.assignee`, so a
     // v9 row would render a teammate's ticket as if it were the viewer's own.

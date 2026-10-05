@@ -14,9 +14,11 @@ import { EVERYONE_SLUG, EXTERNAL_SLUG } from "@/lib/access/groups";
  * Eligibility is applied READ-side here even though the groups writer already refuses
  * ineligible memberships — a flag flipped after a row snuck in must still resolve to nothing.
  *
- * `projectScope` is token attenuation (spec §10): `null`/`undefined` = unattenuated (the spawn
- * default — the ONE access-input where null opens rather than closes, deliberate and named in
- * the spec); `[]` = sees nothing. The two must never be conflated.
+ * `projectScope` is token attenuation (spec §10): `null`/`undefined` = unattenuated (the ONE
+ * access-input where null opens rather than closes, deliberate and named in the spec); `[]` = sees
+ * nothing. The two must never be conflated. This is the STORED read meaning only: since AUDITFIX-19
+ * a new mint stores NULL solely for an explicit all-reachable choice — omission is refused at
+ * issuance — while every existing NULL/`[]`/list token keeps exactly this read behaviour.
  *
  * Authorship is never an access input: nothing in this module reads the items table or any
  * authorship column (guarded by the oracle-no-authorship check in
@@ -61,7 +63,18 @@ export async function visibleProjects(db: DbClient, principal: Principal): Promi
 export async function visibleProjectsWithError(
   db: DbClient,
   principal: Principal
-): Promise<{ set: VisibleSet; error?: boolean }> {
+): Promise<{
+  set: VisibleSet;
+  error?: boolean;
+  /**
+   * TIERRET-1 (N3): true iff the principal's builtin EVERYONE row was ACCEPTED by this oracle —
+   * i.e. passed `isBuiltinEligible` (an active human). Raw posture (`lib/access/posture`) reads the
+   * row alone, so a PLANTED Everyone row on a standing agent is "team" posture but never this bit.
+   * The member-content admission resolver keys Everyone's hand-entered audience on THIS, never on
+   * posture. Absent on every empty/error path — the fail-closed reading.
+   */
+  everyone?: boolean;
+}> {
   const { data: member, error: mErr } = await db
     .from("members")
     .select("id, kind, is_connector, status")
@@ -82,18 +95,16 @@ export async function visibleProjectsWithError(
   // permissive model — the release precondition guarantees materialization). PERMANENT checks:
   // isBuiltinEligible (a planted non-human row never grants) and the unknown-slug fail-closed.
   const rows = (memberships ?? []) as { group_id: string; groups: { slug: string; is_builtin: boolean } | null }[];
-  const groupIds = new Set(
-    rows
-      .filter((r) => {
-        const g = r.groups;
-        if (!g) return false; // missing embed: unresolvable group → fail closed (review M2)
-        if (!g.is_builtin) return true;
-        if (!isBuiltinEligible(member)) return false;
-        return g.slug === EVERYONE_SLUG || g.slug === EXTERNAL_SLUG;
-      })
-      .map((r) => r.group_id)
-  );
+  const accepted = rows.filter((r) => {
+    const g = r.groups;
+    if (!g) return false; // missing embed: unresolvable group → fail closed (review M2)
+    if (!g.is_builtin) return true;
+    if (!isBuiltinEligible(member)) return false;
+    return g.slug === EVERYONE_SLUG || g.slug === EXTERNAL_SLUG;
+  });
+  const groupIds = new Set(accepted.map((r) => r.group_id));
   if (groupIds.size === 0) return { set: empty() };
+  const everyone = accepted.some((r) => r.groups?.is_builtin === true && r.groups.slug === EVERYONE_SLUG);
 
   const { data: grants, error: pgErr } = await db
     .from("project_groups")
@@ -108,7 +119,7 @@ export async function visibleProjectsWithError(
     const scope = new Set(principal.projectScope);
     projectIds = new Set([...projectIds].filter((p) => scope.has(p)));
   }
-  return { set: { projectIds, groupIds } };
+  return { set: { projectIds, groupIds }, everyone };
 }
 
 /** Convenience predicate over the oracle result. */

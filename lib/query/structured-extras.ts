@@ -1,7 +1,12 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
 import { isRestrictedTier } from "@/lib/auth/visibility";
-import { newSqlParams, provenanceRowSqlFromIds, type ProvenancePrincipal } from "@/lib/access/provenance-sql";
+import {
+  newSqlParams,
+  provenanceRowSqlFromIds,
+  labelCeilingApplies,
+  type ProvenancePrincipal,
+} from "@/lib/access/provenance-sql";
 
 /**
  * Structured-context helpers that fix the "digests are recency-capped" scaling gaps (Gaps #5, #6).
@@ -72,11 +77,14 @@ export async function matchingDecisions(
     principal?: ProvenancePrincipal;
     /** AUDITFIX-7: a token's effective project set; absent closes the hand-typed arm. */
     tokenProjectIds?: readonly string[];
+    /** TIERRET-1: an admitted member's granted project set; absent closes the hand-typed arm. */
+    memberProjectIds?: readonly string[];
   }
 ): Promise<DecisionMatch[]> {
   if (!orQuery.trim()) return [];
   try {
-    const access = isRestrictedTier(tier) ? "and d.audience = 'external'" : "";
+    // TIERRET-1: the label ceiling follows the PRINCIPAL — lifted for an admitted member only.
+    const access = labelCeilingApplies(enforce?.principal, tier) ? "and d.audience = 'external'" : "";
     const p = newSqlParams([orQuery, teamId, limit]);
     const prov = provenanceRowSqlFromIds("d", p, {
       visibleItemIds: enforce?.visibleItemIds ?? new Set(),
@@ -86,6 +94,8 @@ export async function matchingDecisions(
       principal: enforce?.principal,
       // AUDITFIX-7: forwarded on the same terms — absent closes.
       tokenProjectIds: enforce?.tokenProjectIds,
+      // TIERRET-1: forwarded on the same terms — absent closes.
+      memberProjectIds: enforce?.memberProjectIds,
     });
     const params: unknown[] = p.values;
     const sql = `

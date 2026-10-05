@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # dev-test-setup.sh — one command to set up a clean manual e2e test:
 #   reset+seed the brain (with login-able demo users) → build a wired demo spoke
-#   → print a one-click dashboard login link and the exact aios commands to run.
+#   → print the local dashboard login link and the exact aios commands to run.
 #
-# Prereqs: the ephemeral test Postgres (`npm run db:test:up`, port 5434) and
-# `npm run dev` (port 3000) both up, with `npm run dev` pointed at the SAME test DB
-# (DATABASE_URL=postgres://app:app@localhost:5434/app_test) — never a real/prod DB.
+# Prereqs: the ephemeral test Postgres (`npm run db:test:up`, port 5434) and ONE dev server started
+# with `npm run dev:login` (AIOS_DEV_LOGIN=1, bound to 127.0.0.1, port 3000), pointed at the SAME
+# test DB (DATABASE_URL=postgres://app:app@localhost:5434/app_test) — never a real/prod DB.
+# Plain `npm run dev` serves push/query but leaves the login link a 404: the dev-login bypass is off
+# unless the server was started with it. This script never enables it and never requests it.
 #
 # NOTE: the reset path below runs `npm run db:test:up`, which DESTROYS and recreates the container
-# (scripts/db-test-up.sh) — so an already-running `npm run dev` loses every pooled connection and
+# (scripts/db-test-up.sh) — so an already-running dev server loses every pooled connection and
 # reconnects. That is normally invisible (node-postgres evicts dead clients), but if the dev server
 # is mid-request you may see one transient error. `--no-reset` skips it.
 #
@@ -16,7 +18,13 @@
 #   npm run test:setup            # full reset + seed + spoke
 #   npm run test:setup -- --no-reset   # keep existing data, just re-mint key + spoke
 #
-# Env: OPS_DIR (default ~/Projects/aios-workspace), SPOKE (default /tmp/acme-workspace)
+# Env: OPS_DIR (default ~/Projects/aios-workspace), SPOKE (default /tmp/acme-workspace),
+#      APP_URL (default http://127.0.0.1:3000) — the brain URL wired into the spoke and checked for
+#        API availability. It is never used to build the login link.
+#      DEV_LOGIN_PORT (default 3000) — this helper only: the port of the local dev server, printed in
+#        the login link and its launch command. For another port start the server with
+#        `npm run dev:login -- --port <port>` and point APP_URL at the same port: the two are
+#        independent, and the banner says so (it never rewrites APP_URL) when they differ.
 
 set -euo pipefail
 BRAIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -33,6 +41,11 @@ set -a; source .env.local; set +a
 # Target the ephemeral test DB, never whatever .env.local's DATABASE_URL points at.
 export DATABASE_URL="postgres://app:app@localhost:${DB_PORT}/app_test"
 [[ -d "$OPS_DIR" ]] || { echo "aios-workspace not found at $OPS_DIR (set OPS_DIR=)"; exit 1; }
+# Canonical decimal 1–65535 only (no sign, no leading zero): it is printed into a URL and a command.
+DEV_LOGIN_PORT="${DEV_LOGIN_PORT:-3000}"
+if [[ ! "$DEV_LOGIN_PORT" =~ ^[1-9][0-9]{0,4}$ ]] || (( DEV_LOGIN_PORT > 65535 )); then
+  echo "DEV_LOGIN_PORT must be a port number 1-65535 (set DEV_LOGIN_PORT=)"; exit 1
+fi
 
 if [[ "$RESET" == "1" ]]; then
   echo "── resetting + migrating the brain DB (ephemeral test Postgres) …"
@@ -51,10 +64,16 @@ bash "$OPS_DIR/scripts/demo-spoke.sh" \
   --api-key "$KEY" --member alex >/dev/null
 echo "   spoke ready (content across team / external / admin tiers)."
 
-# Stable, re-usable, host-correct one-click login (mints+verifies per request).
-LOGIN_URL="$APP_URL/auth/dev-login?email=alex@demo.aios.local&next=/t/demo"
+# Stable, re-usable local login (mints+verifies per request). Always the literal loopback address
+# and the explicit local port — never APP_URL or a forwarded header: the route admits only a local
+# authority on the server's own port.
+LOGIN_ORIGIN="http://127.0.0.1:${DEV_LOGIN_PORT}"
+LOGIN_URL="${LOGIN_ORIGIN}/auth/dev-login?email=alex@demo.aios.local&next=/t/demo"
+LOGIN_SERVER="npm run dev:login"
+[[ "$DEV_LOGIN_PORT" == "3000" ]] || LOGIN_SERVER="npm run dev:login -- --port $DEV_LOGIN_PORT"
 
-# Is the dev server up?
+# Is a server answering the API? Availability only: it says nothing about whether the dev-login
+# bypass is on, and the session-minting route is never requested to find out.
 DEV_UP=0
 curl -s -o /dev/null --max-time 2 "$APP_URL/api/v1/items" && DEV_UP=1 || true
 
@@ -64,8 +83,11 @@ cat <<BANNER
   AIOS manual test — ready.
 ────────────────────────────────────────────────────────────────────
 
-  Dashboard login (open in browser — no email, re-usable, never stale):
-    $LOGIN_URL
+  Dashboard login (no email, re-usable — works ONLY on a server started with the bypass):
+    1. start ONE dev server:   $LOGIN_SERVER
+       (AIOS_DEV_LOGIN=1, bound to 127.0.0.1; under plain 'npm run dev' this link is a 404)
+    2. open in a browser on this machine:
+       $LOGIN_URL
 
   Contributor CLI (spoke is pre-wired; key is in its .env):
     export PATH="$OPS_DIR/bin:\$PATH"
@@ -79,7 +101,19 @@ cat <<BANNER
 
 BANNER
 
+# DEV_LOGIN_PORT only names the login server; the spoke above and the API check were wired with
+# APP_URL. On a non-default port say so when the two differ — a hint, never a rewrite of either.
+if [[ "$DEV_LOGIN_PORT" != "3000" && "$APP_URL" != "$LOGIN_ORIGIN" ]]; then
+  echo "  note: DEV_LOGIN_PORT=$DEV_LOGIN_PORT names the dev server for the login link only."
+  echo "        The spoke and the API check use APP_URL, which is $APP_URL."
+  echo "        To point them at that dev server too, re-run with:   APP_URL=$LOGIN_ORIGIN"
+  echo ""
+fi
+
+# Two separate facts, never merged: the API check asked APP_URL, and the login link needs the
+# login server. Starting the one is not said to serve the other — on another port it does not.
 if [[ "$DEV_UP" != "1" ]]; then
-  echo "  ⚠ dev server not detected on $APP_URL — run 'npm run dev' before push/query/pull-bundle."
+  echo "  ⚠ no server answered the API check on $APP_URL (APP_URL) — push/query/pull-bundle need one there."
+  echo "    The login link is separate: it needs '$LOGIN_SERVER' running on $LOGIN_ORIGIN."
   echo ""
 fi

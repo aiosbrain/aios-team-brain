@@ -239,6 +239,50 @@ describe("one-click Slack OAuth (start/callback/status, real Postgres)", () => {
     expect(await getMemberSecret(db(), seed.teamId, owner.memberId, "slack")).toBeNull();
   });
 
+  // AIO-1208 AC-11: this callback is a PUBLIC route — the signed single-use state is its only
+  // authority. A state that does not verify must stop the handler before it talks to the provider
+  // or touches a secret: zero fetch calls and a byte-identical member_secrets table, per refusal.
+  it("a tampered, expired or replayed state makes zero provider calls and zero secret writes", async () => {
+    const seed = await seedTeam();
+    const owner = await memberWithKey(seed);
+    const secretRows = async () =>
+      (await db().from("member_secrets").select("member_id, secret_ciphertext, meta").eq("team_id", seed.teamId)).data;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      throw new Error("the Slack provider must not be called for an unverified state");
+    });
+
+    // Tampered: a real state with its signature altered.
+    const genuine = await createSlackOAuthState(db(), seed.teamId, owner.memberId);
+    const tampered = genuine.slice(0, -3) + (genuine.endsWith("a") ? "bbb" : "aaa");
+    expect((await callbackReq({ code: "good-code", state: tampered })).status).toBe(400);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(await secretRows()).toEqual([]);
+
+    // Expired: the persisted nonce is past its TTL.
+    const stale = await createSlackOAuthState(db(), seed.teamId, owner.memberId);
+    await db().from("oauth_states").update({ expires_at: new Date(Date.now() - 1000).toISOString() }).eq("member_id", owner.memberId);
+    expect((await callbackReq({ code: "good-code", state: stale })).status).toBe(400);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(await secretRows()).toEqual([]);
+
+    // Replayed: redeem a fresh state once (the only provider calls), then present it again.
+    fetchSpy.mockRestore();
+    const state = await createSlackOAuthState(db(), seed.teamId, owner.memberId);
+    mockSlack({ token: `xoxp-${randomUUID()}` });
+    expect((await callbackReq({ code: "code-A", state })).status).toBe(200);
+    const stored = await secretRows();
+    expect(stored).toHaveLength(1);
+
+    vi.restoreAllMocks();
+    const replaySpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      throw new Error("the Slack provider must not be called for a replayed state");
+    });
+    expect((await callbackReq({ code: "code-B", state })).status).toBe(400);
+    expect(replaySpy).not.toHaveBeenCalled();
+    // The ciphertext carries a random nonce, so ANY rewrite — even of the same token — would differ.
+    expect(await secretRows()).toEqual(stored);
+  });
+
   it("callback on user denial (?error) renders an error page and stores nothing", async () => {
     const seed = await seedTeam();
     const owner = await memberWithKey(seed);

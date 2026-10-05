@@ -1,0 +1,31 @@
+# AIO-1124 PC-06: the inert off-branch environment negative probe.
+#
+# Dispatched once per commissioning attempt, by the local operator only, from the one fixed
+# disposable ref below. Each job targets one protected environment whose deployment branch policy
+# admits `staging` alone, so the expected result is a provider refusal before any runner starts.
+# There is nothing here to run: no checkout, no action, no secret, no variable, no input and no
+# token permission. An admitted job executing its literal no-op is a FAILED negative control.
+#
+# These bytes are pinned by `PROBE_WORKFLOW_SHA256` in scripts/staging-ops/offbranch-probe.mjs and
+# guarded by test/guards/offbranch-probe-workflow.test.ts. Runbook: docs/OPS.md §14.
+name: release-environment-negative-probe
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  probe-release:
+    name: probe-release
+    if: github.repository == 'aiosbrain/aios-team-brain' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/remediation/pc06-off-branch-negative-20260921' && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    environment: staging-release
+    steps:
+      - run: ':'
+  probe-emergency:
+    name: probe-emergency
+    if: github.repository == 'aiosbrain/aios-team-brain' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/remediation/pc06-off-branch-negative-20260921' && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    environment: staging-emergency
+    steps:
+      - run: ':'

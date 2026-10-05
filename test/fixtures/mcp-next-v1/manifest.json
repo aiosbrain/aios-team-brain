@@ -1,0 +1,15 @@
+{
+  "version": "1.0.0",
+  "status": "proposed",
+  "files": {
+    "actions-fixtures.json": "ef5c5a35912d927ceb2505366f44951e349cc7ed4ff5d4a5382989d0ac091754",
+    "actions.schema.json": "3d77fd11203811b7f3cefd023b1bbfed7630afbe8fc43726fcc9fea8a348fa84",
+    "operations.json": "4e997bf3b91edf4378a5746b0699a1fe492a36f9f96bbbee82d962eafeedbd16",
+    "profile.schema.json": "25a322a0cf859ee0033997b6f60d04f33a797ecbb7e093b6e1d65bc0cc4a7a33",
+    "read-baseline.json": "657753d3397889fcf0dfb12c7169ade68de5fcdc28a91b06539eb39e035fa0c1",
+    "tasks-fixtures.json": "c11d3d27c0d4acbe76997561d171b668ab26bc1cf27e3f0e69f0128b3e510220",
+    "tasks.schema.json": "b88f910b4a9a37a3043b641c9e814680ef188468403f14e8aa0a4d6263d5f95a",
+    "workspace-fixtures.json": "1e54c15cfa7333d66cb2c87798d21315db55771dd32a48998712f9d939edcc6c",
+    "workspace.schema.json": "4a1a3705afaafe30a2bf779d13489d48800de97c2367995d665c2e8bf8595773"
+  }
+}

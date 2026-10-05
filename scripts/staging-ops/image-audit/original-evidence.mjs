@@ -32,7 +32,8 @@
  */
 import { EVIDENCE_SCHEMA, VERDICTS } from "./evidence.mjs";
 import { UNSUPPORTED_FORMATS } from "./export-walk.mjs";
-import { SCANNER } from "./scanner.mjs";
+import { CANARY_TEXT, CANARY_UNVERIFIED_REASONS, SCAN_REPRESENTATION } from "./scan-surface.mjs";
+import { SCANNER, settingsMatchPolicy } from "./scanner.mjs";
 import { AUDIT_LIMITS, SUBJECT } from "./subject.mjs";
 
 /**
@@ -61,6 +62,11 @@ export const REFUSAL_CODES = Object.freeze([
   "original-scanner-version-mismatch",
   "original-scanner-sha256-mismatch",
   "original-scanner-config-path-mismatch",
+  "original-scanner-config-sha256-mismatch",
+  "original-scanner-settings-unsupported",
+  "original-scan-representation-unsupported",
+  "original-scanner-canary-malformed",
+  "original-scanner-canary-representation-mismatch",
   "original-identity-not-measured",
   "original-recipe-malformed",
   "original-limits-malformed",
@@ -210,6 +216,10 @@ const limitation = shape({
   reason: text(/^[A-Za-z]{1,40}$/),
 });
 
+/**
+ * `representation` and `archiveSurfaceBytes` are REQUIRED (AC-AUDIT-01/02): a complete-coverage claim
+ * is only meaningful against a stated representation, and only v2 staged the archive surface.
+ */
 const coverage = shape({
   complete: required(bool),
   layers: required(count),
@@ -217,7 +227,8 @@ const coverage = shape({
   stagedBytes: required(count),
   limitations: required(listOf(limitation)),
   stagedByteLimit: (value) => (isCount(value) || value === "unbounded" ? value : undefined),
-  representation: text(DOTTED),
+  representation: required(text(DOTTED)),
+  archiveSurfaceBytes: required(count),
   configBytes: count,
   scanSurfaceBytes: count,
   representationOverheadBytes: count,
@@ -268,21 +279,30 @@ const packageInventory = shape({
   }),
 });
 
+/**
+ * THE SCANNER MEASUREMENTS ARE REQUIRED (AC-AUDIT-06). `configSha256`, `settings`, `representation`
+ * and `capabilityCanary` used to be optional, and an independent probe reconciled a record with all
+ * four DROPPED to `clean` / ready — while the successful audit always emits them. A measurement the
+ * producer always writes and the validator never requires is not a measurement anything checks.
+ *
+ * The shapes here decide the values are readable; `scannerBindingCodes` below decides they are the
+ * REVIEWED values, with a fixed code per failure.
+ */
 const scanner = shape({
   name: required(text(/^[a-z0-9-]{1,32}$/)),
   version: required(text(/^[0-9]{1,4}(?:\.[0-9]{1,4}){1,3}$/)),
   sha256: required(text(SHA256)),
   configPath: required(text(PUBLIC_PATH)),
-  configSha256: text(SHA256),
-  settings: objectOf(/^[a-zA-Z][a-zA-Z0-9]{0,40}$/, (value) => (
-    matches(printable(300), value) ? value : listOf(text(printable(300)))(value)
-  )),
-  representation: shape({
+  configSha256: required(text(SHA256)),
+  settings: required(objectOf(/^[a-zA-Z][a-zA-Z0-9]{0,40}$/, (value) => (
+    matches(printable(600), value) ? value : listOf(text(printable(600)))(value)
+  ))),
+  representation: required(shape({
     version: required(text(DOTTED)),
     header: required(text(/^[\x20-\x7e\n]{0,200}$/)),
     suffix: required(text(/^\.[a-z0-9]{1,8}$/)),
-    note: text(printable(500)),
-  }),
+    note: text(printable(600)),
+  })),
   /**
    * `note` is NOT optional decoration — it is the field the VERIFIED path always writes
    * (`assessCanary` in `scan-surface.mjs`), and omitting it from this list refused every record whose
@@ -291,14 +311,51 @@ const scanner = shape({
    * healthy case this route exists for was dead on arrival. Listed, not required, because the two
    * paths genuinely differ.
    */
-  capabilityCanary: shape({
+  capabilityCanary: required(shape({
     status: required(oneOf(["verified", "unverified"])),
-    representation: text(DOTTED),
+    representation: required(text(DOTTED)),
     reason: text(printable(300)),
     binaryMagicSkipReproduced: bool,
+    archiveSurfaceDetected: bool,
     note: text(printable(500)),
-  }),
+  })),
 });
+
+/**
+ * The measured scanner against REVIEWED CONSTANTS — never against anything the record supplies.
+ *
+ *   - `configSha256` must be the pinned `SCANNER.configSha256` (AC-AUDIT-07). A syntactically valid
+ *     wrong digest is exactly the probe that used to reconcile to ready.
+ *   - `settings` must equal the reviewed policy the producer enforces (AC-AUDIT-06).
+ *   - `representation` must BE the supported v2 representation, field for field (AC-AUDIT-01).
+ *   - the canary must name that representation, and a VERIFIED canary must carry both measured
+ *     booleans with the archive surface detected (AC-AUDIT-07). An UNVERIFIED canary stays
+ *     representable — it validates as a blocked audit — but its `archiveSurfaceDetected`, if any, is
+ *     optional because the unreadable-counts path has no answer to report.
+ */
+function scannerBindingCodes(measured) {
+  const codes = [];
+  if (measured.configSha256 !== SCANNER.configSha256) codes.push("original-scanner-config-sha256-mismatch");
+  if (!settingsMatchPolicy(measured.settings)) codes.push("original-scanner-settings-unsupported");
+  const representation = measured.representation;
+  if (representation.version !== SCAN_REPRESENTATION.version || representation.header !== SCAN_REPRESENTATION.header
+    || representation.suffix !== SCAN_REPRESENTATION.suffix || representation.note !== SCAN_REPRESENTATION.note) {
+    codes.push("original-scan-representation-unsupported");
+  }
+  const canary = measured.capabilityCanary;
+  if (canary.representation !== SCAN_REPRESENTATION.version) codes.push("original-scanner-canary-representation-mismatch");
+  // The canary's TEXT is bound to the constants the producer writes: its `note`/`reason` reach the
+  // public reconciled record, so any other printable string is refused rather than carried.
+  if (canary.status === "verified"
+    && (!isBool(canary.binaryMagicSkipReproduced) || canary.archiveSurfaceDetected !== true || canary.reason !== undefined
+      || canary.note !== CANARY_TEXT.verifiedNote)) {
+    codes.push("original-scanner-canary-malformed");
+  }
+  if (canary.status === "unverified" && (!CANARY_UNVERIFIED_REASONS.includes(canary.reason) || canary.note !== undefined)) {
+    codes.push("original-scanner-canary-malformed");
+  }
+  return codes;
+}
 
 /**
  * The scanner the record CLAIMS, against the one reviewed source pins.
@@ -381,6 +438,17 @@ export function validateOriginalEvidence(record, subject = SUBJECT) {
    */
   if (record.verdict === "refused" || record.failure !== undefined) refuse("original-run-refused");
 
+  /**
+   * A PRE-REMEDIATION (v1) ORIGINAL IS REFUSED BY NAME (AC-AUDIT-01), before and independently of the
+   * shape checks, so a v1 record always carries this code rather than only a generic "malformed" one.
+   * Its complete-coverage claim was made without the archive surface; no operator inventory can
+   * grandfather that. It needs a fresh audit.
+   */
+  if (record.coverage?.representation !== SCAN_REPRESENTATION.version
+    || record.scanner?.representation?.version !== SCAN_REPRESENTATION.version) {
+    refuse("original-scan-representation-unsupported");
+  }
+
   const measured = {
     coverage: coverage(record.coverage),
     inventory: inventory(record.inventory),
@@ -408,6 +476,7 @@ export function validateOriginalEvidence(record, subject = SUBJECT) {
    */
   if (measured.scanner !== undefined) {
     for (const [field, code] of SCANNER_BINDING) if (measured.scanner[field] !== SCANNER[field]) refuse(code);
+    for (const code of scannerBindingCodes(measured.scanner)) refuse(code);
   }
 
   /**
@@ -443,8 +512,12 @@ export function validateOriginalEvidence(record, subject = SUBJECT) {
     record.transitionReady && (record.verdict !== "clean" || (record.blockers ?? []).length > 0),
     // The canary's `unverified` is mirrored into coverage as a limitation by `coverageWithCanary`;
     // a record claiming complete coverage beside an unverified canary contradicts its own scanner.
-    measured.scanner.capabilityCanary !== undefined
-      && measured.scanner.capabilityCanary.status !== "verified" && measured.coverage.complete,
+    measured.scanner.capabilityCanary.status !== "verified" && measured.coverage.complete,
+    // The ARCHIVE SURFACE is part of the staged total, never more than it (AC-AUDIT-02)…
+    measured.coverage.archiveSurfaceBytes > measured.coverage.stagedBytes,
+    // …and complete coverage of N layers staged at least each layer's two end blocks: a valid layer
+    // cannot be complete with less surface than that.
+    measured.coverage.complete && measured.coverage.archiveSurfaceBytes < 2 * 512 * measured.coverage.layers,
   ];
   if (inconsistent.some(Boolean)) return { ok: false, codes: Object.freeze(["original-internally-inconsistent"]) };
 

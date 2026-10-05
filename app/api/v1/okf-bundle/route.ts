@@ -6,7 +6,7 @@ import { rateLimit } from "@/lib/api/rate-limit";
 import { errorResponse } from "@/lib/api/schemas";
 import { extractLinks, extractTitle, resolveLink } from "@/lib/okf/links";
 import { pageVisibleOkfItems, parseOkfCursor, formatOkfCursor } from "@/lib/okf/page";
-import { visibleItemIds } from "@/lib/access/enforce";
+import { resolveContentView, contentLabelTier, type ContentView } from "@/lib/access/admission";
 
 export const runtime = "nodejs";
 
@@ -22,6 +22,11 @@ const PAGE_SIZE = 500;
  * contract (dangling preserved, membership-invisible redacted like above-tier, visible
  * preserved). The cursor is the §2.5 composite `<updated_at>|<id>` (legacy bare-timestamp
  * accepted).
+ *
+ * TIERRET-1: the default export's ceiling is the caller's member-content admission — an admitted
+ * member exports every node its grants serve (team-labelled included), a legacy key keeps its
+ * posture ceiling. An EXPLICIT `?tier=external` is caller-selected narrowing and still excludes
+ * team-labelled nodes and redacts links to them. Authenticated route only; nothing public here.
  */
 export async function GET(req: NextRequest) {
   const auth = await authenticateApiKey(req);
@@ -41,10 +46,20 @@ export async function GET(req: NextRequest) {
     : await rateLimit(db, `${auth.apiKeyId}:okf`, 30);
   if (!ok) return errorResponse("rate_limited", includeBody ? "10/min with body" : "30/min", 429);
 
-  // Effective tier can never exceed the caller's ceiling.
-  const ceiling = auth.memberTier; // "team" | "external"
-  const effectiveTier: "team" | "external" =
-    requestedTier === "external" ? "external" : ceiling; // requesting "team" while external stays external
+  // ENFB-1 + TIERRET-1: the caller's admission and MEMBERSHIP-visible id set, resolved ONCE — gates
+  // the page AND feeds the §2.4 link-redaction contract. Fail closed: a resolution error is a 500.
+  let vis: ContentView;
+  try {
+    vis = await resolveContentView(db, auth.teamId, auth.memberId);
+  } catch {
+    return errorResponse("internal", "access resolution failed", 500);
+  }
+  if (vis.error) return errorResponse("internal", "access resolution failed", 500);
+
+  // Effective tier can never exceed the caller's ceiling (an admitted member has none; a legacy key
+  // keeps its posture). Requesting "team" while ceilinged stays ceilinged.
+  const ceiling = contentLabelTier(vis.admission);
+  const effectiveTier: "team" | "external" = requestedTier === "external" ? "external" : ceiling;
 
   // Resolve the optional project slug → id up front. (Filtering on an embedded
   // relation column does not restrict parent rows in PostgREST without an inner
@@ -65,11 +80,6 @@ export async function GET(req: NextRequest) {
     }
     projectId = p.id;
   }
-
-  // ENFB-1: the caller's MEMBERSHIP-visible id set, resolved ONCE — gates the page AND feeds
-  // the §2.4 link-redaction contract. Fail closed: a resolution error serves an empty page.
-  const vis = await visibleItemIds(db, { teamId: auth.teamId, memberId: auth.memberId });
-  if (vis.error) return errorResponse("internal", "access resolution failed", 500);
 
   // 1. Path → {id, access} map for the WHOLE team (deliberately unfiltered — it is an internal
   //    map that is never serialized, and it is what lets redaction DISCRIMINATE the three §2.4

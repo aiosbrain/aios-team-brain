@@ -1,10 +1,11 @@
 import "server-only";
 import { ACTIVE_STATUSES } from "@/lib/tasks/activity-policy";
 import { runSql } from "@/lib/db/pg/pool";
-import { newSqlParams, provenanceRowSqlFromIds } from "@/lib/access/provenance-sql";
+import { newSqlParams, provenanceRowSqlFromIds, type ProvenanceIdsCtx } from "@/lib/access/provenance-sql";
+import { provenanceCtxForReader, type ContentReader } from "@/lib/access/admission";
 import { resolvePositiveInt } from "@/lib/util/env";
 import type { DbClient } from "@/lib/db/types";
-import { isRestrictedTier, type ViewerTier } from "@/lib/auth/visibility";
+import type { ViewerTier } from "@/lib/auth/visibility";
 import { commitSubject } from "./team-work";
 import { sourceRules } from "@/lib/ingest/source-rules";
 import { assigneeMember, decisionActors, type RosterPerson } from "./people-match";
@@ -25,7 +26,7 @@ import { MIN_CONFIDENCE } from "./doc-task-infer";
 import { resolveItemCreditIds } from "@/lib/attribution/contributor-credit";
 import { slackParticipations, foldProviderId } from "@/lib/ingest/slack-participants";
 import { canSeeMeetingNotes } from "@/lib/meetings/notes";
-import { rowVisibleByProvenance } from "@/lib/access/provenance";
+import { rowVisibleByProvenanceCtx } from "@/lib/access/provenance";
 import { isCalendarEvent } from "@/lib/meetings/from-calendar";
 
 // Only ACTIVE tasks are considered work "in progress". Since brain-api v1.21 (AIO-950) a Linear
@@ -129,6 +130,8 @@ type TaskRow = {
   assignee: string | null;
   source_item_id?: string | null;
   created_by?: string | null;
+  /** NOT NULL in the schema; selected so the member's granted-project hand-entered arm can apply. */
+  project_id?: string | null;
 };
 
 
@@ -156,12 +159,18 @@ export async function getWorkTimeline(
   // IN-QUERY (each leg's limit must rank over VISIBLE rows — a post-filter lets invisible items
   // crowd visible ones out of the page). Structured rows (tasks/decisions/meetings) gate on their
   // SOURCE ITEM when they have one — a restricted item's derived TITLE is the leak.
-  enforce: { visibleItemIds: ReadonlySet<string> } | null = null,
+  // TIERRET-1: `reader` is WHO is asking, carried from the ONE admission resolver
+  // (`lib/access/admission.ts`) — this library never decides memberhood itself. An admitted MEMBER's
+  // structured rows follow provenance alone and its meeting leg is the transcript oracle alone; a
+  // LEGACY reader keeps the pre-TIERRET posture rules. An ABSENT reader closes the hand-entered arm
+  // and the meeting leg (fail closed — a caller that did not resolve admission gets no new content).
+  enforce: { visibleItemIds: ReadonlySet<string>; reader?: ContentReader } | null = null,
   // A generation-aware cache rebuild must never publish a partial Slack leg as a fresh payload.
   // Direct legacy readers retain their prior best-effort behavior until the coordinated cutover.
   requireSlackReads = false
 ): Promise<TimelineDay[]> {
   const visArr: string[] | null = enforce ? [...enforce.visibleItemIds] : null;
+  const reader = enforce?.reader;
   // A SOURCED structured row is visible iff its source item is. Meetings + decisions gate on this
   // alone (a null source there is the PURGE case — a restricted item removed via `on delete set
   // null` — so fail closed and drop it; Codex B2's retrieve ruling).
@@ -179,13 +188,17 @@ export async function getWorkTimeline(
   // formerly-restricted adopted title leak (Codex B4 High). `created_by` nulls only on creator
   // deletion (`on delete set null`) → the task drops (over-restriction, fail closed). Immutable
   // otherwise: no UPDATE writes it.
+  // The ONE provenance ctx for this build — the in-query windows below and the TS defense-in-depth
+  // filters take the same value. TIERRET-1 retired PRET-5 H2's "a hand-typed task belongs to NO
+  // project" premise (AUDITFIX-7 showed it carries `project_id`): an Everyone member keeps every
+  // hand-entered row, another admitted member gets those in its GRANTED projects, legacy keeps the
+  // posture rule, and a missing reader gets none.
+  const provCtx: ProvenanceIdsCtx = reader
+    ? provenanceCtxForReader(reader, enforce?.visibleItemIds ?? new Set<string>())
+    : { visibleItemIds: enforce?.visibleItemIds ?? new Set<string>(), teamPosture: false };
   const taskVisible = (t: TaskRow): boolean => {
     if (enforce == null) return false; // PRET-6: a null enforcement is a caller bug — fail closed
-    if (t.source_item_id != null) return enforce.visibleItemIds.has(t.source_item_id);
-    // PRET-5 H2 ruling: a hand-typed task belongs to NO project — no membership axis exists —
-    // so the audience wall survives on exactly this one branch (a team-audience hand-typed
-    // title must not reach a restricted-posture viewer through an evidence link).
-    return t.created_by != null && !isRestrictedTier(tier);
+    return rowVisibleByProvenanceCtx(t, provCtx);
   };
   // Conditionally AND the item-membership conjunct into an item-leg query (kept in ONE place so a
   // new leg has an obvious handle). An EMPTY visible set compiles to `WHERE false` in the pg
@@ -209,8 +222,7 @@ export async function getWorkTimeline(
   // downstream as the defense-in-depth layer over the SAME contract), so invisible rows can no
   // longer starve the TASK_LIMIT/DECISION_LIMIT windows. `{ data, error }` shape mirrors the
   // builder so the legs' existing error contracts (throw for core, WARN for enrichment) hold.
-  // Member-only surface (AUDITFIX-1 §2a): the timeline is session-authenticated.
-  const provCtx = { visibleItemIds: enforce?.visibleItemIds ?? new Set<string>(), teamPosture: tier !== "external", principal: "member" as const };
+  // The ctx is `provCtx` above — from the caller's admission reader, never hard-coded here.
   const provenanceTaskWindow = (opts: { statuses?: readonly string[]; requireRowKey?: boolean }) => {
     const p = newSqlParams();
     const conds = [`t.team_id = ${p.add(teamId)}`];
@@ -218,7 +230,7 @@ export async function getWorkTimeline(
     if (opts.requireRowKey) conds.push(`t.row_key is not null`);
     conds.push(provenanceRowSqlFromIds("t", p, provCtx));
     return runSql<TaskRow>(
-      `select t.id, t.row_key, t.title, t.status, t.assignee, t.source_item_id, t.created_by
+      `select t.id, t.row_key, t.title, t.status, t.assignee, t.source_item_id, t.created_by, t.project_id
          from tasks t where ${conds.join(" and ")}
         order by t.updated_at desc limit ${p.add(TASK_LIMIT)}`,
       p.values
@@ -375,13 +387,13 @@ export async function getWorkTimeline(
     // the `:658` one-owner TS filter stays as defense-in-depth.
     (() => {
       const p = newSqlParams();
-      const sql = `select d.id, d.title, d.decided_by, d.decided_at::text as decided_at, d.source_item_id, d.created_by, d.still_valid, d.audience
+      const sql = `select d.id, d.title, d.decided_by, d.decided_at::text as decided_at, d.source_item_id, d.created_by, d.still_valid, d.audience, d.project_id
          from decisions d
         where d.team_id = ${p.add(teamId)}
           and d.decided_at >= ${p.add(sinceIso.slice(0, 10))}::date
           and ${provenanceRowSqlFromIds("d", p, provCtx)}
         order by d.decided_at desc limit ${p.add(DECISION_LIMIT)}`;
-      return runSql<{ id: string; title: string | null; decided_by: string | null; decided_at: string | null; source_item_id: string | null; created_by: string | null; still_valid: boolean | null; audience: string }>(sql, p.values)
+      return runSql<{ id: string; title: string | null; decided_by: string | null; decided_at: string | null; source_item_id: string | null; created_by: string | null; still_valid: boolean | null; audience: string; project_id: string }>(sql, p.values)
         .then((r) => ({ data: r.rows, error: null as { message: string } | null }))
         .catch((e) => ({ data: null, error: { message: e instanceof Error ? e.message : String(e) } }));
     })(),
@@ -672,11 +684,11 @@ export async function getWorkTimeline(
     source_item_id: string | null;
     created_by?: string | null;
     still_valid: boolean | null;
+    project_id?: string | null;
   }[]) {
     // The settled provenance rule, decisions edition (ENFB-1 §2.7) — ONE owner
-    // (lib/access/provenance); srcVisible's extra enforce-null guard is subsumed: enforce is
-    // never null here (the builder throws upstream without a view).
-    if (!rowVisibleByProvenance(d, enforce?.visibleItemIds ?? null, tier === "external" ? "external" : "team", "member")) continue;
+    // (lib/access/provenance), over the same ctx as the in-query window above.
+    if (enforce == null || !rowVisibleByProvenanceCtx(d, provCtx)) continue;
     if (!d.decided_at) continue; // no day to place it on (mirrors the undated-work drop)
     const by = (d.decided_by ?? "").trim();
     if (!by) continue; // empty / group-level decided_by → dropped (a later team-signal lane's job)
@@ -708,13 +720,16 @@ export async function getWorkTimeline(
   // GUI-uploaded meeting is ingested with `frontmatter: { title }` only — no work-time key matches, so
   // it never leaves SQL. Relaxing the `continue` at the transcript filter would not have admitted it.
   //
-  // TIER + ORACLE (prose corrected in ENFB-3 — the old note claimed "no visibility helper can
-  // gate meeting_notes", which has been false since the enforcement era): the posture bit
-  // below is the coarse wall, and the REAL gate is four lines down — a note's restriction
-  // axis is its source transcript item (`srcVisible`), the same rule the meetings pages now
-  // apply (lib/meetings/notes.ts, ENFB-3). No audience column is needed: source_item_id is
-  // NOT NULL by schema.
-  if (canSeeMeetingNotes(tier)) {
+  // ORACLE (prose corrected in ENFB-3 — the old note claimed "no visibility helper can gate
+  // meeting_notes", which has been false since the enforcement era): a note's restriction axis is
+  // its source transcript item (`srcVisible`), the same rule the meetings pages apply
+  // (lib/meetings/notes.ts, ENFB-3). No audience column is needed: source_item_id is NOT NULL by
+  // schema. TIERRET-1 retired the posture bit for an admitted MEMBER (PRET-5's "kept carve-out"):
+  // the transcript oracle IS the read rule, at either posture. A LEGACY reader keeps the posture
+  // bit (its item set is empty anyway); an absent reader gets no meeting leg.
+  const meetingLegServes =
+    reader?.principal === "member" ? true : reader?.principal === "legacy" ? canSeeMeetingNotes(tier) : false;
+  if (meetingLegServes) {
     const meetRes = await db
       .from("meeting_notes")
       .select("id, title, occurred_at, created_at, submitted_by, merged_into, source_item_id")
@@ -731,6 +746,12 @@ export async function getWorkTimeline(
       // instead would need an OR for null-dated notes, which this query builder has no `.or()` for —
       // and meetings are a low-volume table (tens of rows per team), so a capped ordered scan is both
       // simpler and exactly correct.
+      //
+      // The transcript oracle is IN-QUERY, before the cap, like every item leg's `withVis`: a
+      // post-filter alone let newer hidden notes fill the cap and starve an older visible one. A null
+      // vis-set compiles to `WHERE false`, matching `srcVisible`'s fail-closed null. The `srcVisible`
+      // post-filter below stays as defense in depth.
+      .in("source_item_id", visArr ?? [])
       .order("occurred_at", { ascending: false })
       .limit(MEETING_NOTE_LIMIT);
     if (meetRes.error) {

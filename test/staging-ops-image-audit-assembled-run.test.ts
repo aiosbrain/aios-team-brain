@@ -59,7 +59,7 @@ const scanner = Object.freeze({ ...SCANNER, sha256: createHash("sha256").update(
  * Every external command the audit shells out to, answered. The audit's own code decides what to do
  * with each answer; nothing here simulates a decision.
  */
-function harness({ canaryWrappedFindings = 1, scanReport = "[]" } = {}) {
+function harness({ canaryWrappedFindings = 1, canaryArchiveFindings = 1, scanReport = "[]" } = {}) {
   const secret = syntheticSecret();
   const image = synthesizeImage([buildTar([
     { name: "app/index.js", content: "export const ok = true;\n" },
@@ -86,6 +86,9 @@ function harness({ canaryWrappedFindings = 1, scanReport = "[]" } = {}) {
         Array.from({ length: canaryWrappedFindings }, () => ({ RuleID: "github-pat", File: "000000.txt" })),
       ));
       case "scanner-canary-unwrapped": return report("[]");
+      case "scanner-canary-archive-metadata": return report(JSON.stringify(
+        Array.from({ length: canaryArchiveFindings }, () => ({ RuleID: "github-pat", File: "000000.txt" })),
+      ));
       case "scanner-detect": return report(scanReport);
       case "source-head": return Buffer.from(`${SUBJECT.sourceRevision}\n`);
       case "source-ls-tree": return Buffer.from("");
@@ -133,12 +136,19 @@ describe("the assembled run wires every measured stage into the record (PUB-07, 
     // run installed. Deleting `runCapabilityCanary(...)` from the dispatcher removes both labels.
     expect(labels(invocations)).toContain("scanner-canary-wrapped");
     expect(labels(invocations)).toContain("scanner-canary-unwrapped");
+    expect(labels(invocations)).toContain("scanner-canary-archive-metadata");
     // …and BEFORE the real scan, which is the ordering F1 asks for: a zero-finding report must not
     // already be assembled into something clean-looking before the capability is known.
     expect(labels(invocations).indexOf("scanner-canary-wrapped"))
       .toBeLessThan(labels(invocations).indexOf("scanner-detect"));
 
-    expect(record.scanner.capabilityCanary).toMatchObject({ status: "verified", binaryMagicSkipReproduced: true });
+    expect(record.scanner.capabilityCanary).toMatchObject({ status: "verified", binaryMagicSkipReproduced: true, archiveSurfaceDetected: true });
+    // Every canary scan used the SAME config and isolation as the real scan (AC-AUDIT-07).
+    const scans = invocations.filter((invocation) => invocation.label.startsWith("scanner-canary-") || invocation.label === "scanner-detect");
+    const flag = (invocation: Invocation, name: string) => invocation.args[invocation.args.indexOf(name) + 1];
+    expect(new Set(scans.map((invocation) => flag(invocation, "--config"))).size).toBe(1);
+    expect(new Set(scans.map((invocation) => flag(invocation, "--gitleaks-ignore-path"))).size).toBe(1);
+    expect(new Set(scans.map((invocation) => invocation.command)).size).toBe(1);
     // The canary's own synthetic findings are counted and DISCARDED — they are not about the image.
     expect(record.findings.total).toBe(0);
     expect(record.coverage.limitations).not.toContainEqual({ kind: "binary-scan-capability-unverified" });
@@ -155,6 +165,26 @@ describe("the assembled run wires every measured stage into the record (PUB-07, 
     expect(record.coverage.complete).toBe(false);
     expect(record.transitionReady).toBe(false);
     expect(record.blockers.join(" ")).toMatch(/binary-scan-capability-unverified/);
+  });
+
+  it("folds a MISSED archive-metadata canary into coverage, where it blocks (AC-AUDIT-07)", async () => {
+    const { env, run, fetchImpl } = harness({ canaryArchiveFindings: 0 });
+    const record = await runAudit(env, { run, fetchImpl, scanner });
+    expect(record.scanner.capabilityCanary).toMatchObject({ status: "unverified", archiveSurfaceDetected: false });
+    expect(record.coverage.limitations).toContainEqual({ kind: "binary-scan-capability-unverified" });
+    expect(record.coverage.complete).toBe(false);
+    expect(record.transitionReady).toBe(false);
+  });
+
+  it("REFUSES before any scan when the config bytes it would use are not the pinned config (AC-AUDIT-07)", async () => {
+    const { env, run, fetchImpl, invocations } = harness();
+    // A real tracked file whose bytes are not the reviewed audit config. The expected digest stays the
+    // reviewed constant; nothing about this file can become the trust anchor.
+    const drifted = Object.freeze({ ...scanner, configPath: ".gitleaks.toml" });
+    await expect(runAudit(env, { run, fetchImpl, scanner: drifted })).rejects.toMatchObject({ code: "AUDIT_SCANNER_CONFIG_MISMATCH" });
+    expect(labels(invocations).some((label) => label.startsWith("scanner-canary-") || label === "scanner-detect")).toBe(false);
+    const written = JSON.parse(readFileSync(env.AUDIT_EVIDENCE_PATH, "utf8"));
+    expect(written).toMatchObject({ verdict: "refused", transitionReady: false, failure: { errorCode: "AUDIT_SCANNER_CONFIG_MISMATCH" } });
   });
 
   it("runs the real scan under the audit-owned isolation, outside the checkout (F13)", async () => {
@@ -235,7 +265,8 @@ describe("the assembled run wires every measured stage into the record (PUB-07, 
     // Two layer members plus the gzip's inflated payload were inventoried…
     expect(record.coverage.members).toBe(2);
     expect(record.coverage.stagedBytes).toBeGreaterThan(0);
-    expect(record.coverage.representation).toBe("aios.image-audit.scan-surface.v1");
+    expect(record.coverage.representation).toBe("aios.image-audit.scan-surface.v2");
+    expect(record.coverage.archiveSurfaceBytes).toBeGreaterThan(0);
     // …and the artifact on disk is the record, carrying no scratch path and no member content.
     const written = readFileSync(env.AUDIT_EVIDENCE_PATH, "utf8");
     expect(JSON.parse(written).subject.digest).toBe(SUBJECT.digest);

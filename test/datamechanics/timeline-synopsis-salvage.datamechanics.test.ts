@@ -67,7 +67,13 @@ async function seedCommit(seed: Seed, title: string, whenIso: string, access: "t
   return r;
 }
 
-const visKey = async (seed: Seed, memberId: string = seed.memberId, tier = "team"): Promise<string> => `vis:${tier}:${(await visOf(seed, memberId))!.visibilityHash}`;
+// TIERRET-1: the reader's row is its admission variant (`adm:<class>:<tier>:<hash>`), resolved by
+// the same function a real read uses — salvage is same-key, so the fixture must plant THAT row.
+const visKey = async (seed: Seed, memberId: string = seed.memberId, tier: "team" | "external" = "team"): Promise<string> => {
+  const { timelineViewKey } = await import("@/lib/dashboard/timeline-cache");
+  void visOf;
+  return timelineViewKey(db(), seed.teamId, tier, memberId);
+};
 
 /** Write a cache row from a PREVIOUS payload version that carries a synopsis for one person-day. */
 async function seedPriorRow(args: {

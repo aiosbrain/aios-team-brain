@@ -43,6 +43,8 @@ import {
   SCANNER,
   SCANNER_IGNORE_FILE,
   assertScannerPinned,
+  settingsMatchPolicy,
+  verifyScannerConfig,
   scannerArgs,
   scannerInterfaceFailures,
   scannerSettings,
@@ -52,6 +54,8 @@ import {
   verifyScannerDownload,
 } from "./image-audit/scanner.mjs";
 import {
+  ARCHIVE_SURFACE_CATEGORY,
+  CANARY_VARIANTS,
   SCAN_REPRESENTATION,
   assessCanary,
   canaryFixtures,
@@ -266,7 +270,10 @@ export function runScan({ binary, scanDir, scratch, budget, configPath, isolatio
 export function runCapabilityCanary({ binary, scratch, budget, configPath, isolation, run = runPrivate, sentinel = canarySentinel() }) {
   const fixtures = canaryFixtures(sentinel);
   const counts = {};
-  for (const variant of ["wrapped", "unwrapped"]) {
+  // THREE fixtures (AC-AUDIT-07): the wrapped ELF case, its unwrapped negative control, and a wrapped
+  // NUL-padded archive-metadata block — the shape the archive surface stages. The same binary, config
+  // and isolation as the real scan, so the canary measures the scan that follows it.
+  for (const variant of CANARY_VARIANTS) {
     const dir = join(scratch, "canary", variant);
     mkdirSync(dir, { recursive: true });
     // The same neutral suffix the real staging uses, so the canary measures the REPRESENTATION rather
@@ -275,9 +282,9 @@ export function runCapabilityCanary({ binary, scratch, budget, configPath, isola
     const { report } = scanDirectory({
       binary,
       sourceDir: dir,
-      reportPath: join(scratch, "logs", `scanner-canary-${variant}.json`),
+      reportPath: join(scratch, "logs", `scanner-canary-${canaryLabel(variant)}.json`),
       scratch,
-      label: `scanner-canary-${variant}`,
+      label: `scanner-canary-${canaryLabel(variant)}`,
       timeoutMs: budget.remaining(2 * 60_000, "scanner capability canary"),
       configPath,
       isolation,
@@ -285,7 +292,16 @@ export function runCapabilityCanary({ binary, scratch, budget, configPath, isola
     });
     counts[variant] = report.length;
   }
-  return assessCanary({ wrappedFindings: counts.wrapped, unwrappedFindings: counts.unwrapped });
+  return assessCanary({
+    wrappedFindings: counts.wrapped,
+    unwrappedFindings: counts.unwrapped,
+    archiveSurfaceFindings: counts.archiveMetadata,
+  });
+}
+
+/** A canary variant's subprocess label, in this module's own kebab-case vocabulary. */
+function canaryLabel(variant) {
+  return variant.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +371,8 @@ export function publicPathResolver(staged, expected, { configScanId } = {}) {
     if (configScanId !== undefined && scratchId === configScanId) return { category: "image-config" };
     const detail = staged.get(scratchId);
     if (!detail) return { category: "unresolved" };
+    // Archive metadata has no member name to resolve and must never be named: category and layer only.
+    if (detail.category === ARCHIVE_SURFACE_CATEGORY) return { category: ARCHIVE_SURFACE_CATEGORY };
     if (detail.depth > 0) return { category: "nested-archive-content" };
     if (SENSITIVE.test(detail.name)) return { category: "sensitive-path" };
     if (expected.has(detail.name)) return { publicPath: detail.name, category: "public-source-path" };
@@ -384,7 +402,13 @@ export function publicPathResolver(staged, expected, { configScanId } = {}) {
  * more useful than an abort.
  */
 export function coverageWithCanary(coverage, canary) {
-  if (canary === undefined || canary?.status === "verified") return coverage;
+  /**
+   * FAIL-CLOSED ON ABSENCE (AC-AUDIT-07). Only a canary that verified BOTH capabilities for the v2
+   * representation leaves coverage as it was. An absent canary used to be treated like a verified one,
+   * so a caller that forgot to measure it produced complete coverage; now it is the same gap as a miss.
+   */
+  if (canary?.status === "verified" && canary.archiveSurfaceDetected === true
+    && canary.representation === SCAN_REPRESENTATION.version) return coverage;
   const limitations = Object.freeze([
     ...(coverage?.limitations ?? []),
     Object.freeze({ kind: "binary-scan-capability-unverified" }),
@@ -571,6 +595,12 @@ export async function runAudit(env = process.env, {
     stage = "secret-scan";
     const binary = installScanner({ scratch, budget, scanner, run });
     const configPath = join(process.cwd(), scanner.configPath);
+    /**
+     * THE CONFIG BYTES THIS RUN WILL USE, against the pinned constant — BEFORE the canary or the scan
+     * reads them (AC-AUDIT-07). The expected digest comes from reviewed source, never from the file.
+     */
+    const configBytes = readFileSync(configPath);
+    verifyScannerConfig(configBytes, scanner);
     const isolation = scannerIsolation(scratch);
     /**
      * BEFORE the real scan: does this binary read this audit's representation at all (F1)?
@@ -581,6 +611,14 @@ export async function runAudit(env = process.env, {
      */
     const canary = runCapabilityCanary({ binary, scratch, budget, configPath, isolation, run });
     const { args: scanArgs, report } = runScan({ binary, scanDir: inspected.scanDir, scratch, budget, configPath, isolation, run });
+    /**
+     * The settings of the invocation that RAN, against the reviewed policy (AC-AUDIT-06). A run whose
+     * measured settings are not the supported v2 policy is not the audit the evidence would describe.
+     */
+    const settings = scannerSettings(scanArgs);
+    if (!settingsMatchPolicy(settings)) {
+      throw Object.assign(new Error("the scanner invocation's settings are not the reviewed policy"), { code: "AUDIT_SCANNER_SETTINGS_UNSUPPORTED" });
+    }
     const findings = summarizeFindings(report, {
       // The pinned scanner reports ABSOLUTE locations, and the ids this audit staged are relative to
       // the scan root. Without the root there is nothing to normalise against, and every real finding
@@ -617,8 +655,8 @@ export async function runAudit(env = process.env, {
       // The coverage-relevant settings are read back from THE ARGUMENT LIST THAT RAN, not from a
       // freshly built one: `--gitleaks-ignore-path` is only present when the caller supplied a path,
       // so restating it would let the record claim an isolation the invocation did not have.
-      scanner: scannerIdentity(scanner, readFileSync(configPath, "utf8"), {
-        settings: scannerSettings(scanArgs),
+      scanner: scannerIdentity(scanner, configBytes, {
+        settings,
         representation: SCAN_REPRESENTATION,
         canary,
       }),

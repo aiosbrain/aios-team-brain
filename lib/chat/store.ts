@@ -106,10 +106,12 @@ export async function appendMessage(
     .single();
   if (error) throw new Error(`appendMessage: ${error.message}`);
   const insertedId = (data as { id: string } | null)?.id ?? null;
-  // Bump the conversation so the list sorts most-recent-first.
+  // Use the same database clock and precision as creation. PostgreSQL resolves
+  // this timestamp input when the parameterized UPDATE executes, avoiding app
+  // clock skew and millisecond rounding that can move activity backwards.
   await db
     .from("conversations")
-    .update({ updated_at: new Date().toISOString() })
+    .update({ updated_at: "now" })
     .eq("id", conversationId)
     .eq("team_id", owner.teamId)
     .eq("member_id", owner.memberId);

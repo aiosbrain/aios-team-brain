@@ -1,0 +1,26 @@
+[
+  {
+    "path": ".github",
+    "blob_href": "https://github.com/aiosbrain/aios-team-brain/blob/f8c099f646cd13448e6f1b15e41ce2a0e68d5bcb/.github",
+    "start_line": 1,
+    "start_column": null,
+    "end_line": 1,
+    "end_column": null,
+    "annotation_level": "failure",
+    "title": ".github#L1",
+    "message": "Branch \"staging\" is not allowed to deploy to trusted-automation due to environment protection rules.",
+    "raw_details": null
+  },
+  {
+    "path": ".github",
+    "blob_href": "https://github.com/aiosbrain/aios-team-brain/blob/f8c099f646cd13448e6f1b15e41ce2a0e68d5bcb/.github",
+    "start_line": 1,
+    "start_column": null,
+    "end_line": 1,
+    "end_column": null,
+    "annotation_level": "failure",
+    "title": "",
+    "message": "The deployment was rejected or didn't satisfy other protection rules.",
+    "raw_details": ""
+  }
+]

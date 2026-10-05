@@ -343,7 +343,7 @@ describe("social chain follows a narrowed evidence item (real Postgres)", () => 
     { pathKind: "unchanged-body", changed: false },
     { pathKind: "changed-body", changed: true },
   ])(
-    "A13-08/13: settled no-widening refusal performs no inherited/social cascade ($pathKind)",
+    "A13-08/13: settled system-integrity refusal (forbidden General edge) performs no inherited/social cascade ($pathKind)",
     async ({ pathKind, changed }) => {
       const seed = await seedTeam();
       const boot = await ensureAccessBootstrap(db(), seed.teamId);
@@ -411,7 +411,7 @@ describe("social chain follows a narrowed evidence item (real Postgres)", () => 
           },
           "team"
         )
-      ).rejects.toThrow(/context gate refusal|no-widening/i);
+      ).rejects.toThrow(/context gate refusal: system-integrity/i);
 
       expect(cascadeWrites, "early desired-audience gate runs before expensive cascade writes").toBe(0);
       const { data: stored } = await db()

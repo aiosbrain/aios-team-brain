@@ -11,7 +11,16 @@ vi.mock("@/lib/db/server", () => ({ serverClient: async () => ({
 vi.mock("@/lib/db/admin", () => ({ adminClient: () => ({}) }));
 vi.mock("@/lib/auth/session", () => ({ getSessionUser: async () => ({ id: "user-1" }) }));
 vi.mock("@/lib/access/posture", () => ({ resolveViewerPosture: async () => "team" }));
-vi.mock("@/lib/access/enforce", () => ({ memberEnforcement: async () => ({ visibleItemIds: new Set(), visibleProjectIds: new Set() }) }));
+// TIERRET-1: the expanded window resolves its enforcement through the ONE admission resolver, not
+// `memberEnforcement` — so that is what this route test has to stub. The reader field is what the
+// builder's hand-entered/meeting arms key on; it is opaque to the route.
+vi.mock("@/lib/access/admission", () => ({
+  contentTimelineEnforcement: async () => ({
+    visibleItemIds: new Set<string>(),
+    visibleProjectIds: new Set<string>(),
+    reader: { principal: "member", everyone: false, memberProjectIds: [] },
+  }),
+}));
 vi.mock("@/lib/dashboard/timeline-cache", () => ({ getCachedWorkTimeline: cached }));
 vi.mock("@/lib/dashboard/work-timeline", () => ({
   WINDOW_DAYS: 7, MAX_WINDOW_DAYS: 30, getWorkTimeline: pure,
@@ -39,8 +48,10 @@ describe("dashboard timeline route Slack read failures", () => {
     });
     for (const days of [8, 30]) {
       await expect(GET(req(days))).rejects.toThrow("work-timeline slack identities: unavailable");
+      // Both contracts on the one call: the admission READER rides the enforcement (TIERRET-1) and
+      // the Slack legs are strict (AIO-1170).
       expect(pure).toHaveBeenLastCalledWith(expect.anything(), "team-1", "team", days,
-        expect.anything(), true);
+        expect.objectContaining({ reader: expect.objectContaining({ principal: "member" }) }), true);
     }
     expect(cached).not.toHaveBeenCalled();
   });

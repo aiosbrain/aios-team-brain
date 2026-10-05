@@ -133,6 +133,21 @@ export const AUDIT_LIMITS = Object.freeze({
   maxTotalStagedBytes: 6 * 1024 * 1024 * 1024,
   /** One member's decoded size. Larger members are recorded as an oversized-member limitation. */
   maxMemberBytes: 256 * 1024 * 1024,
+  /**
+   * THE TAR METADATA BOUNDS (AC-AUDIT-04), checked by the reader BEFORE the bytes they bound are read.
+   * One PAX/GNU metadata body; all metadata accumulated ahead of one member; and every physical header
+   * of one archive, metadata included — so a metadata-only flood meets a bound the member count never
+   * sees. Real long names and PAX records are a few hundred bytes.
+   */
+  maxTarMetadataRecordBytes: 1024 * 1024,
+  maxTarPendingMetadataBytes: 4 * 1024 * 1024,
+  maxTarPhysicalHeadersPerLayer: 1_500_000,
+  /**
+   * One staged ARCHIVE-SURFACE file (AC-AUDIT-02). Above the metadata-record bound plus its header and
+   * padding, so a metadata record always fits whole; a larger range (an unsupported member's body, a
+   * large trailer) is a recorded limitation rather than a split.
+   */
+  maxArchiveSurfaceFileBytes: 8 * 1024 * 1024,
   /** Nested archives inside a layer are expanded ONE level; deeper nesting is a recorded limitation. */
   maxNestedArchiveDepth: 1,
   /** Bytes of any subprocess diagnostic retained in PRIVATE scratch (never emitted). */

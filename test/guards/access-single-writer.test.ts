@@ -78,7 +78,7 @@ const UNAMBIGUOUS = ["group_members", "project_groups"];
  * cross-table READ that legitimately appears in a file that also writes its OWN table — the
  * precise chain-scan (`writesTo`) confirms these are NOT writes. Auditable by construction:
  * a new entry has to be justified as a read here, and the chain-scan still catches an actual
- * write. `lib/projects/context/memberships.ts` reads `project_groups` (no-widening gate) and
+ * write. `lib/projects/context/memberships.ts` reads `project_groups` (system-integrity gate) and
  * `project_context_units` (the unit's inherited audience) while writing only memberships.
  */
 const READ_EXEMPT = new Set<string>([

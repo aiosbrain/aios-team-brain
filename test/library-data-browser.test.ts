@@ -16,6 +16,9 @@ type Row = {
 const state = vi.hoisted(() => ({
   rows: [] as Row[],
   visibleIds: [] as string[],
+  // TIERRET-1: WHO is reading. Default is the LEGACY external arm — the one reader that still carries
+  // a label ceiling — so the label gate below is exercised; `member` is an admitted member (no ceiling).
+  member: false,
   queries: [] as { filters: { col: string; op: string; value: unknown }[]; from: number; count: number }[],
 }));
 
@@ -79,8 +82,18 @@ vi.mock("@/lib/db/server", () => ({
   }),
 }));
 vi.mock("@/lib/auth/guard", () => ({ currentMember: async () => ({ id: "viewer", tier: "external" }) }));
-vi.mock("@/lib/access/enforce", () => ({
-  visibleItemIds: async () => ({ ids: new Set(state.visibleIds), error: null }),
+// The browser resolves its reader through the ONE admission resolver. Only the resolved VIEW is
+// stubbed; `contentLabelTier` stays real, so the label ceiling asserted below is the product's rule.
+vi.mock("@/lib/access/admission", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/access/admission")>()),
+  resolveContentView: async () => ({
+    admission: state.member
+      ? { kind: "member", teamId: "team-1", memberId: "viewer", posture: "external", everyone: false, grantedProjectIds: ["project-1"] }
+      : { kind: "legacy", teamId: "team-1", memberId: "viewer", posture: "external" },
+    ids: new Set(state.visibleIds),
+    empty: state.visibleIds.length === 0,
+    projectIds: state.member ? ["project-1"] : [],
+  }),
 }));
 vi.mock("@/lib/db/admin", () => ({ adminClient: () => ({}) }));
 vi.mock("@/components/library/channel-rail", () => ({ ChannelRail: () => null }));
@@ -100,6 +113,7 @@ async function page(channel: string, limitParam?: string): Promise<string> {
 beforeEach(() => {
   state.rows = [];
   state.visibleIds = [];
+  state.member = false;
   state.queries = [];
 });
 
@@ -134,6 +148,25 @@ describe("DataBrowser scoped feed", () => {
       { col: "access", op: "eq", value: "external" },
       { col: "id", op: "in", value: state.visibleIds },
     ]));
+  });
+
+  it("serves an admitted member by membership alone: a granted team-labelled row shows, an ungranted row does not", async () => {
+    // The session posture is still "external" (`currentMember` above) — membership, not posture or
+    // label, is the member read rule, and the oracle set stays an in-query gate.
+    state.member = true;
+    state.rows = [
+      row("granted-team", "slack/t1/c1/1718900000.000100.md", "team"),
+      row("granted-external", "slack/t1/c1/1718900001.000100.md"),
+      row("ungranted", "slack/t1/c1/1718900002.000100.md"),
+    ];
+    state.visibleIds = ["granted-team", "granted-external"];
+
+    const html = await page("slack/t1/c1");
+    expect(html).toContain("granted-team");
+    expect(html).toContain("granted-external");
+    expect(html).not.toContain("ungranted");
+    expect(state.queries[0].filters).toContainEqual({ col: "id", op: "in", value: state.visibleIds });
+    expect(state.queries[0].filters.some((filter) => filter.col === "access")).toBe(false);
   });
 
   it("fills a legacy page after scoped rows sharing its SQL prefix", async () => {

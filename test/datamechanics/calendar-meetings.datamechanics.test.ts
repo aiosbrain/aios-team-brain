@@ -203,9 +203,10 @@ describe("shared calendar events become per-person work (real Postgres)", () => 
     ]);
   });
 
-  it("TIER: a shared calendar event never reaches an external-tier viewer", async () => {
-    // Meeting notes are team-tier by construction and `meeting_notes` has no audience column, so the
-    // timeline's `canSeeMeetingNotes` gate is the sole enforcement. A calendar event must inherit it.
+  it("a shared calendar event never reaches an UNGRANTED external viewer", async () => {
+    // Meeting notes are team-labelled by construction; TIERRET-1 made their source transcript's
+    // MEMBERSHIP the read rule (no posture gate on a member's read). A calendar event inherits it:
+    // this one lands in General, which the external-only viewer is not granted.
     const seed = await seedTeam();
     const bobEmail = `bob-${randomUUID().slice(0, 6)}@acme.com`;
     await addMember(seed, "Bob", bobEmail);

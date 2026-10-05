@@ -1,5 +1,10 @@
 import "server-only";
-import { unsourcedAdmission, assertNeverAdmission, type ProvenancePrincipal } from "@/lib/access/provenance-sql";
+import {
+  unsourcedAdmission,
+  assertNeverAdmission,
+  type ProvenancePrincipal,
+  type ProvenanceIdsCtx,
+} from "@/lib/access/provenance-sql";
 
 /**
  * The settled PROVENANCE rule for structured rows (tasks/decisions) on body-serving surfaces —
@@ -8,16 +13,17 @@ import { unsourcedAdmission, assertNeverAdmission, type ProvenancePrincipal } fr
  *   - a SOURCED row gates on its source item's membership visibility;
  *   - a NULL-SOURCE row survives only when HAND-TYPED (`created_by` — written solely by the
  *     dashboard create actions, never by sync, so a purged restricted basis stays dropped)
- *     AND EITHER the viewer is a member at team posture, OR the viewer is a TOKEN whose effective
- *     project set contains the row's `project_id` (AUDITFIX-7 — the claim that a hand-typed row
- *     "cannot be tested against a token's scope" was false; it carries a project).
+ *     AND `unsourcedAdmission` admits it: an oracle-accepted Everyone member (all), another admitted
+ *     member whose GRANTED projects contain the row's `project_id` (TIERRET-1), a legacy principal
+ *     at team posture (the pre-TIERRET rule, preserved), or a TOKEN whose effective project set
+ *     contains it (AUDITFIX-7 — the claim that a hand-typed row "cannot be tested against a token's
+ *     scope" was false; it carries a project).
  * Fail-closed: a missing visibility set denies sourced rows.
  *
  * `principal` (AUDITFIX-1) is the THIRD owner of this contract taking the same discriminator as the
- * two SQL forms, so "one contract, three owners" is true rather than asserted. The hand-typed arm is
- * admitted only for an explicit member at team posture; a token, an absent value and a foreign value
- * all close. It is REQUIRED rather than defaulted: a default would be the permissive value, and this
- * whole slice exists because a permissive default was obtainable by saying nothing.
+ * two SQL forms, so "one contract, three owners" is true rather than asserted. An absent or foreign
+ * value closes. It is REQUIRED rather than defaulted: a default would be the permissive value, and
+ * this whole slice exists because a permissive default was obtainable by saying nothing.
  */
 export interface ProvenanceRow {
   source_item_id?: string | null;
@@ -59,11 +65,32 @@ export function rowVisibleByProvenance(
   principal: ProvenancePrincipal,
   tokenProjectIds?: readonly string[]
 ): boolean {
+  return admitRow(row, visibleItemIds, unsourcedAdmission({ principal, teamPosture: tier === "team", tokenProjectIds }));
+}
+
+/**
+ * TIERRET-1 — the TS twin over the SAME ctx object the id-array SQL form takes
+ * (`provenanceRowSqlFromIds`), so a page that compiles a window and then filters defensively applies
+ * ONE value to both. Member callers build the ctx through `lib/access/admission.ts#provenanceCtxFor`
+ * (the member arm's `teamPosture` is the oracle-accepted Everyone bit and its hand-entered scope is
+ * `memberProjectIds`); the positional form above remains for the token/legacy-shaped callers.
+ *
+ * A row without `project_id` is denied (and logged) on any `projects` admission — the column is NOT
+ * NULL, so its absence means the caller did not select it.
+ */
+export function rowVisibleByProvenanceCtx(row: ProvenanceRow, ctx: ProvenanceIdsCtx): boolean {
+  return admitRow(row, ctx.visibleItemIds, unsourcedAdmission(ctx));
+}
+
+function admitRow(
+  row: ProvenanceRow,
+  visibleItemIds: ReadonlySet<string> | null,
+  admission: ReturnType<typeof unsourcedAdmission>
+): boolean {
   const source = row.source_item_id ?? null;
   if (source !== null) return visibleItemIds != null && visibleItemIds.has(source);
   if ((row.created_by ?? null) === null) return false;
 
-  const admission = unsourcedAdmission({ principal, teamPosture: tier === "team", tokenProjectIds });
   switch (admission.kind) {
     case "closed":
       return false;
@@ -75,7 +102,7 @@ export function rowVisibleByProvenance(
         // Denied, but NOT silently: the column is NOT NULL, so this is a caller that forgot to
         // select it. The overloads make it a compile error; this is the runtime backstop.
         console.error(
-          "[access] rowVisibleByProvenance: token admission with no project_id on the row — the caller did not select it; denying"
+          "[access] rowVisibleByProvenance: project-scoped admission with no project_id on the row — the caller did not select it; denying"
         );
         return false;
       }

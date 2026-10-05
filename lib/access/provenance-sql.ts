@@ -1,4 +1,5 @@
 import "server-only";
+import { isRestrictedTier } from "@/lib/auth/visibility";
 
 /**
  * The IN-QUERY form of the settled provenance rule (ENFB-2 §2.2) — the SQL sibling of
@@ -37,16 +38,23 @@ export function newSqlParams(initial: readonly unknown[] = []): SqlParams {
 }
 
 /**
- * WHO is asking. The unsourced (hand-typed) arm is admitted for a MEMBER at team posture and for
- * nobody else — see `admitsUnsourced`.
+ * WHO is asking — see `unsourcedAdmission` for what each arm admits.
  *
  * ⚠️ THIS USED TO SAY a row with no `source_item_id` "cannot be tested against that scope, so it can
  * never be shown to one". **The premise was false** (AUDITFIX-7): hand-entered rows carry
  * `project_id`, written by the dashboard create actions in the same insert as `created_by`, and both
  * token-reachable leg queries already join `projects`. A token now sees such a row when its EFFECTIVE
  * project set contains that project. Absent/foreign values still close.
+ *
+ * TIERRET-1 split the old single member value in two, because "a valid `aios_` key" and "a positively
+ * admitted member" were never the same fact (`authenticateApiKey` does not select kind/is_connector):
+ *   · `"member"` — ONLY from `lib/access/admission.ts`, after the members row passed `isPrincipal`
+ *     (active human or standing agent). Membership is its whole read rule: no label ceiling.
+ *   · `"legacy"` — a valid key/session whose ACTIVE member is NOT a principal (connector or
+ *     offroster). Keeps the pre-TIERRET posture rule byte-for-byte: no gain, no loss. Inactive rows
+ *     never reach either arm — the resolver throws.
  */
-export type ProvenancePrincipal = "member" | "token" | undefined;
+export type ProvenancePrincipal = "member" | "legacy" | "token" | undefined;
 
 /**
  * The two discriminant tags, DERIVED rather than re-spelled.
@@ -58,6 +66,7 @@ export type ProvenancePrincipal = "member" | "token" | undefined;
  * arms without introducing a literal the guard would have to be weakened to permit.
  */
 export type MemberTag = Extract<ProvenancePrincipal, "member">;
+export type LegacyTag = Extract<ProvenancePrincipal, "legacy">;
 export type TokenTag = Extract<ProvenancePrincipal, "token">;
 
 /**
@@ -65,8 +74,9 @@ export type TokenTag = Extract<ProvenancePrincipal, "token">;
  *
  * Positive on purpose: `principal !== "token"` would admit `undefined`, `null` and any foreign value
  * — and those are real runtime states here, because `tsconfig.json` excludes `test/`, so an omitted
- * discriminator never fails typecheck. Everything that is not an explicit member at team posture, or
- * an explicit token with a project set, closes.
+ * discriminator never fails typecheck. Everything that is not an explicit admitted member (Everyone →
+ * all; otherwise its granted projects), an explicit legacy principal at team posture, or an explicit
+ * token with a project set, closes.
  *
  * ⚠️ A UNION IS NOT SELF-ENFORCING. A consumer that branches on `kind !== "closed"` reads `"projects"`
  * as `"all"` and hands a scoped token the whole corpus — the very widening the union was chosen to
@@ -85,11 +95,31 @@ export function assertNeverAdmission(x: never): never {
 
 export function unsourcedAdmission(ctx: {
   principal?: ProvenancePrincipal;
+  /**
+   * MEMBER arm: the ORACLE-ACCEPTED Everyone bit (`ContentAdmission.everyone` — an active human whose
+   * builtin Everyone row passes `isBuiltinEligible`), produced only by `lib/access/admission.ts`.
+   * LEGACY arm: raw viewer posture, exactly as before TIERRET-1. Ignored for tokens.
+   */
   teamPosture: boolean;
   /** The token's EFFECTIVE project set (`effectiveVisibleProjects`). Absent closes. */
   tokenProjectIds?: readonly string[];
+  /** TIERRET-1: an admitted member's oracle GRANTED project set. Absent or empty closes. */
+  memberProjectIds?: readonly string[];
 }): UnsourcedAdmission {
-  if (ctx.principal === "member" && ctx.teamPosture === true) return { kind: "all" };
+  if (ctx.principal === "member") {
+    // TIERRET-1 AC-04 (revised): Everyone is the existing audience group of its oracle-accepted
+    // humans, so they keep every hand-entered row. Every other admitted member — an external human,
+    // a standing agent, even one with a PLANTED builtin row (N3: posture ≠ oracle acceptance) — gets
+    // exactly the projects the oracle granted them. A grantless member gets nothing: the rejected
+    // "all members" proposal would have disclosed every hand-entered project to them.
+    if (ctx.teamPosture === true) return { kind: "all" };
+    const ids = ctx.memberProjectIds;
+    if (ids === undefined || ids.length === 0) return { kind: "closed" };
+    return { kind: "projects", projectIds: ids };
+  }
+  // LEGACY (active connector / offroster) — the pre-TIERRET member rule verbatim. AC-03 requires
+  // that these principals GAIN nothing; it does not revoke what they already had.
+  if (ctx.principal === "legacy") return ctx.teamPosture === true ? { kind: "all" } : { kind: "closed" };
   if (ctx.principal === "token") {
     // ⚠️ THE TOKEN ARM DOES NOT CONSULT `teamPosture`, AND THAT IS ONLY SAFE BECAUSE OF ONE LINE
     // ELSEWHERE (Fable diff review, MEDIUM). A token's wall is its project authority, not posture —
@@ -119,10 +149,28 @@ export interface ProvenanceSqlCtx {
   /** The oracle's granted project set (`visibleProjects(...).projectIds`) — NOT the §2.1
    *  row-visible set; the semijoin derives item visibility from grants + curations. */
   grantedProjectIds: readonly string[];
-  /** True when the viewer is team posture — the hand-typed arm's audience wall. */
+  /** See `unsourcedAdmission`: the oracle-accepted Everyone bit (member) or raw posture (legacy). */
   teamPosture: boolean;
   /** AUDITFIX-7: a TOKEN's effective project set, gating the hand-typed arm. Absent closes it. */
   tokenProjectIds?: readonly string[];
+  /** TIERRET-1: an admitted MEMBER's granted project set, gating the hand-typed arm. Absent closes it. */
+  memberProjectIds?: readonly string[];
+}
+
+/**
+ * TIERRET-1 — the LABEL ceiling (items.access / tasks|decisions.audience = 'external' only).
+ *
+ * A positively admitted MEMBER has none: membership (the oracle) is the member read rule, and a label
+ * veto over a valid grant is exactly the inconsistency this slice retires. Every OTHER reader keeps
+ * the posture ceiling it had — the explicit legacy arm (no gain), tokens (whose launchers are never
+ * external: `verifyAgentToken` refuses external delegation), and any absent/foreign discriminator,
+ * which is restricted whenever its tier is not exactly "team" (fail closed via `isRestrictedTier`).
+ * Labels still route placement and still narrow an EXPLICIT export (`?tier=external`); that is
+ * caller-selected narrowing, not this ceiling.
+ */
+export function labelCeilingApplies(principal: ProvenancePrincipal, tier: string): boolean {
+  if (principal === "member") return false;
+  return isRestrictedTier(tier);
 }
 
 /**
@@ -154,7 +202,7 @@ export function itemVisibleSql(expr: string, p: SqlParams, ctx: ProvenanceSqlCtx
  * The full row predicate for a structured row (task/decision) aliased `alias`:
  *   sourced  → the source item is membership-visible;
  *   null-source → hand-typed (`created_by` non-null — the sole-writer provenance proof;
- *                 `origin` is durability, never provenance) AND team posture.
+ *                 `origin` is durability, never provenance) AND admitted by `unsourcedAdmission`.
  * Deleted-creator rows (created_by nulled by `on delete set null`) fall to no-provenance and
  * hide — the stated fail-closed over-restriction (work-timeline.ts:173-175, extended to
  * decisions by ENFB-2 design round 2 H6).
@@ -180,11 +228,21 @@ export function provenanceRowSql(alias: string, p: SqlParams, ctx: ProvenanceSql
   }
 }
 
+/** The id-array ctx — shared by both id-array owners (this SQL form and `rowVisibleByProvenanceCtx`). */
+export interface ProvenanceIdsCtx {
+  visibleItemIds: ReadonlySet<string>;
+  teamPosture: boolean;
+  principal?: ProvenancePrincipal;
+  /** AUDITFIX-7: the token's effective project set. Absent closes the arm for a token. */
+  tokenProjectIds?: readonly string[];
+  /** TIERRET-1: an admitted member's granted project set. Absent closes the arm for a member. */
+  memberProjectIds?: readonly string[];
+}
+
 /**
  * The ID-ARRAY form — the exact SQL twin of `rowVisibleByProvenance` for sites that ALREADY hold the
  * principal's materialized visible-item set (retrieve, the timeline, the board, both API lists):
- * sourced → the source id is in the set; null-source → hand-typed, and ONLY for a member at team
- * posture (`admitsUnsourced`).
+ * sourced → the source id is in the set; null-source → hand-typed, admitted by `unsourcedAdmission`.
  *
  * ⚠️ THIS DOCSTRING USED TO CLAIM the form "serves EVERY principal correctly (a delegated token's set
  * is its attenuated set)". That was false and it was the whole bug: the null-source arm never
@@ -193,17 +251,7 @@ export function provenanceRowSql(alias: string, p: SqlParams, ctx: ProvenanceSql
  *
  * The array binds as ONE parameter. The documented large-corpus deferral (enforce.ts) is unchanged.
  */
-export function provenanceRowSqlFromIds(
-  alias: string,
-  p: SqlParams,
-  ctx: {
-    visibleItemIds: ReadonlySet<string>;
-    teamPosture: boolean;
-    principal?: ProvenancePrincipal;
-    /** AUDITFIX-7: the token's effective project set. Absent closes the arm for a token. */
-    tokenProjectIds?: readonly string[];
-  }
-): string {
+export function provenanceRowSqlFromIds(alias: string, p: SqlParams, ctx: ProvenanceIdsCtx): string {
   const ids = p.add([...ctx.visibleItemIds]);
   const sourced = `(${alias}.source_item_id is not null and ${alias}.source_item_id = any(${ids}::uuid[]))`;
   const authored = `${alias}.source_item_id is null and ${alias}.created_by is not null`;

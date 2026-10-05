@@ -191,8 +191,9 @@ describe("the artifact is an ALLOWLIST, and it refuses to leak (PUB-04)", () => 
   });
 
   it("refuses credential-shaped values and private-key blocks wherever they hide", () => {
+    const privateKeyHeader = ["-----BEGIN", "RSA PRIVATE KEY-----"].join(" ");
     expect(evidenceLeakFailures({ subject: { note: `ghp_${"A".repeat(30)}` } })).not.toEqual([]);
-    expect(evidenceLeakFailures({ provenance: { detail: "-----BEGIN RSA PRIVATE KEY-----" } })).not.toEqual([]);
+    expect(evidenceLeakFailures({ provenance: { detail: privateKeyHeader } })).not.toEqual([]);
     expect(evidenceLeakFailures({ coverage: { url: "postgres://user:hunter2@db:5432/app" } })).not.toEqual([]);
     expect(evidenceLeakFailures({ audit: { dockerconfig: "x" } })).not.toEqual([]);
     expect(evidenceLeakFailures({ verdict: "clean", coverage: { complete: true } })).toEqual([]);

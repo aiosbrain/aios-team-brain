@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, it, expect } from "vitest";
 import { groupTimeline, summaryPromptFor, type EvidenceWithMember, type TimelineMember } from "@/lib/dashboard/timeline-group";
 import { isBareDate } from "@/lib/dashboard/timeline-group";
@@ -118,8 +120,33 @@ describe("meetings on the person card (spec: meeting-participation-as-work-v1)",
   it("pins the payload version constants", () => {
     // The shape guard alone does NOT catch a revert: v11 is still pinned in SHAPE_BY_VERSION, so
     // dropping the bump back to 11 sails straight through it — which is the v8 incident class the
-    // guard's own comment records. v15 changes Slack authorship/day meaning, so old prose is unsafe.
-    expect(PAYLOAD_VERSION).toBe(15);
-    expect(MIN_SALVAGEABLE_VERSION).toBe(15);
+    // guard's own comment records.
+    //
+    // MIN_SALVAGEABLE_VERSION normally must NOT follow the bump: raising it blanks every person-day
+    // summary, a regression reported twice as "we've lost the summaries". v17 is the exception the
+    // floor exists for — it integrates TWO independent meaning changes (TIERRET-1 member admission,
+    // which staging shipped as v16 after reserving 15 for this PR, and the Slack authorship/day
+    // semantics with durable revision stamps), so NO older sentence can establish compatibility with
+    // both. The floor therefore equals the version here, which is why there is deliberately no
+    // `MIN_SALVAGEABLE_VERSION < PAYLOAD_VERSION` assertion: staging's version of this test asserted
+    // that invariant, and it is retired on purpose for this one bump. Restore it on the next
+    // shape-only bump, which may bridge again.
+    expect(PAYLOAD_VERSION).toBe(17);
+    expect(MIN_SALVAGEABLE_VERSION).toBe(17);
+  });
+
+  it("the DOCUMENTED payload version follows the constant", () => {
+    // The number is restated where an operator and an API reader meet it: the v1 route's access note
+    // and the release notes' rollback section. Both said 16 after the integration took 17 — a stale
+    // number in the ROLLBACK section is the costly one, because the version decides which older build
+    // can still read a row. Pinned to the constant, so the next bump fails here until both are updated.
+    const read = (file: string): string => readFileSync(join(process.cwd(), file), "utf8");
+    expect(read("app/api/v1/timeline/route.ts")).toContain(`(payload v${PAYLOAD_VERSION})`);
+    const rollback = read("docs/RELEASE-NOTES-tierret1.md").split("## Timeline cache — rollback and roll-forward")[1]?.split("\n## ")[0];
+    expect(rollback, "the release notes keep a timeline-cache rollback section").toBeTruthy();
+    expect(rollback).toContain(`payload version **${PAYLOAD_VERSION}**`);
+    // Exactly ONE bolded version: the current one. Older versions are named in prose, never as the
+    // version rows are written at.
+    expect(rollback!.match(/payload version \*\*\d+\*\*/g)).toEqual([`payload version **${PAYLOAD_VERSION}**`]);
   });
 });

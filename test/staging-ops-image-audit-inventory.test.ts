@@ -434,7 +434,7 @@ describe("recipe assertions are measured, and capped honestly (M3)", () => {
           "": {},
           "node_modules/ok": { resolved: `${EXPECTED_REGISTRY_ORIGIN}/ok/-/ok-1.0.0.tgz`, integrity: "sha512-a" },
           "node_modules/elsewhere": { resolved: "https://packages.internal.example/elsewhere.tgz", integrity: "sha512-b" },
-          "node_modules/withauth": { resolved: `https://ci:${token}@registry.npmjs.org/withauth.tgz`, integrity: "sha512-c" },
+          "node_modules/withauth": { resolved: ["https:", "", `ci:${token}@registry.npmjs.org/withauth.tgz`].join("/"), integrity: "sha512-c" },
           // A workspace link has no registry origin to pin, by construction, and is not counted.
           "packages/local": { link: true },
         },

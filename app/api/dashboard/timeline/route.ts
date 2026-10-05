@@ -5,7 +5,7 @@ import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
 import { getCachedWorkTimeline } from "@/lib/dashboard/timeline-cache";
 import { getWorkTimeline, WINDOW_DAYS, MAX_WINDOW_DAYS } from "@/lib/dashboard/work-timeline";
-import { memberEnforcement } from "@/lib/access/enforce";
+import { contentTimelineEnforcement } from "@/lib/access/admission";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -16,8 +16,12 @@ export const maxDuration = 60;
  * the same payload the SSR panel + CLI read); a larger window is built FRESH and uncached (an on-demand,
  * infrequent action) via `getWorkTimeline`, so older days carry counts, not the per-person LLM synopsis —
  * that fan-out is deliberately kept off this request path. `days` is clamped to [WINDOW_DAYS, MAX_WINDOW_DAYS].
- * Session-authed; tier decides visibility (`visibleItems`/`visibleTasks`, the sole enforcement — no RLS,
- * CLAUDE.md §5).
+ * Session-authed. Access (TIERRET-1, CLAUDE.md §5 — no RLS): both windows resolve the member through the
+ * ONE admission resolver (`lib/access/admission.ts`) — the cached window via `getCachedWorkTimeline`'s
+ * `adm:` variant, the expansion via `contentTimelineEnforcement` — so an admitted member reads exactly its
+ * membership (oracle-visible evidence/meetings, sourced tasks by source item, hand-entered tasks by
+ * Everyone-or-grants) at either posture. Posture (`tier`) remains only a cache-key segment and the legacy
+ * arm's rule; it is not a member read ceiling.
  */
 export async function GET(req: NextRequest) {
   const rls = await serverClient();
@@ -53,11 +57,12 @@ export async function GET(req: NextRequest) {
   // Note `Number(null) === 0`, so a request with no `days` param clamps to 7 and takes the cached arm —
   // i.e. the default request is the one that would have broken.
   // §5.8: BOTH arms carry the member's enforcement — the fresh-build arm resolves it explicitly
-  // (it bypasses the cache layer, so the cache layer's resolution can't cover it).
+  // (it bypasses the cache layer, so the cache layer's resolution can't cover it). TIERRET-1: that
+  // enforcement includes the READER from the one admission resolver, exactly like the cached arm.
   const timeline =
     days <= WINDOW_DAYS
       ? (await getCachedWorkTimeline(adminClient(), team.id, tier, memberId)).days
       : await getWorkTimeline(adminClient(), team.id, tier, days,
-        await memberEnforcement(adminClient(), { teamId: team.id, memberId }), true);
+        await contentTimelineEnforcement(adminClient(), team.id, memberId), true);
   return Response.json({ days: timeline, window_days: days });
 }

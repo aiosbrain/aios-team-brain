@@ -32,15 +32,49 @@ const REQUIRED: { file: string; needle: string; why: string }[] = [
     needle: "!scope.generalSuppressed",
     why: "same discrimination as facts",
   },
+  // TIERRET-1: the two query routes no longer spell the member's graph scope themselves — they hand
+  // the WHOLE enforcement to the admission resolver, and the resolver's member arm carries the oracle
+  // partition set. Both halves are pinned: a route that stopped calling the resolver, or a resolver
+  // that stopped forwarding `graphProjectIds`, would silently drop the members' graph leg.
   {
     file: join("app", "api", "v1", "query", "route.ts"),
-    needle: "graphProjectIds: projectIds",
-    why: "the API query route must hand team members their partition set",
+    needle: "enforce = retrieveEnforceFor(await resolveContentView(db, teamId, auth!.memberId));",
+    why: "the API query route must hand admitted members their partition set (via the admission resolver)",
   },
   {
     file: join("app", "api", "dashboard", "query", "route.ts"),
-    needle: "graphProjectIds: projectIds",
+    needle: "enforce = retrieveEnforceFor(await resolveContentView(db, team.id, me.id));",
     why: "the dashboard chat is the members' primary surface — an unwired split here shipped once in review",
+  },
+  {
+    file: join("lib", "access", "admission.ts"),
+    needle: "memberProjectIds: reader.memberProjectIds,\n      graphProjectIds: view.projectIds,",
+    why: "the member arm's graph scope IS the oracle granted set the view resolved — never recomputed, never a fallback",
+  },
+  {
+    file: join("lib", "access", "admission.ts"),
+    needle: "projectIds: items.error ? [] : [...admission.grantedProjectIds],",
+    why: "a substrate error yields an EMPTY scope (fail closed), never the granted set served next to an error",
+  },
+  {
+    file: join("lib", "access", "admission.ts"),
+    needle: "return { visibleItemIds: view.ids, principal: reader.principal };",
+    why: "the legacy arm carries NO graphProjectIds — a connector/offroster key gains no graph authority",
+  },
+  {
+    file: join("app", "api", "v1", "query", "route.ts"),
+    needle: 'enforce = { visibleItemIds: ids, principal: "token", tokenProjectIds: projectIds };',
+    why: "delegated tokens keep the §5.8b omit — their enforcement carries no graphProjectIds",
+  },
+  {
+    file: join("lib", "graph", "partition-read.ts"),
+    needle: "if (args.visibleProjectIds.length === 0) return { groups: [], covered: 0, total: 0, generalSuppressed: false };",
+    why: "an EMPTY member scope selects no partitions — never a whole-team or tier-group fallback",
+  },
+  {
+    file: join("lib", "query", "retrieve.ts"),
+    needle: "if (!enforce?.graphProjectIds) return [];",
+    why: "an absent scope (legacy key, token) omits the graph leg entirely",
   },
   {
     file: join("lib", "query", "retrieve.ts"),
@@ -97,6 +131,15 @@ describe("PCCC-6 cutover call sites", () => {
     for (const { file, needle, why } of REQUIRED) {
       const src = readFileSync(join(ROOT, file), "utf8");
       expect(src.includes(needle), `${file}: missing "${needle}" — ${why}`).toBe(true);
+    }
+  });
+  it("TIERRET-1: neither query route builds a graph scope of its own (the resolver is the only source)", () => {
+    for (const file of [join("app", "api", "v1", "query", "route.ts"), join("app", "api", "dashboard", "query", "route.ts")]) {
+      const code = readFileSync(join(ROOT, file), "utf8")
+        .split("\n")
+        .filter((l) => !l.trim().startsWith("//") && !l.trim().startsWith("*"))
+        .join("\n");
+      expect(code, `${file}: a route-local graphProjectIds would bypass the admission resolver`).not.toMatch(/graphProjectIds\s*:/);
     }
   });
 });

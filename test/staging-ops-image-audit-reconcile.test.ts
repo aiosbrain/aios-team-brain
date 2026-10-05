@@ -10,7 +10,7 @@ import { scannerIdentity } from "../scripts/staging-ops/image-audit/evidence.mjs
 import { assessPackageInventory } from "../scripts/staging-ops/image-audit/registry.mjs";
 import { assessCanary, SCAN_REPRESENTATION } from "../scripts/staging-ops/image-audit/scan-surface.mjs";
 import { AUDIT_LIMITS, SUBJECT } from "../scripts/staging-ops/image-audit/subject.mjs";
-import { SCANNER } from "../scripts/staging-ops/image-audit/scanner.mjs";
+import { SCANNER, scannerArgs, scannerSettings } from "../scripts/staging-ops/image-audit/scanner.mjs";
 import { syntheticSecret } from "./helpers/tar-fixture";
 
 /**
@@ -52,6 +52,20 @@ const apiFailed = assessPackageInventory({ status: "unverified", reason: "the ve
 });
 
 /**
+ * THE SCANNER EXACTLY AS THE PRODUCER EMITS IT (AC-AUDIT-08) — built by the production
+ * `scannerIdentity` from the tracked config's real bytes, the settings read back from a real argument
+ * list, the v2 representation and a VERIFIED three-fixture canary. The four-field stand-in this
+ * replaces (`{ name, version, sha256, configPath }`) was the incomplete positive fixture that let a
+ * record with every scanner measurement dropped reconcile to ready.
+ */
+const verifiedCanary = assessCanary({ wrappedFindings: 1, unwrappedFindings: 0, archiveSurfaceFindings: 1 });
+const productionScanner = (canary: unknown = verifiedCanary) => scannerIdentity(SCANNER, readFileSync(SCANNER.configPath), {
+  settings: scannerSettings(scannerArgs({ sourceDir: "/scratch/scan", reportPath: "/scratch/report.json", ignorePath: "/scratch/cwd/.gitleaksignore" })),
+  representation: SCAN_REPRESENTATION,
+  canary,
+});
+
+/**
  * A REAL original audit record, assembled by the production `assembleAudit` from synthetic measured
  * outputs. Deliberately not a hand-built `{ blockers: [...] }` object: the positive control has to
  * prove that what the audit actually writes is what reconciliation accepts, and a hand-built stand-in
@@ -69,11 +83,12 @@ function originalAudit(overrides: Record<string, unknown> = {}, assembly: Record
         limitations: [],
         layers: 1,
         members: 3,
-        stagedBytes: 512,
+        stagedBytes: 2048,
+        archiveSurfaceBytes: 1536,
         stagedByteLimit: AUDIT_LIMITS.maxTotalStagedBytes,
-        representation: "aios.image-audit.scan-surface.v1",
+        representation: SCAN_REPRESENTATION.version,
         configBytes: 240,
-        scanSurfaceBytes: 844,
+        scanSurfaceBytes: 2380,
         representationOverheadBytes: 92,
       },
       config: { digest: `sha256:${"a".repeat(64)}` },
@@ -88,7 +103,8 @@ function originalAudit(overrides: Record<string, unknown> = {}, assembly: Record
     recipe: { assertions: [{ id: "workflow.no-secret-refs", status: "satisfied", detail: "no secret reference" }] },
     labelFailures: [],
     tagReadback: { status: "confirmed" },
-    scanner: { name: SCANNER.name, version: SCANNER.version, sha256: SCANNER.sha256, configPath: SCANNER.configPath },
+    canary: verifiedCanary,
+    scanner: productionScanner(),
     audit: { repository: SUBJECT.repository, runId: "1" },
     startedAt: "2026-09-09T00:00:00.000Z",
     completedAt: "2026-09-09T00:10:00.000Z",
@@ -315,6 +331,132 @@ describe("the ORIGINAL record must exist, match the subject, and be complete (PU
   });
 });
 
+/**
+ * AC-AUDIT-08 — THE READINESS BOUNDARY, table-driven over the full PRODUCTION scanner shape.
+ *
+ * Every row starts from the complete record `assembleAudit` writes with `productionScanner()` and makes
+ * ONE deficiency: a required field omitted, a nested field omitted or altered, a syntactically valid
+ * wrong digest, a v1 representation, unsupported settings, a representation mismatch, a missing or
+ * failed canary, or a contradictory complete-coverage claim. Each is reconciled WITH an otherwise-valid
+ * operator inventory — the substitution that used to launder these — and must refuse or stay blocked.
+ *
+ * Where a row plants a value, that value is a per-run marker, and the reconciled record must not
+ * contain it: a refusal names what failed with a fixed code, never what was rejected.
+ */
+describe("every deficient scanner measurement refuses or stays blocked after operator substitution (AC-AUDIT-08)", () => {
+  type Fields = Record<string, unknown>;
+  /** The production scanner record's shape, as far as these rows reach into it. */
+  interface ScannerRecord extends Fields {
+    settings: Fields & { ruleLimitations: readonly string[] };
+    representation: Fields;
+    capabilityCanary: Fields;
+  }
+  interface AuditRecord extends Fields {
+    scanner: ScannerRecord;
+    coverage: Fields;
+  }
+  type Mutate = (record: AuditRecord, marker: string) => Fields;
+  const withScanner = (change: (scanner: ScannerRecord, marker: string) => Fields): Mutate =>
+    (record, marker) => ({ ...record, scanner: change(structuredClone(record.scanner), marker) });
+  const without = (object: Fields, key: string): Fields => { const { [key]: _gone, ...rest } = object; return rest; };
+  const baseRecord = () => originalAudit() as unknown as AuditRecord;
+  const hex = (character: string) => character.repeat(64);
+
+  const rows: [string, Mutate, string?][] = [
+    // Each required top-level scanner field, omitted.
+    ...(["name", "version", "sha256", "configPath", "configSha256", "settings", "representation", "capabilityCanary"] as const)
+      .map((field): [string, Mutate, string] => [`scanner.${field} omitted`, withScanner((scanner) => without(scanner, field)), "original-scanner-malformed"]),
+    // Syntactically valid, wrong digests.
+    ["a wrong configSha256 (valid hex)", withScanner((scanner) => ({ ...scanner, configSha256: hex("f") })), "original-scanner-config-sha256-mismatch"],
+    ["a wrong asset sha256 (valid hex)", withScanner((scanner) => ({ ...scanner, sha256: hex("e") })), "original-scanner-sha256-mismatch"],
+    // Settings: each policy key omitted, an extra key, altered values.
+    ...(["gitleaksIgnorePath", "ruleLimitations", "maxTargetMegabytes", "maxArchiveDepth", "archiveExpansion"] as const)
+      .map((key): [string, Mutate, string] => [`settings.${key} omitted`, withScanner((scanner) => ({ ...scanner, settings: without(scanner.settings, key) })), "original-scanner-settings-unsupported"]),
+    ["an extra settings key", withScanner((scanner, marker) => ({ ...scanner, settings: { ...scanner.settings, extra: marker } })), "original-scanner-settings-unsupported"],
+    ["a scanner file-size skip", withScanner((scanner) => ({ ...scanner, settings: { ...scanner.settings, maxTargetMegabytes: "100" } })), "original-scanner-settings-unsupported"],
+    ["archive traversal enabled", withScanner((scanner) => ({ ...scanner, settings: { ...scanner.settings, maxArchiveDepth: "8" } })), "original-scanner-settings-unsupported"],
+    ["no audit-owned ignore file", withScanner((scanner) => ({ ...scanner, settings: { ...scanner.settings, gitleaksIgnorePath: "unset (the documented default is the working directory, which may carry a .gitleaksignore)" } })), "original-scanner-settings-unsupported"],
+    ["a reworded rule limitation", withScanner((scanner, marker) => ({ ...scanner, settings: { ...scanner.settings, ruleLimitations: [marker, ...scanner.settings.ruleLimitations.slice(1)] } })), "original-scanner-settings-unsupported"],
+    ["a dropped rule limitation", withScanner((scanner) => ({ ...scanner, settings: { ...scanner.settings, ruleLimitations: scanner.settings.ruleLimitations.slice(0, -1) } })), "original-scanner-settings-unsupported"],
+    // Representation: nested fields omitted or altered.
+    ...(["version", "header", "suffix"] as const)
+      .map((key): [string, Mutate, string] => [`representation.${key} omitted`, withScanner((scanner) => ({ ...scanner, representation: without(scanner.representation, key) })), "original-scanner-malformed"]),
+    ["representation.note omitted", withScanner((scanner) => ({ ...scanner, representation: without(scanner.representation, "note") })), "original-scan-representation-unsupported"],
+    ["representation.header altered", withScanner((scanner) => ({ ...scanner, representation: { ...scanner.representation, header: "OTHER header\n" } })), "original-scan-representation-unsupported"],
+    ["representation.suffix altered", withScanner((scanner) => ({ ...scanner, representation: { ...scanner.representation, suffix: ".bin" } })), "original-scan-representation-unsupported"],
+    ["representation.note altered", withScanner((scanner, marker) => ({ ...scanner, representation: { ...scanner.representation, note: marker } })), "original-scan-representation-unsupported"],
+    ["scanner representation v1, coverage v2 (mismatch)", withScanner((scanner) => ({ ...scanner, representation: { ...scanner.representation, version: "aios.image-audit.scan-surface.v1" } })), "original-scan-representation-unsupported"],
+    ["coverage representation v1, scanner v2 (mismatch)", (record) => ({ ...record, coverage: { ...record.coverage, representation: "aios.image-audit.scan-surface.v1" } }), "original-scan-representation-unsupported"],
+    ["coverage.representation omitted", (record) => ({ ...record, coverage: without(record.coverage, "representation") }), "original-scan-representation-unsupported"],
+    ["coverage.archiveSurfaceBytes omitted", (record) => ({ ...record, coverage: without(record.coverage, "archiveSurfaceBytes") }), "original-coverage-malformed"],
+    // Canary: nested fields omitted, altered, v1, failed.
+    ["canary.status omitted", withScanner((scanner) => ({ ...scanner, capabilityCanary: without(scanner.capabilityCanary, "status") })), "original-scanner-malformed"],
+    ["canary.representation omitted", withScanner((scanner) => ({ ...scanner, capabilityCanary: without(scanner.capabilityCanary, "representation") })), "original-scanner-malformed"],
+    ["canary.representation v1", withScanner((scanner) => ({ ...scanner, capabilityCanary: { ...scanner.capabilityCanary, representation: "aios.image-audit.scan-surface.v1" } })), "original-scanner-canary-representation-mismatch"],
+    ["verified canary without archiveSurfaceDetected", withScanner((scanner) => ({ ...scanner, capabilityCanary: without(scanner.capabilityCanary, "archiveSurfaceDetected") })), "original-scanner-canary-malformed"],
+    ["verified canary with archiveSurfaceDetected false", withScanner((scanner) => ({ ...scanner, capabilityCanary: { ...scanner.capabilityCanary, archiveSurfaceDetected: false } })), "original-scanner-canary-malformed"],
+    ["verified canary without binaryMagicSkipReproduced", withScanner((scanner) => ({ ...scanner, capabilityCanary: without(scanner.capabilityCanary, "binaryMagicSkipReproduced") })), "original-scanner-canary-malformed"],
+    ["verified canary carrying a failure reason", withScanner((scanner, marker) => ({ ...scanner, capabilityCanary: { ...scanner.capabilityCanary, reason: marker } })), "original-scanner-canary-malformed"],
+    ["a FAILED canary beside complete coverage", withScanner((scanner) => ({ ...scanner, capabilityCanary: assessCanary({ wrappedFindings: 1, unwrappedFindings: 0, archiveSurfaceFindings: 0 }) })), "original-internally-inconsistent"],
+    // F5 — canary TEXT is bound to the producer's constants; anything else is refused, never carried.
+    ["a verified canary with an altered note", withScanner((scanner, marker) => ({ ...scanner, capabilityCanary: { ...scanner.capabilityCanary, note: marker } })), "original-scanner-canary-malformed"],
+    ["an unverified canary with an arbitrary reason", withScanner((scanner, marker) => ({ ...scanner, capabilityCanary: { ...assessCanary({ wrappedFindings: 0, unwrappedFindings: 0, archiveSurfaceFindings: 1 }), reason: marker } })), "original-scanner-canary-malformed"],
+    ["an unverified canary carrying a note", withScanner((scanner, marker) => ({ ...scanner, capabilityCanary: { ...assessCanary({ wrappedFindings: 0, unwrappedFindings: 0, archiveSurfaceFindings: 1 }), note: marker } })), "original-scanner-canary-malformed"],
+    // F6 — the archive-surface figure must be consistent with the rest of coverage.
+    ["archiveSurfaceBytes greater than stagedBytes", (record) => ({ ...record, coverage: { ...record.coverage, archiveSurfaceBytes: Number(record.coverage.stagedBytes) + 1 } }), "original-internally-inconsistent"],
+    ["archiveSurfaceBytes of 0 beside complete coverage of a layer", (record) => ({ ...record, coverage: { ...record.coverage, archiveSurfaceBytes: 0 } }), "original-internally-inconsistent"],
+    // Contradictory complete coverage.
+    ["complete coverage beside a recorded limitation", (record) => ({ ...record, coverage: { ...record.coverage, limitations: [{ kind: "oversized-member", layer: 0 }] } }), "original-internally-inconsistent"],
+  ];
+
+  for (const [label, mutate, code] of rows) {
+    it(`${label} → ${code}`, () => {
+      const marker = `ZZ-${syntheticSecret("m").slice(1)}`;
+      const record = mutate(baseRecord(), marker);
+      const result = reconcile(record);
+      expect(result.transitionReady).toBe(false);
+      expect(result.verdict).toBe("refused");
+      expect(codes(result)).toContain(code);
+      // Fixed codes only: the rejected value is not echoed anywhere in the public record.
+      expect(JSON.stringify(result)).not.toContain(marker);
+    });
+  }
+
+  it("a COMPLETE pre-remediation v1 original is refused by name, however otherwise valid", () => {
+    const v1 = "aios.image-audit.scan-surface.v1";
+    const valid = baseRecord();
+    const record = {
+      ...valid,
+      coverage: { ...without(valid.coverage, "archiveSurfaceBytes"), representation: v1 },
+      scanner: {
+        ...without(valid.scanner, "capabilityCanary"),
+        representation: { ...valid.scanner.representation, version: v1 },
+        capabilityCanary: { ...without(valid.scanner.capabilityCanary, "archiveSurfaceDetected"), representation: v1 },
+      },
+    };
+    const result = reconcile(record);
+    expect(codes(result)).toContain("original-scan-representation-unsupported");
+    expect(result.transitionReady).toBe(false);
+  });
+
+  it("a FAILED canary on an honestly incomplete record validates as BLOCKED, not refused, and stays blocked", () => {
+    const failed = assessCanary({ wrappedFindings: 1, unwrappedFindings: 0, archiveSurfaceFindings: 0 });
+    const record = originalAudit({}, { canary: failed, scanner: productionScanner(failed) });
+    expect(validateOriginalEvidence(record, SUBJECT).ok).toBe(true);
+    const result = reconcile(record);
+    expect(result.verdict).not.toBe("refused");
+    expect(result.transitionReady).toBe(false);
+    expect(result.blockers.join(" ")).toMatch(/binary-scan-capability-unverified/);
+    // The substituted dimension is still the only one that moved.
+    expect(result.packageInventory).toMatchObject({ source: "operator-evidence", apiStatus: "unverified", status: "verified" });
+  });
+
+  it("the table's base record is itself ready — so every refusal above is caused by its one change", () => {
+    const result = reconcile(originalAudit());
+    expect(result).toMatchObject({ verdict: "clean", transitionReady: true });
+  });
+});
+
 describe("readiness is RECOMPUTED from measurements, never filtered out of a blocker list", () => {
   /** THE PROBE'S THIRD CASE: incomplete coverage and a real finding, with the blockers key ABSENT. */
   it("does not promote a record whose blockers are missing but whose measurements are not clean", () => {
@@ -382,7 +524,9 @@ describe("readiness is RECOMPUTED from measurements, never filtered out of a blo
     const valid = originalAudit();
     const result = reconcile({
       ...valid,
-      scanner: { ...(valid.scanner as object), capabilityCanary: { status: "unverified", reason: "the pinned scanner did not detect the sentinel" } },
+      // The production UNVERIFIED canary, not a hand-shaped one: it names the v2 representation, so the
+      // only thing wrong with this record is the contradiction under test.
+      scanner: productionScanner(assessCanary({ wrappedFindings: 0, unwrappedFindings: 0, archiveSurfaceFindings: 1 })),
     });
     expect(codes(result)).toEqual(["original-internally-inconsistent"]);
   });
@@ -547,11 +691,12 @@ describe("the reconciled record is an ALLOWLIST of validated fields (PUB-04)", (
     // SHAPES, so this is not a claim that arbitrary text in a free-text field is filtered.
     const valid = originalAudit();
     const marker = syntheticSecret("key_");
+    const privateKeyHeader = ["-----BEGIN", "RSA PRIVATE KEY-----"].join(" ");
     expect(() => reconcile({
       ...valid,
       packageInventory: {
         ...(valid.packageInventory as object),
-        reason: `the read failed: -----BEGIN RSA PRIVATE KEY----- ${marker}`,
+        reason: `the read failed: ${privateKeyHeader} ${marker}`,
       },
     })).toThrow(/leaks/);
   });
@@ -609,16 +754,13 @@ describe("a valid original whose ONLY blocker is the API inventory DOES become r
    * canary-less scanner, so this is the one case that exercises the field the defect was in.
    */
   it("validates an original whose scanner carries a REAL verified capability canary", () => {
-    const canary = assessCanary({ wrappedFindings: 1, unwrappedFindings: 0 }) as Record<string, unknown>;
+    const canary = assessCanary({ wrappedFindings: 1, unwrappedFindings: 0, archiveSurfaceFindings: 1 }) as Record<string, unknown>;
     // The premise, asserted rather than assumed: `note` is present on the verified path only.
     expect(canary.status).toBe("verified");
     expect(typeof canary.note).toBe("string");
-    expect(assessCanary({ wrappedFindings: 0, unwrappedFindings: 0 })).not.toHaveProperty("note");
+    expect(assessCanary({ wrappedFindings: 0, unwrappedFindings: 0, archiveSurfaceFindings: 0 })).not.toHaveProperty("note");
 
-    const record = originalAudit({}, {
-      canary,
-      scanner: scannerIdentity(SCANNER, "[allowlist]\n", { representation: SCAN_REPRESENTATION, canary }),
-    });
+    const record = originalAudit({}, { canary, scanner: productionScanner(canary) });
     // The audit really does carry the canary into the record — otherwise this case proves nothing.
     expect(record.scanner.capabilityCanary).toEqual(canary);
 

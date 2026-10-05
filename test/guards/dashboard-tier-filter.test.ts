@@ -97,8 +97,9 @@ const BODY_SURFACE_WIRING: [string, RegExp][] = [
   ["app/t/[team]/library/[itemId]/page.tsx", /await canSeeItem\(.*\)\s*notFound\(\)/],
   ["app/t/[team]/library/skills/page.tsx", /\.in\("id", \[\.\.\.vis\.ids\]\)/],
   ["app/t/[team]/team-tools/page.tsx", /\.in\("id", \[\.\.\.vis\.ids\]\)/],
-  ["app/t/[team]/tasks/page.tsx", /\.filter\(\(t\) => rowVisibleByProvenance\(/],
-  ["app/t/[team]/decisions/page.tsx", /\.filter\(\(d\) => rowVisibleByProvenance\(/],
+  // TIERRET-1: the TS twin now takes the reader's admission ctx (`rowVisibleByProvenanceCtx`).
+  ["app/t/[team]/tasks/page.tsx", /\.filter\(\(t\) => rowVisibleByProvenance(?:Ctx)?\(/],
+  ["app/t/[team]/decisions/page.tsx", /\.filter\(\(d\) => (?:provCtx !== null && )?rowVisibleByProvenance(?:Ctx)?\(/],
   ["components/library/data-browser.tsx", /\.in\("id", visArr\)/],
   ["app/api/v1/items/[id]/route.ts", /await canSeeItem\(/],
   // ENFB-2 (Codex diff H2): the member-driven meeting-todo scan serves item BODIES back to
@@ -127,6 +128,7 @@ describe("ENFB-1 — body-serving surfaces APPLY the membership oracle (the coar
   it("the wiring matchers discriminate (non-vacuity: each pattern is an application, not a resolution)", () => {
     const tasksPat = BODY_SURFACE_WIRING.find(([f]) => f.includes("tasks/page"))![1];
     expect(tasksPat.test('rows.filter((t) => rowVisibleByProvenance(t, ids, tier))')).toBe(true);
+    expect(tasksPat.test("rows.filter((t) => rowVisibleByProvenanceCtx(t, provCtx))")).toBe(true);
     expect(tasksPat.test('const vis = await visibleItemIds(db, p)'), "a bare resolution must NOT satisfy the wiring pin").toBe(false);
     const skillsPat = BODY_SURFACE_WIRING.find(([f]) => f.includes("skills"))![1];
     expect(skillsPat.test('.in("id", [...vis.ids])')).toBe(true);
@@ -151,7 +153,11 @@ describe("ENFB-1 — body-serving surfaces APPLY the membership oracle (the coar
  */
 const TITLE_SURFACE_WIRING: [string, RegExp][] = [
   ["app/t/[team]/projects/page.tsx", /visibleProjectCards\(/],
-  ["app/t/[team]/projects/[project]/page.tsx", /await canSeeProjectRow\([\s\S]*?notFound\(\)/],
+  // TIERRET-1: a container PAGE is a read — it takes the READER rule; write gates keep canSeeProjectRow.
+  ["app/t/[team]/projects/[project]/page.tsx", /await canReadProjectRow\([\s\S]*?notFound\(\)/],
+  // …and the per-row container slug on the decisions page is a read of names too.
+  ["app/t/[team]/decisions/page.tsx", /await readableProjectRows\(adminClient\(\)/],
+  ["app/t/[team]/decisions/page.tsx", /readRows\.ids\.has\(d\.project_id\)/],
   ["app/t/[team]/tasks/page.tsx", /boardTaskWindow[<(]/],
   ["app/t/[team]/tasks/page.tsx", /\.in\("id", projRows && !projRows\.error \? \[\.\.\.projRows\.ids\] : \[\]\)/],
   ["app/t/[team]/decisions/page.tsx", /\.in\("id", projRows && !projRows\.error \? \[\.\.\.projRows\.ids\] : \[\]\)/],
@@ -171,7 +177,7 @@ const TITLE_SURFACE_WIRING: [string, RegExp][] = [
   ["app/actions/tasks.ts", /await canSeeProjectRow\(adminClient\(\)/],
   ["app/actions/decisions.ts", /await canSeeProjectRow\(adminClient\(\)/],
   ["app/t/[team]/page.tsx", /decisionsCardWindow\(team\.id, provCtx/],
-  ["app/t/[team]/library/[itemId]/page.tsx", /await canSeeProjectRow\(/],
+  ["app/t/[team]/library/[itemId]/page.tsx", /await canReadProjectRow\(/],
   ["app/api/v1/projects/route.ts", /\.in\("id", \[\.\.\.rows\.ids\]\)/],
   ["app/api/v1/tasks/route.ts", /taskFeedWindow\(/],
   // The windows module: each window's OWN predicate application (per-function pins — deleting
@@ -318,6 +324,65 @@ describe("ENFB-2 — title/count surfaces APPLY the oracle (wiring + sweep tripw
     const projPat = TITLE_SURFACE_WIRING.find(([f]) => f === "app/t/[team]/projects/page.tsx")![1];
     expect(projPat.test("const cards = await visibleProjectCards(db, principal)")).toBe(true);
     expect(projPat.test("const rows = await visibleProjectRows(db, principal)"), "the list page must use the CARD read (visible counts), not the bare row set").toBe(false);
+  });
+});
+
+/**
+ * TIERRET-1 — read visibility must never become write authority. The member read rule widened
+ * (admitted members read by membership alone), so a READABLE container is not necessarily a WRITABLE
+ * one: the create actions, the create dropdowns and the agent-token picker keep the pre-TIERRET
+ * WRITER predicate (`canSeeProjectRow`/`visibleProjectRows`), and none of them may switch to the
+ * reader helpers. Each pin names an application site; the negative pins are the point.
+ */
+describe("TIERRET-1 — writer predicates stay on the legacy rule; reader helpers never gate a write", () => {
+  const WRITE_SITES = [
+    "app/actions/tasks.ts",
+    "app/actions/decisions.ts",
+    "app/t/[team]/admin/agents/page.tsx",
+    "app/t/[team]/admin/agents/actions.ts",
+    "app/api/v1/projects/route.ts",
+  ];
+  it("no write/authority site uses the reader helpers", () => {
+    for (const f of WRITE_SITES) {
+      const src = readFileSync(join(ROOT, f), "utf8");
+      expect(src, `${f} must not authorize with a READ helper`).not.toMatch(/canReadProjectRow|readableProjectRows/);
+    }
+  });
+  it("the writer predicate is the explicit legacy rule (byte-identical to pre-TIERRET)", () => {
+    const enforce = readFileSync(join(ROOT, "lib/access/enforce.ts"), "utf8");
+    expect(enforce).toMatch(/rule: \{ labelCeiling: !posture, ctx: \{ teamPosture: posture, principal: LEGACY_WRITER_RULE \} \}/);
+    expect(enforce).toMatch(/export async function canSeeProjectRow[\s\S]{0,200}?await writerRule\(db, principal\)/);
+    expect(enforce).toMatch(/export async function visibleProjectRows[\s\S]{0,200}?await writerRule\(db, principal\)/);
+    expect(enforce).toMatch(/export async function canReadProjectRow[\s\S]{0,200}?await readerRule\(db, principal\)/);
+  });
+
+  // Code review 1 HIGH-1: the widened board/decisions page hands readers ids of rows they could only
+  // READ, and every card renders drag/edit controls. Each EXISTING-row write action must apply the
+  // pre-TIERRET row WRITER predicate before its UPDATE (and so before `scheduleProjection`). Per-action
+  // pins: deleting the gate from one action must redden even while its sibling still carries it.
+  const ROW_WRITE_ACTIONS: [string, string, RegExp][] = [
+    ["app/actions/tasks.ts", "moveTaskAction", /canWriteTask\(teamId, me\.id, taskId\)/],
+    ["app/actions/tasks.ts", "updateTaskAction", /canWriteTask\(row\.team_id, me\.id, input\.taskId\)/],
+    ["app/actions/decisions.ts", "setDecisionValidityAction", /await canWriteStructuredRow\(adminClient\(\), \{ teamId, memberId: me\.id \}, "decisions", decisionId\)/],
+  ];
+  it.each(ROW_WRITE_ACTIONS)("%s %s gates the row with the WRITER predicate before its UPDATE", (file, fn, gate) => {
+    const src = readFileSync(join(ROOT, file), "utf8");
+    const start = src.indexOf(`export async function ${fn}(`);
+    expect(start, `${fn} must exist`).toBeGreaterThan(-1);
+    const next = src.indexOf("export async function", start + 1);
+    const body = src.slice(start, next === -1 ? undefined : next);
+    const gateAt = body.search(gate);
+    const updateAt = body.search(/\.update\(/);
+    expect(gateAt, `${fn} must call the row writer gate`).toBeGreaterThan(-1);
+    expect(updateAt, `${fn} must still write`).toBeGreaterThan(-1);
+    expect(gateAt, `${fn}: the gate must precede the UPDATE`).toBeLessThan(updateAt);
+  });
+  it("the task gate helper is the writer predicate (never a reader helper, never canSeeProjectRow)", () => {
+    const tasks = readFileSync(join(ROOT, "app/actions/tasks.ts"), "utf8");
+    expect(tasks).toMatch(/async function canWriteTask[\s\S]{0,300}?canWriteStructuredRow\(adminClient\(\), \{ teamId, memberId \}, "tasks", taskId\)/);
+    const enforce = readFileSync(join(ROOT, "lib/access/enforce.ts"), "utf8");
+    expect(enforce).toMatch(/export async function canWriteStructuredRow[\s\S]{0,400}?await writerRule\(db, principal\)/);
+    expect(enforce, "the row gate is not a container gate").not.toMatch(/export async function canWriteStructuredRow[\s\S]{0,1200}?canSeeProjectRow\(/);
   });
 });
 

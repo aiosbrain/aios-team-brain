@@ -16,14 +16,37 @@ for (const route of ["app/api/v1/query/route.ts", "app/api/dashboard/query/route
   describe(`enforcement wired in ${route}`, () => {
     const src = read(route);
     it("PRET-6 (the anti-zombie inverted pin): enforcement is constructed UNCONDITIONALLY — no flag read, no mode branch, no permissive null arm", () => {
-      // AC1's greps cannot catch a renamed mode source; this call-site pin can. The member arm
+      // AC1's greps cannot catch a renamed mode source; this call-site pin can. The non-token arm
       // must build enforce with no conditional guarding it.
+      // (Was a pin on the comment text 'PRET-6: enforcing is the only behavior' — prose proves
+      // nothing about control flow, so it is replaced by structural pins on the code itself.)
       expect(src).not.toMatch(/teamEnforcesAccess/);
-      expect(src).toContain('PRET-6: enforcing is the only behavior');
-      expect(src).toContain('principal: "member", graphProjectIds: projectIds');
+      expect(src).not.toMatch(/access_enforcement|accessEnforcement|ACCESS_ENFORCEMENT/);
+      // TIERRET-1: the non-token arm is built by the ONE admission resolver (member vs legacy is its
+      // decision, never the route's) — an ordinary key is not assumed to be a member.
+      const call = /enforce\s*=\s*retrieveEnforceFor\(\s*await\s+resolveContentView\(/;
+      expect(src).toMatch(call);
+      // Exactly ONE resolver-built assignment, and it is not under any `if (<flag/mode>)`: the line
+      // immediately governing it is either the try body (dashboard) or the token branch's `else`
+      // (v1). A wrapping conditional would have to appear between that opener and the call.
+      // split() cuts at EVERY non-overlapping match regardless of flags; `call` is capture-free and
+      // never matches empty, so exactly one occurrence yields exactly two pieces.
+      expect(src.split(call)).toHaveLength(2);
+      const at = src.search(call);
+      const opener = Math.max(src.lastIndexOf("try {", at), src.lastIndexOf("} else {", at));
+      expect(opener, "the resolver call sits directly in the try body or the token branch's else").toBeGreaterThan(-1);
+      const between = src
+        .slice(opener + 1, at)
+        .split("\n")
+        .filter((l) => !l.trim().startsWith("//"))
+        .join("\n");
+      expect(between, "no conditional wraps the resolver call (no feature-flag opt-out)").not.toMatch(/\bif\s*\(|\bswitch\s*\(|&&|\|\||\?\?|\?\s/);
+      // …and the resolver itself has no opt-out: it never reads a flag or mode before choosing an arm.
+      const adm = read("lib/access/admission.ts");
+      expect(adm).not.toMatch(/process\.env|teamEnforcesAccess|access_enforcement/);
     });
     it("resolves the member's visible items and passes enforce to retrieve", () => {
-      expect(src).toMatch(/visibleItemIds\s*\(/);
+      expect(src).toMatch(/resolveContentView\s*\(/);
       // retrieve is called WITH the enforce arg (not the 5-arg permissive form).
       expect(src).toMatch(/retrieve\([^)]*enforce\s*\)/);
     });
@@ -91,7 +114,8 @@ describe("timeline enforcement wiring (Phase B slice 4, §5.8)", () => {
   it("the windowed dashboard route enforces BOTH arms (the fresh-build arm bypasses the cache layer)", () => {
     const src = read("app/api/dashboard/timeline/route.ts");
     expect(src).toMatch(/getCachedWorkTimeline\(adminClient\(\),\s*team\.id,\s*tier,\s*memberId\s*\)/);
-    expect(src).toMatch(/getWorkTimeline\([^;]*days,\s*await\s+memberEnforcement\(/);
+    // TIERRET-1: the fresh-build arm carries the READER too (the cached arm resolves it inside).
+    expect(src).toMatch(/getWorkTimeline\([^;]*days,\s*await\s+contentTimelineEnforcement\(/);
   });
   it("the cache layer fails closed: no principal on an enforcing team throws", () => {
     expect(read("lib/dashboard/timeline-cache.ts")).toMatch(/timeline read without a principal/); // PRET-6: always throws
@@ -125,12 +149,25 @@ describe("delegated query wiring in app/api/v1/query/route.ts (Phase B slice 3)"
     // does not match this pattern, so the legal count is zero.
     expect(src.match(/enforce\s*=\s*null/g) ?? [], "enforce must never be re-nulled after the branch").toHaveLength(0);
   });
-  it("both MEMBER arms carry principal: \"member\" (QMIR-1 review Low 1 — the call site nothing else pins)", () => {
-    // Fail direction is closed (a dropped/flipped discriminant silently costs members the org
-    // chart, not a leak) — but a call site pinned by nothing is this repo's flagship defect class.
-    expect(src).toMatch(/enforce\s*=\s*\{\s*visibleItemIds:\s*ids\s*,\s*principal:\s*"member"/);
+  it("both non-token arms route through the admission resolver, whose arms are pinned here (QMIR-1 review Low 1; TIERRET-1)", () => {
+    // A call site pinned by nothing is this repo's flagship defect class — so pin both halves:
+    // the routes delegate, and the resolver's two arms carry exactly their authority.
+    expect(src).toMatch(/enforce\s*=\s*retrieveEnforceFor\(\s*await\s+resolveContentView\(\s*db\s*,\s*teamId\s*,\s*auth!\.memberId\s*\)\s*\)/);
     const dash = read("app/api/dashboard/query/route.ts");
-    expect(dash).toMatch(/enforce\s*=\s*\{\s*visibleItemIds:\s*ids\s*,\s*principal:\s*"member"/);
+    expect(dash).toMatch(/enforce\s*=\s*retrieveEnforceFor\(\s*await\s+resolveContentView\(\s*db\s*,\s*team\.id\s*,\s*me\.id\s*\)\s*\)/);
+    const adm = read("lib/access/admission.ts");
+    // Member arm: item set + Everyone bit + granted projects + graph partitions = the oracle set.
+    expect(adm).toMatch(
+      /principal:\s*reader\.principal,\s*memberEveryone:\s*reader\.everyone,\s*memberProjectIds:\s*reader\.memberProjectIds,\s*graphProjectIds:\s*view\.projectIds/
+    );
+    // Legacy arm: no graph scope, no member authority — the baseline shape only.
+    expect(adm).toMatch(/return \{ visibleItemIds: view\.ids, principal: reader\.principal \};/);
+    // Positive admission is `isPrincipal` on a same-team members row, read by the resolver itself —
+    // and an inactive row is refused BEFORE either arm (never demoted to legacy).
+    expect(adm).toMatch(/if \(!isPrincipal\(eligibility\)\) return \{ kind: "legacy"/);
+    expect(adm.indexOf('if (member.status !== "active") throw new ContentAdmissionError')).toBeLessThan(
+      adm.indexOf('if (!isPrincipal(eligibility)) return { kind: "legacy"')
+    );
   });
   it("the Phase A 403 refusal is gone — delegated tokens authenticate instead", () => {
     expect(src).not.toMatch(/delegation_not_supported/);

@@ -258,9 +258,11 @@ describe("timeline cache Slack generation fence (real Postgres)", () => {
     const { seed } = await fixture();
     await cache.getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId);
     await cache.settleTimelineRefreshes();
+    // TIERRET-1: the cache resolves the reader through the one admission resolver, which is what
+    // refuses each failed read (member row, posture, oracle grants).
     for (const table of ["members", "group_members", "project_groups"] as const) {
       await expect(cache.getCachedWorkTimeline(failedOracleRead(db(), table), seed.teamId, "team", seed.memberId))
-        .rejects.toThrow("member visibility");
+        .rejects.toThrow("content admission unavailable");
     }
     const { data: grantless, error } = await db().from("members").insert({ id: randomUUID(),
       team_id: seed.teamId, email: `${randomUUID()}@test.local`, display_name: "Grantless",
@@ -274,7 +276,7 @@ describe("timeline cache Slack generation fence (real Postgres)", () => {
   it("throws on a grant-read failure on a cold miss without persisting an empty variant", async () => {
     const { seed } = await fixture();
     await expect(cache.getCachedWorkTimeline(failedOracleRead(db(), "project_groups"),
-      seed.teamId, "team", seed.memberId)).rejects.toThrow("member visibility");
+      seed.teamId, "team", seed.memberId)).rejects.toThrow("content admission unavailable");
     const { data } = await db().from("work_timeline_cache").select("group_key").eq("team_id", seed.teamId);
     expect(data).toEqual([]);
   });
@@ -311,8 +313,7 @@ describe("timeline cache Slack generation fence (real Postgres)", () => {
     const old = await cache.getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId);
     expect(credited(old.days)).toContain(seed.memberId);
     await cache.settleTimelineRefreshes();
-    const vis = await visOf(seed);
-    const key = `vis:team:${vis!.visibilityHash}`;
+    const key = await cache.timelineViewKey(db(), seed.teamId, "team", seed.memberId);
     const row = await db().from("work_timeline_cache").select("payload").eq("team_id", seed.teamId)
       .eq("group_key", key).single();
     const payload = row.data.payload as { days: TimelineDay[] };
@@ -395,7 +396,8 @@ describe("timeline cache Slack generation fence (real Postgres)", () => {
 
   it("rejects an unstamped persisted row and rebuilds a real ledger", async () => {
     const { seed } = await fixture();
-    const key = `vis:team:${(await visOf(seed))!.visibilityHash}`;
+    // The READER's own `adm:` row — an unstamped row at any other key would never be looked up.
+    const key = await cache.timelineViewKey(db(), seed.teamId, "team", seed.memberId);
     await db().from("work_timeline_cache").upsert({ team_id: seed.teamId, group_key: key,
       payload: JSON.stringify({ v: cache.PAYLOAD_VERSION, days: [] }), computed_at: new Date().toISOString() },
       { onConflict: "team_id,group_key" });

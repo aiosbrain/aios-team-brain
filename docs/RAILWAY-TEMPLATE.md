@@ -94,3 +94,24 @@ The Railway template is a derived deployment asset. For every Team Brain release
 
 Do not generate the template from the production AIOS project: it contains organization-specific
 services and variables that do not belong in a public installer.
+
+
+## Startup and readiness
+
+The Railway pre-deploy command `npm run pg:schema` owns schema changes. The runtime
+wrapper calls `node docker/bootstrap.mjs --schema=predeployed`, preserving database
+waiting, team/admin provisioning and generated-secret sourcing while avoiding DDL
+against an application that is still serving traffic. Ordinary Docker startup
+omits this flag and continues to load schema before provisioning.
+
+Railway waits up to 120 seconds for `GET /api/health`. The route is uncached and
+returns 200 `{ "ok": true, "commit": "<deployment commit or null>" }` only after a
+Postgres pool checkout and query succeed within a shared 2.5-second budget; errors
+return 503 `{ "ok": false }`. This readiness probe does not inspect optional graph
+or model services and never exposes database diagnostics.
+
+If pre-deploy fails, inspect its migration/lock error before retrying; do not bypass
+pre-deploy or run the runtime-only mode against an unmigrated database. If startup
+fails after successful pre-deploy, inspect provisioning and readiness separately.
+Keep the pre-deploy command when reverting runtime changes. Do not restart the
+database or terminate unrelated readers as a routine application recovery step.

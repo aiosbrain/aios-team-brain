@@ -62,11 +62,12 @@ export async function DataBrowser({
   if (!team) return null;
 
   const me = await currentMember(team.id);
-  const tier = me?.tier ?? "external";
   // ENFB-1: the viewer's membership-visible set gates BOTH queries; no member → empty (fail closed).
-  const { visibleItemIds } = await import("@/lib/access/enforce");
+  // TIERRET-1: the label tier is the reader's admission ceiling (none for an admitted member).
+  const { resolveContentView, contentLabelTier } = await import("@/lib/access/admission");
   const { adminClient } = await import("@/lib/db/admin");
-  const vis = me ? await visibleItemIds(adminClient(), { teamId: team.id, memberId: me.id }) : null;
+  const vis = me ? await resolveContentView(adminClient(), team.id, me.id) : null;
+  const tier = vis ? contentLabelTier(vis.admission) : "external";
   if (!vis || vis.error || vis.ids.size === 0) {
     return (
       <p className="text-sm text-ink-secondary">
@@ -86,7 +87,7 @@ export async function DataBrowser({
     .eq("team_id", team.id)
     .order("synced_at", { ascending: false })
     .limit(CHANNEL_SCAN_CAP);
-  chQuery = visibleItems(chQuery, tier).in("id", visArr); // posture wall + the ENFB-1 oracle gate
+  chQuery = visibleItems(chQuery, tier).in("id", visArr); // admission label ceiling + the ENFB-1 oracle gate
   const { data: chRows } = await chQuery;
   const channels = groupChannels(
     ((chRows ?? []) as { path: string; synced_at: string | Date; frontmatter: Record<string, unknown> | null }[]).map(
@@ -124,10 +125,15 @@ export async function DataBrowser({
         .order("synced_at", { ascending: false })
         .order("id", { ascending: false })
         .range(offset, offset + batchSize - 1);
-      feedQuery = visibleItems(feedQuery, tier).in("id", visArr); // posture wall + the ENFB-1 oracle gate
+      // TIERRET-1: admission label ceiling + the ENFB-1 oracle gate — both IN-QUERY, so the bounded
+      // refill below ranks over VISIBLE rows only and cannot be starved by invisible ones.
+      feedQuery = visibleItems(feedQuery, tier).in("id", visArr);
       const { data: feed, error: feedError } = await feedQuery;
       if (feedError) throw new Error(`Data channel feed: ${feedError.message}`);
       const batch = (feed ?? []) as FeedItem[];
+      // Exact segment guard: LIKE treats `_` as a wildcard AND a legacy three-segment Slack prefix
+      // also matches a scoped four-segment path sharing its workspace segment, so confirm the
+      // channel boundary in JS after the parser.
       matching.push(...batch.filter((it) => belongsToChannel(it.path, selected)));
       offset += batch.length;
       if (batch.length < batchSize) break;

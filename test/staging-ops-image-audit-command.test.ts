@@ -5,6 +5,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { assembleAudit, createScratch, runAudit, runPrivate, runScan, scannerIsolation, verifyContext } from "../scripts/staging-ops/image-audit.mjs";
 import { CHECKSUM_UNRECORDED, SCANNER } from "../scripts/staging-ops/image-audit/scanner.mjs";
 import { SUBJECT } from "../scripts/staging-ops/image-audit/subject.mjs";
+import { assessCanary } from "../scripts/staging-ops/image-audit/scan-surface.mjs";
 import { createOperationBudget } from "../scripts/staging-ops/operation-deadline.mjs";
 import { syntheticSecret } from "./helpers/tar-fixture";
 
@@ -247,6 +248,9 @@ describe("the measured build recipe reaches the verdict, not just the record (M3
     identityVerified: true,
     labelFailures: [],
     tagReadback: { status: "confirmed" },
+    // The production VERIFIED canary: an absent one is now a coverage gap (AC-AUDIT-07), so a fixture
+    // meant to be clean has to carry the measurement a real run always makes.
+    canary: assessCanary({ wrappedFindings: 1, unwrappedFindings: 0, archiveSurfaceFindings: 1 }),
     scanner: { name: SCANNER.name, version: SCANNER.version, sha256: SCANNER.sha256, configPath: SCANNER.configPath },
     audit: { repository: "aiosbrain/aios-team-brain", runId: "1" },
     startedAt: "2026-09-09T00:00:00.000Z",
@@ -299,10 +303,25 @@ describe("the measured build recipe reaches the verdict, not just the record (M3
 
     // The positive control, so this is a fold rather than an unconditional limitation: a VERIFIED
     // canary leaves the measured coverage exactly as the inspection reported it.
-    const verified = assembleAudit({ ...measured, recipe, canary: { status: "verified", binaryMagicSkipReproduced: true } });
+    const verified = assembleAudit({ ...measured, recipe });
     expect(verified.coverage.complete).toBe(true);
     expect(verified.coverage.limitations).toEqual([]);
     expect(verified.transitionReady).toBe(true);
+  });
+
+  /**
+   * F4 — an ABSENT canary fails closed. `coverageWithCanary` used to treat `undefined` like a verified
+   * canary, so an assembly that never measured the capability produced complete coverage. So does a
+   * "verified" canary that never measured the archive surface.
+   */
+  it("treats an ABSENT canary, or one that never measured the archive surface, as unverified", () => {
+    const recipe = { assertions: [{ id: "workflow.no-secret-refs", status: "satisfied" }] };
+    for (const canary of [undefined, { status: "verified", binaryMagicSkipReproduced: true }]) {
+      const record = assembleAudit({ ...measured, recipe, canary });
+      expect(record.coverage.complete).toBe(false);
+      expect(record.coverage.limitations).toContainEqual({ kind: "binary-scan-capability-unverified" });
+      expect(record.transitionReady).toBe(false);
+    }
   });
 
   /**

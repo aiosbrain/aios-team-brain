@@ -1457,7 +1457,8 @@ export const ENTRY_INVENTORY: Record<string, EntryRecord> = {
     reason:
       "imports getCachedWorkTimeline (lib/dashboard/timeline-cache) and getWorkTimeline/WINDOW_DAYS " +
       "(lib/dashboard/work-timeline); work-timeline reaches the writer only through canSeeMeetingNotes " +
-      "in lib/meetings/notes, a visibility READER",
+      "in lib/meetings/notes (the legacy arm's posture predicate — a pure READER), and reaches " +
+      "lib/access/admission only for its types/ctx builder (no write path)",
   },
   "app/api/dashboard/team-work/route.ts": {
     class: "IMPORT_ONLY",
@@ -1477,6 +1478,14 @@ export const ENTRY_INVENTORY: Record<string, EntryRecord> = {
       "imports getAttributionHealth and getMemberItems from lib/attribution/health, which reaches the " +
       "closure via parseAuthorIdentity in lib/codebases/commits-to-items — a parser shared with the " +
       "commit writer, read-only here",
+  },
+  "app/api/v1/evidence/search/route.ts": {
+    class: "IMPORT_ONLY",
+    reason:
+      "imports searchEvidence from lib/query/evidence, which reaches the closure via parseAuthorRefs in " +
+      "lib/attribution/resolve-authors → parseAuthorIdentity in lib/codebases/commits-to-items — the " +
+      "same shared author parser as the attribution route. Evidence search is a ranked FTS READ plus " +
+      "identity lookups; its only write is the rate-limit bucket, never an item",
   },
 
   /* ── admin server actions that mutate ATTRIBUTION, not the item set ──────────────────────── */

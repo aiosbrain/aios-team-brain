@@ -1,6 +1,5 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
-import { isRestrictedTier } from "@/lib/auth/visibility";
 
 /**
  * Term-specificity analysis for the grounding signal (Gap #3). The old signal was
@@ -17,7 +16,9 @@ import { isRestrictedTier } from "@/lib/auth/visibility";
  *                        no over-abstain on legit common-word queries like "latest update").
  * Neither → the false-grounding signature (specific terms that match nothing + incidental common
  * words) → NOT grounded. Best-effort: on any error returns {false, true} so grounding degrades to
- * the old any-hit behavior rather than throwing. Tier-scoped on the live `items.access`.
+ * the old any-hit behavior rather than throwing. TIERRET-1: the corpus is EXACTLY the reader's
+ * served corpus — the membership-visible ids, plus the live `items.access` label conjunct ONLY when
+ * the caller's label ceiling applies (`labelCeilingApplies`: never for an admitted member).
  */
 
 const COMMON_FRAC = Number(process.env.GROUNDING_COMMON_FRAC ?? 0.15);
@@ -29,7 +30,9 @@ export interface TermSpecificity {
 
 export async function analyzeTermSpecificity(
   teamId: string,
-  tier: "team" | "external",
+  /** TIERRET-1: the reader's LABEL ceiling (true → external-labelled items only), computed by the
+   *  caller from its principal — the same ceiling every sibling leg applies. */
+  externalLabelOnly: boolean,
   terms: string[],
   /** ENFB-1: the caller's membership-visible item ids — the SAME set its sibling legs take.
    *  The counts are computed over the VISIBLE corpus only, closing the existence oracle (a
@@ -40,7 +43,7 @@ export async function analyzeTermSpecificity(
   if (terms.length === 0) return { specificMatching: false, allCommon: true };
   if (visibleIds.length === 0) return { specificMatching: false, allCommon: true }; // nothing visible → no specific evidence
   try {
-    const access = isRestrictedTier(tier) ? "and access = 'external'" : "";
+    const access = externalLabelOnly ? "and access = 'external'" : "";
     // One row per term: VISIBLE-corpus total + that term's document frequency.
     // Error contract (§2.6): a failure here degrades to the fts-hit fallback, which is ALREADY
     // vis-scoped — grounding can never widen past visible evidence on this path.

@@ -26,8 +26,11 @@ import { groupTimeline } from "@/lib/dashboard/timeline-group";
 
 /** Every node type in the payload → the keys that version is allowed to carry. */
 const SHAPE_BY_VERSION: Record<number, Record<string, string[]>> = {
-  // v15 changes evidence meaning and adds revision stamps to the envelope; TimelineDay stays the same.
-  get 15() { return this[12]; },
+  // v17 integrates the reserved Slack evidence-meaning/revision-stamp change with TIERRET-1's
+  // membership-only admission. Both are MEANING changes and both add fields to the ENVELOPE
+  // (`generations`, `itemFingerprint`) rather than to `TimelineDay`, so the tree stays identical.
+  // v15 is NOT pinned: it was reserved for #714 and then skipped — it never shipped to staging.
+  get 17() { return this[12]; },
   10: {
     // `summary` is attached on the cache-build path (`timeline-summary`), not by the pure builder, so
     // the fixture can't produce it — it is allowed but not required.
@@ -53,6 +56,11 @@ const SHAPE_BY_VERSION: Record<number, Record<string, string[]>> = {
   // v12 adds `via` to evidenceItem — set only on a meeting credited to its SUBMITTER because no
   // attendee resolved. It is copied explicitly by the grouper, so it is exactly the kind of key that
   // gets silently dropped; the REQUIRED half below forces the fixture to actually produce one.
+  // v16 (TIERRET-1): membership-only member reads (granted meetings + hand-entered rows) — a meaning
+  // change, shape identical. It reserved 15 for the pending Slack-semantics PR (#714); when the two
+  // integrated, the combined payload took 17 and 15 stayed unused, because whichever lands second must
+  // take the next unclaimed number and never share one.
+  get 16() { return this[12]; },
   // v14 (PRET-6): the permissive tier row retired — again a meaning change, shape identical.
   get 14() { return this[12]; },
   // v13 (PRET-5): the wall drop changes ROW SELECTION meaning, not shape — identical keys.
@@ -74,7 +82,7 @@ const SHAPE_BY_VERSION: Record<number, Record<string, string[]>> = {
  * field a stale payload still carries is the same hazard as adding one.
  */
 const REQUIRED_BY_VERSION: Record<number, Record<string, string[]>> = {
-  get 15() { return this[12]; },
+  get 17() { return this[12]; },
   10: {
     personDay: ["memberId", "name", "handle", "total", "tasks", "other", "unlinked", "signals"],
     taskGroup: ["taskId", "title", "status", "source", "sources", "evidenceCount", "assignee"],
@@ -94,6 +102,8 @@ const REQUIRED_BY_VERSION: Record<number, Record<string, string[]>> = {
     signalGroup: ["kind", "count", "items"],
     signalItem: ["id", "kind", "title", "at", "url", "stillValid"],
   },
+  // v16 (TIERRET-1): meaning-only, shape identical (see SHAPE_BY_VERSION; 15 reserved by #714).
+  get 16() { return this[12]; },
   // v14 (PRET-6): the permissive tier row retired — again a meaning change, shape identical.
   get 14() { return this[12]; },
   // v13 (PRET-5): the wall drop changes ROW SELECTION meaning, not shape — identical keys.

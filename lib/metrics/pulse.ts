@@ -1,7 +1,7 @@
 import "server-only";
 import { isOpenStatus } from "@/lib/tasks/activity-policy";
 import { runSql } from "@/lib/db/pg/pool";
-import { newSqlParams, provenanceRowSqlFromIds } from "@/lib/access/provenance-sql";
+import { newSqlParams, provenanceRowSqlFromIds, labelCeilingApplies, type ProvenanceIdsCtx } from "@/lib/access/provenance-sql";
 import type { DbClient } from "@/lib/db/types";
 import { rangeDays, type Range } from "./range";
 import { getSpendDailyUsd, getSpendTotalUsdBetween } from "./llm-spend";
@@ -16,11 +16,12 @@ import {
  * automatic — it is all applied here in app code (CLAUDE.md §5):
  *   • query_log / llm_usage via `scopeQueryLog` / `scopeLlmUsage` — a member sees only their own
  *     queries/spend, an admin the whole team's (role-scoped).
- *   • items / tasks via `visibleItems` / `visibleTasks` — a restricted (`external`) viewer sees only
- *     `access='external'` items and `audience='external'` tasks (tier-scoped). The home page routes
- *     any member with their own API key into the dashboard, INCLUDING an external one, so these
- *     aggregates MUST be tier-scoped — an unfiltered team-wide count quantifies internal activity
- *     (knowledge growth by kind, the task funnel) to a client collaborator.
+ *   • items / tasks over the viewer's MEMBERSHIP-visible sets (the oracle item ids + the provenance
+ *     predicate, in-query) — an unfiltered team-wide count would quantify internal activity
+ *     (knowledge growth by kind, the task funnel) to a client collaborator. TIERRET-1: the old
+ *     `access='external'`/`audience='external'` conjuncts are now the LABEL ceiling, applied only
+ *     where `labelCeilingApplies(provCtx.principal, tier)` says so — never for an admitted member,
+ *     whose counts describe exactly the rows their other surfaces serve.
  *
  * Aggregation is done in JS over rows fetched within the window. That is fine
  * at MVP volumes; if the corpus grows large, move the day-bucketing into SQL
@@ -161,10 +162,11 @@ export async function getPulseMetrics(
     /** ENFB-2 §2.2: the viewer's oracle ctx — DISPLAYED counts compute over the visible sets
      *  (per-kind item growth and the task funnel were team-wide volume disclosures). Absent →
      *  fail closed (empty sets → zero counts). */
-    provCtx?: { visibleItemIds: ReadonlySet<string>; teamPosture: boolean; principal?: "member" | "token" };
+    provCtx?: ProvenanceIdsCtx;
   }
 ): Promise<PulseMetrics> {
   const { isAdmin, tier } = viewer;
+  const labelCeiling = labelCeilingApplies(viewer.provCtx?.principal, tier);
   // The FALLBACK synthesises nothing (AUDITFIX-1 §2d): an absent ctx yields an absent principal,
   // which closes the hand-typed arm. It is inert today only because the fallback also pins
   // `teamPosture: false` — and relying on that would mean a later "fix" to the default posture
@@ -198,7 +200,7 @@ export async function getPulseMetrics(
         .gte("created_at", windowStart.toISOString())
         .order("created_at", { ascending: false })
         .limit(10_000),
-      tier
+      labelCeiling ? "external" : "team"
     ),
     scopeQueryLog(
       db
@@ -214,7 +216,7 @@ export async function getPulseMetrics(
     // 5,000-row sample would be starvable AND biased; the audience conjunct is preserved).
     (() => {
       const p = newSqlParams();
-      const access = tier === "team" ? "" : `and t.audience = 'external'`;
+      const access = labelCeiling ? `and t.audience = 'external'` : "";
       return runSql<{ status: string; updated_at: string | Date | null }>(
         `select t.status, t.updated_at from tasks t
           where t.team_id = ${p.add(teamId)} ${access}

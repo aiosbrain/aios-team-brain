@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { NextRequest } from "next/server";
 import { GET as itemsGET } from "@/app/api/v1/items/route";
 import { POST as queryPOST } from "@/app/api/v1/query/route";
-import { db, ingest, seedTeam, type Seed } from "./helpers";
+import { db, ingest, persistLegacyEmptyScopeForTest, seedTeam, type Seed } from "./helpers";
 import { mintAgentToken, revokeAgentToken, verifyAgentToken } from "@/lib/access/agent-tokens";
 import { addMemberToGroup, createGroup, grantProjectToGroup } from "@/lib/access/groups";
 import { effectiveVisibleProjects } from "@/lib/access/oracle";
@@ -12,6 +12,12 @@ import { effectiveVisibleProjects } from "@/lib/access/oracle";
 // of the delegated-token contract: triple-intersection attenuation, NULL vs [] scope, live
 // (non-snapshot) inheritance, verify-time principal re-checks, the items-route oracle filter, and
 // delegated `query` (admitted in B; retrieval ALWAYS attenuated, graph legs omitted, stateless).
+//
+// AUDITFIX-19: every mint here states its scope. Fixtures that used to omit it (or pass null) now
+// choose `all-reachable` deliberately — the same stored NULL — and the legacy `[]` token is a
+// test-only persisted-row fixture, because a new mint can no longer request it.
+
+const ALL_REACHABLE = { kind: "all-reachable" } as const;
 
 async function seedMember(seed: Seed, over: Partial<{ kind: string; tier: string; status: string }> = {}): Promise<string> {
   const { data, error } = await db()
@@ -57,16 +63,21 @@ describe("mint + verify lifecycle", () => {
     const seed = await seedTeam();
     const agent = await seedMember(seed, { kind: "agent" });
 
-    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent }, seed.memberId);
+    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent, scope: ALL_REACHABLE }, seed.memberId);
     expect(minted.ok, minted.error).toBe(true);
     expect(minted.token).toMatch(/^aiosd_/);
     expect(await verifyAgentToken(db(), minted.token!)).not.toBeNull();
     expect(await verifyAgentToken(db(), `${minted.token!.slice(0, -4)}XXXX`)).toBeNull();
 
-    // mint refusals: offroster launcher, offroster on_behalf_of
+    // mint refusals: offroster launcher, offroster on_behalf_of — with a VALID scope, so each
+    // refusal is the eligibility rule and not a missing scope choice.
     const offroster = await seedMember(seed, { kind: "offroster" });
-    expect((await mintAgentToken(db(), seed.teamId, { memberId: offroster }, seed.memberId)).ok).toBe(false);
-    expect((await mintAgentToken(db(), seed.teamId, { memberId: agent, onBehalfOf: offroster }, seed.memberId)).ok).toBe(false);
+    const offLauncher = await mintAgentToken(db(), seed.teamId, { memberId: offroster, scope: ALL_REACHABLE }, seed.memberId);
+    expect(offLauncher.ok).toBe(false);
+    expect(offLauncher.error).toBe("launching member is not a principal");
+    const offRep = await mintAgentToken(db(), seed.teamId, { memberId: agent, onBehalfOf: offroster, scope: ALL_REACHABLE }, seed.memberId);
+    expect(offRep.ok).toBe(false);
+    expect(offRep.error).toBe("on_behalf_of member is not a principal");
 
     // verify-time re-check: deactivating the launcher kills the live token on the next request
     await db().from("members").update({ status: "disabled" }).eq("id", agent).eq("team_id", seed.teamId);
@@ -83,9 +94,10 @@ describe("mint + verify lifecycle", () => {
     const expired = await mintAgentToken(
       db(),
       seed.teamId,
-      { memberId: agent, expiresAt: new Date(Date.now() - 1000).toISOString() },
+      { memberId: agent, scope: ALL_REACHABLE, expiresAt: new Date(Date.now() - 1000).toISOString() },
       seed.memberId
     );
+    expect(expired.ok, "the core primitive does not adopt the action's expiry policy").toBe(true);
     expect(await verifyAgentToken(db(), expired.token!)).toBeNull();
   });
 
@@ -104,7 +116,7 @@ describe("mint + verify lifecycle", () => {
     expect(cross.error, "composite FK must reject a cross-team on_behalf_of").not.toBeNull();
 
     const rep = await seedMember(seedA);
-    const minted = await mintAgentToken(db(), seedA.teamId, { memberId: seedA.memberId, onBehalfOf: rep }, seedA.memberId);
+    const minted = await mintAgentToken(db(), seedA.teamId, { memberId: seedA.memberId, onBehalfOf: rep, scope: ALL_REACHABLE }, seedA.memberId);
     expect(minted.ok).toBe(true);
     await db().from("members").delete().eq("id", rep).eq("team_id", seedA.teamId);
     const { data: row } = await db().from("agent_tokens").select("id").eq("id", minted.tokenRowId!).maybeSingle();
@@ -176,7 +188,9 @@ describe("the items route honors delegated tokens with the oracle filter (the ON
     const agent = await seedMember(seed, { kind: "agent" });
     const g = await createGroup(db(), seed.teamId, "agent-g", "G", seed.memberId);
     await addMemberToGroup(db(), seed.teamId, g.groupId!, agent, seed.memberId);
-    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent }, seed.memberId);
+    // AUDITFIX-19 AC-06: a DELIBERATE all-reachable token — the live inheritance is what it chose.
+    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent, scope: ALL_REACHABLE }, seed.memberId);
+    expect(minted.ok, minted.error).toBe(true);
 
     // No grants yet: the fresh agent sees NOTHING (empty effective set short-circuits).
     const empty = await itemsGET(itemsReq(minted.token!));
@@ -217,7 +231,7 @@ describe("the items route honors delegated tokens with the oracle filter (the ON
 });
 
 describe("stored scope end to end (Fable H2: the []→NULL fail-open direction must have a red test)", () => {
-  it("a token minted with projectScope [] sees ZERO items through the route — distinct from NULL = all granted", async () => {
+  it("a LEGACY stored [] token sees ZERO items through the route — distinct from an all-reachable NULL token", async () => {
     const seed = await seedTeam();
     const one = await ingest(seed, { path: "s/one.md", body: "scoped one", access: "team", project: "sproj" });
     await backfill(seed);
@@ -230,9 +244,14 @@ describe("stored scope end to end (Fable H2: the []→NULL fail-open direction m
     await addMemberToGroup(db(), seed.teamId, g.groupId!, agent, seed.memberId);
     await grantProjectToGroup(db(), seed.teamId, proj, g.groupId!, seed.memberId);
 
-    const nullScope = await mintAgentToken(db(), seed.teamId, { memberId: agent, projectScope: null }, seed.memberId);
-    const emptyScope = await mintAgentToken(db(), seed.teamId, { memberId: agent, projectScope: [] }, seed.memberId);
+    const nullScope = await mintAgentToken(db(), seed.teamId, { memberId: agent, scope: ALL_REACHABLE }, seed.memberId);
+    // AUDITFIX-19: a new mint cannot request [] — but a stored [] must still read nothing. The
+    // legacy row is made by test-only substrate setup on a fresh explicit token, before any read.
+    const emptyScope = await mintAgentToken(db(), seed.teamId, { memberId: agent, scope: ALL_REACHABLE }, seed.memberId);
     expect(nullScope.ok && emptyScope.ok).toBe(true);
+    await persistLegacyEmptyScopeForTest(seed.teamId, emptyScope.tokenRowId!);
+    expect((await verifyAgentToken(db(), nullScope.token!))!.projectScope, "all-reachable verifies as NULL").toBeNull();
+    expect((await verifyAgentToken(db(), emptyScope.token!))!.projectScope, "stored [] verifies as [] — never NULL").toEqual([]);
 
     const all = await itemsGET(itemsReq(nullScope.token!));
     expect(((await all.json()).items as { path: string }[]).map((i) => i.path)).toContain("s/one.md");
@@ -240,7 +259,7 @@ describe("stored scope end to end (Fable H2: the []→NULL fail-open direction m
     expect((await none.json()).items, "stored [] must survive mint→pg→verify→route as SEES NOTHING").toEqual([]);
   });
 
-  it("a token minted with projectScope [P] where the principal sees {P,Q} serves only P through the route", async () => {
+  it("a token minted with projects [P] where the principal sees {P,Q} serves only P through the route", async () => {
     const seed = await seedTeam();
     const pin = await ingest(seed, { path: "p/in.md", body: "in scope", access: "team", project: "pproj" });
     const qout = await ingest(seed, { path: "q/out.md", body: "out of scope", access: "team", project: "qproj" });
@@ -259,9 +278,11 @@ describe("stored scope end to end (Fable H2: the []→NULL fail-open direction m
     const minted = await mintAgentToken(
       db(),
       seed.teamId,
-      { memberId: agent, projectScope: [bySlug.get("pproj")!] },
+      { memberId: agent, scope: { kind: "projects", projectIds: [bySlug.get("pproj")!] } },
       seed.memberId
     );
+    expect(minted.ok, minted.error).toBe(true);
+    expect((await verifyAgentToken(db(), minted.token!))!.projectScope).toEqual([bySlug.get("pproj")!]);
     const res = await itemsGET(itemsReq(minted.token!));
     const paths = ((await res.json()).items as { path: string }[]).map((i) => i.path);
     expect(paths).toContain("p/in.md");
@@ -287,7 +308,8 @@ describe("stored scope end to end (Fable H2: the []→NULL fail-open direction m
     await grantProjectToGroup(db(), seed.teamId, bySlug.get("xshared")!, hg.groupId!, seed.memberId);
     await grantProjectToGroup(db(), seed.teamId, bySlug.get("yhuman")!, hg.groupId!, seed.memberId);
 
-    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent, onBehalfOf: seed.memberId }, seed.memberId);
+    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent, onBehalfOf: seed.memberId, scope: ALL_REACHABLE }, seed.memberId);
+    expect(minted.ok, minted.error).toBe(true);
     const res = await itemsGET(itemsReq(minted.token!));
     const paths = ((await res.json()).items as { path: string }[]).map((i) => i.path);
     expect(paths).toContain("x/shared.md");
@@ -301,14 +323,19 @@ describe("Phase A: no external-tier delegation (Fable H1)", () => {
     const extAgent = await seedMember(seed, { kind: "agent", tier: "external" });
     const extHuman = await seedMember(seed, { tier: "external" });
     const agent = await seedMember(seed, { kind: "agent" });
-    expect((await mintAgentToken(db(), seed.teamId, { memberId: extAgent }, seed.memberId)).ok).toBe(false);
-    expect((await mintAgentToken(db(), seed.teamId, { memberId: agent, onBehalfOf: extHuman }, seed.memberId)).ok).toBe(false);
+    // Valid scope on both, so the refusal is the tier rule and not a missing scope choice.
+    const extLauncher = await mintAgentToken(db(), seed.teamId, { memberId: extAgent, scope: ALL_REACHABLE }, seed.memberId);
+    expect(extLauncher.ok).toBe(false);
+    expect(extLauncher.error).toMatch(/external-tier delegation/);
+    const extRep = await mintAgentToken(db(), seed.teamId, { memberId: agent, onBehalfOf: extHuman, scope: ALL_REACHABLE }, seed.memberId);
+    expect(extRep.ok).toBe(false);
+    expect(extRep.error).toMatch(/external-tier delegation/);
   });
 
   it("a tier downgrade AFTER mint kills the live token at verify", async () => {
     const seed = await seedTeam();
     const agent = await seedMember(seed, { kind: "agent" });
-    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent }, seed.memberId);
+    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent, scope: ALL_REACHABLE }, seed.memberId);
     expect(await verifyAgentToken(db(), minted.token!)).not.toBeNull();
     await db().from("members").update({ tier: "external" }).eq("id", agent).eq("team_id", seed.teamId);
     expect(await verifyAgentToken(db(), minted.token!), "external downgrade must kill the token in Phase A").toBeNull();
@@ -324,10 +351,10 @@ function queryReq(token: string, body: Record<string, unknown>): NextRequest {
 }
 
 describe("query honors delegated tokens (Phase B slice 3, spec §10/§17-B)", () => {
-  it("a valid spawn-default token gets the SSE stream — the Phase A 403 refusal is lifted", async () => {
+  it("a valid all-reachable token gets the SSE stream — the Phase A 403 refusal is lifted", async () => {
     const seed = await seedTeam();
     const agent = await seedMember(seed, { kind: "agent" });
-    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent }, seed.memberId);
+    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent, scope: ALL_REACHABLE }, seed.memberId);
     const res = await queryPOST(queryReq(minted.token!, { question: "anything at all" }));
     expect(res.status, "delegated query must be admitted, not refused").toBe(200);
     expect(res.headers.get("content-type")).toBe("text/event-stream");
@@ -342,7 +369,7 @@ describe("query honors delegated tokens (Phase B slice 3, spec §10/§17-B)", ()
   it("a query that never reaches `done` still consumes daily quota — the query_log row is written BEFORE streaming (Codex B3 High: read-deltas-and-disconnect was free and uncounted)", async () => {
     const seed = await seedTeam();
     const agent = await seedMember(seed, { kind: "agent" });
-    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent }, seed.memberId);
+    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent, scope: ALL_REACHABLE }, seed.memberId);
     const res = await queryPOST(queryReq(minted.token!, { question: "count this attempt" }));
     expect(res.status).toBe(200);
     await res.text(); // drain: with no LLM configured this tier's stream ends in an error frame, never `done`
@@ -357,7 +384,7 @@ describe("query honors delegated tokens (Phase B slice 3, spec §10/§17-B)", ()
   it("a delegated query is stateless: conversation_id is refused explicitly (422), never silently ignored", async () => {
     const seed = await seedTeam();
     const agent = await seedMember(seed, { kind: "agent" });
-    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent }, seed.memberId);
+    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent, scope: ALL_REACHABLE }, seed.memberId);
     const res = await queryPOST(queryReq(minted.token!, { question: "q", conversation_id: randomUUID() }));
     expect(res.status).toBe(422);
   });

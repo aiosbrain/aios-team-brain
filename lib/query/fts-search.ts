@@ -10,8 +10,10 @@ import { channelScopeSql, resolveVisibleChannelScope, type VisibleChannelScope }
  * match but orders by `ts_rank` DESC, so the capped window is the *best* N, not an arbitrary N (Gap
  * #2 from the multi-channel adversarial suite). Postgres-only, same raw-SQL precedent as dense-search.
  *
- * `rank` is returned so callers can reason about match strength. Tier is enforced in-DB on the live
- * `items.access` (external callers never get team content) — the sole enforcement, no RLS backstop.
+ * `rank` is returned so callers can reason about match strength. Access is the caller's
+ * membership-visible item set (`visibleIds`, the oracle set), applied IN-QUERY — the sole enforcement,
+ * no RLS backstop. There is no label (`items.access`) filter here (PRET-6 retired the posture wall;
+ * TIERRET-1 made membership the whole member read rule); `tier` is accepted but does not filter.
  */
 
 export interface FtsHit {
@@ -24,6 +26,10 @@ export interface FtsHit {
   work_at: string;
   project: string;
   rank: number;
+  title?: string | null;
+  frontmatter?: Record<string, unknown>;
+  member_id?: string | null;
+  actor?: string | null;
 }
 
 export async function rankedFtsSearch(
@@ -36,12 +42,19 @@ export async function rankedFtsSearch(
   // IN-QUERY so `limit` ranks over VISIBLE rows only — a post-filter would let invisible rows
   // crowd visible ones out of the top-N (under-return) and leak an abstention side channel. Null
   // = permissive (no filter). Empty = enforcing-but-sees-nothing → the SQL returns zero rows.
-  visibleIds?: readonly string[] | null
+  visibleIds?: readonly string[] | null,
+  options?: { project?: string | null; metadata?: boolean; identifiers?: string[] }
 ): Promise<FtsHit[]> {
   if (!orQuery.trim()) return [];
   if (visibleIds && visibleIds.length === 0) return []; // enforcing, sees nothing
   const params: unknown[] = [orQuery, teamId];
   let where = "i.team_id = $2 and i.search @@ websearch_to_tsquery('english', $1)";
+  let exact = "false";
+  if (options?.identifiers?.length) {
+    params.push(options.identifiers.map(x => x.toLowerCase()));
+    exact = `(lower(i.frontmatter->>'id') = any($${params.length}::text[]) or lower(split_part(regexp_replace(i.path, '^.*/', ''), '.', 1)) = any($${params.length}::text[]))`;
+    where = `i.team_id = $2 and (i.search @@ websearch_to_tsquery('english', $1) or ${exact})`;
+  }
   // PRET-6: the oracle set alone (the permissive posture wall retired with the model).
   if (visibleIds) {
     params.push(visibleIds);
@@ -57,12 +70,17 @@ export async function rankedFtsSearch(
       : channel;
     where += ` and ${channelScopeSql(scope, "i", params)}`;
   }
+  if (options?.project) {
+    params.push(options.project);
+    where += ` and p.slug = $${params.length}`;
+  }
   params.push(limit);
   const limitIdx = params.length;
 
   const sql = `
     select i.id, i.path, i.kind, i.body, i.synced_at, i.work_at, coalesce(p.slug, '') as project,
-           ts_rank(i.search, websearch_to_tsquery('english', $1)) as rank
+           ${options?.metadata ? "i.frontmatter->>'title' as title, i.frontmatter, i.member_id, i.actor," : ""}
+           (ts_rank(i.search, websearch_to_tsquery('english', $1)) + case when ${exact} then 1 else 0 end) as rank
     from items i
     left join projects p on p.id = i.project_id
     where ${where}
@@ -78,9 +96,14 @@ export async function rankedFtsSearch(
     work_at: string | Date;
     project: string;
     rank: number | string;
+    title?: string | null;
+    frontmatter?: Record<string, unknown>;
+    member_id?: string | null;
+    actor?: string | null;
   }>(sql, params);
 
   return res.rows.map((r) => ({
+    ...(options?.metadata ? { title: r.title, frontmatter: r.frontmatter, member_id: r.member_id, actor: r.actor } : {}),
     id: r.id,
     path: r.path,
     kind: r.kind,

@@ -88,8 +88,8 @@ export function parseTaskKeys(raw: string | null, mode: TaskFeedMode): TaskKeysP
  * counts, and it still returns null rather than a list that would be quietly wrong — the same rule
  * the CI consumer applies, kept on the side that actually knows.
  *
- * A key hidden by the caller's tier is reported as unknown, deliberately: "it exists but you may not
- * see it" is itself a disclosure, and the audience conjunct in the feed SQL is the only enforcement (no RLS).
+ * A key hidden from the caller is reported as unknown, deliberately: "it exists but you may not see
+ * it" is itself a disclosure, and the in-query feed predicate is the only enforcement (no RLS).
  */
 export function unknownKeysFor(
   requested: string[],
@@ -117,9 +117,9 @@ export function unknownKeysFor(
  *    Linear status + assignee changes back into its markdown. Without it the markdown decays —
  *    the projection is one-way and the writeback feed is dashboard-origin only.
  *
- * Tier isolation (audit H1) applies to every mode: the `tasks.audience` conjunct compiles into
- * the feed SQL (ENFB-2 — with the membership provenance predicate), so an external-tier key
- * never reads a team board. There is no RLS.
+ * Access applies to every mode: the membership provenance predicate compiles into the feed SQL
+ * (ENFB-2), so a key never reads a board it has no grant to. TIERRET-1: the `tasks.audience`
+ * conjunct is the LABEL ceiling of a legacy (non-principal) key only. There is no RLS.
  */
 export async function GET(req: NextRequest) {
   const auth = await authenticateApiKey(req);
@@ -179,9 +179,18 @@ export async function GET(req: NextRequest) {
   // AND the per-mode filters (writeback's changed-after-push test lived app-side, post-LIMIT)
   // — compiles in-query, so the 500-row window fills with rows that will actually serve and
   // `unknown_keys`/`truncated` describe the SAME set the caller receives (design round 1 F3 +
-  // the draft's by-construction claim made true). Audience conjunct preserved verbatim.
-  const { visibleItemIds } = await import("@/lib/access/enforce");
-  const vis = await visibleItemIds(db, { teamId: auth.teamId, memberId: auth.memberId });
+  // the draft's by-construction claim made true).
+  // TIERRET-1: WHO is asking comes from the ONE admission resolver, not from the key's validity —
+  // an admitted member's rows follow provenance alone (no audience conjunct; hand-entered rows by
+  // Everyone-or-grants); a non-principal key (connector/offroster) keeps its exact legacy rule.
+  // `authenticateApiKey` accepts `aios_` keys only — an `aiosd_` delegated token cannot reach here.
+  const { resolveContentView, provenanceCtxFor, contentLabelTier } = await import("@/lib/access/admission");
+  let vis: import("@/lib/access/admission").ContentView;
+  try {
+    vis = await resolveContentView(db, auth.teamId, auth.memberId);
+  } catch {
+    return errorResponse("internal", "visibility resolution failed", 500);
+  }
   if (vis.error) return errorResponse("internal", "visibility resolution failed", 500);
   const { taskFeedWindow } = await import("@/lib/access/structured-windows");
 
@@ -189,13 +198,10 @@ export async function GET(req: NextRequest) {
   try {
     const rows = await taskFeedWindow(
       auth.teamId,
-      // Member-only route (AUDITFIX-1 §2a): `authenticateApiKey` accepts `aios_` member keys only —
-      // an `aiosd_` delegated token cannot authenticate here (lib/api/auth.ts). Omitting this closes
-      // the hand-typed arm and drops every UI-origin task out of the writeback feed.
-      { visibleItemIds: vis.ids, teamPosture: auth.memberTier === "team", principal: "member" as const },
+      provenanceCtxFor(vis),
       {
         since,
-        externalAudienceOnly: auth.memberTier !== "team",
+        externalAudienceOnly: contentLabelTier(vis.admission) === "external",
         projectId,
         // The by-key filter is what makes absence provable: the result is bounded by what was
         // ASKED for, not by an arbitrary page of the newest-last table.

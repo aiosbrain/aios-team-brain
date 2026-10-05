@@ -5,6 +5,7 @@ import classification from "../scripts/staging-ops/credential-classification.jso
 import {
   EXCLUDED_PAIRED_TABLE_DATA,
   credentialClassificationGaps,
+  pairedDumpArguments,
   transformedAuthUserProjection,
   transformedGraphEpisodeProjection,
 } from "../scripts/staging-ops/pg-sanitize.mjs";
@@ -14,6 +15,16 @@ describe("paired Postgres sanitation policy", () => {
 
   it("classifies every credential-like/hash column in the current canonical schema", () => {
     expect(credentialClassificationGaps(schema, classification)).toEqual([]);
+  });
+
+  it("excludes credential-bound governed history from the actual dump arguments", () => {
+    expect(classification["governed_action_identities.request_hash"]).toBe("exclude-table-noncredential");
+    expect(classification["governed_actions.credential_id"]).toBe("exclude-table");
+    const args = pairedDumpArguments("00000003-0000001B-1", "/fixture/postgres.dump");
+    for (const table of ["api_keys", "governed_action_identities", "governed_actions"]) {
+      expect(args.filter((arg: string) => arg === `--exclude-table-data=${table}`)).toHaveLength(1);
+      expect(args).not.toContain(`--exclude-table=${table}`);
+    }
   });
 
   it("keeps identities but forces password hashes null in the exported projection", () => {
@@ -28,6 +39,7 @@ describe("paired Postgres sanitation policy", () => {
       "auth_tokens", "oauth_states", "api_keys", "agent_tokens", "integrations", "member_secrets",
       "gateway_service_identities", "gateway_service_credentials", "gateway_connections",
       "gateway_resolution_leases", "gateway_executions", "gateway_approvals", "gateway_audit_log",
+      "governed_action_identities", "governed_actions",
       "social_jobs", "llm_usage", "llm_failures", "usage_costs", "arc_cache", "work_timeline_cache",
     ]));
     expect(EXCLUDED_PAIRED_TABLE_DATA).not.toContain("graph_episodes");
