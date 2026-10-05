@@ -7,7 +7,7 @@ import { readTimelineCache, resolveTimelineVariant, writeTimelineCache } from "@
 import { getPool } from "@/lib/db/pg/pool";
 import type { DbClient } from "@/lib/db/types";
 import { createAttributionRepairLoop, type RepairRoundSummary } from "@/lib/ingest/attribution-repair-scheduler";
-import { reattributeItems, REPAIR_TURN_BATCH } from "@/lib/ingest/reattribute";
+import { reattributeItems, REPAIR_TURN_BATCH, takeRepairScanTurn } from "@/lib/ingest/reattribute";
 import {
   discoverPendingAttributionRepairs,
   drainPendingAttributionRepairs,
@@ -64,6 +64,16 @@ async function authority(seed: Seed): Promise<AuthorityRow> {
             items_updated::int as items_updated, attempts, last_error,
             coalesce(next_attempt_at > now(), false) as deferred
        from team_identity_authority where team_id=$1`, [seed.teamId]);
+  return rows[0];
+}
+
+/** What a stale writer could disturb beyond the row's logical state: when it was completed, when
+ * it was last written, and the team's authorization epoch. */
+async function authorityStamp(seed: Seed) {
+  const { rows } = await getPool().query<{ completed_at: string | null; updated_at: string; epoch: number | null }>(
+    `select a.completed_at::text as completed_at, a.updated_at::text as updated_at,
+            (select e.epoch::int from team_authorization_epochs e where e.team_id=a.team_id) as epoch
+       from team_identity_authority a where a.team_id=$1`, [seed.teamId]);
   return rows[0];
 }
 
@@ -395,7 +405,7 @@ describe("AIO-1167 attribution repair continues promptly from durable state (rea
       // hook all answer at once, and none of them is a failure.
       expect(await repairAttributionNow(db(), seed.teamId, seed.teamSlug, { maxBatches: 10, batchSize: 5 }))
         .toMatchObject({ status: "continuing", busy: true, scanned: 0, partial: true });
-      expect(await reattributeItems(db(), seed.teamId, { batchSize: 5 })).toMatchObject({ turn: "busy", scanned: 0 });
+      expect(await takeRepairScanTurn(db(), seed.teamId, { batchSize: 5 })).toMatchObject({ turn: "busy", scanned: 0 });
       expect(await bootedScheduler(5).runRound()).toEqual(round({ attempted: 1, busy: 1 }));
       expect(await drainPendingAttributionRepairs(db(), { maxBatchesPerTeam: 2, batchSize: 5 }))
         .toEqual({ attempted: 1, complete: 0, continuing: 1, failed: 0 });
@@ -841,6 +851,219 @@ describe("AIO-1167 attribution repair continues promptly from durable state (rea
       attempts: 0, last_error: null, deferred: false,
     });
     expect(await credited(seed, alice.id)).toBe(12);
+    expect(await fenced(seed)).toBe(false);
+  }, 60_000);
+
+  /** A team whose scan has FINISHED and whose finalization is owed, with 7 of its 12 rows then made
+   *  wrong behind the cursor — stored credit that no mapping change will ever enqueue a repair for. */
+  async function scannedWithMismatchBehindCursor() {
+    const seed = await seedTeam();
+    const alice = await member(seed, "Alice");
+    const author = authorAddress();
+    await storedItems(seed, 12, author);
+    await addAuthorAlias(db(), seed.teamId, alice.id, author);
+    const scanning = bootedScheduler(5);
+    for (let batch = 0; batch < 3; batch++) await scanning.runRound();
+    await getPool().query(
+      `update items set member_id=$2
+        where id in (select id from items where team_id=$1 order by id limit 7)`, [seed.teamId, seed.memberId]);
+    const scanned = await authority(seed);
+    expect(scanned).toMatchObject({ repair_status: "awaiting_cache", items_scanned: 12, attempts: 0 });
+    expect(scanned.cursor_item_id).not.toBeNull();
+    expect(await credited(seed, alice.id)).toBe(5);
+    return { seed, alice, scanned };
+  }
+
+  /** A scheduler that has just booted and is never kicked, run until the revision completes:
+   *  [status, rows revisited, rows correct] after each round, fenced until the last. */
+  async function convergeBySchedulerAlone(seed: Seed, correctFor: string): Promise<[string, number, number][]> {
+    const scheduler = bootedScheduler(5);
+    const seen: [string, number, number][] = [];
+    while (seen.length < 10) {
+      const summary = await scheduler.runRound();
+      const now = await authority(seed);
+      seen.push([now.repair_status, now.items_scanned, await credited(seed, correctFor)]);
+      if (now.repair_status === "complete") break;
+      expect(summary).toEqual(round({ attempted: 1, continuing: 1 }));
+      expect(await fenced(seed)).toBe(true);
+    }
+    return seen;
+  }
+
+  it("REQUEST vs a FINALIZER in flight: the request waits behind the finalization instead of being refused, reopens what it completed, and survives the requester dying and no kick ever arriving", async () => {
+    const { seed, alice, scanned } = await scannedWithMismatchBehindCursor();
+
+    // The finalizer: it owns the turn AND the identity authority, has validated the revision, and
+    // is about to purge and mark it complete.
+    let release!: () => void;
+    let owning!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const owned = new Promise<void>((resolve) => { owning = resolve; });
+    const finalizer = runAttributionRepairTurn(db(), seed.teamId, seed.teamSlug, {
+      beforeFinalize: async () => { owning(); await gate; },
+    });
+    finalizer.catch(() => undefined);
+    await owned;
+
+    // The manual request arrives now. Nothing in this process listens for a kick, and the
+    // requesting process dies the moment its request has committed: whatever is to happen next
+    // can only come from the authority row.
+    const enqueued: AuthorityRow[] = [];
+    const request = repairAttributionNow(db(), seed.teamId, seed.teamSlug, {
+      request: true, batchSize: 5,
+      afterRequest: async () => {
+        enqueued.push(await authority(seed));
+        throw new Error("requester died after enqueuing");
+      },
+    });
+    request.catch(() => undefined);
+    try {
+      // It is not refused and it is not applied: it is WAITING, behind the finalizer's authority lock.
+      await expect.poll(async () => (await getPool().query<{ n: number }>(
+        "select count(*)::int as n from pg_locks where locktype='advisory' and not granted")).rows[0].n,
+      { timeout: 5_000 }).toBe(1);
+      expect(enqueued).toEqual([]);
+      expect(await authority(seed)).toEqual(scanned);
+    } finally {
+      release();
+    }
+    // The finalizer finishes exactly as it would have: the revision IS marked complete…
+    await expect(finalizer).resolves.toMatchObject({ status: "finalized" });
+    await expect(request).rejects.toThrow(/requester died after enqueuing/);
+    // …and the request, applied to what the finalizer committed, has reopened it: the same
+    // revision, pending, with no cursor. Not a failure, not an attempt, not a backoff.
+    expect(enqueued).toHaveLength(1);
+    expect(enqueued[0]).toMatchObject({
+      repair_status: "pending", revision: scanned.revision, cursor_item_id: null,
+      items_scanned: 0, items_updated: 0, attempts: 0, last_error: null, deferred: false,
+    });
+    expect(await authority(seed)).toEqual(enqueued[0]);
+    // The seven wrong rows are still wrong, and nothing may be read over them.
+    expect(await credited(seed, alice.id)).toBe(5);
+    expect(await fenced(seed)).toBe(true);
+
+    // A restart. The scheduler finds the request by discovery alone and rescans from the first row.
+    expect(await convergeBySchedulerAlone(seed, alice.id)).toEqual([
+      ["running", 5, 10], ["running", 10, 12], ["awaiting_cache", 12, 12], ["complete", 12, 12],
+    ]);
+    expect(await authority(seed)).toMatchObject({
+      repair_status: "complete", revision: scanned.revision, items_scanned: 12, items_updated: 7, attempts: 0,
+    });
+    expect(await credited(seed, seed.memberId)).toBe(0);
+    expect(await fenced(seed)).toBe(false);
+  }, 60_000);
+
+  it("REQUEST while the turn is BUSY: `busy` answers for the turn, not for the request — the row is reopened, nothing counts as a failure, and the owner that held the turn finalizes nothing", async () => {
+    const { seed, alice, scanned } = await scannedWithMismatchBehindCursor();
+
+    // Another owner has taken the turn — a finalizer that has not yet reached the authority lock.
+    const owner = new Client({ connectionString: process.env.DATABASE_URL });
+    owner.on("error", () => undefined);
+    await owner.connect();
+    try {
+      await owner.query("begin");
+      const turn = await owner.query<{ acquired: boolean }>(
+        "select pg_try_advisory_xact_lock(hashtextextended($1,0)) as acquired", [`${seed.teamId}:attribution-repair-turn`]);
+      expect(turn.rows[0].acquired).toBe(true);
+
+      const kicks = vi.fn();
+      onAttributionRepairKick(kicks);
+      let outcome: Awaited<ReturnType<typeof repairAttributionNow>>;
+      try {
+        outcome = await repairAttributionNow(db(), seed.teamId, seed.teamSlug, { request: true, batchSize: 5 });
+      } finally {
+        onAttributionRepairKick(null); // and from here on nobody is listening
+      }
+      // The caller is told the truth about the turn: someone else has it, and this is not a failure.
+      expect(outcome).toMatchObject({ status: "continuing", busy: true, scanned: 0 });
+      expect(kicks).toHaveBeenCalledTimes(1);
+      // But the request did not wait on that answer. It is on the row.
+      const requested = await authority(seed);
+      expect(requested).toMatchObject({
+        repair_status: "pending", revision: scanned.revision, cursor_item_id: null,
+        items_scanned: 0, items_updated: 0, attempts: 0, last_error: null, deferred: false,
+      });
+      expect(await fenced(seed)).toBe(true);
+      // Everything that only continues is still simply busy, and changes nothing.
+      expect(await bootedScheduler(5).runRound()).toEqual(round({ attempted: 1, busy: 1 }));
+      expect(await authority(seed)).toEqual(requested);
+
+      // The owner now does what a finalizer does next — the authority lock, then the reread — and
+      // what it reads is a pending row. There is no finished scan here for it to mark complete.
+      await owner.query("select pg_advisory_xact_lock(hashtextextended($1,0))", [`${seed.teamId}:identity-authority`]);
+      const reread = await owner.query<{ repair_status: string; cursor_item_id: string | null }>(
+        "select repair_status, cursor_item_id from team_identity_authority where team_id=$1 for update", [seed.teamId]);
+      expect(reread.rows).toEqual([{ repair_status: "pending", cursor_item_id: null }]);
+      await owner.query("rollback");
+    } finally {
+      await owner.end().catch(() => undefined);
+    }
+
+    expect(await convergeBySchedulerAlone(seed, alice.id)).toEqual([
+      ["running", 5, 10], ["running", 10, 12], ["awaiting_cache", 12, 12], ["complete", 12, 12],
+    ]);
+    expect(await authority(seed)).toMatchObject({
+      repair_status: "complete", revision: scanned.revision, items_scanned: 12, items_updated: 7, attempts: 0, last_error: null,
+    });
+    expect(await fenced(seed)).toBe(false);
+  }, 60_000);
+
+  it.each([
+    ["is still pending", false],
+    ["has already been repaired to completion", true],
+  ])("STALE FAILURE RECORD: a snapshot failure of revision P, recorded after newer revision Q %s, changes nothing of Q", async (_name, completeQ) => {
+    const seed = await seedTeam();
+    const alice = await member(seed, "Alice");
+    const bob = await member(seed, "Bob");
+    const author = authorAddress();
+    await storedItems(seed, 12, author);
+    await addAuthorAlias(db(), seed.teamId, alice.id, author);
+    const p = await authority(seed);
+    expect(p).toMatchObject({ repair_status: "pending", attempts: 0 });
+
+    // P's turn: its strict snapshot read fails, its transaction rolls back — and it is held there,
+    // with nothing locked and its failure not yet recorded.
+    let release!: () => void;
+    let reached!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const rolledBack = new Promise<void>((resolve) => { reached = resolve; });
+    const stale = takeRepairScanTurn(failingSelect("members", "roster read unavailable"), seed.teamId, {
+      beforeFailureRecord: async () => { reached(); await gate; },
+    });
+    stale.catch(() => undefined);
+    let q!: AuthorityRow;
+    let stamp!: Awaited<ReturnType<typeof authorityStamp>>;
+    try {
+      await rolledBack;
+      expect(await authority(seed)).toEqual(p);
+      // Q: the address is remapped to Bob — a newer revision — and, in one case, repaired and
+      // finalized before P's recorder gets the authority lock.
+      expect(await addAuthorAlias(db(), seed.teamId, bob.id, author, { force: true })).toMatchObject({ aliased: true });
+      if (completeQ) {
+        expect(await repairAttributionNow(db(), seed.teamId, seed.teamSlug, { batchSize: 50 }))
+          .toMatchObject({ status: "complete", scanned: 12 });
+      }
+      q = await authority(seed);
+      stamp = await authorityStamp(seed);
+      expect(q.revision).toBe(p.revision + 1);
+      expect(q).toMatchObject({ repair_status: completeQ ? "complete" : "pending", attempts: 0, last_error: null, deferred: false });
+    } finally {
+      release();
+    }
+    await expect(stale).rejects.toThrow(/unavailable/);
+
+    // P's failure was P's. Q's status, cursor, counters, attempts, error, deadline, completion
+    // time and authorization epoch are exactly what Q's own writers left.
+    expect(await authority(seed)).toEqual(q);
+    expect(await authorityStamp(seed)).toEqual(stamp);
+    expect(await fenced(seed)).toBe(!completeQ);
+    if (!completeQ) {
+      // And Q is repaired on schedule: no inherited backoff holds it.
+      const rounds = await runUntilIdle(bootedScheduler(50));
+      expect(rounds.reduce((n, summary) => n + summary.failed + summary.deferred, 0)).toBe(0);
+      expect(await authority(seed)).toMatchObject({ repair_status: "complete", revision: q.revision, attempts: 0 });
+    }
+    expect(await credited(seed, bob.id)).toBe(12);
     expect(await fenced(seed)).toBe(false);
   }, 60_000);
 

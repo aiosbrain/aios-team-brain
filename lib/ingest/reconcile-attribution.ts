@@ -8,7 +8,6 @@ import { bustTeamTimeline } from "@/lib/dashboard/timeline-cache";
 import {
   completeIdentityRepair,
   IdentitySnapshotChangedError,
-  markCurrentIdentityRepairRetry,
   markIdentityRepairRetry,
   peekIdentityRepairStatus,
   readOwnedIdentityRepairState,
@@ -126,10 +125,11 @@ async function finalizeAttributionRepair(
       return nothing("finalized", "complete", false);
     });
   } catch (error) {
-    // The finalization has rolled back; the failure is recorded outside it.
-    if (owned.revision === null) {
-      await markCurrentIdentityRepairRetry(teamId, error).catch(() => {});
-    } else if (!(error instanceof IdentitySnapshotChangedError)) {
+    // The finalization has rolled back; the failure is recorded outside it, against the revision
+    // it was finalizing and no other. One that failed before it could read that revision records
+    // nothing: there is no "whatever is current now" to blame.
+    if (owned.revision !== null && !(error instanceof IdentitySnapshotChangedError)) {
+      await opts.beforeFailureRecord?.();
       await markIdentityRepairRetry(teamId, owned.revision, error).catch(() => {});
     }
     throw error;

@@ -1,6 +1,7 @@
 import "server-only";
 
 import type { DbClient } from "@/lib/db/types";
+import { withBoundedLockWaits } from "@/lib/db/pg/bounded-lock";
 import { ambientTransactionClient, runSql, withTransaction } from "@/lib/db/pg/pool";
 import { connectorMemberIds } from "@/lib/attribution/resolve-authors";
 import { buildIdentityMap, type IdentityMap } from "@/lib/identity/resolve";
@@ -147,7 +148,9 @@ export async function validateIdentityAuthorityRevision(
  * owning process dies. Nothing has to notice a crash and nothing has to expire.
  *
  * The lock serializes repair OWNERS only. Identity mutations, Drive commits and corrections do not
- * take it; they queue on the identity-authority lock as before and run between batches.
+ * take it; they queue on the identity-authority lock as before and run between batches. Neither
+ * does a REQUEST for a repair (`requestIdentityRepair`): like a mutation it only enqueues, and an
+ * enqueue that could be turned away as `busy` would be lost.
  */
 export async function tryLockAttributionRepairTurn(teamId: string): Promise<boolean> {
   // A transaction-scoped lock taken outside a transaction is released by the statement that took
@@ -215,8 +218,24 @@ export async function readOwnedIdentityRepairState(teamId: string): Promise<Owne
  * mapping change enqueues its own repair through the trigger; this is the only other way one is
  * enqueued, and it is just as durable: the revision goes back to `pending` with its cursor and
  * counters cleared, exactly as a new revision starts, and that is COMMITTED — in a transaction of
- * its own, under the turn — before the snapshot is read or any row is scanned. Attribution-dependent
- * reads are fenced from that commit until the strict finalization, like any other repair.
+ * its own — before the snapshot is read or any row is scanned. Attribution-dependent reads are
+ * fenced from that commit until the strict finalization, like any other repair.
+ *
+ * A REQUEST DOES NOT TAKE THE TURN, AND IS NEVER `busy`. It is an enqueue, not a repair: like the
+ * trigger's, its write is serialized by the identity-authority lock alone. It must be. A request
+ * that had to own the turn would be refused exactly when it matters — while another owner is
+ * finalizing — and that owner would then mark the revision complete with nothing durable left to
+ * say a rescan was asked for. Instead the request WAITS, for at most one bounded lock wait, behind
+ * whoever holds the authority lock — an owner holds it for one batch or one finalization — and is
+ * applied to the state that owner committed: a finalization that completed is reopened; a last
+ * batch that reached `awaiting_cache` is reopened; and an owner that had not yet begun rereads,
+ * under its own turn, a row that is pending again and finalizes nothing. Either way the request
+ * is on the authority row before this function returns. A wait that times out is an error the
+ * caller is given (55P03), and writes no failure state.
+ *
+ * The turn still has exactly one owner at a time: this function scans nothing and finalizes
+ * nothing. Whoever takes the next turn — this caller, if the turn is free, or the scheduler in any
+ * process, after any restart — finds pending work with no cursor.
  *
  * What a request reopens is every state in which the stored cursor is NOT a promise that the rows
  * behind it are right for this request:
@@ -234,22 +253,21 @@ export async function readOwnedIdentityRepairState(teamId: string): Promise<Owne
  *
  * Without a request a finished revision is never reopened: a turn that finds one does nothing.
  */
-export async function reopenIdentityRepair(teamId: string): Promise<boolean> {
-  if (!ambientTransactionClient()) {
-    throw new Error("an attribution repair can only be requested inside its owned transaction");
-  }
-  await lockIdentityAuthority(teamId);
-  await ensureAuthorityRow(teamId);
-  const { rowCount } = await runSql(
-    `update team_identity_authority
-        set repair_status='pending',cursor_item_id=null,
-            items_scanned=0,items_updated=0,versions_updated=0,contributions_updated=0,
-            attempts=0,last_error=null,next_attempt_at=null,updated_at=now(),completed_at=null
-      where team_id=$1 and repair_revision=revision
-        and repair_status in ('complete','awaiting_cache','retry')`,
-    [teamId],
-  );
-  return rowCount > 0;
+export async function requestIdentityRepair(teamId: string): Promise<boolean> {
+  return withTransaction(() => withBoundedLockWaits(async () => {
+    await lockIdentityAuthority(teamId);
+    await ensureAuthorityRow(teamId);
+    const { rowCount } = await runSql(
+      `update team_identity_authority
+          set repair_status='pending',cursor_item_id=null,
+              items_scanned=0,items_updated=0,versions_updated=0,contributions_updated=0,
+              attempts=0,last_error=null,next_attempt_at=null,updated_at=now(),completed_at=null
+        where team_id=$1 and repair_revision=revision
+          and repair_status in ('complete','awaiting_cache','retry')`,
+      [teamId],
+    );
+    return rowCount > 0;
+  }));
 }
 
 /** Which turn a team needs next. Unlocked and advisory: it only routes; the turn decides again
@@ -277,10 +295,20 @@ export async function beginIdentityRepairBatch(teamId: string, revision: number)
   );
 }
 
-/** Durable failure state for a turn that did not commit. Written by its caller AFTER the failed
+/**
+ * Durable failure state for a turn that did not commit. Written by its caller AFTER the failed
  * turn's transaction has rolled back — in a transaction of its own, so the record survives the
- * rollback — and only against the revision that failed: a newer revision has already reset the
- * row, and its fresh state is not this failure's to overwrite. */
+ * rollback.
+ *
+ * It is ALWAYS scoped to the revision the failed turn was working, and there is no unscoped form.
+ * Between the rollback and this write the authority lock is free: a mapping change may commit a
+ * newer revision, and that revision may even be repaired to completion. A failure recorded against
+ * "whatever is current" would then mark the new revision `retry`, give it the old one's error and
+ * backoff, and — if it had completed — fence reads that were open and schedule work that is not
+ * owed. So this is a no-op when the failed revision is no longer current, and a no-op when the
+ * current revision is complete; a turn that failed before it could read which revision it was
+ * working records nothing at all.
+ */
 export async function markIdentityRepairRetry(
   teamId: string,
   revision: number,
@@ -296,24 +324,6 @@ export async function markIdentityRepairRetry(
               updated_at=now()
         where team_id=$1 and revision=$2 and repair_revision=$2 and repair_status<>'complete'`,
       [teamId, revision, message],
-    );
-  });
-}
-
-/** Snapshot construction can fail before its revision is returned. Record that complete-read
- * failure against whichever revision is still current; the team lock prevents mislabeling a newer
- * mutation that commits concurrently. */
-export async function markCurrentIdentityRepairRetry(teamId: string, error: unknown): Promise<void> {
-  const message=(error instanceof Error ? error.message : String(error)).slice(0,1000);
-  await withTransaction(async()=>{
-    await lockIdentityAuthority(teamId);
-    await ensureAuthorityRow(teamId);
-    await runSql(
-      `update team_identity_authority set repair_status='retry',attempts=attempts+1,last_error=$2,
-              next_attempt_at=now() + (least(3600,power(2,least(attempts,10)))::text || ' seconds')::interval,
-              updated_at=now(),completed_at=null
-        where team_id=$1`,
-      [teamId,message],
     );
   });
 }
