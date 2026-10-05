@@ -1148,7 +1148,10 @@ every row before it can finalize. A request reopens `complete`, `awaiting_cache`
 state whose stored cursor is not a promise about the rows behind it — and leaves a scan in healthy
 progress (`pending`, `running`) alone; it creates no revision. `lib/ingest/attribution-repair-scheduler.ts`,
 started from `instrumentation.register()` on timers of its own (not a leg of the 30-minute ingest chain,
-and suppressed on a copied-staging runtime), continues these repairs promptly: the authority table is
+and suppressed on a copied-staging runtime — where nothing continues a repair automatically: reads stay
+fenced, and an admin converges it by running the manual "Re-attribute content" action until it reports
+completion, as `lib/ingest/attribution-repair-report.ts` tells them and `docs/OPS.md` §11 documents),
+continues these repairs promptly: the authority table is
 the only queue — it is asked at boot and every five seconds while idle for teams with unfinished work
 whose deadline has passed, oldest-touched first — each discovered team gets one turn per round, and a
 round that left work to do is followed by the next at once, back to back with no timer between them

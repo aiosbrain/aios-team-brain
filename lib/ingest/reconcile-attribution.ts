@@ -14,6 +14,7 @@ import {
   tryLockAttributionRepairTurn,
 } from "@/lib/identity/authority";
 import { afterTransactionCommit, runSql, withTransaction } from "@/lib/db/pg/pool";
+import { reportRepairHandover } from "./attribution-repair-report";
 
 /**
  * Make a re-association PERCOLATE: after an identity mapping changes (or an NL correction is applied),
@@ -323,7 +324,9 @@ const dirty = new Set<string>();
 
 async function runReconcile(db: DbClient, teamId: string, teamSlug: string): Promise<void> {
   try {
-    await repairAttributionNow(db, teamId, teamSlug);
+    // A pass that could not finish says what carries it on — or, where nothing does (a
+    // copied-staging runtime), that an admin must run the manual repair.
+    reportRepairHandover(teamId, await repairAttributionNow(db, teamId, teamSlug));
   } catch (err) {
     console.error("[attribution] reconcile failed:", err instanceof Error ? err.message : err);
   }

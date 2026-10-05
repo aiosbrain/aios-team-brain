@@ -170,7 +170,7 @@ export function replayStepMarker(step) {
 export const REPLAY_STEP_SUPERSESSIONS = Object.freeze([
   {
     migration: "20260922130000_gdrive_audience_claims.sql",
-    gitBlob: "9019c0836f0a0cc011abf28b79e484d9c98d890a",
+    gitBlob: "f656298ac65ba009de7438b5a0f58769ba8e900e",
     step: "gdrive_legacy_context_suppression",
     obsoleteSql: GDRIVE_LEGACY_SUPPRESSION_UNSCOPED,
     supersededBy: "20260922135000_gdrive_legacy_context_suppression.sql",

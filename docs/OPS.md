@@ -984,6 +984,58 @@ extraction you just paid for.
   identity conditions that bind the *graph* being deleted, which this manual step gets from the
   operator instead. The reasoning is in `docs/design/staging-graph-reset.md`.
 
+### Attribution repair on copied staging — manual recovery (AIO-1167)
+
+Attribution-dependent reads (the work timeline, narrative arcs, their caches) are **fenced** for a
+team while its identity-attribution repair is unfinished: `team_identity_authority.repair_status` is
+anything but `complete`. In production an in-process scheduler finishes that repair within seconds.
+**On a copied-staging runtime it does not run** — every in-process scheduler is suppressed there on
+purpose (`instrumentation.ts`), and nothing else continues a repair in the background. The fence is
+not lifted, exempted or auto-completed; the repair converges only when an admin runs it.
+
+Two things leave a team pending on copied staging:
+
+- **The initial upgrade or a restore.** The schema replay seeds every team that has no authority
+  row as `pending` (`20260922190000_identity_snapshot_fence.sql`). After a refresh, expect every
+  copied team to be pending and its timeline/arcs unavailable until repaired.
+- **Any later roster or identity change** on a team that has content — a member added, activated,
+  deactivated or re-keyed, an email alias or provider identity linked or removed. The roster trigger
+  re-pends the team. The Admin action that made the change runs a bounded repair afterwards, but on
+  copied staging nothing carries on what that budget did not finish.
+
+**Procedure — per team, as an admin of that team:**
+
+1. Open **Admin → Members** and press **Re-attribute content**. The page and the button do not
+   depend on the fenced reads; they work while the team is pending.
+2. Read the result. `Re-attributed N of M item(s) to current identity mappings.` means the repair
+   **completed**: caches were purged, the authorization epoch advanced, and reads have resumed.
+3. `… so far; the repair is not complete. Progress is saved, but background continuation is
+   disabled on this deployment: an admin must run Re-attribute content again to continue.` means the
+   run spent its budget (10,000 items). **Press the button again**; it resumes from the saved
+   cursor. Repeat until step 2's message appears. Nothing is lost between presses, and reads stay
+   fenced until the last one.
+4. `Another re-attribution run holds this team's repair right now …` means a second run (another
+   admin, or the bounded pass after a roster edit) is in flight. This press did nothing. Wait for
+   that run, then press again.
+5. An error (for example a cache purge failure) leaves the work durable. Press again; a request made
+   after a failure rescans from the start before it finalizes.
+
+The server log says the same thing from the hooks' side: `[attribution] repair for team <id> is NOT
+complete (…): progress is saved, but background continuation is disabled on this deployment — an
+admin must run Re-attribute content again`.
+
+To see which teams still need it (read-only):
+
+```sql
+select t.slug, a.repair_status, a.items_scanned, a.last_error
+  from team_identity_authority a join teams t on t.id = a.team_id
+ where a.repair_status <> 'complete' order by t.slug;
+```
+
+**Do not** set `repair_status` by hand, delete the authority row, or enable a scheduler on copied
+staging to get around this: completion is only valid after the strict cache purge and the epoch
+advance that the repair's own finalization performs.
+
 ### Builtin materialization during deploy and attended recovery
 
 **STAGINGMARK-2 repairs markerless fleets during PRET-6 preDeploy**, including teams with
