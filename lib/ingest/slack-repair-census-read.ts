@@ -60,7 +60,8 @@ export interface SlackRepairCensusReadOptions {
    * and before the refusal decision and every later read — so it also runs for a request that is then
    * refused. It does not run for input rejected before the transaction or when that first SELECT
    * fails. It receives only the transaction-bound query function; whatever it throws rejects the
-   * invocation. No application caller passes options.
+   * invocation. That function is revoked when the invocation ends — a copy kept by the hook rejects
+   * instead of reaching the pooled connection again. No application caller passes options.
    */
   afterFirstRead?: (query: SqlExecutor) => Promise<void>;
 }
@@ -119,6 +120,19 @@ const OTHER_WORKSPACE_STATE_SQL = `
    where team_id = $1 and channel_id = $2 and workspace_id <> $3
    order by workspace_id collate "C", id
    limit $4`;
+
+// Case-only variants of the requested ids anywhere in this team's channel state: a workspace or a
+// channel id that is equal when case-folded and different in bytes. A dedicated aggregate, so the cap
+// on the observation array above cannot hide a contradiction. The fold uses the "C" collation (the
+// table's own CHECK keeps these ids ASCII), so it does not depend on the database locale. This read
+// only DETECTS a variant; every source-key read in this module stays byte-exact.
+const STORED_ID_VARIANT_SQL = `
+  select coalesce(bool_or(lower(workspace_id collate "C") = lower($2::text collate "C")
+                          and workspace_id <> $2::text), false) as workspace_variant,
+         coalesce(bool_or(lower(channel_id collate "C") = lower($3::text collate "C")
+                          and channel_id <> $3::text), false) as channel_variant
+    from slack_sync_channels
+   where team_id = $1`;
 
 const GATE_SQL = `
   select state, revision::text as revision, ready_revision::text as ready_revision,
@@ -291,7 +305,7 @@ interface MappingCandidateRow {
 interface PeerSeeker {
   id: string;
   projectId: string;
-  /** Only a legacy candidate has a hypothetical target other candidates can converge on. */
+  /** Only a legacy entry with a hypothetical target has one that candidates can converge on. */
   wantsConverging: boolean;
   converging: string[];
   otherProject: string[];
@@ -328,6 +342,14 @@ function pushGrouped<K, V>(groups: Map<K, V[]>, key: K, value: V): void {
   else groups.set(key, [value]);
 }
 
+/** Raised by the test seam's executor when it is used after its invocation has ended. */
+class SlackRepairCensusHookRevokedError extends Error {
+  constructor() {
+    super("slack repair census: the test hook executor is revoked once its invocation ends");
+    this.name = "SlackRepairCensusHookRevokedError";
+  }
+}
+
 export async function readSlackRepairCensusPage(
   request: SlackRepairCensusRequest,
   options: SlackRepairCensusReadOptions = {}
@@ -344,12 +366,27 @@ export async function readSlackRepairCensusPage(
       const result = await client.query(sql, params);
       return { rows: result.rows as T[], rowCount: result.rowCount ?? 0 };
     };
-    return readPageInSnapshot(query, captured, afterFirstRead);
+    // The seam's executor is a closure over a POOLED connection. Left live, a copy captured by the hook
+    // could run a statement after this transaction ended — on a connection that is no longer
+    // read-only, or that another caller now holds. So the hook never receives `query` itself: it gets
+    // this revocable wrapper, revoked before this callback returns on every outcome, and therefore
+    // before the commit or rollback and the release.
+    let hookActive = true;
+    const hookQuery: SqlExecutor = async <T>(sql: string, params: unknown[] = []) => {
+      if (!hookActive) throw new SlackRepairCensusHookRevokedError();
+      return query<T>(sql, params);
+    };
+    try {
+      return await readPageInSnapshot(query, hookQuery, captured, afterFirstRead);
+    } finally {
+      hookActive = false;
+    }
   });
 }
 
 async function readPageInSnapshot(
   query: SqlExecutor,
+  hookQuery: SqlExecutor,
   captured: ValidatedSlackRepairCensusRequest,
   afterFirstRead: SlackRepairCensusReadOptions["afterFirstRead"]
 ): Promise<SlackRepairCensusResult> {
@@ -357,7 +394,7 @@ async function readPageInSnapshot(
 
   const scopeRead = await query<ScopeReadRow>(SCOPE_SQL, [scope.teamId, scope.integrationId]);
   // The snapshot now exists. The seam runs before any decision, including a refusal.
-  if (afterFirstRead) await afterFirstRead(query);
+  if (afterFirstRead) await afterFirstRead(hookQuery);
 
   const stored = scopeRead.rows[0];
   if (!stored) throw new Error("slack repair census: the scope read returned no row");
@@ -390,6 +427,14 @@ async function readPageInSnapshot(
     workspace,
     SLACK_REPAIR_CENSUS_LIMITS.observationCap + 1,
   ]);
+  const variantRead = await query<{ workspace_variant: boolean; channel_variant: boolean }>(
+    STORED_ID_VARIANT_SQL,
+    sourceKey
+  );
+  // Either kind contradicts a match: a path segment is compared lower-cased, so with a variant on
+  // record it no longer names one stored source. It is evidence against a match, never an alias.
+  const storedIdVariantObserved =
+    variantRead.rows[0]?.workspace_variant === true || variantRead.rows[0]?.channel_variant === true;
   const gateRead = await query<SlackRepairGateRow>(GATE_SQL, [scope.teamId, scope.channelId]);
   const namespaceGate = decodeSlackRepairGate(gateRead.rows[0] ?? null);
 
@@ -430,6 +475,7 @@ async function readPageInSnapshot(
         path: row.path,
         frontmatter: projectedFrontmatter(row),
         ledgerSources: ledgerByItem.get(row.id) ?? [],
+        storedIdVariantObserved,
       })
     );
   }
@@ -438,7 +484,7 @@ async function readPageInSnapshot(
   const authorStatuses = await readAuthorStatuses(query, scope, workspace, entryRows, hasRequestedLedger);
   const queueByRoot = await readQueueByRoot(query, sourceKey, rows, relations);
   const occupantByTarget = await readTargetOccupants(query, scope, rows, relations);
-  const seekers = await readPeers(query, scope, workspace, rows, relations);
+  const seekers = await readPeers(query, scope, workspace, rows, relations, storedIdVariantObserved);
 
   // Second pass: every scanned row lands in exactly one bucket.
   const entries: SlackRepairCensusEntry[] = [];
@@ -472,6 +518,7 @@ async function readPageInSnapshot(
         relation?.relationship === "scoped_channel_match" && rootTs !== null
           ? (queueByRoot.get(rootTs) ?? null)
           : null,
+      storedIdVariantObserved,
     });
     if (classified.gateNoncanonical) gateNoncanonicalItems += 1;
     if (classified.bucket === "entry") entries.push(classified.entry);
@@ -738,19 +785,22 @@ async function readPeers(
   scope: SlackRepairCensusScope,
   workspace: string,
   rows: readonly ScanRow[],
-  relations: ReadonlyMap<string, SlackRepairRelationshipResult>
+  relations: ReadonlyMap<string, SlackRepairRelationshipResult>,
+  storedIdVariantObserved: boolean
 ): Promise<Map<string, PeerSeeker>> {
   const seekers = new Map<string, PeerSeeker>();
   const seekersByRoot = new Map<string, PeerSeeker[]>();
   for (const row of rows) {
     const relation = relations.get(row.id);
     if (!relation || relation.path.kind === "malformed") continue;
-    const legacyCandidate = relation.relationship === "channel_candidate" && relation.path.kind === "legacy";
-    if (!legacyCandidate && relation.relationship !== "scoped_channel_match") continue;
+    // A legacy entry with a hypothetical target seeks peers whether it is still a candidate or a
+    // contradiction made it conflicting: the diagnostics belong to the item's basis, not its verdict.
+    const hasLegacyTarget = relation.path.kind === "legacy" && relation.hypotheticalTarget !== null;
+    if (!hasLegacyTarget && relation.relationship !== "scoped_channel_match") continue;
     const seeker: PeerSeeker = {
       id: row.id,
       projectId: row.project_id,
-      wantsConverging: legacyCandidate,
+      wantsConverging: hasLegacyTarget,
       converging: [],
       otherProject: [],
     };
@@ -786,6 +836,7 @@ async function readPeers(
         path: row.path,
         frontmatter: projectedFrontmatter(row),
         ledgerSources: sourcesByItem.get(row.id) ?? [],
+        storedIdVariantObserved,
       });
       if (relation.path.kind === "malformed") continue;
       const legacyCandidate = relation.relationship === "channel_candidate" && relation.path.kind === "legacy";

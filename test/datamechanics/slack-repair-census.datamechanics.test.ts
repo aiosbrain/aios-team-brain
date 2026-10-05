@@ -1204,6 +1204,378 @@ describe("slack repair census: stored source, queue and gate observations (real 
   });
 });
 
+describe("slack repair census: case-only stored-id variants in channel state (real Postgres)", () => {
+  /** A legacy candidate, a scoped match with a ledger and a queued root, and an unresolved slug. */
+  async function matches(): Promise<{ seed: Seed; scope: Scope }> {
+    const seed = await seedTeam();
+    const scope = await verifiedScope(seed);
+    const p = await project(seed.teamId);
+    await item(seed.teamId, p, id(1), `slack/c0abc/${ROOT}.md`);
+    await item(seed.teamId, p, id(2), `slack/t1/c0abc/${ROOT2}.md`);
+    await message(seed.teamId, id(2), ROOT2);
+    await item(seed.teamId, p, id(3), `slack/general/${ROOT3}.md`);
+    await runSql(
+      `insert into slack_sync_threads (team_id, workspace_id, channel_id, root_ts) values ($1, $2, $3, $4)`,
+      [seed.teamId, WORKSPACE, CHANNEL, ROOT2]
+    );
+    expect(await channelRow(seed.teamId, WORKSPACE, CHANNEL), "fixture: the exact channel state").not.toBeNull();
+    // Control: with no variant on record these are plain matches.
+    plain(await page(scope));
+    return { seed, scope };
+  }
+
+  const channelState = async (teamId: string, workspaceId: string, channelId: string): Promise<void> => {
+    await runSql(`insert into slack_sync_channels (team_id, workspace_id, channel_id) values ($1, $2, $3)`, [
+      teamId, workspaceId, channelId,
+    ]);
+  };
+
+  function plain(result: Loose): void {
+    expect(entryOf(result, id(1))).toMatchObject({ relationship: "channel_candidate", evidence: ["legacy_path_segment"] });
+    expect(entryOf(result, id(2))).toMatchObject({
+      relationship: "scoped_channel_match",
+      evidence: ["scoped_path_segments", "source_ledger"],
+      provenance: "scoped_ledger_observed",
+      queueStatus: "queued",
+    });
+    expect(JSON.stringify(result.entries)).not.toContain("channel_state");
+  }
+
+  function contradicted(result: Loose): void {
+    expect(entryOf(result, id(1))).toMatchObject({
+      relationship: "conflicting_evidence",
+      provenance: "conflicting",
+      evidence: ["legacy_path_segment", "channel_state"],
+      hypotheticalTarget: { hypothetical: true, path: `slack/t1/c0abc/${ROOT}.md` },
+    });
+    expect(entryOf(result, id(2))).toMatchObject({
+      relationship: "conflicting_evidence",
+      provenance: "conflicting",
+      evidence: ["scoped_path_segments", "source_ledger", "channel_state"],
+      // The source-key reads stayed byte-exact: the item's own ledger rows are still the requested
+      // source's, and a contradicted match gets no queue association.
+      ledger: { present: true, totalMessages: "1", conflictingSourceMessages: "0" },
+      queueStatus: "not_applicable",
+    });
+    // Not a match to begin with: a variant contradicts a match, it does not create an entry or a label.
+    expect(entryOf(result, id(3))).toMatchObject({ relationship: "unresolved_channel", evidence: [] });
+    expect(result.counts.byRelationship).toEqual({
+      channel_candidate: 0, scoped_channel_match: 0, unresolved_channel: 1, conflicting_evidence: 2,
+    });
+    expect(result.source).toMatchObject({ channelState: "present", threads: { queued: "1", running: "0" } });
+  }
+
+  it.each([
+    ["a workspace-only variant", "t1", CHANNEL, [{ kind: "channel_state", workspaceId: "t1" }]],
+    ["a channel-only variant", WORKSPACE, "c0abc", []],
+  ])("%s overrides every match to conflicting_evidence", async (_label, workspaceId, channelId, observations) => {
+    const { seed, scope } = await matches();
+    await channelState(seed.teamId, workspaceId, channelId);
+    const before = await tables();
+    const result = await page(scope);
+    contradicted(result);
+    // The variant is not an alias for the requested source in any other read either: it is listed as
+    // another workspace only when its workspace bytes differ for this exact channel.
+    expect(result.otherWorkspaceObservations).toHaveLength(observations.length);
+    expect(result.otherWorkspaceObservations).toMatchObject(observations);
+    expect(result.otherWorkspaceObservationsTruncated).toBe(false);
+    expect(await tables()).toEqual(before);
+  });
+
+  it("ignores the same variants when another team holds them", async () => {
+    const { scope } = await matches();
+    const other = await seedTeam();
+    await channelState(other.teamId, "t1", CHANNEL);
+    await channelState(other.teamId, WORKSPACE, "c0abc");
+    await channelState(other.teamId, WORKSPACE, CHANNEL);
+    const result = await page(scope);
+    plain(result);
+    expect(result.otherWorkspaceObservations).toEqual([]);
+    expect(result.counts.byRelationship.conflicting_evidence).toBe(0);
+  });
+
+  it("detects a variant that the capped observation array does not show", async () => {
+    const { seed, scope } = await matches();
+    await runSql(
+      `insert into slack_sync_channels (team_id, workspace_id, channel_id)
+       select $1::uuid, 'T0WS' || lpad(n::text, 3, '0'), $2::text from generate_series(1, 51) n`,
+      [seed.teamId, CHANNEL]
+    );
+    // Byte order puts every upper-case `T0WS…` before `t1`, so the variant is the 52nd observation.
+    await channelState(seed.teamId, "t1", CHANNEL);
+    const result = await page(scope);
+    expect(result.otherWorkspaceObservationsTruncated).toBe(true);
+    expect(result.otherWorkspaceObservations).toHaveLength(50);
+    expect(result.otherWorkspaceObservations.map((o: Loose) => o.workspaceId)).not.toContain("t1");
+    contradicted(result);
+  });
+});
+
+describe("slack repair census: stored ids longer than the request bound (real Postgres)", () => {
+  it("reads a 65-character stored binding workspace, ready-gate workspace and retained metadata channel", async () => {
+    const LONG_WORKSPACE = `T${"0".repeat(64)}`;
+    const LONG_CHANNEL = `C${"9".repeat(64)}`;
+    const seed = await seedTeam();
+    const scope = await verifiedScope(seed);
+    const p = await project(seed.teamId);
+    await item(seed.teamId, p, id(1), `slack/c0abc/${ROOT}.md`);
+    await item(seed.teamId, p, id(2), `slack/c0abc/${ROOT2}.md`, {
+      frontmatter: { source: "slack", channel_id: LONG_CHANNEL },
+    });
+    await item(seed.teamId, p, id(3), `slack/${LONG_WORKSPACE.toLowerCase()}/c0abc/${ROOT3}.md`);
+    await message(seed.teamId, id(3), ROOT3, { workspace: LONG_WORKSPACE });
+    const repair = randomUUID();
+    expect(
+      await committed(`update slack_integration_bindings set workspace_id = $2 where team_id = $1`, [seed.teamId, LONG_WORKSPACE]),
+      "fixture: the long workspace is storable"
+    ).toBe(1);
+    expect(
+      await committed(
+        `insert into slack_channel_migration_gates
+           (team_id, raw_channel_id, state, revision, ready_revision, resolved_workspace_ids, completed_repair_id)
+         values ($1, $2, 'ready', 0, 0, $3::text[], $4)`,
+        [seed.teamId, CHANNEL, [LONG_WORKSPACE], repair]
+      ),
+      "fixture: the long gate workspace is storable"
+    ).toBe(1);
+
+    const result = await page(scope, { pageSize: 50 });
+    expect(result.scopeFingerprint).toBe(await storedFingerprint(scope));
+    expect(entryIds(result)).toEqual([id(1), id(2), id(3)]);
+    expect(entryOf(result, id(1))).toMatchObject({
+      relationship: "channel_candidate",
+      hypotheticalTarget: { path: `slack/${LONG_WORKSPACE.toLowerCase()}/c0abc/${ROOT}.md` },
+    });
+    // Valid contradictory evidence — a real, different channel id — not a malformed value.
+    expect(entryOf(result, id(2))).toMatchObject({
+      relationship: "conflicting_evidence", provenance: "conflicting", retainedChannelMetadata: "valid",
+    });
+    expect(entryOf(result, id(3))).toMatchObject({
+      relationship: "scoped_channel_match",
+      provenance: "scoped_ledger_observed",
+      ledger: { totalMessages: "1", conflictingSourceMessages: "0" },
+    });
+    expect(result.namespaceGate).toEqual({
+      status: "ready", revision: 0, readyRevision: 0, resolvedWorkspaceIds: [LONG_WORKSPACE], completedRepairId: repair,
+    });
+    // The channel state discovery recorded under the old workspace is now another workspace's.
+    expect(result.otherWorkspaceObservations).toMatchObject([{ kind: "channel_state", workspaceId: WORKSPACE }]);
+
+    // The cursor still fits its bound and still continues: the stored workspace is not in it.
+    const first = await page(scope, { pageSize: 1 });
+    expect(first.nextCursor.length).toBeLessThanOrEqual(512);
+    expect(entryIds(await page(scope, { pageSize: 1, cursor: first.nextCursor }))).toEqual([id(2)]);
+    // What a CALLER supplies is still bounded.
+    await expect(read({ scope: { ...scope, channelId: LONG_CHANNEL } })).rejects.toMatchObject({
+      category: "invalid_scope",
+    });
+  });
+});
+
+describe("slack repair census: diagnostics on a contradicted legacy entry (real Postgres)", () => {
+  it("keeps the exact target and the qualified peers of a legacy requested-channel entry made conflicting", async () => {
+    const seed = await seedTeam();
+    const scope = await verifiedScope(seed);
+    const p1 = await project(seed.teamId, "one");
+    const p2 = await project(seed.teamId, "two");
+    const [N, T, P, B, U, X] = [1, 2, 3, 4, 5, 6].map((n) => id(n));
+    // N: a legacy path for the requested channel whose retained metadata names another channel.
+    await item(seed.teamId, p1, N, `slack/c0abc/${ROOT}.md`, { frontmatter: { source: "slack", channel_id: "C0OTHER" } });
+    await item(seed.teamId, p1, T, `slack/t1/c0abc/${ROOT}.md`); // the same-project occupant of N's target
+    await item(seed.teamId, p2, P, `slack/c0abc/${ROOT}.md`); // a compatible peer in another project
+    await item(seed.teamId, p1, B, `slack/general/${ROOT}.md`, { frontmatter: { source: "slack", channel_id: CHANNEL } });
+    // U: agrees with ANOTHER channel in path and metadata, and is an entry only because of a ledger row.
+    await item(seed.teamId, p1, U, `slack/c0other/${ROOT}.md`, { frontmatter: { source: "slack", channel_id: "C0OTHER" } });
+    await message(seed.teamId, U, ROOT);
+    await item(seed.teamId, p1, X, `slack//c0abc/${ROOT}.md`); // unparseable
+    await runSql(
+      `insert into slack_sync_threads (team_id, workspace_id, channel_id, root_ts) values ($1, $2, $3, $4)`,
+      [seed.teamId, WORKSPACE, CHANNEL, ROOT]
+    );
+
+    const pages = await traverse(scope, 1);
+    const target = { hypothetical: true, workspace: "stored_binding_workspace", path: `slack/t1/c0abc/${ROOT}.md` };
+    const n = entryOf(pages, N);
+    expect(n).toMatchObject({
+      relationship: "conflicting_evidence",
+      provenance: "conflicting",
+      retainedChannelMetadata: "valid",
+      hypotheticalTarget: target,
+      exactTargetItemId: T,
+      sameProjectConvergingItemIds: [B],
+      sameProjectConvergingItemIdsTruncated: false,
+      sameThreadOtherProjectItemIds: [P],
+      sameThreadOtherProjectItemIdsTruncated: false,
+      // The queue holds this very root for the requested source, and a legacy item still gets none.
+      queueStatus: "not_applicable",
+      queueErrorObserved: false,
+    });
+    expect(n.pending).toEqual(expect.arrayContaining(["source_refetch_required", "provenance_review_required"]));
+    expect(n.pending).not.toContain("pending_queue_work");
+    // Control: the queue row is real, and the scoped match for that root is what observes it.
+    expect(entryOf(pages, T)).toMatchObject({ relationship: "scoped_channel_match", queueStatus: "queued" });
+
+    // N seeks peers but is not one: a contradicted item is never counted as somebody's candidate.
+    expect(entryOf(pages, B)).toMatchObject({
+      relationship: "channel_candidate", exactTargetItemId: T, sameProjectConvergingItemIds: [],
+      sameThreadOtherProjectItemIds: [P],
+    });
+    expect(entryOf(pages, P)).toMatchObject({
+      relationship: "channel_candidate", exactTargetItemId: null, sameProjectConvergingItemIds: [],
+      sameThreadOtherProjectItemIds: [T, B],
+    });
+
+    // No target is manufactured for a row that never had one.
+    for (const none of [U, X]) {
+      expect(entryOf(pages, none)).toMatchObject({
+        hypotheticalTarget: null, exactTargetItemId: null, sameProjectConvergingItemIds: [],
+        sameThreadOtherProjectItemIds: [], queueStatus: "not_applicable",
+      });
+    }
+    expect(entryOf(pages, U).relationship).toBe("conflicting_evidence");
+    expect(entryOf(pages, X).relationship).toBe("unresolved_channel");
+  });
+
+  it("distinguishes a missing channel_id from a present null one", async () => {
+    const seed = await seedTeam();
+    const scope = await verifiedScope(seed);
+    const p = await project(seed.teamId);
+    const root = (n: number): string => `1718900000.${String(n).padStart(6, "0")}`;
+    await item(seed.teamId, p, id(1), `slack/c0abc/${root(1)}.md`, { frontmatter: { source: "slack" } });
+    await item(seed.teamId, p, id(2), `slack/c0abc/${root(2)}.md`, { frontmatter: { source: "slack", channel_id: null } });
+    await item(seed.teamId, p, id(3), `slack/c0abc/${root(3)}.md`, { frontmatter: { source: "slack", channel_id: "C0 ABC!" } });
+    await item(seed.teamId, p, id(4), `slack/c0abc/${root(4)}.md`, { frontmatter: { source: "slack", channel_id: CHANNEL } });
+    await item(seed.teamId, p, id(5), `slack/general/${root(5)}.md`, { frontmatter: { source: "slack", channel_id: null } });
+    const stored = await runSql<{ present: boolean; value: string }>(
+      `select jsonb_exists(frontmatter, 'channel_id') as present, jsonb_typeof(frontmatter->'channel_id') as value
+         from items where id = $1`,
+      [id(2)]
+    );
+    expect(stored.rows, "fixture: the key is stored, holding JSON null").toEqual([{ present: true, value: "null" }]);
+
+    const result = await page(scope);
+    expect(entryOf(result, id(1))).toMatchObject({ relationship: "channel_candidate", retainedChannelMetadata: "absent" });
+    expect(entryOf(result, id(2))).toMatchObject({
+      relationship: "channel_candidate", retainedChannelMetadata: "malformed", evidence: ["legacy_path_segment"],
+    });
+    expect(entryOf(result, id(3))).toMatchObject({ relationship: "channel_candidate", retainedChannelMetadata: "malformed" });
+    expect(entryOf(result, id(4))).toMatchObject({
+      relationship: "channel_candidate", retainedChannelMetadata: "valid",
+      evidence: ["legacy_path_segment", "retained_channel_metadata"],
+    });
+    expect(entryOf(result, id(5))).toMatchObject({ relationship: "unresolved_channel", retainedChannelMetadata: "malformed" });
+  });
+});
+
+describe("slack repair census: the peer inventory read continues past a batch (real Postgres)", () => {
+  it("finds a qualifying peer after more than 500 disqualified root-sharing rows, and terminates", async () => {
+    const seed = await seedTeam();
+    const scope = await verifiedScope(seed);
+    const home = await project(seed.teamId, "home");
+    const elsewhere = await project(seed.teamId, "elsewhere");
+    const slugs = (from: number, count: number, prefix: string): Promise<unknown> =>
+      runSql(
+        `insert into items (id, team_id, project_id, path, kind, access, frontmatter, body, content_sha256)
+         select ('10000000-0000-4000-8000-' || lpad(($5::int + n)::text, 12, '0'))::uuid, $1::uuid, $2::uuid,
+                'slack/' || $6::text || '-' || n::text || '/' || $3::text || '.md', 'deliverable', 'team',
+                '{"source":"slack"}'::jsonb, '', $4::text
+           from generate_series(1, $7::int) n`,
+        [seed.teamId, home, ROOT, HASH, from, prefix, count]
+      );
+    await item(seed.teamId, home, id(1), `slack/c0abc/${ROOT}.md`);
+    // Disqualified early: tied to the channel by metadata, contradicted by its own ledger.
+    await item(seed.teamId, home, id(50), `slack/early/${ROOT}.md`, { frontmatter: { source: "slack", channel_id: CHANNEL } });
+    await message(seed.teamId, id(50), ROOT, { workspace: "T2" });
+    // 600 unresolved slugs sharing the root, ids 101…700: the first internal batch holds no peer at all.
+    await slugs(100, 600, "slug");
+    // The only qualifying peers sit beyond that batch.
+    await item(seed.teamId, home, id(900), `slack/late/${ROOT}.md`, { frontmatter: { source: "slack", channel_id: CHANNEL } });
+    await item(seed.teamId, elsewhere, id(901), `slack/c0abc/${ROOT}.md`);
+    const sharing = async (): Promise<number> =>
+      Number(
+        (await runSql<{ n: string }>(`select count(*)::text as n from items where team_id = $1 and path like $2`, [
+          seed.teamId, `slack/%/${ROOT}.md`,
+        ])).rows[0].n
+      );
+    expect(await sharing(), "fixture: more root-sharing rows than one batch").toBe(604);
+
+    const expected = {
+      relationship: "channel_candidate",
+      exactTargetItemId: null,
+      sameProjectConvergingItemIds: [id(900)],
+      sameProjectConvergingItemIdsTruncated: false,
+      sameThreadOtherProjectItemIds: [id(901)],
+      sameThreadOtherProjectItemIdsTruncated: false,
+    };
+    const first = await page(scope, { pageSize: 1 });
+    expect(first.scannedItems).toBe(1);
+    expect(entryOf(first, id(1))).toMatchObject(expected);
+
+    // Exactly two full batches: the read must also stop when the last batch is full and the next empty.
+    await slugs(1000, 396, "pad");
+    expect(await sharing(), "fixture: a whole number of batches").toBe(1000);
+    expect(entryOf(await page(scope, { pageSize: 1 }), id(1))).toMatchObject(expected);
+  });
+});
+
+describe("slack repair census: the hook's executor is revoked with its invocation (real Postgres)", () => {
+  it("rejects a captured executor after a page, a refusal and a failed invocation, and cannot write", async () => {
+    const seed = await seedTeam();
+    const scope = await verifiedScope(seed);
+    await item(seed.teamId, await project(seed.teamId), id(1), `slack/c0abc/${ROOT}.md`);
+    const captured: SqlExecutor[] = [];
+    const capture = async (query: SqlExecutor): Promise<void> => {
+      // While the invocation is live the executor works, on the reader's own read-only transaction.
+      expect((await query<{ one: number }>("select 1 as one")).rows).toEqual([{ one: 1 }]);
+      expect((await query<{ transaction_read_only: string }>("show transaction_read_only")).rows[0].transaction_read_only).toBe("on");
+      captured.push(query);
+    };
+
+    expect(entryIds(await page(scope, {}, { afterFirstRead: capture }))).toEqual([id(1)]);
+    expect(await read({ scope: { ...scope, channelId: "C0NEVER" } }, { afterFirstRead: capture })).toEqual(
+      REFUSED("scope_unavailable")
+    );
+    await expect(
+      read({ scope }, {
+        afterFirstRead: async (query) => {
+          await capture(query);
+          throw new Error("census-fixture-abort");
+        },
+      })
+    ).rejects.toThrow("census-fixture-abort");
+    expect(captured).toHaveLength(3);
+
+    // Statements that would SUCCEED on an ordinary pooled connection — which is what the closure holds
+    // once the transaction is over. Each must be refused before it reaches PostgreSQL.
+    const insertGate = `insert into slack_channel_migration_gates (team_id, raw_channel_id) values ($1, 'C0ABC')`;
+    const lockItem = `update items set member_id_locked = true where team_id = $1 and id = '${id(1)}'`;
+    const before = await tables();
+    for (const query of captured) {
+      for (const [statement, params] of [["select 1", []], [insertGate, [seed.teamId]], [lockItem, [seed.teamId]]] as const) {
+        const outcome = await query(statement, [...params]).then(
+          (value) => ({ returned: value }),
+          (error: unknown) => ({ error: error as Loose })
+        );
+        expect(outcome, statement).not.toHaveProperty("returned");
+        expect((outcome as { error: Loose }).error).toMatchObject({ name: "SlackRepairCensusHookRevokedError" });
+        // Refused by the revocation, not by a read-only transaction that no longer exists.
+        expect((outcome as { error: Loose }).error).not.toHaveProperty("code");
+      }
+    }
+    expect(await tables()).toEqual(before);
+
+    // Control: the very same statements ARE valid writes through the pool, so it was the revocation
+    // that protected the rows. The reader is unaffected and the pool is healthy.
+    expect(await committed(insertGate, [seed.teamId])).toBe(1);
+    expect(await committed(lockItem, [seed.teamId])).toBe(1);
+    expect(await tables()).not.toEqual(before);
+    const after = await page(scope, {}, { afterFirstRead: capture });
+    expect(entryOf(after, id(1))).toMatchObject({ correctionLock: "locked_no_owner" });
+    expect(after.namespaceGate).toMatchObject({ status: "blocked" });
+    expect(captured).toHaveLength(4);
+  });
+});
+
 describe("slack repair census: one read-only snapshot per invocation (real Postgres)", () => {
   async function census(): Promise<{ seed: Seed; scope: Scope; projectId: string }> {
     const seed = await seedTeam();

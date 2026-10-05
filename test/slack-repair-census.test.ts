@@ -635,6 +635,275 @@ describe("slack repair census: the relationship decision table", () => {
   });
 });
 
+describe("slack repair census: case-only stored-id variants", () => {
+  const variant = { storedIdVariantObserved: true };
+
+  it("a variant on record overrides every otherwise matching relationship, labelled channel_state", async () => {
+    // Control: the same facts without a variant are plain matches.
+    expect(await entryOf()).toMatchObject({ relationship: "channel_candidate", evidence: ["legacy_path_segment"] });
+    expect(await entryOf({ storedIdVariantObserved: false })).toMatchObject({ relationship: "channel_candidate" });
+
+    expect(await entryOf(variant)).toMatchObject({
+      relationship: "conflicting_evidence",
+      provenance: "conflicting",
+      evidence: ["legacy_path_segment", "channel_state"],
+    });
+    expect(
+      await entryOf({
+        ...variant,
+        item: { path: `slack/general/${ROOT}.md`, frontmatter: { source: "slack", channel_id: CHANNEL } },
+      })
+    ).toMatchObject({
+      relationship: "conflicting_evidence",
+      provenance: "conflicting",
+      evidence: ["retained_channel_metadata", "channel_state"],
+    });
+    const scoped = await entryOf({
+      ...variant,
+      item: { path: `slack/t1/c0abc/${ROOT}.md` },
+      ledgerSources: [ledgerSource()],
+      queue: { status: "queued", errorObserved: false },
+    });
+    expect(scoped).toMatchObject({
+      relationship: "conflicting_evidence",
+      provenance: "conflicting",
+      evidence: ["scoped_path_segments", "source_ledger", "channel_state"],
+      // The ledger was still read byte-exact, and a contradicted match gets no queue association.
+      ledger: { present: true, totalMessages: "1", conflictingSourceMessages: "0" },
+      queueStatus: "not_applicable",
+    });
+    expect(scoped.pending).toContain("provenance_review_required");
+    expect(scoped.pending).not.toContain("pending_queue_work");
+  });
+
+  it("a variant contradicts a match; it never creates one, an alias or an entry", async () => {
+    // Not matches to begin with: unchanged, and never labelled.
+    const unresolved = await entryOf({ ...variant, item: { path: `slack/general/${ROOT}.md` } });
+    expect(unresolved).toMatchObject({ relationship: "unresolved_channel", provenance: "unproven", evidence: [] });
+    const malformed = await entryOf({ ...variant, item: { path: `slack//c0abc/${ROOT}.md` } });
+    expect(malformed).toMatchObject({ relationship: "unresolved_channel", evidence: [] });
+    expect(await classify({ ...variant, item: { path: `slack/t1/c0other/${ROOT}.md` } })).toMatchObject({
+      bucket: "unrelated",
+    });
+    expect(
+      await classify({
+        ...variant,
+        item: { path: `slack/c0other/${ROOT}.md`, frontmatter: { source: "slack", channel_id: "C0OTHER" } },
+      })
+    ).toMatchObject({ bucket: "unrelated" });
+    expect(await classify({ ...variant, item: { path: `slack/t0other/c0abc/${ROOT}.md` } })).toMatchObject({
+      bucket: "other_workspace",
+      observation: { kind: "scanned_scoped_path", workspaceId: "t0other" },
+    });
+    // A conflict that already stood for another reason does not gain the label on a non-match.
+    const elsewhere = await entryOf({
+      ...variant,
+      item: { path: `slack/t1/c0other/${ROOT}.md` },
+      ledgerSources: [ledgerSource()],
+    });
+    expect(elsewhere.relationship).toBe("conflicting_evidence");
+    expect(elsewhere.evidence).not.toContain("channel_state");
+  });
+});
+
+describe("slack repair census: stored ids are not held to the request size bound", () => {
+  const LONG_WORKSPACE = `T${"0".repeat(64)}`;
+  const LONG_CHANNEL = `C${"9".repeat(64)}`;
+
+  it("accepts a 65-character stored binding workspace, and names targets under it", async () => {
+    const { decideSlackRepairScope } = await census();
+    expect(LONG_WORKSPACE).toHaveLength(65);
+    const row = scopeRow({ bindingWorkspaceId: LONG_WORKSPACE });
+    expect(decideSlackRepairScope({ scope: SCOPE, row, cursor: null })).toEqual({
+      outcome: "available",
+      scopeFingerprint: tupleFingerprint(row, [CHANNEL, "C0ZED"]),
+      bindingWorkspaceId: LONG_WORKSPACE,
+      integrationStatus: "enabled",
+    });
+    expect(await entryOf({ bindingWorkspaceId: LONG_WORKSPACE })).toMatchObject({
+      relationship: "channel_candidate",
+      hypotheticalTarget: { path: `slack/${LONG_WORKSPACE.toLowerCase()}/c0abc/${ROOT}.md` },
+    });
+    expect(
+      await entryOf({
+        bindingWorkspaceId: LONG_WORKSPACE,
+        item: { path: `slack/${LONG_WORKSPACE.toLowerCase()}/c0abc/${ROOT}.md` },
+        ledgerSources: [ledgerSource({ workspaceId: LONG_WORKSPACE })],
+      })
+    ).toMatchObject({ relationship: "scoped_channel_match", provenance: "scoped_ledger_observed" });
+    // Still a provider id: the syntax rule is unchanged, only the length rule is not applied.
+    expect(
+      decideSlackRepairScope({ scope: SCOPE, row: scopeRow({ bindingWorkspaceId: `${LONG_WORKSPACE} ` }), cursor: null })
+    ).toEqual({ outcome: "refused", reason: "scope_unavailable" });
+  });
+
+  it("accepts a 65-character ready-gate workspace", async () => {
+    const { decodeSlackRepairGate } = await census();
+    const repair = "77777777-7777-4777-8777-777777777777";
+    expect(
+      decodeSlackRepairGate({
+        state: "ready", revision: "4", ready_revision: "4", resolved_workspace_ids: [WORKSPACE, LONG_WORKSPACE],
+        completed_repair_id: repair, blocked_reason: null,
+      })
+    ).toEqual({
+      status: "ready", revision: 4, readyRevision: 4, resolvedWorkspaceIds: [WORKSPACE, LONG_WORKSPACE],
+      completedRepairId: repair,
+    });
+  });
+
+  it("reads a 65-character retained metadata channel as valid — contradictory evidence, not malformed", async () => {
+    expect(LONG_CHANNEL).toHaveLength(65);
+    expect(await entryOf({ item: { frontmatter: { source: "slack", channel_id: LONG_CHANNEL } } })).toMatchObject({
+      relationship: "conflicting_evidence",
+      provenance: "conflicting",
+      retainedChannelMetadata: "valid",
+    });
+    expect(
+      await entryOf({
+        item: { path: `slack/general/${ROOT}.md`, frontmatter: { source: "slack", channel_id: LONG_CHANNEL } },
+      })
+    ).toMatchObject({ relationship: "unresolved_channel", retainedChannelMetadata: "valid" });
+    // A legacy segment that IS that long channel id, lower-cased, agrees with it: unrelated.
+    expect(
+      await classify({
+        item: {
+          path: `slack/${LONG_CHANNEL.toLowerCase()}/${ROOT}.md`,
+          frontmatter: { source: "slack", channel_id: LONG_CHANNEL },
+        },
+      })
+    ).toMatchObject({ bucket: "unrelated" });
+  });
+
+  it("keeps the bound on what a CALLER supplies: the request scope and the cursor", async () => {
+    const { validateSlackRepairCensusRequest, encodeSlackRepairCursor } = await census();
+    const atBound = LONG_CHANNEL.slice(0, 64);
+    expect(validateSlackRepairCensusRequest({ scope: { ...SCOPE, channelId: atBound } }).scope.channelId).toBe(atBound);
+    expect(
+      await rejection(() => validateSlackRepairCensusRequest({ scope: { ...SCOPE, channelId: LONG_CHANNEL } }))
+    ).toMatchObject({ category: "invalid_scope" });
+    expect(
+      await rejection(() =>
+        encodeSlackRepairCursor({
+          scope: { ...SCOPE, channelId: LONG_CHANNEL }, scopeFingerprint: FINGERPRINT, lastItemId: ITEM,
+        })
+      )
+    ).toMatchObject({ category: "invalid_cursor" });
+    const cursor = encodeSlackRepairCursor({
+      scope: { ...SCOPE, channelId: atBound }, scopeFingerprint: FINGERPRINT, lastItemId: ITEM,
+    });
+    expect(cursor.length).toBeLessThanOrEqual(512);
+    expect(
+      validateSlackRepairCensusRequest({ scope: { ...SCOPE, channelId: atBound }, cursor }).cursor
+    ).toEqual({ scopeFingerprint: FINGERPRINT, lastItemId: ITEM });
+  });
+});
+
+describe("slack repair census: diagnostics survive a contradiction on a legacy requested-channel entry", () => {
+  const related = {
+    targetPathItems: [{ itemId: itemId(7), projectId: PROJECT }],
+    otherProjectSameThreadItemIds: [itemId(3)],
+    sameProjectConvergingItemIds: [itemId(9)],
+    queue: { status: "queued", errorObserved: true },
+  };
+  const target = { hypothetical: true, workspace: "stored_binding_workspace", path: `slack/t1/c0abc/${ROOT}.md` };
+
+  it.each([
+    ["retained metadata naming another channel", { item: { frontmatter: { source: "slack", channel_id: "C0OTHER" } } }],
+    ["a ledger row from another source", { ledgerSources: [ledgerSource({ workspaceId: "T2" })] }],
+    ["a case-only stored-id variant", { storedIdVariantObserved: true }],
+    [
+      "a slug tied by metadata, with a ledger row from another source",
+      {
+        item: { path: `slack/general/${ROOT}.md`, frontmatter: { source: "slack", channel_id: CHANNEL } },
+        ledgerSources: [ledgerSource({ channelId: "C0OTHER" })],
+      },
+    ],
+  ])("keeps the target, the occupant and the qualified peers under %s", async (_label, contradiction) => {
+    const entry = await entryOf({ ...related, ...contradiction });
+    expect(entry).toMatchObject({
+      relationship: "conflicting_evidence",
+      provenance: "conflicting",
+      hypotheticalTarget: target,
+      exactTargetItemId: itemId(7),
+      sameThreadOtherProjectItemIds: [itemId(3)],
+      sameProjectConvergingItemIds: [itemId(9)],
+      // A queue row is associated with a scoped MATCH only; a contradicted legacy item gets none.
+      queueStatus: "not_applicable",
+      queueErrorObserved: false,
+    });
+    expect(entry.pending).toEqual(
+      expect.arrayContaining(["source_refetch_required", "provenance_review_required"])
+    );
+    expect(entry.pending).not.toContain("pending_queue_work");
+  });
+
+  it("manufactures no target for a row that never had one", async () => {
+    const none = { hypotheticalTarget: null, exactTargetItemId: null };
+    // A scoped match contradicted by its own ledger.
+    expect(
+      await entryOf({
+        ...related,
+        item: { path: `slack/t1/c0abc/${ROOT}.md` },
+        ledgerSources: [ledgerSource(), ledgerSource({ workspaceId: "T2" })],
+      })
+    ).toMatchObject({ relationship: "conflicting_evidence", ...none, queueStatus: "not_applicable" });
+    // A legacy path that agrees with ANOTHER channel's metadata, pulled in only by a ledger row.
+    expect(
+      await entryOf({
+        ...related,
+        item: { path: `slack/c0other/${ROOT}.md`, frontmatter: { source: "slack", channel_id: "C0OTHER" } },
+        ledgerSources: [ledgerSource()],
+      })
+    ).toMatchObject({ relationship: "conflicting_evidence", ...none });
+    // A scoped path for another channel that the requested source's ledger claims.
+    expect(
+      await entryOf({ ...related, item: { path: `slack/t1/c0other/${ROOT}.md` }, ledgerSources: [ledgerSource()] })
+    ).toMatchObject({ relationship: "conflicting_evidence", ...none });
+    // Unresolved and unparseable rows.
+    expect(await entryOf({ ...related, item: { path: `slack/general/${ROOT}.md` } })).toMatchObject({
+      relationship: "unresolved_channel", ...none,
+    });
+    expect(await entryOf({ ...related, item: { path: `slack//c0abc/${ROOT}.md` } })).toMatchObject({
+      relationship: "unresolved_channel", ...none,
+    });
+    // Unrelated rows are not entries at all.
+    expect((await classify({ ...related, item: { path: `slack/t1/c0other/${ROOT}.md` } })).entry).toBeUndefined();
+  });
+});
+
+describe("slack repair census: a present null channel_id is not an absent one", () => {
+  it("reads a missing key as absent, and a key holding null as malformed", async () => {
+    const withMetadata = (frontmatter: Json, path = `slack/c0abc/${ROOT}.md`): Promise<Json> =>
+      entryOf({ item: { path, frontmatter } });
+    expect(await withMetadata({ source: "slack" })).toMatchObject({
+      relationship: "channel_candidate", retainedChannelMetadata: "absent", evidence: ["legacy_path_segment"],
+    });
+    expect(await entryOf({ item: { frontmatter: null } })).toMatchObject({ retainedChannelMetadata: "absent" });
+    // Present and invalid: flagged, not trusted, and not a contradiction either.
+    expect(await withMetadata({ source: "slack", channel_id: null })).toMatchObject({
+      relationship: "channel_candidate", retainedChannelMetadata: "malformed", evidence: ["legacy_path_segment"],
+    });
+    expect(await withMetadata({ source: "slack", channel_id: null }, `slack/general/${ROOT}.md`)).toMatchObject({
+      relationship: "unresolved_channel", retainedChannelMetadata: "malformed",
+    });
+    expect(await withMetadata({ source: "slack", channel_id: null }, `slack/t1/c0abc/${ROOT}.md`)).toMatchObject({
+      relationship: "scoped_channel_match", retainedChannelMetadata: "malformed",
+    });
+    // The other three states are as they were.
+    for (const malformed of ["C0 ABC!", "", 7, false, ["C0ABC"], { id: "C0ABC" }]) {
+      expect(await withMetadata({ source: "slack", channel_id: malformed }), JSON.stringify(malformed)).toMatchObject({
+        relationship: "channel_candidate", retainedChannelMetadata: "malformed",
+      });
+    }
+    expect(await withMetadata({ source: "slack", channel_id: CHANNEL })).toMatchObject({
+      retainedChannelMetadata: "valid", evidence: ["legacy_path_segment", "retained_channel_metadata"],
+    });
+    expect(await withMetadata({ source: "slack", channel_id: "C0OTHER" })).toMatchObject({
+      relationship: "conflicting_evidence", retainedChannelMetadata: "valid",
+    });
+  });
+});
+
 describe("slack repair census: collisions, peers and their bounds", () => {
   const target = `slack/t1/c0abc/${ROOT}.md`;
 

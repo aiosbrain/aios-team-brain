@@ -97,8 +97,12 @@ const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 const ANY_CASE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** The provider-id alphabet every Slack table and the path namespace share. */
 const PROVIDER_ID = /^[A-Za-z0-9]+$/;
-/** Far above any id Slack mints; it is what keeps an encoded cursor inside its size bound. */
-const MAX_PROVIDER_ID_LENGTH = 64;
+/**
+ * A bound on ids a CALLER supplies (the request scope and a cursor), far above any id Slack mints. It
+ * is what keeps an encoded cursor inside its size bound. It is NOT a rule about stored ids: a binding
+ * workspace, a retained metadata channel and a gate workspace are whatever the tables hold.
+ */
+const MAX_REQUEST_PROVIDER_ID_LENGTH = 64;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
 const MAX_CURSOR_LENGTH = 512;
@@ -113,8 +117,14 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return prototype === Object.prototype || prototype === null;
 }
 
-function isProviderId(value: unknown): value is string {
-  return typeof value === "string" && value.length <= MAX_PROVIDER_ID_LENGTH && PROVIDER_ID.test(value);
+/** A STORED provider id: the existing alphanumeric syntax, with no length rule of this module's own. */
+function isStoredProviderId(value: unknown): value is string {
+  return typeof value === "string" && PROVIDER_ID.test(value);
+}
+
+/** A provider id taken from a request or a cursor: the same syntax, inside the request size bound. */
+function isRequestProviderId(value: unknown): value is string {
+  return isStoredProviderId(value) && value.length <= MAX_REQUEST_PROVIDER_ID_LENGTH;
 }
 
 function isCanonicalUuid(value: unknown): value is string {
@@ -129,7 +139,7 @@ function readScope(value: unknown): SlackRepairCensusScope {
   const { teamId, integrationId, channelId } = value;
   if (typeof teamId !== "string" || !ANY_CASE_UUID.test(teamId)) throw invalid();
   if (typeof integrationId !== "string" || !ANY_CASE_UUID.test(integrationId)) throw invalid();
-  if (!isProviderId(channelId)) throw invalid();
+  if (!isRequestProviderId(channelId)) throw invalid();
   // UUIDs are canonical lower case; a provider id keeps its bytes.
   return { teamId: teamId.toLowerCase(), integrationId: integrationId.toLowerCase(), channelId };
 }
@@ -160,7 +170,7 @@ export function encodeSlackRepairCursor(input: {
   if (
     !isCanonicalUuid(scope?.teamId) ||
     !isCanonicalUuid(scope?.integrationId) ||
-    !isProviderId(scope?.channelId) ||
+    !isRequestProviderId(scope?.channelId) ||
     typeof scopeFingerprint !== "string" ||
     !SHA256_HEX.test(scopeFingerprint) ||
     !isCanonicalUuid(lastItemId)
@@ -187,7 +197,7 @@ function readCursor(value: unknown, scope: SlackRepairCensusScope): SlackRepairC
   const { v, teamId, integrationId, channelId, scopeFingerprint, lastItemId } = decoded;
   if (v !== CURSOR_VERSION) throw invalid();
   if (!isCanonicalUuid(teamId) || !isCanonicalUuid(integrationId) || !isCanonicalUuid(lastItemId)) throw invalid();
-  if (!isProviderId(channelId)) throw invalid();
+  if (!isRequestProviderId(channelId)) throw invalid();
   if (typeof scopeFingerprint !== "string" || !SHA256_HEX.test(scopeFingerprint)) throw invalid();
   // One spelling only: padding, whitespace, re-ordered or repeated keys all decode to a different wire.
   if (cursorWire({ teamId, integrationId, channelId }, { scopeFingerprint, lastItemId }) !== value) throw invalid();
@@ -325,7 +335,7 @@ export function decideSlackRepairScope(input: {
   if (status !== "enabled" && status !== "disabled") return unavailable;
   if (row.bindingState !== "verified") return unavailable;
   const workspace = row.bindingWorkspaceId;
-  if (!isProviderId(workspace)) return unavailable;
+  if (!isStoredProviderId(workspace)) return unavailable;
   // Byte-exact against the current selection: a case variant of a selected channel is not selected.
   if (!selected.includes(scope.channelId)) return unavailable;
   return { outcome: "available", scopeFingerprint, bindingWorkspaceId: workspace, integrationStatus: status };
@@ -374,6 +384,12 @@ export interface SlackRepairRelationshipFacts {
   /** A narrow frontmatter projection. Only `channel_id` is read here. */
   frontmatter: unknown;
   ledgerSources: readonly SlackRepairLedgerSourceIdentity[];
+  /**
+   * The team's channel state holds a workspace or channel id that equals the requested one when
+   * case-folded and differs in bytes. Path segments compare lower-cased, so with such a variant on
+   * record a matching segment no longer names ONE stored source.
+   */
+  storedIdVariantObserved?: boolean;
 }
 
 export interface SlackRepairRelationshipResult {
@@ -403,19 +419,23 @@ const EVIDENCE_ORDER: readonly SlackRepairEvidenceLabel[] = [
 ];
 
 function readChannelMetadata(frontmatter: unknown): { status: SlackRepairChannelMetadataStatus; value: string | null } {
-  if (!isPlainObject(frontmatter)) return { status: "absent", value: null };
+  // Absent means the key is not there. A key that IS there holding null is a present, invalid value.
+  if (!isPlainObject(frontmatter) || !Object.prototype.hasOwnProperty.call(frontmatter, "channel_id")) {
+    return { status: "absent", value: null };
+  }
   const stored = frontmatter.channel_id;
-  if (stored === undefined || stored === null) return { status: "absent", value: null };
+  if (stored === undefined) return { status: "absent", value: null };
   // Present but not a provider id: flagged, never trusted and never treated as proof of exclusion.
-  if (!isProviderId(stored)) return { status: "malformed", value: null };
+  if (!isStoredProviderId(stored)) return { status: "malformed", value: null };
   return { status: "valid", value: stored };
 }
 
 /**
  * The deterministic relationship of one stored Slack item to the requested scope.
  *
- * Rules in order, with explicit contradictory ledger/metadata facts overriding an otherwise matching
- * classification to `conflicting_evidence`:
+ * Rules in order, with explicit contradictory ledger/metadata facts — or a case-only stored-id variant
+ * observed in channel state — overriding an otherwise matching classification to
+ * `conflicting_evidence`. A variant is never an alias that grants a match:
  *
  *  • scoped path, channel differs → unrelated, unless this item's own ledger or valid retained
  *    metadata names the requested source;
@@ -427,6 +447,11 @@ function readChannelMetadata(frontmatter: unknown): { status: SlackRepairChannel
  *  • every other legacy or unparseable Slack item → `unresolved_channel`.
  *
  * A path that does not parse is never repaired into one that does.
+ *
+ * A legacy item tied to the requested channel by its segment or its retained metadata keeps its
+ * hypothetical target even when a contradiction makes it `conflicting_evidence`: the target and peer
+ * diagnostics are exactly what a reviewer of that conflict needs. No target is named for a row that
+ * is unrelated, unresolved, scoped or unparseable.
  */
 export function classifySlackRepairRelationship(input: SlackRepairRelationshipFacts): SlackRepairRelationshipResult {
   const { scope, bindingWorkspaceId } = input;
@@ -472,11 +497,14 @@ export function classifySlackRepairRelationship(input: SlackRepairRelationshipFa
   const entry = (
     relationship: SlackRepairRelationship,
     labels: readonly (SlackRepairEvidenceLabel | false)[],
-    provenance: SlackRepairProvenance = relationship === "conflicting_evidence" ? "conflicting" : "unproven"
+    provenance: SlackRepairProvenance = relationship === "conflicting_evidence" ? "conflicting" : "unproven",
+    // Decided by the BASIS of the entry (a legacy path tied to the requested channel), not by its final
+    // relationship: a contradiction changes the verdict, not which target the item would have had.
+    legacyTargetApplies = false
   ): SlackRepairRelationshipResult => {
     const present = new Set(labels.filter((label): label is SlackRepairEvidenceLabel => label !== false));
     let hypotheticalTarget: SlackRepairHypotheticalTarget | null = null;
-    if (relationship === "channel_candidate" && parsed?.kind === "legacy") {
+    if (legacyTargetApplies && parsed?.kind === "legacy") {
       // Where this item WOULD live under the stored binding workspace. Being able to name the path
       // is not evidence that the item belongs there.
       hypotheticalTarget = {
@@ -496,6 +524,9 @@ export function classifySlackRepairRelationship(input: SlackRepairRelationshipFa
   };
   const ledgerLabel = ledgerRequested && "source_ledger";
   const metadataLabel = metadataMatches && "retained_channel_metadata";
+  // Applied only where a match would otherwise stand; it contradicts a match, it does not create one.
+  const variantObserved = input.storedIdVariantObserved === true;
+  const variantLabel = variantObserved && "channel_state";
 
   if (!parsed) return entry("unresolved_channel", [ledgerLabel]);
 
@@ -512,8 +543,13 @@ export function classifySlackRepairRelationship(input: SlackRepairRelationshipFa
       if (ledgerRequested) return entry("conflicting_evidence", [metadataLabel, ledgerLabel]);
       return notAnEntry("other_workspace", parsed.workspaceSegment);
     }
-    const labels: readonly (SlackRepairEvidenceLabel | false)[] = ["scoped_path_segments", metadataLabel, ledgerLabel];
-    if (ledgerForeign || metadataDiffers) return entry("conflicting_evidence", labels);
+    const labels: readonly (SlackRepairEvidenceLabel | false)[] = [
+      "scoped_path_segments",
+      metadataLabel,
+      ledgerLabel,
+      variantLabel,
+    ];
+    if (ledgerForeign || metadataDiffers || variantObserved) return entry("conflicting_evidence", labels);
     // Reports ledger facts. It is not migration authority.
     return entry("scoped_channel_match", labels, ledgerRequested ? "scoped_ledger_observed" : "unproven");
   }
@@ -522,11 +558,23 @@ export function classifySlackRepairRelationship(input: SlackRepairRelationshipFa
   // display-name slug, indistinguishable here. A match is a candidate and stays unproven.
   const segmentMatches = parsed.channelSegment === scope.channelId.toLowerCase();
   if (segmentMatches) {
-    const labels: readonly (SlackRepairEvidenceLabel | false)[] = ["legacy_path_segment", metadataLabel, ledgerLabel];
-    return entry(metadataDiffers || ledgerForeign ? "conflicting_evidence" : "channel_candidate", labels);
+    const labels: readonly (SlackRepairEvidenceLabel | false)[] = [
+      "legacy_path_segment",
+      metadataLabel,
+      ledgerLabel,
+      variantLabel,
+    ];
+    const contradicted = metadataDiffers || ledgerForeign || variantObserved;
+    return entry(contradicted ? "conflicting_evidence" : "channel_candidate", labels, undefined, true);
   }
   if (metadataMatches) {
-    return entry(ledgerForeign ? "conflicting_evidence" : "channel_candidate", [metadataLabel, ledgerLabel]);
+    const contradicted = ledgerForeign || variantObserved;
+    return entry(
+      contradicted ? "conflicting_evidence" : "channel_candidate",
+      [metadataLabel, ledgerLabel, variantLabel],
+      undefined,
+      true
+    );
   }
   if (metadataDiffers && metadata.value !== null && parsed.channelSegment === metadata.value.toLowerCase()) {
     // Path and retained metadata agree on a different channel.
@@ -632,6 +680,8 @@ export interface SlackRepairItemFacts {
   sameProjectConvergingItemIds: readonly string[];
   /** A queue row for this exact scope and byte-exact root, or null when none was observed. */
   queue: { status: string; errorObserved: boolean } | null;
+  /** A case-only variant of the stored workspace or channel id is on record in channel state. */
+  storedIdVariantObserved?: boolean;
 }
 
 export interface SlackRepairWorkspaceObservation {
@@ -834,6 +884,7 @@ export function classifySlackRepairItem(facts: SlackRepairItemFacts): SlackRepai
     path: item.path,
     frontmatter: item.frontmatter,
     ledgerSources: facts.ledgerSources,
+    storedIdVariantObserved: facts.storedIdVariantObserved === true,
   });
   const { gateNoncanonical } = relation;
   const relationship = relation.relationship;
@@ -1104,7 +1155,7 @@ export function decodeSlackRepairGate(row: SlackRepairGateRow | null | undefined
   }
   const resolvedWorkspaceIds: string[] = [];
   for (const workspace of row.resolved_workspace_ids as unknown[]) {
-    if (!isProviderId(workspace)) {
+    if (!isStoredProviderId(workspace)) {
       throw new TypeError("slack repair census: a stored gate workspace is not a provider id");
     }
     resolvedWorkspaceIds.push(workspace);
