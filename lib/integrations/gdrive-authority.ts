@@ -5,6 +5,7 @@ import { ensureBuiltins, writeInviteDefaultMembership } from "@/lib/access/group
 import { audit } from "@/lib/api/audit";
 import type { ApiAuth } from "@/lib/api/auth";
 import { adminClient } from "@/lib/db/admin";
+import type { DbClient } from "@/lib/db/types";
 import { withBoundedLockWaits } from "@/lib/db/pg/bounded-lock";
 import { runSql, withTransaction } from "@/lib/db/pg/pool";
 import { lockIdentityAuthority, lockIdentityMutationAuthorities } from "@/lib/identity/authority";
@@ -446,6 +447,138 @@ export async function provisionGdriveConnectorPrincipal(input: {
     });
     return { key: `aios_${keyId}_${secret}`, keyId, memberId: member.id, rotated };
   });
+}
+
+export interface GdriveConnectorUnbinding {
+  integrationId: string;
+  priorConnectorMemberId: string | null;
+  priorConnectorApiKeyId: string | null;
+  generation: number;
+  fence: number;
+}
+
+/**
+ * Unbind a member from every Drive connection it is the connector principal of, BEFORE that member
+ * row is deleted — the binding half of a hard member deletion (`deleteMember({ hard: true })`,
+ * `rollbackMemberCreation`).
+ *
+ * WHY HERE. A binding is a PAIR: `connector_member_id` and `connector_api_key_id` are both set or
+ * both null (a table CHECK). Left to the foreign keys, deleting the member nulls them one at a
+ * time — the member reference directly, the key reference through the cascading key delete — and
+ * the first of those violates the pair: the deletion fails closed and a bound connector member can
+ * never be removed. So the pair is cleared TOGETHER, by the authority owner, and the foreign-key
+ * actions that follow find nothing left to do.
+ *
+ * It is a binding transition like any other (`provisionGdriveConnectorPrincipal`): in the one
+ * statement that clears the pair, the generation and the fence advance exactly once and the lease
+ * is dropped, so an execution acquired under the old binding is refused wherever it next presents
+ * itself. Nothing else is touched — not the credential, the progress or recovery state, the
+ * claims, the content, its attribution or any repair obligation.
+ *
+ * ONE TRANSACTION, the caller's. This joins the deletion's identity-mutation transaction; it opens
+ * none. The unbinding, the invalidation and their audit rows commit with the member deletion or
+ * roll back with it — a deletion that fails afterwards leaves the binding exactly as it was.
+ *
+ * LOCK ORDER. The caller already holds the team identity authority (asserted, never acquired here:
+ * it could only be acquired late). Under it, the affected connections are discovered, their
+ * integration and authority rows locked in ascending integration-id order, and the binding re-read
+ * from the locked rows. Every other Drive connection path takes the identity authority first
+ * (`lockedAuthority`), so provisioning, rotation and execution queue behind this deletion or ahead
+ * of it — never interleaved with it.
+ */
+export async function unbindGdriveConnectorMember(
+  db: DbClient,
+  input: {
+    teamId: string;
+    memberId: string;
+    reason: "member-deleted" | "member-creation-rolled-back";
+    actor?: { kind?: "member" | "system"; memberId?: string | null };
+  },
+): Promise<GdriveConnectorUnbinding[]> {
+  const { teamId, memberId } = input;
+  const { rows: authority } = await runSql<{ held: boolean }>(
+    `select exists(
+       select 1 from pg_locks
+        where locktype = 'advisory' and pid = pg_backend_pid() and granted and objsubid = 1
+          and ((classid::bigint << 32) | objid::bigint) = hashtextextended($1, 0)) as held`,
+    [`${teamId}:identity-authority`],
+  );
+  if (authority[0]?.held !== true) {
+    throw new Error("Drive connector unbinding requires the caller's identity-mutation transaction");
+  }
+
+  // A binding names the member, and a key of the member's. Either reference makes it this member's.
+  const BOUND_TO_MEMBER = `(a.connector_member_id = $2
+    or a.connector_api_key_id in (select k.id from api_keys k where k.team_id = $1 and k.member_id = $2))`;
+  const { rows: discovered } = await runSql<{ integration_id: string }>(
+    `select a.integration_id from gdrive_connection_authority a
+      where a.team_id = $1 and ${BOUND_TO_MEMBER}
+      order by a.integration_id`,
+    [teamId, memberId],
+  );
+  if (discovered.length === 0) return [];
+
+  const { rows: locked } = await runSql<{
+    integration_id: string;
+    connector_member_id: string | null;
+    connector_api_key_id: string | null;
+    bound: boolean;
+  }>(
+    `select i.id as integration_id, a.connector_member_id, a.connector_api_key_id,
+            ${BOUND_TO_MEMBER} as bound
+       from integrations i
+       join gdrive_connection_authority a on a.integration_id = i.id and a.team_id = i.team_id
+      where i.team_id = $1 and i.type = 'gdrive' and i.id = any($3::uuid[])
+      order by i.id
+      for update of i, a`,
+    [teamId, memberId, discovered.map((row) => row.integration_id)],
+  );
+  // Revalidated on the locked rows: only a binding that is still this member's is cleared.
+  const bound = locked.filter((row) => row.bound === true);
+  if (bound.length === 0) return [];
+
+  const { rows: cleared } = await runSql<{ integration_id: string; generation: string | number; fence: string | number }>(
+    `update gdrive_connection_authority
+        set connector_member_id = null, connector_api_key_id = null,
+            generation = generation + 1, fence = fence + 1,
+            lease_owner = null, lease_until = null, updated_at = now()
+      where team_id = $1 and integration_id = any($2::uuid[])
+      returning integration_id, generation, fence`,
+    [teamId, bound.map((row) => row.integration_id)],
+  );
+  if (cleared.length !== bound.length) {
+    throw new Error("Drive connector unbinding did not clear every locked binding");
+  }
+  const after = new Map(cleared.map((row) => [row.integration_id, row]));
+  const unbound: GdriveConnectorUnbinding[] = [];
+  for (const row of bound) {
+    const advanced = after.get(row.integration_id)!;
+    const unbinding: GdriveConnectorUnbinding = {
+      integrationId: row.integration_id,
+      priorConnectorMemberId: row.connector_member_id,
+      priorConnectorApiKeyId: row.connector_api_key_id,
+      generation: Number(advanced.generation),
+      fence: Number(advanced.fence),
+    };
+    // Row ids only: the key's id in `api_keys`, never its public id, hash or secret.
+    await audit(db, {
+      team_id: teamId,
+      actor_kind: input.actor?.kind ?? "system",
+      member_id: input.actor?.memberId ?? null,
+      action: "gdrive.connector_unbound",
+      target_type: "integration",
+      target_id: row.integration_id,
+      meta: {
+        reason: input.reason,
+        connector_member_id: unbinding.priorConnectorMemberId,
+        connector_api_key_id: unbinding.priorConnectorApiKeyId,
+        generation: unbinding.generation,
+        fence: unbinding.fence,
+      },
+    });
+    unbound.push(unbinding);
+  }
+  return unbound;
 }
 
 export async function acquireGdriveExecution(

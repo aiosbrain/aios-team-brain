@@ -248,20 +248,30 @@ async function touchSourceProject(db: DbClient, teamId: string, projectId: strin
 async function acquireIngestProjects(
   session: TransactionSession,
   input: { teamId: string; slug: string; path: string; driveSourceId: string; now: string },
-): Promise<{ sourceProjectId: string; lockedProjectIds: ReadonlySet<string> }> {
+): Promise<{
+  sourceProjectId: string;
+  lockedProjectIds: ReadonlySet<string>;
+  /** For a Drive-sourced payload: THE plan these projects were taken for. Its identity and item
+   * locks are taken from this same plan next; it is never planned again into other projects. */
+  drivePlan: GdriveIngestPlan | null;
+}> {
   const exec: ProjectSqlExecutor = <T,>(text: string, params?: unknown[]) => session.executeSql<T>(text, params);
   // The same 10-second bound as the session's identity and item acquisitions.
   return withBoundedLockWaits(async () => {
     const source = await resolveSourceProject(exec, input.teamId, input.slug, input.now);
-    const reference = input.driveSourceId
-      // Drive context is claim-derived, never system-routed; what it can reference is where the
-      // document already lives.
-      ? (await planGdriveIngest({
+    // Drive context is claim-derived, never system-routed; what it can reference is where the
+    // document already lives. Planned here — in this transaction, before any project row is
+    // locked — so the complete set is known for the one pass below.
+    const drivePlan = input.driveSourceId
+      ? await planGdriveIngest({
           teamId: input.teamId,
           storageProjectId: source.id,
           requestedPath: input.path,
           providerId: input.driveSourceId,
-        })).referenceProjectIds
+        })
+      : null;
+    const reference = drivePlan
+      ? drivePlan.referenceProjectIds
       : await systemDestinationProjectIds(exec, input.teamId);
     const locked = await lockProjectRows(exec, input.teamId, { write: [source.id], share: [], reference });
     if (locked.get(source.id.toLowerCase()) !== input.slug) {
@@ -270,7 +280,7 @@ async function acquireIngestProjects(
     if (reference.some((id) => !locked.has(id.toLowerCase()))) {
       throw new ProjectPlanChangedError("a planned project was removed before its row lock");
     }
-    return { sourceProjectId: source.id, lockedProjectIds: new Set(locked.keys()) };
+    return { sourceProjectId: source.id, lockedProjectIds: new Set(locked.keys()), drivePlan };
   });
 }
 
@@ -498,11 +508,18 @@ export async function ingestItem(
     // test decorator around the client — where there is no ambient transaction to plan and bound
     // in; there the source project is still written first, and inside this session.
     let lockedProjectIds: ReadonlySet<string> | null = null;
+    // The Drive IDENTITY locks this transaction holds for the document — provider, mapping row,
+    // path set, attribution advisories, item rows — whoever took them. Deliberately not
+    // `gdriveCommit`: identity locks confer no connection authority, and only a fenced commit may
+    // publish or retire a claim. Null for a payload that is not Drive-sourced, and off the runtime
+    // path.
+    let driveLocks: GdriveIngestLocks | null = null;
     if (gdriveCommit) {
       // The commit planned and locked its complete set — this storage project for write — before
       // its provider, path, attribution and item locks. Nothing is acquired here.
       projectId = gdriveCommit.storageProjectId;
       lockedProjectIds = gdriveCommit.locks.projectIds;
+      driveLocks = gdriveCommit.locks;
     } else if (isPgClient(rootDb)) {
       const acquired = await acquireIngestProjects(session, {
         teamId: auth.teamId,
@@ -513,6 +530,23 @@ export async function ingestItem(
       });
       projectId = acquired.sourceProjectId;
       lockedProjectIds = acquired.lockedProjectIds;
+      if (acquired.drivePlan) {
+        // A DIRECT Drive ingest takes the same locks, in the same order, as a fenced commit —
+        // provider → mapping row → the complete path set → attribution advisories → item rows —
+        // from the plan its projects were just taken for, and before its first path acquisition.
+        // (It used to take its path first and reach the mapping afterwards: against a fenced
+        // commit requested from another project, each then held what the other needed next.)
+        // No connection authority is taken, and no claim is touched: this is not a commit. A plan
+        // its locks do not confirm abandons the ingest; nothing here retries it.
+        driveLocks = await lockGdriveIngestIdentities({
+          plan: acquired.drivePlan,
+          lockedProjectIds,
+          hooks: {
+            beforeAttributionLock: _internal.concurrencyHooks?.beforeAttributionLock,
+            afterAttributionLock: _internal.concurrencyHooks?.afterAttributionLock,
+          },
+        });
+      }
     } else {
       const { data: upserted, error: projectError } = await db
         .from("projects")
@@ -538,7 +572,7 @@ export async function ingestItem(
     /** A project resolved after the acquisition must already be held: it is never taken late. */
     const assertProjectHeld = (id: string, what: string) => {
       if (!lockedProjectIds || lockedProjectIds.has(id.toLowerCase())) return;
-      throw gdriveCommit
+      throw driveLocks
         ? new GdriveIngestStateChangedError(`${what} was not among the planned projects`)
         : new ProjectPlanChangedError(`${what} was not among the planned projects`);
     };
@@ -549,10 +583,14 @@ export async function ingestItem(
     // row through retained provenance. More than one match is an old collision: fail visibly rather
     // than guessing and overwriting an unrelated document.
     const gdriveSourceId = requestedDriveSourceId;
-    if (gdriveSourceId) {
-      // Both paths this document can be created at here — the requested one and its collision-safe
-      // alternative — in the one order every Drive writer takes them, held from before the
-      // existence checks below to after the insert. A Drive commit already holds them (re-entrant).
+    if (driveLocks) {
+      // Every path this document can be checked for or created at — the requested one, its
+      // collision-safe alternative, a retained mapping's location and where an existing row is —
+      // has been held since before the mapping was touched (`lockGdriveIngestIdentities`), by a
+      // fenced commit and a direct ingest alike. No path is acquired from here on.
+    } else if (gdriveSourceId) {
+      // Off the runtime path only (a unit fake has no provider or mapping locks to order against):
+      // the request's two paths, held from before the existence checks below to after the insert.
       for (const identity of driveRequestPathIdentities(auth.teamId, projectId, payload.path, gdriveSourceId)) {
         await lockIngestIdentity(session, auth.teamId, identity.projectId, identity.path);
       }
@@ -742,22 +780,24 @@ export async function ingestItem(
   // The complete project set was planned and taken before any identity or item lock. A project
   // resolved only here was not in that plan, and is never acquired late.
   assertProjectHeld(itemProjectId, "the item's project");
-  if (gdriveCommit && canonicalItemId !== mintedDriveItemId
-      && !gdriveCommit.locks.itemIds.has(canonicalItemId)) {
-    // The commit took its item advisories and rows before this session read anything. An identity
-    // resolved here that it does not hold was not there to lock: taking its advisory now would come
-    // after item rows, so the attempt is abandoned instead.
+  const identityAlreadyHeld = driveLocks?.itemIds.has(canonicalItemId) === true;
+  if (driveLocks && canonicalItemId !== mintedDriveItemId && !identityAlreadyHeld) {
+    // A Drive writer — fenced or direct — took its item advisories and rows before this session
+    // read anything. An identity resolved here that it does not hold was not there to lock: taking
+    // its advisory now would come after item rows, so the attempt is abandoned instead.
     throw new GdriveIngestStateChangedError("the canonical item was not among the locked candidates");
   }
   if (_internal.transactionBound) {
-    await _internal.concurrencyHooks?.beforeAttributionLock?.(canonicalItemId);
-    // Re-entrant for a Drive commit; for a newly minted id the key is uncontended by construction.
+    // For an identity the Drive locks already cover, the seams fired where the advisory was really
+    // taken (`lockGdriveIngestIdentities`), not here where it is only re-entered.
+    if (!identityAlreadyHeld) await _internal.concurrencyHooks?.beforeAttributionLock?.(canonicalItemId);
+    // Re-entrant for a Drive writer; for a newly minted id the key is uncontended by construction.
     // An existing item's key can be held by a correction, a repair or another ingest, so the wait
     // carries the same 10-second bound as the project rows before it and the item row after it.
     // The bracket holds only the acquisition: the caller's `lock_timeout` is back before the item
     // row is asked for, and a timeout (55P03) is not one of the context engine's retryable causes.
     await withBoundedLockWaits(() => lockItemAttribution(auth.teamId,canonicalItemId));
-    await _internal.concurrencyHooks?.afterAttributionLock?.(canonicalItemId);
+    if (!identityAlreadyHeld) await _internal.concurrencyHooks?.afterAttributionLock?.(canonicalItemId);
   }
   // ONE row lock and ONE fresh authority read for both owners: it is the attribution reread above
   // and the locked item context the context move below requires. Always after the item advisory
@@ -794,10 +834,10 @@ export async function ingestItem(
     }
     if (driveOwned) throw _internal.refuseDriveOwnedTarget();
   }
-  if (gdriveCommit && !existing
-      && !gdriveCommit.locks.pathKeys.has(
+  if (driveLocks && !existing
+      && !driveLocks.pathKeys.has(
         drivePathIdentityKey(auth.teamId, { projectId: itemProjectId, path: itemPath }))) {
-    // The identity about to be created must be one the commit has held since before it was checked.
+    // The identity about to be created must be one this writer has held since before it was checked.
     throw new GdriveIngestStateChangedError("the creation path was not among the locked identities");
   }
 

@@ -161,7 +161,9 @@ const isPathLock = (e: Entry) => e.sql === "select pg_advisory_xact_lock($1::int
 const isOccupantRead = (e: Entry) => e.sql.includes("jsonb_to_recordset");
 const isProvenanceRead = (e: Entry) => e.sql.includes("frontmatter->>'source_id'=$2");
 const isAttributionLock = (e: Entry) => e.sql.includes("pg_advisory_xact_lock(hashtextextended(") && /:item:[0-9a-f-]{36}$/.test(String(e.params[0]));
-const isItemRowLock = (e: Entry) => e.sql.startsWith("select id, project_id from items where team_id=$1 and id=any($2::uuid[])") && e.sql.endsWith("for update");
+const isItemRowLock = (e: Entry) => e.sql.startsWith("select id, project_id, path from items where team_id=$1 and id=any($2::uuid[])") && e.sql.endsWith("for update");
+const isMappedItemRead = (e: Entry) => e.sql === "select id, project_id, path from items where team_id=$1 and id=$2";
+const isMappingWrite = (e: Entry) => /^(insert into|update|delete from) source_item_mappings\b/.test(e.sql);
 const isReconcileItemRead = (e: Entry) => e.sql.startsWith("select c.item_id from gdrive_item_claims c") && e.sql.includes("union select m.item_id from source_item_mappings m");
 const isReconcileItemLock = (e: Entry) => e.sql === "select id from items where team_id=$1 and id=any($2::uuid[]) order by id for update";
 const isSlugPathLock = (e: Entry) => String(e.params[0]).startsWith(`${TEAM}:item:docs:`);
@@ -179,10 +181,12 @@ const mode = (entry: Entry) => entry.sql.match(/for (key share|share|no key upda
 /** What a project row lock returns: the id, and the slug read under the lock (`docs` is the payload's). */
 const lockedProjectRow = (id: string): Row => ({ id, slug: id === STORAGE ? "docs" : `project-${id.slice(-1)}` });
 
-/** A candidate: an item id (in the storage project) or `[id, projectId]`. */
-type Candidate = string | [string, string];
-const candidateRow = (candidate: Candidate): Row =>
-  typeof candidate === "string" ? { id: candidate, project_id: STORAGE } : { id: candidate[0], project_id: candidate[1] };
+/** A candidate: an item id (in the storage project), `[id, projectId]` or `[id, projectId, path]`. */
+type Candidate = string | [string, string] | [string, string, string];
+const candidateRow = (candidate: Candidate, pathFor: (id: string) => string): Row =>
+  typeof candidate === "string"
+    ? { id: candidate, project_id: STORAGE, path: pathFor(candidate) }
+    : { id: candidate[0], project_id: candidate[1], path: candidate[2] ?? pathFor(candidate[0]) };
 
 /** A scripted database holding one Drive connection and whatever items a test places in it. */
 function driveDatabase(opts: {
@@ -202,7 +206,17 @@ function driveDatabase(opts: {
   let rowLocks = 0;
   const discoveries = opts.discoveries ?? [[]];
   const mappings = opts.mappings ?? [null];
-  const projectOf = new Map<string, string>();
+  // Where an item lives unless a test says otherwise: the mapped item at its mapping's canonical
+  // path (so its location adds no path identity of its own), anything else at a path of its own.
+  const planned = mappings.find((mapping) => mapping !== null) ?? null;
+  const pathFor = (id: string) =>
+    planned?.item_id === id && typeof planned.canonical_path === "string" ? planned.canonical_path : `occupied/${id}.md`;
+  const row = (candidate: Candidate) => candidateRow(candidate, pathFor);
+  const rowOf = new Map<string, Row>();
+  const remember = (rows: Row[]) => {
+    for (const found of rows) rowOf.set(found.id as string, found);
+    return rows;
+  };
   return (sql: string, params: unknown[]): Reply => {
     const scripted = opts.fail?.(sql, params);
     if (scripted) return scripted;
@@ -228,20 +242,12 @@ function driveDatabase(opts: {
       const mapping = mappings[Math.min(mappingReads++, mappings.length - 1)];
       return mapping ? [mapping] : [];
     }
-    if (isOccupantRead(e)) {
-      const rows = discoveries[Math.min(occupantReads++, discoveries.length - 1)].map(candidateRow);
-      for (const row of rows) projectOf.set(row.id as string, row.project_id as string);
-      return rows;
-    }
-    if (sql === "select id, project_id from items where team_id=$1 and id=$2") {
-      const rows = (opts.mappedItem ?? []).map(candidateRow);
-      for (const row of rows) projectOf.set(row.id as string, row.project_id as string);
-      return rows;
-    }
+    if (isOccupantRead(e)) return remember(discoveries[Math.min(occupantReads++, discoveries.length - 1)].map(row));
+    if (isMappedItemRead(e)) return remember((opts.mappedItem ?? []).map(row));
     if (isItemRowLock(e)) {
       const scriptedLock = opts.rowLocks?.[Math.min(rowLocks++, (opts.rowLocks?.length ?? 1) - 1)];
-      if (scriptedLock) return scriptedLock.map(candidateRow);
-      return (params[1] as string[]).map((id) => ({ id, project_id: projectOf.get(id) ?? STORAGE }));
+      if (scriptedLock) return scriptedLock.map(row);
+      return (params[1] as string[]).map((id) => rowOf.get(id) ?? row(id));
     }
     return [];
   };
@@ -339,7 +345,10 @@ describe("the plan: every project, path and item, read without a lock", () => {
     })));
     const plan = await withTransaction(planTheDocument);
     expect(which(c.work, isLocking)).toEqual([]);
-    expect(plan.candidates).toEqual([{ id: item(1), projectId: STORAGE }, { id: item(7), projectId: elsewhere }]);
+    expect(plan.candidates).toEqual([
+      { id: item(1), projectId: STORAGE, path: `occupied/${item(1)}.md` },
+      { id: item(7), projectId: elsewhere, path: "gdrive/kept.md" },
+    ]);
     // The storage project is written, not merely referenced; it is not listed twice.
     expect(plan.referenceProjectIds).toEqual([elsewhere]);
     expect(plan.paths).toHaveLength(3);
@@ -358,6 +367,46 @@ describe("the plan: every project, path and item, read without a lock", () => {
     const plan = await withTransaction(planTheDocument);
     expect(which(mapped.work, isProvenanceRead)).toEqual([]);
     expect(plan.referenceProjectIds).toEqual([]);
+  });
+});
+
+describe("the plan: where the document already IS joins the path set", () => {
+  const elsewhere = project(9);
+  const legacy = { id: item(7), project_id: elsewhere, path: "gdrive/legacy.md" };
+  /** An item ingested before mappings existed: found by provenance, in another project. */
+  const withLegacyItem = (atRowLock: Row = legacy) => {
+    const base = driveDatabase();
+    return (sql: string, params: unknown[]): Reply => {
+      const e: Entry = { sql, params, lockTimeout: "" };
+      if (isProvenanceRead(e)) return [legacy];
+      if (isItemRowLock(e)) return [atRowLock];
+      return base(sql, params);
+    };
+  };
+
+  it("a historical item's own location is planned, its project referenced, and both are held and revalidated", async () => {
+    const c = use(new ScriptedConnection(withLegacyItem()));
+    const { plan, locks } = await planAndLock();
+    const legacyKey = drivePathIdentityKey(TEAM, { projectId: elsewhere, path: "gdrive/legacy.md" });
+    expect(plan.candidates).toEqual([{ id: item(7), projectId: elsewhere, path: "gdrive/legacy.md" }]);
+    // The request's two paths, plus the canonical location the existing row supplies.
+    expect(plan.paths).toHaveLength(3);
+    expect(plan.referenceProjectIds).toEqual([elsewhere]);
+    expect(locks.pathKeys.has(legacyKey)).toBe(true);
+    expect(which(c.work, isPathLock).map((entry) => entry.params[1])).toContain(legacyKey);
+    expect([...locks.itemIds]).toEqual([item(7)]);
+    // Still provider → mapping → paths → advisory → row, with the extra path in the one sorted pass.
+    const work = c.work;
+    const order = [indexOf(work, isProviderLock), indexOf(work, isMappingLock), indexOf(work, isPathLock), lastIndexOf(work, isPathLock), indexOf(work, isAttributionLock), indexOf(work, isItemRowLock)];
+    expect(order.every((index) => index >= 0)).toBe(true);
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+    const keys = which(work, isPathLock).map((entry) => entry.params[1] as string);
+    expect(keys).toEqual([...keys].sort());
+  });
+
+  it("a historical item that MOVED before its row lock abandons the attempt", async () => {
+    use(new ScriptedConnection(withLegacyItem({ ...legacy, path: "gdrive/renamed.md" })));
+    await expect(planAndLock()).rejects.toBeInstanceOf(GdriveIngestStateChangedError);
   });
 });
 
@@ -1106,5 +1155,179 @@ describe("an ordinary ingest: project acquisition is inside the publishing trans
     expect(c.log.filter((entry) => entry.sql.startsWith("savepoint "))).toHaveLength(1);
     expect(c.log.at(-1)!.sql).toBe("rollback");
     expect(which(c.work, isSessionPathLock)).toEqual([]);
+  });
+});
+
+describe("a DIRECT Drive ingest takes the fenced order: provider → mapping → the whole path set → advisories → rows", () => {
+  /**
+   * Spec. `ingestItem` given a Drive-sourced payload directly (no execution commit) used to take
+   * its path identity and only then read and write the provider mapping, while a fenced commit
+   * takes provider → mapping → paths. Requested from different projects their project locks are
+   * compatible, so each could hold what the other needed next. Every runtime Drive writer now runs
+   * `lockGdriveIngestIdentities` from the plan its projects were taken for, before its first path.
+   * The identity locks are not a commit: no connection authority, no claim.
+   */
+  type Scripted = NonNullable<Parameters<typeof driveDatabase>[0]>;
+  const mappingColumns = (entry: Entry) =>
+    entry.sql.match(/^insert into source_item_mappings \(([^)]*)\)/)![1].split(",").map((column) => column.trim());
+
+  /** The scripted Drive world, plus what the ingest session itself reads once its locks are held. */
+  function directDatabase(opts: Scripted = {}) {
+    const base = driveDatabase(opts);
+    let mapping = (opts.mappings ?? [null]).find((row) => row !== null) ?? null;
+    return (sql: string, params: unknown[]): Reply => {
+      if (sql.startsWith("select slug, kind, graph_group_id from projects")) {
+        return [{ slug: "docs", kind: "source", graph_group_id: projectGroupId(TEAM, STORAGE) }];
+      }
+      // The session's own (builder) mapping reads see the planned row, or the one it just inserted.
+      if (sql.startsWith("select item_id, project_id, canonical_path from source_item_mappings where team_id = $1")) {
+        return mapping ? [mapping] : [];
+      }
+      if (sql.startsWith("insert into source_item_mappings (") && !mapping) {
+        const columns = sql.match(/^insert into source_item_mappings \(([^)]*)\)/)![1].split(",").map((column) => column.trim());
+        mapping = Object.fromEntries(["item_id", "project_id", "canonical_path"].map((column) => [column, params[columns.indexOf(column)]]));
+        return [];
+      }
+      return base(sql, params);
+    };
+  }
+  const direct = (hooks?: { beforeAttributionLock?: (id: string) => Promise<void>; afterAttributionLock?: (id: string) => Promise<void> }) =>
+    ingestItem(
+      new PgClient(), { teamId: TEAM, memberId: "member", apiKeyId: "key" }, drivePayload(), "external",
+      { authorMemberId: null }, "team", undefined, hooks ? { concurrencyHooks: hooks } : {},
+    ).then(() => null, (error: unknown) => error as Error);
+  const noCommitAuthority = (work: Entry[]) => {
+    expect(which(work, isAuthorityLock)).toEqual([]);
+    expect(which(work, isPrincipalLock)).toEqual([]);
+    expect(which(work, isIdentityLock)).toEqual([]);
+    expect(which(work, (e) => /gdrive_item_claims|gdrive_item_claim_projects|gdrive_connection_authority/.test(e.sql))).toEqual([]);
+  };
+
+  it("ABSENT MAPPING: provider advisory, then the (absent) mapping row, then both paths — and only then is the mapping created, with no connection id", async () => {
+    const c = use(new ScriptedConnection(directDatabase()));
+    await direct();
+
+    const work = c.work;
+    const order = [
+      indexOf(work, isSourceProjectRead),
+      indexOf(work, isMappingRead),
+      indexOf(work, isProjectLock),
+      lastIndexOf(work, isProjectLock),
+      indexOf(work, isProviderLock),
+      indexOf(work, isMappingLock),
+      indexOf(work, isPathLock),
+      lastIndexOf(work, isPathLock),
+      indexOf(work, (e) => e.sql.startsWith("update projects set last_synced_at")),
+      indexOf(work, isMappingWrite),
+    ];
+    expect(order.every((index) => index >= 0), `missing a level: ${order}`).toBe(true);
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+    // The plan is made ONCE, before the project pass, and reused: it is never planned again.
+    expect(which(work, isMappingRead)).toHaveLength(1);
+    // The whole path set is taken once, in order, AFTER the mapping row — and never again by the
+    // session: there is no second, path-first acquisition.
+    const keys = which(work, isPathLock).map((entry) => entry.params[1] as string);
+    expect(keys).toEqual([
+      drivePathIdentityKey(TEAM, { projectId: STORAGE, path: PATH }),
+      drivePathIdentityKey(TEAM, { projectId: STORAGE, path: driveCollisionSafePath(PATH, PROVIDER) }),
+    ].sort());
+    for (const entry of work.filter((e) => isProviderLock(e) || isMappingLock(e) || isPathLock(e))) {
+      expect(entry.lockTimeout, `unbounded wait: ${entry.sql}`).toBe(LOCK_ACQUISITION_TIMEOUT);
+    }
+    // No placeholder: absence was re-read under the provider advisory, and the row is created only
+    // after every acquisition — insert-if-absent, with a NULL connection id.
+    const created = work[order[9]];
+    expect(created.sql).toContain("on conflict (team_id, source, provider_id) do nothing");
+    expect(created.params[mappingColumns(created).indexOf("connection_id")]).toBeNull();
+    expect(created.params[mappingColumns(created).indexOf("project_id")]).toBe(STORAGE);
+    // FRESH UUID: the minted item's advisory is the one identity taken after the mapping exists.
+    const minted = String(created.params[mappingColumns(created).indexOf("item_id")]);
+    const mintedLock = indexOf(work, (e) => isAttributionLock(e) && e.params[0] === `${TEAM}:item:${minted}`);
+    expect(mintedLock).toBeGreaterThan(order[9]);
+    noCommitAuthority(work);
+    expect(c.count("begin")).toBe(1);
+  });
+
+  it("CANONICAL ELSEWHERE: requested from one project, living in another — the canonical project by key, its path in the set, the item held before the session reads", async () => {
+    const elsewhere = project(9);
+    const c = use(new ScriptedConnection(directDatabase({
+      mappings: [{ item_id: item(7), project_id: elsewhere, canonical_path: "gdrive/kept.md" }],
+      mappedItem: [[item(7), elsewhere]],
+      discoveries: [[[item(7), elsewhere]]],
+    })));
+    const fired: string[] = [];
+    await direct({
+      beforeAttributionLock: async (id) => { fired.push(`before:${id}`); },
+      afterAttributionLock: async (id) => { fired.push(`after:${id}`); },
+    });
+
+    const work = c.work;
+    // COMPLETE project set, final modes: the requested project written, the canonical one by key.
+    expect(which(work, isProjectLock).map((entry) => [entry.params[1], mode(entry)])).toEqual([
+      [[STORAGE], "no key update"],
+      [[elsewhere], "key share"],
+    ]);
+    const order = [
+      lastIndexOf(work, isProjectLock),
+      indexOf(work, isProviderLock),
+      indexOf(work, isMappingLock),
+      indexOf(work, isPathLock),
+      lastIndexOf(work, isPathLock),
+      indexOf(work, isAttributionLock),
+      indexOf(work, isItemRowLock),
+      indexOf(work, isMappingWrite),
+    ];
+    expect(order.every((index) => index >= 0), `missing a level: ${order}`).toBe(true);
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+    // The retained canonical location is one of the THREE paths, taken in the one sorted pass.
+    const keys = which(work, isPathLock).map((entry) => entry.params[1] as string);
+    expect(keys).toHaveLength(3);
+    expect(keys).toEqual([...keys].sort());
+    expect(keys).toContain(drivePathIdentityKey(TEAM, { projectId: elsewhere, path: "gdrive/kept.md" }));
+    // The seams fire once, where the advisory is really taken — not again where it is re-entered.
+    expect(fired).toEqual([`before:${item(7)}`, `after:${item(7)}`]);
+    // The mapping keeps its identity: nothing rewrites which item or provider it names.
+    for (const write of which(work, isMappingWrite)) {
+      if (write.sql.startsWith("update ")) expect(write.sql).not.toMatch(/\b(item_id|provider_id|source|team_id) = \$\d+,|set (item_id|provider_id|source|team_id) =/);
+    }
+    noCommitAuthority(work);
+  });
+
+  it("CHANGED PLAN: a mapping that differs under the provider advisory abandons the ingest — once, with nothing owned below it and nothing written", async () => {
+    const c = use(new ScriptedConnection(directDatabase({
+      mappings: [null, { item_id: item(7), project_id: STORAGE, canonical_path: PATH }],
+    })));
+    // `directDatabase` answers the session's own reads from the first non-null mapping; this
+    // attempt never gets that far.
+    const error = await direct();
+    expect(error).toBeInstanceOf(GdriveIngestStateChangedError);
+    const work = c.work;
+    expect(which(work, isPathLock)).toEqual([]);
+    expect(which(work, isAttributionLock)).toEqual([]);
+    expect(which(work, isItemRowLock)).toEqual([]);
+    expect(which(work, isWrite)).toEqual([]);
+    // Not the fenced owner's two attempts, and not a replan: one transaction, one session, one plan.
+    expect(c.count("begin")).toBe(1);
+    expect(c.log.filter((entry) => entry.sql.startsWith("savepoint "))).toHaveLength(1);
+    expect(which(work, isMappingRead)).toHaveLength(1);
+    expect(c.count("commit")).toBe(0);
+    expect(c.log.at(-1)!.sql).toBe("rollback");
+  });
+
+  it("BOUNDED: a held provider identity times the direct ingest out once (55P03), before the mapping row or any path", async () => {
+    const c = use(new ScriptedConnection(directDatabase({
+      fail: (_sql, params) => (String(params[0]).startsWith(`${TEAM}:gdrive:`)
+        ? sqlError("canceling statement due to lock timeout", "55P03") : null),
+    })));
+    const error = await direct();
+    expect(error).toMatchObject({ code: "55P03" });
+    const work = c.work;
+    expect(which(work, isProviderLock)).toHaveLength(1);
+    expect(work.find(isProviderLock)!.lockTimeout).toBe(LOCK_ACQUISITION_TIMEOUT);
+    expect(which(work, isMappingLock)).toEqual([]);
+    expect(which(work, isPathLock)).toEqual([]);
+    expect(c.count("begin")).toBe(1);
+    expect(c.log.filter((entry) => entry.sql.startsWith("savepoint "))).toHaveLength(1);
+    expect(c.log.at(-1)!.sql).toBe("rollback");
   });
 });

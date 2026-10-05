@@ -17,11 +17,13 @@ import { ITEM_INGEST_LOCK_NS } from "@/lib/projects/context/transaction";
  * Every ingest is project-before-item. An ordinary ingest writes one project and knows it from its
  * payload. A Drive ingest does not: the document may already live in another project, and the rows
  * it can collide with are found by looking. So it PLANS first — unlocked reads of the provider's
- * mapping and of every item it could adopt or collide with (`planGdriveIngest`) — hands the planned
- * projects to `withGdriveExecutionCommit`, which takes them all in one pass, and only then takes
- * the identity and item locks here, proving under each that the plan still describes the database.
- * A plan that no longer does is never patched up with a late lock: the whole attempt is abandoned
- * and planned again (`GdriveIngestStateChangedError`).
+ * mapping and of every item it could adopt or collide with (`planGdriveIngest`) — has the planned
+ * projects taken in one pass, and only then takes the identity and item locks here, proving under
+ * each that the plan still describes the database. That is true of BOTH runtime Drive writers: the
+ * fenced commit (`ingestGdriveApiItem`, whose projects `withGdriveExecutionCommit` takes) and a
+ * direct `ingestItem` of a Drive-sourced payload (which takes them in its own session). A plan that
+ * no longer holds is never patched up with a late lock: the attempt is abandoned
+ * (`GdriveIngestStateChangedError`) — and, by the fenced owner only, planned again once.
  *
  * Source reconciliation takes the same head — connection authority, project rows, then all of its
  * provider identities, item-attribution advisories and item rows (`lockGdriveReconciliationSet`) —
@@ -123,18 +125,21 @@ interface MappingRow {
   canonical_path: string | null;
 }
 
-/** An item the ingest can adopt or collide with, and the project it lives in. */
+/** An item the ingest can adopt or collide with, and where it lives. */
 export interface DriveCandidateItem {
   id: string;
   projectId: string;
+  path: string;
 }
 
-/** Everything a Drive ingest will lock, decided before it locks anything below the connection. */
+/** Everything a Drive ingest will lock, decided before it locks anything below its projects. */
 export interface GdriveIngestPlan {
   teamId: string;
   providerId: string;
   /** The project the request names: the one row this ingest writes. */
   storageProjectId: string;
+  /** The path the request names; with the provider id it fixes the request's two path identities. */
+  requestedPath: string;
   /** The provider's mapping as planned; it must be exactly this again under the provider lock. */
   mapping: MappingRow | null;
   /** Every path this ingest can check for or create an item at, in lock order. */
@@ -172,57 +177,73 @@ const sameMapping = (planned: MappingRow | null, locked: MappingRow | null) =>
 
 const sameCandidates = (planned: readonly DriveCandidateItem[], found: readonly DriveCandidateItem[]) =>
   planned.length === found.length
-  && planned.every((item, index) => item.id === found[index].id && item.projectId === found[index].projectId);
+  && planned.every((item, index) => item.id === found[index].id
+    && item.projectId === found[index].projectId && item.path === found[index].path);
 
-/** Every path this ingest can check for or create an item at: the request's two, plus where a
- * retained mapping says the document lives (a tombstone is restored there, not at the request). */
-function plannedPaths(
+const samePaths = (teamId: string, planned: readonly DrivePathIdentity[], found: readonly DrivePathIdentity[]) =>
+  planned.length === found.length
+  && planned.every((identity, index) =>
+    drivePathIdentityKey(teamId, identity) === drivePathIdentityKey(teamId, found[index]));
+
+interface ItemLocation { id: string; project_id: string; path: string }
+const asCandidate = (row: ItemLocation): DriveCandidateItem => ({ id: row.id, projectId: row.project_id, path: row.path });
+
+/**
+ * The rows that ARE this document, if any: the item its mapping names, or — with no mapping yet —
+ * items ingested before mappings existed, recovered by their provenance.
+ */
+async function identityItems(
   teamId: string,
-  storageProjectId: string,
-  requestedPath: string,
   providerId: string,
   mapping: MappingRow | null,
-): DrivePathIdentity[] {
-  return orderDrivePathIdentities(teamId, [
+): Promise<DriveCandidateItem[]> {
+  const { rows } = mapping
+    ? await runSql<ItemLocation>(
+        `select id, project_id, path from items where team_id=$1 and id=$2`,
+        [teamId, mapping.item_id],
+      )
+    : await runSql<ItemLocation>(
+        `select id, project_id, path from items
+          where team_id=$1 and frontmatter->>'source'='gdrive' and frontmatter->>'source_id'=$2`,
+        [teamId, providerId],
+      );
+  return rows.map(asCandidate);
+}
+
+/**
+ * Everything one Drive ingest can check, adopt, collide with or create at, for a given mapping —
+ * the same lookups `ingestItem` performs itself.
+ *
+ * PATHS, complete: the request's two (the requested path and its collision-safe alternative), where
+ * a retained mapping says the document lives (a tombstone is restored there, not at the request),
+ * and where the document's existing row actually is — an existing row keeps its location, so that
+ * location is the canonical one whatever the request or an out-of-date mapping says.
+ *
+ * CANDIDATES: the document's own rows and whatever occupies any of those paths.
+ */
+async function discover(
+  scope: { teamId: string; storageProjectId: string; requestedPath: string; providerId: string },
+  mapping: MappingRow | null,
+): Promise<{ paths: DrivePathIdentity[]; candidates: DriveCandidateItem[] }> {
+  const { teamId, storageProjectId, requestedPath, providerId } = scope;
+  const own = await identityItems(teamId, providerId, mapping);
+  const paths = orderDrivePathIdentities(teamId, [
     ...driveRequestPathIdentities(teamId, storageProjectId, requestedPath, providerId),
     ...(mapping
       ? [{ projectId: mapping.project_id ?? storageProjectId, path: mapping.canonical_path ?? requestedPath }]
       : []),
+    ...own.map((item) => ({ projectId: item.projectId, path: item.path })),
   ]);
-}
-
-/** The rows the ingest can adopt or collide with — the same lookups `ingestItem` performs itself. */
-async function discoverCandidates(
-  teamId: string,
-  providerId: string,
-  mapping: MappingRow | null,
-  paths: readonly DrivePathIdentity[],
-): Promise<DriveCandidateItem[]> {
-  const found = new Map<string, string>();
-  const { rows: occupants } = await runSql<{ id: string; project_id: string }>(
-    `select i.id, i.project_id from items i
+  const { rows: occupants } = await runSql<ItemLocation>(
+    `select i.id, i.project_id, i.path from items i
        join jsonb_to_recordset($2::jsonb) as p(project_id uuid, path text)
          on p.project_id=i.project_id and p.path=i.path
       where i.team_id=$1`,
     [teamId, JSON.stringify(paths.map((identity) => ({ project_id: identity.projectId, path: identity.path })))],
   );
-  for (const row of occupants) found.set(row.id, row.project_id);
-  if (mapping) {
-    const { rows } = await runSql<{ id: string; project_id: string }>(
-      `select id, project_id from items where team_id=$1 and id=$2`,
-      [teamId, mapping.item_id],
-    );
-    for (const row of rows) found.set(row.id, row.project_id);
-  } else {
-    // No mapping yet: an item ingested before mappings existed is recovered by its provenance.
-    const { rows } = await runSql<{ id: string; project_id: string }>(
-      `select id, project_id from items
-        where team_id=$1 and frontmatter->>'source'='gdrive' and frontmatter->>'source_id'=$2`,
-      [teamId, providerId],
-    );
-    for (const row of rows) found.set(row.id, row.project_id);
-  }
-  return [...found.keys()].sort().map((id) => ({ id, projectId: found.get(id)! }));
+  const found = new Map<string, DriveCandidateItem>();
+  for (const item of [...own, ...occupants.map(asCandidate)]) found.set(item.id, item);
+  return { paths, candidates: [...found.keys()].sort().map((id) => found.get(id)!) };
 }
 
 /**
@@ -232,7 +253,8 @@ async function discoverCandidates(
  * mode — before any identity or item lock.
  *
  * Nothing here authorizes anything. Every part of the plan is re-read under its lock by
- * `lockGdriveIngestIdentities`.
+ * `lockGdriveIngestIdentities`, which is handed THIS plan: a caller never plans a second time into
+ * projects it did not take.
  */
 export async function planGdriveIngest(input: {
   teamId: string;
@@ -243,15 +265,18 @@ export async function planGdriveIngest(input: {
   const { teamId, storageProjectId, requestedPath, providerId } = input;
   const { rows: mappings } = await runSql<MappingRow>(MAPPING_READ, [teamId, providerId]);
   const mapping = mappings[0] ?? null;
-  const paths = plannedPaths(teamId, storageProjectId, requestedPath, providerId, mapping);
-  const candidates = await discoverCandidates(teamId, providerId, mapping, paths);
-  const referenced = new Set<string>(candidates.map((item) => item.projectId));
-  if (mapping?.project_id) referenced.add(mapping.project_id);
+  const { paths, candidates } = await discover(input, mapping);
+  const referenced = new Set<string>([
+    ...candidates.map((item) => item.projectId),
+    // A path identity is keyed by its project: every project a planned path lives in is held too.
+    ...paths.map((identity) => identity.projectId),
+  ]);
   referenced.delete(storageProjectId);
   return {
     teamId,
     providerId,
     storageProjectId,
+    requestedPath,
     mapping,
     paths,
     candidates,
@@ -261,10 +286,23 @@ export async function planGdriveIngest(input: {
 
 /**
  * Take every lock below the project rows for one planned Drive document, in order, and prove under
- * each that the plan still describes the database.
+ * each that the plan still describes the database:
  *
- * Must run inside the Drive execution commit (`withGdriveExecutionCommit`), which already holds the
- * connection authority and `lockedProjectIds` — the audience plus the plan's projects.
+ *   provider advisory → the provider's existing mapping row → the complete sorted path set
+ *     → sorted item-attribution advisories → sorted item rows
+ *
+ * EVERY runtime Drive writer runs this before its first path acquisition — the fenced commit
+ * (`withGdriveExecutionCommit`, which also holds the connection authority) and a direct
+ * `ingestItem` of a Drive-sourced payload alike. A writer that took its path first and only then
+ * touched the mapping would hold the path a writer in this order is waiting for while waiting for
+ * the mapping row that writer holds. The caller already holds `lockedProjectIds`, which must cover
+ * the plan's projects.
+ *
+ * The locks returned are identity locks and nothing more: they confer no connection authority and
+ * no permission to publish or retire a claim.
+ *
+ * An absent mapping is not given a placeholder row: the provider advisory serializes its creation,
+ * and its absence is re-read under that advisory.
  */
 export async function lockGdriveIngestIdentities(input: {
   plan: GdriveIngestPlan;
@@ -314,15 +352,20 @@ export async function lockGdriveIngestIdentities(input: {
   // not returned; one that moved comes back in another project. Either is a stale plan.
   const locked = plan.candidates.length === 0
     ? []
-    : (await acquireWithLockTimeout<{ id: string; project_id: string }>(
-        `select id, project_id from items where team_id=$1 and id=any($2::uuid[]) order by id for update`,
+    : (await acquireWithLockTimeout<ItemLocation>(
+        `select id, project_id, path from items where team_id=$1 and id=any($2::uuid[]) order by id for update`,
         [teamId, plan.candidates.map((item) => item.id)],
-      )).rows.map((row) => ({ id: row.id, projectId: row.project_id })).sort((a, b) => (a.id < b.id ? -1 : 1));
+      )).rows.map(asCandidate).sort((a, b) => (a.id < b.id ? -1 : 1));
   if (!sameCandidates(plan.candidates, locked)) {
     throw new GdriveIngestStateChangedError("a candidate item was removed or moved before its row lock");
   }
-  // And nothing new: the same lookups, now under every lock, must name the same rows.
-  if (!sameCandidates(plan.candidates, await discoverCandidates(teamId, providerId, plan.mapping, plan.paths))) {
+  // And nothing new: the same lookups, now under every lock, must name the same paths and rows. A
+  // location or an item that only shows up here was not locked in order, and is not locked now.
+  const underLocks = await discover(plan, plan.mapping);
+  if (!samePaths(teamId, plan.paths, underLocks.paths)) {
+    throw new GdriveIngestStateChangedError("the document's canonical location changed before its path locks");
+  }
+  if (!sameCandidates(plan.candidates, underLocks.candidates)) {
     throw new GdriveIngestStateChangedError("the candidate items changed before their row locks");
   }
 

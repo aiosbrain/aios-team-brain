@@ -89,6 +89,7 @@ import {
   provisionGdriveConnectorPrincipal,
   publishGdriveVerifiedConfig,
   releaseGdriveExecution,
+  unbindGdriveConnectorMember,
   type GdriveAdminTestAuthority,
 } from "@/lib/integrations/gdrive-authority";
 import {
@@ -97,6 +98,7 @@ import {
   publishGoogleDriveOAuthCredential,
 } from "@/lib/integrations/gdrive-oauth";
 import { decryptSecret, encryptSecret } from "@/lib/secrets/crypto";
+import { PgClient } from "@/lib/db/pg/client";
 
 function use(connection: ScriptedConnection): ScriptedConnection {
   h.connection = connection;
@@ -424,5 +426,99 @@ describe("OAuth publication: one transaction, canonical order", () => {
     }, { afterLocks: async () => { seen = [...c.work]; } });
     expect(seen.some(isIdentityLock) && seen.some(isNamedLock) && seen.some(isConnectionLock) && seen.some(isAdminLock)).toBe(true);
     expect(which(seen, isWrite)).toEqual([]);
+  });
+});
+
+describe("connector unbinding before a hard member deletion", () => {
+  /**
+   * Spec. `unbindGdriveConnectorMember` runs INSIDE the deletion's identity-mutation transaction:
+   * it asserts the team identity authority is already held (it never acquires it — it could only
+   * do so late), discovers the member's bindings, locks their integration and authority rows in
+   * ascending integration id, re-reads the binding on the locked rows, and clears each pair in ONE
+   * statement that also advances generation and fence once and drops the lease. Each cleared
+   * binding is audited with row ids only.
+   */
+  const CONNECTOR = "30000000-0000-4000-8000-0000000000c0";
+  const A = "20000000-0000-4000-8000-00000000000a";
+  const B = "20000000-0000-4000-8000-00000000000b";
+  const isHeldCheck = (e: Entry) => e.sql.includes("from pg_locks") && e.params[0] === `${TEAM}:identity-authority`;
+  const isDiscovery = (e: Entry) => e.sql.startsWith("select a.integration_id from gdrive_connection_authority a");
+  const isUnbindLock = (e: Entry) => e.sql.startsWith("select i.id as integration_id, a.connector_member_id, a.connector_api_key_id,")
+    && e.sql.endsWith("order by i.id for update of i, a");
+  const isUnbind = (e: Entry) => e.sql.startsWith("update gdrive_connection_authority set connector_member_id = null, connector_api_key_id = null,");
+  const isAudit = (e: Entry) => e.sql.startsWith("insert into audit_log");
+
+  function bindings(opts: { held?: boolean; locked?: Row[] } = {}) {
+    const locked = opts.locked ?? [
+      { integration_id: A, connector_member_id: CONNECTOR, connector_api_key_id: "key-a", bound: true },
+      { integration_id: B, connector_member_id: CONNECTOR, connector_api_key_id: "key-b", bound: true },
+    ];
+    return (sql: string, params: unknown[]): Reply => {
+      const e: Entry = { sql, params };
+      if (isHeldCheck(e)) return [{ held: opts.held ?? true }];
+      // Discovered unsorted on purpose: the order that matters is the lock's own.
+      if (isDiscovery(e)) return [...locked].reverse().map((row) => ({ integration_id: row.integration_id }));
+      if (isUnbindLock(e)) return locked;
+      if (isUnbind(e)) return (params[1] as string[]).map((id) => ({ integration_id: id, generation: 8, fence: 4 }));
+      return [];
+    };
+  }
+  const unbind = () => unbindGdriveConnectorMember(new PgClient(), {
+    teamId: TEAM, memberId: CONNECTOR, reason: "member-deleted", actor: { kind: "member", memberId: ADMIN },
+  });
+
+  it("refuses outside the caller's identity transaction, before it reads or locks anything", async () => {
+    const c = use(new ScriptedConnection(bindings({ held: false })));
+    await expect(unbind()).rejects.toThrow(/identity-mutation transaction/);
+    expect(c.work).toHaveLength(1);
+    expect(isHeldCheck(c.work[0])).toBe(true);
+  });
+
+  it("discovers, locks in integration-id order, clears each PAIR in one statement with one generation/fence step, then audits", async () => {
+    const c = use(new ScriptedConnection(bindings()));
+    await expect(unbind()).resolves.toEqual([
+      { integrationId: A, priorConnectorMemberId: CONNECTOR, priorConnectorApiKeyId: "key-a", generation: 8, fence: 4 },
+      { integrationId: B, priorConnectorMemberId: CONNECTOR, priorConnectorApiKeyId: "key-b", generation: 8, fence: 4 },
+    ]);
+    const work = c.work;
+    const order = [indexOf(work, isHeldCheck), indexOf(work, isDiscovery), indexOf(work, isUnbindLock), indexOf(work, isUnbind), indexOf(work, isAudit)];
+    expect(order).toEqual([0, 1, 2, 3, 4]);
+    // The identity authority is checked, never taken: no advisory lock is requested here at all.
+    expect(which(work, (e) => advisoryKey(e) !== "")).toEqual([]);
+    // No member or key row is locked: the caller already holds the member it is deleting.
+    expect(which(work, isMemberRowLock)).toEqual([]);
+    expect(work[2].sql).toContain("order by i.id for update of i, a");
+    // ONE statement clears both ids, advances generation and fence once and drops the lease.
+    expect(which(work, isUnbind)).toHaveLength(1);
+    expect(work[3].sql).toContain("connector_member_id = null, connector_api_key_id = null, generation = generation + 1, fence = fence + 1, lease_owner = null, lease_until = null");
+    expect(work[3].params).toEqual([TEAM, [A, B]]);
+    // Nothing else is written: not the integration, its credential, its progress or a claim.
+    expect(which(work, isWrite).filter((e) => !isUnbind(e) && !isAudit(e))).toEqual([]);
+    expect(work[3].sql).not.toMatch(/progress|scope_hash|credential_revision/);
+    // One audit row per connection, in the same order, naming the actor and the prior row ids.
+    const audits = which(work, isAudit);
+    expect(audits).toHaveLength(2);
+    expect(audits.map((entry) => entry.params.includes(A) ? A : B)).toEqual([A, B]);
+    for (const entry of audits) {
+      expect(entry.params).toContain("gdrive.connector_unbound");
+      expect(entry.params).toContain(ADMIN);
+      expect(entry.params).toContain("member");
+    }
+    expect(JSON.stringify(audits[0].params)).toContain("key-a");
+  });
+
+  it("a binding that is no longer this member's under its row lock is left alone; none at all takes no lock", async () => {
+    const stale = use(new ScriptedConnection(bindings({ locked: [
+      { integration_id: A, connector_member_id: CONNECTOR, connector_api_key_id: "key-a", bound: true },
+      { integration_id: B, connector_member_id: "someone-else", connector_api_key_id: "key-x", bound: false },
+    ] })));
+    await expect(unbind()).resolves.toMatchObject([{ integrationId: A }]);
+    expect(which(stale.work, isUnbind)[0].params).toEqual([TEAM, [A]]);
+    expect(which(stale.work, isAudit)).toHaveLength(1);
+
+    const none = use(new ScriptedConnection(bindings({ locked: [] })));
+    await expect(unbind()).resolves.toEqual([]);
+    expect(which(none.work, isUnbindLock)).toEqual([]);
+    expect(which(none.work, isWrite)).toEqual([]);
   });
 });
