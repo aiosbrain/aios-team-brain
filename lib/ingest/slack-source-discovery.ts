@@ -234,6 +234,9 @@ const TRANSIENT_PROVIDER_ERRORS = new Set([
   "request_timeout",
 ]);
 
+/** The transport's category for a response whose HTTP status was 500–599, whatever its body said. */
+const HTTP_SERVER_FAULT = /^http_5[0-9]{2}$/;
+
 /**
  * Every transport outcome, mapped to what a source may do about it. Exhaustive by construction: the
  * switch has no default, so a new outcome added to `SlackRequestResult` fails the type-check here
@@ -259,6 +262,11 @@ export function classifySlackCall(result: SlackRequestResult): SlackCallDisposit
     case "transport_error":
       return { kind: "transient", category: result.category };
     case "provider_error":
+      // An HTTP 5xx FIRST, before any provider code is weighed: the transport reports a server fault
+      // by its status alone (`http_500`…`http_599`), and a provider that was down has refused nothing.
+      // Read as a refusal it blocked bootstrap until a config edit and wrote `unverifiable` over a
+      // valid public proof.
+      if (HTTP_SERVER_FAULT.test(result.category)) return { kind: "transient", category: result.category };
       return TRANSIENT_PROVIDER_ERRORS.has(result.category)
         ? { kind: "transient", category: result.category }
         : { kind: "refused", category: result.category };
@@ -925,7 +933,16 @@ async function fetchAndAccept(
     ...(claim.cursor === null ? {} : { cursor: claim.cursor }),
   };
   const scope = verifiedScope(selection, bound);
-  const call = await request(pass, "history", selection, scope, "conversations.history", params, { claim });
+  // Whether this request actually LEFT. The transport runs the hook only for a granted, committed
+  // slot, immediately before the fetch — so `false` afterwards means the METHOD BUDGET said no
+  // (deferred, or a durably blocked bucket) and zero HTTP was sent.
+  const wire = { sent: false };
+  const call = await request(pass, "history", selection, scope, "conversations.history", params, {
+    claim,
+    beforeSend: async () => {
+      wire.sent = true;
+    },
+  });
   if (!call) return;
 
   if (call.kind !== "ok") {
@@ -933,12 +950,21 @@ async function fetchAndAccept(
     // a fresh generation and no cursor, and the certified interval is untouched — a cursor the
     // provider forgot says nothing about the pages already read.
     const restart = call.kind === "refused" && call.category === "invalid_cursor";
+    // ⚠️ THE LANES ALTERNATE REQUEST SLOTS, NOT WAKES. A wake is frequent and a slot is one a minute:
+    // the wake after a historical page usually arrives inside that minute, claims the newest lane and
+    // is refused by the budget. If handing the lane back passed the turn on, the next real slot went
+    // to the historical lane again — every time — and a long backfill took every request until it
+    // was done. A request that was never sent used no slot, so its lane KEEPS the turn; the provider
+    // deadline and every bit of frontier progress are released exactly as before. A request that WAS
+    // sent, whatever came back, used its slot and passes the turn as it always did.
+    const turn = wire.sent ? "passed" : "kept";
     await runContextTransaction(pass.input.db, (session) =>
       restart
         ? restartSlackChannelScan(session, claim, { errorCode: sanitize(call.category) })
         : releaseSlackChannelForRetry(session, claim, {
             nextDueAt: deadline(call),
             errorCode: sanitize(call.category),
+            turn,
           })
     );
     step(pass, {

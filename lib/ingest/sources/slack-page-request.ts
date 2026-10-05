@@ -403,8 +403,16 @@ export async function slackReservedRequest(
     // and the status is a bounded safe value, so that becomes the category. An unrecognised `error`
     // is arbitrary remote text — REPLACED, never truncated or escaped, because a category is meant
     // to be safe to put in a log line or a `last_error_code` column.
+    //
+    // ⚠️ A 5xx IS REPORTED BY ITS STATUS AND NOTHING ELSE. It is the provider failing, so whatever
+    // error name its body carries — none, an unknown one, even a credential or reachability code —
+    // is not a statement about THIS request, and must not travel on as one: a source acts on
+    // `invalid_auth` by blocking a configuration and on `channel_not_found` by writing a verdict.
+    // `http_5xx` is the one category a source can recognise as "the provider was down" without
+    // knowing anything else about the response.
+    const serverFault = response.status >= 500 && response.status <= 599;
     const code =
-      body.error === undefined || body.error === null
+      serverFault || body.error === undefined || body.error === null
         ? `http_${response.status}`
         : categoryOf(body.error, "provider_error");
     return AUTH_ERRORS.has(code)

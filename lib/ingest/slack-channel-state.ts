@@ -806,8 +806,17 @@ export async function restartSlackChannelScan(
 /**
  * Hand the channel back for a later attempt with a sanitized category. Everything the scan had —
  * anchor, cursor, generation, certified interval — is left exactly as it is, so the retry RESUMES
- * the same anchored scan rather than restarting it at a new "now". The lane's turn still passes, so
- * a channel failing on one lane cannot starve the other.
+ * the same anchored scan rather than restarting it at a new "now".
+ *
+ * THE TURN, which the CALLER states because only the caller knows what happened to the request:
+ *   · `passed` (the default) — the lane's turn passes to the other lane, so a channel failing on one
+ *     lane cannot starve the other. Right for a request that was sent and failed, and for a wake
+ *     that stopped at its own invocation ceiling.
+ *   · `kept`   — the claimed lane stays the pending one. Right ONLY for a request the durable method
+ *     budget refused before it was sent: the lanes alternate REQUEST SLOTS, and no slot was used. If
+ *     such a wake passed the turn, every early wake would hand the next real slot back to the lane
+ *     that just had one.
+ * This writer does not infer which it was from the error category; a category is a diagnostic.
  *
  * `nextDueAt` null means DUE NOW, and that is not the same decision as `delaySlackChannel`'s null
  * (which leaves the not-before alone): here the channel is being handed back for its own lane, and
@@ -817,15 +826,22 @@ export async function restartSlackChannelScan(
 export async function releaseSlackChannelForRetry(
   session: TransactionSession,
   claim: SlackChannelClaim,
-  input: { nextDueAt: Date | null; errorCode: string }
+  input: { nextDueAt: Date | null; errorCode: string; turn?: "passed" | "kept" }
 ): Promise<SlackChannelWrite> {
   assertScope(claim.scope);
   const lane = assertLane(claim.lane);
   assertErrorCode(input.errorCode);
   if (input.nextDueAt !== null) assertInstant("nextDueAt", input.nextDueAt);
+  const turn = input.turn ?? "passed";
+  if (turn !== "passed" && turn !== "kept") {
+    throw new SlackChannelStateError(`turn must be "passed" or "kept" (got ${JSON.stringify(turn)})`);
+  }
   const result = await session.executeSql<StateRow>(
     `update slack_sync_channels
-        set next_lane = case when claimed_lane = 'newest' then 'historical' else 'newest' end,
+        set next_lane = case
+              when $13::boolean then claimed_lane
+              when claimed_lane = 'newest' then 'historical'
+              else 'newest' end,
             claimed_lane = null,
             lease_owner = null,
             lease_expires_at = null,
@@ -853,6 +869,7 @@ export async function releaseSlackChannelForRetry(
       claim.anchorTs,
       input.errorCode,
       input.nextDueAt,
+      turn === "kept",
     ]
   );
   return written(result);
