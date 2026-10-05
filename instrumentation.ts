@@ -61,6 +61,12 @@ export async function register() {
     const { startIngestScheduler } = await import("@/lib/ingest/scheduler");
     startIngestScheduler();
   }
+  // Attribution-repair poller (AIO-1167) — deliberately NOT inside the ingest gate above and not a
+  // leg of that 30-minute chain: a roster or identity-mapping change fences attribution-dependent
+  // reads until its repair completes, so the repair continues on its own short cadence. It only
+  // arms a timer here; self-gates on ATTRIBUTION_REPAIR_POLL_ENABLED=false.
+  const { startAttributionRepairScheduler } = await import("@/lib/ingest/attribution-repair-scheduler");
+  startAttributionRepairScheduler();
   // Graphiti projector poller — self-gates to a no-op unless GRAPHITI_URL is set.
   const { startGraphScheduler } = await import("@/lib/graph/scheduler");
   startGraphScheduler();

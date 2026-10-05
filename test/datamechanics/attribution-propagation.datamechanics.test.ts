@@ -34,7 +34,7 @@ describe("attribution propagation (real Postgres)", () => {
     const row = async () =>
       (await db().from("items").select("member_id, member_id_locked").eq("id", id).single()).data as { member_id: string | null; member_id_locked: boolean };
 
-    await reattributeItems(db(), seed.teamId);
+    expect(await reattributeItems(db(), seed.teamId)).toMatchObject({ scanned: 1, updated: 1 });
     expect((await row()).member_id).toBe(alice); // re-attribution → Alice (from frontmatter)
 
     // Admin corrects it to Bob — this locks it.
@@ -45,9 +45,10 @@ describe("attribution propagation (real Postgres)", () => {
     expect(afterCorrection.member_id_locked).toBe(true);
 
     // Re-attribution runs again (an unrelated mapping edit fires it): frontmatter still resolves to Alice,
-    // but the lock must hold — no silent revert.
-    await reattributeItems(db(), seed.teamId);
-    expect((await row()).member_id).toBe(bob);
+    // but the lock must hold — no silent revert. The item really is scanned again (`scanned: 1`):
+    // the lock is what keeps it, not a cursor that had already passed it.
+    expect(await reattributeItems(db(), seed.teamId)).toMatchObject({ scanned: 1, updated: 0 });
+    expect(await row()).toMatchObject({ member_id: bob, member_id_locked: true });
   });
 
   it("preserves a LOCKED correction even when the item's body changes (a real edit doesn't undo it)", async () => {

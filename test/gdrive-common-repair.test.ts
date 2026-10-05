@@ -254,6 +254,11 @@ describe("common repair: one eligibility rule, in selection and under the item l
   it("the bounded candidate selection applies the SAME rule and consults nothing else", async () => {
     // A complete, healthy snapshot with nothing to repair: one candidate read, then awaiting-cache.
     const c = use(new ScriptedConnection((sql) => {
+      // The scan is an owned turn: it takes the team's repair turn, then rereads the durable state.
+      if (sql.startsWith("select pg_try_advisory_xact_lock(")) return [{ acquired: true }];
+      if (sql.startsWith("select revision,repair_revision,repair_status,cursor_item_id, (next_attempt_at")) {
+        return [{ revision: REVISION, repair_revision: REVISION, repair_status: "pending", cursor_item_id: null, deferred: false }];
+      }
       if (sql.startsWith("select revision,repair_revision,repair_status,cursor_item_id from team_identity_authority")) {
         return [{ revision: REVISION, repair_revision: REVISION, repair_status: "pending", cursor_item_id: null }];
       }

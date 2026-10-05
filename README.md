@@ -758,6 +758,7 @@ shipping app code ahead of its database.
 | `RERANK_URL` / `RERANK_MODEL` / `RERANK_TOKEN` | unset → off / `qwen3-reranker-0.6b` | Cross-encoder reranking. **Env only — no per-team setting.** |
 | `LLM_BASE_URL` / `LLM_MODEL` | unset → Anthropic | Local OpenAI-compatible endpoint |
 | `INGEST_POLL_ENABLED` / `INGEST_POLL_MINUTES` | on / `30` | Connector poller |
+| `ATTRIBUTION_REPAIR_POLL_ENABLED` | on | Prompt attribution-repair poller (independent of the connector poller) |
 | `SLACK_BOT_TOKEN` | unset | Env fallback if no Admin-stored Slack token |
 | `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` / `SLACK_OAUTH_REDIRECT` | unset | Per-member Slack OAuth ("act as me"), **not** ingestion |
 | `GITHUB_TOKEN` | unset | Member provisioning, profile sync, codebase scans — **not** the ingest runner |
@@ -800,6 +801,7 @@ effective behaviour.
 | Poller | Starts | Interval | Gate |
 |---|---|---|---|
 | Ingest | +20s after boot | **30 min** | on unless `INGEST_POLL_ENABLED=false` |
+| Attribution repair | at boot | 5 s while idle; immediately while a repair is in progress | on unless `ATTRIBUTION_REPAIR_POLL_ENABLED=false` |
 | Graph projector | +30s | **60 min** | inert unless `GRAPHITI_URL` set |
 | Social jobs | +15s | 30 s | opt-in, `SOCIAL_JOBS_ENABLED=true` |
 

@@ -5,10 +5,14 @@ import { runSql, withTransaction } from "@/lib/db/pg/pool";
 import {
   buildIdentityAuthoritySnapshot,
   advanceIdentityRepairCursor,
+  beginIdentityRepairBatch,
+  IdentitySnapshotChangedError,
   markIdentityRepairAwaitingCache,
   markCurrentIdentityRepairRetry,
   markIdentityRepairRetry,
-  markIdentityRepairRunning,
+  readOwnedIdentityRepairState,
+  reopenIdentityRepair,
+  tryLockAttributionRepairTurn,
   validateIdentityAuthorityRevision,
   type IdentityAuthoritySnapshot,
 } from "@/lib/identity/authority";
@@ -16,15 +20,39 @@ import { parseAuthorRefs, resolveItemAuthorMember } from "@/lib/attribution/reso
 import { providerIdentityState } from "@/lib/identity/resolve";
 import { syncGdriveContributionEvidence } from "@/lib/ingest/gdrive-contribution-store";
 import { lockItemAttribution } from "@/lib/ingest/item-attribution-lock";
+import { COMMON_REPAIR_ELIGIBLE, readCommonRepairEligibility } from "@/lib/ingest/repair-eligibility";
+
+/** What one call did with the team's repair turn. */
+export type RepairTurn =
+  /** It owned the turn and committed one bounded batch. */
+  | "scanned"
+  /** Another owner holds this team's turn. Not a failure: that owner is making the progress. */
+  | "busy"
+  /** A recorded failure's retry deadline has not passed (only when the caller honors deadlines). */
+  | "deferred"
+  /** The scan is finished at this revision; finalization is owed and is a turn of its own. */
+  | "awaiting_cache"
+  /** This revision is already complete: nothing to do. */
+  | "complete";
 
 export interface ReattributeSummary {
   scanned: number;
   updated: number;
   versionsUpdated: number;
   contributionsUpdated: number;
+  /** The revision the turn ran at; 0 when the turn was `busy` before any state could be read. */
   revision: number;
+  /** The scan is not known to be finished at `revision`. */
   partial: boolean;
+  turn: RepairTurn;
 }
+
+/**
+ * Items per owned batch. The batch is ONE transaction that holds the team's identity-authority lock
+ * from its first statement to its commit, so its size bounds how long an identity mutation, a Drive
+ * commit, a correction or a cache read on this team can wait behind the repair.
+ */
+export const REPAIR_TURN_BATCH = 100;
 
 interface ItemRow {
   id: string;
@@ -32,40 +60,6 @@ interface ItemRow {
   member_id_locked: boolean;
   frontmatter: Record<string, unknown>;
 }
-
-/**
- * COMMON REPAIR ELIGIBILITY — one rule, applied to the bounded candidate selection and again to
- * each item once its attribution advisory and its row are held. `i` is the `items` row.
- *
- * A team-tier row is repairable. An `external` row is not — it is a client's content, and its
- * stored credit is never rewritten from roster state — with ONE exception: a Google Drive document.
- * Drive documents are stored `external` by construction (the unit tier is the conservative one;
- * claim memberships are the authority), so the tier alone would exclude every one of them.
- *
- * What makes an external row a Drive document is the PERSISTED same-team provider mapping, and
- * nothing else. Not its frontmatter, authors or contributions (a pusher writes those), not a
- * connection id on the payload or on the mapping (the mapping's is NULL by design), not an active
- * claim, a live lease or an enabled integration: the mapping is written only by the ingest owner
- * for a provider identity it resolved, and it outlives disconnect and a paired staging restore.
- *
- * THROUGH COMMIT. The recheck takes no provider or mapping lock — either would come after the item
- * row, the inverse of provider → path → attribution → item. It does not need one. `access` is read
- * from the locked row. And a mapping, once it names an item, keeps naming it: `lib/ingest/index.ts`
- * is the only writer, it only ever inserts a row for a provider identity (do-nothing on conflict)
- * and afterwards updates that row's project/path by item id; no application path deletes a mapping
- * or changes its `item_id`, `source` or `team_id`, and the row survives its item's purge as a
- * tombstone (`test/guards/source-item-mapping-stability.test.ts` holds that line). So an
- * eligibility read that is true under the item lock stays true until this transaction ends.
- *
- * The only transition is the other way — an unmapped row gaining a mapping when the ingest owner
- * adopts it. A Drive commit does that under the item's attribution advisory, so it queues behind
- * this repair or is seen by it. A row adopted after the cursor has passed it is not revisited at
- * this revision: it was not a Drive document when the repair looked, and the adopting ingest
- * attributes the current row itself.
- */
-const REPAIR_ELIGIBLE = `(i.access::text <> 'external' or exists (
-  select 1 from source_item_mappings m
-   where m.team_id = i.team_id and m.item_id = i.id and m.source = 'gdrive'))`;
 
 interface VersionRow {
   id: string;
@@ -132,18 +126,7 @@ export async function repairAttributionItem(
     // the tier of the locked row and whatever mapping is committed now, not what a statement that
     // had to wait for the lock saw when it started. A failed read throws: the transaction rolls
     // back and the cursor does not move.
-    let eligible = false;
-    if (item) {
-      const { rows: eligibility } = await runSql<{ eligible: boolean | null }>(
-        `select ${REPAIR_ELIGIBLE} as eligible from items i where i.team_id=$1 and i.id=$2`,
-        [snapshot.teamId, itemId],
-      );
-      const answer = eligibility[0]?.eligible;
-      if (eligibility.length !== 1 || typeof answer !== "boolean") {
-        throw new Error("repair eligibility could not be read for a locked item");
-      }
-      eligible = answer;
-    }
+    const eligible = item ? await readCommonRepairEligibility(snapshot.teamId, itemId) : false;
     if (!item || !eligible) {
       await advanceIdentityRepairCursor({
         teamId: snapshot.teamId, revision: snapshot.revision, itemId,
@@ -200,47 +183,129 @@ export async function repairAttributionItem(
   });
 }
 
-/** Bounded, durable team repair. A mapping change resets the DB cursor and invalidates the snapshot;
- * the caller retries under the new revision rather than letting an old worker publish. */
-export async function reattributeItems(
+export interface ReattributeOptions {
+  batchSize?: number;
+  /**
+   * This call REQUESTS a repair at the current revision rather than only continuing one: a
+   * revision whose scan has finished is durably reopened — committed, with its cursor reset —
+   * before anything is scanned (`reopenIdentityRepair`). The manual button and the direct
+   * `reattributeItems` request; the scheduler, the backstop and the post-mutation hooks do not,
+   * because the mutation they follow already enqueued its repair.
+   */
+  request?: boolean;
+  /** A recorded failure's retry deadline defers the turn. The scheduler honors it; an explicit
+   * manual repair does not. */
+  honorRetryDeadline?: boolean;
+  /** Test-only scheduling point: the snapshot is built and NOTHING is held. */
+  afterSnapshot?: (revision: number) => Promise<void>;
+  /** Test-only scheduling point: the turn and the identity authority are held, nothing written. */
+  afterOwnership?: () => Promise<void>;
+  /** Test-only scheduling point: one item's repair is written, the batch is not committed. */
+  afterItem?: (itemId: string) => Promise<void>;
+}
+
+/**
+ * One SCAN TURN of the team-wide repair: at most one bounded batch, owned and atomic.
+ *
+ * Two transactions, each of which takes the team's repair turn before the identity-authority lock
+ * and gives up at once (`busy`) if another owner has it:
+ *
+ *   1. the complete resolver snapshot, read under the authority lock and then RELEASED — it is the
+ *      expensive read, and holding the turn across it would only lengthen what everyone else waits;
+ *   2. the batch. Once it owns the turn it rereads the durable state, because the snapshot was only
+ *      a nomination: a newer revision throws (the caller retries from the current one; nothing an
+ *      old snapshot resolved is published), a revision another owner finished is a no-op, and the
+ *      cursor used is the one committed NOW. Every item, version and evidence write of the batch,
+ *      its cursor and its status commit together or not at all.
+ *
+ * A failure rolls the whole batch back; only then is the durable retry state written, in its own
+ * transaction. `busy`, a deferred deadline and a healthy partial batch write no failure state.
+ *
+ * By itself a turn only CONTINUES durable work: a revision it finds complete, or already scanned,
+ * is left exactly as it is. With `request` the first transaction reopens such a revision before the
+ * snapshot is read, so the scan that follows is a scan of durably pending work like any other —
+ * a complete revision is never scanned as complete.
+ */
+export async function takeRepairScanTurn(
   db: DbClient,
   teamId: string,
-  opts: { batchSize?: number; afterSnapshot?: (revision: number) => Promise<void> } = {},
+  opts: ReattributeOptions = {},
 ): Promise<ReattributeSummary> {
-  const batchSize = Math.max(1,Math.min(500,opts.batchSize ?? 250));
-  let snapshot: IdentityAuthoritySnapshot;
+  const batchSize = Math.max(1,Math.min(500,opts.batchSize ?? REPAIR_TURN_BATCH));
+  const nothing = (turn: RepairTurn, revision: number, partial: boolean): ReattributeSummary => ({
+    scanned:0,updated:0,versionsUpdated:0,contributionsUpdated:0,revision,partial,turn,
+  });
+  let nominated: IdentityAuthoritySnapshot | null;
   try {
-    snapshot=await buildIdentityAuthoritySnapshot(db,teamId);
+    nominated=await withTransaction(async () => {
+      if (!await tryLockAttributionRepairTurn(teamId)) return null;
+      if (opts.request) await reopenIdentityRepair(teamId);
+      return buildIdentityAuthoritySnapshot(db,teamId);
+    });
   } catch (error) {
     await markCurrentIdentityRepairRetry(teamId,error).catch(()=>{});
     throw error;
   }
+  if (!nominated) return nothing("busy",0,true);
+  const snapshot = nominated;
   try {
-    await markIdentityRepairRunning(teamId,snapshot.revision);
     await opts.afterSnapshot?.(snapshot.revision);
-    const { rows: candidates } = await runSql<{ id: string }>(
-      `select i.id from items i
-        where i.team_id=$1 and ${REPAIR_ELIGIBLE} and ($2::uuid is null or i.id>$2::uuid)
-        order by i.id limit $3`,
-      [teamId,snapshot.cursorItemId,batchSize],
-    );
-    let updated=0;
-    let versionsUpdated=0;
-    let contributionsUpdated=0;
-    for (const candidate of candidates) {
-      const result = await repairAttributionItem(db,snapshot,candidate.id);
-      updated += result.item;
-      versionsUpdated += result.versions;
-      contributionsUpdated += result.contributions;
-    }
-    const partial = candidates.length === batchSize;
-    if (!partial) await markIdentityRepairAwaitingCache(teamId,snapshot.revision);
-    return {
-      scanned:candidates.length,updated,versionsUpdated,contributionsUpdated,
-      revision:snapshot.revision,partial,
-    };
+    return await withTransaction(async () => {
+      if (!await tryLockAttributionRepairTurn(teamId)) return nothing("busy",snapshot.revision,true);
+      const state = await readOwnedIdentityRepairState(teamId);
+      if (state.revision !== snapshot.revision) throw new IdentitySnapshotChangedError();
+      if (state.repairStatus === "complete") return nothing("complete",state.revision,false);
+      if (state.repairStatus === "awaiting_cache") return nothing("awaiting_cache",state.revision,false);
+      if (opts.honorRetryDeadline && state.deferred) return nothing("deferred",state.revision,true);
+      await opts.afterOwnership?.();
+      await beginIdentityRepairBatch(teamId,snapshot.revision);
+      const owned: IdentityAuthoritySnapshot = {
+        ...snapshot,repairStatus:"running",cursorItemId:state.cursorItemId,
+      };
+      const { rows: candidates } = await runSql<{ id: string }>(
+        `select i.id from items i
+          where i.team_id=$1 and ${COMMON_REPAIR_ELIGIBLE} and ($2::uuid is null or i.id>$2::uuid)
+          order by i.id limit $3`,
+        [teamId,owned.cursorItemId,batchSize],
+      );
+      let updated=0;
+      let versionsUpdated=0;
+      let contributionsUpdated=0;
+      for (const candidate of candidates) {
+        const result = await repairAttributionItem(db,owned,candidate.id);
+        updated += result.item;
+        versionsUpdated += result.versions;
+        contributionsUpdated += result.contributions;
+        await opts.afterItem?.(candidate.id);
+      }
+      const partial = candidates.length === batchSize;
+      if (!partial) await markIdentityRepairAwaitingCache(teamId,snapshot.revision);
+      return {
+        scanned:candidates.length,updated,versionsUpdated,contributionsUpdated,
+        revision:snapshot.revision,partial,turn:"scanned" as const,
+      };
+    });
   } catch (error) {
-    await markIdentityRepairRetry(teamId,snapshot.revision,error).catch(() => {});
+    // The batch has rolled back. A superseded snapshot is not a failure of the current revision.
+    if (!(error instanceof IdentitySnapshotChangedError)) {
+      await markIdentityRepairRetry(teamId,snapshot.revision,error).catch(() => {});
+    }
     throw error;
   }
+}
+
+/**
+ * The DIRECT form: re-apply the team's current identity mappings to its stored rows, one bounded
+ * batch per call. Calling it IS a request — it always was: a team whose revision had already been
+ * marked complete (every roster change on a team with nothing yet to repair is) was scanned all the
+ * same, which is how rows that predate a rule, or were stored around the attributing route, get put
+ * right. The request is now a durable step of its own, taken under the turn before the scan
+ * (`ReattributeOptions.request`), and a scan in progress is continued, not restarted.
+ */
+export async function reattributeItems(
+  db: DbClient,
+  teamId: string,
+  opts: ReattributeOptions = {},
+): Promise<ReattributeSummary> {
+  return takeRepairScanTurn(db,teamId,{ ...opts,request:true });
 }
