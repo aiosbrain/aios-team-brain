@@ -22,6 +22,7 @@ import { pgConnectionConfig, shouldUseSsl } from "../lib/db/pg/ssl.mjs";
 import { assertServiceIdentity } from "./service-guard.mjs";
 import { acquireDataUseLock, hasExclusiveDataUseLock } from "./staging-ops/journal.mjs";
 import { classifyFenceAdmission, stagingFenceScope } from "./staging-ops/fence-admission.mjs";
+import { effectiveReplayPlan } from "./migration-replay-plan.mjs";
 
 // The TLS predicate + posture live in the ONE shared helper; re-exported here because bootstrap,
 // doctor and the startup fence have always imported it from the loader.
@@ -48,6 +49,18 @@ export async function loadSchema({
 
   const pgDir = path.join(cwd, "postgres");
   const sql = readFile(path.join(pgDir, "schema.sql"), "utf8");
+  // The EFFECTIVE replay plan, not the raw files: shipped migrations are immutable, and a CHECK
+  // definition one of them carries that a later migration has widened is omitted from replay
+  // (scripts/migration-replay-plan.mjs). Resolved HERE — for the whole set, before a connection is
+  // opened or schema.sql runs — so an edited shipped file aborts the release with nothing applied.
+  const migDir = path.join(pgDir, "migrations");
+  const files = exists(migDir)
+    ? readDir(migDir).filter((f) => f.endsWith(".sql")).sort()
+    : [];
+  const plan = effectiveReplayPlan(
+    files.map((f) => ({ name: f, sql: readFile(path.join(migDir, f), "utf8") })),
+  );
+
   const makeClient = createClient ?? ((config) => new Client(config));
   const client = connectedClient ?? makeClient(
     pgConnectionConfig(databaseUrl, { legacyTls: shouldUseSsl(databaseUrl, env), env })
@@ -90,13 +103,13 @@ export async function loadSchema({
     await client.query(sql);
     logger.log("✓ postgres/schema.sql loaded");
 
-    const migDir = path.join(pgDir, "migrations");
-    const files = exists(migDir)
-      ? readDir(migDir).filter((f) => f.endsWith(".sql")).sort()
-      : [];
-    for (const f of files) {
-      await client.query(readFile(path.join(migDir, f), "utf8"));
-      logger.log(`✓ postgres/migrations/${f} applied`);
+    for (const step of plan) {
+      await client.query(step.sql);
+      const superseded = step.superseded.map((entry) => entry.constraint).join(", ");
+      logger.log(
+        `✓ postgres/migrations/${step.name} applied` +
+          (superseded ? ` (replay-superseded: ${superseded})` : ""),
+      );
     }
   } finally {
     if (ownsClient) await client.end();

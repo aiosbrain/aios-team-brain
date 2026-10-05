@@ -1,7 +1,10 @@
 import "server-only";
 import type { PoolClient } from "pg";
 import { ambientTransactionClient, doomAmbientTransaction, getPool } from "./pool";
+import { commitRefusal, TransactionExecutionError } from "./tx-outcome";
 import type { DbClient, SqlExecutor, TransactionSession } from "@/lib/db/types";
+
+export { TransactionExecutionError };
 
 type SqlStateError = Error & { code?: string };
 
@@ -10,23 +13,6 @@ interface RecordedFailure {
   readonly message: string;
   readonly code?: string;
   readonly sql?: string;
-}
-
-export class TransactionExecutionError extends Error {
-  readonly code?: string;
-  readonly sql?: string;
-  readonly unknownCommit: boolean;
-
-  constructor(
-    message: string,
-    options: { cause?: unknown; code?: string; sql?: string; unknownCommit?: boolean } = {}
-  ) {
-    super(message, { cause: options.cause });
-    this.name = "TransactionExecutionError";
-    this.code = options.code;
-    this.sql = options.sql;
-    this.unknownCommit = options.unknownCommit ?? false;
-  }
 }
 
 class FailureTracker {
@@ -407,8 +393,12 @@ export async function runPgClientTransaction<T>(
       return result;
     }
 
+    let commitReply: unknown;
     try {
-      await control(savepoint ? `RELEASE SAVEPOINT ${savepoint}` : "COMMIT");
+      // The raw reply, not `control`'s row envelope: its command tag is the only proof of a commit.
+      commitReply = savepoint
+        ? await control(`RELEASE SAVEPOINT ${savepoint}`)
+        : await client.query("COMMIT");
     } catch (error) {
       session.active = false;
       // A joined session has no durable outcome of its own: a failed release dooms the enclosing
@@ -425,6 +415,18 @@ export async function runPgClientTransaction<T>(
       releaseUncertain(unknown);
       released = true;
       throw unknown;
+    }
+    // COMMIT that the server answered WITHOUT committing. The tracker above catches every statement
+    // that failed through this session, so this is the residue: a failure on the connection that
+    // bypassed it. The joined case has no COMMIT of its own — the enclosing scope checks its tag.
+    const refusal = savepoint ? null : commitRefusal(commitReply);
+    if (refusal) {
+      session.active = false;
+      // Resolved ROLLBACK is a known, clean end; an unconfirmed reply is not, so that connection goes.
+      if (refusal.unknownCommit) releaseUncertain(refusal);
+      else releaseHealthy();
+      released = true;
+      throw refusal;
     }
     session.active = false;
     releaseHealthy();
@@ -459,12 +461,22 @@ export async function withTransaction<T>(fn: (client: PoolClient) => Promise<T>)
     }
     try {
       const result = await fn(client);
+      let commitReply: unknown;
       try {
-        await client.query("COMMIT");
+        commitReply = await client.query("COMMIT");
       } catch (error) {
         destroyRelease(client, error);
         released = true;
         throw error;
+      }
+      // PostgreSQL answers COMMIT in a failed transaction with the tag ROLLBACK and no error. A
+      // callback that swallowed a statement failure would otherwise return its result as committed.
+      const refusal = commitRefusal(commitReply);
+      if (refusal) {
+        if (refusal.unknownCommit) destroyRelease(client, refusal);
+        else normalRelease(client);
+        released = true;
+        throw refusal;
       }
       normalRelease(client);
       released = true;
