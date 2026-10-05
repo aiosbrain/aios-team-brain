@@ -1,5 +1,7 @@
 import "server-only";
 import { INGEST_FETCH_TIMEOUT_MS } from "@/lib/http";
+// Type only: the HTTP client must not acquire the identity writer as a runtime dependency.
+import type { SlackUser } from "./slack-identity";
 
 /**
  * Minimal Slack Web API client (raw fetch, no SDK) for the in-app ingestion
@@ -139,6 +141,49 @@ function isMissingScopeError(err: unknown): boolean {
 function isUnverifiableChannelError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return isMissingScopeError(err) || /channel_not_found|not_in_channel/i.test(msg);
+}
+
+/**
+ * A classification flag as Slack stated it, or undefined. ONLY a literal boolean is a statement:
+ * an absent, null, string, numeric, array or object value is unknown, and is never coerced, parsed
+ * or defaulted — a missing flag must not read as "not a bot".
+ */
+function literalBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+/**
+ * One `users.list` member → a directory record, or null when it has no usable id.
+ *
+ * An entry that is null or not an object, or whose id is missing, not a string, or blank, is omitted
+ * rather than thrown on, so one malformed record cannot cost the valid ones beside it; the id is never
+ * coerced, and a valid one is returned unchanged. Only TOP-LEVEL fields classify — a look-alike nested
+ * in `profile` does not — and nothing else of the provider object is carried along.
+ */
+function directoryUser(entry: unknown): SlackUser | null {
+  if (typeof entry !== "object" || entry === null) return null;
+  const u = entry as {
+    id?: unknown;
+    name?: string;
+    real_name?: string;
+    profile?: { display_name?: string; real_name?: string; email?: string };
+    is_bot?: unknown;
+    is_app_user?: unknown;
+    deleted?: unknown;
+    is_restricted?: unknown;
+    is_ultra_restricted?: unknown;
+  };
+  if (typeof u.id !== "string" || u.id.trim() === "") return null;
+  return {
+    id: u.id,
+    displayName: u.profile?.display_name || u.profile?.real_name || u.real_name || u.name || u.id,
+    email: u.profile?.email,
+    isBot: literalBoolean(u.is_bot),
+    isAppUser: literalBoolean(u.is_app_user),
+    deleted: literalBoolean(u.deleted),
+    isRestricted: literalBoolean(u.is_restricted),
+    isUltraRestricted: literalBoolean(u.is_ultra_restricted),
+  };
 }
 
 export class SlackClient {
@@ -281,24 +326,26 @@ export class SlackClient {
    * present only when the token has the `users:read.email` scope — otherwise undefined, and
    * automatic identity mapping degrades to manual admin mapping. Used to attribute Slack content
    * to the right person.
+   *
+   * Each record also keeps Slack's five classification facts (bot, app user, deleted, guest,
+   * single-channel guest), so the identity adapter can tell a person from a bot. EVERY record with a
+   * usable id is returned — bots and apps included — because transcripts still need their names;
+   * deciding who may be linked is the adapter's job, not this method's.
    */
-  async usersDetailed(): Promise<{ id: string; displayName: string; email?: string }[]> {
-    const out: { id: string; displayName: string; email?: string }[] = [];
+  async usersDetailed(): Promise<SlackUser[]> {
+    const out: SlackUser[] = [];
     let cursor: string | undefined;
     try {
       do {
         const params: Record<string, string> = { limit: "200" };
         if (cursor) params.cursor = cursor;
         const r = await this.call<{
-          members: { id: string; name?: string; real_name?: string; profile?: { display_name?: string; real_name?: string; email?: string } }[];
+          members: unknown[];
           response_metadata?: { next_cursor?: string };
         }>("users.list", params);
-        for (const u of r.members ?? []) {
-          out.push({
-            id: u.id,
-            displayName: u.profile?.display_name || u.profile?.real_name || u.real_name || u.name || u.id,
-            email: u.profile?.email,
-          });
+        for (const entry of r.members ?? []) {
+          const user = directoryUser(entry);
+          if (user) out.push(user);
         }
         cursor = r.response_metadata?.next_cursor || undefined;
       } while (cursor);
