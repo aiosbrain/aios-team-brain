@@ -1187,7 +1187,14 @@ one ascending-id pass, each row once in its final mode — the storage project f
 projects for share, a canonical item's project by key — and no project row is acquired or strengthened
 afterwards. Under the provider, path, attribution and item locks the plan is re-read; a mapping that
 changed, or a candidate that was removed, moved or appeared, abandons the whole attempt, which is
-planned again once and then fails as `GdriveIngestStateChangedError`. A Drive path identity has one
+planned again once and then fails as `GdriveIngestStateChangedError`. Every runtime Drive writer takes
+that order — provider advisory → the provider's existing mapping row → the complete sorted path set →
+sorted attribution advisories → sorted item rows — before its first path: a direct `ingestItem` of a
+Drive-sourced payload plans in its own session, takes its projects, and runs the same
+`lockGdriveIngestIdentities` from that one plan. Its locks are identity locks only (no connection
+authority, no claim is published or retired), an absent mapping gets no placeholder row, and a plan its
+locks do not confirm abandons the ingest without the fenced owner's second attempt. The path set also
+includes where the document's existing row actually is, revalidated under its locks. A Drive path identity has one
 key — the ingest session's identity key, by project id — covering the requested path, its
 collision-safe alternative and a tombstone's restore path from before the existence check to after the
 insert. Source reconciliation shares the connection → project → provider prefix and takes all of its
@@ -1211,7 +1218,14 @@ is reserved with `created_by = NULL` (create-or-read-winner, `reserveGdriveInteg
 locked, the initiating Admin is validated, reusable config and credential are read from the locked
 row, and only then are the config, the encrypted credential and both verified identity mappings
 written. A lost Admin authorization, an incomplete credential or a mapping conflict rolls all of it
-back, the reservation included; nothing is retried.
+back, the reservation included; nothing is retried. A connection's binding is a pair (connector member
+and connector key, both set or both null, by CHECK) that the foreign keys cannot clear one column at a
+time, so a hard member deletion (`deleteMember({ hard: true })`, `rollbackMemberCreation`) unbinds
+first, inside its own identity-mutation transaction (`unbindGdriveConnectorMember`): under the
+already-held identity authority the member's connections are locked in integration-id order and each
+pair is cleared in one statement that advances generation and fence once and drops the lease, with an
+audit row naming the prior member and key row ids. Credential, progress, claims and content are
+untouched; a delete that then fails rolls the unbinding back; a soft disable does not unbind.
 
 A paired staging refresh copies Drive documents and their authorization substrate (items, context
 units, `gdrive_claim` memberships) but not the connection: integrations, API keys and the five Drive

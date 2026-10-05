@@ -4,6 +4,7 @@ import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
 import { runSql } from "@/lib/db/pg/pool";
 import { withIdentityMutationBoundary } from "@/lib/identity/authority";
+import { unbindGdriveConnectorMember } from "@/lib/integrations/gdrive-authority";
 
 /**
  * Shared admin primitive: create (or upsert) a member. Used by the admin server
@@ -189,6 +190,12 @@ export async function rollbackMemberCreation(
       [memberId, teamId],
     );
     if (!rows[0]) return;
+    // A Drive connection bound to this member is unbound first, in this same transaction: the
+    // binding is a pair the foreign keys cannot clear one column at a time. A failed delete below
+    // rolls the unbinding back with it.
+    await unbindGdriveConnectorMember(admin, {
+      teamId, memberId, reason: "member-creation-rolled-back", actor: opts.actor,
+    });
     const { error } = await admin.from("members").delete().eq("id", memberId).eq("team_id", teamId);
     if (error) throw new Error(`rollback member creation failed: ${error.message}`);
     await audit(admin, {
@@ -365,6 +372,13 @@ export async function deleteMember(
     }
 
     if (opts.hard) {
+      // A Drive connection bound to this member is unbound first, in this same transaction (see
+      // `unbindGdriveConnectorMember`): the binding is a pair the foreign keys cannot clear one
+      // column at a time. A failed delete below rolls the unbinding back with it. A soft disable
+      // leaves the binding alone — the connection simply stops authorizing a disabled principal.
+      await unbindGdriveConnectorMember(admin, {
+        teamId, memberId: member.id, reason: "member-deleted", actor: opts.actor,
+      });
       const { error } = await admin.from("members").delete().eq("id", member.id);
       if (error) throw new Error(`delete member failed: ${error.message}`);
     } else {
