@@ -440,10 +440,14 @@ function readChannelMetadata(frontmatter: unknown): { status: SlackRepairChannel
  *  • scoped path, channel differs → unrelated, unless this item's own ledger or valid retained
  *    metadata names the requested source;
  *  • scoped path, channel and workspace match → `scoped_channel_match`;
- *  • scoped path, channel matches, workspace differs → an other-workspace observation only;
+ *  • scoped path, channel matches, workspace differs → an other-workspace observation only, unless
+ *    valid retained metadata names another channel or one of the item's own ledger rows is stored
+ *    under a different workspace or channel than the path states — then one conflicting entry;
  *  • legacy path, segment equals the lower-cased requested channel → `channel_candidate`;
  *  • legacy path, segment differs, valid retained metadata exactly matches → `channel_candidate`;
  *  • legacy path, segment equals a DIFFERENT valid retained channel id, lower-cased → unrelated;
+ *  • legacy path tied to the requested channel by neither segment nor metadata, with valid retained
+ *    metadata for another channel AND a ledger row from the requested source → a conflict;
  *  • every other legacy or unparseable Slack item → `unresolved_channel`.
  *
  * A path that does not parse is never repaired into one that does.
@@ -539,8 +543,17 @@ export function classifySlackRepairRelationship(input: SlackRepairRelationshipFa
     }
     if (!workspaceMatches) {
       // Another workspace's copy of this raw channel is ambiguity evidence, never a requested-workspace
-      // count — unless this item's own ledger says the requested source wrote it.
-      if (ledgerRequested) return entry("conflicting_evidence", [metadataLabel, ledgerLabel]);
+      // count. It is an OBSERVATION only while nothing stored contradicts the path, and that is decided
+      // first: valid retained metadata naming another channel, or a ledger row of this item stored under
+      // a workspace other than the path's or a channel other than the requested one (the requested
+      // source's own rows included), makes the row one conflicting entry instead — never both. A path
+      // segment is lower-case on disk, so the stored workspace is compared to it case-folded; the
+      // channel stays byte-exact.
+      const pathWorkspace = parsed.workspaceSegment.toLowerCase();
+      const ledgerContradictsPath = input.ledgerSources.some(
+        (source) => source.workspaceId.toLowerCase() !== pathWorkspace || source.channelId !== scope.channelId
+      );
+      if (metadataDiffers || ledgerContradictsPath) return entry("conflicting_evidence", [metadataLabel, ledgerLabel]);
       return notAnEntry("other_workspace", parsed.workspaceSegment);
     }
     const labels: readonly (SlackRepairEvidenceLabel | false)[] = [
@@ -576,9 +589,13 @@ export function classifySlackRepairRelationship(input: SlackRepairRelationshipFa
       true
     );
   }
+  // Neither the segment nor the retained metadata ties this item to the requested channel. Valid
+  // metadata naming ANOTHER channel beside a ledger row from the requested source is a direct
+  // contradiction between two stored facts, whatever the segment is — a conflict, not an unresolved
+  // row. No target is named: nothing but that ledger row puts the item in the requested channel.
+  if (metadataDiffers && ledgerRequested) return entry("conflicting_evidence", [ledgerLabel]);
   if (metadataDiffers && metadata.value !== null && parsed.channelSegment === metadata.value.toLowerCase()) {
-    // Path and retained metadata agree on a different channel.
-    if (ledgerRequested) return entry("conflicting_evidence", [ledgerLabel]);
+    // Path and retained metadata agree on a different channel, and no stored fact says otherwise.
     return notAnEntry("unrelated", null);
   }
   return entry("unresolved_channel", [ledgerLabel]);
@@ -784,27 +801,48 @@ function observeLedger(
   return ledger;
 }
 
-const ISO_INSTANT = /^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:[.]([0-9]{1,6}))?Z$/;
+/** The accepted endpoint syntax: UTC, whole seconds, an optional fraction of one to six digits. */
+const ISO_INSTANT =
+  /^(([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2}))(?:[.]([0-9]{1,6}))?Z$/;
 
 interface AttestedInstant {
   text: string;
-  milliseconds: number;
+  /** The fixed-width `YYYY-MM-DDTHH:MM:SS` part. Validated digits, so text order is time order. */
+  second: string;
   microseconds: number;
 }
 
+function daysInMonth(year: number, month: number): number {
+  if (month === 2) return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0 ? 29 : 28;
+  return month === 4 || month === 6 || month === 9 || month === 11 ? 30 : 31;
+}
+
+/**
+ * A stored endpoint → an attested instant, or null. The syntax alone is not enough, and neither is the
+ * platform date parser: it accepts `2024-02-30` and silently reads it as 1 March, which would attest a
+ * day nobody wrote. Every field is range-checked against the real calendar instead, and an endpoint
+ * that fails is neither reported nor rolled over.
+ */
 function readInstant(value: unknown): AttestedInstant | null {
   if (typeof value !== "string") return null;
   const match = ISO_INSTANT.exec(value);
   if (!match) return null;
-  const milliseconds = Date.parse(`${match[1]}Z`);
-  if (!Number.isFinite(milliseconds)) return null;
-  return { text: value, milliseconds, microseconds: Number((match[2] ?? "").padEnd(6, "0")) };
+  const [year, month, day, hour, minute, secondOfMinute] = [
+    match[2],
+    match[3],
+    match[4],
+    match[5],
+    match[6],
+    match[7],
+  ].map(Number);
+  if (month < 1 || month > 12) return null;
+  if (day < 1 || day > daysInMonth(year, month)) return null;
+  if (hour > 23 || minute > 59 || secondOfMinute > 59) return null;
+  return { text: value, second: match[1], microseconds: Number((match[8] ?? "").padEnd(6, "0")) };
 }
 
 function earlier(left: AttestedInstant, right: AttestedInstant): boolean {
-  return left.milliseconds !== right.milliseconds
-    ? left.milliseconds < right.milliseconds
-    : left.microseconds < right.microseconds;
+  return left.second !== right.second ? left.second < right.second : left.microseconds < right.microseconds;
 }
 
 /**
@@ -826,8 +864,9 @@ function observeParticipants(frontmatter: unknown): SlackRepairParticipantsObser
   let latest: AttestedInstant | null = null;
   for (const participant of stored as unknown[]) {
     if (!isPlainObject(participant)) continue;
-    const authorId = participant.author_id;
-    if (typeof authorId !== "string" || authorId.trim() === "") continue;
+    // An author that is not an account id is malformed evidence, not a participant: it is not counted
+    // and its endpoints are not attested. The syntax is the one the author diagnostics already apply.
+    if (!hasSlackAccountIdSyntax(participant.author_id)) continue;
     const endpoints: AttestedInstant[] = [];
     let wellFormed = true;
     for (const key of ["first_ts", "last_ts"] as const) {
@@ -989,6 +1028,17 @@ export function classifySlackRepairItem(facts: SlackRepairItemFacts): SlackRepai
 /** The existing account lookup's id-part syntax: Slack states these ids upper-case. */
 const SLACK_ID_PART = /^[A-Z0-9]+$/;
 
+/**
+ * The account-id syntax the existing lookup accepts and nothing wider: a plain legacy `USER`, or
+ * `WORKSPACE:USER`, each part upper-case alphanumeric. One rule for both uses — whether a retained
+ * participant is a participant at all, and whether an observed author is `invalid_input`.
+ */
+function hasSlackAccountIdSyntax(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const parts = value.split(":");
+  return parts.length <= 2 && parts.every((part) => SLACK_ID_PART.test(part));
+}
+
 export interface SlackRepairAuthorFacts {
   teamId: string;
   externalId: unknown;
@@ -1015,9 +1065,7 @@ export interface SlackRepairAuthorFacts {
  */
 export function classifySlackRepairAuthor(input: SlackRepairAuthorFacts): SlackRepairAuthorStatus {
   const { externalId } = input;
-  if (typeof externalId !== "string") return "invalid_input";
-  const parts = externalId.split(":");
-  if (parts.length > 2 || parts.some((part) => !SLACK_ID_PART.test(part))) return "invalid_input";
+  if (!hasSlackAccountIdSyntax(externalId)) return "invalid_input";
 
   if (input.origin === "participant_metadata") return "incomplete_provenance";
   if (input.origin !== "source_ledger") {
