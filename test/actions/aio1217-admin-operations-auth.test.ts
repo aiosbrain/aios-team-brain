@@ -16,9 +16,13 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
  *       the server resolved, every refusal, and the posture read fault.
  *   S — the two refusal shapes side by side.
  *   L — two client-supplied ids, recorded as current limits (pinned, not endorsed, not a pass).
- *   Z — the follow-up evidence this file does not supply, as executable TODOs.
+ *   M — app/actions/projects.ts#createProjectAction (continuation; see TWO MEMBER-TIER EXPORTS).
+ *   F — app/t/[team]/codebases/[slug]/actions.ts#recordFindingDecision (continuation; likewise).
+ *   Z — the follow-up evidence this file does not supply, as executable TODOs, each naming the
+ *       later batch that owns it.
  *
- * PER-EXPORT EVIDENCE RECORD. Key is `<repository path>#<export>`. Every row has the same guard —
+ * PER-EXPORT EVIDENCE RECORD. Key is `<repository path>#<export>`. Each of the five rows that
+ * follow (the two member-tier rows have their own section further down) has the same guard —
  * ADM: a session the real verifier accepts, an active same-team membership, role admin, and
  * unrestricted membership-derived posture (the team's builtin everyone row) — through
  * `requireTeamAdmin` → `resolveIntegrationsAdmin` → `resolveViewerPosture` / `canAccessAdmin`. The
@@ -79,13 +83,71 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
  * `inviteMember`, the fourth export of app/t/[team]/admin/actions.ts, is deliberately NOT exercised:
  * it is a later compensating-flow family. Its lower owners are tripwires here.
  *
+ * TWO MEMBER-TIER EXPORTS (bounded continuation; groups M and F). Neither is ADM: both go through
+ * `lib/auth/guard` `currentMember` — a session the real verifier accepts and an active membership
+ * of the team, with posture resolved by `resolveViewerPosture` — and neither policy is changed,
+ * tightened or reinterpreted here. Their real-Postgres complement is
+ * test/datamechanics/aio1217-project-finding-auth.datamechanics.test.ts; everything in THIS file is
+ * unit and recording evidence.
+ *
+ *   app/actions/projects.ts#createProjectAction
+ *     guard              MEM: session + active same-team membership. NO role and NO posture
+ *                        conjunct — an ordinary member creates, and so does an external-posture one.
+ *     admitted before    name/slug validation (before any identity read); then the cookie read, the
+ *                        server client and the `members` and `group_members` statements
+ *     refusal            { ok: false, error: "not a member of this team" }
+ *     forbidden after    the second server-client acquisition; the action's own `projects` insert;
+ *                        the creator grant (`ensurePersonSingleton`, `grantProjectToGroup`);
+ *                        `ensureProjectGraphPointer`
+ *     admitted control   an ordinary member (role member, builtin everyone row) and a valid name →
+ *                        one `projects` row for the requested team with the server-derived slug and
+ *                        kind `initiative`, then the creator singleton and grant for the
+ *                        server-resolved member, then the graph pointer — in that order — and the
+ *                        exact `{ ok, project }` result. No privileged client, audit row or
+ *                        revalidation is this action's own.
+ *     client ids         `teamId` — the team is the client's, admitted only by the caller's own
+ *                        active membership read under that id; nothing else is supplied.
+ *     cases (group M)    "admitted control: …"   "<role or posture> → admitted identically: …" (4)
+ *                        "binding: …"   "<removed conjunct> → refused as `not a member of this
+ *                        team`: …" (6)   "<fault form> after the session and active membership are
+ *                        admitted: …" (2)   "an empty or unsluggable name …"
+ *
+ *   app/t/[team]/codebases/[slug]/actions.ts#recordFindingDecision
+ *     guard              LEAD (tier=team): session + active same-team membership + role admin OR
+ *                        lead + team posture (the builtin everyone row), all three inline after
+ *                        `currentMember`
+ *     admitted before    schema validation; the server client and the `teams` read by slug — issued
+ *                        BEFORE the caller is identified, so `team not found` is reachable with no
+ *                        session (pinned as current); then the cookie read, a second server client
+ *                        and the `members` and `group_members` statements
+ *     refusal            { ok: false, error: "team leads or admins only" }
+ *     forbidden after    `getCodebaseIdentity` (its `codebases` read); the privileged client; the
+ *                        `decide_codebase_finding` rpc; the `codebase_finding.decision` audit row;
+ *                        revalidation
+ *     admitted control   an admin, and a lead, each holding the builtin everyone row, an owned
+ *                        codebase and finding → the identity read bound to the resolved team, one
+ *                        rpc carrying the resolved team, codebase and actor, one audit row,
+ *                        `/t/<slug>/codebases/<codebase>` revalidated, `{ ok: true }`
+ *     client ids         `codebaseSlug` — team-bound at the identity read (another team's slug is
+ *                        `codebase not found`). `findingId`, `ownerMemberId` — forwarded as given;
+ *                        their binding is the SQL function's own and is NOT exercised here (the rpc
+ *                        double implements none of its predicates). See the Postgres fixture.
+ *     cases (group F)    "admitted control: …" (2)   "binding: …"   "<removed membership conjunct>
+ *                        → refused as `team leads or admins only`: …" (6)   "<removed role or
+ *                        posture conjunct> → refused …" (6)   "<fault form> after the session and
+ *                        active membership are admitted: …" (2)   "after admission, a codebase slug
+ *                        only the other team holds …"   "before any identity read: …"
+ *
  * What is real, and never mocked or handed a verdict: the five exports; `lib/auth/guard`
  * `requireTeamAdmin`; `lib/auth/session` `getSessionUser`; `lib/auth/pg-session`
  * `signSession`/`verifySession` (jose HS256 against AUTH_SECRET); `lib/integrations/read`
  * `resolveIntegrationsAdmin`; `lib/access/posture` `resolveViewerPosture`; `lib/auth/admin-access`
  * `canAccessAdmin`; `lib/admin/keys` `issueApiKey`/`revokeApiKey` (node:crypto included); and
  * `lib/api/audit` `audit`. A caller is admitted only by a cookie the real verifier accepts and rows
- * the real owners read and judge themselves.
+ * the real owners read and judge themselves. For M and F, additionally real: the two exports;
+ * `lib/auth/guard` `currentMember`; `lib/ids` `slugify`; `lib/metrics/codebases`
+ * `getCodebaseIdentity` with `lib/codebases/visibility` `canSeeCodebases`; and
+ * `lib/codebases/finding-ledger` `findingDecisionSchema` and `decideCodebaseFinding`.
  *
  * The synthetic seams, all of them:
  *   SEAM cookies     `next/headers` `cookies` — async, resolves a recording store over a per-request Map.
@@ -104,7 +166,23 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
  *                    `@/lib/auth/mailer`, `@/lib/graph/company-actors`). Each records and throws.
  *                    None of the five exports reaches one today, so their zero is a tripwire, not
  *                    behavior.
+ *   SEAM member lower  (M only) `@/lib/access/groups` is the ORIGINAL module with two exports
+ *                    replaced by recording doubles — `ensurePersonSingleton`, `grantProjectToGroup`
+ *                    — so the slug constants the real posture resolver imports from it are
+ *                    untouched; `@/lib/graph/project-pointer` is replaced whole by its one export,
+ *                    `ensureProjectGraphPointer`. Each records its arguments and returns a healthy
+ *                    result. The groups single writer and the pointer writer are therefore NOT
+ *                    executed here: that is the Postgres fixture's evidence.
  * AUTH_SECRET is a synthetic value stubbed for this file and restored afterwards.
+ *
+ * THE DESK (M and F) holds the synthetic rows of three further statements, each recorded as an
+ * `effect:` — never a `read:` — so the five ADM families' ledger equalities would still show one:
+ * through the server client, the project action's own `projects` insert (returning id, slug, name)
+ * and `getCodebaseIdentity`'s `codebases` id read by team and slug; through the privileged client,
+ * the `decide_codebase_finding` rpc. The insert double mints an id and has no unique constraint;
+ * the rpc double binds the finding by (id, team, codebase) and implements none of the SQL
+ * function's own predicates. Every other write through the server client, and every other rpc,
+ * still fails a fixture premise.
  *
  * THE GUARD SUBSTRATE holds synthetic `teams`, `members`, `groups` and `group_members` rows and
  * admits exactly the three statements the owners issue: `teams` by slug (maybeSingle), `members` by
@@ -129,8 +207,13 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
  * gate admitted the call, the ledger and the vault would show it.
  *
  * Bounds of what is claimed.
- *   - Five selected exports only. Not a census, not final acceptance of any AIO-1217 criterion, and
- *     nothing about AIO-1225, AIO-1227 or AIO-1228. For AIO-1226 it records the existing limit only.
+ *   - Seven selected exports only (five ADM, two member-tier). Not a census, not final acceptance of
+ *     any AIO-1217 criterion, not the 95-action or 15-connection evidence, and nothing about
+ *     AIO-1225, AIO-1227 or AIO-1228. For AIO-1226 it records the existing limit only.
+ *   - M and F: the creator grant, the graph pointer, the `projects` unique constraint and the
+ *     decision function are doubles here. This file proves which call each export makes, for which
+ *     team and member, and that a refused caller reaches none of them — not that Postgres accepts
+ *     or constrains any of it.
  *   - UNIT AND RECORDING ONLY. Neither double is PostgreSQL or the pg adapter: no SQL, no join, no
  *     foreign key, no constraint, no concurrency. Rows are not schema-checked.
  *   - The PM, reconcile and availability doubles are wiring evidence. Provider resolution, task
@@ -146,7 +229,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
  *
  * Run status at authoring: NOT RUN. This file was written without executing vitest, tsc or any other
  * command. Its expectations come from reading the sources above, not from an observed run; replace
- * this paragraph with the observed result once it has been executed.
+ * this paragraph with the observed result once it has been executed. The M and F groups, the desk
+ * and the member-lower seam were added by a later writer under the same condition: NOT RUN.
  */
 
 const FIXTURE = "FIXTURE PREMISE FAILED (setup, not a security observation):";
@@ -168,6 +252,10 @@ const h = vi.hoisted(() => {
     recordProjectionRun: vi.fn(),
     reconcileProviderState: vi.fn(),
     getProvisioningAvailability: vi.fn(),
+    /** SEAM member lower: the creator grant's two owners and the graph pointer writer. */
+    ensurePersonSingleton: vi.fn(),
+    grantProjectToGroup: vi.fn(),
+    ensureProjectGraphPointer: vi.fn(),
     /** SEAM tripwires. */
     after: vi.fn(),
     headers: vi.fn(),
@@ -204,7 +292,15 @@ vi.mock("@/lib/admin/members", () => ({
 vi.mock("@/lib/admin/invite", () => ({ issueMemberInvite: h.inviteOwner("issueMemberInvite") }));
 vi.mock("@/lib/auth/mailer", () => ({ magicLinkAvailable: h.inviteOwner("magicLinkAvailable") }));
 vi.mock("@/lib/graph/company-actors", () => ({ syncMemberActor: h.inviteOwner("syncMemberActor") }));
+// The original module, with only the creator grant's two owners replaced.
+vi.mock("@/lib/access/groups", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/access/groups")>()),
+  ensurePersonSingleton: h.ensurePersonSingleton,
+  grantProjectToGroup: h.grantProjectToGroup,
+}));
+vi.mock("@/lib/graph/project-pointer", () => ({ ensureProjectGraphPointer: h.ensureProjectGraphPointer }));
 
+import { createProjectAction } from "@/app/actions/projects";
 import {
   getProvisioningAvailabilityAction,
   issueApiKey,
@@ -212,11 +308,14 @@ import {
   type ProvisioningAvailability,
 } from "@/app/t/[team]/admin/actions";
 import { projectBoardAction, reconcileDivergenceAction } from "@/app/t/[team]/admin/pm-sync/actions";
+import { recordFindingDecision } from "@/app/t/[team]/codebases/[slug]/actions";
 import { resolveViewerPosture, type ViewerPosture } from "@/lib/access/posture";
 import { EVERYONE_SLUG, EXTERNAL_SLUG } from "@/lib/access/system-projects";
 import { canAccessAdmin } from "@/lib/auth/admin-access";
 import { signSession, verifySession, type SessionUser } from "@/lib/auth/pg-session";
+import { findingDecisionSchema, type FindingDecision } from "@/lib/codebases/finding-ledger";
 import type { DbClient } from "@/lib/db/types";
+import { slugify } from "@/lib/ids";
 import type { ProjectionReport } from "@/lib/pm-sync";
 import type { ReconcileResult } from "@/lib/pm-sync/reconcile";
 
@@ -466,11 +565,18 @@ const GUARD_READS: Record<GuardTable, GuardRead> = {
 };
 const isGuardTable = (table: string): table is GuardTable => Object.keys(GUARD_READS).includes(table);
 
+/** The one write the server client admits: the project action's own insert, returning the new row. */
+interface ProjectInsert {
+  select(spec?: string): ProjectInsert;
+  single(): Promise<Envelope>;
+}
+
 interface GuardChain extends PromiseLike<Envelope> {
   select(spec?: string): GuardChain;
   eq(column: string, value: unknown): GuardChain;
   maybeSingle(): Promise<Envelope>;
-  insert(values: unknown): never;
+  /** Refused for every table but `projects` (the desk, below). */
+  insert(values: unknown): ProjectInsert;
   update(values: unknown): never;
   upsert(values: unknown): never;
   delete(): never;
@@ -490,6 +596,13 @@ const serverDb = {
     const run = async (terminal: Terminal): Promise<Envelope> => {
       const columns = filters.map(([column]) => column);
       const issued = `select(${String(select)}) eq(${columns.join(", ")}) ${terminal}`;
+      // The desk's one read: recorded as an effect, since it follows admission.
+      if (table === "codebases") {
+        if (select !== "id" || terminal !== "maybeSingle" || [...columns].sort().join() !== "slug,team_id") {
+          throw new Error(`${FIXTURE} unmodelled statement on ${table}: ${issued}`);
+        }
+        return codebaseIdentity(new Map(filters));
+      }
       if (!isGuardTable(table)) throw new Error(`${FIXTURE} unmodelled statement on ${table}: ${issued}`);
       const read = GUARD_READS[table];
       const sameFilters = [...columns].sort().join() === [...read.filters].sort().join();
@@ -521,7 +634,7 @@ const serverDb = {
         return chain;
       },
       maybeSingle: () => run("maybeSingle"),
-      insert: refuseWrite("insert"),
+      insert: (values) => (table === "projects" ? projectInsert(values) : refuseWrite("insert")()),
       update: refuseWrite("update"),
       upsert: refuseWrite("upsert"),
       delete: refuseWrite("delete"),
