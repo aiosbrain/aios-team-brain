@@ -537,7 +537,14 @@ describe("Slack timeline drain — one bounded restart (D2)", () => {
       tamper: (page, { attempt, page: index }) => {
         if (!attempts.includes(attempt) || index !== 1) return page;
         const days = structuredClone(page.days) as TimelineDay[];
-        for (const day of days) for (const person of day.people) person.name = "Renamed mid-drain";
+        // The second page shares the day 2024-06-20 with the first but no (day, person) pair, and the
+        // shared merger compares a person only within one day — so a rename alone conflicts with
+        // nothing here. The day's LABEL is shared presentation the merger does compare: relabelling
+        // it mid-drain is the valid-shape cross-page conflict this case is about.
+        for (const day of days) {
+          day.label = "Relabelled mid-drain";
+          for (const person of day.people) person.name = "Renamed mid-drain";
+        }
         return { ...page, days };
       },
     });
