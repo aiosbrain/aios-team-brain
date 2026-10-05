@@ -287,9 +287,11 @@ describe("inactive hydration transient backoff — exact jitter, taxonomy and sa
    * It deliberately does NOT ban the rejected values' text in general: `0`, `1`, `NaN` and `Infinity`
    * are ordinary words for describing a domain, and `must be finite and in [0, 1)` is a perfectly good
    * static message. The only renderings checked are ones already in the invalid matrix that no domain
-   * description would contain, so their presence could only be an interpolated input.
+   * description would contain, so their presence could only be an interpolated input. The ordinal
+   * matrix has none: even `9007199254740992` can legitimately appear, as the exclusive safe-integer
+   * bound, so for ordinals the whole-matrix equality stands alone.
    */
-  function expectOneStaticMessage(messages: ReadonlySet<string>, interpolationOnly: readonly string[]): void {
+  function expectOneStaticMessage(messages: ReadonlySet<string>, interpolationOnly: readonly string[] = []): void {
     expect([...messages], "one message for every rejected value").toHaveLength(1);
     const [message] = [...messages];
     expect(message.length).toBeGreaterThan(0);
@@ -297,8 +299,6 @@ describe("inactive hydration transient backoff — exact jitter, taxonomy and sa
       expect(message, `echoes ${JSON.stringify(rendering)}`).not.toContain(rendering);
     }
   }
-  /** `String(2 ** 53)`: the unsafe-integer ordinal, a number no domain description spells out. */
-  const ORDINAL_INTERPOLATION_ONLY = ["9007199254740992"];
   /** The negative sample's own digits, and what an interpolated object sample prints as. */
   const SAMPLE_INTERPOLATION_ONLY = ["-0.000001", "[object Object]"];
 
@@ -312,7 +312,7 @@ describe("inactive hydration transient backoff — exact jitter, taxonomy and sa
         messages.add(String((decision.error as Error).message));
       }
     }
-    expectOneStaticMessage(messages, ORDINAL_INTERPOLATION_ONLY);
+    expectOneStaticMessage(messages);
   });
 
   it.each(INVALID_ORDINALS.map((attempts) => [attempts]))(
@@ -329,9 +329,9 @@ describe("inactive hydration transient backoff — exact jitter, taxonomy and sa
         nothingStagedOrAdvanced();
         messages.add(String((decision.error as Error).message));
       }
-      // A static message: the rejected value is not clamped into a delay and not echoed into the error.
+      // A static message: the rejected value is not clamped into a delay. Non-echo is proved across the
+      // whole matrix by the test above, where a message that names its input cannot stay identical.
       expect(messages.size).toBe(1);
-      for (const echoed of ORDINAL_INTERPOLATION_ONLY) expect([...messages][0]).not.toContain(echoed);
     }
   );
 
@@ -435,7 +435,7 @@ describe("inactive hydration transient backoff — exact jitter, taxonomy and sa
         messages.add(String((decision.error as Error).message));
       }
     }
-    expectOneStaticMessage(messages, ORDINAL_INTERPOLATION_ONLY);
+    expectOneStaticMessage(messages);
   });
 
   it.each([[0], [-1], [1.5], [Number.NaN], [Number.POSITIVE_INFINITY], [2 ** 53], ["2"]])(

@@ -28,6 +28,8 @@ export interface SlackThreadHydratorOptions {
   readonly fetchImpl?: typeof fetch;
   readonly leaseMs?: number;
   readonly snapshotTtlMs?: number;
+  /** Jitter sampler for a transient retry: one number in `[0, 1)` per decision. Defaults to `Math.random`. */
+  readonly random?: () => number;
 }
 export type SlackThreadHydrationResult = {
   readonly outcome: "idle" | "progressed" | "deferred" | "failed" | "refused";
@@ -69,6 +71,76 @@ function merged(existing: readonly Record<string, unknown>[], page: readonly Rec
 function snapshotBytes(messages: readonly Record<string, unknown>[]): number { return Buffer.byteLength(JSON.stringify(messages), "utf8"); }
 class CheckpointRefused extends Error {}
 class SnapshotTooLarge extends Error {}
+
+/**
+ * TRANSIENT FAILURES — the closed set this module retries with jitter. It is private and deliberately
+ * repeated here rather than shared: the transport owns sanitization and the raw HTTP-to-outcome
+ * mapping, and this module owns only the retry schedule.
+ *
+ *  • every `transport_error`, whatever its diagnostic category (no answer, or an unreadable one);
+ *  • a `provider_error` the transport reported by status alone, `http_500` … `http_599` — matched on
+ *    its sanitized category, exactly and anchored, never on provider body text;
+ *  • a `provider_error` carrying one of the five transient provider codes.
+ *
+ * Everything else — unknown codes and the reachability/refusal codes — keeps the flat five minutes.
+ * The category decides the DELAY only: what is stored and returned stays the coarse outcome.
+ */
+const TRANSIENT_HTTP_STATUS = /^http_5[0-9]{2}$/;
+const TRANSIENT_PROVIDER_CODES: ReadonlySet<string> = new Set([
+  "ratelimited", "internal_error", "service_unavailable", "fatal_error", "request_timeout",
+]);
+function isTransientFailure(call: { readonly outcome: string; readonly category?: string }): boolean {
+  if (call.outcome === "transport_error") return true;
+  if (call.outcome !== "provider_error" || typeof call.category !== "string") return false;
+  return TRANSIENT_HTTP_STATUS.test(call.category) || TRANSIENT_PROVIDER_CODES.has(call.category);
+}
+
+const TRANSIENT_CAP_MS = 5 * 60_000;
+const TRANSIENT_FIRST_UPPER_MS = 2 * 60_000;
+
+/**
+ * The claim's persisted ordinal, or a static refusal. `attempts` is the row's LIFETIME claim count as
+ * the database returned it, not a count of consecutive failures; a real claim already validates the
+ * stored counter, so this guards a malformed one from being clamped into a delay. The rejected value
+ * is not quoted.
+ */
+function claimOrdinal(claim: SlackThreadClaim): number {
+  const attempts: unknown = claim.attempts;
+  if (typeof attempts !== "number" || !Number.isSafeInteger(attempts) || attempts < 1) {
+    throw new TypeError("Slack thread claim attempts must be a positive safe integer");
+  }
+  return attempts;
+}
+
+/** One sample from the injected source, or a static refusal. It is never coerced. */
+function jitterSample(random: () => number): number {
+  const sample: unknown = random();
+  if (typeof sample !== "number" || !Number.isFinite(sample) || sample < 0 || sample >= 1) {
+    throw new TypeError("Slack retry jitter sample must be a finite number in [0, 1)");
+  }
+  return sample;
+}
+
+/**
+ * Five-minute-capped, jittered backoff on the persisted claim ordinal: `[60s, 120s]` on the first
+ * lifetime claim, `[120s, 240s]` on the second, `[150s, 300s]` from the third on. The cap is applied
+ * BEFORE any exponent, so the exponent is only ever 0 or 1 and a very large ordinal cannot overflow.
+ * Past the second claim the delay is uniform jitter in the capped band and repeated failures do not
+ * lengthen it; request pressure in a sustained outage is bounded by the method budget, not by this.
+ * The sample maps onto every integer of the inclusive band (`+ 1`), and cannot exceed its upper end.
+ */
+function transientDelayMs(attempts: number, sample: number): number {
+  const upperMs = attempts >= 3 ? TRANSIENT_CAP_MS : TRANSIENT_FIRST_UPPER_MS * 2 ** (attempts - 1);
+  const lowerMs = upperMs / 2;
+  return lowerMs + Math.floor(sample * (upperMs - lowerMs + 1));
+}
+
+/**
+ * The due time for every NON-transient requeue. A parsable provider deadline keeps its precedence and
+ * its minimum, and is never shortened to the transient cap. Without one, `rate_limited` keeps its
+ * deterministic exponential fallback on the claim ordinal (up to one hour) — it is not the jittered
+ * policy and draws no sample — auth and block hold for a day, and everything else is five minutes.
+ */
 function retryDate(claim: SlackThreadClaim, category: string, providerAt?: string): Date {
   const now = Date.now();
   if (providerAt) {
@@ -76,7 +148,7 @@ function retryDate(claim: SlackThreadClaim, category: string, providerAt?: strin
     if (Number.isFinite(deadline)) return new Date(Math.max(now + (category === "rate_limited" ? 60_000 : 1_000), deadline));
   }
   const delay = category === "auth_error" || category === "blocked" ? 24 * 60 * 60_000
-    : category === "transport_error" || category === "rate_limited" ? Math.min(60 * 60_000, 60_000 * 2 ** Math.min(claim.attempts - 1, 6))
+    : category === "rate_limited" ? Math.min(60 * 60_000, 60_000 * 2 ** Math.min(claimOrdinal(claim) - 1, 6))
     : 5 * 60_000;
   return new Date(now + delay);
 }
@@ -120,6 +192,16 @@ export async function hydrateOneSlackThread(input: SlackThreadHydratorInput, opt
     const category = call.outcome === "deferred" ? "deferred" : call.outcome === "rate_limited" ? "rate_limited"
       : call.outcome === "blocked" ? "blocked" : call.outcome === "auth_error" ? "auth_error"
       : call.outcome === "transport_error" ? "transport_error" : "provider_error";
+    if (isTransientFailure(call)) {
+      // The ordinal of the claim actually held (a same-lease snapshot restart above keeps it), then
+      // exactly ONE sample. Either can throw, and deliberately does so before the release: the row
+      // stays leased as it was after the claim, the spent method reservation is not refunded, and
+      // another worker reclaims it only once the lease expires. Nothing is staged or advanced.
+      const attempts = claimOrdinal(claim);
+      // The platform sampler is looked up when the decision is made, not captured at module load.
+      const delayMs = transientDelayMs(attempts, jitterSample(options.random ?? (() => Math.random())));
+      return requeue(input, claim, category, new Date(Date.now() + delayMs));
+    }
     return requeue(input, claim, category, retryDate(claim, category, "nextPermittedAt" in call ? call.nextPermittedAt : undefined));
   }
   const page = validateSlackRepliesPage(call.page, claim.scope.rootTs, claim.pageCursor, prior?.seenCursors ?? []);
