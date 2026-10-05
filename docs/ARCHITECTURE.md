@@ -1126,13 +1126,23 @@ validate the revision, strictly purge the caches, mark it complete and advance t
 atomically. A crash releases the turn with its connection and leaves exactly the last committed batch; a
 real failure rolls its batch back and only then records `retry` with exponential backoff, in its own
 transaction; a healthy partial batch or a busy turn never counts as an attempt; a newer revision resets
-the row and a stale owner records nothing against it. A turn only CONTINUES durable work: a revision it
+the row and a stale owner records nothing against it. That record is always scoped to the revision the
+failed turn was working (read under its own turn), never to "whatever is current": the authority lock is
+free between the rollback and the record, so a newer revision may have committed — and completed — and
+it is not that failure's to mark; a turn that failed before it could read its revision records nothing.
+A turn only CONTINUES durable work: a revision it
 finds complete is a no-op, whoever calls. A repair is enqueued in exactly two ways — by the roster
 trigger on a mapping change (which records the revision as already complete when the team has nothing
 stored to repair), and by an explicit REQUEST from the manual "Re-attribute content" button or the direct
-`reattributeItems`: under the turn, in a transaction of its own that commits before the strict snapshot
-read is attempted, the revision is set back to pending with its cursor and counters cleared. Because it
-is its own commit, the request outlives a failure (or a crash) of anything after it: a failed snapshot is
+`reattributeItems`: in a transaction of its own that commits before the strict snapshot read is
+attempted, the revision is set back to pending with its cursor and counters cleared. A request is an
+enqueue, not a turn: like the trigger's write it is serialized by the identity-authority lock alone and
+never asks for the repair turn, so it cannot be answered `busy` and lost. Made while another owner is
+finalizing, it waits (one bounded lock wait) for that owner's transaction and reopens the revision it
+completed; made before a finalizer has locked, that finalizer rereads a pending row and finalizes
+nothing. Either way the request is on the authority row — the only queue — before the caller learns
+whether the turn is free, and survives a lost kick or a restart. Because it
+is its own commit, the request also outlives a failure (or a crash) of anything after it: a failed snapshot is
 recorded as `retry` on top of the cleared cursor, never on the finished scan's, so the retry revisits
 every row before it can finalize. A request reopens `complete`, `awaiting_cache` and `retry` — every
 state whose stored cursor is not a promise about the rows behind it — and leaves a scan in healthy

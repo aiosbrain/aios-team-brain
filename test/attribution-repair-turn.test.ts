@@ -20,12 +20,18 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  *   6. A bounded caller whose budget ends, or who finds the turn busy, reports `continuing` and
  *      kicks the scheduler — after commit, never as a failure.
  *   7. A turn only CONTINUES durable work. A REQUEST — the direct `reattributeItems`, the manual
- *      button — is a durable step of its own: under the turn, in a transaction of ITS OWN that
- *      commits before the strict snapshot read is attempted, the revision is set back to pending
- *      with its cursor cleared. So a snapshot failure (or a crash) after it cannot take the reset
- *      back: the failure is recorded on top of the cleared cursor and the retry scans from the
- *      start. A request reopens `complete`, `awaiting_cache` and `retry`; it leaves a scan in
- *      healthy progress alone, creates no revision, and — if it fails itself — records nothing.
+ *      button — is a durable step of its own: in a transaction of ITS OWN that commits before the
+ *      strict snapshot read is attempted, the revision is set back to pending with its cursor
+ *      cleared. So a snapshot failure (or a crash) after it cannot take the reset back: the failure
+ *      is recorded on top of the cleared cursor and the retry scans from the start. A request
+ *      reopens `complete`, `awaiting_cache` and `retry`; it leaves a scan in healthy progress
+ *      alone, creates no revision, and — if it fails itself — records nothing.
+ *   8. A request is an ENQUEUE, not a turn. It never asks for the turn and is never `busy`: it is
+ *      serialized by the identity-authority lock alone (a bounded wait), so it is on the row before
+ *      the caller learns whether the turn is free. A finalizer that held the turn when the request
+ *      was made rereads a pending row and finalizes nothing.
+ *   9. A failure is recorded against the revision the failed turn was working — read under its own
+ *      turn — and never against "whatever is current": not a newer revision, not a completed one.
  *
  * The connection below records each statement and answers from a script; the real-PostgreSQL
  * counterpart is `test/datamechanics/attribution-repair-continuation.datamechanics.test.ts`.
@@ -112,6 +118,7 @@ const isItemRowLock = (e: Entry) => e.sql === "select id,member_id,member_id_loc
 const isEligibilityRead = (e: Entry) => e.sql.includes(") as eligible from items i where");
 const isRunning = (e: Entry) => e.sql.startsWith("update team_identity_authority set repair_status='running'");
 const isReopen = (e: Entry) => e.sql.startsWith("update team_identity_authority set repair_status='pending'");
+const isLockTimeout = (value: string) => (e: Entry) => e.sql === "select set_config('lock_timeout', $1, true)" && e.params[0] === value;
 const isCursorAdvance = (e: Entry) => e.sql.startsWith("update team_identity_authority set cursor_item_id=$3");
 const isAwaitingCache = (e: Entry) => e.sql.startsWith("update team_identity_authority set repair_status='awaiting_cache'");
 const isRetry = (e: Entry) => e.sql.startsWith("update team_identity_authority set repair_status='retry'");
@@ -295,11 +302,15 @@ describe("a request is a durable step; a turn alone only continues", () => {
   function completedTeam(
     stored: { status: string; cursor: string | null },
     fail?: (entry: Entry) => Error | undefined,
+    turn: boolean[] = [true],
+    /** What an UNLOCKED routing read says, when it is older than the stored state. */
+    stalePeek?: string,
   ) {
-    const base = repository({ candidates: [[ITEM_A]] });
+    const base = repository({ candidates: [[ITEM_A]], turn });
     const connection = new ScriptedConnection((entry) => {
       const failure = fail?.(entry);
       if (failure) return failure;
+      if (stalePeek && isPeek(entry)) return [{ repair_status: stalePeek }];
       if (isReopen(entry)) {
         // The statement's own WHERE: a scan in healthy progress is not reopened.
         if (stored.status === "pending" || stored.status === "running") return [];
@@ -337,7 +348,7 @@ describe("a request is a durable step; a turn alone only continues", () => {
     expect(stored).toEqual({ status: "complete", cursor: ITEM_B });
   });
 
-  it("the DIRECT call is a request: the reopen is taken under the turn and COMMITTED on its own, before the snapshot and the scan", async () => {
+  it("the DIRECT call is a request: an enqueue COMMITTED on its own — behind the authority lock, not the turn — before the snapshot and the scan", async () => {
     const stored = { status: "complete", cursor: ITEM_B };
     const c = completedTeam(stored);
     await expect(reattributeItems(new PgClient(), TEAM, { batchSize: 25 }))
@@ -345,17 +356,19 @@ describe("a request is a durable step; a turn alone only continues", () => {
 
     const [request, snapshot, batch] = c.transactions;
     expect(c.transactions.map((t) => t.end)).toEqual(["commit", "commit", "commit"]);
+    // The request does not ask for the turn at all: it cannot be answered `busy`.
+    expect(request.work.filter(isTurnLock)).toEqual([]);
+    // It is serialized by the identity-authority lock, and its wait for that lock is bounded.
     const order = [
-      indexOf(request.work, isTurnLock),
+      indexOf(request.work, isLockTimeout("10s")),
       indexOf(request.work, isIdentityLock),
       indexOf(request.work, isReopen),
     ];
-    expect(order[0]).toBe(0);
     expect(order.every((index) => index >= 0), `missing a step: ${order}`).toBe(true);
     expect(order).toEqual([...order].sort((a, b) => a - b));
     // The request transaction is ONLY the request: the strict snapshot read — which can fail — is
     // not in it, so nothing after this commit can take the reset back.
-    expect(request.work.filter((e) => isSnapshotRead(e) || isCandidateRead(e) || isRunning(e) || isCursorAdvance(e))).toEqual([]);
+    expect(request.work.filter((e) => isSnapshotRead(e) || isOwnedReread(e) || isCandidateRead(e) || isRunning(e) || isCursorAdvance(e))).toEqual([]);
     // Each later transaction takes the turn again, first.
     expect(isTurnLock(snapshot.work[0])).toBe(true);
     expect(indexOf(snapshot.work, isSnapshotRead)).toBeGreaterThan(0);
@@ -419,6 +432,33 @@ describe("a request is a durable step; a turn alone only continues", () => {
     expect(d.log.find(isCandidateRead)!.params).toEqual([TEAM, ITEM_B, 25]);
   });
 
+  it("a failure is recorded against the revision the turn was WORKING, after its rollback — and a turn that never learned its revision records nothing", async () => {
+    const events: string[] = [];
+    const c = completedTeam({ status: "pending", cursor: null }, (entry) => (
+      isSnapshotRead(entry) ? injected("identity authority read unavailable") : undefined
+    ));
+    await expect(takeRepairScanTurn(new PgClient(), TEAM, {
+      beforeFailureRecord: async () => { events.push(`after ${c.log.at(-1)!.sql}`); },
+    })).rejects.toThrow(/read unavailable/);
+    // The window in question: the snapshot transaction is gone, nothing is held, nothing recorded.
+    expect(events).toEqual(["after rollback"]);
+    const retry = c.transactions.at(-1)!.work.find(isRetry)!;
+    // Scoped to the revision this turn read under its own turn — never "whatever is current now" —
+    // and never against a revision that has completed.
+    expect(retry.params).toEqual([TEAM, REVISION, "identity authority read unavailable"]);
+    expect(retry.sql.split(" where ")[1])
+      .toBe("team_id=$1 and revision=$2 and repair_revision=$2 and repair_status<>'complete'");
+    expect(retry.sql).not.toContain("completed_at");
+
+    // Failing before the revision could be read at all: there is nothing to scope a record to.
+    const d = completedTeam({ status: "pending", cursor: null }, (entry) => (
+      isOwnedReread(entry) ? injected("authority row unavailable") : undefined
+    ));
+    await expect(takeRepairScanTurn(new PgClient(), TEAM)).rejects.toThrow(/row unavailable/);
+    expect(d.transactions.map((t) => t.end)).toEqual(["rollback"]);
+    expect(d.log.filter(isRetry)).toEqual([]);
+  });
+
   it("a request that itself fails enqueued nothing and records nothing: it is only reported", async () => {
     const stored = { status: "complete", cursor: ITEM_B as string | null };
     const c = completedTeam(stored, (entry) => (isReopen(entry) ? injected("authority write unavailable") : undefined));
@@ -437,10 +477,44 @@ describe("a request is a durable step; a turn alone only continues", () => {
     expect(c.log.find(isCandidateRead)!.params).toEqual([TEAM, ITEM_A, 25]);
   });
 
-  it("a request that finds the turn BUSY requests nothing", async () => {
-    const c = use({ status: "complete", turn: [false] });
-    await expect(reattributeItems(new PgClient(), TEAM)).resolves.toMatchObject({ turn: "busy", scanned: 0 });
-    expect(c.log.filter((e) => isReopen(e) || isIdentityLock(e))).toEqual([]);
+  it("a request made while the turn is BUSY is still durable: the row is reopened before `busy` is ever answered, and the finalizer that held the turn finalizes nothing", async () => {
+    // Another owner holds the turn for the whole of this — it is about to finalize a finished scan.
+    const stored = { status: "awaiting_cache", cursor: ITEM_B as string | null };
+    const kicks = vi.fn();
+    onAttributionRepairKick(kicks);
+    const c = completedTeam(stored, undefined, [false]);
+    const outcome = await repairAttributionNow(new PgClient(), TEAM, "acme", { request: true, batchSize: 25 });
+    // Busy is what it is: continuing, no failure, no attempt, no backoff.
+    expect(outcome).toMatchObject({ status: "continuing", busy: true, scanned: 0 });
+    expect(c.log.filter(isRetry)).toEqual([]);
+    // But the request did not depend on that answer. It committed first, without asking for the turn…
+    const [request, refused] = c.transactions;
+    expect(c.transactions.map((t) => t.end)).toEqual(["commit", "commit"]);
+    expect(request.work.filter(isTurnLock)).toEqual([]);
+    expect(request.work.filter(isReopen)).toHaveLength(1);
+    // …and only then was the turn asked for, and refused, with nothing else done.
+    expect(refused.work.every(isTurnLock)).toBe(true);
+    expect(stored).toEqual({ status: "pending", cursor: null });
+    // The kick is an acceleration; the request no longer rests on it.
+    expect(kicks).toHaveBeenCalledTimes(1);
+
+    // The owner that held the turn decided to finalize BEFORE the request (its routing read said
+    // `awaiting_cache`). Under its own turn it rereads the row, finds it pending, and finalizes
+    // nothing: the revision is not marked complete over the request.
+    const before = c.log.length;
+    const finalizer = completedTeam(stored, undefined, [true], "awaiting_cache");
+    await expect(runAttributionRepairTurn(new PgClient(), TEAM, "acme"))
+      .resolves.toMatchObject({ status: "partial", summary: { scanned: 0, partial: true } });
+    expect(finalizer.log.filter((e) => isComplete(e) || isEpochAdvance(e) || isCachePurge("work_timeline_cache")(e))).toEqual([]);
+    expect(stored).toEqual({ status: "pending", cursor: null });
+    expect(c.log.length).toBe(before);
+
+    // Any later turn — the scheduler's, in any process — scans from the beginning.
+    const scheduled = completedTeam(stored);
+    await expect(runScheduledAttributionRepairTurn(new PgClient(), { teamId: TEAM, teamSlug: "acme" }, { batchSize: 25 }))
+      .resolves.toBe("continuing");
+    expect(scheduled.log.filter(isReopen)).toEqual([]);
+    expect(scheduled.log.find(isCandidateRead)!.params).toEqual([TEAM, null, 25]);
   });
 
   it("the bounded caller requests ONCE: its first turn reopens, every later turn only continues, and it finalizes", async () => {

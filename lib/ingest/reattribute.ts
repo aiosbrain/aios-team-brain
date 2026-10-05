@@ -8,10 +8,9 @@ import {
   beginIdentityRepairBatch,
   IdentitySnapshotChangedError,
   markIdentityRepairAwaitingCache,
-  markCurrentIdentityRepairRetry,
   markIdentityRepairRetry,
   readOwnedIdentityRepairState,
-  reopenIdentityRepair,
+  requestIdentityRepair,
   tryLockAttributionRepairTurn,
   validateIdentityAuthorityRevision,
   type IdentityAuthoritySnapshot,
@@ -188,20 +187,25 @@ export interface ReattributeOptions {
   /**
    * This call REQUESTS a repair at the current revision rather than only continuing one: a
    * revision whose scan has finished is durably reopened — committed, with its cursor reset —
-   * before anything is scanned (`reopenIdentityRepair`). The manual button and the direct
-   * `reattributeItems` request; the scheduler, the backstop and the post-mutation hooks do not,
-   * because the mutation they follow already enqueued its repair.
+   * before anything is scanned (`requestIdentityRepair`). The request is written whether or not
+   * this caller then gets the turn. The manual button and the direct `reattributeItems` request;
+   * the scheduler, the backstop and the post-mutation hooks do not, because the mutation they
+   * follow already enqueued its repair.
    */
   request?: boolean;
   /** A recorded failure's retry deadline defers the turn. The scheduler honors it; an explicit
    * manual repair does not. */
   honorRetryDeadline?: boolean;
+  /** Test-only scheduling point: the request has committed; no turn has been asked for yet. */
+  afterRequest?: () => Promise<void>;
   /** Test-only scheduling point: the snapshot is built and NOTHING is held. */
   afterSnapshot?: (revision: number) => Promise<void>;
   /** Test-only scheduling point: the turn and the identity authority are held, nothing written. */
   afterOwnership?: () => Promise<void>;
   /** Test-only scheduling point: one item's repair is written, the batch is not committed. */
   afterItem?: (itemId: string) => Promise<void>;
+  /** Test-only scheduling point: a failed turn has rolled back and its failure is not yet recorded. */
+  beforeFailureRecord?: () => Promise<void>;
 }
 
 /**
@@ -224,8 +228,9 @@ export interface ReattributeOptions {
  * By itself a turn only CONTINUES durable work: a revision it finds complete, or already scanned,
  * is left exactly as it is. With `request` a transaction of its own, before those two, reopens such
  * a revision and commits, so the scan that follows is a scan of durably pending work like any
- * other — a complete revision is never scanned as complete, and the request outlives a failure of
- * anything that comes after it.
+ * other — a complete revision is never scanned as complete. That request is an enqueue, not a
+ * turn: it does not take the turn and cannot be `busy`, so it outlives both a failure of anything
+ * that comes after it and another owner holding the turn when it is made.
  */
 export async function takeRepairScanTurn(
   db: DbClient,
@@ -237,28 +242,42 @@ export async function takeRepairScanTurn(
     scanned:0,updated:0,versionsUpdated:0,contributionsUpdated:0,revision,partial,turn,
   });
   if (opts.request) {
-    // THE REQUEST IS ITS OWN COMMIT. It is taken under the turn, like everything else here, and it
-    // is durable before the snapshot is even attempted — because the snapshot is a strict read
-    // that can fail, and a request that shared its transaction would be rolled back with it: the
-    // row would then be marked `retry` still carrying the finished scan's cursor, and the retry
-    // would scan nothing, finalize, and lift the fence over rows nobody revisited. Committed
-    // first, a failure anywhere after it — or a crash — leaves pending work that starts from the
-    // beginning, which the scheduler finds like any other. A failure of the request itself
-    // enqueued nothing and records nothing: it is simply reported.
-    const requested=await withTransaction(async () => {
-      if (!await tryLockAttributionRepairTurn(teamId)) return false;
-      await reopenIdentityRepair(teamId);
-      return true;
-    });
-    if (!requested) return nothing("busy",0,true);
+    // THE REQUEST IS ITS OWN COMMIT, AND IT IS NOT A TURN. It is durable before this caller even
+    // asks whether the turn is free (`requestIdentityRepair`), for two reasons.
+    //
+    // It must not depend on the snapshot: that is a strict read that can fail, and a request that
+    // shared its transaction would be rolled back with it — the row would then be marked `retry`
+    // still carrying the finished scan's cursor, and the retry would scan nothing, finalize, and
+    // lift the fence over rows nobody revisited.
+    //
+    // And it must not depend on the turn: another owner may hold it — finalizing — and a request
+    // answered `busy` there would leave that owner to mark the revision complete with no record
+    // that a rescan was asked for. So the request is written first, behind whoever holds the
+    // authority lock, and only then does this caller try for a turn. If the turn is busy the
+    // answer below is still `busy`; the difference is that the work is already on the authority
+    // row, where the scheduler — in any process, after any restart — finds it without being told.
+    //
+    // A failure of the request itself enqueued nothing and records nothing: it is simply reported.
+    await requestIdentityRepair(teamId);
+    await opts.afterRequest?.();
   }
   let nominated: IdentityAuthoritySnapshot | null;
+  // The revision this turn is working, as soon as it is known: a failure is recorded against that
+  // revision and no other (`markIdentityRepairRetry`).
+  const working: { revision: number | null } = { revision: null };
   try {
-    nominated=await withTransaction(async () => (
-      await tryLockAttributionRepairTurn(teamId) ? buildIdentityAuthoritySnapshot(db,teamId) : null
-    ));
+    nominated=await withTransaction(async () => {
+      if (!await tryLockAttributionRepairTurn(teamId)) return null;
+      working.revision=(await readOwnedIdentityRepairState(teamId)).revision;
+      return buildIdentityAuthoritySnapshot(db,teamId);
+    });
   } catch (error) {
-    await markCurrentIdentityRepairRetry(teamId,error).catch(()=>{});
+    // The snapshot transaction has rolled back and holds nothing. Between here and the record a
+    // mapping change can commit a newer revision — and it can be repaired to completion.
+    await opts.beforeFailureRecord?.();
+    if (working.revision !== null) {
+      await markIdentityRepairRetry(teamId,working.revision,error).catch(()=>{});
+    }
     throw error;
   }
   if (!nominated) return nothing("busy",0,true);
@@ -303,6 +322,7 @@ export async function takeRepairScanTurn(
   } catch (error) {
     // The batch has rolled back. A superseded snapshot is not a failure of the current revision.
     if (!(error instanceof IdentitySnapshotChangedError)) {
+      await opts.beforeFailureRecord?.();
       await markIdentityRepairRetry(teamId,snapshot.revision,error).catch(() => {});
     }
     throw error;
@@ -314,8 +334,8 @@ export async function takeRepairScanTurn(
  * batch per call. Calling it IS a request — it always was: a team whose revision had already been
  * marked complete (every roster change on a team with nothing yet to repair is) was scanned all the
  * same, which is how rows that predate a rule, or were stored around the attributing route, get put
- * right. The request is now a durable step of its own, taken under the turn before the scan
- * (`ReattributeOptions.request`), and a scan in progress is continued, not restarted.
+ * right. The request is now a durable step of its own, committed before the scan and whoever owns
+ * the turn (`ReattributeOptions.request`), and a scan in progress is continued, not restarted.
  */
 export async function reattributeItems(
   db: DbClient,
