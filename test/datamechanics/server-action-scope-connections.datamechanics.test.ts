@@ -203,7 +203,7 @@ type Via = "admin" | "server";
 type ScanResult = Awaited<ReturnType<typeof scanMeetingTodosAction>>;
 type DiscoverResult = Awaited<ReturnType<typeof discoverNow>>;
 
-/** Two teams, four sessions, three ingests and whole-rowset snapshots around every request. */
+/** Two teams, five sessions, three ingests and whole-rowset snapshots around every request. */
 const ROOMY = 30_000;
 
 /** One sentinel per item: lowercase alphanumerics only, so no path or title derivation rewrites it. */
@@ -236,14 +236,14 @@ const NATIVE_ERROR = "native error:";
 const UNCLASSIFIED = "unclassified";
 
 // What became of the resolver's reads, as `boundaries` reports them.
-const answered = (tables: readonly string[]): string[] => tables.map((table) => `select ${table}: ${ANSWERED}`);
+const allAnswered = (tables: readonly string[]): string[] => tables.map((table) => `select ${table}: ${ANSWERED}`);
 /** A resolution that ran to its end: all four reads answered. */
-const RESOLVED = answered(RESOLVER_LEGS);
+const RESOLVED = allAnswered(RESOLVER_LEGS);
 /** A resolution the oracle ended at "no accepted group": no grant read and no item-membership read. */
-const NO_ACCEPTED_GROUP = answered(RESOLVER_LEGS.slice(0, 2));
+const NO_ACCEPTED_GROUP = allAnswered(RESOLVER_LEGS.slice(0, 2));
 /** A resolution stopped at `leg`: the reads before it answered, and it was not sent. */
 const stoppedAt = (leg: string): string[] => [
-  ...answered(RESOLVER_LEGS.slice(0, (RESOLVER_LEGS as readonly string[]).indexOf(leg))),
+  ...allAnswered(RESOLVER_LEGS.slice(0, (RESOLVER_LEGS as readonly string[]).indexOf(leg))),
   `select ${leg}: ${FAULTED}`,
 ];
 
