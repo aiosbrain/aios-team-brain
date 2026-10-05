@@ -864,8 +864,8 @@ const CANDIDATE_SQL = `
     select * from unnest($5::text[], $6::text[], $7::uuid[]) as r(workspace_id, user_id, member_id)
   ), grouped as (
     select m.item_id, r.member_id,
-           (m.occurred_at at time zone 'UTC')::date as day,
-           max(m.occurred_at) as at,
+           (m.occurred_at at time zone 'UTC')::date as group_day,
+           max(m.occurred_at) as latest_at,
            count(*) as message_count,
            bool_or(m.is_root and m.message_ts = m.root_ts) as root_authored
       from slack_messages m
@@ -881,16 +881,16 @@ const CANDIDATE_SQL = `
        and ($8::date is null or m.occurred_at < (($8::date + 1)::timestamp at time zone 'UTC'))
      group by m.item_id, r.member_id, (m.occurred_at at time zone 'UTC')::date
   )
-  select item_id as "itemId", member_id as "memberId", to_char(day, 'YYYY-MM-DD') as day,
-         to_char(at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as at,
+  select item_id as "itemId", member_id as "memberId", to_char(group_day, 'YYYY-MM-DD') as "day",
+         to_char(latest_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "at",
          message_count::text as "messageCount", root_authored as "rootAuthored"
     from grouped
    where $8::date is null
-      or day < $8::date
-      or (day = $8::date and at < $9::timestamptz)
-      or (day = $8::date and at = $9::timestamptz and item_id > $10::uuid)
-      or (day = $8::date and at = $9::timestamptz and item_id = $10::uuid and member_id > $11::uuid)
-   order by day desc, at desc, item_id asc, member_id asc
+      or group_day < $8::date
+      or (group_day = $8::date and latest_at < $9::timestamptz)
+      or (group_day = $8::date and latest_at = $9::timestamptz and item_id > $10::uuid)
+      or (group_day = $8::date and latest_at = $9::timestamptz and item_id = $10::uuid and member_id > $11::uuid)
+   order by group_day desc, latest_at desc, item_id asc, member_id asc
    limit $12`;
 
 /**
@@ -1095,7 +1095,13 @@ export async function readSlackPersonDayPage(
 
   let payload: SlackTimelineCursorPayload | null = null;
   if (valid.cursor !== null) payload = decodeSlackTimelineCursor(valid.cursor, deps.key);
-  const admittedAt = deps.now();
+  let admittedAt: Date;
+  try {
+    admittedAt = deps.now();
+  } catch {
+    // A clock that throws is a failed trusted dependency, like any other: never a raw error.
+    return unavailable("wall clock failed");
+  }
   let window: SlackTimelineWindow;
   if (payload !== null) {
     assertSlackTimelineCursorFresh(payload, admittedAt);
