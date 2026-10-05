@@ -33,7 +33,18 @@ const GUARDED: readonly string[] = [
   "lib/ingest/slack-thread-hydrator.ts",
   "lib/ingest/slack-method-budget.ts",
   "lib/ingest/sources/slack-page-request.ts",
+  // The repair census (pure classifier + read-only reader) performs no provider request, but it is an
+  // administrative reader with NO authorization of its own and a test-only options seam. Nothing in the
+  // application may call it until an entry point that authorizes team administration exists.
+  "lib/ingest/slack-repair-census.ts",
+  "lib/ingest/slack-repair-census-read.ts",
 ];
+
+/** The guarded modules an entry point of this tree can reach, each as the import chain that got there. */
+function reachedGuarded(tree: ReadonlyMap<string, string>): string[] {
+  const via = reach(importGraph(tree), entryPoints(tree));
+  return GUARDED.filter((g) => via.has(g)).map((g) => chainTo(via, g));
+}
 
 const SPECIFIER =
   /(?:^|\n)\s*(?:import|export)\b[^'";]*?\bfrom\s*['"]([^'"]+)['"]|(?:^|\n)\s*import\s*['"]([^'"]+)['"]|\bimport\(\s*['"]([^'"]+)['"]\s*\)|\brequire\(\s*['"]([^'"]+)['"]\s*\)/g;
@@ -126,6 +137,8 @@ describe("the Slack source pipeline is not wired to anything", () => {
         `import "./sources/slack-page-request";`,
         `const h = await import("./slack-thread-hydrator");`,
         `const m = require("@/lib/ingest/slack-method-budget");`,
+        `import { classifySlackRepairItem } from "./slack-repair-census";`,
+        `export * from "@/lib/ingest/slack-repair-census-read";`,
         `import type { T } from "./not-a-real-module";`,
         `import pg from "pg";`,
         `// import { x } from "./slack-source-binding";`,
@@ -192,11 +205,62 @@ describe("the Slack source pipeline is not wired to anything", () => {
     expect(chainTo(via, "lib/ingest/slack-source-discovery.ts")).toBe("proxy.ts → lib/ingest/slack-source-discovery.ts");
   });
 
+  it("flags the repair census the moment an app/ entry point can reach it, directly or transitively", () => {
+    const READER = "lib/ingest/slack-repair-census-read.ts";
+    const PURE = "lib/ingest/slack-repair-census.ts";
+    const census: [string, string][] = [
+      [READER, `import { classifySlackRepairItem } from "./slack-repair-census";`],
+      [PURE, ""],
+    ];
+    // Control: the two modules existing, importing each other and being imported by a test is not wiring.
+    expect(
+      reachedGuarded(
+        new Map([
+          ...census,
+          ["test/datamechanics/slack-repair-census.datamechanics.test.ts", `import "@/lib/ingest/slack-repair-census-read";`],
+          ["lib/ingest/unreferenced.ts", `import { readSlackRepairCensusPage } from "./slack-repair-census-read";`],
+          ["app/api/v1/items/route.ts", `import { ingestItem } from "@/lib/ingest";`],
+          ["lib/ingest/index.ts", `export { ingestItem } from "./run";`],
+          ["lib/ingest/run.ts", ""],
+        ])
+      )
+    ).toEqual([]);
+
+    // Direct: a route (or a server action) importing the reader reaches it AND the classifier behind it.
+    const route = "app/api/v1/admin/slack-repair-census/route.ts";
+    expect(
+      reachedGuarded(new Map([...census, [route, `import { readSlackRepairCensusPage } from "@/lib/ingest/slack-repair-census-read";`]]))
+    ).toEqual([`${route} → ${READER} → ${PURE}`, `${route} → ${READER}`]);
+    const action = "app/admin/actions.ts";
+    expect(reachedGuarded(new Map([...census, [action, `const census = await import("@/lib/ingest/slack-repair-census");`]]))).toEqual([
+      `${action} → ${PURE}`,
+    ]);
+
+    // Transitive: through a relative import, and through a re-export from the ingest index — the two
+    // spellings a per-file pattern would have missed.
+    const relative = new Map([
+      ...census,
+      ["app/admin/slack/page.tsx", `import { loadCensus } from "../../../lib/admin/slack-census";`],
+      ["lib/admin/slack-census.ts", `import { readSlackRepairCensusPage } from "../ingest/slack-repair-census-read";`],
+    ]);
+    expect(reachedGuarded(relative)).toContain(`app/admin/slack/page.tsx → lib/admin/slack-census.ts → ${READER}`);
+    const reexported = new Map([
+      ...census,
+      ["app/api/v1/items/route.ts", `import { ingestItem } from "@/lib/ingest";`],
+      ["lib/ingest/index.ts", `export { readSlackRepairCensusPage } from "./slack-repair-census-read";`],
+    ]);
+    expect(reachedGuarded(reexported)).toEqual([
+      `app/api/v1/items/route.ts → lib/ingest/index.ts → ${READER} → ${PURE}`,
+      `app/api/v1/items/route.ts → lib/ingest/index.ts → ${READER}`,
+    ]);
+    // A script and a root-level file are entry points too.
+    expect(reachedGuarded(new Map([...census, ["scripts/census.ts", `import "../lib/ingest/slack-repair-census-read";`]]))).toHaveLength(2);
+    expect(reachedGuarded(new Map([...census, ["instrumentation.ts", `import "@/lib/ingest/slack-repair-census";`]]))).toEqual([
+      `instrumentation.ts → ${PURE}`,
+    ]);
+  });
+
   it("is reachable from no route, page, action, script or instrumentation entry point", () => {
-    const tree = readTree();
-    const roots = entryPoints(tree);
-    const via = reach(importGraph(tree), roots);
-    const reached = GUARDED.filter((g) => via.has(g)).map((g) => chainTo(via, g));
-    expect(reached).toEqual([]);
+    expect(reachedGuarded(readTree())).toEqual([]);
   });
 });
