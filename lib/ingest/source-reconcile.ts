@@ -5,7 +5,7 @@ import { runSql, withTransaction } from "@/lib/db/pg/pool";
 import { purgeItemIds, type PurgeResult } from "./purge";
 import {
   lockGdriveProvider,
-  lockGdriveProviders,
+  lockGdriveReconciliationSet,
   reconcileGdriveItemClaims,
   retireGdriveItemClaim,
 } from "@/lib/projects/context/gdrive-claims";
@@ -48,11 +48,13 @@ export async function stageGdriveReconciliation(
         order by provider_id`,
       [teamId, connectionId, explicit, snapshotApplied, selected],
     );
-    // Same order as Drive ingest: the connection authority (held by the route's execution commit)
-    // comes first, then EVERY provider identity this pass will touch, and only then item rows. A
-    // provider taken later, between retirements, would wait behind item rows this transaction
-    // already holds while an ingest holding that provider waits on one of them.
-    await lockGdriveProviders(teamId, rows.map((row) => row.provider_id));
+    // Same order as Drive ingest: the connection authority and audience project rows (held by the
+    // route's execution commit) come first, then EVERY provider identity this pass will touch and
+    // its mapping row, then every item-attribution advisory and the complete set of item rows, both
+    // in id order — all before the first retirement. A provider, advisory or item taken later,
+    // between retirements, would wait behind item rows this transaction already holds while an
+    // ingest or correction holding it waits on one of them.
+    await lockGdriveReconciliationSet(teamId, connectionId, rows.map((row) => row.provider_id));
     let cleanupQueued = 0;
     for (const row of rows) {
       const retired = await retireGdriveItemClaim(db, teamId, connectionId, row.provider_id, {

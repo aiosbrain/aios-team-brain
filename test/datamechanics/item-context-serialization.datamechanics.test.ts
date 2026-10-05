@@ -5,7 +5,7 @@ import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
 import { canSeeItem } from "@/lib/access/enforce";
 import { ingestItem } from "@/lib/ingest";
 import { PgClient } from "@/lib/db/pg/client";
-import { getPool } from "@/lib/db/pg/pool";
+import { getPool, withTransaction } from "@/lib/db/pg/pool";
 import type {
   DbClient,
   SqlExecutor,
@@ -18,6 +18,7 @@ import {
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { selectCandidateItemIds } from "@/lib/projects/context/backfill-candidates";
 import { reconcileItemUnit } from "@/lib/projects/context/units";
+import { lockItemContext, runContextTransaction } from "@/lib/projects/context/transaction";
 import {
   closeMembershipInto,
   ensureIncludeMembership,
@@ -89,11 +90,16 @@ function sessionClient(
   return new PgClient({ decorateSessionExecutor: decorate });
 }
 
+/**
+ * THE authoritative item read: the one statement that takes the item row lock and returns the
+ * authority columns under it. An unlocked lookup of the same row — whatever it selects — is a
+ * candidate read, and pausing or measuring on it proves nothing about serialization.
+ */
 function isItemAuthorityRead(text: string): boolean {
   const normalized = text.replace(/\s+/g, " ").trim();
   return /^select /i.test(normalized) &&
     normalized.includes("member_id_locked") &&
-    / from items where team_id = \$1 and (?:id = \$2|project_id = \$2 and path = \$3)/i.test(normalized);
+    / from items where team_id = \$1 and (?:id = \$2|project_id = \$2 and path = \$3) for update$/i.test(normalized);
 }
 
 async function observeAuthorityBlock(
@@ -576,7 +582,8 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
       const release = deferred();
       const body = changed ? `${fixture.original.body}\nserialized edit` : fixture.original.body;
       const payload = { ...fixture.original, body, content_sha256: sha(body) };
-      const waiterStarted = deferred();
+      const before = await storedState(fixture.seed, fixture.itemId);
+      const waiterOpened = deferred();
       let holderPid: number | null = null;
       let waiterPid: number | null = null;
       let holderAuthorityReadCompleted = false;
@@ -601,10 +608,10 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
         if (waiterPid === null) {
           const pid = await execute<{ pid: number }>("select pg_backend_pid() as pid");
           waiterPid = pid.rows[0]?.pid ?? null;
+          waiterOpened.resolve();
         }
         if (!attempted && isItemAuthorityRead(text)) {
           attempted = true;
-          waiterStarted.resolve();
           const result = await execute<T>(text, params);
           waiterAuthorityReadCompleted = true;
           return result;
@@ -627,7 +634,10 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
         waiter = holder === "reconcile"
           ? ingestItem(waitingDb, fixture.auth, payload, "team", undefined, "team")
           : reconcileItemContext(waitingDb, fixture.seed.teamId, fixture.itemId);
-        await within(waiterStarted.promise, "waiter to issue its authority read");
+        // Project-before-item: a contender is entitled to stop at the holder's project row and never
+        // issue its item read at all. What must hold is that it stops BEHIND the holder, on a lock
+        // acquisition, before its own authoritative read returns.
+        await within(waiterOpened.promise, "waiter to open its session");
         expect(waiterPid, "waiter backend PID was captured from its dedicated session").not.toBeNull();
 
         const observation = await observeAuthorityBlock(
@@ -644,9 +654,20 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
           observation.blockers,
           `waiter ${waiterPid} blockers while its authority SELECT was incomplete; active query: ${observation.query}`
         ).toContain(holderPid);
-        expect(observation.query, "the blocked statement is the authority SELECT, not later DML").toMatch(
-          /from items/i
-        );
+        expect(
+          observation.query,
+          "the blocked statement is a project or item row-lock acquisition, not later DML"
+        ).toMatch(/from (?:items|projects)\b[\s\S]*\bfor (?:no key )?update\b/i);
+        expect(
+          waiterAuthorityReadCompleted,
+          "the waiter has no authoritative item read while the holder is unreleased"
+        ).toBe(false);
+        // Nothing either actor decided is visible before the holder is released: the committed
+        // item, unit, placements, versions and audit trail are exactly the pre-race state.
+        expect(
+          await storedState(fixture.seed, fixture.itemId),
+          "no authoritative state or effect precedes the holder's release"
+        ).toEqual(before);
 
         release.resolve();
         const settled = await Promise.allSettled([first, waiter]);
@@ -744,7 +765,10 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
       const allowLock = deferred();
       let held = false;
       const staleStarter = sessionClient((execute) => async <T>(text: string, params: unknown[] = []) => {
-        if (!held && /pg_advisory_xact_lock/i.test(text)) {
+        // Project-before-item: the first lock an ingest takes is its source project row. The
+        // untrusted writer is stopped BEFORE that acquisition — it has read (planned) but holds
+        // nothing — so the trusted narrowing of the same project can commit ahead of it.
+        if (!held && /from projects\b[\s\S]*\bfor no key update\b/i.test(text)) {
           held = true;
           started.resolve();
           await allowLock.promise;
@@ -762,10 +786,18 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
           "external"
         )
       );
-      await within(started.promise, "untrusted ingest to reach identity lock");
-      await ingestItem(db(), fixture.auth, fixture.original, "team", undefined, "team");
-      allowLock.resolve();
-      const outcome = await untrusted;
+      let outcome: Awaited<typeof untrusted> = { result: null, error: "untrusted ingest never settled" };
+      try {
+        await within(started.promise, "untrusted ingest to reach project acquisition");
+        const narrowed = await within(
+          ingestItem(db(), fixture.auth, fixture.original, "team", undefined, "team"),
+          "trusted narrowing to commit while the untrusted writer holds no lock"
+        );
+        expect(narrowed).toMatchObject({ status: "unchanged", accessChanged: true });
+      } finally {
+        allowLock.resolve();
+        outcome = await untrusted;
+      }
       const after = await storedState(fixture.seed, fixture.itemId);
       expect(after.item.access).toBe("team");
       expect(after.item.body).toBe(fixture.original.body);
@@ -778,7 +810,7 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
     }
   );
 
-  it("A13-04: the identity lock makes concurrent first ingests observe one winner while another path progresses", async () => {
+  it("A13-04: concurrent first ingests observe one winner, the contender waits at the project row, and another project progresses", async () => {
     const seed = await seedTeam();
     const auth = { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: randomUUID() };
     const body = "one first-ingest body";
@@ -794,7 +826,12 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
     const held = deferred();
     const release = deferred();
     let paused = false;
+    let firstPid: number | null = null;
     const firstDb = sessionClient((execute) => async <T>(text: string, params: unknown[] = []) => {
+      if (firstPid === null) {
+        const pid = await execute<{ pid: number }>("select pg_backend_pid() as pid");
+        firstPid = pid.rows[0]?.pid ?? null;
+      }
       const result = await execute<T>(text, params);
       if (!paused && /pg_advisory_xact_lock/i.test(text)) {
         paused = true;
@@ -803,28 +840,80 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
       }
       return result;
     });
-    const first = ingestItem(firstDb, auth, payload, "team");
-    await within(held.promise, "first ingest to acquire identity lock");
-    const loserStarted = deferred();
-    let loserAttempted = false;
+    // Project-before-item: the first ingest holds its (new) source project row and then the path
+    // identity. A contender for the same project stops at the project boundary — it never reaches
+    // the identity lock while the winner is unreleased.
+    const loserOpened = deferred();
+    let loserPid: number | null = null;
+    let loserProjectLocked = false;
+    let loserReachedIdentity = false;
     const loserDb = sessionClient((execute) => async <T>(text: string, params: unknown[] = []) => {
-      if (!loserAttempted && /pg_advisory_xact_lock/i.test(text)) {
-        loserAttempted = true;
-        loserStarted.resolve();
+      if (loserPid === null) {
+        const pid = await execute<{ pid: number }>("select pg_backend_pid() as pid");
+        loserPid = pid.rows[0]?.pid ?? null;
+        loserOpened.resolve();
       }
-      return execute<T>(text, params);
+      if (/pg_advisory_xact_lock/i.test(text)) loserReachedIdentity = true;
+      const result = await execute<T>(text, params);
+      if (/from projects\b[\s\S]*\bfor no key update\b/i.test(text)) loserProjectLocked = true;
+      return result;
     });
-    const loser = ingestItem(loserDb, auth, payload, "team");
-    await within(loserStarted.promise, "competing ingest to issue identity lock");
-    const other = await ingestItem(
-      db(),
-      auth,
-      { ...payload, path: "different.md", body: "different", content_sha256: sha("different") },
-      "team"
-    );
-    expect(other.status).toBe("created");
-    release.resolve();
-    const results = await Promise.all([first, loser]);
+    const observer = new Client({ connectionString: process.env.DATABASE_URL });
+    let first: Promise<Awaited<ReturnType<typeof ingestItem>>> | undefined;
+    let loser: Promise<Awaited<ReturnType<typeof ingestItem>>> | undefined;
+    let results: Awaited<ReturnType<typeof ingestItem>>[] = [];
+    await observer.connect();
+    try {
+      first = ingestItem(firstDb, auth, payload, "team");
+      await within(held.promise, "first ingest to acquire identity lock");
+      loser = ingestItem(loserDb, auth, payload, "team");
+      await within(loserOpened.promise, "competing ingest to open its session");
+      const observation = await observeAuthorityBlock(
+        observer,
+        firstPid!,
+        loserPid!,
+        () => loserProjectLocked
+      );
+      expect(
+        observation.premature,
+        "the contender acquired the project while the first ingest still held it"
+      ).toBe(false);
+      expect(
+        observation.blockers,
+        `contender ${loserPid} blockers; active query: ${observation.query}`
+      ).toContain(firstPid);
+      expect(observation.query, "the contender waits on the project it shares with the winner").toMatch(
+        /projects/i
+      );
+      expect(loserReachedIdentity, "no identity lock is requested behind an unheld project").toBe(false);
+
+      // Independent progress: a different project shares no project row, identity or item with the
+      // paused winner, so its ingest completes while both same-project writers are still open.
+      const other = await within(
+        ingestItem(
+          db(),
+          auth,
+          {
+            ...payload,
+            project: "auditfix13-first-other",
+            path: "different.md",
+            body: "different",
+            content_sha256: sha("different"),
+          },
+          "team"
+        ),
+        "an ingest into another project to finish while the first is paused"
+      );
+      expect(other.status).toBe("created");
+      release.resolve();
+      results = await Promise.all([first, loser]);
+    } finally {
+      release.resolve();
+      await Promise.allSettled(
+        [first, loser].filter((actor): actor is Promise<Awaited<ReturnType<typeof ingestItem>>> => Boolean(actor))
+      );
+      await observer.end();
+    }
     expect(results.map((result) => result.status).sort()).toEqual(["created", "unchanged"]);
     const { data: items } = await db()
       .from("items")
@@ -839,7 +928,7 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
     expect(versions ?? []).toHaveLength(1);
   });
 
-  it("A13-04: opposite task-row order exercises a real deadlock and at most one whole retry", async () => {
+  it("A13-04: opposite task-row order cannot deadlock — the second writer blocks before any task DML and the result is serial", async () => {
     const seed = await seedTeam();
     const auth = { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: randomUUID() };
     const firstRows = [
@@ -874,24 +963,41 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
         pm_external_id: "A13-SECOND-A",
       },
     ];
-    const bothArrived = deferred();
-    let arrivals = 0;
-    let synchronize = true;
+    // Both ingests write the same two task rows of ONE project, in opposite order. Under
+    // item-before-project each could hold its first task row and wait for the other's: a real
+    // deadlock, resolved by one whole retry. Project-before-item removes the schedule — the second
+    // writer cannot get past the shared project row — so what is proven here is that it waits
+    // there, before any task DML, and that the outcome is the serial one. The whole-operation retry
+    // itself stays covered by the SQLSTATE injection and transaction-engine deadlock tests below.
+    const firstHeld = deferred();
+    const release = deferred();
+    const secondOpened = deferred();
     const attempts = [0, 0];
+    const taskWrites = [0, 0];
+    const pids: (number | null)[] = [null, null];
+    let secondProjectLocked = false;
+    let holding = false;
     const makeClient = (index: 0 | 1) =>
       new PgClient({
         decorateSessionExecutor: (execute) => {
           attempts[index]++;
-          let taskWrites = 0;
           return async <T>(text: string, params: unknown[] = []) => {
+            if (pids[index] === null) {
+              const pid = await execute<{ pid: number }>("select pg_backend_pid() as pid");
+              pids[index] = pid.rows[0]?.pid ?? null;
+              if (index === 1) secondOpened.resolve();
+            }
             const result = await execute<T>(text, params);
-            if (synchronize && /^insert into tasks/i.test(text.trim()) && ++taskWrites === 1) {
-              arrivals++;
-              if (arrivals === 2) {
-                synchronize = false;
-                bothArrived.resolve();
+            if (index === 1 && /from projects\b[\s\S]*\bfor no key update\b/i.test(text)) {
+              secondProjectLocked = true;
+            }
+            if (/^insert into tasks/i.test(text.trim())) {
+              taskWrites[index]++;
+              if (index === 0 && !holding) {
+                holding = true;
+                firstHeld.resolve();
+                await release.promise;
               }
-              await within(bothArrived.promise, "both task transactions to hold their first row");
             }
             return result;
           };
@@ -911,23 +1017,60 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
       } as IngestPayload;
     };
 
-    const outcomes = await within(
-      Promise.all([
-        ingestItem(makeClient(0), auth, payload("deadlock-a.md", firstRows), "team"),
-        ingestItem(makeClient(1), auth, payload("deadlock-b.md", secondRows), "team"),
-      ]),
-      "deadlock retry completion",
-      25_000
-    );
-    expect(outcomes.every((outcome) => outcome.status === "created")).toBe(true);
-    expect(Math.max(...attempts), "one deadlock victim retried the whole operation").toBe(2);
-    expect(Math.min(...attempts)).toBe(1);
-    expect(Math.max(...attempts), "retry budget is at most two total attempts").toBeLessThanOrEqual(2);
+    const observer = new Client({ connectionString: process.env.DATABASE_URL });
+    type Created = Awaited<ReturnType<typeof ingestItem>>;
+    let firstActor: Promise<Created> | undefined;
+    let secondActor: Promise<Created> | undefined;
+    let outcomes: Created[] = [];
+    await observer.connect();
+    try {
+      firstActor = ingestItem(makeClient(0), auth, payload("deadlock-a.md", firstRows), "team");
+      await within(firstHeld.promise, "the first writer to hold its first task row");
+      secondActor = ingestItem(makeClient(1), auth, payload("deadlock-b.md", secondRows), "team");
+      await within(secondOpened.promise, "the second writer to open its session");
+      const observation = await observeAuthorityBlock(
+        observer,
+        pids[0]!,
+        pids[1]!,
+        () => secondProjectLocked
+      );
+      expect(
+        observation.premature,
+        "the second writer acquired the project while the first still held it"
+      ).toBe(false);
+      expect(
+        observation.blockers,
+        `second writer ${pids[1]} blockers; active query: ${observation.query}`
+      ).toContain(pids[0]);
+      expect(observation.query, "the second writer waits at the project boundary").toMatch(/projects/i);
+      expect(taskWrites[1], "the second writer issued no task DML behind the first").toBe(0);
+      const committedTasks = await observer.query<{ id: string }>(
+        "select id from tasks where team_id = $1",
+        [seed.teamId]
+      );
+      expect(committedTasks.rows, "no task row is visible before the first writer commits").toEqual([]);
 
-    // The deadlock victim retries after the other transaction commits, so its distinct row payload
-    // is the final serialized winner. This checks both materializers, not only the item envelope.
-    const committedIndex = attempts[0] === 2 ? 0 : 1;
-    const winner = committedIndex === 0 ? firstRows : secondRows;
+      release.resolve();
+      outcomes = await within(
+        Promise.all([firstActor, secondActor]),
+        "both serialized task ingests to complete",
+        25_000
+      );
+    } finally {
+      release.resolve();
+      await Promise.allSettled(
+        [firstActor, secondActor].filter((actor): actor is Promise<Created> => Boolean(actor))
+      );
+      await observer.end();
+    }
+    expect(outcomes.every((outcome) => outcome.status === "created")).toBe(true);
+    expect(attempts, "serialized at the project row: neither writer consumed its retry").toEqual([1, 1]);
+    expect(taskWrites[1], "the second writer materialized its rows after the first committed").toBeGreaterThan(0);
+
+    // The second writer ran wholly after the first committed, so its distinct row payload is the
+    // final serialized winner. This checks both materializers, not only the item envelope.
+    const committedIndex = 1;
+    const winner = secondRows;
     const expectedByKey = new Map(winner.map((row) => [row.row_key, row]));
     const taskRead = await db()
       .from("tasks")
@@ -993,17 +1136,38 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
     }
   });
 
-  it("A13-FR1 G5: two post-link 40P01 injections exhaust retry budget and roll back task/link DML", async () => {
+  it.each([
+    { variant: "a project the ingest creates", existing: false },
+    { variant: "an existing project", existing: true },
+  ])("A13-FR1 G5: two post-link 40P01 injections exhaust retry budget and roll back task/link DML and the source-project setup ($variant)", async ({ existing }) => {
     const seed = await seedTeam();
     const suffix = randomUUID().slice(0, 8);
     const projectSlug = `auditfix13-retry-budget-${suffix}`;
     const path = `terminal-${suffix}.md`;
     const rowKey = `A13-TERMINAL-${suffix}`;
     const auth = { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: randomUUID() };
+    const priorSync = "2020-01-02T03:04:05.000Z";
+    if (existing) {
+      const { data: planted, error: plantError } = await db()
+        .from("projects")
+        .insert({ team_id: seed.teamId, slug: projectSlug })
+        .select("id")
+        .single();
+      if (plantError || !planted) throw new Error(`existing project fixture failed: ${plantError?.message}`);
+      // A project that has synced before and has no graph partition pointer yet: both writes the
+      // ingest makes to it are then real, observable row changes.
+      await getPool().query(
+        "update projects set last_synced_at = $2, graph_group_id = null where id = $1",
+        [planted.id, priorSync]
+      );
+    }
     let attempts = 0;
     let taskWrites = 0;
     let linkWrites = 0;
     let injections = 0;
+    let projectCreates = 0;
+    let syncWrites = 0;
+    let pointerWrites = 0;
     const faulted = new PgClient({
       decorateSessionExecutor: (execute) => {
         attempts++;
@@ -1011,6 +1175,9 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
         return async <T>(text: string, params: unknown[] = []) => {
           const result = await execute<T>(text, params);
           const normalized = text.replace(/\s+/g, " ").trim();
+          if (/^INSERT INTO projects /i.test(normalized) && result.rowCount === 1) projectCreates++;
+          if (/^UPDATE projects SET last_synced_at /i.test(normalized) && result.rowCount === 1) syncWrites++;
+          if (/^UPDATE projects SET graph_group_id /i.test(normalized) && result.rowCount === 1) pointerWrites++;
           if (/^INSERT INTO tasks /i.test(normalized) && result.rowCount === 1) taskWrites++;
           if (/^INSERT INTO task_pm_links /i.test(normalized) && result.rowCount === 1) {
             linkWrites++;
@@ -1072,29 +1239,54 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
       expect(outcome.result).toBeNull();
       expect(outcome.error).toMatch(/A13-FR1 injected 40P01 after task and PM-link writes/i);
 
-      const project = await observer.query<{ id: string }>(
-        "select id from projects where team_id = $1 and slug = $2",
+      // The source-project setup belongs to the publication's transaction: it really ran in BOTH
+      // attempts, and the terminal failure took all of it back.
+      expect(syncWrites, "each attempt advanced the source project's sync timestamp").toBe(2);
+      expect(pointerWrites, "each attempt set the source project's graph pointer").toBe(2);
+      const project = await observer.query<{
+        id: string;
+        // A string here: the pool's module-wide type parsers return timestamptz as text.
+        last_synced_at: string | Date | null;
+        graph_group_id: string | null;
+      }>(
+        "select id, last_synced_at, graph_group_id from projects where team_id = $1 and slug = $2",
         [seed.teamId, projectSlug]
       );
-      expect(project.rowCount, "the pre-transaction source project setup actually ran").toBe(1);
-      const projectId = project.rows[0].id;
+      if (existing) {
+        expect(projectCreates, "an existing source project is never re-created").toBe(0);
+        expect(project.rowCount, "the existing project survives the failed ingest").toBe(1);
+        const syncedAt = project.rows[0].last_synced_at;
+        expect(
+          syncedAt === null ? null : new Date(syncedAt).toISOString(),
+          "terminal failure rolls back the advanced sync timestamp"
+        ).toBe(priorSync);
+        expect(
+          project.rows[0].graph_group_id,
+          "terminal failure rolls back the graph pointer"
+        ).toBeNull();
+      } else {
+        expect(projectCreates, "each attempt created the source project in its own transaction").toBe(2);
+        expect(project.rows, "terminal failure rolls back the newly created project").toEqual([]);
+      }
+      // Scoped by team and by the test's unique path/row key rather than by project id: in the
+      // created-project variant there is no project row left to read an id from.
       const items = await observer.query<{ id: string }>(
-        "select id from items where team_id = $1 and project_id = $2 and path = $3",
-        [seed.teamId, projectId, path]
+        "select id from items where team_id = $1 and path = $2",
+        [seed.teamId, path]
       );
       const versions = await observer.query<{ id: string }>(
         `select v.id from item_versions v
           join items i on i.id = v.item_id
-         where i.team_id = $1 and i.project_id = $2 and i.path = $3`,
-        [seed.teamId, projectId, path]
+         where i.team_id = $1 and i.path = $2`,
+        [seed.teamId, path]
       );
       const tasks = await observer.query<{ id: string }>(
-        "select id from tasks where team_id = $1 and project_id = $2 and row_key = $3",
-        [seed.teamId, projectId, rowKey]
+        "select id from tasks where team_id = $1 and row_key = $2",
+        [seed.teamId, rowKey]
       );
       const links = await observer.query<{ id: string }>(
-        "select id from task_pm_links where team_id = $1 and project_id = $2 and row_key = $3",
-        [seed.teamId, projectId, rowKey]
+        "select id from task_pm_links where team_id = $1 and row_key = $2",
+        [seed.teamId, rowKey]
       );
       const afterAudit = await observer.query<{ count: string }>(
         "select count(*)::text as count from audit_log where team_id = $1",
@@ -1111,6 +1303,104 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
       await observer.end();
     }
   });
+
+  it.each([
+    { mode: "its own transaction", joined: false },
+    { mode: "a session joined to an enclosing ingest transaction", joined: true },
+  ])(
+    "A13-04: a real wait-graph deadlock in $mode is retried whole, exactly once, by the transaction engine",
+    async ({ joined }) => {
+      // The shared ingest order leaves no product schedule that deadlocks, so the engine's retry is
+      // driven directly: two context transactions take the SAME two item rows through the real
+      // locking read in opposite order. PostgreSQL's own detector picks the victim (40P01 — not an
+      // injected SQLSTATE), and the engine must rerun that whole operation once.
+      const seed = await seedTeam();
+      const auth = { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: randomUUID() };
+      const itemIds: string[] = [];
+      for (const name of ["one", "two"]) {
+        const body = `transaction-engine deadlock ${name}`;
+        const created = await ingestItem(
+          db(),
+          auth,
+          {
+            project: "auditfix13-engine-deadlock",
+            kind: "deliverable",
+            actor: "auditfix13-test",
+            frontmatter: {},
+            path: `engine-deadlock-${name}.md`,
+            body,
+            content_sha256: sha(body),
+          },
+          "team"
+        );
+        itemIds.push(created.id);
+      }
+      const bothArrived = deferred();
+      let arrivals = 0;
+      let synchronize = true;
+      const sessions = [0, 0];
+      const writes = [0, 0];
+      const run = (index: 0 | 1): Promise<1 | 2> => {
+        const client = new PgClient({
+          decorateSessionExecutor: (execute) => {
+            sessions[index]++;
+            return execute;
+          },
+        });
+        const order = index === 0 ? itemIds : [...itemIds].reverse();
+        const operation = () =>
+          runContextTransaction(client, async (session, attemptNumber) => {
+            const first = await lockItemContext(session, seed.teamId, order[0]);
+            if (!first) throw new Error("deadlock fixture item missing");
+            if (synchronize) {
+              arrivals++;
+              if (arrivals === 2) {
+                synchronize = false;
+                bothArrived.resolve();
+              }
+              await within(bothArrived.promise, "both transactions to hold their first item row");
+            }
+            const second = await lockItemContext(session, seed.teamId, order[1]);
+            if (!second) throw new Error("deadlock fixture item missing");
+            const marked = await session.executeSql(
+              `update items set frontmatter = coalesce(frontmatter, '{}'::jsonb) || $3::jsonb
+                where team_id = $1 and id = any($2::uuid[])`,
+              [seed.teamId, itemIds, JSON.stringify({ a13_engine_deadlock_writer: index })]
+            );
+            writes[index] += marked.rowCount;
+            return attemptNumber;
+          });
+        return joined ? withTransaction(operation) : operation();
+      };
+
+      const actors = [run(0), run(1)];
+      let finalAttempts: (1 | 2)[] = [];
+      try {
+        finalAttempts = await within(Promise.all(actors), "deadlock retry completion", 25_000);
+      } finally {
+        bothArrived.resolve();
+        await Promise.allSettled(actors);
+      }
+
+      expect([...finalAttempts].sort(), "the victim committed on its second attempt, the other on its first").toEqual([1, 2]);
+      expect([...sessions].sort(), "exactly one whole-operation retry was spent").toEqual([1, 2]);
+      const victim = finalAttempts[0] === 2 ? 0 : 1;
+      // Only committed work counts: the victim's first attempt never reached its write, and its
+      // retry ran after the survivor committed, so the victim is the last serialized writer.
+      expect(writes, "each transaction's write ran once, over both rows").toEqual([2, 2]);
+      const { data: marked, error: markedError } = await db()
+        .from("items")
+        .select("id, frontmatter")
+        .eq("team_id", seed.teamId)
+        .in("id", itemIds);
+      expect(markedError).toBeNull();
+      expect(marked ?? []).toHaveLength(2);
+      for (const row of (marked ?? []) as { frontmatter: Record<string, unknown> | null }[]) {
+        expect(row.frontmatter?.a13_engine_deadlock_writer).toBe(victim);
+      }
+    },
+    30_000
+  );
 
   it("A13-07: a third reader sees only the old placement until close/open commit together", async () => {
     const fixture = await seedConvergedExternalItem("auditfix13/atomic-visibility.md");

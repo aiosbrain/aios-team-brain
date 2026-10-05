@@ -121,6 +121,70 @@ export const REPLAY_SUPERSESSIONS = Object.freeze([
   },
 ].map((entry) => Object.freeze(entry)));
 
+const GDRIVE_LEGACY_SUPPRESSION_UNSCOPED = [
+  "insert into gdrive_suppressed_units(unit_id,team_id)",
+  "select u.id,u.team_id",
+  "  from project_context_units u join items i on i.team_id=u.team_id and i.id=u.source_item_id",
+  " where i.frontmatter->>'source'='gdrive'",
+  "   and not exists (",
+  "     select 1 from gdrive_item_claims c",
+  "      where c.team_id=i.team_id and c.item_id=i.id and c.active",
+  "   )",
+  "on conflict do nothing;",
+].join("\n");
+
+/**
+ * A DATA STEP superseded on replay — the second kind of supersession, same machinery.
+ *
+ * A migration may carry a one-time data step whose statement is only correct against the database
+ * it was written for. Replayed on every deploy — and on every staging restore, over a database the
+ * sanitized export has deliberately thinned — the same statement can be destructive. Such a
+ * statement is pinned and omitted exactly like an obsolete CHECK, and a later migration OWNS the
+ * step in a form that is safe to replay over populated data.
+ *
+ * @typedef {object} ReplayStepSupersession
+ * @property {string} migration     the migration file carrying the statement (pinned, immutable)
+ * @property {string} gitBlob       its git blob id — the content pin
+ * @property {string} step          the named data step whose statement here must not replay
+ * @property {string} obsoleteSql   the exact statement omitted from replay (must occur exactly once)
+ * @property {string} supersededBy  the later migration that owns the step: it must carry the
+ *                                  ownership line `-- [replay-step <step>]`
+ */
+
+/** The line an owning migration carries to declare that it performs a superseded data step. */
+export function replayStepMarker(step) {
+  return `[replay-step ${step}]`;
+}
+
+/**
+ * `gdrive_legacy_context_suppression` (AIO-1167). 20260922130000 selects "every Drive item's unit
+ * whose item has no active claim" and deletes it, to fail legacy pre-claim visibility closed. On a
+ * paired staging restore the claim tables are excluded from the export (credentials, queues and
+ * their FK dependents), so that selection is EVERY copied Drive unit and the replay deleted the
+ * claim-authorized memberships of every copied document. The selection is omitted; with nothing
+ * selected the rest of that block is inert, and 20260922135000 performs the suppression with a
+ * predicate that never reads the claim tables.
+ *
+ * @type {readonly ReplayStepSupersession[]}
+ */
+export const REPLAY_STEP_SUPERSESSIONS = Object.freeze([
+  {
+    migration: "20260922130000_gdrive_audience_claims.sql",
+    gitBlob: "9019c0836f0a0cc011abf28b79e484d9c98d890a",
+    step: "gdrive_legacy_context_suppression",
+    obsoleteSql: GDRIVE_LEGACY_SUPPRESSION_UNSCOPED,
+    supersededBy: "20260922135000_gdrive_legacy_context_suppression.sql",
+  },
+].map((entry) => Object.freeze(entry)));
+
+/** Every supersession the current tree's replay is subject to: obsolete CHECKs and data steps. */
+export const ALL_REPLAY_SUPERSESSIONS = Object.freeze([...REPLAY_SUPERSESSIONS, ...REPLAY_STEP_SUPERSESSIONS]);
+
+/** What an entry supersedes, by name: its CHECK constraint or its data step. */
+export function supersessionSubject(entry) {
+  return entry.constraint ?? entry.step;
+}
+
 /** The git blob id of a file's content — the same id `git rev-parse <rev>:<path>` prints. */
 export function gitBlobId(content) {
   const bytes = Buffer.isBuffer(content) ? content : Buffer.from(content, "utf8");
@@ -148,13 +212,14 @@ function addsConstraint(sql, constraint) {
  * @param {readonly ReplaySupersession[]} [supersessions]
  * @returns {{ sql: string, superseded: ReplaySupersession[] }}
  */
-export function effectiveMigrationSql(name, sql, supersessions = REPLAY_SUPERSESSIONS) {
+export function effectiveMigrationSql(name, sql, supersessions = ALL_REPLAY_SUPERSESSIONS) {
   const entries = supersessions.filter((entry) => entry.migration === name);
   if (entries.length === 0) return { sql, superseded: [] };
 
   const actual = gitBlobId(sql);
   let effective = sql;
   for (const entry of entries) {
+    const subject = supersessionSubject(entry);
     if (actual !== entry.gitBlob) {
       throw new Error(
         `replay plan: shipped migration ${name} has changed (blob ${actual}, pinned ${entry.gitBlob}). ` +
@@ -165,13 +230,13 @@ export function effectiveMigrationSql(name, sql, supersessions = REPLAY_SUPERSES
     const found = occurrences(effective, entry.obsoleteSql);
     if (found !== 1) {
       throw new Error(
-        `replay plan: ${name} must contain the obsolete ${entry.constraint} definition exactly once ` +
+        `replay plan: ${name} must contain the obsolete ${subject} definition exactly once ` +
         `(found ${found}); refusing to replay it unreviewed.`,
       );
     }
     effective = effective.replace(
       entry.obsoleteSql,
-      () => `-- ${SUPERSESSION_MARKER} ${entry.constraint}: obsolete definition not replayed; owned by ${entry.supersededBy}`,
+      () => `-- ${SUPERSESSION_MARKER} ${subject}: obsolete definition not replayed; owned by ${entry.supersededBy}`,
     );
   }
   return { sql: effective, superseded: entries };
@@ -198,7 +263,7 @@ export function effectiveMigrationSql(name, sql, supersessions = REPLAY_SUPERSES
  * @param {readonly ReplaySupersession[]} [supersessions]
  * @returns {{ name: string, sql: string, superseded: ReplaySupersession[] }[]}
  */
-export function effectiveReplayPlan(migrations, supersessions = REPLAY_SUPERSESSIONS) {
+export function effectiveReplayPlan(migrations, supersessions = ALL_REPLAY_SUPERSESSIONS) {
   const order = new Map(migrations.map((m, index) => [m.name, index]));
   const inForce = supersessions.filter((entry) => order.has(entry.supersededBy));
   const plan = migrations.map((m) => ({ name: m.name, ...effectiveMigrationSql(m.name, m.sql, inForce) }));
@@ -207,16 +272,28 @@ export function effectiveReplayPlan(migrations, supersessions = REPLAY_SUPERSESS
   for (const step of plan) {
     for (const entry of step.superseded) {
       const owner = byName.get(entry.supersededBy);
+      const subject = supersessionSubject(entry);
       if (order.get(owner.name) <= order.get(step.name)) {
         throw new Error(
-          `replay plan: ${entry.supersededBy} must replay AFTER ${entry.migration} to own ${entry.constraint}.`,
+          `replay plan: ${entry.supersededBy} must replay AFTER ${entry.migration} to own ${subject}.`,
         );
       }
-      if (owner.superseded.some((other) => other.constraint === entry.constraint)) {
+      if (owner.superseded.some((other) => supersessionSubject(other) === subject)) {
         throw new Error(
-          `replay plan: ${entry.supersededBy} is itself superseded for ${entry.constraint}; point ` +
-          `${entry.migration} at the migration that owns the constraint now.`,
+          `replay plan: ${entry.supersededBy} is itself superseded for ${subject}; point ` +
+          `${entry.migration} at the migration that owns it now.`,
         );
+      }
+      if (entry.step !== undefined) {
+        // A data step has no catalog object to look for, so its owner says so in as many words.
+        if (!owner.sql.includes(`-- ${replayStepMarker(entry.step)}`)) {
+          throw new Error(
+            `replay plan: ${entry.supersededBy} does not declare ownership of ${entry.step} ` +
+            `(-- ${replayStepMarker(entry.step)}), so nothing in this replay would perform it after ` +
+            `${entry.migration} stops doing so.`,
+          );
+        }
+        continue;
       }
       if (!addsConstraint(owner.sql, entry.constraint)) {
         throw new Error(

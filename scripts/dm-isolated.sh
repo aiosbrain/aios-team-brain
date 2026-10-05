@@ -79,5 +79,51 @@ if [[ -n "$fresh" ]]; then
   DATABASE_URL="$URL" npm run pg:schema
 fi
 
+# POSTGRES CLIENT TOOLS. Some specs spawn the real `pg_dump`/`pg_restore`/`psql` (the staging paired
+# restore), and `pg_dump` refuses a server newer than itself. The host's client is whatever its
+# package manager installed — not this tier's business to upgrade. When a host tool is missing or is
+# not the server's major, the tools from the server container's OWN image are used instead
+# (`scripts/dm-pg-client.sh`), through shims that exist for this run only. A matching host toolchain
+# (CI's pinned `postgresql-client-16`) is used as-is.
+#
+# No pipes: parameter expansion only, for the same SIGPIPE-under-pipefail reason as `exists` above.
+pg_major() {
+  local out
+  out="$("$@" --version 2>/dev/null)" || { printf ''; return 0; }
+  out="${out##*) }"       # "pg_dump (PostgreSQL) 16.14 (Debian …)" → "16.14 (Debian …)"
+  printf '%s' "${out%%.*}" # → "16"
+}
+SERVER_MAJOR="$(pg_major docker exec "$NAME" pg_dump)"
+if [[ -z "$SERVER_MAJOR" ]]; then
+  echo "[dm-isolated] could not read the PostgreSQL major version of $NAME"; exit 1
+fi
+SHIMS=""
+cleanup() { if [[ -n "$SHIMS" ]]; then rm -rf "$SHIMS"; fi; }
+trap cleanup EXIT
+mismatched=""
+for tool in pg_dump pg_restore psql; do
+  host_major="$(pg_major "$tool")"
+  if [[ "$host_major" != "$SERVER_MAJOR" ]]; then mismatched="${mismatched} ${tool}=${host_major:-missing}"; fi
+done
+# Also tells a spec it is running under this harness, where a usable toolchain is guaranteed — so a
+# missing or mismatched one is a failure there, never a silent skip.
+export AIOS_DM_PG_CONTAINER="$NAME"
+if [[ -n "$mismatched" ]]; then
+  export AIOS_DM_PG_HOST_PORT="$PORT"
+  # The image ID the container was created from, so the client is the server's exact build.
+  AIOS_DM_PG_IMAGE="$(docker inspect -f '{{.Image}}' "$NAME")"
+  export AIOS_DM_PG_IMAGE
+  # Node's own answer for `os.tmpdir()`: the specs create their archives beneath it.
+  AIOS_DM_PG_TMP="$(node -p 'require("node:os").tmpdir()')"
+  export AIOS_DM_PG_TMP
+  SHIMS="$(mktemp -d "${AIOS_DM_PG_TMP}/aios-dm-pgtools.XXXXXX")"
+  for tool in pg_dump pg_restore psql; do
+    printf '#!/usr/bin/env bash\nexec bash %q %q "$@"\n' "$ROOT/scripts/dm-pg-client.sh" "$tool" > "$SHIMS/$tool"
+    chmod +x "$SHIMS/$tool"
+  done
+  export PATH="$SHIMS:$PATH"
+  echo "[dm-isolated] host PostgreSQL client tools (${mismatched# }) are not server major ${SERVER_MAJOR}; using the tools in ${NAME}'s image"
+fi
+
 echo "[dm-isolated] $NAME → $URL"
 DATABASE_TEST_URL="$URL" npx vitest run --config vitest.datamechanics.config.ts "$@"
