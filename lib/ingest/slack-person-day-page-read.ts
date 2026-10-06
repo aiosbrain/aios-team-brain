@@ -218,6 +218,11 @@ const ID_BATCH = 500;
 /** A floor on the internal fetch, so a long rejected run is not scanned one group per query. */
 const FETCH_FLOOR = 64;
 const QUERY_CANCELED = "57014";
+/**
+ * The largest delay a Node timer honours and the largest `statement_timeout` PostgreSQL accepts
+ * (a signed 32-bit count of milliseconds). One more and the timer fires after a single millisecond.
+ */
+const MAX_TIMER_MS = 2_147_483_647;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -340,6 +345,8 @@ function validDependencies(dependencies: SlackPersonDayPageDependencies): ValidD
     budgets[name] = value;
   }
   if (budgets.candidateFetchSize > SLACK_PERSON_DAY_PAGE_BUDGETS.candidateFetchSize) return unavailable("page budgets are misconfigured");
+  // Refused HERE, as configuration: a longer budget is neither a deadline nor a statement timeout.
+  if (budgets.maxElapsedMs > MAX_TIMER_MS) return unavailable("page budgets are misconfigured");
 
   return {
     key,
@@ -360,6 +367,17 @@ function internalPageSize(options: SlackPersonDayPageOptions): number {
     return unavailable("internal page size is misconfigured");
   }
   return size;
+}
+
+/**
+ * The outer signal a caller supplied, or none. It is runtime input: anything but an actual
+ * `AbortSignal` — a controller, a deserialized look-alike with the two listener methods — is
+ * refused here, before a deadline is armed, a listener attached or a connection asked for.
+ */
+function outerSignal(value: unknown): AbortSignal | undefined {
+  if (value === undefined) return undefined;
+  if (!(value instanceof AbortSignal)) return unavailable("outer signal is not an AbortSignal");
+  return value;
 }
 
 // ── one page's budgets, deadline and abort ───────────────────────────────────
@@ -887,8 +905,17 @@ function validAdmission(result: unknown, request: ValidRequest): {
   }
   const admissionJson = canonicalSlackTimelineJson(result.admissionBinding);
   const sourceJson = canonicalSlackTimelineJson(result.sourceAdmissionBinding);
+  // The admission is copied out of the loader's hands in the step it arrived, and frozen: every
+  // later loader, the view key and the visibility oracle are given THIS value, whatever the loader
+  // goes on to do with the object it returned while the page awaits its next statement.
+  let admission: ContentAdmission;
+  try {
+    admission = deepFreeze(structuredClone(result.admission)) as unknown as ContentAdmission;
+  } catch {
+    return incomplete();
+  }
   return {
-    admission: result.admission as unknown as ContentAdmission,
+    admission,
     principalKey: result.principalKey,
     items,
     admissionBindingDigest: slackTimelineDigest(result.admissionBinding),
@@ -981,7 +1008,12 @@ async function capture(
     asOf: window.asOf, windowDays: window.windowDays, viewKey, signal: run.signal,
   }));
   if (presentationInput === undefined || presentationInput === null) return unavailable("presentation bundle is incomplete");
+  // Captured ONCE, in the step the bundle arrived and before anything else is awaited: an immutable
+  // copy rebuilt from its canonical bytes. That copy is what the composer renders AND what the
+  // digest binds — the loader's own graph, which it may keep and change, is never read again.
   const presentationJson = canonicalSlackTimelineJson(presentationInput);
+  const presentation = deepFreeze(JSON.parse(presentationJson) as unknown);
+  const presentationInputDigest = slackTimelineDigest(presentation);
   run.meterBytes(Buffer.byteLength(presentationJson, "utf8"));
   await snapshot.refreshTimeout();
 
@@ -1017,7 +1049,7 @@ async function capture(
     identityGeneration: identities.generations.identityGeneration,
     presentationGeneration: identities.generations.presentationGeneration,
     creditInputDigest,
-    presentationInputDigest: slackTimelineDigest(presentationInput),
+    presentationInputDigest,
   });
   run.check();
   return {
@@ -1029,8 +1061,8 @@ async function capture(
     mappings: identities.mappings,
     humanMemberIds: identities.humanMemberIds,
     generations: identities.generations,
-    // An immutable copy: the composer cannot change what the digest was computed over.
-    presentation: deepFreeze(JSON.parse(presentationJson) as unknown),
+    // The same immutable copy the digest was computed over: the composer cannot change it either.
+    presentation,
     binding,
   };
 }
@@ -1463,6 +1495,7 @@ export async function readSlackPersonDayPage(
   const deps = validDependencies(dependencies);
   const seams: SlackPersonDayPageOptions = isRecord(options) ? options : {};
   const internalSize = internalPageSize(seams);
+  const outer = outerSignal(seams.signal);
 
   let payload: SlackTimelineCursorPayload | null = null;
   if (valid.cursor !== null) payload = decodeSlackTimelineCursor(valid.cursor, deps.key);
@@ -1487,7 +1520,7 @@ export async function readSlackPersonDayPage(
   }
   const after = payload?.lastAggregateTuple ?? null;
 
-  const run = new PageRun(deps, seams.signal);
+  const run = new PageRun(deps, outer);
   try {
     // ── the evidence snapshot ──
     const evidence = await inSnapshot(run, async (snapshot) => {
@@ -1586,11 +1619,12 @@ export async function validateSlackPersonDayFinal(
   const deps = validDependencies(dependencies);
   const pinned = assertSlackTimelineBinding((input as unknown as Record<string, unknown>).binding);
   const sourceItemIds = backingIdList((input as unknown as Record<string, unknown>).initialNonSlackSourceItemIds);
+  const outer = outerSignal(isRecord(options) ? options.signal : undefined);
   const window: SlackTimelineWindow = {
     windowDays: pinned.windowDays, since: pinned.since, asOf: pinned.asOf, issuedAt: pinned.issuedAt, expiresAt: pinned.expiresAt,
   };
 
-  const run = new PageRun(deps, isRecord(options) ? options.signal : undefined);
+  const run = new PageRun(deps, outer);
   try {
     await inSnapshot(run, async (snapshot) => {
       const current = await capture(run, snapshot, deps, { ...valid, cursor: null }, window);

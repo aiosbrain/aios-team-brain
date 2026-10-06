@@ -70,6 +70,8 @@ export interface SlackTimelineDrainResult {
 
 const DRAIN_WINDOW_DAYS = 7;
 const MAX_ATTEMPTS = 2;
+/** The largest delay a platform timer honours (signed 32-bit milliseconds). One more fires after 1 ms. */
+const MAX_TIMER_MS = 2_147_483_647;
 const LOWER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 function unavailable(reason: string): never {
@@ -92,6 +94,8 @@ function resolveBudgets(overrides: unknown): SlackTimelineDrainBudgets {
     if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) return unavailable("drain budgets are misconfigured");
     budgets[key] = value;
   }
+  // A longer elapsed budget is not a deadline any timer can hold: it is refused as configuration.
+  if (budgets.maxElapsedMs > MAX_TIMER_MS) return unavailable("drain budgets are misconfigured");
   return budgets;
 }
 
@@ -221,7 +225,16 @@ export async function drainSlackTimeline(dependencies: SlackTimelineDrainDepende
     nextTuple: SlackAggregateTuple | null;
   } {
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return unavailable("page is malformed");
-    const page = raw as SlackTimelinePage;
+    // A detached deep snapshot, taken in the step the page arrived and before anything is judged or
+    // kept. The page service may retain the graph it returned and go on changing it while the next
+    // page or final validation is awaited; everything validated, merged and published from here on
+    // is this copy, which shares no object with it. The service's page is neither frozen nor kept.
+    let page: SlackTimelinePage;
+    try {
+      page = structuredClone(raw) as SlackTimelinePage;
+    } catch {
+      return unavailable("page is malformed");
+    }
     const binding = assertSlackTimelineBinding(page.binding);
     if (pinned === null && (page.window_days !== DRAIN_WINDOW_DAYS || binding.windowDays !== DRAIN_WINDOW_DAYS ||
         binding.pageSize !== pageSize)) {
@@ -239,12 +252,14 @@ export async function drainSlackTimeline(dependencies: SlackTimelineDrainDepende
       }
       if (typeof cursorPayload !== "object" || cursorPayload === null) return unavailable("page cursor cannot be verified");
     }
-    assertSlackTimelinePageProtocol({ page, requestTuple, nextTuple: cursorPayload?.lastAggregateTuple ?? null });
+    const nextTuple = cursorPayload?.lastAggregateTuple ?? null;
+    assertSlackTimelinePageProtocol({ page, requestTuple, nextTuple });
 
     // Only a well-formed, self-consistent page reaches the snapshot comparison.
     if (pinned !== null) assertSlackTimelineBindingUnchanged(pinned, binding);
     if (cursorPayload !== null) assertSlackTimelineBindingUnchanged(binding, cursorPayload);
-    return { page, binding, nextTuple: cursorPayload?.lastAggregateTuple ?? null };
+    // The validated tuple is kept across the next request as a copy: the payload is the decoder's.
+    return { page, binding, nextTuple: nextTuple === null ? null : { ...nextTuple } };
   }
 
   function backingIds(value: unknown): string[] {
