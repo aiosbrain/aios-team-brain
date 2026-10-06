@@ -2517,9 +2517,72 @@ describe("aggregate Slack page — pending work, cancellation and statement time
   async function holdWholePool(): Promise<{ pool: Pool; release: () => void }> {
     const pool = getPool();
     const held: PoolClient[] = [];
-    for (let n = 0; n < pool.options.max; n++) held.push(await pool.connect());
+    try {
+      for (let n = 0; n < pool.options.max; n++) held.push(await pool.connect());
+    } catch (error) {
+      // A checkout that fails part-way must not strand the clients already taken: hand every one
+      // back before the failure is reported, or the rest of the file runs on a starved pool.
+      for (const client of held) client.release();
+      throw error;
+    }
     let released = false;
     return { pool, release: () => { if (!released) { released = true; for (const client of held) client.release(); } } };
+  }
+
+  interface LateClient {
+    /** Every statement sent on the client between its late acquisition and its disposal. */
+    statements: string[];
+    disposed: boolean;
+    /** True when it was released WITH an error or flag, which makes the pool destroy the session. */
+    destroyed: boolean;
+  }
+
+  /**
+   * Watches the client(s) the pool hands to a WAITER while `during()` runs. pg-pool serves a queued
+   * checkout synchronously inside `release()`, so every `acquire` emitted during that call belongs to
+   * a waiter — here, the checkout the unit under test abandoned at its deadline. Each such client is
+   * instrumented before the pool gives it to its waiter, and watched until the pool sees it released.
+   */
+  function lateClients(pool: Pool): { seen: LateClient[]; during: (release: () => void) => void; stop: () => void } {
+    const seen: LateClient[] = [];
+    const tracked = new Map<PoolClient, { entry: LateClient; restore: () => void }>();
+    let serving = false;
+    const onAcquire = (client: PoolClient): void => {
+      if (!serving || tracked.has(client)) return;
+      const entry: LateClient = { statements: [], disposed: false, destroyed: false };
+      seen.push(entry);
+      const original = client.query as unknown as (...args: unknown[]) => unknown;
+      (client as unknown as { query: unknown }).query = function (this: unknown, ...args: unknown[]): unknown {
+        const first = args[0] as { text?: unknown } | string | undefined;
+        entry.statements.push(typeof first === "string" ? first : String(first?.text ?? "(statement)"));
+        return original.apply(this, args);
+      };
+      tracked.set(client, { entry, restore: () => { delete (client as unknown as { query?: unknown }).query; } });
+    };
+    const onRelease = (error: unknown, client: PoolClient): void => {
+      const watched = tracked.get(client);
+      if (!watched) return;
+      watched.entry.disposed = true;
+      watched.entry.destroyed = Boolean(error);
+      // From here the pool may hand the client to anyone: stop recording, restore the driver's method.
+      watched.restore();
+      tracked.delete(client);
+    };
+    pool.on("acquire", onAcquire);
+    pool.on("release", onRelease);
+    return {
+      seen,
+      during: (release) => {
+        serving = true;
+        try { release(); } finally { serving = false; }
+      },
+      stop: () => {
+        pool.off("acquire", onAcquire);
+        pool.off("release", onRelease);
+        for (const watched of tracked.values()) watched.restore();
+        tracked.clear();
+      },
+    };
   }
 
   /** Event-loop turns only — usable while the pool is exhausted and no round trip is possible. */
@@ -2561,6 +2624,7 @@ describe("aggregate Slack page — pending work, cancellation and statement time
     const pool = getPool();
     let hold: { release: () => void } | null = null;
     let started: { run: Watched; blocked: Promise<void> } | null = null;
+    const late = lateClients(pool);
     s.w.mono = 0;
     try {
       started = await startPhase(s, phase, { scheduleDeadline: clock.scheduleDeadline, budgets: { maxElapsedMs: BUDGET_MS } }, async () => {
@@ -2589,19 +2653,36 @@ describe("aggregate Slack page — pending work, cancellation and statement time
       for (const partial of ["days", "aggregates", "binding", "nextSlackCursor", "slackComplete"]) expect(failure).not.toHaveProperty(partial);
       expect(clock.timers.filter((t) => !t.cancelled && !t.fired), "no deadline is left armed").toEqual([]);
 
-      // Only now is a connection available. The checkout that was abandoned receives its client LATE:
-      // that client must be handed straight back (or destroyed), never used and never leaked.
-      (hold as { release: () => void } | null)?.release();
+      // Only now is a connection available. The checkout that was abandoned receives its client LATE.
+      // Ending the PROMISE on time is not enough: racing the whole transaction helper against the
+      // deadline does that too, and then lets the helper wake up on this client and run BEGIN, SET
+      // TRANSACTION and its configuration read for a page that no longer exists. So the late client
+      // itself is watched from the instant the pool serves it: it must be disposed — handed back, or
+      // destroyed — without one statement ever being sent on it.
+      const waiting = pool.waitingCount;
+      late.during(() => (hold as { release: () => void } | null)?.release());
+      expect(late.seen, "each abandoned checkout was served a client late").toHaveLength(waiting);
+      await turnsWhile(() => late.seen.some((client) => !client.disposed));
+      for (let n = 0; n < 200 && late.seen.some((client) => !client.disposed); n++) await runSql(`select 1`).catch(() => undefined);
+      for (const client of late.seen) {
+        expect(client.statements, "no statement was sent on the late client before it was disposed").toEqual([]);
+        expect(client.disposed, "the late client was disposed, not kept").toBe(true);
+      }
+
+      // And eventually: nothing waiting, nothing checked out, nothing in a transaction.
       expect(await poolSettlesClean(pool)).toEqual({ waiting: 0, checkedOut: 0, inTransaction: 0 });
       expect(run.state()).toBe(after);
       // The pool is healthy: an ordinary page reads again.
       s.w.mono = 0;
       expect((await page(s.w)).aggregates).toHaveLength(1);
     } finally {
+      // Runs after a failed assertion too: spend the budget, fire down every deadline, free the pool,
+      // give the run a bounded chance to settle, and take the instrumentation off the pool's clients.
       s.w.mono = BUDGET_MS + 1;
       clock.fireAll();
       (hold as { release: () => void } | null)?.release();
       if (started) await settlesWithin(started.run);
+      late.stop();
       for (const t of clock.timers) t.cancelled = true;
     }
   });
@@ -2613,16 +2694,37 @@ describe("aggregate Slack page — pending work, cancellation and statement time
     // The next client the pool hands out is given two seconds of server-side work FIRST, so the
     // transaction helper's own BEGIN queues behind it: acquisition succeeded, SETUP is what blocks.
     let busy: Promise<void> | null = null;
-    let busyDone = false;
+    // The statement's two possible ends are told apart: it ran to COMPLETION on the server (two
+    // seconds), or it was ABORTED because the session was destroyed under it. A safe reader may do
+    // the second at once; only waiting for the first is what the page's deadline forbids.
+    let completed = false;
+    let aborted = false;
+    const stillRunning = (): boolean => !completed && !aborted;
+    let busyClient: PoolClient | null = null;
+    // What the POOL saw happen to that one session, each event stamped with whether its statement was
+    // still running. `reusable` is a release the pool would keep for the next caller: no error passed,
+    // and the session neither closing nor unqueryable (pg-pool's own condition for removing it).
+    const handedBack: { whileBusy: boolean; reusable: boolean }[] = [];
+    const takenAgain: { whileBusy: boolean }[] = [];
     const occupy = (client: PoolClient): void => {
-      if (busy !== null) return;
-      busy = client.query(`select pg_sleep(2)`).then(() => undefined, () => undefined).then(() => { busyDone = true; });
+      if (busy === null) {
+        busyClient = client;
+        busy = client.query(`select pg_sleep(2)`).then(() => { completed = true; }, () => { aborted = true; });
+        return;
+      }
+      if (client === busyClient) takenAgain.push({ whileBusy: stillRunning() });
+    };
+    const disposed = (error: unknown, client: PoolClient): void => {
+      if (client !== busyClient) return;
+      const session = client as unknown as { _ending?: boolean; _queryable?: boolean };
+      handedBack.push({ whileBusy: stillRunning(), reusable: !error && session._ending !== true && session._queryable !== false });
     };
     let started: { run: Watched; blocked: Promise<void> } | null = null;
     s.w.mono = 0;
     try {
       started = await startPhase(s, phase, { scheduleDeadline: clock.scheduleDeadline, budgets: { maxElapsedMs: BUDGET_MS } }, async () => {
         pool.on("acquire", occupy);
+        pool.on("release", disposed);
       });
       const { run, blocked } = started;
       const first = await Promise.race([blocked.then(() => "blocked" as const), run.done]);
@@ -2639,21 +2741,41 @@ describe("aggregate Slack page — pending work, cancellation and statement time
       await turnsWhile(() => run.state().state === "pending");
       const after = run.state();
       // Ended by the deadline, not by the session finally getting round to BEGIN two seconds later.
-      expect(busyDone, "the session was still busy when the page ended").toBe(false);
+      // (Destroying the session aborts its statement; that is not the statement completing.)
+      expect(completed, "the page did not wait for the session's statement to run to completion").toBe(false);
       expect(after.state).toBe("rejected");
       expect((after as { error: Json }).error).toMatchObject({ name: "SlackTimelineError", code: "budget_exhausted" });
       expect(clock.timers.filter((t) => !t.cancelled && !t.fired), "no deadline is left armed").toEqual([]);
 
+      // The page is over and its session is mid-statement. Ending the promise must not put that
+      // session back into circulation: a reusable release now would let the next checkout share a
+      // connection that is still executing, with the helper's BEGIN queued behind it. The pool is
+      // used here, before the statement could have completed, exactly as any other caller would use
+      // it: a session wrongly put back is the one the pool hands out next.
+      expect(completed, "the statement has not completed while the pool is used again").toBe(false);
+      for (let n = 0; n < 3; n++) await runSql(`select 1`);
+
       // Let the server finish (or the destroyed session drop) its statement; this is the test's only
-      // real wait and the server bounds it. Then: nothing in a transaction, nothing checked out.
-      pool.off("acquire", occupy);
+      // real wait and the server bounds it. The observers stay on the pool until the session's fate
+      // is known: disposed at least once, after bounded round trips.
       await busy;
+      for (let n = 0; n < 200 && handedBack.length === 0; n++) await runSql(`select 1`).catch(() => undefined);
+      expect(handedBack.length, "the timed-out session was disposed").toBeGreaterThanOrEqual(1);
+      // Either its statement was over, or it was disposed destructively. Never reusable while busy…
+      expect(handedBack.filter((event) => event.whileBusy && event.reusable), "no reusable release while the session was busy").toEqual([]);
+      // …and so never handed to another checkout while busy.
+      expect(takenAgain.filter((event) => event.whileBusy), "the busy session was never acquired again").toEqual([]);
+
+      // And eventually: nothing waiting, nothing checked out, nothing in a transaction.
       expect(await poolSettlesClean(pool)).toEqual({ waiting: 0, checkedOut: 0, inTransaction: 0 });
       expect(run.state()).toBe(after);
       s.w.mono = 0;
       expect((await page(s.w)).aggregates).toHaveLength(1);
     } finally {
+      // Runs after a failed assertion too. The statement the test started is always awaited (the
+      // server bounds it at two seconds), so no query of this test outlives it on a pooled session.
       pool.off("acquire", occupy);
+      pool.off("release", disposed);
       s.w.mono = BUDGET_MS + 1;
       clock.fireAll();
       if (busy) await busy;

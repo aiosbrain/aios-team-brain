@@ -994,11 +994,22 @@ describe("Slack timeline page contract — merge classification", () => {
     for (const placement of ["other", "task"] as const) {
       // A count above the rendered rows is a cap; a bare date is how a meeting is dated. Neither is malformed.
       const existing = existingWith([pr("g1"), pr("m1", { source: "meetings", kind: "meeting", at: "2024-06-20" })], placement);
-      (existing[0].people[0][placement === "other" ? "other" : "tasks"][0] as { count?: number }).count = 9;
+      // The cap is set on the SOURCE GROUP that holds the rows: the unlinked group, or the group
+      // nested under the task — not on the task that contains it.
+      const capped = placement === "other" ? existing[0].people[0].other[0] : existing[0].people[0].tasks[0].sources[0];
+      expect(capped.source, placement).toBe("github");
+      expect(capped.items, placement).toHaveLength(2);
+      capped.count = 9;
       expect(() => c.assertAssembledSlackDays({ aggregates: [], days: existing })).not.toThrow();
       const merged = c.mergeSlackTimelineDays(existing, continuation([row(a1)]));
       expect(JSON.stringify(merged)).toContain('"g1"');
       expect(JSON.stringify(merged)).toContain('"m1"');
+      // The capped group came through the merge as it was: two rendered rows, a count of nine.
+      const mergedPerson = merged[0].people[0];
+      const mergedGroup = (placement === "other" ? mergedPerson.other : mergedPerson.tasks[0].sources)
+        .find((group: { source: string }) => group.source === "github");
+      expect(mergedGroup, placement).toMatchObject({ source: "github", count: 9 });
+      expect(mergedGroup.items, placement).toHaveLength(2);
       // A well-formed page that DISAGREES with it is still a restart, exactly as before.
       const conflict = [day("2024-06-20", [person(MEMBER_A, { other: [slackGroup([row(a1)])] as never })], "Another label")];
       await expectFailure(() => c.mergeSlackTimelineDays(existing, conflict), "restart_required");
