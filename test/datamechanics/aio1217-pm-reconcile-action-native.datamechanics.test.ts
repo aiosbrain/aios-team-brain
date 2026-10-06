@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
+import { appendFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PgClient } from "@/lib/db/pg/client";
 import { getPool, runSql } from "@/lib/db/pg/pool";
@@ -120,6 +121,20 @@ import { db, placeMemberByTier, seedTeam, type Seed } from "./helpers";
  *                    read for another Linear team; a request carrying, anywhere in its URL, headers
  *                    or body, the other team's synthetic secret or its Linear team id.
  *   SEAM tripwire    `next/headers` `headers`. Records and throws.
+ *   SEAM record      `node:fs` `appendFileSync`, real and write-only, reached by nothing the action
+ *                    calls. With `AIO1217_E4_RECORD_DIR` unset, nothing is written. Set, each request
+ *                    appends ONE JSON line to `requests.jsonl` in that directory — after the call
+ *                    settled, every seam above was detached and the `after` snapshot was read, and
+ *                    before any premise or assertion reads the observation: the ISO instants this
+ *                    process read just before the call was started and just after its seams were
+ *                    detached, how the call settled, the acquisition counts, the seams' call counts,
+ *                    the revalidation arguments, the whole trace, every statement either client
+ *                    issued with its bound parameters, every statement Postgres refused, every
+ *                    transport violation, and both whole-rowset snapshots of the ten tables (the
+ *                    stored synthetic ciphertexts among them). It issues no SQL and no `fetch`, calls
+ *                    no mock and adds nothing to the trace; a line that cannot be written fails the
+ *                    request as a fixture premise. It is a JSON rendering: a key holding `undefined`
+ *                    is not in it. It names no test: the snapshots identify the cell.
  *
  * ASSUMED, NOT READ. `lib/pm-sync/linear-client.ts` — `linearGraphql` — is outside this slice's read
  * list. Two things about it are taken from elsewhere and would fail loudly here if wrong: that the
@@ -1256,6 +1271,22 @@ async function settle(start: () => Promise<unknown>): Promise<Settled> {
   }
 }
 
+/**
+ * SEAM record: appends what a request did as one JSON line, before any premise or assertion reads
+ * it. Write-only; with `AIO1217_E4_RECORD_DIR` unset, nothing is written.
+ */
+function recordRequest(entry: Row): void {
+  const dir = process.env.AIO1217_E4_RECORD_DIR;
+  if (!dir) return;
+  try {
+    appendFileSync(`${dir}/requests.jsonl`, `${JSON.stringify(entry)}\n`);
+  } catch (error) {
+    throw new Error(
+      `${FIXTURE} the request record could not be written: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 /** How often each seam was called since the request began, read off its own call log. */
 const seamCalls = (): Record<string, number> =>
   Object.fromEntries(
@@ -1279,6 +1310,7 @@ async function request(session: string | null, action: () => Promise<unknown>): 
 
   const before = await durable();
   for (const seam of Object.values(SEAMS)) seam.mockClear();
+  const startedAt = new Date().toISOString();
   let outcome: Settled;
   try {
     inFlight = flight;
@@ -1297,7 +1329,24 @@ async function request(session: string | null, action: () => Promise<unknown>): 
     h.adminDb = null;
     h.serverDb = null;
   }
+  const endedAt = new Date().toISOString();
   const after = await durable();
+
+  // SEAM record: the whole observation, before any premise or assertion below can throw it away.
+  recordRequest({
+    startedAt,
+    endedAt,
+    outcome,
+    acquired,
+    seams,
+    revalidated,
+    trace: flight.trace,
+    bound: flight.bound,
+    refused: flight.refused,
+    violations: flight.violations,
+    before,
+    after,
+  });
 
   // The owner reads no `error` off its link statements and the audit writer swallows a failed insert.
   premise("no statement the request issued was refused by Postgres", flight.refused, []);
