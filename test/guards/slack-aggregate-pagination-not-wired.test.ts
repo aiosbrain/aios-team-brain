@@ -307,6 +307,40 @@ describe("the aggregate Slack pagination packet touches no PR 743 path", () => {
     ]) expect(PR743_PINNED_PATHS, owned).toContain(owned);
   });
 
+  /** The fenced path list under a specification's "Pinned PR743 path list" heading, one path per line. */
+  const pinnedListOf = (specification: string): string[] | null => {
+    const heading = specification.indexOf("### Pinned PR743 path list");
+    if (heading < 0) return null;
+    const block = /```text\n([\s\S]*?)\n```/.exec(specification.slice(heading));
+    return block ? block[1].split("\n") : null;
+  };
+  const TRACKED_SPEC = "docs/design/slack-aggregate-pagination-spec.md";
+
+  // UNCONDITIONAL, and against the TRACKED specification. The earlier form compared the fixture with
+  // an ignored working copy and ran only where that copy happened to exist — so in CI, and in any
+  // fresh clone, nothing tied the fixture to the accepted list at all (Stage 4 review).
+  it("matches the tracked specification's pinned list exactly, always", () => {
+    expect(existsSync(join(ROOT, TRACKED_SPEC)), `${TRACKED_SPEC} is tracked beside the code it governs`).toBe(true);
+    const listed = pinnedListOf(readFileSync(join(ROOT, TRACKED_SPEC), "utf8"));
+    expect(listed, "the specification's pinned list is a fenced text block under its heading").not.toBeNull();
+    expect(listed).toHaveLength(226);
+    expect(listed).toEqual([...PR743_PINNED_PATHS]);
+    // The specification names the same pinned head the fixture was transcribed at.
+    expect(readFileSync(join(ROOT, TRACKED_SPEC), "utf8")).toContain(PR743_PINNED_HEAD);
+    // The tracked specification is not itself one of the frozen paths, and neither is this guard.
+    expect(pr743Intersection({ changedPaths: [TRACKED_SPEC], pinnedPaths: PR743_PINNED_PATHS })).toEqual([]);
+  });
+
+  it("reads a pinned list only from under its heading, and reports a missing one instead of an empty match (control)", () => {
+    expect(pinnedListOf("# spec\n\n### Pinned PR743 path list\n\n```text\na.ts\nb/c.ts\n```\n")).toEqual(["a.ts", "b/c.ts"]);
+    // A fenced block BEFORE the heading is not the list; no heading, or no block after it, is no list.
+    expect(pinnedListOf("```text\nearlier.ts\n```\n\n### Pinned PR743 path list\n\n```text\na.ts\n```\n")).toEqual(["a.ts"]);
+    expect(pinnedListOf("```text\na.ts\n```\n")).toBeNull();
+    expect(pinnedListOf("### Pinned PR743 path list\n\nno fenced block follows\n")).toBeNull();
+  });
+
+  // Where the ignored working copy of the specification also exists, it must agree as well. This is
+  // local parity only; the tracked check above is the one that binds.
   it.runIf(existsSync(join(ROOT, ".context/aio-1170-resume/slack-aggregate-pagination-astra-spec.md")))(
     "matches the accepted specification's list exactly, where that ignored artifact is present",
     () => {
