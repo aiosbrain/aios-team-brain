@@ -595,9 +595,8 @@ function validTaskShape(task: unknown): task is TaskGroup {
 
 const SLACK_ROW_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/;
 
-function validSlackRow(item: unknown): item is EvidenceItem {
-  if (!isRecord(item) || !nonempty(item.id) || !nonempty(item.title) || item.source !== "slack" || !nonempty(item.kind) ||
-      typeof item.at !== "string" || !SLACK_ROW_INSTANT.test(item.at) || Number.isNaN(Date.parse(item.at))) return false;
+/** The optional fields of an evidence row of ANY source: absent, or exactly their declared type. */
+function validRowOptions(item: Record<string, unknown>): boolean {
   if (item.url !== undefined && typeof item.url !== "string") return false;
   if (item.linkVia !== undefined && !["commit-text", "pr", "inferred"].includes(item.linkVia as string)) return false;
   if (item.via !== undefined && item.via !== "submitter") return false;
@@ -606,11 +605,35 @@ function validSlackRow(item: unknown): item is EvidenceItem {
   return isRecord(linked) && nonempty(linked.key) && nonempty(linked.title) && typeof linked.status === "string";
 }
 
+function validSlackRow(item: unknown): item is EvidenceItem {
+  if (!isRecord(item) || !nonempty(item.id) || !nonempty(item.title) || item.source !== "slack" || !nonempty(item.kind) ||
+      typeof item.at !== "string" || !SLACK_ROW_INSTANT.test(item.at) || Number.isNaN(Date.parse(item.at))) return false;
+  return validRowOptions(item);
+}
+
+/**
+ * A rendered row of any source but Slack. The shared merger copies these rows and sorts them by
+ * `at` and `id` without looking at them, so their shape is judged HERE: a record with a string
+ * identity, title, kind and time, belonging to the group that holds it. `at` is only required to be
+ * a string — a meeting is dated by a bare day, and the builder's undated row carries an empty one.
+ */
+function validNonSlackRow(item: unknown, source: string): item is EvidenceItem {
+  if (!isRecord(item) || !nonempty(item.id) || typeof item.title !== "string" || item.source !== source ||
+      typeof item.kind !== "string" || typeof item.at !== "string") return false;
+  return validRowOptions(item);
+}
+
 function validInitialGroups(groups: unknown): groups is SourceGroup[] {
   if (!Array.isArray(groups)) return false;
   for (const group of groups) {
     if (!isRecord(group) || !nonempty(group.source) || !isCount(group.count) || !Array.isArray(group.items)) return false;
-    if (group.source === "slack" && (group.count !== group.items.length || !group.items.every(validSlackRow))) return false;
+    const source = group.source;
+    if (source === "slack") {
+      if (group.count !== group.items.length || !group.items.every(validSlackRow)) return false;
+    } else if (!group.items.every((item) => validNonSlackRow(item, source))) {
+      // Rows only: `count` may exceed them, because every other source is capped for rendering.
+      return false;
+    }
   }
   return true;
 }

@@ -365,12 +365,13 @@ function internalPageSize(options: SlackPersonDayPageOptions): number {
 // ── one page's budgets, deadline and abort ───────────────────────────────────
 
 /**
- * The shared budget state of one page (or one final validation). Every opaque wait is raced
- * against a single deadline; when it fires, the signal handed to the loaders is aborted and the
- * pending wait rejects at once, so the enclosing transaction rolls back and releases its connection
- * without waiting for the abandoned work. The first budget failure observed is remembered: a
- * dependency that swallows it (the access adapter returns an error envelope) cannot turn it into a
- * different outcome, or into a result.
+ * The shared budget state of one page (or one final validation). Every wait — an opaque loader, a
+ * pool checkout, a single driver statement — is raced against a single deadline; when it fires, the
+ * signal handed to the loaders is aborted, every registered canceller runs (a snapshot transaction
+ * destroys its connection there) and the pending wait rejects at once, without waiting for the
+ * abandoned work. The first budget failure observed is remembered: a dependency that swallows it
+ * (the access adapter returns an error envelope) cannot turn it into a different outcome, or into a
+ * result. A failed clock is remembered the same way.
  */
 class PageRun {
   readonly signal: AbortSignal;
@@ -380,9 +381,12 @@ class PageRun {
   private readonly deadline: Promise<never>;
   private readonly cancelDeadline: () => void;
   private readonly detach: () => void;
+  private readonly cancellers = new Set<() => void>();
   private rejectDeadline: (error: SlackTimelineError) => void = () => undefined;
   private finished = false;
+  private expired = false;
   private budgetFailure: SlackTimelineError | null = null;
+  private clockFailure: SlackTimelineError | null = null;
   private rows = 0;
   private bytes = 0;
 
@@ -395,8 +399,16 @@ class PageRun {
     const expire = (): void => {
       if (this.finished) return; // a deadline that fires after the page settled is inert
       this.finished = true;
+      this.expired = true;
       const failure = this.exhausted("page exceeded its elapsed budget while work was pending");
       this.controller.abort();
+      for (const cancel of [...this.cancellers]) {
+        try {
+          cancel();
+        } catch {
+          // A canceller disposes of a connection; nothing it throws may keep the deadline from ending the page.
+        }
+      }
       this.rejectDeadline(failure);
     };
     let cancel: unknown;
@@ -417,16 +429,25 @@ class PageRun {
     this.detach = () => outer?.removeEventListener("abort", expire);
   }
 
-  /** One monotonic reading. A clock that throws or misreports is a failed dependency, never a raw error. */
+  /**
+   * One monotonic reading. A clock that throws or misreports is a failed dependency, never a raw
+   * error — and it stays failed: a dependency that swallowed the failure cannot continue the page.
+   */
   private clock(): number {
+    if (this.clockFailure) throw this.clockFailure;
     let value: unknown;
+    let reason: string | null = null;
     try {
       value = this.deps.monotonicNow();
     } catch {
-      return unavailable("monotonic clock failed");
+      reason = "monotonic clock failed";
     }
-    if (typeof value !== "number" || !Number.isFinite(value)) return unavailable("monotonic clock is misconfigured");
-    return value;
+    if (reason === null && (typeof value !== "number" || !Number.isFinite(value))) reason = "monotonic clock is misconfigured";
+    if (reason !== null) {
+      this.clockFailure = new SlackTimelineError("unavailable", reason);
+      throw this.clockFailure;
+    }
+    return value as number;
   }
 
   /** A budget failure carrying counters only. The first one observed is the one reported. */
@@ -443,6 +464,7 @@ class PageRun {
 
   /** Milliseconds of budget left, after one clock reading. Throws when the budget is spent. */
   remaining(): number {
+    if (this.clockFailure) throw this.clockFailure;
     if (this.budgetFailure) throw this.budgetFailure;
     const elapsed = this.clock() - this.startedAt;
     if (elapsed > this.deps.budgets.maxElapsedMs) throw this.exhausted("page exceeded its elapsed budget");
@@ -454,14 +476,53 @@ class PageRun {
     this.remaining();
   }
 
-  meterRows(rows: readonly unknown[]): void {
-    this.rows += rows.length;
-    let bytes = 0;
+  /**
+   * True while the deadline has neither fired nor been passed on the clock — whatever ELSE has
+   * failed. It is what a rollback asks: a page refused for its rows still has time to end its
+   * transaction properly; a page whose time is gone does not. Never throws, records no failure.
+   */
+  hasTime(): boolean {
+    if (this.expired) return false;
     try {
-      bytes = Buffer.byteLength(JSON.stringify(rows) ?? "", "utf8");
+      return this.clock() - this.startedAt <= this.deps.budgets.maxElapsedMs;
     } catch {
-      bytes = 0;
+      return false;
     }
+  }
+
+  /** True once the deadline fired or the outer signal aborted. It never becomes false again. */
+  get cancelled(): boolean {
+    return this.expired;
+  }
+
+  /**
+   * Register work to cancel when the deadline fires or the outer signal aborts. The canceller runs
+   * synchronously inside that event, before the pending wait is rejected; at once when the page is
+   * already cancelled. Returns the function that withdraws it.
+   */
+  onCancel(cancel: () => void): () => void {
+    if (this.expired) {
+      cancel();
+      return () => undefined;
+    }
+    this.cancellers.add(cancel);
+    return () => { this.cancellers.delete(cancel); };
+  }
+
+  /**
+   * The rows of ONE materialized driver result: their number, and the UTF-8 length of their JSON.
+   * (Object keys sorted or not, the length is the same, so this is the canonical length too.) A
+   * result with no rows materialized nothing. One that cannot be measured cannot be admitted.
+   */
+  meterRows(rows: readonly unknown[]): void {
+    if (rows.length === 0) return;
+    let bytes: number;
+    try {
+      bytes = Buffer.byteLength(JSON.stringify(rows), "utf8");
+    } catch {
+      return unavailable("a result could not be measured");
+    }
+    this.rows += rows.length;
     this.meterBytes(bytes);
     if (this.rows > this.deps.budgets.maxRows) throw this.exhausted("page exceeded its row budget");
   }
@@ -481,6 +542,15 @@ class PageRun {
     return result;
   }
 
+  /**
+   * Await work that has ALREADY started — a pool checkout, one driver statement — under the
+   * deadline, and nothing else: no clock is read here. The caller keeps the promise, and so keeps
+   * knowing when the work itself settles after a deadline has ended the wait for it.
+   */
+  untilDeadline<T>(pending: Promise<T>): Promise<T> {
+    return Promise.race([pending, this.deadline]);
+  }
+
   /** Cancel the deadline and drop the outer listener. Idempotent; called on every terminal path. */
   finish(): void {
     this.finished = true;
@@ -491,6 +561,7 @@ class PageRun {
   /** Whatever was thrown, as exactly one of the four failures. */
   classify(error: unknown): SlackTimelineError {
     if (isSlackTimelineError(error)) return error;
+    if (this.clockFailure) return this.clockFailure;
     if (this.budgetFailure) return this.budgetFailure;
     if (isRecord(error) && error.code === QUERY_CANCELED) return this.exhausted("a statement exceeded the remaining runtime");
     return new SlackTimelineError("unavailable", "a read or dependency failed");
@@ -507,61 +578,252 @@ interface Snapshot {
  * One fresh `REPEATABLE READ, READ ONLY` transaction on its own pooled connection, demonstrably
  * configured before any read. Its executor re-derives the transaction-local `statement_timeout`
  * from the remaining budget before EVERY statement (never 0, which the server reads as "no
- * timeout"), meters every result row, and refuses to run once the transaction has ended.
+ * timeout"), and refuses to run once the transaction has ended. Every row the driver returns on
+ * that connection — for the transaction's own control statements too — is metered.
  */
-async function inSnapshot<T>(run: PageRun, body: (snapshot: Snapshot) => Promise<T>): Promise<T> {
-  run.check();
-  return withTransaction(async (client) => {
-    await client.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
-    const configured = await client.query(
-      `select current_setting('transaction_isolation') as isolation, current_setting('transaction_read_only') as read_only`
-    );
-    const row = configured.rows[0] as { isolation?: string; read_only?: string } | undefined;
-    if (row?.isolation !== "repeatable read" || row?.read_only !== "on") {
-      return unavailable("transaction is not a fresh read-only snapshot");
-    }
+function inSnapshot<T>(run: PageRun, body: (snapshot: Snapshot) => Promise<T>): Promise<T> {
+  return new SnapshotTransaction(run).execute(body);
+}
 
-    // The executor belongs to THIS transaction only. Once the transaction's body has ended — by
-    // returning, failing or being abandoned on a deadline — the connection goes back to the pool,
-    // so a dependency that kept the executor must be refused, never run on someone else's session.
-    let open = true;
-    const ended = (): never => unavailable("snapshot transaction has ended");
+/** The rows one driver result materialized. A control statement's result has none. */
+const rowsOf = (result: unknown): unknown[] => (isRecord(result) && Array.isArray(result.rows) ? result.rows : []);
 
-    let applied = -1;
-    const refreshTimeout = async (): Promise<void> => {
-      if (!open) return ended();
-      const timeout = Math.max(1, Math.ceil(run.remaining()));
-      // Only an unchanged bound is skipped; any change in the remaining budget is sent to the server.
-      if (timeout === applied) return;
-      await client.query(`select set_config('statement_timeout', $1, true)`, [String(timeout)]);
-      applied = timeout;
-    };
-    await refreshTimeout();
+/**
+ * Give a pooled client back so that the pool DISCARDS it: pg-pool removes a client released with an
+ * error, and pg destroys the socket of one that is mid-statement instead of waiting for it. This is
+ * the only way a session of unknown state leaves this module.
+ */
+function discard(client: PoolClient, reason: string): void {
+  try {
+    client.release(new Error(`slack page snapshot: ${reason}`));
+  } catch {
+    // Already released: the pool has it, and there is nothing further to do from here.
+  }
+}
 
-    const query: SqlExecutor = async <R>(text: string, params: unknown[] = []) => {
-      // Immediately before EVERY statement the transaction-local timeout is re-derived from the
-      // budget that actually remains (one clock reading, which also stops a spent budget). A later
-      // statement therefore never inherits the larger timeout an earlier statement was given.
-      await refreshTimeout();
-      if (!open) return ended();
-      let result;
+/**
+ * The packet's own owner of one snapshot transaction: checkout, BEGIN, configuration, every
+ * statement, COMMIT or ROLLBACK, and the fate of the connection. It exists because the page deadline
+ * has to reach all of those, and a race around a transaction helper reaches none of them: the helper
+ * would still wake up on a late connection and run a transaction for a page that no longer exists.
+ *
+ *  - Cancellation is registered before the checkout, and only the checkout is raced. A client the
+ *    pool hands over after the page ended is discarded on the spot, with no statement sent on it.
+ *  - Every statement the driver is ever given goes through `send`, and nowhere else.
+ *  - The driver's own promise is tracked until IT settles. When the deadline fires, or the outer
+ *    signal aborts, the connection is discarded there and then: nothing is queued behind a running
+ *    statement, and a session that may be mid-statement is never returned for reuse.
+ *  - A session goes back to the pool reusable only after the server ANSWERED its COMMIT or ROLLBACK.
+ */
+class SnapshotTransaction {
+  private client: PoolClient | null = null;
+  private phase: "setup" | "open" | "ended" = "setup";
+  /** The client has left this transaction's hands, reusable or discarded. Set once. */
+  private handedBack = false;
+  /** Driver statements dispatched and not yet settled — whatever became of whoever awaited them. */
+  private outstanding = 0;
+  private applied = -1;
+
+  constructor(private readonly run: PageRun) {}
+
+  async execute<T>(body: (snapshot: Snapshot) => Promise<T>): Promise<T> {
+    // BEFORE the checkout: from here a deadline finds this transaction, whatever it is waiting for.
+    const withdraw = this.run.onCancel(() => this.destroy("its page was cancelled"));
+    try {
+      await this.checkout();
+      let value: T;
       try {
-        result = await client.query(text, params);
+        await this.configure();
+        this.phase = "open";
+        value = await body({ query: this.query, refreshTimeout: () => this.refreshTimeout() });
+        // A dependency that resolved with a statement of its own still running has not finished its
+        // read: that result was never metered, and COMMIT may not be queued behind it.
+        if (this.outstanding > 0) unavailable("a statement was still running when the snapshot's work ended");
       } catch (error) {
-        // The server cancelled the statement: remember it even if the caller swallows the error.
-        if (isRecord(error) && error.code === QUERY_CANCELED) run.exhausted("a statement exceeded the remaining runtime");
+        await this.endFailed();
         throw error;
       }
-      const rows = (Array.isArray(result.rows) ? result.rows : []) as R[];
-      run.meterRows(rows);
-      return { rows, rowCount: result.rowCount ?? 0 };
-    };
-    try {
-      return await body({ query, refreshTimeout });
+      await this.commit();
+      return value;
     } finally {
-      open = false;
+      withdraw();
+      // Whatever path led here without a disposition — an abandoned checkout included — ends closed.
+      this.destroy("its transaction ended in an uncertain state");
     }
-  });
+  }
+
+  /** The executor and every statement refuse here: on the page's own failure when it was cancelled. */
+  private refuse(): never {
+    if (this.run.cancelled) throw this.run.exhausted("page exceeded its elapsed budget while work was pending");
+    return unavailable("snapshot transaction has ended");
+  }
+
+  private async checkout(): Promise<void> {
+    this.run.check();
+    // Pool checkout cannot be cancelled, so the wait for it is what ends at the deadline. The
+    // observer below is attached in the same step as the checkout itself, and is the one piece of
+    // work that may outlive the page: it does exactly one thing to a late client — discards it.
+    const acquiring = getPool().connect().then((client) => {
+      if (this.phase === "ended") {
+        discard(client, "it was acquired after its page had ended");
+        return;
+      }
+      this.client = client;
+    });
+    acquiring.catch(() => undefined);
+    await this.run.untilDeadline(acquiring);
+  }
+
+  /**
+   * The ONE place a statement reaches the driver — BEGIN, configuration, the timeout, verification,
+   * every application read, COMMIT and ROLLBACK alike. State and budget are judged immediately
+   * before the dispatch (nothing is awaited in between); the driver's promise is observed at once
+   * and counted until it settles; the wait for it, and only the wait, ends at the deadline; every
+   * row the driver materialized is metered here and nowhere else; and the budget is judged again
+   * before the result is handed on. It never refreshes the statement timeout itself.
+   *
+   * `rule` is "budget" for everything but ROLLBACK, which asks only whether time is left: a page
+   * refused for its rows must still be able to end its transaction. `answered` runs the instant the
+   * server's answer arrives, before any metering or check can fail — it is how COMMIT and ROLLBACK
+   * tell "the server ended the transaction" from "something went wrong afterwards".
+   */
+  private async send(
+    text: string, params?: unknown[], rule: "budget" | "time" = "budget", answered?: () => void
+  ): Promise<unknown[]> {
+    const client = this.client;
+    if (client === null || this.handedBack) return this.refuse();
+    if (rule === "budget") this.run.check();
+    else if (!this.run.hasTime()) return this.refuse();
+
+    let driver: Promise<unknown>;
+    try {
+      driver = Promise.resolve(params === undefined ? client.query(text) : client.query(text, params));
+    } catch (error) {
+      driver = Promise.reject(error);
+    }
+    this.outstanding++;
+    const settled = (): void => { this.outstanding--; };
+    driver.then(settled, settled);
+
+    let answer: unknown;
+    try {
+      answer = await this.run.untilDeadline(driver);
+    } catch (error) {
+      // The server cancelled the statement: remember it even if the caller swallows the error.
+      if (isRecord(error) && error.code === QUERY_CANCELED) this.run.exhausted("a statement exceeded the remaining runtime");
+      throw error;
+    }
+    answered?.();
+    // A text of several statements comes back as one result per statement: each is metered.
+    const results: unknown[] = Array.isArray(answer) ? answer : [answer];
+    for (const result of results) this.run.meterRows(rowsOf(result));
+    if (rule === "budget") this.run.check();
+    return results;
+  }
+
+  /** Demonstrably a fresh `REPEATABLE READ, READ ONLY` transaction, under the page's own timeout, before any read. */
+  private async configure(): Promise<void> {
+    await this.send("BEGIN");
+    await this.send("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
+    await this.refreshTimeout();
+    const [configured] = await this.send(
+      `select current_setting('transaction_isolation') as isolation, current_setting('transaction_read_only') as read_only`
+    );
+    const row = rowsOf(configured)[0];
+    if (!isRecord(row) || row.isolation !== "repeatable read" || row.read_only !== "on") {
+      unavailable("transaction is not a fresh read-only snapshot");
+    }
+  }
+
+  /**
+   * Re-derive the transaction-local `statement_timeout` from the budget that actually remains (one
+   * clock reading, which also stops a spent budget). Never 0, which the server reads as "no timeout".
+   */
+  private async refreshTimeout(): Promise<void> {
+    if (this.phase === "ended") return this.refuse();
+    const timeout = Math.max(1, Math.ceil(this.run.remaining()));
+    // Only an unchanged bound is skipped; any change in the remaining budget is sent to the server.
+    if (timeout === this.applied) return;
+    await this.send(`select set_config('statement_timeout', $1, true)`, [String(timeout)]);
+    this.applied = timeout;
+  }
+
+  /**
+   * The executor belongs to THIS transaction only, and only while its body runs. Once the body has
+   * ended — by returning, failing or being cancelled — a dependency that kept the executor is
+   * refused, never run on a session that now belongs to someone else.
+   */
+  private readonly query: SqlExecutor = async <R>(text: string, params: unknown[] = []) => {
+    if (this.phase !== "open") return this.refuse();
+    // Immediately before EVERY statement: a later statement never inherits the larger timeout an
+    // earlier statement was given.
+    await this.refreshTimeout();
+    if (this.phase !== "open") return this.refuse();
+    const results = await this.send(text, params);
+    // The executor's contract is one result: of a multi-statement text, the last statement's.
+    const last = results[results.length - 1];
+    return { rows: rowsOf(last) as R[], rowCount: isRecord(last) && typeof last.rowCount === "number" ? last.rowCount : 0 };
+  };
+
+  /**
+   * Setup or the body failed. With the transaction configured, no statement running and time left,
+   * it is rolled back under the deadline and the session is reused once the server has answered.
+   * In every other case — setup never completed, a statement still running, no time, a ROLLBACK
+   * that failed or went unanswered — the session is discarded and nothing more is sent on it.
+   */
+  private async endFailed(): Promise<void> {
+    const configured = this.phase === "open";
+    this.phase = "ended";
+    if (this.client === null || this.handedBack) return;
+    if (!configured) return this.destroy("its transaction setup did not complete");
+    if (this.outstanding > 0) return this.destroy("a statement was still running when its transaction failed");
+    const rollback = { answered: false };
+    try {
+      await this.send("ROLLBACK", undefined, "time", () => { rollback.answered = true; });
+    } catch {
+      // Judged below: only the server's answer makes the session reusable.
+    }
+    if (rollback.answered) this.handBack();
+    else this.destroy("its rollback did not complete");
+  }
+
+  /**
+   * The body succeeded. A COMMIT the server answered leaves a clean session, whatever the metering
+   * and checks after it decide; one that failed, or lost the race to the deadline, leaves a session
+   * of unknown state, which is discarded. A read-only transaction commits nothing, so an answer of
+   * anything but COMMIT means a statement had failed inside it and a dependency hid that.
+   */
+  private async commit(): Promise<void> {
+    this.phase = "ended";
+    const commit = { answered: false };
+    let results: unknown[];
+    try {
+      results = await this.send("COMMIT", undefined, "budget", () => { commit.answered = true; });
+    } finally {
+      if (commit.answered) this.handBack();
+      else this.destroy("its commit did not complete");
+    }
+    const [result] = results;
+    if (!isRecord(result) || result.command !== "COMMIT") unavailable("snapshot transaction had already failed");
+  }
+
+  /** Return the session for reuse. Only ever reached after the server answered COMMIT or ROLLBACK. */
+  private handBack(): void {
+    const client = this.client;
+    if (client === null || this.handedBack) return;
+    if (this.outstanding > 0) return this.destroy("a statement was still running at the end of its transaction");
+    this.handedBack = true;
+    client.release();
+  }
+
+  /** Close the executor and discard the session, at once and whatever it is doing. Idempotent. */
+  private destroy(reason: string): void {
+    this.phase = "ended";
+    const client = this.client;
+    if (client === null || this.handedBack) return;
+    this.handedBack = true;
+    discard(client, reason);
+  }
 }
 
 // ── the complete bound state of one snapshot ─────────────────────────────────
@@ -809,6 +1071,48 @@ interface InitialNonSlack {
   sourceItemIds: string[];
 }
 
+/** What the non-Slack loader resolved with, as this page's OWN deeply frozen graph. */
+interface InitialCapture {
+  days: unknown;
+  sourceItemIds: unknown;
+  /** UTF-8 bytes of the canonical JSON the capture was rebuilt from. */
+  bytes: number;
+}
+
+/**
+ * Copy the loader's result out of the loader's hands. Canonical JSON admits only plain JSON values,
+ * so parsing it back yields a graph that shares no object with the one the loader returned — and
+ * may keep, cache and change. Everything this page validates, traverses, meters, merges and
+ * publishes of its non-Slack evidence is this copy; the loader's graph is never frozen or read again.
+ */
+function captureInitialNonSlack(result: unknown): InitialCapture {
+  if (!isRecord(result)) return unavailable("initial non-Slack result is incomplete");
+  let json: string;
+  try {
+    json = canonicalSlackTimelineJson({ days: result.days, sourceItemIds: result.sourceItemIds });
+  } catch {
+    return unavailable("initial non-Slack result is not JSON-safe");
+  }
+  const copy = deepFreeze(JSON.parse(json) as { days?: unknown; sourceItemIds?: unknown });
+  return { days: copy.days, sourceItemIds: copy.sourceItemIds, bytes: Buffer.byteLength(json, "utf8") };
+}
+
+/**
+ * Days as they are PUBLISHED: a deeply frozen graph of their own. The shared merger and the composer
+ * hand back containers that still hold the objects they were given; a page must not change after it
+ * was assembled, through any of them or through its own reader. Nothing a dependency retains is
+ * frozen: the page is a copy.
+ */
+function publishedDays(days: readonly TimelineDay[]): TimelineDay[] {
+  let json: string;
+  try {
+    json = JSON.stringify(days);
+  } catch {
+    return unavailable("page days are not JSON-safe");
+  }
+  return deepFreeze(JSON.parse(json) as TimelineDay[]);
+}
+
 /**
  * True when any source group, or any row inside one, is Slack's. Deliberately tolerant of every
  * other malformation — it runs on an unvalidated dependency result, and shape is judged afterwards.
@@ -842,26 +1146,28 @@ function carriesSlackEvidence(days: unknown): boolean {
 async function loadInitial(
   run: PageRun, snapshot: Snapshot, deps: ValidDependencies, request: ValidRequest, captured: Captured
 ): Promise<InitialNonSlack> {
-  const result = await run.race(() => deps.loadInitialNonSlack(snapshot.query, {
-    teamId: request.teamId, principal: { ...request.principal }, admission: captured.admission,
-    viewKey: captured.viewKey, asOf: captured.binding.asOf, windowDays: captured.binding.windowDays, signal: run.signal,
-  }));
+  // The capture is taken INSIDE the awaited work: it runs in the same step in which the loader's
+  // result arrives, with no other await between the two. A loader that goes on to change the graph
+  // it returned — while this page is still reading, or after it was published — changes nothing here.
+  const result = await run.race(async () => {
+    const loaded: unknown = await deps.loadInitialNonSlack(snapshot.query, {
+      teamId: request.teamId, principal: { ...request.principal }, admission: captured.admission,
+      viewKey: captured.viewKey, asOf: captured.binding.asOf, windowDays: captured.binding.windowDays, signal: run.signal,
+    });
+    // An answer that arrives after the page was cancelled is dropped, not copied.
+    return run.cancelled ? null : captureInitialNonSlack(loaded);
+  });
+  if (result === null) return unavailable("initial non-Slack result is incomplete");
   await snapshot.refreshTimeout();
-  if (!isRecord(result)) return unavailable("initial non-Slack result is incomplete");
   const sourceItemIds = backingIdList(result.sourceItemIds);
   // Slack evidence is refused BEFORE the shared merger sees these days. The merger reconciles Slack
   // rows, so two conflicting legacy Slack rows would otherwise surface as a merge conflict — a
   // restart — when the truth is a malformed dependency result.
   if (carriesSlackEvidence(result.days)) return unavailable("initial non-Slack days carry Slack evidence");
-  // Then shape: the shared merger's own rules, with nothing merged in yet.
+  // Then shape — every non-Slack row included — by the packet's own rules, with nothing merged in yet.
   const days = mergeSlackTimelineDays(result.days as TimelineDay[], []);
-  let json: string;
-  try {
-    json = JSON.stringify(result.days) ?? "";
-  } catch {
-    return unavailable("initial non-Slack result is incomplete");
-  }
-  run.meterBytes(Buffer.byteLength(json, "utf8"));
+  // Metered once, as the bundle the page actually holds: the capture, not the loader's graph.
+  run.meterBytes(result.bytes);
 
   const rowIds = new Set<string>();
   const cited = new Set<string>();
@@ -1207,7 +1513,8 @@ export async function readSlackPersonDayPage(
       const more = deliverable.length > valid.pageSize;
       const slackDays = composeDays(deps, captured, Object.freeze([...emitted]));
       // Initial composition goes through the shared merger; a continuation holds only its own groups.
-      const days = initial === null ? slackDays : mergeSlackTimelineDays(initial.days, slackDays);
+      // Either way the page's days are copied and frozen HERE, in the step that assembled them.
+      const days = publishedDays(initial === null ? slackDays : mergeSlackTimelineDays(initial.days, slackDays));
       run.check();
       return { captured, initial, emitted, more, days };
     });
@@ -1240,7 +1547,7 @@ export async function readSlackPersonDayPage(
       aggregates: evidence.emitted.map((aggregate) => ({ id: aggregate.id, tuple: slackAggregateTuple(aggregate) })),
       nextSlackCursor,
       slackComplete: nextSlackCursor === null,
-      ...(evidence.initial !== null ? { initialNonSlackSourceItemIds: [...evidence.initial.sourceItemIds] } : {}),
+      ...(evidence.initial !== null ? { initialNonSlackSourceItemIds: deepFreeze([...evidence.initial.sourceItemIds]) } : {}),
     };
     if (Buffer.byteLength(JSON.stringify(page), "utf8") > deps.budgets.maxPageBytes) {
       throw run.exhausted("page exceeded its serialized size budget");

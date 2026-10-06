@@ -965,6 +965,8 @@ describe("Slack timeline page contract — merge classification", () => {
     ["a row with an empty id", [pr(""), pr("g2")]],
     ["rows with no instant", [without(pr("g1"), "at"), without(pr("g2"), "at")]],
     ["a row whose instant is not a string", [pr("g1", { at: 20240620 }), pr("g2")]],
+    // The adjudicated rule: a row belongs to the source group that holds it.
+    ["a row of another source than its group", [pr("g1"), pr("m1", { source: "meetings", kind: "meeting", at: "2024-06-20" })]],
   ];
   /** Existing days whose one non-Slack group holds `items`, unlinked or nested under a task. */
   const existingWith = (items: unknown[], placement: "other" | "task"): TimelineDay[] => {
@@ -992,8 +994,9 @@ describe("Slack timeline page contract — merge classification", () => {
   it("accepts well-formed non-Slack rows, capped or dated by day alone (control)", async () => {
     const c = await contract();
     for (const placement of ["other", "task"] as const) {
-      // A count above the rendered rows is a cap; a bare date is how a meeting is dated. Neither is malformed.
-      const existing = existingWith([pr("g1"), pr("m1", { source: "meetings", kind: "meeting", at: "2024-06-20" })], placement);
+      // A count above the rendered rows is a cap; a bare date is how a row with no time is dated. Neither
+      // is malformed. Both rows carry the source of the group that holds them.
+      const existing = existingWith([pr("g1"), pr("m1", { kind: "commit", at: "2024-06-20" })], placement);
       // The cap is set on the SOURCE GROUP that holds the rows: the unlinked group, or the group
       // nested under the task — not on the task that contains it.
       const capped = placement === "other" ? existing[0].people[0].other[0] : existing[0].people[0].tasks[0].sources[0];
