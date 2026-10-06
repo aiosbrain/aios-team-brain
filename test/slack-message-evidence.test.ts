@@ -510,6 +510,94 @@ describe("eligibility — who earns a person's work credit", () => {
   });
 });
 
+/**
+ * Slack's own service account, `USLACKBOT`. The reliability contract says service-account text earns
+ * no personal contribution credit — and the directory cannot be what enforces that, because Slack
+ * reports this account with `is_bot: false` and `is_app_user: false`: by the flags alone it is a
+ * KNOWN human. So the exclusion is by the exact source author id, and it has to hold on the message
+ * itself: an explicit `WORKSPACE:USLACKBOT` mapping to a person may already be stored, and every
+ * reader downstream credits whatever this projection called eligible.
+ */
+describe("Slack's own service account — its text is never a person's contribution", () => {
+  const SERVICE_ACCOUNT = "USLACKBOT";
+  /** Exactly what the directory states for it: both bot flags READ, and both false. */
+  const SLACKBOT: SlackEvidenceUser = { displayName: "Slackbot", isBot: false, isAppUser: false };
+  /** Ordinary people whose ids merely resemble it: longer, shorter, prefixed, suffixed. */
+  const NEAR_MISSES = ["USLACKBOT2", "USLACKBOTS", "USLACKBO", "U0SLACKBOT", "XUSLACKBOT"];
+  const directory: Record<string, SlackEvidenceUser> = {
+    ...users,
+    [SERVICE_ACCOUNT]: SLACKBOT,
+    ...Object.fromEntries(NEAR_MISSES.map((nearMiss) => [nearMiss, HUMAN])),
+  };
+
+  it("excludes a normal text message from exact USLACKBOT as bot_identity, although the directory says not-a-bot", () => {
+    // The fixture states the classification that makes this a defect: nothing here says "bot".
+    expect(directory.USLACKBOT.isBot).toBe(false);
+    expect(directory.USLACKBOT.isAppUser).toBe(false);
+    const row = only(
+      [{ ts: TS_BASE, user: SERVICE_ACCOUNT, text: "Reminder: stand-up in ten minutes" }],
+      { users: directory }
+    );
+    expect(row.status).toBe("excluded");
+    expect(row.reason).toBe("bot_identity");
+    // The source identity is still recorded exactly: the message exists, it just earns nobody a day.
+    expect(row.authorExternalId).toBe("USLACKBOT");
+    expect(row.qualifiedAuthorId).toBe("T0AAAAAAA:USLACKBOT");
+    expect(row.occurredAt).toBe("2024-06-20T16:13:20.000100Z");
+  });
+
+  it("excludes its thread_broadcast the same way — the one creditable subtype is not a way in", () => {
+    const out = project(
+      [
+        { ts: TS_BASE, user: "U1", text: "kickoff" },
+        {
+          ts: TS_BASE_NEXT_MICRO, thread_ts: TS_BASE, user: SERVICE_ACCOUNT,
+          text: "also sending to channel", subtype: "thread_broadcast",
+        },
+      ],
+      { users: directory }
+    ).messages;
+    expect(out).toHaveLength(2);
+    // The person's root in the same thread is untouched: the exclusion is of one author, not a thread.
+    expect(out[0]).toMatchObject({ authorExternalId: "U1", status: "eligible", reason: null });
+    expect(out[1]).toMatchObject({
+      authorExternalId: "USLACKBOT", subtype: "thread_broadcast", isRoot: false, status: "excluded", reason: "bot_identity",
+    });
+  });
+
+  it("is never eligible, whatever the directory could or could not read about it (control)", () => {
+    // Already true today for every reading below except the complete one the two cases above pin:
+    // kept so that excluding by id can never be traded for crediting on a partial record.
+    const message: SlackMessage = { ts: TS_BASE, user: SERVICE_ACCOUNT, text: "Reminder: stand-up in ten minutes" };
+    const readings: (Record<string, SlackEvidenceUser> | undefined)[] = [
+      undefined, // the whole directory unreadable
+      users, // readable, and this account absent from it
+      { ...users, USLACKBOT: { displayName: "Slackbot" } }, // a name, no flags
+      { ...users, USLACKBOT: { displayName: "Slackbot", isBot: false } }, // half a classification
+      { ...users, USLACKBOT: { displayName: "Slackbot", isBot: true, isAppUser: false } }, // flagged a bot
+    ];
+    for (const reading of readings) expect(only([message], { users: reading }).status).not.toBe("eligible");
+  });
+
+  it("still credits a near-miss id: the rule is the exact account, never a substring (control)", () => {
+    for (const nearMiss of NEAR_MISSES) {
+      const text = only([{ ts: TS_BASE, user: nearMiss, text: "shipping today" }], { users: directory });
+      expect(text.status, nearMiss).toBe("eligible");
+      expect(text.reason, nearMiss).toBeNull();
+      const broadcast = only(
+        [{ ts: TS_BASE_NEXT_MICRO, thread_ts: TS_BASE, user: nearMiss, text: "also sending to channel", subtype: "thread_broadcast" }],
+        { users: directory }
+      );
+      expect(broadcast.status, nearMiss).toBe("eligible");
+    }
+    // Nor is it a rule about names or about text: a person called Slackbot, or one who mentions it.
+    const named = only([{ ts: TS_BASE, user: "U1", text: "hi" }], { users: { ...directory, U1: SLACKBOT } });
+    expect(named.status).toBe("eligible");
+    const mentions = only([{ ts: TS_BASE, user: "U1", text: "ask <@USLACKBOT> to remind us" }], { users: directory });
+    expect(mentions.status).toBe("eligible");
+  });
+});
+
 describe("source hash — raw evidence only", () => {
   const thread: SlackMessage[] = [
     { ts: TS_BASE, user: "U1", text: "shipping today", reply_count: 0 },

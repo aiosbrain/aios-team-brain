@@ -5,6 +5,7 @@ import type { AuthorizedSlackCreditItem } from "@/lib/attribution/slack-credit-b
 import type { SlackEvidenceSnapshot } from "@/lib/ingest/slack-evidence-snapshot";
 import type { SlackItemCreditAuthor, SlackItemCreditLedger } from "@/lib/ingest/slack-item-credit-ledger-read";
 import type { VisibleSlackMessage } from "@/lib/ingest/slack-message-read";
+import { projectSlackMessageEvidence } from "@/lib/ingest/sources/slack-message-evidence";
 
 const TEAM = "11111111-1111-1111-1111-111111111111";
 const FOREIGN_TEAM = "22222222-2222-2222-2222-222222222222";
@@ -179,5 +180,56 @@ describe("composeSlackEvidence (inactive)", () => {
     expect(() => composeSlackEvidence({ ...input, mappings: [...input.mappings,
       { teamId: FOREIGN_TEAM, provider: "slack", externalId: "T1:U6", memberId: B, state: "live" }] },
     [item()])).toThrow("invalid team roster or mapping");
+  });
+
+  it("gives Slack's service account no factual day and no credit, even through an explicit mapping to a human", () => {
+    // The whole boundary, with nothing stubbed: the REAL projector decides which source messages are
+    // eligible, the ledger holds exactly those as creditable authors, and the REAL composition turns
+    // them into person-days. The service account is in the directory as Slack reports it (both bot
+    // flags false) and its canonical account is ALREADY mapped to a standing human — the state an
+    // earlier link can leave behind, and one composition has no way to recognise on its own.
+    const C = "member-c";
+    const human = { isBot: false, isAppUser: false };
+    const projection = projectSlackMessageEvidence([
+      { ts: rootTs, user: "U1", text: "kickoff" },
+      { ts: "1718841600.000001", thread_ts: rootTs, user: "USLACKBOT", text: "Reminder: stand-up in ten minutes" },
+      { ts: "1719014400.000001", thread_ts: rootTs, user: "USLACKBOT", text: "also sending to channel", subtype: "thread_broadcast" },
+      // A person whose id merely resembles it, on a day of their own.
+      { ts: "1719100800.000001", thread_ts: rootTs, user: "USLACKBOT2", text: "picking this up" },
+    ], {
+      scope: { workspaceId: "T1", channelId: "C1" },
+      now: new Date("2024-07-01T00:00:00.000Z"),
+      users: { U1: human, USLACKBOT: { displayName: "Slackbot", ...human }, USLACKBOT2: human },
+    });
+    expect(projection.messages).toHaveLength(4);
+    const authors = projection.messages
+      .filter((message) => message.status === "eligible")
+      .map((message) => author(message.messageTs, message.occurredAt as string, message.authorExternalId as string));
+    const input = snapshot([{ itemId: ITEM, status: "present", authors }], authors.map((row) => visible(row)), {
+      mappings: [
+        { teamId: TEAM, provider: "slack", externalId: "T1:U1", memberId: A, state: "live" },
+        { teamId: TEAM, provider: "slack", externalId: "T1:USLACKBOT", memberId: C, state: "live" },
+        { teamId: TEAM, provider: "slack", externalId: "T1:USLACKBOT2", memberId: B, state: "live" },
+      ],
+      humanMemberIds: new Set([A, B, C]),
+    });
+    const result = composeSlackEvidence(input, [item()]);
+
+    // Nobody is credited for the service account's text: not on the 20th, not on the 22nd.
+    expect(result.personDays.filter((day) => day.memberId === C)).toEqual([]);
+    expect(result.personDays.map((day) => [day.day, day.memberId, day.messageCount]).sort()).toEqual([
+      ["2024-06-19", A, 1],
+      ["2024-06-23", B, 1], // the near-miss id is a person, and keeps their day
+    ]);
+    const contributors = result.creditByItem.get(ITEM)?.creditIds?.contributorIds ?? [];
+    expect([...contributors].sort()).toEqual([A, B]);
+    expect(contributors).not.toContain(C);
+    // And the reason is the projector's own verdict on those two messages, not an absent mapping.
+    expect(projection.messages.map((message) => [message.authorExternalId, message.subtype, message.status, message.reason])).toEqual([
+      ["U1", null, "eligible", null],
+      ["USLACKBOT", null, "excluded", "bot_identity"],
+      ["USLACKBOT", "thread_broadcast", "excluded", "bot_identity"],
+      ["USLACKBOT2", null, "eligible", null],
+    ]);
   });
 });

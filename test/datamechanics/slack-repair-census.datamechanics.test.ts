@@ -1050,6 +1050,94 @@ describe("slack repair census: ledger, attribution and locks (real Postgres)", (
     const text = JSON.stringify(result);
     for (const leaked of [seed.memberId, connector, "UAUTHOR", "UTRIM", "umany"]) expect(text).not.toContain(leaked);
   });
+
+  it("resolves a ledger author only to a HUMAN member: a standing agent and an offroster actor are nonhuman_member, like a connector", async () => {
+    const seed = await seedTeam();
+    const scope = await verifiedScope(seed);
+    const p = await project(seed.teamId);
+    /** An active member row of the given kind. Only `kind` and `is_connector` differ between them. */
+    const member = async (kind: "human" | "agent" | "offroster", isConnector = false): Promise<string> =>
+      (
+        await runSql<{ id: string }>(
+          `insert into members (team_id, email, display_name, actor_handle, role, tier, status, kind, is_connector)
+           values ($1, $2, $3, $4, 'member', 'team', 'active', $5, $6) returning id`,
+          [seed.teamId, `${randomUUID()}@test.local`, `Census ${kind} ${randomUUID().slice(0, 6)}`, `census-${randomUUID().slice(0, 10)}`, kind, isConnector]
+        )
+      ).rows[0].id;
+    const human = await member("human");
+    const agent = await member("agent");
+    const offroster = await member("offroster");
+    const connector = await member("human", true);
+    // Fixture preconditions, read back: the two rows under test are NOT connectors, so nothing but
+    // their kind can be what keeps them from resolving.
+    const stored = (
+      await runSql<{ id: string; kind: string; is_connector: boolean; status: string }>(
+        `select id::text as id, kind, is_connector, status from members where id = any($1::uuid[])`,
+        [[human, agent, offroster, connector]]
+      )
+    ).rows;
+    const facts = new Map(stored.map((row) => [row.id, `${row.kind}/${row.is_connector ? "connector" : "member"}/${row.status}`]));
+    expect([human, agent, offroster, connector].map((memberId) => facts.get(memberId))).toEqual([
+      "human/member/active", "agent/member/active", "offroster/member/active", "human/connector/active",
+    ]);
+
+    // One scoped item per author, each with one eligible, live, exactly mapped ledger message — the
+    // same evidence four times over, differing only in WHO the account is mapped to.
+    const cases: [number, string, string, string][] = [
+      [1, ROOT, "UHUMAN", human],
+      [2, ROOT2, "UAGENT", agent],
+      [3, ROOT3, "UOFFROSTER", offroster],
+      [4, "1718900000.000400", "UCONNECTOR", connector],
+    ];
+    for (const [n, root, author, memberId] of cases) {
+      await item(seed.teamId, p, id(n), `slack/t1/c0abc/${root}.md`);
+      await message(seed.teamId, id(n), root, { author });
+      await mapping(seed.teamId, memberId, `T1:${author}`);
+    }
+    // A fifth item whose thread has ALL four authors: the statuses are counted per author, not per item.
+    const MIXED = "1718900000.000500";
+    await item(seed.teamId, p, id(5), `slack/t1/c0abc/${MIXED}.md`);
+    await message(seed.teamId, id(5), MIXED, { author: "UHUMAN" });
+    for (const [n, , author] of cases.slice(1)) {
+      await message(seed.teamId, id(5), `1718900001.00000${n}`, { rootTs: MIXED, author });
+    }
+
+    const result = await page(scope, { pageSize: 50 });
+    expect(entryIds(result)).toEqual([id(1), id(2), id(3), id(4), id(5)]);
+    for (const entry of result.entries as Loose[]) {
+      expect(entry, entry.itemId).toMatchObject({
+        relationship: "scoped_channel_match", provenance: "scoped_ledger_observed", ledger: { present: true },
+      });
+    }
+
+    // Positive control: the human member resolves, and nothing about its mapping needs review.
+    const resolved = entryOf(result, id(1));
+    expect(resolved.authorMapping).toMatchObject({ resolved: 1, nonhuman_member: 0, no_mapping: 0, conflicting_mapping: 0 });
+    expect(resolved.pending).not.toContain("mapping_review_required");
+
+    // A standing agent is a principal, and an offroster row is an attribution-only actor. Neither is
+    // a person whose Slack messages are personal contribution, however exactly the account is mapped.
+    for (const [n, label] of [[2, "agent"], [3, "offroster"]] as const) {
+      const entry = entryOf(result, id(n));
+      expect(entry.authorMapping, label).toMatchObject({ resolved: 0, nonhuman_member: 1, no_mapping: 0, conflicting_mapping: 0 });
+      expect(Object.values(entry.authorMapping as Record<string, number>).reduce((a, b) => a + b, 0), label).toBe(1);
+      expect(entry.pending, label).toContain("mapping_review_required");
+    }
+
+    // Existing behaviour, retained as the control for the other half of the predicate: a connector.
+    const viaConnector = entryOf(result, id(4));
+    expect(viaConnector.authorMapping).toMatchObject({ resolved: 0, nonhuman_member: 1 });
+    expect(viaConnector.pending).toContain("mapping_review_required");
+
+    const mixed = entryOf(result, id(5));
+    expect(mixed.ledger).toMatchObject({ totalMessages: "4", eligibleNondeletedMessages: "4" });
+    expect(mixed.authorMapping).toMatchObject({ resolved: 1, nonhuman_member: 3, no_mapping: 0, conflicting_mapping: 0 });
+    expect(mixed.pending).toContain("mapping_review_required");
+    // Four of the five entries need a mapping review; the human-only one does not.
+    expect(result.counts.byPendingCategory.mapping_review_required).toBe(4);
+    const text = JSON.stringify(result);
+    for (const leaked of [human, agent, offroster, connector, "UAGENT", "UOFFROSTER"]) expect(text).not.toContain(leaked);
+  });
 });
 
 describe("slack repair census: stored source, queue and gate observations (real Postgres)", () => {
