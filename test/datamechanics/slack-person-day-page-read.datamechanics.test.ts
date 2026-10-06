@@ -3429,6 +3429,120 @@ describe("aggregate Slack page — pending work, cancellation and statement time
     expect(await poolSettlesClean(pool)).toEqual({ waiting: 0, checkedOut: 0, inTransaction: 0 });
     expect((await page(s.w)).aggregates).toHaveLength(1);
   });
+
+  // ── source review of the Stage 4 corrections: two LOW findings ────────────────────────────────
+
+  /**
+   * A forged signal: an object whose prototype is `AbortSignal.prototype`. It passes `instanceof`,
+   * and it is not a signal — the platform's own brand check refuses it, with a raw `TypeError`, the
+   * moment `.aborted` is read. The second form also carries working listener methods of its own, so
+   * that a listener attached to it would be SEEN; the native `aborted` getter is untouched in both.
+   */
+  const FORGED_SIGNALS: [string, () => { signal: unknown; attached: unknown[] }][] = [
+    ["a bare object created from AbortSignal.prototype", () => ({ signal: Object.create(AbortSignal.prototype) as unknown, attached: [] })],
+    ["the same forgery carrying working listener methods of its own", () => {
+      const attached: unknown[] = [];
+      const signal = Object.create(AbortSignal.prototype, {
+        addEventListener: { value: (_type: string, listener: unknown): void => { attached.push(listener); } },
+        removeEventListener: {
+          value: (_type: string, listener: unknown): void => {
+            const at = attached.indexOf(listener);
+            if (at >= 0) attached.splice(at, 1);
+          },
+        },
+      }) as unknown;
+      return { signal, attached };
+    }],
+  ];
+
+  // FALSIFIER. `instanceof` admits the forgery; current production then arms its deadline and reads
+  // `.aborted` outside any classification, so the platform's TypeError escapes with the timer armed.
+  it.each(FORGED_SIGNALS)("refuses %s as its outer signal: unavailable, before any checkout or read, with no deadline or listener left", async (_label, forge) => {
+    const s = await oneThread();
+    const input = await publishedInput(s);
+    // The fixture is what it claims to be: admitted by `instanceof`, refused by the native brand check.
+    const probe = forge().signal;
+    expect(probe instanceof AbortSignal, "fixture: the forgery passes instanceof").toBe(true);
+    expect(() => (probe as AbortSignal).aborted, "fixture: the platform's brand check refuses it").toThrow(TypeError);
+
+    for (const unit of UNITS) {
+      const clock = fakeTimers();
+      const forged = forge();
+      const reads = s.w.seen.admission.length;
+      const { value: failure, checkouts } = await checkoutsDuring(() =>
+        failureOf(() => runUnit(s, unit, input, { signal: forged.signal }, { scheduleDeadline: clock.scheduleDeadline })));
+      // One of the four failures — never the platform's own TypeError.
+      expect(failure, unit).toMatchObject({ name: "SlackTimelineError", code: "unavailable" });
+      expect(failure, unit).not.toHaveProperty("days");
+      expect(checkouts, `${unit}: no connection was checked out`).toBe(0);
+      expect(s.w.seen.admission.length, `${unit}: nothing was read`).toBe(reads);
+      expect(clock.timers.filter((t) => !t.cancelled && !t.fired), `${unit}: no deadline is left armed`).toEqual([]);
+      expect(forged.attached, `${unit}: no listener is left on the object`).toEqual([]);
+    }
+    expect(await openTransactionsSettleToZero()).toBe(0);
+    // A real signal is still an ordinary page (the accepted-input control for this refusal).
+    expect((await page(s.w, {}, { signal: new AbortController().signal })).aggregates).toHaveLength(1);
+  });
+
+  // FALSIFIER. The budget cap bounds `maxElapsedMs`, not what is derived from it. A monotonic clock
+  // that reads 0 and then steps back to -5 leaves five milliseconds MORE than the budget remaining;
+  // at the maximum legal budget current production asks PostgreSQL for a statement timeout of
+  // 2 147 483 652 ms, the server refuses the value, and a healthy page fails. The server is the
+  // judge here: a value out of its range is an error on that statement, and 0 would mean "no timeout".
+  it("keeps every statement timeout and every timer delay within 1..2147483647 when the monotonic clock steps back under the maximum legal budget, and completes", async () => {
+    const s = await oneThread();
+    const real = dependencies(s.w);
+    const ordinary = await page(s.w);
+    const timeoutMs = async (query: SqlExecutor): Promise<number> =>
+      (await query<{ ms: number }>(`select setting::int as ms from pg_settings where name = 'statement_timeout'`)).rows[0].ms;
+    const clock = fakeTimers();
+    const seen: { at: string; ms: number }[] = [];
+    let admissions = 0;
+    let readings = 0;
+    /** Fresh for each unit, as each takes its own first reading: 0 once, then five milliseconds EARLIER. */
+    const deps = (): Json => {
+      let mine = 0;
+      return {
+        scheduleDeadline: clock.scheduleDeadline, budgets: { maxElapsedMs: TIMER_MAX_MS },
+        monotonicNow: () => { readings++; return mine++ === 0 ? 0 : -5; },
+        loadAdmission: async (query: SqlExecutor, context: Json) => {
+          seen.push({ at: `admission ${++admissions}`, ms: await timeoutMs(query) });
+          return (real.loadAdmission as (q: SqlExecutor, c: Json) => unknown)(query, context);
+        },
+      };
+    };
+
+    // A page: its evidence transaction (setup, then mid-read) and its validation transaction.
+    const published = await page(s.w, {}, {
+      afterTransactionConfigured: async (query: SqlExecutor) => { seen.push({ at: "evidence, configured", ms: await timeoutMs(query) }); },
+      afterDiscovery: async (query: SqlExecutor) => { seen.push({ at: "evidence, after discovery", ms: await timeoutMs(query) }); },
+    }, deps());
+    // Final validation: its own deadline and its own transaction.
+    await (await reader()).validateSlackPersonDayFinal(
+      { ...request(s.w), binding: published.binding, initialNonSlackSourceItemIds: published.initialNonSlackSourceItemIds },
+      dependencies(s.w, deps())
+    );
+
+    expect(readings, "the clock was read again after each first reading, and had stepped back").toBeGreaterThan(2);
+    // Ordinary completion is unchanged: the same page a steady clock reads.
+    expect(published.aggregates).toEqual(ordinary.aggregates);
+    expect(JSON.stringify(published.days)).toBe(JSON.stringify(ordinary.days));
+    expect(published.binding).toEqual(ordinary.binding);
+    // Every transaction was observed: evidence, validation (admission 2) and final validation (admission 3).
+    expect(seen.map((row) => row.at)).toEqual(["evidence, configured", "admission 1", "evidence, after discovery", "admission 2", "admission 3"]);
+    for (const row of seen) {
+      expect(row.ms, `${row.at}: never 0, which the server reads as no timeout`).toBeGreaterThan(0);
+      expect(row.ms, `${row.at}: within the server's range`).toBeLessThanOrEqual(TIMER_MAX_MS);
+    }
+    // The page and final validation each armed a deadline; every one is a delay the platform timer honours.
+    expect(clock.timers.length, "both units armed a deadline").toBeGreaterThanOrEqual(2);
+    for (const t of clock.timers) {
+      expect(Number.isSafeInteger(t.delayMs) && t.delayMs >= 1, "a deadline is a positive whole delay").toBe(true);
+      expect(t.delayMs, "a delay the platform timer honours").toBeLessThanOrEqual(TIMER_MAX_MS);
+      expect(t.cancelled).toBe(true);
+    }
+    expect(await openTransactionsSettleToZero()).toBe(0);
+  });
 });
 
 // ── final review: the frozen non-Slack snapshot, malformed rows, and the real task-provenance owner ──

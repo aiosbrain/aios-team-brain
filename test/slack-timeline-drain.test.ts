@@ -1127,6 +1127,34 @@ describe("Slack timeline drain — the timer bound, and accepted pages that chan
     expect(clock.timers, "no deadline was armed with a delay the platform cannot honour").toHaveLength(0);
   });
 
+  // FALSIFIER (source review, LOW) — the cap above bounds the BUDGET, not the delay derived from it.
+  // A monotonic clock that reads 0 and then steps back to -5 makes the remaining time five
+  // milliseconds MORE than the budget; at the maximum legal budget current production asks the
+  // scheduler for 2 147 483 652 ms, which a platform timer fires after one. The drain itself is
+  // healthy, so it must still complete — with every delay it asks for one a timer can hold.
+  it("never asks for a delay above the timer maximum when the monotonic clock steps back under the maximum legal budget, and still completes", async () => {
+    const d = await drainModule();
+    const w = world([stable()], 2);
+    const clock = recordingScheduler();
+    let readings = 0;
+    const result = await d.drainSlackTimeline({
+      ...w.deps, budgets: { maxElapsedMs: TIMER_MAX_MS }, scheduleDeadline: clock.scheduleDeadline,
+      monotonicNow: () => (readings++ === 0 ? 0 : -5),
+    });
+    expect(readings, "the clock was read again after its first reading, and had stepped back").toBeGreaterThan(1);
+    // Ordinary completion is unchanged: three pages, one final validation, the whole result.
+    expect(result).toEqual({ window_days: 7, days: expected(stable()) });
+    expect(w.calls.next).toEqual(["cursor:0:2", "cursor:0:4"]);
+    expect(w.calls.final).toHaveLength(1);
+    // One deadline per page request and one for final validation, each within the platform's range.
+    expect(clock.timers.length, "the drain armed a deadline for each call").toBeGreaterThanOrEqual(4);
+    for (const timer of clock.timers) {
+      expect(Number.isSafeInteger(timer.delayMs) && timer.delayMs >= 1, "a deadline is a positive whole delay").toBe(true);
+      expect(timer.delayMs, "a delay the platform timer honours").toBeLessThanOrEqual(TIMER_MAX_MS);
+      expect(timer.cancelled).toBe(true);
+    }
+  });
+
   function deepFreeze<T>(value: T): T {
     if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
       Object.freeze(value);
