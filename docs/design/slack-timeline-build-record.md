@@ -986,7 +986,7 @@ Unchanged prohibitions. No human or live acceptance has been completed. Not done
 
 ### AC-02 inactive known-root requeue — specification and implementation record
 
-**Current status (updated only here): specification accepted; red-first test foundation written and under review correction; production NOT implemented.** The two source modules are stubs. No acceptance criterion of this slice is green, no query plan has been measured, and no final verification, mutation run or final review has been performed. **AC-02 is not complete, and nothing in this section completes it or AIO-1170.**
+**Current status (updated only here): specification accepted; red-first test foundation written; red-review corrections checkpointed at `3e665c39`; one focused-rereview correction to the boundary guard in the commit that carries this update; production NOT implemented.** The two source modules are stubs. No acceptance criterion of this slice is green, no query plan has been measured, and no final verification, mutation run or final review has been performed. **AC-02 is not complete, and nothing in this section completes it or AIO-1170.**
 
 #### Specification — recorded October 6
 
@@ -1019,7 +1019,7 @@ This is behavioural red against placeholders. It is not evidence that any behavi
 
 #### Independent red review and its corrections — recorded October 6
 
-An independent Opus 5.5 high-effort review examined `20b08295` against specification commit `2c040b19`. The coordinator assigned four MEDIUM corrections and a set of LOW corrections from it. The reviewer's verdict wording was not given to the writer and is not restated here. The corrections below were written after `20b08295`, touch only the red-test files and this record, change no production file, and **had not been committed or run when this entry was written**; their results belong in a later dated subsection.
+An independent Opus 5.5 high-effort review examined `20b08295` against specification commit `2c040b19`. The coordinator assigned four MEDIUM corrections and a set of LOW corrections from it. The reviewer's verdict wording was not given to the writer and is not restated here. The corrections below were written after `20b08295`, touch only the red-test files and this record, and change no production file. They were committed as `3e665c393277da4bea57f8b4a74927b2e5ef246f`, and the coordinator's results on that exact checkpoint are in the dated subsection that follows the clarifications below.
 
 - **MEDIUM — the boundary guard and session surfaces.** The guard now refuses property access, string-keyed access and destructuring of `db`, `rpc`, `optionalAudit` and `transaction`, a computed key or a spread on a session, and any definition of one of those members that does anything but throw. The intended fail-closed `get db()` and `optionalAudit` definitions are allowed. Negative controls cover each of the four surfaces in each of the three access forms, including builder-mediated DML and RPC.
 - **MEDIUM — gate and binding imports.** Value imports from `slack-namespace-gate` are restricted to `lockReadySlackNamespaceGate` and from `slack-source-binding` to `lockSlackSelection`. `invalidateSlackNamespaceGate`, `ensureBlockedSlackNamespaceGate`, `prepareNewSlackChannelNamespace`, `blockSlackBinding`, `bindSlackSelection`, `recordSlackWorkspaceIdentity`, `recordSlackAppIdentity` and `delaySlackBinding` are each refused, alone, beside the permitted lock, and renamed. The two path builders and the exact timestamp parser are likewise the only value imports allowed from their modules.
@@ -1035,6 +1035,26 @@ Accepted LOW clarifications carried into implementation and final tests:
 4. Classifier rungs 2 to 8 have no dedicated mutant each; this is recorded as non-blocking, and the precedence table is pinned by assertion instead.
 5. The pure reducer relies on the caller's settlement discipline: complete accounting is produced only after every started invocation has settled. No active worker in this slice enforces that.
 6. This record names specification commit `2c040b19`.
+
+#### Review-correction checkpoint `3e665c39` and the focused rereview — recorded October 6
+
+The red-review corrections listed above are checkpoint `3e665c393277da4bea57f8b4a74927b2e5ef246f`. Results on that exact checkpoint, as run by the coordinator:
+
+- Diff check, targeted ESLint and TypeScript typecheck: all passed.
+- Focused unit and guards: 179 tests, **146 intentional behavioural reds and 33 passing controls**.
+- Isolated real PostgreSQL: 3 tests, **2 intentional behavioural reds and 1 passing characterization**. The reds are the located-entry assertion of enumeration and the queue-row assertion of KR-01; the passing case is the old-root omission characterization.
+
+This is still behavioural red against placeholders, and the larger counts reflect added red cases and controls, not implemented behaviour.
+
+A fresh focused rereview of `3e665c39` found one required test-only correction, a path-helper module mismatch in the boundary guard. The guard's named-only allowlist permitted `slackChannelPathPrefix` from `lib/ingest/sources/slack-namespace.ts`. That module does not export it: the legacy channel path prefix is exported by `lib/ingest/sources/slack-normalize.ts`, which the requeue module was not allowed to import at all. As written, the guard described an import the module could never make and would have refused the one the specification's §5.4 requires. The sentence in the correction list above that speaks of "the two path builders … from their modules" is superseded by this paragraph for the legacy prefix.
+
+The commit that carries this subsection corrects it, in `test/guards/slack-known-root-requeue-not-wired.test.ts` only:
+
+- `lib/ingest/sources/slack-normalize.ts` is an allowed dependency of the requeue module, with `slackChannelPathPrefix` as its only permitted value import; `normalizeThread`, its other exports, and a namespace or dynamic import of it are refused by negative controls.
+- The `slack-namespace.ts` allowlist is reduced to its real export `scopedSlackItemPath`.
+- A real-tree assertion now requires every name in every named-only allowlist to be an actual export of its dependency, with a negative control, so an unsatisfiable allowlist cannot recur.
+
+No source stub, production file, unit suite or real-PostgreSQL suite changed in that commit, and its own check results are not recorded in this subsection. The rereview's adversarial LOW guard bypasses and its cosmetic control-label notes are non-blocking and were deliberately not addressed in this pass.
 
 #### Pending — not done, and not claimed
 

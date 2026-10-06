@@ -55,6 +55,8 @@ const ALLOWED_DEPENDENCIES: Readonly<Record<string, readonly string[]>> = {
     "lib/ingest/slack-source-binding.ts",
     "lib/ingest/slack-thread-state.ts",
     "lib/ingest/sources/slack-namespace.ts",
+    // The LEGACY channel path prefix lives with the normalizer, not with the scoped namespace.
+    "lib/ingest/sources/slack-normalize.ts",
     "lib/ingest/sources/slack-message-evidence.ts",
   ],
 };
@@ -78,8 +80,11 @@ const NAMED_ONLY: Readonly<Record<string, readonly string[]>> = {
   // §5.1 step 2: the selection lock, which also resolves the effective token locally. Never a
   // binder, an identity recorder, a blocker or a delay: preparation changes no binding.
   "lib/ingest/slack-source-binding.ts": ["lockSlackSelection"],
-  // §5.3 and §5.4: the two existing path builders, and nothing that parses a path back into ids.
-  "lib/ingest/sources/slack-namespace.ts": ["scopedSlackItemPath", "slackChannelPathPrefix"],
+  // §5.3 and §5.4: the scoped path builder, and nothing that parses a path back into ids.
+  "lib/ingest/sources/slack-namespace.ts": ["scopedSlackItemPath"],
+  // §5.4: the legacy channel path prefix — exported by the normalizer, which is where it really
+  // lives. Never the normalizer itself, its participant reader or anything else it exports.
+  "lib/ingest/sources/slack-normalize.ts": ["slackChannelPathPrefix"],
   // §5.3 and §6: the existing exact timestamp parser.
   "lib/ingest/sources/slack-message-evidence.ts": ["parseSlackTimestamp"],
 };
@@ -285,6 +290,26 @@ function exportedNames(file: string, source: string): string[] {
   return names.sort();
 }
 
+/**
+ * `file: name` for every name a named-only allowlist permits that its dependency does not actually
+ * export, and `file: missing` for a dependency that is not in the tree. An allowlist entry nothing
+ * can satisfy is not a harmless extra: it describes an import the module cannot make, and hides
+ * that the helper it meant lives somewhere the allowlist does not permit.
+ */
+function unsatisfiableAllowlistNames(tree: ReadonlyMap<string, string>, namedOnly: Readonly<Record<string, readonly string[]>>): string[] {
+  const problems: string[] = [];
+  for (const [file, names] of Object.entries(namedOnly)) {
+    const source = tree.get(file);
+    if (source === undefined) {
+      problems.push(`${file}: missing`);
+      continue;
+    }
+    const exported = new Set(exportedNames(file, source));
+    for (const name of names) if (!exported.has(name)) problems.push(`${file}: ${name}`);
+  }
+  return problems.sort();
+}
+
 // ── the real tree ────────────────────────────────────────────────────────────
 
 let REAL_TREE: Map<string, string> | null = null;
@@ -379,6 +404,36 @@ describe("the known-root requeue packet stays inside its boundary", () => {
     for (const packetModule of PACKET_MODULES) expect(dependencyViolations(tree, packetModule), packetModule).toEqual([]);
   });
 
+  it("permits by name only what each dependency really exports", () => {
+    const tree = readTree();
+    // Every named-only dependency is an allowed dependency of at least one packet module…
+    const allowed = new Set(Object.values(ALLOWED_DEPENDENCIES).flat());
+    for (const dependency of Object.keys(NAMED_ONLY)) expect(allowed.has(dependency), `${dependency} is an allowed dependency`).toBe(true);
+    // …and every name its allowlist permits is an actual export of that file in the real tree. A
+    // name the file does not export is an import the module could never make.
+    expect(unsatisfiableAllowlistNames(tree, NAMED_ONLY)).toEqual([]);
+    for (const names of Object.values(NAMED_ONLY)) expect(names.length, "no allowlist is empty").toBeGreaterThan(0);
+    // Stated outright for the two path helpers, whose modules were once confused.
+    expect(exportedNames("lib/ingest/sources/slack-namespace.ts", tree.get("lib/ingest/sources/slack-namespace.ts") ?? "")).toContain("scopedSlackItemPath");
+    expect(exportedNames("lib/ingest/sources/slack-namespace.ts", tree.get("lib/ingest/sources/slack-namespace.ts") ?? "")).not.toContain("slackChannelPathPrefix");
+    expect(exportedNames("lib/ingest/sources/slack-normalize.ts", tree.get("lib/ingest/sources/slack-normalize.ts") ?? "")).toContain("slackChannelPathPrefix");
+  });
+
+  it("reports an allowlist name its dependency does not export, and a dependency that does not exist (negative control)", () => {
+    const tree = new Map<string, string>([
+      ["lib/a.ts", "export function real(): void {}\nexport const ALSO_REAL = 1;\nfunction internal(): void {}\nexport class RealClass {}"],
+      ["lib/b.ts", "export async function onlyThis(): Promise<void> {}"],
+    ]);
+    // Satisfiable: every permitted name is exported by its file.
+    expect(unsatisfiableAllowlistNames(tree, { "lib/a.ts": ["real", "ALSO_REAL", "RealClass"], "lib/b.ts": ["onlyThis"] })).toEqual([]);
+    // The recurrence this exists to stop: a name permitted from the wrong module.
+    expect(unsatisfiableAllowlistNames(tree, { "lib/a.ts": ["real", "onlyThis"], "lib/b.ts": ["onlyThis"] })).toEqual(["lib/a.ts: onlyThis"]);
+    // A declared-but-unexported name, a misspelling, and a file that is not there.
+    expect(unsatisfiableAllowlistNames(tree, { "lib/a.ts": ["internal", "Real"], "lib/c.ts": ["anything"] })).toEqual([
+      "lib/a.ts: Real", "lib/a.ts: internal", "lib/c.ts: missing",
+    ]);
+  });
+
   it("refuses a provider, pool, transaction, ingest or writer dependency, and any queue writer but enqueue (negative control)", () => {
     const base: [string, string][] = [
       [PAGE, ""],
@@ -386,7 +441,8 @@ describe("the known-root requeue packet stays inside its boundary", () => {
         "lib/db/types.ts", "lib/db/pg/tx.ts", "lib/db/pg/pool.ts", "lib/ingest/index.ts", "lib/ingest/slack-thread-state.ts",
         "lib/ingest/slack-namespace-gate.ts", "lib/ingest/slack-source-binding.ts", "lib/ingest/sources/slack-page-request.ts",
         "lib/ingest/slack-message-ledger.ts", "lib/ingest/slack-channel-state.ts", "lib/integrations/manage.ts",
-        "lib/projects/context/transaction.ts", "lib/ingest/sources/slack-namespace.ts", "lib/ingest/sources/slack-message-evidence.ts",
+        "lib/projects/context/transaction.ts", "lib/ingest/sources/slack-namespace.ts", "lib/ingest/sources/slack-normalize.ts",
+        "lib/ingest/sources/slack-message-evidence.ts",
       ].map((file): [string, string] => [file, ""]),
     ];
     const violationsOf = (source: string): string[] => dependencyViolations(new Map([...base, [REQUEUE, source]]), REQUEUE);
@@ -401,10 +457,12 @@ describe("the known-root requeue packet stays inside its boundary", () => {
       `import { lockReadySlackNamespaceGate } from "./slack-namespace-gate";`,
       `import { lockSlackSelection } from "./slack-source-binding";`,
       `import type { SlackKnownRootEntry } from "./slack-known-root-page";`,
-      // Types of the gate and the binding are free; the two path builders and the exact parser are named.
+      // Types of the gate and the binding are free; the two path builders and the exact parser are
+      // named, each from the module that really exports it.
       `import type { SlackNamespaceReadyLockResult } from "./slack-namespace-gate";`,
       `import { lockSlackSelection as lockSelection, type SlackSelection } from "./slack-source-binding";`,
-      `import { scopedSlackItemPath, slackChannelPathPrefix } from "./sources/slack-namespace";`,
+      `import { scopedSlackItemPath } from "./sources/slack-namespace";`,
+      `import { slackChannelPathPrefix } from "./sources/slack-normalize";`,
       `import { parseSlackTimestamp } from "./sources/slack-message-evidence";`,
     ].join("\n"))).toEqual([]);
 
@@ -463,6 +521,33 @@ describe("the known-root requeue packet stays inside its boundary", () => {
       [`import { projectSlackMessageEvidence } from "./sources/slack-message-evidence";`, `${REQUEUE}: imports projectSlackMessageEvidence from lib/ingest/sources/slack-message-evidence.ts`],
     ];
     for (const [source, violation] of wholesale) expect(violationsOf(source), source).toEqual([violation]);
+
+    // The path helpers, each from the module that really exports it and nothing else from either.
+    const NAMESPACE = "lib/ingest/sources/slack-namespace.ts";
+    const NORMALIZE = "lib/ingest/sources/slack-normalize.ts";
+    const pathHelpers: [string, string][] = [
+      // The normalizer is allowed for ONE name. Its own entry point, its participant reader and its
+      // constant are not that name — alone, beside the permitted prefix, renamed, or wholesale.
+      [`import { normalizeThread } from "./sources/slack-normalize";`, `${REQUEUE}: imports normalizeThread from ${NORMALIZE}`],
+      [`import { slackChannelPathPrefix, normalizeThread } from "./sources/slack-normalize";`, `${REQUEUE}: imports normalizeThread from ${NORMALIZE}`],
+      [`import { normalizeThread as prefix } from "./sources/slack-normalize";`, `${REQUEUE}: imports normalizeThread from ${NORMALIZE}`],
+      [`import { threadParticipants } from "./sources/slack-normalize";`, `${REQUEUE}: imports threadParticipants from ${NORMALIZE}`],
+      [`import { REDACTED_MESSAGE } from "./sources/slack-normalize";`, `${REQUEUE}: imports REDACTED_MESSAGE from ${NORMALIZE}`],
+      [`import * as normalize from "./sources/slack-normalize";`, `${REQUEUE}: imports * from ${NORMALIZE}`],
+      [`const normalize = await import("./sources/slack-normalize");`, `${REQUEUE}: imports * from ${NORMALIZE}`],
+      // The legacy prefix is NOT a namespace export: asking the namespace module for it is refused,
+      // as are that module's parser and its scoped channel prefix.
+      [`import { slackChannelPathPrefix } from "./sources/slack-namespace";`, `${REQUEUE}: imports slackChannelPathPrefix from ${NAMESPACE}`],
+      [`import { scopedSlackItemPath, parseSlackItemPath } from "./sources/slack-namespace";`, `${REQUEUE}: imports parseSlackItemPath from ${NAMESPACE}`],
+      [`import { scopedSlackChannelPathPrefix } from "./sources/slack-namespace";`, `${REQUEUE}: imports scopedSlackChannelPathPrefix from ${NAMESPACE}`],
+      // …and the scoped builder is not a normalizer export.
+      [`import { scopedSlackItemPath } from "./sources/slack-normalize";`, `${REQUEUE}: imports scopedSlackItemPath from ${NORMALIZE}`],
+    ];
+    for (const [source, violation] of pathHelpers) expect(violationsOf(source), source).toEqual([violation]);
+    // The page module may not take the normalizer at all.
+    expect(dependencyViolations(new Map([...base, [PAGE, `import { slackChannelPathPrefix } from "./sources/slack-normalize";`]]), PAGE)).toEqual([
+      `${PAGE}: imports ${NORMALIZE}`,
+    ]);
     // The page module has the narrower allowlist: it may not take the queue writer at all.
     expect(dependencyViolations(new Map([...base, [PAGE, `import { enqueueSlackThread } from "./slack-thread-state";`]]), PAGE)).toEqual([
       `${PAGE}: imports lib/ingest/slack-thread-state.ts`,
