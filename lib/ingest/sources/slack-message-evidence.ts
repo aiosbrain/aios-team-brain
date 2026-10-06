@@ -161,6 +161,13 @@ const SCOPE_PATTERN = /^[^\s:]+$/;
 /** Subtypes that are still a person's own message. Everything else is structural or a file post. */
 const CREDITABLE_SUBTYPES = new Set(["thread_broadcast"]);
 
+/**
+ * Slack's own service account. Slack reports it with `is_bot: false` and `is_app_user: false`, so by
+ * the directory flags alone it is a known human; it is therefore excluded by its EXACT source author
+ * id. Equality, never a prefix or substring: `USLACKBOT2` is somebody's account.
+ */
+const SLACK_SERVICE_ACCOUNT_ID = "USLACKBOT";
+
 /** An exact Slack instant, kept as its integer parts so later packets can persist microseconds. */
 export interface ParsedInstant {
   seconds: number;
@@ -237,8 +244,10 @@ function classify(
 
   const user = opts.users?.[m.user];
   // A positive bot signal is decisive on its own, even from a partial record: half a record that
-  // says "bot" still says bot.
-  if (user?.isBot === true || user?.isAppUser === true) {
+  // says "bot" still says bot. The service account is the same verdict by id, whatever the directory
+  // read about it — an explicit mapping of that account to a person must not turn its text into
+  // that person's contribution.
+  if (m.user === SLACK_SERVICE_ACCOUNT_ID || user?.isBot === true || user?.isAppUser === true) {
     return { status: "excluded", reason: "bot_identity" };
   }
   // Credit requires a KNOWN human: the directory was read and stated BOTH flags false. Anything less

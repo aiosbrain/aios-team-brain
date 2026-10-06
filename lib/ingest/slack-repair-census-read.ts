@@ -205,10 +205,12 @@ const MAPPING_CANDIDATES_SQL = `
       limit $4
    ) c`;
 
+// The roster predicate credit projection uses: a HUMAN row that is not a connector. A standing agent
+// and an offroster actor are members, and neither is a person whose messages are personal credit.
 const HUMAN_MEMBERS_SQL = `
   select id::text as id
     from members
-   where team_id = $1 and id = any($2::uuid[]) and not is_connector`;
+   where team_id = $1 and id = any($2::uuid[]) and kind = 'human' and not is_connector`;
 
 // Byte-exact root and exact scope: the queue has no item key, so this is the only association allowed.
 const THREAD_ROOTS_SQL = `
