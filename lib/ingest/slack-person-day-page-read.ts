@@ -224,6 +224,17 @@ const QUERY_CANCELED = "57014";
  */
 const MAX_TIMER_MS = 2_147_483_647;
 
+/**
+ * A duration as the whole number of milliseconds a timer or a `statement_timeout` is given: never
+ * below 1 (0 means "no timeout" to the server, and "now" to a timer) and never above the maximum
+ * either accepts. Every deadline delay and every statement timeout of a page is derived HERE, so a
+ * monotonic clock that steps back — leaving more than the budget "remaining" — cannot produce a
+ * value the platform or the server refuses.
+ */
+function timerMs(durationMs: number): number {
+  return Math.min(MAX_TIMER_MS, Math.max(1, Math.ceil(durationMs)));
+}
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 const nonempty = (value: unknown): value is string => typeof value === "string" && value.length > 0;
@@ -376,7 +387,19 @@ function internalPageSize(options: SlackPersonDayPageOptions): number {
  */
 function outerSignal(value: unknown): AbortSignal | undefined {
   if (value === undefined) return undefined;
-  if (!(value instanceof AbortSignal)) return unavailable("outer signal is not an AbortSignal");
+  const refuse = (): never => unavailable("outer signal is not an AbortSignal");
+  if (typeof AbortSignal !== "function" || !(value instanceof AbortSignal)) return refuse();
+  // `instanceof` only walks a prototype chain, and any object can be given this one. The platform's
+  // own `aborted` getter checks the BRAND: called on a forgery it throws, and called on a real
+  // signal it only reports a boolean — it never throws the signal's abort reason. It is taken from
+  // the prototype, so a property the value defines for itself cannot answer in its place.
+  const brand = Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")?.get;
+  if (typeof brand !== "function") return refuse();
+  try {
+    brand.call(value);
+  } catch {
+    return refuse();
+  }
   return value;
 }
 
@@ -431,7 +454,7 @@ class PageRun {
     };
     let cancel: unknown;
     try {
-      cancel = deps.scheduleDeadline(expire, Math.max(1, Math.ceil(deps.budgets.maxElapsedMs)));
+      cancel = deps.scheduleDeadline(expire, timerMs(deps.budgets.maxElapsedMs));
     } catch {
       cancel = undefined;
     }
@@ -759,7 +782,7 @@ class SnapshotTransaction {
    */
   private async refreshTimeout(): Promise<void> {
     if (this.phase === "ended") return this.refuse();
-    const timeout = Math.max(1, Math.ceil(this.run.remaining()));
+    const timeout = timerMs(this.run.remaining());
     // Only an unchanged bound is skipped; any change in the remaining budget is sent to the server.
     if (timeout === this.applied) return;
     await this.send(`select set_config('statement_timeout', $1, true)`, [String(timeout)]);

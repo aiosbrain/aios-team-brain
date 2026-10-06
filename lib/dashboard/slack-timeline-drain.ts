@@ -72,6 +72,16 @@ const DRAIN_WINDOW_DAYS = 7;
 const MAX_ATTEMPTS = 2;
 /** The largest delay a platform timer honours (signed 32-bit milliseconds). One more fires after 1 ms. */
 const MAX_TIMER_MS = 2_147_483_647;
+
+/**
+ * A remaining duration as the delay a deadline is armed with: a whole number of milliseconds, never
+ * below 1 and never above what a timer honours. Every deadline of a drain is derived HERE, so a
+ * monotonic clock that steps back — leaving more than the budget "remaining" — cannot ask for a
+ * delay the platform would fire at once.
+ */
+function deadlineDelayMs(remainingMs: number): number {
+  return Math.min(MAX_TIMER_MS, Math.max(1, Math.ceil(remainingMs)));
+}
 const LOWER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 function unavailable(reason: string): never {
@@ -173,7 +183,7 @@ export async function drainSlackTimeline(dependencies: SlackTimelineDrainDepende
           settled = true;
           controller.abort();
           reject(exhausted("drain exceeded its elapsed budget while a call was pending"));
-        }, Math.max(1, Math.ceil(remaining)));
+        }, deadlineDelayMs(remaining));
       } catch {
         schedulerFailed = true;
       }
