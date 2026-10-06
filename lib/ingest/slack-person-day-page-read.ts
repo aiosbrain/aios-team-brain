@@ -1,5 +1,7 @@
 import "server-only";
 
+import type { PoolClient } from "pg";
+
 import type { ContentAdmission } from "@/lib/access/admission";
 import { visibleItemIdsForProjects } from "@/lib/access/enforce";
 import type { AuthorizedSlackCreditItem } from "@/lib/attribution/slack-credit-batch";
@@ -33,7 +35,7 @@ import {
 } from "@/lib/dashboard/slack-timeline-page-contract";
 import type { TimelineDay } from "@/lib/dashboard/timeline-group";
 import { PgClient } from "@/lib/db/pg/client";
-import { withTransaction } from "@/lib/db/pg/tx";
+import { getPool } from "@/lib/db/pg/pool";
 import type { SqlExecutor } from "@/lib/db/types";
 import { lookupSlackAccount, type SlackAccountMapping } from "@/lib/identity/resolve";
 import { readSlackCreditInputSnapshotInSession } from "./slack-credit-input-snapshot";
@@ -319,8 +321,12 @@ function validDependencies(dependencies: SlackPersonDayPageDependencies): ValidD
   for (const name of ["now", "monotonicNow", "loadAdmission", "loadPresentation", "composeSlackPage", "loadInitialNonSlack"]) {
     if (typeof d[name] !== "function") return unavailable("page dependencies are missing");
   }
-  const key = d.slackTimelineCursorKey;
-  if (!(key instanceof Uint8Array) || key.byteLength !== 32) return unavailable("cursor key is not configured");
+  const callerKey = d.slackTimelineCursorKey;
+  if (!(callerKey instanceof Uint8Array) || callerKey.byteLength !== 32) return unavailable("cursor key is not configured");
+  // Copied HERE, synchronously, into storage of its own: the caller may overwrite or zeroise its
+  // buffer while a dependency is suspended, and the page must still open and seal cursors with the
+  // key it was given. `new Uint8Array(typedArray)` copies the bytes; it never shares a Buffer slice.
+  const key = new Uint8Array(callerKey);
   const scheduleDeadline = d.scheduleDeadline === undefined ? platformTimer : d.scheduleDeadline;
   if (typeof scheduleDeadline !== "function") return unavailable("deadline scheduler is misconfigured");
 
