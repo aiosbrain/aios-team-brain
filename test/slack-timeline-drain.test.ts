@@ -1058,3 +1058,183 @@ describe("Slack timeline drain — pending work and the shared deadline", () => 
     expect(w.calls.final).toEqual([]);
   });
 });
+
+/**
+ * Stage 4 review. Two things the cases above did not pin.
+ *
+ *  - THE TIMER BOUND. A platform timer honours a delay of at most 2 147 483 647 ms; given one
+ *    millisecond more, Node warns and fires after a single millisecond. An elapsed budget above that
+ *    bound is therefore not "a very long budget" but an immediate deadline, and it is configuration
+ *    the drain must refuse before it requests anything or arms anything.
+ *
+ *  - ACCEPTED PAGES THAT CHANGE AFTERWARDS. The drain accepts a page, then awaits the next page and
+ *    final validation. A page service that keeps the graph it returned — a cache does — can change
+ *    that graph during those awaits. What the drain publishes must be the pages it ACCEPTED: it
+ *    either holds its own copy or refuses, and its result never changes under the caller either.
+ *
+ * Each case says whether CURRENT production is expected to fail it (a falsifier) or to pass it already
+ * (a control, kept so a later change cannot quietly lose the behaviour).
+ */
+describe("Slack timeline drain — the timer bound, and accepted pages that change afterwards (Stage 4 review)", () => {
+  const TIMER_MAX_MS = 2_147_483_647;
+
+  /** A scheduler that never fires and records every delay it was asked for. */
+  function recordingScheduler(): { timers: { delayMs: number; cancelled: boolean }[]; scheduleDeadline: (callback: () => void, delayMs: number) => () => void } {
+    const timers: { delayMs: number; cancelled: boolean }[] = [];
+    return {
+      timers,
+      scheduleDeadline: (_callback, delayMs) => {
+        const timer = { delayMs, cancelled: false };
+        timers.push(timer);
+        return () => { timer.cancelled = true; };
+      },
+    };
+  }
+
+  // CONTROL — expected to pass on current production.
+  it("accepts an elapsed budget of exactly the signed 32-bit timer maximum, and never asks for a longer delay (control)", async () => {
+    const d = await drainModule();
+    const w = world([stable()], 2);
+    const clock = recordingScheduler();
+    const result = await d.drainSlackTimeline({
+      ...w.deps, budgets: { maxElapsedMs: TIMER_MAX_MS }, monotonicNow: () => 0, scheduleDeadline: clock.scheduleDeadline,
+    });
+    expect(result.days).toEqual(expected(stable()));
+    expect(clock.timers.length, "the drain armed a deadline").toBeGreaterThan(0);
+    for (const timer of clock.timers) {
+      expect(Number.isSafeInteger(timer.delayMs) && timer.delayMs >= 1, "a deadline is a positive whole delay").toBe(true);
+      expect(timer.delayMs, "a delay the platform timer honours").toBeLessThanOrEqual(TIMER_MAX_MS);
+      expect(timer.cancelled).toBe(true);
+    }
+  });
+
+  // FALSIFIER — current production accepts the budget and arms a timer with it.
+  it.each([
+    ["one millisecond above the timer maximum", TIMER_MAX_MS + 1],
+    ["2^32 milliseconds", 2 ** 32],
+    ["the largest safe integer", Number.MAX_SAFE_INTEGER],
+  ])("refuses an elapsed budget of %s as unavailable configuration, before any request and before any timer", async (_label, maxElapsedMs) => {
+    const d = await drainModule();
+    const w = world([stable()], 2);
+    const clock = recordingScheduler();
+    const failure = await failureOf(() => d.drainSlackTimeline({
+      ...w.deps, budgets: { maxElapsedMs }, monotonicNow: () => 0, scheduleDeadline: clock.scheduleDeadline,
+    }));
+    expect(failure).toMatchObject({ name: "SlackTimelineError", code: "unavailable" });
+    expect(failure).not.toHaveProperty("days");
+    expect(w.calls.start, "nothing was requested").toEqual([]);
+    expect(w.calls.final).toEqual([]);
+    expect(clock.timers, "no deadline was armed with a delay the platform cannot honour").toHaveLength(0);
+  });
+
+  function deepFreeze<T>(value: T): T {
+    if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+      Object.freeze(value);
+      for (const child of Object.values(value)) deepFreeze(child);
+    }
+    return value;
+  }
+
+  /**
+   * A page service that RETAINS every page it returns and can rewrite them later. Every write is
+   * attempted on its own: a drain that froze a page in place has made it immutable too, and the
+   * rewrite is then simply refused by the runtime — which is equally an accepted answer.
+   */
+  function retainingService() {
+    const returned: Json[] = [];
+    let rewrites = 0;
+    const poke = (change: () => void): void => {
+      try {
+        change();
+      } catch {
+        // frozen in place: it cannot change under the drain either
+      }
+    };
+    return {
+      returned,
+      rewrites: () => rewrites,
+      retain: (page: Json): Json => { returned.push(page); return page; },
+      rewrite: (): void => {
+        if (returned.length === 0) return;
+        rewrites++;
+        for (const page of returned) {
+          for (const day of page.days as TimelineDay[]) {
+            for (const person of day.people) {
+              for (const group of [...person.tasks.flatMap((task) => task.sources), ...person.other]) {
+                // The rows are the objects the shared merger keeps by reference: Slack and non-Slack alike.
+                for (const row of group.items) poke(() => { row.title = "MUTATED after the drain accepted this page"; });
+                poke(() => { group.items.push({ id: "late-row", title: "MUTATED added row", source: group.source, kind: "pr", at: "2024-06-20T09:00:00Z" } as never); });
+              }
+              poke(() => { person.name = "MUTATED person"; });
+            }
+            poke(() => { day.label = "MUTATED label"; });
+          }
+          poke(() => { (page.binding as Json).dataGeneration = "999"; });
+          poke(() => { (page.initialNonSlackSourceItemIds as string[] | undefined)?.push(item(99)); });
+          poke(() => { (page.aggregates as Json[]).length = 0; });
+        }
+      },
+    };
+  }
+
+  // FALSIFIER — current production publishes the rewritten rows: the accumulated days share row
+  // objects with the pages they were merged from. (Its pinned binding and backing IDs are copies
+  // already; those assertions are expected to hold today.)
+  it.each([
+    ["while a later page is being requested", "page"],
+    ["during final validation", "final"],
+  ] as const)("publishes the pages it ACCEPTED when the page service rewrites them %s", async (_label, when) => {
+    const d = await drainModule();
+    const service = retainingService();
+    const w = world([stable(), stable({ asOfMs: AS_OF_2 })], 2, {
+      // The drain is handed the very objects the service keeps.
+      tamper: (page) => service.retain(page),
+      before: () => { if (when === "page") service.rewrite(); },
+      final: () => { if (when === "final") service.rewrite(); },
+    });
+    let result: Loose | null = null;
+    let failure: Json | null = null;
+    try {
+      result = await d.drainSlackTimeline(w.deps);
+    } catch (error) {
+      const e = error as Json;
+      failure = { ...e, name: String(e?.name), code: String(e?.code) };
+    }
+    expect(service.rewrites(), "the service rewrote pages it had already returned, while the drain was still running").toBeGreaterThan(0);
+
+    if (result === null) {
+      // Refusing a page graph that will not hold still is an accepted answer; a raw error is not.
+      expect(failure).toMatchObject({ name: "SlackTimelineError" });
+      expect(["restart_required", "unavailable"]).toContain(failure?.code);
+      expect(failure).not.toHaveProperty("days");
+      return;
+    }
+    // Otherwise the answer is exactly the accepted snapshot: nothing rewritten, nothing added.
+    expect(JSON.stringify(result)).not.toContain("MUTATED");
+    expect(JSON.stringify(result)).not.toContain("late-row");
+    expect(result).toEqual({ window_days: 7, days: expected(stable()) });
+    // Final validation was asked about the binding and backing IDs that were PINNED, not rewritten ones.
+    expect(w.calls.final).toEqual([{ binding: binding(AS_OF_1, 2), initialNonSlackSourceItemIds: [GITHUB_ITEM] }]);
+
+    // And the published result is the caller's: a later rewrite of the service's pages cannot reach it.
+    const published = JSON.stringify(result);
+    service.rewrite();
+    expect(JSON.stringify(result)).toBe(published);
+  });
+
+  // CONTROL — expected to pass on current production. The real reader publishes deeply frozen pages
+  // (the data-mechanics suite pins that); whatever the drain does to hold its own copy, it may not
+  // need to write into a page it was handed.
+  it("drains deeply frozen pages to the same result, writing into none of them (control)", async () => {
+    const d = await drainModule();
+    for (const size of [1, 2, 128]) {
+      const pages: Json[] = [];
+      const w = world([stable()], size, { tamper: (page) => { pages.push(deepFreeze(page)); return page; } });
+      const result = await d.drainSlackTimeline(w.deps);
+      expect(result.days).toEqual(expected(stable()));
+      expect(pages).toHaveLength(Math.ceil(FIVE.length / size));
+      // The first page's backing IDs and binding reached final validation intact.
+      expect(w.calls.final).toEqual([{ binding: binding(AS_OF_1, size), initialNonSlackSourceItemIds: [GITHUB_ITEM] }]);
+    }
+  });
+});

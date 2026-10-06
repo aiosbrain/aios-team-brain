@@ -2936,6 +2936,499 @@ describe("aggregate Slack page — pending work, cancellation and statement time
     expect(short).not.toHaveProperty("aggregates");
     expect(await openTransactionsSettleToZero()).toBe(0);
   });
+
+  // ── Stage 4 review: runtime input, the timer bound, and the transaction lifecycle ──────────────
+  //
+  // Every case below is marked. A FALSIFIER is expected to fail on current production. A CONTROL is
+  // expected to pass already, and is kept so a later change cannot quietly lose the behaviour; none
+  // of the controls is written to fail.
+
+  /** The largest delay a Node timer honours, and the largest `statement_timeout` PostgreSQL accepts. */
+  const TIMER_MAX_MS = 2_147_483_647;
+
+  /** Pool checkouts made while `work` runs: zero means no connection was ever asked for. */
+  async function checkoutsDuring<T>(work: () => Promise<T>): Promise<{ value: T; checkouts: number }> {
+    const pool = getPool();
+    let checkouts = 0;
+    const onAcquire = (): void => { checkouts++; };
+    pool.on("acquire", onAcquire);
+    try {
+      const value = await work();
+      return { value, checkouts };
+    } finally {
+      pool.off("acquire", onAcquire);
+    }
+  }
+
+  /** A published page and the final-validation input built from it, read before anything is disturbed. */
+  async function publishedInput(s: Scene): Promise<Json> {
+    const published = await page(s.w);
+    return { ...request(s.w), binding: published.binding, initialNonSlackSourceItemIds: published.initialNonSlackSourceItemIds };
+  }
+
+  const UNITS = ["a page", "final validation"] as const;
+
+  /** Run one unit under test with the given options and dependency overrides. */
+  async function runUnit(s: Scene, unit: (typeof UNITS)[number], input: Json, options: Json, deps: Json): Promise<unknown> {
+    if (unit === "a page") return page(s.w, {}, options, deps);
+    return (await reader()).validateSlackPersonDayFinal(input, dependencies(s.w, deps), options);
+  }
+
+  // FALSIFIER. `options.signal` is runtime input: a caller that passes the controller instead of its
+  // signal, or a deserialized look-alike, must get one of the four failures. Current production
+  // arms its deadline first and then calls `addEventListener` on whatever it was given.
+  it.each<[string, () => unknown]>([
+    ["an empty object", () => ({})],
+    ["a string", () => "abort"],
+    ["a number", () => 42],
+    ["true", () => true],
+    ["an AbortController instead of its signal", () => new AbortController()],
+    ["a plain object that says it is aborted", () => ({ aborted: true })],
+  ])("refuses %s as its outer signal: unavailable, before any checkout or read, with no deadline left armed", async (_label, make) => {
+    const s = await oneThread();
+    const input = await publishedInput(s);
+    for (const unit of UNITS) {
+      const clock = fakeTimers();
+      const reads = s.w.seen.admission.length;
+      const { value: failure, checkouts } = await checkoutsDuring(() =>
+        failureOf(() => runUnit(s, unit, input, { signal: make() }, { scheduleDeadline: clock.scheduleDeadline })));
+      // Never a raw TypeError from a method the value does not have.
+      expect(failure, unit).toMatchObject({ name: "SlackTimelineError", code: "unavailable" });
+      expect(failure, unit).not.toHaveProperty("days");
+      expect(checkouts, `${unit}: no connection was checked out`).toBe(0);
+      expect(s.w.seen.admission.length, `${unit}: nothing was read`).toBe(reads);
+      expect(clock.timers.filter((t) => !t.cancelled && !t.fired), `${unit}: no deadline is left armed`).toEqual([]);
+    }
+    expect(await openTransactionsSettleToZero()).toBe(0);
+  });
+
+  // FALSIFIER. Current production accepts anything with the two listener methods and reads a page.
+  it("refuses an object that only LOOKS like an AbortSignal, and leaves no listener on it", async () => {
+    const s = await oneThread();
+    const input = await publishedInput(s);
+    for (const unit of UNITS) {
+      const clock = fakeTimers();
+      const attached: unknown[] = [];
+      const lookalike = {
+        aborted: false, reason: undefined, onabort: null,
+        addEventListener: (_type: string, listener: unknown): void => { attached.push(listener); },
+        removeEventListener: (_type: string, listener: unknown): void => {
+          const at = attached.indexOf(listener);
+          if (at >= 0) attached.splice(at, 1);
+        },
+        dispatchEvent: (): boolean => true,
+        throwIfAborted: (): void => undefined,
+      };
+      const reads = s.w.seen.admission.length;
+      const failure = await failureOf(() => runUnit(s, unit, input, { signal: lookalike }, { scheduleDeadline: clock.scheduleDeadline }));
+      expect(failure, unit).toMatchObject({ name: "SlackTimelineError", code: "unavailable" });
+      expect(attached, `${unit}: no listener is left on the object`).toEqual([]);
+      expect(s.w.seen.admission.length, `${unit}: nothing was read`).toBe(reads);
+      expect(clock.timers.filter((t) => !t.cancelled && !t.fired), `${unit}: no deadline is left armed`).toEqual([]);
+    }
+    expect(await openTransactionsSettleToZero()).toBe(0);
+  });
+
+  // CONTROL. The bound itself is a valid budget: a timer delay the platform honours and a statement
+  // timeout the server accepts.
+  it("accepts an elapsed budget of exactly the signed 32-bit maximum, as a timer delay and as a statement timeout (control)", async () => {
+    const s = await oneThread();
+    const clock = fakeTimers();
+    let serverTimeoutMs = 0;
+    s.w.mono = 0;
+    const p = await page(s.w, {}, {
+      afterTransactionConfigured: async (query: SqlExecutor) => {
+        serverTimeoutMs = (await query<{ ms: number }>(`select setting::int as ms from pg_settings where name = 'statement_timeout'`)).rows[0].ms;
+      },
+    }, { scheduleDeadline: clock.scheduleDeadline, budgets: { maxElapsedMs: TIMER_MAX_MS } });
+    expect(p.aggregates).toHaveLength(1);
+    // Never 0 ("no timeout"), and never more than the server's own maximum.
+    expect(serverTimeoutMs).toBeGreaterThan(0);
+    expect(serverTimeoutMs).toBeLessThanOrEqual(TIMER_MAX_MS);
+    expect(clock.timers.length, "the page armed a deadline").toBeGreaterThan(0);
+    for (const t of clock.timers) {
+      expect(Number.isSafeInteger(t.delayMs) && t.delayMs >= 1, "a deadline is a positive whole delay").toBe(true);
+      expect(t.delayMs, "a delay the platform timer honours").toBeLessThanOrEqual(TIMER_MAX_MS);
+      expect(t.cancelled).toBe(true);
+    }
+    expect(await openTransactionsSettleToZero()).toBe(0);
+  });
+
+  // FALSIFIER. One millisecond above the bound, a Node timer fires after ONE millisecond and
+  // PostgreSQL rejects the statement timeout. Current production arms that timer, opens a
+  // transaction and fails on the server's error; the budget must be refused as configuration first.
+  it.each([
+    ["one millisecond above the timer maximum", TIMER_MAX_MS + 1],
+    ["2^32 milliseconds", 2 ** 32],
+    ["the largest safe integer", Number.MAX_SAFE_INTEGER],
+  ])("refuses an elapsed budget of %s as unavailable configuration, before any timer, checkout or read", async (_label, maxElapsedMs) => {
+    const s = await oneThread();
+    const input = await publishedInput(s);
+    for (const unit of UNITS) {
+      const clock = fakeTimers();
+      const reads = s.w.seen.admission.length;
+      const { value: failure, checkouts } = await checkoutsDuring(() =>
+        failureOf(() => runUnit(s, unit, input, {}, { scheduleDeadline: clock.scheduleDeadline, budgets: { maxElapsedMs } })));
+      expect(failure, unit).toMatchObject({ name: "SlackTimelineError", code: "unavailable" });
+      expect(failure, unit).not.toHaveProperty("days");
+      expect(clock.timers, `${unit}: no deadline was armed with a delay the platform cannot honour`).toHaveLength(0);
+      expect(checkouts, `${unit}: no connection was checked out`).toBe(0);
+      expect(s.w.seen.admission.length, `${unit}: nothing was read`).toBe(reads);
+    }
+    expect(await openTransactionsSettleToZero()).toBe(0);
+  });
+
+  // CONTROL. An outer signal that was aborted before the call: nothing is checked out or read.
+  // (`budget_exhausted` is what an ended outer deadline already reports today; it is retained, not new.)
+  it.each(UNITS)("ends %s at once when its outer signal was ALREADY aborted: no checkout, no read, no deadline left armed (control)", async (unit) => {
+    const s = await oneThread();
+    const input = await publishedInput(s);
+    const clock = fakeTimers();
+    const controller = new AbortController();
+    controller.abort();
+    const reads = s.w.seen.admission.length;
+    s.w.mono = 0;
+    const { value: failure, checkouts } = await checkoutsDuring(() =>
+      failureOf(() => runUnit(s, unit, input, { signal: controller.signal }, { scheduleDeadline: clock.scheduleDeadline })));
+    expect(failure).toMatchObject({ name: "SlackTimelineError", code: "budget_exhausted" });
+    for (const partial of ["days", "aggregates", "binding", "nextSlackCursor", "slackComplete"]) expect(failure).not.toHaveProperty(partial);
+    expect(checkouts, "no connection was checked out").toBe(0);
+    expect(s.w.seen.admission.length, "nothing was read").toBe(reads);
+    expect(clock.timers.filter((t) => !t.cancelled && !t.fired), "no deadline is left armed").toEqual([]);
+    expect(await openTransactionsSettleToZero()).toBe(0);
+    // The same call with a live signal is an ordinary page.
+    expect((await page(s.w, {}, { signal: new AbortController().signal })).aggregates).toHaveLength(1);
+  });
+
+  // CONTROL. The pool-checkout case above is ended by the page's own deadline. Here the budget is
+  // untouched and no deadline fires: only the OUTER abort can end the wait, and the client the pool
+  // serves afterwards must run nothing and be destroyed, not kept.
+  it("ends at once when the outer signal aborts while the pool checkout is still blocked; the late client runs nothing and is destroyed (control)", { timeout: 30_000 }, async () => {
+    const s = await oneThread();
+    const clock = fakeTimers();
+    const pool = getPool();
+    const controller = new AbortController();
+    const late = lateClients(pool);
+    let hold: { release: () => void } | null = null;
+    let run: Watched | null = null;
+    s.w.mono = 0;
+    try {
+      hold = await holdWholePool();
+      run = watch(page(s.w, {}, { signal: controller.signal }, { scheduleDeadline: clock.scheduleDeadline, budgets: { maxElapsedMs: BUDGET_MS } }));
+      const started = run;
+      await turnsWhile(() => pool.waitingCount === 0 && started.state().state === "pending");
+      expect(pool.waitingCount, "the transaction's checkout is waiting on the exhausted pool").toBeGreaterThanOrEqual(1);
+      expect(started.state().state).toBe("pending");
+
+      controller.abort();
+      await turnsWhile(() => started.state().state === "pending");
+      const after = started.state();
+      expect(after.state, "the outer abort ends it without waiting for a connection").toBe("rejected");
+      const failure = (after as { error: Json }).error;
+      expect(failure).toMatchObject({ name: "SlackTimelineError", code: "budget_exhausted" });
+      for (const partial of ["days", "aggregates", "binding", "nextSlackCursor", "slackComplete"]) expect(failure).not.toHaveProperty(partial);
+      expect(clock.timers.filter((t) => t.fired), "no deadline fired: the abort ended it").toEqual([]);
+      expect(clock.timers.filter((t) => !t.cancelled), "no deadline is left armed").toEqual([]);
+
+      // Only now is a connection available; the abandoned checkout is served LATE.
+      const waiting = pool.waitingCount;
+      late.during(() => (hold as { release: () => void } | null)?.release());
+      expect(late.seen, "each abandoned checkout was served a client late").toHaveLength(waiting);
+      await turnsWhile(() => late.seen.some((client) => !client.disposed));
+      for (let n = 0; n < 200 && late.seen.some((client) => !client.disposed); n++) await runSql(`select 1`).catch(() => undefined);
+      for (const client of late.seen) {
+        expect(client.statements, "no statement was sent on the late client").toEqual([]);
+        expect(client.disposed, "the late client was disposed, not kept").toBe(true);
+        expect(client.destroyed, "the late client was destroyed, not returned for reuse").toBe(true);
+      }
+      expect(await poolSettlesClean(pool)).toEqual({ waiting: 0, checkedOut: 0, inTransaction: 0 });
+      expect(started.state()).toBe(after);
+      expect((await page(s.w)).aggregates).toHaveLength(1);
+    } finally {
+      controller.abort();
+      (hold as { release: () => void } | null)?.release();
+      if (run) await settlesWithin(run);
+      late.stop();
+      for (const t of clock.timers) t.cancelled = true;
+    }
+  });
+
+  /** A REAL AbortSignal whose `abort` listeners are tracked as they are attached and withdrawn. */
+  function observedSignal(): { controller: AbortController; signal: AbortSignal; attached: Set<unknown> } {
+    const controller = new AbortController();
+    const signal = controller.signal;
+    const attached = new Set<unknown>();
+    const add = signal.addEventListener.bind(signal) as (...args: unknown[]) => void;
+    const remove = signal.removeEventListener.bind(signal) as (...args: unknown[]) => void;
+    const own = signal as unknown as Loose;
+    own.addEventListener = (...args: unknown[]): void => { if (args[0] === "abort") attached.add(args[1]); add(...args); };
+    own.removeEventListener = (...args: unknown[]): void => { if (args[0] === "abort") attached.delete(args[1]); remove(...args); };
+    return { controller, signal, attached };
+  }
+
+  // CONTROL. A long-lived outer signal (a request's, a drain's) must not collect one listener per
+  // page, and aborting it later must not reach a page that has already been returned.
+  it("leaves no listener on the outer signal after success or failure, and a later abort is inert (control)", async () => {
+    const s = await oneThread();
+    const real = dependencies(s.w);
+    const handed: AbortSignal[] = [];
+    const recording = (name: string) => (query: SqlExecutor, context: Json): unknown => {
+      handed.push(context.signal as AbortSignal);
+      return (real[name] as (q: SqlExecutor, c: Json) => unknown)(query, context);
+    };
+    const loaders = { loadAdmission: recording("loadAdmission"), loadPresentation: recording("loadPresentation"), loadInitialNonSlack: recording("loadInitialNonSlack") };
+    const clock = fakeTimers();
+
+    // A page that completes, and final validation of it: both under their own observed signals.
+    const completed = observedSignal();
+    const published = await page(s.w, {}, { signal: completed.signal }, { ...loaders, scheduleDeadline: clock.scheduleDeadline });
+    expect(published.aggregates).toHaveLength(1);
+    expect(completed.attached.size, "a completed page leaves no listener behind").toBe(0);
+    const validated = observedSignal();
+    await (await reader()).validateSlackPersonDayFinal(
+      { ...request(s.w), binding: published.binding, initialNonSlackSourceItemIds: published.initialNonSlackSourceItemIds },
+      dependencies(s.w, { ...loaders, scheduleDeadline: clock.scheduleDeadline }), { signal: validated.signal }
+    );
+    expect(validated.attached.size, "a completed final validation leaves no listener behind").toBe(0);
+    const handedToCompletedWork = [...handed];
+    expect(handedToCompletedWork.length).toBeGreaterThan(0);
+
+    // A page that fails for an ordinary reason, inside its open transaction.
+    const failed = observedSignal();
+    s.w.fail.presentation = new Error("presentation store is down");
+    try {
+      await expectFailure(() => page(s.w, {}, { signal: failed.signal }, { scheduleDeadline: clock.scheduleDeadline }), "unavailable");
+    } finally {
+      s.w.fail.presentation = undefined;
+    }
+    expect(failed.attached.size, "a failed page leaves no listener behind").toBe(0);
+
+    // Aborting afterwards reaches nothing that has already ended.
+    for (const observed of [completed, validated, failed]) observed.controller.abort();
+    await turn();
+    expect(handedToCompletedWork.every((signal) => !signal.aborted), "a later outer abort does not reach a returned page's loaders").toBe(true);
+    expect(clock.timers.filter((t) => !t.cancelled), "every deadline was cancelled").toEqual([]);
+    expect(await openTransactionsSettleToZero()).toBe(0);
+    expect((await page(s.w)).aggregates).toHaveLength(1);
+  });
+
+  /** The backend pid of every session the pool can hand out: the whole pool, checked out at once. */
+  async function pooledBackendPids(pool: Pool): Promise<number[]> {
+    const held: PoolClient[] = [];
+    try {
+      for (let n = 0; n < pool.options.max; n++) held.push(await pool.connect());
+      const pids: number[] = [];
+      for (const client of held) pids.push((await client.query<{ pid: number }>(`select pg_backend_pid() as pid`)).rows[0].pid);
+      return pids;
+    } finally {
+      for (const client of held) client.release();
+    }
+  }
+
+  // CONTROL. The cases above end a page while a LOADER is pending, or before BEGIN. Here the page's
+  // own deadline fires while the SERVER is executing a statement inside the open transaction. The
+  // statement's timeout (the five-second budget) is longer than the statement, so only the page
+  // deadline can end it; the session is then mid-statement, of unknown state, and may never be reused.
+  it("ends on the page deadline while a statement of its OPEN transaction is executing on the server, and that session never returns to the pool (control)", { timeout: 30_000 }, async () => {
+    const s = await oneThread();
+    const clock = fakeTimers();
+    const pool = getPool();
+    let pid: number | null = null;
+    let completed = false;
+    let markSent = (): void => undefined;
+    const sent = new Promise<void>((resolve) => { markSent = resolve; });
+    // The first checkout after this point is the page's evidence transaction: the test touches the
+    // pool again only after that session exists.
+    let session: PoolClient | null = null;
+    const fate: { destroyed: boolean }[] = [];
+    let takenAgain = 0;
+    const onAcquire = (client: PoolClient): void => {
+      if (session === null) session = client;
+      else if (client === session) takenAgain++;
+    };
+    const onRelease = (error: unknown, client: PoolClient): void => {
+      if (client === session) fate.push({ destroyed: Boolean(error) });
+    };
+    s.w.mono = 0;
+    pool.on("acquire", onAcquire);
+    pool.on("release", onRelease);
+    const run = watch(page(s.w, {}, {
+      afterDiscovery: async (query: SqlExecutor) => {
+        pid = (await query<{ pid: number }>(`select pg_backend_pid() as pid`)).rows[0].pid;
+        const statement = query(`select pg_sleep(3)`);
+        markSent();
+        await statement;
+        completed = true;
+      },
+    }, { scheduleDeadline: clock.scheduleDeadline, budgets: { maxElapsedMs: BUDGET_MS } }));
+    try {
+      const first = await Promise.race([sent.then(() => "sent" as const), run.done]);
+      if (first !== "sent") {
+        if (first.state === "rejected") throw first.error;
+        throw new Error("the page completed without reaching its in-transaction statement");
+      }
+      // The scenario is real, and it is the SERVER that says so: that backend is executing the
+      // statement, inside the page's transaction, right now.
+      let executing = false;
+      for (let n = 0; n < 400 && !executing && run.state().state === "pending"; n++) {
+        executing = (await runSql<{ n: number }>(
+          `select count(*)::int as n from pg_stat_activity
+            where pid = $1::int and state = 'active' and xact_start is not null and query like '%pg_sleep(3)%'`, [pid]
+        )).rows[0].n === 1;
+      }
+      expect(executing, "the statement is executing on the page's own session").toBe(true);
+      expect(run.state().state, "nothing ends the page before its deadline").toBe("pending");
+
+      s.w.mono = BUDGET_MS + 1;
+      clock.fireAll();
+      await turnsWhile(() => run.state().state === "pending");
+      const after = run.state();
+      expect(completed, "the page did not wait for its statement to finish").toBe(false);
+      expect(after.state, "the deadline ends it while the statement is still executing").toBe("rejected");
+      const failure = (after as { error: Json }).error;
+      expect(failure).toMatchObject({ name: "SlackTimelineError", code: "budget_exhausted" });
+      for (const partial of ["days", "aggregates", "binding", "nextSlackCursor", "slackComplete"]) expect(failure).not.toHaveProperty(partial);
+      expect(String(failure.message)).not.toContain("pg_sleep");
+      expect(clock.timers.filter((t) => !t.cancelled && !t.fired), "no deadline is left armed").toEqual([]);
+
+      // What the POOL saw: that one session was given back exactly once, destructively…
+      for (let n = 0; n < 200 && fate.length === 0; n++) await runSql(`select 1`).catch(() => undefined);
+      expect(fate, "the mid-statement session was destroyed, not released for reuse").toEqual([{ destroyed: true }]);
+      // …and what the SERVER says: no session the pool can hand out is that backend.
+      expect(await pooledBackendPids(pool), "the poisoned backend is not in the pool").not.toContain(pid);
+      expect(takenAgain, "the session was never acquired again").toBe(0);
+
+      // Test-owned tidy-up of the orphaned backend (it would otherwise sleep out its three seconds).
+      // Only reached once the assertions above have shown the pool does not hold it.
+      await runSql(`select pg_terminate_backend($1::int)`, [pid]).catch(() => undefined);
+      expect(await poolSettlesClean(pool)).toEqual({ waiting: 0, checkedOut: 0, inTransaction: 0 });
+      expect(run.state()).toBe(after);
+      s.w.mono = 0;
+      expect((await page(s.w)).aggregates).toHaveLength(1);
+    } finally {
+      pool.off("acquire", onAcquire);
+      pool.off("release", onRelease);
+      s.w.mono = BUDGET_MS + 1;
+      clock.fireAll();
+      await settlesWithin(run);
+      for (const t of clock.timers) t.cancelled = true;
+    }
+  });
+
+  // CONTROL. The narrowest window: COMMIT has been sent and the server has not answered. The fake
+  // deadline is fired from the DRIVER boundary, in the very call that puts COMMIT on the wire, so
+  // nothing in the reader is consulted about when. A session whose COMMIT went unanswered is of
+  // unknown state: there is no page, and that session is destroyed.
+  it.each([
+    ["the evidence transaction", 1],
+    ["the validation transaction", 2],
+  ] as const)("ends on the page deadline while the COMMIT of %s is unanswered: no page, and that session never returns to the pool (control)", { timeout: 30_000 }, async (_label, nth) => {
+    const s = await oneThread();
+    const clock = fakeTimers();
+    const pool = getPool();
+    const patched = new Set<PoolClient>();
+    const fate: { destroyed: boolean }[] = [];
+    let commits = 0;
+    let unanswered: PoolClient | null = null;
+    let pid: number | null = null;
+    const onAcquire = (client: PoolClient): void => {
+      if (patched.has(client)) return;
+      patched.add(client);
+      const original = client.query as unknown as (...args: unknown[]) => unknown;
+      (client as unknown as { query: unknown }).query = function (this: unknown, ...args: unknown[]): unknown {
+        const first = args[0] as { text?: unknown } | string | undefined;
+        const text = typeof first === "string" ? first : String(first?.text ?? "");
+        // The statement goes to the driver FIRST: the transaction's end really is on the wire.
+        const out = original.apply(this, args);
+        if (unanswered === null && /^\s*(commit|end)\b/i.test(text) && ++commits === nth) {
+          unanswered = client;
+          // The fixture's loaders recorded the backend of every transaction they ran in; the latest is this one.
+          pid = s.w.seen.snapshots.at(-1)?.pid ?? null;
+          s.w.mono = BUDGET_MS + 1;
+          clock.fireAll();
+        }
+        return out;
+      };
+    };
+    const onRelease = (error: unknown, client: PoolClient): void => {
+      if (client === unanswered) fate.push({ destroyed: Boolean(error) });
+    };
+    const stop = (): void => {
+      pool.off("acquire", onAcquire);
+      pool.off("release", onRelease);
+      for (const client of patched) delete (client as unknown as { query?: unknown }).query; // back to the prototype's method
+      patched.clear();
+    };
+    s.w.mono = 0;
+    s.w.seen.snapshots.length = 0;
+    pool.on("acquire", onAcquire);
+    pool.on("release", onRelease);
+    const run = watch(page(s.w, {}, {}, { scheduleDeadline: clock.scheduleDeadline, budgets: { maxElapsedMs: BUDGET_MS } }));
+    try {
+      const after = await settlesWithin(run);
+      expect(commits, "the page reached that COMMIT").toBe(nth);
+      expect(unanswered, "the deadline fired with COMMIT on the wire").not.toBeNull();
+      expect(after.state, "a page whose time ran out at COMMIT is not published").toBe("rejected");
+      const failure = (after as { error: Json }).error;
+      expect(failure).toMatchObject({ name: "SlackTimelineError", code: "budget_exhausted" });
+      for (const partial of ["days", "aggregates", "binding", "nextSlackCursor", "slackComplete"]) expect(failure).not.toHaveProperty(partial);
+      expect(clock.timers.filter((t) => !t.cancelled && !t.fired), "no deadline is left armed").toEqual([]);
+
+      for (let n = 0; n < 200 && fate.length === 0; n++) await runSql(`select 1`).catch(() => undefined);
+      expect(fate, "the session whose COMMIT went unanswered was destroyed, not released for reuse").toEqual([{ destroyed: true }]);
+      stop();
+      expect(pid, "the transaction's backend was recorded").not.toBeNull();
+      expect(await pooledBackendPids(pool), "that backend is not in the pool").not.toContain(pid);
+      expect(await poolSettlesClean(pool)).toEqual({ waiting: 0, checkedOut: 0, inTransaction: 0 });
+      expect(run.state()).toBe(after);
+      s.w.mono = 0;
+      expect((await page(s.w)).aggregates).toHaveLength(1);
+    } finally {
+      s.w.mono = BUDGET_MS + 1;
+      clock.fireAll();
+      await settlesWithin(run);
+      stop();
+      for (const t of clock.timers) t.cancelled = true;
+    }
+  });
+
+  // CONTROL. The other side of the two cases above: a transaction the server ANSWERED — COMMIT after
+  // an ordinary page, ROLLBACK after an ordinary failure — leaves a clean session, and destroying
+  // those would turn every page into a new connection.
+  it("returns its sessions to the pool reusable after an answered COMMIT and after an answered ROLLBACK (control)", async () => {
+    const s = await oneThread();
+    const pool = getPool();
+    const ended: { destroyed: boolean }[] = [];
+    const onRelease = (error: unknown): void => { ended.push({ destroyed: Boolean(error) }); };
+    const backends = (): number[] => [...new Set(s.w.seen.snapshots.map((row) => row.pid))];
+    let committed: number[] = [];
+    let rolledBack: number[] = [];
+    s.w.mono = 0;
+    pool.on("release", onRelease);
+    try {
+      // Both transactions of an ordinary page commit.
+      s.w.seen.snapshots.length = 0;
+      expect((await page(s.w)).aggregates).toHaveLength(1);
+      committed = backends();
+      // An ordinary failure inside the open transaction: it is rolled back, and the server answers.
+      s.w.seen.snapshots.length = 0;
+      s.w.fail.presentation = new Error("presentation store is down");
+      await expectFailure(() => page(s.w), "unavailable");
+      rolledBack = backends();
+    } finally {
+      s.w.fail.presentation = undefined;
+      pool.off("release", onRelease);
+    }
+    expect(committed.length, "the committed transactions' backends were recorded").toBeGreaterThan(0);
+    expect(rolledBack.length, "the rolled-back transaction's backend was recorded").toBeGreaterThan(0);
+    // Two commits and one rollback: three sessions given back, none of them destructively.
+    expect(ended.length).toBeGreaterThanOrEqual(3);
+    expect(ended.filter((event) => event.destroyed), "no answered transaction's session was destroyed").toEqual([]);
+    const pooled = await pooledBackendPids(pool);
+    for (const backend of [...committed, ...rolledBack]) expect(pooled, "an answered transaction's backend is still in the pool").toContain(backend);
+    expect(await poolSettlesClean(pool)).toEqual({ waiting: 0, checkedOut: 0, inTransaction: 0 });
+    expect((await page(s.w)).aggregates).toHaveLength(1);
+  });
 });
 
 // ── final review: the frozen non-Slack snapshot, malformed rows, and the real task-provenance owner ──
@@ -3238,5 +3731,147 @@ describe("aggregate Slack page — final-review falsifiers: frozen snapshot, row
     expect((await page(s.w, { ...viewer, pageSize: 1, cursor: one.nextSlackCursor })).aggregates).toHaveLength(1);
     // The owner decides per READER: the previous case shows an Everyone member keeping a hand-entered
     // task in a project nobody granted them, which this reader is denied.
+  });
+
+  // ── Stage 4 review, MEDIUM: what is BOUND is what was RENDERED, and what was captured stays captured ──
+  //
+  // A loader may keep the graph it returns and go on changing it (a cache normalizing in place). The
+  // page awaits real round trips after each loader returns — the statement-timeout refresh is one —
+  // so a value read once before such an await and again after it can be two different values.
+  //
+  // The mechanism is the same in both cases and consults nothing inside the reader: the wrapped
+  // loader returns the real fixture's result, lets the monotonic clock advance (as any real clock
+  // does while a loader runs, which makes the page's next statement a genuine round trip), and
+  // rewrites the object it returned on the next macrotask — that is, while that round trip is in
+  // flight. It does so in the evidence AND the validation transaction, so the two snapshots agree
+  // with each other and nothing but the alias can be at fault.
+
+  it("binds the presentation bytes it RENDERED: a loader that rewrites the bundle it returned cannot put older rendering under a newer digest (falsifier)", async () => {
+    const s = await base();
+    s.w.titles.set(s.x, "Original thread title");
+    const c = await contract();
+    const real = dependencies(s.w);
+    /** The canonical bytes of each presentation the composer was handed, taken as it was handed over. */
+    const rendered: string[] = [];
+    const recordingComposer = (input: Json): unknown => {
+      rendered.push(c.canonicalSlackTimelineJson(input.presentation));
+      return (real.composeSlackPage as (i: Json) => unknown)(input);
+    };
+
+    // Control, expected green: with nothing rewritten, the bound digest IS the digest of the rendered bytes.
+    const baseline = await page(s.w, {}, {}, { composeSlackPage: recordingComposer });
+    expect(rendered).toHaveLength(1);
+    expect(JSON.stringify(baseline.days)).toContain("Original thread title");
+    expect(baseline.binding.presentationInputDigest).toBe(c.slackTimelineDigest(JSON.parse(rendered[0])));
+
+    rendered.length = 0;
+    let rewrites = 0;
+    let published: Loose | null = null;
+    let failure: Json | null = null;
+    s.w.mono = 0;
+    try {
+      published = await page(s.w, {}, {}, {
+        composeSlackPage: recordingComposer,
+        loadPresentation: async (query: SqlExecutor, context: Json) => {
+          const bundle = (await (real.loadPresentation as (q: SqlExecutor, x: Json) => Promise<unknown>)(query, context)) as { items: { title: string }[] };
+          s.w.mono += 1_000;
+          setImmediate(() => {
+            rewrites++;
+            for (const item of bundle.items) {
+              try { item.title = "REWRITTEN after the loader returned"; } catch { /* frozen in place: also immutable */ }
+            }
+          });
+          return bundle;
+        },
+      });
+    } catch (error) {
+      const e = error as Json;
+      failure = { ...e, name: String(e?.name), code: String(e?.code) };
+    } finally {
+      s.w.mono = 0;
+    }
+    expect(rewrites, "the bundle was rewritten after it was returned, while the page was still reading").toBeGreaterThanOrEqual(1);
+
+    if (published === null) {
+      // Refusing a presentation graph that will not hold still is an accepted answer; a raw error is not.
+      expect(failure).toMatchObject({ name: "SlackTimelineError" });
+      expect(["restart_required", "unavailable"]).toContain(failure?.code);
+      expect(failure).not.toHaveProperty("days");
+      return;
+    }
+    // It published. Then one captured value was both bound and rendered:
+    expect(rendered).toHaveLength(1);
+    expect(published.binding.presentationInputDigest, "the bound digest is the digest of the bytes the composer rendered")
+      .toBe(c.slackTimelineDigest(JSON.parse(rendered[0])));
+    // …and, with no digest arithmetic at all: one rendering never travels under two digests.
+    if (JSON.stringify(published.days) === JSON.stringify(baseline.days)) {
+      expect(published.binding.presentationInputDigest, "the original rendering keeps the original digest")
+        .toBe(baseline.binding.presentationInputDigest);
+    } else {
+      expect(JSON.stringify(published.days), "a different digest is a different rendering").toContain("REWRITTEN after the loader returned");
+      expect(published.binding.presentationInputDigest).not.toBe(baseline.binding.presentationInputDigest);
+    }
+  });
+
+  it("keeps the admission it CAPTURED: a loader that later narrows the admission it returned changes no visibility and no digest (falsifier)", async () => {
+    const s = await base();
+    s.w.nonSlack.push({ itemId: s.g, title: "PR one", memberId: s.team.memberId });
+    // A task the reader sees only because its backing GitHub item is visible under their admission.
+    s.w.tasks.set(s.x, [{ taskId: "T1", title: "Backed task", status: "in_progress", backingItemId: s.g }]);
+    const real = dependencies(s.w);
+
+    const baseline = await page(s.w);
+    const shown = JSON.stringify(baseline.days);
+    for (const text of ["PR one", "Backed task"]) expect(shown, `fixture: the baseline shows ${text}`).toContain(text);
+    expect(baseline.initialNonSlackSourceItemIds).toEqual([s.g]);
+
+    /** A deep copy of each admission exactly AS the loader returned it. */
+    const returned: Loose[] = [];
+    const handedBefore = s.w.seen.presentation.length;
+    let rewrites = 0;
+    s.w.mono = 0;
+    let published: Loose;
+    try {
+      published = await page(s.w, {}, {}, {
+        loadAdmission: async (query: SqlExecutor, context: Json) => {
+          const result = (await (real.loadAdmission as (q: SqlExecutor, x: Json) => Promise<unknown>)(query, context)) as { admission: Loose };
+          returned.push(structuredClone(result.admission));
+          s.w.mono += 1_000;
+          setImmediate(() => {
+            rewrites++;
+            const admission = result.admission;
+            const narrowings: (() => void)[] = [
+              () => {
+                if (Array.isArray(admission.grantedProjectIds)) admission.grantedProjectIds.length = 0;
+                else admission.grantedProjectIds?.clear?.();
+              },
+              () => { admission.everyone = false; },
+            ];
+            for (const narrow of narrowings) {
+              try { narrow(); } catch { /* frozen in place: also immutable */ }
+            }
+          });
+          return result;
+        },
+      });
+    } finally {
+      s.w.mono = 0;
+    }
+    // Fixture preconditions: the loader's admission was rewritten in both transactions, and the
+    // rewrite is a real narrowing of a real member admission.
+    expect(rewrites).toBe(2);
+    expect(returned).toHaveLength(2);
+    expect(returned[0]).toMatchObject({ kind: "member", memberId: s.team.memberId, everyone: true });
+    expect([...returned[0].grantedProjectIds].length, "fixture: the reader holds at least one grant").toBeGreaterThan(0);
+
+    // Nothing the reader is shown moved, and nothing the cursor is bound to moved.
+    expect(JSON.stringify(published.days), "the page shows what the captured admission admits").toBe(shown);
+    expect(published.initialNonSlackSourceItemIds).toEqual(baseline.initialNonSlackSourceItemIds);
+    expect(published.binding).toEqual(baseline.binding);
+    // And every later loader was handed the admission as it was captured, in both transactions.
+    const handed = s.w.seen.presentation.slice(handedBefore).map((input) => input.admission);
+    expect(handed).toHaveLength(2);
+    expect(handed[0]).toEqual(returned[0]);
+    expect(handed[1]).toEqual(returned[1]);
   });
 });
