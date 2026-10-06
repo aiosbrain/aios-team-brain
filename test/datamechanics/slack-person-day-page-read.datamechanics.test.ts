@@ -1,13 +1,16 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import type { Pool, PoolClient } from "pg";
 import { describe, expect, it } from "vitest";
 
 import { visibleItemIdsForProjects } from "@/lib/access/enforce";
-import { resolveContentAdmission, type ContentAdmission } from "@/lib/access/admission";
+import { contentReaderFor, provenanceCtxForReader, resolveContentAdmission, type ContentAdmission } from "@/lib/access/admission";
+import { createGroup, grantProjectToGroup } from "@/lib/access/groups";
+import { rowVisibleByProvenanceCtx } from "@/lib/access/provenance";
 import { ITEM_LIMIT } from "@/lib/dashboard/work-timeline";
 import type { PersonDay, TaskGroup, TimelineDay } from "@/lib/dashboard/timeline-group";
 import { PgClient } from "@/lib/db/pg/client";
-import { runSql } from "@/lib/db/pg/pool";
+import { getPool, runSql } from "@/lib/db/pg/pool";
 import type { SqlExecutor, TransactionSession } from "@/lib/db/types";
 import { removeMemberIdentity, setMemberIdentity } from "@/lib/identity/member-identities";
 import { applyAttributionCorrection } from "@/lib/ingest/attribution-correction";
@@ -15,7 +18,7 @@ import { reconcileCompleteSlackThreadEvidence } from "@/lib/ingest/slack-message
 import { projectSlackMessageEvidence } from "@/lib/ingest/sources/slack-message-evidence";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { transactionCapability } from "@/lib/projects/context/transaction";
-import { db, ingest, seedTeam, type Seed } from "./helpers";
+import { db, externalMember, ingest, seedTeam, type Seed } from "./helpers";
 
 /**
  * AIO-1170 AC-09 — the inactive aggregate Slack page reader on REAL Postgres
@@ -188,7 +191,26 @@ async function correct(team: Seed, itemId: string, toMember: string): Promise<vo
 
 // ── the injected server-only dependencies ────────────────────────────────────
 
-interface TaskLink { taskId: string; title: string; status: string; backingItemId?: string }
+/**
+ * A task associated with a Slack item. Either a FIXTURE-ONLY link (title and status given here, and
+ * optionally the item that backs it), or — with `taskRowId` — a REAL `tasks` row, whose provenance
+ * fields, title, status and assignee are read through the page's executor. Both kinds are admitted or
+ * denied by the one existing provenance owner; nothing here decides visibility on its own.
+ */
+interface TaskLink { taskId: string; title: string; status: string; backingItemId?: string; taskRowId?: string }
+
+/** A link to a real `tasks` row: everything shown comes from that row, if the owner admits it. */
+const realTask = (taskRowId: string): TaskLink => ({ taskId: taskRowId, title: "", status: "", taskRowId });
+
+interface TaskRow {
+  id: string;
+  project_id: string | null;
+  source_item_id: string | null;
+  created_by: string | null;
+  title: string;
+  status: string;
+  assignee: string | null;
+}
 
 interface World {
   team: Seed;
@@ -210,6 +232,8 @@ interface World {
     aggregates: Json[][];
     admission: Json[];
     presentation: Json[];
+    /** Every presentation bundle the loader RETURNED, in order (two per page: evidence, validation). */
+    bundles: Json[];
     initial: number;
     snapshots: { label: string; pid: number; snapshot: string; isolation: string; readOnly: string }[];
   };
@@ -219,7 +243,7 @@ function world(team: Seed): World {
   return {
     team, nowMs: NOW_MS, mono: 0, roots: new Map(), provenance: new Map(), denied: new Set(), tasks: new Map(),
     titles: new Map(), nonSlack: [], fail: {}, override: {},
-    seen: { aggregates: [], admission: [], presentation: [], initial: 0, snapshots: [] },
+    seen: { aggregates: [], admission: [], presentation: [], bundles: [], initial: 0, snapshots: [] },
   };
 }
 
@@ -284,6 +308,7 @@ function composeDays(aggregates: readonly Json[], presentation: Json, asOf: unkn
       tasks: [...p.tasks].map(([taskId, t]): TaskGroup => ({
         taskId, title: t.link.title as string, status: t.link.status as string, source: "linear", evidenceCount: t.rows.length,
         sources: [{ source: "slack", count: t.rows.length, items: t.rows as never[] }],
+        ...(t.link.assignee ? { assignee: { name: t.link.assignee as string, avatarUrl: null } } : {}),
       })),
       other: p.other.length ? [{ source: "slack", count: p.other.length, items: p.other as never[] }] : [],
     })),
@@ -328,17 +353,39 @@ function dependencies(w: World, over: Json = {}): Json {
       const members = await query<{ id: string; name: string; handle: string }>(
         `select id, display_name as name, actor_handle as handle from members where team_id = $1::uuid order by id`, [input.teamId]
       );
-      // A linked task is presented only when ITS backing item is visible to this admission, read
-      // through the real oracle on this executor: seeing the Slack thread does not grant the task.
+      // Seeing the Slack thread does not grant its linked task. Every association is admitted or
+      // denied by the EXISTING provenance owner — `contentReaderFor` → `provenanceCtxForReader` →
+      // `rowVisibleByProvenanceCtx` — over the real oracle's visible set, read on THIS executor
+      // under the admission the packet handed over. A real task row supplies its own provenance
+      // fields (`source_item_id`, `created_by`, `project_id`); a fixture-only link is judged as the
+      // row it stands for: sourced by its backing item, or hand-entered by the seed member.
       const visible = await oracleVisible(query, input.teamId, input.admission);
-      const associations = ids.flatMap((itemId) => (w.tasks.get(itemId) ?? [])
-        .filter((t) => !t.backingItemId || visible.has(t.backingItemId))
-        .map((t) => ({ itemId, taskId: t.taskId, title: t.title, status: t.status })));
-      return {
+      const ctx = provenanceCtxForReader(contentReaderFor(input.admission), visible);
+      const links = ids.flatMap((itemId) => (w.tasks.get(itemId) ?? []).map((link) => ({ itemId, link })));
+      const rowIds = [...new Set(links.flatMap(({ link }) => (link.taskRowId ? [link.taskRowId] : [])))];
+      const stored = rowIds.length === 0 ? [] : (await query<TaskRow>(
+        `select id, project_id, source_item_id, created_by, title, status, assignee
+           from tasks where team_id = $1::uuid and id = any($2::uuid[]) order by id`, [input.teamId, rowIds]
+      )).rows;
+      const storedById = new Map(stored.map((row) => [row.id, row]));
+      const associations = links.flatMap(({ itemId, link }) => {
+        const row: TaskRow | undefined = link.taskRowId
+          ? storedById.get(link.taskRowId)
+          : {
+            id: link.taskId, project_id: null, source_item_id: link.backingItemId ?? null,
+            created_by: link.backingItemId ? null : w.team.memberId, title: link.title, status: link.status, assignee: null,
+          };
+        if (!row || !rowVisibleByProvenanceCtx(row, ctx)) return [];
+        // Only an ADMITTED task contributes anything: its title, its status and its assignee's display name.
+        return [{ itemId, taskId: row.id, title: row.title, status: row.status, ...(row.assignee ? { assignee: row.assignee } : {}) }];
+      });
+      const bundle = {
         locale: "en-US", policyVersion: "1",
         items: items.rows.map((r) => ({ itemId: r.id, title: w.titles.get(r.id) ?? r.path })),
         members: members.rows, associations,
       };
+      w.seen.bundles.push(bundle);
+      return bundle;
     },
     composeSlackPage: (input: { aggregates: Json[]; presentation: Json; asOf: unknown }) => {
       w.seen.aggregates.push(input.aggregates.map((a) => ({ ...a })));
@@ -2447,5 +2494,627 @@ describe("aggregate Slack page — pending work, cancellation and statement time
     expect(String(failure.message)).not.toContain("pg_sleep");
     expect(await openTransactionsSettleToZero()).toBe(0);
     expect((await page(s.w)).aggregates).toHaveLength(1);
+  });
+
+  // ── final review, finding 1: the deadline covers transaction ACQUISITION and SETUP ──────────────
+  //
+  // The page's deadline was raced only against injected callbacks. Obtaining the transaction itself —
+  // the pool checkout, BEGIN, and the transaction's configuration — sat outside it: with the pool
+  // exhausted the page stayed pending past its budget. These cases block the REAL pool and the REAL
+  // session, never a loader, and require the page (and final validation) to end on its own deadline
+  // while the checkout or the setup statement is still outstanding. Whatever arrives late must be
+  // disposed safely: no session left in a transaction, no client left checked out, a healthy pool.
+
+  type Phase = "the evidence transaction" | "the validation transaction" | "final validation";
+  const PHASES: Phase[] = ["the evidence transaction", "the validation transaction", "final validation"];
+  /**
+   * A budget generous enough that the real statements run BEFORE the block (their transaction-local
+   * timeout is this budget) cannot trip on a slow machine. Elapsed time is the fake monotonic clock.
+   */
+  const BUDGET_MS = 5_000;
+
+  /** Check out every connection the pool may open, so the NEXT checkout has to wait. */
+  async function holdWholePool(): Promise<{ pool: Pool; release: () => void }> {
+    const pool = getPool();
+    const held: PoolClient[] = [];
+    for (let n = 0; n < pool.options.max; n++) held.push(await pool.connect());
+    let released = false;
+    return { pool, release: () => { if (!released) { released = true; for (const client of held) client.release(); } } };
+  }
+
+  /** Event-loop turns only — usable while the pool is exhausted and no round trip is possible. */
+  async function turnsWhile(condition: () => boolean, limit = 400): Promise<void> {
+    for (let n = 0; n < limit && condition(); n++) await turn();
+  }
+
+  /** No client checked out, nobody waiting, no session inside a transaction — after bounded round trips. */
+  async function poolSettlesClean(pool: Pool): Promise<{ waiting: number; checkedOut: number; inTransaction: number }> {
+    const inTransaction = await openTransactionsSettleToZero();
+    for (let n = 0; n < 200 && (pool.waitingCount !== 0 || pool.totalCount !== pool.idleCount); n++) await runSql(`select 1`).catch(() => undefined);
+    return { waiting: pool.waitingCount, checkedOut: pool.totalCount - pool.idleCount, inTransaction };
+  }
+
+  /** Start the unit under test for one phase; `blockNow` is called at the moment that phase's transaction is about to be obtained. */
+  async function startPhase(s: Scene, phase: Phase, deps: Json, blockNow: () => Promise<void>): Promise<{ run: Watched; blocked: Promise<void> }> {
+    const r = await reader();
+    let markBlocked = (): void => undefined;
+    const blocked = new Promise<void>((resolve) => { markBlocked = resolve; });
+    const block = async (): Promise<void> => { await blockNow(); markBlocked(); };
+    if (phase === "the validation transaction") {
+      return { run: watch(page(s.w, {}, { afterEvidence: block }, deps)), blocked };
+    }
+    // The published page final validation checks is read BEFORE anything is blocked.
+    const published = phase === "final validation" ? await page(s.w) : null;
+    await block();
+    const run = published === null
+      ? watch(page(s.w, {}, {}, deps))
+      : watch(r.validateSlackPersonDayFinal(
+        { ...request(s.w), binding: published.binding, initialNonSlackSourceItemIds: published.initialNonSlackSourceItemIds },
+        dependencies(s.w, deps)
+      ));
+    return { run, blocked };
+  }
+
+  it.each(PHASES)("ends on the page deadline while the pool checkout for %s is still blocked, and disposes the late client", { timeout: 30_000 }, async (phase) => {
+    const s = await oneThread();
+    const clock = fakeTimers();
+    const pool = getPool();
+    let hold: { release: () => void } | null = null;
+    let started: { run: Watched; blocked: Promise<void> } | null = null;
+    s.w.mono = 0;
+    try {
+      started = await startPhase(s, phase, { scheduleDeadline: clock.scheduleDeadline, budgets: { maxElapsedMs: BUDGET_MS } }, async () => {
+        hold = await holdWholePool();
+      });
+      const { run, blocked } = started;
+      const first = await Promise.race([blocked.then(() => "blocked" as const), run.done]);
+      if (first !== "blocked") {
+        if (first.state === "rejected") throw first.error;
+        throw new Error("the run completed before its transaction could be blocked");
+      }
+      // The scenario is real: the unit under test is queued on the pool, and nothing has ended it.
+      await turnsWhile(() => pool.waitingCount === 0 && run.state().state === "pending");
+      expect(pool.waitingCount, "the transaction's checkout is waiting on the exhausted pool").toBeGreaterThanOrEqual(1);
+      expect(run.state().state).toBe("pending");
+      expect(clock.timers.filter((t) => !t.cancelled && !t.fired).length, "a deadline is armed while the checkout is pending").toBeGreaterThan(0);
+
+      // One millisecond past the budget. The pool is STILL exhausted: only the deadline can end this.
+      s.w.mono = BUDGET_MS + 1;
+      clock.fireAll();
+      await turnsWhile(() => run.state().state === "pending");
+      const after = run.state();
+      expect(after.state, "the deadline ends it without waiting for a connection").toBe("rejected");
+      const failure = (after as { error: Json }).error;
+      expect(failure).toMatchObject({ name: "SlackTimelineError", code: "budget_exhausted" });
+      for (const partial of ["days", "aggregates", "binding", "nextSlackCursor", "slackComplete"]) expect(failure).not.toHaveProperty(partial);
+      expect(clock.timers.filter((t) => !t.cancelled && !t.fired), "no deadline is left armed").toEqual([]);
+
+      // Only now is a connection available. The checkout that was abandoned receives its client LATE:
+      // that client must be handed straight back (or destroyed), never used and never leaked.
+      (hold as { release: () => void } | null)?.release();
+      expect(await poolSettlesClean(pool)).toEqual({ waiting: 0, checkedOut: 0, inTransaction: 0 });
+      expect(run.state()).toBe(after);
+      // The pool is healthy: an ordinary page reads again.
+      s.w.mono = 0;
+      expect((await page(s.w)).aggregates).toHaveLength(1);
+    } finally {
+      s.w.mono = BUDGET_MS + 1;
+      clock.fireAll();
+      (hold as { release: () => void } | null)?.release();
+      if (started) await settlesWithin(started.run);
+      for (const t of clock.timers) t.cancelled = true;
+    }
+  });
+
+  it.each(PHASES)("ends on the page deadline while the acquired session for %s is still busy before BEGIN, and never reuses that session mid-statement", { timeout: 30_000 }, async (phase) => {
+    const s = await oneThread();
+    const clock = fakeTimers();
+    const pool = getPool();
+    // The next client the pool hands out is given two seconds of server-side work FIRST, so the
+    // transaction helper's own BEGIN queues behind it: acquisition succeeded, SETUP is what blocks.
+    let busy: Promise<void> | null = null;
+    let busyDone = false;
+    const occupy = (client: PoolClient): void => {
+      if (busy !== null) return;
+      busy = client.query(`select pg_sleep(2)`).then(() => undefined, () => undefined).then(() => { busyDone = true; });
+    };
+    let started: { run: Watched; blocked: Promise<void> } | null = null;
+    s.w.mono = 0;
+    try {
+      started = await startPhase(s, phase, { scheduleDeadline: clock.scheduleDeadline, budgets: { maxElapsedMs: BUDGET_MS } }, async () => {
+        pool.on("acquire", occupy);
+      });
+      const { run, blocked } = started;
+      const first = await Promise.race([blocked.then(() => "blocked" as const), run.done]);
+      if (first !== "blocked") {
+        if (first.state === "rejected") throw first.error;
+        throw new Error("the run completed before its transaction could be blocked");
+      }
+      await turnsWhile(() => busy === null && run.state().state === "pending");
+      expect(busy, "the transaction's session was acquired and is busy").not.toBeNull();
+      expect(run.state().state).toBe("pending");
+
+      s.w.mono = BUDGET_MS + 1;
+      clock.fireAll();
+      await turnsWhile(() => run.state().state === "pending");
+      const after = run.state();
+      // Ended by the deadline, not by the session finally getting round to BEGIN two seconds later.
+      expect(busyDone, "the session was still busy when the page ended").toBe(false);
+      expect(after.state).toBe("rejected");
+      expect((after as { error: Json }).error).toMatchObject({ name: "SlackTimelineError", code: "budget_exhausted" });
+      expect(clock.timers.filter((t) => !t.cancelled && !t.fired), "no deadline is left armed").toEqual([]);
+
+      // Let the server finish (or the destroyed session drop) its statement; this is the test's only
+      // real wait and the server bounds it. Then: nothing in a transaction, nothing checked out.
+      pool.off("acquire", occupy);
+      await busy;
+      expect(await poolSettlesClean(pool)).toEqual({ waiting: 0, checkedOut: 0, inTransaction: 0 });
+      expect(run.state()).toBe(after);
+      s.w.mono = 0;
+      expect((await page(s.w)).aggregates).toHaveLength(1);
+    } finally {
+      pool.off("acquire", occupy);
+      s.w.mono = BUDGET_MS + 1;
+      clock.fireAll();
+      if (busy) await busy;
+      if (started) await settlesWithin(started.run);
+      for (const t of clock.timers) t.cancelled = true;
+    }
+  });
+
+  // ── final review, finding 5: the cursor key is captured before the first await ─────────────────
+
+  it("seals the next cursor with the key it was GIVEN: a caller overwriting its buffer while a dependency is suspended changes nothing", async () => {
+    const s = await scene();
+    await thread(s, "x", ts(D20, 1), "U1");
+    await thread(s, "y", ts(D19, 1), "U2");
+    await thread(s, "z", ts(D18, 1), "U3");
+    await converge(s.team);
+    const c = await contract();
+    const original = Buffer.from(KEY);
+    const real = dependencies(s.w);
+
+    for (const when of ["during the evidence admission read", "between the two transactions", "during the validation admission read"] as const) {
+      // Each run hands over its OWN buffer and overwrites it mid-page, as a caller zeroising key material would.
+      const callerKey = Buffer.from(original);
+      let admissions = 0;
+      const overwrite = (): void => { callerKey.fill(0xee); };
+      const run = async (cursor: string | null): Promise<Loose> => {
+        admissions = 0;
+        callerKey.set(original);
+        return page(s.w, { pageSize: 1, cursor }, when === "between the two transactions" ? { afterEvidence: async () => overwrite() } : {}, {
+          slackTimelineCursorKey: callerKey,
+          loadAdmission: async (query: SqlExecutor, context: Json) => {
+            const result = await (real.loadAdmission as (q: SqlExecutor, x: Json) => Promise<unknown>)(query, context);
+            admissions++;
+            // The loader is suspended on a real read just above; the caller's buffer changes under it.
+            if ((when === "during the evidence admission read" && admissions === 1) ||
+                (when === "during the validation admission read" && admissions === 2)) overwrite();
+            return result;
+          },
+        });
+      };
+
+      const first = await run(null);
+      expect(callerKey.equals(original), `${when}: the caller's buffer really was overwritten`).toBe(false);
+      expect(first.nextSlackCursor).not.toBeNull();
+      // The cursor verifies under the ORIGINAL bytes — the configuration captured before any await…
+      expect(c.decodeSlackTimelineCursor(first.nextSlackCursor, original)).toEqual({
+        ...first.binding, lastAggregateTuple: first.aggregates[0].tuple,
+      });
+      // …and not under whatever the caller's buffer became.
+      await expectFailure(() => c.decodeSlackTimelineCursor(first.nextSlackCursor, Buffer.alloc(32, 0xee)), "invalid_request");
+
+      // A continuation both OPENS its cursor and SEALS the next one with the captured key.
+      const second = await run(first.nextSlackCursor);
+      expect(second.aggregates).toHaveLength(1);
+      expect(second.nextSlackCursor).not.toBeNull();
+      expect(c.decodeSlackTimelineCursor(second.nextSlackCursor, original).lastAggregateTuple).toEqual(second.aggregates[0].tuple);
+      // And the traversal completes for a caller that still holds the true key.
+      const third = await page(s.w, { pageSize: 1, cursor: second.nextSlackCursor });
+      expect(third).toMatchObject({ slackComplete: true, nextSlackCursor: null });
+      expect(third.aggregates).toHaveLength(1);
+    }
+  });
+
+  // ── final review, finding 6: transaction-control results are materialized rows too ─────────────
+
+  /**
+   * Every result the DATABASE returned on connections checked out while armed, tallied at the driver:
+   * nothing here reads the reader's own counters. A result with no rows materializes nothing.
+   */
+  function tallyMaterializedResults(): { rows: () => number; bytes: () => number; stop: () => void } {
+    const pool = getPool();
+    const patched = new Set<PoolClient>();
+    let rows = 0;
+    let bytes = 0;
+    const count = (result: unknown): void => {
+      for (const one of Array.isArray(result) ? result : [result]) {
+        const got = (one as { rows?: unknown } | null | undefined)?.rows;
+        if (!Array.isArray(got) || got.length === 0) continue;
+        rows += got.length;
+        bytes += Buffer.byteLength(JSON.stringify(got), "utf8");
+      }
+    };
+    const instrument = (client: PoolClient): void => {
+      if (patched.has(client)) return;
+      patched.add(client);
+      const original = client.query as unknown as (...args: unknown[]) => unknown;
+      (client as unknown as { query: unknown }).query = function (this: unknown, ...args: unknown[]): unknown {
+        const out = original.apply(this, args);
+        if (out === null || typeof out !== "object" || typeof (out as PromiseLike<unknown>).then !== "function") return out;
+        return (out as Promise<unknown>).then((result) => { count(result); return result; });
+      };
+    };
+    pool.on("acquire", instrument);
+    return {
+      rows: () => rows,
+      bytes: () => bytes,
+      stop: () => {
+        pool.off("acquire", instrument);
+        for (const client of patched) delete (client as unknown as { query?: unknown }).query; // back to the prototype's method
+        patched.clear();
+      },
+    };
+  }
+
+  it("meters every row the database actually materializes for a page — the transaction's own control results included", async () => {
+    const s = await oneThread();
+    const real = dependencies(s.w);
+    // The fixture's snapshot probe is answered locally so two runs are byte-identical (a backend pid
+    // of another length would change the byte totals); everything else goes to the database.
+    const steady = (query: SqlExecutor): SqlExecutor => (async (text: string, params?: unknown[]) =>
+      text.includes("pg_backend_pid()")
+        ? { rows: [{ pid: 1, snapshot: "1:1:", isolation: "repeatable read", readOnly: "on" }], rowCount: 1 }
+        : query(text, params)) as SqlExecutor;
+    const wrap = (name: string) => (query: SqlExecutor, context: Json): unknown =>
+      (real[name] as (q: SqlExecutor, x: Json) => unknown)(steady(query), context);
+    const loaders = { loadAdmission: wrap("loadAdmission"), loadPresentation: wrap("loadPresentation"), loadInitialNonSlack: wrap("loadInitialNonSlack") };
+
+    /** One page refused only at PUBLICATION: every read is done, so both tallies are the page's totals. */
+    const totals = async (options: Json): Promise<{ reader: { rowsRead: number; bytesRead: number }; driver: { rows: number; bytes: number } }> => {
+      const tally = tallyMaterializedResults();
+      try {
+        s.w.mono = 0;
+        const failure = await expectFailure(() => page(s.w, {}, options, { ...loaders, budgets: { maxPageBytes: 1 } }), "budget_exhausted");
+        return { reader: failure.diagnostics as { rowsRead: number; bytesRead: number }, driver: { rows: tally.rows(), bytes: tally.bytes() } };
+      } finally {
+        tally.stop();
+      }
+    };
+    const probes = async (query: SqlExecutor, perturbClock: boolean): Promise<void> => {
+      // Two ordinary statements. With `perturbClock` the remaining budget changes before each, so the
+      // transaction issues two more of its OWN control statements; the data read is identical.
+      if (perturbClock) s.w.mono = 10_000;
+      await query(`select 1 as probe`);
+      if (perturbClock) s.w.mono = 0;
+      await query(`select 1 as probe`);
+    };
+
+    const plain = await totals({ afterDiscovery: (query: SqlExecutor) => probes(query, false) });
+    expect(plain.driver.rows).toBeGreaterThan(0);
+    // The reader's row count IS the number of rows the database returned on its connections.
+    expect(plain.reader.rowsRead, "rows the reader metered vs rows the driver saw returned").toBe(plain.driver.rows);
+    // Deterministic for an unchanged fixture, at the driver as well as in the reader.
+    expect(await totals({ afterDiscovery: (query: SqlExecutor) => probes(query, false) })).toEqual(plain);
+
+    // More control statements, same data: whatever extra the database materializes, the reader meters.
+    const perturbed = await totals({ afterDiscovery: (query: SqlExecutor) => probes(query, true) });
+    expect(perturbed.reader.rowsRead).toBe(perturbed.driver.rows);
+    expect(perturbed.reader.rowsRead - plain.reader.rowsRead, "extra rows metered vs extra rows materialized").toBe(perturbed.driver.rows - plain.driver.rows);
+    expect(perturbed.reader.bytesRead - plain.reader.bytesRead, "extra bytes metered vs extra bytes materialized").toBe(perturbed.driver.bytes - plain.driver.bytes);
+
+    // The exact boundary, set from the DRIVER's count and not from the reader's: exactly that many
+    // rows is allowed, one fewer is refused. A reader that leaves its control results unmetered
+    // still fits under the smaller budget, and so fails here.
+    const options = { afterDiscovery: (query: SqlExecutor) => probes(query, false) };
+    s.w.mono = 0;
+    expect((await page(s.w, {}, options, { ...loaders, budgets: { maxRows: plain.driver.rows } })).aggregates).toHaveLength(1);
+    const short = await expectFailure(() => page(s.w, {}, options, { ...loaders, budgets: { maxRows: plain.driver.rows - 1 } }), "budget_exhausted");
+    expect(short).not.toHaveProperty("aggregates");
+    expect(await openTransactionsSettleToZero()).toBe(0);
+  });
+});
+
+// ── final review: the frozen non-Slack snapshot, malformed rows, and the real task-provenance owner ──
+
+/** True when the value and everything reachable from it is frozen. */
+function deepFrozen(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return true;
+  return Object.isFrozen(value) && Object.values(value as object).every(deepFrozen);
+}
+
+describe("aggregate Slack page — final-review falsifiers: frozen snapshot, row shapes, real task provenance", () => {
+  /** A team with one thread (A on the 20th, B on the 19th) and one visible GitHub item. */
+  async function base(): Promise<Scene & { x: string; g: string }> {
+    const s = await scene();
+    const x = await thread(s, "x", ts(D20, 1), "U1");
+    await message(s.team.teamId, x, ts(D19, 1), { root: ts(D20, 1), user: "U2" });
+    const g = await githubItem(s.team, "pr");
+    await converge(s.team);
+    return { ...s, x, g };
+  }
+
+  // Finding 2. The shared merger copies containers but keeps the row, signal-item and assignee
+  // OBJECTS it was given. A loader that keeps its own graph — a cache does — can therefore change a
+  // page after its evidence snapshot was read, or after it was published.
+  it("publishes the non-Slack snapshot as it was READ: mutating the loader's retained rows, signals and nested fields changes nothing", async () => {
+    const s = await base();
+    const meetingId = randomUUID();
+    /** A fresh object graph each time, with handles on every nested object a loader could retain. */
+    const build = () => {
+      const meeting = { id: meetingId, title: "Standup", source: "meetings", kind: "meeting", at: "2024-06-20" };
+      const cited = {
+        id: s.g, title: "PR one", source: "github", kind: "pr", at: "2024-06-20T09:00:00Z",
+        url: "https://github.com/acme/repo/pull/1", linkedTask: { key: "AIO-1", title: "Linked task", status: "open" },
+      };
+      const taskRow = { id: "commit:abc123", title: "Task commit", source: "github", kind: "commit", at: "2024-06-20T08:00:00Z" };
+      const signalItem = { id: "decision-1", kind: "decision", title: "Decided X", at: "2024-06-20", url: `/library/${s.g}`, stillValid: true };
+      const assignee = { name: "Owner Name", avatarUrl: null as string | null };
+      const result = {
+        sourceItemIds: [s.g],
+        days: [{
+          date: "2024-06-20", label: labelFor("2024-06-20", new Date(s.w.nowMs)),
+          people: [{
+            memberId: s.team.memberId, name: "Tester", handle: "tester", avatarUrl: null, total: 3, unlinked: 2, summary: "Did things.",
+            tasks: [{
+              taskId: "T9", title: "Tracked task", status: "in_progress", source: "linear", evidenceCount: 1, assignee,
+              sources: [{ source: "github", count: 1, items: [taskRow] }],
+            }],
+            other: [{ source: "github", count: 1, items: [cited] }, { source: "meetings", count: 1, items: [meeting] }],
+            signals: [{ kind: "decision", count: 1, items: [signalItem] }],
+          }],
+        }],
+      };
+      /** Every write is attempted; an object the reader froze in place simply refuses it. */
+      const mutate = (): void => {
+        const attempts: (() => void)[] = [
+          () => { meeting.title = "MUTATED meeting"; },
+          () => { meeting.at = "2024-06-19"; },
+          () => { cited.title = "MUTATED row"; },
+          () => { cited.url = "https://example.com/MUTATED"; },
+          () => { cited.linkedTask.title = "MUTATED nested task"; },
+          () => { taskRow.title = "MUTATED task row"; },
+          () => { signalItem.title = "MUTATED signal"; },
+          () => { signalItem.stillValid = false; },
+          () => { assignee.name = "MUTATED assignee"; },
+          () => { result.days[0].people[0].summary = "MUTATED synopsis"; },
+          () => { result.days[0].people[0].name = "MUTATED person"; },
+          () => { result.days[0].people[0].tasks[0].title = "MUTATED task"; },
+          () => { result.days[0].people[0].other[0].items.push({ ...cited, id: "commit:late", title: "MUTATED added row" }); },
+          () => { result.days[0].people[0].signals[0].items.push({ ...signalItem, id: "decision-late", title: "MUTATED added signal" }); },
+          () => { result.sourceItemIds.push(randomUUID()); },
+        ];
+        for (const attempt of attempts) {
+          try { attempt(); } catch { /* frozen in place: also immutable */ }
+        }
+      };
+      return { result, mutate };
+    };
+
+    // What the snapshot publishes when nobody touches it.
+    const untouched = build();
+    s.w.override.initial = () => untouched.result as unknown as Json;
+    const clean = await page(s.w);
+    const snapshotBytes = JSON.stringify(clean.days);
+    for (const shown of ["Standup", "PR one", "Linked task", "Task commit", "Decided X", "Owner Name", "Did things."]) expect(snapshotBytes).toContain(shown);
+
+    // Mutated between the evidence snapshot and publication.
+    const during = build();
+    s.w.override.initial = () => during.result as unknown as Json;
+    const published = await page(s.w, {}, { afterEvidence: async () => during.mutate() });
+    expect(JSON.stringify(published.days), "the page is the snapshot that was read").toBe(snapshotBytes);
+    expect(JSON.stringify(published)).not.toContain("MUTATED");
+    expect(published.initialNonSlackSourceItemIds).toEqual(clean.initialNonSlackSourceItemIds);
+
+    // Mutated AFTER publication, through the loader's graph: the page already returned is unaffected.
+    const later = build();
+    s.w.override.initial = () => later.result as unknown as Json;
+    const returned = await page(s.w);
+    later.mutate();
+    expect(JSON.stringify(returned.days)).toBe(snapshotBytes);
+    expect(JSON.stringify(returned)).not.toContain("MUTATED");
+
+    // And nobody holding the PAGE can change it either: the first page's days are frozen all the way down.
+    for (const p of [clean, published, returned]) {
+      expect(deepFrozen(p.days), "page days are deeply frozen").toBe(true);
+      expect(deepFrozen(p.initialNonSlackSourceItemIds), "backing IDs are frozen").toBe(true);
+    }
+    // A frozen first page still drains: the shared merger copies, it does not write into its input.
+    expect((await contract()).mergeSlackTimelineDays(published.days, [])).toHaveLength(2);
+  });
+
+  // Finding 3. A group of a non-Slack source whose rows are not rows reached the shared merger, which
+  // threw on them, and the wrapper reported that as a cross-page conflict: restart_required. A
+  // malformed dependency result is unavailable, before anything is merged.
+  const prRow = (id: string, over: Json = {}): Json => ({ id, title: "PR", source: "github", kind: "pr", at: "2024-06-20T09:00:00Z", ...over });
+  const withoutKey = (row: Json, key: string): Json => { const copy = { ...row }; delete copy[key]; return copy; };
+
+  it.each([
+    ["two null rows (the review counterexample)", [null, null]],
+    ["one null row", [null]],
+    ["a string where a row belongs", ["row", prRow("g2")]],
+    ["an array where a row belongs", [[], prRow("g2")]],
+    ["a number where a row belongs", [7, prRow("g2")]],
+    ["a row with no id", [withoutKey(prRow("g1"), "id"), prRow("g2")]],
+    ["a row whose id is not a string", [prRow("g1", { id: 42 }), prRow("g2")]],
+    ["rows with no instant", [withoutKey(prRow("g1"), "at"), withoutKey(prRow("g2"), "at")]],
+    ["a row whose instant is not a string", [prRow("g1", { at: 20240620 }), prRow("g2")]],
+  ])("refuses an initial non-Slack group holding %s as unavailable, before any merge or composition", async (_label, items) => {
+    for (const placement of ["other", "task"] as const) {
+      const s = await base();
+      const group = { source: "github", count: 2, items };
+      s.w.override.initial = () => ({
+        sourceItemIds: [],
+        days: [{
+          date: "2024-06-20", label: labelFor("2024-06-20", new Date(s.w.nowMs)),
+          people: [{
+            memberId: s.team.memberId, name: "Tester", handle: "tester", avatarUrl: null, total: 2, unlinked: 2, signals: [],
+            tasks: placement === "task"
+              ? [{ taskId: "T9", title: "Tracked task", status: "in_progress", source: "linear", evidenceCount: 2, sources: [group] }]
+              : [],
+            other: placement === "other" ? [group] : [],
+          }],
+        }],
+      });
+      const failure = await expectFailure(() => page(s.w), "unavailable");
+      expect(String(failure.message), placement).not.toMatch(/disagree|conflict/i);
+      expect(s.w.seen.aggregates, `${placement}: refused before composition`).toEqual([]);
+    }
+  });
+
+  it("still accepts well-formed non-Slack rows, capped or not (control)", async () => {
+    const s = await base();
+    s.w.override.initial = () => ({
+      sourceItemIds: [s.g],
+      days: [{
+        date: "2024-06-20", label: labelFor("2024-06-20", new Date(s.w.nowMs)),
+        people: [{
+          memberId: s.team.memberId, name: "Tester", handle: "tester", avatarUrl: null, total: 5, unlinked: 5, tasks: [], signals: [],
+          // `count` may exceed the rendered rows: that is a cap, not a malformation.
+          other: [{ source: "github", count: 5, items: [prRow(s.g), prRow("commit:abc123", { kind: "commit", at: "2024-06-20" })] }],
+        }],
+      }],
+    });
+    const p = await page(s.w);
+    expect(JSON.stringify(p.days)).toContain("commit:abc123");
+    expect(p.aggregates).toHaveLength(2);
+  });
+
+  // Finding 4 (N2). The presentation fixture now asks the EXISTING provenance owner about real
+  // `tasks` rows. These cases use rows the old fixture admitted merely because they named no backing
+  // item: a sourced task whose source was purged, and a hand-entered task in a project the viewer was
+  // never granted.
+  let rowKey = 0;
+  async function insertTask(s: Scene, projectId: string, over: Json): Promise<string> {
+    const { data, error } = await db().from("tasks").insert({
+      team_id: s.team.teamId, project_id: projectId, row_key: `N2-${randomUUID().slice(0, 8)}-${++rowKey}`, title: "task",
+      assignee: "Nobody", status: "in_progress", audience: "team", origin: "ui", ...over,
+    }).select("id").single();
+    if (error || !data) throw new Error(`fixture: task insert failed: ${error?.message}`);
+    return (data as { id: string }).id;
+  }
+  async function projectOf(itemId: string): Promise<string> {
+    return (await runSql<{ project_id: string }>(`select project_id from items where id = $1`, [itemId])).rows[0].project_id;
+  }
+  async function newProject(s: Scene, name: string): Promise<string> {
+    const { data, error } = await db().from("projects").insert({
+      team_id: s.team.teamId, slug: `${name}-${randomUUID().slice(0, 8)}`, name, kind: "initiative",
+    }).select("id").single();
+    if (error || !data) throw new Error(`fixture: project insert failed: ${error?.message}`);
+    return (data as { id: string }).id;
+  }
+  const DENIED = ["Purged sourced task", "Purged Assignee", "Ungranted hand-entered task", "Ungranted Assignee", "Hidden-source task", "Hidden Assignee"];
+
+  it("denies a purged sourced task and a task whose source is not visible to EVERY reader, assignee included, and they cannot move the digest", async () => {
+    const s = await base();
+    const project = await projectOf(s.x);
+    const hidden = await githubItem(s.team, "hidden-basis");
+    await converge(s.team);
+    await revokeMembership(hidden);
+    const handEntered = await insertTask(s, await newProject(s, "elsewhere"), {
+      title: "Hand-entered task", assignee: "Hand Assignee", source_item_id: null, created_by: s.team.memberId,
+    });
+    const sourced = await insertTask(s, project, {
+      title: "Visible sourced task", assignee: "Sourced Assignee", origin: "sync", source_item_id: s.g, created_by: null,
+    });
+    // A synced task whose source was purged: no source left, and never hand-entered.
+    const purged = await insertTask(s, project, {
+      title: "Purged sourced task", assignee: "Purged Assignee", origin: "sync", source_item_id: null, created_by: null,
+    });
+    const hiddenSource = await insertTask(s, project, {
+      title: "Hidden-source task", assignee: "Hidden Assignee", origin: "sync", source_item_id: hidden, created_by: null,
+    });
+    const allowed = [realTask(handEntered), realTask(sourced)];
+    s.w.tasks.set(s.x, [...allowed, realTask(purged), realTask(hiddenSource)]);
+
+    const one = await page(s.w, { pageSize: 1 });
+    // The loader was handed the snapshot's own admission: the seed member is an Everyone reader.
+    expect(s.w.seen.presentation.at(-1)?.admission).toMatchObject({ kind: "member", memberId: s.team.memberId, everyone: true });
+    const bundle = JSON.stringify(s.w.seen.bundles.at(-1));
+    const composed = JSON.stringify(one.days);
+    for (const text of [bundle, composed]) {
+      // An Everyone reader keeps every hand-entered task, in any project, and a task whose source it sees…
+      for (const shown of ["Hand-entered task", "Hand Assignee", "Visible sourced task", "Sourced Assignee"]) expect(text).toContain(shown);
+      // …and nobody keeps a task with no provenance left, or one whose source is not visible.
+      for (const denied of DENIED) expect(text).not.toContain(denied);
+      for (const id of [purged, hiddenSource]) expect(text).not.toContain(id);
+    }
+
+    // The denied rows are not part of the bound presentation: without them the digest is identical…
+    s.w.tasks.set(s.x, allowed);
+    expect((await page(s.w, { pageSize: 1 })).binding.presentationInputDigest).toBe(one.binding.presentationInputDigest);
+    // …and changing them between pages is not a change to anything the viewer was shown.
+    s.w.tasks.set(s.x, [...allowed, realTask(purged), realTask(hiddenSource)]);
+    await runSql(`update tasks set title = 'Renamed while denied', assignee = 'Renamed denied assignee' where id = any($1::uuid[])`, [[purged, hiddenSource]]);
+    const two = await page(s.w, { pageSize: 1, cursor: one.nextSlackCursor });
+    expect(two.aggregates).toHaveLength(1);
+    expect(JSON.stringify(two.days)).not.toContain("Renamed");
+    // An ADMITTED task's assignee is bound: changing it does require restart.
+    const again = await page(s.w, { pageSize: 1 });
+    await runSql(`update tasks set assignee = 'New owner' where id = $1`, [sourced]);
+    await expectFailure(() => page(s.w, { pageSize: 1, cursor: again.nextSlackCursor }), "restart_required");
+    // And a real sourced task follows its source's membership, exactly like the fixture-only control above.
+    const beforeRevocation = await page(s.w, { pageSize: 1 });
+    await revokeMembership(s.g);
+    await expectFailure(() => page(s.w, { pageSize: 1, cursor: beforeRevocation.nextSlackCursor }), "restart_required");
+    expect(JSON.stringify((await traverse(s.w, 1)).pages)).not.toContain("Visible sourced task");
+  });
+
+  it("denies a hand-entered task in a project the reader was never granted, and still shows the one in a granted project", async () => {
+    const s = await base();
+    // A reader who is NOT an Everyone member: an external human whose only grant is one project,
+    // reached through a group. The thread is placed in that project, so they see it by membership.
+    const viewerId = await externalMember(s.team);
+    const granted = await newProject(s, "granted");
+    const ungranted = await newProject(s, "ungranted");
+    const group = await createGroup(db(), s.team.teamId, `rg-${randomUUID().slice(0, 8)}`, "RG", s.team.memberId);
+    await grantProjectToGroup(db(), s.team.teamId, granted, group.groupId!, s.team.memberId);
+    const joined = await db().from("group_members").upsert(
+      { team_id: s.team.teamId, group_id: group.groupId, member_id: viewerId }, { onConflict: "group_id,member_id" }
+    );
+    expect(joined.error, "fixture: the reader joins the granted group").toBeNull();
+    const { data: unit } = await db().from("project_context_units").select("id").eq("source_item_id", s.x).single();
+    await db().from("project_context_memberships").update({ valid_to: new Date().toISOString() }).eq("context_unit_id", unit!.id).is("valid_to", null);
+    const placed = await db().from("project_context_memberships").insert({
+      team_id: s.team.teamId, project_id: granted, context_unit_id: unit!.id, method: "manual",
+    });
+    expect(placed.error, "fixture: the thread is placed in the granted project").toBeNull();
+
+    const inGranted = await insertTask(s, granted, {
+      title: "Granted hand-entered task", assignee: "Granted Assignee", source_item_id: null, created_by: s.team.memberId,
+    });
+    const inUngranted = await insertTask(s, ungranted, {
+      title: "Ungranted hand-entered task", assignee: "Ungranted Assignee", source_item_id: null, created_by: s.team.memberId,
+    });
+    const purged = await insertTask(s, granted, {
+      title: "Purged sourced task", assignee: "Purged Assignee", origin: "sync", source_item_id: null, created_by: null,
+    });
+    s.w.tasks.set(s.x, [realTask(inGranted), realTask(inUngranted), realTask(purged)]);
+
+    const viewer = { principal: { teamId: s.team.teamId, memberId: viewerId } };
+    const one = await page(s.w, { ...viewer, pageSize: 1 });
+    // Fixture preconditions, stated so a broken fixture cannot pass for a denial.
+    const admission = s.w.seen.presentation.at(-1)?.admission as { kind: string; everyone: boolean; grantedProjectIds: string[] };
+    expect(admission).toMatchObject({ kind: "member", memberId: viewerId, everyone: false });
+    expect(admission.grantedProjectIds).toContain(granted);
+    expect(admission.grantedProjectIds).not.toContain(ungranted);
+    expect(one.aggregates.map((a: Json) => a.id)).toEqual([groupId(s.x, s.a.id, "2024-06-20")]);
+
+    const bundle = JSON.stringify(s.w.seen.bundles.at(-1));
+    const composed = JSON.stringify(one.days);
+    for (const text of [bundle, composed]) {
+      for (const shown of ["Granted hand-entered task", "Granted Assignee"]) expect(text).toContain(shown);
+      for (const denied of DENIED) expect(text).not.toContain(denied);
+      for (const id of [inUngranted, purged]) expect(text).not.toContain(id);
+    }
+    // Denied rows are outside the digest for this reader too.
+    s.w.tasks.set(s.x, [realTask(inGranted)]);
+    expect((await page(s.w, { ...viewer, pageSize: 1 })).binding.presentationInputDigest).toBe(one.binding.presentationInputDigest);
+    s.w.tasks.set(s.x, [realTask(inGranted), realTask(inUngranted), realTask(purged)]);
+    await runSql(`update tasks set title = 'Renamed while denied' where id = any($1::uuid[])`, [[inUngranted, purged]]);
+    expect((await page(s.w, { ...viewer, pageSize: 1, cursor: one.nextSlackCursor })).aggregates).toHaveLength(1);
+    // The owner decides per READER: the previous case shows an Everyone member keeping a hand-entered
+    // task in a project nobody granted them, which this reader is denied.
   });
 });

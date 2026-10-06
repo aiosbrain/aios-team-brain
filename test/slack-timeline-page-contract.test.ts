@@ -948,6 +948,63 @@ describe("Slack timeline page contract — merge classification", () => {
     await expectFailure(() => c.mergeSlackTimelineDays(existing, page), "unavailable");
   });
 
+  // Final review, finding 3. Rows of a NON-Slack group were never looked at before the merger was
+  // called. The shared merger sorts them by `at` and `id`, so `[null, null]` made it throw — and a
+  // throw from that call is reported as a cross-page conflict. A malformed dependency result is
+  // `unavailable`; `restart_required` is reserved for well-formed pages that disagree.
+  const pr = (id: string, over: Json = {}): Json => ({ id, title: "PR", source: "github", kind: "pr", at: "2024-06-20T09:00:00Z", ...over });
+  const without = (row: Json, key: string): Json => { const copy = { ...row }; delete copy[key]; return copy; };
+  const NON_SLACK_ROWS: [string, unknown[]][] = [
+    ["two null rows (the review counterexample)", [null, null]],
+    ["one null row", [null]],
+    ["a string where a row belongs", ["row", pr("g2")]],
+    ["a number where a row belongs", [7, pr("g2")]],
+    ["an array where a row belongs", [[], pr("g2")]],
+    ["a row with no id", [without(pr("g1"), "id"), pr("g2")]],
+    ["a row whose id is not a string", [pr("g1", { id: 42 }), pr("g2")]],
+    ["a row with an empty id", [pr(""), pr("g2")]],
+    ["rows with no instant", [without(pr("g1"), "at"), without(pr("g2"), "at")]],
+    ["a row whose instant is not a string", [pr("g1", { at: 20240620 }), pr("g2")]],
+  ];
+  /** Existing days whose one non-Slack group holds `items`, unlinked or nested under a task. */
+  const existingWith = (items: unknown[], placement: "other" | "task"): TimelineDay[] => {
+    const group = { source: "github", count: 2, items } as never;
+    return [day("2024-06-20", [person(MEMBER_A, {
+      total: 2, unlinked: 2,
+      other: placement === "other" ? [group] : [],
+      tasks: placement === "task" ? [{ taskId: "T9", title: "Tracked task", status: "in_progress", source: "linear", evidenceCount: 2, sources: [group] }] : [],
+    })])];
+  };
+
+  it.each(NON_SLACK_ROWS)("refuses existing non-Slack evidence holding %s as unavailable, never as a merge conflict", async (_label, items) => {
+    const c = await contract();
+    for (const placement of ["other", "task"] as const) {
+      // With a continuation to merge, with nothing to merge (the normalization every first page gets)…
+      for (const page of [continuation([row(a1)]), []]) {
+        const failure = await failureOf(() => c.mergeSlackTimelineDays(existingWith(items, placement), page));
+        expect(failure, placement).toMatchObject({ name: "SlackTimelineError", code: "unavailable" });
+      }
+      // …and as the assembled first page a drain checks before it normalizes.
+      await expectFailure(() => c.assertAssembledSlackDays({ aggregates: [], days: existingWith(items, placement) }), "unavailable");
+    }
+  });
+
+  it("accepts well-formed non-Slack rows, capped or dated by day alone (control)", async () => {
+    const c = await contract();
+    for (const placement of ["other", "task"] as const) {
+      // A count above the rendered rows is a cap; a bare date is how a meeting is dated. Neither is malformed.
+      const existing = existingWith([pr("g1"), pr("m1", { source: "meetings", kind: "meeting", at: "2024-06-20" })], placement);
+      (existing[0].people[0][placement === "other" ? "other" : "tasks"][0] as { count?: number }).count = 9;
+      expect(() => c.assertAssembledSlackDays({ aggregates: [], days: existing })).not.toThrow();
+      const merged = c.mergeSlackTimelineDays(existing, continuation([row(a1)]));
+      expect(JSON.stringify(merged)).toContain('"g1"');
+      expect(JSON.stringify(merged)).toContain('"m1"');
+      // A well-formed page that DISAGREES with it is still a restart, exactly as before.
+      const conflict = [day("2024-06-20", [person(MEMBER_A, { other: [slackGroup([row(a1)])] as never })], "Another label")];
+      await expectFailure(() => c.mergeSlackTimelineDays(existing, conflict), "restart_required");
+    }
+  });
+
   it("does not mutate either input, so a caller can retry after any refusal", async () => {
     const c = await contract();
     const existing = initial();
