@@ -1,0 +1,57 @@
+{
+  "utc": "2026-10-06T04:53:06.030306+00:00",
+  "completedBuilder": true,
+  "childReaped": true,
+  "sourceScopePassed": true,
+  "oldCasesObserverHistoryBytesPreserved": true,
+  "checkpoint": "d8427efdfc3498a167e3b4155ca22b9278d5eb29",
+  "fixtureSha256": "7ae552da7d3d637a5c545caca92322f7f3330294c696cabf7de1873bc42e3407",
+  "fixtureBytes": 200634,
+  "patchSha256": "61235d43666574cd360666e5bfe58714d2c0c0e4a9f11c59089ba51c5db4334e",
+  "clean": true,
+  "checks": [
+    {
+      "stage": "f4e3_remaining_adm_recovery_lint",
+      "exit": 0
+    },
+    {
+      "stage": "f4e3_remaining_adm_recovery_typecheck",
+      "exit": 0
+    }
+  ],
+  "artifacts": {
+    "final.md": {
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-recovery-builder.final.md",
+      "sha256": "b1007ac07ac093e67880672de924648c81c86abcdf98bf3ce7ee59cf86e83346",
+      "bytes": 6734
+    },
+    "status.json": {
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-recovery-builder.status.json",
+      "sha256": "df2f9ae72c815081524528197ba8e4820bdd4846cfb1308c259f87c755105e83",
+      "bytes": 9617
+    },
+    "jsonl": {
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-recovery-builder.jsonl",
+      "sha256": "f98d8d72a281568e0e65688ee894d03b6752d4f6085c5cb31a254d0b07fc82cb",
+      "bytes": 1355914
+    },
+    "stderr": {
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-recovery-builder.stderr",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    "live.json": {
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-recovery-builder.live.json",
+      "sha256": "f3125825fa8ca6bf9181080c4d2c56c0b988563ea7c60d2dffb53ed75f5b6a2f",
+      "bytes": 266
+    },
+    "patch": {
+      "path": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-remaining-adm-recovery-builder.patch",
+      "sha256": "61235d43666574cd360666e5bfe58714d2c0c0e4a9f11c59089ba51c5db4334e",
+      "bytes": 57811
+    }
+  },
+  "PG": "NOT RUN",
+  "review": "NOT RUN",
+  "push": "NOT RUN"
+}

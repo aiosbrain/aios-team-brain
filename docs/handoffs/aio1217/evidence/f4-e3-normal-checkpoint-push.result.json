@@ -1,0 +1,22 @@
+{
+  "exit": 0,
+  "requestedHead": "2437df69f2146e84a646a46f288c555dd2ad032a",
+  "branch": "codex/aio-1217-server-action-auth",
+  "scopeVerified": true,
+  "cleanBefore": true,
+  "normalHooks": "normal git push; hooks enabled; no bypass",
+  "pushOutput": "pre-push: checking docs drift\u2026\n\u2713 routes: 70 item(s) in sync\n\u2713 tables: 90 item(s) in sync\n\u2713 sources: 8 item(s) in sync\n\nDocs are congruent with the code. \u2713\npre-push: checking skill runtime sync\u2026\nskill runtimes in sync (8 published skills \u00d7 .agents/.opencode/.cursor)\nTo https://github.com/aiosbrain/aios-team-brain.git\n   d99aa9b9..2437df69  codex/aio-1217-server-action-auth -> codex/aio-1217-server-action-auth\n",
+  "pushExit": 0,
+  "remoteBeforeActual": "d99aa9b90ac232f82709f66eb107d2f9b8216221\trefs/heads/codex/aio-1217-server-action-auth\n",
+  "terminalReaped": true,
+  "broaderAcceptance": false,
+  "remoteReadback": "2437df69f2146e84a646a46f288c555dd2ad032a\trefs/heads/codex/aio-1217-server-action-auth\n",
+  "stagingReadback": "c5e832c2ff179ee5c99f95966fba1ed9ce77ae3e\trefs/heads/staging\n",
+  "verifiedRemoteAt": "2026-10-06T02:53:28.197236+00:00",
+  "cleanAfter": true,
+  "localRemoteSynchronized": true,
+  "priorDeadline": "2026-10-06T02:24:15.835774+00:00",
+  "priorCadenceMet": false,
+  "priorDelaySeconds": 1752.361462,
+  "nextDeadline": "2026-10-06T03:23:28.197236+00:00"
+}

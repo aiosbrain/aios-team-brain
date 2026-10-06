@@ -1,0 +1,31 @@
+{
+  "control": "reuse exact successful f4-focused-pg at cd0387e",
+  "records": [
+    {
+      "id": "M1",
+      "copy": "/private/tmp/aio1217-f4-mutants-o52sjiyb/M1/aio1217-worktree",
+      "head": "cd0387e8f6315199f0497d64a4f2134ca02f6ad4",
+      "changedPath": "lib/pm-sync/reconcile.ts",
+      "beforeSha256": "9cad6dcd76888ac124559dcd904c8ac2afc8c261c80bf102e2e0b99c43d81f78",
+      "afterSha256": "d3d9a864647e1d0e97caba753bdebb2636a5deb96ed4cae51730de067fd5f6ad",
+      "exit": 1,
+      "runnerResult": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-mutants-M1.result.json",
+      "log": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-mutants-M1.log",
+      "classification": "Coordinator must verify executed behavioral failure; nonzero alone not credit"
+    },
+    {
+      "id": "M2",
+      "copy": "/private/tmp/aio1217-f4-mutants-o52sjiyb/M2/aio1217-worktree",
+      "head": "cd0387e8f6315199f0497d64a4f2134ca02f6ad4",
+      "changedPath": "app/t/[team]/admin/pm-sync/actions.ts",
+      "beforeSha256": "85fe8b5c647c119735664ce6640fd027fe9d4347304e813a98f4083fa0619ca9",
+      "afterSha256": "9a8ddc20f608dd57fee3f2bceffc156f0e4bac858836546f805e81072b32c5eb",
+      "exit": 1,
+      "runnerResult": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-mutants-M2.result.json",
+      "log": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-mutants-M2.log",
+      "classification": "Coordinator must verify executed behavioral failure; nonzero alone not credit"
+    }
+  ],
+  "candidateUnchanged": true,
+  "verifiedAt": "2026-10-05T21:50:21.046284+00:00"
+}

@@ -1,0 +1,8 @@
+{
+  "container": "/aios-aio1217-pg-8a4e78cb postgres:16",
+  "database": "synthetic app_test loopback",
+  "postgresPort": 50538,
+  "httpPort": null,
+  "providerEnv": "allowlisted without credentials",
+  "functionalOnly": true
+}

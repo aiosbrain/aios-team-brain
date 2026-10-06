@@ -1,0 +1,1 @@
+I'll start by locating the immutable manifest in the pinned directories.
