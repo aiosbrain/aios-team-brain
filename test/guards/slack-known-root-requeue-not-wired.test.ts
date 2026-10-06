@@ -261,7 +261,7 @@ const stubs = (): [string, string][] => PACKET_MODULES.map((module): [string, st
 describe("the known-root requeue packet stays inside its boundary", () => {
   it("exists as two modules exporting the accepted interfaces", () => {
     const tree = readTree();
-    for (const module of PACKET_MODULES) expect(tree.has(module), `${module} exists`).toBe(true);
+    for (const packetModule of PACKET_MODULES) expect(tree.has(packetModule), `${packetModule} exists`).toBe(true);
     expect(tree.size, "the tree scan is not vacuous").toBeGreaterThan(500);
     expect(exportedNames(PAGE, tree.get(PAGE) ?? "")).toEqual(expect.arrayContaining([
       "readSlackKnownRootItemPage", "createSlackKnownRootExecution", "SlackKnownRootValidationError", "SlackKnownRootDeadlineError",
@@ -317,7 +317,7 @@ describe("the known-root requeue packet stays inside its boundary", () => {
   it("imports only the dependencies the specification allows", () => {
     const tree = readTree();
     for (const dependency of Object.values(ALLOWED_DEPENDENCIES).flat()) expect(tree.has(dependency), `${dependency} exists`).toBe(true);
-    for (const module of PACKET_MODULES) expect(dependencyViolations(tree, module), module).toEqual([]);
+    for (const packetModule of PACKET_MODULES) expect(dependencyViolations(tree, packetModule), packetModule).toEqual([]);
   });
 
   it("refuses a provider, pool, transaction, ingest or writer dependency, and any queue writer but enqueue (negative control)", () => {
@@ -371,7 +371,7 @@ describe("the known-root requeue packet stays inside its boundary", () => {
 
   it("carries no DML or DDL of its own, opens no transaction, races no statement and calls out to nothing", () => {
     const tree = readTree();
-    for (const module of PACKET_MODULES) expect(effectViolations(module, tree.get(module) ?? ""), module).toEqual([]);
+    for (const packetModule of PACKET_MODULES) expect(effectViolations(packetModule, tree.get(packetModule) ?? ""), packetModule).toEqual([]);
   });
 
   it("sees a direct write, a transaction, a race or a provider call in module code, and ignores comments (negative control)", () => {
