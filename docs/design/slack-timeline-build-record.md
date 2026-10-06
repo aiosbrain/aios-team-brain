@@ -930,3 +930,56 @@ Broad suite. The broad `npm test` was not rerun for this packet and remains **no
 Still pending at the time of this record: the fresh Astra-high and the blind GPT-6.1 Sol-high final reviews. This entry does not claim final readiness.
 
 Not done and not authorized: human live acceptance, activation, wiring of any route, cache, UI or runner, deletion of either not-wired guard, repair apply, the identity cutover, merge, deployment and any production or main write. This entry follows the reviewed source and changes no source or test; it does not mark AC-09 complete, live-validated or integrated with PR 743, or the full task complete.
+
+#### AC-09 continuation — final-review hardening, and the converged service-account and census corrections, recorded October 6
+
+This continuation supersedes the sentence above that recorded the final reviews as pending. Nothing above is rewritten: the `883aa24d` figures stand as that candidate's record, and the figures below belong to the later snapshots they name.
+
+**Hardening to `dc4fbf84`.** After the early candidate `883aa24d`, accepted final-review findings were corrected test-first, culminating at `dc4fbf8487f0aa087eb0b8e4f0b3ee0fb8db27a8`:
+
+- the presentation bundle is captured once, and the digest is bound to the same captured bytes the composer renders;
+- the admission is cloned and frozen in the step the loader returns it;
+- a supplied outer signal must be a native `AbortSignal`, checked by brand and not only by `instanceof`, before any timer, listener or checkout;
+- every derived timer delay and every `statement_timeout` is bounded to 1..2,147,483,647 ms, and an elapsed budget above that bound is refused as configuration;
+- the drain takes a detached deep snapshot of each accepted page before validating, merging or keeping it.
+
+Coordinator checks on that snapshot, before the mandatory final reviews: focused drain and guard **131 passed / 1 skipped**; isolated real-PostgreSQL page reader **210/210**; typecheck; targeted lint; and **8/8** controlled mutants killed, with the source restored byte-identically. These counts cover the named focused suites only, not the whole branch.
+
+**Mandatory whole-branch reviews of `dc4fbf84`.** The fresh Astra-high review and the blind GPT-6.1 Sol-high review both returned **NOT READY**, converging on the same two findings. No blocker or HIGH was confirmed, and neither review confirmed any further defect in the aggregate page and drain packet. Both disclosed coverage limits.
+
+- Service-account credit (MEDIUM in both): a message from the exact source author `USLACKBOT`, with both directory bot flags false and an explicit mapping of that account to a human, was projected eligible and could earn that human a person-day.
+- Census roster (Astra LOW, Sol MEDIUM): the repair census's human-member query lacked `kind = 'human'`, so a non-connector agent or offroster member counted as human.
+
+Reviewer-specific facts, not coordinator reruns: Astra independently derived zero guarded-pipeline reachability and zero outside imports over 837 source files and 293 entry points; Sol independently ran 326 and 577 focused tests and typecheck.
+
+**Red checkpoint `7ff1cd8b619b96065189117d696c20649d4f11a6`.** It changes only three behaviour-test paths: `test/slack-message-evidence.test.ts`, `test/slack-evidence-adapter.test.ts` and `test/datamechanics/slack-repair-census.datamechanics.test.ts`. Coordinator proof: projector and composition **3 expected failures / 54 passed**; isolated real-PostgreSQL census **1 expected failure / 52 passed**. The exact-diff independent Sol-high review returned SAFE TO PUSH AS RED CHECKPOINT with no findings. The checkpoint was pushed and independently verified on the remote.
+
+**Production correction `865c579357311502f89bb35844ecaf480ccc9cdb`.** Two files changed, and no PR 743-owned shared path:
+
+- `lib/ingest/sources/slack-message-evidence.ts` — the exact source author `USLACKBOT` is excluded as `bot_identity` before the directory's human classification. The match is exact equality; near-miss ids stay creditable.
+- `lib/ingest/slack-repair-census-read.ts` — the census human-member query now requires same-team `kind = 'human' AND not is_connector`.
+
+Coordinator checks on `865c5793`: projector and composition **57/57**; isolated real-PostgreSQL census **53/53**; typecheck, targeted ESLint and the diff check all passed. Two controlled source mutants were killed and both sources restored byte-identically: removing the exact service-account predicate gave 3 failures / 54 passed, and removing the census human-kind predicate gave 1 failure / 52 passed. The durable ignored result is `.context/aio-1170-resume/final-converged-finding-mutation-results.json`.
+
+**Focused final reviews of `865c5793`.**
+
+- Fresh Astra-high: **READY**, no findings, with 28 in-memory probes and diff, merge-base and PR 743-disjointness checks.
+- Fresh blind GPT-6.1 Sol-high: **READY**, no findings; it independently ran 57 projector and adapter tests and 28 credit and person-day tests.
+- Fresh independent Opus 5.5: **READY**, no blocker, HIGH or MEDIUM, with four LOW notes.
+
+Disposition of the four LOW notes:
+
+1. Pinning the reason precedence for an unclassified or future-dated service-account message is optional test hardening. Astra's probes verified the current behaviour, and the exact false-flags counterexample is durably pinned. Deferred.
+2. Adding `UHUMAN` and `UCONNECTOR` to one privacy assertion is optional redundancy beside the existing identifier non-leak checks. Deferred.
+3. Disabled-human status parity is already guaranteed, because both inspected predicates intentionally omit status; a test for it is optional coverage. Deferred.
+4. The service-account id is declared in two modules on purpose: identity admission normalizes provider ids, while evidence projection requires the exact raw source id. No change.
+
+**Published state.** When this entry was written, the remote branch head and the PR 714 head were both `865c5793`, independently verified on the remote. This documentation edit will be a later docs-only commit, so the final published SHA is not that recorded source SHA and is not recorded here.
+
+**Broad suite.** The broad `npm test` remains **not green** and was not rerun. The historical exact run had 8,848 tests passed and three 5,000ms timeouts in `test/staging-policy-commissioning.test.ts`; their cause and baseline status are unverified. These corrections are not claimed to have caused or fixed them.
+
+**PR 743.** In the last fresh readback, the snapshot `e1ba30c4c55cc9aee9c7781394c01546c27830bc` was open, draft, blocked and unmerged, and it shares 27 paths with the full PR 714 branch. This correction itself is path-disjoint from it. Integration remains to be done: PR 743 first or an explicit combined branch; semantic reconciliation of identity and provider signatures and locks, the actual commit before provider HTTP under ambient transactions, the cache payload and salvage version and authorization epochs, and shared ingest, reattribution, admission and schema; then both branches' suites and fresh reviews of what is affected.
+
+**Still pending after this documentation-only update:** the final accepted-scope audit, the PR body and attestation, exact-head CI, and publication status. This entry does not claim that the task or the branch is complete, or that CI is green.
+
+Unchanged prohibitions. No human or live acceptance has been completed. Not done and not authorized: activation; wiring of any route, cache, UI, runner or publisher; deletion of either not-wired guard; repair apply; the identity cutover; merge; deployment; any main, production or force push; and the soak.
