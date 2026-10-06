@@ -62,12 +62,26 @@ const ALLOWED_DEPENDENCIES: Readonly<Record<string, readonly string[]>> = {
 /** Bare package specifiers either module may name. */
 const ALLOWED_PACKAGES: readonly string[] = ["server-only"];
 
-/** Dependencies of which only these VALUE names may be imported (type-only names are free). */
+/**
+ * Dependencies of which only these VALUE names may be imported (type-only names are free). Each list
+ * is exactly what the accepted specification names for that module; a namespace, default,
+ * side-effect, dynamic or re-exporting import of any of them is refused outright.
+ */
 const NAMED_ONLY: Readonly<Record<string, readonly string[]>> = {
   // The sole production queue writer of this packet.
   "lib/ingest/slack-thread-state.ts": ["enqueueSlackThread"],
   // Never `runPgClientTransaction`, `withTransaction` or a session helper.
   "lib/db/pg/tx.ts": ["TransactionExecutionError"],
+  // §5.1 step 1: the LOCKED readiness check. Never the invalidator, the blocked-gate writer or the
+  // readiness producer — preparation observes a gate, it does not move one.
+  "lib/ingest/slack-namespace-gate.ts": ["lockReadySlackNamespaceGate"],
+  // §5.1 step 2: the selection lock, which also resolves the effective token locally. Never a
+  // binder, an identity recorder, a blocker or a delay: preparation changes no binding.
+  "lib/ingest/slack-source-binding.ts": ["lockSlackSelection"],
+  // §5.3 and §5.4: the two existing path builders, and nothing that parses a path back into ids.
+  "lib/ingest/sources/slack-namespace.ts": ["scopedSlackItemPath", "slackChannelPathPrefix"],
+  // §5.3 and §6: the existing exact timestamp parser.
+  "lib/ingest/sources/slack-message-evidence.ts": ["parseSlackTimestamp"],
 };
 
 // ── imports ──────────────────────────────────────────────────────────────────
@@ -185,21 +199,66 @@ const FORBIDDEN_IDENTIFIERS: readonly string[] = [
   "runPgClientTransaction", "withTransaction", "AbortController", "AbortSignal", "XMLHttpRequest", "WebSocket",
 ];
 
+/**
+ * The capabilities of a session or client that reach past `executeSql`: the PostgREST-shaped builder
+ * (`db`, and `rpc` on it), the savepoint helper, and a transaction opener. Every statement of this
+ * packet goes through `executeSql`, where the DML check above can see its text; through any of these
+ * four a write or a remote function call would be invisible to it.
+ */
+const SESSION_SURFACES: readonly string[] = ["db", "rpc", "optionalAudit", "transaction"];
+
+/** True when the first statement of a member's body is `throw`: it does nothing else when used. */
+function throwsFirst(body: ts.Node | undefined): boolean {
+  return body !== undefined && ts.isBlock(body) && body.statements.length > 0 && ts.isThrowStatement(body.statements[0]);
+}
+
+/**
+ * The ONE place a surface name may appear as an identifier: naming a member that fails closed —
+ * `get db() { throw … }`, `optionalAudit() { throw … }`, `optionalAudit: () => { throw … }` — or a
+ * member of a type. That is how the packet's decorated session refuses those capabilities. Reading
+ * one, binding one, passing one on, or defining one that does anything but throw is a violation.
+ */
+function isFailClosedDefinition(name: ts.Identifier): boolean {
+  const parent = name.parent;
+  if (parent === undefined) return false;
+  if ((ts.isGetAccessorDeclaration(parent) || ts.isMethodDeclaration(parent)) && parent.name === name) return throwsFirst(parent.body);
+  if (ts.isPropertyAssignment(parent) && parent.name === name) {
+    const value = parent.initializer;
+    return (ts.isArrowFunction(value) || ts.isFunctionExpression(value)) && throwsFirst(value.body);
+  }
+  return (ts.isPropertySignature(parent) || ts.isMethodSignature(parent)) && parent.name === name;
+}
+
 /** What a module's own code does that the packet may not: read from the syntax tree, comments excluded. */
 function effectViolations(file: string, source: string): string[] {
-  const syntax = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, false);
+  const syntax = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true);
   const violations = new Set<string>();
+  const namesASession = (node: ts.Node): boolean => /session|client/i.test(node.getText(syntax));
   const visit = (node: ts.Node): void => {
     if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node) ||
         ts.isTemplateMiddle(node) || ts.isTemplateTail(node)) {
       const match = DML_OR_DDL.exec(node.text);
       if (match) violations.add(`${file}: SQL "${match[0].toLowerCase().replace(/\s+/g, " ")}"`);
+      // A surface named by a string — `session["db"]`, `Reflect.get(session, "rpc")`, a key held in a
+      // variable — is the same access. A string in a TYPE position (`Pick<…, "db">`) reads nothing.
+      if (SESSION_SURFACES.includes(node.text) && !ts.isLiteralTypeNode(node.parent)) violations.add(`${file}: "${node.text}" as a key`);
     } else if (ts.isIdentifier(node) && FORBIDDEN_IDENTIFIERS.includes(node.text)) {
       violations.add(`${file}: ${node.text}`);
+    } else if (ts.isIdentifier(node) && SESSION_SURFACES.includes(node.text)) {
+      const parent = node.parent;
+      if (ts.isPropertyAccessExpression(parent) && parent.name === node) violations.add(`${file}: .${node.text}`);
+      else if (!isFailClosedDefinition(node)) violations.add(`${file}: ${node.text} outside a fail-closed definition`);
     } else if (ts.isPropertyAccessExpression(node)) {
       const owner = ts.isIdentifier(node.expression) ? node.expression.text : null;
       if (owner === "Promise" && node.name.text === "race") violations.add(`${file}: Promise.race`);
-      if (node.name.text === "transaction" || node.name.text === "optionalAudit") violations.add(`${file}: .${node.name.text}`);
+    } else if (ts.isElementAccessExpression(node)) {
+      // A key that is not a literal cannot be shown to avoid a surface: on a session it is refused.
+      const key = node.argumentExpression;
+      const literalKey = ts.isStringLiteral(key) || ts.isNoSubstitutionTemplateLiteral(key) || ts.isNumericLiteral(key);
+      if (!literalKey && namesASession(node.expression)) violations.add(`${file}: computed access on a session`);
+    } else if ((ts.isSpreadAssignment(node) || ts.isSpreadElement(node)) && namesASession(node.expression)) {
+      // Spreading a session copies its builder and its savepoint helper into the copy.
+      violations.add(`${file}: spread of a session`);
     }
     ts.forEachChild(node, visit);
   };
@@ -327,7 +386,7 @@ describe("the known-root requeue packet stays inside its boundary", () => {
         "lib/db/types.ts", "lib/db/pg/tx.ts", "lib/db/pg/pool.ts", "lib/ingest/index.ts", "lib/ingest/slack-thread-state.ts",
         "lib/ingest/slack-namespace-gate.ts", "lib/ingest/slack-source-binding.ts", "lib/ingest/sources/slack-page-request.ts",
         "lib/ingest/slack-message-ledger.ts", "lib/ingest/slack-channel-state.ts", "lib/integrations/manage.ts",
-        "lib/projects/context/transaction.ts",
+        "lib/projects/context/transaction.ts", "lib/ingest/sources/slack-namespace.ts", "lib/ingest/sources/slack-message-evidence.ts",
       ].map((file): [string, string] => [file, ""]),
     ];
     const violationsOf = (source: string): string[] => dependencyViolations(new Map([...base, [REQUEUE, source]]), REQUEUE);
@@ -342,6 +401,11 @@ describe("the known-root requeue packet stays inside its boundary", () => {
       `import { lockReadySlackNamespaceGate } from "./slack-namespace-gate";`,
       `import { lockSlackSelection } from "./slack-source-binding";`,
       `import type { SlackKnownRootEntry } from "./slack-known-root-page";`,
+      // Types of the gate and the binding are free; the two path builders and the exact parser are named.
+      `import type { SlackNamespaceReadyLockResult } from "./slack-namespace-gate";`,
+      `import { lockSlackSelection as lockSelection, type SlackSelection } from "./slack-source-binding";`,
+      `import { scopedSlackItemPath, slackChannelPathPrefix } from "./sources/slack-namespace";`,
+      `import { parseSlackTimestamp } from "./sources/slack-message-evidence";`,
     ].join("\n"))).toEqual([]);
 
     const refused: [string, string][] = [
@@ -363,6 +427,42 @@ describe("the known-root requeue packet stays inside its boundary", () => {
       [`import { TransactionExecutionError, withTransaction } from "@/lib/db/pg/tx";`, `${REQUEUE}: imports withTransaction from lib/db/pg/tx.ts`],
     ];
     for (const [source, violation] of refused) expect(violationsOf(source), source).toEqual([violation]);
+
+    // The namespace gate and the source binding: the locked read each offers, and no writer of either.
+    const GATE = "lib/ingest/slack-namespace-gate.ts";
+    const BINDING = "lib/ingest/slack-source-binding.ts";
+    const writers: [string, string, string][] = [
+      ["./slack-namespace-gate", "invalidateSlackNamespaceGate", GATE],
+      ["./slack-namespace-gate", "ensureBlockedSlackNamespaceGate", GATE],
+      ["./slack-namespace-gate", "prepareNewSlackChannelNamespace", GATE],
+      ["./slack-source-binding", "blockSlackBinding", BINDING],
+      ["./slack-source-binding", "bindSlackSelection", BINDING],
+      ["./slack-source-binding", "recordSlackWorkspaceIdentity", BINDING],
+      ["./slack-source-binding", "recordSlackAppIdentity", BINDING],
+      ["./slack-source-binding", "delaySlackBinding", BINDING],
+    ];
+    for (const [specifier, name, file] of writers) {
+      const expected = [`${REQUEUE}: imports ${name} from ${file}`];
+      // Alone, beside the permitted lock, and renamed on the way in: the exported name is what counts.
+      expect(violationsOf(`import { ${name} } from "${specifier}";`), name).toEqual(expected);
+      const permitted = file === GATE ? "lockReadySlackNamespaceGate" : "lockSlackSelection";
+      expect(violationsOf(`import { ${permitted}, ${name} } from "${specifier}";`), name).toEqual(expected);
+      expect(violationsOf(`import { ${name} as harmless } from "${specifier}";`), name).toEqual(expected);
+    }
+    const wholesale: [string, string][] = [
+      [`import * as gate from "./slack-namespace-gate";`, `${REQUEUE}: imports * from ${GATE}`],
+      [`const gate = await import("./slack-namespace-gate");`, `${REQUEUE}: imports * from ${GATE}`],
+      [`export * from "./slack-source-binding";`, `${REQUEUE}: imports * from ${BINDING}`],
+      [`const binding = require("@/lib/ingest/slack-source-binding");`, `${REQUEUE}: imports * from ${BINDING}`],
+      [`import "./slack-source-binding";`, `${REQUEUE}: imports * from ${BINDING}`],
+      // Not a writer, and still not named by the specification: an unlisted helper is refused too.
+      [`import { readSlackBinding } from "./slack-source-binding";`, `${REQUEUE}: imports readSlackBinding from ${BINDING}`],
+      [`import { slackTokenFingerprint } from "./slack-source-binding";`, `${REQUEUE}: imports slackTokenFingerprint from ${BINDING}`],
+      // The path module's builders only — nothing that turns a path back into provider ids.
+      [`import { scopedSlackItemPath, parseScopedSlackItemPath } from "./sources/slack-namespace";`, `${REQUEUE}: imports parseScopedSlackItemPath from lib/ingest/sources/slack-namespace.ts`],
+      [`import { projectSlackMessageEvidence } from "./sources/slack-message-evidence";`, `${REQUEUE}: imports projectSlackMessageEvidence from lib/ingest/sources/slack-message-evidence.ts`],
+    ];
+    for (const [source, violation] of wholesale) expect(violationsOf(source), source).toEqual([violation]);
     // The page module has the narrower allowlist: it may not take the queue writer at all.
     expect(dependencyViolations(new Map([...base, [PAGE, `import { enqueueSlackThread } from "./slack-thread-state";`]]), PAGE)).toEqual([
       `${PAGE}: imports lib/ingest/slack-thread-state.ts`,
@@ -401,5 +501,72 @@ describe("the known-root requeue packet stays inside its boundary", () => {
       ["const controller = new AbortController();", `${REQUEUE}: AbortController`],
     ];
     for (const [source, violation] of refused) expect(of(source), source).toContain(violation);
+  });
+
+  it("refuses every way past executeSql — the builder, rpc, the savepoint helper and a transaction — by property, key or destructuring (negative control)", () => {
+    const of = (source: string): string[] => effectViolations(REQUEUE, source);
+    const outside = (name: string): string => `${REQUEUE}: ${name} outside a fail-closed definition`;
+
+    // The intended decorated session is clean: `db` and `optionalAudit` are DEFINED, and each only throws.
+    expect(of([
+      "const decorated: TransactionSession = {",
+      "  get db(): never { throw new SlackKnownRootSessionError(); },",
+      "  executeSql,",
+      "  async optionalAudit<T>(): Promise<T> { throw new SlackKnownRootSessionError(); },",
+      "};",
+      "const alsoClosed = { optionalAudit: () => { throw new SlackKnownRootSessionError(); }, db: function () { throw new SlackKnownRootSessionError(); } };",
+      "type OnlyExecute = Omit<TransactionSession, \"db\" | \"optionalAudit\">;",
+      "interface Refusing { db: never; optionalAudit(): never }",
+      "const rows = result.rows[0];",
+      "const copy = { ...cursor };",
+    ].join("\n"))).toEqual([]);
+
+    // Each prohibited surface, by each access form. None of these is vacuous: every row names the
+    // exact violation, and the clean sample above shows the same checker returning nothing.
+    const refused: [string, string][] = [
+      // Property access — direct, and builder-mediated DML and RPC behind it.
+      ["await session.db.from(\"slack_sync_threads\").insert({ team_id: teamId });", `${REQUEUE}: .db`],
+      ["await session.db.from(\"items\").update({ member_id: null }).eq(\"id\", itemId);", `${REQUEUE}: .db`],
+      ["await session.db.rpc(\"bump_slack_generation\", { team: teamId });", `${REQUEUE}: .rpc`],
+      ["await client.rpc(\"bump_slack_generation\");", `${REQUEUE}: .rpc`],
+      ["await session.optionalAudit(() => write(), null);", `${REQUEUE}: .optionalAudit`],
+      ["await capability.transaction(async (inner) => inner.executeSql(text));", `${REQUEUE}: .transaction`],
+      ["const builder = session?.db;", `${REQUEUE}: .db`],
+      // Element access and any other string key.
+      ["await session[\"db\"].from(\"items\").delete();", `${REQUEUE}: "db" as a key`],
+      ["await session['rpc'](\"bump\");", `${REQUEUE}: "rpc" as a key`],
+      ["await session[`optionalAudit`](() => write(), null);", `${REQUEUE}: "optionalAudit" as a key`],
+      ["await capability[\"transaction\"](run);", `${REQUEUE}: "transaction" as a key`],
+      ["const builder = Reflect.get(session, \"db\");", `${REQUEUE}: "db" as a key`],
+      ["const key = \"rpc\"; await client[key](\"bump\");", `${REQUEUE}: "rpc" as a key`],
+      ["await session[surface].from(\"items\");", `${REQUEUE}: computed access on a session`],
+      // Destructuring, in a declaration, a parameter and an assignment, renamed or not.
+      ["const { db } = session;", outside("db")],
+      ["const { db: builder } = session;", outside("db")],
+      ["const { rpc } = client;", outside("rpc")],
+      ["function run({ optionalAudit }: TransactionSession): void { void optionalAudit; }", outside("optionalAudit")],
+      ["const { transaction } = capability;", outside("transaction")],
+      ["({ db: builder } = session);", outside("db")],
+      ["({ transaction } = capability);", outside("transaction")],
+      // Handing one on, or copying a whole session.
+      ["const passthrough = { db: session.db, executeSql };", `${REQUEUE}: .db`],
+      ["const passthrough = { db: inner, executeSql };", outside("db")],
+      ["const passthrough = { db, executeSql };", outside("db")],
+      ["const copied = { ...session, executeSql: decorated };", `${REQUEUE}: spread of a session`],
+      ["function helper(db: DbClient): void { void db; }", outside("db")],
+      // A definition that does anything but throw is not fail-closed.
+      ["const open = { get db() { return inner.db; }, executeSql };", outside("db")],
+      ["const open = { optionalAudit(operation) { return operation(); } };", outside("optionalAudit")],
+      ["const open = { optionalAudit: (operation) => operation() };", outside("optionalAudit")],
+      ["const open = { get db() { log(); throw new Error(); } };", outside("db")],
+    ];
+    for (const [source, violation] of refused) expect(of(source), source).toContain(violation);
+    // Every one of the four surfaces was refused in every one of the three access forms.
+    for (const surface of ["db", "rpc", "optionalAudit", "transaction"]) {
+      const violations = refused.filter(([source]) => source.includes(surface)).flatMap(([source]) => of(source));
+      expect(violations, `${surface} by property`).toContain(`${REQUEUE}: .${surface}`);
+      expect(violations, `${surface} by key`).toContain(`${REQUEUE}: "${surface}" as a key`);
+      expect(violations, `${surface} by destructuring`).toContain(outside(surface));
+    }
   });
 });

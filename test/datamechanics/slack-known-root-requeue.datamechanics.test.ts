@@ -26,7 +26,7 @@ import { parseSlackTimestamp } from "@/lib/ingest/sources/slack-message-evidence
 import { scopedSlackItemPath } from "@/lib/ingest/sources/slack-namespace";
 import { normalizeThread } from "@/lib/ingest/sources/slack-normalize";
 import { transactionCapability } from "@/lib/projects/context/transaction";
-import { db, seedTeam, type Seed } from "./helpers";
+import { db, ingest, seedTeam, type Seed } from "./helpers";
 import {
   authTestBody,
   channelInfoBody,
@@ -211,6 +211,25 @@ async function newestPassOmittingOldRoot(f: Published): Promise<string[]> {
   return [...served].sort();
 }
 
+/**
+ * An unrelated item of the same team that is not Slack's at all: another project, another source,
+ * written through ordinary ingest. Enumeration examines EVERY team item, so it must come back as an
+ * entry of its own — unlocated, `not_slack` — and never be skipped in search of a Slack root.
+ */
+async function seedUnrelatedItem(seed: Seed): Promise<string> {
+  const created = await ingest(seed, {
+    project: "notes", path: `notes/unrelated-${randomUUID().slice(0, 8)}.md`, body: "an unrelated note", access: "team",
+    frontmatter: { source: "github" },
+  });
+  expect(created.status, "fixture: the unrelated item was created").toBe("created");
+  const [row] = await query<{ source: string | null; path: string }>(
+    `select frontmatter->>'source' as source, path from items where team_id = $1 and id = $2`, [seed.teamId, created.id]
+  );
+  expect(row, "fixture: the unrelated item is stored, and is not a Slack item").toMatchObject({ source: "github" });
+  expect(row.path.startsWith("slack/")).toBe(false);
+  return created.id;
+}
+
 /** FIXTURE CLOCK: the stored observation of this team's ledger rows, moved two hours into the past. */
 async function ageObservation(teamId: string): Promise<void> {
   const aged = await (await rawSql()).query(
@@ -261,9 +280,12 @@ describe("a published old root that newest history no longer returns (real Postg
   // BEHAVIOURAL RED against the stub reader, which returns a placeholder page with no entries.
   it("is found by enumeration, with the exact durable locator of its published item", async () => {
     const f = await publishOldRoot();
+    const unrelatedItemId = await seedUnrelatedItem(f.seed);
     const channel = await channelRow(f.seed.teamId, WORKSPACE, CHANNEL);
     const teamItems = (await query<{ n: number }>(`select count(*)::int as n from items where team_id = $1`, [f.seed.teamId]))[0].n;
-    expect(teamItems, "fixture: the team has the published item").toBeGreaterThanOrEqual(1);
+    expect(teamItems, "fixture: the team has the published root AND an unrelated item").toBeGreaterThanOrEqual(2);
+    // The expected revision below is a real stored one, not an absent value two `undefined`s would agree on.
+    expect(channel?.binding_config_revision, "fixture: the channel row stores a configuration revision").toMatch(/^[0-9a-f]{64}$/);
 
     const page = await enumerate(f.seed.teamId);
 
@@ -287,6 +309,14 @@ describe("a published old root that newest history no longer returns (real Postg
       },
     ]);
     expect(channel?.binding_integration_id, "fixture: the channel is bound to the seeded integration").toBe(f.integrationId);
+    // The unrelated item is an entry too — exactly this one, with the closed reason it has no locator.
+    expect(page.entries.filter((entry) => entry.itemId === unrelatedItemId)).toEqual([
+      { teamId: f.seed.teamId, itemId: unrelatedItemId, revisitAfterMs: REVISIT_AFTER_MS, unlocated: "not_slack" },
+    ]);
+    // Every other examined item is unlocated as well: the published root is the page's only locator.
+    for (const entry of page.entries) {
+      if (entry.itemId !== f.itemId) expect(entry, entry.itemId).toHaveProperty("unlocated");
+    }
     expect(page.examined).toBe(teamItems);
     expect(page.entries).toHaveLength(teamItems);
     expect(page).toMatchObject({ exhausted: true, nextCursor: null });
@@ -299,6 +329,7 @@ describe("a published old root that newest history no longer returns (real Postg
   // assertion is the same one: the old root's pending row was not rebuilt.
   it("gets exactly one due pending row back from preparation, given only the team and its enumerated entry", async () => {
     const f = await publishOldRoot();
+    const unrelatedItemId = await seedUnrelatedItem(f.seed);
     const recent = await newestPassOmittingOldRoot(f);
     await ageObservation(f.seed.teamId);
     const before = await stored(f.seed.teamId);
@@ -335,6 +366,10 @@ describe("a published old root that newest history no longer returns (real Postg
     // The root's own entry reports the insertion; nothing else was scheduled or disturbed.
     const mine = results.filter(({ entry }) => entry.itemId === f.itemId);
     expect(mine.map(({ result }) => result)).toEqual([{ outcome: "enqueued" }]);
+    // The unrelated item was prepared like every other entry, and is unattested for this observation.
+    expect(results.filter(({ entry }) => entry.itemId === unrelatedItemId).map(({ result }) => result)).toEqual([
+      { outcome: "unattested", reason: "not_slack" },
+    ]);
     expect(after.allQueue.map((row) => row.root_ts).sort()).toEqual([OLD_ROOT, ...recent].sort());
     expect(after.snapshots).toBe(0);
     expect(after.ledger).toEqual(before.ledger);

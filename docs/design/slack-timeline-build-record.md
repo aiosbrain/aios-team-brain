@@ -983,3 +983,72 @@ Disposition of the four LOW notes:
 **Still pending after this documentation-only update:** the final accepted-scope audit, the PR body and attestation, exact-head CI, and publication status. This entry does not claim that the task or the branch is complete, or that CI is green.
 
 Unchanged prohibitions. No human or live acceptance has been completed. Not done and not authorized: activation; wiring of any route, cache, UI, runner or publisher; deletion of either not-wired guard; repair apply; the identity cutover; merge; deployment; any main, production or force push; and the soak.
+
+### AC-02 inactive known-root requeue — specification and implementation record
+
+**Current status (updated only here): specification accepted; red-first test foundation written and under review correction; production NOT implemented.** The two source modules are stubs. No acceptance criterion of this slice is green, no query plan has been measured, and no final verification, mutation run or final review has been performed. **AC-02 is not complete, and nothing in this section completes it or AIO-1170.**
+
+#### Specification — recorded October 6
+
+The accepted specification is the tracked file `docs/design/slack-known-root-requeue-spec.md`, round 3 of 3, the final Astra architectural adjudication. Its accepted commit is `2c040b19f690f8433a844ec4916b9dfa38696ea6`. The file is 69,251 bytes with SHA-256 `08439e57f821022189e666329d80cc25dd1560868898e549ec2f624c15cdf4dd`, and it was attached to Linear AIO-1170 with a byte-identical readback at comment `fe96a957-bead-4fe6-b1e5-6ac35ca059a9`. The third and final independent Opus review of the specification returned READY with no blocker, HIGH or MEDIUM. These identities and that verdict were supplied by the coordinator; the writer did not recompute the hash.
+
+The specification's own pinned snapshot, as it records it: documentation HEAD `12bca192c6ea7a6c048546ca24e45034df0c1c0d`; source and test candidate `865c579357311502f89bb35844ecaf480ccc9cdb`; staging merge base `c5e832c2ff179ee5c99f95966fba1ed9ce77ae3e`; PR 743 path inventory `e1ba30c4c55cc9aee9c7781394c01546c27830bc`. It states that live PR 714 and PR 743 status, remote heads, query plans, performance and integrated behaviour were unverified at adjudication.
+
+Final round-two dispositions, as the specification records them: R2-1 (MEDIUM, the conflicting-thread predicate and its unindexed scan) and R2-2 (MEDIUM, the product-owned classifier and tally reducer) accepted and resolved in the specification; L-a, L-b, L-c and L-e accepted and resolved; L-d accepted as a held capacity limitation. Earlier decisions F1 to F7 and L1 to L7 are preserved.
+
+Scope. The slice is an inactive, schema-free enumeration and preparation primitive in two new modules, `lib/ingest/slack-known-root-page.ts` and `lib/ingest/slack-known-root-requeue.ts`, with exported pure failure-classification and page-tally helpers. It adds no driver, runner, scheduler, route, provider request, schema, lane or durable cursor, and it edits no discovery, channel-state, thread-state, hydration, publication, ledger, namespace, binding, ingest, integration-management, purge, transaction or schema file. Its numeric plan gate is the specification's: every measured data statement at most 200 ms and every complete page or preparation operation at most 750 ms on the stated single-channel fixture, with any exceedance a stop for schema-owner adjudication. That gate has not been measured.
+
+#### Red-first checkpoints — recorded October 6
+
+The sole writer was subscription-authenticated `claude-opus-5-5` at high effort, session `b1767100-da84-4808-818f-6b0107480c68`. The writer's permission mode allowed it no test or shell execution, so every result below was produced by the coordinator, who also owns the commits.
+
+Two red commits exist:
+
+- `fae70a27` — the first red checkpoint: the two typed stub modules, the unit suite `test/slack-known-root-requeue.test.ts`, the real-PostgreSQL suite `test/datamechanics/slack-known-root-requeue.datamechanics.test.ts`, the new boundary guard `test/guards/slack-known-root-requeue-not-wired.test.ts`, and the extension of `test/guards/slack-source-not-wired.test.ts` that places both modules in the forbidden reachability set. Only the short id was given to the writer. The repository lint rule then reported three local bindings named `module` in the new guard. No test counts for this commit are recorded here.
+- `20b082952f71517df2bfb1fec8883e5f7a5f8e32` — the lint-corrected red checkpoint. The writer's only change between the two was renaming those three loop bindings and their references; no assertion, fixture or stub changed.
+
+**What the stubs are.** Both source modules compile and are callable, and they **return typed placeholders normally; they do not throw**. The page reader returns a fixed page with no entries, the preparer a fixed refusal, the classifier one fixed category and the reducer a fixed tally. Two placeholders are deliberately invalid values (a page that is neither exhausted nor continued, and a tally whose examined count is -1) so that neither can pass for a correct empty answer. Any description of these modules as throwing stubs is superseded by this paragraph. A failing test therefore fails on a behavioural assertion, not on an import, a "not implemented" exception or a type error.
+
+**Observed red on `20b08295`, as run by the coordinator:**
+
+- Focused unit and guards: 111 tests, **84 expected behavioural failures and 27 passes**. Both guard files passed.
+- TypeScript typecheck passed. Targeted ESLint passed.
+- Isolated real PostgreSQL: 3 tests, **2 expected behavioural failures and 1 passing characterization**. Enumeration returned no entry where exactly one located entry was expected, and KR-01 found no queue row where exactly one queued row was expected. The passing case is the permanent characterization: real publication deletes the old root's queue row and staging, and a completed-history newest pass that omits the root leaves it unscheduled.
+
+This is behavioural red against placeholders. It is not evidence that any behaviour of the slice is implemented, and the passing characterization is evidence of the gap, not a red-to-green proof.
+
+#### Independent red review and its corrections — recorded October 6
+
+An independent Opus 5.5 high-effort review examined `20b08295` against specification commit `2c040b19`. The coordinator assigned four MEDIUM corrections and a set of LOW corrections from it. The reviewer's verdict wording was not given to the writer and is not restated here. The corrections below were written after `20b08295`, touch only the red-test files and this record, change no production file, and **had not been committed or run when this entry was written**; their results belong in a later dated subsection.
+
+- **MEDIUM — the boundary guard and session surfaces.** The guard now refuses property access, string-keyed access and destructuring of `db`, `rpc`, `optionalAudit` and `transaction`, a computed key or a spread on a session, and any definition of one of those members that does anything but throw. The intended fail-closed `get db()` and `optionalAudit` definitions are allowed. Negative controls cover each of the four surfaces in each of the three access forms, including builder-mediated DML and RPC.
+- **MEDIUM — gate and binding imports.** Value imports from `slack-namespace-gate` are restricted to `lockReadySlackNamespaceGate` and from `slack-source-binding` to `lockSlackSelection`. `invalidateSlackNamespaceGate`, `ensureBlockedSlackNamespaceGate`, `prepareNewSlackChannelNamespace`, `blockSlackBinding`, `bindSlackSelection`, `recordSlackWorkspaceIdentity`, `recordSlackAppIdentity` and `delaySlackBinding` are each refused, alone, beside the permitted lock, and renamed. The two path builders and the exact timestamp parser are likewise the only value imports allowed from their modules.
+- **MEDIUM — the enumeration fixture.** The real-PostgreSQL enumeration and KR-01 cases now seed an unrelated non-Slack item through ordinary ingest, require at least two team items, require the stored `binding_config_revision` to be 64 lowercase hex characters, and assert the unrelated item's exact unlocated `not_slack` entry. The characterization and both behavioural reds are preserved.
+- **MEDIUM — the execution object.** Database-free cases now go through both primitives: a malformed, infinite or NaN execution object is a static validation error with no statement issued; a context created with an already-expired ambient deadline may be created and is then refused by each primitive with the slice's deadline error and no statement; a context whose own allowance ran out before the call is refused the same way; and a clock that throws or misreports after creation, or at creation, fails without leaking a canary.
+- **LOW, corrected now.** Unknown-commit precedence over the deadline marker is pinned; five-character Node codes (`EPIPE`, `EPERM`, `EBUSY`) are pinned as not SQLSTATEs; the exact static validation message is pinned wherever a validation error is asserted; and the unit suite states that issuing no statement at all for an unlocated entry is a deliberate invariant stronger than the specification's "no mutation".
+
+Accepted LOW clarifications carried into implementation and final tests:
+
+1. A failed receipt accepts 0, 1 or 2 attempts; a committed receipt requires 1 or 2. The explicit prose of the specification governs over a literal that shows only 1 or 2.
+2. The retry fixture needs an injected retryable SQLSTATE or a lowered timeout to produce a real two-attempt transaction.
+3. The first five timing samples after fixture loading and statistics collection are the retained observations; none is discarded or replaced.
+4. Classifier rungs 2 to 8 have no dedicated mutant each; this is recorded as non-blocking, and the precedence table is pinned by assertion instead.
+5. The pure reducer relies on the caller's settlement discipline: complete accounting is produced only after every started invocation has settled. No active worker in this slice enforces that.
+6. This record names specification commit `2c040b19`.
+
+#### Pending — not done, and not claimed
+
+Deferred by the red review to the implementation and final-test stage, and **all still pending**:
+
+- KR-02, KR-03, KR-04 to KR-09, KR-10 to KR-13 and KR-15 to KR-17 in full. KR-01 exists only as behavioural red; KR-14 and KR-16 are covered in part by the guards and the unit suite.
+- M1h and M15, and the rest of the mutation matrix, with recorded baseline, mutant and restored hashes.
+- The deterministic executor-barrier conflict race, both publisher orderings and the two-preparer race.
+- The 100,000-item traversal, the required `EXPLAIN (ANALYZE, BUFFERS)` inventory, the five retained observations per case and the numeric stop comparison.
+- The stored-secret rotation fixture, the environment-fallback fixture and the namespace re-readiness fixture.
+- Timeout restoration on every normal and throwing outcome, retry accounting through the real transaction wrapper, and the no-mutation snapshots.
+
+Also pending: the production implementation of both modules; the existing thread-state, publication, discovery, ledger and source-fence regressions on the implemented snapshot; typecheck, lint, docs-drift and diff checks on that snapshot; the independent exact-snapshot code review; a fresh PR 743 path refresh and comparison before publication; and PR 743 semantic integration.
+
+The broad `npm test` was not rerun for this slice and remains **not green** from the earlier exact run recorded above. No claim is made about it here.
+
+Not done and not authorized, unchanged: any driver, runner, scheduler, route, action or manual trigger for this primitive; provider HTTP; publisher wiring; deletion or weakening of either not-wired guard; repair apply; the identity cutover; activation; merge; deployment; any main, production or force push; live acceptance and the soak. The held items of the specification's final section — retained-history seeding, durable sweep rotation, lane fairness, provider reservations, sweep capacity, deletion-safe publication and the runner-to-timeline AC-02 proof — remain held.

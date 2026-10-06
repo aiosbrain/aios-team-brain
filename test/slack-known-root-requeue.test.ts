@@ -133,9 +133,19 @@ function thrown(run: () => unknown): unknown {
   return undefined;
 }
 
-/** A static validation error: the packet's own class, quoting nothing it was given. */
+/** The one sentence a caller-contract failure may say. Stated here, not imported: a changed message must fail. */
+const STATIC_VALIDATION_MESSAGE = "slack known-root: invalid request";
+const STATIC_DEADLINE_MESSAGE = "slack known-root: operation deadline exceeded";
+
+/**
+ * A static validation error: the packet's own class, with EXACTLY the static message — the same
+ * bytes whatever was rejected — so nothing it was given can be quoted, formatted in or appended.
+ */
 function expectStaticValidationError(error: unknown, label: string): void {
   expect(error, `${label}: a validation error was thrown`).toBeInstanceOf(SlackKnownRootValidationError);
+  expect((error as Error).message, `${label}: the message is the static sentence, exactly`).toBe(STATIC_VALIDATION_MESSAGE);
+  expect((error as Error).name, label).toBe("SlackKnownRootValidationError");
+  expect("cause" in (error as object) && (error as { cause?: unknown }).cause !== undefined, `${label}: no cause travels with it`).toBe(false);
   expectNoCanary(error, label);
 }
 
@@ -151,6 +161,12 @@ describe("known-root preparation — composed from teamId plus one enumerated en
       const result = await prepareSlackKnownRootRequeue(session, { teamId: TEAM, entry }, execution());
       expect(result).toEqual({ outcome: "unattested", reason: category });
       // Unresolved coverage for this observation: no lock, no read, no write, no setting changed.
+      //
+      // ZERO STATEMENTS IS A DELIBERATE, STRONGER INVARIANT THAN THE SPECIFICATION STATES. §4.2 asks
+      // for "no mutation", and §7.3 would permit a session-settings read and its restoration around
+      // a result that needed neither. This packet pins the stronger form on purpose: an entry with
+      // no locator names nothing to look up, so the session is not touched at all — not even to
+      // read a timeout — and there is therefore nothing to restore and nothing that can fail.
       expect(statements, "no statement was issued").toEqual([]);
       expect(other, "no other session capability was used").toEqual([]);
     }
@@ -271,6 +287,137 @@ describe("known-root enumeration — invalid and boundary requests", () => {
   });
 });
 
+// ── §7.2 and §11: both primitives enforce the execution object ───────────────
+
+/**
+ * Red review, MEDIUM. Validating the options of `createSlackKnownRootExecution` proves nothing about
+ * what the two primitives do with the object they are HANDED: a caller can pass anything, and a
+ * context that was sound when it was created can have run out, or its clock can have failed, by the
+ * time a primitive is called. Each case below goes through a primitive, with a session that records
+ * every use, and none depends on how a context is represented: a hand-built object is only ever
+ * expected to be REFUSED, so an implementation that accepts nothing but its own contexts and one that
+ * checks the fields both satisfy them.
+ */
+describe("known-root primitives — the execution object is enforced by the primitive it is handed to", () => {
+  const PRIMITIVES: [string, (session: TransactionSession, execution: unknown) => Promise<unknown>][] = [
+    ["the page reader", (session, execution) =>
+      readSlackKnownRootItemPage(session, { teamId: TEAM, pageSize: 10, revisitAfterMs: REVISIT_MS }, execution as never)],
+    ["the preparer", (session, execution) =>
+      prepareSlackKnownRootRequeue(session, { teamId: TEAM, entry: located() }, execution as never)],
+  ];
+  const NOW = 50_000;
+  const steady = (): number => NOW;
+
+  const MALFORMED: [string, unknown][] = [
+    ["no execution at all", undefined],
+    ["null", null],
+    ["a string", CANARY.token],
+    ["an empty object", {}],
+    ["an array", [2_000, NOW + 2_000, steady]],
+    ["a deadline that is not a number", { allowanceMs: 2_000, deadlineAt: CANARY.metadata, monotonicNow: steady }],
+    ["a NaN deadline", { allowanceMs: 2_000, deadlineAt: Number.NaN, monotonicNow: steady }],
+    ["an infinite deadline", { allowanceMs: 2_000, deadlineAt: Number.POSITIVE_INFINITY, monotonicNow: steady }],
+    ["a negatively infinite deadline", { allowanceMs: 2_000, deadlineAt: Number.NEGATIVE_INFINITY, monotonicNow: steady }],
+    ["no deadline", { allowanceMs: 2_000, monotonicNow: steady }],
+    ["a NaN allowance", { allowanceMs: Number.NaN, deadlineAt: NOW + 2_000, monotonicNow: steady }],
+    ["an infinite allowance", { allowanceMs: Number.POSITIVE_INFINITY, deadlineAt: NOW + 2_000, monotonicNow: steady }],
+    ["an allowance below the minimum", { allowanceMs: 999, deadlineAt: NOW + 999, monotonicNow: steady }],
+    ["an allowance above the maximum", { allowanceMs: 5_001, deadlineAt: NOW + 5_001, monotonicNow: steady }],
+    ["a fractional allowance", { allowanceMs: 1_500.5, deadlineAt: NOW + 1_500, monotonicNow: steady }],
+    ["an allowance given as text", { allowanceMs: "2000", deadlineAt: NOW + 2_000, monotonicNow: steady }],
+    ["no clock", { allowanceMs: 2_000, deadlineAt: NOW + 2_000 }],
+    ["a clock that is not a function", { allowanceMs: 2_000, deadlineAt: NOW + 2_000, monotonicNow: 42 }],
+  ];
+
+  describe.each(PRIMITIVES)("%s", (_primitive, run) => {
+    it.each(MALFORMED)("refuses %s as a static validation error, before any statement", async (label, execution) => {
+      const { session, statements, other } = recordingSession();
+      const error = await rejection(() => run(session, execution));
+      expectStaticValidationError(error, label);
+      expect(statements, `${label}: refused before any statement`).toEqual([]);
+      expect(other, `${label}: no other session capability was used`).toEqual([]);
+    });
+
+    // §11: "An already-expired ambient deadline issues no data SQL." Creating the context is allowed —
+    // an ambient deadline that has passed is a fact about the caller's remaining time, not a malformed
+    // option — and the primitive is what refuses to start. This packet pins the stronger form of
+    // "no data SQL": the admission check comes first, so the session is not touched at all.
+    it.each([1, 250, 60_000])("refuses a context whose ambient deadline passed %d ms before it was created: a deadline error, and not one statement", async (ago) => {
+      let execution: unknown;
+      expect(() => {
+        execution = createSlackKnownRootExecution({ ambientDeadlineAt: NOW - ago, monotonicNow: steady });
+      }, "creating it is allowed").not.toThrow();
+      const { session, statements, other } = recordingSession();
+      const error = await rejection(() => run(session, execution));
+      expect(error, "the primitive rejected with the slice's deadline error").toBeInstanceOf(SlackKnownRootDeadlineError);
+      expect((error as Error).message).toBe(STATIC_DEADLINE_MESSAGE);
+      expectNoCanary(error, "deadline error");
+      expect(statements, "no statement was issued").toEqual([]);
+      expect(other).toEqual([]);
+      // The same rejection is what the reporting classifier is given.
+      expect(classifySlackKnownRootPreparationFailure(error)).toBe("deadline_exceeded");
+    });
+
+    // §7.2: the context is created BEFORE the transaction and reused across its attempts. One whose
+    // allowance ran out before this call — a retry, or a late start — gets no fresh allowance.
+    it("refuses a context whose own allowance ran out before the call: a retry gets no fresh allowance", async () => {
+      let now = NOW;
+      const execution = createSlackKnownRootExecution({ ambientDeadlineAt: null, monotonicNow: () => now });
+      now += SLACK_KNOWN_ROOT_LIMITS.allowanceMs.default + 1;
+      const { session, statements } = recordingSession();
+      const error = await rejection(() => run(session, execution));
+      expect(error).toBeInstanceOf(SlackKnownRootDeadlineError);
+      expect((error as Error).message).toBe(STATIC_DEADLINE_MESSAGE);
+      expect(statements, "no statement was issued").toEqual([]);
+    });
+
+    // §7.2: "Invalid or failing clock reads throw safely." The clock is sound while the context is
+    // created and fails afterwards, however many readings creation took.
+    it.each<[string, () => number]>([
+      ["throws", () => { throw new Error(`clock device failed: ${CANARY.metadata}`); }],
+      ["throws something that is not an error", () => { throw CANARY.token; }],
+      ["returns NaN", () => Number.NaN],
+      ["returns Infinity", () => Number.POSITIVE_INFINITY],
+      ["returns text", () => CANARY.fingerprint as unknown as number],
+    ])("fails safely when the monotonic clock %s after creation: an error that leaks nothing, and not one statement", async (label, broken) => {
+      let failed = false;
+      const execution = createSlackKnownRootExecution({ ambientDeadlineAt: null, monotonicNow: () => (failed ? broken() : NOW) });
+      failed = true;
+      const { session, statements, other } = recordingSession();
+      const error = await rejection(() => run(session, execution));
+      // An error of the packet's own making: never the clock's exception, and nothing it carried.
+      expect(error, `${label}: the primitive rejected`).toBeInstanceOf(Error);
+      expectNoCanary(error, label);
+      expect(statements, `${label}: no statement was issued`).toEqual([]);
+      expect(other).toEqual([]);
+      // Whatever it is, it is reportable only as a closed category.
+      expect(SLACK_KNOWN_ROOT_FAILURE_CATEGORIES as readonly string[]).toContain(classifySlackKnownRootPreparationFailure(error));
+    });
+  });
+
+  it.each<[string, () => number]>([
+    ["throws", () => { throw new Error(`clock device failed: ${CANARY.metadata}`); }],
+    ["returns NaN", () => Number.NaN],
+    ["returns Infinity", () => Number.POSITIVE_INFINITY],
+    ["returns text", () => CANARY.fingerprint as unknown as number],
+  ])("refuses to CREATE a context on a monotonic clock that %s, leaking nothing", (label, monotonicNow) => {
+    const error = thrown(() => createSlackKnownRootExecution({ ambientDeadlineAt: null, monotonicNow }));
+    expect(error, `${label}: creation threw`).toBeInstanceOf(Error);
+    expectNoCanary(error, label);
+  });
+
+  // CONTROL — passes against the stubs and must keep passing: a sound context that still has time
+  // is not what any case above refuses. Whatever a recording session then makes of the read, it is
+  // neither a caller-contract failure nor a deadline.
+  it.each(PRIMITIVES)("%s does not refuse a sound context that still has time (control)", async (_label, run) => {
+    const execution = createSlackKnownRootExecution({ ambientDeadlineAt: NOW + 60_000, monotonicNow: steady });
+    const { session } = recordingSession();
+    const error = await rejection(() => run(session, execution));
+    expect(error).not.toBeInstanceOf(SlackKnownRootValidationError);
+    expect(error).not.toBeInstanceOf(SlackKnownRootDeadlineError);
+  });
+});
+
 // ── §8.1: the pure failure classifier ────────────────────────────────────────
 
 describe("known-root failure classifier — closed categories, fixed precedence, nothing leaked", () => {
@@ -290,6 +437,10 @@ describe("known-root failure classifier — closed categories, fixed precedence,
     ["an unknown commit carrying a retryable SQLSTATE", () => outer({ unknownCommit: true, code: "40001" }), "commit_unknown"],
     ["an unknown commit carrying a lock-timeout SQLSTATE", () => outer({ unknownCommit: true, code: "55P03" }), "commit_unknown"],
     ["an unknown commit carrying a Node error code", () => outer({ unknownCommit: true, code: "ECONNRESET" }), "commit_unknown"],
+    // Rung 1 above rung 2: with BOTH markers on the final rejection, the commit is what is unknown.
+    ["an unknown commit that also carries the deadline marker", () => Object.assign(outer({ unknownCommit: true }), { slackKnownRootDeadlineExceeded: true }), "commit_unknown"],
+    ["the deadline error itself marked as an unknown commit", () => Object.assign(new SlackKnownRootDeadlineError(), { unknownCommit: true }), "commit_unknown"],
+    ["an unknown commit carrying the deadline marker and a statement-timeout SQLSTATE", () => Object.assign(outer({ unknownCommit: true, code: "57014" }), { slackKnownRootDeadlineExceeded: true }), "commit_unknown"],
     ["the slice's own deadline error", () => new SlackKnownRootDeadlineError(), "deadline_exceeded"],
     ["the deadline error even with a statement-timeout SQLSTATE attached", () => Object.assign(new SlackKnownRootDeadlineError(), { code: "57014" }), "deadline_exceeded"],
     ["SQLSTATE 55P03 from the driver", () => sqlError("55P03"), "lock_timeout"],
@@ -302,6 +453,13 @@ describe("known-root failure classifier — closed categories, fixed precedence,
     ["the outer transaction error with no SQLSTATE at all", () => outer(), "database_failure"],
     ["the outer transaction error whose code is a Node code, not a SQLSTATE", () => outer({ code: "ECONNRESET" }), "database_failure"],
     ["a Node error code on an ordinary error", () => Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }), "dependency_failure"],
+    // FIVE upper-case characters, exactly the length of a SQLSTATE — and not one. A classifier that
+    // tests only "five characters of [0-9A-Z]" reports a broken pipe as a database failure.
+    ["a five-character Node code (EPIPE) on an ordinary error", () => Object.assign(new Error("write EPIPE"), { code: "EPIPE" }), "dependency_failure"],
+    ["a five-character Node code (EPERM) on an ordinary error", () => Object.assign(new Error("operation not permitted"), { code: "EPERM" }), "dependency_failure"],
+    ["a five-character Node code (EBUSY) on an ordinary error", () => Object.assign(new Error("resource busy"), { code: "EBUSY" }), "dependency_failure"],
+    // …while the same code on the shared transaction error is that error type, by rung 7's second clause.
+    ["the outer transaction error whose code is EPIPE", () => outer({ code: "EPIPE" }), "database_failure"],
     ["an ordinary dependency exception", () => new Error(`dependency failed: ${CANARY.metadata}`), "dependency_failure"],
     ["a thrown string", () => CANARY.token, "dependency_failure"],
     ["a thrown null", () => null, "dependency_failure"],
