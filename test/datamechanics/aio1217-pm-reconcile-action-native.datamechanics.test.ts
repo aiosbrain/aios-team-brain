@@ -2671,6 +2671,1033 @@ describe("AIO-1217 F4-E3, prospective — app/t/[team]/admin/pm-sync/actions.ts#
   );
 });
 
+// ── F4-E3, prospective: the remaining ADM arms, both stale tier directions, the association row, team B ──
+
+/**
+ * CASES 11 TO 15 — ADDED LATER, PROSPECTIVELY, AND BY ADDITION ALONE. Nothing above this comment was
+ * changed for them — not the header, not cases 1 to 10, not `request`, its recorder, `admit`, `reach`
+ * or `refuse` — and nothing below it. They call the same actual export through the same `request`,
+ * `refuse` and `admit`, over the same `seedWorld`, with the same seams and no new one. The helpers
+ * defined here are setup, readbacks and assertions; none of them hands the action a verdict or an
+ * answer.
+ *
+ * What they supply: the arms of accepted v9 §5 F4-E3 that cases 1 to 10 leave open, natively.
+ *
+ *   11 — INVALID SESSION. Three non-empty cookies the real `verifySession` rejects — a string that is
+ *        not a token, Alice's own session with its signature altered, and a session the real
+ *        `signSession` signed for Alice's auth user under another secret — each at team A's slug.
+ *        Control: Alice's own valid session at the same slug, the first pass of case 1.
+ *   12 — NO ACTIVE MEMBER ROW, AND A ROLE THAT IS NOT ADMIN. A verified session whose auth user has no
+ *        member row in any team; a role-admin of team A holding its builtin Everyone row whose status
+ *        is `invited`; the same whose status is `disabled`; and an active role-`lead` of team A
+ *        holding that row. Control: Alice, the first pass of case 1, over the rows those four left.
+ *   13 — BOTH STALE DIRECTIONS OF THE LEGACY COLUMN. `members.tier = 'team'` holding only the builtin
+ *        External row is refused; `members.tier = 'external'` holding the builtin Everyone row is
+ *        admitted and makes the first pass of case 1 in full, audited under its own member row.
+ *   14 — THE ASSOCIATION ROW, REMOVED THEN RESTORED. Alice is admitted; the board moves; her builtin
+ *        Everyone row is deleted and a new invocation under the same session is refused, leaving the
+ *        moved link unrecorded; the row is restored and a further new invocation is admitted and
+ *        records it.
+ *   15 — AN ADMITTED PASS IN TEAM B. Each admin is refused at the other team's slug; then Bob, at team
+ *        B's own slug, over team B's own board, makes a pass that resolves, decrypts, reads and
+ *        rewrites team B's alone; then Alice's first pass of case 1 over rows Bob's left unrecorded.
+ *
+ * Earlier prose these cases are the later exception to, left as it was written: the header's `NO
+ * ADMITTED OTHER-TEAM INVOCATION` bound and `World.bob`'s `Never admitted by an invocation in this
+ * file` (case 15); Z's `ADMITTED TEAM-B INVOCATION` TODO (case 15); Z's `OTHER REFUSAL FAMILIES` TODO
+ * and case 10's `ONE ARM` bound, for the arms listed above and no other (cases 11 to 13); `admit`'s
+ * `under Alice's session` (case 13 hands it another cast of team A — see `admitAs`). The rest of each
+ * stands: an EXPIRED cookie, and a guard read that Postgres refuses, are still not exercised.
+ *
+ * SOURCE FACTS beyond the header's and cases 9 and 10's:
+ *   lib/auth/session.ts:12-14  the cookie is read by name and `verifySession` is called for any
+ *             non-empty value; its null is `getSessionUser`'s.
+ *   lib/auth/pg-session.ts
+ *     :19-25  the secret is read from AUTH_SECRET on every call.
+ *     :36-46  `verifySession`: `jwtVerify` under that secret, HS256 only; ANY throw is a null.
+ *   lib/auth/guard.ts:49-50  a null session user returns before the server client is asked for.
+ *   lib/integrations/read.ts
+ *     :74-80  the member read binds the slug's team, the session's auth user and `status = "active"`;
+ *             role is selected, not filtered.
+ *     :86     no such row returns null BEFORE posture is read.
+ *     :87-89  posture is read for a row that was found, and only then is role judged with it.
+ *   lib/access/posture.ts:34-43  `team` iff one of the member's group rows is a builtin group slugged
+ *             `everyone`; `members.tier` is not read.
+ *   lib/auth/admin-access.ts:16, lib/auth/visibility.ts:20-22  role `admin` AND a posture that is `team`.
+ *   postgres/schema.sql
+ *     :23     `member_role` is `admin`, `lead`, `member`.
+ *     :26     `member_status` is `invited`, `active`, `disabled`. THERE IS NO `suspended`: the two
+ *             states that are not `active` are both exercised, and that list is read back from the
+ *             catalog as a premise.
+ *     :228-234 `auth_user_id`, `role`, `tier` and `status` are independent columns of `members`.
+ *     :1053-1062 a `group_members` row is keyed by group and member.
+ *   test/datamechanics/helpers.ts:137-155, lib/access/groups.ts:109-146  `placeMemberByTier` ensures the
+ *             two builtin groups — inserting one only when absent, touching no membership — and
+ *             upserts ONE `group_members` row.
+ *   lib/pm-sync/linear-client.ts:43-47  the request the transport seam sees carries the decrypted key
+ *             in a header and `{ query, variables }` as its body: `carried` searches both, so the
+ *             other team's secret in a request of case 15 would be a transport violation.
+ *
+ * Bounds, in addition to the header's.
+ *   - THE REJECTED COOKIES ARE THREE. Not a token; a real token with another signature; a real token
+ *     under another secret. An expired token is not constructed (it needs a clock or a signer this
+ *     file does not hold), nor one that verifies and lacks a claim. Why the verifier rejected each is
+ *     not observed: that it did is read back from the real `verifySession`, and the action's trace
+ *     shows only the cookie read.
+ *   - THE LEGACY COLUMN IS OBSERVED, NOT JUDGED. Case 13 records what this action does today where
+ *     `members.tier` and the builtin row disagree. Neither direction is a policy pass, neither
+ *     corrects the disagreement, and neither declares the conflicting data compliant.
+ *   - FRESH INVOCATIONS, NOT REVOCATION. Case 14's three requests are sequential and each reads its
+ *     rows anew; nothing is claimed about a row removed while a request is in flight.
+ *   - TEAM B'S BOARD IS A VALUE IN THIS FILE TOO. Case 15 swaps which board the responder answers
+ *     from, in memory, between requests. That Bob's request carried nothing of team A's is a search
+ *     of what reached global `fetch`, of the statements issued and of the trace.
+ *   - "NO SERVICE CLIENT" IS A COUNT, as case 10 says of itself.
+ *   - TEST-ONLY AND PROSPECTIVE. Not a reference-runtime run and not F4-E4; nothing here establishes
+ *     what was inspected or admitted before the F4 edits; no mutant is run; no Next action wire,
+ *     browser or cache behavior and no provider service behavior is exercised; this is not the whole
+ *     of E3, and dependent PM-reconciliation acceptance is not claimed by it.
+ *   - With `AIO1217_E4_RECORD_DIR` set, each request of these cases appends its line as any other does.
+ *
+ * Run status. NOT RUN when written, as the header says of the rest of the file.
+ */
+
+/** Cases 11 to 15 make up to five requests each, with raw readbacks between them. */
+const ROOMIEST = 120_000;
+
+/** `members.role` and `members.status` as postgres/schema.sql:23 and :26 declare them. */
+type Rank = "admin" | "lead" | "member";
+type MemberState = "active" | "invited" | "disabled";
+
+/**
+ * What `authority` reads back for a cast: an active role-admin of their team holding its builtin
+ * Everyone row, the legacy column agreeing — but for whatever `held` says otherwise.
+ */
+const standingOf = (cast: Cast, held: Row = {}): Row => ({
+  team_id: cast.team.teamId,
+  auth_user_id: cast.user.id,
+  role: "admin",
+  status: "active",
+  tier: "team",
+  everyone_rows: 1,
+  external_rows: 0,
+  ...held,
+});
+
+/** `member_status` as the database holds it, in the order it was declared. */
+const memberStates = async (): Promise<string[]> =>
+  (
+    await fx<{ label: string }>(
+      "member_status readback",
+      `select e.enumlabel::text as label from pg_enum e join pg_type t on t.oid = e.enumtypid
+        where t.typname = 'member_status' order by e.enumsortorder`,
+    )
+  ).map((row) => row.label);
+
+/**
+ * A distinct member bound to a fresh auth user, and a real session signed for that auth user — as
+ * `seedCast` is, but with each column the gate reads, and the one it does not, placed on its own:
+ * `role` (admin unless said), `status` (active unless said), `legacyTier` (the `members.tier` column,
+ * `team` unless said) and `builtin` (the ONE builtin row held, Everyone unless said). The legacy
+ * column need not agree with the row. Read back from the pool here; nothing about the guard is stubbed.
+ */
+async function seedPlaced(
+  team: Seed,
+  label: string,
+  placed: { role?: Rank; status?: MemberState; legacyTier?: Tier; builtin?: Tier } = {},
+): Promise<Cast> {
+  const role = placed.role ?? "admin";
+  const status = placed.status ?? "active";
+  const legacyTier = placed.legacyTier ?? "team";
+  const builtin = placed.builtin ?? "team";
+  const user = { id: randomUUID(), email: `${label}-${randomUUID().slice(0, 8)}@aio1217.fixture.test` };
+  await fxOne("auth user insert", `insert into auth_users(id, email) values($1, $2) returning id`, [user.id, user.email]);
+  const { id } = await fxOne<{ id: string }>(
+    "member insert",
+    `insert into members(team_id, email, display_name, actor_handle, role, tier, status, auth_user_id)
+     values($1, $2, $3, $4, $5, $6, $7, $8) returning id`,
+    [
+      team.teamId,
+      user.email,
+      `AIO1217 ${label}`,
+      `${label}-${randomUUID().slice(0, 8)}`,
+      role,
+      legacyTier,
+      status,
+      user.id,
+    ],
+  );
+  await placeMemberByTier(team.teamId, id, builtin);
+  const session = await signSession(user);
+  premise(`${label}'s session verifies under the real verifier`, await verifySession(session), user);
+  const cast: Cast = { label, team, memberId: id, user, session };
+  premise(
+    `${label}'s authority`,
+    await authority(id),
+    standingOf(cast, {
+      role,
+      status,
+      tier: legacyTier,
+      everyone_rows: builtin === "team" ? 1 : 0,
+      external_rows: builtin === "external" ? 1 : 0,
+    }),
+  );
+  return cast;
+}
+
+/**
+ * A real auth user NO member row is bound to — in any team, in any status, by id or by email — and a
+ * real session signed for it. Read back from the pool: one `auth_users` row and no `members` row.
+ */
+async function seedMemberless(label: string): Promise<{ label: string; user: SessionUser; session: string }> {
+  const user = { id: randomUUID(), email: `${label}-${randomUUID().slice(0, 8)}@aio1217.fixture.test` };
+  await fxOne("auth user insert", `insert into auth_users(id, email) values($1, $2) returning id`, [user.id, user.email]);
+  premise(
+    `${label} is an auth user no member row is bound to`,
+    [
+      await countOf("auth user readback", `select count(*)::int as n from auth_users where id = $1`, [user.id]),
+      await countOf("bound member readback", `select count(*)::int as n from members where auth_user_id = $1`, [
+        user.id,
+      ]),
+      await countOf("same-email member readback", `select count(*)::int as n from members where email = $1`, [
+        user.email,
+      ]),
+    ],
+    [1, 0, 0],
+  );
+  const session = await signSession(user);
+  premise(`${label}'s session verifies under the real verifier`, await verifySession(session), user);
+  return { label, user, session };
+}
+
+const MEMBERS_WHERE = `select count(*)::int as n from members where`;
+
+/**
+ * The gate's member read as raw SQL (lib/integrations/read.ts:74-80): how many rows it is answered
+ * with for a session user at a team as written, and without its status, its team and its user
+ * equality in turn — so which equality a refusal rests on is a readback.
+ */
+async function memberLookup(team: Seed, user: SessionUser): Promise<Row> {
+  return {
+    asWritten: await countOf(
+      "member read as written",
+      `${MEMBERS_WHERE} team_id = $1 and auth_user_id = $2 and status = 'active'`,
+      [team.teamId, user.id],
+    ),
+    withoutStatus: await countOf("status-less member read", `${MEMBERS_WHERE} team_id = $1 and auth_user_id = $2`, [
+      team.teamId,
+      user.id,
+    ]),
+    withoutTeam: await countOf("team-less member read", `${MEMBERS_WHERE} auth_user_id = $1 and status = 'active'`, [
+      user.id,
+    ]),
+    withoutUser: await countOf("user-less member read", `${MEMBERS_WHERE} team_id = $1 and status = 'active'`, [
+      team.teamId,
+    ]),
+  };
+}
+
+/**
+ * Three NON-EMPTY cookies the real `verifySession` rejects, each beside the real session it is not:
+ * a string that is not a token; `who`'s own session with the first character of its signature
+ * changed; and a session the real `signSession` signed for `who`'s auth user while AUTH_SECRET was
+ * another secret (lib/auth/pg-session.ts:19-25 reads it per call), this test's being put back before
+ * anything else runs. Read back: this test's secret is in force, the real session still verifies,
+ * the session signed elsewhere verified under the secret it was signed with, and the real verifier
+ * answers null for each of the three.
+ */
+async function rejectedCookies(who: Cast): Promise<Array<{ label: string; cookie: string }>> {
+  const segments = who.session.split(".");
+  premise(`${who.label}'s real session is three dot-separated segments`, segments.length, 3);
+  const [head, payload, signature] = segments;
+  // The first character carries six of the signature's bits: another character there is another signature.
+  const altered = `${head}.${payload}.${signature.startsWith("A") ? "B" : "A"}${signature.slice(1)}`;
+
+  let elsewhere = "";
+  let underItsOwnSecret: unknown = null;
+  vi.stubEnv("AUTH_SECRET", randomBytes(32).toString("hex"));
+  try {
+    elsewhere = await signSession(who.user);
+    underItsOwnSecret = await verifySession(elsewhere);
+  } finally {
+    vi.stubEnv("AUTH_SECRET", authSecret);
+  }
+  premise(
+    "this test's AUTH_SECRET is in force again, the real session still verifies under it, and the session signed elsewhere verified under the secret it was signed with",
+    [process.env.AUTH_SECRET === authSecret, await verifySession(who.session), underItsOwnSecret],
+    [true, who.user, who.user],
+  );
+
+  const cookies = [
+    { label: "a non-empty cookie that is not a token", cookie: "aio1217-not-a-session-token" },
+    { label: `${who.label}'s own session with its signature altered`, cookie: altered },
+    { label: `a session signed for ${who.label}'s auth user under another secret`, cookie: elsewhere },
+  ];
+  for (const { label, cookie } of cookies) {
+    premise(
+      `${label}: non-empty, not the real session, and rejected by the real verifier`,
+      [cookie.length > 0, cookie === who.session, await verifySession(cookie)],
+      [true, false, null],
+    );
+  }
+  return cookies;
+}
+
+/**
+ * FIXTURE READBACK, from stored rows and the responder's own state: every feature input an admitted
+ * pass of team A needs is live — both teams name `linear`, each holds its one enabled
+ * ciphertext-bearing `linear` integration, team A holds three links a pass would read and team B
+ * one, and the responder answers from this world's board. So a refusal is of a pass that would run.
+ */
+async function featureArmed(world: World, label: string): Promise<void> {
+  const eligible = (team: Seed): Promise<number> =>
+    countOf(
+      "scoped link read",
+      `select count(*)::int as n from task_pm_links
+        where team_id = $1 and provider = $2 and provider_resource_id is not null`,
+      [team.teamId, PROVIDER],
+    );
+  premise(
+    `${label}: both teams name \`linear\` and hold an enabled integration with a ciphertext, team A holds three eligible links and team B one, and the responder answers from this world's board`,
+    {
+      primaries: [await primaryOf(world.a.team), await primaryOf(world.b.team)],
+      integrations: await integrationsHeld(),
+      eligible: [await eligible(world.a.team), await eligible(world.b.team)],
+      answering: synthetic === world.provider,
+    },
+    { primaries: [PROVIDER, PROVIDER], integrations: integrationsOf(world), eligible: [3, 1], answering: true },
+  );
+}
+
+/** A cast's own two identifiers, by the labels `identifiersOf` gives the seeded admins'. */
+const namesOf = (cast: Cast): Record<string, string> => ({
+  [`${cast.label}'s member row`]: cast.memberId,
+  [`${cast.label}'s auth user`]: cast.user.id,
+});
+
+/**
+ * `refuse`, and what it does not itself hold: that the zeros are of rows that existed (read from the
+ * request's own `before` snapshot); exactly which identifiers — of either team, or of `caller` — the
+ * request's statements bound, by label; that no secret surfaced, nothing was decrypted, nothing was
+ * asked of the provider, no link was rewritten and nothing was handed down; and that every row of
+ * the ten tables of both teams is equal in every column, timestamps included.
+ */
+async function refuseWhole(
+  world: World,
+  label: string,
+  refusal: Refusal,
+  caller: Record<string, string>,
+  bound: string[],
+): Promise<Seen> {
+  const seen = await refuse(label, refusal);
+  premise(
+    `${label}: before the request team A held its team row, its project, four tasks, four links and its enabled integration, and team B its own one of each`,
+    [holdings(seen.before, world.a.team), holdings(seen.before, world.b.team)],
+    [
+      [1, 1, 4, 4, 1],
+      [1, 1, 1, 1, 1],
+    ],
+  );
+  expect(
+    {
+      identifiers: boundOf(seen, {
+        ...identifiersOf("A", world.a, world.alice),
+        ...identifiersOf("B", world.b, world.bob),
+        ...caller,
+      }),
+      surfaced: surfaced(seen, world),
+      decrypted: decryptedBy(seen),
+      reads: readsOf(seen),
+      rewrites: rewrites(seen),
+      answeredKeys: answeredKeys(seen),
+    },
+    `${label}: what the refused request bound, decrypted, asked of the provider and handed down`,
+  ).toEqual({
+    identifiers: [...bound].sort(),
+    surfaced: [],
+    decrypted: [],
+    reads: [],
+    rewrites: [],
+    answeredKeys: [],
+  });
+  expect(seen.after, `${label}: every row of the ten tables, both teams, every column`).toEqual(seen.before);
+  return seen;
+}
+
+/**
+ * The gate's whole trace for a verified session whose auth user is bound to no member row
+ * (lib/auth/guard.ts:49-52, lib/integrations/read.ts:72-86): the session cookie, the server client,
+ * the slug's team, and the member read — answered with no row. No group read follows.
+ */
+const memberlessChain = (user: SessionUser, team: Seed): Step[] => [
+  SESSION_READ,
+  SERVER_CLIENT,
+  statement("server", "teams", { slug: team.teamSlug }, 1),
+  statement("server", "members", { team_id: team.teamId, auth_user_id: user.id, status: "active" }, 0),
+];
+
+/**
+ * `admit`, for another cast of team A. `admit` reads its caller from `world.alice` — the session, the
+ * guard's reads, the audit row's member — and nothing else from it, so the world it is handed here is
+ * this world with `who` standing there; team A, team B, the board and the secrets are the same objects.
+ */
+function admitAs(world: World, who: Cast, label: string, pass: Pass): Promise<Seen> {
+  premise(`${who.label} is a cast of team A`, who.team.teamId, world.a.team.teamId);
+  return admit({ ...world, alice: who }, label, pass);
+}
+
+/**
+ * A member's builtin Everyone row as a snapshot holds it: their ONE group row, in a builtin group of
+ * their own team slugged `everyone`.
+ */
+function everyoneRow(snapshot: Durable, cast: Cast): Row {
+  const rows = snapshot.group_members.filter((row) => row.member_id === cast.memberId);
+  if (rows.length !== 1) throw new Error(`${FIXTURE} ${cast.label} holds ${rows.length} group rows, not one`);
+  const group = snapshot.groups.find((held) => held.id === rows[0].group_id);
+  premise(
+    `${cast.label}'s one group row is their own team's builtin Everyone row`,
+    [group?.team_id, group?.slug, group?.is_builtin],
+    [cast.team.teamId, "everyone", true],
+  );
+  return rows[0];
+}
+
+/**
+ * SETUP WRITE, raw SQL: exactly one row is deleted — the member's row in their team's builtin
+ * Everyone group. Their member row, their other group rows and the group itself are not named.
+ */
+async function removeEveryone(cast: Cast): Promise<void> {
+  await fxOne(
+    "everyone row removal",
+    `delete from group_members gm using groups g
+      where g.team_id = gm.team_id and g.id = gm.group_id and g.slug = 'everyone' and g.is_builtin
+        and gm.team_id = $1 and gm.member_id = $2
+      returning gm.member_id`,
+    [cast.team.teamId, cast.memberId],
+  );
+}
+
+/**
+ * Team B's synthetic board: the mirror of the one `seedWorld` arms. The responder would answer the
+ * three state reads for team B's invented Linear team and refuse anything carrying team A's secret
+ * or Linear team id. It lists team B's one resource as `Done` and, deliberately, two of team A's: a
+ * link read that lost its team equality would record them.
+ */
+const reverseBoard = (world: World): Provider => ({
+  linearTeam: world.b.linearTeam,
+  issues: [
+    { id: resourceOf(world.foreign), state: stateNamed("Done") },
+    { id: resourceOf(world.diverged), state: stateNamed("Done") },
+    { id: resourceOf(world.inSync), state: stateNamed("In Progress") },
+  ],
+  forbidden: { [A_SECRET]: world.markers[A_SECRET], "team A's Linear team id": world.a.linearTeam },
+});
+
+/** SETUP, in this file's memory and nowhere else: the board the responder answers from. */
+function answerFrom(board: Provider): void {
+  synthetic = board;
+}
+
+/** `behindBoard`, of any board: the row keys of the links of ANY team it lists under a state name that is not their stored seen status. */
+async function behind(board: Provider): Promise<string[]> {
+  const listed = new Map(board.issues.map((issue) => [issue.id, issue.state.name]));
+  const rows = await fx<{ row_key: string; provider_resource_id: string; provider_seen_status: string | null }>(
+    "listed links readback",
+    `select row_key, provider_resource_id, provider_seen_status from task_pm_links
+      where provider_resource_id is not null order by row_key`,
+  );
+  return rows
+    .filter((row) => listed.has(row.provider_resource_id))
+    .filter((row) => listed.get(row.provider_resource_id) !== row.provider_seen_status)
+    .map((row) => row.row_key);
+}
+
+/** The labels of the given identifiers found in what a request returned, traced or asked revalidated, sorted. */
+function carriedBy(seen: Seen, identifiers: Record<string, string>): string[] {
+  const said = searchable("", [seen.outcome, seen.trace, seen.revalidated]);
+  return Object.entries(identifiers)
+    .filter(([, value]) => said.includes(value))
+    .map(([label]) => label)
+    .sort();
+}
+
+/**
+ * A new invocation under BOB's session for team B, over team B's board — `admit` with the two teams
+ * exchanged, written out because `admit` names team A's secret and team A's three links: admitted by
+ * the guard's real reads; the service client; the real owner handed the server-resolved team B and
+ * no options; beneath it the integrations read bound to team B and `enabled`, answered with ONE row,
+ * ONE decrypt yielding team B's synthetic secret, team B's primary, and the link read bound to team
+ * B and `linear`, answered with ONE row; three provider reads naming team B's configured Linear
+ * team; one update, by team B's link's id; the owner's return; then one stored audit row under
+ * Bob's member row and team B, and one revalidation of team B's path; and the `ok: true` return
+ * carrying team B's one divergence. No identifier of team A in any statement, in the return, in the
+ * trace or in the revalidation; no secret anywhere; every row team A holds as it was.
+ */
+async function admitBob(world: World, board: Provider, label: string): Promise<Seen> {
+  const who = world.bob;
+  const team = world.b.team;
+  const ofTeamA = identifiersOf("A", world.a, world.alice);
+  premise(`${label}: the responder answers from team B's board`, [synthetic === board, board.linearTeam], [
+    true,
+    world.b.linearTeam,
+  ]);
+  const guard = guardChain(who, await groupRows(who));
+  const path = `/t/${team.teamSlug}/admin/pm-sync`;
+  const divergence = {
+    row_key: world.foreign.rowKey,
+    provider: PROVIDER,
+    last_projected_status: "Backlog",
+    provider_seen_status: "Done",
+  };
+  const settled = { provider: PROVIDER, seenUpdated: 1, divergences: [divergence] };
+
+  const seen = await request(who.session, () => reconcileDivergenceAction(team.teamSlug));
+
+  const bystander = heldBy(seen.before, world.a.team);
+  premise(
+    `${label}: team A held its team row, its project, four tasks, four links and its enabled integration before the request`,
+    holdings(seen.before, world.a.team),
+    [1, 1, 4, 4, 1],
+  );
+
+  expect(
+    {
+      ...observed(seen),
+      guard: seen.trace.slice(0, guard.length),
+      ledger: ledger(seen, guard.length),
+      answeredKeys: answeredKeys(seen),
+      rewrites: rewrites(seen),
+      foreign: boundOf(seen, ofTeamA),
+      carried: carriedBy(seen, ofTeamA),
+      surfaced: surfaced(seen, world),
+      bystander: heldBy(seen.after, world.a.team),
+    },
+    label,
+  ).toEqual({
+    outcome: { returned: { ok: true, ...settled } },
+    shape: RECONCILED_KEYS,
+    answeredKeys: [RESOLVED_KEYS],
+    acquired: { server: 1, admin: 1 },
+    // One decrypt although two ciphertexts are stored; three reads; no `headers`.
+    seams: { reconcileProviderState: 1, decryptSecret: 1, fetch: READS.length, revalidatePath: 1 },
+    revalidated: [[path]],
+    // Team B's one link and the audit row: no key of any other table, and no row of team A's.
+    changed: {
+      task_pm_links: {
+        added: [{ ...heldLink(seen, world.foreign), provider_seen_status: "Done", updated_at: expect.any(String) }],
+        removed: [heldLink(seen, world.foreign)],
+      },
+      audit_log: {
+        added: [auditRow(who, { provider: PROVIDER, seenUpdated: 1, divergences: 1 })],
+        removed: [],
+      },
+    },
+    guard,
+    ledger: [
+      SERVICE_CLIENT,
+      {
+        step: "lower",
+        owner: OWNER,
+        client: REQUEST_SERVICE_CLIENT,
+        args: { teamId: team.teamId, opts: null },
+        answered: settled,
+      },
+      // By team B and `enabled`, answered with team B's own row only.
+      statement("admin", "integrations", { team_id: team.teamId, status: "enabled" }, 1),
+      { step: "decrypt", yielded: B_SECRET },
+      statement("admin", "teams", { id: team.teamId }, 1),
+      // Team B's one link holding a resource id; never team A's three, though the board lists two of them.
+      statement("admin", "task_pm_links", { team_id: team.teamId, provider: PROVIDER }, 1),
+      ...stateReads(board),
+      wrote("update", "task_pm_links"),
+      { step: "returned", owner: OWNER },
+      wrote("insert", "audit_log"),
+      { step: "revalidate", path },
+    ],
+    rewrites: [{ id: world.foreign.linkId, rows: 1 }],
+    foreign: [],
+    carried: [],
+    surfaced: [],
+    bystander,
+  });
+  return seen;
+}
+
+describe("AIO-1217 F4-E3, prospective — app/t/[team]/admin/pm-sync/actions.ts#reconcileDivergenceAction over real Postgres, the real session verifier, real guard, real resolver, real posture and real reconcileProviderState: the remaining ADM arms, both stale directions of the legacy `members.tier` column, removal and restoration of the builtin Everyone row, and an admitted pass in team B (direct calls; the same seams; every refusal beside an admitted pass that reaches the provider reads)", () => {
+  it(
+    "11 — invalid session, by the real verifier and no mocked guard: over the seeded world of case 1, untouched, with team A's slug and every conjunct but the session holding for Alice (read back), three NON-EMPTY cookies the real `verifySession` answers null for — a string that is not a token; Alice's own session with its signature altered; a session the real `signSession` signed for Alice's auth user under another secret — are each sent in a new invocation: the session cookie read is the WHOLE trace, the server client is never acquired and no statement is issued; the action returns exactly `{ ok: false, error: \"admins only\" }` — two keys — with no service client, neither the real owner nor `decryptSecret` reached, nothing sent to the provider, no audit row, no revalidation, no run, no tripwire, no secret anywhere and every row of the ten tables of both teams equal in every column; then, as the control, Alice's own valid session at the same slug is admitted and makes the first pass of case 1 in full over links the refused requests left unrecorded; and the other-secret cookie again issues the identical trace and changes nothing, the only reconcile audit row being the control's (a missing cookie is case 3's; an expired one is not constructed)",
+    async () => {
+      const world = await seedWorld();
+      const { a, alice } = world;
+      const slug = a.team.teamSlug;
+
+      // Every conjunct the gate reads AFTER the session holds for the caller these cookies name.
+      await featureArmed(world, "before the rejected cookies");
+      premise(
+        "Alice is an active role-admin of team A holding its builtin Everyone row",
+        await authority(alice.memberId),
+        standingOf(alice),
+      );
+      premise("the slug names team A", await countOf("team A slug read", TEAMS_BY_SLUG, [slug]), 1);
+
+      const cookies = await rejectedCookies(alice);
+      premise("three rejected cookies", cookies.length, 3);
+
+      const refusals: Seen[] = [];
+      for (const { label, cookie } of cookies) {
+        refusals.push(
+          await refuseWhole(
+            world,
+            label,
+            // lib/auth/guard.ts:50 returns on a null session user before it asks for the server client.
+            { session: cookie, slug, guard: [SESSION_READ], server: 0 },
+            {},
+            [],
+          ),
+        );
+      }
+      expect(
+        refusals.map((refused) => refused.bound),
+        "no statement was issued by any of the three",
+      ).toEqual([[], [], []]);
+
+      // Read back raw: a pass that ran would have recorded two seen statuses and stored an audit row.
+      expect(await linksHeld()).toEqual(linksAfter(world, {}));
+      expect(await tasksHeld()).toEqual(tasksOf(world));
+      expect(await reconcileAudits()).toEqual([]);
+      expect(await integrationsHeld()).toEqual(integrationsOf(world));
+
+      // The same caller and the same slug, the cookie alone different: admitted, and the pass is made.
+      const control = await admit(world, `${CONTROL} Alice's own valid session at the same slug`, firstPass(world));
+      premise("the control began from the rows the last refused request left", control.before, refusals[2].after);
+
+      const again = await refuseWhole(
+        world,
+        `${cookies[2].label}, again after the control`,
+        { session: cookies[2].cookie, slug, guard: [SESSION_READ], server: 0 },
+        {},
+        [],
+      );
+      premise("the repeat began from the rows the control left", again.before, control.after);
+      expect(again.trace, "the repeat issued exactly what the first refusal of that cookie did").toEqual(
+        refusals[2].trace,
+      );
+
+      expect(await authority(alice.memberId), "Alice's rows are as they were").toEqual(standingOf(alice));
+      expect(await linksHeld()).toEqual(
+        linksAfter(world, { [world.diverged.rowKey]: "Done", [world.inSync.rowKey]: "In Progress" }),
+      );
+      expect(await tasksHeld()).toEqual(tasksOf(world));
+      expect(await reconcileAudits()).toEqual(
+        auditsOf(world, [{ provider: PROVIDER, seenUpdated: 2, divergences: 1 }]),
+      );
+      expect(await integrationsHeld()).toEqual(integrationsOf(world));
+    },
+    ROOMIEST,
+  );
+
+  it(
+    "12 — no active member row, and a role that is not admin, by real row state and no mocked guard: over the seeded world of case 1, at team A's valid slug, four callers under sessions the real verifier accepts, each a new invocation returning exactly `{ ok: false, error: \"admins only\" }` with no service client, no lower owner, no decrypt, no provider request, no audit row, no revalidation, no run and every row of the ten tables of both teams equal in every column — (a) an auth user with an `auth_users` row and NO member row in either team: the team read, then the active-member read answered with ZERO rows, and no group read; (b) a role-admin of team A holding its builtin Everyone row whose status is `invited`, and (c) the same whose status is `disabled` — the two states `member_status` has beside `active` (read back from the catalog; there is no `suspended`): each stops at that same member read, answered with zero rows where the read without its status equality is answered with one, before posture, their member row never bound; (d) an active role-`lead` of team A holding its builtin Everyone row: the whole guard chain through the posture read, answered with one row, and then refused on role; then, as the control, Alice — active, role-admin, the same row — makes the first pass of case 1 in full over links the four left unrecorded, and no status was changed by any request",
+    async () => {
+      const world = await seedWorld();
+      const { a, alice } = world;
+      const team = a.team;
+      const slug = team.teamSlug;
+
+      premise(
+        "`member_status` holds exactly the states postgres/schema.sql:26 declares: the two that are not `active` are `invited` and `disabled`",
+        await memberStates(),
+        ["invited", "active", "disabled"],
+      );
+      const lead = await seedPlaced(team, "lead", { role: "lead" });
+      const invited = await seedPlaced(team, "invited", { status: "invited" });
+      const disabled = await seedPlaced(team, "disabled", { status: "disabled" });
+      const drifter = await seedMemberless("memberless");
+
+      await featureArmed(world, "before the four refusals");
+      premise(
+        "Alice is an active role-admin of team A holding its builtin Everyone row",
+        await authority(alice.memberId),
+        standingOf(alice),
+      );
+      const stored = async (): Promise<Row[]> => [
+        await authority(lead.memberId),
+        await authority(invited.memberId),
+        await authority(disabled.memberId),
+      ];
+      const asSeeded = [
+        standingOf(lead, { role: "lead" }),
+        standingOf(invited, { status: "invited" }),
+        standingOf(disabled, { status: "disabled" }),
+      ];
+      premise("each differs from Alice in ONE column: role, status and status", await stored(), asSeeded);
+      premise(
+        "what the gate's member read is answered with for each caller at team A — as written, and without its status, its team and its user equality",
+        {
+          memberless: await memberLookup(team, drifter.user),
+          invited: await memberLookup(team, invited.user),
+          disabled: await memberLookup(team, disabled.user),
+          lead: await memberLookup(team, lead.user),
+          alice: await memberLookup(team, alice.user),
+        },
+        // Team A's active rows are its seeded member, Alice and the lead.
+        {
+          memberless: { asWritten: 0, withoutStatus: 0, withoutTeam: 0, withoutUser: 3 },
+          invited: { asWritten: 0, withoutStatus: 1, withoutTeam: 0, withoutUser: 3 },
+          disabled: { asWritten: 0, withoutStatus: 1, withoutTeam: 0, withoutUser: 3 },
+          lead: { asWritten: 1, withoutStatus: 1, withoutTeam: 1, withoutUser: 3 },
+          alice: { asWritten: 1, withoutStatus: 1, withoutTeam: 1, withoutUser: 3 },
+        },
+      );
+      premise(
+        "the posture read would be answered with one row for each of the three members",
+        [await groupRows(lead), await groupRows(invited), await groupRows(disabled)],
+        [1, 1, 1],
+      );
+
+      await refuseWhole(
+        world,
+        "a verified session whose auth user has no member row in any team",
+        { session: drifter.session, slug, guard: memberlessChain(drifter.user, team), server: 1 },
+        { [`${drifter.label}'s auth user`]: drifter.user.id },
+        ["team A id", "team A slug", `${drifter.label}'s auth user`],
+      );
+      for (const inactive of [invited, disabled]) {
+        await refuseWhole(
+          world,
+          `a role-admin of team A holding the builtin Everyone row whose status is \`${inactive.label}\``,
+          // lib/integrations/read.ts:79 and :86: no ACTIVE row, so null before posture is read.
+          { session: inactive.session, slug, guard: strangerChain(inactive, team), server: 1 },
+          namesOf(inactive),
+          // Never their member row: the read that would have found it was answered with nothing.
+          ["team A id", "team A slug", `${inactive.label}'s auth user`],
+        );
+      }
+      const last = await refuseWhole(
+        world,
+        "an active role-lead of team A holding the builtin Everyone row",
+        // lib/integrations/read.ts:74-89: the member row is found, posture is read, then role refuses.
+        { session: lead.session, slug, guard: guardChain(lead, 1), server: 1 },
+        namesOf(lead),
+        ["team A id", "team A slug", `${lead.label}'s auth user`, `${lead.label}'s member row`],
+      );
+
+      // Read back raw: nobody was activated or promoted, and a pass that ran would have left rows.
+      expect(await stored(), "no request changed a role, a status, a legacy tier or a builtin row").toEqual(asSeeded);
+      expect(await linksHeld()).toEqual(linksAfter(world, {}));
+      expect(await tasksHeld()).toEqual(tasksOf(world));
+      expect(await reconcileAudits()).toEqual([]);
+
+      // Active, role-admin, the same builtin row, the same slug: admitted, and the pass is made.
+      const control = await admit(world, `${CONTROL} Alice on team A`, firstPass(world));
+      premise("the control began from the rows the last refused request left", control.before, last.after);
+
+      expect(await stored()).toEqual(asSeeded);
+      expect(await linksHeld()).toEqual(
+        linksAfter(world, { [world.diverged.rowKey]: "Done", [world.inSync.rowKey]: "In Progress" }),
+      );
+      expect(await tasksHeld()).toEqual(tasksOf(world));
+      expect(await reconcileAudits()).toEqual(
+        auditsOf(world, [{ provider: PROVIDER, seenUpdated: 2, divergences: 1 }]),
+      );
+      expect(await integrationsHeld()).toEqual(integrationsOf(world));
+    },
+    ROOMIEST,
+  );
+
+  it(
+    "13 — both stale directions of the legacy `members.tier` column, on this native action (OBSERVED, NOT JUDGED: the gate reads the builtin row and never the column; neither direction is a policy pass, corrects the disagreement or declares the conflicting data compliant): over the seeded world of case 1, two active role-admins of team A, read back — one whose `members.tier` is `team` and who holds only the builtin External row, one whose `members.tier` is `external` and who holds the builtin Everyone row; the first, at team A's slug, runs the whole guard chain through the posture read (one row, not Everyone's) and is returned exactly `{ ok: false, error: \"admins only\" }` with no service client, no lower owner, no decrypt, no provider request, no audit row, no revalidation and every row of both teams equal in every column; the second, at the same slug, is ADMITTED and makes the first pass of case 1 in full — team A's integration alone resolved and decrypted, team A's three links read, the three provider reads, two seen statuses recorded, the audit row under ITS OWN member row, the revalidation and the `ok: true` return, nothing of team B's bound and team B's rows unchanged; and the first again, after that pass, issues the identical trace and changes nothing — role, status, legacy tier and builtin rows of both as they were throughout",
+    async () => {
+      const world = await seedWorld();
+      const { a } = world;
+      const slug = a.team.teamSlug;
+      const columnOnly = await seedPlaced(a.team, "tier-team-no-everyone", { legacyTier: "team", builtin: "external" });
+      const rowOnly = await seedPlaced(a.team, "tier-external-with-everyone", {
+        legacyTier: "external",
+        builtin: "team",
+      });
+
+      await featureArmed(world, "before the two stale-tier callers");
+      const stored = async (): Promise<Row[]> => [
+        await authority(columnOnly.memberId),
+        await authority(rowOnly.memberId),
+      ];
+      const asSeeded = [
+        standingOf(columnOnly, { tier: "team", everyone_rows: 0, external_rows: 1 }),
+        standingOf(rowOnly, { tier: "external", everyone_rows: 1, external_rows: 0 }),
+      ];
+      premise(
+        "both are active role-admins of team A; the column says `team` where only the External row is held, and `external` where the Everyone row is",
+        await stored(),
+        asSeeded,
+      );
+      premise(
+        "each holds one group row: what the posture read is answered with",
+        [await groupRows(columnOnly), await groupRows(rowOnly)],
+        [1, 1],
+      );
+
+      const refusal: Refusal = { session: columnOnly.session, slug, guard: guardChain(columnOnly, 1), server: 1 };
+      const bound = [
+        "team A id",
+        "team A slug",
+        `${columnOnly.label}'s auth user`,
+        `${columnOnly.label}'s member row`,
+      ];
+      const refused = await refuseWhole(
+        world,
+        "an active role-admin whose legacy tier says `team`, holding only the builtin External row",
+        refusal,
+        namesOf(columnOnly),
+        bound,
+      );
+      expect(await linksHeld()).toEqual(linksAfter(world, {}));
+      expect(await reconcileAudits()).toEqual([]);
+
+      // A gate that read the column would have admitted the first and refused this one.
+      const admitted = await admitAs(
+        world,
+        rowOnly,
+        "an active role-admin whose legacy tier says `external`, holding the builtin Everyone row",
+        firstPass(world),
+      );
+      premise("the admitted pass began from the rows the refused request left", admitted.before, refused.after);
+      expect(readsOf(admitted), "the admitted pass reached the three provider reads").toEqual(
+        stateReads(world.provider),
+      );
+
+      const again = await refuseWhole(
+        world,
+        "the legacy-`team` admin without the Everyone row again, after the admitted pass",
+        refusal,
+        namesOf(columnOnly),
+        bound,
+      );
+      premise("the repeat began from the rows the admitted pass left", again.before, admitted.after);
+      expect(again.trace, "the repeat issued exactly what the first refusal did").toEqual(refused.trace);
+
+      expect(await stored(), "no request changed a role, a status, a legacy tier or a builtin row").toEqual(asSeeded);
+      expect(await linksHeld()).toEqual(
+        linksAfter(world, { [world.diverged.rowKey]: "Done", [world.inSync.rowKey]: "In Progress" }),
+      );
+      expect(await tasksHeld()).toEqual(tasksOf(world));
+      // The one audit row is the admitted stale-`external` admin's own, not Alice's.
+      expect(await reconcileAudits()).toEqual([
+        {
+          team_id: a.team.teamId,
+          member_id: rowOnly.memberId,
+          action: AUDIT_ACTION,
+          meta: { provider: PROVIDER, seenUpdated: 2, divergences: 1 },
+        },
+      ]);
+      expect(await integrationsHeld()).toEqual(integrationsOf(world));
+    },
+    ROOMIEST,
+  );
+
+  it(
+    "14 — the builtin Everyone row removed, then restored, each step a NEW invocation under the SAME session with role admin, status active and legacy tier `team` read back before each: Alice is admitted and makes the first pass of case 1; the fixture then moves the board (team A's diverged resource `Done` → `In Progress`, as case 9 does) so the next admitted pass owes one link update; her builtin Everyone row — that one `group_members` row and nothing else — is deleted by raw SQL and read back, and a new invocation runs the whole guard chain, its posture read now answered with ZERO rows, and returns exactly `{ ok: false, error: \"admins only\" }` with no service client, no lower owner, no decrypt, no provider request, no audit row, no revalidation and every row of both teams equal in every column — the moved link still recorded `Done`; the row is restored through `placeMemberByTier` and read back, and a further new invocation is admitted, is served the same three provider reads, issues ONE link update by the moved link's id and adds the second audit row and revalidation — so the two admitted passes' audit rows and link bookkeeping are theirs, and the denied invocation between them left nothing",
+    async () => {
+      const world = await seedWorld();
+      const { a, alice } = world;
+      const slug = a.team.teamSlug;
+      const healthy = standingOf(alice);
+      const afterFirst = { [world.diverged.rowKey]: "Done", [world.inSync.rowKey]: "In Progress" };
+      const afterMove = { [world.diverged.rowKey]: MOVED_TO, [world.inSync.rowKey]: "In Progress" };
+
+      await featureArmed(world, "before the first invocation");
+      premise("Alice holds the builtin Everyone row before the first invocation", await authority(alice.memberId), healthy);
+      const first = await admit(world, `${CONTROL} Alice holding the builtin Everyone row`, firstPass(world));
+      premise("the first pass recorded `Done` and `In Progress`", await linksHeld(), linksAfter(world, afterFirst));
+      const association = everyoneRow(first.after, alice);
+
+      // SETUP: a pass that ran now would rewrite team A's moved link — and team B's, without its team equality.
+      const board = moveBoard(world, [
+        { link: world.diverged, state: MOVED_TO },
+        { link: world.inSync, state: "In Progress" },
+        { link: world.foreign, state: "Done" },
+      ]);
+      premise(
+        "the links behind the moved board are team A's moved one and team B's bystander",
+        await behindBoard(world),
+        [world.diverged.rowKey, world.foreign.rowKey],
+      );
+
+      await removeEveryone(alice);
+      premise(
+        "with the row removed Alice is still an active role-admin of team A whose legacy tier says `team`, and holds no group row",
+        [await authority(alice.memberId), await groupRows(alice)],
+        [standingOf(alice, { everyone_rows: 0 }), 0],
+      );
+      await featureArmed(world, "with the Everyone row removed");
+
+      const denied = await refuseWhole(
+        world,
+        "Alice, the same session, with her builtin Everyone row removed",
+        // lib/access/posture.ts:41-43: no builtin Everyone row among no rows at all is `external`.
+        { session: alice.session, slug, guard: guardChain(alice, 0), server: 1 },
+        {},
+        ["alice's auth user", "alice's member row", "team A id", "team A slug"],
+      );
+      expect(
+        changes(first.after, denied.before),
+        "between the first pass and the denied invocation the one association row was removed, and nothing else differs",
+      ).toEqual({ group_members: { added: [], removed: [association] } });
+      premise("the board is as moved after the denied invocation", JSON.stringify(world.provider), board);
+      expect(await linksHeld(), "the moved link is still recorded `Done`").toEqual(linksAfter(world, afterFirst));
+      expect(await behindBoard(world)).toEqual([world.diverged.rowKey, world.foreign.rowKey]);
+      expect(await reconcileAudits(), "the only audit row is the first pass's").toEqual(
+        auditsOf(world, [{ provider: PROVIDER, seenUpdated: 2, divergences: 1 }]),
+      );
+
+      await placeMemberByTier(a.team.teamId, alice.memberId, "team");
+      premise("with the row restored Alice's rows read as they first did", await authority(alice.memberId), healthy);
+
+      const restored = await admit(world, "Alice, the same session, with her builtin Everyone row restored", movedPass(world));
+      expect(
+        changes(denied.after, restored.before),
+        "between the denied invocation and the restored one the one association row was added back, and nothing else differs",
+      ).toEqual({ group_members: { added: [{ ...association, created_at: expect.any(String) }], removed: [] } });
+      expect(readsOf(restored), "the restored invocation was served the reads the first pass was").toEqual(
+        readsOf(first),
+      );
+      expect(readsOf(restored)).toHaveLength(READS.length);
+      expect(
+        stampOf(leftLink(restored, world.diverged)),
+        "the moved link's `updated_at` is later than the denied invocation left it",
+      ).toBeGreaterThan(stampOf(heldLink(restored, world.diverged)));
+
+      expect(await authority(alice.memberId)).toEqual(healthy);
+      expect(await linksHeld()).toEqual(linksAfter(world, afterMove));
+      expect(await behindBoard(world), "team B's link is still unrecorded, though the board lists it").toEqual([
+        world.foreign.rowKey,
+      ]);
+      expect(await tasksHeld()).toEqual(tasksOf(world));
+      // One audit row per ADMITTED invocation; none for the denied one between them.
+      expect(await reconcileAudits()).toEqual(
+        auditsOf(world, [2, 1].map((seenUpdated) => ({ provider: PROVIDER, seenUpdated, divergences: 1 }))),
+      );
+      expect(await integrationsHeld()).toEqual(integrationsOf(world));
+    },
+    ROOMIEST,
+  );
+
+  it(
+    "15 — an admitted pass in team B, the positive counterpart of each admin's refusal at the other team's slug: over the seeded world of case 1, Bob under his own valid session handed team A's slug, and Alice under hers handed team B's, are each returned exactly `{ ok: false, error: \"admins only\" }` after the team read and a member read answered with ZERO rows (one without its team equality), binding only that slug, the team id it resolved to and their own auth user, with no service client and every row of both teams equal in every column; then, over team B's own board — which answers for team B's Linear team alone, refuses anything carrying team A's secret or Linear team id, and lists two of team A's resources beside team B's one — Bob at team B's OWN slug is admitted: the integrations read bound to team B and `enabled` is answered with ONE row where two are enabled, ONE secret is decrypted and it is team B's, the link read bound to team B and `linear` is answered with ONE row where four hold a resource id, exactly three read-only queries name team B's Linear team, ONE link is updated by team B's link's id, the owner answers `{ provider: \"linear\", seenUpdated: 1, divergences: [<team B's Backlog → Done row>] }`, and only then one audit row is stored under team B and Bob's member row, one revalidation of team B's path is asked and `{ ok: true, … }` is returned — no identifier of team A in any statement, the return, the trace or the revalidation, neither secret anywhere, and every row team A holds unchanged although the board lists its resources; and, as the control that team A's links were left unrecorded, Alice's first pass of case 1 then records them over team A's board",
+    async () => {
+      const world = await seedWorld();
+      const { a, b, alice, bob } = world;
+
+      await featureArmed(world, "before either admin calls");
+      premise(
+        "each team's admin is an active role-admin of their own team holding its builtin Everyone row",
+        [await authority(alice.memberId), await authority(bob.memberId)],
+        [standingOf(alice), standingOf(bob)],
+      );
+      const enabled = `select count(*)::int as n from integrations where status = 'enabled'`;
+      premise(
+        "what team B's integrations read is answered with as written, and without its team equality",
+        [
+          await countOf("scoped integrations read", `${enabled} and team_id = $1`, [b.team.teamId]),
+          await countOf("status-only integrations read", enabled),
+        ],
+        [1, 2],
+      );
+      premise(
+        "what the gate's member read is answered with for each admin at the other team, and for Bob at his own — as written, and without its status, its team and its user equality",
+        {
+          bobAtA: await memberLookup(a.team, bob.user),
+          aliceAtB: await memberLookup(b.team, alice.user),
+          bobAtB: await memberLookup(b.team, bob.user),
+        },
+        // Each team's active rows are its seeded member and its admin.
+        {
+          bobAtA: { asWritten: 0, withoutStatus: 0, withoutTeam: 1, withoutUser: 2 },
+          aliceAtB: { asWritten: 0, withoutStatus: 0, withoutTeam: 1, withoutUser: 2 },
+          bobAtB: { asWritten: 1, withoutStatus: 1, withoutTeam: 1, withoutUser: 2 },
+        },
+      );
+
+      // Team A's board is armed: a Bob admitted at team A's slug would be served team A's pass.
+      await refuseWhole(
+        world,
+        "Bob, an admin of team B, handed team A's slug",
+        { session: bob.session, slug: a.team.teamSlug, guard: strangerChain(bob, a.team), server: 1 },
+        {},
+        ["bob's auth user", "team A id", "team A slug"],
+      );
+
+      // SETUP: from here the responder answers for team B's Linear team, and refuses team A's secret and id.
+      const board = reverseBoard(world);
+      answerFrom(board);
+      premise(
+        "every link the board lists is behind it: team A's two and team B's one",
+        await behind(board),
+        [world.diverged.rowKey, world.inSync.rowKey, world.foreign.rowKey],
+      );
+
+      const aliceAtB = await refuseWhole(
+        world,
+        "Alice, an admin of team A, handed team B's slug",
+        { session: alice.session, slug: b.team.teamSlug, guard: strangerChain(alice, b.team), server: 1 },
+        {},
+        ["alice's auth user", "team B id", "team B slug"],
+      );
+      expect(await linksHeld()).toEqual(linksAfter(world, {}));
+      expect(await reconcileAudits()).toEqual([]);
+
+      // The same session Bob was refused under at team A's slug; the slug alone is different.
+      const bobAtB = await admitBob(world, board, "Bob on team B, at team B's own slug");
+      premise("Bob's pass began from the rows the refused requests left", bobAtB.before, aliceAtB.after);
+      expect(readsOf(bobAtB), "Bob's pass reached the three provider reads, each naming team B's Linear team").toEqual(
+        stateReads(board),
+      );
+      expect(readsOf(bobAtB)).toHaveLength(READS.length);
+      premise("team B's board is as this file armed it", synthetic === board, true);
+      expect(await behind(board), "team A's two listed links are still unrecorded").toEqual([
+        world.diverged.rowKey,
+        world.inSync.rowKey,
+      ]);
+      expect(await linksHeld()).toEqual(linksAfter(world, { [world.foreign.rowKey]: "Done" }));
+      expect(await reconcileAudits()).toEqual([
+        {
+          team_id: b.team.teamId,
+          member_id: bob.memberId,
+          action: AUDIT_ACTION,
+          meta: { provider: PROVIDER, seenUpdated: 1, divergences: 1 },
+        },
+      ]);
+
+      // SETUP: team A's board again. Two seen statuses are recorded over rows Bob's pass left as they were.
+      answerFrom(world.provider);
+      const control = await admit(world, `${CONTROL} Alice on team A, after Bob's pass on team B`, firstPass(world));
+      premise("the control began from the rows Bob's pass left", control.before, bobAtB.after);
+
+      expect(await linksHeld()).toEqual(
+        linksAfter(world, {
+          [world.diverged.rowKey]: "Done",
+          [world.inSync.rowKey]: "In Progress",
+          [world.foreign.rowKey]: "Done",
+        }),
+      );
+      expect(await tasksHeld()).toEqual(tasksOf(world));
+      // In the order written: team B's under Bob, then team A's under Alice.
+      expect(await reconcileAudits()).toEqual([
+        {
+          team_id: b.team.teamId,
+          member_id: bob.memberId,
+          action: AUDIT_ACTION,
+          meta: { provider: PROVIDER, seenUpdated: 1, divergences: 1 },
+        },
+        ...auditsOf(world, [{ provider: PROVIDER, seenUpdated: 2, divergences: 1 }]),
+      ]);
+      expect(await integrationsHeld()).toEqual(integrationsOf(world));
+      expect([await primaryOf(a.team), await primaryOf(b.team)]).toEqual([PROVIDER, PROVIDER]);
+    },
+    ROOMIEST,
+  );
+});
+
 // Each TODO names evidence this slice was told not to supply, or could not.
 describe("Z — evidence this file does NOT supply (executable TODOs: none is run, none is passed)", () => {
   it.todo(
