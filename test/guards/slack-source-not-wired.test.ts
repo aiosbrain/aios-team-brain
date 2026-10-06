@@ -38,6 +38,12 @@ const GUARDED: readonly string[] = [
   // application may call it until an entry point that authorizes team administration exists.
   "lib/ingest/slack-repair-census.ts",
   "lib/ingest/slack-repair-census-read.ts",
+  // The known-root requeue packet (AC-02, inactive) performs no provider request either, but its
+  // preparer WRITES pending work under shared authority locks and decrypts a stored token locally,
+  // with no caller authorization, no fairness lane and no deletion-safe publication behind it. No
+  // route, action, script, scheduler or process start may reach either module, or its pure helpers.
+  "lib/ingest/slack-known-root-page.ts",
+  "lib/ingest/slack-known-root-requeue.ts",
 ];
 
 /** The guarded modules an entry point of this tree can reach, each as the import chain that got there. */
@@ -139,6 +145,8 @@ describe("the Slack source pipeline is not wired to anything", () => {
         `const m = require("@/lib/ingest/slack-method-budget");`,
         `import { classifySlackRepairItem } from "./slack-repair-census";`,
         `export * from "@/lib/ingest/slack-repair-census-read";`,
+        `import { readSlackKnownRootItemPage } from "./slack-known-root-page";`,
+        `const requeue = await import("@/lib/ingest/slack-known-root-requeue");`,
         `import type { T } from "./not-a-real-module";`,
         `import pg from "pg";`,
         `// import { x } from "./slack-source-binding";`,
@@ -257,6 +265,69 @@ describe("the Slack source pipeline is not wired to anything", () => {
     expect(reachedGuarded(new Map([...census, ["scripts/census.ts", `import "../lib/ingest/slack-repair-census-read";`]]))).toHaveLength(2);
     expect(reachedGuarded(new Map([...census, ["instrumentation.ts", `import "@/lib/ingest/slack-repair-census";`]]))).toEqual([
       `instrumentation.ts → ${PURE}`,
+    ]);
+  });
+
+  it("flags the known-root requeue packet from every entry class and by every import spelling", () => {
+    const PAGE = "lib/ingest/slack-known-root-page.ts";
+    const REQUEUE = "lib/ingest/slack-known-root-requeue.ts";
+    const packet: [string, string][] = [
+      [REQUEUE, `import type { SlackKnownRootEntry } from "./slack-known-root-page";`],
+      [PAGE, ""],
+    ];
+    // Control: the two modules existing, one importing the other, and tests or an unreferenced
+    // library file importing them, is not wiring.
+    expect(
+      reachedGuarded(
+        new Map([
+          ...packet,
+          ["test/slack-known-root-requeue.test.ts", `import { tallySlackKnownRootPage } from "@/lib/ingest/slack-known-root-requeue";`],
+          ["test/datamechanics/slack-known-root-requeue.datamechanics.test.ts", `import "@/lib/ingest/slack-known-root-page";`],
+          ["lib/ingest/unreferenced.ts", `import { prepareSlackKnownRootRequeue } from "./slack-known-root-requeue";`],
+          ["app/api/v1/items/route.ts", `import { ingestItem } from "@/lib/ingest";`],
+          ["lib/ingest/index.ts", `export { ingestItem } from "./run";`],
+          ["lib/ingest/run.ts", ""],
+        ])
+      )
+    ).toEqual([]);
+
+    // A route by alias reaches the preparer AND the page module behind it; a pure helper is no exception.
+    const route = "app/api/v1/admin/slack-requeue/route.ts";
+    expect(
+      reachedGuarded(new Map([...packet, [route, `import { classifySlackKnownRootPreparationFailure } from "@/lib/ingest/slack-known-root-requeue";`]]))
+    ).toEqual([`${route} → ${REQUEUE} → ${PAGE}`, `${route} → ${REQUEUE}`]);
+    // A server action by dynamic import, and by require.
+    const action = "app/admin/actions.ts";
+    expect(reachedGuarded(new Map([...packet, [action, `const page = await import("@/lib/ingest/slack-known-root-page");`]]))).toEqual([
+      `${action} → ${PAGE}`,
+    ]);
+    expect(reachedGuarded(new Map([...packet, [action, `const page = require("../../lib/ingest/slack-known-root-page");`]]))).toEqual([
+      `${action} → ${PAGE}`,
+    ]);
+    // A scheduler chain: a cron route, through the runner, by relative imports only.
+    const scheduled = new Map([
+      ...packet,
+      ["app/api/cron/ingest/route.ts", `import { runIngest } from "@/lib/ingest/run";`],
+      ["lib/ingest/run.ts", `import { sweepKnownRoots } from "./slack-known-root-sweep";`],
+      ["lib/ingest/slack-known-root-sweep.ts", `import { prepareSlackKnownRootRequeue } from "./slack-known-root-requeue";`],
+    ]);
+    expect(reachedGuarded(scheduled)).toContain(
+      `app/api/cron/ingest/route.ts → lib/ingest/run.ts → lib/ingest/slack-known-root-sweep.ts → ${REQUEUE}`
+    );
+    // A re-export from the ingest index, which a route already imports.
+    const reexported = new Map([
+      ...packet,
+      ["app/api/v1/items/route.ts", `import { ingestItem } from "@/lib/ingest";`],
+      ["lib/ingest/index.ts", `export { prepareSlackKnownRootRequeue } from "./slack-known-root-requeue";`],
+    ]);
+    expect(reachedGuarded(reexported)).toEqual([
+      `app/api/v1/items/route.ts → lib/ingest/index.ts → ${REQUEUE} → ${PAGE}`,
+      `app/api/v1/items/route.ts → lib/ingest/index.ts → ${REQUEUE}`,
+    ]);
+    // A script and a root-level instrumentation file are entry points too.
+    expect(reachedGuarded(new Map([...packet, ["scripts/requeue-known-roots.ts", `import "../lib/ingest/slack-known-root-requeue";`]]))).toHaveLength(2);
+    expect(reachedGuarded(new Map([...packet, ["instrumentation.ts", `import "@/lib/ingest/slack-known-root-page";`]]))).toEqual([
+      `instrumentation.ts → ${PAGE}`,
     ]);
   });
 
