@@ -1,0 +1,4 @@
+
+> aios-team-brain@0.13.0 typecheck
+> tsc --noEmit
+
