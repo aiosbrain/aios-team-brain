@@ -2457,6 +2457,220 @@ describe("AIO-1217 F4-E2, prospective — app/t/[team]/admin/pm-sync/actions.ts#
   );
 });
 
+// ── F4-E3, prospective: a slug that names no team, under a session its own team admits ───────────
+
+/**
+ * CASE 10 — ADDED LATER, PROSPECTIVELY, AND BY ADDITION ALONE. Nothing above this comment was changed
+ * for it — not the header, not cases 1 to 9, not `request`, its recorder, `admit`, `reach` or `refuse`
+ * — and nothing below it. It calls the same actual export through the same `refuse` and `admit`, over
+ * the same `seedWorld`, with the same seams and no new one. `refuse`'s own comment says `with a valid
+ * slug`: here the slug is the one thing that is not, and nothing `refuse` asserts leans on its being.
+ *
+ * What it supplies: the UNKNOWN-TEAM refusal arm of accepted v9 §5 F4-E3, natively, and that arm
+ * alone. The header's list and Z's `OTHER REFUSAL FAMILIES` TODO are left as they were written; where
+ * that TODO says a slug that names no team is not exercised, this case is the later exception, and
+ * the rest of that TODO stands.
+ *
+ *   refused — over the seeded world of case 1, untouched (both teams naming `linear`, each holding an
+ *             enabled integration with a decryptable synthetic secret, team A three projected links,
+ *             the board armed to answer): team A's admitted admin, under their own valid session,
+ *             hands the action a slug that names no team. The session cookie is read, the server
+ *             client acquired, and ONE statement issued — `teams` by that slug, answered with zero
+ *             rows. Nothing follows it, and the action returns its `admins only`.
+ *   control — the SAME session at team A's own slug, nothing else changed: admitted, and the first
+ *             pass of case 1 in full. So the session, the membership, the integration, the links and
+ *             the board were all live when the slug alone refused; and its two seen statuses are
+ *             recorded over rows the refused request left unrecorded.
+ *   again   — the same session and the same unknown slug once more, after that admission: the
+ *             identical trace and no durable difference.
+ *
+ * SOURCE FACTS beyond the header's:
+ *   lib/integrations/read.ts:72-73  the team is read by `slug` alone, through `maybeSingle`; a null
+ *             team returns null BEFORE the member read — so the session's auth user is never bound
+ *             and posture is never read.
+ *   lib/auth/guard.ts:49-52  the session user, then the server client, then that resolver, whose null
+ *             is the guard's.
+ *   postgres/schema.sql:124  `teams.slug` is `text not null unique`, checked against
+ *             `^[a-z0-9][a-z0-9-]*$`.
+ *   test/datamechanics/helpers.ts:103  `seedTeam` slugs are `team-` and eight hex characters.
+ *   test/datamechanics/setup.ts:66-77  the data tables, `teams` among them, are truncated before each
+ *             test: the two seeded teams are every team row there is, and that is read back.
+ *
+ * Bounds, in addition to the header's.
+ *   - ONE ARM. Unknown team, under a session that verifies and whose user is an active role-admin of
+ *     another, real team holding its builtin Everyone row. A session the verifier rejects, a session
+ *     user with no member row anywhere, an inactive member, a role-`lead` member, both stale
+ *     legacy-tier directions and association removal and restoration are not supplied by this case.
+ *   - ONE SLUG, WELL-FORMED. It is shaped as a seeded slug is, so nothing about its form refuses it;
+ *     an empty, malformed, case-variant, padded, over-long or non-string slug, and the slug of a
+ *     team that was renamed or deleted, are not exercised.
+ *   - "NO SERVICE CLIENT" IS A COUNT OF `adminClient()` ACQUISITIONS during the request, beside a
+ *     trace in which the server client issued one statement and no other client any. A route to the
+ *     pool that is neither factory would not be counted there; what it wrote to the ten tables would
+ *     be in the durable difference, and tables outside the ten are not compared.
+ *   - NO EXISTENCE-ORACLE CLAIM. The value returned is equal to what case 3's refusals return; the
+ *     trace is shorter than theirs, and no timing is measured.
+ *   - TEST-ONLY AND PROSPECTIVE. This is not a reference-runtime run and not F4-E4; it establishes
+ *     nothing about what was inspected or admitted before the F4 edits; it earns no historical
+ *     admission and no E3 credit beyond this one arm; dependent PM-reconciliation acceptance is not
+ *     claimed by it.
+ *   - With `AIO1217_E4_RECORD_DIR` set, each of this case's three requests appends its line as any
+ *     other request does.
+ *
+ * Run status. NOT RUN when written, as the header says of the rest of the file.
+ */
+
+/** The gate's team read as raw SQL: how many rows a slug names. */
+const TEAMS_BY_SLUG = `select count(*)::int as n from teams where slug = $1`;
+
+/**
+ * A slug that names no team, shaped as `seedTeam`'s are so that nothing about its form refuses it.
+ * Read back from the pool beside the read it stands against: it names no row, team A's slug names
+ * one, and the two seeded teams are every row a read without its slug equality would be answered with.
+ */
+async function unknownSlug(world: Pick<World, "a" | "b">): Promise<string> {
+  const slug = `team-${randomUUID().slice(0, 8)}`;
+  premise(
+    "the unknown slug is neither seeded team's",
+    [slug === world.a.team.teamSlug, slug === world.b.team.teamSlug],
+    [false, false],
+  );
+  premise(
+    "what the gate's team read is answered with for the unknown slug, for team A's, and without its slug equality",
+    {
+      unknown: await countOf("unknown slug read", TEAMS_BY_SLUG, [slug]),
+      known: await countOf("team A slug read", TEAMS_BY_SLUG, [world.a.team.teamSlug]),
+      withoutSlug: await countOf("slug-less team read", `select count(*)::int as n from teams`),
+    },
+    // One of the two a looser read could resolve to is the team this session administers.
+    { unknown: 0, known: 1, withoutSlug: 2 },
+  );
+  return slug;
+}
+
+/**
+ * The gate's whole trace for a valid session handed a slug that names no team (lib/auth/guard.ts:49-52,
+ * lib/integrations/read.ts:72-73): the session cookie, the server client, and the slug's team —
+ * answered with no row. No member read follows, so no group read either.
+ */
+const unknownTeamChain = (slug: string): Step[] => [
+  SESSION_READ,
+  SERVER_CLIENT,
+  statement("server", "teams", { slug }, 0),
+];
+
+/** How many rows of the five tables a pass reads or writes one team holds in a snapshot. */
+function holdings(snapshot: Durable, team: Seed): number[] {
+  const held = heldBy(snapshot, team);
+  return [
+    held.teams.length,
+    held.projects.length,
+    held.tasks.length,
+    held.task_pm_links.length,
+    held.integrations.length,
+  ];
+}
+
+describe("AIO-1217 F4-E3, prospective — app/t/[team]/admin/pm-sync/actions.ts#reconcileDivergenceAction over real Postgres, real guard and real resolver, handed a slug that names NO team under a valid session whose own team names `linear` and holds an enabled integration with a decryptable synthetic secret, projected links and a board armed to answer (direct calls; the same seams; the unknown-team arm alone)", () => {
+  it(
+    "10 — unknown team, by real row state and no mocked guard: over the seeded world of case 1, untouched, team A's admitted admin under their own valid session hands the action a well-formed slug that names no team (read back: zero rows, where team A's slug names one and two teams exist) — the session cookie is read, the server client is acquired once, and ONE statement is issued, `teams` bound to that slug and answered with ZERO rows; the action returns exactly `{ ok: false, error: \"admins only\" }` — two keys — with no member or group read, no service client (so no integration, primary or link read and nothing handed down), neither the real owner nor `decryptSecret` reached, nothing sent to the provider, no audit row, no revalidation, no run, no tripwire, no identifier of either team and not even the session's own auth user bound by any statement, neither secret anywhere, and every row of the ten tables of both teams equal in every column; then, as the control, the SAME session at team A's own slug is admitted and makes the first pass of case 1 in full — two seen statuses recorded over links the refused request left unrecorded, one audit row, one revalidation; and the same unknown slug again issues the identical trace and changes nothing, the only reconcile audit row being the control's",
+    async () => {
+      const world = await seedWorld();
+      const { a, b, alice, bob } = world;
+      const slug = await unknownSlug(world);
+      const everyIdentifier = { ...identifiersOf("A", a, alice), ...identifiersOf("B", b, bob) };
+
+      // Every conjunct the gate reads AFTER the team holds for this caller: the slug alone refuses.
+      premise("Alice's session verifies under the real verifier", await verifySession(alice.session), alice.user);
+      premise(
+        "Alice is an active role-admin of team A holding its builtin Everyone row",
+        await authority(alice.memberId),
+        {
+          team_id: a.team.teamId,
+          auth_user_id: alice.user.id,
+          role: "admin",
+          status: "active",
+          tier: "team",
+          everyone_rows: 1,
+          external_rows: 0,
+        },
+      );
+
+      const refusal: Refusal = { session: alice.session, slug, guard: unknownTeamChain(slug), server: 1 };
+      const refused = await refuse("Alice's valid session, handed a slug that names no team", refusal);
+
+      // The zeros are of rows that existed: read from the request's own `before` snapshot.
+      premise(
+        "before the refused request team A held its team row, its project, four tasks, four links and its enabled integration, and team B its own one of each",
+        [holdings(refused.before, a.team), holdings(refused.before, b.team)],
+        [
+          [1, 1, 4, 4, 1],
+          [1, 1, 1, 1, 1],
+        ],
+      );
+      expect(
+        {
+          statements: refused.bound.map((bound) => bound.includes(slug)),
+          identifiers: boundOf(refused, everyIdentifier),
+          surfaced: surfaced(refused, world),
+          decrypted: decryptedBy(refused),
+          reads: readsOf(refused),
+          rewrites: rewrites(refused),
+          answeredKeys: answeredKeys(refused),
+        },
+        "what the refused request bound, decrypted, asked of the provider and handed down",
+      ).toEqual({
+        // ONE statement, carrying the slug it was handed.
+        statements: [true],
+        // Not team A's id, and not even Alice's auth user: the member read is never issued.
+        identifiers: [],
+        surfaced: [],
+        decrypted: [],
+        reads: [],
+        rewrites: [],
+        answeredKeys: [],
+      });
+      expect(
+        refused.after,
+        "every row of the ten tables, both teams, every column, across the refused request",
+      ).toEqual(refused.before);
+
+      // Read back raw: a pass that ran would have recorded two seen statuses and stored an audit row.
+      expect(await linksHeld()).toEqual(linksAfter(world, {}));
+      expect(await tasksHeld()).toEqual(tasksOf(world));
+      expect(await reconcileAudits()).toEqual([]);
+      expect(await integrationsHeld()).toEqual(integrationsOf(world));
+      expect([await primaryOf(a.team), await primaryOf(b.team)]).toEqual([PROVIDER, PROVIDER]);
+      expect(await countOf("unknown slug readback", TEAMS_BY_SLUG, [slug]), "the slug still names no team").toBe(0);
+
+      // The same session, one argument different: admitted, and everything the refusal left undone is done.
+      const control = await admit(world, `${CONTROL} Alice, the same session, at team A's own slug`, firstPass(world));
+      premise("the control began from the rows the refused request left", control.before, refused.after);
+
+      const again = await refuse("the same session and the same unknown slug again, after the control", refusal);
+
+      premise("the repeat began from the rows the control left", again.before, control.after);
+      expect(again.trace, "the repeat issued exactly what the first refusal did").toEqual(refused.trace);
+      expect(boundOf(again, everyIdentifier), "what the repeat bound of either team").toEqual([]);
+      expect(surfaced(again, world)).toEqual([]);
+      expect(again.after, "every row of the ten tables, both teams, every column, across the repeat").toEqual(
+        again.before,
+      );
+
+      expect(await linksHeld()).toEqual(
+        linksAfter(world, { [world.diverged.rowKey]: "Done", [world.inSync.rowKey]: "In Progress" }),
+      );
+      expect(await tasksHeld()).toEqual(tasksOf(world));
+      expect(await reconcileAudits()).toEqual(
+        auditsOf(world, [{ provider: PROVIDER, seenUpdated: 2, divergences: 1 }]),
+      );
+      expect(await integrationsHeld()).toEqual(integrationsOf(world));
+      expect(await countOf("unknown slug readback", TEAMS_BY_SLUG, [slug]), "the slug still names no team").toBe(0);
+    },
+    ROOMIER,
+  );
+});
+
 // Each TODO names evidence this slice was told not to supply, or could not.
 describe("Z — evidence this file does NOT supply (executable TODOs: none is run, none is passed)", () => {
   it.todo(
