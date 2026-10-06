@@ -2243,6 +2243,220 @@ describe("AIO-1217 F4 — app/t/[team]/admin/pm-sync/actions.ts#reconcileDiverge
   );
 });
 
+// ── F4-E2, prospective: a board that moved after an earlier pass, then held fixed ────────────────
+
+/**
+ * CASE 9 — ADDED LATER, PROSPECTIVELY, AND BY ADDITION ALONE. Nothing above this comment was changed
+ * for it — not the header, not cases 1 to 8, not `request`, its recorder, `admit`, `reach` or `refuse`
+ * — and nothing below it. It calls the same actual export through the same `admit`, over the same
+ * `seedWorld`, with the same seams and no new one.
+ *
+ * What it supplies: the Linear changed-state control and unchanged rerun of accepted v9 §5 F4-E2, on
+ * a board that MOVED after an earlier pass. The header's list and Z's `OTHER OWNER BRANCHES` TODO
+ * are left as they were written; where that TODO says a moved board after the first pass is not
+ * constructed, this case is the later exception, and the rest of that TODO stands.
+ *
+ *   baseline — the first pass of case 1: `Done` and `In Progress` are recorded on team A's two
+ *              answered links. Labelled as a baseline: a failure there is case 1's, not this case's.
+ *   moved    — the fixture restates the board: team A's diverged resource moves `Done` → `In
+ *              Progress`; team A's other listed resource stays `In Progress`; team B's stays `Done`.
+ *              The same call then reads the board through the same three reads and issues ONE link
+ *              update, by that link's id; the owner answers `seenUpdated: 1` and the one divergence
+ *              carrying the FRESHLY seen name; then the audit row, the revalidation and the return.
+ *   held     — the same call again, the board not touched: the same three reads, no link update,
+ *              `seenUpdated: 0`, the same divergence, and the legitimate third audit row and
+ *              revalidation.
+ *
+ * SOURCE FACTS beyond the header's:
+ *   lib/pm-sync/reconcile.ts
+ *     :118    the write is taken only when the seen name differs from the STORED seen status — so a
+ *             stored `Done` against a listed `In Progress` is written, and a stored `In Progress`
+ *             against a listed `In Progress` is not.
+ *     :121    that write sets `provider_seen_status` and `updated_at`, the latter to this process's
+ *             clock as an ISO string, by link `id`.
+ *     :127-133 the divergence is decided on, and carries, the name just seen — not the stored one.
+ *   postgres/schema.sql:1315  `task_pm_links.updated_at` is `timestamptz not null default now()`; a
+ *             search of `postgres/` for a trigger naming the table found none.
+ *
+ * Bounds, in addition to the header's.
+ *   - THE BOARD IS MOVED BY THIS FILE. `moveBoard` is setup in this file's memory: it issues no SQL
+ *     and no `fetch`. That the action moved nothing on a provider is, as everywhere here, a count of
+ *     what reached global `fetch` — three reads per request, no violation.
+ *   - THE RESPONDER RECORDS WHAT IT WAS ASKED, NOT WHAT IT ANSWERED. That the moved board is what the
+ *     owner was told is read from what the owner then wrote and returned.
+ *   - `updated_at` IS COMPARED, NOT BOUNDED. The moved link's is later than the first pass left it;
+ *     every other link row is equal in every column. No clock window is asserted.
+ *   - TEST-ONLY AND PROSPECTIVE. This is not a reference-runtime run and not F4-E4; it establishes
+ *     nothing about what was inspected or admitted before the F4 edits; dependent PM-reconciliation
+ *     acceptance is not claimed by it.
+ *   - With `AIO1217_E4_RECORD_DIR` set, each of this case's three requests appends its line as any
+ *     other request does.
+ *
+ * Run status. NOT RUN when written, as the header says of the rest of the file.
+ */
+
+const BASELINE = "BASELINE PASS FAILED (the moved-board pass would start from rows this case did not establish):";
+
+/** The state the board moves team A's diverged resource to, after the first pass recorded `Done`. */
+const MOVED_TO = "In Progress";
+
+/**
+ * SETUP, in this file's memory and nowhere else: the synthetic board the responder answers from is
+ * restated with the listed states. Answers the board as one string, to hold it fixed against.
+ */
+function moveBoard(world: World, listed: Array<{ link: Linked; state: string }>): string {
+  premise("the responder answers from the board this world holds", synthetic === world.provider, true);
+  world.provider.issues = listed.map(({ link, state }) => ({ id: resourceOf(link), state: stateNamed(state) }));
+  return JSON.stringify(world.provider);
+}
+
+/**
+ * FIXTURE READBACK, raw SQL against the board value: the row keys of the links of ANY team whose
+ * resource the board lists under a state name that is not their stored seen status, by row key —
+ * what a pass that read every team's links would rewrite.
+ */
+async function behindBoard(world: World): Promise<string[]> {
+  const listed = new Map(world.provider.issues.map((issue) => [issue.id, issue.state.name]));
+  const rows = await fx<{ row_key: string; provider_resource_id: string; provider_seen_status: string | null }>(
+    "listed links readback",
+    `select row_key, provider_resource_id, provider_seen_status from task_pm_links
+      where provider_resource_id is not null order by row_key`,
+  );
+  return rows
+    .filter((row) => listed.has(row.provider_resource_id))
+    .filter((row) => listed.get(row.provider_resource_id) !== row.provider_seen_status)
+    .map((row) => row.row_key);
+}
+
+/** A link's whole row as the pool held it immediately after the request. */
+function leftLink(seen: Seen, link: Linked): Row {
+  const row = seen.after.task_pm_links.find((held) => held.id === link.linkId);
+  if (!row) throw new Error(`link ${link.rowKey} was not held after the request`);
+  return row;
+}
+
+/** A link row's `updated_at` as an instant; NaN, which no comparison passes, when it is not one. */
+const stampOf = (row: Row): number => Date.parse(String(row.updated_at));
+
+/** A snapshot without the two tables an admitted pass may write: its links and the audit log. */
+const besidesPass = (snapshot: Durable): Record<string, Row[]> =>
+  Object.fromEntries(
+    DURABLE_TABLES.filter((table) => table !== "task_pm_links" && table !== "audit_log").map((table) => [
+      table,
+      snapshot[table],
+    ]),
+  );
+
+/** The one divergence the moved board holds against team A's brain: the same row, freshly seen. */
+const movedDivergence = (world: World): Row => ({ ...divergenceOf(world), provider_seen_status: MOVED_TO });
+
+/** The pass over the moved board: one seen status rewritten, the divergence carrying the new name. */
+const movedPass = (world: World): Pass => ({
+  rewritten: [{ link: world.diverged, state: MOVED_TO }],
+  divergences: [movedDivergence(world)],
+});
+
+/** Any later pass over the moved board held fixed: nothing to record, that divergence still surfaced. */
+const heldPass = (world: World): Pass => ({ rewritten: [], divergences: [movedDivergence(world)] });
+
+describe("AIO-1217 F4-E2, prospective — app/t/[team]/admin/pm-sync/actions.ts#reconcileDivergenceAction over real Postgres, real guard, real resolution and real reconcileProviderState, resolved `linear`, over a synthetic board that MOVED after an earlier pass and is then held fixed (direct calls; the same seams; the board is restated by this file between requests and by nothing else)", () => {
+  it(
+    "9 — changed state, then unchanged: after the first pass of case 1 recorded `Done` and `In Progress` on team A's two answered links, the fixture moves the board — team A's diverged resource `Done` → `In Progress`, team A's other listed resource still `In Progress`, team B's still `Done` — and the SAME call under the same session is admitted, resolves and decrypts as before, reads team A's three links and is served the same three provider reads; ONE `task_pm_links` update is issued, by the moved link's id, and the owner answers `{ provider: \"linear\", seenUpdated: 1, divergences: [<the Backlog → In Progress row>] }` — three keys, no marker; only after it returns the action writes one audit row (`seenUpdated: 1`, `divergences: 1`), asks one revalidation and returns `{ ok: true, … }`; the moved link's row differs in `provider_seen_status` and a LATER `updated_at` and in nothing else, and every other link row — the listed link whose state did not move among them — is equal in every column; then the same call again over that board held fixed is served the same three reads, issues NO link update, leaves every link row equal in every column, answers `seenUpdated: 0` with the same one divergence, and adds only the third audit row before the third revalidation — across all three requests no brain task status, no integration, no primary, no run and no row of team B differs, team B's link is still unrecorded although the board lists it, and the board is as this file moved it",
+    async () => {
+      const world = await seedWorld();
+      const seeded = JSON.stringify(world.provider);
+      const afterFirst = { [world.diverged.rowKey]: "Done", [world.inSync.rowKey]: "In Progress" };
+      const afterMove = { [world.diverged.rowKey]: MOVED_TO, [world.inSync.rowKey]: "In Progress" };
+
+      const first = await admit(
+        world,
+        `${BASELINE} Alice on team A, first pass over the seeded board`,
+        firstPass(world),
+      );
+      premise(
+        "the first pass recorded `Done` and `In Progress`, and nothing else",
+        await linksHeld(),
+        linksAfter(world, afterFirst),
+      );
+      premise("the synthetic board is as seeded after the first pass", JSON.stringify(world.provider), seeded);
+
+      // SETUP: one of team A's two listed resources moves; the other, and team B's, are listed as before.
+      const board = moveBoard(world, [
+        { link: world.diverged, state: MOVED_TO },
+        { link: world.inSync, state: "In Progress" },
+        { link: world.foreign, state: "Done" },
+      ]);
+      premise("the board is no longer as seeded", board === seeded, false);
+      // Team B's is the one a link read that lost its team equality would rewrite as well.
+      premise(
+        "the links behind the moved board are team A's moved one and team B's bystander",
+        await behindBoard(world),
+        [world.diverged.rowKey, world.foreign.rowKey],
+      );
+
+      const moved = await admit(world, "Alice on team A, the pass over the moved board", movedPass(world));
+
+      premise("the synthetic board is as moved after the pass that read it", JSON.stringify(world.provider), board);
+      premise("the moved-board pass began from the rows the first pass left", moved.before, first.after);
+      expect(readsOf(moved), "the moved board was asked the reads the seeded board was").toEqual(readsOf(first));
+      expect(readsOf(moved)).toHaveLength(READS.length);
+
+      // Changed-link-only: `admit` holds the one update and the one changed row; these hold the rest.
+      const others = (snapshot: Durable): Row[] =>
+        snapshot.task_pm_links.filter((row) => row.id !== world.diverged.linkId);
+      premise("four links are not the moved one", others(moved.before).length, 4);
+      expect(others(moved.after), "every other link row, every column, across the moved-board pass").toEqual(
+        others(moved.before),
+      );
+      expect(
+        leftLink(moved, world.inSync),
+        "the listed link whose state did not move is the row the first pass left, `updated_at` included",
+      ).toEqual(leftLink(first, world.inSync));
+      expect(
+        stampOf(leftLink(moved, world.diverged)),
+        "the moved link's `updated_at` is later than the first pass left it",
+      ).toBeGreaterThan(stampOf(heldLink(moved, world.diverged)));
+
+      premise("only team B's bystander is behind the board before the rerun", await behindBoard(world), [
+        world.foreign.rowKey,
+      ]);
+
+      const rerun = await admit(
+        world,
+        "Alice on team A, the same call again over the moved board held fixed",
+        heldPass(world),
+      );
+
+      premise("the synthetic board is as moved after the rerun", JSON.stringify(world.provider), board);
+      premise("the rerun began from the rows the moved-board pass left", rerun.before, moved.after);
+      expect(readsOf(rerun), "the rerun was served the reads the moved-board pass was").toEqual(readsOf(moved));
+      expect(readsOf(rerun)).toHaveLength(READS.length);
+      expect(rewrites(rerun)).toEqual([]);
+      expect(rerun.after.task_pm_links, "every link row, every column, across the rerun").toEqual(
+        rerun.before.task_pm_links,
+      );
+
+      // No task, configuration, membership or run row of either team, across all three requests.
+      expect(
+        besidesPass(rerun.after),
+        "every row of the eight tables a pass does not write, both teams, every column, across all three requests",
+      ).toEqual(besidesPass(first.before));
+
+      expect(await linksHeld()).toEqual(linksAfter(world, afterMove));
+      expect(await behindBoard(world), "team B's link is still unrecorded, though the board lists it").toEqual([
+        world.foreign.rowKey,
+      ]);
+      expect(await tasksHeld()).toEqual(tasksOf(world));
+      expect(await reconcileAudits()).toEqual(
+        auditsOf(world, [2, 1, 0].map((seenUpdated) => ({ provider: PROVIDER, seenUpdated, divergences: 1 }))),
+      );
+      expect(await integrationsHeld()).toEqual(integrationsOf(world));
+      expect([await primaryOf(world.a.team), await primaryOf(world.b.team)]).toEqual([PROVIDER, PROVIDER]);
+    },
+    ROOMIER,
+  );
+});
+
 // Each TODO names evidence this slice was told not to supply, or could not.
 describe("Z — evidence this file does NOT supply (executable TODOs: none is run, none is passed)", () => {
   it.todo(
