@@ -4,10 +4,10 @@ import type { TransactionSession } from "@/lib/db/types";
  * AIO-1170 AC-02 — INACTIVE enumeration of previously published Slack roots
  * (`docs/design/slack-known-root-requeue-spec.md`, §4 and §7).
  *
- * RED-CHECKPOINT STUB. This file fixes the typed public surface only, so the behavioural tests
- * compile and fail on behaviour. Nothing here reads the database, validates a request, enforces a
- * deadline or decorates a session: `readSlackKnownRootItemPage` returns a placeholder empty page and
- * `createSlackKnownRootExecution` a placeholder context. The accepted algorithms replace every body.
+ * PARTLY IMPLEMENTED. `createSlackKnownRootExecution` is the accepted validation and deadline
+ * calculation (§7.2). `readSlackKnownRootItemPage` is STILL THE RED-CHECKPOINT PLACEHOLDER: it reads
+ * nothing, validates nothing, checks no deadline and decorates no session, and returns a fixed page
+ * that is deliberately not a valid one. The accepted enumeration replaces that body.
  *
  * Nothing in the application imports this module
  * (`test/guards/slack-known-root-requeue-not-wired.test.ts`, `test/guards/slack-source-not-wired.test.ts`).
@@ -128,14 +128,83 @@ export interface SlackKnownRootExecution {
   readonly monotonicNow: () => number;
 }
 
-/** STUB: validates nothing and enforces no deadline. */
+function invalidRequest(): never {
+  throw new SlackKnownRootValidationError();
+}
+
+/** The process's own monotonic clock, in milliseconds. */
+function realMonotonicNow(): number {
+  return performance.now();
+}
+
+/**
+ * One reading of a monotonic clock. A clock that throws, or that answers with anything but a finite
+ * number, is a broken caller contract: it is refused with the static error, and neither the clock's
+ * exception nor the value it returned travels any further.
+ */
+function readMonotonicClock(clock: () => number): number {
+  let reading: unknown;
+  try {
+    reading = clock();
+  } catch {
+    return invalidRequest();
+  }
+  if (typeof reading !== "number" || !Number.isFinite(reading)) return invalidRequest();
+  return reading;
+}
+
+/**
+ * The execution context of one logical operation: its allowance and its absolute deadline, fixed
+ * from ONE clock reading taken here. It is created before the transaction and handed to every
+ * attempt, so a retry is measured against the same deadline and receives no fresh allowance.
+ *
+ * The effective deadline is the earlier of `now + allowance` and the ambient deadline the caller
+ * declared. An ambient deadline that has already passed is a valid declaration — it is a fact about
+ * the caller's remaining time — and yields a context that is already out of time; refusing to start
+ * work under it is the job of the primitive that is handed the context, not of this function.
+ *
+ * Throws only the static validation error. Every option is read once and copied; the options
+ * object is not retained.
+ */
 export function createSlackKnownRootExecution(options: SlackKnownRootExecutionOptions): SlackKnownRootExecution {
-  const monotonicNow = options?.monotonicNow ?? ((): number => performance.now());
-  return Object.freeze({
-    allowanceMs: SLACK_KNOWN_ROOT_LIMITS.allowanceMs.default,
-    deadlineAt: Number.POSITIVE_INFINITY,
-    monotonicNow,
-  });
+  let allowance: unknown;
+  let ambient: unknown;
+  let clock: unknown;
+  try {
+    if (typeof options !== "object" || options === null || Array.isArray(options)) return invalidRequest();
+    const supplied = options as unknown as Record<string, unknown>;
+    allowance = supplied.allowanceMs;
+    ambient = supplied.ambientDeadlineAt;
+    clock = supplied.monotonicNow;
+  } catch {
+    // An options object whose accessor throws is as invalid as one that is not an object.
+    return invalidRequest();
+  }
+
+  const limits = SLACK_KNOWN_ROOT_LIMITS.allowanceMs;
+  let allowanceMs: number;
+  if (allowance === undefined) allowanceMs = limits.default;
+  else if (typeof allowance === "number" && Number.isSafeInteger(allowance) && allowance >= limits.min && allowance <= limits.max) allowanceMs = allowance;
+  else return invalidRequest();
+
+  // The caller always SAYS: `null` declares that there is no ambient deadline, a finite number is
+  // one. An absent declaration is refused — the session cannot discover a deadline on its own.
+  let ambientDeadlineAt: number | null;
+  if (ambient === null) ambientDeadlineAt = null;
+  else if (typeof ambient === "number" && Number.isFinite(ambient)) ambientDeadlineAt = ambient;
+  else return invalidRequest();
+
+  let monotonicNow: () => number;
+  if (clock === undefined) monotonicNow = realMonotonicNow;
+  else if (typeof clock === "function") monotonicNow = clock as () => number;
+  else return invalidRequest();
+
+  const createdAt = readMonotonicClock(monotonicNow);
+  const operationDeadlineAt = createdAt + allowanceMs;
+  const deadlineAt = ambientDeadlineAt === null ? operationDeadlineAt : Math.min(operationDeadlineAt, ambientDeadlineAt);
+  if (!Number.isFinite(deadlineAt)) return invalidRequest();
+
+  return Object.freeze({ allowanceMs, deadlineAt, monotonicNow });
 }
 
 /**
