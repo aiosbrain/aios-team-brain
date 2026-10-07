@@ -148,30 +148,17 @@ async function unlinkDisplayed(seed: Seed, memberId: string, provider: Provider,
   expect(await unlinkMemberIdentity(seed.teamSlug, provider, shown.externalId, shown.revision)).toEqual({ ok: true });
 }
 
+/** How long one lock-evidence poll may wait for the expected waits to appear. */
+const POLL_TIMEOUT_MS = 10_000;
+/** How long cleanup waits, per step, for raced operations to finish once their barrier is gone. */
+const CLEANUP_BOUND_MS = 5_000;
 /**
- * Put two fenced calls in flight TOGETHER: the team's identity authority is held from a connection
- * of its own until both are waiting on it — which is before either has observed anything, because
- * the fenced action enters the boundary first. Released, they run one after the other, and the
- * second observes what the first committed.
+ * The timeout of every test that races. It must exceed the bounded waits such a test can make —
+ * Vitest's default (5 s) is shorter than ONE poll, which would cut a failing schedule off before
+ * its `finally` had released the barrier. A failing test spends at most one poll timeout plus both
+ * cleanup steps; the passing polls return as soon as PostgreSQL shows the waits.
  */
-async function bothQueuedOnAuthority<T>(seed: Seed, first: () => Promise<T>, second: () => Promise<T>): Promise<[T, T]> {
-  const owner = new Client({ connectionString: process.env.DATABASE_URL });
-  owner.on("error", () => undefined);
-  await owner.connect();
-  await owner.query("begin");
-  await owner.query("select pg_advisory_xact_lock(hashtextextended($1,0))", [`${seed.teamId}:identity-authority`]);
-  const both = Promise.all([first(), second()]);
-  both.catch(() => undefined);
-  try {
-    await expect.poll(async () => (await getPool().query<{ n: number }>(
-      "select count(*)::int as n from pg_locks where locktype='advisory' and not granted")).rows[0].n,
-    { timeout: 10_000 }).toBe(2);
-  } finally {
-    await owner.query("rollback").catch(() => undefined);
-    await owner.end().catch(() => undefined);
-  }
-  return both;
-}
+const RACE_TEST_TIMEOUT_MS = 60_000;
 
 interface Barrier { pid: number; release: () => Promise<void> }
 
@@ -203,34 +190,163 @@ const holdTable = (table: "member_identities" | "member_identity_mapping_state")
 const holdIdentityKey = (seed: Seed, provider: Provider, externalId: string) =>
   holdLock("select pg_advisory_xact_lock(hashtextextended($1, 0))", [`${seed.teamId}:identity:${provider}:${externalId}`]);
 
-interface LockWait { pid: number; locktype: string; blockers: number[] }
+interface LockWait {
+  pid: number;
+  locktype: string;
+  /** The 64-bit key of an advisory wait, as PostgreSQL stores it; null for any other lock. */
+  key: string | null;
+  blockers: number[];
+}
 
-/** Every backend waiting on a lock right now: the kind of lock, and exactly which backends block it. */
+/**
+ * Every backend waiting on a lock IN THIS DATABASE right now: the kind of lock, the advisory key
+ * if it is one, and exactly which backends block it. `pg_locks` is cluster-wide, so the database
+ * filter is what keeps another database's waiters out of the evidence.
+ */
 async function lockWaits(): Promise<LockWait[]> {
   const { rows } = await getPool().query<LockWait>(
-    "select pid, locktype, pg_blocking_pids(pid) as blockers from pg_locks where not granted order by pid");
+    `select l.pid, l.locktype,
+            case when l.locktype = 'advisory' and l.objsubid = 1
+                 then ((l.classid::bigint << 32) | l.objid::bigint)::text end as key,
+            pg_blocking_pids(l.pid) as blockers
+       from pg_locks l
+      where not l.granted
+        and l.database = (select oid from pg_database where datname = current_database())
+      order by l.pid`);
   return rows;
 }
 
-/** Wait — on PostgreSQL's own lock table, never on a clock — until exactly these waits exist. */
-async function untilWaiting(expected: { locktype: string; blockedBy: number }[]): Promise<LockWait[]> {
+/** The advisory key of one team's identity authority — the lock the mutation boundary takes first. */
+async function authorityKey(seed: Seed): Promise<string> {
+  const { rows } = await getPool().query<{ key: string }>(
+    "select hashtextextended($1,0)::text as key", [`${seed.teamId}:identity-authority`]);
+  return rows[0].key;
+}
+
+interface ExpectedWait {
+  locktype: string;
+  /** True when the wait must be on the team identity authority's own advisory key. */
+  authority: boolean;
+  /** The exact backends that block it — no fewer, and none besides. */
+  blockedBy: number[];
+}
+
+/**
+ * Wait — on PostgreSQL's own lock table, never on a clock — until the waits behind the test's own
+ * backends (`behind`) are exactly `expected`. A wait is this test's only if one of those backends
+ * blocks it; anything else waiting in the database is neither counted nor required to be absent.
+ */
+async function untilWaiting(expected: ExpectedWait[], behind: number[], authority: string): Promise<LockWait[]> {
+  const mine = (waits: LockWait[]) => waits.filter((wait) => wait.blockers.some((pid) => behind.includes(pid)));
   // `pg_blocking_pids` may repeat a backend that blocks through more than one lock.
-  const shape = (waits: { locktype: string; blockers: number[] }[]) =>
-    waits.map((wait) => `${wait.locktype} blocked by ${[...new Set(wait.blockers)].sort().join(",")}`).sort();
-  await expect.poll(async () => shape(await lockWaits()), { timeout: 10_000 })
-    .toEqual(shape(expected.map((wait) => ({ locktype: wait.locktype, blockers: [wait.blockedBy] }))));
-  return lockWaits();
+  const shape = (waits: ExpectedWait[]) => waits.map((wait) =>
+    `${wait.locktype}${wait.authority ? " on the team identity authority" : ""} blocked by ${[...new Set(wait.blockedBy)].sort((a, b) => a - b).join(",")}`).sort();
+  await expect.poll(async () => shape(mine(await lockWaits()).map((wait) => ({
+    locktype: wait.locktype, authority: wait.key === authority, blockedBy: wait.blockers,
+  }))), { timeout: POLL_TIMEOUT_MS }).toEqual(shape(expected));
+  return mine(await lockWaits());
+}
+
+/** This test's own waiting sessions: every backend waiting behind `root`, directly or through another of them. */
+async function waitersBehind(root: number): Promise<number[]> {
+  const waits = await lockWaits().catch(() => [] as LockWait[]);
+  const own = new Set<number>();
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const wait of waits) {
+      if (!own.has(wait.pid) && wait.blockers.some((pid) => pid === root || own.has(pid))) {
+        own.add(wait.pid);
+        grew = true;
+      }
+    }
+  }
+  return [...own];
+}
+
+/**
+ * BOUNDED CLEANUP of raced operations whose barrier has just been released, so none of them is
+ * still running — holding a lock or a transaction — when the next test truncates. They normally
+ * finish at once. If they have not within the bound, the test's own backends (`ownBackends`, read
+ * from `pg_locks` before the release) have their statements cancelled, and the wait is repeated
+ * once. The timer bounds CLEANUP only: no schedule is ever established by waiting on it. Returns
+ * whether every operation finished by itself.
+ */
+async function settleRaced(operations: (Promise<unknown> | undefined)[], ownBackends: number[]): Promise<boolean> {
+  const started = operations.filter((operation): operation is Promise<unknown> => operation !== undefined);
+  const all = Promise.allSettled(started).then(() => true as const);
+  const withinBound = async (): Promise<boolean> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const bound = new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), CLEANUP_BOUND_MS); });
+    try {
+      return await Promise.race([all, bound]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  if (await withinBound()) return true;
+  if (ownBackends.length > 0) {
+    await getPool().query("select pg_cancel_backend(pid) from unnest($1::int[]) as pid", [ownBackends]).catch(() => undefined);
+    await withinBound();
+  }
+  return false;
+}
+
+/**
+ * Put two fenced calls in flight TOGETHER: the team's identity authority is held from a connection
+ * of the test's own until both are waiting on it — which is before either has observed anything,
+ * because the fenced action enters the boundary first. Released, they run one after the other, and
+ * the second observes what the first committed.
+ *
+ * The evidence is exact to this test: the two waits are in this database, each is an advisory wait
+ * on THIS team's authority key, each is blocked by the test's own holder backend, and nothing but
+ * that holder and the other of the two blocks either (the later arrival also queues behind the
+ * earlier). Waits behind any other backend are not counted.
+ */
+async function bothQueuedOnAuthority<T>(seed: Seed, first: () => Promise<T>, second: () => Promise<T>): Promise<[T, T]> {
+  const owner = await holdLock("select pg_advisory_xact_lock(hashtextextended($1,0))", [`${seed.teamId}:identity-authority`]);
+  const queued = { locktype: "advisory", onAuthority: true, blockedOnlyByThisTest: true };
+  let one: Promise<T> | undefined;
+  let other: Promise<T> | undefined;
+  let quiet = true;
+  try {
+    const authority = await authorityKey(seed);
+    one = first();
+    one.catch(() => undefined);
+    other = second();
+    other.catch(() => undefined);
+    await expect.poll(async () => {
+      const waits = (await lockWaits()).filter((wait) => wait.blockers.includes(owner.pid));
+      const own = new Set([owner.pid, ...waits.map((wait) => wait.pid)]);
+      return waits.map((wait) => ({
+        locktype: wait.locktype,
+        onAuthority: wait.key === authority,
+        blockedOnlyByThisTest: wait.blockers.every((pid) => own.has(pid)),
+      }));
+    }, { timeout: POLL_TIMEOUT_MS }).toEqual([queued, queued]);
+  } finally {
+    // On EVERY path — a failed poll included — the holder is released and both calls are settled.
+    const ownBackends = await waitersBehind(owner.pid);
+    await owner.release();
+    quiet = await settleRaced([one, other], ownBackends);
+  }
+  if (!quiet) throw new Error("the queued calls did not finish after the team authority was released");
+  return [await one!, await other!];
 }
 
 /**
  * THE DETERMINISTIC RACE. `first` is started and PARKED: it must come to wait on the barrier (a
  * `relation` or `advisory` wait, blocked by the barrier's backend and nothing else). Only then is
- * `second` started, and it must come to wait on an ADVISORY lock blocked by `first`'s backend and
- * nothing else — the team identity authority `first` holds. Then the barrier is released and both
- * finish. Every step is evidence read from `pg_locks`; if `second` did not wait behind `first`
- * (or waited on anything else), the poll fails rather than the test passing by timing.
+ * `second` started, and it must come to wait on THIS team's identity-authority advisory key,
+ * blocked by `first`'s backend and nothing else. Then the barrier is released and both finish.
+ * Every step is evidence read from `pg_locks` for this database; if `second` did not wait behind
+ * `first` (or waited on anything else), the poll fails rather than the test passing by timing.
+ *
+ * On EVERY path — a failed or timed-out poll included — the barrier is released and whatever was
+ * started is settled within a bound, so nothing raced here outlives its test.
  */
 async function parkThenCompete<A, B>(opts: {
+  seed: Seed;
   barrier: Barrier;
   parksOn: "relation" | "advisory";
   first: () => Promise<A>;
@@ -238,20 +354,27 @@ async function parkThenCompete<A, B>(opts: {
 }): Promise<{ first: A; second: B }> {
   let first: Promise<A> | undefined;
   let second: Promise<B> | undefined;
+  let quiet = true;
   try {
+    const authority = await authorityKey(opts.seed);
+    const parkedOnBarrier = { locktype: opts.parksOn, authority: false, blockedBy: [opts.barrier.pid] };
     first = opts.first();
     first.catch(() => undefined);
-    const parked = await untilWaiting([{ locktype: opts.parksOn, blockedBy: opts.barrier.pid }]);
+    const parked = await untilWaiting([parkedOnBarrier], [opts.barrier.pid], authority);
     const holder = parked[0].pid;
     second = opts.second();
     second.catch(() => undefined);
-    await untilWaiting([
-      { locktype: opts.parksOn, blockedBy: opts.barrier.pid },
-      { locktype: "advisory", blockedBy: holder },
-    ]);
+    await untilWaiting(
+      [parkedOnBarrier, { locktype: "advisory", authority: true, blockedBy: [holder] }],
+      [opts.barrier.pid, holder],
+      authority,
+    );
   } finally {
+    const ownBackends = await waitersBehind(opts.barrier.pid);
     await opts.barrier.release();
+    quiet = await settleRaced([first, second], ownBackends);
   }
+  if (!quiet) throw new Error("the raced operations did not finish after their barrier was released");
   return { first: await first!, second: await second! };
 }
 
@@ -479,7 +602,7 @@ describe.each(PROVIDERS)("AIO-1167 X-02 — %s: the Admin link keeps the display
     expect(remaps.filter((result) => !result.ok)).toEqual([{ ok: false, error: STALE }]);
     expect(await mapping(seed, provider, held)).toEqual({ holder: remaps[0].ok ? alice : bob, revision: 2, state: "linked" });
     expect((await audits(seed, held)).map((row) => row.mapping_revision)).toEqual([1, 2]);
-  });
+  }, RACE_TEST_TIMEOUT_MS);
 });
 
 describe.each(PROVIDERS)("AIO-1167 X-02 — %s: the fenced decision is ONE boundary — deterministic races against the real writer (real Postgres)", (provider) => {
@@ -501,17 +624,28 @@ describe.each(PROVIDERS)("AIO-1167 X-02 — %s: the fenced decision is ONE bound
 
   it("(1) OFFER OBSERVATION: a competing remap of the requested id cannot commit inside the action's observation — it waits for the action, and the offer names one holder at that holder's revision", async () => {
     const { seed, alice, carol, target, aliceRow } = await heldTarget();
-
-    // The action is parked INSIDE its observation: it has read who holds an id and is waiting to
-    // read the mapping revisions. The real writer then remaps the requested id Bob → Carol.
+    // WHERE THE ACTION PARKS, exactly. The barrier holds the mapping-state table, so the action
+    // stops at its first read of that table, already inside the boundary.
+    //   - Slack / Linear / Plane ask from a BLANK row: nothing is displayed, so the first thing
+    //     read is the REQUESTED id. Its holder (Bob) has been read from `member_identities`; the
+    //     action is waiting to read that id's revision — parked between the two reads of the
+    //     requested id, the very gap a remap used to commit in.
+    //   - Google asks from a CHANGE row, because a blank Google row naming a linked identity is
+    //     refused, never offered. There the first mapping-state read is the DISPLAYED identity's,
+    //     so the action parks before it has read the requested id at all. That schedule proves
+    //     the remap waits for the whole fenced decision; it does not sit between the two reads.
+    // In both, the real writer then asks to remap the requested id Bob → Carol.
+    const observed: Observation = provider === "gdrive" ? { original: aliceRow } : BLANK;
     const { first: offer, second: remapped } = await parkThenCompete({
+      seed,
       barrier: await holdTable("member_identity_mapping_state"),
       parksOn: "relation",
-      first: () => link(seed, alice, provider, target, { original: aliceRow }),
+      first: () => link(seed, alice, provider, target, observed),
       second: () => setMemberIdentity(db(), seed.teamId, carol, { provider, externalId: target }, { force: true, expectedRevision: 1 }),
     });
 
-    // Bob at Bob's revision — not Bob at Carol's, which is what a remap between the reads gave.
+    // The remap was shown waiting on the team authority behind the action. So the offer is Bob at
+    // Bob's revision — never Bob at Carol's, which a remap committing between the reads produced.
     expect(offer).toEqual(offerOf(target, 1, "Bob"));
     // The remap was only made to wait: it then committed, against the state the action left alone.
     expect(remapped).toMatchObject({ memberId: carol, updated: true, conflict: false, mappingRevision: 2 });
@@ -519,17 +653,19 @@ describe.each(PROVIDERS)("AIO-1167 X-02 — %s: the fenced decision is ONE bound
 
     // Alice's offer was for Bob's link at revision 1. Confirming it is NOT refreshed to Carol's.
     const moved = await effects(seed, provider, target);
-    expect(await link(seed, alice, provider, target, { original: aliceRow, remap: { revision: 1 } })).toEqual({ ok: false, error: STALE });
+    expect(await link(seed, alice, provider, target, { ...observed, remap: { revision: 1 } })).toEqual({ ok: false, error: STALE });
     expect(await mapping(seed, provider, target)).toEqual({ holder: carol, revision: 2, state: "linked" });
     expect(await effects(seed, provider, target)).toEqual(moved);
-  });
+  }, RACE_TEST_TIMEOUT_MS);
 
   it("(2) a competing remap that COMMITS FIRST is what the action then shows: the new holder at the new revision, and that exact revision is what a confirmation remaps", async () => {
     const { seed, alice, carol, target, aliceRow } = await heldTarget();
 
-    // The real writer is parked mid-remap, holding the team authority; the action is in flight
-    // behind it and has observed nothing yet.
+    // The real writer is parked mid-remap — at its own locked read of the mapping state, holding
+    // the team authority, its remap not yet written. The action (from a Change row, for every
+    // provider) is shown waiting on that authority: it is in flight and has read nothing.
     const { first: remapped, second: offer } = await parkThenCompete({
+      seed,
       barrier: await holdTable("member_identity_mapping_state"),
       parksOn: "relation",
       first: () => setMemberIdentity(db(), seed.teamId, carol, { provider, externalId: target }, { force: true, expectedRevision: 1 }),
@@ -542,36 +678,47 @@ describe.each(PROVIDERS)("AIO-1167 X-02 — %s: the fenced decision is ONE bound
 
     expect(await link(seed, alice, provider, target, { original: aliceRow, remap: { revision: 2 } })).toEqual({ ok: true });
     expect(await mapping(seed, provider, target)).toEqual({ holder: alice, revision: 3, state: "linked" });
-  });
+  }, RACE_TEST_TIMEOUT_MS);
 
   it("(3) the DISPLAYED identity cannot be remapped or unlinked between its validation and the requested id's write: the competing mutation waits for the action and commits after it", async () => {
     const seed = await adminSeed();
     const alice = await member(seed, "Alice");
     const bob = await member(seed, "Bob");
 
-    // (a) Parked as its validation begins. A real remap of the displayed id (Alice → Bob) arrives.
+    // (a) THE DISCRIMINATING SCHEDULE. The barrier holds `member_identities`, so the action parks
+    // at its very first read — of the displayed identity — having validated nothing, but already
+    // holding the team authority. A real remap of the displayed id (Alice → Bob) arrives and is
+    // shown waiting on that authority. An action that validated the displayed identity before
+    // entering the boundary would hold no authority here: the remap would not wait behind it, and
+    // this evidence could not be produced.
     const shownA = await ownRow(seed, alice, provider);
     const nextA = idFor(provider, "next");
     const remap = await parkThenCompete({
+      seed,
       barrier: await holdTable("member_identities"),
       parksOn: "relation",
       first: () => link(seed, alice, provider, nextA, { original: shownA }),
       second: () => setMemberIdentity(db(), seed.teamId, bob, { provider, externalId: shownA.externalId }, { force: true, expectedRevision: shownA.revision }),
     });
-    // The action validated the identity as displayed and wrote the requested id; only then did
-    // the remap of the displayed identity commit.
+    // Released, the action validated the identity as displayed and wrote the requested id; only
+    // then did the remap of the displayed identity commit — the audit order below is that order.
     expect(remap.first).toEqual({ ok: true });
     expect(remap.second).toMatchObject({ memberId: bob, updated: true, mappingRevision: shownA.revision + 1 });
     expect(await mapping(seed, provider, nextA)).toEqual({ holder: alice, revision: 1, state: "linked" });
     expect(await mapping(seed, provider, shownA.externalId)).toEqual({ holder: bob, revision: shownA.revision + 1, state: "linked" });
     expect((await auditOrder(seed)).slice(-2)).toEqual([[nextA, "identity.set"], [shownA.externalId, "identity.set"]]);
 
-    // (b) Parked BETWEEN the two: the displayed identity is validated and the requested id
-    // observed; the writer is waiting for the requested id's own key. A real unlink of the
-    // displayed identity arrives.
+    // (b) THE WINDOW ITSELF, pinned — not a second proof of the fix. The barrier holds the
+    // requested id's own key, which only the writer takes: so the action parks INSIDE the writer,
+    // with the displayed identity already validated, the requested id already observed and
+    // nothing yet written. A real unlink of the displayed identity arrives and waits. This shows
+    // that an unlink arriving in exactly that window commits after the requested id's write. It
+    // does NOT by itself distinguish an action that validates outside the boundary: the writer
+    // holds the team authority by this point either way. (a) is the schedule that does.
     const shownB = await ownRow(seed, alice, provider);
     const nextB = idFor(provider, "next");
     const unlink = await parkThenCompete({
+      seed,
       barrier: await holdIdentityKey(seed, provider, nextB),
       parksOn: "advisory",
       first: () => link(seed, alice, provider, nextB, { original: shownB }),
@@ -582,7 +729,7 @@ describe.each(PROVIDERS)("AIO-1167 X-02 — %s: the fenced decision is ONE bound
     expect(await mapping(seed, provider, nextB)).toEqual({ holder: alice, revision: 1, state: "linked" });
     expect(await mapping(seed, provider, shownB.externalId)).toEqual({ holder: null, revision: shownB.revision + 1, state: "unlinked" });
     expect((await auditOrder(seed)).slice(-2)).toEqual([[nextB, "identity.set"], [shownB.externalId, "identity.removed"]]);
-  });
+  }, RACE_TEST_TIMEOUT_MS);
 
   it("(4) a displayed identity mutated FIRST — committed before the action starts, or while it waits — makes the action stale: no requested id, no audit row, no effect", async () => {
     const seed = await adminSeed();
@@ -599,12 +746,15 @@ describe.each(PROVIDERS)("AIO-1167 X-02 — %s: the fenced decision is ONE bound
     expect(await audits(seed, nextA)).toEqual([]);
     expect(await effects(seed, provider, nextA)).toEqual(beforeA);
 
-    // (b) Committed while the action waits: a real unlink of the displayed id is parked holding
-    // the team authority; the action is in flight behind it and has validated nothing yet.
+    // (b) Committed while the action waits. A real unlink of the displayed id is parked at its own
+    // locked read of the mapping state — holding the team authority, its unlink not yet written.
+    // The action is shown waiting on that authority: in flight, having validated nothing. Released,
+    // the unlink commits first and the action then validates against what it committed.
     const shownB = await ownRow(seed, alice, provider);
     const nextB = idFor(provider, "next");
     const beforeB = await effects(seed, provider, nextB);
     const { first: unlinked, second: change } = await parkThenCompete({
+      seed,
       barrier: await holdTable("member_identity_mapping_state"),
       parksOn: "relation",
       first: () => removeMemberIdentity(db(), seed.teamId, { provider, externalId: shownB.externalId }, { expectedRevision: shownB.revision }),
@@ -620,7 +770,7 @@ describe.each(PROVIDERS)("AIO-1167 X-02 — %s: the fenced decision is ONE bound
     expect(afterB.authority).toBe(beforeB.authority + 1);
     expect(afterB.obligations).toEqual([]);
     expect(afterB.deferred).toBe(beforeB.deferred);
-  });
+  }, RACE_TEST_TIMEOUT_MS);
 });
 
 describe.each(["slack", "linear", "plane"] as const)("AIO-1167 X-02 — %s: a BLANK row naming an id another member holds (real Postgres)", (provider) => {
