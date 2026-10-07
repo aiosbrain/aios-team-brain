@@ -420,8 +420,14 @@ const UNPROVEN_BARRIER: CleanupReport = { outcome: "unproven", barrierGone: fals
  * session's time zone), so a later backend given the same pid is not it. */
 interface BackendIdentity { pid: number; started: string }
 
-/** One read of absence evidence, as the wait is to make it: the real read, or the seam's stand-in for it. */
-const seamed = <T>(seam: EvidenceSeam, read: () => Promise<T>) => (): Promise<T> => (seam.read ? seam.read(read) : read());
+/**
+ * One read of absence evidence, as the wait is to make it: the real read, or the seam's stand-in for it.
+ *
+ * NAME its result before handing it to `untilEvidence`. Called in place, as that call's `read`, a
+ * generic function that returns a function is set aside while the call's own type is inferred — so
+ * nothing is learnt from it in time, and `accept` and `show` are given `unknown`.
+ */
+const seamed =<T>(seam: EvidenceSeam, read: () => Promise<T>) => (): Promise<T> => (seam.read ? seam.read(read) : read());
 
 /** The monitor's own reading of one exact backend: the rows of `pg_stat_activity` that are it. */
 const backendRows = (backend: BackendIdentity) => observe<{ pid: number }>(
@@ -437,8 +443,9 @@ const backendRows = (backend: BackendIdentity) => observe<{ pid: number }>(
  */
 async function backendAbsent(backend: BackendIdentity, ms: number, seam: EvidenceSeam = {}): Promise<boolean> {
   try {
+    const read = seamed(seam, () => backendRows(backend));
     await untilEvidence({
-      read: seamed(seam, () => backendRows(backend)),
+      read,
       accept: (sessions) => sessions.length === 0,
       expected: `backend ${backend.pid} (started ${backend.started}) gone`,
       show: (sessions) => JSON.stringify(sessions),
@@ -457,8 +464,9 @@ async function backendAbsent(backend: BackendIdentity, ms: number, seam: Evidenc
  */
 async function barrierAbsent(tag: string, ms: number, seam: EvidenceSeam = {}): Promise<boolean> {
   try {
+    const read = seamed(seam, () => barrierSessions(tag));
     await untilEvidence({
-      read: seamed(seam, () => barrierSessions(tag)),
+      read,
       accept: (sessions) => sessions.length === 0,
       expected: `no session left for barrier ${tag}`,
       show: (sessions) => JSON.stringify(sessions),
