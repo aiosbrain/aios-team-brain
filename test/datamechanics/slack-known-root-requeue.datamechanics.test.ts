@@ -3531,3 +3531,320 @@ describe("KR-07 exact due persistence — observation age and millisecond ceilin
     ]);
   });
 });
+
+/**
+ * KR-07 — the DECISION CLOCK: due-ness is decided against `clock_timestamp()`, not against the
+ * moment the preparation's transaction began
+ * (`docs/design/slack-known-root-requeue-spec.md` §5.5, §11 KR-07).
+ *
+ * EVIDENCE, NOT RED, AND SUPPLEMENTARY: every case here is expected to pass on the current source.
+ * It adds the clock part of KR-07 to the exact-persistence part above. It closes no row of the
+ * mutation matrix. Still not claimed: KR-07's finite and conversion bounds, and an unchanged
+ * publication refreshing the observation without semantic-generation churn.
+ *
+ * THE CROSSED CASE. Preparation runs inside the caller's transaction, and a transaction can be
+ * older than the instant a root comes due. The case builds exactly that, with no sleep and no
+ * mocked clock, by ordering completed queries:
+ *
+ *   1. transaction A begins, and through A's own executor its `transaction_timestamp()` and its
+ *      backend pid are read and kept;
+ *   2. while A sits idle in its transaction — no statement in flight, and no preparation lock,
+ *      because preparation has not been called — an independent connection C sets the root
+ *      witness's observation to the DATABASE's `clock_timestamp() - interval '60 seconds'` and
+ *      commits. Under the minimum interval of 60,000 ms the exact due instant is therefore the
+ *      instant of C's own statement: after A began, and already past for any later statement;
+ *   3. through A it is read back that A is the same connection in the same transaction, that C was
+ *      another connection, and that `transaction_timestamp() < exact due <= clock_timestamp()`;
+ *   4. the real preparation is then called in that same transaction A, and A commits.
+ *
+ * The clock that says the root is due is the statement clock. The transaction's start says it is
+ * not. A decision made against the transaction's start would answer `not_due`.
+ *
+ * TWO CONTROLS. A root whose due instant was already past before A began is enqueued under either
+ * clock. A root whose due instant is a day ahead is `not_due` under either clock. They show that
+ * the crossed case's result is about WHICH clock, not about the fixture.
+ *
+ * FIXTURE AGING is labeled as such wherever it happens. It is the only fixture DML: one statement on
+ * the one root witness row, which must change exactly one row. Fixture facts are asserted before
+ * the preparation is called, under `fixture` labels, so a setup that did not produce the intended
+ * interleaving fails as a fixture and cannot be read as a behavioral result.
+ *
+ * THE EXECUTION CONTEXT is created before transaction A and is never replaced: A's fixture reads,
+ * C's statement and a snapshot all happen inside its allowance. It is created with the largest
+ * allowance the contract permits, 5,000 ms, because the crossed case does fixture work between the
+ * context's creation and the preparation. This suite is not timeout evidence.
+ *
+ * THE LATER CONTROLLED FALSIFIER, not made here: in the due read, the one decision comparison
+ * `<= clock_timestamp()` becomes `<= transaction_timestamp()`, with the arithmetic, the ceiling,
+ * the witness and the enqueue untouched. Expected: this suite passes 3 of 3 before and after; under
+ * the substitution ONLY the crossed case fails, at the assertion labeled
+ * "KR-07 CLOCK: due after transaction start is enqueued", receiving `not_due`; both controls pass.
+ * A setup, deadline or SQL failure, or any other failed case, is inconclusive and not a kill.
+ *
+ * The named-table snapshot is not the whole of KR-13.
+ */
+describe("KR-07 decision clock", () => {
+  const CLOCK_LABEL = "KR-07 CLOCK: due after transaction start is enqueued";
+  /** The minimum revisit interval. The fixture's `interval '60 seconds'` below is this same interval, written out. */
+  const REVISIT_MS = 60_000;
+
+  /** An instant as the DATABASE renders it: UTC, six fractional digits, as text. The expression is parenthesized as a whole. */
+  const utc = (expression: string): string => `to_char((${expression}) at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00'`;
+  /** The one root witness row of the fixture, as `w`, and no other ledger row. */
+  const ROOT_WITNESS = `w.team_id = $1 and w.workspace_id = $2 and w.channel_id = $3 and w.message_ts = $4 and w.root_ts = $4 and w.is_root and w.item_id = $5::uuid`;
+  const witnessOf = (f: Published): unknown[] => [f.seed.teamId, WORKSPACE, CHANNEL, OLD_ROOT, f.itemId];
+
+  /** What the fixture aging stored, as the database renders it, and the connection that stored it. */
+  interface Aged {
+    pidOfC: number;
+    /** The root witness's stored observation. */
+    observedAt: string;
+    /** The observation plus the 60,000 ms interval, to the microsecond: the exact due instant, before any rounding. */
+    exactDue: string;
+  }
+
+  /**
+   * FIXTURE AGING, on an independent connection C, in one transaction that commits before this
+   * returns: the root witness's observation becomes the database's own clock shifted by `shift`.
+   * It must change exactly one row. What it stored is returned as the database renders it.
+   */
+  async function ageRootWitness(f: Published, shift: "- interval '60 seconds'" | "- interval '2 hours'" | "+ interval '1 day'", label: string): Promise<Aged> {
+    const written = await tx(async (c) => {
+      const pid = Number((await c.executeSql<{ pid: number }>(`select pg_backend_pid() as pid`)).rows[0].pid);
+      const changed = await c.executeSql<{ observed_at_utc: string; exact_due_utc: string }>(
+        `update slack_messages w set observed_at = clock_timestamp() ${shift}
+          where ${ROOT_WITNESS}
+      returning ${utc("w.observed_at")} as observed_at_utc, ${utc("w.observed_at + interval '60 seconds'")} as exact_due_utc`, witnessOf(f)
+      );
+      return { pid, rows: changed.rows };
+    });
+    expect(written.rows.length, `${label}: fixture aging: exactly one ledger row, the root witness, was changed`).toBe(1);
+    const aged: Aged = { pidOfC: written.pid, observedAt: written.rows[0].observed_at_utc, exactDue: written.rows[0].exact_due_utc };
+    expect(await rootWitness(f), `${label}: fixture aging: the committed root witness stores exactly that observation, live, and no other ledger row carries it`).toEqual([
+      { observed_at_utc: aged.observedAt, live: true, rows_with_this_observation: 1 },
+    ]);
+    return aged;
+  }
+  /** The root witness as stored: its observation as text, whether it is live, and how many of the team's ledger rows carry that same instant. */
+  const rootWitness = (f: Published): Promise<Row[]> => query(
+    `select ${utc("w.observed_at")} as observed_at_utc, w.deleted_at is null as live,
+            (select count(*)::int from slack_messages m where m.team_id = w.team_id and m.observed_at = w.observed_at) as rows_with_this_observation
+       from slack_messages w where ${ROOT_WITNESS}`, witnessOf(f)
+  );
+
+  /** Every row of the team in the named tables, exactly as the database renders it. Not the whole of KR-13. */
+  const SNAPSHOT_TABLES = [
+    "items", "slack_messages", "slack_sync_threads", "slack_thread_snapshots", "slack_sync_channels",
+    "slack_integration_bindings", "slack_channel_migration_gates", "integrations", "projects", "slack_team_state",
+  ];
+  async function snapshot(teamId: string): Promise<Record<string, string>> {
+    const scoped = (await query(
+      `select table_name from information_schema.columns
+        where table_schema = 'public' and column_name = 'team_id' and table_name = any($1::text[])
+        order by table_name`, [SNAPSHOT_TABLES]
+    )).map((row) => row.table_name as string);
+    for (const required of SNAPSHOT_TABLES) expect(scoped, `fixture: ${required} is snapshotted`).toContain(required);
+    const out: Record<string, string> = {};
+    for (const table of scoped) {
+      const [aggregate] = await query(
+        `select coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text), '[]'::jsonb)::text as rows from "${table}" t where t.team_id = $1`, [teamId]
+      );
+      out[table] = aggregate.rows as string;
+    }
+    const [versions] = await query(
+      `select coalesce(jsonb_agg(to_jsonb(v) order by to_jsonb(v)::text), '[]'::jsonb)::text as rows
+         from item_versions v join items i on i.id = v.item_id where i.team_id = $1`, [teamId]
+    );
+    out.item_versions = versions.rows as string;
+    return out;
+  }
+
+  /** The real publication, checked to have acknowledged, and the real enumeration under the minimum interval, on its own completed transaction. */
+  async function publishedAndEnumerated(label: string): Promise<{ f: Published; entry: SlackKnownRootEntry }> {
+    const f = await publishOldRoot();
+    const teamId = f.seed.teamId;
+    const afterPublication = await stored(teamId);
+    expect([afterPublication.allQueue, afterPublication.snapshots], `${label}: fixture: the real publication removed the queue row and the staging`).toEqual([[], 0]);
+    const channel = await channelRow(teamId, WORKSPACE, CHANNEL);
+    expect(channel?.binding_config_revision, `${label}: fixture: the channel row stores a configuration revision`).toMatch(/^[0-9a-f]{64}$/);
+    const pageExecution = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+    const page = await tx((s) => readSlackKnownRootItemPage(s, { teamId, pageSize: 100, revisitAfterMs: REVISIT_MS }, pageExecution));
+    expect(page, `${label}: fixture: enumeration returns exactly this root, located, under the minimum revisit interval`).toEqual({
+      entries: [{
+        teamId, itemId: f.itemId, revisitAfterMs: 60_000,
+        locator: {
+          workspaceId: WORKSPACE, channelId: CHANNEL, rootTs: OLD_ROOT, integrationId: f.integrationId,
+          bindingConfigRevision: channel?.binding_config_revision, namespaceRevision: f.namespaceRevision,
+        },
+      }],
+      nextCursor: null, exhausted: true, examined: 1,
+    });
+    return { f, entry: page.entries[0] };
+  }
+
+  /** The context of ONE preparation, created BEFORE its transaction A and never replaced. The largest allowance the contract permits. */
+  const contextBeforeA = (): SlackKnownRootExecution => createSlackKnownRootExecution({ ambientDeadlineAt: null, allowanceMs: 5_000 });
+
+  /** Where an exact due instant lies against A's two clocks, read through A's OWN executor, with A's identity. */
+  interface ClockFacts {
+    pid: number;
+    transaction_start: string;
+    transaction_starts_before_due: boolean;
+    due_before_transaction_start: boolean;
+    due_by_the_decision_clock: boolean;
+  }
+  async function clockFacts(a: TransactionSession, exactDue: string): Promise<ClockFacts> {
+    const { rows } = await a.executeSql<ClockFacts>(
+      `select pg_backend_pid() as pid, ${utc("transaction_timestamp()")} as transaction_start,
+              transaction_timestamp() < $1::timestamptz as transaction_starts_before_due,
+              $1::timestamptz < transaction_timestamp() as due_before_transaction_start,
+              $1::timestamptz <= clock_timestamp() as due_by_the_decision_clock`, [exactDue]
+    );
+    return { ...rows[0], pid: Number(rows[0].pid) };
+  }
+
+  /** The committed state after an enqueue, read on another connection: the queue row, its persisted due, and nothing else moved. */
+  async function enqueuedExactly(f: Published, aged: Aged, before: Record<string, string>, label: string): Promise<void> {
+    const teamId = f.seed.teamId;
+    // The persisted due is the retained exact due rounded UP to its millisecond: not before it, less
+    // than a millisecond after it, and on a whole millisecond. Only one instant is all three.
+    expect(await query(
+      `select t.workspace_id, t.channel_id, t.root_ts, t.status, t.attempts,
+              t.due_at >= $2::timestamptz as not_before_the_exact_due,
+              t.due_at < $2::timestamptz + interval '1 millisecond' as less_than_a_millisecond_after_it,
+              to_char(t.due_at at time zone 'UTC', 'US') like '%000' as on_a_whole_millisecond
+         from slack_sync_threads t where t.team_id = $1 order by t.root_ts`, [teamId, aged.exactDue]
+    ), `${label}: exactly one queue row, in the root's exact scope, queued and never attempted, due at the exact due instant rounded up to its millisecond`).toEqual([{
+      workspace_id: WORKSPACE, channel_id: CHANNEL, root_ts: OLD_ROOT, status: "queued", attempts: 0,
+      not_before_the_exact_due: true, less_than_a_millisecond_after_it: true, on_a_whole_millisecond: true,
+    }]);
+    expect((await stored(teamId)).snapshots, `${label}: no staging`).toBe(0);
+    expect(await query(`select team_id::text as team_id, root_ts from slack_sync_threads`), `${label}: the only queue row in the database is this root's`).toEqual([
+      { team_id: teamId, root_ts: OLD_ROOT },
+    ]);
+    const after = await snapshot(teamId);
+    expect(after.slack_sync_threads, `${label}: the snapshot sees the queue row`).not.toBe(before.slack_sync_threads);
+    for (const table of Object.keys(before)) {
+      if (table !== "slack_sync_threads") expect(after[table], `${label}: ${table} is unchanged by the preparation`).toBe(before[table]);
+    }
+    expect(await rootWitness(f), `${label}: the root witness is unchanged by the preparation`).toEqual([
+      { observed_at_utc: aged.observedAt, live: true, rows_with_this_observation: 1 },
+    ]);
+  }
+
+  // THE FALSIFIER of a decision made against the transaction's start.
+  it("enqueues a root whose due instant falls after the preparation's transaction began and before its due decision (crossed transaction start)", async () => {
+    const label = "crossed transaction start";
+    const { f, entry } = await publishedAndEnumerated(label);
+    const teamId = f.seed.teamId;
+
+    // Created BEFORE transaction A. Everything A does before the preparation is inside this allowance.
+    const execution = contextBeforeA();
+    const committed = await tx(async (a) => {
+      // 1. A HAS BEGUN. Its transaction start and its backend pid, through A's own executor.
+      const begun = await a.executeSql<{ pid: number; transaction_start: string }>(
+        `select pg_backend_pid() as pid, ${utc("transaction_timestamp()")} as transaction_start`
+      );
+      const pidOfA = Number(begun.rows[0].pid);
+      const transactionStart = begun.rows[0].transaction_start;
+
+      // 2. FIXTURE AGING, by C, while A is idle: the exact due instant becomes the instant of C's own
+      //    statement, which is after A began. C commits before this returns.
+      const aged = await ageRootWitness(f, "- interval '60 seconds'", label);
+      // What the DATABASE says about A, from a third connection: idle in its transaction, waiting on no lock.
+      expect(await query(
+        `select s.state, s.wait_event_type is not distinct from 'Lock' as waiting_for_a_lock,
+                (select count(*)::int from pg_locks l where l.pid = s.pid and not l.granted) as ungranted_locks
+           from pg_stat_activity s where s.pid = $1`, [pidOfA]
+      ), `${label}: fixture: A is idle in its transaction, with no statement in flight and no lock wait, while C ages the witness`).toEqual([
+        { state: "idle in transaction", waiting_for_a_lock: false, ungranted_locks: 0 },
+      ]);
+      const before = await snapshot(teamId);
+
+      // 3. THE INTERLEAVING, read through A: the same connection, the same transaction, another
+      //    connection than C; and the exact due instant is AFTER A's start and NOT AFTER the clock.
+      const facts = await clockFacts(a, aged.exactDue);
+      expect({
+        sameConnection: facts.pid === pidOfA, sameTransactionStart: facts.transaction_start === transactionStart, cWasAnotherConnection: aged.pidOfC !== pidOfA,
+        transaction_starts_before_due: facts.transaction_starts_before_due, due_before_transaction_start: facts.due_before_transaction_start,
+        due_by_the_decision_clock: facts.due_by_the_decision_clock,
+      }, `${label}: fixture: transaction_timestamp() < exact due <= clock_timestamp(), in the one unchanged transaction A, with C another connection`).toEqual({
+        sameConnection: true, sameTransactionStart: true, cWasAnotherConnection: true,
+        transaction_starts_before_due: true, due_before_transaction_start: false, due_by_the_decision_clock: true,
+      });
+
+      // 4. THE REAL PREPARATION, in the same transaction A, from the team and the enumerated entry alone.
+      const result = await prepareSlackKnownRootRequeue(a, { teamId, entry }, execution);
+      return { result, aged, before };
+    });
+
+    // A COMMITTED. The decision was made against the clock: the root is enqueued.
+    expect(committed.result, CLOCK_LABEL).toEqual({ outcome: "enqueued" });
+    await enqueuedExactly(f, committed.aged, committed.before, label);
+  });
+
+  it("enqueues a root whose due instant was already past when the preparation's transaction began (positive control)", async () => {
+    const label = "already overdue before the transaction (control)";
+    const { f, entry } = await publishedAndEnumerated(label);
+    const teamId = f.seed.teamId;
+
+    // FIXTURE AGING, completed and committed BEFORE transaction A begins: due about two hours ago.
+    const aged = await ageRootWitness(f, "- interval '2 hours'", label);
+    const before = await snapshot(teamId);
+
+    const execution = contextBeforeA();
+    const result = await tx(async (a) => {
+      const facts = await clockFacts(a, aged.exactDue);
+      expect({
+        transaction_starts_before_due: facts.transaction_starts_before_due, due_before_transaction_start: facts.due_before_transaction_start,
+        due_by_the_decision_clock: facts.due_by_the_decision_clock,
+      }, `${label}: fixture: exact due < transaction_timestamp(), so the root is due under either clock`).toEqual({
+        transaction_starts_before_due: false, due_before_transaction_start: true, due_by_the_decision_clock: true,
+      });
+      return prepareSlackKnownRootRequeue(a, { teamId, entry }, execution);
+    });
+
+    expect(result, `${label}: the committed outcome`).toEqual({ outcome: "enqueued" });
+    await enqueuedExactly(f, aged, before, label);
+  });
+
+  it("is not due when the due instant is a day ahead of both the transaction's start and the decision clock (negative control)", async () => {
+    const label = "a day ahead of both clocks (control)";
+    const { f, entry } = await publishedAndEnumerated(label);
+    const teamId = f.seed.teamId;
+
+    // FIXTURE AGING, the other way and by the database's own clock: the observation is a day AHEAD.
+    const aged = await ageRootWitness(f, "+ interval '1 day'", label);
+    const before = await snapshot(teamId);
+    const AHEAD_OF_BOTH = { transaction_starts_before_due: true, due_before_transaction_start: false, due_by_the_decision_clock: false };
+    const position = (facts: ClockFacts) => ({
+      transaction_starts_before_due: facts.transaction_starts_before_due, due_before_transaction_start: facts.due_before_transaction_start,
+      due_by_the_decision_clock: facts.due_by_the_decision_clock,
+    });
+
+    const execution = contextBeforeA();
+    const committed = await tx(async (a) => {
+      const beforePreparation = await clockFacts(a, aged.exactDue);
+      expect(position(beforePreparation), `${label}: fixture: before the preparation the exact due is ahead of the transaction's start and of the clock`).toEqual(AHEAD_OF_BOTH);
+      const result = await prepareSlackKnownRootRequeue(a, { teamId, entry }, execution);
+      // Read through A again, in the same transaction, after the preparation has returned.
+      const afterPreparation = await clockFacts(a, aged.exactDue);
+      return { result, beforePreparation, afterPreparation };
+    });
+
+    expect({
+      position: position(committed.afterPreparation),
+      sameConnection: committed.afterPreparation.pid === committed.beforePreparation.pid,
+      sameTransactionStart: committed.afterPreparation.transaction_start === committed.beforePreparation.transaction_start,
+    }, `${label}: fixture: after the preparation, in the same transaction, the exact due is still ahead of both clocks`).toEqual({
+      position: AHEAD_OF_BOTH, sameConnection: true, sameTransactionStart: true,
+    });
+    expect(committed.result, `${label}: the committed outcome`).toEqual({ outcome: "not_due" });
+    expect(await query(`select 1 as pending from slack_sync_threads`), `${label}: no queue row, of this team or any other`).toEqual([]);
+    expect((await stored(teamId)).snapshots, `${label}: no staging`).toBe(0);
+    expect(await snapshot(teamId), `${label}: every named table, the queue included, is unchanged by the preparation`).toEqual(before);
+    expect(await rootWitness(f), `${label}: the root witness is unchanged by the preparation`).toEqual([
+      { observed_at_utc: aged.observedAt, live: true, rows_with_this_observation: 1 },
+    ]);
+  });
+});
