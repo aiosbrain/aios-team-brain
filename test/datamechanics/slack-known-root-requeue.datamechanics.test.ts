@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { TransactionSession } from "@/lib/db/types";
+import type { SqlExecutor, TransactionSession } from "@/lib/db/types";
 import { ingestItem } from "@/lib/ingest";
 import {
   createSlackKnownRootExecution,
   readSlackKnownRootItemPage,
   type SlackKnownRootEntry,
+  type SlackKnownRootExecution,
   type SlackKnownRootItemPage,
 } from "@/lib/ingest/slack-known-root-page";
 import { prepareSlackKnownRootRequeue, type SlackKnownRootPreparationResult } from "@/lib/ingest/slack-known-root-requeue";
@@ -1457,5 +1458,734 @@ describe("KR-03 — canonical proof refuses exactly what it should, and nothing 
         await plantedItem(later, otherTeam.teamId, theirs, LEGACY_PATH);
       }),
     ]));
+  });
+});
+
+/**
+ * KR-17 — the §7.5 single-channel capacity fixture, its query plans and the numeric stop
+ * (`docs/design/slack-known-root-requeue-spec.md` §7.5, §9 and §11).
+ *
+ * EVIDENCE, NOT RED, and the one place in this file where a FAILURE IS A RESULT: an observation over
+ * a stop threshold is "NOT READY, pending schema-owner adjudication" (§7.5), not a test to be fixed.
+ * The thresholds are the specification's and are not tunable here: every measured data statement at
+ * most 200 ms, every complete page operation and complete preparation operation at most 750 ms.
+ *
+ * THE FIXTURE is the specification's minimum, built by set-based fixture DML on top of ONE root that
+ * the real discovery, readiness, staging and publication paths produced: one team; 100,000 non-Slack
+ * items; 601 canonical Slack root items in one exact workspace and one exact channel (the real one
+ * and 600 synthetic); one live root witness and 100 distinct replies per root, 90 live and 10
+ * deleted — 60,701 ledger rows in that channel. Every synthetic row is labeled (`kr17_synthetic` in
+ * its frontmatter, deterministic ids and timestamps), every cardinality is read back and compared
+ * exactly, and the synthetic roots are proven to be canonical the only way that counts: the real
+ * enumeration locates them and the real preparation enqueues one. Authority — binding, channel
+ * proof, namespace gate, integration secret — is whatever the real paths left behind.
+ *
+ * WHAT IS MEASURED IS THE PRIMITIVE'S OWN SQL. Nothing here restates a query. The real exported
+ * functions run on a recording session — a test-only wrapper of the caller's `executeSql`, the kind
+ * of instrumented wrapper `SqlExecutor` is documented to allow — which keeps the text and the
+ * parameters of every statement the primitive and its dependencies actually issue, and how long each
+ * took. Those captured statements are then given back, unchanged, to
+ * `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` inside a transaction that is rolled back, so the locks and
+ * the enqueue insert are measured and leave nothing behind. A statement this test cannot name by a
+ * fragment of its text is reported as an evidence gap and fails the test: nothing unnamed is measured
+ * on trust.
+ *
+ * OBSERVATIONS, exactly as accepted: for each case the FIRST five ordinary executions after fixture
+ * loading and `ANALYZE` are retained — operation time from primitive entry to its return, settings
+ * round trips included, checkout and commit excluded — and then five plan observations of each
+ * captured statement, compared as planning plus execution time. There is no warm-up run, nothing is
+ * discarded or replaced, and nothing is averaged: every retained observation is printed, and each one
+ * is compared with its stop on its own. The traversal's remaining pages are measured too and are held
+ * to the same stops; only their maximum is printed.
+ *
+ * NOT CERTIFIED HERE: cold-cache behaviour; contention; any other fixture; sweep cadence or capacity
+ * (the 1,007 page transactions are §9's traversal cost, characterized, not accepted); KR-11's insert
+ * semantics; and the plan SHAPES, which are recorded as the planner chose them and never forced.
+ * The catalog case states which indexes exist; the single shape assertion is the one that follows
+ * from the catalog alone.
+ */
+const KR17 = Object.freeze({
+  statementStopMs: 200,
+  operationStopMs: 750,
+  retained: 5,
+  pageSize: 100,
+  nonSlackItems: 100_000,
+  syntheticRoots: 600,
+  repliesPerRoot: 100,
+  /** Every tenth reply of a root is a deleted ledger row: 10 of its 100. */
+  deletedReplyEvery: 10,
+  /** Fixed instants of every synthetic row. Both are far enough in the past to be due at any revisit policy. */
+  observedAt: "2024-07-01T00:00:00Z",
+  deletedAt: "2024-07-02T00:00:00Z",
+});
+const KR17_ROOTS = KR17.syntheticRoots + 1;
+const KR17_ITEMS = KR17.nonSlackItems + KR17_ROOTS;
+const KR17_LEDGER_ROWS = KR17_ROOTS * (KR17.repliesPerRoot + 1);
+const KR17_PAGES = Math.ceil(KR17_ITEMS / KR17.pageSize);
+
+// Deterministic ids. Synthetic items sort, in PostgreSQL's UUID order, as: the 100,000 non-Slack
+// items, then the 600 synthetic roots. The one really published item has a random id, which the
+// fixture requires to sort after both blocks, so a page of 100 holds either no root at all or roots
+// only: both extremes of the locator read are in the fixture, at known pages.
+const kr17RootItemId = (k: number): string => `00000000-0000-4000-9000-${k.toString(16).padStart(12, "0")}`;
+const kr17RootTs = (k: number): string => `${1_718_000_000 + k}.000100`;
+const KR17_ABOVE_EVERY_SYNTHETIC_ID = "00000000-0000-4000-9000-ffffffffffff";
+
+/** One statement the primitive really issued, as the recording session saw it. */
+interface Kr17Issued { name: string; kind: "settings" | "data"; text: string; params: unknown[]; elapsedMs: number }
+interface Kr17Sample { operationMs: number; issued: Kr17Issued[] }
+interface Kr17PlanObservation { planningMs: number; executionMs: number; totalMs: number; nodes: Row[] }
+interface Kr17PlanCase { name: string; parameters: string[]; observations: Kr17PlanObservation[] }
+
+/**
+ * NAMES, not queries: each data statement is recognized by one fragment of its own text, with
+ * whitespace collapsed. A statement that matches no fragment, or more than one, is unnamed.
+ */
+const KR17_STATEMENTS: readonly (readonly [name: string, fragment: string])[] = [
+  ["page: upper-bound id read", "from items where team_id = $1::uuid order by id desc limit 1"],
+  ["page: first id read", "from items where team_id = $1::uuid and id <= $2::uuid order by id limit $3"],
+  ["page: continuation id read", "from items where team_id = $1::uuid and id > $2::uuid and id <= $3::uuid order by id limit $4"],
+  ["page: locator enrichment", "from unnest($2::uuid[]) as wanted(id) join items i on i.team_id = $1::uuid and i.id = wanted.id"],
+  ["preparation: namespace gate lock", "from slack_channel_migration_gates where team_id = $1 and raw_channel_id = $2 for update"],
+  ["preparation: integration selection lock", "from integrations where team_id = $1 and id = $2::uuid for update"],
+  ["preparation: binding row lock", "from slack_integration_bindings where team_id = $1::uuid and integration_id = $2::uuid for update"],
+  ["preparation: scoped channel row lock", "from slack_sync_channels where team_id = $1::uuid and workspace_id = $2 and channel_id = $3 for update"],
+  ["preparation: plain queue read", "select 1 as pending from slack_sync_threads where team_id = $1::uuid"],
+  ["preparation: item lock", "from items i where i.team_id = $1::uuid and i.id = $2::uuid for update"],
+  ["preparation: slack project read", "from projects where team_id = $1::uuid and slug = $2"],
+  ["preparation: root witness", "select 1 as witnessed from slack_messages w where"],
+  ["preparation: ledger contradictions", ") as item_bound_elsewhere, exists ("],
+  ["preparation: path conflicts", ") as scoped_conflict, exists ("],
+  ["preparation: due decision", "end as due_epoch_ms from slack_messages w where"],
+  ["preparation: enqueue insert", "insert into slack_sync_threads (team_id, workspace_id, channel_id, root_ts, due_at)"],
+];
+const KR17_UNNAMED = "UNNAMED STATEMENT (evidence gap)";
+const KR17_FIRST_PAGE = ["page: upper-bound id read", "page: first id read", "page: locator enrichment"];
+const KR17_NEXT_PAGE = ["page: continuation id read", "page: locator enrichment"];
+/** A complete preparation that reaches the enqueue, in the specification's order (§5.1–§5.5). */
+const KR17_PREPARATION = [
+  "preparation: namespace gate lock", "preparation: integration selection lock", "preparation: binding row lock",
+  "preparation: scoped channel row lock", "preparation: plain queue read", "preparation: item lock",
+  "preparation: slack project read", "preparation: root witness", "preparation: ledger contradictions",
+  "preparation: path conflicts", "preparation: due decision", "preparation: enqueue insert",
+];
+
+function kr17Named(text: string): Pick<Kr17Issued, "name" | "kind"> {
+  const flat = text.replace(/\s+/g, " ").trim();
+  if (flat.includes("from pg_settings")) return { name: "settings: read both timeouts", kind: "settings" };
+  if (flat.includes("set_config('statement_timeout'")) return { name: "settings: apply both timeouts", kind: "settings" };
+  const matches = KR17_STATEMENTS.filter(([, fragment]) => flat.includes(fragment));
+  // The start of the SQL text identifies the gap. It carries no parameter value.
+  return { name: matches.length === 1 ? matches[0][0] : `${KR17_UNNAMED}: ${flat.slice(0, 120)}`, kind: "data" };
+}
+
+/** The caller's session, unchanged in behaviour, with every statement it is asked for written down. */
+function kr17Recording(session: TransactionSession, issued: Kr17Issued[]): TransactionSession {
+  const executeSql: SqlExecutor = async <T = Record<string, unknown>>(text: string, params?: unknown[]) => {
+    const started = performance.now();
+    const result = await session.executeSql<T>(text, params);
+    issued.push({ ...kr17Named(text), text, params: params === undefined ? [] : [...params], elapsedMs: performance.now() - started });
+    return result;
+  };
+  return {
+    get db() {
+      return session.db;
+    },
+    executeSql,
+    optionalAudit<T>(operation: () => Promise<T>, fallback: T): Promise<T> {
+      return session.optionalAudit(operation, fallback);
+    },
+  };
+}
+
+/**
+ * ONE ordinary execution of one primitive, on its own transaction. The clock runs from the call of
+ * the primitive to its return: validation, both settings round trips, every data statement and the
+ * restoration are inside it; connection checkout, BEGIN and COMMIT are not. The default 2,000 ms
+ * allowance, the real monotonic clock, and a declared absence of any ambient deadline.
+ */
+function kr17Measured<T>(
+  operation: (session: TransactionSession, execution: SlackKnownRootExecution) => Promise<T>
+): Promise<Kr17Sample & { value: T }> {
+  return tx(async (s) => {
+    const issued: Kr17Issued[] = [];
+    const session = kr17Recording(s, issued);
+    const execution = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+    const started = performance.now();
+    const value = await operation(session, execution);
+    const operationMs = performance.now() - started;
+    return { value, operationMs, issued };
+  });
+}
+
+const kr17Data = (sample: Kr17Sample): Kr17Issued[] => sample.issued.filter((statement) => statement.kind === "data");
+const kr17DataNames = (sample: Kr17Sample): string[] => kr17Data(sample).map((statement) => statement.name);
+
+/** A parameter by its kind and size, never by its value. */
+function kr17Described(value: unknown): string {
+  if (value === null || value === undefined) return "null";
+  if (Array.isArray(value)) return `array[${value.length}]`;
+  if (value instanceof Date) return "timestamp";
+  if (typeof value === "string") return /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(value) ? "uuid" : `text(${Buffer.byteLength(value, "utf8")} bytes)`;
+  return typeof value;
+}
+
+const KR17_PLAN_KEYS = [
+  "Node Type", "Parent Relationship", "Subplan Name", "Operation", "Conflict Resolution", "Relation Name", "Index Name",
+  "Scan Direction", "Index Cond", "Recheck Cond", "Filter", "Rows Removed by Filter", "Heap Fetches", "Actual Rows", "Actual Loops",
+  "Actual Total Time", "Shared Hit Blocks", "Shared Read Blocks", "Workers Launched",
+];
+
+/** The plan as a flat list of its nodes: access path, conditions, rows, loops, buffers and time. */
+function kr17PlanNodes(node: Row, depth = 0, out: Row[] = []): Row[] {
+  const kept: Row = { depth };
+  for (const key of KR17_PLAN_KEYS) if (node[key] !== undefined) kept[key] = node[key];
+  out.push(kept);
+  for (const child of (node.Plans as Row[] | undefined) ?? []) kr17PlanNodes(child, depth + 1, out);
+  return out;
+}
+
+/**
+ * Five plan observations of each captured statement. Every observation runs the statements in the
+ * order the primitive issued them, with the parameters it issued them with, inside one transaction on
+ * the fixture connection that is ROLLED BACK: row locks are taken and the enqueue insert really
+ * inserts, and neither survives. No planner setting is changed and no index is added.
+ */
+async function kr17PlanCases(label: string, statements: readonly Kr17Issued[]): Promise<Kr17PlanCase[]> {
+  const raw = await rawSql();
+  const cases: Kr17PlanCase[] = statements.map((statement) => ({
+    name: `${label} · ${statement.name}`, parameters: statement.params.map(kr17Described), observations: [],
+  }));
+  for (let observation = 0; observation < KR17.retained; observation++) {
+    await raw.query("begin");
+    try {
+      for (const [index, statement] of statements.entries()) {
+        const explained = await raw.query<Row>(`explain (analyze, buffers, format json) ${statement.text}`, statement.params);
+        const column = explained.rows[0]?.["QUERY PLAN"];
+        const [top] = (typeof column === "string" ? JSON.parse(column) : column) as Row[];
+        const planningMs = Number(top["Planning Time"]);
+        const executionMs = Number(top["Execution Time"]);
+        cases[index].observations.push({ planningMs, executionMs, totalMs: planningMs + executionMs, nodes: kr17PlanNodes(top.Plan as Row) });
+      }
+    } finally {
+      await raw.query("rollback");
+    }
+  }
+  return cases;
+}
+
+/** Over the stop, or not a measurement at all: a value that is not a finite duration never passes. */
+const kr17Over = (ms: number, stopMs: number): boolean => !(Number.isFinite(ms) && ms >= 0 && ms <= stopMs);
+const kr17Ms = (ms: number): number | string => (Number.isFinite(ms) ? Math.round(ms * 1000) / 1000 : String(ms));
+
+/** Ordinary executions of one case: every retained operation and every data statement against its stop. */
+function kr17Ordinary(name: string, samples: readonly Kr17Sample[], retained: number, print: "every observation" | "maximum only"): { evidence: Row; violations: string[] } {
+  const violations: string[] = [];
+  if (samples.length !== retained) violations.push(`${name}: ${samples.length} observations were retained, not ${retained}`);
+  const statements = new Map<string, number[]>();
+  samples.forEach((sample, index) => {
+    const at = `ordinary execution ${index + 1} of ${samples.length}`;
+    if (kr17Over(sample.operationMs, KR17.operationStopMs)) {
+      violations.push(`${name} · COMPLETE OPERATION · ${at}: measured ${kr17Ms(sample.operationMs)} ms against the ${KR17.operationStopMs} ms operation stop`);
+    }
+    for (const statement of kr17Data(sample)) {
+      statements.set(statement.name, [...(statements.get(statement.name) ?? []), statement.elapsedMs]);
+      if (kr17Over(statement.elapsedMs, KR17.statementStopMs)) {
+        violations.push(`${name} · ${statement.name} · ${at}: measured ${kr17Ms(statement.elapsedMs)} ms against the ${KR17.statementStopMs} ms statement stop`);
+      }
+    }
+  });
+  const operations = samples.map((sample) => sample.operationMs);
+  const evidence: Row = {
+    case: name, observations: samples.length, operationStopMs: KR17.operationStopMs, statementStopMs: KR17.statementStopMs,
+    maxOperationMs: kr17Ms(Math.max(...operations)),
+    maxStatementMs: Object.fromEntries([...statements].map(([statement, elapsed]) => [statement, kr17Ms(Math.max(...elapsed))])),
+    settingsRoundTripsPerOperation: [...new Set(samples.map((sample) => sample.issued.length - kr17Data(sample).length))],
+  };
+  if (print === "every observation") {
+    evidence.operationMs = operations.map(kr17Ms);
+    evidence.statementMs = Object.fromEntries([...statements].map(([statement, elapsed]) => [statement, elapsed.map(kr17Ms)]));
+  }
+  return { evidence, violations };
+}
+
+/** Plan observations: planning plus execution time of every observation against the statement stop. */
+function kr17Plans(cases: readonly Kr17PlanCase[]): { evidence: Row[]; violations: string[] } {
+  const violations: string[] = [];
+  const evidence = cases.map((planCase): Row => {
+    if (planCase.observations.length !== KR17.retained) violations.push(`${planCase.name}: ${planCase.observations.length} plan observations were retained, not ${KR17.retained}`);
+    planCase.observations.forEach((observation, index) => {
+      if (kr17Over(observation.totalMs, KR17.statementStopMs)) {
+        violations.push(
+          `${planCase.name} · plan observation ${index + 1} of ${planCase.observations.length}: planning ${kr17Ms(observation.planningMs)} ms + execution ` +
+          `${kr17Ms(observation.executionMs)} ms = ${kr17Ms(observation.totalMs)} ms against the ${KR17.statementStopMs} ms statement stop · plan ${JSON.stringify(observation.nodes)}`
+        );
+      }
+    });
+    const slowest = [...planCase.observations].sort((a, b) => b.totalMs - a.totalMs)[0];
+    return {
+      plan: planCase.name, parameters: planCase.parameters, statementStopMs: KR17.statementStopMs,
+      observationsMs: planCase.observations.map((observation) => ({
+        planning: kr17Ms(observation.planningMs), execution: kr17Ms(observation.executionMs), total: kr17Ms(observation.totalMs),
+      })),
+      maxTotalMs: slowest ? kr17Ms(slowest.totalMs) : null,
+      slowestObservationPlan: slowest ? slowest.nodes : null,
+    };
+  });
+  return { evidence, violations };
+}
+
+/** What the run was measured on. Printed with every evidence report; none of it is a secret or an id. */
+async function kr17Environment(): Promise<Row> {
+  const [server] = await query(
+    `select version() as version,
+            current_setting('shared_buffers') as shared_buffers, current_setting('work_mem') as work_mem,
+            current_setting('effective_cache_size') as effective_cache_size, current_setting('random_page_cost') as random_page_cost,
+            current_setting('max_parallel_workers_per_gather') as max_parallel_workers_per_gather, current_setting('jit') as jit,
+            pg_relation_size('items')::text as items_heap_bytes, pg_relation_size('slack_messages')::text as slack_messages_heap_bytes`
+  );
+  // The session settings the primitive finds and restores: those of an ordinary pooled connection.
+  const pooled = await tx((s) => s.executeSql<Row>(
+    `select current_setting('statement_timeout') as statement_timeout, current_setting('lock_timeout') as lock_timeout`
+  ));
+  return { server, originalSessionSettings: pooled.rows[0], node: process.version, platform: `${process.platform}/${process.arch}` };
+}
+
+const kr17Report = (title: string, evidence: Row): void => console.info(`[KR-17 evidence · ${title}]\n${JSON.stringify(evidence, null, 2)}`);
+
+const kr17Change = async (text: string, params: unknown[]): Promise<void> => {
+  const result = await (await rawSql()).query(text, params);
+  if (result.rowCount !== 1) throw new Error(`fixture: expected to change exactly one row, changed ${result.rowCount}`);
+};
+
+describe("KR-17 — the index premise of §7.5, read from the catalog (real Postgres)", () => {
+  // §7.5 rests on five statements about the schema. They are facts of the catalog, so they are read
+  // from it; a schema that has since gained one of the "absent" indexes has changed the premise of
+  // the fixture below, and that is for adjudication, not for this test to absorb.
+  it("has the three access paths §7.5 says the schema provides, and neither of the two it says are absent", async () => {
+    const indexes = await query<{ table_name: string; index_name: string; is_unique: boolean; columns: string[] }>(
+      `select c.relname::text as table_name, i.relname::text as index_name, x.indisunique as is_unique,
+              array(select a.attname::text
+                      from unnest(x.indkey::int2[]) with ordinality as k(attnum, position)
+                      join pg_attribute a on a.attrelid = x.indrelid and a.attnum = k.attnum
+                     order by k.position) as columns
+         from pg_index x
+         join pg_class i on i.oid = x.indexrelid
+         join pg_class c on c.oid = x.indrelid
+         join pg_namespace n on n.oid = c.relnamespace
+        where n.nspname = 'public' and c.relname in ('items', 'slack_messages')
+        order by 1, 2`
+    );
+    kr17Report("catalog", { indexes });
+    const on = (table: string) => indexes.filter((index) => index.table_name === table);
+    const leads = (columns: readonly string[], prefix: readonly string[]): boolean => prefix.every((column, position) => columns[position] === column);
+    const exactly = (columns: readonly string[], wanted: readonly string[]): boolean => columns.length === wanted.length && leads(columns, wanted);
+
+    // PROVIDED.
+    expect(on("items").some((index) => index.is_unique && exactly(index.columns, ["team_id", "id"])),
+      "items has a unique index on exactly (team_id, id): the enumeration's key range").toBe(true);
+    expect(on("slack_messages").some((index) => leads(index.columns, ["team_id", "item_id", "occurred_at"])),
+      "slack_messages has an index leading with (team_id, item_id, occurred_at): the per-item ledger lookup").toBe(true);
+    expect(on("slack_messages").some((index) => index.is_unique && exactly(index.columns, ["team_id", "workspace_id", "channel_id", "message_ts"])),
+      "slack_messages has a unique index on exactly (team_id, workspace_id, channel_id, message_ts): the root witness").toBe(true);
+
+    // NOT PROVIDED. Either of these changing is a changed premise, not a pass.
+    expect(on("items").filter((index) => leads(index.columns, ["team_id", "path"])).map((index) => index.index_name),
+      "PREMISE: no index leads with (team_id, path), so a cross-project path conflict check is not an indexed lookup").toEqual([]);
+    expect(on("slack_messages").filter((index) => index.columns.includes("root_ts")).map((index) => index.index_name),
+      "PREMISE: no index contains root_ts, so the second contradictory-ledger predicate is not an indexed lookup").toEqual([]);
+  });
+});
+
+describe("KR-17 — the §7.5 single-channel capacity fixture: plans and the numeric stop (real Postgres)", () => {
+  interface Capacity {
+    f: Published; teamId: string; realItemId: string; realPath: string; slackProjectId: string; capacityProjectId: string;
+    cardinalities: Row; statistics: string;
+  }
+  let loading: Omit<Capacity, "cardinalities" | "statistics"> & { frontmatter: string };
+  let capacity: Capacity;
+
+  // The fixture is built by the two hooks below, before each of the two cases: the global setup
+  // truncates every table before every test, so nothing built earlier survives to be shared.
+
+  // FIRST HALF: the one really published root, and the 100,000 non-Slack items.
+  beforeEach(async () => {
+    const f = await publishOldRoot();
+    const teamId = f.seed.teamId;
+    // FIXTURE CLOCK, as everywhere in this file: the published witness is aged so that it is due.
+    await ageObservation(teamId);
+    const [real] = await query<{ project_id: string; path: string; frontmatter: Record<string, unknown> }>(
+      `select project_id::text as project_id, path, frontmatter from items where team_id = $1 and id = $2`, [teamId, f.itemId]
+    );
+    expect(real.path, "fixture: the published root is at its canonical scoped path").toBe(scopedSlackItemPath(WORKSPACE, CHANNEL, OLD_ROOT));
+    const realItemId = f.itemId.toLowerCase();
+    expect(realItemId > KR17_ABOVE_EVERY_SYNTHETIC_ID,
+      "fixture: the published item's random id sorts after every synthetic id (a one-in-four-billion miss: run again)").toBe(true);
+
+    const [project] = await query<{ id: string }>(`insert into projects (team_id, slug) values ($1, 'kr17-capacity') returning id::text as id`, [teamId]);
+    // SYNTHETIC CAPACITY FIXTURE: 100,000 non-Slack items, by one set-based statement.
+    const inserted = await (await rawSql()).query(
+      `insert into items (id, team_id, project_id, path, kind, access, frontmatter, body, content_sha256, member_id, member_id_locked,
+                          created_at, work_at, work_at_from_source, synced_at, updated_at)
+       select ('00000000-0000-4000-8000-' || lpad(to_hex(n), 12, '0'))::uuid, $1::uuid, $2::uuid,
+              'kr17/capacity-' || lpad(n::text, 6, '0') || '.md', 'deliverable'::item_kind, 'team'::access_tier,
+              '{"source":"kr17-capacity","kr17_synthetic":true}'::jsonb, '', repeat('a', 64), null::uuid, false,
+              $3::timestamptz, $3::timestamptz, false, $3::timestamptz, $3::timestamptz
+         from generate_series(1, $4::int) as n`,
+      [teamId, project.id, KR17.observedAt, KR17.nonSlackItems]
+    );
+    expect(inserted.rowCount, "fixture: the non-Slack items were inserted").toBe(KR17.nonSlackItems);
+    loading = {
+      f, teamId, realItemId, realPath: real.path, slackProjectId: real.project_id, capacityProjectId: project.id,
+      frontmatter: JSON.stringify(real.frontmatter),
+    };
+  });
+
+  // SECOND HALF: 600 synthetic canonical roots in the SAME workspace and channel, the ledger of all
+  // 601 roots, exact readbacks, and statistics.
+  beforeEach(async () => {
+    const { teamId, realItemId, realPath, slackProjectId, capacityProjectId, frontmatter } = loading;
+    const raw = await rawSql();
+    const pathPrefix = realPath.slice(0, realPath.length - `${OLD_ROOT}.md`.length);
+    expect(`${pathPrefix}${OLD_ROOT}.md`, "fixture: the scoped path ends in the root timestamp").toBe(realPath);
+
+    // SYNTHETIC CAPACITY FIXTURE: 600 root items with the published item's own stored metadata and
+    // only the two root timestamps replaced. Same project, kind, access and scoped path shape.
+    const roots = await raw.query(
+      `insert into items (id, team_id, project_id, path, kind, access, frontmatter, body, content_sha256, member_id, member_id_locked,
+                          created_at, work_at, work_at_from_source, synced_at, updated_at)
+       select ('00000000-0000-4000-9000-' || lpad(to_hex(k), 12, '0'))::uuid, $1::uuid, $2::uuid,
+              $3::text || r.ts || '.md', 'transcript'::item_kind, 'team'::access_tier,
+              $4::jsonb || jsonb_build_object('ts', r.ts, 'thread_ts', r.ts, 'kr17_synthetic', true),
+              '', repeat('a', 64), null::uuid, false,
+              $5::timestamptz, $5::timestamptz, false, $5::timestamptz, $5::timestamptz
+         from generate_series(1, $6::int) as k
+        cross join lateral (select (1718000000 + k)::text || '.000100' as ts) r`,
+      [teamId, slackProjectId, pathPrefix, frontmatter, KR17.observedAt, KR17.syntheticRoots]
+    );
+    expect(roots.rowCount, "fixture: the synthetic roots were inserted").toBe(KR17.syntheticRoots);
+
+    // SYNTHETIC CAPACITY FIXTURE: the ledger. For each synthetic root, its witness (j = 0) and 100
+    // replies; for the published root, replies 2 to 100 — its witness and its first reply are the
+    // publication's own rows. Every tenth reply is deleted. All in the one workspace and channel.
+    const ledger = await raw.query(
+      `with roots as (
+         select ('00000000-0000-4000-9000-' || lpad(to_hex(k), 12, '0'))::uuid as item_id,
+                (1718000000 + k)::text || '.000100' as root_ts, 0 as first_j
+           from generate_series(1, $8::int) as k
+         union all
+         select $6::uuid, $7::text, 2
+       )
+       insert into slack_messages (id, team_id, item_id, workspace_id, channel_id, message_ts, root_ts, author_external_id,
+                                   occurred_at, is_root, eligible, exclusion_reason, deleted_at, last_seen_generation, source_hash, observed_at)
+       select md5('kr17:message:' || r.root_ts || ':' || j::text)::uuid, $1::uuid, r.item_id, $2::text, $3::text,
+              split_part(r.root_ts, '.', 1) || '.' || lpad((100 + j)::text, 6, '0'), r.root_ts, 'U1',
+              to_timestamp(split_part(r.root_ts, '.', 1)::bigint) + (100 + j) * interval '1 microsecond',
+              j = 0, true, null,
+              case when j > 0 and j % $10::int = 0 then $4::timestamptz end,
+              0, repeat('a', 64), $5::timestamptz
+         from roots r
+        cross join lateral generate_series(r.first_j, $9::int) as j`,
+      [teamId, WORKSPACE, CHANNEL, KR17.deletedAt, KR17.observedAt, realItemId, OLD_ROOT, KR17.syntheticRoots, KR17.repliesPerRoot, KR17.deletedReplyEvery]
+    );
+    expect(ledger.rowCount, "fixture: the ledger rows were inserted").toBe(KR17_LEDGER_ROWS - 2);
+
+    // EXACT READBACKS. The literals are the specification's numbers, not arithmetic on the constants.
+    expect({ roots: KR17_ROOTS, items: KR17_ITEMS, ledger: KR17_LEDGER_ROWS, pages: KR17_PAGES })
+      .toEqual({ roots: 601, items: 100_601, ledger: 60_701, pages: 1_007 });
+    const [items] = await query(
+      `select count(*)::int as items,
+              count(*) filter (where project_id = $2::uuid)::int as non_slack_items,
+              count(*) filter (where project_id = $3::uuid)::int as slack_project_items,
+              count(*) filter (where project_id = $3::uuid and kind = 'transcript' and access = 'team'
+                                 and frontmatter->>'source' = 'slack' and frontmatter->>'workspace_id' = $4 and frontmatter->>'channel_id' = $5
+                                 and frontmatter->>'ts' = frontmatter->>'thread_ts')::int as canonical_shaped_roots,
+              count(*) filter (where frontmatter->>'kr17_synthetic' = 'true')::int as labeled_synthetic
+         from items where team_id = $1`, [teamId, capacityProjectId, slackProjectId, WORKSPACE, CHANNEL]
+    );
+    expect(items, "fixture: item cardinalities").toEqual({
+      items: 100_601, non_slack_items: 100_000, slack_project_items: 601, canonical_shaped_roots: 601, labeled_synthetic: 100_600,
+    });
+    const [messages] = await query(
+      `select count(*)::int as ledger_rows,
+              count(distinct message_ts)::int as distinct_message_ts,
+              count(*) filter (where workspace_id = $2 and channel_id = $3)::int as in_the_one_channel,
+              count(distinct root_ts)::int as threads,
+              count(distinct item_id)::int as owning_items,
+              count(*) filter (where is_root)::int as root_rows,
+              count(*) filter (where is_root and deleted_at is null and isfinite(observed_at))::int as live_root_witnesses,
+              count(*) filter (where not is_root and deleted_at is null)::int as live_replies,
+              count(*) filter (where not is_root and deleted_at is not null)::int as deleted_replies
+         from slack_messages where team_id = $1`, [teamId, WORKSPACE, CHANNEL]
+    );
+    expect(messages, "fixture: ledger cardinalities, all in one exact workspace and channel").toEqual({
+      ledger_rows: 60_701, distinct_message_ts: 60_701, in_the_one_channel: 60_701, threads: 601, owning_items: 601,
+      root_rows: 601, live_root_witnesses: 601, live_replies: 54_090, deleted_replies: 6_010,
+    });
+    const [shape] = await query<{ threads: number }>(
+      `select count(*)::int as threads from (
+         select root_ts from slack_messages where team_id = $1
+          group by root_ts
+         having count(*) = 101 and count(distinct item_id) = 1
+            and count(*) filter (where is_root and message_ts = root_ts and deleted_at is null) = 1
+            and count(*) filter (where not is_root and deleted_at is null) = 90
+            and count(*) filter (where not is_root and deleted_at is not null) = 10
+       ) complete`, [teamId]
+    );
+    expect(shape.threads, "fixture: every root has its whole cohort — one live witness, 90 live and 10 deleted replies, one owning item").toBe(601);
+    // Each root item is bound to its own live witness, and sits at the path the real builder gives.
+    const bound = await query<{ ts: string; path: string }>(
+      `select i.frontmatter->>'ts' as ts, i.path
+         from items i
+         join slack_messages w on w.team_id = i.team_id and w.item_id = i.id and w.is_root and w.deleted_at is null
+                              and w.message_ts = i.frontmatter->>'ts' and w.root_ts = i.frontmatter->>'ts'
+        where i.team_id = $1 and i.project_id = $2::uuid
+        order by 1`, [teamId, slackProjectId]
+    );
+    expect(bound.length, "fixture: every root item has its own live witness").toBe(601);
+    expect(bound.filter((root) => root.path !== scopedSlackItemPath(WORKSPACE, CHANNEL, root.ts)).length,
+      "fixture: every root item is at its canonical scoped path").toBe(0);
+    expect(bound.map((root) => root.ts).sort(), "fixture: the 601 roots are exactly the expected ones")
+      .toEqual([...Array.from({ length: KR17.syntheticRoots }, (_unused, index) => kr17RootTs(index + 1)), OLD_ROOT].sort());
+    expect(await query(`select 1 from slack_sync_threads where team_id = $1`, [teamId]), "fixture: no pending work").toEqual([]);
+
+    // STATISTICS COLLECTION, the last step before anything is measured. ANALYZE only: no VACUUM, no
+    // planner setting, no index.
+    const analyzed = "items, slack_messages, slack_sync_threads, slack_sync_channels, slack_channel_migration_gates, slack_integration_bindings, integrations, projects";
+    await raw.query(`analyze ${analyzed}`);
+    capacity = {
+      f: loading.f, teamId, realItemId, realPath, slackProjectId, capacityProjectId,
+      cardinalities: { items, messages, threadsWithACompleteCohort: shape.threads, workspace: "one", channel: "one", reallyPublishedRoots: 1, syntheticRoots: KR17.syntheticRoots },
+      statistics: `ANALYZE ${analyzed} — after loading, before the first measured statement`,
+    };
+  });
+
+  type Located = Extract<SlackKnownRootEntry, { locator: unknown }>;
+  const isLocated = (entry: SlackKnownRootEntry): entry is Located => "locator" in entry;
+  const queuedRoots = async (teamId: string): Promise<unknown[]> =>
+    (await query(`select root_ts from slack_sync_threads where team_id = $1 order by root_ts`, [teamId])).map((row) => row.root_ts);
+
+  // ── ENUMERATION: page operations. Not evidence of preparation. ─────────────
+
+  it("PAGE ENUMERATION: reads all 100,601 items in exactly 1,007 page transactions of 100, every page operation at most 750 ms and every statement at most 200 ms", async () => {
+    const { teamId, f, realItemId } = capacity;
+    const request = { teamId, pageSize: KR17.pageSize, revisitAfterMs: REVISIT_AFTER_MS };
+    const pageOf = (cursor?: SlackKnownRootItemPage["nextCursor"]) =>
+      kr17Measured((session, execution) => readSlackKnownRootItemPage(session, cursor ? { ...request, cursor } : request, execution));
+
+    // The FIRST five ordinary executions of the first-page operation: nothing ran before them.
+    const firstPages: (Kr17Sample & { value: SlackKnownRootItemPage })[] = [];
+    for (let sample = 0; sample < KR17.retained; sample++) firstPages.push(await pageOf());
+    // THE TRAVERSAL: the fifth first page, then every continuation, each on its own transaction.
+    const traversal = [firstPages[KR17.retained - 1]];
+    for (let cursor = traversal[0].value.nextCursor; cursor !== null; ) {
+      if (traversal.length > KR17_PAGES + 10) throw new Error("fixture: the traversal did not end where the population does");
+      const next = await pageOf(cursor);
+      traversal.push(next);
+      cursor = next.value.nextCursor;
+    }
+
+    // ── what was traversed: exact pages, exact ids, exact classification ──
+    expect(traversal.length, "ceil(100,601 / 100) nonempty pages, one transaction each").toBe(1_007);
+    const examinedPerPage = traversal.map((page) => [page.value.examined, page.value.entries.length]);
+    expect(examinedPerPage.slice(0, -1).filter(([examined, entries]) => examined !== KR17.pageSize || entries !== KR17.pageSize).length,
+      "every page but the last examines exactly 100 items").toBe(0);
+    expect(examinedPerPage[examinedPerPage.length - 1], "the last page examines the one remaining item").toEqual([1, 1]);
+    expect(traversal.slice(0, -1).filter((page) => page.value.exhausted || page.value.nextCursor === null).length,
+      "every page but the last continues").toBe(0);
+    expect(traversal[traversal.length - 1].value, "the last page ends the key range").toMatchObject({ exhausted: true, nextCursor: null });
+
+    const examined = traversal.flatMap((page) => page.value.entries);
+    const stored = (await query<{ id: string }>(`select id::text as id from items where team_id = $1 order by id`, [teamId])).map((row) => row.id);
+    expect([examined.length, stored.length], "one entry per stored item").toEqual([100_601, 100_601]);
+    expect(examined.findIndex((entry, index) => entry.itemId !== stored[index]),
+      "the traversal returned exactly the stored ids, each once, in PostgreSQL's UUID order (index of the first difference)").toBe(-1);
+
+    const located = examined.filter(isLocated);
+    expect([located.length, examined.length - located.length], "601 located roots and 100,000 unlocated items").toEqual([601, 100_000]);
+    expect(examined.filter((entry) => !isLocated(entry) && entry.unlocated !== "not_slack").length, "every unlocated item is not_slack").toBe(0);
+    expect(located.filter(({ locator }) => locator.workspaceId !== WORKSPACE || locator.channelId !== CHANNEL ||
+      locator.integrationId !== f.integrationId || locator.namespaceRevision !== f.namespaceRevision).length,
+      "every root is located in the one exact workspace and channel, under the one binding and gate revision").toBe(0);
+    expect(located.map(({ locator }) => locator.rootTs).sort(), "the located roots are exactly the fixture's 601")
+      .toEqual([...Array.from({ length: KR17.syntheticRoots }, (_unused, index) => kr17RootTs(index + 1)), OLD_ROOT].sort());
+    expect(located[located.length - 1].itemId, "the really published root is the last item of the range").toBe(realItemId);
+    // Where the roots are: none in the first 1,000 pages, 100 in each of the next six, one in the last.
+    const locatedPerPage = traversal.map((page) => page.value.entries.filter(isLocated).length);
+    expect(locatedPerPage.slice(0, 1_000).filter((count) => count !== 0).length, "pages 1–1,000 hold only non-Slack items").toBe(0);
+    expect(locatedPerPage.slice(1_000), "pages 1,001–1,006 hold 100 located roots each; page 1,007 holds the published one")
+      .toEqual([100, 100, 100, 100, 100, 100, 1]);
+
+    // ── what was issued: the exact data statements of every page operation ──
+    expect(firstPages.map(kr17DataNames), "a first page issues exactly these data statements").toEqual(firstPages.map(() => KR17_FIRST_PAGE));
+    expect(traversal.slice(1).filter((page) => JSON.stringify(kr17DataNames(page)) !== JSON.stringify(KR17_NEXT_PAGE)).map(kr17DataNames).slice(0, 3),
+      "a continuation page issues exactly the continuation read and the locator read (first three that did not)").toEqual([]);
+    // Enumeration only reads.
+    expect(await queuedRoots(teamId), "enumeration created no pending work").toEqual([]);
+
+    // ── retained observations, plans, and the stop ──
+    const ordinary = [
+      kr17Ordinary("PAGE OPERATION · first page, 100 non-Slack items · five first-page requests", firstPages, KR17.retained, "every observation"),
+      kr17Ordinary("PAGE OPERATION · continuation, 100 non-Slack items · traversal pages 2–6", traversal.slice(1, 6), KR17.retained, "every observation"),
+      kr17Ordinary("PAGE OPERATION · continuation, 100 located roots · traversal pages 1,001–1,005", traversal.slice(1_000, 1_005), KR17.retained, "every observation"),
+      kr17Ordinary("PAGE OPERATION · every page of the traversal, pages 1–1,007", traversal, 1_007, "maximum only"),
+    ];
+    const plans = kr17Plans([
+      ...(await kr17PlanCases("first page, 100 non-Slack items", kr17Data(firstPages[0]))),
+      ...(await kr17PlanCases("continuation page 2, 100 non-Slack items", kr17Data(traversal[1]))),
+      ...(await kr17PlanCases("continuation page 1,001, after 100,000 ids, 100 located roots", kr17Data(traversal[1_000]))),
+    ]);
+    const traversalMs = traversal.reduce((total, page) => total + page.operationMs, 0);
+    kr17Report("page enumeration", {
+      environment: await kr17Environment(), statistics: capacity.statistics, fixture: capacity.cardinalities,
+      traversal: {
+        pageSize: KR17.pageSize, pageTransactions: traversal.length, additionalFirstPageTransactions: KR17.retained - 1,
+        itemsExamined: examined.length, sumOfPageOperationMs: kr17Ms(traversalMs),
+      },
+      ordinary: ordinary.map((result) => result.evidence), plans: plans.evidence,
+    });
+
+    const gaps = [...firstPages, ...traversal].flatMap((page) => kr17DataNames(page)).filter((name) => name.startsWith(KR17_UNNAMED));
+    expect([...new Set(gaps)], "EVIDENCE GAP: a data statement of the page read that this test could not name was not measured on trust").toEqual([]);
+    expect([...ordinary.flatMap((result) => result.violations), ...plans.violations],
+      "§7.5 NUMERIC STOP — PAGE ENUMERATION. Any entry is NOT READY pending schema-owner adjudication, not a test to adjust").toEqual([]);
+  });
+
+  // ── PREPARATION: preparation operations. Not evidence of enumeration. ──────
+
+  it("PREPARATION: prepares a root of the 601-root channel to its enqueue, and refuses each hit case, every preparation operation at most 750 ms and every statement at most 200 ms", async () => {
+    const { teamId, realItemId, realPath, capacityProjectId } = capacity;
+
+    // The two entries come from the real page reader. The key range is the one a real first page
+    // froze; only the position inside it is chosen, so that a page of one lands on the wanted root.
+    const range = (await tx((s) => readSlackKnownRootItemPage(
+      s, { teamId, pageSize: 1, revisitAfterMs: REVISIT_AFTER_MS }, createSlackKnownRootExecution({ ambientDeadlineAt: null })
+    ))).nextCursor;
+    if (range === null) throw new Error("fixture: a first page of one item has no continuation");
+    const entryAfter = async (afterItemId: string, itemId: string): Promise<Located> => {
+      const page = await tx((s) => readSlackKnownRootItemPage(
+        s, { teamId, pageSize: 1, revisitAfterMs: REVISIT_AFTER_MS, cursor: { ...range, afterItemId } }, createSlackKnownRootExecution({ ambientDeadlineAt: null })
+      ));
+      const [entry] = page.entries;
+      expect(entry?.itemId, "fixture: the page of one is the wanted root").toBe(itemId);
+      if (!entry || !isLocated(entry)) throw new Error("fixture: enumeration did not locate the root");
+      return entry;
+    };
+    const realEntry = await entryAfter(kr17RootItemId(KR17.syntheticRoots), realItemId);
+    const syntheticEntry = await entryAfter(kr17RootItemId(299), kr17RootItemId(300));
+    expect([realEntry.locator.rootTs, syntheticEntry.locator.rootTs]).toEqual([OLD_ROOT, kr17RootTs(300)]);
+
+    const prepared = (entry: SlackKnownRootEntry) =>
+      kr17Measured((session, execution) => prepareSlackKnownRootRequeue(session, { teamId, entry }, execution));
+    const ordinary: ReturnType<typeof kr17Ordinary>[] = [];
+    const planCases: Kr17PlanCase[] = [];
+    const everySample: Kr17Sample[] = [];
+
+    // ── the complete path, to the enqueue: NO-HIT scans of both ledger checks and both path checks ──
+    const enqueueCases: [label: string, entry: Located, rootTs: string][] = [
+      ["the REALLY PUBLISHED root (last in the channel's message order)", realEntry, OLD_ROOT],
+      ["SYNTHETIC capacity root 300 (mid-channel)", syntheticEntry, kr17RootTs(300)],
+    ];
+    for (const [label, entry, rootTs] of enqueueCases) {
+      const samples: (Kr17Sample & { value: SlackKnownRootPreparationResult })[] = [];
+      for (let sample = 0; sample < KR17.retained; sample++) {
+        // The queue is reset before every observation, so the early existing-row shortcut can never
+        // stand in for the full path.
+        expect(await queuedRoots(teamId), `${label}, observation ${sample + 1}: fixture: no pending work`).toEqual([]);
+        const observed = await prepared(entry);
+        expect(observed.value, `${label}, observation ${sample + 1}`).toEqual({ outcome: "enqueued" });
+        expect(kr17DataNames(observed), `${label}, observation ${sample + 1}: the complete preparation's data statements, in order`).toEqual(KR17_PREPARATION);
+        expect(await queuedRoots(teamId), `${label}, observation ${sample + 1}: exactly this root was enqueued`).toEqual([rootTs]);
+        await kr17Change(
+          `delete from slack_sync_threads where team_id = $1 and workspace_id = $2 and channel_id = $3 and root_ts = $4`, [teamId, WORKSPACE, CHANNEL, rootTs]
+        );
+        samples.push(observed);
+      }
+      everySample.push(...samples);
+      ordinary.push(kr17Ordinary(`PREPARATION OPERATION · complete path to the enqueue · ${label}`, samples, KR17.retained, "every observation"));
+      // Every statement of that complete preparation, the enqueue insert included, rollback-controlled.
+      planCases.push(...(await kr17PlanCases(`preparation to the enqueue, NO HIT, ${label}`, kr17Data(samples[0]))));
+      expect(await queuedRoots(teamId), `${label}: the plan observations' enqueue inserts were rolled back`).toEqual([]);
+    }
+
+    // ── the hit cases, each on the really published root, each arranged and removed by fixture DML ──
+    const SECOND_ITEM = "00000000-0000-4000-a000-000000000001";
+    const SCOPED_CONFLICT_ITEM = "00000000-0000-4000-a000-000000000002";
+    const LEGACY_CONFLICT_ITEM = "00000000-0000-4000-a000-000000000003";
+    const SECOND_REPLY_ROW = "00000000-0000-4000-b000-000000000001";
+    // A reply of the published root that is NOT the root's own timestamp, later than every message
+    // of the channel: an ordered scan of the channel meets it last.
+    const SECOND_REPLY_TS = "1718900000.000250";
+    const bareItem = (id: string, path: string): Promise<void> => kr17Change(
+      `insert into items (id, team_id, project_id, path, kind, access, frontmatter, body, content_sha256, member_id, member_id_locked)
+       values ($1::uuid, $2::uuid, $3::uuid, $4, 'deliverable', 'team', '{"kr17_synthetic":true}'::jsonb, '', repeat('a', 64), null, false)`,
+      [id, teamId, capacityProjectId, path]
+    );
+    const dropItem = (id: string): Promise<void> => kr17Change(`delete from items where team_id = $1 and id = $2::uuid`, [teamId, id]);
+    const secondItemReply = async (deleted: boolean): Promise<void> => {
+      await bareItem(SECOND_ITEM, "kr17/second-owner.md");
+      await kr17Change(
+        `insert into slack_messages (id, team_id, item_id, workspace_id, channel_id, message_ts, root_ts, author_external_id,
+                                     occurred_at, is_root, eligible, exclusion_reason, deleted_at, source_hash, observed_at)
+         values ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, 'U1',
+                 to_timestamp(split_part($6, '.', 1)::bigint) + split_part($6, '.', 2)::integer * interval '1 microsecond',
+                 false, true, null, case when $8::boolean then $9::timestamptz end, repeat('a', 64), $10::timestamptz)`,
+        [SECOND_REPLY_ROW, teamId, SECOND_ITEM, WORKSPACE, CHANNEL, SECOND_REPLY_TS, OLD_ROOT, deleted, KR17.deletedAt, KR17.observedAt]
+      );
+    };
+    const dropSecondItemReply = async (): Promise<void> => {
+      await kr17Change(`delete from slack_messages where team_id = $1 and id = $2::uuid`, [teamId, SECOND_REPLY_ROW]);
+      await dropItem(SECOND_ITEM);
+    };
+    const contradictory: SlackKnownRootPreparationResult = { outcome: "unattested", reason: "contradictory_ledger" };
+    const hits: { label: string; arrange: () => Promise<void>; undo: () => Promise<void>; expected: SlackKnownRootPreparationResult; last: string }[] = [
+      { label: "HIT: a second item owns a LIVE reply of the root", arrange: () => secondItemReply(false), undo: dropSecondItemReply,
+        expected: contradictory, last: "preparation: ledger contradictions" },
+      { label: "HIT: a second item owns a DELETED reply of the root", arrange: () => secondItemReply(true), undo: dropSecondItemReply,
+        expected: contradictory, last: "preparation: ledger contradictions" },
+      { label: "HIT: another project's item is at the root's SCOPED path", arrange: () => bareItem(SCOPED_CONFLICT_ITEM, realPath),
+        undo: () => dropItem(SCOPED_CONFLICT_ITEM), expected: { outcome: "refused", reason: "scoped_path_conflict" }, last: "preparation: path conflicts" },
+      // The legacy path of the root, WRITTEN OUT, as in the KR-03 group.
+      { label: "HIT: an item is at the root's LEGACY path", arrange: () => bareItem(LEGACY_CONFLICT_ITEM, `slack/c0known1170/${OLD_ROOT}.md`),
+        undo: () => dropItem(LEGACY_CONFLICT_ITEM), expected: { outcome: "refused", reason: "legacy_path_conflict" }, last: "preparation: path conflicts" },
+    ];
+    for (const hit of hits) {
+      await hit.arrange();
+      const expectedStatements = KR17_PREPARATION.slice(0, KR17_PREPARATION.indexOf(hit.last) + 1);
+      const samples: (Kr17Sample & { value: SlackKnownRootPreparationResult })[] = [];
+      for (let sample = 0; sample < KR17.retained; sample++) {
+        const observed = await prepared(realEntry);
+        expect(observed.value, `${hit.label}, observation ${sample + 1}`).toEqual(hit.expected);
+        expect(kr17DataNames(observed), `${hit.label}, observation ${sample + 1}: the preparation stops at the statement that hit`).toEqual(expectedStatements);
+        expect(await queuedRoots(teamId), `${hit.label}, observation ${sample + 1}: nothing was enqueued`).toEqual([]);
+        samples.push(observed);
+      }
+      everySample.push(...samples);
+      ordinary.push(kr17Ordinary(`PREPARATION OPERATION · ${hit.label}`, samples, KR17.retained, "every observation"));
+      planCases.push(...(await kr17PlanCases(hit.label, kr17Data(samples[0]).filter((statement) => statement.name === hit.last))));
+      await hit.undo();
+    }
+    // With every arranged hit removed, the very same entry prepares: the hits were what was refused.
+    expect((await prepared(realEntry)).value, "control: with the hit cases removed the published root prepares again").toEqual({ outcome: "enqueued" });
+
+    const plans = kr17Plans(planCases);
+    kr17Report("preparation", {
+      environment: await kr17Environment(), statistics: capacity.statistics, fixture: capacity.cardinalities,
+      ordinary: ordinary.map((result) => result.evidence), plans: plans.evidence,
+    });
+
+    // PLAN PREMISE, not the numeric stop: with no index containing root_ts, the second-item
+    // predicate's `root_ts = …` can only ever be a filter over scanned ledger rows.
+    const noHitScan = planCases.filter((planCase) => planCase.name.includes("NO HIT") && planCase.name.endsWith("preparation: ledger contradictions"))
+      .flatMap((planCase) => planCase.observations).flatMap((observation) => observation.nodes);
+    expect(noHitScan.some((node) => node["Relation Name"] === "slack_messages" && String(node.Filter ?? "").includes("root_ts = ")),
+      "PLAN PREMISE: the root_ts equality of the second contradictory-ledger predicate is a FILTER on a slack_messages scan").toBe(true);
+    expect(noHitScan.filter((node) => String(node["Index Cond"] ?? "").includes("root_ts")).length,
+      "PLAN PREMISE: root_ts is never an index condition").toBe(0);
+
+    const gaps = everySample.flatMap((sample) => kr17DataNames(sample)).filter((name) => name.startsWith(KR17_UNNAMED));
+    expect([...new Set(gaps)], "EVIDENCE GAP: a data statement of preparation that this test could not name was not measured on trust").toEqual([]);
+    expect([...ordinary.flatMap((result) => result.violations), ...plans.violations],
+      "§7.5 NUMERIC STOP — PREPARATION. Any entry is NOT READY pending schema-owner adjudication, not a test to adjust").toEqual([]);
   });
 });
