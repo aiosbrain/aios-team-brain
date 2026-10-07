@@ -134,6 +134,7 @@ describe("guard: the docs say NEO4J_URL is required for graph reads once GRAPHIT
     const setup = between(README, "**2.8c. Point the app at it.**", "**2.8d.");
     expect(setup).toContain("**`GRAPHITI_URL` alone is not enough — set `NEO4J_URL` with it.**");
     expect(setup).toMatch(/\*\*fail closed\*\*/);
+    expect(setup).toMatch(/direct `\/api\/v1\/graph-query` reads remain available\s+when `NEO4J_URL` is configured/);
     expect(ENV_EXAMPLE).toMatch(/^# NEO4J_URL is REQUIRED whenever GRAPHITI_URL is set/m);
     expect(ENV_EXAMPLE).toMatch(/FAIL CLOSED/);
   });
