@@ -4,6 +4,11 @@ import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { Hash, Check, X } from "lucide-react";
 import { linkMemberIdentity, unlinkMemberIdentity } from "@/app/t/[team]/admin/members/actions";
+import {
+  identityLinkRequest,
+  standingRemapOffer,
+  type IdentityRemapOffer,
+} from "@/components/admin/provider-identity-link-payload";
 
 /**
  * Inline admin control to map a member to ONE provider's user id (slack/linear/plane) — the manual
@@ -12,7 +17,9 @@ import { linkMemberIdentity, unlinkMemberIdentity } from "@/app/t/[team]/admin/m
  *
  * `externalId` + `revision` are what this row DISPLAYS. They are sent as the observation of that
  * identity only; the id typed into the box is a separate request, and the action observes it
- * itself. An id another member holds comes back as a remap offer, confirmed here explicitly.
+ * itself. An id another member holds comes back as a remap offer, confirmed here explicitly — except
+ * from a blank Google row, which the action refuses outright. What is sent, and which offer still
+ * stands, is decided in `provider-identity-link-payload` (pure, and tested there).
  */
 export function ProviderIdentityLink({
   teamSlug,
@@ -42,17 +49,15 @@ export function ProviderIdentityLink({
   const [error, setError] = useState<string | null>(null);
   // A remap the action reported and has not made: the requested id, who holds it, and the revision
   // it was shown at. Only an explicit confirmation sends that revision back.
-  const [remap, setRemap] = useState<{ externalId: string; revision: number; linkedTo: string } | null>(null);
+  const [remap, setRemap] = useState<IdentityRemapOffer | null>(null);
+  // Shown, and confirmable, only while the box still holds the id the offer named.
+  const offer = standingRemapOffer(remap, value);
 
   function submit(confirmRemap = false) {
     setError(null);
-    const requested = value.trim();
-    const confirmed = confirmRemap && remap && remap.externalId === requested ? { revision: remap.revision } : undefined;
+    const request = identityLinkRequest({ provider, externalId, revision }, value, remap, confirmRemap);
     startTransition(async () => {
-      const res = await linkMemberIdentity(teamSlug, memberId, provider, requested, handle ?? undefined, {
-        original: externalId ? { externalId, revision } : null,
-        ...(confirmed ? { remap: confirmed } : {}),
-      });
+      const res = await linkMemberIdentity(teamSlug, memberId, request.provider, request.externalId, handle ?? undefined, request.observed);
       if (res.remap) return setRemap(res.remap);
       setRemap(null);
       if (!res.ok) return setError(res.error ?? "could not link");
@@ -87,8 +92,9 @@ export function ProviderIdentityLink({
               value={value}
               onChange={(e) => {
                 // An offer is for the exact id it named; a different id is a different request.
-                setRemap(null);
-                setValue(e.target.value);
+                const requested = e.target.value;
+                setRemap((standing) => standingRemapOffer(standing, requested));
+                setValue(requested);
               }}
               onKeyDown={(e) => {
                 if (e.key === "Enter") submit();
@@ -128,10 +134,10 @@ export function ProviderIdentityLink({
           </>
         )}
       </div>
-      {editing && remap ? (
+      {editing && offer ? (
         <div className="flex items-center gap-1.5 pl-14 text-xs text-amber-600">
           <span>
-            <span className="font-mono">{remap.externalId}</span> is linked to {remap.linkedTo}. Remap it to this member?
+            <span className="font-mono">{offer.externalId}</span> is linked to {offer.linkedTo}. Remap it to this member?
           </span>
           <button onClick={() => submit(true)} disabled={pending} className="rounded border border-border-default px-1.5 py-0 text-xs text-ink-secondary hover:text-ink disabled:opacity-50">
             {pending ? "…" : "Remap"}
