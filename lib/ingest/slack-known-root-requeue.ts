@@ -1,3 +1,5 @@
+import "server-only";
+
 import { TransactionExecutionError } from "@/lib/db/pg/tx";
 import type { TransactionSession } from "@/lib/db/types";
 import {
@@ -13,6 +15,7 @@ import {
 import { lockReadySlackNamespaceGate } from "./slack-namespace-gate";
 import { lockSlackSelection } from "./slack-source-binding";
 import { enqueueSlackThread } from "./slack-thread-state";
+import { parseSlackTimestamp } from "./sources/slack-message-evidence";
 import { scopedSlackItemPath } from "./sources/slack-namespace";
 import { slackChannelPathPrefix } from "./sources/slack-normalize";
 
@@ -101,6 +104,20 @@ const refused = (reason: SlackKnownRootRefusedReason): SlackKnownRootPreparation
 const unattested = (reason: SlackKnownRootUnattestedReason): SlackKnownRootPreparationResult => ({ outcome: "unattested", reason });
 
 const PROVIDER_ID = /^[A-Za-z0-9]+$/;
+/** The same private bounds the item projection applies in SQL, restated for the values it returns. */
+const STORED_PROVIDER_ID_BYTES = 256;
+const STORED_TIMESTAMP_BYTES = 128;
+
+/** A stored provider id that is one: a non-empty ASCII alphanumeric string within its byte bound. */
+function isStoredProviderId(value: unknown): value is string {
+  return typeof value === "string" && PROVIDER_ID.test(value) && Buffer.byteLength(value, "utf8") <= STORED_PROVIDER_ID_BYTES;
+}
+
+/** A stored Slack timestamp the existing exact parser accepts, within its byte bound. Its bytes are kept. */
+function isStoredTimestamp(value: unknown): value is string {
+  return typeof value === "string" && Buffer.byteLength(value, "utf8") <= STORED_TIMESTAMP_BYTES && parseSlackTimestamp(value) !== null;
+}
+
 /** The internal publication project: the only project a canonical scoped Slack item lives in. */
 const SLACK_PROJECT_SLUG = "slack";
 const DUE_EPOCH_MS = /^-?(?:0|[1-9][0-9]*)$/;
@@ -160,11 +177,18 @@ const SLACK_PROJECT_SQL = `
    where team_id = $1::uuid and slug = $2`;
 
 // The live root witness (§5.3): this exact root message, in this exact scope, bound to this item,
-// not deleted, with a finite observation.
+// not deleted, with a finite observation — and one that can be an observation at all. A stored
+// instant before the Unix epoch was never written by a clock: the year 1, or a date before the
+// common era, is corrupt data. It is no witness, exactly as a non-finite one is none. Left in, its
+// due instant would be "overdue" by millennia and would sort ahead of every real root in a queue
+// that is claimed in due order. The check is made HERE, in the database and before anything is
+// derived, so no such value is ever added to, converted or handed to the enqueue helper, and no
+// error can come to quote it.
 const WITNESS_PREDICATE = `
        w.team_id = $1::uuid and w.workspace_id = $2 and w.channel_id = $3
    and w.message_ts = $4 and w.root_ts = $4 and w.is_root = true
-   and w.item_id = $5::uuid and w.deleted_at is null and isfinite(w.observed_at)`;
+   and w.item_id = $5::uuid and w.deleted_at is null and isfinite(w.observed_at)
+   and w.observed_at >= timestamptz '1970-01-01 00:00:00+00'`;
 
 const WITNESS_SQL = `
   select 1 as witnessed
@@ -233,7 +257,9 @@ function capturedInput(input: unknown): { teamId: string; entry: SlackKnownRootE
 function dueDate(value: unknown): Date {
   if (typeof value !== "string" || !DUE_EPOCH_MS.test(value)) return unexpected("a due instant is unreadable");
   const epochMs = Number(value);
-  if (!Number.isSafeInteger(epochMs) || Math.abs(epochMs) > MAX_DATE_MS) return unexpected("a due instant is not representable");
+  // The witness predicate admits no observation before the epoch, so a due instant is never
+  // negative; one that is did not come from an admitted witness and is not turned into a date.
+  if (!Number.isSafeInteger(epochMs) || epochMs < 0 || epochMs > MAX_DATE_MS) return unexpected("a due instant is not representable");
   const due = new Date(epochMs);
   return Number.isNaN(due.getTime()) ? unexpected("a due instant is not representable") : due;
 }
@@ -317,9 +343,21 @@ async function prepareLocated(
   const projects = await decorated.executeSql<{ id: unknown }>(SLACK_PROJECT_SQL, [teamId, SLACK_PROJECT_SLUG]);
   if (projects.rows.length > 1) return unexpected("a team has more than one project of one slug");
   const slackProjectId = projects.rows.length === 1 ? projects.rows[0].id : null;
+  // An item that is no longer marked as Slack's is simply not this root's item.
+  if (item.source !== "slack") return unattested("canonical_mismatch");
+  // The four stored locator fields are judged for what they ARE before they are compared. The
+  // projection returned NULL for a value that is missing, of another JSON type, or past its byte
+  // bound; a string that is not a provider id, or that the exact parser refuses as a timestamp, is
+  // malformed as well. None of those is a different identity — it is no identity — and the item's
+  // stored metadata is unusable: `invalid_metadata`. A well-formed value that merely differs from
+  // the locator, by a single byte or by case, falls through to the comparison below.
+  if (!isStoredProviderId(item.workspace_id) || !isStoredProviderId(item.channel_id) ||
+      !isStoredTimestamp(item.ts) || !isStoredTimestamp(item.thread_ts)) {
+    return unattested("invalid_metadata");
+  }
   if (typeof slackProjectId !== "string" || item.project_id !== slackProjectId ||
       item.kind !== "transcript" || item.access !== "team" || item.path !== scopedPath ||
-      item.source !== "slack" || item.workspace_id !== workspaceId || item.channel_id !== channelId ||
+      item.workspace_id !== workspaceId || item.channel_id !== channelId ||
       item.ts !== rootTs || item.thread_ts !== rootTs) {
     return unattested("canonical_mismatch");
   }

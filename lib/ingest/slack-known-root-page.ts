@@ -1,3 +1,5 @@
+import "server-only";
+
 import type { SqlExecutor, TransactionSession } from "@/lib/db/types";
 import { parseSlackTimestamp } from "./sources/slack-message-evidence";
 
@@ -249,13 +251,20 @@ export function createSlackKnownRootExecution(options: SlackKnownRootExecutionOp
  * clock that throws or misreports. A context that is out of time is refused with the slice's
  * deadline error. Nothing here touches a session, so a caller checks admission BEFORE its first
  * statement and no statement is issued for a context that fails it.
+ *
+ * The result is never more than the context's own allowance. The deadline itself is exact and is
+ * not moved; but the time that "remains" is the deadline minus a clock reading, and a clock that
+ * reads EARLIER than it did when the context was created would otherwise report more time than was
+ * ever declared — and that number becomes a server-side statement timeout. A context grants its
+ * allowance at most, whatever its clock says later. With a clock that only moves forward the cap
+ * changes nothing.
  */
 export function admitSlackKnownRootExecution(execution: unknown): number {
   if (typeof execution !== "object" || execution === null || !issuedExecutions.has(execution)) return invalidRequest();
   const context = execution as SlackKnownRootExecution;
   const remainingMs = Math.floor(context.deadlineAt - readMonotonicClock(context.monotonicNow));
   if (!(remainingMs >= 1)) throw new SlackKnownRootDeadlineError();
-  return Math.min(remainingMs, MAX_TIMEOUT_MS);
+  return Math.min(remainingMs, context.allowanceMs, MAX_TIMEOUT_MS);
 }
 
 // ── validation and capture (§6) ──────────────────────────────────────────────
