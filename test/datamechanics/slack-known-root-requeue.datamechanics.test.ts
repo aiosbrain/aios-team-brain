@@ -4127,3 +4127,334 @@ describe("KR-07 finite upper observation bounds", () => {
     await nothingMoved(f, observedAt, false, before, label);
   });
 });
+
+/**
+ * KR-06 — a pending row that ALREADY EXISTS when preparation reads the queue is left exactly as it is
+ * (`docs/design/slack-known-root-requeue-spec.md` §5.2, §10, §11 KR-06, and KR-13 as scoped below).
+ *
+ * EVIDENCE, NOT RED: every case here is expected to pass on the current source.
+ *
+ * SIX STATES, each established on its own freshly published root through the existing thread-state
+ * helpers — enqueue, claim, release, checkpoint, snapshot write — and each made recognizable, so that
+ * no freshly inserted row could be mistaken for it:
+ *
+ *   queued              never claimed, at a written-out due instant
+ *   backed off          claimed once and released with an error code, due at a written-out future instant
+ *   running             claimed twice, live lease, with a checkpointed cursor and snapshot generation
+ *   expired lease       claimed, and its lease then expired
+ *   partial snapshot    claimed, an incomplete staged snapshot, a checkpointed cursor
+ *   complete snapshot   claimed, a complete staged snapshot, checkpointed with no cursor
+ *
+ * The ONLY fixture DML on the queue is in the expired-lease case and is labeled there: no helper
+ * moves a lease's expiry into the past. The stored observation is aged as everywhere in this file,
+ * so that the root is otherwise due and nothing but the existing row stands between preparation and
+ * an insertion.
+ *
+ * WHAT IS REQUIRED. Preparation, from the team and the real enumerated entry, commits
+ * `already_pending`. Its data statements end at the plain queue read, which returned the one row:
+ * the item is never locked. Every column of the queue row and of the staged snapshot, as the
+ * database renders the whole row, is identical before and after — attempts, due and lease instants,
+ * owner, generations and cursor included. And no row of the team differs in any snapshotted table.
+ *
+ * TWO SNAPSHOTS, KEPT APART. What the FIXTURE changed is asserted on its own: between the aged
+ * publication and the established state, only the queue table differs, and the staging table in the
+ * two snapshot cases. What the PREPARATION changed is asserted separately: nothing.
+ *
+ * SCOPED KR-13. The snapshot here covers the surfaces a preparation is forbidden to touch — item and
+ * versions, ledger, identity, access, generations, channel and source authority, budgets and runs,
+ * queue and staging — for these six early returns. It is not the whole of KR-13: it does not cover
+ * the outcomes that are not `already_pending`, the audit log, or tables that are not listed.
+ *
+ * THIS DOES NOT REPLACE THE M4 EVIDENCE. Here the row exists BEFORE the queue read, and the result
+ * comes from the early return. The conflict-do-nothing branch — a row committed AFTER the queue read
+ * — is the suite "KR-06 — a queue row committed between the plain queue read and the enqueue is left
+ * exactly as committed" above, with its controlled M4 run. Neither stands in for the other, and no
+ * mutant is claimed to be killed by this suite.
+ */
+describe("KR-06 existing queue state preservation", () => {
+  const QUEUE_READ = "preparation: plain queue read";
+  const FIRST_DUE = new Date("2024-03-05T06:07:08.901Z");
+  const FIRST_DUE_UTC = "2024-03-05 06:07:08.901000+00";
+  const RETRY_DUE = new Date("2024-04-05T06:07:08.902Z");
+  const RETRY_DUE_UTC = "2024-04-05 06:07:08.902000+00";
+  const BACKED_OFF_DUE = new Date("2031-02-03T04:05:06.789Z");
+  const BACKED_OFF_DUE_UTC = "2031-02-03 04:05:06.789000+00";
+  const RUNNING_CURSOR = "kr06-running-page-3";
+  const PARTIAL_CURSOR = "kr06-partial-page-2";
+
+  type Scope = { teamId: string; workspaceId: string; channelId: string; rootTs: string };
+  const QUEUE_SCOPE = `team_id = $1 and workspace_id = $2 and channel_id = $3 and root_ts = $4`;
+  const scopeParams = (teamId: string): unknown[] => [teamId, WORKSPACE, CHANNEL, OLD_ROOT];
+
+  /**
+   * The surfaces a preparation must not touch, by what they are. Every one of these tables has a
+   * `team_id`, and every row of the team is rendered whole by the database. Not the whole of KR-13.
+   */
+  const SNAPSHOT_TABLES = [
+    // queue and staging
+    "slack_sync_threads", "slack_thread_snapshots",
+    // item (its versions are added below, through the item), and the ledger
+    "items", "slack_messages",
+    // identity
+    "members", "member_identities", "member_identity_suppressions",
+    // access
+    "projects", "groups", "group_members", "project_groups", "project_context_units", "project_context_memberships",
+    // generations
+    "slack_team_state",
+    // channel and source authority
+    "slack_sync_channels", "slack_integration_bindings", "slack_channel_migration_gates", "slack_namespace_readiness_proofs",
+    "integrations", "slack_workspace_observations",
+    // budgets and runs
+    "slack_method_budgets", "ingest_runs", "connector_cursors",
+  ];
+  async function snapshot(teamId: string): Promise<Record<string, string>> {
+    const scoped = (await query(
+      `select table_name from information_schema.columns
+        where table_schema = 'public' and column_name = 'team_id' and table_name = any($1::text[])
+        order by table_name`, [SNAPSHOT_TABLES]
+    )).map((row) => row.table_name as string).sort();
+    expect(scoped, "fixture: every named surface is snapshotted").toEqual([...SNAPSHOT_TABLES].sort());
+    const out: Record<string, string> = {};
+    for (const table of scoped) {
+      const [aggregate] = await query(
+        `select coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text), '[]'::jsonb)::text as rows from "${table}" t where t.team_id = $1`, [teamId]
+      );
+      out[table] = aggregate.rows as string;
+    }
+    const [versions] = await query(
+      `select coalesce(jsonb_agg(to_jsonb(v) order by to_jsonb(v)::text), '[]'::jsonb)::text as rows
+         from item_versions v join items i on i.id = v.item_id where i.team_id = $1`, [teamId]
+    );
+    out.item_versions = versions.rows as string;
+    return out;
+  }
+  const tablesThatDiffer = (from: Record<string, string>, to: Record<string, string>): string[] =>
+    Object.keys(from).filter((table) => from[table] !== to[table]).sort();
+
+  /** EVERY column of every row of the team in one table, as the database renders the whole row. */
+  const rowsExactly = async (table: "slack_sync_threads" | "slack_thread_snapshots", teamId: string): Promise<string[]> =>
+    (await query(`select to_jsonb(t)::text as stored from "${table}" t where t.team_id = $1 order by t.root_ts`, [teamId])).map((row) => row.stored as string);
+
+  /** The queue row's recognizable facts, for the fixture's readback against literals. */
+  const queueFacts = (teamId: string): Promise<Row[]> => query(
+    `select status, attempts, lease_generation::text as lease_generation, snapshot_generation::text as snapshot_generation,
+            page_cursor, last_error_code, checkpointed_at is not null as checkpointed,
+            to_char(due_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00' as due_at_utc,
+            due_at > clock_timestamp() as due_in_the_future,
+            case when lease_owner is null and lease_expires_at is null then 'none'
+                 when lease_owner is not null and lease_expires_at > clock_timestamp() then 'live'
+                 when lease_owner is not null and lease_expires_at <= clock_timestamp() then 'expired'
+                 else 'INCONSISTENT' end as lease
+       from slack_sync_threads where ${QUEUE_SCOPE}`, scopeParams(teamId)
+  );
+  /** The staged snapshot's recognizable facts. */
+  const stagingFacts = (teamId: string): Promise<Row[]> => query(
+    `select snapshot_generation::text as snapshot_generation, complete, jsonb_array_length(messages) as messages,
+            stored_bytes > 0 as has_bytes, expires_at > clock_timestamp() as live
+       from slack_thread_snapshots where ${QUEUE_SCOPE}`, scopeParams(teamId)
+  );
+
+  /** A claim that must succeed. */
+  async function claimed(session: TransactionSession, scope: Scope): Promise<SlackThreadClaim> {
+    const claim = await claimSlackThread(session, scope, { leaseMs: 900_000 });
+    if (!claim) throw new Error("fixture: the claim was refused");
+    return claim;
+  }
+  /** A staged snapshot and its checkpoint, in the claim's own transaction, as a hydrator leaves them. */
+  async function staged(session: TransactionSession, claim: SlackThreadClaim, messages: readonly SlackMessage[], complete: boolean, pageCursor: string | null): Promise<void> {
+    const written = await writeSlackThreadSnapshot(session, claim, {
+      messages: [...messages], complete, expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+    });
+    if (written !== "written") throw new Error("fixture: the snapshot was refused");
+    const checkpointed = await checkpointSlackThread(session, claim, { pageCursor, snapshotGeneration: 1 });
+    if (checkpointed.outcome !== "checkpointed") throw new Error("fixture: the checkpoint was refused");
+  }
+
+  interface State {
+    label: string;
+    /** Establishes the state, committed, through the existing helpers. */
+    establish: (scope: Scope) => Promise<void>;
+    /** The queue row's facts, WRITTEN OUT. */
+    queue: Row;
+    /** The staged snapshot's facts, WRITTEN OUT; empty when the state has none. */
+    staging: Row[];
+  }
+
+  /** One state: established, read back, and then shown untouched by a committed preparation that returns already_pending. */
+  async function preserved(state: State): Promise<void> {
+    const { label } = state;
+    const f = await publishOldRoot();
+    const teamId = f.seed.teamId;
+    const scope: Scope = { teamId, workspaceId: WORKSPACE, channelId: CHANNEL, rootTs: OLD_ROOT };
+    const afterPublication = await stored(teamId);
+    expect([afterPublication.allQueue, afterPublication.snapshots], `${label}: fixture: the real publication removed the queue row and the staging`).toEqual([[], 0]);
+
+    // FIXTURE CLOCK: the root is otherwise due, so only the existing row keeps preparation from inserting.
+    await ageObservation(teamId);
+    expect(await query(
+      `select w.observed_at + interval '60 seconds' <= clock_timestamp() as otherwise_due
+         from slack_messages w where w.team_id = $1 and w.message_ts = $2 and w.root_ts = $2 and w.is_root and w.deleted_at is null`, [teamId, OLD_ROOT]
+    ), `${label}: fixture: the root's own due instant is past`).toEqual([{ otherwise_due: true }]);
+    const aged = await snapshot(teamId);
+
+    // ── THE FIXTURE'S CHANGE: the state, established and committed, and read back against literals. ──
+    await state.establish(scope);
+    expect(await queueFacts(teamId), `${label}: fixture: the established queue row`).toEqual([state.queue]);
+    expect(await stagingFacts(teamId), `${label}: fixture: the established staging`).toEqual(state.staging);
+    const established = await snapshot(teamId);
+    expect(tablesThatDiffer(aged, established), `${label}: fixture: establishing the state changed the queue${state.staging.length > 0 ? " and the staging" : ""}, and nothing else`)
+      .toEqual(state.staging.length > 0 ? ["slack_sync_threads", "slack_thread_snapshots"] : ["slack_sync_threads"]);
+    // Retained whole: every column of the queue row and of the staged snapshot.
+    const queueBefore = await rowsExactly("slack_sync_threads", teamId);
+    const stagingBefore = await rowsExactly("slack_thread_snapshots", teamId);
+    expect([queueBefore.length, stagingBefore.length], `${label}: fixture: one queue row, and the staging the state has`).toEqual([1, state.staging.length]);
+
+    // The real enumeration: this root, located. The existing queue row does not change what is enumerated.
+    const channel = await channelRow(teamId, WORKSPACE, CHANNEL);
+    expect(channel?.binding_config_revision, `${label}: fixture: the channel row stores a configuration revision`).toMatch(/^[0-9a-f]{64}$/);
+    const page = await enumerate(teamId);
+    expect(page, `${label}: fixture: enumeration returns exactly this root, located`).toEqual({
+      entries: [{
+        teamId, itemId: f.itemId, revisitAfterMs: REVISIT_AFTER_MS,
+        locator: {
+          workspaceId: WORKSPACE, channelId: CHANNEL, rootTs: OLD_ROOT, integrationId: f.integrationId,
+          bindingConfigRevision: channel?.binding_config_revision, namespaceRevision: f.namespaceRevision,
+        },
+      }],
+      nextCursor: null, exhausted: true, examined: 1,
+    });
+    const entry = page.entries[0];
+    expect(await snapshot(teamId), `${label}: fixture: enumeration changed nothing`).toEqual(established);
+
+    // ── THE PREPARATION, on its own transaction, from the team and the enumerated entry alone. Its
+    //    statements are forwarded unchanged and written down by name with their row counts. ──
+    const issued: { name: string; rows: number }[] = [];
+    const recording = (session: TransactionSession): TransactionSession => {
+      const executeSql: SqlExecutor = async <T = Record<string, unknown>>(text: string, params?: unknown[]) => {
+        const result = await session.executeSql<T>(text, params);
+        const named = kr17Named(text);
+        if (named.kind === "data") issued.push({ name: named.name, rows: result.rows.length });
+        return result;
+      };
+      return {
+        get db() {
+          return session.db;
+        },
+        executeSql,
+        optionalAudit<T>(operation: () => Promise<T>, fallback: T): Promise<T> {
+          return session.optionalAudit(operation, fallback);
+        },
+      };
+    };
+    // The execution context is created BEFORE the transaction it is used in.
+    const execution = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+    const result = await tx((s) => prepareSlackKnownRootRequeue(recording(s), { teamId, entry }, execution));
+
+    expect(result, `${label}: the committed outcome`).toEqual({ outcome: "already_pending" });
+    // The EARLY return: the statements end at the plain queue read, which found the one row. The item
+    // was never locked and the enqueue was never reached.
+    expect(issued, `${label}: the preparation ends at the plain queue read, which returned the existing row`).toEqual([
+      ...KR17_PREPARATION.slice(0, KR17_PREPARATION.indexOf(QUEUE_READ)).map((name) => ({ name, rows: 1 })),
+      { name: QUEUE_READ, rows: 1 },
+    ]);
+
+    // ── THE PREPARATION'S CHANGE: none. ──
+    expect(await rowsExactly("slack_sync_threads", teamId), `${label}: every column of the queue row is byte-identical`).toEqual(queueBefore);
+    expect(await rowsExactly("slack_thread_snapshots", teamId), `${label}: every column of the staged snapshot is byte-identical`).toEqual(stagingBefore);
+    expect(await snapshot(teamId), `${label}: no row of any snapshotted surface was changed by the preparation`).toEqual(established);
+    expect(await query(`select team_id::text as team_id, root_ts from slack_sync_threads`), `${label}: the only queue row in the database is the established one`).toEqual([
+      { team_id: teamId, root_ts: OLD_ROOT },
+    ]);
+  }
+
+  it("returns already_pending and leaves a queued row that was never claimed byte-identical (queued)", () => preserved({
+    label: "queued",
+    establish: async (scope) => {
+      const enqueued = await tx((c) => enqueueSlackThread(c, scope, { dueAt: FIRST_DUE }));
+      if (!enqueued.inserted) throw new Error("fixture: the enqueue did not insert");
+    },
+    queue: {
+      status: "queued", attempts: 0, lease_generation: "0", snapshot_generation: "0", page_cursor: null, last_error_code: null,
+      checkpointed: false, due_at_utc: FIRST_DUE_UTC, due_in_the_future: false, lease: "none",
+    },
+    staging: [],
+  }));
+
+  it("returns already_pending and leaves a row released for a later retry byte-identical (backed off)", () => preserved({
+    label: "backed off",
+    establish: (scope) => tx(async (c) => {
+      await enqueueSlackThread(c, scope, { dueAt: FIRST_DUE });
+      const released = await releaseSlackThreadForRetry(c, await claimed(c, scope), { nextDueAt: BACKED_OFF_DUE, errorCode: "rate_limited" });
+      if (released.outcome !== "released") throw new Error("fixture: the release was refused");
+    }),
+    queue: {
+      status: "queued", attempts: 1, lease_generation: "1", snapshot_generation: "0", page_cursor: null, last_error_code: "rate_limited",
+      checkpointed: false, due_at_utc: BACKED_OFF_DUE_UTC, due_in_the_future: true, lease: "none",
+    },
+    staging: [],
+  }));
+
+  it("returns already_pending and leaves a twice-claimed row with a live lease and a checkpointed cursor byte-identical (running)", () => preserved({
+    label: "running",
+    establish: (scope) => tx(async (c) => {
+      await enqueueSlackThread(c, scope, { dueAt: FIRST_DUE });
+      const released = await releaseSlackThreadForRetry(c, await claimed(c, scope), { nextDueAt: RETRY_DUE, errorCode: "slack_timeout" });
+      if (released.outcome !== "released") throw new Error("fixture: the release was refused");
+      const checkpointed = await checkpointSlackThread(c, await claimed(c, scope), { pageCursor: RUNNING_CURSOR, snapshotGeneration: 2 });
+      if (checkpointed.outcome !== "checkpointed") throw new Error("fixture: the checkpoint was refused");
+    }),
+    queue: {
+      status: "running", attempts: 2, lease_generation: "2", snapshot_generation: "2", page_cursor: RUNNING_CURSOR, last_error_code: "slack_timeout",
+      checkpointed: true, due_at_utc: RETRY_DUE_UTC, due_in_the_future: false, lease: "live",
+    },
+    staging: [],
+  }));
+
+  it("returns already_pending and leaves a claimed row whose lease has expired byte-identical (expired lease)", () => preserved({
+    label: "expired lease",
+    establish: async (scope) => {
+      await tx(async (c) => {
+        await enqueueSlackThread(c, scope, { dueAt: FIRST_DUE });
+        await claimed(c, scope);
+      });
+      // FIXTURE DML, the only one on the queue in this suite: no helper moves a lease's expiry into
+      // the past. It changes that one column of the one claimed row, and must change exactly one row.
+      const expired = await (await rawSql()).query(
+        `update slack_sync_threads set lease_expires_at = clock_timestamp() - interval '1 hour' where ${QUEUE_SCOPE} and status = 'running'`,
+        [scope.teamId, scope.workspaceId, scope.channelId, scope.rootTs]
+      );
+      if (expired.rowCount !== 1) throw new Error(`fixture: expected to expire exactly one lease, changed ${expired.rowCount}`);
+    },
+    queue: {
+      status: "running", attempts: 1, lease_generation: "1", snapshot_generation: "0", page_cursor: null, last_error_code: null,
+      checkpointed: false, due_at_utc: FIRST_DUE_UTC, due_in_the_future: false, lease: "expired",
+    },
+    staging: [],
+  }));
+
+  it("returns already_pending and leaves a claimed row with an incomplete staged snapshot, and that snapshot, byte-identical (partial snapshot)", () => preserved({
+    label: "partial snapshot",
+    establish: (scope) => tx(async (c) => {
+      await enqueueSlackThread(c, scope, { dueAt: FIRST_DUE });
+      await staged(c, await claimed(c, scope), [ROOT_MESSAGE], false, PARTIAL_CURSOR);
+    }),
+    queue: {
+      status: "running", attempts: 1, lease_generation: "1", snapshot_generation: "1", page_cursor: PARTIAL_CURSOR, last_error_code: null,
+      checkpointed: true, due_at_utc: FIRST_DUE_UTC, due_in_the_future: false, lease: "live",
+    },
+    staging: [{ snapshot_generation: "1", complete: false, messages: 1, has_bytes: true, live: true }],
+  }));
+
+  it("returns already_pending and leaves a claimed row with a complete staged snapshot, and that snapshot, byte-identical (complete snapshot)", () => preserved({
+    label: "complete snapshot",
+    establish: (scope) => tx(async (c) => {
+      await enqueueSlackThread(c, scope, { dueAt: FIRST_DUE });
+      await staged(c, await claimed(c, scope), [ROOT_MESSAGE, REPLY_MESSAGE], true, null);
+    }),
+    queue: {
+      status: "running", attempts: 1, lease_generation: "1", snapshot_generation: "1", page_cursor: null, last_error_code: null,
+      checkpointed: true, due_at_utc: FIRST_DUE_UTC, due_in_the_future: false, lease: "live",
+    },
+    staging: [{ snapshot_generation: "1", complete: true, messages: 2, has_bytes: true, live: true }],
+  }));
+});

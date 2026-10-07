@@ -23,6 +23,7 @@ import {
   type SlackKnownRootPreparationResult,
   type SlackKnownRootReceipt,
 } from "@/lib/ingest/slack-known-root-requeue";
+import { slackConfigRevision, slackTokenFingerprint } from "@/lib/ingest/slack-source-binding";
 
 /**
  * The decorated session is handed only to the packet's own dependencies, so the one way to hold it is
@@ -1303,5 +1304,257 @@ describe("known-root page tally — one contribution per page slot", () => {
     receipts.push(committed(0, { outcome: "refused", reason: "binding_changed" }));
     expect(JSON.stringify(tally)).toBe(before);
     expect(tally).toMatchObject({ examined: 2, enqueued: 1, not_attempted: 1 });
+  });
+});
+
+// ── §5.5: what preparation does with the due read's OUTPUT ───────────────────
+
+/**
+ * KR-07 in part — the conversion of the due read's output into the instant handed to the enqueue
+ * (`docs/design/slack-known-root-requeue-spec.md` §5.5).
+ *
+ * EVIDENCE, NOT RED: every case here is expected to pass on the current source.
+ *
+ * SYNTHETIC, DEFENSIVE, UNIT-LEVEL. The due read's answer is scripted: these cases say what the
+ * preparer does with an answer of a given shape, whatever produced it. The two maximum-date cases
+ * are adapter-output evidence — the largest instant a JavaScript Date can hold, and the one before
+ * it — and say NOTHING about what PostgreSQL can store, compute or schedule. No real database is
+ * involved, and none of this is calendar evidence.
+ *
+ * ONLY THE DUE ANSWER VARIES. The exported preparer runs against a scripted executor that answers
+ * every earlier read of a preparation validly — the gate, the integration, the binding, the channel,
+ * the absent queue row, the canonical item, its project, the witness, the two contradiction checks
+ * and the two path checks — through the REAL dependencies, which are not replaced. Every case first
+ * shows that the due read was reached, once, by exactly that sequence. The enqueue is the real
+ * helper as well: what it was handed is read off the parameters of the insert it sends.
+ *
+ * THE DATE OBSERVER. For "rejected BEFORE a Date was constructed" a unit-only observer stands in for
+ * the global `Date` constructor. It is armed by the scripted executor at the moment the due answer
+ * is returned and disarmed in a `finally` as soon as the preparation settles; everything in between
+ * runs on microtasks, so nothing else can construct a Date inside the window. The fixture is built
+ * before it is armed and every assertion is made after it is disarmed. It forwards every
+ * construction unchanged and only writes down the arguments. The valid cases show the observer does
+ * see a construction, so that seeing none means something.
+ *
+ * Nothing here restates the conversion: no pattern, no bound and no arithmetic of the parser is
+ * copied. Each case states an input and the exported behavior it must produce.
+ */
+describe("known-root due-output conversion contract", () => {
+  const WORKSPACE = "T0SOURCE1";
+  const CHANNEL = "C0KNOWN1";
+  const ROOT = "1718900000.000100";
+  const PROJECT = "0d000000-0000-4000-8000-00000000000d";
+  /** The canonical scoped path of the fixture root, WRITTEN OUT, not built by the code under test. */
+  const SCOPED_PATH = "slack/t0source1/c0known1/1718900000.000100.md";
+  const TOKEN = "xoxb-synthetic-due-conversion";
+  const UPDATED_AT = "2026-01-02T03:04:05.000006Z";
+  // FIXTURE AUTHORITY, built with the source binding's own pure helpers so that the real selection
+  // lock finds the configuration the entry names. Neither helper is part of what is under test here.
+  const CONFIG_REVISION = slackConfigRevision({ updatedAt: UPDATED_AT, status: "enabled", type: "slack", channelIds: [CHANNEL] });
+  const FINGERPRINT = slackTokenFingerprint(TOKEN);
+  const ENTRY = located({ locator: { ...located().locator, bindingConfigRevision: CONFIG_REVISION } });
+
+  /** Every data statement of a preparation that reaches the due read, in the specification's order. */
+  const TO_THE_DUE_READ = [
+    "namespace gate lock", "integration selection lock", "binding row lock", "scoped channel row lock", "plain queue read",
+    "item lock", "slack project read", "root witness", "ledger contradictions", "path conflicts", "due read",
+  ];
+
+  const RealDate = Date;
+  afterEach(() => {
+    // Belt and braces: every case disarms its own observer in a `finally`.
+    globalThis.Date = RealDate;
+    vi.unstubAllEnvs();
+  });
+
+  /** The unit-only stand-in for the global Date constructor: forwards unchanged, and writes down the arguments. */
+  function dateObserver() {
+    const constructedWith: unknown[][] = [];
+    const Observed = new Proxy(RealDate, {
+      construct(target, args: unknown[], newTarget) {
+        constructedWith.push([...args]);
+        return Reflect.construct(target, args, newTarget) as object;
+      },
+    });
+    return {
+      constructedWith,
+      arm: (): void => { globalThis.Date = Observed; },
+      disarm: (): void => { globalThis.Date = RealDate; },
+    };
+  }
+
+  /**
+   * A scripted executor: valid answers for everything before the due read, the given rows for the
+   * due read, and a stored row for the enqueue's insert. A statement it does not know fails loudly.
+   */
+  function scriptedPreparation(dueRows: unknown[], onDueAnswered: () => void) {
+    const sent: string[] = [];
+    const enqueueInserts: unknown[][] = [];
+    const answers: [name: string, recognizes: RegExp, rows: (params: readonly unknown[]) => unknown[]][] = [
+      ["due read", /\bdue_epoch_ms\b/, () => dueRows],
+      ["enqueue insert", /insert into slack_sync_threads/, (params) => {
+        enqueueInserts.push([...params]);
+        return [{
+          team_id: TEAM, workspace_id: WORKSPACE, channel_id: CHANNEL, root_ts: ROOT, status: "queued", due_at: params[4], attempts: 0,
+          lease_generation: "0", lease_owner: null, lease_expires_at: null, page_cursor: null, snapshot_generation: "0",
+          checkpointed_at: null, last_error_code: null,
+        }];
+      }],
+      ["root witness", /\bas witnessed\b/, () => [{ witnessed: 1 }]],
+      ["ledger contradictions", /\bitem_bound_elsewhere\b/, () => [{ item_bound_elsewhere: false, thread_bound_to_another_item: false }]],
+      ["path conflicts", /\bscoped_conflict\b/, () => [{ scoped_conflict: false, legacy_conflict: false }]],
+      ["namespace gate lock", /from slack_channel_migration_gates/, () => [{
+        team_id: TEAM, raw_channel_id: CHANNEL, state: "ready", revision: "3", ready_revision: "3",
+        resolved_workspace_ids: [WORKSPACE], completed_repair_id: "0c000000-0000-4000-8000-00000000000c", blocked_reason: null,
+      }]],
+      ["integration selection lock", /from integrations\b/, () => [{
+        status: "enabled", type: "slack", config: { channelIds: [CHANNEL] }, secret_ciphertext: null, updated_at_utc: UPDATED_AT,
+      }]],
+      ["binding row lock", /from slack_integration_bindings/, () => [{
+        state: "verified", config_revision: CONFIG_REVISION, token_fingerprint: FINGERPRINT,
+        workspace_id: WORKSPACE, app_id: "A0SOURCE1", selected_channel_ids: [CHANNEL],
+      }]],
+      ["scoped channel row lock", /from slack_sync_channels/, () => [{
+        binding_integration_id: INTEGRATION, binding_config_revision: CONFIG_REVISION, public_state: "public", public_checked: true,
+      }]],
+      ["plain queue read", /from slack_sync_threads/, () => []],
+      ["item lock", /from items i\b/, () => [{
+        project_id: PROJECT, kind: "transcript", access: "team", path: SCOPED_PATH, source: "slack",
+        workspace_id: WORKSPACE, channel_id: CHANNEL, ts: ROOT, thread_ts: ROOT,
+      }]],
+      ["slack project read", /from projects\b/, () => [{ id: PROJECT }]],
+    ];
+    const executeSql = (async (text: string, params: unknown[] = []) => {
+      const flat = text.replace(/\s+/g, " ");
+      if (/\bpg_settings\b/.test(flat)) {
+        sent.push("settings read");
+        const rows = [{ name: "statement_timeout", setting: "0" }, { name: "lock_timeout", setting: "0" }];
+        return { rows, rowCount: rows.length };
+      }
+      if (/set_config\(/.test(flat)) {
+        sent.push("settings assignment");
+        return { rows: [{}], rowCount: 1 };
+      }
+      const answer = answers.find(([, recognizes]) => recognizes.test(flat));
+      if (!answer) throw new Error("fixture: the scripted executor was sent a statement it does not know");
+      sent.push(answer[0]);
+      const rows = answer[2](params);
+      // The window opens HERE, as the due answer is handed back, and not a statement earlier.
+      if (answer[0] === "due read") onDueAnswered();
+      return { rows, rowCount: rows.length };
+    }) as SqlExecutor;
+    const session = {
+      get db(): never {
+        throw new Error("fixture: the caller's own db client was used");
+      },
+      executeSql,
+      optionalAudit: async (): Promise<never> => {
+        throw new Error("fixture: the caller's own audit helper was used");
+      },
+    } as unknown as TransactionSession;
+    return {
+      session, enqueueInserts,
+      /** The data statements, in order: everything but the settings read and the settings assignments. */
+      data: (): string[] => sent.filter((name) => !name.startsWith("settings ")),
+      /** What was sent AFTER the due read, of any kind. */
+      afterTheDueRead: (): string[] => sent.slice(sent.lastIndexOf("due read") + 1),
+    };
+  }
+
+  /** One preparation through the exported preparer, with only the due answer chosen by the case. */
+  async function preparedWithDueAnswer(dueRow: unknown) {
+    // FIXTURE, all of it before the observer's window: the token the real selection lock resolves,
+    // the scripted executor, and the execution context.
+    vi.stubEnv("SLACK_BOT_TOKEN", TOKEN);
+    const observer = dateObserver();
+    const scripted = scriptedPreparation([dueRow], observer.arm);
+    const context = execution();
+    let result: SlackKnownRootPreparationResult | undefined;
+    let error: unknown;
+    let threw = false;
+    try {
+      result = await prepareSlackKnownRootRequeue(scripted.session, { teamId: TEAM, entry: ENTRY }, context);
+    } catch (caught) {
+      threw = true;
+      error = caught;
+    } finally {
+      observer.disarm();
+    }
+    return { result, error, threw, scripted, constructedWith: observer.constructedWith, dateIsRestored: Object.is(globalThis.Date, RealDate) };
+  }
+  type Prepared = Awaited<ReturnType<typeof preparedWithDueAnswer>>;
+
+  /** FIXTURE VALIDITY, asserted first in every case: the due read was reached, once, by a valid preparation. */
+  function expectTheDueReadWasReached(prepared: Prepared, label: string): void {
+    expect(prepared.dateIsRestored, `${label}: fixture: the global Date constructor is the real one again`).toBe(true);
+    expect(prepared.scripted.data().slice(0, TO_THE_DUE_READ.length), `${label}: fixture: a valid preparation reached the due read, once, in order`).toEqual(TO_THE_DUE_READ);
+  }
+
+  /** A thrown preparation that enqueued nothing, sent nothing after the due read, and constructed no Date on the way. */
+  function expectThrownWithNothingEnqueued(prepared: Prepared, label: string, rejectedText: string | null): void {
+    expectTheDueReadWasReached(prepared, label);
+    expect([prepared.threw, prepared.result], `${label}: the preparation throws and returns no result`).toEqual([true, undefined]);
+    expect(prepared.error, `${label}: what is thrown is an error`).toBeInstanceOf(Error);
+    if (rejectedText !== null) expect((prepared.error as Error).message.includes(rejectedText), `${label}: the rejected value is not quoted`).toBe(false);
+    expect(prepared.scripted.enqueueInserts, `${label}: zero enqueue`).toEqual([]);
+    expect(prepared.scripted.data(), `${label}: the due read is the last data statement`).toEqual(TO_THE_DUE_READ);
+    expect(prepared.scripted.afterTheDueRead(), `${label}: nothing at all is sent after the due read`).toEqual([]);
+    expect(prepared.constructedWith, `${label}: rejected before construction`).toEqual([]);
+  }
+
+  it.each<[name: string, dueText: string, epochMs: number]>([
+    ["an ordinary instant", "1718903600123", 1718903600123],
+    ["the largest instant a Date can hold (synthetic adapter output, not PostgreSQL calendar evidence)", "8640000000000000", 8640000000000000],
+    ["the instant immediately before that maximum (synthetic adapter output, not PostgreSQL calendar evidence)", "8639999999999999", 8639999999999999],
+  ])("reaches the enqueue with a Date of the exact numeric value for a valid decimal-millisecond due: %s", async (name, dueText, epochMs) => {
+    const prepared = await preparedWithDueAnswer({ is_due: true, due_epoch_ms: dueText });
+    expectTheDueReadWasReached(prepared, name);
+    expect([prepared.threw, prepared.result], `${name}: the preparation returns enqueued`).toEqual([false, { outcome: "enqueued" }]);
+    expect(prepared.scripted.data(), `${name}: the enqueue's insert follows the due read, and nothing else does`).toEqual([...TO_THE_DUE_READ, "enqueue insert"]);
+    expect(prepared.scripted.enqueueInserts, `${name}: exactly one enqueue`).toHaveLength(1);
+    const [insert] = prepared.scripted.enqueueInserts;
+    expect(insert.slice(0, 4), `${name}: the enqueue is for the entry's exact scope`).toEqual([TEAM, WORKSPACE, CHANNEL, ROOT]);
+    const handed = insert[4];
+    expect(handed instanceof RealDate, `${name}: the enqueue is handed a Date`).toBe(true);
+    expect((handed as Date).getTime(), `${name}: the Date's numeric value is exactly the due answer's`).toBe(epochMs);
+    // The observer's own control: a conversion that succeeds IS seen constructing a Date.
+    expect(prepared.constructedWith.length, `${name}: observer control: the window sees a Date being constructed`).toBeGreaterThanOrEqual(1);
+  });
+
+  it.each<[name: string, dueValue: unknown]>([
+    ["null", null],
+    ["a number where text is required", 1718903600123],
+    ["empty text", ""],
+    ["fractional text", "1718903600123.5"],
+    ["exponent text", "1.7189036e12"],
+    ["non-finite text, NaN", "NaN"],
+    ["non-finite text, Infinity", "Infinity"],
+    ["a negative integer", "-1"],
+    ["one millisecond past the largest instant a Date can hold", "8640000000000001"],
+    ["an unsafe integer", "9007199254740993"],
+  ])("throws, enqueues nothing and constructs no Date for an invalid due under is_due true: %s", async (name, dueValue) => {
+    const prepared = await preparedWithDueAnswer({ is_due: true, due_epoch_ms: dueValue });
+    expectThrownWithNothingEnqueued(prepared, name, typeof dueValue === "string" && dueValue !== "" ? dueValue : null);
+  });
+
+  it.each<[name: string, isDue: unknown]>([
+    ["the text \"true\"", "true"],
+    ["the number 1", 1],
+    ["null", null],
+  ])("throws and enqueues nothing when is_due is not a boolean, even with a valid due: %s", async (name, isDue) => {
+    const prepared = await preparedWithDueAnswer({ is_due: isDue, due_epoch_ms: "1718903600123" });
+    expectThrownWithNothingEnqueued(prepared, `is_due is ${name}`, null);
+  });
+
+  it("returns not_due for is_due false with a null due, without converting anything and without an enqueue", async () => {
+    const label = "is_due false, null due";
+    const prepared = await preparedWithDueAnswer({ is_due: false, due_epoch_ms: null });
+    expectTheDueReadWasReached(prepared, label);
+    expect([prepared.threw, prepared.result], `${label}: the preparation returns not_due`).toEqual([false, { outcome: "not_due" }]);
+    expect(prepared.scripted.enqueueInserts, `${label}: zero enqueue`).toEqual([]);
+    expect(prepared.scripted.data(), `${label}: the due read is the last data statement`).toEqual(TO_THE_DUE_READ);
+    expect(prepared.constructedWith, `${label}: nothing was converted: no Date was constructed`).toEqual([]);
+    // A normal result: the only thing sent after the due read is the restoration of the settings.
+    expect(prepared.scripted.afterTheDueRead(), `${label}: only the settings restoration follows`).toEqual(["settings assignment"]);
   });
 });
