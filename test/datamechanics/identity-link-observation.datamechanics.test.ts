@@ -1,16 +1,20 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { getPool } from "@/lib/db/pg/pool";
+import { getPool, runSql, withTransaction } from "@/lib/db/pg/pool";
 import { listMemberIdentities } from "@/lib/identity/list";
 import { removeMemberIdentity, setMemberIdentity } from "@/lib/identity/member-identities";
 import { db, seedTeam, type Seed } from "./helpers";
 import {
   RACE_TEST_TIMEOUT_MS,
+  advisoryKeysHeld,
+  authorityKey,
   bothQueuedOnAuthority,
   closeRaceHarness,
   holdIdentityKey,
+  holdNamedLock,
   holdTable,
   parkThenCompete,
+  parkWhile,
   raceHarnessFatal,
 } from "./identity-race-harness";
 
@@ -170,6 +174,41 @@ const unlink = (seed: Seed, provider: Provider, externalId: string, observed: Un
 async function unlinkDisplayed(seed: Seed, memberId: string, provider: Provider, externalId: string): Promise<void> {
   const shown = await displayed(seed, memberId, provider, externalId);
   expect(await unlink(seed, provider, shown.externalId, { memberId, revision: shown.revision })).toEqual({ ok: true });
+}
+
+/** Carries a result out of a transaction that is rolled back on purpose. */
+class RolledBack<T> {
+  constructor(readonly value: T) {}
+}
+
+/**
+ * Run `read` so that the production statement it issues PAUSES INSIDE ITSELF on the advisory lock
+ * named `gate` — after PostgreSQL has taken that statement's snapshot — without changing a
+ * character of the production SQL.
+ *
+ * How: `read` runs inside a transaction of this test's own, in which a TEMPORARY VIEW named
+ * `member_identity_mapping_state` stands in front of the real table (temporary objects are found
+ * first). The view is the real table, plus one condition that takes the gate. So when the
+ * listing's own joined SELECT reaches the mapping state, it is that SELECT — already executing, its
+ * snapshot fixed — that waits. The gate is a lock of the test's naming; it is not, and is unrelated
+ * to, the team's identity authority. The transaction is always rolled back: the view never exists
+ * outside it, and nothing the read did is kept.
+ */
+async function pausedInStatement<T>(gate: string, read: () => Promise<T>): Promise<T> {
+  if (!/^[A-Za-z0-9:_-]+$/.test(gate)) throw new Error(`unusable gate name: ${gate}`);
+  try {
+    await withTransaction(async () => {
+      await runSql(
+        `create temporary view member_identity_mapping_state as
+           select s.* from public.member_identity_mapping_state s
+            where exists (select 1 from pg_advisory_xact_lock(hashtextextended('${gate}', 0)))`);
+      throw new RolledBack(await read());
+    });
+  } catch (carried) {
+    if (carried instanceof RolledBack) return carried.value as T;
+    throw carried;
+  }
+  throw new Error("the paused read's transaction ended without a result");
 }
 
 /** The team's identity audit rows in commit order: which id, and what was done to it. */
@@ -779,36 +818,84 @@ describe.each(PROVIDERS)("AIO-1167 X-02 — %s: UNLINK is bound to the displayed
     setMemberIdentity(db(), seed.teamId, to, { provider, externalId }, { force: true, expectedRevision });
   const actionsOn = async (seed: Seed, externalId: string) => (await audits(seed, externalId)).map((row) => row.action);
 
-  it("(1) THE LISTING IS ONE OBSERVATION: parked between its holder read and its revision read, it makes a competing remap wait — the pair it returns is Alice at revision 1, and once the remap has landed that pair can no longer unlink", async () => {
-    const { seed, alice, bob, target } = await aliceHolds();
+  /** What one listing shows for the id under test: on whose row, at which revision. */
+  const shownIn = (listing: Awaited<ReturnType<typeof listMemberIdentities>>, memberId: string, externalId: string) =>
+    (listing.get(memberId)?.providers ?? [])
+      .filter((identity) => identity.provider === provider && identity.externalId === externalId)
+      .map((identity) => identity.revision);
 
-    // The page's own reader is parked exactly between its two reads: it has read WHO holds each id
-    // and is waiting — inside the team's identity boundary — to read the revisions. The real
-    // writer then remaps the id Alice → Bob and is shown waiting on the authority the reader holds.
-    // (Read outside the boundary, the remap would not wait: it would commit between the reads and
-    // the reader would return Alice paired with Bob's revision 2.)
-    const { first: listing, second: remapped } = await parkThenCompete({
+  it("(1) THE LISTING IS ONE STATEMENT, ONE SNAPSHOT: paused after its snapshot was taken, it lets a real remap COMMIT — and still returns Alice at revision 1; a fresh read returns Bob at revision 2; the old pair can no longer unlink", async () => {
+    const { seed, alice, bob, target } = await aliceHolds();
+    // A barrier of this test's own: an advisory lock under a name no production code takes — in
+    // particular NOT the team's identity authority, which the listing does not touch.
+    const gate = `identity-list-snapshot-test:${randomUUID()}`;
+
+    // The page's own reader, running its own statement, is paused INSIDE that statement — after
+    // PostgreSQL has taken the statement's snapshot — waiting on the test's gate. While it is
+    // paused the real writer remaps the id Alice → Bob and COMMITS: it is not made to wait (the
+    // harness requires it to finish while the listing is still parked exactly where it was).
+    const { first: paused, during: remapped } = await parkWhile({
       seed,
-      barrier: await holdTable("member_identity_mapping_state"),
-      parksOn: "relation",
-      first: () => listMemberIdentities(db(), seed.teamId),
-      second: () => remap(seed, bob, target, 1),
+      barrier: await holdNamedLock(gate),
+      parksOn: "advisory",
+      first: () => pausedInStatement(gate, () => listMemberIdentities(db(), seed.teamId)),
+      during: () => remap(seed, bob, target, 1),
     });
 
-    const shownOn = (memberId: string) => (listing.get(memberId)?.providers ?? [])
-      .filter((identity) => identity.provider === provider && identity.externalId === target)
-      .map((identity) => identity.revision);
-    expect(shownOn(alice), "Alice's row: the id at Alice's own revision").toEqual([1]);
-    expect(shownOn(bob), "Bob's row does not show it").toEqual([]);
+    // The remap is committed: Bob holds the id at revision 2.
     expect(remapped).toMatchObject({ memberId: bob, updated: true, mappingRevision: 2 });
     expect(await mapping(seed, provider, target)).toEqual({ holder: bob, revision: 2, state: "linked" });
+    // The paused statement resumed AFTER that commit and returned what its snapshot held: the id
+    // on Alice's row at Alice's revision. Not Alice with Bob's revision 2 — the pair two separate
+    // reads produced — and not on Bob's row.
+    expect(shownIn(paused, alice, target), "the old statement: Alice at her own revision").toEqual([1]);
+    expect(shownIn(paused, bob, target), "the old statement does not show it on Bob's row").toEqual([]);
+    // A FRESH read is a new statement with a new snapshot: Bob at revision 2, and only Bob.
+    const fresh = await listMemberIdentities(db(), seed.teamId);
+    expect(shownIn(fresh, bob, target)).toEqual([2]);
+    expect(shownIn(fresh, alice, target)).toEqual([]);
 
-    // The row still displays Alice at revision 1. It is Bob's link now: the unlink is refused.
+    // The row built from the old listing still displays Alice at revision 1. It is Bob's link now:
+    // the unlink is refused under the authority, and nothing of its own happens.
     const before = await effects(seed, provider, target);
     expect(await unlink(seed, provider, target, { memberId: alice, revision: 1 })).toEqual({ ok: false, error: STALE });
     expect(await mapping(seed, provider, target)).toEqual({ holder: bob, revision: 2, state: "linked" });
     expect(await actionsOn(seed, target)).toEqual(["identity.set", "identity.set"]);
     expect(await effects(seed, provider, target)).toEqual(before);
+  }, RACE_TEST_TIMEOUT_MS);
+
+  it("(1) THE LISTING WAITS FOR NO WRITER: beside a real remap that holds the team authority with its identity changes written and uncommitted, it completes — with the previous committed pair", async () => {
+    const { seed, alice, bob, target } = await aliceHolds();
+
+    // The real writer is parked at the LAST thing it does — its audit row — with everything else
+    // done and nothing committed: it holds the team authority, has moved the identity to Bob and
+    // advanced the mapping state. The listing is then run, and must finish while the writer is
+    // still parked there.
+    const { first: remapped, during: listing } = await parkWhile({
+      seed,
+      barrier: await holdTable("audit_log"),
+      parksOn: "relation",
+      first: () => remap(seed, bob, target, 1),
+      during: async (writer) => {
+        // The parked backend really does hold this team's identity authority…
+        expect(await advisoryKeysHeld(writer)).toContain(await authorityKey(seed.teamId));
+        // …and an uncommitted change of the identity row: another session cannot lock it.
+        const lockable = await getPool().query(
+          "select id from member_identities where team_id=$1 and provider=$2 and external_id=$3 for update skip locked",
+          [seed.teamId, provider, target]);
+        expect(lockable.rows, "the identity row is locked by the writer's open transaction").toEqual([]);
+        return listMemberIdentities(db(), seed.teamId);
+      },
+    });
+
+    // It completed beside the open writer, and showed what was COMMITTED then: Alice at revision 1.
+    expect(shownIn(listing, alice, target)).toEqual([1]);
+    expect(shownIn(listing, bob, target)).toEqual([]);
+    // Released, the writer commits; a fresh read then shows Bob at revision 2.
+    expect(remapped).toMatchObject({ memberId: bob, updated: true, mappingRevision: 2 });
+    const fresh = await listMemberIdentities(db(), seed.teamId);
+    expect(shownIn(fresh, bob, target)).toEqual([2]);
+    expect(shownIn(fresh, alice, target)).toEqual([]);
   }, RACE_TEST_TIMEOUT_MS);
 
   it("(2) DISPLAYED ALICE, CURRENT BOB: an observation naming Alice is refused even when its revision is exactly Bob's current one — the revision alone is not whose link it is", async () => {
@@ -940,6 +1027,82 @@ describe.each(PROVIDERS)("AIO-1167 X-02 — %s: UNLINK is bound to the displayed
     // The Drive-only effects are the writer's: a durable obligation at the new revision, and the epoch.
     expect(after.obligations).toEqual(provider === "gdrive" ? [1, 2] : []);
     if (provider === "gdrive") expect(after.epoch).toBeGreaterThan(before.epoch);
+  });
+
+  it("(7) LEGACY IDENTITY WITHOUT MAPPING STATE: it is listed at revision 0, and the displayed holder at revision 0 unlinks it through the unchanged writer — with the writer's audit and repair effects", async () => {
+    const { seed, alice, bob, target } = await aliceHolds();
+    // An identity row as rows were before mapping state existed: stored directly, no state row.
+    const legacy = idFor(provider, "legacy");
+    await getPool().query(
+      "insert into member_identities (team_id, member_id, provider, external_id, handle, email) values ($1, $2, $3, $4, 'legacy-handle', '')",
+      [seed.teamId, alice, provider, legacy]);
+    expect(await mapping(seed, provider, legacy)).toEqual({ holder: alice, revision: 0, state: null });
+
+    // LISTED, at revision 0 — the left join keeps an identity that has no state.
+    expect(await displayed(seed, alice, provider, legacy)).toEqual({ externalId: legacy, revision: 0 });
+    // And the converse: a state with no identity — an unlinked tombstone — lists nothing.
+    await unlinkDisplayed(seed, alice, provider, target);
+    expect(await mapping(seed, provider, target)).toEqual({ holder: null, revision: 2, state: "unlinked" });
+    const listing = await listMemberIdentities(db(), seed.teamId);
+    expect([alice, bob, seed.memberId].flatMap((memberId) => shownIn(listing, memberId, target))).toEqual([]);
+    expect(shownIn(listing, alice, legacy)).toEqual([0]);
+
+    const before = await effects(seed, provider, legacy);
+    // Not at a revision it does not have, and not as another member's…
+    expect(await unlink(seed, provider, legacy, { memberId: alice, revision: 1 })).toEqual({ ok: false, error: STALE });
+    expect(await unlink(seed, provider, legacy, { memberId: bob, revision: 0 })).toEqual({ ok: false, error: STALE });
+    expect(await effects(seed, provider, legacy)).toEqual(before);
+    // …but exactly as displayed: Alice, revision 0.
+    expect(await unlink(seed, provider, legacy, { memberId: alice, revision: 0 })).toEqual({ ok: true });
+
+    // The writer removed the link and gave the id its first mapping state: an unlinked tombstone.
+    expect(await mapping(seed, provider, legacy)).toEqual({ holder: null, revision: 1, state: "unlinked" });
+    expect(await audits(seed, legacy)).toEqual([
+      { action: "identity.removed", actor_kind: "member", member_id: seed.memberId, target_id: alice, mapping_revision: 1 },
+    ]);
+    const after = await effects(seed, provider, legacy);
+    expect(after.authority).toBe(before.authority + 1);
+    expect(after.deferred).toBe(before.deferred + 1);
+    expect(after.revalidated).toBe(before.revalidated + 1);
+    expect(after.obligations).toEqual(provider === "gdrive" ? [1] : []);
+    if (provider === "gdrive") expect(after.epoch).toBeGreaterThan(before.epoch);
+  });
+
+  it("(8) MALFORMED RUNTIME ARGUMENTS: a provider or an id that is not a string is refused by both actions before anything is read off it — no write, no audit, no repair, no revalidation", async () => {
+    const { seed, alice, target } = await aliceHolds();
+    const fresh = idFor(provider, "fresh");
+    const before = await effects(seed, provider, target);
+    const notStrings: unknown[] = [undefined, null, 7, true, {}, ["slack"], { trim: "not a function" }];
+
+    for (const bad of notStrings) {
+      const shown = JSON.stringify(bad);
+      // UNLINK — with an observation that would otherwise be exactly right.
+      expect(await unlinkMemberIdentity(seed.teamSlug, bad as string, target, { memberId: alice, revision: 1 }), `unlink provider ${shown}`)
+        .toEqual({ ok: false, error: "provider and externalId are required" });
+      expect(await unlinkMemberIdentity(seed.teamSlug, provider, bad as string, { memberId: alice, revision: 1 }), `unlink id ${shown}`)
+        .toEqual({ ok: false, error: "provider and externalId are required" });
+      // LINK — fenced from a blank row, and unfenced.
+      for (const observed of [BLANK, undefined]) {
+        expect(await linkMemberIdentity(seed.teamSlug, alice, bad as string, fresh, undefined, observed), `link provider ${shown}`)
+          .toEqual({ ok: false, error: "provider and user id are required" });
+        expect(await linkMemberIdentity(seed.teamSlug, alice, provider, bad as string, undefined, observed), `link id ${shown}`)
+          .toEqual({ ok: false, error: "provider and user id are required" });
+      }
+    }
+
+    // Nothing was written by any of them, and nothing was started.
+    expect(await mapping(seed, provider, target)).toEqual({ holder: alice, revision: 1, state: "linked" });
+    expect(await mapping(seed, provider, fresh)).toEqual({ holder: null, revision: 0, state: null });
+    expect(await actionsOn(seed, target)).toEqual(["identity.set"]);
+    expect(await audits(seed, fresh)).toEqual([]);
+    expect(await effects(seed, provider, target)).toEqual(before);
+    // The required-input refusals for STRINGS are what they were.
+    expect(await unlinkMemberIdentity(seed.teamSlug, " ", target, { memberId: alice, revision: 1 }))
+      .toEqual({ ok: false, error: "provider and externalId are required" });
+    expect(await linkMemberIdentity(seed.teamSlug, alice, provider, "   ", undefined, BLANK))
+      .toEqual({ ok: false, error: `${provider} user id is required` });
+    expect(await linkMemberIdentity(seed.teamSlug, alice, "github", fresh, undefined, BLANK))
+      .toEqual({ ok: false, error: 'unsupported provider "github"' });
   });
 
   it("(6) REFUSALS: a missing or malformed observation, a missing identity, another team's identity or holder, and a caller who is not an admin — each refused, none of them writing anything", async () => {

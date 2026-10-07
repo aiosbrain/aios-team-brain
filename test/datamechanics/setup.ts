@@ -1,6 +1,14 @@
-import { afterAll, beforeEach } from "vitest";
+import { afterAll, beforeEach, inject } from "vitest";
 import { Client } from "pg";
-import { assertRunNotFatal, noteTruncationHook } from "./run-fatal-latch";
+import { RUN_ID_PROVIDED, adoptRunId, assertRunSafe, noteSetupModuleCheck, noteTruncationHook } from "./run-fatal-latch";
+
+// MODULE SCOPE — evaluated before the test module is imported and before any `beforeAll`. A run
+// that has been stopped, or that still carries an in-flight harness scope (a test that raced real
+// sessions and never proved them gone — after a failure, a timeout or an interruption), may not
+// load another test file, let alone truncate for it. Throwing here fails the whole file.
+adoptRunId(inject(RUN_ID_PROVIDED));
+assertRunSafe();
+noteSetupModuleCheck();
 
 // Per-test isolation against the shared test Postgres: truncate all data tables
 // before each test. One dedicated connection (separate from the app's pool) so
@@ -66,12 +74,13 @@ async function ensureConnected(): Promise<void> {
 }
 
 beforeEach(async () => {
-  // FIRST — before this hook connects or truncates anything. A test that could not prove its
-  // database sessions idle has stopped the run (`run-fatal-latch`): truncating now would block on,
-  // or clean up around, work that may still be in flight. This hook is registered by the setup
-  // file, so it runs before any test file's own `beforeEach`; the refusal is therefore earlier than
-  // every later test's cleanup, in this worker and in the workers of every later file.
-  assertRunNotFatal();
+  // AGAIN, and FIRST — before this hook connects or truncates anything. A test that could not prove
+  // its database sessions gone has stopped the run, and one that never finished its cleanup still
+  // has its in-flight marker on file (`run-fatal-latch`): truncating now would block on, or clean
+  // up around, work that may still be in flight. This hook is registered by the setup file, so it
+  // runs before any test file's own `beforeEach`; the refusal is therefore earlier than every later
+  // test's cleanup, in this worker and in the workers of every later file.
+  assertRunSafe();
   noteTruncationHook();
   await ensureConnected();
   // Only truncate tables that exist (schema may evolve); RESTART IDENTITY + CASCADE.
