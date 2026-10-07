@@ -45,6 +45,11 @@ import { currentRunSafety, type RunSafety } from "./run-fatal-latch";
  * No wait here establishes a schedule by elapsed time. Evidence is re-read from PostgreSQL until it
  * is what is expected, the operation in question can no longer produce it, or a bound expires; the
  * pause between two reads is only the interval of that re-reading.
+ *
+ * A BOUND IS A DEADLINE, NOT A COUNT OF READS. Evidence counts only if it was read before the
+ * wait's deadline: a read that outlasts the deadline fails the wait there and then, and whatever
+ * that read comes back with later — the very evidence that was expected, included — is observed
+ * and dropped. Nothing a read returns after its wait has failed can make that wait succeed.
  */
 
 export interface RaceBounds {
@@ -139,30 +144,106 @@ export function raceHarnessFatal(): string | null {
   return currentRunSafety().fatal();
 }
 
-const pause = (ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms); });
+/**
+ * The clock one evidence wait runs on: where its deadline is read from, and what ends a read or a
+ * pause that would outlast it. Every wait runs on the real one; another is a SEAM for the harness's
+ * own tests, which stage a deadline passing instead of waiting for one.
+ */
+export interface EvidenceClock {
+  now: () => number;
+  /** Call `fire` once `ms` have passed. Returns how to call that off. */
+  after: (ms: number, fire: () => void) => () => void;
+}
+
+const REAL_CLOCK: EvidenceClock = {
+  now: () => Date.now(),
+  after: (ms, fire) => {
+    const timer = setTimeout(fire, ms);
+    return () => clearTimeout(timer);
+  },
+};
+
+/**
+ * SEAMS for the harness's own tests, on the waits that prove a barrier's session gone: another
+ * clock, and something to stand in front of every read of that evidence — it is given the real
+ * read, and what it returns is what the wait awaits. Together they stage evidence of absence that
+ * arrives only after the cleanup budget has run out.
+ */
+export interface EvidenceSeam {
+  clock?: EvidenceClock;
+  read?: <T>(read: () => Promise<T>) => Promise<T>;
+}
+
+/**
+ * `work`, for at most `ms`: what it resolved to, or `null` if it had not settled by then. A
+ * rejection inside the bound is rethrown.
+ *
+ * BOTH of `work`'s outcomes are observed, whenever they come. One that comes after the bound finds
+ * this promise already settled and changes nothing: it is never an unhandled rejection, and never a
+ * result anyone acts on.
+ */
+function settledWithin<T>(clock: EvidenceClock, work: Promise<T>, ms: number): Promise<{ value: T } | null> {
+  return new Promise((resolve, reject) => {
+    const callOff = clock.after(ms, () => resolve(null));
+    work.then(
+      (value) => { callOff(); resolve({ value }); },
+      (error: unknown) => { callOff(); reject(error); },
+    );
+  });
+}
 
 /**
  * Re-read `read` until `accept` holds. Stops early — with an error — as soon as `abort` gives a
- * reason the evidence can no longer appear, and otherwise when `timeoutMs` has passed.
+ * reason the evidence can no longer appear, and otherwise at the wait's DEADLINE, `timeoutMs` after
+ * it began.
+ *
+ * The deadline bounds everything the wait does, not just how often it reads:
+ *
+ *   - a read is started only while there is budget left, and is given what is left of it. One still
+ *     pending at the deadline fails the wait then; no other read is started, and whatever that one
+ *     later resolves or rejects with is dropped (`settledWithin`);
+ *   - a read that does come back is checked against the deadline BEFORE it is accepted. The timer
+ *     that bounds a read and the clock are not the same thing — a late result can be delivered ahead
+ *     of a timer that is already due — so evidence that is what was expected, but was read at or
+ *     after the deadline, fails the wait like any other;
+ *   - the pause between two reads never runs past the deadline either.
+ *
+ * `clock` is a seam for the harness's own tests (`EvidenceClock`).
  */
-async function untilEvidence<T>(opts: {
+export async function untilEvidence<T>(opts: {
   read: () => Promise<T>;
   accept: (value: T) => boolean;
   expected: string;
   show: (value: T) => string;
   timeoutMs: number;
   abort?: () => string | null;
+  clock?: EvidenceClock;
 }): Promise<T> {
-  const deadline = Date.now() + opts.timeoutMs;
+  const clock = opts.clock ?? REAL_CLOCK;
+  const deadline = clock.now() + opts.timeoutMs;
+  const expired = (how: string) => new RaceHarnessError(`no evidence within ${opts.timeoutMs} ms of ${opts.expected}; ${how}`);
+  // The last read that came back IN TIME — the detail of a wait that then runs out.
+  let seen: { value: T } | null = null;
   for (;;) {
-    const value = await opts.read();
-    if (opts.accept(value)) return value;
-    const aborted = opts.abort?.() ?? null;
-    if (aborted) throw new RaceHarnessError(`${aborted} — expected ${opts.expected}; saw ${opts.show(value)}`);
-    if (Date.now() >= deadline) {
-      throw new RaceHarnessError(`no evidence within ${opts.timeoutMs} ms of ${opts.expected}; last saw ${opts.show(value)}`);
+    const remaining = deadline - clock.now();
+    if (remaining <= 0) throw expired(seen ? `last saw ${opts.show(seen.value)}` : "nothing was read");
+    const read = await settledWithin(clock, opts.read(), remaining);
+    if (!read) throw expired(`a read was still pending at the deadline${seen ? `; last saw ${opts.show(seen.value)}` : ""}`);
+    const { value } = read;
+    // Asked BEFORE acceptance, and of the clock itself: that the read beat its timer says nothing.
+    const late = clock.now() >= deadline;
+    const accepted = opts.accept(value);
+    if (accepted && !late) return value;
+    if (!accepted) {
+      const aborted = opts.abort?.() ?? null;
+      if (aborted) throw new RaceHarnessError(`${aborted} — expected ${opts.expected}; saw ${opts.show(value)}`);
     }
-    await pause(EVIDENCE_INTERVAL_MS);
+    if (late) {
+      throw expired(accepted ? `what was expected was read only at or after the deadline: ${opts.show(value)}` : `last saw ${opts.show(value)}`);
+    }
+    seen = read;
+    const interval = Math.min(EVIDENCE_INTERVAL_MS, deadline - clock.now());
+    await new Promise<void>((resolve) => { clock.after(interval, resolve); });
   }
 }
 
@@ -310,8 +391,10 @@ export interface Barrier {
    * and this rejects. Idempotent, and safe to call concurrently.
    */
   release: () => Promise<void>;
-  /** For the schedules: close the connection once, and say whether its session was SEEN gone. */
-  vanish: (cleanupMs: number) => Promise<boolean>;
+  /** For the schedules: close the connection once, and say whether its session was SEEN gone —
+   * each proof of that within `cleanupMs` of its own. `evidence` is a seam for the harness's own
+   * tests (`EvidenceSeam`); like `cleanupMs`, it is the first call's that counts. */
+  vanish: (cleanupMs: number, evidence?: EvidenceSeam) => Promise<boolean>;
   /** For the schedules: clear this scope's marker (`proven`) or stop the run. The first conclusion stands. */
   conclude: (proven: boolean, reason: string) => void;
 }
@@ -337,6 +420,9 @@ const UNPROVEN_BARRIER: CleanupReport = { outcome: "unproven", barrierGone: fals
  * session's time zone), so a later backend given the same pid is not it. */
 interface BackendIdentity { pid: number; started: string }
 
+/** One read of absence evidence, as the wait is to make it: the real read, or the seam's stand-in for it. */
+const seamed = <T>(seam: EvidenceSeam, read: () => Promise<T>) => (): Promise<T> => (seam.read ? seam.read(read) : read());
+
 /** The monitor's own reading of one exact backend: the rows of `pg_stat_activity` that are it. */
 const backendRows = (backend: BackendIdentity) => observe<{ pid: number }>(
   "select pid from pg_stat_activity where pid = $1 and extract(epoch from backend_start)::text = $2", [backend.pid, backend.started]);
@@ -349,14 +435,15 @@ const backendRows = (backend: BackendIdentity) => observe<{ pid: number }>(
  * it was alive. Without that, a predicate that never matched — the two sessions rendering the start
  * time differently, say — would read as "gone" at once.
  */
-async function backendAbsent(backend: BackendIdentity, ms: number): Promise<boolean> {
+async function backendAbsent(backend: BackendIdentity, ms: number, seam: EvidenceSeam = {}): Promise<boolean> {
   try {
     await untilEvidence({
-      read: () => backendRows(backend),
+      read: seamed(seam, () => backendRows(backend)),
       accept: (sessions) => sessions.length === 0,
       expected: `backend ${backend.pid} (started ${backend.started}) gone`,
       show: (sessions) => JSON.stringify(sessions),
       timeoutMs: ms,
+      clock: seam.clock,
     });
     return true;
   } catch {
@@ -364,15 +451,19 @@ async function backendAbsent(backend: BackendIdentity, ms: number): Promise<bool
   }
 }
 
-/** The tagged barrier session was SEEN to be absent within `ms`. Unreadable evidence is not absence. */
-async function barrierAbsent(tag: string, ms: number): Promise<boolean> {
+/**
+ * The tagged barrier session was SEEN to be absent within `ms`. Unreadable evidence is not absence —
+ * and nor is evidence read too late: a read that shows the session gone only after `ms` is `false`.
+ */
+async function barrierAbsent(tag: string, ms: number, seam: EvidenceSeam = {}): Promise<boolean> {
   try {
     await untilEvidence({
-      read: () => barrierSessions(tag),
+      read: seamed(seam, () => barrierSessions(tag)),
       accept: (sessions) => sessions.length === 0,
       expected: `no session left for barrier ${tag}`,
       show: (sessions) => JSON.stringify(sessions),
       timeoutMs: ms,
+      clock: seam.clock,
     });
     return true;
   } catch {
@@ -429,19 +520,19 @@ export async function holdLock(sql: string, params: unknown[] = [], opts: Barrie
   // The monitor has SEEN that exact backend present — the positive control its absence rests on.
   let backendSeen = false;
   let vanished: Promise<boolean> | undefined;
-  const vanish = (ms: number): Promise<boolean> => (vanished ??= (async () => {
+  const vanish = (ms: number, evidence: EvidenceSeam = {}): Promise<boolean> => (vanished ??= (async () => {
     try {
       await dispose(owner, begun);
     } catch {
       // Whatever closing did or did not do, only the evidence below counts.
     }
     // Never connected: there was no session. (The tag is still looked for, for what it is worth.)
-    if (!connected) return barrierAbsent(tag, ms);
+    if (!connected) return barrierAbsent(tag, ms, evidence);
     // A session that was opened and never identified, or that the monitor never saw under the
     // identity it would be looked for by, cannot be seen gone: an absent row would prove nothing.
     if (!backend || !backendSeen) return false;
-    if (!(await barrierAbsent(tag, ms))) return false;
-    return backendAbsent(backend, ms);
+    if (!(await barrierAbsent(tag, ms, evidence))) return false;
+    return backendAbsent(backend, ms, evidence);
   })());
   let concluded = false;
   const conclude = (proven: boolean, reason: string): void => {

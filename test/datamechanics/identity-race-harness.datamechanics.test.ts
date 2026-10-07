@@ -10,8 +10,10 @@ import { setMemberIdentity } from "@/lib/identity/member-identities";
 import { db, seedTeam, type Seed } from "./helpers";
 import {
   RACE_TEST_TIMEOUT_MS,
+  RaceHarnessError,
   RaceScheduleError,
   type Barrier,
+  type EvidenceClock,
   authorityLockName,
   barrierSessions,
   closeRaceHarness,
@@ -24,6 +26,7 @@ import {
   sessionEvidence,
   sessionsNamed,
   untilBarrierGone,
+  untilEvidence,
   untilSessions,
 } from "./identity-race-harness";
 import {
@@ -63,7 +66,12 @@ import {
  *      cleanup clears only its own marker; unreadable state is not clean; a marker that cannot be
  *      written prevents the database work; a fresh run inherits nothing from another run's files;
  *      and the tier's setup file checks all of it at module scope and again before it truncates —
- *      ahead of this file's own hooks, which is asserted here rather than assumed.
+ *      ahead of this file's own hooks, which is asserted here rather than assumed;
+ *   5. an evidence wait ENDS AT ITS DEADLINE: evidence read at or after it is not accepted, however
+ *      much it is what was expected; a read still pending then fails the wait without another being
+ *      started; and what that read comes back with later changes nothing — so a barrier whose
+ *      absence could only be read after its cleanup budget stays `unproven`, its run stopped and its
+ *      marker on file. The deadline is staged on a clock moved by hand, never waited for.
  *
  * Everything is established from PostgreSQL evidence about exact, known backends. The "foreign"
  * sessions are plain clients this file opens and never registers with the harness. Wherever a
@@ -114,6 +122,105 @@ function gate(): { opened: Promise<void>; open: () => void } {
   const opened = new Promise<void>((resolve) => { open = resolve; });
   return { opened, open };
 }
+
+// ── A clock, and reads, that a test moves by hand ──────────────────────────────────────────────
+
+/** Counts things as they happen, and lets a test wait for the Nth of them — an event, never a time. */
+function tally(): { note: () => void; count: () => number; reached: (target: number) => Promise<void> } {
+  let count = 0;
+  let waiting: { target: number; resolve: () => void }[] = [];
+  return {
+    note: () => {
+      count += 1;
+      const ready = waiting.filter((waiter) => waiter.target <= count);
+      waiting = waiting.filter((waiter) => waiter.target > count);
+      for (const waiter of ready) waiter.resolve();
+    },
+    count: () => count,
+    reached: (target) => (count >= target
+      ? Promise.resolve()
+      : new Promise<void>((resolve) => { waiting = [...waiting, { target, resolve }]; })),
+  };
+}
+
+interface HandClock {
+  clock: EvidenceClock;
+  /** Move the time and fire NOTHING: the clock now reads later than any timer has been run for —
+   * what a busy event loop does when a result is delivered ahead of a timer that is already due. */
+  drift: (ms: number) => void;
+  /** Move the time and fire every timer then due, in the order they were set. */
+  tick: (ms: number) => void;
+  /** The delay of every timer ever set, in order. */
+  delays: () => number[];
+  /** How many timers are still set: neither fired nor called off. */
+  outstanding: () => number;
+  /** Resolves once `count` timers have been set in all. */
+  set: (count: number) => Promise<void>;
+}
+
+/** A clock a test moves by hand: time passes only when the test says so, and no timer fires by itself. */
+function handClock(): HandClock {
+  let now = 1_000_000;
+  let timers: { at: number; fire: () => void }[] = [];
+  let delays: number[] = [];
+  const set = tally();
+  return {
+    clock: {
+      now: () => now,
+      after: (ms, fire) => {
+        const timer = { at: now + ms, fire };
+        timers = [...timers, timer];
+        delays = [...delays, ms];
+        set.note();
+        return () => { timers = timers.filter((other) => other !== timer); };
+      },
+    },
+    drift: (ms) => { now += ms; },
+    tick: (ms) => {
+      now += ms;
+      const due = timers.filter((timer) => timer.at <= now);
+      timers = timers.filter((timer) => timer.at > now);
+      for (const timer of due) timer.fire();
+    },
+    delays: () => [...delays],
+    outstanding: () => timers.length,
+    set: set.reached,
+  };
+}
+
+interface HeldReads<T> {
+  read: () => Promise<T>;
+  /** How many reads have been asked for. */
+  count: () => number;
+  /** Resolves once `count` reads have been asked for in all. */
+  asked: (count: number) => Promise<void>;
+  answer: (index: number, value: T) => void;
+  fail: (index: number, error: unknown) => void;
+}
+
+/** Reads a test answers by hand: each one is counted, and stays pending until the test settles it. */
+function heldReads<T>(): HeldReads<T> {
+  let calls: { resolve: (value: T) => void; reject: (error: unknown) => void }[] = [];
+  const asked = tally();
+  return {
+    read: () => new Promise<T>((resolve, reject) => {
+      calls = [...calls, { resolve, reject }];
+      asked.note();
+    }),
+    count: asked.count,
+    asked: asked.reached,
+    answer: (index, value) => calls[index].resolve(value),
+    fail: (index, error) => calls[index].reject(error),
+  };
+}
+
+/**
+ * One turn of the event loop: every promise reaction queued so far, and all they queue in turn, has
+ * run. An ORDERING, not a wait — no time has to pass for it. It is what lets a test say "nothing came
+ * of that" of a promise it has just settled, and see a wait that failed to end as `pending` at once
+ * rather than by timing out on it.
+ */
+const turn = () => new Promise<void>((resolve) => { setImmediate(resolve); });
 
 /** One backend, exactly — its pid and when it started — as the session itself reports it. */
 interface BackendIdentity { pid: number; started: string }
@@ -990,4 +1097,260 @@ describe("race harness (4): the run-safety state — in-flight scopes, sticky fa
       expect(observed.truncationHooks, "global truncation hook runs before this file's hooks").toBe(observed.fileHooks);
     }
   });
+});
+
+/** The budget every wait below is given: the harness's own default for one cleanup step. */
+const BUDGET_MS = 5_000;
+/** The harness's interval between two reads of the same evidence. */
+const REREAD_MS = 25;
+
+describe("race harness (5): an evidence wait ends at its deadline — late evidence is not evidence (a clock and reads moved by hand)", () => {
+  /**
+   * The wait every cleanup proof is: "no session left". Its reads are answered by the test, and its
+   * clock moved by the test, so each case puts the read on exactly the side of the deadline it
+   * names. Nothing here sleeps, and nothing here touches the database.
+   */
+  type Sessions = { pid: number }[];
+  const untilNoSession = (hand: HandClock, reads: HeldReads<Sessions>): InFlight<Sessions> => inFlight(untilEvidence({
+    read: reads.read,
+    accept: (sessions) => sessions.length === 0,
+    expected: "no session left",
+    show: (sessions) => JSON.stringify(sessions),
+    timeoutMs: BUDGET_MS,
+    clock: hand.clock,
+  }));
+  const rejection = (wait: InFlight<Sessions>) => wait.promise.then(() => null, (error: unknown) => error);
+
+  it("evidence read BEFORE the deadline — by one millisecond — is accepted: one read, bounded by the whole budget, and that bound is called off", async () => {
+    const hand = handClock();
+    const reads = heldReads<Sessions>();
+    const wait = untilNoSession(hand, reads);
+    // Begun at once: one read, and one timer — the bound on that read, which is the whole budget.
+    expect(reads.count()).toBe(1);
+    expect(hand.delays()).toEqual([BUDGET_MS]);
+
+    hand.tick(BUDGET_MS - 1);
+    await turn();
+    expect(wait.state(), "nothing has ended the wait: its budget is not spent").toBe("pending");
+    reads.answer(0, []);
+
+    expect(await wait.promise).toEqual([]);
+    expect(reads.count()).toBe(1);
+    expect(hand.outstanding(), "the read's bound was called off, not left to fire").toBe(0);
+  });
+
+  it("the within-budget path: evidence that is not yet what is expected is re-read after the interval, each read bounded by what is LEFT of the one budget", async () => {
+    const hand = handClock();
+    const reads = heldReads<Sessions>();
+    const wait = untilNoSession(hand, reads);
+
+    hand.tick(100);
+    reads.answer(0, [{ pid: 7 }]);
+    // The pause before the next read is the second timer; until it is over, nothing is read.
+    await hand.set(2);
+    expect(reads.count()).toBe(1);
+    hand.tick(REREAD_MS);
+    await reads.asked(2);
+    // The second read is given what is left of the SAME budget — not a budget of its own.
+    expect(hand.delays()).toEqual([BUDGET_MS, REREAD_MS, BUDGET_MS - 100 - REREAD_MS]);
+
+    hand.tick(BUDGET_MS - 100 - REREAD_MS - 1);
+    reads.answer(1, []);
+    expect(await wait.promise).toEqual([]);
+    expect(reads.count()).toBe(2);
+    expect(hand.outstanding()).toBe(0);
+  });
+
+  it.each([
+    { when: "AT", past: 0 },
+    { when: "one millisecond AFTER", past: 1 },
+  ])("evidence that IS what was expected, read $when the deadline, fails the wait — also when it is delivered ahead of the timer that bounds its read", async ({ past }) => {
+    const hand = handClock();
+    const reads = heldReads<Sessions>();
+    const wait = untilNoSession(hand, reads);
+
+    // THE DEADLINE PASSES ON THE CLOCK, and the timer bounding the read has not been run: the read's
+    // result is delivered first. Only asking the clock again can tell that it is late.
+    hand.drift(BUDGET_MS + past);
+    expect(hand.outstanding()).toBe(1);
+    reads.answer(0, []);
+
+    const failure = await rejection(wait);
+    expect(failure, "acceptable evidence, read too late, must not be accepted").toBeInstanceOf(RaceHarnessError);
+    expect((failure as Error).message).toBe(
+      `no evidence within ${BUDGET_MS} ms of no session left; what was expected was read only at or after the deadline: []`,
+    );
+    expect(reads.count()).toBe(1);
+    expect(hand.delays(), "nothing was started after it: no pause, no other read").toEqual([BUDGET_MS]);
+    expect(hand.outstanding()).toBe(0);
+  });
+
+  it.each([
+    { later: "resolves with the very evidence that was expected", settle: (reads: HeldReads<Sessions>) => reads.answer(0, []) },
+    { later: "rejects", settle: (reads: HeldReads<Sessions>) => reads.fail(0, new Error("canceling statement due to statement timeout")) },
+  ])("a read still PENDING at the deadline fails the wait there — one read, and no other started — and when it later $later, nothing comes of it", async ({ settle }) => {
+    const hand = handClock();
+    const reads = heldReads<Sessions>();
+    const unhandled: unknown[] = [];
+    const noteUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+    process.on("unhandledRejection", noteUnhandled);
+    try {
+      const wait = untilNoSession(hand, reads);
+      hand.tick(BUDGET_MS - 1);
+      await turn();
+      expect(wait.state()).toBe("pending");
+
+      // THE DEADLINE: the bound on the read fires, and the read has still not come back.
+      hand.tick(1);
+      await turn();
+      expect(wait.state(), "a read that outlasts the deadline must not keep the wait open").toBe("rejected");
+      const failure = await rejection(wait);
+      expect(failure).toBeInstanceOf(RaceHarnessError);
+      expect((failure as Error).message).toBe(`no evidence within ${BUDGET_MS} ms of no session left; a read was still pending at the deadline`);
+      expect(reads.count(), "exactly one read: none is started once the budget is spent").toBe(1);
+      expect(hand.delays()).toEqual([BUDGET_MS]);
+
+      // THE READ COMES BACK NOW — observed, and dropped: not an unhandled rejection, not a second
+      // outcome for the wait, and not the start of anything else.
+      settle(reads);
+      await turn();
+      expect(unhandled).toEqual([]);
+      expect(wait.state()).toBe("rejected");
+      expect(await rejection(wait)).toBe(failure);
+      expect(reads.count()).toBe(1);
+      expect(hand.delays()).toEqual([BUDGET_MS]);
+    } finally {
+      process.removeListener("unhandledRejection", noteUnhandled);
+    }
+  });
+
+  it("the pause between two reads is bounded by the same deadline: evidence that is not what is expected, read just before it, is not re-read after it", async () => {
+    const hand = handClock();
+    const reads = heldReads<Sessions>();
+    const wait = untilNoSession(hand, reads);
+
+    hand.tick(BUDGET_MS - 10);
+    reads.answer(0, [{ pid: 7 }]);
+    await hand.set(2);
+    // Ten milliseconds are left, so the pause is ten — not the interval, which would outlast them.
+    expect(hand.delays()).toEqual([BUDGET_MS, 10]);
+    hand.tick(10);
+    await turn();
+
+    expect(wait.state()).toBe("rejected");
+    const failure = await rejection(wait);
+    expect(failure).toBeInstanceOf(RaceHarnessError);
+    expect((failure as Error).message).toBe(`no evidence within ${BUDGET_MS} ms of no session left; last saw [{"pid":7}]`);
+    expect(reads.count(), "no read is started at the deadline").toBe(1);
+    expect(hand.delays()).toEqual([BUDGET_MS, 10]);
+  });
+});
+
+describe("race harness (5, in a barrier): proof of a barrier's absence that arrives after its cleanup budget is not proof (real Postgres)", () => {
+  it("the one read of its absence is still pending when the budget runs out: the barrier is `unproven`, the run is stopped and the marker stays — and so they stay when that read is then let through and shows the session gone", async () => {
+    // Staged in a run-safety state of this test's own: the real run is not stopped by testing what stops it.
+    const { directory, safety } = privateRun();
+    const tag = `late-${randomUUID().slice(0, 8)}`;
+    const hand = handClock();
+    const held = gate();
+    const asked = tally();
+    let lateReads: Promise<unknown>[] = [];
+    // In front of every read of the barrier's absence: counted when the harness asks for it, and
+    // MADE — the real read, of the real `pg_stat_activity` — only once this test opens its gate.
+    const read = <T>(real: () => Promise<T>): Promise<T> => {
+      const late = held.opened.then(real);
+      lateReads = [...lateReads, late.then((value: unknown) => value, (error: unknown) => error)];
+      asked.note();
+      return late;
+    };
+    // The barrier is a REAL session, and its marker is in the private state, which the real run
+    // does not read. So the real run carries a sentinel of its own until that session is SEEN gone.
+    const staged = stagedOnRealRun("a barrier whose absence is read only after its cleanup budget has run out");
+    let barrier: Barrier | undefined;
+    let releaseStaged = false;
+    try {
+      // Acquired on the real clock and the real reads: nothing is staged until the barrier is held.
+      barrier = await holdNamedLock(`harness-late:${randomUUID()}`, { tag, safety });
+      expect(safety.armed()).toEqual([tag]);
+      expect(await barrierSessions(tag)).toEqual([{ pid: barrier.pid, state: "idle in transaction" }]);
+      expect(currentRunSafety().armed(), "the real run: the sentinel, and only the sentinel").toEqual([staged.scope]);
+
+      // ITS RELEASE BEGINS. The connection is really closed; then the proof of its absence is asked
+      // for — on a clock this test moves, from a read this test holds back.
+      releaseStaged = true;
+      const vanishing = inFlight(barrier.vanish(BUDGET_MS, { clock: hand.clock, read }));
+      // Until the read is asked for — or, were it never to be, until `vanish` has ended without it.
+      await Promise.race([asked.reached(1), vanishing.promise.then(() => undefined, () => undefined)]);
+      expect(asked.count(), "the proof of absence was asked for").toBe(1);
+      expect(hand.delays(), "that read is bounded by the cleanup budget").toEqual([BUDGET_MS]);
+      await turn();
+      expect(vanishing.state()).toBe("pending");
+
+      // THE CLEANUP BUDGET RUNS OUT with that one read still pending.
+      hand.tick(BUDGET_MS);
+      await turn();
+      expect(vanishing.state(), "a proof still being read at the deadline must not keep cleanup waiting").toBe("resolved");
+      expect(await vanishing.promise, "not seen gone within the budget").toBe(false);
+      expect(asked.count(), "exactly one read: none is started once the budget is spent").toBe(1);
+
+      // So the release is refused, as `unproven`, and THE RUN IS STOPPED: a fatal reason, the
+      // marker still on file, and the guard the setup file runs — at module scope and before every
+      // TRUNCATE — refusing.
+      const failure = await barrier.release().then(() => null, (error: unknown) => error);
+      expect(failure).toBeInstanceOf(RaceScheduleError);
+      expect((failure as RaceScheduleError).cleanup).toEqual({ outcome: "unproven", barrierGone: false, signalled: [], operations: [] });
+      const reason = safety.fatal();
+      expect(reason).toMatch(/barrier late-[a-f0-9]+ was released, and its session could not be proven gone/);
+      expect(safety.armed()).toEqual([tag]);
+      expect(() => assertRunSafe(safety)).toThrow(/run STOPPED — refusing to truncate or run another test/);
+
+      // The session really is gone by now — seen by this test's own reading, on the real clock —
+      // so what the held read will return is exactly the evidence the harness was waiting for.
+      await untilBarrierGone(tag);
+
+      // THE LATE READ IS LET THROUGH, and returns it: no session under the tag.
+      held.open();
+      expect(await lateReads[0]).toEqual([]);
+      await turn();
+
+      // NOTHING CAME OF IT. The wait did not go on: no other read, no pause, no other bound…
+      expect(asked.count()).toBe(1);
+      expect(lateReads).toHaveLength(1);
+      expect(hand.delays()).toEqual([BUDGET_MS]);
+      // …the barrier is as unproven as it was, to the schedules and to its own release…
+      expect(await barrier.vanish(BUDGET_MS)).toBe(false);
+      expect(await barrier.release().then(() => null, (error: unknown) => error)).toBe(failure);
+      // …no later conclusion clears what was concluded…
+      barrier.conclude(true, "");
+      expect(safety.armed()).toEqual([tag]);
+      expect(safety.fatal()).toBe(reason);
+      expect(safety.setFatal("a later, different reason")).toBe(reason);
+      // …and the guard still refuses — here, and for any other reader of the same state, as the
+      // next test file's worker is.
+      expect(() => assertRunSafe(safety)).toThrow(/run STOPPED — refusing to truncate or run another test/);
+      const elsewhere = createRunSafety(directory);
+      expect(elsewhere.armed()).toEqual([tag]);
+      expect(elsewhere.fatal()).toBe(reason);
+      expect(() => assertRunSafe(elsewhere)).toThrow(/run STOPPED/);
+      // The real run was not stopped by this test: its state is not this one.
+      expect(raceHarnessFatal()).toBeNull();
+      expect(currentRunSafety().armed()).toEqual([staged.scope]);
+    } finally {
+      // ON EVERY EXIT nothing stays held back, and the real run's sentinel comes off only once the
+      // barrier's session is SEEN gone — by this test's own reading, on the real clock. `vanish`
+      // closes the connection before it asks for any evidence, so a release that was staged has
+      // closed it whatever became of the staged proof, and is NOT awaited here: on the hand clock
+      // it might never end. A barrier this test never got to release is released now, for real.
+      // If the session cannot be seen gone, this throws, the sentinel stays, and the real run stops.
+      held.open();
+      if (barrier && !releaseStaged) await barrier.release().catch(() => undefined);
+      await untilBarrierGone(tag);
+      staged.clear();
+    }
+    // The sentinel took nothing else with it: the staged state is still stopped, its scope still on
+    // file, and the real run is clean.
+    expect(safety.armed()).toEqual([tag]);
+    expect(safety.fatal()).toMatch(/could not be proven gone/);
+    expect(currentRunSafety().blocked()).toBeNull();
+  }, RACE_TEST_TIMEOUT_MS);
 });
