@@ -1,15 +1,35 @@
 import { TransactionExecutionError } from "@/lib/db/pg/tx";
 import type { TransactionSession } from "@/lib/db/types";
-import { SlackKnownRootValidationError, type SlackKnownRootEntry, type SlackKnownRootExecution } from "./slack-known-root-page";
+import {
+  SlackKnownRootValidationError,
+  admitSlackKnownRootExecution,
+  captureSlackKnownRootEntry,
+  captureSlackKnownRootTeamId,
+  runSlackKnownRootOperation,
+  type SlackKnownRootEntry,
+  type SlackKnownRootExecution,
+  type SlackKnownRootLocatedEntry,
+} from "./slack-known-root-page";
+import { lockReadySlackNamespaceGate } from "./slack-namespace-gate";
+import { lockSlackSelection } from "./slack-source-binding";
+import { enqueueSlackThread } from "./slack-thread-state";
+import { scopedSlackItemPath } from "./sources/slack-namespace";
+import { slackChannelPathPrefix } from "./sources/slack-normalize";
 
 /**
  * AIO-1170 AC-02 — INACTIVE preparation of completed-root reconciliation work
  * (`docs/design/slack-known-root-requeue-spec.md`, §5, §6 and §8).
  *
- * PARTLY IMPLEMENTED. The two PURE helpers are the accepted ones: the failure classifier (§8.1) and
- * the page tally reducer (§8.2, §8.3). Neither performs I/O. `prepareSlackKnownRootRequeue` is STILL
- * THE RED-CHECKPOINT PLACEHOLDER: it does no work — no SQL, no lock, no enqueue, no validation — and
- * reports a fixed refusal for every input. The accepted preparation replaces that body.
+ * `prepareSlackKnownRootRequeue` recreates the missing pending row of ONE previously published,
+ * provably canonical Slack root, from the team and one enumerated entry and nothing else. It checks
+ * current source authority under the same locks, in the same order, as publication; proves the item
+ * canonical and its root witnessed under the item's own lock; and then hands the exact scope and an
+ * observation-derived due time to the existing enqueue helper — its only write. It issues no
+ * provider request, opens no transaction, and writes no item, ledger row, identity, generation or
+ * channel state. A stored proof is checked, never refreshed.
+ *
+ * The two PURE helpers that account for it — the failure classifier (§8.1) and the page tally
+ * reducer (§8.2, §8.3) — are here as well. Neither performs I/O.
  *
  * Nothing in the application imports this module
  * (`test/guards/slack-known-root-requeue-not-wired.test.ts`, `test/guards/slack-source-not-wired.test.ts`).
