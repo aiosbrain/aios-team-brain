@@ -54,14 +54,26 @@ const EVIDENCE_INTERVAL_MS = 25;
  * The timeout of every test that races — far above Vitest's default (5 s), which is shorter than a
  * single evidence wait.
  *
- * What one schedule can spend, each part separately bounded: the barrier's acquisition
- * (`OWNED_CONNECTION_BOUND_MS`); its evidence waits, of which there are SEVERAL — `parkThenCompete`
- * makes three, five with `whileQueued`; `parkWhile` makes two around a bounded run — each up to
- * `pollMs`; then the barrier's disappearance (`cleanupMs`) and up to three cleanup rounds (settle,
- * cancel, terminate) of up to two `cleanupMs` each. A wait that succeeds returns as soon as
- * PostgreSQL shows the evidence, and a schedule stops at its first wait that fails, so in practice
- * one wait runs long. But nothing makes the others short: a schedule in which every wait takes
- * nearly its whole bound adds up to more than this timeout.
+ * What one schedule can spend, each part separately bounded:
+ *
+ *   - the barrier's acquisition: connecting, its four statements (who it is, BEGIN, the lock
+ *     timeout, the lock) and the monitor's two reads of it (that exact backend, then its tag), up
+ *     to `OWNED_CONNECTION_BOUND_MS` apiece;
+ *   - its evidence waits, of which there are SEVERAL — `parkThenCompete` makes three, five with
+ *     `whileQueued`; `parkWhile` makes two around a bounded run — each up to `pollMs`;
+ *   - the barrier's disappearance, which is FOUR bounded steps, not one: `disposeOwned` rolls back
+ *     and then ends the connection (up to `OWNED_CONNECTION_BOUND_MS` each), and absence is then
+ *     waited for twice — no session under the tag, and not that exact backend — up to `cleanupMs`
+ *     each;
+ *   - up to three cleanup rounds (settle, cancel, terminate) of up to two `cleanupMs` each.
+ *
+ * At the defaults (`pollMs` 10 s, `cleanupMs` 5 s, `OWNED_CONNECTION_BOUND_MS` 10 s) that is up to
+ * 70 s to acquire, 30 s of evidence waits (50 s with `whileQueued`), 30 s for the barrier to be seen
+ * gone and 30 s of cleanup rounds: 160 s, or 180 s — and 90 s (110 s) even when acquisition is
+ * instant. A wait that succeeds returns as soon as PostgreSQL shows the evidence, and a schedule
+ * stops at its first wait that fails, so in practice one wait runs long. But nothing makes the
+ * others short: a schedule in which every part takes nearly its whole bound adds up to more than
+ * this timeout.
  *
  * That case is not made to fit by this number; it fails closed. A test Vitest gives up on leaves
  * its scope's in-flight marker on file until `finish` has proven cleanup, and until then the
@@ -315,12 +327,22 @@ const UNPROVEN_BARRIER: CleanupReport = { outcome: "unproven", barrierGone: fals
  * session's time zone), so a later backend given the same pid is not it. */
 interface BackendIdentity { pid: number; started: string }
 
-/** That exact backend was SEEN to be absent within `ms`. Unreadable evidence is not absence. */
+/** The monitor's own reading of one exact backend: the rows of `pg_stat_activity` that are it. */
+const backendRows = (backend: BackendIdentity) => observe<{ pid: number }>(
+  "select pid from pg_stat_activity where pid = $1 and extract(epoch from backend_start)::text = $2", [backend.pid, backend.started]);
+
+/**
+ * That exact backend was SEEN to be absent within `ms`. Unreadable evidence is not absence.
+ *
+ * Only meaningful for a backend the monitor has first SEEN PRESENT under this same predicate
+ * (`holdLock` records that): "no row matches" proves a backend gone only if a row did match while
+ * it was alive. Without that, a predicate that never matched — the two sessions rendering the start
+ * time differently, say — would read as "gone" at once.
+ */
 async function backendAbsent(backend: BackendIdentity, ms: number): Promise<boolean> {
   try {
     await untilEvidence({
-      read: () => observe<{ pid: number }>(
-        "select pid from pg_stat_activity where pid = $1 and extract(epoch from backend_start)::text = $2", [backend.pid, backend.started]),
+      read: () => backendRows(backend),
       accept: (sessions) => sessions.length === 0,
       expected: `backend ${backend.pid} (started ${backend.started}) gone`,
       show: (sessions) => JSON.stringify(sessions),
@@ -366,7 +388,10 @@ async function barrierAbsent(tag: string, ms: number): Promise<boolean> {
  * out, the monitor must see exactly one session under the tag, and it must be this backend. Either
  * failing is a failed acquisition. And absence is then seen twice over: no session under the tag,
  * and not this exact backend (its pid and start time) — so a session that could not be found by
- * its name is still not mistaken for one that has gone.
+ * its name is still not mistaken for one that has gone. That second proof has a positive control
+ * of its own: right after the session identifies itself, the monitor must see exactly that backend
+ * by the very predicate that will later show it gone. A backend the monitor never saw present —
+ * unreadable, or not matching — is `unproven` on every path; its absence is never taken as proof.
  */
 export async function holdLock(sql: string, params: unknown[] = [], opts: BarrierOptions = {}): Promise<Barrier> {
   const tag = opts.tag ?? randomUUID().slice(0, 12);
@@ -391,6 +416,8 @@ export async function holdLock(sql: string, params: unknown[] = [], opts: Barrie
   let connected = false;
   let begun = false;
   let backend: BackendIdentity | null = null;
+  // The monitor has SEEN that exact backend present — the positive control its absence rests on.
+  let backendSeen = false;
   let vanished: Promise<boolean> | undefined;
   const vanish = (ms: number): Promise<boolean> => (vanished ??= (async () => {
     try {
@@ -398,10 +425,13 @@ export async function holdLock(sql: string, params: unknown[] = [], opts: Barrie
     } catch {
       // Whatever closing did or did not do, only the evidence below counts.
     }
-    // A session that was opened and never identified cannot be seen gone: nothing says where to look.
-    if (connected && !backend) return false;
+    // Never connected: there was no session. (The tag is still looked for, for what it is worth.)
+    if (!connected) return barrierAbsent(tag, ms);
+    // A session that was opened and never identified, or that the monitor never saw under the
+    // identity it would be looked for by, cannot be seen gone: an absent row would prove nothing.
+    if (!backend || !backendSeen) return false;
     if (!(await barrierAbsent(tag, ms))) return false;
-    return backend ? backendAbsent(backend, ms) : true;
+    return backendAbsent(backend, ms);
   })());
   let concluded = false;
   const conclude = (proven: boolean, reason: string): void => {
@@ -430,6 +460,16 @@ export async function holdLock(sql: string, params: unknown[] = [], opts: Barrie
     }
     backend = { pid: self.pid, started: self.started };
     const pid = backend.pid;
+    // THE POSITIVE CONTROL FOR ITS IDENTITY, before anything can fail on its name: the monitor must
+    // see exactly one row that is this backend, by the predicate that will later be asked to show
+    // it gone. If it does not — or cannot be read — the session is never treated as absent.
+    const present = await backendRows(backend);
+    if (present.length !== 1 || present[0].pid !== pid) {
+      throw new RaceHarnessError(
+        `barrier ${tag}: the monitor must see exactly its backend ${pid} (started ${backend.started}), and sees ${JSON.stringify(present)}`,
+      );
+    }
+    backendSeen = true;
     if (self.name !== sessionName) {
       throw new RaceHarnessError(
         `barrier ${tag}: its session reports application_name ${JSON.stringify(self.name)}, not ${JSON.stringify(sessionName)} — `
