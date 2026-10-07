@@ -3,6 +3,7 @@ import { Client } from "pg";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getPool } from "@/lib/db/pg/pool";
 import { listMemberIdentities } from "@/lib/identity/list";
+import { removeMemberIdentity, setMemberIdentity } from "@/lib/identity/member-identities";
 import { db, seedTeam, type Seed } from "./helpers";
 
 /**
@@ -26,7 +27,16 @@ import { db, seedTeam, type Seed } from "./helpers";
  *      an identity that is already linked is refused outright, with no offer and no write, while
  *      it may still claim a new identity or re-link an unlinked tombstone;
  *   4. the write, its audit actor, its epoch and its repair obligation are the shared writer's,
- *      once per mapping change — and a refusal or an offer causes none of them.
+ *      once per mapping change — and a refusal or an offer causes none of them;
+ *   5. the whole fenced decision runs inside the team's identity mutation boundary. The holder and
+ *      the revision of the requested id are ONE observation — no remap commits between the two
+ *      reads — and the displayed identity cannot be unlinked or remapped between its validation and
+ *      the requested id's write. An offer releases the boundary; a confirmation enters a fresh one
+ *      and is held to the revision the admin was shown.
+ *
+ * The races in (5) are driven deterministically: one side is parked on a PostgreSQL lock held by a
+ * connection of the test's own, and the other is shown — from `pg_locks`, not from a clock — to be
+ * waiting on the team authority the parked side holds, before the lock is released.
  *
  * The action and the writer are the REAL ones. Only the session lookup, the cache revalidation and
  * the post-response deferral — which need a live Next request — are stood in for; the deferred
@@ -139,10 +149,12 @@ async function unlinkDisplayed(seed: Seed, memberId: string, provider: Provider,
 }
 
 /**
- * Run two calls so that EACH has made its observation before EITHER may write: the team's identity
- * authority is held from a connection of its own until both writers are waiting on it.
+ * Put two fenced calls in flight TOGETHER: the team's identity authority is held from a connection
+ * of its own until both are waiting on it — which is before either has observed anything, because
+ * the fenced action enters the boundary first. Released, they run one after the other, and the
+ * second observes what the first committed.
  */
-async function afterBothObserved<T>(seed: Seed, first: () => Promise<T>, second: () => Promise<T>): Promise<[T, T]> {
+async function bothQueuedOnAuthority<T>(seed: Seed, first: () => Promise<T>, second: () => Promise<T>): Promise<[T, T]> {
   const owner = new Client({ connectionString: process.env.DATABASE_URL });
   owner.on("error", () => undefined);
   await owner.connect();
@@ -159,6 +171,96 @@ async function afterBothObserved<T>(seed: Seed, first: () => Promise<T>, second:
     await owner.end().catch(() => undefined);
   }
   return both;
+}
+
+interface Barrier { pid: number; release: () => Promise<void> }
+
+/** A connection of its own, in a transaction that holds the lock `sql` takes until `release()`. */
+async function holdLock(sql: string, params: unknown[] = []): Promise<Barrier> {
+  const owner = new Client({ connectionString: process.env.DATABASE_URL });
+  owner.on("error", () => undefined);
+  await owner.connect();
+  await owner.query("begin");
+  await owner.query(sql, params);
+  const pid = (await owner.query<{ pid: number }>("select pg_backend_pid() as pid")).rows[0].pid;
+  let released = false;
+  return {
+    pid,
+    release: async () => {
+      if (released) return;
+      released = true;
+      await owner.query("rollback").catch(() => undefined);
+      await owner.end().catch(() => undefined);
+    },
+  };
+}
+
+/** ACCESS EXCLUSIVE on one identity table: every read and write of it waits, nothing else does. */
+const holdTable = (table: "member_identities" | "member_identity_mapping_state") =>
+  holdLock(`lock table ${table} in access exclusive mode`);
+
+/** The writer's own exact-identity advisory key — taken after the team authority, before its rows. */
+const holdIdentityKey = (seed: Seed, provider: Provider, externalId: string) =>
+  holdLock("select pg_advisory_xact_lock(hashtextextended($1, 0))", [`${seed.teamId}:identity:${provider}:${externalId}`]);
+
+interface LockWait { pid: number; locktype: string; blockers: number[] }
+
+/** Every backend waiting on a lock right now: the kind of lock, and exactly which backends block it. */
+async function lockWaits(): Promise<LockWait[]> {
+  const { rows } = await getPool().query<LockWait>(
+    "select pid, locktype, pg_blocking_pids(pid) as blockers from pg_locks where not granted order by pid");
+  return rows;
+}
+
+/** Wait — on PostgreSQL's own lock table, never on a clock — until exactly these waits exist. */
+async function untilWaiting(expected: { locktype: string; blockedBy: number }[]): Promise<LockWait[]> {
+  // `pg_blocking_pids` may repeat a backend that blocks through more than one lock.
+  const shape = (waits: { locktype: string; blockers: number[] }[]) =>
+    waits.map((wait) => `${wait.locktype} blocked by ${[...new Set(wait.blockers)].sort().join(",")}`).sort();
+  await expect.poll(async () => shape(await lockWaits()), { timeout: 10_000 })
+    .toEqual(shape(expected.map((wait) => ({ locktype: wait.locktype, blockers: [wait.blockedBy] }))));
+  return lockWaits();
+}
+
+/**
+ * THE DETERMINISTIC RACE. `first` is started and PARKED: it must come to wait on the barrier (a
+ * `relation` or `advisory` wait, blocked by the barrier's backend and nothing else). Only then is
+ * `second` started, and it must come to wait on an ADVISORY lock blocked by `first`'s backend and
+ * nothing else — the team identity authority `first` holds. Then the barrier is released and both
+ * finish. Every step is evidence read from `pg_locks`; if `second` did not wait behind `first`
+ * (or waited on anything else), the poll fails rather than the test passing by timing.
+ */
+async function parkThenCompete<A, B>(opts: {
+  barrier: Barrier;
+  parksOn: "relation" | "advisory";
+  first: () => Promise<A>;
+  second: () => Promise<B>;
+}): Promise<{ first: A; second: B }> {
+  let first: Promise<A> | undefined;
+  let second: Promise<B> | undefined;
+  try {
+    first = opts.first();
+    first.catch(() => undefined);
+    const parked = await untilWaiting([{ locktype: opts.parksOn, blockedBy: opts.barrier.pid }]);
+    const holder = parked[0].pid;
+    second = opts.second();
+    second.catch(() => undefined);
+    await untilWaiting([
+      { locktype: opts.parksOn, blockedBy: opts.barrier.pid },
+      { locktype: "advisory", blockedBy: holder },
+    ]);
+  } finally {
+    await opts.barrier.release();
+  }
+  return { first: await first!, second: await second! };
+}
+
+/** The team's identity audit rows in commit order: which id, and what was done to it. */
+async function auditOrder(seed: Seed): Promise<[string, string][]> {
+  const { rows } = await getPool().query<{ external_id: string; action: string }>(
+    `select meta->>'external_id' as external_id, action from audit_log
+      where team_id=$1 and action in ('identity.set','identity.removed') order by id`, [seed.teamId]);
+  return rows.map((row) => [row.external_id, row.action]);
 }
 
 beforeEach(() => {
@@ -339,20 +441,26 @@ describe.each(PROVIDERS)("AIO-1167 X-02 — %s: the Admin link keeps the display
     expect(await mapping(seed, provider, target)).toEqual({ holder: bob, revision: 2, state: "linked" });
   });
 
-  it("CONCURRENT first claims and CONCURRENT confirmed remaps: each pair observes the same state, and the writer lets exactly one win", async () => {
+  it("CONCURRENT first claims and CONCURRENT confirmed remaps: the two are serialized, exactly one writes, and the other is answered from what the first committed — never refreshed into a second write", async () => {
     const seed = await adminSeed();
     const alice = await member(seed, "Alice");
     const bob = await member(seed, "Bob");
     const carol = await member(seed, "Carol");
     const claimed = idFor(provider, "claimed");
 
-    // Both blank rows observe "never linked" (revision 0) before either writes.
-    const claims = await afterBothObserved(seed,
+    // Two blank rows claim one never-linked id together. One writes it. The other, observing
+    // under the same authority, sees an id that is now held: it is offered the remap — or, from a
+    // blank Google row, refused outright — and writes nothing.
+    const claims = await bothQueuedOnAuthority(seed,
       () => link(seed, alice, provider, claimed, BLANK),
       () => link(seed, bob, provider, claimed, BLANK));
     expect(claims.filter((result) => result.ok)).toEqual([{ ok: true }]);
-    expect(claims.filter((result) => !result.ok)).toEqual([{ ok: false, error: STALE }]);
     const claimant = claims[0].ok ? alice : bob;
+    const claimantName = claims[0].ok ? "Alice" : "Bob";
+    expect(claims.filter((result) => !result.ok)).toEqual([provider === "gdrive"
+      ? { ok: false, error: "this Google identity is already linked; refresh and use Change" }
+      : { ok: false, error: `this ${provider} identity is linked to ${claimantName}; confirm to remap it`,
+        remap: { externalId: claimed, revision: 1, linkedTo: claimantName } }]);
     expect(await mapping(seed, provider, claimed)).toEqual({ holder: claimant, revision: 1, state: "linked" });
     expect(await audits(seed, claimed)).toHaveLength(1);
 
@@ -362,13 +470,156 @@ describe.each(PROVIDERS)("AIO-1167 X-02 — %s: the Admin link keeps the display
     expect(await link(seed, carol, provider, held, BLANK)).toEqual({ ok: true });
     const aliceRow = await ownRow(seed, alice, provider);
     const bobRow = await ownRow(seed, bob, provider);
-    const remaps = await afterBothObserved(seed,
+    // TARGET CAS: each confirmation hands the writer the revision its admin was SHOWN (1). The
+    // second finds the id at revision 2 and is refused by the writer's compare-and-set.
+    const remaps = await bothQueuedOnAuthority(seed,
       () => link(seed, alice, provider, held, { original: aliceRow, remap: { revision: 1 } }),
       () => link(seed, bob, provider, held, { original: bobRow, remap: { revision: 1 } }));
     expect(remaps.filter((result) => result.ok)).toEqual([{ ok: true }]);
     expect(remaps.filter((result) => !result.ok)).toEqual([{ ok: false, error: STALE }]);
     expect(await mapping(seed, provider, held)).toEqual({ holder: remaps[0].ok ? alice : bob, revision: 2, state: "linked" });
     expect((await audits(seed, held)).map((row) => row.mapping_revision)).toEqual([1, 2]);
+  });
+});
+
+describe.each(PROVIDERS)("AIO-1167 X-02 — %s: the fenced decision is ONE boundary — deterministic races against the real writer (real Postgres)", (provider) => {
+  /** Alice acts from a Change row displaying her own identity; Bob holds the id she asks for. */
+  async function heldTarget() {
+    const seed = await adminSeed();
+    const alice = await member(seed, "Alice");
+    const bob = await member(seed, "Bob");
+    const carol = await member(seed, "Carol");
+    const target = idFor(provider, "held");
+    expect(await link(seed, bob, provider, target, BLANK)).toEqual({ ok: true });
+    const aliceRow = await ownRow(seed, alice, provider);
+    return { seed, alice, bob, carol, target, aliceRow };
+  }
+  const offerOf = (target: string, revision: number, linkedTo: string) => ({
+    ok: false, error: `this ${provider} identity is linked to ${linkedTo}; confirm to remap it`,
+    remap: { externalId: target, revision, linkedTo },
+  });
+
+  it("(1) OFFER OBSERVATION: a competing remap of the requested id cannot commit inside the action's observation — it waits for the action, and the offer names one holder at that holder's revision", async () => {
+    const { seed, alice, carol, target, aliceRow } = await heldTarget();
+
+    // The action is parked INSIDE its observation: it has read who holds an id and is waiting to
+    // read the mapping revisions. The real writer then remaps the requested id Bob → Carol.
+    const { first: offer, second: remapped } = await parkThenCompete({
+      barrier: await holdTable("member_identity_mapping_state"),
+      parksOn: "relation",
+      first: () => link(seed, alice, provider, target, { original: aliceRow }),
+      second: () => setMemberIdentity(db(), seed.teamId, carol, { provider, externalId: target }, { force: true, expectedRevision: 1 }),
+    });
+
+    // Bob at Bob's revision — not Bob at Carol's, which is what a remap between the reads gave.
+    expect(offer).toEqual(offerOf(target, 1, "Bob"));
+    // The remap was only made to wait: it then committed, against the state the action left alone.
+    expect(remapped).toMatchObject({ memberId: carol, updated: true, conflict: false, mappingRevision: 2 });
+    expect(await mapping(seed, provider, target)).toEqual({ holder: carol, revision: 2, state: "linked" });
+
+    // Alice's offer was for Bob's link at revision 1. Confirming it is NOT refreshed to Carol's.
+    const moved = await effects(seed, provider, target);
+    expect(await link(seed, alice, provider, target, { original: aliceRow, remap: { revision: 1 } })).toEqual({ ok: false, error: STALE });
+    expect(await mapping(seed, provider, target)).toEqual({ holder: carol, revision: 2, state: "linked" });
+    expect(await effects(seed, provider, target)).toEqual(moved);
+  });
+
+  it("(2) a competing remap that COMMITS FIRST is what the action then shows: the new holder at the new revision, and that exact revision is what a confirmation remaps", async () => {
+    const { seed, alice, carol, target, aliceRow } = await heldTarget();
+
+    // The real writer is parked mid-remap, holding the team authority; the action is in flight
+    // behind it and has observed nothing yet.
+    const { first: remapped, second: offer } = await parkThenCompete({
+      barrier: await holdTable("member_identity_mapping_state"),
+      parksOn: "relation",
+      first: () => setMemberIdentity(db(), seed.teamId, carol, { provider, externalId: target }, { force: true, expectedRevision: 1 }),
+      second: () => link(seed, alice, provider, target, { original: aliceRow }),
+    });
+
+    expect(remapped).toMatchObject({ memberId: carol, updated: true, mappingRevision: 2 });
+    expect(offer).toEqual(offerOf(target, 2, "Carol"));
+    expect(await mapping(seed, provider, target)).toEqual({ holder: carol, revision: 2, state: "linked" });
+
+    expect(await link(seed, alice, provider, target, { original: aliceRow, remap: { revision: 2 } })).toEqual({ ok: true });
+    expect(await mapping(seed, provider, target)).toEqual({ holder: alice, revision: 3, state: "linked" });
+  });
+
+  it("(3) the DISPLAYED identity cannot be remapped or unlinked between its validation and the requested id's write: the competing mutation waits for the action and commits after it", async () => {
+    const seed = await adminSeed();
+    const alice = await member(seed, "Alice");
+    const bob = await member(seed, "Bob");
+
+    // (a) Parked as its validation begins. A real remap of the displayed id (Alice → Bob) arrives.
+    const shownA = await ownRow(seed, alice, provider);
+    const nextA = idFor(provider, "next");
+    const remap = await parkThenCompete({
+      barrier: await holdTable("member_identities"),
+      parksOn: "relation",
+      first: () => link(seed, alice, provider, nextA, { original: shownA }),
+      second: () => setMemberIdentity(db(), seed.teamId, bob, { provider, externalId: shownA.externalId }, { force: true, expectedRevision: shownA.revision }),
+    });
+    // The action validated the identity as displayed and wrote the requested id; only then did
+    // the remap of the displayed identity commit.
+    expect(remap.first).toEqual({ ok: true });
+    expect(remap.second).toMatchObject({ memberId: bob, updated: true, mappingRevision: shownA.revision + 1 });
+    expect(await mapping(seed, provider, nextA)).toEqual({ holder: alice, revision: 1, state: "linked" });
+    expect(await mapping(seed, provider, shownA.externalId)).toEqual({ holder: bob, revision: shownA.revision + 1, state: "linked" });
+    expect((await auditOrder(seed)).slice(-2)).toEqual([[nextA, "identity.set"], [shownA.externalId, "identity.set"]]);
+
+    // (b) Parked BETWEEN the two: the displayed identity is validated and the requested id
+    // observed; the writer is waiting for the requested id's own key. A real unlink of the
+    // displayed identity arrives.
+    const shownB = await ownRow(seed, alice, provider);
+    const nextB = idFor(provider, "next");
+    const unlink = await parkThenCompete({
+      barrier: await holdIdentityKey(seed, provider, nextB),
+      parksOn: "advisory",
+      first: () => link(seed, alice, provider, nextB, { original: shownB }),
+      second: () => removeMemberIdentity(db(), seed.teamId, { provider, externalId: shownB.externalId }, { expectedRevision: shownB.revision }),
+    });
+    expect(unlink.first).toEqual({ ok: true });
+    expect(unlink.second).toEqual({ removed: true, mappingRevision: shownB.revision + 1 });
+    expect(await mapping(seed, provider, nextB)).toEqual({ holder: alice, revision: 1, state: "linked" });
+    expect(await mapping(seed, provider, shownB.externalId)).toEqual({ holder: null, revision: shownB.revision + 1, state: "unlinked" });
+    expect((await auditOrder(seed)).slice(-2)).toEqual([[nextB, "identity.set"], [shownB.externalId, "identity.removed"]]);
+  });
+
+  it("(4) a displayed identity mutated FIRST — committed before the action starts, or while it waits — makes the action stale: no requested id, no audit row, no effect", async () => {
+    const seed = await adminSeed();
+    const alice = await member(seed, "Alice");
+    const bob = await member(seed, "Bob");
+
+    // (a) Committed before the action starts: the displayed id is remapped to Bob.
+    const shownA = await ownRow(seed, alice, provider);
+    const nextA = idFor(provider, "next");
+    await setMemberIdentity(db(), seed.teamId, bob, { provider, externalId: shownA.externalId }, { force: true, expectedRevision: shownA.revision });
+    const beforeA = await effects(seed, provider, nextA);
+    expect(await link(seed, alice, provider, nextA, { original: shownA })).toEqual({ ok: false, error: STALE });
+    expect(await mapping(seed, provider, nextA)).toEqual({ holder: null, revision: 0, state: null });
+    expect(await audits(seed, nextA)).toEqual([]);
+    expect(await effects(seed, provider, nextA)).toEqual(beforeA);
+
+    // (b) Committed while the action waits: a real unlink of the displayed id is parked holding
+    // the team authority; the action is in flight behind it and has validated nothing yet.
+    const shownB = await ownRow(seed, alice, provider);
+    const nextB = idFor(provider, "next");
+    const beforeB = await effects(seed, provider, nextB);
+    const { first: unlinked, second: change } = await parkThenCompete({
+      barrier: await holdTable("member_identity_mapping_state"),
+      parksOn: "relation",
+      first: () => removeMemberIdentity(db(), seed.teamId, { provider, externalId: shownB.externalId }, { expectedRevision: shownB.revision }),
+      second: () => link(seed, alice, provider, nextB, { original: shownB }),
+    });
+    expect(unlinked).toEqual({ removed: true, mappingRevision: shownB.revision + 1 });
+    expect(change).toEqual({ ok: false, error: STALE });
+    expect(await mapping(seed, provider, nextB)).toEqual({ holder: null, revision: 0, state: null });
+    expect(await audits(seed, nextB)).toEqual([]);
+    // The unlink's own row change is the only one the team authority counted, and the action
+    // deferred nothing.
+    const afterB = await effects(seed, provider, nextB);
+    expect(afterB.authority).toBe(beforeB.authority + 1);
+    expect(afterB.obligations).toEqual([]);
+    expect(afterB.deferred).toBe(beforeB.deferred);
   });
 });
 
