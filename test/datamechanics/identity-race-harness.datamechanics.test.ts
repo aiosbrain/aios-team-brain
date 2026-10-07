@@ -2,8 +2,8 @@ import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Client, type PoolClient } from "pg";
-import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { Client, PoolClient } from "pg";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getPool } from "@/lib/db/pg/pool";
 import { listMemberIdentities } from "@/lib/identity/list";
 import { setMemberIdentity } from "@/lib/identity/member-identities";
@@ -13,7 +13,10 @@ import {
   RaceHarnessError,
   RaceScheduleError,
   type Barrier,
+  type Disposal,
   type EvidenceClock,
+  type PendingSignal,
+  type TestSession,
   authorityLockName,
   barrierSessions,
   closeRaceHarness,
@@ -21,13 +24,16 @@ import {
   holdLock,
   holdNamedLock,
   holdTable,
+  openTestSession,
   parkThenCompete,
   raceHarnessFatal,
   sessionEvidence,
   sessionsNamed,
+  settleStarted,
   untilBarrierGone,
   untilEvidence,
   untilSessions,
+  withinBound,
 } from "./identity-race-harness";
 import {
   RUN_ID_ENV,
@@ -71,12 +77,22 @@ import {
  *      much it is what was expected; a read still pending then fails the wait without another being
  *      started; and what that read comes back with later changes nothing — so a barrier whose
  *      absence could only be read after its cleanup budget stays `unproven`, its run stopped and its
- *      marker on file. The deadline is staged on a clock moved by hand, never waited for.
+ *      marker on file. The deadline is staged on a clock moved by hand, never waited for. And the
+ *      REAL clock is monotonic: moving the wall clock neither extends a deadline nor cuts it short;
+ *   6. EVERY bounded step ends at its deadline the same way — not only evidence waits: an operation
+ *      that settles at or after its round's deadline, ahead of a timer that is overdue, has not met
+ *      it, whichever way it settled, and nothing it does later reopens that round;
+ *   7. what was NOT ACKNOWLEDGED IN TIME is not proven later: a barrier whose closing is still
+ *      pending at its deadline, fails, answers late or does not say, and a signal PostgreSQL did not
+ *      acknowledge in time, each leave cleanup `unproven` for good — the marker on file, the run
+ *      stopped, the signalled connection never handed back — whatever is read or answered afterwards;
+ *   8. this file's OWN foreign sessions are scopes of the real run: a marker before each connects,
+ *      removed only once its closing was acknowledged and that exact backend seen gone.
  *
  * Everything is established from PostgreSQL evidence about exact, known backends. The "foreign"
- * sessions are plain clients this file opens and never registers with the harness. Wherever a
- * test stages an unsafe outcome it does so in a run-safety state of ITS OWN, and removes what it
- * staged before it ends: the real run is never stopped by testing what stops it.
+ * sessions are plain clients this file opens and never registers with the harness as raced
+ * operations. Wherever a test stages an unsafe outcome it does so in a run-safety state of ITS OWN,
+ * and removes what it staged before it ends: the real run is never stopped by testing what stops it.
  */
 
 // ── Order evidence: taken at module load and by this file's own `beforeEach`, checked in (4) ───
@@ -90,22 +106,23 @@ beforeEach(() => {
   hookOrder.push({ truncationHooks: truncationHookRuns() - truncationHooksAtLoad, fileHooks });
 });
 
-// ── Foreign sessions: this file's own clients, NOT registered with the harness ─────────────────
-interface Foreign { client: Client; pid: number }
-const foreignClients: Client[] = [];
+// ── Foreign sessions: this file's own clients, NOT registered with the harness as raced ────────
+// They are never read for lock-wait evidence and never signalled. They ARE scopes of the real run
+// (`openTestSession`): each has its in-flight marker on file before it connects, and keeps it until
+// it has been closed and that exact backend SEEN gone — which the `afterEach` below does, and which
+// stops the run if it cannot be done. Asserted in (8).
+type Foreign = TestSession;
+const foreignSessions: Foreign[] = [];
 
 async function foreign(name: string): Promise<Foreign> {
-  const client = new Client({
-    connectionString: process.env.DATABASE_URL,
-    application_name: `identity-race-foreign/${name}`,
-    connectionTimeoutMillis: 10_000,
-  });
-  client.on("error", () => undefined);
-  foreignClients.push(client);
-  await client.connect();
-  const pid = (await client.query<{ pid: number }>("select pg_backend_pid() as pid")).rows[0].pid;
-  return { client, pid };
+  // A name of its own each time: the scope's marker is this session's, and no other's.
+  const session = await openTestSession(`${name}-${randomUUID().slice(0, 8)}`);
+  foreignSessions.push(session);
+  return session;
 }
+
+/** The scopes the real run has on file for the foreign sessions this test opened — as `armed()` lists them. */
+const foreignScopes = (): string[] => foreignSessions.map((session) => session.scope).sort();
 
 interface InFlight<T> { promise: Promise<T>; state: () => "pending" | "resolved" | "rejected" }
 
@@ -121,6 +138,27 @@ function gate(): { opened: Promise<void>; open: () => void } {
   let open: () => void = () => undefined;
   const opened = new Promise<void>((resolve) => { open = resolve; });
   return { opened, open };
+}
+
+interface Controlled<T> { promise: Promise<T>; resolve: (value: T) => void; reject: (error: unknown) => void }
+
+/** A promise a test settles by hand, either way, and only by hand: an operation, an acknowledgement. */
+function controlled<T>(): Controlled<T> {
+  let resolve: (value: T) => void = () => undefined;
+  let reject: (error: unknown) => void = () => undefined;
+  const promise = new Promise<T>((settle, fail) => { resolve = settle; reject = fail; });
+  return { promise, resolve, reject };
+}
+
+/**
+ * Every unhandled rejection from here until `stop()`. A late outcome the harness had dropped without
+ * observing it would be one — so "nothing came of it" is asserted of this list too.
+ */
+function watchUnhandled(): { seen: unknown[]; stop: () => void } {
+  const seen: unknown[] = [];
+  const note = (reason: unknown): void => { seen.push(reason); };
+  process.on("unhandledRejection", note);
+  return { seen, stop: () => { process.removeListener("unhandledRejection", note); } };
 }
 
 // ── A clock, and reads, that a test moves by hand ──────────────────────────────────────────────
@@ -264,10 +302,32 @@ function stagedOnRealRun(what: string): { scope: string; clear: () => void } {
 const untilNoSessionsNamed = (applicationName: string) =>
   expect.poll(() => sessionsNamed(applicationName), { timeout: 10_000 }).toEqual([]);
 
+/**
+ * Take one connection out of the application pool for good, by hand — what the harness, by design,
+ * never does for a STRANDED lease: a connection a signal may still be on its way to is not handed
+ * back at all, so a test that stages one must retire it itself, once it has seen what became of its
+ * backend. The pool has no public way to give up a connection it was never given back; `_remove` is
+ * what its own `release(error)` ends in.
+ */
+function discardFromPool(client: PoolClient): void {
+  const internals = getPool() as unknown as { _remove?: (client: unknown) => void };
+  if (typeof internals._remove !== "function") {
+    throw new Error("pg-pool no longer has `_remove`: a stranded connection staged by this file cannot be retired from the pool");
+  }
+  internals._remove(client);
+}
+
 afterEach(async () => {
-  // Ending a client whose query is still waiting drops its connection; the server then abandons it.
-  for (const client of foreignClients.splice(0)) await client.end().catch(() => undefined);
+  // Every foreign session is closed and PROVEN gone — its closing acknowledged, its exact backend
+  // seen absent — and only then is its marker removed from the real run. All at once: ending one of
+  // them is what lets another, still waiting behind its lock, go. (Ending a client whose query is
+  // still waiting drops its connection; the server abandons it once nothing blocks it.)
+  const closing = await Promise.allSettled(foreignSessions.splice(0).map((session) => session.close()));
   for (const root of privateRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+  // One that could not be proven gone has already stopped the run and kept its marker: the next
+  // truncation is refused. Say so here too, against the test that left it.
+  const unproven = closing.find((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (unproven) throw unproven.reason;
 });
 
 afterAll(async () => {
@@ -591,8 +651,11 @@ describe("race harness (2): a foreign session of the same database is never the 
       expect(queued!.state()).toBe("resolved");
       expect(read.state()).toBe("resolved");
       await behindParked.client.query("rollback");
-      // The scope's cleanup was proven, so its marker is gone and the run goes on.
-      expect(currentRunSafety().armed()).toEqual([]);
+      // The scope's cleanup was proven, so its marker is gone and the run goes on. What is still on
+      // file is this test's own two foreign sessions, open until the `afterEach` proves them gone.
+      expect(currentRunSafety().armed()).not.toContain(barrier.tag);
+      expect(foreignScopes()).toEqual([behindBarrier.scope, behindParked.scope].sort());
+      expect(currentRunSafety().armed()).toEqual(foreignScopes());
       expect(raceHarnessFatal()).toBeNull();
     } finally {
       // If the release cannot be proven it has already stopped the run; do not mask what failed.
@@ -667,9 +730,13 @@ describe("race harness (2): a foreign session of the same database is never the 
       await holder.client.query("rollback");
       expect((await stuck.promise).rows).toEqual([{ n: expect.any(Number) }]);
       expect(stuck.state()).toBe("resolved");
-      // The cancelled writer wrote nothing; cleanup was proven, so the marker is gone and the run goes on.
+      // The cancelled writer wrote nothing; cleanup was proven, so the marker is gone and the run goes
+      // on. What is still on file is this test's own three foreign sessions, open until the
+      // `afterEach` proves them gone.
       expect(await slackIds(seed, alice)).not.toContain(fresh);
-      expect(currentRunSafety().armed()).toEqual([]);
+      expect(currentRunSafety().armed()).not.toContain(barrier.tag);
+      expect(foreignScopes()).toEqual([holder.scope, behindHolder.scope, behindBarrier.scope].sort());
+      expect(currentRunSafety().armed()).toEqual(foreignScopes());
       expect(raceHarnessFatal()).toBeNull();
     } finally {
       await barrier.release().catch(() => undefined);
@@ -1224,6 +1291,44 @@ describe("race harness (5): an evidence wait ends at its deadline — late evide
     }
   });
 
+  it.each([
+    { when: "AT", past: 0 },
+    { when: "one millisecond AFTER", past: 1 },
+  ])("a read that FAILS $when the deadline, delivered ahead of the timer that bounds it, ends the wait as EXPIRED — late like any other outcome, not a failure that came in time", async ({ past }) => {
+    const hand = handClock();
+    const reads = heldReads<Sessions>();
+    const wait = untilNoSession(hand, reads);
+
+    // THE DEADLINE PASSES ON THE CLOCK with the read's timer not yet run, and the read then REJECTS.
+    hand.drift(BUDGET_MS + past);
+    expect(hand.outstanding()).toBe(1);
+    reads.fail(0, new Error("canceling statement due to statement timeout"));
+
+    const failure = await rejection(wait);
+    expect(failure, "the wait ended at its deadline: that is what is reported").toBeInstanceOf(RaceHarnessError);
+    expect((failure as Error).message).toBe(
+      `no evidence within ${BUDGET_MS} ms of no session left; a read failed only at or after the deadline (canceling statement due to statement timeout)`,
+    );
+    expect(reads.count()).toBe(1);
+    expect(hand.delays(), "nothing was started after it: no pause, no other read").toEqual([BUDGET_MS]);
+    expect(hand.outstanding()).toBe(0);
+  });
+
+  it("the control: a read that fails one millisecond BEFORE the deadline fails the wait there, with its own error", async () => {
+    const hand = handClock();
+    const reads = heldReads<Sessions>();
+    const wait = untilNoSession(hand, reads);
+    const refused = new Error("canceling statement due to statement timeout");
+
+    hand.drift(BUDGET_MS - 1);
+    reads.fail(0, refused);
+
+    expect(await rejection(wait)).toBe(refused);
+    expect(reads.count()).toBe(1);
+    expect(hand.delays()).toEqual([BUDGET_MS]);
+    expect(hand.outstanding()).toBe(0);
+  });
+
   it("the pause between two reads is bounded by the same deadline: evidence that is not what is expected, read just before it, is not re-read after it", async () => {
     const hand = handClock();
     const reads = heldReads<Sessions>();
@@ -1243,6 +1348,230 @@ describe("race harness (5): an evidence wait ends at its deadline — late evide
     expect((failure as Error).message).toBe(`no evidence within ${BUDGET_MS} ms of no session left; last saw [{"pid":7}]`);
     expect(reads.count(), "no read is started at the deadline").toBe(1);
     expect(hand.delays()).toEqual([BUDGET_MS, 10]);
+  });
+});
+
+describe("race harness (5, the real clock): a deadline is read from a MONOTONIC clock — setting the wall clock neither extends it nor cuts it short", () => {
+  /**
+   * An EVIDENCE wait and a CLEANUP bound, each given NO clock: they run on the harness's real one.
+   * What is staged is what that clock is read from. The monotonic reading (`performance.now`) is
+   * set by the test to exactly the side of the deadline each case names, and the WALL clock (`Date`)
+   * is set a week the other way — the way that would rescue, or condemn, a deadline read from it.
+   * The timers that bound them are the real ones, and are never reached: nothing here waits for one.
+   */
+  type Sessions = { pid: number }[];
+  const WEEK_MS = 7 * 24 * 60 * 60 * 1_000;
+
+  it.each([
+    {
+      wall: "BACK a week", moved: -WEEK_MS, monotonic: "has reached the deadline", elapsed: BUDGET_MS, inTime: false,
+      verdict: "the evidence is late and the step has not met its bound: a wall clock set back does not EXTEND a deadline",
+    },
+    {
+      wall: "FORWARD a week", moved: WEEK_MS, monotonic: "is one millisecond short of the deadline", elapsed: BUDGET_MS - 1, inTime: true,
+      verdict: "the evidence is accepted and the step has met its bound: a wall clock set forward does not CUT A DEADLINE SHORT",
+    },
+  ])("the wall clock is set $wall while the monotonic clock $monotonic — $verdict", async ({ moved, elapsed, inTime }) => {
+    const reads = heldReads<Sessions>();
+    const work = controlled<string>();
+    const startedAt = Date.now();
+    const origin = performance.now();
+    const monotonic = vi.spyOn(performance, "now").mockReturnValue(origin);
+    try {
+      // Both begin at the same monotonic reading, each with the same budget.
+      const wait = inFlight(untilEvidence({
+        read: reads.read,
+        accept: (sessions) => sessions.length === 0,
+        expected: "no session left",
+        show: (sessions) => JSON.stringify(sessions),
+        timeoutMs: BUDGET_MS,
+      }));
+      const bounded = inFlight(withinBound(work.promise, BUDGET_MS));
+      expect(reads.count()).toBe(1);
+      expect(monotonic, "the real clock is read from the monotonic source").toHaveBeenCalled();
+
+      // THE WALL CLOCK IS SET, by a week — and the monotonic clock moves by exactly `elapsed`.
+      vi.setSystemTime(startedAt + moved);
+      expect(Date.now(), "the wall clock really was set").toBe(startedAt + moved);
+      monotonic.mockReturnValue(origin + elapsed);
+      reads.answer(0, []);
+      work.resolve("done");
+
+      // THE EVIDENCE WAIT…
+      const outcome = await wait.promise.then((value) => ({ value }), (error: unknown) => ({ error }));
+      if (inTime) {
+        expect(outcome).toEqual({ value: [] });
+      } else {
+        const failure = "error" in outcome ? outcome.error : null;
+        expect(failure, "acceptable evidence, read at the monotonic deadline, must not be accepted").toBeInstanceOf(RaceHarnessError);
+        expect((failure as Error).message).toBe(
+          `no evidence within ${BUDGET_MS} ms of no session left; what was expected was read only at or after the deadline: []`,
+        );
+      }
+      expect(reads.count(), "one read: the wait ended there, either way").toBe(1);
+      // …AND THE CLEANUP BOUND, by the same clock.
+      expect(await bounded.promise).toBe(inTime);
+    } finally {
+      vi.useRealTimers();
+      monotonic.mockRestore();
+    }
+  });
+});
+
+describe("race harness (6): every bounded step ends at its deadline — settling at or after it, ahead of an overdue timer, is not settling in time (a clock and operations moved by hand)", () => {
+  /**
+   * The bound every cleanup step is — the raced operations settling in a round, a connection being
+   * closed, a signal being acknowledged — taken by itself, and then as the rounds of cleanup. The
+   * work is a promise the test settles, either way; the clock is moved by the test and its timers
+   * are WITHHELD (`drift`), so each case puts the settlement on exactly the side of the deadline it
+   * names with the timer that should have said so still not run. Nothing sleeps; no database.
+   */
+  const settlements = [
+    { how: "RESOLVES", settle: (work: Controlled<string>) => work.resolve("done") },
+    { how: "REJECTS", settle: (work: Controlled<string>) => work.reject(new Error("the operation failed")) },
+  ];
+  const moments = [
+    { when: "one millisecond BEFORE", elapsed: BUDGET_MS - 1, inTime: true },
+    { when: "exactly AT", elapsed: BUDGET_MS, inTime: false },
+    { when: "one millisecond AFTER", elapsed: BUDGET_MS + 1, inTime: false },
+  ];
+  const everyCase = settlements.flatMap((settlement) => moments.map((moment) => ({ ...settlement, ...moment })));
+  const operation = { label: "the operation", backends: [] as number[] };
+  /** Cleanup of one operation that never touches the database, each round given `BUDGET_MS`, on a hand clock. */
+  const cleanupOf = (hand: HandClock, work: Controlled<string>) => inFlight(settleStarted(
+    [{ label: operation.label, run: () => work.promise }],
+    { bounds: { cleanupMs: BUDGET_MS }, cleanup: { clock: hand.clock } },
+  ));
+
+  it.each(everyCase)("work that $how $when its deadline, the timer for it withheld — met its bound: $inTime", async ({ settle, elapsed, inTime }) => {
+    const hand = handClock();
+    const work = controlled<string>();
+    const unhandled = watchUnhandled();
+    try {
+      const bounded = inFlight(withinBound(work.promise, BUDGET_MS, hand.clock));
+      expect(hand.delays()).toEqual([BUDGET_MS]);
+
+      // THE CLOCK MOVES AND NO TIMER IS RUN: only asking the clock can tell when the work settled.
+      hand.drift(elapsed);
+      expect(hand.outstanding()).toBe(1);
+      await turn();
+      expect(bounded.state(), "nothing has ended it: no timer fired, and the work has not settled").toBe("pending");
+      settle(work);
+
+      expect(await bounded.promise).toBe(inTime);
+      expect(hand.outstanding(), "its timer was called off, not left to fire").toBe(0);
+      expect(hand.delays()).toEqual([BUDGET_MS]);
+      await turn();
+      expect(unhandled.seen, "a rejection is observed, in time or not").toEqual([]);
+    } finally {
+      unhandled.stop();
+    }
+  });
+
+  it.each(settlements)("work still PENDING when the timer for its deadline fires has not met its bound — and when it later $how, nothing comes of it", async ({ settle }) => {
+    const hand = handClock();
+    const work = controlled<string>();
+    const unhandled = watchUnhandled();
+    try {
+      const bounded = inFlight(withinBound(work.promise, BUDGET_MS, hand.clock));
+      hand.tick(BUDGET_MS - 1);
+      await turn();
+      expect(bounded.state()).toBe("pending");
+
+      hand.tick(1);
+      expect(await bounded.promise).toBe(false);
+
+      // THE WORK SETTLES NOW — observed, and dropped: no second verdict, no unhandled rejection.
+      settle(work);
+      await turn();
+      expect(unhandled.seen).toEqual([]);
+      expect(bounded.state()).toBe("resolved");
+      expect(await bounded.promise).toBe(false);
+      expect(hand.delays()).toEqual([BUDGET_MS]);
+      expect(hand.outstanding()).toBe(0);
+    } finally {
+      unhandled.stop();
+    }
+  });
+
+  it.each(settlements)("CLEANUP: an operation that $how one millisecond before the first round's deadline makes that round `quiet`", async ({ settle }) => {
+    const hand = handClock();
+    const work = controlled<string>();
+    const unhandled = watchUnhandled();
+    try {
+      const cleanup = cleanupOf(hand, work);
+      await hand.set(1);
+      expect(hand.delays(), "the first round: the operations settling, within one cleanup budget").toEqual([BUDGET_MS]);
+
+      hand.drift(BUDGET_MS - 1);
+      settle(work);
+
+      expect(await cleanup.promise).toEqual({ outcome: "quiet", signalled: [], operations: [{ ...operation, settled: true }] });
+      expect(hand.delays(), "no other round was needed").toEqual([BUDGET_MS]);
+      expect(hand.outstanding()).toBe(0);
+      await turn();
+      expect(unhandled.seen).toEqual([]);
+    } finally {
+      unhandled.stop();
+    }
+  });
+
+  it.each(everyCase.filter((each) => !each.inTime))("CLEANUP: an operation that $how $when the first round's deadline, ahead of the overdue timer, does NOT make that round quiet — it is found settled by the NEXT round, whose outcome it is", async ({ settle, elapsed }) => {
+    const hand = handClock();
+    const work = controlled<string>();
+    const unhandled = watchUnhandled();
+    try {
+      const cleanup = cleanupOf(hand, work);
+      await hand.set(1);
+
+      // THE ROUND'S DEADLINE PASSES ON THE CLOCK, its timer is not run, and the operation settles.
+      hand.drift(elapsed);
+      expect(hand.outstanding()).toBe(1);
+      settle(work);
+
+      const report = await cleanup.promise;
+      expect(report.outcome, "a late settlement must not qualify for the round whose deadline it missed").not.toBe("quiet");
+      // With no connection of its own there was nothing to signal: the cancel round simply found it settled.
+      expect(report).toEqual({ outcome: "cancelled", signalled: [], operations: [{ ...operation, settled: true }] });
+      // The next round was a new one, with a budget of its own — which it did not need.
+      expect(hand.delays()).toEqual([BUDGET_MS, BUDGET_MS]);
+      expect(hand.outstanding()).toBe(0);
+      await turn();
+      expect(unhandled.seen).toEqual([]);
+    } finally {
+      unhandled.stop();
+    }
+  });
+
+  it.each(settlements)("CLEANUP: an operation still pending through all three rounds is `unproven` — and when it then $how, no round is reopened and the report does not change", async ({ settle }) => {
+    const hand = handClock();
+    const work = controlled<string>();
+    const unhandled = watchUnhandled();
+    try {
+      const cleanup = cleanupOf(hand, work);
+      // SETTLE, CANCEL, TERMINATE: each round's deadline passes with the operation still pending.
+      for (const round of [1, 2, 3]) {
+        await hand.set(round);
+        await turn();
+        expect(cleanup.state(), `round ${round} is still waiting`).toBe("pending");
+        hand.tick(BUDGET_MS);
+      }
+
+      const report = await cleanup.promise;
+      expect(report).toEqual({ outcome: "unproven", signalled: [], operations: [{ ...operation, settled: false }] });
+      expect(hand.delays()).toEqual([BUDGET_MS, BUDGET_MS, BUDGET_MS]);
+
+      // THE OPERATION SETTLES NOW — after the last round. Observed, and dropped.
+      settle(work);
+      await turn();
+      expect(unhandled.seen).toEqual([]);
+      expect(await cleanup.promise).toBe(report);
+      expect(report.outcome).toBe("unproven");
+      expect(hand.delays(), "no round was started for it").toEqual([BUDGET_MS, BUDGET_MS, BUDGET_MS]);
+      expect(hand.outstanding()).toBe(0);
+    } finally {
+      unhandled.stop();
+    }
   });
 });
 
@@ -1352,5 +1681,597 @@ describe("race harness (5, in a barrier): proof of a barrier's absence that arri
     expect(safety.armed()).toEqual([tag]);
     expect(safety.fatal()).toMatch(/could not be proven gone/);
     expect(currentRunSafety().blocked()).toBeNull();
+  }, RACE_TEST_TIMEOUT_MS);
+});
+
+/** The harness's bound on one statement of a connection of its own — and so on closing one, and on a signal's acknowledgement. */
+const OWNED_BOUND_MS = 10_000;
+
+interface StagedClosing {
+  hand: HandClock;
+  /** What the staged closing answers with — when, and if, the test says so. */
+  verdict: Controlled<Disposal | void>;
+  /** Counts the times the harness asked for the connection to be closed. */
+  asked: ReturnType<typeof tally>;
+  /** Every client the harness asked to have closed, in order. */
+  handed: Client[];
+  /** The seam itself: what the harness is given in place of closing the connection. */
+  dispose: (client: Client) => Promise<Disposal | void>;
+  /** From here on a closing is the test's to answer. Until then it is a real one, honestly reported. */
+  stage: () => void;
+  staging: () => boolean;
+}
+
+/**
+ * Something to stand in front of the closing of ONE harness-owned connection, on a clock moved by
+ * hand. Until `stage()` it really closes the connection and says so — so an acquisition that fails
+ * before the test has staged anything is cleaned up for real, and does not hang on a clock nobody
+ * moves. After it, the closing does nothing and answers only what, and when, the test makes it.
+ */
+function stagedClosing(): StagedClosing {
+  const hand = handClock();
+  const verdict = controlled<Disposal | void>();
+  const asked = tally();
+  const handed: Client[] = [];
+  let staging = false;
+  return {
+    hand,
+    verdict,
+    asked,
+    handed,
+    dispose: (client) => {
+      handed.push(client);
+      asked.note();
+      return staging ? verdict.promise : client.end().then((): Disposal => "closed");
+    },
+    stage: () => { staging = true; },
+    staging: () => staging,
+  };
+}
+
+describe("race harness (7): a closing that was not acknowledged in time is not proven later — the barrier stays `unproven`, its marker on file and the run stopped, though its session IS gone (real Postgres)", () => {
+  /**
+   * The barrier is a real session, and in every case this test really closes it and SEES it gone
+   * before the staged closing answers at all: the database evidence of its absence is there, and
+   * reads of it succeed. What is missing is only the acknowledgement of the closing, in time — and
+   * that alone must keep the barrier `unproven`, then and for good.
+   */
+  const unacknowledged: {
+    what: string;
+    then: string;
+    stage: (staged: StagedClosing) => void;
+    later: (staged: StagedClosing) => void;
+  }[] = [
+    {
+      what: "is still PENDING at its deadline",
+      then: "is acknowledged `closed` only afterwards",
+      stage: ({ hand }) => hand.tick(OWNED_BOUND_MS),
+      later: ({ verdict }) => verdict.resolve("closed"),
+    },
+    {
+      what: "is acknowledged `closed` exactly AT its deadline, ahead of the overdue timer",
+      then: "that timer is finally run",
+      stage: ({ hand, verdict }) => { hand.drift(OWNED_BOUND_MS); verdict.resolve("closed"); },
+      later: ({ hand }) => hand.tick(OWNED_BOUND_MS),
+    },
+    {
+      what: "REJECTS, in time",
+      then: "its deadline passes",
+      stage: ({ verdict }) => verdict.reject(new Error("Connection terminated unexpectedly")),
+      later: ({ hand }) => hand.tick(OWNED_BOUND_MS),
+    },
+    {
+      what: "is OPAQUE — it resolves in time, and does not say `closed`",
+      then: "its deadline passes",
+      stage: ({ verdict }) => verdict.resolve(undefined),
+      later: ({ hand }) => hand.tick(OWNED_BOUND_MS),
+    },
+  ];
+
+  it.each(unacknowledged)("a closing that $what: `unproven`, the marker kept and the run stopped while reads of the session's absence succeed — and so it stays when $then", async ({ stage, later }) => {
+    // Staged in a run-safety state of this test's own: the real run is not stopped by testing what stops it.
+    const { directory, safety } = privateRun();
+    const tag = `closing-${randomUUID().slice(0, 8)}`;
+    const closing = stagedClosing();
+    const { hand, asked, handed } = closing;
+    const unhandled = watchUnhandled();
+    // The barrier is a REAL session whose marker is in the private state, which the real run does
+    // not read: the real run carries a sentinel of its own until that session is SEEN gone.
+    const staged = stagedOnRealRun("a barrier whose closing is staged not to be acknowledged in time");
+    let barrier: Barrier | undefined;
+    try {
+      barrier = await holdNamedLock(`harness-closing:${randomUUID()}`, { tag, safety, clock: hand.clock, dispose: closing.dispose });
+      expect(safety.armed()).toEqual([tag]);
+      expect(await barrierSessions(tag)).toEqual([{ pid: barrier.pid, state: "idle in transaction" }]);
+      expect(asked.count(), "nothing has been closed yet").toBe(0);
+
+      // ITS RELEASE BEGINS: the harness asks for the connection to be closed, and bounds that —
+      // as the one step it is — on the clock this test moves.
+      closing.stage();
+      const releasing = inFlight(barrier.release());
+      await Promise.race([asked.reached(1), releasing.promise.then(() => undefined, () => undefined)]);
+      expect(asked.count(), "the closing was asked for").toBe(1);
+      expect(hand.delays(), "and it is bounded").toEqual([OWNED_BOUND_MS]);
+      await turn();
+      expect(releasing.state()).toBe("pending");
+
+      // THE SESSION REALLY GOES — closed by this test, behind the harness's back, and SEEN gone by
+      // its tag and by its backend. Everything the database could say of its absence, it now says.
+      await handed[0].end();
+      await untilBarrierGone(tag);
+      await untilSessions([barrier.pid], "the barrier's backend gone", (sessions) => sessions.length === 0);
+
+      // …BUT THE CLOSING IS NOT ACKNOWLEDGED IN TIME.
+      stage(closing);
+      const failure = await releasing.promise.then(() => null, (error: unknown) => error);
+      expect(failure).toBeInstanceOf(RaceScheduleError);
+      expect((failure as RaceScheduleError).cleanup).toEqual({ outcome: "unproven", barrierGone: false, signalled: [], operations: [] });
+      // THE RUN IS STOPPED: a fatal reason, the marker still on file, and the guard refusing…
+      const reason = safety.fatal();
+      expect(reason).toMatch(/barrier closing-[a-f0-9]+ was released, and its session could not be proven gone/);
+      expect(safety.armed()).toEqual([tag]);
+      expect(() => assertRunSafe(safety)).toThrow(/run STOPPED — refusing to truncate or run another test/);
+      // …WHILE READS OF ITS ABSENCE SUCCEED: no session under the tag, and not that backend.
+      expect(await barrierSessions(tag)).toEqual([]);
+      expect(await sessionEvidence([barrier.pid])).toEqual([]);
+
+      // WHATEVER COMES LATER — the acknowledgement itself, or the timer that was overdue.
+      later(closing);
+      await turn();
+
+      // NOTHING CAME OF IT. Not an unhandled rejection; the closing was not asked for again, and no
+      // other bound was started…
+      expect(unhandled.seen).toEqual([]);
+      expect(asked.count()).toBe(1);
+      expect(hand.delays()).toEqual([OWNED_BOUND_MS]);
+      // …the barrier is as unproven as it was, to the schedules and to its own release…
+      expect(await barrier.vanish(BUDGET_MS)).toBe(false);
+      expect(await barrier.release().then(() => null, (error: unknown) => error)).toBe(failure);
+      // …no later conclusion clears what was concluded…
+      barrier.conclude(true, "");
+      expect(safety.armed()).toEqual([tag]);
+      expect(safety.fatal()).toBe(reason);
+      expect(safety.setFatal("a later, different reason")).toBe(reason);
+      // …and the guard still refuses — here, and for any other reader of the same state — with the
+      // session's absence still there to be read.
+      expect(await barrierSessions(tag)).toEqual([]);
+      expect(() => assertRunSafe(safety)).toThrow(/run STOPPED — refusing to truncate or run another test/);
+      const elsewhere = createRunSafety(directory);
+      expect(elsewhere.armed()).toEqual([tag]);
+      expect(elsewhere.fatal()).toBe(reason);
+      expect(() => assertRunSafe(elsewhere)).toThrow(/run STOPPED/);
+      // The real run was not stopped by this test: its state is not this one.
+      expect(raceHarnessFatal()).toBeNull();
+      expect(currentRunSafety().armed()).toEqual([staged.scope]);
+    } finally {
+      // ON EVERY EXIT nothing stays held back; every connection the harness asked to have closed is
+      // really closed; a barrier this test never got to release is released for real; and the real
+      // run's sentinel comes off only once the barrier's session is SEEN gone. If it cannot be,
+      // this throws, the sentinel stays, and the real run stops.
+      unhandled.stop();
+      closing.verdict.resolve(undefined);
+      for (const client of handed) await client.end().catch(() => undefined);
+      if (barrier && !closing.staging()) await barrier.release().catch(() => undefined);
+      await untilBarrierGone(tag);
+      staged.clear();
+    }
+    // The sentinel took nothing else with it: the staged state is still stopped, its scope still on
+    // file, and the real run is clean.
+    expect(safety.armed()).toEqual([tag]);
+    expect(safety.fatal()).toMatch(/could not be proven gone/);
+    expect(currentRunSafety().blocked()).toBeNull();
+  }, RACE_TEST_TIMEOUT_MS);
+
+  it("the control: a closing acknowledged `closed` one millisecond BEFORE its deadline, its session then seen gone, IS proven — the marker comes off and the run goes on", async () => {
+    const { safety } = privateRun();
+    const tag = `closed-${randomUUID().slice(0, 8)}`;
+    const closing = stagedClosing();
+    const { hand, asked, handed } = closing;
+    const staged = stagedOnRealRun("a barrier whose closing is staged to be acknowledged just in time");
+    let barrier: Barrier | undefined;
+    try {
+      barrier = await holdNamedLock(`harness-closed:${randomUUID()}`, { tag, safety, clock: hand.clock, dispose: closing.dispose });
+      expect(safety.armed()).toEqual([tag]);
+
+      closing.stage();
+      const releasing = inFlight(barrier.release());
+      await Promise.race([asked.reached(1), releasing.promise.then(() => undefined, () => undefined)]);
+      expect(asked.count()).toBe(1);
+      expect(hand.delays()).toEqual([OWNED_BOUND_MS]);
+
+      // The same seam, the same clock, the same real closing behind the harness's back — and the
+      // acknowledgement one millisecond inside the bound, its timer still not run.
+      await handed[0].end();
+      hand.drift(OWNED_BOUND_MS - 1);
+      expect(hand.outstanding()).toBe(1);
+      closing.verdict.resolve("closed");
+
+      // The release resolves: the closing was acknowledged, and the session's absence — read by
+      // the harness, on the real clock — was then seen.
+      await releasing.promise;
+      expect(hand.outstanding(), "the bound on the closing was called off").toBe(0);
+      expect(await barrierSessions(tag)).toEqual([]);
+      expect(safety.armed()).toEqual([]);
+      expect(safety.fatal()).toBeNull();
+      expect(() => assertRunSafe(safety)).not.toThrow();
+      expect(currentRunSafety().armed()).toEqual([staged.scope]);
+    } finally {
+      closing.verdict.resolve(undefined);
+      for (const client of handed) await client.end().catch(() => undefined);
+      if (barrier && !closing.staging()) await barrier.release().catch(() => undefined);
+      await untilBarrierGone(tag);
+      staged.clear();
+    }
+    expect(currentRunSafety().blocked()).toBeNull();
+  }, RACE_TEST_TIMEOUT_MS);
+});
+
+describe("race harness (7, signals): a signal PostgreSQL did not acknowledge in time strands its lease and leaves cleanup `unproven` for good (real Postgres)", () => {
+  /**
+   * A raced operation holds one pool connection, in a transaction, when cleanup comes to cancel it.
+   * The CANCEL's acknowledgement is this test's to give (`CleanupSeam.signal`) and it does not give
+   * it: its deadline passes on a clock moved by hand. Meanwhile the operation finishes and releases
+   * its connection — which must not reach the pool. Cleanup goes on: the TERMINATE is the real one,
+   * really executed and acknowledged in time. None of that may hand the connection back or make the
+   * outcome anything but `unproven`; and nor may the cancel's acknowledgement, when it finally comes.
+   *
+   * The schedule's own waits and the evidence waits run on the real clock, answered by PostgreSQL.
+   * Only the steps of cleanup that are not evidence waits are on the hand clock — and there are
+   * exactly five of them, in a fixed order, so each is waited for as an event, never as a time.
+   */
+  it.each([
+    { later: "RESOLVES", settle: (ack: Controlled<unknown>) => ack.resolve([{ pg_cancel_backend: true }]) },
+    { later: "REJECTS", settle: (ack: Controlled<unknown>) => ack.reject(new Error("Connection terminated unexpectedly")) },
+  ])("the cancel's acknowledgement is still PENDING at its deadline: the lease is stranded — never handed to the pool, not on the operation's release and not after a terminate that IS acknowledged — and cleanup is `unproven`; when it later $later, nothing changes", async ({ settle }) => {
+    const pool = getPool();
+    const { directory, safety } = privateRun();
+    const tag = `ack-${randomUUID().slice(0, 8)}`;
+    const lockName = `harness-ack:${randomUUID()}`;
+    const CLEANUP_MS = 300;
+    const hand = handClock();
+    const ack = controlled<unknown>();
+    const asked = tally();
+    const signals: PendingSignal[] = [];
+    const proceed = gate();
+    const released = gate();
+    // The raced operation's backend, and its checked-out client: filled in by the operation itself.
+    const owners: BackendIdentity[] = [];
+    const held: PoolClient[] = [];
+    // Every time the POOL is given the raced operation's connection back, and with what.
+    const handedBack: unknown[] = [];
+    const onRelease = (error: unknown, client: unknown): void => {
+      if (owners.some((owner) => (client as { processID?: unknown }).processID === owner.pid)) handedBack.push(error);
+    };
+    // In front of every signal. The CANCEL is not sent at all, and what is waited for as its
+    // acknowledgement is this test's promise; the TERMINATE is the real one, as it comes.
+    const signal = (pending: PendingSignal, send: () => Promise<unknown>): Promise<unknown> => {
+      signals.push(pending);
+      asked.note();
+      return pending.signal === "cancel" ? ack.promise : send();
+    };
+    const unhandled = watchUnhandled();
+    // Real sessions are staged here under a run-safety state the real run does not read: a barrier,
+    // and a raced operation's backend left in a transaction. The real run carries a sentinel until
+    // both are SEEN gone or idle.
+    const staged = stagedOnRealRun("a raced operation whose cancel is staged not to be acknowledged in time");
+    let barrier: Barrier | undefined;
+    try {
+      pool.on("release", onRelease);
+      barrier = await holdNamedLock(lockName, { tag, safety });
+      const scheduled = inFlight(parkThenCompete({
+        seed: { teamId: randomUUID() },
+        barrier,
+        parksOn: "advisory",
+        // The raced operation: one pool connection, in a transaction, parked on the barrier's lock.
+        // Past it, it waits for this test's gate and for nothing in the database — so it is still
+        // holding its connection when cleanup comes to signal it.
+        first: async () => {
+          const client = await pool.connect();
+          held.push(client);
+          try {
+            owners.push(await whoIs(client));
+            await client.query("begin");
+            await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [lockName]);
+            await proceed.opened;
+            await client.query("rollback");
+          } finally {
+            client.release();
+            released.open();
+          }
+          return "released";
+        },
+        // The schedule itself fails at once, so cleanup runs with the first operation still held.
+        second: async () => "finished without waiting",
+        bounds: { cleanupMs: CLEANUP_MS },
+        cleanup: { clock: hand.clock, signal },
+      }));
+      const over = scheduled.promise.then(() => undefined, () => undefined);
+
+      // ROUND ONE: the operation has not settled when its budget runs out.
+      await Promise.race([hand.set(1), over]);
+      expect(hand.delays(), "the first round: the operations settling").toEqual([CLEANUP_MS]);
+      expect(scheduled.state()).toBe("pending");
+      hand.tick(CLEANUP_MS);
+
+      // THE CANCEL: aimed at the raced operation's own backend, and its acknowledgement bounded.
+      await Promise.race([asked.reached(1), over]);
+      expect(signals).toEqual([{ signal: "cancel", backends: [owners[0].pid] }]);
+      await Promise.race([hand.set(2), over]);
+      expect(hand.delays(), "the acknowledgement of the cancel is bounded").toEqual([CLEANUP_MS, OWNED_BOUND_MS]);
+      await untilSessions([owners[0].pid], "the raced operation idle in its transaction",
+        (sessions) => sessions.length === 1 && sessions[0].state === "idle in transaction" && sessions[0].waitingOn === null);
+
+      // WITH THE ACKNOWLEDGEMENT OUTSTANDING, THE OPERATION FINISHES AND RELEASES. Its transaction
+      // is over, its backend idle — and the pool has not been given the connection.
+      proceed.open();
+      await released.opened;
+      await untilSessions([owners[0].pid], "the raced operation's backend idle, its transaction over",
+        (sessions) => sessions.length === 1 && sessions[0].state === "idle");
+      expect(handedBack, "the pool must not be given a backend a signal is aimed at").toEqual([]);
+      expect(scheduled.state()).toBe("pending");
+
+      // THE ACKNOWLEDGEMENT'S DEADLINE PASSES. Cleanup goes on by itself from here: the next round
+      // finds the operation settled; a terminate — the real one — is executed and acknowledged; the
+      // last round ends. Each of those is inside its own bound, so no timer has to be run for it.
+      hand.tick(OWNED_BOUND_MS);
+      const failure = await scheduled.promise.then(() => null, (error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(RaceScheduleError);
+      const { cleanup, message } = failure as RaceScheduleError;
+      expect(message).toContain("the competing operation finished without waiting");
+      // UNPROVEN — with the barrier seen gone, the operation settled, and both signals asked for.
+      expect(cleanup.outcome).toBe("unproven");
+      expect(cleanup.barrierGone).toBe(true);
+      expect(cleanup.signalled).toEqual([owners[0].pid]);
+      expect(cleanup.operations).toEqual([
+        { label: "the parked operation", backends: [owners[0].pid], settled: true },
+        { label: "the competing operation", backends: [], settled: true },
+      ]);
+      // The rounds went on as they do: the terminate was aimed at that same backend — still the
+      // operation's own, because its connection was never let back into the pool.
+      expect(signals).toEqual([
+        { signal: "cancel", backends: [owners[0].pid] },
+        { signal: "terminate", backends: [owners[0].pid] },
+      ]);
+      // Five bounded steps, in order: settle, the cancel's acknowledgement, settle, the terminate's
+      // acknowledgement, settle. The last three were met, and their timers called off.
+      expect(hand.delays()).toEqual([CLEANUP_MS, OWNED_BOUND_MS, CLEANUP_MS, OWNED_BOUND_MS, CLEANUP_MS]);
+      expect(hand.outstanding()).toBe(0);
+      // THE STRANDED CONNECTION WAS NEVER HANDED BACK: not when its operation released it, and not
+      // when a later signal at the same backend was executed and acknowledged.
+      expect(handedBack).toEqual([]);
+      // THE RUN IS STOPPED: a fatal reason, the marker still on file, and the guard refusing.
+      const reason = safety.fatal();
+      expect(reason).toMatch(/could not be proven settled, idle or disposed/);
+      expect(safety.armed()).toEqual([tag]);
+      expect(() => assertRunSafe(safety)).toThrow(/run STOPPED — refusing to truncate or run another test/);
+      // The terminate was real: that backend is gone.
+      await untilSessions([owners[0].pid], "the terminated backend gone", (sessions) => sessions.length === 0);
+
+      // THE CANCEL'S ACKNOWLEDGEMENT COMES NOW — long after its deadline.
+      settle(ack);
+      await turn();
+
+      // NOTHING CAME OF IT. Not an unhandled rejection; the connection is still not the pool's; no
+      // signal was sent for it and no bound started…
+      expect(unhandled.seen).toEqual([]);
+      expect(handedBack).toEqual([]);
+      expect(signals).toHaveLength(2);
+      expect(hand.delays()).toEqual([CLEANUP_MS, OWNED_BOUND_MS, CLEANUP_MS, OWNED_BOUND_MS, CLEANUP_MS]);
+      // …the verdict is what it was, and no later conclusion clears it…
+      barrier.conclude(true, "");
+      await barrier.release();
+      expect(safety.armed()).toEqual([tag]);
+      expect(safety.fatal()).toBe(reason);
+      expect(safety.setFatal("a later, different reason")).toBe(reason);
+      // …and the guard still refuses — here, and for any other reader of the same state.
+      expect(() => assertRunSafe(safety)).toThrow(/run STOPPED — refusing to truncate or run another test/);
+      const elsewhere = createRunSafety(directory);
+      expect(elsewhere.armed()).toEqual([tag]);
+      expect(elsewhere.fatal()).toBe(reason);
+      expect(() => assertRunSafe(elsewhere)).toThrow(/run STOPPED/);
+      // The real run was not stopped by this test: its state is not this one.
+      expect(raceHarnessFatal()).toBeNull();
+      expect(currentRunSafety().armed(), "the real run: the sentinel, and only the sentinel").toEqual([staged.scope]);
+    } finally {
+      // ON EVERY EXIT: nothing stays held back and the raced operation may finish; the barrier is
+      // released (a no-op once the schedule has seen it gone). The sentinel comes off only when the
+      // barrier is SEEN gone and the raced operation's backend SEEN idle or gone — and only then is
+      // the connection the harness stranded retired from the pool by hand, so that no later test
+      // inherits a pool one connection short. If either cannot be seen, this throws, the sentinel
+      // stays, and the real run stops.
+      unhandled.stop();
+      proceed.open();
+      ack.resolve(undefined);
+      await barrier?.release().catch(() => undefined);
+      await untilBarrierGone(tag);
+      if (owners.length > 0) {
+        await untilSessions([owners[0].pid], "the raced operation's backend idle or gone",
+          (sessions) => sessions.every((session) => session.state === "idle"));
+      }
+      pool.removeListener("release", onRelease);
+      for (const client of held) discardFromPool(client);
+      staged.clear();
+    }
+  }, RACE_TEST_TIMEOUT_MS);
+});
+
+describe("race harness (8): a test's own foreign session is a scope of the run — its marker comes before its connection, and comes off only once it is closed and SEEN gone (real Postgres)", () => {
+  it("THE CONTROL, on the REAL run: a foreign lock holder has its marker on file from before it connects — so a truncation is refused while it lives — and closed, acknowledged and seen gone, the marker comes off and its lock is free", async () => {
+    const run = currentRunSafety();
+    expect(run.armed(), "nothing is in flight before it is opened").toEqual([]);
+
+    // Opened exactly as every other test in this file opens one.
+    const holder = await foreign("lock-holder");
+    // ITS MARKER IS ON THE REAL RUN — its own, named for this one session — and the guard the setup
+    // file runs before every TRUNCATE refuses while it is there.
+    expect(holder.scope).toMatch(/^session-lock-holder-[a-f0-9]{8}$/);
+    expect(run.armed()).toEqual([holder.scope]);
+    expect(() => assertRunSafe()).toThrow(/1 harness scope\(s\) still in flight/);
+
+    // THE LOCK HOLDER: in a transaction of its own, holding a table every truncation needs.
+    await holder.client.query("begin");
+    await holder.client.query("lock table member_identity_mapping_state in access exclusive mode");
+    const [holding] = await sessionEvidence([holder.pid]);
+    expect(holding).toMatchObject({ pid: holder.pid, state: "idle in transaction", waitingOn: null });
+    expect(holding.locksHeld).toBeGreaterThanOrEqual(1);
+    expect(run.armed(), "still in flight: holding a lock changes nothing about that").toEqual([holder.scope]);
+
+    // CLOSED — twice at once, and once more: every call resolves, and the session is gone.
+    await Promise.all([holder.close(), holder.close()]);
+    await holder.close();
+
+    // SEEN GONE, by its exact backend — and only so is the marker off and the run clean again.
+    expect(await sessionEvidence([holder.pid])).toEqual([]);
+    expect(run.armed()).toEqual([]);
+    expect(run.blocked()).toBeNull();
+    expect(() => assertRunSafe()).not.toThrow();
+    // Its lock went with it: a barrier takes that table at once.
+    const free = await holdTable("member_identity_mapping_state", { lockTimeoutMs: 250 });
+    await free.release();
+    expect(run.blocked()).toBeNull();
+    expect(raceHarnessFatal()).toBeNull();
+  }, RACE_TEST_TIMEOUT_MS);
+
+  it("THE MARKER COMES FIRST: one that cannot be written prevents the session, and a name that could not be carried whole is refused before either", async () => {
+    const { root, safety } = privateRun();
+
+    // `identity-race-foreign/` + 42 characters is 64 bytes; PostgreSQL keeps 63.
+    for (const name of ["n".repeat(42), "n".repeat(200), "not a name", "é".repeat(8)]) {
+      const refusal = await openTestSession(name, { safety }).then(() => null, (error: unknown) => error);
+      expect(refusal, name).toBeInstanceOf(RaceHarnessError);
+      expect((refusal as Error).message, name).toMatch(/unusable test session name/);
+    }
+    expect(safety.armed(), "refused before the marker, and before any connection").toEqual([]);
+
+    // A MARKER THAT CANNOT BE WRITTEN: the session is refused before it connects. None under its
+    // name ever exists, and nothing is left to clean up.
+    const missing = createRunSafety(join(root, "no-such-database", randomUUID()));
+    const name = `unrecorded-${randomUUID().slice(0, 8)}`;
+    const failure = await openTestSession(name, { safety: missing }).then(() => null, (error: unknown) => error);
+    expect(failure).toBeInstanceOf(RunSafetyError);
+    expect((failure as Error).message).toMatch(/could not be recorded — no database work may start/);
+    expect(await sessionsNamed(`identity-race-foreign/${name}`)).toEqual([]);
+  }, RACE_TEST_TIMEOUT_MS);
+
+  it("A LOCK HOLDER WHOSE CLOSING IS NOT ACKNOWLEDGED IN TIME: the run is stopped and its marker kept — rightly, it still holds its lock and a reader still waits behind it — and when it is then really closed, seen gone and acknowledged, the failed conclusion stands", async () => {
+    // Staged in a run-safety state of this test's own: the real run is not stopped by testing what stops it.
+    const { directory, safety } = privateRun();
+    const name = `lock-holder-${randomUUID().slice(0, 8)}`;
+    const sessionName = `identity-race-foreign/${name}`;
+    const hand = handClock();
+    // What ending the holder's connection answers with, once this test has stood in front of it.
+    const ending = controlled<void>();
+    const asked = tally();
+    const unhandled = watchUnhandled();
+    // The lock holder is a REAL session whose marker is in the private state, which the real run
+    // does not read: the real run carries a sentinel of its own until that session is SEEN gone.
+    const staged = stagedOnRealRun("a test-owned lock holder whose closing is staged not to be acknowledged in time");
+    let holder: TestSession | undefined;
+    // The connection's own `end`, kept from before this test stood in front of it.
+    let reallyEnd: (() => Promise<void>) | undefined;
+    try {
+      // Opened on the clock this test moves — and on nothing else staged: until the gate below, its
+      // closing would be the real one, acknowledged in real time.
+      holder = await openTestSession(name, { safety, clock: hand.clock });
+      // ITS MARKER IS ON FILE, in the state it was opened under, and that state's guard refuses.
+      expect(safety.armed()).toEqual([holder.scope]);
+      expect(() => assertRunSafe(safety)).toThrow(/1 harness scope\(s\) still in flight/);
+      expect(await sessionsNamed(sessionName)).toEqual([{ pid: holder.pid, state: "idle" }]);
+
+      // THE SCHEDULE: it holds a table lock in a transaction of its own, and a reader — another
+      // foreign session, a scope of the real run — is proven waiting behind it, on that lock.
+      await holder.client.query("begin");
+      await holder.client.query("lock table member_identity_mapping_state in access exclusive mode");
+      const waiter = await foreign("behind-holder");
+      const stuck = inFlight(waiter.client.query("select count(*)::int as n from member_identity_mapping_state"));
+      await untilSessions([waiter.pid], "the foreign read waiting on the holder's table lock", waitsOn("relation", 1));
+      const [holding] = await sessionEvidence([holder.pid]);
+      expect(holding).toMatchObject({ pid: holder.pid, state: "idle in transaction", waitingOn: null });
+      expect(holding.locksHeld).toBeGreaterThanOrEqual(1);
+      expect(currentRunSafety().armed(), "the real run: the sentinel and the waiter").toEqual([staged.scope, waiter.scope].sort());
+
+      // THE FAILURE GATE. No seam of the harness's: the client is this test's, so it is the client's
+      // own `end` that is made to do nothing and not to answer — which is what the harness's real
+      // closing, the one every foreign session of this file is closed by, then runs into.
+      const connection = holder.client as unknown as { end: () => Promise<void> };
+      const end = connection.end;
+      reallyEnd = () => end.call(connection);
+      connection.end = () => {
+        asked.note();
+        return ending.promise;
+      };
+      const closed = inFlight(holder.close());
+      await Promise.race([asked.reached(1), closed.promise.then(() => undefined, () => undefined)]);
+      expect(asked.count(), "the closing was asked for").toBe(1);
+      expect(hand.delays(), "and it is bounded").toEqual([OWNED_BOUND_MS]);
+      await turn();
+      expect(closed.state()).toBe("pending");
+
+      // ITS DEADLINE PASSES. The close is refused, and THE RUN IS STOPPED: a fatal reason, the
+      // marker still on file, and the guard that runs before every TRUNCATE refusing.
+      hand.tick(OWNED_BOUND_MS);
+      const failure = await closed.promise.then(() => null, (error: unknown) => error);
+      expect(failure).toBeInstanceOf(RaceHarnessError);
+      expect((failure as Error).message).toMatch(
+        /a test's own session identity-race-foreign\/lock-holder-[a-f0-9]+ was closed, and it could not be proven gone/,
+      );
+      const reason = safety.fatal();
+      expect(reason).toBe((failure as Error).message);
+      expect(safety.armed()).toEqual([holder.scope]);
+      expect(() => assertRunSafe(safety)).toThrow(/run STOPPED — refusing to truncate or run another test/);
+      // AND RIGHTLY SO. The session is exactly where it was: in its transaction, holding its lock,
+      // with the reader still waiting behind it — as a truncation would.
+      const [still] = await sessionEvidence([holder.pid]);
+      expect(still).toMatchObject({ pid: holder.pid, state: "idle in transaction", waitingOn: null });
+      expect(still.locksHeld).toBeGreaterThanOrEqual(1);
+      expect(await sessionEvidence([waiter.pid])).toMatchObject([{ pid: waiter.pid, state: "active", waitingOn: "relation" }]);
+      expect(stuck.state()).toBe("pending");
+
+      // THE CLEANUP GATE, opened LATE: the connection really is closed now, its backend SEEN gone,
+      // the reader behind it completes — and the ending the harness asked for is, at last, acknowledged.
+      await reallyEnd();
+      await untilSessions([holder.pid], "the lock holder's backend gone", (sessions) => sessions.length === 0);
+      expect((await stuck.promise).rows).toEqual([{ n: expect.any(Number) }]);
+      ending.resolve();
+      await turn();
+
+      // NOTHING CAME OF IT. Not an unhandled rejection; the closing was not asked for again and no
+      // other bound started; reads of the session's absence succeed…
+      expect(unhandled.seen).toEqual([]);
+      expect(asked.count()).toBe(1);
+      expect(hand.delays()).toEqual([OWNED_BOUND_MS]);
+      expect(await sessionEvidence([holder.pid])).toEqual([]);
+      expect(await sessionsNamed(sessionName)).toEqual([]);
+      // …and the failed conclusion stands: the same refusal, the marker, the reason, the guard —
+      // here, and for any other reader of the same state, as the next test file's worker is.
+      expect(await holder.close().then(() => null, (error: unknown) => error)).toBe(failure);
+      expect(safety.armed()).toEqual([holder.scope]);
+      expect(safety.fatal()).toBe(reason);
+      expect(safety.setFatal("a later, different reason")).toBe(reason);
+      expect(() => assertRunSafe(safety)).toThrow(/run STOPPED — refusing to truncate or run another test/);
+      const elsewhere = createRunSafety(directory);
+      expect(elsewhere.armed()).toEqual([holder.scope]);
+      expect(elsewhere.fatal()).toBe(reason);
+      expect(() => assertRunSafe(elsewhere)).toThrow(/run STOPPED/);
+      // The real run was not stopped by this test: its state is not this one.
+      expect(raceHarnessFatal()).toBeNull();
+      expect(currentRunSafety().armed()).toEqual([staged.scope, waiter.scope].sort());
+    } finally {
+      // ON EVERY EXIT nothing stays held back, and the holder's connection is really closed — by its
+      // own `end`, whether or not this test ever stood in front of it. The real run's sentinel comes
+      // off only once no session is left under the holder's name. If one is, this throws, the
+      // sentinel stays, and the real run stops.
+      unhandled.stop();
+      ending.resolve();
+      if (reallyEnd) await reallyEnd().catch(() => undefined);
+      else if (holder) await holder.client.end().catch(() => undefined);
+      await untilNoSessionsNamed(sessionName);
+      staged.clear();
+    }
+    // The sentinel took nothing else with it: the staged state is still stopped, its scope still on file.
+    expect(safety.armed()).toEqual([`session-${name}`]);
+    expect(safety.fatal()).toMatch(/could not be proven gone/);
+    expect(raceHarnessFatal()).toBeNull();
   }, RACE_TEST_TIMEOUT_MS);
 });

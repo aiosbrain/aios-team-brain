@@ -50,6 +50,22 @@ import { currentRunSafety, type RunSafety } from "./run-fatal-latch";
  * wait's deadline: a read that outlasts the deadline fails the wait there and then, and whatever
  * that read comes back with later — the very evidence that was expected, included — is observed
  * and dropped. Nothing a read returns after its wait has failed can make that wait succeed.
+ *
+ * AND EVERY BOUND HERE IS THAT KIND OF DEADLINE — not only the evidence waits. The raced operations
+ * settling, a connection being closed, PostgreSQL acknowledging a signal: each is asked of the clock
+ * when it settles, whichever way it settles, and one that settles at or after its deadline has not
+ * met it, however late the timer that was to say so (`outcomeBy`). The clock is MONOTONIC
+ * (`REAL_CLOCK`): the wall clock can be set, and a deadline read from it would move with it.
+ *
+ * WHAT WAS NOT ACKNOWLEDGED IN TIME IS NOT PROVEN LATER. A connection whose closing was not
+ * acknowledged, and a signal whose execution was not, each leave their cleanup `unproven` for good:
+ * the marker stays and the run is stopped, whatever PostgreSQL shows afterwards and whatever the
+ * late answer turns out to be. Closing is still attempted to the end; it just proves nothing.
+ *
+ * A TEST'S OWN SESSIONS ARE SCOPES TOO. A plain client a test opens to hold a lock or to wait on one
+ * is never registered as a raced operation and never signalled — but it can outlive its test just
+ * as a barrier can. So it is opened through `openTestSession`: its marker is recorded before it
+ * connects, and comes off only once its closing was acknowledged and that exact backend was seen gone.
  */
 
 export interface RaceBounds {
@@ -79,11 +95,12 @@ const EVIDENCE_INTERVAL_MS = 25;
  *     and then ends the connection (up to `OWNED_CONNECTION_BOUND_MS` each), and absence is then
  *     waited for twice — no session under the tag, and not that exact backend — up to `cleanupMs`
  *     each;
- *   - up to three cleanup rounds (settle, cancel, terminate) of up to two `cleanupMs` each.
+ *   - up to three cleanup rounds (settle, cancel, terminate) of up to two `cleanupMs` each, and
+ *     between them the two signals' acknowledgements, up to `OWNED_CONNECTION_BOUND_MS` each.
  *
  * At the defaults (`pollMs` 10 s, `cleanupMs` 5 s, `OWNED_CONNECTION_BOUND_MS` 10 s) that is up to
  * 70 s to acquire, 30 s of evidence waits (50 s with `whileQueued`), 30 s for the barrier to be seen
- * gone and 30 s of cleanup rounds: 160 s, or 180 s — and 90 s (110 s) even when acquisition is
+ * gone and 50 s of cleanup rounds: 180 s, or 200 s — and 110 s (130 s) even when acquisition is
  * instant. A wait that succeeds returns as soon as PostgreSQL shows the evidence, and a schedule
  * stops at its first wait that fails, so in practice one wait runs long. But nothing makes the
  * others short: a schedule in which every part takes nearly its whole bound adds up to more than
@@ -145,23 +162,46 @@ export function raceHarnessFatal(): string | null {
 }
 
 /**
- * The clock one evidence wait runs on: where its deadline is read from, and what ends a read or a
- * pause that would outlast it. Every wait runs on the real one; another is a SEAM for the harness's
- * own tests, which stage a deadline passing instead of waiting for one.
+ * The clock a bounded wait runs on: where its deadline is read from, and what ends a read, a pause
+ * or a step that would outlast it. Every wait runs on the real one; another is a SEAM for the
+ * harness's own tests, which stage a deadline passing instead of waiting for one.
  */
 export interface EvidenceClock {
+  /** Milliseconds on a clock that only goes forward. Only differences between two readings mean anything. */
   now: () => number;
   /** Call `fire` once `ms` have passed. Returns how to call that off. */
   after: (ms: number, fire: () => void) => () => void;
 }
 
+/**
+ * THE REAL CLOCK IS MONOTONIC. A deadline is a length of time, so it is read from a clock that only
+ * goes forward, at the rate time passes (`performance.now()`) — never from the wall clock. A wall
+ * clock is SET: by NTP, by a machine waking from sleep, by hand. A deadline read from it is extended
+ * when it is set back and cut short when it is set forward, and neither is time having passed. The
+ * timers are the event loop's, which are monotonic too.
+ *
+ * `performance.now` is looked up on every call, not captured once: the harness's own tests stage a
+ * monotonic reading there while they move the wall clock the other way.
+ */
 const REAL_CLOCK: EvidenceClock = {
-  now: () => Date.now(),
+  now: () => globalThis.performance.now(),
   after: (ms, fire) => {
     const timer = setTimeout(fire, ms);
     return () => clearTimeout(timer);
   },
 };
+
+const explain = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+/** `start()`, with a synchronous throw — or a result that is no promise — made the promise it stands for. */
+function attempt<T>(start: () => Promise<T>): Promise<T> {
+  try {
+    const started = start();
+    return new Promise<T>((resolve) => { resolve(started); });
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
 
 /**
  * SEAMS for the harness's own tests, on the waits that prove a barrier's session gone: another
@@ -174,22 +214,53 @@ export interface EvidenceSeam {
   read?: <T>(read: () => Promise<T>) => Promise<T>;
 }
 
+/** How `work` settled — and whether the clock had already reached the deadline when it did. */
+interface Outcome<T> {
+  result: { ok: true; value: T } | { ok: false; error: unknown };
+  /** It settled AT OR AFTER the deadline: ahead of the timer that was to say so, but not in time. */
+  late: boolean;
+}
+
 /**
- * `work`, for at most `ms`: what it resolved to, or `null` if it had not settled by then. A
- * rejection inside the bound is rethrown.
+ * THE ONE PRIMITIVE EVERY BOUND IS BUILT ON. What became of `work` by `deadline` (a reading of
+ * `clock`): how it settled, or `null` if the timer for the deadline fired while it was still pending.
  *
- * BOTH of `work`'s outcomes are observed, whenever they come. One that comes after the bound finds
- * this promise already settled and changes nothing: it is never an unhandled rejection, and never a
- * result anyone acts on.
+ * THE TIMER IS NOT THE CLOCK. A timer that is due can be run after a result that arrived later than
+ * it was due — a busy event loop does exactly that — so "the result came before the timer fired" says
+ * nothing about when it came. The clock is therefore asked when `work` settles, on BOTH paths: a
+ * resolution and a rejection at or after the deadline are each reported `late`, and no caller here
+ * treats a late outcome as one that met its bound.
+ *
+ * This promise settles ONCE, and never rejects. Both of `work`'s outcomes are observed whenever they
+ * come; one that comes after the timer finds it settled and changes nothing — never an unhandled
+ * rejection, never a result anyone acts on, never a second verdict.
  */
-function settledWithin<T>(clock: EvidenceClock, work: Promise<T>, ms: number): Promise<{ value: T } | null> {
-  return new Promise((resolve, reject) => {
-    const callOff = clock.after(ms, () => resolve(null));
+function outcomeBy<T>(clock: EvidenceClock, work: Promise<T>, deadline: number): Promise<Outcome<T> | null> {
+  return new Promise((resolve) => {
+    let over = false;
+    let callOff = (): void => undefined;
+    const end = (outcome: Outcome<T> | null): void => {
+      if (over) return;
+      over = true;
+      callOff();
+      resolve(outcome);
+    };
+    callOff = clock.after(Math.max(0, deadline - clock.now()), () => end(null));
     work.then(
-      (value) => { callOff(); resolve({ value }); },
-      (error: unknown) => { callOff(); reject(error); },
+      (value) => end({ result: { ok: true, value }, late: clock.now() >= deadline }),
+      (error: unknown) => end({ result: { ok: false, error }, late: clock.now() >= deadline }),
     );
   });
+}
+
+/**
+ * What `work` RESOLVED to, if it did so before `ms` had passed on `clock`; otherwise `null` — it
+ * rejected, it was still pending, or it resolved only at or after the deadline. For a step that
+ * proves something only by being acknowledged: closing a connection, executing a signal.
+ */
+async function fulfilledWithin<T>(clock: EvidenceClock, work: Promise<T>, ms: number): Promise<{ value: T } | null> {
+  const outcome = await outcomeBy(clock, work, clock.now() + ms);
+  return outcome && !outcome.late && outcome.result.ok ? { value: outcome.result.value } : null;
 }
 
 /**
@@ -201,11 +272,13 @@ function settledWithin<T>(clock: EvidenceClock, work: Promise<T>, ms: number): P
  *
  *   - a read is started only while there is budget left, and is given what is left of it. One still
  *     pending at the deadline fails the wait then; no other read is started, and whatever that one
- *     later resolves or rejects with is dropped (`settledWithin`);
+ *     later resolves or rejects with is dropped (`outcomeBy`);
  *   - a read that does come back is checked against the deadline BEFORE it is accepted. The timer
  *     that bounds a read and the clock are not the same thing — a late result can be delivered ahead
  *     of a timer that is already due — so evidence that is what was expected, but was read at or
  *     after the deadline, fails the wait like any other;
+ *   - a read that FAILS is the wait's failure, as its own error, when it fails in time; one that
+ *     fails only at or after the deadline is late like any other, and the wait ends as expired;
  *   - the pause between two reads never runs past the deadline either.
  *
  * `clock` is a seam for the harness's own tests (`EvidenceClock`).
@@ -225,13 +298,17 @@ export async function untilEvidence<T>(opts: {
   // The last read that came back IN TIME — the detail of a wait that then runs out.
   let seen: { value: T } | null = null;
   for (;;) {
-    const remaining = deadline - clock.now();
-    if (remaining <= 0) throw expired(seen ? `last saw ${opts.show(seen.value)}` : "nothing was read");
-    const read = await settledWithin(clock, opts.read(), remaining);
-    if (!read) throw expired(`a read was still pending at the deadline${seen ? `; last saw ${opts.show(seen.value)}` : ""}`);
-    const { value } = read;
-    // Asked BEFORE acceptance, and of the clock itself: that the read beat its timer says nothing.
-    const late = clock.now() >= deadline;
+    if (deadline - clock.now() <= 0) throw expired(seen ? `last saw ${opts.show(seen.value)}` : "nothing was read");
+    const read = await outcomeBy(clock, opts.read(), deadline);
+    const lastSaw = seen ? `; last saw ${opts.show(seen.value)}` : "";
+    if (!read) throw expired(`a read was still pending at the deadline${lastSaw}`);
+    // `late` was asked of the clock itself, as the read settled: that it beat its timer says nothing.
+    const { result, late } = read;
+    if (!result.ok) {
+      if (!late) throw result.error;
+      throw expired(`a read failed only at or after the deadline (${explain(result.error)})${lastSaw}`);
+    }
+    const { value } = result;
     const accepted = opts.accept(value);
     if (accepted && !late) return value;
     if (!accepted) {
@@ -241,28 +318,64 @@ export async function untilEvidence<T>(opts: {
     if (late) {
       throw expired(accepted ? `what was expected was read only at or after the deadline: ${opts.show(value)}` : `last saw ${opts.show(value)}`);
     }
-    seen = read;
+    seen = { value };
     const interval = Math.min(EVIDENCE_INTERVAL_MS, deadline - clock.now());
     await new Promise<void>((resolve) => { clock.after(interval, resolve); });
   }
 }
 
-/** `true` if `work` finished inside `ms`. The timer bounds CLEANUP only. */
-async function withinBound(work: Promise<unknown>, ms: number): Promise<boolean> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const bound = new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), ms); });
-  try {
-    return await Promise.race([work.then(() => true as const, () => true as const), bound]);
-  } finally {
-    clearTimeout(timer);
-  }
+/**
+ * `true` only if `work` SETTLED — resolved or rejected — before `ms` had passed on `clock`. One that
+ * settles at or after that deadline is `false`, also when the timer for it has not been run yet; and
+ * once this has said `false`, nothing `work` does later says anything else (`outcomeBy`).
+ *
+ * Exported, with its `clock`, as a SEAM for the harness's own tests.
+ */
+export async function withinBound(work: Promise<unknown>, ms: number, clock: EvidenceClock = REAL_CLOCK): Promise<boolean> {
+  const outcome = await outcomeBy(clock, work, clock.now() + ms);
+  return outcome !== null && !outcome.late;
 }
 
-/** Close a harness-owned client for good: roll back if asked, end it, and never wait unboundedly. */
-async function disposeOwned(client: Client, rollback: boolean): Promise<void> {
-  if (rollback) await withinBound(client.query("rollback"), OWNED_CONNECTION_BOUND_MS);
-  // Ending the connection ends its session: the server rolls back whatever it still held.
-  await withinBound(client.end(), OWNED_CONNECTION_BOUND_MS);
+/**
+ * What closing a harness-owned connection was SEEN to do. `closed`: every step of it was
+ * acknowledged, each within its bound. `uncertain`: a step was still pending at its deadline, failed,
+ * or was acknowledged only at or after it — or the closing was somebody else's code that did not say.
+ *
+ * `uncertain` is not "probably closed". A session whose closing was not acknowledged is not proven
+ * gone by anything read afterwards (`holdLock`, `openTestSession`).
+ */
+export type Disposal = "closed" | "uncertain";
+
+/** A replacement for closing an owned connection — a SEAM for the harness's own tests. */
+export type DisposeSeam = (client: Client, rollback: boolean) => Promise<Disposal | void>;
+
+/**
+ * Close a harness-owned client for good: roll back if asked, end it, never wait unboundedly — and
+ * SAY what was seen of it. Never throws.
+ *
+ * Best-effort to the end: whatever became of the rollback, the connection is still ended (ending it
+ * ends its session, and the server rolls back whatever it still held). But only a closing whose every
+ * step was acknowledged in time is reported `closed`.
+ */
+async function disposeOwned(client: Client, rollback: boolean, clock: EvidenceClock = REAL_CLOCK): Promise<Disposal> {
+  const rolledBack = !rollback
+    || (await fulfilledWithin(clock, attempt(() => client.query("rollback")), OWNED_CONNECTION_BOUND_MS)) !== null;
+  const ended = (await fulfilledWithin(clock, attempt(() => client.end()), OWNED_CONNECTION_BOUND_MS)) !== null;
+  return rolledBack && ended ? "closed" : "uncertain";
+}
+
+/**
+ * Close an owned client — by `replacement`, if a test gave one — and say what was seen of it. Never
+ * throws.
+ *
+ * A replacement is bounded here, as the one step it is, and is believed only if it SAYS `closed`,
+ * in time. One that is still pending at the deadline, that rejects, that answers late, or that
+ * resolves with anything else — nothing at all, included — is `uncertain`.
+ */
+async function closeOwned(client: Client, rollback: boolean, clock: EvidenceClock, replacement?: DisposeSeam): Promise<Disposal> {
+  if (!replacement) return disposeOwned(client, rollback, clock);
+  const said = await fulfilledWithin(clock, attempt(() => replacement(client, rollback)), OWNED_CONNECTION_BOUND_MS);
+  return said?.value === "closed" ? "closed" : "uncertain";
 }
 
 function ownedClient(role: string, applicationName = `${APPLICATION}/${role}`): Client {
@@ -288,6 +401,8 @@ function monitorClient(): Promise<Client> {
       return client;
     } catch (error) {
       monitor = undefined;
+      // It never connected, and it is the failed connection that is reported: what closing it was
+      // seen to do decides nothing here.
       await disposeOwned(client, false);
       throw error;
     }
@@ -295,8 +410,28 @@ function monitorClient(): Promise<Client> {
   return monitor;
 }
 
+/**
+ * One query on the monitor, as it comes: bounded by nothing of its own. That is right INSIDE an
+ * evidence wait, which bounds each of its reads by what is left of its one deadline — a second timer
+ * around the same read would only compete with it. A read made anywhere else goes through `answered`.
+ */
 async function observe<T>(text: string, params: unknown[] = []): Promise<T[]> {
   return (await (await monitorClient()).query(text, params)).rows as T[];
+}
+
+/**
+ * A read asked of the monitor DIRECTLY — not inside an evidence wait, so with no deadline around it
+ * yet. It is answered within the bound of one owned-connection statement, or it has failed: an
+ * answer still pending then, or arriving at or after it, is not one, and is dropped when it comes.
+ * A read that fails in time fails with its own error.
+ */
+async function answered<T>(what: string, read: Promise<T>): Promise<T> {
+  const outcome = await outcomeBy(REAL_CLOCK, read, REAL_CLOCK.now() + OWNED_CONNECTION_BOUND_MS);
+  if (!outcome || outcome.late) {
+    throw new RaceHarnessError(`the monitor did not answer within ${OWNED_CONNECTION_BOUND_MS} ms: ${what}`);
+  }
+  if (!outcome.result.ok) throw outcome.result.error;
+  return outcome.result.value;
 }
 
 /** Close the monitor. Call once, after the file's last test. */
@@ -320,8 +455,8 @@ export interface SessionEvidence {
 
 const databaseOid = "(select oid from pg_database where datname = current_database())";
 
-/** What PostgreSQL says about exactly these backends. A backend that is gone has no row. */
-export async function sessionEvidence(pids: number[]): Promise<SessionEvidence[]> {
+/** One reading of exactly these backends, unbounded: for an evidence wait to bound (`observe`). */
+async function readSessionEvidence(pids: number[]): Promise<SessionEvidence[]> {
   if (pids.length === 0) return [];
   return observe<SessionEvidence>(
     `select a.pid, a.state,
@@ -334,6 +469,11 @@ export async function sessionEvidence(pids: number[]): Promise<SessionEvidence[]
       order by a.pid`, [pids]);
 }
 
+/** What PostgreSQL says about exactly these backends. A backend that is gone has no row. */
+export async function sessionEvidence(pids: number[]): Promise<SessionEvidence[]> {
+  return answered(`the state of backends ${pids.join(",")}`, readSessionEvidence(pids));
+}
+
 /** Re-read exactly these backends until `accept` holds, within the default evidence bound. */
 export async function untilSessions(
   pids: number[],
@@ -341,7 +481,7 @@ export async function untilSessions(
   accept: (sessions: SessionEvidence[]) => boolean,
 ): Promise<SessionEvidence[]> {
   return untilEvidence({
-    read: () => sessionEvidence(pids),
+    read: () => readSessionEvidence(pids),
     accept,
     expected,
     show: (sessions) => JSON.stringify(sessions),
@@ -355,11 +495,14 @@ const MAX_APPLICATION_NAME_BYTES = 63;
 /** The `application_name` a barrier's session is found — and later seen gone — by. */
 const barrierSessionName = (tag: string) => `${APPLICATION}/barrier/${tag}`;
 
+/** One reading of the sessions under one exact `application_name`, unbounded: for an evidence wait to bound. */
+const readSessionsNamed = (applicationName: string) => observe<{ pid: number; state: string | null }>(
+  "select pid, state from pg_stat_activity where datname = current_database() and application_name = $1 order by pid",
+  [applicationName]);
+
 /** The live sessions of this database under one exact `application_name`. */
 export async function sessionsNamed(applicationName: string): Promise<{ pid: number; state: string | null }[]> {
-  return observe<{ pid: number; state: string | null }>(
-    "select pid, state from pg_stat_activity where datname = current_database() and application_name = $1 order by pid",
-    [applicationName]);
+  return answered(`the sessions named ${applicationName}`, readSessionsNamed(applicationName));
 }
 
 /** The live sessions of one named barrier (`holdLock`'s `tag`), found by its exact `application_name`. */
@@ -370,7 +513,7 @@ export async function barrierSessions(tag: string): Promise<{ pid: number; state
 /** Re-read one named barrier's sessions until none is left, within the default evidence bound. */
 export async function untilBarrierGone(tag: string): Promise<void> {
   await untilEvidence({
-    read: () => barrierSessions(tag),
+    read: () => readSessionsNamed(barrierSessionName(tag)),
     accept: (sessions) => sessions.length === 0,
     expected: `no session left for barrier ${tag}`,
     show: (sessions) => JSON.stringify(sessions),
@@ -391,9 +534,10 @@ export interface Barrier {
    * and this rejects. Idempotent, and safe to call concurrently.
    */
   release: () => Promise<void>;
-  /** For the schedules: close the connection once, and say whether its session was SEEN gone —
-   * each proof of that within `cleanupMs` of its own. `evidence` is a seam for the harness's own
-   * tests (`EvidenceSeam`); like `cleanupMs`, it is the first call's that counts. */
+  /** For the schedules: close the connection once, and say whether its session was PROVEN gone —
+   * its closing acknowledged within its bound, and then each proof of absence within `cleanupMs` of
+   * its own. `evidence` is a seam for the harness's own tests (`EvidenceSeam`); like `cleanupMs`, it
+   * is the first call's that counts — and so is the verdict: it is never taken again. */
   vanish: (cleanupMs: number, evidence?: EvidenceSeam) => Promise<boolean>;
   /** For the schedules: clear this scope's marker (`proven`) or stop the run. The first conclusion stands. */
   conclude: (proven: boolean, reason: string) => void;
@@ -405,12 +549,14 @@ export interface BarrierOptions {
   /** Shortens how long the barrier's own lock request may wait before PostgreSQL refuses it. */
   lockTimeoutMs?: number;
   /** SEAMS for the harness's own tests: another run-safety state, a shorter cleanup budget, a
-   * replacement for closing the connection (to stage a barrier that survives its release), and a
+   * replacement for closing the connection (to stage a barrier that survives its release, or a
+   * closing that is never acknowledged — `DisposeSeam`), the clock that closing is bounded on, and a
    * different `application_name` for its session (to stage one that cannot be found by its tag —
    * what an `application_name` in the connection string does to every session). */
   safety?: RunSafety;
   cleanupMs?: number;
-  dispose?: (client: Client, rollback: boolean) => Promise<void>;
+  dispose?: DisposeSeam;
+  clock?: EvidenceClock;
   applicationName?: string;
 }
 
@@ -459,16 +605,16 @@ async function backendAbsent(backend: BackendIdentity, ms: number, seam: Evidenc
 }
 
 /**
- * The tagged barrier session was SEEN to be absent within `ms`. Unreadable evidence is not absence —
- * and nor is evidence read too late: a read that shows the session gone only after `ms` is `false`.
+ * No session under one exact `application_name` was SEEN within `ms`. Unreadable evidence is not
+ * absence — and nor is evidence read too late: a read that shows none only after `ms` is `false`.
  */
-async function barrierAbsent(tag: string, ms: number, seam: EvidenceSeam = {}): Promise<boolean> {
+async function namedAbsent(applicationName: string, expected: string, ms: number, seam: EvidenceSeam = {}): Promise<boolean> {
   try {
-    const read = seamed(seam, () => barrierSessions(tag));
+    const read = seamed(seam, () => readSessionsNamed(applicationName));
     await untilEvidence({
       read,
       accept: (sessions) => sessions.length === 0,
-      expected: `no session left for barrier ${tag}`,
+      expected,
       show: (sessions) => JSON.stringify(sessions),
       timeoutMs: ms,
       clock: seam.clock,
@@ -478,6 +624,10 @@ async function barrierAbsent(tag: string, ms: number, seam: EvidenceSeam = {}): 
     return false;
   }
 }
+
+/** The tagged barrier session was SEEN to be absent within `ms` (`namedAbsent`). */
+const barrierAbsent = (tag: string, ms: number, seam: EvidenceSeam = {}): Promise<boolean> =>
+  namedAbsent(barrierSessionName(tag), `no session left for barrier ${tag}`, ms, seam);
 
 /**
  * A connection of the harness's own, in a transaction that holds the lock `sql` takes until it is
@@ -501,6 +651,12 @@ async function barrierAbsent(tag: string, ms: number, seam: EvidenceSeam = {}): 
  * of its own: right after the session identifies itself, the monitor must see exactly that backend
  * by the very predicate that will later show it gone. A backend the monitor never saw present —
  * unreadable, or not matching — is `unproven` on every path; its absence is never taken as proof.
+ *
+ * AND ABSENCE NEEDS AN ACKNOWLEDGED CLOSING. The connection is closed first, within a bound, and
+ * what was seen of that is kept (`Disposal`). If the closing was not acknowledged in time — still
+ * pending, failed, answered late, or not answered in so many words — the barrier is `unproven` there
+ * and then and for good: the marker stays, the run is stopped, and no absence read then or later, and
+ * no late answer from the closing, changes that. The first verdict of `vanish` is the only one.
  */
 export async function holdLock(sql: string, params: unknown[] = [], opts: BarrierOptions = {}): Promise<Barrier> {
   const tag = opts.tag ?? randomUUID().slice(0, 12);
@@ -517,7 +673,7 @@ export async function holdLock(sql: string, params: unknown[] = [], opts: Barrie
   }
   const safety = opts.safety ?? currentRunSafety();
   const cleanupMs = opts.cleanupMs ?? DEFAULT_BOUNDS.cleanupMs;
-  const dispose = opts.dispose ?? disposeOwned;
+  const clock = opts.clock ?? REAL_CLOCK;
   // FIRST: the in-flight marker. If it cannot be written, nothing below runs.
   safety.arm(tag, `barrier ${tag}: ${sql}`);
 
@@ -529,11 +685,10 @@ export async function holdLock(sql: string, params: unknown[] = [], opts: Barrie
   let backendSeen = false;
   let vanished: Promise<boolean> | undefined;
   const vanish = (ms: number, evidence: EvidenceSeam = {}): Promise<boolean> => (vanished ??= (async () => {
-    try {
-      await dispose(owner, begun);
-    } catch {
-      // Whatever closing did or did not do, only the evidence below counts.
-    }
+    // THE CLOSING ITSELF, bounded, and what was seen of it KEPT. A closing that was not acknowledged
+    // in time proves nothing, and nothing read afterwards proves it for it: the session may be gone,
+    // and may be seen gone — it is `unproven` all the same, now and whenever this is asked again.
+    if ((await closeOwned(owner, begun, clock, opts.dispose)) !== "closed") return false;
     // Never connected: there was no session. (The tag is still looked for, for what it is worth.)
     if (!connected) return barrierAbsent(tag, ms, evidence);
     // A session that was opened and never identified, or that the monitor never saw under the
@@ -572,7 +727,7 @@ export async function holdLock(sql: string, params: unknown[] = [], opts: Barrie
     // THE POSITIVE CONTROL FOR ITS IDENTITY, before anything can fail on its name: the monitor must
     // see exactly one row that is this backend, by the predicate that will later be asked to show
     // it gone. If it does not — or cannot be read — the session is never treated as absent.
-    const present = await backendRows(backend);
+    const present = await answered(`backend ${pid} of barrier ${tag}`, backendRows(backend));
     if (present.length !== 1 || present[0].pid !== pid) {
       throw new RaceHarnessError(
         `barrier ${tag}: the monitor must see exactly its backend ${pid} (started ${backend.started}), and sees ${JSON.stringify(present)}`,
@@ -632,6 +787,149 @@ export const holdNamedLock = (name: string, opts: BarrierOptions = {}) =>
 
 /** The name of one team's identity-authority advisory lock — what the mutation boundary takes first. */
 export const authorityLockName = (teamId: string) => `${teamId}:identity-authority`;
+
+// ── A test's own sessions: plain clients, never registered, never signalled — and still scopes ──
+
+/** Every session a test opens through `openTestSession` is named under this, so it can be told apart. */
+const TEST_SESSION = "identity-race-foreign";
+
+export interface TestSession {
+  /** The test's own client. What it runs, and when, is the test's business. */
+  client: Client;
+  /** Its backend: what the test reads evidence about. */
+  pid: number;
+  /** The name of its in-flight scope in the run-safety state. */
+  scope: string;
+  /**
+   * Close it and PROVE it: end the connection, see that exact backend gone, and only then clear its
+   * in-flight marker. If the closing is not acknowledged in time, or the backend is not seen gone,
+   * the run is stopped, the marker stays and this rejects — then and on every later call.
+   * Idempotent, and safe to call concurrently.
+   */
+  close: () => Promise<void>;
+}
+
+export interface TestSessionOptions {
+  /** SEAMS for the harness's own tests, as a barrier's (`BarrierOptions`): another run-safety state,
+   * a shorter budget for seeing the backend gone, and the clock its closing is bounded on. (There is
+   * no replacement for the closing here: the client is the test's, and a test that wants its `end`
+   * to do something else can make it so.) */
+  safety?: RunSafety;
+  cleanupMs?: number;
+  clock?: EvidenceClock;
+}
+
+/**
+ * A session of a TEST's own: a plain client, under an `application_name` of its own, that the
+ * harness never registers as a raced operation, never reads lock-wait evidence for and never
+ * signals. It is what a test uses to hold a lock the harness does not release, or to wait where a
+ * raced operation waits.
+ *
+ * It is a SCOPE all the same, because it can hold a lock past its test exactly as a barrier can —
+ * and a `TRUNCATE` would then block on it, or clean up around it. So, as for a barrier (`holdLock`):
+ *
+ *   - BEFORE it connects, its scope is recorded as in flight; if that cannot be recorded this throws
+ *     and no connection is made;
+ *   - the session reports who it is — its pid and when it started — and the monitor must SEE exactly
+ *     that backend, by the predicate that will later be asked to show it gone, before the session is
+ *     handed out. One the monitor never saw present is never treated as absent;
+ *   - `close` ends the connection within a bound and keeps what was seen of that (`Disposal`), then
+ *     waits, within `cleanupMs`, to see that exact backend gone. Only both together clear the marker.
+ *     A closing that was not acknowledged in time, or a backend not seen gone, stops the run and
+ *     leaves the marker — for good: the first conclusion stands, whatever is read or answered later;
+ *   - a session that could not be opened is closed and proven gone the same way before the original
+ *     error is rethrown, and stops the run if it cannot be.
+ *
+ * Its closing does not roll back first: a test's client may have a statement still waiting on a
+ * lock, and a `rollback` would only queue behind it. Ending the connection ends the session.
+ */
+export async function openTestSession(name: string, opts: TestSessionOptions = {}): Promise<TestSession> {
+  const sessionName = `${TEST_SESSION}/${name}`;
+  // As for a barrier's tag: the name is what a session that never identified itself is looked for
+  // by, and it names the scope's marker. One that cannot be carried whole is refused before anything
+  // is recorded or connected.
+  if (!/^[A-Za-z0-9._-]+$/.test(name) || Buffer.byteLength(sessionName, "utf8") > MAX_APPLICATION_NAME_BYTES) {
+    throw new RaceHarnessError(
+      `unusable test session name ${JSON.stringify(name)}: it must be [A-Za-z0-9._-]+ and "${sessionName}" must fit PostgreSQL's `
+      + `${MAX_APPLICATION_NAME_BYTES}-byte application_name`,
+    );
+  }
+  const safety = opts.safety ?? currentRunSafety();
+  const cleanupMs = opts.cleanupMs ?? DEFAULT_BOUNDS.cleanupMs;
+  const clock = opts.clock ?? REAL_CLOCK;
+  const scope = `session-${name}`;
+  // FIRST: the in-flight marker. If it cannot be written, nothing below runs.
+  safety.arm(scope, `a test's own session ${sessionName}`);
+
+  // The test's client, as a test would make it: bounded in connecting, and in nothing it runs — a
+  // statement of its own may be MEANT to wait on a lock for as long as the schedule takes.
+  const client = new Client({
+    connectionString: process.env.DATABASE_URL,
+    application_name: sessionName,
+    connectionTimeoutMillis: OWNED_CONNECTION_BOUND_MS,
+  });
+  client.on("error", () => undefined);
+  let connected = false;
+  let backend: BackendIdentity | null = null;
+  // The monitor has SEEN that exact backend present — the positive control its absence rests on.
+  let backendSeen = false;
+  let vanished: Promise<boolean> | undefined;
+  const vanish = (): Promise<boolean> => (vanished ??= (async () => {
+    // As for a barrier: a closing that was not acknowledged in time proves nothing, and nothing read
+    // afterwards proves it for it.
+    if ((await disposeOwned(client, false, clock)) !== "closed") return false;
+    // Never connected: there was no session. (Its name is still looked for, for what it is worth.)
+    if (!connected) return namedAbsent(sessionName, `no session left named ${sessionName}`, cleanupMs);
+    if (!backend || !backendSeen) return false;
+    return backendAbsent(backend, cleanupMs);
+  })());
+  let concluded = false;
+  const conclude = (proven: boolean, reason: string): void => {
+    if (concluded) return;
+    concluded = true;
+    if (proven) safety.disarm(scope);
+    else safety.setFatal(reason);
+  };
+  const stop = (what: string): RaceHarnessError => {
+    const reason = `identity race harness: a test's own session ${sessionName} ${what}, and it could not be proven gone. `
+      + "Sessions that may still hold locks must not be truncated around.";
+    conclude(false, reason);
+    return new RaceHarnessError(reason);
+  };
+
+  try {
+    await client.connect();
+    connected = true;
+    // WHO this session is, from the session itself, before the test is given it.
+    const self = (await client.query<{ pid: unknown; started: unknown }>(
+      `select pg_backend_pid() as pid,
+              (select extract(epoch from backend_start)::text from pg_stat_activity where pid = pg_backend_pid()) as started`)).rows[0];
+    if (!self || typeof self.pid !== "number" || !Number.isInteger(self.pid) || typeof self.started !== "string" || !self.started) {
+      throw new RaceHarnessError(`the backend of test session ${sessionName} could not be identified`);
+    }
+    backend = { pid: self.pid, started: self.started };
+    const pid = backend.pid;
+    // THE POSITIVE CONTROL: the monitor sees exactly one row that is this backend, by the predicate
+    // that will later be asked to show it gone.
+    const present = await answered(`backend ${pid} of test session ${sessionName}`, backendRows(backend));
+    if (present.length !== 1 || present[0].pid !== pid) {
+      throw new RaceHarnessError(
+        `test session ${sessionName}: the monitor must see exactly its backend ${pid} (started ${backend.started}), and sees ${JSON.stringify(present)}`,
+      );
+    }
+    backendSeen = true;
+    let closed: Promise<void> | undefined;
+    const close = (): Promise<void> => (closed ??= (async () => {
+      if (!(await vanish())) throw stop("was closed");
+      conclude(true, "");
+    })());
+    return { client, pid, scope, close };
+  } catch (error) {
+    if (!(await vanish())) throw stop(`could not be opened (${explain(error)})`);
+    conclude(true, "");
+    throw error;
+  }
+}
 
 // ── Registered raced operations ────────────────────────────────────────────────────────────────
 
@@ -855,18 +1153,19 @@ async function lockWaits(): Promise<LockWait[]> {
 
 /** The advisory key of one team's identity authority, as `pg_locks` shows it. */
 export async function authorityKey(teamId: string): Promise<string> {
-  const rows = await observe<{ key: string }>("select hashtextextended($1,0)::text as key", [authorityLockName(teamId)]);
+  const rows = await answered("the team identity authority's advisory key",
+    observe<{ key: string }>("select hashtextextended($1,0)::text as key", [authorityLockName(teamId)]));
   return rows[0].key;
 }
 
 /** The advisory keys exactly this backend holds GRANTED in this database, as `pg_locks` shows them. */
 export async function advisoryKeysHeld(pid: number): Promise<string[]> {
-  const rows = await observe<{ key: string }>(
+  const rows = await answered(`the advisory keys backend ${pid} holds`, observe<{ key: string }>(
     `select ((l.classid::bigint << 32) | l.objid::bigint)::text as key
        from pg_locks l
       where l.pid = $1 and l.granted and l.locktype = 'advisory' and l.objsubid = 1
         and l.database = ${databaseOid}
-      order by 1`, [pid]);
+      order by 1`, [pid]));
   return rows.map((row) => row.key);
 }
 
@@ -935,6 +1234,25 @@ export interface PendingSignal {
 }
 
 /**
+ * SEAMS for the harness's own tests, on the cleanup of the raced operations (`settleRaced`):
+ *
+ *   - `clock`: what the steps of it that are NOT evidence waits are bounded on — the raced operations
+ *     settling in each round, and PostgreSQL acknowledging each signal. (The evidence waits of
+ *     cleanup — the backends going idle — keep the real clock: they are answered by PostgreSQL.)
+ *   - `beforeSignal`: awaited after the leases a signal is aimed at have been reserved and before
+ *     PostgreSQL is asked to execute it — the window in which a release used to be able to hand a
+ *     targeted backend to someone else.
+ *   - `signal`: stands in front of the signal itself. It is given the signal and the real send, and
+ *     what it returns is what the harness waits for as the acknowledgement — so a test can stage one
+ *     that does not come, or comes late.
+ */
+export interface CleanupSeam {
+  clock?: EvidenceClock;
+  beforeSignal?: (pending: PendingSignal) => Promise<void>;
+  signal?: (pending: PendingSignal, send: () => Promise<unknown>) => Promise<unknown>;
+}
+
+/**
  * After the barrier is gone: establish that every raced operation has settled, has returned its
  * connections and left its backends idle or gone. If that does not happen by itself within the
  * bound, a cancel — and then, if still needed, a terminate — is sent to the backends the raced
@@ -949,19 +1267,35 @@ export interface PendingSignal {
  * `cancelled` and `terminated` all mean every checkout was given back to the pool — returned by its
  * operation, or retired here — and every backend was then SEEN idle or gone.
  *
- * `beforeSignal` is a seam for the harness's own tests: it is awaited after the reservation and
- * before PostgreSQL is asked to execute the signal — the window in which a release used to be able
- * to hand a targeted backend to someone else.
+ * EACH ROUND HAS A DEADLINE OF ITS OWN, AND MEETS IT OR DOES NOT. The operations must have settled
+ * before the round's `cleanupMs` has passed on the clock (`withinBound`): settling at or after it —
+ * ahead of a timer that is overdue, included — does not make that round quiet, and nothing they do
+ * later reopens it. The next round is a new one, with a budget of its own; an operation that
+ * settled late is simply found settled there, and the outcome is then that round's, never `quiet`.
+ *
+ * A SIGNAL IS EXECUTED ONLY IF POSTGRESQL SAID SO, IN TIME. Its acknowledgement has a deadline too
+ * (`OWNED_CONNECTION_BOUND_MS`: it is one statement on the harness's own connection). If it is
+ * still pending then, fails, or comes at or after it, whether — and when — the signal is executed
+ * cannot be told: the leases it was aimed at are STRANDED, never handed back to the pool, and the
+ * outcome is `unproven` from then on, whatever the remaining rounds find and whatever that
+ * acknowledgement later turns out to be. The rounds still run — a terminate is still sent, to
+ * backends that are still held out of the pool — but they can no longer prove anything.
+ *
+ * `seam` is for the harness's own tests (`CleanupSeam`).
  */
 async function settleRaced(
   operations: Raced<unknown>[],
   bounds: RaceBounds,
-  beforeSignal?: (pending: PendingSignal) => Promise<void>,
+  seam: CleanupSeam = {},
 ): Promise<Omit<CleanupReport, "barrierGone">> {
+  const clock = seam.clock ?? REAL_CLOCK;
   const seen = () => [...new Set(operations.flatMap((operation) => [...operation.seen]))];
   const signalled = new Set<number>();
+  // A signal was asked for and not acknowledged in time. STICKY: nothing below unsets it, and with
+  // it set no outcome is reported but `unproven`.
+  let unacknowledged = false;
   const quiet = async (): Promise<boolean> =>
-    (await withinBound(Promise.allSettled(operations.map((operation) => operation.result)), bounds.cleanupMs))
+    (await withinBound(Promise.allSettled(operations.map((operation) => operation.result)), bounds.cleanupMs, clock))
     && operations.every((operation) => operation.unidentified === 0 && operation.undisposed === 0 && operation.leases.size === 0)
     && (await sessionsIdle(seen(), bounds));
   const signal = async (kind: PendingSignal["signal"]): Promise<void> => {
@@ -986,18 +1320,30 @@ async function settleRaced(
       }
     };
     try {
-      if (beforeSignal) await beforeSignal({ signal: kind, backends: [...pids] });
+      if (seam.beforeSignal) await seam.beforeSignal({ signal: kind, backends: [...pids] });
     } catch (error) {
       // Nothing was sent, so nothing can still arrive: the connections may be given up.
       resolve("condemned");
       throw error;
     }
     for (const pid of pids) signalled.add(pid);
-    try {
-      await observe(`select ${kind === "cancel" ? "pg_cancel_backend" : "pg_terminate_backend"}(pid) from unnest($1::int[]) as pid`, [pids]);
-    } catch {
-      // Sent, perhaps, and perhaps still to be executed: these connections are never handed back,
-      // so no outcome below can be anything but `unproven`.
+    const send = (): Promise<unknown> =>
+      observe(`select ${kind === "cancel" ? "pg_cancel_backend" : "pg_terminate_backend"}(pid) from unnest($1::int[]) as pid`, [pids]);
+    const stand = seam.signal;
+    // THE ACKNOWLEDGEMENT, bounded: PostgreSQL's answer that it has executed the signal, before the
+    // deadline on the clock. `fulfilledWithin` settles once — what the answer turns out to be after
+    // that is observed and dropped, and reaches none of the code below.
+    const acknowledged = await fulfilledWithin(
+      clock,
+      attempt(() => (stand ? stand({ signal: kind, backends: [...pids] }, send) : send())),
+      OWNED_CONNECTION_BOUND_MS,
+    );
+    if (!acknowledged) {
+      // Sent, perhaps, and perhaps still to be executed — the answer failed, is still pending, or
+      // came too late to say. These connections are never handed back: destroyed, a PID could pass
+      // to a new backend with that signal still to come. And no outcome can now be anything but
+      // `unproven`, whatever the rounds that follow find.
+      unacknowledged = true;
       resolve("stranded");
       return;
     }
@@ -1008,7 +1354,8 @@ async function settleRaced(
     resolve("condemned");
   };
   const report = (outcome: CleanupOutcome): Omit<CleanupReport, "barrierGone"> => ({
-    outcome,
+    // Read when the report is made: an unacknowledged signal overrides whatever a round concluded.
+    outcome: unacknowledged ? "unproven" : outcome,
     signalled: [...signalled].sort((a, b) => a - b),
     operations: operations.map((operation) => ({
       label: operation.label, backends: [...operation.seen].sort((a, b) => a - b), settled: operation.settled,
@@ -1025,6 +1372,19 @@ async function settleRaced(
     // Evidence could not even be read: nothing is proven.
   }
   return report("unproven");
+}
+
+/**
+ * SEAM for the harness's own tests: the cleanup of raced operations BY ITSELF — what `finish` does
+ * once its barrier is gone — over operations the test starts here and settles by hand. With
+ * operations that never check out a connection it touches no database at all: there is no backend
+ * to see idle and none to signal, so what is left is exactly the rounds and their deadlines.
+ */
+export function settleStarted(
+  runs: { label: string; run: () => Promise<unknown> }[],
+  opts: { bounds?: Partial<RaceBounds>; cleanup?: CleanupSeam } = {},
+): Promise<Omit<CleanupReport, "barrierGone">> {
+  return settleRaced(runs.map(({ label, run }) => race(label, run)), { ...DEFAULT_BOUNDS, ...opts.bounds }, opts.cleanup);
 }
 
 const describeCleanup = (cleanup: CleanupReport, settled: CleanupOutcome): string => {
@@ -1055,10 +1415,12 @@ async function finish<T>(
   failure: { error: unknown } | null,
   results: () => Promise<T>,
   bounds: RaceBounds,
-  beforeSignal?: (pending: PendingSignal) => Promise<void>,
+  cleanup: CleanupSeam = {},
 ): Promise<T> {
+  // A barrier whose closing was not acknowledged, or whose session was not seen gone, is `false`
+  // here for good — and the raced operations are cleaned up all the same.
   const barrierGone = await barrier.vanish(bounds.cleanupMs);
-  const settled = await settleRaced(started, bounds, beforeSignal);
+  const settled = await settleRaced(started, bounds, cleanup);
   const cleanup: CleanupReport = { ...settled, barrierGone, outcome: barrierGone ? settled.outcome : "unproven" };
   const described = describeCleanup(cleanup, settled.outcome);
   barrier.conclude(
@@ -1085,11 +1447,12 @@ async function finish<T>(
  * On EVERY path — a failed or timed-out schedule included — the barrier is released and cleanup of
  * whatever was started is established before anything is reported (see `finish`).
  *
- * `whileQueued`, `beforeSignal` and `bounds` are seams for the harness's own tests: a moment, with
- * both operations proven waiting, at which a test may add sessions of its own (the two waits are
- * then proven again, unchanged); a moment in cleanup, after the leases a cancel or terminate is
- * aimed at have been reserved and before PostgreSQL is asked to execute it (see `settleRaced`); and
- * shorter bounds. The run-safety state is the barrier's (`BarrierOptions.safety`).
+ * `whileQueued`, `beforeSignal`, `cleanup` and `bounds` are seams for the harness's own tests: a
+ * moment, with both operations proven waiting, at which a test may add sessions of its own (the two
+ * waits are then proven again, unchanged); a moment in cleanup, after the leases a cancel or
+ * terminate is aimed at have been reserved and before PostgreSQL is asked to execute it; the clock
+ * cleanup's own steps are bounded on, and a stand-in for a signal's acknowledgement (`CleanupSeam`);
+ * and shorter bounds. The run-safety state is the barrier's (`BarrierOptions.safety`).
  */
 export async function parkThenCompete<A, B>(opts: {
   seed: { teamId: string };
@@ -1099,6 +1462,7 @@ export async function parkThenCompete<A, B>(opts: {
   second: () => Promise<B>;
   whileQueued?: (waiting: { parked: number; competing: number }) => Promise<void>;
   beforeSignal?: (pending: PendingSignal) => Promise<void>;
+  cleanup?: Pick<CleanupSeam, "clock" | "signal">;
   bounds?: Partial<RaceBounds>;
 }): Promise<{ first: A; second: B }> {
   const bounds = { ...DEFAULT_BOUNDS, ...opts.bounds };
@@ -1129,7 +1493,7 @@ export async function parkThenCompete<A, B>(opts: {
     opts.barrier, started, failure,
     async () => ({ first: await first!.result, second: await second!.result }),
     bounds,
-    opts.beforeSignal,
+    { ...opts.cleanup, beforeSignal: opts.beforeSignal },
   );
 }
 
@@ -1164,6 +1528,7 @@ export async function parkWhile<A, B>(opts: {
     const run = opts.during;
     during = race("the operation run while it is parked", () => run(parked));
     started.push(during);
+    // Finished BEFORE the bound, by the clock — not merely ahead of the timer for it.
     if (!(await withinBound(during.result, bounds.pollMs))) {
       throw new RaceHarnessError(`the operation run while the other is parked did not finish within ${bounds.pollMs} ms — it is waiting, and it must not`);
     }
