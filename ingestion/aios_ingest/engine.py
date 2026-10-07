@@ -90,20 +90,32 @@ async def _push_all(
     async def worker() -> None:
         while True:
             doc = await queue.get()
-            try:
-                if doc is None:
-                    return
-                await push_one(doc)
-            finally:
-                queue.task_done()
+            if doc is None:
+                return
+            await push_one(doc)
+
+    async def produce() -> None:
+        for doc in docs:
+            await queue.put(doc)
+        for _ in workers:
+            await queue.put(None)
 
     workers = [asyncio.create_task(worker()) for _ in range(max(1, max_concurrency))]
-    for doc in docs:
-        await queue.put(doc)
-    for _ in workers:
-        await queue.put(None)
-    await queue.join()
-    await asyncio.gather(*workers)
+    tasks = [asyncio.create_task(produce()), *workers]
+    try:
+        # A worker that dies on anything but BrainError (a normalize ValidationError, an uncaught
+        # transport exception) stops consuming.  With a bounded queue the producer would then block
+        # on put() and the remaining sentinels would never be delivered, so the first failure ends
+        # the whole batch instead of waiting for a drain that cannot happen.
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    finally:
+        # Also reached on outer cancellation: no producer or worker may outlive this call.
+        for task in tasks:
+            task.cancel()
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
+            raise outcome
 
     return IngestSummary(
         connection=name,

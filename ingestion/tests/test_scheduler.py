@@ -1,8 +1,11 @@
 from aios_ingest.config import BrainSettings, Connection
-from aios_ingest.scheduler import build_scheduler, due_for_renewal, _renewal_job, _gdrive_outcome_status
+from aios_ingest.scheduler import (
+    build_scheduler, due_for_renewal, _renewal_job, _gdrive_outcome_status,
+    _manual_gdrive_job, _remote_gdrive_poll_job,
+)
 from aios_ingest.engine import IngestSummary
 from aios_ingest.state import Channel, StateStore, StreamKey
-from aios_ingest.brain_client import GdriveExecution
+from aios_ingest.brain_client import BrainError, GdriveExecution, GdriveRunRequest
 import pytest
 
 SETTINGS = BrainSettings(base_url="http://brain", api_key="aios_a_b", team="demo")
@@ -52,6 +55,132 @@ def test_build_scheduler_adds_renewal_when_watch_manager_present(tmp_path):
     sched = build_scheduler(SETTINGS, conns, state=state, watch_manager=FakeWatch())
     ids = {j.id for j in sched.get_jobs()}
     assert ids == {"poll:gd", "gdrive-manual-queue", "renewal-sweep"}
+    state.close()
+
+
+def test_build_scheduler_bootstraps_remote_gdrive_without_a_local_connection(tmp_path):
+    state = StateStore(str(tmp_path / "s.sqlite"))
+    assert build_scheduler(SETTINGS, [], state=state).get_jobs() == []
+    sched = build_scheduler(SETTINGS, [], state=state, bootstrap_remote_gdrive=True)
+    assert {j.id for j in sched.get_jobs()} == {"gdrive-manual-queue", "gdrive-remote-poll"}
+    state.close()
+
+
+def _oauth_row(integration_id, name, **overrides):
+    return {
+        "id": integration_id, "type": "gdrive", "name": name, "status": "enabled",
+        "config": {"authMode": "oauth", "fileIds": ["Doc"], "selectionState": "selected",
+                   "authenticatedAccountId": "subject:google-123"},
+        **overrides,
+    }
+
+
+async def test_remote_poll_runs_only_unconfigured_enabled_oauth_selections(tmp_path, monkeypatch):
+    state = StateStore(str(tmp_path / "remote-poll.sqlite"))
+    admin_id = "00000000-0000-0000-0000-00000000000a"
+    later_id = "00000000-0000-0000-0000-00000000000b"
+    local = Connection("local-docs", "gdrive", options={"service_account_key_path": "local.json"})
+    ran, reported = [], []
+
+    class Client:
+        def __init__(self, *args, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def fetch_integration_selections(self, **kwargs):
+            assert kwargs == {"include_disabled": True}
+            return [
+                _oauth_row(admin_id, "admin-docs"),
+                _oauth_row("00000000-0000-0000-0000-00000000000c", "paused", status="disabled"),
+                _oauth_row("00000000-0000-0000-0000-00000000000d", "sa-docs",
+                           config={"authMode": "service_account"}),
+                _oauth_row("00000000-0000-0000-0000-00000000000e", "local-docs"),
+                _oauth_row("00000000-0000-0000-0000-00000000000f", "admin-docs", type="slack"),
+                _oauth_row(later_id, "later-docs"),
+            ]
+        async def report_scheduled_gdrive_run(self, report_id, integration_id, started, summary, **kwargs):
+            reported.append((integration_id, kwargs["status"]))
+
+    async def run(_settings, conn, _state):
+        ran.append(conn)
+        if conn.name == "admin-docs":
+            raise RuntimeError("first integration failed")
+        return IngestSummary(conn.name, backlog=0, authoritative_complete=True,
+                             integration_id=conn.options["integration_id"])
+
+    monkeypatch.setattr("aios_ingest.brain_client.BrainClient", Client)
+    monkeypatch.setattr("aios_ingest.scheduler.run_gdrive_stream", run)
+    await _remote_gdrive_poll_job(SETTINGS, [local], state)
+
+    # Paused, service-account and non-Drive rows never bootstrap; the locally configured name stays
+    # with its own poll job; one integration's failure does not starve the next.
+    assert [conn.name for conn in ran] == ["admin-docs", "later-docs"]
+    assert [conn.options["integration_id"] for conn in ran] == [admin_id, later_id]
+    for conn in ran:
+        assert conn.options["auth_mode"] == "oauth"
+        assert conn.options["credential_identity"] == "subject:google-123"
+        assert not {"service_account_key_path", "credential_json", "access_token"} & set(conn.options)
+    assert reported == [(later_id, "complete")]
+    state.close()
+
+
+async def test_remote_poll_fails_closed_when_selections_cannot_be_read(tmp_path, monkeypatch):
+    state = StateStore(str(tmp_path / "remote-poll-unreadable.sqlite"))
+    ran = []
+
+    class Client:
+        def __init__(self, *args, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def fetch_integration_selections(self, **kwargs):
+            raise BrainError(503, "unavailable", "selection read failed")
+
+    async def run(_settings, conn, _state):
+        ran.append(conn)
+
+    monkeypatch.setattr("aios_ingest.brain_client.BrainClient", Client)
+    monkeypatch.setattr("aios_ingest.scheduler.run_gdrive_stream", run)
+    with pytest.raises(BrainError):
+        await _remote_gdrive_poll_job(SETTINGS, [], state)
+    assert ran == []
+    state.close()
+
+
+@pytest.mark.parametrize("configured", [False, True])
+async def test_manual_request_runs_oauth_only_connection_without_a_local_stub(
+    tmp_path, monkeypatch, configured,
+):
+    state = StateStore(str(tmp_path / "manual.sqlite"))
+    integration_id = "00000000-0000-0000-0000-00000000000a"
+    request = GdriveRunRequest("request-1", integration_id, "admin-docs", "manual", NOW)
+    local = Connection("admin-docs", "gdrive", options={"service_account_key_path": "local.json"})
+    other = Connection("other-docs", "gdrive", options={"service_account_key_path": "other.json"})
+    ran, completed = [], []
+
+    class Client:
+        def __init__(self, *args, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def claim_gdrive_run_request(self):
+            return request
+        async def complete_gdrive_run_request(self, claimed, summary, **kwargs):
+            completed.append((claimed, summary.connection, kwargs["status"], kwargs["error"]))
+
+    async def run(_settings, conn, _state):
+        ran.append(conn)
+        return IngestSummary(conn.name, backlog=0, authoritative_complete=True)
+
+    monkeypatch.setattr("aios_ingest.brain_client.BrainClient", Client)
+    monkeypatch.setattr("aios_ingest.scheduler.run_gdrive_stream", run)
+    await _manual_gdrive_job(SETTINGS, [other, local] if configured else [other], state)
+
+    assert completed == [(request, "admin-docs", "complete", None)]
+    if configured:
+        # A same-named local connection keeps the request; it is never replaced by a broker stub.
+        assert ran == [local]
+    else:
+        assert [(conn.name, conn.source, conn.options) for conn in ran] == [
+            ("admin-docs", "gdrive", {"integration_id": integration_id, "auth_mode": "oauth"}),
+        ]
     state.close()
 
 
