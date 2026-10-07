@@ -181,8 +181,10 @@ async function auditOrder(seed: Seed): Promise<[string, string][]> {
 }
 
 beforeEach(() => {
-  // A race whose cleanup could not be proven may have left sessions holding locks. Nothing else in
-  // this file may run as if it had been cleaned up.
+  // A race whose cleanup could not be proven may have left sessions holding locks. What keeps the
+  // NEXT test from truncating around them is the tier's global `beforeEach` (`setup.ts`), which
+  // reads the same run-fatal latch first and runs before this hook. This check is only the second
+  // line: it cannot stop a truncation, and merely repeats the refusal for this file's own body.
   const fatal = raceHarnessFatal();
   if (fatal) throw new Error(fatal);
   admin.teamId = "";
