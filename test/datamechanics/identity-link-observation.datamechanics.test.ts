@@ -46,10 +46,12 @@ import {
  *      the requested id's write. An offer releases the boundary; a confirmation enters a fresh one
  *      and is held to the revision the admin was shown;
  *   6. an UNLINK is bound to the displayed HOLDER as well as the displayed revision. The listing a
- *      row is built from reads holder and revision as one observation, inside the same boundary;
- *      the unlink action requires both, observes the id there, and removes it only if it is still
- *      that member's link at that revision. The revision alone — which may be another member's by
- *      now — never unlinks, and a call without a readable observation is refused.
+ *      row is built from reads holder and revision by ONE statement — one snapshot, no lock, so it
+ *      waits for no writer and may be stale the moment it returns; the unlink action requires both,
+ *      observes the id inside the boundary, and removes it only if it is still that member's link
+ *      at that revision. The revision alone — which may be another member's by now — never
+ *      unlinks, and a call without a readable observation, or with arguments that are not strings,
+ *      is refused.
  *
  * The races in (5) and (6) are driven deterministically (`./identity-race-harness`): one side is
  * parked on a PostgreSQL lock held by a connection of the harness's own, and the other is shown —

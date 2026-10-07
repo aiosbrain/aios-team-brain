@@ -57,7 +57,7 @@ export class RunSafetyError extends Error {
   }
 }
 
-const describe = (error: unknown) => (error instanceof Error ? error.message : String(error));
+const explain = (error: unknown) => (error instanceof Error ? error.message : String(error));
 const isMissing = (error: unknown) => (error as { code?: unknown } | null)?.code === "ENOENT";
 
 /** The directory of one run against one database. Pure: the same inputs give the same directory. */
@@ -104,7 +104,7 @@ export function createRunSafety(directory: string): RunSafety {
       text = readFileSync(join(directory, FATAL_FILE), "utf8");
     } catch (error) {
       if (isMissing(error)) return null;
-      return `the run's fatal state could not be read (${describe(error)})`;
+      return `the run's fatal state could not be read (${explain(error)})`;
     }
     try {
       const stored = JSON.parse(text) as { reason?: unknown };
@@ -139,7 +139,7 @@ export function createRunSafety(directory: string): RunSafety {
         if (!statSync(directory).isDirectory()) return `the run-safety state at ${directory} is not a directory`;
         inFlight = armed();
       } catch (error) {
-        return `the run-safety state at ${directory} could not be read (${describe(error)})`;
+        return `the run-safety state at ${directory} could not be read (${explain(error)})`;
       }
       if (inFlight.length > 0) {
         return `${inFlight.length} harness scope(s) still in flight — their database sessions were never proven gone: ${inFlight.join(", ")}`;
@@ -163,7 +163,7 @@ export function createRunSafety(directory: string): RunSafety {
       try {
         writeFileSync(scopeFile(scope), JSON.stringify({ scope, detail, at: new Date().toISOString() }), { flag: "wx" });
       } catch (error) {
-        throw new RunSafetyError(`in-flight marker for scope ${scope} could not be recorded — no database work may start (${describe(error)})`);
+        throw new RunSafetyError(`in-flight marker for scope ${scope} could not be recorded — no database work may start (${explain(error)})`);
       }
     },
     disarm(scope: string): void {
