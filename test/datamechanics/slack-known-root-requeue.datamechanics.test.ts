@@ -27,6 +27,7 @@ import {
   checkpointSlackThread,
   claimSlackThread,
   enqueueSlackThread,
+  releaseSlackThreadForRetry,
   writeSlackThreadSnapshot,
   type SlackThreadClaim,
 } from "@/lib/ingest/slack-thread-state";
@@ -2964,5 +2965,304 @@ describe("KR-05 — a witnessed root stays schedulable whatever its attribution 
 
     // The live tombstone, from the same entry.
     await staysSchedulable(ctx);
+  });
+});
+
+/**
+ * KR-06 — the deterministic conflict-do-nothing branch, and the falsifier of M4
+ * (`docs/design/slack-known-root-requeue-spec.md` §5.2, §5.5, §7.2, §11 KR-06 and "Deterministic
+ * conflict-do-nothing race", §12 M4).
+ *
+ * EVIDENCE, NOT RED: expected to pass on the current source. It is ONE branch of KR-06 — a pending
+ * row that appears AFTER preparation's plain queue read and BEFORE its enqueue. The rows that exist
+ * before the read (queued, backed off, running, expired, with a partial or a complete snapshot) take
+ * the early `already_pending` return and are not this case; they are not claimed here.
+ *
+ * TWO CONNECTIONS, AND ONE BARRIER THAT IS NOT A SLEEP.
+ *
+ *   A  the preparation, on its own transaction. It runs on a TEST-ONLY wrapper of that transaction's
+ *      `executeSql`. The wrapper forwards every statement unchanged. When the REAL plain queue read
+ *      has come back from the database it looks at what came back, tells the test, and then withholds
+ *      only the resolution of that one call from the preparer until the test releases it. Nothing in
+ *      the product knows the wrapper is there.
+ *   C  an independent queue writer, on another connection and its own transaction, using the existing
+ *      thread-state helpers and nothing else: enqueue, claim, release, claim, checkpoint, release.
+ *      It commits a row no fresh insert could be mistaken for. Discovery is not used: it would need
+ *      the integration lock A is holding.
+ *
+ * While A is held, the test reads from a third connection what the specification says must be true:
+ * A's read returned no row; A has no statement in flight and is idle in its transaction, waiting on
+ * no lock; A holds the four authority locks; and A has neither requested nor taken the item lock.
+ *
+ * THE CONTROLLED CLOCK (§7.2). A's execution context is given a test clock: the real monotonic clock
+ * minus the time the barrier held A. It stops when the barrier is reached and resumes, from the same
+ * reading, when A is released, so the artificial pause — and only that — is outside A's operation
+ * budget. This case proves nothing about timeouts or speed.
+ *
+ * M4. With the enqueue's `on conflict … do nothing` replaced by a resetting update, the same
+ * interleaving rewrites C's row and reports an insertion. The one labeled assertion below then
+ * fails: the outcome is `enqueued`, the insert returns a row, and the stored row is no longer the
+ * one C committed. An `already_pending` from the early read could not show this, which is why the
+ * case first proves that A's read saw nothing.
+ */
+describe("KR-06 — a queue row committed between the plain queue read and the enqueue is left exactly as committed (real Postgres)", () => {
+  const QUEUE_READ = "preparation: plain queue read";
+  const ITEM_LOCK = "preparation: item lock";
+  const ENQUEUE_INSERT = "preparation: enqueue insert";
+  const CONFLICT_READBACK = "preparation: enqueue conflict readback";
+  const PAGE_CURSOR = "kr06-backed-off-page-2";
+  const M4_LABEL = "M4: the row another connection committed after the plain queue read is preserved field for field, and the conflicting enqueue inserts nothing";
+
+  /** One data statement A was asked for, by name, and how many rows the database returned for it. */
+  interface Issued { name: string; rows: number }
+  /** What the wrapper saw at the moment it held A. */
+  interface AtBarrier { queueReadRows: number; requested: string[]; inFlight: number }
+
+  /** The KR-17 names, and one more: the read the enqueue helper makes only when its insert conflicted. */
+  function nameOf(text: string): { name: string; kind: "settings" | "data" } {
+    const known = kr17Named(text);
+    if (known.kind !== "data" || !known.name.startsWith(KR17_UNNAMED)) return known;
+    const flat = text.replace(/\s+/g, " ").trim();
+    const conflictReadback = flat.startsWith("select team_id,") &&
+      flat.endsWith("from slack_sync_threads where team_id = $1 and workspace_id = $2 and channel_id = $3 and root_ts = $4");
+    return conflictReadback ? { name: CONFLICT_READBACK, kind: "data" } : known;
+  }
+
+  /** Every row of the team in the tables preparation could plausibly disturb, exactly as the database renders it. */
+  const SNAPSHOT_TABLES = [
+    "items", "slack_messages", "slack_sync_threads", "slack_thread_snapshots", "slack_sync_channels",
+    "slack_integration_bindings", "slack_channel_migration_gates", "integrations", "projects",
+    "slack_team_state", "slack_method_budgets", "slack_workspace_observations", "member_identities",
+  ];
+  const SNAPSHOT_REQUIRED = [
+    "items", "slack_messages", "slack_sync_threads", "slack_sync_channels", "slack_integration_bindings",
+    "slack_channel_migration_gates", "integrations", "projects",
+  ];
+  async function snapshot(teamId: string): Promise<Record<string, string>> {
+    const scoped = (await query(
+      `select table_name from information_schema.columns
+        where table_schema = 'public' and column_name = 'team_id' and table_name = any($1::text[])
+        order by table_name`, [SNAPSHOT_TABLES]
+    )).map((row) => row.table_name as string);
+    for (const required of SNAPSHOT_REQUIRED) expect(scoped, `fixture: ${required} is snapshotted`).toContain(required);
+    const out: Record<string, string> = {};
+    for (const table of scoped) {
+      const [aggregate] = await query(
+        `select coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text), '[]'::jsonb)::text as rows from "${table}" t where t.team_id = $1`, [teamId]
+      );
+      out[table] = aggregate.rows as string;
+    }
+    const [versions] = await query(
+      `select coalesce(jsonb_agg(to_jsonb(v) order by to_jsonb(v)::text), '[]'::jsonb)::text as rows
+         from item_versions v join items i on i.id = v.item_id where i.team_id = $1`, [teamId]
+    );
+    out.item_versions = versions.rows as string;
+    return out;
+  }
+
+  /** EVERY column of every queue row of the team, as the database renders the row: ids, counters, state and all timestamps. */
+  const queueRowsExactly = async (teamId: string): Promise<string[]> =>
+    (await query(`select to_jsonb(t)::text as stored from slack_sync_threads t where t.team_id = $1 order by t.root_ts`, [teamId]))
+      .map((row) => row.stored as string);
+
+  it("returns already_pending through the enqueue's own conflict clause, and changes no field of the backed-off row another connection committed after the plain queue read (KR-06 conflict branch, M4)", async () => {
+    const f = await publishOldRoot();
+    const teamId = f.seed.teamId;
+    // Aged, so that nothing but the conflicting row stands between A and an insertion: A is due.
+    await ageObservation(teamId);
+    const scope = { teamId, workspaceId: WORKSPACE, channelId: CHANNEL, rootTs: OLD_ROOT };
+    const page = await enumerate(teamId);
+    const entry = page.entries.find((candidate) => candidate.itemId === f.itemId && "locator" in candidate);
+    if (!entry) throw new Error("fixture: enumeration did not locate the published root");
+    expect((await stored(teamId)).allQueue, "fixture: the root has no pending work").toEqual([]);
+
+    /**
+     * Which of the rows preparation locks are free RIGHT NOW, asked from a third connection that
+     * waits for nothing: a locked row is skipped, and a free one is locked and released at once.
+     */
+    const free = async (text: string, params: unknown[]): Promise<"free" | "LOCKED"> =>
+      (await query(`${text} for update skip locked`, params)).length === 1 ? "free" : "LOCKED";
+    const locks = async () => ({
+      namespaceGate: await free(`select 1 as free from slack_channel_migration_gates where team_id = $1 and raw_channel_id = $2`, [teamId, CHANNEL]),
+      integration: await free(`select 1 as free from integrations where team_id = $1 and id = $2`, [teamId, f.integrationId]),
+      binding: await free(`select 1 as free from slack_integration_bindings where team_id = $1 and integration_id = $2`, [teamId, f.integrationId]),
+      channel: await free(`select 1 as free from slack_sync_channels where team_id = $1 and workspace_id = $2 and channel_id = $3`, [teamId, WORKSPACE, CHANNEL]),
+      item: await free(`select 1 as free from items where team_id = $1 and id = $2`, [teamId, f.itemId]),
+    });
+    const ALL_FREE = { namespaceGate: "free", integration: "free", binding: "free", channel: "free", item: "free" };
+    expect(await locks(), "fixture: all five rows exist and none is locked before A starts (the probe's own control)").toEqual(ALL_FREE);
+    const atStart = await snapshot(teamId);
+
+    // ── THE BARRIER: two observable promises. Nothing here waits for time to pass. ──
+    let signalReached!: (seen: AtBarrier) => void;
+    const reached = new Promise<AtBarrier>((resolve) => { signalReached = resolve; });
+    let releaseA!: () => void;
+    const released = new Promise<void>((resolve) => { releaseA = resolve; });
+
+    // ── THE CONTROLLED CLOCK of §7.2: the real monotonic clock, less the time the barrier holds A. ──
+    let excludedMs = 0;
+    let heldSince: number | null = null;
+    const monotonicNow = (): number => (heldSince ?? performance.now()) - excludedMs;
+    const clockIsStopped = (): boolean => heldSince !== null;
+    // Created before A's transaction, as every execution context is.
+    const execution = createSlackKnownRootExecution({ ambientDeadlineAt: null, monotonicNow });
+
+    // ── A's TEST-ONLY executor wrapper. Every statement is forwarded unchanged. ──
+    const issued: Issued[] = [];
+    const requested: string[] = [];
+    let inFlight = 0;
+    let held = false;
+    const barrierSession = (session: TransactionSession): TransactionSession => {
+      const executeSql: SqlExecutor = async <T = Record<string, unknown>>(text: string, params?: unknown[]) => {
+        const { name, kind } = nameOf(text);
+        if (kind === "data") requested.push(name);
+        inFlight += 1;
+        const result = await session.executeSql<T>(text, params).finally(() => { inFlight -= 1; });
+        if (kind === "data") issued.push({ name, rows: result.rows.length });
+        if (name === QUEUE_READ && !held) {
+          // The ACTUAL plain queue read has returned. What it returned is reported as it is.
+          held = true;
+          const heldAt = performance.now();
+          heldSince = heldAt; // the controlled clock stops
+          signalReached({ queueReadRows: result.rows.length, requested: [...requested], inFlight });
+          await released; // ONLY the resolution to the preparer is withheld
+          excludedMs += performance.now() - heldAt;
+          heldSince = null; // ordinary progression again, from the reading it stopped at
+        }
+        return result;
+      };
+      return {
+        get db() {
+          return session.db;
+        },
+        executeSql,
+        optionalAudit<T>(operation: () => Promise<T>, fallback: T): Promise<T> {
+          return session.optionalAudit(operation, fallback);
+        },
+      };
+    };
+
+    // ── CONNECTION A: the preparation, from the team and the enumerated entry alone. ──
+    let pidOfA = 0;
+    const preparation = tx(async (a) => {
+      pidOfA = Number((await a.executeSql<{ pid: number }>(`select pg_backend_pid() as pid`)).rows[0].pid);
+      return prepareSlackKnownRootRequeue(barrierSession(a), { teamId, entry }, execution);
+    });
+    type Settled = { state: "resolved"; value: SlackKnownRootPreparationResult } | { state: "rejected"; error: unknown };
+    const settled: Promise<Settled> = preparation.then(
+      (value) => ({ state: "resolved" as const, value }),
+      (error: unknown) => ({ state: "rejected" as const, error })
+    );
+    const seen = await Promise.race([
+      reached,
+      settled.then((ended): AtBarrier => {
+        if (ended.state === "rejected") throw ended.error;
+        throw new Error("fixture: the preparation ended before its plain queue read was held");
+      }),
+    ]);
+
+    let committedRows: string[] = [];
+    let afterC: Record<string, string> = {};
+    let pidOfC = 0;
+    try {
+      const stoppedAt = monotonicNow();
+
+      // ── A IS HELD. What the wrapper saw: the real read returned NO row; nothing is in flight; the
+      //    four authority locks and the queue read were asked for, in order, and nothing after them. ──
+      expect(seen, "barrier: A's actual plain queue read returned no row, with nothing in flight and the item lock not yet requested").toEqual({
+        queueReadRows: 0, inFlight: 0, requested: KR17_PREPARATION.slice(0, KR17_PREPARATION.indexOf(QUEUE_READ) + 1),
+      });
+      expect([seen.requested.includes(QUEUE_READ), seen.requested.includes(ITEM_LOCK)], "barrier: the queue read was requested and the item lock was not").toEqual([true, false]);
+      // What the DATABASE says about A, from another connection: idle in its transaction, waiting on no lock.
+      expect(await query(
+        `select a.state, a.wait_event_type is not distinct from 'Lock' as waiting_for_a_lock,
+                (select count(*)::int from pg_locks l where l.pid = a.pid and not l.granted) as ungranted_locks
+           from pg_stat_activity a where a.pid = $1`, [pidOfA]
+      ), "barrier: A has no statement in flight and no lock wait is running").toEqual([
+        { state: "idle in transaction", waiting_for_a_lock: false, ungranted_locks: 0 },
+      ]);
+      // A holds the four authority locks, and has NOT taken the item lock.
+      expect(await locks(), "barrier: A holds its authority locks and not the item lock").toEqual({
+        namespaceGate: "LOCKED", integration: "LOCKED", binding: "LOCKED", channel: "LOCKED", item: "free",
+      });
+      expect((await stored(teamId)).allQueue, "barrier: no queue row is committed, as A's read said").toEqual([]);
+
+      // ── CONNECTION C: an independent writer, the existing helpers only, ONE committed transaction. ──
+      const written = await tx(async (c) => {
+        pidOfC = Number((await c.executeSql<{ pid: number }>(`select pg_backend_pid() as pid`)).rows[0].pid);
+        const enqueued = await enqueueSlackThread(c, scope);
+        const first = await claimSlackThread(c, scope, { leaseMs: 60_000 });
+        if (!first) throw new Error("fixture: C's first claim was refused");
+        const retried = await releaseSlackThreadForRetry(c, first, { nextDueAt: new Date(Date.now() - 60_000), errorCode: "slack_timeout" });
+        const second = await claimSlackThread(c, scope, { leaseMs: 60_000 });
+        if (!second) throw new Error("fixture: C's second claim was refused");
+        const progressed = await checkpointSlackThread(c, second, { pageCursor: PAGE_CURSOR, snapshotGeneration: 3 });
+        const backedOff = await releaseSlackThreadForRetry(c, second, { nextDueAt: new Date(Date.now() + 3_600_000), errorCode: "rate_limited" });
+        return { inserted: enqueued.inserted, retried: retried.outcome, progressed: progressed.outcome, backedOff: backedOff.outcome };
+      });
+      // C's own enqueue INSERTED: there was no row for it to conflict with either.
+      expect(written, "fixture: C inserted the row, then claimed, released, claimed, checkpointed and released it").toEqual({
+        inserted: true, retried: "released", progressed: "checkpointed", backedOff: "released",
+      });
+      expect([pidOfA > 0, pidOfC > 0, pidOfC !== pidOfA], "fixture: C ran on another connection than A").toEqual([true, true, true]);
+
+      // ── THE COMMITTED ROW, read back and RETAINED: every column, as the database renders it. ──
+      committedRows = await queueRowsExactly(teamId);
+      expect(committedRows, "fixture: C committed exactly one queue row").toHaveLength(1);
+      expect(await query(
+        `select status, attempts, lease_generation::text as lease_generation, lease_owner, lease_expires_at, page_cursor,
+                snapshot_generation::text as snapshot_generation, last_error_code, checkpointed_at is not null as checkpointed,
+                due_at > clock_timestamp() + interval '30 minutes' as backed_off, updated_at > created_at as updated_after_creation
+           from slack_sync_threads where team_id = $1 and workspace_id = $2 and channel_id = $3 and root_ts = $4`, [teamId, WORKSPACE, CHANNEL, OLD_ROOT]
+      ), "fixture: the committed row is recognizably NOT a fresh insert: backed off, twice attempted, fenced, checkpointed, with an error code").toEqual([{
+        status: "queued", attempts: 2, lease_generation: "2", lease_owner: null, lease_expires_at: null, page_cursor: PAGE_CURSOR,
+        snapshot_generation: "3", last_error_code: "rate_limited", checkpointed: true, backed_off: true, updated_after_creation: true,
+      }]);
+      afterC = await snapshot(teamId);
+      for (const table of Object.keys(atStart)) {
+        if (table !== "slack_sync_threads") expect(afterC[table], `fixture: C changed nothing of the team but the queue (${table})`).toBe(atStart[table]);
+      }
+      expect(afterC.slack_sync_threads, "fixture: the snapshot sees C's row").not.toBe(atStart.slack_sync_threads);
+
+      // A is STILL held exactly where it was, and its clock has not moved while C worked.
+      expect(await locks(), "barrier: A still holds its authority locks and still not the item lock").toEqual({
+        namespaceGate: "LOCKED", integration: "LOCKED", binding: "LOCKED", channel: "LOCKED", item: "free",
+      });
+      expect([held, clockIsStopped(), monotonicNow() === stoppedAt, issued.map((statement) => statement.name).includes(ITEM_LOCK)],
+        "barrier: A is held, its controlled clock is stopped, and it has issued nothing since").toEqual([true, true, true, false]);
+    } finally {
+      // RELEASE A — also when something above failed, so that A never outlives the case.
+      releaseA();
+      await settled;
+    }
+    const ended = await settled;
+    if (ended.state === "rejected") throw ended.error;
+
+    // ── M4's FALSIFIER, FIRST. A reached the existing enqueue's conflict clause: its insert returned
+    //    no row, its outcome is `already_pending`, and the stored row is, column for column, the row
+    //    C committed. A resetting update fails this one assertion. ──
+    const rowsOf = (name: string): number[] => issued.filter((statement) => statement.name === name).map((statement) => statement.rows);
+    expect({ outcome: ended.value, rowsReturnedByTheEnqueueInsert: rowsOf(ENQUEUE_INSERT), queueRows: await queueRowsExactly(teamId) }, M4_LABEL).toEqual({
+      outcome: { outcome: "already_pending" }, rowsReturnedByTheEnqueueInsert: [0], queueRows: committedRows,
+    });
+
+    // ── THE BRANCH, in A's own statements. After its release A locked the item, read the project,
+    //    proved the witness, checked both contradictions and both paths, decided it was due, issued
+    //    the enqueue insert, and — because that insert conflicted — read the existing row back. ──
+    expect(issued.map((statement) => statement.name), "branch: the complete preparation, then the conflict readback").toEqual([...KR17_PREPARATION, CONFLICT_READBACK]);
+    expect({ queueRead: rowsOf(QUEUE_READ), itemLock: rowsOf(ITEM_LOCK), conflictReadback: rowsOf(CONFLICT_READBACK) },
+      "branch: the queue read saw no row, the item lock found the item, and the conflict readback found C's row").toEqual({
+      queueRead: [0], itemLock: [1], conflictReadback: [1],
+    });
+
+    // ── NOTHING ELSE MOVED, AND THERE IS NO SECOND ROW. A's whole transaction changed no row of the
+    //    team in any snapshotted table, the queue included. ──
+    expect(await snapshot(teamId), "A's committed transaction changed nothing: every table reads as it did after C committed").toEqual(afterC);
+    expect(await query(`select team_id::text as team_id, root_ts from slack_sync_threads`), "the only queue row in the database is the one C committed").toEqual([
+      { team_id: teamId, root_ts: OLD_ROOT },
+    ]);
+    expect(await locks(), "A committed and released every lock").toEqual(ALL_FREE);
+    // The controlled clock is running again, from where it stopped; the pause it excluded was real.
+    expect([clockIsStopped(), excludedMs > 0], "the controlled clock resumed on release").toEqual([false, true]);
   });
 });
