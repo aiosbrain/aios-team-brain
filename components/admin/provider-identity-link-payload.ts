@@ -6,6 +6,9 @@
  * mapping revision); the admin REQUESTS one (whatever is typed). The displayed pair travels only as
  * `observed.original`. A revision for the requested id travels only as `observed.remap`, and only
  * when the admin has confirmed an offer the action made for that exact id.
+ *
+ * An UNLINK names the displayed id only, and says whose link it is: the row's member travels with
+ * the displayed revision, never the revision alone.
  */
 
 export type IdentityProvider = "slack" | "linear" | "plane" | "gdrive";
@@ -34,6 +37,25 @@ export interface IdentityLinkRequest {
     /** The requested id's revision as the admin was shown it — present only on a confirmation. */
     remap?: { revision: number };
   };
+}
+
+export interface IdentityUnlinkRequest {
+  provider: IdentityProvider;
+  /** The DISPLAYED id — the only one a row can unlink. */
+  externalId: string;
+  /** Who the row displayed as holding it, and at what revision. Always both. */
+  observed: { memberId: string; revision: number };
+}
+
+/**
+ * What an unlink sends: the displayed id, bound to the member the row belongs to and to the
+ * revision it displayed. The revision alone names no holder — the action refuses an unlink that
+ * does not say whose link the admin was looking at. A blank row displays nothing and unlinks
+ * nothing (null).
+ */
+export function identityUnlinkRequest(row: DisplayedIdentityRow, memberId: string): IdentityUnlinkRequest | null {
+  if (!row.externalId) return null;
+  return { provider: row.provider, externalId: row.externalId, observed: { memberId, revision: row.revision } };
 }
 
 /**

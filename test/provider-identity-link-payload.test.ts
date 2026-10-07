@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   identityLinkRequest,
+  identityUnlinkRequest,
   standingRemapOffer,
   type DisplayedIdentityRow,
   type IdentityProvider,
@@ -18,7 +19,9 @@ import {
  *   2. a revision for the REQUESTED id is sent only as `observed.remap`, only on the explicit
  *      "Remap" confirmation, and only for the exact id the action's offer named;
  *   3. an offer is discarded the moment a different id is requested, and typing the old id again
- *      does not bring it back.
+ *      does not bring it back;
+ *   4. an UNLINK sends the displayed id bound to the row's own member AND its displayed revision —
+ *      never the revision alone, never the id typed into the box — and a blank row sends nothing.
  *
  * SCOPE, stated plainly: this repository has no DOM test harness, so nothing here renders the
  * component or clicks a button. These are tests of the pure payload module the component delegates
@@ -137,6 +140,34 @@ describe.each(PROVIDERS)("identity row payload — %s", (provider) => {
   });
 });
 
+describe.each(PROVIDERS)("identity row UNLINK payload — %s", (provider) => {
+  const id = ids(provider);
+  const MEMBER = "member-alice";
+
+  it("binds the displayed id to the row's member and its displayed revision — all three, and nothing else", () => {
+    const request = identityUnlinkRequest(changeRow(provider), MEMBER);
+    expect(request).toEqual({
+      provider,
+      externalId: id.displayed,
+      observed: { memberId: MEMBER, revision: DISPLAYED_REVISION },
+    });
+    // The observation is never the revision alone: it always says whose link was displayed.
+    expect(Object.keys(request!.observed).sort()).toEqual(["memberId", "revision"]);
+  });
+
+  it("follows the row it is given: another member's row, or another revision, is another observation", () => {
+    expect(identityUnlinkRequest(changeRow(provider), "member-bob")?.observed)
+      .toEqual({ memberId: "member-bob", revision: DISPLAYED_REVISION });
+    expect(identityUnlinkRequest({ provider, externalId: id.displayed, revision: TARGET_REVISION }, MEMBER)?.observed)
+      .toEqual({ memberId: MEMBER, revision: TARGET_REVISION });
+  });
+
+  it("a BLANK row displays no identity and so unlinks nothing", () => {
+    expect(identityUnlinkRequest(blankRow(provider), MEMBER)).toBeNull();
+    expect(identityUnlinkRequest({ provider, externalId: "", revision: DISPLAYED_REVISION }, MEMBER)).toBeNull();
+  });
+});
+
 describe("the component delegates its payload to that module", () => {
   const ROOT = join(import.meta.dirname, "..");
   const component = readFileSync(join(ROOT, "components/admin/provider-identity-link.tsx"), "utf8");
@@ -149,6 +180,16 @@ describe("the component delegates its payload to that module", () => {
     expect(component).toContain(
       "linkMemberIdentity(teamSlug, memberId, request.provider, request.externalId, handle ?? undefined, request.observed)"
     );
+  });
+
+  it("the one unlink call sends exactly what `identityUnlinkRequest` built from the row's displayed identity and its own member", () => {
+    expect(component).toContain("const request = identityUnlinkRequest({ provider, externalId, revision }, memberId);");
+    expect(component.match(/\bunlinkMemberIdentity\(/g), "one unlink call site").toHaveLength(1);
+    expect(component).toContain("unlinkMemberIdentity(teamSlug, request.provider, request.externalId, request.observed)");
+    // The box's text is a link request only: an unlink never reads it.
+    const unlink = component.slice(component.indexOf("function unlink() {"), component.indexOf("return (\n    <div"));
+    expect(unlink.length, "the unlink handler must be found").toBeGreaterThan(100);
+    expect(unlink).not.toMatch(/\bvalue\b/);
   });
 
   it("only the Remap button confirms; Save and Enter never do", () => {
