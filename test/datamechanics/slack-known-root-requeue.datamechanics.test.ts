@@ -4461,7 +4461,9 @@ describe("KR-06 existing queue state preservation", () => {
 
 // ── Lifecycle packet: what the two suites below share ────────────────────────────────────────────
 // New, file-local helpers for "KR-07 unchanged republication refresh" and "KR-08 rollback and
-// replay". Nothing above is moved or changed, and no KR-17 hook is involved in either selection.
+// replay". No earlier helper or case is moved. One earlier fixture value was changed in the same
+// packet: the backed-off due instant of "KR-06 existing queue state preservation" was moved to a
+// stable far-future literal. No KR-17 hook is involved in either selection.
 
 /** An instant as the DATABASE renders it: UTC, six fractional digits, as text. The expression is parenthesized as a whole. */
 const lifecycleUtc = (expression: string): string => `to_char((${expression}) at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00'`;
@@ -4923,8 +4925,9 @@ describe("KR-08 rollback and replay", () => {
 });
 
 // ── Lifecycle packet: what the concurrency suite below adds ──────────────────────────────────────
-// New, file-local helpers for "KR-08 concurrent preparers and publication orderings". Nothing above
-// is moved or changed.
+// New, file-local helpers for "KR-08 concurrent preparers and publication orderings". No earlier
+// helper or case is moved or changed by them; the file's import of the test helpers gained one name,
+// `transactionSessionDecoratedDb`, for the publisher-first hold.
 
 /** How a tracked promise ended. It never rejects: a rejection is a value here. */
 type LifecycleEnded<T> = { state: "resolved"; value: T } | { state: "rejected"; error: unknown };
@@ -5001,18 +5004,35 @@ const LIFECYCLE_WAITERS_SQL = `
      and $1::int = any(pg_blocking_pids(a.pid))
    order by a.pid`;
 /**
- * Reads the lock table until a waiter behind `blockerPid` is there. The ONLY thing repeated is this
- * readback: there is no sleep, each round is one query, and it stops when a waiter is seen, when the
- * party that should be waiting has ended, or when the bound has passed. Not seeing a wait is
- * reported, never assumed.
+ * Reads the lock table until a waiter behind `blockerPid` has been seen TWICE IN A ROW, and returns
+ * the facts of the second reading.
+ *
+ * The first sighting is provisional. `pg_blocking_pids` reads the live lock queue, while the state,
+ * wait event and statement of `pg_stat_activity` in that same reading can still describe the
+ * backend's last moment BEFORE it went to sleep on the lock. A reading that first names the waiter
+ * can therefore carry facts of the transition into the wait and not of the wait. So nothing is
+ * returned from it: a second, fresh query is made, and only a reading that again names a waiter is
+ * handed back. If the waiter is gone by then — a waiting preparation's lock timeout has fired — that
+ * is not an observed wait, and the reading goes on until the waiting party has ended or the bound
+ * has passed.
+ *
+ * The ONLY thing repeated is this readback: there is no sleep, and each round is one query. Not
+ * seeing a wait is reported, never assumed.
  */
 async function lifecycleObservedWaiters(blockerPid: number, waiterHasEnded: () => boolean, boundMs: number): Promise<{ waiters: LifecycleWaiter[]; polls: number; notObservedBecause: string | null }> {
   const startedAt = performance.now();
+  let sightedOnThePreviousReading = false;
   for (let polls = 1; ; polls++) {
     const waiters = await query<LifecycleWaiter>(LIFECYCLE_WAITERS_SQL, [blockerPid]);
-    if (waiters.length > 0) return { waiters, polls, notObservedBecause: null };
-    if (waiterHasEnded()) return { waiters, polls, notObservedBecause: "the party that should have waited ended before any wait was observed" };
-    if (performance.now() - startedAt > boundMs) return { waiters, polls, notObservedBecause: `no wait was observed within ${boundMs} ms` };
+    if (waiters.length > 0) {
+      // The second of two consecutive sightings is the observation. The first only says: read again.
+      if (sightedOnThePreviousReading) return { waiters, polls, notObservedBecause: null };
+      sightedOnThePreviousReading = true;
+      continue;
+    }
+    sightedOnThePreviousReading = false;
+    if (waiterHasEnded()) return { waiters, polls, notObservedBecause: "the party that should have waited ended before a wait was seen on two consecutive readings" };
+    if (performance.now() - startedAt > boundMs) return { waiters, polls, notObservedBecause: `no wait was seen on two consecutive readings within ${boundMs} ms` };
   }
 }
 /** The observed waiters as the facts a case asserts: one line per waiter, nothing inferred. */
@@ -5094,6 +5114,8 @@ async function lifecycleRestaged(f: Published, label: string): Promise<{ publish
  * lock; and `pg_locks` shows it waiting for a transaction id that the first party's backend holds.
  * Only after that readback is the first party released. An unresolved JavaScript promise is never
  * taken as the proof, and nothing sleeps: the readback is repeated, one query a round, under a bound.
+ * A first reading that names the waiter is provisional, because its state fields can still describe
+ * the moment before the wait; the facts asserted are those of a second, fresh reading that names it again.
  *
  * A WAITING PREPARATION HAS 250 ms. Preparation caps every lock wait at 250 ms. In the first two
  * cases the waiting party is a preparation, so the wait must be seen and the holder released within
@@ -5105,7 +5127,9 @@ async function lifecycleRestaged(f: Published, label: string): Promise<{ publish
  *   publisher first   a test-only wrapper of the publication's own session, on the real `ingestItem`:
  *                     it forwards every statement unchanged and withholds only the resolution of the
  *                     acknowledging delete of the queue row — so the evidence has been refreshed and
- *                     the row acknowledged, and nothing is committed.
+ *                     the row acknowledged, and nothing is committed. At that point, and only there,
+ *                     it also issues one statement of its own on that session: a read-only
+ *                     `select pg_backend_pid()`, which is how the test learns the publication's backend.
  *   preparer first    A's own transaction callback, after preparation has returned `already_pending`.
  *
  * WHAT CAN AND CANNOT BE ATTRIBUTED. Where a preparation's work is finished while the other party is
@@ -5128,7 +5152,7 @@ describe("KR-08 concurrent preparers and publication orderings", () => {
   /** A waiting publication has no such cap; its wait is looked for a little longer. */
   const PUBLICATION_WAIT_BOUND_MS = 10_000;
   const CASE_TIMEOUT_MS = 30_000;
-  /** The only tables a republication writes, of the snapshotted surfaces: the two it must, and the two it may. */
+  /** The only tables a republication writes, of the snapshotted surfaces: the three it must, and two more it may. */
   const A_REPUBLICATION_MUST_CHANGE = ["slack_messages", "slack_sync_threads", "slack_thread_snapshots"];
   const A_REPUBLICATION_MAY_CHANGE = [...A_REPUBLICATION_MUST_CHANGE, "items", "projects"];
 
@@ -5261,7 +5285,9 @@ describe("KR-08 concurrent preparers and publication orderings", () => {
 
     // ── THE PUBLICATION: the real `ingestItem`, on a client whose transaction session is wrapped by
     //    the test. The wrapper forwards every statement unchanged, and withholds only the resolution
-    //    of the acknowledging delete: evidence refreshed, queue row acknowledged, nothing committed. ──
+    //    of the acknowledging delete: evidence refreshed, queue row acknowledged, nothing committed.
+    //    At that hold point it also runs one read-only statement of its own on the publication's
+    //    session, `select pg_backend_pid()`, to learn which backend the publication is. ──
     const holdPublication = lifecycleHold<{ pid: number; acknowledgedRows: number }>();
     onTestFinished(() => holdPublication.release());
     let heldOnce = false;
