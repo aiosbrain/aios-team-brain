@@ -986,7 +986,7 @@ Unchanged prohibitions. No human or live acceptance has been completed. Not done
 
 ### AC-02 inactive known-root requeue — specification and implementation record
 
-**Current status (updated only here): specification accepted; red-first test foundation written; red-review corrections checkpointed at `3e665c39`; one focused-rereview correction to the boundary guard in the commit that carries this update; production NOT implemented.** The two source modules are stubs. No acceptance criterion of this slice is green, no query plan has been measured, and no final verification, mutation run or final review has been performed. **AC-02 is not complete, and nothing in this section completes it or AIO-1170.**
+**Current status (updated only here, last on October 7, 2026): specification accepted; both production modules implemented and still inactive; exact source head `c5679f8904cf6dd71f5c758314466fed19add7a5`; the focused unit, guard and real-PostgreSQL suites pass on that head; a fresh independent Opus 5.5 high affected-contract review of it returned PASS/READY with no blocker, HIGH or MEDIUM.** The full KR-02 to KR-17 acceptance matrix, the controlled mutation matrix, the §7.5 plan and performance evidence, the fresh Astra-high and blind GPT-6.1 Sol-high final reviews, final CI and PR publication evidence are all still pending. The subsections dated October 6 below record the red-first history as it stood then, when the modules were stubs; they are not rewritten. **AC-02 is not complete, the primitive is not wired or activated, and nothing in this section completes AC-02 or AIO-1170.**
 
 #### Specification — recorded October 6
 
@@ -1058,6 +1058,8 @@ No source stub, production file, unit suite or real-PostgreSQL suite changed in 
 
 #### Pending — not done, and not claimed
 
+*Dated note, October 7, 2026: this list is the state on October 6, before any production implementation. It is kept as written. For what has since been implemented and verified, and for what is pending now, the October 7 subsection that follows it governs.*
+
 Deferred by the red review to the implementation and final-test stage, and **all still pending**:
 
 - KR-02, KR-03, KR-04 to KR-09, KR-10 to KR-13 and KR-15 to KR-17 in full. KR-01 exists only as behavioural red; KR-14 and KR-16 are covered in part by the guards and the unit suite.
@@ -1072,3 +1074,60 @@ Also pending: the production implementation of both modules; the existing thread
 The broad `npm test` was not rerun for this slice and remains **not green** from the earlier exact run recorded above. No claim is made about it here.
 
 Not done and not authorized, unchanged: any driver, runner, scheduler, route, action or manual trigger for this primitive; provider HTTP; publisher wiring; deletion or weakening of either not-wired guard; repair apply; the identity cutover; activation; merge; deployment; any main, production or force push; live acceptance and the soak. The held items of the specification's final section — retained-history seeding, durable sweep rotation, lane fairness, provider reservations, sweep capacity, deletion-safe publication and the runner-to-timeline AC-02 proof — remain held.
+
+#### Production implementation and focused evidence — recorded October 7, 2026
+
+This subsection supersedes, for current status only, the October 6 statements above that the modules are stubs and that production implementation is pending. Those statements were true when written and are left in place.
+
+**Identities.** The accepted specification is unchanged: `docs/design/slack-known-root-requeue-spec.md` at commit `2c040b19f690f8433a844ec4916b9dfa38696ea6`, SHA-256 `08439e57f821022189e666329d80cc25dd1560868898e549ec2f624c15cdf4dd`, verified at Linear comment `fe96a957-bead-4fe6-b1e5-6ac35ca059a9`. The sole writer remained subscription-authenticated Claude Opus 5.5 at high effort, session `b1767100-da84-4808-818f-6b0107480c68`. The writer's permission mode allowed it no test or shell execution; the coordinator owns every commit and ran every check recorded here.
+
+**Production history, in order.** Each step was red-first where it changed behaviour: the tests were written and reviewed against the then-current source before the source changed.
+
+- `b3a23d74264928fc52b714c3ce3c0dab88f7179f` — the pure helpers: execution-context creation with its deadline calculation, the failure classifier and the page tally reducer. The page reader and the preparer were still placeholders.
+- `f003edcbcd19dc982baae33b5d78848dd1d257aa` — a work-in-progress backup of the partial page and session implementation, preserved after a coordinator turn loss interrupted the writer mid-edit. It was reviewed as safe for backup only, not as complete.
+- `f912012133a23d13daa46960767b033a1ed2c142` — the first full source: validation and capture, the slice-local decorated session, enumeration, and preparation. An independent Opus 5.5 high review found no blocker, HIGH or MEDIUM source defect and marked the source ready for evidence collection, with the evidence itself not ready.
+- `267c3a6d24ea572fdc9474d3cd655781cd354ebf` — the accepted red corrections: focused tests and guard extensions written against `f9120121`, then corrected after an independent red review accepted the gate with bounded test-only changes. They exposed four source gaps: a regressing injected clock could yield a statement timeout above the declared allowance; a stored locator field of the wrong type or past its byte bound was reported as `canonical_mismatch`; a root witness observed in the year 0001 or before the common era was enqueued with that instant as its due date; and neither module carried the `server-only` import.
+- `b075dfba26a59d4c07bc86dac0387839c702e451` — the source fixes for those four: admission never returns more than the context's allowance; malformed, missing, wrong-typed or over-bound `workspace_id`, `channel_id`, `ts` and `thread_ts` on the locked item are `unattested/invalid_metadata`, while a well-formed value that differs stays `canonical_mismatch`; the shared witness predicate gained a lower bound at the Unix epoch, so an ancient observation is `unattested/missing_root_witness` and nothing is derived from it; and both modules import `server-only`.
+- `2361892809fb7370707b29faa563f0247f4405fb` — the final reviewed red evidence: three further regressions written after a fresh affected-fix review of `b075dfba` found one MEDIUM and two LOW hardening gaps, and accepted as red by an independent Opus high review that confirmed exactly three production defects.
+- `c5679f8904cf6dd71f5c758314466fed19add7a5` — the final source fix, and the local and remote head when this entry was written.
+
+**What `c5679f89` changed**, in the two production modules only:
+
+- The clock reading a context was created at is kept privately, in the module's `WeakMap` of issued contexts and not on the context object. At every admission a reading earlier than that one is refused with the existing static validation error, before any session statement. A regressed clock can therefore no longer make an ambient deadline that had already passed, or one tighter than the allowance, look as if it were still ahead.
+- A locked item whose stored path is longer than 2,048 bytes — which the item projection returns as null — is `unattested/invalid_metadata`. A path of exactly 2,048 bytes, and any other in-bound path that is not the canonical one, remain `canonical_mismatch`.
+- The witness lower bound is strict, `observed_at >` the Unix epoch. An observation at exactly the epoch now fails the shared witness predicate and is refused exactly as an ancient one is.
+
+**What is implemented, in brief.** `lib/ingest/slack-known-root-page.ts` holds the execution context, the slice-local decorated session (deadline admission before and after awaited work, transaction-local `statement_timeout` and `lock_timeout` refreshed before every data statement, fail-closed `db` and `optionalAudit`, restoration of both original settings on a normal return and none after a throw, an executor that stops working when the operation ends) and the bounded enumeration over a fixed key range. `lib/ingest/slack-known-root-requeue.ts` holds preparation in the specification's lock order — namespace gate, selection, binding row, scoped channel row, plain queue read, item lock, witness, both ledger contradictions over deleted rows, both path conflicts, the database due calculation, and the existing enqueue helper as its only write — together with the pure classifier and reducer. Both modules remain unreachable from every execution entry and imported by nothing outside the packet; the two not-wired guards enforce that.
+
+**Verification on exact `c5679f89`, as run by the coordinator.** All passed:
+
+- focused unit and guards: **219/219**;
+- isolated real PostgreSQL: **9/9**;
+- TypeScript typecheck, targeted ESLint, the diff check, the docs-drift gate and the skill-runtime-sync gate.
+
+These are the focused suites of this packet. They are ordinary coverage on the stated snapshot: not mutation evidence, not plan or performance evidence, and not the acceptance matrix.
+
+**Independent review of the exact candidate.** A fresh independent Opus 5.5 high affected-contract review returned **PASS / READY** with no blocker, HIGH or MEDIUM. It inspected the complete specification, both production modules, the three focused test and guard files, and the direct lock, publication, enqueue, ledger, parser, path and transaction interactions. The reviewer could not read git metadata; the coordinator independently verified the full head id and that the diff from the parent to the candidate is exactly the two production modules.
+
+The review's LOW notes, none of which it or this record calls a source defect:
+
+1. This build record was stale. This edit corrects it.
+2. Optional future hardening: a stored path longer than 2,048 bytes made of multibyte characters, and a clock that moves forward and then backward while staying inside the original allowance. Neither is required by the accepted contract or covered by a test.
+3. A stricter plausibility rule — treating an observation that is later than the epoch but still implausibly old as corrupt — is speculative and remains unrequired. The accepted behaviour is the strict epoch bound and nothing beyond it.
+
+The six accepted LOW clarifications listed above are unchanged, and unknown-commit precedence in the classifier is unchanged.
+
+**Still pending — not done, and not claimed:**
+
+- the full KR-02 to KR-17 acceptance matrix. The focused suites cover KR-01, parts of KR-03, KR-10, KR-12, KR-14 and KR-16, and the specific regressions above; they are not the matrix;
+- the controlled mutation matrix, M1h and M15 included, with baseline, mutant and restored hashes;
+- the §7.5 evidence: the 100,000-item and 601-root single-channel fixture, the `EXPLAIN (ANALYZE, BUFFERS)` inventory, the first five retained observations per case, and the comparison with the 200 ms statement and 750 ms operation stops. Nothing has been measured, and an exceedance remains a stop for schema-owner adjudication;
+- the deterministic executor-barrier conflict race, both publisher orderings and the two-preparer race; the stored-secret rotation, environment-fallback and namespace re-readiness fixtures; retry accounting through the real transaction wrapper with an injected retryable SQLSTATE or a lowered timeout; and timeout restoration on every normal and throwing outcome against a real connection;
+- the existing thread-state, publication, discovery, ledger and source-fence regressions on this snapshot;
+- the fresh Astra-high and the blind GPT-6.1 Sol-high final reviews;
+- final CI on the exact published head, the PR body and attestation, and publication evidence;
+- a fresh PR 743 path refresh and comparison before publication, and PR 743 semantic integration.
+
+**Broad suite.** The broad `npm test` was not rerun for this slice and is **not claimed green**. The inherited exact run recorded earlier in this document remains non-green, with three 5,000ms timeouts in `test/staging-policy-commissioning.test.ts` whose cause and baseline status are unverified. This slice is not claimed to have caused or fixed them.
+
+**Unchanged prohibitions.** Not done and not authorized: any driver, runner, scheduler, route, action or manual trigger for this primitive; provider HTTP; publisher wiring; removal or weakening of either not-wired guard; repair apply; the identity cutover; activation; PR 743 integration; merge; deployment; any main, production or force push; live acceptance; and the soak. The held items of the specification's final section remain held. **AC-02 is incomplete and the primitive is inactive.**
