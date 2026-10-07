@@ -1,0 +1,33 @@
+{
+  "kind": "AIO-1217_F4_E3_SERIAL_PAIRED_PG_LINT_TYPECHECK",
+  "status": "PREPARED_NOT_EXECUTED",
+  "owner": "parent host only; serialized dedicated PostgreSQL campaign",
+  "checkpoint": "2437df69f2146e84a646a46f288c555dd2ad032a",
+  "candidateRuntimeBase": "9cd35756ce9459a4c389803714fc06e34192c108",
+  "referenceOwnerCommit": "ceb184db9991dc9c6bb5ba3cb3b249cf6c480834",
+  "fixture": "test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts",
+  "fixtureSha256": "9297aff3e275bb0d32ce8c799a874c646fa1831e69ce5c8e96917736d73656c1",
+  "helper": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e3-paired-evidence/packet/output/run_paired_e3.sh",
+  "helperSha256": "9ae2658399f570500cee42ab17ef320b30b8449693fa815c4fb8b7dd4692f7f5",
+  "helperTemplate": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e2-paired-helper-sol-repair/packet/output/run_paired_e2.sh",
+  "helperTemplateSha256": "e6afee0a9bb444b5a0029b5dbe2b43c49cb9335d266b64c66eac92ce41fffe1c",
+  "runner": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e2-affected-review-frozen/packet/runner/01-immutable-e4-runner.py",
+  "runnerSha256": "5ec2b76bdb536bef088f8a461155e3abf7f61b59215d46b5aa7a858e7083682d",
+  "referenceOwnerBlobPaths": ["lib/pm-sync/reconcile.ts", "app/t/[team]/admin/pm-sync/actions.ts"],
+  "hostScript": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-paired-parent-campaign.py",
+  "hostScriptPurpose": "mechanical E3-specific instantiation of the already-executed /private/tmp/aio1217-parent-paired-e2.py algorithm; it captures its own SHA in the result",
+  "execution": [
+    "Before execution, verify this request, helper, runner, clean checkpoint, fixture hash, exact two reference blobs, and owned container identity /aios-aio1217-pg-8a4e78cb on only 127.0.0.1:50538.",
+    "Run only python3 hostScript. It creates isolated layouts serially: reference then candidate; both begin from candidate base 9cd357 with exact current fixture; reference substitutes only the two ceb184 owner blobs.",
+    "The helper has exactly five arguments and invokes pg followed directly by the fixture; an extra separator before the fixture is forbidden. It copies and rehashes only immutable runner 5ec2 and accepts only the synthetic relative recorder directory.",
+    "Host script then runs exactly one fixture lint and one current full typecheck through canonical handoff/run_check.py, preserving result/log/provenance for each.",
+    "Do not infer any count or behavior from exit class. Reconcile complete logs, JSONL, durable row/timestamp/provider traces, result/provenance/environment records, and full reference/candidate byte inventories."
+  ],
+  "acceptanceFocus": {
+    "case10": "actual native unknown-team-slug resolver refusal must be nonvacuous: a valid privileged caller, live provider/integration and durable effects are demonstrated by its admitted same-session control; refusal/repeat must show exact no-effect trace and durable comparison.",
+    "bothRuntimes": "case 10 must pass on both exact layouts; retain and evaluate case 9 controls and prior unavailable/refusal qualifications without treating expected reference failure or record counts as proof.",
+    "nonGrants": ["no historical PM admission/census waiver", "no E4 whole acceptance", "no E6/UI credit", "no PR/merge/Done claim"]
+  },
+  "freezeContract": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e3-affected-review-freeze-contract.json",
+  "afterSuccessOnly": "Parent populates the freeze contract's copied evidence and host inventory, hashes all copied regular non-symlink files, and returns without a review or push. Terra alone then writes the prompt and manifest against that immutable freeze."
+}

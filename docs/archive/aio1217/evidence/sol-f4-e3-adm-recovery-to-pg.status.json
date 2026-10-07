@@ -1,0 +1,27 @@
+{
+  "exit": 0,
+  "success": false,
+  "completed": true,
+  "threadId": "01a10f03-e9c0-7b33-88dd-c1c6a6125dae",
+  "model": "gpt-5.6-sol",
+  "reasoning": "medium",
+  "errors": [
+    {
+      "type": "error",
+      "message": "Reconnecting... 2/5 (request timed out)"
+    },
+    {
+      "type": "error",
+      "message": "Reconnecting... 3/5 (request timed out)"
+    },
+    {
+      "type": "error",
+      "message": "Reconnecting... 4/5 (request timed out)"
+    },
+    {
+      "type": "error",
+      "message": "Reconnecting... 5/5 (request timed out)"
+    }
+  ],
+  "duration": 958.3799388330663
+}

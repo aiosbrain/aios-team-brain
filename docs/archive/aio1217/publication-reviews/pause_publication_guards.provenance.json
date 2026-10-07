@@ -1,0 +1,14 @@
+{
+  "head": "fb773ef87aa87bebb0b5c804876f23ae53a5a572",
+  "productionFingerprint": "22b1b182100cb10455cffa30b0a71bbbf3641c107c92be3744f35cb65ec20a2f",
+  "testFingerprint": "155050f3d0566e92349fbf531f7b818aeae4da108d70402a0d891cf43de092c1",
+  "command": [
+    "npx",
+    "vitest",
+    "run",
+    "test/guards/server-action-auth.test.ts",
+    "test/guards/instruction-base.test.ts"
+  ],
+  "providerEnvironment": "allowlisted synthetic no credentials",
+  "runnerSha256": "9252586f8c222d44351b12b5ab89d9ee5a63da14d8ed8021079fd15f79e3cdb6"
+}

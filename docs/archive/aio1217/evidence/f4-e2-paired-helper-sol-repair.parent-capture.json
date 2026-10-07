@@ -1,0 +1,61 @@
+{
+  "exit": 0,
+  "success": true,
+  "model": "gpt-5.6-sol",
+  "effort": "medium",
+  "thread": "01a10edc-94bb-7f02-a08c-24c6cbf086b0",
+  "argv": [
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+    "exec",
+    "--ephemeral",
+    "--cd",
+    "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/review-public-support/f4-e2-paired-helper-sol-repair/packet",
+    "-m",
+    "gpt-5.6-sol",
+    "-c",
+    "model_reasoning_effort=\"medium\"",
+    "--sandbox",
+    "workspace-write",
+    "--json",
+    "-o",
+    "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e2-paired-helper-sol-repair.final.md",
+    "-"
+  ],
+  "promptSha256": "634ce92faffb8f6bc5eccee32f484066dadd0f257259831df4153de9177c37e2",
+  "manifestSha256": "b0b200b39059b68fcfccea4493931c74800112b4a01f4b3b6e473c52fa1f0c1d",
+  "requestSha256": "14a82494087f32f98381ae2a8da2c180658e2814e5923bc792c6920c0d08701e",
+  "hostVerified5Hashes": true,
+  "inspections": [
+    {
+      "command": "/bin/zsh -lc \"pwd && rg --files -g 'AGENTS.md' -g '\"'!output/run_paired_e2.sh'\"' -g '\"'!output/campaign-contract.json'\"' | sort && rg --files | sort | sed -n '1,240p'\"",
+      "exit": 0
+    },
+    {
+      "command": "/bin/zsh -lc \"sed -n '1,260p' inputs/02-old-helper.sh && sed -n '1,260p' inputs/03-invalid-new-fixture-request.json && sed -n '1,260p' inputs/04-checkpoint.json && sed -n '1,300p' manifest.json && sed -n '1,260p' prompt.md\"",
+      "exit": 0
+    },
+    {
+      "command": "/bin/zsh -lc \"sed -n '1,360p' inputs/01-immutable-e4-runner.py && sed -n '1,320p' inputs/05-current-fixture.ts && shasum -a 256 inputs/01-immutable-e4-runner.py inputs/02-old-helper.sh inputs/03-invalid-new-fixture-request.json inputs/04-checkpoint.json inputs/05-current-fixture.ts\"",
+      "exit": 0
+    },
+    {
+      "command": "/bin/zsh -lc 'ls -la && ls -ld output 2>/dev/null || true'",
+      "exit": 0
+    },
+    {
+      "command": "/bin/zsh -lc 'mkdir -p output'",
+      "exit": 0
+    },
+    {
+      "command": "/bin/zsh -lc 'shasum -a 256 output/run_paired_e2.sh'",
+      "exit": 0
+    },
+    {
+      "command": "/bin/zsh -lc \"chmod +x output/run_paired_e2.sh && zsh -n output/run_paired_e2.sh && python3 -m json.tool output/campaign-contract.json >/dev/null && shasum -a 256 output/run_paired_e2.sh inputs/01-immutable-e4-runner.py inputs/05-current-fixture.ts && find output -maxdepth 1 -type f -print | sort && stat -f '%Sp %N' output/run_paired_e2.sh output/campaign-contract.json && rg -n --fixed-strings 'python3 ./run_check_e4.py \\\"\"'$stage\" pg \"$fixture\"'\"' output/run_paired_e2.sh && if rg -n --fixed-strings ' pg -- \\\"\"'$fixture\"'\"' output/run_paired_e2.sh; then exit 1; fi\"",
+      "exit": 0
+    }
+  ],
+  "terminalReaped": true,
+  "duration": 100.02756520803086,
+  "errors": []
+}

@@ -1,0 +1,21 @@
+{
+  "utc": "2026-10-06T04:31:00.453033+00:00",
+  "state": "INTERRUPTED_SAVED_EDIT_NOT_COMPLETED",
+  "actualModel": "claude-opus-5-5",
+  "session": "759558bf-501b-48ad-b2f0-a538e5cf7140",
+  "terminalError": true,
+  "parentReaped": true,
+  "singleChangedFile": "test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts",
+  "oldBytesPreserved": true,
+  "prefixBytes": 136595,
+  "suffixBytes": 7937,
+  "insertionBytes": 56102,
+  "fixtureSha256": "7ae552da7d3d637a5c545caca92322f7f3330294c696cabf7de1873bc42e3407",
+  "patchSha256": "61235d43666574cd360666e5bfe58714d2c0c0e4a9f11c59089ba51c5db4334e",
+  "allOtherInputsUnchanged": true,
+  "remoteDeadline": "2026-10-06T03:32:08.229672+00:00",
+  "overdueSeconds": 3532.223361,
+  "checks": "NOT RUN",
+  "acceptance": "NONE",
+  "clockObservation": "UTC advanced from 03:02 to04:30 while worker monotonic duration859s; preserve both, do not infer elapsed reconciliation"
+}

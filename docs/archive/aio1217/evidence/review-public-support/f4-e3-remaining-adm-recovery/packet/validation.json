@@ -1,0 +1,31 @@
+{
+  "kind": "AIO-1217_F4_E3_REMAINING_ADM_RECOVERY_PACKET_LOCAL_VALIDATION",
+  "status": "PASS_COORDINATOR_READ_ONLY",
+  "validatedAt": "2026-10-06T04:31:00.453033Z",
+  "qualification": "Timestamp is the parent's captured evidence time used as the latest supplied UTC anchor, not a claim that coordinator validation occurred at that instant.",
+  "packet": {
+    "admission": {
+      "sha256": "2a7fa1d0e886bcc4ed9d73d2017096b6ef608789b5361f42a31400babc07fa7c",
+      "bytes": 120
+    },
+    "prompt": {
+      "sha256": "5043368b52e8ee14a2932169de0702e3aff30993847f4720317a2cd6d38cb7ca",
+      "bytes": 8573
+    },
+    "manifest": {
+      "sha256": "84ccd059df866cdb3ae8310ab068ebe6724a6327120a4ca0086c0c845efe895d",
+      "bytes": 14801,
+      "inputCount": 35
+    }
+  },
+  "checks": [
+    "manifest JSON parsed",
+    "exactly 35 input entries",
+    "every input exists as a regular non-symlink leaf",
+    "every input SHA-256 and byte size matched",
+    "current fixture matched 7ae552da7d3d637a5c545caca92322f7f3330294c696cabf7de1873bc42e3407 and 200634 bytes",
+    "original prompt and original manifest matched their historical identities"
+  ],
+  "scope": "Read-only packet/input validation only; no source, git, model, check, PG, network, push, or remote action.",
+  "caveat": "Parent must independently repeat all guards and verify current repository/remote/worker state immediately before launch."
+}

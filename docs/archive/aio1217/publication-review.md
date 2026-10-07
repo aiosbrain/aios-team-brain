@@ -1,0 +1,11 @@
+# Preservation-only review and packaging validation
+
+No implementation or native PG work resumed. Fresh subscription Opus5.5 HIGH `fcf6c7b1-781d-4840-835d-1a3ca0694240` found no blocker/HIGH in the cases11–15 increment; it found two HIGH packaging regressions in the initial documentation commit. Independent fresh Opus skeptics `36fae4b7-7b80-486a-b56f-7a4f8a529d9d` and `be5cb950-70ee-4223-a03c-7ab616e6aceb` confirmed the findings separately. Public reports are retained in publication-reviews/.
+
+Both packaging findings were corrected without changing application/test/guard source: eight owner snapshots renamed to .ts.txt with identical bytes/hashes; archived evidence moved under existing docs/archive/ with an explicit non-executable banner and updated publication pointers/index. No exclusions/census/registry/assertions were weakened.
+
+Actual post-correction checks: the two affected guard files passed **317 tests, 3 TODO**; project typecheck passed. Production fingerprint remained 22b1b182100cb10455cffa30b0a71bbbf3641c107c92be3744f35cb65ec20a2f and test fingerprint155050f3d0566e92349fbf531f7b818aeae4da108d70402a0d891cf43de092c1, unchanged during both runs. Project typecheck excludes test files. Full logs/results/provenance/copied runner are retained.
+
+MED deferrals: native cases11–15 remain NOT RUN and explicitly uncredited; earlier lint/typecheck evidence is pre-publication and supplemented by the actual post-correction checks above. LOWs: PAUSE now distinguishes interrupted writer from completed no-edit continuation and requires a new explicit resume instruction; stale fixture prose stays historical and is documented as superseded by the insertion; one historical validation hash is truncated, so use the actual indexed file digest. Destination visibility was independently verified PUBLIC; only authorized task source, sanitized public reports and synthetic evidence are published, excluding credentials, signed URLs, customer data and private model reasoning.
+
+This is preservation-only review, not whole-PR/final/E3/E4/E6/95-action acceptance. The old historical admission gap remains blocked. Do not merge or mark Done. A fresh final packaging readback review is recorded in the PR body; it does not run the pending campaign.

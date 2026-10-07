@@ -1,0 +1,15 @@
+{
+  "head": "9cd35756ce9459a4c389803714fc06e34192c108",
+  "productionFingerprint": "22b1b182100cb10455cffa30b0a71bbbf3641c107c92be3744f35cb65ec20a2f",
+  "testFingerprint": "79bbfe3974d3aefb7c3c2997d6f9cd0fcc39f4c4087637bff86caf37f86c684e",
+  "command": [
+    "npx",
+    "vitest",
+    "run",
+    "--config",
+    "vitest.datamechanics.config.ts",
+    "test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts"
+  ],
+  "providerEnvironment": "allowlisted synthetic no credentials",
+  "runnerSha256": "5ec2b76bdb536bef088f8a461155e3abf7f61b59215d46b5aa7a858e7083682d"
+}

@@ -1,0 +1,3 @@
+f4e3_reference: ['npx', 'vitest', 'run', '--config', 'vitest.datamechanics.config.ts', 'test/datamechanics/aio1217-pm-reconcile-action-native.datamechanics.test.ts']
+f4e3_reference: exit=1
+reference stage=f4e3_reference runner_exit=1 records=/private/tmp/aio1217-paired-e3-20261006T021440Z/reference/aio1217-worktree/.context/aio1217-e4-observation-records/requests.jsonl

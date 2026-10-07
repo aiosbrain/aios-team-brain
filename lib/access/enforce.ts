@@ -1,7 +1,7 @@
 import "server-only";
 import { createHash } from "node:crypto";
 import type { DbClient } from "@/lib/db/types";
-import { visibleProjects, effectiveVisibleProjects, type Principal } from "@/lib/access/oracle";
+import { visibleProjects, visibleProjectsWithError, effectiveVisibleProjects, type Principal } from "@/lib/access/oracle";
 import { newSqlParams, itemVisibleSql, provenanceRowSql, type ProvenanceSqlCtx } from "@/lib/access/provenance-sql";
 import { runSql } from "@/lib/db/pg/pool";
 
@@ -124,14 +124,21 @@ export async function canSeeItem(db: DbClient, principal: Principal, itemId: str
 
 /** Member convenience: resolve the principal's visible projects via the oracle, then the item ids.
  * Also RETURNS the project ids (PCCC-6): the graph legs partition by project, and recomputing the
- * oracle a second time for them would be a disagreement surface. */
+ * oracle a second time for them would be a disagreement surface.
+ *
+ * AIO-1217: reads the ERROR-VISIBLE oracle, so a failed `members`/`group_members`/`project_groups`
+ * read is flagged exactly like the membership read below instead of collapsing into the empty set a
+ * genuinely grantless member gets — a caller that refuses on `error` must not run its consumer on an
+ * error-derived empty. The flag comes from the oracle alone, never from emptiness: a grantless
+ * principal still resolves `empty` WITHOUT `error`. */
 export async function visibleItemIds(
   db: DbClient,
   principal: Principal
 ): Promise<VisibleItemIds & { projectIds: string[] }> {
-  const { projectIds } = await visibleProjects(db, principal);
-  const items = await visibleItemIdsForProjects(db, principal.teamId, projectIds);
-  return { ...items, projectIds: [...projectIds] };
+  const { set, error } = await visibleProjectsWithError(db, principal);
+  if (error) return { ids: new Set(), empty: true, error: true, projectIds: [] };
+  const items = await visibleItemIdsForProjects(db, principal.teamId, set.projectIds);
+  return { ...items, projectIds: [...set.projectIds] };
 }
 
 /**

@@ -1,0 +1,47 @@
+{
+  "records": [
+    {
+      "id": "control",
+      "copy": "/private/tmp/aio1217-f4-e5-d1pxnx5m/control/aio1217-worktree",
+      "head": "cd0387e8f6315199f0497d64a4f2134ca02f6ad4",
+      "exit": 0,
+      "patchSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "patchBytes": 0,
+      "log": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e5-control.log",
+      "result": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e5-control.result.json"
+    },
+    {
+      "id": "audit-before-refusal",
+      "copy": "/private/tmp/aio1217-f4-e5-d1pxnx5m/audit-before-refusal/aio1217-worktree",
+      "head": "cd0387e8f6315199f0497d64a4f2134ca02f6ad4",
+      "exit": 1,
+      "patchSha256": "9776a664f97a942b8d0561ca1d56ab7f22fdd34736cbce38909d0b8507b5a5a9",
+      "patchBytes": 1403,
+      "log": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e5-audit-before-refusal.log",
+      "result": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e5-audit-before-refusal.result.json"
+    },
+    {
+      "id": "revalidate-before-refusal",
+      "copy": "/private/tmp/aio1217-f4-e5-d1pxnx5m/revalidate-before-refusal/aio1217-worktree",
+      "head": "cd0387e8f6315199f0497d64a4f2134ca02f6ad4",
+      "exit": 1,
+      "patchSha256": "38ffb24e43e6784b2702530208ce4995c6b73791dea53053845436e7ecb05152",
+      "patchBytes": 1209,
+      "log": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e5-revalidate-before-refusal.log",
+      "result": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e5-revalidate-before-refusal.result.json"
+    },
+    {
+      "id": "overbroad-marker-no-link",
+      "copy": "/private/tmp/aio1217-f4-e5-d1pxnx5m/overbroad-marker-no-link/aio1217-worktree",
+      "head": "cd0387e8f6315199f0497d64a4f2134ca02f6ad4",
+      "exit": 1,
+      "patchSha256": "259de74514abcbe3c8f27fec8fad1a804f635bb0c2c2b56cf28f7ff85c54a831",
+      "patchBytes": 843,
+      "log": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e5-overbroad-marker-no-link.log",
+      "result": "/Users/chetan/.codex/worktrees/2b54/aios-team-brain/.context/aio1217-handoff/f4-e5-overbroad-marker-no-link.result.json"
+    }
+  ],
+  "candidateUnchanged": true,
+  "verifiedAt": "2026-10-05T22:07:19.861209+00:00",
+  "classification": "Coordinator must inspect executed assertions; no automatic kill credit"
+}

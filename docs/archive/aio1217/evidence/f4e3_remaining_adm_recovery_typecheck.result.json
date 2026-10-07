@@ -1,0 +1,15 @@
+{
+  "exit": 0,
+  "tier": "typecheck",
+  "command": [
+    "npm",
+    "run",
+    "typecheck"
+  ],
+  "productionBefore": "22b1b182100cb10455cffa30b0a71bbbf3641c107c92be3744f35cb65ec20a2f",
+  "productionAfter": "22b1b182100cb10455cffa30b0a71bbbf3641c107c92be3744f35cb65ec20a2f",
+  "unchanged": true,
+  "testBefore": "155050f3d0566e92349fbf531f7b818aeae4da108d70402a0d891cf43de092c1",
+  "testAfter": "155050f3d0566e92349fbf531f7b818aeae4da108d70402a0d891cf43de092c1",
+  "testUnchanged": true
+}
