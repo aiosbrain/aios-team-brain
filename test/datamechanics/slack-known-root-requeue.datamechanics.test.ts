@@ -36,7 +36,7 @@ import { parseSlackTimestamp, type SlackEvidenceUser } from "@/lib/ingest/source
 import { scopedSlackItemPath } from "@/lib/ingest/sources/slack-namespace";
 import { normalizeThread } from "@/lib/ingest/sources/slack-normalize";
 import { runContextTransaction, transactionCapability } from "@/lib/projects/context/transaction";
-import { db, ingest, seedTeam, type Seed } from "./helpers";
+import { db, ingest, seedTeam, transactionSessionDecoratedDb, type Seed } from "./helpers";
 import {
   authTestBody,
   channelInfoBody,
@@ -4920,4 +4920,517 @@ describe("KR-08 rollback and replay", () => {
     });
     expect(await lifecycleSnapshot(teamId), `${label}: no row of any snapshotted surface was changed by the replay`).toEqual(before);
   });
+});
+
+// ── Lifecycle packet: what the concurrency suite below adds ──────────────────────────────────────
+// New, file-local helpers for "KR-08 concurrent preparers and publication orderings". Nothing above
+// is moved or changed.
+
+/** How a tracked promise ended. It never rejects: a rejection is a value here. */
+type LifecycleEnded<T> = { state: "resolved"; value: T } | { state: "rejected"; error: unknown };
+/** A promise whose end can be awaited without throwing, and asked about without awaiting. */
+function lifecycleTracked<T>(promise: Promise<T>): { ended: Promise<LifecycleEnded<T>>; hasEnded: () => boolean } {
+  let over = false;
+  const ended: Promise<LifecycleEnded<T>> = promise.then(
+    (value) => { over = true; return { state: "resolved" as const, value }; },
+    (error: unknown) => { over = true; return { state: "rejected" as const, error }; }
+  );
+  return { ended, hasEnded: () => over };
+}
+/** An ending as something a failed assertion can show: the value, or what kind of failure it was. Never the error itself. */
+function lifecycleShown<T>(ending: LifecycleEnded<T>): unknown {
+  if (ending.state === "resolved") return { state: "resolved", value: ending.value };
+  const error = ending.error;
+  return {
+    state: "rejected",
+    failure: classifySlackKnownRootPreparationFailure(error),
+    sqlstate: typeof (error as { code?: unknown } | null)?.code === "string" ? (error as { code: string }).code : null,
+  };
+}
+/** A value handed over once, from inside a transaction to the test. */
+function lifecycleHandover<T>(): { given: Promise<T>; give: (value: T) => void } {
+  let give!: (value: T) => void;
+  const given = new Promise<T>((resolve) => { give = resolve; });
+  return { given, give };
+}
+/** A hold point: the held party says it is there, and stays until it is released. Releasing twice does nothing. */
+function lifecycleHold<T>(): { reached: Promise<T>; arrive: (value: T) => void; released: Promise<void>; release: () => void } {
+  const arrival = lifecycleHandover<T>();
+  let open!: () => void;
+  const released = new Promise<void>((resolve) => { open = resolve; });
+  let isReleased = false;
+  return {
+    reached: arrival.given, arrive: arrival.give, released,
+    release: () => {
+      if (isReleased) return;
+      isReleased = true;
+      open();
+    },
+  };
+}
+/** What was handed over, unless the party that should hand it over ended first: then a fixture error says how it ended. */
+async function lifecycleArrived<T, U>(given: Promise<T>, party: { ended: Promise<LifecycleEnded<U>> }, what: string): Promise<T> {
+  const first = await Promise.race([
+    given.then((value) => ({ arrived: true as const, value })),
+    party.ended.then((ending) => ({ arrived: false as const, ending })),
+  ]);
+  if (first.arrived) return first.value;
+  throw new Error(`fixture: ${what} ended before reaching its hold point: ${JSON.stringify(lifecycleShown(first.ending))}`);
+}
+
+/**
+ * WHO IS WAITING ON A LOCK HELD BY ONE BACKEND, as PostgreSQL itself reports it, read from this
+ * file's own dedicated connection: every other backend of this database that `pg_blocking_pids`
+ * says is blocked by `blockerPid`; its state, wait event and current statement; the locks it is
+ * waiting for; and the transaction ids the BLOCKER holds — so that "it waits for a transaction of
+ * that backend" is read off the lock table, not inferred.
+ */
+type LifecycleWaiter = {
+  pid: number; state: string | null; wait_event_type: string | null; query: string | null;
+  ungranted: { locktype: string; mode: string; transactionid: string | null }[];
+  blocker_transaction_ids: string[];
+};
+const LIFECYCLE_WAITERS_SQL = `
+  select a.pid, a.state, a.wait_event_type, a.query,
+         (select coalesce(jsonb_agg(jsonb_build_object('locktype', l.locktype, 'mode', l.mode, 'transactionid', l.transactionid::text) order by l.locktype, l.mode), '[]'::jsonb)
+            from pg_locks l where l.pid = a.pid and not l.granted) as ungranted,
+         (select coalesce(jsonb_agg(h.transactionid::text order by h.transactionid::text), '[]'::jsonb)
+            from pg_locks h where h.pid = $1::int and h.locktype = 'transactionid' and h.granted) as blocker_transaction_ids
+    from pg_stat_activity a
+   where a.datname = current_database() and a.pid <> pg_backend_pid()
+     and $1::int = any(pg_blocking_pids(a.pid))
+   order by a.pid`;
+/**
+ * Reads the lock table until a waiter behind `blockerPid` is there. The ONLY thing repeated is this
+ * readback: there is no sleep, each round is one query, and it stops when a waiter is seen, when the
+ * party that should be waiting has ended, or when the bound has passed. Not seeing a wait is
+ * reported, never assumed.
+ */
+async function lifecycleObservedWaiters(blockerPid: number, waiterHasEnded: () => boolean, boundMs: number): Promise<{ waiters: LifecycleWaiter[]; polls: number; notObservedBecause: string | null }> {
+  const startedAt = performance.now();
+  for (let polls = 1; ; polls++) {
+    const waiters = await query<LifecycleWaiter>(LIFECYCLE_WAITERS_SQL, [blockerPid]);
+    if (waiters.length > 0) return { waiters, polls, notObservedBecause: null };
+    if (waiterHasEnded()) return { waiters, polls, notObservedBecause: "the party that should have waited ended before any wait was observed" };
+    if (performance.now() - startedAt > boundMs) return { waiters, polls, notObservedBecause: `no wait was observed within ${boundMs} ms` };
+  }
+}
+/** The observed waiters as the facts a case asserts: one line per waiter, nothing inferred. */
+const lifecycleWaitFacts = (waiters: readonly LifecycleWaiter[]) => waiters.map((waiter) => {
+  const statement = (waiter.query ?? "").replace(/\s+/g, " ");
+  return {
+    pid: Number(waiter.pid), state: waiter.state, wait_event_type: waiter.wait_event_type,
+    isTheNamespaceGateRowLock: /from slack_channel_migration_gates\b/.test(statement) && /\bfor update\b/.test(statement),
+    waitsFor: waiter.ungranted.map((lock) => `${lock.locktype}/${lock.mode}`),
+    everyAwaitedTransactionIsTheBlockers: waiter.ungranted.length > 0 &&
+      waiter.ungranted.every((lock) => lock.transactionid !== null && waiter.blocker_transaction_ids.includes(lock.transactionid)),
+  };
+});
+/** ONE waiter, active, in a lock wait, at the namespace gate's row lock, waiting for a transaction the blocker holds. */
+const lifecycleOneGateWaiter = (pid: unknown) => [{
+  pid, state: "active", wait_event_type: "Lock", isTheNamespaceGateRowLock: true,
+  waitsFor: ["transactionid/ShareLock"], everyAwaitedTransactionIsTheBlockers: true,
+}];
+
+/**
+ * The identical complete thread of a published root, staged again as a hydrator leaves it — a queue
+ * row, its claim, a complete snapshot, a checkpoint — and read back. Returns the one call that
+ * republishes it through the real `ingestItem`, on whatever client it is given.
+ */
+async function lifecycleRestaged(f: Published, label: string): Promise<{ publish: (client: Parameters<typeof ingestItem>[0]) => ReturnType<typeof ingestItem> }> {
+  const teamId = f.seed.teamId;
+  const selection = await tx((s) => lockSlackSelection(s, { teamId, integrationId: f.integrationId, envToken: () => null }));
+  if (selection.outcome !== "current") throw new Error("fixture: the selection is not current");
+  const scope = { teamId, workspaceId: WORKSPACE, channelId: CHANNEL, rootTs: OLD_ROOT };
+  await tx((s) => enqueueSlackThread(s, scope));
+  const acquired = await tx((s) => claimSlackThread(s, scope, { leaseMs: 900_000 }));
+  if (!acquired) throw new Error("fixture: the claim was refused");
+  const staged = await tx(async (s) => {
+    const written = await writeSlackThreadSnapshot(s, acquired, {
+      messages: [ROOT_MESSAGE, REPLY_MESSAGE], complete: true, expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+    });
+    if (written !== "written") throw new Error("fixture: the snapshot was refused");
+    return checkpointSlackThread(s, acquired, { pageCursor: null, snapshotGeneration: 1 });
+  });
+  if (staged.outcome !== "checkpointed") throw new Error("fixture: the checkpoint was refused");
+  expect(await query(
+    `select status, attempts, snapshot_generation::text as snapshot_generation, page_cursor, lease_expires_at > clock_timestamp() as lease_is_live
+       from slack_sync_threads where team_id = $1`, [teamId]
+  ), `${label}: fixture: a legitimately claimed, running queue row with a checkpointed complete snapshot`).toEqual([
+    { status: "running", attempts: 1, snapshot_generation: "1", page_cursor: null, lease_is_live: true },
+  ]);
+  expect(await query(
+    `select snapshot_generation::text as snapshot_generation, complete, jsonb_array_length(messages) as messages, expires_at > clock_timestamp() as live
+       from slack_thread_snapshots where team_id = $1`, [teamId]
+  ), `${label}: fixture: the staged snapshot is complete and live`).toEqual([{ snapshot_generation: "1", complete: true, messages: 2, live: true }]);
+
+  const claim: SlackThreadClaim = { ...acquired, snapshotGeneration: 1 };
+  const option = slackPublicationOption({
+    claim, binding: slackBindingRef(selection.selection), namespaceRevision: f.namespaceRevision, channelName: "general", users: USERS,
+  });
+  const normalized = normalizeThread({ root: ROOT_MESSAGE, replies: [REPLY_MESSAGE] }, {
+    channelId: CHANNEL, channelName: "general", users: { U1: "Person One" }, project: "slack",
+  });
+  const payload = {
+    ...normalized,
+    path: scopedSlackItemPath(WORKSPACE, CHANNEL, OLD_ROOT),
+    frontmatter: { ...normalized.frontmatter, workspace_id: WORKSPACE, source_ts: parseSlackTimestamp(OLD_ROOT)!.iso },
+  };
+  const auth = { teamId, memberId: f.seed.memberId, apiKeyId: randomUUID() };
+  return { publish: (client) => ingestItem(client, auth, payload, "team", { authorMemberId: null }, "team", option) };
+}
+
+/**
+ * KR-08 in part — two preparers, and both orderings of a preparer against the publisher
+ * (`docs/design/slack-known-root-requeue-spec.md` §5.1, §8.4, §11 KR-08).
+ *
+ * EVIDENCE, NOT RED: all three cases are expected to pass on the current source. The stale-claim
+ * characterization of KR-08 is not here, and no mutant is claimed to be killed by this suite.
+ *
+ * THE OVERLAP IS READ FROM POSTGRESQL, NOT FROM TIME. In each case one party is held at a named
+ * point INSIDE its open transaction, and the other is started. That the second is really waiting
+ * behind the first is then read from the server: `pg_blocking_pids` names the first party's backend
+ * as its blocker; `pg_stat_activity` shows it active in a lock wait on the namespace gate's row
+ * lock; and `pg_locks` shows it waiting for a transaction id that the first party's backend holds.
+ * Only after that readback is the first party released. An unresolved JavaScript promise is never
+ * taken as the proof, and nothing sleeps: the readback is repeated, one query a round, under a bound.
+ *
+ * A WAITING PREPARATION HAS 250 ms. Preparation caps every lock wait at 250 ms. In the first two
+ * cases the waiting party is a preparation, so the wait must be seen and the holder released within
+ * that time. If it is not, the waiter fails with a lock timeout and the case FAILS: a lock timeout,
+ * or an overlap that was not observed, is never a pass. Nothing in the test raises or evades the cap.
+ *
+ * THE HOLD POINTS, each in test-local control and none in production code:
+ *   two preparers     A's own transaction callback, after preparation has returned `enqueued`.
+ *   publisher first   a test-only wrapper of the publication's own session, on the real `ingestItem`:
+ *                     it forwards every statement unchanged and withholds only the resolution of the
+ *                     acknowledging delete of the queue row — so the evidence has been refreshed and
+ *                     the row acknowledged, and nothing is committed.
+ *   preparer first    A's own transaction callback, after preparation has returned `already_pending`.
+ *
+ * WHAT CAN AND CANNOT BE ATTRIBUTED. Where a preparation's work is finished while the other party is
+ * still blocked — the preparer-first case — the scoped snapshot is taken then, and shows the
+ * preparation changed nothing. Where the two commit close together, the whole episode is compared
+ * instead: only the tables a republication is known to write may differ, and what it wrote is read
+ * back exactly. The scoped snapshot is the one of the lifecycle suites above, and is not the whole
+ * of KR-13.
+ *
+ * Every held party is released in a `finally`, which then waits for both to end; a hook releases
+ * them again if the body never gets there. Each case has its own wall-clock timeout.
+ */
+describe("KR-08 concurrent preparers and publication orderings", () => {
+  /** The minimum policy, for the two preparers. */
+  const A_MINUTE = { ms: 60_000, sqlInterval: "60 seconds" };
+  /** A roomy policy for the publication orderings: an hour. The fixture ages the witness by two. */
+  const AN_HOUR = { ms: 3_600_000, sqlInterval: "1 hour" };
+  /** A waiting preparation gives up after 250 ms, so its wait is seen well inside this bound or not at all. */
+  const PREPARATION_WAIT_BOUND_MS = 2_000;
+  /** A waiting publication has no such cap; its wait is looked for a little longer. */
+  const PUBLICATION_WAIT_BOUND_MS = 10_000;
+  const CASE_TIMEOUT_MS = 30_000;
+  /** The only tables a republication writes, of the snapshotted surfaces: the two it must, and the two it may. */
+  const A_REPUBLICATION_MUST_CHANGE = ["slack_messages", "slack_sync_threads", "slack_thread_snapshots"];
+  const A_REPUBLICATION_MAY_CHANGE = [...A_REPUBLICATION_MUST_CHANGE, "items", "projects"];
+
+  const ledgerSemantics = (teamId: string): Promise<Row[]> => query(
+    `select workspace_id, channel_id, message_ts, root_ts, is_root, item_id::text as item_id, author_external_id,
+            ${lifecycleUtc("occurred_at")} as occurred_at_utc, eligible, exclusion_reason, source_hash,
+            deleted_at is null as live, last_seen_generation::text as last_seen_generation
+       from slack_messages where team_id = $1 order by message_ts`, [teamId]
+  );
+  const generations = (teamId: string): Promise<Row[]> => query(
+    `select data_generation::text as data_generation, identity_generation::text as identity_generation,
+            presentation_generation::text as presentation_generation
+       from slack_team_state where team_id = $1`, [teamId]
+  );
+  const itemAndVersions = (teamId: string): Promise<Row[]> => query(
+    `select i.id::text as id, (select count(*)::int from item_versions v where v.item_id = i.id) as versions
+       from items i where i.team_id = $1 order by i.id`, [teamId]
+  );
+  const databaseClock = async (): Promise<string> =>
+    (await query<{ at: string }>(`select ${lifecycleUtc("clock_timestamp()")} as at`))[0].at;
+  const rootObservation = async (f: Published): Promise<unknown> =>
+    (await query(`select ${lifecycleUtc("w.observed_at")} as observed_at_utc from slack_messages w where ${LIFECYCLE_ROOT_WITNESS}`, lifecycleWitnessOf(f)))
+      .map((row) => row.observed_at_utc);
+  const stagingRowsExactly = async (teamId: string): Promise<string[]> =>
+    (await query(`select to_jsonb(t)::text as stored from slack_thread_snapshots t where t.team_id = $1 order by t.root_ts`, [teamId])).map((row) => row.stored as string);
+
+  /** What a republication must have done to the root's observation: all database inequalities. */
+  const observationRefreshed = (f: Published, agedObservedAt: string, clockBefore: string, clockAfter: string, exactDue: string): Promise<Row[]> => query(
+    `select w.observed_at > $6::timestamptz as strictly_after_the_aged_observation,
+            w.observed_at >= $7::timestamptz as not_before_the_clock_reading_before,
+            w.observed_at <= $8::timestamptz as not_after_the_clock_reading_after,
+            w.deleted_at is null as live,
+            w.observed_at + interval '1 hour' > clock_timestamp() as refreshed_due_is_in_the_future,
+            $9::timestamptz < clock_timestamp() as old_exact_due_is_still_past
+       from slack_messages w where ${LIFECYCLE_ROOT_WITNESS}`, [...lifecycleWitnessOf(f), agedObservedAt, clockBefore, clockAfter, exactDue]
+  );
+  const REFRESHED = [{
+    strictly_after_the_aged_observation: true, not_before_the_clock_reading_before: true, not_after_the_clock_reading_after: true,
+    live: true, refreshed_due_is_in_the_future: true, old_exact_due_is_still_past: true,
+  }];
+
+  it("commits exactly one insertion when two preparers share one enumerated entry: the second waits in PostgreSQL behind the first and returns already_pending", async () => {
+    const label = "two preparers";
+    const { f, teamId, entry, agedObservedAt, exactDue } = await lifecycleAgedRoot(label, A_MINUTE);
+    const before = await lifecycleSnapshot(teamId);
+
+    // ── A: prepares, and is HELD in its own transaction after preparation returned. ──
+    const holdA = lifecycleHold<{ pid: number; provisional: SlackKnownRootPreparationResult; dueSeenInside: string[] }>();
+    onTestFinished(() => holdA.release());
+    const executionA = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+    const preparerA = lifecycleTracked(tx(async (a) => {
+      const pid = await lifecyclePidOf(a);
+      const provisional = await prepareSlackKnownRootRequeue(a, { teamId, entry }, executionA);
+      const dueSeenInside = (await a.executeSql<{ due_at_utc: string }>(
+        `select ${lifecycleUtc("due_at")} as due_at_utc from slack_sync_threads where team_id = $1 order by root_ts`, [teamId]
+      )).rows.map((row) => row.due_at_utc);
+      holdA.arrive({ pid, provisional, dueSeenInside });
+      await holdA.released;
+      return provisional;
+    }));
+
+    let startedPreparerB: ReturnType<typeof lifecycleTracked<SlackKnownRootPreparationResult>> | null = null;
+    let reachedHoldA: Awaited<typeof holdA.reached> | null = null;
+    let pidOfB = 0;
+    let committedWhileAHeld: unknown = null;
+    let observedOverlap: Awaited<ReturnType<typeof lifecycleObservedWaiters>> | null = null;
+    try {
+      const held = await lifecycleArrived(holdA.reached, preparerA, "preparer A");
+      reachedHoldA = held;
+      // From outside, while A is held: its insert is not committed.
+      committedWhileAHeld = await lifecycleQueueAndStagingAnywhere();
+
+      // ── B: the same entry, on another connection, with its own context created before its transaction. ──
+      const startedB = lifecycleHandover<number>();
+      const executionB = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+      const second = lifecycleTracked(tx(async (b) => {
+        startedB.give(await lifecyclePidOf(b));
+        return prepareSlackKnownRootRequeue(b, { teamId, entry }, executionB);
+      }));
+      startedPreparerB = second;
+      pidOfB = await lifecycleArrived(startedB.given, second, "preparer B");
+      // ── THE OVERLAP, read from PostgreSQL. A is released the moment it has been read. ──
+      observedOverlap = await lifecycleObservedWaiters(held.pid, second.hasEnded, PREPARATION_WAIT_BOUND_MS);
+    } finally {
+      holdA.release();
+      await preparerA.ended;
+      if (startedPreparerB) await startedPreparerB.ended;
+    }
+    if (reachedHoldA === null || startedPreparerB === null || observedOverlap === null) throw new Error("fixture: the case did not get as far as its overlap");
+    const heldA = reachedHoldA;
+    const observed = observedOverlap;
+    const endedA = await preparerA.ended;
+    const endedB = await startedPreparerB.ended;
+
+    // FIXTURE: the hold was where it should be, and B was another connection.
+    expect(heldA.provisional, `${label}: fixture: A was held after preparation had returned a provisional enqueued`).toEqual({ outcome: "enqueued" });
+    expect(heldA.dueSeenInside, `${label}: fixture: inside A's transaction the inserted row was there`).toHaveLength(1);
+    expect(committedWhileAHeld, `${label}: fixture: while A was held, nothing of it was committed`).toEqual({ queue: [], staging: [] });
+    expect([pidOfB > 0, pidOfB !== heldA.pid], `${label}: fixture: B ran on another connection than A`).toEqual([true, true]);
+    // THE OVERLAP: B was blocked in PostgreSQL, by A's backend, waiting for A's transaction.
+    expect(observed.notObservedBecause, `${label}: barrier: B's wait behind A was observed in PostgreSQL`).toBeNull();
+    expect(lifecycleWaitFacts(observed.waiters), `${label}: barrier: exactly B is blocked by A's backend, at the namespace gate's row lock, waiting for a transaction A holds`)
+      .toEqual(lifecycleOneGateWaiter(pidOfB));
+
+    // BOTH COMMITTED: one insertion, one already_pending. A lock timeout on B would show here as a rejection.
+    expect([lifecycleShown(endedA), lifecycleShown(endedB)], `${label}: A commits enqueued and B commits already_pending`).toEqual([
+      { state: "resolved", value: { outcome: "enqueued" } }, { state: "resolved", value: { outcome: "already_pending" } },
+    ]);
+    expect(await lifecycleQueueAgainst(teamId, exactDue), `${label}: exactly one queue row, at the exact due instant rounded up to its millisecond`)
+      .toEqual(LIFECYCLE_ONE_ROW_AT_THE_EXACT_DUE);
+    expect((await query<{ due_at_utc: string }>(`select ${lifecycleUtc("due_at")} as due_at_utc from slack_sync_threads where team_id = $1 order by root_ts`, [teamId])).map((row) => row.due_at_utc),
+      `${label}: the committed due instant is the historical one A computed, unchanged by B`).toEqual(heldA.dueSeenInside);
+    expect(await lifecycleQueueAndStagingAnywhere(), `${label}: the only queue row in the database is this root's, and nothing is staged`).toEqual({
+      queue: [{ team_id: teamId, root_ts: OLD_ROOT }], staging: [],
+    });
+    expect(lifecycleTablesThatDiffer(before, await lifecycleSnapshot(teamId)), `${label}: of the snapshotted surfaces the two preparations changed the queue, and nothing else`).toEqual(["slack_sync_threads"]);
+    expect(await rootObservation(f), `${label}: the root witness still stores the aged observation`).toEqual([agedObservedAt]);
+  }, CASE_TIMEOUT_MS);
+
+  it("publisher first: a preparation that waits in PostgreSQL behind an uncommitted republication commits not_due and leaves queue and staging absent", async () => {
+    const label = "publisher first";
+    const { f, teamId, entry, agedObservedAt, exactDue } = await lifecycleAgedRoot(label, AN_HOUR);
+    const restaged = await lifecycleRestaged(f, label);
+    const itemBefore = await itemAndVersions(teamId);
+    const generationsBefore = await generations(teamId);
+    const ledgerBefore = await ledgerSemantics(teamId);
+    const queueBefore = await lifecycleQueueRowsExactly(teamId);
+    const stagingBefore = await stagingRowsExactly(teamId);
+    const before = await lifecycleSnapshot(teamId);
+
+    // ── THE PUBLICATION: the real `ingestItem`, on a client whose transaction session is wrapped by
+    //    the test. The wrapper forwards every statement unchanged, and withholds only the resolution
+    //    of the acknowledging delete: evidence refreshed, queue row acknowledged, nothing committed. ──
+    const holdPublication = lifecycleHold<{ pid: number; acknowledgedRows: number }>();
+    onTestFinished(() => holdPublication.release());
+    let heldOnce = false;
+    const heldClient = transactionSessionDecoratedDb(db(), (session) => ({
+      ...session,
+      executeSql: async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        const result = await session.executeSql<T>(sql, params);
+        if (!heldOnce && /delete from slack_sync_threads t where/.test(sql.replace(/\s+/g, " "))) {
+          heldOnce = true;
+          holdPublication.arrive({ pid: await lifecyclePidOf(session), acknowledgedRows: result.rows.length });
+          await holdPublication.released;
+        }
+        return result;
+      },
+    }));
+    const clockBefore = await databaseClock();
+    const publication = lifecycleTracked(restaged.publish(heldClient));
+
+    let startedPreparation: ReturnType<typeof lifecycleTracked<SlackKnownRootPreparationResult>> | null = null;
+    let reachedHold: Awaited<typeof holdPublication.reached> | null = null;
+    let pidOfPreparation = 0;
+    let committedWhileHeld: unknown = null;
+    let observedOverlap: Awaited<ReturnType<typeof lifecycleObservedWaiters>> | null = null;
+    try {
+      const held = await lifecycleArrived(holdPublication.reached, publication, "the publication");
+      reachedHold = held;
+      // From outside, while the publication is held: nothing of it is committed.
+      committedWhileHeld = {
+        queue: await lifecycleQueueRowsExactly(teamId), staging: await stagingRowsExactly(teamId), rootObservation: await rootObservation(f),
+      };
+
+      // ── THE PREPARATION, from the entry enumerated before any of this, with its own context. ──
+      const started = lifecycleHandover<number>();
+      const execution = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+      const preparing = lifecycleTracked(tx(async (p) => {
+        started.give(await lifecyclePidOf(p));
+        return prepareSlackKnownRootRequeue(p, { teamId, entry }, execution);
+      }));
+      startedPreparation = preparing;
+      pidOfPreparation = await lifecycleArrived(started.given, preparing, "the preparation");
+      // ── THE OVERLAP, read from PostgreSQL. The publication is released the moment it has been read. ──
+      observedOverlap = await lifecycleObservedWaiters(held.pid, preparing.hasEnded, PREPARATION_WAIT_BOUND_MS);
+    } finally {
+      holdPublication.release();
+      await publication.ended;
+      if (startedPreparation) await startedPreparation.ended;
+    }
+    if (reachedHold === null || startedPreparation === null || observedOverlap === null) throw new Error("fixture: the case did not get as far as its overlap");
+    const heldPublication = reachedHold;
+    const observed = observedOverlap;
+    const clockAfter = await databaseClock();
+    const endedPublication = await publication.ended;
+    const endedPreparation = await startedPreparation.ended;
+
+    // FIXTURE: the hold was where it should be.
+    expect(heldPublication.acknowledgedRows, `${label}: fixture: the publication was held after its acknowledging delete had removed the one queue row`).toBe(1);
+    expect(committedWhileHeld, `${label}: fixture: while the publication was held, the committed queue row, staging and aged observation were all still there`).toEqual({
+      queue: queueBefore, staging: stagingBefore, rootObservation: [agedObservedAt],
+    });
+    expect([pidOfPreparation > 0, pidOfPreparation !== heldPublication.pid], `${label}: fixture: the preparation ran on another connection than the publication`).toEqual([true, true]);
+    // THE OVERLAP: the preparation was blocked in PostgreSQL, by the publication's backend, at the authority lock.
+    expect(observed.notObservedBecause, `${label}: barrier: the preparation's wait behind the publication was observed in PostgreSQL`).toBeNull();
+    expect(lifecycleWaitFacts(observed.waiters), `${label}: barrier: exactly the preparation is blocked by the publication's backend, at the namespace gate's row lock, waiting for a transaction it holds`)
+      .toEqual(lifecycleOneGateWaiter(pidOfPreparation));
+
+    // THE PUBLICATION COMMITTED, unchanged; THE PREPARATION then read the refreshed witness and the
+    // absent queue row. Had it read the row it would have answered already_pending; had it read the
+    // aged witness, enqueued. A lock timeout would show here as a rejection.
+    expect(endedPublication.state === "resolved" ? endedPublication.value : lifecycleShown(endedPublication), `${label}: the republication's status is unchanged, for the same item`)
+      .toMatchObject({ status: "unchanged", id: f.itemId });
+    expect(lifecycleShown(endedPreparation), `${label}: the preparation commits not_due`).toEqual({ state: "resolved", value: { outcome: "not_due" } });
+    expect(await lifecycleQueueAndStagingAnywhere(), `${label}: queue and staging are absent`).toEqual({ queue: [], staging: [] });
+    expect(await observationRefreshed(f, agedObservedAt, clockBefore, clockAfter, exactDue), `${label}: the root observation strictly advanced, to an instant between the two database clock readings`).toEqual(REFRESHED);
+    expect(await itemAndVersions(teamId), `${label}: the same item id and the same number of versions`).toEqual(itemBefore);
+    expect(await generations(teamId), `${label}: the data, identity and presentation generations are unchanged`).toEqual(generationsBefore);
+    expect(await ledgerSemantics(teamId), `${label}: every semantic ledger field, and last_seen_generation, is unchanged`).toEqual(ledgerBefore);
+    // The whole episode, on the scoped surfaces: only what a republication writes may differ.
+    const differing = lifecycleTablesThatDiffer(before, await lifecycleSnapshot(teamId));
+    expect(differing.filter((table) => !A_REPUBLICATION_MAY_CHANGE.includes(table)), `${label}: no scoped surface that a republication does not write was changed by either party`).toEqual([]);
+    expect(A_REPUBLICATION_MUST_CHANGE.filter((table) => !differing.includes(table)), `${label}: the republication wrote the ledger and removed the queue row and the staging`).toEqual([]);
+  }, CASE_TIMEOUT_MS);
+
+  it("preparer first: a republication that waits in PostgreSQL behind a preparation holding already_pending proceeds unchanged, refreshes the observation and acknowledges the queue and staging", async () => {
+    const label = "preparer first";
+    const { f, teamId, entry, agedObservedAt, exactDue } = await lifecycleAgedRoot(label, AN_HOUR);
+    const restaged = await lifecycleRestaged(f, label);
+    const itemBefore = await itemAndVersions(teamId);
+    const generationsBefore = await generations(teamId);
+    const ledgerBefore = await ledgerSemantics(teamId);
+    const queueBefore = await lifecycleQueueRowsExactly(teamId);
+    const stagingBefore = await stagingRowsExactly(teamId);
+    const before = await lifecycleSnapshot(teamId);
+
+    // ── THE PREPARATION: finds the running row, returns already_pending, and is HELD in its own
+    //    transaction, still holding its authority locks. ──
+    const holdA = lifecycleHold<{ pid: number; provisional: SlackKnownRootPreparationResult }>();
+    onTestFinished(() => holdA.release());
+    const executionA = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+    const preparerA = lifecycleTracked(tx(async (a) => {
+      const pid = await lifecyclePidOf(a);
+      const provisional = await prepareSlackKnownRootRequeue(a, { teamId, entry }, executionA);
+      holdA.arrive({ pid, provisional });
+      await holdA.released;
+      return provisional;
+    }));
+
+    let startedPublication: ReturnType<typeof lifecycleTracked<Awaited<ReturnType<typeof ingestItem>>>> | null = null;
+    let reachedHoldA: Awaited<typeof holdA.reached> | null = null;
+    let whileBothOpen: { differsFromBefore: string[]; queue: string[]; staging: string[]; rootObservation: unknown } | null = null;
+    let observedOverlap: Awaited<ReturnType<typeof lifecycleObservedWaiters>> | null = null;
+    let clockBefore = "";
+    try {
+      const held = await lifecycleArrived(holdA.reached, preparerA, "the preparation");
+      reachedHoldA = held;
+
+      // ── THE PUBLICATION: the real `ingestItem`, on the ordinary client, for the legitimately
+      //    claimed pending work. Its backend is not known here; it is found by whom it waits behind. ──
+      clockBefore = await databaseClock();
+      const publishing = lifecycleTracked(restaged.publish(db()));
+      startedPublication = publishing;
+      // ── THE OVERLAP, read from PostgreSQL. ──
+      const overlap = await lifecycleObservedWaiters(held.pid, publishing.hasEnded, PUBLICATION_WAIT_BOUND_MS);
+      observedOverlap = overlap;
+      // The preparation has finished its work and the publication is blocked before its first
+      // transactional write: what differs now is what either has written so far. Read only when the
+      // wait was really observed; otherwise the case fails on that, below.
+      if (overlap.notObservedBecause === null) {
+        whileBothOpen = {
+          differsFromBefore: lifecycleTablesThatDiffer(before, await lifecycleSnapshot(teamId)),
+          queue: await lifecycleQueueRowsExactly(teamId), staging: await stagingRowsExactly(teamId), rootObservation: await rootObservation(f),
+        };
+      }
+    } finally {
+      holdA.release();
+      await preparerA.ended;
+      if (startedPublication) await startedPublication.ended;
+    }
+    if (reachedHoldA === null || startedPublication === null || observedOverlap === null) throw new Error("fixture: the case did not get as far as its overlap");
+    const heldA = reachedHoldA;
+    const observed = observedOverlap;
+    const clockAfter = await databaseClock();
+    const endedA = await preparerA.ended;
+    const endedPublication = await startedPublication.ended;
+
+    // FIXTURE: the hold was where it should be.
+    expect(heldA.provisional, `${label}: fixture: the preparation was held after it had returned already_pending`).toEqual({ outcome: "already_pending" });
+    // THE OVERLAP: the publication was blocked in PostgreSQL, by the preparation's backend, at the authority lock.
+    expect(observed.notObservedBecause, `${label}: barrier: the publication's wait behind the preparation was observed in PostgreSQL`).toBeNull();
+    expect(lifecycleWaitFacts(observed.waiters), `${label}: barrier: exactly one backend is blocked by the preparation's backend, at the namespace gate's row lock, waiting for a transaction it holds`)
+      .toEqual(lifecycleOneGateWaiter(expect.any(Number)));
+    expect(observed.waiters.map((waiter) => Number(waiter.pid) !== heldA.pid), `${label}: barrier: that backend is not the preparation's own`).toEqual([true]);
+    // WHILE BOTH WERE OPEN: the preparation had changed nothing. The one surface that differs is the
+    // project row the publication touches BEFORE it opens its transaction, and the queue row, the
+    // staging and the aged observation are exactly as staged.
+    expect(whileBothOpen, `${label}: while the preparation was held and the publication waited, nothing the preparation could write had changed`).toEqual({
+      differsFromBefore: ["projects"], queue: queueBefore, staging: stagingBefore, rootObservation: [agedObservedAt],
+    });
+
+    // THE PREPARATION COMMITTED already_pending; THE PUBLICATION then proceeded, unchanged.
+    expect(lifecycleShown(endedA), `${label}: the preparation commits already_pending`).toEqual({ state: "resolved", value: { outcome: "already_pending" } });
+    expect(endedPublication.state === "resolved" ? endedPublication.value : lifecycleShown(endedPublication), `${label}: the republication's status is unchanged, for the same item`)
+      .toMatchObject({ status: "unchanged", id: f.itemId });
+    expect(await lifecycleQueueAndStagingAnywhere(), `${label}: the publication acknowledged the queue row and removed the staging`).toEqual({ queue: [], staging: [] });
+    expect(await observationRefreshed(f, agedObservedAt, clockBefore, clockAfter, exactDue), `${label}: the root observation strictly advanced, to an instant between the two database clock readings`).toEqual(REFRESHED);
+    expect(await itemAndVersions(teamId), `${label}: the same item id and the same number of versions`).toEqual(itemBefore);
+    expect(await generations(teamId), `${label}: the data, identity and presentation generations are unchanged`).toEqual(generationsBefore);
+    expect(await ledgerSemantics(teamId), `${label}: every semantic ledger field, and last_seen_generation, is unchanged`).toEqual(ledgerBefore);
+    const differing = lifecycleTablesThatDiffer(before, await lifecycleSnapshot(teamId));
+    expect(differing.filter((table) => !A_REPUBLICATION_MAY_CHANGE.includes(table)), `${label}: no scoped surface that a republication does not write was changed by either party`).toEqual([]);
+    expect(A_REPUBLICATION_MUST_CHANGE.filter((table) => !differing.includes(table)), `${label}: the republication wrote the ledger and removed the queue row and the staging`).toEqual([]);
+  }, CASE_TIMEOUT_MS);
 });
