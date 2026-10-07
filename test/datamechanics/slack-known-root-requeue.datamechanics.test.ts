@@ -3848,3 +3848,282 @@ describe("KR-07 decision clock", () => {
     ]);
   });
 });
+
+/**
+ * KR-07 — FINITE observations at and beyond the upper arithmetic guard of the due read
+ * (`docs/design/slack-known-root-requeue-spec.md` §5.5, §11 KR-07).
+ *
+ * EVIDENCE, NOT RED, AND SUPPLEMENTARY: every case here is expected to pass on the current source.
+ * It closes no row of the mutation matrix. The due read does its date arithmetic only for an
+ * observation at or before 9999-12-31 00:00:00 UTC; a later one is answered `not_due` without being
+ * added to. These cases CHARACTERIZE that conservative cutoff as it is. They are not a claim about
+ * calendar support in general. Still not claimed: KR-07's JavaScript conversion boundaries, an
+ * unchanged publication refreshing the observation, and other clock variants.
+ *
+ * FOUR STORED OBSERVATIONS, all finite, all written out, all under the maximum interval of
+ * 86,400,000 ms:
+ *
+ *   ordinary     2024-07-01 12:34:56.123001   enqueued, at its literal due instant. The control: the
+ *                                             maximum interval does enqueue an overdue root.
+ *   boundary     9999-12-31 00:00:00.000000   exactly AT the guard. Added to, and not due.
+ *   above        9999-12-31 00:00:00.000001   one microsecond ABOVE the guard. Not added to; not due.
+ *   extreme      294276-12-31 00:00:00.000000 a finite instant PostgreSQL stores, whose sum with the
+ *                                             interval it CANNOT represent. Not added to; not due.
+ *
+ * NO EXTREME VALUE EVER BECOMES A JAVASCRIPT DATE. Every observation is written as text, cast by the
+ * database, and read back as the database's own text rendering.
+ *
+ * THE EXTREME CASE HAS TWO SEPARATE THINGS IN IT, which must not be confused.
+ *
+ *   The FIXTURE PROBE, on another connection and before any preparation, deliberately asks the
+ *   database for that observation plus the interval and requires the statement to FAIL with SQLSTATE
+ *   22008. Its error is caught there and nowhere else. It proves the hazard is real; if it does not
+ *   fail that way the case stops as a fixture failure, before any product verdict.
+ *
+ *   The DUE OBSERVER is a test-only wrapper of the preparation's own executor. It forwards every
+ *   statement unchanged; for the actual due read and for nothing else it counts the statement and,
+ *   if that statement is rejected, records the rejection's SQLSTATE and rethrows the same error. The
+ *   probe's 22008 cannot reach it. Outside the transaction, the preparation's end is formed into one
+ *   closed observation — the committed outcome or the classified failure, how many due reads were
+ *   issued, and the SQLSTATE of a rejected one — and that observation is asserted whole, under the
+ *   label "KR-07 FINITE: extreme finite observation commits not_due without arithmetic overflow".
+ *   A preparation that threw is therefore a failed assertion with its cause in it, never an
+ *   uncaught error.
+ *
+ * THE LATER CONTROLLED FALSIFIER, not made here: in the due read, both occurrences — and only those
+ * two — of `case when w.observed_at <= timestamptz '9999-12-31 00:00:00+00'` become `case when true`.
+ * Expected: this suite passes 4 of 4 before and after. Under the substitution ONLY the extreme case
+ * fails, at the labeled assertion, after the actual due read was rejected with 22008; the ordinary,
+ * boundary and above cases pass, because their sums are representable and in the future or the
+ * past as before. A setup, timeout or unrelated failure is inconclusive and not a kill.
+ *
+ * The named-table snapshot is not the whole of KR-13.
+ */
+describe("KR-07 finite upper observation bounds", () => {
+  const FINITE_LABEL = "KR-07 FINITE: extreme finite observation commits not_due without arithmetic overflow";
+  /** The maximum revisit interval the contract accepts. */
+  const REVISIT_MS = 86_400_000;
+  /** The KR-17 name of the due read: the one statement the observer watches. */
+  const DUE_STATEMENT = "preparation: due decision";
+
+  /** An instant as the DATABASE renders it: UTC, six fractional digits, as text. The expression is parenthesized as a whole. */
+  const utc = (expression: string): string => `to_char((${expression}) at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00'`;
+  /** The one root witness row of the fixture, as `w`, and no other ledger row. */
+  const ROOT_WITNESS = `w.team_id = $1 and w.workspace_id = $2 and w.channel_id = $3 and w.message_ts = $4 and w.root_ts = $4 and w.is_root and w.item_id = $5::uuid`;
+  const witnessOf = (f: Published): unknown[] => [f.seed.teamId, WORKSPACE, CHANNEL, OLD_ROOT, f.itemId];
+
+  /** The SQLSTATE an error carries, or a fixed token when it carries none. */
+  const sqlstateOf = (error: unknown): string => {
+    const code = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+    return typeof code === "string" ? code : "NO SQLSTATE";
+  };
+
+  /**
+   * The root witness as stored, all as the database renders it and none of it through a JavaScript
+   * Date: its observation as text; live; finite; its exact scope; how many of the team's ledger rows
+   * carry that same instant; and on which side of the guard's literal instant it lies.
+   */
+  const rootWitness = (f: Published): Promise<Row[]> => query(
+    `select ${utc("w.observed_at")} as observed_at_utc, w.deleted_at is null as live, isfinite(w.observed_at) as finite,
+            w.workspace_id, w.channel_id, w.message_ts, w.root_ts, w.is_root, w.item_id::text as item_id,
+            (select count(*)::int from slack_messages m where m.team_id = w.team_id and m.observed_at = w.observed_at) as rows_with_this_observation,
+            w.observed_at <= timestamptz '9999-12-31 00:00:00+00' as at_or_before_the_guard
+       from slack_messages w where ${ROOT_WITNESS}`, witnessOf(f)
+  );
+  const witnessAt = (f: Published, observedAt: string, atOrBeforeTheGuard: boolean) => [{
+    observed_at_utc: observedAt, live: true, finite: true,
+    workspace_id: WORKSPACE, channel_id: CHANNEL, message_ts: OLD_ROOT, root_ts: OLD_ROOT, is_root: true, item_id: f.itemId,
+    rows_with_this_observation: 1, at_or_before_the_guard: atOrBeforeTheGuard,
+  }];
+
+  /** Every row of the team in the named tables, exactly as the database renders it. Not the whole of KR-13. */
+  const SNAPSHOT_TABLES = [
+    "items", "slack_messages", "slack_sync_threads", "slack_thread_snapshots", "slack_sync_channels",
+    "slack_integration_bindings", "slack_channel_migration_gates", "integrations", "projects", "slack_team_state",
+  ];
+  async function snapshot(teamId: string): Promise<Record<string, string>> {
+    const scoped = (await query(
+      `select table_name from information_schema.columns
+        where table_schema = 'public' and column_name = 'team_id' and table_name = any($1::text[])
+        order by table_name`, [SNAPSHOT_TABLES]
+    )).map((row) => row.table_name as string);
+    for (const required of SNAPSHOT_TABLES) expect(scoped, `fixture: ${required} is snapshotted`).toContain(required);
+    const out: Record<string, string> = {};
+    for (const table of scoped) {
+      const [aggregate] = await query(
+        `select coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text), '[]'::jsonb)::text as rows from "${table}" t where t.team_id = $1`, [teamId]
+      );
+      out[table] = aggregate.rows as string;
+    }
+    const [versions] = await query(
+      `select coalesce(jsonb_agg(to_jsonb(v) order by to_jsonb(v)::text), '[]'::jsonb)::text as rows
+         from item_versions v join items i on i.id = v.item_id where i.team_id = $1`, [teamId]
+    );
+    out.item_versions = versions.rows as string;
+    return out;
+  }
+
+  /**
+   * One case's fixture: the real publication, checked to have acknowledged; then FIXTURE DML that
+   * sets the stored observation of the ONE root witness row and must change exactly one row, read
+   * back whole; then the real enumeration under the maximum interval, on its own completed transaction.
+   */
+  async function publishedObservedAt(observedAt: string, atOrBeforeTheGuard: boolean, label: string): Promise<{ f: Published; entry: SlackKnownRootEntry }> {
+    const f = await publishOldRoot();
+    const teamId = f.seed.teamId;
+    const afterPublication = await stored(teamId);
+    expect([afterPublication.allQueue, afterPublication.snapshots], `${label}: fixture: the real publication removed the queue row and the staging`).toEqual([[], 0]);
+
+    // FIXTURE DML: the observation is written as TEXT and cast by the database.
+    const changed = await (await rawSql()).query(
+      `update slack_messages w set observed_at = $6::timestamptz where ${ROOT_WITNESS}`, [...witnessOf(f), observedAt]
+    );
+    expect(changed.rowCount, `${label}: fixture: exactly one ledger row, the root witness, was changed`).toBe(1);
+    expect(await rootWitness(f), `${label}: fixture: the root witness stores exactly the literal observation — accepted, finite, live, in its exact scope — and no other ledger row carries it`)
+      .toEqual(witnessAt(f, observedAt, atOrBeforeTheGuard));
+
+    const channel = await channelRow(teamId, WORKSPACE, CHANNEL);
+    expect(channel?.binding_config_revision, `${label}: fixture: the channel row stores a configuration revision`).toMatch(/^[0-9a-f]{64}$/);
+    const pageExecution = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+    const page = await tx((s) => readSlackKnownRootItemPage(s, { teamId, pageSize: 100, revisitAfterMs: REVISIT_MS }, pageExecution));
+    expect(page, `${label}: fixture: enumeration returns exactly this root, located, under the maximum revisit interval`).toEqual({
+      entries: [{
+        teamId, itemId: f.itemId, revisitAfterMs: 86_400_000,
+        locator: {
+          workspaceId: WORKSPACE, channelId: CHANNEL, rootTs: OLD_ROOT, integrationId: f.integrationId,
+          bindingConfigRevision: channel?.binding_config_revision, namespaceRevision: f.namespaceRevision,
+        },
+      }],
+      nextCursor: null, exhausted: true, examined: 1,
+    });
+    return { f, entry: page.entries[0] };
+  }
+
+  /** Preparation on a transaction of its own, from the team and the enumerated entry ALONE. The result is the COMMITTED one. */
+  function prepared(teamId: string, entry: SlackKnownRootEntry): Promise<SlackKnownRootPreparationResult> {
+    // The ordinary bounded context, created BEFORE the transaction it is used in.
+    const execution = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+    return tx((s) => prepareSlackKnownRootRequeue(s, { teamId, entry }, execution));
+  }
+
+  /** Committed state after a `not_due`: nothing queued or staged anywhere, no named table changed, and the witness as it was. */
+  async function nothingMoved(f: Published, observedAt: string, atOrBeforeTheGuard: boolean, before: Record<string, string>, label: string): Promise<void> {
+    const teamId = f.seed.teamId;
+    expect(await query(`select 1 as pending from slack_sync_threads`), `${label}: no queue row, of this team or any other`).toEqual([]);
+    expect(await query(`select 1 as staged from slack_thread_snapshots`), `${label}: no staging, of this team or any other`).toEqual([]);
+    expect(await snapshot(teamId), `${label}: every named table, the queue included, is unchanged by the preparation`).toEqual(before);
+    expect(await rootWitness(f), `${label}: the root witness is unchanged by the preparation`).toEqual(witnessAt(f, observedAt, atOrBeforeTheGuard));
+  }
+
+  /** A guarded observation whose sum with the interval IS representable: asserted computable and in the future, then `not_due`. */
+  async function notDueAt(observedAt: string, atOrBeforeTheGuard: boolean, label: string): Promise<void> {
+    const { f, entry } = await publishedObservedAt(observedAt, atOrBeforeTheGuard, label);
+    const teamId = f.seed.teamId;
+    // FIXTURE EVIDENCE, not the product's decision: for THIS observation the sum can be computed, and it is in the future.
+    expect(await query(
+      `select (w.observed_at + ($6::bigint * interval '1 millisecond')) > clock_timestamp() as sum_is_computable_and_in_the_future
+         from slack_messages w where ${ROOT_WITNESS}`, [...witnessOf(f), REVISIT_MS]
+    ), `${label}: fixture: observation + 86,400,000 ms is representable, and in the future`).toEqual([{ sum_is_computable_and_in_the_future: true }]);
+
+    const before = await snapshot(teamId);
+    const result = await prepared(teamId, entry);
+
+    expect(result, `${label}: the committed outcome`).toEqual({ outcome: "not_due" });
+    await nothingMoved(f, observedAt, atOrBeforeTheGuard, before, label);
+  }
+
+  it("enqueues an ordinary overdue root under the maximum interval, at its literal due instant (control)", async () => {
+    const label = "ordinary overdue (control)";
+    const observedAt = "2024-07-01 12:34:56.123001+00";
+    const dueAt = "2024-07-02 12:34:56.124000+00";
+    const { f, entry } = await publishedObservedAt(observedAt, true, label);
+    const teamId = f.seed.teamId;
+    expect(await query(`select $1::timestamptz < clock_timestamp() as already_past`, [dueAt]), `${label}: fixture: the literal due instant is already past`).toEqual([{ already_past: true }]);
+
+    const before = await snapshot(teamId);
+    const result = await prepared(teamId, entry);
+
+    expect(result, `${label}: the committed outcome`).toEqual({ outcome: "enqueued" });
+    // The stored due instant, as text from the database, against the literal.
+    expect(await query(
+      `select workspace_id, channel_id, root_ts, status, attempts, ${utc("due_at")} as due_at_utc
+         from slack_sync_threads where team_id = $1 order by root_ts`, [teamId]
+    ), `${label}: exactly one queue row, in the root's exact scope, queued and never attempted, at the literal due instant`).toEqual([
+      { workspace_id: WORKSPACE, channel_id: CHANNEL, root_ts: OLD_ROOT, status: "queued", attempts: 0, due_at_utc: dueAt },
+    ]);
+    expect((await stored(teamId)).snapshots, `${label}: no staging`).toBe(0);
+    expect(await query(`select team_id::text as team_id, root_ts from slack_sync_threads`), `${label}: the only queue row in the database is this root's`).toEqual([
+      { team_id: teamId, root_ts: OLD_ROOT },
+    ]);
+    const after = await snapshot(teamId);
+    expect(after.slack_sync_threads, `${label}: the snapshot sees the queue row`).not.toBe(before.slack_sync_threads);
+    for (const table of Object.keys(before)) {
+      if (table !== "slack_sync_threads") expect(after[table], `${label}: ${table} is unchanged by the preparation`).toBe(before[table]);
+    }
+    expect(await rootWitness(f), `${label}: the root witness is unchanged by the preparation`).toEqual(witnessAt(f, observedAt, true));
+  });
+
+  it("is not due for an observation exactly at the arithmetic guard, 9999-12-31 00:00:00 UTC (boundary)", () =>
+    notDueAt("9999-12-31 00:00:00.000000+00", true, "exactly at the guard (boundary)"));
+
+  it("is not due for an observation one microsecond above the arithmetic guard (immediately above)", () =>
+    notDueAt("9999-12-31 00:00:00.000001+00", false, "one microsecond above the guard"));
+
+  it("commits not_due, with no arithmetic failure, for a finite observation whose due instant PostgreSQL cannot represent (extreme)", async () => {
+    const label = "extreme finite observation";
+    const observedAt = "294276-12-31 00:00:00.000000+00";
+    // The readback inside proves the database ACCEPTED the value and that it is finite, live and in scope.
+    const { f, entry } = await publishedObservedAt(observedAt, false, label);
+    const teamId = f.seed.teamId;
+
+    // THE FIXTURE PROBE, on another connection and before any preparation. It is MEANT to fail: the
+    // sum is outside PostgreSQL's timestamp range. Its error is caught here, for this precondition
+    // only, and it is not the product's statement.
+    const probed = await (await rawSql()).query(
+      `select (w.observed_at + ($6::bigint * interval '1 millisecond')) is not null as computed
+         from slack_messages w where ${ROOT_WITNESS}`, [...witnessOf(f), REVISIT_MS]
+    ).then((answered) => `NO ERROR (${answered.rowCount} row)`, (error: unknown) => sqlstateOf(error));
+    expect(probed, `${label}: fixture: observation + 86,400,000 ms is outside PostgreSQL's timestamp range (SQLSTATE 22008)`).toBe("22008");
+    expect(await rootWitness(f), `${label}: fixture: the probe changed nothing`).toEqual(witnessAt(f, observedAt, false));
+
+    const before = await snapshot(teamId);
+
+    // THE DUE OBSERVER: every statement forwarded unchanged; the actual due read counted, and its
+    // rejection's SQLSTATE recorded and rethrown.
+    const due = { issued: 0, rejectedWith: null as string | null };
+    const observingDue = (session: TransactionSession): TransactionSession => {
+      const executeSql: SqlExecutor = async <T = Record<string, unknown>>(text: string, params?: unknown[]) => {
+        if (kr17Named(text).name !== DUE_STATEMENT) return session.executeSql<T>(text, params);
+        due.issued += 1;
+        try {
+          return await session.executeSql<T>(text, params);
+        } catch (error) {
+          due.rejectedWith = sqlstateOf(error);
+          throw error;
+        }
+      };
+      return {
+        get db() {
+          return session.db;
+        },
+        executeSql,
+        optionalAudit<T>(operation: () => Promise<T>, fallback: T): Promise<T> {
+          return session.optionalAudit(operation, fallback);
+        },
+      };
+    };
+
+    // The ordinary bounded context, created BEFORE the transaction it is used in.
+    const execution = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+    // The preparation's END, whichever it is, as one closed observation formed OUTSIDE the transaction.
+    const ended = await tx((s) => prepareSlackKnownRootRequeue(observingDue(s), { teamId, entry }, execution)).then(
+      (committed) => ({ committed, failure: null }),
+      (error: unknown) => ({ committed: null, failure: classifySlackKnownRootPreparationFailure(error) })
+    );
+
+    expect({ ...ended, dueReadsIssued: due.issued, dueReadRejectedWithSqlstate: due.rejectedWith }, FINITE_LABEL).toEqual({
+      committed: { outcome: "not_due" }, failure: null, dueReadsIssued: 1, dueReadRejectedWithSqlstate: null,
+    });
+    await nothingMoved(f, observedAt, false, before, label);
+  });
+});
