@@ -16,6 +16,7 @@ import {
   type Disposal,
   type EvidenceClock,
   type PendingSignal,
+  type SessionEvidence,
   type TestSession,
   authorityLockName,
   barrierSessions,
@@ -89,7 +90,11 @@ import {
  *      acknowledge in time, each leave cleanup `unproven` for good — the marker on file, the run
  *      stopped, the signalled connection never handed back — whatever is read or answered afterwards;
  *   8. this file's OWN foreign sessions are scopes of the real run: a marker before each connects,
- *      removed only once its closing was acknowledged and that exact backend seen gone.
+ *      removed only once its closing was acknowledged and that exact backend seen gone;
+ *   9. a pool connection a STAGED test checks out itself is on the real run's sentinel from before
+ *      it is asked who it is: one whose answer is still pending, or was refused, leaves its test no
+ *      backend to look for — so the sentinel is then not cleared at all, until that connection has
+ *      said who it is, the monitor has seen that backend, and it was then SEEN gone within its bound.
  *
  * Everything is established from PostgreSQL evidence about exact, known backends. The "foreign"
  * sessions are plain clients this file opens and never registers with the harness as raced
@@ -286,18 +291,107 @@ function privateRun(root?: string, databaseUrl = "postgres://harness-self-test")
   return { root: ownRoot, runId, directory, safety: createRunSafety(directory) };
 }
 
+/** What a sentinel knows of one pool checkout its test made: who it SAID it is, and whether that backend was then SEEN. */
+interface StagedCheckout { identity: BackendIdentity | null; proven: boolean }
+
+interface Sentinel {
+  /** The name of its marker in the real run's safety state. */
+  scope: string;
+  /**
+   * Who a pool connection this test checked out is — recorded as CHECKED OUT first, synchronously,
+   * before it is asked. It has said who it is only once the session itself answered with a backend
+   * (its pid and when it started) AND the monitor saw exactly that backend; until then, and for good
+   * if the answer never comes, is rejected or is no identity, it is on the books as unidentified.
+   * Asked again, it starts over: only the latest question's answer counts, and it is to be seen again.
+   */
+  identify: (client: PoolClient) => Promise<BackendIdentity>;
+  /**
+   * Wait, within the default evidence bound, until every checkout's own backend is as `accept`
+   * says — and note each one that was. Rejects at once, having waited for nothing, if any checkout
+   * has not said who it is: there is no backend to read evidence about.
+   */
+  seen: (expected: string, accept: (sessions: SessionEvidence[]) => boolean) => Promise<void>;
+  /** Remove the marker — or THROW and leave it, while any checkout has not said who it is or has
+   * not since been `seen`. */
+  clear: () => void;
+}
+
 /**
  * A SENTINEL on the REAL run's safety state, for a test that stages real sessions the harness will
  * — by design — not clean up, under a private state the real run does not read. While the sentinel
  * is on file the real run refuses to truncate, so a test that times out or is interrupted with such
  * a session still alive cannot be truncated around. `clear()` removes that one marker and nothing
  * else; a test calls it only after it has SEEN its staged sessions gone.
+ *
+ * A POOL CONNECTION such a test checks out itself is on the sentinel's books from BEFORE it is
+ * asked who it is (`identify`), and what decides is those books — never what the test happens to
+ * know. A test learns its backend only from that answer; one still pending, rejected, or not an
+ * identity leaves it nothing to look for, and "nothing to look for" is not "nothing there". So
+ * while any checkout has not said who it is, `seen` rejects and `clear()` throws: the marker stays
+ * and the real run stops. The only way off the books is a POSITIVE IDENTITY — from the session
+ * itself, and that backend seen present by the monitor — and then the BOUNDED evidence wait about
+ * exactly that backend (`seen`). Asking again is allowed; nothing else stands in for an answer.
+ *
+ * `ask` is a SEAM for this file's own test of that (9): what a checkout is asked, in place of `whoIs`.
  */
-function stagedOnRealRun(what: string): { scope: string; clear: () => void } {
+function stagedOnRealRun(what: string, ask: (client: PoolClient) => Promise<BackendIdentity> = whoIs): Sentinel {
   const run = currentRunSafety();
   const scope = `sentinel-${randomUUID().slice(0, 8)}`;
   run.arm(scope, what);
-  return { scope, clear: () => run.disarm(scope) };
+  const checkouts = new Map<PoolClient, StagedCheckout>();
+  const unidentified = (): number => [...checkouts.values()].filter((checkout) => !checkout.identity).length;
+  return {
+    scope,
+    identify: (client) => {
+      // ON THE BOOKS FIRST — before the question is put, let alone answered — as one that has not
+      // said who it is and has not been seen. Asked again, it is that again, under an entry of its
+      // own: what an earlier question comes to, or an earlier wait saw, says nothing about this one.
+      const checkout: StagedCheckout = { identity: null, proven: false };
+      checkouts.set(client, checkout);
+      return (async () => {
+        const said: Partial<BackendIdentity> | undefined = await ask(client);
+        if (!said || typeof said.pid !== "number" || !Number.isInteger(said.pid) || typeof said.started !== "string" || !said.started) {
+          throw new Error(`a pool checkout under ${scope} (${what}) could not be identified: it answered ${JSON.stringify(said)}`);
+        }
+        const identity: BackendIdentity = { pid: said.pid, started: said.started };
+        // THE POSITIVE CONTROL: the monitor — the connection that will later look for it — sees
+        // exactly that backend now. One it never saw present is never taken to be gone.
+        const present = await sessionEvidence([identity.pid]);
+        if (present.length !== 1 || present[0].pid !== identity.pid) {
+          throw new Error(
+            `a pool checkout under ${scope} (${what}): the monitor must see exactly its backend ${identity.pid} `
+            + `(started ${identity.started}), and sees ${JSON.stringify(present)}`,
+          );
+        }
+        checkout.identity = identity;
+        return identity;
+      })();
+    },
+    seen: async (expected, accept) => {
+      if (unidentified() > 0) {
+        throw new Error(
+          `${unidentified()} pool checkout(s) under ${scope} (${what}) did not say who they are: `
+          + `nothing names a backend to read evidence about — expected ${expected}`,
+        );
+      }
+      for (const checkout of [...checkouts.values()]) {
+        const { identity } = checkout;
+        if (!identity) continue;
+        await untilSessions([identity.pid], expected, accept);
+        checkout.proven = true;
+      }
+    },
+    clear: () => {
+      const unseen = [...checkouts.values()].filter((checkout) => checkout.identity && !checkout.proven).length;
+      if (unidentified() > 0 || unseen > 0) {
+        throw new Error(
+          `the real run's ${scope} (${what}) is NOT cleared: of this test's own pool checkouts, ${unidentified()} did not say who `
+          + `they are and ${unseen} said so but were not then SEEN as its cleanup requires. Sessions that may still be there must not be truncated around.`,
+        );
+      }
+      run.disarm(scope);
+    },
+  };
 }
 
 /** Re-read until no session of this database is left under one exact `application_name`. */
@@ -821,7 +915,7 @@ describe("race harness (2, leases): a backend a signal is aimed at is not lent t
         first: async () => {
           const client = await pool.connect();
           try {
-            owner = await whoIs(client);
+            owner = await staged.identify(client);
             await client.query("begin");
             await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [lockName]);
             await proceed.opened;
@@ -933,13 +1027,12 @@ describe("race harness (2, leases): a backend a signal is aimed at is not lent t
       if (borrower && !borrowed) await borrower.promise.then((client) => client.release(), () => undefined);
       await barrier?.release().catch(() => undefined);
       // The sentinel comes off only when the barrier is SEEN gone and the raced operation's backend
-      // SEEN idle or gone. If either cannot be seen, this throws, the sentinel stays, and the real
-      // run stops.
+      // SEEN idle or gone — the backend its connection SAID it is: one that was checked out and
+      // never said leaves nothing to see. If any of that cannot be seen, this throws, the sentinel
+      // stays, and the real run stops.
       await untilBarrierGone(tag);
-      if (owner) {
-        await untilSessions([owner.pid], "the raced operation's backend idle or gone",
-          (sessions) => sessions.every((session) => session.state === "idle"));
-      }
+      await staged.seen("the raced operation's backend idle or gone",
+        (sessions) => sessions.every((session) => session.state === "idle"));
       staged.clear();
     }
   }, RACE_TEST_TIMEOUT_MS);
@@ -995,7 +1088,7 @@ describe("race harness (2, leases — a hand-over that threw): a release the poo
         first: async () => {
           const client = await pool.connect();
           held.push(client);
-          owners.push(await whoIs(client));
+          owners.push(await staged.identify(client));
           await client.query("begin");
           await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [lockName]);
           await client.query("rollback");
@@ -1076,15 +1169,14 @@ describe("race harness (2, leases — a hand-over that threw): a release the poo
       // another's — can meet it; the barrier is released (a no-op once the schedule has seen it
       // gone); and the connection the pool lost track of is retired from it by hand, so that no
       // later test inherits a pool one connection short. The sentinel comes off only when the
-      // barrier and that backend are both SEEN gone. If either cannot be seen, this throws, the
-      // sentinel stays, and the real run stops.
+      // barrier and that backend are both SEEN gone — the backend the connection SAID it is: one
+      // that was checked out and never said leaves nothing to see. If any of that cannot be seen,
+      // this throws, the sentinel stays, and the real run stops.
       pool.removeListener("release", throwOnce);
       await barrier?.release().catch(() => undefined);
       await untilBarrierGone(tag);
       for (const client of held) discardFromPool(client);
-      for (const owner of owners) {
-        await untilSessions([owner.pid], "the raced operation's backend gone", (sessions) => sessions.length === 0);
-      }
+      await staged.seen("the raced operation's backend gone", (sessions) => sessions.length === 0);
       staged.clear();
     }
   }, RACE_TEST_TIMEOUT_MS);
@@ -2131,7 +2223,7 @@ describe("race harness (7, signals): a signal PostgreSQL did not acknowledge in 
           const client = await pool.connect();
           held.push(client);
           try {
-            owners.push(await whoIs(client));
+            owners.push(await staged.identify(client));
             await client.query("begin");
             await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [lockName]);
             await proceed.opened;
@@ -2238,19 +2330,18 @@ describe("race harness (7, signals): a signal PostgreSQL did not acknowledge in 
     } finally {
       // ON EVERY EXIT: nothing stays held back and the raced operation may finish; the barrier is
       // released (a no-op once the schedule has seen it gone). The sentinel comes off only when the
-      // barrier is SEEN gone and the raced operation's backend SEEN idle or gone — and only then is
-      // the connection the harness stranded retired from the pool by hand, so that no later test
-      // inherits a pool one connection short. If either cannot be seen, this throws, the sentinel
-      // stays, and the real run stops.
+      // barrier is SEEN gone and the raced operation's backend SEEN idle or gone — the backend its
+      // connection SAID it is: one that was checked out and never said leaves nothing to see — and
+      // only then is the connection the harness stranded retired from the pool by hand, so that no
+      // later test inherits a pool one connection short. If any of that cannot be seen, this throws,
+      // the sentinel stays, and the real run stops.
       unhandled.stop();
       proceed.open();
       ack.resolve(undefined);
       await barrier?.release().catch(() => undefined);
       await untilBarrierGone(tag);
-      if (owners.length > 0) {
-        await untilSessions([owners[0].pid], "the raced operation's backend idle or gone",
-          (sessions) => sessions.every((session) => session.state === "idle"));
-      }
+      await staged.seen("the raced operation's backend idle or gone",
+        (sessions) => sessions.every((session) => session.state === "idle"));
       pool.removeListener("release", onRelease);
       for (const client of held) discardFromPool(client);
       staged.clear();
@@ -2434,6 +2525,121 @@ describe("race harness (8): a test's own foreign session is a scope of the run �
     // The sentinel took nothing else with it: the staged state is still stopped, its scope still on file.
     expect(safety.armed()).toEqual([`session-${name}`]);
     expect(safety.fatal()).toMatch(/could not be proven gone/);
+    expect(raceHarnessFatal()).toBeNull();
+  }, RACE_TEST_TIMEOUT_MS);
+});
+
+describe("race harness (9): a staged test's own pool checkout is on the real run's sentinel BEFORE it is asked who it is — one that never said is not cleared around, until it is identified and its backend SEEN gone (real Postgres)", () => {
+  /**
+   * The staged tests above put a real session on a pool connection of their own, and learn its
+   * backend only by asking it (`whoIs`). If that answer never comes — still pending, or rejected —
+   * the test has no backend to look for; and a cleanup that waits only on the backends its test
+   * knows of then waits on nothing and clears the real run's sentinel, with that session alive.
+   *
+   * The first answer is this test's own promise, settled by hand — left pending, then rejected —
+   * and nothing is timed. It is staged on the REAL run, because whether the real run's sentinel
+   * comes off is what is tested. It does, at the end, by the one way there is: the connection
+   * really says who it is, the monitor sees that backend, the connection is retired from the pool,
+   * and the backend is then SEEN gone.
+   */
+  it("`whoIs` is still PENDING, and then REJECTS, for an acquired client: its test knows no backend — and the sentinel is NOT cleared, the marker stays and the guard refuses; identified at last, it is still not cleared until that backend is SEEN gone", async () => {
+    const pool = getPool();
+    const run = currentRunSafety();
+    const stagedFailure = new Error("staged: the acquired client does not say who it is");
+    // What the checkout is asked the FIRST time, in place of `whoIs`: this test's promise. Asked
+    // again, it is really asked.
+    const answer = controlled<BackendIdentity>();
+    const asked = tally();
+    const ask = (client: PoolClient): Promise<BackendIdentity> => {
+      asked.note();
+      return asked.count() === 1 ? answer.promise : whoIs(client);
+    };
+    const gone = (sessions: SessionEvidence[]): boolean => sessions.length === 0;
+    expect(run.armed(), "nothing is in flight before it is staged").toEqual([]);
+    const staged = stagedOnRealRun("a pool checkout staged not to say who it is", ask);
+    // What a cleanup that goes by the sentinel's books comes to: the wait on its checkouts, and the clearing.
+    const refusals = async (): Promise<{ seen: unknown; clear: unknown }> => {
+      const seen = await staged.seen("the checkout's backend gone", gone).then(() => null, (error: unknown) => error);
+      try {
+        staged.clear();
+        return { seen, clear: null };
+      } catch (error) {
+        return { seen, clear: error };
+      }
+    };
+    let client: PoolClient | undefined;
+    let retired = false;
+    try {
+      // THE RACED OPERATION'S FIRST TWO STEPS, as the staged tests above write them: a pool
+      // connection, and who it is — all its test will ever know of its backend.
+      const owners: BackendIdentity[] = [];
+      client = await pool.connect();
+      const identified = inFlight(staged.identify(client).then((identity) => { owners.push(identity); }));
+      expect(asked.count(), "it was asked, once").toBe(1);
+      await turn();
+      expect(identified.state()).toBe("pending");
+
+      // THE ANSWER IS STILL PENDING. The test knows no backend: a cleanup that goes by what it
+      // knows has nothing to wait for. The sentinel does — and is not cleared.
+      expect(owners).toEqual([]);
+      const pending = await refusals();
+      expect(pending.seen).toBeInstanceOf(Error);
+      expect((pending.seen as Error).message).toMatch(/1 pool checkout\(s\) under sentinel-[a-f0-9]{8} .* did not say who they are/);
+      expect(pending.clear).toBeInstanceOf(Error);
+      expect((pending.clear as Error).message).toMatch(/is NOT cleared: of this test's own pool checkouts, 1 did not say who they are and 0 said so/);
+      expect(run.armed(), "the real run: the sentinel is still on file").toEqual([staged.scope]);
+      expect(() => assertRunSafe()).toThrow(/1 harness scope\(s\) still in flight/);
+
+      // THE ANSWER IS A REJECTION. The operation is told, as it would be; its test still knows no
+      // backend — and nothing has changed: no wait, no clearing, the marker on file, the guard refusing.
+      answer.reject(stagedFailure);
+      expect(await identified.promise.then(() => null, (error: unknown) => error)).toBe(stagedFailure);
+      expect(owners).toEqual([]);
+      const rejected = await refusals();
+      expect(rejected.seen).toBeInstanceOf(Error);
+      expect((rejected.seen as Error).message).toMatch(/1 pool checkout\(s\) under sentinel-[a-f0-9]{8} .* did not say who they are/);
+      expect(rejected.clear).toBeInstanceOf(Error);
+      expect((rejected.clear as Error).message).toMatch(/is NOT cleared: of this test's own pool checkouts, 1 did not say who they are and 0 said so/);
+      expect(asked.count(), "refusing asked it nothing more").toBe(1);
+      expect(run.armed()).toEqual([staged.scope]);
+      expect(() => assertRunSafe()).toThrow(/1 harness scope\(s\) still in flight/);
+
+      // AND RIGHTLY SO. THE POSITIVE IDENTITY, at last: really asked, the session says who it is,
+      // and the monitor sees exactly that backend. It was there all along, checked out and alive.
+      const owner = await staged.identify(client);
+      expect(asked.count()).toBe(2);
+      expect(await sessionEvidence([owner.pid])).toEqual([{ pid: owner.pid, state: "idle", waitingOn: null, locksHeld: 0 }]);
+      expect(poolInventoryOf(client)).toEqual({ known: true, idle: false });
+      // KNOWING WHO IT IS IS NOT HAVING SEEN IT GONE: the sentinel is still not cleared.
+      expect(() => staged.clear()).toThrow(/is NOT cleared: of this test's own pool checkouts, 0 did not say who they are and 1 said so but were not then SEEN/);
+      expect(run.armed()).toEqual([staged.scope]);
+      expect(() => assertRunSafe()).toThrow(/1 harness scope\(s\) still in flight/);
+
+      // THE BOUNDED ABSENCE: retired from the pool by hand, that backend is SEEN gone within the
+      // evidence bound — and only now may the sentinel come off (it does, below).
+      discardFromPool(client);
+      retired = true;
+      await staged.seen("the checkout's backend gone", gone);
+      expect(await sessionEvidence([owner.pid])).toEqual([]);
+      expect(run.armed(), "seen gone, and not yet cleared").toEqual([staged.scope]);
+      expect(raceHarnessFatal()).toBeNull();
+    } finally {
+      // ON EVERY EXIT the connection this test checked out is really asked who it is and retired
+      // from the pool by hand, so that no later test inherits it; and the real run's sentinel comes
+      // off only once that backend — named by the session, seen by the monitor — is SEEN gone. If
+      // it cannot be identified, or cannot be seen gone, this throws, the sentinel stays, and the
+      // real run stops.
+      if (client && !retired) {
+        await staged.identify(client);
+        discardFromPool(client);
+      }
+      await staged.seen("the checkout's backend gone", gone);
+      staged.clear();
+    }
+    // Cleared, by its own proof: the real run is clean and was never stopped.
+    expect(run.armed()).toEqual([]);
+    expect(run.blocked()).toBeNull();
+    expect(() => assertRunSafe()).not.toThrow();
     expect(raceHarnessFatal()).toBeNull();
   }, RACE_TEST_TIMEOUT_MS);
 });
