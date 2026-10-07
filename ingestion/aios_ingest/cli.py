@@ -187,7 +187,15 @@ def scan(repo_path, slug, full_name, window_days, backfill, rubric_path) -> None
 @click.option("--poll-interval", default=300, type=int, help="seconds between polls")
 @click.option("--renewal-interval", default=1800, type=int, help="seconds between authorized Drive watch-channel sweeps")
 @click.option("--state-db", default="aios_ingest_state.sqlite", help="sqlite path for cursors/channels")
-def schedule(config_path, poll_interval, renewal_interval, state_db) -> None:
+@click.option(
+    "--use-brain-selections/--no-use-brain-selections",
+    "use_brain_selections",
+    default=False,
+    help="also schedule Admin-created OAuth Google Drive integrations (and consume their "
+    "Run now/Retry requests) without a local connection entry. Also enabled by "
+    "AIOS_BRAIN_SELECTIONS=1.",
+)
+def schedule(config_path, poll_interval, renewal_interval, state_db, use_brain_selections) -> None:
     """Run the background scheduler: poll every configured connection on an interval.
 
     Drive connections with a ``webhook_url`` create and renew channels through the same fenced
@@ -205,7 +213,8 @@ def schedule(config_path, poll_interval, renewal_interval, state_db) -> None:
         conn.source == "gdrive" and conn.options.get("webhook_url") for conn in conns
     ) else None
     run_scheduler(settings, conns, state=state, poll_interval=poll_interval,
-                  renewal_interval=renewal_interval, watch_manager=watch_manager)
+                  renewal_interval=renewal_interval, watch_manager=watch_manager,
+                  bootstrap_remote_gdrive=_selections_enabled(use_brain_selections))
 
 
 if __name__ == "__main__":

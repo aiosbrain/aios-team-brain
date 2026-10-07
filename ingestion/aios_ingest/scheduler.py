@@ -9,6 +9,7 @@ unit-tested; the actual Drive API call lives behind a pluggable WatchManager.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Protocol
@@ -19,7 +20,9 @@ from .config import BrainSettings, Connection
 from .engine import run_connection
 from .state import Channel, StateStore, StreamKey
 from .gdrive_sync import credential_identity, run_gdrive_stream
-from .selections import effective_gdrive_connection
+from .selections import effective_gdrive_connection, merge_selections
+
+log = logging.getLogger(__name__)
 
 # Renew a watch channel this many seconds before its stated expiry.
 _RENEWAL_SKEW = 600
@@ -63,9 +66,14 @@ def build_scheduler(
     poll_interval: int = 300,
     renewal_interval: int = 1800,
     watch_manager: WatchManager | None = None,
+    bootstrap_remote_gdrive: bool = False,
 ) -> AsyncIOScheduler:
     """Register a poll job per connection (+ a renewal sweep if a WatchManager is given).
-    Does not start the scheduler — caller starts it (see :func:`run`)."""
+    Does not start the scheduler — caller starts it (see :func:`run`).
+
+    ``bootstrap_remote_gdrive`` serves Admin-created OAuth Drive integrations that have no entry
+    in the local connection list: their scheduled poll and their Run now/Retry queue are registered
+    even when ``connections`` names no Drive connection at all."""
     sched = AsyncIOScheduler(timezone="UTC")
 
     for conn in connections:
@@ -79,12 +87,23 @@ def build_scheduler(
             coalesce=True,
         )
 
-    if any(conn.source == "gdrive" for conn in connections):
+    if bootstrap_remote_gdrive or any(conn.source == "gdrive" for conn in connections):
         sched.add_job(
             _manual_gdrive_job,
             "interval",
             seconds=min(15, max(5, poll_interval)),
             id="gdrive-manual-queue",
+            args=[settings, connections, state],
+            max_instances=1,
+            coalesce=True,
+        )
+
+    if bootstrap_remote_gdrive:
+        sched.add_job(
+            _remote_gdrive_poll_job,
+            "interval",
+            seconds=poll_interval,
+            id="gdrive-remote-poll",
             args=[settings, connections, state],
             max_instances=1,
             coalesce=True,
@@ -124,6 +143,33 @@ async def _poll_job(settings: BrainSettings, conn: Connection, state: StateStore
     # Advance the cursor only after a successful run, so a failure re-polls next time.
     if summary.failed == 0:
         state.set_cursor(conn.name, started)
+
+
+async def _remote_gdrive_poll_job(
+    settings: BrainSettings, connections: list[Connection], state: StateStore,
+) -> None:
+    """Poll the Admin-created OAuth Drive integrations that have no local connection entry.
+
+    Admin state is re-read on every sweep, so an integration connected, paused or disconnected
+    after the scheduler started is honored without a restart; a selection read failure raises and
+    nothing runs. Which rows are runnable is decided by ``merge_selections`` alone (enabled OAuth
+    only — a service-account row still needs its local credential entry), and a name that is
+    configured locally stays with that connection's own ``poll:<name>`` job.
+    """
+    from .brain_client import BrainClient
+    async with BrainClient(settings.base_url, settings.api_key, settings.team) as client:
+        remote = await client.fetch_integration_selections(include_disabled=True)
+    configured = {conn.name for conn in connections if conn.source == "gdrive"}
+    unconfigured = [
+        row for row in remote
+        if row.get("type") == "gdrive" and row.get("name") not in configured
+    ]
+    for conn in merge_selections([], unconfigured):
+        try:
+            await _poll_job(settings, conn, state)
+        except Exception as exc:
+            # One integration's failure must not starve the ones after it; the next sweep retries.
+            log.warning("remote Drive poll for %s failed: %s", conn.name, type(exc).__name__)
 
 
 async def _manual_gdrive_job(
@@ -291,6 +337,7 @@ def run(
     poll_interval: int = 300,
     renewal_interval: int = 1800,
     watch_manager: WatchManager | None = None,
+    bootstrap_remote_gdrive: bool = False,
 ) -> None:
     """Build, start, and serve the scheduler until interrupted."""
     sched = build_scheduler(
@@ -300,6 +347,7 @@ def run(
         poll_interval=poll_interval,
         renewal_interval=renewal_interval,
         watch_manager=watch_manager,
+        bootstrap_remote_gdrive=bootstrap_remote_gdrive,
     )
 
     async def _serve() -> None:

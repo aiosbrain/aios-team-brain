@@ -3,7 +3,7 @@ import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
 import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
-import { recentEventsWithStatus } from "@/lib/graph/learning";
+import { recentEventsWithStatus, type GraphEvent } from "@/lib/graph/learning";
 import { resolveHumanActorsByItem } from "@/lib/graph/human-actors";
 import { attributeEventParticipants } from "@/lib/graph/arc-attribution";
 import { authorizationEpoch } from "@/lib/access/authorization-epoch";
@@ -91,7 +91,7 @@ export async function GET(req: NextRequest) {
     console.error(`[events] partition resolution failed for team ${teamSlug}:`, e);
     return Response.json({ events: [], as_of: new Date().toISOString(), degraded: true });
   }
-  let events: Awaited<ReturnType<typeof recentEventsWithStatus>>["events"] = [];
+  let attributed: Omit<GraphEvent, "factEvidence">[] = [];
   try {
     let settled = false;
     for (let attempt = 0; attempt < 2 && !settled; attempt += 1) {
@@ -103,9 +103,8 @@ export async function GET(req: NextRequest) {
       const authorizedFacts = await readAuthorizedGraphFacts(admin, {
         teamId: team.id, groupIds: groups, sinceISO: since, limit: LIMIT * 20,
       });
-      if (await authorizationEpoch(admin, team.id) !== epoch) continue;
       const authorizedFactIds = new Set(authorizedFacts.map((fact) => fact.id));
-      events = graph.events.flatMap((event) => {
+      const events = graph.events.flatMap((event) => {
         // Titles and participants are episode-derived prose too: the event's canonical item must
         // remain visible. Facts additionally require their complete relationship dependency set.
         if (!event.itemId || !visible.ids.has(event.itemId)) return [];
@@ -115,6 +114,17 @@ export async function GET(req: NextRequest) {
         const { factEvidence: _privateEvidence, ...wire } = event;
         return [{ ...wire, facts, factCount: facts.length }];
       });
+      // Tag any recognized AI-agent participant name with the human behind that event's item, or
+      // "(unattributed AI agent)" when none resolves — same attribution as narrative arcs (Layer 3);
+      // see docs/design/brain-learning-panel.md. Attribution is one more await, so it belongs to
+      // this attempt: a revocation that lands while it runs must invalidate the whole candidate.
+      const itemIds = [...new Set(events.map((e) => e.itemId).filter((id): id is string => !!id))];
+      const humanByItem = await resolveHumanActorsByItem(admin, team.id, itemIds);
+      const candidate = attributeEventParticipants(events, humanByItem);
+      // The LAST await before publication. Nothing asynchronous may follow this check, or the
+      // candidate built above could be served across a revocation it never observed.
+      if (await authorizationEpoch(admin, team.id) !== epoch) continue;
+      attributed = candidate;
       settled = true;
     }
     if (!settled) throw new GraphProvenanceUnavailableError("event authorization changed repeatedly");
@@ -124,13 +134,6 @@ export async function GET(req: NextRequest) {
     }
     throw error;
   }
-
-  // Tag any recognized AI-agent participant name with the human behind that event's item, or
-  // "(unattributed AI agent)" when none resolves — same attribution as narrative arcs (Layer 3);
-  // see docs/design/brain-learning-panel.md.
-  const itemIds = [...new Set(events.map((e) => e.itemId).filter((id): id is string => !!id))];
-  const humanByItem = await resolveHumanActorsByItem(admin, team.id, itemIds);
-  const attributed = attributeEventParticipants(events, humanByItem);
 
   // `degraded` on EVERY branch (additive): a field that appears only on the failure path is a
   // branch-dependent wire shape, and it leaves a genuinely quiet week indistinguishable from a

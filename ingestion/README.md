@@ -143,7 +143,10 @@ selection/generation. All Drive invocations, including legacy service-account co
 now migrate through this coordinator and therefore require that Admin row plus explicit connector-key
 provisioning; local service-account credentials remain local. OAuth integrations require no matching
 local connection: enabling brain selections bootstraps them from the non-secret Admin row and obtains
-credentials through the broker.
+credentials through the broker. Under `schedule`, `--use-brain-selections` (or
+`AIOS_BRAIN_SELECTIONS=1`) re-reads the Admin rows on every poll interval, so an OAuth integration
+created after the scheduler started is polled, and its **Run now**/**Retry** requests are consumed,
+without a restart or a local entry. A name that is configured locally stays with that connection.
 Create the Admin row with `authMode=service_account`; its status remains pending until the matching
 sidecar performs a real provider identity call under the current execution fence. The brain then
 stores only the verified non-secret service-account email. Admin never accepts the JSON key, and a
