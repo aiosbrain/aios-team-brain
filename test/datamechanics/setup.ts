@@ -1,5 +1,6 @@
 import { afterAll, beforeEach } from "vitest";
 import { Client } from "pg";
+import { assertRunNotFatal, noteTruncationHook } from "./run-fatal-latch";
 
 // Per-test isolation against the shared test Postgres: truncate all data tables
 // before each test. One dedicated connection (separate from the app's pool) so
@@ -65,6 +66,13 @@ async function ensureConnected(): Promise<void> {
 }
 
 beforeEach(async () => {
+  // FIRST — before this hook connects or truncates anything. A test that could not prove its
+  // database sessions idle has stopped the run (`run-fatal-latch`): truncating now would block on,
+  // or clean up around, work that may still be in flight. This hook is registered by the setup
+  // file, so it runs before any test file's own `beforeEach`; the refusal is therefore earlier than
+  // every later test's cleanup, in this worker and in the workers of every later file.
+  assertRunNotFatal();
+  noteTruncationHook();
   await ensureConnected();
   // Only truncate tables that exist (schema may evolve); RESTART IDENTITY + CASCADE.
   const { rows } = await client.query<{ tablename: string }>(
