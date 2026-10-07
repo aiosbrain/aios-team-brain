@@ -957,8 +957,9 @@ interface Lease {
   fate: LeaseFate;
   /** The operation's own release request, made when it could not be carried out as asked: its argument. */
   requested: { error: unknown } | null;
-  /** The pool has been given the client back — to keep or to destroy. Never twice for one checkout. */
-  disposed: boolean;
+  /** The pool has been ASKED to take the client back — to keep or to destroy. Never twice for one
+   * checkout. That it was asked is not that it did: a hand-over that threw is `undisposed`. */
+  surrendered: boolean;
   /** Give the client to the pool: the pool's own `release` of this checkout. */
   surrender: (error?: unknown) => unknown;
   /** Listen for the client's `error` event while a signal is aimed at it. A checked-out client is
@@ -981,7 +982,9 @@ interface RacedSessions {
   /** Checkouts whose backend PID could not be read, or whose release could not be intercepted. Any
    * makes ownership unprovable. */
   unidentified: number;
-  /** Checkouts the pool did not take back when the harness retired them. Any makes cleanup unprovable. */
+  /** Checkouts whose hand-over to the pool THREW — the operation's own ordinary release, or the
+   * harness's retirement of a signalled one. Where such a connection is cannot be told. Never
+   * decremented: any makes cleanup unprovable, for good. */
   undisposed: number;
   /** Its promise has resolved or rejected. */
   settled: boolean;
@@ -990,12 +993,33 @@ interface RacedSessions {
 /** What the pool itself says to a second release of one checkout. */
 const DOUBLE_RELEASE = "Release called on client which has already been released to the pool.";
 
-/** Carry a release out: the lease leaves its operation's books, and the pool is given the client. */
+/**
+ * Carry a release out: the lease leaves its operation's books, and the pool is ASKED to take the
+ * client — on every path, an ordinary release as much as a retirement.
+ *
+ * The lease is struck off BEFORE the pool is called, and has to be: inside its `release` the pool
+ * may already lend that very connection on — to this same operation, even — and a lease still on
+ * the books then would make the new checkout unidentifiable.
+ *
+ * BEING ASKED IS NOT HAVING TAKEN IT. The pool's `release` can throw part-way: an application's own
+ * `release` listener runs before the pool has either kept the connection or destroyed it, and a
+ * queued borrower's callback runs after it has already been lent on. Then nothing says where the
+ * connection is — still out, or a stranger's. So a hand-over that throws is COUNTED (`undisposed`),
+ * for good: no cleanup of this operation is proven after it, its scope's marker stays and the run
+ * is stopped. The lease does not come back onto the books — a backend that may be someone else's
+ * is not one to read lock waits for, or to aim a signal at — and the error goes on to whoever
+ * asked, as it would without this harness.
+ */
 function surrenderLease(sessions: RacedSessions, lease: Lease, error: unknown): unknown {
-  lease.disposed = true;
+  lease.surrendered = true;
   sessions.leases.delete(lease.pid);
   lease.unguard();
-  return lease.surrender(error);
+  try {
+    return lease.surrender(error);
+  } catch (failure) {
+    sessions.undisposed += 1;
+    throw failure;
+  }
 }
 
 /**
@@ -1004,13 +1028,13 @@ function surrenderLease(sessions: RacedSessions, lease: Lease, error: unknown): 
  * told to destroy a connection instead of keeping it. Any other lease is left exactly as it is.
  */
 function retireLease(sessions: RacedSessions, lease: Lease): void {
-  if (lease.disposed || lease.fate !== "condemned" || !lease.requested) return;
+  if (lease.surrendered || lease.fate !== "condemned" || !lease.requested) return;
   try {
     surrenderLease(sessions, lease, lease.requested.error
       || new RaceHarnessError(`backend ${lease.pid} was signalled by the identity race harness: its connection is retired, not pooled`));
   } catch {
-    // The pool did not take it: nothing says where that connection is now.
-    sessions.undisposed += 1;
+    // The pool did not take it, and `surrenderLease` has counted that. There is nobody to tell:
+    // the operation's own release returned long ago.
   }
 }
 
@@ -1068,7 +1092,7 @@ function instrumentPool(): void {
       pid,
       fate: "returnable",
       requested: null,
-      disposed: false,
+      surrendered: false,
       surrender: (error) => release.call(client, error),
       guard: () => {
         if (guarded || typeof held.on !== "function") return;
@@ -1084,8 +1108,9 @@ function instrumentPool(): void {
     sessions.seen.add(pid);
     held.release = (error?: unknown) => {
       // A SECOND release of one checkout: the pool's own refusal, as without this harness — and
-      // never a second hand-over, nor a different argument for the first.
-      if (lease.disposed) return release.call(client, error);
+      // never a second hand-over, nor a different argument for the first. (Also after a hand-over
+      // that threw: the pool counts that checkout as released once, whatever became of it.)
+      if (lease.surrendered) return release.call(client, error);
       if (lease.requested) throw new Error(DOUBLE_RELEASE);
       if (lease.fate === "returnable") return surrenderLease(sessions, lease, error);
       // A signal is, or was, aimed at this backend. The request stands, with its argument; it is
@@ -1265,7 +1290,9 @@ export interface CleanupSeam {
  * operation asks, until PostgreSQL has executed the signal; it is then retired, not pooled
  * (`LeaseFate`). No outcome but `unproven` is reported while any lease is outstanding: `quiet`,
  * `cancelled` and `terminated` all mean every checkout was given back to the pool — returned by its
- * operation, or retired here — and every backend was then SEEN idle or gone.
+ * operation, or retired here — and every backend was then SEEN idle or gone. Nor once any
+ * hand-over to the pool has THROWN, on either path (`surrenderLease`): that connection is no
+ * longer on any operation's books, so no round signals it, and no round can prove anything.
  *
  * EACH ROUND HAS A DEADLINE OF ITS OWN, AND MEETS IT OR DOES NOT. The operations must have settled
  * before the round's `cleanupMs` has passed on the clock (`withinBound`): settling at or after it —
