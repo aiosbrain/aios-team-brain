@@ -178,9 +178,11 @@ const SLACK_PROJECT_SQL = `
 
 // The live root witness (§5.3): this exact root message, in this exact scope, bound to this item,
 // not deleted, with a finite observation — and one that can be an observation at all. A stored
-// instant before the Unix epoch was never written by a clock: the year 1, or a date before the
-// common era, is corrupt data. It is no witness, exactly as a non-finite one is none. Left in, its
-// due instant would be "overdue" by millennia and would sort ahead of every real root in a queue
+// instant AT or before the Unix epoch was never written by a clock: the year 1, a date before the
+// common era, and zero itself are corrupt data. The bound is strict for the same reason the exact
+// Slack timestamp parser refuses epoch seconds of zero or less: zero is the absence of a time, not
+// a time. Such a row is no witness, exactly as a non-finite one is none. Left in, its due instant
+// would be "overdue" by decades or millennia and would sort ahead of every real root in a queue
 // that is claimed in due order. The check is made HERE, in the database and before anything is
 // derived, so no such value is ever added to, converted or handed to the enqueue helper, and no
 // error can come to quote it.
@@ -188,7 +190,7 @@ const WITNESS_PREDICATE = `
        w.team_id = $1::uuid and w.workspace_id = $2 and w.channel_id = $3
    and w.message_ts = $4 and w.root_ts = $4 and w.is_root = true
    and w.item_id = $5::uuid and w.deleted_at is null and isfinite(w.observed_at)
-   and w.observed_at >= timestamptz '1970-01-01 00:00:00+00'`;
+   and w.observed_at > timestamptz '1970-01-01 00:00:00+00'`;
 
 const WITNESS_SQL = `
   select 1 as witnessed
@@ -355,6 +357,10 @@ async function prepareLocated(
       !isStoredTimestamp(item.ts) || !isStoredTimestamp(item.thread_ts)) {
     return unattested("invalid_metadata");
   }
+  // The path is bounded the same way: the projection returns NULL for one past 2,048 bytes. That is
+  // an oversized stored value, not a different canonical path, so it is `invalid_metadata` too. A
+  // path of exactly 2,048 bytes, or any other in-bound path, is returned and compared below.
+  if (typeof item.path !== "string") return unattested("invalid_metadata");
   if (typeof slackProjectId !== "string" || item.project_id !== slackProjectId ||
       item.kind !== "transcript" || item.access !== "team" || item.path !== scopedPath ||
       item.workspace_id !== workspaceId || item.channel_id !== channelId ||

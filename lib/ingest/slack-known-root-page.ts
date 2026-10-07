@@ -147,10 +147,12 @@ function invalidRequest(): never {
 }
 
 /**
- * The contexts this module issued. Only one of these is ever admitted: an object that merely has the
- * same fields was validated by nobody.
+ * The contexts this module issued, each with the clock reading it was created at. Only one of these
+ * is ever admitted: an object that merely has the same fields was validated by nobody. The creation
+ * reading is kept HERE and not on the context, so it is not a field a caller can read, copy onto a
+ * look-alike or change.
  */
-const issuedExecutions = new WeakSet<object>();
+const issuedExecutions = new WeakMap<object, number>();
 
 /** The most by which `reading + allowance - reading` may differ from the allowance: one microsecond. */
 const DEADLINE_ARITHMETIC_TOLERANCE_MS = 0.001;
@@ -238,7 +240,7 @@ export function createSlackKnownRootExecution(options: SlackKnownRootExecutionOp
   const deadlineAt = ambientDeadlineAt === null ? operationDeadlineAt : Math.min(operationDeadlineAt, ambientDeadlineAt);
 
   const execution: SlackKnownRootExecution = Object.freeze({ allowanceMs, deadlineAt, monotonicNow });
-  issuedExecutions.add(execution);
+  issuedExecutions.set(execution, createdAt);
   return execution;
 }
 
@@ -260,9 +262,18 @@ export function createSlackKnownRootExecution(options: SlackKnownRootExecutionOp
  * changes nothing.
  */
 export function admitSlackKnownRootExecution(execution: unknown): number {
-  if (typeof execution !== "object" || execution === null || !issuedExecutions.has(execution)) return invalidRequest();
+  if (typeof execution !== "object" || execution === null) return invalidRequest();
+  const createdAt = issuedExecutions.get(execution);
+  if (createdAt === undefined) return invalidRequest();
   const context = execution as SlackKnownRootExecution;
-  const remainingMs = Math.floor(context.deadlineAt - readMonotonicClock(context.monotonicNow));
+  const now = readMonotonicClock(context.monotonicNow);
+  // A monotonic clock never reads earlier than it did when the context was created. One that does
+  // is broken, and under it the time that remains is unknowable: the deadline minus such a reading
+  // makes ANY deadline look comfortably ahead — one that had already passed at creation, or an
+  // ambient deadline tighter than the allowance. It is refused here, with the same static error as
+  // any other clock that misreports, before the session is touched or a statement issued.
+  if (now < createdAt) return invalidRequest();
+  const remainingMs = Math.floor(context.deadlineAt - now);
   if (!(remainingMs >= 1)) throw new SlackKnownRootDeadlineError();
   return Math.min(remainingMs, context.allowanceMs, MAX_TIMEOUT_MS);
 }
