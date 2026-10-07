@@ -515,6 +515,62 @@ describe("a published root whose stored facts were corrupted after enumeration (
     expect((await stored(f.seed.teamId)).queue).toHaveLength(1);
   });
 
+  // EXPECTED RED at checkpoint b075dfba (affected-fix review). The item lock projects `path` through
+  // the same 2,048-byte bound §6 states for paths, and returns NULL for a longer one — but the result
+  // is then only COMPARED with the canonical path, so an over-bound path is reported as a mismatch.
+  // §6: "Oversized stored values are `invalid_metadata`". A path past its bound is not a different
+  // canonical path; it is a stored value this primitive refuses to read at all.
+  it("reports a locked item whose stored path is past its 2,048-byte bound as invalid_metadata, and a different in-bound path as a mismatch", async () => {
+    const f = await publishOldRoot();
+    await ageObservation(f.seed.teamId);
+    const entry = await locatedEntryOf(f);
+    const canonicalPath = scopedSlackItemPath(WORKSPACE, CHANNEL, OLD_ROOT);
+    const storedPath = async (): Promise<{ path: string; bytes: number }> =>
+      (await query<{ path: string; bytes: number }>(`select path, octet_length(path)::int as bytes from items where id = $1`, [f.itemId]))[0];
+    expect(await storedPath(), "fixture: the published item is at its canonical path").toEqual({
+      path: canonicalPath, bytes: Buffer.byteLength(canonicalPath, "utf8"),
+    });
+    /** A path under the same scoped prefix, of exactly `bytes` bytes of ASCII, ending in `.md`. */
+    const pathOf = (bytes: number): string => {
+      const prefix = canonicalPath.slice(0, canonicalPath.lastIndexOf("/") + 1);
+      return `${prefix}${"p".repeat(bytes - prefix.length - 3)}.md`;
+    };
+    const setPath = async (path: string): Promise<void> => {
+      const changed = await (await rawSql()).query(`update items set path = $2 where id = $1`, [f.itemId, path]);
+      expect(changed.rowCount, "fixture: the path was stored").toBe(1);
+      expect(await storedPath(), "fixture: the path reads back, byte for byte").toEqual({ path, bytes: Buffer.byteLength(path, "utf8") });
+    };
+
+    // One byte past the bound.
+    const overBound = pathOf(2_049);
+    expect(Buffer.byteLength(overBound, "utf8")).toBe(2_049);
+    await setPath(overBound);
+    expect.soft(await prepare(f, entry), "a 2,049-byte path").toEqual({ outcome: "unattested", reason: "invalid_metadata" });
+    expect((await stored(f.seed.teamId)).queue, "a 2,049-byte path: nothing was enqueued").toEqual([]);
+    await setPath(canonicalPath);
+
+    // CONTROLS (expected green). Exactly AT the bound, and comfortably inside it: a well-formed
+    // stored path that simply is not the canonical one is a mismatch, not invalid metadata.
+    const atBound = pathOf(2_048);
+    expect(Buffer.byteLength(atBound, "utf8")).toBe(2_048);
+    const controls: [string, string][] = [
+      ["a different path of exactly 2,048 bytes", atBound],
+      ["an in-bound path that is not the canonical one", `${canonicalPath.slice(0, -3)}.moved.md`],
+      ["an in-bound path outside the Slack namespace", `notes/known-root-${OLD_ROOT}.md`],
+    ];
+    for (const [label, path] of controls) {
+      await setPath(path);
+      expect(await prepare(f, entry), label).toEqual({ outcome: "unattested", reason: "canonical_mismatch" });
+      expect((await stored(f.seed.teamId)).queue, `${label}: nothing was enqueued`).toEqual([]);
+      await setPath(canonicalPath);
+    }
+
+    // With the canonical path back, the very same entry prepares: nothing above was refused for a
+    // reason other than the path that was stored.
+    expect(await prepare(f, entry)).toEqual({ outcome: "enqueued" });
+    expect((await stored(f.seed.teamId)).queue).toHaveLength(1);
+  });
+
   // EXPECTED RED at the source-reviewed checkpoint: the due instant is the stored observation plus
   // the revisit interval, so an observation in the year 1, or before the common era, is "due" by
   // two thousand years — and the row is enqueued with that instant as its due_at. The queue is
@@ -659,5 +715,75 @@ describe("a published root whose stored facts were corrupted after enumeration (
     }
     // The identity check: both instants, both teams, one outcome.
     expect(outcomes[1].shape, "the two corrupt observations are refused identically").toEqual(outcomes[0].shape);
+  });
+
+  // EXPECTED RED at checkpoint b075dfba (affected-fix review). The lower bound that keeps ancient
+  // observations out admits the Unix epoch itself: an observation at exactly 1970-01-01T00:00:00Z
+  // passes, and its root is enqueued with a due instant one revisit interval after the epoch — still
+  // decades ahead of every real root in a queue that is claimed in due order. Zero is not an
+  // observation either. The codebase's own exact parser already says so for Slack instants: epoch
+  // seconds of zero or less are not a real message time, and are refused rather than planted in
+  // 1970. An observation at the epoch must fail closed in exactly the way the year 0001 does — the
+  // same closed outcome, no new reason — with nothing enqueued and nothing of the input repeated.
+  it("fails closed on a root witness observed at exactly the Unix epoch, identically to an ancient one", async () => {
+    const outcomes: { observedAt: string; queue: Row[]; early: number; shape: Record<string, unknown>; text: string }[] = [];
+    for (const observedAt of ["1970-01-01 00:00:00+00", "0001-01-01 00:00:00+00"]) {
+      const f = await publishOldRoot();
+      const entry = await locatedEntryOf(f);
+      const changed = await (await rawSql()).query(
+        `update slack_messages set observed_at = $2::timestamptz where team_id = $1 and is_root and message_ts = $3`,
+        [f.seed.teamId, observedAt, OLD_ROOT]
+      );
+      expect(changed.rowCount, `fixture: the witness of ${observedAt} was replaced`).toBe(1);
+      // The stored value is finite, live and schema-valid, and — for the first instant — is zero.
+      const [witness] = await query<{ finite: boolean; live: boolean; epoch_seconds: string }>(
+        `select isfinite(observed_at) as finite, deleted_at is null as live,
+                trunc(extract(epoch from observed_at)::numeric)::text as epoch_seconds
+           from slack_messages where team_id = $1 and is_root and message_ts = $2`, [f.seed.teamId, OLD_ROOT]
+      );
+      expect(witness).toMatchObject({ finite: true, live: true });
+      if (observedAt.startsWith("1970")) expect(witness.epoch_seconds, "fixture: the observation is exactly the epoch").toBe("0");
+      else expect(Number(witness.epoch_seconds), "fixture: the comparison observation is ancient").toBeLessThan(0);
+
+      let shape: Record<string, unknown>;
+      let text = "";
+      try {
+        shape = { kind: "result", result: await prepare(f, entry) };
+      } catch (error) {
+        const thrown = error as { name?: unknown; message?: unknown; constructor?: { name?: unknown } };
+        shape = {
+          kind: "error", isError: error instanceof Error, class: thrown?.constructor?.name,
+          name: thrown?.name, message: thrown?.message,
+        };
+        text = `${String(thrown?.name)}\n${String(thrown?.message)}`;
+      }
+      // Nothing due before any real Slack root could exist: the epoch's own due instant included.
+      const [early] = await query<{ n: number }>(
+        `select count(*)::int as n from slack_sync_threads where team_id = $1 and due_at < timestamptz '2000-01-01 00:00:00+00'`,
+        [f.seed.teamId]
+      );
+      outcomes.push({ observedAt, queue: (await stored(f.seed.teamId)).queue, early: early.n, shape, text });
+    }
+
+    for (const outcome of outcomes) {
+      expect.soft(outcome.queue, `${outcome.observedAt}: nothing was enqueued for the root`).toEqual([]);
+      expect.soft(outcome.early, `${outcome.observedAt}: no queue row is due before the year 2000`).toBe(0);
+      if (outcome.shape.kind === "result") {
+        // A closed refusal: never the insertion, never existing work, never "not yet due".
+        const result = outcome.shape.result as SlackKnownRootPreparationResult;
+        expect.soft(["unattested", "refused"], `${outcome.observedAt}: a closed refusal`).toContain(result.outcome);
+        expect.soft(Object.keys(result).sort(), `${outcome.observedAt}: an outcome and a reason, nothing else`).toEqual(["outcome", "reason"]);
+      } else {
+        // A thrown failure is static: no date, no epoch value, no identifier of the root.
+        expect.soft(outcome.shape.isError, `${outcome.observedAt}: a thrown failure is an Error`).toBe(true);
+        expect.soft(outcome.text, `${outcome.observedAt}: no long digit run`).not.toMatch(/\d{4,}/);
+        for (const leaked of ["1970", "0001", "epoch", OLD_ROOT, WORKSPACE, CHANNEL]) {
+          expect.soft(outcome.text.includes(leaked), `${outcome.observedAt}: the failure does not carry ${leaked}`).toBe(false);
+        }
+      }
+    }
+    // The identity check, and with it "no new public reason": the epoch is refused exactly as the
+    // year 0001 already is — same kind of outcome, same reason or same static error.
+    expect(outcomes[0].shape, "the epoch is refused identically to an ancient observation").toEqual(outcomes[1].shape);
   });
 });

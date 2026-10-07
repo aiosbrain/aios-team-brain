@@ -719,6 +719,71 @@ describe("known-root decorated session — statement order, refreshed timeouts, 
     }
   });
 
+  // EXPECTED RED at checkpoint b075dfba (affected-fix review, MEDIUM). Capping what admission
+  // returns at the allowance bounds the TIMEOUTS, but admission itself still trusts the clock: the
+  // remaining time is the effective deadline minus a clock reading, and a reading from before the
+  // context was created makes ANY deadline look comfortably ahead. A context whose ambient deadline
+  // had already passed when it was created is then admitted, and one whose ambient deadline left it
+  // 300 ms is granted its whole allowance. The effective deadline is the earlier of the two by
+  // §7.2; a clock that has gone backwards past the context's own creation cannot extend it. Under
+  // such a clock the remaining time is unknowable, so the primitive must not start: no data
+  // statement, and one of the packet's two static errors — not whatever happens to be thrown.
+  const AMBIENT_REGRESSIONS: [string, { allowanceMs?: number; ambientOffsetMs: number }][] = [
+    ["an ambient deadline that had passed 1 ms before creation", { ambientOffsetMs: -1 }],
+    ["an ambient deadline that had passed a minute before creation", { ambientOffsetMs: -60_000 }],
+    ["an ambient deadline 300 ms after creation under the default allowance", { ambientOffsetMs: 300 }],
+    ["an ambient deadline 300 ms after creation under a 5,000 ms allowance", { allowanceMs: 5_000, ambientOffsetMs: 300 }],
+  ];
+  const AMBIENT_REGRESSION_CASES = REGRESSING_SUBJECTS.flatMap(([subject, run]) =>
+    AMBIENT_REGRESSIONS.map(([label, shape]): [string, string, typeof shape, typeof run] => [subject, label, shape, run]));
+
+  it.each(AMBIENT_REGRESSION_CASES)("does not start under a regressed clock that would outrun the effective deadline: %s, %s", async (_subject, _label, shape, run) => {
+    const createdAt = 1_000_000;
+    let regressed = false;
+    // Every data statement finds nothing, so a primitive that DOES start simply completes — an empty
+    // page, or a refusal at the namespace gate — and the failure below is that it ran at all.
+    const scripted = scriptedSession({ original: { statementMs: 0, lockMs: 0 }, respond: () => [] });
+    let context: unknown;
+    // Creating the context is allowed in every one of these: an ambient deadline that has passed, or
+    // one that is close, is a fact about the caller's time, not a malformed option.
+    expect(() => {
+      context = createSlackKnownRootExecution({
+        ...(shape.allowanceMs === undefined ? {} : { allowanceMs: shape.allowanceMs }),
+        ambientDeadlineAt: createdAt + shape.ambientOffsetMs,
+        monotonicNow: () => (regressed ? 400_000 : createdAt),
+      });
+    }, "creating the context is allowed").not.toThrow();
+    // Fixture precondition: the effective deadline is the AMBIENT one, not the allowance.
+    expect((context as { deadlineAt: number }).deadlineAt, "fixture: the ambient deadline is the effective one").toBe(createdAt + shape.ambientOffsetMs);
+
+    // Ten minutes EARLIER on every reading from here on.
+    regressed = true;
+    let rejected: unknown;
+    let settled = false;
+    try {
+      await run(scripted, context as never);
+      settled = true;
+    } catch (error) {
+      rejected = error;
+    }
+
+    expect(settled, "the primitive did not run to a result").toBe(false);
+    // Exactly one of the two approved static errors, with its static message.
+    const staticRefusal =
+      (rejected instanceof SlackKnownRootValidationError && rejected.message === STATIC_VALIDATION_MESSAGE) ||
+      (rejected instanceof SlackKnownRootDeadlineError && rejected.message === STATIC_DEADLINE_MESSAGE);
+    expect(staticRefusal, "the refusal is the static validation or deadline error, exactly").toBe(true);
+    expectNoCanary(rejected, "a refusal of the clock");
+    // Nothing was read or written on the caller's connection under a clock nobody can trust, and no
+    // timeout was set for a statement that never ran.
+    expect(scripted.data().map((statement) => statement.text), "no data statement was dispatched").toEqual([]);
+    expect(scripted.assignments(), "no timeout was assigned").toEqual([]);
+    expect(scripted.other, "the caller's own db client and audit helper were never used").toEqual([]);
+    expect(scripted.effective, "the session settings are untouched").toEqual(scripted.original);
+    // The refusal is reportable only as a closed category, like any other.
+    expect(SLACK_KNOWN_ROOT_FAILURE_CATEGORIES as readonly string[]).toContain(classifySlackKnownRootPreparationFailure(rejected));
+  });
+
   it.each<[string, Script["respond"], (scripted: Scripted) => Promise<unknown>, unknown]>([
     [
       "the page reader on an empty team", () => [],
