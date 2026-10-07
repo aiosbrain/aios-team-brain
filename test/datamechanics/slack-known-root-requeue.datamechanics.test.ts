@@ -792,11 +792,21 @@ describe("a published root whose stored facts were corrupted after enumeration (
  * KR-03 — canonical proof, and the operative falsifiers M1d, M1e, M1f, M1g, M1h and M2 of the
  * specification's mutation matrix (`docs/design/slack-known-root-requeue-spec.md` §5.2–§5.4, §11, §12).
  *
- * EVIDENCE, NOT RED: every case here is expected to pass on source checkpoint `c5679f89`. Each one is
- * its own test, with its own published root, so that a later mutation run names the behaviour that
- * killed the mutant instead of the first row of a loop.
+ * EVIDENCE, NOT RED: every scenario here is expected to pass on source checkpoint `c5679f89`.
  *
- * Every case has the same three movements:
+ * ONE PUBLISHED ROOT PER GROUP. Publishing a root through the real discovery, readiness, staging and
+ * publication paths is the expensive part of this fixture, so the scenarios of one logical group run
+ * one after another against a single published, enumerated root (`inSequence`). Reuse is made safe
+ * rather than assumed: a scenario removes the one queue row its closing proof created, through
+ * explicit fixture DML that must delete exactly that row, and the whole-team snapshot must then equal
+ * the snapshot the group started from before the next scenario may begin. A scenario that fails is
+ * still undone and still checked against that baseline, and the scenarios after it still run — so a
+ * mutation run is told EVERY scenario a mutant breaks, by label, not only the first of a loop.
+ * Nothing is soft: any failed scenario fails its test, and a root that cannot be returned to its
+ * baseline stops its group there instead of reporting later scenarios against a root that is no
+ * longer the fixture.
+ *
+ * Every refusal scenario has the same movements:
  *
  *  1. ARRANGE one stored fact that is wrong — through fixture DML, on a root that the REAL
  *     publication produced and the REAL enumeration located. Authority (binding, channel proof,
@@ -808,6 +818,10 @@ describe("a published root whose stored facts were corrupted after enumeration (
  *     and BEFORE the call, and must be byte-identical afterwards: a refusal writes nothing.
  *  3. UNDO that one fact and prepare again with the very same entry: it must now enqueue. So the
  *     arranged fact — and nothing else in the fixture — is what was refused.
+ *  4. REMOVE that one queue row and require the group's baseline snapshot again.
+ *
+ * A CONTROL scenario arranges a fact that must not be a refusal, requires the same entry to enqueue,
+ * and then removes what it planted and its queue row in the same way.
  *
  * The oracles are the test's own: results are compared with literal values, the legacy path is
  * written out here rather than taken from the helper under test, and "nothing changed" is the
@@ -881,37 +895,115 @@ describe("KR-03 — canonical proof refuses exactly what it should, and nothing 
     label: string;
     /** Makes ONE stored fact wrong. What it returns is handed to `undo`. */
     arrange: (ctx: Ctx) => Promise<Token>;
+    /** Fixture facts read back after the arrangement and before the call. If one is false the arrangement is still undone. */
+    verify?: (ctx: Ctx, token: Token) => Promise<void>;
     undo: (ctx: Ctx, token: Token) => Promise<void>;
     expected: Outcome;
   }
   const scenario = <Token>(value: Case<Token>): Case => value as unknown as Case;
 
-  /** The three movements described above. */
-  async function refusesThenPrepares(scenarioCase: Case): Promise<void> {
-    const ctx = await preparable();
-    const token = await scenarioCase.arrange(ctx);
+  type Cleanup = () => Promise<void>;
+  /** One labeled scenario on a shared root. `later` collects what has to be put back if the scenario stops early. */
+  interface Step { label: string; run: (ctx: Ctx, later: Cleanup[]) => Promise<void> }
 
-    const before = await snapshot(ctx.teamId);
-    expect(await queuedRoots(ctx.teamId), "fixture: the root has no pending work").toEqual([]);
-    const result = await prepareEntry(ctx);
-    expect(result, scenarioCase.label).toEqual(scenarioCase.expected);
-    // No queue row, and no row of any snapshotted table differs: the queue table is in the snapshot.
-    expect(await queuedRoots(ctx.teamId), `${scenarioCase.label}: nothing was enqueued`).toEqual([]);
-    expect(await snapshot(ctx.teamId), `${scenarioCase.label}: nothing was written`).toEqual(before);
+  /** Movements 1–3 above for one arranged fact; `inSequence` performs the fourth. */
+  const refusal = (scenarioCase: Case): Step => ({
+    label: scenarioCase.label,
+    run: async (ctx, later) => {
+      const { label } = scenarioCase;
+      const token = await scenarioCase.arrange(ctx);
+      let undone = false;
+      const undo: Cleanup = async () => {
+        if (undone) return;
+        undone = true;
+        await scenarioCase.undo(ctx, token);
+      };
+      later.push(undo);
+      await scenarioCase.verify?.(ctx, token);
 
-    await scenarioCase.undo(ctx, token);
-    expect(await prepareEntry(ctx), `${scenarioCase.label}: with that one fact undone the same entry prepares`).toEqual({ outcome: "enqueued" });
-    expect(await queuedRoots(ctx.teamId)).toEqual([OLD_ROOT]);
+      const before = await snapshot(ctx.teamId);
+      expect(await queuedRoots(ctx.teamId), `${label}: fixture: the root has no pending work`).toEqual([]);
+      const result = await prepareEntry(ctx);
+      expect(result, label).toEqual(scenarioCase.expected);
+      // No queue row, and no row of any snapshotted table differs: the queue table is in the snapshot.
+      expect(await queuedRoots(ctx.teamId), `${label}: nothing was enqueued`).toEqual([]);
+      expect(await snapshot(ctx.teamId), `${label}: nothing was written`).toEqual(before);
+
+      await undo();
+      expect(await prepareEntry(ctx), `${label}: with that one fact undone the same entry prepares`).toEqual({ outcome: "enqueued" });
+      expect(await queuedRoots(ctx.teamId), `${label}: with that one fact undone the root is queued`).toEqual([OLD_ROOT]);
+    },
+  });
+
+  /** A fact that must NOT be a refusal: arrange it, and the same entry still enqueues. What it plants goes on `later`. */
+  const control = (label: string, arrange: (ctx: Ctx, later: Cleanup[]) => Promise<unknown>): Step => ({
+    label,
+    run: async (ctx, later) => {
+      await arrange(ctx, later);
+      expect(await queuedRoots(ctx.teamId), `${label}: fixture: the root has no pending work`).toEqual([]);
+      expect(await prepareEntry(ctx), label).toEqual({ outcome: "enqueued" });
+      expect(await queuedRoots(ctx.teamId), `${label}: the root is queued`).toEqual([OLD_ROOT]);
+    },
+  });
+
+  /**
+   * Runs labeled scenarios one after another against ONE published root.
+   *
+   * A scenario that passes has left exactly one queue row — the root's — and that row, and only that
+   * row, is deleted here by scope; a delete that does not remove exactly one row is itself a failure
+   * of the scenario. Whatever the scenario registered is then put back, and the team must read
+   * exactly as it did before the first scenario. A scenario that FAILS is recorded under its label,
+   * is put back the same way (with whatever queue rows it left removed), and the next scenario runs
+   * only if the baseline was really restored. Every recorded failure is thrown at the end.
+   */
+  async function inSequence(ctx: Ctx, steps: readonly Step[]): Promise<void> {
+    const baseline = await snapshot(ctx.teamId);
+    expect(baseline.slack_sync_threads, "fixture: the reusable root has no pending work").toBe("[]");
+    const failures: Error[] = [];
+    const labeled = (label: string, error: unknown): Error => {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      if (!failure.message.includes(label)) failure.message = `${label}: ${failure.message}`;
+      return failure;
+    };
+
+    let ran = 0;
+    for (const step of steps) {
+      ran += 1;
+      const later: Cleanup[] = [];
+      let passed = false;
+      try {
+        await step.run(ctx, later);
+        await change(
+          `delete from slack_sync_threads where team_id = $1 and workspace_id = $2 and channel_id = $3 and root_ts = $4`,
+          [ctx.teamId, WORKSPACE, CHANNEL, OLD_ROOT]
+        );
+        passed = true;
+      } catch (error) {
+        failures.push(labeled(step.label, error));
+      }
+      try {
+        for (const putBack of later.reverse()) await putBack();
+        if (!passed) await run(`delete from slack_sync_threads where team_id = $1`, [ctx.teamId]);
+        expect(await snapshot(ctx.teamId), `${step.label}: the reusable baseline is restored`).toEqual(baseline);
+      } catch (error) {
+        failures.push(labeled(
+          `${step.label}: the root could NOT be returned to its baseline, so the ${steps.length - ran} scenario(s) after it were not run`, error
+        ));
+        break;
+      }
+    }
+
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(
+        failures,
+        `${failures.length} failures across ${steps.length} scenarios on one root:\n${failures.map((failure) => `  - ${failure.message}`).join("\n")}`
+      );
+    }
   }
 
-  /** A fact that must NOT be a refusal: arrange it, and the same entry still enqueues. */
-  async function stillPrepares(arrange: (ctx: Ctx) => Promise<unknown>): Promise<void> {
-    const ctx = await preparable();
-    await arrange(ctx);
-    expect(await queuedRoots(ctx.teamId), "fixture: the root has no pending work").toEqual([]);
-    expect(await prepareEntry(ctx)).toEqual({ outcome: "enqueued" });
-    expect(await queuedRoots(ctx.teamId)).toEqual([OLD_ROOT]);
-  }
+  /** One published root for the whole list of refusals. */
+  const refusesEach = async (cases: readonly Case[]): Promise<void> => inSequence(await preparable(), cases.map(refusal));
 
   // ── fixture builders ───────────────────────────────────────────────────────
 
@@ -982,6 +1074,30 @@ describe("KR-03 — canonical proof refuses exactly what it should, and nothing 
     )).id as string;
   }
   const dropItem = (_ctx: Ctx, id: string): Promise<void> => change(`delete from items where id = $1::uuid`, [id]);
+  const dropProject = (id: string): Promise<void> => change(`delete from projects where id = $1::uuid`, [id]);
+  /** A planted item TOGETHER WITH the project that was created to hold it: a shared root must get both back. */
+  const dropPlanted = async (ctx: Ctx, token: { item: string; project: string }): Promise<void> => {
+    await dropItem(ctx, token.item);
+    await dropProject(token.project);
+  };
+
+  // The same rows for a CONTROL, which has no undo of its own: each one is removed, newest first,
+  // when its scenario ends — whether or not the scenario passed.
+  async function plantedLedgerRow(later: Cleanup[], teamId: string, itemId: string, row: Parameters<typeof ledgerRow>[2]): Promise<string> {
+    const id = await ledgerRow(teamId, itemId, row);
+    later.push(() => change(`delete from slack_messages where id = $1::uuid`, [id]));
+    return id;
+  }
+  async function plantedProject(later: Cleanup[], teamId: string): Promise<string> {
+    const id = await projectId(teamId, `other-${randomUUID().slice(0, 8)}`, true);
+    later.push(() => dropProject(id));
+    return id;
+  }
+  async function plantedItem(later: Cleanup[], teamId: string, project: string, path: string): Promise<string> {
+    const id = await plantItem(teamId, project, path);
+    later.push(() => change(`delete from items where id = $1::uuid`, [id]));
+    return id;
+  }
 
   const mismatch: Outcome = { outcome: "unattested", reason: "canonical_mismatch" };
   const invalidMetadata: Outcome = { outcome: "unattested", reason: "invalid_metadata" };
@@ -1014,7 +1130,7 @@ describe("KR-03 — canonical proof refuses exactly what it should, and nothing 
   // ── §5.3 the locked item: project, kind, access, typed metadata, path ──────
 
   describe("the locked item", () => {
-    it.each<Case>([
+    it("is a canonical mismatch for each well-formed fact that is not the candidate's — project, kind, access, path (M1g), source, channel, root", () => refusesEach([
       scenario<string>({
         label: "the team has no project with the slug slack any more",
         expected: mismatch,
@@ -1049,9 +1165,9 @@ describe("KR-03 — canonical proof refuses exactly what it should, and nothing 
       frontmatterCase("the stored channel_id is another well-formed channel", "channel_id", "C0OTHER1170", mismatch),
       frontmatterCase("the stored ts is another well-formed root", "ts", "1718900000.000200", mismatch),
       frontmatterCase("the stored thread_ts is another well-formed root", "thread_ts", "1718900000.000200", mismatch),
-    ])("is a canonical mismatch when $label", refusesThenPrepares);
+    ]));
 
-    it.each<Case>([
+    it("is invalid metadata for each missing, wrong-typed or over-bound stored field, and for a path over 2,048 bytes", () => refusesEach([
       frontmatterCase("the stored workspace_id is missing", "workspace_id", null, invalidMetadata, true),
       frontmatterCase("the stored channel_id is missing", "channel_id", null, invalidMetadata, true),
       frontmatterCase("the stored ts is missing", "ts", null, invalidMetadata, true),
@@ -1067,7 +1183,7 @@ describe("KR-03 — canonical proof refuses exactly what it should, and nothing 
       columnCase("the item's path is 2,049 bytes of ASCII", "path", `slack/t0source1/c0known1170/${"p".repeat(2_049 - 28 - 3)}.md`, invalidMetadata),
       // BYTES, not characters: 1,100 two-byte characters are 2,200 bytes in well under 2,048 characters.
       columnCase("the item's path is over 2,048 BYTES in fewer than 2,048 characters", "path", `slack/t0source1/c0known1170/${"é".repeat(1_100)}.md`, invalidMetadata),
-    ])("is invalid metadata when $label", refusesThenPrepares);
+    ]));
   });
 
   // ── §5.3 the root witness: KR-03 and M2 ────────────────────────────────────
@@ -1075,7 +1191,7 @@ describe("KR-03 — canonical proof refuses exactly what it should, and nothing 
   describe("the root witness", () => {
     const rootRow = `team_id = $1 and message_ts = $2 and root_ts = $2 and is_root`;
 
-    it.each<Case>([
+    it("is missing for each way the root's own row fails to witness it: deleted, absent, or observed at a non-finite instant", () => refusesEach([
       scenario<null>({
         label: "the root's ledger row is deleted (soft-deleted evidence is not a witness)",
         expected: noWitness,
@@ -1109,7 +1225,7 @@ describe("KR-03 — canonical proof refuses exactly what it should, and nothing 
         },
         undo: (ctx, original) => change(`update slack_messages set observed_at = $3::timestamptz where ${rootRow}`, [ctx.teamId, OLD_ROOT, original]),
       })),
-    ])("is missing when $label", refusesThenPrepares);
+    ]));
 
     /**
      * M2. The mutant bypasses the existence of a live root witness while still supplying a due
@@ -1121,23 +1237,7 @@ describe("KR-03 — canonical proof refuses exactly what it should, and nothing 
      * work is pending. On the unmutated source the answer is `missing_root_witness` and nothing is
      * written; on the mutant the same fixture reaches the enqueue helper and a row appears.
      */
-    it.each([
-      ["the root row is present but deleted", async (ctx: Ctx): Promise<void> => {
-        await change(`update slack_messages set deleted_at = now() where ${rootRow}`, [ctx.teamId, OLD_ROOT]);
-      }, { overdue_root_rows: 1, live_root_rows: 0 }],
-      ["the root row is gone and only the overdue reply remains", async (ctx: Ctx): Promise<void> => {
-        await change(`delete from slack_messages where ${rootRow}`, [ctx.teamId, OLD_ROOT]);
-        // The reply is still there, live, bound to this item and overdue: an observation a mutant
-        // could be handed, on a thread that has no root witness at all.
-        expect(await run(
-          `select message_ts from slack_messages
-            where team_id = $1 and item_id = $3::uuid and root_ts = $2 and deleted_at is null
-              and isfinite(observed_at) and observed_at + interval '60 seconds' <= clock_timestamp()`, [ctx.teamId, OLD_ROOT, ctx.itemId]
-        )).toEqual([{ message_ts: OLD_REPLY }]);
-      }, { overdue_root_rows: 0, live_root_rows: 0 }],
-    ] as const)("stays missing_root_witness when %s, on a fixture where only the witness stands between it and an enqueue (M2)", async (_label, arrange, expectedRows) => {
-      const ctx = await preparable();
-      await arrange(ctx);
+    const onlyTheWitnessIsMissing = (label: string, expectedRows: { overdue_root_rows: number; live_root_rows: number }) => async (ctx: Ctx): Promise<void> => {
       const facts = await one(
         `select
            (select count(*)::int from slack_messages
@@ -1154,23 +1254,53 @@ describe("KR-03 — canonical proof refuses exactly what it should, and nothing 
            (select count(*)::int from slack_sync_threads where team_id = $1) as queue_rows`,
         [ctx.teamId, OLD_ROOT, ctx.itemId, WORKSPACE, CHANNEL, LEGACY_PATH, SCOPED_PATH]
       );
-      expect(facts, "fixture: only the witness is missing; everything a mutant would need to enqueue is present").toEqual({
+      expect(facts, `${label}: fixture: only the witness is missing; everything a mutant would need to enqueue is present`).toEqual({
         ...expectedRows, item_rows_elsewhere: 0, thread_rows_of_other_items: 0,
         items_at_legacy_path: 0, other_items_at_scoped_path: 0, queue_rows: 0,
       });
+    };
 
-      const before = await snapshot(ctx.teamId);
-      expect(await prepareEntry(ctx)).toEqual(noWitness);
-      expect(await queuedRoots(ctx.teamId), "nothing was enqueued").toEqual([]);
-      expect(await snapshot(ctx.teamId), "nothing was written").toEqual(before);
-    });
+    // Each scenario then goes on, like every other refusal, to put the witness back and require the
+    // same entry to enqueue: the witness, and nothing else in the fixture, is what was refused.
+    const M2_DELETED = "M2: the root row is present but deleted, and its observation is finite and overdue";
+    const M2_GONE = "M2: the root row is gone and only the overdue reply remains";
+    it("stays missing_root_witness on a fixture where only the witness stands between it and an enqueue (M2)", () => refusesEach([
+      scenario<null>({
+        label: M2_DELETED, expected: noWitness,
+        arrange: async (ctx) => {
+          await change(`update slack_messages set deleted_at = now() where ${rootRow}`, [ctx.teamId, OLD_ROOT]);
+          return null;
+        },
+        verify: onlyTheWitnessIsMissing(M2_DELETED, { overdue_root_rows: 1, live_root_rows: 0 }),
+        undo: (ctx) => change(`update slack_messages set deleted_at = null where ${rootRow}`, [ctx.teamId, OLD_ROOT]),
+      }),
+      scenario<string>({
+        label: M2_GONE, expected: noWitness,
+        arrange: async (ctx) => {
+          const saved = (await one(`select to_jsonb(m)::text as saved from slack_messages m where ${rootRow}`, [ctx.teamId, OLD_ROOT])).saved as string;
+          await change(`delete from slack_messages where ${rootRow}`, [ctx.teamId, OLD_ROOT]);
+          return saved;
+        },
+        verify: async (ctx) => {
+          // The reply is still there, live, bound to this item and overdue: an observation a mutant
+          // could be handed, on a thread that has no root witness at all.
+          expect(await run(
+            `select message_ts from slack_messages
+              where team_id = $1 and item_id = $3::uuid and root_ts = $2 and deleted_at is null
+                and isfinite(observed_at) and observed_at + interval '60 seconds' <= clock_timestamp()`, [ctx.teamId, OLD_ROOT, ctx.itemId]
+          ), `${M2_GONE}: fixture: the overdue reply remains`).toEqual([{ message_ts: OLD_REPLY }]);
+          await onlyTheWitnessIsMissing(M2_GONE, { overdue_root_rows: 0, live_root_rows: 0 })(ctx);
+        },
+        undo: (_ctx, saved) => change(`insert into slack_messages select * from jsonb_populate_record(null::slack_messages, $1::jsonb)`, [saved]),
+      }),
+    ]));
   });
 
   // ── §5.3 the same item bound to another thread or scope: M1d, M1e, M1f ─────
 
   describe("the item's own ledger rows", () => {
-    const sameItem = (label: string, row: Parameters<typeof ledgerRow>[2]): Case => scenario<string>({
-      label, expected: contradictory,
+    const sameItem = (where: string, row: Parameters<typeof ledgerRow>[2]): Step => refusal(scenario<string>({
+      label: `a ledger row of the candidate's OWN item is in ${where}`, expected: contradictory,
       arrange: async (ctx) => {
         const id = await ledgerRow(ctx.teamId, ctx.itemId, row);
         // Fixture: exactly ONE component of the stored row differs from the candidate's scope.
@@ -1179,27 +1309,24 @@ describe("KR-03 — canonical proof refuses exactly what it should, and nothing 
                   message_ts <> root_ts as is_reply, is_root, (deleted_at is not null) as deleted
              from slack_messages where id = $1::uuid`, [id, WORKSPACE, CHANNEL, OLD_ROOT]
         );
-        expect(stored, `fixture: ${label}`).toEqual({ differing: 1, is_reply: true, is_root: false, deleted: row.deleted === true });
+        expect(stored, `fixture: the own item's row is in ${where}`).toEqual({ differing: 1, is_reply: true, is_root: false, deleted: row.deleted === true });
         return id;
       },
       undo: dropLedgerRow,
-    });
+    }));
 
-    it.each<Case>([
+    it("contradict the candidate when ONE component of one of them differs — workspace (M1d), channel (M1e), root (M1f), live or deleted — and not when they are further replies of the same root", async () => inSequence(await preparable(), [
       sameItem("another WORKSPACE only (M1d)", { workspace: "T0OTHER9", messageTs: OTHER_REPLY, rootTs: OLD_ROOT }),
       sameItem("another CHANNEL only (M1e)", { channel: "C0OTHER1170", messageTs: OTHER_REPLY, rootTs: OLD_ROOT }),
       sameItem("another ROOT only (M1f)", { messageTs: "1718800000.000101", rootTs: "1718800000.000100" }),
       sameItem("another workspace only, on a DELETED row", { workspace: "T0OTHER9", messageTs: OTHER_REPLY, rootTs: OLD_ROOT, deleted: true }),
       sameItem("another channel only, on a DELETED row", { channel: "C0OTHER1170", messageTs: OTHER_REPLY, rootTs: OLD_ROOT, deleted: true }),
       sameItem("another root only, on a DELETED row", { messageTs: "1718800000.000101", rootTs: "1718800000.000100", deleted: true }),
-    ])("contradict the candidate when one of them is in $label", refusesThenPrepares);
-
-    it("do not contradict it when they are further replies of the SAME root in the same scope (control)", async () => {
-      await stillPrepares(async (ctx) => {
-        await ledgerRow(ctx.teamId, ctx.itemId, { messageTs: OTHER_REPLY, rootTs: OLD_ROOT });
-        await ledgerRow(ctx.teamId, ctx.itemId, { messageTs: "1718900000.000151", rootTs: OLD_ROOT, deleted: true });
-      });
-    });
+      control("further replies of the SAME root in the same scope, one live and one deleted, belong to the candidate's own item (control)", async (ctx, later) => {
+        await plantedLedgerRow(later, ctx.teamId, ctx.itemId, { messageTs: OTHER_REPLY, rootTs: OLD_ROOT });
+        await plantedLedgerRow(later, ctx.teamId, ctx.itemId, { messageTs: "1718900000.000151", rootTs: OLD_ROOT, deleted: true });
+      }),
+    ]));
   });
 
   // ── §5.3 the same scoped thread bound to another item: M1h ─────────────────
@@ -1214,10 +1341,9 @@ describe("KR-03 — canonical proof refuses exactly what it should, and nothing 
       expect(String(stored.path).startsWith("slack/"), "fixture: the second item is outside the Slack namespace").toBe(false);
       return second;
     }
-    const ownedReply = (label: string, deleted: boolean): Case => scenario<string>({
+    const ownedReply = (label: string, second: string, deleted: boolean): Step => refusal(scenario<string>({
       label, expected: contradictory,
       arrange: async (ctx) => {
-        const second = await secondItem(ctx);
         const id = await ledgerRow(ctx.teamId, second, { messageTs: OTHER_REPLY, rootTs: OLD_ROOT, deleted });
         // The row M1h is about, read back: a REPLY — its own timestamp is not the root's — of this
         // exact root, in this exact team, workspace and channel, owned by the second item.
@@ -1238,40 +1364,50 @@ describe("KR-03 — canonical proof refuses exactly what it should, and nothing 
         return id;
       },
       undo: dropLedgerRow,
-    });
+    }));
 
+    /** One root and ONE second item for the whole list: the baseline `inSequence` takes already contains that item. */
+    async function withSecondItem(steps: (second: string) => readonly Step[]): Promise<void> {
+      const ctx = await preparable();
+      const second = await secondItem(ctx);
+      await inSequence(ctx, steps(second));
+    }
+
+    // The two M1h variants stay separate tests, each on its own root, because each is the operative
+    // falsifier of a different mutant and should be named on its own in a mutation run.
     // Kills `root_ts = rootTs` replaced by `message_ts = rootTs`: this row's message_ts is NOT the root's.
     it("contradicts the candidate when the second item owns a LIVE reply of the same root (M1h)", () =>
-      refusesThenPrepares(ownedReply("a second item owns a live reply of the same root", false)));
+      withSecondItem((second) => [ownedReply("a second item owns a live reply of the same root (M1h)", second, false)]));
 
     // Kills `deleted_at IS NULL` added to the contradiction check: this row is deleted, and still binds.
     it("contradicts the candidate when the second item's reply of the same root is DELETED (M1h, deleted-row variant)", () =>
-      refusesThenPrepares(ownedReply("a second item owns a deleted reply of the same root", true)));
+      withSecondItem((second) => [ownedReply("a second item owns a deleted reply of the same root (M1h, deleted-row variant)", second, true)]));
 
-    it.each<[string, (ctx: Ctx, second: string) => Promise<unknown>]>([
-      ["in another CHANNEL of the same workspace", (ctx, second) => ledgerRow(ctx.teamId, second, { channel: "C0OTHER1170", messageTs: OTHER_REPLY, rootTs: OLD_ROOT })],
-      ["in another WORKSPACE with the same channel id", (ctx, second) => ledgerRow(ctx.teamId, second, { workspace: "T0OTHER9", messageTs: OTHER_REPLY, rootTs: OLD_ROOT })],
-      ["of ANOTHER root in the same channel", (ctx, second) => ledgerRow(ctx.teamId, second, { messageTs: "1718800000.000101", rootTs: "1718800000.000100" })],
-    ])("does not contradict it when the second item's row is %s (scope control)", async (_label, plant) => {
-      await stillPrepares(async (ctx) => { await plant(ctx, await secondItem(ctx)); });
-    });
-
-    it("does not contradict it when ANOTHER TEAM stores the same workspace, channel and root under its own item (tenant control)", async () => {
-      await stillPrepares(async (ctx) => {
-        const otherTeam = await seedTeam();
-        const theirs = await seedUnrelatedItem(otherTeam);
-        // The same provider ids and the same timestamps, root and reply, in a different tenant.
-        await ledgerRow(otherTeam.teamId, theirs, { messageTs: OLD_ROOT, rootTs: OLD_ROOT });
-        await ledgerRow(otherTeam.teamId, theirs, { messageTs: OTHER_REPLY, rootTs: OLD_ROOT });
-        expect(otherTeam.teamId).not.toBe(ctx.teamId);
-      });
-    });
+    it("does not contradict it when the second item's row is outside the candidate's scope, or the same scope is another team's (scope and tenant controls)", () =>
+      withSecondItem((second) => [
+        control("the second item's row is in another CHANNEL of the same workspace (scope control)", (ctx, later) =>
+          plantedLedgerRow(later, ctx.teamId, second, { channel: "C0OTHER1170", messageTs: OTHER_REPLY, rootTs: OLD_ROOT })),
+        control("the second item's row is in another WORKSPACE with the same channel id (scope control)", (ctx, later) =>
+          plantedLedgerRow(later, ctx.teamId, second, { workspace: "T0OTHER9", messageTs: OTHER_REPLY, rootTs: OLD_ROOT })),
+        control("the second item's row is of ANOTHER root in the same channel (scope control)", (ctx, later) =>
+          plantedLedgerRow(later, ctx.teamId, second, { messageTs: "1718800000.000101", rootTs: "1718800000.000100" })),
+        // LAST in its group: the other team and its own ingested item outlive the scenario. Only the
+        // two ledger rows planted here are removed, and nothing runs on this root afterwards.
+        control("ANOTHER TEAM stores the same workspace, channel and root under its own item (tenant control)", async (ctx, later) => {
+          const otherTeam = await seedTeam();
+          const theirs = await seedUnrelatedItem(otherTeam);
+          // The same provider ids and the same timestamps, root and reply, in a different tenant.
+          await plantedLedgerRow(later, otherTeam.teamId, theirs, { messageTs: OLD_ROOT, rootTs: OLD_ROOT });
+          await plantedLedgerRow(later, otherTeam.teamId, theirs, { messageTs: OTHER_REPLY, rootTs: OLD_ROOT });
+          expect(otherTeam.teamId, "fixture: the other team is another team").not.toBe(ctx.teamId);
+        }),
+      ]));
   });
 
   // ── §5.4 exact path conflicts ──────────────────────────────────────────────
 
   describe("another item at one of the root's two paths", () => {
-    it.each<Case>([
+    it("refuses a scoped-path conflict and a legacy-path conflict, whatever project, kind, access or metadata the other item has", () => refusesEach([
       scenario<{ item: string; project: string }>({
         label: "the SCOPED path is owned by an item of another project",
         expected: { outcome: "refused", reason: "scoped_path_conflict" },
@@ -1281,7 +1417,7 @@ describe("KR-03 — canonical proof refuses exactly what it should, and nothing 
           expect(project, "fixture: the conflicting item is in another project").not.toBe(await projectId(ctx.teamId, "slack"));
           return { item, project };
         },
-        undo: (ctx, token) => dropItem(ctx, token.item),
+        undo: dropPlanted,
       }),
       scenario<string>({
         label: "an item exists at the LEGACY path in the Slack project",
@@ -1291,29 +1427,31 @@ describe("KR-03 — canonical proof refuses exactly what it should, and nothing 
       }),
       // "Live legacy path" is ANY extant item row there: another project, another kind, another
       // access, no Slack frontmatter at all.
-      scenario<string>({
+      scenario<{ item: string; project: string }>({
         label: "an item exists at the LEGACY path in another project, with another kind and access and no Slack metadata",
         expected: { outcome: "refused", reason: "legacy_path_conflict" },
-        arrange: async (ctx) => plantItem(
-          ctx.teamId, await projectId(ctx.teamId, `other-${randomUUID().slice(0, 8)}`, true), LEGACY_PATH, { kind: "transcript", access: "external" }
-        ),
-        undo: dropItem,
+        arrange: async (ctx) => {
+          const project = await projectId(ctx.teamId, `other-${randomUUID().slice(0, 8)}`, true);
+          const item = await plantItem(ctx.teamId, project, LEGACY_PATH, { kind: "transcript", access: "external" });
+          return { item, project };
+        },
+        undo: dropPlanted,
       }),
-    ])("refuses when $label", refusesThenPrepares);
+    ]));
 
-    it.each<[string, (ctx: Ctx) => Promise<unknown>]>([
-      ["the legacy path of ANOTHER root of the same channel is occupied", async (ctx) =>
-        plantItem(ctx.teamId, await projectId(ctx.teamId, "slack"), `slack/c0known1170/1718900000.000200.md`)],
-      ["the scoped path of ANOTHER root is owned by another project", async (ctx) =>
-        plantItem(ctx.teamId, await projectId(ctx.teamId, `other-${randomUUID().slice(0, 8)}`, true), `slack/t0source1/c0known1170/1718900000.000200.md`)],
-      ["ANOTHER TEAM has items at both of the root's paths", async () => {
+    it("does not refuse for an item at another root's path, or for another team's items at this root's own two paths (scope and tenant controls)", async () => inSequence(await preparable(), [
+      control("the legacy path of ANOTHER root of the same channel is occupied (scope control)", async (ctx, later) =>
+        plantedItem(later, ctx.teamId, await projectId(ctx.teamId, "slack"), `slack/c0known1170/1718900000.000200.md`)),
+      control("the scoped path of ANOTHER root is owned by another project (scope control)", async (ctx, later) =>
+        plantedItem(later, ctx.teamId, await plantedProject(later, ctx.teamId), `slack/t0source1/c0known1170/1718900000.000200.md`)),
+      // LAST in its group: the other team outlives the scenario; what was planted in it does not.
+      control("ANOTHER TEAM has items at both of the root's paths (tenant control)", async (ctx, later) => {
         const otherTeam = await seedTeam();
-        const theirs = await projectId(otherTeam.teamId, `other-${randomUUID().slice(0, 8)}`, true);
-        await plantItem(otherTeam.teamId, theirs, SCOPED_PATH);
-        await plantItem(otherTeam.teamId, theirs, LEGACY_PATH);
-      }],
-    ])("does not refuse when %s (scope and tenant control)", async (_label, arrange) => {
-      await stillPrepares(arrange);
-    });
+        expect(otherTeam.teamId, "fixture: the other team is another team").not.toBe(ctx.teamId);
+        const theirs = await plantedProject(later, otherTeam.teamId);
+        await plantedItem(later, otherTeam.teamId, theirs, SCOPED_PATH);
+        await plantedItem(later, otherTeam.teamId, theirs, LEGACY_PATH);
+      }),
+    ]));
   });
 });
