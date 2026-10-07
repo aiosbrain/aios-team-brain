@@ -6,6 +6,7 @@ import { Hash, Check, X } from "lucide-react";
 import { linkMemberIdentity, unlinkMemberIdentity } from "@/app/t/[team]/admin/members/actions";
 import {
   identityLinkRequest,
+  identityUnlinkRequest,
   standingRemapOffer,
   type IdentityRemapOffer,
 } from "@/components/admin/provider-identity-link-payload";
@@ -70,10 +71,12 @@ export function ProviderIdentityLink({
     setEditing(false);
   }
   function unlink() {
-    if (!externalId) return;
+    // The displayed id, bound to THIS row's member and the revision it displays.
+    const request = identityUnlinkRequest({ provider, externalId, revision }, memberId);
+    if (!request) return;
     setError(null);
     startTransition(async () => {
-      const res = await unlinkMemberIdentity(teamSlug, provider, externalId, revision);
+      const res = await unlinkMemberIdentity(teamSlug, request.provider, request.externalId, request.observed);
       if (!res.ok) return setError(res.error ?? "could not unlink");
       router.refresh();
     });

@@ -278,24 +278,73 @@ export async function linkMemberSlack(
   return linkMemberIdentity(teamSlug, memberId, "slack", slackUserId, handle);
 }
 
-/** Remove a provider identity mapping (admins clearing/correcting a link). */
+/**
+ * What the Admin row displayed for the identity being unlinked: WHO it showed as holding the id,
+ * and that id's mapping revision. Both, always — the revision alone does not say whose link it is.
+ */
+interface IdentityUnlinkObservation {
+  memberId: string;
+  revision: number;
+}
+
+function isUnlinkObservation(value: unknown): value is IdentityUnlinkObservation {
+  if (!value || typeof value !== "object") return false;
+  const { memberId, revision } = value as { memberId?: unknown; revision?: unknown };
+  return typeof memberId === "string" && memberId.trim() !== "" && isRevision(revision);
+}
+
+/**
+ * Remove a provider identity mapping (admins clearing/correcting a link).
+ *
+ * `observed` is REQUIRED: the member the row displayed as the id's holder and the revision it
+ * displayed. The writer's `expectedRevision` is a compare-and-set on the id alone, so a row that
+ * showed Alice with a revision that is really Bob's link would, on the revision alone, remove
+ * Bob's. A call without a readable observation is refused; it is never run revision-only or
+ * unfenced.
+ *
+ * The whole decision runs inside the team's identity mutation boundary, like the fenced link: the
+ * id's current holder and revision are read there, as one observation, and must be exactly the
+ * displayed member at the displayed revision — no holder, another holder or another revision is
+ * stale and nothing is written. The unchanged writer then removes the link in that same
+ * transaction (it joins it; the team authority is taken before any row), at the revision just
+ * observed. An error leaves the boundary uncaught, so nothing partial commits; revalidation and
+ * repair acceleration follow the commit.
+ */
 export async function unlinkMemberIdentity(
   teamSlug: string,
   provider: string,
   externalId: string,
-  expectedRevision?: number,
+  observed: IdentityUnlinkObservation,
 ): Promise<{ ok: boolean; error?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
+  const p = provider.trim().toLowerCase();
+  const ext = externalId.trim();
+  if (!p || !ext) return { ok: false, error: "provider and externalId are required" };
+  // No observation, or one that cannot be read: refused, never downgraded to an unfenced removal.
+  if (!isUnlinkObservation(observed)) return { ok: false, error: STALE_IDENTITY };
+  const displayed = { memberId: observed.memberId.trim(), revision: observed.revision };
   try {
-    await removeMemberIdentity(
-      adminClient(),
-      ctx.teamId,
-      { provider: provider.trim().toLowerCase(), externalId: externalId.trim() },
-      { expectedRevision, actor: { kind: "member", memberId: ctx.memberId } }
-    );
+    const identityDb = adminClient();
+    // Nothing in here is caught: a failed read or a refused write must leave the boundary as an
+    // error, so its transaction rolls back.
+    const removed = await withIdentityMutationBoundary(ctx.teamId, async (): Promise<boolean> => {
+      const current = await observeIdentity(identityDb, ctx.teamId, p, ext);
+      if (current.memberId === null || current.memberId !== displayed.memberId || current.revision !== displayed.revision) {
+        return false;
+      }
+      const res = await removeMemberIdentity(
+        identityDb,
+        ctx.teamId,
+        { provider: p, externalId: ext },
+        { expectedRevision: current.revision, actor: { kind: "member", memberId: ctx.memberId } }
+      );
+      return res.removed;
+    });
+    // Only a committed removal is revalidated or repaired; a stale refusal wrote nothing.
+    if (!removed) return { ok: false, error: STALE_IDENTITY };
     revalidatePath(`/t/${teamSlug}/admin/members`);
-    scheduleIdentityEffects(adminClient(), ctx.teamId, teamSlug, provider.trim().toLowerCase());
+    scheduleIdentityEffects(adminClient(), ctx.teamId, teamSlug, p);
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not unlink identity" };

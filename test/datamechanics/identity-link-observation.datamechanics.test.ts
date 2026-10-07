@@ -1,10 +1,18 @@
 import { randomUUID } from "node:crypto";
-import { Client } from "pg";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getPool } from "@/lib/db/pg/pool";
 import { listMemberIdentities } from "@/lib/identity/list";
 import { removeMemberIdentity, setMemberIdentity } from "@/lib/identity/member-identities";
 import { db, seedTeam, type Seed } from "./helpers";
+import {
+  RACE_TEST_TIMEOUT_MS,
+  bothQueuedOnAuthority,
+  closeRaceHarness,
+  holdIdentityKey,
+  holdTable,
+  parkThenCompete,
+  raceHarnessFatal,
+} from "./identity-race-harness";
 
 /**
  * THE ADMIN IDENTITY LINK ACTION keeps what a row DISPLAYED apart from the id being REQUESTED
@@ -45,11 +53,12 @@ import { db, seedTeam, type Seed } from "./helpers";
 
 const admin = vi.hoisted(() => ({ teamId: "", memberId: "" }));
 const deferred = vi.hoisted(() => ({ callbacks: [] as Array<() => unknown> }));
+const revalidated = vi.hoisted(() => ({ paths: [] as string[] }));
 
 vi.mock("@/lib/auth/guard", () => ({
   requireTeamAdmin: async () => (admin.teamId ? { teamId: admin.teamId, memberId: admin.memberId } : null),
 }));
-vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));
+vi.mock("next/cache", () => ({ revalidatePath: (path: string) => { revalidated.paths.push(path); } }));
 vi.mock("next/server", async (original) => ({
   ...(await original<typeof import("next/server")>()),
   after: (callback: () => unknown) => { deferred.callbacks.push(callback); },
@@ -129,7 +138,10 @@ async function effects(seed: Seed, provider: Provider, externalId: string) {
                from identity_repair_obligations
               where team_id=$1 and provider=$2 and external_id=$3 and status='pending') as obligations`,
     [seed.teamId, provider, externalId]);
-  return { authority: rows[0].authority, epoch: rows[0].epoch, obligations: rows[0].obligations ?? [], deferred: deferred.callbacks.length };
+  return {
+    authority: rows[0].authority, epoch: rows[0].epoch, obligations: rows[0].obligations ?? [],
+    deferred: deferred.callbacks.length, revalidated: revalidated.paths.length,
+  };
 }
 
 const link = (seed: Seed, memberId: string, provider: Provider, externalId: string, observed: Observation) =>
@@ -142,240 +154,15 @@ async function ownRow(seed: Seed, memberId: string, provider: Provider) {
   return displayed(seed, memberId, provider, own);
 }
 
-/** Unlink exactly as the row does: the displayed id, at its displayed revision. */
+type UnlinkObservation = Parameters<typeof unlinkMemberIdentity>[3];
+
+const unlink = (seed: Seed, provider: Provider, externalId: string, observed: UnlinkObservation) =>
+  unlinkMemberIdentity(seed.teamSlug, provider, externalId, observed);
+
+/** Unlink exactly as the row does: the displayed id, bound to the row's member and its displayed revision. */
 async function unlinkDisplayed(seed: Seed, memberId: string, provider: Provider, externalId: string): Promise<void> {
   const shown = await displayed(seed, memberId, provider, externalId);
-  expect(await unlinkMemberIdentity(seed.teamSlug, provider, shown.externalId, shown.revision)).toEqual({ ok: true });
-}
-
-/** How long one lock-evidence poll may wait for the expected waits to appear. */
-const POLL_TIMEOUT_MS = 10_000;
-/** How long cleanup waits, per step, for raced operations to finish once their barrier is gone. */
-const CLEANUP_BOUND_MS = 5_000;
-/**
- * The timeout of every test that races. It must exceed the bounded waits such a test can make —
- * Vitest's default (5 s) is shorter than ONE poll, which would cut a failing schedule off before
- * its `finally` had released the barrier. A failing test spends at most one poll timeout plus both
- * cleanup steps; the passing polls return as soon as PostgreSQL shows the waits.
- */
-const RACE_TEST_TIMEOUT_MS = 60_000;
-
-interface Barrier { pid: number; release: () => Promise<void> }
-
-/** A connection of its own, in a transaction that holds the lock `sql` takes until `release()`. */
-async function holdLock(sql: string, params: unknown[] = []): Promise<Barrier> {
-  const owner = new Client({ connectionString: process.env.DATABASE_URL });
-  owner.on("error", () => undefined);
-  await owner.connect();
-  await owner.query("begin");
-  await owner.query(sql, params);
-  const pid = (await owner.query<{ pid: number }>("select pg_backend_pid() as pid")).rows[0].pid;
-  let released = false;
-  return {
-    pid,
-    release: async () => {
-      if (released) return;
-      released = true;
-      await owner.query("rollback").catch(() => undefined);
-      await owner.end().catch(() => undefined);
-    },
-  };
-}
-
-/** ACCESS EXCLUSIVE on one identity table: every read and write of it waits, nothing else does. */
-const holdTable = (table: "member_identities" | "member_identity_mapping_state") =>
-  holdLock(`lock table ${table} in access exclusive mode`);
-
-/** The writer's own exact-identity advisory key — taken after the team authority, before its rows. */
-const holdIdentityKey = (seed: Seed, provider: Provider, externalId: string) =>
-  holdLock("select pg_advisory_xact_lock(hashtextextended($1, 0))", [`${seed.teamId}:identity:${provider}:${externalId}`]);
-
-interface LockWait {
-  pid: number;
-  locktype: string;
-  /** The 64-bit key of an advisory wait, as PostgreSQL stores it; null for any other lock. */
-  key: string | null;
-  blockers: number[];
-}
-
-/**
- * Every backend waiting on a lock IN THIS DATABASE right now: the kind of lock, the advisory key
- * if it is one, and exactly which backends block it. `pg_locks` is cluster-wide, so the database
- * filter is what keeps another database's waiters out of the evidence.
- */
-async function lockWaits(): Promise<LockWait[]> {
-  const { rows } = await getPool().query<LockWait>(
-    `select l.pid, l.locktype,
-            case when l.locktype = 'advisory' and l.objsubid = 1
-                 then ((l.classid::bigint << 32) | l.objid::bigint)::text end as key,
-            pg_blocking_pids(l.pid) as blockers
-       from pg_locks l
-      where not l.granted
-        and l.database = (select oid from pg_database where datname = current_database())
-      order by l.pid`);
-  return rows;
-}
-
-/** The advisory key of one team's identity authority — the lock the mutation boundary takes first. */
-async function authorityKey(seed: Seed): Promise<string> {
-  const { rows } = await getPool().query<{ key: string }>(
-    "select hashtextextended($1,0)::text as key", [`${seed.teamId}:identity-authority`]);
-  return rows[0].key;
-}
-
-interface ExpectedWait {
-  locktype: string;
-  /** True when the wait must be on the team identity authority's own advisory key. */
-  authority: boolean;
-  /** The exact backends that block it — no fewer, and none besides. */
-  blockedBy: number[];
-}
-
-/**
- * Wait — on PostgreSQL's own lock table, never on a clock — until the waits behind the test's own
- * backends (`behind`) are exactly `expected`. A wait is this test's only if one of those backends
- * blocks it; anything else waiting in the database is neither counted nor required to be absent.
- */
-async function untilWaiting(expected: ExpectedWait[], behind: number[], authority: string): Promise<LockWait[]> {
-  const mine = (waits: LockWait[]) => waits.filter((wait) => wait.blockers.some((pid) => behind.includes(pid)));
-  // `pg_blocking_pids` may repeat a backend that blocks through more than one lock.
-  const shape = (waits: ExpectedWait[]) => waits.map((wait) =>
-    `${wait.locktype}${wait.authority ? " on the team identity authority" : ""} blocked by ${[...new Set(wait.blockedBy)].sort((a, b) => a - b).join(",")}`).sort();
-  await expect.poll(async () => shape(mine(await lockWaits()).map((wait) => ({
-    locktype: wait.locktype, authority: wait.key === authority, blockedBy: wait.blockers,
-  }))), { timeout: POLL_TIMEOUT_MS }).toEqual(shape(expected));
-  return mine(await lockWaits());
-}
-
-/** This test's own waiting sessions: every backend waiting behind `root`, directly or through another of them. */
-async function waitersBehind(root: number): Promise<number[]> {
-  const waits = await lockWaits().catch(() => [] as LockWait[]);
-  const own = new Set<number>();
-  let grew = true;
-  while (grew) {
-    grew = false;
-    for (const wait of waits) {
-      if (!own.has(wait.pid) && wait.blockers.some((pid) => pid === root || own.has(pid))) {
-        own.add(wait.pid);
-        grew = true;
-      }
-    }
-  }
-  return [...own];
-}
-
-/**
- * BOUNDED CLEANUP of raced operations whose barrier has just been released, so none of them is
- * still running — holding a lock or a transaction — when the next test truncates. They normally
- * finish at once. If they have not within the bound, the test's own backends (`ownBackends`, read
- * from `pg_locks` before the release) have their statements cancelled, and the wait is repeated
- * once. The timer bounds CLEANUP only: no schedule is ever established by waiting on it. Returns
- * whether every operation finished by itself.
- */
-async function settleRaced(operations: (Promise<unknown> | undefined)[], ownBackends: number[]): Promise<boolean> {
-  const started = operations.filter((operation): operation is Promise<unknown> => operation !== undefined);
-  const all = Promise.allSettled(started).then(() => true as const);
-  const withinBound = async (): Promise<boolean> => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const bound = new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), CLEANUP_BOUND_MS); });
-    try {
-      return await Promise.race([all, bound]);
-    } finally {
-      clearTimeout(timer);
-    }
-  };
-  if (await withinBound()) return true;
-  if (ownBackends.length > 0) {
-    await getPool().query("select pg_cancel_backend(pid) from unnest($1::int[]) as pid", [ownBackends]).catch(() => undefined);
-    await withinBound();
-  }
-  return false;
-}
-
-/**
- * Put two fenced calls in flight TOGETHER: the team's identity authority is held from a connection
- * of the test's own until both are waiting on it — which is before either has observed anything,
- * because the fenced action enters the boundary first. Released, they run one after the other, and
- * the second observes what the first committed.
- *
- * The evidence is exact to this test: the two waits are in this database, each is an advisory wait
- * on THIS team's authority key, each is blocked by the test's own holder backend, and nothing but
- * that holder and the other of the two blocks either (the later arrival also queues behind the
- * earlier). Waits behind any other backend are not counted.
- */
-async function bothQueuedOnAuthority<T>(seed: Seed, first: () => Promise<T>, second: () => Promise<T>): Promise<[T, T]> {
-  const owner = await holdLock("select pg_advisory_xact_lock(hashtextextended($1,0))", [`${seed.teamId}:identity-authority`]);
-  const queued = { locktype: "advisory", onAuthority: true, blockedOnlyByThisTest: true };
-  let one: Promise<T> | undefined;
-  let other: Promise<T> | undefined;
-  let quiet = true;
-  try {
-    const authority = await authorityKey(seed);
-    one = first();
-    one.catch(() => undefined);
-    other = second();
-    other.catch(() => undefined);
-    await expect.poll(async () => {
-      const waits = (await lockWaits()).filter((wait) => wait.blockers.includes(owner.pid));
-      const own = new Set([owner.pid, ...waits.map((wait) => wait.pid)]);
-      return waits.map((wait) => ({
-        locktype: wait.locktype,
-        onAuthority: wait.key === authority,
-        blockedOnlyByThisTest: wait.blockers.every((pid) => own.has(pid)),
-      }));
-    }, { timeout: POLL_TIMEOUT_MS }).toEqual([queued, queued]);
-  } finally {
-    // On EVERY path — a failed poll included — the holder is released and both calls are settled.
-    const ownBackends = await waitersBehind(owner.pid);
-    await owner.release();
-    quiet = await settleRaced([one, other], ownBackends);
-  }
-  if (!quiet) throw new Error("the queued calls did not finish after the team authority was released");
-  return [await one!, await other!];
-}
-
-/**
- * THE DETERMINISTIC RACE. `first` is started and PARKED: it must come to wait on the barrier (a
- * `relation` or `advisory` wait, blocked by the barrier's backend and nothing else). Only then is
- * `second` started, and it must come to wait on THIS team's identity-authority advisory key,
- * blocked by `first`'s backend and nothing else. Then the barrier is released and both finish.
- * Every step is evidence read from `pg_locks` for this database; if `second` did not wait behind
- * `first` (or waited on anything else), the poll fails rather than the test passing by timing.
- *
- * On EVERY path — a failed or timed-out poll included — the barrier is released and whatever was
- * started is settled within a bound, so nothing raced here outlives its test.
- */
-async function parkThenCompete<A, B>(opts: {
-  seed: Seed;
-  barrier: Barrier;
-  parksOn: "relation" | "advisory";
-  first: () => Promise<A>;
-  second: () => Promise<B>;
-}): Promise<{ first: A; second: B }> {
-  let first: Promise<A> | undefined;
-  let second: Promise<B> | undefined;
-  let quiet = true;
-  try {
-    const authority = await authorityKey(opts.seed);
-    const parkedOnBarrier = { locktype: opts.parksOn, authority: false, blockedBy: [opts.barrier.pid] };
-    first = opts.first();
-    first.catch(() => undefined);
-    const parked = await untilWaiting([parkedOnBarrier], [opts.barrier.pid], authority);
-    const holder = parked[0].pid;
-    second = opts.second();
-    second.catch(() => undefined);
-    await untilWaiting(
-      [parkedOnBarrier, { locktype: "advisory", authority: true, blockedBy: [holder] }],
-      [opts.barrier.pid, holder],
-      authority,
-    );
-  } finally {
-    const ownBackends = await waitersBehind(opts.barrier.pid);
-    await opts.barrier.release();
-    quiet = await settleRaced([first, second], ownBackends);
-  }
-  if (!quiet) throw new Error("the raced operations did not finish after their barrier was released");
-  return { first: await first!, second: await second! };
+  expect(await unlink(seed, provider, shown.externalId, { memberId, revision: shown.revision })).toEqual({ ok: true });
 }
 
 /** The team's identity audit rows in commit order: which id, and what was done to it. */
@@ -387,9 +174,18 @@ async function auditOrder(seed: Seed): Promise<[string, string][]> {
 }
 
 beforeEach(() => {
+  // A race whose cleanup could not be proven may have left sessions holding locks. Nothing else in
+  // this file may run as if it had been cleaned up.
+  const fatal = raceHarnessFatal();
+  if (fatal) throw new Error(fatal);
   admin.teamId = "";
   admin.memberId = "";
   deferred.callbacks.length = 0;
+  revalidated.paths.length = 0;
+});
+
+afterAll(async () => {
+  await closeRaceHarness();
 });
 
 describe.each(PROVIDERS)("AIO-1167 X-02 — %s: the Admin link keeps the displayed identity apart from the requested id (real Postgres)", (provider) => {
@@ -719,7 +515,7 @@ describe.each(PROVIDERS)("AIO-1167 X-02 — %s: the fenced decision is ONE bound
     const nextB = idFor(provider, "next");
     const unlink = await parkThenCompete({
       seed,
-      barrier: await holdIdentityKey(seed, provider, nextB),
+      barrier: await holdIdentityKey(seed.teamId, provider, nextB),
       parksOn: "advisory",
       first: () => link(seed, alice, provider, nextB, { original: shownB }),
       second: () => removeMemberIdentity(db(), seed.teamId, { provider, externalId: shownB.externalId }, { expectedRevision: shownB.revision }),
