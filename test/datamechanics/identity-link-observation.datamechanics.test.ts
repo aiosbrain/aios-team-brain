@@ -20,8 +20,11 @@ import { db, seedTeam, type Seed } from "./helpers";
  *   2. the displayed identity, when a different id is requested, must still be what the admin saw
  *      (stale ORIGINAL), and a confirmation must name the revision the admin was shown (stale
  *      TARGET) — otherwise nothing is written;
- *   3. an id another member holds is OFFERED as a remap and written only on explicit confirmation,
- *      for every provider and from either kind of row;
+ *   3. an id another member holds is OFFERED as a remap and written only on explicit confirmation
+ *      at the observed target revision — from a Change row for every provider, and from a blank
+ *      row for Slack / Linear / Plane. The Google ADD protection is kept: a blank Google row naming
+ *      an identity that is already linked is refused outright, with no offer and no write, while
+ *      it may still claim a new identity or re-link an unlinked tombstone;
  *   4. the write, its audit actor, its epoch and its repair obligation are the shared writer's,
  *      once per mapping change — and a refusal or an offer causes none of them.
  *
