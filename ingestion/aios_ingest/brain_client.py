@@ -12,6 +12,7 @@ import math
 import os
 import random
 import time
+import uuid
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
@@ -28,6 +29,8 @@ _DEFAULT_MAX_PER_MIN = 100
 _MAX_RETRIES = 5
 _GDRIVE_CHECKPOINT_MAX_ATTEMPTS = 6
 _GDRIVE_CHECKPOINT_DEADLINE_SECONDS = 45.0
+# Provider ids one source-reconcile request may carry (the brain's GDRIVE_SNAPSHOT_PAGE_LIMIT).
+_GDRIVE_SNAPSHOT_PAGE = 10_000
 _SCAN_RATE_LIMIT_WINDOW_SECONDS = 60
 # A codebase scan push is the heaviest single request: the brain projects every recent commit into
 # searchable items (with embeddings) synchronously before responding, which can far exceed the 30s
@@ -506,19 +509,49 @@ class BrainClient:
         complete_snapshot_ids: list[str] | None = None,
         reason: str,
     ) -> dict:
-        """Route verified removals through the brain's shared ingest cleanup owner."""
-        url = f"{self._base}/api/v1/items/source-reconcile"
-        body: dict = {
+        """Route verified removals through the brain's shared ingest cleanup owner.
+
+        A complete snapshot larger than one request is staged on the brain in pages that all name
+        one snapshot; only the last page is marked complete, and it carries the removals and the
+        snapshot's total so the brain applies the whole set atomically or not at all.
+        """
+        base: dict = {
             "source": "gdrive",
             "integration_id": execution.integration_id,
             "generation": execution.generation,
             "fence": execution.fence,
             "owner": execution.owner,
-            "removed_provider_ids": removed_provider_ids or [],
             "reason": reason,
         }
-        if complete_snapshot_ids is not None:
-            body["snapshot"] = {"complete": True, "provider_ids": complete_snapshot_ids}
+        removed = removed_provider_ids or []
+        if complete_snapshot_ids is None:
+            return await self._post_gdrive_reconcile({**base, "removed_provider_ids": removed})
+        if len(complete_snapshot_ids) <= _GDRIVE_SNAPSHOT_PAGE:
+            return await self._post_gdrive_reconcile({
+                **base, "removed_provider_ids": removed,
+                "snapshot": {"complete": True, "provider_ids": complete_snapshot_ids},
+            })
+        members = list(dict.fromkeys(complete_snapshot_ids))
+        snapshot_id = str(uuid.uuid4())
+        pages = [
+            members[start:start + _GDRIVE_SNAPSHOT_PAGE]
+            for start in range(0, len(members), _GDRIVE_SNAPSHOT_PAGE)
+        ]
+        for page in pages[:-1]:
+            await self._post_gdrive_reconcile({
+                **base, "removed_provider_ids": [],
+                "snapshot": {"complete": False, "provider_ids": page, "snapshot_id": snapshot_id},
+            })
+        return await self._post_gdrive_reconcile({
+            **base, "removed_provider_ids": removed,
+            "snapshot": {
+                "complete": True, "provider_ids": pages[-1],
+                "snapshot_id": snapshot_id, "total": len(members),
+            },
+        })
+
+    async def _post_gdrive_reconcile(self, body: dict) -> dict:
+        url = f"{self._base}/api/v1/items/source-reconcile"
         last_status = 503
         last_code = "retry_exhausted"
         last_message = "provider unavailable"

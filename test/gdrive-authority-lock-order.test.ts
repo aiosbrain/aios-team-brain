@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ApiAuth } from "@/lib/api/auth";
 
 /**
@@ -85,6 +85,7 @@ import {
   acquireGdriveExecution,
   authorizeGdriveAdminTestCall,
   authorizeGdriveProviderCall,
+  brokerGoogleAccessToken,
   checkpointGdriveExecution,
   provisionGdriveConnectorPrincipal,
   publishGdriveVerifiedConfig,
@@ -268,6 +269,71 @@ describe("Drive connection paths: identity authority → connection rows → mem
     // The lease/progress write is below the whole prefix.
     expect(indexOf(c.work, isWrite)).toBeGreaterThan(indexOf(c.work, isPrincipalLock));
     expect(c.count("begin")).toBe(1);
+  });
+});
+
+/**
+ * Spec. A token is released only while the execution is still current, and its release is recorded.
+ * The record is a write the broker awaits, so the last validation may not finish before it: a
+ * pause, disconnect, rebind or key rotation that commits while `gdrive.token_issued` is being
+ * written must not be followed by a token. The validation and the record are therefore ONE
+ * transaction — the connection and principal rows a revocation has to write stay locked from the
+ * check until the record commits — and that COMMIT is the last thing the broker does.
+ *
+ * The real-Postgres counterpart, with a real revocation queued behind a suspended record, is
+ * `test/datamechanics/gdrive-token-issuance-race.datamechanics.test.ts`.
+ */
+describe("token broker: the last validation and its issuance record are one transaction", () => {
+  const isIssuedRecord = (e: Entry) =>
+    e.sql.startsWith("insert into audit_log") && JSON.stringify(e.params).includes("gdrive.token_issued");
+  const isTransactionControl = (e: Entry) => ["begin", "commit", "rollback"].includes(e.sql);
+
+  beforeEach(() => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(
+      JSON.stringify({ access_token: "short-lived", expires_in: 600 }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ));
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it("records the issuance with the connection and principal rows still locked, and commits last", async () => {
+    // What the transaction that is open when the record is written has done so far.
+    let openWhenRecorded: Entry[] = [];
+    const answer = database();
+    const c = use(new ScriptedConnection((sql, params, log) => {
+      if (isIssuedRecord({ sql, params })) {
+        openWhenRecorded = log.slice(log.map((entry) => entry.sql).lastIndexOf("begin"));
+      }
+      return answer(sql, params);
+    }));
+    await expect(brokerGoogleAccessToken(connector, execution))
+      .resolves.toMatchObject({ accessToken: "short-lived" });
+
+    expect(which(c.log, isIssuedRecord)).toHaveLength(1);
+    // The record is written inside the validating transaction: both rows locked, neither released.
+    expect(openWhenRecorded[0]?.sql).toBe("begin");
+    expect(which(openWhenRecorded, isConnectionLock)).toHaveLength(1);
+    expect(which(openWhenRecorded, isPrincipalLock)).toHaveLength(1);
+    expect(which(openWhenRecorded.slice(1), isTransactionControl)).toEqual([]);
+    expect(indexOf(openWhenRecorded, isIssuedRecord)).toBeGreaterThan(
+      Math.max(indexOf(openWhenRecorded, isConnectionLock), indexOf(openWhenRecorded, isPrincipalLock)),
+    );
+    // Nothing follows the record but its COMMIT: no statement runs between the last check's commit
+    // and the token's return, so there is no window for a revocation to commit unseen.
+    expect(c.log.slice(indexOf(c.log, isIssuedRecord) + 1).map((entry) => entry.sql)).toEqual(["commit"]);
+  });
+
+  it("a revocation that committed during the provider refresh is refused, and nothing is recorded as issued", async () => {
+    const live = database();
+    const paused = database({ status: "disabled" });
+    let connectionLocks = 0;
+    const c = use(new ScriptedConnection((sql, params) =>
+      (isConnectionLock({ sql, params }) && ++connectionLocks > 1 ? paused : live)(sql, params)));
+    await expect(brokerGoogleAccessToken(connector, execution))
+      .rejects.toMatchObject({ code: "stale_execution" });
+    expect(connectionLocks).toBe(2);
+    expect(which(c.log, isIssuedRecord)).toEqual([]);
+    expect(c.log.at(-1)!.sql).toBe("rollback");
   });
 });
 

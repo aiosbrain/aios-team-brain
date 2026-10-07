@@ -833,16 +833,24 @@ export async function brokerGoogleAccessToken(auth: ApiAuth, ref: GdriveExecutio
     });
     throw new GdriveAuthorityError(revoked ? "reconnect_required" : "provider_unavailable", revoked ? "Google Drive connection requires reconnection" : "Google credential refresh is temporarily unavailable", revoked ? 409 : 503);
   }
-  // A pause, disconnect, scope change, lease replacement, or key revocation during refresh wins.
-  await withTransaction(async () => { await assertLockedExecution(auth, ref); });
   const granted = typeof payload.scope === "string"
     ? payload.scope.split(/\s+/).filter(Boolean)
     : (Array.isArray(credential.scopes) ? credential.scopes.map(String) : credential.configuredScopes);
   const expiresIn = Math.max(1, Math.min(Number(payload.expires_in) || 3600, 3600));
-  await audit((await import("@/lib/db/admin")).adminClient(), {
-    team_id: auth.teamId, actor_kind: "api_key", member_id: auth.memberId, api_key_id: auth.apiKeyId,
-    action: "gdrive.token_issued", target_type: "integration", target_id: ref.integrationId,
-    meta: { generation: ref.generation, fence: ref.fence, scopeCount: granted.length, expiresIn },
+  // A pause, disconnect, scope change, lease replacement, rebind, or key revocation during refresh
+  // wins — and so does one that arrives while the issuance is being recorded. The final validation
+  // and its `gdrive.token_issued` row are ONE transaction: the connection, authority, key and
+  // member rows stay locked from the check to COMMIT, so a revocation either committed first (and
+  // the check refuses) or queues behind this commit. Nothing is awaited between that commit and
+  // the return. A record PostgreSQL rejects aborts the transaction and the commit is refused, so
+  // the token is withheld rather than released unrecorded.
+  await withTransaction(async () => {
+    await assertLockedExecution(auth, ref);
+    await audit(adminClient(), {
+      team_id: auth.teamId, actor_kind: "api_key", member_id: auth.memberId, api_key_id: auth.apiKeyId,
+      action: "gdrive.token_issued", target_type: "integration", target_id: ref.integrationId,
+      meta: { generation: ref.generation, fence: ref.fence, scopeCount: granted.length, expiresIn },
+    });
   });
   return {
     accessToken: payload.access_token,

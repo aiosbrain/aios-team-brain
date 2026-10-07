@@ -2816,6 +2816,22 @@ create table if not exists gdrive_cleanup_obligations (
 create index if not exists gdrive_cleanup_obligations_retry_idx
   on gdrive_cleanup_obligations(updated_at, team_id);
 
+-- A complete selection snapshot too large for one reconcile request: its membership is staged here
+-- in bounded pages by the fenced execution that owns it, and applied — absence retired, these rows
+-- removed — by the one transaction that finalizes it. A connection holds at most one snapshot; a
+-- page for another snapshot or another execution replaces it. Nothing here establishes absence.
+create table if not exists gdrive_snapshot_members (
+  team_id uuid not null,
+  integration_id uuid not null,
+  snapshot_id uuid not null,
+  generation bigint not null check (generation > 0),
+  fence bigint not null check (fence > 0),
+  provider_id text not null,
+  created_at timestamptz not null default now(),
+  primary key (team_id, integration_id, snapshot_id, provider_id),
+  foreign key (team_id, integration_id) references gdrive_connection_authority(team_id, integration_id) on delete cascade
+);
+
 -- Graphiti projection state (idempotency for the brain → Graphiti projector, lib/graph/project).
 -- Graphiti does not dedupe by source id, so we track which brain rows we've already projected
 -- and the content hash we sent. Re-projection skips unchanged rows; changed content re-pushes

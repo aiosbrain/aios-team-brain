@@ -11,10 +11,31 @@ import {
 } from "@/lib/projects/context/gdrive-claims";
 import { advanceAuthorizationEpoch } from "@/lib/access/authorization-epoch";
 
+/** Provider ids one reconcile request may carry — and so the size of one staged snapshot page. */
+export const GDRIVE_SNAPSHOT_PAGE_LIMIT = 10_000;
+/** Members one staged snapshot may hold: the ceiling on what a connector can make the brain retain. */
+export const GDRIVE_SNAPSHOT_MEMBER_LIMIT = 1_000_000;
+
+/**
+ * A complete selection too large for one request. Its membership arrives as pages that all name one
+ * snapshot; every page is held in `gdrive_snapshot_members` and establishes nothing. The page
+ * marked complete finalizes it: in that one transaction the whole staged membership is checked
+ * against the declared total, absence is retired exactly as for a single-request snapshot, and the
+ * staged rows are removed.
+ */
+export interface GdriveStagedSnapshot {
+  snapshotId: string;
+  /** The execution staging it; pages staged under another generation or fence are discarded. */
+  generation: number;
+  fence: number;
+  /** Required on the finalizing page: the distinct provider ids in the whole snapshot. */
+  total?: number;
+}
+
 export interface GdriveReconcileInput {
   connectionId: string;
   removedProviderIds?: string[];
-  snapshot?: { complete: boolean; providerIds: string[] };
+  snapshot?: { complete: boolean; providerIds: string[]; staged?: GdriveStagedSnapshot };
   reason: string;
 }
 
@@ -22,6 +43,72 @@ export interface StagedGdriveReconciliation {
   candidates: number;
   snapshotApplied: boolean;
   cleanupQueued: number;
+  /** Members held for a staged snapshot that is not finalized yet. */
+  snapshotStaged?: number;
+}
+
+/** A staged snapshot that cannot be held, or cannot be finalized as the complete set it claims to be. */
+export class GdriveSnapshotError extends Error {
+  constructor(
+    readonly code: "snapshot_incomplete" | "snapshot_too_large",
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * Hold one page of a staged snapshot and return how many members the snapshot now has. A connection
+ * holds one snapshot: pages of any other, or of an execution that no longer owns the connection,
+ * are dropped here, so an abandoned upload is bounded by the next one. A replayed page is the same
+ * rows again. The caller's transaction owns all of it — a refusal leaves the staged set as it was.
+ */
+async function stageSnapshotPage(
+  teamId: string,
+  connectionId: string,
+  staged: GdriveStagedSnapshot,
+  providerIds: readonly string[],
+  finalizing: boolean,
+): Promise<number> {
+  await runSql(
+    `delete from gdrive_snapshot_members
+      where team_id=$1 and integration_id=$2
+        and (snapshot_id<>$3 or generation<>$4 or fence<>$5)`,
+    [teamId, connectionId, staged.snapshotId, staged.generation, staged.fence],
+  );
+  if (providerIds.length > 0) {
+    await runSql(
+      `insert into gdrive_snapshot_members(team_id,integration_id,snapshot_id,generation,fence,provider_id)
+       select $1::uuid,$2::uuid,$3::uuid,$4::bigint,$5::bigint,page.provider_id
+         from unnest($6::text[]) as page(provider_id)
+       on conflict do nothing`,
+      [teamId, connectionId, staged.snapshotId, staged.generation, staged.fence, providerIds],
+    );
+  }
+  const { rows } = await runSql<{ count: string | number }>(
+    `select count(*)::bigint as count from gdrive_snapshot_members
+      where team_id=$1 and integration_id=$2 and snapshot_id=$3`,
+    [teamId, connectionId, staged.snapshotId],
+  );
+  const members = Number(rows[0]?.count ?? 0);
+  if (members > GDRIVE_SNAPSHOT_MEMBER_LIMIT) {
+    throw new GdriveSnapshotError(
+      "snapshot_too_large",
+      `a staged Google Drive snapshot holds at most ${GDRIVE_SNAPSHOT_MEMBER_LIMIT} documents`,
+      422,
+    );
+  }
+  // Completion is a claim about the whole set. A lost page, or a finalization replayed after its
+  // pages were consumed, does not add up to the declared total — and then nothing is absent.
+  if (finalizing && members !== staged.total) {
+    throw new GdriveSnapshotError(
+      "snapshot_incomplete",
+      `staged Google Drive snapshot holds ${members} of ${staged.total ?? "an undeclared number of"} documents`,
+      409,
+    );
+  }
+  return members;
 }
 
 /** Short authoritative phase. No graph call or physical item/cache deletion is allowed here. */
@@ -37,17 +124,36 @@ export async function stageGdriveReconciliation(
   return withTransaction(async () => {
     const snapshotApplied = input.snapshot?.complete === true;
     const explicit = [...new Set((input.removedProviderIds ?? []).map((id) => id.trim()).filter(Boolean))];
-    const selected = input.snapshot?.complete
+    const staged = input.snapshot?.staged;
+    const pageIds = input.snapshot
       ? [...new Set(input.snapshot.providerIds.map((id) => id.trim()).filter(Boolean))]
       : [];
-    const { rows } = await runSql<{ provider_id: string }>(
-      `select provider_id from gdrive_item_claims
-        where team_id=$1 and integration_id=$2 and active
-          and (provider_id=any($3::text[])
-               or ($4::boolean and not (provider_id=any($5::text[]))))
-        order by provider_id`,
-      [teamId, connectionId, explicit, snapshotApplied, selected],
-    );
+    // A staged page is held before anything is decided, and decides nothing unless it finalizes.
+    const snapshotStaged = staged
+      ? await stageSnapshotPage(teamId, connectionId, staged, pageIds, snapshotApplied)
+      : undefined;
+    const selected = snapshotApplied && !staged ? pageIds : [];
+    const { rows } = staged && snapshotApplied
+      // The same absence rule, read against the staged membership instead of one request's array.
+      ? await runSql<{ provider_id: string }>(
+          `select c.provider_id from gdrive_item_claims c
+            where c.team_id=$1 and c.integration_id=$2 and c.active
+              and (c.provider_id=any($3::text[])
+                   or not exists (
+                     select 1 from gdrive_snapshot_members s
+                      where s.team_id=c.team_id and s.integration_id=c.integration_id
+                        and s.snapshot_id=$4 and s.provider_id=c.provider_id))
+            order by c.provider_id`,
+          [teamId, connectionId, explicit, staged.snapshotId],
+        )
+      : await runSql<{ provider_id: string }>(
+          `select provider_id from gdrive_item_claims
+            where team_id=$1 and integration_id=$2 and active
+              and (provider_id=any($3::text[])
+                   or ($4::boolean and not (provider_id=any($5::text[]))))
+            order by provider_id`,
+          [teamId, connectionId, explicit, snapshotApplied, selected],
+        );
     // Same order as Drive ingest: the connection authority and audience project rows (held by the
     // route's execution commit) come first, then EVERY provider identity this pass will touch and
     // its mapping row, then every item-attribution advisory and the complete set of item rows, both
@@ -64,6 +170,13 @@ export async function stageGdriveReconciliation(
       if (retired.itemId && !retired.survives) cleanupQueued++;
     }
     if (rows.length > 0) await advanceAuthorizationEpoch(teamId);
+    if (!staged) return { candidates: rows.length, snapshotApplied, cleanupQueued };
+    if (!snapshotApplied) return { candidates: rows.length, snapshotApplied, cleanupQueued, snapshotStaged };
+    // Finalized: the membership has been applied and commits with its own removal.
+    await runSql(
+      `delete from gdrive_snapshot_members where team_id=$1 and integration_id=$2`,
+      [teamId, connectionId],
+    );
     return { candidates: rows.length, snapshotApplied, cleanupQueued };
   });
 }

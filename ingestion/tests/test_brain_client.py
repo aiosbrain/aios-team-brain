@@ -505,3 +505,59 @@ async def test_codebase_scan_retry_behaviour_survives_the_new_admission_statuses
 
     assert len(attempts) == 2
     assert sleeps == [2]
+
+
+_RECONCILE_EXECUTION = GdriveExecution(
+    "11111111-1111-1111-1111-111111111111", 2, 4,
+    "22222222-2222-2222-2222-222222222222", "later", "scope", {},
+)
+
+
+async def test_gdrive_snapshot_within_one_request_is_sent_whole():
+    bodies: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(req.content))
+        return httpx.Response(200, json={"items": 0})
+
+    ids = [f"doc-{n}" for n in range(10_000)]
+    async with _client(httpx.MockTransport(handler)) as c:
+        await c.reconcile_gdrive(
+            _RECONCILE_EXECUTION, complete_snapshot_ids=ids, reason="complete scope",
+        )
+
+    assert len(bodies) == 1
+    assert bodies[0]["snapshot"] == {"complete": True, "provider_ids": ids}
+
+
+async def test_gdrive_snapshot_above_one_request_is_staged_in_pages_and_finalized_once():
+    """A selection of more than 10,000 documents must reconcile, not fail validation forever."""
+    bodies: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/api/v1/items/source-reconcile"
+        bodies.append(json.loads(req.content))
+        return httpx.Response(200, json={"items": 3 if bodies[-1]["snapshot"]["complete"] else 0})
+
+    ids = [f"doc-{n}" for n in range(25_001)]
+    async with _client(httpx.MockTransport(handler)) as c:
+        result = await c.reconcile_gdrive(
+            _RECONCILE_EXECUTION, complete_snapshot_ids=ids, removed_provider_ids=["gone"],
+            reason="complete scope",
+        )
+
+    assert result == {"items": 3}
+    snapshots = [body["snapshot"] for body in bodies]
+    # No request exceeds the brain's per-request bound, and together they are exactly the set.
+    assert [len(s["provider_ids"]) for s in snapshots] == [10_000, 10_000, 5_001]
+    assert [pid for s in snapshots for pid in s["provider_ids"]] == ids
+    # Every page names the one snapshot, under the one execution.
+    assert len({s["snapshot_id"] for s in snapshots}) == 1
+    assert {(b["integration_id"], b["generation"], b["fence"], b["owner"]) for b in bodies} == {
+        (_RECONCILE_EXECUTION.integration_id, 2, 4, _RECONCILE_EXECUTION.owner),
+    }
+    # Only the last page claims completeness; it alone states the total and carries the removals.
+    assert [s["complete"] for s in snapshots] == [False, False, True]
+    assert ["total" in s for s in snapshots] == [False, False, True]
+    assert snapshots[-1]["total"] == 25_001
+    assert [b["removed_provider_ids"] for b in bodies] == [[], [], ["gone"]]
