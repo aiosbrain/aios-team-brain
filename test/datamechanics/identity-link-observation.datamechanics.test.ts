@@ -854,12 +854,17 @@ describe("AIO-1167 X-02 — the listing FAILS rather than display what it could 
 
     // The listing's own statement is made to fail in PostgreSQL: inside a transaction of this
     // test's own, a temporary view without the columns it reads stands in front of the table. The
-    // transaction is rolled back, so the view never exists outside it.
+    // transaction is rolled back on EVERY path, so the view never exists outside it: the listing's
+    // own error rolls it back, and a listing that wrongly succeeded is carried out by a throw too —
+    // returning would commit the view onto a pooled session, in front of the table for every later
+    // test that session serves.
     const failure = await withTransaction(async () => {
       await runSql("create temporary view member_identities as select 1 as unrelated");
-      return listMemberIdentities(db(), seed.teamId);
+      throw new RolledBack(await listMemberIdentities(db(), seed.teamId));
     }).then(() => null, (error: unknown) => error);
 
+    // The listing's own error — not the carrier of a listing that came back.
+    expect(failure).not.toBeInstanceOf(RolledBack);
     expect(failure).toBeInstanceOf(Error);
     expect((failure as Error).message).toMatch(/^member identities read failed: /);
     // CONTROL: outside that transaction the very same call reads the link.

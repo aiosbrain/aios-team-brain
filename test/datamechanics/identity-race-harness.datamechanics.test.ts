@@ -235,10 +235,13 @@ describe("race harness (1): a barrier's cleanup is proven — after a failed acq
     // in the private state, which the real run does not read. So the real run carries a sentinel
     // of its own for as long as that session may exist (see `stagedOnRealRun`).
     const staged = stagedOnRealRun("a barrier staged to survive its release");
-    const barrier = await holdNamedLock(`harness-survivor:${randomUUID()}`, {
-      tag, safety, cleanupMs: 300, dispose: async (client) => { survivors.push(client); },
-    });
     try {
+      // Acquired INSIDE the `try`: the seam below keeps the session open even when acquisition
+      // itself fails, so that failure too must reach the `finally` that closes it and sees it gone.
+      // The barrier exists only from here on — nothing below can release one that was not handed out.
+      const barrier = await holdNamedLock(`harness-survivor:${randomUUID()}`, {
+        tag, safety, cleanupMs: 300, dispose: async (client) => { survivors.push(client); },
+      });
       expect(safety.armed()).toEqual([tag]);
       expect(currentRunSafety().armed(), "the real run: the sentinel, and only the sentinel").toEqual([staged.scope]);
 
@@ -263,6 +266,8 @@ describe("race harness (1): a barrier's cleanup is proven — after a failed acq
     } finally {
       // The suite is left safe: the survivor is really closed, SEEN gone — and only then does the
       // real run's sentinel come off. If it cannot be seen gone, this throws and the sentinel stays.
+      // The same on a failed acquisition: whatever session it opened was kept by the seam, is in
+      // `survivors`, and went by this tag — and if it opened none, none is there to be seen.
       for (const client of survivors) await client.end().catch(() => undefined);
       await untilBarrierGone(tag);
       staged.clear();
@@ -339,19 +344,26 @@ describe("race harness (1, in a schedule): a surviving barrier makes the whole s
     const survivors: Client[] = [];
     // Two REAL sessions are staged here that only a private state knows about: the surviving
     // barrier, and a writer parked holding the team authority. The real run carries a sentinel for
-    // both, which comes off only when the barrier is seen gone AND the writer was seen idle.
+    // both, which comes off only when the barrier is seen gone AND the writer — if one was ever
+    // started — was seen idle.
     const staged = stagedOnRealRun("a surviving barrier and a parked writer");
+    let writerStarted = false;
     let writerSeenIdle = false;
-    // The barrier holds the new id's own key, which the writer takes after the team authority.
-    const barrier = await holdIdentityKey(seed.teamId, "slack", fresh, {
-      tag, safety, cleanupMs: 300, dispose: async (client) => { survivors.push(client); },
-    });
     try {
+      // Acquired INSIDE the `try`, for the reason given in the test above: the seam keeps the
+      // session open even when acquisition fails. The barrier holds the new id's own key, which the
+      // writer takes after the team authority.
+      const barrier = await holdIdentityKey(seed.teamId, "slack", fresh, {
+        tag, safety, cleanupMs: 300, dispose: async (client) => { survivors.push(client); },
+      });
       const failure = await parkThenCompete({
         seed,
         barrier,
         parksOn: "advisory",
-        first: () => linkFresh(seed, alice, fresh).then(() => "linked", (error: unknown) => (error as { code?: string }).code ?? "failed"),
+        first: () => {
+          writerStarted = true;
+          return linkFresh(seed, alice, fresh).then(() => "linked", (error: unknown) => (error as { code?: string }).code ?? "failed");
+        },
         second: async () => "finished without waiting",
         bounds: { cleanupMs: 300 },
       }).then(() => null, (error: unknown) => error);
@@ -382,11 +394,14 @@ describe("race harness (1, in a schedule): a surviving barrier makes the whole s
       expect(raceHarnessFatal()).toBeNull();
       expect(currentRunSafety().armed(), "the real run: the sentinel, and only the sentinel").toEqual([staged.scope]);
     } finally {
-      // The survivor is really closed and SEEN gone. The sentinel comes off only if, as well, the
-      // writer was seen idle above; otherwise it stays, and the real run stops.
+      // The survivor is really closed and SEEN gone — on a failed acquisition too, where the seam
+      // kept whatever session was opened. The sentinel comes off only if, as well, no writer is
+      // unaccounted for: none was ever started (the barrier was not acquired, or the schedule never
+      // reached it), or the one that was started was seen idle above. Otherwise it stays, and the
+      // real run stops.
       for (const client of survivors) await client.end().catch(() => undefined);
       await untilBarrierGone(tag);
-      if (writerSeenIdle) staged.clear();
+      if (!writerStarted || writerSeenIdle) staged.clear();
     }
     // The sentinel took nothing else with it: the staged state is still stopped, its scope still on
     // file, and the real run is clean.
