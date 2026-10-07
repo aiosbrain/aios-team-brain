@@ -520,14 +520,15 @@ describe("known-root decorated session — statement order, refreshed timeouts, 
           script.onTimeouts?.(assignments, log.filter((entry) => entry.kind === "data").length);
           return { rows: [{}], rowCount: 1 };
         }
-        if (/pg_settings|current_setting\s*\(|^\s*show\b/i.test(text)) {
+        // The model answers ONE way of reading the settings: the `pg_settings` catalog, whose
+        // `setting` is the server-normalized value in the setting's own unit (milliseconds here).
+        // Any other read reaches the script as a data statement.
+        if (/\bpg_settings\b/i.test(text)) {
           log.push({ kind: "settings-read" });
-          const rows = /pg_settings/i.test(text)
-            ? [
-                { name: "statement_timeout", setting: String(effective.statementMs), unit: "ms" },
-                { name: "lock_timeout", setting: String(effective.lockMs), unit: "ms" },
-              ]
-            : [{ statement_timeout: `${effective.statementMs}ms`, lock_timeout: `${effective.lockMs}ms` }];
+          const rows = [
+            { name: "statement_timeout", setting: String(effective.statementMs), unit: "ms" },
+            { name: "lock_timeout", setting: String(effective.lockMs), unit: "ms" },
+          ];
           return { rows, rowCount: rows.length };
         }
         log.push({ kind: "data", text, effective: { ...effective } });
@@ -568,7 +569,16 @@ describe("known-root decorated session — statement order, refreshed timeouts, 
   function expectOrdered(scripted: Scripted): void {
     const kinds = scripted.log.map((entry) => entry.kind);
     expect(kinds[0], "the original settings are read first").toBe("settings-read");
-    expect(kinds.filter((kind) => kind === "settings-read"), "the originals are read once, at entry").toHaveLength(1);
+    // Between that first read and the last data statement the settings are only ever SET, each time
+    // just before a data statement. A read-back that verifies the restoration afterwards is allowed;
+    // a second read in the middle would not be the originals any more.
+    const lastData = kinds.lastIndexOf("data");
+    expect(kinds.slice(1, Math.max(lastData, 1)).filter((kind) => kind === "settings-read"), "no settings read between entry and the last data statement").toEqual([]);
+    // Every assignment before the last data statement belongs to a data statement: it is directly
+    // followed by one. Nothing is set and then left unused in the middle of the operation.
+    kinds.slice(0, Math.max(lastData, 0)).forEach((kind, index) => {
+      if (kind === "timeouts") expect(kinds[index + 1], `the assignment at ${index} is followed by its data statement`).toBe("data");
+    });
     scripted.log.forEach((entry, index) => {
       if (entry.kind !== "data") return;
       const previous = scripted.log[index - 1];
@@ -585,8 +595,25 @@ describe("known-root decorated session — statement order, refreshed timeouts, 
 
   /** A normal result leaves both settings exactly as it found them, and the restoring assignment is the last statement. */
   function expectRestored(scripted: Scripted): void {
-    expect(scripted.log.at(-1)?.kind, "the last statement restores the settings").toBe("timeouts");
+    // What follows the last data statement (or the entry read, when no data statement ran) is the
+    // restoration and nothing else: at least one assignment, optionally a read-back that verifies it,
+    // and never another data statement or an assignment after that read-back.
+    const kinds = scripted.log.map((entry) => entry.kind);
+    const tail = kinds.slice(Math.max(kinds.lastIndexOf("data"), 0) + 1);
+    expect(tail.filter((kind) => kind === "data"), "no data statement follows the restoration").toEqual([]);
+    expect(tail.filter((kind) => kind === "timeouts").length, "the settings are restored after the last data statement").toBeGreaterThanOrEqual(1);
+    const firstReadBack = tail.indexOf("settings-read");
+    if (firstReadBack >= 0) expect(tail.slice(firstReadBack), "nothing but read-backs follows a read-back").toEqual(tail.slice(firstReadBack).map(() => "settings-read"));
     expect(scripted.effective, "both original settings are in effect again").toEqual(scripted.original);
+  }
+
+  /** After a failed data statement nothing more is sent: no assignment, no restoration, no read, no data. */
+  function expectNothingAfterLastData(scripted: Scripted): void {
+    const kinds = scripted.log.map((entry) => entry.kind);
+    const lastData = kinds.lastIndexOf("data");
+    expect(lastData, "a data statement was dispatched").toBeGreaterThanOrEqual(0);
+    expect(kinds.slice(lastData + 1), "no statement of any kind was sent after the failing data statement").toEqual([]);
+    expect(kinds.slice(lastData + 1).filter((kind) => kind === "timeouts"), "in particular no timeout assignment or restoration").toEqual([]);
   }
 
   it("reads the original settings first, then sets both timeouts afresh before EVERY data statement from the time that is left (control)", async () => {
@@ -644,36 +671,51 @@ describe("known-root decorated session — statement order, refreshed timeouts, 
   // context was created yields more "remaining" than the allowance that was declared, and that is
   // handed to the server as the statement timeout. With the original limit disabled nothing else
   // caps it. A context never grants more than its own allowance, whatever the clock says later.
-  it.each<[string, (scripted: Scripted, context: never) => Promise<unknown>]>([
+  //
+  // One case per module AND per allowance, so each is reported on its own.
+  const REGRESSING_SUBJECTS: [string, (scripted: Scripted, context: never) => Promise<unknown>][] = [
     ["the page reader", (scripted, context) => readSlackKnownRootItemPage(scripted.session, pageRequest, context)],
     ["the preparer", (scripted, context) => prepareSlackKnownRootRequeue(scripted.session, { teamId: TEAM, entry: located() }, context)],
-  ])("never sets a statement timeout above the declared allowance when the monotonic clock regresses: %s", async (_label, run) => {
-    for (const allowanceMs of [1_000, 2_000, 5_000]) {
-      let regressed = false;
-      const scripted = scriptedSession({ original: { statementMs: 0, lockMs: 0 }, respond: () => [] });
-      const context = createSlackKnownRootExecution({
-        allowanceMs, ambientDeadlineAt: null, monotonicNow: () => (regressed ? 400_000 : 1_000_000),
-      });
-      // Ten minutes EARLIER on every reading after creation.
-      regressed = true;
-      let rejected: unknown;
-      try {
-        await run(scripted, context as never);
-      } catch (error) {
-        rejected = error;
-      }
-      // Either the operation ran under its allowance, or it refused the clock outright: what it may
-      // not do is run a statement with more time than the context declared.
-      if (rejected !== undefined) expectNoCanary(rejected, "a refusal of the clock");
-      expect(scripted.data().length > 0 || rejected !== undefined, "the operation ran a statement or refused").toBe(true);
-      for (const statement of scripted.data()) {
-        expect(statement.effective.statementMs, `allowance ${allowanceMs}: statement timeout`).toBeGreaterThanOrEqual(1);
-        expect(statement.effective.statementMs, `allowance ${allowanceMs}: statement timeout`).toBeLessThanOrEqual(allowanceMs);
-        expect(statement.effective.lockMs, `allowance ${allowanceMs}: lock timeout`).toBeLessThanOrEqual(SLACK_KNOWN_ROOT_LIMITS.lockTimeoutMs);
-      }
-      for (const assignment of scripted.assignments().filter((candidate) => candidate.name === "statement_timeout" && candidate.ms !== 0)) {
-        expect(assignment.ms, `allowance ${allowanceMs}: no statement timeout assignment exceeds it`).toBeLessThanOrEqual(allowanceMs);
-      }
+  ];
+  const REGRESSING_CASES = REGRESSING_SUBJECTS.flatMap(([subject, run]) =>
+    [1_000, 2_000, 5_000].map((allowanceMs): [string, number, typeof run] => [subject, allowanceMs, run]));
+
+  it.each(REGRESSING_CASES)("never sets a statement timeout above the declared allowance when the monotonic clock regresses: %s, allowance %d ms", async (_subject, allowanceMs, run) => {
+    let regressed = false;
+    const scripted = scriptedSession({ original: { statementMs: 0, lockMs: 0 }, respond: () => [] });
+    const context = createSlackKnownRootExecution({
+      allowanceMs, ambientDeadlineAt: null, monotonicNow: () => (regressed ? 400_000 : 1_000_000),
+    });
+    // Ten minutes EARLIER on every reading after creation.
+    regressed = true;
+    let rejected: unknown;
+    let settled = false;
+    try {
+      await run(scripted, context as never);
+      settled = true;
+    } catch (error) {
+      rejected = error;
+    }
+    // Either the operation ran under its allowance, or it refused the clock outright: what it may
+    // not do is run a statement with more time than the context declared.
+    if (!settled) {
+      // A refusal is one of the packet's two static errors, exactly — never an arbitrary rejection,
+      // and never something a dependency or the session happened to throw.
+      const staticRefusal =
+        (rejected instanceof SlackKnownRootValidationError && rejected.message === STATIC_VALIDATION_MESSAGE) ||
+        (rejected instanceof SlackKnownRootDeadlineError && rejected.message === STATIC_DEADLINE_MESSAGE);
+      expect(staticRefusal, "a refusal of a regressing clock is the static validation or deadline error").toBe(true);
+      expectNoCanary(rejected, "a refusal of the clock");
+    }
+    expect(scripted.data().length > 0 || !settled, "the operation ran a statement or refused").toBe(true);
+    for (const statement of scripted.data()) {
+      expect(statement.effective.statementMs, "statement timeout").toBeGreaterThanOrEqual(1);
+      expect(statement.effective.statementMs, "statement timeout").toBeLessThanOrEqual(allowanceMs);
+      expect(statement.effective.lockMs, "lock timeout").toBeGreaterThanOrEqual(1);
+      expect(statement.effective.lockMs, "lock timeout").toBeLessThanOrEqual(Math.min(SLACK_KNOWN_ROOT_LIMITS.lockTimeoutMs, allowanceMs));
+    }
+    for (const assignment of scripted.assignments().filter((candidate) => candidate.name === "statement_timeout" && candidate.ms !== 0)) {
+      expect(assignment.ms, "no statement timeout assignment exceeds the allowance").toBeLessThanOrEqual(allowanceMs);
     }
   });
 
@@ -734,6 +776,12 @@ describe("known-root decorated session — statement order, refreshed timeouts, 
     expect(error, "the very same error object, for the caller's rollback and retry logic").toBe(failure);
     expect(scripted.data(), "the failing statement was the only data statement").toHaveLength(1);
     expect(scripted.log.at(-1)?.kind, "nothing was sent after the failed statement").toBe("data");
+    // Read off the event log itself: after the failing data statement there is no assignment, no
+    // restoration, no read and no further data statement.
+    expectNothingAfterLastData(scripted);
+    // …and the assignment that preceded the failing statement is therefore still in effect on the
+    // model: the settings were NOT put back by the packet. Rollback is what undoes them.
+    expect(scripted.effective, "no restoring assignment was applied").not.toEqual(scripted.original);
     expect(scripted.maxInFlight()).toBe(1);
     expect(classifySlackKnownRootPreparationFailure(error)).toBe("statement_timeout");
   });
@@ -825,23 +873,50 @@ describe("known-root decorated session — statement order, refreshed timeouts, 
   });
 
   it("leaves a retained executor unusable after a primitive that THREW as well (control)", async () => {
-    const scripted = scriptedSession({ respond: () => [] });
+    // The dependency runs one statement that works and one that FAILS on the caller's connection,
+    // and lets that failure propagate.
+    const failure = new Error("dependency failed");
+    const scripted = scriptedSession({
+      respond: (text) => {
+        if (/failing_probe/.test(text)) throw failure;
+        return [{ probe: 1 }];
+      },
+    });
     let handed: TransactionSession | null = null;
     gateSeat.current = async (session: unknown) => {
-      handed = session as TransactionSession;
-      throw new Error("dependency failed");
+      const decorated = session as TransactionSession;
+      handed = decorated;
+      await decorated.executeSql("select 1 as working_probe");
+      await decorated.executeSql("select 1 as failing_probe");
+      return { outcome: "locked" };
     };
     const error = await rejection(() => prepareSlackKnownRootRequeue(scripted.session, { teamId: TEAM, entry: located() }, execution()));
     expect(error).toBeInstanceOf(Error);
+    expect(error, "the dependency's own failure, as it was thrown").toBe(failure);
     expect(classifySlackKnownRootPreparationFailure(error)).toBe("dependency_failure");
     const kept = handed as unknown as TransactionSession;
     // As above: decided as a boolean, never by handing the getter-bearing session to a matcher.
     expect((handed as unknown) !== null, "the gate helper was handed a session").toBe(true);
+
+    // The event log, not an absence that was never possible: two data statements were dispatched,
+    // the second is the one that failed, and NOTHING was sent after it — no timeout assignment, no
+    // restoration, no read-back.
+    const data = scripted.data();
+    expect(data.map((statement) => /failing_probe/.test(statement.text)), "a working statement, then the failing one").toEqual([false, true]);
+    expectNothingAfterLastData(scripted);
+    // Each of the two was still preceded by its own assignment, and nothing was session-level.
+    const kinds = scripted.log.map((entry) => entry.kind);
+    expect(kinds[0], "the original settings were read first").toBe("settings-read");
+    kinds.forEach((kind, index) => {
+      if (kind === "data") expect(kinds[index - 1], `data statement ${index} was preceded by its assignment`).toBe("timeouts");
+    });
+    expect(scripted.assignments().filter((assignment) => !assignment.local)).toEqual([]);
+    // The settings in effect are the ones set for the failing statement: the packet restored nothing.
+    expect(scripted.effective, "no restoring assignment was applied").not.toEqual(scripted.original);
+
     const before = scripted.log.length;
     expect(await rejection(() => kept.executeSql("select 1 as late"))).toBeInstanceOf(Error);
     expect(scripted.log).toHaveLength(before);
-    // A dependency exception is not followed by a restoring statement either.
-    expect(scripted.assignments().filter((assignment) => !assignment.local)).toEqual([]);
   });
 });
 

@@ -196,7 +196,22 @@ function dependencyViolations(tree: ReadonlyMap<string, string>, module: string)
 
 // ── writes and effects ───────────────────────────────────────────────────────
 
-const DML_OR_DDL = /\b(?:insert\s+into|delete\s+from|update\s+[a-z_."]+\s+set|merge\s+into|truncate|alter\s+table|drop\s+table|create\s+(?:table|index|unique)|savepoint|begin\b|commit\b|rollback\b)/i;
+/**
+ * Data and schema writes, wherever they appear in a string of SQL. `UPDATE` is matched in every
+ * spelling that reaches a SET list — `update t set`, `update only t set`, `update t x set`,
+ * `update t as x set` — and `CREATE` for every object kind that persists or runs code. Transaction
+ * control is NOT here: those words are ordinary English, and are judged by statement below.
+ */
+const DML_OR_DDL = /\b(?:insert\s+into|delete\s+from|update\s+(?:only\s+)?[a-z_."]+(?:\s+(?:as\s+)?[a-z_"]+)?\s+set\b|merge\s+into|truncate\b|alter\s+table|drop\s+table|create\s+(?:or\s+replace\s+)?(?:table|index|unique|function|procedure|trigger|view|materialized|temp|temporary|unlogged)\b)/i;
+
+/**
+ * SQL text with its comments removed, so that neither a leading comment nor one placed between two
+ * keywords can hide what a statement does. (A `--` inside a string constant is cut too; that can
+ * only shorten what is examined after it, and never invents a violation.)
+ */
+function withoutSqlComments(text: string): string {
+  return text.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/--[^\n]*/g, " ");
+}
 
 /** The only settings the packet may change, and only for the current transaction (§7.3). */
 const TIMEOUT_SETTINGS: readonly string[] = ["statement_timeout", "lock_timeout"];
@@ -257,7 +272,7 @@ function sqlEffectViolations(text: string): string[] {
     else if (args[2].trim().toLowerCase() !== "true") found.push("session-level set_config");
   }
   for (const statement of text.split(";")) {
-    const head = statement.trimStart().toLowerCase();
+    const head = statement.trim().toLowerCase();
     if (/^set\s/.test(head)) {
       if (/^set\s+local\s/.test(head)) {
         if (!/^set\s+local\s+(?:statement_timeout|lock_timeout)\b/.test(head)) found.push("SET LOCAL of another setting");
@@ -268,8 +283,76 @@ function sqlEffectViolations(text: string): string[] {
     if (/^reset\s/.test(head)) found.push("RESET");
     if (/^lock\s/.test(head)) found.push("LOCK");
     if (/^do(?:\s|\$)/.test(head)) found.push("DO block");
+    // Transaction control, judged as a STATEMENT: the bare keyword, or the keyword followed by one
+    // of the words SQL allows after it. "the commit outcome is unknown" and "begin again later" are
+    // sentences, not statements, and are left alone.
+    const control = /^(begin|commit|rollback|end|abort)(?:\s+(?:transaction|work|isolation|read|deferrable|not|and|to|prepared)\b[\s\S]*)?$/.exec(head);
+    if (control) found.push(`"${control[1]}"`);
+    if (/^start\s+transaction\b/.test(head)) found.push('"start transaction"');
+    if (/^savepoint\s+[a-z_][a-z0-9_]*$/.test(head)) found.push('"savepoint"');
+    if (/^release\s+(?:savepoint\s+)?[a-z_][a-z0-9_]*$/.test(head)) found.push('"release savepoint"');
+    // A read that writes its result somewhere, a bulk transfer, and a procedure call.
+    if (/^(?:select|with|table)\b[\s\S]*\binto\s+(?:temp\s+|temporary\s+|unlogged\s+|table\s+|strict\s+)*[a-z_."]+/.test(head)) found.push("SELECT INTO");
+    if (/^copy\s+(?:\([\s\S]*\)|[a-z_."]+(?:\s*\([^)]*\))?)\s+(?:from|to)\b/.test(head)) found.push("COPY");
+    if (/^call\s+[a-z_."]+\s*\(/.test(head)) found.push("CALL");
   }
   return found;
+}
+
+/** The one function of the packet that may hold the caller's own, undecorated session. */
+const RAW_SESSION_OWNERS: readonly string[] = ["runSlackKnownRootOperation"];
+
+/**
+ * `file: function lets its raw session escape` for every exported function that does anything with
+ * a `TransactionSession` parameter except hand it, as the first argument, to the decorator.
+ *
+ * The caller's session enters the packet only through an exported function, and it is the RAW one:
+ * no deadline admission, no refreshed timeouts, a working `db` and `optionalAudit`. Everything else
+ * in the packet — its helpers and every dependency — must be given the decorated session the
+ * decorator builds. Structurally that means the raw parameter may appear in exactly one place. Using
+ * it directly, aliasing it, closing over it, or passing it to a helper or a dependency is an escape.
+ * A non-exported helper's own session parameter is the decorated one and is not examined here.
+ */
+function rawSessionEscapes(file: string, source: string): string[] {
+  const syntax = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true);
+  const escapes = new Set<string>();
+  const exportedFunctions: [string, ts.FunctionLikeDeclaration][] = [];
+  for (const statement of syntax.statements) {
+    const exported = ts.canHaveModifiers(statement) && (ts.getModifiers(statement)?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) ?? false);
+    if (!exported) continue;
+    if (ts.isFunctionDeclaration(statement) && statement.name) exportedFunctions.push([statement.name.text, statement]);
+    if (ts.isVariableStatement(statement)) {
+      for (const declaration of statement.declarationList.declarations) {
+        const value = declaration.initializer;
+        if (ts.isIdentifier(declaration.name) && value && (ts.isArrowFunction(value) || ts.isFunctionExpression(value))) {
+          exportedFunctions.push([declaration.name.text, value]);
+        }
+      }
+    }
+  }
+  for (const [name, declared] of exportedFunctions) {
+    if (RAW_SESSION_OWNERS.includes(name) || !declared.body) continue;
+    for (const parameter of declared.parameters) {
+      if (!ts.isIdentifier(parameter.name) || !parameter.type || parameter.type.getText(syntax) !== "TransactionSession") continue;
+      const raw = parameter.name.text;
+      const visit = (node: ts.Node): void => {
+        // A nested function that declares the same name has a session of its own.
+        if (ts.isFunctionLike(node) && node.parameters.some((inner) => ts.isIdentifier(inner.name) && inner.name.text === raw)) return;
+        if (ts.isIdentifier(node) && node.text === raw) {
+          const parent = node.parent;
+          const isName = (ts.isPropertyAccessExpression(parent) && parent.name === node) ||
+            (ts.isPropertyAssignment(parent) && parent.name === node) ||
+            (ts.isBindingElement(parent) && parent.propertyName === node);
+          const handedToOwner = ts.isCallExpression(parent) && ts.isIdentifier(parent.expression) &&
+            RAW_SESSION_OWNERS.includes(parent.expression.text) && parent.arguments[0] === node;
+          if (!isName && !handedToOwner && !ts.isVoidExpression(parent)) escapes.add(`${file}: ${name} lets its raw session escape`);
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(declared.body);
+    }
+  }
+  return [...escapes].sort();
 }
 
 /**
@@ -328,9 +411,11 @@ function effectViolations(file: string, source: string): string[] {
   const visit = (node: ts.Node): void => {
     if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateHead(node) ||
         ts.isTemplateMiddle(node) || ts.isTemplateTail(node)) {
-      const match = DML_OR_DDL.exec(node.text);
+      // Comments are removed first: one before a statement, or between two keywords, hides nothing.
+      const sql = withoutSqlComments(node.text);
+      const match = DML_OR_DDL.exec(sql);
       if (match) violations.add(`${file}: SQL "${match[0].toLowerCase().replace(/\s+/g, " ")}"`);
-      for (const effect of sqlEffectViolations(node.text)) violations.add(`${file}: SQL ${effect}`);
+      for (const effect of sqlEffectViolations(sql)) violations.add(`${file}: SQL ${effect}`);
       // A surface named by a string — `session["db"]`, `Reflect.get(session, "rpc")`, a key held in a
       // variable — is the same access. A string in a TYPE position (`Pick<…, "db">`) reads nothing.
       if (SESSION_SURFACES.includes(node.text) && !ts.isLiteralTypeNode(node.parent)) violations.add(`${file}: "${node.text}" as a key`);
@@ -677,11 +762,11 @@ describe("the known-root requeue packet stays inside its boundary", () => {
 
   // RED at the source-reviewed checkpoint: neither module carries the import yet. Both read a
   // decrypted token's fingerprint or hold a transaction session; neither may reach a client bundle.
-  it("marks both modules server-only with an explicit top-level import", () => {
-    const tree = readTree();
-    for (const packetModule of PACKET_MODULES) {
-      expect(importsServerOnly(packetModule, tree.get(packetModule) ?? ""), `${packetModule} imports "server-only"`).toBe(true);
-    }
+  // One case per module, so each is reported on its own and neither hides the other.
+  it.each(PACKET_MODULES)("marks %s server-only with an explicit top-level import", (packetModule) => {
+    const source = readTree().get(packetModule);
+    expect(source, `${packetModule} exists`).toBeDefined();
+    expect(importsServerOnly(packetModule, source ?? ""), `${packetModule} imports "server-only"`).toBe(true);
   });
 
   it("accepts only the plain static side-effect import as the server-only marker (negative control)", () => {
@@ -765,6 +850,133 @@ describe("the known-root requeue packet stays inside its boundary", () => {
     // Not SQL effects: an upsert's `do nothing`, a timeout NAME, and words that merely contain one.
     expect(of(sql("insert into t (a) values ($1) on conflict do nothing"))).toEqual([`${REQUEUE}: SQL "insert into"`]);
     expect(of(sql("select 'set statement_timeout' as words, lock_timeout from pg_settings"))).toEqual([]);
+  });
+
+  it("sees a write, a procedure, a bulk transfer or transaction control behind a comment or an unusual spelling, and leaves ordinary sentences alone (negative control)", () => {
+    const of = (source: string): string[] => effectViolations(REQUEUE, source);
+    const sql = (text: string): string => `const statement = ${JSON.stringify(text)};`;
+
+    const refused: [string, string][] = [
+      // UPDATE in every spelling that reaches a SET list.
+      ["update only items set member_id = null where id = $1", `SQL "update only items set"`],
+      ["update slack_sync_threads t set due_at = now() where t.team_id = $1", `SQL "update slack_sync_threads t set"`],
+      ["update slack_sync_threads as t set attempts = 0", `SQL "update slack_sync_threads as t set"`],
+      ["UPDATE ONLY public.items AS i SET path = $2", `SQL "update only public.items as i set"`],
+      ["with moved as (update items i set path = $2 where id = $1 returning id) select id from moved", `SQL "update items i set"`],
+      // A comment before the statement, or between its keywords, hides nothing.
+      ["-- restore the queue\nupdate slack_sync_threads set due_at = now()", `SQL "update slack_sync_threads set"`],
+      ["/* housekeeping */ delete from slack_sync_threads where team_id = $1", `SQL "delete from"`],
+      ["update /* quietly */ items -- really\n set kind = 'x'", `SQL "update items set"`],
+      ["insert /* x */ into slack_sync_threads (team_id) values ($1)", `SQL "insert into"`],
+      ["-- note; still one statement\n  set statement_timeout = 0", "SQL session-level SET"],
+      ["/* a */ -- b\n /* c */ lock table items", "SQL LOCK"],
+      ["  -- first\n  do $$ begin null; end $$", "SQL DO block"],
+      ["/* tx */ commit", `SQL "commit"`],
+      // A read that writes its result, a bulk transfer, a procedure call, and code that persists.
+      ["select id into temp table found from items where team_id = $1", "SQL SELECT INTO"],
+      ["select * into backup_threads from slack_sync_threads", "SQL SELECT INTO"],
+      ["with x as (select 1 as n) select n into unlogged y from x", "SQL SELECT INTO"],
+      ["copy slack_sync_threads to stdout", "SQL COPY"],
+      ["copy items (id, path) from stdin", "SQL COPY"],
+      ["copy (select id from items) to program 'cat'", "SQL COPY"],
+      ["call requeue_known_roots($1)", "SQL CALL"],
+      ["CALL public.sweep()", "SQL CALL"],
+      ["create function requeue() returns void language sql as 'select 1'", `SQL "create function"`],
+      ["create or replace function requeue() returns void language sql as 'select 1'", `SQL "create or replace function"`],
+      ["create procedure sweep() language sql as 'select 1'", `SQL "create procedure"`],
+      ["create temp table found as select 1", `SQL "create temp"`],
+      // Transaction control, as a statement.
+      ["begin", `SQL "begin"`],
+      ["BEGIN ISOLATION LEVEL SERIALIZABLE", `SQL "begin"`],
+      ["select 1; commit", `SQL "commit"`],
+      ["rollback to savepoint known_root", `SQL "rollback"`],
+      ["commit and chain", `SQL "commit"`],
+      ["end transaction", `SQL "end"`],
+      ["start transaction read only", `SQL "start transaction"`],
+      ["release savepoint known_root", `SQL "release savepoint"`],
+    ];
+    for (const [text, violation] of refused) expect(of(sql(text)), text).toContain(`${REQUEUE}: ${violation}`);
+
+    // The same words in ordinary strings that are not statements: error text, category names, and
+    // the read and lock forms the packet is allowed.
+    const untouched: string[] = [
+      "the commit outcome is unknown",
+      "slack known-root: nothing was committed before the rollback",
+      "begin again on a later sweep",
+      "end of the key range",
+      "a call to the provider is never made here",
+      "copy the entry before the first await",
+      "an update is never issued; the helper sets nothing but a pending row",
+      "commit_unknown",
+      "select the settings to restore",
+      "select id::text as id from items where team_id = $1::uuid order by id limit $2",
+      "select 1 as pending from slack_sync_threads where team_id = $1 limit 1",
+      "select i.kind from items i where i.id = $1 for update",
+      "select set_config('statement_timeout', $1, true), set_config('lock_timeout', $2, true)",
+      "set local lock_timeout = '250ms'",
+      "-- the scoped channel row, locked\nselect public_state from slack_sync_channels where team_id = $1 for update",
+    ];
+    for (const text of untouched) expect(of(sql(text)), text).toEqual([]);
+    // …and the packet's one write stays the existing helper, called on the decorated session.
+    expect(of("const enqueued = await enqueueSlackThread(decorated, { teamId, workspaceId, channelId, rootTs }, { dueAt });")).toEqual([]);
+  });
+
+  it("lets the caller's raw session reach nothing but the decorator", () => {
+    const tree = readTree();
+    for (const packetModule of PACKET_MODULES) expect(rawSessionEscapes(packetModule, tree.get(packetModule) ?? ""), packetModule).toEqual([]);
+    // Non-vacuity over the real tree: both exported primitives do take a raw session, and the
+    // decorator that owns it is where the real tree says it is.
+    for (const [packetModule, primitive] of [[PAGE, "readSlackKnownRootItemPage"], [REQUEUE, "prepareSlackKnownRootRequeue"]] as const) {
+      expect(tree.get(packetModule) ?? "").toMatch(new RegExp(`export async function ${primitive}\\(\\s*session: TransactionSession`));
+    }
+    expect(exportedNames(PAGE, tree.get(PAGE) ?? "")).toContain("runSlackKnownRootOperation");
+  });
+
+  it("sees a raw session used directly, aliased, closed over, or handed to a helper or a dependency (negative control)", () => {
+    const escapesOf = (body: string): string[] => rawSessionEscapes(REQUEUE, [
+      "export async function prepareSlackKnownRootRequeue(session: TransactionSession, input: Input, execution: Execution): Promise<Result> {",
+      body,
+      "}",
+      "async function prepareLocated(decorated: TransactionSession, entry: Entry): Promise<Result> {",
+      "  const gate = await lockReadySlackNamespaceGate(decorated, entry);",
+      "  await decorated.executeSql(QUEUE_SQL, []);",
+      "  return enqueueSlackThread(decorated, entry.scope, {});",
+      "}",
+    ].join("\n"));
+    const escape = [`${REQUEUE}: prepareSlackKnownRootRequeue lets its raw session escape`];
+
+    // The intended shape: the raw session goes to the decorator and nowhere else; the helper and the
+    // dependencies are handed the DECORATED one, which this check does not restrict.
+    expect(escapesOf("  return runSlackKnownRootOperation(session, execution, (decorated) => prepareLocated(decorated, entry));")).toEqual([]);
+    expect(escapesOf("  void session;\n  return runSlackKnownRootOperation<Result>(session, execution, async (decorated) => prepareLocated(decorated, entry));")).toEqual([]);
+    // A nested function that declares the same name has its own session.
+    expect(escapesOf("  return runSlackKnownRootOperation(session, execution, (session) => prepareLocated(session, entry));")).toEqual([]);
+
+    const escaping: string[] = [
+      "  return enqueueSlackThread(session, entry.scope, {});",
+      "  const selected = await lockSlackSelection(session, { teamId, integrationId });",
+      "  const gate = await lockReadySlackNamespaceGate(session, entry);",
+      "  return prepareLocated(session, entry);",
+      "  await session.executeSql(QUEUE_SQL, []);",
+      "  const raw = session;\n  return runSlackKnownRootOperation(raw, execution, work);",
+      "  const { executeSql } = session;",
+      "  return runSlackKnownRootOperation(session, execution, (decorated) => prepareLocated(session, entry));",
+      "  return runSlackKnownRootOperation(session, execution, () => helper({ session }));",
+      "  return runSlackKnownRootOperation(wrapped, execution, work, session);",
+      "  return someOtherRunner(session, execution, work);",
+      "  return runSlackKnownRootOperation(decorate(session), execution, work);",
+    ];
+    for (const body of escaping) expect(escapesOf(body), body).toEqual(escape);
+
+    // An exported arrow function is an entry point as well; the decorator itself is the one owner.
+    expect(rawSessionEscapes(REQUEUE, "export const prepare = async (session: TransactionSession): Promise<void> => { await session.executeSql('select 1'); };"))
+      .toEqual([`${REQUEUE}: prepare lets its raw session escape`]);
+    expect(rawSessionEscapes(PAGE, [
+      "export async function runSlackKnownRootOperation<T>(session: TransactionSession, execution: Execution, operation: Operation<T>): Promise<T> {",
+      "  const original = originalExecutor(session);",
+      "  return operation(decorate(original));",
+      "}",
+    ].join("\n"))).toEqual([]);
   });
 
   it("refuses every way past executeSql — the builder, rpc, the savepoint helper and a transaction — by property, key or destructuring (negative control)", () => {

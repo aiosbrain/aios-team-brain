@@ -410,11 +410,26 @@ describe("a published root whose stored facts were corrupted after enumeration (
   }
 
   // EXPECTED RED at the source-reviewed checkpoint: every corrupted value below is currently
-  // reported as `canonical_mismatch`. A stored value of the wrong JSON type, or one past the
-  // primitive's byte bound, is not a DIFFERENT identity — it is no identity at all, and §6 names
-  // that `invalid_metadata`. The distinction matters to whoever reads the counts: a mismatch says
-  // "this item belongs to another thread", invalid metadata says "this item's stored metadata is
-  // unusable", and the two call for different repairs.
+  // reported as `canonical_mismatch`.
+  //
+  // What the specification says LITERALLY, in §6, is about size: "Oversized stored values are
+  // `invalid_metadata`, never silently truncated into accepted identities", with bounds of 256 bytes
+  // per provider id and 128 bytes per timestamp. The over-bound rows below are that sentence.
+  //
+  // The WRONG-TYPE rows are not a quotation. §6 requires new projections to "check JSON string types
+  // and byte lengths before returning values" and names no reason for a value that fails the type
+  // check. Reporting it as `invalid_metadata` too is the accepted, consistent fail-closed
+  // classification from the source review: the same projection rejects both, and a value that is not
+  // a string is no more a DIFFERENT identity than one that is too long — it is no identity at all.
+  //
+  // The distinction matters to whoever reads the counts: a mismatch says "this item belongs to
+  // another thread", invalid metadata says "this item's stored metadata is unusable", and the two
+  // call for different repairs.
+  //
+  // NOT COVERED HERE, deliberately: a stored value that IS a string, IS within its bound, and is
+  // syntactically invalid — a workspace id with a space in it, a `ts` the exact parser refuses. The
+  // accepted findings do not say whether that is `invalid_metadata` or `canonical_mismatch`, and
+  // this focused red does not choose. It remains a later KR-16 case.
   it("reports a locked item whose stored locator metadata is of the wrong type or past its byte bound as invalid_metadata, not as a mismatch", async () => {
     const f = await publishOldRoot();
     await ageObservation(f.seed.teamId);
@@ -446,6 +461,39 @@ describe("a published root whose stored facts were corrupted after enumeration (
       const result = await prepare(f, entry);
       expect.soft(result, label).toEqual({ outcome: "unattested", reason: "invalid_metadata" });
       // Whatever it is called, it is never work: nothing was enqueued for the root.
+      expect((await stored(f.seed.teamId)).queue, `${label}: nothing was enqueued`).toEqual([]);
+
+      await (await rawSql()).query(`update items set frontmatter = $2::jsonb where id = $1`, [f.itemId, JSON.stringify(original)]);
+      expect(await storedFrontmatter(f.itemId), "fixture: the stored frontmatter was put back").toEqual(original);
+    }
+
+    // CONTROLS (expected green) — exactly AT the bound. A string of exactly 256 bytes in a provider
+    // id, or exactly 128 bytes in a timestamp, is within the bound: it is a real, well-typed,
+    // syntactically valid value that simply is not this root's, so it is a mismatch and not invalid
+    // metadata. Each value below is valid for its field's own syntax — the ids are ASCII
+    // alphanumeric, and the timestamps are the root's own instant written with leading zeros, which
+    // the exact parser accepts and which is a different string of bytes. So none of them is the
+    // undecided "in-bound but syntactically invalid" case described above.
+    const paddedRoot = `${"0".repeat(128 - OLD_ROOT.length)}${OLD_ROOT}`;
+    expect(Buffer.byteLength(paddedRoot, "utf8"), "fixture: the padded timestamp is exactly 128 bytes").toBe(128);
+    expect(parseSlackTimestamp(paddedRoot)?.iso, "fixture: the exact parser accepts it, as the same instant").toBe(parseSlackTimestamp(OLD_ROOT)!.iso);
+    const atBound: [string, string, string][] = [
+      ["a workspace_id of exactly 256 bytes", "workspace_id", `T${"0".repeat(255)}`],
+      ["a channel_id of exactly 256 bytes", "channel_id", `C${"0".repeat(255)}`],
+      ["a ts of exactly 128 bytes", "ts", paddedRoot],
+      ["a thread_ts of exactly 128 bytes", "thread_ts", paddedRoot],
+    ];
+    for (const [label, key, value] of atBound) {
+      const bound = key === "ts" || key === "thread_ts" ? 128 : 256;
+      expect(Buffer.byteLength(value, "utf8"), `fixture: ${label}`).toBe(bound);
+      const changed = await (await rawSql()).query(
+        `update items set frontmatter = jsonb_set(frontmatter, array[$2::text], $3::jsonb, true) where id = $1`,
+        [f.itemId, key, JSON.stringify(value)]
+      );
+      expect(changed.rowCount, `fixture: ${label} was stored`).toBe(1);
+      expect((await storedFrontmatter(f.itemId))[key], `fixture: ${label} reads back`).toBe(value);
+
+      expect(await prepare(f, entry), label).toEqual({ outcome: "unattested", reason: "canonical_mismatch" });
       expect((await stored(f.seed.teamId)).queue, `${label}: nothing was enqueued`).toEqual([]);
 
       await (await rawSql()).query(`update items set frontmatter = $2::jsonb where id = $1`, [f.itemId, JSON.stringify(original)]);
@@ -520,9 +568,96 @@ describe("a published root whose stored facts were corrupted after enumeration (
       expect(failure).toBeInstanceOf(Error);
       const text = `${(failure as Error).name}\n${(failure as Error).message}`;
       for (const leaked of ["0001-01-01", "0044", " BC", OLD_ROOT, WORKSPACE, CHANNEL, f.itemId]) expect(text).not.toContain(leaked);
+      // Not only those spellings. The same instant can reach a message as an ISO string with a
+      // negative or zero-padded year, as epoch seconds, or as the rounded due instant in epoch
+      // milliseconds — whatever the database or the driver renders. Each of those is computed here,
+      // from what is stored, and none may appear.
+      for (const rendering of await renderingsOfStoredObservation(f)) {
+        expect(text.includes(rendering), `the failure does not carry the rendering ${rendering.slice(0, 6)}…`).toBe(false);
+      }
+      // And it is one of the packet's own errors or a plain static one: its text is the same
+      // whatever was stored, which the case after this one checks across both instants.
+      expect(text).not.toMatch(/\d{6,}/);
     }
     // The ledger and the item are untouched, and the observation is still exactly what was stored.
     expect(after.ledger.map((row) => row.message_ts)).toEqual([OLD_ROOT, OLD_REPLY]);
     expect((await query(`select 1 from items where id = $1`, [f.itemId]))).toHaveLength(1);
+  });
+
+  /**
+   * Every way the stored observation, and the due instant derived from it, can be rendered as text:
+   * by the database (day, epoch seconds, rounded due milliseconds) and by JavaScript (the ISO string
+   * of the due instant, which writes a year before the common era as a signed six-digit year).
+   */
+  async function renderingsOfStoredObservation(f: Published): Promise<string[]> {
+    const [row] = await query<{ day: string; epoch_seconds: string; epoch_ms: string; due_ms: string }>(
+      `select to_char(observed_at at time zone 'UTC', 'YYYY-MM-DD') as day,
+              trunc(extract(epoch from observed_at)::numeric)::text as epoch_seconds,
+              trunc(extract(epoch from observed_at)::numeric * 1000)::text as epoch_ms,
+              ceil(extract(epoch from (observed_at + interval '60 seconds'))::numeric * 1000)::text as due_ms
+         from slack_messages where team_id = $1 and is_root and message_ts = $2`, [f.seed.teamId, OLD_ROOT]
+    );
+    const digits = (value: string): string => value.replace(/^-/, "").replace(/\.0*$/, "");
+    const due = new Date(Number(row.due_ms));
+    const observed = new Date(Number(row.epoch_ms));
+    const renderings = [
+      row.day,
+      digits(row.epoch_seconds), digits(row.epoch_ms), digits(row.due_ms),
+      due.toISOString(), due.toISOString().slice(0, due.toISOString().indexOf("T")),
+      observed.toISOString(), observed.toISOString().slice(0, observed.toISOString().indexOf("T")),
+    ];
+    // Fixture precondition: these really are long, specific strings, not a digit or two.
+    for (const rendering of renderings) expect(rendering.length, `fixture: the rendering ${rendering} is specific`).toBeGreaterThanOrEqual(8);
+    return [...new Set(renderings)];
+  }
+
+  // EXPECTED RED at the source-reviewed checkpoint, for the same reason as the two cases above, and
+  // stated the strongest way: two DIFFERENT corrupt instants, in two different teams, must be refused
+  // IDENTICALLY — the same closed result, or an error of the same class with byte-for-byte the same
+  // message. An outcome that is the same for both cannot have been derived from either instant, or
+  // from either team's ids, however a leak would have been spelled. Today one is enqueued and the
+  // other is not, so they are not even the same kind of outcome.
+  it("refuses two different corrupt observations identically: the same closed result, or the same static error", async () => {
+    const outcomes: { observedAt: string; queue: Row[]; ancient: number; shape: Record<string, unknown> }[] = [];
+    for (const observedAt of ["0001-01-01 00:00:00+00", "0044-03-15 12:00:00 BC"]) {
+      const f = await publishOldRoot();
+      const entry = await locatedEntryOf(f);
+      const changed = await (await rawSql()).query(
+        `update slack_messages set observed_at = $2::timestamptz where team_id = $1 and is_root and message_ts = $3`,
+        [f.seed.teamId, observedAt, OLD_ROOT]
+      );
+      expect(changed.rowCount, `fixture: the witness of ${observedAt} was replaced`).toBe(1);
+
+      let shape: Record<string, unknown>;
+      try {
+        shape = { kind: "result", result: await prepare(f, entry) };
+      } catch (error) {
+        const thrown = error as { name?: unknown; message?: unknown; constructor?: { name?: unknown } };
+        shape = {
+          kind: "error", isError: error instanceof Error, class: thrown?.constructor?.name,
+          name: thrown?.name, message: thrown?.message,
+        };
+      }
+      const [ancient] = await query<{ n: number }>(
+        `select count(*)::int as n from slack_sync_threads where team_id = $1 and due_at < timestamptz '1970-01-01 00:00:00+00'`,
+        [f.seed.teamId]
+      );
+      outcomes.push({ observedAt, queue: (await stored(f.seed.teamId)).queue, ancient: ancient.n, shape });
+    }
+
+    // No-enqueue proof, for each instant on its own.
+    for (const outcome of outcomes) {
+      expect.soft(outcome.queue, `${outcome.observedAt}: nothing was enqueued for the root`).toEqual([]);
+      expect.soft(outcome.ancient, `${outcome.observedAt}: no queue row carries an ancient due date`).toBe(0);
+      if (outcome.shape.kind === "result") {
+        // Never the insertion, never existing work, and never "not yet due" for a value that is due.
+        expect.soft(["unattested", "refused"], `${outcome.observedAt}: a closed refusal`).toContain((outcome.shape.result as SlackKnownRootPreparationResult).outcome);
+      } else {
+        expect.soft(outcome.shape.isError, `${outcome.observedAt}: a thrown failure is an Error`).toBe(true);
+        expect.soft(typeof outcome.shape.message, `${outcome.observedAt}: with a message`).toBe("string");
+      }
+    }
+    // The identity check: both instants, both teams, one outcome.
+    expect(outcomes[1].shape, "the two corrupt observations are refused identically").toEqual(outcomes[0].shape);
   });
 });
