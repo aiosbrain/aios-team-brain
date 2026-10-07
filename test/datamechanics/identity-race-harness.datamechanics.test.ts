@@ -2,14 +2,16 @@ import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Client } from "pg";
+import { Client, type PoolClient } from "pg";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
+import { getPool } from "@/lib/db/pg/pool";
 import { listMemberIdentities } from "@/lib/identity/list";
 import { setMemberIdentity } from "@/lib/identity/member-identities";
 import { db, seedTeam, type Seed } from "./helpers";
 import {
   RACE_TEST_TIMEOUT_MS,
   RaceScheduleError,
+  type Barrier,
   authorityLockName,
   barrierSessions,
   closeRaceHarness,
@@ -52,7 +54,9 @@ import {
  *   2. a FOREIGN session of the same database is never the harness's: waiting behind the same
  *      barrier, or behind the parked operation itself, it is not counted as evidence; and when
  *      cleanup has to cancel a raced operation, only that operation's own backend is signalled —
- *      the foreign sessions keep their locks and their waits, and complete once released;
+ *      the foreign sessions keep their locks and their waits, and complete once released; and a
+ *      backend a signal is aimed at stays the raced operation's until the signal has been executed
+ *      — the pool cannot lend it to anyone else in between, even once the operation has let it go;
  *   3. a schedule that FAILS after an operation has started a real transaction is reported only
  *      after that operation's backend is idle; a cleanup that cannot be proven stops the run;
  *   4. the run-safety state: an in-flight scope blocks truncation and the next file; a scope's own
@@ -103,6 +107,20 @@ function inFlight<T>(work: Promise<T>): InFlight<T> {
   work.then(() => { state = "resolved"; }, () => { state = "rejected"; });
   return { promise: work, state: () => state };
 }
+
+/** A gate a test opens by hand: nothing but `open()` lets what waits on `opened` go on. */
+function gate(): { opened: Promise<void>; open: () => void } {
+  let open: () => void = () => undefined;
+  const opened = new Promise<void>((resolve) => { open = resolve; });
+  return { opened, open };
+}
+
+/** One backend, exactly — its pid and when it started — as the session itself reports it. */
+interface BackendIdentity { pid: number; started: string }
+const WHO_AM_I = `select pg_backend_pid() as pid,
+  (select extract(epoch from backend_start)::text from pg_stat_activity where pid = pg_backend_pid()) as started`;
+const whoIs = async (client: PoolClient): Promise<BackendIdentity> =>
+  (await client.query<BackendIdentity>(WHO_AM_I)).rows[0];
 
 /** Exactly `count` of the named backends exist, and every one of them is waiting for a `locktype` lock. */
 const waitsOn = (locktype: string, count: number) => (sessions: { waitingOn: string | null }[]) =>
@@ -548,6 +566,190 @@ describe("race harness (2): a foreign session of the same database is never the 
       expect(raceHarnessFatal()).toBeNull();
     } finally {
       await barrier.release().catch(() => undefined);
+    }
+  }, RACE_TEST_TIMEOUT_MS);
+});
+
+describe("race harness (2, leases): a backend a signal is aimed at is not lent to anyone else until the signal has been executed (real Postgres)", () => {
+  /**
+   * THE WINDOW. Cleanup reads which backends a raced operation holds, in this process, and then has
+   * PostgreSQL signal them. If the operation returns its connection in between, the pool can lend
+   * that very backend to an unrelated borrower — and the signal lands on the borrower's work.
+   *
+   * Each test holds that window open with an explicit gate (`beforeSignal`: after the target is
+   * captured and reserved, before PostgreSQL is asked to execute the signal), and inside it:
+   * fills the pool, lets the raced operation finish and release, and queues an unrelated borrower
+   * that only the raced operation's connection could serve. The borrower must still be waiting
+   * after a real round trip to PostgreSQL; the pool must not have been given the connection at
+   * all. Then the gate is left, the signal is executed, and the borrower is served — by another
+   * backend — while every unrelated connection is exactly as it was.
+   *
+   * Nothing here is timed: the raced operation, the borrower and the signal each move only when a
+   * gate is opened or evidence from PostgreSQL has been read.
+   */
+  it.each(["cancel", "terminate"] as const)("%s: the raced operation releases after its backend was captured and before the signal is executed — the pool is not given that backend, a queued borrower is not served by it, and unrelated work is untouched", async (gated) => {
+    const pool = getPool();
+    const max = (pool as unknown as { options: { max: number } }).options.max;
+    const { safety } = privateRun();
+    const tag = `lease-${randomUUID().slice(0, 8)}`;
+    const lockName = `harness-lease:${randomUUID()}`;
+    // What the raced operation releases with: nothing (cancel), or an error of its own (terminate).
+    const releasedWith = gated === "terminate" ? new Error("the raced operation's own release error") : undefined;
+    const proceed = gate();
+    const released = gate();
+    const lent = new Set<PoolClient>();
+    const lend = (client: PoolClient): PoolClient => { lent.add(client); return client; };
+    const hogs: { client: PoolClient; identity: BackendIdentity }[] = [];
+    const signals: string[] = [];
+    // Every time the POOL is given the raced operation's connection back, and with what.
+    const handedBack: unknown[] = [];
+    let owner: BackendIdentity | undefined;
+    let repeatedRelease: unknown = "not attempted";
+    let borrower: InFlight<PoolClient> | undefined;
+    let borrowed: PoolClient | undefined;
+    let barrier: Barrier | undefined;
+    // What the gate itself found wrong, if anything: the harness reports a failed gate as `unproven`.
+    const gateFailures: unknown[] = [];
+    const onRelease = (error: unknown, client: unknown): void => {
+      if (owner && (client as { processID?: unknown }).processID === owner.pid) handedBack.push(error);
+    };
+    // Real sessions are staged here under a run-safety state the real run does not read: a barrier,
+    // and a raced operation's backend left in a transaction. The real run carries a sentinel until
+    // both are SEEN gone or idle.
+    const staged = stagedOnRealRun("a raced operation held between the capture of its backend and the signal");
+    try {
+      pool.on("release", onRelease);
+      barrier = await holdNamedLock(lockName, { tag, safety });
+      const failure = await parkThenCompete({
+        seed: { teamId: randomUUID() },
+        barrier,
+        parksOn: "advisory",
+        // The raced operation: one pool connection, in a transaction, parked on the barrier's lock.
+        // Past it, it waits for this test's gate and for nothing in the database — so it is still
+        // holding its connection when cleanup comes to signal it.
+        first: async () => {
+          const client = await pool.connect();
+          try {
+            owner = await whoIs(client);
+            await client.query("begin");
+            await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [lockName]);
+            await proceed.opened;
+            await client.query("rollback");
+          } finally {
+            client.release(releasedWith);
+            // A SECOND release of the same checkout is refused as the pool refuses one.
+            try {
+              client.release();
+              repeatedRelease = "accepted";
+            } catch (error) {
+              repeatedRelease = error;
+            }
+            released.open();
+          }
+          return "released";
+        },
+        // The schedule itself fails at once, so cleanup runs with the first operation still held.
+        second: async () => "finished without waiting",
+        bounds: { cleanupMs: 300 },
+        beforeSignal: async (pending) => {
+          try {
+            signals.push(pending.signal);
+            // THE TARGET IS CAPTURED: the raced operation's own backend, and nothing else…
+            expect(pending.backends).toEqual([owner!.pid]);
+            // …past its lock and waiting only on this test: no statement for a cancel to find.
+            await untilSessions([owner!.pid], "the raced operation idle in its transaction",
+              (sessions) => sessions.length === 1 && sessions[0].state === "idle in transaction" && sessions[0].waitingOn === null);
+            if (pending.signal !== gated) return;
+
+            // A CONSTRAINED POOL: every other connection it has, or may open, is taken by this
+            // test. From here a borrower can be served only by a connection that is given back.
+            while (pool.idleCount > 0 || pool.totalCount < max) {
+              const client = lend(await pool.connect());
+              hogs.push({ client, identity: await whoIs(client) });
+            }
+            expect(hogs.map((hog) => hog.identity)).not.toContainEqual(owner);
+
+            // THE RACED OPERATION FINISHES AND RELEASES — after the capture, before the signal.
+            proceed.open();
+            await released.opened;
+            await untilSessions([owner!.pid], "the raced operation's backend idle, its transaction over",
+              (sessions) => sessions.length === 1 && sessions[0].state === "idle");
+
+            // AN UNRELATED BORROWER queues for a connection. Nothing of the harness's knows it.
+            borrower = inFlight(pool.connect());
+            // A real round trip to PostgreSQL later — long after a pool that had been given the
+            // connection would have lent it — the backend is still there, idle, the pool has not
+            // been given it, and the borrower is still waiting.
+            expect(await sessionEvidence([owner!.pid])).toEqual([{ pid: owner!.pid, state: "idle", waitingOn: null, locksHeld: 0 }]);
+            expect(handedBack, "the pool must not be given a backend a signal is aimed at").toEqual([]);
+            expect(borrower.state()).toBe("pending");
+            expect({ total: pool.totalCount, idle: pool.idleCount, waiting: pool.waitingCount }).toEqual({ total: max, idle: 0, waiting: 1 });
+          } catch (error) {
+            gateFailures.push(error);
+            throw error;
+          }
+        },
+      }).then(() => null, (error: unknown) => error);
+
+      // Whatever the gate found wrong is the failure to report — not what cleanup made of it.
+      if (gateFailures.length > 0) throw gateFailures[0];
+      expect(signals).toEqual(gated === "cancel" ? ["cancel"] : ["cancel", "terminate"]);
+      expect(failure).toBeInstanceOf(RaceScheduleError);
+      const { cleanup, message } = failure as RaceScheduleError;
+      expect(message).toContain("the competing operation finished without waiting");
+      // CLEANUP WAS PROVEN, and took that signal — of the raced operation's own backend, and no other.
+      expect(cleanup.outcome).toBe(gated === "cancel" ? "cancelled" : "terminated");
+      expect(cleanup.barrierGone).toBe(true);
+      expect(cleanup.signalled).toEqual([owner!.pid]);
+      expect(cleanup.operations).toEqual([
+        { label: "the parked operation", backends: [owner!.pid], settled: true },
+        { label: "the competing operation", backends: [], settled: true },
+      ]);
+      // THE RELEASE THE OPERATION ASKED FOR WAS CARRIED OUT, ONCE, after the signal: with the
+      // operation's own error where it gave one, and otherwise with the harness's — a signalled
+      // connection is retired, never pooled. Its second release was refused as the pool refuses one.
+      expect(handedBack).toHaveLength(1);
+      if (releasedWith) expect(handedBack[0]).toBe(releasedWith);
+      else expect((handedBack[0] as Error).message).toMatch(/was signalled by the identity race harness: its connection is retired, not pooled/);
+      expect(repeatedRelease).toBeInstanceOf(Error);
+      expect((repeatedRelease as Error).message).toBe("Release called on client which has already been released to the pool.");
+      await untilSessions([owner!.pid], "the signalled backend gone", (sessions) => sessions.length === 0);
+
+      // ONLY NOW IS THE BORROWER SERVED — by a backend that is not the one the signal was aimed at…
+      borrowed = lend(await borrower!.promise);
+      expect(await whoIs(borrowed)).not.toEqual(owner);
+      // …and UNRELATED WORK COMPLETES, UNAFFECTED: the borrower's, and on every connection this
+      // test held through the signal — each still the very backend it was, neither cancelled nor
+      // terminated.
+      expect((await borrowed.query("select count(*)::int as n from member_identities")).rows).toEqual([{ n: expect.any(Number) }]);
+      for (const hog of hogs) expect(await whoIs(hog.client)).toEqual(hog.identity);
+      expect(cleanup.signalled).not.toContain((await whoIs(borrowed)).pid);
+      // The scope's cleanup was proven, so its marker is gone; neither state was stopped.
+      expect(safety.armed()).toEqual([]);
+      expect(safety.fatal()).toBeNull();
+      expect(raceHarnessFatal()).toBeNull();
+      expect(currentRunSafety().armed(), "the real run: the sentinel, and only the sentinel").toEqual([staged.scope]);
+    } finally {
+      // ON EVERY EXIT: the raced operation may finish; every connection this test took goes back —
+      // which is also what serves a borrower still waiting, whose connection then goes back too;
+      // and the barrier is released (a no-op once the schedule has proven it gone).
+      pool.removeListener("release", onRelease);
+      proceed.open();
+      for (const client of [...lent]) {
+        lent.delete(client);
+        client.release();
+      }
+      if (borrower && !borrowed) await borrower.promise.then((client) => client.release(), () => undefined);
+      await barrier?.release().catch(() => undefined);
+      // The sentinel comes off only when the barrier is SEEN gone and the raced operation's backend
+      // SEEN idle or gone. If either cannot be seen, this throws, the sentinel stays, and the real
+      // run stops.
+      await untilBarrierGone(tag);
+      if (owner) {
+        await untilSessions([owner.pid], "the raced operation's backend idle or gone",
+          (sessions) => sessions.every((session) => session.state === "idle"));
+      }
+      staged.clear();
     }
   }, RACE_TEST_TIMEOUT_MS);
 });
