@@ -20,6 +20,15 @@ import { currentRunSafety, type RunSafety } from "./run-fatal-latch";
  * holds checked out at that moment. The barriers and the monitor are connections this module opens
  * itself, each under an `application_name` of its own.
  *
+ * A SIGNAL IS AIMED AT A CHECKOUT, NOT AT A PID. "Held at that moment" is read in this process;
+ * the signal is executed later, in PostgreSQL. Were the operation to return its connection in
+ * between, the pool could hand that same backend to a stranger, and the signal would land on the
+ * stranger's work. So each checkout is a LEASE, and before anything asynchronous happens the
+ * leases about to be signalled are reserved: a release the operation asks for from then on is
+ * recorded and NOT carried out. Once the signal has been executed the connection is retired —
+ * given to the pool to destroy, never to keep. A lease whose signal cannot be shown to have been
+ * executed is never handed back at all, and cleanup is then `unproven`.
+ *
  * CLEANUP IS PROVEN, NOT ASSUMED. Before a barrier connects, its scope is recorded as IN FLIGHT in
  * the run-safety state (`run-fatal-latch`); if that cannot be recorded, nothing connects. After the
  * barrier is released — on every path, a failed schedule or a failed acquisition included — two
@@ -101,7 +110,8 @@ export interface CleanupReport {
   outcome: CleanupOutcome;
   /** The barrier's own tagged session was SEEN to be absent from `pg_stat_activity`. */
   barrierGone: boolean;
-  /** The backends that were signalled: always, and only, ones a raced operation held at that moment. */
+  /** The backends that were signalled: always, and only, ones a raced operation held at that moment
+   * — and that the pool was kept from handing to anyone else until the signal had been executed. */
   signalled: number[];
   /** Each raced operation: every backend it ever held, and whether it had settled. */
   operations: { label: string; backends: number[]; settled: boolean }[];
@@ -526,16 +536,85 @@ export const authorityLockName = (teamId: string) => `${teamId}:identity-authori
 
 // ── Registered raced operations ────────────────────────────────────────────────────────────────
 
+/**
+ * What becomes of one checkout when the operation that made it asks for its release.
+ *
+ *   - `returnable`: no signal was ever aimed at its backend. A release goes straight to the pool,
+ *     with the operation's own argument — exactly as without this harness.
+ *   - `reserved`: a cancel or terminate aimed at its backend may be on its way. A release is
+ *     RECORDED and not carried out: the pool must not hand that backend to anyone else while a
+ *     signal can still reach its PID.
+ *   - `condemned`: the signal aimed at it has been executed by PostgreSQL (or was certainly never
+ *     sent). The connection is never pooled again: when a signal is acted on by its backend cannot
+ *     be observed, so a backend that was aimed at cannot be shown fit for a stranger's work. A
+ *     release RETIRES it — the pool is given the client with an error, and destroys it.
+ *   - `stranded`: a signal aimed at it may still be executed, and that cannot be told. It is never
+ *     handed back at all: destroyed, its PID could pass to a new backend with that signal still to
+ *     come.
+ */
+type LeaseFate = "returnable" | "reserved" | "condemned" | "stranded";
+
+/** ONE CHECKOUT of one pool connection by a raced operation — not merely the PID it had. */
+interface Lease {
+  pid: number;
+  fate: LeaseFate;
+  /** The operation's own release request, made when it could not be carried out as asked: its argument. */
+  requested: { error: unknown } | null;
+  /** The pool has been given the client back — to keep or to destroy. Never twice for one checkout. */
+  disposed: boolean;
+  /** Give the client to the pool: the pool's own `release` of this checkout. */
+  surrender: (error?: unknown) => unknown;
+  /** Listen for the client's `error` event while a signal is aimed at it. A checked-out client is
+   * listened to by nobody; one that is idle when its backend is terminated would otherwise raise
+   * an uncaught exception in this process. */
+  guard: () => void;
+  unguard: () => void;
+}
+
 interface RacedSessions {
   label: string;
-  /** Backends of connections this operation holds checked out RIGHT NOW. */
-  active: Set<number>;
+  /**
+   * Its OUTSTANDING checkouts, by backend PID: connections the pool has not been given back. That
+   * is every connection the operation still holds — and also one it has asked to release while a
+   * signal was aimed at it, until that release is carried out.
+   */
+  leases: Map<number, Lease>;
   /** Every backend it has ever held: what must be seen idle or gone once it has finished. */
   seen: Set<number>;
-  /** Checkouts whose backend PID could not be read. Any makes ownership unprovable. */
+  /** Checkouts whose backend PID could not be read, or whose release could not be intercepted. Any
+   * makes ownership unprovable. */
   unidentified: number;
+  /** Checkouts the pool did not take back when the harness retired them. Any makes cleanup unprovable. */
+  undisposed: number;
   /** Its promise has resolved or rejected. */
   settled: boolean;
+}
+
+/** What the pool itself says to a second release of one checkout. */
+const DOUBLE_RELEASE = "Release called on client which has already been released to the pool.";
+
+/** Carry a release out: the lease leaves its operation's books, and the pool is given the client. */
+function surrenderLease(sessions: RacedSessions, lease: Lease, error: unknown): unknown {
+  lease.disposed = true;
+  sessions.leases.delete(lease.pid);
+  lease.unguard();
+  return lease.surrender(error);
+}
+
+/**
+ * Retire a CONDEMNED checkout whose release has been asked for: the pool is given the client with
+ * an error — the operation's own if it gave one, the harness's otherwise — which is how a pool is
+ * told to destroy a connection instead of keeping it. Any other lease is left exactly as it is.
+ */
+function retireLease(sessions: RacedSessions, lease: Lease): void {
+  if (lease.disposed || lease.fate !== "condemned" || !lease.requested) return;
+  try {
+    surrenderLease(sessions, lease, lease.requested.error
+      || new RaceHarnessError(`backend ${lease.pid} was signalled by the identity race harness: its connection is retired, not pooled`));
+  } catch {
+    // The pool did not take it: nothing says where that connection is now.
+    sessions.undisposed += 1;
+  }
 }
 
 interface Raced<T> extends RacedSessions {
@@ -551,9 +630,15 @@ type Connect = (callback?: ConnectCallback) => unknown;
 
 /**
  * Record, for the raced operation in whose scope a pool connection is checked out, which backend it
- * is and when it is returned. Installed once, on the application pool of THIS test process; outside
- * a raced scope it does nothing. The scope is read when `connect` is CALLED — a pooled connection
- * can be handed over later from another operation's release.
+ * is — as a LEASE — and take over when it is returned. Installed once, on the application pool of
+ * THIS test process; outside a raced scope it does nothing. The scope is read when `connect` is
+ * CALLED — a pooled connection can be handed over later from another operation's release.
+ *
+ * The operation's `release` is the pool's own, wrapped: for a lease nothing was ever aimed at it
+ * is the pool's release, with the operation's argument, at once. For a lease that is reserved,
+ * condemned or stranded (`LeaseFate`) the request and its argument are recorded, and the pool is
+ * given the client when — and if — that is safe (`retireLease`). Either way the pool is given one
+ * checkout at most once; a second release of it is answered as the pool answers one.
  */
 function instrumentPool(): void {
   if (instrumented) return;
@@ -564,22 +649,54 @@ function instrumentPool(): void {
   const connect = (pool.connect as unknown as Connect).bind(pool);
   const register = (sessions: RacedSessions | undefined, client: unknown): void => {
     if (!sessions || !client) return;
-    const held = client as { processID?: unknown; release?: Release };
+    const held = client as {
+      processID?: unknown;
+      release?: Release;
+      on?: (event: string, listener: () => void) => unknown;
+      removeListener?: (event: string, listener: () => void) => unknown;
+    };
     const pid = held.processID;
-    if (typeof pid !== "number" || !Number.isInteger(pid)) {
+    // The pool installs a fresh `release` on every checkout; this checkout's is the one to wrap.
+    const release = held.release;
+    // Not this operation's alone, provably: a backend that cannot be named, a release that cannot
+    // be taken over (the pool could then be given the connection behind a signal's back), or a PID
+    // this operation already has a lease on.
+    if (typeof pid !== "number" || !Number.isInteger(pid) || typeof release !== "function" || sessions.leases.has(pid)) {
       sessions.unidentified += 1;
       return;
     }
-    sessions.active.add(pid);
+    const swallow = (): void => undefined;
+    let guarded = false;
+    const lease: Lease = {
+      pid,
+      fate: "returnable",
+      requested: null,
+      disposed: false,
+      surrender: (error) => release.call(client, error),
+      guard: () => {
+        if (guarded || typeof held.on !== "function") return;
+        held.on("error", swallow);
+        guarded = true;
+      },
+      unguard: () => {
+        if (guarded && typeof held.removeListener === "function") held.removeListener("error", swallow);
+        guarded = false;
+      },
+    };
+    sessions.leases.set(pid, lease);
     sessions.seen.add(pid);
-    // The pool installs a fresh `release` on every checkout; wrap this checkout's.
-    const release = held.release;
-    if (typeof release === "function") {
-      held.release = (error?: unknown) => {
-        sessions.active.delete(pid);
-        return release.call(client, error);
-      };
-    }
+    held.release = (error?: unknown) => {
+      // A SECOND release of one checkout: the pool's own refusal, as without this harness — and
+      // never a second hand-over, nor a different argument for the first.
+      if (lease.disposed) return release.call(client, error);
+      if (lease.requested) throw new Error(DOUBLE_RELEASE);
+      if (lease.fate === "returnable") return surrenderLease(sessions, lease, error);
+      // A signal is, or was, aimed at this backend. The request stands, with its argument; it is
+      // carried out now only if the signal is known to be over (see `retireLease`).
+      lease.requested = { error };
+      retireLease(sessions, lease);
+      return undefined;
+    };
   };
   (pool as unknown as { connect: Connect }).connect = (callback) => {
     const sessions = racedScope.getStore();
@@ -600,7 +717,7 @@ function instrumentPool(): void {
 /** Start `run` as a registered raced operation: every pool connection it checks out is recorded. */
 function race<T>(label: string, run: () => Promise<T>): Raced<T> {
   instrumentPool();
-  const sessions: RacedSessions = { label, active: new Set(), seen: new Set(), unidentified: 0, settled: false };
+  const sessions: RacedSessions = { label, leases: new Map(), seen: new Set(), unidentified: 0, undisposed: 0, settled: false };
   const result = racedScope.run(sessions, async () => run());
   const settle = () => { sessions.settled = true; };
   result.then(settle, settle);
@@ -681,7 +798,7 @@ const cannotWait = (operation: RacedSessions): string | null => {
  */
 async function untilWaiting(operation: RacedSessions, expected: ExpectedWait, authority: string, bounds: RaceBounds): Promise<number> {
   const waiting = await untilEvidence({
-    read: async () => (await lockWaits()).filter((wait) => operation.active.has(wait.pid)),
+    read: async () => (await lockWaits()).filter((wait) => operation.leases.has(wait.pid)),
     accept: (waits) => waits.length === 1
       && describeWait({ locktype: waits[0].locktype, authority: waits[0].key === authority, blockedBy: waits[0].blockers }) === describeWait(expected),
     expected: `${operation.label} waiting on exactly: ${describeWait(expected)}`,
@@ -712,25 +829,84 @@ async function sessionsIdle(pids: number[], bounds: RaceBounds): Promise<boolean
   }
 }
 
+/** A signal the harness is about to have PostgreSQL execute: which, and at which of its own backends. */
+export interface PendingSignal {
+  signal: "cancel" | "terminate";
+  backends: number[];
+}
+
 /**
  * After the barrier is gone: establish that every raced operation has settled, has returned its
  * connections and left its backends idle or gone. If that does not happen by itself within the
  * bound, a cancel — and then, if still needed, a terminate — is sent to the backends the raced
  * operations hold checked out AT THAT MOMENT, and to no other backend, whatever else is waiting in
  * the database. Never throws: the report says which of the four outcomes it was.
+ *
+ * "At that moment" is made to last until the signal has been executed. The leases to be signalled
+ * are RESERVED synchronously — before the first `await`, so no release can slip in between reading
+ * them and reserving them — and a reserved connection is not given back to the pool, whatever its
+ * operation asks, until PostgreSQL has executed the signal; it is then retired, not pooled
+ * (`LeaseFate`). No outcome but `unproven` is reported while any lease is outstanding: `quiet`,
+ * `cancelled` and `terminated` all mean every checkout was given back to the pool — returned by its
+ * operation, or retired here — and every backend was then SEEN idle or gone.
+ *
+ * `beforeSignal` is a seam for the harness's own tests: it is awaited after the reservation and
+ * before PostgreSQL is asked to execute the signal — the window in which a release used to be able
+ * to hand a targeted backend to someone else.
  */
-async function settleRaced(operations: Raced<unknown>[], bounds: RaceBounds): Promise<Omit<CleanupReport, "barrierGone">> {
+async function settleRaced(
+  operations: Raced<unknown>[],
+  bounds: RaceBounds,
+  beforeSignal?: (pending: PendingSignal) => Promise<void>,
+): Promise<Omit<CleanupReport, "barrierGone">> {
   const seen = () => [...new Set(operations.flatMap((operation) => [...operation.seen]))];
-  const held = () => [...new Set(operations.flatMap((operation) => [...operation.active]))];
   const signalled = new Set<number>();
   const quiet = async (): Promise<boolean> =>
     (await withinBound(Promise.allSettled(operations.map((operation) => operation.result)), bounds.cleanupMs))
-    && operations.every((operation) => operation.unidentified === 0 && operation.active.size === 0)
+    && operations.every((operation) => operation.unidentified === 0 && operation.undisposed === 0 && operation.leases.size === 0)
     && (await sessionsIdle(seen(), bounds));
-  const signal = async (fn: "pg_cancel_backend" | "pg_terminate_backend"): Promise<void> => {
-    const pids = held();
+  const signal = async (kind: PendingSignal["signal"]): Promise<void> => {
+    // RESERVE, SYNCHRONOUSLY: every outstanding lease is still out of the pool, so its backend is
+    // still a raced operation's own — and from here to the end of this function it stays out,
+    // whatever its operation asks. Nothing is awaited before every target is reserved.
+    const targets = operations.flatMap((operation) => [...operation.leases.values()].map((lease) => ({ operation, lease })));
+    for (const { lease } of targets) {
+      // A stranded lease stays stranded: this signal being executed says nothing of the earlier one.
+      if (lease.fate !== "stranded") lease.fate = "reserved";
+      lease.guard();
+    }
+    if (targets.length === 0) return;
+    const pids = targets.map(({ lease }) => lease.pid);
+    // What the reservation turns into, and — for a lease whose release was asked for meanwhile —
+    // the release itself, if it may now be carried out.
+    const resolve = (fate: "condemned" | "stranded"): void => {
+      for (const { operation, lease } of targets) {
+        if (lease.fate !== "reserved") continue;
+        lease.fate = fate;
+        retireLease(operation, lease);
+      }
+    };
+    try {
+      if (beforeSignal) await beforeSignal({ signal: kind, backends: [...pids] });
+    } catch (error) {
+      // Nothing was sent, so nothing can still arrive: the connections may be given up.
+      resolve("condemned");
+      throw error;
+    }
     for (const pid of pids) signalled.add(pid);
-    if (pids.length > 0) await observe(`select ${fn}(pid) from unnest($1::int[]) as pid`, [pids]).catch(() => undefined);
+    try {
+      await observe(`select ${kind === "cancel" ? "pg_cancel_backend" : "pg_terminate_backend"}(pid) from unnest($1::int[]) as pid`, [pids]);
+    } catch {
+      // Sent, perhaps, and perhaps still to be executed: these connections are never handed back,
+      // so no outcome below can be anything but `unproven`.
+      resolve("stranded");
+      return;
+    }
+    // EXECUTED: PostgreSQL has sent the signal to those very processes, and a signal already sent
+    // goes with its process. Nothing can reach a later owner of the PID any more, so the
+    // connections can be given to the pool — to destroy: WHEN each backend acts on the signal is
+    // not known, so none of them is lent to anyone again.
+    resolve("condemned");
   };
   const report = (outcome: CleanupOutcome): Omit<CleanupReport, "barrierGone"> => ({
     outcome,
@@ -742,9 +918,9 @@ async function settleRaced(operations: Raced<unknown>[], bounds: RaceBounds): Pr
 
   try {
     if (await quiet()) return report("quiet");
-    await signal("pg_cancel_backend");
+    await signal("cancel");
     if (await quiet()) return report("cancelled");
-    await signal("pg_terminate_backend");
+    await signal("terminate");
     if (await quiet()) return report("terminated");
   } catch {
     // Evidence could not even be read: nothing is proven.
@@ -758,8 +934,8 @@ const describeCleanup = (cleanup: CleanupReport, settled: CleanupOutcome): strin
   const barrier = cleanup.barrierGone ? "" : "the barrier's own session was not seen gone after its release; ";
   switch (settled) {
     case "quiet": return `${barrier}${who} settled and left their backends idle`;
-    case "cancelled": return `${barrier}${who} did not finish after the barrier was released: their own backends (${backends}) were cancelled and are now idle`;
-    case "terminated": return `${barrier}${who} did not finish after the barrier was released: their own backends (${backends}) were terminated and are now gone`;
+    case "cancelled": return `${barrier}${who} did not finish after the barrier was released: their own backends (${backends}) were cancelled, their connections retired, and they are now idle or gone`;
+    case "terminated": return `${barrier}${who} did not finish after the barrier was released: their own backends (${backends}) were terminated, their connections retired, and they are now gone`;
     case "unproven": return `${barrier}${who} could not be proven settled, idle or disposed after the barrier was released `
       + `(backends ever held: ${cleanup.operations.flatMap((operation) => operation.backends).join(",") || "none identified"})`;
   }
@@ -780,9 +956,10 @@ async function finish<T>(
   failure: { error: unknown } | null,
   results: () => Promise<T>,
   bounds: RaceBounds,
+  beforeSignal?: (pending: PendingSignal) => Promise<void>,
 ): Promise<T> {
   const barrierGone = await barrier.vanish(bounds.cleanupMs);
-  const settled = await settleRaced(started, bounds);
+  const settled = await settleRaced(started, bounds, beforeSignal);
   const cleanup: CleanupReport = { ...settled, barrierGone, outcome: barrierGone ? settled.outcome : "unproven" };
   const described = describeCleanup(cleanup, settled.outcome);
   barrier.conclude(
@@ -809,9 +986,11 @@ async function finish<T>(
  * On EVERY path — a failed or timed-out schedule included — the barrier is released and cleanup of
  * whatever was started is established before anything is reported (see `finish`).
  *
- * `whileQueued` and `bounds` are seams for the harness's own tests: a moment, with both operations
- * proven waiting, at which a test may add sessions of its own (the two waits are then proven again,
- * unchanged); and shorter bounds. The run-safety state is the barrier's (`BarrierOptions.safety`).
+ * `whileQueued`, `beforeSignal` and `bounds` are seams for the harness's own tests: a moment, with
+ * both operations proven waiting, at which a test may add sessions of its own (the two waits are
+ * then proven again, unchanged); a moment in cleanup, after the leases a cancel or terminate is
+ * aimed at have been reserved and before PostgreSQL is asked to execute it (see `settleRaced`); and
+ * shorter bounds. The run-safety state is the barrier's (`BarrierOptions.safety`).
  */
 export async function parkThenCompete<A, B>(opts: {
   seed: { teamId: string };
@@ -820,6 +999,7 @@ export async function parkThenCompete<A, B>(opts: {
   first: () => Promise<A>;
   second: () => Promise<B>;
   whileQueued?: (waiting: { parked: number; competing: number }) => Promise<void>;
+  beforeSignal?: (pending: PendingSignal) => Promise<void>;
   bounds?: Partial<RaceBounds>;
 }): Promise<{ first: A; second: B }> {
   const bounds = { ...DEFAULT_BOUNDS, ...opts.bounds };
@@ -850,6 +1030,7 @@ export async function parkThenCompete<A, B>(opts: {
     opts.barrier, started, failure,
     async () => ({ first: await first!.result, second: await second!.result }),
     bounds,
+    opts.beforeSignal,
   );
 }
 
@@ -930,8 +1111,8 @@ export async function bothQueuedOnAuthority<T>(
     await untilEvidence({
       read: async () => {
         const waits = await lockWaits();
-        const own = new Set([holder.pid, ...calls.flatMap((call) => [...call.active])]);
-        return calls.map((call) => waits.filter((wait) => call.active.has(wait.pid)).map((wait) => JSON.stringify({
+        const own = new Set([holder.pid, ...calls.flatMap((call) => [...call.leases.keys()])]);
+        return calls.map((call) => waits.filter((wait) => call.leases.has(wait.pid)).map((wait) => JSON.stringify({
           locktype: wait.locktype,
           onAuthority: wait.key === authority,
           behindHolder: wait.blockers.includes(holder.pid),
