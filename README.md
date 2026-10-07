@@ -707,7 +707,9 @@ NEO4J_USER=neo4j
 NEO4J_PASSWORD=<same as above>
 ```
 
-`GRAPHITI_URL` is the master switch: unset, the projector never starts and every graph read is inert.
+`GRAPHITI_URL` enables episode projection and conversational graph retrieval. The direct
+`/api/v1/graph-query` endpoint reads Neo4j itself and remains available when `NEO4J_URL` is set,
+even if `GRAPHITI_URL` is unset.
 
 **`GRAPHITI_URL` alone is not enough — set `NEO4J_URL` with it.** Graphiti is the write path: the
 projector posts episodes to it. Graph *reads* do not use Graphiti's `/search`, whose results do not
@@ -717,7 +719,9 @@ and `NEO4J_URL` unset, those reads **fail closed**: a read that has graph partit
 the graph leg of ordinary retrieval included — stops with a provenance-unavailable error instead of
 answering from a graph it cannot verify, and `/api/v1/graph-query` reports Neo4j as not configured
 (`503`). That is deliberate, not a degraded mode, and it does not clear until `NEO4J_URL` is set. Set
-all four variables, or leave `GRAPHITI_URL` unset to run without graph memory.
+all four variables for graph projection and conversational graph retrieval. Leaving
+`GRAPHITI_URL` unset disables those paths, while direct `/api/v1/graph-query` reads remain available
+when `NEO4J_URL` is configured.
 
 **2.8d. Understand the extraction limits.** Items are **chunked**, not truncated:
 
