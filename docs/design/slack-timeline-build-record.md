@@ -986,7 +986,7 @@ Unchanged prohibitions. No human or live acceptance has been completed. Not done
 
 ### AC-02 inactive known-root requeue — specification and implementation record
 
-**Current status (updated only here, last on October 7, 2026, with the supplementary KR-07 finite upper-observation update at the end of this section): specification accepted; both production modules implemented and still inactive; reviewed source checkpoint `c5679f8904cf6dd71f5c758314466fed19add7a5`, on which the focused unit, guard and real-PostgreSQL suites pass and of which a fresh independent Opus 5.5 high affected-contract review returned PASS/READY with no blocker, HIGH or MEDIUM; newest evidence checkpoint the source and test content of remote-verified `8505d379ece5247c45a29671614801a7b0fbcc8b`, which is test-only over the earlier checkpoints, the other commits between them changing this build record and, once, one comment of the test file, with no production change; KR-03 evidence of 49 labeled scenarios passes on real PostgreSQL at `7311f95e10f780613c33ab3471339b9512203b9c` and was independently reviewed PASS/READY at that checkpoint; KR-05 evidence of five real-publication cases passed on real PostgreSQL at `70bf4aaf` in the controlled run's two unmutated phases and was independently reviewed PASS / READY TO RUN at that checkpoint; of KR-06, only its deterministic conflict-do-nothing branch — a queue row committed after preparation's plain queue read — passed on real PostgreSQL at `5ec32c32` in a controlled run's two unmutated phases, and is closed to that scope only; of KR-07, only the exact persistence of the observation-derived due instant with its millisecond ceiling — four literal overdue cases and one future control — passed on real PostgreSQL at `82398edb` in a controlled run's two unmutated phases, and is closed to that scope only; supplementary KR-07 decision-clock evidence — a due instant that falls after the preparation's transaction began is decided against `clock_timestamp()` and not against the transaction's start, with one positive and one negative control — passed at `1deafae7` in a controlled run's two unmutated phases, and the substitution of the transaction's start for the decision clock was detected there, which closes no mutation-matrix row and does not complete KR-07; supplementary KR-07 finite upper-observation evidence — a finite observation whose due instant PostgreSQL cannot represent commits `not_due` without an arithmetic failure, with three controls — passed at `8505d379` in a controlled run's two unmutated phases, and the removal of both arithmetic guards of the due read was detected there, which likewise closes no mutation-matrix row and does not complete KR-07; mutants M1a, on its first and on its continuation id read, M1b, M1c, M1d, M1e, M1f, M1g, both M1h variants, the combined M2, M3 in its adjudicated root-author form, M4, M5, and M15a, M15b and M15c were killed in controlled runs, M15a and M15c in their required real-wrapper and integrated-tally forms; the KR-17 §7.5 fixture and numeric-evidence gate was independently ACCEPTED by a fresh Astra-high adjudication on one preserved isolated run whose captured output holds every evidence report, and the KR-17-specific hold is lifted.** The rest of the KR-02 to KR-16 acceptance matrix, in which KR-02, KR-04, KR-06 and KR-07 are not complete, the rest of the mutation matrix, M6 to M14, the fresh Astra-high and blind GPT-6.1 Sol-high final reviews, final CI and PR publication evidence are all still pending, and neither the branch as a whole nor the broad suite is claimed green. The subsections dated October 6 below record the red-first history as it stood then, when the modules were stubs; they are not rewritten. **AC-02 is not complete, the primitive is not wired or activated, and nothing in this section completes AC-02 or AIO-1170.**
+**Current status (updated only here, last on October 7, 2026, with the lifecycle and transaction-escape mutation update at the end of this section): specification accepted; both production modules implemented and still inactive; reviewed source checkpoint `c5679f8904cf6dd71f5c758314466fed19add7a5`, on which the focused unit, guard and real-PostgreSQL suites pass and of which a fresh independent Opus 5.5 high affected-contract review returned PASS/READY with no blocker, HIGH or MEDIUM; newest evidence checkpoint the source and test content of `cad2eceb82d06ec3360d32060e02ca9f0ae92b14`, which the coordinator reports as the independently verified remote head and as changing, over the reviewed source checkpoint, only tests and this build record, with no production change; KR-03 evidence of 49 labeled scenarios passes on real PostgreSQL at `7311f95e10f780613c33ab3471339b9512203b9c` and was independently reviewed PASS/READY at that checkpoint; KR-05 evidence of five real-publication cases passed on real PostgreSQL at `70bf4aaf` in the controlled run's two unmutated phases and was independently reviewed PASS / READY TO RUN at that checkpoint; of KR-06, only its deterministic conflict-do-nothing branch — a queue row committed after preparation's plain queue read — passed on real PostgreSQL at `5ec32c32` in a controlled run's two unmutated phases, and is closed to that scope only; of KR-07, only the exact persistence of the observation-derived due instant with its millisecond ceiling — four literal overdue cases and one future control — passed on real PostgreSQL at `82398edb` in a controlled run's two unmutated phases, and is closed to that scope only; supplementary KR-07 decision-clock evidence — a due instant that falls after the preparation's transaction began is decided against `clock_timestamp()` and not against the transaction's start, with one positive and one negative control — passed at `1deafae7` in a controlled run's two unmutated phases, and the substitution of the transaction's start for the decision clock was detected there, which closes no mutation-matrix row and does not complete KR-07; supplementary KR-07 finite upper-observation evidence — a finite observation whose due instant PostgreSQL cannot represent commits `not_due` without an arithmetic failure, with three controls — passed at `8505d379` in a controlled run's two unmutated phases, and the removal of both arithmetic guards of the due read was detected there, which likewise closes no mutation-matrix row and does not complete KR-07; the lifecycle packet's evidence — the synthetic unit-level due-output conversion suite, KR-06 existing-state preservation, KR-07 unchanged republication, KR-08 caller rollback, retry and application receipt loss, and the two-preparer and both publisher-ordering fixtures — passed on the exact candidate `cad2eceb` as the coordinator reports, and in one controlled run there the unchanged-republication, caller-rollback and two due-conversion selections passed in their unmutated and restored phases, M10 was killed, and three supplementary mutants that close no mutation-matrix row were killed, which closes the unchanged-republication part of KR-07 and the caller rollback and replay part of KR-08 to the scope of the named tests and completes none of KR-06, KR-07, KR-08 or KR-13; mutants M1a, on its first and on its continuation id read, M1b, M1c, M1d, M1e, M1f, M1g, both M1h variants, the combined M2, M3 in its adjudicated root-author form, M4, M5, M10, and M15a, M15b and M15c were killed in controlled runs, M15a and M15c in their required real-wrapper and integrated-tally forms; the KR-17 §7.5 fixture and numeric-evidence gate was independently ACCEPTED by a fresh Astra-high adjudication on one preserved isolated run whose captured output holds every evidence report, and the KR-17-specific hold is lifted.** The rest of the KR-02 to KR-16 acceptance matrix, in which KR-02, KR-04, KR-06, KR-07 and KR-08 are not complete, the rest of the mutation matrix, M6a, M6b, M7, M8a, M8b, M9, M11, M12, M13 and M14, the fresh Astra-high and blind GPT-6.1 Sol-high final reviews, final CI and PR publication evidence are all still pending, and neither the branch as a whole nor the broad suite is claimed green. The subsections dated October 6 below record the red-first history as it stood then, when the modules were stubs; they are not rewritten. **AC-02 is not complete, the primitive is not wired or activated, and nothing in this section completes AC-02 or AIO-1170.**
 
 #### Specification — recorded October 6
 
@@ -1901,3 +1901,159 @@ After the mutant phase the source was restored and its SHA-256 equalled the star
 Unchanged from the AC-09 section and not addressed by this slice: an active adapter and its wiring, secure cursor-key provisioning, and the intersection with the real membership oracle.
 
 **Broad suite and prohibitions.** The broad `npm test` was not rerun and is not claimed green; no full-file run of the real-PostgreSQL suite is claimed either. Production is unchanged. Not done and not authorized, unchanged: any driver, runner, scheduler, route, action or manual trigger for this primitive; provider HTTP; publisher wiring; removal or weakening of either not-wired guard; any schema change or migration; repair apply; the identity cutover; activation; PR 743 integration; any edit of a shared or PR 743-owned file; merge; deployment; any main, production or force push; live acceptance; and the soak. The held items of the specification's final section remain held. **AC-02 is incomplete and the primitive is inactive and unwired.**
+
+#### The lifecycle packet — existing-state preservation, unchanged republication, rollback, replay and orderings, and due-output conversion — its reviews, and the controlled M10 and supplementary mutation run — recorded October 7, 2026, after the finite upper-observation subsection above
+
+Every subsection above stays true as of when it was written. This subsection supersedes, as current status only, exactly these statements of their pending lists:
+
+- "the rest of the mutation matrix: M6 to M14". **M10 is now killed.** The rows still pending are M6a, M6b, M7, M8a, M8b, M9, M11, M12, M13 and M14.
+- "KR-08 … in full", and "both publisher orderings and the two-preparer race". Evidence for caller rollback, retry on another connection, application receipt loss, the two-preparer race and both publisher orderings is recorded below, each to its stated scope. KR-08 is not complete.
+- Of the KR-07 list of the finite upper-observation subsection, "that an unchanged publication refreshes the observation without semantic-generation churn" is closed to the scope of the named tests below, and "the JavaScript conversion bounds of the due instant" is narrowed by synthetic unit-level evidence. KR-07 is not complete.
+- "the rest of KR-06". The existing-state preservation suite passed on the exact candidate, as the coordinator reports. KR-06 is not declared complete here.
+
+**It completes none of KR-06, KR-07, KR-08 or KR-13, and it does not complete AC-02.**
+
+**Identities.**
+
+- The candidate, and the clean HEAD the controlled run below was made on, is `cad2eceb82d06ec3360d32060e02ca9f0ae92b14`, on the branch `codex/aio-1170-resume-20261005` as the harness recorded it. The coordinator's state file, `.context/aio-1170-resume/current-state.md`, records it as pushed to `origin/codex/aio-1170-slack-timeline` and independently read back at `2026-10-07T17:06:49Z`.
+- Lifecycle test commits, as the coordinator states them: `0798c2babb4d60e860f721038f7500e1168246d4` for the KR-07 unchanged-republication tests, the KR-08 rollback and replay tests and the due-output tests; `c0d24de3e1432b05cd4733e4949b71433b65ba29` for the three concurrency and ordering fixtures; `cad2eceb82d06ec3360d32060e02ca9f0ae92b14` for the test-only lock-observer stability fix. The writer has no git access and did not read the history.
+- **One attribution is not recorded.** The KR-06 existing-state preservation suite, and the first form of the due-output suite, were written in the writer's turn that started from `f04c6c58a6077a583d2cfbc1abce3686a2fb5900`, the packet's starting checkpoint; the next turn started from a checkpoint the coordinator named `8d42de08`. The coordinator's list for this subsection attributes no commit to the KR-06 preservation suite, so none is attributed here.
+- Files at the candidate, as the harness recorded them, each byte-identical to its blob at the commit, at HEAD and in the index:
+
+| File | SHA-256 | Cases |
+|---|---|---|
+| `lib/ingest/slack-message-ledger.ts` | `22fe2f1ddb138ec51b3c841a94191191ecaab64e737cace954f5ebe53b31edd2` | — |
+| `lib/ingest/slack-known-root-requeue.ts` | `ed46bd3744b0d9bf9a7555e831b0a4360ff10c2ca4108dfa5ff8b94a9e3fc9a6` | — |
+| `test/datamechanics/slack-known-root-requeue.datamechanics.test.ts` | `51f02e1059b4cd35825bf83f10211159f1a193278ab2cce5133173d89b4ca872` | 58 |
+| `test/slack-known-root-requeue.test.ts` | `91b6238972713c30648a925b5a967e31e0cfe7354e23b361492fa408f333e7dd` | 211 |
+
+- **Production source was not changed by this packet.** The requeue module's hash is the value recorded throughout this section. The coordinator reports that only the two known-root test files changed. The ledger module is a dependency that was mutated only disposably, inside the controlled run, and restored. The primitive remains inactive and unwired.
+- The same writer authored the tracked tests and the ignored harness: subscription-authenticated Claude Opus 5.5 at high effort, session `b1767100-da84-4808-818f-6b0107480c68`, with no test or shell execution. The coordinator ran every check and run recorded here and owns every commit and push.
+
+**Scope.** The packet is the fresh Astra-high disposition `.context/aio-1170-resume/ac02-lifecycle-packet-astra.md`, a local git-ignored file the writer read. It is READY on existing accepted requirements with no specification amendment, and it names the tests and the controlled experiments recorded here.
+
+**What was added — tests only.** Five suites, all evidence expected to pass on the unchanged source.
+
+| Suite | Tier | Cases | What it requires |
+|---|---|---|---|
+| `known-root due-output conversion contract` | unit, synthetic | 17 | Through the exported preparer with only the due answer varied: three valid decimal-millisecond answers reach the enqueue as a Date of the exact number; ten invalid answers under `is_due: true` throw, enqueue nothing and construct no Date; three non-boolean `is_due` values throw and enqueue nothing; `is_due: false` with a null due returns `not_due` without conversion. |
+| `KR-06 existing queue state preservation` | real PostgreSQL | 6 | For an existing queued, backed-off, running, expired-lease, partial-snapshot and complete-snapshot row, preparation returns `already_pending` and the queue and staging rows are unchanged. |
+| `KR-07 unchanged republication refresh` | real PostgreSQL | 2 | Recorded below. |
+| `KR-08 rollback and replay` | real PostgreSQL | 3 | Caller rollback after a provisional `enqueued` persists nothing; a retry on another connection commits exactly one row at the same observation-derived due instant; after a known commit whose result the application discards, a replay on another connection returns `already_pending` and leaves the single row byte-identical. |
+| `KR-08 concurrent preparers and publication orderings` | real PostgreSQL | 3 | Two preparers on independent connections commit one insertion; publisher first; preparer first. Each overlap is observed as real database blocking, not assumed. |
+
+- **Unchanged republication, main case.** A root is published by the real publication and its root witness alone is aged by two hours under a one-hour interval. The entry is enumerated. The identical complete thread is staged again and published again through the real `ingestItem`, between two readings of the database's clock. Asserted in this order: the republication's status is `unchanged` for the same item; the same item id and version count; the data, identity and presentation generations unchanged; every semantic ledger field and `last_seen_generation` unchanged; the root observation strictly after the aged value and inside the clock bracket, live, with the refreshed due in the future and the old exact due still past; queue and staging removed; then preparation from the previously enumerated entry commits `not_due`, inserts no queue row and changes no snapshotted surface.
+- **Unchanged republication, control.** An aged root that was not republished is enqueued at its previously established exact due instant.
+- **The receipt-loss case is exactly "application receipt loss after known commit".** It is not network ambiguity, not a commit whose outcome is unknown, and no replacement for the `commit_unknown` evidence of M15c.
+- **The due-output suite is synthetic and unit-level.** It varies an injected due answer; it is not real-PostgreSQL scheduling or calendar evidence.
+
+**Checks on the exact candidate, by the coordinator.** As reported to the writer, on `cad2eceb`: the due-output unit selection 17/17; on isolated real PostgreSQL, the KR-06 selection 6/6, KR-07 unchanged republication 2/2, rollback and replay 3/3, and concurrency and orderings 3/3; typecheck, targeted ESLint, the diff check, docs drift and skill-runtime sync all passed. The writer saw none of these outputs. Three of the selections were also run by the harness below, whose results the writer did read.
+
+**Independent reviews of the tests, as the coordinator relayed them.** The writer read no review artifact.
+
+- A fresh independent Opus 5.5 high combined review found one HIGH and one MEDIUM.
+- **HIGH: a transitional first sighting in `pg_stat_activity` could fail a concurrency fixture falsely.** The coordinator reports it was independently accepted and traced. The same writer changed the test-only observer to return only the second of two consecutive blocker sightings. No exact assertion and no timeout was weakened, and no sleep was added. In the same turn the writer made three comment-only corrections relayed as LOW. This is the change at `cad2eceb`.
+- **MEDIUM: a stale-snapshot evidence gap.** The coordinator reports that reruns on the exact candidate closed it. The writer was asked for no test change for it.
+- A fresh focused Opus rereview returned PASS / READY TO PUSH, with no unresolved blocker, HIGH, MEDIUM or LOW.
+
+**Controlled run.** The harness `.context/aio-1170-resume/run-ac02-lifecycle-mutants.mjs` and its run directory `.context/aio-1170-resume/ac02-lifecycle-mutants/2026-10-07T17-50-13-417Z-94199` are local, git-ignored files, **not tracked and not themselves remotely backed**. This tracked record carries the facts needed to recover or repeat the run.
+
+- The run's summary records the harness file's SHA-256 as `ac08f617e0cca189694b007ab884f0f2e13533ce221a63076ef7132d24b53b7b`. The coordinator reports that `node --check` and the harness's exact read-only preflight both passed before the run.
+- One run only. The summary records no earlier run directory and no rerun flag; nothing was retried. Terminal exit code 0.
+- The coordinator gives the SHA-256 of `summary.json` as `8906b400b619cc3c3e45e8f4e353cb3dc30929fdfd8621aa37e33affb718f034` and of `record.md` as `1180faab2a0b321b97bb76d8585661f3071f1844d72b2a49ad8274ca0c1a714f`. The writer recomputed no hash.
+- The writer read `record.md` in full and checked its hashes, exit codes, totals, outcomes and final-state line against `summary.json`. It did not read the preserved phase logs.
+- Verified copies of both unmutated sources are kept under `.context/aio-1170-resume/ac02-lifecycle-mutants/baseline/`, each named by its SHA-256.
+
+**Selections**, each one child process started directly, with `AIOS_DM_RESET` removed from its environment and `--reporter=default --reporter=json --outputFile.json=<phase-report>` appended. No KR-17 case is in any selection.
+
+- republication: `npm run test:datamechanics:iso -- test/datamechanics/slack-known-root-requeue.datamechanics.test.ts -t "KR-07 unchanged republication refresh"`
+- rollback: the same file with `-t "persists nothing when the caller throws after preparation returned a provisional enqueued"`
+- preconversion: `npm run test -- test/slack-known-root-requeue.test.ts -t "is_due true: (one millisecond past the largest instant a Date can hold|an unsafe integer)"`
+
+| Phase | Selection | Exit | Passed | Failed | Skipped | Total | Duration |
+|---|---|---|---|---|---|---|---|
+| baseline | republication | 0 | 2 | 0 | 56 | 58 | 5,439 ms |
+| baseline | rollback | 0 | 1 | 0 | 57 | 58 | 3,883 ms |
+| baseline | preconversion | 0 | 2 | 0 | 209 | 211 | 1,478 ms |
+| mutant observation-refresh | republication | 1 | 1 | 1 | 56 | 58 | 4,070 ms |
+| mutant generation-churn | republication | 1 | 1 | 1 | 56 | 58 | 4,296 ms |
+| mutant M10 | rollback | 1 | 0 | 1 | 57 | 58 | 3,874 ms |
+| mutant preconversion | preconversion | 1 | 0 | 2 | 209 | 211 | 1,236 ms |
+| restored | republication | 0 | 2 | 0 | 56 | 58 | 3,876 ms |
+| restored | rollback | 0 | 1 | 0 | 57 | 58 | 3,276 ms |
+| restored | preconversion | 0 | 2 | 0 | 209 | 211 | 1,338 ms |
+
+Every baseline and every restored control was recorded valid: exit 0, exactly the selected cases ran and passed, and every other case was skipped, with identical totals before and after.
+
+**The four experiments.** Each is one replacement of an anchor that occurred exactly once, in one file. After each, the source was restored to its baseline SHA-256, and the harness verified the exact HEAD, the clean status, and all four files byte-identical to the commit, HEAD and the index and at their starting SHA-256.
+
+| Experiment | Matrix row | File and line | Mutant SHA-256 | Result |
+|---|---|---|---|---|
+| observation-refresh | none: supplementary | ledger, 281 | `941186ae44f6463a4c753d6efc04ac56dd83bd3505c3085f6a8553397269f15e` | KILLED |
+| generation-churn | none: supplementary | ledger, 265 | `86a4f690c073e4115fd6c606c7f8b03ce207ef6df4249957802b70a118b4cc4f` | KILLED |
+| M10 | M10 — transaction escape | requeue, 414 | `aebdb31b104186992d3af62648aa0b25a14dacf5298e36751effc22e65b56760` | KILLED |
+| preconversion | none: optional, supplementary | requeue, 264 | `d132852fde3acb2f3464ed82ec1cbf7f179f92b04351568595b461ed9799378a` | KILLED |
+
+**A discrepancy in one relayed hash.** The coordinator's instruction for this subsection gave the observation-refresh mutant as `941186c038bded37e56b19f1d8ba544d92c6098e06e1db11ec6a6193c180f15e`. Both `record.md` and `summary.json` of the run record `941186ae44f6463a4c753d6efc04ac56dd83bd3505c3085f6a8553397269f15e`. The table carries the value of the two durable artifacts. The other three mutant hashes agree with the instruction.
+
+- **observation-refresh.** In the ledger's conflict update, `last_seen_generation = excluded.last_seen_generation,` followed by `observed_at = excluded.observed_at` became `last_seen_generation = excluded.last_seen_generation` alone. Only the main republication case failed, with one plain assertion error at line 4751 of the test file: `identical republication: the root observation strictly advanced, to an instant between the two database clock readings`. The value received was `strictly_after_the_aged_observation: false`, `not_before_the_clock_reading_before: false`, `not_after_the_clock_reading_after: true`, `live: true`, `refreshed_due_is_in_the_future: false`, `old_exact_due_is_still_past: true`, against all six `true`. The control passed.
+- **generation-churn.** `const generation = semanticChange` became `const generation = true`, so the existing data-generation bump was always taken. Only the main republication case failed, with one plain assertion error at line 4740: `identical republication: the data, identity and presentation generations are unchanged`. The data generation received was `2` against the required `1`; the identity generation, `0`, and the presentation generation, `1`, were equal on both sides. The case reaches that assertion only after the republication's `unchanged` status and the item and version assertions have passed. The control passed.
+- **M10.** The single enqueue call of the preparation, on the decorated session, became the same call inside an independent transaction of the application's own client, opened through dynamic imports of `@/lib/db/admin` and `@/lib/projects/context/transaction`. No shared file was edited. The one selected case failed, with one plain assertion error at line 4851: `caller rollback: no queue row survived the rollback, and nothing is staged`. The value received held exactly one queue row, of the fixture root `1718900000.000100`, and empty staging, against an empty queue and empty staging. The case reaches that assertion only after preparation returned a provisional `enqueued` inside the caller's transaction and the caller's throw ended that transaction. The selection has no control.
+- **preconversion.** The one line rejecting a due number that is not a safe integer, is negative, or is past the largest Date was replaced by a comment; the final rejection of an invalid Date was kept. Both selected cases failed, each with one plain assertion error at line 1521: `one millisecond past the largest instant a Date can hold: rejected before construction`, which observed the construction `[8640000000000001]`, and `an unsafe integer: rejected before construction`, which observed `[9007199254740992]`, each against no construction at all. The selection has no control.
+
+No timeout, suite error, unhandled error or deadline error was recorded in any phase; the harness would have classified any of them inconclusive.
+
+**Final restoration.** The harness's final state is "verified: exact HEAD, clean status, and all four files byte-identical to the commit, HEAD and the index and at their starting SHA-256". The ledger ended at `22fe2f1d…1edd2` and the requeue module at `ed46bd37…fc9a6`, each equal to its starting value. Neither test file was ever written.
+
+**Independent review of the harness, as the coordinator relayed it.** A fresh independent Opus harness review returned PASS / READY TO RUN, with no blocker, HIGH or MEDIUM. Its six LOW limitations are retained as stated and are not upgraded:
+
+1. A restored control that is missing is not handled as its own outcome; the run then still exits non-zero or as interrupted. Every restored control ran and was valid in this run.
+2. A grandchild process that keeps a pipe open can delay the close of a phase, and with it the restoration; an operator signal restores at once.
+3. The console error-line parser can miss a bare `Error:` line; the exact assertions of the JSON report still govern.
+4. The quoting of the unit selection's regular expression is validated only by the baseline phase.
+5. The escaped M10 row stays in the isolated database until the next `beforeEach` truncation.
+6. The observation mutant shows the scheduling consequence only indirectly, and must be worded as it is below.
+
+**What this establishes.**
+
+- **KR-07 unchanged-republication lifecycle evidence, to the scope of the two named tests.** On real PostgreSQL an identical republication refreshes the root observation without changing the data, identity or presentation generation, and preparation from the previously enumerated entry then commits `not_due`. Both properties are operative: removing the observation refresh is detected, and forcing a generation bump is detected.
+- **The bounded claim of the observation mutant.** It shows that the test does not accept a stale observation, and that it requires the refreshed due to lie in the future. **The final `not_due` assertion is not reached under the mutant**: the case fails earlier. That preparation would then enqueue was not observed.
+- **KR-08 caller rollback and replay evidence, to the scope of the three named tests.** The caller-rollback case passed unmutated and restored in the controlled run. The retry and receipt-loss cases are covered by the coordinator's 3/3 result only.
+- **M10 is killed.** An enqueue that escapes the caller's transaction leaves a committed queue row that the caller-rollback case finds.
+- **The optional supplementary preconversion mutant, to its exact scope.** For the two selected invalid answers, the numeric validation is what rejects them before a Date is constructed.
+
+**What it does not establish.**
+
+- The observation-refresh, generation-churn and preconversion mutants close no row of the mutation matrix. Only M10 is a matrix row.
+- The preconversion mutant covers two of the ten invalid answers. The negative-integer answer was excluded by design, because without the validation it yields a valid Date and is not rejected at all; nothing is claimed about it.
+- M10 was judged on the caller-rollback case alone. The retry and receipt-loss cases were not selected under the mutant.
+- The KR-06 preservation suite, the retry and receipt-loss cases, the three concurrency and ordering fixtures and the other fifteen due-output cases were not part of the controlled run. Their results are the coordinator's, and no mutant was run against them; the packet required none for every state or race.
+- The snapshots that surround preparation in these tests do not discharge KR-13.
+- The queue and staging assertions that are not scoped to a team hold only on an isolated database.
+- This is not a full-file run and not a broad-suite pass. KR-17 was excluded from every selection.
+
+**Remaining matrix — not done, and not claimed.** This replaces the pending list of the subsection above as the current one.
+
+Acceptance matrix:
+
+- **KR-02 and KR-04:** completion pending, as limited in the M1a, M1b and M1c subsection.
+- **KR-06:** evidence is now on record for the conflict branch, with M4, and for the six existing states, the latter as a coordinator-reported 6/6. The row is not declared complete: no reconciliation of the whole row has been adjudicated.
+- **KR-07:** evidence is on record for exact due persistence and the millisecond ceiling with M5, the decision clock, the finite upper observation, the unchanged republication, and the due-output conversion at the synthetic unit level. The row is not declared complete. The packet states that closing KR-07 requires reconciling all of that evidence, which has not been done. The limitations of the earlier subsections stand: the inclusivity of the finite cutoff is not pinned, whether a far-future finite witness should be `not_due` is not adjudicated, and any other clock variant the accepted language may require is not shown.
+- **KR-08:** the stale-claim dependency characterization is not done. The two-preparer race and both publisher orderings have passing fixtures and no mutation evidence. The row is not complete.
+- **KR-09, KR-11, KR-13 and KR-15:** pending in full.
+- **KR-10, KR-12, KR-14 and KR-16:** their uncovered parts are pending, as the earlier subsections limit them.
+
+Mutation matrix, each with baseline, mutant and restored hashes: M6a, M6b, M7, M8a, M8b, M9, M11, M12, M13 and M14.
+
+Carried forward unchanged:
+
+- the stored-secret rotation, environment-fallback and namespace re-readiness fixtures; the parts of KR-10 that the M15 subsection left pending; and timeout restoration against a real connection;
+- the packet's run of the known-root unit and guard suites, and of the existing thread-state, publication, discovery, ledger and source-fence regressions, on the restored candidate, none of which was reported to the writer; and a run of the whole real-PostgreSQL file on `cad2eceb`. A full-file run of the real-PostgreSQL file includes the KR-17 cases: it needs a fresh adjudication by the Astra owner, or must explicitly exclude the KR-17 selection;
+- any cold-cache or production-capacity claim;
+- the fresh Astra-high and the blind GPT-6.1 Sol-high final reviews;
+- final CI, the final PR body and attestation, and publication evidence, all on the eventual exact final head;
+- a fresh PR 743 path refresh and comparison at integration time, and PR 743 semantic integration.
+
+Unchanged from the AC-09 section and not addressed by this packet: an active adapter and its wiring, secure cursor-key provisioning, and the intersection with the real membership oracle.
+
+**Broad suite and prohibitions.** The broad `npm test` was not rerun for this packet and is not claimed green. The last broad run on record remains non-green, with three five-second timeouts in `test/staging-policy-commissioning.test.ts` whose cause and relation to the baseline are unverified. No full-file run of the real-PostgreSQL suite is claimed either. Production is unchanged. Not done and not authorized, unchanged: any driver, runner, scheduler, route, action or manual trigger for this primitive; provider HTTP; publisher wiring; removal or weakening of either not-wired guard; any schema change or migration; repair apply; the identity cutover; activation; PR 743 integration; any edit of a shared or PR 743-owned file; merge; deployment; any main, production or force push; live acceptance; and the soak. The held items of the specification's final section remain held. **AC-02 is incomplete and the primitive is inactive and unwired.**
