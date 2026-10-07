@@ -4,11 +4,11 @@ Status: **UNACCEPTED PROPOSAL; NOT READY; NO BUILDER ADMISSION.** Sole specifica
 
 ## 1. Authority, scope, hierarchy and exact snapshot
 
-The sole current write is this new file. Accepted v9 and unaccepted v10 remain byte-for-byte unchanged. No implementation, tests, scanner, CDC sweep, network operation, Linear write, Git write or worker dispatch belongs to this author stage. The parent owns hash computation, one-file-delta verification and any subsequently qualified documentation checkpoint.
+The sole current write is completion of this retained v11 file. Accepted v9 and unaccepted v10 remain byte-for-byte unchanged. No implementation, tests, scanner, CDC sweep, network operation, Linear write, Git write or worker dispatch belongs to this author stage. The parent owns hash computation, one-file-delta verification and any subsequently qualified documentation checkpoint.
 
 The frozen v11 input manifest incorporates the entire v10 author manifest: 43 fixed inputs, 325 lexical candidate identities and 678 app/lib/scripts source identities, plus 28 round-2 inputs. These are exact evidence identities, not a semantic safety census. `W` means the supplied task worktree and `H` its durable sibling handoff. Evidence names below are relative references within those frozen packets; no private scanner report or private model stream is a source.
 
-Local clean HEAD at launch: `9753e94d86e8eaf2164976d6edd5222fdf8ea7c5`; remote task branch checkpoint: `813f61c395fef73c236de9804598f40ab497bbce`; staging: `c5e832c2ff179ee5c99f95966fba1ed9ce77ae3e`; PR 744 remains draft. Local HEAD adds only the unaccepted v10 documentation commit above the remote checkpoint. Neither that commit nor v11 has been rerun through unit/scanner/CDC validation. All supplied executed results labelled `813f61c...` remain evidence of that snapshot only.
+Original v11-author launch HEAD was `9753e94d86e8eaf2164976d6edd5222fdf8ea7c5`, adding only unaccepted v10 above remote `813f61c395fef73c236de9804598f40ab497bbce`. Recovery starts from verified clean local HEAD `f757d7582d001e08fd94056f3a6fc43178337d27`, whose sole additional task change is the retained partial v11 (SHA-256 `8342ce7d538364929ba540f4eb05b919aed2a7cf14334d006767e775f92dceba`, 397800 bytes, 2074 lines). The prior author thread `01a110d6-109b-73e3-9363-3d641e779a9d` ended `turn.failed` on a provider usage limit, was reaped and emitted no completion marker; that run remains incomplete. This recovery continues its valid draft, not a new predecessor-based rewrite. The sanitized interruption and local-checkpoint records establish lifecycle/scope only. Recorded remote remains `813f61c395fef73c236de9804598f40ab497bbce`, staging remains `c5e832c2ff179ee5c99f95966fba1ed9ce77ae3e`, and PR 744 remains draft in the preserved readback; recovery performs no network readback. No unit/scanner/CDC result attests `9753e94...`, the partial-v11 checkpoint or final v11 bytes. All supplied executed results labelled `813f61c...` remain evidence of that snapshot only.
 
 The remote checkpoint deadline `2026-10-06T09:36:31.465516Z` is overdue and unreset. A readback of the older remote does not reset it. This author grants no push authorization, cadence reset or attestation. The parent must preserve that debt until a qualifying remotely verified checkpoint under normal controls actually exists.
 
@@ -17,6 +17,8 @@ Accepted v9: SHA-256 `0a19ddf87f9247d960cd5ed0247e14962963df3f99ae3c4b1a1546cd43
 Precedence for this successor is: current explicit task constraints; the fresh Astra HIGH decision `NARROW_EXISTING_GUARD_CONTRACT_ADMISSIBLE` for Contract A; this complete v11 proposal for the stated B/C amendments and renewed gates, subject to independent acceptance; accepted v9 for every unchanged application requirement; source and executed receipts for current facts; older proposals/reviews as qualified historical evidence. The fresh scope decision materially supersedes the earlier Astra material-revision decision's expanded Contract A. It does not invalidate the H1/H2 counterexamples against v10 or accept Contracts B/C. The full normative finite contract and its controls are reproduced below, and every §6 amendment is reproduced as a traceability table in Appendix D.
 
 Appendix A reproduces the complete v9 text, including its complete Appendix, without abbreviation. That is exact content incorporation, not a summary that loses F4. V11's expressly enumerated supersessions take precedence over affected historical future-version references, the false CDC universal envelope and the new CI contract; no other v9 requirement is weakened. Historical status words inside reproduced predecessor evidence do not become current v11 status. There remain exactly AC-01 through AC-14.
+
+**Reference namespaces.** Unqualified section references outside incorporated quotations mean v11 §§1–10 and its Appendices A–E. Inside the exact v9 body in Appendix A, references retain v9's namespace; its nested immutable v6 body retains v6's namespace and original path context. Inside the reproduced Astra decision in §4 and Appendix D, numbered decision sections refer to that named decision; the left column of Appendix D refers to preserved v10. Thus v10 §§10–12 and Appendix B.3 are predecessor references, not missing v11 sections. Historical source line numbers identify the frozen artifact, not this expanded document. The nineteen `Criterion N` headings are Appendix E's documentation-edit keys. No scanner occurrence ordinal is introduced. Closing v11 §8 contains dispositions/ACs, §9 implementation and verification, and §10 remaining gates.
 
 ## 2. Preserved outcome, data ownership, invariants and exclusions
 
@@ -177,6 +179,12 @@ H1 remains valid against v10: its expansion demanded detection/refusal of those 
 
 Deferred and uncredited: generalized `runSql`/`executeSql`/`.rpc`, pg-client/receiver identity, generic helpers and callers, SQL-fragment transfer, dynamic identifiers, function invocation side effects, arbitrary SQL loaders, extra roots (`components`, instrumentation and others) and extra extensions. Unsupported forms beyond the existing finite channels are not newly certified safe. Parser failure in the retained syntactic task still fails closed. The frozen materializer definition and required executable call remain enforced even though general function-call closure is deferred. AIO-1230 creation is the verified separate routing required by AC-11; owner disposition remains a distinct unresolved fact.
 
+### 4.2 Exact frozen materializer reference
+
+The authorized definition is the complete `postgres/schema.sql` lines **2987–3083 inclusive**, from `create or replace function materialize_builtin_membership_once()` through `end $$;`, including its terminating LF. In the frozen 177596-byte schema (SHA-256 `23c79fcdce11c7dd1171c06d79b9ab3ad80d745a5c7879c3f90837e2490b5eca`) that is the zero-based UTF-8 byte interval **[166106, 171748)**: **5642 bytes**, SHA-256 **`488dae3c5d9ad62105a69909ae8eb5027a61ee100d05e8521735672b473e37f7`**. These are source-identity measurements only, not an executed guard or SQL result. Copy this exact span into the allowed guard implementation as its frozen reference; no additional committed fixture path is authorized. Validate signature and complete definition against that reference before masking only its body. A current-source extraction must never become its own approval. Definition absence, change, duplication or relocation fails; scan all outside bytes and other SQL normally.
+
+The required migration is exactly `postgres/migrations/20260818210000_pret6_retire_access_enforcement.sql`, **1924 bytes**, SHA-256 `7f25361556b438cc3d227e92ba2acfffc2e1d380b6be11ae93b19196d26184b6`. Preserve the actual executable `perform materialize_builtin_membership_once();` after the permissive-fleet refusal and before `alter table teams drop column access_enforcement;`, plus the sole-definition check. Its original full source is the reference, not a name-only or comment-only match. Future production-entry controls still must prove each required failure category; these frozen identities earn no such execution credit.
+
 ## 5. Contract B — pinned Linux scanner and exact occurrence reconciliation
 
 ### 5.1 Preservation and evidence identity
@@ -256,9 +264,61 @@ Each specimen records nonnegative safe integer `beforeAdmitted`, `afterAdmitted`
 
 Function-level bindings are mandatory, not just whole-file hashes. A binding is `{path,symbol,syntaxKind,sourceStart,sourceEnd,sha256,bytes,dependencies}` over the exact UTF-8 bytes of a TypeScript-parser-selected complete declaration (start/end are source UTF-16 offsets; hash bytes are explicit UTF-8). Record parser version 5.9.3, reject duplicate/missing symbols and source span ambiguity, and include exact constant/initializer declarations and transitive boundary-affecting dependencies. Whole-file hashes remain provenance diagnostics, not a reason an unrelated edit silently changes the algorithm identity.
 
-CDC bindings include `chunkCdc`, `cdcBoundaries`, `normalizeParams`, `masksFor`, `avoidSurrogateSplit`, `isHighSurrogate`, `isLowSurrogate`, `splitmix32`, `gear`, `GEAR_SEED`, both gear-table initialization declarations and their dependencies, defaults/config arithmetic and any directly used boundary-affecting declaration. The discovery must verify this closure against actual pinned source rather than treat this list as permission to omit a renamed dependency. Bind BOTH `chunkContentLegacy` in `lib/graph/project.ts` and `legacyChunks` in `scripts/cdc-churn-sweep.mjs`, plus effective target/cap and blank-input handling dependencies. The latter is an inlined implementation, not proof of the former. The independent measurement harness extracts/evaluates the actual pure production legacy declaration with explicit constant bindings (no DB/provider initialization), and cross-checks it against actual sweep legacy on every specimen and blank/cap/surrogate edge control. A hand-retyped copy cannot satisfy the production cross-check. Any extraction/dependency ambiguity blocks measurement.
+CDC bindings include `chunkCdc`, `cdcBoundaries`, `normalizeParams`, `masksFor`, `avoidSurrogateSplit`, `isHighSurrogate`, `isLowSurrogate`, `splitmix32`, `gear`, `GEAR_SEED`, the single destructuring/IIFE declaration initializing both `GEAR_LO` and `GEAR_HI` and its dependencies, defaults/config arithmetic and any directly used boundary-affecting declaration. The discovery must verify this closure against actual pinned source rather than treat this list as permission to omit a renamed dependency. Bind BOTH `chunkContentLegacy` in `lib/graph/project.ts` and `legacyChunks` in `scripts/cdc-churn-sweep.mjs`, plus effective target/cap and blank-input handling dependencies. The latter is an inlined implementation, not proof of the former. The independent measurement harness extracts/evaluates the actual pure production legacy declaration with explicit constant bindings (no DB/provider initialization), and cross-checks it against actual sweep legacy on every specimen and blank/cap/surrogate edge control. A hand-retyped copy cannot satisfy the production cross-check. Any extraction/dependency ambiguity blocks measurement.
 
 The producer computes these function identities; no function digest or final v11 budget is fabricated here. Frozen whole-file source identities remain in Appendix C, including CDC `0ad3b17c954bfbe0bbfadf7483dbe58c99fe596eac672111dd319bc79895f8b5`, project `06774065ffd60f1fdfa11eb9154102dc799e8ccab1bb6273d52cdb480362ec8c`, sweep `8b89658c873da66224d18a5d033888fb906c49b05249321cb79664fc91176bbc`, and unit `4ae834ec40f229d6f1e2b329401871a31529820e880902f4fad33980a5de7fa9`. These source hashes do not stand in for the outstanding function-level receipt.
+
+### 6.3.1 Closed schema, identity encoding and continuing admission
+
+The following closes the field names/types implied by §6.3; it is schema notation, not measured fixture content. `UInt` is a nonnegative safe integer, `Int` a signed safe integer, `Hash` exactly 64 lowercase hexadecimal characters, and `Path` a canonical regular non-symlink repository-relative POSIX path. Every object rejects unknown/duplicate keys; every array has the ordering and uniqueness rules below. No optional free-form measurement fields are allowed.
+
+```text
+Config = { algorithm: "cdc1", min: 1250, target: 2500, max: 4000,
+           cap: 80, unit: "UTF-16" }
+BindingRef = { path: Path, symbol: string }
+Binding = { path: Path, symbol: string, syntaxKind: string,
+            sourceStart: UInt, sourceEnd: UInt, sha256: Hash, bytes: UInt,
+            dependencies: BindingRef[] }
+AlgorithmBindings = { parserVersion: "5.9.3", cdc: Binding[],
+                      legacyProduction: Binding[], legacySweep: Binding[],
+                      sha256: Hash }
+Recipe = { id: string, family: string, length: UInt, definitionVersion: 1,
+           generatorBinding: Binding[], appendSha256: Hash }
+InventoryEntry = { path: Path, sha256: Hash, bytes: UInt,
+                   utf16Length: UInt, eligible: boolean }
+SpecimenKey = { path: Path, documentSha256: Hash, documentBytes: UInt,
+                documentUtf16Length: UInt, recipeId: string,
+                appendSha256: Hash, appendUtf16Length: UInt,
+                algorithmBindingSetSha256: Hash, config: Config }
+Structural = { admittedArrayBound: UInt, admittedArrayPass: boolean,
+               tailLocalityPass: boolean, sizeEnvelopePass: boolean,
+               depthCeiling: 4, depthPass: boolean,
+               nonblankCeiling: UInt | null, nonblankCeilingPass: boolean | null,
+               whitespaceTransition: boolean, admittedBoundaryAgreementPass: boolean,
+               deterministic: boolean, legacyArraysEqual: boolean }
+Specimen = { key: SpecimenKey, beforeAdmitted: UInt, afterAdmitted: UInt,
+             commonChunkPrefix: UInt, commonBoundaryPrefix: UInt,
+             divergenceDepth: UInt, cdcChurn: UInt,
+             legacyProductionChurn: UInt, legacySweepChurn: UInt,
+             gap: Int, positionalChurn: UInt, blankBase: boolean,
+             structural: Structural, maxCdcChurn: UInt, maxGap: Int }
+Admission = { key: SpecimenKey, disposition: "ADMITTED" | "REJECTED",
+              decisionRef: Hash, predecessor: SpecimenKey | null }
+Fixture = { schemaVersion: 1, metric: "admitted-set-membership-v1",
+            config: Config, algorithmBindings: AlgorithmBindings,
+            recipeDefinitions: Recipe[], corpusInventory: InventoryEntry[],
+            specimens: Specimen[], admissions: Admission[] }
+```
+
+A measured candidate has `admissions: []`; its measured `maxCdcChurn`/`maxGap` are proposed ceilings only, not approvals. A committed admitted fixture requires exactly one `ADMITTED` entry per specimen and no rejected/unreferenced entry. `decisionRef` identifies the independent value-free review artifact whose external parent receipt binds the complete candidate and resulting admitted bytes. Keep prior fixtures and rejection/removal decisions in the durable parent record; never satisfy a missing current specimen by retaining a stale admission. For a genuinely new document, predecessor is null; changed document/recipe/config keys name their preceding reviewed key. Removed documents require a separate reviewed inventory-removal receipt before a smaller current fixture is admissible. Ordinary CI cannot perform admission.
+
+`sourceStart`/`sourceEnd` are zero-based, half-open UTF-16 offsets locating a complete declaration; select its first syntactic token through declaration end, preserving internal comments/literals and excluding leading trivia. A destructuring declaration is one complete binding (`symbol: "GEAR_LO,GEAR_HI"`), with both exported names resolved to it. Dependencies are unique `(path,symbol)` references sorted by path then symbol, and must resolve in the corresponding transitive binding set. Literal generators use their complete enclosing declaration/expression and necessary constants; they cannot be represented by an empty dependency assertion in place of actual source identity.
+
+For deterministic hashing use UTF-8 compact JSON with object keys recursively sorted by Unicode code-point order, no extra whitespace or final LF, and arrays ordered as specified. The algorithm-binding-set digest hashes `{parserVersion,cdc,legacyProduction,legacySweep}` after projecting each Binding to `{path,symbol,syntaxKind,sha256,bytes,dependencies}` and sorting by path then symbol. Exclude location offsets and the digest itself from that digest: a comment inserted elsewhere in a large source file cannot change the function identity. Re-extract every binding to verify its declaration bytes; changed offsets alone are refreshed as location provenance through independent review, never treated as changed behavior or permission to increase a budget. Recipe generator identities use the same projection and exact dependency-byte validation. Recipe family is the ID prefix before `/`; `length` and generated append length must equal the ID suffix. A source declaration changed internally requires renewed identity/admission even if output appears unchanged.
+
+For every specimen validate inventory/key/config/recipe/hash equality, `gap = cdcChurn - legacyProductionChurn`, both legacy values and arrays equal, and `admittedArrayBound = max(0, afterAdmitted-commonChunkPrefix)`. Blank-base qualification is derived from actual `trim()` behavior, not chosen metadata. Only a blank base allows both nonblank-ceiling fields to be null; all other applicable pass fields must be true for admission. Preserve tail-locality and boundary checks for blank inputs under §6.2's qualification; null is not a general structural bypass. Signed gap/ceiling values may be negative. Sort admissions exactly as specimens; references use complete keys, never ordinals. Reject impossible prefix/count/coordinate relationships, mismatched derived values or non-deterministic measurements.
+
+After merge, any maintainer proposing a corpus change takes the producer role and a separate reviewer takes the independent admission role, using the same frozen harness, exact-byte candidate, reproduction and durable receipts. These roles do not depend on this chat being present. The implementation author may propose measurements but cannot approve them, remove difficult specimens or use an update flag to admit a regression. A new counterexample returns to reviewed policy adjudication; it does not automatically raise a ceiling. All initial final-v11 measurements, binding/recipe digests and admissions remain outstanding.
 
 ### 6.4 Complete live-specimen recipe IDs and exact recipe definitions
 
@@ -352,7 +412,37 @@ For §2d, replace its entire body up to the next heading with:
 
 > Remove the falsified live `cdcChurn <= legacyChurn + 1` assertion. Require both the structural live-corpus gate and independently reviewed frozen per-specimen CDC and gap budgets, keyed by exact document, append recipe and function/config identities. Do not assert universal +2. Preserve insertion/deletion comparisons and all independent in-place controls unchanged. New or changed specimens cannot disappear or approve their own baseline; missing, stale, extra, duplicate or malformed baseline data fails. V9 quiet-66 remains 2/0/2, not a new permissible bound for other specimens.
 
-For §3, replace each of its nineteen bullets exactly as specified in Appendix E's old-text-to-new-text table, preserving nineteen criteria and their order. That table is the exhaustive disposition; no bullet may be silently dropped. Also supersede §4's `Gating the long-append legacy envelope.` deferral: frozen finite long-append specimen budgets are now required, while a universal long-append theorem remains deferred. Qualify §5's absolute-ceiling sentence with “for nonblank bases” and the whitespace activation rule. The introduction's two-document exclusions describe historical published figures only; future acceptance includes those documents and all specifications. Any related current-tense sentence claiming universal short-append loss <=1 must be replaced with the exact v9 witness and finite-budget statement, preserving its original measured figure as explicitly historical if retained.
+For §3, replace each of its nineteen bullets exactly as specified in Appendix E's old-text-to-new-text table, preserving nineteen criteria and their order. That table is the exhaustive disposition; no bullet may be silently dropped. The supplementary exact spans below settle the introduction, §4 and §5; they replace the former open-ended instruction to alter related sentences. Other historical measurements retain their original labels and scopes.
+
+**Preservation within the three full-body replacements:** before replacing §§0f, 2b and 2d, retain each original body verbatim immediately after its new normative body in a block labelled “Historical predecessor text — superseded acceptance rules, original finite measurements only.” This explicitly preserves old witnesses, numbers and the reasons for the prior comparison without making their universal/deferral language current. The new body controls; the old block cannot supply acceptance. Heading boundaries for those operations are the exact source heading pairs below (start heading retained, next heading excluded):
+
+| Source start heading | Next heading / exclusive endpoint |
+|---|---|
+| `### 0f. The two assertions guarding this row today` | `## 1. The claims that cannot hold` |
+| `### 2b. The test asserts the bound per document — and an ABSOLUTE ceiling that cannot self-adjust` | `### 2c. Four checked-in fixtures, because the live corpus cannot guarantee any of these branches` |
+| `### 2d. The false comparison is REPLACED, not deleted` | `### 2e. The sweep script` |
+
+**Introduction disposition:** retain the entire historical command/exclusion account from `**Every number below comes from one run of**` through the paragraph ending `rather than a fix.` unchanged, prefixed by: “Historical measurement scope only. The exclusions below apply to the original published figures, not current acceptance. AIO-1217 v11 acceptance includes both design documents and every eligible specification, with exact-byte independent specimen admission.” This is a historical qualification, not permission to exclude documents in CI.
+
+**§4 exact old bullet:**
+
+> - **Gating the long-append legacy envelope.** The synthetic maximum (+2 here, higher under other
+>   generators) is a lower bound, and this file does not gate on lower bounds — the short-append regime is
+>   where the envelope is measured on both populations.
+
+Replace that whole bullet with:
+
+- **Universal long-append theorem remains deferred.** Independently reviewed exact-byte finite specimen budgets for both short and long listed recipes are required now. They do not claim a universal maximum gap or turn a synthetic maximum into a theorem.
+
+**§5 exact old paragraph:**
+
+> Wrong if any document exceeds the absolute ceiling of `(1 + ⌊(max − 1)/min⌋) + ⌈A/min⌉`, which would mean
+> the structural window in §0d is not what `cdcBoundaries` does.
+
+Replace that paragraph with:
+
+> Wrong if a nonblank-base document exceeds `(1 + floor((max-1)/min)) + ceil(A/min)`, or an applicable structural gate fails. Whitespace-to-nonblank activation instead uses the admitted-array bound and qualified boundary checks. Independently, an unchanged exact specimen exceeding either reviewed CDC churn or gap budget fails, and a new/changed specimen lacking independent admission fails. Neither structural success nor a universal legacy +1/+2 assertion can replace these budgets.
+
 
 In `content-defined-chunking.md`, replace the exact acceptance row `| append at end | 1 of 20 (for a SHORT append — see below) | **conditional — see below** |` with:
 
@@ -362,7 +452,7 @@ Replace the paragraph beginning `**The trade, both directions measured.**` throu
 
 > The historical corpus and 300-document comparison measured a short-append gap no greater than one, but that does not hold universally on later live documents. Accepted AIO-1217 v9 quiet-66 yields CDC 2, legacy 0, gap 2. No universal +2 is claimed. Current append acceptance uses both structural bounds and independently reviewed per-specimen CDC/gap budgets for exact document and append bytes, including long appends. The insertion benefit remains measured separately. The summary table's legacy one-chunk claim stays scoped to its original 66-character append; a 2501-character legacy append can churn two. These validation amendments do not change cdc1 or exclude documents.
 
-Retain the exact historical legacy summary row and its 66-character qualifier, unrelated in-place/insertion/deletion claims, runtime/config/lazy-rollout/content-safety contracts and their historical limitations. The future documentation review must compare all anchored replacements and all nineteen criteria, not grep only for `+ 1`.
+Preserve the replaced trade paragraphs verbatim after the replacement in a block labelled “Historical predecessor trade measurements — not current acceptance”; keep their original finite-corpus attribution. Retain the exact historical legacy summary row and its 66-character qualifier, unrelated in-place/insertion/deletion claims, runtime/config/lazy-rollout/content-safety contracts and their historical limitations. The future documentation review must compare all anchored replacements and all nineteen criteria, not grep only for `+ 1`.
 
 
 ## Appendix A. Complete immutable accepted v9 text
@@ -1674,6 +1764,15 @@ Input content was read and exact regular-file hash/size identities reverified. I
 | last qualifying clean remote proof before v10 author | `resume-ci-v10-author-preflight.json` | `014cd989ee98080f066871b232aecee8ed5650c6c27973ddcfbde0aba822ebba` | 435 |
 | first preserved overdue checkpoint record | `resume-ci-v10-overdue-checkpoint.json` | `2381349f8434b50dcad4eb5a3fd1da397e25323efac09260211495ffac77d788` | 419 |
 
+Recovery continuity identities supplement the frozen evidence above; they do not supply application/scanner/CDC measurements.
+
+| Role | Safe reference | SHA-256 | Bytes |
+|---|---|---|---:|
+| Original v11 author manifest | `review-public-support/resume-ci-v11-astra-medium-author/packet/input-manifest.json` | `1f9ba6e8590a2034c80904e58b88f51bcc5fc28ec06446726e3ae9e6c49c2adb` | 11176 |
+| Inherited complete v10 author manifest | `review-public-support/resume-ci-v10-astra-medium-author/packet/input-manifest.json` | `98f8ff4dd7d9ae039a4e0082df4d8b065302589f0a1a23bfcfddf16e7435ab72` | 13443 |
+| Sanitized prior-author interruption; lifecycle/scope only | `resume-ci-v11-astra-medium-author.interruption.json` | `97db56d9962c6af830aa7fb753890c039a7b1e9876e61f1c9bc1a1c7a8d9d1e3` | 1864 |
+| Preserved local-checkpoint result; lifecycle/scope only | `resume-ci-v11-interrupted-local-checkpoint.result.json` | `266d8b71ea92b08a9195540a8c4e82f1df1916ce2ecb9d5c042c4df3c593a0ab` | 1134 |
+
 The v6/v7 original Linear description continuity remains historical (185181 bytes, SHA-256 `fa17678bd795a64c207e42443c52f2b9a9c66e6bc7144cb046eb60e08020c9ac`). Native v9 attachment identity is separate from that description; equality between the description and later attachment is not required. V11 is not uploaded, attached or accepted. Native v11 attachment verification will require exact bytes, with no Markdown serialization-normalization tolerance. AIO-1230's routine description normalization does not relax this requirement.
 
 ## Appendix D. Every normative Astra HIGH §6 amendment
@@ -1989,22 +2088,22 @@ Exact predecessor AC text, retained with the separately enumerated AC-11/12/13/1
 
 | AC | Required evidence / v11 delta | Present credit |
 |---|---|---|
-| AC-01 | Complete executing action discovery and unsupported-shape refusal at the exact snapshot; retain original census reconciliation. | Historical pre-edit admission BLOCKED; no new full census execution. |
-| AC-02 | One current complete policy row for every runtime export, guard/refusal/effects/ID-binding/evidence semantics. | 95-action/14-AC whole-coverage gap remains; historic 96-row census cannot be silently renamed a complete current proof. |
-| AC-03 | Actual unauthenticated/identity guard denial and no protected effects under the retained action contract. | Expired-cookie and guard-read-fault gaps remain. |
-| AC-04 | Correct tenant/admin/role guard semantics on actual executing paths with genuine authorization refusals. | Existing scoped evidence only; complete runtime matrix unearned. |
-| AC-05 | Client-controlled identifier/project/team binding and compatibility across all admitted actions. | Caller/context coverage incomplete; no whole-census inference. |
-| AC-06 | Protected effect ordering and actual denial observations, not inventory/proxy-only evidence. | Existing paired observations limited to their exact scopes. |
-| AC-07 | Required paired RED/mutation controls and genuine caller surfaces in the full inherited contract. | Historical pre-edit/runtime/RED gaps not repaired by this documentation. |
-| AC-08 | Full F4 state/cardinality/claim/producer/concurrency/fault semantics, including uncertain completion and zero-dispatch refusals. | Qualified affected behavior review is not whole acceptance; concurrency/revocation/live-provider limits persist. |
-| AC-09 | Full retained runtime/error/caller compatibility criterion, including refusal conventions and sanitized faults. | E6/UI/Server Action caller/wire evidence gap remains. |
-| AC-10 | Full retained migration/rollout/documentation/operational criterion and actual evidence rather than inferred coverage. | No runtime rollout, deployment, production or completion credit. |
+| AC-01 | Complete discovery: current census reconciliation and filesystem/directive/unsupported-shape controls. | Historical pre-edit census/runtime admission BLOCKED; no new complete executing census. |
+| AC-02 | Complete policy rows: exactly one registration per runtime export with exact owners, refusals, effects, client-ID limits and executing evidence. | Whole 95-action/14-AC coverage remains unearned; historical inventory is not current proof. |
+| AC-03 | Genuine invocation: exact owner identities/completion modes and all full-policy positive/mutation controls, including trusted-mode/browser-target enforcement. | No new checker or mutant execution; retained evidence is snapshot-scoped. |
+| AC-04 | Actual boundary denial: all 95 protected exports, each documented conjunction, eight resolver-fault cases, 15 scope connections/14 actions and non-vacuous admitted controls. Retain F4-E1/E3 consequences. | Expired-cookie, guard-read-fault and whole-action coverage gaps persist; deferred protections are not passes. |
+| AC-05 | Guard owners and policy compatibility: real session/member/posture predicates, stale-tier directions, visibility propagation, ten-call-site compatibility and exact residual outcomes. Retain F4 ADM/caller compatibility. | Existing scoped owner evidence only; caller/UI/E6/wire and revocation limits remain. |
+| AC-06 | Account protocol: own-cookie sign-out, own-identity welcome/password change, only-if-unset/current-password refusals and admitted controls without a new tenant-membership requirement. | No new account-protocol execution or complete acceptance. |
+| AC-07 | Approval team binding RED→GREEN: foreign legacy/governed IDs match absent refusal with durable non-effects; same-team approve/deny compatibility. | No new paired runtime or durable-state evidence; historical qualifications persist. |
+| AC-08 | Approval state/fault boundary: team/id/state-bound transitions, cardinality, producer readiness, atomic pending claim, competing requests, dispatch and uncertain-completion faults. | This is the approval state machine, not PM F4; no new native concurrency/fault proof or broader guarantee. |
+| AC-09 | People tenant target RED→GREEN: foreign-team profile/avatar/time-off/goal refusal with durable non-effects; preserved self/admin-other controls. | No new People target execution; original RED and snapshot qualifications remain. |
+| AC-10 | People child owner RED→GREEN: team/member/resource binding, peer IDs/import dedup, zero-row/race refusal, explicit trusted import and browser-mode mutants. | No new ownership/race/mode evidence or whole-task acceptance. |
 | AC-11 | RETAIN owner/schema/membership compatibility. New delta is verified separate routing of raw edge residuals without waiver. | AIO-1230 routing verified; owner agreement/accepted deferral NOT VERIFIED; no production edits admitted. |
-| AC-12 | RETAIN historical evidence and RED duties. ADD finite A mask/channel/identity/full-entry controls; B exact bijection and ambiguity; C exact measured specimen budgets. WITHDRAW v10 whole semantic census promise. | All new executable evidence and independently reviewed final-v11 baseline/ledger outstanding. |
-| AC-13 | RETAIN all unrelated required tests/checks. AMEND coarse channel comment input only; preserve raw/static/ownership controls. REPLACE false universal CDC envelope with both gates; reconcile active scanner findings with exact approvals. | Current CI/Codacy state remains failed/unearned; none rerun for 9753e94/v11. |
-| AC-14 | REPLACE future version-specific admission references with fresh Opus HIGH spec → resolved findings → separate Astra HIGH readiness → exact native attachment verification → sole builder → three later reviews. | Every complete-v11 gate pending; no attachment/readiness/PR publication credit. |
+| AC-12 | RETAIN historical evidence and RED duties, including v9's bounded F4-E4 retrospective route and its permanent chronology qualification. ADD finite A mask/channel/identity/full-entry controls; B exact bijection and ambiguity; C exact measured specimen budgets. WITHDRAW v10 whole semantic census promise. | All new executable evidence and independently reviewed final-v11 baseline/ledger outstanding; original chronology and six unreached reference repeats receive no new credit. |
+| AC-13 | RETAIN all unrelated required tests/checks and F4 affected validation. AMEND coarse channel comment input only; preserve raw/static/ownership controls. REPLACE false universal CDC envelope with both gates; reconcile active scanner findings with exact approvals. | Current CI/Codacy state remains failed/unearned; none rerun for 9753e94, f757d75 or final v11. |
+| AC-14 | REPLACE future version-specific admission references with fresh Opus HIGH spec → resolved findings/required independent HIGH skeptics → separate Astra HIGH readiness → exact native attachment verification → sole builder → three later reviews. | Every complete-v11 gate pending; no attachment/readiness/PR publication credit. |
 
-The preceding compact matrix cannot redefine the full AC text. In particular any topic overlap between matrix rows must be assessed against the exact retained wording, not used to narrow an obligation. Contracts A/B/C are evidence subcontracts, not replacement or renumbered ACs.
+The compact matrix preserves each original AC identity and subject; the full retained wording controls every detailed obligation. PM reconciliation F4 continues to map to AC-04/05/11/12/13/14 as v9 specifies; it does not rename AC-08 or the People/account criteria. Contracts A/B/C are evidence subcontracts, not replacement or renumbered ACs.
 
 ## 9. Exact future implementation scope, sequence and parent-owned checks
 
@@ -2038,7 +2137,7 @@ Forbidden implementation writes: every `app/**` and `lib/**` file, including `li
 
 ### 9.2 Exact implementation and verification order
 
-1. Parent verifies this one new file, predecessor hashes, source/evidence identity and all author-stage restrictions. Preserve exact proposed bytes and overdue cadence state. A normal local documentation checkpoint requires its ordinary qualification; this author makes no Git write or push decision.
+1. Parent verifies the recovery delta in this one retained file, predecessor hashes, source/evidence identity and all author-stage restrictions. Preserve exact proposed bytes and overdue cadence state. A normal local documentation checkpoint requires its ordinary qualification; this author makes no Git write or push decision.
 2. Obtain fresh independent Opus 5.5 HIGH review of COMPLETE v11, resolve each finding (HIGH/blocker requires independent per-finding skepticism), and verify the already specified narrow policy rather than invent SQL abstractions or seed authority. Parent acquires/reviews the outstanding Linux provisioning/coordinate/suppression controls, value-free ledger dispositions and exact v11 CDC measurement packet under producer/reviewer separation. If exact final bytes change, repeat affected complete-byte review and measurements.
 3. Fresh separate Astra HIGH readiness reviews Contracts A/B/C, all dispositions, exact baseline/ledger receipts and AIO-1230 limitations. No readiness with an invented baseline, ambiguous individual category mapping, unqualified review or implied owner agreement. Then upload exact complete reviewed v11 as a NEW native AIO-1217 attachment and independently download/read back full hash/size. Preserve v9 native attachment and original description continuity. No builder until all these gates are satisfied.
 4. Verify sole future Opus 5.5 HIGH builder identity and fresh subscription capacity, stop latch and single-writer/overlap ownership. No API key billing, nested writer or automatic provider switch. Parent owns visibility, 90% stop, checkpoints and authorized remote backups under the workflow; attach display without restarting existing work. This author does not dispatch that worker.
@@ -2060,6 +2159,10 @@ Rollout is atomic adoption of the bounded checks plus their controls and indepen
 ## 10. Still-uncredited ledger and final role gates
 
 Unresolved facts/gates include: historical pre-edit census/runtime admission BLOCKED; expired-cookie and guard-read-fault gaps; 95-action/14-AC whole-coverage gap and historical census reconciliation; E6/UI/Server Action caller/wire gap; live-provider and concurrency/revocation limits; all affected-review qualifications; current CI/Codacy failures/unverified state; original Opus review's historical denial; first projection's rejected alignment; actual Linux binary digest/provisioning/suppression/path/coordinate/error controls; independent safe occurrence/group approvals and new-metadata zero-finding proof; exact final-v11 CDC function/generator identities, measured baseline, both-legacy cross-check and independent reproduction/admission; future changed-doc specimen admission; full-entry guard controls; five uncovered raw edge writes and lack of AIO-1230 owner agreement/accepted deferral; all generic SQL/extra-root/extension coverage explicitly deferred; renewed complete-byte reviews/readiness/native attachment; overdue remote backup; later implementation/check/code/final review obligations. A routed child is progress on routing only.
+
+**Pre-builder evidence checklist (all still pending unless explicitly identified as preserved routing/identity evidence):** parent verification and freezing of the complete recovered bytes and one-file delta; fresh qualified independent subscription Opus 5.5 HIGH complete-spec review and resolution of findings with separate independent HIGH/blocker skeptics; reviewed pinned Linux executable digest/provisioning and actual suppression/path/coordinate/error/completion controls; independently reviewed value-free occurrence/group approval candidate and metadata zero-finding evidence; parent-produced exact-final-v11 corpus/function/recipe/legacy-cross-check measurements with independent reproduction and specimen-budget admission; fresh separate Astra HIGH readiness assessing those receipts and the verified AIO-1230 routing with owner agreement/accepted deferral still absent; exact complete new native Linear attachment plus independent full download/readback hash/size equality; and verified sole Opus 5.5 HIGH worker identity, subscription capacity/stop-latch status, source ownership/overlap, exact allowed scope and recoverable handoff. Parent controls and measurement harnesses must themselves be independently inspected and identity-bound; a source-only proposal cannot replace their actual results. Any spec-byte change invalidates affected measurement/review/attachment identities and returns to those gates.
+
+Full-entry guard mutation results, final implemented scanner/CI results, post-edit CDC-design specimen admission, parent verification and the three code/final reviews are subsequent implementation/completion obligations. They remain unearned but are not falsely required as already-implemented proof before admitting the sole builder. AIO-1230's absent owner agreement is retained for readiness's explicit limited-scope disposition; no agreement or accepted deferral may be inferred from its verified routing. Historical production admission remains separately BLOCKED regardless of a future bounded CI-builder admission.
 
 These are not requests for this author to exceed scope. They are explicit parent-owned admission and evidence gates. Whole acceptance is unearned. There is no PR readiness, merge, remote-main containment, deploy, release or Done credit. Staging remains the feature/PR destination; merging and deployment require their own authorization. The inherited lifecycle's remote-main-containment requirement for eventual Done is not permission to merge or push main.
 
