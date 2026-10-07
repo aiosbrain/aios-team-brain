@@ -3109,10 +3109,11 @@ describe("KR-06 — a queue row committed between the plain queue read and the e
       barrierReleased = true;
       releaseA();
     };
-    // LAST RESORT: if this case times out or hangs before its own `finally` runs, A is still released
-    // when the case finishes, so its transaction ends and its locks go. On every ordinary path the
-    // `finally` below has already released A and this does nothing. It only releases: it asserts
-    // nothing, awaits nothing and throws nothing, so it cannot replace the error the case ended with.
+    // LAST RESORT, for a case whose body does not reach the `try`/`finally` below, or that times out:
+    // when the case finishes, this releases A's barrier. It RELEASES ONLY. It does not await A's
+    // transaction, which then ends asynchronously, some time after this hook has returned. When the
+    // `finally` below did run, it has already released A and this does nothing. The hook asserts
+    // nothing and throws nothing, so it cannot replace the error the case ended with.
     onTestFinished(() => {
       releaseBarrier();
     });
@@ -3249,8 +3250,9 @@ describe("KR-06 — a queue row committed between the plain queue read and the e
       expect(await locks(), "barrier: A still holds its authority locks and still not the item lock").toEqual({
         namespaceGate: "LOCKED", integration: "LOCKED", binding: "LOCKED", channel: "LOCKED", item: "free",
       });
-      expect([held, clockIsStopped(), monotonicNow() === stoppedAt, issued.map((statement) => statement.name).includes(ITEM_LOCK)],
-        "barrier: A is held, its controlled clock is stopped, and it has issued nothing since").toEqual([true, true, true, false]);
+      // `requested` is the wrapper's live list; `seen.requested` is the copy it took when it held A.
+      expect([held, clockIsStopped(), monotonicNow() === stoppedAt, requested, issued.map((statement) => statement.name).includes(ITEM_LOCK)],
+        "barrier: A is held, its controlled clock is stopped, and it has issued nothing since").toEqual([true, true, true, seen.requested, false]);
     } finally {
       // RELEASE A — also when something above failed, so that A never outlives the case.
       releaseBarrier();
