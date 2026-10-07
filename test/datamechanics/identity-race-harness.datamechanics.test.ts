@@ -66,6 +66,8 @@ import {
  *      the foreign sessions keep their locks and their waits, and complete once released; and a
  *      backend a signal is aimed at stays the raced operation's until the signal has been executed
  *      — the pool cannot lend it to anyone else in between, even once the operation has let it go;
+ *      and a release the pool THREW out of — an ordinary one included — is not a return: cleanup
+ *      is `unproven`, the marker stays and the run is stopped;
  *   3. a schedule that FAILS after an operation has started a real transaction is reported only
  *      after that operation's backend is idle; a cleanup that cannot be proven stops the run;
  *   4. the run-safety state: an in-flight scope blocks truncation and the next file; a scope's own
@@ -315,6 +317,21 @@ function discardFromPool(client: PoolClient): void {
     throw new Error("pg-pool no longer has `_remove`: a stranded connection staged by this file cannot be retired from the pool");
   }
   internals._remove(client);
+}
+
+/**
+ * Where the application pool has one connection, from its own inventory: `known` — it still counts
+ * it among its connections; `idle` — it holds it ready to lend. A connection it was properly given
+ * back is known and idle, or (given back with an error) not known at all. The pool has no public
+ * reading of ONE connection — its counters move with every other connection's idle timeout — so
+ * this reads the two lists those counters are the lengths of.
+ */
+function poolInventoryOf(client: PoolClient): { known: boolean; idle: boolean } {
+  const internals = getPool() as unknown as { _clients?: unknown[]; _idle?: { client: unknown }[] };
+  if (!Array.isArray(internals._clients) || !Array.isArray(internals._idle)) {
+    throw new Error("pg-pool no longer has `_clients` / `_idle`: where it has a connection cannot be read");
+  }
+  return { known: internals._clients.includes(client), idle: internals._idle.some((item) => item.client === client) };
 }
 
 afterEach(async () => {
@@ -922,6 +939,151 @@ describe("race harness (2, leases): a backend a signal is aimed at is not lent t
       if (owner) {
         await untilSessions([owner.pid], "the raced operation's backend idle or gone",
           (sessions) => sessions.every((session) => session.state === "idle"));
+      }
+      staged.clear();
+    }
+  }, RACE_TEST_TIMEOUT_MS);
+});
+
+describe("race harness (2, leases — a hand-over that threw): a release the pool did not complete is not a return — cleanup is `unproven`, the marker stays and the run is stopped (real Postgres)", () => {
+  /**
+   * A raced operation finishes by itself and releases its connection in the ordinary way: nothing
+   * was ever aimed at its backend. But the pool's `release` THROWS — a `release` listener of the
+   * application's, which the pool runs before it has either kept the connection or destroyed it.
+   * The operation is settled and holds nothing it knows of; and where its connection is, nothing
+   * says. That must not read as "returned": the scope's marker must stay and the run must stop.
+   *
+   * The listener throws once, for that operation's connection only, and is removed on every exit.
+   * Nothing is timed: the operation moves when the barrier's lock is released to it, and what
+   * became of its backend is read from PostgreSQL.
+   */
+  it("an ordinary, UNSIGNALLED release that throws out of the pool: the operation is settled and its backend idle, but the connection was not taken back — `unproven`, nobody signalled, the marker and the fatal reason kept, the guard refusing", async () => {
+    const pool = getPool();
+    const { directory, safety } = privateRun();
+    const tag = `handover-${randomUUID().slice(0, 8)}`;
+    const lockName = `harness-handover:${randomUUID()}`;
+    const stagedFailure = new Error("staged: a pool `release` listener that throws");
+    // The raced operation's backend, and its checked-out client: filled in by the operation itself.
+    const owners: BackendIdentity[] = [];
+    const held: PoolClient[] = [];
+    // What each of the operation's two release calls came to: what it threw, or "returned".
+    const releases: unknown[] = [];
+    const signals: PendingSignal[] = [];
+    // ONE SHOT: the first time the pool announces the release of the raced operation's connection.
+    let thrown = 0;
+    const throwOnce = (_error: unknown, client: unknown): void => {
+      if (thrown > 0 || !owners.some((owner) => (client as { processID?: unknown }).processID === owner.pid)) return;
+      thrown += 1;
+      throw stagedFailure;
+    };
+    expect(safety.blocked()).toBeNull();
+    // Real sessions are staged here under a run-safety state the real run does not read: a barrier,
+    // and a connection the pool is made to lose track of. The real run carries a sentinel until
+    // both are SEEN gone.
+    const staged = stagedOnRealRun("a raced operation whose ordinary release is staged to throw out of the pool");
+    let barrier: Barrier | undefined;
+    try {
+      pool.on("release", throwOnce);
+      barrier = await holdNamedLock(lockName, { tag, safety });
+      const failure = await parkThenCompete({
+        seed: { teamId: randomUUID() },
+        barrier,
+        parksOn: "advisory",
+        // The raced operation: one pool connection, in a transaction, parked on the barrier's lock.
+        // Once cleanup has released the barrier it gets the lock, ends its transaction and releases
+        // — by itself, before any round of cleanup has reason to signal it.
+        first: async () => {
+          const client = await pool.connect();
+          held.push(client);
+          owners.push(await whoIs(client));
+          await client.query("begin");
+          await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [lockName]);
+          await client.query("rollback");
+          // AN ORDINARY RELEASE, twice: the first is the one the pool throws out of.
+          for (let call = 0; call < 2; call += 1) {
+            try {
+              client.release();
+              releases.push("returned");
+            } catch (error) {
+              releases.push(error);
+            }
+          }
+          return "released";
+        },
+        // The schedule itself fails at once, so cleanup runs with the first operation still parked.
+        second: async () => "finished without waiting",
+        // Every signal cleanup asks for, should it ask for one.
+        cleanup: { signal: (pending, send) => { signals.push(pending); return send(); } },
+      }).then(() => null, (error: unknown) => error);
+
+      expect(owners).toHaveLength(1);
+      const [owner] = owners;
+      // THE RELEASE: the listener threw, once, and the operation was told — as without the harness.
+      // Its second release of that checkout was refused as the pool refuses one: no second hand-over.
+      expect(thrown).toBe(1);
+      expect(releases).toHaveLength(2);
+      expect(releases[0]).toBe(stagedFailure);
+      expect(releases[1]).toBeInstanceOf(Error);
+      expect((releases[1] as Error).message).toBe("Release called on client which has already been released to the pool.");
+
+      // WHERE THE CONNECTION IS. Its backend is there, idle, its transaction over and its lock
+      // gone; the client still answers, as that very backend; and the pool still counts the
+      // connection as one of its own but does NOT hold it ready to lend. It was neither kept nor
+      // destroyed: it was not returned.
+      expect(await sessionEvidence([owner.pid])).toEqual([{ pid: owner.pid, state: "idle", waitingOn: null, locksHeld: 0 }]);
+      expect(await whoIs(held[0])).toEqual(owner);
+      expect(poolInventoryOf(held[0])).toEqual({ known: true, idle: false });
+
+      // CLEANUP IS UNPROVEN — though the barrier was seen gone and both operations had settled. And
+      // nobody was signalled: a connection nothing can place is not one to aim at.
+      expect(failure).toBeInstanceOf(RaceScheduleError);
+      const { cleanup, message } = failure as RaceScheduleError;
+      expect(message).toContain("the competing operation finished without waiting");
+      expect(cleanup).toEqual({
+        outcome: "unproven",
+        barrierGone: true,
+        signalled: [],
+        operations: [
+          { label: "the parked operation", backends: [owner.pid], settled: true },
+          { label: "the competing operation", backends: [], settled: true },
+        ],
+      });
+      expect(signals).toEqual([]);
+      expect(await barrierSessions(tag)).toEqual([]);
+
+      // THE RUN IS STOPPED: a fatal reason, the marker still on file, and the guard refusing.
+      const reason = safety.fatal();
+      expect(reason).toMatch(/could not be proven settled, idle or disposed/);
+      expect(safety.armed()).toEqual([tag]);
+      expect(() => assertRunSafe(safety)).toThrow(/run STOPPED — refusing to truncate or run another test/);
+      // STICKY: no later conclusion, release or reason clears it…
+      barrier.conclude(true, "");
+      await barrier.release();
+      expect(safety.armed()).toEqual([tag]);
+      expect(safety.fatal()).toBe(reason);
+      expect(safety.setFatal("a later, different reason")).toBe(reason);
+      expect(() => assertRunSafe(safety)).toThrow(/run STOPPED — refusing to truncate or run another test/);
+      // …and SHARED: another reader of the same state — as the next test file's worker is — is refused too.
+      const elsewhere = createRunSafety(directory);
+      expect(elsewhere.armed()).toEqual([tag]);
+      expect(elsewhere.fatal()).toBe(reason);
+      expect(() => assertRunSafe(elsewhere)).toThrow(/run STOPPED/);
+      // The real run was not stopped by this test: its state is not this one.
+      expect(raceHarnessFatal()).toBeNull();
+      expect(currentRunSafety().armed(), "the real run: the sentinel, and only the sentinel").toEqual([staged.scope]);
+    } finally {
+      // ON EVERY EXIT: the listener is taken off first, so no later release — this test's or
+      // another's — can meet it; the barrier is released (a no-op once the schedule has seen it
+      // gone); and the connection the pool lost track of is retired from it by hand, so that no
+      // later test inherits a pool one connection short. The sentinel comes off only when the
+      // barrier and that backend are both SEEN gone. If either cannot be seen, this throws, the
+      // sentinel stays, and the real run stops.
+      pool.removeListener("release", throwOnce);
+      await barrier?.release().catch(() => undefined);
+      await untilBarrierGone(tag);
+      for (const client of held) discardFromPool(client);
+      for (const owner of owners) {
+        await untilSessions([owner.pid], "the raced operation's backend gone", (sessions) => sessions.length === 0);
       }
       staged.clear();
     }
