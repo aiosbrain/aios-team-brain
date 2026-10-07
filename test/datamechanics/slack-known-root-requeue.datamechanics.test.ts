@@ -2631,7 +2631,7 @@ describe("M1a team-bounded enumeration — another team's item ids inside the ke
 });
 
 /**
- * KR-05 — a witnessed root stays schedulable whatever its attribution, and the falsifier of M3
+ * KR-05 — a witnessed root stays schedulable whatever its attribution, and the three falsifiers of M3
  * (`docs/design/slack-known-root-requeue-spec.md` §5.3, §10, §11 KR-05, §12 M3).
  *
  * EVIDENCE, NOT RED: every case here is expected to pass on the current source. Preparation reads
@@ -2663,14 +2663,17 @@ describe("M1a team-bounded enumeration — another team's item ids inside the ke
  * The tombstone case shows both on one root: with its row also deleted it is `missing_root_witness`
  * and nothing is written; with the row live again, the same entry is enqueued.
  *
- * M3. A gate on the root's author — eligible, and mapped — refuses the unmapped, bot and tombstone
- * roots. A gate on the thread having a creditable, mapped reply refuses the zero-reply root. Either
- * gate, and both together, leave the reference alone: under any of them the reference still
- * enqueues, so in a mutation run it is the control that shows a refusal of the others to be the
- * gate's doing and not a statement that no longer matches anything. A case's two preparations are
- * both made before either is judged, and the labeled enqueue is judged first, so a gate fails each
- * case once, at that label. The tombstone case's contrast is `missing_root_witness` with or without
- * such a gate, and does not fail under one.
+ * M3 IS ONE MUTANT: a gate on the root's author. The live root witness is strengthened to require
+ * `eligible = true` and a Slack `member_identities` mapping, in the same team, for the root row's
+ * `author_external_id`; its scope, liveness and observation predicates stay as they are. Under it
+ * the unmapped, bot and tombstone roots are refused, each at its labeled enqueue: those three cases
+ * are M3's falsifiers. The reference and the zero-reply root are both roots of the mapped human, so
+ * the gate admits them and they still enqueue: they are KR-05 baseline evidence and M3's positive
+ * controls, which show a refusal of the other three to be the gate's doing and not a statement that
+ * no longer matches anything. A case's two preparations are both made before either is judged, and
+ * the labeled enqueue is judged first, so the gate fails each falsifier once, at that label. The
+ * tombstone case's contrast is `missing_root_witness` with or without the gate, and does not fail
+ * under it.
  *
  * Each case is its own team in a database truncated before it, and ends by counting the queue rows
  * of EVERY team: one.
@@ -2722,7 +2725,7 @@ describe("KR-05 — a witnessed root stays schedulable whatever its attribution 
     ledger: [[OLD_ROOT, BOT_USER, false, "bot_message"], [OLD_REPLY, MAPPED_HUMAN, true, null]],
   };
   const ZERO_REPLY_ROOT: Shape = {
-    label: "a ZERO-REPLY root of a mapped human is enqueued (KR-05, M3)",
+    label: "a ZERO-REPLY root of a mapped human is enqueued (KR-05 baseline, and a positive control for M3)",
     thread: { root: humanRoot(MAPPED_HUMAN), replies: [], users: DIRECTORY },
     ledger: [[OLD_ROOT, MAPPED_HUMAN, true, null]],
   };
@@ -2853,7 +2856,7 @@ describe("KR-05 — a witnessed root stays schedulable whatever its attribution 
   /**
    * The same entry, prepared twice: once before the revisit interval has passed, and once after the
    * fixture clock has aged the observation. Both calls are made before anything is asserted, and the
-   * labeled enqueue is asserted FIRST, so that an attribution gate fails a case exactly once, there.
+   * labeled enqueue is asserted FIRST, so that the M3 gate fails a case it refuses exactly once, there.
    */
   async function staysSchedulable(ctx: Ctx): Promise<void> {
     const { label } = ctx.shape;
@@ -2870,7 +2873,7 @@ describe("KR-05 — a witnessed root stays schedulable whatever its attribution 
     const aged = await prepareEntry(ctx);
     const afterAged = await snapshot(ctx.teamId);
 
-    // KR-05, and the falsifier of M3: the root is enqueued.
+    // KR-05: the root is enqueued. For the unmapped, bot and tombstone roots this is also M3's falsifier.
     expect(aged, label).toEqual({ outcome: "enqueued" });
 
     // DUE BEHAVIOR. Before the interval had passed the root was admitted and simply not due: the
@@ -2923,7 +2926,7 @@ describe("KR-05 — a witnessed root stays schedulable whatever its attribution 
   it("enqueues a bot-authored root (KR-05, M3)", async () =>
     staysSchedulable(await published(BOT_ROOT)));
 
-  it("enqueues a zero-reply root (KR-05, M3)", async () =>
+  it("enqueues a zero-reply root (KR-05 baseline, and a positive control for M3)", async () =>
     staysSchedulable(await published(ZERO_REPLY_ROOT)));
 
   it("enqueues a tombstone root whose ledger row is live, and refuses the same root while that row is deleted (KR-05, M3)", async () => {
