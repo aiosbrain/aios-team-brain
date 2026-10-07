@@ -886,7 +886,7 @@ Each mutation requires a named behavioral assertion and green baseline. Dependen
 | M6a — token currency | Remove only current-token fingerprint equality. The exact stored-secret fixture preserves real configuration revision; mutant incorrectly enqueues. |
 | M6b — revision pin | Substitute a freshly read gate revision for the captured one. Invalidate/reready between page and preparation. |
 | M7 — cursor classification | Advance only past Slack-looking entries. An all-non-Slack page must advance to later items. |
-| M8a — upper bound | Remove `id <= upperItemId`; a newly inserted above-bound item is incorrectly included. |
+| M8a — upper bound | Remove the continuation SQL predicate `id <= upperItemId`, retaining its parameter’s type reference and the independent local range guard. A newly inserted above-bound item must cause the named valid-page assertion to fail through the exact static range rejection. Separately, remove both that SQL predicate and only the local upper-range check; the same fixture must return the exact newly inserted above-bound ID and fail the named exact-ID assertion. Require both experiments; distinguish rejection from inclusion. |
 | M8b — OFFSET | Substitute offset pagination; deletion before page two causes an exact-ID omission. |
 | M9 — swallowed failure | Catch executor failure and return successful empty/refused output. Direct rejecting-executor tests detect it. Separately prove real transaction-tracker rollback without mislabeling existing protection as the mutation kill. |
 | M10 — transaction escape | Enqueue on another connection in an isolated mutant. Caller rollback leaves an independently committed row. |
