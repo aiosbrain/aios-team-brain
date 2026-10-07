@@ -1466,6 +1466,57 @@ describe("KR-03 — canonical proof refuses exactly what it should, and nothing 
       }),
     ]));
   });
+
+  // ── §5.3 stored provider ids that differ ONLY BY CASE: M1b, M1c (and KR-04 in part) ──
+
+  describe("stored provider ids that differ from the locator only by case", () => {
+    /**
+     * M1b and M1c. EVIDENCE, NOT RED: expected to pass on the current source.
+     *
+     * The scoped path lowercases its workspace and channel segments, so a stored provider id that
+     * differs from the locator only by case leaves the canonical path — and with it the path
+     * comparison — exactly as it was. Nothing but the comparison of the stored frontmatter value
+     * itself can refuse such an item. Each scenario changes ONE stored field of the really published
+     * item, by case only, after the real enumeration; `verify` then reads back, before the call,
+     * that everything else the candidate is proven by is untouched: the other stored id, both stored
+     * timestamps, the path (which the real builder gives for BOTH spellings), and the live root
+     * witness in the exact provider scope. Authority rows are never touched. The scenario then goes
+     * through the same movements as every other refusal of this group: exact closed result, nothing
+     * enqueued, whole-team snapshot unchanged, and the same entry enqueues once the field is restored.
+     */
+    const caseOnly = (label: string, key: "workspace_id" | "channel_id", stored: string, exact: string): Case => ({
+      ...frontmatterCase(label, key, stored, mismatch),
+      verify: async (ctx) => {
+        expect([stored === exact, stored.toUpperCase() === exact.toUpperCase()], `${label}: fixture: the stored spelling differs from the locator's, and only by case`).toEqual([false, true]);
+        expect(await one(
+          `select frontmatter->>'workspace_id' as workspace_id, frontmatter->>'channel_id' as channel_id,
+                  frontmatter->>'ts' as ts, frontmatter->>'thread_ts' as thread_ts, path
+             from items where id = $1`, [ctx.itemId]
+        ), `${label}: fixture: ONE stored field changed, and the path did not`).toEqual({
+          workspace_id: key === "workspace_id" ? stored : WORKSPACE, channel_id: key === "channel_id" ? stored : CHANNEL,
+          ts: OLD_ROOT, thread_ts: OLD_ROOT, path: SCOPED_PATH,
+        });
+        // Path equality cannot stand in for the missing comparison: the real builder gives the SAME
+        // path for the stored spelling and for the locator's.
+        const pathOfStoredSpelling = key === "workspace_id" ? scopedSlackItemPath(stored, CHANNEL, OLD_ROOT) : scopedSlackItemPath(WORKSPACE, stored, OLD_ROOT);
+        expect([pathOfStoredSpelling, scopedSlackItemPath(WORKSPACE, CHANNEL, OLD_ROOT)], `${label}: fixture: one canonical path for both spellings`).toEqual([SCOPED_PATH, SCOPED_PATH]);
+        // The witness keeps the provider's exact ids, bound to this item, live.
+        expect(await run(
+          `select workspace_id, channel_id, message_ts, root_ts, item_id::text as item_id
+             from slack_messages where team_id = $1 and is_root and deleted_at is null`, [ctx.teamId]
+        ), `${label}: fixture: the live root witness is untouched, in the exact provider scope`).toEqual([
+          { workspace_id: WORKSPACE, channel_id: CHANNEL, message_ts: OLD_ROOT, root_ts: OLD_ROOT, item_id: ctx.itemId },
+        ]);
+      },
+    });
+
+    it("is a canonical mismatch when the stored workspace_id or channel_id differs from the locator only by case, with the path, the witness and the authority facts unchanged (M1b, M1c)", () => refusesEach([
+      // Kills removal of ONLY the locked workspace equality: without it this item enqueues.
+      caseOnly("the stored workspace_id differs from the locator only by case (M1b)", "workspace_id", "t0source1", WORKSPACE),
+      // Kills removal of ONLY the locked channel equality, independently of the scenario above.
+      caseOnly("the stored channel_id differs from the locator only by case (M1c)", "channel_id", "c0known1170", CHANNEL),
+    ]));
+  });
 });
 
 /**
@@ -2426,5 +2477,139 @@ describe("M15a real-wrapper retry accounting — KR-10 through runContextTransac
       expect(sums.sumOfUnattestedCounts, `${label}: unattested reasons sum to unattested`).toBe(tally.unattested);
       expect(sums.sumOfRefusedCounts, `${label}: refused reasons sum to refused`).toBe(tally.refused);
     }
+  });
+});
+
+/**
+ * M1a — team-bounded enumeration, and the page-boundary part of KR-02 it rests on
+ * (`docs/design/slack-known-root-requeue-spec.md` §4.2, §4.3, §11 KR-02, §12 M1a).
+ *
+ * EVIDENCE, NOT RED: expected to pass on the current source. The falsifier is the fixture: ANOTHER
+ * TEAM's item ids are placed INSIDE the key range every page reads — one below the target team's
+ * first id, and one immediately after each of its first three ids — so that the only thing keeping
+ * them out of a page is the team predicate of the bounded id read itself. None of them is above the
+ * upper bound: the kill does not depend on a foreign row falling outside the range, nor on the
+ * upper-bound read.
+ *
+ * The target team has four items: a really published, eligible root; an unrelated item written by
+ * ordinary ingest; and two fixture items with the lowest and highest ids, which fix where the range
+ * starts and ends whatever random ids the two real items were given. The foreign items are bare
+ * fixture rows with chosen ids, in the other team's own project: an id cannot be chosen through the
+ * application's writers. Every expected page is written out, for five page sizes — one item per
+ * page, an exact multiple, a remainder, exactly the population, and more than the population.
+ *
+ * NOT CLAIMED: KR-02's 601-root traversal at several page sizes (the KR-17 fixture traverses 601
+ * roots at page size 100 only), or anything of KR-04 beyond the case-only stored ids above.
+ */
+describe("M1a team-bounded enumeration — another team's item ids inside the key range (real Postgres)", () => {
+  const FIRST_ID = "00000000-0000-4000-8000-000000000010";
+  const LAST_ID = "ffffffff-ffff-4fff-bfff-fffffffffff0";
+  const FOREIGN_BELOW_FIRST = "00000000-0000-4000-8000-000000000001";
+  /** The UUID that sorts immediately after this one. */
+  const nextUuid = (id: string): string => {
+    const hex = (BigInt(`0x${id.replace(/-/g, "")}`) + BigInt(1)).toString(16).padStart(32, "0");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  };
+  /** FIXTURE DML: a bare, non-Slack item row with a CHOSEN id. */
+  const bareItem = async (id: string, teamId: string, projectId: string, path: string): Promise<void> => {
+    const inserted = await (await rawSql()).query(
+      `insert into items (id, team_id, project_id, path, kind, access, frontmatter, body, content_sha256, member_id, member_id_locked)
+       values ($1::uuid, $2::uuid, $3::uuid, $4, 'deliverable', 'team', '{}'::jsonb, '', repeat('a', 64), null, false)`,
+      [id, teamId, projectId, path]
+    );
+    if (inserted.rowCount !== 1) throw new Error(`fixture: expected to insert exactly one item, inserted ${inserted.rowCount}`);
+  };
+  /** The page layouts, WRITTEN OUT: for each page size, which of the four ids each page examines. */
+  const LAYOUTS: [pageSize: number, pages: number[][]][] = [
+    [1, [[0], [1], [2], [3]]],
+    [2, [[0, 1], [2, 3]]],
+    [3, [[0, 1, 2], [3]]],
+    [4, [[0, 1, 2, 3]]],
+    [100, [[0, 1, 2, 3]]],
+  ];
+
+  it("returns exactly the target team item ids, cursors and exhaustion at every page size while another team has item ids inside every page key range", async () => {
+    const f = await publishOldRoot();
+    const teamId = f.seed.teamId;
+    const unrelatedItemId = await seedUnrelatedItem(f.seed);
+    const other = await seedTeam();
+    expect(other.teamId, "fixture: the other team is another team").not.toBe(teamId);
+    const [mine] = await query<{ id: string }>(`insert into projects (team_id, slug) values ($1, 'm1a-bracket') returning id::text as id`, [teamId]);
+    const [theirs] = await query<{ id: string }>(`insert into projects (team_id, slug) values ($1, 'm1a-foreign') returning id::text as id`, [other.teamId]);
+
+    // THE TARGET TEAM: two bracket items around the published root and the ingested item.
+    await bareItem(FIRST_ID, teamId, mine.id, "m1a/first.md");
+    await bareItem(LAST_ID, teamId, mine.id, "m1a/last.md");
+    const publishedId = f.itemId.toLowerCase();
+    const [second, third] = [publishedId, unrelatedItemId.toLowerCase()].sort();
+    const targetIds = [FIRST_ID, second, third, LAST_ID];
+    expect(FIRST_ID < second && second < third && nextUuid(third) < LAST_ID,
+      "fixture: the two real items' random ids lie strictly between the bracket ids (a one-in-four-billion miss: run again)").toBe(true);
+
+    // THE OTHER TEAM: one id below the target's first, and the id immediately after each of the
+    // target's first three. All four are at or below the target's upper bound.
+    const foreignIds = [FOREIGN_BELOW_FIRST, nextUuid(FIRST_ID), nextUuid(second), nextUuid(third)];
+    expect(foreignIds.filter((id) => targetIds.includes(id)), "fixture: no foreign id is a target id").toEqual([]);
+    expect(foreignIds.filter((id) => id > LAST_ID), "fixture: no foreign id is above the range's upper bound").toEqual([]);
+    for (const [index, id] of foreignIds.entries()) await bareItem(id, other.teamId, theirs.id, `m1a/foreign-${index}.md`);
+
+    // READBACK, across both teams and with no team predicate of the product's: the foreign ids
+    // really are interleaved with the target's, in PostgreSQL's own UUID order.
+    const everyItem = (): Promise<{ id: string; team_id: string }[]> => query<{ id: string; team_id: string }>(
+      `select id::text as id, team_id::text as team_id from items where team_id = any($1::uuid[]) order by id`, [[teamId, other.teamId]]
+    );
+    const interleaved = await everyItem();
+    expect(interleaved.map((row) => [row.id, row.team_id === teamId ? "target" : "FOREIGN"]), "fixture: a foreign id inside every page's key range").toEqual([
+      [FOREIGN_BELOW_FIRST, "FOREIGN"], [FIRST_ID, "target"], [nextUuid(FIRST_ID), "FOREIGN"], [second, "target"],
+      [nextUuid(second), "FOREIGN"], [third, "target"], [nextUuid(third), "FOREIGN"], [LAST_ID, "target"],
+    ]);
+
+    // What each target item is: the published root is located by exactly its durable facts; the
+    // other three are unlocated, each with the closed reason.
+    const channel = await channelRow(teamId, WORKSPACE, CHANNEL);
+    expect(channel?.binding_config_revision, "fixture: the channel row stores a configuration revision").toMatch(/^[0-9a-f]{64}$/);
+    const entryOf = (itemId: string) => (itemId === publishedId
+      ? {
+          teamId, itemId, revisitAfterMs: REVISIT_AFTER_MS,
+          locator: {
+            workspaceId: WORKSPACE, channelId: CHANNEL, rootTs: OLD_ROOT, integrationId: f.integrationId,
+            bindingConfigRevision: channel?.binding_config_revision, namespaceRevision: f.namespaceRevision,
+          },
+        }
+      : { teamId, itemId, revisitAfterMs: REVISIT_AFTER_MS, unlocated: "not_slack" });
+
+    for (const [pageSize, layout] of LAYOUTS) {
+      // A complete traversal at this page size: the first page, then every cursor it is handed.
+      const pages: SlackKnownRootItemPage[] = [];
+      for (let cursor: SlackKnownRootItemPage["nextCursor"] | undefined; cursor !== null; ) {
+        if (pages.length > 8) throw new Error(`fixture: the traversal at page size ${pageSize} did not end`);
+        const request = { teamId, pageSize, revisitAfterMs: REVISIT_AFTER_MS, ...(cursor ? { cursor } : {}) };
+        const page = await tx((s) => readSlackKnownRootItemPage(s, request, createSlackKnownRootExecution({ ambientDeadlineAt: null })));
+        pages.push(page);
+        cursor = page.nextCursor;
+      }
+
+      // EVERY page, whole: exactly the target team's ids in order with their entries, the examined
+      // count, whether the range ended, and the exact cursor — which continues after the last
+      // examined id inside the range the first page froze, or is null on the last page.
+      const expected = layout.map((indexes, position) => {
+        const ids = indexes.map((index) => targetIds[index]);
+        const last = position === layout.length - 1;
+        return {
+          entries: ids.map(entryOf),
+          nextCursor: last ? null : { version: 1, teamId, upperItemId: LAST_ID, afterItemId: ids[ids.length - 1], revisitAfterMs: REVISIT_AFTER_MS },
+          exhausted: last,
+          examined: ids.length,
+        };
+      });
+      expect(pages, `M1a: exactly the target team's pages at page size ${pageSize}`).toEqual(expected);
+      // Stated on its own as well: no entry of any page is another team's item.
+      expect(pages.flatMap((page) => page.entries.map((entry) => entry.itemId)).filter((id) => foreignIds.includes(id)),
+        `M1a: no foreign item id at page size ${pageSize}`).toEqual([]);
+    }
+
+    // Enumeration only reads: no pending work for either team, and both teams' items are as they were.
+    expect(await query(`select 1 from slack_sync_threads where team_id = any($1::uuid[])`, [[teamId, other.teamId]]), "no pending work was created for either team").toEqual([]);
+    expect(await everyItem(), "no item of either team was added, removed or re-keyed").toEqual(interleaved);
   });
 });
