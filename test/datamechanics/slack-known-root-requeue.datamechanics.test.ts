@@ -2638,16 +2638,22 @@ describe("M1a team-bounded enumeration — another team's item ids inside the ke
  * no author, no eligibility verdict, no exclusion reason and no identity mapping, and it must not:
  * "no mapping, correction owner, contributor count or member eligibility controls root scheduling".
  *
- * ONE REFERENCE, AND FOUR SHAPES THAT EACH LEAVE IT IN ONE WAY. The reference is a thread an
- * attribution gate could find nothing wrong with: a root by a human whose account is mapped to a
- * member, and a reply by that same mapped human. Each shape KR-05 names differs from it in exactly
- * one respect:
+ * ONE REFERENCE, AND FOUR SHAPES. The reference is a thread an attribution gate could find nothing
+ * wrong with: a root by a human whose account is mapped to a member, and a reply by that same
+ * mapped human. Each shape KR-05 names changes the root, or removes the reply, and every reply it
+ * has is still the mapped human's:
  *
- *   - the root's author is a human whose account is mapped to nobody — the replies stay mapped;
- *   - the root was posted by a bot — the reply stays mapped;
- *   - the root has no reply at all — its author stays mapped;
+ *   - the root's author is a human whose account is mapped to nobody. This shape has two mapped
+ *     human replies where the reference has one, because KR-05 names "replies";
+ *   - the root was posted by a bot, with one mapped human reply. Its root row is ineligible, and
+ *     its author is unmapped as well;
+ *   - the root has no reply at all, and its author is the mapped human;
  *   - the root is a tombstone, what the provider leaves in place of a deleted root whose replies
- *     live on — the reply stays mapped.
+ *     live on, with one mapped human reply. Its root row is ineligible, and its author is unmapped
+ *     as well.
+ *
+ * The shapes are therefore NOT each one step from the reference: the unmapped shape also has a
+ * second reply, and the bot and tombstone roots differ from it in both eligibility and mapping.
  *
  * WHAT THE PRODUCT WROTE. Every thread is published by the real publication, from the provider's
  * own message shape and a workspace directory, so the ledger's author, eligibility verdict and
