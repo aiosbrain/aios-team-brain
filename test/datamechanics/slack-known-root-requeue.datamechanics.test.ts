@@ -1803,9 +1803,10 @@ describe("KR-17 — the §7.5 single-channel capacity fixture: plans and the num
     cardinalities: Row; statistics: string;
   }
   let loading: Omit<Capacity, "cardinalities" | "statistics"> & { frontmatter: string };
+  let readbacks: { items: Row; messages: Row; threadsWithACompleteCohort: number };
   let capacity: Capacity;
 
-  // The fixture is built by the two hooks below, before each of the two cases: the global setup
+  // The fixture is built by the five hooks below, before each of the two cases: the global setup
   // truncates every table before every test, so nothing built earlier survives to be shared.
 
   // FIRST HALF: the one really published root, and the 100,000 non-Slack items.
@@ -1841,10 +1842,14 @@ describe("KR-17 — the §7.5 single-channel capacity fixture: plans and the num
     };
   });
 
-  // SECOND HALF: 600 synthetic canonical roots in the SAME workspace and channel, the ledger of all
-  // 601 roots, exact readbacks, and statistics.
+  // SECOND HALF, as four hooks that run in this order, each with the hook timeout to itself: 600
+  // synthetic canonical roots in the SAME workspace and channel (A), the ledger of all 601 roots (B),
+  // exact readbacks (C), and statistics (D). The statements, their order and their parameters are
+  // those of the single hook this was.
+
+  // A: the 600 synthetic roots.
   beforeEach(async () => {
-    const { teamId, realItemId, realPath, slackProjectId, capacityProjectId, frontmatter } = loading;
+    const { teamId, realPath, slackProjectId, frontmatter } = loading;
     const raw = await rawSql();
     const pathPrefix = realPath.slice(0, realPath.length - `${OLD_ROOT}.md`.length);
     expect(`${pathPrefix}${OLD_ROOT}.md`, "fixture: the scoped path ends in the root timestamp").toBe(realPath);
@@ -1864,7 +1869,12 @@ describe("KR-17 — the §7.5 single-channel capacity fixture: plans and the num
       [teamId, slackProjectId, pathPrefix, frontmatter, KR17.observedAt, KR17.syntheticRoots]
     );
     expect(roots.rowCount, "fixture: the synthetic roots were inserted").toBe(KR17.syntheticRoots);
+  });
 
+  // B: the root witnesses and the 100 replies of every root.
+  beforeEach(async () => {
+    const { teamId, realItemId } = loading;
+    const raw = await rawSql();
     // SYNTHETIC CAPACITY FIXTURE: the ledger. For each synthetic root, its witness (j = 0) and 100
     // replies; for the published root, replies 2 to 100 — its witness and its first reply are the
     // publication's own rows. Every tenth reply is deleted. All in the one workspace and channel.
@@ -1889,7 +1899,11 @@ describe("KR-17 — the §7.5 single-channel capacity fixture: plans and the num
       [teamId, WORKSPACE, CHANNEL, KR17.deletedAt, KR17.observedAt, realItemId, OLD_ROOT, KR17.syntheticRoots, KR17.repliesPerRoot, KR17.deletedReplyEvery]
     );
     expect(ledger.rowCount, "fixture: the ledger rows were inserted").toBe(KR17_LEDGER_ROWS - 2);
+  });
 
+  // C: the cardinality, cohort and canonical readbacks.
+  beforeEach(async () => {
+    const { teamId, slackProjectId, capacityProjectId } = loading;
     // EXACT READBACKS. The literals are the specification's numbers, not arithmetic on the constants.
     expect({ roots: KR17_ROOTS, items: KR17_ITEMS, ledger: KR17_LEDGER_ROWS, pages: KR17_PAGES })
       .toEqual({ roots: 601, items: 100_601, ledger: 60_701, pages: 1_007 });
@@ -1948,14 +1962,21 @@ describe("KR-17 — the §7.5 single-channel capacity fixture: plans and the num
     expect(bound.map((root) => root.ts).sort(), "fixture: the 601 roots are exactly the expected ones")
       .toEqual([...Array.from({ length: KR17.syntheticRoots }, (_unused, index) => kr17RootTs(index + 1)), OLD_ROOT].sort());
     expect(await query(`select 1 from slack_sync_threads where team_id = $1`, [teamId]), "fixture: no pending work").toEqual([]);
+    readbacks = { items, messages, threadsWithACompleteCohort: shape.threads };
+  });
 
+  // D: statistics, and the capacity state the two cases read.
+  beforeEach(async () => {
+    const { teamId, realItemId, realPath, slackProjectId, capacityProjectId } = loading;
+    const { items, messages, threadsWithACompleteCohort } = readbacks;
+    const raw = await rawSql();
     // STATISTICS COLLECTION, the last step before anything is measured. ANALYZE only: no VACUUM, no
     // planner setting, no index.
     const analyzed = "items, slack_messages, slack_sync_threads, slack_sync_channels, slack_channel_migration_gates, slack_integration_bindings, integrations, projects";
     await raw.query(`analyze ${analyzed}`);
     capacity = {
       f: loading.f, teamId, realItemId, realPath, slackProjectId, capacityProjectId,
-      cardinalities: { items, messages, threadsWithACompleteCohort: shape.threads, workspace: "one", channel: "one", reallyPublishedRoots: 1, syntheticRoots: KR17.syntheticRoots },
+      cardinalities: { items, messages, threadsWithACompleteCohort, workspace: "one", channel: "one", reallyPublishedRoots: 1, syntheticRoots: KR17.syntheticRoots },
       statistics: `ANALYZE ${analyzed} — after loading, before the first measured statement`,
     };
   });
