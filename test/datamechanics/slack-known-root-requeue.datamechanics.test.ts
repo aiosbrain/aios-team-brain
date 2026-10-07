@@ -3289,3 +3289,245 @@ describe("KR-06 — a queue row committed between the plain queue read and the e
     expect([clockIsStopped(), excludedMs > 0], "the controlled clock resumed on release").toEqual([false, true]);
   });
 });
+
+/**
+ * KR-07 — the EXACT persisted due instant, and the falsifier of M5
+ * (`docs/design/slack-known-root-requeue-spec.md` §5.5, §11 KR-07, §12 M5).
+ *
+ * EVIDENCE, NOT RED: every case here is expected to pass on the current source. It is PART of
+ * KR-07: the due instant a preparation persists, for four literal observations, and one future
+ * observation that must not be due. The rest of KR-07 is not claimed here — `clock_timestamp()`
+ * against the transaction's start time, the finite bounds, and an unchanged publication refreshing
+ * the observation without semantic-generation churn.
+ *
+ * EVERYTHING EXPECTED IS A LITERAL. Each overdue case sets the root witness's stored observation to
+ * a written-out UTC instant, enumerates under a written-out revisit interval, and requires the
+ * committed queue row's `due_at` to be a written-out UTC instant. The expected instant is not
+ * computed here, by this file or by SQL that mirrors the product's: it was worked out by hand, as
+ * the observation plus the interval, rounded UP to the next whole millisecond. What is compared is
+ * the database's own rendering of the stored `due_at` in UTC with six fractional digits, as text.
+ * No JavaScript `Date` is on that path.
+ *
+ * WHAT EACH OVERDUE CASE IS THERE FOR.
+ *
+ *   aligned       the sum is already on a millisecond: an unconditional "+1 ms" would be wrong.
+ *   one micro     the sum is one microsecond past a millisecond: truncation, and rounding to the
+ *                 nearest millisecond, would both land one millisecond early.
+ *   rollover      the ceiling carries into the next second.
+ *   whole day     the maximum interval, with the micro again: a hard-coded 60 seconds would be wrong.
+ *
+ * The second case's interval is 60,001 ms, so no case but the first and third could pass with a
+ * hard-coded 60,000. NOT CLAIMED: that these cases tell a ceiling taken AFTER the interval is added
+ * from one taken before it. The interval is a whole number of milliseconds, and the two agree.
+ *
+ * THE FIXTURE. Every case starts from the real publication. The only fixture DML is the stored
+ * observation of the ONE root witness row, changed by a statement that must change exactly one row
+ * and read back as text. The reply's row is not touched. Enumeration and preparation each run on a
+ * transaction of their own, each with an execution context created before that transaction, and
+ * preparation is given the team and the enumerated entry and nothing else.
+ *
+ * M5. With the line that turns the database's due instant into the persisted one replaced by the
+ * moment of the invocation (`const dueAt = dueDate(due.due_epoch_ms);` → `const dueAt = new Date();`),
+ * each overdue case still enqueues and still passes every assertion before the one labeled
+ * "M5: persisted due is the literal observation-derived instant" — and fails there, because the
+ * stored instant is then today and not in July 2024. The future control returns `not_due` before
+ * that line is reached, and passes with or without the mutant.
+ *
+ * The named-table snapshot shows that these preparations wrote nothing else to those tables. It is
+ * not the whole of KR-13.
+ */
+describe("KR-07 exact due persistence — observation age and millisecond ceiling (real Postgres)", () => {
+  const M5_LABEL = "M5: persisted due is the literal observation-derived instant";
+
+  /** An instant as the DATABASE renders it: UTC, six fractional digits, as text. The expression is parenthesized as a whole. */
+  const utc = (expression: string): string => `to_char((${expression}) at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00'`;
+  /** The one root witness row of the fixture, as `w`, and no other ledger row. */
+  const ROOT_WITNESS = `w.team_id = $1 and w.workspace_id = $2 and w.channel_id = $3 and w.message_ts = $4 and w.root_ts = $4 and w.is_root and w.item_id = $5::uuid`;
+  const witnessOf = (f: Published): unknown[] => [f.seed.teamId, WORKSPACE, CHANNEL, OLD_ROOT, f.itemId];
+
+  /** FIXTURE DML: the stored observation of the root witness row, and of that row only. */
+  async function setRootObservation(f: Published, observedAt: string, label: string): Promise<void> {
+    const changed = await (await rawSql()).query(
+      `update slack_messages w set observed_at = $6::timestamptz where ${ROOT_WITNESS}`, [...witnessOf(f), observedAt]
+    );
+    expect(changed.rowCount, `${label}: fixture: exactly one ledger row, the root witness, was changed`).toBe(1);
+  }
+  /** The root witness as stored: its observation as text, whether it is live, and how many of the team's ledger rows carry that same instant. */
+  const rootWitness = (f: Published): Promise<Row[]> => query(
+    `select ${utc("w.observed_at")} as observed_at_utc, w.deleted_at is null as live,
+            (select count(*)::int from slack_messages m where m.team_id = w.team_id and m.observed_at = w.observed_at) as rows_with_this_observation
+       from slack_messages w where ${ROOT_WITNESS}`, witnessOf(f)
+  );
+  /** Every queue row of the team: its scope and state, and its due instant as the database renders it. */
+  const queueOf = (teamId: string): Promise<Row[]> => query(
+    `select workspace_id, channel_id, root_ts, status, attempts, ${utc("due_at")} as due_at_utc
+       from slack_sync_threads where team_id = $1 order by root_ts`, [teamId]
+  );
+
+  /** Every row of the team in the named tables, exactly as the database renders it. Not the whole of KR-13. */
+  const SNAPSHOT_TABLES = [
+    "items", "slack_messages", "slack_sync_threads", "slack_thread_snapshots", "slack_sync_channels",
+    "slack_integration_bindings", "slack_channel_migration_gates", "integrations", "projects", "slack_team_state",
+  ];
+  async function snapshot(teamId: string): Promise<Record<string, string>> {
+    const scoped = (await query(
+      `select table_name from information_schema.columns
+        where table_schema = 'public' and column_name = 'team_id' and table_name = any($1::text[])
+        order by table_name`, [SNAPSHOT_TABLES]
+    )).map((row) => row.table_name as string);
+    for (const required of SNAPSHOT_TABLES) expect(scoped, `fixture: ${required} is snapshotted`).toContain(required);
+    const out: Record<string, string> = {};
+    for (const table of scoped) {
+      const [aggregate] = await query(
+        `select coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text), '[]'::jsonb)::text as rows from "${table}" t where t.team_id = $1`, [teamId]
+      );
+      out[table] = aggregate.rows as string;
+    }
+    const [versions] = await query(
+      `select coalesce(jsonb_agg(to_jsonb(v) order by to_jsonb(v)::text), '[]'::jsonb)::text as rows
+         from item_versions v join items i on i.id = v.item_id where i.team_id = $1`, [teamId]
+    );
+    out.item_versions = versions.rows as string;
+    return out;
+  }
+
+  /** The real publication, checked to have acknowledged: no queue row and no staging are left. */
+  async function published(label: string): Promise<Published> {
+    const f = await publishOldRoot();
+    const afterPublication = await stored(f.seed.teamId);
+    expect([afterPublication.allQueue, afterPublication.snapshots], `${label}: fixture: the real publication removed the queue row and the staging`).toEqual([[], 0]);
+    return f;
+  }
+
+  /** The real enumeration under THIS case's revisit policy, on its own transaction: the one located entry of the published root. */
+  async function enumerated(f: Published, revisitAfterMs: number, label: string): Promise<SlackKnownRootEntry> {
+    const teamId = f.seed.teamId;
+    const channel = await channelRow(teamId, WORKSPACE, CHANNEL);
+    expect(channel?.binding_config_revision, `${label}: fixture: the channel row stores a configuration revision`).toMatch(/^[0-9a-f]{64}$/);
+    // The execution context is created BEFORE the transaction it is used in.
+    const execution = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+    const page = await tx((s) => readSlackKnownRootItemPage(s, { teamId, pageSize: 100, revisitAfterMs }, execution));
+    expect(page, `${label}: fixture: enumeration returns exactly this root, located, under this case's revisit policy`).toEqual({
+      entries: [{
+        teamId, itemId: f.itemId, revisitAfterMs,
+        locator: {
+          workspaceId: WORKSPACE, channelId: CHANNEL, rootTs: OLD_ROOT, integrationId: f.integrationId,
+          bindingConfigRevision: channel?.binding_config_revision, namespaceRevision: f.namespaceRevision,
+        },
+      }],
+      nextCursor: null, exhausted: true, examined: 1,
+    });
+    return page.entries[0];
+  }
+
+  /** Preparation on a transaction of its own, from the team and the enumerated entry ALONE. The result is the COMMITTED one. */
+  function prepared(teamId: string, entry: SlackKnownRootEntry): Promise<SlackKnownRootPreparationResult> {
+    // The execution context is created BEFORE the transaction it is used in.
+    const execution = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+    return tx((s) => prepareSlackKnownRootRequeue(s, { teamId, entry }, execution));
+  }
+
+  interface Overdue {
+    /** The root witness's stored observation, WRITTEN OUT. */
+    observedAt: string;
+    /** The revisit interval the traversal is started with, WRITTEN OUT. */
+    revisitAfterMs: number;
+    /** The due instant that must be persisted, WRITTEN OUT: worked out by hand, not computed. */
+    dueAt: string;
+  }
+
+  /** One overdue case: the committed queue row's due instant is the literal one, and nothing else of the named tables moved. */
+  async function persistsExactly(label: string, expected: Overdue): Promise<void> {
+    const f = await published(label);
+    const teamId = f.seed.teamId;
+
+    // FIXTURE DML, and its readback as text: ONE row, the root witness, at the literal instant.
+    await setRootObservation(f, expected.observedAt, label);
+    expect(await rootWitness(f), `${label}: fixture: the root witness stores exactly the literal observation, live, and no other ledger row carries it`).toEqual([
+      { observed_at_utc: expected.observedAt, live: true, rows_with_this_observation: 1 },
+    ]);
+    // FIXTURE EVIDENCE, not the product's due decision: the literal expected instant is already past.
+    expect(await query(`select $1::timestamptz < clock_timestamp() as already_past`, [expected.dueAt]), `${label}: fixture: the literal due instant is already past`).toEqual([
+      { already_past: true },
+    ]);
+
+    const entry = await enumerated(f, expected.revisitAfterMs, label);
+    const before = await snapshot(teamId);
+    const result = await prepared(teamId, entry);
+    const queue = await queueOf(teamId);
+    const after = await snapshot(teamId);
+
+    expect(result, `${label}: the committed outcome`).toEqual({ outcome: "enqueued" });
+    // THE STORED VALUE, as text from the database, against the literal. M5's falsifier.
+    expect(queue.map((row) => row.due_at_utc), M5_LABEL).toEqual([expected.dueAt]);
+
+    // Exactly one row, in the root's exact scope, queued and never attempted; and no staging.
+    expect(queue.map((row) => ({ workspace_id: row.workspace_id, channel_id: row.channel_id, root_ts: row.root_ts, status: row.status, attempts: row.attempts })),
+      `${label}: exactly one queue row, in the root's exact scope, queued and never attempted`).toEqual([
+      { workspace_id: WORKSPACE, channel_id: CHANNEL, root_ts: OLD_ROOT, status: "queued", attempts: 0 },
+    ]);
+    expect((await stored(teamId)).snapshots, `${label}: no staging`).toBe(0);
+    expect(await query(`select team_id::text as team_id, root_ts from slack_sync_threads`), `${label}: the only queue row in the database is this root's`).toEqual([
+      { team_id: teamId, root_ts: OLD_ROOT },
+    ]);
+    // Of the named tables, only the queue differs; and the witness still stores the literal observation.
+    expect(after.slack_sync_threads, `${label}: the snapshot sees the queue row`).not.toBe(before.slack_sync_threads);
+    for (const table of Object.keys(before)) {
+      if (table !== "slack_sync_threads") expect(after[table], `${label}: ${table} is unchanged by the preparation`).toBe(before[table]);
+    }
+    expect(await rootWitness(f), `${label}: the root witness's observation is still exactly the literal`).toEqual([
+      { observed_at_utc: expected.observedAt, live: true, rows_with_this_observation: 1 },
+    ]);
+  }
+
+  it("persists the due instant unchanged when the observation plus the interval already falls on a millisecond (aligned, 60,000 ms)", () =>
+    persistsExactly("aligned", {
+      observedAt: "2024-07-01 12:34:56.123000+00", revisitAfterMs: 60_000, dueAt: "2024-07-01 12:35:56.123000+00",
+    }));
+
+  it("persists the due instant rounded UP to the next millisecond when the sum is one microsecond past one (60,001 ms)", () =>
+    persistsExactly("one microsecond past a millisecond", {
+      observedAt: "2024-07-01 12:34:56.123001+00", revisitAfterMs: 60_001, dueAt: "2024-07-01 12:35:56.125000+00",
+    }));
+
+  it("persists the due instant carried into the next second when the observation ends in .999999 (rollover, 60,000 ms)", () =>
+    persistsExactly("rollover into the next second", {
+      observedAt: "2024-07-01 12:34:56.999999+00", revisitAfterMs: 60_000, dueAt: "2024-07-01 12:35:57.000000+00",
+    }));
+
+  it("persists the due instant a whole day after the observation, rounded UP, under the maximum interval (86,400,000 ms)", () =>
+    persistsExactly("the maximum interval, a whole day", {
+      observedAt: "2024-07-01 12:34:56.123001+00", revisitAfterMs: 86_400_000, dueAt: "2024-07-02 12:34:56.124000+00",
+    }));
+
+  it("is not due, and writes nothing, when the root witness's observation is a day in the future (control, 60,000 ms)", async () => {
+    const label = "future observation (control)";
+    const f = await published(label);
+    const teamId = f.seed.teamId;
+
+    // An exact FUTURE instant, captured from the database's own clock as text, then stored and read back.
+    const [{ future }] = await query<{ future: string }>(`select ${utc("clock_timestamp() + interval '1 day'")} as future`);
+    await setRootObservation(f, future, label);
+    expect(await rootWitness(f), `${label}: fixture: the root witness stores exactly the captured future observation, live, and no other ledger row carries it`).toEqual([
+      { observed_at_utc: future, live: true, rows_with_this_observation: 1 },
+    ]);
+    // FIXTURE EVIDENCE, not the product's due decision: the observation, and so anything derived from it by adding an interval, is in the future.
+    expect(await query(`select $1::timestamptz > clock_timestamp() + interval '23 hours' as in_the_future`, [future]), `${label}: fixture: the stored observation is in the future`).toEqual([
+      { in_the_future: true },
+    ]);
+
+    const entry = await enumerated(f, 60_000, label);
+    const before = await snapshot(teamId);
+    const result = await prepared(teamId, entry);
+    const after = await snapshot(teamId);
+
+    expect(result, `${label}: the committed outcome`).toEqual({ outcome: "not_due" });
+    expect(await queueOf(teamId), `${label}: no queue row`).toEqual([]);
+    expect((await stored(teamId)).snapshots, `${label}: no staging`).toBe(0);
+    expect(await query(`select 1 as pending from slack_sync_threads`), `${label}: no queue row of any team`).toEqual([]);
+    expect(after, `${label}: every named table, the queue included, is unchanged by the preparation`).toEqual(before);
+    expect(await rootWitness(f), `${label}: the root witness's observation is still exactly the captured one`).toEqual([
+      { observed_at_utc: future, live: true, rows_with_this_observation: 1 },
+    ]);
+  });
+});
