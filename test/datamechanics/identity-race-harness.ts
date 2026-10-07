@@ -1415,12 +1415,12 @@ async function finish<T>(
   failure: { error: unknown } | null,
   results: () => Promise<T>,
   bounds: RaceBounds,
-  cleanup: CleanupSeam = {},
+  cleanupSeam: CleanupSeam = {},
 ): Promise<T> {
   // A barrier whose closing was not acknowledged, or whose session was not seen gone, is `false`
   // here for good — and the raced operations are cleaned up all the same.
   const barrierGone = await barrier.vanish(bounds.cleanupMs);
-  const settled = await settleRaced(started, bounds, cleanup);
+  const settled = await settleRaced(started, bounds, cleanupSeam);
   const cleanup: CleanupReport = { ...settled, barrierGone, outcome: barrierGone ? settled.outcome : "unproven" };
   const described = describeCleanup(cleanup, settled.outcome);
   barrier.conclude(
