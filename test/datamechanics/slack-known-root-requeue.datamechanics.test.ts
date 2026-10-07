@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { TransactionExecutionError } from "@/lib/db/pg/tx";
 import type { SqlExecutor, TransactionSession } from "@/lib/db/types";
 import { ingestItem } from "@/lib/ingest";
 import {
@@ -10,7 +11,13 @@ import {
   type SlackKnownRootExecution,
   type SlackKnownRootItemPage,
 } from "@/lib/ingest/slack-known-root-page";
-import { prepareSlackKnownRootRequeue, type SlackKnownRootPreparationResult } from "@/lib/ingest/slack-known-root-requeue";
+import {
+  classifySlackKnownRootPreparationFailure,
+  prepareSlackKnownRootRequeue,
+  tallySlackKnownRootPage,
+  type SlackKnownRootPreparationResult,
+  type SlackKnownRootReceipt,
+} from "@/lib/ingest/slack-known-root-requeue";
 import { prepareNewSlackChannelNamespace } from "@/lib/ingest/slack-namespace-gate";
 import { slackPublicationOption } from "@/lib/ingest/slack-publication";
 import { lockSlackSelection, slackBindingRef } from "@/lib/ingest/slack-source-binding";
@@ -26,7 +33,7 @@ import type { SlackMessage } from "@/lib/ingest/sources/slack";
 import { parseSlackTimestamp } from "@/lib/ingest/sources/slack-message-evidence";
 import { scopedSlackItemPath } from "@/lib/ingest/sources/slack-namespace";
 import { normalizeThread } from "@/lib/ingest/sources/slack-normalize";
-import { transactionCapability } from "@/lib/projects/context/transaction";
+import { runContextTransaction, transactionCapability } from "@/lib/projects/context/transaction";
 import { db, ingest, seedTeam, type Seed } from "./helpers";
 import {
   authTestBody,
@@ -2208,5 +2215,216 @@ describe("KR-17 — the §7.5 single-channel capacity fixture: plans and the num
     expect([...new Set(gaps)], "EVIDENCE GAP: a data statement of preparation that this test could not name was not measured on trust").toEqual([]);
     expect([...ordinary.flatMap((result) => result.violations), ...plans.violations],
       "§7.5 NUMERIC STOP — PREPARATION. Any entry is NOT READY pending schema-owner adjudication, not a test to adjust").toEqual([]);
+  });
+});
+
+/**
+ * KR-10 and M15a in their REAL-WRAPPER form (`docs/design/slack-known-root-requeue-spec.md` §8.2, §8.3,
+ * §11 "Retry and accounting fixtures", §12).
+ *
+ * EVIDENCE, NOT RED. The unit suite already pins the reducer on receipts a test wrote by hand. This
+ * case writes none by hand: every receipt is the FINAL outcome of a complete
+ * `runContextTransaction` promise — the actual wrapper, unmodified, on the real pool — and the two
+ * outcomes the specification names are real two-attempt transactions.
+ *
+ *  - THE RETRYABLE FAILURE is raised by the server. After the real preparation has run inside the
+ *    callback, the callback issues one fixture statement on the same transaction session whose only
+ *    effect is `RAISE EXCEPTION USING ERRCODE = '40001'`. PostgreSQL answers with SQLSTATE 40001,
+ *    the driver rejects, the transaction engine rolls the attempt back, and the wrapper's own retry
+ *    policy decides what happens next. Nothing is slept on, raced or stubbed, and no source seam is
+ *    used: this is the "injected retryable SQLSTATE" the accepted clarification allows.
+ *  - ONE EXECUTION CONTEXT per logical invocation, created before the transaction and handed to both
+ *    attempts, as §7.2 requires: the second attempt gets no fresh allowance.
+ *  - RECEIPTS ARE TERMINAL ONLY. A slot's receipt is built after its promise settles, from the
+ *    resolved value or from the exported classifier's reading of the final rejection, and from the
+ *    number of callbacks the wrapper ran. What each attempt provisionally returned is kept only to
+ *    show that the first attempt's insert was rolled back; it never reaches the reducer.
+ *
+ * FIRST, A CONTINUATION: a traversal in pages of ONE. The slot of its first page fails terminally,
+ * by the same wrapper and the same server-raised 40001, and the cursor that page returned is then
+ * used for the next page, which must be the other item. That is "a failed entry does not prevent
+ * obtaining the next enumeration page", shown with a real cursor. It involves no tally.
+ *
+ * THEN TWO SWEEPS, each one real enumeration page of the same two items, each with complete
+ * receipts: in the first, both attempts for the published root fail, so its slot is one terminal
+ * failure and the root simply waits; in the second — a LATER SWEEP that reads the same page again,
+ * not a next page — the first attempt fails and the second commits.
+ */
+describe("M15a real-wrapper retry accounting — KR-10 through runContextTransaction and a server-raised 40001 (real Postgres)", () => {
+  /** FIXTURE STATEMENT: the server raises a serialization failure. It reads and writes nothing. */
+  const RAISE_SERIALIZATION_FAILURE =
+    `do $$ begin raise exception using errcode = '40001', message = 'aio-1170 fixture: injected serialization failure'; end $$`;
+
+  const NO_UNATTESTED = {
+    not_slack: 0, invalid_metadata: 0, missing_channel_binding: 0, missing_namespace_pin: 0, item_missing: 0,
+    canonical_mismatch: 0, missing_root_witness: 0, contradictory_ledger: 0,
+  };
+  const NO_REFUSED = {
+    namespace_changed_or_unready: 0, source_not_current: 0, binding_changed: 0, channel_not_public: 0,
+    scoped_path_conflict: 0, legacy_path_conflict: 0,
+  };
+  const NO_FAILURE = {
+    lock_timeout: 0, statement_timeout: 0, deadline_exceeded: 0, serialization_failure: 0, deadlock: 0,
+    database_failure: 0, dependency_failure: 0, commit_unknown: 0,
+  };
+  type Tally = ReturnType<typeof tallySlackKnownRootPage>;
+  const sum = (counts: Readonly<Record<string, number>>): number => Object.values(counts).reduce((total, count) => total + count, 0);
+  /** The tally together with the four sums of §8.2's accounting identity, taken from the tally itself. */
+  const accounted = (tally: Tally) => ({
+    tally,
+    sumOfTheSevenOutcomes: tally.enqueued + tally.already_pending + tally.not_due + tally.unattested + tally.refused + tally.preparation_failed + tally.not_attempted,
+    sumOfFailureCounts: sum(tally.failureCounts),
+    sumOfUnattestedCounts: sum(tally.unattestedCounts),
+    sumOfRefusedCounts: sum(tally.refusedCounts),
+  });
+
+  it("counts one serialization_failure for a slot whose two attempts both failed and one enqueued for a slot whose second attempt committed, from the final outcomes of real two-attempt transactions", async () => {
+    const f = await publishOldRoot();
+    const teamId = f.seed.teamId;
+    const unrelatedItemId = await seedUnrelatedItem(f.seed);
+    await ageObservation(teamId);
+    expect((await stored(teamId)).allQueue, "fixture: no pending work").toEqual([]);
+
+    interface Settled {
+      receipt: SlackKnownRootReceipt;
+      /** The attempt numbers the WRAPPER passed to the callback, in order. */
+      attempts: number[];
+      /** What each attempt's preparation returned before its transaction ended. Never a receipt. */
+      provisional: SlackKnownRootPreparationResult[];
+      rejection: unknown;
+    }
+    /**
+     * ONE logical invocation for one page slot, through the actual wrapper. The fixture statement
+     * runs after the preparation on every attempt named in `failingAttempts`.
+     */
+    async function settle(entryIndex: number, entry: SlackKnownRootEntry, failingAttempts: readonly number[]): Promise<Settled> {
+      // Created BEFORE the transaction and shared by every attempt of it.
+      const execution = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+      const attempts: number[] = [];
+      const provisional: SlackKnownRootPreparationResult[] = [];
+      try {
+        const result = await runContextTransaction(db(), async (session, attempt) => {
+          attempts.push(attempt);
+          const outcome = await prepareSlackKnownRootRequeue(session, { teamId, entry }, execution);
+          provisional.push(outcome);
+          if (failingAttempts.includes(attempt)) await session.executeSql(RAISE_SERIALIZATION_FAILURE);
+          return outcome;
+        });
+        // The complete promise RESOLVED: a committed receipt, with the callbacks that actually ran.
+        return { receipt: { entryIndex, state: "committed", attempts: attempts.length as 1 | 2, result }, attempts, provisional, rejection: undefined };
+      } catch (rejection) {
+        // The complete promise finally REJECTED: classified outside it, by the exported classifier.
+        const failure = classifySlackKnownRootPreparationFailure(rejection);
+        return { receipt: { entryIndex, state: "failed", attempts: attempts.length as 0 | 1 | 2, failure }, attempts, provisional, rejection };
+      }
+    }
+    /** One real enumeration page, one settled invocation per slot in order, and the exported tally of its receipts. */
+    async function sweep(rootAttemptsThatFail: readonly number[]) {
+      const page = await enumerate(teamId);
+      const settled: Settled[] = [];
+      for (const [entryIndex, entry] of page.entries.entries()) {
+        settled.push(await settle(entryIndex, entry, entry.itemId === f.itemId ? rootAttemptsThatFail : []));
+      }
+      const rootIndex = page.entries.findIndex((entry) => entry.itemId === f.itemId);
+      const unrelatedIndex = page.entries.findIndex((entry) => entry.itemId === unrelatedItemId);
+      expect([page.examined, page.entries.length, [rootIndex, unrelatedIndex].sort()], "fixture: the page is the published root and the unrelated item").toEqual([2, 2, [0, 1]]);
+      // Every started invocation has settled: the receipts are complete, one per slot.
+      const tally = tallySlackKnownRootPage({ examined: page.examined, receipts: settled.map((slot) => slot.receipt) });
+      return { page, root: settled[rootIndex], unrelated: settled[unrelatedIndex], rootIndex, unrelatedIndex, tally };
+    }
+    const notSlack: SlackKnownRootPreparationResult = { outcome: "unattested", reason: "not_slack" };
+    const enqueuedTwice: SlackKnownRootPreparationResult[] = [{ outcome: "enqueued" }, { outcome: "enqueued" }];
+
+    // ── CONTINUATION: a slot that failed terminally does not prevent obtaining the NEXT PAGE ──
+    // A traversal in pages of one. Whichever of the two items sorts first is the first page's only
+    // slot; it is failed on both attempts, and the cursor that page returned is then continued.
+    const pageOfOne = (cursor?: SlackKnownRootItemPage["nextCursor"]) => tx((s) => readSlackKnownRootItemPage(
+      s, { teamId, pageSize: 1, revisitAfterMs: REVISIT_AFTER_MS, ...(cursor ? { cursor } : {}) }, createSlackKnownRootExecution({ ambientDeadlineAt: null })
+    ));
+    const firstPage = await pageOfOne();
+    const continuation = firstPage.nextCursor;
+    expect([firstPage.examined, firstPage.entries.length, firstPage.exhausted, continuation === null],
+      "continuation: the first page of one examines one item and is not the end of the range").toEqual([1, 1, false, false]);
+    if (continuation === null) throw new Error("fixture: a page of one of two items has no continuation");
+    const [firstSlot] = firstPage.entries;
+    expect([f.itemId, unrelatedItemId], "continuation: the first slot is one of the team's two items").toContain(firstSlot.itemId);
+    const otherItemId = firstSlot.itemId === f.itemId ? unrelatedItemId : f.itemId;
+    // The page committed and returned its cursor BEFORE this preparation was started and failed.
+    const failedFirstSlot = await settle(0, firstSlot, [1, 2]);
+    expect([failedFirstSlot.attempts, failedFirstSlot.receipt], "continuation: the first slot failed terminally, on both attempts, with the server's 40001").toEqual([
+      [1, 2], { entryIndex: 0, state: "failed", attempts: 2, failure: "serialization_failure" },
+    ]);
+    expect((await stored(teamId)).allQueue, "continuation: the failed slot left nothing durable").toEqual([]);
+    // THE NEXT PAGE, from the cursor the first page returned: the other item, and the end of the range.
+    expect(continuation.afterItemId, "continuation: the cursor continues after the slot that failed").toBe(firstSlot.itemId);
+    const nextPage = await pageOfOne(continuation);
+    expect([nextPage.examined, nextPage.entries.map((entry) => entry.itemId), nextPage.exhausted, nextPage.nextCursor],
+      "continuation: the failed slot did not prevent obtaining the next page, which is the other item").toEqual([1, [otherItemId], true, null]);
+
+    // ── FIRST SWEEP: both attempts for the published root fail with the server's 40001 ──
+    const first = await sweep([1, 2]);
+    expect(first.root.attempts, "terminal failure: the wrapper ran the callback as attempt 1 and attempt 2, and no third time").toEqual([1, 2]);
+    // Each attempt's preparation really reached the enqueue. Had attempt 1's insert survived its
+    // rollback, attempt 2 would have found the row and answered `already_pending`.
+    expect(first.root.provisional, "terminal failure: each attempt inserted, and each insert was rolled back").toEqual(enqueuedTwice);
+    expect(first.root.rejection, "terminal failure: the final rejection is the transaction engine's own error").toBeInstanceOf(TransactionExecutionError);
+    expect([(first.root.rejection as TransactionExecutionError).code, (first.root.rejection as TransactionExecutionError).unknownCommit],
+      "terminal failure: it carries the server's SQLSTATE and is not an unknown commit").toEqual(["40001", false]);
+    expect(first.root.receipt, "terminal failure: ONE failed receipt for the slot, with both attempts counted on it").toEqual({
+      entryIndex: first.rootIndex, state: "failed", attempts: 2, failure: "serialization_failure",
+    });
+    expect([first.unrelated.attempts, first.unrelated.receipt], "the other slot committed on its only attempt").toEqual([
+      [1], { entryIndex: first.unrelatedIndex, state: "committed", attempts: 1, result: notSlack },
+    ]);
+    // TRANSACTION EFFECT, read back: both attempts rolled back, so nothing durable was written.
+    const afterFirst = await stored(teamId);
+    expect(afterFirst.allQueue, "terminal failure: no pending row survived either attempt").toEqual([]);
+
+    // ── SECOND SWEEP: a LATER sweep, reading the same page again; attempt 1 fails with the same 40001, attempt 2 commits ──
+    const second = await sweep([1]);
+    expect(second.page, "a later sweep reads the same page again: the entry that failed is simply offered once more").toEqual(first.page);
+    expect(second.root.attempts, "retry: the wrapper ran the callback as attempt 1 and attempt 2").toEqual([1, 2]);
+    expect(second.root.provisional, "retry: attempt 1 inserted and was rolled back, so attempt 2 inserted again").toEqual(enqueuedTwice);
+    expect(second.root.rejection, "retry: the complete promise resolved").toBeUndefined();
+    expect(second.root.receipt, "retry: ONE committed receipt for the slot, with both attempts counted on it").toEqual({
+      entryIndex: second.rootIndex, state: "committed", attempts: 2, result: { outcome: "enqueued" },
+    });
+    expect(second.unrelated.receipt).toEqual({ entryIndex: second.unrelatedIndex, state: "committed", attempts: 1, result: notSlack });
+    // TRANSACTION EFFECT, read back: exactly one durable row, from the attempt that committed.
+    const afterSecond = await stored(teamId);
+    expect(afterSecond.allQueue, "retry: exactly one pending row, the root's, queued and due").toEqual([
+      { workspace_id: WORKSPACE, channel_id: CHANNEL, root_ts: OLD_ROOT, status: "queued", attempts: 0, due: true },
+    ]);
+    expect(afterSecond.ledger, "neither sweep touched the ledger").toEqual(afterFirst.ledger);
+
+    // ── THE ACCOUNTING, of both pages at once, as literals ──
+    // One contribution per slot however many attempts its transaction took: the two-attempt failure
+    // is ONE preparation_failed and ONE serialization_failure; the two-attempt commit is ONE enqueued.
+    // Each page's seven outcomes sum to its examined count, and each category sums to its parent.
+    expect({ terminalTwoAttemptFailure: accounted(first.tally), retryThatCommitted: accounted(second.tally) },
+      "M15a: one contribution per page slot, from real two-attempt transactions").toEqual({
+      terminalTwoAttemptFailure: {
+        tally: {
+          examined: 2, enqueued: 0, already_pending: 0, not_due: 0, unattested: 1, refused: 0, preparation_failed: 1, not_attempted: 0,
+          unattestedCounts: { ...NO_UNATTESTED, not_slack: 1 }, refusedCounts: NO_REFUSED, failureCounts: { ...NO_FAILURE, serialization_failure: 1 },
+        },
+        sumOfTheSevenOutcomes: 2, sumOfFailureCounts: 1, sumOfUnattestedCounts: 1, sumOfRefusedCounts: 0,
+      },
+      retryThatCommitted: {
+        tally: {
+          examined: 2, enqueued: 1, already_pending: 0, not_due: 0, unattested: 1, refused: 0, preparation_failed: 0, not_attempted: 0,
+          unattestedCounts: { ...NO_UNATTESTED, not_slack: 1 }, refusedCounts: NO_REFUSED, failureCounts: NO_FAILURE,
+        },
+        sumOfTheSevenOutcomes: 2, sumOfFailureCounts: 0, sumOfUnattestedCounts: 1, sumOfRefusedCounts: 0,
+      },
+    });
+    // The identity itself, as a relation on the reducer's own output rather than on the literals.
+    for (const [label, tally] of [["terminal two-attempt failure", first.tally], ["retry that committed", second.tally]] as const) {
+      const sums = accounted(tally);
+      expect(sums.sumOfTheSevenOutcomes, `${label}: examined is the sum of the seven outcomes`).toBe(tally.examined);
+      expect(sums.sumOfFailureCounts, `${label}: failure categories sum to preparation_failed`).toBe(tally.preparation_failed);
+      expect(sums.sumOfUnattestedCounts, `${label}: unattested reasons sum to unattested`).toBe(tally.unattested);
+      expect(sums.sumOfRefusedCounts, `${label}: refused reasons sum to refused`).toBe(tally.refused);
+    }
   });
 });

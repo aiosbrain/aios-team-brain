@@ -1167,6 +1167,51 @@ describe("known-root page tally — one contribution per page slot", () => {
     expectClosed(tally);
   });
 
+  // M15c, INTEGRATED (§8.3, third example; §12). The case above hands the reducer a category the test
+  // wrote. This one writes none: the category in the receipt is whatever the EXPORTED classifier makes
+  // of the final rejection, and the first thing asserted is the page tally. So a classifier that lets
+  // the SQLSTATE outrank the unknown commit fails HERE, at the count, as one `serialization_failure`
+  // where exactly one `commit_unknown` is required — not at a separate assertion about the classifier.
+  it("tallies a commit whose outcome is unknown as exactly one commit_unknown failure and no success, classified from the final rejection alone", () => {
+    // What the transaction wrapper finally rejects with when the COMMIT acknowledgement is lost: the
+    // outer error marked `unknownCommit`, carrying the retryable SQLSTATE the lost connection
+    // surfaced — while the callback had already returned `enqueued`. That provisional result rides
+    // along on the rejection and on its cause, where nothing may read it.
+    const provisional: SlackKnownRootPreparationResult = { outcome: "enqueued" };
+    const cause = Object.assign(new Error(CANARY.sql), { code: "40001", provisional });
+    const rejection = Object.assign(
+      new TransactionExecutionError(`COMMIT failed running ${CANARY.sql}`, { sql: CANARY.sql, unknownCommit: true, code: "40001", cause }),
+      { result: provisional }
+    );
+    // ONE terminal receipt for the slot, built from that final rejection and nothing else. One
+    // callback ran, and an unknown commit is not retried.
+    const receipt: SlackKnownRootReceipt = {
+      entryIndex: 0, state: "failed", attempts: 1, failure: classifySlackKnownRootPreparationFailure(rejection),
+    };
+    const tally = tallySlackKnownRootPage({ examined: 1, receipts: [receipt] });
+
+    // The whole tally, as literals: exactly one failure, of exactly this category, and no success.
+    expect(tally, "an unknown commit is one commit_unknown failure of its slot, never the insertion its callback reported").toEqual({
+      examined: 1, enqueued: 0, already_pending: 0, not_due: 0, unattested: 0, refused: 0, preparation_failed: 1, not_attempted: 0,
+      unattestedCounts: {
+        not_slack: 0, invalid_metadata: 0, missing_channel_binding: 0, missing_namespace_pin: 0, item_missing: 0,
+        canonical_mismatch: 0, missing_root_witness: 0, contradictory_ledger: 0,
+      },
+      refusedCounts: {
+        namespace_changed_or_unready: 0, source_not_current: 0, binding_changed: 0, channel_not_public: 0,
+        scoped_path_conflict: 0, legacy_path_conflict: 0,
+      },
+      failureCounts: {
+        lock_timeout: 0, statement_timeout: 0, deadline_exceeded: 0, serialization_failure: 0, deadlock: 0,
+        database_failure: 0, dependency_failure: 0, commit_unknown: 1,
+      },
+    });
+    expectClosed(tally);
+    // Nothing the rejection carried travels into the receipt or the tally.
+    expectNoCanary(receipt, "the terminal receipt");
+    expectNoCanary(tally, "tally output");
+  });
+
   it("collapses an exact duplicate of a slot's final receipt", () => {
     const once = tallySlackKnownRootPage({ examined: 2, receipts: [committed(0, { outcome: "enqueued" }, 2), failed(1, "deadlock")] });
     const twice = tallySlackKnownRootPage({
