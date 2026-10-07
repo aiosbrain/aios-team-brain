@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { TransactionExecutionError } from "@/lib/db/pg/tx";
 import type { SqlExecutor, TransactionSession } from "@/lib/db/types";
@@ -2992,7 +2992,10 @@ describe("KR-05 — a witnessed root stays schedulable whatever its attribution 
  *
  * While A is held, the test reads from a third connection what the specification says must be true:
  * A's read returned no row; A has no statement in flight and is idle in its transaction, waiting on
- * no lock; A holds the four authority locks; and A has neither requested nor taken the item lock.
+ * no lock; the four authority rows are locked; and the item row is not, the item lock not having
+ * been requested. The lock probes show that a row is locked, not who holds it: that the holder is A
+ * follows from the same probes finding every row free before A starts and after it commits, and
+ * from C touching only the queue.
  *
  * THE CONTROLLED CLOCK (§7.2). A's execution context is given a test clock: the real monotonic clock
  * minus the time the barrier held A. It stops when the barrier is reached and resumes, from the same
@@ -3079,6 +3082,7 @@ describe("KR-06 — a queue row committed between the plain queue read and the e
     /**
      * Which of the rows preparation locks are free RIGHT NOW, asked from a third connection that
      * waits for nothing: a locked row is skipped, and a free one is locked and released at once.
+     * It reports THAT a row is locked, never by which connection.
      */
     const free = async (text: string, params: unknown[]): Promise<"free" | "LOCKED"> =>
       (await query(`${text} for update skip locked`, params)).length === 1 ? "free" : "LOCKED";
@@ -3098,6 +3102,20 @@ describe("KR-06 — a queue row committed between the plain queue read and the e
     const reached = new Promise<AtBarrier>((resolve) => { signalReached = resolve; });
     let releaseA!: () => void;
     const released = new Promise<void>((resolve) => { releaseA = resolve; });
+    /** Release A's barrier, once. Every later call does nothing. */
+    let barrierReleased = false;
+    const releaseBarrier = (): void => {
+      if (barrierReleased) return;
+      barrierReleased = true;
+      releaseA();
+    };
+    // LAST RESORT: if this case times out or hangs before its own `finally` runs, A is still released
+    // when the case finishes, so its transaction ends and its locks go. On every ordinary path the
+    // `finally` below has already released A and this does nothing. It only releases: it asserts
+    // nothing, awaits nothing and throws nothing, so it cannot replace the error the case ended with.
+    onTestFinished(() => {
+      releaseBarrier();
+    });
 
     // ── THE CONTROLLED CLOCK of §7.2: the real monotonic clock, less the time the barrier holds A. ──
     let excludedMs = 0;
@@ -3181,7 +3199,10 @@ describe("KR-06 — a queue row committed between the plain queue read and the e
       ), "barrier: A has no statement in flight and no lock wait is running").toEqual([
         { state: "idle in transaction", waiting_for_a_lock: false, ungranted_locks: 0 },
       ]);
-      // A holds the four authority locks, and has NOT taken the item lock.
+      // The four authority rows are LOCKED and the item row is free. The probe shows that a row is
+      // locked, not by whom. That it is A follows from the controls: the same probe found all five
+      // rows free before A started and finds them free again after A commits, and the only other
+      // writer, C, touches the queue table and none of these rows.
       expect(await locks(), "barrier: A holds its authority locks and not the item lock").toEqual({
         namespaceGate: "LOCKED", integration: "LOCKED", binding: "LOCKED", channel: "LOCKED", item: "free",
       });
@@ -3232,7 +3253,7 @@ describe("KR-06 — a queue row committed between the plain queue read and the e
         "barrier: A is held, its controlled clock is stopped, and it has issued nothing since").toEqual([true, true, true, false]);
     } finally {
       // RELEASE A — also when something above failed, so that A never outlives the case.
-      releaseA();
+      releaseBarrier();
       await settled;
     }
     const ended = await settled;
@@ -3257,7 +3278,7 @@ describe("KR-06 — a queue row committed between the plain queue read and the e
 
     // ── NOTHING ELSE MOVED, AND THERE IS NO SECOND ROW. A's whole transaction changed no row of the
     //    team in any snapshotted table, the queue included. ──
-    expect(await snapshot(teamId), "A's committed transaction changed nothing: every table reads as it did after C committed").toEqual(afterC);
+    expect(await snapshot(teamId), "A's committed transaction changed nothing: every snapshotted table reads as it did after C committed").toEqual(afterC);
     expect(await query(`select team_id::text as team_id, root_ts from slack_sync_threads`), "the only queue row in the database is the one C committed").toEqual([
       { team_id: teamId, root_ts: OLD_ROOT },
     ]);
