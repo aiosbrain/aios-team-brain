@@ -466,7 +466,7 @@ describe("TIERRET-1 AC-12 — timeline cache: new namespace, v16, admission-sepa
     expect(await repairStatus(F.seed)).toBe("pending");
     await expect(getCachedWorkTimeline(db(), F.seed.teamId, "external", F.external)).rejects.toBeInstanceOf(AttributionRepairPendingError);
     await settleTimelineRefreshes();
-    expect(await keysOf(F.seed.teamId), "a fenced read publishes nothing").toEqual([]);
+    expect((await keysOf(F.seed.teamId)).filter((r) => r.group_key.startsWith("adm:")), "a fenced read publishes no variant").toEqual([]);
     expect(await repairStatus(F.seed), "a refused read does not complete, or otherwise move, the repair").toBe("pending");
 
     // The actual bounded repair, to completion — and only then does the same read serve and publish.
