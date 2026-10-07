@@ -8,6 +8,7 @@ import { describeManualRepair, reportRepairHandover } from "@/lib/ingest/attribu
 import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { linkGithub } from "@/lib/codebases/github";
 import { setMemberIdentity, removeMemberIdentity } from "@/lib/identity/member-identities";
+import { withIdentityMutationBoundary } from "@/lib/identity/authority";
 import { addAuthorAlias, removeAuthorAlias } from "@/lib/admin/aliases";
 import { adminSetPassword } from "@/lib/auth/pg-login";
 import { isPasswordStrongEnough, randomPassword, MIN_PASSWORD_LENGTH } from "@/lib/auth/password";
@@ -91,6 +92,9 @@ interface IdentityRemapOffer {
   linkedTo: string;
 }
 
+/** What the fenced decision came to: the write committed, or a refusal / offer that wrote nothing. */
+type IdentityLinkDecision = { ok: true } | { ok: false; error: string; remap?: IdentityRemapOffer };
+
 const STALE_IDENTITY = "identity mapping changed concurrently; refresh and retry";
 
 const isRevision = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
@@ -112,6 +116,11 @@ function isLinkObservation(value: unknown): value is IdentityLinkObservation {
  * the same reading the writer makes). `linked` is true when a member holds it or its mapping state
  * says so. Either read failing fails the action: an observation that could not be made is not an
  * observation of "absent".
+ *
+ * CALLED ONLY INSIDE `withIdentityMutationBoundary`. The holder and the revision live in two
+ * tables; read without the team's identity authority, a remap committing between the two reads
+ * pairs one member with another's revision. Under the authority no identity writer can commit, so
+ * the two reads — made on the boundary's own transaction — are one observation.
  */
 async function observeIdentity(
   db: ReturnType<typeof adminClient>,
@@ -119,13 +128,11 @@ async function observeIdentity(
   provider: string,
   externalId: string,
 ): Promise<{ memberId: string | null; revision: number; linked: boolean }> {
-  const [link, state] = await Promise.all([
-    db.from("member_identities").select("member_id")
-      .eq("team_id", teamId).eq("provider", provider).eq("external_id", externalId).maybeSingle(),
-    db.from("member_identity_mapping_state").select("revision,state")
-      .eq("team_id", teamId).eq("provider", provider).eq("external_id", externalId).maybeSingle(),
-  ]);
+  const link = await db.from("member_identities").select("member_id")
+    .eq("team_id", teamId).eq("provider", provider).eq("external_id", externalId).maybeSingle();
   if (link.error) throw new Error(`${provider} identity link read failed: ${link.error.message}`);
+  const state = await db.from("member_identity_mapping_state").select("revision,state")
+    .eq("team_id", teamId).eq("provider", provider).eq("external_id", externalId).maybeSingle();
   if (state.error) throw new Error(`${provider} identity authority read failed: ${state.error.message}`);
   const stored = state.data as { revision: string | number; state: string } | null;
   const revision = Number(stored?.revision ?? 0);
@@ -146,13 +153,24 @@ async function observeIdentity(
  * given a revision observed for that id:
  *   - the requested id IS the displayed one → the displayed revision;
  *   - a different id (a change, or a blank row) → that id's own state, read here: never linked
- *     (0 — two first claims both see 0 and the writer lets one win), an unlinked tombstone (its
- *     revision, so a deliberate re-link is possible), or already this member's;
+ *     (0), an unlinked tombstone (its revision, so a deliberate re-link is possible), or already
+ *     this member's;
  *   - a different id that ANOTHER member holds → nothing is written. The holder and the revision
  *     are returned as a remap offer; the admin's confirmation sends that revision back, and only
  *     then is the mapping forced. A remap is never the side effect of a link.
  * The displayed identity, when the request is for a different id, must itself still be what the
  * admin saw — still this member's, at the displayed revision — or the action refuses as stale.
+ *
+ * ONE BOUNDARY. The whole fenced decision — validating the displayed identity, observing the
+ * requested one, refusing / offering / writing — runs inside the team's identity mutation boundary,
+ * the same one the writer takes (it joins this transaction; no row is locked before the team
+ * authority). So the holder and revision of the requested id are one observation, and the displayed
+ * identity cannot be unlinked or remapped between its validation and the requested id's write. An
+ * offer returns and RELEASES the boundary: nothing is held while the admin decides, and the
+ * confirmation enters a fresh boundary, validates the displayed identity again and hands the writer
+ * the revision the admin was shown — never one re-read for them. Two fenced calls for one team are
+ * therefore serial: the second observes what the first committed. An error leaves the boundary
+ * uncaught, so nothing partial commits; revalidation and repair acceleration follow the commit.
  *
  * GOOGLE ADD PROTECTION. A blank "Add Google account" row that names an id already linked — to
  * anyone — is refused outright: no remap is offered and none can be confirmed from it. Remapping a
@@ -180,62 +198,68 @@ export async function linkMemberIdentity(
   if (observed !== undefined && !isLinkObservation(observed)) return { ok: false, error: STALE_IDENTITY };
   try {
     const identityDb = adminClient();
-    let force = true;
-    let expectedRevision: number | undefined;
-    if (observed) {
-      force = false;
-      const shown = observed.original
-        ? { externalId: observed.original.externalId.trim(), revision: observed.original.revision }
-        : null;
-      if (shown && shown.externalId === ext) {
-        // The requested id is the one on screen: its displayed revision is the observation.
-        if (observed.remap) return { ok: false, error: STALE_IDENTITY };
-        expectedRevision = shown.revision;
-      } else {
-        if (shown) {
-          const original = await observeIdentity(identityDb, ctx.teamId, p, shown.externalId);
-          if (original.memberId !== memberId || original.revision !== shown.revision) {
-            return { ok: false, error: STALE_IDENTITY };
-          }
-        }
-        const target = await observeIdentity(identityDb, ctx.teamId, p, ext);
-        // A blank "Add Google account" row starts from nothing observed. It may claim a new id or
-        // re-link a tombstone, but it never turns into a remap — offered or confirmed.
-        if (p === "gdrive" && !shown && target.linked) {
-          return { ok: false, error: "this Google identity is already linked; refresh and use Change" };
-        }
-        if (target.memberId && target.memberId !== memberId) {
-          if (!observed.remap) {
-            const { data: holder, error } = await identityDb.from("members").select("display_name")
-              .eq("team_id", ctx.teamId).eq("id", target.memberId).maybeSingle();
-            if (error) throw new Error(`${p} identity holder read failed: ${error.message}`);
-            const linkedTo = (holder as { display_name: string | null } | null)?.display_name || "another member";
-            return {
-              ok: false,
-              error: `this ${p} identity is linked to ${linkedTo}; confirm to remap it`,
-              remap: { externalId: ext, revision: target.revision, linkedTo },
-            };
-          }
-          // The revision the admin was SHOWN, not the one just read: if the id moved again after
-          // the offer, the writer's compare-and-set refuses it.
-          expectedRevision = observed.remap.revision;
-          force = true;
+    const identity = { provider: p, externalId: ext, handle: (handle ?? "").trim() };
+    const actor = { kind: "member" as const, memberId: ctx.memberId };
+    let decision: IdentityLinkDecision;
+    if (!observed) {
+      await setMemberIdentity(identityDb, ctx.teamId, memberId, identity, { force: true, actor });
+      decision = { ok: true };
+    } else {
+      const { original: displayed, remap: confirmed } = observed;
+      // Nothing in here is caught: a failed read or a refused write must leave the boundary as an
+      // error, so its transaction rolls back rather than committing whatever came before it.
+      decision = await withIdentityMutationBoundary(ctx.teamId, async (): Promise<IdentityLinkDecision> => {
+        let force = false;
+        let expectedRevision: number;
+        const shown = displayed ? { externalId: displayed.externalId.trim(), revision: displayed.revision } : null;
+        if (shown && shown.externalId === ext) {
+          // The requested id is the one on screen: its displayed revision is the observation.
+          if (confirmed) return { ok: false, error: STALE_IDENTITY };
+          expectedRevision = shown.revision;
         } else {
-          // Confirming a remap of an id nobody else holds any more is acting on a stale offer.
-          if (observed.remap) return { ok: false, error: STALE_IDENTITY };
-          expectedRevision = target.revision;
+          if (shown) {
+            const original = await observeIdentity(identityDb, ctx.teamId, p, shown.externalId);
+            if (original.memberId !== memberId || original.revision !== shown.revision) {
+              return { ok: false, error: STALE_IDENTITY };
+            }
+          }
+          const target = await observeIdentity(identityDb, ctx.teamId, p, ext);
+          // A blank "Add Google account" row starts from nothing observed. It may claim a new id or
+          // re-link a tombstone, but it never turns into a remap — offered or confirmed.
+          if (p === "gdrive" && !shown && target.linked) {
+            return { ok: false, error: "this Google identity is already linked; refresh and use Change" };
+          }
+          if (target.memberId && target.memberId !== memberId) {
+            if (!confirmed) {
+              const { data: holder, error } = await identityDb.from("members").select("display_name")
+                .eq("team_id", ctx.teamId).eq("id", target.memberId).maybeSingle();
+              if (error) throw new Error(`${p} identity holder read failed: ${error.message}`);
+              const linkedTo = (holder as { display_name: string | null } | null)?.display_name || "another member";
+              return {
+                ok: false,
+                error: `this ${p} identity is linked to ${linkedTo}; confirm to remap it`,
+                remap: { externalId: ext, revision: target.revision, linkedTo },
+              };
+            }
+            // The revision the admin was SHOWN, never the one just read: an id that moved after
+            // the offer is refused by the writer's compare-and-set, not quietly re-observed.
+            expectedRevision = confirmed.revision;
+            force = true;
+          } else {
+            // Confirming a remap of an id nobody else holds any more is acting on a stale offer.
+            if (confirmed) return { ok: false, error: STALE_IDENTITY };
+            expectedRevision = target.revision;
+          }
         }
-      }
+        // The writer enters the same boundary and joins this transaction: the displayed identity
+        // validated above is still what it was when the requested id is written.
+        const res = await setMemberIdentity(identityDb, ctx.teamId, memberId, identity, { force, expectedRevision, actor });
+        // Unforced, the writer reports — and does not write — an id another member holds.
+        return res.conflict ? { ok: false, error: STALE_IDENTITY } : { ok: true };
+      });
     }
-    const res = await setMemberIdentity(
-      identityDb,
-      ctx.teamId,
-      memberId,
-      { provider: p, externalId: ext, handle: (handle ?? "").trim() },
-      { force, expectedRevision, actor: { kind: "member", memberId: ctx.memberId } }
-    );
-    // Unforced, the writer reports — and does not write — an id another member holds.
-    if (res.conflict) return { ok: false, error: STALE_IDENTITY };
+    // Only a committed mapping is revalidated or repaired; a refusal or an offer wrote nothing.
+    if (!decision.ok) return decision;
     revalidatePath(`/t/${teamSlug}/admin/members`);
     scheduleIdentityEffects(adminClient(), ctx.teamId, teamSlug, p);
     return { ok: true };
