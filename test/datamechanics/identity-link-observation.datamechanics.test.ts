@@ -40,11 +40,18 @@ import {
  *      the revision of the requested id are ONE observation — no remap commits between the two
  *      reads — and the displayed identity cannot be unlinked or remapped between its validation and
  *      the requested id's write. An offer releases the boundary; a confirmation enters a fresh one
- *      and is held to the revision the admin was shown.
+ *      and is held to the revision the admin was shown;
+ *   6. an UNLINK is bound to the displayed HOLDER as well as the displayed revision. The listing a
+ *      row is built from reads holder and revision as one observation, inside the same boundary;
+ *      the unlink action requires both, observes the id there, and removes it only if it is still
+ *      that member's link at that revision. The revision alone — which may be another member's by
+ *      now — never unlinks, and a call without a readable observation is refused.
  *
- * The races in (5) are driven deterministically: one side is parked on a PostgreSQL lock held by a
- * connection of the test's own, and the other is shown — from `pg_locks`, not from a clock — to be
- * waiting on the team authority the parked side holds, before the lock is released.
+ * The races in (5) and (6) are driven deterministically (`./identity-race-harness`): one side is
+ * parked on a PostgreSQL lock held by a connection of the harness's own, and the other is shown —
+ * from `pg_locks`, for backends REGISTERED as the raced operations' own, not from a clock — to be
+ * waiting on the team authority the parked side holds, before the lock is released. Cleanup of
+ * every raced session is proven before a test ends; if it cannot be, the file stops.
  *
  * The action and the writer are the REAL ones. Only the session lookup, the cache revalidation and
  * the post-response deferral — which need a live Next request — are stood in for; the deferred
@@ -752,5 +759,244 @@ describe("AIO-1167 X-02 — what the action does not decide (real Postgres)", ()
     admin.teamId = "";
     expect(await link(seed, alice, "slack", target, BLANK)).toEqual({ ok: false, error: "admins only" });
     expect(await mapping(seed, "slack", target)).toEqual({ holder: null, revision: 0, state: null });
+  });
+});
+
+describe.each(PROVIDERS)("AIO-1167 X-02 — %s: UNLINK is bound to the displayed holder AND the displayed revision (real Postgres)", (provider) => {
+  /** Alice holds one id at revision 1; Bob is who it may be remapped to. */
+  async function aliceHolds() {
+    const seed = await adminSeed();
+    const alice = await member(seed, "Alice");
+    const bob = await member(seed, "Bob");
+    const target = idFor(provider, "held");
+    expect(await link(seed, alice, provider, target, BLANK)).toEqual({ ok: true });
+    return { seed, alice, bob, target };
+  }
+  /** A remap by the REAL shared writer, as any other authorized caller makes it. */
+  const remap = (seed: Seed, to: string, externalId: string, expectedRevision?: number) =>
+    setMemberIdentity(db(), seed.teamId, to, { provider, externalId }, { force: true, expectedRevision });
+  const actionsOn = async (seed: Seed, externalId: string) => (await audits(seed, externalId)).map((row) => row.action);
+
+  it("(1) THE LISTING IS ONE OBSERVATION: parked between its holder read and its revision read, it makes a competing remap wait — the pair it returns is Alice at revision 1, and once the remap has landed that pair can no longer unlink", async () => {
+    const { seed, alice, bob, target } = await aliceHolds();
+
+    // The page's own reader is parked exactly between its two reads: it has read WHO holds each id
+    // and is waiting — inside the team's identity boundary — to read the revisions. The real
+    // writer then remaps the id Alice → Bob and is shown waiting on the authority the reader holds.
+    // (Read outside the boundary, the remap would not wait: it would commit between the reads and
+    // the reader would return Alice paired with Bob's revision 2.)
+    const { first: listing, second: remapped } = await parkThenCompete({
+      seed,
+      barrier: await holdTable("member_identity_mapping_state"),
+      parksOn: "relation",
+      first: () => listMemberIdentities(db(), seed.teamId),
+      second: () => remap(seed, bob, target, 1),
+    });
+
+    const shownOn = (memberId: string) => (listing.get(memberId)?.providers ?? [])
+      .filter((identity) => identity.provider === provider && identity.externalId === target)
+      .map((identity) => identity.revision);
+    expect(shownOn(alice), "Alice's row: the id at Alice's own revision").toEqual([1]);
+    expect(shownOn(bob), "Bob's row does not show it").toEqual([]);
+    expect(remapped).toMatchObject({ memberId: bob, updated: true, mappingRevision: 2 });
+    expect(await mapping(seed, provider, target)).toEqual({ holder: bob, revision: 2, state: "linked" });
+
+    // The row still displays Alice at revision 1. It is Bob's link now: the unlink is refused.
+    const before = await effects(seed, provider, target);
+    expect(await unlink(seed, provider, target, { memberId: alice, revision: 1 })).toEqual({ ok: false, error: STALE });
+    expect(await mapping(seed, provider, target)).toEqual({ holder: bob, revision: 2, state: "linked" });
+    expect(await actionsOn(seed, target)).toEqual(["identity.set", "identity.set"]);
+    expect(await effects(seed, provider, target)).toEqual(before);
+  }, RACE_TEST_TIMEOUT_MS);
+
+  it("(2) DISPLAYED ALICE, CURRENT BOB: an observation naming Alice is refused even when its revision is exactly Bob's current one — the revision alone is not whose link it is", async () => {
+    const { seed, alice, bob, target } = await aliceHolds();
+    await remap(seed, bob, target, 1);
+    expect(await mapping(seed, provider, target)).toEqual({ holder: bob, revision: 2, state: "linked" });
+    const before = await effects(seed, provider, target);
+
+    // THE INCOHERENT PAIR a listing read apart could display: Alice, with Bob's revision 2. The
+    // writer's compare-and-set alone would accept it — and remove Bob's link.
+    expect(await unlink(seed, provider, target, { memberId: alice, revision: 2 })).toEqual({ ok: false, error: STALE });
+    // The pair Alice's row really had, and a member who never held it.
+    expect(await unlink(seed, provider, target, { memberId: alice, revision: 1 })).toEqual({ ok: false, error: STALE });
+    expect(await unlink(seed, provider, target, { memberId: seed.memberId, revision: 2 })).toEqual({ ok: false, error: STALE });
+
+    expect(await mapping(seed, provider, target)).toEqual({ holder: bob, revision: 2, state: "linked" });
+    expect(await actionsOn(seed, target)).toEqual(["identity.set", "identity.set"]);
+    expect(await effects(seed, provider, target)).toEqual(before);
+
+    // CONTROL: the same id, observed as it is — Bob at revision 2 — is unlinked.
+    expect(await unlink(seed, provider, target, { memberId: bob, revision: 2 })).toEqual({ ok: true });
+    expect(await mapping(seed, provider, target)).toEqual({ holder: null, revision: 3, state: "unlinked" });
+  });
+
+  it("(3) the unlink keeps the team authority from validating Alice THROUGH the removal: a competing remap waits for it and is serialized after its commit", async () => {
+    const { seed, alice, bob, target } = await aliceHolds();
+
+    // The barrier holds the id's own key, which only the writer takes: so the action is parked
+    // INSIDE the writer — Alice validated as the holder at revision 1, nothing yet removed. A real
+    // remap to Bob arrives and is shown waiting on the authority the action still holds.
+    // What this pins: the validation and the removal are one critical section. It does not by
+    // itself distinguish the old action, whose writer also held the authority here; schedules (1)
+    // and (2) are the ones the old listing and the old revision-only unlink fail.
+    const { first: unlinked, second: relinked } = await parkThenCompete({
+      seed,
+      barrier: await holdIdentityKey(seed.teamId, provider, target),
+      parksOn: "advisory",
+      first: () => unlink(seed, provider, target, { memberId: alice, revision: 1 }),
+      second: () => remap(seed, bob, target),
+    });
+
+    // The unlink committed first, against the link it validated; the remap then ran against what
+    // it left — a tombstone — and linked the id to Bob at the next revision.
+    expect(unlinked).toEqual({ ok: true });
+    expect(relinked).toMatchObject({ memberId: bob, created: true, mappingRevision: 3 });
+    expect(await mapping(seed, provider, target)).toEqual({ holder: bob, revision: 3, state: "linked" });
+    expect((await audits(seed, target)).map((row) => [row.action, row.actor_kind, row.target_id, row.mapping_revision])).toEqual([
+      ["identity.set", "member", alice, 1],
+      ["identity.removed", "member", alice, 2],
+      ["identity.set", "system", bob, 3],
+    ]);
+  }, RACE_TEST_TIMEOUT_MS);
+
+  it("(4) a remap that COMMITS FIRST while the unlink waits: the unlink then refuses, and nothing it owns happens — no audit row, no repair, no revalidation, no epoch or authority movement beyond the remap's own", async () => {
+    const { seed, alice, bob, target } = await aliceHolds();
+    // CONTROL MEASUREMENT: what one real remap moves, by itself, in this team for this provider.
+    const control = idFor(provider, "control");
+    expect(await link(seed, alice, provider, control, BLANK)).toEqual({ ok: true });
+    const alone = await effects(seed, provider, control);
+    await remap(seed, bob, control, 1);
+    const moved = await effects(seed, provider, control);
+    const remapAlone = { authority: moved.authority - alone.authority, epoch: moved.epoch - alone.epoch };
+    expect(remapAlone.authority).toBe(1);
+
+    // The real remap is parked mid-write — at its own locked read of the mapping state, holding
+    // the team authority. The unlink, displaying Alice at revision 1, is shown waiting on that
+    // authority: in flight, having observed nothing.
+    const before = await effects(seed, provider, target);
+    const { first: remapped, second: refused } = await parkThenCompete({
+      seed,
+      barrier: await holdTable("member_identity_mapping_state"),
+      parksOn: "relation",
+      first: () => remap(seed, bob, target, 1),
+      second: () => unlink(seed, provider, target, { memberId: alice, revision: 1 }),
+    });
+
+    expect(remapped).toMatchObject({ memberId: bob, updated: true, mappingRevision: 2 });
+    expect(refused).toEqual({ ok: false, error: STALE });
+    expect(await mapping(seed, provider, target)).toEqual({ holder: bob, revision: 2, state: "linked" });
+    expect(await actionsOn(seed, target)).toEqual(["identity.set", "identity.set"]);
+    const after = await effects(seed, provider, target);
+    // Exactly the remap's own movement — the refused unlink added none of its own.
+    expect({ authority: after.authority - before.authority, epoch: after.epoch - before.epoch }).toEqual(remapAlone);
+    expect(after.obligations).toEqual(provider === "gdrive" ? [1, 2] : []);
+    expect(after.deferred).toBe(before.deferred);
+    expect(after.revalidated).toBe(before.revalidated);
+  }, RACE_TEST_TIMEOUT_MS);
+
+  it("(5) ABA — Alice → Bob → Alice: the id is Alice's again, at revision 3, and the observation of Alice at revision 1 is refused", async () => {
+    const { seed, alice, bob, target } = await aliceHolds();
+    await remap(seed, bob, target, 1);
+    await remap(seed, alice, target, 2);
+    expect(await mapping(seed, provider, target)).toEqual({ holder: alice, revision: 3, state: "linked" });
+    const before = await effects(seed, provider, target);
+
+    // Same holder as displayed — but not the link that was displayed.
+    expect(await unlink(seed, provider, target, { memberId: alice, revision: 1 })).toEqual({ ok: false, error: STALE });
+    expect(await unlink(seed, provider, target, { memberId: alice, revision: 2 })).toEqual({ ok: false, error: STALE });
+    expect(await mapping(seed, provider, target)).toEqual({ holder: alice, revision: 3, state: "linked" });
+    expect(await actionsOn(seed, target)).toEqual(["identity.set", "identity.set", "identity.set"]);
+    expect(await effects(seed, provider, target)).toEqual(before);
+
+    // CONTROL: the row as it displays now — Alice at revision 3 — unlinks it.
+    expect(await displayed(seed, alice, provider, target)).toEqual({ externalId: target, revision: 3 });
+    expect(await unlink(seed, provider, target, { memberId: alice, revision: 3 })).toEqual({ ok: true });
+    expect(await mapping(seed, provider, target)).toEqual({ holder: null, revision: 4, state: "unlinked" });
+  });
+
+  it("(6) POSITIVE: the displayed holder at the displayed revision is unlinked — by the admin, once, with the writer's repair effects — for the exact normalized provider and id", async () => {
+    const { seed, alice, target } = await aliceHolds();
+    const shown = await displayed(seed, alice, provider, target);
+    expect(shown).toEqual({ externalId: target, revision: 1 });
+    const before = await effects(seed, provider, target);
+
+    // As a client might send them: the provider in another case, both padded.
+    expect(await unlinkMemberIdentity(seed.teamSlug, ` ${provider.toUpperCase()} `, `  ${target}\t`, { memberId: alice, revision: shown.revision }))
+      .toEqual({ ok: true });
+
+    expect(await mapping(seed, provider, target)).toEqual({ holder: null, revision: 2, state: "unlinked" });
+    expect(await audits(seed, target)).toEqual([
+      { action: "identity.set", actor_kind: "member", member_id: seed.memberId, target_id: alice, mapping_revision: 1 },
+      { action: "identity.removed", actor_kind: "member", member_id: seed.memberId, target_id: alice, mapping_revision: 2 },
+    ]);
+    const after = await effects(seed, provider, target);
+    expect(after.authority).toBe(before.authority + 1);
+    expect(after.deferred).toBe(before.deferred + 1);
+    expect(after.revalidated).toBe(before.revalidated + 1);
+    expect(revalidated.paths.at(-1)).toBe(`/t/${seed.teamSlug}/admin/members`);
+    // The Drive-only effects are the writer's: a durable obligation at the new revision, and the epoch.
+    expect(after.obligations).toEqual(provider === "gdrive" ? [1, 2] : []);
+    if (provider === "gdrive") expect(after.epoch).toBeGreaterThan(before.epoch);
+  });
+
+  it("(6) REFUSALS: a missing or malformed observation, a missing identity, another team's identity or holder, and a caller who is not an admin — each refused, none of them writing anything", async () => {
+    const { seed, alice, target } = await aliceHolds();
+    const other = await seedTeam();
+    const zed = await member(other, "Zed");
+    const foreign = idFor(provider, "foreign");
+    // The other team links the SAME id string, and one id of its own.
+    await setMemberIdentity(db(), other.teamId, zed, { provider, externalId: target });
+    await setMemberIdentity(db(), other.teamId, zed, { provider, externalId: foreign });
+    const before = await effects(seed, provider, target);
+    const untouched = async () => {
+      expect(await mapping(seed, provider, target)).toEqual({ holder: alice, revision: 1, state: "linked" });
+      expect(await mapping(other, provider, target)).toEqual({ holder: zed, revision: 1, state: "linked" });
+      expect(await mapping(other, provider, foreign)).toEqual({ holder: zed, revision: 1, state: "linked" });
+      expect(await actionsOn(seed, target)).toEqual(["identity.set"]);
+      expect(await effects(seed, provider, target)).toEqual(before);
+    };
+
+    // MISSING or MALFORMED: no observation, the bare revision an older client sent, and every way
+    // of naming only half of it. Refused — never run on the revision alone, never unfenced.
+    for (const observed of [undefined, null, 1, "1", {}, { memberId: alice }, { revision: 1 },
+      { memberId: "", revision: 1 }, { memberId: "   ", revision: 1 }, { memberId: alice, revision: -1 },
+      { memberId: alice, revision: 1.5 }, { memberId: alice, revision: "1" }, { memberId: 7, revision: 1 }]) {
+      expect(await unlink(seed, provider, target, observed as unknown as UnlinkObservation), JSON.stringify(observed))
+        .toEqual({ ok: false, error: STALE });
+    }
+    await untouched();
+
+    // MISSING IDENTITY: an id never linked here, and an id that exists only in the other team.
+    const never = idFor(provider, "never");
+    for (const revision of [0, 1]) {
+      expect(await unlink(seed, provider, never, { memberId: alice, revision })).toEqual({ ok: false, error: STALE });
+    }
+    expect(await mapping(seed, provider, never)).toEqual({ holder: null, revision: 0, state: null });
+    expect(await unlink(seed, provider, foreign, { memberId: zed, revision: 1 })).toEqual({ ok: false, error: STALE });
+    // CROSS-TEAM HOLDER: this team's id, displayed as held by the other team's member.
+    expect(await unlink(seed, provider, target, { memberId: zed, revision: 1 })).toEqual({ ok: false, error: STALE });
+    // Neither half of the request may be blank.
+    expect(await unlinkMemberIdentity(seed.teamSlug, " ", target, { memberId: alice, revision: 1 }))
+      .toEqual({ ok: false, error: "provider and externalId are required" });
+    expect(await unlinkMemberIdentity(seed.teamSlug, provider, "  ", { memberId: alice, revision: 1 }))
+      .toEqual({ ok: false, error: "provider and externalId are required" });
+    await untouched();
+
+    // NOT AN ADMIN of the team: neither the observation nor the writer is reached.
+    admin.teamId = "";
+    expect(await unlink(seed, provider, target, { memberId: alice, revision: 1 })).toEqual({ ok: false, error: "admins only" });
+    admin.teamId = seed.teamId;
+    await untouched();
+
+    // A TOMBSTONE has no holder: once unlinked, the same id cannot be "unlinked" again at any revision.
+    expect(await unlink(seed, provider, target, { memberId: alice, revision: 1 })).toEqual({ ok: true });
+    for (const revision of [1, 2]) {
+      expect(await unlink(seed, provider, target, { memberId: alice, revision })).toEqual({ ok: false, error: STALE });
+    }
+    expect(await mapping(seed, provider, target)).toEqual({ holder: null, revision: 2, state: "unlinked" });
+    expect(await actionsOn(seed, target)).toEqual(["identity.set", "identity.removed"]);
+    // …and it was this team's link only: the other team's same id is as it was.
+    expect(await mapping(other, provider, target)).toEqual({ holder: zed, revision: 1, state: "linked" });
   });
 });
