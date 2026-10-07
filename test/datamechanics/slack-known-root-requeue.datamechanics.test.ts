@@ -3,6 +3,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 
 import { TransactionExecutionError } from "@/lib/db/pg/tx";
 import type { SqlExecutor, TransactionSession } from "@/lib/db/types";
+import { setMemberIdentity } from "@/lib/identity/member-identities";
 import { ingestItem } from "@/lib/ingest";
 import {
   createSlackKnownRootExecution,
@@ -30,7 +31,7 @@ import {
   type SlackThreadClaim,
 } from "@/lib/ingest/slack-thread-state";
 import type { SlackMessage } from "@/lib/ingest/sources/slack";
-import { parseSlackTimestamp } from "@/lib/ingest/sources/slack-message-evidence";
+import { parseSlackTimestamp, type SlackEvidenceUser } from "@/lib/ingest/sources/slack-message-evidence";
 import { scopedSlackItemPath } from "@/lib/ingest/sources/slack-namespace";
 import { normalizeThread } from "@/lib/ingest/sources/slack-normalize";
 import { runContextTransaction, transactionCapability } from "@/lib/projects/context/transaction";
@@ -114,8 +115,21 @@ interface Published {
   namespaceRevision: number;
 }
 
-/** A canonical old root, published through the real publication into a channel whose history is complete. */
-async function publishOldRoot(): Promise<Published> {
+/** One thread as the provider returns it, and the workspace directory its authors are classified with. */
+interface PublishedThread {
+  root: SlackMessage;
+  replies: readonly SlackMessage[];
+  users: Readonly<Record<string, SlackEvidenceUser>>;
+}
+/** The thread every fixture publishes unless it supplies its own: one human's root and that human's reply. */
+const DEFAULT_THREAD: PublishedThread = { root: ROOT_MESSAGE, replies: [REPLY_MESSAGE], users: USERS };
+
+/**
+ * A canonical old root, published through the real publication into a channel whose history is
+ * complete. The thread is the default one unless the caller supplies another; its root is always
+ * `OLD_ROOT`, and nothing else about the fixture varies with it.
+ */
+async function publishOldRoot(thread: PublishedThread = DEFAULT_THREAD): Promise<Published> {
   const seed = await seedTeam();
   const integrationId = await seedSlackIntegration(seed, { channelIds: [CHANNEL], token: "xoxb-synthetic-known-root" });
   let history: (call: SlackCall) => readonly Record<string, unknown>[] = () => [];
@@ -143,7 +157,7 @@ async function publishOldRoot(): Promise<Published> {
   if (!acquired) throw new Error("fixture: the claim was refused");
   const staged = await tx(async (s) => {
     const written = await writeSlackThreadSnapshot(s, acquired, {
-      messages: [ROOT_MESSAGE, REPLY_MESSAGE], complete: true, expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      messages: [thread.root, ...thread.replies], complete: true, expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
     });
     if (written !== "written") throw new Error("fixture: the snapshot was refused");
     return checkpointSlackThread(s, acquired, { pageCursor: null, snapshotGeneration: 1 });
@@ -151,10 +165,12 @@ async function publishOldRoot(): Promise<Published> {
   if (staged.outcome !== "checkpointed") throw new Error("fixture: the checkpoint was refused");
   const claim: SlackThreadClaim = { ...acquired, snapshotGeneration: 1 };
   const option = slackPublicationOption({
-    claim, binding: slackBindingRef(selection.selection), namespaceRevision: gate.gate.revision, channelName: "general", users: USERS,
+    claim, binding: slackBindingRef(selection.selection), namespaceRevision: gate.gate.revision, channelName: "general", users: thread.users,
   });
-  const normalized = normalizeThread({ root: ROOT_MESSAGE, replies: [REPLY_MESSAGE] }, {
-    channelId: CHANNEL, channelName: "general", users: { U1: "Person One" }, project: "slack",
+  // The display names publication renders with: each directory record's name, or its id.
+  const displayNames = Object.fromEntries(Object.entries(thread.users).map(([id, user]) => [id, user.displayName ?? id]));
+  const normalized = normalizeThread({ root: thread.root, replies: [...thread.replies] }, {
+    channelId: CHANNEL, channelName: "general", users: displayNames, project: "slack",
   });
   const payload = {
     ...normalized,
@@ -2611,5 +2627,333 @@ describe("M1a team-bounded enumeration — another team's item ids inside the ke
     // Enumeration only reads: no pending work for either team, and both teams' items are as they were.
     expect(await query(`select 1 from slack_sync_threads where team_id = any($1::uuid[])`, [[teamId, other.teamId]]), "no pending work was created for either team").toEqual([]);
     expect(await everyItem(), "no item of either team was added, removed or re-keyed").toEqual(interleaved);
+  });
+});
+
+/**
+ * KR-05 — a witnessed root stays schedulable whatever its attribution, and the falsifier of M3
+ * (`docs/design/slack-known-root-requeue-spec.md` §5.3, §10, §11 KR-05, §12 M3).
+ *
+ * EVIDENCE, NOT RED: every case here is expected to pass on the current source. Preparation reads
+ * no author, no eligibility verdict, no exclusion reason and no identity mapping, and it must not:
+ * "no mapping, correction owner, contributor count or member eligibility controls root scheduling".
+ *
+ * ONE REFERENCE, AND FOUR SHAPES THAT EACH LEAVE IT IN ONE WAY. The reference is a thread an
+ * attribution gate could find nothing wrong with: a root by a human whose account is mapped to a
+ * member, and a reply by that same mapped human. Each shape KR-05 names differs from it in exactly
+ * one respect:
+ *
+ *   - the root's author is a human whose account is mapped to nobody — the replies stay mapped;
+ *   - the root was posted by a bot — the reply stays mapped;
+ *   - the root has no reply at all — its author stays mapped;
+ *   - the root is a tombstone, what the provider leaves in place of a deleted root whose replies
+ *     live on — the reply stays mapped.
+ *
+ * WHAT THE PRODUCT WROTE. Every thread is published by the real publication, from the provider's
+ * own message shape and a workspace directory, so the ledger's author, eligibility verdict and
+ * exclusion reason are the publication's verdicts and not fixture columns. The mapping is written by
+ * the product's single identity writer. Each case then reads back, as literals: every ledger row;
+ * the team's identity rows; the stored item; and the one entry enumeration returns, with its exact
+ * locator. The only fixture DML is the clock — the stored observation is aged, as everywhere in
+ * this file — and, in the tombstone case, the root row's `deleted_at`.
+ *
+ * A TOMBSTONE IS NOT A DELETED WITNESS. `exclusion_reason = 'tombstone'` says the root message is not
+ * itself evidence of anybody's work; its row is live and still witnesses the root. `deleted_at` says
+ * reconciliation confirmed the message gone, and such a row witnesses nothing — tombstone or not.
+ * The tombstone case shows both on one root: with its row also deleted it is `missing_root_witness`
+ * and nothing is written; with the row live again, the same entry is enqueued.
+ *
+ * M3. A gate on the root's author — eligible, and mapped — refuses the unmapped, bot and tombstone
+ * roots. A gate on the thread having a creditable, mapped reply refuses the zero-reply root. Either
+ * gate, and both together, leave the reference alone: under any of them the reference still
+ * enqueues, so in a mutation run it is the control that shows a refusal of the others to be the
+ * gate's doing and not a statement that no longer matches anything. A case's two preparations are
+ * both made before either is judged, and the labeled enqueue is judged first, so a gate fails each
+ * case once, at that label. The tombstone case's contrast is `missing_root_witness` with or without
+ * such a gate, and does not fail under one.
+ *
+ * Each case is its own team in a database truncated before it, and ends by counting the queue rows
+ * of EVERY team: one.
+ */
+describe("KR-05 — a witnessed root stays schedulable whatever its attribution (real Postgres)", () => {
+  type Outcome = SlackKnownRootPreparationResult;
+  interface Shape {
+    label: string;
+    thread: PublishedThread;
+    /** Every ledger row the publication must leave, WRITTEN OUT: message, author, eligible, exclusion reason. */
+    ledger: readonly (readonly [messageTs: string, author: string, eligible: boolean, exclusionReason: string | null])[];
+  }
+  interface Ctx { shape: Shape; teamId: string; entry: SlackKnownRootEntry }
+
+  /** The canonical scoped path of the fixture root, WRITTEN OUT, not built by the code under test. */
+  const CANONICAL_PATH = `slack/t0source1/c0known1170/${OLD_ROOT}.md`;
+  const SECOND_REPLY = "1718900000.000102";
+  /** A human the directory classifies, whose account is mapped to NOBODY. */
+  const UNMAPPED_HUMAN = "U1";
+  /** A human the directory classifies, whose account every case maps to the team's member. */
+  const MAPPED_HUMAN = "U2";
+  const BOT_USER = "U0BOT1";
+  /** The provider's own service account, which it attributes a tombstone to. */
+  const SERVICE_ACCOUNT = "USLACKBOT";
+  const DIRECTORY: Readonly<Record<string, SlackEvidenceUser>> = {
+    U1: { displayName: "Person One", isBot: false, isAppUser: false },
+    U2: { displayName: "Person Two", isBot: false, isAppUser: false },
+    U0BOT1: { displayName: "Deploy Bot", isBot: true, isAppUser: false },
+  };
+  const humanRoot = (user: string): SlackMessage => ({ ts: OLD_ROOT, user, text: "root" });
+  const mappedReply = (ts: string): SlackMessage => ({ ts, thread_ts: OLD_ROOT, user: MAPPED_HUMAN, text: "reply" });
+
+  const REFERENCE: Shape = {
+    label: "the reference: a mapped human's root with a mapped human reply is enqueued (control, and not an M3 falsifier)",
+    thread: { root: humanRoot(MAPPED_HUMAN), replies: [mappedReply(OLD_REPLY)], users: DIRECTORY },
+    ledger: [[OLD_ROOT, MAPPED_HUMAN, true, null], [OLD_REPLY, MAPPED_HUMAN, true, null]],
+  };
+  const UNMAPPED_ROOT: Shape = {
+    label: "an UNMAPPED human's root with mapped human replies is enqueued (KR-05, M3)",
+    thread: { root: humanRoot(UNMAPPED_HUMAN), replies: [mappedReply(OLD_REPLY), mappedReply(SECOND_REPLY)], users: DIRECTORY },
+    ledger: [[OLD_ROOT, UNMAPPED_HUMAN, true, null], [OLD_REPLY, MAPPED_HUMAN, true, null], [SECOND_REPLY, MAPPED_HUMAN, true, null]],
+  };
+  const BOT_ROOT: Shape = {
+    label: "a BOT-authored root with a mapped human reply is enqueued (KR-05, M3)",
+    thread: {
+      root: { ts: OLD_ROOT, user: BOT_USER, bot_id: "B0BOT1", subtype: "bot_message", text: "automated root" },
+      replies: [mappedReply(OLD_REPLY)], users: DIRECTORY,
+    },
+    ledger: [[OLD_ROOT, BOT_USER, false, "bot_message"], [OLD_REPLY, MAPPED_HUMAN, true, null]],
+  };
+  const ZERO_REPLY_ROOT: Shape = {
+    label: "a ZERO-REPLY root of a mapped human is enqueued (KR-05, M3)",
+    thread: { root: humanRoot(MAPPED_HUMAN), replies: [], users: DIRECTORY },
+    ledger: [[OLD_ROOT, MAPPED_HUMAN, true, null]],
+  };
+  const TOMBSTONE_ROOT: Shape = {
+    label: "a TOMBSTONE root with a mapped human reply, its ledger row live, is enqueued (KR-05, M3)",
+    thread: {
+      root: { ts: OLD_ROOT, user: SERVICE_ACCOUNT, subtype: "tombstone", text: "This message was deleted." },
+      replies: [mappedReply(OLD_REPLY)], users: DIRECTORY,
+    },
+    ledger: [[OLD_ROOT, SERVICE_ACCOUNT, false, "tombstone"], [OLD_REPLY, MAPPED_HUMAN, true, null]],
+  };
+
+  const ledgerFacts = (teamId: string): Promise<Row[]> => query(
+    `select workspace_id, channel_id, message_ts, root_ts, is_root, item_id::text as item_id, author_external_id,
+            eligible, exclusion_reason, deleted_at is null as live, isfinite(observed_at) as finite
+       from slack_messages where team_id = $1 order by message_ts`, [teamId]
+  );
+  /** Everything of the team that identity is stored in: its mappings, its unlink fences and its identity generation. */
+  async function identityFacts(teamId: string): Promise<{ identities: Row[]; suppressions: Row[]; identityGeneration: unknown[] }> {
+    const identities = await query(
+      `select provider, external_id, member_id::text as member_id from member_identities where team_id = $1 order by provider, external_id`, [teamId]
+    );
+    const suppressions = await query(
+      `select provider, external_id from member_identity_suppressions where team_id = $1 order by provider, external_id`, [teamId]
+    );
+    const state = await query(`select identity_generation::text as identity_generation from slack_team_state where team_id = $1`, [teamId]);
+    return { identities, suppressions, identityGeneration: state.map((row) => row.identity_generation) };
+  }
+
+  /** The tables preparation could plausibly disturb, with the identity tables: every row of the team, as the database renders it. */
+  const SNAPSHOT_TABLES = [
+    "items", "slack_messages", "slack_sync_threads", "slack_thread_snapshots", "slack_sync_channels",
+    "slack_integration_bindings", "slack_channel_migration_gates", "integrations", "projects",
+    "slack_team_state", "slack_method_budgets", "slack_workspace_observations",
+    "member_identities", "member_identity_suppressions",
+  ];
+  const SNAPSHOT_REQUIRED = [
+    "items", "slack_messages", "slack_sync_threads", "slack_sync_channels", "slack_integration_bindings",
+    "slack_channel_migration_gates", "integrations", "projects", "slack_team_state", "member_identities", "member_identity_suppressions",
+  ];
+  async function snapshot(teamId: string): Promise<Record<string, string>> {
+    const scoped = (await query(
+      `select table_name from information_schema.columns
+        where table_schema = 'public' and column_name = 'team_id' and table_name = any($1::text[])
+        order by table_name`, [SNAPSHOT_TABLES]
+    )).map((row) => row.table_name as string);
+    for (const required of SNAPSHOT_REQUIRED) expect(scoped, `fixture: ${required} is snapshotted`).toContain(required);
+    const out: Record<string, string> = {};
+    for (const table of scoped) {
+      const [aggregate] = await query(
+        `select coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text), '[]'::jsonb)::text as rows from "${table}" t where t.team_id = $1`, [teamId]
+      );
+      out[table] = aggregate.rows as string;
+    }
+    const [versions] = await query(
+      `select coalesce(jsonb_agg(to_jsonb(v) order by to_jsonb(v)::text), '[]'::jsonb)::text as rows
+         from item_versions v join items i on i.id = v.item_id where i.team_id = $1`, [teamId]
+    );
+    out.item_versions = versions.rows as string;
+    return out;
+  }
+
+  const prepareEntry = (ctx: Ctx): Promise<Outcome> =>
+    tx((s) => prepareSlackKnownRootRequeue(s, { teamId: ctx.teamId, entry: ctx.entry }, createSlackKnownRootExecution({ ambientDeadlineAt: null })));
+
+  /**
+   * One shape, published by the real publication, with the mapped human's account linked by the
+   * product's identity writer, and every fact the case rests on read back as a literal.
+   */
+  async function published(shape: Shape): Promise<Ctx> {
+    const { label } = shape;
+    const f = await publishOldRoot(shape.thread);
+    const teamId = f.seed.teamId;
+    // The mapping: the raw account id, which is what a team that has not been cut over stores.
+    const linked = await setMemberIdentity(db(), teamId, f.seed.memberId, { provider: "slack", externalId: MAPPED_HUMAN });
+    expect(linked, `${label}: fixture: the mapped human's account was linked to the member`).toMatchObject({ created: true, conflict: false });
+
+    // READBACK — the ledger, exactly as the publication left it: one live, finite row per message of
+    // this thread, in the exact provider scope, bound to this item, with the publication's own verdict.
+    expect(await ledgerFacts(teamId), `${label}: fixture: the ledger the real publication wrote`).toEqual(
+      shape.ledger.map(([messageTs, author, eligible, exclusionReason]) => ({
+        workspace_id: WORKSPACE, channel_id: CHANNEL, message_ts: messageTs, root_ts: OLD_ROOT, is_root: messageTs === OLD_ROOT,
+        item_id: f.itemId, author_external_id: author, eligible, exclusion_reason: exclusionReason, live: true, finite: true,
+      }))
+    );
+    expect(shape.ledger.map(([messageTs]) => messageTs).filter((messageTs) => messageTs === OLD_ROOT),
+      `${label}: fixture: exactly one of those rows is the root's`).toEqual([OLD_ROOT]);
+    // READBACK — identity: ONE mapping, the mapped human's, and so none for any other author here.
+    expect(await identityFacts(teamId), `${label}: fixture: the mapped human, and nobody else, is mapped`).toEqual({
+      identities: [{ provider: "slack", external_id: MAPPED_HUMAN, member_id: f.seed.memberId }],
+      suppressions: [],
+      identityGeneration: [expect.stringMatching(/^[1-9][0-9]*$/)],
+    });
+    // READBACK — the item: canonical, in scope, and of the shape the case is about.
+    expect(await query(
+      `select path, kind::text as kind, access::text as access, frontmatter->>'source' as source,
+              frontmatter->>'workspace_id' as workspace_id, frontmatter->>'channel_id' as channel_id,
+              frontmatter->>'ts' as ts, frontmatter->>'thread_ts' as thread_ts,
+              frontmatter->>'author_id' as root_author, (frontmatter->>'reply_count')::int as reply_count
+         from items where team_id = $1`, [teamId]
+    ), `${label}: fixture: the team's one item is the canonical item of this root`).toEqual([{
+      path: CANONICAL_PATH, kind: "transcript", access: "team", source: "slack", workspace_id: WORKSPACE, channel_id: CHANNEL,
+      ts: OLD_ROOT, thread_ts: OLD_ROOT, root_author: shape.thread.root.user, reply_count: shape.thread.replies.length,
+    }]);
+
+    // The real enumeration: one item, one located entry, with the authority the real discovery,
+    // readiness and publication paths recorded. Nothing below supplies an authority of its own.
+    const channel = await channelRow(teamId, WORKSPACE, CHANNEL);
+    expect(channel, `${label}: fixture: the channel is public and bound to the seeded integration`).toMatchObject({
+      public_state: "public", binding_integration_id: f.integrationId,
+    });
+    expect(channel?.binding_config_revision, `${label}: fixture: the channel row stores a configuration revision`).toMatch(/^[0-9a-f]{64}$/);
+    const page = await enumerate(teamId);
+    expect(page, `${label}: fixture: enumeration returns exactly this root, located`).toEqual({
+      entries: [{
+        teamId, itemId: f.itemId, revisitAfterMs: REVISIT_AFTER_MS,
+        locator: {
+          workspaceId: WORKSPACE, channelId: CHANNEL, rootTs: OLD_ROOT, integrationId: f.integrationId,
+          bindingConfigRevision: channel?.binding_config_revision, namespaceRevision: f.namespaceRevision,
+        },
+      }],
+      nextCursor: null, exhausted: true, examined: 1,
+    });
+    expect((await stored(teamId)).allQueue, `${label}: fixture: the root has no pending work`).toEqual([]);
+    return { shape, teamId, entry: page.entries[0] };
+  }
+
+  /**
+   * The same entry, prepared twice: once before the revisit interval has passed, and once after the
+   * fixture clock has aged the observation. Both calls are made before anything is asserted, and the
+   * labeled enqueue is asserted FIRST, so that an attribution gate fails a case exactly once, there.
+   */
+  async function staysSchedulable(ctx: Ctx): Promise<void> {
+    const { label } = ctx.shape;
+    const identity = await identityFacts(ctx.teamId);
+
+    const atPublication = await snapshot(ctx.teamId);
+    const fresh = await prepareEntry(ctx);
+    const afterFresh = await snapshot(ctx.teamId);
+    const queueAfterFresh = (await stored(ctx.teamId)).allQueue;
+
+    // FIXTURE CLOCK: the revisit interval has passed. No attribution fact is touched.
+    await ageObservation(ctx.teamId);
+    const overdue = await snapshot(ctx.teamId);
+    const aged = await prepareEntry(ctx);
+    const afterAged = await snapshot(ctx.teamId);
+
+    // KR-05, and the falsifier of M3: the root is enqueued.
+    expect(aged, label).toEqual({ outcome: "enqueued" });
+
+    // DUE BEHAVIOR. Before the interval had passed the root was admitted and simply not due: the
+    // witness, the ledger checks and the path checks all come before the due decision. Nothing was written.
+    expect(fresh, `${label}: before the revisit interval has passed it is not due`).toEqual({ outcome: "not_due" });
+    expect(queueAfterFresh, `${label}: a root that is not due is not queued`).toEqual([]);
+    expect(afterFresh, `${label}: a root that is not due writes nothing`).toEqual(atPublication);
+
+    // THE QUEUE ROW: exactly one, the root's, queued, never attempted and due…
+    expect((await stored(ctx.teamId)).allQueue, `${label}: exactly one pending row, in the root's exact scope`).toEqual([
+      { workspace_id: WORKSPACE, channel_id: CHANNEL, root_ts: OLD_ROOT, status: "queued", attempts: 0, due: true },
+    ]);
+    // …at the root witness's own observation plus the revisit interval, rounded up to the millisecond.
+    const [derivation] = await query<{ derived: boolean }>(
+      `select t.due_at >= w.observed_at + interval '60 seconds'
+              and t.due_at < w.observed_at + interval '60 seconds' + interval '1 millisecond' as derived
+         from slack_sync_threads t
+         join slack_messages w
+           on w.team_id = t.team_id and w.workspace_id = t.workspace_id and w.channel_id = t.channel_id
+          and w.message_ts = t.root_ts and w.root_ts = t.root_ts and w.is_root and w.deleted_at is null
+        where t.team_id = $1 and t.root_ts = $2`, [ctx.teamId, OLD_ROOT]
+    );
+    expect(derivation?.derived, `${label}: the due instant derives from the root witness's stored observation`).toBe(true);
+
+    // NOTHING ELSE MOVED. The queue is the only table of the team that differs: no item, version,
+    // ledger row, channel, binding, gate, integration, project, generation or identity was written.
+    expect(afterAged.slack_sync_threads, `${label}: the snapshot sees the queue row`).not.toBe(overdue.slack_sync_threads);
+    for (const table of Object.keys(overdue)) {
+      if (table !== "slack_sync_threads") expect(afterAged[table], `${label}: ${table} is unchanged by the preparation`).toBe(overdue[table]);
+    }
+    expect(overdue.member_identities, `${label}: fixture: the snapshot holds the mapping`).toContain(`"external_id": "${MAPPED_HUMAN}"`);
+    expect(await identityFacts(ctx.teamId), `${label}: no mapping, unlink fence or identity generation was written`).toEqual(identity);
+    expect(await ledgerFacts(ctx.teamId), `${label}: every ledger verdict is as the publication left it`).toEqual(
+      ctx.shape.ledger.map(([messageTs, author, eligible, exclusionReason]) => expect.objectContaining({
+        message_ts: messageTs, author_external_id: author, eligible, exclusion_reason: exclusionReason, live: true,
+      }))
+    );
+
+    // ISOLATION: this case's root is the only pending work of ANY team.
+    expect(await query(`select team_id::text as team_id, root_ts from slack_sync_threads`), `${label}: the only queue row in the database is this root's`)
+      .toEqual([{ team_id: ctx.teamId, root_ts: OLD_ROOT }]);
+  }
+
+  it("enqueues the reference thread, a mapped human's root with a mapped human reply (control)", async () =>
+    staysSchedulable(await published(REFERENCE)));
+
+  it("enqueues an unmapped human's root that has mapped human replies (KR-05, M3)", async () =>
+    staysSchedulable(await published(UNMAPPED_ROOT)));
+
+  it("enqueues a bot-authored root (KR-05, M3)", async () =>
+    staysSchedulable(await published(BOT_ROOT)));
+
+  it("enqueues a zero-reply root (KR-05, M3)", async () =>
+    staysSchedulable(await published(ZERO_REPLY_ROOT)));
+
+  it("enqueues a tombstone root whose ledger row is live, and refuses the same root while that row is deleted (KR-05, M3)", async () => {
+    const ctx = await published(TOMBSTONE_ROOT);
+    const label = "a tombstone root whose ledger row is ALSO deleted is not witnessed (contrast)";
+    const rootRow = `team_id = $1 and message_ts = $2 and root_ts = $2 and is_root`;
+    const rootFacts = () => query(
+      `select eligible, exclusion_reason, deleted_at is null as live from slack_messages where ${rootRow}`, [ctx.teamId, OLD_ROOT]
+    );
+    /** Fixture DML that must change exactly the root's one ledger row. */
+    const changeRoot = async (assignment: string): Promise<void> => {
+      const changed = await (await rawSql()).query(`update slack_messages set ${assignment} where ${rootRow}`, [ctx.teamId, OLD_ROOT]);
+      if (changed.rowCount !== 1) throw new Error(`fixture: expected to change exactly the root's row, changed ${changed.rowCount}`);
+    };
+
+    // THE CONTRAST: the same tombstone root, with its ledger row deleted as reconciliation deletes a
+    // message that is gone. The exclusion reason is untouched; only `deleted_at` is set.
+    const live = await snapshot(ctx.teamId);
+    expect(await rootFacts(), `${label}: fixture: the root's row is a live tombstone`).toEqual([{ eligible: false, exclusion_reason: "tombstone", live: true }]);
+    await changeRoot(`deleted_at = clock_timestamp()`);
+    expect(await rootFacts(), `${label}: fixture: the same row, the same reason, now deleted`).toEqual([{ eligible: false, exclusion_reason: "tombstone", live: false }]);
+    const deleted = await snapshot(ctx.teamId);
+    expect(await prepareEntry(ctx), label).toEqual({ outcome: "unattested", reason: "missing_root_witness" });
+    expect((await stored(ctx.teamId)).allQueue, `${label}: nothing was enqueued`).toEqual([]);
+    expect(await snapshot(ctx.teamId), `${label}: nothing was written`).toEqual(deleted);
+    // Undone: the team reads exactly as it did before the row was deleted.
+    await changeRoot(`deleted_at = null`);
+    expect(await snapshot(ctx.teamId), `${label}: fixture: the deletion is undone, and nothing else differs`).toEqual(live);
+
+    // The live tombstone, from the same entry.
+    await staysSchedulable(ctx);
   });
 });
