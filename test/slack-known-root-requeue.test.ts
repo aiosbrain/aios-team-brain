@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { TransactionExecutionError } from "@/lib/db/pg/tx";
 import type { SqlExecutor, TransactionSession } from "@/lib/db/types";
@@ -23,6 +23,27 @@ import {
   type SlackKnownRootPreparationResult,
   type SlackKnownRootReceipt,
 } from "@/lib/ingest/slack-known-root-requeue";
+
+/**
+ * The decorated session is handed only to the packet's own dependencies, so the one way to hold it is
+ * to stand where a dependency stands. This wraps the REAL namespace-gate module: with no hook set —
+ * which is every case but the lifecycle ones that set it — the real `lockReadySlackNamespaceGate`
+ * runs, unchanged.
+ */
+const gateSeat = vi.hoisted(() => ({
+  current: null as null | ((session: unknown, request: unknown) => unknown),
+}));
+vi.mock("@/lib/ingest/slack-namespace-gate", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/ingest/slack-namespace-gate")>();
+  return {
+    ...actual,
+    lockReadySlackNamespaceGate: (session: never, request: never) =>
+      gateSeat.current ? gateSeat.current(session, request) : actual.lockReadySlackNamespaceGate(session, request),
+  };
+});
+afterEach(() => {
+  gateSeat.current = null;
+});
 
 /**
  * AIO-1170 AC-02 — the inactive known-root requeue packet, product contracts that need no database
@@ -415,6 +436,412 @@ describe("known-root primitives — the execution object is enforced by the prim
     const error = await rejection(() => run(session, execution));
     expect(error).not.toBeInstanceOf(SlackKnownRootValidationError);
     expect(error).not.toBeInstanceOf(SlackKnownRootDeadlineError);
+  });
+});
+
+// ── §7.3 and §7.4: the decorated session, observed at the executor it wraps ───
+
+/**
+ * Source review (KR-12 in part). These cases drive the two PUBLIC primitives against a scripted
+ * session and read the contract off the only place it is observable without a database: the
+ * statements that reach the caller's own executor, in the order they reach it, and the values they
+ * carry.
+ *
+ * The script is a small model of the server, not a copy of the implementation. It recognises a
+ * timeout assignment by what it DOES — `set_config('statement_timeout' | 'lock_timeout', …)` or a
+ * `SET` of either, local or not — and applies it to its own "effective settings"; it answers a read
+ * of those settings; and everything else is a data statement, recorded with the settings in effect
+ * when it was dispatched. No case counts statements or matches a statement's text beyond that, so an
+ * implementation is free in how many reads it makes and how it words them.
+ *
+ * Cases marked "(control)" are expected to pass at the source-reviewed checkpoint and are the
+ * lifecycle evidence that was missing. The regressing-clock case is expected to FAIL there.
+ */
+describe("known-root decorated session — statement order, refreshed timeouts, restoration and closure", () => {
+  type TimeoutName = "statement_timeout" | "lock_timeout";
+  interface Settings { statementMs: number; lockMs: number }
+  interface Assignment { name: TimeoutName; ms: number; local: boolean }
+  type Logged =
+    | { kind: "settings-read" }
+    | { kind: "timeouts"; assignments: Assignment[] }
+    | { kind: "data"; text: string; effective: Settings };
+
+  function milliseconds(value: unknown): number {
+    const match = /^(\d+)\s*(ms|s|min)?$/.exec(String(value).trim());
+    if (!match) return Number.NaN;
+    const amount = Number(match[1]);
+    return match[2] === "s" ? amount * 1_000 : match[2] === "min" ? amount * 60_000 : amount;
+  }
+
+  /** Every timeout assignment a statement makes, whichever of the server's spellings it uses. */
+  function timeoutAssignments(text: string, params: readonly unknown[]): Assignment[] {
+    const found: Assignment[] = [];
+    const call = /set_config\s*\(\s*'(statement_timeout|lock_timeout)'\s*,\s*(?:\$(\d+)(?:::\w+)?|'([^']*)')\s*,\s*(true|false)\s*\)/gi;
+    for (const match of text.matchAll(call)) {
+      found.push({
+        name: match[1].toLowerCase() as TimeoutName,
+        ms: milliseconds(match[2] ? params[Number(match[2]) - 1] : match[3]),
+        local: match[4].toLowerCase() === "true",
+      });
+    }
+    const statement = /\bset\s+(local\s+|session\s+)?(statement_timeout|lock_timeout)\s*(?:=|\bto\b)\s*'?(\w+)'?/gi;
+    for (const match of text.matchAll(statement)) {
+      found.push({ name: match[2].toLowerCase() as TimeoutName, ms: milliseconds(match[3]), local: /^local/i.test(match[1] ?? "") });
+    }
+    return found;
+  }
+
+  interface Script {
+    original?: Settings;
+    /** Rows for a data statement. May advance a clock, throw, or wait. */
+    respond?: (text: string, params: readonly unknown[]) => unknown[] | Promise<unknown[]>;
+    /** Called for a timeout statement AFTER its assignments were recorded; may throw to fail it. */
+    onTimeouts?: (assignments: Assignment[], dataSoFar: number) => void;
+  }
+
+  function scriptedSession(script: Script = {}) {
+    const original: Settings = script.original ?? { statementMs: 30_000, lockMs: 1_500 };
+    const effective: Settings = { ...original };
+    const log: Logged[] = [];
+    const other: string[] = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const executeSql = (async (text: string, params: unknown[] = []) => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      try {
+        const assignments = timeoutAssignments(text, params);
+        if (assignments.length > 0) {
+          log.push({ kind: "timeouts", assignments });
+          for (const assignment of assignments) {
+            if (assignment.name === "statement_timeout") effective.statementMs = assignment.ms;
+            else effective.lockMs = assignment.ms;
+          }
+          script.onTimeouts?.(assignments, log.filter((entry) => entry.kind === "data").length);
+          return { rows: [{}], rowCount: 1 };
+        }
+        if (/pg_settings|current_setting\s*\(|^\s*show\b/i.test(text)) {
+          log.push({ kind: "settings-read" });
+          const rows = /pg_settings/i.test(text)
+            ? [
+                { name: "statement_timeout", setting: String(effective.statementMs), unit: "ms" },
+                { name: "lock_timeout", setting: String(effective.lockMs), unit: "ms" },
+              ]
+            : [{ statement_timeout: `${effective.statementMs}ms`, lock_timeout: `${effective.lockMs}ms` }];
+          return { rows, rowCount: rows.length };
+        }
+        log.push({ kind: "data", text, effective: { ...effective } });
+        const rows = await (script.respond ? script.respond(text, params) : []);
+        return { rows, rowCount: rows.length };
+      } finally {
+        inFlight--;
+      }
+    }) as SqlExecutor;
+    const session = {
+      get db(): never {
+        other.push("db");
+        throw new Error("fixture: the caller's own db client was used");
+      },
+      executeSql,
+      optionalAudit: async <T>(_operation: () => Promise<T>, fallback: T): Promise<T> => {
+        other.push("optionalAudit");
+        return fallback;
+      },
+    } as unknown as TransactionSession;
+    return {
+      session, log, other, original, effective,
+      maxInFlight: () => maxInFlight,
+      data: () => log.filter((entry): entry is Extract<Logged, { kind: "data" }> => entry.kind === "data"),
+      assignments: () => log.flatMap((entry) => (entry.kind === "timeouts" ? entry.assignments : [])),
+    };
+  }
+  type Scripted = ReturnType<typeof scriptedSession>;
+
+  const pageRequest = { teamId: TEAM, pageSize: 10, revisitAfterMs: REVISIT_MS } as const;
+  /** A stored gate row that is ready for the fixture locator: the real gate helper reads it. */
+  const readyGateRow = {
+    team_id: TEAM, raw_channel_id: "C0KNOWN1", state: "ready", revision: "3", ready_revision: "3",
+    resolved_workspace_ids: ["T0SOURCE1"], completed_repair_id: "0c000000-0000-4000-8000-00000000000c", blocked_reason: null,
+  };
+
+  /** The order every outcome shares: settings are read before anything is set, and each data statement runs under a fresh assignment. */
+  function expectOrdered(scripted: Scripted): void {
+    const kinds = scripted.log.map((entry) => entry.kind);
+    expect(kinds[0], "the original settings are read first").toBe("settings-read");
+    expect(kinds.filter((kind) => kind === "settings-read"), "the originals are read once, at entry").toHaveLength(1);
+    scripted.log.forEach((entry, index) => {
+      if (entry.kind !== "data") return;
+      const previous = scripted.log[index - 1];
+      expect(previous?.kind, `data statement ${index} is immediately preceded by a timeout assignment`).toBe("timeouts");
+      const names = previous?.kind === "timeouts" ? previous.assignments.map((assignment) => assignment.name).sort() : [];
+      expect(names, `both timeouts are set before data statement ${index}`).toEqual(["lock_timeout", "statement_timeout"]);
+    });
+    // Nothing is ever set for the SESSION: a pooled connection keeps whatever outlives the transaction.
+    expect(scripted.assignments().filter((assignment) => !assignment.local), "every assignment is transaction-local").toEqual([]);
+    for (const assignment of scripted.assignments()) expect(Number.isSafeInteger(assignment.ms) && assignment.ms >= 0, "an assignment is whole milliseconds").toBe(true);
+    expect(scripted.maxInFlight(), "the caller's executor never has two statements in flight").toBe(1);
+    expect(scripted.other, "the caller's own db client and audit helper were never used").toEqual([]);
+  }
+
+  /** A normal result leaves both settings exactly as it found them, and the restoring assignment is the last statement. */
+  function expectRestored(scripted: Scripted): void {
+    expect(scripted.log.at(-1)?.kind, "the last statement restores the settings").toBe("timeouts");
+    expect(scripted.effective, "both original settings are in effect again").toEqual(scripted.original);
+  }
+
+  it("reads the original settings first, then sets both timeouts afresh before EVERY data statement from the time that is left (control)", async () => {
+    const clock = { now: 500_000 };
+    // Every data statement takes 300 ms and finds one item: a first page of a non-empty team.
+    const scripted = scriptedSession({
+      original: { statementMs: 0, lockMs: 0 },
+      respond: () => { clock.now += 300; return [{ id: ITEM }]; },
+    });
+    const context = createSlackKnownRootExecution({ ambientDeadlineAt: null, monotonicNow: () => clock.now });
+    const page = await readSlackKnownRootItemPage(scripted.session, pageRequest, context);
+    expect(page.examined).toBe(1);
+
+    expectOrdered(scripted);
+    const data = scripted.data();
+    // The upper bound and the id read are separate reads by §4.2: at least two data statements.
+    expect(data.length, "a first page of a non-empty team is more than one read").toBeGreaterThanOrEqual(2);
+    data.forEach((statement, index) => {
+      const remaining = SLACK_KNOWN_ROOT_LIMITS.allowanceMs.default - 300 * index;
+      // No more than what is left of the allowance, and not an arbitrary smaller number either.
+      expect(statement.effective.statementMs, `statement timeout of data statement ${index}`).toBeLessThanOrEqual(remaining);
+      expect(statement.effective.statementMs, `statement timeout of data statement ${index}`).toBeGreaterThanOrEqual(remaining - 1);
+      expect(statement.effective.lockMs, `lock timeout of data statement ${index}`).toBeLessThanOrEqual(Math.min(SLACK_KNOWN_ROOT_LIMITS.lockTimeoutMs, remaining));
+      // Zero would DISABLE the limit: an assignment before a data statement is never zero.
+      expect(statement.effective.statementMs).toBeGreaterThanOrEqual(1);
+      expect(statement.effective.lockMs).toBeGreaterThanOrEqual(1);
+      if (index > 0) expect(statement.effective.statementMs, "refreshed, not reused").toBeLessThan(data[index - 1].effective.statementMs);
+    });
+    expectRestored(scripted);
+  });
+
+  it.each<[string, Settings, Settings]>([
+    ["a stricter original statement timeout and lock timeout", { statementMs: 50, lockMs: 20 }, { statementMs: 50, lockMs: 20 }],
+    ["a stricter original statement timeout with the lock timeout disabled", { statementMs: 40, lockMs: 0 }, { statementMs: 40, lockMs: 40 }],
+    ["a stricter original lock timeout with the statement timeout disabled", { statementMs: 0, lockMs: 100 }, { statementMs: 2_000, lockMs: 100 }],
+    ["a looser original statement timeout", { statementMs: 30_000, lockMs: 10_000 }, { statementMs: 2_000, lockMs: 250 }],
+  ])("never loosens %s (control)", async (_label, original, ceiling) => {
+    const scripted = scriptedSession({ original, respond: () => [{ id: ITEM }] });
+    const context = createSlackKnownRootExecution({ ambientDeadlineAt: null, monotonicNow: () => 500_000 });
+    await readSlackKnownRootItemPage(scripted.session, pageRequest, context);
+    expectOrdered(scripted);
+    expect(scripted.data().length).toBeGreaterThanOrEqual(1);
+    for (const statement of scripted.data()) {
+      expect(statement.effective.statementMs).toBeGreaterThanOrEqual(1);
+      expect(statement.effective.statementMs).toBeLessThanOrEqual(ceiling.statementMs);
+      expect(statement.effective.lockMs).toBeGreaterThanOrEqual(1);
+      expect(statement.effective.lockMs).toBeLessThanOrEqual(ceiling.lockMs);
+    }
+    // Restored to the ORIGINALS, including a disabled (zero) one — not to this packet's own caps.
+    expectRestored(scripted);
+  });
+
+  // EXPECTED RED at the source-reviewed checkpoint (review finding S6). The remaining time is
+  // computed from the clock alone, so a monotonic clock that reads EARLIER than it did when the
+  // context was created yields more "remaining" than the allowance that was declared, and that is
+  // handed to the server as the statement timeout. With the original limit disabled nothing else
+  // caps it. A context never grants more than its own allowance, whatever the clock says later.
+  it.each<[string, (scripted: Scripted, context: never) => Promise<unknown>]>([
+    ["the page reader", (scripted, context) => readSlackKnownRootItemPage(scripted.session, pageRequest, context)],
+    ["the preparer", (scripted, context) => prepareSlackKnownRootRequeue(scripted.session, { teamId: TEAM, entry: located() }, context)],
+  ])("never sets a statement timeout above the declared allowance when the monotonic clock regresses: %s", async (_label, run) => {
+    for (const allowanceMs of [1_000, 2_000, 5_000]) {
+      let regressed = false;
+      const scripted = scriptedSession({ original: { statementMs: 0, lockMs: 0 }, respond: () => [] });
+      const context = createSlackKnownRootExecution({
+        allowanceMs, ambientDeadlineAt: null, monotonicNow: () => (regressed ? 400_000 : 1_000_000),
+      });
+      // Ten minutes EARLIER on every reading after creation.
+      regressed = true;
+      let rejected: unknown;
+      try {
+        await run(scripted, context as never);
+      } catch (error) {
+        rejected = error;
+      }
+      // Either the operation ran under its allowance, or it refused the clock outright: what it may
+      // not do is run a statement with more time than the context declared.
+      if (rejected !== undefined) expectNoCanary(rejected, "a refusal of the clock");
+      expect(scripted.data().length > 0 || rejected !== undefined, "the operation ran a statement or refused").toBe(true);
+      for (const statement of scripted.data()) {
+        expect(statement.effective.statementMs, `allowance ${allowanceMs}: statement timeout`).toBeGreaterThanOrEqual(1);
+        expect(statement.effective.statementMs, `allowance ${allowanceMs}: statement timeout`).toBeLessThanOrEqual(allowanceMs);
+        expect(statement.effective.lockMs, `allowance ${allowanceMs}: lock timeout`).toBeLessThanOrEqual(SLACK_KNOWN_ROOT_LIMITS.lockTimeoutMs);
+      }
+      for (const assignment of scripted.assignments().filter((candidate) => candidate.name === "statement_timeout" && candidate.ms !== 0)) {
+        expect(assignment.ms, `allowance ${allowanceMs}: no statement timeout assignment exceeds it`).toBeLessThanOrEqual(allowanceMs);
+      }
+    }
+  });
+
+  it.each<[string, Script["respond"], (scripted: Scripted) => Promise<unknown>, unknown]>([
+    [
+      "the page reader on an empty team", () => [],
+      (scripted) => readSlackKnownRootItemPage(scripted.session, pageRequest, execution()),
+      { entries: [], nextCursor: null, exhausted: true, examined: 0 },
+    ],
+    [
+      "the page reader on a continuation that finds nothing more", () => [],
+      (scripted) => readSlackKnownRootItemPage(scripted.session, {
+        ...pageRequest,
+        cursor: { version: 1, teamId: TEAM, upperItemId: "0f000000-0000-4000-8000-00000000000f", afterItemId: ITEM, revisitAfterMs: REVISIT_MS },
+      }, execution()),
+      { entries: [], nextCursor: null, exhausted: true, examined: 0 },
+    ],
+    [
+      "the preparer refused at the namespace gate", () => [],
+      (scripted) => prepareSlackKnownRootRequeue(scripted.session, { teamId: TEAM, entry: located() }, execution()),
+      { outcome: "refused", reason: "namespace_changed_or_unready" },
+    ],
+    [
+      "the preparer refused at the integration, after the gate locked",
+      (text) => (/slack_channel_migration_gates/i.test(text) ? [readyGateRow] : []),
+      (scripted) => prepareSlackKnownRootRequeue(scripted.session, { teamId: TEAM, entry: located() }, execution()),
+      { outcome: "refused", reason: "source_not_current" },
+    ],
+  ])("restores both original settings before a normal result resolves: %s (control)", async (_label, respond, run, expected) => {
+    const scripted = scriptedSession({ original: { statementMs: 30_000, lockMs: 1_500 }, respond });
+    const result = await run(scripted);
+    expect(result).toEqual(expected);
+    expectOrdered(scripted);
+    expect(scripted.data().length, "the outcome was reached through at least one data statement").toBeGreaterThanOrEqual(1);
+    // While the operation ran the settings really were changed: the restoration is not a no-op.
+    for (const statement of scripted.data()) expect(statement.effective).not.toEqual(scripted.original);
+    expectRestored(scripted);
+  });
+
+  it("issues no statement at all for an unlocated entry: there is nothing to set and nothing to restore (control)", async () => {
+    const scripted = scriptedSession();
+    const entry: SlackKnownRootEntry = { teamId: TEAM, itemId: ITEM, revisitAfterMs: REVISIT_MS, unlocated: "invalid_metadata" };
+    expect(await prepareSlackKnownRootRequeue(scripted.session, { teamId: TEAM, entry }, execution()))
+      .toEqual({ outcome: "unattested", reason: "invalid_metadata" });
+    expect(scripted.log).toEqual([]);
+    expect(scripted.effective).toEqual(scripted.original);
+  });
+
+  it.each<[string, (scripted: Scripted) => Promise<unknown>]>([
+    ["the page reader", (scripted) => readSlackKnownRootItemPage(scripted.session, pageRequest, execution())],
+    ["the preparer", (scripted) => prepareSlackKnownRootRequeue(scripted.session, { teamId: TEAM, entry: located() }, execution())],
+  ])("rethrows a failed statement as it is and sends nothing after it — no restoration: %s (control)", async (_label, run) => {
+    // After a SQL failure the transaction may be aborted: a restoring statement would only mask the
+    // primary error, and the caller's rollback undoes transaction-local settings by itself.
+    const failure = Object.assign(new Error(`canceling statement: ${CANARY.sql}`), { code: "57014" });
+    const scripted = scriptedSession({ respond: () => { throw failure; } });
+    const error = await rejection(() => run(scripted));
+    expect(error, "the very same error object, for the caller's rollback and retry logic").toBe(failure);
+    expect(scripted.data(), "the failing statement was the only data statement").toHaveLength(1);
+    expect(scripted.log.at(-1)?.kind, "nothing was sent after the failed statement").toBe("data");
+    expect(scripted.maxInFlight()).toBe(1);
+    expect(classifySlackKnownRootPreparationFailure(error)).toBe("statement_timeout");
+  });
+
+  it.each<[string, (scripted: Scripted, context: never) => Promise<unknown>]>([
+    ["the page reader", (scripted, context) => readSlackKnownRootItemPage(scripted.session, pageRequest, context)],
+    ["the preparer", (scripted, context) => prepareSlackKnownRootRequeue(scripted.session, { teamId: TEAM, entry: located() }, context)],
+  ])("throws the deadline error when a statement outlives the allowance, and runs no further data statement: %s (control)", async (_label, run) => {
+    const clock = { now: 500_000 };
+    const scripted = scriptedSession({
+      respond: (text) => {
+        clock.now += 60_000;
+        return /slack_channel_migration_gates/i.test(text) ? [readyGateRow] : [{ id: ITEM }];
+      },
+    });
+    const context = createSlackKnownRootExecution({ ambientDeadlineAt: null, monotonicNow: () => clock.now });
+    const error = await rejection(() => run(scripted, context as never));
+    expect(error).toBeInstanceOf(SlackKnownRootDeadlineError);
+    expect(scripted.data(), "the statement that ran out the clock was the last data statement").toHaveLength(1);
+    expect(classifySlackKnownRootPreparationFailure(error)).toBe("deadline_exceeded");
+  });
+
+  it("never reports success when the restoring assignment itself fails (control)", async () => {
+    const failure = Object.assign(new Error("current transaction is aborted"), { code: "25P02" });
+    const original = { statementMs: 30_000, lockMs: 1_500 };
+    // The restoring assignment is the one that sets BOTH settings back to the originals after data ran.
+    const scripted = scriptedSession({
+      original,
+      respond: () => [],
+      onTimeouts: (assignments, dataSoFar) => {
+        const restoring = dataSoFar > 0 &&
+          assignments.some((assignment) => assignment.name === "statement_timeout" && assignment.ms === original.statementMs) &&
+          assignments.some((assignment) => assignment.name === "lock_timeout" && assignment.ms === original.lockMs);
+        if (restoring) throw failure;
+      },
+    });
+    const error = await rejection(() => readSlackKnownRootItemPage(scripted.session, pageRequest, execution()));
+    expect(error, "the restoration failure is thrown, not swallowed into an empty page").toBe(failure);
+    expect(classifySlackKnownRootPreparationFailure(error)).toBe("database_failure");
+  });
+
+  it("hands its dependencies a session whose db and audit helper refuse, whose statements are sequential, and which stops working once the primitive settles (control)", async () => {
+    const scripted = scriptedSession({ respond: () => [{ probe: 1 }] });
+    let handed: TransactionSession | null = null;
+    const seen: Record<string, unknown> = {};
+    let auditRan = false;
+    gateSeat.current = async (session: unknown) => {
+      const decorated = session as TransactionSession;
+      handed = decorated;
+      // The builder: getting it, or using it, must fail — it must never yield a working client.
+      seen.db = thrown(() => (decorated.db as unknown as { from: (table: string) => unknown }).from("items"));
+      // The savepoint helper: it must fail, and must neither run the operation nor answer the fallback.
+      seen.audit = await rejection(async () => decorated.optionalAudit(async () => { auditRan = true; return "ran"; }, "fallback"));
+      // Statements still work while the operation is running…
+      seen.probe = await decorated.executeSql("select 1 as probe");
+      // …one at a time, however a dependency issues them.
+      seen.pair = await Promise.allSettled([decorated.executeSql("select 'first' as probe"), decorated.executeSql("select 'second' as probe")]);
+      return { outcome: "refused" };
+    };
+
+    const result = await prepareSlackKnownRootRequeue(scripted.session, { teamId: TEAM, entry: located() }, execution());
+    expect(result).toEqual({ outcome: "refused", reason: "namespace_changed_or_unready" });
+    // The handed session is never given to a matcher as a VALUE: `toBe` on two different objects
+    // goes on to compare them deeply for its hint, which reads `db` on both — and each getter throws,
+    // one of them recording a use of the caller's own client. Identity is decided here, as booleans.
+    expect((handed as unknown) !== null, "the gate helper was handed a session").toBe(true);
+    expect(Object.is(handed, scripted.session), "…and not the caller's own").toBe(false);
+
+    expect(seen.db, "the decorated db refuses").toBeInstanceOf(Error);
+    expect(seen.audit, "the decorated audit helper refuses").toBeInstanceOf(Error);
+    expect(auditRan, "the audited operation never ran").toBe(false);
+    expect(scripted.other, "neither capability reached the caller's own session").toEqual([]);
+    expect(seen.probe).toMatchObject({ rows: [{ probe: 1 }] });
+    expect((seen.pair as PromiseSettledResult<unknown>[])[0].status, "the first of two statements ran").toBe("fulfilled");
+    expectOrdered(scripted);
+    expectRestored(scripted);
+
+    // After the primitive has settled, the executor somebody kept is of no further use: it rejects,
+    // and nothing reaches the caller's connection.
+    const kept = handed as unknown as TransactionSession;
+    const before = scripted.log.length;
+    expect(await rejection(() => kept.executeSql("select 1 as late")), "a retained executor rejects").toBeInstanceOf(Error);
+    expect(scripted.log, "nothing was sent after the primitive settled").toHaveLength(before);
+    // The getter is invoked INSIDE the callback, so the matcher observes it throwing.
+    expect(() => kept.db, "the retained session's db still refuses").toThrow();
+    expect(thrown(() => (kept.db as unknown as { from: (table: string) => unknown }).from("items"))).toBeInstanceOf(Error);
+    expect(scripted.other, "the caller's own session was still never used").toEqual([]);
+    expect(scripted.effective, "the settings stayed restored").toEqual(scripted.original);
+  });
+
+  it("leaves a retained executor unusable after a primitive that THREW as well (control)", async () => {
+    const scripted = scriptedSession({ respond: () => [] });
+    let handed: TransactionSession | null = null;
+    gateSeat.current = async (session: unknown) => {
+      handed = session as TransactionSession;
+      throw new Error("dependency failed");
+    };
+    const error = await rejection(() => prepareSlackKnownRootRequeue(scripted.session, { teamId: TEAM, entry: located() }, execution()));
+    expect(error).toBeInstanceOf(Error);
+    expect(classifySlackKnownRootPreparationFailure(error)).toBe("dependency_failure");
+    const kept = handed as unknown as TransactionSession;
+    // As above: decided as a boolean, never by handing the getter-bearing session to a matcher.
+    expect((handed as unknown) !== null, "the gate helper was handed a session").toBe(true);
+    const before = scripted.log.length;
+    expect(await rejection(() => kept.executeSql("select 1 as late"))).toBeInstanceOf(Error);
+    expect(scripted.log).toHaveLength(before);
+    // A dependency exception is not followed by a restoring statement either.
+    expect(scripted.assignments().filter((assignment) => !assignment.local)).toEqual([]);
   });
 });
 

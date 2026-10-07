@@ -198,6 +198,92 @@ function dependencyViolations(tree: ReadonlyMap<string, string>, module: string)
 
 const DML_OR_DDL = /\b(?:insert\s+into|delete\s+from|update\s+[a-z_."]+\s+set|merge\s+into|truncate|alter\s+table|drop\s+table|create\s+(?:table|index|unique)|savepoint|begin\b|commit\b|rollback\b)/i;
 
+/** The only settings the packet may change, and only for the current transaction (§7.3). */
+const TIMEOUT_SETTINGS: readonly string[] = ["statement_timeout", "lock_timeout"];
+
+/**
+ * The top-level arguments of a call whose opening parenthesis ends just before `from`, as source
+ * text, or null when the call is not closed inside this string. Quotes and nested parentheses are
+ * respected, so `coalesce($1, '0')` is one argument.
+ */
+function callArguments(text: string, from: number): string[] | null {
+  const args: string[] = [];
+  let depth = 0;
+  let quoted = false;
+  let current = "";
+  for (let position = from; position < text.length; position++) {
+    const char = text[position];
+    if (quoted) {
+      current += char;
+      if (char === "'") quoted = false;
+    } else if (char === "'") {
+      quoted = true;
+      current += char;
+    } else if (char === "(") {
+      depth++;
+      current += char;
+    } else if (char === ")") {
+      if (depth === 0) return [...args, current];
+      depth--;
+      current += char;
+    } else if (char === "," && depth === 0) {
+      args.push(current);
+      current = "";
+    } else {
+      current += char;
+    }
+  }
+  return null;
+}
+
+/**
+ * What one string of SQL does that the packet may not, beyond DML and DDL: change a setting for the
+ * SESSION (or any setting but its two timeouts), take a table lock, or run a procedural block. The
+ * transaction-local timeout forms — `set_config('statement_timeout' | 'lock_timeout', …, true)` and
+ * `SET LOCAL` of those two — are the only setting changes allowed. A `set_config` whose arguments
+ * cannot be read in full from the string is refused: what cannot be shown local is not assumed so.
+ */
+function sqlEffectViolations(text: string): string[] {
+  const found: string[] = [];
+  const call = /set_config\s*\(/gi;
+  for (let match = call.exec(text); match !== null; match = call.exec(text)) {
+    const args = callArguments(text, match.index + match[0].length);
+    if (args === null) {
+      found.push("unverifiable set_config");
+      continue;
+    }
+    const setting = /^'([a-z_.]+)'$/i.exec((args[0] ?? "").trim())?.[1]?.toLowerCase();
+    if (args.length !== 3 || setting === undefined || !TIMEOUT_SETTINGS.includes(setting)) found.push("set_config of another setting");
+    else if (args[2].trim().toLowerCase() !== "true") found.push("session-level set_config");
+  }
+  for (const statement of text.split(";")) {
+    const head = statement.trimStart().toLowerCase();
+    if (/^set\s/.test(head)) {
+      if (/^set\s+local\s/.test(head)) {
+        if (!/^set\s+local\s+(?:statement_timeout|lock_timeout)\b/.test(head)) found.push("SET LOCAL of another setting");
+      } else {
+        found.push("session-level SET");
+      }
+    }
+    if (/^reset\s/.test(head)) found.push("RESET");
+    if (/^lock\s/.test(head)) found.push("LOCK");
+    if (/^do(?:\s|\$)/.test(head)) found.push("DO block");
+  }
+  return found;
+}
+
+/**
+ * True when the module's own top level carries the side-effect import `import "server-only"`. A
+ * dynamic import, a `require`, a type import or a comment is not that statement: the marker has to be
+ * the plain static import a client bundle fails on.
+ */
+function importsServerOnly(file: string, source: string): boolean {
+  const syntax = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, false);
+  return syntax.statements.some((statement) =>
+    ts.isImportDeclaration(statement) && statement.importClause === undefined &&
+    ts.isStringLiteral(statement.moduleSpecifier) && statement.moduleSpecifier.text === "server-only");
+}
+
 /** Identifiers that open a transaction, reach a pool, call out, or abandon a running statement. */
 const FORBIDDEN_IDENTIFIERS: readonly string[] = [
   "fetch", "getPool", "runSql", "adminClient", "runContextTransaction", "transactionCapability",
@@ -244,6 +330,7 @@ function effectViolations(file: string, source: string): string[] {
         ts.isTemplateMiddle(node) || ts.isTemplateTail(node)) {
       const match = DML_OR_DDL.exec(node.text);
       if (match) violations.add(`${file}: SQL "${match[0].toLowerCase().replace(/\s+/g, " ")}"`);
+      for (const effect of sqlEffectViolations(node.text)) violations.add(`${file}: SQL ${effect}`);
       // A surface named by a string — `session["db"]`, `Reflect.get(session, "rpc")`, a key held in a
       // variable — is the same access. A string in a TYPE position (`Pick<…, "db">`) reads nothing.
       if (SESSION_SURFACES.includes(node.text) && !ts.isLiteralTypeNode(node.parent)) violations.add(`${file}: "${node.text}" as a key`);
@@ -586,6 +673,98 @@ describe("the known-root requeue packet stays inside its boundary", () => {
       ["const controller = new AbortController();", `${REQUEUE}: AbortController`],
     ];
     for (const [source, violation] of refused) expect(of(source), source).toContain(violation);
+  });
+
+  // RED at the source-reviewed checkpoint: neither module carries the import yet. Both read a
+  // decrypted token's fingerprint or hold a transaction session; neither may reach a client bundle.
+  it("marks both modules server-only with an explicit top-level import", () => {
+    const tree = readTree();
+    for (const packetModule of PACKET_MODULES) {
+      expect(importsServerOnly(packetModule, tree.get(packetModule) ?? ""), `${packetModule} imports "server-only"`).toBe(true);
+    }
+  });
+
+  it("accepts only the plain static side-effect import as the server-only marker (negative control)", () => {
+    const marked = (source: string): boolean => importsServerOnly(PAGE, source);
+    expect(marked(`import "server-only";\nimport type { TransactionSession } from "@/lib/db/types";`)).toBe(true);
+    expect(marked(`import type { TransactionSession } from "@/lib/db/types";\nimport 'server-only';\nexport const x = 1;`)).toBe(true);
+    const unmarked: string[] = [
+      ``,
+      `import type { TransactionSession } from "@/lib/db/types";\nexport const x = 1;`,
+      `// import "server-only";\nexport const x = 1;`,
+      `/* import "server-only"; */\nexport const x = 1;`,
+      `const marker = 'import "server-only";';`,
+      `await import("server-only");`,
+      `require("server-only");`,
+      `import serverOnly from "server-only";`,
+      `import * as marker from "server-only";`,
+      `import type {} from "server-only";`,
+      `import "server-only-ish";`,
+      `import "client-only";`,
+      `function load(): void { import("server-only"); }`,
+      `export * from "server-only";`,
+    ];
+    for (const source of unmarked) expect(marked(source), source).toBe(false);
+    // The marker is an allowed package of both modules: requiring it cannot trip the dependency check.
+    expect(ALLOWED_PACKAGES).toContain("server-only");
+    expect(dependencyViolations(new Map([[PAGE, `import "server-only";`]]), PAGE)).toEqual([]);
+  });
+
+  it("refuses a session-level setting, any setting but the two timeouts, a table lock and a procedural block in module SQL (negative control)", () => {
+    const of = (source: string): string[] => effectViolations(REQUEUE, source);
+    const sql = (text: string): string => `const statement = ${JSON.stringify(text)};`;
+
+    // What the packet is allowed: both timeouts, for the current transaction only, in either
+    // spelling; row locks; and the existing enqueue helper as its one writer.
+    expect(of([
+      "const APPLY = `select set_config('statement_timeout', $1, true), set_config('lock_timeout', $2, true)`;",
+      "const NESTED = `select set_config('lock_timeout', coalesce($1, '250'), true)`;",
+      "const LOCAL = `set local statement_timeout = 500`;",
+      "const LOCAL_LOCK = `SET LOCAL lock_timeout TO '250ms'`;",
+      "const ROW_LOCK = `select id from items where team_id = $1 and id = $2 for update`;",
+      "const READ = `select name, setting from pg_settings where name in ('statement_timeout', 'lock_timeout')`;",
+      "const WORDS = ['lock_timeout', 'deadlock', 'statement_timeout', 'not_due'];",
+      "await decorated.executeSql(APPLY, [String(statementMs), String(lockMs)]);",
+      "const enqueued = await enqueueSlackThread(decorated, { teamId, workspaceId, channelId, rootTs }, { dueAt });",
+    ].join("\n"))).toEqual([]);
+
+    const refused: [string, string][] = [
+      // A setting that outlives the transaction stays on a POOLED connection for whoever is next.
+      ["select set_config('statement_timeout', $1, false)", "session-level set_config"],
+      ["select set_config('lock_timeout', '250', FALSE)", "session-level set_config"],
+      ["select set_config('statement_timeout', $1, true), set_config('lock_timeout', $2, false)", "session-level set_config"],
+      ["select set_config('statement_timeout', $1, $3)", "session-level set_config"],
+      ["select set_config('statement_timeout', $1)", "set_config of another setting"],
+      ["select set_config('search_path', $1, true)", "set_config of another setting"],
+      ["select set_config('role', 'postgres', true)", "set_config of another setting"],
+      ["select set_config($1, $2, true)", "set_config of another setting"],
+      ["select set_config('statement_timeout', $1, true", "unverifiable set_config"],
+      ["set statement_timeout = 0", "session-level SET"],
+      ["SET lock_timeout TO '5s'", "session-level SET"],
+      ["set session statement_timeout = 0", "session-level SET"],
+      ["  \n  set search_path to public", "session-level SET"],
+      ["select 1; set statement_timeout = 0", "session-level SET"],
+      ["set transaction isolation level serializable", "session-level SET"],
+      ["set local search_path to public", "SET LOCAL of another setting"],
+      ["set local role postgres", "SET LOCAL of another setting"],
+      ["reset statement_timeout", "RESET"],
+      // A table lock is neither a row lock nor one of the authority locks the specification names.
+      ["lock table slack_sync_threads in access exclusive mode", "LOCK"],
+      ["LOCK TABLE items IN SHARE MODE", "LOCK"],
+      ["select 1; lock slack_messages", "LOCK"],
+      // A procedural block hides whatever it does from every check above.
+      ["do $$ begin perform pg_sleep(1); end $$", "DO block"],
+      ["DO $body$ declare n int; begin n := 1; end $body$", "DO block"],
+      ["select 1;\n do language plpgsql $$ begin null; end $$", "DO block"],
+    ];
+    for (const [text, effect] of refused) expect(of(sql(text)), text).toContain(`${REQUEUE}: SQL ${effect}`);
+    // The same statements split across a template's pieces are still read piece by piece.
+    expect(of("const statement = `select set_config('statement_timeout', ${value}, false)`;"))
+      .toContain(`${REQUEUE}: SQL unverifiable set_config`);
+    expect(of("const statement = `${prefix}; lock table items`;")).toContain(`${REQUEUE}: SQL LOCK`);
+    // Not SQL effects: an upsert's `do nothing`, a timeout NAME, and words that merely contain one.
+    expect(of(sql("insert into t (a) values ($1) on conflict do nothing"))).toEqual([`${REQUEUE}: SQL "insert into"`]);
+    expect(of(sql("select 'set statement_timeout' as words, lock_timeout from pg_settings"))).toEqual([]);
   });
 
   it("refuses every way past executeSql — the builder, rpc, the savepoint helper and a transaction — by property, key or destructuring (negative control)", () => {

@@ -384,3 +384,145 @@ describe("a published old root that newest history no longer returns (real Postg
     expect((await stored(f.seed.teamId)).queue).toEqual(after.queue);
   });
 });
+
+/**
+ * Source review of the implemented primitive: two findings only a real database can show.
+ *
+ * Both start from a root that is published, enumerated and otherwise fully preparable, and then
+ * change ONE stored fact through fixture DML — a state no application writer produces, which is
+ * exactly why preparation has to read it defensively. The entry handed to the preparer is always the
+ * one enumeration returned BEFORE the change; nothing else is supplied.
+ */
+describe("a published root whose stored facts were corrupted after enumeration (real Postgres)", () => {
+  async function locatedEntryOf(f: Published): Promise<SlackKnownRootEntry> {
+    const page = await enumerate(f.seed.teamId);
+    const entry = page.entries.find((candidate) => candidate.itemId === f.itemId && "locator" in candidate);
+    if (!entry) throw new Error("fixture: enumeration did not locate the published root");
+    return entry;
+  }
+
+  const prepare = (f: Published, entry: SlackKnownRootEntry): Promise<SlackKnownRootPreparationResult> =>
+    tx((s) => prepareSlackKnownRootRequeue(s, { teamId: f.seed.teamId, entry }, createSlackKnownRootExecution({ ambientDeadlineAt: null })));
+
+  async function storedFrontmatter(itemId: string): Promise<Record<string, unknown>> {
+    const [row] = await query<{ frontmatter: Record<string, unknown> }>(`select frontmatter from items where id = $1`, [itemId]);
+    return row.frontmatter;
+  }
+
+  // EXPECTED RED at the source-reviewed checkpoint: every corrupted value below is currently
+  // reported as `canonical_mismatch`. A stored value of the wrong JSON type, or one past the
+  // primitive's byte bound, is not a DIFFERENT identity — it is no identity at all, and §6 names
+  // that `invalid_metadata`. The distinction matters to whoever reads the counts: a mismatch says
+  // "this item belongs to another thread", invalid metadata says "this item's stored metadata is
+  // unusable", and the two call for different repairs.
+  it("reports a locked item whose stored locator metadata is of the wrong type or past its byte bound as invalid_metadata, not as a mismatch", async () => {
+    const f = await publishOldRoot();
+    await ageObservation(f.seed.teamId);
+    const entry = await locatedEntryOf(f);
+    const original = await storedFrontmatter(f.itemId);
+    for (const key of ["workspace_id", "channel_id", "ts", "thread_ts"]) expect(typeof original[key], `fixture: stored ${key} is a string`).toBe("string");
+
+    const corruptions: [string, string, unknown][] = [
+      ["a numeric workspace_id", "workspace_id", 12345],
+      ["an object workspace_id", "workspace_id", { id: WORKSPACE }],
+      ["a workspace_id of 257 bytes", "workspace_id", "T".repeat(257)],
+      ["an array channel_id", "channel_id", [CHANNEL]],
+      ["a boolean channel_id", "channel_id", false],
+      ["a channel_id of 257 bytes", "channel_id", "C".repeat(257)],
+      ["a numeric ts", "ts", 1718900000.0001],
+      ["a ts of 257 bytes", "ts", "1".repeat(257)],
+      ["a null thread_ts", "thread_ts", null],
+      ["an array thread_ts", "thread_ts", [OLD_ROOT]],
+      ["a thread_ts of 257 bytes", "thread_ts", "1".repeat(257)],
+    ];
+    for (const [label, key, value] of corruptions) {
+      const changed = await (await rawSql()).query(
+        `update items set frontmatter = jsonb_set(frontmatter, array[$2::text], $3::jsonb, true) where id = $1`,
+        [f.itemId, key, JSON.stringify(value)]
+      );
+      expect(changed.rowCount, `fixture: ${label} was stored`).toBe(1);
+      expect((await storedFrontmatter(f.itemId))[key], `fixture: ${label} reads back`).toEqual(value);
+
+      const result = await prepare(f, entry);
+      expect.soft(result, label).toEqual({ outcome: "unattested", reason: "invalid_metadata" });
+      // Whatever it is called, it is never work: nothing was enqueued for the root.
+      expect((await stored(f.seed.teamId)).queue, `${label}: nothing was enqueued`).toEqual([]);
+
+      await (await rawSql()).query(`update items set frontmatter = $2::jsonb where id = $1`, [f.itemId, JSON.stringify(original)]);
+      expect(await storedFrontmatter(f.itemId), "fixture: the stored frontmatter was put back").toEqual(original);
+    }
+
+    // CONTROLS (expected green). A well-typed, in-bound value that simply DIFFERS is a mismatch —
+    // here the workspace changed only by case, which no path comparison could tell apart…
+    await (await rawSql()).query(
+      `update items set frontmatter = jsonb_set(frontmatter, '{workspace_id}', $2::jsonb) where id = $1`,
+      [f.itemId, JSON.stringify(WORKSPACE.toLowerCase())]
+    );
+    expect(await prepare(f, entry)).toEqual({ outcome: "unattested", reason: "canonical_mismatch" });
+    expect((await stored(f.seed.teamId)).queue).toEqual([]);
+    // …and with the original metadata back, the very same entry prepares. Nothing above was refused
+    // for a reason other than the one value that was changed.
+    await (await rawSql()).query(`update items set frontmatter = $2::jsonb where id = $1`, [f.itemId, JSON.stringify(original)]);
+    expect(await prepare(f, entry)).toEqual({ outcome: "enqueued" });
+    expect((await stored(f.seed.teamId)).queue).toHaveLength(1);
+  });
+
+  // EXPECTED RED at the source-reviewed checkpoint: the due instant is the stored observation plus
+  // the revisit interval, so an observation in the year 1, or before the common era, is "due" by
+  // two thousand years — and the row is enqueued with that instant as its due_at. The queue is
+  // claimed in due order, so one corrupt observation would sort ahead of every real root. A stored
+  // observation that cannot be a real one must fail closed: no row, and no date from before the
+  // epoch anywhere in the queue.
+  it.each([
+    ["in the year 0001", "0001-01-01 00:00:00+00"],
+    // No offset on this one: the fixture connection's time zone is UTC, and the era suffix is last.
+    ["before the common era", "0044-03-15 12:00:00 BC"],
+  ])("fails closed on a root witness observed %s: nothing is enqueued and no ancient due date enters the queue", async (_label, observedAt) => {
+    const f = await publishOldRoot();
+    const entry = await locatedEntryOf(f);
+    const changed = await (await rawSql()).query(
+      `update slack_messages set observed_at = $2::timestamptz where team_id = $1 and is_root and message_ts = $3`,
+      [f.seed.teamId, observedAt, OLD_ROOT]
+    );
+    expect(changed.rowCount, "fixture: the root witness's observation was replaced").toBe(1);
+    // The stored value is FINITE and schema-valid: nothing but its implausibility distinguishes it.
+    const [witness] = await query<{ finite: boolean; ancient: boolean; live: boolean }>(
+      `select isfinite(observed_at) as finite, observed_at < timestamptz '1000-01-01 00:00:00+00' as ancient,
+              deleted_at is null as live
+         from slack_messages where team_id = $1 and is_root and message_ts = $2`, [f.seed.teamId, OLD_ROOT]
+    );
+    expect(witness).toEqual({ finite: true, ancient: true, live: true });
+
+    let result: SlackKnownRootPreparationResult | null = null;
+    let failure: unknown;
+    try {
+      result = await prepare(f, entry);
+    } catch (error) {
+      failure = error;
+    }
+
+    // No pending row for the root, and no due date from before the epoch for anything in the team.
+    const after = await stored(f.seed.teamId);
+    expect(after.queue, "nothing was enqueued for the root").toEqual([]);
+    const [ancient] = await query<{ n: number }>(
+      `select count(*)::int as n from slack_sync_threads where team_id = $1 and due_at < timestamptz '1970-01-01 00:00:00+00'`,
+      [f.seed.teamId]
+    );
+    expect(ancient.n, "no queue row carries an ancient due date").toBe(0);
+
+    if (result !== null) {
+      // A closed refusal — never the insertion, never "work already exists", and never "not yet due":
+      // by its own arithmetic this observation is due, so calling it not-due would be a guess.
+      expect(["unattested", "refused"], "a closed refusal").toContain(result.outcome);
+      expect(Object.keys(result).sort()).toEqual(["outcome", "reason"]);
+    } else {
+      // Or a thrown failure, static: it rolls the caller back and quotes nothing that was stored.
+      expect(failure).toBeInstanceOf(Error);
+      const text = `${(failure as Error).name}\n${(failure as Error).message}`;
+      for (const leaked of ["0001-01-01", "0044", " BC", OLD_ROOT, WORKSPACE, CHANNEL, f.itemId]) expect(text).not.toContain(leaked);
+    }
+    // The ledger and the item are untouched, and the observation is still exactly what was stored.
+    expect(after.ledger.map((row) => row.message_ts)).toEqual([OLD_ROOT, OLD_REPLY]);
+    expect((await query(`select 1 from items where id = $1`, [f.itemId]))).toHaveLength(1);
+  });
+});
