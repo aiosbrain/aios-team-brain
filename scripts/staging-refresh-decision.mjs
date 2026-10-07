@@ -84,6 +84,7 @@ export const EXCLUDED_TABLE_DATA = Object.freeze([
   "gdrive_run_requests",
   "gdrive_item_claim_projects",
   "gdrive_item_claims",
+  "gdrive_snapshot_members",
   "graph_episodes",
   "integrations",
   "member_secrets",

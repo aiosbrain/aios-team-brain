@@ -30,6 +30,7 @@ import { rowVisibleByProvenanceCtx } from "@/lib/access/provenance";
 import { isCalendarEvent } from "@/lib/meetings/from-calendar";
 import { buildIdentityMap } from "@/lib/identity/resolve";
 import { googleDriveContributionEvidence } from "./gdrive-contributions";
+import { gdriveObservationIdentity } from "@/lib/ingest/gdrive-ledger";
 
 // Only ACTIVE tasks are considered work "in progress". Since brain-api v1.21 (AIO-950) a Linear
 // "In Review" state normalizes to its own `in_review` rather than collapsing into `in_progress`;
@@ -460,6 +461,7 @@ export async function getWorkTimeline(
     display_name: string | null;
     role: string;
     source_at: string;
+    updated_at: string;
     member_id: string | null;
     member_id_locked: boolean;
     frontmatter: Record<string, unknown> | null;
@@ -488,7 +490,7 @@ export async function getWorkTimeline(
     }
     const page = await runSql<GdriveLedgerRow>(
       `select e.item_id,e.evidence_key,e.external_id,e.email::text,e.display_name,e.role,
-              e.source_at::text,i.member_id,i.member_id_locked,i.frontmatter,i.path
+              e.source_at::text,e.updated_at::text,i.member_id,i.member_id_locked,i.frontmatter,i.path
          from gdrive_contribution_evidence e
          join items i on i.team_id=e.team_id and i.id=e.item_id
         where ${conditions.join(" and ")}
@@ -503,6 +505,22 @@ export async function getWorkTimeline(
     const last = page.rows.at(-1)!;
     driveCursor = { at: last.source_at, itemId: last.item_id, key: last.evidence_key };
   }
+  // One row per observation. The ledger converges on that itself — a stable provider id, role and
+  // instant are one row from the item's next write on — but until that write a row from before an
+  // e-mail or timestamp-spelling change can still be there. The most recently written row speaks
+  // for the observation: the older one must neither double the credit nor resolve it through an
+  // e-mail the person no longer has. Decided before anything is resolved, across every page.
+  const gdriveObservations = new Map<string, GdriveLedgerRow>();
+  for (const row of gdriveRows) {
+    const { stableId, person, role, at } = gdriveObservationIdentity({
+      external_id: row.external_id, role: row.role, at: row.source_at,
+    });
+    const key = stableId
+      ? `${row.item_id}\0${person}\0${role}\0${at}`
+      : `${row.item_id}\0${row.evidence_key}`;
+    const seen = gdriveObservations.get(key);
+    if (!seen || Date.parse(row.updated_at) > Date.parse(seen.updated_at)) gdriveObservations.set(key, row);
+  }
 
   // In-window evidence items (commits + docs) with the text an issue key would appear in. A git
   // commit's key is in its BODY; other items' in the title/path (no large-body fetch — see the
@@ -510,7 +528,7 @@ export async function getWorkTimeline(
   // `sha` is set for git commits only — the join key to the PR that merged them (work_events.merged_sha).
   type Ev = EvidenceItem & { memberId: string; text: string; sha?: string };
   const evItems: Ev[] = [];
-  for (const row of gdriveRows) {
+  for (const row of gdriveObservations.values()) {
     const fm = row.frontmatter ?? {};
     const title = str(fm.title) || (row.path ? basename(row.path) : "") || "Google document";
     const contributions = [{

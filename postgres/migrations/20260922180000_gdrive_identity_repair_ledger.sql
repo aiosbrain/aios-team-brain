@@ -107,6 +107,13 @@ select i.team_id, i.id,
   ) c
  where i.frontmatter->>'source'='gdrive'
    and nullif(lower(btrim(c->>'role')),'') is not null
+   -- First adoption only. An item the ledger already holds is written by the ingest owner, which
+   -- keys a stable provider identity by id, role and instant; replaying this legacy key over it
+   -- would add a second row for the same observation on every rollout.
+   and not exists (
+     select 1 from gdrive_contribution_evidence e
+      where e.team_id=i.team_id and e.item_id=i.id
+   )
 on conflict (team_id,item_id,evidence_key) do nothing;
 
 insert into identity_repair_obligations(team_id,provider,external_id,mapping_revision)

@@ -1067,7 +1067,14 @@ provider lock and prove the destination collision-free rather than overwriting i
 authorized snapshots and positive Drive tombstones reconcile through
 `POST /api/v1/items/source-reconcile`, which calls the shared `lib/ingest` purge owner so item history,
 search derivatives and graph retirement follow the existing lifecycle. Incomplete/denied listings
-never establish absence. Revision observations are retained as a contribution ledger; exact `gdrive`
+never establish absence. One request carries at most 10,000 provider ids; a larger complete selection
+is staged by its fenced execution in `gdrive_snapshot_members`, page by page under one `snapshot_id`,
+and applied by the page marked complete — in one transaction that requires the staged membership to
+equal the declared `total`, retires absence against it, and removes the staged rows. A page short of
+that, a lost page, or pages left by another snapshot or execution establish nothing. Revision
+observations are retained as a contribution ledger, one row per observation: a stable provider id,
+role and UTC instant identify it in both the frontmatter ledger and `gdrive_contribution_evidence`, so
+a replay that changes only the e-mail or the timestamp spelling updates that row; exact `gdrive`
 permission identities (or exact verified email fallback) produce source-time UTC person/day Timeline
 evidence with the provider role rendered visibly. OAuth account subjects use the separate
 `subject:<sub>` namespace and are never treated as Drive permission IDs; author addresses retained
@@ -2293,7 +2300,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `POST /api/internal/executor-gateway/v1/admin/:teamSlug/service-identities/:serviceIdentityId/credentials` — add a client-generated overlapping credential without returning its secret
 - `POST /api/internal/executor-gateway/v1/admin/:teamSlug/service-identities/:serviceIdentityId/credentials/:credentialId/revoke` — advisory-lock-linearized credential revocation
 - `POST /api/v1/items` — upsert synced content; its ingest owner transaction locks candidate path/provider identities and requires the current Drive execution when incoming provenance OR the persisted item/mapping is Drive-owned, so omission/relabel and first-create races cannot bypass the fence
-- `POST /api/v1/items/source-reconcile` — authenticated gdrive tombstone/complete-snapshot reconciliation through the shared ingest purge owner; incomplete snapshots never delete
+- `POST /api/v1/items/source-reconcile` — authenticated gdrive tombstone/complete-snapshot reconciliation through the shared ingest purge owner; incomplete snapshots never delete; a snapshot above 10,000 ids is staged in pages and finalized atomically
 - `GET /api/v1/items` — tier-filtered, keyset-paginated pull
 - `GET /api/v1/items/:id` — single item fetch
 - `GET /api/v1/tasks` — dashboard task changes for `aios pull` writeback; `?all=1` selects the tier-filtered full tasks-table read (bounded at 500 rows, `updated_at` ASC, no cursor — a full page is the STALEST prefix, so it can confirm a key but can never prove one absent); `?mode=table&keys=A,B` (brain-api 1.14) is the by-key lookup that can — bounded by the keys asked for, answering `unknown_keys` outright (`null` = couldn't determine, never a wrong list). Refused outside table mode, since the other modes filter rows and a real key would look missing
@@ -2316,7 +2323,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/auth/gdrive/start` — team-admin-authenticated Google Drive OAuth start; signed single-use team/member-bound state and explicit per-file vs folder-discovery scopes
 - `GET /api/auth/gdrive/callback` — consume bound state, exchange and verify the Google account, then atomically publish account config + encrypted refresh credential; an old refresh token is reusable only for the same verified subject/client pair
 - `POST /api/v1/integrations/gdrive/execution` — dedicated connector-principal acquire/checkpoint/release for the current immutable integration generation + lease fence and authoritative progress revision; acquire never self-binds, and every commit transaction rereads the bound key/member/posture plus connection/fence. Selection/account/credential changes advance the content generation and reset its cursor obligations; status-only pause/resume instead advances the fence, clears the lease, and retains generation/progress so resumption cannot skip acknowledged work or request a fresh start token
-- `POST /api/v1/integrations/gdrive/token` — fenced no-store OAuth access-token broker; refresh/client secrets remain server-side, and bound-principal revocation is reread after provider refresh before issuance
+- `POST /api/v1/integrations/gdrive/token` — fenced no-store OAuth access-token broker; refresh/client secrets remain server-side, and bound-principal revocation is reread after provider refresh before issuance, in the one row-locked transaction that also records the issuance — a pause, disconnect, rebind or key revocation cannot commit between that check and the token's release
 - `GET /api/v1/integrations/gdrive/runs` — connection-bound connector claim for durable Admin Run-now/retry requests
 - `POST /api/v1/integrations/gdrive/runs` — connection-bound completion for a claimed Drive run; appends the ordinary `ingest_runs` summary
 - `POST /api/v1/evidence/search` — bounded native FTS passages with recorded contributors; live member/delegated visibility, no answer generation
@@ -2393,7 +2400,7 @@ leak. See `docs/specs/meeting-participation-as-work-v1.md`. A person's evidence 
 `projects` · `items` · `item_versions` · `tasks` · `decisions` · `extracted_facts` · `stakeholder_mentions` · `graph_entities` ·
 `graph_relationships` · `query_log` · `policies` · `approval_requests` · `actions` · `governed_action_identities` · `governed_actions` ·
 `codebases` · `code_metrics` · `codebase_findings` · `codebase_finding_events` · `code_contributions` · `github_issues` · `member_emails` ·
-`member_identities` · `member_identity_mapping_state` · `identity_repair_obligations` · `team_identity_authority` · `gdrive_contribution_evidence` · `member_secrets` · `member_profiles` · `member_time_off` · `member_goals` · `member_provisioning` · `integrations` · `gdrive_connection_authority` · `gdrive_run_requests` · `gdrive_item_claims` · `gdrive_item_claim_projects` · `gdrive_cleanup_obligations` · `team_authorization_epochs` ·
+`member_identities` · `member_identity_mapping_state` · `identity_repair_obligations` · `team_identity_authority` · `gdrive_contribution_evidence` · `member_secrets` · `member_profiles` · `member_time_off` · `member_goals` · `member_provisioning` · `integrations` · `gdrive_connection_authority` · `gdrive_run_requests` · `gdrive_item_claims` · `gdrive_item_claim_projects` · `gdrive_cleanup_obligations` · `gdrive_snapshot_members` · `team_authorization_epochs` ·
 `agentic_maturity_snapshots` · `migration_markers` · `task_pm_links` · `task_evidence` · `work_events` · `usage_costs` · `llm_usage` · `llm_failures` · `subscriptions` · `graph_episodes` · `graph_project_arming` · `arc_cache` · `arc_corrections` · `arc_correction_source_dependencies` · `arc_correction_revisions` · `arc_correction_revision_dependencies` · `arc_correction_revision_parents` · `team_arc_correction_versions` · `work_timeline_cache` · `doc_task_inference` ·
 `conversations` · `chat_messages` · `chat_turn_runs` · `ingest_runs` · `social_jobs` · `brand_profiles` · `brand_assets` · `social_opportunities` · `content_plans` · `content_variants` · `media_assets` · `social_image_usage` · `social_settings` · `content_approvals` · `social_publications` · `publication_analytics` ·
 `meeting_notes` · `meeting_note_attendees` · `meeting_note_submitters` ·

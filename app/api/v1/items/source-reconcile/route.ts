@@ -7,6 +7,8 @@ import { errorResponse } from "@/lib/api/schemas";
 import { rateLimit } from "@/lib/api/rate-limit";
 import {
   drainGdriveCleanupObligations,
+  GDRIVE_SNAPSHOT_PAGE_LIMIT,
+  GdriveSnapshotError,
   stageGdriveReconciliation,
 } from "@/lib/ingest/source-reconcile";
 import { GdriveAuthorityError, withGdriveExecutionCommit } from "@/lib/integrations/gdrive-authority";
@@ -22,8 +24,15 @@ const requestSchema = z.object({
   removed_provider_ids: z.array(z.string().trim().min(1).max(500)).max(1_000).default([]),
   snapshot: z.object({
     complete: z.boolean(),
-    provider_ids: z.array(z.string().trim().min(1).max(500)).max(10_000),
-  }).optional(),
+    provider_ids: z.array(z.string().trim().min(1).max(500)).max(GDRIVE_SNAPSHOT_PAGE_LIMIT),
+    // A selection larger than one request: every page names the same snapshot and is only held;
+    // the page marked complete states the whole snapshot's size and finalizes it atomically.
+    snapshot_id: z.string().uuid().optional(),
+    total: z.number().int().nonnegative().optional(),
+  }).refine(
+    (snapshot) => (snapshot.snapshot_id !== undefined && snapshot.complete) === (snapshot.total !== undefined),
+    { message: "snapshot.total is stated on, and only on, the completing page of a staged snapshot" },
+  ).optional(),
   reason: z.string().trim().min(1).max(500),
 }).strict();
 
@@ -57,7 +66,19 @@ export async function POST(req: NextRequest) {
         connectionId: parsed.data.integration_id,
         removedProviderIds: parsed.data.removed_provider_ids,
         snapshot: parsed.data.snapshot
-          ? { complete: parsed.data.snapshot.complete, providerIds: parsed.data.snapshot.provider_ids }
+          ? {
+              complete: parsed.data.snapshot.complete,
+              providerIds: parsed.data.snapshot.provider_ids,
+              // Staged under the execution this request was just fenced as.
+              staged: parsed.data.snapshot.snapshot_id
+                ? {
+                    snapshotId: parsed.data.snapshot.snapshot_id,
+                    generation: parsed.data.generation,
+                    fence: parsed.data.fence,
+                    total: parsed.data.snapshot.total,
+                  }
+                : undefined,
+            }
           : undefined,
         reason: parsed.data.reason,
       },
@@ -68,7 +89,7 @@ export async function POST(req: NextRequest) {
     const cleaned = await drainGdriveCleanupObligations(db, auth.teamId);
     return Response.json({ ...staged, ...cleaned });
   } catch (error) {
-    if (error instanceof GdriveAuthorityError) {
+    if (error instanceof GdriveAuthorityError || error instanceof GdriveSnapshotError) {
       return errorResponse(error.code, error.message, error.status);
     }
     return errorResponse("internal", error instanceof Error ? error.message : "reconciliation failed", 500);

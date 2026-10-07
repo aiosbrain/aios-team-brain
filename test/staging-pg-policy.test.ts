@@ -35,7 +35,7 @@ describe("paired Postgres sanitation policy", () => {
   // if the tables are really absent from the dump.
   const DRIVE_CONNECTION_TABLES = [
     "gdrive_cleanup_obligations", "gdrive_connection_authority", "gdrive_item_claim_projects",
-    "gdrive_item_claims", "gdrive_run_requests",
+    "gdrive_item_claims", "gdrive_run_requests", "gdrive_snapshot_members",
   ];
 
   it("excludes Drive connection state bound to excluded API keys from the actual dump arguments", () => {
