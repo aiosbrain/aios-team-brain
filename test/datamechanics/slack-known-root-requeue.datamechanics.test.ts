@@ -4177,8 +4177,8 @@ describe("KR-06 existing queue state preservation", () => {
   const FIRST_DUE_UTC = "2024-03-05 06:07:08.901000+00";
   const RETRY_DUE = new Date("2024-04-05T06:07:08.902Z");
   const RETRY_DUE_UTC = "2024-04-05 06:07:08.902000+00";
-  const BACKED_OFF_DUE = new Date("2031-02-03T04:05:06.789Z");
-  const BACKED_OFF_DUE_UTC = "2031-02-03 04:05:06.789000+00";
+  const BACKED_OFF_DUE = new Date("2099-02-03T04:05:06.789Z");
+  const BACKED_OFF_DUE_UTC = "2099-02-03 04:05:06.789000+00";
   const RUNNING_CURSOR = "kr06-running-page-3";
   const PARTIAL_CURSOR = "kr06-partial-page-2";
 
@@ -4457,4 +4457,467 @@ describe("KR-06 existing queue state preservation", () => {
     },
     staging: [{ snapshot_generation: "1", complete: true, messages: 2, has_bytes: true, live: true }],
   }));
+});
+
+// ── Lifecycle packet: what the two suites below share ────────────────────────────────────────────
+// New, file-local helpers for "KR-07 unchanged republication refresh" and "KR-08 rollback and
+// replay". Nothing above is moved or changed, and no KR-17 hook is involved in either selection.
+
+/** An instant as the DATABASE renders it: UTC, six fractional digits, as text. The expression is parenthesized as a whole. */
+const lifecycleUtc = (expression: string): string => `to_char((${expression}) at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00'`;
+/** The one root witness row of the fixture, as `w`, and no other ledger row. */
+const LIFECYCLE_ROOT_WITNESS = `w.team_id = $1 and w.workspace_id = $2 and w.channel_id = $3 and w.message_ts = $4 and w.root_ts = $4 and w.is_root and w.item_id = $5::uuid`;
+const lifecycleWitnessOf = (f: Published): unknown[] => [f.seed.teamId, WORKSPACE, CHANNEL, OLD_ROOT, f.itemId];
+
+/**
+ * The surfaces a preparation must not touch, by what they are: queue and staging; item (and, through
+ * it, its versions) and ledger; identity; access; generations; channel and source authority; budgets
+ * and runs. Every row of the team, rendered whole by the database. SCOPED KR-13: it covers the
+ * preparations of the two suites below, and is not the whole of KR-13 — the audit log and tables
+ * that are not listed are outside it.
+ */
+const LIFECYCLE_SNAPSHOT_TABLES = [
+  "slack_sync_threads", "slack_thread_snapshots",
+  "items", "slack_messages",
+  "members", "member_identities", "member_identity_suppressions",
+  "projects", "groups", "group_members", "project_groups", "project_context_units", "project_context_memberships",
+  "slack_team_state",
+  "slack_sync_channels", "slack_integration_bindings", "slack_channel_migration_gates", "slack_namespace_readiness_proofs",
+  "integrations", "slack_workspace_observations",
+  "slack_method_budgets", "ingest_runs", "connector_cursors",
+];
+async function lifecycleSnapshot(teamId: string): Promise<Record<string, string>> {
+  const scoped = (await query(
+    `select table_name from information_schema.columns
+      where table_schema = 'public' and column_name = 'team_id' and table_name = any($1::text[])`, [LIFECYCLE_SNAPSHOT_TABLES]
+  )).map((row) => row.table_name as string).sort();
+  expect(scoped, "fixture: every named surface is snapshotted").toEqual([...LIFECYCLE_SNAPSHOT_TABLES].sort());
+  const out: Record<string, string> = {};
+  for (const table of scoped) {
+    const [aggregate] = await query(
+      `select coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text), '[]'::jsonb)::text as rows from "${table}" t where t.team_id = $1`, [teamId]
+    );
+    out[table] = aggregate.rows as string;
+  }
+  const [versions] = await query(
+    `select coalesce(jsonb_agg(to_jsonb(v) order by to_jsonb(v)::text), '[]'::jsonb)::text as rows
+       from item_versions v join items i on i.id = v.item_id where i.team_id = $1`, [teamId]
+  );
+  out.item_versions = versions.rows as string;
+  return out;
+}
+const lifecycleTablesThatDiffer = (from: Record<string, string>, to: Record<string, string>): string[] =>
+  Object.keys(from).filter((table) => from[table] !== to[table]).sort();
+
+/** The backend pid of the connection a session is bound to. */
+const lifecyclePidOf = async (session: TransactionSession): Promise<number> =>
+  Number((await session.executeSql<{ pid: number }>(`select pg_backend_pid() as pid`)).rows[0].pid);
+
+/** A published root whose root witness, and nothing else, was aged; its enumerated entry; and its exact due instant. */
+interface LifecycleAgedRoot {
+  f: Published;
+  teamId: string;
+  entry: SlackKnownRootEntry;
+  /** The root witness's aged observation, as the database renders it. */
+  agedObservedAt: string;
+  /** The aged observation plus the revisit interval, to the microsecond, before any rounding. */
+  exactDue: string;
+}
+/**
+ * The real publication; FIXTURE AGING of the exact root witness row only, by two hours; and the
+ * real enumeration under the given revisit policy on its own completed transaction. The interval is
+ * given twice, WRITTEN OUT both ways: as the policy's milliseconds and as the SQL interval the
+ * fixture adds to the stored observation.
+ */
+async function lifecycleAgedRoot(label: string, revisit: { ms: number; sqlInterval: string }): Promise<LifecycleAgedRoot> {
+  const f = await publishOldRoot();
+  const teamId = f.seed.teamId;
+  const afterPublication = await stored(teamId);
+  expect([afterPublication.allQueue, afterPublication.snapshots], `${label}: fixture: the real publication removed the queue row and the staging`).toEqual([[], 0]);
+
+  // FIXTURE AGING: one statement, on the one root witness row, which must change exactly one row.
+  const aged = await (await rawSql()).query<{ observed_at_utc: string; exact_due_utc: string }>(
+    `update slack_messages w set observed_at = w.observed_at - interval '2 hours'
+      where ${LIFECYCLE_ROOT_WITNESS}
+  returning ${lifecycleUtc("w.observed_at")} as observed_at_utc, ${lifecycleUtc(`w.observed_at + interval '${revisit.sqlInterval}'`)} as exact_due_utc`, lifecycleWitnessOf(f)
+  );
+  expect(aged.rowCount, `${label}: fixture aging: exactly one ledger row, the root witness, was changed`).toBe(1);
+  const agedObservedAt = aged.rows[0].observed_at_utc;
+  const exactDue = aged.rows[0].exact_due_utc;
+  expect(await query(
+    `select ${lifecycleUtc("w.observed_at")} as observed_at_utc, w.deleted_at is null as live,
+            (select count(*)::int from slack_messages m where m.team_id = w.team_id and m.observed_at = w.observed_at) as rows_with_this_observation,
+            $6::timestamptz < clock_timestamp() as exact_due_is_past
+       from slack_messages w where ${LIFECYCLE_ROOT_WITNESS}`, [...lifecycleWitnessOf(f), exactDue]
+  ), `${label}: fixture aging: only the root witness carries the aged observation, live, and its exact due instant is past`).toEqual([
+    { observed_at_utc: agedObservedAt, live: true, rows_with_this_observation: 1, exact_due_is_past: true },
+  ]);
+
+  const channel = await channelRow(teamId, WORKSPACE, CHANNEL);
+  expect(channel?.binding_config_revision, `${label}: fixture: the channel row stores a configuration revision`).toMatch(/^[0-9a-f]{64}$/);
+  // The execution context is created BEFORE the transaction it is used in.
+  const pageExecution = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+  const page = await tx((s) => readSlackKnownRootItemPage(s, { teamId, pageSize: 100, revisitAfterMs: revisit.ms }, pageExecution));
+  expect(page, `${label}: fixture: enumeration returns exactly this root, located, under this suite's revisit policy`).toEqual({
+    entries: [{
+      teamId, itemId: f.itemId, revisitAfterMs: revisit.ms,
+      locator: {
+        workspaceId: WORKSPACE, channelId: CHANNEL, rootTs: OLD_ROOT, integrationId: f.integrationId,
+        bindingConfigRevision: channel?.binding_config_revision, namespaceRevision: f.namespaceRevision,
+      },
+    }],
+    nextCursor: null, exhausted: true, examined: 1,
+  });
+  return { f, teamId, entry: page.entries[0], agedObservedAt, exactDue };
+}
+
+/** Every queue row of the team against an exact due instant: scope, state, and the due rounded UP to its millisecond. */
+const lifecycleQueueAgainst = (teamId: string, exactDue: string): Promise<Row[]> => query(
+  `select t.workspace_id, t.channel_id, t.root_ts, t.status, t.attempts,
+          t.due_at >= $2::timestamptz as not_before_the_exact_due,
+          t.due_at < $2::timestamptz + interval '1 millisecond' as less_than_a_millisecond_after_it,
+          to_char(t.due_at at time zone 'UTC', 'US') like '%000' as on_a_whole_millisecond
+     from slack_sync_threads t where t.team_id = $1 order by t.root_ts`, [teamId, exactDue]
+);
+/** ONE queued, never-attempted row in the root's exact scope, due at the exact due instant rounded up to its millisecond. */
+const LIFECYCLE_ONE_ROW_AT_THE_EXACT_DUE = [{
+  workspace_id: WORKSPACE, channel_id: CHANNEL, root_ts: OLD_ROOT, status: "queued", attempts: 0,
+  not_before_the_exact_due: true, less_than_a_millisecond_after_it: true, on_a_whole_millisecond: true,
+}];
+/** EVERY column of every queue row of the team, as the database renders the whole row. */
+const lifecycleQueueRowsExactly = async (teamId: string): Promise<string[]> =>
+  (await query(`select to_jsonb(t)::text as stored from slack_sync_threads t where t.team_id = $1 order by t.root_ts`, [teamId])).map((row) => row.stored as string);
+/** Every queue row and every staged snapshot in the DATABASE, of any team. */
+const lifecycleQueueAndStagingAnywhere = async (): Promise<{ queue: Row[]; staging: Row[] }> => ({
+  queue: await query(`select team_id::text as team_id, root_ts from slack_sync_threads order by team_id, root_ts`),
+  staging: await query(`select team_id::text as team_id, root_ts from slack_thread_snapshots order by team_id, root_ts`),
+});
+
+/**
+ * KR-07 — an UNCHANGED republication refreshes the root's observation without semantic churn, and so
+ * postpones preparation (`docs/design/slack-known-root-requeue-spec.md` §5.3, §5.5, §11 KR-07).
+ *
+ * EVIDENCE, NOT RED: both cases are expected to pass on the current source. It is PART of KR-07 and
+ * closes no row of the mutation matrix.
+ *
+ * THE MAIN CASE. A root is published by the real publication and its root witness alone is aged, so
+ * that under a roomy one-hour revisit policy its exact due instant is an hour in the past. It is
+ * enumerated, and that entry is kept. The identical complete thread is then staged again through the
+ * existing enqueue, claim, snapshot and checkpoint helpers and published again through the real
+ * `ingestItem`, with the same payload, the same directory and the same binding. Required of that
+ * republication, all read from the database:
+ *
+ *   - its status is `unchanged`, for the same item id, with the same number of versions;
+ *   - the team's data, identity and presentation generations are unchanged;
+ *   - every semantic field of every ledger row, and its `last_seen_generation`, is unchanged;
+ *   - the root's `observed_at` is strictly later than the aged value and lies between two database
+ *     clock readings taken on either side of the republication;
+ *   - its queue row and its staging are gone.
+ *
+ * The preparation is then run from the PREVIOUSLY enumerated entry. It commits `not_due`: the
+ * refreshed observation plus one hour is an hour ahead. It inserts no queue row and changes no
+ * snapshotted surface.
+ *
+ * THE CONTROL. The same aged root, NOT republished, is enqueued at its previously established exact
+ * due instant. So the main case's `not_due` is the refresh's doing.
+ *
+ * TWO KINDS OF CHANGE, KEPT APART. What the fixture and the republication change is asserted by the
+ * specific readbacks above. The scoped snapshot is taken only AFTER the republication, immediately
+ * around the preparation, and must not differ at all.
+ *
+ * No sleep, and no equality with a JavaScript clock: every time comparison is a database inequality.
+ * One thing is not identical between the two publications and is not part of the payload: each call
+ * is made with its own random API-key id, as the publication fixture already does.
+ */
+describe("KR-07 unchanged republication refresh", () => {
+  /** A roomy policy: an hour. The fixture ages the witness by two. */
+  const REVISIT = { ms: 3_600_000, sqlInterval: "1 hour" };
+
+  /** Preparation on a transaction of its own, from the team and the enumerated entry ALONE. The result is the COMMITTED one. */
+  function prepared(teamId: string, entry: SlackKnownRootEntry): Promise<SlackKnownRootPreparationResult> {
+    // The execution context is created BEFORE the transaction it is used in.
+    const execution = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+    return tx((s) => prepareSlackKnownRootRequeue(s, { teamId, entry }, execution));
+  }
+
+  /** The semantic fields of every ledger row of the team — everything but `observed_at` — as the database renders them. */
+  const ledgerSemantics = (teamId: string): Promise<Row[]> => query(
+    `select workspace_id, channel_id, message_ts, root_ts, is_root, item_id::text as item_id, author_external_id,
+            ${lifecycleUtc("occurred_at")} as occurred_at_utc, eligible, exclusion_reason, source_hash,
+            deleted_at is null as live, last_seen_generation::text as last_seen_generation
+       from slack_messages where team_id = $1 order by message_ts`, [teamId]
+  );
+  const generations = (teamId: string): Promise<Row[]> => query(
+    `select data_generation::text as data_generation, identity_generation::text as identity_generation,
+            presentation_generation::text as presentation_generation
+       from slack_team_state where team_id = $1`, [teamId]
+  );
+  const itemAndVersions = (teamId: string): Promise<Row[]> => query(
+    `select i.id::text as id, (select count(*)::int from item_versions v where v.item_id = i.id) as versions
+       from items i where i.team_id = $1 order by i.id`, [teamId]
+  );
+  const databaseClock = async (): Promise<string> =>
+    (await query<{ at: string }>(`select ${lifecycleUtc("clock_timestamp()")} as at`))[0].at;
+
+  /**
+   * The identical complete thread, staged again as a hydrator leaves it — a queue row, its claim, a
+   * complete snapshot, a checkpoint — and published again through the real `ingestItem`. Every value
+   * is the one the first publication used.
+   */
+  async function republishIdentical(f: Published): Promise<unknown> {
+    const teamId = f.seed.teamId;
+    const selection = await tx((s) => lockSlackSelection(s, { teamId, integrationId: f.integrationId, envToken: () => null }));
+    if (selection.outcome !== "current") throw new Error("fixture: the selection is not current");
+    const scope = { teamId, workspaceId: WORKSPACE, channelId: CHANNEL, rootTs: OLD_ROOT };
+    await tx((s) => enqueueSlackThread(s, scope));
+    const acquired = await tx((s) => claimSlackThread(s, scope, { leaseMs: 900_000 }));
+    if (!acquired) throw new Error("fixture: the claim was refused");
+    const staged = await tx(async (s) => {
+      const written = await writeSlackThreadSnapshot(s, acquired, {
+        messages: [ROOT_MESSAGE, REPLY_MESSAGE], complete: true, expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      });
+      if (written !== "written") throw new Error("fixture: the snapshot was refused");
+      return checkpointSlackThread(s, acquired, { pageCursor: null, snapshotGeneration: 1 });
+    });
+    if (staged.outcome !== "checkpointed") throw new Error("fixture: the checkpoint was refused");
+    const claim: SlackThreadClaim = { ...acquired, snapshotGeneration: 1 };
+    const option = slackPublicationOption({
+      claim, binding: slackBindingRef(selection.selection), namespaceRevision: f.namespaceRevision, channelName: "general", users: USERS,
+    });
+    const normalized = normalizeThread({ root: ROOT_MESSAGE, replies: [REPLY_MESSAGE] }, {
+      channelId: CHANNEL, channelName: "general", users: { U1: "Person One" }, project: "slack",
+    });
+    const payload = {
+      ...normalized,
+      path: scopedSlackItemPath(WORKSPACE, CHANNEL, OLD_ROOT),
+      frontmatter: { ...normalized.frontmatter, workspace_id: WORKSPACE, source_ts: parseSlackTimestamp(OLD_ROOT)!.iso },
+    };
+    const auth = { teamId, memberId: f.seed.memberId, apiKeyId: randomUUID() };
+    return ingestItem(db(), auth, payload, "team", { authorMemberId: null }, "team", option);
+  }
+
+  it("enqueues an aged root that was not republished, at its previously established exact due instant (control)", async () => {
+    const label = "aged, not republished (control)";
+    const { f, teamId, entry, agedObservedAt, exactDue } = await lifecycleAgedRoot(label, REVISIT);
+
+    const before = await lifecycleSnapshot(teamId);
+    const result = await prepared(teamId, entry);
+
+    expect(result, `${label}: the committed outcome`).toEqual({ outcome: "enqueued" });
+    expect(await lifecycleQueueAgainst(teamId, exactDue), `${label}: exactly one queue row, at the previously established exact due instant rounded up to its millisecond`)
+      .toEqual(LIFECYCLE_ONE_ROW_AT_THE_EXACT_DUE);
+    expect(await lifecycleQueueAndStagingAnywhere(), `${label}: the only queue row in the database is this root's, and nothing is staged`).toEqual({
+      queue: [{ team_id: teamId, root_ts: OLD_ROOT }], staging: [],
+    });
+    expect(lifecycleTablesThatDiffer(before, await lifecycleSnapshot(teamId)), `${label}: of the snapshotted surfaces the preparation changed the queue, and nothing else`).toEqual(["slack_sync_threads"]);
+    expect(await query(`select ${lifecycleUtc("w.observed_at")} as observed_at_utc from slack_messages w where ${LIFECYCLE_ROOT_WITNESS}`, lifecycleWitnessOf(f)),
+      `${label}: the root witness still stores the aged observation`).toEqual([{ observed_at_utc: agedObservedAt }]);
+  });
+
+  it("commits not_due from the previously enumerated entry after an identical republication refreshed the root observation, with generations, ledger semantics, item and versions unchanged", async () => {
+    const label = "identical republication";
+    const { f, teamId, entry, agedObservedAt, exactDue } = await lifecycleAgedRoot(label, REVISIT);
+
+    // ── BEFORE THE REPUBLICATION: what must not change, read from the database. ──
+    const itemBefore = await itemAndVersions(teamId);
+    const generationsBefore = await generations(teamId);
+    const ledgerBefore = await ledgerSemantics(teamId);
+    expect(itemBefore.map((row) => row.id), `${label}: fixture: the team's one item is the published root's`).toEqual([f.itemId]);
+    expect(generationsBefore, `${label}: fixture: the team has one generation row`).toHaveLength(1);
+    expect(ledgerBefore.map((row) => [row.message_ts, row.is_root, row.live]), `${label}: fixture: the ledger holds the live root and its live reply`).toEqual([
+      [OLD_ROOT, true, true], [OLD_REPLY, false, true],
+    ]);
+
+    // ── THE REPUBLICATION, between two readings of the database's own clock. ──
+    const clockBefore = await databaseClock();
+    const republished = await republishIdentical(f);
+    const clockAfter = await databaseClock();
+
+    expect(republished, `${label}: the republication's status is unchanged, for the same item`).toMatchObject({ status: "unchanged", id: f.itemId });
+    expect(await itemAndVersions(teamId), `${label}: the same item id and the same number of versions`).toEqual(itemBefore);
+    expect(await generations(teamId), `${label}: the data, identity and presentation generations are unchanged`).toEqual(generationsBefore);
+    expect(await ledgerSemantics(teamId), `${label}: every semantic ledger field, and last_seen_generation, is unchanged`).toEqual(ledgerBefore);
+    // The observation, by database inequalities only: later than the aged value, and inside the bracket.
+    expect(await query(
+      `select w.observed_at > $6::timestamptz as strictly_after_the_aged_observation,
+              w.observed_at >= $7::timestamptz as not_before_the_clock_reading_before,
+              w.observed_at <= $8::timestamptz as not_after_the_clock_reading_after,
+              w.deleted_at is null as live,
+              w.observed_at + interval '1 hour' > clock_timestamp() as refreshed_due_is_in_the_future,
+              $9::timestamptz < clock_timestamp() as old_exact_due_is_still_past
+         from slack_messages w where ${LIFECYCLE_ROOT_WITNESS}`, [...lifecycleWitnessOf(f), agedObservedAt, clockBefore, clockAfter, exactDue]
+    ), `${label}: the root observation strictly advanced, to an instant between the two database clock readings`).toEqual([{
+      strictly_after_the_aged_observation: true, not_before_the_clock_reading_before: true, not_after_the_clock_reading_after: true,
+      live: true, refreshed_due_is_in_the_future: true, old_exact_due_is_still_past: true,
+    }]);
+    expect(await lifecycleQueueAndStagingAnywhere(), `${label}: the republication removed its queue row and its staging`).toEqual({ queue: [], staging: [] });
+
+    // ── THE PREPARATION, from the entry enumerated BEFORE the republication. Its own snapshots. ──
+    const before = await lifecycleSnapshot(teamId);
+    const result = await prepared(teamId, entry);
+
+    expect(result, `${label}: the committed outcome`).toEqual({ outcome: "not_due" });
+    expect(await lifecycleQueueAndStagingAnywhere(), `${label}: no queue row was inserted, and nothing is staged`).toEqual({ queue: [], staging: [] });
+    expect(await lifecycleSnapshot(teamId), `${label}: no row of any snapshotted surface was changed by the preparation`).toEqual(before);
+  });
+});
+
+/**
+ * KR-08 in part — caller rollback, replay on another connection, and an application that loses its
+ * receipt after a known commit (`docs/design/slack-known-root-requeue-spec.md` §8.3, §8.4, §11 KR-08).
+ *
+ * EVIDENCE, NOT RED: all three cases are expected to pass on the current source. It is PART of
+ * KR-08: the two-preparer race, both publisher orderings and the stale-claim characterization are
+ * not here.
+ *
+ * ROLLBACK. Preparation returns `enqueued` inside the caller's transaction, and through that same
+ * transaction the inserted row is read. The caller then throws. From another connection there is no
+ * queue row and no snapshotted surface differs: a preparation result is provisional until the
+ * caller's transaction commits.
+ *
+ * RETRY. After that rollback, the same entry is prepared again on ANOTHER connection — a different
+ * backend than the one that rolled back — and commits. There is exactly one row, at the same
+ * observation-derived due instant the rolled-back attempt had computed.
+ *
+ * "APPLICATION RECEIPT LOSS AFTER KNOWN COMMIT". The transaction's promise RESOLVES — the commit is
+ * known to have happened — and the application deliberately keeps nothing of what preparation
+ * returned. A replay on another connection returns `already_pending` and leaves the single committed
+ * row byte-identical. This is exactly that: an application that lost a result it had. It is NOT
+ * network ambiguity, NOT a commit whose outcome is unknown, and NOT evidence about how the
+ * transaction manager reports one; it does not replace the `commit_unknown` evidence of M15c.
+ *
+ * "Another connection" is established, not assumed: every connection's backend pid is read, and a
+ * pooled connection that turns out to be the one to avoid is kept checked out while another is taken.
+ */
+describe("KR-08 rollback and replay", () => {
+  /** The minimum policy. The fixture ages the witness by two hours, so the exact due instant is long past. */
+  const REVISIT = { ms: 60_000, sqlInterval: "60 seconds" };
+
+  /** What the caller throws to abandon its transaction. */
+  class CallerAbort extends Error {}
+
+  /** Runs on a pooled connection whose backend is NOT `avoidPid`; one that is, is kept checked out while another is taken. */
+  function onAnotherConnection<T>(avoidPid: number, run: (session: TransactionSession, pid: number) => Promise<T>): Promise<T> {
+    return tx(async (first) => {
+      const firstPid = await lifecyclePidOf(first);
+      if (firstPid !== avoidPid) return run(first, firstPid);
+      return tx(async (second) => {
+        const secondPid = await lifecyclePidOf(second);
+        if (secondPid === avoidPid) throw new Error("fixture: two checked-out connections report the same backend");
+        return run(second, secondPid);
+      });
+    });
+  }
+
+  /** The due instant of every queue row of the team, as the database renders it. */
+  const DUE_OF_THE_QUEUE = `select ${lifecycleUtc("due_at")} as due_at_utc from slack_sync_threads where team_id = $1 order by root_ts`;
+
+  /**
+   * One preparation that returns `enqueued` and is then ROLLED BACK by its caller. Returns what was
+   * seen inside the transaction and how its promise ended; asserts nothing itself.
+   */
+  async function preparedThenRolledBack(teamId: string, entry: SlackKnownRootEntry) {
+    const abort = new CallerAbort("fixture: the caller abandons its transaction after a provisional result");
+    // The execution context is created BEFORE the transaction it is used in.
+    const execution = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+    const inside: { pid: number; provisional: SlackKnownRootPreparationResult | null; dueSeenInside: unknown[] } = { pid: 0, provisional: null, dueSeenInside: [] };
+    const ending = await tx(async (a) => {
+      inside.pid = await lifecyclePidOf(a);
+      inside.provisional = await prepareSlackKnownRootRequeue(a, { teamId, entry }, execution);
+      // Through the SAME transaction, after preparation has returned: the row it inserted is there.
+      inside.dueSeenInside = (await a.executeSql<{ due_at_utc: string }>(DUE_OF_THE_QUEUE, [teamId])).rows.map((row) => row.due_at_utc);
+      throw abort;
+    }).then(
+      () => "THE TRANSACTION RESOLVED",
+      (error: unknown) => (error === abort ? "rejected with the caller's own error"
+        : (error as { cause?: unknown } | null)?.cause === abort ? "rejected with an error caused by the caller's own"
+        : `rejected with something else: ${error instanceof Error ? error.name : typeof error}`)
+    );
+    return { ...inside, ending };
+  }
+  type RolledBack = Awaited<ReturnType<typeof preparedThenRolledBack>>;
+
+  /** What every rollback case requires of the rolled-back attempt, and of the database after it. */
+  async function expectRolledBackWithNothingPersisted(rolledBack: RolledBack, teamId: string, before: Record<string, string>, label: string): Promise<void> {
+    expect(rolledBack.provisional, `${label}: inside the caller's transaction, preparation returned enqueued`).toEqual({ outcome: "enqueued" });
+    expect(rolledBack.dueSeenInside, `${label}: fixture: inside that transaction the inserted row was there`).toHaveLength(1);
+    expect(["rejected with the caller's own error", "rejected with an error caused by the caller's own"], `${label}: the caller's throw ended the transaction (${rolledBack.ending})`)
+      .toContain(rolledBack.ending);
+    // From ANOTHER connection: this file's own dedicated one, which is not in the pool.
+    const [{ pid: readerPid }] = await query<{ pid: number }>(`select pg_backend_pid() as pid`);
+    expect([rolledBack.pid > 0, Number(readerPid) !== rolledBack.pid], `${label}: fixture: the independent read is on another connection than the one that rolled back`).toEqual([true, true]);
+    expect(await lifecycleQueueAndStagingAnywhere(), `${label}: no queue row survived the rollback, and nothing is staged`).toEqual({ queue: [], staging: [] });
+    expect(await lifecycleSnapshot(teamId), `${label}: no row of any snapshotted surface survived the rollback as a change`).toEqual(before);
+  }
+
+  it("persists nothing when the caller throws after preparation returned a provisional enqueued: no queue row and no other preparation write", async () => {
+    const label = "caller rollback";
+    const { teamId, entry } = await lifecycleAgedRoot(label, REVISIT);
+    const before = await lifecycleSnapshot(teamId);
+
+    const rolledBack = await preparedThenRolledBack(teamId, entry);
+
+    await expectRolledBackWithNothingPersisted(rolledBack, teamId, before, label);
+  });
+
+  it("commits exactly one row at the same observation-derived due instant when the rolled-back preparation is retried on another connection", async () => {
+    const label = "retry after rollback";
+    const { teamId, entry, exactDue } = await lifecycleAgedRoot(label, REVISIT);
+    const before = await lifecycleSnapshot(teamId);
+
+    const rolledBack = await preparedThenRolledBack(teamId, entry);
+    await expectRolledBackWithNothingPersisted(rolledBack, teamId, before, label);
+
+    // THE RETRY: a later invocation, with its own execution context created before its transaction,
+    // on a connection that is not the one that rolled back.
+    const execution = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+    const retried = await onAnotherConnection(rolledBack.pid, async (b, pid) => ({
+      pid, result: await prepareSlackKnownRootRequeue(b, { teamId, entry }, execution),
+    }));
+
+    expect([retried.pid !== rolledBack.pid, retried.result], `${label}: on another connection, the committed outcome`).toEqual([true, { outcome: "enqueued" }]);
+    expect(await lifecycleQueueAgainst(teamId, exactDue), `${label}: exactly one queue row, at the exact due instant rounded up to its millisecond`)
+      .toEqual(LIFECYCLE_ONE_ROW_AT_THE_EXACT_DUE);
+    // The SAME historical instant the rolled-back attempt computed, as the database renders both.
+    expect((await query<{ due_at_utc: string }>(DUE_OF_THE_QUEUE, [teamId])).map((row) => row.due_at_utc),
+      `${label}: the committed due instant is the one the rolled-back attempt had computed`).toEqual(rolledBack.dueSeenInside);
+    expect(await lifecycleQueueAndStagingAnywhere(), `${label}: the only queue row in the database is this root's, and nothing is staged`).toEqual({
+      queue: [{ team_id: teamId, root_ts: OLD_ROOT }], staging: [],
+    });
+    expect(lifecycleTablesThatDiffer(before, await lifecycleSnapshot(teamId)), `${label}: of the snapshotted surfaces the committed retry changed the queue, and nothing else`).toEqual(["slack_sync_threads"]);
+  });
+
+  it("application receipt loss after known commit: a replay on another connection returns already_pending and leaves the single committed row byte-identical", async () => {
+    const label = "application receipt loss after known commit";
+    const { teamId, entry, exactDue } = await lifecycleAgedRoot(label, REVISIT);
+
+    // THE FIRST INVOCATION COMMITS, and the application keeps NOTHING of what preparation returned:
+    // the callback returns only its connection's pid. The promise resolving is the known commit.
+    const firstExecution = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+    const committedOnPid = await tx(async (a) => {
+      const pid = await lifecyclePidOf(a);
+      await prepareSlackKnownRootRequeue(a, { teamId, entry }, firstExecution);
+      return pid;
+    });
+
+    // What that known commit left, read from another connection and retained whole.
+    expect(await lifecycleQueueAgainst(teamId, exactDue), `${label}: fixture: the known commit left exactly one queue row, at the exact due instant rounded up to its millisecond`)
+      .toEqual(LIFECYCLE_ONE_ROW_AT_THE_EXACT_DUE);
+    const committedRows = await lifecycleQueueRowsExactly(teamId);
+    expect(committedRows, `${label}: fixture: one committed queue row`).toHaveLength(1);
+    const before = await lifecycleSnapshot(teamId);
+
+    // THE REPLAY, on another connection, with its own execution context created before its transaction.
+    const replayExecution = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+    const replayed = await onAnotherConnection(committedOnPid, async (b, pid) => ({
+      pid, result: await prepareSlackKnownRootRequeue(b, { teamId, entry }, replayExecution),
+    }));
+
+    expect([replayed.pid !== committedOnPid, replayed.result], `${label}: on another connection, the replay's committed outcome`).toEqual([true, { outcome: "already_pending" }]);
+    expect(await lifecycleQueueRowsExactly(teamId), `${label}: the single committed row is byte-identical after the replay`).toEqual(committedRows);
+    expect(await lifecycleQueueAndStagingAnywhere(), `${label}: still the only queue row in the database, and nothing is staged`).toEqual({
+      queue: [{ team_id: teamId, root_ts: OLD_ROOT }], staging: [],
+    });
+    expect(await lifecycleSnapshot(teamId), `${label}: no row of any snapshotted surface was changed by the replay`).toEqual(before);
+  });
 });

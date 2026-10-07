@@ -1334,7 +1334,11 @@ describe("known-root page tally — one contribution per page slot", () => {
  * runs on microtasks, so nothing else can construct a Date inside the window. The fixture is built
  * before it is armed and every assertion is made after it is disarmed. It forwards every
  * construction unchanged and only writes down the arguments. The valid cases show the observer does
- * see a construction, so that seeing none means something.
+ * see the conversion — exactly one Date, from exactly the due answer's number — so that seeing none
+ * means something. On the valid path the window necessarily also holds the real enqueue helper's
+ * validation of its scope, which builds a Date from the fixture root's own timestamp; those are set
+ * aside by that written-out fixture value, and nothing else may be there. On every rejected path the
+ * enqueue is never reached, and the window must hold no construction at all.
  *
  * Nothing here restates the conversion: no pattern, no bound and no arithmetic of the parser is
  * copied. Each case states an input and the exported behavior it must produce.
@@ -1343,6 +1347,8 @@ describe("known-root due-output conversion contract", () => {
   const WORKSPACE = "T0SOURCE1";
   const CHANNEL = "C0KNOWN1";
   const ROOT = "1718900000.000100";
+  /** The whole seconds of ROOT, as milliseconds, WRITTEN OUT: what a parse of the root's own timestamp builds a Date from. */
+  const ROOT_WHOLE_SECONDS_AS_MS = 1718900000000;
   const PROJECT = "0d000000-0000-4000-8000-00000000000d";
   /** The canonical scoped path of the fixture root, WRITTEN OUT, not built by the code under test. */
   const SCOPED_PATH = "slack/t0source1/c0known1/1718900000.000100.md";
@@ -1367,19 +1373,31 @@ describe("known-root due-output conversion contract", () => {
     vi.unstubAllEnvs();
   });
 
-  /** The unit-only stand-in for the global Date constructor: forwards unchanged, and writes down the arguments. */
+  /**
+   * The unit-only stand-in for the global Date constructor: forwards unchanged, and writes down the
+   * arguments. Arming keeps whatever constructor was ambient at that moment, and disarming puts that
+   * same one back; disarming an observer that was never armed does nothing.
+   */
   function dateObserver() {
     const constructedWith: unknown[][] = [];
-    const Observed = new Proxy(RealDate, {
-      construct(target, args: unknown[], newTarget) {
-        constructedWith.push([...args]);
-        return Reflect.construct(target, args, newTarget) as object;
-      },
-    });
+    let ambient: DateConstructor | null = null;
     return {
       constructedWith,
-      arm: (): void => { globalThis.Date = Observed; },
-      disarm: (): void => { globalThis.Date = RealDate; },
+      arm: (): void => {
+        if (ambient !== null) return;
+        ambient = globalThis.Date;
+        globalThis.Date = new Proxy(ambient, {
+          construct(target, args: unknown[], newTarget) {
+            constructedWith.push([...args]);
+            return Reflect.construct(target, args, newTarget) as object;
+          },
+        });
+      },
+      disarm: (): void => {
+        if (ambient === null) return;
+        globalThis.Date = ambient;
+        ambient = null;
+      },
     };
   }
 
@@ -1480,13 +1498,12 @@ describe("known-root due-output conversion contract", () => {
     } finally {
       observer.disarm();
     }
-    return { result, error, threw, scripted, constructedWith: observer.constructedWith, dateIsRestored: Object.is(globalThis.Date, RealDate) };
+    return { result, error, threw, scripted, constructedWith: observer.constructedWith };
   }
   type Prepared = Awaited<ReturnType<typeof preparedWithDueAnswer>>;
 
   /** FIXTURE VALIDITY, asserted first in every case: the due read was reached, once, by a valid preparation. */
   function expectTheDueReadWasReached(prepared: Prepared, label: string): void {
-    expect(prepared.dateIsRestored, `${label}: fixture: the global Date constructor is the real one again`).toBe(true);
     expect(prepared.scripted.data().slice(0, TO_THE_DUE_READ.length), `${label}: fixture: a valid preparation reached the due read, once, in order`).toEqual(TO_THE_DUE_READ);
   }
 
@@ -1495,7 +1512,9 @@ describe("known-root due-output conversion contract", () => {
     expectTheDueReadWasReached(prepared, label);
     expect([prepared.threw, prepared.result], `${label}: the preparation throws and returns no result`).toEqual([true, undefined]);
     expect(prepared.error, `${label}: what is thrown is an error`).toBeInstanceOf(Error);
-    if (rejectedText !== null) expect((prepared.error as Error).message.includes(rejectedText), `${label}: the rejected value is not quoted`).toBe(false);
+    // A LOCAL check of this one message and nothing more: it is not KR-16 evidence and not a
+    // redaction proof, which need the reportable outputs walked whole.
+    if (rejectedText !== null) expect((prepared.error as Error).message.includes(rejectedText), `${label}: local check: the thrown message does not hold the rejected text`).toBe(false);
     expect(prepared.scripted.enqueueInserts, `${label}: zero enqueue`).toEqual([]);
     expect(prepared.scripted.data(), `${label}: the due read is the last data statement`).toEqual(TO_THE_DUE_READ);
     expect(prepared.scripted.afterTheDueRead(), `${label}: nothing at all is sent after the due read`).toEqual([]);
@@ -1517,8 +1536,15 @@ describe("known-root due-output conversion contract", () => {
     const handed = insert[4];
     expect(handed instanceof RealDate, `${name}: the enqueue is handed a Date`).toBe(true);
     expect((handed as Date).getTime(), `${name}: the Date's numeric value is exactly the due answer's`).toBe(epochMs);
-    // The observer's own control: a conversion that succeeds IS seen constructing a Date.
-    expect(prepared.constructedWith.length, `${name}: observer control: the window sees a Date being constructed`).toBeGreaterThanOrEqual(1);
+    // The observer's own control: a conversion that succeeds IS seen, as exactly one construction
+    // from exactly the due answer's number. On this path the window also contains the REAL enqueue
+    // helper validating its scope, which parses the root's own timestamp and builds a Date from that
+    // root's whole seconds. Those constructions are named by their one argument — a fixture literal
+    // that is none of the due answers — and set aside; everything else the window saw must be the
+    // one conversion, and nothing more.
+    const besidesTheScopeValidation = prepared.constructedWith.filter((args) => !(args.length === 1 && args[0] === ROOT_WHOLE_SECONDS_AS_MS));
+    expect(besidesTheScopeValidation, `${name}: observer control: apart from the enqueue's own validation of the root timestamp, the window sees exactly one Date constructed, from the exact number`)
+      .toEqual([[epochMs]]);
   });
 
   it.each<[name: string, dueValue: unknown]>([
