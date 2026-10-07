@@ -1633,6 +1633,24 @@ export const ENTRY_INVENTORY: Record<string, EntryRecord> = {
       "lib/admin/invite (both in the closure through lib/identity/authority and lib/auth/pg-login). " +
       "Creates a member and sends the invite; no item write",
   },
+  "app/api/v1/members/route.ts": {
+    class: "IMPORT_ONLY",
+    reason:
+      "imports listMemberIdentities from lib/identity/list, which reads each provider identity's " +
+      "holder and mapping revision inside withIdentityMutationBoundary (lib/identity/authority) so " +
+      "the pair is one observation — that import is the closure edge. GET /api/v1/members is a " +
+      "roster READER: it takes the team identity authority only to read, mutates no identity, and " +
+      "its only write is the rate-limit bucket, never an item",
+  },
+  "app/api/v1/identities/resolve/route.ts": {
+    class: "IMPORT_ONLY",
+    reason:
+      "imports listMemberIdentities from lib/identity/list (same edge as the members route: its " +
+      "holder + revision read runs inside withIdentityMutationBoundary in lib/identity/authority). " +
+      "GET /api/v1/identities/resolve resolves an identifier to a roster member and returns that " +
+      "member's contact set: a roster READER under the identity authority boundary, whose only " +
+      "write is the rate-limit bucket, never an item",
+  },
   "app/t/[team]/admin/actions.ts": {
     class: "IMPORT_ONLY",
     reason:
