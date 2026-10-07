@@ -17,6 +17,7 @@ import {
   type EvidenceClock,
   type PendingSignal,
   type SessionEvidence,
+  type SignalAcknowledgement,
   type TestSession,
   authorityLockName,
   barrierSessions,
@@ -89,6 +90,8 @@ import {
  *      pending at its deadline, fails, answers late or does not say, and a signal PostgreSQL did not
  *      acknowledge in time, each leave cleanup `unproven` for good — the marker on file, the run
  *      stopped, the signalled connection never handed back — whatever is read or answered afterwards;
+ *      and a signal is acknowledged by PostgreSQL's own answer to the real send, for exactly the
+ *      backends it was aimed at, and by nothing else that resolves in its place;
  *   8. this file's OWN foreign sessions are scopes of the real run: a marker before each connects,
  *      removed only once its closing was acknowledged and that exact backend seen gone;
  *   9. a pool connection a STAGED test checks out itself is on the real run's sentinel from before
@@ -2338,6 +2341,250 @@ describe("race harness (7, signals): a signal PostgreSQL did not acknowledge in 
       unhandled.stop();
       proceed.open();
       ack.resolve(undefined);
+      await barrier?.release().catch(() => undefined);
+      await untilBarrierGone(tag);
+      await staged.seen("the raced operation's backend idle or gone",
+        (sessions) => sessions.every((session) => session.state === "idle"));
+      pool.removeListener("release", onRelease);
+      for (const client of held) discardFromPool(client);
+      staged.clear();
+    }
+  }, RACE_TEST_TIMEOUT_MS);
+});
+
+describe("race harness (7, signals — whose acknowledgement): only PostgreSQL's own answer to the real send acknowledges a signal — anything else resolved in its place strands the lease and leaves cleanup `unproven` (real Postgres)", () => {
+  /** Shaped exactly like an acknowledgement of the cancel of that backend — and made here, not by the real send. */
+  const lookalike = (pid: number): SignalAcknowledgement => ({ signal: "cancel", backends: [{ pid, sent: true }] });
+  /** What the cancel's statement answers when PostgreSQL has signalled that backend. */
+  const signalledRows = (pid: number): unknown => [{ pid, sent: true }];
+
+  interface StagedAnswer {
+    staged: string;
+    /** The seam makes the real send — whose statement's answer is then this test's to give. */
+    sends: boolean;
+    /** What the seam resolves with, when the test says so; `null`: it hands over the real send itself. */
+    says: ((pid: number) => unknown) | null;
+    /** What the real send's statement answers with, long after the verdict. (Where no send was made
+     * nothing awaits that answer, so it is never a rejection there: nobody would observe one.) */
+    later: (answered: Controlled<unknown>, pid: number) => void;
+  }
+
+  /**
+   * The raced operation of the test above, held in the same place when cleanup comes to cancel it.
+   * Here BOTH of the cancel's promises are this test's: what the seam in front of the signal
+   * resolves with (`CleanupSeam.signal`: `said`), and what the statement of the real send answers
+   * (`CleanupSeam.execute`: `answered` — the statement itself is not run, so that send stays pending
+   * for exactly as long as this test leaves it). The TERMINATE is the real one, through both.
+   *
+   * The seam resolves — IN TIME: the clock is not moved — with something that is not PostgreSQL's
+   * acknowledgement, while the real send was never made or has not answered. Believed, that would
+   * condemn the lease and give the connection to the pool to destroy, with a cancel still to be
+   * executed at its PID. It must strand it instead. (Where the seam hands over the real send itself
+   * there is nothing to believe: it is simply still pending at its deadline.)
+   */
+  it.each<StagedAnswer>([
+    {
+      staged: "resolves with NOTHING AT ALL, the real send never made",
+      sends: false,
+      says: () => undefined,
+      later: (answered, pid) => answered.resolve(signalledRows(pid)),
+    },
+    {
+      staged: "resolves with something SHAPED like an acknowledgement of that very backend, the real send never made",
+      sends: false,
+      says: lookalike,
+      later: (answered, pid) => answered.resolve(signalledRows(pid)),
+    },
+    {
+      staged: "resolves with NOTHING AT ALL while the real send is still PENDING — which later RESOLVES with PostgreSQL's answer",
+      sends: true,
+      says: () => undefined,
+      later: (answered, pid) => answered.resolve(signalledRows(pid)),
+    },
+    {
+      staged: "resolves with something SHAPED like an acknowledgement of that very backend while the real send is still PENDING — which later REJECTS",
+      sends: true,
+      says: lookalike,
+      later: (answered) => answered.reject(new Error("Connection terminated unexpectedly")),
+    },
+    {
+      staged: "hands over the real send itself, still PENDING at its deadline — which later RESOLVES with PostgreSQL's answer",
+      sends: true,
+      says: null,
+      later: (answered, pid) => answered.resolve(signalledRows(pid)),
+    },
+  ])("the seam in front of the cancel $staged: the lease is stranded — never handed to the pool, not on the operation's release and not after a terminate that IS acknowledged — cleanup is `unproven`, the marker and the fatal reason are kept, and nothing answered afterwards changes that", async ({ sends, says, later }) => {
+    const pool = getPool();
+    const { directory, safety } = privateRun();
+    const tag = `own-ack-${randomUUID().slice(0, 8)}`;
+    const lockName = `harness-own-ack:${randomUUID()}`;
+    const CLEANUP_MS = 300;
+    const hand = handClock();
+    const said = controlled<unknown>();
+    const answered = controlled<unknown>();
+    const asked = tally();
+    const signals: PendingSignal[] = [];
+    // Every statement a real send was made of: one for each signal whose seam made that send.
+    const statements: PendingSignal[] = [];
+    const proceed = gate();
+    const released = gate();
+    // The raced operation's backend, and its checked-out client: filled in by the operation itself.
+    const owners: BackendIdentity[] = [];
+    const held: PoolClient[] = [];
+    // Every time the POOL is given the raced operation's connection back, and with what.
+    const handedBack: unknown[] = [];
+    const onRelease = (error: unknown, client: unknown): void => {
+      if (owners.some((owner) => (client as { processID?: unknown }).processID === owner.pid)) handedBack.push(error);
+    };
+    // In front of every signal. The TERMINATE is the real send, as it comes. The CANCEL's seam
+    // makes the real send or does not, lets go of it, and answers with this test's promise — or
+    // hands the real send over as its answer.
+    const signal = (pending: PendingSignal, send: () => Promise<unknown>): Promise<unknown> => {
+      signals.push(pending);
+      asked.note();
+      if (pending.signal !== "cancel" || !says) return send();
+      if (sends) void send();
+      return said.promise;
+    };
+    // In front of the statement of every real send. The CANCEL's is not run: its answer is this
+    // test's promise, so that send is pending until the test says otherwise.
+    const execute = (pending: PendingSignal, statement: () => Promise<unknown>): Promise<unknown> => {
+      statements.push(pending);
+      return pending.signal === "cancel" ? answered.promise : statement();
+    };
+    const unhandled = watchUnhandled();
+    const staged = stagedOnRealRun("a raced operation whose cancel is staged to be acknowledged by something other than PostgreSQL");
+    let barrier: Barrier | undefined;
+    try {
+      pool.on("release", onRelease);
+      barrier = await holdNamedLock(lockName, { tag, safety });
+      const scheduled = inFlight(parkThenCompete({
+        seed: { teamId: randomUUID() },
+        barrier,
+        parksOn: "advisory",
+        // The raced operation: one pool connection, in a transaction, parked on the barrier's lock.
+        // Past it, it waits for this test's gate and for nothing in the database — so it is still
+        // holding its connection when cleanup comes to signal it.
+        first: async () => {
+          const client = await pool.connect();
+          held.push(client);
+          try {
+            owners.push(await staged.identify(client));
+            await client.query("begin");
+            await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [lockName]);
+            await proceed.opened;
+            await client.query("rollback");
+          } finally {
+            client.release();
+            released.open();
+          }
+          return "released";
+        },
+        // The schedule itself fails at once, so cleanup runs with the first operation still held.
+        second: async () => "finished without waiting",
+        bounds: { cleanupMs: CLEANUP_MS },
+        cleanup: { clock: hand.clock, signal, execute },
+      }));
+      const over = scheduled.promise.then(() => undefined, () => undefined);
+
+      // ROUND ONE: the operation has not settled when its budget runs out.
+      await Promise.race([hand.set(1), over]);
+      expect(hand.delays(), "the first round: the operations settling").toEqual([CLEANUP_MS]);
+      expect(scheduled.state()).toBe("pending");
+      hand.tick(CLEANUP_MS);
+
+      // THE CANCEL: aimed at the raced operation's own backend, its acknowledgement bounded — and
+      // its real send made, of a statement for that same backend, only where the seam made it.
+      await Promise.race([asked.reached(1), over]);
+      const cancel = { signal: "cancel", backends: [owners[0].pid] };
+      const terminate = { signal: "terminate", backends: [owners[0].pid] };
+      expect(signals).toEqual([cancel]);
+      expect(statements).toEqual(sends ? [cancel] : []);
+      await Promise.race([hand.set(2), over]);
+      expect(hand.delays(), "the acknowledgement of the cancel is bounded").toEqual([CLEANUP_MS, OWNED_BOUND_MS]);
+      await untilSessions([owners[0].pid], "the raced operation idle in its transaction",
+        (sessions) => sessions.length === 1 && sessions[0].state === "idle in transaction" && sessions[0].waitingOn === null);
+
+      // WITH NOTHING YET ANSWERED, THE OPERATION FINISHES AND RELEASES. Its transaction is over,
+      // its backend idle — and the pool has not been given the connection.
+      proceed.open();
+      await released.opened;
+      await untilSessions([owners[0].pid], "the raced operation's backend idle, its transaction over",
+        (sessions) => sessions.length === 1 && sessions[0].state === "idle");
+      expect(handedBack, "the pool must not be given a backend a signal is aimed at").toEqual([]);
+      expect(scheduled.state()).toBe("pending");
+
+      // THE SEAM ANSWERS — well inside the bound: no time has passed on the clock — with what is
+      // not PostgreSQL's acknowledgement. (Or, where it handed over the real send, the deadline
+      // passes on that.) Cleanup goes on by itself from here: the next round finds the operation
+      // settled; a terminate — the real one — is executed and acknowledged; the last round ends.
+      if (says) said.resolve(says(owners[0].pid));
+      else hand.tick(OWNED_BOUND_MS);
+      const failure = await scheduled.promise.then(() => null, (error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(RaceScheduleError);
+      const { cleanup, message } = failure as RaceScheduleError;
+      expect(message).toContain("the competing operation finished without waiting");
+      // UNPROVEN — with the barrier seen gone, the operation settled, and both signals asked for.
+      expect(cleanup.outcome).toBe("unproven");
+      expect(cleanup.barrierGone).toBe(true);
+      expect(cleanup.signalled).toEqual([owners[0].pid]);
+      expect(cleanup.operations).toEqual([
+        { label: "the parked operation", backends: [owners[0].pid], settled: true },
+        { label: "the competing operation", backends: [], settled: true },
+      ]);
+      // The terminate was aimed at that same backend — still the operation's own, because its
+      // connection was never let back into the pool — and its real send was made.
+      expect(signals).toEqual([cancel, terminate]);
+      expect(statements).toEqual(sends ? [cancel, terminate] : [terminate]);
+      // The same five bounded steps, and no timer left set: the cancel's was called off when its
+      // seam answered, or fired at its deadline.
+      expect(hand.delays()).toEqual([CLEANUP_MS, OWNED_BOUND_MS, CLEANUP_MS, OWNED_BOUND_MS, CLEANUP_MS]);
+      expect(hand.outstanding()).toBe(0);
+      // THE STRANDED CONNECTION WAS NEVER HANDED BACK: not when its operation released it, not when
+      // the seam answered, and not when a later signal at the same backend was really acknowledged.
+      expect(handedBack).toEqual([]);
+      // THE RUN IS STOPPED: a fatal reason, the marker still on file, and the guard refusing.
+      const reason = safety.fatal();
+      expect(reason).toMatch(/could not be proven settled, idle or disposed/);
+      expect(safety.armed()).toEqual([tag]);
+      expect(() => assertRunSafe(safety)).toThrow(/run STOPPED — refusing to truncate or run another test/);
+      // The terminate was real: that backend is gone.
+      await untilSessions([owners[0].pid], "the terminated backend gone", (sessions) => sessions.length === 0);
+
+      // THE REAL SEND OF THE CANCEL IS ANSWERED NOW — long after the verdict.
+      later(answered, owners[0].pid);
+      await turn();
+
+      // NOTHING CAME OF IT. Not an unhandled rejection — though the seam had let go of that send;
+      // the connection is still not the pool's; no signal was sent for it and no bound started…
+      expect(unhandled.seen).toEqual([]);
+      expect(handedBack).toEqual([]);
+      expect(signals).toHaveLength(2);
+      expect(hand.delays()).toEqual([CLEANUP_MS, OWNED_BOUND_MS, CLEANUP_MS, OWNED_BOUND_MS, CLEANUP_MS]);
+      // …the verdict is what it was, and no later conclusion clears it…
+      barrier.conclude(true, "");
+      await barrier.release();
+      expect(safety.armed()).toEqual([tag]);
+      expect(safety.fatal()).toBe(reason);
+      // …and the guard still refuses — here, and for any other reader of the same state.
+      expect(() => assertRunSafe(safety)).toThrow(/run STOPPED — refusing to truncate or run another test/);
+      const elsewhere = createRunSafety(directory);
+      expect(elsewhere.armed()).toEqual([tag]);
+      expect(elsewhere.fatal()).toBe(reason);
+      // The real run was not stopped by this test: its state is not this one.
+      expect(raceHarnessFatal()).toBeNull();
+      expect(currentRunSafety().armed(), "the real run: the sentinel, and only the sentinel").toEqual([staged.scope]);
+    } finally {
+      // ON EVERY EXIT, as in the test above: nothing stays held back and the raced operation may
+      // finish; the barrier is released; the sentinel comes off only when the barrier is SEEN gone
+      // and the raced operation's backend SEEN idle or gone — and only then is the connection the
+      // harness stranded retired from the pool by hand. If any of that cannot be seen, this throws,
+      // the sentinel stays, and the real run stops.
+      unhandled.stop();
+      proceed.open();
+      said.resolve(undefined);
+      answered.resolve(undefined);
       await barrier?.release().catch(() => undefined);
       await untilBarrierGone(tag);
       await staged.seen("the raced operation's backend idle or gone",
