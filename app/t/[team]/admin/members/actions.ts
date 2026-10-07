@@ -190,6 +190,11 @@ export async function linkMemberIdentity(
 ): Promise<{ ok: boolean; error?: string; remap?: IdentityRemapOffer }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
+  // A server action's arguments are whatever the client sent: checked as strings before anything
+  // is read off them, so a malformed call is a refusal, not a thrown TypeError.
+  if (typeof provider !== "string" || typeof externalId !== "string") {
+    return { ok: false, error: "provider and user id are required" };
+  }
   const p = provider.trim().toLowerCase();
   if (!PROVIDERS.has(p)) return { ok: false, error: `unsupported provider "${provider}"` };
   const ext = externalId.trim();
@@ -318,6 +323,10 @@ export async function unlinkMemberIdentity(
 ): Promise<{ ok: boolean; error?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
+  // Checked as strings before anything is read off them (see `linkMemberIdentity`).
+  if (typeof provider !== "string" || typeof externalId !== "string") {
+    return { ok: false, error: "provider and externalId are required" };
+  }
   const p = provider.trim().toLowerCase();
   const ext = externalId.trim();
   if (!p || !ext) return { ok: false, error: "provider and externalId are required" };
