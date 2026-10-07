@@ -122,6 +122,13 @@ async function effects(seed: Seed, provider: Provider, externalId: string) {
 const link = (seed: Seed, memberId: string, provider: Provider, externalId: string, observed: Observation) =>
   linkMemberIdentity(seed.teamSlug, memberId, provider, externalId, undefined, observed);
 
+/** Give a member an identity of their own and return what its row then displays — the "Change" row. */
+async function ownRow(seed: Seed, memberId: string, provider: Provider) {
+  const own = idFor(provider, "own");
+  expect(await link(seed, memberId, provider, own, BLANK)).toEqual({ ok: true });
+  return displayed(seed, memberId, provider, own);
+}
+
 /** Unlink exactly as the row does: the displayed id, at its displayed revision. */
 async function unlinkDisplayed(seed: Seed, memberId: string, provider: Provider, externalId: string): Promise<void> {
   const shown = await displayed(seed, memberId, provider, externalId);
@@ -216,11 +223,10 @@ describe.each(PROVIDERS)("AIO-1167 X-02 — %s: the Admin link keeps the display
     ]);
   });
 
-  it("REMAP is OFFERED, never made — not even when the two revisions coincide — and is written only on confirmation", async () => {
+  it("CHANGE REMAP: from a row displaying the member's own identity, an id another member holds is OFFERED, never made — not even when the two revisions coincide — and is written only on confirmation", async () => {
     const seed = await adminSeed();
     const alice = await member(seed, "Alice");
     const bob = await member(seed, "Bob");
-    const carol = await member(seed, "Carol");
     const original = idFor(provider, "original");
     const target = idFor(provider, "held");
     expect(await link(seed, alice, provider, original, BLANK)).toEqual({ ok: true });
@@ -233,9 +239,9 @@ describe.each(PROVIDERS)("AIO-1167 X-02 — %s: the Admin link keeps the display
 
     const offer = { ok: false, error: `this ${provider} identity is linked to Bob; confirm to remap it`,
       remap: { externalId: target, revision: 1, linkedTo: "Bob" } };
-    // From a row that displays an identity, and from a blank one.
+    // Asked twice: an offer is a read, and repeating it changes nothing.
     expect(await link(seed, alice, provider, target, { original: shown })).toEqual(offer);
-    expect(await link(seed, await member(seed, "Carol"), provider, target, BLANK)).toEqual(offer);
+    expect(await link(seed, alice, provider, target, { original: shown })).toEqual(offer);
 
     // An offer writes nothing and starts nothing.
     expect(await mapping(seed, provider, target)).toEqual({ holder: bob, revision: 1, state: "linked" });
@@ -262,21 +268,24 @@ describe.each(PROVIDERS)("AIO-1167 X-02 — %s: the Admin link keeps the display
     const carol = await member(seed, "Carol");
     const target = idFor(provider, "moving");
     expect(await link(seed, bob, provider, target, BLANK)).toEqual({ ok: true });
-    // Alice and Carol are both offered Bob's id at revision 1. Carol confirms first.
-    expect((await link(seed, alice, provider, target, BLANK)).remap).toEqual({ externalId: target, revision: 1, linkedTo: "Bob" });
-    expect(await link(seed, carol, provider, target, { original: null, remap: { revision: 1 } })).toEqual({ ok: true });
+    // Alice and Carol each act from a row displaying an identity of their own.
+    const aliceRow = await ownRow(seed, alice, provider);
+    const carolRow = await ownRow(seed, carol, provider);
+    // Both are offered Bob's id at revision 1. Carol confirms first.
+    expect((await link(seed, alice, provider, target, { original: aliceRow })).remap).toEqual({ externalId: target, revision: 1, linkedTo: "Bob" });
+    expect(await link(seed, carol, provider, target, { original: carolRow, remap: { revision: 1 } })).toEqual({ ok: true });
     const moved = await effects(seed, provider, target);
 
     // MOVED: still held by someone else, but not at the revision Alice was shown.
-    expect(await link(seed, alice, provider, target, { original: null, remap: { revision: 1 } })).toEqual({ ok: false, error: STALE });
+    expect(await link(seed, alice, provider, target, { original: aliceRow, remap: { revision: 1 } })).toEqual({ ok: false, error: STALE });
     expect(await mapping(seed, provider, target)).toEqual({ holder: carol, revision: 2, state: "linked" });
 
     // UNLINKED: Alice is offered it again at revision 2, and it is unlinked before she confirms.
-    expect((await link(seed, alice, provider, target, BLANK)).remap).toEqual({ externalId: target, revision: 2, linkedTo: "Carol" });
+    expect((await link(seed, alice, provider, target, { original: aliceRow })).remap).toEqual({ externalId: target, revision: 2, linkedTo: "Carol" });
     expect(await effects(seed, provider, target)).toEqual(moved);
     await unlinkDisplayed(seed, carol, provider, target);
     const unlinked = await effects(seed, provider, target);
-    expect(await link(seed, alice, provider, target, { original: null, remap: { revision: 2 } })).toEqual({ ok: false, error: STALE });
+    expect(await link(seed, alice, provider, target, { original: aliceRow, remap: { revision: 2 } })).toEqual({ ok: false, error: STALE });
     expect(await mapping(seed, provider, target)).toEqual({ holder: null, revision: 3, state: "unlinked" });
     expect(await effects(seed, provider, target)).toEqual(unlinked);
     expect((await audits(seed, target)).map((row) => row.mapping_revision)).toEqual([1, 2, 3]);
@@ -320,8 +329,9 @@ describe.each(PROVIDERS)("AIO-1167 X-02 — %s: the Admin link keeps the display
     expect(await link(seed, alice, provider, target, { original: shown })).toEqual({ ok: true });
     expect(await mapping(seed, provider, target)).toEqual({ holder: alice, revision: 1, state: "linked" });
 
-    // The id is remapped to Bob. Alice's row still displays it at revision 1.
-    expect(await link(seed, bob, provider, target, { original: null, remap: { revision: 1 } })).toEqual({ ok: true });
+    // The id is remapped to Bob, by a confirmed Change from Bob's own row. Alice's row still
+    // displays it at revision 1.
+    expect(await link(seed, bob, provider, target, { original: await ownRow(seed, bob, provider), remap: { revision: 1 } })).toEqual({ ok: true });
     expect(await link(seed, alice, provider, target, { original: shown })).toEqual({ ok: false, error: STALE });
     expect(await mapping(seed, provider, target)).toEqual({ holder: bob, revision: 2, state: "linked" });
   });
@@ -343,16 +353,142 @@ describe.each(PROVIDERS)("AIO-1167 X-02 — %s: the Admin link keeps the display
     expect(await mapping(seed, provider, claimed)).toEqual({ holder: claimant, revision: 1, state: "linked" });
     expect(await audits(seed, claimed)).toHaveLength(1);
 
-    // Carol holds an id; Alice and Bob were both offered it at revision 1 and both confirm.
+    // Carol holds an id; Alice and Bob, each from a row of their own, were both offered it at
+    // revision 1 and both confirm.
     const held = idFor(provider, "held");
     expect(await link(seed, carol, provider, held, BLANK)).toEqual({ ok: true });
+    const aliceRow = await ownRow(seed, alice, provider);
+    const bobRow = await ownRow(seed, bob, provider);
     const remaps = await afterBothObserved(seed,
-      () => link(seed, alice, provider, held, { original: null, remap: { revision: 1 } }),
-      () => link(seed, bob, provider, held, { original: null, remap: { revision: 1 } }));
+      () => link(seed, alice, provider, held, { original: aliceRow, remap: { revision: 1 } }),
+      () => link(seed, bob, provider, held, { original: bobRow, remap: { revision: 1 } }));
     expect(remaps.filter((result) => result.ok)).toEqual([{ ok: true }]);
     expect(remaps.filter((result) => !result.ok)).toEqual([{ ok: false, error: STALE }]);
     expect(await mapping(seed, provider, held)).toEqual({ holder: remaps[0].ok ? alice : bob, revision: 2, state: "linked" });
     expect((await audits(seed, held)).map((row) => row.mapping_revision)).toEqual([1, 2]);
+  });
+});
+
+describe.each(["slack", "linear", "plane"] as const)("AIO-1167 X-02 — %s: a BLANK row naming an id another member holds (real Postgres)", (provider) => {
+  it("is offered the remap, writes nothing until it is confirmed, and is refused if the id moved after the offer", async () => {
+    const seed = await adminSeed();
+    const alice = await member(seed, "Alice");
+    const bob = await member(seed, "Bob");
+    const carol = await member(seed, "Carol");
+    const target = idFor(provider, "held");
+    expect(await link(seed, bob, provider, target, BLANK)).toEqual({ ok: true });
+    const before = await effects(seed, provider, target);
+
+    const offer = { ok: false, error: `this ${provider} identity is linked to Bob; confirm to remap it`,
+      remap: { externalId: target, revision: 1, linkedTo: "Bob" } };
+    expect(await link(seed, alice, provider, target, BLANK)).toEqual(offer);
+    expect(await link(seed, carol, provider, target, BLANK)).toEqual(offer);
+    expect(await mapping(seed, provider, target)).toEqual({ holder: bob, revision: 1, state: "linked" });
+    expect(await audits(seed, target)).toHaveLength(1);
+    expect(await effects(seed, provider, target)).toEqual(before);
+
+    expect(await link(seed, alice, provider, target, { original: null, remap: { revision: 1 } })).toEqual({ ok: true });
+    expect(await mapping(seed, provider, target)).toEqual({ holder: alice, revision: 2, state: "linked" });
+    // Carol confirms the offer she was shown — at revision 1, which the id no longer has.
+    expect(await link(seed, carol, provider, target, { original: null, remap: { revision: 1 } })).toEqual({ ok: false, error: STALE });
+    expect(await mapping(seed, provider, target)).toEqual({ holder: alice, revision: 2, state: "linked" });
+    expect((await audits(seed, target)).map((row) => [row.target_id, row.mapping_revision])).toEqual([[bob, 1], [alice, 2]]);
+  });
+});
+
+describe("AIO-1167 X-02 — gdrive: the Google ADD protection is kept (real Postgres)", () => {
+  const ALREADY_LINKED = { ok: false, error: "this Google identity is already linked; refresh and use Change" };
+
+  it("a BLANK Google row naming a LINKED identity is refused outright — no offer, no confirmable remap, no write — whoever holds it", async () => {
+    const seed = await adminSeed();
+    const alice = await member(seed, "Alice");
+    const bob = await member(seed, "Bob");
+    const held = idFor("gdrive", "held");
+    const own = idFor("gdrive", "own");
+    expect(await link(seed, bob, "gdrive", held, BLANK)).toEqual({ ok: true });
+    expect(await link(seed, alice, "gdrive", own, BLANK)).toEqual({ ok: true });
+    const before = {
+      held: await effects(seed, "gdrive", held), own: await effects(seed, "gdrive", own),
+      heldAudits: await audits(seed, held), ownAudits: await audits(seed, own),
+    };
+
+    // Another member's identity: the plain Add, and an Add dressed as the confirmation of an offer
+    // this row was never made — at the id's true revision, and at a wrong one.
+    for (const observed of [BLANK, { original: null, remap: { revision: 1 } }, { original: null, remap: { revision: 0 } }]) {
+      const refused = await link(seed, alice, "gdrive", held, observed);
+      expect(refused, JSON.stringify(observed)).toEqual(ALREADY_LINKED);
+      expect(refused, "no remap is offered from a blank Google row").not.toHaveProperty("remap");
+    }
+    // The member's own identity, added again from the blank row: the same refusal.
+    for (const observed of [BLANK, { original: null, remap: { revision: 1 } }]) {
+      const refused = await link(seed, alice, "gdrive", own, observed);
+      expect(refused, JSON.stringify(observed)).toEqual(ALREADY_LINKED);
+      expect(refused).not.toHaveProperty("remap");
+    }
+
+    // NO MUTATION: neither mapping, no audit row, no authority revision, epoch, obligation or
+    // deferred repair moved.
+    expect(await mapping(seed, "gdrive", held)).toEqual({ holder: bob, revision: 1, state: "linked" });
+    expect(await mapping(seed, "gdrive", own)).toEqual({ holder: alice, revision: 1, state: "linked" });
+    expect({
+      held: await effects(seed, "gdrive", held), own: await effects(seed, "gdrive", own),
+      heldAudits: await audits(seed, held), ownAudits: await audits(seed, own),
+    }).toEqual(before);
+  });
+
+  it("the blank Google row still CLAIMS a never-linked identity and RE-LINKS an unlinked tombstone at the tombstone's revision", async () => {
+    const seed = await adminSeed();
+    const alice = await member(seed, "Alice");
+    const bob = await member(seed, "Bob");
+    const target = idFor("gdrive", "tombstone");
+    expect(await link(seed, bob, "gdrive", target, BLANK)).toEqual({ ok: true });
+    expect(await link(seed, alice, "gdrive", target, BLANK)).toEqual(ALREADY_LINKED);
+    await unlinkDisplayed(seed, bob, "gdrive", target);
+    expect(await mapping(seed, "gdrive", target)).toEqual({ holder: null, revision: 2, state: "unlinked" });
+
+    // Nobody holds a tombstone: linking it is not a remap, and the protection does not apply.
+    expect(await link(seed, alice, "gdrive", target, BLANK)).toEqual({ ok: true });
+    expect(await mapping(seed, "gdrive", target)).toEqual({ holder: alice, revision: 3, state: "linked" });
+    expect((await effects(seed, "gdrive", target)).obligations).toEqual([1, 2, 3]);
+    // …and now that it is linked again, the blank row is refused again.
+    expect(await link(seed, bob, "gdrive", target, BLANK)).toEqual(ALREADY_LINKED);
+    expect(await mapping(seed, "gdrive", target)).toEqual({ holder: alice, revision: 3, state: "linked" });
+  });
+
+  it("CHANGE is the Google remap: the same held identity, requested from a row displaying the member's own, is offered and remapped on confirmation at the observed target revision", async () => {
+    const seed = await adminSeed();
+    const alice = await member(seed, "Alice");
+    const bob = await member(seed, "Bob");
+    const held = idFor("gdrive", "held");
+    expect(await link(seed, bob, "gdrive", held, BLANK)).toEqual({ ok: true });
+    const aliceRow = await ownRow(seed, alice, "gdrive");
+    const before = await effects(seed, "gdrive", held);
+
+    // Refused from the blank row…
+    expect(await link(seed, alice, "gdrive", held, BLANK)).toEqual(ALREADY_LINKED);
+    // …offered from the Change row, with nothing written by either.
+    expect(await link(seed, alice, "gdrive", held, { original: aliceRow })).toEqual({
+      ok: false, error: "this gdrive identity is linked to Bob; confirm to remap it",
+      remap: { externalId: held, revision: 1, linkedTo: "Bob" },
+    });
+    expect(await mapping(seed, "gdrive", held)).toEqual({ holder: bob, revision: 1, state: "linked" });
+    expect(await effects(seed, "gdrive", held)).toEqual(before);
+
+    // A confirmation naming a revision the admin was not shown is refused by the writer…
+    expect(await link(seed, alice, "gdrive", held, { original: aliceRow, remap: { revision: 2 } })).toEqual({ ok: false, error: STALE });
+    expect(await mapping(seed, "gdrive", held)).toEqual({ holder: bob, revision: 1, state: "linked" });
+    // …and the one naming the observed target revision remaps it, as the admin, with the writer's
+    // Drive effects: a durable obligation at the new revision and an advanced epoch.
+    expect(await link(seed, alice, "gdrive", held, { original: aliceRow, remap: { revision: 1 } })).toEqual({ ok: true });
+    expect(await mapping(seed, "gdrive", held)).toEqual({ holder: alice, revision: 2, state: "linked" });
+    expect((await audits(seed, held))[1]).toEqual(
+      { action: "identity.set", actor_kind: "member", member_id: seed.memberId, target_id: alice, mapping_revision: 2 });
+    const after = await effects(seed, "gdrive", held);
+    expect(after.obligations).toEqual([1, 2]);
+    expect(after.epoch).toBeGreaterThan(before.epoch);
+    expect(after.deferred).toBe(before.deferred + 1);
+    // Alice's own displayed identity is exactly as it was.
+    expect(await mapping(seed, "gdrive", aliceRow.externalId)).toEqual({ holder: alice, revision: aliceRow.revision, state: "linked" });
   });
 });
 

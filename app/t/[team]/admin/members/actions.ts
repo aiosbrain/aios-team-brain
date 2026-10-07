@@ -109,26 +109,29 @@ function isLinkObservation(value: unknown): value is IdentityLinkObservation {
 
 /**
  * Who holds ONE provider id now, and that id's mapping revision (0 when it has never had one —
- * the same reading the writer makes). Either read failing fails the action: an observation that
- * could not be made is not an observation of "absent".
+ * the same reading the writer makes). `linked` is true when a member holds it or its mapping state
+ * says so. Either read failing fails the action: an observation that could not be made is not an
+ * observation of "absent".
  */
 async function observeIdentity(
   db: ReturnType<typeof adminClient>,
   teamId: string,
   provider: string,
   externalId: string,
-): Promise<{ memberId: string | null; revision: number }> {
+): Promise<{ memberId: string | null; revision: number; linked: boolean }> {
   const [link, state] = await Promise.all([
     db.from("member_identities").select("member_id")
       .eq("team_id", teamId).eq("provider", provider).eq("external_id", externalId).maybeSingle(),
-    db.from("member_identity_mapping_state").select("revision")
+    db.from("member_identity_mapping_state").select("revision,state")
       .eq("team_id", teamId).eq("provider", provider).eq("external_id", externalId).maybeSingle(),
   ]);
   if (link.error) throw new Error(`${provider} identity link read failed: ${link.error.message}`);
   if (state.error) throw new Error(`${provider} identity authority read failed: ${state.error.message}`);
-  const revision = Number((state.data as { revision: string | number } | null)?.revision ?? 0);
+  const stored = state.data as { revision: string | number; state: string } | null;
+  const revision = Number(stored?.revision ?? 0);
   if (!isRevision(revision)) throw new Error(`${provider} identity authority read failed: unreadable revision`);
-  return { memberId: (link.data as { member_id: string } | null)?.member_id ?? null, revision };
+  const memberId = (link.data as { member_id: string } | null)?.member_id ?? null;
+  return { memberId, revision, linked: memberId !== null || stored?.state === "linked" };
 }
 
 /**
@@ -150,6 +153,11 @@ async function observeIdentity(
  *     then is the mapping forced. A remap is never the side effect of a link.
  * The displayed identity, when the request is for a different id, must itself still be what the
  * admin saw — still this member's, at the displayed revision — or the action refuses as stale.
+ *
+ * GOOGLE ADD PROTECTION. A blank "Add Google account" row that names an id already linked — to
+ * anyone — is refused outright: no remap is offered and none can be confirmed from it. Remapping a
+ * Google identity is a Change, made from a row that displays one of the member's own identities;
+ * re-linking an unlinked tombstone from the blank row stays possible.
  *
  * Without `observed` (a programmatic caller, `linkMemberSlack`) this is the unfenced admin write
  * it has always been: it forces over any prior mapping.
@@ -191,6 +199,11 @@ export async function linkMemberIdentity(
           }
         }
         const target = await observeIdentity(identityDb, ctx.teamId, p, ext);
+        // A blank "Add Google account" row starts from nothing observed. It may claim a new id or
+        // re-link a tombstone, but it never turns into a remap — offered or confirmed.
+        if (p === "gdrive" && !shown && target.linked) {
+          return { ok: false, error: "this Google identity is already linked; refresh and use Change" };
+        }
         if (target.memberId && target.memberId !== memberId) {
           if (!observed.remap) {
             const { data: holder, error } = await identityDb.from("members").select("display_name")

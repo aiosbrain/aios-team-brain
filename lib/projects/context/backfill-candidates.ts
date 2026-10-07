@@ -59,7 +59,16 @@ scoped as (
          case when i.access = 'external' then sys.general_id else sys.external_id end as opposite_id
     from items i cross join sys
    where i.team_id = $1
+     -- DRIVE-OWNED EXCLUSION, by BOTH signals. A Drive document's context comes from its audience
+     -- claims, never from this sweep: reconcile refuses it under the item lock, so selecting it
+     -- would only burn a reconcile every tick. Stored provenance alone is not enough — it can be
+     -- missing or altered — so the exact same-team mapping is checked too. Deliberately nothing
+     -- about the connection, its claims or its leases: none of them ends Drive's ownership.
      and coalesce(i.frontmatter->>'source','') <> 'gdrive'
+     and not exists (
+       select 1 from source_item_mappings dm
+        where dm.team_id = i.team_id and dm.item_id = i.id and dm.source = 'gdrive'
+     )
      and ($4::uuid is null or i.id > $4::uuid)
      and ($5::timestamptz is null or i.created_at < $5::timestamptz)
 )
