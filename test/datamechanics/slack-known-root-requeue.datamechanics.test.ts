@@ -5482,7 +5482,8 @@ describe("KR-08 concurrent preparers and publication orderings", () => {
  *     gives, with one live root witness bound to it in the exact scope;
  *   - a PLAIN FIXTURE ITEM is a bare item row with a chosen id, path and frontmatter.
  *
- * Chosen ids all begin `00000000-`, so they sort before a random id; each fixture ASSERTS, by reading
+ * Chosen ids all begin `00000000-`, so they sort before any random id that does not itself
+ * begin with eight zero digits (fewer than one random id in four billion does); each fixture ASSERTS, by reading
  * the team's ids back in PostgreSQL's own UUID order, that the order written out in the test is the
  * order the database has. An expected page is written from the specification's contract — at most
  * `pageSize` examined ids, one entry per examined id, a cursor after the last examined id inside the
@@ -5492,7 +5493,7 @@ type EnumCursor = SlackKnownRootItemPage["nextCursor"];
 type EnumExpectedEntry = { teamId: string; itemId: string; revisitAfterMs: number } & ({ locator: Record<string, unknown> } | { unlocated: string });
 interface EnumExpectedPage {
   entries: EnumExpectedEntry[];
-  nextCursor: Record<string, unknown> | null;
+  nextCursor: NonNullable<EnumCursor> | null;
   exhausted: boolean;
   examined: number;
 }
@@ -5506,7 +5507,12 @@ const enumLocated = (teamId: string, itemId: string, locator: Record<string, unk
   ({ teamId, itemId, revisitAfterMs: REVISIT_AFTER_MS, locator });
 const enumUnlocated = (teamId: string, itemId: string, unlocated: string): EnumExpectedEntry =>
   ({ teamId, itemId, revisitAfterMs: REVISIT_AFTER_MS, unlocated });
-const enumCursor = (teamId: string, upperItemId: string, afterItemId: string): Record<string, unknown> =>
+/**
+ * A cursor WRITTEN FROM THE CONTRACT: version, team, the frozen upper bound, the last examined id and
+ * the echoed policy. It is what a page is compared with, and it can be handed to a page read in
+ * place of a cursor a read returned.
+ */
+const enumCursor = (teamId: string, upperItemId: string, afterItemId: string): NonNullable<EnumCursor> =>
   ({ version: 1, teamId, upperItemId, afterItemId, revisitAfterMs: REVISIT_AFTER_MS });
 
 /** The pages a fixed, ordered population must be read as, WRITTEN FROM THE CONTRACT of §4.2 and §4.3. */
@@ -5559,9 +5565,13 @@ const enumEnded = (read: Promise<SlackKnownRootItemPage>): Promise<EnumEnded> =>
   }
 );
 
-/** Every item id of the team in PostgreSQL's OWN UUID order, with no predicate of the product's. */
+/**
+ * Every item id of the team in PostgreSQL's OWN UUID order, with no predicate of the product's. The
+ * order is taken from the BASE uuid column, qualified by its table alias: a bare `order by id` beside
+ * an output column `id::text as id` would name that text output, and sort as text.
+ */
 const enumItemIdsInUuidOrder = async (teamId: string): Promise<string[]> =>
-  (await query<{ id: string }>(`select id::text as id from items where team_id = $1 order by id`, [teamId])).map((row) => row.id);
+  (await query<{ item_id: string }>(`select i.id::text as item_id from items i where i.team_id = $1 order by i.id`, [teamId])).map((row) => row.item_id);
 
 /** The really published root as the fixture CHECKS enumeration against, and as synthetic roots are shaped from. */
 interface EnumReal {
@@ -5711,7 +5721,7 @@ describe("KR-02 exact enumeration traversal of a fixed population", () => {
       enumUnlocated(teamId, ordinaryId, "not_slack"),
     ].sort((a, b) => (a.itemId < b.itemId ? -1 : 1));
     expect(realItems[0].itemId > enumId(rootSlot(SYNTHETIC_ROOTS)),
-      `${label}: fixture: both real items' random ids sort after every chosen id (a one-in-two-billion miss: run again)`).toBe(true);
+      `${label}: fixture: both real items' random ids sort after every chosen id (a random id sorts lower only if it begins with eight zero digits, which fewer than one in four billion do: run again)`).toBe(true);
     const ordered = [...synthetic, ...realItems];
     const orderedIds = ordered.map((entry) => entry.itemId);
     const upperItemId = orderedIds[orderedIds.length - 1];
@@ -5784,9 +5794,12 @@ describe("KR-02 exact enumeration traversal of a fixed population", () => {
  *     the workspace id in lower case; the channel id in lower case; both in mixed case; another
  *     workspace with the same channel; the same workspace with another channel. Each has its OWN
  *     live root witness in its own scope;
- *   - one SPELLING DECOY in the target's own workspace and channel, canonical in every stored fact,
- *     whose root timestamp is another valid spelling of the SAME INSTANT (`1718900000.0001`). It has
- *     NO witness of its own;
+ *   - two SPELLING DECOYS in the target's own workspace and channel — so both are LOCATED, and no
+ *     missing binding stands in front of what they show — canonical in every stored fact, whose root
+ *     timestamps are the two OTHER valid spellings of the SAME INSTANT. The first
+ *     (`1718900000.0001`) has no ledger row bound to it. The second (`1718900000.00010`) has its OWN
+ *     live, overdue root witness, bound to its own item in the exact scope, stored under the FIRST
+ *     decoy's spelling and not under its own;
  *   - two PATH-NOISE items whose PATHS are lower-case, Slack-looking scoped paths, and whose
  *     frontmatter is not a Slack root's.
  *
@@ -5794,8 +5807,18 @@ describe("KR-02 exact enumeration traversal of a fixed population", () => {
  * exact provider bytes. A scope decoy located through them borrowed an authority fact by folding
  * case or by ignoring half of the scope. A path-noise item located at all had its path segments
  * turned into provider ids. And every decoy witness — like the other team's — is OVERDUE while the
- * target's own is fresh, so a preparation of the target that enqueues, or one of the spelling decoy
- * that finds a witness or pending work, used a row of another scope.
+ * target's own is fresh, so a preparation of the target that enqueues used a row of another scope.
+ * A spelling decoy that is anything but `missing_root_witness` matched a witness by its instant, or
+ * by its bytes without its item, and not by the exact bytes of its own root bound to its own item.
+ *
+ * THE PREPARATION CASE ADDS TWO THINGS, both before the target is first prepared. The real enqueue
+ * dependency writes a queue row of the SAME root bytes in four other scopes of the target team —
+ * workspace in lower case, channel in lower case, another workspace, another channel — so a target
+ * that is `already_pending`, or that is not enqueued when its own observation is overdue, read a
+ * queue row of another scope; those four rows must stay byte-identical throughout. And two
+ * FABRICATED entries are prepared: the published root's own enumerated entry with only its workspace
+ * id, or only its channel id, changed to lower case. Each names a scope that HAS a queue row and has
+ * no namespace gate naming it, and must be refused.
  *
  * LIMITS. The two teams' integration ids differ and are asserted to; their configuration revisions
  * and namespace revisions are whatever the product gave each team and may be equal, so those two
@@ -5820,6 +5843,9 @@ describe("KR-04 scope isolation of enumeration and preparation", () => {
     // A lower-case scoped path of the published root's own timestamp in a scope that does not exist.
     { slot: 8, path: "slack/t0other01/c0other1170/1718900000.000100.md", frontmatter: { source: "slack" }, category: "invalid_metadata" },
   ];
+  /** The third valid spelling of that instant: five fractional digits. */
+  const SECOND_SPELLING = "1718900000.00010";
+  const SECOND_SPELLING_SLOT = 9;
   const overdueUnderTheRevisitPolicy = `(w.observed_at + interval '60 seconds') <= clock_timestamp()`;
 
   interface Scopes {
@@ -5871,13 +5897,27 @@ describe("KR-04 scope isolation of enumeration and preparation", () => {
       [target.teamId, OLD_ROOT, SCOPE_DECOYS.map((decoy) => enumId(decoy.slot)), SCOPE_DECOYS.map((decoy) => decoy.workspaceId), SCOPE_DECOYS.map((decoy) => decoy.channelId)]
     );
     expect(witnesses.rowCount, `${label}: fixture: one live root witness per scope decoy was inserted`).toBe(SCOPE_DECOYS.length);
-    // THE SPELLING DECOY: canonical in every stored fact, in the target's own scope, with NO witness.
+    // THE FIRST SPELLING DECOY: canonical in every stored fact, in the target's own scope, with NO ledger row bound to it.
     await enumPlantCanonicalRoots(target, [{ id: enumId(SPELLING_SLOT), ts: OTHER_SPELLING }], "kr04-spelling-decoy", false);
     await enumPlantItems(target.teamId, project, PATH_NOISE.map((noise) => ({ id: enumId(noise.slot), path: noise.path, frontmatter: noise.frontmatter })));
+    // THE SECOND SPELLING DECOY: canonical in every stored fact under ITS OWN spelling, with its OWN
+    // live, overdue root witness — bound to its own item, in the exact scope — stored under the
+    // OTHER spelling of the same instant.
+    await enumPlantCanonicalRoots(target, [{ id: enumId(SECOND_SPELLING_SLOT), ts: SECOND_SPELLING }], "kr04-second-spelling-decoy", false);
+    const underTheOtherSpelling = await raw.query(
+      `insert into slack_messages (team_id, item_id, workspace_id, channel_id, message_ts, root_ts, author_external_id,
+                                   occurred_at, is_root, eligible, exclusion_reason, deleted_at, last_seen_generation, source_hash, observed_at)
+       select $1::uuid, $2::uuid, $3::text, $4::text, $5::text, $5::text, 'U1',
+              to_timestamp(split_part($5::text, '.', 1)::bigint) + rpad(split_part($5::text, '.', 2), 6, '0')::int * interval '1 microsecond',
+              true, true, null::text, null::timestamptz, 0, repeat('a', 64), clock_timestamp() - interval '2 hours'`,
+      [target.teamId, enumId(SECOND_SPELLING_SLOT), WORKSPACE, CHANNEL, OTHER_SPELLING]
+    );
+    expect(underTheOtherSpelling.rowCount, `${label}: fixture: the second spelling decoy's own witness was inserted under the other spelling`).toBe(1);
 
     // FIXTURE READBACKS.
-    expect([OTHER_SPELLING === OLD_ROOT, parseSlackTimestamp(OLD_ROOT)?.iso, parseSlackTimestamp(OTHER_SPELLING)?.iso], `${label}: fixture: two byte-distinct valid spellings of one instant`)
-      .toEqual([false, "2024-06-20T16:13:20.000100Z", "2024-06-20T16:13:20.000100Z"]);
+    expect([new Set([OLD_ROOT, OTHER_SPELLING, SECOND_SPELLING]).size, parseSlackTimestamp(OLD_ROOT)?.iso, parseSlackTimestamp(OTHER_SPELLING)?.iso, parseSlackTimestamp(SECOND_SPELLING)?.iso],
+      `${label}: fixture: three byte-distinct valid spellings of one instant`)
+      .toEqual([3, "2024-06-20T16:13:20.000100Z", "2024-06-20T16:13:20.000100Z", "2024-06-20T16:13:20.000100Z"]);
     expect(SCOPE_DECOYS.slice(0, 3).map((decoy) => [decoy.workspaceId.toUpperCase() === WORKSPACE.toUpperCase(), decoy.channelId.toUpperCase() === CHANNEL.toUpperCase(),
       decoy.workspaceId === WORKSPACE && decoy.channelId === CHANNEL]), `${label}: fixture: the three case decoys differ from the published scope by case, and only by case`)
       .toEqual([[true, true, false], [true, true, false], [true, true, false]]);
@@ -5894,22 +5934,41 @@ describe("KR-04 scope isolation of enumeration and preparation", () => {
       `target ${WORKSPACE} ${CHANNEL} fresh`,
       ...SCOPE_DECOYS.map((decoy) => `target ${decoy.workspaceId} ${decoy.channelId} OVERDUE`),
     ].sort());
-    expect(await query(`select count(*)::int as rows from slack_messages where team_id = $1 and (message_ts = $2 or root_ts = $2)`, [target.teamId, OTHER_SPELLING]),
-      `${label}: fixture: no ledger row carries the other spelling`).toEqual([{ rows: 0 }]);
+    // Every live root witness in the published root's EXACT workspace and channel: the published
+    // root's own, fresh, under its own bytes; and the second spelling decoy's own, overdue, under the
+    // first decoy's spelling. No ledger row is bound to the first decoy, and none carries the second
+    // decoy's own spelling.
+    const inTheExactScope = await query<{ message_ts: string; root_ts: string; item_id: string; overdue: boolean }>(
+      `select w.message_ts, w.root_ts, w.item_id::text as item_id, ${overdueUnderTheRevisitPolicy} as overdue
+         from slack_messages w
+        where w.team_id = $1 and w.workspace_id = $2 and w.channel_id = $3 and w.is_root and w.deleted_at is null`, [target.teamId, WORKSPACE, CHANNEL]
+    );
+    expect(inTheExactScope.map((row) => `${row.message_ts} ${row.root_ts} item ${row.item_id} ${row.overdue ? "OVERDUE" : "fresh"}`).sort(),
+      `${label}: fixture: two live root witnesses in the exact scope, each bound to its own item under the bytes written here`).toEqual([
+      `${OLD_ROOT} ${OLD_ROOT} item ${target.itemId} fresh`,
+      `${OTHER_SPELLING} ${OTHER_SPELLING} item ${enumId(SECOND_SPELLING_SLOT)} OVERDUE`,
+    ].sort());
+    expect(await query(
+      `select (select count(*)::int from slack_messages where team_id = $1 and item_id = $2::uuid) as rows_bound_to_the_first_spelling_decoy,
+              (select count(*)::int from slack_messages where team_id = $1 and (message_ts = $3 or root_ts = $3)) as rows_under_the_second_decoys_own_spelling`,
+      [target.teamId, enumId(SPELLING_SLOT), SECOND_SPELLING]
+    ), `${label}: fixture: no ledger row is bound to the first spelling decoy, and none carries the second decoy's own spelling`)
+      .toEqual([{ rows_bound_to_the_first_spelling_decoy: 0, rows_under_the_second_decoys_own_spelling: 0 }]);
     // The authority rows the published root is located through exist ONCE in the target team, for the exact bytes.
     expect(await query(`select workspace_id, channel_id from slack_sync_channels where team_id = $1`, [target.teamId]),
       `${label}: fixture: the target team has one channel row, for the exact provider bytes`).toEqual([{ workspace_id: WORKSPACE, channel_id: CHANNEL }]);
     expect(await query(`select raw_channel_id from slack_channel_migration_gates where team_id = $1`, [target.teamId]),
       `${label}: fixture: the target team has one namespace gate, for the exact channel bytes`).toEqual([{ raw_channel_id: CHANNEL }]);
-    expect(target.itemId > enumId(PATH_NOISE[PATH_NOISE.length - 1].slot), `${label}: fixture: the published item's random id sorts after every chosen id (a one-in-four-billion miss: run again)`).toBe(true);
+    expect(target.itemId > enumId(SECOND_SPELLING_SLOT), `${label}: fixture: the published item's random id sorts after every chosen id (a random id sorts lower only if it begins with eight zero digits, which fewer than one in four billion do: run again)`).toBe(true);
 
     const expectedTargetEntries = [
       ...SCOPE_DECOYS.map((decoy) => enumUnlocated(target.teamId, enumId(decoy.slot), "missing_channel_binding")),
       enumLocated(target.teamId, enumId(SPELLING_SLOT), target.locatorOf(OTHER_SPELLING)),
       ...PATH_NOISE.map((noise) => enumUnlocated(target.teamId, enumId(noise.slot), noise.category)),
+      enumLocated(target.teamId, enumId(SECOND_SPELLING_SLOT), target.locatorOf(SECOND_SPELLING)),
       enumLocated(target.teamId, target.itemId, target.locatorOf(OLD_ROOT)),
     ];
-    expect(await enumItemIdsInUuidOrder(target.teamId), `${label}: fixture: the target team's nine items, in PostgreSQL's UUID order`).toEqual(expectedTargetEntries.map((entry) => entry.itemId));
+    expect(await enumItemIdsInUuidOrder(target.teamId), `${label}: fixture: the target team's ten items, in PostgreSQL's UUID order`).toEqual(expectedTargetEntries.map((entry) => entry.itemId));
     expect(await lifecycleQueueAndStagingAnywhere(), `${label}: fixture: no pending work and no staging in either team`).toEqual({ queue: [], staging: [] });
     return { target, other, expectedTargetEntries };
   }
@@ -5918,6 +5977,23 @@ describe("KR-04 scope isolation of enumeration and preparation", () => {
   const queueRowsAnywhere = async (): Promise<string[]> => (await query(
     `select team_id::text as team_id, workspace_id, channel_id, root_ts, status, attempts from slack_sync_threads`
   )).map((row) => `${row.team_id} ${row.workspace_id} ${row.channel_id} ${row.root_ts} ${row.status} ${row.attempts}`).sort();
+
+  /** Every queue row of the team OUTSIDE the published root's exact workspace and channel: every column, as the database renders the whole row. */
+  const queueOutsideTheExactScope = async (teamId: string): Promise<string[]> => (await query(
+    `select to_jsonb(t)::text as stored from slack_sync_threads t where t.team_id = $1 and not (t.workspace_id = $2 and t.channel_id = $3)`, [teamId, WORKSPACE, CHANNEL]
+  )).map((row) => row.stored as string).sort();
+  /** Every queue row of the team IN the published root's exact workspace and channel, whole. */
+  const queueInTheExactScopeExactly = async (teamId: string): Promise<string[]> => (await query(
+    `select to_jsonb(t)::text as stored from slack_sync_threads t where t.team_id = $1 and t.workspace_id = $2 and t.channel_id = $3`, [teamId, WORKSPACE, CHANNEL]
+  )).map((row) => row.stored as string).sort();
+  /** The same rows against an exact due instant: scope, state, and the due rounded UP to its millisecond. */
+  const queueInTheExactScopeAgainst = (teamId: string, exactDue: string): Promise<Row[]> => query(
+    `select t.workspace_id, t.channel_id, t.root_ts, t.status, t.attempts,
+            t.due_at >= $4::timestamptz as not_before_the_exact_due,
+            t.due_at < $4::timestamptz + interval '1 millisecond' as less_than_a_millisecond_after_it,
+            to_char(t.due_at at time zone 'UTC', 'US') like '%000' as on_a_whole_millisecond
+       from slack_sync_threads t where t.team_id = $1 and t.workspace_id = $2 and t.channel_id = $3`, [teamId, WORKSPACE, CHANNEL, exactDue]
+  );
 
   /** Preparation on a transaction of its own, from the team and the enumerated entry ALONE. */
   function prepared(teamId: string, entry: SlackKnownRootEntry): Promise<SlackKnownRootPreparationResult> {
@@ -5946,8 +6022,11 @@ describe("KR-04 scope isolation of enumeration and preparation", () => {
       expect(targetPage.entries[SCOPE_DECOYS.length + 1 + index], `${label}: an item at ${noise.path} is ${noise.category}: no provider id was taken from its path`)
         .toEqual(enumUnlocated(target.teamId, enumId(noise.slot), noise.category));
     }
+    // The second spelling, likewise: its own bytes, not the spelling its own witness is stored under.
+    expect(targetPage.entries[SCOPE_DECOYS.length + 1 + PATH_NOISE.length], `${label}: the second spelling of the instant is located with its own timestamp bytes, not those its witness is stored under`)
+      .toEqual(enumLocated(target.teamId, enumId(SECOND_SPELLING_SLOT), target.locatorOf(SECOND_SPELLING)));
     // THE WHOLE PAGE of each team.
-    expect(targetPage, `${label}: the target team's page, whole`).toEqual({ entries: expectedTargetEntries, nextCursor: null, exhausted: true, examined: 9 });
+    expect(targetPage, `${label}: the target team's page, whole`).toEqual({ entries: expectedTargetEntries, nextCursor: null, exhausted: true, examined: 10 });
     expect(otherPage, `${label}: the other team's page is its own one root, with its own integration`).toEqual({
       entries: [enumLocated(other.teamId, other.itemId, other.locatorOf(OLD_ROOT))], nextCursor: null, exhausted: true, examined: 1,
     });
@@ -5955,7 +6034,7 @@ describe("KR-04 scope isolation of enumeration and preparation", () => {
     const integrationOf = (page: SlackKnownRootItemPage): unknown[] =>
       page.entries.flatMap((entry) => ("locator" in entry ? [entry.locator.integrationId] : []));
     expect([integrationOf(targetPage), integrationOf(otherPage)], `${label}: no locator carries the other team's integration`)
-      .toEqual([[target.f.integrationId, target.f.integrationId], [other.f.integrationId]]);
+      .toEqual([[target.f.integrationId, target.f.integrationId, target.f.integrationId], [other.f.integrationId]]);
 
     expect({ target: await lifecycleSnapshot(target.teamId), other: await lifecycleSnapshot(other.teamId) }, `${label}: enumeration changed no row of any snapshotted surface of either team`).toEqual(before);
     expect(await lifecycleQueueAndStagingAnywhere(), `${label}: no pending work and no staging in either team`).toEqual({ queue: [], staging: [] });
@@ -5968,7 +6047,9 @@ describe("KR-04 scope isolation of enumeration and preparation", () => {
     const otherPage = await enumPage(other.teamId, 100);
     expect([targetPage.entries, otherPage.entries.length], `${label}: fixture: both pages are the ones the enumeration case requires`).toEqual([expectedTargetEntries, 1]);
     const targetEntry = targetPage.entries[targetPage.entries.length - 1];
+    if (!("locator" in targetEntry)) throw new Error("fixture: the published root's entry is not a located one");
     const spellingEntry = targetPage.entries[SCOPE_DECOYS.length];
+    const secondSpellingEntry = targetPage.entries[SCOPE_DECOYS.length + 1 + PATH_NOISE.length];
     const otherEntry = otherPage.entries[0];
     /** Every entry of the target team's page but the published root's own, with the result each must have. */
     const decoyResults: [what: string, entry: SlackKnownRootEntry, expected: SlackKnownRootPreparationResult][] = [
@@ -5977,46 +6058,84 @@ describe("KR-04 scope isolation of enumeration and preparation", () => {
       ["the other spelling of the instant", spellingEntry, { outcome: "unattested", reason: "missing_root_witness" }],
       ["path noise, not Slack", targetPage.entries[SCOPE_DECOYS.length + 1], { outcome: "unattested", reason: "not_slack" }],
       ["path noise, Slack without ids", targetPage.entries[SCOPE_DECOYS.length + 2], { outcome: "unattested", reason: "invalid_metadata" }],
+      ["the second spelling of the instant, whose own witness is stored under the other spelling", secondSpellingEntry, { outcome: "unattested", reason: "missing_root_witness" }],
     ];
+    /**
+     * FABRICATED entries: the published root's own enumerated entry — its item, its integration, its
+     * configuration revision, its namespace revision — with ONE provider id changed to lower case.
+     * No enumeration returned either. Each names a scope in which a queue row of these root bytes is
+     * planted below.
+     */
+    const fabricated: [what: string, entry: SlackKnownRootEntry][] = [
+      ["the published root's entry with its workspace id in lower case", { ...targetEntry, locator: { ...targetEntry.locator, workspaceId: SCOPE_DECOYS[0].workspaceId } }],
+      ["the published root's entry with its channel id in lower case", { ...targetEntry, locator: { ...targetEntry.locator, channelId: SCOPE_DECOYS[1].channelId } }],
+    ];
+    const REFUSED_AT_THE_NAMESPACE_GATE: SlackKnownRootPreparationResult = { outcome: "refused", reason: "namespace_changed_or_unready" };
+
+    // ── 0. QUEUE ROWS OF THE SAME ROOT BYTES IN FOUR OTHER SCOPES of the target team, each written
+    //       by the real enqueue dependency before the target is prepared at all. ──
+    const queuedElsewhere = [SCOPE_DECOYS[0], SCOPE_DECOYS[1], SCOPE_DECOYS[3], SCOPE_DECOYS[4]];
+    for (const decoy of queuedElsewhere) {
+      const written = await tx((s) => enqueueSlackThread(s, { teamId: target.teamId, workspaceId: decoy.workspaceId, channelId: decoy.channelId, rootTs: OLD_ROOT }));
+      expect(written.inserted, `${label}: fixture: the real enqueue dependency inserted a queue row of the same root bytes for: ${decoy.what}`).toBe(true);
+    }
+    const elsewhereRows = queuedElsewhere.map((decoy) => `${target.teamId} ${decoy.workspaceId} ${decoy.channelId} ${OLD_ROOT} queued 0`);
+    expect(await queueRowsAnywhere(), `${label}: fixture: four queue rows in the database, of the same root bytes, each in another scope of the target team`).toEqual([...elsewhereRows].sort());
+    const elsewhereExactly = await queueOutsideTheExactScope(target.teamId);
+    expect([elsewhereExactly.length, await queueInTheExactScopeExactly(target.teamId)], `${label}: fixture: four whole rows outside the published root's exact scope, and none inside it`).toEqual([4, []]);
     const before = { target: await lifecycleSnapshot(target.teamId), other: await lifecycleSnapshot(other.teamId) };
 
     // ── 1. THE TARGET'S OWN WITNESS IS FRESH. The same bytes are overdue in the other team and in
-    //       five other scopes of this team. ──
-    expect(await prepared(target.teamId, targetEntry), `${label}: the published root is not_due on its own fresh observation, whatever is overdue in another scope`).toEqual({ outcome: "not_due" });
+    //       five other scopes of this team, and QUEUED in four of those. ──
+    expect(await prepared(target.teamId, targetEntry), `${label}: the published root is not_due on its own fresh observation: neither an overdue witness nor a queue row of the same root bytes in another scope is its own`).toEqual({ outcome: "not_due" });
     for (const [what, entry, expected] of decoyResults) {
       expect(await prepared(target.teamId, entry), `${label}: ${what}: unattested, on its own facts`).toEqual(expected);
     }
-    expect(await queueRowsAnywhere(), `${label}: nothing was enqueued in any team or scope`).toEqual([]);
-    expect({ target: await lifecycleSnapshot(target.teamId), other: await lifecycleSnapshot(other.teamId) }, `${label}: nine preparations changed no row of any snapshotted surface of either team`).toEqual(before);
+    for (const [what, entry] of fabricated) {
+      expect(await prepared(target.teamId, entry), `${label}: fabricated: ${what}: refused at the namespace gate, whatever is queued in the scope it names`).toEqual(REFUSED_AT_THE_NAMESPACE_GATE);
+    }
+    expect(await queueRowsAnywhere(), `${label}: nothing was enqueued in any team or scope: the four rows of other scopes are the only queue rows`).toEqual([...elsewhereRows].sort());
+    expect([await queueOutsideTheExactScope(target.teamId), await queueInTheExactScopeExactly(target.teamId)], `${label}: the four rows of other scopes are byte-identical, and there is no row in the published root's exact scope`)
+      .toEqual([elsewhereExactly, []]);
+    expect({ target: await lifecycleSnapshot(target.teamId), other: await lifecycleSnapshot(other.teamId) }, `${label}: none of those preparations changed a row of any snapshotted surface of either team`).toEqual(before);
 
     // ── 2. THE OTHER TEAM's root is overdue, and is enqueued for the other team only. ──
     expect(await prepared(other.teamId, otherEntry), `${label}: the other team's overdue root is enqueued`).toEqual({ outcome: "enqueued" });
     const otherRow = `${other.teamId} ${WORKSPACE} ${CHANNEL} ${OLD_ROOT} queued 0`;
-    expect(await queueRowsAnywhere(), `${label}: exactly one queue row, the other team's, in its exact scope`).toEqual([otherRow]);
+    expect(await queueRowsAnywhere(), `${label}: exactly one queue row was added, the other team's, in its exact scope`).toEqual([...elsewhereRows, otherRow].sort());
     expect(await lifecycleSnapshot(target.teamId), `${label}: the other team's preparation changed no row of the target team`).toEqual(before.target);
     expect(lifecycleTablesThatDiffer(before.other, await lifecycleSnapshot(other.teamId)), `${label}: of the other team's surfaces only its queue changed`).toEqual(["slack_sync_threads"]);
     const otherQueueExactly = await lifecycleQueueRowsExactly(other.teamId);
     // The other team's pending row, of the same bytes, is not the target's pending work.
     expect(await prepared(target.teamId, targetEntry), `${label}: the published root is still not_due: the other team's queue row is not its pending work`).toEqual({ outcome: "not_due" });
 
-    // ── 3. FIXTURE AGING of the target's own witness. Now, and only now, it is enqueued. ──
+    // ── 3. FIXTURE AGING of the target's own witness. Now, and only now, it is enqueued — although
+    //       four rows of the same root bytes were pending in other scopes all along. ──
     const exactDue = await ageOwnWitness(target, `${label}: the target team`);
     expect(await prepared(target.teamId, targetEntry), `${label}: the published root is enqueued once its own observation is overdue`).toEqual({ outcome: "enqueued" });
-    expect(await lifecycleQueueAgainst(target.teamId, exactDue), `${label}: exactly one queue row of the target team, in the exact provider scope, at its own exact due instant`)
+    expect(await queueInTheExactScopeAgainst(target.teamId, exactDue), `${label}: exactly one queue row of the target team in the exact provider scope, at its own exact due instant`)
       .toEqual(LIFECYCLE_ONE_ROW_AT_THE_EXACT_DUE);
-    expect(await queueRowsAnywhere(), `${label}: two queue rows in the database, one per team, each in its exact scope`)
-      .toEqual([otherRow, `${target.teamId} ${WORKSPACE} ${CHANNEL} ${OLD_ROOT} queued 0`].sort());
+    expect(await queueRowsAnywhere(), `${label}: six queue rows in the database: the four of other scopes, the other team's, and the published root's own, each in its exact scope`)
+      .toEqual([...elsewhereRows, otherRow, `${target.teamId} ${WORKSPACE} ${CHANNEL} ${OLD_ROOT} queued 0`].sort());
+    expect(await queueOutsideTheExactScope(target.teamId), `${label}: the four queue rows of other scopes are byte-identical after the published root was enqueued`).toEqual(elsewhereExactly);
     expect(await lifecycleQueueRowsExactly(other.teamId), `${label}: the other team's queue row is byte-identical`).toEqual(otherQueueExactly);
-    const targetQueueExactly = await lifecycleQueueRowsExactly(target.teamId);
+    const targetQueueExactly = await queueInTheExactScopeExactly(target.teamId);
+    expect(targetQueueExactly.length, `${label}: fixture: one whole row in the published root's exact scope`).toBe(1);
 
-    // ── 4. WITH THE PUBLISHED ROOT PENDING, every decoy is still judged on its own facts: the other
-    //       spelling of the same instant has no witness and is not "already pending". ──
+    // ── 4. WITH THE PUBLISHED ROOT PENDING, every decoy is still judged on its own facts: neither
+    //       other spelling of the same instant has a witness of its own bytes bound to its own
+    //       item, and neither is "already pending"; and a fabricated entry is still refused. ──
     for (const [what, entry, expected] of decoyResults) {
       expect(await prepared(target.teamId, entry), `${label}: ${what}: unchanged by the published root's pending row`).toEqual(expected);
     }
+    for (const [what, entry] of fabricated) {
+      expect(await prepared(target.teamId, entry), `${label}: fabricated: ${what}: still refused, and not already_pending, with the published root and the scope it names both pending`).toEqual(REFUSED_AT_THE_NAMESPACE_GATE);
+    }
     expect(await prepared(target.teamId, targetEntry), `${label}: the published root itself is now already_pending`).toEqual({ outcome: "already_pending" });
-    expect([await lifecycleQueueRowsExactly(target.teamId), await lifecycleQueueRowsExactly(other.teamId)], `${label}: both queue rows are byte-identical, and there is no third`)
-      .toEqual([targetQueueExactly, otherQueueExactly]);
+    expect([await queueInTheExactScopeExactly(target.teamId), await queueOutsideTheExactScope(target.teamId), await lifecycleQueueRowsExactly(other.teamId)],
+      `${label}: the published root's row, the four rows of other scopes and the other team's row are all byte-identical, and there is no seventh`)
+      .toEqual([targetQueueExactly, elsewhereExactly, otherQueueExactly]);
+    expect((await queueRowsAnywhere()).length, `${label}: six queue rows in the database`).toBe(6);
     expect((await lifecycleQueueAndStagingAnywhere()).staging, `${label}: nothing is staged`).toEqual([]);
   });
 });
@@ -6036,6 +6155,12 @@ describe("KR-04 scope isolation of enumeration and preparation", () => {
  * past on page 1; one that advanced past the last Slack-looking entry would stop one short on pages 2
  * and 3; and one that advanced past the last LOCATED entry would have nothing on pages 1 and 2 and
  * stop two short on page 3. Every plain item sits at a lower-case, Slack-looking path, which is noise.
+ *
+ * HOW THE PAGES ARE READ. At page size five nothing traverses: page 1 is read and judged whole first,
+ * and pages 2, 3 and 4 are each asked for with the cursor the contract requires of the page before,
+ * written out in the test. A read that does not advance, or advances short, therefore fails the
+ * labeled assertion of the page it is wrong on — never a page cap of this file, and never the
+ * product's own validation of a cursor it produced.
  *
  * NOT CLAIMED: `missing_namespace_pin` (no channel row without a gate is built here), the deleted
  * cursor (the KR-11 suite below), contention, or the classifier and reducer parts of KR-10.
@@ -6071,7 +6196,7 @@ describe("KR-10 sparse and all-unlocated pages advance by examined id (M7)", () 
     const project = await enumFixtureProject(teamId, "m7-noise");
     await enumPlantCanonicalRoots(real, ROOT_SLOTS.map((slot) => ({ id: enumId(slot), ts: synthTs(slot) })), "m7-root");
     await enumPlantItems(teamId, project, PLAIN.map(([slot, frontmatter]) => ({ id: enumId(slot), path: noisePath(slot), frontmatter })));
-    expect(real.itemId > enumId(16), `${label}: fixture: the published item's random id sorts after every chosen id (a one-in-four-billion miss: run again)`).toBe(true);
+    expect(real.itemId > enumId(16), `${label}: fixture: the published item's random id sorts after every chosen id (a random id sorts lower only if it begins with eight zero digits, which fewer than one in four billion do: run again)`).toBe(true);
 
     const bySlot = new Map<number, EnumExpectedEntry>([
       ...PLAIN.map(([slot, , category]): [number, EnumExpectedEntry] => [slot, enumUnlocated(teamId, enumId(slot), category)]),
@@ -6086,25 +6211,40 @@ describe("KR-10 sparse and all-unlocated pages advance by examined id (M7)", () 
       `${label}: fixture: thirteen plain items sit at lower-case, Slack-looking paths`).toEqual([{ rows: 13 }]);
     const before = await lifecycleSnapshot(teamId);
 
-    // ── PAGE SIZE FIVE, every page written out. ──
-    const pages = await enumTraverse(teamId, 5, 8);
-    expect(pages[0], `${label}: page 1: five non-Slack items are five not_slack entries, and the cursor is after the fifth`).toEqual({
-      entries: slots(1, 5), nextCursor: enumCursor(teamId, real.itemId, enumId(5)), exhausted: false, examined: 5,
+    // ── PAGE SIZE FIVE, ONE READ AT A TIME, every page written out. Page 1 is judged, whole, before
+    //    anything is read after it. Each later page is then asked for with the cursor the CONTRACT
+    //    requires of the page before it — written out here, never one a page read returned — so a
+    //    read that advances wrongly, or not at all, fails the labeled assertion of the page it is
+    //    wrong on, and no later read depends on it. Each read's END is one closed value. ──
+    const upper = real.itemId;
+    const categories = (ended: EnumEnded): unknown =>
+      ("page" in ended ? ended.page.entries.map((entry) => ("unlocated" in entry ? entry.unlocated : "LOCATED")) : ended);
+
+    const first = await enumEnded(enumPage(teamId, 5));
+    expect(first, `${label}: page 1: five non-Slack items are five not_slack entries, and the cursor is after the fifth`).toEqual({
+      page: { entries: slots(1, 5), nextCursor: enumCursor(teamId, upper, enumId(5)), exhausted: false, examined: 5 },
     });
-    expect(pages[0].entries.map((entry) => ("unlocated" in entry ? entry.unlocated : "LOCATED")), `${label}: page 1: every entry is not_slack`)
+    expect(categories(first), `${label}: page 1: every entry is not_slack`)
       .toEqual(["not_slack", "not_slack", "not_slack", "not_slack", "not_slack"]);
-    expect(pages[1], `${label}: page 2: nothing located, each entry with its closed category, and the cursor is after the non-Slack item that ends the page`).toEqual({
-      entries: slots(6, 10), nextCursor: enumCursor(teamId, real.itemId, enumId(10)), exhausted: false, examined: 5,
+
+    const second = await enumEnded(enumPage(teamId, 5, enumCursor(teamId, upper, enumId(5))));
+    expect(second, `${label}: page 2: nothing located, each entry with its closed category, and the cursor is after the non-Slack item that ends the page`).toEqual({
+      page: { entries: slots(6, 10), nextCursor: enumCursor(teamId, upper, enumId(10)), exhausted: false, examined: 5 },
     });
-    expect(pages[1].entries.map((entry) => ("unlocated" in entry ? entry.unlocated : "LOCATED")), `${label}: page 2: the four closed categories, in order`)
+    expect(categories(second), `${label}: page 2: the four closed categories, in order`)
       .toEqual(["invalid_metadata", "invalid_metadata", "missing_channel_binding", "missing_channel_binding", "not_slack"]);
-    expect(pages[2], `${label}: page 3: two roots among three unlocated items, and the cursor is after the unrelated item that ends the page`).toEqual({
-      entries: slots(11, 15), nextCursor: enumCursor(teamId, real.itemId, enumId(15)), exhausted: false, examined: 5,
+
+    const third = await enumEnded(enumPage(teamId, 5, enumCursor(teamId, upper, enumId(10))));
+    expect(third, `${label}: page 3: two roots among three unlocated items, and the cursor is after the unrelated item that ends the page`).toEqual({
+      page: { entries: slots(11, 15), nextCursor: enumCursor(teamId, upper, enumId(15)), exhausted: false, examined: 5 },
     });
-    expect(pages[3], `${label}: page 4: the two roots that follow, and the range has ended`).toEqual({
-      entries: [...slots(16, 16), publishedRoot], nextCursor: null, exhausted: true, examined: 2,
+
+    const fourth = await enumEnded(enumPage(teamId, 5, enumCursor(teamId, upper, enumId(15))));
+    expect(fourth, `${label}: page 4: the two roots that follow, and the range has ended`).toEqual({
+      page: { entries: [...slots(16, 16), publishedRoot], nextCursor: null, exhausted: true, examined: 2 },
     });
-    expect(pages.length, `${label}: four pages at page size five`).toBe(4);
+    expect([first, second, third, fourth].map((ended) => ("page" in ended ? ended.page.exhausted : "REJECTED")), `${label}: four pages at page size five, and only the fourth says the range has ended`)
+      .toEqual([false, false, false, true]);
 
     // ── BOUNDED OUTPUT at two more sizes: never more than the page size, never fewer than there are. ──
     for (const [pageSize, pageCount] of [[3, 6], [100, 1]]) {
@@ -6114,7 +6254,7 @@ describe("KR-10 sparse and all-unlocated pages advance by examined id (M7)", () 
         `${label}: page size ${pageSize}: ${pageCount} page(s), none over the page size, one entry per examined id`).toEqual([pageCount, 0]);
     }
 
-    expect(await lifecycleSnapshot(teamId), `${label}: three traversals changed no row of any snapshotted surface`).toEqual(before);
+    expect(await lifecycleSnapshot(teamId), `${label}: the four reads and the two traversals changed no row of any snapshotted surface`).toEqual(before);
     expect(await lifecycleQueueAndStagingAnywhere(), `${label}: no pending work and no staging was created`).toEqual({ queue: [], staging: [] });
   });
 
@@ -6148,9 +6288,9 @@ describe("KR-10 sparse and all-unlocated pages advance by examined id (M7)", () 
  * population changes (`docs/design/slack-known-root-requeue-spec.md` §4.2, §4.3, §9, §11 KR-11 and
  * KR-15, §12 M8a and M8b).
  *
- * TWELVE ORIGINAL ITEMS: eleven with chosen ids `…10` to `…b0`, alternately plain items and synthetic
- * canonical roots, and the really published root, whose random id is the greatest and is therefore
- * the UPPER BOUND the first page freezes. Page size four. Between pages, labeled fixture DML:
+ * TWELVE ORIGINAL ITEMS: eleven with chosen ids `…10` to `…b0` — five plain items and six synthetic
+ * canonical roots, interleaved — and the really published root, whose random id is the greatest and
+ * is therefore the UPPER BOUND the first page freezes. Page size four. Between pages, labeled fixture DML:
  *
  *   after page 1   deletes `…20` (an earlier item) and `…40` (THE CURSOR ITEM), and inserts `…15`
  *                  (below the consumed cursor), `…55` (strictly between the cursor and the bound) and
@@ -6193,7 +6333,11 @@ describe("KR-11 continuation inside a frozen key range (M8a, M8b)", () => {
     const root = (slot: number): EnumExpectedEntry => enumLocated(teamId, enumId(slot), real.locatorOf(tsOf(slot)));
     const plain = (itemId: string): EnumExpectedEntry => enumUnlocated(teamId, itemId, "not_slack");
     const publishedRoot = enumLocated(teamId, real.itemId, real.locatorOf(OLD_ROOT));
-    const cursorAfter = (itemId: string, upperItemId = bound): Record<string, unknown> => enumCursor(teamId, upperItemId, itemId);
+    const cursorAfter = (itemId: string, upperItemId = bound): NonNullable<EnumCursor> => enumCursor(teamId, upperItemId, itemId);
+    /** The ids, the cursor and the exhaustion of one page read's end — or, if it was rejected, that. */
+    const idsAndCursor = (ended: EnumEnded): unknown => ("page" in ended
+      ? { ids: ended.page.entries.map((entry) => entry.itemId), nextCursor: ended.page.nextCursor, exhausted: ended.page.exhausted }
+      : ended);
     const pageOf = (page: EnumEnded): SlackKnownRootItemPage => {
       if (!("page" in page)) throw new Error("fixture: the page read did not return a page");
       return page.page;
@@ -6206,7 +6350,9 @@ describe("KR-11 continuation inside a frozen key range (M8a, M8b)", () => {
     expect(first, `${label}: page 1: the first four originals, and a cursor after the fourth inside the frozen bound`).toEqual({
       page: { entries: [plain(enumId(0x10)), root(0x20), plain(enumId(0x30)), root(0x40)], nextCursor: cursorAfter(enumId(0x40)), exhausted: false, examined: 4 },
     });
-    const firstCursor = pageOf(first).nextCursor;
+    // Every later page is asked for with the cursor the CONTRACT requires of the page before it,
+    // written out here: no later read depends on a cursor that a page read returned.
+    const firstCursor = cursorAfter(enumId(0x40));
 
     // ── FIXTURE DML after page 1: two deletions, three insertions. ──
     await enumDeleteItems(teamId, [enumId(0x20), enumId(0x40)]);
@@ -6222,10 +6368,15 @@ describe("KR-11 continuation inside a frozen key range (M8a, M8b)", () => {
 
     // ── PAGE 2, from a cursor whose item is gone. ──
     const second = await enumEnded(enumPage(teamId, 4, firstCursor));
+    // FIRST, and narrowly: the ids and the exact cursor. A page that skips rows instead of continuing
+    // after the cursor id is wrong here, in both.
+    expect(idsAndCursor(second), `${label}: M8b: page 2 is exactly the four ids after the deleted cursor item, beginning with the original that follows it, with a cursor exactly after its fourth id inside the frozen bound`).toEqual({
+      ids: [0x50, 0x55, 0x60, 0x70].map(enumId), nextCursor: cursorAfter(enumId(0x70)), exhausted: false,
+    });
     expect(second, `${label}: page 2: the next original after the deleted cursor item comes FIRST, the insert between cursor and bound is admitted, and the bound is still the frozen one`).toEqual({
       page: { entries: [root(0x50), plain(enumId(0x55)), plain(enumId(0x60)), root(0x70)], nextCursor: cursorAfter(enumId(0x70)), exhausted: false, examined: 4 },
     });
-    const secondCursor = pageOf(second).nextCursor;
+    const secondCursor = cursorAfter(enumId(0x70));
 
     // ── FIXTURE DML after page 2: a NEW row at exactly the first cursor's id, and one below the second cursor. ──
     await enumPlantItems(teamId, project, [
@@ -6241,7 +6392,13 @@ describe("KR-11 continuation inside a frozen key range (M8a, M8b)", () => {
     expect(third, `${label}: page 3: the four originals after the second cursor; nothing inserted at or below it appears`).toEqual({
       page: { entries: [plain(enumId(0x80)), root(0x90), plain(enumId(0xa0)), root(0xb0)], nextCursor: cursorAfter(enumId(0xb0)), exhausted: false, examined: 4 },
     });
-    const fourth = await enumEnded(enumPage(teamId, 4, pageOf(third).nextCursor));
+    const fourth = await enumEnded(enumPage(teamId, 4, cursorAfter(enumId(0xb0))));
+    // FIRST, and narrowly: what the last page ENDED as. A continuation with no upper bound meets the
+    // item above the frozen bound here: it either returns that id or is rejected for it, and either
+    // is a different value from this one.
+    expect(idsAndCursor(fourth), `${label}: M8a: page 4 returned a page of exactly the published root's id at the frozen bound, with no cursor, and the range has ended`).toEqual({
+      ids: [bound], nextCursor: null, exhausted: true,
+    });
     expect(fourth, `${label}: page 4: the published root alone, at the frozen bound, and the range has ended; the item above the bound is not returned`).toEqual({
       page: { entries: [publishedRoot], nextCursor: null, exhausted: true, examined: 1 },
     });
@@ -6287,12 +6444,17 @@ describe("KR-11 continuation inside a frozen key range (M8a, M8b)", () => {
  * The published root already has pending work, with a DISTINCTIVE HISTORY: the real enqueue helper
  * wrote its row with a due instant in 2001, and one labeled fixture statement then gave it seven
  * attempts. A three-page traversal is read. Between its pages the real enqueue helper is called for
- * the same root again, with another due instant, and for two other roots of the channel.
+ * the same root again, with another due instant, and for two other roots of the channel; and between
+ * pages 1 and 2 the REAL PREPARATION is run for the synthetic root that page 1 returned, from that
+ * enumerated entry alone.
  *
- * Required: the three pages are exactly the pages of a quiet team, under the one bound the first
- * page froze; each page read changes no snapshotted row; the historical row is byte-identical after
+ * Required: that preparation is `enqueued`, with one queue row in the root's exact scope at its own
+ * observation-derived due instant; the three pages are exactly the pages of a quiet team, under the
+ * one bound the first page froze, with that root's pending work changing nothing of the pages that
+ * follow; each page read changes no snapshotted row; the historical row is byte-identical after
  * every step; the published root is still returned as a located entry although its work is pending;
- * and a preparation from that entry returns `already_pending` and leaves the row byte-identical.
+ * and a preparation from either entry afterwards returns `already_pending` and leaves both rows
+ * byte-identical.
  *
  * NOT CLAIMED: anything about claim order, FIFO, fairness or starvation; running, expired or staged
  * queue states (the KR-06 suites above); or a traversal concurrent with a writer on another
@@ -6311,7 +6473,7 @@ describe("KR-11 queue traffic during a traversal", () => {
     const tsOf = (slot: number): string => `${1718000000 + slot}.000100`;
     await enumPlantCanonicalRoots(real, [3, 5].map((slot) => ({ id: enumId(slot), ts: tsOf(slot) })), "kr11-traffic-root");
     await enumPlantItems(teamId, project, [1, 2, 4, 6].map((slot) => ({ id: enumId(slot), path: `kr11/traffic-${slot}.md`, frontmatter: { source: "kr11-fixture" } })));
-    expect(real.itemId > enumId(6), `${label}: fixture: the published item's random id sorts after every chosen id (a one-in-four-billion miss: run again)`).toBe(true);
+    expect(real.itemId > enumId(6), `${label}: fixture: the published item's random id sorts after every chosen id (a random id sorts lower only if it begins with eight zero digits, which fewer than one in four billion do: run again)`).toBe(true);
     const publishedRoot = enumLocated(teamId, real.itemId, real.locatorOf(OLD_ROOT));
     const ordered = [1, 2, 3, 4, 5, 6].map((slot) => ([3, 5].includes(slot)
       ? enumLocated(teamId, enumId(slot), real.locatorOf(tsOf(slot)))
@@ -6356,6 +6518,40 @@ describe("KR-11 queue traffic during a traversal", () => {
     expect([again.inserted, another.inserted], `${label}: traffic: the existing row conflicted and was not re-inserted; another root's row was inserted`).toEqual([false, true]);
     expect(await historicalNow(), `${label}: after the first traffic the historical row is byte-identical`).toEqual([historicalExactly]);
 
+    // ── A REAL PREPARATION BETWEEN PAGES 1 AND 2: the synthetic root that page 1 returned, from its
+    //    enumerated entry alone. Its witness was planted two hours old, so it is overdue. ──
+    const syntheticEntry = first.page.entries[2];
+    const syntheticScope = [teamId, WORKSPACE, CHANNEL, tsOf(3)];
+    const syntheticWitness = await query<{ exact_due_utc: string; exact_due_is_past: boolean }>(
+      `select ${lifecycleUtc("w.observed_at + interval '60 seconds'")} as exact_due_utc,
+              w.observed_at + interval '60 seconds' < clock_timestamp() as exact_due_is_past
+         from slack_messages w where ${LIFECYCLE_ROOT_WITNESS} and w.deleted_at is null`, [...syntheticScope, enumId(3)]
+    );
+    expect(syntheticWitness.map((row) => row.exact_due_is_past), `${label}: fixture: the synthetic root has exactly one live root witness, and its exact due instant is past`).toEqual([true]);
+    const syntheticDue = syntheticWitness[0].exact_due_utc;
+    /** The synthetic root's queue rows, against its exact due instant; and the same rows, whole. */
+    const syntheticQueue = (): Promise<Row[]> => query(
+      `select t.workspace_id, t.channel_id, t.root_ts, t.status, t.attempts,
+              t.due_at >= $5::timestamptz as not_before_the_exact_due,
+              t.due_at < $5::timestamptz + interval '1 millisecond' as less_than_a_millisecond_after_it,
+              to_char(t.due_at at time zone 'UTC', 'US') like '%000' as on_a_whole_millisecond
+         from slack_sync_threads t where t.team_id = $1 and t.workspace_id = $2 and t.channel_id = $3 and t.root_ts = $4`, [...syntheticScope, syntheticDue]
+    );
+    const syntheticNow = async (): Promise<string[]> => (await query(
+      `select to_jsonb(t)::text as stored from slack_sync_threads t where t.team_id = $1 and t.workspace_id = $2 and t.channel_id = $3 and t.root_ts = $4`, syntheticScope
+    )).map((row) => row.stored as string);
+    expect(await syntheticQueue(), `${label}: fixture: the synthetic root has no pending work before its preparation`).toEqual([]);
+    // The execution context is created BEFORE the transaction it is used in.
+    const betweenPages = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+    expect(await tx((s) => prepareSlackKnownRootRequeue(s, { teamId, entry: syntheticEntry }, betweenPages)),
+      `${label}: between pages 1 and 2 the real preparation of the synthetic root page 1 returned is enqueued`).toEqual({ outcome: "enqueued" });
+    expect(await syntheticQueue(), `${label}: that preparation wrote one queued, never-attempted row in the root's exact scope, at its observation-derived due instant rounded up to its millisecond`).toEqual([{
+      workspace_id: WORKSPACE, channel_id: CHANNEL, root_ts: tsOf(3), status: "queued", attempts: 0,
+      not_before_the_exact_due: true, less_than_a_millisecond_after_it: true, on_a_whole_millisecond: true,
+    }]);
+    const [syntheticExactly] = await syntheticNow();
+    expect(await historicalNow(), `${label}: after that preparation the historical row is byte-identical`).toEqual([historicalExactly]);
+
     // ── PAGE 2, from page 1's cursor. ──
     const second = await quietlyRead(first.page.nextCursor);
     expect([second.page, second.changed], `${label}: page 2 is the quiet team's page 2, under the same frozen bound, and reading it changed nothing`).toEqual([expected[1], []]);
@@ -6369,17 +6565,24 @@ describe("KR-11 queue traffic during a traversal", () => {
     expect([last.page, last.changed], `${label}: page 3 is the published root as a located entry, the range has ended, and reading it changed nothing`).toEqual([expected[2], []]);
     expect([first.page, second.page, last.page], `${label}: the whole traversal is the quiet team's, page for page`).toEqual(expected);
 
-    // ── THE QUEUE: three rows, and the historical one exactly as it was. ──
-    expect((await enumQueueOf(teamId)).map((row) => [row.root_ts, row.status, row.attempts]), `${label}: three queue rows: the historical one and the two the traffic inserted`)
-      .toEqual([[OLD_ROOT, "queued", 7], [TRAFFIC_ROOTS[0], "queued", 0], [TRAFFIC_ROOTS[1], "queued", 0]]);
-    expect((await enumQueueOf(teamId))[0], `${label}: the historical row still has its 2001 due instant, its seven attempts and its state`).toEqual(HISTORICAL_ROW);
-    expect(await historicalNow(), `${label}: after the traversal the historical row is byte-identical`).toEqual([historicalExactly]);
+    // ── THE QUEUE: four rows, and the historical one exactly as it was. ──
+    expect((await enumQueueOf(teamId)).map((row) => [row.root_ts, row.status, row.attempts]), `${label}: four queue rows: the one the preparation between pages wrote, the historical one, and the two the traffic inserted`)
+      .toEqual([[tsOf(3), "queued", 0], [OLD_ROOT, "queued", 7], [TRAFFIC_ROOTS[0], "queued", 0], [TRAFFIC_ROOTS[1], "queued", 0]]);
+    expect((await enumQueueOf(teamId)).filter((row) => row.root_ts === OLD_ROOT), `${label}: the historical row still has its 2001 due instant, its seven attempts and its state`).toEqual([HISTORICAL_ROW]);
+    expect([await historicalNow(), await syntheticNow()], `${label}: after the traversal the historical row and the row the preparation between pages wrote are byte-identical`)
+      .toEqual([[historicalExactly], [syntheticExactly]]);
 
-    // ── PREPARATION from the enumerated entry: pending work is left exactly as it is. ──
+    // ── PREPARATION from the enumerated entries: pending work is left exactly as it is. ──
     const execution = createSlackKnownRootExecution({ ambientDeadlineAt: null });
     const entry = last.page.entries[0];
     expect(await tx((s) => prepareSlackKnownRootRequeue(s, { teamId, entry }, execution)), `${label}: preparation from the enumerated entry returns already_pending`).toEqual({ outcome: "already_pending" });
     expect(await historicalNow(), `${label}: after the preparation the historical row is byte-identical`).toEqual([historicalExactly]);
+    const syntheticAgain = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+    expect(await tx((s) => prepareSlackKnownRootRequeue(s, { teamId, entry: syntheticEntry }, syntheticAgain)), `${label}: a second preparation of the synthetic root returns already_pending`).toEqual({ outcome: "already_pending" });
+    expect([await syntheticQueue(), await syntheticNow()], `${label}: after it, that root still has one row at its observation-derived due instant, byte-identical`).toEqual([[{
+      workspace_id: WORKSPACE, channel_id: CHANNEL, root_ts: tsOf(3), status: "queued", attempts: 0,
+      not_before_the_exact_due: true, less_than_a_millisecond_after_it: true, on_a_whole_millisecond: true,
+    }], [syntheticExactly]]);
     expect((await lifecycleQueueAndStagingAnywhere()).staging, `${label}: nothing is staged`).toEqual([]);
   });
 });
@@ -6431,7 +6634,7 @@ describe("KR-10 a failed page read supplies no continuation", () => {
     const project = await enumFixtureProject(teamId, "kr10-failure");
     await enumPlantCanonicalRoots(real, [{ id: enumId(3), ts: "1718000003.000100" }], "kr10-failure-root");
     await enumPlantItems(teamId, project, [1, 2, 4, 5].map((slot) => ({ id: enumId(slot), path: `kr10/failure-${slot}.md`, frontmatter: { source: "kr10-fixture" } })));
-    expect(real.itemId > enumId(5), "fixture: the published item's random id sorts after every chosen id (a one-in-four-billion miss: run again)").toBe(true);
+    expect(real.itemId > enumId(5), "fixture: the published item's random id sorts after every chosen id (a random id sorts lower only if it begins with eight zero digits, which fewer than one in four billion do: run again)").toBe(true);
     const ordered = [1, 2, 3, 4, 5].map((slot) => (slot === 3
       ? enumLocated(teamId, enumId(slot), real.locatorOf("1718000003.000100"))
       : enumUnlocated(teamId, enumId(slot), "not_slack"))).concat([enumLocated(teamId, real.itemId, real.locatorOf(OLD_ROOT))]);
