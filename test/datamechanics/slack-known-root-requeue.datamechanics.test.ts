@@ -54,10 +54,12 @@ import {
  * schedules nothing for it. A later remote reply changes no local durable state, so nothing ever
  * brings the root back.
  *
- * FIRST RED CHECKPOINT. The two new modules are typed stubs that do no work. The first case below is
- * a permanent CHARACTERIZATION of the gap and passes before and after this slice. The other two are
- * behavioural red: they import, set up, connect and run normally, and fail only on the assertion
- * that the enumeration found the published root and that preparation rebuilt its pending row.
+ * HISTORY. The first three cases below were written at the first red checkpoint, when the two new
+ * modules were typed stubs that did no work; both modules are implemented now, and all three pass.
+ * The first case is a permanent CHARACTERIZATION of the gap and passed before and after this slice.
+ * The other two were behavioural red against the stubs: they imported, set up, connected and ran
+ * normally, and failed only on the assertion that the enumeration found the published root and that
+ * preparation rebuilt its pending row. The later groups in this file state their own history.
  *
  * Fixture rules:
  *  - The published root is reached through the real discovery entrypoint (a verified binding), the
@@ -277,7 +279,7 @@ describe("a published old root that newest history no longer returns (real Postg
     expect((await stored(f.seed.teamId)).queue, "the old root is still unscheduled after a further pass").toEqual([]);
   });
 
-  // BEHAVIOURAL RED against the stub reader, which returns a placeholder page with no entries.
+  // WAS BEHAVIOURAL RED against the stub reader, which returned a placeholder page with no entries.
   it("is found by enumeration, with the exact durable locator of its published item", async () => {
     const f = await publishOldRoot();
     const unrelatedItemId = await seedUnrelatedItem(f.seed);
@@ -324,9 +326,9 @@ describe("a published old root that newest history no longer returns (real Postg
     expect((await stored(f.seed.teamId)).allQueue).toEqual([]);
   });
 
-  // BEHAVIOURAL RED (KR-01). Against the stub reader there is no entry to prepare; against a real
-  // reader and the no-op stub preparer there is an entry and still no row. Either way the failing
-  // assertion is the same one: the old root's pending row was not rebuilt.
+  // WAS BEHAVIOURAL RED (KR-01). Against the stub reader there was no entry to prepare; against a
+  // real reader and the no-op stub preparer there was an entry and still no row. Either way the
+  // failing assertion was the same one: the old root's pending row was not rebuilt.
   it("gets exactly one due pending row back from preparation, given only the team and its enumerated entry", async () => {
     const f = await publishOldRoot();
     const unrelatedItemId = await seedUnrelatedItem(f.seed);
@@ -1407,7 +1409,7 @@ describe("KR-03 — canonical proof refuses exactly what it should, and nothing 
   // ── §5.4 exact path conflicts ──────────────────────────────────────────────
 
   describe("another item at one of the root's two paths", () => {
-    it("refuses a scoped-path conflict and a legacy-path conflict, whatever project, kind, access or metadata the other item has", () => refusesEach([
+    it("refuses when another project's item is at the scoped path, and when an item is at the legacy path in the Slack project or in another project", () => refusesEach([
       scenario<{ item: string; project: string }>({
         label: "the SCOPED path is owned by an item of another project",
         expected: { outcome: "refused", reason: "scoped_path_conflict" },
@@ -1425,10 +1427,12 @@ describe("KR-03 — canonical proof refuses exactly what it should, and nothing 
         arrange: async (ctx) => plantItem(ctx.teamId, await projectId(ctx.teamId, "slack"), LEGACY_PATH, { frontmatter: { source: "slack" } }),
         undo: dropItem,
       }),
-      // "Live legacy path" is ANY extant item row there: another project, another kind, another
-      // access, no Slack frontmatter at all.
+      // "Live legacy path" is ANY extant item row there. This one is in another project, with another
+      // access and no Slack frontmatter at all; its kind is the candidate's own (`transcript`), where
+      // the variant above planted `deliverable`. Only the legacy path is varied this way: the scoped
+      // path has the one variant above.
       scenario<{ item: string; project: string }>({
-        label: "an item exists at the LEGACY path in another project, with another kind and access and no Slack metadata",
+        label: "an item exists at the LEGACY path in another project, with the candidate's own kind, another access and no Slack metadata",
         expected: { outcome: "refused", reason: "legacy_path_conflict" },
         arrange: async (ctx) => {
           const project = await projectId(ctx.teamId, `other-${randomUUID().slice(0, 8)}`, true);
