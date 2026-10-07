@@ -1250,3 +1250,57 @@ Run `2026-10-07T09-25-26-865Z-99466`, at head `0349d95b`, after the KR-17 rerun:
 Unchanged from the AC-09 section and not addressed by this slice: an active adapter and its wiring, secure cursor-key provisioning, and the intersection with the real membership oracle.
 
 **Broad suite and prohibitions.** The broad `npm test` was not rerun and is not claimed green. Not done and not authorized, unchanged: any driver, runner, scheduler, route, action or manual trigger for this primitive; provider HTTP; publisher wiring; removal or weakening of either not-wired guard; repair apply; the identity cutover; activation; PR 743 integration; merge; deployment; any main, production or force push; live acceptance; and the soak. The held items of the specification's final section remain held. **AC-02 is incomplete and the primitive is inactive and unwired.**
+
+#### The two required M15 forms, and the failed KR-17 evidence capture — recorded October 7, 2026, after the KR-17 and M15 subsection above
+
+This subsection supersedes, for current status only, one statement of the subsection above: that "the two required forms of M15" are not yet shown. It was true when written and is left in place. Nothing else there is superseded. In particular KR-17 remains held, and this subsection records a further attempt to capture its evidence that failed before anything was measured.
+
+**Identities.**
+
+- The tracked checkpoint is `49524caa86a3a9d3f185d9ae944b239c85340d98`. The coordinator read the remote `origin/codex/aio-1170-slack-timeline` back at exactly that id after the normal pre-push docs and skill gates. The base of this test-only packet was `0c42dd7452493bff0e7b3a252faadb20c0bba9c4`.
+- Production is unchanged: `lib/ingest/slack-known-root-requeue.ts` has SHA-256 `ed46bd3744b0d9bf9a7555e831b0a4360ff10c2ca4108dfa5ff8b94a9e3fc9a6`, before the mutation run below and as restored after it.
+- At this checkpoint the mutation harness recorded `test/datamechanics/slack-known-root-requeue.datamechanics.test.ts` as SHA-256 `f01fe05e4ae8545535d762913018694699a11029b55fbdb9abf1e8defaf53801` and `test/slack-known-root-requeue.test.ts` as `fa5cbeb5c7f2592b5bc1fdd8382c8e7e1ec9c9341d763f5afa8ce9ea2062a060`.
+- The sole writer remained subscription-authenticated Claude Opus 5.5 at high effort, session `b1767100-da84-4808-818f-6b0107480c68`, with no test or shell execution. The coordinator ran every check and run recorded here and owns every commit.
+
+**What was added — tests only.**
+
+- **M15a and KR-10, real-wrapper form, on real PostgreSQL.** The case "counts one serialization_failure for a slot whose two attempts both failed and one enqueued for a slot whose second attempt committed, from the final outcomes of real two-attempt transactions" calls the actual `runContextTransaction`, with one execution context shared by both attempts. After the actual preparation has run in the callback, the server raises SQLSTATE `40001`. A true `pageSize: 1` cursor continuation retrieves the other item after the first slot has failed terminally. Later full sweeps then show that a two-attempt terminal failure contributes exactly one `serialization_failure` and a two-attempt retry that commits exactly one `enqueued`, that every page's seven outcomes equal its examined count, and that each child category sums to its parent. Receipts are built only from the final outcome of each complete transaction promise.
+- **M15c, integrated form, unit.** The case "tallies a commit whose outcome is unknown as exactly one commit_unknown failure and no success, classified from the final rejection alone" gives the actual classifier one final `TransactionExecutionError` with `unknownCommit: true`, SQLSTATE `40001` and a provisional `enqueued` result, and tallies the one terminal receipt that results. It asserts exactly one `commit_unknown`, zero successes and no other category.
+
+**Verification on exact `49524caa`, as run by the coordinator.** The harness passed a syntax check and its exact-snapshot `--check`. The isolated selection of the M15a real-PostgreSQL case passed 1/1, with 23 skipped. The coordinator also reports the earlier targeted run of the integrated M15c unit case, 1/1. **None of these is a full-file run or a broad-suite pass.**
+
+**Independent rereview.** A fresh independent Opus 5.5 high focused rereview at exact `49524caa` inspected the tests, the production callers, the transaction wrapper, the page reader and the ignored harness. It returned **PASS / READY** with no blocker, HIGH or MEDIUM, and found both MEDIUM points of the preceding review of this packet resolved: the "next page" evidence had re-read the same exhausted page and is now the real cursor continuation described above, and the harness had pinned only the source file and now requires the exact HEAD and a clean worktree and index. It explicitly cleared one controlled harness run. Its LOW notes, none of which invalidated that run:
+
+1. item ids are random, so the continuation's first slot can be the non-Slack item;
+2. the older M15 result directory belongs to `0349d95b` and must not be cited for this checkpoint;
+3. the harness is an ignored file and does not record its own hash;
+4. the summary's checkout record is authoritative over the per-mutant files;
+5. a recovery sentence in the harness header is stale;
+6. sibling mutation harnesses must not run concurrently.
+
+**Controlled M15 mutation run at this checkpoint.** The run directory `.context/aio-1170-resume/ac02-m15-mutation-results/2026-10-07T10-12-36-995Z-13867` is a local, git-ignored artifact, **not tracked and not remote evidence**; this record carries its results. The harness required HEAD to be exactly `49524caa86a3a9d3f185d9ae944b239c85340d98` and the worktree and index to be clean, before the run, before each mutant and after it, and recorded each check. The three source mutations are those described in the subsection above, and the mutant hashes are the same.
+
+- **M15a — KILLED**, mutant SHA-256 `b8cf193f62f616472e8af01c2074316985eaa16bb8eb47cf9a18bc7d6e71c3a7`, by the new real-PostgreSQL case, at its labeled accounting assertion "M15a: one contribution per page slot, from real two-attempt transactions".
+- **M15b — KILLED**, mutant SHA-256 `226c9b230ffb5a0d6433697eafae5f1ef3db2cadd3db5826a443dadda40d0697`, by the duplicate terminal-receipt unit case "collapses an exact duplicate of a slot's final receipt".
+- **M15c — KILLED**, mutant SHA-256 `93fc5077c98f530bf8cd80b5bac8903a91d2654e9413805ec12353c16e1a5c53`, by the new integrated classifier-and-tally unit case, at its labeled tally assertion.
+
+Each was killed at exactly its expected assertion. All six baseline and restored selections exited 0. The final source SHA-256 equalled the baseline, and the final checkout was the exact HEAD, clean. **This closes the two M15 forms the subsection above called pending. It does not close the rest of the mutation matrix, the acceptance matrix or AC-02.** Of KR-10, it shows the retry-then-commit and retry-then-terminal-failure accounting and the continuation after a failed slot; the remaining parts of KR-10 stay pending.
+
+**Why the earlier KR-17 run recorded no evidence.** Vitest 4.1.9 detects an agent environment (`std-env` `isAgent` true) and selects its `agent` reporter, `MinimalReporter`, whose `silent: 'passed-only'` suppresses the `console.info` output of passing tests. `--silent=false` alone was not sufficient.
+
+**The single authorized evidence capture, and its failure.** A fresh Astra-high adjudication authorized exactly one evidence-only rerun, with `--reporter=verbose --silent=false`, unchanged source, schema, fixtures, timeouts and thresholds, a fresh isolated database, and no retry if setup, measurement or capture failed.
+
+- Before that run, the KR-17 section of the test file at this checkpoint was byte-identical to its text at `0349d95b`: 33,724 bytes, SHA-256 `70aaecae4e0c5da259a530c603df96d34e54bb78646ec4d2d977cd657c550184`. The log of the earlier passing run has SHA-256 `2962f933aa5a366373018fc91c1efbafe7d34985f21d0a249bb2d093c01e2590`.
+- The capture exited 1 during schema setup, before Vitest started and before any measurement or evidence block: `schema load failed: read ECONNRESET`. Its log is the local, git-ignored file `.context/aio-1170-resume/kr17-evidence-capture.log`, SHA-256 `cbe153658a9599e09ed6237ffe7c5e6982098916e51a835d53d1f17ab9d69a28`, with `.exit` 1.
+- No retry was made. The worker stopped, the tracked status remained clean, and the source and test hashes are unchanged.
+
+**KR-17 therefore remains held, and any further capture needs a new Astra adjudication.** That run produced no measurement, so it is neither a pass nor an exceedance. The cause of the setup failure is not established beyond the error quoted.
+
+**Still pending — not done, and not claimed:**
+
+- the durable KR-17 evidence record: every retained observation and its maximum, the plans, the environment and the snapshot identity;
+- the acceptance and mutation coverage that the subsection above lists as pending, other than the two M15 forms closed here;
+- the final full-scope reviews, the checks and CI on the exact published head, and the PR documentation;
+- the PR 743 refresh and integration, and every integration and live gate stated earlier in this section.
+
+**Broad suite and prohibitions.** The broad `npm test` was not rerun and is not claimed green. Not done and not authorized, unchanged: any driver, runner, scheduler, route, action or manual trigger for this primitive; provider HTTP; publisher wiring; removal or weakening of either not-wired guard; repair apply; the identity cutover; activation; PR 743 integration; merge; deployment; any main, production or force push; live acceptance; and the soak. The held items of the specification's final section remain held. **AC-02 is incomplete and the primitive is inactive and unwired.**
