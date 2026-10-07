@@ -787,3 +787,533 @@ describe("a published root whose stored facts were corrupted after enumeration (
     expect(outcomes[0].shape, "the epoch is refused identically to an ancient observation").toEqual(outcomes[1].shape);
   });
 });
+
+/**
+ * KR-03 — canonical proof, and the operative falsifiers M1d, M1e, M1f, M1g, M1h and M2 of the
+ * specification's mutation matrix (`docs/design/slack-known-root-requeue-spec.md` §5.2–§5.4, §11, §12).
+ *
+ * EVIDENCE, NOT RED: every case here is expected to pass on source checkpoint `c5679f89`. Each one is
+ * its own test, with its own published root, so that a later mutation run names the behaviour that
+ * killed the mutant instead of the first row of a loop.
+ *
+ * Every case has the same three movements:
+ *
+ *  1. ARRANGE one stored fact that is wrong — through fixture DML, on a root that the REAL
+ *     publication produced and the REAL enumeration located. Authority (binding, channel proof,
+ *     namespace gate, integration secret) is whatever the real discovery, readiness and publication
+ *     paths left behind; no authority constant is supplied to preparation.
+ *  2. PREPARE, from the team and the entry enumeration returned before the change, and require the
+ *     exact closed result. A whole-table snapshot of the team's items, versions, ledger, queue,
+ *     staging, channels, bindings, gates, integrations and projects is taken AFTER the arrangement
+ *     and BEFORE the call, and must be byte-identical afterwards: a refusal writes nothing.
+ *  3. UNDO that one fact and prepare again with the very same entry: it must now enqueue. So the
+ *     arranged fact — and nothing else in the fixture — is what was refused.
+ *
+ * The oracles are the test's own: results are compared with literal values, the legacy path is
+ * written out here rather than taken from the helper under test, and "nothing changed" is the
+ * database's own rendering of every row.
+ */
+describe("KR-03 — canonical proof refuses exactly what it should, and nothing else moves (real Postgres)", () => {
+  interface Ctx { f: Published; entry: SlackKnownRootEntry; teamId: string; itemId: string }
+  type Outcome = SlackKnownRootPreparationResult;
+
+  const run = async (text: string, params: unknown[] = []): Promise<Row[]> => (await (await rawSql()).query<Row>(text, params)).rows;
+  const one = async (text: string, params: unknown[] = []): Promise<Row> => {
+    const rows = await run(text, params);
+    if (rows.length !== 1) throw new Error(`fixture: expected exactly one row, got ${rows.length}`);
+    return rows[0];
+  };
+  /** Fixture DML that must change exactly one row. */
+  const change = async (text: string, params: unknown[]): Promise<void> => {
+    const result = await (await rawSql()).query(text, params);
+    if (result.rowCount !== 1) throw new Error(`fixture: expected to change exactly one row, changed ${result.rowCount}`);
+  };
+
+  /** A published, aged, enumerated root that prepares as it stands. */
+  async function preparable(): Promise<Ctx> {
+    const f = await publishOldRoot();
+    await ageObservation(f.seed.teamId);
+    const page = await enumerate(f.seed.teamId);
+    const entry = page.entries.find((candidate) => candidate.itemId === f.itemId && "locator" in candidate);
+    if (!entry) throw new Error("fixture: enumeration did not locate the published root");
+    return { f, entry, teamId: f.seed.teamId, itemId: f.itemId };
+  }
+
+  const prepareEntry = (ctx: Ctx): Promise<Outcome> =>
+    tx((s) => prepareSlackKnownRootRequeue(s, { teamId: ctx.teamId, entry: ctx.entry }, createSlackKnownRootExecution({ ambientDeadlineAt: null })));
+
+  /** The tables preparation could plausibly disturb. Every row of the team, exactly as the database renders it. */
+  const SNAPSHOT_TABLES = [
+    "items", "slack_messages", "slack_sync_threads", "slack_thread_snapshots", "slack_sync_channels",
+    "slack_integration_bindings", "slack_channel_migration_gates", "integrations", "projects",
+    "slack_team_state", "slack_method_budgets", "slack_workspace_observations", "member_identities",
+  ];
+  const SNAPSHOT_REQUIRED = [
+    "items", "slack_messages", "slack_sync_threads", "slack_sync_channels", "slack_integration_bindings",
+    "slack_channel_migration_gates", "integrations", "projects",
+  ];
+
+  async function snapshot(teamId: string): Promise<Record<string, string>> {
+    const scoped = (await run(
+      `select table_name from information_schema.columns
+        where table_schema = 'public' and column_name = 'team_id' and table_name = any($1::text[])
+        order by table_name`, [SNAPSHOT_TABLES]
+    )).map((row) => row.table_name as string);
+    for (const required of SNAPSHOT_REQUIRED) expect(scoped, `fixture: ${required} is snapshotted`).toContain(required);
+    const out: Record<string, string> = {};
+    for (const table of scoped) {
+      out[table] = (await one(
+        `select coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text), '[]'::jsonb)::text as rows from "${table}" t where t.team_id = $1`,
+        [teamId]
+      )).rows as string;
+    }
+    out.item_versions = (await one(
+      `select coalesce(jsonb_agg(to_jsonb(v) order by to_jsonb(v)::text), '[]'::jsonb)::text as rows
+         from item_versions v join items i on i.id = v.item_id where i.team_id = $1`, [teamId]
+    )).rows as string;
+    return out;
+  }
+
+  const queuedRoots = async (teamId: string): Promise<unknown[]> =>
+    (await run(`select root_ts from slack_sync_threads where team_id = $1 order by root_ts`, [teamId])).map((row) => row.root_ts);
+
+  interface Case<Token = unknown> {
+    label: string;
+    /** Makes ONE stored fact wrong. What it returns is handed to `undo`. */
+    arrange: (ctx: Ctx) => Promise<Token>;
+    undo: (ctx: Ctx, token: Token) => Promise<void>;
+    expected: Outcome;
+  }
+  const scenario = <Token>(value: Case<Token>): Case => value as unknown as Case;
+
+  /** The three movements described above. */
+  async function refusesThenPrepares(scenarioCase: Case): Promise<void> {
+    const ctx = await preparable();
+    const token = await scenarioCase.arrange(ctx);
+
+    const before = await snapshot(ctx.teamId);
+    expect(await queuedRoots(ctx.teamId), "fixture: the root has no pending work").toEqual([]);
+    const result = await prepareEntry(ctx);
+    expect(result, scenarioCase.label).toEqual(scenarioCase.expected);
+    // No queue row, and no row of any snapshotted table differs: the queue table is in the snapshot.
+    expect(await queuedRoots(ctx.teamId), `${scenarioCase.label}: nothing was enqueued`).toEqual([]);
+    expect(await snapshot(ctx.teamId), `${scenarioCase.label}: nothing was written`).toEqual(before);
+
+    await scenarioCase.undo(ctx, token);
+    expect(await prepareEntry(ctx), `${scenarioCase.label}: with that one fact undone the same entry prepares`).toEqual({ outcome: "enqueued" });
+    expect(await queuedRoots(ctx.teamId)).toEqual([OLD_ROOT]);
+  }
+
+  /** A fact that must NOT be a refusal: arrange it, and the same entry still enqueues. */
+  async function stillPrepares(arrange: (ctx: Ctx) => Promise<unknown>): Promise<void> {
+    const ctx = await preparable();
+    await arrange(ctx);
+    expect(await queuedRoots(ctx.teamId), "fixture: the root has no pending work").toEqual([]);
+    expect(await prepareEntry(ctx)).toEqual({ outcome: "enqueued" });
+    expect(await queuedRoots(ctx.teamId)).toEqual([OLD_ROOT]);
+  }
+
+  // ── fixture builders ───────────────────────────────────────────────────────
+
+  /** The canonical scoped path and the legacy path of the fixture root, WRITTEN OUT, not built by the code under test. */
+  const SCOPED_PATH = `slack/t0source1/c0known1170/${OLD_ROOT}.md`;
+  const LEGACY_PATH = `slack/c0known1170/${OLD_ROOT}.md`;
+  const OTHER_REPLY = "1718900000.000150";
+
+  const frontmatterOf = async (ctx: Ctx): Promise<string> =>
+    JSON.stringify((await one(`select frontmatter from items where id = $1`, [ctx.itemId])).frontmatter);
+  const restoreFrontmatter = (ctx: Ctx, original: string): Promise<void> =>
+    change(`update items set frontmatter = $2::jsonb where id = $1`, [ctx.itemId, original]);
+  /** Replace one frontmatter key with a JSON value, or remove it. Returns the original frontmatter. */
+  const frontmatterCase = (label: string, key: string, value: unknown, expected: Outcome, remove = false): Case => scenario<string>({
+    label, expected,
+    arrange: async (ctx) => {
+      const original = await frontmatterOf(ctx);
+      if (remove) await change(`update items set frontmatter = frontmatter - $2::text where id = $1`, [ctx.itemId, key]);
+      else await change(`update items set frontmatter = jsonb_set(frontmatter, array[$2::text], $3::jsonb, true) where id = $1`, [ctx.itemId, key, JSON.stringify(value)]);
+      const stored = (await one(`select frontmatter ? $2::text as present, frontmatter->$2::text as value from items where id = $1`, [ctx.itemId, key]));
+      expect(stored.present, `fixture: ${label}`).toBe(!remove);
+      if (!remove) expect(stored.value, `fixture: ${label} reads back`).toEqual(value);
+      return original;
+    },
+    undo: restoreFrontmatter,
+  });
+  const columnCase = (label: string, column: "kind" | "access" | "path", value: string, expected: Outcome): Case => scenario<string>({
+    label, expected,
+    arrange: async (ctx) => {
+      const original = (await one(`select ${column}::text as value from items where id = $1`, [ctx.itemId])).value as string;
+      expect(original, `fixture: the ${column} differs from the arranged one`).not.toBe(value);
+      await change(`update items set ${column} = $2 where id = $1`, [ctx.itemId, value]);
+      const stored = await one(`select ${column}::text as value, octet_length(${column}::text)::int as bytes from items where id = $1`, [ctx.itemId]);
+      expect(stored, `fixture: ${label} reads back`).toEqual({ value, bytes: Buffer.byteLength(value, "utf8") });
+      return original;
+    },
+    undo: (ctx, original) => change(`update items set ${column} = $2 where id = $1`, [ctx.itemId, original]),
+  });
+
+  /** One schema-valid ledger row, as the stored codec requires it. Returns its id. */
+  async function ledgerRow(teamId: string, itemId: string, row: {
+    workspace?: string; channel?: string; messageTs: string; rootTs: string; deleted?: boolean;
+  }): Promise<string> {
+    return (await one(
+      `insert into slack_messages
+         (team_id, item_id, workspace_id, channel_id, message_ts, root_ts, author_external_id,
+          occurred_at, is_root, eligible, exclusion_reason, deleted_at, source_hash)
+       values ($1, $2::uuid, $3, $4, $5, $6, 'U1',
+               to_timestamp(split_part($5, '.', 1)::bigint) + split_part($5, '.', 2)::integer * interval '1 microsecond',
+               $5 = $6, true, null, case when $7 then now() else null end, repeat('a', 64))
+       returning id::text as id`,
+      [teamId, itemId, row.workspace ?? WORKSPACE, row.channel ?? CHANNEL, row.messageTs, row.rootTs, row.deleted === true]
+    )).id as string;
+  }
+  const dropLedgerRow = (_ctx: Ctx, id: string): Promise<void> => change(`delete from slack_messages where id = $1::uuid`, [id]);
+
+  async function projectId(teamId: string, slug: string, create = false): Promise<string> {
+    if (create) return (await one(`insert into projects (team_id, slug) values ($1, $2) returning id::text as id`, [teamId, slug])).id as string;
+    return (await one(`select id::text as id from projects where team_id = $1 and slug = $2`, [teamId, slug])).id as string;
+  }
+  /** A bare item row at a chosen path: the shape a conflicting writer would leave behind. Returns its id. */
+  async function plantItem(teamId: string, project: string, path: string, over: { kind?: string; access?: string; frontmatter?: Record<string, unknown> } = {}): Promise<string> {
+    return (await one(
+      `insert into items (id, team_id, project_id, path, kind, access, frontmatter, body, content_sha256, member_id, member_id_locked)
+       values (gen_random_uuid(), $1, $2::uuid, $3, $4, $5, $6::jsonb, '', repeat('a', 64), null, false)
+       returning id::text as id`,
+      [teamId, project, path, over.kind ?? "deliverable", over.access ?? "team", JSON.stringify(over.frontmatter ?? {})]
+    )).id as string;
+  }
+  const dropItem = (_ctx: Ctx, id: string): Promise<void> => change(`delete from items where id = $1::uuid`, [id]);
+
+  const mismatch: Outcome = { outcome: "unattested", reason: "canonical_mismatch" };
+  const invalidMetadata: Outcome = { outcome: "unattested", reason: "invalid_metadata" };
+  const noWitness: Outcome = { outcome: "unattested", reason: "missing_root_witness" };
+  const contradictory: Outcome = { outcome: "unattested", reason: "contradictory_ledger" };
+
+  // ── the baseline, and the snapshot's own non-vacuity ───────────────────────
+
+  it("prepares the untouched root, changing the queue and NOTHING else (baseline, and the snapshot's own control)", async () => {
+    const ctx = await preparable();
+    const before = await snapshot(ctx.teamId);
+    // Fixture preconditions the cases below lean on, stated once against real rows.
+    expect((await one(`select path, kind::text as kind, access::text as access from items where id = $1`, [ctx.itemId])))
+      .toEqual({ path: SCOPED_PATH, kind: "transcript", access: "team" });
+    expect(SCOPED_PATH, "fixture: the written-out scoped path is the publication's").toBe(scopedSlackItemPath(WORKSPACE, CHANNEL, OLD_ROOT));
+    expect(await run(`select 1 from items where team_id = $1 and path = $2`, [ctx.teamId, LEGACY_PATH]), "fixture: nothing is at the legacy path").toEqual([]);
+
+    expect(await prepareEntry(ctx)).toEqual({ outcome: "enqueued" });
+    const after = await snapshot(ctx.teamId);
+    // The snapshot SEES a write: the queue table differs…
+    expect(after.slack_sync_threads).not.toBe(before.slack_sync_threads);
+    expect(await queuedRoots(ctx.teamId)).toEqual([OLD_ROOT]);
+    // …and it is the only table that does. Preparation writes no item, version, ledger row, channel,
+    // binding, gate, integration, project, generation, budget, observation or identity.
+    for (const table of Object.keys(before)) {
+      if (table !== "slack_sync_threads") expect(after[table], `${table} is unchanged by a successful preparation`).toBe(before[table]);
+    }
+  });
+
+  // ── §5.3 the locked item: project, kind, access, typed metadata, path ──────
+
+  describe("the locked item", () => {
+    it.each<Case>([
+      scenario<string>({
+        label: "the team has no project with the slug slack any more",
+        expected: mismatch,
+        arrange: async (ctx) => {
+          const slack = await projectId(ctx.teamId, "slack");
+          await change(`update projects set slug = $2 where id = $1::uuid`, [slack, `renamed-${randomUUID().slice(0, 8)}`]);
+          return slack;
+        },
+        undo: (_ctx, slack) => change(`update projects set slug = 'slack' where id = $1::uuid`, [slack]),
+      }),
+      scenario<{ slack: string; impostor: string }>({
+        label: "another project now holds the slug slack, and the item is not in it",
+        expected: mismatch,
+        arrange: async (ctx) => {
+          const slack = await projectId(ctx.teamId, "slack");
+          await change(`update projects set slug = $2 where id = $1::uuid`, [slack, `renamed-${randomUUID().slice(0, 8)}`]);
+          const impostor = await projectId(ctx.teamId, "slack", true);
+          expect((await one(`select project_id::text as id from items where id = $1`, [ctx.itemId])).id, "fixture: the item stayed in its own project").toBe(slack);
+          return { slack, impostor };
+        },
+        undo: async (_ctx, token) => {
+          await change(`delete from projects where id = $1::uuid`, [token.impostor]);
+          await change(`update projects set slug = 'slack' where id = $1::uuid`, [token.slack]);
+        },
+      }),
+      columnCase("the item's kind is not transcript", "kind", "deliverable", mismatch),
+      columnCase("the item's access is not team", "access", "external", mismatch),
+      // M1g: only the path changes, to a well-formed one that is not canonical.
+      columnCase("the item's path is a well-formed path that is not the canonical one (M1g)", "path", `slack/t0source1/c0known1170/${OLD_ROOT}.moved.md`, mismatch),
+      columnCase("the item's path is the LEGACY path of the same root (M1g)", "path", LEGACY_PATH, mismatch),
+      frontmatterCase("the stored source is not slack", "source", "github", mismatch),
+      frontmatterCase("the stored channel_id is another well-formed channel", "channel_id", "C0OTHER1170", mismatch),
+      frontmatterCase("the stored ts is another well-formed root", "ts", "1718900000.000200", mismatch),
+      frontmatterCase("the stored thread_ts is another well-formed root", "thread_ts", "1718900000.000200", mismatch),
+    ])("is a canonical mismatch when $label", refusesThenPrepares);
+
+    it.each<Case>([
+      frontmatterCase("the stored workspace_id is missing", "workspace_id", null, invalidMetadata, true),
+      frontmatterCase("the stored channel_id is missing", "channel_id", null, invalidMetadata, true),
+      frontmatterCase("the stored ts is missing", "ts", null, invalidMetadata, true),
+      frontmatterCase("the stored thread_ts is missing", "thread_ts", null, invalidMetadata, true),
+      frontmatterCase("the stored workspace_id is a number", "workspace_id", 7, invalidMetadata),
+      frontmatterCase("the stored channel_id is an object", "channel_id", { id: CHANNEL }, invalidMetadata),
+      frontmatterCase("the stored ts is a boolean", "ts", true, invalidMetadata),
+      frontmatterCase("the stored thread_ts is JSON null", "thread_ts", null, invalidMetadata),
+      frontmatterCase("the stored workspace_id is 257 bytes", "workspace_id", `T${"0".repeat(256)}`, invalidMetadata),
+      // One byte past the TIMESTAMP bound, in a spelling the exact parser would otherwise accept.
+      frontmatterCase("the stored ts is 129 bytes", "ts", `${"0".repeat(129 - OLD_ROOT.length)}${OLD_ROOT}`, invalidMetadata),
+      frontmatterCase("the stored thread_ts is 129 bytes", "thread_ts", `${"0".repeat(129 - OLD_ROOT.length)}${OLD_ROOT}`, invalidMetadata),
+      columnCase("the item's path is 2,049 bytes of ASCII", "path", `slack/t0source1/c0known1170/${"p".repeat(2_049 - 28 - 3)}.md`, invalidMetadata),
+      // BYTES, not characters: 1,100 two-byte characters are 2,200 bytes in well under 2,048 characters.
+      columnCase("the item's path is over 2,048 BYTES in fewer than 2,048 characters", "path", `slack/t0source1/c0known1170/${"é".repeat(1_100)}.md`, invalidMetadata),
+    ])("is invalid metadata when $label", refusesThenPrepares);
+  });
+
+  // ── §5.3 the root witness: KR-03 and M2 ────────────────────────────────────
+
+  describe("the root witness", () => {
+    const rootRow = `team_id = $1 and message_ts = $2 and root_ts = $2 and is_root`;
+
+    it.each<Case>([
+      scenario<null>({
+        label: "the root's ledger row is deleted (soft-deleted evidence is not a witness)",
+        expected: noWitness,
+        arrange: async (ctx) => {
+          await change(`update slack_messages set deleted_at = now() where ${rootRow}`, [ctx.teamId, OLD_ROOT]);
+          return null;
+        },
+        undo: (ctx) => change(`update slack_messages set deleted_at = null where ${rootRow}`, [ctx.teamId, OLD_ROOT]),
+      }),
+      scenario<string>({
+        label: "the root's ledger row is absent while its reply remains",
+        expected: noWitness,
+        arrange: async (ctx) => {
+          const saved = (await one(`select to_jsonb(m)::text as saved from slack_messages m where ${rootRow}`, [ctx.teamId, OLD_ROOT])).saved as string;
+          await change(`delete from slack_messages where ${rootRow}`, [ctx.teamId, OLD_ROOT]);
+          expect((await run(`select message_ts from slack_messages where team_id = $1 order by message_ts`, [ctx.teamId])).map((row) => row.message_ts))
+            .toEqual([OLD_REPLY]);
+          return saved;
+        },
+        undo: (_ctx, saved) => change(`insert into slack_messages select * from jsonb_populate_record(null::slack_messages, $1::jsonb)`, [saved]),
+      }),
+      ...(["infinity", "-infinity"] as const).map((value) => scenario<string>({
+        label: `the root's observation is ${value} (not finite)`,
+        expected: noWitness,
+        arrange: async (ctx) => {
+          const original = (await one(`select observed_at::text as at from slack_messages where ${rootRow}`, [ctx.teamId, OLD_ROOT])).at as string;
+          await change(`update slack_messages set observed_at = $3::timestamptz where ${rootRow}`, [ctx.teamId, OLD_ROOT, value]);
+          expect((await one(`select isfinite(observed_at) as finite, deleted_at is null as live from slack_messages where ${rootRow}`, [ctx.teamId, OLD_ROOT])))
+            .toEqual({ finite: false, live: true });
+          return original;
+        },
+        undo: (ctx, original) => change(`update slack_messages set observed_at = $3::timestamptz where ${rootRow}`, [ctx.teamId, OLD_ROOT, original]),
+      })),
+    ])("is missing when $label", refusesThenPrepares);
+
+    /**
+     * M2. The mutant bypasses the existence of a live root witness while still supplying a due
+     * observation. For that mutant to be KILLED rather than to crash, the fixture has to be one in
+     * which everything except the witness is in order — so that with the check gone, the path to the
+     * enqueue is open. That is asserted here against the stored rows, with the test's own counts,
+     * before the call: a row for the root with a finite, overdue observation exists; it is not
+     * live; nothing else binds the item or the thread elsewhere; neither path is in conflict; and no
+     * work is pending. On the unmutated source the answer is `missing_root_witness` and nothing is
+     * written; on the mutant the same fixture reaches the enqueue helper and a row appears.
+     */
+    it.each([
+      ["the root row is present but deleted", async (ctx: Ctx): Promise<void> => {
+        await change(`update slack_messages set deleted_at = now() where ${rootRow}`, [ctx.teamId, OLD_ROOT]);
+      }, { overdue_root_rows: 1, live_root_rows: 0 }],
+      ["the root row is gone and only the overdue reply remains", async (ctx: Ctx): Promise<void> => {
+        await change(`delete from slack_messages where ${rootRow}`, [ctx.teamId, OLD_ROOT]);
+        // The reply is still there, live, bound to this item and overdue: an observation a mutant
+        // could be handed, on a thread that has no root witness at all.
+        expect(await run(
+          `select message_ts from slack_messages
+            where team_id = $1 and item_id = $3::uuid and root_ts = $2 and deleted_at is null
+              and isfinite(observed_at) and observed_at + interval '60 seconds' <= clock_timestamp()`, [ctx.teamId, OLD_ROOT, ctx.itemId]
+        )).toEqual([{ message_ts: OLD_REPLY }]);
+      }, { overdue_root_rows: 0, live_root_rows: 0 }],
+    ] as const)("stays missing_root_witness when %s, on a fixture where only the witness stands between it and an enqueue (M2)", async (_label, arrange, expectedRows) => {
+      const ctx = await preparable();
+      await arrange(ctx);
+      const facts = await one(
+        `select
+           (select count(*)::int from slack_messages
+             where team_id = $1 and workspace_id = $4 and channel_id = $5 and message_ts = $2 and item_id = $3::uuid
+               and isfinite(observed_at) and observed_at + interval '60 seconds' <= clock_timestamp()) as overdue_root_rows,
+           (select count(*)::int from slack_messages
+             where team_id = $1 and message_ts = $2 and root_ts = $2 and is_root and deleted_at is null) as live_root_rows,
+           (select count(*)::int from slack_messages
+             where team_id = $1 and item_id = $3::uuid and (workspace_id <> $4 or channel_id <> $5 or root_ts <> $2)) as item_rows_elsewhere,
+           (select count(*)::int from slack_messages
+             where team_id = $1 and workspace_id = $4 and channel_id = $5 and root_ts = $2 and item_id <> $3::uuid) as thread_rows_of_other_items,
+           (select count(*)::int from items where team_id = $1 and path = $6) as items_at_legacy_path,
+           (select count(*)::int from items where team_id = $1 and path = $7 and id <> $3::uuid) as other_items_at_scoped_path,
+           (select count(*)::int from slack_sync_threads where team_id = $1) as queue_rows`,
+        [ctx.teamId, OLD_ROOT, ctx.itemId, WORKSPACE, CHANNEL, LEGACY_PATH, SCOPED_PATH]
+      );
+      expect(facts, "fixture: only the witness is missing; everything a mutant would need to enqueue is present").toEqual({
+        ...expectedRows, item_rows_elsewhere: 0, thread_rows_of_other_items: 0,
+        items_at_legacy_path: 0, other_items_at_scoped_path: 0, queue_rows: 0,
+      });
+
+      const before = await snapshot(ctx.teamId);
+      expect(await prepareEntry(ctx)).toEqual(noWitness);
+      expect(await queuedRoots(ctx.teamId), "nothing was enqueued").toEqual([]);
+      expect(await snapshot(ctx.teamId), "nothing was written").toEqual(before);
+    });
+  });
+
+  // ── §5.3 the same item bound to another thread or scope: M1d, M1e, M1f ─────
+
+  describe("the item's own ledger rows", () => {
+    const sameItem = (label: string, row: Parameters<typeof ledgerRow>[2]): Case => scenario<string>({
+      label, expected: contradictory,
+      arrange: async (ctx) => {
+        const id = await ledgerRow(ctx.teamId, ctx.itemId, row);
+        // Fixture: exactly ONE component of the stored row differs from the candidate's scope.
+        const stored = await one(
+          `select (workspace_id <> $2)::int + (channel_id <> $3)::int + (root_ts <> $4)::int as differing,
+                  message_ts <> root_ts as is_reply, is_root, (deleted_at is not null) as deleted
+             from slack_messages where id = $1::uuid`, [id, WORKSPACE, CHANNEL, OLD_ROOT]
+        );
+        expect(stored, `fixture: ${label}`).toEqual({ differing: 1, is_reply: true, is_root: false, deleted: row.deleted === true });
+        return id;
+      },
+      undo: dropLedgerRow,
+    });
+
+    it.each<Case>([
+      sameItem("another WORKSPACE only (M1d)", { workspace: "T0OTHER9", messageTs: OTHER_REPLY, rootTs: OLD_ROOT }),
+      sameItem("another CHANNEL only (M1e)", { channel: "C0OTHER1170", messageTs: OTHER_REPLY, rootTs: OLD_ROOT }),
+      sameItem("another ROOT only (M1f)", { messageTs: "1718800000.000101", rootTs: "1718800000.000100" }),
+      sameItem("another workspace only, on a DELETED row", { workspace: "T0OTHER9", messageTs: OTHER_REPLY, rootTs: OLD_ROOT, deleted: true }),
+      sameItem("another channel only, on a DELETED row", { channel: "C0OTHER1170", messageTs: OTHER_REPLY, rootTs: OLD_ROOT, deleted: true }),
+      sameItem("another root only, on a DELETED row", { messageTs: "1718800000.000101", rootTs: "1718800000.000100", deleted: true }),
+    ])("contradict the candidate when one of them is in $label", refusesThenPrepares);
+
+    it("do not contradict it when they are further replies of the SAME root in the same scope (control)", async () => {
+      await stillPrepares(async (ctx) => {
+        await ledgerRow(ctx.teamId, ctx.itemId, { messageTs: OTHER_REPLY, rootTs: OLD_ROOT });
+        await ledgerRow(ctx.teamId, ctx.itemId, { messageTs: "1718900000.000151", rootTs: OLD_ROOT, deleted: true });
+      });
+    });
+  });
+
+  // ── §5.3 the same scoped thread bound to another item: M1h ─────────────────
+
+  describe("a second item owning part of the same thread", () => {
+    /** A second item of the same team at an unrelated, non-conflicting path. */
+    async function secondItem(ctx: Ctx): Promise<string> {
+      const second = await seedUnrelatedItem(ctx.f.seed);
+      const stored = await one(`select path, team_id::text as team_id from items where id = $1`, [second]);
+      expect(stored.team_id).toBe(ctx.teamId);
+      expect([SCOPED_PATH, LEGACY_PATH], "fixture: the second item's path conflicts with neither path of the root").not.toContain(stored.path);
+      expect(String(stored.path).startsWith("slack/"), "fixture: the second item is outside the Slack namespace").toBe(false);
+      return second;
+    }
+    const ownedReply = (label: string, deleted: boolean): Case => scenario<string>({
+      label, expected: contradictory,
+      arrange: async (ctx) => {
+        const second = await secondItem(ctx);
+        const id = await ledgerRow(ctx.teamId, second, { messageTs: OTHER_REPLY, rootTs: OLD_ROOT, deleted });
+        // The row M1h is about, read back: a REPLY — its own timestamp is not the root's — of this
+        // exact root, in this exact team, workspace and channel, owned by the second item.
+        expect(await one(
+          `select team_id::text as team_id, workspace_id, channel_id, root_ts, message_ts, is_root, item_id::text as item_id,
+                  (deleted_at is not null) as deleted, eligible, exclusion_reason
+             from slack_messages where id = $1::uuid`, [id]
+        )).toEqual({
+          team_id: ctx.teamId, workspace_id: WORKSPACE, channel_id: CHANNEL, root_ts: OLD_ROOT, message_ts: OTHER_REPLY,
+          is_root: false, item_id: second, deleted, eligible: true, exclusion_reason: null,
+        });
+        expect(OTHER_REPLY).not.toBe(OLD_ROOT);
+        // The candidate's own witness is untouched and live: only the second owner is wrong.
+        expect(await run(
+          `select item_id::text as item_id from slack_messages
+            where team_id = $1 and message_ts = $2 and root_ts = $2 and is_root and deleted_at is null`, [ctx.teamId, OLD_ROOT]
+        )).toEqual([{ item_id: ctx.itemId }]);
+        return id;
+      },
+      undo: dropLedgerRow,
+    });
+
+    // Kills `root_ts = rootTs` replaced by `message_ts = rootTs`: this row's message_ts is NOT the root's.
+    it("contradicts the candidate when the second item owns a LIVE reply of the same root (M1h)", () =>
+      refusesThenPrepares(ownedReply("a second item owns a live reply of the same root", false)));
+
+    // Kills `deleted_at IS NULL` added to the contradiction check: this row is deleted, and still binds.
+    it("contradicts the candidate when the second item's reply of the same root is DELETED (M1h, deleted-row variant)", () =>
+      refusesThenPrepares(ownedReply("a second item owns a deleted reply of the same root", true)));
+
+    it.each<[string, (ctx: Ctx, second: string) => Promise<unknown>]>([
+      ["in another CHANNEL of the same workspace", (ctx, second) => ledgerRow(ctx.teamId, second, { channel: "C0OTHER1170", messageTs: OTHER_REPLY, rootTs: OLD_ROOT })],
+      ["in another WORKSPACE with the same channel id", (ctx, second) => ledgerRow(ctx.teamId, second, { workspace: "T0OTHER9", messageTs: OTHER_REPLY, rootTs: OLD_ROOT })],
+      ["of ANOTHER root in the same channel", (ctx, second) => ledgerRow(ctx.teamId, second, { messageTs: "1718800000.000101", rootTs: "1718800000.000100" })],
+    ])("does not contradict it when the second item's row is %s (scope control)", async (_label, plant) => {
+      await stillPrepares(async (ctx) => { await plant(ctx, await secondItem(ctx)); });
+    });
+
+    it("does not contradict it when ANOTHER TEAM stores the same workspace, channel and root under its own item (tenant control)", async () => {
+      await stillPrepares(async (ctx) => {
+        const otherTeam = await seedTeam();
+        const theirs = await seedUnrelatedItem(otherTeam);
+        // The same provider ids and the same timestamps, root and reply, in a different tenant.
+        await ledgerRow(otherTeam.teamId, theirs, { messageTs: OLD_ROOT, rootTs: OLD_ROOT });
+        await ledgerRow(otherTeam.teamId, theirs, { messageTs: OTHER_REPLY, rootTs: OLD_ROOT });
+        expect(otherTeam.teamId).not.toBe(ctx.teamId);
+      });
+    });
+  });
+
+  // ── §5.4 exact path conflicts ──────────────────────────────────────────────
+
+  describe("another item at one of the root's two paths", () => {
+    it.each<Case>([
+      scenario<{ item: string; project: string }>({
+        label: "the SCOPED path is owned by an item of another project",
+        expected: { outcome: "refused", reason: "scoped_path_conflict" },
+        arrange: async (ctx) => {
+          const project = await projectId(ctx.teamId, `other-${randomUUID().slice(0, 8)}`, true);
+          const item = await plantItem(ctx.teamId, project, SCOPED_PATH);
+          expect(project, "fixture: the conflicting item is in another project").not.toBe(await projectId(ctx.teamId, "slack"));
+          return { item, project };
+        },
+        undo: (ctx, token) => dropItem(ctx, token.item),
+      }),
+      scenario<string>({
+        label: "an item exists at the LEGACY path in the Slack project",
+        expected: { outcome: "refused", reason: "legacy_path_conflict" },
+        arrange: async (ctx) => plantItem(ctx.teamId, await projectId(ctx.teamId, "slack"), LEGACY_PATH, { frontmatter: { source: "slack" } }),
+        undo: dropItem,
+      }),
+      // "Live legacy path" is ANY extant item row there: another project, another kind, another
+      // access, no Slack frontmatter at all.
+      scenario<string>({
+        label: "an item exists at the LEGACY path in another project, with another kind and access and no Slack metadata",
+        expected: { outcome: "refused", reason: "legacy_path_conflict" },
+        arrange: async (ctx) => plantItem(
+          ctx.teamId, await projectId(ctx.teamId, `other-${randomUUID().slice(0, 8)}`, true), LEGACY_PATH, { kind: "transcript", access: "external" }
+        ),
+        undo: dropItem,
+      }),
+    ])("refuses when $label", refusesThenPrepares);
+
+    it.each<[string, (ctx: Ctx) => Promise<unknown>]>([
+      ["the legacy path of ANOTHER root of the same channel is occupied", async (ctx) =>
+        plantItem(ctx.teamId, await projectId(ctx.teamId, "slack"), `slack/c0known1170/1718900000.000200.md`)],
+      ["the scoped path of ANOTHER root is owned by another project", async (ctx) =>
+        plantItem(ctx.teamId, await projectId(ctx.teamId, `other-${randomUUID().slice(0, 8)}`, true), `slack/t0source1/c0known1170/1718900000.000200.md`)],
+      ["ANOTHER TEAM has items at both of the root's paths", async () => {
+        const otherTeam = await seedTeam();
+        const theirs = await projectId(otherTeam.teamId, `other-${randomUUID().slice(0, 8)}`, true);
+        await plantItem(otherTeam.teamId, theirs, SCOPED_PATH);
+        await plantItem(otherTeam.teamId, theirs, LEGACY_PATH);
+      }],
+    ])("does not refuse when %s (scope and tenant control)", async (_label, arrange) => {
+      await stillPrepares(arrange);
+    });
+  });
+});
