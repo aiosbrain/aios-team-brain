@@ -21,6 +21,9 @@ export default defineConfig({
   test: {
     ...httpConfig.test,
     include: ["test/http/tierret1-query.test.ts"],
-    globalSetup: ["test/http/tierret1-query-global-setup.ts"],
+    // The setup file inherited from the HTTP config (the data-mechanics truncation hook) refuses to
+    // truncate without the run-safety state, so this override must keep its initializer — first,
+    // as in the HTTP config. Pinned by test/guards/datamechanics-run-safety-config.test.ts.
+    globalSetup: ["test/datamechanics/global-setup.ts", "test/http/tierret1-query-global-setup.ts"],
   },
 });

@@ -188,22 +188,35 @@ class RolledBack<T> {
  * named `gate` — after PostgreSQL has taken that statement's snapshot — without changing a
  * character of the production SQL.
  *
- * How: `read` runs inside a transaction of this test's own, in which a TEMPORARY VIEW named
- * `member_identity_mapping_state` stands in front of the real table (temporary objects are found
- * first). The view is the real table, plus one condition that takes the gate. So when the
- * listing's own joined SELECT reaches the mapping state, it is that SELECT — already executing, its
- * snapshot fixed — that waits. The gate is a lock of the test's naming; it is not, and is unrelated
- * to, the team's identity authority. The transaction is always rolled back: the view never exists
- * outside it, and nothing the read did is kept.
+ * How: `read` runs inside a transaction of this test's own, in which TEMPORARY VIEWS named
+ * `member_identities` and `member_identity_mapping_state` stand in front of the two real tables
+ * (temporary objects are found first). Each view is its real table, plus one condition that takes
+ * the gate. So the first statement that reads EITHER table is the one that waits — already
+ * executing, its snapshot fixed. The gate is a transaction-level advisory lock, which the same
+ * transaction may take again without waiting: a statement that reads both tables pauses once, and
+ * so does a transaction that reads them in two statements — at its FIRST read.
+ *
+ * BOTH tables are gated on purpose. Gating only the mapping state would pause a two-statement
+ * reader at its second read, after it had already read the holder: both of its reads would then
+ * predate the remap, and it would pass for a coherent one. With both gated, such a reader pauses
+ * on the holder (read before the remap) and reads the revision afterwards — and returns the torn
+ * pair this schedule exists to catch. Only a single statement returns one snapshot's pair.
+ *
+ * The gate is a lock of the test's naming; it is not, and is unrelated to, the team's identity
+ * authority. The transaction is always rolled back: the views never exist outside it, and nothing
+ * the read did is kept.
  */
 async function pausedInStatement<T>(gate: string, read: () => Promise<T>): Promise<T> {
   if (!/^[A-Za-z0-9:_-]+$/.test(gate)) throw new Error(`unusable gate name: ${gate}`);
+  const takesGate = `exists (select 1 from pg_advisory_xact_lock(hashtextextended('${gate}', 0)))`;
   try {
     await withTransaction(async () => {
       await runSql(
+        `create temporary view member_identities as
+           select i.* from public.member_identities i where ${takesGate}`);
+      await runSql(
         `create temporary view member_identity_mapping_state as
-           select s.* from public.member_identity_mapping_state s
-            where exists (select 1 from pg_advisory_xact_lock(hashtextextended('${gate}', 0)))`);
+           select s.* from public.member_identity_mapping_state s where ${takesGate}`);
       throw new RolledBack(await read());
     });
   } catch (carried) {
@@ -805,6 +818,55 @@ describe("AIO-1167 X-02 — what the action does not decide (real Postgres)", ()
   });
 });
 
+describe("AIO-1167 X-02 — the listing FAILS rather than display what it could not read exactly (real Postgres)", () => {
+  it("a stored revision above Number.MAX_SAFE_INTEGER is an error — never a rounded number handed out as an observation; the largest exact one is listed exactly", async () => {
+    const seed = await adminSeed();
+    const alice = await member(seed, "Alice");
+    const target = idFor("slack", "huge");
+    expect(await link(seed, alice, "slack", target, BLANK)).toEqual({ ok: true });
+    const setRevision = (revision: string) => getPool().query(
+      "update member_identity_mapping_state set revision = $3::bigint where team_id=$1 and provider='slack' and external_id=$2",
+      [seed.teamId, target, revision]);
+
+    // 2^53 + 1: a legal bigint the schema's `revision > 0` check admits, and one JavaScript cannot
+    // hold — as a number it reads 9007199254740992, a revision the id does not have.
+    expect((await setRevision("9007199254740993")).rowCount).toBe(1);
+    expect(Number("9007199254740993")).toBe(9007199254740992);
+    await expect(listMemberIdentities(db(), seed.teamId))
+      .rejects.toThrow("identity mapping state read failed: malformed revision for slack identity " + target);
+    // …and so is 2^53 itself, the first integer that is no longer exact.
+    await setRevision("9007199254740992");
+    await expect(listMemberIdentities(db(), seed.teamId)).rejects.toThrow(/malformed revision for slack identity/);
+
+    // CONTROL: the largest revision that IS exact is listed, digit for digit.
+    await setRevision("9007199254740991");
+    expect(await displayed(seed, alice, "slack", target)).toEqual({ externalId: target, revision: Number.MAX_SAFE_INTEGER });
+    // And an ordinary one, as ever.
+    await setRevision("1");
+    expect(await displayed(seed, alice, "slack", target)).toEqual({ externalId: target, revision: 1 });
+  });
+
+  it("a FAILED read is an error, named as the identities read — never an empty listing", async () => {
+    const seed = await adminSeed();
+    const alice = await member(seed, "Alice");
+    const target = idFor("slack", "unread");
+    expect(await link(seed, alice, "slack", target, BLANK)).toEqual({ ok: true });
+
+    // The listing's own statement is made to fail in PostgreSQL: inside a transaction of this
+    // test's own, a temporary view without the columns it reads stands in front of the table. The
+    // transaction is rolled back, so the view never exists outside it.
+    const failure = await withTransaction(async () => {
+      await runSql("create temporary view member_identities as select 1 as unrelated");
+      return listMemberIdentities(db(), seed.teamId);
+    }).then(() => null, (error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toMatch(/^member identities read failed: /);
+    // CONTROL: outside that transaction the very same call reads the link.
+    expect(await displayed(seed, alice, "slack", target)).toEqual({ externalId: target, revision: 1 });
+  });
+});
+
 describe.each(PROVIDERS)("AIO-1167 X-02 — %s: UNLINK is bound to the displayed holder AND the displayed revision (real Postgres)", (provider) => {
   /** Alice holds one id at revision 1; Bob is who it may be remapped to. */
   async function aliceHolds() {
@@ -833,9 +895,12 @@ describe.each(PROVIDERS)("AIO-1167 X-02 — %s: UNLINK is bound to the displayed
     const gate = `identity-list-snapshot-test:${randomUUID()}`;
 
     // The page's own reader, running its own statement, is paused INSIDE that statement — after
-    // PostgreSQL has taken the statement's snapshot — waiting on the test's gate. While it is
-    // paused the real writer remaps the id Alice → Bob and COMMITS: it is not made to wait (the
-    // harness requires it to finish while the listing is still parked exactly where it was).
+    // PostgreSQL has taken the statement's snapshot — waiting on the test's gate. Both identity
+    // tables are gated (see `pausedInStatement`), so whatever reads the holder is what pauses: a
+    // reader that fetched holder and revision in two statements would pause on the first and read
+    // the second after the commit. While it is paused the real writer remaps the id Alice → Bob
+    // and COMMITS: it is not made to wait (the harness requires it to finish while the listing is
+    // still parked exactly where it was).
     const { first: paused, during: remapped } = await parkWhile({
       seed,
       barrier: await holdNamedLock(gate),
@@ -848,8 +913,8 @@ describe.each(PROVIDERS)("AIO-1167 X-02 — %s: UNLINK is bound to the displayed
     expect(remapped).toMatchObject({ memberId: bob, updated: true, mappingRevision: 2 });
     expect(await mapping(seed, provider, target)).toEqual({ holder: bob, revision: 2, state: "linked" });
     // The paused statement resumed AFTER that commit and returned what its snapshot held: the id
-    // on Alice's row at Alice's revision. Not Alice with Bob's revision 2 — the pair two separate
-    // reads produced — and not on Bob's row.
+    // on Alice's row at Alice's revision. Not Alice with Bob's revision 2 — the torn pair a
+    // holder-then-revision reader returns from this very schedule — and not on Bob's row.
     expect(shownIn(paused, alice, target), "the old statement: Alice at her own revision").toEqual([1]);
     expect(shownIn(paused, bob, target), "the old statement does not show it on Bob's row").toEqual([]);
     // A FRESH read is a new statement with a new snapshot: Bob at revision 2, and only Bob.

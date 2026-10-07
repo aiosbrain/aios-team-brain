@@ -51,10 +51,21 @@ const OWNED_CONNECTION_BOUND_MS = 10_000;
 /** The interval between two reads of the same evidence. Never what a schedule is built on. */
 const EVIDENCE_INTERVAL_MS = 25;
 /**
- * The timeout of every test that races. It must exceed the bounded waits such a test can make —
- * Vitest's default (5 s) is shorter than ONE evidence wait. A failing test spends at most one
- * barrier acquisition, one evidence wait and three cleanup rounds (settle, cancel, terminate); the
- * passing waits return as soon as PostgreSQL shows the evidence.
+ * The timeout of every test that races — far above Vitest's default (5 s), which is shorter than a
+ * single evidence wait.
+ *
+ * What one schedule can spend, each part separately bounded: the barrier's acquisition
+ * (`OWNED_CONNECTION_BOUND_MS`); its evidence waits, of which there are SEVERAL — `parkThenCompete`
+ * makes three, five with `whileQueued`; `parkWhile` makes two around a bounded run — each up to
+ * `pollMs`; then the barrier's disappearance (`cleanupMs`) and up to three cleanup rounds (settle,
+ * cancel, terminate) of up to two `cleanupMs` each. A wait that succeeds returns as soon as
+ * PostgreSQL shows the evidence, and a schedule stops at its first wait that fails, so in practice
+ * one wait runs long. But nothing makes the others short: a schedule in which every wait takes
+ * nearly its whole bound adds up to more than this timeout.
+ *
+ * That case is not made to fit by this number; it fails closed. A test Vitest gives up on leaves
+ * its scope's in-flight marker on file until `finish` has proven cleanup, and until then the
+ * tier's setup file refuses to truncate or load another file.
  */
 export const RACE_TEST_TIMEOUT_MS = 90_000;
 
@@ -151,10 +162,10 @@ async function disposeOwned(client: Client, rollback: boolean): Promise<void> {
   await withinBound(client.end(), OWNED_CONNECTION_BOUND_MS);
 }
 
-function ownedClient(role: string): Client {
+function ownedClient(role: string, applicationName = `${APPLICATION}/${role}`): Client {
   const client = new Client({
     connectionString: process.env.DATABASE_URL,
-    application_name: `${APPLICATION}/${role}`,
+    application_name: applicationName,
     connectionTimeoutMillis: OWNED_CONNECTION_BOUND_MS,
     statement_timeout: OWNED_CONNECTION_BOUND_MS,
   });
@@ -235,11 +246,22 @@ export async function untilSessions(
   });
 }
 
-/** The live sessions of one named barrier (`holdLock`'s `tag`), found by its exact `application_name`. */
-export async function barrierSessions(tag: string): Promise<{ pid: number; state: string | null }[]> {
+/** PostgreSQL keeps at most this many bytes of an `application_name`; the rest is silently cut. */
+const MAX_APPLICATION_NAME_BYTES = 63;
+
+/** The `application_name` a barrier's session is found — and later seen gone — by. */
+const barrierSessionName = (tag: string) => `${APPLICATION}/barrier/${tag}`;
+
+/** The live sessions of this database under one exact `application_name`. */
+export async function sessionsNamed(applicationName: string): Promise<{ pid: number; state: string | null }[]> {
   return observe<{ pid: number; state: string | null }>(
     "select pid, state from pg_stat_activity where datname = current_database() and application_name = $1 order by pid",
-    [`${APPLICATION}/barrier/${tag}`]);
+    [applicationName]);
+}
+
+/** The live sessions of one named barrier (`holdLock`'s `tag`), found by its exact `application_name`. */
+export async function barrierSessions(tag: string): Promise<{ pid: number; state: string | null }[]> {
+  return sessionsNamed(barrierSessionName(tag));
 }
 
 /** Re-read one named barrier's sessions until none is left, within the default evidence bound. */
@@ -277,14 +299,38 @@ export interface BarrierOptions {
   tag?: string;
   /** Shortens how long the barrier's own lock request may wait before PostgreSQL refuses it. */
   lockTimeoutMs?: number;
-  /** SEAMS for the harness's own tests: another run-safety state, a shorter cleanup budget, and a
-   * replacement for closing the connection (to stage a barrier that survives its release). */
+  /** SEAMS for the harness's own tests: another run-safety state, a shorter cleanup budget, a
+   * replacement for closing the connection (to stage a barrier that survives its release), and a
+   * different `application_name` for its session (to stage one that cannot be found by its tag —
+   * what an `application_name` in the connection string does to every session). */
   safety?: RunSafety;
   cleanupMs?: number;
   dispose?: (client: Client, rollback: boolean) => Promise<void>;
+  applicationName?: string;
 }
 
 const UNPROVEN_BARRIER: CleanupReport = { outcome: "unproven", barrierGone: false, signalled: [], operations: [] };
+
+/** One backend, exactly: its pid AND when it started (epoch seconds, as text — the same in every
+ * session's time zone), so a later backend given the same pid is not it. */
+interface BackendIdentity { pid: number; started: string }
+
+/** That exact backend was SEEN to be absent within `ms`. Unreadable evidence is not absence. */
+async function backendAbsent(backend: BackendIdentity, ms: number): Promise<boolean> {
+  try {
+    await untilEvidence({
+      read: () => observe<{ pid: number }>(
+        "select pid from pg_stat_activity where pid = $1 and extract(epoch from backend_start)::text = $2", [backend.pid, backend.started]),
+      accept: (sessions) => sessions.length === 0,
+      expected: `backend ${backend.pid} (started ${backend.started}) gone`,
+      show: (sessions) => JSON.stringify(sessions),
+      timeoutMs: ms,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /** The tagged barrier session was SEEN to be absent within `ms`. Unreadable evidence is not absence. */
 async function barrierAbsent(tag: string, ms: number): Promise<boolean> {
@@ -307,22 +353,44 @@ async function barrierAbsent(tag: string, ms: number): Promise<boolean> {
  * released.
  *
  * BEFORE it connects, its scope is recorded as in flight in the run-safety state; if that cannot
- * be recorded this throws and no connection is made. Connecting, BEGIN, the lock itself and the PID
- * read are all bounded. If any of them fails, the connection is closed and its tagged session must
- * be SEEN gone before the marker is cleared and the original error rethrown; if it cannot be, the
- * run is stopped. A barrier that was not handed out holds nothing, leaves no session — and that is
- * proven, not inferred from `rollback` / `end()` having returned.
+ * be recorded this throws and no connection is made. Connecting, BEGIN, the lock itself and the
+ * identity reads are all bounded. If any of them fails, the connection is closed and its session
+ * must be SEEN gone before the marker is cleared and the original error rethrown; if it cannot be,
+ * the run is stopped. A barrier that was not handed out holds nothing, leaves no session — and that
+ * is proven, not inferred from `rollback` / `end()` having returned.
+ *
+ * ABSENCE NEEDS A POSITIVE CONTROL. "No session under this tag" proves the barrier gone only if the
+ * barrier WAS a session under this tag. So, before any lock is taken, the session itself must
+ * report the exact `application_name` it will be looked for by (a name set in the connection
+ * string overrides the one given here; a name too long is cut); and before the barrier is handed
+ * out, the monitor must see exactly one session under the tag, and it must be this backend. Either
+ * failing is a failed acquisition. And absence is then seen twice over: no session under the tag,
+ * and not this exact backend (its pid and start time) — so a session that could not be found by
+ * its name is still not mistaken for one that has gone.
  */
 export async function holdLock(sql: string, params: unknown[] = [], opts: BarrierOptions = {}): Promise<Barrier> {
   const tag = opts.tag ?? randomUUID().slice(0, 12);
+  // The tag IS the evidence: the session is found, and later seen gone, by its exact
+  // `application_name`. PostgreSQL silently truncates a name longer than 63 bytes — a session whose
+  // name was cut would never match, and "no such session" would read as "gone". So a tag that
+  // cannot be carried whole is refused before anything is recorded or connected.
+  const sessionName = barrierSessionName(tag);
+  if (!/^[A-Za-z0-9._-]+$/.test(tag) || Buffer.byteLength(sessionName, "utf8") > MAX_APPLICATION_NAME_BYTES) {
+    throw new RaceHarnessError(
+      `unusable barrier tag ${JSON.stringify(tag)}: it must be [A-Za-z0-9._-]+ and "${sessionName}" must fit PostgreSQL's `
+      + `${MAX_APPLICATION_NAME_BYTES}-byte application_name`,
+    );
+  }
   const safety = opts.safety ?? currentRunSafety();
   const cleanupMs = opts.cleanupMs ?? DEFAULT_BOUNDS.cleanupMs;
   const dispose = opts.dispose ?? disposeOwned;
   // FIRST: the in-flight marker. If it cannot be written, nothing below runs.
   safety.arm(tag, `barrier ${tag}: ${sql}`);
 
-  const owner = ownedClient(`barrier/${tag}`);
+  const owner = ownedClient(`barrier/${tag}`, opts.applicationName ?? sessionName);
+  let connected = false;
   let begun = false;
+  let backend: BackendIdentity | null = null;
   let vanished: Promise<boolean> | undefined;
   const vanish = (ms: number): Promise<boolean> => (vanished ??= (async () => {
     try {
@@ -330,7 +398,10 @@ export async function holdLock(sql: string, params: unknown[] = [], opts: Barrie
     } catch {
       // Whatever closing did or did not do, only the evidence below counts.
     }
-    return barrierAbsent(tag, ms);
+    // A session that was opened and never identified cannot be seen gone: nothing says where to look.
+    if (connected && !backend) return false;
+    if (!(await barrierAbsent(tag, ms))) return false;
+    return backend ? backendAbsent(backend, ms) : true;
   })());
   let concluded = false;
   const conclude = (proven: boolean, reason: string): void => {
@@ -348,14 +419,35 @@ export async function holdLock(sql: string, params: unknown[] = [], opts: Barrie
 
   try {
     await owner.connect();
+    connected = true;
+    // WHO this session is, from the session itself, before it begins or locks anything.
+    const self = (await owner.query<{ pid: unknown; started: unknown; name: unknown }>(
+      `select pg_backend_pid() as pid,
+              (select extract(epoch from backend_start)::text from pg_stat_activity where pid = pg_backend_pid()) as started,
+              current_setting('application_name') as name`)).rows[0];
+    if (!self || typeof self.pid !== "number" || !Number.isInteger(self.pid) || typeof self.started !== "string" || !self.started) {
+      throw new RaceHarnessError("the barrier's backend could not be identified");
+    }
+    backend = { pid: self.pid, started: self.started };
+    const pid = backend.pid;
+    if (self.name !== sessionName) {
+      throw new RaceHarnessError(
+        `barrier ${tag}: its session reports application_name ${JSON.stringify(self.name)}, not ${JSON.stringify(sessionName)} — `
+        + "it could not be found again by its tag (is application_name set in the connection string?)",
+      );
+    }
     await owner.query("begin");
     begun = true;
     // The barrier waits for nobody: if its lock is not free, that is a failed schedule, not a wait.
     await owner.query("select set_config('lock_timeout', $1, true)", [`${opts.lockTimeoutMs ?? OWNED_CONNECTION_BOUND_MS}ms`]);
     await owner.query(sql, params);
-    const pid: unknown = (await owner.query<{ pid: number }>("select pg_backend_pid() as pid")).rows[0]?.pid;
-    if (typeof pid !== "number" || !Number.isInteger(pid)) {
-      throw new RaceHarnessError("the barrier's backend could not be identified");
+    // THE POSITIVE CONTROL, from the monitor — the connection that will later look for it: exactly
+    // one session under this tag, and it is this backend. Unreadable evidence fails here too.
+    const visible = await barrierSessions(tag);
+    if (visible.length !== 1 || visible[0].pid !== pid) {
+      throw new RaceHarnessError(
+        `barrier ${tag}: the monitor must see exactly its own session (backend ${pid}) under its tag, and sees ${JSON.stringify(visible)}`,
+      );
     }
     let released: Promise<void> | undefined;
     const release = (): Promise<void> => (released ??= (async () => {
