@@ -1259,6 +1259,46 @@ export interface PendingSignal {
 }
 
 /**
+ * POSTGRESQL'S OWN ANSWER THAT IT EXECUTED ONE SIGNAL: which, and — for each backend it was aimed
+ * at, and for no other — what the signalling function returned. `sent: false` is an answer too:
+ * there was no such backend left to signal, so nothing was sent and nothing can still arrive.
+ *
+ * ONLY THE REAL SEND MAKES ONE (`settleRaced`), out of an answer it has checked row by row against
+ * the backends that were targeted (`acknowledgementOf`). A value that merely has this shape is not
+ * one: an acknowledgement is recognised by being the very object the real send made, never by what
+ * it says.
+ */
+export interface SignalAcknowledgement {
+  signal: PendingSignal["signal"];
+  backends: { pid: number; sent: boolean }[];
+}
+
+/**
+ * What a signal's statement answered, as the acknowledgement of THAT signal — or the reason it is
+ * not one. It is one only if it is rows, one for each targeted backend and none for any other, each
+ * saying which backend it is and, as a boolean, what PostgreSQL's signalling function returned.
+ * Nothing at all, rows of another shape, a backend short, a backend too many: each throws.
+ */
+function acknowledgementOf(pending: PendingSignal, answer: unknown): SignalAcknowledgement {
+  const refused = (why: string) =>
+    new RaceHarnessError(`the ${pending.signal} of backends ${pending.backends.join(",")} was not acknowledged: ${why}`);
+  if (!Array.isArray(answer)) throw refused("its statement did not answer with rows");
+  const backends = (answer as unknown[]).map((row) => {
+    const { pid, sent } = (typeof row === "object" && row !== null ? row : {}) as { pid?: unknown; sent?: unknown };
+    if (typeof pid !== "number" || !Number.isInteger(pid) || typeof sent !== "boolean") {
+      throw refused("a row of its answer does not say which backend it is, or whether it was signalled");
+    }
+    return { pid, sent };
+  });
+  const answeredFor = backends.map((backend) => backend.pid).sort((a, b) => a - b);
+  const aimedAt = [...pending.backends].sort((a, b) => a - b);
+  if (answeredFor.length !== aimedAt.length || answeredFor.some((pid, index) => pid !== aimedAt[index])) {
+    throw refused(`its answer is for backends ${answeredFor.join(",") || "(none)"}`);
+  }
+  return { signal: pending.signal, backends };
+}
+
+/**
  * SEAMS for the harness's own tests, on the cleanup of the raced operations (`settleRaced`):
  *
  *   - `clock`: what the steps of it that are NOT evidence waits are bounded on — the raced operations
@@ -1268,13 +1308,21 @@ export interface PendingSignal {
  *     PostgreSQL is asked to execute it — the window in which a release used to be able to hand a
  *     targeted backend to someone else.
  *   - `signal`: stands in front of the signal itself. It is given the signal and the real send, and
- *     what it returns is what the harness waits for as the acknowledgement — so a test can stage one
- *     that does not come, or comes late.
+ *     what it returns is what the harness waits for — so a test can stage an acknowledgement that
+ *     does not come, or comes late. It can WITHHOLD one; it cannot MAKE one. What it returns
+ *     acknowledges the signal only if it resolves, in time, with the very `SignalAcknowledgement`
+ *     the real send made. Nothing at all, anything opaque, something merely shaped like one — with
+ *     the real send never made, or made and still pending — acknowledges nothing.
+ *   - `execute`: stands in front of the STATEMENT the real send is — the one that has PostgreSQL
+ *     execute the signal, on the monitor. It is given the signal and that statement, and what it
+ *     returns is what the real send takes for PostgreSQL's answer, and checks as it checks the real
+ *     one — so a test can stage a real send whose answer does not come.
  */
 export interface CleanupSeam {
   clock?: EvidenceClock;
   beforeSignal?: (pending: PendingSignal) => Promise<void>;
-  signal?: (pending: PendingSignal, send: () => Promise<unknown>) => Promise<unknown>;
+  signal?: (pending: PendingSignal, send: () => Promise<SignalAcknowledgement>) => Promise<unknown>;
+  execute?: (pending: PendingSignal, statement: () => Promise<unknown>) => Promise<unknown>;
 }
 
 /**
@@ -1307,6 +1355,13 @@ export interface CleanupSeam {
  * outcome is `unproven` from then on, whatever the remaining rounds find and whatever that
  * acknowledgement later turns out to be. The rounds still run — a terminate is still sent, to
  * backends that are still held out of the pool — but they can no longer prove anything.
+ *
+ * AND ONLY POSTGRESQL SAYS SO. That SOMETHING resolved in time acknowledges nothing. The
+ * acknowledgement is the one the real send made of PostgreSQL's answer — a row for each targeted
+ * backend, and for no other (`SignalAcknowledgement`) — and it is recognised as that very object.
+ * An answer that is anything else — nothing at all, something opaque, something shaped like an
+ * acknowledgement — strands the leases exactly as a missing one does, there and then: the real
+ * send may never have been made, or be pending still, with its signal yet to be executed.
  *
  * `seam` is for the harness's own tests (`CleanupSeam`).
  */
@@ -1354,22 +1409,41 @@ async function settleRaced(
       throw error;
     }
     for (const pid of pids) signalled.add(pid);
-    const send = (): Promise<unknown> =>
-      observe(`select ${kind === "cancel" ? "pg_cancel_backend" : "pg_terminate_backend"}(pid) from unnest($1::int[]) as pid`, [pids]);
+    const pending = (): PendingSignal => ({ signal: kind, backends: [...pids] });
+    // THE STATEMENT: PostgreSQL executes the signal, and answers backend by backend.
+    const statement = (): Promise<unknown> => observe(
+      `select target.pid as pid, ${kind === "cancel" ? "pg_cancel_backend" : "pg_terminate_backend"}(target.pid) as sent
+         from unnest($1::int[]) as target(pid)`, [pids]);
+    // THE REAL SEND, and the only maker of an acknowledgement of this signal: the statement's
+    // answer, checked against these very backends. Made at most once — asked for again, it is the
+    // same send — and observed here whoever else does, so one that fails after its seam has let go
+    // of it is never an unhandled rejection.
+    const real: { send?: Promise<SignalAcknowledgement>; acknowledgement?: SignalAcknowledgement } = {};
+    const send = (): Promise<SignalAcknowledgement> => {
+      if (!real.send) {
+        real.send = attempt(() => (seam.execute ? seam.execute(pending(), statement) : statement()))
+          .then((answer) => {
+            real.acknowledgement = acknowledgementOf(pending(), answer);
+            return real.acknowledgement;
+          });
+        real.send.catch(() => undefined);
+      }
+      return real.send;
+    };
     const stand = seam.signal;
     // THE ACKNOWLEDGEMENT, bounded: PostgreSQL's answer that it has executed the signal, before the
     // deadline on the clock. `fulfilledWithin` settles once — what the answer turns out to be after
     // that is observed and dropped, and reaches none of the code below.
-    const acknowledged = await fulfilledWithin(
-      clock,
-      attempt(() => (stand ? stand({ signal: kind, backends: [...pids] }, send) : send())),
-      OWNED_CONNECTION_BOUND_MS,
-    );
+    const answer = await fulfilledWithin(clock, attempt(() => (stand ? stand(pending(), send) : send())), OWNED_CONNECTION_BOUND_MS);
+    // …AND POSTGRESQL'S OWN: what came in time must be the acknowledgement the real send made, that
+    // very object. A seam's answer that is not — while the real send was never made, or is pending
+    // still — is no more an acknowledgement than no answer at all.
+    const acknowledged = answer !== null && real.acknowledgement !== undefined && answer.value === real.acknowledgement;
     if (!acknowledged) {
-      // Sent, perhaps, and perhaps still to be executed — the answer failed, is still pending, or
-      // came too late to say. These connections are never handed back: destroyed, a PID could pass
-      // to a new backend with that signal still to come. And no outcome can now be anything but
-      // `unproven`, whatever the rounds that follow find.
+      // Sent, perhaps, and perhaps still to be executed — the answer failed, is still pending, came
+      // too late to say, or was not PostgreSQL's. These connections are never handed back:
+      // destroyed, a PID could pass to a new backend with that signal still to come. And no outcome
+      // can now be anything but `unproven`, whatever the rounds that follow find.
       unacknowledged = true;
       resolve("stranded");
       return;
@@ -1478,8 +1552,9 @@ async function finish<T>(
  * moment, with both operations proven waiting, at which a test may add sessions of its own (the two
  * waits are then proven again, unchanged); a moment in cleanup, after the leases a cancel or
  * terminate is aimed at have been reserved and before PostgreSQL is asked to execute it; the clock
- * cleanup's own steps are bounded on, and a stand-in for a signal's acknowledgement (`CleanupSeam`);
- * and shorter bounds. The run-safety state is the barrier's (`BarrierOptions.safety`).
+ * cleanup's own steps are bounded on, and something to stand in front of a signal and of the
+ * statement that sends it (`CleanupSeam`); and shorter bounds. The run-safety state is the
+ * barrier's (`BarrierOptions.safety`).
  */
 export async function parkThenCompete<A, B>(opts: {
   seed: { teamId: string };
@@ -1489,7 +1564,7 @@ export async function parkThenCompete<A, B>(opts: {
   second: () => Promise<B>;
   whileQueued?: (waiting: { parked: number; competing: number }) => Promise<void>;
   beforeSignal?: (pending: PendingSignal) => Promise<void>;
-  cleanup?: Pick<CleanupSeam, "clock" | "signal">;
+  cleanup?: Pick<CleanupSeam, "clock" | "signal" | "execute">;
   bounds?: Partial<RaceBounds>;
 }): Promise<{ first: A; second: B }> {
   const bounds = { ...DEFAULT_BOUNDS, ...opts.bounds };
