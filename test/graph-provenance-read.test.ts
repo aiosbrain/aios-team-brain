@@ -89,11 +89,83 @@ describe("authoritative graph provenance reader", () => {
     expect(result.checked).toBe(26);
     expect(result.incomplete).toBe(false);
 
+    // Discovery budget exhausted with nothing authorized: everything read was consumed, so the
+    // continuation resumes after the last candidate checked.
     mocks.recent.mockReset().mockResolvedValue({ ok: true, facts: hidden });
-    mocks.authorize.mockImplementation(async (_db, input) => input.facts);
+    mocks.authorize.mockImplementation(async () => []);
     const bounded = await readAuthorizedGraphFactsResult({} as never, {
       teamId: "team", groupIds: ["g"], query: "launch", limit: 1, discoveryLimit: 25,
     });
-    expect(bounded).toMatchObject({ incomplete: true, nextOffset: 25, checked: 25 });
+    expect(bounded).toMatchObject({ facts: [], incomplete: true, nextOffset: 25, checked: 25 });
+  });
+
+  describe("continuation over authorized overflow", () => {
+    // 60 candidates in the graph's own order (newest first). Every third one is unauthorized, and
+    // candidates from the eleventh on match the query better, so a ranking across a whole page
+    // would prefer facts read LATER over the earliest authorized ones.
+    const corpus = Array.from({ length: 60 }, (_, index) => ({
+      id: `fact-${String(index).padStart(2, "0")}`,
+      fact: `launch ${index >= 10 ? "rollout" : "note"} ${index}`,
+      at: new Date(Date.UTC(2026, 8, 22) - index * 60_000).toISOString(),
+      subjectType: "project", subject: "project", object: "launch",
+      episodeUuids: [`episode-${index}`], groupId: index % 2 === 0 ? "g" : "h",
+    }));
+    const authorizedIds = corpus.filter((_, index) => index % 3 !== 0).map((fact) => fact.id);
+
+    beforeEach(() => {
+      mocks.recent.mockReset().mockImplementation(async (
+        _groups: string[], _since: string | null, take: number, offset: number,
+      ) => ({ ok: true, facts: corpus.slice(offset, offset + take) }));
+      mocks.resolve.mockImplementation(async (_groups, ids: string[]) => ({
+        ok: true, items: new Map(ids.map((id) => [id, { itemId: id }])),
+      }));
+      mocks.authorize.mockImplementation(async (_db, input) => input.facts
+        .filter((fact: { id: string }) => authorizedIds.includes(fact.id)));
+    });
+
+    it("resumes at the first authorized fact it read but did not return", async () => {
+      const { readAuthorizedGraphFactsResult } = await import("@/lib/graph/provenance-read");
+      // One 25-candidate page holds 16 authorized facts; only the first two are published.
+      const first = await readAuthorizedGraphFactsResult({} as never, {
+        teamId: "team", groupIds: ["g", "h"], query: "launch rollout", limit: 2,
+      });
+      expect(first.facts.map((fact) => fact.id).sort()).toEqual(["fact-01", "fact-02"]);
+      expect(first).toMatchObject({ incomplete: true, nextOffset: 3, checked: 25 });
+    });
+
+    it("pages every authorized fact exactly once, in order, and then reports complete", async () => {
+      const { readAuthorizedGraphFactsResult } = await import("@/lib/graph/provenance-read");
+      const seen: string[] = [];
+      let continuation: number | undefined;
+      let last: { incomplete: boolean; nextOffset: number | null } | null = null;
+      for (let page = 0; page < corpus.length; page += 1) {
+        const result = await readAuthorizedGraphFactsResult({} as never, {
+          teamId: "team", groupIds: ["g", "h"], query: "launch rollout", limit: 7, offset: continuation,
+        });
+        // A page is a contiguous run of the authorized stream, whatever order it is presented in.
+        seen.push(...result.facts.map((fact) => fact.id).sort());
+        last = result;
+        if (result.nextOffset === null) break;
+        expect(result.incomplete).toBe(true);
+        expect(result.nextOffset).toBeGreaterThan(continuation ?? 0);
+        continuation = result.nextOffset;
+      }
+      expect(seen).toEqual(authorizedIds);
+      expect(last).toMatchObject({ incomplete: false, nextOffset: null });
+      for (const id of corpus.filter((_, index) => index % 3 === 0).map((fact) => fact.id)) {
+        expect(seen).not.toContain(id);
+      }
+    });
+
+    it("discloses overflow on a short final page instead of reporting it complete", async () => {
+      const { readAuthorizedGraphFactsResult } = await import("@/lib/graph/provenance-read");
+      // Offset 50 leaves ten candidates — a short page, so the corpus is exhausted — yet seven of
+      // them are authorized and only two fit.
+      const tail = await readAuthorizedGraphFactsResult({} as never, {
+        teamId: "team", groupIds: ["g", "h"], query: "launch", limit: 2, offset: 50,
+      });
+      expect(tail.facts.map((fact) => fact.id).sort()).toEqual(["fact-50", "fact-52"]);
+      expect(tail).toMatchObject({ incomplete: true, nextOffset: 53, checked: 10 });
+    });
   });
 });

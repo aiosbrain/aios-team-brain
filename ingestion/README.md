@@ -49,8 +49,9 @@ aios-ingest backfill --source notion --opt token=$NOTION_TOKEN --opt database_id
 # Run all configured connections:
 aios-ingest sync --config connections.yaml
 
-# Webhook receiver — validated Drive notifications enqueue durable poll work; payload bodies are
-# never trusted as document content. Other registered sources remain pull-only.
+# Webhook receiver — a validated Drive notification marks its stream dirty (one mark per stream,
+# however many arrive); payload bodies are never trusted as document content. Other registered
+# sources remain pull-only.
 uvicorn aios_ingest.webhook_app:app --port 8088
 
 # Scheduled polling:
@@ -159,6 +160,17 @@ owner, including retained versions, search/context derivatives and graph retirem
 credentials, items and cursor state but stops scheduled reads. Disconnect stops credential use and
 watch renewal; it is not an implicit data purge. Operators must use an explicit retention/purge
 decision rather than treating disconnected material as current.
+
+A selected file or folder that lives inside a Shared Drive is read through that drive's change
+stream: at the start of a scope generation the sidecar looks up, once and durably, which drive
+contains each selected root. That does not select the drive — only the root is in scope. Until every
+root can be read nothing is enumerated (`selection_root_unresolved`); a selected file later moved to
+another drive keeps its stream partial until the selection is saved again.
+
+A run has one absolute deadline. Brain writes and reconciliations never wait past it: a rate-limit
+or outage wait that does not fit is deferred to a later run with the retry time the brain gave, and
+the work stays queued. A complete snapshot of more than 10,000 documents is uploaded in pages and
+may take several runs; each run continues after the pages the brain already holds.
 
 The Admin **Run now** and **Retry pending work** controls enqueue a durable request; the sidecar polls
 that queue and runs it through the same generation/fence coordinator as scheduled and notification

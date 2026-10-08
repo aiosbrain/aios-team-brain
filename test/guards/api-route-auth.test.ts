@@ -1186,7 +1186,7 @@ describe("route-auth checker: real-source mutants, in memory only (AC-03, AC-04)
   const DRIVE_START = "app/api/auth/gdrive/start/route.ts";
   const DRIVE_CALLBACK = "app/api/auth/gdrive/callback/route.ts";
 
-  it("inventories exactly the seven Drive handlers: five key-guarded, one admin-session, one public protocol", () => {
+  it("inventories exactly the seven Drive handlers: five key-guarded, two admin-session, none public", () => {
     const keyGuarded = PROTECTED_ROUTES.filter(
       (entry) => entry.path.startsWith(`${DRIVE}/`) || entry.path === "app/api/v1/items/source-reconcile/route.ts",
     );
@@ -1200,9 +1200,12 @@ describe("route-auth checker: real-source mutants, in memory only (AC-03, AC-04)
     expect(PROTECTED_ROUTES.filter((entry) => entry.path === DRIVE_START)).toEqual([
       { path: DRIVE_START, method: "GET", guards: ["requireTeamAdmin"] },
     ]);
-    expect(PUBLIC_EXCEPTIONS.filter((entry) => entry.path === DRIVE_CALLBACK).map((entry) => entry.method)).toEqual(["GET"]);
-    // The callback is public ONLY as an OAuth redirect: it must not be protected-and-public at once.
-    expect(PROTECTED_ROUTES.some((entry) => entry.path === DRIVE_CALLBACK)).toBe(false);
+    expect(PROTECTED_ROUTES.filter((entry) => entry.path === DRIVE_CALLBACK)).toEqual([
+      { path: DRIVE_CALLBACK, method: "GET", guards: ["requireTeamAdmin"] },
+    ]);
+    // The callback returns to the browser that started the grant: it is session-guarded, and must
+    // not also be admitted as a public protocol.
+    expect(PUBLIC_EXCEPTIONS.some((entry) => entry.path === DRIVE_CALLBACK)).toBe(false);
   });
 
   it.each([
@@ -1238,15 +1241,23 @@ describe("route-auth checker: real-source mutants, in memory only (AC-03, AC-04)
     expect(run(repo)).toEqual([NO_INVOCATION(`${DRIVE_START} GET`, "requireTeamAdmin")]);
   });
 
-  it("the Drive OAuth callback is admitted ONLY by its public-protocol exception", () => {
-    // Non-vacuity for the row itself: without its exception the real callback is an unclassified
-    // handler — it invokes no registered guard, so nothing else in the registry is covering for it.
-    const withoutException = {
+  it("fails the Drive OAuth callback when requireTeamAdmin is removed (its import stays)", () => {
+    // The callback exchanges Google's code only for the session of the Admin who started the grant.
+    // Without that invocation it is a session-less handler holding a protected row.
+    const repo = mutant(DRIVE_CALLBACK, "await requireTeamAdmin(bound.teamSlug)", "null");
+    expect(repo.routeSources.get(DRIVE_CALLBACK)).toContain(`import { requireTeamAdmin } from "@/lib/auth/guard"`);
+    expect(run(repo)).toEqual([NO_INVOCATION(`${DRIVE_CALLBACK} GET`, "requireTeamAdmin")]);
+  });
+
+  it("the Drive OAuth callback is admitted ONLY by its admin-session row", () => {
+    // Non-vacuity for the row itself: without it the real callback is an unclassified handler that
+    // does invoke the guard — nothing else in the registry is covering for it.
+    const withoutRow = {
       ...ROUTE_AUTH_POLICY,
-      publicExceptions: PUBLIC_EXCEPTIONS.filter((entry) => entry.path !== DRIVE_CALLBACK),
+      protectedRoutes: PROTECTED_ROUTES.filter((entry) => entry.path !== DRIVE_CALLBACK),
     };
-    expect(checkRouteAuth(REAL, withoutException)).toEqual([
-      `${DRIVE_CALLBACK} GET: no registered authentication invocation — unclassified handler; add an expected-guard row or a public protocol exception`,
+    expect(checkRouteAuth(REAL, withoutRow)).toEqual([
+      `${DRIVE_CALLBACK} GET: unclassified handler invoking requireTeamAdmin — add an expected-guard row`,
     ]);
   });
 

@@ -1,7 +1,9 @@
 import asyncio
+import dataclasses
 import http.client
 import json
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 
@@ -25,15 +27,19 @@ from aios_ingest.normalize import RawDoc
 from aios_ingest.gdrive_sync import (
     _checkpoint_progress,
     _checkpoint_complete_if_clean,
+    _configured_roots,
     _drain_pending,
     _finish_materialized_pages,
+    _run_deadline_reached,
     _run_gdrive_stream_unlocked,
     read_change_page,
     run_gdrive_stream,
     scope_generation,
     _retry_deferred,
 )
-from aios_ingest.brain_client import BrainError, GdriveExecution, GdriveTokenProvider, IngestResult
+from aios_ingest.brain_client import (
+    BrainDeferred, BrainError, GdriveExecution, GdriveTokenProvider, IngestResult,
+)
 from aios_ingest.sources.gdrive_watch import ConfiguredGoogleDriveWatchManager, GoogleDriveWatchManager
 
 
@@ -1041,6 +1047,7 @@ async def test_each_scheduler_run_rebuilds_connection_from_latest_acquired_confi
     class Source:
         def __init__(self, **kwargs): self.kwargs = kwargs
         def _execute(self, request): return request.execute()
+        def _metadata(self, file_id): return {"id": file_id}
         def _services(self):
             class Changes:
                 def getStartPageToken(self, **kwargs): return _Request({"startPageToken": "start"})
@@ -1114,6 +1121,7 @@ async def test_explicit_service_account_mode_never_uses_broker_and_requires_comp
     class Source:
         def __init__(self, **kwargs): self.kwargs = kwargs
         def _execute(self, request): return request.execute()
+        def _metadata(self, file_id): return {"id": file_id}
         def _services(self):
             class Changes:
                 def getStartPageToken(self, **kwargs): return _Request({"startPageToken": "start"})
@@ -1648,6 +1656,7 @@ async def test_multi_stream_captures_my_drive_and_each_shared_drive_before_any_e
         def __init__(self, **kwargs): pass
         def _services(self): return Drive(), object()
         def _execute(self, request): return request.execute()
+        def _metadata(self, file_id): return {"id": file_id}
 
     async def capture(_settings, _conn, _state, **kwargs):
         runs.append((kwargs["drive_id"], list(starts)))
@@ -3542,4 +3551,925 @@ async def test_malformed_first_listing_page_does_not_block_later_page_or_snapsho
         namespace=namespace, max_work=1, discovery_budget=1, retry_budget=1,
     )
     assert second.created == 1 and client.pushed == ["good"]
+    state.close()
+
+
+# ---------------------------------------------------------------------------------------------
+# Shared fakes for the coordinator tests below
+# ---------------------------------------------------------------------------------------------
+
+_DOC_MIME = "application/vnd.google-apps.document"
+
+
+class _RecordingBrain:
+    """Brain fake: records every push and removal, and acknowledges every checkpoint."""
+
+    def __init__(self):
+        self.pushed, self.removed, self.revision = [], [], 0
+
+    async def push(self, payload, *, execution):
+        self.pushed.append(payload.frontmatter["source_id"])
+        return IngestResult("created", "item", payload.path)
+
+    async def reconcile_gdrive(self, execution, **kwargs):
+        self.removed.extend(kwargs.get("removed_provider_ids") or [])
+        return {"items": len(kwargs.get("removed_provider_ids") or [])}
+
+    async def checkpoint_gdrive_execution(self, execution, progress):
+        self.revision += 1
+        return {"progress_revision": self.revision, "progress": progress}
+
+
+def _pending_rows(state, namespace):
+    return [
+        (row["item_key"], row["attempts"], row["not_before"], row["last_error"])
+        for row in state._db.execute(
+            "select item_key,attempts,not_before,last_error from pending_work "
+            "where namespace=? and acknowledged_at is null order by item_key",
+            (namespace,),
+        ).fetchall()
+    ]
+
+
+# ---------------------------------------------------------------------------------------------
+# A document that cannot be normalized is that document's failure
+# ---------------------------------------------------------------------------------------------
+
+
+def test_document_that_cannot_be_normalized_is_a_durable_failure_and_its_siblings_still_run(tmp_path):
+    path = tmp_path / "unnormalizable.sqlite"
+    state = StateStore(str(path))
+    progress = state.begin_generation(
+        StreamKey("team", "connection", "account"), 1, start_token="start",
+    )
+    state.enqueue_work(progress.namespace, 1, "a-huge", "upsert")
+    state.enqueue_work(progress.namespace, 1, "b-good", "upsert")
+    marker = "CONFIDENTIAL-BODY-TEXT"
+
+    class Source:
+        def _metadata(self, file_id): return {"id": file_id}
+        def _raw_doc(self, meta):
+            # Over the item contract's body limit: normalization itself refuses the document.
+            body = marker + "x" * 1_000_000 if meta["id"] == "a-huge" else "good"
+            return RawDoc(source="gdrive", external_id=meta["id"], body=body)
+
+    client = _RecordingBrain()
+    summary = IngestSummary("docs", failure_categories={})
+    # The run does not crash on the first document: the second is still read and pushed.
+    asyncio.run(_drain_pending(
+        client, GdriveExecution("connection", 1, 1, "owner", "later", "scope", {}),
+        Source(), Connection("docs", "gdrive"), state, progress.namespace, 1, summary, 10,
+    ))
+
+    assert summary.failed == 1 and summary.created == 1
+    assert summary.failure_categories == {"invalid_payload": 1}
+    assert client.pushed == ["b-good"]
+    ((item_key, attempts, not_before, last_error),) = _pending_rows(state, progress.namespace)
+    assert (item_key, attempts) == ("a-huge", 1)
+    assert not_before
+    # The diagnosis names the field and the rule, and carries none of the document's text.
+    assert last_error == "invalid item payload: body (string_too_long)"
+    assert marker not in last_error
+    state.close()
+
+    restarted = StateStore(str(path))
+    assert restarted.pending_count(progress.namespace, 1) == 1
+    restarted.close()
+
+
+# ---------------------------------------------------------------------------------------------
+# Sink and reconcile calls observe the run's absolute deadline, and defer safely
+# ---------------------------------------------------------------------------------------------
+
+
+def test_run_deadline_is_reached_only_at_or_after_the_executions_absolute_instant():
+    execution = GdriveExecution("connection", 1, 1, "owner", "later", "scope", {})
+    assert _run_deadline_reached(execution) is False
+    assert _run_deadline_reached(
+        dataclasses.replace(execution, run_deadline=time.monotonic() + 3600)
+    ) is False
+    assert _run_deadline_reached(
+        dataclasses.replace(execution, run_deadline=time.monotonic() - 1)
+    ) is True
+
+
+def test_expired_run_deadline_starts_no_provider_or_sink_work_and_fails_nothing(tmp_path):
+    state = StateStore(str(tmp_path / "deadline-expired.sqlite"))
+    progress = state.begin_generation(
+        StreamKey("team", "connection", "account"), 1, start_token="start",
+    )
+    state.enqueue_work(progress.namespace, 1, "a", "upsert")
+    state.enqueue_work(progress.namespace, 1, "b", "upsert")
+    state.enqueue_work(progress.namespace, 1, "c", "remove")
+
+    class Source:
+        reads = []
+        def _metadata(self, file_id):
+            self.reads.append(file_id)
+            return {"id": file_id}
+        def _raw_doc(self, meta):
+            return RawDoc(source="gdrive", external_id=meta["id"], body="body")
+
+    client, source = _RecordingBrain(), Source()
+    summary = IngestSummary("docs", failure_categories={})
+    execution = GdriveExecution(
+        "connection", 1, 1, "owner", "later", "scope", {}, run_deadline=time.monotonic() - 1,
+    )
+    consumed = asyncio.run(_drain_pending(
+        client, execution, source, Connection("docs", "gdrive"), state,
+        progress.namespace, 1, summary, 10,
+    ))
+
+    assert consumed == 0
+    assert source.reads == [] and client.pushed == [] and client.removed == []
+    assert summary.failed == 0 and summary.failure_categories == {"run_deadline": 1}
+    # Out of time is not a failed attempt: nothing was charged or pushed back.
+    assert _pending_rows(state, progress.namespace) == [
+        ("a", 0, None, None), ("b", 0, None, None), ("c", 0, None, None),
+    ]
+    state.close()
+
+
+def test_sink_call_stopped_by_the_run_deadline_leaves_its_work_untouched_and_starts_nothing_else(
+    tmp_path,
+):
+    state = StateStore(str(tmp_path / "deadline-mid-run.sqlite"))
+    progress = state.begin_generation(
+        StreamKey("team", "connection", "account"), 1, start_token="start",
+    )
+    for item in ("a", "b", "c"):
+        state.enqueue_work(progress.namespace, 1, item, "upsert")
+
+    class Source:
+        reads = []
+        def _metadata(self, file_id):
+            self.reads.append(file_id)
+            return {"id": file_id}
+        def _raw_doc(self, meta):
+            return RawDoc(source="gdrive", external_id=meta["id"], body="body")
+
+    class Client(_RecordingBrain):
+        async def push(self, payload, *, execution):
+            # The deadline arrives while this document is at the sink: the brain client refuses
+            # to start (or wait for) the request instead of sleeping past it.
+            self.pushed.append(payload.frontmatter["source_id"])
+            raise BrainDeferred(503, "run_deadline", "run deadline reached before the brain request was sent")
+
+    client, source = Client(), Source()
+    summary = IngestSummary("docs", failure_categories={})
+    asyncio.run(_drain_pending(
+        client, GdriveExecution("connection", 1, 1, "owner", "later", "scope", {}),
+        source, Connection("docs", "gdrive"), state, progress.namespace, 1, summary, 10,
+    ))
+
+    # `b` and `c` were never read from Drive: nothing is started once the sink is out of time.
+    assert client.pushed == ["a"] and source.reads == ["a"]
+    assert summary.failed == 0 and summary.failure_categories == {"run_deadline": 1}
+    assert _pending_rows(state, progress.namespace) == [
+        ("a", 0, None, None), ("b", 0, None, None), ("c", 0, None, None),
+    ]
+    state.close()
+
+
+def test_sink_wait_the_brain_named_beyond_the_deadline_is_kept_as_the_retry_time_and_ends_the_drain(
+    tmp_path,
+):
+    state = StateStore(str(tmp_path / "deadline-retry-after.sqlite"))
+    progress = state.begin_generation(
+        StreamKey("team", "connection", "account"), 1, start_token="start",
+    )
+    state.enqueue_work(progress.namespace, 1, "a", "upsert")
+    state.enqueue_work(progress.namespace, 1, "b", "upsert")
+    retry_at = "2099-01-01T00:00:00+00:00"
+
+    class Source:
+        reads = []
+        def _metadata(self, file_id):
+            self.reads.append(file_id)
+            return {"id": file_id}
+        def _raw_doc(self, meta):
+            return RawDoc(source="gdrive", external_id=meta["id"], body="body")
+
+    class Client(_RecordingBrain):
+        async def push(self, payload, *, execution):
+            # The brain is rate limiting, and the wait it names does not fit the run.
+            self.pushed.append(payload.frontmatter["source_id"])
+            raise BrainDeferred(429, "rate_limited", "wait", not_before=retry_at)
+
+    client, source = Client(), Source()
+    summary = IngestSummary("docs", failure_categories={})
+    asyncio.run(_drain_pending(
+        client, GdriveExecution("connection", 1, 1, "owner", "later", "scope", {}),
+        source, Connection("docs", "gdrive"), state, progress.namespace, 1, summary, 10,
+    ))
+
+    # One refused attempt, remembered with the brain's own retry time — and `b` is not sent into
+    # the same closed limit, nor even read from Drive, to be charged a failure of its own.
+    assert client.pushed == ["a"] and source.reads == ["a"]
+    assert summary.failed == 1 and summary.failure_categories == {"rate_limited": 1}
+    rows = _pending_rows(state, progress.namespace)
+    assert [(key, attempts, not_before) for key, attempts, not_before, _error in rows] == [
+        ("a", 1, retry_at), ("b", 0, None),
+    ]
+    state.close()
+
+
+def test_reconcile_call_stopped_by_the_run_deadline_keeps_the_removal_obligation_untouched(tmp_path):
+    state = StateStore(str(tmp_path / "deadline-remove.sqlite"))
+    progress = state.begin_generation(
+        StreamKey("team", "connection", "account"), 1, start_token="start",
+    )
+    state.enqueue_work(progress.namespace, 1, "gone", "remove", {"file_id": "gone"})
+
+    class Client(_RecordingBrain):
+        async def reconcile_gdrive(self, execution, **kwargs):
+            raise BrainDeferred(503, "run_deadline", "run deadline reached before the brain request was admitted")
+
+    summary = IngestSummary("docs", failure_categories={})
+    asyncio.run(_drain_pending(
+        Client(), GdriveExecution("connection", 1, 1, "owner", "later", "scope", {}),
+        object(), Connection("docs", "gdrive"), state, progress.namespace, 1, summary, 10,
+    ))
+
+    assert summary.failed == 0 and summary.removed == 0
+    assert summary.failure_categories == {"run_deadline": 1}
+    assert _pending_rows(state, progress.namespace) == [("gone", 0, None, None)]
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_deferred_all_stream_reconciliation_is_not_a_failure_and_completes_on_the_next_run(
+    tmp_path, monkeypatch,
+):
+    integration_id = "00000000-0000-0000-0000-000000000029"
+    deadlines = []
+
+    class Changes:
+        def getStartPageToken(self, **kwargs):
+            return _Request({"startPageToken": f"start:{kwargs.get('driveId')}"})
+
+    class Drive:
+        def changes(self): return Changes()
+
+    class Client:
+        outcomes = [
+            BrainDeferred(429, "rate_limited", "30 reconciliations/min per key",
+                          not_before="2099-01-01T00:00:00+00:00"),
+            {"items": 2},
+        ]
+        revision = 0
+        def __init__(self, *args, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def acquire_gdrive_execution(self, requested, owner):
+            return GdriveExecution(requested, 6, 1, owner, "later", "scope", {
+                "authMode": "oauth", "authenticatedAccountId": "account",
+                "fileIds": [], "folderIds": [], "sharedDriveIds": ["drive-a", "drive-b"],
+                "selectionState": "selected",
+            })
+        async def broker_gdrive_access_token(self, execution):
+            return {"access_token": "memory", "account": {"subject": "account"}}
+        def gdrive_token_provider(self, execution, grant):
+            class Provider:
+                def close(self): pass
+            return Provider()
+        def gdrive_provider_gate(self, execution):
+            class Gate:
+                def __call__(self): pass
+                def close(self): pass
+            return Gate()
+        async def checkpoint_gdrive_execution(self, execution, payload):
+            self.revision += 1
+            return {"progress_revision": self.revision, "progress": payload}
+        async def reconcile_gdrive(self, execution, **kwargs):
+            deadlines.append(execution.run_deadline)
+            outcome = type(self).outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        async def release_gdrive_execution(self, execution): pass
+
+    class Source:
+        def __init__(self, **kwargs): pass
+        def set_run_deadline(self, deadline): pass
+        def _services(self): return Drive(), object()
+        def _execute(self, request): return request.execute()
+
+    async def finished_stream(_settings, _conn, state, **kwargs):
+        # The one deadline the provider reads use is the one the sink and reconcile calls carry.
+        assert kwargs["execution"].run_deadline == kwargs["run_deadline"]
+        namespace, generation = kwargs["namespace"], kwargs["generation"]
+        if state.get_progress(namespace).active_snapshot is None:
+            snapshot = state.begin_selection_snapshot(namespace, generation, [])
+            state.publish_selection_snapshot(namespace, generation, snapshot)
+        state.update_progress(
+            namespace, listing_complete=True, page_token="terminal",
+            checkpoint_id="terminal-page", terminal_drain_token="terminal",
+            terminal_drain_checkpoint_id="terminal-page", terminal_drain_acknowledged=True,
+            drain_observation=1, terminal_drain_observation=1,
+        )
+        return IngestSummary("docs", failure_categories={})
+
+    monkeypatch.setattr("aios_ingest.gdrive_sync.BrainClient", Client)
+    monkeypatch.setattr("aios_ingest.gdrive_sync.GoogleDriveSource", Source)
+    monkeypatch.setattr("aios_ingest.gdrive_sync._run_gdrive_stream_unlocked", finished_stream)
+    settings = BrainSettings("http://brain", "key", "team")
+    connection = Connection("docs", "gdrive", options={"integration_id": integration_id})
+    state = StateStore(str(tmp_path / "deferred-reconcile.sqlite"))
+    started = time.monotonic()
+
+    deferred = await run_gdrive_stream(settings, connection, state)
+
+    # Every stream is complete, but absence was not established: nothing is reported current.
+    assert deferred.authoritative_complete is False
+    assert deferred.failed == 0 and deferred.failure_categories == {"rate_limited": 1}
+    assert "current" not in {p.phase for p in state.list_progress(integration_id, 6)}
+
+    completed = await run_gdrive_stream(settings, connection, state)
+
+    assert completed.authoritative_complete is True and completed.removed == 2
+    assert {p.phase for p in state.list_progress(integration_id, 6)} == {"current"}
+    assert len(deadlines) == 2
+    assert all(started < deadline <= time.monotonic() + 55.0 for deadline in deadlines)
+    state.close()
+
+
+# ---------------------------------------------------------------------------------------------
+# Selected file/folder roots bind to the stream of the drive that contains them
+# ---------------------------------------------------------------------------------------------
+
+
+def _binding_harness(monkeypatch, *, file_ids, folder_ids, shared_drive_ids, metadata):
+    """Run the real coordinator entry point; ``metadata(root_id)`` plays Drive's files.get."""
+    starts, reads, runs = [], [], []
+
+    class Changes:
+        def getStartPageToken(self, **kwargs):
+            starts.append(kwargs.get("driveId", "my-drive"))
+            return _Request({"startPageToken": f"start:{kwargs.get('driveId', 'my-drive')}"})
+
+    class Drive:
+        def changes(self): return Changes()
+
+    class Client:
+        revision = 0
+        def __init__(self, *args, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def acquire_gdrive_execution(self, requested, owner):
+            return GdriveExecution(requested, 5, 1, owner, "later", "scope", {
+                "authMode": "oauth", "authenticatedAccountId": "account",
+                "fileIds": file_ids, "folderIds": folder_ids, "sharedDriveIds": shared_drive_ids,
+                "recursive": True, "selectionState": "selected",
+            })
+        async def broker_gdrive_access_token(self, execution):
+            return {"access_token": "memory", "account": {"subject": "account"}}
+        def gdrive_token_provider(self, execution, grant):
+            class Provider:
+                def close(self): pass
+            return Provider()
+        def gdrive_provider_gate(self, execution):
+            class Gate:
+                def __call__(self): pass
+                def close(self): pass
+            return Gate()
+        async def checkpoint_gdrive_execution(self, execution, progress):
+            self.revision += 1
+            return {"progress_revision": self.revision, "progress": progress}
+        async def release_gdrive_execution(self, execution): pass
+
+    class Source:
+        def __init__(self, **kwargs): pass
+        def _services(self): return Drive(), object()
+        def _execute(self, request): return request.execute()
+        def _metadata(self, file_id):
+            reads.append(file_id)
+            return metadata(file_id)
+
+    async def capture(_settings, _conn, _state, **kwargs):
+        runs.append((
+            kwargs["drive_id"],
+            _configured_roots(kwargs["options"], kwargs["drive_id"], kwargs["root_bindings"]),
+        ))
+        return IngestSummary("docs", failure_categories={})
+
+    monkeypatch.setattr("aios_ingest.gdrive_sync.BrainClient", Client)
+    monkeypatch.setattr("aios_ingest.gdrive_sync.GoogleDriveSource", Source)
+    monkeypatch.setattr("aios_ingest.gdrive_sync._run_gdrive_stream_unlocked", capture)
+    return starts, reads, runs
+
+
+@pytest.mark.asyncio
+async def test_selected_roots_bind_to_the_stream_of_the_drive_that_contains_them(tmp_path, monkeypatch):
+    integration_id = "00000000-0000-0000-0000-000000000031"
+    containing_drive = {"file-x": "shared-x", "folder-y": "shared-y", "folder-mine": None}
+
+    def metadata(file_id):
+        drive = containing_drive[file_id]
+        return {"id": file_id, **({"driveId": drive} if drive else {})}
+
+    starts, reads, runs = _binding_harness(
+        monkeypatch, file_ids=["file-x"], folder_ids=["folder-y", "folder-mine"],
+        shared_drive_ids=[], metadata=metadata,
+    )
+    settings = BrainSettings("http://brain", "key", "team")
+    connection = Connection("docs", "gdrive", options={"integration_id": integration_id})
+    path = tmp_path / "bound-roots.sqlite"
+    state = StateStore(str(path))
+
+    await run_gdrive_stream(settings, connection, state)
+
+    assert reads == ["file-x", "folder-y", "folder-mine"]
+    # Each containing drive gets its own start token, captured with that drive's id.
+    assert starts == ["my-drive", "shared-x", "shared-y"]
+    assert dict(runs) == {
+        "my-drive": [("folder-mine", "folder", "my-drive", True)],
+        "shared-x": [("file-x", "file", "shared-x", False)],
+        "shared-y": [("folder-y", "folder", "shared-y", True)],
+    }
+    # Binding a root to a Shared Drive's stream selects that root, never the drive.
+    assert all(kind != "drive" for roots in dict(runs).values() for _id, kind, _drive, _rec in roots)
+    assert {
+        progress.key.drive_id: progress.baseline_start_token
+        for progress in state.list_progress(integration_id, 5)
+    } == {"my-drive": "start:my-drive", "shared-x": "start:shared-x", "shared-y": "start:shared-y"}
+    state.close()
+
+    # A restart reads no root again and captures no second start token: the binding is durable.
+    reads.clear(), starts.clear(), runs.clear()
+    state = StateStore(str(path))
+    await run_gdrive_stream(settings, connection, state)
+    assert reads == [] and starts == []
+    assert sorted(drive for drive, _roots in runs) == ["my-drive", "shared-x", "shared-y"]
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_a_selection_wholly_inside_shared_drives_opens_no_my_drive_stream(tmp_path, monkeypatch):
+    integration_id = "00000000-0000-0000-0000-000000000032"
+    starts, _reads, runs = _binding_harness(
+        monkeypatch, file_ids=["file-x"], folder_ids=["folder-x"], shared_drive_ids=["shared-x"],
+        metadata=lambda file_id: {"id": file_id, "driveId": "shared-x"},
+    )
+    state = StateStore(str(tmp_path / "shared-only.sqlite"))
+
+    await run_gdrive_stream(
+        BrainSettings("http://brain", "key", "team"),
+        Connection("docs", "gdrive", options={"integration_id": integration_id}), state,
+    )
+
+    assert starts == ["shared-x"]
+    # The drive was ALSO selected whole: its root joins the roots bound to it, losing neither.
+    assert runs == [("shared-x", [
+        ("file-x", "file", "shared-x", False),
+        ("folder-x", "folder", "shared-x", True),
+        ("shared-x", "drive", "shared-x", True),
+    ])]
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_unreadable_selected_root_enumerates_nothing_and_binding_resumes_where_it_stopped(
+    tmp_path, monkeypatch,
+):
+    integration_id = "00000000-0000-0000-0000-000000000033"
+    available = {"file-a": {"id": "file-a", "driveId": "shared-x"}}
+
+    def metadata(file_id):
+        if file_id not in available:
+            raise RuntimeError("404 file not found")
+        return available[file_id]
+
+    starts, reads, runs = _binding_harness(
+        monkeypatch, file_ids=["file-a", "file-b"], folder_ids=[], shared_drive_ids=["shared-z"],
+        metadata=metadata,
+    )
+    settings = BrainSettings("http://brain", "key", "team")
+    connection = Connection("docs", "gdrive", options={"integration_id": integration_id})
+    state = StateStore(str(tmp_path / "unreadable-root.sqlite"))
+
+    blocked = await run_gdrive_stream(settings, connection, state)
+
+    assert blocked.failed == 1 and blocked.failure_categories == {"selection_root_unresolved": 1}
+    assert reads == ["file-a", "file-b"]
+    # Where `file-b` lives is unknown, so the set of streams is unknown: none is started on a guess.
+    assert starts == [] and runs == []
+    assert state.list_progress(integration_id, 5) == []
+
+    available["file-b"] = {"id": "file-b"}
+    reads.clear()
+    resumed = await run_gdrive_stream(settings, connection, state)
+
+    assert resumed.failed == 0
+    assert reads == ["file-b"]
+    assert starts == ["my-drive", "shared-x", "shared-z"]
+    assert dict(runs) == {
+        "my-drive": [("file-b", "file", "my-drive", False)],
+        "shared-x": [("file-a", "file", "shared-x", False)],
+        "shared-z": [("shared-z", "drive", "shared-z", True)],
+    }
+    state.close()
+
+
+@pytest.mark.parametrize("failure,category", [
+    (ProviderDeferred("quota", not_before="2099-01-01T00:00:00+00:00", category="rate_limited"),
+     "rate_limited"),
+    (BrainError(409, "stale_execution", "replaced"), "stale_execution"),
+])
+@pytest.mark.asyncio
+async def test_root_binding_interrupted_by_the_provider_or_authority_enumerates_nothing(
+    tmp_path, monkeypatch, failure, category,
+):
+    integration_id = "00000000-0000-0000-0000-000000000034"
+
+    def metadata(_file_id):
+        raise failure
+
+    starts, _reads, runs = _binding_harness(
+        monkeypatch, file_ids=["file-a"], folder_ids=[], shared_drive_ids=[], metadata=metadata,
+    )
+    state = StateStore(str(tmp_path / "interrupted-binding.sqlite"))
+
+    summary = await run_gdrive_stream(
+        BrainSettings("http://brain", "key", "team"),
+        Connection("docs", "gdrive", options={"integration_id": integration_id}), state,
+    )
+
+    assert summary.failure_categories == {category: 1}
+    assert starts == [] and runs == []
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_bound_shared_drive_stream_uses_that_drives_cursor_without_selecting_the_drive(tmp_path):
+    state = StateStore(str(tmp_path / "bound-stream.sqlite"))
+    key = StreamKey("team", "connection", "account", "shared-x")
+    namespace = key.namespace(3)
+    bindings = {
+        ("file", "file-x"): "shared-x", ("folder", "folder-y"): "shared-x",
+        ("folder", "folder-mine"): "my-drive",
+    }
+    docs = {
+        doc_id: {
+            "id": doc_id, "name": doc_id, "mimeType": _DOC_MIME, "driveId": "shared-x",
+            "modifiedTime": "2026-09-22T00:00:00Z", "parents": [parent],
+        }
+        for doc_id, parent in (
+            ("file-x", "elsewhere"), ("doc-in-y", "folder-y"), ("new-in-y", "folder-y"),
+        )
+    }
+    unrelated = {
+        doc_id: {**docs["file-x"], "id": doc_id, "name": doc_id, "parents": [parent]}
+        for doc_id, parent in (("unrelated", "other-folder"), ("at-drive-root", "shared-x"))
+    }
+
+    class Files:
+        calls = []
+        def list(self, **kwargs):
+            self.calls.append(kwargs)
+            return _Request({"files": [docs["doc-in-y"]]})
+
+    class Changes:
+        starts, lists = [], []
+        def getStartPageToken(self, **kwargs):
+            self.starts.append(kwargs)
+            return _Request({"startPageToken": "start:shared-x"})
+        def list(self, **kwargs):
+            self.lists.append(kwargs)
+            # The drive's change log reports everything in the drive, selected or not.
+            return _Request({
+                "changes": [
+                    {"fileId": doc_id, "file": meta}
+                    for doc_id, meta in (
+                        ("file-x", docs["file-x"]), ("new-in-y", docs["new-in-y"]),
+                        ("unrelated", unrelated["unrelated"]),
+                        ("at-drive-root", unrelated["at-drive-root"]),
+                    )
+                ],
+                "newStartPageToken": "terminal",
+            })
+
+    class Drive:
+        def __init__(self): self.file_api, self.change_api = Files(), Changes()
+        def files(self): return self.file_api
+        def changes(self): return self.change_api
+
+    class Source:
+        def _execute(self, request): return request.execute()
+        def _metadata(self, file_id):
+            assert file_id in docs, f"{file_id} is not selected and must never be read"
+            return docs[file_id]
+        def _raw_doc(self, meta):
+            return RawDoc(source="gdrive", external_id=meta["id"], title=meta["name"], body="body")
+
+    client, drive = _RecordingBrain(), Drive()
+    summary = await _run_gdrive_stream_unlocked(
+        BrainSettings("http://brain", "key", "team"), Connection("docs", "gdrive"), state,
+        client=client, execution=GdriveExecution("connection", 3, 1, "owner", "later", "scope", {}),
+        options={
+            "credential_identity": "account", "selection_state": "selected",
+            "file_ids": ["file-x"], "folder_ids": ["folder-y", "folder-mine"], "recursive": True,
+        }, source=Source(), drive=drive, generation=3, drive_id="shared-x",
+        namespace=namespace, max_work=10, root_bindings=bindings,
+    )
+
+    assert summary.failed == 0
+    # The stream's start token, its folder listing and its changes are all the Shared Drive's own.
+    assert drive.change_api.starts == [{"supportsAllDrives": True, "driveId": "shared-x"}]
+    (listing,) = drive.file_api.calls
+    assert listing["corpora"] == "drive" and listing["driveId"] == "shared-x"
+    assert listing["q"] == "'folder-y' in parents and trashed = false"
+    assert [call["driveId"] for call in drive.change_api.lists] == ["shared-x"]
+    assert drive.change_api.lists[0]["pageToken"] == "start:shared-x"
+    # Only the two bound roots are roots here: not the drive, and not the My Drive folder.
+    assert {(row["root_kind"], row["root_id"], row["drive_id"]) for row in state.list_roots(namespace, 3)} == {
+        ("file", "file-x", "shared-x"), ("folder", "folder-y", "shared-x"),
+    }
+    # Baseline, then the drive's change page: the selected file's edit and the folder's new
+    # document arrive; the drive's other documents are neither members nor ever pushed.
+    assert client.pushed == ["file-x", "doc-in-y", "file-x", "new-in-y"]
+    assert state.membership_ids(namespace, 3) == ["doc-in-y", "file-x", "new-in-y"]
+    assert state.get_progress(namespace).page_token == "terminal"
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_bound_file_found_in_another_drive_keeps_its_baseline_partial(tmp_path):
+    state = StateStore(str(tmp_path / "relocated-root.sqlite"))
+    key = StreamKey("team", "connection", "account", "shared-x")
+    namespace = key.namespace(3)
+
+    class Changes:
+        lists = 0
+        def getStartPageToken(self, **kwargs): return _Request({"startPageToken": "start"})
+        def list(self, **kwargs):
+            type(self).lists += 1
+            return _Request({"changes": [], "newStartPageToken": "terminal"})
+
+    class Drive:
+        def changes(self): return Changes()
+
+    class Source:
+        def _execute(self, request): return request.execute()
+        def _metadata(self, file_id):
+            # Bound to shared-x when the generation began; it has since been moved to shared-z,
+            # whose changes this stream's cursor never reports.
+            return {"id": file_id, "name": file_id, "mimeType": _DOC_MIME, "driveId": "shared-z",
+                    "modifiedTime": "2026-09-22T00:00:00Z", "parents": ["shared-z"]}
+        def _raw_doc(self, meta):
+            raise AssertionError("a relocated root must not be ingested through the wrong stream")
+
+    client = _RecordingBrain()
+    summary = await _run_gdrive_stream_unlocked(
+        BrainSettings("http://brain", "key", "team"), Connection("docs", "gdrive"), state,
+        client=client, execution=GdriveExecution("connection", 3, 1, "owner", "later", "scope", {}),
+        options={"credential_identity": "account", "selection_state": "selected", "file_ids": ["file-x"]},
+        source=Source(), drive=Drive(), generation=3, drive_id="shared-x",
+        namespace=namespace, max_work=10, root_bindings={("file", "file-x"): "shared-x"},
+    )
+
+    progress = state.get_progress(namespace)
+    assert summary.failed == 1 and client.pushed == []
+    assert progress.listing_complete is False and progress.phase == "partial"
+    assert progress.last_error == "baseline: SelectedRootRelocated"
+    assert state.membership_ids(namespace, 3, building=True) == []
+    # No change page is drained on top of an unproven baseline.
+    assert Changes.lists == 0
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_root_left_in_my_drive_state_from_before_binding_is_not_ingested_twice(tmp_path):
+    state = StateStore(str(tmp_path / "pre-binding-roots.sqlite"))
+    key = StreamKey("team", "connection", "account", "my-drive")
+    namespace = key.namespace(3)
+    # Local state written before roots were bound: both files are My Drive roots here.
+    state.begin_generation(key, 3, start_token="start")
+    state.replace_roots(namespace, 3, [
+        ("file-x", "file", "my-drive", False), ("mine", "file", "my-drive", False),
+    ])
+    metadata = {
+        "file-x": {"id": "file-x", "name": "X", "mimeType": _DOC_MIME, "driveId": "shared-x",
+                   "modifiedTime": "2026-09-22T00:00:00Z", "parents": ["shared-x"]},
+        "mine": {"id": "mine", "name": "Mine", "mimeType": _DOC_MIME,
+                 "modifiedTime": "2026-09-22T00:00:00Z", "parents": ["root"]},
+    }
+
+    class Changes:
+        def getStartPageToken(self, **kwargs):
+            raise AssertionError("an existing stream keeps its captured start token")
+        def list(self, **kwargs):
+            return _Request({"changes": [], "newStartPageToken": "terminal"})
+
+    class Drive:
+        def changes(self): return Changes()
+
+    class Source:
+        def _execute(self, request): return request.execute()
+        def _metadata(self, file_id): return metadata[file_id]
+        def _raw_doc(self, meta):
+            return RawDoc(source="gdrive", external_id=meta["id"], title=meta["name"], body="body")
+
+    client = _RecordingBrain()
+    summary = await _run_gdrive_stream_unlocked(
+        BrainSettings("http://brain", "key", "team"), Connection("docs", "gdrive"), state,
+        client=client, execution=GdriveExecution("connection", 3, 1, "owner", "later", "scope", {}),
+        options={
+            "credential_identity": "account", "selection_state": "selected",
+            "file_ids": ["file-x", "mine"],
+        }, source=Source(), drive=Drive(), generation=3, drive_id="my-drive",
+        namespace=namespace, max_work=10,
+        root_bindings={("file", "file-x"): "shared-x", ("file", "mine"): "my-drive"},
+    )
+
+    # `file-x` belongs to shared-x's stream now. This stream still finishes, without it.
+    assert summary.failed == 0 and client.pushed == ["mine"]
+    assert state.membership_ids(namespace, 3) == ["mine"]
+    assert state.get_progress(namespace).listing_complete is True
+    state.close()
+
+
+# ---------------------------------------------------------------------------------------------
+# Notification hints are one bounded, race-safe dirty mark per stream
+# ---------------------------------------------------------------------------------------------
+
+
+def _notify(channel_id="chan-1", resource_id="res-1", token="secret", number="1"):
+    from aios_ingest.webhook_app import _gdrive_notification
+
+    return _gdrive_notification({
+        "x-goog-channel-id": channel_id, "x-goog-resource-id": resource_id,
+        "x-goog-channel-token": token, "x-goog-message-number": number,
+        "x-goog-resource-state": "change",
+    })
+
+
+def test_any_number_of_notifications_is_one_dirty_mark_and_no_backlog(tmp_path, monkeypatch):
+    path = tmp_path / "hints.sqlite"
+    monkeypatch.setenv("AIOS_INGEST_STATE", str(path))
+    key = StreamKey("team", "connection", "account", "shared-x")
+    state = StateStore(str(path))
+    progress = state.begin_generation(key, 3, start_token="start")
+    state.save_channel(Channel(
+        "docs", "chan-1", "res-1", "2099-01-01T00:00:00Z", progress.namespace,
+        verification_hash("secret"),
+    ))
+    state.close()
+
+    for number in range(200):
+        assert _notify(number=str(number)).status_code == 202
+
+    state = StateStore(str(path))
+    # Not one work row: a flood can neither fill the document backlog nor spend a work budget.
+    assert state.pending_count(progress.namespace, 3) == 0
+    assert state._db.execute("select count(*) from pending_work").fetchone()[0] == 0
+    assert state._db.execute("select count(*), max(dirty_seq) from stream_hints").fetchone()[:] == (1, 200)
+    assert state.pending_stream_hint(key) == 200
+    state.close()
+
+
+def test_invalid_notification_marks_nothing(tmp_path, monkeypatch):
+    path = tmp_path / "hints-invalid.sqlite"
+    monkeypatch.setenv("AIOS_INGEST_STATE", str(path))
+    key = StreamKey("team", "connection", "account", "shared-x")
+    state = StateStore(str(path))
+    progress = state.begin_generation(key, 3, start_token="start")
+    state.save_channel(Channel(
+        "docs", "chan-1", "res-1", "2099-01-01T00:00:00Z", progress.namespace,
+        verification_hash("secret"),
+    ))
+    state.close()
+
+    assert _notify(token="guessed").status_code == 401
+    assert _notify(resource_id="other-resource").status_code == 401
+    assert _notify(channel_id="unknown-channel").status_code == 401
+
+    state = StateStore(str(path))
+    assert state.pending_stream_hint(key) is None
+    assert state._db.execute("select count(*) from stream_hints").fetchone()[0] == 0
+    state.close()
+
+
+def test_notification_on_a_channel_from_an_earlier_generation_marks_the_stream_the_coordinator_reads(
+    tmp_path, monkeypatch,
+):
+    path = tmp_path / "hints-generations.sqlite"
+    monkeypatch.setenv("AIOS_INGEST_STATE", str(path))
+    key = StreamKey("team", "connection", "account", "shared-x")
+    state = StateStore(str(path))
+    earlier = state.begin_generation(key, 2, start_token="old-start")
+    current = state.begin_generation(key, 3, start_token="new-start")
+    assert earlier.namespace != current.namespace
+    # The watch channel still names the namespace of the generation it was created under.
+    state.save_channel(Channel(
+        "docs", "chan-1", "res-1", "2099-01-01T00:00:00Z", earlier.namespace,
+        verification_hash("secret"),
+    ))
+    state.close()
+
+    assert _notify().status_code == 202
+
+    state = StateStore(str(path))
+    # The hint is on the stream itself, so the run for the CURRENT generation consumes it; it is
+    # not stranded as work in a namespace nothing drains any more.
+    assert state.pending_stream_hint(current.key) == 1
+    assert state.pending_count(earlier.namespace, 2) == 0
+    assert state.pending_count(current.namespace, 3) == 0
+    state.close()
+
+
+def test_hint_acknowledgment_covers_only_what_the_drain_observed_before_it_began(tmp_path):
+    path = tmp_path / "hint-ack.sqlite"
+    key = StreamKey("team", "connection", "account", "shared-x")
+    other = StreamKey("team", "connection", "account", "shared-y")
+    state = StateStore(str(path))
+    assert state.pending_stream_hint(key) is None
+    assert [state.record_stream_hint(key) for _ in range(3)] == [1, 2, 3]
+
+    observed = state.pending_stream_hint(key)
+    assert observed == 3
+    # A notification lands while the drain that observed 3 is still reading.
+    assert state.record_stream_hint(key) == 4
+    state.ack_stream_hint(key, observed)
+    assert state.pending_stream_hint(key) == 4
+
+    # A late acknowledgment of an older observation cannot regress, and one for a sequence that
+    # was never issued cannot clear the stream.
+    state.ack_stream_hint(key, 2)
+    state.ack_stream_hint(key, 99)
+    assert state.pending_stream_hint(key) == 4
+    assert state.pending_stream_hint(other) is None
+    state.close()
+
+    restarted = StateStore(str(path))
+    assert restarted.pending_stream_hint(key) == 4
+    restarted.ack_stream_hint(key, 4)
+    assert restarted.pending_stream_hint(key) is None
+    restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_acknowledges_the_hint_it_observed_and_keeps_one_that_arrives_mid_drain(tmp_path):
+    state = StateStore(str(tmp_path / "hint-drain.sqlite"))
+    key = StreamKey("team", "connection", "account", "my-drive")
+    namespace = key.namespace(7)
+    state.begin_generation(key, 7, start_token="baseline-start")
+    snapshot = state.begin_selection_snapshot(namespace, 7, [])
+    state.publish_selection_snapshot(namespace, 7, snapshot)
+    state.update_progress(namespace, phase="partial", page_token="cursor", listing_complete=True)
+    state.record_stream_hint(key)
+    pages = [
+        # Not terminal: more changes remain, so nothing may be acknowledged yet.
+        {"changes": [], "nextPageToken": "next"},
+        {"changes": [], "newStartPageToken": "terminal-1"},
+        {"changes": [], "newStartPageToken": "terminal-2"},
+    ]
+    arrive_during_read = {2}
+
+    class Changes:
+        tokens = []
+        def list(self, **kwargs):
+            self.tokens.append(kwargs["pageToken"])
+            if len(self.tokens) in arrive_during_read:
+                # Google notifies again while this very page is being read.
+                state.record_stream_hint(key)
+            return _Request(pages.pop(0))
+
+    class Drive:
+        def __init__(self): self.api = Changes()
+        def changes(self): return self.api
+
+    class Source:
+        def _execute(self, request): return request.execute()
+
+    client, drive = _RecordingBrain(), Drive()
+
+    async def run_once():
+        return await _run_gdrive_stream_unlocked(
+            BrainSettings("http://brain", "key", "team"), Connection("docs", "gdrive"), state,
+            client=client,
+            execution=GdriveExecution(
+                "connection", 7, 1, "owner", "later", "scope", {},
+                progress={}, progress_revision=client.revision,
+            ),
+            options={"credential_identity": "account", "selection_state": "selected"},
+            source=Source(), drive=drive, generation=7, drive_id="my-drive",
+            namespace=namespace, max_work=10, discovery_budget=1,
+        )
+
+    # Run 1 stops at its page budget before the terminal token: the hint stays pending.
+    await run_once()
+    assert drive.api.tokens == ["cursor"]
+    assert state.pending_stream_hint(key) == 1
+
+    # Run 2 reaches the terminal token, so the hint it observed (1) is acknowledged — but the one
+    # that arrived while it was reading (2) is not: that change may be after what it read.
+    await run_once()
+    assert drive.api.tokens == ["cursor", "next"]
+    assert state.pending_stream_hint(key) == 2
+
+    # Run 3 begins after that notification and drains to the terminal token: now it is clean.
+    await run_once()
+    assert drive.api.tokens == ["cursor", "next", "terminal-1"]
+    assert state.pending_stream_hint(key) is None
     state.close()

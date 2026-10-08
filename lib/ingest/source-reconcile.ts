@@ -25,11 +25,23 @@ export const GDRIVE_SNAPSHOT_MEMBER_LIMIT = 1_000_000;
  */
 export interface GdriveStagedSnapshot {
   snapshotId: string;
-  /** The execution staging it; pages staged under another generation or fence are discarded. */
+  /**
+   * The execution staging it. Pages staged under another generation are discarded; pages staged
+   * under another fence are discarded too, unless this execution proves them with `resume`.
+   */
   generation: number;
   fence: number;
   /** Required on the finalizing page: the distinct provider ids in the whole snapshot. */
   total?: number;
+  /**
+   * A successor execution continuing an upload its predecessor deferred. It states exactly what it
+   * believes is held — how many members, and the sha256 of them in byte order, newline-joined. Only
+   * if the held rows are that set are they adopted under this fence; a snapshot name alone never
+   * carries a predecessor's pages forward.
+   */
+  resume?: { members: number; digest: string };
+  /** Report what is held for this snapshot and change nothing. */
+  inspect?: boolean;
 }
 
 export interface GdriveReconcileInput {
@@ -50,7 +62,7 @@ export interface StagedGdriveReconciliation {
 /** A staged snapshot that cannot be held, or cannot be finalized as the complete set it claims to be. */
 export class GdriveSnapshotError extends Error {
   constructor(
-    readonly code: "snapshot_incomplete" | "snapshot_too_large",
+    readonly code: "snapshot_incomplete" | "snapshot_too_large" | "snapshot_resume_mismatch",
     message: string,
     readonly status: number,
   ) {
@@ -58,11 +70,34 @@ export class GdriveSnapshotError extends Error {
   }
 }
 
+/** What the brain holds for one staged snapshot of the current generation, under any fence. */
+async function heldSnapshot(
+  teamId: string,
+  connectionId: string,
+  staged: GdriveStagedSnapshot,
+): Promise<{ members: number; digest: string }> {
+  // Byte order ("C") and a newline join: the one canonical form the connector can reproduce.
+  const { rows } = await runSql<{ members: string | number; digest: string }>(
+    `select count(*)::bigint as members,
+            encode(sha256(convert_to(
+              coalesce(string_agg(provider_id, E'\\n' order by provider_id collate "C"), ''), 'UTF8')), 'hex') as digest
+       from gdrive_snapshot_members
+      where team_id=$1 and integration_id=$2 and snapshot_id=$3 and generation=$4`,
+    [teamId, connectionId, staged.snapshotId, staged.generation],
+  );
+  return { members: Number(rows[0]?.members ?? 0), digest: rows[0]?.digest ?? "" };
+}
+
 /**
  * Hold one page of a staged snapshot and return how many members the snapshot now has. A connection
  * holds one snapshot: pages of any other, or of an execution that no longer owns the connection,
  * are dropped here, so an abandoned upload is bounded by the next one. A replayed page is the same
  * rows again. The caller's transaction owns all of it — a refusal leaves the staged set as it was.
+ *
+ * The one way a predecessor's pages survive a change of hands is `resume`: the successor states the
+ * exact set it expects to find, and the held rows are adopted under its fence only if they are that
+ * set. The route fences every request before it gets here, so an execution whose fence is no longer
+ * current can neither stage nor finalize.
  */
 async function stageSnapshotPage(
   teamId: string,
@@ -71,12 +106,33 @@ async function stageSnapshotPage(
   providerIds: readonly string[],
   finalizing: boolean,
 ): Promise<number> {
+  if (staged.inspect) return (await heldSnapshot(teamId, connectionId, staged)).members;
   await runSql(
     `delete from gdrive_snapshot_members
-      where team_id=$1 and integration_id=$2
-        and (snapshot_id<>$3 or generation<>$4 or fence<>$5)`,
-    [teamId, connectionId, staged.snapshotId, staged.generation, staged.fence],
+      where team_id=$1 and integration_id=$2 and (snapshot_id<>$3 or generation<>$4)`,
+    [teamId, connectionId, staged.snapshotId, staged.generation],
   );
+  if (staged.resume) {
+    const held = await heldSnapshot(teamId, connectionId, staged);
+    if (held.members !== staged.resume.members || held.digest !== staged.resume.digest) {
+      throw new GdriveSnapshotError(
+        "snapshot_resume_mismatch",
+        "the staged Google Drive snapshot is not the membership this execution expected to continue",
+        409,
+      );
+    }
+    await runSql(
+      `update gdrive_snapshot_members set fence=$5
+        where team_id=$1 and integration_id=$2 and snapshot_id=$3 and generation=$4 and fence<>$5`,
+      [teamId, connectionId, staged.snapshotId, staged.generation, staged.fence],
+    );
+  } else {
+    await runSql(
+      `delete from gdrive_snapshot_members
+        where team_id=$1 and integration_id=$2 and snapshot_id=$3 and fence<>$4`,
+      [teamId, connectionId, staged.snapshotId, staged.fence],
+    );
+  }
   if (providerIds.length > 0) {
     await runSql(
       `insert into gdrive_snapshot_members(team_id,integration_id,snapshot_id,generation,fence,provider_id)

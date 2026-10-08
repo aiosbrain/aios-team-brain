@@ -963,7 +963,12 @@ requires compatible local credentials.
 The direct Drive/Docs adapter requests `includeTabsContent`, preserves ordered root/child tabs,
 headings, lists, tables, links, footnotes and Unicode, and refuses to overwrite a prior complete item
 when required extraction is incomplete. SQLite retains one namespaced opaque stream per selected
-Shared Drive and (when selected) My Drive. Before any baseline listing, every required stream's start
+Shared Drive and (when selected) My Drive. A selected file or folder that lives inside a Shared Drive is
+reported only by that drive's change log, so every selected root is first bound — durably, once per
+generation, by one provider read — to the drive that contains it, and is enumerated and drained through
+that drive's stream and cursor. A binding adds no drive root: the drive's other content stays
+unselected. Until every root is bound no stream is enumerated; a bound file found in another drive
+keeps its stream's baseline partial rather than read once and reported current. Before any baseline listing, every required stream's start
 token is captured. Shared Drive listing, traversal, rescan, and parent-membership checks use the
 provider's actual `driveId` as the root; the former synthetic `root` key is repaired only when the
 persisted root/drive identity matches exactly, otherwise the stream enters controlled recovery and
@@ -990,7 +995,12 @@ Restoration revalidates live provider access and current selected membership. Do
 outlive their listing page, so separately bounded discovery, fresh-work and retry counters continue past
 a malformed document without charging one class against another. A durable per-generation stream
 rotation gives later drives the fresh-work turn across runs and restarts even with a one-item budget,
-while fair work-class scheduling and a global run deadline cap the backlog.
+while fair work-class scheduling and a global run deadline cap the backlog. That one absolute deadline
+travels with the execution: every brain sink and reconcile call bounds its limiter wait, its request
+and each retry by it, and raises a deferral instead of sleeping past it. A deferral the brain timed
+(`Retry-After`) is retried no earlier than that; one stopped only by the deadline leaves the obligation
+untouched, and no further document is started for the run. A document that cannot be normalized into
+an item is that document's durable, retryable failure; the obligations after it still run.
 Acknowledgments remain until the
 fenced terminal or continuation cursor is committed, so exact-budget exits and a crash after sink
 acknowledgment do not lose or endlessly replay work. Each stream persists terminal-drain evidence
@@ -1028,7 +1038,11 @@ identity in the same PostgreSQL transaction as the ingest-owner mutation; stale 
 omitted/relabelled provenance cannot commit content, removal, or progress. The sidecar checkpoints the
 actual next/terminal cursor on the brain before mirroring it to SQLite, so restart recovery survives a
 crash between those writes. Google push notifications are validated against overlapping persisted
-channel/resource/token records and only enqueue poll work; production watch create/renew acquires the
+channel/resource/token records and only mark their stream dirty: one counter pair per stream
+(connection, account, drive — not per notification, and not per scope generation), outside the document
+backlog and work budget. A drain reads the dirty sequence before its first change page and
+acknowledges exactly that sequence once a page read in that run reaches the terminal token, so a
+notification arriving mid-drain stays pending for the next one; production watch create/renew acquires the
 same immutable execution and broker grant, fences channel publication, and never resets the
 consumption cursor. Periodic polling remains the recovery authority.
 Immediately before every new Drive/Docs request, pagination step, retry, or watch call, the sidecar
@@ -1056,7 +1070,10 @@ Graph query discovery is query-aware and pages through a bounded candidate corpu
 the complete source-provenance authorization gate. Unauthorized high-ranked candidates are refilled
 from later pages. When the discovery budget is exhausted the API returns an explicit `incomplete`
 flag and continuation offset; provenance or epoch instability remains retryable-unavailable rather
-than a healthy empty result.
+than a healthy empty result. A response publishes a prefix of the authorized, query-matching stream
+(ranking orders only that prefix), and the continuation resumes at the first authorized fact that was
+read but not returned — including on a short final page — so paging never steps over authorized
+overflow.
 
 Provider IDs are retained exactly in `frontmatter.source_id`, with connection and scope-generation
 provenance. `source_item_mappings` is the durable `(team, source, exact provider id) → item UUID`
@@ -1071,7 +1088,13 @@ never establish absence. One request carries at most 10,000 provider ids; a larg
 is staged by its fenced execution in `gdrive_snapshot_members`, page by page under one `snapshot_id`,
 and applied by the page marked complete — in one transaction that requires the staged membership to
 equal the declared `total`, retires absence against it, and removes the staged rows. A page short of
-that, a lost page, or pages left by another snapshot or execution establish nothing. Revision
+that, a lost page, or pages left by another snapshot or execution establish nothing. The upload spans
+runs: the route's limit answers with `Retry-After`, and the connector waits it out or defers the rest
+to its next run. The snapshot is named from its own membership, so a later execution names the same
+one, asks what is held (`inspect`, which changes nothing) and continues after that prefix only by
+proving it (`resume`: member count and digest) — the brain then adopts those rows under the new fence.
+Without that proof a successor's page still replaces a predecessor's, and an execution whose fence is
+no longer current can neither stage nor finalize. Revision
 observations are retained as a contribution ledger, one row per observation: a stable provider id,
 role and UTC instant identify it in both the frontmatter ledger and `gdrive_contribution_evidence`, so
 a replay that changes only the e-mail or the timestamp spelling updates that row; exact `gdrive`
@@ -2320,8 +2343,8 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/auth/slack/start` — member-authed: mint single-use state nonce + return Slack OAuth authorize_url with the full `slack-personal` user-scope set (including matched conversation read/history scopes and `files:write`; signed short-TTL state JWT; CSRF/replay guard)
 - `GET /api/auth/slack/callback` — browser (no API key): verify+consume state nonce, exchange `code` (`oauth.v2.access`), re-validate via `auth.test`, store the user token encrypted (`member_secrets`) + capture identity; renders HTML (never the token)
 - `GET /api/auth/slack/status` — member-authed: `{ connected, slack_user_id, workspace }` (never returns the token; `no-store`)
-- `GET /api/auth/gdrive/start` — team-admin-authenticated Google Drive OAuth start; signed single-use team/member-bound state and explicit per-file vs folder-discovery scopes
-- `GET /api/auth/gdrive/callback` — consume bound state, exchange and verify the Google account, then atomically publish account config + encrypted refresh credential; an old refresh token is reusable only for the same verified subject/client pair
+- `GET /api/auth/gdrive/start` — team-admin-authenticated Google Drive OAuth start; signed single-use team/member-bound state whose browser half is an HttpOnly binding cookie, and explicit per-file vs folder-discovery scopes
+- `GET /api/auth/gdrive/callback` — redeem the state only with the initiating browser's binding cookie and only for the session of the Admin who started it, then exchange and verify the Google account and atomically publish account config + encrypted refresh credential; an old refresh token is reusable only for the same verified subject/client pair
 - `POST /api/v1/integrations/gdrive/execution` — dedicated connector-principal acquire/checkpoint/release for the current immutable integration generation + lease fence and authoritative progress revision; acquire never self-binds, and every commit transaction rereads the bound key/member/posture plus connection/fence. Selection/account/credential changes advance the content generation and reset its cursor obligations; status-only pause/resume instead advances the fence, clears the lease, and retains generation/progress so resumption cannot skip acknowledged work or request a fresh start token
 - `POST /api/v1/integrations/gdrive/token` — fenced no-store OAuth access-token broker; refresh/client secrets remain server-side, and bound-principal revocation is reread after provider refresh before issuance, in the one row-locked transaction that also records the issuance — a pause, disconnect, rebind or key revocation cannot commit between that check and the token's release
 - `GET /api/v1/integrations/gdrive/runs` — connection-bound connector claim for durable Admin Run-now/retry requests

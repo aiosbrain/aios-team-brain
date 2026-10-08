@@ -35,18 +35,37 @@ export interface AuthorizedGraphFactsResult {
   checked: number;
 }
 
-function relevant(facts: AtomicFact[], query: string, limit: number): AtomicFact[] {
+/** An authorized fact with its absolute position in the ordered discovery stream. */
+interface PositionedFact {
+  fact: AtomicFact;
+  position: number;
+}
+
+/**
+ * Choose what one response publishes and where the next one resumes. The published set is always a
+ * PREFIX of the authorized, query-matching stream: ranking only orders that prefix. A response that
+ * ranked across everything read and resumed after the last page would step over every authorized
+ * fact it read but did not return.
+ */
+function selectPrefix(
+  authorized: PositionedFact[],
+  query: string,
+  limit: number,
+): { facts: AtomicFact[]; overflowAt: number | null } {
   const terms = queryTerms(query);
-  if (terms.length === 0) return facts.slice(0, limit);
-  return facts
-    .map((fact) => {
-      const haystack = `${fact.fact} ${fact.subject} ${fact.object}`.toLowerCase();
-      return { fact, score: terms.reduce((n, term) => n + (haystack.includes(term) ? 1 : 0), 0) };
+  const matching = authorized
+    .map((entry) => {
+      const haystack = `${entry.fact.fact} ${entry.fact.subject} ${entry.fact.object}`.toLowerCase();
+      return { ...entry, score: terms.reduce((n, term) => n + (haystack.includes(term) ? 1 : 0), 0) };
     })
-    .filter((entry) => entry.score > 0)
-    .sort((a, b) => b.score - a.score || b.fact.at.localeCompare(a.fact.at))
-    .slice(0, limit)
-    .map((entry) => entry.fact);
+    .filter((entry) => terms.length === 0 || entry.score > 0)
+    .sort((a, b) => a.position - b.position);
+  const selected = matching.slice(0, limit);
+  const overflowAt = matching.length > limit ? selected[selected.length - 1].position + 1 : null;
+  if (terms.length > 0) {
+    selected.sort((a, b) => b.score - a.score || b.fact.at.localeCompare(a.fact.at));
+  }
+  return { facts: selected.map((entry) => entry.fact), overflowAt };
 }
 
 /**
@@ -94,7 +113,7 @@ export async function readAuthorizedGraphFactsResult(
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const epoch = await authorizationEpoch(db, args.teamId);
     try {
-      const authorized: AtomicFact[] = [];
+      const authorized: PositionedFact[] = [];
       let checked = 0;
       let offset = startOffset;
       let more = false;
@@ -112,15 +131,24 @@ export async function readAuthorizedGraphFactsResult(
           Math.min(4000, graph.facts.length * 64),
         );
         if (!episodes.ok) throw new GraphProvenanceUnavailableError("graph episode provenance read failed");
+        // The earliest position wins a repeated id, so a continuation can only re-read, never skip.
+        const positions = new Map<string, number>();
+        graph.facts.forEach((fact, index) => {
+          if (!positions.has(fact.id)) positions.set(fact.id, offset + index);
+        });
         for (const groupId of groups) {
           const partitionFacts = graph.facts.filter((fact) => fact.groupId === groupId);
-          authorized.push(...await authorizedArcFacts(db, {
+          const allowed = await authorizedArcFacts(db, {
             teamId: args.teamId,
             partitionGroup: groupId,
             expectedAuthorizationEpoch: epoch,
             facts: partitionFacts,
             episodeItems: episodes.items,
-          }));
+          });
+          for (const fact of allowed) {
+            const position = positions.get(fact.id);
+            if (position !== undefined) authorized.push({ fact, position });
+          }
         }
         checked += graph.facts.length;
         offset += graph.facts.length;
@@ -130,12 +158,11 @@ export async function readAuthorizedGraphFactsResult(
       if (await authorizationEpoch(db, args.teamId) !== epoch) {
         throw new ArcSynthesisAuthorizationChangedError();
       }
-      return {
-        facts: relevant(authorized, args.query ?? "", limit),
-        incomplete: more,
-        nextOffset: more ? offset : null,
-        checked,
-      };
+      const { facts, overflowAt } = selectPrefix(authorized, args.query ?? "", limit);
+      // Authorized facts read beyond the limit are overflow, not consumed: resume AT the first of
+      // them. Only a response that published everything it read may resume after the last page.
+      const nextOffset = overflowAt ?? (more ? offset : null);
+      return { facts, incomplete: nextOffset !== null, nextOffset, checked };
     } catch (error) {
       if (error instanceof ArcSynthesisAuthorizationChangedError && attempt === 0) continue;
       if (

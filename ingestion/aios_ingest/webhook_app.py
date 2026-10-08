@@ -99,14 +99,10 @@ def _gdrive_notification(headers: dict[str, str]) -> Response:
         if channel.namespace:
             progress = state.get_progress(channel.namespace)
             if progress:
-                message_number = headers.get("x-goog-message-number", "unknown")
-                state.enqueue_work(
-                    channel.namespace,
-                    progress.generation,
-                    f"notification:{channel_id}:{message_number}",
-                    "poll",
-                    {"resource_state": headers.get("x-goog-resource-state", "")},
-                )
+                # Any number of notifications is one dirty mark on the stream itself. The channel
+                # may have been created under an earlier scope generation; the stream (connection,
+                # account, drive) is what the current coordinator reads, so that is what is marked.
+                state.record_stream_hint(progress.key)
         return Response(status_code=202, content="Drive poll scheduled")
     finally:
         state.close()

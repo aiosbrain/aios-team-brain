@@ -1224,6 +1224,10 @@ export const PROTECTED_ROUTES: readonly ProtectedRoute[] = [
   // AIO-1167: starts the Google Drive OAuth grant from the Admin UI — a browser navigation, so the
   // authority is the session's team-admin membership, bound into the signed state it mints.
   row("api/auth/gdrive/start", "GET", "requireTeamAdmin"),
+  // Google redirects the SAME browser back, so the callback is not a public protocol: it redeems the
+  // state only with that browser's binding cookie, and exchanges the code only for the session of
+  // the Admin who started the grant.
+  row("api/auth/gdrive/callback", "GET", "requireTeamAdmin"),
   row("api/auth/slack/start", "GET", "authenticateApiKey"),
   row("api/auth/slack/status", "GET", "authenticateApiKey"),
 
@@ -1353,15 +1357,6 @@ export const PUBLIC_EXCEPTIONS: readonly PublicException[] = [
     reason: "An OAuth browser redirect cannot carry a member API bearer.",
     protocol: "consumeSlackOAuthState verifies the signed single-use member/team binding before exchange or write.",
     evidence: ["test/slack-oauth-state.test.ts", "test/datamechanics/slack-oauth.datamechanics.test.ts"],
-  },
-  {
-    path: "app/api/auth/gdrive/callback/route.ts",
-    method: "GET",
-    reason: "Google's OAuth browser redirect cannot carry a session-independent credential of ours.",
-    protocol:
-      "consumeGoogleDriveOAuthState verifies the signed, single-use team/admin/integration binding before any " +
-      "code exchange; the credential is stored only after the initiating admin is re-verified at publish time.",
-    evidence: ["test/gdrive-oauth-state.test.ts", "test/datamechanics/gdrive-authority.datamechanics.test.ts"],
   },
   {
     path: "app/api/health/route.ts",

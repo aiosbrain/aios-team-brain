@@ -8,15 +8,16 @@ backing off on 429. It is the only thing in the sidecar that talks to the brain.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 import os
 import random
 import time
 import uuid
 from email.utils import parsedate_to_datetime
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Awaitable, Callable, Iterable, Literal
 
 import httpx
 
@@ -31,6 +32,8 @@ _GDRIVE_CHECKPOINT_MAX_ATTEMPTS = 6
 _GDRIVE_CHECKPOINT_DEADLINE_SECONDS = 45.0
 # Provider ids one source-reconcile request may carry (the brain's GDRIVE_SNAPSHOT_PAGE_LIMIT).
 _GDRIVE_SNAPSHOT_PAGE = 10_000
+# Names a staged snapshot from its own membership, so the name survives a restart unchanged.
+_GDRIVE_SNAPSHOT_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "aios:gdrive:complete-snapshot")
 _SCAN_RATE_LIMIT_WINDOW_SECONDS = 60
 # A codebase scan push is the heaviest single request: the brain projects every recent commit into
 # searchable items (with embeddings) synchronously before responding, which can far exceed the 30s
@@ -58,6 +61,9 @@ class GdriveExecution:
     config: dict[str, Any]
     progress: dict[str, Any] = field(default_factory=dict)
     progress_revision: int = 0
+    # Absolute ``time.monotonic()`` instant after which this run starts no sink or reconcile call.
+    # ``None`` (a caller outside the coordinator) keeps the unbounded retry policy.
+    run_deadline: float | None = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +82,19 @@ class BrainError(RuntimeError):
         self.status_code = status_code
         self.code = code
         super().__init__(f"{status_code} {code}: {message}")
+
+
+class BrainDeferred(BrainError):
+    """A brain call the caller's absolute run deadline stopped before it could complete.
+
+    ``not_before`` is set when a retryable response named a wait that does not fit the deadline:
+    that is the time to retry. It is ``None`` when the deadline arrived before the request was
+    even sent: nothing was attempted, and the work is retryable at once.
+    """
+
+    def __init__(self, status_code: int, code: str, message: str, *, not_before: str | None = None):
+        super().__init__(status_code, code, message)
+        self.not_before = not_before
 
 
 class GdriveProviderGate:
@@ -206,26 +225,37 @@ class GdriveTokenProvider:
 class _RateLimiter:
     """Simple async token bucket so concurrent posts respect the per-minute cap."""
 
-    def __init__(self, max_per_min: int):
+    def __init__(
+        self,
+        max_per_min: int,
+        *,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        monotonic_fn: Callable[[], float] = time.monotonic,
+    ):
         self._capacity = max_per_min
         self._tokens = float(max_per_min)
         self._refill_per_sec = max_per_min / 60.0
-        self._last = time.monotonic()
+        self._sleep = sleep
+        self._monotonic = monotonic_fn
+        self._last = self._monotonic()
         self._lock = asyncio.Lock()
 
-    async def acquire(self) -> None:
+    async def acquire(self, *, deadline: float | None = None) -> bool:
+        """Take one token. With a deadline, return False instead of waiting past it."""
         while True:
             async with self._lock:
-                now = time.monotonic()
+                now = self._monotonic()
                 self._tokens = min(
                     self._capacity, self._tokens + (now - self._last) * self._refill_per_sec
                 )
                 self._last = now
                 if self._tokens >= 1:
                     self._tokens -= 1
-                    return
+                    return True
                 wait = (1 - self._tokens) / self._refill_per_sec
-            await asyncio.sleep(wait)
+            if deadline is not None and now + wait >= deadline:
+                return False
+            await self._sleep(wait)
 
 
 class BrainClient:
@@ -251,8 +281,9 @@ class BrainClient:
             "X-AIOS-Team": team,
             "Content-Type": "application/json",
         }
-        self._limiter = _RateLimiter(max_per_min)
+        self._limiter = _RateLimiter(max_per_min, sleep=sleep, monotonic_fn=monotonic_fn)
         self._client = httpx.AsyncClient(timeout=timeout)
+        self._timeout = timeout
         self._sleep = sleep
         self._random = random_fn
         self._monotonic = monotonic_fn
@@ -273,26 +304,71 @@ class BrainClient:
             "X-AIOS-Execution-Owner": execution.owner,
         }
 
+    async def _post_bounded(
+        self, url: str, body: dict, headers: dict[str, str], deadline: float | None,
+    ) -> httpx.Response:
+        """One rate-limited POST. Under an absolute deadline neither the limiter wait nor the
+        request may outlive it: the call is deferred instead of started late."""
+        if deadline is None:
+            await self._limiter.acquire()
+            return await self._client.post(url, json=body, headers=headers)
+        if not await self._limiter.acquire(deadline=deadline):
+            raise BrainDeferred(
+                503, "run_deadline", "run deadline reached before the brain request was admitted",
+            )
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            raise BrainDeferred(
+                503, "run_deadline", "run deadline reached before the brain request was sent",
+            )
+        try:
+            return await asyncio.wait_for(
+                self._client.post(
+                    url, json=body, headers=headers,
+                    timeout=max(0.1, min(self._timeout, remaining)),
+                ),
+                timeout=remaining,
+            )
+        except (TimeoutError, httpx.TimeoutException) as exc:
+            # A request that was sent and not answered is a failed attempt, not a deferral. The
+            # brain may still have committed it: the caller's obligation stays durable, and the
+            # brain's dedup makes the replay a no-op.
+            raise BrainError(
+                504, "brain_timeout", "the brain did not answer inside the run deadline",
+            ) from exc
+
+    async def _backoff(self, resp: httpx.Response, attempt: int, deadline: float | None) -> None:
+        """Wait out one retryable response. Under an absolute deadline a wait that cannot fit
+        inside it is not slept: the call is deferred, with the time it may be retried."""
+        delay = (_retry_after(resp) or min(2**attempt, 30)) + _bounded_jitter(self._random())
+        if deadline is not None and self._monotonic() + delay >= deadline:
+            raise BrainDeferred(
+                resp.status_code, *_error_fields(resp), not_before=_iso_after(delay),
+            )
+        await self._sleep(delay)
+
     async def push(self, item: ItemPayload, *, execution: GdriveExecution | None = None) -> IngestResult:
         """POST one item. Retries on 429 (honoring backoff) and 5xx; raises BrainError
-        on a definitive 4xx so a bad mapping fails loudly instead of silently dropping."""
+        on a definitive 4xx so a bad mapping fails loudly instead of silently dropping.
+
+        A Drive execution's run deadline bounds the limiter wait, the request and every retry;
+        work that cannot fit raises :class:`BrainDeferred`."""
         url = f"{self._base}/api/v1/items"
         body = item.to_json()
+        deadline = execution.run_deadline if execution else None
         last_status = 503
         last_code = "retry_exhausted"
         last_message = "provider unavailable"
         for attempt in range(_MAX_RETRIES):
-            await self._limiter.acquire()
             headers = {**self._headers, **(self._execution_headers(execution) if execution else {})}
-            resp = await self._client.post(url, json=body, headers=headers)
+            resp = await self._post_bounded(url, body, headers, deadline)
             if resp.status_code in (200, 201):
                 data = resp.json()
                 return IngestResult(status=data["status"], id=data["id"], path=item.path)
             if resp.status_code == 429 or resp.status_code >= 500:
                 last_status = resp.status_code
                 last_code, last_message = _error_fields(resp)
-                backoff = _retry_after(resp) or min(2**attempt, 30)
-                await self._sleep(backoff + _bounded_jitter(self._random()))
+                await self._backoff(resp, attempt, deadline)
                 continue
             raise BrainError(resp.status_code, *_error_fields(resp))
         raise BrainError(last_status, last_code, f"{last_message}; gave up after {_MAX_RETRIES} attempts")
@@ -514,7 +590,13 @@ class BrainClient:
         A complete snapshot larger than one request is staged on the brain in pages that all name
         one snapshot; only the last page is marked complete, and it carries the removals and the
         snapshot's total so the brain applies the whole set atomically or not at all.
+
+        The upload spans runs. The route's rate limit and the execution's run deadline can stop it
+        between pages (:class:`BrainDeferred`); the snapshot is named from its own membership, so
+        the next execution names the same one, asks the brain what it holds, and continues after
+        that prefix — proving, by digest, that the prefix is what it would have sent itself.
         """
+        deadline = execution.run_deadline
         base: dict = {
             "source": "gdrive",
             "integration_id": execution.integration_id,
@@ -525,46 +607,78 @@ class BrainClient:
         }
         removed = removed_provider_ids or []
         if complete_snapshot_ids is None:
-            return await self._post_gdrive_reconcile({**base, "removed_provider_ids": removed})
+            return await self._post_gdrive_reconcile({**base, "removed_provider_ids": removed}, deadline)
         if len(complete_snapshot_ids) <= _GDRIVE_SNAPSHOT_PAGE:
             return await self._post_gdrive_reconcile({
                 **base, "removed_provider_ids": removed,
                 "snapshot": {"complete": True, "provider_ids": complete_snapshot_ids},
-            })
+            }, deadline)
         members = list(dict.fromkeys(complete_snapshot_ids))
-        snapshot_id = str(uuid.uuid4())
+        snapshot_id = _gdrive_snapshot_id(execution, members)
         pages = [
             members[start:start + _GDRIVE_SNAPSHOT_PAGE]
             for start in range(0, len(members), _GDRIVE_SNAPSHOT_PAGE)
         ]
-        for page in pages[:-1]:
-            await self._post_gdrive_reconcile({
+        last = len(pages) - 1
+        index = 0
+        resume: dict | None = None
+        if last > 0:
+            inspected = await self._post_gdrive_reconcile({
                 **base, "removed_provider_ids": [],
-                "snapshot": {"complete": False, "provider_ids": page, "snapshot_id": snapshot_id},
-            })
-        return await self._post_gdrive_reconcile({
-            **base, "removed_provider_ids": removed,
-            "snapshot": {
-                "complete": True, "provider_ids": pages[-1],
-                "snapshot_id": snapshot_id, "total": len(members),
-            },
-        })
+                "snapshot": {
+                    "complete": False, "provider_ids": [], "snapshot_id": snapshot_id,
+                    "inspect": True,
+                },
+            }, deadline)
+            held = int(inspected.get("snapshotStaged") or 0)
+            # Pages are staged whole and in order, so anything else held is not a prefix of this
+            # upload and is simply replaced from the first page.
+            if held and held % _GDRIVE_SNAPSHOT_PAGE == 0 and held // _GDRIVE_SNAPSHOT_PAGE <= last:
+                index = held // _GDRIVE_SNAPSHOT_PAGE
+                resume = {
+                    "members": held,
+                    "digest": _gdrive_members_digest(
+                        member for page in pages[:index] for member in page
+                    ),
+                }
+        while True:
+            final = index == last
+            snapshot: dict = {
+                "complete": final, "provider_ids": pages[index], "snapshot_id": snapshot_id,
+            }
+            if final:
+                snapshot["total"] = len(members)
+            if resume is not None:
+                snapshot["resume"] = resume
+            try:
+                result = await self._post_gdrive_reconcile({
+                    **base, "removed_provider_ids": removed if final else [], "snapshot": snapshot,
+                }, deadline)
+            except BrainError as exc:
+                if resume is None or exc.code != "snapshot_resume_mismatch":
+                    raise
+                # What the brain holds is not this upload's prefix after all: stage it afresh.
+                index, resume = 0, None
+                continue
+            # Adoption happens once; every later page is this execution's own.
+            resume = None
+            if final:
+                return result
+            index += 1
 
-    async def _post_gdrive_reconcile(self, body: dict) -> dict:
+    async def _post_gdrive_reconcile(self, body: dict, deadline: float | None = None) -> dict:
         url = f"{self._base}/api/v1/items/source-reconcile"
         last_status = 503
         last_code = "retry_exhausted"
         last_message = "provider unavailable"
         for attempt in range(_MAX_RETRIES):
-            await self._limiter.acquire()
-            resp = await self._client.post(url, json=body, headers=self._headers)
+            resp = await self._post_bounded(url, body, self._headers, deadline)
             if resp.status_code == 200:
                 return resp.json()
             if resp.status_code == 429 or resp.status_code >= 500:
                 last_status = resp.status_code
                 last_code, last_message = _error_fields(resp)
-                backoff = _retry_after(resp) or min(2**attempt, 30)
-                await self._sleep(backoff + _bounded_jitter(self._random()))
+                await self._backoff(resp, attempt, deadline)
                 continue
             raise BrainError(resp.status_code, *_error_fields(resp))
         raise BrainError(last_status, last_code, f"{last_message}; gave up after {_MAX_RETRIES} attempts")
@@ -603,6 +717,24 @@ def _bounded_jitter(value: float) -> float:
     if not math.isfinite(value):
         return 0.0
     return min(1.0, max(0.0, value))
+
+
+def _iso_after(seconds: float) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=max(0.0, seconds))).isoformat()
+
+
+def _gdrive_members_digest(members: Iterable[str]) -> str:
+    """sha256 over the members in code-point order, newline-joined. The brain computes the same
+    value over the rows it holds, which is how a resumed prefix is proven rather than assumed."""
+    return hashlib.sha256("\n".join(sorted(members)).encode("utf-8")).hexdigest()
+
+
+def _gdrive_snapshot_id(execution: GdriveExecution, members: list[str]) -> str:
+    """A staged snapshot's name, bound to its content: the same membership under the same
+    generation names the same snapshot after a restart, and any other membership names another —
+    so pages of two different selections can never add up to one total."""
+    material = f"{execution.integration_id}:{execution.generation}:{_gdrive_members_digest(members)}"
+    return str(uuid.uuid5(_GDRIVE_SNAPSHOT_NAMESPACE, material))
 
 
 def _retry_after(resp: httpx.Response) -> float | None:

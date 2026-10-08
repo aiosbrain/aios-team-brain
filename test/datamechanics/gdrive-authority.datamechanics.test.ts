@@ -8,7 +8,7 @@ import { POST as itemsPOST } from "@/app/api/v1/items/route";
 import { GET as runsGET, POST as runsPOST } from "@/app/api/v1/integrations/gdrive/runs/route";
 import { GET as oauthCallbackGET } from "@/app/api/auth/gdrive/callback/route";
 import { issueApiKey, revokeApiKey } from "@/lib/admin/keys";
-import { createGoogleDriveOAuthState } from "@/lib/auth/gdrive-oauth-state";
+import { createGoogleDriveOAuthState, GDRIVE_OAUTH_BINDING_COOKIE } from "@/lib/auth/gdrive-oauth-state";
 import { getIntegrationWithSecret, upsertIntegration, setIntegrationSecret, setIntegrationStatus } from "@/lib/integrations/manage";
 import {
   acquireGdriveAdminTestAuthority,
@@ -23,7 +23,31 @@ const GOOGLE_SECRET = JSON.stringify({
   scopes: ["https://www.googleapis.com/auth/drive.file"], account_subject: "subject:acct-1",
 });
 
-afterEach(() => vi.restoreAllMocks());
+// The OAuth callback is redeemed only by the browser and Admin session that started the grant. The
+// session resolver is the one seam faked here; the binding cookie is a real request header.
+const adminSession = vi.hoisted(() => ({ teamId: "", memberId: "" }));
+vi.mock("@/lib/auth/guard", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/auth/guard")>()),
+  requireTeamAdmin: async () => adminSession.teamId
+    ? { teamId: adminSession.teamId, memberId: adminSession.memberId }
+    : null,
+}));
+
+const BROWSER = "aio-1167-initiating-browser-binding";
+const INITIATING_BROWSER = { headers: { cookie: `${GDRIVE_OAUTH_BINDING_COOKIE}=${BROWSER}` } };
+
+/** Start a grant as `seed`'s Admin: signs that Admin in and returns the browser's binding. */
+function startedBy(seed: Seed): string {
+  adminSession.teamId = seed.teamId;
+  adminSession.memberId = seed.memberId;
+  return BROWSER;
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  adminSession.teamId = "";
+  adminSession.memberId = "";
+});
 
 async function connector(seed: Seed, posture: "team" | "external" = "team") {
   const { data, error } = await db().from("members").insert({
@@ -338,6 +362,7 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
     process.env.GOOGLE_DRIVE_OAUTH_REDIRECT = "http://test/api/auth/gdrive/callback";
     const state = await createGoogleDriveOAuthState(db(), {
       teamId: seed.teamId, memberId: seed.memberId, integrationName: "callback-docs", teamSlug: seed.teamSlug,
+      browserBinding: startedBy(seed),
     });
     const provider = vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(new Response(JSON.stringify({
@@ -353,6 +378,7 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
       }), { status: 200, headers: { "content-type": "application/json" } }));
     const callback = await oauthCallbackGET(new NextRequest(
       `http://test/api/auth/gdrive/callback?state=${encodeURIComponent(state)}&code=one-time-code`,
+      INITIATING_BROWSER,
     ));
     expect(callback.status).toBe(200);
     const stored = await getIntegrationWithSecret(db(), seed.teamId, "gdrive", "callback-docs");
@@ -402,6 +428,7 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
     const state = await createGoogleDriveOAuthState(db(), {
       teamId: seed.teamId, memberId: seed.memberId,
       integrationName: "exact-member-account", teamSlug: seed.teamSlug,
+      browserBinding: startedBy(seed),
     });
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(new Response(JSON.stringify({
@@ -414,6 +441,7 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
 
     const callback = await oauthCallbackGET(new NextRequest(
       `http://test/api/auth/gdrive/callback?state=${encodeURIComponent(state)}&code=one-time-code`,
+      INITIATING_BROWSER,
     ));
     expect(callback.status).toBe(200);
     const { data: identities, error } = await db().from("member_identities")
@@ -451,6 +479,7 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
     const before = await getIntegrationWithSecret(db(), seed.teamId, "gdrive", "atomic-pair");
     const state = await createGoogleDriveOAuthState(db(), {
       teamId: seed.teamId, memberId: seed.memberId, integrationName: "atomic-pair", teamSlug: seed.teamSlug,
+      browserBinding: startedBy(seed),
     });
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(new Response(JSON.stringify({ access_token: "new-account-no-refresh" }), {
@@ -461,6 +490,7 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
       }));
     const callback = await oauthCallbackGET(new NextRequest(
       `http://test/api/auth/gdrive/callback?state=${encodeURIComponent(state)}&code=new-account`,
+      INITIATING_BROWSER,
     ));
     expect(callback.status).toBe(422);
     const after = await getIntegrationWithSecret(db(), seed.teamId, "gdrive", "atomic-pair");
@@ -486,6 +516,7 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
     const state = await createGoogleDriveOAuthState(db(), {
       teamId: seed.teamId, memberId: seed.memberId,
       integrationName: "service-to-oauth", teamSlug: seed.teamSlug,
+      browserBinding: startedBy(seed),
     });
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(new Response(JSON.stringify({
@@ -497,11 +528,79 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
 
     const callback = await oauthCallbackGET(new NextRequest(
       `http://test/api/auth/gdrive/callback?state=${encodeURIComponent(state)}&code=one-time-code`,
+      INITIATING_BROWSER,
     ));
     expect(callback.status).toBe(200);
     const stored = await getIntegrationWithSecret(db(), seed.teamId, "gdrive", "service-to-oauth");
     expect(stored?.config).toMatchObject({ authMode: "oauth", fileIds: ["Selected"] });
     expect(stored?.secret).toContain("oauth-refresh");
+  });
+
+  it("a state presented by another browser exchanges nothing, stores nothing, and stays redeemable", async () => {
+    const seed = await seedTeam();
+    await db().from("members").update({ role: "admin" }).eq("id", seed.memberId).eq("team_id", seed.teamId);
+    process.env.AUTH_SECRET = "aio-1167-data-mechanics-auth-secret";
+    process.env.GOOGLE_DRIVE_CLIENT_ID = "oauth-client";
+    process.env.GOOGLE_DRIVE_CLIENT_SECRET = "oauth-secret";
+    process.env.GOOGLE_DRIVE_OAUTH_REDIRECT = "http://test/api/auth/gdrive/callback";
+    const state = await createGoogleDriveOAuthState(db(), {
+      teamId: seed.teamId, memberId: seed.memberId, integrationName: "leaked-state", teamSlug: seed.teamSlug,
+      browserBinding: startedBy(seed),
+    });
+    const provider = vi.spyOn(globalThis, "fetch");
+    const url = `http://test/api/auth/gdrive/callback?state=${encodeURIComponent(state)}&code=one-time-code`;
+
+    // Whoever holds the leaked state finishes consent with a Google account of their own, from a
+    // browser that never started this grant: with no binding cookie, or with some other one.
+    for (const browser of [undefined, { headers: { cookie: `${GDRIVE_OAUTH_BINDING_COOKIE}=another-browser` } }]) {
+      expect((await oauthCallbackGET(new NextRequest(url, browser))).status).toBe(400);
+    }
+    expect(provider).not.toHaveBeenCalled();
+    expect(await getIntegrationWithSecret(db(), seed.teamId, "gdrive", "leaked-state")).toBeFalsy();
+    // The nonce was not consumed, so the attempt cost the rightful Admin nothing.
+    const { data: unused } = await db().from("oauth_states").select("used_at")
+      .eq("team_id", seed.teamId).eq("provider", "gdrive");
+    expect(unused).toEqual([{ used_at: null }]);
+
+    provider
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        access_token: "callback-access", refresh_token: "callback-refresh",
+      }), { status: 200, headers: { "content-type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ sub: "rightful-subject", email: "rightful@example.com" }), {
+        status: 200, headers: { "content-type": "application/json" },
+      }));
+    expect((await oauthCallbackGET(new NextRequest(url, INITIATING_BROWSER))).status).toBe(200);
+    expect((await getIntegrationWithSecret(db(), seed.teamId, "gdrive", "leaked-state"))?.config)
+      .toMatchObject({ authenticatedAccountId: "subject:rightful-subject" });
+  });
+
+  it("the initiating browser without the initiating Admin's session exchanges nothing and stores nothing", async () => {
+    const seed = await seedTeam();
+    await db().from("members").update({ role: "admin" }).eq("id", seed.memberId).eq("team_id", seed.teamId);
+    process.env.AUTH_SECRET = "aio-1167-data-mechanics-auth-secret";
+    process.env.GOOGLE_DRIVE_CLIENT_ID = "oauth-client";
+    process.env.GOOGLE_DRIVE_CLIENT_SECRET = "oauth-secret";
+    process.env.GOOGLE_DRIVE_OAUTH_REDIRECT = "http://test/api/auth/gdrive/callback";
+    await integration(seed, "session-changed");
+    const before = await getIntegrationWithSecret(db(), seed.teamId, "gdrive", "session-changed");
+    const state = await createGoogleDriveOAuthState(db(), {
+      teamId: seed.teamId, memberId: seed.memberId, integrationName: "session-changed", teamSlug: seed.teamSlug,
+      browserBinding: startedBy(seed),
+    });
+    const provider = vi.spyOn(globalThis, "fetch");
+    // Same browser, but the Admin who started the grant is no longer the one signed in.
+    adminSession.memberId = "00000000-0000-4000-8000-000000000000";
+
+    const callback = await oauthCallbackGET(new NextRequest(
+      `http://test/api/auth/gdrive/callback?state=${encodeURIComponent(state)}&code=one-time-code`,
+      INITIATING_BROWSER,
+    ));
+
+    expect(callback.status).toBe(403);
+    expect(provider).not.toHaveBeenCalled();
+    const after = await getIntegrationWithSecret(db(), seed.teamId, "gdrive", "session-changed");
+    expect(after?.config).toEqual(before?.config);
+    expect(after?.secret).toBe(before?.secret);
   });
 
   it.each([
@@ -519,6 +618,7 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
     const state = await createGoogleDriveOAuthState(db(), {
       teamId: seed.teamId, memberId: seed.memberId,
       integrationName: `initiator-${_case}`, teamSlug: seed.teamSlug,
+      browserBinding: startedBy(seed),
     });
     vi.spyOn(globalThis, "fetch")
       .mockImplementationOnce(async () => {
@@ -533,6 +633,7 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
 
     const callback = await oauthCallbackGET(new NextRequest(
       `http://test/api/auth/gdrive/callback?state=${encodeURIComponent(state)}&code=one-time-code`,
+      INITIATING_BROWSER,
     ));
     expect(callback.status).toBe(403);
     const after = await getIntegrationWithSecret(db(), seed.teamId, "gdrive", `initiator-${_case}`);
@@ -553,6 +654,7 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
     const state = await createGoogleDriveOAuthState(db(), {
       teamId: seed.teamId, memberId: seed.memberId,
       integrationName: "initiator-transferred", teamSlug: seed.teamSlug,
+      browserBinding: startedBy(seed),
     });
     vi.spyOn(globalThis, "fetch")
       .mockImplementationOnce(async () => {
@@ -570,6 +672,7 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
 
     const callback = await oauthCallbackGET(new NextRequest(
       `http://test/api/auth/gdrive/callback?state=${encodeURIComponent(state)}&code=one-time-code`,
+      INITIATING_BROWSER,
     ));
     expect(callback.status).toBe(403);
     const after = await getIntegrationWithSecret(db(), seed.teamId, "gdrive", "initiator-transferred");

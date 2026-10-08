@@ -8,6 +8,7 @@ state only. Notifications, manual runs and periodic polling converge here.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import math
@@ -17,7 +18,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from .brain_client import BrainClient, BrainError, GdriveExecution
+from pydantic import ValidationError
+
+from .brain_client import BrainClient, BrainDeferred, BrainError, GdriveExecution
 from .config import BrainSettings, Connection
 from .engine import IngestSummary
 from .normalize import normalize
@@ -84,15 +87,54 @@ def _page_id(kind: str, *parts: object) -> str:
     return f"{kind}:{hashlib.sha256(material.encode()).hexdigest()}"
 
 
-def _stream_ids(options: dict[str, Any]) -> list[str]:
+class SelectedRootRelocated(RuntimeError):
+    """A selected root no longer lives in the drive whose change stream it is bound to."""
+
+
+def _selected_roots(options: dict[str, Any]) -> list[tuple[str, str]]:
+    """Every explicitly selected file/folder root as ``(kind, id)``, in configuration order."""
+    return (
+        [("file", str(value)) for value in options.get("file_ids") or [] if value]
+        + [("folder", str(value)) for value in options.get("folder_ids") or [] if value]
+    )
+
+
+def _bind_selected_roots(
+    source: GoogleDriveSource,
+    state: StateStore,
+    integration_id: str,
+    generation: int,
+    options: dict[str, Any],
+) -> dict[tuple[str, str], str]:
+    """Bind every selected file/folder root to the change stream of the drive that contains it.
+
+    A document or folder inside a Shared Drive is reported by that drive's change log, so it is
+    consumed through that drive's stream and cursor. A binding only says where a root lives: it
+    adds no ``drive`` root, so nothing else in that drive becomes selected. Bindings are durable
+    and fixed for the generation — one provider read per root, resumed across runs.
+    """
+    bindings = state.root_bindings(integration_id, generation)
+    for kind, root_id in _selected_roots(options):
+        if (kind, root_id) in bindings:
+            continue
+        meta = source._metadata(root_id)
+        drive_id = str(meta.get("driveId") or "my-drive")
+        state.bind_root(integration_id, generation, kind, root_id, drive_id)
+        bindings[(kind, root_id)] = drive_id
+    return bindings
+
+
+def _stream_ids(
+    options: dict[str, Any], bindings: dict[tuple[str, str], str] | None = None,
+) -> list[str]:
     """Return every independently consumed Drive change stream for the selected scope."""
     if str(options.get("selection_state") or "selected") == "empty":
         # A synthetic no-provider stream makes the authoritative empty snapshot durable without
         # interpreting empty as all of My Drive.
         return ["my-drive"]
     streams = {str(value) for value in options.get("shared_drive_ids") or [] if value}
-    if options.get("file_ids") or options.get("folder_ids"):
-        streams.add("my-drive")
+    # Without bindings (callers that never resolved them) a file/folder root is a My Drive root.
+    streams.update((bindings or {}).get(root, "my-drive") for root in _selected_roots(options))
     return sorted(streams, key=lambda value: (value != "my-drive", value))
 
 
@@ -105,14 +147,18 @@ def _remote_stream(progress: dict[str, Any], drive_id: str) -> dict[str, Any]:
     return dict(progress) if remote_drive == drive_id else {}
 
 
-def _configured_roots(options: dict[str, Any], drive_id: str) -> list[tuple[str, str, str, bool]]:
-    configured: list[tuple[str, str, str, bool]] = []
-    if drive_id == "my-drive":
-        configured.extend((str(value), "file", drive_id, False)
-                          for value in options.get("file_ids") or [])
-        configured.extend((str(value), "folder", drive_id, bool(options.get("recursive")))
-                          for value in options.get("folder_ids") or [])
-    elif drive_id in {str(value) for value in options.get("shared_drive_ids") or []}:
+def _configured_roots(
+    options: dict[str, Any], drive_id: str,
+    bindings: dict[tuple[str, str], str] | None = None,
+) -> list[tuple[str, str, str, bool]]:
+    """The selected roots one stream enumerates: those bound to its drive, plus the drive itself
+    only when the whole Shared Drive was selected."""
+    configured: list[tuple[str, str, str, bool]] = [
+        (root_id, kind, drive_id, kind == "folder" and bool(options.get("recursive")))
+        for kind, root_id in _selected_roots(options)
+        if (bindings or {}).get((kind, root_id), "my-drive") == drive_id
+    ]
+    if drive_id in {str(value) for value in options.get("shared_drive_ids") or []}:
         configured.append((drive_id, "drive", drive_id, True))
     return configured
 
@@ -194,6 +240,10 @@ async def run_gdrive_stream(
                 conn.name, skipped=1, failure_categories={exc.code: 1},
                 deferred=exc.code == "execution_busy", backlog=None, integration_id=integration_id,
             )
+        # One absolute deadline for the whole run. It travels with the execution so every sink and
+        # reconcile call — limiter wait, request and retry — is bounded by the same instant.
+        run_deadline = time.monotonic() + _RUN_DEADLINE_SECONDS
+        execution = dataclasses.replace(execution, run_deadline=run_deadline)
         try:
             config = execution.config
             conn = effective_gdrive_connection(conn, config, integration_id)
@@ -231,7 +281,8 @@ async def run_gdrive_stream(
                     total.authoritative_complete = True
                     total.backlog = 0
                 except BrainError as exc:
-                    total.failed += 1
+                    if not isinstance(exc, BrainDeferred):
+                        total.failed += 1
                     total.failure_categories[exc.code] = 1
                 return total
             auth_mode = str(options.get("auth_mode") or "oauth")
@@ -264,7 +315,6 @@ async def run_gdrive_stream(
             source = GoogleDriveSource(
                 **source_options, provider_gate=provider_gate, token_provider=token_provider,
             )
-            run_deadline = time.monotonic() + _RUN_DEADLINE_SECONDS
             if hasattr(source, "set_run_deadline"):
                 source.set_run_deadline(run_deadline)
             drive, _ = source._services()
@@ -285,7 +335,32 @@ async def run_gdrive_stream(
                     return IngestSummary(conn.name, failed=1, failure_categories={exc.category: 1})
             generation = execution.generation
             total = IngestSummary(conn.name, failure_categories={}, integration_id=integration_id)
-            streams = _stream_ids(options)
+            # Which streams exist depends on where each selected root lives, so every root is bound
+            # before any start token is captured. An unreadable root has no known stream: nothing
+            # is enumerated on a guess, and the generation resumes binding on the next run.
+            try:
+                root_bindings = _bind_selected_roots(
+                    source, state, integration_id, generation, options,
+                )
+            except BrainError as exc:
+                total.failed += 1
+                total.failure_categories[exc.code] = 1
+                return total
+            except ProviderDeferred as exc:
+                total.failed += 1
+                total.failure_categories[exc.category] = 1
+                return total
+            except Exception:
+                total.failed += 1
+                total.failure_categories["selection_root_unresolved"] = 1
+                return total
+            # A stream this generation already consumes stays accounted for, so local state written
+            # before roots were bound cannot leave a cursor that no run ever finishes.
+            streams = sorted(
+                {*_stream_ids(options, root_bindings),
+                 *(progress.key.drive_id for progress in state.list_progress(integration_id, generation))},
+                key=lambda value: (value != "my-drive", value),
+            )
             if not streams:
                 total.failed = 1
                 total.failure_categories["selection_unresolved"] = 1
@@ -342,6 +417,7 @@ async def run_gdrive_stream(
                     retry_budget=_MAX_RETRY_WORK_PER_STREAM,
                     run_deadline=run_deadline,
                     provider_gate=provider_gate,
+                    root_bindings=root_bindings,
                 )
                 _merge_summary(total, part)
                 # Fresh capacity is reserved independently of retries/failures. Debiting the
@@ -385,16 +461,22 @@ async def run_gdrive_stream(
                         )
                     total.authoritative_complete = True
                 except BrainError as exc:
-                    total.failed += 1
+                    # A reconciliation the rate limit or the run deadline deferred is not a failed
+                    # one: every stream stays complete-pending, a staged snapshot keeps the pages
+                    # the brain already holds, and the next run continues from them.
+                    if not isinstance(exc, BrainDeferred):
+                        total.failed += 1
                     total.failure_categories[exc.code] = total.failure_categories.get(exc.code, 0) + 1
             # Report only coordinator evidence, never infer zero from counters. A partial listing,
-            # deferred retry, or uncommitted page is backlog even when this run processed no docs.
+            # deferred retry, uncommitted page, or unacknowledged notification is backlog even when
+            # this run processed no docs.
             progresses = state.list_progress(integration_id, generation)
             if len(progresses) == len(streams):
                 total.backlog = sum(
                     state.pending_count(progress.namespace, generation)
                     + (1 if state.next_uncommitted_page(progress.namespace, generation) else 0)
                     + (1 if progress.building_snapshot is not None or progress.recovery_required else 0)
+                    + (1 if state.pending_stream_hint(progress.key) is not None else 0)
                     for progress in progresses
                 )
                 if not total.authoritative_complete and total.backlog == 0:
@@ -448,11 +530,14 @@ async def _run_gdrive_stream_unlocked(
     retry_budget: int | None = None,
     run_deadline: float | None = None,
     provider_gate=None,
+    root_bindings: dict[tuple[str, str], str] | None = None,
 ) -> IngestSummary:
     discovery_budget = max(0, discovery_budget if discovery_budget is not None else max_work)
     retry_budget = max(0, retry_budget if retry_budget is not None else min(max_work, 10))
     if run_deadline is not None and hasattr(source, "set_run_deadline"):
         source.set_run_deadline(run_deadline)
+    if run_deadline is not None and execution.run_deadline is None:
+        execution = dataclasses.replace(execution, run_deadline=run_deadline)
     key = StreamKey(settings.team, execution.integration_id, credential_identity(options), drive_id)
     progress = state.get_progress(namespace)
     had_local_progress = progress is not None
@@ -569,7 +654,7 @@ async def _run_gdrive_stream_unlocked(
                 kwargs["driveId"] = drive_id
             fresh = source._execute(drive.changes().getStartPageToken(**kwargs))["startPageToken"]
             state.begin_selection_snapshot(
-                namespace, generation, _configured_roots(options, drive_id),
+                namespace, generation, _configured_roots(options, drive_id, root_bindings),
             )
             await _checkpoint_progress(
                 client, execution, state, namespace, phase="baselining",
@@ -620,6 +705,7 @@ async def _run_gdrive_stream_unlocked(
                     client, execution, source, drive, options, state, namespace, generation,
                     drive_id, conn, summary,
                     max(0, fresh_remaining), discovery_budget,
+                    root_bindings=root_bindings,
                 )
                 fresh_remaining = max(0, fresh_remaining - consumed)
             except BrainError:
@@ -685,6 +771,11 @@ async def _run_gdrive_stream_unlocked(
                 terminal_drain_acknowledged=False, terminal_drain_observation=None,
             )
             progress = state.get_progress(namespace)
+        # A notification is acknowledged only by a drain that began after it: read the sequence
+        # BEFORE the first change page, and acknowledge exactly that sequence once a page read in
+        # this run reaches the terminal token. A notification arriving meanwhile stays pending.
+        observed_hint = state.pending_stream_hint(key)
+        drained_to_terminal = False
         pages_read = 0
         while token and pages_read < discovery_budget:
             if run_deadline is not None and time.monotonic() >= run_deadline:
@@ -905,7 +996,10 @@ async def _run_gdrive_stream_unlocked(
             token = materialized.next_token or materialized.terminal_token or token
             terminal = materialized.terminal_token and not materialized.next_token
             if terminal:
+                drained_to_terminal = True
                 break
+        if observed_hint is not None and drained_to_terminal:
+            state.ack_stream_hint(key, observed_hint)
         if state.pending_count(namespace, generation):
             await _checkpoint_progress(
                 client, execution, state, namespace, phase="partial",
@@ -936,6 +1030,8 @@ async def _enumerate_baseline(
     summary: IngestSummary,
     work_budget: int,
     discovery_budget: int,
+    *,
+    root_bindings: dict[tuple[str, str], str] | None = None,
 ) -> tuple[bool, int]:
     """Durably enumerate selected roots and process bounded extraction obligations."""
     work_consumed = 0
@@ -943,7 +1039,7 @@ async def _enumerate_baseline(
     page_budget = max(0, discovery_budget)
     roots = state.list_roots(namespace, generation)
     if not roots:
-        configured = _configured_roots(options, drive_id)
+        configured = _configured_roots(options, drive_id, root_bindings)
         state.replace_roots(namespace, generation, configured)
         roots = state.list_roots(namespace, generation)
     snapshot_id = state.snapshot_id(namespace)
@@ -964,7 +1060,19 @@ async def _enumerate_baseline(
             pages_read += 1
             obligations: list[tuple[str, str, dict[str, Any]]] = []
             membership_additions: list[tuple[str, str, str]] = []
-            if not meta.get("trashed") and meta.get("mimeType") == GOOGLE_DOC_MIME:
+            bound_drive = (root_bindings or {}).get(("file", str(root["root_id"])))
+            if bound_drive is not None and bound_drive != drive_id:
+                # Retained from local state written before roots were bound: the stream of the
+                # drive that contains this root owns it now. Its page here records nothing.
+                pass
+            elif bound_drive is not None and str(meta.get("driveId") or "my-drive") != drive_id:
+                # This stream's cursor can no longer observe the document. Reading it once here
+                # and then reporting the stream current would hide every later edit, so the
+                # baseline stays partial until the selection is saved again and rebound.
+                raise SelectedRootRelocated(
+                    f"selected file {root['root_id']} is no longer in the drive it was bound to"
+                )
+            elif not meta.get("trashed") and meta.get("mimeType") == GOOGLE_DOC_MIME:
                 actual_drive = str(meta.get("driveId") or drive_id)
                 membership_additions.append((str(meta["id"]), root["root_id"], actual_drive))
                 if not state.has_membership(
@@ -1194,7 +1302,8 @@ async def _push_doc(
     generation: int,
     summary: IngestSummary,
     work: PendingWork | None = None,
-) -> None:
+) -> bool:
+    """Push one document. Returns False only when the run's deadline deferred the sink call."""
     doc.extra_frontmatter["connection_id"] = execution.integration_id
     doc.extra_frontmatter.setdefault("scope_generation", generation)
     work = work or next((w for w in state.list_pending(namespace, generation, limit=1000)
@@ -1209,13 +1318,24 @@ async def _push_doc(
         summary.failure_categories["incomplete_extraction"] = summary.failure_categories.get("incomplete_extraction", 0) + 1
         if work:
             state.fail_work(work, detail, not_before=_defer_until())
-        return
+        return True
     if work and not state.work_membership_current(work):
         # A newer remove/move observation won while extraction was in flight. Never let the stale
         # body reach the sink; the newer durable obligation remains independently runnable.
-        return
+        return True
     try:
-        result = await client.push(normalize(doc, conn.normalize_config()), execution=execution)
+        item = normalize(doc, conn.normalize_config())
+    except ValidationError as exc:
+        # The document cannot be expressed as an item at all (an over-long body, title or path).
+        # That is this document's failure, not the run's: it stays durable and retryable, and the
+        # obligations after it still run.
+        summary.failed += 1
+        summary.failure_categories["invalid_payload"] = summary.failure_categories.get("invalid_payload", 0) + 1
+        if work:
+            state.fail_work(work, _validation_detail(exc), not_before=_defer_until())
+        return True
+    try:
+        result = await client.push(item, execution=execution)
         setattr(summary, result.status, getattr(summary, result.status) + 1)
         if work:
             progress = state.get_progress(namespace)
@@ -1225,10 +1345,8 @@ async def _push_doc(
     except BrainError as exc:
         if _is_terminal_authority(exc):
             raise
-        summary.failed += 1
-        summary.failure_categories[exc.code] = summary.failure_categories.get(exc.code, 0) + 1
-        if work:
-            state.fail_work(work, str(exc), not_before=_defer_until())
+        return _record_sink_failure(state, work, exc, summary)
+    return True
 
 
 async def _drain_pending(
@@ -1248,6 +1366,11 @@ async def _drain_pending(
     for work in state.list_pending(
         namespace, generation, limit=max(1, budget), work_class=work_class,
     )[:budget]:
+        if _run_deadline_reached(execution):
+            # Out of time is not a failure of the work that was never started: it is left exactly
+            # as it was, and no further provider or sink call is made in this drain.
+            summary.failure_categories.setdefault("run_deadline", 1)
+            break
         if not state.work_is_current(work):
             continue
         consumed += 1
@@ -1270,9 +1393,8 @@ async def _drain_pending(
             except BrainError as exc:
                 if _is_terminal_authority(exc):
                     raise
-                state.fail_work(work, str(exc), not_before=_defer_until())
-                summary.failed += 1
-                summary.failure_categories[exc.code] = summary.failure_categories.get(exc.code, 0) + 1
+                if not _record_sink_failure(state, work, exc, summary):
+                    break
             continue
         try:
             if not state.work_membership_current(work):
@@ -1322,8 +1444,44 @@ async def _drain_pending(
             summary.failed += 1
             summary.failure_categories["provider_read"] = summary.failure_categories.get("provider_read", 0) + 1
             continue
-        await _push_doc(client, execution, doc, conn, state, namespace, generation, summary, work)
+        if not await _push_doc(
+            client, execution, doc, conn, state, namespace, generation, summary, work,
+        ):
+            break
     return consumed
+
+
+def _run_deadline_reached(execution: GdriveExecution) -> bool:
+    return execution.run_deadline is not None and time.monotonic() >= execution.run_deadline
+
+
+def _record_sink_failure(
+    state: StateStore, work: PendingWork | None, exc: BrainError, summary: IngestSummary,
+) -> bool:
+    """Keep one obligation durable and retryable after its sink or reconcile call failed.
+
+    Returns False when the run's deadline deferred the call: the sink will not take more work
+    before that deadline, so the caller starts none. A call the deadline stopped before it was
+    sent was never an attempt and leaves the obligation untouched; a wait the brain named
+    (``Retry-After``) that does not fit is retried no earlier than that.
+    """
+    summary.failure_categories[exc.code] = summary.failure_categories.get(exc.code, 0) + 1
+    deferred = isinstance(exc, BrainDeferred)
+    not_before = exc.not_before if isinstance(exc, BrainDeferred) else None
+    if deferred and not_before is None:
+        return False
+    summary.failed += 1
+    if work:
+        state.fail_work(work, str(exc), not_before=not_before or _defer_until())
+    return not deferred
+
+
+def _validation_detail(exc: ValidationError) -> str:
+    """Field and rule only: pydantic's own message would copy the offending text into state."""
+    return "invalid item payload: " + ", ".join(
+        f"{'.'.join(str(part) for part in error.get('loc', ()))} ({error.get('type', 'invalid')})"
+        for error in exc.errors()
+    )
 
 
 def _metadata_in_current_selection(
