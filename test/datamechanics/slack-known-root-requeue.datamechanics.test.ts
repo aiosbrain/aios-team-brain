@@ -6723,12 +6723,18 @@ describe("KR-10 a failed page read supplies no continuation", () => {
  * preparation; no queue row and no staging in any team; the entry byte-identical.
  *
  * WHAT IS REPORTED, AND WHAT IS NOT. Every value handed to an assertion here is a fixed label, a
- * closed outcome or reason name, a table name, a count or a boolean. A snapshot is a per-table row
- * count and digest COMPUTED BY THE DATABASE: no row content, token, ciphertext, fingerprint,
- * revision, path or id is read into an assertion, and a comparison of two such values is reported
- * as the names of the tables that differ. Tokens, ciphertext, fingerprints and revisions that a
- * fixture must hold are held privately and only ever compared with each other. A preparation that
- * throws is reported as the exported classifier's closed failure category.
+ * closed outcome or reason name, a table name, a count or a boolean, with one bounded exception.
+ * The case that changes a binding's state alone reads that row's stored `state` and `error_code`
+ * back, before and after the change, and hands them to one assertion. Those two readbacks are the
+ * only row content of a binding, an integration, a channel, an item or the ledger handed to an
+ * assertion, and the schema bounds both columns: to a closed set of states, and to a sanitized
+ * category or null. The namespace cases likewise report the gate's `state`, which is one of two
+ * closed names. A snapshot is a per-table row count and digest COMPUTED BY THE DATABASE, and a
+ * comparison of two such values is reported as the names of the tables that differ. No token,
+ * ciphertext, fingerprint, revision, path or id is handed to an assertion. Tokens, ciphertext,
+ * fingerprints and revisions that a fixture must hold are held privately and only ever compared
+ * with each other. A preparation that throws is reported as the exported classifier's closed
+ * failure category.
  *
  * FIXTURE DML IS LABELED, AND IS NOT A PRODUCT PATH. Each change is one statement on one fact, so
  * that the refusal can be attributed to it; the surfaces it altered are read back and must be
