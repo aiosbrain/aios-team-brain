@@ -1053,10 +1053,18 @@ async def _run_gdrive_stream_unlocked(
                     client, execution, state, namespace, exc, unavailable,
                 )
                 return unavailable
-            state.begin_selection_snapshot(
+            # A build left unfinished was enumerated under another token, or under none. A folder
+            # it already listed is not listed again by resuming it, and a document that entered
+            # that folder before this token is in no change after it. So the build is superseded,
+            # never resumed: every root is listed again under new page identities, and no page
+            # read before this token can move the cursor or end the drain that has to follow. The
+            # published membership and every document obligation stay until the replacement is
+            # published.
+            state.restart_selection_snapshot(
                 namespace, generation, _stream_roots(
                     state, execution.integration_id, generation, options, drive_id, root_bindings,
                 ),
+                start_token=fresh,
             )
             await _checkpoint_progress(
                 client, execution, state, namespace, phase="baselining",
@@ -1067,7 +1075,7 @@ async def _run_gdrive_stream_unlocked(
                 ) else None),
                 checkpoint_id=None, terminal_drain_token=None,
                 terminal_drain_checkpoint_id=None, terminal_drain_acknowledged=False,
-                drain_observation=progress.drain_observation + 1,
+                drain_observation=state.get_progress(namespace).drain_observation,
                 terminal_drain_observation=None,
             )
             progress = state.get_progress(namespace)
@@ -1265,14 +1273,14 @@ async def _run_gdrive_stream_unlocked(
                         client, execution, state, namespace, exc, summary,
                     )
                     return summary
-                state.reset_selection_snapshot(namespace, generation)
+                state.reset_selection_snapshot(namespace, generation, start_token=fresh)
                 await _checkpoint_progress(
                     client, execution, state, namespace, phase="baselining",
                     baseline_start_token=fresh, page_token=None, listing_complete=False,
                     last_error="invalid cursor; controlled rescan",
                     terminal_drain_token=None, terminal_drain_checkpoint_id=None,
                     terminal_drain_acknowledged=False,
-                    drain_observation=(state.get_progress(namespace).drain_observation + 1),
+                    drain_observation=state.get_progress(namespace).drain_observation,
                     terminal_drain_observation=None,
                 )
                 summary.failed += 1

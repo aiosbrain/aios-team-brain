@@ -5940,6 +5940,296 @@ async def test_stream_record_left_without_a_token_by_an_interrupted_run_is_unsta
 
 
 # ---------------------------------------------------------------------------------------------
+# A build begun under one token is never resumed under another
+# ---------------------------------------------------------------------------------------------
+#
+# Spec. A snapshot build is evidence only together with the token it was begun under: what it
+# listed, and every change after that token. A recovery that captures a new token — for a record
+# that holds none, or one whose local state is not what the brain acknowledged — resumes nothing
+# of a build left unfinished. A folder that build had listed is listed again, because a document
+# that entered it before the new token is in no change after it. Until the replacement is
+# published the last published membership and every document obligation stand, and the
+# connection reconciles only after a change page read from the new token reaches the terminal
+# token. A drive that refuses the token changes nothing the stream holds.
+
+
+async def _unfinished_rescan_with_a_listed_folder(tmp_path, monkeypatch, name, *, seeded_by):
+    """A published snapshot, and a rescan of it that listed ``folder-r`` and then stopped.
+
+    The rescan is begun by a rejected cursor, or seeded by a change page that reports a folder of
+    the subtree and cannot retire before that rescan is published.
+    """
+    world = _DriveWorld(folder_ids=["folder-r"]).install(monkeypatch)
+    world.put("folder-r", drive="shared-a", folder=True)
+    world.put("folder-n", drive="shared-a", parent="folder-r", folder=True)
+    world.put("doc-1", drive="shared-a", parent="folder-r")
+    world.put("doc-2", drive="shared-a", parent="folder-n")
+    path = str(tmp_path / name)
+    state = StateStore(path)
+    namespace = world.namespace("shared-a")
+    assert (await world.run(state)).authoritative_complete is True
+    assert world.reconciled == [["doc-1", "doc-2"]]
+    published = state.get_progress(namespace).active_snapshot
+
+    if seeded_by == "invalid_cursor":
+        world.cursor_errors["shared-a"] = ProviderCursorInvalid("expired")
+        assert (await world.run(state)).failure_categories.get("invalid_cursor") == 1
+        world.cursor_errors.clear()
+    else:
+        world.logs["shared-a"].append({"fileId": "folder-n", "file": dict(world.files["folder-n"])})
+        await world.run(state)
+        assert state.next_uncommitted_page(namespace, 9).rescan_snapshot_id is not None
+    build = state.get_progress(namespace).building_snapshot
+    assert build is not None and build != published
+
+    # The rescan lists `folder-r`, finding a document it cannot read yet, and the listing of
+    # `folder-n` then fails: one folder listed, one obligation owed, and the build unfinished.
+    world.put("doc-3", drive="shared-a", parent="folder-r")
+    world.unreadable["doc-3"] = _ProviderHttpError(500)
+
+    def listing_fails():
+        raise _ProviderHttpError(500)
+
+    world.hooks[("list", "shared-a", "folder-n")] = listing_fails
+    world.calls.clear()
+    await world.run(state)
+
+    assert ("list", "shared-a", "folder-r") in world.calls
+    assert state.next_traversal(namespace, 9)["folder_id"] == "folder-n"
+    assert state.get_progress(namespace).building_snapshot == build
+    assert state.membership_ids(namespace, 9) == ["doc-1", "doc-2"]
+    assert [row[0] for row in _pending_rows(state, namespace)] == ["doc-3"]
+    assert world.reconciled == [["doc-1", "doc-2"]] and world.removed == []
+    return world, path, state, published, build
+
+
+def _lose_stream_tokens(world, state, namespace):
+    """The record keeps what was enumerated through it and loses both of its change tokens."""
+    state.update_progress(namespace, baseline_start_token=None, page_token=None)
+    world.progress["streams"]["shared-a"].update(baseline_start_token=None, page_token=None)
+
+
+def _quota_deferral():
+    return ProviderDeferred("quota", not_before="2000-01-01T00:00:00+00:00", category="rate_limited")
+
+
+@pytest.mark.parametrize("status", [403, 404])
+@pytest.mark.parametrize("lost", ["tokens", "checkpoint"])
+@pytest.mark.asyncio
+async def test_recovery_under_a_fresh_token_lists_again_what_an_unfinished_build_already_listed(
+    tmp_path, monkeypatch, status, lost,
+):
+    world, path, state, published, build = await _unfinished_rescan_with_a_listed_folder(
+        tmp_path, monkeypatch, f"fresh-token-unfinished-build-{lost}-{status}.sqlite",
+        seeded_by="invalid_cursor",
+    )
+    namespace = world.namespace("shared-a")
+    diagnostic = _start_diagnostic("shared-a", status)
+
+    # A document enters the folder the build has already listed, and only then is a recovery
+    # owed: the record loses its tokens, or the brain's checkpoint names a page this sidecar never
+    # retired. The token that recovery will capture is past the document's change.
+    world.put("doc-late", drive="shared-a", parent="folder-r")
+    world.logs["shared-a"].append({"fileId": "doc-late", "file": dict(world.files["doc-late"])})
+    fresh = "shared-a@1"
+    if lost == "tokens":
+        _lose_stream_tokens(world, state, namespace)
+    else:
+        world.progress["streams"]["shared-a"]["checkpoint_id"] = "page-this-sidecar-never-retired"
+        world.revision += 1
+    held = state.get_progress(namespace)
+    world.token_errors["shared-a"] = _ProviderHttpError(status)
+
+    for _run in range(2):
+        state.close()
+        state = StateStore(path)
+        world.calls.clear()
+        denied = await world.run(state)
+
+        assert denied.failed == 1 and denied.failure_categories == {"stream_start_unavailable": 1}
+        assert ("start", "shared-a") in world.calls
+        assert not [call for call in world.calls if call[0] in {"changes", "list", "doc"}]
+        local = state.get_progress(namespace)
+        assert local.last_error == diagnostic
+        assert world.stream("shared-a")["last_error"] == diagnostic
+        # The refusal gave nothing up: the tokens the record held, the published membership, the
+        # unfinished build and where it stopped, and the obligation it owes.
+        assert (local.baseline_start_token, local.page_token) == (
+            held.baseline_start_token, held.page_token,
+        )
+        assert (local.active_snapshot, local.building_snapshot) == (published, build)
+        assert state.membership_ids(namespace, 9) == ["doc-1", "doc-2"]
+        assert state.next_traversal(namespace, 9)["folder_id"] == "folder-n"
+        assert [row[0] for row in _pending_rows(state, namespace)] == ["doc-3"]
+        assert world.reconciled == [["doc-1", "doc-2"]] and world.removed == []
+        assert denied.authoritative_complete is False
+        assert denied.backlog is not None and denied.backlog > 0
+
+    # The drive issues a token. It is captured before anything is listed, and the folder the
+    # build had listed is listed again under it, so the document that entered it before the token
+    # is found. The first change page from that token cannot be read in this run.
+    del world.token_errors["shared-a"]
+    del world.unreadable["doc-3"]
+    world.change_errors["shared-a"] = [_quota_deferral()]
+    state.close()
+    state = StateStore(path)
+    world.calls.clear()
+    world.pushed.clear()
+    recovered = await world.run(state)
+
+    assert (world.calls.index(("start", "shared-a"))
+            < world.calls.index(("list", "shared-a", "folder-r"))
+            < world.calls.index(("list", "shared-a", "folder-n")))
+    assert [call for call in world.calls if call[0] == "changes"] == [("changes", "shared-a", fresh)]
+    progress = state.get_progress(namespace)
+    # What was published is a new incarnation: neither the prior snapshot nor the build.
+    assert progress.active_snapshot not in {published, build} and progress.building_snapshot is None
+    assert progress.listing_complete is True and progress.recovery_required is False
+    assert (progress.baseline_start_token, progress.page_token) == (fresh, fresh)
+    assert state.membership_ids(namespace, 9) == ["doc-1", "doc-2", "doc-3", "doc-late"]
+    assert sorted(world.pushed) == ["doc-1", "doc-2", "doc-3", "doc-late"]
+    assert state.pending_count(namespace, 9) == 0
+    # Published is not drained: no terminal page has been read from the new token, locally or on
+    # the brain, and the connection reconciles to nothing yet.
+    assert progress.terminal_drain_acknowledged is False
+    assert world.stream("shared-a")["terminal_drain_acknowledged"] is False
+    assert recovered.failure_categories == {"rate_limited": 1}
+    assert recovered.authoritative_complete is False
+    assert recovered.backlog is not None and recovered.backlog > 0
+    assert world.reconciled == [["doc-1", "doc-2"]] and world.removed == []
+
+    # A restart: the drain is still owed. The page from the new token is read, it is terminal, and
+    # only then does the connection reconcile — to a membership that holds the late document.
+    state.close()
+    state = StateStore(path)
+    world.calls.clear()
+    world.pushed.clear()
+    drained = await world.run(state)
+
+    assert [call for call in world.calls if call[0] in {"changes", "list"}] == [
+        ("changes", "shared-a", fresh),
+    ]
+    assert world.pushed == []
+    assert state.get_progress(namespace).terminal_drain_acknowledged is True
+    assert drained.failed == 0 and drained.authoritative_complete is True and drained.backlog == 0
+    assert world.reconciled == [["doc-1", "doc-2"], ["doc-1", "doc-2", "doc-3", "doc-late"]]
+    assert world.removed == []
+    assert world.stream("shared-a")["phase"] == "current"
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_change_page_read_before_a_fresh_token_neither_moves_the_cursor_nor_ends_its_drain(
+    tmp_path, monkeypatch,
+):
+    world, path, state, published, build = await _unfinished_rescan_with_a_listed_folder(
+        tmp_path, monkeypatch, "fresh-token-stale-change-page.sqlite", seeded_by="folder_change",
+    )
+    namespace = world.namespace("shared-a")
+    # The page that seeded the build waits on it, holding the cursor the stream would move to.
+    seeding = state.next_uncommitted_page(namespace, 9)
+    assert seeding.page_kind == "changes" and seeding.rescan_snapshot_id == build
+    assert seeding.terminal_token == "shared-a@1" and seeding.next_token is None
+
+    world.put("doc-late", drive="shared-a", parent="folder-r")
+    world.logs["shared-a"].append({"fileId": "doc-late", "file": dict(world.files["doc-late"])})
+    fresh = "shared-a@2"
+    _lose_stream_tokens(world, state, namespace)
+    del world.unreadable["doc-3"]
+    world.change_errors["shared-a"] = [_quota_deferral()]
+    state.close()
+    state = StateStore(path)
+    world.calls.clear()
+    recovered = await world.run(state)
+
+    assert (world.calls.index(("start", "shared-a"))
+            < world.calls.index(("list", "shared-a", "folder-r")))
+    # The page read before the token is retired with the build it waited on. Its cursor is never
+    # read: the only change page asked for is the one from the new token.
+    assert state.next_uncommitted_page(namespace, 9) is None
+    assert state.get_page(namespace, 9, seeding.page_id).committed_at is not None
+    assert [call for call in world.calls if call[0] == "changes"] == [("changes", "shared-a", fresh)]
+    progress = state.get_progress(namespace)
+    assert progress.active_snapshot not in {published, build} and progress.building_snapshot is None
+    assert (progress.baseline_start_token, progress.page_token) == (fresh, fresh)
+    assert progress.checkpoint_id != seeding.page_id
+    assert state.membership_ids(namespace, 9) == ["doc-1", "doc-2", "doc-3", "doc-late"]
+    # Nothing that page said ends the drain the new token owes.
+    assert progress.terminal_drain_acknowledged is False
+    assert world.stream("shared-a")["terminal_drain_acknowledged"] is False
+    assert recovered.authoritative_complete is False
+    assert recovered.backlog is not None and recovered.backlog > 0
+    assert world.reconciled == [["doc-1", "doc-2"]] and world.removed == []
+
+    state.close()
+    state = StateStore(path)
+    world.calls.clear()
+    drained = await world.run(state)
+
+    assert [call for call in world.calls if call[0] in {"changes", "list"}] == [
+        ("changes", "shared-a", fresh),
+    ]
+    assert state.get_progress(namespace).terminal_drain_acknowledged is True
+    assert drained.failed == 0 and drained.authoritative_complete is True and drained.backlog == 0
+    assert world.reconciled == [["doc-1", "doc-2"], ["doc-1", "doc-2", "doc-3", "doc-late"]]
+    assert world.removed == []
+    state.close()
+
+
+def test_restarted_snapshot_supersedes_the_unfinished_build_and_retires_the_pages_before_it(tmp_path):
+    state = StateStore(str(tmp_path / "restarted-snapshot.sqlite"))
+    key = StreamKey("team", "connection", "account", "shared-a")
+    peer = StreamKey("team", "connection", "account", "shared-b").namespace(4)
+    namespace = state.begin_generation(key, 4, start_token="old-start").namespace
+    roots = [("folder", "folder", "shared-a", True)]
+    build = state.begin_selection_snapshot(namespace, 4, roots)
+    state.materialize_page(
+        namespace, 4, "baseline:folder", "baseline", None, None, None,
+        [("doc-acked", "upsert", {"file_id": "doc-acked"}),
+         ("doc-owed", "upsert", {"file_id": "doc-owed"})],
+        snapshot_id=build,
+        membership_additions=[
+            ("doc-acked", "folder", "shared-a", "folder"),
+            ("doc-owed", "folder", "shared-a", "folder"),
+        ],
+        traversal_completion=("folder", "folder", None),
+    )
+    work = {item.item_key: item for item in state.list_pending(namespace, 4)}
+    state.ack_work(work["doc-acked"])
+    state.materialize_page(
+        namespace, 4, "changes:old-cursor", "changes", "old-cursor", None, "old-terminal", [],
+        snapshot_id=build,
+    )
+    before = state.get_progress(namespace)
+
+    # Under the token it was begun with, the build is resumed: its folder stays listed.
+    assert state.begin_selection_snapshot(namespace, 4, roots) == build
+    assert state.next_traversal(namespace, 4) is None
+
+    restarted = state.restart_selection_snapshot(namespace, 4, roots, start_token="fresh-start")
+
+    progress = state.get_progress(namespace)
+    assert restarted > build and progress.building_snapshot == restarted
+    assert (progress.baseline_start_token, progress.page_token) == ("fresh-start", None)
+    assert progress.drain_observation == before.drain_observation + 1
+    assert progress.terminal_drain_acknowledged is False
+    # Nothing of the build is carried over, and it can never be published.
+    assert state.next_traversal(namespace, 4)["folder_id"] == "folder"
+    assert state.membership_ids(namespace, 4, snapshot_id=restarted) == []
+    assert state.snapshot_build_complete(namespace, 4, build) is False
+    # No page read before the token is left to finish; the work those pages owed is still owed.
+    assert state.next_uncommitted_page(namespace, 4) is None
+    assert [row[0] for row in _pending_rows(state, namespace)] == ["doc-owed"]
+    assert state.work_membership_current(work["doc-owed"]) is True
+    # What the superseded build listed stays claimed until its replacement is published without it.
+    assert state.claimed_elsewhere("connection", 4, peer, "doc-acked") is True
+    state.complete_traversal(namespace, 4, "folder", "folder", None, snapshot_id=restarted)
+    state.publish_selection_snapshot(namespace, 4, restarted)
+    assert state.claimed_elsewhere("connection", 4, peer, "doc-acked") is False
+    state.close()
+
+
+# ---------------------------------------------------------------------------------------------
 # A removal is weighed against the whole roster, and waits on every peer it could have moved to
 # ---------------------------------------------------------------------------------------------
 #
