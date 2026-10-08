@@ -6,6 +6,7 @@ import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
+from types import SimpleNamespace
 
 import httpx
 from aios_ingest.sources.gdrive_docs import extract_google_doc
@@ -30,6 +31,7 @@ from aios_ingest.gdrive_sync import (
     _configured_roots,
     _drain_pending,
     _finish_materialized_pages,
+    _push_doc,
     _run_deadline_reached,
     _run_gdrive_stream_unlocked,
     read_change_page,
@@ -4491,7 +4493,9 @@ class _DriveWorld:
     in ``calls``, in order; the brain records what it is pushed, told to remove, and reconciled to.
     """
 
-    def __init__(self, *, file_ids=(), folder_ids=(), generation=9):
+    def __init__(self, *, file_ids=(), folder_ids=(), generation=9,
+                 integration_id=_WORLD_INTEGRATION):
+        self.integration_id = integration_id
         self.config = {
             "authMode": "oauth", "authenticatedAccountId": "account",
             "fileIds": list(file_ids), "folderIds": list(folder_ids), "sharedDriveIds": [],
@@ -4509,6 +4513,10 @@ class _DriveWorld:
         # the process dying there; and whether the brain acknowledges with its own copy of what
         # it stored, as a real HTTP round trip does, instead of the object it was handed.
         self.checkpoint_crashes, self.ack_copies = {}, False
+        # Documents whose required content is missing; checkpoints to fail by what they say — each
+        # a callable given the payload, returning the error to raise, once; and the brain's record
+        # of which connection claims what, when more than one connection is modelled.
+        self.malformed, self.checkpoint_faults, self.ledger = set(), [], None
 
     def put(self, file_id, *, drive, parent=None, folder=False):
         self.files[file_id] = {
@@ -4529,7 +4537,7 @@ class _DriveWorld:
             )
 
     def namespace(self, drive_id):
-        return StreamKey("team", _WORLD_INTEGRATION, "account", drive_id).namespace(self.generation)
+        return StreamKey("team", self.integration_id, "account", drive_id).namespace(self.generation)
 
     def stream(self, drive_id):
         """One stream as the brain durably holds it."""
@@ -4600,6 +4608,8 @@ class _DriveWorld:
 
             def _raw_doc(self, meta):
                 world.calls.append(("doc", meta["id"]))
+                if meta["id"] in world.malformed:
+                    raise IncompleteExtractionError("required content is missing")
                 return RawDoc(source="gdrive", external_id=meta["id"], title=meta["name"], body="body")
 
         class Client:
@@ -4622,6 +4632,11 @@ class _DriveWorld:
             async def checkpoint_gdrive_execution(self, execution, progress):
                 if world.checkpoint_crashes.get(progress.get("drive_id")):
                     raise world.checkpoint_crashes[progress["drive_id"]].pop(0)
+                for fault in list(world.checkpoint_faults):
+                    error = fault(progress)
+                    if error is not None:
+                        world.checkpoint_faults.remove(fault)
+                        raise error
                 world.revision += 1
                 world.progress = json.loads(json.dumps(progress))
                 acknowledged = json.loads(json.dumps(progress)) if world.ack_copies else progress
@@ -4629,12 +4644,20 @@ class _DriveWorld:
 
             async def push(self, payload, *, execution):
                 world.pushed.append(payload.frontmatter["source_id"])
+                if world.ledger is not None:
+                    world.ledger.push(execution.integration_id, payload.frontmatter["source_id"])
                 return IngestResult("created", "item", payload.path)
 
             async def reconcile_gdrive(self, execution, **kwargs):
                 world.removed.extend(kwargs.get("removed_provider_ids") or [])
                 if kwargs.get("complete_snapshot_ids") is not None:
                     world.reconciled.append(list(kwargs["complete_snapshot_ids"]))
+                if world.ledger is not None:
+                    world.ledger.reconcile(
+                        execution.integration_id,
+                        removed=kwargs.get("removed_provider_ids") or (),
+                        complete=kwargs.get("complete_snapshot_ids"),
+                    )
                 return {"items": 0}
 
             async def release_gdrive_execution(self, execution): pass
@@ -4646,7 +4669,7 @@ class _DriveWorld:
     async def run(self, state):
         return await run_gdrive_stream(
             BrainSettings("http://brain", "key", "team"),
-            Connection("docs", "gdrive", options={"integration_id": _WORLD_INTEGRATION}), state,
+            Connection("docs", "gdrive", options={"integration_id": self.integration_id}), state,
         )
 
 
@@ -6746,4 +6769,719 @@ async def test_retired_orphan_stream_is_gone_from_the_brains_own_copy_and_stays_
     assert [p.key.drive_id for p in state.list_progress(_WORLD_INTEGRATION, 9)] == ["shared-a"]
     assert again.failed == 0 and again.authoritative_complete is True and again.backlog == 0
     assert world.removed == []
+    state.close()
+
+
+# ---------------------------------------------------------------------------------------------
+# What a replaced snapshot owed ends when its replacement is published without the document
+# ---------------------------------------------------------------------------------------------
+#
+# Spec. An upsert is owed under the snapshot of the page that observed it, and that snapshot
+# answers for it — a build before it is published, the authoritative snapshot after — until a
+# replacement is published. Publication is one SQLite transaction, made after the brain
+# acknowledged it: an upsert a replaced snapshot still owed for a document the published one does
+# not hold is superseded there. It is never acknowledged, its page outcome names the snapshot
+# that superseded it, it is neither backlog nor a claim any more, and a work object read before
+# the publication cannot be pushed after it. An upsert for a document the replacement holds stays
+# owed until it is ingested. A replacement that is unfinished, or that the brain refused, changes
+# nothing; removals, their barriers and every other connection's obligations are untouched. The
+# sidecar removes nothing to clear backlog: what the brain holds ends only with the fenced
+# reconciliation of every stream, after a drain from the replacement's token reached the terminal
+# token — and only for the connection that reconciled.
+
+
+_SECOND_INTEGRATION = "00000000-0000-0000-0000-000000000042"
+_HELD = "2999-01-01T00:00:00+00:00"
+_ORIGINS = ("change-page", "superseded-build")
+_LOSSES = ("deleted", "trashed", "nested-folder-moved-out")
+
+
+class _ClaimLedger:
+    """The brain's side of overlapping connections: a document stands while any of them claims it.
+
+    A connection's claim begins with its push and ends only with its own reconciliation — a
+    removal it names, or a complete snapshot of its own that does not hold the document.
+    """
+
+    def __init__(self):
+        self.claims, self.retired, self.deleted = {}, [], []
+
+    def push(self, connection_id, provider_id):
+        self.claims.setdefault(provider_id, set()).add(connection_id)
+
+    def reconcile(self, connection_id, *, removed=(), complete=None):
+        for provider_id, holders in self.claims.items():
+            if connection_id not in holders:
+                continue
+            if provider_id in removed or (complete is not None and provider_id not in complete):
+                holders.discard(connection_id)
+                self.retired.append((connection_id, provider_id))
+                if not holders:
+                    self.deleted.append(provider_id)
+
+
+def _listing_fails():
+    raise _ProviderHttpError(500)
+
+
+def _retry_at(state, namespace, item_key, not_before):
+    """Hold one document's retry (a time far ahead) or let it arrive (``None``)."""
+    state._db.execute(
+        "update pending_work set not_before=? where namespace=? and item_key=?",
+        (not_before, namespace, item_key),
+    )
+    state._db.commit()
+
+
+def _upsert_rows(state, namespace, item_key):
+    """``(acknowledged, superseded)`` of the durable upsert row of one document."""
+    return [
+        (row["acknowledged_at"] is not None, row["superseded_at"] is not None)
+        for row in state._db.execute(
+            "select acknowledged_at,superseded_at from pending_work "
+            "where namespace=? and item_key=? and action='upsert'",
+            (namespace, item_key),
+        ).fetchall()
+    ]
+
+
+def _page_outcomes(state, namespace, item_key):
+    """Each page outcome of one document, in observation order, with the snapshot that ended it."""
+    return [
+        (row["status"], row["superseded_by_snapshot"])
+        for row in state._db.execute(
+            "select status,superseded_by_snapshot from page_obligation_outcomes "
+            "where namespace=? and item_key=? order by observation_revision",
+            (namespace, item_key),
+        ).fetchall()
+    ]
+
+
+async def _upsert_owed_under_a_snapshot_being_replaced(
+    tmp_path, monkeypatch, name, *, origin, loss, known=False, ledger=None,
+):
+    """A stream that owes ``doc-x`` an upsert, and whose snapshot is being replaced without it.
+
+    The upsert is owed from a change page of the published snapshot, or from a build that listed
+    the document and was left unfinished. Its retry is held. Before a fresh token is captured the
+    document is deleted, trashed, or its folder is moved out of the selected root; the recovery
+    that captures that token begins a replacement, which is left with nothing listed. ``known``
+    is a document the published snapshot already held and the brain had already ingested.
+    """
+    world = _DriveWorld(folder_ids=["folder-r"]).install(monkeypatch)
+    world.ledger = ledger
+    world.put("folder-r", drive="shared-a", folder=True)
+    world.put("folder-n", drive="shared-a", parent="folder-r", folder=True)
+    world.put("folder-z", drive="shared-a", parent="folder-r", folder=True)
+    world.put("doc-1", drive="shared-a", parent="folder-r")
+    if known:
+        world.put("doc-x", drive="shared-a", parent="folder-n")
+    path = str(tmp_path / name)
+    state = StateStore(path)
+    namespace = world.namespace("shared-a")
+    assert (await world.run(state)).authoritative_complete is True
+    published = state.get_progress(namespace).active_snapshot
+    members = state.membership_ids(namespace, 9)
+    assert world.reconciled == [members]
+
+    # The document's upsert cannot be delivered: it stays owed, under the snapshot that saw it.
+    if not known:
+        world.put("doc-x", drive="shared-a", parent="folder-n")
+    world.unreadable["doc-x"] = _ProviderHttpError(500)
+    build = None
+    if origin == "change-page":
+        world.logs["shared-a"].append({"fileId": "doc-x", "file": dict(world.files["doc-x"])})
+        await world.run(state)
+    else:
+        world.cursor_errors["shared-a"] = ProviderCursorInvalid("expired")
+        assert (await world.run(state)).failure_categories.get("invalid_cursor") == 1
+        world.cursor_errors.clear()
+        build = state.get_progress(namespace).building_snapshot
+        # The build lists the document's folder, and the listing of another folder then fails.
+        world.hooks[("list", "shared-a", "folder-z")] = _listing_fails
+        await world.run(state)
+        assert state.get_progress(namespace).building_snapshot == build
+        assert state.next_traversal(namespace, 9)["folder_id"] == "folder-z"
+    assert state.get_progress(namespace).active_snapshot == published
+    assert [row[:2] for row in _pending_rows(state, namespace)] == [("doc-x", 1)]
+    # The work object as a drain reads it, and then no retry until the test lets one arrive.
+    _retry_at(state, namespace, "doc-x", None)
+    (saved,) = state.list_pending(namespace, 9)
+    _retry_at(state, namespace, "doc-x", _HELD)
+
+    # Before the token the recovery will capture, the document leaves the selection.
+    del world.unreadable["doc-x"]
+    if loss == "deleted":
+        del world.files["doc-x"]
+        world.logs["shared-a"].append({"fileId": "doc-x", "removed": True})
+    elif loss == "trashed":
+        world.files["doc-x"]["trashed"] = True
+        world.logs["shared-a"].append({"fileId": "doc-x", "file": dict(world.files["doc-x"])})
+    else:
+        # Still readable, under a folder the snapshot being replaced had traversed.
+        world.files["folder-n"]["parents"] = ["outside"]
+        world.logs["shared-a"].append({"fileId": "folder-n", "file": dict(world.files["folder-n"])})
+    fresh = f"shared-a@{len(world.logs['shared-a'])}"
+
+    # The recovery captures that token and begins a replacement, whose first listing fails.
+    world.hooks[("list", "shared-a", "folder-r")] = _listing_fails
+    world.calls.clear()
+    if origin == "change-page":
+        world.cursor_errors["shared-a"] = ProviderCursorInvalid("expired")
+        assert (await world.run(state)).failure_categories.get("invalid_cursor") == 1
+        world.cursor_errors.clear()
+    else:
+        _lose_stream_tokens(world, state, namespace)
+    await world.run(state)
+
+    progress = state.get_progress(namespace)
+    replacement = progress.building_snapshot
+    assert replacement is not None and replacement not in {published, build}
+    assert progress.active_snapshot == published and progress.baseline_start_token == fresh
+    assert state.next_traversal(namespace, 9)["folder_id"] == "folder-r"
+    # Begun is not published: the upsert is owed, answered for and claimed exactly as before, and
+    # nothing was read, pushed, reconciled or removed for the document.
+    assert state.pending_count(namespace, 9) == 1
+    assert _upsert_rows(state, namespace, "doc-x") == [(False, False)]
+    assert state.work_membership_current(saved) is True
+    assert state.claimed_elsewhere(
+        world.integration_id, 9, world.namespace("shared-b"), "doc-x",
+    ) is True
+    assert not [call for call in world.calls if call[1:] == ("doc-x",)]
+    assert known or "doc-x" not in world.pushed
+    assert world.reconciled == [members] and world.removed == []
+    return SimpleNamespace(
+        world=world, path=path, state=state, namespace=namespace, published=published,
+        replacement=replacement, fresh=fresh, saved=saved,
+    )
+
+
+@pytest.mark.parametrize("loss", _LOSSES)
+@pytest.mark.parametrize("origin", _ORIGINS)
+@pytest.mark.asyncio
+async def test_upsert_owed_under_a_replaced_snapshot_is_superseded_when_its_replacement_publishes_without_it(
+    tmp_path, monkeypatch, origin, loss,
+):
+    held = await _upsert_owed_under_a_snapshot_being_replaced(
+        tmp_path, monkeypatch, f"replaced-snapshot-{origin}-{loss}.sqlite", origin=origin, loss=loss,
+    )
+    world, namespace = held.world, held.namespace
+    peer = world.namespace("shared-b")
+
+    # A restart of the sidecar. The replacement lists every root and is published without the
+    # document; the first change page from its token cannot be read in this run.
+    world.change_errors["shared-a"] = [_quota_deferral()]
+    held.state.close()
+    state = StateStore(held.path)
+    world.calls.clear()
+    world.pushed.clear()
+    replaced = await world.run(state)
+
+    progress = state.get_progress(namespace)
+    assert progress.active_snapshot == held.replacement and progress.building_snapshot is None
+    assert state.membership_ids(namespace, 9) == ["doc-1"]
+    assert world.pushed == ["doc-1"]
+    # The upsert ended with the publication: superseded, not acknowledged, and its page outcome
+    # names the snapshot that replaced the one it was owed under. It is no backlog and no claim.
+    assert state.pending_count(namespace, 9) == 0
+    assert _upsert_rows(state, namespace, "doc-x") == [(False, True)]
+    assert _page_outcomes(state, namespace, "doc-x") == [("superseded", held.replacement)]
+    assert state.claimed_elsewhere(world.integration_id, 9, peer, "doc-x") is False
+    assert not [call for call in world.calls if call[1:] == ("doc-x",)]
+    # Published is not drained: nothing is reconciled, and nothing was removed to clear backlog.
+    assert progress.terminal_drain_acknowledged is False
+    assert replaced.failure_categories == {"rate_limited": 1}
+    assert replaced.authoritative_complete is False
+    assert replaced.backlog is not None and replaced.backlog > 0
+    assert world.reconciled == [["doc-1"]] and world.removed == []
+
+    # The retry time arrives. The work object read before the publication is not current, is not
+    # listed again, and cannot be delivered: the sink is never called for it.
+    _retry_at(state, namespace, "doc-x", None)
+    assert state.list_pending(namespace, 9) == []
+    assert state.work_is_current(held.saved) is False
+    assert state.work_membership_current(held.saved) is False
+    brain = _RecordingBrain()
+    stale = IngestSummary("docs", failure_categories={})
+    assert await _push_doc(
+        brain, GdriveExecution(world.integration_id, 9, 1, "owner", "later", "scope", {}),
+        RawDoc(source="gdrive", external_id="doc-x", title="doc-x", body="stale"),
+        Connection("docs", "gdrive"), state, namespace, 9, stale, held.saved,
+    ) is True
+    assert brain.pushed == [] and brain.revision == 0 and stale.failed == 0
+
+    # A restart retries nothing of it. The page from the new token is read, it is terminal, and
+    # only then does the connection reconcile — to exactly the replacement's membership.
+    state.close()
+    state = StateStore(held.path)
+    world.calls.clear()
+    world.pushed.clear()
+    drained = await world.run(state)
+
+    assert [call for call in world.calls if call[0] in {"changes", "list"}] == [
+        ("changes", "shared-a", held.fresh),
+    ]
+    assert not [call for call in world.calls if call[1:] == ("doc-x",)]
+    assert world.pushed == []
+    assert state.get_progress(namespace).terminal_drain_acknowledged is True
+    assert drained.failed == 0 and drained.authoritative_complete is True and drained.backlog == 0
+    assert state.membership_ids(namespace, 9) == ["doc-1"]
+    assert world.reconciled == [["doc-1"], ["doc-1"]] and world.removed == []
+    assert world.stream("shared-a")["phase"] == "current"
+    assert _upsert_rows(state, namespace, "doc-x") == [(False, True)]
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_replacement_the_brain_refuses_to_publish_keeps_what_the_replaced_snapshot_owed(
+    tmp_path, monkeypatch,
+):
+    held = await _upsert_owed_under_a_snapshot_being_replaced(
+        tmp_path, monkeypatch, "replaced-snapshot-refused.sqlite",
+        origin="change-page", loss="deleted",
+    )
+    world, state, namespace = held.world, held.state, held.namespace
+    peer = world.namespace("shared-b")
+
+    # The replacement lists every root, and the brain refuses the checkpoint that publishes it.
+    world.checkpoint_faults.append(
+        lambda progress: BrainError(409, "progress_conflict", "refused")
+        if progress.get("active_snapshot") == held.replacement else None
+    )
+    refused = await world.run(state)
+
+    assert refused.failed == 1 and refused.failure_categories == {"progress_conflict": 1}
+    assert state.next_traversal(namespace, 9) is None
+    progress = state.get_progress(namespace)
+    assert (progress.active_snapshot, progress.building_snapshot) == (held.published, held.replacement)
+    assert world.stream("shared-a")["active_snapshot"] == held.published
+    # Nothing was decided: the upsert is owed, answered for and claimed as it was.
+    assert state.pending_count(namespace, 9) == 1
+    assert _upsert_rows(state, namespace, "doc-x") == [(False, False)]
+    assert _page_outcomes(state, namespace, "doc-x") == [("pending", None)]
+    assert state.work_membership_current(held.saved) is True
+    assert state.claimed_elsewhere(world.integration_id, 9, peer, "doc-x") is True
+    assert refused.authoritative_complete is False
+    assert world.reconciled == [["doc-1"]] and world.removed == []
+    state.close()
+
+    # A restart: the brain accepts the publication, and only then is the upsert superseded.
+    state = StateStore(held.path)
+    world.calls.clear()
+    accepted = await world.run(state)
+
+    assert not [call for call in world.calls if call[0] == "list" or call[1:] == ("doc-x",)]
+    assert state.get_progress(namespace).active_snapshot == held.replacement
+    assert state.pending_count(namespace, 9) == 0
+    assert _upsert_rows(state, namespace, "doc-x") == [(False, True)]
+    assert _page_outcomes(state, namespace, "doc-x") == [("superseded", held.replacement)]
+    assert state.claimed_elsewhere(world.integration_id, 9, peer, "doc-x") is False
+    assert accepted.failed == 0 and accepted.authoritative_complete is True and accepted.backlog == 0
+    assert world.reconciled == [["doc-1"], ["doc-1"]] and world.removed == []
+    state.close()
+
+
+@pytest.mark.parametrize("origin", _ORIGINS)
+@pytest.mark.asyncio
+async def test_publication_the_brain_acknowledged_and_sqlite_never_recorded_recovers_the_same_supersession(
+    tmp_path, monkeypatch, origin,
+):
+    held = await _upsert_owed_under_a_snapshot_being_replaced(
+        tmp_path, monkeypatch, f"replaced-snapshot-ack-then-crash-{origin}.sqlite",
+        origin=origin, loss="nested-folder-moved-out",
+    )
+    world, state, namespace = held.world, held.state, held.namespace
+    peer = world.namespace("shared-b")
+
+    # The brain acknowledges the publication, and the process dies before SQLite records it.
+    def killed(*_args, **_kwargs):
+        raise RuntimeError("process killed")
+
+    state.publish_selection_snapshot = killed
+    with pytest.raises(RuntimeError, match="process killed"):
+        await world.run(state)
+    state.close()
+
+    assert world.stream("shared-a")["active_snapshot"] == held.replacement
+    assert world.stream("shared-a")["building_snapshot"] is None
+    state = StateStore(held.path)
+    progress = state.get_progress(namespace)
+    assert (progress.active_snapshot, progress.building_snapshot) == (held.published, held.replacement)
+    # Locally nothing was decided, and nothing is lost: the upsert is owed and claimed.
+    assert state.pending_count(namespace, 9) == 1
+    assert _upsert_rows(state, namespace, "doc-x") == [(False, False)]
+    assert state.claimed_elsewhere(world.integration_id, 9, peer, "doc-x") is True
+
+    # The retry time arrives before the restarted sidecar runs. The publication is recovered
+    # first, with the decision it carries — so the document, still readable under a folder only
+    # the replaced snapshot traversed, is neither read nor pushed.
+    _retry_at(state, namespace, "doc-x", None)
+    world.calls.clear()
+    world.pushed.clear()
+    recovered = await world.run(state)
+
+    assert [call for call in world.calls if call[0] in {"start", "list", "changes"}] == [
+        ("changes", "shared-a", held.fresh),
+    ]
+    assert not [call for call in world.calls if call[1:] == ("doc-x",)]
+    assert world.pushed == []
+    progress = state.get_progress(namespace)
+    assert progress.active_snapshot == held.replacement and progress.building_snapshot is None
+    assert state.pending_count(namespace, 9) == 0
+    assert _upsert_rows(state, namespace, "doc-x") == [(False, True)]
+    assert _page_outcomes(state, namespace, "doc-x") == [("superseded", held.replacement)]
+    assert state.work_membership_current(held.saved) is False
+    assert state.claimed_elsewhere(world.integration_id, 9, peer, "doc-x") is False
+    assert recovered.failed == 0 and recovered.authoritative_complete is True
+    assert recovered.backlog == 0
+    assert world.reconciled == [["doc-1"], ["doc-1"]] and world.removed == []
+    state.close()
+
+
+@pytest.mark.parametrize("failure", ["malformed", "inaccessible"])
+@pytest.mark.asyncio
+async def test_selected_document_that_cannot_be_ingested_stays_owed_through_a_replacement_that_holds_it(
+    tmp_path, monkeypatch, failure,
+):
+    world = _DriveWorld(folder_ids=["folder-r"]).install(monkeypatch)
+    world.put("folder-r", drive="shared-a", folder=True)
+    world.put("doc-1", drive="shared-a", parent="folder-r")
+    path = str(tmp_path / f"replaced-snapshot-still-selected-{failure}.sqlite")
+    state = StateStore(path)
+    namespace = world.namespace("shared-a")
+    assert (await world.run(state)).authoritative_complete is True
+
+    # A document enters the selection that cannot be ingested: its required content is missing,
+    # or it cannot be read for now. Its upsert is owed from a change page of the snapshot.
+    world.put("doc-bad", drive="shared-a", parent="folder-r")
+    world.logs["shared-a"].append({"fileId": "doc-bad", "file": dict(world.files["doc-bad"])})
+    if failure == "malformed":
+        world.malformed.add("doc-bad")
+    else:
+        world.unreadable["doc-bad"] = _ProviderHttpError(503)
+    await world.run(state)
+    assert [row[:2] for row in _pending_rows(state, namespace)] == [("doc-bad", 1)]
+    _retry_at(state, namespace, "doc-bad", _HELD)
+    replaced = state.get_progress(namespace).active_snapshot
+
+    # The cursor is rejected. The replacement, under a fresh token, lists the document again.
+    world.cursor_errors["shared-a"] = ProviderCursorInvalid("expired")
+    assert (await world.run(state)).failure_categories.get("invalid_cursor") == 1
+    world.cursor_errors.clear()
+    state.close()
+    state = StateStore(path)
+    world.pushed.clear()
+    published = await world.run(state)
+
+    progress = state.get_progress(namespace)
+    assert progress.active_snapshot != replaced and progress.building_snapshot is None
+    assert state.membership_ids(namespace, 9) == ["doc-1", "doc-bad"]
+    assert world.pushed == ["doc-1"]
+    # Its upsert is still owed — to the replacement that holds it, which observed it again. That
+    # newer observation, not the publication, ended the older one; nothing is superseded by a
+    # snapshot, and the stream is not complete.
+    assert state.pending_count(namespace, 9) == 1
+    assert _upsert_rows(state, namespace, "doc-bad") == [(False, False)]
+    assert _page_outcomes(state, namespace, "doc-bad") == [("superseded", None), ("pending", None)]
+    (owed,) = _pending_rows(state, namespace)
+    assert owed[:2] == ("doc-bad", 1) and owed[2]
+    assert published.failed == 1 and published.authoritative_complete is False
+    assert published.backlog is not None and published.backlog > 0
+    assert world.reconciled == [["doc-1"]] and world.removed == []
+
+    # The document becomes ingestible and its retry time arrives: it is pushed, and only then
+    # does the connection reconcile, to a membership that holds it.
+    world.malformed.discard("doc-bad")
+    world.unreadable.pop("doc-bad", None)
+    _retry_at(state, namespace, "doc-bad", None)
+    state.close()
+    state = StateStore(path)
+    world.pushed.clear()
+    ingested = await world.run(state)
+
+    assert world.pushed == ["doc-bad"]
+    assert state.pending_count(namespace, 9) == 0
+    assert ingested.failed == 0 and ingested.authoritative_complete is True and ingested.backlog == 0
+    assert world.reconciled == [["doc-1"], ["doc-1", "doc-bad"]] and world.removed == []
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_superseded_upsert_removes_nothing_itself_and_another_connections_claim_keeps_the_document(
+    tmp_path, monkeypatch,
+):
+    ledger = _ClaimLedger()
+    name = "replaced-snapshot-overlapping-connection.sqlite"
+    # Another connection of the same sidecar selects the document directly, and has ingested it.
+    second = _DriveWorld(file_ids=["doc-x"], integration_id=_SECOND_INTEGRATION).install(monkeypatch)
+    second.ledger = ledger
+    second.put("doc-x", drive="shared-a")
+    state = StateStore(str(tmp_path / name))
+    assert (await second.run(state)).authoritative_complete is True
+    state.close()
+    assert ledger.claims == {"doc-x": {_SECOND_INTEGRATION}}
+
+    # This connection ingested it too, through a folder, and owes it a newer upsert when that
+    # folder is moved out of its selected root.
+    held = await _upsert_owed_under_a_snapshot_being_replaced(
+        tmp_path, monkeypatch, name, origin="change-page", loss="nested-folder-moved-out",
+        known=True, ledger=ledger,
+    )
+    world, state, namespace = held.world, held.state, held.namespace
+    theirs = second.namespace("shared-a")
+    assert ledger.claims["doc-x"] == {_SECOND_INTEGRATION, _WORLD_INTEGRATION}
+    assert ledger.retired == []
+
+    # The replacement is published without the document, drained and reconciled.
+    world.pushed.clear()
+    reconciled = await world.run(state)
+
+    assert reconciled.failed == 0 and reconciled.authoritative_complete is True
+    assert _upsert_rows(state, namespace, "doc-x") == [(False, True)]
+    assert world.pushed == ["doc-1"]
+    # The sidecar named no removal. This connection's claim ended with its own complete snapshot,
+    # and the document stands: the other connection still claims it.
+    assert world.removed == [] and world.reconciled[-1] == ["doc-1"]
+    assert ledger.retired == [(_WORLD_INTEGRATION, "doc-x")]
+    assert ledger.claims["doc-x"] == {_SECOND_INTEGRATION} and ledger.deleted == []
+    # Nothing of the other connection's local state was touched.
+    assert state.membership_ids(theirs, 9) == ["doc-x"]
+    assert state.claimed_elsewhere(
+        _SECOND_INTEGRATION, 9, second.namespace("shared-b"), "doc-x",
+    ) is True
+
+    second.install(monkeypatch)
+    again = await second.run(state)
+    assert again.failed == 0 and again.authoritative_complete is True
+    assert second.removed == [] and second.reconciled[-1] == ["doc-x"]
+    assert ledger.claims["doc-x"] == {_SECOND_INTEGRATION} and ledger.deleted == []
+    state.close()
+
+
+def test_publication_ends_only_the_upserts_replaced_snapshots_owed_for_documents_the_replacement_lacks(
+    tmp_path,
+):
+    path = str(tmp_path / "publication-supersession.sqlite")
+    state = StateStore(path)
+    key = StreamKey("team", "connection", "account", "shared-a")
+    other = StreamKey("team", "connection", "account", "shared-b")
+    peer = other.namespace(4)
+    namespace = state.begin_generation(key, 4, start_token="start").namespace
+    roots = [("folder", "folder", "shared-a", True)]
+    first = state.begin_selection_snapshot(namespace, 4, roots)
+    state.materialize_page(
+        namespace, 4, "baseline:folder", "baseline", None, None, None,
+        [("doc-gone", "upsert", {"file_id": "doc-gone"}),
+         ("doc-kept", "upsert", {"file_id": "doc-kept"})],
+        snapshot_id=first,
+        membership_additions=[
+            ("doc-gone", "folder", "shared-a", "folder"),
+            ("doc-kept", "folder", "shared-a", "folder"),
+            ("doc-removed", "folder", "shared-a", "folder"),
+        ],
+        traversal_completion=("folder", "folder", None),
+    )
+    work = {item.item_key: item for item in state.list_pending(namespace, 4)}
+    # Owed under a build: the build answers for it before it is published…
+    assert state.get_progress(namespace).active_snapshot is None
+    assert state.work_snapshot_id(work["doc-gone"]) == first
+    assert state.work_membership_current(work["doc-gone"]) is True
+    state.publish_selection_snapshot(namespace, 4, first)
+    # …and goes on answering for it as the authoritative snapshot. Publishing ends nothing owed
+    # under the snapshot being published.
+    assert state.work_snapshot_id(work["doc-gone"]) == first
+    assert state.work_membership_current(work["doc-gone"]) is True
+    assert state.pending_count(namespace, 4) == 2
+
+    # A removal the published snapshot's change page observed, withheld behind a peer's barrier.
+    state.materialize_page(
+        namespace, 4, "changes:cursor", "changes", "cursor", None, "terminal",
+        [("doc-removed", "remove", {"file_id": "doc-removed"})],
+        snapshot_id=first, membership_removals=["doc-removed"],
+    )
+    work.update({item.item_key: item for item in state.list_pending(namespace, 4)})
+    assert state.raise_removal_barrier(work["doc-removed"], other) is True
+
+    # Another connection in the same state file owes the same document under its own snapshot.
+    theirs = state.begin_generation(
+        StreamKey("team", "other-connection", "account", "shared-a"), 4, start_token="start",
+    ).namespace
+    their_snapshot = state.begin_selection_snapshot(theirs, 4, roots)
+    state.materialize_page(
+        theirs, 4, "baseline:folder", "baseline", None, None, None,
+        [("doc-gone", "upsert", {"file_id": "doc-gone"})], snapshot_id=their_snapshot,
+        membership_additions=[("doc-gone", "folder", "shared-a", "folder")],
+        traversal_completion=("folder", "folder", None),
+    )
+    state.publish_selection_snapshot(theirs, 4, their_snapshot)
+    (their_work,) = state.list_pending(theirs, 4)
+
+    # A replacement under a fresh token holds one of the two documents still owed.
+    replacement = state.restart_selection_snapshot(namespace, 4, roots, start_token="fresh")
+    state.record_membership(
+        namespace, 4, "doc-kept", "folder", "shared-a", snapshot_id=replacement,
+    )
+    # Until it is published, the snapshot each upsert was owed under answers for it; a
+    # replacement that cannot be published yet ends nothing.
+    with pytest.raises(RuntimeError, match="incomplete selection traversal"):
+        state.publish_selection_snapshot(namespace, 4, replacement)
+    assert state.work_snapshot_id(work["doc-gone"]) == first
+    assert state.work_membership_current(work["doc-gone"]) is True
+    assert state.claimed_elsewhere("connection", 4, peer, "doc-gone") is True
+    assert state.pending_count(namespace, 4) == 3
+    assert _upsert_rows(state, namespace, "doc-gone") == [(False, False)]
+
+    state.complete_traversal(namespace, 4, "folder", "folder", None, snapshot_id=replacement)
+    state.publish_selection_snapshot(namespace, 4, replacement)
+    state.close()
+    state = StateStore(path)
+
+    # The upsert for the document the replacement lacks is superseded — not acknowledged — with
+    # the snapshot that did it, and is no longer current, backlog or a claim.
+    assert sorted((item.item_key, item.action) for item in state.list_pending(namespace, 4)) == [
+        ("doc-kept", "upsert"), ("doc-removed", "remove"),
+    ]
+    assert _upsert_rows(state, namespace, "doc-gone") == [(False, True)]
+    assert _page_outcomes(state, namespace, "doc-gone") == [("superseded", replacement)]
+    assert state.work_is_current(work["doc-gone"]) is False
+    assert state.work_membership_current(work["doc-gone"]) is False
+    assert state.claimed_elsewhere("connection", 4, peer, "doc-gone") is False
+    # The upsert for the document it holds stays owed, and the replacement — not the retired
+    # snapshot — now answers for it.
+    assert state.work_snapshot_id(work["doc-kept"]) == replacement
+    assert state.work_membership_current(work["doc-kept"]) is True
+    assert _upsert_rows(state, namespace, "doc-kept") == [(False, False)]
+    assert _page_outcomes(state, namespace, "doc-kept") == [("pending", None)]
+    assert state.claimed_elsewhere("connection", 4, peer, "doc-kept") is True
+    # The removal and its barrier stand.
+    assert state.work_is_current(work["doc-removed"]) is True
+    assert state.removal_barrier(work["doc-removed"], other) == "standing"
+    # The other connection's upsert and claim for the same document are untouched.
+    assert state.pending_count(theirs, 4) == 1
+    assert state.work_membership_current(their_work) is True
+    assert _upsert_rows(state, theirs, "doc-gone") == [(False, False)]
+    assert state.claimed_elsewhere("other-connection", 4, peer, "doc-gone") is True
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_in_flight_upsert_is_not_pushed_when_its_snapshot_is_replaced_without_it_during_extraction(
+    tmp_path,
+):
+    state = StateStore(str(tmp_path / "in-flight-publication.sqlite"))
+    progress = state.begin_generation(
+        StreamKey("team", "connection", "account"), 9, start_token="start",
+    )
+    roots = [("folder", "folder", "my-drive", True)]
+    active = state.begin_selection_snapshot(progress.namespace, 9, roots)
+    state.materialize_page(
+        progress.namespace, 9, "baseline:folder", "baseline", None, None, None,
+        [("doc", "upsert", {"file_id": "doc"})], snapshot_id=active,
+        membership_additions=[("doc", "folder", "my-drive", "folder")],
+        traversal_completion=("folder", "folder", None),
+    )
+    state.publish_selection_snapshot(progress.namespace, 9, active)
+
+    class Source:
+        def _metadata(self, file_id):
+            # Readable, and under a folder the snapshot about to be replaced traversed.
+            return {"id": file_id, "mimeType": _DOC_MIME, "parents": ["folder"]}
+
+        def _raw_doc(self, meta):
+            # While the body is extracted, a replacement is published without the document.
+            replacement = state.restart_selection_snapshot(
+                progress.namespace, 9, roots, start_token="fresh",
+            )
+            state.complete_traversal(
+                progress.namespace, 9, "folder", "folder", None, snapshot_id=replacement,
+            )
+            state.publish_selection_snapshot(progress.namespace, 9, replacement)
+            return RawDoc(source="gdrive", external_id=meta["id"], body="stale")
+
+    client = _RecordingBrain()
+    summary = IngestSummary("docs", failure_categories={})
+    await _drain_pending(
+        client, GdriveExecution("connection", 9, 1, "owner", "later", "scope", {}),
+        Source(), Connection("docs", "gdrive"), state, progress.namespace, 9, summary, 1,
+    )
+
+    assert client.pushed == [] and summary.failed == 0
+    assert state.pending_count(progress.namespace, 9) == 0
+    assert _upsert_rows(state, progress.namespace, "doc") == [(False, True)]
+    state.close()
+
+
+# ---------------------------------------------------------------------------------------------
+# A restart committed locally survives the loss of the checkpoint that reports it
+# ---------------------------------------------------------------------------------------------
+#
+# Spec. A restart under a fresh token is one SQLite transaction, and the brain is told of it
+# afterwards. A process that dies between the two leaves the restart in local state and the
+# brain's record as it was. The next run neither captures another token nor restarts again: it
+# enumerates the build that restart began, under the token captured for it, never reads the
+# cursor the brain still holds, and reconciles only after a drain from that token.
+
+
+@pytest.mark.parametrize("recovery", ["invalid-cursor", "lost-tokens"])
+@pytest.mark.asyncio
+async def test_restart_committed_locally_whose_brain_checkpoint_is_lost_is_carried_through_by_the_next_run(
+    tmp_path, monkeypatch, recovery,
+):
+    world = _DriveWorld(folder_ids=["folder-r"]).install(monkeypatch)
+    world.put("folder-r", drive="shared-a", folder=True)
+    world.put("doc-1", drive="shared-a", parent="folder-r")
+    path = str(tmp_path / f"restart-checkpoint-lost-{recovery}.sqlite")
+    state = StateStore(path)
+    namespace = world.namespace("shared-a")
+    assert (await world.run(state)).authoritative_complete is True
+    before = state.get_progress(namespace)
+
+    # A document enters the folder. Its change is before the token the recovery captures, so
+    # only a listing under that token can find it.
+    world.put("doc-late", drive="shared-a", parent="folder-r")
+    world.logs["shared-a"].append({"fileId": "doc-late", "file": dict(world.files["doc-late"])})
+    fresh = "shared-a@1"
+    if recovery == "invalid-cursor":
+        world.cursor_errors["shared-a"] = ProviderCursorInvalid("expired")
+    else:
+        _lose_stream_tokens(world, state, namespace)
+    # The restart is committed to SQLite, and the process dies before the brain hears of it.
+    world.checkpoint_faults.append(
+        lambda progress: RuntimeError("process killed")
+        if progress.get("baseline_start_token") == fresh else None
+    )
+    with pytest.raises(RuntimeError, match="process killed"):
+        await world.run(state)
+    world.cursor_errors.clear()
+    state.close()
+
+    state = StateStore(path)
+    local = state.get_progress(namespace)
+    assert local.active_snapshot == before.active_snapshot
+    assert local.building_snapshot not in {None, before.active_snapshot}
+    assert (local.baseline_start_token, local.page_token) == (fresh, None)
+    assert local.drain_observation > before.drain_observation
+    assert local.terminal_drain_acknowledged is False
+    assert state.membership_ids(namespace, 9) == ["doc-1"]
+    # The brain's record is the one from before the restart.
+    assert world.stream("shared-a")["building_snapshot"] is None
+    assert world.stream("shared-a")["baseline_start_token"] != fresh
+    assert world.reconciled == [["doc-1"]]
+
+    world.calls.clear()
+    world.pushed.clear()
+    converged = await world.run(state)
+
+    assert ("start", "shared-a") not in world.calls
+    assert ("list", "shared-a", "folder-r") in world.calls
+    assert [call for call in world.calls if call[0] == "changes"] == [("changes", "shared-a", fresh)]
+    progress = state.get_progress(namespace)
+    assert progress.active_snapshot == local.building_snapshot and progress.building_snapshot is None
+    assert state.membership_ids(namespace, 9) == ["doc-1", "doc-late"]
+    assert sorted(world.pushed) == ["doc-1", "doc-late"]
+    assert world.stream("shared-a")["baseline_start_token"] == fresh
+    assert converged.failed == 0 and converged.authoritative_complete is True
+    assert converged.backlog == 0
+    assert world.reconciled == [["doc-1"], ["doc-1", "doc-late"]] and world.removed == []
+    assert world.stream("shared-a")["phase"] == "current"
     state.close()

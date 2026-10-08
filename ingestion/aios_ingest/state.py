@@ -182,6 +182,7 @@ CREATE TABLE IF NOT EXISTS page_obligation_outcomes (
   action TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending',
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  superseded_by_snapshot INTEGER,
   PRIMARY KEY (namespace, generation, page_id, item_key, observation_revision)
 );
 CREATE TABLE IF NOT EXISTS stream_leases (
@@ -375,6 +376,11 @@ class StateStore:
             )
         if "superseded_at" not in work_columns:
             self._db.execute("ALTER TABLE pending_work ADD COLUMN superseded_at TEXT")
+        outcome_columns = {r[1] for r in self._db.execute("PRAGMA table_info(page_obligation_outcomes)")}
+        if "superseded_by_snapshot" not in outcome_columns:
+            self._db.execute(
+                "ALTER TABLE page_obligation_outcomes ADD COLUMN superseded_by_snapshot INTEGER"
+            )
         binding_columns = {r[1] for r in self._db.execute("PRAGMA table_info(selection_root_bindings)")}
         if "status" not in binding_columns:
             self._db.execute(
@@ -1072,6 +1078,17 @@ class StateStore:
                 for r in rows]
 
     def work_is_current(self, work: PendingWork) -> bool:
+        owed = self._db.execute(
+            "SELECT superseded_at FROM pending_work WHERE namespace=? AND generation=? "
+            "AND item_key=? AND action=? AND observation_revision=?",
+            (work.namespace, work.generation, work.item_key, work.action,
+             work.observation_revision),
+        ).fetchone()
+        if owed is not None and owed["superseded_at"] is not None:
+            # Retired with no newer observation to say so: the snapshot that replaced the one this
+            # was owed under was published without the document. A work object read before that
+            # publication is not current after it.
+            return False
         row = self._db.execute(
             "SELECT observation_revision,action FROM item_observations "
             "WHERE namespace=? AND generation=? AND item_key=?",
@@ -1086,27 +1103,46 @@ class StateStore:
     def work_membership_current(self, work: PendingWork) -> bool:
         if work.action != "upsert":
             return self.work_is_current(work)
-        snapshot_id: int | None = None
-        if work.page_id:
-            page = self.get_page(work.namespace, work.generation, work.page_id)
-            snapshot_id = page.snapshot_id if page else None
+        snapshot_id = self.work_snapshot_id(work)
         if snapshot_id is None:
-            progress = self.get_progress(work.namespace)
-            snapshot_id = progress.active_snapshot if progress else None
-            if snapshot_id is None:
-                # Compatibility for pre-page local obligations. Upgraded Drive enumeration always
-                # binds an upsert to a materialized page/snapshot before it can reach this path.
-                return self.work_is_current(work)
+            if self._work_origin(work)[1]:
+                # Owed under a snapshot that was replaced, with no authoritative one to answer for
+                # it: history authorizes nothing.
+                return False
+            # Compatibility for pre-page local obligations. Upgraded Drive enumeration always
+            # binds an upsert to a materialized page/snapshot before it can reach this path.
+            return self.work_is_current(work)
         return self.work_is_current(work) and self.has_membership(
             work.namespace, work.generation, work.item_key,
             snapshot_id=snapshot_id, building=False,
         )
 
+    def _work_origin(self, work: PendingWork) -> tuple[int | None, bool]:
+        """The snapshot of the page that observed one obligation, and whether it was replaced."""
+        if not work.page_id:
+            return None, False
+        page = self.get_page(work.namespace, work.generation, work.page_id)
+        if page is None or page.snapshot_id is None:
+            return None, False
+        status = self._db.execute(
+            "SELECT status FROM selection_snapshots WHERE namespace=? AND generation=? AND snapshot_id=?",
+            (work.namespace, work.generation, int(page.snapshot_id)),
+        ).fetchone()
+        return int(page.snapshot_id), bool(status and status["status"] == "retired")
+
     def work_snapshot_id(self, work: PendingWork) -> int | None:
-        if work.page_id:
-            page = self.get_page(work.namespace, work.generation, work.page_id)
-            if page and page.snapshot_id is not None:
-                return int(page.snapshot_id)
+        """The snapshot whose membership and traversal answer for one obligation now.
+
+        That is the snapshot of the page that observed it — a build before it is published, the
+        authoritative snapshot once it is — for as long as that snapshot is not retired. A build a
+        restart superseded still answers for what it listed until its replacement is published.
+        A retired snapshot is history: its replacement was published, so what it listed and
+        traversed authorizes nothing, and work it still owes is weighed against the authoritative
+        snapshot alone.
+        """
+        origin, retired = self._work_origin(work)
+        if origin is not None and not retired:
+            return origin
         progress = self.get_progress(work.namespace)
         return progress.active_snapshot if progress else None
 
@@ -1233,7 +1269,8 @@ class StateStore:
         cursor, and the stream's cursor becomes this token in a new drain observation with no
         terminal evidence. The published membership stays authoritative, the superseded build
         still claims what it listed, and every document obligation stays owed, until the
-        replacement is published.
+        replacement is published — :meth:`publish_selection_snapshot` then ends the upserts owed
+        for documents the replacement does not hold.
         """
         if not start_token:
             raise ValueError("a restarted snapshot needs the start token it is enumerated under")
@@ -1524,7 +1561,9 @@ class StateStore:
         an upsert it still owes. A removal one drive's change log reports says nothing about any of
         them: the document may simply have moved between two selected roots. A build that a
         restart under a fresh token superseded still claims what it listed, until its replacement
-        is published: the restart is no evidence that the document left.
+        is published: the restart is no evidence that the document left. That publication is: an
+        upsert it supersedes, for a document the replacement does not hold, is owed no longer and
+        is no claim.
         """
         for row in self._db.execute(
             "SELECT namespace,active_snapshot,building_snapshot FROM stream_progress "
@@ -1613,7 +1652,17 @@ class StateStore:
         return bool(page and page.committed_at)
 
     def publish_selection_snapshot(self, namespace: str, generation: int, snapshot_id: int) -> None:
-        """Atomically swap completed membership into authority after the server checkpoint."""
+        """Atomically swap completed membership into authority after the server checkpoint.
+
+        The same transaction ends what the snapshots it replaces still owed for documents the
+        published one does not hold. That snapshot was enumerated in full without them, so such
+        an upsert is superseded — never acknowledged: nothing was ingested — its page outcome
+        records the snapshot that superseded it, and it stops counting as a claim of this stream.
+        An upsert for a document the published snapshot holds stays owed until its ingestion is
+        acknowledged. Removals and their barriers are not touched, and nothing is removed here:
+        what the brain holds for a document is settled only by the fenced reconciliation of every
+        stream. A publication that does not complete changes none of it.
+        """
         self._db.execute("BEGIN IMMEDIATE")
         try:
             pending_traversal = self._db.execute(
@@ -1641,6 +1690,32 @@ class StateStore:
                 ).fetchone()
                 if not already or already["status"] != "active":
                     raise RuntimeError("selection snapshot is not publishable")
+            now = _now_iso()
+            for obsolete in self._db.execute(
+                "SELECT w.item_key,w.observation_revision,w.page_id FROM pending_work w "
+                "JOIN materialized_pages p ON p.namespace=w.namespace AND p.generation=w.generation "
+                "AND p.page_id=w.page_id "
+                "JOIN selection_snapshots s ON s.namespace=p.namespace AND s.generation=p.generation "
+                "AND s.snapshot_id=p.snapshot_id "
+                "WHERE w.namespace=? AND w.generation=? AND w.action='upsert' "
+                "AND w.acknowledged_at IS NULL AND w.superseded_at IS NULL AND s.status='retired' "
+                "AND NOT EXISTS (SELECT 1 FROM selected_membership m WHERE m.namespace=w.namespace "
+                "AND m.generation=w.generation AND m.snapshot_id=? AND m.provider_id=w.item_key)",
+                (namespace, generation, snapshot_id),
+            ).fetchall():
+                self._db.execute(
+                    "UPDATE pending_work SET superseded_at=?,updated_at=? WHERE namespace=? "
+                    "AND generation=? AND item_key=? AND action='upsert' AND observation_revision=?",
+                    (now, now, namespace, generation, obsolete["item_key"],
+                     obsolete["observation_revision"]),
+                )
+                self._db.execute(
+                    "UPDATE page_obligation_outcomes SET status='superseded',superseded_by_snapshot=?,"
+                    "updated_at=? WHERE namespace=? AND generation=? AND page_id=? AND item_key=? "
+                    "AND observation_revision=? AND status='pending'",
+                    (snapshot_id, now, namespace, generation, obsolete["page_id"],
+                     obsolete["item_key"], obsolete["observation_revision"]),
+                )
             self._db.execute(
                 "UPDATE stream_progress SET active_snapshot=?,building_snapshot=NULL,recovery_required=0,"
                 "listing_complete=1,updated_at=? WHERE namespace=?",
