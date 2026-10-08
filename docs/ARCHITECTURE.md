@@ -1010,7 +1010,13 @@ cannot treat the mismatch as removal evidence. Each stream has an explicit snaps
 created atomically, a replacement builds beside the prior authoritative membership, and only a fully
 enumerated snapshot is published. Missing or mismatched local durable state for remote v2 progress
 enters controlled recovery; absence reconciliation remains disabled until a fresh baseline is
-published. Selection roots, recursive traversal pages, deduplicated membership, provider-page
+published. A build is evidence only with the start token it was begun under, so a recovery or
+invalid-cursor rescan that captures a new token resumes nothing (`restart_selection_snapshot`, one
+SQLite transaction): the unfinished build is superseded and never published, a new incarnation lists
+every root again under new page identities, pages still uncommitted are retired without moving the
+cursor, and the cursor becomes the new token in a new drain observation with no terminal evidence.
+The published membership, the superseded build's claims and every document obligation stand until
+the replacement is published; a refused token request changes none of it. Selection roots, recursive traversal pages, deduplicated membership, provider-page
 continuations, document obligations, acknowledgments, and deferred retry times are durable. A page is
 materialized atomically with all of its outcomes, continuation and traversal completion; folder-change
 pages also persist their subtree-rescan incarnation in that transaction and cannot retire until it is

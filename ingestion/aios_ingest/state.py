@@ -1213,15 +1213,67 @@ class StateStore:
         """Atomically create a replacement incarnation with roots and traversal seeds.
 
         The prior active incarnation remains readable until :meth:`publish_selection_snapshot`.
-        Repeated calls while a build exists return that build and repair any missing seeds.
+        Repeated calls while a build exists return that build and repair any missing seeds: the
+        build is resumed under the start token it was begun with. A token captured since is not
+        that token — see :meth:`restart_selection_snapshot`.
         """
+        return self._open_selection_snapshot(namespace, generation, roots)
+
+    def restart_selection_snapshot(
+        self, namespace: str, generation: int, roots: list[tuple[str, str, str, bool]],
+        *, start_token: str,
+    ) -> int:
+        """Atomically begin a new incarnation under a start token captured just now.
+
+        What an unfinished build listed is no evidence for this token: a document that entered a
+        folder after that folder was listed and before the token was captured is in neither the
+        listing nor the changes after the token. So nothing is resumed. In one transaction the
+        build is superseded — never enumerated or published again — a new incarnation is seeded
+        with every root unlisted, each page still uncommitted is retired without moving the
+        cursor, and the stream's cursor becomes this token in a new drain observation with no
+        terminal evidence. The published membership stays authoritative, the superseded build
+        still claims what it listed, and every document obligation stays owed, until the
+        replacement is published.
+        """
+        if not start_token:
+            raise ValueError("a restarted snapshot needs the start token it is enumerated under")
+        return self._open_selection_snapshot(namespace, generation, roots, start_token=start_token)
+
+    def _open_selection_snapshot(
+        self, namespace: str, generation: int, roots: list[tuple[str, str, str, bool]],
+        *, start_token: str | None = None,
+    ) -> int:
         self._db.execute("BEGIN IMMEDIATE")
         try:
             progress = self._db.execute(
                 "SELECT building_snapshot FROM stream_progress WHERE namespace=?",
                 (namespace,),
             ).fetchone()
-            snapshot_id = int(progress[0]) if progress and progress[0] is not None else int(
+            if start_token is not None:
+                if progress is None:
+                    raise KeyError(f"unknown stream namespace {namespace}")
+                self._db.execute(
+                    "UPDATE selection_snapshots SET status='superseded' "
+                    "WHERE namespace=? AND generation=? AND status='building'",
+                    (namespace, generation),
+                )
+                # A page read before this token is settled by the baseline that follows it, not by
+                # its own continuation: retired here, it can neither advance the cursor nor wait on
+                # a rescan that will never publish. The work it still owes is not touched.
+                self._db.execute(
+                    "DELETE FROM pending_work WHERE namespace=? AND generation=? "
+                    "AND acknowledged_at IS NOT NULL AND page_id IN ("
+                    "SELECT page_id FROM materialized_pages WHERE namespace=? AND generation=? "
+                    "AND committed_at IS NULL)",
+                    (namespace, generation, namespace, generation),
+                )
+                self._db.execute(
+                    "UPDATE materialized_pages SET committed_at=? "
+                    "WHERE namespace=? AND generation=? AND committed_at IS NULL",
+                    (_now_iso(), namespace, generation),
+                )
+            resumed = progress[0] if progress and start_token is None else None
+            snapshot_id = int(resumed) if resumed is not None else int(
                 self._db.execute(
                     "SELECT coalesce(max(snapshot_id),0)+1 FROM ("
                     "SELECT snapshot_id FROM selection_snapshots WHERE namespace=? AND generation=? "
@@ -1264,6 +1316,14 @@ class StateStore:
                 "WHERE namespace=?",
                 (snapshot_id, _now_iso(), namespace),
             )
+            if start_token is not None:
+                # The new observation keeps every change page read from this token distinct from
+                # any page read before it, even one read from an equal token.
+                self._db.execute(
+                    "UPDATE stream_progress SET baseline_start_token=?,page_token=NULL,"
+                    "drain_observation=drain_observation+1 WHERE namespace=?",
+                    (start_token, namespace),
+                )
             self._db.commit()
             return snapshot_id
         except Exception:
@@ -1462,14 +1522,21 @@ class StateStore:
 
         A claim is membership in that stream's authoritative snapshot or in one it is building, or
         an upsert it still owes. A removal one drive's change log reports says nothing about any of
-        them: the document may simply have moved between two selected roots.
+        them: the document may simply have moved between two selected roots. A build that a
+        restart under a fresh token superseded still claims what it listed, until its replacement
+        is published: the restart is no evidence that the document left.
         """
         for row in self._db.execute(
             "SELECT namespace,active_snapshot,building_snapshot FROM stream_progress "
             "WHERE connection_id=? AND generation=? AND namespace<>?",
             (connection_id, generation, namespace),
         ).fetchall():
-            for snapshot in (row["active_snapshot"], row["building_snapshot"]):
+            superseded = [found[0] for found in self._db.execute(
+                "SELECT snapshot_id FROM selection_snapshots "
+                "WHERE namespace=? AND generation=? AND status='superseded'",
+                (row["namespace"], generation),
+            ).fetchall()]
+            for snapshot in (row["active_snapshot"], row["building_snapshot"], *superseded):
                 if snapshot is not None and self.has_membership(
                     row["namespace"], generation, provider_id, snapshot_id=int(snapshot),
                 ):
@@ -1503,14 +1570,14 @@ class StateStore:
             (namespace, generation, selected, parent_id),
         ).fetchall()]
 
-    def reset_selection_snapshot(self, namespace: str, generation: int) -> int:
-        """Start a replacement snapshot while retaining the prior authoritative membership."""
+    def reset_selection_snapshot(self, namespace: str, generation: int, *, start_token: str) -> int:
+        """Restart the authoritative roots under a fresh token, retaining their membership."""
         active = self.snapshot_id(namespace, building=False)
         roots = self.list_roots(namespace, generation, snapshot_id=active)
-        return self.begin_selection_snapshot(namespace, generation, [
+        return self.restart_selection_snapshot(namespace, generation, [
             (row["root_id"], row["root_kind"], row["drive_id"], bool(row["recursive"]))
             for row in roots
-        ])
+        ], start_token=start_token)
 
     def snapshot_complete(self, namespace: str, generation: int, snapshot_id: int | None) -> bool:
         if snapshot_id is None:
@@ -1556,8 +1623,10 @@ class StateStore:
             ).fetchone()
             if pending_traversal:
                 raise RuntimeError("cannot publish incomplete selection traversal")
+            # A superseded build stops claiming what it listed once its replacement is authoritative.
             self._db.execute(
-                "UPDATE selection_snapshots SET status='retired' WHERE namespace=? AND generation=? AND status='active'",
+                "UPDATE selection_snapshots SET status='retired' WHERE namespace=? AND generation=? "
+                "AND status IN ('active','superseded')",
                 (namespace, generation),
             )
             cur = self._db.execute(
