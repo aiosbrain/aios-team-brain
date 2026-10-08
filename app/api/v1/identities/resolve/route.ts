@@ -4,7 +4,7 @@ import { authenticateApiKey } from "@/lib/api/auth";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { errorResponse } from "@/lib/api/schemas";
 import { buildIdentityMap, resolveByProviderId, resolveMember } from "@/lib/identity/resolve";
-import { listMemberIdentities } from "@/lib/identity/list";
+import { listMemberIdentities, providerIdentityResponse } from "@/lib/identity/list";
 
 export const runtime = "nodejs";
 
@@ -65,7 +65,7 @@ export async function GET(req: NextRequest) {
   if (!m) return errorResponse("not_found", "member resolved but not readable", 404);
 
   const identities = (await listMemberIdentities(db, auth.teamId)).get(memberId);
-  const provs = identities?.providers ?? [];
+  const provs = (identities?.providers ?? []).map(providerIdentityResponse);
   const slack = provs.find((p) => p.provider === "slack");
 
   return Response.json({

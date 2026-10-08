@@ -4,7 +4,7 @@ import { authenticateApiKey } from "@/lib/api/auth";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { errorResponse } from "@/lib/api/schemas";
 import { audit } from "@/lib/api/audit";
-import { listEnabledIntegrationSelections } from "@/lib/integrations/manage";
+import { listEnabledIntegrationSelections, listIntegrationSelections } from "@/lib/integrations/manage";
 
 export const runtime = "nodejs";
 
@@ -26,14 +26,17 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    const integrations = await listEnabledIntegrationSelections(db, auth.teamId);
+    const includeDisabled = req.nextUrl.searchParams.get("include_disabled") === "1";
+    const integrations = includeDisabled
+      ? await listIntegrationSelections(db, auth.teamId)
+      : await listEnabledIntegrationSelections(db, auth.teamId);
     await audit(db, {
       team_id: auth.teamId,
       actor_kind: "api_key",
       member_id: auth.memberId,
       api_key_id: auth.apiKeyId,
       action: "integrations.read",
-      meta: { count: integrations.length, types: integrations.map((i) => i.type) },
+      meta: { count: integrations.length, types: integrations.map((i) => i.type), includeDisabled },
     });
     // Non-secret selections only — no token/secret/secret_ciphertext ever leaves here.
     return Response.json({ integrations });

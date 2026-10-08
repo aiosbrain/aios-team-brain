@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { effectiveReplayPlan, REPLAY_SUPERSESSIONS } from "../../scripts/migration-replay-plan.mjs";
 
 /**
  * GENERALIZED enumerated-CHECK replay-consistency guard (generalizes the `integrations_type_check`
@@ -14,12 +15,16 @@ import { join } from "node:path";
  * re-imposes a CHECK the live row violates → "check constraint … is violated by some row" → the schema
  * load aborts and the release is halted.
  *
- * Invariant that prevents recurrence, for EVERY such constraint: every place it is defined — the inline
- * column check in schema.sql (Postgres auto-names it `<table>_<col>_check`), any named re-add in
- * schema.sql, and every re-add in a migration — must allow the IDENTICAL, complete value set. Then no
- * intermediate replay state is ever narrower than live data. Widening a set means updating schema.sql
- * AND every migration that (re-)defines the constraint, or this fails the build in review instead of on
- * the next deploy.
+ * Invariant that prevents recurrence, for EVERY such constraint: every place it is defined AND REPLAYED
+ * — the inline column check in schema.sql (Postgres auto-names it `<table>_<col>_check`), any named
+ * re-add in schema.sql, and every re-add in the effective replay plan — must allow the IDENTICAL,
+ * complete value set. Then no intermediate replay state is ever narrower than live data.
+ *
+ * Widening a set (AIO-1167 onward) means: schema.sql, ONE new migration carrying the complete set, and
+ * a supersession entry in `scripts/migration-replay-plan.mjs` for each earlier migration that re-adds
+ * the constraint. It no longer means editing those earlier files — shipped migrations are immutable,
+ * and `test/guards/migration-replay-plan.test.ts` pins them. Leave an earlier re-add replaying and
+ * this fails the build in review instead of on the next deploy.
  */
 
 const PG_DIR = join(import.meta.dirname, "..", "..", "postgres");
@@ -77,14 +82,50 @@ function looseEnumConstraintNames(sql: string): string[] {
   return names;
 }
 
-function allDefs(): Def[] {
+function rawMigrations(): Array<{ name: string; sql: string }> {
+  return readdirSync(MIG_DIR)
+    .filter((f) => f.endsWith(".sql"))
+    .sort()
+    .map((f) => ({ name: f, sql: readFileSync(join(MIG_DIR, f), "utf8") }));
+}
+
+/**
+ * The migrations as a deploy REPLAYS them — the effective plan from
+ * `scripts/migration-replay-plan.mjs`, the same function `pg-load-schema.mjs` calls. A shipped
+ * migration is immutable; where a later one widened a CHECK it re-adds, that obsolete definition is
+ * omitted from replay rather than edited in place, so it is the plan (not the raw file) whose
+ * definitions must agree.
+ */
+function replayedMigrations(): Array<{ name: string; sql: string }> {
+  return effectiveReplayPlan(rawMigrations()).map(({ name, sql }) => ({ name, sql }));
+}
+
+function allDefs(migrations: Array<{ name: string; sql: string }> = replayedMigrations()): Def[] {
   const schema = readFileSync(join(PG_DIR, "schema.sql"), "utf8");
-  const migFiles = readdirSync(MIG_DIR).filter((f) => f.endsWith(".sql")).sort();
   return [
     ...inlineSchemaDefs(schema),
     ...namedDefs(schema, "schema.sql", false),
-    ...migFiles.flatMap((f) => namedDefs(readFileSync(join(MIG_DIR, f), "utf8"), f, true)),
+    ...migrations.flatMap((m) => namedDefs(m.sql, m.name, true)),
   ];
+}
+
+/** Every definition that disagrees with the widest set seen for its constraint. */
+function driftOf(defs: Def[]): string[] {
+  const grouped = new Map<string, Def[]>();
+  for (const d of defs) grouped.set(d.name, [...(grouped.get(d.name) ?? []), d]);
+  const drift: string[] = [];
+  for (const [name, ds] of grouped) {
+    if (!ds.some((d) => d.inMigration)) continue;
+    // Canonical = the widest set seen (the intended, current allowed set).
+    const canonical = ds.reduce((a, b) => (b.values.length > a.length ? b.values : a), ds[0].values);
+    for (const d of ds) {
+      if (JSON.stringify(d.values) !== JSON.stringify(canonical)) {
+        const missing = canonical.filter((v) => !d.values.includes(v));
+        drift.push(`${name} in ${d.source}: missing [${missing.join(", ")}] (replaying this halts the deploy once a row uses one)`);
+      }
+    }
+  }
+  return drift;
 }
 
 describe("enumerated-CHECK replay consistency (generalized)", () => {
@@ -112,10 +153,8 @@ describe("enumerated-CHECK replay consistency (generalized)", () => {
   it("the parser captures every enumerated CHECK any migration re-adds (a form it can't parse fails loudly)", () => {
     // Guards the guard: if a future migration re-adds an enumerated CHECK in a shape the strict parser
     // above misses, this turns that silent blind spot into a red test.
-    const migFiles = readdirSync(MIG_DIR).filter((f) => f.endsWith(".sql")).sort();
     const uncaptured: string[] = [];
-    for (const f of migFiles) {
-      const sql = readFileSync(join(MIG_DIR, f), "utf8");
+    for (const { name: f, sql } of replayedMigrations()) {
       for (const name of looseEnumConstraintNames(sql)) {
         if (!(byName.get(name) ?? []).some((d) => d.inMigration && d.source === f)) uncaptured.push(`${name} in ${f}`);
       }
@@ -123,18 +162,27 @@ describe("enumerated-CHECK replay consistency (generalized)", () => {
     expect(uncaptured, `enumerated CHECK re-adds the guard's parser did not capture:\n${uncaptured.join("\n")}`).toEqual([]);
   });
 
-  it("every migration-re-added enumerated CHECK allows the SAME complete set everywhere it is defined", () => {
-    const drift: string[] = [];
-    for (const [name, ds] of migrationReadded) {
-      // Canonical = the widest set seen (the intended, current allowed set).
-      const canonical = ds.reduce((a, b) => (b.values.length > a.length ? b.values : a), ds[0].values);
-      for (const d of ds) {
-        if (JSON.stringify(d.values) !== JSON.stringify(canonical)) {
-          const missing = canonical.filter((v) => !d.values.includes(v));
-          drift.push(`${name} in ${d.source}: missing [${missing.join(", ")}] (replaying this halts the deploy once a row uses one)`);
-        }
-      }
-    }
-    expect(drift, `enumerated CHECK definitions drift — converge every re-add to the full set:\n${drift.join("\n")}`).toEqual([]);
+  it("every REPLAYED enumerated CHECK allows the SAME complete set everywhere it is defined", () => {
+    const drift = driftOf(defs);
+    expect(
+      drift,
+      `enumerated CHECK definitions drift. Widen in a NEW migration carrying the full set, mirror ` +
+        `schema.sql, and declare each earlier re-add obsolete in scripts/migration-replay-plan.mjs — ` +
+        `never edit a shipped migration:\n${drift.join("\n")}`
+    ).toEqual([]);
+  });
+
+  it("the widened values are in the complete current sets", () => {
+    const current = (name: string) => byName.get(name)?.find((d) => !d.inMigration)?.values ?? [];
+    expect(current("integrations_type_check")).toContain("gdrive");
+    expect(current("project_context_memberships_method_check")).toContain("gdrive_claim");
+  });
+
+  it("MUTANT: the same check over the RAW shipped files reports exactly the superseded definitions", () => {
+    // Non-vacuity. If the supersessions were dropped — or this guard read the raw files again — the
+    // six shipped definitions are precisely the narrower-replay hazard, and they are caught BY NAME.
+    const rawDrift = driftOf(allDefs(rawMigrations()));
+    const expected = REPLAY_SUPERSESSIONS.map((entry) => `${entry.constraint} in ${entry.migration}`).sort();
+    expect(rawDrift.map((line) => line.split(":")[0]).sort()).toEqual(expected);
   });
 });

@@ -1135,6 +1135,13 @@ export const REGISTERED_GUARDS = {
     reason: "Session → active same-team membership with membership-derived posture.",
     evidence: [WRAPPER_EVIDENCE],
   },
+  requireTeamAdmin: {
+    module: "lib/auth/guard",
+    exportName: "requireTeamAdmin",
+    owner: "lib/auth/guard.ts → lib/integrations/read.ts:resolveIntegrationsAdmin",
+    reason: "Session → active ADMIN of the addressed team (admin-only: a lead or another team's admin resolves to null).",
+    evidence: ["test/datamechanics/integrations-auth.datamechanics.test.ts"],
+  },
   canAccessAdmin: {
     module: "lib/auth/admin-access",
     exportName: "canAccessAdmin",
@@ -1214,6 +1221,13 @@ const GATEWAY = "api/internal/executor-gateway/v1";
 
 /** One row per protected `(path, method)`. A new handler needs a new, reviewed row. */
 export const PROTECTED_ROUTES: readonly ProtectedRoute[] = [
+  // AIO-1167: starts the Google Drive OAuth grant from the Admin UI — a browser navigation, so the
+  // authority is the session's team-admin membership, bound into the signed state it mints.
+  row("api/auth/gdrive/start", "GET", "requireTeamAdmin"),
+  // Google redirects the SAME browser back, so the callback is not a public protocol: it redeems the
+  // state only with that browser's binding cookie, and exchanges the code only for the session of
+  // the Admin who started the grant.
+  row("api/auth/gdrive/callback", "GET", "requireTeamAdmin"),
   row("api/auth/slack/start", "GET", "authenticateApiKey"),
   row("api/auth/slack/status", "GET", "authenticateApiKey"),
 
@@ -1277,9 +1291,23 @@ export const PROTECTED_ROUTES: readonly ProtectedRoute[] = [
   row("api/v1/graph-query", "POST", "authenticateApiKey"),
   row("api/v1/identities/resolve", "GET", "authenticateApiKey"),
   row("api/v1/integrations", "GET", "authenticateApiKey"),
+  // AIO-1167 Google Drive connector surface. The member API key is AUTHENTICATION only; what each
+  // handler may do is decided past it by the Drive execution authority this scanner does not prove
+  // (the dedicated connector principal bound to the integration, its generation and lease fence) —
+  // `lib/integrations/gdrive-authority.ts`, denied end to end in
+  // test/datamechanics/gdrive-authority.datamechanics.test.ts and test/http/gdrive-authority.http.test.ts.
+  row("api/v1/integrations/gdrive/execution", "POST", "authenticateApiKey"),
+  // Both `runs` methods reach the key through the called local `connector`, which also requires the
+  // trusted `gdrive-sync` connector principal — that name is not itself an authority.
+  row("api/v1/integrations/gdrive/runs", "GET", "authenticateApiKey"),
+  row("api/v1/integrations/gdrive/runs", "POST", "authenticateApiKey"),
+  row("api/v1/integrations/gdrive/token", "POST", "authenticateApiKey"),
   row("api/v1/items/[id]", "GET", "authenticateApiKey"),
   row("api/v1/items", "POST", "authenticateApiKey"),
   row("api/v1/items", "GET", "authenticateApiKey", "authenticateAgentToken"),
+  // AIO-1167: provider-confirmed removal / complete-snapshot reconciliation, committed only inside
+  // the same fenced Drive execution (`withGdriveExecutionCommit`).
+  row("api/v1/items/source-reconcile", "POST", "authenticateApiKey"),
   row("api/v1/me", "GET", "authenticateApiKey"),
   row("api/v1/me/slack-token", "GET", "authenticateApiKey"),
   row("api/v1/me/slack-token", "POST", "authenticateApiKey"),

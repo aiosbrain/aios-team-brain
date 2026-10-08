@@ -1,7 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { NextRequest } from "next/server";
-import { db, ingest, persistLegacyEmptyScopeForTest, seedTeam, sha, type Seed } from "./helpers";
+import {
+  convergeIdentityAttribution,
+  db,
+  ingest,
+  persistLegacyEmptyScopeForTest,
+  seedTeam,
+  sha,
+  type Seed,
+} from "./helpers";
 import { GET as itemsGET } from "@/app/api/v1/items/route";
 import { GET as membersGET } from "@/app/api/v1/members/route";
 import { issueApiKey } from "@/lib/admin/keys";
@@ -145,6 +153,7 @@ async function buildFixture(): Promise<Fixture> {
     tier: "external",
   });
   await db().from("members").update({ status: "active" }).eq("id", m.id).eq("team_id", seed.teamId);
+  await convergeIdentityAttribution(seed);
   const g = await createGroup(db(), seed.teamId, "clients-x", "Clients X", seed.memberId);
   expect(g.ok, g.error).toBe(true);
   expect((await addMemberToGroup(db(), seed.teamId, g.groupId!, m.id, seed.memberId)).ok).toBe(true);

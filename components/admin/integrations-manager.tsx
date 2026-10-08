@@ -22,6 +22,10 @@ import {
   setExtractionSmallModel,
   setEmbeddingModel,
   setMeetingTaskStatus,
+  testGoogleDriveConnection,
+  provisionGoogleDriveConnector,
+  saveGoogleDrivePickerSelection,
+  runGoogleDriveNow,
   type PrimaryPmProvider,
 } from "@/app/t/[team]/admin/integrations/actions";
 import type { AnsweringProvider, ExtractionProvider } from "@/lib/query/llm-backend";
@@ -284,6 +288,7 @@ type IntegrationType =
   | "openrouter"
   | "google"
   | "notion"
+  | "gdrive"
   | "clickup";
 
 export interface IntegrationRow {
@@ -298,7 +303,7 @@ export interface IntegrationRow {
 // Data-source connectors shown in the generic "Add an integration" form. Provider keys get their
 // own panel (PROVIDER_TYPES); GitHub gets its own repo panel (GithubReposPanel) — so both are
 // excluded here to avoid two places to manage the same thing.
-const TYPES: IntegrationType[] = ["slack", "notion", "linear", "plane", "clickup"];
+const TYPES: IntegrationType[] = ["slack", "notion", "gdrive", "linear", "plane", "clickup"];
 
 // LLM provider API keys — one set for the team, managed in the dedicated "AI provider keys" panel.
 const PROVIDER_TYPES = ["anthropic", "openai", "google"] as const;
@@ -318,6 +323,7 @@ const SELECTION_HINT: Partial<Record<IntegrationType, string>> = {
   // plus EITHER page ids or a database id. Pages are the common case, so that's what this field holds;
   // a `databaseId=<id>` entry is accepted for the whole-database case.
   notion: "page IDs (comma-separated), or databaseId=<id>",
+  gdrive: "fileIds=A|B, folderIds=F, audienceProjectIds=<project-uuid>|<project-uuid>, recursive=true, authMode=oauth",
   linear: "teamId=..., projectId=..., doneStateName=Done",
   plane: "workspaceSlug=..., projectId=..., doneStateName=DONE, externalSource=aios-backlog",
   // `,` separates entries, so a multi-value entry uses `|` (see lib/integrations/build-config).
@@ -331,6 +337,12 @@ function summarizeConfig(type: IntegrationType, config: Record<string, unknown>)
   if (type === "notion") {
     if (config.databaseId) return `database ${config.databaseId}`;
     return `${arr("pageIds").length} page(s)`;
+  }
+  if (type === "gdrive") {
+    const files = arr("fileIds").length;
+    const folders = arr("folderIds").length;
+    const drives = arr("sharedDriveIds").length;
+    return `${config.selectionState ?? "absent"} · ${files} file(s) · ${folders} folder(s) · ${drives} Shared Drive(s)${config.recursive ? " · recursive" : ""}`;
   }
   if (type === "linear") {
     return [
@@ -365,6 +377,8 @@ export function IntegrationsManager({
   meetingTaskStatus,
   answering,
   embedding,
+  gdrivePicker,
+  gdriveRuns,
 }: {
   teamSlug: string;
   integrations: IntegrationRow[];
@@ -372,6 +386,12 @@ export function IntegrationsManager({
   meetingTaskStatus: MeetingTaskStatus;
   answering: AnsweringState;
   embedding: EmbeddingState;
+  gdrivePicker: { clientId: string; apiKey: string; appId: string } | null;
+  gdriveRuns: Array<{
+    id: string; integration_id: string; trigger: string; status: string;
+    created_at: string; started_at: string | null; finished_at: string | null;
+    summary: Record<string, unknown>; error: string | null;
+  }>;
 }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
@@ -462,6 +482,146 @@ export function IntegrationsManager({
       i.type !== "openrouter" && // OpenRouter has its own dedicated panel (key + model)
       !(PROVIDER_TYPES as readonly string[]).includes(i.type)
   );
+  const driveIntegration = integrations.find((i) => i.type === "gdrive");
+  const driveRun = driveIntegration
+    ? gdriveRuns.find((run) => run.integration_id === driveIntegration.id)
+    : undefined;
+  const driveSuccess = driveIntegration
+    ? gdriveRuns.find((run) => run.integration_id === driveIntegration.id
+      && run.status === "complete" && run.summary.authoritativeComplete === true)
+    : undefined;
+  const [driveTest, setDriveTest] = useState<string | null>(null);
+  const [drivePreviewContinuation, setDrivePreviewContinuation] = useState<number | null>(null);
+  const [driveConnectorKey, setDriveConnectorKey] = useState<string | null>(null);
+
+  async function chooseDriveFiles() {
+    if (!driveIntegration || !gdrivePicker) return;
+    setError(null);
+    setDriveTest(null);
+    try {
+      const load = (id: string, src: string) => new Promise<void>((resolve, reject) => {
+        const existing = document.getElementById(id) as HTMLScriptElement | null;
+        if (existing?.dataset.loaded === "true") return resolve();
+        const script = existing ?? Object.assign(document.createElement("script"), { id, src, async: true });
+        script.addEventListener("load", () => { script.dataset.loaded = "true"; resolve(); }, { once: true });
+        script.addEventListener("error", () => reject(new Error("Google Picker failed to load")), { once: true });
+        if (!existing) document.head.appendChild(script);
+      });
+      await Promise.all([
+        load("google-api-js", "https://apis.google.com/js/api.js"),
+        load("google-gis-js", "https://accounts.google.com/gsi/client"),
+      ]);
+      type PickerDoc = { id?: string };
+      type PickerData = { action?: string; docs?: PickerDoc[] };
+      type PickerApi = {
+        Action: { PICKED: string; CANCEL: string };
+        Feature: { MULTISELECT_ENABLED: string };
+        DocsView: new () => { setMimeTypes(value: string): unknown; setIncludeFolders(value: boolean): unknown };
+        PickerBuilder: new () => {
+          addView(view: unknown): unknown; enableFeature(feature: string): unknown;
+          setOAuthToken(token: string): unknown; setDeveloperKey(key: string): unknown;
+          setAppId(id: string): unknown; setOrigin(origin: string): unknown;
+          setCallback(callback: (data: PickerData) => void): unknown;
+          build(): { setVisible(visible: boolean): void };
+        };
+      };
+      type GoogleGlobal = {
+        accounts: { oauth2: { initTokenClient(config: {
+          client_id: string; scope: string; callback: (response: { access_token?: string; error?: string }) => void;
+        }): { requestAccessToken(input: { prompt: string }): void } } };
+        picker: PickerApi;
+      };
+      const browser = window as typeof window & {
+        gapi?: { load(name: string, callback: () => void): void };
+        google?: GoogleGlobal;
+      };
+      await new Promise<void>((resolve, reject) => {
+        if (!browser.gapi) return reject(new Error("Google Picker API did not initialize"));
+        browser.gapi.load("picker", resolve);
+      });
+      const google = browser.google;
+      if (!google) throw new Error("Google Identity Services did not initialize");
+      const tokenClient = google.accounts.oauth2.initTokenClient({
+        client_id: gdrivePicker.clientId,
+        scope: "https://www.googleapis.com/auth/drive.file",
+        callback: (response) => {
+          if (!response.access_token || response.error) {
+            setError("Google file authorization was cancelled or denied");
+            return;
+          }
+          const view = new google.picker.DocsView();
+          view.setIncludeFolders(false);
+          view.setMimeTypes("application/vnd.google-apps.document");
+          const builder = new google.picker.PickerBuilder();
+          builder.addView(view);
+          builder.enableFeature(google.picker.Feature.MULTISELECT_ENABLED);
+          builder.setOAuthToken(response.access_token);
+          builder.setDeveloperKey(gdrivePicker.apiKey);
+          builder.setAppId(gdrivePicker.appId);
+          builder.setOrigin(window.location.origin);
+          builder.setCallback((data) => {
+            if (data.action === google.picker.Action.CANCEL) {
+              setDriveTest("Selection cancelled; the saved scope was unchanged.");
+              return;
+            }
+            if (data.action !== google.picker.Action.PICKED) return;
+            const ids = (data.docs ?? []).map((doc) => doc.id ?? "").filter(Boolean);
+            startTransition(async () => {
+              const result = await saveGoogleDrivePickerSelection(teamSlug, driveIntegration.name, ids);
+              if (!result.ok) setError(result.error ?? "Google Picker selection could not be saved");
+              else {
+                setNotice(result.message ?? "Google Drive selection saved.");
+                router.refresh();
+              }
+            });
+          });
+          builder.build().setVisible(true);
+        },
+      });
+      tokenClient.requestAccessToken({ prompt: "consent" });
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Google Picker could not be opened");
+    }
+  }
+
+  function testDrive(continuation = 0) {
+    if (!driveIntegration) return;
+    setDriveTest(null);
+    setError(null);
+    startTransition(async () => {
+      const result = await testGoogleDriveConnection(teamSlug, driveIntegration.name, continuation);
+      setDriveTest(result.message ?? result.error ?? "Google Drive test did not return a result");
+      setDrivePreviewContinuation(result.continuation ?? null);
+      if (!result.ok) setError(result.error ?? "Google Drive test failed");
+    });
+  }
+
+  function provisionDriveConnector() {
+    if (!driveIntegration) return;
+    setError(null);
+    setDriveConnectorKey(null);
+    startTransition(async () => {
+      const result = await provisionGoogleDriveConnector(teamSlug, driveIntegration.id);
+      if (!result.ok || !result.key) setError(result.error ?? "Google Drive connector provisioning failed");
+      else {
+        setDriveConnectorKey(result.key);
+        setNotice(result.rotated ? "Connector key rotated. Replace the sidecar key now." : "Connector key provisioned.");
+      }
+    });
+  }
+
+  function runDriveNow(trigger: "manual" | "retry" = "manual") {
+    if (!driveIntegration) return;
+    setError(null);
+    startTransition(async () => {
+      const result = await runGoogleDriveNow(teamSlug, driveIntegration.id, trigger);
+      if (!result.ok) setError(result.error ?? "Google Drive run could not be queued");
+      else {
+        setNotice(result.message ?? "Google Drive run queued.");
+        router.refresh();
+      }
+    });
+  }
 
   // Answer-model drafts for the editable provider keys (anthropic/openai), seeded from saved config.
   const [modelDraft, setModelDraft] = useState<Record<"anthropic" | "openai", string>>({
@@ -897,6 +1057,153 @@ export function IntegrationsManager({
         </div>
       </div>
 
+      <section className="prism-card flex flex-col gap-3 p-4" aria-labelledby="google-drive-heading">
+        <div>
+          <p id="google-drive-heading" className="flex items-center gap-2 text-sm font-medium text-ink">
+            <Plug className="size-4 text-violet" /> Google Drive authorization
+          </p>
+          <p className="mt-1 text-xs text-ink-secondary">
+            {driveIntegration
+              ? driveIntegration.config.authMode === "service_account"
+                ? `Service-account mode: ${String(driveIntegration.config.serviceAccountStatus ?? "pending")} ${driveIntegration.config.serviceAccountIdentity ? `(${String(driveIntegration.config.serviceAccountIdentity)})` : ""}. Credentials remain local to the sidecar. ${summarizeConfig("gdrive", driveIntegration.config)}.`
+                : `${driveIntegration.hasSecret ? `Connected as ${String(driveIntegration.config.authenticatedAccount ?? "an unverified account")}` : "Reconnect required"}. ${driveIntegration.status === "disabled" ? "Paused or disconnected. " : ""}${summarizeConfig("gdrive", driveIntegration.config)}. Shared-login member credit is managed under Members → Identities.`
+              : "No Google Drive account is connected yet."}
+          </p>
+        </div>
+        <div className="grid gap-2 sm:grid-cols-2">
+          <div className="rounded-lg border border-border-default p-3">
+            <p className="text-xs font-medium text-ink">Individual files</p>
+            <p className="mt-1 text-xs text-ink-secondary">
+              Uses Google&apos;s per-file <code>drive.file</code> scope. It cannot discover every child
+              of a folder unless those files were individually authorized.
+            </p>
+            {driveIntegration && gdrivePicker ? (
+              <button
+                type="button"
+                onClick={chooseDriveFiles}
+                disabled={pending}
+                className="mt-3 inline-flex rounded-lg border border-violet/40 bg-violet/10 px-3 py-1.5 text-xs font-medium text-violet disabled:opacity-50"
+              >
+                Choose Google Docs
+              </button>
+            ) : (
+              <a
+                className="mt-3 inline-flex rounded-lg border border-violet/40 bg-violet/10 px-3 py-1.5 text-xs font-medium text-violet"
+                href={`/api/auth/gdrive/start?team=${encodeURIComponent(teamSlug)}&name=${encodeURIComponent(driveIntegration?.name ?? "google-drive")}&mode=files`}
+              >
+                {driveIntegration ? "Reconnect file access" : "Connect selected files"}
+              </a>
+            )}
+            {driveIntegration && !gdrivePicker ? (
+              <p className="mt-2 text-xs text-amber-700">Picker is not configured on this instance; reconnect remains available.</p>
+            ) : null}
+          </div>
+          <div className="rounded-lg border border-border-default p-3">
+            <p className="text-xs font-medium text-ink">Folders or Shared Drives</p>
+            <p className="mt-1 text-xs text-ink-secondary">
+              Folder discovery needs broader read-only Drive access. Consent allows discovery, but
+              the saved selection below still limits what the connector imports.
+            </p>
+            <a
+              className="mt-3 inline-flex rounded-lg border border-violet/40 bg-violet/10 px-3 py-1.5 text-xs font-medium text-violet"
+              href={`/api/auth/gdrive/start?team=${encodeURIComponent(teamSlug)}&name=${encodeURIComponent(driveIntegration?.name ?? "google-drive")}&mode=folders`}
+            >
+              {driveIntegration ? "Reconnect folder access" : "Connect folders"}
+            </a>
+          </div>
+        </div>
+        <p className="text-xs text-ink-tertiary">
+          Reconnecting replaces credentials for this named connection without expanding its saved
+          file, folder, Shared Drive, project, or audience selection.
+        </p>
+        <div className="rounded-lg border border-border-default p-3" aria-live="polite">
+          <p className="text-xs font-medium text-ink">Coordinator status</p>
+          {driveRun ? (
+            <p className="mt-1 text-xs text-ink-secondary">
+              {driveRun.trigger} · {driveRun.status} · last attempt {new Date(driveRun.started_at ?? driveRun.created_at).toLocaleString()}
+              {driveSuccess
+                ? ` · last proven success ${new Date(driveSuccess.finished_at ?? driveSuccess.created_at).toLocaleString()}`
+                : " · no proven complete success"}
+              {` · ${Number(driveRun.summary.created ?? 0)} created, ${Number(driveRun.summary.updated ?? 0)} updated, ${Number(driveRun.summary.unchanged ?? 0)} unchanged, ${Number(driveRun.summary.removed ?? 0)} removed, ${Number(driveRun.summary.skipped ?? 0)} skipped`}
+              {driveRun.summary.backlog == null ? " · backlog unknown" : ` · backlog ${Number(driveRun.summary.backlog)}`}
+              {driveRun.summary.cursorAgeSeconds == null ? " · cursor age unknown" : ` · cursor age ${Math.round(Number(driveRun.summary.cursorAgeSeconds))}s`}
+              {driveRun.error ? ` · ${driveRun.error}` : ""}
+            </p>
+          ) : (
+            <p className="mt-1 text-xs text-ink-secondary">
+              {driveIntegration?.status === "disabled"
+                ? "Paused or disconnected; no work will be claimed."
+                : driveIntegration
+                  ? "No coordinator attempt has been reported yet. Backlog and cursor age are unknown."
+                  : "Connect Google Drive to begin reporting runs."}
+            </p>
+          )}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => runDriveNow("manual")}
+            disabled={pending || !driveIntegration || driveIntegration.status !== "enabled"
+              || (driveIntegration.config.authMode !== "service_account" && !driveIntegration.hasSecret)}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-violet/40 bg-violet/10 px-3 py-1.5 text-xs font-medium text-violet disabled:opacity-50"
+          >
+            <RefreshCw className={`size-3.5 ${pending ? "animate-spin" : ""}`} /> Run now
+          </button>
+          <button
+            type="button"
+            onClick={() => runDriveNow("retry")}
+            disabled={pending || !driveIntegration || driveIntegration.status !== "enabled"
+              || (driveIntegration.config.authMode !== "service_account" && !driveIntegration.hasSecret)}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-border-default px-3 py-1.5 text-xs font-medium text-ink-secondary disabled:opacity-50"
+          >
+            Retry pending work
+          </button>
+          <button
+            type="button"
+            onClick={() => testDrive()}
+            disabled={pending || !driveIntegration}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-border-default px-3 py-1.5 text-xs font-medium text-ink-secondary disabled:opacity-50"
+          >
+            <RefreshCw className={`size-3.5 ${pending ? "animate-spin" : ""}`} /> Test connection and preview scope
+          </button>
+          <span className="text-xs text-ink-tertiary">Tests only the exact saved roots; it never expands the selection.</span>
+          {drivePreviewContinuation !== null ? (
+            <button
+              type="button"
+              onClick={() => testDrive(drivePreviewContinuation)}
+              disabled={pending}
+              className="inline-flex items-center rounded-lg border border-border-default px-3 py-1.5 text-xs font-medium text-ink-secondary disabled:opacity-50"
+            >
+              Continue preview at {drivePreviewContinuation}
+            </button>
+          ) : null}
+        </div>
+        <div className="rounded-lg border border-border-default p-3">
+          <p className="text-xs font-medium text-ink">Remote connector principal</p>
+          <p className="mt-1 text-xs text-ink-secondary">
+            Provision or rotate the dedicated sidecar key. Rotation immediately fences active workers;
+            the key is shown once and is never stored in plaintext.
+          </p>
+          <button
+            type="button"
+            onClick={provisionDriveConnector}
+            disabled={pending || !driveIntegration}
+            className="mt-3 inline-flex items-center gap-1.5 rounded-lg border border-border-default px-3 py-1.5 text-xs font-medium text-ink-secondary disabled:opacity-50"
+          >
+            <KeyRound className="size-3.5" /> Provision / rotate connector key
+          </button>
+          {driveConnectorKey ? (
+            <div className="mt-3" role="status">
+              <p className="text-xs font-medium text-amber-700">Copy this key now. It will not be shown again.</p>
+              <input className="prism-input mt-1 w-full font-mono text-xs" readOnly value={driveConnectorKey} aria-label="One-time Google Drive connector key" />
+            </div>
+          ) : null}
+        </div>
+        <p aria-live="polite" className="text-xs text-ink-secondary">
+          {driveTest ?? "OAuth runs use short-lived server-brokered access; refresh credentials never leave the encrypted store."}
+        </p>
+      </section>
+
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -960,14 +1267,22 @@ export function IntegrationsManager({
             lands.
           </p>
         ) : null}
-        <input
-          className="prism-input"
-          type="password"
-          autoComplete="off"
-          placeholder="secret token (e.g. xoxb-… for Slack) — stored encrypted, never shown again"
-          value={form.secret}
-          onChange={(e) => setForm({ ...form, secret: e.target.value })}
-        />
+        {form.type === "gdrive" ? (
+          <p className="text-xs text-ink-secondary">
+            Save the non-secret selection and approved audience project IDs here, then authorize
+            above. OAuth credentials are written only by the verified callback and are never accepted
+            in this form. Drive content is not placed in General automatically.
+          </p>
+        ) : (
+          <input
+            className="prism-input"
+            type="password"
+            autoComplete="off"
+            placeholder="secret token (e.g. xoxb-… for Slack) — stored encrypted, never shown again"
+            value={form.secret}
+            onChange={(e) => setForm({ ...form, secret: e.target.value })}
+          />
+        )}
         <button type="submit" disabled={pending} className="btn-prism justify-center">
           <Plug className="size-4" /> Save integration
         </button>
@@ -1018,26 +1333,33 @@ export function IntegrationsManager({
                       : "border-border-default text-ink-tertiary"
                   }`}
                 >
-                  {i.status === "enabled" ? "Enabled" : "Disabled"}
+                  {i.type === "gdrive"
+                    ? (i.status === "enabled" ? "Pause" : "Resume")
+                    : (i.status === "enabled" ? "Enabled" : "Disabled")}
                 </button>
+                {i.type !== "gdrive" ? (
+                  <button
+                    onClick={() => {
+                      const s = window.prompt(`New secret for ${i.name}:`);
+                      if (s) run(() => rotateSecret(teamSlug, i.id, s));
+                    }}
+                    disabled={pending}
+                    className="rounded-lg border border-border-default p-1.5 text-ink-secondary hover:text-ink"
+                    aria-label="Rotate secret"
+                  >
+                    <KeyRound className="size-4" />
+                  </button>
+                ) : null}
                 <button
                   onClick={() => {
-                    const s = window.prompt(`New secret for ${i.name}:`);
-                    if (s) run(() => rotateSecret(teamSlug, i.id, s));
-                  }}
-                  disabled={pending}
-                  className="rounded-lg border border-border-default p-1.5 text-ink-secondary hover:text-ink"
-                  aria-label="Rotate secret"
-                >
-                  <KeyRound className="size-4" />
-                </button>
-                <button
-                  onClick={() => {
-                    if (window.confirm(`Delete integration "${i.name}"?`)) run(() => removeIntegration(teamSlug, i.id));
+                    const message = i.type === "gdrive"
+                      ? `Disconnect "${i.name}"? Imported content is retained; disconnecting does not purge it or claim it is current.`
+                      : `Delete integration "${i.name}"?`;
+                    if (window.confirm(message)) run(() => removeIntegration(teamSlug, i.id));
                   }}
                   disabled={pending}
                   className="rounded-lg border border-border-default p-1.5 text-ink-secondary hover:text-red"
-                  aria-label="Delete integration"
+                  aria-label={i.type === "gdrive" ? "Disconnect Google Drive" : "Delete integration"}
                 >
                   <Trash2 className="size-4" />
                 </button>

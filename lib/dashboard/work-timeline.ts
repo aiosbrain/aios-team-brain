@@ -28,6 +28,9 @@ import { slackParticipations, foldProviderId } from "@/lib/ingest/slack-particip
 import { canSeeMeetingNotes } from "@/lib/meetings/notes";
 import { rowVisibleByProvenanceCtx } from "@/lib/access/provenance";
 import { isCalendarEvent } from "@/lib/meetings/from-calendar";
+import { buildIdentityMap } from "@/lib/identity/resolve";
+import { googleDriveContributionEvidence } from "./gdrive-contributions";
+import { gdriveObservationIdentity } from "@/lib/ingest/gdrive-ledger";
 
 // Only ACTIVE tasks are considered work "in progress". Since brain-api v1.21 (AIO-950) a Linear
 // "In Review" state normalizes to its own `in_review` rather than collapsing into `in_progress`;
@@ -251,7 +254,7 @@ export async function getWorkTimeline(
   const todayISO = new Date().toISOString().slice(0, 10);
 
   const [memberRes, teamRes, slackIdRes] = await Promise.all([
-    db.from("members").select("id, display_name, actor_handle, avatar_url, email").eq("team_id", teamId).eq("status", "active"),
+    db.from("members").select("id, display_name, actor_handle, avatar_url, email, is_connector").eq("team_id", teamId).eq("status", "active"),
     db.from("teams").select("primary_pm_provider, slug").eq("id", teamId).maybeSingle(),
     // Slack user id → member, for per-participant Slack attribution. Best-effort ENRICHMENT (a missing
     // map just means no Slack rows), so — unlike the core ledger legs — a failure here isn't fatal.
@@ -273,7 +276,8 @@ export async function getWorkTimeline(
     actor_handle: string | null;
     avatar_url: string | null;
     email: string | null;
-  }[]).filter((m) => !(m.email ?? "").endsWith("@connector.local"));
+    is_connector?: boolean | null;
+  }[]).filter((m) => !m.is_connector && !(m.email ?? "").endsWith("@connector.local"));
   const members = new Map<string, TimelineMember>();
   const roster: RosterPerson[] = [];
   for (const m of humans) {
@@ -333,7 +337,6 @@ export async function getWorkTimeline(
           .select("id, kind, member_id, member_id_locked, frontmatter, path, work_at")
           .eq("team_id", teamId)
           .neq("kind", "task")
-          .not("member_id", "is", null)
           .eq("work_at_from_source", true)
           .gte("work_at", sinceIso)
           .order("work_at", { ascending: false })
@@ -443,9 +446,81 @@ export async function getWorkTimeline(
     })),
   });
   // Primary contributor for an item, falling back to the current owner when the oracle has no opinion
-  // (e.g. no human version history). Kept the `.not("member_id","is",null)` prefetch prefilter on the leg
-  // queries: an owner-null but version-authored item stays hidden (documented — matches prior behavior).
+  // (e.g. no human version history). Drive is deliberately excluded here because its independent,
+  // paginated evidence ledger applies current mapping authority and correction locks below.
   const primaryOf = (r: ItemRow): string | null => credit.get(r.id)?.primaryId ?? r.member_id;
+  // Google contribution observations resolve through the same shared registry as ingest and the
+  // member identity UI. STRICT: a failed alias/provider read must not become a cached partial ledger.
+  const googleIdentities = await buildIdentityMap(db, teamId, { strict: true });
+
+  type GdriveLedgerRow = {
+    item_id: string;
+    evidence_key: string;
+    external_id: string | null;
+    email: string | null;
+    display_name: string | null;
+    role: string;
+    source_at: string;
+    updated_at: string;
+    member_id: string | null;
+    member_id_locked: boolean;
+    frontmatter: Record<string, unknown> | null;
+    path: string | null;
+  };
+  // Drive evidence has its own retained ledger and seek pagination. It must not compete with the
+  // generic ITEM_LIMIT window: a burst of Notion/git rows or equal timestamps cannot silently evict
+  // older valid Drive contributions. Every page is required; a read failure aborts the build so no
+  // partial payload can be cached as complete.
+  const gdriveRows: GdriveLedgerRow[] = [];
+  let driveCursor: { at: string; itemId: string; key: string } | null = null;
+  for (;;) {
+    const p = newSqlParams();
+    const conditions = [
+      `e.team_id=${p.add(teamId)}`,
+      `e.source_at is not null`,
+      `e.source_at>=${p.add(sinceIso)}::timestamptz`,
+      `e.source_at<=${p.add(new Date(futureBoundMs).toISOString())}::timestamptz`,
+    ];
+    if (visArr) conditions.push(`e.item_id=any(${p.add(visArr)}::uuid[])`);
+    if (driveCursor) {
+      conditions.push(
+        `(e.source_at,e.item_id,e.evidence_key)<(` +
+        `${p.add(driveCursor.at)}::timestamptz,${p.add(driveCursor.itemId)}::uuid,${p.add(driveCursor.key)})`,
+      );
+    }
+    const page = await runSql<GdriveLedgerRow>(
+      `select e.item_id,e.evidence_key,e.external_id,e.email::text,e.display_name,e.role,
+              e.source_at::text,e.updated_at::text,i.member_id,i.member_id_locked,i.frontmatter,i.path
+         from gdrive_contribution_evidence e
+         join items i on i.team_id=e.team_id and i.id=e.item_id
+        where ${conditions.join(" and ")}
+        order by e.source_at desc,e.item_id desc,e.evidence_key desc
+        limit ${p.add(ITEM_LIMIT)}`,
+      p.values,
+    ).catch((error) => {
+      throw new Error(`work-timeline gdrive ledger: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    gdriveRows.push(...page.rows);
+    if (page.rows.length < ITEM_LIMIT) break;
+    const last = page.rows.at(-1)!;
+    driveCursor = { at: last.source_at, itemId: last.item_id, key: last.evidence_key };
+  }
+  // One row per observation. The ledger converges on that itself — a stable provider id, role and
+  // instant are one row from the item's next write on — but until that write a row from before an
+  // e-mail or timestamp-spelling change can still be there. The most recently written row speaks
+  // for the observation: the older one must neither double the credit nor resolve it through an
+  // e-mail the person no longer has. Decided before anything is resolved, across every page.
+  const gdriveObservations = new Map<string, GdriveLedgerRow>();
+  for (const row of gdriveRows) {
+    const { stableId, person, role, at } = gdriveObservationIdentity({
+      external_id: row.external_id, role: row.role, at: row.source_at,
+    });
+    const key = stableId
+      ? `${row.item_id}\0${person}\0${role}\0${at}`
+      : `${row.item_id}\0${row.evidence_key}`;
+    const seen = gdriveObservations.get(key);
+    if (!seen || Date.parse(row.updated_at) > Date.parse(seen.updated_at)) gdriveObservations.set(key, row);
+  }
 
   // In-window evidence items (commits + docs) with the text an issue key would appear in. A git
   // commit's key is in its BODY; other items' in the title/path (no large-body fetch — see the
@@ -453,6 +528,35 @@ export async function getWorkTimeline(
   // `sha` is set for git commits only — the join key to the PR that merged them (work_events.merged_sha).
   type Ev = EvidenceItem & { memberId: string; text: string; sha?: string };
   const evItems: Ev[] = [];
+  for (const row of gdriveObservations.values()) {
+    const fm = row.frontmatter ?? {};
+    const title = str(fm.title) || (row.path ? basename(row.path) : "") || "Google document";
+    const contributions = [{
+      external_id: row.external_id,
+      email: row.email,
+      display_name: row.display_name,
+      role: row.role,
+      at: row.source_at,
+    }];
+    const evidence = googleDriveContributionEvidence(
+      { ...fm, source: "gdrive", contributions },
+      row.item_id,
+      googleIdentities,
+      { memberIdLocked: row.member_id_locked, memberId: row.member_id },
+    )[0];
+    if (!evidence || !members.has(evidence.memberId) || !inWindow(evidence.at)) continue;
+    evItems.push({
+      id: evidence.id,
+      memberId: evidence.memberId,
+      source: "gdrive",
+      kind: "deliverable",
+      title,
+      url: evidence.sourceUrl ? httpUrl(evidence.sourceUrl) : undefined,
+      at: evidence.at,
+      contributionRole: evidence.role,
+      text: `${title}\n${row.path ?? ""}`,
+    });
+  }
   for (const r of (gitRes.data ?? []) as ItemRow[]) {
     const memberId = primaryOf(r);
     if (!memberId || !members.has(memberId)) continue;
@@ -466,6 +570,7 @@ export async function getWorkTimeline(
     const fm = r.frontmatter ?? {};
     if (str(fm.source) === "git") continue; // handled by gitRes — no double-count
     const source = normalizeSource(str(fm.source));
+    if ((str(fm.source) ?? "").toLowerCase() === "gdrive") continue; // retained ledger above — no cap/double-count
     // Each of these has its OWN leg, so admitting the raw item here would count the same work twice.
     // CALENDAR is the newest and was the easy one to miss: unlike a granola transcript it arrives as a
     // plain `artifact` with `occurred_at` frontmatter, so it passes `work_at_from_source` and lands in
@@ -629,7 +734,7 @@ export async function getWorkTimeline(
   // headers) — that gate, not a status filter, is what keeps the backlog off the timeline.
   const evidence: EvidenceWithMember[] = [];
   for (const e of evItems) {
-    const base: EvidenceItem & { memberId: string } = { id: e.id, memberId: e.memberId, source: e.source, kind: e.kind, title: e.title, url: e.url, at: e.at };
+    const base: EvidenceItem & { memberId: string } = { id: e.id, memberId: e.memberId, source: e.source, kind: e.kind, title: e.title, url: e.url, at: e.at, contributionRole: e.contributionRole };
     // Resolve against ALL referenced tasks (`allLinks`), not just the active ones, so a just-shipped
     // ticket heads its own group instead of its evidence falling to "Other" with a contradicting chip.
     const ownTaskIds = (allLinks.get(e.id) ?? []).filter((id) => taskInfo.has(id));

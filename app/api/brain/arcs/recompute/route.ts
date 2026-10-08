@@ -13,6 +13,11 @@ import { freshnessWire, computedNow } from "@/lib/freshness";
 import { memberEnforcement } from "@/lib/access/enforce";
 import { filterArcsByVisibleItems } from "@/lib/graph/arc-visibility";
 import { readArcCache } from "@/lib/graph/arc-cache";
+import { authorizationEpoch, withLockedAuthorizationEpoch } from "@/lib/access/authorization-epoch";
+import {
+  ArcInputAuthorizationUnavailableError,
+  ArcSynthesisAuthorizationChangedError,
+} from "@/lib/graph/arc-input-authorization";
 
 export const runtime = "nodejs";
 export const maxDuration = 120; // arc synthesis (LLM) inline path can take up to ~110s on a cold cache
@@ -66,109 +71,122 @@ export async function POST(req: NextRequest) {
   const memberId = (me as { id: string }).id;
 
   const admin = adminClient();
-  // PRET-4 §1a: posture, not the record — the correction-write gate keys on team posture.
   const { resolveViewerPosture } = await import("@/lib/access/posture");
-  const tier = await resolveViewerPosture(admin, team.id, memberId);
-  if (tier !== "team") return errorResponse("forbidden", "corrections are team-posture only", 403);
-
-  // Access enforcement (Phase B slice 5, spec §5.8). Resolve the member's visibility ONCE, fail
-  // closed on a substrate error (→ 500), and use it for the scope + BOTH gates below.
-  // PCCC6B-1: an ENFORCED member's recompute runs in their partition scope — the same scope their
-  // GET serves — so the correction is recorded under that scope key and can never feed another
-  // scope's synthesis. Permissive keeps the tier path byte-identical.
-  let enforce: import("@/lib/access/enforce").TimelineEnforcement | null;
-  let scope: import("@/lib/graph/partition-read").ArcScope;
-  try {
-    enforce = await memberEnforcement(admin, { teamId: team.id, memberId });
-    // PRET-3: the SAME mode-keyed resolution as the GET — the gate below must consult the row
-    // the member was actually served, so the two resolutions must agree (Fable 6b Medium 3's
-    // uncapped rule lives inside resolveArcScope now).
-    scope = await resolveArcScope(admin, { teamId: team.id, teamSlug, memberId, tier, enforcement: enforce });
-  } catch {
-    return errorResponse("internal", "enforcement check failed", 500);
-  }
   // PRET-3: every recompute runs in ONE partition — the fused panel annotates each arc with its
   // sourceGroup, so every client can name one. Absent = a stale pre-unification client (spec
   // M5: a NEW 422 class, stated in the slice spec; the panel self-heals on next load).
   if (sourceGroup == null) {
     return errorResponse("invalid_payload", "sourceGroup is required — correct one partition at a time (refresh the arcs panel if yours predates the unification)", 422);
   }
-  if (!scope.groups.includes(sourceGroup)) {
-    return errorResponse("forbidden", "the claimed partition is outside your visible scope", 403);
-  }
-  // PRET-3 H1 write-side corollary: the external-shared partition's synthesis is
-  // CORRECTIONS-FREE (client-facing prose carries no internal editorial text), so accepting a
-  // correction scoped to it would store prose the read side never loads — the H13
-  // dead-correction shape. Refuse loudly instead.
-  if (isExternalGroupId(sourceGroup)) {
-    return errorResponse(
-      "invalid_payload",
-      "corrections cannot target the external-shared partition — its synthesis is corrections-free (client-facing prose carries no internal editorial text)",
-      422
-    );
-  }
   const groups = [sourceGroup];
   const scopeKey = `g:${sourceGroup}`;
 
-  // WRITE gate (Codex B5 High — correction poisoning): recomputeArcs WRITES each correction to
-  // `arc_corrections` AND projects it into a Graphiti group, then feeds every future same-scope
-  // synthesis. The schema accepts ANY `arc_id`, so without this an attenuated member could
-  // inject arbitrary/invisible corrections and poison the SHARED synthesis (not a replay-only edge as
-  // an earlier fold wrongly claimed). Under enforcing, a member may only correct an arc they can
-  // currently SEE: validate every target against the VISIBLE cached arc set BEFORE the write — read
-  // the cache (no synthesis; a cold cache has nothing to correct → reject). An `arc_id` that churned
-  // since their GET no longer matches → rejected, they re-fetch (fail closed beats poisonable).
-  // PCCC6B-1: the cache row consulted is the member's OWN scope row — the arcs they were actually
-  // looking at — not the tier row their GET no longer reads.
-  if (enforce) {
-    const cached = await readArcCache(admin, team.id, scopeKey);
-    const visibleIds = new Set(filterArcsByVisibleItems(cached?.arcs ?? [], enforce.visibleItemIds).map((a) => a.id));
+  // Resolve posture, visibility and the exact partition from scratch on each attempt. The correction
+  // gate, synthesis, cache publication and response are all tied to the same durable epoch. A
+  // revocation during model work retries the whole authority resolution once; it never reuses the
+  // superseded groups or visible-item set.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const epoch = await withLockedAuthorizationEpoch(team.id, (current) => current);
+    let tier: Awaited<ReturnType<typeof resolveViewerPosture>>;
+    let enforce: import("@/lib/access/enforce").TimelineEnforcement;
+    let scope: import("@/lib/graph/partition-read").ArcScope;
+    try {
+      tier = await resolveViewerPosture(admin, team.id, memberId);
+      enforce = await memberEnforcement(admin, { teamId: team.id, memberId });
+      scope = await resolveArcScope(admin, { teamId: team.id, teamSlug, memberId, tier, enforcement: enforce });
+    } catch {
+      return errorResponse("internal", "enforcement check failed", 500);
+    }
+    if (await authorizationEpoch(admin, team.id) !== epoch) continue;
+    if (tier !== "team") return errorResponse("forbidden", "corrections are team-posture only", 403);
+    if (!scope.groups.includes(sourceGroup)) {
+      return errorResponse("forbidden", "the claimed partition is outside your visible scope", 403);
+    }
+    // Client-facing prose is corrections-free. Persisting a correction there would create a durable
+    // input that the corresponding synthesis deliberately never loads.
+    if (isExternalGroupId(sourceGroup)) {
+      return errorResponse(
+        "invalid_payload",
+        "corrections cannot target the external-shared partition — its synthesis is corrections-free (client-facing prose carries no internal editorial text)",
+        422
+      );
+    }
+
+    // Validate every correction against the exact cached partition the member saw. A cold or stale-id
+    // request fails closed; arbitrary arc ids can never become synthesis inputs.
+    let cached: Awaited<ReturnType<typeof readArcCache>>;
+    try {
+      cached = await readArcCache(admin, team.id, scopeKey);
+    } catch {
+      return errorResponse("internal", "arc visibility check failed", 500);
+    }
+    const visibleArcs = filterArcsByVisibleItems(cached?.arcs ?? [], enforce.visibleItemIds);
+    const visibleById = new Map(visibleArcs.map((arc) => [arc.id, arc]));
+    const visibleIds = new Set(visibleById.keys());
     if (corrections.some((c) => !visibleIds.has(c.arc_id))) {
-      // Fable 6b Medium 5: scope-key drift (a latch flip or General's debt toggling between the
-      // member's GET and this POST) reads a different row than the arcs they saw — fail closed,
-      // but the message must not accuse them of a visibility violation for cache churn.
       return errorResponse(
         "forbidden",
         "a correction targets an arc outside your visibility, or your arc view is stale — refresh the arcs and retry",
         403
       );
     }
+    if (await authorizationEpoch(admin, team.id) !== epoch) continue;
+
+    // M9: unlike the arcs READ, a recompute has no non-model reading to fall back to — synthesis IS
+    // the operation. So the honest outcome is a named refusal, placed after authentication,
+    // membership, posture and the correction-visibility gate above (so it discloses nothing to a
+    // caller who would not have been allowed to recompute anyway) and before the eager key
+    // resolution, which would otherwise throw `copied-staging-no-spend` as a generic 500.
+    const answering = modelFeatureVerdict();
+    if (!answering.enabled) {
+      return errorResponse(answering.code ?? "answering_disabled", answering.message ?? "model-backed answering is disabled", 503);
+    }
+    const keys = await resolveAnsweringKeys(admin, team.id);
+    // The wire carries only the human edit. Source dependencies come from the exact authorized arc
+    // row the server just gated, including every item behind every cited source fact. Legacy arcs
+    // without complete server provenance still preserve the edit, but it remains synthesis-ineligible.
+    const serverCorrections = corrections.map((correction) => ({
+      ...correction,
+      source_provenance: visibleById.get(correction.arc_id)?.source_provenance ?? {
+        state: "incomplete" as const,
+        item_ids: [],
+      },
+      captured_authorization_epoch: epoch,
+    }));
+
+    try {
+      const { arcs: allArcs, freshness } = await recomputeArcs(
+        admin,
+        team.id,
+        teamSlug,
+        tier,
+        groups,
+        serverCorrections,
+        keys,
+        memberId,
+        { scopeKey, expectedAuthorizationEpoch: epoch }
+      );
+      const served = await withLockedAuthorizationEpoch(team.id, (current) => {
+        if (current !== epoch) return null;
+        return {
+          arcs: filterArcsByVisibleItems(allArcs, enforce.visibleItemIds),
+          freshness,
+        };
+      });
+      if (!served) continue;
+      const wire = freshnessWire(served.freshness);
+      return Response.json(
+        served.arcs.length === 0
+          ? { arcs: served.arcs, ...freshnessWire(computedNow()) }
+          : { arcs: served.arcs, ...wire }
+      );
+    } catch (error) {
+      if (error instanceof ArcSynthesisAuthorizationChangedError) continue;
+      if (error instanceof ArcInputAuthorizationUnavailableError) {
+        return errorResponse("temporarily_unavailable", "arc authorization unavailable; retry the request", 503);
+      }
+      throw error;
+    }
   }
-
-  // M9: unlike the arcs READ, a recompute has no non-model reading to fall back to — synthesis IS
-  // the operation. So the honest outcome is a named refusal, placed after authentication,
-  // membership, posture and the correction-visibility gate above (so it discloses nothing to a
-  // caller who would not have been allowed to recompute anyway) and before the eager key
-  // resolution, which would otherwise throw `copied-staging-no-spend` as a generic 500.
-  const answering = modelFeatureVerdict();
-  if (!answering.enabled) {
-    return errorResponse(answering.code ?? "answering_disabled", answering.message ?? "model-backed answering is disabled", 503);
-  }
-  const keys = await resolveAnsweringKeys(admin, team.id);
-  const { arcs: allArcs, freshness } = await recomputeArcs(
-    admin,
-    team.id,
-    teamSlug,
-    tier,
-    groups,
-    corrections,
-    keys,
-    memberId,
-    { scopeKey } // PRET-3: every recompute is partition-scoped — the g: key always
-  );
-
-  // READ gate: drop arcs the member can't see — this route returns the recomputed TIER set, so
-  // without the filter it is an unfiltered bypass of the enforced arc read (Fable B5 High).
-  const arcs = filterArcsByVisibleItems(allArcs, enforce?.visibleItemIds ?? null);
-
-  // WAS `new Date()`. A recompute can legitimately return arcs it did NOT compute: `canReuseArcs` skips
-  // the model when facts are unchanged, and a degraded synthesis is refused in favour of the prior (H11).
-  // Stamping "now" told the user their correction had landed in a fresh set when it may not have.
-  // §5.7: when an enforcing member's result is EMPTY, neutralize the freshness envelope — the tier
-  // cache's `as_of`/`stale`/`degraded` would otherwise leak hidden-corpus refresh/failure activity
-  // (Codex B5 Medium), letting them distinguish "team has nothing" from "everything is invisible".
-  const wire = freshnessWire(freshness);
-  const enforcingEmpty = enforce != null && arcs.length === 0;
-  // Neutral envelope via `computedNow` on enforcing-empty (§5.7) — not an inline `new Date()`.
-  return Response.json(enforcingEmpty ? { arcs, ...freshnessWire(computedNow()) } : { arcs, ...wire });
+  return errorResponse("temporarily_unavailable", "arc authorization changed; retry the request", 503);
 }

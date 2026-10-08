@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { recordArcCorrections, listArcCorrections } from "@/lib/graph/arc-corrections";
+import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { arcCorrectionVersion, recordArcCorrections, listArcCorrections, rollbackArcCorrection } from "@/lib/graph/arc-corrections";
 import { runSql } from "@/lib/db/pg/pool";
+import { writeArcCache } from "@/lib/graph/arc-cache";
 import { db, seedTeam } from "./helpers";
 
 /**
@@ -44,6 +47,50 @@ describe("arc corrections are durable in Postgres (real Postgres)", () => {
     expect(ok).toBe(true);
     expect(stored).toHaveLength(1);
     expect(stored[0].corrected_text).toBe("second take");
+  });
+
+  it("appends immutable revisions, preserves dependency lineage, and rolls back by pointer", async () => {
+    const seed = await seedTeam();
+    const sourceA = randomUUID();
+    const sourceB = randomUUID();
+    await recordArcCorrections(db(), seed.teamId, seed.memberId, [{
+      arc_id: "immutable", arc_title: "Immutable", corrected_text: "first",
+      provenance_state: "complete", source_item_ids: [sourceA], captured_authorization_epoch: 1,
+    }], "g:immutable");
+    const first = (await listArcCorrections(db(), seed.teamId, { groupKey: "g:immutable", includeLegacy: false })).corrections[0];
+    await recordArcCorrections(db(), seed.teamId, seed.memberId, [{
+      arc_id: "immutable", arc_title: "Immutable", corrected_text: "second",
+      provenance_state: "complete", source_item_ids: [sourceA, sourceB],
+      source_correction_revision_ids: [first.revision_id!], captured_authorization_epoch: 1,
+    }], "g:immutable");
+    const current = (await listArcCorrections(db(), seed.teamId, { groupKey: "g:immutable", includeLegacy: false })).corrections[0];
+    expect(current.corrected_text).toBe("second");
+    expect((await db().from("arc_correction_revisions").select("id").eq("correction_id", current.id)).data).toHaveLength(2);
+    expect((await db().from("arc_correction_revision_dependencies").select("source_item_id")
+      .eq("revision_id", first.revision_id!)).data).toEqual([{ source_item_id: sourceA }]);
+    expect((await db().from("arc_correction_revision_parents").select("parent_revision_id")
+      .eq("revision_id", current.revision_id!)).data).toEqual([{ parent_revision_id: first.revision_id }]);
+    const versionBeforeRollback = await arcCorrectionVersion(seed.teamId);
+    await rollbackArcCorrection(seed.teamId, current.id, first.revision_id!);
+    const rolledBack = (await listArcCorrections(db(), seed.teamId, { groupKey: "g:immutable", includeLegacy: false })).corrections[0];
+    expect(rolledBack.corrected_text).toBe("first");
+    expect(await arcCorrectionVersion(seed.teamId)).toBe(versionBeforeRollback + 1);
+  });
+
+  it("rejects a paused old correction-version publisher even when dependency count is unchanged", async () => {
+    const seed = await seedTeam();
+    const source = randomUUID();
+    const edit = (text: string) => recordArcCorrections(db(), seed.teamId, seed.memberId, [{
+      arc_id: "paused", arc_title: "Paused", corrected_text: text,
+      provenance_state: "complete" as const, source_item_ids: [source], captured_authorization_epoch: 1,
+    }], "g:paused");
+    await edit("A");
+    const pausedVersion = await arcCorrectionVersion(seed.teamId);
+    await edit("B");
+    expect(await writeArcCache(db(), seed.teamId, "g:paused", [], "same-count", {
+      authorizationEpoch: 1,
+      correctionVersion: pausedVersion,
+    })).toBe(false);
   });
 
   it("scopes corrections to their team", async () => {
@@ -174,5 +221,40 @@ describe("arc corrections are durable in Postgres (real Postgres)", () => {
 
     const partition = await listArcCorrections(db(), seed.teamId, { groupKey: "p:acme:g_x", includeLegacy: false });
     expect(partition.corrections).toEqual([]);
+  });
+
+  it("migration is additive/replay-safe and legacy corrections default to unproven", async () => {
+    const seed = await seedTeam();
+    await db().from("arc_corrections").insert({
+      team_id: seed.teamId, arc_id: "legacy-provenance", arc_title: "Legacy",
+      corrected_text: "history only", group_key: "g:legacy",
+    });
+    const migration = readFileSync(
+      "postgres/migrations/20260922160000_arc_correction_source_dependencies.sql",
+      "utf8",
+    );
+    await runSql(migration, []);
+    await runSql(migration, []);
+    const revisionsMigration = readFileSync(
+      "postgres/migrations/20260922170000_arc_correction_immutable_revisions.sql",
+      "utf8",
+    );
+    await runSql(revisionsMigration, []);
+    await runSql(revisionsMigration, []);
+    const { data } = await db().from("arc_corrections")
+      .select("provenance_state,source_dependency_count,captured_authorization_epoch")
+      .eq("team_id", seed.teamId).eq("arc_id", "legacy-provenance").single();
+    expect(data).toEqual({
+      provenance_state: "unproven",
+      source_dependency_count: 0,
+      captured_authorization_epoch: null,
+    });
+    const { data: logical } = await db().from("arc_corrections")
+      .select("current_revision_id").eq("team_id", seed.teamId).eq("arc_id", "legacy-provenance").single();
+    expect((logical as { current_revision_id: string }).current_revision_id).toBeTruthy();
+    const { data: revision } = await db().from("arc_correction_revisions")
+      .select("provenance_state,parent_revision_count")
+      .eq("id", (logical as { current_revision_id: string }).current_revision_id).single();
+    expect(revision).toEqual({ provenance_state: "unproven", parent_revision_count: 0 });
   });
 });

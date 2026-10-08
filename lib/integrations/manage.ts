@@ -60,6 +60,58 @@ export async function upsertIntegration(
   return { id: data.id as string, status: data.status as string };
 }
 
+/**
+ * Reserve a named Google Drive connection that does not exist yet, so an OAuth publication has
+ * connection rows to lock BEFORE it locks its initiating Admin (`lib/integrations/gdrive-oauth.ts`).
+ *
+ * Transaction-local by contract: the caller is inside its publication transaction and follows this
+ * with `upsertIntegration` (which audits and sets `created_by`) or rolls back, so a reservation is
+ * never visible on its own and a failed publication leaves none. For that reason:
+ *   • `created_by` is NULL — inserting it would take the member's foreign-key lock ahead of the
+ *     connection, the wrong way round for the Drive acquisition order;
+ *   • it is CREATE-OR-READ-WINNER — a concurrent creator of the same name is waited for and then
+ *     read; an existing connection is never rewritten merely to reserve it;
+ *   • it writes no audit row of its own — the publication it precedes is the audited change.
+ */
+export async function reserveGdriveIntegration(
+  db: DbClient,
+  teamId: string,
+  name: string,
+  rawConfig: Record<string, unknown>,
+): Promise<{ id: string; reserved: boolean }> {
+  const config = validateIntegrationConfig("gdrive", rawConfig); // throws IntegrationConfigError → 400
+  const { data, error } = await db
+    .from("integrations")
+    .upsert(
+      {
+        team_id: teamId,
+        type: "gdrive",
+        name,
+        config,
+        status: "enabled",
+        created_by: null,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "team_id,type,name", ignoreDuplicates: true }
+    )
+    .select("id");
+  if (error) throw new Error(`integration reservation failed: ${error.message}`);
+  const created = ((data ?? []) as { id: string }[])[0];
+  if (created) return { id: created.id, reserved: true };
+
+  const { data: winner, error: winnerError } = await db
+    .from("integrations")
+    .select("id")
+    .eq("team_id", teamId)
+    .eq("type", "gdrive")
+    .eq("name", name)
+    .maybeSingle();
+  if (winnerError || !winner) {
+    throw new Error(`integration reservation failed: ${winnerError?.message ?? "the concurrent creator's row is gone"}`);
+  }
+  return { id: (winner as { id: string }).id, reserved: false };
+}
+
 export async function setIntegrationStatus(
   db: DbClient,
   auth: IntegrationAuth,
@@ -126,6 +178,54 @@ export async function deleteIntegration(
   if (deletedType && (PROVIDER_INTEGRATION_TYPES as readonly string[]).includes(deletedType)) {
     await clearDanglingProviderPointers(db, auth, deletedType as ProviderIntegrationType);
   }
+}
+
+/** Disconnect Drive without purging content: retain a disabled non-secret row as the stop marker. */
+export async function disconnectGdriveIntegration(
+  db: DbClient,
+  auth: IntegrationAuth,
+  id: string,
+): Promise<void> {
+  const { error } = await db
+    .from("integrations")
+    .update({ status: "disabled", secret_ciphertext: null, updated_at: new Date().toISOString() })
+    .eq("id", id)
+    .eq("team_id", auth.teamId)
+    .eq("type", "gdrive");
+  if (error) throw new Error(`Google Drive disconnect failed: ${error.message}`);
+  await audit(db, {
+    team_id: auth.teamId,
+    actor_kind: "member",
+    member_id: auth.memberId,
+    action: "integration.disconnected",
+    target_type: "integration",
+    target_id: id,
+    meta: { type: "gdrive", retainedContent: true, credentialRemoved: true },
+  });
+}
+
+/**
+ * Apply the product's remove semantics without making a dashboard action inspect the integrations
+ * table directly. Drive is disconnected in place so retained documents keep a durable stop marker;
+ * every other integration keeps the existing hard-delete behavior.
+ */
+export async function removeIntegrationById(
+  db: DbClient,
+  auth: IntegrationAuth,
+  id: string,
+): Promise<void> {
+  const { data, error } = await db
+    .from("integrations")
+    .select("type")
+    .eq("id", id)
+    .eq("team_id", auth.teamId)
+    .maybeSingle();
+  if (error) throw new Error(`integration lookup failed: ${error.message}`);
+  if ((data as { type?: string } | null)?.type === "gdrive") {
+    await disconnectGdriveIntegration(db, auth, id);
+    return;
+  }
+  await deleteIntegration(db, auth, id);
 }
 
 /**
@@ -247,9 +347,57 @@ export interface IntegrationWithSecret {
   secret: string | null;
 }
 
+/** One named integration, including its decrypted credential, for server-only admin/OAuth flows. */
+export async function getIntegrationWithSecret(
+  db: DbClient,
+  teamId: string,
+  type: IntegrationType,
+  name: string,
+): Promise<(IntegrationWithSecret & { status: "enabled" | "disabled" }) | null> {
+  const { data, error } = await db
+    .from("integrations")
+    .select("id, type, name, config, status, secret_ciphertext")
+    .eq("team_id", teamId)
+    .eq("type", type)
+    .eq("name", name)
+    .maybeSingle();
+  if (error) throw new Error(`load integration failed: ${error.message}`);
+  if (!data) return null;
+  return {
+    id: data.id as string,
+    type: data.type as IntegrationType,
+    name: data.name as string,
+    config: (data.config as Record<string, unknown>) ?? {},
+    status: data.status as "enabled" | "disabled",
+    secret: data.secret_ciphertext ? decryptSecret(data.secret_ciphertext as string) : null,
+  };
+}
+
+/** Server-only exact-id variant for an already Admin-authorized mutation/action. */
+export async function getIntegrationWithSecretById(
+  db: DbClient,
+  teamId: string,
+  id: string,
+): Promise<(IntegrationWithSecret & { status: "enabled" | "disabled" }) | null> {
+  const { data, error } = await db.from("integrations")
+    .select("id,type,name,config,status,secret_ciphertext")
+    .eq("team_id", teamId).eq("id", id).maybeSingle();
+  if (error) throw new Error(`load integration failed: ${error.message}`);
+  if (!data) return null;
+  return {
+    id: data.id as string,
+    type: data.type as IntegrationType,
+    name: data.name as string,
+    config: (data.config as Record<string, unknown>) ?? {},
+    status: data.status as "enabled" | "disabled",
+    secret: data.secret_ciphertext ? decryptSecret(data.secret_ciphertext as string) : null,
+  };
+}
+
 /**
- * The sidecar read path: enabled integrations for a team with DECRYPTED secrets. Call ONLY
- * from the connector-key-authenticated endpoint (GET /api/v1/integrations) — never a page.
+ * In-process runner read path: enabled integrations for a team with DECRYPTED secrets. Never use
+ * from `GET /api/v1/integrations` (selection-only) or a browser route. The HTTP-only Drive sidecar
+ * uses the dedicated short-lived token broker instead.
  */
 export async function getEnabledIntegrationsWithSecrets(
   db: DbClient,
@@ -385,7 +533,7 @@ export interface IntegrationSelection {
   type: IntegrationType;
   name: string;
   config: Record<string, unknown>;
-  status: "enabled";
+  status: "enabled" | "disabled";
 }
 
 /**
@@ -414,6 +562,26 @@ export async function listEnabledIntegrationSelections(
     name: r.name as string,
     config: (r.config as Record<string, unknown>) ?? {},
     status: "enabled" as const,
+  }));
+}
+
+/** All non-secret selections, including disabled stop markers for Admin-managed sidecars. */
+export async function listIntegrationSelections(
+  db: DbClient,
+  teamId: string,
+): Promise<IntegrationSelection[]> {
+  const { data, error } = await db
+    .from("integrations")
+    .select("id, type, name, config, status")
+    .eq("team_id", teamId)
+    .order("created_at", { ascending: true });
+  if (error) throw new Error(`list integration selections failed: ${error.message}`);
+  return (data ?? []).map((r) => ({
+    id: r.id as string,
+    type: r.type as IntegrationType,
+    name: r.name as string,
+    config: (r.config as Record<string, unknown>) ?? {},
+    status: r.status as "enabled" | "disabled",
   }));
 }
 

@@ -40,7 +40,7 @@ async def _apply_brain_selections(
     selection-fetch failure never crashes a sync."""
     try:
         async with BrainClient(settings.base_url, settings.api_key, settings.team) as client:
-            remote = await client.fetch_integration_selections()
+            remote = await client.fetch_integration_selections(include_disabled=True)
     except BrainError as e:
         click.echo(f"warning: brain selection fetch failed ({e}); using local connections")
         return conns
@@ -185,23 +185,36 @@ def scan(repo_path, slug, full_name, window_days, backfill, rubric_path) -> None
 @main.command()
 @click.option("--config", "config_path", required=True, help="connections.yaml path")
 @click.option("--poll-interval", default=300, type=int, help="seconds between polls")
-@click.option("--renewal-interval", default=1800, type=int, help="(inert) reserved for Drive watch-channel sweeps — no watch manager is wired")
+@click.option("--renewal-interval", default=1800, type=int, help="seconds between authorized Drive watch-channel sweeps")
 @click.option("--state-db", default="aios_ingest_state.sqlite", help="sqlite path for cursors/channels")
-def schedule(config_path, poll_interval, renewal_interval, state_db) -> None:
+@click.option(
+    "--use-brain-selections/--no-use-brain-selections",
+    "use_brain_selections",
+    default=False,
+    help="also schedule Admin-created OAuth Google Drive integrations (and consume their "
+    "Run now/Retry requests) without a local connection entry. Also enabled by "
+    "AIOS_BRAIN_SELECTIONS=1.",
+)
+def schedule(config_path, poll_interval, renewal_interval, state_db, use_brain_selections) -> None:
     """Run the background scheduler: poll every configured connection on an interval.
 
-    NOTE: Drive watch-channel renewal is NOT wired. `build_scheduler` registers that job only
-    when a `WatchManager` is passed, and this command never constructs one — so Google Drive is
-    pull-on-a-schedule only and `--renewal-interval` is currently inert.
+    Drive connections with a ``webhook_url`` create and renew channels through the same fenced
+    execution authority as polling. Polling remains the correctness backstop.
     """
     from .scheduler import run as run_scheduler
     from .state import StateStore
+    from .sources.gdrive_watch import ConfiguredGoogleDriveWatchManager
 
     settings = BrainSettings.from_env()
     conns = load_connections(config_path)
     state = StateStore(state_db)
     click.echo(f"scheduling {len(conns)} connection(s), poll every {poll_interval}s — Ctrl-C to stop")
-    run_scheduler(settings, conns, state=state, poll_interval=poll_interval, renewal_interval=renewal_interval)
+    watch_manager = ConfiguredGoogleDriveWatchManager(conns) if any(
+        conn.source == "gdrive" and conn.options.get("webhook_url") for conn in conns
+    ) else None
+    run_scheduler(settings, conns, state=state, poll_interval=poll_interval,
+                  renewal_interval=renewal_interval, watch_manager=watch_manager,
+                  bootstrap_remote_gdrive=_selections_enabled(use_brain_selections))
 
 
 if __name__ == "__main__":

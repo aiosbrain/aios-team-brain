@@ -45,6 +45,9 @@ export async function reconcileItemUnitLocked(
   if (existing) {
     const row = existing as UnitRow;
     const workAtDrift = new Date(row.occurred_at).getTime() !== new Date(item.work_at).getTime();
+    // The mirror copies the item's audience, hash and work time. It never touches `state`: a unit a
+    // Drive revocation retracted stays retracted through any ordinary reconcile, and only the claim
+    // owner reverses it (`reconcileItemUnit` with `reactivate`).
     if (
       row.audience !== item.access ||
       row.content_sha256 !== item.content_sha256 ||
@@ -103,17 +106,66 @@ export async function reconcileItemUnitLocked(
   };
 }
 
-/** Standalone compatibility entry: takes the shared item lock and never recursively checks out. */
+/**
+ * Standalone compatibility entry: takes the shared item lock and never recursively checks out.
+ *
+ * `reactivate` is for the Drive claim owner alone (`reconcileGdriveItemClaims`), which calls it
+ * while it re-derives a document's context from its SURVIVING claims and fails the surrounding
+ * transaction when there are none. It reverses a retraction under the same item lock as the mirror.
+ * No other caller may pass it: an ordinary reconcile of a revoked document must leave it suppressed.
+ */
 export async function reconcileItemUnit(
   db: DbClient,
   teamId: string,
-  itemId: string
+  itemId: string,
+  opts: { reactivate?: boolean } = {}
 ): Promise<ReconcileResult> {
   try {
     return await runContextTransaction(db, async (session) => {
       const context = await lockItemContext(session, teamId, itemId);
       if (!context) return { ok: false, error: "item not found" };
-      return reconcileItemUnitLocked(context);
+      const reconciled = await reconcileItemUnitLocked(context);
+      if (!opts.reactivate || !reconciled.ok || !reconciled.unitId) return reconciled;
+      const { error } = await session.db
+        .from("project_context_units")
+        .update({ state: "active", updated_at: new Date().toISOString() })
+        .eq("team_id", teamId)
+        .eq("id", reconciled.unitId)
+        .eq("state", "retracted");
+      if (error) return { ok: false, error: `unit reactivation failed: ${error.message}` };
+      return reconciled;
+    });
+  } catch (error) {
+    return { ok: false, error: contextFailureMessage(error) };
+  }
+}
+
+/**
+ * Durable visibility suppression used by source revocation. Retraction leaves membership history
+ * intact but every enforced reader rejects the unit until a surviving claim reactivates it through
+ * `reconcileItemUnit(…, { reactivate: true })`.
+ */
+export async function retractItemUnit(
+  db: DbClient,
+  teamId: string,
+  itemId: string
+): Promise<ReconcileResult> {
+  try {
+    // Same item lock as every other unit write, so a retraction cannot interleave with a mirror.
+    return await runContextTransaction(db, async (session) => {
+      const context = await lockItemContext(session, teamId, itemId);
+      if (!context) return { ok: false, error: "item not found" };
+      const { data, error } = await session.db
+        .from("project_context_units")
+        .update({ state: "retracted", updated_at: new Date().toISOString() })
+        .eq("team_id", teamId)
+        .eq("source_item_id", itemId)
+        .eq("unit_kind", "item")
+        .select("id")
+        .maybeSingle();
+      if (error) return { ok: false, error: error.message };
+      if (!data) return { ok: false, error: "context unit not found" };
+      return { ok: true, unitId: (data as { id: string }).id, created: false };
     });
   } catch (error) {
     return { ok: false, error: contextFailureMessage(error) };

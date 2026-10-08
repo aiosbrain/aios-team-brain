@@ -6,11 +6,14 @@ import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { modelFeatureVerdict } from "@/lib/staging/model-features";
-import { getFusedArcs } from "@/lib/graph/arc-fusion";
+import {
+  ArcFusionAuthorizationChangedError,
+  getAuthorizationBoundFusedArcs,
+} from "@/lib/graph/arc-fusion";
 import { resolveArcScope } from "@/lib/graph/partition-read";
 import { memberEnforcement } from "@/lib/access/enforce";
-import { filterArcsByVisibleItems } from "@/lib/graph/arc-visibility";
 import { freshnessWire, computedNow } from "@/lib/freshness";
+import { ArcInputAuthorizationUnavailableError } from "@/lib/graph/arc-input-authorization";
 
 export const runtime = "nodejs";
 // Arc synthesis with a reasoning model can be slow (it reasons over ~200 facts). Give the inline
@@ -64,26 +67,27 @@ export async function POST(req: NextRequest) {
   // Access enforcement — resolved BEFORE the read, because the read's SCOPE depends on it. The
   // resolution fails CLOSED: a substrate error throws → 500, never the unfiltered set; a
   // structurally-empty scope serves an empty panel (spec SR15 boundary).
-  let enforce: import("@/lib/access/enforce").TimelineEnforcement | null;
-  let scope: import("@/lib/graph/partition-read").ArcScope;
+  let panel: Awaited<ReturnType<typeof getAuthorizationBoundFusedArcs>>;
   try {
-    enforce = await memberEnforcement(admin, { teamId: team.id, memberId });
-    // PRET-3 ARCS UNIFICATION (docs/design/pret3-arcs-unification.md), post-PRET-6 shape:
-    // ONE resolution for every reader — the member's oracle scope (uncapped, arm:true, any
-    // tier: ruling 2 makes externals members). The permissive arm this comment once named
-    // retired with the model (resolveArcScope always returns arm:true now).
-    scope = await resolveArcScope(admin, { teamId: team.id, teamSlug, memberId, tier, enforcement: enforce });
-  } catch {
+    panel = await getAuthorizationBoundFusedArcs(admin, team.id, teamSlug, keys, async () => {
+      const enforce = await memberEnforcement(admin, { teamId: team.id, memberId });
+      // PRET-3 ARCS UNIFICATION (docs/design/pret3-arcs-unification.md), post-PRET-6 shape:
+      // ONE resolution for every reader — rebuilt together with visible item ids when the durable
+      // epoch changes. Reusing `scope.groups` from the first attempt would authorize a replacement
+      // synthesis with the very membership snapshot the epoch invalidated.
+      const scope = await resolveArcScope(admin, { teamId: team.id, teamSlug, memberId, tier, enforcement: enforce });
+      return { groups: scope.groups, visibleItemIds: enforce.visibleItemIds };
+    });
+  } catch (error) {
+    if (error instanceof ArcFusionAuthorizationChangedError || error instanceof ArcInputAuthorizationUnavailableError) {
+      return errorResponse("temporarily_unavailable", "arc authorization changed; retry the request", 503);
+    }
     return errorResponse("internal", "enforcement check failed", 500);
   }
 
-  // The fused panel is THE arcs read (ruling 1): per-partition g: rows, at most one inline
-  // synthesis, budgeted warming, coverage disclosed — for everyone.
-  const { arcs: allArcs, freshness, covered, total } = await getFusedArcs(admin, team.id, teamSlug, scope.groups, keys);
-
-  // The PCCB-5 evidence filter stays as defense-in-depth: a partition scope's facts are
-  // principal-visible by construction, but an item restricted BETWEEN synthesis and read is not.
-  const arcs = filterArcsByVisibleItems(allArcs, enforce?.visibleItemIds ?? null);
+  // The fused panel is THE arcs read. Its source enforcement, partition scope, synthesis, cache
+  // publication, final evidence filter, and serving boundary share one epoch in the helper above.
+  const { arcs, freshness, covered, total } = panel;
 
   // PRET-6: the empty-panel DIAGNOSTIC (the three reason codes + the ops note) is RETIRED with
   // the permissive mode. It read TEAM-WIDE graph/LLM health, which §5.7
@@ -97,7 +101,7 @@ export async function POST(req: NextRequest) {
   // `as_of`/`stale`/`degraded` would leak hidden-corpus refresh/failure activity (they reflect the
   // full-tier synthesis, not the member's empty slice). Return a neutral envelope so "team has
   // nothing" and "everything is invisible" are indistinguishable. Permissive → byte-identical.
-  if (enforce != null && arcs.length === 0) {
+  if (arcs.length === 0) {
     // Neutral envelope via the freshness layer (`computedNow` — not an inline `new Date()`, which the
     // fabricated-freshness guard rightly forbids): an empty result has no cached data whose staleness
     // to report, and stamping the tier row's real time is the §5.7 leak.

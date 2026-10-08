@@ -52,6 +52,31 @@ export function buildConfig(
     case "notion":
       // `databaseId=<id>` selects a whole database; otherwise the entries are page ids.
       return kv.databaseId ? { databaseId: kv.databaseId } : { pageIds: list };
+    case "gdrive": {
+      const fileIds = kv.fileIds ? subList(kv.fileIds) : [];
+      const folderIds = kv.folderIds ? subList(kv.folderIds) : [];
+      const sharedDriveIds = kv.sharedDriveIds ? subList(kv.sharedDriveIds) : [];
+      const requested = kv.selectionState;
+      const selectionState = requested === "empty"
+        ? "empty"
+        : requested === "denied" || requested === "partial"
+          ? requested
+          : fileIds.length || folderIds.length || sharedDriveIds.length
+            ? "selected"
+            : "absent";
+      const out: Record<string, unknown> = {
+        fileIds,
+        folderIds,
+        sharedDriveIds,
+        recursive: kv.recursive === "true",
+        selectionState,
+      };
+      if (kv.projectSlug) out.projectSlug = kv.projectSlug;
+      if (kv.access === "team" || kv.access === "external") out.access = kv.access;
+      if (kv.authMode === "oauth" || kv.authMode === "service_account") out.authMode = kv.authMode;
+      if (kv.audienceProjectIds) out.audienceProjectIds = subList(kv.audienceProjectIds);
+      return out;
+    }
     case "linear": {
       const base = Object.keys(kv).length
         ? { teamId: kv.teamId, projectId: kv.projectId, doneStateName: kv.doneStateName }

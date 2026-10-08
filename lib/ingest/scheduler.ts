@@ -34,6 +34,10 @@ export function startIngestScheduler(): void {
     await runInbound(db);
     await runImport(db, "github", runGithubIngestion);
     await runAuthCleanup(db);
+    // Durable Google identity repair. Mapping mutations enqueue revision-fenced obligations; this
+    // bounded drain is the restart backstop for post-response/manual attempts and never trusts a
+    // process-local coalescer as completion authority.
+    await runIdentityRepair(db);
     // §11 access-bootstrap convergence: built-in groups/system projects/grants for every team.
     // Idempotent and cheap when converged; this is also how PRE-EXISTING teams get bootstrapped
     // on first deploy (SQL migrations cannot seed the edge tables — the single-writer guard
@@ -476,6 +480,31 @@ export function startIngestScheduler(): void {
       }
     } catch (err) {
       console.error("[ingest] meeting-notes backfill tick failed:", err instanceof Error ? err.message : err);
+    }
+  }
+
+  async function runIdentityRepair(db: ReturnType<typeof adminClient>): Promise<void> {
+    try {
+      const { drainIdentityRepairs } = await import("@/lib/ingest/identity-repair");
+      const result = await drainIdentityRepairs(db);
+      if (result.attempted) {
+        console.info(
+          `[ingest] identity-repair: ${result.complete} complete, ${result.partial} partial, ${result.failed} failed`,
+        );
+      }
+      // The team-wide repair is continued promptly by its own scheduler
+      // (lib/ingest/attribution-repair-scheduler). This bounded pass is only the backstop for a
+      // deployment that runs without it; it takes the same per-team turn, so the two never overlap,
+      // and a team it leaves `continuing` or finds busy is not a failure.
+      const { drainPendingAttributionRepairs } = await import("@/lib/ingest/reconcile-attribution");
+      const shared = await drainPendingAttributionRepairs(db);
+      if (shared.attempted) {
+        console.info(
+          `[ingest] attribution-repair: ${shared.complete} complete, ${shared.continuing} continuing, ${shared.failed} failed`,
+        );
+      }
+    } catch (err) {
+      console.error("[ingest] identity repair tick failed:", err instanceof Error ? err.message : err);
     }
   }
 

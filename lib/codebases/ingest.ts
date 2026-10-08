@@ -3,7 +3,12 @@ import type { DbClient } from "@/lib/db/types";
 import type { CodebaseScanPayload } from "@/lib/api/schemas";
 import { computeScores } from "@/lib/codebases/score";
 import { normalizeStoredScannerField } from "@/lib/codebases/scanner-version";
-import { buildIdentityMap, resolveMember } from "@/lib/identity/resolve";
+import { resolveMember } from "@/lib/identity/resolve";
+import {
+  buildIdentityAuthoritySnapshot,
+  validateIdentityAuthorityRevision,
+} from "@/lib/identity/authority";
+import { withTransaction } from "@/lib/db/pg/pool";
 import {
   projectCommitsToItems,
   type ScanCommit,
@@ -25,6 +30,7 @@ export async function ingestCodebaseScan(
   db: DbClient,
   auth: { teamId: string; memberId: string; apiKeyId: string },
   payload: CodebaseScanPayload,
+  hooks: { afterIdentitySnapshot?: () => Promise<void> } = {},
 ): Promise<{
   codebase_id: string;
   metrics_id: string;
@@ -167,45 +173,56 @@ export async function ingestCodebaseScan(
   let contribCount = 0;
   let commitItemCount = 0;
   if (payload.contributions.length || recentCommits.length) {
-    const identityMap = await buildIdentityMap(db, auth.teamId);
-
-    for (const row of payload.contributions) {
-      const mapped = resolveMember(identityMap, {
-        email: row.author_email,
-        key: row.author_key,
-      });
-      const { error } = await db.from("code_contributions").upsert(
-        {
-          team_id: auth.teamId,
-          codebase_id: codebase.id,
-          author_key: row.author_key,
-          author_name: row.author_name,
-          author_email: row.author_email,
-          member_id: mapped,
-          day: row.day,
-          commits: row.commits,
-          ai_commits: row.ai_commits,
-          additions: row.additions,
-          deletions: row.deletions,
-        },
-        { onConflict: "codebase_id,author_key,day" },
-      );
-      if (error)
-        throw new Error(
-          `contribution ${row.author_key}/${row.day}: ${error.message}`,
-        );
-      contribCount++;
-    }
-
-    // Project recent commits into searchable items (author message text + member attribution),
-    // so NL queries can answer per-person git history — not just the aggregate counts above.
-    commitItemCount = await projectCommitsToItems(
+    const identitySnapshot = await buildIdentityAuthoritySnapshot(
       db,
-      auth,
-      c.slug,
-      recentCommits,
-      identityMap,
+      auth.teamId,
     );
+    await hooks.afterIdentitySnapshot?.();
+    await withTransaction(async () => {
+      await validateIdentityAuthorityRevision(
+        auth.teamId,
+        identitySnapshot.revision,
+      );
+      for (const row of payload.contributions) {
+        const mapped = resolveMember(identitySnapshot.map, {
+          email: row.author_email,
+          key: row.author_key,
+        });
+        const { error } = await db.from("code_contributions").upsert(
+          {
+            team_id: auth.teamId,
+            codebase_id: codebase.id,
+            author_key: row.author_key,
+            author_name: row.author_name,
+            author_email: row.author_email,
+            member_id: mapped,
+            day: row.day,
+            commits: row.commits,
+            ai_commits: row.ai_commits,
+            additions: row.additions,
+            deletions: row.deletions,
+          },
+          { onConflict: "codebase_id,author_key,day" },
+        );
+        if (error)
+          throw new Error(
+            `contribution ${row.author_key}/${row.day}: ${error.message}`,
+          );
+        contribCount++;
+      }
+
+      // Project recent commits into searchable items (author message text + member attribution),
+      // so NL queries can answer per-person git history — not just the aggregate counts above.
+      // Same fenced resolver snapshot as the contribution rows.
+      commitItemCount = await projectCommitsToItems(
+        db,
+        auth,
+        c.slug,
+        recentCommits,
+        identitySnapshot.map,
+        identitySnapshot.revision,
+      );
+    });
   }
 
   // 6. issues — upsert by number

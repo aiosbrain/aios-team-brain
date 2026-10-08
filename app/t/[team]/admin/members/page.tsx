@@ -65,8 +65,16 @@ export default async function MembersAdminPage({
   const provisioningByMember = new Map(provisioningEntries);
   const providerOf = (memberId: string, provider: string): ProviderLink | null => {
     const p = identities.get(memberId)?.providers.find((x) => x.provider === provider);
-    return p ? { externalId: p.externalId, handle: p.handle } : null;
+    return p ? {
+      externalId: p.externalId, handle: p.handle, email: p.email, revision: p.revision,
+    } : null;
   };
+  const providersOf = (memberId: string, provider: string): ProviderLink[] =>
+    (identities.get(memberId)?.providers ?? [])
+      .filter((x) => x.provider === provider)
+      .map((p) => ({
+        externalId: p.externalId, handle: p.handle, email: p.email, revision: p.revision,
+      }));
 
   return (
     <div className="flex flex-col gap-4">
@@ -141,6 +149,7 @@ export default async function MembersAdminPage({
                     slack={providerOf(m.id, "slack")}
                     linear={providerOf(m.id, "linear")}
                     plane={providerOf(m.id, "plane")}
+                    gdrive={providersOf(m.id, "gdrive")}
                   />
                 </td>
                 <td className="px-4 py-3">

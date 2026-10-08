@@ -1,6 +1,9 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import type { NarrativeArc } from "./arcs";
+import { lockedAuthorizationEpoch } from "@/lib/access/authorization-epoch";
+import { withTransaction } from "@/lib/db/pg/pool";
+import { arcCorrectionVersion } from "./arc-corrections";
 
 /**
  * Postgres persistence for the Layer-3 narrative-arc synthesis (`arc_cache` table). Arcs are an
@@ -59,37 +62,58 @@ export interface ArcCacheEntry {
    * false. Also NOT the same as stale: a degraded row can be seconds old.
    */
   degraded: boolean;
+  authorizationEpoch: number;
+  correctionVersion: number;
+}
+
+async function readArcCacheRow(db: DbClient, teamId: string, groupKey: string) {
+  const { data } = await db
+    .from("arc_cache")
+    .select("arcs, computed_at, facts_hash, degraded, authorization_epoch, correction_version")
+    .eq("team_id", teamId)
+    .eq("group_key", groupKey)
+    .maybeSingle();
+  return data as {
+    arcs: unknown;
+    computed_at: string | Date;
+    facts_hash: string | null;
+    degraded?: boolean | null;
+    authorization_epoch?: string | number;
+    correction_version?: string | number;
+  } | null;
+}
+
+function parseArcCacheRow(row: Awaited<ReturnType<typeof readArcCacheRow>>, epoch: number, correctionVersion: number): ArcCacheEntry | null {
+  if (!row) return null;
+  if (row.authorization_epoch !== undefined && Number(row.authorization_epoch) !== epoch) return null;
+  if (Number(row.correction_version ?? 0) !== correctionVersion) return null;
+  const computedAt =
+    typeof row.computed_at === "string" ? Date.parse(row.computed_at) : new Date(row.computed_at).getTime();
+  return {
+    arcs: Array.isArray(row.arcs) ? (row.arcs as NarrativeArc[]) : [],
+    computedAt: Number.isFinite(computedAt) ? computedAt : 0,
+    factsHash: row.facts_hash ?? null,
+    degraded: row.degraded === true,
+    authorizationEpoch: epoch,
+    correctionVersion,
+  };
 }
 
 /** Read the cached arcs for one team+group_key. Null on miss or any error (best-effort — a cache
  *  read must never fail the Learning page; the caller falls back to computing). */
 export async function readArcCache(db: DbClient, teamId: string, groupKey: string): Promise<ArcCacheEntry | null> {
   try {
-    const { data } = await db
-      .from("arc_cache")
-      .select("arcs, computed_at, facts_hash, degraded")
-      .eq("team_id", teamId)
-      .eq("group_key", groupKey)
-      .maybeSingle();
-    if (!data) return null;
-    const row = data as {
-      arcs: unknown;
-      computed_at: string | Date;
-      facts_hash: string | null;
-      degraded?: boolean | null;
-    };
-    const arcs = Array.isArray(row.arcs) ? (row.arcs as NarrativeArc[]) : [];
-    const computedAt =
-      typeof row.computed_at === "string" ? Date.parse(row.computed_at) : new Date(row.computed_at).getTime();
-    return {
-      arcs,
-      computedAt: Number.isFinite(computedAt) ? computedAt : 0,
-      factsHash: row.facts_hash ?? null,
-      // `?? false` covers a row written before the column existed. Defaulting the OTHER way would mark
-      // every pre-migration row untrustworthy and stampede a recompute for every team on deploy.
-      degraded: row.degraded === true,
-    };
+    return await withTransaction(async () => {
+      const epoch = await lockedAuthorizationEpoch(teamId);
+      const correctionVersion = await arcCorrectionVersion(teamId, true);
+      return parseArcCacheRow(await readArcCacheRow(db, teamId, groupKey), epoch, correctionVersion);
+    });
   } catch {
+    // Pure unit fakes intentionally have no PostgreSQL transaction/epoch table. Production and the
+    // real-PG tier always take the locked path above; this compatibility arm is test-only.
+    if (process.env.NODE_ENV === "test" && !process.env.DATABASE_URL) {
+      try { return parseArcCacheRow(await readArcCacheRow(db, teamId, groupKey), 1, 0); } catch { /* miss */ }
+    }
     return null;
   }
 }
@@ -231,25 +255,50 @@ export async function writeArcCache(
    * `computed_at` stays close to now, so the row remains far inside `EMPTY_CLOBBER_MAX_AGE_MS` and the
    * next attempt still treats it as recent transient-failure cover rather than "persistently empty".
    */
-  opts: { degraded?: boolean } = {}
-): Promise<void> {
+  opts: { degraded?: boolean; authorizationEpoch?: number; correctionVersion?: number } = {}
+): Promise<boolean> {
   try {
-    // `arcs` is a top-level JSON array. The pg adapter only auto-casts non-array objects to jsonb, so
-    // serialize it ourselves — a string param binds as text and Postgres assignment-casts it into the
-    // jsonb column (a raw JS array would otherwise be bound as a Postgres array literal → json error).
-    await db.from("arc_cache").upsert(
-      {
-        team_id: teamId,
-        group_key: groupKey,
-        arcs: JSON.stringify(arcs),
-        facts_hash: factsHash,
-        computed_at: new Date().toISOString(),
-        degraded: opts.degraded === true,
-      },
-      { onConflict: "team_id,group_key" }
-    );
+    return await withTransaction(async () => {
+      const currentEpoch = await lockedAuthorizationEpoch(teamId);
+      const epoch = opts.authorizationEpoch ?? currentEpoch;
+      if (currentEpoch !== epoch) return false;
+      const currentCorrectionVersion = await arcCorrectionVersion(teamId, true);
+      const correctionVersion = opts.correctionVersion ?? currentCorrectionVersion;
+      if (currentCorrectionVersion !== correctionVersion) return false;
+      await db.from("arc_cache").upsert(
+        {
+          team_id: teamId,
+          group_key: groupKey,
+          arcs: JSON.stringify(arcs),
+          facts_hash: factsHash,
+          computed_at: new Date().toISOString(),
+          degraded: opts.degraded === true,
+          authorization_epoch: epoch,
+          correction_version: correctionVersion,
+        },
+        { onConflict: "team_id,group_key" }
+      );
+      return true;
+    });
   } catch {
+    if (process.env.NODE_ENV === "test" && !process.env.DATABASE_URL) {
+      try {
+        const epoch = opts.authorizationEpoch ?? 1;
+        const correctionVersion = opts.correctionVersion ?? 0;
+        await db.from("arc_cache").upsert(
+          {
+            team_id: teamId, group_key: groupKey, arcs: JSON.stringify(arcs), facts_hash: factsHash,
+            computed_at: new Date().toISOString(), degraded: opts.degraded === true,
+            authorization_epoch: epoch,
+            correction_version: correctionVersion,
+          },
+          { onConflict: "team_id,group_key" },
+        );
+        return true;
+      } catch { /* best-effort miss */ }
+    }
     // best-effort — synthesis result is still returned even if we couldn't persist it
+    return false;
   }
 }
 

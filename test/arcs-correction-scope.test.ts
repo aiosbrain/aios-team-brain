@@ -14,7 +14,7 @@ const factsMock = vi.hoisted(() => ({ recentFacts: vi.fn(), resolveEpisodeItems:
 const llmMock = vi.hoisted(() => ({ completeTextOrNull: vi.fn() }));
 const gateMock = vi.hoisted(() => ({ arcIneligibleItemIds: vi.fn() }));
 const creditMock = vi.hoisted(() => ({ resolveItemCredit: vi.fn() }));
-const correctionsMock = vi.hoisted(() => ({ listArcCorrections: vi.fn(), recordArcCorrections: vi.fn() }));
+const correctionsMock = vi.hoisted(() => ({ listAuthorizedArcCorrections: vi.fn(), recordArcCorrections: vi.fn() }));
 const graphitiMock = vi.hoisted(() => ({ addEpisodes: vi.fn() }));
 
 vi.mock("@/lib/graph/learning", async (importOriginal) => ({
@@ -32,7 +32,7 @@ vi.mock("@/lib/attribution/contributor-credit", async (importOriginal) => ({
 }));
 vi.mock("@/lib/graph/arc-corrections", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/graph/arc-corrections")>()),
-  listArcCorrections: correctionsMock.listArcCorrections,
+  listAuthorizedArcCorrections: correctionsMock.listAuthorizedArcCorrections,
   recordArcCorrections: correctionsMock.recordArcCorrections,
 }));
 vi.mock("@/lib/llm/complete", async (importOriginal) => ({
@@ -88,14 +88,35 @@ const FACT = {
   id: "f1", fact: "shipped the payments retry", at: "2026-07-20T00:00:00Z", subject: "alex",
   subjectType: "Person", object: "payments", objectType: "Service", episodeUuids: ["ep-1"],
 };
-const CORRECTION = { arc_id: "a1", arc_title: "Payments", corrected_text: "actually shipped in June" };
+const CORRECTION = {
+  arc_id: "a1",
+  arc_title: "Payments",
+  corrected_text: "actually shipped in June",
+  source_provenance: { state: "complete" as const, item_ids: ["11111111-1111-4111-8111-111111111111"] },
+  captured_authorization_epoch: 1,
+};
 
 beforeEach(() => {
   vi.clearAllMocks();
   llmMock.completeTextOrNull.mockResolvedValue('{"arcs":[]}');
   gateMock.arcIneligibleItemIds.mockResolvedValue(new Set());
   creditMock.resolveItemCredit.mockResolvedValue(new Map());
-  correctionsMock.listArcCorrections.mockResolvedValue({ corrections: [], ok: true });
+  correctionsMock.listAuthorizedArcCorrections.mockResolvedValue({
+    corrections: [{
+      ...CORRECTION,
+      id: "correction-1",
+      revision_id: "11111111-1111-4111-8111-222222222222",
+      revision_number: 1,
+      group_key: "g:test",
+      provenance_state: "complete",
+      source_dependency_count: 1,
+      parent_revision_count: 0,
+      source_item_ids: CORRECTION.source_provenance.item_ids,
+      created_by: null,
+      updated_at: new Date().toISOString(),
+    }],
+    ok: true,
+  });
   correctionsMock.recordArcCorrections.mockResolvedValue(undefined);
   factsMock.recentFacts.mockResolvedValue({ facts: [FACT], ok: true });
   factsMock.resolveEpisodeItems.mockResolvedValue({
@@ -106,20 +127,22 @@ beforeEach(() => {
 });
 
 describe("the g: write-back follows the scope (PCCC6B rules, g:-era)", () => {
-  it("a SINGLE-group g: recompute writes back to THAT group", async () => {
+  it("keeps correction projection disabled until revision-bound graph mappings are enforced", async () => {
     const { recomputeArcs } = await import("@/lib/graph/arcs");
     const t = slug();
     const group = projGroup();
     await recomputeArcs(fakeDb(), "team-1", t, "team", [group], [CORRECTION], KEYS, null, { scopeKey: `g:${group}` });
-    expect(graphitiMock.addEpisodes).toHaveBeenCalledTimes(1);
-    expect(graphitiMock.addEpisodes.mock.calls[0][0]).toBe(group);
+    expect(graphitiMock.addEpisodes).not.toHaveBeenCalled();
   });
 
-  it("a MULTI-group g: scope writes NOTHING — a target narrower than the derivation scope launders (the route never sends multi; the function rule holds anyway)", async () => {
+  it("a MULTI-group g: scope fails closed before storing or projecting a correction", async () => {
     const { recomputeArcs } = await import("@/lib/graph/arcs");
     const t = slug();
     const groups = [`${t}_team`, projGroup()];
-    await recomputeArcs(fakeDb(), "team-1", t, "team", groups, [CORRECTION], KEYS, null, { scopeKey: `g:${groups.join(",")}` });
+    await expect(recomputeArcs(fakeDb(), "team-1", t, "team", groups, [CORRECTION], KEYS, null, {
+      scopeKey: `g:${groups.join(",")}`,
+    })).rejects.toThrow("one exact partition");
+    expect(correctionsMock.recordArcCorrections).not.toHaveBeenCalled();
     expect(graphitiMock.addEpisodes).not.toHaveBeenCalled();
   });
 
@@ -138,7 +161,7 @@ describe("the g: write-back follows the scope (PCCC6B rules, g:-era)", () => {
     const t2 = slug();
     const group2 = `${t2}_external`;
     await getArcs(fakeDb(), "team-1", t2, [group2], KEYS, { scopeKey: `g:${group2}` });
-    const scoped = correctionsMock.listArcCorrections.mock.calls.filter((c) => c[2]?.groupKey === `g:${group2}`);
+    const scoped = correctionsMock.listAuthorizedArcCorrections.mock.calls.filter((c) => c[2]?.groupKey === `g:${group2}`);
     expect(scoped, "the external-shaped partition's synthesis is corrections-free").toHaveLength(0);
   });
 
@@ -154,6 +177,54 @@ describe("the g: write-back follows the scope (PCCC6B rules, g:-era)", () => {
     await recomputeArcs(fakeDb(), "team-1", t, "team", [group], [CORRECTION], KEYS, null, { scopeKey: `g:${group}` });
     expect(correctionsMock.recordArcCorrections).toHaveBeenCalledTimes(1);
     expect(correctionsMock.recordArcCorrections.mock.calls[0][4]).toBe(`g:${group}`);
+  });
+
+  it("retains a revoked correction record but excludes its marker from prompt, projection, cache, and response", async () => {
+    const { recomputeArcs } = await import("@/lib/graph/arcs");
+    const marker = { ...CORRECTION, corrected_text: "REVOKED-CORRECTION-MARKER" };
+    correctionsMock.listAuthorizedArcCorrections.mockResolvedValue({ corrections: [], ok: true });
+    llmMock.completeTextOrNull.mockResolvedValue(
+      '{"arcs":[{"title":"Safe","summary":"safe","confidence":"high","participants":[],"supporting_facts":[1]}]}',
+    );
+    const upserts: Array<{ table: string; row: unknown }> = [];
+    const group = projGroup();
+    const response = await recomputeArcs(
+      fakeDb([], upserts), "team-revoked-correction", slug(), "team", [group], [marker], KEYS, null,
+      { scopeKey: `g:${group}` },
+    );
+
+    expect(correctionsMock.recordArcCorrections).toHaveBeenCalled();
+    expect(JSON.stringify(llmMock.completeTextOrNull.mock.calls)).not.toContain(marker.corrected_text);
+    expect(JSON.stringify(upserts)).not.toContain(marker.corrected_text);
+    expect(JSON.stringify(response)).not.toContain(marker.corrected_text);
+    expect(graphitiMock.addEpisodes).not.toHaveBeenCalled();
+  });
+
+  it("propagates the conservative fact + immutable correction revision union independent of citations", async () => {
+    const sourceA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const sourceB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    correctionsMock.listAuthorizedArcCorrections.mockResolvedValue({ corrections: [{
+      id: "logical", revision_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", revision_number: 2,
+      arc_id: "a1", arc_title: "Earlier", corrected_text: "C1 from A", group_key: "g:test",
+      provenance_state: "complete", source_dependency_count: 1, parent_revision_count: 0,
+      source_item_ids: [sourceA], captured_authorization_epoch: 1, created_by: null, updated_at: "",
+    }], ok: true });
+    factsMock.resolveEpisodeItems.mockResolvedValue({
+      items: new Map([["ep-1", { itemId: sourceB, source: "github" }]]), ok: true,
+    });
+    llmMock.completeTextOrNull.mockResolvedValue(
+      '{"arcs":[{"title":"Descendant","summary":"C2","confidence":"high","participants":[],"supporting_facts":[1]}]}',
+    );
+    const group = projGroup();
+    const response = await (await import("@/lib/graph/arcs")).recomputeArcs(
+      fakeDb(), "team-transitive", slug(), "team", [group], [CORRECTION], KEYS, null,
+      { scopeKey: `g:${group}` },
+    );
+    expect(response.arcs[0].source_provenance).toEqual({
+      state: "complete",
+      item_ids: [sourceA, sourceB],
+      correction_revision_ids: ["cccccccc-cccc-4ccc-8ccc-cccccccccccc"],
+    });
   });
 });
 

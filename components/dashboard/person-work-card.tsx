@@ -76,6 +76,9 @@ function EvidenceList({ group }: { group: SourceGroup }) {
               )}
               <span className="shrink-0 text-[11px] text-ink-tertiary">{timeOf(it.at)}</span>
             </div>
+            {it.contributionRole ? (
+              <span className="text-[11px] capitalize text-ink-tertiary">{it.contributionRole}</span>
+            ) : null}
             {it.linkedTask ? (
               <span
                 className="inline-flex max-w-full items-center gap-1 self-start rounded border border-border-subtle bg-surface-sunken px-1.5 py-0.5 text-[11px] text-ink-secondary"

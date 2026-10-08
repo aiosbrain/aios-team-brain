@@ -248,7 +248,7 @@ All connector APIs are free. Cost shows up downstream in embeddings and LLM spen
 | **Plane** | API token | Plane → Workspace settings → API tokens | Admin UI **only** |
 | **Notion** | Internal integration token | notion.so/my-integrations | **Sidecar** `.env` (`NOTION_TOKEN`) |
 | **Confluence** | `CONFLUENCE_USERNAME` (your email) + `CONFLUENCE_PASSWORD` (an API token) for Atlassian Cloud | Atlassian account | **Sidecar** `.env`. The reader takes `CONFLUENCE_API_TOKEN` **alone** OR username+password — never both; with the token set it ignores the username, which on Cloud 401s at request time rather than failing loudly |
-| **Google Drive** | Service-account JSON key | Google Cloud Console | **Sidecar** `connections.yaml` (path option) |
+| **Google Drive** | **OAuth** — an admin connects a Google account — **or** a service-account JSON key | Google Cloud Console (an OAuth client, or a service account) | **Admin → Integrations** (`gdrive`) owns the connection and its selection; the **sidecar** does the reading. OAuth needs the `GOOGLE_DRIVE_*` variables on the brain; a service-account key stays in the sidecar's own config. See [Google Drive configuration](#google-drive-configuration) |
 | **RSS/Radar**, **Web**, **Local files** | none | — | **Sidecar** `connections.yaml` |
 
 **Maturity, honestly.** Slack, GitHub, Linear and Plane are the proven path — each has a real runner
@@ -259,12 +259,16 @@ adapters pass is checked against the real installed reader classes — which is 
 here can cover is a credential actually authenticating, real pagination, or the live API returning
 the metadata keys we map; expect to debug your first run for those. Confluence also has no
 `connections.yaml` example (Notion and Google Drive do — see `ingestion/connections.yaml.example`).
-**Google Drive additionally has no owner enrichment** — unlike Notion it emits no mappable
-`authors[]`, so a Drive doc is ingested and searchable but credited to nobody: it never appears
-under a person on the timeline. Google Drive's watch-channel *renewal* advertised in
-`ingestion/README.md` is never constructed by `aios-ingest schedule` — Drive is pull-on-a-schedule
-only. `gdrive`/`confluence`/`web`/`local`/`radar` cannot be stored as brain integrations at all (the
+**Google Drive is credited only through a mapped Google identity.** A Drive doc carries the editors
+Google reports (`authors[]` and per-revision contributions); it appears under a person on the
+timeline when that Google account is mapped to a roster member — by an exact roster/alias email, or
+by an admin in Admin → Members — and is otherwise ingested and searchable but credited to nobody.
+Drive is polled on a schedule; a connection that sets `webhook_url` also gets Drive watch channels
+created and renewed by `aios-ingest schedule` as an accelerator, never as a replacement for polling.
+`confluence`/`web`/`local`/`radar` cannot be stored as brain integrations at all (the
 `integrations.type` CHECK has no such values) — they are `connections.yaml`-only by construction.
+`gdrive` is the opposite: it **requires** an Admin → Integrations row, which owns the connection's
+selection, audience and execution fence, while the sidecar still performs every read.
 
 Slack scopes the code actually needs: **`channels:history`**, **`channels:read`**, **`users:read`**,
 and optionally **`users:read.email`** (enables automatic identity mapping; without it you map members
@@ -279,6 +283,60 @@ by hand). A missing `channels:read` is diagnosed by name in the ingest error.
 > selection. The UI encrypts and stores both, but only the Slack/GitHub/Linear/Plane runners read
 > stored secrets, and the sidecar's selection merge maps Notion to a no-op, so neither the token nor
 > the page IDs reach anything. Configure Notion in the sidecar's own `.env` + `connections.yaml`.
+
+#### Google Drive configuration
+
+Drive has two halves. The **brain** owns the connection (Admin → Integrations → `gdrive`) and, for
+OAuth, the Google credential. The **sidecar** (`ingestion/`) reads Drive and Docs and pushes items; it
+authenticates to the brain with a connector key you provision from that Admin row (**Provision
+connector key**) and put in the sidecar's `AIOS_API_KEY`. Operational detail — selection states,
+pause/disconnect, run requests, watch channels — is in [`ingestion/README.md`](ingestion/README.md).
+
+**OAuth (an admin connects a Google account).** Set these on the *brain*:
+
+| Var | What it is |
+|---|---|
+| `GOOGLE_DRIVE_CLIENT_ID` | The OAuth 2.0 *Web application* client id from Google Cloud Console |
+| `GOOGLE_DRIVE_CLIENT_SECRET` | That client's secret. A secret — set it in your deploy environment, never in a file you commit |
+| `GOOGLE_DRIVE_OAUTH_REDIRECT` | The exact redirect URI registered on that client: `<APP_URL>/api/auth/gdrive/callback` |
+
+All three are required. Without the client id or the redirect URI (or `AUTH_SECRET`), **Connect**
+answers `503 Google Drive OAuth is not configured on this instance`; without the client secret the
+callback refuses with `OAuth is not configured on this instance`. In both cases nothing is stored.
+Storing the credential also needs `SECRETS_KEY`. In the Google Cloud project, enable the Drive and
+Docs APIs and register the redirect URI above character for character.
+
+The callback completes only in the browser, and for the signed-in Admin, that started **Connect**: it
+needs the short-lived cookie that step set and the same Admin session. So the redirect URI must be on
+the same origin the Admin uses for the app; a link opened in another browser, or after signing out,
+is refused and nothing is stored — start **Connect** again.
+
+The brain asks for `openid email profile` plus **`drive.file`** when you authorize individual files,
+or **`drive.readonly`** when you authorize folders and Shared Drives; the broader scope allows
+discovery but does not widen the selection you save. Access is requested offline, and the refresh
+credential is stored **encrypted in the brain** through the integration-secret path (`SECRETS_KEY`),
+together with the OAuth client it was issued to — so replacing the client or its secret means
+reconnecting the account. It is never returned by the integrations API and never sent to the
+sidecar, which receives only short-lived access tokens from the brain.
+
+**File picker (optional).** To choose individual files with Google Picker, also set:
+
+| Var | What it is |
+|---|---|
+| `GOOGLE_DRIVE_PICKER_API_KEY` | A browser API key for the Picker API |
+| `GOOGLE_DRIVE_APP_ID` | The Google Cloud **project number** |
+
+Both are needed, alongside `GOOGLE_DRIVE_CLIENT_ID`. Without them Admin reports Picker as not
+configured and keeps the reconnect path; either way the brain verifies every selected document with
+its own stored credential before the selection is saved. These two values and the client id are
+delivered to the admin's browser by design, so restrict the API key to the Picker API and to your
+origin in Google Cloud Console.
+
+**Service account (no OAuth).** Create the Admin row with service-account auth, share each selected
+file, folder or Shared Drive with the service-account email, and give the JSON key to the *sidecar
+only* (`service_account_key_path` or `credential_json` in its local configuration). The brain never
+accepts or stores that key — it records only the verified service-account email — and this mode
+needs none of the `GOOGLE_DRIVE_*` variables.
 
 ---
 
@@ -476,8 +534,12 @@ is safe to put in a setup script. Agents: the `connect` skill drives this whole 
 
 For **Notion, Google Drive, Confluence, RSS, web pages and local files**, run the Python sidecar in
 `ingestion/` — it pulls on your infrastructure and pushes over the same API, so those credentials
-never touch the brain. It needs `BRAIN_URL`, `AIOS_API_KEY` and `AIOS_TEAM`, and its own
-`connections.yaml`. See [`ingestion/README.md`](ingestion/README.md).
+never touch the brain. **Google Drive OAuth is the one exception:** its refresh credential is stored
+encrypted in the brain, which hands the sidecar only short-lived access tokens; a Drive
+service-account key, like every other sidecar credential, stays in the sidecar
+([Google Drive configuration](#google-drive-configuration)). The sidecar needs `BRAIN_URL`,
+`AIOS_API_KEY` and `AIOS_TEAM`, and its own `connections.yaml`. See
+[`ingestion/README.md`](ingestion/README.md).
 
 And to push from a person's terminal, they install
 [AIOS Workspace](https://github.com/aiosbrain/aios-workspace), set `brain_url` and `AIOS_API_KEY`,
@@ -650,7 +712,21 @@ NEO4J_USER=neo4j
 NEO4J_PASSWORD=<same as above>
 ```
 
-`GRAPHITI_URL` is the master switch: unset, the projector never starts and every graph read is inert.
+`GRAPHITI_URL` enables episode projection and conversational graph retrieval. The direct
+`/api/v1/graph-query` endpoint reads Neo4j itself and remains available when `NEO4J_URL` is set,
+even if `GRAPHITI_URL` is unset.
+
+**`GRAPHITI_URL` alone is not enough — set `NEO4J_URL` with it.** Graphiti is the write path: the
+projector posts episodes to it. Graph *reads* do not use Graphiti's `/search`, whose results do not
+carry the source episodes behind each fact; the brain reads facts directly from Neo4j so that every
+fact's provenance can be checked against what the reader is allowed to see. With `GRAPHITI_URL` set
+and `NEO4J_URL` unset, those reads **fail closed**: a read that has graph partitions to consult —
+the graph leg of ordinary retrieval included — stops with a provenance-unavailable error instead of
+answering from a graph it cannot verify, and `/api/v1/graph-query` reports Neo4j as not configured
+(`503`). That is deliberate, not a degraded mode, and it does not clear until `NEO4J_URL` is set. Set
+all four variables for graph projection and conversational graph retrieval. Leaving
+`GRAPHITI_URL` unset disables those paths, while direct `/api/v1/graph-query` reads remain available
+when `NEO4J_URL` is configured.
 
 **2.8d. Understand the extraction limits.** Items are **chunked**, not truncated:
 
@@ -749,8 +825,8 @@ shipping app code ahead of its database.
 
 | Var | Default | Purpose |
 |---|---|---|
-| `GRAPHITI_URL` | unset → graph off | Master switch for graph memory |
-| `NEO4J_URL` / `NEO4J_USER` / `NEO4J_PASSWORD` | unset / `neo4j` / `""` | Direct bolt reads for the learning panel |
+| `GRAPHITI_URL` | unset → graph off | Master switch for graph memory. Not sufficient on its own — set `NEO4J_URL` with it |
+| `NEO4J_URL` / `NEO4J_USER` / `NEO4J_PASSWORD` | unset / `neo4j` / `""` | Direct bolt reads. **Required whenever `GRAPHITI_URL` is set:** provenance-checked graph reads (retrieval's graph leg, `/api/v1/graph-query`) go to Neo4j and fail closed without it (§2.8c). Also feeds the learning panel |
 | `GRAPH_PROJECT_ENABLED` | on | `false` disables the projector even with a URL |
 | `GRAPH_PROJECT_MINUTES` | `60` | Projector interval |
 | `GRAPH_CHUNK_CHARS` / `GRAPH_MAX_EPISODE_CHUNKS` | `2500` / `16` | Episode chunking |
@@ -758,8 +834,11 @@ shipping app code ahead of its database.
 | `RERANK_URL` / `RERANK_MODEL` / `RERANK_TOKEN` | unset → off / `qwen3-reranker-0.6b` | Cross-encoder reranking. **Env only — no per-team setting.** |
 | `LLM_BASE_URL` / `LLM_MODEL` | unset → Anthropic | Local OpenAI-compatible endpoint |
 | `INGEST_POLL_ENABLED` / `INGEST_POLL_MINUTES` | on / `30` | Connector poller |
+| `ATTRIBUTION_REPAIR_POLL_ENABLED` | on | Prompt attribution-repair poller (independent of the connector poller) |
 | `SLACK_BOT_TOKEN` | unset | Env fallback if no Admin-stored Slack token |
 | `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` / `SLACK_OAUTH_REDIRECT` | unset | Per-member Slack OAuth ("act as me"), **not** ingestion |
+| `GOOGLE_DRIVE_CLIENT_ID` / `GOOGLE_DRIVE_CLIENT_SECRET` / `GOOGLE_DRIVE_OAUTH_REDIRECT` | unset → Drive OAuth off | Google Drive connector OAuth; all three, redirect = `<APP_URL>/api/auth/gdrive/callback`. Not needed for service-account mode (§1.4) |
+| `GOOGLE_DRIVE_PICKER_API_KEY` / `GOOGLE_DRIVE_APP_ID` | unset → Picker off | Google Picker for choosing individual Drive files; both, plus the client id. Sent to the admin's browser by design |
 | `GITHUB_TOKEN` | unset | Member provisioning, profile sync, codebase scans — **not** the ingest runner |
 | `PGSSL` / `PGSSLMODE` | unset | Set to `require` for managed Postgres |
 | `SENTRY_DSN`, `NEXT_PUBLIC_SENTRY_DSN`, … | unset | Fully inert when unset |
@@ -800,6 +879,7 @@ effective behaviour.
 | Poller | Starts | Interval | Gate |
 |---|---|---|---|
 | Ingest | +20s after boot | **30 min** | on unless `INGEST_POLL_ENABLED=false` |
+| Attribution repair | at boot | 5 s while idle; immediately while a repair is in progress | on unless `ATTRIBUTION_REPAIR_POLL_ENABLED=false` |
 | Graph projector | +30s | **60 min** | inert unless `GRAPHITI_URL` set |
 | Social jobs | +15s | 30 s | opt-in, `SOCIAL_JOBS_ENABLED=true` |
 

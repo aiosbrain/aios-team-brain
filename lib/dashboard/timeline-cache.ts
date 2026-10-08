@@ -1,6 +1,12 @@
 import "server-only";
 import { createHash } from "node:crypto";
+import {
+  authorizationEpoch,
+  lockedAuthorizationEpoch,
+  withLockedAuthorizationEpoch,
+} from "@/lib/access/authorization-epoch";
 import { adminClient } from "@/lib/db/admin";
+import { withTransaction } from "@/lib/db/pg/pool";
 import type { DbClient } from "@/lib/db/types";
 import type { ViewerTier } from "@/lib/auth/visibility";
 import { getWorkTimeline } from "./work-timeline";
@@ -159,7 +165,12 @@ export const TIMELINE_TTL_MS = TTL_MS;
 // v8 lesson below). The version is NOT the isolation mechanism — the `adm:` namespace is (header).
 // Integrating #714 later must keep both bumps distinct (take the next unclaimed number) and keep
 // its revision/item fingerprints; this change does not touch the Slack leg.
-export const PAYLOAD_VERSION = 16;
+// v18 (AIO-1167): Google evidence now comes from the complete source-time ledger and obeys manual
+// credit locks. Old payloads/summaries can name the wrong person or omit capped Drive evidence.
+// Authored as v15 and moved on the rebase: 16 is TIERRET-1 above and 17 is the number #714's branch
+// now claims for the Slack meaning it had reserved 15 for, so this takes the next unclaimed one.
+// Whichever of the two lands second must re-check that its number is still free (the v8 lesson).
+export const PAYLOAD_VERSION = 18;
 
 /** The timeline WITH the per-person-day synopsis attached. Runs the (up to 7d × roster) best-effort LLM
  *  calls — so it's used ONLY on the BACKGROUND refresh path, never inline on a request (a cold miss
@@ -230,8 +241,11 @@ const SALVAGE_MAX_AGE_MS = 48 * 3_600_000;
  * This is deliberately a floor, not a blanket "never salvage across a bump": dropping every synopsis on
  * every bump is the regression the salvage was built for (reported twice as "we've lost the summaries").
  * Raise it ONLY for a bump that changes what the prose can claim, not for a shape change.
+ *
+ * v18 (AIO-1167) is such a bump — older prose can credit Drive work to the wrong person — so the
+ * floor follows `PAYLOAD_VERSION` to it (authored as 15; renumbered with the version on the rebase).
  */
-export const MIN_SALVAGEABLE_VERSION = 11;
+export const MIN_SALVAGEABLE_VERSION = 18;
 
 /** `${date}|${memberId}` → that person-day's synopsis. */
 export type SalvagedSummaries = Map<string, string>;
@@ -305,6 +319,7 @@ interface CacheEntry {
    *  this map is read BEFORE the row, so omitting it would report a partial payload as healthy for the
    *  life of the process (R2/M6). */
   degraded: boolean;
+  authorizationEpoch: number;
 }
 
 // In-memory cache (per process), fronting the Postgres row. Keyed by `${teamId}:${viewKey}`.
@@ -326,14 +341,14 @@ async function readTimelineCacheRow(
   db: DbClient,
   teamId: string,
   groupKey: string
-): Promise<{ payload: unknown; computed_at: string | Date; degraded?: boolean | null } | null> {
+): Promise<{ payload: unknown; computed_at: string | Date; degraded?: boolean | null; authorization_epoch: string | number } | null> {
   const { data } = await db
     .from("work_timeline_cache")
-    .select("payload, computed_at, degraded")
+    .select("payload, computed_at, degraded, authorization_epoch")
     .eq("team_id", teamId)
     .eq("group_key", groupKey)
     .maybeSingle();
-  return (data as { payload: unknown; computed_at: string | Date; degraded?: boolean | null } | null) ?? null;
+  return (data as { payload: unknown; computed_at: string | Date; degraded?: boolean | null; authorization_epoch: string | number } | null) ?? null;
 }
 
 /** The previous payload's per-person-day summaries, whatever version wrote them. Empty on any error —
@@ -341,14 +356,19 @@ async function readTimelineCacheRow(
 async function readSalvageableSummaries(
   db: DbClient,
   teamId: string,
-  groupKey: string
+  groupKey: string,
+  expectedAuthorizationEpoch: number,
 ): Promise<SalvagedSummaries> {
   try {
-    const row = await readTimelineCacheRow(db, teamId, groupKey);
-    if (!row) return new Map();
-    const at =
-      typeof row.computed_at === "string" ? Date.parse(row.computed_at) : new Date(row.computed_at).getTime();
-    return salvageSummaries(row.payload, at, Date.now());
+    return await withTransaction(async () => {
+      const epoch = await lockedAuthorizationEpoch(teamId);
+      if (epoch !== expectedAuthorizationEpoch) return new Map();
+      const row = await readTimelineCacheRow(db, teamId, groupKey);
+      if (!row || Number(row.authorization_epoch) !== epoch) return new Map();
+      const at =
+        typeof row.computed_at === "string" ? Date.parse(row.computed_at) : new Date(row.computed_at).getTime();
+      return salvageSummaries(row.payload, at, Date.now());
+    });
   } catch {
     return new Map();
   }
@@ -375,22 +395,32 @@ export async function readTimelineCache(
   variant: TimelineVariant
 ): Promise<CacheEntry | null> {
   try {
-    const row = await readTimelineCacheRow(db, teamId, viewKey(variant));
-    if (!row) return null;
-    // Payload is `{ v, days }`. A missing/older version = a shape from a previous deploy → treat as a
-    // MISS so the caller rebuilds (never render a stale wrong shape).
-    const p = row.payload as { v?: number; days?: unknown } | null;
-    if (!p || p.v !== PAYLOAD_VERSION || !Array.isArray(p.days)) return null;
-    const days = p.days as TimelineDay[];
-    const at =
-      typeof row.computed_at === "string" ? Date.parse(row.computed_at) : new Date(row.computed_at).getTime();
-    // `=== true` so a row written before the column existed reads false — "no evidence of degradation",
-    // not "verified good". Defaulting the other way would mark every pre-migration team's ledger bad.
-    return { days, at: Number.isFinite(at) ? at : 0, degraded: row.degraded === true };
+    return await withTransaction(async () => {
+      const epoch = await lockedAuthorizationEpoch(teamId);
+      const row = await readTimelineCacheRow(db, teamId, viewKey(variant));
+      if (!row || Number(row.authorization_epoch) !== epoch) return null;
+      // Payload is `{ v, days }`. A missing/older version = a shape from a previous deploy → treat as a
+      // MISS so the caller rebuilds (never render a stale wrong shape).
+      const p = row.payload as { v?: number; days?: unknown } | null;
+      if (!p || p.v !== PAYLOAD_VERSION || !Array.isArray(p.days)) return null;
+      const days = p.days as TimelineDay[];
+      const at =
+        typeof row.computed_at === "string" ? Date.parse(row.computed_at) : new Date(row.computed_at).getTime();
+      // `=== true` so a row written before the column existed reads false — "no evidence of degradation",
+      // not "verified good". Defaulting the other way would mark every pre-migration team's ledger bad.
+      return { days, at: Number.isFinite(at) ? at : 0, degraded: row.degraded === true, authorizationEpoch: epoch };
+    });
   } catch {
     return null;
   }
 }
+
+/** What a ledger write did. Only `published` may be mirrored into process memory as-is. */
+export type TimelineCacheWriteOutcome =
+  | { status: "published"; authorizationEpoch: number }
+  | { status: "epoch_rejected"; expectedAuthorizationEpoch: number; currentAuthorizationEpoch: number }
+  | { status: "posture_refused" }
+  | { status: "cache_failed"; expectedAuthorizationEpoch: number | null; error: string };
 
 /** Upsert the ledger for one variant, stamping `computed_at` now. Best-effort — a failed write must
  *  never fail the build (the days are still returned).
@@ -399,7 +429,10 @@ export async function readTimelineCache(
  *  with that posture is REFUSED (nothing written): `days` is caller-assembled, and a mismatched tier
  *  is the sign it was built under a different authority than the variant's key names — placing it
  *  anywhere could publish one reader class's payload to another. Internal callers always pass the
- *  variant's own posture. */
+ *  variant's own posture.
+ *
+ *  The write is also bound to the team's authorization epoch: a ledger built under an epoch that has
+ *  since advanced is rejected rather than published under the current one. */
 export async function writeTimelineCache(
   db: DbClient,
   teamId: string,
@@ -410,27 +443,48 @@ export async function writeTimelineCache(
    *  handed a partial payload as healthy. Defaults false — the callers that know pass it explicitly. */
   degraded: boolean,
   /** The admission-keyed variant — the row is `adm:<class>:<posture>:<hash>`, never a tier/`vis:` row. */
-  variant: TimelineVariant
-): Promise<void> {
+  variant: TimelineVariant,
+  expectedAuthorizationEpoch?: number,
+): Promise<TimelineCacheWriteOutcome> {
   if (tier !== variant.admission.posture) {
     console.warn("[timeline] cache write refused: caller tier disagrees with the resolved admission posture");
-    return;
+    return { status: "posture_refused" };
   }
   try {
-    // `payload` is a top-level JSON array — serialize it ourselves (the pg adapter binds a raw JS array
-    // as a Postgres array literal, which the jsonb column rejects); a text param assignment-casts to jsonb.
-    await db.from("work_timeline_cache").upsert(
-      {
-        team_id: teamId,
-        group_key: viewKey(variant),
-        payload: JSON.stringify({ v: PAYLOAD_VERSION, days }),
-        computed_at: new Date().toISOString(),
-        degraded,
-      },
-      { onConflict: "team_id,group_key" }
-    );
-  } catch {
+    return await withTransaction(async () => {
+      const currentEpoch = await lockedAuthorizationEpoch(teamId);
+      const epoch = expectedAuthorizationEpoch ?? currentEpoch;
+      if (currentEpoch !== epoch) {
+        return {
+          status: "epoch_rejected" as const,
+          expectedAuthorizationEpoch: epoch,
+          currentAuthorizationEpoch: currentEpoch,
+        };
+      }
+      // `payload` is a top-level JSON array — serialize it ourselves (the pg adapter binds a raw JS array
+      // as a Postgres array literal, which the jsonb column rejects); a text param assignment-casts to jsonb.
+      const { error } = await db.from("work_timeline_cache").upsert(
+        {
+          team_id: teamId,
+          group_key: viewKey(variant),
+          payload: JSON.stringify({ v: PAYLOAD_VERSION, days }),
+          computed_at: new Date().toISOString(),
+          degraded,
+          authorization_epoch: epoch,
+        },
+        { onConflict: "team_id,group_key" }
+      );
+      if (error) throw error;
+      return { status: "published" as const, authorizationEpoch: epoch };
+    });
+  } catch (error) {
     // best-effort — the ledger is still returned even if we couldn't persist it
+    console.error("[timeline] cache publication failed:", error instanceof Error ? error.message : error);
+    return {
+      status: "cache_failed",
+      expectedAuthorizationEpoch: expectedAuthorizationEpoch ?? null,
+      error: error instanceof Error ? error.message : "timeline cache publication failed",
+    };
   }
 }
 
@@ -564,9 +618,29 @@ function refreshInBackground(teamId: string, view: TimelineView): void {
       const bg = adminClient();
       do {
         dirty.delete(key); // claim the current request; anything arriving from here re-dirties the key
+        const epoch = await authorizationEpoch(bg, teamId);
         const built = await buildTimeline(bg, teamId, view);
-        mem.set(key, { days: built.days, at: Date.now(), degraded: built.degraded });
-        await writeTimelineCache(bg, teamId, view.admission.posture, built.days, built.degraded, view);
+        if (await authorizationEpoch(bg, teamId) !== epoch) { dirty.add(key); continue; }
+        const publication = await writeTimelineCache(bg, teamId, view.admission.posture, built.days, built.degraded, view, epoch);
+        if (publication.status === "epoch_rejected") {
+          dirty.add(key);
+          continue;
+        }
+        // Unreachable here (the tier passed IS the variant's posture); never mirror a refused write.
+        if (publication.status === "posture_refused") continue;
+        // A persistent-cache outage is allowed to fall back to process memory only after one final
+        // authoritative check. An epoch rejection never publishes either copy: both were built under
+        // authorization that is no longer current.
+        if (publication.status === "cache_failed") {
+          const authorized = await withLockedAuthorizationEpoch(teamId, (current) => {
+            if (current !== epoch) return false;
+            mem.set(key, { days: built.days, at: Date.now(), degraded: built.degraded, authorizationEpoch: epoch });
+            return true;
+          });
+          if (!authorized) dirty.add(key);
+          continue;
+        }
+        mem.set(key, { days: built.days, at: Date.now(), degraded: built.degraded, authorizationEpoch: epoch });
       } while (dirty.has(key));
     } catch (err) {
       console.error("[timeline] background refresh failed:", err instanceof Error ? err.message : err);
@@ -599,6 +673,20 @@ export interface CachedTimeline {
   freshness: Freshness;
 }
 
+export class TimelineAuthorizationChangedError extends Error {
+  readonly retryable = true;
+
+  constructor() {
+    super("Timeline authorization changed while the view was being built; retry the request");
+    this.name = "TimelineAuthorizationChangedError";
+  }
+}
+
+export interface TimelineReadHooks {
+  /** Deterministic concurrency hook used by the epoch-race regression tests. */
+  beforeColdPublish?: (attempt: number) => Promise<void>;
+}
+
 /**
  * Return the work-timeline for a team+tier, serve-stale-while-revalidate:
  *   1. fresh in-memory → return instantly;
@@ -621,23 +709,45 @@ export async function getCachedWorkTimeline(
   db: DbClient,
   teamId: string,
   _tier: ViewerTier,
-  memberId: string | null
+  memberId: string | null,
+  hooks: TimelineReadHooks = {},
 ): Promise<CachedTimeline> {
+  // An authorization-epoch change mid-read retries the WHOLE resolution once — the admission, key
+  // and item set of the superseded attempt are never reused.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const result = await getCachedWorkTimelineAttempt(db, teamId, memberId, hooks, attempt);
+    if (result !== null) return result;
+  }
+  throw new TimelineAuthorizationChangedError();
+}
+
+async function getCachedWorkTimelineAttempt(
+  db: DbClient,
+  teamId: string,
+  memberId: string | null,
+  hooks: TimelineReadHooks,
+  attempt: number,
+): Promise<CachedTimeline | null> {
   // PRET-6: there is no permissive tier row anymore — a principal-less read is a caller bug.
   if (memberId == null) throw new Error("timeline read without a principal (fail closed)");
   const view = await resolveView(db, teamId, memberId); // CHEAP (admission + project hash)
   const posture = view.admission.posture;
   const key = memKey(teamId, viewKey(view));
   const now = Date.now();
-
-  const cached = mem.get(key);
-  if (cached && now - cached.at < TTL_MS) {
+  // The shared epoch lock gives a memory hit a linearization point before a concurrent revocation.
+  // Without it, a process could read the old epoch, pause behind a revoker, then serve old memory
+  // after the revocation had already reported success.
+  const { epoch, cached } = await withLockedAuthorizationEpoch(teamId, (current) => {
+    const hit = mem.get(key);
+    return { epoch: current, cached: hit?.authorizationEpoch === current ? hit : undefined };
+  });
+  if (cached && cached.authorizationEpoch === epoch && now - cached.at < TTL_MS) {
     return { days: cached.days, freshness: freshness(cached.at, TTL_MS, { now, degraded: cached.degraded }) };
   }
 
   const persisted = await readTimelineCache(db, teamId, posture, view);
   if (persisted) {
-    mem.set(key, { days: persisted.days, at: persisted.at, degraded: persisted.degraded });
+    mem.set(key, { days: persisted.days, at: persisted.at, degraded: persisted.degraded, authorizationEpoch: persisted.authorizationEpoch });
     // ONE envelope for both the fresh and the stale branch — `freshness()` derives `stale` from the same
     // age comparison the branch below makes, so the reported staleness cannot disagree with the decision
     // actually taken (they were two separate readings of the clock in every earlier draft of this).
@@ -663,14 +773,32 @@ export async function getCachedWorkTimeline(
   // can name work outside this view's visibility — carrying it into a variant payload is a leak.
   // TIERRET-1: the same key is an `adm:` key, so salvage never crosses the authorization namespace in
   // either direction (old `vis:` prose is never read here; old code never reads `adm:` rows).
-  const days = attachSalvagedSummaries(built, await readSalvageableSummaries(db, teamId, viewKey(view)));
+  // Same EPOCH too: prose written under a superseded authorization epoch is never carried.
+  const days = attachSalvagedSummaries(
+    built,
+    await readSalvageableSummaries(db, teamId, viewKey(view), epoch),
+  );
   const at = Date.now();
-  mem.set(key, { days, at, degraded: true });
+  await hooks.beforeColdPublish?.(attempt);
   // PERSISTED as degraded, not just reported. The row this writes is what the next reader gets, and its
   // prose is either absent or salvaged from an older payload version — so the flag has to live on the row
   // or the very next request hands the same partial ledger over as healthy. Self-healing: the background
   // pass below rewrites the row with the real verdict once summaries land.
-  await writeTimelineCache(db, teamId, posture, days, true, view);
+  const publication = await writeTimelineCache(db, teamId, posture, days, true, view, epoch);
+  // `posture_refused` is unreachable here (the tier passed IS the variant's posture); treated like
+  // an epoch rejection so a refused write is never mirrored into memory or served.
+  if (publication.status === "epoch_rejected" || publication.status === "posture_refused") return null;
+  if (publication.status === "cache_failed") {
+    const authorized = await withLockedAuthorizationEpoch(teamId, (current) => {
+      if (current !== epoch) return false;
+      mem.set(key, { days, at, degraded: true, authorizationEpoch: epoch });
+      return true;
+    });
+    if (!authorized) return null;
+  } else {
+    // Publish process memory only after the durable writer accepted the same epoch.
+    mem.set(key, { days, at, degraded: true, authorizationEpoch: epoch });
+  }
   refreshInBackground(teamId, view);
   // DEGRADED, deliberately. A cold miss returns the pure ledger: its per-person-day synopses are either
   // absent (the background pass hasn't run) or SALVAGED from an older payload version. Both are "this is

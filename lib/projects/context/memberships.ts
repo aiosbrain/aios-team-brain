@@ -23,7 +23,8 @@ export type MembershipMethod =
   | "embedding"
   | "llm"
   | "manual"
-  | "exclude_shadow_repair";
+  | "exclude_shadow_repair"
+  | "gdrive_claim";
 
 export interface EnsureIncludeArgs {
   projectId: string;
@@ -35,7 +36,17 @@ export interface EnsureIncludeArgs {
 export type MembershipRefusalReason =
   | "system-integrity"
   | "protected-target-exclusion"
-  | "membership-state-changed";
+  | "membership-state-changed"
+  // No live Google Drive claim authorizes this item at this destination (AIO-1167).
+  | "gdrive-claim-unverified";
+
+/** The exact connection claim a Drive placement is made under. */
+export interface GdriveClaimIncludeArgs {
+  projectId: string;
+  contextUnitId: string;
+  integrationId: string;
+  providerId: string;
+}
 
 export interface WriteResult {
   ok: boolean;
@@ -85,6 +96,31 @@ export async function systemIntegrityGate(
   projectId: string,
   audience: string
 ): Promise<WriteResult> {
+  return protectedTargetGate(db, teamId, projectId, { routedBy: "audience", audience });
+}
+
+/**
+ * How a unit comes to be routed at a protected target.
+ *
+ *   · `audience` — the ordinary rule: the LOCKED item's access picks the one system project it may
+ *     enter (team → General, external → external-shared);
+ *   · `verified-claim` — the destination was selected explicitly by a Google Drive connection's
+ *     approved audience, and the caller has ALREADY verified a live claim for this exact item and
+ *     destination (`verifyGdriveClaim`). Only that entry may pass this; it is not reachable from a
+ *     method name, an argument an ordinary caller can set, or an exported function.
+ *
+ * Either way the SECOND half of the gate is identical and unconditional: every grant on a protected
+ * target must be a sanctioned system edge. A verified claim chooses the destination; it never
+ * excuses a corrupted one.
+ */
+type TargetRouting = { routedBy: "audience"; audience: string } | { routedBy: "verified-claim" };
+
+async function protectedTargetGate(
+  db: DbClient,
+  teamId: string,
+  projectId: string,
+  routing: TargetRouting
+): Promise<WriteResult> {
   const { data: project, error: projectError } = await db
     .from("projects")
     .select("id, kind, slug")
@@ -96,12 +132,18 @@ export async function systemIntegrityGate(
   const target = project as { kind: string; slug: string };
   if (!isProtectedProject(target)) return { ok: true };
 
-  const routed = ROUTED_SLUG[audience];
-  if (!routed) return integrityRefusal(`unknown audience '${audience}' for a protected target`);
-  if (target.slug !== routed) {
-    return integrityRefusal(
-      `a ${audience}-audience unit may enter only '${routed}', not the protected project '${target.slug}'`
-    );
+  if (routing.routedBy === "audience") {
+    const routed = ROUTED_SLUG[routing.audience];
+    if (!routed) return integrityRefusal(`unknown audience '${routing.audience}' for a protected target`);
+    if (target.slug !== routed) {
+      return integrityRefusal(
+        `a ${routing.audience}-audience unit may enter only '${routed}', not the protected project '${target.slug}'`
+      );
+    }
+  } else if (!Object.values(ROUTED_SLUG).includes(target.slug)) {
+    // A claim may select General or external-shared — the two targets some audience routes to. A
+    // protected project under any other slug has no routing rule at all, for anyone.
+    return integrityRefusal(`the protected project '${target.slug}' is not a selectable audience`);
   }
 
   const { data: grants, error: grantsError } = await db
@@ -152,11 +194,19 @@ async function insertInclude(
   return { ok: true, created: true };
 }
 
-/** Conditional auto-exclude repair with one authoritative same-transaction reread. */
+/**
+ * Conditional auto-exclude repair with one authoritative same-transaction reread.
+ *
+ * `repairMethod` is the method the repair include is written with. The ordinary path records
+ * `exclude_shadow_repair`; a Drive claim placement records `gdrive_claim` instead, because the
+ * method is how a later revocation finds the row (`closeGdriveManagedMembership`) — a claim include
+ * filed as a generic repair would outlive the claim that authorized it.
+ */
 async function repairExcludeShadow(
   context: LockedItemContext,
   args: EnsureIncludeArgs,
-  row: CurrentRow
+  row: CurrentRow,
+  repairMethod: MembershipMethod = "exclude_shadow_repair"
 ): Promise<WriteResult> {
   if (row.mode !== "auto") return protectedTarget();
 
@@ -199,19 +249,137 @@ async function repairExcludeShadow(
     const current = reread as CurrentRow | null;
     if (current?.decision === "include") return { ok: true, created: false };
     if (current && isProtected(current)) return protectedTarget();
-    if (!current) return insertInclude(context, args, "exclude_shadow_repair");
+    if (!current) return insertInclude(context, args, repairMethod);
     throw new MembershipStateChangedError(
       "membership-state-changed: automatic target exclusion changed without converging"
     );
   }
 
-  return insertInclude(context, args, "exclude_shadow_repair");
+  return insertInclude(context, args, repairMethod);
 }
 
-/** Internal core for callers that already hold the item lock. */
+/**
+ * Internal core for callers that already hold the item lock.
+ *
+ * `gdrive_claim` is REFUSED here. That method labels a row a Drive claim authorized, and the label
+ * is what revocation acts on, so only `ensureGdriveClaimMembershipLocked` — which verifies the
+ * claim — may write it. Passing the name to this entry grants nothing: it is not routed
+ * differently, and it is not written.
+ */
 export async function ensureIncludeMembershipLocked(
   context: LockedItemContext,
   args: EnsureIncludeArgs
+): Promise<WriteResult> {
+  if (args.method === "gdrive_claim") {
+    return {
+      ok: false,
+      refused: true,
+      refusalReason: "gdrive-claim-unverified",
+      error: "gdrive-claim: a 'gdrive_claim' membership is written only by the claim-authorized entry",
+    };
+  }
+  return ensureIncludeGated(context, args, args.method ?? "ingestion_project", "exclude_shadow_repair", async () => {
+    const gate = await systemIntegrityGate(
+      context.session.db,
+      context.teamId,
+      args.projectId,
+      context.item.access
+    );
+    return gate;
+  });
+}
+
+function claimRefusal(detail: string): WriteResult {
+  return { ok: false, refused: true, refusalReason: "gdrive-claim-unverified", error: `gdrive-claim: ${detail}` };
+}
+
+/**
+ * Is there a LIVE claim, in this team, by this exact connection, for this exact item, naming this
+ * exact destination — recorded under the connection's CURRENT generation?
+ *
+ * Read on the session's own connection, so a claim the surrounding ingest recorded moments ago in
+ * the same transaction is visible, and one that transaction retired is not. Every field is part of
+ * the question:
+ *   · team + integration + provider + item — a claim for another document, or the same provider id
+ *     under another connection or team, authorizes nothing here;
+ *   · `active` — a retired claim is history, not authority;
+ *   · the destination row — a claim covers the projects its connection's audience named, no others;
+ *   · generation — a claim is stamped only by a fenced execution commit. A scope, credential or
+ *     audience change advances the connection's generation, and a claim last seen under an earlier
+ *     one keeps whatever placement it already has but cannot open a new one;
+ *   · an enabled connection — a paused or disconnected one retains content and widens nothing.
+ *
+ * No row lock is taken: every path that retires a claim then re-derives the item's memberships
+ * under the same item lock this caller holds, so a claim retired concurrently is closed by that
+ * writer rather than raced here, and locking the claim or authority row after the item row would
+ * invert the order the fenced ingest takes them in.
+ */
+async function verifyGdriveClaim(
+  context: LockedItemContext,
+  args: GdriveClaimIncludeArgs
+): Promise<WriteResult> {
+  const { rows } = await context.session.executeSql<{ claimed: boolean; live: boolean }>(
+    `select true as claimed,
+            (c.active
+              and c.generation = a.generation
+              and i.type = 'gdrive'
+              and i.status = 'enabled'
+              and exists (
+                select 1 from gdrive_item_claim_projects cp
+                 where cp.team_id = c.team_id and cp.integration_id = c.integration_id
+                   and cp.provider_id = c.provider_id and cp.project_id = $5
+              )) as live
+       from gdrive_item_claims c
+       join gdrive_connection_authority a
+         on a.team_id = c.team_id and a.integration_id = c.integration_id
+       join integrations i
+         on i.team_id = c.team_id and i.id = c.integration_id
+      where c.team_id = $1 and c.integration_id = $2 and c.provider_id = $3 and c.item_id = $4`,
+    [context.teamId, args.integrationId, args.providerId, context.itemId, args.projectId]
+  );
+  const claim = rows[0];
+  if (!claim) return claimRefusal("no claim by this connection for this item");
+  if (!claim.live) {
+    return claimRefusal(
+      "the claim is retired, was last seen under a superseded connection generation, belongs to a " +
+        "paused connection, or does not name this destination"
+    );
+  }
+  return { ok: true };
+}
+
+/**
+ * CLAIM-AUTHORIZED include (AIO-1167): place a Google Drive item in a project its connection's
+ * approved audience selected — which, unlike the ordinary rule, MAY be General or external-shared
+ * whatever the item's own access tier.
+ *
+ * What makes that safe is the claim, verified HERE and not by the caller, and nothing weaker:
+ *   1. the unit must belong to the locked item and mirror its access (as for every include);
+ *   2. `verifyGdriveClaim` must find a live, current-generation claim for this item + destination;
+ *   3. a protected destination must still hold only sanctioned grants (the gate's second half).
+ * The ordinary audience routing is the ONE check a verified claim replaces. An explicit exclusion
+ * is still never overridden, and the row is written with method `gdrive_claim` — including when it
+ * replaces an automatic exclude — so revoking the claim can close it.
+ */
+export async function ensureGdriveClaimMembershipLocked(
+  context: LockedItemContext,
+  args: GdriveClaimIncludeArgs
+): Promise<WriteResult> {
+  const include: EnsureIncludeArgs = { projectId: args.projectId, contextUnitId: args.contextUnitId };
+  return ensureIncludeGated(context, include, "gdrive_claim", "gdrive_claim", async () => {
+    const claim = await verifyGdriveClaim(context, args);
+    if (!claim.ok) return claim;
+    return protectedTargetGate(context.session.db, context.teamId, args.projectId, { routedBy: "verified-claim" });
+  });
+}
+
+/** The one include algorithm. `authorize` and the method written are all its two entries differ by. */
+async function ensureIncludeGated(
+  context: LockedItemContext,
+  args: EnsureIncludeArgs,
+  method: MembershipMethod,
+  repairMethod: MembershipMethod,
+  authorize: () => Promise<WriteResult>
 ): Promise<WriteResult> {
   const { data: unit, error: unitError } = await context.session.db
     .from("project_context_units")
@@ -235,12 +403,7 @@ export async function ensureIncludeMembershipLocked(
       `the unit's audience mirror ('${unitAudience}') disagrees with the locked item ('${context.item.access}') — reconcile the unit before placing it`
     );
   }
-  const gate = await systemIntegrityGate(
-    context.session.db,
-    context.teamId,
-    args.projectId,
-    context.item.access
-  );
+  const gate = await authorize();
   if (!gate.ok) return gate;
 
   const { data: existing, error: existingError } = await context.session.db
@@ -254,8 +417,8 @@ export async function ensureIncludeMembershipLocked(
   if (existingError) return { ok: false, error: `membership read failed: ${existingError.message}` };
   const current = existing as CurrentRow | null;
   if (current?.decision === "include") return { ok: true, created: false };
-  if (current) return repairExcludeShadow(context, args, current);
-  return insertInclude(context, args, args.method ?? "ingestion_project");
+  if (current) return repairExcludeShadow(context, args, current, repairMethod);
+  return insertInclude(context, args, method);
 }
 
 export type CloseResult =
@@ -362,6 +525,27 @@ export async function ensureIncludeMembership(
   }
 }
 
+/**
+ * Standalone claim-authorized writer — the entry `lib/projects/context/gdrive-claims.ts` uses. Same
+ * lock/revalidation protocol; the claim is verified inside, under the item lock, on this session's
+ * connection (see `ensureGdriveClaimMembershipLocked`). A refusal rolls the session back.
+ */
+export async function ensureGdriveClaimMembership(
+  db: DbClient,
+  teamId: string,
+  args: GdriveClaimIncludeArgs
+): Promise<WriteResult> {
+  try {
+    return await runContextTransaction(db, async (session) => {
+      const context = await lockContextForUnit(session, teamId, args.contextUnitId);
+      if (!context) return { ok: false, error: "context unit or item not found" };
+      return ensureGdriveClaimMembershipLocked(context, args);
+    });
+  } catch (error) {
+    return { ok: false, error: contextFailureMessage(error) };
+  }
+}
+
 /** Standalone public close with the same lock/revalidation protocol. */
 export async function closeMembershipInto(
   db: DbClient,
@@ -374,6 +558,37 @@ export async function closeMembershipInto(
       const context = await lockContextForUnit(session, teamId, contextUnitId);
       if (!context) return { ok: false, error: "context unit or item not found" };
       return closeMembershipIntoLocked(context, contextUnitId, projectId);
+    });
+  } catch (error) {
+    return { ok: false, error: contextFailureMessage(error) };
+  }
+}
+
+/**
+ * Close only machine-owned Drive/default includes; human curation is never a claim side effect.
+ * Same lock/revalidation protocol as every other membership write.
+ */
+export async function closeGdriveManagedMembership(
+  db: DbClient,
+  teamId: string,
+  contextUnitId: string,
+  projectId: string
+): Promise<WriteResult> {
+  try {
+    return await runContextTransaction(db, async (session) => {
+      const context = await lockContextForUnit(session, teamId, contextUnitId);
+      if (!context) return { ok: false, error: "context unit or item not found" };
+      const { error } = await session.db
+        .from("project_context_memberships")
+        .update({ valid_to: new Date().toISOString() })
+        .eq("team_id", teamId)
+        .eq("context_unit_id", contextUnitId)
+        .eq("project_id", projectId)
+        .eq("decision", "include")
+        .eq("mode", "auto")
+        .in("method", ["gdrive_claim", "ingestion_project"])
+        .is("valid_to", null);
+      return error ? { ok: false, error: error.message } : { ok: true };
     });
   } catch (error) {
     return { ok: false, error: contextFailureMessage(error) };

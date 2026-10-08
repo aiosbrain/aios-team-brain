@@ -16,6 +16,7 @@ from fastapi import FastAPI, Request, Response
 from .config import BrainSettings, Connection, load_connections
 from .engine import ingest_docs
 from .sources import build_source
+from .state import StateStore
 
 app = FastAPI(title="aios-ingest webhooks")
 
@@ -39,6 +40,11 @@ def health() -> dict[str, str]:
 async def webhook(source: str, request: Request) -> Response:
     raw = await request.body()
     headers = {k.lower(): v for k, v in request.headers.items()}
+
+    # Drive notifications are empty-body, header-only HINTS. Validate all persisted channel
+    # identity before scheduling an idempotent poll; never fetch provider content in this request.
+    if source == "gdrive":
+        return _gdrive_notification(headers)
 
     # Slack Events API URL verification handshake.
     if source == "slack":
@@ -75,3 +81,28 @@ async def _safe_json(raw: bytes) -> dict:
     except json.JSONDecodeError as e:
         raise ValueError("invalid JSON") from e
     return data if isinstance(data, dict) else {}
+
+
+def _gdrive_notification(headers: dict[str, str]) -> Response:
+    channel_id = headers.get("x-goog-channel-id")
+    resource_id = headers.get("x-goog-resource-id")
+    token = headers.get("x-goog-channel-token")
+    if not channel_id or not resource_id:
+        return Response(status_code=401, content="invalid Drive notification")
+    state = StateStore(os.environ.get("AIOS_INGEST_STATE", "aios_ingest_state.sqlite"))
+    try:
+        channel = state.validate_notification(
+            channel_id=channel_id, resource_id=resource_id, verification_token=token
+        )
+        if not channel:
+            return Response(status_code=401, content="invalid Drive notification")
+        if channel.namespace:
+            progress = state.get_progress(channel.namespace)
+            if progress:
+                # Any number of notifications is one dirty mark on the stream itself. The channel
+                # may have been created under an earlier scope generation; the stream (connection,
+                # account, drive) is what the current coordinator reads, so that is what is marked.
+                state.record_stream_hint(progress.key)
+        return Response(status_code=202, content="Drive poll scheduled")
+    finally:
+        state.close()
