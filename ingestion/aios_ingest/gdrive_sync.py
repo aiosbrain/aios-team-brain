@@ -119,6 +119,48 @@ def _start_blocked(stream: Any) -> bool:
     return not token and str(last_error or "").startswith(_START_UNAVAILABLE)
 
 
+def _start_recovery_blocked(progress: Any) -> bool:
+    """True for a stream that had started and whose recovery is waiting on a start token."""
+    return bool(
+        progress.baseline_start_token and progress.recovery_required
+        and str(progress.last_error or "").startswith(_START_UNAVAILABLE)
+    )
+
+
+class StreamStartUnavailable(RuntimeError):
+    """A containing drive's change log could not be opened: that stream's failure, not the run's."""
+
+    def __init__(self, drive_id: str, status: int):
+        super().__init__(
+            f"{_START_UNAVAILABLE}: drive {drive_id} not found or not accessible ({status})"
+        )
+        self.drive_id = drive_id
+        self.status = status
+
+
+def _capture_start_token(source: GoogleDriveSource, drive: Any, drive_id: str) -> str:
+    """Capture one drive's start token — the only way any path here asks for one.
+
+    A Shared Drive that answers 403 or 404 is a drive whose change log the account cannot open: a
+    root shared without its drive, or a drive since lost. That is ``StreamStartUnavailable`` at
+    every site alike — a new stream, the recovery of local state, the recovery of an invalid
+    cursor — so none of them can turn one stream's failure into the run's. My Drive, authority
+    and provider deferrals, and every other status are raised exactly as they came.
+    """
+    kwargs = {"supportsAllDrives": True}
+    if drive_id != "my-drive":
+        kwargs["driveId"] = drive_id
+    try:
+        return source._execute(drive.changes().getStartPageToken(**kwargs))["startPageToken"]
+    except (BrainError, ProviderDeferred):
+        raise
+    except Exception as exc:
+        status = _provider_status(exc)
+        if drive_id == "my-drive" or status not in (403, 404):
+            raise
+        raise StreamStartUnavailable(drive_id, status) from exc
+
+
 @dataclass(frozen=True)
 class RootObservation:
     """Where one selected root is now: ``here`` (the stream's own drive), ``elsewhere`` (another
@@ -162,6 +204,61 @@ def _leaving_roots(state: StateStore, integration_id: str, generation: int) -> s
         root for root, binding in state.unsettled_roots(integration_id, generation).items()
         if binding.status == "relocating"
     }
+
+
+def _reobserve_stalled_relocations(
+    source: GoogleDriveSource, state: StateStore, integration_id: str, generation: int,
+    destination_blocked: Any,
+) -> None:
+    """Read again, on every run, each relocating root whose destination has no start token.
+
+    A root is handed over only once its destination stream holds a token. While that drive's
+    change log cannot be opened the hand-over waits — and would wait for good if the root were
+    moved on to a third drive, or back, since nothing else reads where it is. So where it is NOW
+    is read again: found in another drive, that drive becomes its destination; found in the drive
+    it is still bound to, it never left that stream. Still there, unreadable or gone, nothing is
+    concluded. In every case the root stays bound where it was until a hand-over, the claims made
+    through it stand, and the connection stays incomplete.
+    """
+    seen: dict[str, RootObservation] = {}
+    for (root_kind, root_id), binding in state.unsettled_roots(integration_id, generation).items():
+        if binding.status != "relocating" or not binding.pending_drive_id:
+            continue
+        if not destination_blocked(str(binding.pending_drive_id)):
+            continue
+        observed = _observe_root(source, root_id, binding.drive_id, seen)
+        if observed.state == "here":
+            state.cancel_relocation(integration_id, generation, root_kind, root_id)
+        elif observed.state == "elsewhere" and observed.drive_id != binding.pending_drive_id:
+            state.mark_root_relocating(
+                integration_id, generation, root_kind, root_id, binding.drive_id,
+                destination=str(observed.drive_id),
+            )
+
+
+def _retire_orphan_start_diagnostics(
+    state: StateStore, execution: GdriveExecution, integration_id: str, generation: int,
+    required: set[str],
+) -> None:
+    """Forget a stream that is only a start-token diagnostic once no root needs its drive.
+
+    Such a stream holds no token, snapshot or work. Left in place after the root that was on its
+    way there moved on, it would be retried — and would keep the connection incomplete — forever.
+    """
+    remote = execution.progress.get("streams")
+    for progress in state.list_progress(integration_id, generation):
+        if progress.key.drive_id in required or not _start_blocked(progress):
+            continue
+        if state.forget_unstarted_stream(progress.namespace) and isinstance(remote, dict):
+            remote.pop(progress.key.drive_id, None)
+    if isinstance(remote, dict):
+        local = {progress.key.drive_id for progress in state.list_progress(integration_id, generation)}
+        for drive_id in [
+            str(drive_id) for drive_id, stream in remote.items()
+            if str(drive_id) not in required and str(drive_id) not in local
+            and isinstance(stream, dict) and _start_blocked(stream)
+        ]:
+            remote.pop(drive_id, None)
 
 
 def _stream_roots(
@@ -265,6 +362,20 @@ def _configured_roots(
     if drive_id in {str(value) for value in options.get("shared_drive_ids") or []}:
         configured.append((drive_id, "drive", drive_id, True))
     return configured
+
+
+def _terminal_before_rescan(page: Any) -> bool:
+    """True for a terminal change page that seeded a rescan.
+
+    Such a page was read before the enumeration it caused. A document moved between two folders of
+    the rescanned subtree while that enumeration ran can be listed in neither, and the only record
+    of it is a change after this page's token. So this page's terminal token is not evidence that
+    the stream is drained: only a change page read after the enumeration is.
+    """
+    return bool(
+        page.page_kind == "changes" and page.rescan_snapshot_id is not None
+        and page.terminal_token and not page.next_token
+    )
 
 
 def _terminal_drain_complete(progress: Any) -> bool:
@@ -388,6 +499,10 @@ async def run_gdrive_stream(
                     if not isinstance(exc, BrainDeferred):
                         total.failed += 1
                     total.failure_categories[exc.code] = 1
+                    # The empty selection is published, but absence is not established until its
+                    # reconciliation is acknowledged — deferred or failed, that reconciliation is
+                    # the outstanding work. Unmeasured would report the run failed; zero, done.
+                    total.backlog = 1
                 return total
             auth_mode = str(options.get("auth_mode") or "oauth")
             token_provider = None
@@ -439,12 +554,28 @@ async def run_gdrive_stream(
                     return IngestSummary(conn.name, failed=1, failure_categories={exc.category: 1})
             generation = execution.generation
             total = IngestSummary(conn.name, failure_categories={}, integration_id=integration_id)
+
+            def start_blocked(drive_id: str) -> bool:
+                """Whether a drive's stream is, locally or on the brain, only a start diagnostic."""
+                local = state.get_progress(StreamKey(
+                    settings.team, integration_id, credential_identity(options), drive_id,
+                ).namespace(generation))
+                started = local if local is not None else (
+                    _remote_stream(execution.progress, drive_id) or None
+                )
+                return started is not None and _start_blocked(started)
+
             # Which streams exist depends on where each selected root lives, so every root is bound
             # before any start token is captured. An unreadable root has no known stream: nothing
             # is enumerated on a guess, and the generation resumes binding on the next run.
+            # A root on its way to a drive whose change log an earlier run could not open is read
+            # again here, so the streams below are those of where it is now.
             try:
                 root_bindings = _bind_selected_roots(
                     source, state, integration_id, generation, options,
+                )
+                _reobserve_stalled_relocations(
+                    source, state, integration_id, generation, start_blocked,
                 )
             except BrainError as exc:
                 total.failed += 1
@@ -467,10 +598,13 @@ async def run_gdrive_stream(
                 for root, binding in state.unsettled_roots(integration_id, generation).items()
                 if binding.status == "relocating" and binding.pending_drive_id
             }
+            required = {*_stream_ids(options, root_bindings), *relocating.values()}
+            # A drive no root lives in or is on its way to any more — the root moved on, or back —
+            # is not a stream if all it ever was is a start-token diagnostic.
+            _retire_orphan_start_diagnostics(state, execution, integration_id, generation, required)
             streams = sorted(
-                {*_stream_ids(options, root_bindings),
-                 *(progress.key.drive_id for progress in state.list_progress(integration_id, generation)),
-                 *relocating.values()},
+                {*required,
+                 *(progress.key.drive_id for progress in state.list_progress(integration_id, generation))},
                 key=lambda value: (value != "my-drive", value),
             )
             if not streams:
@@ -494,13 +628,8 @@ async def run_gdrive_stream(
                     )
                     if started is not None and not _start_blocked(started):
                         continue
-                    kwargs = {"supportsAllDrives": True}
-                    if drive_id != "my-drive":
-                        kwargs["driveId"] = drive_id
                     try:
-                        start = source._execute(
-                            drive.changes().getStartPageToken(**kwargs)
-                        )["startPageToken"]
+                        start = _capture_start_token(source, drive, drive_id)
                     except BrainError as exc:
                         total.failed += 1
                         total.failure_categories[exc.code] = 1
@@ -509,10 +638,7 @@ async def run_gdrive_stream(
                         total.failed += 1
                         total.failure_categories[exc.category] = 1
                         return total
-                    except Exception as exc:
-                        status = _provider_status(exc)
-                        if drive_id == "my-drive" or status not in (403, 404):
-                            raise
+                    except StreamStartUnavailable as exc:
                         # This drive's change log cannot be opened — a root that lives in a Shared
                         # Drive the account cannot list changes for. That is this stream's failure,
                         # not the connection's authority: it is recorded durably, as a stream that
@@ -521,20 +647,10 @@ async def run_gdrive_stream(
                         # this stream.
                         if local is None:
                             state.begin_generation(key, generation, start_token="", phase="partial")
-                        await _checkpoint_progress(
-                            client, execution, state, namespace, phase="partial",
-                            baseline_start_token=None, page_token=None, listing_complete=False,
-                            last_error=(
-                                f"{_START_UNAVAILABLE}: drive {drive_id} not found or not "
-                                f"accessible ({status})"
-                            ),
-                            last_attempt_at=_now(),
+                        await _checkpoint_start_unavailable(
+                            client, execution, state, namespace, exc, total,
                         )
                         blocked.add(drive_id)
-                        total.failed += 1
-                        total.failure_categories["stream_start_unavailable"] = (
-                            total.failure_categories.get("stream_start_unavailable", 0) + 1
-                        )
                         continue
                     if local is None:
                         state.begin_generation(key, generation, start_token=start)
@@ -754,7 +870,16 @@ async def _run_gdrive_stream_unlocked(
             and checkpoint_page.page_kind == "changes"
             and remote_cursor
             and remote_cursor in {checkpoint_page.next_token, checkpoint_page.terminal_token}
-            and int(remote.get("drain_observation") or 0) == checkpoint_page.drain_observation
+            and (
+                int(remote.get("drain_observation") or 0) == checkpoint_page.drain_observation
+                # Retiring a terminal page that seeded a rescan opens the observation of the
+                # drain that has to confirm it, in that same checkpoint.
+                or (
+                    _terminal_before_rescan(checkpoint_page)
+                    and progress is not None
+                    and int(remote.get("drain_observation") or 0) == progress.drain_observation + 1
+                )
+            )
         ):
             # The authoritative cursor checkpoint succeeded and the process died before its local
             # mirror. Retire exactly that durable page; pending document work remains independent.
@@ -812,26 +937,44 @@ async def _run_gdrive_stream_unlocked(
             publish_snapshot=snapshot_id,
         )
         return IngestSummary(conn.name, failure_categories={})
-    if progress is None:
-        kwargs = {"supportsAllDrives": True}
-        if drive_id != "my-drive":
-            kwargs["driveId"] = drive_id
-        start = source._execute(drive.changes().getStartPageToken(**kwargs))["startPageToken"]
-        progress = state.begin_generation(key, generation, start_token=start)
+    if progress is None or _start_blocked(progress):
+        try:
+            start = _capture_start_token(source, drive, drive_id)
+        except StreamStartUnavailable as exc:
+            # Nothing is enumerated without a token: the stream is only its diagnostic.
+            if progress is None:
+                state.begin_generation(key, generation, start_token="", phase="partial")
+            unavailable = IngestSummary(conn.name, failure_categories={})
+            await _checkpoint_start_unavailable(client, execution, state, namespace, exc, unavailable)
+            return unavailable
+        if progress is None:
+            progress = state.begin_generation(key, generation, start_token=start)
         await _checkpoint_progress(
             client, execution, state, namespace, phase="baselining",
             baseline_start_token=start, page_token=None, listing_complete=False,
-            last_attempt_at=_now(),
+            last_error=None, last_attempt_at=_now(),
         )
         progress = state.get_progress(namespace)
 
-    if remote_v2 and progress is not None:
-        needs_recovery = not durable_remote_match
+    if progress is not None:
+        # A recovery that could not capture its start token is owed until it does: the flag is
+        # durable, so a later run retries it even when local and remote state then agree.
+        needs_recovery = (
+            (remote_v2 and not durable_remote_match) or _start_recovery_blocked(progress)
+        )
         if needs_recovery:
-            kwargs = {"supportsAllDrives": True}
-            if drive_id != "my-drive":
-                kwargs["driveId"] = drive_id
-            fresh = source._execute(drive.changes().getStartPageToken(**kwargs))["startPageToken"]
+            try:
+                fresh = _capture_start_token(source, drive, drive_id)
+            except StreamStartUnavailable as exc:
+                # The recovery cannot begin. What this stream holds stays exactly as it is — its
+                # cursor, its published membership, the claims made through it — and the stream
+                # is recorded as waiting on its drive, which keeps the connection from
+                # reconciling while the other streams run.
+                unavailable = IngestSummary(conn.name, failure_categories={})
+                await _checkpoint_start_unavailable(
+                    client, execution, state, namespace, exc, unavailable,
+                )
+                return unavailable
             state.begin_selection_snapshot(
                 namespace, generation, _stream_roots(
                     state, execution.integration_id, generation, options, drive_id, root_bindings,
@@ -1016,8 +1159,13 @@ async def _run_gdrive_stream_unlocked(
                                                phase="partial", last_error="change page pending")
                     return summary
                 token = existing.next_token or existing.terminal_token or token
-                if existing.terminal_token and not existing.next_token:
+                if existing.terminal_token and not existing.next_token and not (
+                    _terminal_before_rescan(existing)
+                    and state.page_committed(namespace, generation, existing.page_id)
+                ):
                     break
+                # A terminal page that seeded a rescan was read before that rescan enumerated
+                # anything: the drain goes on from its token, and only a page read now can end it.
                 continue
             try:
                 page = read_change_page(
@@ -1029,10 +1177,16 @@ async def _run_gdrive_stream_unlocked(
                 # A 410 never becomes an empty snapshot. Retain the old cursor as evidence, clear
                 # only the selected-membership traversal, and capture a fresh start token before
                 # the controlled baseline rescan.
-                kwargs = {"supportsAllDrives": True}
-                if drive_id != "my-drive":
-                    kwargs["driveId"] = drive_id
-                fresh = source._execute(drive.changes().getStartPageToken(**kwargs))["startPageToken"]
+                try:
+                    fresh = _capture_start_token(source, drive, drive_id)
+                except StreamStartUnavailable as exc:
+                    # The cursor is gone and its drive will not issue another. Nothing is reset:
+                    # the old cursor and the published membership stay, and the recovery this
+                    # stream owes is retried from the top of every run until a token is captured.
+                    await _checkpoint_start_unavailable(
+                        client, execution, state, namespace, exc, summary,
+                    )
+                    return summary
                 state.reset_selection_snapshot(namespace, generation)
                 await _checkpoint_progress(
                     client, execution, state, namespace, phase="baselining",
@@ -1303,7 +1457,9 @@ async def _run_gdrive_stream_unlocked(
                 return summary
             token = materialized.next_token or materialized.terminal_token or token
             terminal = materialized.terminal_token and not materialized.next_token
-            if terminal:
+            # A page replayed after its rescan published still predates that enumeration: it ends
+            # no drain, and the page after it is read while the budget lasts.
+            if terminal and not _terminal_before_rescan(materialized):
                 drained_to_terminal = True
                 break
         if observed_hint is not None and drained_to_terminal:
@@ -1592,7 +1748,13 @@ async def _finish_materialized_pages(
             next_token = page.next_token or page.terminal_token
             if not next_token:
                 raise RuntimeError("Drive change page omitted both continuation and terminal token")
-            terminal = bool(page.terminal_token and not page.next_token)
+            # The terminal token of a page that seeded a rescan is where the drain goes on from,
+            # not where it ended: the cursor advances past the page, but no terminal drain is
+            # acknowledged, and a new observation is opened for the change page that has to be
+            # read now that the rescan has enumerated. That is durable — a restart finds a cursor
+            # with no acknowledged drain, and reads on from it before anything is reconciled.
+            unconfirmed = _terminal_before_rescan(page)
+            terminal = bool(page.terminal_token and not page.next_token) and not unconfirmed
             await _checkpoint_progress(
                 client, execution, state, namespace, page_token=next_token,
                 phase="partial" if terminal else "catching_up",
@@ -1605,6 +1767,9 @@ async def _finish_materialized_pages(
                 terminal_drain_checkpoint_id=(page.page_id if terminal else None),
                 terminal_drain_acknowledged=terminal,
                 terminal_drain_observation=(page.drain_observation if terminal else None),
+                **({
+                    "drain_observation": state.get_progress(namespace).drain_observation + 1,
+                } if unconfirmed else {}),
             )
         state.commit_page(namespace, generation, page.page_id, require_acks=False)
         state.purge_committed_page_work(namespace, generation, page.page_id)
@@ -1745,6 +1910,17 @@ async def _drain_pending(
         if work.action == "remove":
             if not state.work_is_current(work):
                 continue
+            verdict = _cross_stream_removal(state, execution, work)
+            if verdict == "claimed":
+                # Moved between two selected roots of this connection: only this stream's own
+                # membership ended, and that was recorded with the page. Nothing is removed.
+                state.ack_work(work)
+                continue
+            if verdict == "withheld":
+                summary.failure_categories["cross_stream_move_pending"] = (
+                    summary.failure_categories.get("cross_stream_move_pending", 0) + 1
+                )
+                continue
             try:
                 result = await client.reconcile_gdrive(
                     execution,
@@ -1812,6 +1988,47 @@ async def _drain_pending(
         ):
             break
     return consumed
+
+
+# A removal one stream observed while another stream of the connection had not yet drained past it.
+_CROSS_STREAM_PENDING = "cross-stream move unresolved"
+
+
+def _cross_stream_removal(state: StateStore, execution: GdriveExecution, work: PendingWork) -> str:
+    """What one stream's removal means for a connection that consumes other streams too.
+
+    ``removed_provider_ids`` removes a document for the whole connection. But a document — or a
+    folder and everything under it — moved between selected roots in two drives is reported as
+    removed by the drive it left and as present by the drive it entered, each in its own change
+    log, consumed in either order. So before a removal leaves this stream:
+
+      · ``claimed`` — another stream holds the document (in its published snapshot, in one it is
+        building, or as an upsert it still owes). Only this stream's membership ended.
+      · ``withheld`` — no other stream holds it, but one may not have read that far: every other
+        stream is marked dirty once, and this obligation stays durable until each of them has
+        finished a drain that began after the mark. A restart changes none of that.
+      · ``absent`` — every other stream has, and none holds it. The removal is the connection's.
+
+    A connection with one stream has nothing to wait for: its removals are ``absent`` at once.
+    """
+    own = state.get_progress(work.namespace)
+    connection_id = own.key.connection_id if own is not None else execution.integration_id
+    others = [
+        progress for progress in state.list_progress(connection_id, work.generation)
+        if progress.namespace != work.namespace
+    ]
+    if not others:
+        return "absent"
+    if state.claimed_elsewhere(connection_id, work.generation, work.namespace, work.item_key):
+        return "claimed"
+    if not str(work.last_error or "").startswith(_CROSS_STREAM_PENDING):
+        for other in others:
+            state.record_stream_hint(other.key)
+    elif all(state.pending_stream_hint(other.key) is None for other in others):
+        return "absent"
+    # Attempted again each run, behind retries that have waited less.
+    state.fail_work(work, f"{_CROSS_STREAM_PENDING}: awaiting the other streams' next drain")
+    return "withheld"
 
 
 def _run_deadline_reached(execution: GdriveExecution) -> bool:
@@ -1959,6 +2176,37 @@ async def _checkpoint_progress(
     for local in state.list_progress(execution.integration_id, execution.generation):
         if local.namespace != namespace and local.server_revision < revision:
             state.update_progress(local.namespace, server_revision=revision)
+
+
+async def _checkpoint_start_unavailable(
+    client: BrainClient,
+    execution: GdriveExecution,
+    state: StateStore,
+    namespace: str,
+    unavailable: StreamStartUnavailable,
+    summary: IngestSummary,
+) -> None:
+    """Record one stream, locally and on the brain, as waiting on a start token it cannot get.
+
+    A stream that never started has no token and enumerates nothing. One that had started keeps
+    everything it holds — its cursor, its published membership, the claims made through it — and
+    is marked for the recovery it could not begin. Either is retried on every run, counts as
+    backlog and keeps the connection from reconciling, while the other streams still run.
+    """
+    progress = state.get_progress(namespace)
+    if progress is not None and progress.baseline_start_token:
+        changes: dict[str, Any] = {"recovery_required": True}
+    else:
+        changes = {"baseline_start_token": None, "page_token": None, "listing_complete": False}
+    await _checkpoint_progress(
+        client, execution, state, namespace, phase="partial", last_error=str(unavailable),
+        last_attempt_at=_now(), **changes,
+    )
+    summary.failed += 1
+    summary.failure_categories = summary.failure_categories or {}
+    summary.failure_categories["stream_start_unavailable"] = (
+        summary.failure_categories.get("stream_start_unavailable", 0) + 1
+    )
 
 
 def _merge_summary(target: IngestSummary, source: IngestSummary) -> None:
