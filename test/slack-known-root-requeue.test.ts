@@ -810,7 +810,7 @@ describe("known-root decorated session — statement order, refreshed timeouts, 
       (scripted) => prepareSlackKnownRootRequeue(scripted.session, { teamId: TEAM, entry: located() }, execution()),
       { outcome: "refused", reason: "source_not_current" },
     ],
-  ])("restores both original settings before a normal result resolves: %s (control)", async (_label, respond, run, expected) => {
+  ])("restores both original settings before a normal result resolves: %s (control)", async (label, respond, run, expected) => {
     const scripted = scriptedSession({ original: { statementMs: 30_000, lockMs: 1_500 }, respond });
     const result = await run(scripted);
     expect(result).toEqual(expected);
@@ -819,6 +819,25 @@ describe("known-root decorated session — statement order, refreshed timeouts, 
     // While the operation ran the settings really were changed: the restoration is not a no-op.
     for (const statement of scripted.data()) expect(statement.effective).not.toEqual(scripted.original);
     expectRestored(scripted);
+
+    // M14 (§12): omitting EITHER restoration on a normal return must be seen, a refused outcome included.
+    // Each of the two settings, on its own, was something other than its original for every data
+    // statement — so putting back only one of them cannot pass for putting back both…
+    expect({
+      statement_timeout_was_not_its_original_for_any_data_statement: scripted.data().every((statement) => statement.effective.statementMs !== scripted.original.statementMs),
+      lock_timeout_was_not_its_original_for_any_data_statement: scripted.data().every((statement) => statement.effective.lockMs !== scripted.original.lockMs),
+    }, `M14: ${label}: fixture: while the operation ran, each timeout setting on its own was not its original`).toEqual({
+      statement_timeout_was_not_its_original_for_any_data_statement: true, lock_timeout_was_not_its_original_for_any_data_statement: true,
+    });
+    // …and a READ-BACK through the caller's own session, after the normal result and in the same
+    // transaction as far as this model goes, finds each original value again, named one by one. It is
+    // the model's answer to a read of the settings, not this test's own copy of the model's state.
+    const readBack = await scripted.session.executeSql<{ name: string; setting: string }>(
+      "select name, setting from pg_settings where name in ('statement_timeout', 'lock_timeout')"
+    );
+    expect(Object.fromEntries(readBack.rows.map((row) => [row.name, Number(row.setting)])),
+      `M14: ${label}: a read-back on the caller's own session after the normal result finds the original statement_timeout and the original lock_timeout`)
+      .toEqual({ statement_timeout: scripted.original.statementMs, lock_timeout: scripted.original.lockMs });
   });
 
   it("issues no statement at all for an unlocated entry: there is nothing to set and nothing to restore (control)", async () => {
@@ -983,6 +1002,137 @@ describe("known-root decorated session — statement order, refreshed timeouts, 
     const before = scripted.log.length;
     expect(await rejection(() => kept.executeSql("select 1 as late"))).toBeInstanceOf(Error);
     expect(scripted.log).toHaveLength(before);
+  });
+
+  // ── §12 M13: every later data statement gets the REDUCED remaining budget ──
+
+  /**
+   * M13 (§7.3, §12). The first case of this suite already holds the statement timeout to the time
+   * that is left, statement by statement; there the time left never falls below the lock timeout's
+   * own 250 ms cap, so the LOCK timeout is 250 ms throughout and would look the same if it were
+   * computed once and reused. Here a later, slow statement leaves LESS than that cap: under a
+   * controlled monotonic clock and a 1,000 ms allowance the data statements take 500 ms, 350 ms and
+   * 100 ms, so they are dispatched with 1,000 ms, 500 ms and 150 ms left.
+   *
+   * Each data statement must run under a statement timeout of what is left, and a lock timeout of
+   * the lesser of its cap and what is left. A session that reuses the first statement's timeouts
+   * fails at the second statement, or — for the lock timeout alone — at the third. Each bound is
+   * two-sided, to within the one whole millisecond the first case allows: "no more than what is
+   * left" alone would also be satisfied by an arbitrary small cap, which is a different behaviour.
+   *
+   * What is left is computed here from the clock reading at which the model saw each data statement
+   * dispatched, so the case does not depend on how many statements a page takes beyond the three it
+   * needs.
+   */
+  it("M13: gives every later data statement the reduced remaining budget — the statement timeout, and the lock timeout once less than its cap is left", async () => {
+    const createdAt = 500_000;
+    const allowanceMs = 1_000;
+    const durations = [500, 350, 100];
+    const clock = { now: createdAt };
+    const dispatchedAt: number[] = [];
+    const scripted = scriptedSession({
+      original: { statementMs: 0, lockMs: 0 },
+      respond: () => {
+        dispatchedAt.push(clock.now);
+        clock.now += durations[dispatchedAt.length - 1] ?? 0;
+        return [{ id: ITEM }];
+      },
+    });
+    const context = createSlackKnownRootExecution({ allowanceMs, ambientDeadlineAt: null, monotonicNow: () => clock.now });
+    const page = await readSlackKnownRootItemPage(scripted.session, pageRequest, context);
+    expect(page.examined, "M13: fixture: the page read completed normally, with its one item").toBe(1);
+
+    const data = scripted.data();
+    const cap = SLACK_KNOWN_ROOT_LIMITS.lockTimeoutMs;
+    const left = dispatchedAt.map((at) => allowanceMs - (at - createdAt));
+    // FIXTURE: at least three data statements, each of the first three with less left than the one
+    // before it, the third with less than the lock timeout's cap, and time still left at the end.
+    expect({
+      one_reading_per_data_statement: data.length === dispatchedAt.length,
+      left_at_the_first_three: left.slice(0, 3),
+      less_than_the_lock_cap_is_left_at_the_third: left[2] < cap,
+      something_is_left_at_every_one: left.every((ms) => ms >= 1),
+    }, "M13: fixture: three data statements dispatched with 1,000 ms, 500 ms and 150 ms left").toEqual({
+      one_reading_per_data_statement: true, left_at_the_first_three: [1_000, 500, 150],
+      less_than_the_lock_cap_is_left_at_the_third: true, something_is_left_at_every_one: true,
+    });
+
+    data.forEach((statement, index) => {
+      const lockBudget = Math.min(cap, left[index]);
+      expect(statement.effective.statementMs, `M13: data statement ${index}: the statement timeout is no more than the ${left[index]} ms that are left`).toBeLessThanOrEqual(left[index]);
+      expect(statement.effective.statementMs, `M13: data statement ${index}: the statement timeout is the ${left[index]} ms that are left, not an arbitrary smaller cap`).toBeGreaterThanOrEqual(left[index] - 1);
+      expect(statement.effective.lockMs, `M13: data statement ${index}: the lock timeout is no more than ${lockBudget} ms, the lesser of its cap and what is left`).toBeLessThanOrEqual(lockBudget);
+      expect(statement.effective.lockMs, `M13: data statement ${index}: the lock timeout is ${lockBudget} ms, the lesser of its cap and what is left, not an arbitrary smaller cap`).toBeGreaterThanOrEqual(lockBudget - 1);
+    });
+    expectOrdered(scripted);
+    expectRestored(scripted);
+  });
+
+  // ── §12 M9: a rejecting executor is never turned into a result ──
+
+  /** The caller's session with its executor rejecting its `position`-th call and forwarding every other one. Position 0 rejects nothing. */
+  function rejectingAt(scripted: Scripted, position: number, failure: Error): { session: TransactionSession; calls: () => number } {
+    let calls = 0;
+    const executeSql = (async (text: string, params?: unknown[]) => {
+      calls++;
+      if (calls === position) throw failure;
+      return scripted.session.executeSql(text, params);
+    }) as SqlExecutor;
+    const session = {
+      get db(): never {
+        throw new Error("fixture: the caller's own db client was used");
+      },
+      executeSql,
+      optionalAudit: async <T>(_operation: () => Promise<T>, fallback: T): Promise<T> => fallback,
+    } as unknown as TransactionSession;
+    return { session, calls: () => calls };
+  }
+  /** How a primitive ENDED, as one closed value: what it resolved with, or whether it rejected with the executor's own failure. */
+  type M9Ended = { resolvedWith: unknown } | { rejectedWithTheExecutorsOwnFailure: boolean };
+  const m9Ended = (run: Promise<unknown>, failure: Error): Promise<M9Ended> => run.then(
+    (value): M9Ended => ({ resolvedWith: value }),
+    (error: unknown): M9Ended => ({ rejectedWithTheExecutorsOwnFailure: error === failure })
+  );
+  /** Each subject would, undisturbed, resolve with exactly the kind of value a swallowed failure is turned into. */
+  const M9_SUBJECTS: [string, Script["respond"], (session: TransactionSession) => Promise<unknown>][] = [
+    ["the page reader on a non-empty team", () => [{ id: ITEM }], (session) => readSlackKnownRootItemPage(session, pageRequest, execution())],
+    ["the page reader on an empty team", () => [], (session) => readSlackKnownRootItemPage(session, pageRequest, execution())],
+    ["the preparer that is refused at the namespace gate", () => [], (session) => prepareSlackKnownRootRequeue(session, { teamId: TEAM, entry: located() }, execution())],
+    [
+      "the preparer that is refused at the integration, after the gate locked",
+      (text) => (/slack_channel_migration_gates/i.test(text) ? [readyGateRow] : []),
+      (session) => prepareSlackKnownRootRequeue(session, { teamId: TEAM, entry: located() }, execution()),
+    ],
+  ];
+
+  /**
+   * M9 (§7.4, §12). The executor the PUBLIC primitive is handed rejects one of its calls: the read of
+   * the original settings, a timeout assignment, a data statement, or the restoring assignment. The
+   * primitive must reject with that very failure. It must never resolve — not with an empty page,
+   * not with a refused or unattested result — which is what catching the failure and carrying on
+   * would produce, since an empty answer is exactly what these four subjects read as "nothing there".
+   *
+   * Every call position is tried, each on a fresh scripted session; the number of positions is
+   * counted from an undisturbed run through the same wrapper, not assumed.
+   *
+   * WHAT THIS IS NOT. Whether the caller's real transaction then rejects and rolls back is a separate
+   * behaviour, shown against real PostgreSQL and not here. A transaction that rolls back does not
+   * show that the primitive did not swallow the failure, and this case does not show a rollback.
+   */
+  it.each(M9_SUBJECTS)("M9: rejects with the executor's own failure, and resolves no page and no result, whichever of its calls the executor rejects: %s", async (subject, respond, run) => {
+    const never = new Error("fixture: never thrown");
+    const undisturbed = rejectingAt(scriptedSession({ respond }), 0, never);
+    const control = await m9Ended(run(undisturbed.session), never);
+    const total = undisturbed.calls();
+    expect(["resolvedWith" in control, total >= 3], `M9: ${subject}: control: with no call rejected the primitive resolves, through several executor calls`).toEqual([true, true]);
+
+    for (let position = 1; position <= total; position++) {
+      const failure = Object.assign(new Error(`fixture: the executor rejected its call ${position}`), { code: "XX000" });
+      const rejecting = rejectingAt(scriptedSession({ respond }), position, failure);
+      expect(await m9Ended(run(rejecting.session), failure),
+        `M9: ${subject}: the executor rejected its call ${position} of ${total}: the primitive rejects with that same failure, and resolves no page and no result`)
+        .toEqual({ rejectedWithTheExecutorsOwnFailure: true });
+    }
   });
 });
 
