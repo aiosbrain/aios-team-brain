@@ -26,6 +26,22 @@ export interface MemberIdentityRecord {
   providers: MemberProviderIdentity[];
 }
 
+/** A provider identity as the v1 HTTP API returns it: exactly these three keys, as it always has. */
+export interface ProviderIdentityResponse {
+  provider: string;
+  externalId: string;
+  handle: string;
+}
+
+/**
+ * The HTTP shape of a provider identity. `email` and `revision` are the Admin row's observation of
+ * the link — what an authorized admin hands back to change or unlink it — and are not part of the
+ * API: every key is named here, so a field added to the internal record never reaches a response.
+ */
+export function providerIdentityResponse(identity: MemberProviderIdentity): ProviderIdentityResponse {
+  return { provider: identity.provider, externalId: identity.externalId, handle: identity.handle };
+}
+
 /**
  * WHO holds each provider id, and that id's mapping REVISION, read by ONE statement.
  *

@@ -142,13 +142,18 @@ describe("members + identity-resolve endpoints (real handlers, real Postgres)", 
 
     const hit = await get(resolveGET, `${RESOLVE_URL}?provider=slack&external_id=${slackId}`, team, seed.teamSlug);
     expect(hit.status).toBe(200);
-    const body = (await hit.json()) as { member: { id: string }; slack_id: string };
+    const body = (await hit.json()) as { member: { id: string }; slack_id: string; identities: unknown[] };
     expect(body.member.id).toBe(seed.memberId);
     expect(body.slack_id).toBe(slackId);
+    // The provider identity object is exactly these three keys: the link's email and mapping
+    // revision (which this identity has — it was just linked) are the Admin view's, not the API's.
+    const linked = { provider: "slack", externalId: slackId, handle: "tester" };
+    expect(body.identities).toEqual([linked]);
 
     const filtered = await get(membersGET, `${MEMBERS_URL}?provider=slack`, team, seed.teamSlug);
-    const fbody = (await filtered.json()) as { members: { id: string }[] };
+    const fbody = (await filtered.json()) as { members: { id: string; identities: unknown[] }[] };
     expect(fbody.members.some((m) => m.id === seed.memberId)).toBe(true);
+    expect(fbody.members.find((m) => m.id === seed.memberId)?.identities).toEqual([linked]);
 
     const miss = await get(resolveGET, `${RESOLVE_URL}?provider=slack&external_id=UNOPE0000`, team, seed.teamSlug);
     expect(miss.status).toBe(404);

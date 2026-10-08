@@ -3,7 +3,7 @@ import { adminClient } from "@/lib/db/admin";
 import { authenticateApiKey } from "@/lib/api/auth";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { errorResponse } from "@/lib/api/schemas";
-import { listMemberIdentities } from "@/lib/identity/list";
+import { listMemberIdentities, providerIdentityResponse } from "@/lib/identity/list";
 
 export const runtime = "nodejs";
 
@@ -56,7 +56,7 @@ export async function GET(req: NextRequest) {
   const members = (rows ?? [])
     .map((m) => {
       const rec = identities.get(m.id as string);
-      let provs = rec?.providers ?? [];
+      let provs = (rec?.providers ?? []).map(providerIdentityResponse);
       if (provider) provs = provs.filter((p) => p.provider === provider);
       return {
         id: m.id as string,

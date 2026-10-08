@@ -3559,6 +3559,7 @@ async def test_malformed_first_listing_page_does_not_block_later_page_or_snapsho
 # ---------------------------------------------------------------------------------------------
 
 _DOC_MIME = "application/vnd.google-apps.document"
+_FOLDER_MIME = "application/vnd.google-apps.folder"
 
 
 class _RecordingBrain:
@@ -3884,13 +3885,154 @@ async def test_deferred_all_stream_reconciliation_is_not_a_failure_and_completes
     assert deferred.authoritative_complete is False
     assert deferred.failed == 0 and deferred.failure_categories == {"rate_limited": 1}
     assert "current" not in {p.phase for p in state.list_progress(integration_id, 6)}
+    # The reconciliation still owed is the backlog: zero would report nothing left to do.
+    assert deferred.backlog is not None and deferred.backlog > 0
 
     completed = await run_gdrive_stream(settings, connection, state)
 
     assert completed.authoritative_complete is True and completed.removed == 2
+    assert completed.backlog == 0
     assert {p.phase for p in state.list_progress(integration_id, 6)} == {"current"}
     assert len(deadlines) == 2
     assert all(started < deadline <= time.monotonic() + 55.0 for deadline in deadlines)
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_staged_reconciliation_deferred_between_pages_reports_backlog_until_its_final_acknowledgment(
+    tmp_path, monkeypatch,
+):
+    from aios_ingest.brain_client import BrainClient, _gdrive_members_digest
+    from aios_ingest.scheduler import _gdrive_outcome_status
+
+    integration_id = "00000000-0000-0000-0000-000000000035"
+    members = ["doc-a", "doc-b", "doc-c"]
+    # Two members to a request, so this selection is a staged snapshot of two pages.
+    monkeypatch.setattr("aios_ingest.brain_client._GDRIVE_SNAPSHOT_PAGE", 2)
+    requests, held, applied = [], [], []
+    # The route's rate limit, as the number of requests admitted before every further one is 429.
+    admitted = {"limit": 2}
+
+    def brain(request):
+        assert request.url.path == "/api/v1/items/source-reconcile"
+        body = json.loads(request.content)
+        requests.append(body)
+        if admitted["limit"] is not None and len(requests) > admitted["limit"]:
+            # Longer than any run has left: the upload is deferred, never slept on.
+            return httpx.Response(429, headers={"retry-after": "120"}, json={
+                "error": {"code": "rate_limited", "message": "30 reconciliations/min per key"},
+            })
+        snapshot = body["snapshot"]
+        if snapshot.get("inspect"):
+            return httpx.Response(200, json={"snapshotStaged": len(held)})
+        if "resume" in snapshot:
+            assert snapshot["resume"] == {"members": len(held), "digest": _gdrive_members_digest(held)}
+        held.extend(snapshot["provider_ids"])
+        if not snapshot["complete"]:
+            return httpx.Response(200, json={"snapshotStaged": len(held)})
+        assert len(set(held)) == snapshot["total"]
+        applied.extend(sorted(held))
+        return httpx.Response(200, json={"items": 4, "snapshotApplied": True})
+
+    class Changes:
+        def getStartPageToken(self, **kwargs):
+            return _Request({"startPageToken": f"start:{kwargs.get('driveId')}"})
+
+    class Drive:
+        def changes(self): return Changes()
+
+    class Client:
+        revision = 0
+        def __init__(self, *args, **kwargs):
+            # The real client stages the snapshot; only the brain behind it is in memory.
+            self.real = BrainClient("http://brain", "aios_abc_def", "team", max_per_min=10_000,
+                                    random_fn=lambda: 0)
+            self.real._client = httpx.AsyncClient(transport=httpx.MockTransport(brain))
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): await self.real._client.aclose()
+        async def acquire_gdrive_execution(self, requested, owner):
+            return GdriveExecution(requested, 6, 1, owner, "later", "scope", {
+                "authMode": "oauth", "authenticatedAccountId": "account",
+                "fileIds": [], "folderIds": [], "sharedDriveIds": ["drive-a"],
+                "selectionState": "selected",
+            })
+        async def broker_gdrive_access_token(self, execution):
+            return {"access_token": "memory", "account": {"subject": "account"}}
+        def gdrive_token_provider(self, execution, grant):
+            class Provider:
+                def close(self): pass
+            return Provider()
+        def gdrive_provider_gate(self, execution):
+            class Gate:
+                def __call__(self): pass
+                def close(self): pass
+            return Gate()
+        async def checkpoint_gdrive_execution(self, execution, payload):
+            type(self).revision += 1
+            return {"progress_revision": type(self).revision, "progress": payload}
+        async def reconcile_gdrive(self, execution, **kwargs):
+            return await self.real.reconcile_gdrive(execution, **kwargs)
+        async def release_gdrive_execution(self, execution): pass
+
+    class Source:
+        def __init__(self, **kwargs): pass
+        def set_run_deadline(self, deadline): pass
+        def _services(self): return Drive(), object()
+        def _execute(self, request): return request.execute()
+
+    async def finished_stream(_settings, _conn, state, **kwargs):
+        namespace, generation = kwargs["namespace"], kwargs["generation"]
+        if state.get_progress(namespace).active_snapshot is None:
+            snapshot = state.begin_selection_snapshot(namespace, generation, [])
+            for doc_id in members:
+                state.record_membership(
+                    namespace, generation, doc_id, "drive-a", "drive-a", snapshot_id=snapshot,
+                )
+            state.publish_selection_snapshot(namespace, generation, snapshot)
+        state.update_progress(
+            namespace, listing_complete=True, page_token="terminal",
+            checkpoint_id="terminal-page", terminal_drain_token="terminal",
+            terminal_drain_checkpoint_id="terminal-page", terminal_drain_acknowledged=True,
+            drain_observation=1, terminal_drain_observation=1,
+        )
+        return IngestSummary("docs", failure_categories={})
+
+    monkeypatch.setattr("aios_ingest.gdrive_sync.BrainClient", Client)
+    monkeypatch.setattr("aios_ingest.gdrive_sync.GoogleDriveSource", Source)
+    monkeypatch.setattr("aios_ingest.gdrive_sync._run_gdrive_stream_unlocked", finished_stream)
+    settings = BrainSettings("http://brain", "key", "team")
+    connection = Connection("docs", "gdrive", options={"integration_id": integration_id})
+    state = StateStore(str(tmp_path / "staged-deferred-reconcile.sqlite"))
+
+    # Run 1: the inspection and the first page are admitted; the completing page is not.
+    first = await run_gdrive_stream(settings, connection, state)
+
+    assert [body["snapshot"].get("complete") for body in requests] == [False, False, True]
+    assert held == ["doc-a", "doc-b"] and applied == []
+    assert first.authoritative_complete is False
+    assert first.failed == 0 and first.failure_categories == {"rate_limited": 1}
+    # Every stream is drained and nothing is queued locally, yet absence is not established: the
+    # staged snapshot is the backlog, and the run is reported partial, never complete.
+    assert state.pending_count(state.list_progress(integration_id, 6)[0].namespace, 6) == 0
+    assert first.backlog is not None and first.backlog > 0
+    assert _gdrive_outcome_status(first) == "partial"
+
+    # Run 2: the brain still holds the prefix and the limit still bites on the completing page.
+    admitted["limit"] = len(requests) + 1
+    second = await run_gdrive_stream(settings, connection, state)
+
+    assert applied == [] and second.authoritative_complete is False
+    assert second.backlog is not None and second.backlog > 0
+    assert "current" not in {p.phase for p in state.list_progress(integration_id, 6)}
+
+    # Run 3: the completing page is acknowledged. Only now is the backlog zero.
+    admitted["limit"] = None
+    final = await run_gdrive_stream(settings, connection, state)
+
+    assert applied == members
+    assert final.authoritative_complete is True and final.removed == 4
+    assert final.backlog == 0 and _gdrive_outcome_status(final) == "complete"
+    assert {p.phase for p in state.list_progress(integration_id, 6)} == {"current"}
     state.close()
 
 
@@ -4155,8 +4297,13 @@ async def test_bound_shared_drive_stream_uses_that_drives_cursor_without_selecti
         def changes(self): return self.change_api
 
     class Source:
+        root_reads = []
         def _execute(self, request): return request.execute()
         def _metadata(self, file_id):
+            if file_id == "folder-y":
+                # A bound folder root is read where it is now before it is listed.
+                self.root_reads.append(file_id)
+                return {"id": file_id, "mimeType": _FOLDER_MIME, "driveId": "shared-x"}
             assert file_id in docs, f"{file_id} is not selected and must never be read"
             return docs[file_id]
         def _raw_doc(self, meta):
@@ -4174,6 +4321,8 @@ async def test_bound_shared_drive_stream_uses_that_drives_cursor_without_selecti
     )
 
     assert summary.failed == 0
+    # Only this stream's own folder root was read: never the My Drive folder bound elsewhere.
+    assert Source.root_reads == ["folder-y"]
     # The stream's start token, its folder listing and its changes are all the Shared Drive's own.
     assert drive.change_api.starts == [{"supportsAllDrives": True, "driveId": "shared-x"}]
     (listing,) = drive.file_api.calls
@@ -4235,6 +4384,12 @@ async def test_bound_file_found_in_another_drive_keeps_its_baseline_partial(tmp_
     assert state.membership_ids(namespace, 3, building=True) == []
     # No change page is drained on top of an unproven baseline.
     assert Changes.lists == 0
+    # Where it was read is durable: still bound to shared-x, on its way to shared-z's stream.
+    relocating = state.unsettled_roots("connection", 3)
+    assert {root: (b.drive_id, b.status, b.pending_drive_id) for root, b in relocating.items()} == {
+        ("file", "file-x"): ("shared-x", "relocating", "shared-z"),
+    }
+    assert state.root_bindings("connection", 3) == {("file", "file-x"): "shared-x"}
     state.close()
 
 
@@ -4286,6 +4441,574 @@ async def test_root_left_in_my_drive_state_from_before_binding_is_not_ingested_t
     assert summary.failed == 0 and client.pushed == ["mine"]
     assert state.membership_ids(namespace, 3) == ["mine"]
     assert state.get_progress(namespace).listing_complete is True
+    state.close()
+
+
+# ---------------------------------------------------------------------------------------------
+# A selected root that moves to another drive is still selected: nothing becomes absent
+# ---------------------------------------------------------------------------------------------
+#
+# Spec. A selected file or folder is selected by its id, wherever it lives. Moved to another drive
+# it is reported by the old drive's change log as removed — it and everything under it — and a
+# listing of it in the old drive is empty. Neither is absence:
+#   · its current metadata is read, under the run's own fence, before anything is concluded;
+#   · read in another drive, its claims stand, the old stream goes on with its other roots, and
+#     that drive's stream takes it over only after capturing its own start token — enumerating
+#     that root and nothing else of the drive;
+#   · unreadable, it is durably uncertain: no absence, and the connection is not complete;
+#   · only once every stream has a verified snapshot of the roots it now holds may the
+#     connection reconcile — and the moved documents are in that snapshot.
+
+_WORLD_INTEGRATION = "00000000-0000-0000-0000-000000000041"
+
+
+class _ProviderHttpError(Exception):
+    """A provider failure as the Google client raises it: the HTTP status is on ``resp``."""
+
+    def __init__(self, status):
+        super().__init__(f"HTTP {status}")
+        self.resp = type("Response", (), {"status": status})()
+
+
+class _Lazy:
+    def __init__(self, run):
+        self.run = run
+
+    def execute(self):
+        return self.run()
+
+
+class _Closable:
+    def __call__(self): pass
+    def close(self): pass
+
+
+class _DriveWorld:
+    """Google Drive and the brain, as the real coordinator's own calls see them.
+
+    A file lives in one drive, under its parents. Each drive has an append-only change log, and a
+    change token is that drive's name and a position in its log. Every provider call is recorded
+    in ``calls``, in order; the brain records what it is pushed, told to remove, and reconciled to.
+    """
+
+    def __init__(self, *, file_ids=(), folder_ids=(), generation=9):
+        self.config = {
+            "authMode": "oauth", "authenticatedAccountId": "account",
+            "fileIds": list(file_ids), "folderIds": list(folder_ids), "sharedDriveIds": [],
+            "recursive": True, "selectionState": "selected",
+        }
+        self.generation = generation
+        self.files, self.logs, self.calls = {}, {}, []
+        self.unreadable, self.token_errors = {}, {}
+        self.pushed, self.removed, self.reconciled = [], [], []
+        self.progress, self.revision = {}, 0
+
+    def put(self, file_id, *, drive, parent=None, folder=False):
+        self.files[file_id] = {
+            "id": file_id, "name": file_id, "mimeType": _FOLDER_MIME if folder else _DOC_MIME,
+            "modifiedTime": "2026-09-22T00:00:00Z", "parents": [parent or drive],
+            **({} if drive == "my-drive" else {"driveId": drive}),
+        }
+
+    def move(self, *file_ids, source, destination):
+        """Move files between Shared Drives: gone from one drive's log, present in the other's."""
+        for file_id in file_ids:
+            self.files[file_id]["driveId"] = destination
+            self.logs.setdefault(source, []).append({"fileId": file_id, "removed": True})
+            self.logs.setdefault(destination, []).append(
+                {"fileId": file_id, "file": dict(self.files[file_id])}
+            )
+
+    def namespace(self, drive_id):
+        return StreamKey("team", _WORLD_INTEGRATION, "account", drive_id).namespace(self.generation)
+
+    def stream(self, drive_id):
+        """One stream as the brain durably holds it."""
+        return self.progress["streams"][drive_id]
+
+    def install(self, monkeypatch):
+        world = self
+
+        class Changes:
+            def getStartPageToken(self, **kwargs):
+                drive_id = kwargs.get("driveId", "my-drive")
+
+                def start():
+                    world.calls.append(("start", drive_id))
+                    if drive_id in world.token_errors:
+                        raise world.token_errors[drive_id]
+                    return {"startPageToken": f"{drive_id}@{len(world.logs.setdefault(drive_id, []))}"}
+                return _Lazy(start)
+
+            def list(self, **kwargs):
+                drive_id = kwargs.get("driveId", "my-drive")
+
+                def changes():
+                    world.calls.append(("changes", drive_id, kwargs["pageToken"]))
+                    name, _, position = kwargs["pageToken"].rpartition("@")
+                    assert name == drive_id, "a drive's token is only ever read against that drive"
+                    log = world.logs.setdefault(drive_id, [])
+                    return {"changes": log[int(position):], "newStartPageToken": f"{drive_id}@{len(log)}"}
+                return _Lazy(changes)
+
+        class Files:
+            def list(self, **kwargs):
+                folder_id = kwargs["q"].split("'")[1]
+                drive_id = kwargs.get("driveId", "my-drive")
+
+                def listing():
+                    world.calls.append(("list", drive_id, folder_id))
+                    return {"files": [
+                        dict(meta) for meta in world.files.values()
+                        if folder_id in meta["parents"] and meta.get("driveId", "my-drive") == drive_id
+                    ]}
+                return _Lazy(listing)
+
+        class Drive:
+            def changes(self): return Changes()
+            def files(self): return Files()
+
+        class Source:
+            def __init__(self, **kwargs): pass
+            def set_run_deadline(self, deadline): pass
+            def _services(self): return Drive(), object()
+            def _execute(self, request): return request.execute()
+
+            def _metadata(self, file_id):
+                world.calls.append(("metadata", file_id))
+                if file_id in world.unreadable:
+                    raise world.unreadable[file_id]
+                if file_id not in world.files:
+                    raise _ProviderHttpError(404)
+                return dict(world.files[file_id])
+
+            def _raw_doc(self, meta):
+                world.calls.append(("doc", meta["id"]))
+                return RawDoc(source="gdrive", external_id=meta["id"], title=meta["name"], body="body")
+
+        class Client:
+            def __init__(self, *args, **kwargs): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *args): pass
+
+            async def acquire_gdrive_execution(self, requested, owner):
+                return GdriveExecution(
+                    requested, world.generation, 1, owner, "later", "scope", dict(world.config),
+                    progress=json.loads(json.dumps(world.progress)), progress_revision=world.revision,
+                )
+
+            async def broker_gdrive_access_token(self, execution):
+                return {"access_token": "memory", "account": {"subject": "account"}}
+
+            def gdrive_token_provider(self, execution, grant): return _Closable()
+            def gdrive_provider_gate(self, execution): return _Closable()
+
+            async def checkpoint_gdrive_execution(self, execution, progress):
+                world.revision += 1
+                world.progress = json.loads(json.dumps(progress))
+                return {"progress_revision": world.revision, "progress": progress}
+
+            async def push(self, payload, *, execution):
+                world.pushed.append(payload.frontmatter["source_id"])
+                return IngestResult("created", "item", payload.path)
+
+            async def reconcile_gdrive(self, execution, **kwargs):
+                world.removed.extend(kwargs.get("removed_provider_ids") or [])
+                if kwargs.get("complete_snapshot_ids") is not None:
+                    world.reconciled.append(list(kwargs["complete_snapshot_ids"]))
+                return {"items": 0}
+
+            async def release_gdrive_execution(self, execution): pass
+
+        monkeypatch.setattr("aios_ingest.gdrive_sync.BrainClient", Client)
+        monkeypatch.setattr("aios_ingest.gdrive_sync.GoogleDriveSource", Source)
+        return self
+
+    async def run(self, state):
+        return await run_gdrive_stream(
+            BrainSettings("http://brain", "key", "team"),
+            Connection("docs", "gdrive", options={"integration_id": _WORLD_INTEGRATION}), state,
+        )
+
+
+def _unsettled(state, generation=9):
+    return {
+        root: (binding.drive_id, binding.status, binding.pending_drive_id)
+        for root, binding in state.unsettled_roots(_WORLD_INTEGRATION, generation).items()
+    }
+
+
+def _roots(state, world, drive_id):
+    return {
+        (row["root_kind"], row["root_id"], row["drive_id"])
+        for row in state.list_roots(world.namespace(drive_id), world.generation)
+    }
+
+
+@pytest.mark.asyncio
+async def test_selected_file_moved_to_another_shared_drive_after_baseline_keeps_its_claim_and_is_rebound(
+    tmp_path, monkeypatch,
+):
+    world = _DriveWorld(file_ids=["file-x", "file-k"]).install(monkeypatch)
+    world.put("file-x", drive="shared-a")
+    world.put("file-k", drive="shared-a")
+    path = str(tmp_path / "file-relocation.sqlite")
+    state = StateStore(path)
+
+    baseline = await world.run(state)
+
+    assert baseline.authoritative_complete is True
+    assert world.pushed == ["file-k", "file-x"]
+    assert world.reconciled == [["file-k", "file-x"]]
+
+    # `file-x` is moved to shared-b. The old drive's change log reports it removed.
+    world.move("file-x", source="shared-a", destination="shared-b")
+    world.calls.clear()
+    moved = await world.run(state)
+
+    # Its own metadata was read before anything was concluded from that removal…
+    assert ("metadata", "file-x") in world.calls
+    # …so nothing was removed and nothing reconciled: the claim the old stream made stands, in its
+    # authoritative snapshot and on the brain.
+    assert world.removed == [] and world.reconciled == [["file-k", "file-x"]]
+    assert state.membership_ids(world.namespace("shared-a"), 9) == ["file-k", "file-x"]
+    assert _unsettled(state) == {("file", "file-x"): ("shared-a", "relocating", "shared-b")}
+    assert moved.authoritative_complete is False
+    assert moved.backlog is not None and moved.backlog > 0
+    assert world.stream("shared-a")["phase"] != "current"
+    # The destination is not a stream yet: not one call was made against it.
+    assert not [call for call in world.calls if "shared-b" in call]
+    state.close()
+
+    # A restart. The destination's start token is captured before anything is enumerated there.
+    state = StateStore(path)
+    world.calls.clear()
+    world.pushed.clear()
+    rebound = await world.run(state)
+
+    assert world.calls[0] == ("start", "shared-b")
+    assert world.calls.index(("start", "shared-b")) < world.calls.index(("metadata", "file-x"))
+    assert world.calls.count(("start", "shared-b")) == 1
+    assert state.root_bindings(_WORLD_INTEGRATION, 9) == {
+        ("file", "file-k"): "shared-a", ("file", "file-x"): "shared-b",
+    }
+    assert _unsettled(state) == {}
+    # The destination enumerates the selected file and nothing else of its drive: no drive root,
+    # no listing — and its cursor is the token captured before that enumeration.
+    assert _roots(state, world, "shared-b") == {("file", "file-x", "shared-b")}
+    assert not [call for call in world.calls if call[0] == "list"]
+    assert state.get_progress(world.namespace("shared-b")).baseline_start_token == "shared-b@1"
+    # The old stream went on with its other root, and no longer holds the one that left.
+    assert _roots(state, world, "shared-a") == {("file", "file-k", "shared-a")}
+    assert state.membership_ids(world.namespace("shared-a"), 9) == ["file-k"]
+    assert state.membership_ids(world.namespace("shared-b"), 9) == ["file-x"]
+    assert sorted(world.pushed) == ["file-k", "file-x"]
+    # Only now — both snapshots verified — does the connection reconcile, and the moved file is
+    # in what it reconciles to. It was never absent.
+    assert rebound.authoritative_complete is True and rebound.backlog == 0
+    assert world.reconciled == [["file-k", "file-x"], ["file-k", "file-x"]]
+    assert world.removed == []
+    assert {world.stream(drive)["phase"] for drive in ("shared-a", "shared-b")} == {"current"}
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_selected_folder_moved_to_another_shared_drive_is_not_absent_by_removal_or_empty_listing(
+    tmp_path, monkeypatch,
+):
+    world = _DriveWorld(folder_ids=["folder-r", "folder-k"]).install(monkeypatch)
+    world.put("folder-r", drive="shared-a", folder=True)
+    world.put("doc-1", drive="shared-a", parent="folder-r")
+    world.put("folder-k", drive="shared-a", folder=True)
+    world.put("doc-k", drive="shared-a", parent="folder-k")
+    path = str(tmp_path / "folder-relocation.sqlite")
+    state = StateStore(path)
+
+    baseline = await world.run(state)
+
+    assert baseline.authoritative_complete is True
+    assert world.reconciled == [["doc-1", "doc-k"]]
+
+    # The folder and its document move to shared-b. The old drive's log reports the document
+    # removed BEFORE the folder itself — the order least favourable to the old stream.
+    world.move("doc-1", "folder-r", source="shared-a", destination="shared-b")
+    world.calls.clear()
+    moved = await world.run(state)
+
+    assert ("metadata", "folder-r") in world.calls
+    # Neither the document's removal nor the folder's is absence…
+    assert world.removed == [] and world.reconciled == [["doc-1", "doc-k"]]
+    assert state.membership_ids(world.namespace("shared-a"), 9) == ["doc-1", "doc-k"]
+    assert _unsettled(state) == {("folder", "folder-r"): ("shared-a", "relocating", "shared-b")}
+    assert moved.authoritative_complete is False and moved.backlog > 0
+    # …and the folder is never listed in the drive it left: that listing is empty, and proves nothing.
+    assert ("list", "shared-a", "folder-r") not in world.calls
+    state.close()
+
+    state = StateStore(path)
+    world.calls.clear()
+    rebound = await world.run(state)
+
+    assert world.calls[0] == ("start", "shared-b")
+    assert world.calls.index(("start", "shared-b")) < world.calls.index(("list", "shared-b", "folder-r"))
+    assert ("list", "shared-a", "folder-r") not in world.calls
+    # Only the selected folder is enumerated in the destination: never the drive itself.
+    assert [call for call in world.calls if call[0] == "list" and call[1] == "shared-b"] == [
+        ("list", "shared-b", "folder-r"),
+    ]
+    assert _roots(state, world, "shared-b") == {("folder", "folder-r", "shared-b")}
+    assert _roots(state, world, "shared-a") == {("folder", "folder-k", "shared-a")}
+    assert state.membership_ids(world.namespace("shared-b"), 9) == ["doc-1"]
+    assert state.membership_ids(world.namespace("shared-a"), 9) == ["doc-k"]
+    assert _unsettled(state) == {}
+    assert rebound.authoritative_complete is True and rebound.backlog == 0
+    assert world.reconciled == [["doc-1", "doc-k"], ["doc-1", "doc-k"]]
+    assert world.removed == []
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_root_whose_location_cannot_be_read_is_durably_uncertain_and_never_absent(
+    tmp_path, monkeypatch,
+):
+    world = _DriveWorld(file_ids=["file-x", "file-k"]).install(monkeypatch)
+    world.put("file-x", drive="shared-a")
+    world.put("file-k", drive="shared-a")
+    path = str(tmp_path / "uncertain-root.sqlite")
+    state = StateStore(path)
+    await world.run(state)
+    cursor = state.get_progress(world.namespace("shared-a")).page_token
+
+    # The old drive's log reports `file-x` removed, and where it is now cannot be read.
+    world.logs["shared-a"].append({"fileId": "file-x", "removed": True})
+    world.unreadable["file-x"] = _ProviderHttpError(403)
+
+    for _run in range(2):
+        world.calls.clear()
+        unverified = await world.run(state)
+
+        assert unverified.failure_categories == {"selection_root_unverified": 1}
+        assert unverified.authoritative_complete is False and unverified.backlog > 0
+        assert world.removed == [] and world.reconciled == [["file-k", "file-x"]]
+        assert state.membership_ids(world.namespace("shared-a"), 9) == ["file-k", "file-x"]
+        assert _unsettled(state) == {("file", "file-x"): ("shared-a", "uncertain", None)}
+        # The cursor did not pass the page it could not interpret: it is read again next run.
+        assert state.get_progress(world.namespace("shared-a")).page_token == cursor
+        assert ("changes", "shared-a", cursor) in world.calls
+        # The brain holds the stream as partial, with why.
+        assert world.stream("shared-a")["phase"] == "partial"
+        assert world.stream("shared-a")["last_error"] == "selected root file-x unverified; absence withheld"
+        # The uncertainty survives a restart.
+        state.close()
+        state = StateStore(path)
+        assert _unsettled(state) == {("file", "file-x"): ("shared-a", "uncertain", None)}
+
+    # Readable again — and it really was deleted: the provider says there is no such file. Only
+    # that makes the removal absence.
+    del world.unreadable["file-x"]
+    del world.files["file-x"]
+    verified = await world.run(state)
+
+    assert _unsettled(state) == {}
+    assert world.removed == ["file-x"]
+    assert verified.authoritative_complete is True and verified.backlog == 0
+    assert world.reconciled == [["file-k", "file-x"], ["file-k"]]
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_bound_folder_found_in_another_drive_on_baseline_is_relocating_and_never_listed_empty(tmp_path):
+    state = StateStore(str(tmp_path / "relocated-folder-baseline.sqlite"))
+    key = StreamKey("team", "connection", "account", "shared-x")
+    namespace = key.namespace(3)
+    lists, change_reads = [], []
+
+    class Files:
+        def list(self, **kwargs):
+            # What Drive answers for a folder that is no longer in this drive: nothing.
+            lists.append(kwargs["q"])
+            return _Request({"files": []})
+
+    class Changes:
+        def getStartPageToken(self, **kwargs): return _Request({"startPageToken": "start"})
+        def list(self, **kwargs):
+            change_reads.append(kwargs["pageToken"])
+            return _Request({"changes": [], "newStartPageToken": "terminal"})
+
+    class Drive:
+        def files(self): return Files()
+        def changes(self): return Changes()
+
+    class Source:
+        def _execute(self, request): return request.execute()
+        def _metadata(self, file_id):
+            return {"id": file_id, "mimeType": _FOLDER_MIME, "driveId": "shared-z"}
+
+    client = _RecordingBrain()
+
+    async def run():
+        return await _run_gdrive_stream_unlocked(
+            BrainSettings("http://brain", "key", "team"), Connection("docs", "gdrive"), state,
+            client=client, execution=GdriveExecution("connection", 3, 1, "owner", "later", "scope", {}),
+            options={
+                "credential_identity": "account", "selection_state": "selected",
+                "folder_ids": ["folder-y"], "recursive": True,
+            }, source=Source(), drive=Drive(), generation=3, drive_id="shared-x",
+            namespace=namespace, max_work=10, root_bindings={("folder", "folder-y"): "shared-x"},
+        )
+
+    summary = await run()
+
+    progress = state.get_progress(namespace)
+    assert summary.failed == 1
+    assert progress.listing_complete is False and progress.phase == "partial"
+    assert progress.last_error == "baseline: SelectedRootRelocated"
+    assert progress.active_snapshot is None
+    # The empty listing was never asked for, so it was never mistaken for an empty folder; and no
+    # change page is drained on top of an unproven baseline.
+    assert lists == [] and change_reads == []
+    assert {root: (b.drive_id, b.status, b.pending_drive_id)
+            for root, b in state.unsettled_roots("connection", 3).items()} == {
+        ("folder", "folder-y"): ("shared-x", "relocating", "shared-z"),
+    }
+
+    # While it is on its way to shared-z's stream this one still does not list it.
+    await run()
+    assert lists == []
+    assert state.membership_ids(namespace, 3) == []
+    assert ("folder", "folder-y") in state.unsettled_roots("connection", 3)
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_bound_folder_whose_metadata_is_unreadable_keeps_its_baseline_partial_and_uncertain(tmp_path):
+    state = StateStore(str(tmp_path / "unverified-folder-baseline.sqlite"))
+    key = StreamKey("team", "connection", "account", "shared-x")
+    namespace = key.namespace(3)
+    lists = []
+
+    class Files:
+        def list(self, **kwargs):
+            lists.append(kwargs["q"])
+            return _Request({"files": []})
+
+    class Changes:
+        def getStartPageToken(self, **kwargs): return _Request({"startPageToken": "start"})
+        def list(self, **kwargs): raise AssertionError("no change page on an unproven baseline")
+
+    class Drive:
+        def files(self): return Files()
+        def changes(self): return Changes()
+
+    class Source:
+        def _execute(self, request): return request.execute()
+        def _metadata(self, file_id): raise _ProviderHttpError(403)
+
+    summary = await _run_gdrive_stream_unlocked(
+        BrainSettings("http://brain", "key", "team"), Connection("docs", "gdrive"), state,
+        client=_RecordingBrain(),
+        execution=GdriveExecution("connection", 3, 1, "owner", "later", "scope", {}),
+        options={
+            "credential_identity": "account", "selection_state": "selected",
+            "folder_ids": ["folder-y"], "recursive": True,
+        }, source=Source(), drive=Drive(), generation=3, drive_id="shared-x",
+        namespace=namespace, max_work=10, root_bindings={("folder", "folder-y"): "shared-x"},
+    )
+
+    progress = state.get_progress(namespace)
+    assert summary.failed == 1
+    assert progress.listing_complete is False and progress.phase == "partial"
+    assert progress.last_error == "baseline: SelectedRootUnverified"
+    assert lists == [] and progress.active_snapshot is None
+    (binding,) = state.unsettled_roots("connection", 3).values()
+    assert (binding.drive_id, binding.status, binding.pending_drive_id) == ("shared-x", "uncertain", None)
+    assert binding.detail == "root metadata unreadable (403)"
+    state.close()
+
+
+# ---------------------------------------------------------------------------------------------
+# A drive whose change log cannot be opened is that stream's failure, not the connection's
+# ---------------------------------------------------------------------------------------------
+#
+# Spec. A selected root can live in a Shared Drive whose change log the account cannot open (it
+# was shared the file, not the drive): the start token request answers 403 or 404. That stream is
+# recorded durably as not complete, with why; every stream that can be read still runs; nothing of
+# the unreadable drive is enumerated on a guess; and the connection never reconciles without it.
+# A failure of the connection's own authority still ends the whole run.
+
+
+@pytest.mark.parametrize("status", [403, 404])
+@pytest.mark.asyncio
+async def test_unopenable_containing_drive_is_a_durable_stream_diagnostic_and_other_streams_progress(
+    tmp_path, monkeypatch, status,
+):
+    world = _DriveWorld(file_ids=["file-x", "file-m"]).install(monkeypatch)
+    world.put("file-x", drive="shared-x")
+    world.put("file-m", drive="my-drive")
+    world.token_errors["shared-x"] = _ProviderHttpError(status)
+    path = str(tmp_path / f"unopenable-drive-{status}.sqlite")
+    state = StateStore(path)
+    diagnostic = f"start token unavailable: drive shared-x not found or not accessible ({status})"
+
+    for _run in range(2):
+        world.calls.clear()
+        blocked = await world.run(state)
+
+        # The readable stream ran to the end of its own work…
+        assert world.pushed == ["file-m"]
+        assert world.stream("my-drive")["listing_complete"] is True
+        assert world.stream("my-drive")["last_error"] == "stream complete; awaiting all-stream reconciliation"
+        # …the unreadable one is recorded, locally and on the brain, as not complete and why…
+        assert blocked.failed == 1 and blocked.failure_categories == {"stream_start_unavailable": 1}
+        local = state.get_progress(world.namespace("shared-x"))
+        assert (local.phase, local.listing_complete, local.baseline_start_token) == ("partial", False, None)
+        assert local.last_error == diagnostic
+        assert world.stream("shared-x")["phase"] == "partial"
+        assert world.stream("shared-x")["last_error"] == diagnostic
+        assert world.stream("shared-x")["baseline_start_token"] is None
+        # …nothing of its drive was enumerated without a token…
+        assert ("start", "shared-x") in world.calls
+        assert not [call for call in world.calls if call[0] in {"changes", "list"} and call[1] == "shared-x"]
+        assert ("doc", "file-x") not in world.calls
+        # …and the connection is neither complete nor reconciled, and says work remains.
+        assert blocked.authoritative_complete is False
+        assert blocked.backlog is not None and blocked.backlog > 0
+        assert world.reconciled == [] and world.removed == []
+        assert "current" not in {world.stream(drive)["phase"] for drive in ("my-drive", "shared-x")}
+        state.close()
+        state = StateStore(path)
+
+    # The drive becomes readable: its token is captured before its root is enumerated, and only
+    # then is the connection complete — with both documents.
+    del world.token_errors["shared-x"]
+    world.calls.clear()
+    opened = await world.run(state)
+
+    assert world.calls.index(("start", "shared-x")) < world.calls.index(("doc", "file-x"))
+    assert state.get_progress(world.namespace("shared-x")).baseline_start_token == "shared-x@0"
+    assert opened.failed == 0 and opened.authoritative_complete is True and opened.backlog == 0
+    assert world.pushed == ["file-m", "file-x"]
+    assert world.reconciled == [["file-m", "file-x"]]
+    assert {world.stream(drive)["phase"] for drive in ("my-drive", "shared-x")} == {"current"}
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_authority_failure_while_opening_a_stream_still_ends_the_whole_run(tmp_path, monkeypatch):
+    world = _DriveWorld(file_ids=["file-x", "file-m"]).install(monkeypatch)
+    world.put("file-x", drive="shared-x")
+    world.put("file-m", drive="my-drive")
+    # The execution was replaced: not this stream's problem, the connection's.
+    world.token_errors["shared-x"] = BrainError(409, "stale_execution", "replaced")
+    state = StateStore(str(tmp_path / "stale-while-opening.sqlite"))
+
+    summary = await world.run(state)
+
+    assert summary.failed == 1 and summary.failure_categories == {"stale_execution": 1}
+    # No stream ran — not even the readable one — and no diagnostic stream was invented.
+    assert world.pushed == [] and world.reconciled == []
+    assert state.get_progress(world.namespace("shared-x")) is None
+    assert not [call for call in world.calls if call[0] in {"changes", "list", "doc"}]
     state.close()
 
 

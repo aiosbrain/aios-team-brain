@@ -16,10 +16,12 @@ import {
   type Disposal,
   type EvidenceClock,
   type PendingSignal,
+  type RetireOptions,
   type SessionEvidence,
   type SignalAcknowledgement,
   type TestSession,
   authorityLockName,
+  backendIdentity,
   barrierSessions,
   closeRaceHarness,
   holdIdentityKey,
@@ -29,6 +31,7 @@ import {
   openTestSession,
   parkThenCompete,
   raceHarnessFatal,
+  retireSessions,
   sessionEvidence,
   sessionsNamed,
   settleStarted,
@@ -97,7 +100,12 @@ import {
  *   9. a pool connection a STAGED test checks out itself is on the real run's sentinel from before
  *      it is asked who it is: one whose answer is still pending, or was refused, leaves its test no
  *      backend to look for — so the sentinel is then not cleared at all, until that connection has
- *      said who it is, the monitor has seen that backend, and it was then SEEN gone within its bound.
+ *      said who it is, the monitor has seen that backend, and it was then SEEN gone within its bound;
+ *  10. a REAL session a staged test closes itself — a barrier whose release it staged, a lock holder
+ *      whose closing it stood in front of — is closed by one bounded, acknowledged step and then
+ *      seen gone as its exact backend before the real run's sentinel comes off. A closing that
+ *      rejects, is still pending at its deadline, does not say `closed` or says so late, and a
+ *      backend not seen gone, each leave that sentinel on file and stop the real run — sticky.
  *
  * Everything is established from PostgreSQL evidence about exact, known backends. The "foreign"
  * sessions are plain clients this file opens and never registers with the harness as raced
@@ -314,8 +322,23 @@ interface Sentinel {
    * has not said who it is: there is no backend to read evidence about.
    */
   seen: (expected: string, accept: (sessions: SessionEvidence[]) => boolean) => Promise<void>;
+  /**
+   * A REAL session this test stages past the harness's own cleanup — a barrier whose release it
+   * stages, a lock holder whose closing it stands in front of — goes on the books by its exact
+   * backend, as the monitor reads it now. On the books FIRST, synchronously, as one that has not
+   * been identified: if the monitor does not then see it, it stays that, and is never cleared around.
+   */
+  session: (pid: number) => Promise<BackendIdentity>;
+  /**
+   * THE ONE WAY a test that staged real sessions ends (`retireSessions`): `close` really closes
+   * them — one bounded step, believed only if it says `closed` in time — every session on the books
+   * is then SEEN gone as its exact backend, and `absent`, if given, is seen too. Only then is the
+   * marker removed. Anything less leaves the marker on file, STOPS the run and rejects. The first
+   * conclusion stands: asked again, it answers the same and closes nothing again.
+   */
+  retire: (close: () => Promise<Disposal | void>, absent?: () => Promise<unknown>) => Promise<void>;
   /** Remove the marker — or THROW and leave it, while any checkout has not said who it is or has
-   * not since been `seen`. */
+   * not since been `seen`, or any real session on the books was not retired. */
   clear: () => void;
 }
 
@@ -335,16 +358,68 @@ interface Sentinel {
  * itself, and that backend seen present by the monitor — and then the BOUNDED evidence wait about
  * exactly that backend (`seen`). Asking again is allowed; nothing else stands in for an answer.
  *
+ * A REAL SESSION such a test closes itself is on the same books, by its exact backend (`session`),
+ * and comes off them only by `retire`: its closing acknowledged within its bound, and that backend
+ * then SEEN gone. A closing merely asked for — awaited without a bound, its rejection swallowed — is
+ * not that, and neither is no session being left under a name.
+ *
  * `ask` is a SEAM for this file's own test of that (9): what a checkout is asked, in place of `whoIs`.
+ * `seams` are for its test of `retire` (10): a run-safety state in place of the real run's, the
+ * clock the closing is bounded on, and a shorter budget for seeing a backend gone.
  */
-function stagedOnRealRun(what: string, ask: (client: PoolClient) => Promise<BackendIdentity> = whoIs): Sentinel {
-  const run = currentRunSafety();
+function stagedOnRealRun(
+  what: string,
+  ask: (client: PoolClient) => Promise<BackendIdentity> = whoIs,
+  seams: Pick<RetireOptions, "safety" | "clock" | "cleanupMs"> = {},
+): Sentinel {
+  const run = seams.safety ?? currentRunSafety();
   const scope = `sentinel-${randomUUID().slice(0, 8)}`;
   run.arm(scope, what);
   const checkouts = new Map<PoolClient, StagedCheckout>();
   const unidentified = (): number => [...checkouts.values()].filter((checkout) => !checkout.identity).length;
+  // Every real session this test staged: who the monitor said it is, and whether it was then retired.
+  const sessions: { backend: BackendIdentity | null; proven: boolean }[] = [];
+  let retired: Promise<void> | undefined;
+  const clear = (): void => {
+    const open = sessions.filter((session) => !session.proven).length;
+    if (open > 0) {
+      throw new Error(
+        `the real run's ${scope} (${what}) is NOT cleared: ${open} real session(s) this test staged were not closed and `
+        + "SEEN gone by their exact backend. Sessions that may still be there must not be truncated around.",
+      );
+    }
+    const unseen = [...checkouts.values()].filter((checkout) => checkout.identity && !checkout.proven).length;
+    if (unidentified() > 0 || unseen > 0) {
+      throw new Error(
+        `the real run's ${scope} (${what}) is NOT cleared: of this test's own pool checkouts, ${unidentified()} did not say who `
+        + `they are and ${unseen} said so but were not then SEEN as its cleanup requires. Sessions that may still be there must not be truncated around.`,
+      );
+    }
+    run.disarm(scope);
+  };
   return {
     scope,
+    session: (pid) => {
+      const entry: (typeof sessions)[number] = { backend: null, proven: false };
+      sessions.push(entry);
+      return (async () => {
+        entry.backend = await backendIdentity(pid);
+        return entry.backend;
+      })();
+    },
+    retire: (close, absent) => (retired ??= (async () => {
+      const staged = [...sessions];
+      await retireSessions(`${scope} (${what})`, staged.map((session) => session.backend), close, { ...seams, absent });
+      for (const session of staged) session.proven = true;
+      try {
+        clear();
+      } catch (error) {
+        // Its sessions are gone, but a pool checkout of this test's is not accounted for: the
+        // marker stays, and that stops the run like any other cleanup that could not be proven.
+        run.setFatal(error instanceof Error ? error.message : String(error));
+        throw error;
+      }
+    })()),
     identify: (client) => {
       // ON THE BOOKS FIRST — before the question is put, let alone answered — as one that has not
       // said who it is and has not been seen. Asked again, it is that again, under an entry of its
@@ -384,16 +459,7 @@ function stagedOnRealRun(what: string, ask: (client: PoolClient) => Promise<Back
         checkout.proven = true;
       }
     },
-    clear: () => {
-      const unseen = [...checkouts.values()].filter((checkout) => checkout.identity && !checkout.proven).length;
-      if (unidentified() > 0 || unseen > 0) {
-        throw new Error(
-          `the real run's ${scope} (${what}) is NOT cleared: of this test's own pool checkouts, ${unidentified()} did not say who `
-          + `they are and ${unseen} said so but were not then SEEN as its cleanup requires. Sessions that may still be there must not be truncated around.`,
-        );
-      }
-      run.disarm(scope);
-    },
+    clear,
   };
 }
 
@@ -2038,6 +2104,8 @@ describe("race harness (7): a closing that was not acknowledged in time is not p
     let barrier: Barrier | undefined;
     try {
       barrier = await holdNamedLock(`harness-closing:${randomUUID()}`, { tag, safety, clock: hand.clock, dispose: closing.dispose });
+      // On the real run's books by its exact backend, before anything is staged in front of its closing.
+      await staged.session(barrier.pid);
       expect(safety.armed()).toEqual([tag]);
       expect(await barrierSessions(tag)).toEqual([{ pid: barrier.pid, state: "idle in transaction" }]);
       expect(asked.count(), "nothing has been closed yet").toBe(0);
@@ -2101,16 +2169,20 @@ describe("race harness (7): a closing that was not acknowledged in time is not p
       expect(raceHarnessFatal()).toBeNull();
       expect(currentRunSafety().armed()).toEqual([staged.scope]);
     } finally {
-      // ON EVERY EXIT nothing stays held back; every connection the harness asked to have closed is
-      // really closed; a barrier this test never got to release is released for real; and the real
-      // run's sentinel comes off only once the barrier's session is SEEN gone. If it cannot be,
-      // this throws, the sentinel stays, and the real run stops.
+      // ON EVERY EXIT nothing stays held back, and the barrier's session is REALLY closed: a barrier
+      // this test never got to release is released for real, and every connection the harness asked
+      // to have closed is ended. That closing is one bounded step and must be acknowledged; the
+      // session must then be SEEN gone — as the exact backend on the sentinel's books, and under its
+      // tag — and only then does the real run's sentinel come off. A closing that rejects, is still
+      // pending at its bound or answers late, or a session not seen gone, leaves the sentinel on
+      // file, STOPS the real run, and this throws.
       unhandled.stop();
       closing.verdict.resolve(undefined);
-      for (const client of handed) await client.end().catch(() => undefined);
-      if (barrier && !closing.staging()) await barrier.release().catch(() => undefined);
-      await untilBarrierGone(tag);
-      staged.clear();
+      await staged.retire(async () => {
+        if (barrier && !closing.staging()) await barrier.release();
+        for (const client of handed) await client.end();
+        return "closed";
+      }, () => untilBarrierGone(tag));
     }
     // The sentinel took nothing else with it: the staged state is still stopped, its scope still on
     // file, and the real run is clean.
@@ -2128,6 +2200,7 @@ describe("race harness (7): a closing that was not acknowledged in time is not p
     let barrier: Barrier | undefined;
     try {
       barrier = await holdNamedLock(`harness-closed:${randomUUID()}`, { tag, safety, clock: hand.clock, dispose: closing.dispose });
+      await staged.session(barrier.pid);
       expect(safety.armed()).toEqual([tag]);
 
       closing.stage();
@@ -2153,11 +2226,14 @@ describe("race harness (7): a closing that was not acknowledged in time is not p
       expect(() => assertRunSafe(safety)).not.toThrow();
       expect(currentRunSafety().armed()).toEqual([staged.scope]);
     } finally {
+      // As above: one bounded, acknowledged closing, that exact backend then SEEN gone, or the
+      // sentinel stays and the real run stops.
       closing.verdict.resolve(undefined);
-      for (const client of handed) await client.end().catch(() => undefined);
-      if (barrier && !closing.staging()) await barrier.release().catch(() => undefined);
-      await untilBarrierGone(tag);
-      staged.clear();
+      await staged.retire(async () => {
+        if (barrier && !closing.staging()) await barrier.release();
+        for (const client of handed) await client.end();
+        return "closed";
+      }, () => untilBarrierGone(tag));
     }
     expect(currentRunSafety().blocked()).toBeNull();
   }, RACE_TEST_TIMEOUT_MS);
@@ -2674,6 +2750,8 @@ describe("race harness (8): a test's own foreign session is a scope of the run �
       // Opened on the clock this test moves — and on nothing else staged: until the gate below, its
       // closing would be the real one, acknowledged in real time.
       holder = await openTestSession(name, { safety, clock: hand.clock });
+      // On the real run's books by its exact backend, before anything is staged in front of its closing.
+      await staged.session(holder.pid);
       // ITS MARKER IS ON FILE, in the state it was opened under, and that state's guard refuses.
       expect(safety.armed()).toEqual([holder.scope]);
       expect(() => assertRunSafe(safety)).toThrow(/1 harness scope\(s\) still in flight/);
@@ -2759,15 +2837,18 @@ describe("race harness (8): a test's own foreign session is a scope of the run �
       expect(currentRunSafety().armed()).toEqual([staged.scope, waiter.scope].sort());
     } finally {
       // ON EVERY EXIT nothing stays held back, and the holder's connection is really closed — by its
-      // own `end`, whether or not this test ever stood in front of it. The real run's sentinel comes
-      // off only once no session is left under the holder's name. If one is, this throws, the
-      // sentinel stays, and the real run stops.
+      // own `end`, whether or not this test ever stood in front of it. That closing is one bounded
+      // step and must be acknowledged; the real run's sentinel comes off only once the holder's exact
+      // backend is then SEEN gone and no session is left under its name. A closing that rejects, is
+      // still pending at its bound or answers late, or a session not seen gone, leaves the sentinel
+      // on file, STOPS the real run, and this throws.
       unhandled.stop();
       ending.resolve();
-      if (reallyEnd) await reallyEnd().catch(() => undefined);
-      else if (holder) await holder.client.end().catch(() => undefined);
-      await untilNoSessionsNamed(sessionName);
-      staged.clear();
+      await staged.retire(async () => {
+        if (reallyEnd) await reallyEnd();
+        else if (holder) await holder.client.end();
+        return "closed";
+      }, () => untilNoSessionsNamed(sessionName));
     }
     // The sentinel took nothing else with it: the staged state is still stopped, its scope still on file.
     expect(safety.armed()).toEqual([`session-${name}`]);
@@ -2887,6 +2968,203 @@ describe("race harness (9): a staged test's own pool checkout is on the real run
     expect(run.armed()).toEqual([]);
     expect(run.blocked()).toBeNull();
     expect(() => assertRunSafe()).not.toThrow();
+    expect(raceHarnessFatal()).toBeNull();
+  }, RACE_TEST_TIMEOUT_MS);
+});
+
+describe("race harness (10): a staged test's own cleanup of a REAL session is one bounded, acknowledged closing and that exact backend SEEN gone — anything less leaves the sentinel on file and stops the run, for good (real Postgres)", () => {
+  /**
+   * The staged tests above take a real session out of the harness's hands, so what closes it at the
+   * end is their own cleanup — the sentinel's `retire`. Here that cleanup is the thing under test.
+   *
+   * The session is a REAL one: a foreign session of this file, a scope of the real run, which the
+   * `afterEach` closes and proves gone whatever happens here. The sentinel stands on a run-safety
+   * state of this test's own, in place of the real run's, so that stopping it does not stop the
+   * real run; and the closing it is given is this test's to answer, on a clock moved by hand.
+   */
+  const unproven: {
+    what: string;
+    then: string;
+    stage: (staged: StagedClosing) => void;
+    later: (staged: StagedClosing) => void;
+  }[] = [
+    {
+      what: "REJECTS, in time",
+      then: "its deadline passes",
+      stage: ({ verdict }) => verdict.reject(new Error("Connection terminated unexpectedly")),
+      later: ({ hand }) => hand.tick(OWNED_BOUND_MS),
+    },
+    {
+      what: "is still PENDING at its deadline",
+      then: "is acknowledged `closed` only afterwards",
+      stage: ({ hand }) => hand.tick(OWNED_BOUND_MS),
+      later: ({ verdict }) => verdict.resolve("closed"),
+    },
+    {
+      what: "is OPAQUE — it resolves in time, and does not say `closed`",
+      then: "its deadline passes",
+      stage: ({ verdict }) => verdict.resolve(undefined),
+      later: ({ hand }) => hand.tick(OWNED_BOUND_MS),
+    },
+    {
+      what: "is acknowledged `closed` exactly AT its deadline, ahead of the overdue timer",
+      then: "that timer is finally run",
+      stage: ({ hand, verdict }) => { hand.drift(OWNED_BOUND_MS); verdict.resolve("closed"); },
+      later: ({ hand }) => hand.tick(OWNED_BOUND_MS),
+    },
+  ];
+
+  it.each(unproven)("a closing that $what: the cleanup rejects, the marker stays and the run is stopped — rightly, the session is still there — and so it stays when $then", async ({ stage, later }) => {
+    const { directory, safety } = privateRun();
+    const closing = stagedClosing();
+    const { hand, asked } = closing;
+    const unhandled = watchUnhandled();
+    const session = await foreign("staged-cleanup");
+    const staged = stagedOnRealRun("a real session whose cleanup closing is staged", whoIs, { safety, clock: hand.clock });
+    try {
+      expect(safety.armed()).toEqual([staged.scope]);
+      // ON THE BOOKS by its exact backend, as the monitor reads it.
+      expect((await staged.session(session.pid)).pid).toBe(session.pid);
+      // Known is not retired: the marker cannot simply be taken off.
+      expect(() => staged.clear()).toThrow(/is NOT cleared: 1 real session\(s\) this test staged were not closed and SEEN gone/);
+
+      // THE CLEANUP BEGINS: it asks for the closing, and bounds that — as the one step it is.
+      closing.stage();
+      const retiring = inFlight(staged.retire(() => closing.dispose(session.client)));
+      await Promise.race([asked.reached(1), retiring.promise.then(() => undefined, () => undefined)]);
+      expect(asked.count(), "the closing was asked for").toBe(1);
+      expect(hand.delays(), "and it is bounded").toEqual([OWNED_BOUND_MS]);
+      await turn();
+      expect(retiring.state()).toBe("pending");
+
+      // …BUT THE CLOSING IS NOT ACKNOWLEDGED IN TIME. The cleanup is refused, and THE RUN IS
+      // STOPPED: a fatal reason, the marker still on file, and the guard refusing.
+      stage(closing);
+      const failure = await retiring.promise.then(() => null, (error: unknown) => error);
+      expect(failure).toBeInstanceOf(RaceHarnessError);
+      expect((failure as Error).message).toMatch(
+        /sentinel-[a-f0-9]{8} \(a real session whose cleanup closing is staged\) was closed, but its closing was not acknowledged in time, and could not be proven gone/,
+      );
+      const reason = safety.fatal();
+      expect(reason).toBe((failure as Error).message);
+      expect(safety.armed()).toEqual([staged.scope]);
+      expect(() => assertRunSafe(safety)).toThrow(/run STOPPED — refusing to truncate or run another test/);
+      // AND RIGHTLY SO: the session is exactly where it was.
+      expect(await sessionEvidence([session.pid])).toMatchObject([{ pid: session.pid, state: "idle" }]);
+
+      // WHATEVER COMES LATER — the acknowledgement itself, or the timer that was overdue.
+      later(closing);
+      await turn();
+
+      // NOTHING CAME OF IT. Not an unhandled rejection; the closing was not asked for again, and no
+      // other bound was started…
+      expect(unhandled.seen).toEqual([]);
+      expect(asked.count()).toBe(1);
+      expect(hand.delays()).toEqual([OWNED_BOUND_MS]);
+      // …the first conclusion stands, asked again or cleared by hand…
+      expect(await staged.retire(() => closing.dispose(session.client)).then(() => null, (error: unknown) => error)).toBe(failure);
+      expect(asked.count()).toBe(1);
+      expect(() => staged.clear()).toThrow(/is NOT cleared/);
+      // …and the run stays stopped — here, and for any other reader of the same state.
+      expect(safety.armed()).toEqual([staged.scope]);
+      expect(safety.fatal()).toBe(reason);
+      expect(safety.setFatal("a later, different reason")).toBe(reason);
+      const elsewhere = createRunSafety(directory);
+      expect(elsewhere.armed()).toEqual([staged.scope]);
+      expect(elsewhere.fatal()).toBe(reason);
+      expect(() => assertRunSafe(elsewhere)).toThrow(/run STOPPED/);
+      // The real run was not stopped by this test: its state is not this one.
+      expect(raceHarnessFatal()).toBeNull();
+      expect(currentRunSafety().armed()).toEqual([session.scope]);
+    } finally {
+      unhandled.stop();
+      closing.verdict.resolve(undefined);
+    }
+  }, RACE_TEST_TIMEOUT_MS);
+
+  it("a closing acknowledged `closed` in time whose backend is NOT then seen gone: the marker stays and the run is stopped — the acknowledgement alone proves nothing", async () => {
+    const { safety } = privateRun();
+    const session = await foreign("survives-cleanup");
+    // A short budget for seeing it gone: the session is never closed here, so the wait runs out.
+    const staged = stagedOnRealRun("a real session whose closing says `closed` and closes nothing", whoIs, { safety, cleanupMs: 250 });
+    const backend = await staged.session(session.pid);
+
+    const failure = await staged.retire(async () => "closed").then(() => null, (error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(RaceHarnessError);
+    expect((failure as Error).message).toContain(`was closed, but its backend ${backend.pid} (started ${backend.started}) was not seen gone`);
+    expect(safety.fatal()).toBe((failure as Error).message);
+    expect(safety.armed()).toEqual([staged.scope]);
+    expect(() => assertRunSafe(safety)).toThrow(/run STOPPED — refusing to truncate or run another test/);
+    expect(() => staged.clear()).toThrow(/is NOT cleared/);
+    expect(await sessionEvidence([session.pid])).toMatchObject([{ pid: session.pid, state: "idle" }]);
+    expect(raceHarnessFatal()).toBeNull();
+  }, RACE_TEST_TIMEOUT_MS);
+
+  it("a session the monitor could NOT identify is not cleared around: its closing acknowledged, there is still no backend to see gone — the marker stays and the run is stopped", async () => {
+    const { safety } = privateRun();
+    const session = await foreign("unidentified-cleanup");
+    const staged = stagedOnRealRun("a real session the monitor never saw", whoIs, { safety });
+    // No backend has this pid: the monitor sees no row, and says so.
+    const unknown = await staged.session(2_147_483_647).then(() => null, (error: unknown) => error);
+    expect(unknown).toBeInstanceOf(RaceHarnessError);
+    expect((unknown as Error).message).toMatch(/backend 2147483647 could not be identified: the monitor sees \[\]/);
+    expect(() => staged.clear()).toThrow(/is NOT cleared: 1 real session\(s\)/);
+
+    // Its closing is a real one, really acknowledged — and it is not enough.
+    const failure = await staged.retire(() => session.client.end().then((): Disposal => "closed")).then(() => null, (error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(RaceHarnessError);
+    expect((failure as Error).message).toMatch(/was closed, but one of its sessions never said who it is, and could not be proven gone/);
+    expect(safety.fatal()).toBe((failure as Error).message);
+    expect(safety.armed()).toEqual([staged.scope]);
+    expect(() => assertRunSafe(safety)).toThrow(/run STOPPED — refusing to truncate or run another test/);
+    expect(raceHarnessFatal()).toBeNull();
+  }, RACE_TEST_TIMEOUT_MS);
+
+  it("the control: a closing acknowledged `closed` one millisecond BEFORE its deadline, its exact backend then seen gone, IS proven — the marker comes off and the run goes on", async () => {
+    const { safety } = privateRun();
+    const closing = stagedClosing();
+    const { hand, asked } = closing;
+    const session = await foreign("retired-cleanup");
+    const staged = stagedOnRealRun("a real session whose cleanup closing is acknowledged just in time", whoIs, { safety, clock: hand.clock });
+    try {
+      await staged.session(session.pid);
+      const gone = controlled<void>();
+
+      closing.stage();
+      const retiring = inFlight(staged.retire(() => closing.dispose(session.client), () => gone.promise));
+      await Promise.race([asked.reached(1), retiring.promise.then(() => undefined, () => undefined)]);
+      expect(asked.count()).toBe(1);
+      expect(hand.delays()).toEqual([OWNED_BOUND_MS]);
+
+      // The same seam, the same clock, a real closing behind it — and the acknowledgement one
+      // millisecond inside the bound, its timer still not run.
+      await session.client.end();
+      hand.drift(OWNED_BOUND_MS - 1);
+      expect(hand.outstanding()).toBe(1);
+      closing.verdict.resolve("closed");
+
+      // The backend is seen gone on the real clock; what else was to be seen absent is still owed,
+      // and until it is the marker stays.
+      await untilSessions([session.pid], "the session's backend gone", (sessions) => sessions.length === 0);
+      await turn();
+      expect(retiring.state()).toBe("pending");
+      expect(safety.armed()).toEqual([staged.scope]);
+      gone.resolve();
+
+      await retiring.promise;
+      expect(hand.outstanding(), "the bound on the closing was called off").toBe(0);
+      expect(await sessionEvidence([session.pid])).toEqual([]);
+      expect(safety.armed()).toEqual([]);
+      expect(safety.fatal()).toBeNull();
+      expect(() => assertRunSafe(safety)).not.toThrow();
+      // Asked again it is the same conclusion, and nothing is closed again.
+      await staged.retire(() => closing.dispose(session.client));
+      expect(asked.count()).toBe(1);
+    } finally {
+      closing.verdict.resolve(undefined);
+    }
     expect(raceHarnessFatal()).toBeNull();
   }, RACE_TEST_TIMEOUT_MS);
 });
