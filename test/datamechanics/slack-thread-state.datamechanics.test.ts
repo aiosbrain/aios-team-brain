@@ -1593,6 +1593,158 @@ describe("release — requeue keeps the progress it did not earn the right to dr
   });
 });
 
+// ── M11: the owner token, when the generations cannot tell two claims apart ──
+
+/**
+ * The known-root requeue specification's mutation row M11 (owner fence), characterized against this
+ * module's fenced checkpoint.
+ *
+ * `lease_generation` is a counter ON A ROW. When the row is deleted and the same scope is enqueued
+ * again, the counter starts over, so a claim on the new row can carry exactly the generations a
+ * claim on the deleted row carried. Scope, status, lease generation, snapshot generation and a live
+ * lease then all match the old claim: the owner token is the ONLY thing that says the row is not
+ * the old claim's to write. The cases above that refuse a replaced owner differ in generation too,
+ * and the forged-owner case never deletes anything; neither arranges this.
+ *
+ * Both claims here are made the same way, through the module: enqueue, claim, checkpoint, expire,
+ * reclaim. The deletion and the expiry are fixture SQL, as everywhere in this file.
+ */
+describe("M11 owner fence — a deleted, recreated and reclaimed row at the same generations", () => {
+  const LEASE_GENERATION = 2;
+  const SNAPSHOT_GENERATION = 4;
+  const CURSOR_BEFORE_THE_RECLAIM = "m11-page-before-the-reclaim";
+  const CURSOR_FROM_THE_STALE_CLAIM = "m11-written-by-the-stale-claim";
+  const CURSOR_FROM_THE_REPLACEMENT = "m11-written-by-the-replacement";
+
+  /** A live claim at lease generation 2 and snapshot generation 4, reached only through the module's own operations. */
+  async function reclaimedAtTheNamedGenerations(scope: SlackThreadScope): Promise<SlackThreadClaim> {
+    const first = await claimed(scope);
+    const progressed = await tx((s) =>
+      checkpointSlackThread(s, first, { pageCursor: CURSOR_BEFORE_THE_RECLAIM, snapshotGeneration: SNAPSHOT_GENERATION })
+    );
+    if (progressed.outcome !== "checkpointed") throw new Error("fixture: expected the first claim to checkpoint");
+    await expireLease(scope);
+    const again = await claim(scope);
+    if (!again) throw new Error("fixture: expected the expired lease to be reclaimable");
+    return again;
+  }
+
+  /** The whole stored row as the database's own JSON text, so a timestamp keeps the microseconds a JavaScript Date drops. */
+  async function storedRow(scope: SlackThreadScope): Promise<{ text: string; columns: Record<string, unknown> }> {
+    const c = await sql();
+    const { rows } = await c.query<{ stored: string; lease_is_live: boolean }>(
+      `select to_jsonb(t)::text as stored, t.lease_expires_at > clock_timestamp() as lease_is_live
+         from slack_sync_threads t
+        where t.team_id = $1 and t.workspace_id = $2 and t.channel_id = $3 and t.root_ts = $4`,
+      [scope.teamId, scope.workspaceId, scope.channelId, scope.rootTs]
+    );
+    if (rows.length !== 1) throw new Error(`fixture: expected exactly one row, found ${rows.length}`);
+    return {
+      text: rows[0].stored,
+      columns: { ...(JSON.parse(rows[0].stored) as Record<string, unknown>), lease_is_live: rows[0].lease_is_live },
+    };
+  }
+
+  /** Everything a claim carries except the two things a new claim always changes: its owner token and its expiry. */
+  const withoutOwnerAndExpiry = (held: SlackThreadClaim) => ({
+    scope: held.scope,
+    leaseGeneration: held.leaseGeneration,
+    attempts: held.attempts,
+    pageCursor: held.pageCursor,
+    snapshotGeneration: held.snapshotGeneration,
+  });
+
+  it("M11: a checkpoint by the stale claim is refused and leaves the replacement row exactly as it was, when only the owner token tells the two claims apart", async () => {
+    const seed = await seedTeam();
+    const scope = scopeFor(seed);
+
+    const stale = await reclaimedAtTheNamedGenerations(scope);
+    const deletedRowId = (await storedRow(scope)).columns.id;
+
+    // FIXTURE DML: the row the stale claim was made on is deleted. Nothing in this module deletes a
+    // queue row; in the product the publication transaction does.
+    const c = await sql();
+    const deleted = await c.query(
+      `delete from slack_sync_threads
+        where team_id = $1 and workspace_id = $2 and channel_id = $3 and root_ts = $4`,
+      [scope.teamId, scope.workspaceId, scope.channelId, scope.rootTs]
+    );
+    if (deleted.rowCount !== 1 || (await rowCount(seed.teamId)) !== 0) {
+      throw new Error("fixture: expected to delete exactly the one queue row of this scope");
+    }
+
+    // The same scope is enqueued again and brought, the same way, to the same generations.
+    const replacement = await reclaimedAtTheNamedGenerations(scope);
+    const before = await storedRow(scope);
+
+    // FIXTURE: everything a fenced write checks — scope, status, lease generation, a live lease and
+    // a snapshot generation that is not rewound — is the same for the two claims. They differ in the
+    // owner token, and the row is a different row.
+    const sameButForTheOwner = {
+      scope, leaseGeneration: LEASE_GENERATION, attempts: 2, pageCursor: CURSOR_BEFORE_THE_RECLAIM, snapshotGeneration: SNAPSHOT_GENERATION,
+    };
+    expect({
+      the_stale_claim_without_owner_and_expiry: withoutOwnerAndExpiry(stale),
+      the_replacement_claim_without_owner_and_expiry: withoutOwnerAndExpiry(replacement),
+      the_owner_tokens_differ: stale.leaseOwner !== replacement.leaseOwner,
+      the_replacement_is_another_row: before.columns.id !== deletedRowId,
+      replacement_row: {
+        status: before.columns.status,
+        lease_generation: before.columns.lease_generation,
+        snapshot_generation: before.columns.snapshot_generation,
+        lease_owner_is_the_replacement_claims: before.columns.lease_owner === replacement.leaseOwner,
+        lease_is_live_by_the_database_clock: before.columns.lease_is_live,
+      },
+    }, "M11: fixture: the stale and the replacement claim have the same scope, lease generation and snapshot generation, on a recreated running row with a live lease, and different owner tokens").toEqual({
+      the_stale_claim_without_owner_and_expiry: sameButForTheOwner,
+      the_replacement_claim_without_owner_and_expiry: sameButForTheOwner,
+      the_owner_tokens_differ: true,
+      the_replacement_is_another_row: true,
+      replacement_row: {
+        status: "running",
+        lease_generation: LEASE_GENERATION,
+        snapshot_generation: SNAPSHOT_GENERATION,
+        lease_owner_is_the_replacement_claims: true,
+        lease_is_live_by_the_database_clock: true,
+      },
+    });
+
+    // THE NAMED WRITE, by the stale claim, at the snapshot generation both claims hold.
+    const attempted = await tx((s) =>
+      checkpointSlackThread(s, stale, { pageCursor: CURSOR_FROM_THE_STALE_CLAIM, snapshotGeneration: stale.snapshotGeneration })
+    );
+    const after = await storedRow(scope);
+
+    expect({
+      the_stale_claims_checkpoint: attempted.outcome,
+      replacement_page_cursor: after.columns.page_cursor,
+      replacement_row_is_exactly_as_it_was: after.text === before.text,
+    }, "M11: a checkpoint by the stale claim is refused, and the replacement row keeps its own cursor and every other column").toEqual({
+      the_stale_claims_checkpoint: "refused",
+      replacement_page_cursor: CURSOR_BEFORE_THE_RECLAIM,
+      replacement_row_is_exactly_as_it_was: true,
+    });
+    expect(after.columns).toEqual(before.columns);
+
+    // CONTROL: the same write, at the same generations, by the claim whose owner token the row
+    // holds, is accepted. The owner token was the one thing the stale claim lacked.
+    const own = await tx((s) =>
+      checkpointSlackThread(s, replacement, { pageCursor: CURSOR_FROM_THE_REPLACEMENT, snapshotGeneration: replacement.snapshotGeneration })
+    );
+    expect(own, "M11: control: the replacement claim's own checkpoint, at the same generations, is accepted").toMatchObject({
+      outcome: "checkpointed",
+      state: {
+        status: "running",
+        pageCursor: CURSOR_FROM_THE_REPLACEMENT,
+        leaseOwner: replacement.leaseOwner,
+        leaseGeneration: LEASE_GENERATION,
+        snapshotGeneration: SNAPSHOT_GENERATION,
+      },
+    });
+    expect((await storedRow(scope)).columns.page_cursor).toBe(CURSOR_FROM_THE_REPLACEMENT);
+  });
+});
+
 // ── the rest of the system does not notice ───────────────────────────────────
 
 describe("an empty, or newly populated, queue changes nothing else", () => {
