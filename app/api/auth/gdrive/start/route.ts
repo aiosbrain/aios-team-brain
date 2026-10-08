@@ -1,7 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { adminClient } from "@/lib/db/admin";
 import { requireTeamAdmin } from "@/lib/auth/guard";
-import { createGoogleDriveOAuthState } from "@/lib/auth/gdrive-oauth-state";
+import {
+  createGoogleDriveOAuthState,
+  GDRIVE_OAUTH_BINDING_COOKIE,
+  gdriveOAuthBindingCookieOptions,
+  newGoogleDriveOAuthBinding,
+} from "@/lib/auth/gdrive-oauth-state";
 
 export const runtime = "nodejs";
 
@@ -23,11 +28,15 @@ export async function GET(req: NextRequest) {
   const db = adminClient();
   await db.from("oauth_states").delete().eq("member_id", auth.memberId).eq("provider", "gdrive")
     .lt("expires_at", new Date().toISOString());
+  // The state is redeemable only from this browser: the binding goes out as an HttpOnly cookie and
+  // only its hash is signed into the state the browser carries to Google and back.
+  const browserBinding = newGoogleDriveOAuthBinding();
   const state = await createGoogleDriveOAuthState(db, {
     teamId: auth.teamId,
     memberId: auth.memberId,
     integrationName: name || "google-drive",
     teamSlug,
+    browserBinding,
   });
   const authorize = new URL("https://accounts.google.com/o/oauth2/v2/auth");
   authorize.search = new URLSearchParams({
@@ -40,5 +49,7 @@ export async function GET(req: NextRequest) {
     scope: (mode === "files" ? FILE_SCOPES : DISCOVERY_SCOPES).join(" "),
     state,
   }).toString();
-  return NextResponse.redirect(authorize);
+  const response = NextResponse.redirect(authorize);
+  response.cookies.set(GDRIVE_OAUTH_BINDING_COOKIE, browserBinding, gdriveOAuthBindingCookieOptions());
+  return response;
 }

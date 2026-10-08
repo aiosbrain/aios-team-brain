@@ -4,7 +4,7 @@ import { z } from "zod";
 import { adminClient } from "@/lib/db/admin";
 import { authenticateApiKey } from "@/lib/api/auth";
 import { errorResponse } from "@/lib/api/schemas";
-import { rateLimit } from "@/lib/api/rate-limit";
+import { rateLimitWithReset } from "@/lib/api/rate-limit";
 import {
   drainGdriveCleanupObligations,
   GDRIVE_SNAPSHOT_PAGE_LIMIT,
@@ -29,9 +29,23 @@ const requestSchema = z.object({
     // the page marked complete states the whole snapshot's size and finalizes it atomically.
     snapshot_id: z.string().uuid().optional(),
     total: z.number().int().nonnegative().optional(),
+    // A successor execution continuing a deferred upload proves the exact prefix it expects to find
+    // held; `inspect` only asks how much is held and changes nothing.
+    resume: z.object({
+      members: z.number().int().positive(),
+      digest: z.string().regex(/^[0-9a-f]{64}$/),
+    }).strict().optional(),
+    inspect: z.boolean().optional(),
   }).refine(
     (snapshot) => (snapshot.snapshot_id !== undefined && snapshot.complete) === (snapshot.total !== undefined),
     { message: "snapshot.total is stated on, and only on, the completing page of a staged snapshot" },
+  ).refine(
+    (snapshot) => snapshot.snapshot_id !== undefined || (snapshot.resume === undefined && !snapshot.inspect),
+    { message: "snapshot.resume and snapshot.inspect apply only to a staged snapshot" },
+  ).refine(
+    (snapshot) => !snapshot.inspect
+      || (!snapshot.complete && snapshot.provider_ids.length === 0 && snapshot.resume === undefined),
+    { message: "snapshot.inspect carries no members, no proof and no completion" },
   ).optional(),
   reason: z.string().trim().min(1).max(500),
 }).strict();
@@ -41,8 +55,13 @@ export async function POST(req: NextRequest) {
   const auth = await authenticateApiKey(req);
   if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
   const db = adminClient();
-  if (!(await rateLimit(db, `${auth.apiKeyId}:source-reconcile:post`, 30))) {
-    return errorResponse("rate_limited", "30 reconciliations/min per key", 429);
+  const quota = await rateLimitWithReset(db, `${auth.apiKeyId}:source-reconcile:post`, 30);
+  if (!quota.allowed) {
+    // A staged snapshot is many requests. The connector waits out exactly this window, or defers
+    // the rest of the upload to its next run, instead of guessing a backoff.
+    const response = errorResponse("rate_limited", "30 reconciliations/min per key", 429);
+    response.headers.set("Retry-After", String(quota.retryAfterSeconds));
+    return response;
   }
 
   let raw: unknown;
@@ -76,6 +95,8 @@ export async function POST(req: NextRequest) {
                     generation: parsed.data.generation,
                     fence: parsed.data.fence,
                     total: parsed.data.snapshot.total,
+                    resume: parsed.data.snapshot.resume,
+                    inspect: parsed.data.snapshot.inspect,
                   }
                 : undefined,
             }

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { NextRequest } from "next/server";
 import { describe, expect, it } from "vitest";
 
@@ -26,6 +26,10 @@ import { approvedAudienceProject, db, seedTeam, sha, type Seed } from "./helpers
  *     or any number of pages short of the whole, retires nothing by omission.
  *   · COMPLETION — the set is complete only if every page arrived: a finalization whose staged
  *     membership does not add up to its declared total establishes no absence.
+ *   · CONTINUATION — the upload may outlive the execution that began it (the route's rate limit or
+ *     the connector's run deadline defers it). The next execution continues from what is held only
+ *     by PROVING that set — its size and digest; a snapshot's name alone carries nothing forward,
+ *     and the execution that was replaced can neither add to the upload nor finalize it.
  * Everything here goes through the real route, as the connector's execution.
  */
 const SELECTED = 2 * GDRIVE_SNAPSHOT_PAGE_LIMIT + 5_001; // 25,001 documents: three pages
@@ -102,6 +106,26 @@ async function reconcile(c: Connector, snapshot: Record<string, unknown>) {
   }));
   return { status: response.status, body: await response.json() as Record<string, unknown> & { error?: { code: string } } };
 }
+
+/** The connection changes hands: the lease is released and acquired again, under the next fence. */
+async function successorOf(c: Connector): Promise<Connector> {
+  const released = await executionPOST(request("http://test/api/v1/integrations/gdrive/execution", c, {
+    action: "release", integration_id: c.integrationId, ...c.execution,
+  }));
+  expect(released.status).toBe(200);
+  const owner = randomUUID();
+  const acquired = await executionPOST(request("http://test/api/v1/integrations/gdrive/execution", c, {
+    action: "acquire", integration_id: c.integrationId, owner,
+  }));
+  expect(acquired.status).toBe(200);
+  const lease = await acquired.json() as { generation: number; fence: number };
+  expect(lease).toMatchObject({ generation: c.execution.generation, fence: c.execution.fence + 1 });
+  return { ...c, execution: { generation: lease.generation, fence: lease.fence, owner } };
+}
+
+/** The proof a connector offers for a prefix: sha256 of its members in byte order, newline-joined. */
+const digest = (providerIds: string[]) =>
+  createHash("sha256").update([...providerIds].sort().join("\n")).digest("hex");
 
 async function activeClaims(c: Connector): Promise<string[]> {
   const { rows } = await getPool().query<{ provider_id: string }>(
@@ -223,4 +247,99 @@ describe("AIO-1167 source reconciliation above 10,000 selected documents (real P
     expect(await stage(c.execution.fence + 1, ["other"], false)).toMatchObject({ snapshotStaged: 1 });
     expect(await stagedMembers(c)).toBe(1);
   });
+
+  it("a successor execution continues a deferred upload by proving the held prefix; the replaced one is fenced out", async () => {
+    const c = await connector();
+    for (const providerId of ["kept-first", "kept-last", "gone"]) await claimDocument(c, providerId);
+    const [first, second, last] = selection();
+    const snapshotId = randomUUID();
+
+    // The first execution stages two of three pages and is then deferred.
+    expect((await reconcile(c, { complete: false, provider_ids: first, snapshot_id: snapshotId })).status).toBe(200);
+    expect((await reconcile(c, { complete: false, provider_ids: second, snapshot_id: snapshotId })).status).toBe(200);
+    const next = await successorOf(c);
+
+    // The execution that was replaced can no longer finalize the upload, or add to it.
+    for (const late of [
+      { complete: true, provider_ids: last, snapshot_id: snapshotId, total: SELECTED },
+      { complete: false, provider_ids: last, snapshot_id: snapshotId },
+    ]) {
+      const obsolete = await reconcile(c, late);
+      expect(obsolete.status).toBe(409);
+      expect(obsolete.body.error?.code).toBe("stale_execution");
+    }
+    expect(await activeClaims(c)).toEqual(["gone", "kept-first", "kept-last"]);
+    expect(await stagedMembers(c)).toBe(2 * GDRIVE_SNAPSHOT_PAGE_LIMIT);
+
+    // The successor asks what is held. That reports, and changes nothing.
+    const inspected = await reconcile(next, { complete: false, provider_ids: [], snapshot_id: snapshotId, inspect: true });
+    expect(inspected).toMatchObject({
+      status: 200, body: { snapshotApplied: false, candidates: 0, snapshotStaged: 2 * GDRIVE_SNAPSHOT_PAGE_LIMIT },
+    });
+    expect(await stagedMembers(c)).toBe(2 * GDRIVE_SNAPSHOT_PAGE_LIMIT);
+
+    // A proof of any other membership — same size, or a true prefix that is not all of it — is
+    // refused together with the finalizing page it came with: no absence, nothing adopted.
+    for (const wrong of [
+      { members: 2 * GDRIVE_SNAPSHOT_PAGE_LIMIT, digest: digest([...first, ...second.slice(1), "not-what-was-staged"]) },
+      { members: GDRIVE_SNAPSHOT_PAGE_LIMIT, digest: digest(first) },
+    ]) {
+      const refused = await reconcile(next, {
+        complete: true, provider_ids: last, snapshot_id: snapshotId, total: SELECTED, resume: wrong,
+      });
+      expect(refused.status).toBe(409);
+      expect(refused.body.error?.code).toBe("snapshot_resume_mismatch");
+    }
+    expect(await activeClaims(c)).toEqual(["gone", "kept-first", "kept-last"]);
+    expect(await stagedMembers(c)).toBe(2 * GDRIVE_SNAPSHOT_PAGE_LIMIT);
+
+    // The exact proof adopts the prefix, and the last page finalizes the WHOLE set against it.
+    const finalized = await reconcile(next, {
+      complete: true, provider_ids: last, snapshot_id: snapshotId, total: SELECTED,
+      resume: { members: 2 * GDRIVE_SNAPSHOT_PAGE_LIMIT, digest: digest([...first, ...second]) },
+    });
+    expect(finalized).toMatchObject({ status: 200, body: { snapshotApplied: true, candidates: 1, cleanupQueued: 1 } });
+    expect(await activeClaims(c)).toEqual(["kept-first", "kept-last"]);
+    expect(await stagedMembers(c)).toBe(0);
+  }, 120_000);
+
+  it("a successor that proves a prefix and then continues page by page holds one membership under its own fence", async () => {
+    const c = await connector();
+    for (const providerId of ["kept-first", "kept-last", "gone"]) await claimDocument(c, providerId);
+    const [first, second, last] = selection();
+    const snapshotId = randomUUID();
+
+    expect((await reconcile(c, { complete: false, provider_ids: first, snapshot_id: snapshotId })).status).toBe(200);
+    const next = await successorOf(c);
+
+    // The proof travels with the next page; from then on the upload is the successor's own.
+    const resumed = await reconcile(next, {
+      complete: false, provider_ids: second, snapshot_id: snapshotId,
+      resume: { members: GDRIVE_SNAPSHOT_PAGE_LIMIT, digest: digest(first) },
+    });
+    expect(resumed).toMatchObject({ status: 200, body: { snapshotApplied: false, snapshotStaged: 2 * GDRIVE_SNAPSHOT_PAGE_LIMIT } });
+    const { rows: fences } = await getPool().query<{ fence: string }>(
+      `select distinct fence::text as fence from gdrive_snapshot_members where team_id=$1 and integration_id=$2`,
+      [c.seed.teamId, c.integrationId]);
+    expect(fences).toEqual([{ fence: String(next.execution.fence) }]);
+
+    const finalized = await reconcile(next, { complete: true, provider_ids: last, snapshot_id: snapshotId, total: SELECTED });
+    expect(finalized).toMatchObject({ status: 200, body: { snapshotApplied: true, candidates: 1 } });
+    expect(await activeClaims(c)).toEqual(["kept-first", "kept-last"]);
+    expect(await stagedMembers(c)).toBe(0);
+  }, 120_000);
+
+  it("a successor that offers no proof starts the same snapshot afresh", async () => {
+    const c = await connector();
+    const [first, second] = selection();
+    const snapshotId = randomUUID();
+
+    expect((await reconcile(c, { complete: false, provider_ids: first, snapshot_id: snapshotId })).status).toBe(200);
+    const next = await successorOf(c);
+
+    // Same snapshot name, no proof: the predecessor's page is replaced, never inherited.
+    const restarted = await reconcile(next, { complete: false, provider_ids: second, snapshot_id: snapshotId });
+    expect(restarted).toMatchObject({ status: 200, body: { snapshotStaged: second.length } });
+    expect(await stagedMembers(c)).toBe(second.length);
+  }, 120_000);
 });

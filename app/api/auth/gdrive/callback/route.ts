@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server";
 import { adminClient } from "@/lib/db/admin";
-import { consumeGoogleDriveOAuthState } from "@/lib/auth/gdrive-oauth-state";
+import { requireTeamAdmin } from "@/lib/auth/guard";
+import { consumeGoogleDriveOAuthState, GDRIVE_OAUTH_BINDING_COOKIE } from "@/lib/auth/gdrive-oauth-state";
 import {
   IncompleteGoogleOAuthPairError,
   GoogleIdentityConflictError,
@@ -21,8 +22,18 @@ function html(status: number, heading: string, detail: string): Response {
 export async function GET(req: NextRequest) {
   const db = adminClient();
   const params = req.nextUrl.searchParams;
-  const bound = await consumeGoogleDriveOAuthState(db, params.get("state"));
+  // The browser first: a state is redeemed only alongside the binding cookie `start` set in the
+  // browser that began this connection. Without it nothing is consumed, exchanged or stored.
+  const bound = await consumeGoogleDriveOAuthState(
+    db, params.get("state"), req.cookies.get(GDRIVE_OAUTH_BINDING_COOKIE)?.value,
+  );
   if (!bound) return html(400, "Google Drive connection failed", "The authorization link is invalid, expired, or already used.");
+  // Then the session: the Admin who started the connection must be the one signed in here, before
+  // Google's code is exchanged. (Publication re-verifies that Admin once more, under its locks.)
+  const session = await requireTeamAdmin(bound.teamSlug);
+  if (!session || session.teamId !== bound.teamId || session.memberId !== bound.memberId) {
+    return html(403, "Google Drive connection failed", "Sign in as the Admin who started this connection, then connect again. No credentials were stored.");
+  }
   if (params.get("error") || !params.get("code")) return html(400, "Google Drive connection failed", "Authorization was denied. No credentials were stored.");
   const clientId = process.env.GOOGLE_DRIVE_CLIENT_ID;
   const clientSecret = process.env.GOOGLE_DRIVE_CLIENT_SECRET;

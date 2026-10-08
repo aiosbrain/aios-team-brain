@@ -197,6 +197,25 @@ CREATE TABLE IF NOT EXISTS connection_stream_schedule (
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (connection_id, generation)
 );
+CREATE TABLE IF NOT EXISTS selection_root_bindings (
+  connection_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  root_kind TEXT NOT NULL,
+  root_id TEXT NOT NULL,
+  drive_id TEXT NOT NULL,
+  bound_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (connection_id, generation, root_kind, root_id)
+);
+CREATE TABLE IF NOT EXISTS stream_hints (
+  team TEXT NOT NULL,
+  connection_id TEXT NOT NULL,
+  credential_id TEXT NOT NULL,
+  drive_id TEXT NOT NULL,
+  dirty_seq INTEGER NOT NULL DEFAULT 0,
+  acked_seq INTEGER NOT NULL DEFAULT 0,
+  last_hint_at TEXT,
+  PRIMARY KEY (team, connection_id, credential_id, drive_id)
+);
 """
 
 
@@ -580,6 +599,71 @@ class StateStore:
             if not hmac.compare_digest(supplied, channel.verification_hash):
                 return None
         return channel
+
+    # -- notification hints --------------------------------------------------
+    # One row per stream, however many notifications arrive and whichever scope generation the
+    # notifying channel was created under. A hint is a pair of counters, never a work item: it
+    # cannot fill the document backlog or spend a run's work budget.
+    def record_stream_hint(self, key: StreamKey) -> int:
+        """Mark a stream dirty and return the sequence this notification was given."""
+        self._db.execute(
+            "INSERT INTO stream_hints(team,connection_id,credential_id,drive_id,dirty_seq,last_hint_at) "
+            "VALUES(?,?,?,?,1,?) ON CONFLICT(team,connection_id,credential_id,drive_id) DO UPDATE SET "
+            "dirty_seq=dirty_seq+1,last_hint_at=excluded.last_hint_at",
+            (key.team, key.connection_id, key.credential_id, key.drive_id, _now_iso()),
+        )
+        self._db.commit()
+        row = self._db.execute(
+            "SELECT dirty_seq FROM stream_hints WHERE team=? AND connection_id=? AND credential_id=? "
+            "AND drive_id=?",
+            (key.team, key.connection_id, key.credential_id, key.drive_id),
+        ).fetchone()
+        return int(row["dirty_seq"])
+
+    def pending_stream_hint(self, key: StreamKey) -> int | None:
+        """The newest unacknowledged notification sequence, or None when the stream is clean."""
+        row = self._db.execute(
+            "SELECT dirty_seq,acked_seq FROM stream_hints WHERE team=? AND connection_id=? "
+            "AND credential_id=? AND drive_id=?",
+            (key.team, key.connection_id, key.credential_id, key.drive_id),
+        ).fetchone()
+        if not row or int(row["dirty_seq"]) <= int(row["acked_seq"]):
+            return None
+        return int(row["dirty_seq"])
+
+    def ack_stream_hint(self, key: StreamKey, observed_seq: int) -> None:
+        """Acknowledge exactly what a drain observed before it began reading.
+
+        A notification that arrived during the drain has a later sequence and stays pending, so a
+        change it announces is never acknowledged by a read that may have missed it.
+        """
+        self._db.execute(
+            "UPDATE stream_hints SET acked_seq=? WHERE team=? AND connection_id=? AND credential_id=? "
+            "AND drive_id=? AND acked_seq<? AND dirty_seq>=?",
+            (observed_seq, key.team, key.connection_id, key.credential_id, key.drive_id,
+             observed_seq, observed_seq),
+        )
+        self._db.commit()
+
+    # -- selected-root drive bindings ----------------------------------------
+    def bind_root(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str, drive_id: str,
+    ) -> None:
+        """Record the drive that contains one selected root. The first binding stands."""
+        self._db.execute(
+            "INSERT OR IGNORE INTO selection_root_bindings(connection_id,generation,root_kind,root_id,drive_id) "
+            "VALUES(?,?,?,?,?)",
+            (connection_id, generation, root_kind, root_id, drive_id),
+        )
+        self._db.commit()
+
+    def root_bindings(self, connection_id: str, generation: int) -> dict[tuple[str, str], str]:
+        rows = self._db.execute(
+            "SELECT root_kind,root_id,drive_id FROM selection_root_bindings "
+            "WHERE connection_id=? AND generation=?",
+            (connection_id, generation),
+        ).fetchall()
+        return {(str(r["root_kind"]), str(r["root_id"])): str(r["drive_id"]) for r in rows}
 
     # -- namespaced Drive progress -----------------------------------------
     def begin_generation(

@@ -306,6 +306,11 @@ callback refuses with `OAuth is not configured on this instance`. In both cases 
 Storing the credential also needs `SECRETS_KEY`. In the Google Cloud project, enable the Drive and
 Docs APIs and register the redirect URI above character for character.
 
+The callback completes only in the browser, and for the signed-in Admin, that started **Connect**: it
+needs the short-lived cookie that step set and the same Admin session. So the redirect URI must be on
+the same origin the Admin uses for the app; a link opened in another browser, or after signing out,
+is refused and nothing is stored — start **Connect** again.
+
 The brain asks for `openid email profile` plus **`drive.file`** when you authorize individual files,
 or **`drive.readonly`** when you authorize folders and Shared Drives; the broader scope allows
 discovery but does not widen the selection you save. Access is requested offline, and the refresh
