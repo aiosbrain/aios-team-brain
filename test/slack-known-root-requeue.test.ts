@@ -1109,7 +1109,7 @@ describe("known-root decorated session — statement order, refreshed timeouts, 
 
   /**
    * Each subject would, undisturbed, resolve with exactly the kind of value a swallowed failure is
-   * turned into; that value is written out and required of the undisturbed run. These four are SHORT
+   * turned into; that value is written out and required of the undisturbed run. These five are SHORT
    * paths: the two preparer subjects end at the namespace gate and at the integration's selection
    * lock. The full preparation path, through to the enqueue, is the M9 case of the due-output suite
    * below, which has the scripted answers for it.
@@ -1124,6 +1124,18 @@ describe("known-root decorated session — statement order, refreshed timeouts, 
       "the page reader on an empty team", () => [],
       (session) => readSlackKnownRootItemPage(session, pageRequest, execution()),
       { entries: [], nextCursor: null, exhausted: true, examined: 0 },
+    ],
+    [
+      // A CONTINUATION: the id read after a cursor, which a first page never issues.
+      "the page reader on a continuation that finds one more item", () => [{ id: "0c000000-0000-4000-8000-00000000000c" }],
+      (session) => readSlackKnownRootItemPage(session, {
+        ...pageRequest,
+        cursor: { version: 1, teamId: TEAM, upperItemId: "0f000000-0000-4000-8000-00000000000f", afterItemId: ITEM, revisitAfterMs: REVISIT_MS },
+      }, execution()),
+      {
+        entries: [{ teamId: TEAM, itemId: "0c000000-0000-4000-8000-00000000000c", revisitAfterMs: REVISIT_MS, unlocated: "not_slack" }],
+        nextCursor: null, exhausted: true, examined: 1,
+      },
     ],
     [
       "the preparer that is refused at the namespace gate", () => [],
@@ -1143,7 +1155,7 @@ describe("known-root decorated session — statement order, refreshed timeouts, 
    * the original settings, a timeout assignment, a data statement, or the restoring assignment. The
    * primitive must reject with that very failure. It must never resolve — not with an empty page,
    * not with a refused or unattested result — which is what catching the failure and carrying on
-   * would produce, since an empty answer is exactly what these four subjects read as "nothing there".
+   * would produce, since an empty answer is exactly what these five subjects read as "nothing there".
    *
    * Every call position is tried, each on a fresh scripted session; the number of positions is
    * counted from an undisturbed run through the same wrapper, not assumed. The wrapper's own db
