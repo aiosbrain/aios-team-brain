@@ -95,8 +95,8 @@ class SelectedRootUnverified(RuntimeError):
     """Where a selected root lives now could not be read, so nothing is concluded about it."""
 
 
-# A stream whose drive's change log could not be opened exists only as this diagnostic: it has no
-# start token, enumerates nothing, and is retried on every run.
+# What a stream is told when its drive's change log could not be opened. The text is a diagnostic
+# for people; whether a stream has started is read from its tokens (``_unstarted``), never from it.
 _START_UNAVAILABLE = "start token unavailable"
 
 
@@ -110,19 +110,34 @@ def _provider_status(exc: Exception) -> int | None:
         return None
 
 
-def _start_blocked(stream: Any) -> bool:
-    """True for a stream recorded only as a start-token diagnostic, locally or on the brain."""
+def _unstarted(stream: Any) -> bool:
+    """True for a stream record, local or on the brain, that holds no change token.
+
+    This is structure, not wording. A stream with no token has nothing to drain from, so it never
+    started — whether its start-token diagnostic was recorded, was replaced by another message, or
+    was never written because the run that created the record was interrupted first. Such a stream
+    is asked for a token before anything of its drive is enumerated, on every run.
+    """
     if isinstance(stream, dict):
-        token, last_error = stream.get("baseline_start_token"), stream.get("last_error")
+        tokens = (stream.get("baseline_start_token"), stream.get("page_token"))
     else:
-        token, last_error = stream.baseline_start_token, stream.last_error
-    return not token and str(last_error or "").startswith(_START_UNAVAILABLE)
+        tokens = (stream.baseline_start_token, stream.page_token)
+    return not any(tokens)
+
+
+def _holds_enumeration(stream: Any) -> bool:
+    """Whether a stream record names a snapshot: something was enumerated through it."""
+    if isinstance(stream, dict):
+        snapshots = (stream.get("active_snapshot"), stream.get("building_snapshot"))
+    else:
+        snapshots = (stream.active_snapshot, stream.building_snapshot)
+    return any(snapshot is not None for snapshot in snapshots)
 
 
 def _start_recovery_blocked(progress: Any) -> bool:
     """True for a stream that had started and whose recovery is waiting on a start token."""
     return bool(
-        progress.baseline_start_token and progress.recovery_required
+        not _unstarted(progress) and progress.recovery_required
         and str(progress.last_error or "").startswith(_START_UNAVAILABLE)
     )
 
@@ -240,14 +255,17 @@ def _retire_orphan_start_diagnostics(
     state: StateStore, execution: GdriveExecution, integration_id: str, generation: int,
     required: set[str],
 ) -> None:
-    """Forget a stream that is only a start-token diagnostic once no root needs its drive.
+    """Forget a stream that never started once no root needs its drive.
 
     Such a stream holds no token, snapshot or work. Left in place after the root that was on its
-    way there moved on, it would be retried — and would keep the connection incomplete — forever.
+    way there moved on, it would be retried — and would keep the connection incomplete, and every
+    removal that waits on it withheld — forever. It leaves the brain's record with the next
+    checkpoint of this run, which is built from ``execution.progress``; a stream that holds a
+    token or names a snapshot is never forgotten here, on either side.
     """
     remote = execution.progress.get("streams")
     for progress in state.list_progress(integration_id, generation):
-        if progress.key.drive_id in required or not _start_blocked(progress):
+        if progress.key.drive_id in required or not _unstarted(progress):
             continue
         if state.forget_unstarted_stream(progress.namespace) and isinstance(remote, dict):
             remote.pop(progress.key.drive_id, None)
@@ -256,9 +274,47 @@ def _retire_orphan_start_diagnostics(
         for drive_id in [
             str(drive_id) for drive_id, stream in remote.items()
             if str(drive_id) not in required and str(drive_id) not in local
-            and isinstance(stream, dict) and _start_blocked(stream)
+            and isinstance(stream, dict) and _unstarted(stream) and not _holds_enumeration(stream)
         ]:
             remote.pop(drive_id, None)
+
+
+def _remote_stream_ids(progress: dict[str, Any]) -> set[str]:
+    """The drives the brain's checkpoint holds a stream record for."""
+    streams = progress.get("streams")
+    if isinstance(streams, dict):
+        return {
+            str(drive_id) for drive_id, stream in streams.items()
+            if isinstance(stream, dict) and stream
+        }
+    legacy_drive = str(progress.get("drive_id") or "")
+    return {legacy_drive} if legacy_drive else set()
+
+
+def _stream_roster(
+    state: StateStore, integration_id: str, generation: int, remote_progress: dict[str, Any],
+    configured: Any = (),
+) -> list[str]:
+    """Every drive whose change stream this connection consumes: the one roster, from every source.
+
+    A stream exists because a root is configured for or bound to its drive, because a root is on
+    its way there, because local state holds it, or because the brain's checkpoint does. None of
+    those alone is the roster: local state can be missing a stream the brain acknowledged, and a
+    relocation destination has no state anywhere until its first run. A drive in the roster with
+    no local progress is a stream nothing is known about yet — unknown, and never absent.
+    """
+    roster = {str(drive_id) for drive_id in configured if drive_id}
+    roster.update(state.root_bindings(integration_id, generation).values())
+    roster.update(
+        str(binding.pending_drive_id)
+        for binding in state.unsettled_roots(integration_id, generation).values()
+        if binding.status == "relocating" and binding.pending_drive_id
+    )
+    roster.update(
+        progress.key.drive_id for progress in state.list_progress(integration_id, generation)
+    )
+    roster.update(_remote_stream_ids(remote_progress))
+    return sorted(roster, key=lambda value: (value != "my-drive", value))
 
 
 def _stream_roots(
@@ -376,6 +432,14 @@ def _terminal_before_rescan(page: Any) -> bool:
         page.page_kind == "changes" and page.rescan_snapshot_id is not None
         and page.terminal_token and not page.next_token
     )
+
+
+# A start token just captured for a stream that had none is where its drain begins: whatever the
+# record said about a finished drain was said without a token, and is not evidence of one.
+_NO_TERMINAL_DRAIN: dict[str, Any] = {
+    "terminal_drain_token": None, "terminal_drain_checkpoint_id": None,
+    "terminal_drain_acknowledged": False, "terminal_drain_observation": None,
+}
 
 
 def _terminal_drain_complete(progress: Any) -> bool:
@@ -556,14 +620,14 @@ async def run_gdrive_stream(
             total = IngestSummary(conn.name, failure_categories={}, integration_id=integration_id)
 
             def start_blocked(drive_id: str) -> bool:
-                """Whether a drive's stream is, locally or on the brain, only a start diagnostic."""
+                """Whether a drive's stream exists, locally or on the brain, without a token."""
                 local = state.get_progress(StreamKey(
                     settings.team, integration_id, credential_identity(options), drive_id,
                 ).namespace(generation))
                 started = local if local is not None else (
                     _remote_stream(execution.progress, drive_id) or None
                 )
-                return started is not None and _start_blocked(started)
+                return started is not None and _unstarted(started)
 
             # Which streams exist depends on where each selected root lives, so every root is bound
             # before any start token is captured. An unreadable root has no known stream: nothing
@@ -600,12 +664,12 @@ async def run_gdrive_stream(
             }
             required = {*_stream_ids(options, root_bindings), *relocating.values()}
             # A drive no root lives in or is on its way to any more — the root moved on, or back —
-            # is not a stream if all it ever was is a start-token diagnostic.
+            # is not a stream if it never started.
             _retire_orphan_start_diagnostics(state, execution, integration_id, generation, required)
-            streams = sorted(
-                {*required,
-                 *(progress.key.drive_id for progress in state.list_progress(integration_id, generation))},
-                key=lambda value: (value != "my-drive", value),
+            # The roster is read after that, from every source: a stream the brain's checkpoint
+            # holds is consumed, and has to finish, even when this sidecar's local state lacks it.
+            streams = _stream_roster(
+                state, integration_id, generation, execution.progress, configured=required,
             )
             if not streams:
                 total.failed = 1
@@ -626,7 +690,11 @@ async def run_gdrive_stream(
                     started = local if local is not None else (
                         _remote_stream(execution.progress, drive_id) or None
                     )
-                    if started is not None and not _start_blocked(started):
+                    if started is not None and not _unstarted(started):
+                        continue
+                    if local is not None and _holds_enumeration(local):
+                        # No token, yet something was enumerated through it: its own run asks for
+                        # the token as the first step of a controlled rescan, never as a resume.
                         continue
                     try:
                         start = _capture_start_token(source, drive, drive_id)
@@ -657,7 +725,7 @@ async def run_gdrive_stream(
                     await _checkpoint_progress(
                         client, execution, state, namespace, phase="baselining",
                         baseline_start_token=start, page_token=None, listing_complete=False,
-                        last_error=None, last_attempt_at=_now(),
+                        last_error=None, last_attempt_at=_now(), **_NO_TERMINAL_DRAIN,
                     )
 
             # Only now — its destination stream holding a token captured before anything is
@@ -669,7 +737,7 @@ async def run_gdrive_stream(
                 destination_progress = state.get_progress(StreamKey(
                     settings.team, integration_id, credential_identity(options), destination,
                 ).namespace(generation))
-                if destination_progress is None or _start_blocked(destination_progress):
+                if destination_progress is None or _unstarted(destination_progress):
                     continue
                 state.rebind_root(integration_id, generation, root_kind, root_id, destination)
             if relocating:
@@ -720,8 +788,11 @@ async def run_gdrive_stream(
                 ))
                 for p in progresses
             )
+            # Every stream of the roster has to be here and finished. One the roster names that has
+            # no local progress yet, or holds no token, is unknown: nothing reconciles around it.
             if verified and len(progresses) == len(streams) and all(
                 p.listing_complete
+                and not _unstarted(p)
                 and not p.recovery_required
                 and p.building_snapshot is None
                 and state.snapshot_complete(p.namespace, generation, p.active_snapshot)
@@ -771,7 +842,10 @@ async def run_gdrive_stream(
                 if not total.authoritative_complete and total.backlog == 0:
                     # Enumeration/drain evidence is itself outstanding work.
                     total.backlog = sum(
-                        0 if progress.listing_complete and _terminal_drain_complete(progress) else 1
+                        0 if (
+                            progress.listing_complete and not _unstarted(progress)
+                            and _terminal_drain_complete(progress)
+                        ) else 1
                         for progress in progresses
                     )
                 if not total.authoritative_complete and total.backlog == 0:
@@ -937,7 +1011,7 @@ async def _run_gdrive_stream_unlocked(
             publish_snapshot=snapshot_id,
         )
         return IngestSummary(conn.name, failure_categories={})
-    if progress is None or _start_blocked(progress):
+    if progress is None or (_unstarted(progress) and not _holds_enumeration(progress)):
         try:
             start = _capture_start_token(source, drive, drive_id)
         except StreamStartUnavailable as exc:
@@ -952,15 +1026,19 @@ async def _run_gdrive_stream_unlocked(
         await _checkpoint_progress(
             client, execution, state, namespace, phase="baselining",
             baseline_start_token=start, page_token=None, listing_complete=False,
-            last_error=None, last_attempt_at=_now(),
+            last_error=None, last_attempt_at=_now(), **_NO_TERMINAL_DRAIN,
         )
         progress = state.get_progress(namespace)
 
     if progress is not None:
         # A recovery that could not capture its start token is owed until it does: the flag is
         # durable, so a later run retries it even when local and remote state then agree.
+        # A stream still without a token here names a snapshot: it was enumerated with nothing to
+        # drain from. A token alone would not make that enumeration trustworthy, so it is rescanned
+        # from a token captured first — and is complete only after a drain from that token.
         needs_recovery = (
             (remote_v2 and not durable_remote_match) or _start_recovery_blocked(progress)
+            or _unstarted(progress)
         )
         if needs_recovery:
             try:
@@ -1910,7 +1988,7 @@ async def _drain_pending(
         if work.action == "remove":
             if not state.work_is_current(work):
                 continue
-            verdict = _cross_stream_removal(state, execution, work)
+            verdict = _cross_stream_removal(state, execution, source, work)
             if verdict == "claimed":
                 # Moved between two selected roots of this connection: only this stream's own
                 # membership ended, and that was recorded with the page. Nothing is removed.
@@ -1994,37 +2072,96 @@ async def _drain_pending(
 _CROSS_STREAM_PENDING = "cross-stream move unresolved"
 
 
-def _cross_stream_removal(state: StateStore, execution: GdriveExecution, work: PendingWork) -> str:
+def _document_loss_verified(source: GoogleDriveSource, file_id: str) -> bool:
+    """Whether the provider itself says one document is gone for this connection.
+
+    A removal a drive's change log reports is ambiguous while another stream cannot be read: the
+    document may have moved there. The document's own metadata, read under the run's fence, is
+    not. An explicit not-found — it was deleted, or the account no longer has access to it — and
+    a trashed document are absence whichever drive it was in. Anything else verifies nothing: it
+    is readable, so it is somewhere, or the read failed in a way that says nothing about it.
+    """
+    try:
+        meta = source._metadata(file_id)
+    except BrainError:
+        raise
+    except ProviderDeferred:
+        return False
+    except Exception as exc:
+        return _provider_status(exc) == 404
+    return bool(meta.get("trashed"))
+
+
+def _cross_stream_removal(
+    state: StateStore, execution: GdriveExecution, source: GoogleDriveSource, work: PendingWork,
+) -> str:
     """What one stream's removal means for a connection that consumes other streams too.
 
     ``removed_provider_ids`` removes a document for the whole connection. But a document — or a
     folder and everything under it — moved between selected roots in two drives is reported as
     removed by the drive it left and as present by the drive it entered, each in its own change
-    log, consumed in either order. So before a removal leaves this stream:
+    log, consumed in either order. So before a removal leaves this stream it is weighed against
+    every other stream of the roster — including one the brain holds and local state does not,
+    and the destination of a root that is still on its way:
 
       · ``claimed`` — another stream holds the document (in its published snapshot, in one it is
         building, or as an upsert it still owes). Only this stream's membership ended.
-      · ``withheld`` — no other stream holds it, but one may not have read that far: every other
-        stream is marked dirty once, and this obligation stays durable until each of them has
-        finished a drain that began after the mark. A restart changes none of that.
-      · ``absent`` — every other stream has, and none holds it. The removal is the connection's.
+      · ``withheld`` — no other stream holds it, but one may not have read that far. Each peer is
+        given a durable barrier when it is first known for this removal — at once, or runs later
+        when a relocation makes a new one — and the obligation stays until every peer has
+        finished a drain that began after its barrier. A peer with no barrier is one nothing is
+        known about, across any restart.
+      · ``absent`` — every peer has, and none holds it. The removal is the connection's.
+
+    A peer that cannot be read — it has no local state yet, holds no token, or waits on one for
+    its recovery — may never pass its barrier. Behind such a peer the removal stays withheld
+    while it is ambiguous, but the document itself is read: gone at the provider, it is absent
+    now, without waiting for a snapshot that peer may never complete.
 
     A connection with one stream has nothing to wait for: its removals are ``absent`` at once.
     """
     own = state.get_progress(work.namespace)
     connection_id = own.key.connection_id if own is not None else execution.integration_id
-    others = [
-        progress for progress in state.list_progress(connection_id, work.generation)
+    local = {
+        progress.key.drive_id: progress
+        for progress in state.list_progress(connection_id, work.generation)
         if progress.namespace != work.namespace
-    ]
-    if not others:
+    }
+    if own is None:
+        # No stream to name the peers from: only those local state itself holds are known.
+        peers = {drive_id: progress.key for drive_id, progress in local.items()}
+    else:
+        peers = {
+            drive_id: dataclasses.replace(own.key, drive_id=drive_id)
+            for drive_id in _stream_roster(
+                state, connection_id, work.generation, execution.progress,
+                configured=(execution.config or {}).get("sharedDriveIds") or (),
+            )
+            if drive_id != own.key.drive_id
+        }
+    if not peers:
         return "absent"
     if state.claimed_elsewhere(connection_id, work.generation, work.namespace, work.item_key):
         return "claimed"
-    if not str(work.last_error or "").startswith(_CROSS_STREAM_PENDING):
-        for other in others:
-            state.record_stream_hint(other.key)
-    elif all(state.pending_stream_hint(other.key) is None for other in others):
+    barriers: dict[str, str] = {}
+    for drive_id, key in peers.items():
+        barrier = state.removal_barrier(work, key)
+        if barrier == "missing" or (barrier == "passed" and drive_id not in local):
+            # No barrier yet — or one this peer passed before local state lost the stream, whose
+            # membership that drain was read into: either way there is no evidence about it now.
+            state.raise_removal_barrier(work, key, renew=True)
+            barrier = "standing"
+        barriers[drive_id] = barrier
+    if all(barrier == "passed" for barrier in barriers.values()):
+        return "absent"
+    unreadable = [
+        drive_id for drive_id, barrier in barriers.items()
+        if barrier != "passed" and (
+            local.get(drive_id) is None or _unstarted(local[drive_id])
+            or _start_recovery_blocked(local[drive_id])
+        )
+    ]
+    if unreadable and _document_loss_verified(source, work.item_key):
         return "absent"
     # Attempted again each run, behind retries that have waited less.
     state.fail_work(work, f"{_CROSS_STREAM_PENDING}: awaiting the other streams' next drain")
@@ -2194,7 +2331,7 @@ async def _checkpoint_start_unavailable(
     backlog and keeps the connection from reconciling, while the other streams still run.
     """
     progress = state.get_progress(namespace)
-    if progress is not None and progress.baseline_start_token:
+    if progress is not None and not _unstarted(progress):
         changes: dict[str, Any] = {"recovery_required": True}
     else:
         changes = {"baseline_start_token": None, "page_token": None, "listing_complete": False}

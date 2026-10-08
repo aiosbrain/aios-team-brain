@@ -179,7 +179,15 @@ re-verified the roots it now holds.
 If a selected root lives in a Shared Drive whose change log the account cannot open (the file was
 shared, the drive was not), that one stream is reported as `stream_start_unavailable` with the
 provider's 403/404, and is retried every run. The other streams keep syncing; the connection is
-not complete, and nothing is removed, until that drive can be read.
+not complete until that drive can be read.
+
+A document that one drive reports removed may only have moved into another selected folder, so a
+removal is held (`cross_stream_move_pending`) until every other stream of the connection has read
+past it — including a stream the brain knows about that this sidecar's local state does not, and
+the drive a moved folder is on its way to. While one of those streams cannot be read at all, the
+sidecar reads the document itself: if Google says it no longer exists, is trashed, or is no longer
+accessible to the connected account, it is removed from the brain right away; if it is still
+readable, or the read fails any other way, it stays until that stream recovers.
 
 A run has one absolute deadline. Brain writes and reconciliations never wait past it: a rate-limit
 or outage wait that does not fit is deferred to a later run with the retry time the brain gave, and
