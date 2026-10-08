@@ -543,6 +543,29 @@ export interface Barrier {
   conclude: (proven: boolean, reason: string) => void;
 }
 
+/**
+ * WHAT AN ACQUISITION CAME TO, told as it happens to whoever staged it — a SEAM for the harness's
+ * own tests.
+ *
+ * A test that stages a session under a run-safety state of its own has taken that session out of
+ * the real run's sight, and puts it on a marker of the real run instead. It cannot wait for the
+ * acquisition to hand it a session to do so: an acquisition that fails, or a test that dies inside
+ * one, hands out nothing — and may have opened a session all the same. So the acquisition itself
+ * says how far it got, synchronously, at the two moments that decide what is owed:
+ *
+ *   - `attempted`: BEFORE the connection is attempted, and after this scope's own marker was
+ *     recorded. From here on a session may exist. One that is never told this opened nothing;
+ *   - `identified`: once the session has said who it is AND the monitor has seen exactly that
+ *     backend, by the predicate that will later be asked to show it gone — before anything can
+ *     fail on its name, its transaction or its lock.
+ *
+ * Attempted and never identified is a session nobody can look for. That is not "no session".
+ */
+export interface AcquisitionWitness {
+  attempted: () => void;
+  identified: (backend: BackendIdentity) => void;
+}
+
 export interface BarrierOptions {
   /** Names the session and the scope, so a test can prove what became of them. */
   tag?: string;
@@ -550,14 +573,16 @@ export interface BarrierOptions {
   lockTimeoutMs?: number;
   /** SEAMS for the harness's own tests: another run-safety state, a shorter cleanup budget, a
    * replacement for closing the connection (to stage a barrier that survives its release, or a
-   * closing that is never acknowledged — `DisposeSeam`), the clock that closing is bounded on, and a
+   * closing that is never acknowledged — `DisposeSeam`), the clock that closing is bounded on, a
    * different `application_name` for its session (to stage one that cannot be found by its tag —
-   * what an `application_name` in the connection string does to every session). */
+   * what an `application_name` in the connection string does to every session), and someone to be
+   * told how far the acquisition got (`AcquisitionWitness`). */
   safety?: RunSafety;
   cleanupMs?: number;
   dispose?: DisposeSeam;
   clock?: EvidenceClock;
   applicationName?: string;
+  acquisition?: AcquisitionWitness;
 }
 
 const UNPROVEN_BARRIER: CleanupReport = { outcome: "unproven", barrierGone: false, signalled: [], operations: [] };
@@ -712,6 +737,8 @@ export async function holdLock(sql: string, params: unknown[] = [], opts: Barrie
   };
 
   try {
+    // A session may exist from here on: whoever staged this acquisition is told BEFORE it connects.
+    opts.acquisition?.attempted();
     await owner.connect();
     connected = true;
     // WHO this session is, from the session itself, before it begins or locks anything.
@@ -734,6 +761,9 @@ export async function holdLock(sql: string, params: unknown[] = [], opts: Barrie
       );
     }
     backendSeen = true;
+    // From here that exact backend is known to whoever staged this acquisition — before anything
+    // below can fail on its name, its transaction or its lock.
+    opts.acquisition?.identified({ pid, started: backend.started });
     if (self.name !== sessionName) {
       throw new RaceHarnessError(
         `barrier ${tag}: its session reports application_name ${JSON.stringify(self.name)}, not ${JSON.stringify(sessionName)} — `
@@ -811,12 +841,14 @@ export interface TestSession {
 
 export interface TestSessionOptions {
   /** SEAMS for the harness's own tests, as a barrier's (`BarrierOptions`): another run-safety state,
-   * a shorter budget for seeing the backend gone, and the clock its closing is bounded on. (There is
-   * no replacement for the closing here: the client is the test's, and a test that wants its `end`
-   * to do something else can make it so.) */
+   * a shorter budget for seeing the backend gone, the clock its closing is bounded on, and someone
+   * to be told how far the acquisition got (`AcquisitionWitness`). (There is no replacement for the
+   * closing here: the client is the test's, and a test that wants its `end` to do something else can
+   * make it so.) */
   safety?: RunSafety;
   cleanupMs?: number;
   clock?: EvidenceClock;
+  acquisition?: AcquisitionWitness;
 }
 
 /**
@@ -898,6 +930,8 @@ export async function openTestSession(name: string, opts: TestSessionOptions = {
   };
 
   try {
+    // A session may exist from here on: whoever staged this acquisition is told BEFORE it connects.
+    opts.acquisition?.attempted();
     await client.connect();
     connected = true;
     // WHO this session is, from the session itself, before the test is given it.
@@ -918,6 +952,8 @@ export async function openTestSession(name: string, opts: TestSessionOptions = {
       );
     }
     backendSeen = true;
+    // From here that exact backend is known to whoever staged this acquisition.
+    opts.acquisition?.identified({ pid, started: backend.started });
     let closed: Promise<void> | undefined;
     const close = (): Promise<void> => (closed ??= (async () => {
       if (!(await vanish())) throw stop("was closed");
@@ -959,14 +995,17 @@ export async function backendIdentity(pid: number): Promise<BackendIdentity> {
 }
 
 export interface RetireOptions {
-  /** Further absence the caller must SEE — a bounded evidence wait of its own (`untilBarrierGone`).
-   * One that rejects is absence not seen. */
+  /** Further absence the caller must SEE (`untilBarrierGone`, say). It is the caller's own wait, so
+   * nothing here trusts it to end: it is bounded as the one step it is, and one that rejects, is
+   * still pending at its deadline or resolves only at or after it is absence not seen. */
   absent?: () => Promise<unknown>;
   /** SEAMS for the harness's own tests, as a barrier's (`BarrierOptions`): another run-safety state,
-   * a shorter budget for seeing each backend gone, and the clock the closing is bounded on. */
+   * a shorter budget for seeing each backend gone, the clock the closing and `absent` are bounded
+   * on, and a shorter budget for `absent` (by default, that of one evidence wait). */
   safety?: RunSafety;
   cleanupMs?: number;
   clock?: EvidenceClock;
+  absentMs?: number;
 }
 
 /**
@@ -983,8 +1022,9 @@ export interface RetireOptions {
  *     acknowledged, and nothing read afterwards proves it for it;
  *   - then every one of `backends` must be SEEN gone, each within `cleanupMs` — that exact backend,
  *     its pid and when it started. A `null` among them is a session that never said who it is: there
- *     is no backend to look for, and "nothing to look for" is not "nothing there";
- *   - then `absent`, if the caller has more to see.
+ *     is no backend to look for, and "nothing to look for" is not "nothing there". An EMPTY list is
+ *     not that: a caller that acquired nothing has nothing to be seen gone, and is not refused for it;
+ *   - then `absent`, if the caller has more to see — within a deadline of its own.
  *
  * This resolves only when all of that held. Otherwise the run is stopped — sticky, so nothing later
  * undoes it — and this rejects. It clears no marker either way: the caller removes its own only
@@ -1014,8 +1054,11 @@ export async function retireSessions(
       throw stop(`was closed, but its backend ${backend.pid} (started ${backend.started}) was not seen gone`);
     }
   }
-  if (opts.absent && !(await attempt(opts.absent).then(() => true, () => false))) {
-    throw stop("was closed, but what was to be seen absent after it was not");
+  // WHAT ELSE WAS TO BE SEEN ABSENT has a deadline of its own, like every other step here. It is
+  // the caller's wait: awaited as it comes, one that never ended would leave this — and the test
+  // that asked for it — pending for good, with the run neither stopped nor cleared.
+  if (opts.absent && !(await fulfilledWithin(clock, attempt(opts.absent), opts.absentMs ?? DEFAULT_BOUNDS.pollMs))) {
+    throw stop("was closed, but what was to be seen absent after it was not seen in time");
   }
 }
 
