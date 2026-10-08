@@ -19,9 +19,9 @@ import {
   type SlackKnownRootPreparationResult,
   type SlackKnownRootReceipt,
 } from "@/lib/ingest/slack-known-root-requeue";
-import { prepareNewSlackChannelNamespace } from "@/lib/ingest/slack-namespace-gate";
+import { invalidateSlackNamespaceGate, prepareNewSlackChannelNamespace } from "@/lib/ingest/slack-namespace-gate";
 import { slackPublicationOption } from "@/lib/ingest/slack-publication";
-import { lockSlackSelection, slackBindingRef } from "@/lib/ingest/slack-source-binding";
+import { lockSlackSelection, resolveEnvSlackToken, slackBindingRef } from "@/lib/ingest/slack-source-binding";
 import { discoverSlackSource } from "@/lib/ingest/slack-source-discovery";
 import {
   checkpointSlackThread,
@@ -36,6 +36,7 @@ import { parseSlackTimestamp, type SlackEvidenceUser } from "@/lib/ingest/source
 import { scopedSlackItemPath } from "@/lib/ingest/sources/slack-namespace";
 import { normalizeThread } from "@/lib/ingest/sources/slack-normalize";
 import { runContextTransaction, transactionCapability } from "@/lib/projects/context/transaction";
+import { encryptSecret } from "@/lib/secrets/crypto";
 import { db, ingest, seedTeam, transactionSessionDecoratedDb, type Seed } from "./helpers";
 import {
   authTestBody,
@@ -6696,5 +6697,720 @@ describe("KR-10 a failed page read supplies no continuation", () => {
     expect(await enumTraverse(teamId, 2, 5), "after every injected failure the whole traversal is the undisturbed one").toEqual(expected);
     expect(await lifecycleSnapshot(teamId), "no injected failure, and no read, changed a row of any snapshotted surface").toEqual(before);
     expect(await lifecycleQueueAndStagingAnywhere(), "no pending work and no staging was created").toEqual({ queue: [], staging: [] });
+  });
+});
+
+// ── THE AUTHORITY INVALIDATION EVIDENCE PACKET ───────────────────────────────────────────────────
+//
+// New, file-local helpers and four suites. No earlier helper, constant or case is moved or changed;
+// three names were added to this file's import statements. No KR-17 hook is involved in any of
+// these selections.
+
+/**
+ * KR-09 — an entry enumerated BEFORE an authoritative change is refused after it, and nothing is
+ * written (`docs/design/slack-known-root-requeue-spec.md` §4.1, §5.1, §11 KR-09 and its two fixture
+ * notes, §12 M6a and M6b).
+ *
+ * EVIDENCE, NOT RED: every case of the four suites below is expected to pass on the current source.
+ * They are evidence to be audited later; none of them declares KR-09 complete.
+ *
+ * THE SHAPE OF EVERY CASE. A root is published by the real discovery, readiness, staging and
+ * `ingestItem` publication. Its root witness alone is aged by fixture DML, so that a preparation
+ * which is NOT refused would enqueue: a refusal is therefore never "not due" in disguise. The real
+ * enumeration returns its one located entry, which is kept, with its bytes. ONE authoritative fact
+ * is then changed. Preparation is given the team, that old entry and an ordinary execution context,
+ * and nothing else. Required: the exact closed result; no snapshotted row changed by the
+ * preparation; no queue row and no staging in any team; the entry byte-identical.
+ *
+ * WHAT IS REPORTED, AND WHAT IS NOT. Every value handed to an assertion here is a fixed label, a
+ * closed outcome or reason name, a table name, a count or a boolean. A snapshot is a per-table row
+ * count and digest COMPUTED BY THE DATABASE: no row content, token, ciphertext, fingerprint,
+ * revision, path or id is read into an assertion, and a comparison of two such values is reported
+ * as the names of the tables that differ. Tokens, ciphertext, fingerprints and revisions that a
+ * fixture must hold are held privately and only ever compared with each other. A preparation that
+ * throws is reported as the exported classifier's closed failure category.
+ *
+ * FIXTURE DML IS LABELED, AND IS NOT A PRODUCT PATH. Each change is one statement on one fact, so
+ * that the refusal can be attributed to it; the surfaces it altered are read back and must be
+ * exactly the ones it is meant to alter. None of these statements is an approved way to disable,
+ * edit, rotate or repair anything.
+ */
+type AuthorityLocatedEntry = Extract<SlackKnownRootEntry, { locator: unknown }>;
+/** How one preparation ENDED: its closed result, or the closed category of what it threw. */
+type AuthorityEnded = SlackKnownRootPreparationResult | { threw: string };
+
+interface AuthorityFixture {
+  teamId: string;
+  integrationId: string;
+  /** The entry the real enumeration returned BEFORE any change, and the bytes it had then. */
+  entry: AuthorityLocatedEntry;
+  entryBytes: string;
+}
+
+const AUTHORITY_NOTHING_PENDING = { queue_rows: 0, staged_snapshots: 0 };
+const AUTHORITY_ONE_QUEUE_ROW = { queue_rows: 1, staged_snapshots: 0 };
+/** Queue rows and staged snapshots in the DATABASE, of any team, as counts. */
+const authorityPendingCounts = async (): Promise<Row> => (await query(
+  `select (select count(*)::int from slack_sync_threads) as queue_rows,
+          (select count(*)::int from slack_thread_snapshots) as staged_snapshots`
+))[0];
+
+/**
+ * Every row of the team in every surface a preparation must not touch — the lifecycle packet's list:
+ * queue and staging, items and versions, ledger, identity, access, generations, channel and source
+ * authority, namespace gate and readiness proofs, budgets and runs — as ONE row count and ONE digest
+ * per table, both computed by the database. Nothing of a row leaves it.
+ */
+async function authorityDigests(teamId: string): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
+  for (const table of LIFECYCLE_SNAPSHOT_TABLES) {
+    const [row] = await query<{ rows: number; digest: string }>(
+      `select count(*)::int as rows,
+              md5(coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text), '[]'::jsonb)::text) as digest
+         from "${table}" t where t.team_id = $1`, [teamId]
+    );
+    out[table] = `${row.rows}:${row.digest}`;
+  }
+  const [versions] = await query<{ rows: number; digest: string }>(
+    `select count(*)::int as rows,
+            md5(coalesce(jsonb_agg(to_jsonb(v) order by to_jsonb(v)::text), '[]'::jsonb)::text) as digest
+       from item_versions v join items i on i.id = v.item_id where i.team_id = $1`, [teamId]
+  );
+  out.item_versions = `${versions.rows}:${versions.digest}`;
+  return out;
+}
+/** The NAMES of the tables whose count or digest differs. */
+const authorityTablesThatDiffer = (from: Record<string, string>, to: Record<string, string>): string[] =>
+  Object.keys(from).filter((table) => from[table] !== to[table]).sort();
+
+/**
+ * FIXTURE AGING of the published root's exact root witness, by two hours, and then the real
+ * enumeration: exactly one located entry, in the published root's exact scope, which is returned
+ * with the bytes it has now.
+ */
+async function authorityRoot(label: string, f: Published): Promise<AuthorityFixture> {
+  const teamId = f.seed.teamId;
+  const aged = await (await rawSql()).query(
+    `update slack_messages w set observed_at = w.observed_at - interval '2 hours' where ${LIFECYCLE_ROOT_WITNESS}`, lifecycleWitnessOf(f)
+  );
+  expect(aged.rowCount, `${label}: fixture aging: exactly one ledger row, the root witness, was changed`).toBe(1);
+  expect(await authorityPendingCounts(), `${label}: fixture: the real publication left no queue row and no staging`).toEqual(AUTHORITY_NOTHING_PENDING);
+
+  const page = await enumPage(teamId, 100);
+  const entry = page.entries[0];
+  expect([page.entries.length, page.examined, page.exhausted, page.nextCursor === null, entry !== undefined && "locator" in entry],
+    `${label}: fixture: the real enumeration returns exactly one entry, located, and the range ends`).toEqual([1, 1, true, true, true]);
+  if (entry === undefined || !("locator" in entry)) throw new Error("fixture: the enumeration returned no located entry");
+  expect([
+    entry.teamId === teamId.toLowerCase(), entry.itemId === f.itemId.toLowerCase(), entry.revisitAfterMs === REVISIT_AFTER_MS,
+    entry.locator.workspaceId === WORKSPACE, entry.locator.channelId === CHANNEL, entry.locator.rootTs === OLD_ROOT,
+    entry.locator.integrationId === f.integrationId.toLowerCase(), entry.locator.namespaceRevision === f.namespaceRevision,
+    /^[0-9a-f]{64}$/.test(entry.locator.bindingConfigRevision),
+  ], `${label}: fixture: the entry is the published root's, in its exact scope, with the integration, namespace revision and a configuration revision of the fixture`)
+    .toEqual([true, true, true, true, true, true, true, true, true]);
+  return { teamId, integrationId: f.integrationId, entry, entryBytes: JSON.stringify(entry) };
+}
+
+/** Preparation on a transaction of its own, from the team and one entry ALONE, as one closed value. */
+function authorityPrepared(teamId: string, entry: SlackKnownRootEntry): Promise<AuthorityEnded> {
+  // The execution context is created BEFORE the transaction it is used in.
+  const execution = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+  return tx((s) => prepareSlackKnownRootRequeue(s, { teamId, entry }, execution)).then(
+    (result): AuthorityEnded => result,
+    (error: unknown): AuthorityEnded => ({ threw: classifySlackKnownRootPreparationFailure(error) })
+  );
+}
+
+/**
+ * What every refusal here requires: the exact closed result of preparing the OLD entry; no row of any
+ * snapshotted surface changed by that preparation; no queue row and no staging in any team; and the
+ * entry byte-identical. `resultLabel` names the first assertion when a later mutation run must find it.
+ */
+async function authorityRefusedWithNothingWritten(
+  fx: AuthorityFixture, label: string, expected: SlackKnownRootPreparationResult, resultLabel?: string
+): Promise<void> {
+  const before = await authorityDigests(fx.teamId);
+  const ended = await authorityPrepared(fx.teamId, fx.entry);
+  expect(ended, resultLabel ?? `${label}: the entry enumerated before the change is refused with the exact closed reason`).toEqual(expected);
+  expect(authorityTablesThatDiffer(before, await authorityDigests(fx.teamId)), `${label}: the refused preparation changed no row of any snapshotted surface`).toEqual([]);
+  expect(await authorityPendingCounts(), `${label}: nothing was enqueued and nothing is staged, in any team`).toEqual(AUTHORITY_NOTHING_PENDING);
+  expect(JSON.stringify(fx.entry) === fx.entryBytes, `${label}: the entry handed to preparation is byte-identical to the one enumeration returned`).toBe(true);
+}
+
+/** Whether each named environment variable is present, and its value. PRIVATE: never handed to an assertion. */
+const authorityEnvironmentState = (names: readonly string[]): { present: boolean; value: string | undefined }[] =>
+  names.map((name) => ({ present: Object.prototype.hasOwnProperty.call(process.env, name), value: process.env[name] }));
+
+/**
+ * Run with the named environment variables under the test's control, and put each back EXACTLY as it
+ * was — present with its value, or absent — in `finally`, whatever the run did.
+ */
+async function authorityWithEnvironment<T>(names: readonly string[], run: () => Promise<T>): Promise<T> {
+  const saved = authorityEnvironmentState(names);
+  try {
+    return await run();
+  } finally {
+    names.forEach((name, index) => {
+      const { present, value } = saved[index];
+      if (present) process.env[name] = value as string;
+      else delete process.env[name];
+    });
+  }
+}
+/** One boolean per variable: it is, now, exactly as `saved` recorded it. */
+const authorityEnvironmentIsAs = (names: readonly string[], saved: readonly { present: boolean; value: string | undefined }[]): boolean[] =>
+  authorityEnvironmentState(names).map((now, index) => now.present === saved[index].present && now.value === saved[index].value);
+
+/**
+ * KR-09 — ten single-fact changes, each its own fixture and its own reported case, and one control.
+ *
+ * THE CONTROL: the same fixture with NO change. Its entry is enqueued. So each refusal below is the
+ * doing of the one fact that case changed, and not of the fixture.
+ *
+ * THE REASON EACH CHANGE MUST GIVE is the one §5.1's order gives: the namespace gate first, then the
+ * integration's current selection, then the binding row, then the channel row.
+ *
+ *   disabled, deleted, deselected, configuration revision moved   `source_not_current`
+ *   binding at another revision, no longer verified, other workspace   `binding_changed`
+ *   channel row deleted                                                `binding_changed`
+ *   channel private, channel public state unknown                      `channel_not_public`
+ *
+ * NOT HERE: the token and the namespace gate, which are the three suites below; a second integration
+ * taking the channel over; and an invalid app id on a verified binding.
+ */
+describe("KR-09 authority invalidation between enumeration and preparation", () => {
+  interface AuthorityChange {
+    /** A fixed label. It is the only thing of the case that is reported. */
+    name: string;
+    /** FIXTURE DML: one statement, which must write exactly one row. */
+    sql: string;
+    params: (fx: AuthorityFixture) => unknown[];
+    /** The snapshotted surfaces the statement must alter, and those it may alter besides. */
+    mustChange: string[];
+    mayChange: string[];
+    expected: SlackKnownRootPreparationResult;
+  }
+  const integration = (fx: AuthorityFixture): unknown[] => [fx.teamId, fx.integrationId];
+  const channel = (fx: AuthorityFixture): unknown[] => [fx.teamId, WORKSPACE, CHANNEL];
+  const ITS_INTEGRATION = `where team_id = $1 and id = $2::uuid`;
+  const ITS_BINDING = `where team_id = $1 and integration_id = $2::uuid`;
+  const ITS_CHANNEL = `where team_id = $1 and workspace_id = $2 and channel_id = $3`;
+  const SOURCE_NOT_CURRENT: SlackKnownRootPreparationResult = { outcome: "refused", reason: "source_not_current" };
+  const BINDING_CHANGED: SlackKnownRootPreparationResult = { outcome: "refused", reason: "binding_changed" };
+  const CHANNEL_NOT_PUBLIC: SlackKnownRootPreparationResult = { outcome: "refused", reason: "channel_not_public" };
+
+  const CHANGES: AuthorityChange[] = [
+    {
+      name: "the integration is disabled",
+      sql: `update integrations set status = 'disabled' ${ITS_INTEGRATION}`, params: integration,
+      mustChange: ["integrations"], mayChange: [], expected: SOURCE_NOT_CURRENT,
+    },
+    {
+      // The binding goes with it, the channel row loses its binder, and a budget row keyed on the integration may go too.
+      name: "the integration is deleted",
+      sql: `delete from integrations ${ITS_INTEGRATION}`, params: integration,
+      mustChange: ["integrations", "slack_integration_bindings", "slack_sync_channels"], mayChange: ["slack_method_budgets"], expected: SOURCE_NOT_CURRENT,
+    },
+    {
+      name: "the channel is deselected in the integration's configuration",
+      sql: `update integrations set config = jsonb_set(config, '{channelIds}', '[]'::jsonb) ${ITS_INTEGRATION}`, params: integration,
+      mustChange: ["integrations"], mayChange: [], expected: SOURCE_NOT_CURRENT,
+    },
+    {
+      // What an ordinary edit of the integration does to the revision: its updated_at moves. Status, type and selection are as they were.
+      name: "the integration's configuration revision has moved",
+      sql: `update integrations set updated_at = updated_at + interval '1 microsecond' ${ITS_INTEGRATION}`, params: integration,
+      mustChange: ["integrations"], mayChange: [], expected: SOURCE_NOT_CURRENT,
+    },
+    {
+      // A synthetic revision of sixty-four zeros: valid in shape, and no revision of this fixture.
+      name: "the binding is recorded at another configuration revision",
+      sql: `update slack_integration_bindings set config_revision = repeat('0', 64) ${ITS_BINDING}`, params: integration,
+      mustChange: ["slack_integration_bindings"], mayChange: [], expected: BINDING_CHANGED,
+    },
+    {
+      // The shape the binding writer's own invalidation leaves: awaiting auth, with every proved identity cleared.
+      name: "the binding is no longer verified",
+      sql: `update slack_integration_bindings set state = 'pending_auth', workspace_id = null, app_id = null, bot_id = null, workspace_url = null ${ITS_BINDING}`, params: integration,
+      mustChange: ["slack_integration_bindings"], mayChange: [], expected: BINDING_CHANGED,
+    },
+    {
+      name: "the binding's stored workspace is another workspace",
+      sql: `update slack_integration_bindings set workspace_id = 'T0SOURCE2' ${ITS_BINDING}`, params: integration,
+      mustChange: ["slack_integration_bindings"], mayChange: [], expected: BINDING_CHANGED,
+    },
+    {
+      name: "the channel's stored public state is private",
+      sql: `update slack_sync_channels set public_state = 'private' ${ITS_CHANNEL}`, params: channel,
+      mustChange: ["slack_sync_channels"], mayChange: [], expected: CHANNEL_NOT_PUBLIC,
+    },
+    {
+      name: "the channel's stored public state is unknown",
+      sql: `update slack_sync_channels set public_state = 'unknown', public_checked_at = null ${ITS_CHANNEL}`, params: channel,
+      mustChange: ["slack_sync_channels"], mayChange: [], expected: CHANNEL_NOT_PUBLIC,
+    },
+    {
+      name: "the channel row is deleted",
+      sql: `delete from slack_sync_channels ${ITS_CHANNEL}`, params: channel,
+      mustChange: ["slack_sync_channels"], mayChange: [], expected: BINDING_CHANGED,
+    },
+  ];
+
+  it("enqueues the same fixture's entry when nothing has changed (control)", async () => {
+    const label = "KR-09 control: nothing changed";
+    const fx = await authorityRoot(label, await publishOldRoot());
+    const before = await authorityDigests(fx.teamId);
+
+    expect(await authorityPrepared(fx.teamId, fx.entry), `${label}: the entry is enqueued: the fixture is preparable as it stands`).toEqual({ outcome: "enqueued" });
+    expect(authorityTablesThatDiffer(before, await authorityDigests(fx.teamId)), `${label}: of the snapshotted surfaces only the queue changed`).toEqual(["slack_sync_threads"]);
+    expect(await authorityPendingCounts(), `${label}: one queue row, nothing staged`).toEqual(AUTHORITY_ONE_QUEUE_ROW);
+    expect(JSON.stringify(fx.entry) === fx.entryBytes, `${label}: the entry is byte-identical`).toBe(true);
+  });
+
+  it.each(CHANGES.map((change): [string, AuthorityChange] => [change.name, change]))(
+    "refuses the entry enumerated before the change with its exact closed reason, and writes nothing, after: %s", async (name, change) => {
+      const label = `KR-09: ${name}`;
+      const fx = await authorityRoot(label, await publishOldRoot());
+      const beforeTheChange = await authorityDigests(fx.teamId);
+
+      // ── THE ONE AUTHORITATIVE CHANGE, by labeled fixture DML, between enumeration and preparation. ──
+      const written = await (await rawSql()).query(change.sql, change.params(fx));
+      expect(written.rowCount, `${label}: fixture: the change wrote exactly one row`).toBe(1);
+      const altered = authorityTablesThatDiffer(beforeTheChange, await authorityDigests(fx.teamId));
+      expect({
+        surfaces_it_must_alter_and_did_not: change.mustChange.filter((table) => !altered.includes(table)),
+        surfaces_it_altered_and_must_not: altered.filter((table) => !change.mustChange.includes(table) && !change.mayChange.includes(table)),
+      }, `${label}: fixture: the change altered exactly the surfaces it is meant to alter`).toEqual({
+        surfaces_it_must_alter_and_did_not: [], surfaces_it_altered_and_must_not: [],
+      });
+
+      await authorityRefusedWithNothingWritten(fx, label, change.expected);
+    }
+  );
+});
+
+/**
+ * KR-09 and the permanent fixture of M6a — a STORED-SECRET rotation that preserves the configuration
+ * revision (`docs/design/slack-known-root-requeue-spec.md` §11 "Stored-secret rotation fixture", §12 M6a).
+ *
+ * The specification's fixture, step by step. A synthetic 32-byte `SECRETS_KEY` is installed for the
+ * whole case, and whatever was there before — present with its value, or absent — is put back in
+ * `finally`. Under that key the real integration writer encrypts synthetic token A with the real
+ * crypto helper; the real discovery, readiness and publication build the binding, the channel and
+ * the gate for it; the real enumeration returns the entry; and the real `lockSlackSelection`, on a
+ * transaction of its own, gives the authoritative selection, which is kept privately.
+ *
+ * THE ROTATION is one statement and nothing else: `update integrations set secret_ciphertext = …`
+ * to a real encryption of a distinct synthetic token B. It is explicitly synthetic fixture
+ * construction, NOT an approved rotation path. Read back afterwards, as booleans: `updated_at` is
+ * the same to the microsecond; every column of the row but the secret is the same; no other
+ * snapshotted surface — binding, channel, gate, readiness proof, item, ledger — changed; and the
+ * real selection has the SAME configuration revision, still selects the channel, still takes its
+ * token from the stored secret, and has a DIFFERENT effective-token fingerprint.
+ *
+ * So everything §5.1 requires is still true except one: the binding's fingerprint is no longer the
+ * current token's. The entry enumerated before the rotation must be refused as `binding_changed`,
+ * at the assertion labeled `M6a: …`, and nothing may be written. A preparation that had lost ONLY
+ * the fingerprint comparison would find nothing else wrong, and — the witness being overdue — would
+ * return `enqueued` there.
+ *
+ * THE CONTROL closes the argument from the other side: the ORIGINAL ciphertext is written back, the
+ * real selection's fingerprint is the first one again, and the SAME entry is enqueued.
+ *
+ * No token, ciphertext, fingerprint or revision is ever handed to an assertion.
+ */
+describe("KR-09 stored-secret rotation with the configuration revision preserved (M6a)", () => {
+  /** A synthetic 32-byte key, base64. Not a secret: thirty-two bytes of one fixed value. */
+  const SYNTHETIC_SECRETS_KEY = Buffer.alloc(32, 0x4b).toString("base64");
+  /** Synthetic token B. Token A is the one the publication fixture stores. */
+  const ROTATED_SYNTHETIC_TOKEN = "xoxb-synthetic-known-root-rotated";
+  const ENVIRONMENT = ["SECRETS_KEY"];
+
+  it("refuses the entry enumerated before the rotation as binding_changed and writes nothing when only the stored secret changed, and enqueues that entry once the original secret is back (KR-09, M6a)", async () => {
+    const label = "stored-secret rotation";
+    const environmentBefore = authorityEnvironmentState(ENVIRONMENT);
+
+    await authorityWithEnvironment(ENVIRONMENT, async () => {
+      process.env.SECRETS_KEY = SYNTHETIC_SECRETS_KEY;
+      // Token A is encrypted, by the real writer and the real crypto helper, under the synthetic key.
+      const fx = await authorityRoot(label, await publishOldRoot());
+      const integration = [fx.teamId, fx.integrationId];
+      /** The authoritative selection, through the real lock, on a completed transaction of its own. PRIVATE. */
+      const selection = async () => {
+        const read = await tx((s) => lockSlackSelection(s, { teamId: fx.teamId, integrationId: fx.integrationId }));
+        if (read.outcome !== "current") throw new Error("fixture: the integration's selection is not current");
+        return read.selection;
+      };
+      /** The integration row, as digests and booleans computed by the database. PRIVATE but for the booleans. */
+      const row = async () => (await query<{ updated_at_utc: string; all_but_the_secret: string; secret: string | null; has_secret: boolean }>(
+        `select to_char(i.updated_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as updated_at_utc,
+                md5((to_jsonb(i) - 'secret_ciphertext')::text) as all_but_the_secret,
+                md5(i.secret_ciphertext) as secret, i.secret_ciphertext is not null as has_secret
+           from integrations i where i.team_id = $1 and i.id = $2::uuid`, integration
+      ))[0];
+
+      const selectedBefore = await selection();
+      const rowBefore = await row();
+      expect({
+        token_source: selectedBefore.tokenSource,
+        has_a_stored_secret: rowBefore.has_secret,
+        the_entry_carries_the_real_configuration_revision: selectedBefore.configRevision === fx.entry.locator.bindingConfigRevision,
+        channel_selected: selectedBefore.channelIds.includes(CHANNEL),
+      }, `${label}: fixture: before the rotation the token is the stored secret, and the entry's revision is the real selection's`).toEqual({
+        token_source: "integration_secret", has_a_stored_secret: true, the_entry_carries_the_real_configuration_revision: true, channel_selected: true,
+      });
+      // PRIVATE: the original ciphertext, kept only to be written back for the control.
+      const [{ original }] = await query<{ original: string }>(`select secret_ciphertext as original from integrations where team_id = $1 and id = $2::uuid`, integration);
+      const beforeTheRotation = await authorityDigests(fx.teamId);
+
+      // ── THE ROTATION: this one statement, and nothing else. SYNTHETIC FIXTURE CONSTRUCTION. ──
+      const rotated = await (await rawSql()).query(
+        `update integrations set secret_ciphertext = $3 where team_id = $1 and id = $2::uuid`, [...integration, encryptSecret(ROTATED_SYNTHETIC_TOKEN)]
+      );
+      expect(rotated.rowCount, `${label}: fixture: the rotation wrote exactly one row`).toBe(1);
+
+      // ── READBACK: only the secret moved. ──
+      const rowAfter = await row();
+      const selectedAfter = await selection();
+      expect(authorityTablesThatDiffer(beforeTheRotation, await authorityDigests(fx.teamId)), `${label}: fixture: the rotation altered the integration row and no other snapshotted surface`).toEqual(["integrations"]);
+      expect({
+        updated_at_unchanged_to_the_microsecond: rowAfter.updated_at_utc === rowBefore.updated_at_utc,
+        every_column_but_the_secret_unchanged: rowAfter.all_but_the_secret === rowBefore.all_but_the_secret,
+        stored_secret_changed: rowAfter.secret !== rowBefore.secret,
+        still_has_a_stored_secret: rowAfter.has_secret,
+      }, `${label}: fixture: of the integration row only the stored secret changed`).toEqual({
+        updated_at_unchanged_to_the_microsecond: true, every_column_but_the_secret_unchanged: true, stored_secret_changed: true, still_has_a_stored_secret: true,
+      });
+      expect({
+        token_source: selectedAfter.tokenSource,
+        configuration_revision_unchanged: selectedAfter.configRevision === selectedBefore.configRevision,
+        channel_still_selected: selectedAfter.channelIds.includes(CHANNEL),
+        effective_token_fingerprint_changed: selectedAfter.tokenFingerprint !== selectedBefore.tokenFingerprint,
+      }, `${label}: fixture: the real selection has the same configuration revision and a different effective token`).toEqual({
+        token_source: "integration_secret", configuration_revision_unchanged: true, channel_still_selected: true, effective_token_fingerprint_changed: true,
+      });
+
+      // ── THE OLD ENTRY IS REFUSED, AND NOTHING IS WRITTEN. ──
+      await authorityRefusedWithNothingWritten(fx, label, { outcome: "refused", reason: "binding_changed" },
+        "M6a: after only the stored secret was rotated, with the configuration revision preserved, the entry enumerated before the rotation is refused as binding_changed and is not enqueued");
+
+      // ── CONTROL: the original ciphertext written back. The same entry is enqueued. ──
+      const restored = await (await rawSql()).query(`update integrations set secret_ciphertext = $3 where team_id = $1 and id = $2::uuid`, [...integration, original]);
+      expect(restored.rowCount, `${label}: control: the original stored secret was written back to exactly one row`).toBe(1);
+      const selectedAgain = await selection();
+      expect([selectedAgain.tokenFingerprint === selectedBefore.tokenFingerprint, selectedAgain.configRevision === selectedBefore.configRevision],
+        `${label}: control: the real selection has the first effective token and the same configuration revision again`).toEqual([true, true]);
+      expect(await authorityPrepared(fx.teamId, fx.entry), `${label}: control: with the original secret back the same entry is enqueued, so every other authority fact was valid throughout`).toEqual({ outcome: "enqueued" });
+      expect(await authorityPendingCounts(), `${label}: control: one queue row, nothing staged`).toEqual(AUTHORITY_ONE_QUEUE_ROW);
+      expect(JSON.stringify(fx.entry) === fx.entryBytes, `${label}: the entry is byte-identical throughout`).toBe(true);
+    });
+
+    expect(authorityEnvironmentIsAs(ENVIRONMENT, environmentBefore), `${label}: SECRETS_KEY is exactly as it was before the case: present with its value, or absent`).toEqual([true]);
+  });
+});
+
+/**
+ * KR-09 — an ENVIRONMENT-FALLBACK token rotation, with no stored ciphertext
+ * (`docs/design/slack-known-root-requeue-spec.md` §5.1, §11 "Stored-secret rotation fixture", last paragraph).
+ *
+ * Both spellings of the fallback variable, `SLACK_BOT_TOKEN` and `slack_bot_token`, are under this
+ * case's control and are put back EXACTLY — present with its value, or absent — in `finally`. The
+ * integration is created with NO secret. Discovery, readiness, the selection and the publication
+ * all resolve the token the product's own way, from the environment: no `envToken` override is
+ * passed anywhere in this case, and preparation has none to pass.
+ *
+ * WHAT IS SHOWN, each step read through the real `resolveEnvSlackToken` and the real
+ * `lockSlackSelection`, and reported as booleans:
+ *
+ *   precedence     with both spellings set to different tokens, the upper-case one is effective;
+ *   not a rotation changing ONLY the lower-case spelling leaves the effective token as it was;
+ *   rotation       changing the upper-case spelling changes the effective token, with the
+ *                  configuration revision and the integration row unchanged — the old entry is
+ *                  refused as `binding_changed`;
+ *   fallback       with the upper-case spelling REMOVED the lower-case one becomes effective, which
+ *                  is again another token — refused as `binding_changed`;
+ *   no token       with both removed there is no token at all — refused as `source_not_current`;
+ *   control        with the first token back in the upper-case spelling, the same entry is enqueued.
+ *
+ * No fingerprint is compared with a constant of this file: every comparison is between two values
+ * the real resolution returned.
+ */
+describe("KR-09 environment-fallback token rotation", () => {
+  const UPPER = "SLACK_BOT_TOKEN";
+  const LOWER = "slack_bot_token";
+  const ENVIRONMENT = [UPPER, LOWER];
+  const FIRST_TOKEN = "xoxb-synthetic-environment-first";
+  const LOWER_ALIAS_TOKEN = "xoxb-synthetic-environment-lower-alias";
+  const OTHER_LOWER_ALIAS_TOKEN = "xoxb-synthetic-environment-lower-alias-changed";
+  const ROTATED_TOKEN = "xoxb-synthetic-environment-rotated";
+
+  /**
+   * `publishOldRoot` for an integration with NO stored secret: the same real steps, with the token
+   * resolved from the environment by the product itself at every one of them.
+   */
+  async function publishedFromTheEnvironmentToken(): Promise<Published> {
+    const seed = await seedTeam();
+    const integrationId = await seedSlackIntegration(seed, { channelIds: [CHANNEL] });
+    const fake = fakeSlack({
+      "auth.test": () => slackJson(authTestBody({ app_id: "A0SOURCE1" })),
+      "conversations.info": () => slackJson(channelInfoBody(CHANNEL)),
+      "conversations.history": () => slackJson(historyBody({ messages: [] })),
+    });
+    const discovered = await discoverSlackSource({ db: db(), teamId: seed.teamId, integrationId }, { fetchImpl: fake.impl });
+    if (discovered.binding?.state !== "verified") throw new Error("fixture: the binding did not verify from the environment token");
+    const gate = await tx((s) => prepareNewSlackChannelNamespace(s, { teamId: seed.teamId, rawChannelId: CHANNEL }));
+    if (gate.outcome !== "ready") throw new Error("fixture: the namespace is not ready");
+    const selection = await tx((s) => lockSlackSelection(s, { teamId: seed.teamId, integrationId }));
+    if (selection.outcome !== "current") throw new Error("fixture: the selection is not current");
+
+    const scope = { teamId: seed.teamId, workspaceId: WORKSPACE, channelId: CHANNEL, rootTs: OLD_ROOT };
+    await tx((s) => enqueueSlackThread(s, scope));
+    const acquired = await tx((s) => claimSlackThread(s, scope, { leaseMs: 900_000 }));
+    if (!acquired) throw new Error("fixture: the claim was refused");
+    const staged = await tx(async (s) => {
+      const written = await writeSlackThreadSnapshot(s, acquired, {
+        messages: [ROOT_MESSAGE, REPLY_MESSAGE], complete: true, expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      });
+      if (written !== "written") throw new Error("fixture: the snapshot was refused");
+      return checkpointSlackThread(s, acquired, { pageCursor: null, snapshotGeneration: 1 });
+    });
+    if (staged.outcome !== "checkpointed") throw new Error("fixture: the checkpoint was refused");
+    const claim: SlackThreadClaim = { ...acquired, snapshotGeneration: 1 };
+    const option = slackPublicationOption({
+      claim, binding: slackBindingRef(selection.selection), namespaceRevision: gate.gate.revision, channelName: "general", users: USERS,
+    });
+    const normalized = normalizeThread({ root: ROOT_MESSAGE, replies: [REPLY_MESSAGE] }, {
+      channelId: CHANNEL, channelName: "general", users: { U1: "Person One" }, project: "slack",
+    });
+    const payload = {
+      ...normalized,
+      path: scopedSlackItemPath(WORKSPACE, CHANNEL, OLD_ROOT),
+      frontmatter: { ...normalized.frontmatter, workspace_id: WORKSPACE, source_ts: parseSlackTimestamp(OLD_ROOT)!.iso },
+    };
+    const auth = { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: randomUUID() };
+    const published = await ingestItem(db(), auth, payload, "team", { authorMemberId: null }, "team", option);
+    if ((published as { status?: unknown }).status !== "created") throw new Error("fixture: the real publication did not create the item");
+    const items = await query<{ id: string }>(`select id::text as id from items where team_id = $1 and path = $2`, [
+      seed.teamId, scopedSlackItemPath(WORKSPACE, CHANNEL, OLD_ROOT),
+    ]);
+    if (items.length !== 1) throw new Error("fixture: there is not exactly one canonical item");
+    return { seed, integrationId, fake, itemId: items[0].id, namespaceRevision: gate.gate.revision, answerHistory: () => undefined };
+  }
+
+  it("resolves the upper-case spelling first, refuses the entry enumerated before the effective token changed and writes nothing, and enqueues that entry once the first token is back (KR-09)", async () => {
+    const label = "environment-fallback rotation";
+    const environmentBefore = authorityEnvironmentState(ENVIRONMENT);
+
+    await authorityWithEnvironment(ENVIRONMENT, async () => {
+      // BOTH SPELLINGS SET, to different synthetic tokens.
+      process.env[UPPER] = FIRST_TOKEN;
+      process.env[LOWER] = LOWER_ALIAS_TOKEN;
+      const fx = await authorityRoot(label, await publishedFromTheEnvironmentToken());
+      const integration = [fx.teamId, fx.integrationId];
+      /** The real selection read, on a completed transaction of its own, with the product's own token resolution. PRIVATE. */
+      const selectionRead = () => tx((s) => lockSlackSelection(s, { teamId: fx.teamId, integrationId: fx.integrationId }));
+      const selection = async () => {
+        const read = await selectionRead();
+        if (read.outcome !== "current") throw new Error("fixture: the integration's selection is not current");
+        return read.selection;
+      };
+      const row = async () => (await query<{ updated_at_utc: string; whole_row: string; has_secret: boolean }>(
+        `select to_char(i.updated_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as updated_at_utc,
+                md5(to_jsonb(i)::text) as whole_row, i.secret_ciphertext is not null as has_secret
+           from integrations i where i.team_id = $1 and i.id = $2::uuid`, integration
+      ))[0];
+
+      // ── PRECEDENCE: the upper-case spelling is the effective token. ──
+      const first = await selection();
+      const rowAtFirst = await row();
+      expect({
+        has_a_stored_secret: rowAtFirst.has_secret,
+        token_source: first.tokenSource,
+        the_resolved_token_is_the_upper_case_spelling: resolveEnvSlackToken() === process.env[UPPER],
+        the_resolved_token_is_the_lower_case_spelling: resolveEnvSlackToken() === process.env[LOWER],
+        the_entry_carries_the_real_configuration_revision: first.configRevision === fx.entry.locator.bindingConfigRevision,
+      }, `${label}: fixture: no stored secret; with both spellings set the upper-case one is the effective token`).toEqual({
+        has_a_stored_secret: false, token_source: "env", the_resolved_token_is_the_upper_case_spelling: true,
+        the_resolved_token_is_the_lower_case_spelling: false, the_entry_carries_the_real_configuration_revision: true,
+      });
+      const atTheStart = await authorityDigests(fx.teamId);
+      /** Against the first selection and the first row: what an environment change did and did not move. */
+      const moved = async () => {
+        const now = await selection();
+        const rowNow = await row();
+        return {
+          token_source: now.tokenSource,
+          effective_token_changed: now.tokenFingerprint !== first.tokenFingerprint,
+          configuration_revision_unchanged: now.configRevision === first.configRevision,
+          integration_row_unchanged: rowNow.whole_row === rowAtFirst.whole_row && rowNow.updated_at_utc === rowAtFirst.updated_at_utc,
+          snapshotted_surfaces_altered: authorityTablesThatDiffer(atTheStart, await authorityDigests(fx.teamId)),
+        };
+      };
+      const ROTATED = { token_source: "env", effective_token_changed: true, configuration_revision_unchanged: true, integration_row_unchanged: true, snapshotted_surfaces_altered: [] };
+
+      // ── NOT A ROTATION: only the lower-case spelling changes. ──
+      process.env[LOWER] = OTHER_LOWER_ALIAS_TOKEN;
+      expect(await moved(), `${label}: changing only the lower-case spelling leaves the effective token as it was`).toEqual({ ...ROTATED, effective_token_changed: false });
+
+      // ── ROTATION: the upper-case spelling changes. Nothing stored changed. ──
+      process.env[UPPER] = ROTATED_TOKEN;
+      expect(await moved(), `${label}: changing the upper-case spelling changes the effective token, and no stored row`).toEqual(ROTATED);
+      await authorityRefusedWithNothingWritten(fx, `${label}: upper-case spelling rotated`, { outcome: "refused", reason: "binding_changed" });
+
+      // ── FALLBACK: the upper-case spelling REMOVED. The lower-case one is now the effective token. ──
+      delete process.env[UPPER];
+      expect([resolveEnvSlackToken() === process.env[LOWER], Object.prototype.hasOwnProperty.call(process.env, UPPER)],
+        `${label}: with the upper-case spelling removed the lower-case one is resolved`).toEqual([true, false]);
+      expect(await moved(), `${label}: the lower-case spelling's token is another effective token, and no stored row changed`).toEqual(ROTATED);
+      await authorityRefusedWithNothingWritten(fx, `${label}: upper-case spelling removed`, { outcome: "refused", reason: "binding_changed" });
+
+      // ── NO TOKEN AT ALL: both spellings removed. ──
+      delete process.env[LOWER];
+      const none = await selectionRead();
+      expect([resolveEnvSlackToken() === null, none.outcome], `${label}: with both spellings removed and no stored secret there is no token`).toEqual([true, "no_token"]);
+      await authorityRefusedWithNothingWritten(fx, `${label}: no token at all`, { outcome: "refused", reason: "source_not_current" });
+
+      // ── CONTROL: the first token back in the upper-case spelling. The same entry is enqueued. ──
+      process.env[UPPER] = FIRST_TOKEN;
+      expect(await moved(), `${label}: control: with the first token back the effective token is the first one again`).toEqual({ ...ROTATED, effective_token_changed: false });
+      expect(await authorityPrepared(fx.teamId, fx.entry), `${label}: control: with the first token back the same entry is enqueued, so every other authority fact was valid throughout`).toEqual({ outcome: "enqueued" });
+      expect(await authorityPendingCounts(), `${label}: control: one queue row, nothing staged`).toEqual(AUTHORITY_ONE_QUEUE_ROW);
+      expect(JSON.stringify(fx.entry) === fx.entryBytes, `${label}: the entry is byte-identical throughout`).toBe(true);
+    });
+
+    expect(authorityEnvironmentIsAs(ENVIRONMENT, environmentBefore), `${label}: both spellings are exactly as they were before the case: present with their values, or absent`).toEqual([true, true]);
+  });
+});
+
+/**
+ * KR-09 and the permanent fixture of M6b — the namespace gate is invalidated, and then made ready
+ * again at a GREATER revision, between enumeration and preparation
+ * (`docs/design/slack-known-root-requeue-spec.md` §4.1, §5.1, §11 "Namespace rereadiness fixture", §12 M6b).
+ *
+ * INVALIDATION is the real `invalidateSlackNamespaceGate`. REREADINESS is a TEST-ONLY, schema-valid
+ * fixture, labeled where it is written: a readiness proof row at the new revision, copied from the
+ * proof the real producer wrote at the old one, and the gate row set ready at that revision with
+ * that proof. The real empty-new-channel producer is NOT used for it: this channel has a canonical
+ * item, which is exactly what that producer refuses. The proof's kind is the only one the schema
+ * admits, and here it attests nothing: it is a structural fixture, not the producer's verdict.
+ *
+ * FIRST CASE — invalidated only. The old entry is refused; and so is a FRESH entry, enumerated
+ * while the gate is blocked, because enumeration reports a revision and proves no readiness.
+ *
+ * SECOND CASE — invalidated, then ready again at a greater revision. Every authority fact is valid
+ * again, and the workspace is ready again; only the revision the old entry was enumerated at is no
+ * longer the gate's. The old entry must be refused as `namespace_changed_or_unready`, at the
+ * assertion labeled `M6b: …`, with nothing written and its bytes unchanged. A preparation that
+ * read the gate's revision afresh instead of using the entry's would find the gate ready at the
+ * revision it had just read and — the witness being overdue — would return `enqueued` there.
+ * THE CONTROL: a FRESH enumeration returns the same entry but for the greater revision, and that
+ * entry is enqueued.
+ */
+describe("KR-09 namespace invalidation and rereadiness (M6b)", () => {
+  const INVALIDATION_REASON = "kr09_fixture_invalidation";
+  const NAMESPACE_REFUSED: SlackKnownRootPreparationResult = { outcome: "refused", reason: "namespace_changed_or_unready" };
+  const gateScope = (fx: AuthorityFixture) => ({ teamId: fx.teamId, rawChannelId: CHANNEL });
+  /** The gate row, as booleans and one count, against the revision the old entry carries. */
+  const gateFacts = (fx: AuthorityFixture, proofId: string | null): Promise<Row[]> => query(
+    `select g.state, g.revision > $3::bigint as revision_is_greater_than_the_entrys,
+            g.ready_revision is not distinct from g.revision as ready_at_its_current_revision,
+            g.resolved_workspace_ids = array[$4]::text[] as resolves_exactly_the_published_workspace,
+            g.completed_repair_id is not distinct from $5::uuid as completed_by_the_fixture_proof,
+            (select count(*)::int from slack_namespace_readiness_proofs p where p.team_id = g.team_id and p.raw_channel_id = g.raw_channel_id) as proofs
+       from slack_channel_migration_gates g where g.team_id = $1 and g.raw_channel_id = $2`,
+    [fx.teamId, CHANNEL, fx.entry.locator.namespaceRevision, WORKSPACE, proofId]
+  );
+  /** A fresh enumeration's one entry, and whether it is the old entry but for its namespace revision. */
+  async function freshEntry(fx: AuthorityFixture, label: string): Promise<{ entry: AuthorityLocatedEntry; facts: Record<string, boolean> }> {
+    const page = await enumPage(fx.teamId, 100);
+    const entry = page.entries[0];
+    if (page.entries.length !== 1 || entry === undefined || !("locator" in entry)) throw new Error(`fixture: ${label}: the fresh enumeration returned no single located entry`);
+    const butForTheRevision = (candidate: AuthorityLocatedEntry): string => JSON.stringify({ ...candidate, locator: { ...candidate.locator, namespaceRevision: null } });
+    return {
+      entry,
+      facts: {
+        same_entry_but_for_the_namespace_revision: butForTheRevision(entry) === butForTheRevision(fx.entry),
+        carries_a_greater_namespace_revision: entry.locator.namespaceRevision > fx.entry.locator.namespaceRevision,
+      },
+    };
+  }
+
+  it("refuses the entry enumerated before the namespace was invalidated, and a fresh entry enumerated while it is blocked, and writes nothing (KR-09)", async () => {
+    const label = "namespace invalidated";
+    const fx = await authorityRoot(label, await publishOldRoot());
+    const beforeTheChange = await authorityDigests(fx.teamId);
+
+    // ── THE REAL INVALIDATOR. ──
+    const invalidated = await tx((s) => invalidateSlackNamespaceGate(s, gateScope(fx), INVALIDATION_REASON));
+    expect([invalidated.state, invalidated.revision > fx.entry.locator.namespaceRevision, invalidated.readyRevision === null, invalidated.resolvedWorkspaceIds.length],
+      `${label}: fixture: the real invalidator left the gate blocked, at a greater revision, with no readiness`).toEqual(["blocked", true, true, 0]);
+    expect(authorityTablesThatDiffer(beforeTheChange, await authorityDigests(fx.teamId)), `${label}: fixture: the invalidation altered the gate and no other snapshotted surface`).toEqual(["slack_channel_migration_gates"]);
+
+    await authorityRefusedWithNothingWritten(fx, label, NAMESPACE_REFUSED);
+
+    // A FRESH entry, enumerated while the gate is blocked: located, at the greater revision, and refused too.
+    const fresh = await freshEntry(fx, label);
+    expect(fresh.facts, `${label}: a fresh enumeration returns the same entry but for a greater namespace revision`).toEqual({
+      same_entry_but_for_the_namespace_revision: true, carries_a_greater_namespace_revision: true,
+    });
+    await authorityRefusedWithNothingWritten({ ...fx, entry: fresh.entry, entryBytes: JSON.stringify(fresh.entry) }, `${label}: fresh entry, gate still blocked`, NAMESPACE_REFUSED);
+  });
+
+  it("refuses the entry enumerated before the namespace was invalidated and made ready again at a greater revision, writes nothing, and enqueues a freshly enumerated entry (KR-09, M6b)", async () => {
+    const label = "namespace invalidated and ready again";
+    const fx = await authorityRoot(label, await publishOldRoot());
+    const beforeTheChange = await authorityDigests(fx.teamId);
+    expect(await gateFacts(fx, null), `${label}: fixture: before the change the gate is ready at the entry's revision, by the real producer's one proof`).toEqual([{
+      state: "ready", revision_is_greater_than_the_entrys: false, ready_at_its_current_revision: true,
+      resolves_exactly_the_published_workspace: true, completed_by_the_fixture_proof: false, proofs: 1,
+    }]);
+
+    // ── 1. THE REAL INVALIDATOR. ──
+    const invalidated = await tx((s) => invalidateSlackNamespaceGate(s, gateScope(fx), INVALIDATION_REASON));
+    expect([invalidated.state, invalidated.revision > fx.entry.locator.namespaceRevision], `${label}: fixture: the real invalidator left the gate blocked at a greater revision`).toEqual(["blocked", true]);
+
+    // ── 2. TEST-ONLY READINESS FIXTURE at that greater revision. Schema-valid, and NOT the producer:
+    //       a proof row copied from the real producer's proof of the old revision, and the gate set
+    //       ready at the new revision with it. ──
+    const raw = await rawSql();
+    const proof = await raw.query<{ id: string }>(
+      `insert into slack_namespace_readiness_proofs
+              (team_id, raw_channel_id, gate_revision, workspace_id, integration_id, binding_id, config_revision, public_checked_at, legacy_rows_found)
+       select p.team_id, p.raw_channel_id, $4::bigint, p.workspace_id, p.integration_id, p.binding_id, p.config_revision, p.public_checked_at, 0
+         from slack_namespace_readiness_proofs p
+        where p.team_id = $1 and p.raw_channel_id = $2 and p.gate_revision = $3::bigint
+    returning id::text as id`,
+      [fx.teamId, CHANNEL, fx.entry.locator.namespaceRevision, invalidated.revision]
+    );
+    expect(proof.rowCount, `${label}: fixture: one readiness proof row was written at the greater revision`).toBe(1);
+    const ready = await raw.query(
+      `update slack_channel_migration_gates
+          set state = 'ready', ready_revision = revision, resolved_workspace_ids = array[$3]::text[],
+              completed_repair_id = $4::uuid, blocked_reason = null, updated_at = clock_timestamp()
+        where team_id = $1 and raw_channel_id = $2 and state = 'blocked' and revision = $5::bigint`,
+      [fx.teamId, CHANNEL, WORKSPACE, proof.rows[0].id, invalidated.revision]
+    );
+    expect(ready.rowCount, `${label}: fixture: the gate row was set ready at the greater revision`).toBe(1);
+
+    // ── READBACK: ready again, at a GREATER revision, for the same workspace; nothing else moved. ──
+    expect(await gateFacts(fx, proof.rows[0].id), `${label}: fixture: the gate is ready again at a greater revision than the entry's, for the published workspace, by the fixture's proof`).toEqual([{
+      state: "ready", revision_is_greater_than_the_entrys: true, ready_at_its_current_revision: true,
+      resolves_exactly_the_published_workspace: true, completed_by_the_fixture_proof: true, proofs: 2,
+    }]);
+    expect(authorityTablesThatDiffer(beforeTheChange, await authorityDigests(fx.teamId)), `${label}: fixture: the gate and its readiness proofs are the only snapshotted surfaces that differ from before the change`)
+      .toEqual(["slack_channel_migration_gates", "slack_namespace_readiness_proofs"]);
+
+    // ── THE OLD ENTRY IS REFUSED, AND NOTHING IS WRITTEN. ──
+    await authorityRefusedWithNothingWritten(fx, label, NAMESPACE_REFUSED,
+      "M6b: after the namespace was invalidated and made ready again at a greater revision, the entry enumerated at the old revision is refused as namespace_changed_or_unready and is not enqueued");
+
+    // ── CONTROL: a FRESH enumeration carries the greater revision, and that entry is enqueued. ──
+    const fresh = await freshEntry(fx, label);
+    expect(fresh.facts, `${label}: control: a fresh enumeration returns the same entry but for a greater namespace revision`).toEqual({
+      same_entry_but_for_the_namespace_revision: true, carries_a_greater_namespace_revision: true,
+    });
+    expect(await authorityPrepared(fx.teamId, fresh.entry), `${label}: control: the freshly enumerated entry is enqueued, so every other authority fact was valid throughout`).toEqual({ outcome: "enqueued" });
+    expect(await authorityPendingCounts(), `${label}: control: one queue row, nothing staged`).toEqual(AUTHORITY_ONE_QUEUE_ROW);
+    expect(JSON.stringify(fx.entry) === fx.entryBytes, `${label}: the old entry is byte-identical throughout`).toBe(true);
   });
 });
