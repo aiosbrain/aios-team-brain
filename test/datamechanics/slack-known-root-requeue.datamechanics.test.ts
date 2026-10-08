@@ -5811,20 +5811,33 @@ describe("KR-02 exact enumeration traversal of a fixed population", () => {
  * A spelling decoy that is anything but `missing_root_witness` matched a witness by its instant, or
  * by its bytes without its item, and not by the exact bytes of its own root bound to its own item.
  *
+ * PRECEDENCE, PINNED DELIBERATELY. Both spelling decoys are also ledger contradictions: the second
+ * decoy's own row binds its item under another root's bytes, and that same row binds the first
+ * decoy's thread to another item. Each is `missing_root_witness` only because the current source
+ * checks the root witness BEFORE the contradictions. These expectations deliberately pin that
+ * current witness-before-contradiction precedence. A reorder that still conforms to the
+ * specification would answer `contradictory_ledger` for both, and would require this evidence to
+ * be revisited: it would not by itself be a defect.
+ *
  * THE PREPARATION CASE ADDS TWO THINGS, both before the target is first prepared. The real enqueue
  * dependency writes a queue row of the SAME root bytes in four other scopes of the target team —
  * workspace in lower case, channel in lower case, another workspace, another channel — so a target
  * that is `already_pending`, or that is not enqueued when its own observation is overdue, read a
  * queue row of another scope; those four rows must stay byte-identical throughout. And two
  * FABRICATED entries are prepared: the published root's own enumerated entry with only its workspace
- * id, or only its channel id, changed to lower case. Each names a scope that HAS a queue row and has
- * no namespace gate naming it, and must be refused.
+ * id, or only its channel id, changed to lower case. Each names a scope that HAS a queue row, and
+ * must be refused at the namespace gate, for a different reason each. For the lower-case workspace
+ * the channel's gate row EXISTS, but its resolved workspace ids do not include those byte-distinct
+ * workspace bytes. For the lower-case channel there is no gate row matching those channel bytes.
  *
  * LIMITS. The two teams' integration ids differ and are asserted to; their configuration revisions
  * and namespace revisions are whatever the product gave each team and may be equal, so those two
- * fields are checked for the target's own values only. No decoy scope has a channel row or a gate of
- * its own, so `missing_namespace_pin` is not exercised here. Case-only stored ids on the published
- * item itself are M1b and M1c, above, and are not repeated.
+ * fields are checked for the target's own values only. The fixture has no second independently
+ * bound provider workspace or channel: no scope decoy has a channel row of its own. The one
+ * namespace gate is keyed by team and channel, so the scope decoys that share the published
+ * channel's bytes do meet that gate row; each is unlocated for want of its channel row, which is
+ * judged first. So `missing_namespace_pin` is not exercised here. Case-only stored ids on the
+ * published item itself are M1b and M1c, above, and are not repeated.
  */
 describe("KR-04 scope isolation of enumeration and preparation", () => {
   /** Another valid spelling of the published root's instant: four fractional digits instead of six. */
