@@ -72,13 +72,14 @@ export async function linkMemberIdentity(
   const ext = externalId.trim();
   if (!ext) return { ok: false, error: `${p} user id is required` };
   try {
-    await setMemberIdentity(
+    const result = await setMemberIdentity(
       adminClient(),
       ctx.teamId,
       memberId,
       { provider: p, externalId: ext, handle: (handle ?? "").trim() },
-      { force: true, actor: { kind: "member", memberId: ctx.memberId } }
+      { force: true, explicit: true, actor: { kind: "member", memberId: ctx.memberId } }
     );
+    if (result.conflict) return { ok: false, error: result.note ?? "identity link conflicts with an existing mapping" };
     revalidatePath(`/t/${teamSlug}/admin/members`);
     after(() => reconcileAttribution(adminClient(), ctx.teamId, teamSlug));
     return { ok: true };

@@ -1,0 +1,2040 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { TransactionExecutionError } from "@/lib/db/pg/tx";
+import type { SqlExecutor, TransactionSession } from "@/lib/db/types";
+import {
+  SLACK_KNOWN_ROOT_LIMITS,
+  SlackKnownRootDeadlineError,
+  SlackKnownRootValidationError,
+  createSlackKnownRootExecution,
+  readSlackKnownRootItemPage,
+  type SlackKnownRootEntry,
+  type SlackKnownRootLocatedEntry,
+  type SlackKnownRootPageRequest,
+} from "@/lib/ingest/slack-known-root-page";
+import {
+  SLACK_KNOWN_ROOT_FAILURE_CATEGORIES,
+  SLACK_KNOWN_ROOT_REFUSED_REASONS,
+  SLACK_KNOWN_ROOT_UNATTESTED_REASONS,
+  classifySlackKnownRootPreparationFailure,
+  prepareSlackKnownRootRequeue,
+  tallySlackKnownRootPage,
+  type SlackKnownRootPageTally,
+  type SlackKnownRootPreparationResult,
+  type SlackKnownRootReceipt,
+} from "@/lib/ingest/slack-known-root-requeue";
+import { slackConfigRevision, slackTokenFingerprint } from "@/lib/ingest/slack-source-binding";
+
+/**
+ * The decorated session is handed only to the packet's own dependencies, so the one way to hold it is
+ * to stand where a dependency stands. This wraps the REAL namespace-gate module: with no hook set —
+ * which is every case but the lifecycle ones that set it — the real `lockReadySlackNamespaceGate`
+ * runs, unchanged.
+ */
+const gateSeat = vi.hoisted(() => ({
+  current: null as null | ((session: unknown, request: unknown) => unknown),
+}));
+vi.mock("@/lib/ingest/slack-namespace-gate", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/ingest/slack-namespace-gate")>();
+  return {
+    ...actual,
+    lockReadySlackNamespaceGate: (session: never, request: never) =>
+      gateSeat.current ? gateSeat.current(session, request) : actual.lockReadySlackNamespaceGate(session, request),
+  };
+});
+afterEach(() => {
+  gateSeat.current = null;
+});
+
+/**
+ * AIO-1170 AC-02 — the inactive known-root requeue packet, product contracts that need no database
+ * (`docs/design/slack-known-root-requeue-spec.md` §4.1, §6, §8; KR-10 and KR-16 in part).
+ *
+ * FIRST RED CHECKPOINT. Both modules exist as typed stubs that return fixed placeholders, so every
+ * case here compiles and runs; a failing case fails on BEHAVIOUR. Each case is written from the
+ * specification, and none computes its expectation with a test-owned copy of the reducer or
+ * classifier. Cases marked "(control)" are expected to pass against the stubs as well, and say why.
+ */
+
+const TEAM = "1a1b1c1d-1111-4111-8111-1111abcdef11";
+const OTHER_TEAM = "2a2b2c2d-2222-4222-8222-2222abcdef22";
+const ITEM = "0a000000-0000-4000-8000-00000000000a";
+const INTEGRATION = "0b000000-0000-4000-8000-00000000000b";
+const REVISION = "c".repeat(64);
+const REVISIT_MS = 3_600_000;
+
+/** Unique synthetic canaries. None may appear in anything this packet reports. */
+const CANARY = {
+  metadata: "CANARY-METADATA-7f3a91",
+  token: "xoxb-CANARY-TOKEN-5d2c44",
+  fingerprint: "CANARY-FINGERPRINT-9e8b17",
+  ciphertext: "CANARY-CIPHERTEXT-1c6f02",
+  sql: "select 'CANARY-SQL-4a7d39' from integrations",
+} as const;
+const CANARIES = Object.values(CANARY);
+
+function expectNoCanary(value: unknown, label: string): void {
+  const texts: string[] = [];
+  const seen = new Set<unknown>();
+  const collect = (current: unknown, depth: number): void => {
+    if (typeof current === "string") return void texts.push(current);
+    if (typeof current !== "object" || current === null || seen.has(current) || depth > 6) return;
+    seen.add(current);
+    if (current instanceof Error) texts.push(current.name, current.message, String(current.stack ?? ""));
+    for (const key of Reflect.ownKeys(current)) {
+      texts.push(String(key));
+      try {
+        collect((current as Record<PropertyKey, unknown>)[key], depth + 1);
+      } catch {
+        // a throwing accessor exposes nothing
+      }
+    }
+    if (current instanceof Error && "cause" in current) collect((current as { cause?: unknown }).cause, depth + 1);
+  };
+  collect(value, 0);
+  const text = texts.join("\n");
+  for (const canary of CANARIES) expect(text.includes(canary), `${label}: ${canary.slice(0, 16)}… is absent`).toBe(false);
+}
+
+/** A session whose every use is recorded. A call that should not happen is visible, not fatal. */
+function recordingSession(): { session: TransactionSession; statements: string[]; other: string[] } {
+  const statements: string[] = [];
+  const other: string[] = [];
+  const executeSql = (async (text: string) => {
+    statements.push(text);
+    return { rows: [], rowCount: 0 };
+  }) as SqlExecutor;
+  const session = {
+    get db(): never {
+      other.push("db");
+      throw new Error("fixture: the session's db client was used");
+    },
+    executeSql,
+    optionalAudit: async <T>(_operation: () => Promise<T>, fallback: T): Promise<T> => {
+      other.push("optionalAudit");
+      return fallback;
+    },
+  } as unknown as TransactionSession;
+  return { session, statements, other };
+}
+
+const execution = () => createSlackKnownRootExecution({ ambientDeadlineAt: null });
+
+function located(over: Partial<SlackKnownRootLocatedEntry> = {}): SlackKnownRootLocatedEntry {
+  return {
+    teamId: TEAM,
+    itemId: ITEM,
+    revisitAfterMs: REVISIT_MS,
+    locator: {
+      workspaceId: "T0SOURCE1",
+      channelId: "C0KNOWN1",
+      rootTs: "1718900000.000100",
+      integrationId: INTEGRATION,
+      bindingConfigRevision: REVISION,
+      namespaceRevision: 3,
+    },
+    ...over,
+  };
+}
+
+async function rejection(run: () => Promise<unknown>): Promise<unknown> {
+  try {
+    await run();
+  } catch (error) {
+    return error;
+  }
+  return undefined;
+}
+
+function thrown(run: () => unknown): unknown {
+  try {
+    run();
+  } catch (error) {
+    return error;
+  }
+  return undefined;
+}
+
+/**
+ * The caller's session with its executor rejecting its `position`-th call and forwarding every other
+ * one to `inner`. Position 0 rejects nothing. Its `db` client and its audit helper both REFUSE, and
+ * write down that they were asked: nothing can reach `inner` except through the counted executor.
+ */
+function rejectingAt(inner: TransactionSession, position: number, failure: Error): { session: TransactionSession; calls: () => number; other: string[] } {
+  let calls = 0;
+  const other: string[] = [];
+  const executeSql = (async (text: string, params?: unknown[]) => {
+    calls++;
+    if (calls === position) throw failure;
+    return inner.executeSql(text, params);
+  }) as SqlExecutor;
+  const session = {
+    get db(): never {
+      other.push("db");
+      throw new Error("fixture: the caller's own db client was used");
+    },
+    executeSql,
+    optionalAudit: async (): Promise<never> => {
+      other.push("optionalAudit");
+      throw new Error("fixture: the caller's own audit helper was used");
+    },
+  } as unknown as TransactionSession;
+  return { session, calls: () => calls, other };
+}
+/** How a primitive ENDED, as one closed value: what it resolved with, or whether it rejected with the executor's own failure. */
+type RejectingEnded = { resolvedWith: unknown } | { rejectedWithTheExecutorsOwnFailure: boolean };
+const rejectingEnded = (run: Promise<unknown>, failure: Error): Promise<RejectingEnded> => run.then(
+  (value): RejectingEnded => ({ resolvedWith: value }),
+  (error: unknown): RejectingEnded => ({ rejectedWithTheExecutorsOwnFailure: error === failure })
+);
+
+/** The one sentence a caller-contract failure may say. Stated here, not imported: a changed message must fail. */
+const STATIC_VALIDATION_MESSAGE = "slack known-root: invalid request";
+const STATIC_DEADLINE_MESSAGE = "slack known-root: operation deadline exceeded";
+
+/**
+ * A static validation error: the packet's own class, with EXACTLY the static message — the same
+ * bytes whatever was rejected — so nothing it was given can be quoted, formatted in or appended.
+ */
+function expectStaticValidationError(error: unknown, label: string): void {
+  expect(error, `${label}: a validation error was thrown`).toBeInstanceOf(SlackKnownRootValidationError);
+  expect((error as Error).message, `${label}: the message is the static sentence, exactly`).toBe(STATIC_VALIDATION_MESSAGE);
+  expect((error as Error).name, label).toBe("SlackKnownRootValidationError");
+  expect("cause" in (error as object) && (error as { cause?: unknown }).cause !== undefined, `${label}: no cause travels with it`).toBe(false);
+  expectNoCanary(error, label);
+}
+
+// ── §4.1: preparation composes from the team and one enumerated entry ─────────
+
+describe("known-root preparation — composed from teamId plus one enumerated entry", () => {
+  it.each(["not_slack", "invalid_metadata", "missing_channel_binding", "missing_namespace_pin"] as const)(
+    "reports an entry enumeration could not locate (%s) as unattested with that reason, and touches nothing",
+    async (category) => {
+      const { session, statements, other } = recordingSession();
+      const entry: SlackKnownRootEntry = { teamId: TEAM, itemId: ITEM, revisitAfterMs: REVISIT_MS, unlocated: category };
+      // The caller supplies the team and the entry. Nothing else exists to supply.
+      const result = await prepareSlackKnownRootRequeue(session, { teamId: TEAM, entry }, execution());
+      expect(result).toEqual({ outcome: "unattested", reason: category });
+      // Unresolved coverage for this observation: no lock, no read, no write, no setting changed.
+      //
+      // ZERO STATEMENTS IS A DELIBERATE, STRONGER INVARIANT THAN THE SPECIFICATION STATES. §4.2 asks
+      // for "no mutation", and §7.3 would permit a session-settings read and its restoration around
+      // a result that needed neither. This packet pins the stronger form on purpose: an entry with
+      // no locator names nothing to look up, so the session is not touched at all — not even to
+      // read a timeout — and there is therefore nothing to restore and nothing that can fail.
+      expect(statements, "no statement was issued").toEqual([]);
+      expect(other, "no other session capability was used").toEqual([]);
+    }
+  );
+
+  it("refuses a team that is not the entry's team as a static validation error, before any statement", async () => {
+    const { session, statements } = recordingSession();
+    const error = await rejection(() => prepareSlackKnownRootRequeue(session, { teamId: OTHER_TEAM, entry: located() }, execution()));
+    expectStaticValidationError(error, "team mismatch");
+    expect(statements).toEqual([]);
+  });
+
+  it("validates the locator again instead of trusting it: a fabricated one is refused before any statement", async () => {
+    const fabricated: [string, SlackKnownRootLocatedEntry][] = [
+      ["a workspace that is not an ASCII alphanumeric id", located({ locator: { ...located().locator, workspaceId: `T0 ${CANARY.metadata}` } })],
+      ["an empty channel id", located({ locator: { ...located().locator, channelId: "" } })],
+      ["a root the exact parser refuses", located({ locator: { ...located().locator, rootTs: `1718900000.1234567${CANARY.metadata}` } })],
+      ["an integration that is not a UUID", located({ locator: { ...located().locator, integrationId: CANARY.token } })],
+      ["a configuration revision that is not lowercase SHA-256 hex", located({ locator: { ...located().locator, bindingConfigRevision: REVISION.toUpperCase() } })],
+      ["a fingerprint offered as the configuration revision", located({ locator: { ...located().locator, bindingConfigRevision: CANARY.fingerprint } })],
+      ["a negative namespace revision", located({ locator: { ...located().locator, namespaceRevision: -1 } })],
+      ["a fractional namespace revision", located({ locator: { ...located().locator, namespaceRevision: 1.5 } })],
+      ["an unsafe namespace revision", located({ locator: { ...located().locator, namespaceRevision: Number.MAX_SAFE_INTEGER + 2 } })],
+      ["an item that is not a UUID", located({ itemId: CANARY.metadata })],
+      ["a revisit policy below the minimum", located({ revisitAfterMs: SLACK_KNOWN_ROOT_LIMITS.revisitAfterMs.min - 1 })],
+    ];
+    for (const [label, entry] of fabricated) {
+      const { session, statements } = recordingSession();
+      const error = await rejection(() => prepareSlackKnownRootRequeue(session, { teamId: TEAM, entry }, execution()));
+      expectStaticValidationError(error, label);
+      expect(statements, `${label}: refused before any statement`).toEqual([]);
+    }
+  });
+
+  it("refuses an entry that is both located and unlocated, or neither", async () => {
+    const both = { ...located(), unlocated: "not_slack" } as unknown as SlackKnownRootEntry;
+    const neither = { teamId: TEAM, itemId: ITEM, revisitAfterMs: REVISIT_MS } as unknown as SlackKnownRootEntry;
+    const unknownCategory = { teamId: TEAM, itemId: ITEM, revisitAfterMs: REVISIT_MS, unlocated: CANARY.metadata } as unknown as SlackKnownRootEntry;
+    for (const [label, entry] of [["both", both], ["neither", neither], ["an unknown category", unknownCategory]] as const) {
+      const { session, statements } = recordingSession();
+      const error = await rejection(() => prepareSlackKnownRootRequeue(session, { teamId: TEAM, entry }, execution()));
+      expectStaticValidationError(error, label);
+      expect(statements).toEqual([]);
+    }
+  });
+});
+
+// ── §6: page requests, cursors and execution options ─────────────────────────
+
+describe("known-root enumeration — invalid and boundary requests", () => {
+  const request = (over: Record<string, unknown> = {}): SlackKnownRootPageRequest =>
+    ({ teamId: TEAM, pageSize: 10, revisitAfterMs: REVISIT_MS, ...over }) as unknown as SlackKnownRootPageRequest;
+  const cursor = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    version: 1, teamId: TEAM, upperItemId: "0f000000-0000-4000-8000-00000000000f",
+    afterItemId: "0a000000-0000-4000-8000-00000000000a", revisitAfterMs: REVISIT_MS, ...over,
+  });
+
+  it.each<[string, Record<string, unknown>]>([
+    ["a team that is not a UUID", { teamId: CANARY.metadata }],
+    ["page size 0", { pageSize: 0 }],
+    ["page size 101", { pageSize: 101 }],
+    ["a fractional page size", { pageSize: 10.5 }],
+    ["a page size given as text", { pageSize: "10" }],
+    ["no revisit policy (there is no runtime default)", { revisitAfterMs: undefined }],
+    ["a revisit policy one millisecond below the minimum", { revisitAfterMs: 59_999 }],
+    ["a revisit policy one millisecond above the maximum", { revisitAfterMs: 86_400_001 }],
+    ["a fractional revisit policy", { revisitAfterMs: 60_000.5 }],
+    ["a cursor of another version", { cursor: cursor({ version: 2 }) }],
+    ["a cursor of another team", { cursor: cursor({ teamId: OTHER_TEAM }) }],
+    ["a cursor already past its own upper bound", { cursor: cursor({ afterItemId: "0f000000-0000-4000-8000-0000000000ff" }) }],
+    ["a cursor whose bound is not a UUID", { cursor: cursor({ upperItemId: CANARY.metadata }) }],
+    ["a cursor carrying a different revisit policy", { cursor: cursor({ revisitAfterMs: REVISIT_MS + 1 }) }],
+    ["a cursor that is not an object", { cursor: CANARY.token }],
+  ])("refuses %s as a static validation error, before any statement", async (label, over) => {
+    const { session, statements } = recordingSession();
+    const error = await rejection(() => readSlackKnownRootItemPage(session, request(over), execution()));
+    expectStaticValidationError(error, label);
+    expect(statements, "refused before any statement").toEqual([]);
+  });
+
+  // CONTROL — passes against the stub (it rejects nothing) and must keep passing: the bounds
+  // themselves are valid requests. Whatever a recording session then makes of the read, it is not
+  // a caller-contract failure.
+  it.each<[string, Record<string, unknown>]>([
+    ["page size 1", { pageSize: 1 }],
+    ["page size 100", { pageSize: 100 }],
+    ["the minimum revisit policy", { revisitAfterMs: 60_000 }],
+    ["the maximum revisit policy", { revisitAfterMs: 86_400_000 }],
+    ["a well-formed continuation cursor", { cursor: cursor() }],
+  ])("does not refuse %s as a caller-contract error (control)", async (_label, over) => {
+    const { session } = recordingSession();
+    const error = await rejection(() => readSlackKnownRootItemPage(session, request(over), execution()));
+    expect(error).not.toBeInstanceOf(SlackKnownRootValidationError);
+  });
+
+  it.each<[string, Record<string, unknown>]>([
+    ["an allowance below 1,000 ms", { allowanceMs: 999, ambientDeadlineAt: null }],
+    ["an allowance above 5,000 ms", { allowanceMs: 5_001, ambientDeadlineAt: null }],
+    ["a fractional allowance", { allowanceMs: 1_500.5, ambientDeadlineAt: null }],
+    ["an ambient deadline that was never declared", {}],
+    ["an ambient deadline that is not a finite number", { ambientDeadlineAt: Number.NaN }],
+    ["a monotonic clock that is not a function", { ambientDeadlineAt: null, monotonicNow: 42 }],
+  ])("refuses an execution context with %s", (label, options) => {
+    const error = thrown(() => createSlackKnownRootExecution(options as never));
+    expectStaticValidationError(error, label);
+  });
+
+  it("gives an execution context its default 2,000 ms allowance on the supplied clock, capped by an earlier ambient deadline", () => {
+    const now = 50_000;
+    const plain = createSlackKnownRootExecution({ ambientDeadlineAt: null, monotonicNow: () => now });
+    expect(plain.allowanceMs).toBe(2_000);
+    expect(plain.deadlineAt).toBe(now + 2_000);
+    const wide = createSlackKnownRootExecution({ allowanceMs: 5_000, ambientDeadlineAt: null, monotonicNow: () => now });
+    expect(wide.deadlineAt).toBe(now + 5_000);
+    // An earlier ambient deadline can leave less than the minimum allowance; a later one changes nothing.
+    expect(createSlackKnownRootExecution({ ambientDeadlineAt: now + 300, monotonicNow: () => now }).deadlineAt).toBe(now + 300);
+    expect(createSlackKnownRootExecution({ ambientDeadlineAt: now + 60_000, monotonicNow: () => now }).deadlineAt).toBe(now + 2_000);
+  });
+});
+
+// ── §7.2 and §11: both primitives enforce the execution object ───────────────
+
+/**
+ * Red review, MEDIUM. Validating the options of `createSlackKnownRootExecution` proves nothing about
+ * what the two primitives do with the object they are HANDED: a caller can pass anything, and a
+ * context that was sound when it was created can have run out, or its clock can have failed, by the
+ * time a primitive is called. Each case below goes through a primitive, with a session that records
+ * every use, and none depends on how a context is represented: a hand-built object is only ever
+ * expected to be REFUSED, so an implementation that accepts nothing but its own contexts and one that
+ * checks the fields both satisfy them.
+ */
+describe("known-root primitives — the execution object is enforced by the primitive it is handed to", () => {
+  const PRIMITIVES: [string, (session: TransactionSession, execution: unknown) => Promise<unknown>][] = [
+    ["the page reader", (session, execution) =>
+      readSlackKnownRootItemPage(session, { teamId: TEAM, pageSize: 10, revisitAfterMs: REVISIT_MS }, execution as never)],
+    ["the preparer", (session, execution) =>
+      prepareSlackKnownRootRequeue(session, { teamId: TEAM, entry: located() }, execution as never)],
+  ];
+  const NOW = 50_000;
+  const steady = (): number => NOW;
+
+  const MALFORMED: [string, unknown][] = [
+    ["no execution at all", undefined],
+    ["null", null],
+    ["a string", CANARY.token],
+    ["an empty object", {}],
+    ["an array", [2_000, NOW + 2_000, steady]],
+    ["a deadline that is not a number", { allowanceMs: 2_000, deadlineAt: CANARY.metadata, monotonicNow: steady }],
+    ["a NaN deadline", { allowanceMs: 2_000, deadlineAt: Number.NaN, monotonicNow: steady }],
+    ["an infinite deadline", { allowanceMs: 2_000, deadlineAt: Number.POSITIVE_INFINITY, monotonicNow: steady }],
+    ["a negatively infinite deadline", { allowanceMs: 2_000, deadlineAt: Number.NEGATIVE_INFINITY, monotonicNow: steady }],
+    ["no deadline", { allowanceMs: 2_000, monotonicNow: steady }],
+    ["a NaN allowance", { allowanceMs: Number.NaN, deadlineAt: NOW + 2_000, monotonicNow: steady }],
+    ["an infinite allowance", { allowanceMs: Number.POSITIVE_INFINITY, deadlineAt: NOW + 2_000, monotonicNow: steady }],
+    ["an allowance below the minimum", { allowanceMs: 999, deadlineAt: NOW + 999, monotonicNow: steady }],
+    ["an allowance above the maximum", { allowanceMs: 5_001, deadlineAt: NOW + 5_001, monotonicNow: steady }],
+    ["a fractional allowance", { allowanceMs: 1_500.5, deadlineAt: NOW + 1_500, monotonicNow: steady }],
+    ["an allowance given as text", { allowanceMs: "2000", deadlineAt: NOW + 2_000, monotonicNow: steady }],
+    ["no clock", { allowanceMs: 2_000, deadlineAt: NOW + 2_000 }],
+    ["a clock that is not a function", { allowanceMs: 2_000, deadlineAt: NOW + 2_000, monotonicNow: 42 }],
+  ];
+
+  describe.each(PRIMITIVES)("%s", (_primitive, run) => {
+    it.each(MALFORMED)("refuses %s as a static validation error, before any statement", async (label, execution) => {
+      const { session, statements, other } = recordingSession();
+      const error = await rejection(() => run(session, execution));
+      expectStaticValidationError(error, label);
+      expect(statements, `${label}: refused before any statement`).toEqual([]);
+      expect(other, `${label}: no other session capability was used`).toEqual([]);
+    });
+
+    // §11: "An already-expired ambient deadline issues no data SQL." Creating the context is allowed —
+    // an ambient deadline that has passed is a fact about the caller's remaining time, not a malformed
+    // option — and the primitive is what refuses to start. This packet pins the stronger form of
+    // "no data SQL": the admission check comes first, so the session is not touched at all.
+    it.each([1, 250, 60_000])("refuses a context whose ambient deadline passed %d ms before it was created: a deadline error, and not one statement", async (ago) => {
+      let execution: unknown;
+      expect(() => {
+        execution = createSlackKnownRootExecution({ ambientDeadlineAt: NOW - ago, monotonicNow: steady });
+      }, "creating it is allowed").not.toThrow();
+      const { session, statements, other } = recordingSession();
+      const error = await rejection(() => run(session, execution));
+      expect(error, "the primitive rejected with the slice's deadline error").toBeInstanceOf(SlackKnownRootDeadlineError);
+      expect((error as Error).message).toBe(STATIC_DEADLINE_MESSAGE);
+      expectNoCanary(error, "deadline error");
+      expect(statements, "no statement was issued").toEqual([]);
+      expect(other).toEqual([]);
+      // The same rejection is what the reporting classifier is given.
+      expect(classifySlackKnownRootPreparationFailure(error)).toBe("deadline_exceeded");
+    });
+
+    // §7.2: the context is created BEFORE the transaction and reused across its attempts. One whose
+    // allowance ran out before this call — a retry, or a late start — gets no fresh allowance.
+    it("refuses a context whose own allowance ran out before the call: a retry gets no fresh allowance", async () => {
+      let now = NOW;
+      const execution = createSlackKnownRootExecution({ ambientDeadlineAt: null, monotonicNow: () => now });
+      now += SLACK_KNOWN_ROOT_LIMITS.allowanceMs.default + 1;
+      const { session, statements } = recordingSession();
+      const error = await rejection(() => run(session, execution));
+      expect(error).toBeInstanceOf(SlackKnownRootDeadlineError);
+      expect((error as Error).message).toBe(STATIC_DEADLINE_MESSAGE);
+      expect(statements, "no statement was issued").toEqual([]);
+    });
+
+    // §7.2: "Invalid or failing clock reads throw safely." The clock is sound while the context is
+    // created and fails afterwards, however many readings creation took.
+    it.each<[string, () => number]>([
+      ["throws", () => { throw new Error(`clock device failed: ${CANARY.metadata}`); }],
+      ["throws something that is not an error", () => { throw CANARY.token; }],
+      ["returns NaN", () => Number.NaN],
+      ["returns Infinity", () => Number.POSITIVE_INFINITY],
+      ["returns text", () => CANARY.fingerprint as unknown as number],
+    ])("fails safely when the monotonic clock %s after creation: an error that leaks nothing, and not one statement", async (label, broken) => {
+      let failed = false;
+      const execution = createSlackKnownRootExecution({ ambientDeadlineAt: null, monotonicNow: () => (failed ? broken() : NOW) });
+      failed = true;
+      const { session, statements, other } = recordingSession();
+      const error = await rejection(() => run(session, execution));
+      // An error of the packet's own making: never the clock's exception, and nothing it carried.
+      expect(error, `${label}: the primitive rejected`).toBeInstanceOf(Error);
+      expectNoCanary(error, label);
+      expect(statements, `${label}: no statement was issued`).toEqual([]);
+      expect(other).toEqual([]);
+      // Whatever it is, it is reportable only as a closed category.
+      expect(SLACK_KNOWN_ROOT_FAILURE_CATEGORIES as readonly string[]).toContain(classifySlackKnownRootPreparationFailure(error));
+    });
+  });
+
+  it.each<[string, () => number]>([
+    ["throws", () => { throw new Error(`clock device failed: ${CANARY.metadata}`); }],
+    ["returns NaN", () => Number.NaN],
+    ["returns Infinity", () => Number.POSITIVE_INFINITY],
+    ["returns text", () => CANARY.fingerprint as unknown as number],
+  ])("refuses to CREATE a context on a monotonic clock that %s, leaking nothing", (label, monotonicNow) => {
+    const error = thrown(() => createSlackKnownRootExecution({ ambientDeadlineAt: null, monotonicNow }));
+    expect(error, `${label}: creation threw`).toBeInstanceOf(Error);
+    expectNoCanary(error, label);
+  });
+
+  // CONTROL — passes against the stubs and must keep passing: a sound context that still has time
+  // is not what any case above refuses. Whatever a recording session then makes of the read, it is
+  // neither a caller-contract failure nor a deadline.
+  it.each(PRIMITIVES)("%s does not refuse a sound context that still has time (control)", async (_label, run) => {
+    const execution = createSlackKnownRootExecution({ ambientDeadlineAt: NOW + 60_000, monotonicNow: steady });
+    const { session } = recordingSession();
+    const error = await rejection(() => run(session, execution));
+    expect(error).not.toBeInstanceOf(SlackKnownRootValidationError);
+    expect(error).not.toBeInstanceOf(SlackKnownRootDeadlineError);
+  });
+});
+
+// ── §7.3 and §7.4: the decorated session, observed at the executor it wraps ───
+
+/**
+ * Source review (KR-12 in part). These cases drive the two PUBLIC primitives against a scripted
+ * session and read the contract off the only place it is observable without a database: the
+ * statements that reach the caller's own executor, in the order they reach it, and the values they
+ * carry.
+ *
+ * The script is a small model of the server, not a copy of the implementation. It recognises a
+ * timeout assignment by what it DOES — `set_config('statement_timeout' | 'lock_timeout', …)` or a
+ * `SET` of either, local or not — and applies it to its own "effective settings"; it answers a read
+ * of those settings; and everything else is a data statement, recorded with the settings in effect
+ * when it was dispatched. No case counts statements or matches a statement's text beyond that, so an
+ * implementation is free in how many reads it makes and how it words them.
+ *
+ * Cases marked "(control)" are expected to pass at the source-reviewed checkpoint and are the
+ * lifecycle evidence that was missing. The regressing-clock case is expected to FAIL there.
+ */
+describe("known-root decorated session — statement order, refreshed timeouts, restoration and closure", () => {
+  type TimeoutName = "statement_timeout" | "lock_timeout";
+  interface Settings { statementMs: number; lockMs: number }
+  interface Assignment { name: TimeoutName; ms: number; local: boolean }
+  type Logged =
+    | { kind: "settings-read" }
+    | { kind: "timeouts"; assignments: Assignment[] }
+    | { kind: "data"; text: string; effective: Settings };
+
+  function milliseconds(value: unknown): number {
+    const match = /^(\d+)\s*(ms|s|min)?$/.exec(String(value).trim());
+    if (!match) return Number.NaN;
+    const amount = Number(match[1]);
+    return match[2] === "s" ? amount * 1_000 : match[2] === "min" ? amount * 60_000 : amount;
+  }
+
+  /** Every timeout assignment a statement makes, whichever of the server's spellings it uses. */
+  function timeoutAssignments(text: string, params: readonly unknown[]): Assignment[] {
+    const found: Assignment[] = [];
+    const call = /set_config\s*\(\s*'(statement_timeout|lock_timeout)'\s*,\s*(?:\$(\d+)(?:::\w+)?|'([^']*)')\s*,\s*(true|false)\s*\)/gi;
+    for (const match of text.matchAll(call)) {
+      found.push({
+        name: match[1].toLowerCase() as TimeoutName,
+        ms: milliseconds(match[2] ? params[Number(match[2]) - 1] : match[3]),
+        local: match[4].toLowerCase() === "true",
+      });
+    }
+    const statement = /\bset\s+(local\s+|session\s+)?(statement_timeout|lock_timeout)\s*(?:=|\bto\b)\s*'?(\w+)'?/gi;
+    for (const match of text.matchAll(statement)) {
+      found.push({ name: match[2].toLowerCase() as TimeoutName, ms: milliseconds(match[3]), local: /^local/i.test(match[1] ?? "") });
+    }
+    return found;
+  }
+
+  interface Script {
+    original?: Settings;
+    /** Rows for a data statement. May advance a clock, throw, or wait. */
+    respond?: (text: string, params: readonly unknown[]) => unknown[] | Promise<unknown[]>;
+    /** Called for a timeout statement AFTER its assignments were recorded; may throw to fail it. */
+    onTimeouts?: (assignments: Assignment[], dataSoFar: number) => void;
+  }
+
+  function scriptedSession(script: Script = {}) {
+    const original: Settings = script.original ?? { statementMs: 30_000, lockMs: 1_500 };
+    const effective: Settings = { ...original };
+    const log: Logged[] = [];
+    const other: string[] = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const executeSql = (async (text: string, params: unknown[] = []) => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      try {
+        const assignments = timeoutAssignments(text, params);
+        if (assignments.length > 0) {
+          log.push({ kind: "timeouts", assignments });
+          for (const assignment of assignments) {
+            if (assignment.name === "statement_timeout") effective.statementMs = assignment.ms;
+            else effective.lockMs = assignment.ms;
+          }
+          script.onTimeouts?.(assignments, log.filter((entry) => entry.kind === "data").length);
+          return { rows: [{}], rowCount: 1 };
+        }
+        // The model answers ONE way of reading the settings: the `pg_settings` catalog, whose
+        // `setting` is the server-normalized value in the setting's own unit (milliseconds here).
+        // Any other read reaches the script as a data statement.
+        if (/\bpg_settings\b/i.test(text)) {
+          log.push({ kind: "settings-read" });
+          const rows = [
+            { name: "statement_timeout", setting: String(effective.statementMs), unit: "ms" },
+            { name: "lock_timeout", setting: String(effective.lockMs), unit: "ms" },
+          ];
+          return { rows, rowCount: rows.length };
+        }
+        log.push({ kind: "data", text, effective: { ...effective } });
+        const rows = await (script.respond ? script.respond(text, params) : []);
+        return { rows, rowCount: rows.length };
+      } finally {
+        inFlight--;
+      }
+    }) as SqlExecutor;
+    const session = {
+      get db(): never {
+        other.push("db");
+        throw new Error("fixture: the caller's own db client was used");
+      },
+      executeSql,
+      optionalAudit: async <T>(_operation: () => Promise<T>, fallback: T): Promise<T> => {
+        other.push("optionalAudit");
+        return fallback;
+      },
+    } as unknown as TransactionSession;
+    return {
+      session, log, other, original, effective,
+      maxInFlight: () => maxInFlight,
+      data: () => log.filter((entry): entry is Extract<Logged, { kind: "data" }> => entry.kind === "data"),
+      assignments: () => log.flatMap((entry) => (entry.kind === "timeouts" ? entry.assignments : [])),
+    };
+  }
+  type Scripted = ReturnType<typeof scriptedSession>;
+
+  const pageRequest = { teamId: TEAM, pageSize: 10, revisitAfterMs: REVISIT_MS } as const;
+  /** A stored gate row that is ready for the fixture locator: the real gate helper reads it. */
+  const readyGateRow = {
+    team_id: TEAM, raw_channel_id: "C0KNOWN1", state: "ready", revision: "3", ready_revision: "3",
+    resolved_workspace_ids: ["T0SOURCE1"], completed_repair_id: "0c000000-0000-4000-8000-00000000000c", blocked_reason: null,
+  };
+
+  /** The order every outcome shares: settings are read before anything is set, and each data statement runs under a fresh assignment. */
+  function expectOrdered(scripted: Scripted): void {
+    const kinds = scripted.log.map((entry) => entry.kind);
+    expect(kinds[0], "the original settings are read first").toBe("settings-read");
+    // Between that first read and the last data statement the settings are only ever SET, each time
+    // just before a data statement. A read-back that verifies the restoration afterwards is allowed;
+    // a second read in the middle would not be the originals any more.
+    const lastData = kinds.lastIndexOf("data");
+    expect(kinds.slice(1, Math.max(lastData, 1)).filter((kind) => kind === "settings-read"), "no settings read between entry and the last data statement").toEqual([]);
+    // Every assignment before the last data statement belongs to a data statement: it is directly
+    // followed by one. Nothing is set and then left unused in the middle of the operation.
+    kinds.slice(0, Math.max(lastData, 0)).forEach((kind, index) => {
+      if (kind === "timeouts") expect(kinds[index + 1], `the assignment at ${index} is followed by its data statement`).toBe("data");
+    });
+    scripted.log.forEach((entry, index) => {
+      if (entry.kind !== "data") return;
+      const previous = scripted.log[index - 1];
+      expect(previous?.kind, `data statement ${index} is immediately preceded by a timeout assignment`).toBe("timeouts");
+      const names = previous?.kind === "timeouts" ? previous.assignments.map((assignment) => assignment.name).sort() : [];
+      expect(names, `both timeouts are set before data statement ${index}`).toEqual(["lock_timeout", "statement_timeout"]);
+    });
+    // Nothing is ever set for the SESSION: a pooled connection keeps whatever outlives the transaction.
+    expect(scripted.assignments().filter((assignment) => !assignment.local), "every assignment is transaction-local").toEqual([]);
+    for (const assignment of scripted.assignments()) expect(Number.isSafeInteger(assignment.ms) && assignment.ms >= 0, "an assignment is whole milliseconds").toBe(true);
+    expect(scripted.maxInFlight(), "the caller's executor never has two statements in flight").toBe(1);
+    expect(scripted.other, "the caller's own db client and audit helper were never used").toEqual([]);
+  }
+
+  /** A normal result leaves both settings exactly as it found them, and the restoring assignment is the last statement. */
+  function expectRestored(scripted: Scripted): void {
+    // What follows the last data statement (or the entry read, when no data statement ran) is the
+    // restoration and nothing else: at least one assignment, optionally a read-back that verifies it,
+    // and never another data statement or an assignment after that read-back.
+    const kinds = scripted.log.map((entry) => entry.kind);
+    const tail = kinds.slice(Math.max(kinds.lastIndexOf("data"), 0) + 1);
+    expect(tail.filter((kind) => kind === "data"), "no data statement follows the restoration").toEqual([]);
+    expect(tail.filter((kind) => kind === "timeouts").length, "the settings are restored after the last data statement").toBeGreaterThanOrEqual(1);
+    const firstReadBack = tail.indexOf("settings-read");
+    if (firstReadBack >= 0) expect(tail.slice(firstReadBack), "nothing but read-backs follows a read-back").toEqual(tail.slice(firstReadBack).map(() => "settings-read"));
+    expect(scripted.effective, "both original settings are in effect again").toEqual(scripted.original);
+  }
+
+  /** After a failed data statement nothing more is sent: no assignment, no restoration, no read, no data. */
+  function expectNothingAfterLastData(scripted: Scripted): void {
+    const kinds = scripted.log.map((entry) => entry.kind);
+    const lastData = kinds.lastIndexOf("data");
+    expect(lastData, "a data statement was dispatched").toBeGreaterThanOrEqual(0);
+    expect(kinds.slice(lastData + 1), "no statement of any kind was sent after the failing data statement").toEqual([]);
+    expect(kinds.slice(lastData + 1).filter((kind) => kind === "timeouts"), "in particular no timeout assignment or restoration").toEqual([]);
+  }
+
+  it("reads the original settings first, then sets both timeouts afresh before EVERY data statement from the time that is left (control)", async () => {
+    const clock = { now: 500_000 };
+    // Every data statement takes 300 ms and finds one item: a first page of a non-empty team.
+    const scripted = scriptedSession({
+      original: { statementMs: 0, lockMs: 0 },
+      respond: () => { clock.now += 300; return [{ id: ITEM }]; },
+    });
+    const context = createSlackKnownRootExecution({ ambientDeadlineAt: null, monotonicNow: () => clock.now });
+    const page = await readSlackKnownRootItemPage(scripted.session, pageRequest, context);
+    expect(page.examined).toBe(1);
+
+    expectOrdered(scripted);
+    const data = scripted.data();
+    // The upper bound and the id read are separate reads by §4.2: at least two data statements.
+    expect(data.length, "a first page of a non-empty team is more than one read").toBeGreaterThanOrEqual(2);
+    data.forEach((statement, index) => {
+      const remaining = SLACK_KNOWN_ROOT_LIMITS.allowanceMs.default - 300 * index;
+      // No more than what is left of the allowance, and not an arbitrary smaller number either.
+      expect(statement.effective.statementMs, `statement timeout of data statement ${index}`).toBeLessThanOrEqual(remaining);
+      expect(statement.effective.statementMs, `statement timeout of data statement ${index}`).toBeGreaterThanOrEqual(remaining - 1);
+      expect(statement.effective.lockMs, `lock timeout of data statement ${index}`).toBeLessThanOrEqual(Math.min(SLACK_KNOWN_ROOT_LIMITS.lockTimeoutMs, remaining));
+      // Zero would DISABLE the limit: an assignment before a data statement is never zero.
+      expect(statement.effective.statementMs).toBeGreaterThanOrEqual(1);
+      expect(statement.effective.lockMs).toBeGreaterThanOrEqual(1);
+      if (index > 0) expect(statement.effective.statementMs, "refreshed, not reused").toBeLessThan(data[index - 1].effective.statementMs);
+    });
+    expectRestored(scripted);
+  });
+
+  it.each<[string, Settings, Settings]>([
+    ["a stricter original statement timeout and lock timeout", { statementMs: 50, lockMs: 20 }, { statementMs: 50, lockMs: 20 }],
+    ["a stricter original statement timeout with the lock timeout disabled", { statementMs: 40, lockMs: 0 }, { statementMs: 40, lockMs: 40 }],
+    ["a stricter original lock timeout with the statement timeout disabled", { statementMs: 0, lockMs: 100 }, { statementMs: 2_000, lockMs: 100 }],
+    ["a looser original statement timeout", { statementMs: 30_000, lockMs: 10_000 }, { statementMs: 2_000, lockMs: 250 }],
+  ])("never loosens %s (control)", async (_label, original, ceiling) => {
+    const scripted = scriptedSession({ original, respond: () => [{ id: ITEM }] });
+    const context = createSlackKnownRootExecution({ ambientDeadlineAt: null, monotonicNow: () => 500_000 });
+    await readSlackKnownRootItemPage(scripted.session, pageRequest, context);
+    expectOrdered(scripted);
+    expect(scripted.data().length).toBeGreaterThanOrEqual(1);
+    for (const statement of scripted.data()) {
+      expect(statement.effective.statementMs).toBeGreaterThanOrEqual(1);
+      expect(statement.effective.statementMs).toBeLessThanOrEqual(ceiling.statementMs);
+      expect(statement.effective.lockMs).toBeGreaterThanOrEqual(1);
+      expect(statement.effective.lockMs).toBeLessThanOrEqual(ceiling.lockMs);
+    }
+    // Restored to the ORIGINALS, including a disabled (zero) one — not to this packet's own caps.
+    expectRestored(scripted);
+  });
+
+  // EXPECTED RED at the source-reviewed checkpoint (review finding S6). The remaining time is
+  // computed from the clock alone, so a monotonic clock that reads EARLIER than it did when the
+  // context was created yields more "remaining" than the allowance that was declared, and that is
+  // handed to the server as the statement timeout. With the original limit disabled nothing else
+  // caps it. A context never grants more than its own allowance, whatever the clock says later.
+  //
+  // One case per module AND per allowance, so each is reported on its own.
+  const REGRESSING_SUBJECTS: [string, (scripted: Scripted, context: never) => Promise<unknown>][] = [
+    ["the page reader", (scripted, context) => readSlackKnownRootItemPage(scripted.session, pageRequest, context)],
+    ["the preparer", (scripted, context) => prepareSlackKnownRootRequeue(scripted.session, { teamId: TEAM, entry: located() }, context)],
+  ];
+  const REGRESSING_CASES = REGRESSING_SUBJECTS.flatMap(([subject, run]) =>
+    [1_000, 2_000, 5_000].map((allowanceMs): [string, number, typeof run] => [subject, allowanceMs, run]));
+
+  it.each(REGRESSING_CASES)("never sets a statement timeout above the declared allowance when the monotonic clock regresses: %s, allowance %d ms", async (_subject, allowanceMs, run) => {
+    let regressed = false;
+    const scripted = scriptedSession({ original: { statementMs: 0, lockMs: 0 }, respond: () => [] });
+    const context = createSlackKnownRootExecution({
+      allowanceMs, ambientDeadlineAt: null, monotonicNow: () => (regressed ? 400_000 : 1_000_000),
+    });
+    // Ten minutes EARLIER on every reading after creation.
+    regressed = true;
+    let rejected: unknown;
+    let settled = false;
+    try {
+      await run(scripted, context as never);
+      settled = true;
+    } catch (error) {
+      rejected = error;
+    }
+    // Either the operation ran under its allowance, or it refused the clock outright: what it may
+    // not do is run a statement with more time than the context declared.
+    if (!settled) {
+      // A refusal is one of the packet's two static errors, exactly — never an arbitrary rejection,
+      // and never something a dependency or the session happened to throw.
+      const staticRefusal =
+        (rejected instanceof SlackKnownRootValidationError && rejected.message === STATIC_VALIDATION_MESSAGE) ||
+        (rejected instanceof SlackKnownRootDeadlineError && rejected.message === STATIC_DEADLINE_MESSAGE);
+      expect(staticRefusal, "a refusal of a regressing clock is the static validation or deadline error").toBe(true);
+      expectNoCanary(rejected, "a refusal of the clock");
+    }
+    expect(scripted.data().length > 0 || !settled, "the operation ran a statement or refused").toBe(true);
+    for (const statement of scripted.data()) {
+      expect(statement.effective.statementMs, "statement timeout").toBeGreaterThanOrEqual(1);
+      expect(statement.effective.statementMs, "statement timeout").toBeLessThanOrEqual(allowanceMs);
+      expect(statement.effective.lockMs, "lock timeout").toBeGreaterThanOrEqual(1);
+      expect(statement.effective.lockMs, "lock timeout").toBeLessThanOrEqual(Math.min(SLACK_KNOWN_ROOT_LIMITS.lockTimeoutMs, allowanceMs));
+    }
+    for (const assignment of scripted.assignments().filter((candidate) => candidate.name === "statement_timeout" && candidate.ms !== 0)) {
+      expect(assignment.ms, "no statement timeout assignment exceeds the allowance").toBeLessThanOrEqual(allowanceMs);
+    }
+  });
+
+  // EXPECTED RED at checkpoint b075dfba (affected-fix review, MEDIUM). Capping what admission
+  // returns at the allowance bounds the TIMEOUTS, but admission itself still trusts the clock: the
+  // remaining time is the effective deadline minus a clock reading, and a reading from before the
+  // context was created makes ANY deadline look comfortably ahead. A context whose ambient deadline
+  // had already passed when it was created is then admitted, and one whose ambient deadline left it
+  // 300 ms is granted its whole allowance. The effective deadline is the earlier of the two by
+  // §7.2; a clock that has gone backwards past the context's own creation cannot extend it. Under
+  // such a clock the remaining time is unknowable, so the primitive must not start: no data
+  // statement, and one of the packet's two static errors — not whatever happens to be thrown.
+  const AMBIENT_REGRESSIONS: [string, { allowanceMs?: number; ambientOffsetMs: number }][] = [
+    ["an ambient deadline that had passed 1 ms before creation", { ambientOffsetMs: -1 }],
+    ["an ambient deadline that had passed a minute before creation", { ambientOffsetMs: -60_000 }],
+    ["an ambient deadline 300 ms after creation under the default allowance", { ambientOffsetMs: 300 }],
+    ["an ambient deadline 300 ms after creation under a 5,000 ms allowance", { allowanceMs: 5_000, ambientOffsetMs: 300 }],
+  ];
+  const AMBIENT_REGRESSION_CASES = REGRESSING_SUBJECTS.flatMap(([subject, run]) =>
+    AMBIENT_REGRESSIONS.map(([label, shape]): [string, string, typeof shape, typeof run] => [subject, label, shape, run]));
+
+  it.each(AMBIENT_REGRESSION_CASES)("does not start under a regressed clock that would outrun the effective deadline: %s, %s", async (_subject, _label, shape, run) => {
+    const createdAt = 1_000_000;
+    let regressed = false;
+    // Every data statement finds nothing, so a primitive that DOES start simply completes — an empty
+    // page, or a refusal at the namespace gate — and the failure below is that it ran at all.
+    const scripted = scriptedSession({ original: { statementMs: 0, lockMs: 0 }, respond: () => [] });
+    let context: unknown;
+    // Creating the context is allowed in every one of these: an ambient deadline that has passed, or
+    // one that is close, is a fact about the caller's time, not a malformed option.
+    expect(() => {
+      context = createSlackKnownRootExecution({
+        ...(shape.allowanceMs === undefined ? {} : { allowanceMs: shape.allowanceMs }),
+        ambientDeadlineAt: createdAt + shape.ambientOffsetMs,
+        monotonicNow: () => (regressed ? 400_000 : createdAt),
+      });
+    }, "creating the context is allowed").not.toThrow();
+    // Fixture precondition: the effective deadline is the AMBIENT one, not the allowance.
+    expect((context as { deadlineAt: number }).deadlineAt, "fixture: the ambient deadline is the effective one").toBe(createdAt + shape.ambientOffsetMs);
+
+    // Ten minutes EARLIER on every reading from here on.
+    regressed = true;
+    let rejected: unknown;
+    let settled = false;
+    try {
+      await run(scripted, context as never);
+      settled = true;
+    } catch (error) {
+      rejected = error;
+    }
+
+    expect(settled, "the primitive did not run to a result").toBe(false);
+    // Exactly one of the two approved static errors, with its static message.
+    const staticRefusal =
+      (rejected instanceof SlackKnownRootValidationError && rejected.message === STATIC_VALIDATION_MESSAGE) ||
+      (rejected instanceof SlackKnownRootDeadlineError && rejected.message === STATIC_DEADLINE_MESSAGE);
+    expect(staticRefusal, "the refusal is the static validation or deadline error, exactly").toBe(true);
+    expectNoCanary(rejected, "a refusal of the clock");
+    // Nothing was read or written on the caller's connection under a clock nobody can trust, and no
+    // timeout was set for a statement that never ran.
+    expect(scripted.data().map((statement) => statement.text), "no data statement was dispatched").toEqual([]);
+    expect(scripted.assignments(), "no timeout was assigned").toEqual([]);
+    expect(scripted.other, "the caller's own db client and audit helper were never used").toEqual([]);
+    expect(scripted.effective, "the session settings are untouched").toEqual(scripted.original);
+    // The refusal is reportable only as a closed category, like any other.
+    expect(SLACK_KNOWN_ROOT_FAILURE_CATEGORIES as readonly string[]).toContain(classifySlackKnownRootPreparationFailure(rejected));
+  });
+
+  it.each<[string, Script["respond"], (scripted: Scripted) => Promise<unknown>, unknown]>([
+    [
+      "the page reader on an empty team", () => [],
+      (scripted) => readSlackKnownRootItemPage(scripted.session, pageRequest, execution()),
+      { entries: [], nextCursor: null, exhausted: true, examined: 0 },
+    ],
+    [
+      "the page reader on a continuation that finds nothing more", () => [],
+      (scripted) => readSlackKnownRootItemPage(scripted.session, {
+        ...pageRequest,
+        cursor: { version: 1, teamId: TEAM, upperItemId: "0f000000-0000-4000-8000-00000000000f", afterItemId: ITEM, revisitAfterMs: REVISIT_MS },
+      }, execution()),
+      { entries: [], nextCursor: null, exhausted: true, examined: 0 },
+    ],
+    [
+      "the preparer refused at the namespace gate", () => [],
+      (scripted) => prepareSlackKnownRootRequeue(scripted.session, { teamId: TEAM, entry: located() }, execution()),
+      { outcome: "refused", reason: "namespace_changed_or_unready" },
+    ],
+    [
+      "the preparer refused at the integration, after the gate locked",
+      (text) => (/slack_channel_migration_gates/i.test(text) ? [readyGateRow] : []),
+      (scripted) => prepareSlackKnownRootRequeue(scripted.session, { teamId: TEAM, entry: located() }, execution()),
+      { outcome: "refused", reason: "source_not_current" },
+    ],
+  ])("restores both original settings before a normal result resolves: %s (control)", async (label, respond, run, expected) => {
+    const scripted = scriptedSession({ original: { statementMs: 30_000, lockMs: 1_500 }, respond });
+    const result = await run(scripted);
+    expect(result).toEqual(expected);
+    expectOrdered(scripted);
+    expect(scripted.data().length, "the outcome was reached through at least one data statement").toBeGreaterThanOrEqual(1);
+    // While the operation ran the settings really were changed: the restoration is not a no-op.
+    for (const statement of scripted.data()) expect(statement.effective).not.toEqual(scripted.original);
+
+    // M14 (§12): omitting EITHER restoration on a normal return must be seen, a refused outcome included.
+    // These two assertions come BEFORE the general restoration check below, so that an omitted
+    // restoration fails HERE, at the read-back that names the setting that was left behind.
+    // Each of the two settings, on its own, was something other than its original for every data
+    // statement — so putting back only one of them cannot pass for putting back both…
+    expect({
+      statement_timeout_was_not_its_original_for_any_data_statement: scripted.data().every((statement) => statement.effective.statementMs !== scripted.original.statementMs),
+      lock_timeout_was_not_its_original_for_any_data_statement: scripted.data().every((statement) => statement.effective.lockMs !== scripted.original.lockMs),
+    }, `M14: ${label}: fixture: while the operation ran, each timeout setting on its own was not its original`).toEqual({
+      statement_timeout_was_not_its_original_for_any_data_statement: true, lock_timeout_was_not_its_original_for_any_data_statement: true,
+    });
+    // …and a READ-BACK through the caller's own session, after the normal result and in the same
+    // transaction as far as this model goes, finds each original value again, named one by one. It is
+    // the model's answer to a read of the settings, not this test's own copy of the model's state.
+    const readBack = await scripted.session.executeSql<{ name: string; setting: string }>(
+      "select name, setting from pg_settings where name in ('statement_timeout', 'lock_timeout')"
+    );
+    expect(Object.fromEntries(readBack.rows.map((row) => [row.name, Number(row.setting)])),
+      `M14: ${label}: a read-back on the caller's own session after the normal result finds the original statement_timeout and the original lock_timeout`)
+      .toEqual({ statement_timeout: scripted.original.statementMs, lock_timeout: scripted.original.lockMs });
+    // The general check, after the read-back: the restoring assignment follows the last data
+    // statement, and nothing but read-backs — this case's own, above — follows it.
+    expectRestored(scripted);
+  });
+
+  it("issues no statement at all for an unlocated entry: there is nothing to set and nothing to restore (control)", async () => {
+    const scripted = scriptedSession();
+    const entry: SlackKnownRootEntry = { teamId: TEAM, itemId: ITEM, revisitAfterMs: REVISIT_MS, unlocated: "invalid_metadata" };
+    expect(await prepareSlackKnownRootRequeue(scripted.session, { teamId: TEAM, entry }, execution()))
+      .toEqual({ outcome: "unattested", reason: "invalid_metadata" });
+    expect(scripted.log).toEqual([]);
+    expect(scripted.effective).toEqual(scripted.original);
+  });
+
+  it.each<[string, (scripted: Scripted) => Promise<unknown>]>([
+    ["the page reader", (scripted) => readSlackKnownRootItemPage(scripted.session, pageRequest, execution())],
+    ["the preparer", (scripted) => prepareSlackKnownRootRequeue(scripted.session, { teamId: TEAM, entry: located() }, execution())],
+  ])("rethrows a failed statement as it is and sends nothing after it — no restoration: %s (control)", async (_label, run) => {
+    // After a SQL failure the transaction may be aborted: a restoring statement would only mask the
+    // primary error, and the caller's rollback undoes transaction-local settings by itself.
+    const failure = Object.assign(new Error(`canceling statement: ${CANARY.sql}`), { code: "57014" });
+    const scripted = scriptedSession({ respond: () => { throw failure; } });
+    const error = await rejection(() => run(scripted));
+    expect(error, "the very same error object, for the caller's rollback and retry logic").toBe(failure);
+    expect(scripted.data(), "the failing statement was the only data statement").toHaveLength(1);
+    expect(scripted.log.at(-1)?.kind, "nothing was sent after the failed statement").toBe("data");
+    // Read off the event log itself: after the failing data statement there is no assignment, no
+    // restoration, no read and no further data statement.
+    expectNothingAfterLastData(scripted);
+    // …and the assignment that preceded the failing statement is therefore still in effect on the
+    // model: the settings were NOT put back by the packet. Rollback is what undoes them.
+    expect(scripted.effective, "no restoring assignment was applied").not.toEqual(scripted.original);
+    expect(scripted.maxInFlight()).toBe(1);
+    expect(classifySlackKnownRootPreparationFailure(error)).toBe("statement_timeout");
+  });
+
+  it.each<[string, (scripted: Scripted, context: never) => Promise<unknown>]>([
+    ["the page reader", (scripted, context) => readSlackKnownRootItemPage(scripted.session, pageRequest, context)],
+    ["the preparer", (scripted, context) => prepareSlackKnownRootRequeue(scripted.session, { teamId: TEAM, entry: located() }, context)],
+  ])("throws the deadline error when a statement outlives the allowance, and runs no further data statement: %s (control)", async (_label, run) => {
+    const clock = { now: 500_000 };
+    const scripted = scriptedSession({
+      respond: (text) => {
+        clock.now += 60_000;
+        return /slack_channel_migration_gates/i.test(text) ? [readyGateRow] : [{ id: ITEM }];
+      },
+    });
+    const context = createSlackKnownRootExecution({ ambientDeadlineAt: null, monotonicNow: () => clock.now });
+    const error = await rejection(() => run(scripted, context as never));
+    expect(error).toBeInstanceOf(SlackKnownRootDeadlineError);
+    expect(scripted.data(), "the statement that ran out the clock was the last data statement").toHaveLength(1);
+    expect(classifySlackKnownRootPreparationFailure(error)).toBe("deadline_exceeded");
+  });
+
+  it("never reports success when the restoring assignment itself fails (control)", async () => {
+    const failure = Object.assign(new Error("current transaction is aborted"), { code: "25P02" });
+    const original = { statementMs: 30_000, lockMs: 1_500 };
+    // The restoring assignment is the one that sets BOTH settings back to the originals after data ran.
+    const scripted = scriptedSession({
+      original,
+      respond: () => [],
+      onTimeouts: (assignments, dataSoFar) => {
+        const restoring = dataSoFar > 0 &&
+          assignments.some((assignment) => assignment.name === "statement_timeout" && assignment.ms === original.statementMs) &&
+          assignments.some((assignment) => assignment.name === "lock_timeout" && assignment.ms === original.lockMs);
+        if (restoring) throw failure;
+      },
+    });
+    const error = await rejection(() => readSlackKnownRootItemPage(scripted.session, pageRequest, execution()));
+    expect(error, "the restoration failure is thrown, not swallowed into an empty page").toBe(failure);
+    expect(classifySlackKnownRootPreparationFailure(error)).toBe("database_failure");
+  });
+
+  it("hands its dependencies a session whose db and audit helper refuse, whose statements are sequential, and which stops working once the primitive settles (control)", async () => {
+    const scripted = scriptedSession({ respond: () => [{ probe: 1 }] });
+    let handed: TransactionSession | null = null;
+    const seen: Record<string, unknown> = {};
+    let auditRan = false;
+    gateSeat.current = async (session: unknown) => {
+      const decorated = session as TransactionSession;
+      handed = decorated;
+      // The builder: getting it, or using it, must fail — it must never yield a working client.
+      seen.db = thrown(() => (decorated.db as unknown as { from: (table: string) => unknown }).from("items"));
+      // The savepoint helper: it must fail, and must neither run the operation nor answer the fallback.
+      seen.audit = await rejection(async () => decorated.optionalAudit(async () => { auditRan = true; return "ran"; }, "fallback"));
+      // Statements still work while the operation is running…
+      seen.probe = await decorated.executeSql("select 1 as probe");
+      // …one at a time, however a dependency issues them.
+      seen.pair = await Promise.allSettled([decorated.executeSql("select 'first' as probe"), decorated.executeSql("select 'second' as probe")]);
+      return { outcome: "refused" };
+    };
+
+    const result = await prepareSlackKnownRootRequeue(scripted.session, { teamId: TEAM, entry: located() }, execution());
+    expect(result).toEqual({ outcome: "refused", reason: "namespace_changed_or_unready" });
+    // The handed session is never given to a matcher as a VALUE: `toBe` on two different objects
+    // goes on to compare them deeply for its hint, which reads `db` on both — and each getter throws,
+    // one of them recording a use of the caller's own client. Identity is decided here, as booleans.
+    expect((handed as unknown) !== null, "the gate helper was handed a session").toBe(true);
+    expect(Object.is(handed, scripted.session), "…and not the caller's own").toBe(false);
+
+    expect(seen.db, "the decorated db refuses").toBeInstanceOf(Error);
+    expect(seen.audit, "the decorated audit helper refuses").toBeInstanceOf(Error);
+    expect(auditRan, "the audited operation never ran").toBe(false);
+    expect(scripted.other, "neither capability reached the caller's own session").toEqual([]);
+    expect(seen.probe).toMatchObject({ rows: [{ probe: 1 }] });
+    expect((seen.pair as PromiseSettledResult<unknown>[])[0].status, "the first of two statements ran").toBe("fulfilled");
+    expectOrdered(scripted);
+    expectRestored(scripted);
+
+    // After the primitive has settled, the executor somebody kept is of no further use: it rejects,
+    // and nothing reaches the caller's connection.
+    const kept = handed as unknown as TransactionSession;
+    const before = scripted.log.length;
+    expect(await rejection(() => kept.executeSql("select 1 as late")), "a retained executor rejects").toBeInstanceOf(Error);
+    expect(scripted.log, "nothing was sent after the primitive settled").toHaveLength(before);
+    // The getter is invoked INSIDE the callback, so the matcher observes it throwing.
+    expect(() => kept.db, "the retained session's db still refuses").toThrow();
+    expect(thrown(() => (kept.db as unknown as { from: (table: string) => unknown }).from("items"))).toBeInstanceOf(Error);
+    expect(scripted.other, "the caller's own session was still never used").toEqual([]);
+    expect(scripted.effective, "the settings stayed restored").toEqual(scripted.original);
+  });
+
+  it("leaves a retained executor unusable after a primitive that THREW as well (control)", async () => {
+    // The dependency runs one statement that works and one that FAILS on the caller's connection,
+    // and lets that failure propagate.
+    const failure = new Error("dependency failed");
+    const scripted = scriptedSession({
+      respond: (text) => {
+        if (/failing_probe/.test(text)) throw failure;
+        return [{ probe: 1 }];
+      },
+    });
+    let handed: TransactionSession | null = null;
+    gateSeat.current = async (session: unknown) => {
+      const decorated = session as TransactionSession;
+      handed = decorated;
+      await decorated.executeSql("select 1 as working_probe");
+      await decorated.executeSql("select 1 as failing_probe");
+      return { outcome: "locked" };
+    };
+    const error = await rejection(() => prepareSlackKnownRootRequeue(scripted.session, { teamId: TEAM, entry: located() }, execution()));
+    expect(error).toBeInstanceOf(Error);
+    expect(error, "the dependency's own failure, as it was thrown").toBe(failure);
+    expect(classifySlackKnownRootPreparationFailure(error)).toBe("dependency_failure");
+    const kept = handed as unknown as TransactionSession;
+    // As above: decided as a boolean, never by handing the getter-bearing session to a matcher.
+    expect((handed as unknown) !== null, "the gate helper was handed a session").toBe(true);
+
+    // The event log, not an absence that was never possible: two data statements were dispatched,
+    // the second is the one that failed, and NOTHING was sent after it — no timeout assignment, no
+    // restoration, no read-back.
+    const data = scripted.data();
+    expect(data.map((statement) => /failing_probe/.test(statement.text)), "a working statement, then the failing one").toEqual([false, true]);
+    expectNothingAfterLastData(scripted);
+    // Each of the two was still preceded by its own assignment, and nothing was session-level.
+    const kinds = scripted.log.map((entry) => entry.kind);
+    expect(kinds[0], "the original settings were read first").toBe("settings-read");
+    kinds.forEach((kind, index) => {
+      if (kind === "data") expect(kinds[index - 1], `data statement ${index} was preceded by its assignment`).toBe("timeouts");
+    });
+    expect(scripted.assignments().filter((assignment) => !assignment.local)).toEqual([]);
+    // The settings in effect are the ones set for the failing statement: the packet restored nothing.
+    expect(scripted.effective, "no restoring assignment was applied").not.toEqual(scripted.original);
+
+    const before = scripted.log.length;
+    expect(await rejection(() => kept.executeSql("select 1 as late"))).toBeInstanceOf(Error);
+    expect(scripted.log).toHaveLength(before);
+  });
+
+  // ── §12 M13: every later data statement gets the REDUCED remaining budget ──
+
+  /**
+   * M13 (§7.3, §12). The first case of this suite already holds the statement timeout to the time
+   * that is left, statement by statement; there the time left never falls below the lock timeout's
+   * own 250 ms cap, so the LOCK timeout is 250 ms throughout and would look the same if it were
+   * computed once and reused. Here a later, slow statement leaves LESS than that cap: under a
+   * controlled monotonic clock and a 1,000 ms allowance the data statements take 500 ms, 350 ms and
+   * 100 ms, so they are dispatched with 1,000 ms, 500 ms and 150 ms left.
+   *
+   * Each data statement must run under a statement timeout of what is left, and a lock timeout of
+   * the lesser of its cap and what is left. A session that reuses the first statement's timeouts
+   * fails at the second statement, or — for the lock timeout alone — at the third. Each bound is
+   * two-sided, to within the one whole millisecond the first case allows: "no more than what is
+   * left" alone would also be satisfied by an arbitrary small cap, which is a different behaviour.
+   *
+   * What is left is computed here from the clock reading at which the model saw each data statement
+   * dispatched, so the case does not depend on how many statements a page takes beyond the three it
+   * needs.
+   */
+  it("M13: gives every later data statement the reduced remaining budget — the statement timeout, and the lock timeout once less than its cap is left", async () => {
+    const createdAt = 500_000;
+    const allowanceMs = 1_000;
+    const durations = [500, 350, 100];
+    const clock = { now: createdAt };
+    const dispatchedAt: number[] = [];
+    const scripted = scriptedSession({
+      original: { statementMs: 0, lockMs: 0 },
+      respond: () => {
+        dispatchedAt.push(clock.now);
+        clock.now += durations[dispatchedAt.length - 1] ?? 0;
+        return [{ id: ITEM }];
+      },
+    });
+    const context = createSlackKnownRootExecution({ allowanceMs, ambientDeadlineAt: null, monotonicNow: () => clock.now });
+    const page = await readSlackKnownRootItemPage(scripted.session, pageRequest, context);
+    expect(page.examined, "M13: fixture: the page read completed normally, with its one item").toBe(1);
+
+    const data = scripted.data();
+    const cap = SLACK_KNOWN_ROOT_LIMITS.lockTimeoutMs;
+    const left = dispatchedAt.map((at) => allowanceMs - (at - createdAt));
+    // FIXTURE: at least three data statements, each of the first three with less left than the one
+    // before it, the third with less than the lock timeout's cap, and time still left at the end.
+    expect({
+      one_reading_per_data_statement: data.length === dispatchedAt.length,
+      left_at_the_first_three: left.slice(0, 3),
+      less_than_the_lock_cap_is_left_at_the_third: left[2] < cap,
+      something_is_left_at_every_one: left.every((ms) => ms >= 1),
+    }, "M13: fixture: three data statements dispatched with 1,000 ms, 500 ms and 150 ms left").toEqual({
+      one_reading_per_data_statement: true, left_at_the_first_three: [1_000, 500, 150],
+      less_than_the_lock_cap_is_left_at_the_third: true, something_is_left_at_every_one: true,
+    });
+
+    data.forEach((statement, index) => {
+      const lockBudget = Math.min(cap, left[index]);
+      expect(statement.effective.statementMs, `M13: data statement ${index}: the statement timeout is no more than the ${left[index]} ms that are left`).toBeLessThanOrEqual(left[index]);
+      expect(statement.effective.statementMs, `M13: data statement ${index}: the statement timeout is the ${left[index]} ms that are left, not an arbitrary smaller cap`).toBeGreaterThanOrEqual(left[index] - 1);
+      expect(statement.effective.lockMs, `M13: data statement ${index}: the lock timeout is no more than ${lockBudget} ms, the lesser of its cap and what is left`).toBeLessThanOrEqual(lockBudget);
+      expect(statement.effective.lockMs, `M13: data statement ${index}: the lock timeout is ${lockBudget} ms, the lesser of its cap and what is left, not an arbitrary smaller cap`).toBeGreaterThanOrEqual(lockBudget - 1);
+    });
+    expectOrdered(scripted);
+    expectRestored(scripted);
+  });
+
+  // ── §12 M9: a rejecting executor is never turned into a result ──
+
+  /**
+   * Each subject would, undisturbed, resolve with exactly the kind of value a swallowed failure is
+   * turned into; that value is written out and required of the undisturbed run. These five are SHORT
+   * paths: the two preparer subjects end at the namespace gate and at the integration's selection
+   * lock. The full preparation path, through to the enqueue, is the M9 case of the due-output suite
+   * below, which has the scripted answers for it.
+   */
+  const M9_SUBJECTS: [string, Script["respond"], (session: TransactionSession) => Promise<unknown>, unknown][] = [
+    [
+      "the page reader on a non-empty team", () => [{ id: ITEM }],
+      (session) => readSlackKnownRootItemPage(session, pageRequest, execution()),
+      { entries: [{ teamId: TEAM, itemId: ITEM, revisitAfterMs: REVISIT_MS, unlocated: "not_slack" }], nextCursor: null, exhausted: true, examined: 1 },
+    ],
+    [
+      "the page reader on an empty team", () => [],
+      (session) => readSlackKnownRootItemPage(session, pageRequest, execution()),
+      { entries: [], nextCursor: null, exhausted: true, examined: 0 },
+    ],
+    [
+      // A CONTINUATION: the id read after a cursor, which a first page never issues.
+      "the page reader on a continuation that finds one more item", () => [{ id: "0c000000-0000-4000-8000-00000000000c" }],
+      (session) => readSlackKnownRootItemPage(session, {
+        ...pageRequest,
+        cursor: { version: 1, teamId: TEAM, upperItemId: "0f000000-0000-4000-8000-00000000000f", afterItemId: ITEM, revisitAfterMs: REVISIT_MS },
+      }, execution()),
+      {
+        entries: [{ teamId: TEAM, itemId: "0c000000-0000-4000-8000-00000000000c", revisitAfterMs: REVISIT_MS, unlocated: "not_slack" }],
+        nextCursor: null, exhausted: true, examined: 1,
+      },
+    ],
+    [
+      "the preparer that is refused at the namespace gate", () => [],
+      (session) => prepareSlackKnownRootRequeue(session, { teamId: TEAM, entry: located() }, execution()),
+      { outcome: "refused", reason: "namespace_changed_or_unready" },
+    ],
+    [
+      "the preparer that is refused at the integration, after the gate locked",
+      (text) => (/slack_channel_migration_gates/i.test(text) ? [readyGateRow] : []),
+      (session) => prepareSlackKnownRootRequeue(session, { teamId: TEAM, entry: located() }, execution()),
+      { outcome: "refused", reason: "source_not_current" },
+    ],
+  ];
+
+  /**
+   * M9 (§7.4, §12). The executor the PUBLIC primitive is handed rejects one of its calls: the read of
+   * the original settings, a timeout assignment, a data statement, or the restoring assignment. The
+   * primitive must reject with that very failure. It must never resolve — not with an empty page,
+   * not with a refused or unattested result — which is what catching the failure and carrying on
+   * would produce, since an empty answer is exactly what these five subjects read as "nothing there".
+   *
+   * Every call position is tried, each on a fresh scripted session; the number of positions is
+   * counted from an undisturbed run through the same wrapper, not assumed. The wrapper's own db
+   * client and audit helper refuse, so no call can go round the counted executor.
+   *
+   * WHAT THIS IS NOT. It is not evidence about a transaction. Whether the caller's real transaction
+   * then rejects and rolls back is a separate behaviour that this case does not show and that is
+   * not claimed to be shown anywhere: it remains a separate, pending KR-12 concern about the real
+   * transaction. A transaction that rolled back would not show that the primitive had not swallowed
+   * the failure, either.
+   */
+  it.each(M9_SUBJECTS)("M9: rejects with the executor's own failure, and resolves no page and no result, whichever of its calls the executor rejects: %s", async (subject, respond, run, expected) => {
+    const never = new Error("fixture: never thrown");
+    const undisturbed = rejectingAt(scriptedSession({ respond }).session, 0, never);
+    const control = await rejectingEnded(run(undisturbed.session), never);
+    const total = undisturbed.calls();
+    expect([control, total >= 3, undisturbed.other], `M9: ${subject}: control: with no call rejected the primitive resolves with exactly its expected result, through several executor calls and nothing else`)
+      .toEqual([{ resolvedWith: expected }, true, []]);
+
+    for (let position = 1; position <= total; position++) {
+      const failure = Object.assign(new Error(`fixture: the executor rejected its call ${position}`), { code: "XX000" });
+      const rejecting = rejectingAt(scriptedSession({ respond }).session, position, failure);
+      expect(await rejectingEnded(run(rejecting.session), failure),
+        `M9: ${subject}: the executor rejected its call ${position} of ${total}: the primitive rejects with that same failure, and resolves no page and no result`)
+        .toEqual({ rejectedWithTheExecutorsOwnFailure: true });
+      expect(rejecting.other, `M9: ${subject}: the executor rejected its call ${position} of ${total}: neither the caller's db client nor its audit helper was asked for`).toEqual([]);
+    }
+  });
+});
+
+// ── §8.1: the pure failure classifier ────────────────────────────────────────
+
+describe("known-root failure classifier — closed categories, fixed precedence, nothing leaked", () => {
+  const sqlError = (code: string): Error => Object.assign(new Error(`driver said: ${CANARY.sql}`), { code });
+  const outer = (options: { code?: string; unknownCommit?: boolean; cause?: unknown } = {}): TransactionExecutionError =>
+    new TransactionExecutionError(`transaction failed running ${CANARY.sql}`, { sql: CANARY.sql, ...options });
+
+  it("names the closed reporting vocabulary exactly", () => {
+    expect([...SLACK_KNOWN_ROOT_FAILURE_CATEGORIES]).toEqual([
+      "lock_timeout", "statement_timeout", "deadline_exceeded", "serialization_failure", "deadlock",
+      "database_failure", "dependency_failure", "commit_unknown",
+    ]);
+  });
+
+  it.each<[string, () => unknown, string]>([
+    ["an unknown commit", () => outer({ unknownCommit: true }), "commit_unknown"],
+    ["an unknown commit carrying a retryable SQLSTATE", () => outer({ unknownCommit: true, code: "40001" }), "commit_unknown"],
+    ["an unknown commit carrying a lock-timeout SQLSTATE", () => outer({ unknownCommit: true, code: "55P03" }), "commit_unknown"],
+    ["an unknown commit carrying a Node error code", () => outer({ unknownCommit: true, code: "ECONNRESET" }), "commit_unknown"],
+    // Rung 1 above rung 2: with BOTH markers on the final rejection, the commit is what is unknown.
+    ["an unknown commit that also carries the deadline marker", () => Object.assign(outer({ unknownCommit: true }), { slackKnownRootDeadlineExceeded: true }), "commit_unknown"],
+    ["the deadline error itself marked as an unknown commit", () => Object.assign(new SlackKnownRootDeadlineError(), { unknownCommit: true }), "commit_unknown"],
+    ["an unknown commit carrying the deadline marker and a statement-timeout SQLSTATE", () => Object.assign(outer({ unknownCommit: true, code: "57014" }), { slackKnownRootDeadlineExceeded: true }), "commit_unknown"],
+    ["the slice's own deadline error", () => new SlackKnownRootDeadlineError(), "deadline_exceeded"],
+    ["the deadline error even with a statement-timeout SQLSTATE attached", () => Object.assign(new SlackKnownRootDeadlineError(), { code: "57014" }), "deadline_exceeded"],
+    ["SQLSTATE 55P03 from the driver", () => sqlError("55P03"), "lock_timeout"],
+    ["SQLSTATE 55P03 on the outer transaction error", () => outer({ code: "55P03" }), "lock_timeout"],
+    ["SQLSTATE 57014 from the driver", () => sqlError("57014"), "statement_timeout"],
+    ["SQLSTATE 57014 on the outer transaction error", () => outer({ code: "57014" }), "statement_timeout"],
+    ["SQLSTATE 40001", () => outer({ code: "40001" }), "serialization_failure"],
+    ["SQLSTATE 40P01", () => sqlError("40P01"), "deadlock"],
+    ["another SQLSTATE (23505)", () => sqlError("23505"), "database_failure"],
+    ["the outer transaction error with no SQLSTATE at all", () => outer(), "database_failure"],
+    ["the outer transaction error whose code is a Node code, not a SQLSTATE", () => outer({ code: "ECONNRESET" }), "database_failure"],
+    ["a Node error code on an ordinary error", () => Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }), "dependency_failure"],
+    // FIVE upper-case characters, exactly the length of a SQLSTATE — and not one. A classifier that
+    // tests only "five characters of [0-9A-Z]" reports a broken pipe as a database failure.
+    ["a five-character Node code (EPIPE) on an ordinary error", () => Object.assign(new Error("write EPIPE"), { code: "EPIPE" }), "dependency_failure"],
+    ["a five-character Node code (EPERM) on an ordinary error", () => Object.assign(new Error("operation not permitted"), { code: "EPERM" }), "dependency_failure"],
+    ["a five-character Node code (EBUSY) on an ordinary error", () => Object.assign(new Error("resource busy"), { code: "EBUSY" }), "dependency_failure"],
+    // …while the same code on the shared transaction error is that error type, by rung 7's second clause.
+    ["the outer transaction error whose code is EPIPE", () => outer({ code: "EPIPE" }), "database_failure"],
+    ["an ordinary dependency exception", () => new Error(`dependency failed: ${CANARY.metadata}`), "dependency_failure"],
+    ["a thrown string", () => CANARY.token, "dependency_failure"],
+    ["a thrown null", () => null, "dependency_failure"],
+  ])("classifies %s", (_label, make, expected) => {
+    const result = classifySlackKnownRootPreparationFailure(make());
+    expect(result).toBe(expected);
+  });
+
+  it("puts an unknown commit above everything a provisional callback result or a SQLSTATE says", () => {
+    // The callback returned `enqueued`, the commit acknowledgement was lost, and the lost connection
+    // surfaced a retryable code: still exactly one thing is known, and it is that nothing is.
+    const cause = Object.assign(new Error(CANARY.sql), { code: "40001", provisional: { outcome: "enqueued" } });
+    const error = Object.assign(outer({ unknownCommit: true, code: "40001", cause }), { result: { outcome: "enqueued" } });
+    expect(classifySlackKnownRootPreparationFailure(error)).toBe("commit_unknown");
+    // The marker must be TRUE: a false one is an ordinary transaction error with that code.
+    expect(classifySlackKnownRootPreparationFailure(outer({ unknownCommit: false, code: "40001" }))).toBe("serialization_failure");
+  });
+
+  it("never looks inside a cause: only the final rejection's own marker and code count", () => {
+    const hidden = outer({ cause: Object.assign(new Error("inner"), { code: "55P03", unknownCommit: true }) });
+    expect(classifySlackKnownRootPreparationFailure(hidden)).toBe("database_failure");
+    const wrapped = new Error("wrapper", { cause: new SlackKnownRootDeadlineError() });
+    expect(classifySlackKnownRootPreparationFailure(wrapped)).toBe("dependency_failure");
+  });
+
+  it("returns a bare category for every input: no object, message, SQL, identifier or cause travels with it", () => {
+    const inputs: unknown[] = [
+      outer({ unknownCommit: true, code: "40001", cause: new Error(CANARY.ciphertext) }),
+      outer({ code: "57014", cause: Object.assign(new Error(CANARY.sql), { detail: CANARY.fingerprint }) }),
+      Object.assign(new Error(CANARY.token), { code: "55P03", sql: CANARY.sql, where: CANARY.metadata }),
+      Object.assign(new SlackKnownRootDeadlineError(), { detail: CANARY.metadata }),
+      new Error(CANARY.fingerprint),
+      { message: CANARY.ciphertext, code: CANARY.metadata },
+      CANARY.token,
+    ];
+    const seen = new Set<string>();
+    for (const input of inputs) {
+      const result: unknown = classifySlackKnownRootPreparationFailure(input);
+      expect(typeof result).toBe("string");
+      expect(SLACK_KNOWN_ROOT_FAILURE_CATEGORIES as readonly string[]).toContain(result);
+      expectNoCanary(result, "classifier output");
+      seen.add(result as string);
+    }
+    // Not one answer for everything: these seven inputs span five different categories.
+    expect([...seen].sort()).toEqual(["commit_unknown", "deadline_exceeded", "dependency_failure", "lock_timeout", "statement_timeout"]);
+  });
+
+  it("fails safely on a malformed error: a throwing accessor exposes nothing and classifies as a dependency failure (control)", () => {
+    // CONTROL — passes against the stub, which inspects nothing. It pins that inspection, once it
+    // exists, neither throws the object's content nor lets a hostile getter choose the category.
+    const hostile = new Proxy({}, {
+      get: () => { throw new Error(CANARY.metadata); },
+      has: () => { throw new Error(CANARY.metadata); },
+      getPrototypeOf: () => { throw new Error(CANARY.metadata); },
+    });
+    const accessor = Object.defineProperties(new Error("x"), {
+      code: { get: () => { throw new Error(CANARY.sql); } },
+      unknownCommit: { get: () => { throw new Error(CANARY.token); } },
+    });
+    for (const input of [hostile, accessor, Object.create(null), Symbol("x"), 42, undefined]) {
+      let result: unknown;
+      expect(() => { result = classifySlackKnownRootPreparationFailure(input); }).not.toThrow();
+      expect(result).toBe("dependency_failure");
+    }
+  });
+});
+
+// ── §8.2 and §8.3: the pure page tally reducer ───────────────────────────────
+
+describe("known-root page tally — one contribution per page slot", () => {
+  const committed = (entryIndex: number, result: SlackKnownRootPreparationResult, attempts: 1 | 2 = 1): SlackKnownRootReceipt =>
+    ({ entryIndex, state: "committed", attempts, result });
+  const failed = (entryIndex: number, failure: (typeof SLACK_KNOWN_ROOT_FAILURE_CATEGORIES)[number], attempts: 0 | 1 | 2 = 1): SlackKnownRootReceipt =>
+    ({ entryIndex, state: "failed", attempts, failure });
+  const notAttempted = (entryIndex: number): SlackKnownRootReceipt => ({ entryIndex, state: "not_attempted", attempts: 0 });
+
+  const PARENTS = ["enqueued", "already_pending", "not_due", "unattested", "refused", "preparation_failed", "not_attempted"] as const;
+  const sum = (counts: Readonly<Record<string, number>>): number => Object.values(counts).reduce((a, b) => a + b, 0);
+
+  /** The accounting identities of §8.2, checked on the exported reducer's own output. */
+  function expectClosed(tally: SlackKnownRootPageTally): void {
+    expect(PARENTS.reduce((total, key) => total + tally[key], 0), "examined is the sum of the seven parents").toBe(tally.examined);
+    expect(sum(tally.failureCounts), "failure categories sum to preparation_failed").toBe(tally.preparation_failed);
+    expect(sum(tally.unattestedCounts), "unattested reasons sum to unattested").toBe(tally.unattested);
+    expect(sum(tally.refusedCounts), "refused reasons sum to refused").toBe(tally.refused);
+    expect(Object.keys(tally.failureCounts).sort()).toEqual([...SLACK_KNOWN_ROOT_FAILURE_CATEGORIES].sort());
+    expect(Object.keys(tally.unattestedCounts).sort()).toEqual([...SLACK_KNOWN_ROOT_UNATTESTED_REASONS].sort());
+    expect(Object.keys(tally.refusedCounts).sort()).toEqual([...SLACK_KNOWN_ROOT_REFUSED_REASONS].sort());
+    for (const value of [...PARENTS.map((key) => tally[key]), tally.examined]) expect(Number.isSafeInteger(value) && value >= 0).toBe(true);
+  }
+
+  it("counts every outcome of one page exactly once", () => {
+    const tally = tallySlackKnownRootPage({
+      examined: 9,
+      receipts: [
+        committed(0, { outcome: "enqueued" }),
+        committed(1, { outcome: "already_pending" }),
+        committed(2, { outcome: "not_due" }),
+        committed(3, { outcome: "unattested", reason: "not_slack" }),
+        committed(4, { outcome: "unattested", reason: "contradictory_ledger" }),
+        committed(5, { outcome: "refused", reason: "binding_changed" }),
+        failed(6, "lock_timeout"),
+        failed(7, "commit_unknown"),
+        notAttempted(8),
+      ],
+    });
+    expect(tally).toMatchObject({
+      examined: 9, enqueued: 1, already_pending: 1, not_due: 1, unattested: 2, refused: 1, preparation_failed: 2, not_attempted: 1,
+    });
+    expect(tally.unattestedCounts).toMatchObject({ not_slack: 1, contradictory_ledger: 1, item_missing: 0 });
+    expect(tally.refusedCounts).toMatchObject({ binding_changed: 1, source_not_current: 0 });
+    expect(tally.failureCounts).toMatchObject({ lock_timeout: 1, commit_unknown: 1, deadlock: 0 });
+    expectClosed(tally);
+  });
+
+  it("counts a slot once however many attempts its transaction took", () => {
+    // Attempt 1 rolled back and attempt 2 committed: one success. Both attempts failed: one failure.
+    const tally = tallySlackKnownRootPage({
+      examined: 2,
+      receipts: [committed(0, { outcome: "enqueued" }, 2), failed(1, "serialization_failure", 2)],
+    });
+    expect(tally).toMatchObject({ examined: 2, enqueued: 1, preparation_failed: 1, not_attempted: 0 });
+    expect(tally.failureCounts.serialization_failure).toBe(1);
+    expectClosed(tally);
+  });
+
+  it.each([0, 1, 2] as const)("accepts a FAILED receipt with %d attempts: setup can fail before any callback runs", (attempts) => {
+    const tally = tallySlackKnownRootPage({ examined: 1, receipts: [failed(0, "database_failure", attempts)] });
+    expect(tally).toMatchObject({ examined: 1, preparation_failed: 1, enqueued: 0, not_attempted: 0 });
+    expect(tally.failureCounts.database_failure).toBe(1);
+    expectClosed(tally);
+  });
+
+  it("never counts an unknown commit as the insertion its callback reported", () => {
+    const tally = tallySlackKnownRootPage({ examined: 1, receipts: [failed(0, "commit_unknown", 1)] });
+    expect(tally).toMatchObject({ examined: 1, enqueued: 0, preparation_failed: 1 });
+    expect(tally.failureCounts.commit_unknown).toBe(1);
+    expectClosed(tally);
+  });
+
+  // M15c, INTEGRATED (§8.3, third example; §12). The case above hands the reducer a category the test
+  // wrote. This one writes none: the category in the receipt is whatever the EXPORTED classifier makes
+  // of the final rejection, and the first thing asserted is the page tally. So a classifier that lets
+  // the SQLSTATE outrank the unknown commit fails HERE, at the count, as one `serialization_failure`
+  // where exactly one `commit_unknown` is required — not at a separate assertion about the classifier.
+  it("tallies a commit whose outcome is unknown as exactly one commit_unknown failure and no success, classified from the final rejection alone", () => {
+    // What the transaction wrapper finally rejects with when the COMMIT acknowledgement is lost: the
+    // outer error marked `unknownCommit`, carrying the retryable SQLSTATE the lost connection
+    // surfaced — while the callback had already returned `enqueued`. That provisional result rides
+    // along on the rejection and on its cause, where nothing may read it.
+    const provisional: SlackKnownRootPreparationResult = { outcome: "enqueued" };
+    const cause = Object.assign(new Error(CANARY.sql), { code: "40001", provisional });
+    const rejection = Object.assign(
+      new TransactionExecutionError(`COMMIT failed running ${CANARY.sql}`, { sql: CANARY.sql, unknownCommit: true, code: "40001", cause }),
+      { result: provisional }
+    );
+    // ONE terminal receipt for the slot, built from that final rejection and nothing else. One
+    // callback ran, and an unknown commit is not retried.
+    const receipt: SlackKnownRootReceipt = {
+      entryIndex: 0, state: "failed", attempts: 1, failure: classifySlackKnownRootPreparationFailure(rejection),
+    };
+    const tally = tallySlackKnownRootPage({ examined: 1, receipts: [receipt] });
+
+    // The whole tally, as literals: exactly one failure, of exactly this category, and no success.
+    expect(tally, "an unknown commit is one commit_unknown failure of its slot, never the insertion its callback reported").toEqual({
+      examined: 1, enqueued: 0, already_pending: 0, not_due: 0, unattested: 0, refused: 0, preparation_failed: 1, not_attempted: 0,
+      unattestedCounts: {
+        not_slack: 0, invalid_metadata: 0, missing_channel_binding: 0, missing_namespace_pin: 0, item_missing: 0,
+        canonical_mismatch: 0, missing_root_witness: 0, contradictory_ledger: 0,
+      },
+      refusedCounts: {
+        namespace_changed_or_unready: 0, source_not_current: 0, binding_changed: 0, channel_not_public: 0,
+        scoped_path_conflict: 0, legacy_path_conflict: 0,
+      },
+      failureCounts: {
+        lock_timeout: 0, statement_timeout: 0, deadline_exceeded: 0, serialization_failure: 0, deadlock: 0,
+        database_failure: 0, dependency_failure: 0, commit_unknown: 1,
+      },
+    });
+    expectClosed(tally);
+    // Nothing the rejection carried travels into the receipt or the tally.
+    expectNoCanary(receipt, "the terminal receipt");
+    expectNoCanary(tally, "tally output");
+  });
+
+  it("collapses an exact duplicate of a slot's final receipt", () => {
+    const once = tallySlackKnownRootPage({ examined: 2, receipts: [committed(0, { outcome: "enqueued" }, 2), failed(1, "deadlock")] });
+    const twice = tallySlackKnownRootPage({
+      examined: 2,
+      receipts: [
+        committed(0, { outcome: "enqueued" }, 2), failed(1, "deadlock"),
+        committed(0, { outcome: "enqueued" }, 2), failed(1, "deadlock"), failed(1, "deadlock"),
+      ],
+    });
+    expect(once).toMatchObject({ examined: 2, enqueued: 1, preparation_failed: 1 });
+    expect(twice).toEqual(once);
+    expectClosed(twice);
+  });
+
+  it("counts a slot nobody started exactly once, as not attempted", () => {
+    const tally = tallySlackKnownRootPage({
+      examined: 3, receipts: [committed(0, { outcome: "not_due" }), notAttempted(1), notAttempted(2), notAttempted(2)],
+    });
+    expect(tally).toMatchObject({ examined: 3, not_due: 1, not_attempted: 2, preparation_failed: 0 });
+    expectClosed(tally);
+  });
+
+  it("tallies an empty page, and a full one of a hundred slots", () => {
+    const empty = tallySlackKnownRootPage({ examined: 0, receipts: [] });
+    expect(empty).toMatchObject({ examined: 0, enqueued: 0, not_attempted: 0, preparation_failed: 0 });
+    expectClosed(empty);
+    const full = tallySlackKnownRootPage({
+      examined: 100, receipts: Array.from({ length: 100 }, (_, index) => (index % 2 === 0 ? committed(index, { outcome: "enqueued" }) : notAttempted(index))),
+    });
+    expect(full).toMatchObject({ examined: 100, enqueued: 50, not_attempted: 50 });
+    expectClosed(full);
+  });
+
+  it.each<[string, number, unknown[]]>([
+    ["two conflicting receipts for one slot (committed and failed)", 1, [committed(0, { outcome: "enqueued" }), failed(0, "commit_unknown")]],
+    ["two conflicting receipts for one slot (different results)", 1, [committed(0, { outcome: "enqueued" }), committed(0, { outcome: "already_pending" })]],
+    ["the same result reported under different attempt counts", 1, [committed(0, { outcome: "enqueued" }, 1), committed(0, { outcome: "enqueued" }, 2)]],
+    ["a started slot also reported as not attempted", 1, [failed(0, "deadlock"), notAttempted(0)]],
+    ["a slot with no receipt", 2, [committed(0, { outcome: "enqueued" })]],
+    ["an index past the page", 1, [committed(0, { outcome: "enqueued" }), committed(1, { outcome: "enqueued" })]],
+    ["a negative index", 1, [committed(-1, { outcome: "enqueued" })]],
+    ["a fractional index", 1, [committed(0.5, { outcome: "enqueued" })]],
+    ["an examined count of 101", 101, Array.from({ length: 101 }, (_, index) => notAttempted(index))],
+    ["a negative examined count", -1, []],
+    ["a fractional examined count", 1.5, [notAttempted(0)]],
+    ["a committed receipt with zero attempts", 1, [{ entryIndex: 0, state: "committed", attempts: 0, result: { outcome: "enqueued" } }]],
+    ["a committed receipt with three attempts", 1, [{ entryIndex: 0, state: "committed", attempts: 3, result: { outcome: "enqueued" } }]],
+    ["a failed receipt with three attempts", 1, [{ entryIndex: 0, state: "failed", attempts: 3, failure: "deadlock" }]],
+    ["a not-attempted receipt that claims an attempt", 1, [{ entryIndex: 0, state: "not_attempted", attempts: 1 }]],
+    ["a failure outside the closed vocabulary", 1, [{ entryIndex: 0, state: "failed", attempts: 1, failure: CANARY.metadata }]],
+    ["an outcome outside the closed vocabulary", 1, [{ entryIndex: 0, state: "committed", attempts: 1, result: { outcome: CANARY.metadata } }]],
+    ["an unattested result with a refusal's reason", 1, [{ entryIndex: 0, state: "committed", attempts: 1, result: { outcome: "unattested", reason: "binding_changed" } }]],
+    ["a refusal with no reason", 1, [{ entryIndex: 0, state: "committed", attempts: 1, result: { outcome: "refused" } }]],
+    ["an enqueued result carrying a reason", 1, [{ entryIndex: 0, state: "committed", attempts: 1, result: { outcome: "enqueued", reason: "not_slack" } }]],
+    ["a provisional callback result that never reached a commit", 1, [{ entryIndex: 0, state: "provisional", attempts: 1, result: { outcome: "enqueued" } }]],
+    ["a per-attempt record instead of a final receipt", 1, [{ entryIndex: 0, attempt: 1, state: "failed", attempts: 1, failure: "serialization_failure" }]],
+    ["a committed receipt that also names a failure", 1, [{ entryIndex: 0, state: "committed", attempts: 1, result: { outcome: "enqueued" }, failure: "commit_unknown" }]],
+    ["a `{ ok: false }` result", 1, [{ entryIndex: 0, state: "committed", attempts: 1, result: { ok: false, error: CANARY.sql } }]],
+    ["a receipt that is not an object", 1, [CANARY.token]],
+    ["receipts that are not an array", 1, [] as unknown[]],
+  ])("refuses %s with a static contract error, and chooses nothing", (label, examined, receipts) => {
+    const input = label === "receipts that are not an array" ? { examined, receipts: CANARY.token } : { examined, receipts };
+    const error = thrown(() => tallySlackKnownRootPage(input as never));
+    expectStaticValidationError(error, label);
+  });
+
+  it("returns counters only: no receipt, item id, cursor or error, and nothing a receipt carried", () => {
+    const receipts = [
+      { ...committed(0, { outcome: "enqueued" }), itemId: ITEM, note: CANARY.metadata },
+      { ...failed(1, "database_failure"), error: new Error(CANARY.sql), sql: CANARY.sql },
+    ];
+    // Extra fields on a receipt are a contract error; a clean page of the same two slots is counted.
+    expectStaticValidationError(thrown(() => tallySlackKnownRootPage({ examined: 2, receipts } as never)), "receipts carrying extra fields");
+    const tally = tallySlackKnownRootPage({ examined: 2, receipts: [committed(0, { outcome: "enqueued" }), failed(1, "database_failure")] });
+    expect(Object.keys(tally).sort()).toEqual([
+      "already_pending", "enqueued", "examined", "failureCounts", "not_attempted", "not_due", "preparation_failed",
+      "refused", "refusedCounts", "unattested", "unattestedCounts",
+    ]);
+    expect(JSON.stringify(tally)).not.toContain(ITEM);
+    expectNoCanary(tally, "tally output");
+    expectClosed(tally);
+  });
+
+  it("copies its input: a caller changing the receipts afterwards changes no tally already returned", () => {
+    const receipts: SlackKnownRootReceipt[] = [committed(0, { outcome: "enqueued" }), notAttempted(1)];
+    const tally = tallySlackKnownRootPage({ examined: 2, receipts });
+    const before = JSON.stringify(tally);
+    receipts[1] = failed(1, "deadlock");
+    receipts.push(committed(0, { outcome: "refused", reason: "binding_changed" }));
+    expect(JSON.stringify(tally)).toBe(before);
+    expect(tally).toMatchObject({ examined: 2, enqueued: 1, not_attempted: 1 });
+  });
+});
+
+// ── §5.5: what preparation does with the due read's OUTPUT ───────────────────
+
+/**
+ * KR-07 in part — the conversion of the due read's output into the instant handed to the enqueue
+ * (`docs/design/slack-known-root-requeue-spec.md` §5.5).
+ *
+ * EVIDENCE, NOT RED: every case here is expected to pass on the current source.
+ *
+ * SYNTHETIC, DEFENSIVE, UNIT-LEVEL. The due read's answer is scripted: these cases say what the
+ * preparer does with an answer of a given shape, whatever produced it. The two maximum-date cases
+ * are adapter-output evidence — the largest instant a JavaScript Date can hold, and the one before
+ * it — and say NOTHING about what PostgreSQL can store, compute or schedule. No real database is
+ * involved, and none of this is calendar evidence.
+ *
+ * ONLY THE DUE ANSWER VARIES. The exported preparer runs against a scripted executor that answers
+ * every earlier read of a preparation validly — the gate, the integration, the binding, the channel,
+ * the absent queue row, the canonical item, its project, the witness, the two contradiction checks
+ * and the two path checks — through the REAL dependencies, which are not replaced. Every case first
+ * shows that the due read was reached, once, by exactly that sequence. The enqueue is the real
+ * helper as well: what it was handed is read off the parameters of the insert it sends.
+ *
+ * THE DATE OBSERVER. For "rejected BEFORE a Date was constructed" a unit-only observer stands in for
+ * the global `Date` constructor. It is armed by the scripted executor at the moment the due answer
+ * is returned and disarmed in a `finally` as soon as the preparation settles; everything in between
+ * runs on microtasks, so nothing else can construct a Date inside the window. The fixture is built
+ * before it is armed and every assertion is made after it is disarmed. It forwards every
+ * construction unchanged and only writes down the arguments. The valid cases show the observer does
+ * see the conversion — exactly one Date, from exactly the due answer's number — so that seeing none
+ * means something. On the valid path the window necessarily also holds the real enqueue helper's
+ * validation of its scope, which builds a Date from the fixture root's own timestamp; those are set
+ * aside by that written-out fixture value, and nothing else may be there. On every rejected path the
+ * enqueue is never reached, and the window must hold no construction at all.
+ *
+ * Nothing here restates the conversion: no pattern, no bound and no arithmetic of the parser is
+ * copied. Each case states an input and the exported behavior it must produce.
+ */
+describe("known-root due-output conversion contract", () => {
+  const WORKSPACE = "T0SOURCE1";
+  const CHANNEL = "C0KNOWN1";
+  const ROOT = "1718900000.000100";
+  /** The whole seconds of ROOT, as milliseconds, WRITTEN OUT: what a parse of the root's own timestamp builds a Date from. */
+  const ROOT_WHOLE_SECONDS_AS_MS = 1718900000000;
+  const PROJECT = "0d000000-0000-4000-8000-00000000000d";
+  /** The canonical scoped path of the fixture root, WRITTEN OUT, not built by the code under test. */
+  const SCOPED_PATH = "slack/t0source1/c0known1/1718900000.000100.md";
+  const TOKEN = "xoxb-synthetic-due-conversion";
+  const UPDATED_AT = "2026-01-02T03:04:05.000006Z";
+  // FIXTURE AUTHORITY, built with the source binding's own pure helpers so that the real selection
+  // lock finds the configuration the entry names. Neither helper is part of what is under test here.
+  const CONFIG_REVISION = slackConfigRevision({ updatedAt: UPDATED_AT, status: "enabled", type: "slack", channelIds: [CHANNEL] });
+  const FINGERPRINT = slackTokenFingerprint(TOKEN);
+  const ENTRY = located({ locator: { ...located().locator, bindingConfigRevision: CONFIG_REVISION } });
+
+  /** Every data statement of a preparation that reaches the due read, in the specification's order. */
+  const TO_THE_DUE_READ = [
+    "namespace gate lock", "integration selection lock", "binding row lock", "scoped channel row lock", "plain queue read",
+    "item lock", "slack project read", "root witness", "ledger contradictions", "path conflicts", "due read",
+  ];
+
+  const RealDate = Date;
+  afterEach(() => {
+    // Belt and braces: every case disarms its own observer in a `finally`.
+    globalThis.Date = RealDate;
+    vi.unstubAllEnvs();
+  });
+
+  /**
+   * The unit-only stand-in for the global Date constructor: forwards unchanged, and writes down the
+   * arguments. Arming keeps whatever constructor was ambient at that moment, and disarming puts that
+   * same one back; disarming an observer that was never armed does nothing.
+   */
+  function dateObserver() {
+    const constructedWith: unknown[][] = [];
+    let ambient: DateConstructor | null = null;
+    return {
+      constructedWith,
+      arm: (): void => {
+        if (ambient !== null) return;
+        ambient = globalThis.Date;
+        globalThis.Date = new Proxy(ambient, {
+          construct(target, args: unknown[], newTarget) {
+            constructedWith.push([...args]);
+            return Reflect.construct(target, args, newTarget) as object;
+          },
+        });
+      },
+      disarm: (): void => {
+        if (ambient === null) return;
+        globalThis.Date = ambient;
+        ambient = null;
+      },
+    };
+  }
+
+  /**
+   * A case's own answer to a statement, by the NAME this script recognizes it under. It is handed
+   * the usual answer — which it may take, alter or leave — and the statement's flattened text.
+   */
+  type AnswerOverrides = Partial<Record<string, (usual: () => unknown[], flat: string) => unknown[]>>;
+
+  /**
+   * A scripted executor: valid answers for everything before the due read, the given rows for the
+   * due read, and a stored row for the enqueue's insert. A statement it does not know fails loudly.
+   * `overrides` replaces the answer to the statements it names and to no other; with none, every
+   * statement is answered exactly as before.
+   */
+  function scriptedPreparation(dueRows: unknown[], onDueAnswered: () => void, overrides: AnswerOverrides = {}) {
+    const sent: string[] = [];
+    const enqueueInserts: unknown[][] = [];
+    const answers: [name: string, recognizes: RegExp, rows: (params: readonly unknown[]) => unknown[]][] = [
+      ["due read", /\bdue_epoch_ms\b/, () => dueRows],
+      ["enqueue insert", /insert into slack_sync_threads/, (params) => {
+        enqueueInserts.push([...params]);
+        return [{
+          team_id: TEAM, workspace_id: WORKSPACE, channel_id: CHANNEL, root_ts: ROOT, status: "queued", due_at: params[4], attempts: 0,
+          lease_generation: "0", lease_owner: null, lease_expires_at: null, page_cursor: null, snapshot_generation: "0",
+          checkpointed_at: null, last_error_code: null,
+        }];
+      }],
+      ["root witness", /\bas witnessed\b/, () => [{ witnessed: 1 }]],
+      ["ledger contradictions", /\bitem_bound_elsewhere\b/, () => [{ item_bound_elsewhere: false, thread_bound_to_another_item: false }]],
+      ["path conflicts", /\bscoped_conflict\b/, () => [{ scoped_conflict: false, legacy_conflict: false }]],
+      ["namespace gate lock", /from slack_channel_migration_gates/, () => [{
+        team_id: TEAM, raw_channel_id: CHANNEL, state: "ready", revision: "3", ready_revision: "3",
+        resolved_workspace_ids: [WORKSPACE], completed_repair_id: "0c000000-0000-4000-8000-00000000000c", blocked_reason: null,
+      }]],
+      ["integration selection lock", /from integrations\b/, () => [{
+        status: "enabled", type: "slack", config: { channelIds: [CHANNEL] }, secret_ciphertext: null, updated_at_utc: UPDATED_AT,
+      }]],
+      ["binding row lock", /from slack_integration_bindings/, () => [{
+        state: "verified", config_revision: CONFIG_REVISION, token_fingerprint: FINGERPRINT,
+        workspace_id: WORKSPACE, app_id: "A0SOURCE1", selected_channel_ids: [CHANNEL],
+      }]],
+      ["scoped channel row lock", /from slack_sync_channels/, () => [{
+        binding_integration_id: INTEGRATION, binding_config_revision: CONFIG_REVISION, public_state: "public", public_checked: true,
+      }]],
+      ["plain queue read", /from slack_sync_threads/, () => []],
+      ["item lock", /from items i\b/, () => [{
+        project_id: PROJECT, kind: "transcript", access: "team", path: SCOPED_PATH, source: "slack",
+        workspace_id: WORKSPACE, channel_id: CHANNEL, ts: ROOT, thread_ts: ROOT,
+      }]],
+      ["slack project read", /from projects\b/, () => [{ id: PROJECT }]],
+    ];
+    const executeSql = (async (text: string, params: unknown[] = []) => {
+      const flat = text.replace(/\s+/g, " ");
+      if (/\bpg_settings\b/.test(flat)) {
+        sent.push("settings read");
+        const rows = [{ name: "statement_timeout", setting: "0" }, { name: "lock_timeout", setting: "0" }];
+        return { rows, rowCount: rows.length };
+      }
+      if (/set_config\(/.test(flat)) {
+        sent.push("settings assignment");
+        return { rows: [{}], rowCount: 1 };
+      }
+      const answer = answers.find(([, recognizes]) => recognizes.test(flat));
+      if (!answer) throw new Error("fixture: the scripted executor was sent a statement it does not know");
+      sent.push(answer[0]);
+      const usual = (): unknown[] => answer[2](params);
+      const override = overrides[answer[0]];
+      const rows = override ? override(usual, flat) : usual();
+      // The window opens HERE, as the due answer is handed back, and not a statement earlier.
+      if (answer[0] === "due read") onDueAnswered();
+      return { rows, rowCount: rows.length };
+    }) as SqlExecutor;
+    const session = {
+      get db(): never {
+        throw new Error("fixture: the caller's own db client was used");
+      },
+      executeSql,
+      optionalAudit: async (): Promise<never> => {
+        throw new Error("fixture: the caller's own audit helper was used");
+      },
+    } as unknown as TransactionSession;
+    return {
+      session, enqueueInserts,
+      /** Every statement that reached this executor, by the name it was recognized under, in order. */
+      sent: (): string[] => [...sent],
+      /** The data statements, in order: everything but the settings read and the settings assignments. */
+      data: (): string[] => sent.filter((name) => !name.startsWith("settings ")),
+      /** What was sent AFTER the due read, of any kind. */
+      afterTheDueRead: (): string[] => sent.slice(sent.lastIndexOf("due read") + 1),
+    };
+  }
+
+  /** One preparation through the exported preparer, with only the due answer chosen by the case. */
+  async function preparedWithDueAnswer(dueRow: unknown) {
+    // FIXTURE, all of it before the observer's window: the token the real selection lock resolves,
+    // the scripted executor, and the execution context.
+    vi.stubEnv("SLACK_BOT_TOKEN", TOKEN);
+    const observer = dateObserver();
+    const scripted = scriptedPreparation([dueRow], observer.arm);
+    const context = execution();
+    let result: SlackKnownRootPreparationResult | undefined;
+    let error: unknown;
+    let threw = false;
+    try {
+      result = await prepareSlackKnownRootRequeue(scripted.session, { teamId: TEAM, entry: ENTRY }, context);
+    } catch (caught) {
+      threw = true;
+      error = caught;
+    } finally {
+      observer.disarm();
+    }
+    return { result, error, threw, scripted, constructedWith: observer.constructedWith };
+  }
+  type Prepared = Awaited<ReturnType<typeof preparedWithDueAnswer>>;
+
+  /** FIXTURE VALIDITY, asserted first in every case: the due read was reached, once, by a valid preparation. */
+  function expectTheDueReadWasReached(prepared: Prepared, label: string): void {
+    expect(prepared.scripted.data().slice(0, TO_THE_DUE_READ.length), `${label}: fixture: a valid preparation reached the due read, once, in order`).toEqual(TO_THE_DUE_READ);
+  }
+
+  /** A thrown preparation that enqueued nothing, sent nothing after the due read, and constructed no Date on the way. */
+  function expectThrownWithNothingEnqueued(prepared: Prepared, label: string, rejectedText: string | null): void {
+    expectTheDueReadWasReached(prepared, label);
+    expect([prepared.threw, prepared.result], `${label}: the preparation throws and returns no result`).toEqual([true, undefined]);
+    expect(prepared.error, `${label}: what is thrown is an error`).toBeInstanceOf(Error);
+    // A LOCAL check of this one message and nothing more: it is not KR-16 evidence and not a
+    // redaction proof, which need the reportable outputs walked whole.
+    if (rejectedText !== null) expect((prepared.error as Error).message.includes(rejectedText), `${label}: local check: the thrown message does not hold the rejected text`).toBe(false);
+    expect(prepared.scripted.enqueueInserts, `${label}: zero enqueue`).toEqual([]);
+    expect(prepared.scripted.data(), `${label}: the due read is the last data statement`).toEqual(TO_THE_DUE_READ);
+    expect(prepared.scripted.afterTheDueRead(), `${label}: nothing at all is sent after the due read`).toEqual([]);
+    expect(prepared.constructedWith, `${label}: rejected before construction`).toEqual([]);
+  }
+
+  it.each<[name: string, dueText: string, epochMs: number]>([
+    ["an ordinary instant", "1718903600123", 1718903600123],
+    ["the largest instant a Date can hold (synthetic adapter output, not PostgreSQL calendar evidence)", "8640000000000000", 8640000000000000],
+    ["the instant immediately before that maximum (synthetic adapter output, not PostgreSQL calendar evidence)", "8639999999999999", 8639999999999999],
+  ])("reaches the enqueue with a Date of the exact numeric value for a valid decimal-millisecond due: %s", async (name, dueText, epochMs) => {
+    const prepared = await preparedWithDueAnswer({ is_due: true, due_epoch_ms: dueText });
+    expectTheDueReadWasReached(prepared, name);
+    expect([prepared.threw, prepared.result], `${name}: the preparation returns enqueued`).toEqual([false, { outcome: "enqueued" }]);
+    expect(prepared.scripted.data(), `${name}: the enqueue's insert follows the due read, and nothing else does`).toEqual([...TO_THE_DUE_READ, "enqueue insert"]);
+    expect(prepared.scripted.enqueueInserts, `${name}: exactly one enqueue`).toHaveLength(1);
+    const [insert] = prepared.scripted.enqueueInserts;
+    expect(insert.slice(0, 4), `${name}: the enqueue is for the entry's exact scope`).toEqual([TEAM, WORKSPACE, CHANNEL, ROOT]);
+    const handed = insert[4];
+    expect(handed instanceof RealDate, `${name}: the enqueue is handed a Date`).toBe(true);
+    expect((handed as Date).getTime(), `${name}: the Date's numeric value is exactly the due answer's`).toBe(epochMs);
+    // The observer's own control: a conversion that succeeds IS seen, as exactly one construction
+    // from exactly the due answer's number. On this path the window also contains the REAL enqueue
+    // helper validating its scope, which parses the root's own timestamp and builds a Date from that
+    // root's whole seconds. Those constructions are named by their one argument — a fixture literal
+    // that is none of the due answers — and set aside; everything else the window saw must be the
+    // one conversion, and nothing more.
+    const besidesTheScopeValidation = prepared.constructedWith.filter((args) => !(args.length === 1 && args[0] === ROOT_WHOLE_SECONDS_AS_MS));
+    expect(besidesTheScopeValidation, `${name}: observer control: apart from the enqueue's own validation of the root timestamp, the window sees exactly one Date constructed, from the exact number`)
+      .toEqual([[epochMs]]);
+  });
+
+  it.each<[name: string, dueValue: unknown]>([
+    ["null", null],
+    ["a number where text is required", 1718903600123],
+    ["empty text", ""],
+    ["fractional text", "1718903600123.5"],
+    ["exponent text", "1.7189036e12"],
+    ["non-finite text, NaN", "NaN"],
+    ["non-finite text, Infinity", "Infinity"],
+    ["a negative integer", "-1"],
+    ["one millisecond past the largest instant a Date can hold", "8640000000000001"],
+    ["an unsafe integer", "9007199254740993"],
+  ])("throws, enqueues nothing and constructs no Date for an invalid due under is_due true: %s", async (name, dueValue) => {
+    const prepared = await preparedWithDueAnswer({ is_due: true, due_epoch_ms: dueValue });
+    expectThrownWithNothingEnqueued(prepared, name, typeof dueValue === "string" && dueValue !== "" ? dueValue : null);
+  });
+
+  it.each<[name: string, isDue: unknown]>([
+    ["the text \"true\"", "true"],
+    ["the number 1", 1],
+    ["null", null],
+  ])("throws and enqueues nothing when is_due is not a boolean, even with a valid due: %s", async (name, isDue) => {
+    const prepared = await preparedWithDueAnswer({ is_due: isDue, due_epoch_ms: "1718903600123" });
+    expectThrownWithNothingEnqueued(prepared, `is_due is ${name}`, null);
+  });
+
+  it("returns not_due for is_due false with a null due, without converting anything and without an enqueue", async () => {
+    const label = "is_due false, null due";
+    const prepared = await preparedWithDueAnswer({ is_due: false, due_epoch_ms: null });
+    expectTheDueReadWasReached(prepared, label);
+    expect([prepared.threw, prepared.result], `${label}: the preparation returns not_due`).toEqual([false, { outcome: "not_due" }]);
+    expect(prepared.scripted.enqueueInserts, `${label}: zero enqueue`).toEqual([]);
+    expect(prepared.scripted.data(), `${label}: the due read is the last data statement`).toEqual(TO_THE_DUE_READ);
+    expect(prepared.constructedWith, `${label}: nothing was converted: no Date was constructed`).toEqual([]);
+    // A normal result: the only thing sent after the due read is the restoration of the settings.
+    expect(prepared.scripted.afterTheDueRead(), `${label}: only the settings restoration follows`).toEqual(["settings assignment"]);
+  });
+
+  /**
+   * M9 on the FULL preparation path (§7.4, §12). The M9 cases of the decorated-session suite above
+   * end at the namespace gate or at the integration's selection lock. This one uses this suite's
+   * scripted answers, under which the real exported preparer runs the whole of §5 and is ENQUEUED.
+   *
+   * THE UNDISTURBED RUN is required to resolve with exactly `{ outcome: "enqueued" }`, and every
+   * statement that reached the executor is written down by the name the script recognized it
+   * under: the read of the original settings; then, each behind its own settings assignment, the
+   * namespace gate lock, the integration selection lock, the binding row lock, the scoped channel
+   * row lock, the plain queue read, the item lock, the Slack project read, the root witness, the
+   * ledger contradictions, the path conflicts, the due read and the enqueue's insert; and last the
+   * restoring assignment. That named sequence is what "every position" means below: it is asserted
+   * to hold each of those stages, and nothing is claimed about a position that is not in it.
+   *
+   * THEN EACH OF THOSE CALLS IS REJECTED IN TURN, each on a fresh scripted executor. The preparer
+   * must reject with that very failure and must resolve nothing — not `enqueued`, and not a refused,
+   * unattested, not-due or already-pending result. What reached the scripted executor before the
+   * rejected call is required to be exactly the named calls before it, which also says which call
+   * it was that was rejected.
+   *
+   * WHAT THIS IS NOT. It is not evidence about a transaction: no transaction exists here. Whether
+   * the caller's real transaction rejects and rolls back is a separate, pending KR-12 concern.
+   */
+  it("M9: rejects with the executor's own failure, and resolves no result, whichever executor call of a preparation that would be enqueued is rejected — gate, selection, binding, channel, queue, item, project, witness, contradictions, paths, due, enqueue and restoration", async () => {
+    // FIXTURE: the token the real selection lock resolves, as every case of this suite sets it.
+    vi.stubEnv("SLACK_BOT_TOKEN", TOKEN);
+    const dueRow = { is_due: true, due_epoch_ms: "1718903600123" };
+    const prepare = (session: TransactionSession): Promise<unknown> => prepareSlackKnownRootRequeue(session, { teamId: TEAM, entry: ENTRY }, execution());
+
+    // ── THE UNDISTURBED RUN, through the same wrapper, rejecting nothing. ──
+    const never = new Error("fixture: never thrown");
+    const script = scriptedPreparation([dueRow], () => undefined);
+    const undisturbed = rejectingAt(script.session, 0, never);
+    expect(await rejectingEnded(prepare(undisturbed.session), never), "M9 full path: control: with no call rejected the preparation resolves with exactly enqueued").toEqual({ resolvedWith: { outcome: "enqueued" } });
+    const calls = script.sent();
+    const total = undisturbed.calls();
+    const stages = [...TO_THE_DUE_READ, "enqueue insert"];
+    expect({
+      every_counted_call_reached_the_scripted_executor: calls.length === total,
+      data_statements_in_order: script.data(),
+      enqueue_inserts: script.enqueueInserts.length,
+      first_call: calls[0],
+      // Each data statement is directly preceded by a settings assignment of its own.
+      data_statements_not_directly_behind_a_settings_assignment: calls.filter((name, index) => !name.startsWith("settings ") && calls[index - 1] !== "settings assignment"),
+      // After the enqueue's insert comes the restoring assignment, and nothing else.
+      after_the_enqueue_insert: calls.slice(calls.lastIndexOf("enqueue insert") + 1),
+      caller_db_or_audit_helper_asked_for: undisturbed.other,
+    }, "M9 full path: control: the undisturbed preparation sent the settings read, every stage of the full path behind its own assignment, the enqueue, and the restoring assignment").toEqual({
+      every_counted_call_reached_the_scripted_executor: true,
+      data_statements_in_order: stages,
+      enqueue_inserts: 1,
+      first_call: "settings read",
+      data_statements_not_directly_behind_a_settings_assignment: [],
+      after_the_enqueue_insert: ["settings assignment"],
+      caller_db_or_audit_helper_asked_for: [],
+    });
+
+    // ── EACH COUNTED CALL REJECTED IN TURN. ──
+    for (let position = 1; position <= total; position++) {
+      const rejected = calls[position - 1];
+      const behind = rejected === "settings assignment" ? ` before ${calls[position] ?? "nothing more: the restoration"}` : "";
+      const where = `call ${position} of ${total} (${rejected}${behind})`;
+      const failure = Object.assign(new Error(`fixture: the executor rejected its call ${position}`), { code: "XX000" });
+      const fresh = scriptedPreparation([dueRow], () => undefined);
+      const rejecting = rejectingAt(fresh.session, position, failure);
+      expect(await rejectingEnded(prepare(rejecting.session), failure),
+        `M9 full path: the executor rejected its ${where}: the preparation rejects with that same failure, and resolves no result`)
+        .toEqual({ rejectedWithTheExecutorsOwnFailure: true });
+      expect({ reached_the_scripted_executor: fresh.sent(), caller_db_or_audit_helper_asked_for: rejecting.other },
+        `M9 full path: the executor rejected its ${where}: exactly the calls before it reached the scripted executor, and none after it`)
+        .toEqual({ reached_the_scripted_executor: calls.slice(0, position - 1), caller_db_or_audit_helper_asked_for: [] });
+    }
+  });
+
+  /**
+   * KR-12, NORMAL RETURNS (§7.4: "For every normal return, including every `unattested`/`refused`
+   * reason, `not_due`, early `already_pending`, conflict-path `already_pending` and `enqueued`,
+   * restore both original settings on the same connection before resolving").
+   *
+   * The restoration table of the decorated-session suite above reads both settings back after two
+   * refusals — `namespace_changed_or_unready` and `source_not_current` — and two page-reader
+   * results. The cases of THIS suite that return `not_due` and `enqueued` show only that one
+   * assignment follows, on a script that does not model the settings. Nothing produced
+   * `already_pending` from the preparer at all. This table is the rest: every other result and
+   * reason a LOCATED entry can end in, each reached the way the specification says it is reached.
+   *
+   * HOW EACH ROW IS REACHED. Not by a hardcoded return: the real exported preparer runs, through the
+   * real gate, selection and enqueue helpers, against this suite's scripted answers, and ONE answer
+   * is changed — the stored fact that decides that result. Each row states the exact result AND the
+   * data statements that reached the executor, so a row that ended somewhere else fails.
+   *
+   * THE SETTINGS are modelled by a thin layer over the scripted executor: it applies each
+   * transaction-local `set_config` to its own two values and answers a `pg_settings` read from them.
+   * The originals are 30,000 ms and 1,500 ms — neither is anything the preparer applies. The
+   * read-back is a statement on the caller's own session AFTER the result, answered by the model.
+   *
+   * WHAT THIS IS NOT. It is a model, not a server and not a connection: the read-back on a real
+   * connection, and everything about a real transaction, is the KR-12 packet of
+   * `test/datamechanics/slack-known-root-requeue.datamechanics.test.ts`.
+   */
+  type ModelledTimeouts = { statement_timeout: number; lock_timeout: number };
+
+  /** `inner`, with the two timeout settings modelled in front of it. Every other statement is `inner`'s. */
+  function modelledTimeouts(inner: TransactionSession, original: ModelledTimeouts) {
+    const effective: ModelledTimeouts = { ...original };
+    /** Both settings as they were when each data statement was dispatched. */
+    const underEachDataStatement: ModelledTimeouts[] = [];
+    const executeSql = (async (text: string, params: unknown[] = []) => {
+      const flat = text.replace(/\s+/g, " ");
+      if (/\bpg_settings\b/.test(flat)) {
+        const rows = [
+          { name: "statement_timeout", setting: String(effective.statement_timeout) },
+          { name: "lock_timeout", setting: String(effective.lock_timeout) },
+        ];
+        return { rows, rowCount: rows.length };
+      }
+      if (/set_config\(/.test(flat)) {
+        // Only a TRANSACTION-LOCAL assignment of whole milliseconds is modelled. Anything else is not
+        // quietly ignored: the model refuses it.
+        const assignments = [...flat.matchAll(/set_config\(\s*'(statement_timeout|lock_timeout)'\s*,\s*\$(\d+)\s*,\s*true\s*\)/g)];
+        if (assignments.length === 0) throw new Error("fixture: the settings model was sent an assignment it does not model");
+        for (const [, name, position] of assignments) {
+          const value = params[Number(position) - 1];
+          if (typeof value !== "string" || !/^[0-9]+(ms)?$/.test(value)) throw new Error("fixture: the settings model was sent a value that is not whole milliseconds");
+          effective[name as keyof ModelledTimeouts] = Number.parseInt(value, 10);
+        }
+        return inner.executeSql(text, params);
+      }
+      underEachDataStatement.push({ ...effective });
+      return inner.executeSql(text, params);
+    }) as SqlExecutor;
+    const session = {
+      get db(): never {
+        throw new Error("fixture: the caller's own db client was used");
+      },
+      executeSql,
+      optionalAudit: async (): Promise<never> => {
+        throw new Error("fixture: the caller's own audit helper was used");
+      },
+    } as unknown as TransactionSession;
+    return { session, underEachDataStatement };
+  }
+
+  /** Every data statement of a preparation that is enqueued, in order. */
+  const TO_THE_ENQUEUE = [...TO_THE_DUE_READ, "enqueue insert"];
+  const through = (stage: string): string[] => TO_THE_ENQUEUE.slice(0, TO_THE_ENQUEUE.indexOf(stage) + 1);
+  /** The usual answer, with the named stored values of its row changed and everything else as it was. */
+  const altered = (over: Record<string, unknown>) => (usual: () => unknown[]): unknown[] =>
+    usual().map((row) => ({ ...(row as Record<string, unknown>), ...over }));
+
+  const NORMAL_RETURNS: [name: string, overrides: () => AnswerOverrides, expected: SlackKnownRootPreparationResult, dataStatements: string[]][] = [
+    ["refused, binding_changed — the binding row is not there",
+      () => ({ "binding row lock": () => [] }), { outcome: "refused", reason: "binding_changed" }, through("binding row lock")],
+    ["refused, channel_not_public — the stored proof says the channel is private",
+      () => ({ "scoped channel row lock": altered({ public_state: "private" }) }), { outcome: "refused", reason: "channel_not_public" }, through("scoped channel row lock")],
+    ["already_pending on the EARLY path — the plain queue read finds a row",
+      () => ({ "plain queue read": () => [{ pending: 1 }] }), { outcome: "already_pending" }, through("plain queue read")],
+    ["unattested, item_missing — the item lock returns no row",
+      () => ({ "item lock": () => [] }), { outcome: "unattested", reason: "item_missing" }, through("item lock")],
+    ["unattested, canonical_mismatch — the locked item is of another kind",
+      () => ({ "item lock": altered({ kind: "note" }) }), { outcome: "unattested", reason: "canonical_mismatch" }, through("slack project read")],
+    ["unattested, invalid_metadata of a LOCATED entry — the locked item stores no workspace id",
+      () => ({ "item lock": altered({ workspace_id: null }) }), { outcome: "unattested", reason: "invalid_metadata" }, through("slack project read")],
+    ["unattested, missing_root_witness — no live root witness row",
+      () => ({ "root witness": () => [] }), { outcome: "unattested", reason: "missing_root_witness" }, through("root witness")],
+    ["unattested, contradictory_ledger — the item is bound to another thread as well",
+      () => ({ "ledger contradictions": altered({ item_bound_elsewhere: true }) }), { outcome: "unattested", reason: "contradictory_ledger" }, through("ledger contradictions")],
+    ["refused, scoped_path_conflict — another project owns the scoped path",
+      () => ({ "path conflicts": altered({ scoped_conflict: true }) }), { outcome: "refused", reason: "scoped_path_conflict" }, through("path conflicts")],
+    ["refused, legacy_path_conflict — an item exists at the legacy path",
+      () => ({ "path conflicts": altered({ legacy_conflict: true }) }), { outcome: "refused", reason: "legacy_path_conflict" }, through("path conflicts")],
+    ["not_due — the due read says the root is not due",
+      () => ({ "due read": () => [{ is_due: false, due_epoch_ms: null }] }), { outcome: "not_due" }, through("due read")],
+    ["enqueued — nothing is changed",
+      () => ({}), { outcome: "enqueued" }, TO_THE_ENQUEUE],
+    ["already_pending on the CONFLICT path — the enqueue's insert conflicts, and its own reread finds the row",
+      () => {
+        // The real enqueue helper inserts, is told nothing was inserted, and rereads the conflicting
+        // row. The row it is given is the usual stored row, for the scope and due it tried to insert.
+        // The script recognizes that reread under the plain queue read's name: it reads the same table.
+        let conflicting: unknown[] = [];
+        return {
+          "enqueue insert": (usual) => {
+            conflicting = usual();
+            return [];
+          },
+          "plain queue read": (usual, flat) => (/\b1 as pending\b/.test(flat) ? usual() : conflicting),
+        };
+      }, { outcome: "already_pending" }, [...TO_THE_ENQUEUE, "plain queue read"]],
+  ];
+
+  it.each(NORMAL_RETURNS)("restores both original timeout settings before this normal result resolves: %s", async (name, overrides, expected, dataStatements) => {
+    vi.stubEnv("SLACK_BOT_TOKEN", TOKEN);
+    const original: ModelledTimeouts = { statement_timeout: 30_000, lock_timeout: 1_500 };
+    const scripted = scriptedPreparation([{ is_due: true, due_epoch_ms: "1718903600123" }], () => undefined, overrides());
+    const modelled = modelledTimeouts(scripted.session, original);
+
+    const result = await prepareSlackKnownRootRequeue(modelled.session, { teamId: TEAM, entry: ENTRY }, execution());
+    // THE READ-BACK: the next statement on the caller's own session after the result, before anything else.
+    const readBack = await modelled.session.executeSql<{ name: string; setting: string }>(
+      "select name, setting from pg_settings where name in ('statement_timeout', 'lock_timeout')"
+    );
+
+    // FIXTURE VALIDITY first: this exact result, reached by exactly these data statements.
+    expect({ result, dataStatements: scripted.data() }, `${name}: fixture: the real preparer returned exactly this result, through exactly these data statements`)
+      .toEqual({ result: expected, dataStatements });
+    // While it ran, each setting ON ITS OWN was something other than its original for every data
+    // statement: the restoration is not a no-op, and putting back one cannot pass for both.
+    expect({
+      data_statements_run_under_the_model: modelled.underEachDataStatement.length,
+      statement_timeout_was_not_its_original_for_any_data_statement: modelled.underEachDataStatement.every((under) => under.statement_timeout !== original.statement_timeout),
+      lock_timeout_was_not_its_original_for_any_data_statement: modelled.underEachDataStatement.every((under) => under.lock_timeout !== original.lock_timeout),
+    }, `${name}: fixture: while the preparation ran, each timeout setting on its own was not its original`).toEqual({
+      data_statements_run_under_the_model: dataStatements.length,
+      statement_timeout_was_not_its_original_for_any_data_statement: true,
+      lock_timeout_was_not_its_original_for_any_data_statement: true,
+    });
+    expect(Object.fromEntries(readBack.rows.map((row) => [row.name, Number(row.setting)])),
+      `${name}: a read-back on the caller's own session after the normal result finds the original statement_timeout and the original lock_timeout`)
+      .toEqual(original);
+    expect(scripted.sent().slice(-1), `${name}: the restoring assignment is the last thing the preparation sent`).toEqual(["settings assignment"]);
+  });
+
+  it("accounts for every exported result and reason: read back in the table above, read back in the decorated-session table, or reached without a single statement", () => {
+    const expectedResults = NORMAL_RETURNS.map(([, , expected]) => expected);
+    // CROSS-REFERENCES, written out. Read back by "restores both original settings before a normal
+    // result resolves" in the decorated-session suite:
+    const refusedReadBackThere = ["namespace_changed_or_unready", "source_not_current"];
+    // Sent no statement at all, so nothing is set and nothing restored — "reports an entry
+    // enumeration could not locate (%s) as unattested with that reason, and touches nothing":
+    const unlocatedWithoutAStatement = ["not_slack", "invalid_metadata", "missing_channel_binding", "missing_namespace_pin"];
+
+    const refusedHere = expectedResults.flatMap((expected) => (expected.outcome === "refused" ? [expected.reason] : []));
+    const unattestedHere = expectedResults.flatMap((expected) => (expected.outcome === "unattested" ? [expected.reason] : []));
+    expect([...refusedHere, ...refusedReadBackThere].sort(), "every refused reason, each exactly once").toEqual([...SLACK_KNOWN_ROOT_REFUSED_REASONS].sort());
+    // `invalid_metadata` is both: of an entry enumeration could not locate, and of a located one.
+    expect([...new Set([...unattestedHere, ...unlocatedWithoutAStatement])].sort(), "every unattested reason").toEqual([...SLACK_KNOWN_ROOT_UNATTESTED_REASONS].sort());
+    expect(unattestedHere, "the located form of invalid_metadata is one of the rows above").toContain("invalid_metadata");
+    expect(expectedResults.flatMap((expected) => (expected.outcome === "refused" || expected.outcome === "unattested" ? [] : [expected.outcome])).sort(),
+      "not_due, enqueued, and already_pending twice — once on each of its two paths").toEqual(["already_pending", "already_pending", "enqueued", "not_due"]);
+  });
+});

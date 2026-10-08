@@ -4,6 +4,7 @@ import { SlackError, type FetchedChannel, type SlackClient } from "./sources/sla
 import { slackChannelPathPrefix } from "./sources/slack-normalize";
 import { planSlackDeletions, type StoredSlackThread } from "./sources/slack-deletions";
 import { escapeLike, purgeItemIds, type PurgeOptions } from "./purge";
+import { parseSlackItemPath, scopedSlackChannelPathPrefix, scopedSlackItemPath } from "./sources/slack-namespace";
 
 /**
  * Remove the Slack threads a channel no longer has — the DB half of the deletion path (the decision
@@ -101,4 +102,39 @@ export async function purgeDeletedSlackThreads(
     scope: slackChannelPathPrefix(channel.channelId),
   });
   return res.items;
+}
+
+/**
+ * Inactive scoped cleanup seam. Only an exact canonical path PLUS matching Slack metadata is a
+ * candidate. Frontmatter alone never supplies workspace authority. Three-segment legacy paths are
+ * deliberately omitted: their display segment/channel_id cannot establish historical workspace,
+ * and no durable verified legacy-to-scoped mapping table exists yet.
+ */
+async function scopedStoredRows(
+  db: DbClient, teamId: string, workspaceId: string, channelId: string
+): Promise<StoredSlackThread[]> {
+  const prefix = scopedSlackChannelPathPrefix(workspaceId, channelId);
+  const { data, error } = await db.from("items")
+    .select("id,path,frontmatter,kind")
+    .eq("team_id", teamId)
+    .like("path", `${escapeLike(prefix)}%`);
+  if (error) throw new Error(`slack scoped stored-thread read: ${error.message}`);
+  const rows = (data ?? []) as {
+    id: string; path: string; kind: string; frontmatter: Record<string, unknown> | null;
+  }[];
+  return rows.flatMap((row) => {
+    const parsed = parseSlackItemPath(row.path);
+    if (parsed?.kind !== "scoped" || row.path !== scopedSlackItemPath(workspaceId, channelId, parsed.rootTs) ||
+        row.kind !== "transcript" || row.frontmatter?.source !== "slack" ||
+        row.frontmatter.workspace_id !== workspaceId || row.frontmatter.channel_id !== channelId ||
+        row.frontmatter.ts !== parsed.rootTs) return [];
+    return [{ id: row.id, ts: parsed.rootTs }];
+  });
+}
+
+/** Read only canonical threads for this team, workspace and channel. No legacy fallback. */
+export async function storedScopedSlackThreads(
+  db: DbClient, teamId: string, workspaceId: string, channelId: string
+): Promise<StoredSlackThread[]> {
+  return scopedStoredRows(db, teamId, workspaceId, channelId);
 }

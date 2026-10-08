@@ -82,4 +82,3 @@ export function buildFtsQuery(question: string): { query: string; terms: string[
 export function toOrQuery(question: string): string {
   return buildFtsQuery(question).query;
 }
-

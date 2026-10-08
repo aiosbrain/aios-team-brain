@@ -26,6 +26,11 @@ import { groupTimeline } from "@/lib/dashboard/timeline-group";
 
 /** Every node type in the payload → the keys that version is allowed to carry. */
 const SHAPE_BY_VERSION: Record<number, Record<string, string[]>> = {
+  // v17 integrates the reserved Slack evidence-meaning/revision-stamp change with TIERRET-1's
+  // membership-only admission. Both are MEANING changes and both add fields to the ENVELOPE
+  // (`generations`, `itemFingerprint`) rather than to `TimelineDay`, so the tree stays identical.
+  // v15 is NOT pinned: it was reserved for #714 and then skipped — it never shipped to staging.
+  get 17() { return this[12]; },
   10: {
     // `summary` is attached on the cache-build path (`timeline-summary`), not by the pure builder, so
     // the fixture can't produce it — it is allowed but not required.
@@ -52,8 +57,9 @@ const SHAPE_BY_VERSION: Record<number, Record<string, string[]>> = {
   // attendee resolved. It is copied explicitly by the grouper, so it is exactly the kind of key that
   // gets silently dropped; the REQUIRED half below forces the fixture to actually produce one.
   // v16 (TIERRET-1): membership-only member reads (granted meetings + hand-entered rows) — a meaning
-  // change, shape identical. 15 is RESERVED by the pending Slack-semantics PR (#714) and is NOT pinned
-  // here: whichever lands second must take the next unclaimed number, never share one.
+  // change, shape identical. It reserved 15 for the pending Slack-semantics PR (#714); when the two
+  // integrated, the combined payload took 17 and 15 stayed unused, because whichever lands second must
+  // take the next unclaimed number and never share one.
   get 16() { return this[12]; },
   // v14 (PRET-6): the permissive tier row retired — again a meaning change, shape identical.
   get 14() { return this[12]; },
@@ -76,6 +82,7 @@ const SHAPE_BY_VERSION: Record<number, Record<string, string[]>> = {
  * field a stale payload still carries is the same hazard as adding one.
  */
 const REQUIRED_BY_VERSION: Record<number, Record<string, string[]>> = {
+  get 17() { return this[12]; },
   10: {
     personDay: ["memberId", "name", "handle", "total", "tasks", "other", "unlinked", "signals"],
     taskGroup: ["taskId", "title", "status", "source", "sources", "evidenceCount", "assignee"],

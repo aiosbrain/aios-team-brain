@@ -192,6 +192,23 @@ export async function visOf(seed: Seed, memberId: string = seed.memberId) {
   return resolveTimelineVariant(db(), seed.teamId, memberId);
 }
 
+/**
+ * The two stamps a `work_timeline_cache` payload must carry to be read at all — as a hit OR as a
+ * salvage source: the team's live Slack generations and the reader's current item fingerprint.
+ * Computed here, NOT lifted from a row the cache wrote, so a planted row carrying them can only be
+ * refused by the rule under test (its key, a purge) — an unstamped poison row is refused by the
+ * stamp check first and proves nothing about the key (merge review F1/F2).
+ */
+export async function liveTimelineStamps(teamId: string, memberId: string) {
+  const real = db();
+  if (!isTransactionCapableDbClient(real)) throw new Error("test fixture requires transaction capability");
+  const { readSlackTeamGenerations } = await import("@/lib/ingest/slack-message-ledger");
+  const generations = await real.transaction((session) => readSlackTeamGenerations(session, teamId));
+  const { contentTimelineEnforcement } = await import("@/lib/access/admission");
+  const { visibleItemIds } = await contentTimelineEnforcement(real, teamId, memberId);
+  return { generations, itemFingerprint: sha(JSON.stringify([...visibleItemIds].sort())) };
+}
+
 /** Mint an ACTIVE external-posture member (invite-default shape: the external builtin row). */
 export async function externalMember(seed: Seed): Promise<string> {
   const admin = db();

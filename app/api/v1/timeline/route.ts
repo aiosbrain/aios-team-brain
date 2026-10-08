@@ -15,7 +15,7 @@ export const runtime = "nodejs";
  *
  * Access (TIERRET-1, CLAUDE.md §5 — no RLS backstop): `getCachedWorkTimeline` resolves the key's member
  * through the ONE admission resolver (`lib/access/admission.ts`) and serves its
- * `adm:<class>:<tier>:<hash>` variant (payload v16). An admitted member (active human/standing agent)
+ * `adm:<class>:<tier>:<hash>` variant (payload v17). An admitted member (active human/standing agent)
  * receives exactly its membership: evidence from oracle-visible items, sourced tasks whose source item it
  * can see, hand-entered tasks by Everyone-or-grants, and meetings whose transcript it can see — at
  * either posture, with no label ceiling. An active connector/offroster key is the LEGACY arm and keeps

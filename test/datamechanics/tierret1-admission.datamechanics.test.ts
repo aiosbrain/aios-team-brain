@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
-import { db, ingest, seedTeam, sha, type Seed } from "./helpers";
+import { db, ingest, liveTimelineStamps, seedTeam, sha, type Seed } from "./helpers";
 import { ingestItem } from "@/lib/ingest";
 import { createMember } from "@/lib/admin/members";
 import { createGroup, addMemberToGroup, grantProjectToGroup, removeMemberFromGroup } from "@/lib/access/groups";
@@ -364,7 +364,7 @@ describe("TIERRET-1 AC-07 — Social member reads are the EVERY-evidence rule at
   });
 });
 
-describe("TIERRET-1 AC-12 — timeline cache: new namespace, v16, admission-separated, revocation, purge, rollback", () => {
+describe("TIERRET-1 AC-12 — timeline cache: new namespace, v17, admission-separated, revocation, purge, rollback", () => {
   // Fixture teardown (not an assertion): settle background synopsis passes before the next test's
   // TRUNCATE, so a late cache write can't surface as an FK error mistaken for a product failure.
   afterEach(async () => {
@@ -382,9 +382,10 @@ describe("TIERRET-1 AC-12 — timeline cache: new namespace, v16, admission-sepa
   const keysOf = async (teamId: string) =>
     (((await db().from("work_timeline_cache").select("group_key, payload").eq("team_id", teamId)).data ?? []) as { group_key: string; payload: { v: number } }[]);
 
-  it("cold then warm: the granted content is served under adm:<class>:<tier>:<hash> at payload v16", async () => {
+  it("cold then warm: the granted content is served under adm:<class>:<tier>:<hash> at payload v17", async () => {
     const { F } = await timelineFixture();
-    expect(PAYLOAD_VERSION, "15 is reserved by PR 714").toBe(16);
+    // v16 was TIERRET-1 alone and reserved 15 for PR 714; integrating 714's Slack semantics took 17.
+    expect(PAYLOAD_VERSION, "16 (TIERRET-1) + PR 714 integrated at the next unclaimed number").toBe(17);
     const cold = await getCachedWorkTimeline(db(), F.seed.teamId, "external", F.external);
     await settleTimelineRefreshes();
     const warm = await getCachedWorkTimeline(db(), F.seed.teamId, "external", F.external);
@@ -392,7 +393,7 @@ describe("TIERRET-1 AC-12 — timeline cache: new namespace, v16, admission-sepa
     const rows = await keysOf(F.seed.teamId);
     const key = await timelineViewKey(db(), F.seed.teamId, "external", F.external);
     expect(key.startsWith("adm:"), key).toBe(true);
-    expect(rows.find((r) => r.group_key === key)?.payload.v).toBe(16);
+    expect(rows.find((r) => r.group_key === key)?.payload.v).toBe(17);
   });
 
   it("revoking the grant moves the member to a different variant that no longer names the work", async () => {
@@ -455,17 +456,31 @@ describe("TIERRET-1 AC-12 — timeline cache: new namespace, v16, admission-sepa
   it("roll-forward after rollback: the namespace purge deletes pre-rollback summaries before the new code serves", async () => {
     const { F } = await timelineFixture();
     const key = await timelineViewKey(db(), F.seed.teamId, "external", F.external);
-    // A row written BEFORE a rollback, naming work that was narrowed while old code (which cannot
-    // purge this namespace) was live.
+    // A row written BEFORE a rollback, naming work that changed while older code was live. It is
+    // FULLY STAMPED — current version, the team's live Slack generations, the reader's current item
+    // fingerprint — because that is the row the purge exists for: an older build cannot move the
+    // generations, so a pre-rollback row keeps passing every read-side check. (An unstamped row is
+    // refused by the reader anyway, so it would pass this test with the purge deleted.)
+    const stamps = await liveTimelineStamps(F.seed.teamId, F.external);
     await db().from("work_timeline_cache").upsert({
       team_id: F.seed.teamId,
       group_key: key,
-      payload: JSON.stringify({ v: PAYLOAD_VERSION, days: [{ date: new Date().toISOString().slice(0, 10), people: [{ memberId: F.seed.memberId, name: "X", summary: "STALE-PRE-ROLLBACK prose", tasks: [], other: [], unlinked: 0, total: 0, signals: [] }] }] }),
+      payload: JSON.stringify({ v: PAYLOAD_VERSION, ...stamps, days: [{ date: new Date().toISOString().slice(0, 10), people: [{ memberId: F.seed.memberId, name: "X", summary: "STALE-PRE-ROLLBACK prose", tasks: [], other: [], unlinked: 0, total: 0, signals: [] }] }] }),
       computed_at: new Date().toISOString(),
     }, { onConflict: "team_id,group_key" });
+    const rowAtKey = async () =>
+      (await db().from("work_timeline_cache").select("payload").eq("team_id", F.seed.teamId).eq("group_key", key).maybeSingle()).data;
+
+    // NEGATIVE CONTROL: without the purge the new code SERVES this row — nothing else stops it.
+    const unpurged = await getCachedWorkTimeline(db(), F.seed.teamId, "external", F.external);
+    expect(JSON.stringify(unpurged.days), "the planted row must be readable, or the purge below proves nothing").toContain("STALE-PRE-ROLLBACK");
+
     const purged = await purgeAdmissionTimelineNamespace(db());
     expect(purged.ok).toBe(true);
+    expect(await rowAtKey(), "the purge deletes the persisted row itself").toBeNull();
+    // …and this process's copy: the control read above left one in memory, fresh inside its TTL.
     const { days } = await getCachedWorkTimeline(db(), F.seed.teamId, "external", F.external);
     expect(JSON.stringify(days), "the documented roll-forward step leaves nothing stale to serve or salvage").not.toContain("STALE-PRE-ROLLBACK");
+    expect(JSON.stringify(days), "what is served instead is a real rebuild, not an empty view").toContain("xenolith work");
   });
 });

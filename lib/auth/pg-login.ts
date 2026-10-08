@@ -45,8 +45,20 @@ export async function linkMemberByEmail(
   );
   if (teamId) {
     await runSql(
-      `update members set status = 'active'
-       where team_id = $1 and email = $2 and status = 'invited'`,
+      `with activated as (
+         update members set status = 'active'
+          where team_id = $1 and email = $2 and status = 'invited'
+          returning id, team_id
+       ), bumped as (
+         insert into slack_team_state (team_id, identity_generation)
+         select distinct a.team_id, 1 from activated a
+          where exists (select 1 from member_identities mi
+                         where mi.team_id = a.team_id and mi.member_id = a.id and mi.provider = 'slack')
+         on conflict (team_id) do update set
+           identity_generation = slack_team_state.identity_generation + 1,
+           updated_at = clock_timestamp()
+         returning team_id
+       ) select count(*) from bumped`,
       [teamId, email]
     );
     // PRET-4 §1c: no membership hook on activation — the builtin row has existed since
@@ -63,8 +75,20 @@ export async function linkMemberByEmail(
  */
 export async function activateInvitedMembership(teamId: string, authUserId: string): Promise<void> {
   await runSql(
-    `update members set status = 'active'
-     where team_id = $1 and auth_user_id = $2 and status = 'invited'`,
+    `with activated as (
+       update members set status = 'active'
+        where team_id = $1 and auth_user_id = $2 and status = 'invited'
+        returning id, team_id
+     ), bumped as (
+       insert into slack_team_state (team_id, identity_generation)
+       select distinct a.team_id, 1 from activated a
+        where exists (select 1 from member_identities mi
+                       where mi.team_id = a.team_id and mi.member_id = a.id and mi.provider = 'slack')
+       on conflict (team_id) do update set
+         identity_generation = slack_team_state.identity_generation + 1,
+         updated_at = clock_timestamp()
+       returning team_id
+     ) select count(*) from bumped`,
     [teamId, authUserId]
   );
   // PRET-4 §1c: no membership hook here either — see linkMemberByEmail.

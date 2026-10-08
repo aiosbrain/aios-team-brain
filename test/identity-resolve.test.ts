@@ -50,6 +50,9 @@ describe("resolveByProviderId()", () => {
   it("resolves a provider user id (case-insensitive) to a member", () => {
     expect(resolveByProviderId(mapOf(), "slack", "U123")).toBe("m-jane");
     expect(resolveByProviderId(mapOf(), "Slack", "u123")).toBe("m-jane");
+    expect(resolveByProviderId(mapOf(), "\u00a0Slack\u00a0", "U123")).toBe("m-jane");
+    expect(resolveByProviderId(mapOf(), "\tSlack\n", "U123")).toBe("m-jane");
+    expect(resolveByProviderId(mapOf(), "\ufeffSlack\ufeff", "U123")).toBe("m-jane");
   });
 
   it("returns null for an unmapped provider id or empty external id", () => {
