@@ -219,6 +219,16 @@ CREATE TABLE IF NOT EXISTS stream_hints (
   last_hint_at TEXT,
   PRIMARY KEY (team, connection_id, credential_id, drive_id)
 );
+CREATE TABLE IF NOT EXISTS removal_barriers (
+  namespace TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  item_key TEXT NOT NULL,
+  observation_revision INTEGER NOT NULL,
+  peer_drive_id TEXT NOT NULL,
+  barrier_seq INTEGER NOT NULL,
+  raised_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (namespace, generation, item_key, observation_revision, peer_drive_id)
+);
 """
 
 
@@ -665,6 +675,80 @@ class StateStore:
         )
         self._db.commit()
 
+    # -- cross-stream removal barriers ----------------------------------------
+    # A removal one stream observed is the connection's only once every other stream has finished a
+    # drain that began after the removal was observed. A barrier is that requirement for one peer,
+    # durably: the peer's dirty sequence at the moment the barrier was raised. A missing row is
+    # missing evidence, never a passed barrier — a peer that became known only after the removal
+    # was first withheld is given its own, and nothing is concluded about it until then.
+    def raise_removal_barrier(
+        self, work: PendingWork, peer: StreamKey, *, renew: bool = False,
+    ) -> bool:
+        """Mark one peer dirty for one removal and record the sequence it has to drain past.
+
+        Atomic and idempotent: a barrier is raised once per removal observation and peer, so a
+        restart can neither lose it nor move it past a drain the peer has already finished.
+        ``renew`` raises it again at a new sequence — for a peer whose earlier drain is no longer
+        evidence, because the local state that drain was read into is gone.
+        """
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            raised = self._db.execute(
+                "SELECT 1 FROM removal_barriers WHERE namespace=? AND generation=? AND item_key=? "
+                "AND observation_revision=? AND peer_drive_id=?",
+                (work.namespace, work.generation, work.item_key, work.observation_revision,
+                 peer.drive_id),
+            ).fetchone()
+            if raised is not None and not renew:
+                self._db.rollback()
+                return False
+            self._db.execute(
+                "INSERT INTO stream_hints(team,connection_id,credential_id,drive_id,dirty_seq,last_hint_at) "
+                "VALUES(?,?,?,?,1,?) ON CONFLICT(team,connection_id,credential_id,drive_id) DO UPDATE SET "
+                "dirty_seq=dirty_seq+1,last_hint_at=excluded.last_hint_at",
+                (peer.team, peer.connection_id, peer.credential_id, peer.drive_id, _now_iso()),
+            )
+            sequence = int(self._db.execute(
+                "SELECT dirty_seq FROM stream_hints WHERE team=? AND connection_id=? "
+                "AND credential_id=? AND drive_id=?",
+                (peer.team, peer.connection_id, peer.credential_id, peer.drive_id),
+            ).fetchone()["dirty_seq"])
+            self._db.execute(
+                "INSERT INTO removal_barriers(namespace,generation,item_key,observation_revision,"
+                "peer_drive_id,barrier_seq,raised_at) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(namespace,generation,item_key,observation_revision,peer_drive_id) "
+                "DO UPDATE SET barrier_seq=excluded.barrier_seq,raised_at=excluded.raised_at",
+                (work.namespace, work.generation, work.item_key, work.observation_revision,
+                 peer.drive_id, sequence, _now_iso()),
+            )
+            self._db.commit()
+            return True
+        except Exception:
+            self._db.rollback()
+            raise
+
+    def removal_barrier(self, work: PendingWork, peer: StreamKey) -> str:
+        """``missing``, ``standing`` or ``passed`` for one removal observation and one peer.
+
+        ``passed`` is the peer's acknowledgment of a drain that began at or after the barrier.
+        """
+        barrier = self._db.execute(
+            "SELECT barrier_seq FROM removal_barriers WHERE namespace=? AND generation=? "
+            "AND item_key=? AND observation_revision=? AND peer_drive_id=?",
+            (work.namespace, work.generation, work.item_key, work.observation_revision,
+             peer.drive_id),
+        ).fetchone()
+        if barrier is None:
+            return "missing"
+        hint = self._db.execute(
+            "SELECT acked_seq FROM stream_hints WHERE team=? AND connection_id=? "
+            "AND credential_id=? AND drive_id=?",
+            (peer.team, peer.connection_id, peer.credential_id, peer.drive_id),
+        ).fetchone()
+        if hint is not None and int(hint["acked_seq"]) >= int(barrier["barrier_seq"]):
+            return "passed"
+        return "standing"
+
     # -- selected-root drive bindings ----------------------------------------
     def bind_root(
         self, connection_id: str, generation: int, root_kind: str, root_id: str, drive_id: str,
@@ -921,6 +1005,11 @@ class StateStore:
             "WHERE namespace=? AND generation=? AND item_key=? AND status='pending'",
             (now, namespace, generation, item_key),
         )
+        # A barrier belongs to the observation it was raised for; a newer one starts with none.
+        self._db.execute(
+            "DELETE FROM removal_barriers WHERE namespace=? AND generation=? AND item_key=?",
+            (namespace, generation, item_key),
+        )
         self._db.execute(
             "INSERT INTO pending_work(namespace,generation,item_key,action,observation_revision,payload,page_id,created_at,updated_at) "
             "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(namespace,generation,item_key,action) DO UPDATE SET "
@@ -1052,6 +1141,12 @@ class StateStore:
                 "AND status='pending'",
                 (_now_iso(), work.namespace, work.generation, work.page_id, work.item_key,
                  work.observation_revision),
+            )
+        if work.action == "remove":
+            self._db.execute(
+                "DELETE FROM removal_barriers WHERE namespace=? AND generation=? AND item_key=? "
+                "AND observation_revision=?",
+                (work.namespace, work.generation, work.item_key, work.observation_revision),
             )
         self._db.commit()
 

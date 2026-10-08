@@ -4505,6 +4505,10 @@ class _DriveWorld:
         self.cursor_errors, self.change_errors, self.hooks = {}, {}, {}
         self.pushed, self.removed, self.reconciled = [], [], []
         self.progress, self.revision = {}, 0
+        # Failures to raise, once each, from the next checkpoint written for a drive's stream —
+        # the process dying there; and whether the brain acknowledges with its own copy of what
+        # it stored, as a real HTTP round trip does, instead of the object it was handed.
+        self.checkpoint_crashes, self.ack_copies = {}, False
 
     def put(self, file_id, *, drive, parent=None, folder=False):
         self.files[file_id] = {
@@ -4570,6 +4574,7 @@ class _DriveWorld:
                     found = {"files": [
                         dict(meta) for meta in world.files.values()
                         if folder_id in meta["parents"] and meta.get("driveId", "my-drive") == drive_id
+                        and not meta.get("trashed")
                     ]}
                     world.hooks.pop(("list", drive_id, folder_id), lambda: None)()
                     return found
@@ -4615,9 +4620,12 @@ class _DriveWorld:
             def gdrive_provider_gate(self, execution): return _Closable()
 
             async def checkpoint_gdrive_execution(self, execution, progress):
+                if world.checkpoint_crashes.get(progress.get("drive_id")):
+                    raise world.checkpoint_crashes[progress["drive_id"]].pop(0)
                 world.revision += 1
                 world.progress = json.loads(json.dumps(progress))
-                return {"progress_revision": world.revision, "progress": progress}
+                acknowledged = json.loads(json.dumps(progress)) if world.ack_copies else progress
+                return {"progress_revision": world.revision, "progress": acknowledged}
 
             async def push(self, payload, *, execution):
                 world.pushed.append(payload.frontmatter["source_id"])
@@ -5830,5 +5838,622 @@ async def test_rescan_seeded_by_a_terminal_change_page_reconciles_only_after_a_l
     assert state.get_progress(namespace).terminal_drain_acknowledged is True
     assert confirmed.failed == 0 and confirmed.authoritative_complete is True and confirmed.backlog == 0
     assert world.reconciled == [["doc-1", "doc-m"], ["doc-1", "doc-m"]]
+    assert world.removed == []
+    state.close()
+
+
+# ---------------------------------------------------------------------------------------------
+# A stream that holds no token never started, whatever its record says
+# ---------------------------------------------------------------------------------------------
+#
+# Spec. A stream has started when it holds a change token. A record without one — its diagnostic
+# written, replaced by another message, or never written because the run that created it was
+# interrupted first — is a stream that never started: its drive is asked for a token before
+# anything of it is enumerated, on every run, and it is complete only after a drain from that
+# token reaches the terminal token.
+
+
+@pytest.mark.parametrize("status", [403, 404])
+@pytest.mark.asyncio
+async def test_stream_record_left_without_a_token_by_an_interrupted_run_is_unstarted_whatever_it_says(
+    tmp_path, monkeypatch, status,
+):
+    world = _DriveWorld(file_ids=["file-x", "file-m"]).install(monkeypatch)
+    world.put("file-x", drive="shared-x")
+    world.put("file-m", drive="my-drive")
+    world.token_errors["shared-x"] = _ProviderHttpError(status)
+    # The process dies while the refusal is being recorded: the local record exists by then.
+    world.checkpoint_crashes["shared-x"] = [RuntimeError("process killed")]
+    path = str(tmp_path / f"interrupted-start-{status}.sqlite")
+    namespace = world.namespace("shared-x")
+    diagnostic = _start_diagnostic("shared-x", status)
+    state = StateStore(path)
+
+    with pytest.raises(RuntimeError, match="process killed"):
+        await world.run(state)
+    state.close()
+
+    # What the interruption left: a record with no token and no diagnostic, unknown to the brain.
+    state = StateStore(path)
+    interrupted = state.get_progress(namespace)
+    assert interrupted is not None
+    assert not interrupted.baseline_start_token and interrupted.page_token is None
+    assert interrupted.last_error is None
+    assert "shared-x" not in world.progress["streams"]
+
+    def assert_nothing_of_the_drive_was_read():
+        assert ("start", "shared-x") in world.calls
+        assert not [call for call in world.calls if call[0] in {"changes", "list"} and call[1] == "shared-x"]
+        assert ("metadata", "file-x") not in world.calls and ("doc", "file-x") not in world.calls
+        assert world.pushed == ["file-m"]
+
+    # A restart, the drive still refusing: the token is asked for again and nothing is enumerated.
+    world.calls.clear()
+    blocked = await world.run(state)
+
+    assert_nothing_of_the_drive_was_read()
+    assert blocked.failed == 1 and blocked.failure_categories == {"stream_start_unavailable": 1}
+    local = state.get_progress(namespace)
+    assert (local.phase, local.listing_complete, local.baseline_start_token) == ("partial", False, None)
+    assert local.last_error == diagnostic
+    assert world.stream("shared-x")["last_error"] == diagnostic
+    assert world.stream("shared-x")["baseline_start_token"] is None
+    assert blocked.authoritative_complete is False
+    assert blocked.backlog is not None and blocked.backlog > 0
+    assert world.reconciled == [] and world.removed == []
+
+    # The diagnostic is then replaced, locally and on the brain, by an unrelated message. The
+    # record still holds no token, so it is still a stream that never started.
+    state.update_progress(namespace, last_error="overall run deadline exhausted")
+    world.progress["streams"]["shared-x"]["last_error"] = "overall run deadline exhausted"
+    state.close()
+    state = StateStore(path)
+    world.calls.clear()
+    reworded = await world.run(state)
+
+    assert_nothing_of_the_drive_was_read()
+    assert reworded.failure_categories == {"stream_start_unavailable": 1}
+    assert state.get_progress(namespace).last_error == diagnostic
+    assert not state.get_progress(namespace).baseline_start_token
+    assert reworded.authoritative_complete is False
+    assert reworded.backlog is not None and reworded.backlog > 0
+    assert world.reconciled == [] and world.removed == []
+    state.close()
+
+    # The drive issues a token: captured before its root is read, and the stream is complete only
+    # once a drain from that token has reached the terminal token.
+    state = StateStore(path)
+    del world.token_errors["shared-x"]
+    world.calls.clear()
+    opened = await world.run(state)
+
+    assert world.calls.index(("start", "shared-x")) < world.calls.index(("metadata", "file-x"))
+    assert world.calls.index(("doc", "file-x")) < world.calls.index(("changes", "shared-x", "shared-x@0"))
+    started = state.get_progress(namespace)
+    assert started.baseline_start_token == "shared-x@0"
+    assert started.terminal_drain_acknowledged is True
+    assert opened.failed == 0 and opened.authoritative_complete is True and opened.backlog == 0
+    assert world.pushed == ["file-m", "file-x"]
+    assert world.reconciled == [["file-m", "file-x"]]
+    assert {world.stream(drive)["phase"] for drive in ("my-drive", "shared-x")} == {"current"}
+    state.close()
+
+
+# ---------------------------------------------------------------------------------------------
+# A removal is weighed against the whole roster, and waits on every peer it could have moved to
+# ---------------------------------------------------------------------------------------------
+#
+# Spec. The streams of a connection are one roster, from every source: the drives its roots are
+# configured for or bound to, the drive a root is on its way to, the streams local state holds
+# and the streams the brain's checkpoint holds. A peer in the roster with no local state is
+# unknown, never absent. A removal one stream observed leaves it only when no peer claims the
+# document and every peer has finished a drain that began after its barrier — a durable mark,
+# raised for each peer when it is first known for that removal, however much later that is. A
+# peer with no barrier is one nothing is known about, across any restart. Behind a peer that
+# cannot be read an ambiguous removal stays withheld; one the provider itself confirms — the
+# document is not found, or is trashed — is the connection's at once, without a complete snapshot.
+
+
+def _lose_local_stream(state, namespace):
+    """Drop everything this sidecar holds for one stream; the brain's checkpoint keeps it."""
+    for table in (
+        "stream_progress", "selection_snapshots", "selection_roots", "traversal_queue",
+        "selected_membership", "traversal_ancestry", "membership_ancestry", "materialized_pages",
+        "pending_work", "stream_observation_revisions", "item_observations",
+        "page_obligation_outcomes",
+    ):
+        state._db.execute(f"delete from {table} where namespace=?", (namespace,))
+    state._db.commit()
+
+
+def _barrier_peers(state, namespace):
+    return [row[0] for row in state._db.execute(
+        "select peer_drive_id from removal_barriers where namespace=? order by peer_drive_id",
+        (namespace,),
+    ).fetchall()]
+
+
+def test_removal_barrier_is_missing_until_raised_and_passes_only_on_a_later_drain_across_restart(tmp_path):
+    path = str(tmp_path / "removal-barrier.sqlite")
+    key = StreamKey("team", "connection", "account", "shared-a")
+    peer = StreamKey("team", "connection", "account", "shared-b")
+    late = StreamKey("team", "connection", "account", "shared-c")
+    state = StateStore(path)
+    progress = state.begin_generation(key, 3, start_token="start")
+    state.enqueue_work(progress.namespace, 3, "doc", "remove", {"file_id": "doc"})
+    (work,) = state.list_pending(progress.namespace, 3)
+
+    # A drain the peer finished before any barrier existed is not evidence about this removal.
+    state.ack_stream_hint(peer, state.record_stream_hint(peer))
+    assert state.pending_stream_hint(peer) is None
+    assert state.removal_barrier(work, peer) == "missing"
+
+    # Raised once: a second attempt neither moves it nor marks the peer dirty again.
+    assert state.raise_removal_barrier(work, peer) is True
+    assert state.raise_removal_barrier(work, peer) is False
+    assert state.pending_stream_hint(peer) == 2
+    assert state.removal_barrier(work, peer) == "standing"
+    state.close()
+
+    state = StateStore(path)
+    assert state.removal_barrier(work, peer) == "standing"
+    # An acknowledgment of an earlier sequence does not pass it; the one it was raised at does.
+    state.ack_stream_hint(peer, 1)
+    assert state.removal_barrier(work, peer) == "standing"
+    state.ack_stream_hint(peer, 2)
+    assert state.removal_barrier(work, peer) == "passed"
+    # Renewed, it stands again at a new sequence: the earlier drain no longer passes it.
+    assert state.raise_removal_barrier(work, peer, renew=True) is True
+    assert state.removal_barrier(work, peer) == "standing"
+    assert state.pending_stream_hint(peer) == 3
+    # A peer first known later has no barrier, whatever any other peer has drained.
+    assert state.removal_barrier(work, late) == "missing"
+    assert state.raise_removal_barrier(work, late) is True
+    assert state.removal_barrier(work, late) == "standing"
+    assert _barrier_peers(state, progress.namespace) == ["shared-b", "shared-c"]
+
+    # A newer observation of the document starts with no barrier at all…
+    state.enqueue_work(progress.namespace, 3, "doc", "remove", {"file_id": "doc"})
+    (newer,) = state.list_pending(progress.namespace, 3)
+    assert newer.observation_revision > work.observation_revision
+    assert _barrier_peers(state, progress.namespace) == []
+    assert state.removal_barrier(newer, peer) == "missing"
+    # …and an acknowledged removal leaves none behind.
+    assert state.raise_removal_barrier(newer, peer) is True
+    state.ack_work(newer)
+    assert _barrier_peers(state, progress.namespace) == []
+    state.close()
+
+
+@pytest.mark.parametrize("moved,moves,origin_members,destination_members", [
+    ("doc-1", [(("doc-1",), "folder-b")], ["doc-ka", "doc-n"], ["doc-1", "doc-kb"]),
+    # A nested folder and the document under it: the old drive reports the document removed and
+    # then the folder; only the folder is re-parented, so the document is found by descent.
+    ("doc-n", [(("doc-n",), None), (("folder-n",), "folder-b")], ["doc-1", "doc-ka"], ["doc-kb", "doc-n"]),
+])
+@pytest.mark.asyncio
+async def test_move_into_a_stream_only_the_brain_holds_is_not_removed_when_its_origin_reads_first(
+    tmp_path, monkeypatch, moved, moves, origin_members, destination_members,
+):
+    world = _DriveWorld(folder_ids=["folder-a", "folder-b"]).install(monkeypatch)
+    world.put("folder-a", drive="shared-a", folder=True)
+    world.put("doc-1", drive="shared-a", parent="folder-a")
+    world.put("doc-ka", drive="shared-a", parent="folder-a")
+    world.put("folder-n", drive="shared-a", parent="folder-a", folder=True)
+    world.put("doc-n", drive="shared-a", parent="folder-n")
+    world.put("folder-b", drive="shared-b", folder=True)
+    world.put("doc-kb", drive="shared-b", parent="folder-b")
+    everything = ["doc-1", "doc-ka", "doc-kb", "doc-n"]
+    path = str(tmp_path / f"remote-only-destination-{moved}.sqlite")
+    state = StateStore(path)
+    assert (await world.run(state)).authoritative_complete is True
+    assert world.reconciled == [everything]
+    await _run_until_next_is(world, state, "shared-a")
+    reconciliations = len(world.reconciled)
+    origin, destination = world.namespace("shared-a"), world.namespace("shared-b")
+
+    # This sidecar loses what it held for the destination's stream. The brain still holds it.
+    _lose_local_stream(state, destination)
+    assert state.get_progress(destination) is None
+    assert world.stream("shared-b")["baseline_start_token"] == "shared-b@0"
+
+    for file_ids, parent in moves:
+        world.move(*file_ids, source="shared-a", destination="shared-b", parent=parent)
+    world.calls.clear()
+    withheld = await world.run(state)
+
+    # The origin read the removal before the destination's stream had any local state at all…
+    assert (world.calls.index(("changes", "shared-a", "shared-a@0"))
+            < world.calls.index(("start", "shared-b")))
+    # …and removed nothing: a stream the brain holds is unknown here, not absent. The obligation
+    # is durable, with a barrier for that stream, and the connection is not complete.
+    assert world.removed == []
+    assert [(work.item_key, work.action) for work in state.list_pending(origin, 9)] == [(moved, "remove")]
+    assert _barrier_peers(state, origin) == ["shared-b"]
+    assert withheld.failed == 0
+    assert withheld.failure_categories.get("cross_stream_move_pending") == 1
+    assert withheld.authoritative_complete is False
+    assert withheld.backlog is not None and withheld.backlog > 0
+    assert world.reconciled[reconciliations:] == []
+    state.close()
+
+    # Across restarts the destination's recovered stream claims the document, so the obligation
+    # ends without a removal, and the connection never reconciles to a snapshot without it.
+    summary = None
+    for _run in range(4):
+        state = StateStore(path)
+        summary = await world.run(state)
+        assert world.removed == []
+        assert all(moved in members for members in world.reconciled)
+        if summary.authoritative_complete:
+            break
+        state.close()
+
+    assert summary.authoritative_complete is True and summary.backlog == 0
+    assert state.pending_count(origin, 9) == 0 and _barrier_peers(state, origin) == []
+    assert state.membership_ids(origin, 9) == origin_members
+    assert state.membership_ids(destination, 9) == destination_members
+    assert world.reconciled[reconciliations:] == [everything]
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_barrier_a_peer_passed_before_its_local_state_was_lost_is_not_evidence_about_it(
+    tmp_path, monkeypatch,
+):
+    world = _two_selected_folders(monkeypatch)
+    path = str(tmp_path / "barrier-passed-then-lost.sqlite")
+    state = StateStore(path)
+    assert (await world.run(state)).authoritative_complete is True
+    await _run_until_next_is(world, state, "shared-a")
+    reconciliations = len(world.reconciled)
+    origin, destination = world.namespace("shared-a"), world.namespace("shared-b")
+    peer = StreamKey("team", _WORLD_INTEGRATION, "account", "shared-b")
+
+    # The origin reads the removal first and withholds it; the destination then claims the
+    # document and drains past the barrier.
+    world.move("doc-1", source="shared-a", destination="shared-b", parent="folder-b")
+    await world.run(state)
+    (work,) = state.list_pending(origin, 9)
+    assert (work.item_key, work.action) == ("doc-1", "remove")
+    assert state.removal_barrier(work, peer) == "passed"
+    assert "doc-1" in state.membership_ids(destination, 9)
+
+    # Before the origin looks again, this sidecar loses the destination's stream — and with it
+    # the membership that made the document claimed. The origin's stream is consumed first.
+    _lose_local_stream(state, destination)
+    assert state.rotate_streams(_WORLD_INTEGRATION, 9, ["shared-a", "shared-b"]) == ["shared-b", "shared-a"]
+    state.close()
+    state = StateStore(path)
+    world.calls.clear()
+    relost = await world.run(state)
+
+    # The origin weighed its removal before the destination's stream was recovered: the barrier
+    # that stream had passed proved nothing about a stream nothing is known of, so it stands
+    # again and nothing was removed.
+    assert world.calls.index(("metadata", "doc-1")) < world.calls.index(("start", "shared-b"))
+    assert world.removed == []
+    assert world.reconciled[reconciliations:] == []
+    assert relost.authoritative_complete is False
+    state.close()
+
+    summary = None
+    for _run in range(4):
+        state = StateStore(path)
+        summary = await world.run(state)
+        assert world.removed == []
+        assert all("doc-1" in members for members in world.reconciled)
+        if summary.authoritative_complete:
+            break
+        state.close()
+
+    assert summary.authoritative_complete is True and summary.backlog == 0
+    assert state.pending_count(origin, 9) == 0 and _barrier_peers(state, origin) == []
+    assert state.membership_ids(origin, 9) == ["doc-ka"]
+    assert state.membership_ids(destination, 9) == ["doc-1", "doc-kb"]
+    assert world.reconciled[reconciliations:] == [["doc-1", "doc-ka", "doc-kb"]]
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_peer_first_known_after_a_removal_was_withheld_gets_its_own_barrier_and_is_waited_on(
+    tmp_path, monkeypatch,
+):
+    world = _DriveWorld(file_ids=["file-kb"], folder_ids=["folder-a", "folder-b"]).install(monkeypatch)
+    world.put("folder-a", drive="shared-a", folder=True)
+    world.put("doc-1", drive="shared-a", parent="folder-a")
+    world.put("doc-ka", drive="shared-a", parent="folder-a")
+    world.put("folder-b", drive="shared-b", folder=True)
+    world.put("doc-kb", drive="shared-b", parent="folder-b")
+    world.put("file-kb", drive="shared-b")
+    everything = ["doc-1", "doc-ka", "doc-kb", "file-kb"]
+    path = str(tmp_path / "late-relocation-peer.sqlite")
+    state = StateStore(path)
+    assert (await world.run(state)).authoritative_complete is True
+    assert world.reconciled == [everything]
+    await _run_until_next_is(world, state, "shared-a")
+    reconciliations = len(world.reconciled)
+    origin = world.namespace("shared-a")
+    peer_b = StreamKey("team", _WORLD_INTEGRATION, "account", "shared-b")
+    peer_c = StreamKey("team", _WORLD_INTEGRATION, "account", "shared-c")
+
+    # doc-1 moves under folder-b — and folder-b, with everything under it, moves on to shared-c,
+    # a drive whose change log cannot be opened.
+    world.move("doc-1", source="shared-a", destination="shared-b", parent="folder-b")
+    world.move("doc-1", "doc-kb", "folder-b", source="shared-b", destination="shared-c")
+    world.token_errors["shared-c"] = _ProviderHttpError(403)
+    first = await world.run(state)
+
+    # The origin withheld its removal behind the only peer there was. shared-c became one — the
+    # destination of folder-b — only afterwards, in the same run.
+    assert world.removed == [] and first.authoritative_complete is False
+    assert [(work.item_key, work.action) for work in state.list_pending(origin, 9)] == [("doc-1", "remove")]
+    assert _barrier_peers(state, origin) == ["shared-b"]
+    assert _unsettled(state) == {("folder", "folder-b"): ("shared-b", "relocating", "shared-c")}
+    assert state.get_progress(world.namespace("shared-c")) is None
+    state.close()
+
+    # shared-b goes on to drain past its barrier and no longer holds the document; shared-c still
+    # cannot be opened. The removal stays withheld — behind a barrier of shared-c's own.
+    for _run in range(3):
+        state = StateStore(path)
+        stalled = await world.run(state)
+        assert world.removed == []
+        assert stalled.authoritative_complete is False
+        assert stalled.backlog is not None and stalled.backlog > 0
+        assert world.reconciled[reconciliations:] == []
+        assert [(work.item_key, work.action) for work in state.list_pending(origin, 9)] == [("doc-1", "remove")]
+        assert not state.get_progress(world.namespace("shared-c")).baseline_start_token
+        state.close()
+
+    state = StateStore(path)
+    assert "doc-1" not in state.membership_ids(world.namespace("shared-b"), 9)
+    assert _barrier_peers(state, origin) == ["shared-b", "shared-c"]
+    (work,) = state.list_pending(origin, 9)
+    assert state.removal_barrier(work, peer_b) == "passed"
+    assert state.removal_barrier(work, peer_c) == "standing"
+    assert state.pending_stream_hint(peer_b) is None and state.pending_stream_hint(peer_c) is not None
+
+    # shared-c opens: it takes folder-b over and claims the document. It was never removed.
+    del world.token_errors["shared-c"]
+    summary = None
+    for _run in range(4):
+        summary = await world.run(state)
+        assert world.removed == []
+        assert all("doc-1" in members for members in world.reconciled)
+        state.close()
+        state = StateStore(path)
+        if summary.authoritative_complete:
+            break
+
+    assert summary.authoritative_complete is True and summary.backlog == 0
+    assert state.pending_count(origin, 9) == 0 and _barrier_peers(state, origin) == []
+    assert state.membership_ids(origin, 9) == ["doc-ka"]
+    assert state.membership_ids(world.namespace("shared-b"), 9) == ["file-kb"]
+    assert state.membership_ids(world.namespace("shared-c"), 9) == ["doc-1", "doc-kb"]
+    assert world.reconciled[reconciliations:] == [everything]
+    state.close()
+
+
+async def _origin_baselined_while_its_peer_cannot_be_opened(tmp_path, monkeypatch, name):
+    """folder-a's stream is baselined; folder-b's drive refuses its change log from the start."""
+    world = _two_selected_folders(monkeypatch)
+    world.token_errors["shared-b"] = _ProviderHttpError(403)
+    path = str(tmp_path / name)
+    state = StateStore(path)
+    blocked = await world.run(state)
+    assert blocked.failure_categories == {"stream_start_unavailable": 1}
+    assert state.membership_ids(world.namespace("shared-a"), 9) == ["doc-1", "doc-ka"]
+    # The connection has never had a complete snapshot, and cannot while shared-b is unreadable.
+    assert blocked.authoritative_complete is False and world.reconciled == []
+    return world, path, state
+
+
+def _assert_peer_is_still_unopened(world, state):
+    peer = state.get_progress(world.namespace("shared-b"))
+    assert peer is not None and not peer.baseline_start_token and peer.active_snapshot is None
+    assert world.stream("shared-b")["last_error"] == _start_diagnostic("shared-b", 403)
+
+
+@pytest.mark.parametrize("ambiguity", ["readable-elsewhere", "unreadable"])
+@pytest.mark.asyncio
+async def test_ambiguous_removal_stays_withheld_behind_a_peer_that_cannot_be_opened_until_it_recovers(
+    tmp_path, monkeypatch, ambiguity,
+):
+    world, path, state = await _origin_baselined_while_its_peer_cannot_be_opened(
+        tmp_path, monkeypatch, f"blocked-peer-{ambiguity}.sqlite",
+    )
+    origin = world.namespace("shared-a")
+
+    # doc-1 moves under the selected folder of the drive that cannot be opened. Its old drive
+    # reports it removed; read for itself it is either still there to be read, or the read is
+    # refused in a way that says nothing about it.
+    world.move("doc-1", source="shared-a", destination="shared-b", parent="folder-b")
+    if ambiguity == "unreadable":
+        world.unreadable["doc-1"] = _ProviderHttpError(403)
+
+    for _run in range(3):
+        world.calls.clear()
+        withheld = await world.run(state)
+
+        # The document was read for itself, and that read did not make the removal absence.
+        assert ("metadata", "doc-1") in world.calls
+        assert world.removed == [] and world.reconciled == []
+        assert [(work.item_key, work.action) for work in state.list_pending(origin, 9)] == [("doc-1", "remove")]
+        assert _barrier_peers(state, origin) == ["shared-b"]
+        assert withheld.failure_categories == {
+            "stream_start_unavailable": 1, "cross_stream_move_pending": 1,
+        }
+        assert withheld.authoritative_complete is False
+        assert withheld.backlog is not None and withheld.backlog > 0
+        _assert_peer_is_still_unopened(world, state)
+        state.close()
+        state = StateStore(path)
+
+    # The drive opens: its stream finds the document under folder-b and claims it.
+    del world.token_errors["shared-b"]
+    world.unreadable.clear()
+    summary = None
+    for _run in range(4):
+        summary = await world.run(state)
+        assert world.removed == []
+        assert all("doc-1" in members for members in world.reconciled)
+        state.close()
+        state = StateStore(path)
+        if summary.authoritative_complete:
+            break
+
+    assert summary.authoritative_complete is True and summary.backlog == 0
+    assert state.pending_count(origin, 9) == 0 and _barrier_peers(state, origin) == []
+    assert state.membership_ids(origin, 9) == ["doc-ka"]
+    assert state.membership_ids(world.namespace("shared-b"), 9) == ["doc-1", "doc-kb"]
+    assert world.reconciled == [["doc-1", "doc-ka", "doc-kb"]]
+    state.close()
+
+
+@pytest.mark.parametrize("loss", ["deleted", "access-lost", "trashed"])
+@pytest.mark.asyncio
+async def test_document_the_provider_says_is_gone_is_removed_at_once_behind_a_peer_that_cannot_be_opened(
+    tmp_path, monkeypatch, loss,
+):
+    world, path, state = await _origin_baselined_while_its_peer_cannot_be_opened(
+        tmp_path, monkeypatch, f"blocked-peer-{loss}.sqlite",
+    )
+    origin = world.namespace("shared-a")
+
+    if loss == "trashed":
+        world.files["doc-1"]["trashed"] = True
+        world.logs.setdefault("shared-a", []).append(
+            {"fileId": "doc-1", "file": dict(world.files["doc-1"])}
+        )
+    else:
+        if loss == "deleted":
+            del world.files["doc-1"]
+        else:
+            # The account no longer has the document: Drive answers as if it did not exist.
+            world.unreadable["doc-1"] = _ProviderHttpError(404)
+        world.logs.setdefault("shared-a", []).append({"fileId": "doc-1", "removed": True})
+    world.calls.clear()
+    promptly = await world.run(state)
+
+    # The removal was read from the origin's change log, the document was then read for itself,
+    # and the provider's own answer made it absence — in that run, with the peer still unopened
+    # and no complete snapshot of the connection ever taken.
+    assert (world.calls.index(("changes", "shared-a", "shared-a@0"))
+            < world.calls.index(("metadata", "doc-1")))
+    assert world.removed == ["doc-1"]
+    assert world.reconciled == []
+    assert state.pending_count(origin, 9) == 0 and _barrier_peers(state, origin) == []
+    assert state.membership_ids(origin, 9) == ["doc-ka"]
+    assert promptly.failure_categories == {"stream_start_unavailable": 1}
+    assert promptly.authoritative_complete is False
+    assert promptly.backlog is not None and promptly.backlog > 0
+    _assert_peer_is_still_unopened(world, state)
+    state.close()
+
+    # A restart removes nothing again and concludes nothing else.
+    state = StateStore(path)
+    again = await world.run(state)
+    assert world.removed == ["doc-1"] and world.reconciled == []
+    assert state.pending_count(origin, 9) == 0
+    assert again.authoritative_complete is False
+    _assert_peer_is_still_unopened(world, state)
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_deletion_the_provider_would_not_confirm_is_removed_once_the_unopened_peer_has_drained(
+    tmp_path, monkeypatch,
+):
+    world, path, state = await _origin_baselined_while_its_peer_cannot_be_opened(
+        tmp_path, monkeypatch, "blocked-peer-eventual-deletion.sqlite",
+    )
+    origin = world.namespace("shared-a")
+
+    # The document is gone, but reading it for itself is refused throughout: nothing confirms it.
+    del world.files["doc-1"]
+    world.unreadable["doc-1"] = _ProviderHttpError(403)
+    world.logs.setdefault("shared-a", []).append({"fileId": "doc-1", "removed": True})
+
+    for _run in range(2):
+        world.calls.clear()
+        withheld = await world.run(state)
+        assert ("metadata", "doc-1") in world.calls
+        assert world.removed == [] and world.reconciled == []
+        assert [(work.item_key, work.action) for work in state.list_pending(origin, 9)] == [("doc-1", "remove")]
+        assert withheld.authoritative_complete is False
+        _assert_peer_is_still_unopened(world, state)
+        state.close()
+        state = StateStore(path)
+
+    # The drive opens. Its stream drains past the barrier and does not hold the document, so the
+    # removal is the connection's — on that evidence alone: the document is never read again.
+    del world.token_errors["shared-b"]
+    summary = None
+    for _run in range(4):
+        world.calls.clear()
+        summary = await world.run(state)
+        assert ("metadata", "doc-1") not in world.calls
+        assert all("doc-1" not in members for members in world.reconciled)
+        state.close()
+        state = StateStore(path)
+        if summary.authoritative_complete:
+            break
+
+    assert summary.authoritative_complete is True and summary.backlog == 0
+    assert world.removed == ["doc-1"]
+    assert state.pending_count(origin, 9) == 0 and _barrier_peers(state, origin) == []
+    assert state.membership_ids(origin, 9) == ["doc-ka"]
+    assert state.membership_ids(world.namespace("shared-b"), 9) == ["doc-kb"]
+    assert world.reconciled == [["doc-ka", "doc-kb"]]
+    state.close()
+
+
+# ---------------------------------------------------------------------------------------------
+# A retired orphan stream leaves the brain's record, not just this run's copy of it
+# ---------------------------------------------------------------------------------------------
+#
+# Spec. A stream that never started and that no root needs any more is forgotten — locally, and
+# on the brain. The brain's record is its own copy: what a run is handed when it acquires the
+# execution, what the brain stores at a checkpoint and what it acknowledges are three separate
+# objects. The stream is gone only when a checkpoint of that run was written without it, and a
+# later run, handed the brain's copy, neither finds nor opens it again.
+
+
+@pytest.mark.asyncio
+async def test_retired_orphan_stream_is_gone_from_the_brains_own_copy_and_stays_gone_after_a_restart(
+    tmp_path, monkeypatch,
+):
+    world, path, state = await _relocation_stalled_on_an_unopenable_destination(
+        tmp_path, monkeypatch, "orphan-retirement-deep-copy.sqlite",
+    )
+    world.ack_copies = True
+    assert world.stream("shared-b")["last_error"] == _start_diagnostic("shared-b", 403)
+    stored_before, revision = world.progress, world.revision
+
+    # The root is moved back: no root lives in, or is on its way to, shared-b any more.
+    world.move("file-x", source="shared-b", destination="shared-a")
+    back = await world.run(state)
+
+    assert state.get_progress(world.namespace("shared-b")) is None
+    # It left through a checkpoint: the copy the brain held before is untouched, and the one it
+    # holds now was written without the stream — at the top level as well as among the streams.
+    assert "shared-b" in stored_before["streams"]
+    assert world.revision > revision and world.progress is not stored_before
+    assert sorted(world.progress["streams"]) == ["shared-a"]
+    assert world.progress["drive_id"] == "shared-a"
+    assert back.failed == 0 and back.authoritative_complete is True and back.backlog == 0
+    state.close()
+
+    # A restart is handed the brain's copy: the stream is not there, and is not opened again.
+    state = StateStore(path)
+    world.calls.clear()
+    again = await world.run(state)
+
+    assert not [call for call in world.calls if "shared-b" in call]
+    assert state.get_progress(world.namespace("shared-b")) is None
+    assert sorted(world.progress["streams"]) == ["shared-a"]
+    assert [p.key.drive_id for p in state.list_progress(_WORLD_INTEGRATION, 9)] == ["shared-a"]
+    assert again.failed == 0 and again.authoritative_complete is True and again.backlog == 0
     assert world.removed == []
     state.close()

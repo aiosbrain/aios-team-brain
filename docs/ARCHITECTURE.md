@@ -984,7 +984,26 @@ snapshot. Before any baseline listing, every required stream's start
 token is captured. A Shared Drive whose start token request answers 403/404 is that stream's durable
 diagnostic (`start token unavailable`, no token, nothing enumerated, retried each run) while the other
 streams run; it leaves the connection incomplete and unreconciled, whereas a failure of the execution's
-own authority or credential still ends the run. Shared Drive listing, traversal, rescan, and parent-membership checks use the
+own authority or credential still ends the run. Whether a stream has started is read from its tokens,
+never from that diagnostic's text: a stream record with no token — locally or in the brain's
+checkpoint, its diagnostic written, reworded, or never written because the run was interrupted — is
+unstarted, is asked for a token before anything of its drive is enumerated, and is complete only after
+a drain from that token reaches the terminal token; one that names a snapshot without a token is
+rescanned from a token captured first. The streams of a connection are one roster
+(`_stream_roster`): the drives its roots are configured for or bound to, the destination of a
+relocating root, the streams local state holds and the streams the brain's checkpoint holds. Every
+roster stream is consumed and has to finish before the all-stream reconciliation; one with no local
+progress is unknown, never absent. A removal one stream observed is weighed against every other roster
+stream before it becomes the connection's: a peer that claims the document ends only the observing
+stream's membership, and otherwise each peer gets a durable barrier (SQLite `removal_barriers`, the
+peer's dirty sequence when it was first known for that removal — including a peer that appears runs
+later) that only a drain begun after it passes; a peer with no barrier row is unknown across any
+restart. Behind a peer that cannot be read (no local state, no token, or a recovery waiting on one)
+an ambiguous removal stays withheld, while the document's own metadata is read under the execution
+fence: an explicit not-found (deleted, or access lost) or a trashed document is retired at once by a
+targeted removal, without a complete snapshot; a readable document or any other failure verifies
+nothing. An unstarted stream no root needs any more is forgotten locally and leaves the brain's
+checkpoint with the run's next checkpoint. Shared Drive listing, traversal, rescan, and parent-membership checks use the
 provider's actual `driveId` as the root; the former synthetic `root` key is repaired only when the
 persisted root/drive identity matches exactly, otherwise the stream enters controlled recovery and
 cannot treat the mismatch as removal evidence. Each stream has an explicit snapshot incarnation: roots and traversal seeds are
