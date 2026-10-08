@@ -564,7 +564,7 @@ const UNPROVEN_BARRIER: CleanupReport = { outcome: "unproven", barrierGone: fals
 
 /** One backend, exactly: its pid AND when it started (epoch seconds, as text — the same in every
  * session's time zone), so a later backend given the same pid is not it. */
-interface BackendIdentity { pid: number; started: string }
+export interface BackendIdentity { pid: number; started: string }
 
 /**
  * One read of absence evidence, as the wait is to make it: the real read, or the seam's stand-in for it.
@@ -928,6 +928,94 @@ export async function openTestSession(name: string, opts: TestSessionOptions = {
     if (!(await vanish())) throw stop(`could not be opened (${explain(error)})`);
     conclude(true, "");
     throw error;
+  }
+}
+
+// ── Real sessions a test closes ITSELF, past the harness's own cleanup ─────────────────────────
+
+/**
+ * WHO a live backend is, by the monitor's own reading: its pid and when it started.
+ *
+ * For a test that will later have to prove a real session gone and was only told its pid. The
+ * reading is its own POSITIVE CONTROL: exactly one backend must be seen under that pid, and then
+ * seen again by the very predicate that will be asked to show it gone (`backendAbsent`). A backend
+ * the monitor did not see present — unreadable, or no such row — is not identified, and this throws.
+ */
+export async function backendIdentity(pid: number): Promise<BackendIdentity> {
+  const rows = await answered(`who backend ${pid} is`, observe<{ pid: number; started: string | null }>(
+    "select pid, extract(epoch from backend_start)::text as started from pg_stat_activity where pid = $1", [pid]));
+  const started = rows.length === 1 && rows[0].pid === pid ? rows[0].started : null;
+  if (typeof started !== "string" || !started) {
+    throw new RaceHarnessError(`backend ${pid} could not be identified: the monitor sees ${JSON.stringify(rows)}`);
+  }
+  const backend: BackendIdentity = { pid, started };
+  const present = await answered(`backend ${pid} (started ${started})`, backendRows(backend));
+  if (present.length !== 1 || present[0].pid !== pid) {
+    throw new RaceHarnessError(
+      `the monitor must see exactly backend ${pid} (started ${started}), and sees ${JSON.stringify(present)}`,
+    );
+  }
+  return backend;
+}
+
+export interface RetireOptions {
+  /** Further absence the caller must SEE — a bounded evidence wait of its own (`untilBarrierGone`).
+   * One that rejects is absence not seen. */
+  absent?: () => Promise<unknown>;
+  /** SEAMS for the harness's own tests, as a barrier's (`BarrierOptions`): another run-safety state,
+   * a shorter budget for seeing each backend gone, and the clock the closing is bounded on. */
+  safety?: RunSafety;
+  cleanupMs?: number;
+  clock?: EvidenceClock;
+}
+
+/**
+ * CLOSE real sessions a test staged outside the harness's own cleanup, and PROVE them gone — or
+ * STOP THE RUN.
+ *
+ * A harness self-test that stages a barrier's release, or a session's closing, to go unproven has
+ * taken that session out of the harness's hands: its own cleanup is then the only thing between a
+ * live session and the next `TRUNCATE`. So that cleanup is held to what the harness holds itself to:
+ *
+ *   - `close` is ONE bounded step, and is believed only if it SAYS `closed`, within the bound of an
+ *     owned connection. One that rejects, is still pending at its deadline, answers at or after it,
+ *     or resolves with anything else — nothing at all, included — is a closing that was not
+ *     acknowledged, and nothing read afterwards proves it for it;
+ *   - then every one of `backends` must be SEEN gone, each within `cleanupMs` — that exact backend,
+ *     its pid and when it started. A `null` among them is a session that never said who it is: there
+ *     is no backend to look for, and "nothing to look for" is not "nothing there";
+ *   - then `absent`, if the caller has more to see.
+ *
+ * This resolves only when all of that held. Otherwise the run is stopped — sticky, so nothing later
+ * undoes it — and this rejects. It clears no marker either way: the caller removes its own only
+ * after this resolved, so a cleanup that could not be proven leaves that marker on file too.
+ */
+export async function retireSessions(
+  what: string,
+  backends: (BackendIdentity | null)[],
+  close: () => Promise<Disposal | void>,
+  opts: RetireOptions = {},
+): Promise<void> {
+  const safety = opts.safety ?? currentRunSafety();
+  const cleanupMs = opts.cleanupMs ?? DEFAULT_BOUNDS.cleanupMs;
+  const clock = opts.clock ?? REAL_CLOCK;
+  const stop = (why: string): RaceHarnessError => {
+    const reason = `identity race harness: ${what} ${why}, and could not be proven gone. `
+      + "Sessions that may still hold locks must not be truncated around.";
+    safety.setFatal(reason);
+    return new RaceHarnessError(reason);
+  };
+  // The closing is asked for whatever is known of the backends: nothing is to stay held back.
+  const said = await fulfilledWithin(clock, attempt(close), OWNED_CONNECTION_BOUND_MS);
+  if (said?.value !== "closed") throw stop("was closed, but its closing was not acknowledged in time");
+  for (const backend of backends) {
+    if (!backend) throw stop("was closed, but one of its sessions never said who it is");
+    if (!(await backendAbsent(backend, cleanupMs))) {
+      throw stop(`was closed, but its backend ${backend.pid} (started ${backend.started}) was not seen gone`);
+    }
+  }
+  if (opts.absent && !(await attempt(opts.absent).then(() => true, () => false))) {
+    throw stop("was closed, but what was to be seen absent after it was not");
   }
 }
 

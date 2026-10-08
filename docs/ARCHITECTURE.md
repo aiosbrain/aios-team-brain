@@ -967,9 +967,24 @@ Shared Drive and (when selected) My Drive. A selected file or folder that lives 
 reported only by that drive's change log, so every selected root is first bound — durably, once per
 generation, by one provider read — to the drive that contains it, and is enumerated and drained through
 that drive's stream and cursor. A binding adds no drive root: the drive's other content stays
-unselected. Until every root is bound no stream is enumerated; a bound file found in another drive
-keeps its stream's baseline partial rather than read once and reported current. Before any baseline listing, every required stream's start
-token is captured. Shared Drive listing, traversal, rescan, and parent-membership checks use the
+unselected. Until every root is bound no stream is enumerated. The selected root id stays the
+selection when the root is moved to another drive; only its binding changes, and never by inference.
+The old drive reports a moved root, and everything under it, as removed and lists it as empty, so a
+bound root's current metadata is read under the execution fence before a change page may retire a
+claim made through it and before a bound folder is listed. Read in another drive, the root is durably
+`relocating` (`selection_root_bindings.status`, `pending_drive_id`): no removal work and no membership
+removal is written, the old stream rebuilds its snapshot from its remaining roots, and the root is
+rebound only after the destination stream holds a start token captured before that root is enumerated
+there — the destination enumerates the root alone, never its drive. Unreadable (anything but an
+explicit not-found), the root is durably `uncertain`: the change page is not retained, the cursor does
+not pass it, and it is read again. All-stream reconciliation, and therefore `current`, requires that no
+root is `relocating` or `uncertain` and that every stream's published snapshot is of exactly the bound
+roots it now holds — so the claims an old stream made are retired only by the destination's verified
+snapshot. Before any baseline listing, every required stream's start
+token is captured. A Shared Drive whose start token request answers 403/404 is that stream's durable
+diagnostic (`start token unavailable`, no token, nothing enumerated, retried each run) while the other
+streams run; it leaves the connection incomplete and unreconciled, whereas a failure of the execution's
+own authority or credential still ends the run. Shared Drive listing, traversal, rescan, and parent-membership checks use the
 provider's actual `driveId` as the root; the former synthetic `root` key is repaired only when the
 persisted root/drive identity matches exactly, otherwise the stream enters controlled recovery and
 cannot treat the mismatch as removal evidence. Each stream has an explicit snapshot incarnation: roots and traversal seeds are
@@ -1094,7 +1109,9 @@ to its next run. The snapshot is named from its own membership, so a later execu
 one, asks what is held (`inspect`, which changes nothing) and continues after that prefix only by
 proving it (`resume`: member count and digest) — the brain then adopts those rows under the new fence.
 Without that proof a successor's page still replaces a predecessor's, and an execution whose fence is
-no longer current can neither stage nor finalize. Revision
+no longer current can neither stage nor finalize. Until the completing page is acknowledged the run
+reports a non-zero backlog and is never authoritative-complete, even with every stream drained and
+nothing queued locally: the reconciliation itself is the outstanding work. Revision
 observations are retained as a contribution ledger, one row per observation: a stable provider id,
 role and UTC instant identify it in both the frontmatter ledger and `gdrive_contribution_evidence`, so
 a replay that changes only the e-mail or the timestamp spelling updates that row; exact `gdrive`
@@ -2334,9 +2351,9 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/v1/projects` — team project list for `aios pull` brain-project registration (team-tier only)
 - `GET /api/v1/company-graph` — structured stakeholder map for `aios stakeholders` / MCP `brain_stakeholders` (brain-api v1.5): `people[]` (actor entities with attrs-projected `role`/`job_family`/`reports_to`) + `ownership[]` (server-resolved `OWNS`/`TOUCHES`/`PRODUCES` edges → target workflow name/kind/job_family); team-tier only, app-code gate (no RLS backstop); unseeded team → `200` empty arrays
 - `GET /api/v1/me` — authenticated member identity + role (drives client UI gating)
-- `GET /api/v1/members` — team roster + cross-tool identities for external resolution, incl. `github_login`/`avatar_url` for contributor-avatar consumers like `aios timeline` (team-tier only; `?email`/`?handle`/`?provider` filters)
+- `GET /api/v1/members` — team roster + cross-tool identities for external resolution, incl. `github_login`/`avatar_url` for contributor-avatar consumers like `aios timeline` (team-tier only; `?email`/`?handle`/`?provider` filters); each identity is exactly `{provider, externalId, handle}` — the link's email and mapping revision stay with the Admin view
 - `POST /api/v1/members/invite` — invite a member + run the tool-provisioning cascade (brain-api v1.7): team-tier **admin** key only (else 403 `forbidden_role`), 10/min; idempotent on (team_id, email) — existing non-disabled member → `created:false` + re-issue access + re-provision, disabled member → 422; magic-link vs manual decided by `magicLinkAvailable()`; provisioning is best-effort and never changes status; shares the `lib/admin/invite` core with the admin UI action
-- `GET /api/v1/identities/resolve` — resolve a provider external_id (or email/handle) to a member + canonical contacts incl. `slack_id` (team-tier only; 404 on miss)
+- `GET /api/v1/identities/resolve` — resolve a provider external_id (or email/handle) to a member + canonical contacts incl. `slack_id` (team-tier only; 404 on miss); identities in the same `{provider, externalId, handle}` shape as `/members`
 - `GET /api/v1/me/slack-token` — the caller's OWN Slack user token for "act as me" (owner-only: member from the API key, never a param; 404 if not connected; `no-store`)
 - `POST /api/v1/me/slack-token` — connect the caller's Slack via manual paste: validate (`auth.test`) + store encrypted (`member_secrets`) + capture identity
 - `DELETE /api/v1/me/slack-token` — disconnect the caller's Slack

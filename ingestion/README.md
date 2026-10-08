@@ -164,13 +164,28 @@ decision rather than treating disconnected material as current.
 A selected file or folder that lives inside a Shared Drive is read through that drive's change
 stream: at the start of a scope generation the sidecar looks up, once and durably, which drive
 contains each selected root. That does not select the drive — only the root is in scope. Until every
-root can be read nothing is enumerated (`selection_root_unresolved`); a selected file later moved to
-another drive keeps its stream partial until the selection is saved again.
+root can be read nothing is enumerated (`selection_root_unresolved`).
+
+A selected file or folder stays selected when it is moved to another drive. The old drive then
+reports it — and everything under it — as removed, and lists it as empty; neither is treated as a
+deletion. Before a removal retires anything, and before a selected folder is listed, the sidecar
+reads where that root is now. Found in another drive, its documents stay in the brain, the old
+stream goes on with its other roots, and the new drive's stream takes the root over on the next run
+— after capturing that drive's start token, and enumerating only that root. If the root's location
+cannot be read (`selection_root_unverified`) nothing is concluded: the stream stays partial and the
+same change is read again next run. The connection is reported complete only once every stream has
+re-verified the roots it now holds.
+
+If a selected root lives in a Shared Drive whose change log the account cannot open (the file was
+shared, the drive was not), that one stream is reported as `stream_start_unavailable` with the
+provider's 403/404, and is retried every run. The other streams keep syncing; the connection is
+not complete, and nothing is removed, until that drive can be read.
 
 A run has one absolute deadline. Brain writes and reconciliations never wait past it: a rate-limit
 or outage wait that does not fit is deferred to a later run with the retry time the brain gave, and
 the work stays queued. A complete snapshot of more than 10,000 documents is uploaded in pages and
-may take several runs; each run continues after the pages the brain already holds.
+may take several runs; each run continues after the pages the brain already holds, and reports a
+non-zero backlog until the brain has acknowledged the last page.
 
 The Admin **Run now** and **Retry pending work** controls enqueue a durable request; the sidecar polls
 that queue and runs it through the same generation/fence coordinator as scheduled and notification

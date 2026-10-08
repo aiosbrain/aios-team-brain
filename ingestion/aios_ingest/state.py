@@ -204,6 +204,9 @@ CREATE TABLE IF NOT EXISTS selection_root_bindings (
   root_id TEXT NOT NULL,
   drive_id TEXT NOT NULL,
   bound_at TEXT NOT NULL DEFAULT (datetime('now')),
+  status TEXT NOT NULL DEFAULT 'bound',
+  pending_drive_id TEXT,
+  detail TEXT,
   PRIMARY KEY (connection_id, generation, root_kind, root_id)
 );
 CREATE TABLE IF NOT EXISTS stream_hints (
@@ -242,6 +245,14 @@ class StreamKey:
             (self.team, self.connection_id, self.credential_id, self.drive_id, str(generation))
         )
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class RootBinding:
+    drive_id: str
+    status: str = "bound"
+    pending_drive_id: str | None = None
+    detail: str | None = None
 
 
 @dataclass(frozen=True)
@@ -354,6 +365,15 @@ class StateStore:
             )
         if "superseded_at" not in work_columns:
             self._db.execute("ALTER TABLE pending_work ADD COLUMN superseded_at TEXT")
+        binding_columns = {r[1] for r in self._db.execute("PRAGMA table_info(selection_root_bindings)")}
+        if "status" not in binding_columns:
+            self._db.execute(
+                "ALTER TABLE selection_root_bindings ADD COLUMN status TEXT NOT NULL DEFAULT 'bound'"
+            )
+        if "pending_drive_id" not in binding_columns:
+            self._db.execute("ALTER TABLE selection_root_bindings ADD COLUMN pending_drive_id TEXT")
+        if "detail" not in binding_columns:
+            self._db.execute("ALTER TABLE selection_root_bindings ADD COLUMN detail TEXT")
         self._upgrade_observation_revisions()
         self._upgrade_legacy_channels()
         self._db.commit()
@@ -664,6 +684,75 @@ class StateStore:
             (connection_id, generation),
         ).fetchall()
         return {(str(r["root_kind"]), str(r["root_id"])): str(r["drive_id"]) for r in rows}
+
+    # A binding is ``bound`` while its root is known to live in ``drive_id``. Two other states are
+    # durable and both mean the connection is not complete: ``uncertain`` — where the root is now
+    # could not be read, so nothing is concluded about it — and ``relocating`` — it was read in
+    # ``pending_drive_id``, whose stream has not taken it over yet. Neither is absence evidence.
+    def unsettled_roots(
+        self, connection_id: str, generation: int,
+    ) -> dict[tuple[str, str], RootBinding]:
+        """Every selected root that is uncertain or on its way to another drive's stream."""
+        rows = self._db.execute(
+            "SELECT root_kind,root_id,drive_id,status,pending_drive_id,detail FROM selection_root_bindings "
+            "WHERE connection_id=? AND generation=? AND status<>'bound' ORDER BY root_kind,root_id",
+            (connection_id, generation),
+        ).fetchall()
+        return {
+            (str(r["root_kind"]), str(r["root_id"])): RootBinding(
+                str(r["drive_id"]), str(r["status"]), r["pending_drive_id"], r["detail"],
+            )
+            for r in rows
+        }
+
+    def mark_root_uncertain(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str, drive_id: str,
+        *, detail: str,
+    ) -> None:
+        """Record that a root's location is unverified. A root already relocating stays that."""
+        self._db.execute(
+            "INSERT INTO selection_root_bindings(connection_id,generation,root_kind,root_id,drive_id,status,detail) "
+            "VALUES(?,?,?,?,?,'uncertain',?) ON CONFLICT(connection_id,generation,root_kind,root_id) DO UPDATE SET "
+            "status='uncertain',detail=excluded.detail WHERE selection_root_bindings.status<>'relocating'",
+            (connection_id, generation, root_kind, root_id, drive_id, detail),
+        )
+        self._db.commit()
+
+    def mark_root_relocating(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str, drive_id: str,
+        *, destination: str,
+    ) -> None:
+        """Record the drive a root was read in. It stays bound to ``drive_id`` until rebound."""
+        self._db.execute(
+            "INSERT INTO selection_root_bindings(connection_id,generation,root_kind,root_id,drive_id,status,pending_drive_id,detail) "
+            "VALUES(?,?,?,?,?,'relocating',?,?) ON CONFLICT(connection_id,generation,root_kind,root_id) DO UPDATE SET "
+            "status='relocating',pending_drive_id=excluded.pending_drive_id,detail=excluded.detail",
+            (connection_id, generation, root_kind, root_id, drive_id, destination,
+             f"observed in drive {destination}"),
+        )
+        self._db.commit()
+
+    def settle_root(self, connection_id: str, generation: int, root_kind: str, root_id: str) -> None:
+        """A root read where it is bound is no longer uncertain. A relocation is never settled here."""
+        self._db.execute(
+            "UPDATE selection_root_bindings SET status='bound',detail=NULL WHERE connection_id=? "
+            "AND generation=? AND root_kind=? AND root_id=? AND status='uncertain'",
+            (connection_id, generation, root_kind, root_id),
+        )
+        self._db.commit()
+
+    def rebind_root(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str, destination: str,
+    ) -> bool:
+        """Hand a relocating root to the stream of the drive it was read in, atomically."""
+        cur = self._db.execute(
+            "UPDATE selection_root_bindings SET drive_id=pending_drive_id,status='bound',"
+            "pending_drive_id=NULL,detail=NULL,bound_at=? WHERE connection_id=? AND generation=? "
+            "AND root_kind=? AND root_id=? AND status='relocating' AND pending_drive_id=?",
+            (_now_iso(), connection_id, generation, root_kind, root_id, destination),
+        )
+        self._db.commit()
+        return cur.rowcount == 1
 
     # -- namespaced Drive progress -----------------------------------------
     def begin_generation(
@@ -1168,6 +1257,19 @@ class StateStore:
             "ORDER BY provider_id",
             (namespace, generation, selected),
         ).fetchall()]
+
+    def membership_roots(self, namespace: str, generation: int, provider_id: str,
+                         *, snapshot_id: int | None = None) -> list[str]:
+        """The selected roots one member is claimed through in the authoritative snapshot."""
+        selected = snapshot_id if snapshot_id is not None else self.snapshot_id(namespace, building=False)
+        if selected is None:
+            return []
+        row = self._db.execute(
+            "SELECT root_ids FROM selected_membership WHERE namespace=? AND generation=? "
+            "AND snapshot_id=? AND provider_id=?",
+            (namespace, generation, selected, provider_id),
+        ).fetchone()
+        return sorted(json.loads(row["root_ids"])) if row else []
 
     def membership_impacts_for_root(
         self, namespace: str, generation: int, root_id: str,

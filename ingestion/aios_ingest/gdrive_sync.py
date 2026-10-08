@@ -91,6 +91,110 @@ class SelectedRootRelocated(RuntimeError):
     """A selected root no longer lives in the drive whose change stream it is bound to."""
 
 
+class SelectedRootUnverified(RuntimeError):
+    """Where a selected root lives now could not be read, so nothing is concluded about it."""
+
+
+# A stream whose drive's change log could not be opened exists only as this diagnostic: it has no
+# start token, enumerates nothing, and is retried on every run.
+_START_UNAVAILABLE = "start token unavailable"
+
+
+def _provider_status(exc: Exception) -> int | None:
+    """The HTTP status a provider error carries, if any."""
+    response = getattr(exc, "resp", None)
+    value = getattr(response, "status", None) or getattr(exc, "status_code", None)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _start_blocked(stream: Any) -> bool:
+    """True for a stream recorded only as a start-token diagnostic, locally or on the brain."""
+    if isinstance(stream, dict):
+        token, last_error = stream.get("baseline_start_token"), stream.get("last_error")
+    else:
+        token, last_error = stream.baseline_start_token, stream.last_error
+    return not token and str(last_error or "").startswith(_START_UNAVAILABLE)
+
+
+@dataclass(frozen=True)
+class RootObservation:
+    """Where one selected root is now: ``here`` (the stream's own drive), ``elsewhere`` (another
+    drive, named), ``absent`` (the provider says there is no such file) or ``unverified``."""
+    state: str
+    drive_id: str | None = None
+    detail: str | None = None
+
+
+def _observe_root(
+    source: GoogleDriveSource, root_id: str, drive_id: str, seen: dict[str, RootObservation],
+) -> RootObservation:
+    """Read a selected root's current metadata, under the run's own fence, once per ``seen``.
+
+    A change page or a folder listing only says what one drive's stream can still see. When a root
+    was moved to another drive, that is a removal and an empty folder — the same as a deletion. The
+    root's own metadata tells them apart. Only an explicit not-found is ``absent``; any other
+    failure to read it is ``unverified`` and is never treated as either.
+    """
+    if root_id in seen:
+        return seen[root_id]
+    try:
+        meta = source._metadata(root_id)
+    except (BrainError, ProviderDeferred):
+        raise
+    except Exception as exc:
+        status = _provider_status(exc)
+        observed = RootObservation("absent") if status == 404 else RootObservation(
+            "unverified", detail=f"root metadata unreadable ({status or type(exc).__name__})",
+        )
+    else:
+        actual = str(meta.get("driveId") or "my-drive")
+        observed = RootObservation("here" if actual == drive_id else "elsewhere", actual)
+    seen[root_id] = observed
+    return observed
+
+
+def _leaving_roots(state: StateStore, integration_id: str, generation: int) -> set[tuple[str, str]]:
+    """Selected roots read in another drive whose stream has not taken them over yet."""
+    return {
+        root for root, binding in state.unsettled_roots(integration_id, generation).items()
+        if binding.status == "relocating"
+    }
+
+
+def _stream_roots(
+    state: StateStore, integration_id: str, generation: int, options: dict[str, Any],
+    drive_id: str, bindings: dict[tuple[str, str], str] | None,
+) -> list[tuple[str, str, str, bool]]:
+    """The roots one stream enumerates now: those configured for it, less any that left its drive."""
+    configured = _configured_roots(options, drive_id, bindings)
+    if bindings is None:
+        return configured
+    leaving = _leaving_roots(state, integration_id, generation)
+    return [root for root in configured if (root[1], root[0]) not in leaving]
+
+
+def _bound_root_drift(
+    state: StateStore, namespace: str, generation: int, snapshot_id: int | None, drive_id: str,
+    bindings: dict[tuple[str, str], str], leaving: set[tuple[str, str]],
+) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+    """Compare one snapshot's bound file/folder roots with what its stream enumerates now.
+
+    Returns ``(missing, stale)``: roots bound to this drive that the snapshot never enumerated, and
+    roots it holds that are no longer this stream's. Either means the snapshot is not a verified
+    statement of the stream's current selection.
+    """
+    held = {
+        (str(row["root_kind"]), str(row["root_id"]))
+        for row in (state.list_roots(namespace, generation, snapshot_id=snapshot_id)
+                    if snapshot_id is not None else [])
+    } & set(bindings)
+    wanted = {root for root, bound in bindings.items() if bound == drive_id and root not in leaving}
+    return wanted - held, held - wanted
+
+
 def _selected_roots(options: dict[str, Any]) -> list[tuple[str, str]]:
     """Every explicitly selected file/folder root as ``(kind, id)``, in configuration order."""
     return (
@@ -356,9 +460,17 @@ async def run_gdrive_stream(
                 return total
             # A stream this generation already consumes stays accounted for, so local state written
             # before roots were bound cannot leave a cursor that no run ever finishes.
+            # A root read in another drive stays bound where it was until that drive's stream has a
+            # start token, so the destination is a stream from here on and the old one stays one.
+            relocating = {
+                root: str(binding.pending_drive_id)
+                for root, binding in state.unsettled_roots(integration_id, generation).items()
+                if binding.status == "relocating" and binding.pending_drive_id
+            }
             streams = sorted(
                 {*_stream_ids(options, root_bindings),
-                 *(progress.key.drive_id for progress in state.list_progress(integration_id, generation))},
+                 *(progress.key.drive_id for progress in state.list_progress(integration_id, generation)),
+                 *relocating.values()},
                 key=lambda value: (value != "my-drive", value),
             )
             if not streams:
@@ -369,13 +481,18 @@ async def run_gdrive_stream(
             # Close the backfill race independently for every required stream before enumerating
             # any one of them. A small run budget therefore cannot leave later Shared Drives
             # without their pre-baseline opaque token.
+            blocked: set[str] = set()
             if str(options.get("selection_state") or "") != "empty":
                 for drive_id in streams:
                     key = StreamKey(
                         settings.team, integration_id, credential_identity(options), drive_id,
                     )
                     namespace = key.namespace(generation)
-                    if state.get_progress(namespace) or _remote_stream(execution.progress, drive_id):
+                    local = state.get_progress(namespace)
+                    started = local if local is not None else (
+                        _remote_stream(execution.progress, drive_id) or None
+                    )
+                    if started is not None and not _start_blocked(started):
                         continue
                     kwargs = {"supportsAllDrives": True}
                     if drive_id != "my-drive":
@@ -392,15 +509,60 @@ async def run_gdrive_stream(
                         total.failed += 1
                         total.failure_categories[exc.category] = 1
                         return total
-                    state.begin_generation(key, generation, start_token=start)
+                    except Exception as exc:
+                        status = _provider_status(exc)
+                        if drive_id == "my-drive" or status not in (403, 404):
+                            raise
+                        # This drive's change log cannot be opened — a root that lives in a Shared
+                        # Drive the account cannot list changes for. That is this stream's failure,
+                        # not the connection's authority: it is recorded durably, as a stream that
+                        # is not complete, and the streams that can be read still run. Nothing is
+                        # enumerated without a token, and the connection cannot reconcile without
+                        # this stream.
+                        if local is None:
+                            state.begin_generation(key, generation, start_token="", phase="partial")
+                        await _checkpoint_progress(
+                            client, execution, state, namespace, phase="partial",
+                            baseline_start_token=None, page_token=None, listing_complete=False,
+                            last_error=(
+                                f"{_START_UNAVAILABLE}: drive {drive_id} not found or not "
+                                f"accessible ({status})"
+                            ),
+                            last_attempt_at=_now(),
+                        )
+                        blocked.add(drive_id)
+                        total.failed += 1
+                        total.failure_categories["stream_start_unavailable"] = (
+                            total.failure_categories.get("stream_start_unavailable", 0) + 1
+                        )
+                        continue
+                    if local is None:
+                        state.begin_generation(key, generation, start_token=start)
                     await _checkpoint_progress(
                         client, execution, state, namespace, phase="baselining",
                         baseline_start_token=start, page_token=None, listing_complete=False,
-                        last_attempt_at=_now(),
+                        last_error=None, last_attempt_at=_now(),
                     )
 
+            # Only now — its destination stream holding a token captured before anything is
+            # enumerated there — is a relocated root handed over. From this point the destination
+            # enumerates that root (and nothing else of its drive) and the old stream stops
+            # claiming it; the claims the old stream made stand until the destination's snapshot
+            # is verified and every stream reconciles together.
+            for (root_kind, root_id), destination in relocating.items():
+                destination_progress = state.get_progress(StreamKey(
+                    settings.team, integration_id, credential_identity(options), destination,
+                ).namespace(generation))
+                if destination_progress is None or _start_blocked(destination_progress):
+                    continue
+                state.rebind_root(integration_id, generation, root_kind, root_id, destination)
+            if relocating:
+                root_bindings = state.root_bindings(integration_id, generation)
+
             remaining = max(0, max_work)
-            scheduled_streams = state.rotate_streams(integration_id, generation, streams)
+            scheduled_streams = state.rotate_streams(
+                integration_id, generation, [value for value in streams if value not in blocked],
+            )
             for stream_index, drive_id in enumerate(scheduled_streams):
                 key = StreamKey(
                     settings.team, integration_id, credential_identity(options), str(drive_id),
@@ -431,7 +593,18 @@ async def run_gdrive_stream(
                 # work capacity, which permits checkpoint recovery but no provider-page drain.
 
             progresses = state.list_progress(integration_id, generation)
-            if len(progresses) == len(streams) and all(
+            # A selected root that is uncertain or on its way to another drive, and a stream whose
+            # published snapshot is not of the roots it enumerates now, are an incomplete
+            # connection: reconciling would turn what has not been verified into absence.
+            unsettled = state.unsettled_roots(integration_id, generation)
+            verified = not unsettled and not any(
+                any(_bound_root_drift(
+                    state, p.namespace, generation, p.active_snapshot, p.key.drive_id,
+                    root_bindings, set(),
+                ))
+                for p in progresses
+            )
+            if verified and len(progresses) == len(streams) and all(
                 p.listing_complete
                 and not p.recovery_required
                 and p.building_snapshot is None
@@ -478,13 +651,19 @@ async def run_gdrive_stream(
                     + (1 if progress.building_snapshot is not None or progress.recovery_required else 0)
                     + (1 if state.pending_stream_hint(progress.key) is not None else 0)
                     for progress in progresses
-                )
+                ) + len(state.unsettled_roots(integration_id, generation))
                 if not total.authoritative_complete and total.backlog == 0:
                     # Enumeration/drain evidence is itself outstanding work.
                     total.backlog = sum(
                         0 if progress.listing_complete and _terminal_drain_complete(progress) else 1
                         for progress in progresses
                     )
+                if not total.authoritative_complete and total.backlog == 0:
+                    # Every stream is complete, yet the all-stream reconciliation has not been
+                    # acknowledged — deferred between the pages of a staged snapshot, or failed.
+                    # Absence is not established until its final acknowledgment, so that
+                    # reconciliation is the outstanding work: zero would report it done.
+                    total.backlog = 1
                 attempts = [progress.last_attempt_at for progress in progresses if progress.last_attempt_at]
                 if attempts:
                     try:
@@ -654,7 +833,9 @@ async def _run_gdrive_stream_unlocked(
                 kwargs["driveId"] = drive_id
             fresh = source._execute(drive.changes().getStartPageToken(**kwargs))["startPageToken"]
             state.begin_selection_snapshot(
-                namespace, generation, _configured_roots(options, drive_id, root_bindings),
+                namespace, generation, _stream_roots(
+                    state, execution.integration_id, generation, options, drive_id, root_bindings,
+                ),
             )
             await _checkpoint_progress(
                 client, execution, state, namespace, phase="baselining",
@@ -669,6 +850,42 @@ async def _run_gdrive_stream_unlocked(
                 terminal_drain_observation=None,
             )
             progress = state.get_progress(namespace)
+
+    if root_bindings is not None and progress is not None:
+        # The roots a stream enumerates change only when a selected root is rebound to another
+        # drive's stream. A snapshot built before that is not a statement of the current roots:
+        # a build in progress gains the root it lacks, and a published snapshot is replaced by a
+        # controlled rescan of exactly the current roots. The cursor stays where it is — it was
+        # captured before this enumeration — and the published membership stays authoritative
+        # until the replacement is complete.
+        progress = state.get_progress(namespace)
+        leaving = _leaving_roots(state, execution.integration_id, generation)
+        current_roots = _stream_roots(
+            state, execution.integration_id, generation, options, drive_id, root_bindings,
+        )
+        if progress.building_snapshot is not None:
+            missing, _stale = _bound_root_drift(
+                state, namespace, generation, progress.building_snapshot, drive_id,
+                root_bindings, leaving,
+            )
+            if missing:
+                state.begin_selection_snapshot(namespace, generation, current_roots)
+        elif state.snapshot_complete(namespace, generation, progress.active_snapshot) and any(
+            _bound_root_drift(
+                state, namespace, generation, progress.active_snapshot, drive_id,
+                root_bindings, leaving,
+            )
+        ):
+            state.begin_selection_snapshot(namespace, generation, current_roots)
+            await _checkpoint_progress(
+                client, execution, state, namespace, phase="baselining", listing_complete=False,
+                last_error="selected roots rebound; controlled rescan",
+                terminal_drain_token=None, terminal_drain_checkpoint_id=None,
+                terminal_drain_acknowledged=False,
+                drain_observation=progress.drain_observation + 1,
+                terminal_drain_observation=None,
+            )
+        progress = state.get_progress(namespace)
 
     summary = IngestSummary(conn.name, failure_categories={})
     state.update_progress(namespace, last_attempt_at=_now())
@@ -850,6 +1067,58 @@ async def _run_gdrive_stream_unlocked(
                 namespace, generation,
                 snapshot_id=state.snapshot_id(namespace, building=False),
             )
+            # A removal in this drive's change log is absence only while the selected root it
+            # falls under still lives in this drive. A root moved to another drive is reported
+            # here exactly like a deletion — of the root and of everything under it — so before a
+            # change may retire a claim, each bound root it is claimed through is read where it is
+            # NOW. The page was read first: a move that caused any of its removals has already
+            # happened, and the read cannot miss it.
+            bound_root_kinds = {
+                str(row["root_id"]): str(row["root_kind"])
+                for row in active_roots
+                if (str(row["root_kind"]), str(row["root_id"])) in (root_bindings or {})
+            }
+            leaving = (
+                _leaving_roots(state, execution.integration_id, generation)
+                if bound_root_kinds else set()
+            )
+            root_observations: dict[str, RootObservation] = {}
+            unverified: list[tuple[str, ProviderDeferred | None]] = []
+
+            def absence_withheld(root_ids: Any) -> bool:
+                """Whether a removal under these roots must NOT become absence. Records why."""
+                held = False
+                for root_id in sorted({str(value) for value in root_ids}):
+                    root_kind = bound_root_kinds.get(root_id)
+                    if root_kind is None:
+                        continue
+                    if (root_kind, root_id) in leaving:
+                        held = True
+                        continue
+                    try:
+                        observed = _observe_root(source, root_id, drive_id, root_observations)
+                    except ProviderDeferred as exc:
+                        unverified.append((root_id, exc))
+                        held = True
+                        continue
+                    if observed.state == "elsewhere":
+                        state.mark_root_relocating(
+                            execution.integration_id, generation, root_kind, root_id, drive_id,
+                            destination=str(observed.drive_id),
+                        )
+                        leaving.add((root_kind, root_id))
+                        held = True
+                    elif observed.state == "unverified":
+                        state.mark_root_uncertain(
+                            execution.integration_id, generation, root_kind, root_id, drive_id,
+                            detail=str(observed.detail),
+                        )
+                        unverified.append((root_id, None))
+                        held = True
+                    else:
+                        state.settle_root(execution.integration_id, generation, root_kind, root_id)
+                return held
+
             for change in page.changes:
                 change_type = str(change.get("changeType") or "file")
                 changed_drive_id = str(change.get("driveId") or "")
@@ -903,13 +1172,20 @@ async def _run_gdrive_stream_unlocked(
                             namespace, generation, file_id,
                             snapshot_id=state.snapshot_id(namespace, building=False),
                         )
-                        membership_root_removals.extend(ancestor_pairs)
-                        final_items = set(ancestor_final)
                         tombstoned_roots = {
                             str(row["root_id"])
                             for row in active_roots
                             if row["root_kind"] == "folder" and str(row["root_id"]) == file_id
                         }
+                        if absence_withheld(
+                            {root_id for _item_id, root_id in ancestor_pairs} | tombstoned_roots
+                        ):
+                            # The root this folder is, or is under, left this drive or could not
+                            # be read. Its claims stand — in the snapshot and on the brain — and
+                            # the rescan this page seeds re-derives this stream's membership.
+                            continue
+                        membership_root_removals.extend(ancestor_pairs)
+                        final_items = set(ancestor_final)
                         for root_id in tombstoned_roots:
                             affected, final = state.membership_impacts_for_root(
                                 namespace, generation, root_id,
@@ -943,11 +1219,26 @@ async def _run_gdrive_stream_unlocked(
                     and str(row["drive_id"]) == drive_id
                 ), None)
                 in_scope = bool(roots or direct or drive_root)
-                if removed or (selected and not in_scope):
-                    if selected:
-                        obligations.append((file_id, "remove", {"file_id": file_id}))
-                        membership_removals.append(file_id)
-                    continue
+                moved_out = bool(
+                    direct and file_id in bound_root_kinds and file
+                    and str(file.get("driveId") or "my-drive") != drive_id
+                )
+                if removed or moved_out or (selected and not in_scope):
+                    if (selected or moved_out) and absence_withheld(
+                        {*state.membership_roots(namespace, generation, file_id),
+                         *([file_id] if moved_out else [])}
+                    ):
+                        # Gone from this drive because a root it is claimed through moved, or
+                        # cannot be read: not absence. The claim stands until the stream of the
+                        # drive that root is in now has verified it.
+                        subtree_recovery_required = True
+                        continue
+                    if removed or (selected and not in_scope):
+                        if selected:
+                            obligations.append((file_id, "remove", {"file_id": file_id}))
+                            membership_removals.append(file_id)
+                        continue
+                    # Reported with another drive's id, yet read in this one: an ordinary change.
                 if file.get("mimeType") not in (None, GOOGLE_DOC_MIME) or not (in_scope or selected):
                     continue
                 if root_parents:
@@ -957,6 +1248,21 @@ async def _run_gdrive_stream_unlocked(
                     for root in ([file_id] if direct else ([drive_root] if drive_root else [])):
                         membership_additions.append((file_id, root, drive_id, None))
                 obligations.append((file_id, "upsert", {"file_id": file_id, "metadata": file}))
+            if unverified:
+                # Where a root is could not be read, so this page's removals under it are neither
+                # absence nor a move. The page is not retained and the cursor does not pass it:
+                # the root is durably uncertain, the stream partial, and the same page is read —
+                # and the root read — again on the next run.
+                root_id, deferred = unverified[0]
+                await _checkpoint_progress(
+                    client, execution, state, namespace, phase="partial",
+                    last_error=f"selected root {root_id} unverified; absence withheld",
+                    retry_not_before=(deferred.not_before if deferred else None),
+                )
+                category = deferred.category if deferred else "selection_root_unverified"
+                summary.failed += 1
+                summary.failure_categories[category] = summary.failure_categories.get(category, 0) + 1
+                return summary
             if state.projected_pending_count(
                 namespace, generation, [item_key for item_key, _action, _payload in obligations],
             ) > _MAX_PENDING_PER_STREAM:
@@ -979,6 +1285,8 @@ async def _run_gdrive_stream_unlocked(
                 rescan_roots=[
                     (row["root_id"], row["root_kind"], row["drive_id"], bool(row["recursive"]))
                     for row in active_roots
+                    # A root that left this drive is not rescanned here: its stream is another.
+                    if (str(row["root_kind"]), str(row["root_id"])) not in leaving
                 ] if subtree_recovery_required else None,
                 drain_observation=state.get_progress(namespace).drain_observation,
             )
@@ -1037,14 +1345,48 @@ async def _enumerate_baseline(
     work_consumed = 0
     pages_read = 0
     page_budget = max(0, discovery_budget)
+    integration_id = execution.integration_id
     roots = state.list_roots(namespace, generation)
     if not roots:
-        configured = _configured_roots(options, drive_id, root_bindings)
+        configured = _stream_roots(state, integration_id, generation, options, drive_id, root_bindings)
         state.replace_roots(namespace, generation, configured)
         roots = state.list_roots(namespace, generation)
     snapshot_id = state.snapshot_id(namespace)
     if snapshot_id is None:
         raise RuntimeError("selection snapshot initialization failed")
+    leaving = (
+        _leaving_roots(state, integration_id, generation) if root_bindings is not None else set()
+    )
+
+    def another_streams(root_kind: str, root_id: Any) -> bool:
+        """A root this stream no longer enumerates: bound to another drive, or read in one."""
+        bound = (root_bindings or {}).get((root_kind, str(root_id)))
+        return (bound is not None and bound != drive_id) or (root_kind, str(root_id)) in leaving
+
+    # A folder listing scoped to this drive is empty for a folder that was moved out of it, which
+    # reads exactly like a folder that was emptied. So before a bound folder root is listed, its
+    # own metadata is read: found in another drive, it is recorded as relocating and this baseline
+    # stops short of publishing; unreadable, it is recorded as uncertain and the baseline stays
+    # partial. Neither is ever an empty snapshot.
+    for root in (row for row in roots if row["root_kind"] == "folder"):
+        root_id = str(root["root_id"])
+        if ("folder", root_id) not in (root_bindings or {}) or another_streams("folder", root_id):
+            continue
+        observed = _observe_root(source, root_id, drive_id, {})
+        if observed.state == "elsewhere":
+            state.mark_root_relocating(
+                integration_id, generation, "folder", root_id, drive_id,
+                destination=str(observed.drive_id),
+            )
+            raise SelectedRootRelocated(
+                f"selected folder {root_id} is no longer in the drive it was bound to"
+            )
+        if observed.state == "unverified":
+            state.mark_root_uncertain(
+                integration_id, generation, "folder", root_id, drive_id, detail=str(observed.detail),
+            )
+            raise SelectedRootUnverified(f"selected folder {root_id} could not be verified")
+        state.settle_root(integration_id, generation, "folder", root_id)
 
     # Explicit file selections are individual one-item enumeration pages. Their metadata must be
     # proven before membership exists; an inaccessible file leaves this baseline partial.
@@ -1056,19 +1398,28 @@ async def _enumerate_baseline(
         if page is None:
             if pages_read >= page_budget:
                 return False, work_consumed
-            meta = source._metadata(root["root_id"])
-            pages_read += 1
             obligations: list[tuple[str, str, dict[str, Any]]] = []
             membership_additions: list[tuple[str, str, str]] = []
             bound_drive = (root_bindings or {}).get(("file", str(root["root_id"])))
-            if bound_drive is not None and bound_drive != drive_id:
-                # Retained from local state written before roots were bound: the stream of the
-                # drive that contains this root owns it now. Its page here records nothing.
+            if another_streams("file", root["root_id"]):
+                # The stream of the drive that contains this root owns it — it was bound there
+                # before this local state was written, or it was read there since. Its page here
+                # records nothing, and nothing is read through this stream.
+                meta = None
+            else:
+                meta = source._metadata(root["root_id"])
+                pages_read += 1
+            if meta is None:
                 pass
             elif bound_drive is not None and str(meta.get("driveId") or "my-drive") != drive_id:
                 # This stream's cursor can no longer observe the document. Reading it once here
-                # and then reporting the stream current would hide every later edit, so the
-                # baseline stays partial until the selection is saved again and rebound.
+                # and then reporting the stream current would hide every later edit: the root is
+                # recorded as relocating toward the drive it was read in, and this baseline stops
+                # short of publishing. That drive's stream takes it over once it has a token.
+                state.mark_root_relocating(
+                    integration_id, generation, "file", str(root["root_id"]), drive_id,
+                    destination=str(meta.get("driveId") or "my-drive"),
+                )
                 raise SelectedRootRelocated(
                     f"selected file {root['root_id']} is no longer in the drive it was bound to"
                 )
@@ -1081,6 +1432,8 @@ async def _enumerate_baseline(
                     obligations.append((str(meta["id"]), "upsert", {
                         "file_id": str(meta["id"]), "metadata": meta,
                     }))
+            if meta is not None and bound_drive is not None:
+                state.settle_root(integration_id, generation, "file", str(root["root_id"]))
             if state.projected_pending_count(
                 namespace, generation, [item_key for item_key, _action, _payload in obligations],
             ) > _MAX_PENDING_PER_STREAM:
@@ -1100,6 +1453,7 @@ async def _enumerate_baseline(
         if not page or not page.committed_at:
             return False, work_consumed
 
+    root_kinds = {str(row["root_id"]): str(row["root_kind"]) for row in roots}
     while pages_read < page_budget:
         row = state.next_traversal(namespace, generation, snapshot_id=snapshot_id)
         if row is None:
@@ -1107,6 +1461,15 @@ async def _enumerate_baseline(
         token = str(row["page_token"] or "") or None
         page_id = _page_id("baseline", snapshot_id, row["root_id"], row["folder_id"], token)
         page = state.get_page(namespace, generation, page_id)
+        if page is None and another_streams(root_kinds.get(str(row["root_id"]), ""), row["root_id"]):
+            # A folder root that left this drive after this build was seeded. It is not listed
+            # here — the listing would be empty and prove nothing — and its traversal is closed
+            # with a page that records nothing, so the stream's other roots still finish.
+            page = state.materialize_page(
+                namespace, generation, page_id, "baseline", token, None, None, [],
+                snapshot_id=snapshot_id,
+                traversal_completion=(row["root_id"], row["folder_id"], token),
+            )
         if page is None:
             if pages_read >= page_budget:
                 return False, work_consumed
