@@ -6888,8 +6888,25 @@ describe("KR-09 authority invalidation between enumeration and preparation", () 
     /** The snapshotted surfaces the statement must alter, and those it may alter besides. */
     mustChange: string[];
     mayChange: string[];
+    /**
+     * Optionally, the ONE row the statement updates and the only columns of it that may change. Every
+     * other column of that row is digested by the database before and after and must be the same, and
+     * the named columns must go from exactly `from` to exactly `to`. The values named are fixed labels.
+     */
+    onlyColumns?: { table: string; where: string; params: (fx: AuthorityFixture) => unknown[]; from: Record<string, unknown>; to: Record<string, unknown> };
     expected: SlackKnownRootPreparationResult;
   }
+  /** Of that ONE row: a database digest of every column but the named ones, and the named ones as the database holds them. */
+  const rowBut = (only: NonNullable<AuthorityChange["onlyColumns"]>, fx: AuthorityFixture): Promise<{ rest: string; named: Record<string, unknown> }[]> => {
+    const params = only.params(fx);
+    const named = `$${params.length + 1}::text[]`;
+    return query<{ rest: string; named: Record<string, unknown> }>(
+      `select md5((to_jsonb(t) - ${named})::text) as rest,
+              (select jsonb_object_agg(c.key, c.value) from jsonb_each(to_jsonb(t)) as c where c.key = any(${named})) as named
+         from ${only.table} t ${only.where}`, [...params, Object.keys(only.to)]
+    );
+  };
+  const NO_COLUMN_READBACK = "this case has no column-level readback";
   const integration = (fx: AuthorityFixture): unknown[] => [fx.teamId, fx.integrationId];
   const channel = (fx: AuthorityFixture): unknown[] => [fx.teamId, WORKSPACE, CHANNEL];
   const ITS_INTEGRATION = `where team_id = $1 and id = $2::uuid`;
@@ -6906,10 +6923,10 @@ describe("KR-09 authority invalidation between enumeration and preparation", () 
       mustChange: ["integrations"], mayChange: [], expected: SOURCE_NOT_CURRENT,
     },
     {
-      // The binding goes with it, the channel row loses its binder, and a budget row keyed on the integration may go too.
+      // The binding goes with it, the channel row loses its binder, and the budget row that discovery keyed on the integration goes too.
       name: "the integration is deleted",
       sql: `delete from integrations ${ITS_INTEGRATION}`, params: integration,
-      mustChange: ["integrations", "slack_integration_bindings", "slack_sync_channels"], mayChange: ["slack_method_budgets"], expected: SOURCE_NOT_CURRENT,
+      mustChange: ["integrations", "slack_integration_bindings", "slack_method_budgets", "slack_sync_channels"], mayChange: [], expected: SOURCE_NOT_CURRENT,
     },
     {
       name: "the channel is deselected in the integration's configuration",
@@ -6929,10 +6946,17 @@ describe("KR-09 authority invalidation between enumeration and preparation", () 
       mustChange: ["slack_integration_bindings"], mayChange: [], expected: BINDING_CHANGED,
     },
     {
-      // The shape the binding writer's own invalidation leaves: awaiting auth, with every proved identity cleared.
+      // ONLY the state, and the category a blocked state must carry. The workspace, the app id, the configuration revision, the
+      // token fingerprint and the selected channels all stay exactly as verified: the state is the one operative fact, so a
+      // preparation that did not check it would find nothing else wrong with this binding and would enqueue.
       name: "the binding is no longer verified",
-      sql: `update slack_integration_bindings set state = 'pending_auth', workspace_id = null, app_id = null, bot_id = null, workspace_url = null ${ITS_BINDING}`, params: integration,
-      mustChange: ["slack_integration_bindings"], mayChange: [], expected: BINDING_CHANGED,
+      sql: `update slack_integration_bindings set state = 'blocked', error_code = 'kr09_fixture_blocked' ${ITS_BINDING}`, params: integration,
+      mustChange: ["slack_integration_bindings"], mayChange: [],
+      onlyColumns: {
+        table: "slack_integration_bindings", where: ITS_BINDING, params: integration,
+        from: { state: "verified", error_code: null }, to: { state: "blocked", error_code: "kr09_fixture_blocked" },
+      },
+      expected: BINDING_CHANGED,
     },
     {
       name: "the binding's stored workspace is another workspace",
@@ -6972,10 +6996,21 @@ describe("KR-09 authority invalidation between enumeration and preparation", () 
       const label = `KR-09: ${name}`;
       const fx = await authorityRoot(label, await publishOldRoot());
       const beforeTheChange = await authorityDigests(fx.teamId);
+      const only = change.onlyColumns;
+      const rowBefore = only ? await rowBut(only, fx) : [];
 
       // ── THE ONE AUTHORITATIVE CHANGE, by labeled fixture DML, between enumeration and preparation. ──
       const written = await (await rawSql()).query(change.sql, change.params(fx));
       expect(written.rowCount, `${label}: fixture: the change wrote exactly one row`).toBe(1);
+      // Where the case names the only columns that may change: every other column of that row is the same.
+      const rowAfter = only ? await rowBut(only, fx) : [];
+      expect(only ? {
+        rows: [rowBefore.length, rowAfter.length],
+        every_other_column_of_the_row_unchanged: rowBefore[0]?.rest === rowAfter[0]?.rest,
+        named_columns_before: rowBefore[0]?.named, named_columns_now: rowAfter[0]?.named,
+      } : NO_COLUMN_READBACK, `${label}: fixture: of the row the change updated, only the named columns changed, from and to exactly the named values`).toEqual(only ? {
+        rows: [1, 1], every_other_column_of_the_row_unchanged: true, named_columns_before: only.from, named_columns_now: only.to,
+      } : NO_COLUMN_READBACK);
       const altered = authorityTablesThatDiffer(beforeTheChange, await authorityDigests(fx.teamId));
       expect({
         surfaces_it_must_alter_and_did_not: change.mustChange.filter((table) => !altered.includes(table)),
