@@ -1016,7 +1016,18 @@ SQLite transaction): the unfinished build is superseded and never published, a n
 every root again under new page identities, pages still uncommitted are retired without moving the
 cursor, and the cursor becomes the new token in a new drain observation with no terminal evidence.
 The published membership, the superseded build's claims and every document obligation stand until
-the replacement is published; a refused token request changes none of it. Selection roots, recursive traversal pages, deduplicated membership, provider-page
+the replacement is published; a refused token request changes none of it. Publication
+(`publish_selection_snapshot`, the SQLite transaction that swaps membership, after the brain
+acknowledged the checkpoint) ends what the replaced snapshots still owed for documents the published
+one does not hold: such an upsert is superseded — never acknowledged — its page outcome records the
+superseding snapshot, and it is no longer backlog or a claim another stream of the connection counts.
+An upsert for a document the published snapshot holds stays owed until its ingestion is acknowledged;
+removals, their barriers, other connections and an unfinished or refused replacement are untouched,
+and a publication the brain acknowledged but SQLite never recorded is recovered with the same
+decision before any retry. An obligation is authorized by the snapshot of the page that observed it
+only while that snapshot is not retired, and by the authoritative snapshot alone afterwards, so a
+retired snapshot's traversal never authorizes a push. Nothing is removed by that supersession: what
+the brain holds ends only with the fenced all-stream reconciliation. Selection roots, recursive traversal pages, deduplicated membership, provider-page
 continuations, document obligations, acknowledgments, and deferred retry times are durable. A page is
 materialized atomically with all of its outcomes, continuation and traversal completion; folder-change
 pages also persist their subtree-rescan incarnation in that transaction and cannot retire until it is

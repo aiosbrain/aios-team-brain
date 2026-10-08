@@ -929,7 +929,9 @@ async def _run_gdrive_stream_unlocked(
         and remote_snapshot is not None
         and state.snapshot_build_complete(namespace, generation, int(remote_snapshot))
     ):
-        # Server ack won the race but the process died before the SQLite mirror swap.
+        # Server ack won the race but the process died before the SQLite mirror swap. The swap
+        # carries the decision about what the replaced snapshots still owed, so it is made here
+        # exactly as it would have been, before any of that work can be retried below.
         state.publish_selection_snapshot(namespace, generation, int(remote_snapshot))
         progress = state.get_progress(namespace)
 
@@ -1934,8 +1936,11 @@ async def _push_doc(
             state.fail_work(work, detail, not_before=_defer_until())
         return True
     if work and not state.work_membership_current(work):
-        # A newer remove/move observation won while extraction was in flight. Never let the stale
-        # body reach the sink; the newer durable obligation remains independently runnable.
+        # A newer remove/move observation won while extraction was in flight, or the snapshot
+        # this was owed under was replaced by one published without the document. Never let the
+        # stale body reach the sink; a newer durable obligation remains independently runnable.
+        # Nothing awaits between this check and the sink call, so a publication of this run
+        # cannot fall between them; another run is stopped by the brain's execution fence.
         return True
     try:
         item = normalize(doc, conn.normalize_config())
@@ -2212,6 +2217,13 @@ def _validation_detail(exc: ValidationError) -> str:
 def _metadata_in_current_selection(
     state: StateStore, work: PendingWork, meta: dict[str, Any],
 ) -> bool:
+    """Whether the document, as the provider reports it now, is inside the selection.
+
+    The roots and traversal it is weighed against are those of the snapshot that answers for the
+    obligation now (``work_snapshot_id``): the build that listed it until that build is published,
+    and never a snapshot whose replacement was. A folder a retired snapshot traversed, since moved
+    out of the selected root, authorizes nothing.
+    """
     if meta.get("trashed") or meta.get("mimeType") not in (None, GOOGLE_DOC_MIME):
         return False
     snapshot_id = state.work_snapshot_id(work)
