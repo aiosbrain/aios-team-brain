@@ -754,6 +754,18 @@ class StateStore:
         self._db.commit()
         return cur.rowcount == 1
 
+    def cancel_relocation(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str,
+    ) -> bool:
+        """A relocating root read back in the drive it is bound to never left that stream."""
+        cur = self._db.execute(
+            "UPDATE selection_root_bindings SET status='bound',pending_drive_id=NULL,detail=NULL "
+            "WHERE connection_id=? AND generation=? AND root_kind=? AND root_id=? AND status='relocating'",
+            (connection_id, generation, root_kind, root_id),
+        )
+        self._db.commit()
+        return cur.rowcount == 1
+
     # -- namespaced Drive progress -----------------------------------------
     def begin_generation(
         self, key: StreamKey, generation: int, *, start_token: str, phase: str = "baselining"
@@ -804,6 +816,16 @@ class StateStore:
             (connection_id, generation),
         ).fetchall()
         return [p for row in rows if (p := self.get_progress(row["namespace"])) is not None]
+
+    def forget_unstarted_stream(self, namespace: str) -> bool:
+        """Drop a stream that never had a start token: it holds no cursor, snapshot or work."""
+        cur = self._db.execute(
+            "DELETE FROM stream_progress WHERE namespace=? AND coalesce(baseline_start_token,'')='' "
+            "AND active_snapshot IS NULL AND building_snapshot IS NULL",
+            (namespace,),
+        )
+        self._db.commit()
+        return cur.rowcount == 1
 
     def latest_progress_for_connection(self, connection_id: str) -> StreamProgress | None:
         row = self._db.execute(
@@ -1337,6 +1359,33 @@ class StateStore:
             "SELECT 1 FROM selected_membership WHERE namespace=? AND generation=? AND snapshot_id=? AND provider_id=?",
             (namespace, generation, selected, provider_id),
         ).fetchone() is not None
+
+    def claimed_elsewhere(
+        self, connection_id: str, generation: int, namespace: str, provider_id: str,
+    ) -> bool:
+        """Whether another stream of the same connection claims one document.
+
+        A claim is membership in that stream's authoritative snapshot or in one it is building, or
+        an upsert it still owes. A removal one drive's change log reports says nothing about any of
+        them: the document may simply have moved between two selected roots.
+        """
+        for row in self._db.execute(
+            "SELECT namespace,active_snapshot,building_snapshot FROM stream_progress "
+            "WHERE connection_id=? AND generation=? AND namespace<>?",
+            (connection_id, generation, namespace),
+        ).fetchall():
+            for snapshot in (row["active_snapshot"], row["building_snapshot"]):
+                if snapshot is not None and self.has_membership(
+                    row["namespace"], generation, provider_id, snapshot_id=int(snapshot),
+                ):
+                    return True
+            if self._db.execute(
+                "SELECT 1 FROM pending_work WHERE namespace=? AND generation=? AND item_key=? "
+                "AND action='upsert' AND acknowledged_at IS NULL AND superseded_at IS NULL",
+                (row["namespace"], generation, provider_id),
+            ).fetchone() is not None:
+                return True
+        return False
 
     def remove_membership(self, namespace: str, generation: int, provider_id: str,
                           *, snapshot_id: int | None = None) -> bool:
