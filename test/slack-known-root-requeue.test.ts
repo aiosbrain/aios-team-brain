@@ -155,6 +155,39 @@ function thrown(run: () => unknown): unknown {
   return undefined;
 }
 
+/**
+ * The caller's session with its executor rejecting its `position`-th call and forwarding every other
+ * one to `inner`. Position 0 rejects nothing. Its `db` client and its audit helper both REFUSE, and
+ * write down that they were asked: nothing can reach `inner` except through the counted executor.
+ */
+function rejectingAt(inner: TransactionSession, position: number, failure: Error): { session: TransactionSession; calls: () => number; other: string[] } {
+  let calls = 0;
+  const other: string[] = [];
+  const executeSql = (async (text: string, params?: unknown[]) => {
+    calls++;
+    if (calls === position) throw failure;
+    return inner.executeSql(text, params);
+  }) as SqlExecutor;
+  const session = {
+    get db(): never {
+      other.push("db");
+      throw new Error("fixture: the caller's own db client was used");
+    },
+    executeSql,
+    optionalAudit: async (): Promise<never> => {
+      other.push("optionalAudit");
+      throw new Error("fixture: the caller's own audit helper was used");
+    },
+  } as unknown as TransactionSession;
+  return { session, calls: () => calls, other };
+}
+/** How a primitive ENDED, as one closed value: what it resolved with, or whether it rejected with the executor's own failure. */
+type RejectingEnded = { resolvedWith: unknown } | { rejectedWithTheExecutorsOwnFailure: boolean };
+const rejectingEnded = (run: Promise<unknown>, failure: Error): Promise<RejectingEnded> => run.then(
+  (value): RejectingEnded => ({ resolvedWith: value }),
+  (error: unknown): RejectingEnded => ({ rejectedWithTheExecutorsOwnFailure: error === failure })
+);
+
 /** The one sentence a caller-contract failure may say. Stated here, not imported: a changed message must fail. */
 const STATIC_VALIDATION_MESSAGE = "slack known-root: invalid request";
 const STATIC_DEADLINE_MESSAGE = "slack known-root: operation deadline exceeded";
@@ -818,9 +851,10 @@ describe("known-root decorated session — statement order, refreshed timeouts, 
     expect(scripted.data().length, "the outcome was reached through at least one data statement").toBeGreaterThanOrEqual(1);
     // While the operation ran the settings really were changed: the restoration is not a no-op.
     for (const statement of scripted.data()) expect(statement.effective).not.toEqual(scripted.original);
-    expectRestored(scripted);
 
     // M14 (§12): omitting EITHER restoration on a normal return must be seen, a refused outcome included.
+    // These two assertions come BEFORE the general restoration check below, so that an omitted
+    // restoration fails HERE, at the read-back that names the setting that was left behind.
     // Each of the two settings, on its own, was something other than its original for every data
     // statement — so putting back only one of them cannot pass for putting back both…
     expect({
@@ -838,6 +872,9 @@ describe("known-root decorated session — statement order, refreshed timeouts, 
     expect(Object.fromEntries(readBack.rows.map((row) => [row.name, Number(row.setting)])),
       `M14: ${label}: a read-back on the caller's own session after the normal result finds the original statement_timeout and the original lock_timeout`)
       .toEqual({ statement_timeout: scripted.original.statementMs, lock_timeout: scripted.original.lockMs });
+    // The general check, after the read-back: the restoring assignment follows the last data
+    // statement, and nothing but read-backs — this case's own, above — follows it.
+    expectRestored(scripted);
   });
 
   it("issues no statement at all for an unlocated entry: there is nothing to set and nothing to restore (control)", async () => {
@@ -1070,38 +1107,34 @@ describe("known-root decorated session — statement order, refreshed timeouts, 
 
   // ── §12 M9: a rejecting executor is never turned into a result ──
 
-  /** The caller's session with its executor rejecting its `position`-th call and forwarding every other one. Position 0 rejects nothing. */
-  function rejectingAt(scripted: Scripted, position: number, failure: Error): { session: TransactionSession; calls: () => number } {
-    let calls = 0;
-    const executeSql = (async (text: string, params?: unknown[]) => {
-      calls++;
-      if (calls === position) throw failure;
-      return scripted.session.executeSql(text, params);
-    }) as SqlExecutor;
-    const session = {
-      get db(): never {
-        throw new Error("fixture: the caller's own db client was used");
-      },
-      executeSql,
-      optionalAudit: async <T>(_operation: () => Promise<T>, fallback: T): Promise<T> => fallback,
-    } as unknown as TransactionSession;
-    return { session, calls: () => calls };
-  }
-  /** How a primitive ENDED, as one closed value: what it resolved with, or whether it rejected with the executor's own failure. */
-  type M9Ended = { resolvedWith: unknown } | { rejectedWithTheExecutorsOwnFailure: boolean };
-  const m9Ended = (run: Promise<unknown>, failure: Error): Promise<M9Ended> => run.then(
-    (value): M9Ended => ({ resolvedWith: value }),
-    (error: unknown): M9Ended => ({ rejectedWithTheExecutorsOwnFailure: error === failure })
-  );
-  /** Each subject would, undisturbed, resolve with exactly the kind of value a swallowed failure is turned into. */
-  const M9_SUBJECTS: [string, Script["respond"], (session: TransactionSession) => Promise<unknown>][] = [
-    ["the page reader on a non-empty team", () => [{ id: ITEM }], (session) => readSlackKnownRootItemPage(session, pageRequest, execution())],
-    ["the page reader on an empty team", () => [], (session) => readSlackKnownRootItemPage(session, pageRequest, execution())],
-    ["the preparer that is refused at the namespace gate", () => [], (session) => prepareSlackKnownRootRequeue(session, { teamId: TEAM, entry: located() }, execution())],
+  /**
+   * Each subject would, undisturbed, resolve with exactly the kind of value a swallowed failure is
+   * turned into; that value is written out and required of the undisturbed run. These four are SHORT
+   * paths: the two preparer subjects end at the namespace gate and at the integration's selection
+   * lock. The full preparation path, through to the enqueue, is the M9 case of the due-output suite
+   * below, which has the scripted answers for it.
+   */
+  const M9_SUBJECTS: [string, Script["respond"], (session: TransactionSession) => Promise<unknown>, unknown][] = [
+    [
+      "the page reader on a non-empty team", () => [{ id: ITEM }],
+      (session) => readSlackKnownRootItemPage(session, pageRequest, execution()),
+      { entries: [{ teamId: TEAM, itemId: ITEM, revisitAfterMs: REVISIT_MS, unlocated: "not_slack" }], nextCursor: null, exhausted: true, examined: 1 },
+    ],
+    [
+      "the page reader on an empty team", () => [],
+      (session) => readSlackKnownRootItemPage(session, pageRequest, execution()),
+      { entries: [], nextCursor: null, exhausted: true, examined: 0 },
+    ],
+    [
+      "the preparer that is refused at the namespace gate", () => [],
+      (session) => prepareSlackKnownRootRequeue(session, { teamId: TEAM, entry: located() }, execution()),
+      { outcome: "refused", reason: "namespace_changed_or_unready" },
+    ],
     [
       "the preparer that is refused at the integration, after the gate locked",
       (text) => (/slack_channel_migration_gates/i.test(text) ? [readyGateRow] : []),
       (session) => prepareSlackKnownRootRequeue(session, { teamId: TEAM, entry: located() }, execution()),
+      { outcome: "refused", reason: "source_not_current" },
     ],
   ];
 
@@ -1113,25 +1146,30 @@ describe("known-root decorated session — statement order, refreshed timeouts, 
    * would produce, since an empty answer is exactly what these four subjects read as "nothing there".
    *
    * Every call position is tried, each on a fresh scripted session; the number of positions is
-   * counted from an undisturbed run through the same wrapper, not assumed.
+   * counted from an undisturbed run through the same wrapper, not assumed. The wrapper's own db
+   * client and audit helper refuse, so no call can go round the counted executor.
    *
-   * WHAT THIS IS NOT. Whether the caller's real transaction then rejects and rolls back is a separate
-   * behaviour, shown against real PostgreSQL and not here. A transaction that rolls back does not
-   * show that the primitive did not swallow the failure, and this case does not show a rollback.
+   * WHAT THIS IS NOT. It is not evidence about a transaction. Whether the caller's real transaction
+   * then rejects and rolls back is a separate behaviour that this case does not show and that is
+   * not claimed to be shown anywhere: it remains a separate, pending KR-12 concern about the real
+   * transaction. A transaction that rolled back would not show that the primitive had not swallowed
+   * the failure, either.
    */
-  it.each(M9_SUBJECTS)("M9: rejects with the executor's own failure, and resolves no page and no result, whichever of its calls the executor rejects: %s", async (subject, respond, run) => {
+  it.each(M9_SUBJECTS)("M9: rejects with the executor's own failure, and resolves no page and no result, whichever of its calls the executor rejects: %s", async (subject, respond, run, expected) => {
     const never = new Error("fixture: never thrown");
-    const undisturbed = rejectingAt(scriptedSession({ respond }), 0, never);
-    const control = await m9Ended(run(undisturbed.session), never);
+    const undisturbed = rejectingAt(scriptedSession({ respond }).session, 0, never);
+    const control = await rejectingEnded(run(undisturbed.session), never);
     const total = undisturbed.calls();
-    expect(["resolvedWith" in control, total >= 3], `M9: ${subject}: control: with no call rejected the primitive resolves, through several executor calls`).toEqual([true, true]);
+    expect([control, total >= 3, undisturbed.other], `M9: ${subject}: control: with no call rejected the primitive resolves with exactly its expected result, through several executor calls and nothing else`)
+      .toEqual([{ resolvedWith: expected }, true, []]);
 
     for (let position = 1; position <= total; position++) {
       const failure = Object.assign(new Error(`fixture: the executor rejected its call ${position}`), { code: "XX000" });
-      const rejecting = rejectingAt(scriptedSession({ respond }), position, failure);
-      expect(await m9Ended(run(rejecting.session), failure),
+      const rejecting = rejectingAt(scriptedSession({ respond }).session, position, failure);
+      expect(await rejectingEnded(run(rejecting.session), failure),
         `M9: ${subject}: the executor rejected its call ${position} of ${total}: the primitive rejects with that same failure, and resolves no page and no result`)
         .toEqual({ rejectedWithTheExecutorsOwnFailure: true });
+      expect(rejecting.other, `M9: ${subject}: the executor rejected its call ${position} of ${total}: neither the caller's db client nor its audit helper was asked for`).toEqual([]);
     }
   });
 });
@@ -1622,6 +1660,8 @@ describe("known-root due-output conversion contract", () => {
     } as unknown as TransactionSession;
     return {
       session, enqueueInserts,
+      /** Every statement that reached this executor, by the name it was recognized under, in order. */
+      sent: (): string[] => [...sent],
       /** The data statements, in order: everything but the settings read and the settings assignments. */
       data: (): string[] => sent.filter((name) => !name.startsWith("settings ")),
       /** What was sent AFTER the due read, of any kind. */
@@ -1732,5 +1772,79 @@ describe("known-root due-output conversion contract", () => {
     expect(prepared.constructedWith, `${label}: nothing was converted: no Date was constructed`).toEqual([]);
     // A normal result: the only thing sent after the due read is the restoration of the settings.
     expect(prepared.scripted.afterTheDueRead(), `${label}: only the settings restoration follows`).toEqual(["settings assignment"]);
+  });
+
+  /**
+   * M9 on the FULL preparation path (§7.4, §12). The M9 cases of the decorated-session suite above
+   * end at the namespace gate or at the integration's selection lock. This one uses this suite's
+   * scripted answers, under which the real exported preparer runs the whole of §5 and is ENQUEUED.
+   *
+   * THE UNDISTURBED RUN is required to resolve with exactly `{ outcome: "enqueued" }`, and every
+   * statement that reached the executor is written down by the name the script recognized it
+   * under: the read of the original settings; then, each behind its own settings assignment, the
+   * namespace gate lock, the integration selection lock, the binding row lock, the scoped channel
+   * row lock, the plain queue read, the item lock, the Slack project read, the root witness, the
+   * ledger contradictions, the path conflicts, the due read and the enqueue's insert; and last the
+   * restoring assignment. That named sequence is what "every position" means below: it is asserted
+   * to hold each of those stages, and nothing is claimed about a position that is not in it.
+   *
+   * THEN EACH OF THOSE CALLS IS REJECTED IN TURN, each on a fresh scripted executor. The preparer
+   * must reject with that very failure and must resolve nothing — not `enqueued`, and not a refused,
+   * unattested, not-due or already-pending result. What reached the scripted executor before the
+   * rejected call is required to be exactly the named calls before it, which also says which call
+   * it was that was rejected.
+   *
+   * WHAT THIS IS NOT. It is not evidence about a transaction: no transaction exists here. Whether
+   * the caller's real transaction rejects and rolls back is a separate, pending KR-12 concern.
+   */
+  it("M9: rejects with the executor's own failure, and resolves no result, whichever executor call of a preparation that would be enqueued is rejected — gate, selection, binding, channel, queue, item, project, witness, contradictions, paths, due, enqueue and restoration", async () => {
+    // FIXTURE: the token the real selection lock resolves, as every case of this suite sets it.
+    vi.stubEnv("SLACK_BOT_TOKEN", TOKEN);
+    const dueRow = { is_due: true, due_epoch_ms: "1718903600123" };
+    const prepare = (session: TransactionSession): Promise<unknown> => prepareSlackKnownRootRequeue(session, { teamId: TEAM, entry: ENTRY }, execution());
+
+    // ── THE UNDISTURBED RUN, through the same wrapper, rejecting nothing. ──
+    const never = new Error("fixture: never thrown");
+    const script = scriptedPreparation([dueRow], () => undefined);
+    const undisturbed = rejectingAt(script.session, 0, never);
+    expect(await rejectingEnded(prepare(undisturbed.session), never), "M9 full path: control: with no call rejected the preparation resolves with exactly enqueued").toEqual({ resolvedWith: { outcome: "enqueued" } });
+    const calls = script.sent();
+    const total = undisturbed.calls();
+    const stages = [...TO_THE_DUE_READ, "enqueue insert"];
+    expect({
+      every_counted_call_reached_the_scripted_executor: calls.length === total,
+      data_statements_in_order: script.data(),
+      enqueue_inserts: script.enqueueInserts.length,
+      first_call: calls[0],
+      // Each data statement is directly preceded by a settings assignment of its own.
+      data_statements_not_directly_behind_a_settings_assignment: calls.filter((name, index) => !name.startsWith("settings ") && calls[index - 1] !== "settings assignment"),
+      // After the enqueue's insert comes the restoring assignment, and nothing else.
+      after_the_enqueue_insert: calls.slice(calls.lastIndexOf("enqueue insert") + 1),
+      caller_db_or_audit_helper_asked_for: undisturbed.other,
+    }, "M9 full path: control: the undisturbed preparation sent the settings read, every stage of the full path behind its own assignment, the enqueue, and the restoring assignment").toEqual({
+      every_counted_call_reached_the_scripted_executor: true,
+      data_statements_in_order: stages,
+      enqueue_inserts: 1,
+      first_call: "settings read",
+      data_statements_not_directly_behind_a_settings_assignment: [],
+      after_the_enqueue_insert: ["settings assignment"],
+      caller_db_or_audit_helper_asked_for: [],
+    });
+
+    // ── EACH COUNTED CALL REJECTED IN TURN. ──
+    for (let position = 1; position <= total; position++) {
+      const rejected = calls[position - 1];
+      const behind = rejected === "settings assignment" ? ` before ${calls[position] ?? "nothing more: the restoration"}` : "";
+      const where = `call ${position} of ${total} (${rejected}${behind})`;
+      const failure = Object.assign(new Error(`fixture: the executor rejected its call ${position}`), { code: "XX000" });
+      const fresh = scriptedPreparation([dueRow], () => undefined);
+      const rejecting = rejectingAt(fresh.session, position, failure);
+      expect(await rejectingEnded(prepare(rejecting.session), failure),
+        `M9 full path: the executor rejected its ${where}: the preparation rejects with that same failure, and resolves no result`)
+        .toEqual({ rejectedWithTheExecutorsOwnFailure: true });
+      expect({ reached_the_scripted_executor: fresh.sent(), caller_db_or_audit_helper_asked_for: rejecting.other },
+        `M9 full path: the executor rejected its ${where}: exactly the calls before it reached the scripted executor, and none after it`)
+        .toEqual({ reached_the_scripted_executor: calls.slice(0, position - 1), caller_db_or_audit_helper_asked_for: [] });
+    }
   });
 });
