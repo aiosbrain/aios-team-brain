@@ -7472,11 +7472,23 @@ describe("KR-09 namespace invalidation and rereadiness (M6b)", () => {
  * EVIDENCE, NOT RED: every case is expected to pass on the current source. Nothing here was run
  * when it was written.
  *
- * WHAT IS DELIBERATELY NOT REPEATED. The unit file `test/slack-known-root-requeue.test.ts` already
- * proves, on a scripted session, everything that needs no real transaction, and stays as it is:
- *   - every normal result restores both settings before it resolves — "restores both original
- *     settings before a normal result resolves", with the per-setting M14 read-backs, and the
- *     due-output suite for `not_due`, `already_pending` and `enqueued`;
+ * WHAT IS DELIBERATELY NOT REPEATED. The unit file `test/slack-known-root-requeue.test.ts` proves, on
+ * a scripted session that MODELS the two settings, everything that needs no real transaction:
+ *   - NORMAL RETURNS, each with a read-back of both original settings on the caller's own session
+ *     after the result, by exact outcome and reason:
+ *       · "restores both original settings before a normal result resolves" (decorated-session
+ *         suite, with the per-setting M14 read-backs): `refused` for `namespace_changed_or_unready`
+ *         and for `source_not_current`, and two page-reader results;
+ *       · "restores both original timeout settings before this normal result resolves" (due-output
+ *         suite, on the full scripted path through the real gate, selection and enqueue helpers):
+ *         `refused` for `binding_changed`, `channel_not_public`, `scoped_path_conflict` and
+ *         `legacy_path_conflict`; `unattested` for `item_missing`, `canonical_mismatch`,
+ *         `invalid_metadata` of a located entry, `missing_root_witness` and `contradictory_ledger`;
+ *         `not_due`; `already_pending` on the EARLY path and on the CONFLICT path; and `enqueued`;
+ *       · an entry enumeration could not locate — `not_slack`, `invalid_metadata`,
+ *         `missing_channel_binding`, `missing_namespace_pin` — is sent no statement at all, so no
+ *         setting is changed and none is restored ("reports an entry enumeration could not locate");
+ *       · the case next to that table requires those three groups to be every exported reason.
  *   - a rejection at EVERY executor call position is rethrown as it is and never becomes a result —
  *     the two M9 cases;
  *   - a failed statement is rethrown and nothing is sent after it, a statement that outlives the
@@ -7485,7 +7497,8 @@ describe("KR-09 namespace invalidation and rereadiness (M6b)", () => {
  *   - validation and an inadmissible context issue no statement at all;
  *   - the classifier's precedence, an unknown commit included.
  * RETRY EXHAUSTION through the real wrapper is the M15a suite of this file: two real attempts, both
- * failed by a server-raised 40001, one final rejection.
+ * failed by a server-raised 40001, one final rejection. That suite reads no setting and no
+ * connection afterwards.
  *
  * WHAT IS HERE, and only here: the unit cases have no transaction. Each case below runs the real
  * preparation inside the actual `runContextTransaction` on the real pool, after a write of the
@@ -7504,24 +7517,35 @@ describe("KR-09 namespace invalidation and rereadiness (M6b)", () => {
  *      sees (§7.4): a dependency statement rejected in a test-only session wrapper; the RESTORING
  *      assignment rejected after the preparation's own enqueue — the restoration failure of §7.4,
  *      with no success receipt; and the slice's local deadline, on the §7.2 controlled clock.
- *   2. Failures the SERVER raises: `55P03`, with the item row lock held by another transaction until
- *      the preparation has ended; and `57014`, with a genuinely slow statement sent in place of one
- *      dependency read.
+ *   2. Failures the SERVER raises: `55P03`, with the item row lock held by another backend until the
+ *      preparation has ended; and `57014`, with a genuinely slow statement sent in place of one
+ *      dependency read. Each is shown to be the PREPARATION'S OWN cap and not the caller's
+ *      transaction-local 1,500 ms / 20,000 ms: the assignment sent immediately before the failing
+ *      statement carries a 250 ms lock timeout and a statement timeout within the 2,000 ms
+ *      allowance, the wait ends well short of the caller's value, and the engine's error names the
+ *      statement the server failed.
+ *      A THIRD ROW ISOLATES THE ENGINE'S FAILURE TRACKER (§7.4: "forces rollback even if a callback
+ *      accidentally catches it"; §12 M9). The callback CATCHES the server's `55P03` and returns a
+ *      refused-looking result. In the other rows a throw leaves the callback, and any throw is
+ *      rolled back; here nothing is thrown, and only the tracker's record of the failed statement
+ *      can make the complete promise reject.
  *   3. A connection that is really lost: the backend is terminated before the restoring assignment
- *      is sent, so the restoration fails and so does the engine's ROLLBACK. The discard is read three
- *      ways, none of them through the dead connection: the pool announces that the client was given
- *      back WITH an error; the server, asked from another connection, lists no backend of that
- *      process id and start instant; and the pool no longer holds it. The next transaction runs on
- *      another backend whose settings at BEGIN are the established ones.
+ *      is sent, and the client is known to be unusable before that assignment is passed on. The
+ *      discard is read three ways, none of them through the dead connection: the pool announces that
+ *      the client was given back WITH an error; the server, asked from another connection, lists no
+ *      backend of that process id and start instant; and the pool no longer holds it. The next
+ *      transaction runs on another backend whose settings at BEGIN are the established ones.
+ *      That the engine's ROLLBACK on that connection failed is INFERRED from those observations and
+ *      from reading the engine; no assertion here observes the ROLLBACK itself.
  *
  * NOT CLAIMED. An unknown commit on real Postgres (a COMMIT whose outcome is not known) is not
  * produced here; neither is a ROLLBACK that fails on a connection that is otherwise alive. Normal-
- * return restoration is read on a real connection for `enqueued` only; the other results rest on
- * the unit table. The local deadline is on the controlled clock, not the real one. Each server
- * timeout is raised at ONE statement, and the 57014 case does not re-prove M13's reduced budgets.
- * The 55P03 wait has a lower bound only. And suite 3 attaches its own `error` listener to the pooled
- * client: what a process WITHOUT such a listener does when a checked-out connection dies is not
- * examined here.
+ * return restoration is read on a REAL connection for `enqueued` only; every other result and
+ * reason is read back on the unit model named above, not on a server. No pooled connection is read
+ * after a COMMITTED invocation. The local deadline is on the controlled clock, not the real one.
+ * Each server timeout is raised at ONE statement, and the 57014 case does not re-prove M13's reduced
+ * budgets. And suite 3 attaches its own `error` listener to the pooled client: what a process
+ * WITHOUT such a listener does when a checked-out connection dies is not examined here.
  */
 
 /** One connection's physical identity, and its two timeout settings in whole milliseconds as that connection reports them. */
@@ -7568,11 +7592,25 @@ const KR12_CALLER_ROOT = "1718900777.000700";
 const KR12_CALLER_LOCAL: Kr12Timeouts = { statement_timeout_ms: 20_000, lock_timeout_ms: 1_500 };
 const KR12_SET_CALLER_LOCAL = `select set_config('statement_timeout', $1, true), set_config('lock_timeout', $2, true)`;
 const KR12_CALLER_LOCAL_PARAMS = [`${KR12_CALLER_LOCAL.statement_timeout_ms}ms`, `${KR12_CALLER_LOCAL.lock_timeout_ms}ms`];
-/** Fragments that name three of the preparation's statements. None carries a parameter value. */
+/** Fragments that name four of the preparation's statements. None carries a parameter value. */
 const KR12_WITNESS_READ = "select 1 as witnessed";
 const KR12_ENQUEUE_INSERT = "insert into slack_sync_threads";
 const KR12_TIMEOUT_ASSIGNMENT = "set_config('statement_timeout'";
+/** How the item row LOCK ends, flattened: the one statement that takes a row lock on `items`. */
+const KR12_ITEM_ROW_LOCK_ENDS = "from items i where i.team_id = $1::uuid and i.id = $2::uuid for update";
 const kr12Flat = (text: string): string => text.replace(/\s+/g, " ").trim();
+/**
+ * The RESTORING assignment, by what it CARRIES and not by where it comes: the caller's own two
+ * values, in whole milliseconds, statement timeout first. WRITTEN OUT rather than built from the
+ * constant the fixture sets them with. No assignment the preparation makes ahead of a statement
+ * can carry them: those carry at most the 2,000 ms allowance and the 250 ms lock cap.
+ */
+const KR12_RESTORING_PARAMS = ["20000", "1500"];
+const kr12IsTheRestoration = (flat: string, params: unknown[] | undefined): boolean =>
+  flat.includes(KR12_TIMEOUT_ASSIGNMENT) && JSON.stringify(params ?? []) === JSON.stringify(KR12_RESTORING_PARAMS);
+/** A timeout value as it is sent — whole milliseconds, with or without the unit — or NaN. */
+const kr12Milliseconds = (value: unknown): number =>
+  (typeof value === "string" && /^[0-9]+(ms)?$/.test(value) ? Number.parseInt(value, 10) : Number.NaN);
 /** A rejection as a closed description: its kind and its category, never its message. */
 const kr12Described = (error: unknown): string =>
   `${error instanceof Error ? error.name : typeof error} / ${classifySlackKnownRootPreparationFailure(error)}`;
@@ -7615,6 +7653,8 @@ interface Kr12Seen {
   primitiveMs: number | null;
   /** The transaction's own view after the preparation threw, when that was asked for. */
   insideAfterFailure: { queueRoots: string[]; timeouts: Kr12Timeouts } | null;
+  /** What the callback CAUGHT and what it returned instead of throwing, when a case asked for that. */
+  caught: { failure: unknown; answeredWith: SlackKnownRootPreparationResult } | null;
 }
 
 /**
@@ -7626,7 +7666,9 @@ interface Kr12Seen {
  * the real preparation, on the caller's session or on the wrapper a case supplies. A throw of the
  * preparation leaves the callback as the SAME object. `readInsideAfterFailure` first reads the
  * transaction's own view — only for a failure that never reached the server: an aborted
- * transaction answers nothing.
+ * transaction answers nothing. `caughtAndAnsweredWith` is the one exception to the rethrow: the
+ * callback then SWALLOWS the failure, issues nothing more, and returns that result as if the
+ * preparation had returned it.
  */
 async function kr12Invocation(o: {
   teamId: string;
@@ -7634,11 +7676,12 @@ async function kr12Invocation(o: {
   execution?: SlackKnownRootExecution;
   handed?: (session: TransactionSession, seen: Kr12Seen) => TransactionSession;
   readInsideAfterFailure?: boolean;
+  caughtAndAnsweredWith?: SlackKnownRootPreparationResult;
   watch?: (client: PoolClient, session: Kr12Session) => void;
 }) {
   // The execution context is created BEFORE the transaction it is used in (§7.2).
   const execution = o.execution ?? createSlackKnownRootExecution({ ambientDeadlineAt: null });
-  const seen: Kr12Seen = { attempts: [], atBegin: null, callerLocal: null, result: undefined, primitiveMs: null, insideAfterFailure: null };
+  const seen: Kr12Seen = { attempts: [], atBegin: null, callerLocal: null, result: undefined, primitiveMs: null, insideAfterFailure: null, caught: null };
   // At least one connection is idle in the pool, so the transaction takes one that was read beforehand.
   await getPool().query(`select 1`);
   const before = await kr12PooledSessions(o.watch);
@@ -7662,6 +7705,12 @@ async function kr12Invocation(o: {
           )).rows.map((row) => row.root_ts),
           timeouts: kr12Timeouts(await kr12SessionOf(session)),
         };
+      }
+      if (o.caughtAndAnsweredWith) {
+        // THE M9 SHAPE, on a real transaction: the failure is swallowed and a normal-looking result
+        // is returned in its place. `seen.result` stays undefined: the preparation returned nothing.
+        seen.caught = { failure, answeredWith: o.caughtAndAnsweredWith };
+        return o.caughtAndAnsweredWith;
       }
       // Rethrown as it is: the SAME object leaves the callback.
       throw failure;
@@ -7748,8 +7797,8 @@ describe("KR-12 failures that never reach the server escape the real caller tran
           let enqueued = false;
           return kr12Intercepted(session, async (text, params, pass) => {
             const flat = kr12Flat(text);
-            // The timeout assignment that follows the enqueue is the RESTORATION of §7.4. It is never sent.
-            if (enqueued && flat.includes(KR12_TIMEOUT_ASSIGNMENT)) throw failure;
+            // The RESTORATION of §7.4: it follows the enqueue AND carries the caller's own two values. It is never sent.
+            if (enqueued && kr12IsTheRestoration(flat, params)) throw failure;
             const result = await pass(text, params);
             if (flat.includes(KR12_ENQUEUE_INSERT)) enqueued = true;
             return result;
@@ -7810,65 +7859,139 @@ describe("KR-12 failures that never reach the server escape the real caller tran
 });
 
 describe("KR-12 server-raised timeouts through the real caller transaction", () => {
+  const SLOW_STATEMENT = "select pg_sleep(30)";
+
   interface Subject {
     sqlstate: string;
     category: string;
-    handed?: (session: TransactionSession) => TransactionSession;
-    /** Arranges what makes the server raise it, and returns how to undo that. */
-    arrange?: (f: Published, teamId: string) => Promise<() => Promise<void>>;
-    /** The preparation really waited: it was not refused at once. A lower bound only. */
+    /** Whether ANOTHER backend holds the row lock of the root's item until the preparation has ended. */
+    itemRowLockHeld: boolean;
+    /** What is SENT to the server in place of one of the preparation's statements, if anything is. */
+    sentInPlaceOf?: (flat: string) => string | undefined;
+    /** The statement the server must have failed, by its flattened text. */
+    failing: (flat: string) => boolean;
+    /** The preparation really waited: it was not refused at once. */
     atLeastMs: number;
+    /** …and it stopped waiting well short of the CALLER'S OWN transaction-local value. */
+    lessThanMs: number;
+    /** THE M9 SHAPE: the callback catches the failure and returns this instead of throwing. */
+    caughtAndAnsweredWith?: SlackKnownRootPreparationResult;
+  }
+  /** The wait of a lock timeout: at least most of the 250 ms cap, and short of the caller's own 1,500 ms. */
+  const LOCK_WAIT = { atLeastMs: 200, lessThanMs: KR12_CALLER_LOCAL.lock_timeout_ms };
+
+  /**
+   * ANOTHER pooled transaction that takes the row lock of the root's item and keeps it until it is
+   * let go. It is let go when the test finishes, whatever happened; letting go twice does nothing.
+   */
+  async function itemRowLockHeld(f: Published, teamId: string) {
+    const hold = lifecycleHold<number>();
+    const holder = lifecycleTracked(tx(async (b) => {
+      const locked = await b.executeSql(`select 1 from items where team_id = $1::uuid and id = $2::uuid for update`, [teamId, f.itemId]);
+      if (locked.rows.length !== 1) throw new Error("fixture: the item row was not there to lock");
+      hold.arrive(await lifecyclePidOf(b));
+      await hold.released;
+    }));
+    const letGo = (): Promise<LifecycleEnded<void>> => {
+      hold.release();
+      return holder.ended;
+    };
+    onTestFinished(async () => {
+      await letGo();
+    });
+    const pid = await lifecycleArrived(hold.reached, holder, "the holder of the item row lock");
+    return { pid, stillHolds: (): boolean => !holder.hasEnded(), letGo };
   }
 
-  it.each<[string, () => Subject]>([
-    ["55P03, with the item row lock held by another transaction until the preparation has ended", () => ({
-      sqlstate: "55P03", category: "lock_timeout", atLeastMs: 200,
-      arrange: async (f, teamId) => {
-        const hold = lifecycleHold<number>();
-        const holder = lifecycleTracked(tx(async (b) => {
-          const locked = await b.executeSql(`select 1 from items where team_id = $1::uuid and id = $2::uuid for update`, [teamId, f.itemId]);
-          if (locked.rows.length !== 1) throw new Error("fixture: the item row was not there to lock");
-          hold.arrive(await lifecyclePidOf(b));
-          await hold.released;
-        }));
-        const letGo = async (): Promise<void> => {
-          hold.release();
-          await holder.ended;
-        };
-        onTestFinished(letGo);
-        await lifecycleArrived(hold.reached, holder, "the holder of the item row lock");
-        return letGo;
-      },
-    })],
-    ["57014, with a genuinely slow statement sent in place of one dependency read", () => ({
+  it.each<[string, Subject]>([
+    ["55P03, with the item row lock held by another transaction until the preparation has ended", {
+      sqlstate: "55P03", category: "lock_timeout", itemRowLockHeld: true, ...LOCK_WAIT,
+      failing: (flat) => flat.endsWith(KR12_ITEM_ROW_LOCK_ENDS),
+    }],
+    ["57014, with a genuinely slow statement sent in place of one dependency read", {
       // The default allowance on the real clock: the statement timeout the preparation has just set
-      // is what is left of 2,000 ms, and the server ends the statement when it runs out.
-      sqlstate: "57014", category: "statement_timeout", atLeastMs: 500,
+      // is what is left of 2,000 ms, and the server ends the statement when it runs out — long
+      // before the caller's own 20,000 ms would have.
+      sqlstate: "57014", category: "statement_timeout", itemRowLockHeld: false, atLeastMs: 500, lessThanMs: 10_000,
       // SENT to the server on the same connection, under that timeout.
-      handed: (session) => kr12Intercepted(session, (text, params, pass) =>
-        (kr12Flat(text).includes(KR12_WITNESS_READ) ? pass(`select pg_sleep(30)`, []) : pass(text, params))),
-    })],
-  ])("never resolves, rejects with the server's SQLSTATE through the engine, and rolls back: %s", async (name, make) => {
+      sentInPlaceOf: (flat) => (flat.includes(KR12_WITNESS_READ) ? SLOW_STATEMENT : undefined),
+      failing: (flat) => flat === SLOW_STATEMENT,
+    }],
+    ["55P03 that the callback catches and answers with a refused-looking result — only the engine's failure tracker can reject it", {
+      sqlstate: "55P03", category: "lock_timeout", itemRowLockHeld: true, ...LOCK_WAIT,
+      failing: (flat) => flat.endsWith(KR12_ITEM_ROW_LOCK_ENDS),
+      caughtAndAnsweredWith: { outcome: "refused", reason: "source_not_current" },
+    }],
+  ])("never resolves, rejects with the server's SQLSTATE through the engine, and rolls back: %s", async (name, subject) => {
     const label = `KR-12 ${name}`;
     const { f, teamId, entry, exactDue } = await lifecycleAgedRoot(label, KR12_REVISIT);
     const snapshotBefore = await lifecycleSnapshot(teamId);
-    const subject = make();
-    const undo = subject.arrange ? await subject.arrange(f, teamId) : async (): Promise<void> => {};
+    const holder = subject.itemRowLockHeld ? await itemRowLockHeld(f, teamId) : null;
 
-    const invocation = await kr12Invocation({ teamId, entry, handed: subject.handed });
-    await undo();
+    // EVERYTHING the preparation sends, written down AS IT IS SENT and before it is sent: so the last
+    // entry is the statement that failed, and the one before it is the assignment it ran under.
+    const sent: { flat: string; params: unknown[] }[] = [];
+    const handed = (session: TransactionSession): TransactionSession => kr12Intercepted(session, (text, params, pass) => {
+      const inItsPlace = subject.sentInPlaceOf?.(kr12Flat(text));
+      const sending = inItsPlace === undefined ? { text, params } : { text: inItsPlace, params: [] as unknown[] };
+      sent.push({ flat: kr12Flat(sending.text), params: [...(sending.params ?? [])] });
+      return pass(sending.text, sending.params);
+    });
+
+    const invocation = await kr12Invocation({ teamId, entry, handed, caughtAndAnsweredWith: subject.caughtAndAnsweredWith });
+    const heldUntilThePreparationEnded = holder ? holder.stillHolds() : null;
+    const holderEnded = holder ? await holder.letGo() : null;
     const { seen, ended } = invocation;
+    if (holder) {
+      expect({ heldUntilThePreparationEnded, byAnotherBackend: holder.pid !== seen.atBegin?.pid, holderEndedAs: holderEnded?.state },
+        `${label}: fixture: another backend held the item row lock until the invocation had ended, and its own transaction ended normally once it was let go`)
+        .toEqual({ heldUntilThePreparationEnded: true, byAnotherBackend: true, holderEndedAs: "resolved" });
+    }
 
     expect(ended.state, `${label}: the complete runContextTransaction promise did not resolve (${JSON.stringify(lifecycleShown(ended))})`).toBe("rejected");
     if (ended.state !== "rejected") return;
-    const error = ended.error as { code?: unknown; unknownCommit?: unknown };
+    const error = ended.error as { code?: unknown; unknownCommit?: unknown; sql?: unknown };
     expect({
       anEngineError: ended.error instanceof TransactionExecutionError, sqlstate: error.code, unknownCommit: error.unknownCommit,
       category: classifySlackKnownRootPreparationFailure(ended.error),
-    }, `${label}: the complete promise rejected with the transaction engine's error carrying the server's SQLSTATE, which is no success and no refusal`).toEqual({
-      anEngineError: true, sqlstate: subject.sqlstate, unknownCommit: false, category: subject.category,
+      // WHICH statement the server failed, as the engine's failure tracker recorded it.
+      namesTheFailedStatement: typeof error.sql === "string" && subject.failing(kr12Flat(error.sql)),
+    }, `${label}: the complete promise rejected with the transaction engine's error carrying the server's SQLSTATE and the statement it failed, which is no success and no refusal`).toEqual({
+      anEngineError: true, sqlstate: subject.sqlstate, unknownCommit: false, category: subject.category, namesTheFailedStatement: true,
     });
-    expect((seen.primitiveMs ?? 0) >= subject.atLeastMs, `${label}: the preparation really waited before the server ended its statement (${Math.round(seen.primitiveMs ?? 0)} ms)`).toBe(true);
+
+    // ── WHOSE CAP IT WAS. The caller's own transaction-local 1,500 ms lock timeout and 20,000 ms
+    //    statement timeout would raise the same SQLSTATE, later. What ended this statement is read
+    //    off the assignment the preparation sent immediately before it, and off how long it waited. ──
+    const failed = sent[sent.length - 1];
+    const ranUnder = sent[sent.length - 2];
+    const appliedStatementMs = kr12Milliseconds(ranUnder?.params[0]);
+    expect({
+      theLastStatementSentIsTheOneThatFailed: failed ? subject.failing(failed.flat) : null,
+      theAssignmentDirectlyBeforeIt: ranUnder ? [ranUnder.flat.includes(KR12_TIMEOUT_ASSIGNMENT), ranUnder.params.length] : null,
+      appliedLockTimeoutMs: kr12Milliseconds(ranUnder?.params[1]),
+      appliedStatementTimeoutIsWithinTheAllowance: appliedStatementMs >= 1 && appliedStatementMs <= 2_000,
+    }, `${label}: the failing statement ran under the preparation's own assignment: a 250 ms lock timeout and a statement timeout of what was left of 2,000 ms (${appliedStatementMs} ms), neither of them the caller's`).toEqual({
+      theLastStatementSentIsTheOneThatFailed: true,
+      theAssignmentDirectlyBeforeIt: [true, 2],
+      appliedLockTimeoutMs: 250,
+      appliedStatementTimeoutIsWithinTheAllowance: true,
+    });
+    const waitedMs = seen.primitiveMs ?? Number.NaN;
+    expect([waitedMs >= subject.atLeastMs, waitedMs < subject.lessThanMs],
+      `${label}: the preparation really waited, and stopped well short of the caller's own timeout: ${Math.round(waitedMs)} ms, expected within [${subject.atLeastMs}, ${subject.lessThanMs})`).toEqual([true, true]);
+
+    // ── THE TRACKER ALONE. The callback did not throw: it caught the server's failure and returned a
+    //    refused-looking result. The engine rejected all the same, with an error of its own making. ──
+    expect(seen.caught === null ? null : {
+      caughtSqlstate: (seen.caught.failure as { code?: unknown } | null)?.code,
+      theCallbackReturned: seen.caught.answeredWith,
+      thePromiseRejectedWithWhatWasCaught: ended.error === seen.caught.failure,
+    }, `${label}: ${subject.caughtAndAnsweredWith
+      ? "the callback caught the server's failure and returned a refused-looking result, and the promise still rejected, with another object"
+      : "control: this callback caught nothing and returned nothing in a failure's place"}`).toEqual(subject.caughtAndAnsweredWith ? {
+      caughtSqlstate: subject.sqlstate, theCallbackReturned: subject.caughtAndAnsweredWith, thePromiseRejectedWithWhatWasCaught: false,
+    } : null);
 
     await kr12ExpectRolledBackOnItsReusableConnection(label, invocation, teamId, snapshotBefore);
     await kr12ExpectCommitsAfterwards(label, teamId, entry, exactDue);
@@ -7919,9 +8042,9 @@ describe("KR-12 a connection lost inside the caller transaction is discarded and
       let enqueued = false;
       return kr12Intercepted(session, async (text, params, pass) => {
         const flat = kr12Flat(text);
-        // The timeout assignment that follows the enqueue is the restoration. BEFORE it is sent, the
-        // backend this transaction is on is ended from another connection, and its death is awaited.
-        if (enqueued && death.terminated === null && flat.includes(KR12_TIMEOUT_ASSIGNMENT)) {
+        // The restoration: it follows the enqueue AND carries the caller's own two values. BEFORE it is
+        // sent, the backend this transaction is on is ended from another connection, and its death is awaited.
+        if (enqueued && death.terminated === null && kr12IsTheRestoration(flat, params)) {
           const doomed = seen.atBegin;
           if (!doomed || !connectionErrors.has(kr12Identity(doomed))) throw new Error("fixture: the transaction is not on a connection this test is listening to");
           const [answer] = await query<{ terminated: boolean }>(`select pg_terminate_backend($1::int) as terminated`, [doomed.pid]);

@@ -1602,10 +1602,18 @@ describe("known-root due-output conversion contract", () => {
   }
 
   /**
+   * A case's own answer to a statement, by the NAME this script recognizes it under. It is handed
+   * the usual answer — which it may take, alter or leave — and the statement's flattened text.
+   */
+  type AnswerOverrides = Partial<Record<string, (usual: () => unknown[], flat: string) => unknown[]>>;
+
+  /**
    * A scripted executor: valid answers for everything before the due read, the given rows for the
    * due read, and a stored row for the enqueue's insert. A statement it does not know fails loudly.
+   * `overrides` replaces the answer to the statements it names and to no other; with none, every
+   * statement is answered exactly as before.
    */
-  function scriptedPreparation(dueRows: unknown[], onDueAnswered: () => void) {
+  function scriptedPreparation(dueRows: unknown[], onDueAnswered: () => void, overrides: AnswerOverrides = {}) {
     const sent: string[] = [];
     const enqueueInserts: unknown[][] = [];
     const answers: [name: string, recognizes: RegExp, rows: (params: readonly unknown[]) => unknown[]][] = [
@@ -1656,7 +1664,9 @@ describe("known-root due-output conversion contract", () => {
       const answer = answers.find(([, recognizes]) => recognizes.test(flat));
       if (!answer) throw new Error("fixture: the scripted executor was sent a statement it does not know");
       sent.push(answer[0]);
-      const rows = answer[2](params);
+      const usual = (): unknown[] => answer[2](params);
+      const override = overrides[answer[0]];
+      const rows = override ? override(usual, flat) : usual();
       // The window opens HERE, as the due answer is handed back, and not a statement earlier.
       if (answer[0] === "due read") onDueAnswered();
       return { rows, rowCount: rows.length };
@@ -1858,5 +1868,173 @@ describe("known-root due-output conversion contract", () => {
         `M9 full path: the executor rejected its ${where}: exactly the calls before it reached the scripted executor, and none after it`)
         .toEqual({ reached_the_scripted_executor: calls.slice(0, position - 1), caller_db_or_audit_helper_asked_for: [] });
     }
+  });
+
+  /**
+   * KR-12, NORMAL RETURNS (§7.4: "For every normal return, including every `unattested`/`refused`
+   * reason, `not_due`, early `already_pending`, conflict-path `already_pending` and `enqueued`,
+   * restore both original settings on the same connection before resolving").
+   *
+   * The restoration table of the decorated-session suite above reads both settings back after two
+   * refusals — `namespace_changed_or_unready` and `source_not_current` — and two page-reader
+   * results. The cases of THIS suite that return `not_due` and `enqueued` show only that one
+   * assignment follows, on a script that does not model the settings. Nothing produced
+   * `already_pending` from the preparer at all. This table is the rest: every other result and
+   * reason a LOCATED entry can end in, each reached the way the specification says it is reached.
+   *
+   * HOW EACH ROW IS REACHED. Not by a hardcoded return: the real exported preparer runs, through the
+   * real gate, selection and enqueue helpers, against this suite's scripted answers, and ONE answer
+   * is changed — the stored fact that decides that result. Each row states the exact result AND the
+   * data statements that reached the executor, so a row that ended somewhere else fails.
+   *
+   * THE SETTINGS are modelled by a thin layer over the scripted executor: it applies each
+   * transaction-local `set_config` to its own two values and answers a `pg_settings` read from them.
+   * The originals are 30,000 ms and 1,500 ms — neither is anything the preparer applies. The
+   * read-back is a statement on the caller's own session AFTER the result, answered by the model.
+   *
+   * WHAT THIS IS NOT. It is a model, not a server and not a connection: the read-back on a real
+   * connection, and everything about a real transaction, is the KR-12 packet of
+   * `test/datamechanics/slack-known-root-requeue.datamechanics.test.ts`.
+   */
+  type ModelledTimeouts = { statement_timeout: number; lock_timeout: number };
+
+  /** `inner`, with the two timeout settings modelled in front of it. Every other statement is `inner`'s. */
+  function modelledTimeouts(inner: TransactionSession, original: ModelledTimeouts) {
+    const effective: ModelledTimeouts = { ...original };
+    /** Both settings as they were when each data statement was dispatched. */
+    const underEachDataStatement: ModelledTimeouts[] = [];
+    const executeSql = (async (text: string, params: unknown[] = []) => {
+      const flat = text.replace(/\s+/g, " ");
+      if (/\bpg_settings\b/.test(flat)) {
+        const rows = [
+          { name: "statement_timeout", setting: String(effective.statement_timeout) },
+          { name: "lock_timeout", setting: String(effective.lock_timeout) },
+        ];
+        return { rows, rowCount: rows.length };
+      }
+      if (/set_config\(/.test(flat)) {
+        // Only a TRANSACTION-LOCAL assignment of whole milliseconds is modelled. Anything else is not
+        // quietly ignored: the model refuses it.
+        const assignments = [...flat.matchAll(/set_config\(\s*'(statement_timeout|lock_timeout)'\s*,\s*\$(\d+)\s*,\s*true\s*\)/g)];
+        if (assignments.length === 0) throw new Error("fixture: the settings model was sent an assignment it does not model");
+        for (const [, name, position] of assignments) {
+          const value = params[Number(position) - 1];
+          if (typeof value !== "string" || !/^[0-9]+(ms)?$/.test(value)) throw new Error("fixture: the settings model was sent a value that is not whole milliseconds");
+          effective[name as keyof ModelledTimeouts] = Number.parseInt(value, 10);
+        }
+        return inner.executeSql(text, params);
+      }
+      underEachDataStatement.push({ ...effective });
+      return inner.executeSql(text, params);
+    }) as SqlExecutor;
+    const session = {
+      get db(): never {
+        throw new Error("fixture: the caller's own db client was used");
+      },
+      executeSql,
+      optionalAudit: async (): Promise<never> => {
+        throw new Error("fixture: the caller's own audit helper was used");
+      },
+    } as unknown as TransactionSession;
+    return { session, underEachDataStatement };
+  }
+
+  /** Every data statement of a preparation that is enqueued, in order. */
+  const TO_THE_ENQUEUE = [...TO_THE_DUE_READ, "enqueue insert"];
+  const through = (stage: string): string[] => TO_THE_ENQUEUE.slice(0, TO_THE_ENQUEUE.indexOf(stage) + 1);
+  /** The usual answer, with the named stored values of its row changed and everything else as it was. */
+  const altered = (over: Record<string, unknown>) => (usual: () => unknown[]): unknown[] =>
+    usual().map((row) => ({ ...(row as Record<string, unknown>), ...over }));
+
+  const NORMAL_RETURNS: [name: string, overrides: () => AnswerOverrides, expected: SlackKnownRootPreparationResult, dataStatements: string[]][] = [
+    ["refused, binding_changed — the binding row is not there",
+      () => ({ "binding row lock": () => [] }), { outcome: "refused", reason: "binding_changed" }, through("binding row lock")],
+    ["refused, channel_not_public — the stored proof says the channel is private",
+      () => ({ "scoped channel row lock": altered({ public_state: "private" }) }), { outcome: "refused", reason: "channel_not_public" }, through("scoped channel row lock")],
+    ["already_pending on the EARLY path — the plain queue read finds a row",
+      () => ({ "plain queue read": () => [{ pending: 1 }] }), { outcome: "already_pending" }, through("plain queue read")],
+    ["unattested, item_missing — the item lock returns no row",
+      () => ({ "item lock": () => [] }), { outcome: "unattested", reason: "item_missing" }, through("item lock")],
+    ["unattested, canonical_mismatch — the locked item is of another kind",
+      () => ({ "item lock": altered({ kind: "note" }) }), { outcome: "unattested", reason: "canonical_mismatch" }, through("slack project read")],
+    ["unattested, invalid_metadata of a LOCATED entry — the locked item stores no workspace id",
+      () => ({ "item lock": altered({ workspace_id: null }) }), { outcome: "unattested", reason: "invalid_metadata" }, through("slack project read")],
+    ["unattested, missing_root_witness — no live root witness row",
+      () => ({ "root witness": () => [] }), { outcome: "unattested", reason: "missing_root_witness" }, through("root witness")],
+    ["unattested, contradictory_ledger — the item is bound to another thread as well",
+      () => ({ "ledger contradictions": altered({ item_bound_elsewhere: true }) }), { outcome: "unattested", reason: "contradictory_ledger" }, through("ledger contradictions")],
+    ["refused, scoped_path_conflict — another project owns the scoped path",
+      () => ({ "path conflicts": altered({ scoped_conflict: true }) }), { outcome: "refused", reason: "scoped_path_conflict" }, through("path conflicts")],
+    ["refused, legacy_path_conflict — an item exists at the legacy path",
+      () => ({ "path conflicts": altered({ legacy_conflict: true }) }), { outcome: "refused", reason: "legacy_path_conflict" }, through("path conflicts")],
+    ["not_due — the due read says the root is not due",
+      () => ({ "due read": () => [{ is_due: false, due_epoch_ms: null }] }), { outcome: "not_due" }, through("due read")],
+    ["enqueued — nothing is changed",
+      () => ({}), { outcome: "enqueued" }, TO_THE_ENQUEUE],
+    ["already_pending on the CONFLICT path — the enqueue's insert conflicts, and its own reread finds the row",
+      () => {
+        // The real enqueue helper inserts, is told nothing was inserted, and rereads the conflicting
+        // row. The row it is given is the usual stored row, for the scope and due it tried to insert.
+        // The script recognizes that reread under the plain queue read's name: it reads the same table.
+        let conflicting: unknown[] = [];
+        return {
+          "enqueue insert": (usual) => {
+            conflicting = usual();
+            return [];
+          },
+          "plain queue read": (usual, flat) => (/\b1 as pending\b/.test(flat) ? usual() : conflicting),
+        };
+      }, { outcome: "already_pending" }, [...TO_THE_ENQUEUE, "plain queue read"]],
+  ];
+
+  it.each(NORMAL_RETURNS)("restores both original timeout settings before this normal result resolves: %s", async (name, overrides, expected, dataStatements) => {
+    vi.stubEnv("SLACK_BOT_TOKEN", TOKEN);
+    const original: ModelledTimeouts = { statement_timeout: 30_000, lock_timeout: 1_500 };
+    const scripted = scriptedPreparation([{ is_due: true, due_epoch_ms: "1718903600123" }], () => undefined, overrides());
+    const modelled = modelledTimeouts(scripted.session, original);
+
+    const result = await prepareSlackKnownRootRequeue(modelled.session, { teamId: TEAM, entry: ENTRY }, execution());
+    // THE READ-BACK: the next statement on the caller's own session after the result, before anything else.
+    const readBack = await modelled.session.executeSql<{ name: string; setting: string }>(
+      "select name, setting from pg_settings where name in ('statement_timeout', 'lock_timeout')"
+    );
+
+    // FIXTURE VALIDITY first: this exact result, reached by exactly these data statements.
+    expect({ result, dataStatements: scripted.data() }, `${name}: fixture: the real preparer returned exactly this result, through exactly these data statements`)
+      .toEqual({ result: expected, dataStatements });
+    // While it ran, each setting ON ITS OWN was something other than its original for every data
+    // statement: the restoration is not a no-op, and putting back one cannot pass for both.
+    expect({
+      data_statements_run_under_the_model: modelled.underEachDataStatement.length,
+      statement_timeout_was_not_its_original_for_any_data_statement: modelled.underEachDataStatement.every((under) => under.statement_timeout !== original.statement_timeout),
+      lock_timeout_was_not_its_original_for_any_data_statement: modelled.underEachDataStatement.every((under) => under.lock_timeout !== original.lock_timeout),
+    }, `${name}: fixture: while the preparation ran, each timeout setting on its own was not its original`).toEqual({
+      data_statements_run_under_the_model: dataStatements.length,
+      statement_timeout_was_not_its_original_for_any_data_statement: true,
+      lock_timeout_was_not_its_original_for_any_data_statement: true,
+    });
+    expect(Object.fromEntries(readBack.rows.map((row) => [row.name, Number(row.setting)])),
+      `${name}: a read-back on the caller's own session after the normal result finds the original statement_timeout and the original lock_timeout`)
+      .toEqual(original);
+    expect(scripted.sent().slice(-1), `${name}: the restoring assignment is the last thing the preparation sent`).toEqual(["settings assignment"]);
+  });
+
+  it("accounts for every exported result and reason: read back in the table above, read back in the decorated-session table, or reached without a single statement", () => {
+    const expectedResults = NORMAL_RETURNS.map(([, , expected]) => expected);
+    // CROSS-REFERENCES, written out. Read back by "restores both original settings before a normal
+    // result resolves" in the decorated-session suite:
+    const refusedReadBackThere = ["namespace_changed_or_unready", "source_not_current"];
+    // Sent no statement at all, so nothing is set and nothing restored — "reports an entry
+    // enumeration could not locate (%s) as unattested with that reason, and touches nothing":
+    const unlocatedWithoutAStatement = ["not_slack", "invalid_metadata", "missing_channel_binding", "missing_namespace_pin"];
+
+    const refusedHere = expectedResults.flatMap((expected) => (expected.outcome === "refused" ? [expected.reason] : []));
+    const unattestedHere = expectedResults.flatMap((expected) => (expected.outcome === "unattested" ? [expected.reason] : []));
+    expect([...refusedHere, ...refusedReadBackThere].sort(), "every refused reason, each exactly once").toEqual([...SLACK_KNOWN_ROOT_REFUSED_REASONS].sort());
+    // `invalid_metadata` is both: of an entry enumeration could not locate, and of a located one.
+    expect([...new Set([...unattestedHere, ...unlocatedWithoutAStatement])].sort(), "every unattested reason").toEqual([...SLACK_KNOWN_ROOT_UNATTESTED_REASONS].sort());
+    expect(unattestedHere, "the located form of invalid_metadata is one of the rows above").toContain("invalid_metadata");
+    expect(expectedResults.flatMap((expected) => (expected.outcome === "refused" || expected.outcome === "unattested" ? [] : [expected.outcome])).sort(),
+      "not_due, enqueued, and already_pending twice — once on each of its two paths").toEqual(["already_pending", "already_pending", "enqueued", "not_due"]);
   });
 });
