@@ -1261,6 +1261,203 @@ describe("known-root decorated session — statement order, refreshed timeouts, 
       expect(rejecting.other, `M9: ${subject}: the executor rejected its call ${position} of ${total}: neither the caller's db client nor its audit helper was asked for`).toEqual([]);
     }
   });
+
+  // ── KR-16 (§6): captured inputs, stored projections and session timeout settings ──
+
+  const KR16_ID_B = "0b000000-0000-4000-8000-00000000000b";
+  const KR16_ID_C = "0c000000-0000-4000-8000-00000000000c";
+  const KR16_UPPER = "0f000000-0000-4000-8000-00000000000f";
+
+  /**
+   * KR-16 — "Caller mutation after invocation cannot change captured inputs", for the PAGE READER.
+   * The read is HELD by the deferred barrier at its first statement — the settings read, before any
+   * data statement — and only then does the caller rewrite every field of its request and of the
+   * nested cursor, and replace the cursor. Every data statement must still carry the values the read
+   * was CALLED with, and the page — entries and continuation — must be built from them. Limit: a
+   * scripted session; what the server does with those parameters is the real-PostgreSQL suites'.
+   */
+  it("KR-16: a continuation page keeps the request and cursor it was CALLED with, whatever the caller does to them while the read is pending", async () => {
+    const callerCursor: Record<string, unknown> = { version: 1, teamId: TEAM, upperItemId: KR16_UPPER, afterItemId: ITEM, revisitAfterMs: REVISIT_MS };
+    const callerRequest: Record<string, unknown> = { teamId: TEAM, pageSize: 1, revisitAfterMs: REVISIT_MS, cursor: callerCursor };
+    const dataParams: unknown[][] = [];
+    const scripted = scriptedSession({
+      respond: (text, params) => {
+        dataParams.push([...params]);
+        // The continuation id read finds two ids (one examined, one lookahead); the locator read finds a non-Slack item.
+        return /\bunnest\b/i.test(text) ? [{ id: KR16_ID_B, is_slack: false }] : [{ id: KR16_ID_B }, { id: KR16_ID_C }];
+      },
+    });
+    const paused = pausedAtFirstStatement(scripted.session);
+    const pending = readSlackKnownRootItemPage(paused.session, callerRequest as unknown as SlackKnownRootPageRequest, execution());
+    await paused.reachedOrSettled(pending);
+
+    // THE CALLER'S MUTATION, while the read is genuinely pending.
+    Object.assign(callerCursor, {
+      version: 2, teamId: OTHER_TEAM, upperItemId: "ffffffff-ffff-4fff-bfff-ffffffffffff",
+      afterItemId: "00000000-0000-4000-8000-000000000001", revisitAfterMs: 60_000,
+    });
+    Object.assign(callerRequest, { teamId: OTHER_TEAM, pageSize: 100, revisitAfterMs: 86_400_000, cursor: { ...callerCursor } });
+    paused.release();
+    const page = await pending;
+
+    expect(dataParams, "KR-16: every data statement carried the CALLED team, cursor position, bound and page size").toEqual([
+      [TEAM, ITEM, KR16_UPPER, 2],
+      [TEAM, [KR16_ID_B]],
+    ]);
+    expect(page, "KR-16: the page and its continuation were built from the CALLED request and cursor").toEqual({
+      entries: [{ teamId: TEAM, itemId: KR16_ID_B, revisitAfterMs: REVISIT_MS, unlocated: "not_slack" }],
+      nextCursor: { version: 1, teamId: TEAM, upperItemId: KR16_UPPER, afterItemId: KR16_ID_B, revisitAfterMs: REVISIT_MS },
+      exhausted: false, examined: 1,
+    });
+    expectRestored(scripted);
+  });
+
+  /**
+   * KR-16, §6 — STORED PROJECTIONS read by the page reader: "revision as a nonnegative safe integer,
+   * losslessly parsed from stored decimal text", and provider ids by JSON string type and byte bound.
+   * The locator read's row is scripted, with ONE stored value changed per row. An accepted value
+   * arrives in the entry EXACTLY — the largest safe revision included; a refused one makes the entry
+   * unlocated with its closed reason, never rounded, coerced or truncated, and never quoted.
+   * Limit: the SQL projection's own byte checks are the real-PostgreSQL suites'; this is the
+   * application side of the same contract.
+   */
+  const KR16_LOCATOR_ROW = {
+    id: ITEM, is_slack: true, workspace_id: "T0SOURCE1", channel_id: "C0KNOWN1", root_ts: "1718900000.000100",
+    binding_integration_id: INTEGRATION, binding_config_revision: REVISION, namespace_revision: "3",
+  };
+  const kr16Located = (over: Record<string, unknown> = {}) => ({
+    teamId: TEAM, itemId: ITEM, revisitAfterMs: REVISIT_MS,
+    locator: {
+      workspaceId: "T0SOURCE1", channelId: "C0KNOWN1", rootTs: "1718900000.000100",
+      integrationId: INTEGRATION, bindingConfigRevision: REVISION, namespaceRevision: 3, ...over,
+    },
+  });
+  const kr16Unlocated = (category: string) => ({ teamId: TEAM, itemId: ITEM, revisitAfterMs: REVISIT_MS, unlocated: category });
+
+  it.each<[string, Record<string, unknown>, unknown]>([
+    ["stored revision 0", { namespace_revision: "0" }, kr16Located({ namespaceRevision: 0 })],
+    ["the largest safe stored revision, exactly", { namespace_revision: "9007199254740991" }, kr16Located({ namespaceRevision: 9_007_199_254_740_991 })],
+    ["one past the largest safe stored revision", { namespace_revision: "9007199254740992" }, kr16Unlocated("missing_namespace_pin")],
+    ["a stored revision that would round to an even neighbour", { namespace_revision: "9007199254740993" }, kr16Unlocated("missing_namespace_pin")],
+    ["a stored revision with a leading zero", { namespace_revision: "03" }, kr16Unlocated("missing_namespace_pin")],
+    ["a negative stored revision", { namespace_revision: "-1" }, kr16Unlocated("missing_namespace_pin")],
+    ["a fractional stored revision", { namespace_revision: "3.0" }, kr16Unlocated("missing_namespace_pin")],
+    ["a stored revision in exponent form", { namespace_revision: "3e0" }, kr16Unlocated("missing_namespace_pin")],
+    ["a padded stored revision", { namespace_revision: " 3" }, kr16Unlocated("missing_namespace_pin")],
+    ["an empty stored revision", { namespace_revision: "" }, kr16Unlocated("missing_namespace_pin")],
+    ["a stored revision that is a number, not text", { namespace_revision: 3 }, kr16Unlocated("missing_namespace_pin")],
+    ["no stored revision", { namespace_revision: null }, kr16Unlocated("missing_namespace_pin")],
+    ["a stored revision carrying rejected text", { namespace_revision: `3${CANARY.metadata}` }, kr16Unlocated("missing_namespace_pin")],
+    ["a stored workspace id of exactly 256 bytes", { workspace_id: "T".repeat(256) }, kr16Located({ workspaceId: "T".repeat(256) })],
+    ["a stored workspace id of 257 bytes", { workspace_id: "T".repeat(257) }, kr16Unlocated("invalid_metadata")],
+    ["a stored workspace id that is not a string", { workspace_id: 7 }, kr16Unlocated("invalid_metadata")],
+    ["a stored workspace id carrying rejected text", { workspace_id: `T0 ${CANARY.metadata}` }, kr16Unlocated("invalid_metadata")],
+  ])("KR-16: reads %s from the stored projection losslessly, or not at all", async (label, over, expected) => {
+    const scripted = scriptedSession({
+      respond: (text) => (/\bunnest\b/i.test(text) ? [{ ...KR16_LOCATOR_ROW, ...over }] : [{ id: ITEM }]),
+    });
+    const page = await readSlackKnownRootItemPage(scripted.session, pageRequest, execution());
+    expect(page.entries, `KR-16: ${label}`).toEqual([expected]);
+    expectNoCanary(page, label);
+  });
+
+  /**
+   * KR-16, §6 — TIMEOUT VALUES: the session's own `statement_timeout` and `lock_timeout`, as the
+   * real parser reads them from `pg_settings`. That catalog's `setting` is the server-normalized
+   * value in the setting's own unit, whole milliseconds, as decimal text, so the parser accepts
+   * exactly that form and NO unit spelling: "30s", "30000ms" and "1min" are refused, not converted.
+   * 0 (disabled) and PostgreSQL's maximum, 2,147,483,647, are the exact boundaries.
+   *
+   * An accepted pair is applied (each data statement under a fresh cap) and restored EXACTLY, as the
+   * same text. A refused value, or a refused shape of the catalog answer, is a static error after
+   * the settings read and before anything else: no assignment and no data statement. It quotes
+   * nothing it read, and is reportable only as a closed category.
+   */
+  function kr16SettingsSession(settingsRows: unknown[]) {
+    const calls: { kind: "settings read" | "assignment" | "data"; params: unknown[] }[] = [];
+    const executeSql = (async (text: string, params: unknown[] = []) => {
+      if (/\bpg_settings\b/i.test(text)) {
+        calls.push({ kind: "settings read", params: [...params] });
+        return { rows: settingsRows, rowCount: settingsRows.length };
+      }
+      if (/set_config\s*\(/i.test(text)) {
+        calls.push({ kind: "assignment", params: [...params] });
+        return { rows: [{}], rowCount: 1 };
+      }
+      // Every data statement finds nothing: the page reader's upper-bound read ends on an empty team.
+      calls.push({ kind: "data", params: [...params] });
+      return { rows: [], rowCount: 0 };
+    }) as SqlExecutor;
+    const session = {
+      get db(): never {
+        throw new Error("fixture: the caller's own db client was used");
+      },
+      executeSql,
+      optionalAudit: async (): Promise<never> => {
+        throw new Error("fixture: the caller's own audit helper was used");
+      },
+    } as unknown as TransactionSession;
+    return { session, calls };
+  }
+  const kr16Settings = (statement: unknown, lock: unknown): unknown[] => [
+    { name: "statement_timeout", setting: statement }, { name: "lock_timeout", setting: lock },
+  ];
+
+  it.each<[string, string, string, string]>([
+    ["both disabled", "0", "0", "250"],
+    ["both at PostgreSQL's maximum", "2147483647", "2147483647", "250"],
+    ["ordinary values", "30000", "1500", "250"],
+    ["both at one millisecond", "1", "1", "1"],
+  ])("KR-16: accepts session timeout settings %s, applies a cap and restores them as the exact same text", async (label, statement, lock, appliedLock) => {
+    const { session, calls } = kr16SettingsSession(kr16Settings(statement, lock));
+    const page = await readSlackKnownRootItemPage(session, pageRequest, execution());
+    expect(page, `KR-16: ${label}: the read completed`).toEqual({ entries: [], nextCursor: null, exhausted: true, examined: 0 });
+    expect(calls.map((call) => call.kind), `KR-16: ${label}: read, apply, one data statement, restore`).toEqual(["settings read", "assignment", "data", "assignment"]);
+    const applied = calls[1].params;
+    const appliedStatement = Number(applied[0]);
+    expect({
+      appliedLock: applied[1],
+      appliedStatementIsACap: Number.isSafeInteger(appliedStatement) && appliedStatement >= 1 && appliedStatement <= 2_000 &&
+        (statement === "0" || appliedStatement <= Number(statement)),
+      restored: calls[3].params,
+    }, `KR-16: ${label}: the cap is applied, and the originals are restored losslessly`).toEqual({
+      appliedLock, appliedStatementIsACap: true, restored: [statement, lock],
+    });
+  });
+
+  const UNREADABLE_SETTING = "slack known-root: a session timeout setting is unreadable";
+  const UNREADABLE_SETTINGS = "slack known-root: the session timeout settings are unreadable";
+  it.each<[string, unknown[], string]>([
+    ["a negative statement_timeout", kr16Settings("-1", "0"), UNREADABLE_SETTING],
+    ["a fractional statement_timeout", kr16Settings("1.5", "0"), UNREADABLE_SETTING],
+    ["a statement_timeout with a leading zero", kr16Settings("030000", "0"), UNREADABLE_SETTING],
+    ["a statement_timeout spelled in seconds", kr16Settings("30s", "0"), UNREADABLE_SETTING],
+    ["a statement_timeout spelled with its unit", kr16Settings("30000ms", "0"), UNREADABLE_SETTING],
+    ["a statement_timeout spelled in minutes", kr16Settings("1min", "0"), UNREADABLE_SETTING],
+    ["an empty statement_timeout", kr16Settings("", "0"), UNREADABLE_SETTING],
+    ["a padded statement_timeout", kr16Settings(" 30000", "0"), UNREADABLE_SETTING],
+    ["a statement_timeout one past PostgreSQL's maximum", kr16Settings("2147483648", "0"), UNREADABLE_SETTING],
+    ["an unsafe statement_timeout", kr16Settings("9007199254740993", "0"), UNREADABLE_SETTING],
+    ["a statement_timeout that is a number, not text", kr16Settings(30_000, "0"), UNREADABLE_SETTING],
+    ["no statement_timeout value", kr16Settings(null, "0"), UNREADABLE_SETTING],
+    ["a statement_timeout carrying rejected text", kr16Settings(`30000${CANARY.sql}`, "0"), UNREADABLE_SETTING],
+    ["a lock_timeout spelled with its unit", kr16Settings("30000", "250ms"), UNREADABLE_SETTING],
+    ["a negative lock_timeout", kr16Settings("30000", "-1"), UNREADABLE_SETTING],
+    ["a lock_timeout one past PostgreSQL's maximum", kr16Settings("30000", "2147483648"), UNREADABLE_SETTING],
+    ["no lock_timeout row", [{ name: "statement_timeout", setting: "30000" }], UNREADABLE_SETTINGS],
+    ["the statement_timeout row twice", [...kr16Settings("30000", "0"), { name: "statement_timeout", setting: "30000" }], UNREADABLE_SETTINGS],
+  ])("KR-16: refuses %s with a static error after the settings read and before anything else", async (label, rows, message) => {
+    const { session, calls } = kr16SettingsSession(rows);
+    const error = await rejection(() => readSlackKnownRootItemPage(session, pageRequest, execution()));
+    expect({
+      anError: error instanceof Error, notACallerContractError: !(error instanceof SlackKnownRootValidationError),
+      message: (error as Error | undefined)?.message, category: classifySlackKnownRootPreparationFailure(error),
+      calls: calls.map((call) => call.kind),
+    }, `KR-16: ${label}`).toEqual({
+      anError: true, notACallerContractError: true, message, category: "dependency_failure", calls: ["settings read"],
+    });
+    expectNoCanary(error, label);
+  });
 });
 
 // ── §8.1: the pure failure classifier ────────────────────────────────────────
@@ -2113,5 +2310,62 @@ describe("known-root due-output conversion contract", () => {
     expect(unattestedHere, "the located form of invalid_metadata is one of the rows above").toContain("invalid_metadata");
     expect(expectedResults.flatMap((expected) => (expected.outcome === "refused" || expected.outcome === "unattested" ? [] : [expected.outcome])).sort(),
       "not_due, enqueued, and already_pending twice — once on each of its two paths").toEqual(["already_pending", "already_pending", "enqueued", "not_due"]);
+  });
+
+  /**
+   * KR-16 — "Caller mutation after invocation cannot change captured inputs", for the PREPARER. The
+   * preparation is HELD by the deferred barrier at its first statement — the settings read, before
+   * any data statement — and only then does the caller rewrite its input, its entry and every field
+   * of the nested locator, and replace the entry. The real preparer then runs this suite's whole
+   * scripted path. It must still be ENQUEUED, every statement must carry only the CALLED values, and
+   * the enqueue must be for the CALLED scope. Any mutated value that reached a statement would also
+   * change what the scripted answers allow: a mutated revision or channel is a refusal, not
+   * `enqueued`. Limit: a scripted executor, not a server.
+   */
+  it("KR-16: a preparation keeps the team, entry and locator it was CALLED with, whatever the caller does to them while it is pending", async () => {
+    vi.stubEnv("SLACK_BOT_TOKEN", TOKEN);
+    const scripted = scriptedPreparation([{ is_due: true, due_epoch_ms: "1718903600123" }], () => undefined);
+    const sent: { flat: string; params: unknown[] }[] = [];
+    const recorder = {
+      get db(): never {
+        throw new Error("fixture: the caller's own db client was used");
+      },
+      executeSql: (async (text: string, params: unknown[] = []) => {
+        sent.push({ flat: text.replace(/\s+/g, " "), params: [...params] });
+        return scripted.session.executeSql(text, params);
+      }) as SqlExecutor,
+      optionalAudit: async (): Promise<never> => {
+        throw new Error("fixture: the caller's own audit helper was used");
+      },
+    } as unknown as TransactionSession;
+    const paused = pausedAtFirstStatement(recorder);
+
+    const callerLocator: Record<string, unknown> = { ...ENTRY.locator };
+    const callerEntry: Record<string, unknown> = { teamId: ENTRY.teamId, itemId: ENTRY.itemId, revisitAfterMs: ENTRY.revisitAfterMs, locator: callerLocator };
+    const callerInput: Record<string, unknown> = { teamId: TEAM, entry: callerEntry };
+    const pending = prepareSlackKnownRootRequeue(paused.session, callerInput as never, execution());
+    await paused.reachedOrSettled(pending);
+
+    // THE CALLER'S MUTATION, while the preparation is genuinely pending. Each value is distinct.
+    const MUTATED = {
+      team: OTHER_TEAM, item: "2f000000-0000-4000-8000-00000000002f", workspace: "TMUTATEDKR16", channel: "CMUTATEDKR16",
+      root: "1700000000.000216", integration: "1f000000-0000-4000-8000-00000000001f", revision: "d".repeat(64),
+    };
+    Object.assign(callerLocator, {
+      workspaceId: MUTATED.workspace, channelId: MUTATED.channel, rootTs: MUTATED.root,
+      integrationId: MUTATED.integration, bindingConfigRevision: MUTATED.revision, namespaceRevision: 99,
+    });
+    Object.assign(callerEntry, { teamId: MUTATED.team, itemId: MUTATED.item, revisitAfterMs: 86_400_000 });
+    Object.assign(callerInput, { teamId: MUTATED.team, entry: { ...callerEntry } });
+    paused.release();
+    const result = await pending;
+
+    expect({ result, data: scripted.data(), enqueueScope: scripted.enqueueInserts[0]?.slice(0, 4) },
+      "KR-16: the preparation ran its whole path on the CALLED values and enqueued the CALLED scope").toEqual({
+      result: { outcome: "enqueued" }, data: [...TO_THE_DUE_READ, "enqueue insert"], enqueueScope: [TEAM, WORKSPACE, CHANNEL, ROOT],
+    });
+    const everyParameter = JSON.stringify(sent.map((call) => call.params));
+    expect(Object.values(MUTATED).filter((value) => everyParameter.includes(value)), "KR-16: no mutated value reached any statement").toEqual([]);
+    expect(sent.find((call) => /\bdue_epoch_ms\b/.test(call.flat))?.params.slice(4), "KR-16: the due read used the CALLED item and revisit policy").toEqual([ITEM, REVISIT_MS]);
   });
 });
