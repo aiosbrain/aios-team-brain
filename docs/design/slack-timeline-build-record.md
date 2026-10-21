@@ -3219,11 +3219,11 @@ Every subsection above stays true as of when it was written, and none is rewritt
 **Unit evidence**, in `test/slack-known-root-requeue.test.ts`, as the coordinator summarizes it:
 
 - **Captured inputs.** Promise barriers prove that a pending invocation has captured its request, cursor, entry and locator inputs before the caller mutates them. Two moments are covered: a mutation immediately after the invocation, before anything is awaited, and a mutation at the first-statement barrier. Stored projections and gate revisions make any lazy read observable.
-- **Exact validation boundaries.** These cover provider, team, item and channel byte lengths, caller and stored timestamps, stored revisions and timeout settings.
+- **Exact validation boundaries.** These cover provider-id byte lengths (workspace and channel) and timestamp byte lengths, both caller-supplied and stored; namespace and configuration revisions, the stored namespace revision parsed losslessly; and timeout settings. Team and item ids are held to UUID syntax, not to a byte bound.
   - Exact legal bounds pass.
   - Wrong types, and malformed, oversize or unsafe values, fail closed, as do duplicate or missing settings.
-  - A fixed-clock control proves that exactly 1,000 ms is an allowed allowance, while 999 ms and 5,001 ms are refused.
-- **Refusals.** Validation refusals send zero statements where the contract requires it. They emit no telemetry, leak no canary into reportable outputs, and neither enqueue nor stage work.
+  - A new fixed-clock control proves that exactly 1,000 ms is an allowed allowance, with a deadline exactly 1,000 ms after creation. The refusal of 999 ms and of 5,001 ms rests on the existing refusal rows, not on that control.
+- **Refusals.** Validation refusals send zero statements where the contract requires it. They leak no canary into reportable outputs, and neither enqueue nor stage work. The unit cases do not capture console telemetry; the exact-empty telemetry evidence is the real-PostgreSQL case below.
 
 **Real-PostgreSQL evidence**, in `test/datamechanics/slack-known-root-requeue.datamechanics.test.ts`, as the coordinator summarizes it:
 
@@ -3240,7 +3240,7 @@ Every subsection above stays true as of when it was written, and none is rewritt
   - the callback throws its own error;
   - the transaction engine replaces it with its `TransactionExecutionError`.
 
-  The replacement carries five canaries in its PRIVATE SQL and cause graph. It classifies as `database_failure`, after one attempt, with `unknownCommit: false`. The telemetry, and every reportable receipt, tally and record output, contain none of the canaries. The rollback leaves no queue or staging row. **The private exception itself is not scrubbed, and is not claimed to be.**
+  The replacement carries five canaries in its PRIVATE SQL and cause graph. It classifies as `database_failure`, after one attempt, with `unknownCommit: false`. The console telemetry captured from the new validation exceptions through the classification, receipt, tally and reported record is exactly empty. That telemetry, and every reportable receipt, tally and record output, contain none of the canaries. The rollback leaves no queue or staging row. **The private exception itself is not scrubbed, and is not claimed to be.**
 
 **Reviews, as the coordinator states them.**
 
@@ -3256,7 +3256,7 @@ Every subsection above stays true as of when it was written, and none is rewritt
   **All were accepted, and fixed by the same writer.**
 - **Rereview session `ac9acf9d-549f-4153-8353-39dbb88df6de`.** A fresh independent Opus 5.5 high rereview, which completed with a successful terminal result on the exact `d10f3738`. It read the complete frozen 823-line diff and the dependencies. Its verdict: **PASS / READY**, with no blocker, HIGH or MEDIUM. Its optional LOW stand as limitations:
   1. The real-PostgreSQL `source` 256-byte bound is not varied, because the public outcome cannot distinguish it.
-  2. The restore's row-count check is cosmetic, given the final exact-frontmatter verification.
+  2. The fixture's `restore()` does not check its row count. The gap is cosmetic, because the final exact-frontmatter verification would catch a restore that failed.
   3. The private-error identity checks are redundant after the exact empty-telemetry assertion.
 - **Coverage artifact.** The rereview's artifact records 15 successful numbered Read results. They include the complete diff, the complete page, requeue and transaction-engine source, and the relevant specification and test ranges. This is visibility evidence, not proof by itself.
 
