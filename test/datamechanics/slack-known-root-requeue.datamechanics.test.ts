@@ -28,6 +28,7 @@ import { lockSlackSelection, resolveEnvSlackToken, slackBindingRef } from "@/lib
 import { discoverSlackSource } from "@/lib/ingest/slack-source-discovery";
 import {
   checkpointSlackThread,
+  claimDueSlackThread,
   claimSlackThread,
   enqueueSlackThread,
   releaseSlackThreadForRetry,
@@ -8599,5 +8600,307 @@ describe("KR-10 contention and continuation together (real Postgres)", () => {
     ), `${label}: the holder's backend holds no transaction or items lock any more`).toEqual([]);
     expect(await pageOfOne(cursor), `${label}: the same cursor still yields the same next page`).toEqual(EXPECTED_NEXT_PAGE);
     await kr12ExpectCommitsAfterwards(label, teamId, entry, exactDue);
+  });
+});
+
+/**
+ * KR-15 — two HAZARDS, characterized and not solved (`docs/design/slack-known-root-requeue-spec.md`
+ * §9, §10, §11 KR-15). Neither case implements fairness, a lane, provenance, deletion-safe
+ * publication, activation or any provider work, and neither is fairness, capacity or deletion-safety
+ * acceptance. KR-15's traversal cost, lost-cursor replay and failures-awaiting-later-sweeps rest on
+ * their accepted evidence elsewhere in this file, unchanged.
+ *
+ * FIFO DELAY (§9). 601 days-overdue pending rows stand for a cohort of completed roots: they are
+ * fixture DML, labeled, with distinct due instants. One FRESH root is enqueued through the real
+ * enqueue helper, due now, BEFORE the cohort is written, and with a root timestamp BELOW every cohort
+ * root, so that neither insertion order nor root order would put it last. The order is then decided
+ * by the product's only due-work selector, `claimDueSlackThread`, called until nothing more is due,
+ * all inside ONE transaction that is rolled back: every claim is real, and no row is left changed.
+ * The arithmetic is §9's literal lower bound — one request per root ahead of it, one request per
+ * minute — and models no multi-page thread, retry or competing work.
+ *
+ * ORPHAN AND RECREATION RISK (§10). The real preparation runs inside the actual
+ * `runContextTransaction` and is HELD by a test-only executor wrapper right after its item row lock
+ * has returned and before its enqueue: the §7.2 controlled clock excludes the hold from its budget.
+ * Another transaction issues a DELETE of that item row and is SEEN waiting in PostgreSQL, behind the
+ * preparation's backend, for the preparation's transaction. Only then is the preparation released.
+ *
+ * The DELETE is a fixture statement on the item row. The database's own foreign keys decide what it
+ * takes with it; no product deletion entrypoint is called.
+ *
+ * Before anything is recreated, an ordinary preparation of the old entry reports the orphan as
+ * `already_pending` and changes nothing: the primitive cannot tell it from genuine pending work.
+ *
+ * RECREATION is done by the REAL PUBLICATION PATH, and it does recreate the deleted item. As a side
+ * fact, ordinary `ingestItem` refuses the canonical scoped path without the internal publication
+ * option, and that refusal is asserted. Then the existing bounded publication fixture,
+ * `lifecycleRestaged`, takes the orphan exactly as a hydrator would: the real enqueue meets the
+ * orphan, the real claim takes it, and a complete snapshot is staged and checkpointed. Its `publish`
+ * is the real `ingestItem` with an issued publication option. It creates a NEW item at the deleted
+ * item's canonical path, rebinds the root's ledger rows to it, and consumes the orphan queue row and
+ * its staging. Nothing in the orphan row marked the old item as deliberately deleted, so nothing
+ * stopped this. No provider request is made: the snapshot is fixture data, and the fake provider's
+ * call counts are asserted unchanged. The inactive primitive itself recreates nothing; it only left
+ * the row that publication then consumed.
+ */
+describe("KR-15 FIFO delay and orphan risk — characterizations, not fairness or deletion safety (real Postgres)", () => {
+  const COHORT = 601;
+  /** The root of cohort row n, 1 to 601: DESCENDING as n rises, while its due instant ASCENDS. */
+  const cohortRoot = (n: number): string => `${1_719_000_000 + (COHORT + 1 - n)}.000100`;
+  /** Below every cohort root. */
+  const FRESH_ROOT = "1700000000.000100";
+  const ROLL_BACK = new Error("aio-1170 fixture: roll the claim observation back");
+
+  it("KR-15 FIFO delay: a fresh root waits behind all 601 days-overdue roots, a finite 601-minute lower bound at one request per minute", async () => {
+    const label = "KR-15 FIFO delay";
+    const f = await publishOldRoot();
+    const teamId = f.seed.teamId;
+    expect((await stored(teamId)).allQueue, `${label}: fixture: publication left no pending work`).toEqual([]);
+
+    // THE FRESH ROOT, first: the real enqueue helper, due at the database's clock.
+    const fresh = await tx((s) => enqueueSlackThread(s, { teamId, workspaceId: WORKSPACE, channelId: CHANNEL, rootTs: FRESH_ROOT }));
+    expect(fresh.inserted, `${label}: fixture: the fresh root was enqueued`).toBe(true);
+
+    // THE COHORT: labeled fixture DML, 601 pending rows due three days ago and one second apart.
+    const cohort = await (await rawSql()).query(
+      `insert into slack_sync_threads (team_id, workspace_id, channel_id, root_ts, due_at)
+       select $1::uuid, $2, $3, (1719000000 + (${COHORT + 1} - n))::text || '.000100',
+              clock_timestamp() - interval '3 days' + n * interval '1 second'
+         from generate_series(1, ${COHORT}) as n`, [teamId, WORKSPACE, CHANNEL]
+    );
+    expect(cohort.rowCount, `${label}: fixture: exactly ${COHORT} cohort rows were written`).toBe(COHORT);
+    const [shape] = await query(
+      `select count(*) filter (where root_ts <> $2)::int as cohort_rows,
+              count(distinct due_at) filter (where root_ts <> $2)::int as distinct_cohort_dues,
+              bool_and(clock_timestamp() - due_at > interval '2 days') filter (where root_ts <> $2) as every_cohort_row_is_days_overdue,
+              bool_and(status = 'queued' and attempts = 0) as all_queued_never_attempted,
+              max(due_at) filter (where root_ts <> $2) < min(due_at) filter (where root_ts = $2) as fresh_is_due_after_every_cohort_row,
+              min(due_at) filter (where root_ts = $2) <= clock_timestamp() as fresh_is_due,
+              $2 < min(root_ts) filter (where root_ts <> $2) as fresh_root_sorts_below_every_cohort_root
+         from slack_sync_threads where team_id = $1`, [teamId, FRESH_ROOT]
+    );
+    expect(shape, `${label}: fixture: 601 distinct days-overdue rows, and one fresh row that is due, later than all of them, with the lowest root`).toEqual({
+      cohort_rows: COHORT, distinct_cohort_dues: COHORT, every_cohort_row_is_days_overdue: true, all_queued_never_attempted: true,
+      fresh_is_due_after_every_cohort_row: true, fresh_is_due: true, fresh_root_sorts_below_every_cohort_root: true,
+    });
+    const rowsBefore = await lifecycleQueueRowsExactly(teamId);
+
+    // ── THE PRODUCT'S SELECTOR decides the order: every claim real, one transaction, rolled back. ──
+    const claimedInOrder: string[] = [];
+    let afterTheLast: unknown = "not asked";
+    const ended = await lifecycleTracked(tx(async (s) => {
+      for (let turn = 0; turn <= COHORT; turn++) {
+        const claim = await claimDueSlackThread(s, teamId, { leaseMs: 900_000, workspaceId: WORKSPACE });
+        if (!claim) break;
+        claimedInOrder.push(claim.scope.rootTs);
+      }
+      afterTheLast = await claimDueSlackThread(s, teamId, { leaseMs: 900_000, workspaceId: WORKSPACE });
+      throw ROLL_BACK;
+    })).ended;
+    expect(ended.state === "rejected" && ended.error === ROLL_BACK, `${label}: fixture: the observation's transaction was rolled back by the test`).toBe(true);
+
+    const expectedOrder = [...Array.from({ length: COHORT }, (_, index) => cohortRoot(index + 1)), FRESH_ROOT];
+    expect(claimedInOrder, `${label}: the selector took the whole old cohort, oldest due first, and the fresh root only after all 601`).toEqual(expectedOrder);
+    expect(afterTheLast, `${label}: after the fresh root nothing more was due: the cohort is finite`).toBeNull();
+
+    // ── THE LITERAL CHARACTERIZATION: a finite delay, a lower bound, and nothing more. ──
+    const turnsAhead = claimedInOrder.indexOf(FRESH_ROOT);
+    const ONE_REQUEST_PER_MINUTE_MS = 60_000;
+    const lowerBoundMs = turnsAhead * ONE_REQUEST_PER_MINUTE_MS;
+    expect({
+      turnsAhead, lowerBoundMs,
+      hoursAndMinutes: [Math.floor(lowerBoundMs / 3_600_000), (lowerBoundMs % 3_600_000) / 60_000],
+    }, `${label}: one request per old root at one request per minute delays the fresh root at least 601 minutes, 10 hours 1 minute — finite, and not starvation: multi-page threads, retries and competing work are not modelled`).toEqual({
+      turnsAhead: 601, lowerBoundMs: 36_060_000, hoursAndMinutes: [10, 1],
+    });
+    expect(await lifecycleQueueRowsExactly(teamId), `${label}: every row is exactly as it was: due instants, state, attempts and leases`).toEqual(rowsBefore);
+  });
+
+  it("KR-15 orphan: a deletion waiting behind preparation's item lock commits after the enqueue and leaves the queue row, which the real publication path then consumes, recreating the deleted item at its path", async () => {
+    const label = "KR-15 orphan";
+    const { f, teamId, entry, exactDue } = await lifecycleAgedRoot(label, KR12_REVISIT);
+    const scopedPath = scopedSlackItemPath(WORKSPACE, CHANNEL, OLD_ROOT);
+    const ledgerOfTheRoot = (): Promise<Row[]> => query(
+      `select message_ts, item_id::text as item_id from slack_messages where team_id = $1 and root_ts = $2 order by message_ts`, [teamId, OLD_ROOT]
+    );
+    const itemsAtThePath = (): Promise<Row[]> => query(`select id::text as id from items where team_id = $1 and path = $2`, [teamId, scopedPath]);
+    expect([await ledgerOfTheRoot(), await itemsAtThePath()], `${label}: fixture: the canonical item and its two ledger rows exist`).toEqual([
+      [{ message_ts: OLD_ROOT, item_id: f.itemId }, { message_ts: OLD_REPLY, item_id: f.itemId }], [{ id: f.itemId }],
+    ]);
+    expect(await lifecycleQueueAndStagingAnywhere(), `${label}: fixture: no pending work and no staging`).toEqual({ queue: [], staging: [] });
+
+    // ── THE BARRIER, in a test-only wrapper, with the §7.2 controlled clock. ──
+    const hold = lifecycleHold<{ pid: number; itemLockRows: number; enqueueSent: boolean }>();
+    let preparationReleased = false;
+    const releasePreparation = (): void => {
+      preparationReleased = true;
+      hold.release();
+    };
+    // Last resort: releases only, and asserts nothing.
+    onTestFinished(() => {
+      releasePreparation();
+    });
+    let excludedMs = 0;
+    let heldSince: number | null = null;
+    const execution = createSlackKnownRootExecution({ ambientDeadlineAt: null, monotonicNow: () => (heldSince ?? performance.now()) - excludedMs });
+    let heldOnce = false;
+    let enqueueSent = false;
+    const attempts: number[] = [];
+    const preparation = lifecycleTracked(runContextTransaction(db(), async (session, attempt) => {
+      attempts.push(attempt);
+      const pid = await lifecyclePidOf(session);
+      const handed = kr12Intercepted(session, async (text, params, pass) => {
+        const flat = kr12Flat(text);
+        if (flat.includes(KR12_ENQUEUE_INSERT)) enqueueSent = true;
+        const result = await pass(text, params);
+        if (!heldOnce && flat.endsWith(KR12_ITEM_ROW_LOCK_ENDS)) {
+          // The item row lock HAS returned. Only its resolution to the preparation is withheld.
+          heldOnce = true;
+          const holdStartedAt = performance.now();
+          heldSince = holdStartedAt;
+          hold.arrive({ pid, itemLockRows: result.rows.length, enqueueSent });
+          await hold.released;
+          excludedMs += performance.now() - holdStartedAt;
+          heldSince = null;
+        }
+        return result;
+      });
+      return prepareSlackKnownRootRequeue(handed, { teamId, entry }, execution);
+    }));
+
+    type DeletionSaw = { deletedIds: string[]; returnedAfterThePreparationWasReleased: boolean; queueRowVisible: string[]; ledgerRowsLeft: number };
+    let deletion: ReturnType<typeof lifecycleTracked<DeletionSaw>> | null = null;
+    let heldAt: Awaited<typeof hold.reached> | null = null;
+    let deleterPid = 0;
+    let committedWhileHeld: unknown = null;
+    let observed: Awaited<ReturnType<typeof lifecycleObservedWaiters>> | null = null;
+    let deletionWaitingAtRelease: boolean | null = null;
+    let queueRowInsideTheDeletion: string[] = [];
+    try {
+      heldAt = await lifecycleArrived(hold.reached, preparation, "the preparation");
+      committedWhileHeld = await lifecycleQueueAndStagingAnywhere();
+
+      // ── THE DELETION, on another connection: a fixture DELETE of the item row. ──
+      const deleterStarted = lifecycleHandover<number>();
+      deletion = lifecycleTracked(tx(async (d): Promise<DeletionSaw> => {
+        deleterStarted.give(await lifecyclePidOf(d));
+        const deleted = await d.executeSql<{ id: string }>(`delete from items where team_id = $1::uuid and id = $2::uuid returning id::text as id`, [teamId, f.itemId]);
+        const returnedAfterThePreparationWasReleased = preparationReleased;
+        // INSIDE the deletion's own transaction, after its DELETE returned and before it commits.
+        const queue = await d.executeSql<{ stored: string }>(`select to_jsonb(t)::text as stored from slack_sync_threads t where t.team_id = $1 order by t.root_ts`, [teamId]);
+        queueRowInsideTheDeletion = queue.rows.map((row) => row.stored);
+        const ledger = await d.executeSql<{ n: number }>(`select count(*)::int as n from slack_messages where team_id = $1 and root_ts = $2`, [teamId, OLD_ROOT]);
+        return {
+          deletedIds: deleted.rows.map((row) => row.id), returnedAfterThePreparationWasReleased,
+          queueRowVisible: queue.rows.map((row) => (JSON.parse(row.stored) as { root_ts: string }).root_ts), ledgerRowsLeft: ledger.rows[0].n,
+        };
+      }));
+      deleterPid = await lifecycleArrived(deleterStarted.given, deletion, "the deletion");
+      // ── THE WAIT, read from PostgreSQL: the deletion is blocked by the preparation's backend. ──
+      observed = await lifecycleObservedWaiters(heldAt.pid, deletion.hasEnded, 10_000);
+      deletionWaitingAtRelease = !deletion.hasEnded();
+    } finally {
+      releasePreparation();
+      await preparation.ended;
+      if (deletion) await deletion.ended;
+    }
+    if (heldAt === null || deletion === null || observed === null) throw new Error("fixture: the case did not get as far as the deletion's wait");
+    const endedPreparation = await preparation.ended;
+    const endedDeletion = await deletion.ended;
+
+    // FIXTURE: the hold was after the item lock and before the enqueue, and nothing was committed.
+    expect({ itemLockRows: heldAt.itemLockRows, enqueueSent: heldAt.enqueueSent, committedWhileHeld, anotherBackend: deleterPid > 0 && deleterPid !== heldAt.pid },
+      `${label}: fixture: the preparation was held holding the item row lock, before its enqueue, with nothing committed, and the deletion is another backend`).toEqual({
+      itemLockRows: 1, enqueueSent: false, committedWhileHeld: { queue: [], staging: [] }, anotherBackend: true,
+    });
+    // THE WAIT: the deletion was blocked, in PostgreSQL, by the preparation's backend.
+    expect(observed.notObservedBecause, `${label}: barrier: the deletion's wait behind the preparation was observed in PostgreSQL`).toBeNull();
+    expect(observed.waiters.map((waiter) => ({
+      pid: Number(waiter.pid), state: waiter.state, wait_event_type: waiter.wait_event_type,
+      isTheItemDelete: /^delete from items\b/.test((waiter.query ?? "").replace(/\s+/g, " ").trim()),
+      waitsFor: waiter.ungranted.map((lock) => `${lock.locktype}/${lock.mode}`),
+      everyAwaitedTransactionIsThePreparations: waiter.ungranted.length > 0 &&
+        waiter.ungranted.every((lock) => lock.transactionid !== null && waiter.blocker_transaction_ids.includes(lock.transactionid)),
+    })), `${label}: barrier: exactly the deletion is blocked by the preparation's backend, at its DELETE, waiting for the preparation's transaction`).toEqual([{
+      pid: deleterPid, state: "active", wait_event_type: "Lock", isTheItemDelete: true,
+      waitsFor: ["transactionid/ShareLock"], everyAwaitedTransactionIsThePreparations: true,
+    }]);
+    expect(deletionWaitingAtRelease, `${label}: barrier: the deletion had not ended when the preparation was released`).toBe(true);
+
+    // ── THE ORDER: the preparation commits enqueued; the deletion's DELETE returns only after that,
+    //    and, inside its own transaction, already sees the preparation's committed row. ──
+    expect([lifecycleShown(endedPreparation), attempts], `${label}: the preparation committed enqueued, on its one attempt`).toEqual([
+      { state: "resolved", value: { outcome: "enqueued" } }, [1],
+    ]);
+    expect(lifecycleShown(endedDeletion), `${label}: the deletion committed, after removing the item and cascading its ledger rows, with the preparation's row already committed`).toEqual({
+      state: "resolved", value: { deletedIds: [f.itemId], returnedAfterThePreparationWasReleased: true, queueRowVisible: [OLD_ROOT], ledgerRowsLeft: 0 },
+    });
+
+    // ── THE ORPHAN, precisely. ──
+    expect(await lifecycleQueueAgainst(teamId, exactDue), `${label}: the queue row remains, in the root's exact scope, queued, never attempted, at its exact due instant`).toEqual(LIFECYCLE_ONE_ROW_AT_THE_EXACT_DUE);
+    expect({
+      itemById: await query(`select 1 from items where id = $1::uuid`, [f.itemId]),
+      itemsAtThePath: await itemsAtThePath(),
+      ledgerOfTheRoot: await ledgerOfTheRoot(),
+      ledgerOfTheItem: await query(`select 1 from slack_messages where item_id = $1::uuid`, [f.itemId]),
+    }, `${label}: the owning item, any item at its path, and every ledger row of the root and of the item are gone`).toEqual({
+      itemById: [], itemsAtThePath: [], ledgerOfTheRoot: [], ledgerOfTheItem: [],
+    });
+    const orphan = await lifecycleQueueRowsExactly(teamId);
+    expect(orphan, `${label}: the committed queue row is byte-identical to what the deletion's own transaction saw`).toEqual(queueRowInsideTheDeletion);
+    expect(Object.keys(JSON.parse(orphan[0]) as Record<string, unknown>).filter((column) => /item|path|deleted|provenance|lane|origin|producer/i.test(column)),
+      `${label}: the queue row has no column that names an item, a path, a deletion, a provenance or a lane`).toEqual([]);
+    // It is still pending work: the product's selector takes it (in a transaction that is rolled back).
+    let taken: unknown = null;
+    const takenEnded = await lifecycleTracked(tx(async (s) => {
+      taken = (await claimDueSlackThread(s, teamId, { leaseMs: 900_000, workspaceId: WORKSPACE }))?.scope ?? null;
+      throw ROLL_BACK;
+    })).ended;
+    expect([takenEnded.state === "rejected" && takenEnded.error === ROLL_BACK, taken], `${label}: the orphan is still due work the selector would take`).toEqual([
+      true, { teamId, workspaceId: WORKSPACE, channelId: CHANNEL, rootTs: OLD_ROOT },
+    ]);
+
+    // ── BEFORE ANY RECREATION: a later ordinary preparation of the old entry. The database is usable,
+    //    and the primitive reads the orphan as genuine pending work. ──
+    const later = await tx((s) => prepareSlackKnownRootRequeue(s, { teamId, entry }, createSlackKnownRootExecution({ ambientDeadlineAt: null })));
+    expect([later, await lifecycleQueueRowsExactly(teamId)], `${label}: a later preparation of the old entry reports already_pending for the orphan, and changes nothing`).toEqual([
+      { outcome: "already_pending" }, orphan,
+    ]);
+
+    // ── SIDE FACT: an ordinary writer cannot recreate the item. ──
+    let ordinary: unknown = null;
+    try {
+      await ingest(f.seed, {
+        project: "slack", kind: "transcript", path: scopedPath, body: "kr15 recreated", access: "team",
+        frontmatter: { source: "slack", workspace_id: WORKSPACE, channel_id: CHANNEL, ts: OLD_ROOT, thread_ts: OLD_ROOT },
+      });
+    } catch (error) {
+      ordinary = error;
+    }
+    expect([(ordinary as Error | null)?.message, await itemsAtThePath()],
+      `${label}: ordinary ingest refuses the canonical scoped path without the internal publication option, and writes nothing there`).toEqual([
+      "canonical scoped Slack paths require internal Slack publication", [],
+    ]);
+    // ── RECREATION, by the REAL publication path: the orphan is staged as a hydrator would leave it,
+    //    and the real `ingestItem` with an issued publication option publishes it. No provider call. ──
+    const providerCalls = (): number[] => ["auth.test", "conversations.info", "conversations.history"].map((method) => f.fake.countOf(method));
+    const providerCallsBefore = providerCalls();
+    const restaged = await lifecycleRestaged(f, label);
+    const published = await restaged.publish(db());
+    expect({
+      status: published.status,
+      isANewItem: published.id !== f.itemId,
+      itemsAtThePath: await itemsAtThePath(),
+      ledgerOfTheRoot: await ledgerOfTheRoot(),
+      pending: await lifecycleQueueAndStagingAnywhere(),
+      providerCalls: providerCalls(),
+    }, `${label}: the real publication path RECREATED the deleted item: a new item, the only one at the canonical path, with the root's ledger rows bound to it; it consumed the orphan and its staging; and no provider request was made`).toEqual({
+      status: "created",
+      isANewItem: true,
+      itemsAtThePath: [{ id: published.id }],
+      ledgerOfTheRoot: [{ message_ts: OLD_ROOT, item_id: published.id }, { message_ts: OLD_REPLY, item_id: published.id }],
+      pending: { queue: [], staging: [] },
+      providerCalls: providerCallsBefore,
+    });
   });
 });
