@@ -11,6 +11,7 @@ import { ingestItem } from "@/lib/ingest";
 import {
   createSlackKnownRootExecution,
   readSlackKnownRootItemPage,
+  SlackKnownRootValidationError,
   type SlackKnownRootEntry,
   type SlackKnownRootExecution,
   type SlackKnownRootItemPage,
@@ -9005,6 +9006,9 @@ describe("KR-16 redaction after the transaction engine's outer replacement (real
     const restoreSpies = (): void => {
       for (const spy of spies) spy.mockRestore();
     };
+    // The spies stay active until the classification, the receipt, the tally and the caller's
+    // reported record all exist, and are restored only then. This hook is the backstop for a case
+    // that ends before that point.
     onTestFinished(restoreSpies);
 
     const attempts: number[] = [];
@@ -9013,7 +9017,7 @@ describe("KR-16 redaction after the transaction engine's outer replacement (real
     let ended: LifecycleEnded<SlackKnownRootPreparationResult> | null = null;
     const validationErrors: unknown[] = [];
     let page: SlackKnownRootItemPage | null = null;
-    try {
+    {
       // NEW VALIDATION EXCEPTIONS, each from an input that carries a canary.
       const pageExecution = createSlackKnownRootExecution({ ambientDeadlineAt: null });
       validationErrors.push((await lifecycleTracked(tx((s) => readSlackKnownRootItemPage(
@@ -9046,8 +9050,6 @@ describe("KR-16 redaction after the transaction engine's outer replacement (real
         }
         throw callbackError;
       })).ended;
-    } finally {
-      restoreSpies();
     }
 
     if (ended === null || page === null) throw new Error("fixture: the case did not get as far as its invocation");
@@ -9084,6 +9086,9 @@ describe("KR-16 redaction after the transaction engine's outer replacement (real
     const tally = tallySlackKnownRootPage({ examined: 1, receipts: [receipt] });
     /** What a caller would emit for this slot: built from the classification only. */
     const reportedRecord = { slot: 0, attempts: receipt.attempts, failure: category, tally };
+    // ── THE TELEMETRY WINDOW CLOSES only now: every reportable value exists. ──
+    restoreSpies();
+    expect(telemetry, `${label}: nothing at all was written to the console while the outputs, the classification, the receipt, the tally and the reported record were produced`).toEqual([]);
     expect([category, tally.preparation_failed, tally.failureCounts.database_failure], `${label}: one database_failure, counted once`).toEqual(["database_failure", 1, 1]);
 
     // ── THE WHOLE REPORTABLE SET, walked. ──
@@ -9095,5 +9100,178 @@ describe("KR-16 redaction after the transaction engine's outer replacement (real
 
     // The attempt rolled back: nothing durable.
     expect(await lifecycleQueueAndStagingAnywhere(), `${label}: the rejected transaction left no queue row and no staging`).toEqual({ queue: [], staging: [] });
+  });
+});
+
+/**
+ * KR-16, §6 — "New SQL projections must check JSON string types and byte lengths before returning
+ * values … Oversized stored values are `invalid_metadata`, never silently truncated", on REAL
+ * PostgreSQL, for both projections that read stored item metadata: the page reader's locator read
+ * and the preparer's item lock.
+ *
+ * EVIDENCE, NOT RED: expected to pass on the current source.
+ *
+ * THE FIXTURE. The real publication's canonical root item; then, one variant at a time, ONE key of
+ * its stored frontmatter is replaced by labeled fixture DML, both reads run, and the frontmatter is
+ * put back exactly as it was. The preparation is never allowed to enqueue: every variant ends before
+ * the enqueue, so the queue stays empty and the next variant reaches the item lock again.
+ *
+ * THE OBSERVATION. Each read runs through a test-only pass-through wrapper that keeps the RAW rows
+ * the real SQL projection returned — before the application judges them. So the test sees what the
+ * SQL itself did with each value: a value past its bound (257-byte provider ids, 129-byte
+ * timestamps the exact parser would otherwise accept) or of another JSON type (a number) comes back
+ * NULL; a value exactly at its bound (256 and 128 bytes) comes back whole, byte for byte. Then the
+ * public outcome: NULL is `invalid_metadata` — unlocated for the page, unattested for the
+ * preparer — and a whole value is judged as the value it is.
+ *
+ * NOT HERE: the 2,048-byte path bound, which this file's existing item-path cases already show.
+ * `source` and `is_slack` are not varied.
+ */
+describe("KR-16 stored projections on real Postgres — NULL past a byte or type bound, never a truncated or coerced value", () => {
+  /** A Slack root timestamp of exactly `bytes` bytes that the exact parser accepts: zero-padded seconds. */
+  const paddedTs = (bytes: number): string => `${"0".repeat(bytes - OLD_ROOT.length)}${OLD_ROOT}`;
+  const PAGE_LOCATOR_READ = "from unnest($2::uuid[]) as wanted(id) join items i on i.team_id = $1::uuid and i.id = wanted.id";
+
+  it("KR-16 SQL projection: over-bound and non-string provider ids and timestamps project to NULL and are invalid_metadata, and values exactly at the bound are returned whole", async () => {
+    const label = "KR-16 SQL projection";
+    const { f, teamId, entry } = await lifecycleAgedRoot(label, KR12_REVISIT);
+    if ("unlocated" in entry) throw new Error("fixture: the published root was not located");
+    const located = (rootTs: string): SlackKnownRootEntry => ({ ...entry, locator: { ...entry.locator, rootTs } });
+    const unlocated = (category: string): unknown => ({ teamId: entry.teamId, itemId: entry.itemId, revisitAfterMs: entry.revisitAfterMs, unlocated: category });
+
+    // FIXTURE VALIDITY of the timestamp values: exactly the bound and one past it, both accepted by the exact parser.
+    expect([paddedTs(128), paddedTs(129)].map((ts) => [Buffer.byteLength(ts, "utf8"), parseSlackTimestamp(ts)?.iso]),
+      `${label}: fixture: the padded timestamps are 128 and 129 bytes and both are the root's own instant`).toEqual([
+      [128, parseSlackTimestamp(OLD_ROOT)?.iso], [129, parseSlackTimestamp(OLD_ROOT)?.iso],
+    ]);
+    expect(["T".repeat(256), "T".repeat(257)].map((id) => Buffer.byteLength(id, "utf8")), `${label}: fixture: 256 and 257 bytes`).toEqual([256, 257]);
+
+    const [original] = await query<{ frontmatter: string; keys: Row }>(
+      `select frontmatter::text as frontmatter,
+              jsonb_build_object('ts', jsonb_typeof(frontmatter->'ts'), 'thread_ts', jsonb_typeof(frontmatter->'thread_ts'),
+                                 'workspace_id', jsonb_typeof(frontmatter->'workspace_id'), 'channel_id', jsonb_typeof(frontmatter->'channel_id')) as keys
+         from items where team_id = $1 and id = $2::uuid`, [teamId, f.itemId]
+    );
+    expect(original.keys, `${label}: fixture: the published item stores every varied key as a string`).toEqual({ ts: "string", thread_ts: "string", workspace_id: "string", channel_id: "string" });
+    /** FIXTURE DML: replace ONE stored frontmatter key of the root item. */
+    const storeOne = async (key: string, value: unknown): Promise<void> => {
+      const updated = await (await rawSql()).query(
+        `update items set frontmatter = jsonb_set(frontmatter, array[$3::text], $4::jsonb) where team_id = $1::uuid and id = $2::uuid`,
+        [teamId, f.itemId, key, JSON.stringify(value)]
+      );
+      expect(updated.rowCount, `${label}: fixture: exactly the root item was changed`).toBe(1);
+    };
+    /** FIXTURE DML: put the stored frontmatter back exactly. */
+    const restore = async (): Promise<void> => {
+      await (await rawSql()).query(`update items set frontmatter = $3::jsonb where team_id = $1::uuid and id = $2::uuid`, [teamId, f.itemId, original.frontmatter]);
+    };
+
+    /** Both real reads, each through a pass-through wrapper that keeps the raw rows of ONE projection. */
+    const observe = async () => {
+      const pageRows: Row[] = [];
+      const itemRows: Row[] = [];
+      const keeping = (rows: Row[], isTheProjection: (flat: string) => boolean) => (session: TransactionSession): TransactionSession =>
+        kr12Intercepted(session, async (text, params, pass) => {
+          const result = await pass(text, params);
+          if (isTheProjection(kr12Flat(text))) rows.push(...(result.rows as Row[]));
+          return result;
+        });
+      const page = await tx((s) => readSlackKnownRootItemPage(
+        keeping(pageRows, (flat) => flat.includes(PAGE_LOCATOR_READ))(s),
+        { teamId, pageSize: 100, revisitAfterMs: KR12_REVISIT.ms }, createSlackKnownRootExecution({ ambientDeadlineAt: null })
+      ));
+      const prepared = await tx((s) => prepareSlackKnownRootRequeue(
+        keeping(itemRows, (flat) => flat.endsWith(KR12_ITEM_ROW_LOCK_ENDS))(s), { teamId, entry }, createSlackKnownRootExecution({ ambientDeadlineAt: null })
+      ));
+      return { page, prepared, pageRows, itemRows };
+    };
+
+    // CONTROL, unmodified: the page projection returns the stored values whole, and the entry is located.
+    const control = await tx((s) => {
+      const rows: Row[] = [];
+      return readSlackKnownRootItemPage(kr12Intercepted(s, async (text, params, pass) => {
+        const result = await pass(text, params);
+        if (kr12Flat(text).includes(PAGE_LOCATOR_READ)) rows.push(...(result.rows as Row[]));
+        return result;
+      }), { teamId, pageSize: 100, revisitAfterMs: KR12_REVISIT.ms }, createSlackKnownRootExecution({ ambientDeadlineAt: null }))
+        .then((page) => ({ page, rows }));
+    });
+    expect({ entries: control.page.entries, raw: control.rows.map((row) => [row.workspace_id, row.channel_id, row.root_ts]) },
+      `${label}: control: unmodified, the page projection returns the stored values whole and the entry is located`).toEqual({
+      entries: [entry], raw: [[WORKSPACE, CHANNEL, OLD_ROOT]],
+    });
+
+    type Variant = {
+      name: string; key: string; value: unknown;
+      /** The page projection's column for this key, or null: the page does not project thread_ts. */
+      pageColumn: string | null; pageRaw: unknown; pageEntry: unknown;
+      itemColumn: string; itemRaw: unknown; prepared: SlackKnownRootPreparationResult;
+    };
+    const INVALID: SlackKnownRootPreparationResult = { outcome: "unattested", reason: "invalid_metadata" };
+    const MISMATCH: SlackKnownRootPreparationResult = { outcome: "unattested", reason: "canonical_mismatch" };
+    const VARIANTS: Variant[] = [
+      { name: "a 257-byte workspace id", key: "workspace_id", value: "T".repeat(257),
+        pageColumn: "workspace_id", pageRaw: null, pageEntry: unlocated("invalid_metadata"),
+        itemColumn: "workspace_id", itemRaw: null, prepared: INVALID },
+      { name: "a 256-byte workspace id, exactly at the bound", key: "workspace_id", value: "T".repeat(256),
+        // Whole, so it is judged as the id it is: no channel row of that workspace binds it.
+        pageColumn: "workspace_id", pageRaw: "T".repeat(256), pageEntry: unlocated("missing_channel_binding"),
+        itemColumn: "workspace_id", itemRaw: "T".repeat(256), prepared: MISMATCH },
+      { name: "a 257-byte channel id", key: "channel_id", value: "C".repeat(257),
+        pageColumn: "channel_id", pageRaw: null, pageEntry: unlocated("invalid_metadata"),
+        itemColumn: "channel_id", itemRaw: null, prepared: INVALID },
+      { name: "a 256-byte channel id, exactly at the bound", key: "channel_id", value: "C".repeat(256),
+        pageColumn: "channel_id", pageRaw: "C".repeat(256), pageEntry: unlocated("missing_channel_binding"),
+        itemColumn: "channel_id", itemRaw: "C".repeat(256), prepared: MISMATCH },
+      { name: "a channel id stored as a number", key: "channel_id", value: 7,
+        pageColumn: "channel_id", pageRaw: null, pageEntry: unlocated("invalid_metadata"),
+        itemColumn: "channel_id", itemRaw: null, prepared: INVALID },
+      { name: "a 129-byte root timestamp the exact parser would accept", key: "ts", value: paddedTs(129),
+        pageColumn: "root_ts", pageRaw: null, pageEntry: unlocated("invalid_metadata"),
+        itemColumn: "ts", itemRaw: null, prepared: INVALID },
+      { name: "a 128-byte root timestamp, exactly at the bound", key: "ts", value: paddedTs(128),
+        // Whole: the page locates it under that exact timestamp, and the preparer finds it is not the entry's root.
+        pageColumn: "root_ts", pageRaw: paddedTs(128), pageEntry: located(paddedTs(128)),
+        itemColumn: "ts", itemRaw: paddedTs(128), prepared: MISMATCH },
+      { name: "a 129-byte thread timestamp the exact parser would accept", key: "thread_ts", value: paddedTs(129),
+        pageColumn: null, pageRaw: null, pageEntry: entry,
+        itemColumn: "thread_ts", itemRaw: null, prepared: INVALID },
+      { name: "a 128-byte thread timestamp, exactly at the bound", key: "thread_ts", value: paddedTs(128),
+        pageColumn: null, pageRaw: null, pageEntry: entry,
+        itemColumn: "thread_ts", itemRaw: paddedTs(128), prepared: MISMATCH },
+      { name: "a thread timestamp stored as a number", key: "thread_ts", value: 1_718_900_000.0001,
+        pageColumn: null, pageRaw: null, pageEntry: entry,
+        itemColumn: "thread_ts", itemRaw: null, prepared: INVALID },
+    ];
+
+    for (const variant of VARIANTS) {
+      const where = `${label}: ${variant.name}`;
+      await storeOne(variant.key, variant.value);
+      try {
+        const seen = await observe();
+        expect({
+          pageRows: seen.pageRows.length,
+          pageRaw: variant.pageColumn === null ? "not projected" : seen.pageRows[0]?.[variant.pageColumn],
+          pageEntries: seen.page.entries,
+          itemRows: seen.itemRows.length,
+          itemRaw: seen.itemRows[0]?.[variant.itemColumn],
+          prepared: seen.prepared,
+        }, `${where}: the raw SQL projection returned NULL past the bound or for another type, and the exact value at the bound; the public outcome follows`).toEqual({
+          pageRows: 1,
+          pageRaw: variant.pageColumn === null ? "not projected" : variant.pageRaw,
+          pageEntries: [variant.pageEntry],
+          itemRows: 1,
+          itemRaw: variant.itemRaw,
+          prepared: variant.prepared,
+        });
+      } finally {
+        await restore();
+      }
+    }
+
+    // Afterwards: the stored frontmatter is exactly as published, and nothing was enqueued.
+    expect((await query<{ frontmatter: string }>(`select frontmatter::text as frontmatter from items where team_id = $1 and id = $2::uuid`, [teamId, f.itemId]))[0].frontmatter,
+      `${label}: fixture: the stored frontmatter was put back exactly`).toBe(original.frontmatter);
+    expect(await lifecycleQueueAndStagingAnywhere(), `${label}: no variant enqueued anything`).toEqual({ queue: [], staging: [] });
   });
 });

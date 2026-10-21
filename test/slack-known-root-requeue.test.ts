@@ -24,6 +24,7 @@ import {
   type SlackKnownRootReceipt,
 } from "@/lib/ingest/slack-known-root-requeue";
 import { slackConfigRevision, slackTokenFingerprint } from "@/lib/ingest/slack-source-binding";
+import { parseSlackTimestamp } from "@/lib/ingest/sources/slack-message-evidence";
 
 /**
  * The decorated session is handed only to the packet's own dependencies, so the one way to hold it is
@@ -230,6 +231,19 @@ function pausedAtFirstStatement(inner: TransactionSession) {
   };
 }
 
+/**
+ * KR-16 — the two moments a caller mutates what it handed over. "while it is pending": after the
+ * barrier above has been reached. "synchronously, as the call returns": in the same synchronous step
+ * as the call itself, before the test awaits anything — the earliest moment a caller can act.
+ */
+type Kr16MutationMoment = "while it is pending" | "synchronously, as the call returns";
+
+/**
+ * KR-16 — a Slack root timestamp of exactly `bytes` bytes that the exact parser accepts: the
+ * fixture root's seconds, zero-padded on the left. Leading zeros do not change the instant.
+ */
+const kr16PaddedRootTs = (bytes: number): string => `${"0".repeat(bytes - "1718900000.000100".length)}1718900000.000100`;
+
 /** The one sentence a caller-contract failure may say. Stated here, not imported: a changed message must fail. */
 const STATIC_VALIDATION_MESSAGE = "slack known-root: invalid request";
 const STATIC_DEADLINE_MESSAGE = "slack known-root: operation deadline exceeded";
@@ -322,6 +336,7 @@ describe("known-root preparation — composed from teamId plus one enumerated en
     ["the largest safe namespace revision", { namespaceRevision: Number.MAX_SAFE_INTEGER }],
     ["a workspace id of exactly 256 bytes", { workspaceId: "T".repeat(256) }],
     ["a channel id of exactly 256 bytes", { channelId: "C".repeat(256) }],
+    ["a root timestamp of exactly 128 bytes that the exact parser accepts", { rootTs: kr16PaddedRootTs(128) }],
   ])("KR-16: accepts %s at its exact boundary: past validation, into the session (control)", async (label, over) => {
     const { session, statements } = recordingSession();
     const entry = located({ locator: { ...located().locator, ...over } as SlackKnownRootLocatedEntry["locator"] });
@@ -337,12 +352,27 @@ describe("known-root preparation — composed from teamId plus one enumerated en
     ["a channel id of 257 bytes", { channelId: "C".repeat(257) }],
     ["a configuration revision one hex digit short", { bindingConfigRevision: "c".repeat(63) }],
     ["a configuration revision one hex digit long", { bindingConfigRevision: "c".repeat(65) }],
+    ["a root timestamp of 129 bytes that the exact parser would otherwise accept", { rootTs: kr16PaddedRootTs(129) }],
   ])("KR-16: refuses %s, just past its boundary, as a static validation error before any statement", async (label, over) => {
     const { session, statements } = recordingSession();
     const entry = located({ locator: { ...located().locator, ...over } as SlackKnownRootLocatedEntry["locator"] });
     const error = await rejection(() => prepareSlackKnownRootRequeue(session, { teamId: TEAM, entry }, execution()));
     expectStaticValidationError(error, label);
     expect(statements, `${label}: refused before any statement`).toEqual([]);
+  });
+
+  // FIXTURE VALIDITY of the two timestamp rows above: the byte lengths are exactly the boundary and
+  // one past it, and the exact parser accepts BOTH — so only the byte bound can refuse the longer one.
+  it("KR-16: fixture: the padded root timestamps are 128 and 129 bytes, and the exact parser accepts both, as the fixture root's own instant", () => {
+    const [atTheBound, pastIt] = [kr16PaddedRootTs(128), kr16PaddedRootTs(129)];
+    expect({
+      bytes: [Buffer.byteLength(atTheBound, "utf8"), Buffer.byteLength(pastIt, "utf8")],
+      instants: [parseSlackTimestamp(atTheBound)?.iso, parseSlackTimestamp(pastIt)?.iso],
+    }).toEqual({
+      bytes: [128, 129],
+      instants: [parseSlackTimestamp("1718900000.000100")?.iso, parseSlackTimestamp("1718900000.000100")?.iso],
+    });
+    expect(parseSlackTimestamp("1718900000.000100"), "fixture: the unpadded root parses").not.toBeNull();
   });
 });
 
@@ -416,6 +446,14 @@ describe("known-root enumeration — invalid and boundary requests", () => {
     // An earlier ambient deadline can leave less than the minimum allowance; a later one changes nothing.
     expect(createSlackKnownRootExecution({ ambientDeadlineAt: now + 300, monotonicNow: () => now }).deadlineAt).toBe(now + 300);
     expect(createSlackKnownRootExecution({ ambientDeadlineAt: now + 60_000, monotonicNow: () => now }).deadlineAt).toBe(now + 2_000);
+  });
+
+  // KR-16, §6: the allowance's LOWER boundary, accepted exactly. Its upper boundary, 5,000 ms, is
+  // the case above; one past each boundary is refused by the table above it.
+  it("KR-16: accepts the minimum allowance, 1,000 ms, exactly: its deadline is the creation reading plus 1,000 (control)", () => {
+    const now = 50_000;
+    const narrow = createSlackKnownRootExecution({ allowanceMs: 1_000, ambientDeadlineAt: null, monotonicNow: () => now });
+    expect([narrow.allowanceMs, narrow.deadlineAt], "KR-16: the minimum allowance is accepted, and the deadline is exact").toEqual([1_000, now + 1_000]);
   });
 });
 
@@ -1276,7 +1314,7 @@ describe("known-root decorated session — statement order, refreshed timeouts, 
    * was CALLED with, and the page — entries and continuation — must be built from them. Limit: a
    * scripted session; what the server does with those parameters is the real-PostgreSQL suites'.
    */
-  it("KR-16: a continuation page keeps the request and cursor it was CALLED with, whatever the caller does to them while the read is pending", async () => {
+  async function kr16PageMutation(when: Kr16MutationMoment): Promise<void> {
     const callerCursor: Record<string, unknown> = { version: 1, teamId: TEAM, upperItemId: KR16_UPPER, afterItemId: ITEM, revisitAfterMs: REVISIT_MS };
     const callerRequest: Record<string, unknown> = { teamId: TEAM, pageSize: 1, revisitAfterMs: REVISIT_MS, cursor: callerCursor };
     const dataParams: unknown[][] = [];
@@ -1288,15 +1326,18 @@ describe("known-root decorated session — statement order, refreshed timeouts, 
       },
     });
     const paused = pausedAtFirstStatement(scripted.session);
+    // THE CALLER'S MUTATION: every field of the request and of the nested cursor, and the cursor replaced.
+    const mutate = (): void => {
+      Object.assign(callerCursor, {
+        version: 2, teamId: OTHER_TEAM, upperItemId: "ffffffff-ffff-4fff-bfff-ffffffffffff",
+        afterItemId: "00000000-0000-4000-8000-000000000001", revisitAfterMs: 60_000,
+      });
+      Object.assign(callerRequest, { teamId: OTHER_TEAM, pageSize: 100, revisitAfterMs: 86_400_000, cursor: { ...callerCursor } });
+    };
     const pending = readSlackKnownRootItemPage(paused.session, callerRequest as unknown as SlackKnownRootPageRequest, execution());
+    if (when === "synchronously, as the call returns") mutate();
     await paused.reachedOrSettled(pending);
-
-    // THE CALLER'S MUTATION, while the read is genuinely pending.
-    Object.assign(callerCursor, {
-      version: 2, teamId: OTHER_TEAM, upperItemId: "ffffffff-ffff-4fff-bfff-ffffffffffff",
-      afterItemId: "00000000-0000-4000-8000-000000000001", revisitAfterMs: 60_000,
-    });
-    Object.assign(callerRequest, { teamId: OTHER_TEAM, pageSize: 100, revisitAfterMs: 86_400_000, cursor: { ...callerCursor } });
+    if (when === "while it is pending") mutate();
     paused.release();
     const page = await pending;
 
@@ -1310,7 +1351,12 @@ describe("known-root decorated session — statement order, refreshed timeouts, 
       exhausted: false, examined: 1,
     });
     expectRestored(scripted);
-  });
+  }
+
+  it("KR-16: a continuation page keeps the request and cursor it was CALLED with, whatever the caller does to them while the read is pending", () =>
+    kr16PageMutation("while it is pending"));
+  it("KR-16: a continuation page keeps the request and cursor it was CALLED with when the caller rewrites them synchronously, before anything is awaited", () =>
+    kr16PageMutation("synchronously, as the call returns"));
 
   /**
    * KR-16, §6 — STORED PROJECTIONS read by the page reader: "revision as a nonnegative safe integer,
@@ -1352,6 +1398,12 @@ describe("known-root decorated session — statement order, refreshed timeouts, 
     ["a stored workspace id of 257 bytes", { workspace_id: "T".repeat(257) }, kr16Unlocated("invalid_metadata")],
     ["a stored workspace id that is not a string", { workspace_id: 7 }, kr16Unlocated("invalid_metadata")],
     ["a stored workspace id carrying rejected text", { workspace_id: `T0 ${CANARY.metadata}` }, kr16Unlocated("invalid_metadata")],
+    ["a stored channel id of exactly 256 bytes", { channel_id: "C".repeat(256) }, kr16Located({ channelId: "C".repeat(256) })],
+    ["a stored channel id of 257 bytes", { channel_id: "C".repeat(257) }, kr16Unlocated("invalid_metadata")],
+    ["a stored channel id that is not a string", { channel_id: 7 }, kr16Unlocated("invalid_metadata")],
+    ["a stored root timestamp of exactly 128 bytes", { root_ts: kr16PaddedRootTs(128) }, kr16Located({ rootTs: kr16PaddedRootTs(128) })],
+    ["a stored root timestamp of 129 bytes that the exact parser would otherwise accept", { root_ts: kr16PaddedRootTs(129) }, kr16Unlocated("invalid_metadata")],
+    ["a stored root timestamp that is a number, not text", { root_ts: 1_718_900_000.0001 }, kr16Unlocated("invalid_metadata")],
   ])("KR-16: reads %s from the stored projection losslessly, or not at all", async (label, over, expected) => {
     const scripted = scriptedSession({
       respond: (text) => (/\bunnest\b/i.test(text) ? [{ ...KR16_LOCATOR_ROW, ...over }] : [{ id: ITEM }]),
@@ -2322,7 +2374,7 @@ describe("known-root due-output conversion contract", () => {
    * change what the scripted answers allow: a mutated revision or channel is a refusal, not
    * `enqueued`. Limit: a scripted executor, not a server.
    */
-  it("KR-16: a preparation keeps the team, entry and locator it was CALLED with, whatever the caller does to them while it is pending", async () => {
+  async function kr16PreparationMutation(when: Kr16MutationMoment): Promise<void> {
     vi.stubEnv("SLACK_BOT_TOKEN", TOKEN);
     const scripted = scriptedPreparation([{ is_due: true, due_epoch_ms: "1718903600123" }], () => undefined);
     const sent: { flat: string; params: unknown[] }[] = [];
@@ -2343,20 +2395,24 @@ describe("known-root due-output conversion contract", () => {
     const callerLocator: Record<string, unknown> = { ...ENTRY.locator };
     const callerEntry: Record<string, unknown> = { teamId: ENTRY.teamId, itemId: ENTRY.itemId, revisitAfterMs: ENTRY.revisitAfterMs, locator: callerLocator };
     const callerInput: Record<string, unknown> = { teamId: TEAM, entry: callerEntry };
-    const pending = prepareSlackKnownRootRequeue(paused.session, callerInput as never, execution());
-    await paused.reachedOrSettled(pending);
-
-    // THE CALLER'S MUTATION, while the preparation is genuinely pending. Each value is distinct.
+    // THE CALLER'S MUTATION: its input, its entry and every field of the nested locator, and the
+    // entry replaced. Each value is distinct.
     const MUTATED = {
       team: OTHER_TEAM, item: "2f000000-0000-4000-8000-00000000002f", workspace: "TMUTATEDKR16", channel: "CMUTATEDKR16",
       root: "1700000000.000216", integration: "1f000000-0000-4000-8000-00000000001f", revision: "d".repeat(64),
     };
-    Object.assign(callerLocator, {
-      workspaceId: MUTATED.workspace, channelId: MUTATED.channel, rootTs: MUTATED.root,
-      integrationId: MUTATED.integration, bindingConfigRevision: MUTATED.revision, namespaceRevision: 99,
-    });
-    Object.assign(callerEntry, { teamId: MUTATED.team, itemId: MUTATED.item, revisitAfterMs: 86_400_000 });
-    Object.assign(callerInput, { teamId: MUTATED.team, entry: { ...callerEntry } });
+    const mutate = (): void => {
+      Object.assign(callerLocator, {
+        workspaceId: MUTATED.workspace, channelId: MUTATED.channel, rootTs: MUTATED.root,
+        integrationId: MUTATED.integration, bindingConfigRevision: MUTATED.revision, namespaceRevision: 99,
+      });
+      Object.assign(callerEntry, { teamId: MUTATED.team, itemId: MUTATED.item, revisitAfterMs: 86_400_000 });
+      Object.assign(callerInput, { teamId: MUTATED.team, entry: { ...callerEntry } });
+    };
+    const pending = prepareSlackKnownRootRequeue(paused.session, callerInput as never, execution());
+    if (when === "synchronously, as the call returns") mutate();
+    await paused.reachedOrSettled(pending);
+    if (when === "while it is pending") mutate();
     paused.release();
     const result = await pending;
 
@@ -2367,5 +2423,10 @@ describe("known-root due-output conversion contract", () => {
     const everyParameter = JSON.stringify(sent.map((call) => call.params));
     expect(Object.values(MUTATED).filter((value) => everyParameter.includes(value)), "KR-16: no mutated value reached any statement").toEqual([]);
     expect(sent.find((call) => /\bdue_epoch_ms\b/.test(call.flat))?.params.slice(4), "KR-16: the due read used the CALLED item and revisit policy").toEqual([ITEM, REVISIT_MS]);
-  });
+  }
+
+  it("KR-16: a preparation keeps the team, entry and locator it was CALLED with, whatever the caller does to them while it is pending", () =>
+    kr16PreparationMutation("while it is pending"));
+  it("KR-16: a preparation keeps the team, entry and locator it was CALLED with when the caller rewrites them synchronously, before anything is awaited", () =>
+    kr16PreparationMutation("synchronously, as the call returns"));
 });
