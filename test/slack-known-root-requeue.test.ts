@@ -309,6 +309,41 @@ describe("known-root preparation — composed from teamId plus one enumerated en
       expect(statements).toEqual([]);
     }
   });
+
+  /**
+   * KR-16, §6 — the EXACT BOUNDARIES of the locator families the fabricated-locator case above
+   * refuses only from outside: the namespace revision (a nonnegative safe integer), the provider-id
+   * byte bound (256 bytes) and the configuration revision's length. An accepted boundary gets PAST
+   * validation into the session — the recording session then answers the settings read with nothing,
+   * which is not a caller-contract failure. A refused one is the static error before any statement.
+   */
+  it.each<[string, Record<string, unknown>]>([
+    ["namespace revision zero", { namespaceRevision: 0 }],
+    ["the largest safe namespace revision", { namespaceRevision: Number.MAX_SAFE_INTEGER }],
+    ["a workspace id of exactly 256 bytes", { workspaceId: "T".repeat(256) }],
+    ["a channel id of exactly 256 bytes", { channelId: "C".repeat(256) }],
+  ])("KR-16: accepts %s at its exact boundary: past validation, into the session (control)", async (label, over) => {
+    const { session, statements } = recordingSession();
+    const entry = located({ locator: { ...located().locator, ...over } as SlackKnownRootLocatedEntry["locator"] });
+    const error = await rejection(() => prepareSlackKnownRootRequeue(session, { teamId: TEAM, entry }, execution()));
+    expect(error, `${label}: not a caller-contract failure`).not.toBeInstanceOf(SlackKnownRootValidationError);
+    expect(statements.length, `${label}: the session was reached`).toBeGreaterThan(0);
+  });
+
+  it.each<[string, Record<string, unknown>]>([
+    ["one past the largest safe namespace revision", { namespaceRevision: Number.MAX_SAFE_INTEGER + 1 }],
+    ["a namespace revision given as decimal text", { namespaceRevision: "3" }],
+    ["a workspace id of 257 bytes", { workspaceId: "T".repeat(257) }],
+    ["a channel id of 257 bytes", { channelId: "C".repeat(257) }],
+    ["a configuration revision one hex digit short", { bindingConfigRevision: "c".repeat(63) }],
+    ["a configuration revision one hex digit long", { bindingConfigRevision: "c".repeat(65) }],
+  ])("KR-16: refuses %s, just past its boundary, as a static validation error before any statement", async (label, over) => {
+    const { session, statements } = recordingSession();
+    const entry = located({ locator: { ...located().locator, ...over } as SlackKnownRootLocatedEntry["locator"] });
+    const error = await rejection(() => prepareSlackKnownRootRequeue(session, { teamId: TEAM, entry }, execution()));
+    expectStaticValidationError(error, label);
+    expect(statements, `${label}: refused before any statement`).toEqual([]);
+  });
 });
 
 // ── §6: page requests, cursors and execution options ─────────────────────────
