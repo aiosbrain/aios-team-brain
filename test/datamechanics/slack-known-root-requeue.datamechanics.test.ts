@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
+import { PgClient } from "@/lib/db/pg/client";
 import { getPool } from "@/lib/db/pg/pool";
-import { TransactionExecutionError } from "@/lib/db/pg/tx";
-import type { SqlExecutor, TransactionSession } from "@/lib/db/types";
+import { runPgClientTransaction, TransactionExecutionError } from "@/lib/db/pg/tx";
+import type { DbClient, SqlExecutor, TransactionCapableDbClient, TransactionSession } from "@/lib/db/types";
 import { setMemberIdentity } from "@/lib/identity/member-identities";
 import { ingestItem } from "@/lib/ingest";
 import {
@@ -2290,6 +2291,13 @@ describe("KR-17 — the §7.5 single-channel capacity fixture: plans and the num
 });
 
 /**
+ * FIXTURE STATEMENT: the server raises a serialization failure. It reads and writes nothing. Shared by
+ * the M15a suite below and by "KR-12 retry exhaustion" at the end of this file.
+ */
+const RAISE_SERIALIZATION_FAILURE =
+  `do $$ begin raise exception using errcode = '40001', message = 'aio-1170 fixture: injected serialization failure'; end $$`;
+
+/**
  * KR-10 and M15a in their REAL-WRAPPER form (`docs/design/slack-known-root-requeue-spec.md` §8.2, §8.3,
  * §11 "Retry and accounting fixtures", §12).
  *
@@ -2322,10 +2330,6 @@ describe("KR-17 — the §7.5 single-channel capacity fixture: plans and the num
  * not a next page — the first attempt fails and the second commits.
  */
 describe("M15a real-wrapper retry accounting — KR-10 through runContextTransaction and a server-raised 40001 (real Postgres)", () => {
-  /** FIXTURE STATEMENT: the server raises a serialization failure. It reads and writes nothing. */
-  const RAISE_SERIALIZATION_FAILURE =
-    `do $$ begin raise exception using errcode = '40001', message = 'aio-1170 fixture: injected serialization failure'; end $$`;
-
   const NO_UNATTESTED = {
     not_slack: 0, invalid_metadata: 0, missing_channel_binding: 0, missing_namespace_pin: 0, item_missing: 0,
     canonical_mismatch: 0, missing_root_witness: 0, contradictory_ledger: 0,
@@ -8111,5 +8115,340 @@ describe("KR-12 a connection lost inside the caller transaction is discarded and
     const replacement = await kr12ExpectCommitsAfterwards(label, teamId, entry, exactDue);
     expect([wasDoomed(replacement), kr12Timeouts(replacement)],
       `${label}: the transaction that followed ran on another physical connection, whose settings at BEGIN were the established ones`).toEqual([false, baseline[0]]);
+  });
+});
+
+/**
+ * KR-12 — RETRY EXHAUSTION through the real wrapper, with both timeout settings read back on EACH
+ * attempt's own physical connection after that attempt's rollback, and before that connection can
+ * begin anything else (`docs/design/slack-known-root-requeue-spec.md` §7.4 "Throw with reusable
+ * connection", §11 KR-12 "retry exhaustion").
+ *
+ * EVIDENCE, NOT RED: expected to pass on the current source. The M15a suite above shows the same
+ * exhaustion's accounting and reads no setting and no connection; this case reads both.
+ *
+ * THE ONE SEAM IS THE ENGINE'S OWN. `runPgClientTransaction` takes an optional `connect` — "Explicit
+ * test seam; production omits it and uses the singleton pool checkout". The transaction-capable
+ * client below is the production client's `transaction` with that one addition: the same engine,
+ * and the same bound `PgClient` built from the engine's executor and failure reporter. The default
+ * client has no executor decorator and no envelope interceptor, so nothing else differs. The wrapper
+ * is the actual `runContextTransaction`, unmodified, and the 40001 is raised by the server.
+ *
+ * WHAT THE SEAM DOES, and why the ordering is OBSERVED rather than inferred:
+ *   - CHECKOUT. A client is taken from the real pool and read OUTSIDE any transaction, before the
+ *     engine sends BEGIN: its physical identity and its session baseline of both settings.
+ *   - GIVE-BACK. The engine gives a client back after its ROLLBACK. Given back WITHOUT an error, the
+ *     client is held — not returned to the pool — while the same read is made on it. Only then is it
+ *     returned. Nothing else can begin a transaction on it in between: the pool cannot hand out a
+ *     client it does not hold. Given back WITH an error, it is returned at once and never read: an
+ *     unusable connection is not asked anything. A read-back that is not the baseline returns the
+ *     client with an error, so the pool discards it and no later test inherits a contaminated session.
+ *   - THE LOG. Every checkout, callback start, give-back, read-back and return is written to one
+ *     numbered log, by physical identity. The read-back's identity is the one the read-back ITSELF
+ *     reports, so a read-back on another connection would not fall in that connection's sequence.
+ *   - A retry therefore never depends on getting the same connection again: each attempt's own
+ *     connection is read back, whichever connections the two attempts were given.
+ *
+ * NEGATIVE CALIBRATION, fixture-only. On a pooled connection outside the wrapper, each setting in
+ * turn is left changed at SESSION level — what a leak would look like — and read with the same
+ * read-back and judged by the same oracle, which must name that setting and only that one. Each is
+ * then reset, and the connection is returned only once it reads its baseline again; otherwise it is
+ * discarded. The same read inside an open transaction must report that it is not outside one.
+ *
+ * NOT CLAIMED. The 40001 is one fixture statement after the preparation, as in M15a; it is not a
+ * real concurrent serialization conflict. The checkout seam is the engine's test seam, not the
+ * process-wide default checkout. Nothing here is about an unusable connection: both attempts are
+ * expected to be reusable.
+ */
+describe("KR-12 retry exhaustion through the real wrapper, read back on each attempt's own connection (real Postgres)", () => {
+  type Kr12ReadBack = Kr12Session & { outside_any_transaction: boolean };
+  /**
+   * The read of KR12_SESSION_SQL, plus whether it ran outside any open transaction: in a statement of
+   * its own the transaction began when that statement did, and after a BEGIN it began earlier.
+   */
+  const READ_BACK_SQL = `${KR12_SESSION_SQL},
+         transaction_timestamp() = statement_timestamp() as outside_any_transaction`;
+  /** THE ORACLE: which of the two settings a read-back finds other than the baseline. */
+  const leftChanged = (baseline: Kr12Timeouts, readBack: Kr12Timeouts): string[] =>
+    (["statement_timeout_ms", "lock_timeout_ms"] as const).filter((name) => readBack[name] !== baseline[name]);
+
+  type Observation = {
+    seq: number;
+    kind: "checked out" | "callback began" | "given back by the engine" | "read back after rollback" | "read-back failed" | "returned to the pool";
+    identity: string;
+    attempt?: number;
+    settings?: Kr12Timeouts;
+    outsideAnyTransaction?: boolean;
+    withAnError?: boolean;
+  };
+
+  /** A transaction-capable client whose checkouts go through the engine's `connect` seam, observed as described above. */
+  function observedCheckouts() {
+    const real = db();
+    const log: Observation[] = [];
+    const holding: Promise<void>[] = [];
+    const note = (observation: Omit<Observation, "seq">): void => {
+      log.push({ seq: log.length, ...observation });
+    };
+    const connect = async (): Promise<PoolClient> => {
+      const client = await getPool().connect();
+      let atCheckout: Kr12Session;
+      try {
+        atCheckout = (await client.query<Kr12Session>(KR12_SESSION_SQL)).rows[0];
+      } catch (error) {
+        client.release(error instanceof Error ? error : new Error("fixture: the checkout read failed"));
+        throw error;
+      }
+      const identity = kr12Identity(atCheckout);
+      const baseline = kr12Timeouts(atCheckout);
+      note({ kind: "checked out", identity, settings: baseline });
+      let givenBack = false;
+      const release = (err?: Error | boolean): void => {
+        if (givenBack) throw new Error("fixture: the engine gave one checkout back twice");
+        givenBack = true;
+        const withAnError = err instanceof Error || err === true;
+        note({ kind: "given back by the engine", identity, withAnError });
+        if (withAnError) {
+          // Unusable: returned at once, with the engine's error, and never read.
+          client.release(err);
+          note({ kind: "returned to the pool", identity, withAnError: true });
+          return;
+        }
+        holding.push((async () => {
+          let discard: Error | undefined;
+          try {
+            const row = (await client.query<Kr12ReadBack>(READ_BACK_SQL)).rows[0];
+            const settings = kr12Timeouts(row);
+            note({ kind: "read back after rollback", identity: kr12Identity(row), settings, outsideAnyTransaction: row.outside_any_transaction });
+            if (leftChanged(baseline, settings).length > 0 || kr12Identity(row) !== identity) {
+              discard = new Error("fixture: a connection read back other than its baseline is discarded");
+            }
+          } catch (error) {
+            note({ kind: "read-back failed", identity });
+            discard = error instanceof Error ? error : new Error("fixture: the read-back failed");
+          } finally {
+            client.release(discard);
+            note({ kind: "returned to the pool", identity, withAnError: discard !== undefined });
+          }
+        })());
+      };
+      return new Proxy(client, {
+        get(target, property) {
+          if (property === "release") return release;
+          const value: unknown = Reflect.get(target, property, target);
+          return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+        },
+      });
+    };
+    const observedDb: TransactionCapableDbClient = {
+      from: real.from.bind(real),
+      rpc: real.rpc.bind(real),
+      transaction: <T>(fn: (session: TransactionSession) => Promise<T>) => runPgClientTransaction({
+        connect,
+        makeBoundClient: (executor, reportFailure): DbClient => new PgClient({ executor, reportFailure, bound: true }) as unknown as DbClient,
+      }, fn),
+    };
+    return {
+      db: observedDb, log, note,
+      /** Every held client read back and returned. Holds started while waiting are waited for too. */
+      settled: async (): Promise<void> => {
+        for (let index = 0; index < holding.length; index++) await holding[index];
+      },
+    };
+  }
+
+  /** Each setting left changed at session level in turn, read back and judged by the oracle; then reset and verified. */
+  async function calibratedOracle() {
+    const client = await getPool().connect();
+    let discard: Error | undefined;
+    try {
+      const read = async (): Promise<Kr12ReadBack> => (await client.query<Kr12ReadBack>(READ_BACK_SQL)).rows[0];
+      const start = await read();
+      const baseline = kr12Timeouts(start);
+      const another = (ms: number): number => (ms === 4_321 ? 4_322 : 4_321);
+      const leftAt = async (name: "statement_timeout" | "lock_timeout", ms: number) => {
+        // SESSION level (`false`), outside any transaction: exactly what would outlive a rollback.
+        await client.query(`select set_config($1, $2, false)`, [name, `${ms}ms`]);
+        const row = await read();
+        await client.query(name === "statement_timeout" ? `reset statement_timeout` : `reset lock_timeout`);
+        return { judged: leftChanged(baseline, kr12Timeouts(row)), sameConnection: kr12Identity(row) === kr12Identity(start), outside: row.outside_any_transaction };
+      };
+      const statement = await leftAt("statement_timeout", another(baseline.statement_timeout_ms));
+      const lock = await leftAt("lock_timeout", another(baseline.lock_timeout_ms));
+      // The ordering flag, calibrated too: the same read as the second statement of an open transaction.
+      await client.query(`begin`);
+      const inside = await read();
+      await client.query(`rollback`);
+      const afterReset = await read();
+      const resetJudged = leftChanged(baseline, kr12Timeouts(afterReset));
+      if (resetJudged.length > 0) discard = new Error("fixture: the calibration connection did not read its baseline again");
+      return {
+        startedOutsideAnyTransaction: start.outside_any_transaction,
+        statementLeftChanged: statement, lockLeftChanged: lock,
+        insideAnOpenTransaction: { outside: inside.outside_any_transaction, judged: leftChanged(baseline, kr12Timeouts(inside)) },
+        afterReset: { judged: resetJudged, sameConnection: kr12Identity(afterReset) === kr12Identity(start) },
+      };
+    } catch (error) {
+      discard = error instanceof Error ? error : new Error("fixture: the calibration failed");
+      throw error;
+    } finally {
+      // Back to the pool only at its baseline; otherwise discarded, so no later test inherits it.
+      client.release(discard);
+    }
+  }
+
+  it("KR-12 retry exhaustion restores both settings after each reusable attempt rolls back", async () => {
+    const label = "KR-12 retry exhaustion";
+    const { teamId, entry, exactDue } = await lifecycleAgedRoot(label, KR12_REVISIT);
+    const snapshotBefore = await lifecycleSnapshot(teamId);
+    const observed = observedCheckouts();
+    onTestFinished(() => observed.settled());
+
+    // ONE execution context, created before the wrapper is invoked and handed to both attempts (§7.2).
+    // The largest allowance the contract permits, so that two complete preparations fit in it.
+    const execution = createSlackKnownRootExecution({ ambientDeadlineAt: null, allowanceMs: 5_000 });
+    interface Attempt {
+      attempt: number;
+      atBegin: Kr12Session;
+      callerLocal: Kr12Timeouts;
+      /** Each timeout assignment the preparation sent ahead of a statement — not its restoration. */
+      applied: { statementMs: number; lockMs: number }[];
+      enqueueRowsReturned: number | null;
+      provisional: SlackKnownRootPreparationResult;
+      afterThePreparation: Kr12Timeouts;
+      queueRootsInside: string[];
+    }
+    const callbacks: number[] = [];
+    const attempts: Attempt[] = [];
+    const ended = await lifecycleTracked(runContextTransaction(observed.db, async (session, attempt) => {
+      callbacks.push(attempt);
+      const atBegin = await kr12SessionOf(session);
+      observed.note({ kind: "callback began", identity: kr12Identity(atBegin), attempt });
+      // THE CALLER'S OWN WRITE and THE CALLER'S OWN TRANSACTION-LOCAL TIMEOUTS, before the preparation.
+      await enqueueSlackThread(session, { teamId, workspaceId: WORKSPACE, channelId: CHANNEL, rootTs: KR12_CALLER_ROOT });
+      await session.executeSql(KR12_SET_CALLER_LOCAL, KR12_CALLER_LOCAL_PARAMS);
+      const callerLocal = kr12Timeouts(await kr12SessionOf(session));
+      const applied: Attempt["applied"] = [];
+      let enqueueRowsReturned: number | null = null;
+      // Pass-through: every statement is sent unchanged; the assignments and the insert are written down.
+      const handed = kr12Intercepted(session, async (text, params, pass) => {
+        const flat = kr12Flat(text);
+        if (flat.includes(KR12_TIMEOUT_ASSIGNMENT) && !kr12IsTheRestoration(flat, params)) {
+          applied.push({ statementMs: kr12Milliseconds(params?.[0]), lockMs: kr12Milliseconds(params?.[1]) });
+        }
+        const result = await pass(text, params);
+        if (flat.includes(KR12_ENQUEUE_INSERT)) enqueueRowsReturned = result.rows.length;
+        return result;
+      });
+      const provisional = await prepareSlackKnownRootRequeue(handed, { teamId, entry }, execution);
+      const afterThePreparation = kr12Timeouts(await kr12SessionOf(session));
+      const queueRootsInside = (await session.executeSql<{ root_ts: string }>(
+        `select root_ts from slack_sync_threads where team_id = $1 order by root_ts`, [teamId]
+      )).rows.map((row) => row.root_ts);
+      attempts.push({ attempt, atBegin, callerLocal, applied, enqueueRowsReturned, provisional, afterThePreparation, queueRootsInside });
+      // THE SERVER raises 40001 on EVERY attempt: the wrapper's retry is exhausted.
+      await session.executeSql(RAISE_SERIALIZATION_FAILURE);
+      return provisional;
+    })).ended;
+    await observed.settled();
+
+    // ── THE FINAL OUTCOME: two attempts, one terminal serialization_failure, no successful receipt. ──
+    expect(ended.state, `${label}: the complete runContextTransaction promise did not resolve (${JSON.stringify(lifecycleShown(ended))})`).toBe("rejected");
+    if (ended.state !== "rejected") return;
+    const error = ended.error as { code?: unknown; unknownCommit?: unknown };
+    const receipt: SlackKnownRootReceipt = {
+      entryIndex: 0, state: "failed", attempts: callbacks.length as 0 | 1 | 2, failure: classifySlackKnownRootPreparationFailure(ended.error),
+    };
+    expect({ callbacks, anEngineError: ended.error instanceof TransactionExecutionError, sqlstate: error.code, unknownCommit: error.unknownCommit, receipt },
+      `${label}: the wrapper ran the callback as attempt 1 and attempt 2 and no third time, and finally rejected with the engine's error carrying the server's 40001: one failed receipt`).toEqual({
+      callbacks: [1, 2], anEngineError: true, sqlstate: "40001", unknownCommit: false,
+      receipt: { entryIndex: 0, state: "failed", attempts: 2, failure: "serialization_failure" },
+    });
+    const tally = tallySlackKnownRootPage({ examined: 1, receipts: [receipt] });
+    expect({
+      enqueued: tally.enqueued, already_pending: tally.already_pending, preparation_failed: tally.preparation_failed,
+      serialization_failure: tally.failureCounts.serialization_failure,
+      allFailures: Object.values(tally.failureCounts).reduce((total, count) => total + count, 0),
+    }, `${label}: the slot counts once, as one serialization_failure, and nothing counts as completed`).toEqual({
+      enqueued: 0, already_pending: 0, preparation_failed: 1, serialization_failure: 1, allFailures: 1,
+    });
+
+    // ── INSIDE EACH ATTEMPT: the caller's overrides, the preparation's own caps, and a provisional enqueue. ──
+    expect(attempts.map((a) => a.attempt), `${label}: fixture: both attempts reached the fixture statement`).toEqual([1, 2]);
+    for (const a of attempts) {
+      const where = `${label}: attempt ${a.attempt}`;
+      expect({
+        callerLocal: a.callerLocal,
+        appliedAny: a.applied.length > 0,
+        everyLockCapIs250: a.applied.every((assignment) => assignment.lockMs === 250),
+        everyStatementCapIsWithinTheAllowance: a.applied.every((assignment) => assignment.statementMs >= 1 && assignment.statementMs <= 5_000),
+        enqueueRowsReturned: a.enqueueRowsReturned,
+        provisional: a.provisional,
+        queueRootsInside: a.queueRootsInside,
+        afterThePreparation: a.afterThePreparation,
+      }, `${where}: the caller's own overrides were in force, the preparation changed both settings before its statements and reached a provisional enqueue, and on its normal return the caller's values were back`).toEqual({
+        callerLocal: KR12_CALLER_LOCAL,
+        appliedAny: true, everyLockCapIs250: true, everyStatementCapIsWithinTheAllowance: true,
+        enqueueRowsReturned: 1,
+        provisional: { outcome: "enqueued" },
+        queueRootsInside: [OLD_ROOT, KR12_CALLER_ROOT],
+        afterThePreparation: KR12_CALLER_LOCAL,
+      });
+    }
+    // The ONE context: the second attempt gets no fresh allowance.
+    const [first, second] = attempts;
+    expect(second.applied[0].statementMs <= (first.applied.at(-1)?.statementMs ?? Number.NaN),
+      `${label}: the second attempt's first statement timeout (${second.applied[0].statementMs} ms) is no more than the first attempt's last (${first.applied.at(-1)?.statementMs} ms): the same context, not a fresh allowance`).toBe(true);
+
+    // ── EACH ATTEMPT'S OWN PHYSICAL CONNECTION, after its rollback, before it could begin anything else. ──
+    for (const a of attempts) {
+      const where = `${label}: attempt ${a.attempt}`;
+      const identity = kr12Identity(a.atBegin);
+      const began = observed.log.find((o) => o.kind === "callback began" && o.attempt === a.attempt);
+      if (!began) throw new Error(`fixture: ${where} was not logged`);
+      // That connection's own sequence: from its checkout for this attempt to its next checkout, if any.
+      const ofIt = observed.log.filter((o) => o.identity === identity);
+      const from = ofIt.filter((o) => o.kind === "checked out" && o.seq < began.seq).at(-1);
+      if (!from) throw new Error(`fixture: ${where} has no checkout before its callback`);
+      const next = ofIt.find((o) => o.kind === "checked out" && o.seq > from.seq);
+      const sequence = ofIt.filter((o) => o.seq >= from.seq && (next === undefined || o.seq < next.seq));
+      expect(sequence.map((o) => o.kind),
+        `${where}: on its own connection: checked out, the callback began, the engine gave it back, it was read back, and only then returned to the pool`).toEqual([
+        "checked out", "callback began", "given back by the engine", "read back after rollback", "returned to the pool",
+      ]);
+      const [checkedOut, , givenBack, readBack, returned] = sequence;
+      const baseline = checkedOut.settings;
+      if (!baseline) throw new Error(`fixture: ${where} has no baseline`);
+      expect({
+        beginFoundTheBaseline: kr12Timeouts(a.atBegin),
+        statementBaselineIsNeitherTheCallersNorAnyCap: baseline.statement_timeout_ms !== KR12_CALLER_LOCAL.statement_timeout_ms && a.applied.every((assignment) => assignment.statementMs !== baseline.statement_timeout_ms),
+        lockBaselineIsNeitherTheCallersNorTheCap: baseline.lock_timeout_ms !== KR12_CALLER_LOCAL.lock_timeout_ms && baseline.lock_timeout_ms !== 250,
+      }, `${where}: fixture: BEGIN found the session baseline, and a leak of the caller's or the preparation's values would be visible against it`).toEqual({
+        beginFoundTheBaseline: baseline, statementBaselineIsNeitherTheCallersNorAnyCap: true, lockBaselineIsNeitherTheCallersNorTheCap: true,
+      });
+      expect({
+        givenBackWithAnError: givenBack.withAnError,
+        readOutsideAnyTransaction: readBack.outsideAnyTransaction,
+        leftChanged: readBack.settings ? leftChanged(baseline, readBack.settings) : null,
+        readBack: readBack.settings,
+        returnedWithAnError: returned.withAnError,
+      }, `${where}: after the rollback, on the same physical connection and outside any transaction, both settings read the session baseline, and the connection went back to the pool as reusable`).toEqual({
+        givenBackWithAnError: false, readOutsideAnyTransaction: true, leftChanged: [], readBack: baseline, returnedWithAnError: false,
+      });
+    }
+
+    // ── NOTHING DURABLE: neither the caller's write nor either attempt's enqueue. ──
+    expect(await lifecycleQueueAndStagingAnywhere(), `${label}: no queue row and no staging survived either attempt`).toEqual({ queue: [], staging: [] });
+    expect(await lifecycleSnapshot(teamId), `${label}: no row of any snapshotted surface survived as a change`).toEqual(snapshotBefore);
+    await kr12ExpectCommitsAfterwards(label, teamId, entry, exactDue);
+
+    // ── NEGATIVE CALIBRATION: the same read-back and oracle detect each setting left changed, separately. ──
+    expect(await calibratedOracle(), `${label}: calibration: a session-level leak of either setting alone is named, and only that one; the read inside a transaction says so; and the connection reads its baseline again before it is returned`).toEqual({
+      startedOutsideAnyTransaction: true,
+      statementLeftChanged: { judged: ["statement_timeout_ms"], sameConnection: true, outside: true },
+      lockLeftChanged: { judged: ["lock_timeout_ms"], sameConnection: true, outside: true },
+      insideAnOpenTransaction: { outside: false, judged: [] },
+      afterReset: { judged: [], sameConnection: true },
+    });
   });
 });
