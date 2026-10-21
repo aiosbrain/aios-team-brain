@@ -188,6 +188,48 @@ const rejectingEnded = (run: Promise<unknown>, failure: Error): Promise<Rejectin
   (error: unknown): RejectingEnded => ({ rejectedWithTheExecutorsOwnFailure: error === failure })
 );
 
+/**
+ * KR-16 — a DEFERRED BARRIER at the first statement an operation sends. The caller's session is
+ * wrapped so that its first `executeSql` call is held, unanswered, until the test releases it; every
+ * call, the first included, is then forwarded to `inner` unchanged. `reachedOrSettled` resolves when
+ * the operation is genuinely pending at that call — or throws a fixture error if the operation ended
+ * first — so nothing here sleeps, and nothing waits on a time.
+ */
+function pausedAtFirstStatement(inner: TransactionSession) {
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => { release = resolve; });
+  let arrive!: () => void;
+  const reached = new Promise<void>((resolve) => { arrive = resolve; });
+  let first = true;
+  const executeSql = (async (text: string, params?: unknown[]) => {
+    if (first) {
+      first = false;
+      arrive();
+      await released;
+    }
+    return inner.executeSql(text, params);
+  }) as SqlExecutor;
+  const session = {
+    get db(): never {
+      throw new Error("fixture: the caller's own db client was used");
+    },
+    executeSql,
+    optionalAudit: async (): Promise<never> => {
+      throw new Error("fixture: the caller's own audit helper was used");
+    },
+  } as unknown as TransactionSession;
+  return {
+    session,
+    release: (): void => release(),
+    /** Resolves once the operation is held at its first statement; a fixture error if it ended without getting there. */
+    reachedOrSettled: async (operation: Promise<unknown>): Promise<void> => {
+      const ended = operation.then(() => "resolved", () => "rejected");
+      const whichFirst = await Promise.race([reached.then(() => "reached" as const), ended]);
+      if (whichFirst !== "reached") throw new Error(`fixture: the operation ${whichFirst} before it sent a statement`);
+    },
+  };
+}
+
 /** The one sentence a caller-contract failure may say. Stated here, not imported: a changed message must fail. */
 const STATIC_VALIDATION_MESSAGE = "slack known-root: invalid request";
 const STATIC_DEADLINE_MESSAGE = "slack known-root: operation deadline exceeded";
