@@ -8452,3 +8452,152 @@ describe("KR-12 retry exhaustion through the real wrapper, read back on each att
     });
   });
 });
+
+/**
+ * KR-10 — CONTENTION THROWS while the exact next page remains obtainable
+ * (`docs/design/slack-known-root-requeue-spec.md` §4.3, §8.4, §11 KR-10).
+ *
+ * EVIDENCE, NOT RED: expected to pass on the current source. Earlier cases show each half alone: the
+ * M15a continuation shows a failed slot does not prevent the next page, with a server-raised 40001;
+ * the KR-12 `55P03` rows show contention rejecting the real transaction. This case shows both
+ * together, with the lock STILL HELD while the next page is read.
+ *
+ * THE BOUNDARY, written out. The team holds exactly two items: the published root, and one bare
+ * fixture item with a CHOSEN id above every random one. At page size one the first page is the root
+ * alone, and its cursor continues after the root inside a range frozen at the chosen id. The next
+ * page is therefore the bare item alone, `not_slack`, and the end of the range. Both pages are
+ * literals, not read from a second traversal.
+ *
+ * THE LOCK PREMISE, observed and not timed. Another pooled transaction takes the root's item row
+ * `for update` — the row preparation locks after the authority locks — and then waits on a hold
+ * point the test controls. From this file's own connection, a `for update skip locked` probe finds
+ * that row locked; it is asked again after the preparation and after the next-page read. The
+ * holder is released only in the `finally`, after every assertion about the next page. Nothing
+ * sleeps. The holder's backend is another one than the preparation's.
+ *
+ * NOT CLAIMED. The wait is not timed here; the applied 250 ms cap and the wait bounds are the
+ * KR-12 `55P03` rows' evidence. The contention is on the item row only, not on the authority rows
+ * locked earlier. The page reader takes no row lock, so it is not expected to wait at all.
+ */
+describe("KR-10 contention and continuation together (real Postgres)", () => {
+  /** A CHOSEN id above any random UUID the fixture's real items can have. */
+  const LAST_ID = "ffffffff-ffff-4fff-bfff-fffffffffff0";
+
+  it("KR-10 contention throws while the exact next page remains obtainable", async () => {
+    const label = "KR-10 contention";
+    const { teamId, entry, exactDue } = await lifecycleAgedRoot(label, KR12_REVISIT);
+    if ("unlocated" in entry) throw new Error("fixture: the published root was not located");
+    const rootId = entry.itemId;
+
+    // FIXTURE DML: the bare boundary item, a non-Slack row with a CHOSEN id, in a project of the team's own.
+    const [project] = await query<{ id: string }>(`insert into projects (team_id, slug) values ($1, 'kr10-boundary') returning id::text as id`, [teamId]);
+    const inserted = await (await rawSql()).query(
+      `insert into items (id, team_id, project_id, path, kind, access, frontmatter, body, content_sha256, member_id, member_id_locked)
+       values ($1::uuid, $2::uuid, $3::uuid, 'kr10/boundary.md', 'deliverable', 'team', '{}'::jsonb, '', repeat('a', 64), null, false)`,
+      [LAST_ID, teamId, project.id]
+    );
+    expect(inserted.rowCount, `${label}: fixture: exactly one boundary item was inserted`).toBe(1);
+    expect(rootId < LAST_ID, `${label}: fixture: the root's random id sorts below the chosen boundary id`).toBe(true);
+    expect((await query<{ id: string }>(`select id::text as id from items where team_id = $1 order by id`, [teamId])).map((row) => row.id),
+      `${label}: fixture: the team holds exactly the root and the boundary item, in that order`).toEqual([rootId, LAST_ID]);
+
+    const pageOfOne = (cursor?: SlackKnownRootItemPage["nextCursor"]) => tx((s) => readSlackKnownRootItemPage(
+      s, { teamId, pageSize: 1, revisitAfterMs: KR12_REVISIT.ms, ...(cursor ? { cursor } : {}) }, createSlackKnownRootExecution({ ambientDeadlineAt: null })
+    ));
+    // THE TWO PAGES, written out.
+    const EXPECTED_CURSOR = { version: 1, teamId, upperItemId: LAST_ID, afterItemId: rootId, revisitAfterMs: KR12_REVISIT.ms };
+    const EXPECTED_FIRST_PAGE = { entries: [entry], nextCursor: EXPECTED_CURSOR, exhausted: false, examined: 1 };
+    const EXPECTED_NEXT_PAGE = {
+      entries: [{ teamId, itemId: LAST_ID, revisitAfterMs: KR12_REVISIT.ms, unlocated: "not_slack" }],
+      nextCursor: null, exhausted: true, examined: 1,
+    };
+
+    // ── THE COMMITTED FIRST PAGE, and its exact cursor. ──
+    const firstPage = await pageOfOne();
+    expect(firstPage, `${label}: the first page is the root alone, and its cursor continues after the root inside the frozen range`).toEqual(EXPECTED_FIRST_PAGE);
+    const cursor = firstPage.nextCursor;
+    if (cursor === null) throw new Error("fixture: the first page has no cursor");
+    const cursorBytes = JSON.stringify(cursor);
+    const snapshotBefore = await lifecycleSnapshot(teamId);
+
+    /** From this file's own connection, outside any transaction: is the root's item row locked by someone? */
+    const itemRow = async (): Promise<"locked" | "free"> =>
+      ((await query(`select 1 as free from items where team_id = $1::uuid and id = $2::uuid for update skip locked`, [teamId, rootId])).length === 0 ? "locked" : "free");
+    expect(await itemRow(), `${label}: fixture: nobody holds the root's item row before the holder takes it`).toBe("free");
+
+    // ── THE BLOCKER: another pooled transaction holds the root's item row lock until it is let go. ──
+    const hold = lifecycleHold<number>();
+    const holder = lifecycleTracked(tx(async (b) => {
+      const locked = await b.executeSql(`select 1 from items where team_id = $1::uuid and id = $2::uuid for update`, [teamId, rootId]);
+      if (locked.rows.length !== 1) throw new Error("fixture: the root's item row was not there to lock");
+      hold.arrive(await lifecyclePidOf(b));
+      await hold.released;
+    }));
+    const letGo = (): Promise<LifecycleEnded<void>> => {
+      hold.release();
+      return holder.ended;
+    };
+    onTestFinished(async () => {
+      await letGo();
+    });
+
+    let holderPid: number | null = null;
+    try {
+      holderPid = await lifecycleArrived(hold.reached, holder, "the holder of the root's item row lock");
+      expect([await itemRow(), holder.hasEnded()], `${label}: the lock premise: the root's item row is locked, and its holder is still in its transaction`).toEqual(["locked", false]);
+
+      // ── THE PREPARATION, through the actual wrapper, with one context created before it. ──
+      const execution = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+      const attempts: number[] = [];
+      const preparerPids: number[] = [];
+      const provisional: SlackKnownRootPreparationResult[] = [];
+      const ended = await lifecycleTracked(runContextTransaction(db(), async (session, attempt) => {
+        attempts.push(attempt);
+        preparerPids.push(await lifecyclePidOf(session));
+        const outcome = await prepareSlackKnownRootRequeue(session, { teamId, entry: firstPage.entries[0] }, execution);
+        provisional.push(outcome);
+        return outcome;
+      })).ended;
+
+      expect(ended.state, `${label}: the complete runContextTransaction promise did not resolve (${JSON.stringify(lifecycleShown(ended))})`).toBe("rejected");
+      if (ended.state !== "rejected") return;
+      const error = ended.error as { code?: unknown; unknownCommit?: unknown; sql?: unknown };
+      expect({
+        attempts, provisional,
+        anotherBackendHeldTheLock: preparerPids.length === 1 && preparerPids[0] !== holderPid,
+        anEngineError: ended.error instanceof TransactionExecutionError,
+        sqlstate: error.code, unknownCommit: error.unknownCommit,
+        failedAtTheItemRowLock: typeof error.sql === "string" && kr12Flat(error.sql).endsWith(KR12_ITEM_ROW_LOCK_ENDS),
+        category: classifySlackKnownRootPreparationFailure(ended.error),
+      }, `${label}: contention THROWS: one attempt, no result of any kind, and the engine's error with the server's 55P03 at the item row lock`).toEqual({
+        attempts: [1], provisional: [],
+        anotherBackendHeldTheLock: true,
+        anEngineError: true, sqlstate: "55P03", unknownCommit: false, failedAtTheItemRowLock: true,
+        category: "lock_timeout",
+      });
+      expect([await itemRow(), holder.hasEnded()], `${label}: the lock is still held after the preparation failed`).toEqual(["locked", false]);
+
+      // ── THE NEXT PAGE, from the already committed cursor, WHILE the lock is still held. ──
+      const nextPage = await pageOfOne(cursor);
+      expect([await itemRow(), holder.hasEnded()], `${label}: the lock was held throughout the next-page read`).toEqual(["locked", false]);
+      expect(nextPage, `${label}: the exact next page remains obtainable while the preparation's contention holds: the boundary item alone, and the end of the range`).toEqual(EXPECTED_NEXT_PAGE);
+      expect([JSON.stringify(cursor) === cursorBytes, cursor], `${label}: the failed preparation did not consume, rewrite or reset the committed cursor`).toEqual([true, EXPECTED_CURSOR]);
+
+      // ── NOTHING DURABLE, read from another connection while the lock is still held. ──
+      expect(await lifecycleQueueAndStagingAnywhere(), `${label}: no queue row and no staging were created`).toEqual({ queue: [], staging: [] });
+      expect(await lifecycleSnapshot(teamId), `${label}: no row of any snapshotted surface changed`).toEqual(snapshotBefore);
+      expect(holder.hasEnded(), `${label}: the holder was still in its transaction when every assertion above was made`).toBe(false);
+    } finally {
+      await letGo();
+    }
+
+    // ── AFTER THE RELEASE: the holder ended normally, nothing is left locked, and preparation proceeds. ──
+    expect([(await holder.ended).state, holderPid !== null], `${label}: the holder's own transaction ended normally once it was let go`).toEqual(["resolved", true]);
+    expect(await itemRow(), `${label}: the root's item row is free again`).toBe("free");
+    expect(await query(
+      `select locktype from pg_locks where pid = $1 and (locktype = 'transactionid' or relation = 'items'::regclass)`, [holderPid]
+    ), `${label}: the holder's backend holds no transaction or items lock any more`).toEqual([]);
+    expect(await pageOfOne(cursor), `${label}: the same cursor still yields the same next page`).toEqual(EXPECTED_NEXT_PAGE);
+    await kr12ExpectCommitsAfterwards(label, teamId, entry, exactDue);
+  });
+});
