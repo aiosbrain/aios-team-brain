@@ -8904,3 +8904,196 @@ describe("KR-15 FIFO delay and orphan risk — characterizations, not fairness o
     });
   });
 });
+
+/**
+ * KR-16 — NO CANARY IN ANY REPORTABLE OUTPUT, after the transaction engine's own outer replacement
+ * (`docs/design/slack-known-root-requeue-spec.md` §6, §8.1, §11 KR-16: "including classification
+ * after outer transaction replacement").
+ *
+ * EVIDENCE, NOT RED: expected to pass on the current source.
+ *
+ * THE REPLACEMENT IS REAL. Inside the actual `runContextTransaction`, on the real pool, the real
+ * preparation runs and provisionally enqueues. Then one FIXTURE statement fails on the server: it
+ * names a relation that does not exist and selects the four other canaries as literals, so its SQL
+ * text carries all five. The callback catches that failure and throws an error of its OWN that
+ * quotes every canary. The engine's failure tracker recorded the server failure, so it REPLACES the
+ * callback's error with its own `TransactionExecutionError`, whose `.sql` and cause carry the
+ * canaries. That outer error is the final rejection of the complete promise.
+ *
+ * THE BOUNDARY, stated and not blurred. The private outer exception is NOT scrubbed, and this case
+ * shows it is not: the same walker finds every canary in it, and in the callback's error. It is
+ * handed ONLY to the classifier, after the whole promise has rejected. What is reportable is what is
+ * built from the classification, together with this packet's other outputs, and each of those is
+ * walked whole — every own field, string-keyed or symbol-keyed, enumerable or not, nested, an
+ * error's name, message, stack and cause included:
+ *   - new VALIDATION exceptions, raised here from inputs carrying canaries, as the static errors
+ *     they are;
+ *   - SUCCESSFUL OUTPUTS: the provisional preparation result and a real enumeration page;
+ *   - the CLASSIFIER output, the receipt built from it and the TALLY;
+ *   - TELEMETRY: every console call made while all of the above ran, captured by spies, and the
+ *     reportable record a caller would emit.
+ * None may hold a canary, and no captured telemetry argument may BE one of the private errors.
+ *
+ * NOT CLAIMED. The shared transaction error class is unchanged and still carries driver text, SQL
+ * and cause. No logger of the product is exercised: the primitive and the engine have none, so
+ * "telemetry" is the console and the caller's own record.
+ */
+describe("KR-16 redaction after the transaction engine's outer replacement (real Postgres)", () => {
+  /** SYNTHETIC CANARIES, unique to this case. */
+  const KR16_CANARY = Object.freeze({
+    metadata: "KR16-CANARY-METADATA-c41e07",
+    token: "xoxb-KR16-CANARY-TOKEN-9b3a52",
+    fingerprint: "KR16-CANARY-FINGERPRINT-6d0f88",
+    ciphertext: "KR16-CANARY-CIPHERTEXT-2a71c9",
+    sql: "kr16_canary_sql_relation_e58b14",
+  });
+  const KR16_CANARIES = Object.values(KR16_CANARY);
+
+  /**
+   * Every string reachable from a value: strings themselves, every own key, every own property's
+   * value — data or, guarded, accessor — and an error's name, message, stack and cause. Cycles and
+   * depth are bounded. A throwing accessor contributes nothing.
+   */
+  function kr16ReachableText(root: unknown): string {
+    const texts: string[] = [];
+    const seen = new Set<unknown>();
+    const visit = (value: unknown, depth: number): void => {
+      if (typeof value === "string") {
+        texts.push(value);
+        return;
+      }
+      if ((typeof value !== "object" && typeof value !== "function") || value === null || seen.has(value) || depth > 10) return;
+      seen.add(value);
+      if (value instanceof Error) {
+        texts.push(value.name, value.message, String(value.stack ?? ""));
+        visit((value as { cause?: unknown }).cause, depth + 1);
+      }
+      for (const key of Reflect.ownKeys(value)) {
+        texts.push(String(key));
+        try {
+          visit((value as Record<PropertyKey, unknown>)[key], depth + 1);
+        } catch {
+          // A throwing accessor exposes nothing.
+        }
+      }
+    };
+    visit(root, 0);
+    return texts.join("\n");
+  }
+  const kr16CanariesIn = (value: unknown): string[] => {
+    const text = kr16ReachableText(value);
+    return KR16_CANARIES.filter((canary) => text.includes(canary)).sort();
+  };
+
+  it("KR-16 no canary reaches a reportable output or telemetry after the engine replaces the callback's error", async () => {
+    const label = "KR-16 outer replacement";
+    const { teamId, entry } = await lifecycleAgedRoot(label, KR12_REVISIT);
+    if ("unlocated" in entry) throw new Error("fixture: the published root was not located");
+
+    // FIXTURE STATEMENT: fails on the server (no such relation), and its text carries all five canaries.
+    const FAILING_SQL = `select '${KR16_CANARY.metadata}' as metadata, '${KR16_CANARY.token}' as token,
+                                '${KR16_CANARY.fingerprint}' as fingerprint, '${KR16_CANARY.ciphertext}' as ciphertext
+                           from ${KR16_CANARY.sql}`;
+    const callbackError = new Error(`aio-1170 fixture: the callback's own error quotes ${KR16_CANARIES.join(" ")}`);
+
+    // ── TELEMETRY CAPTURE: every console call while the packet's outputs are produced. ──
+    const telemetry: unknown[][] = [];
+    const spies = (["log", "info", "warn", "error", "debug"] as const).map((method) =>
+      vi.spyOn(console, method).mockImplementation((...args: unknown[]) => {
+        telemetry.push([method, ...args]);
+      }));
+    const restoreSpies = (): void => {
+      for (const spy of spies) spy.mockRestore();
+    };
+    onTestFinished(restoreSpies);
+
+    const attempts: number[] = [];
+    const provisional: SlackKnownRootPreparationResult[] = [];
+    let serverFailure: unknown = null;
+    let ended: LifecycleEnded<SlackKnownRootPreparationResult> | null = null;
+    const validationErrors: unknown[] = [];
+    let page: SlackKnownRootItemPage | null = null;
+    try {
+      // NEW VALIDATION EXCEPTIONS, each from an input that carries a canary.
+      const pageExecution = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+      validationErrors.push((await lifecycleTracked(tx((s) => readSlackKnownRootItemPage(
+        s, { teamId: KR16_CANARY.token, pageSize: 10, revisitAfterMs: KR12_REVISIT.ms }, pageExecution
+      ))).ended as { error?: unknown }).error);
+      validationErrors.push((await lifecycleTracked(tx((s) => prepareSlackKnownRootRequeue(
+        s, { teamId, entry: { ...entry, locator: { ...entry.locator, workspaceId: KR16_CANARY.metadata } } }, createSlackKnownRootExecution({ ambientDeadlineAt: null })
+      ))).ended as { error?: unknown }).error);
+      validationErrors.push((await lifecycleTracked(tx((s) => prepareSlackKnownRootRequeue(
+        s, { teamId, entry: { ...entry, locator: { ...entry.locator, bindingConfigRevision: KR16_CANARY.fingerprint } } }, createSlackKnownRootExecution({ ambientDeadlineAt: null })
+      ))).ended as { error?: unknown }).error);
+      try {
+        createSlackKnownRootExecution({ ambientDeadlineAt: null, allowanceMs: KR16_CANARY.ciphertext as unknown as number });
+      } catch (error) {
+        validationErrors.push(error);
+      }
+
+      // A SUCCESSFUL OUTPUT: the real enumeration page of the team.
+      page = await tx((s) => readSlackKnownRootItemPage(s, { teamId, pageSize: 100, revisitAfterMs: KR12_REVISIT.ms }, createSlackKnownRootExecution({ ambientDeadlineAt: null })));
+
+      // ── THE INVOCATION: one context, created before the wrapper is invoked. ──
+      const execution = createSlackKnownRootExecution({ ambientDeadlineAt: null });
+      ended = await lifecycleTracked(runContextTransaction(db(), async (session, attempt) => {
+        attempts.push(attempt);
+        provisional.push(await prepareSlackKnownRootRequeue(session, { teamId, entry }, execution));
+        try {
+          await session.executeSql(FAILING_SQL);
+        } catch (failure) {
+          serverFailure = failure;
+        }
+        throw callbackError;
+      })).ended;
+    } finally {
+      restoreSpies();
+    }
+
+    if (ended === null || page === null) throw new Error("fixture: the case did not get as far as its invocation");
+    expect([page.examined, page.entries.length], `${label}: fixture: the successful enumeration page holds the team's one root`).toEqual([1, 1]);
+
+    // ── FIXTURE VALIDITY: each validation exception is the static one, and the replacement is real. ──
+    expect(validationErrors.map((error) => [error instanceof SlackKnownRootValidationError, (error as Error | undefined)?.message]),
+      `${label}: fixture: four new validation exceptions, each the static error with the static message`).toEqual(
+      Array.from({ length: 4 }, () => [true, "slack known-root: invalid request"]));
+    expect(ended.state, `${label}: the complete runContextTransaction promise did not resolve (${JSON.stringify(lifecycleShown(ended))})`).toBe("rejected");
+    if (ended.state !== "rejected") return;
+    const outer = ended.error;
+    expect({
+      attempts, provisional,
+      serverFailureCode: (serverFailure as { code?: unknown } | null)?.code,
+      replaced: outer !== callbackError,
+      anEngineError: outer instanceof TransactionExecutionError,
+      outerCode: (outer as { code?: unknown }).code,
+      unknownCommit: (outer as { unknownCommit?: unknown }).unknownCommit,
+    }, `${label}: fixture: one attempt reached a provisional enqueue, the server failed the fixture statement, and the engine REPLACED the callback's error with its own`).toEqual({
+      attempts: [1], provisional: [{ outcome: "enqueued" }], serverFailureCode: "42P01",
+      replaced: true, anEngineError: true, outerCode: "42P01", unknownCommit: false,
+    });
+
+    // ── THE PRIVATE ERRORS ARE NOT SCRUBBED: the walker finds every canary in them (its positive control). ──
+    expect({ outer: kr16CanariesIn(outer), callbackError: kr16CanariesIn(callbackError) },
+      `${label}: the private outer exception and the callback's error both still carry every canary — they are private, not reportable`).toEqual({
+      outer: [...KR16_CANARIES].sort(), callbackError: [...KR16_CANARIES].sort(),
+    });
+
+    // ── CLASSIFICATION, only now that the complete promise has rejected. ──
+    const category = classifySlackKnownRootPreparationFailure(outer);
+    const receipt: SlackKnownRootReceipt = { entryIndex: 0, state: "failed", attempts: attempts.length as 0 | 1 | 2, failure: category };
+    const tally = tallySlackKnownRootPage({ examined: 1, receipts: [receipt] });
+    /** What a caller would emit for this slot: built from the classification only. */
+    const reportedRecord = { slot: 0, attempts: receipt.attempts, failure: category, tally };
+    expect([category, tally.preparation_failed, tally.failureCounts.database_failure], `${label}: one database_failure, counted once`).toEqual(["database_failure", 1, 1]);
+
+    // ── THE WHOLE REPORTABLE SET, walked. ──
+    const reportable = { validationErrors, successfulOutputs: { provisional, page }, category, receipt, tally, reportedRecord, consoleTelemetry: telemetry };
+    expect(kr16CanariesIn(reportable), `${label}: no canary in any own or nested field of any validation exception, successful output, classifier output, receipt, tally or captured telemetry`).toEqual([]);
+    const privateErrors = [outer, callbackError, serverFailure];
+    expect(telemetry.flat().filter((argument) => privateErrors.includes(argument)).length,
+      `${label}: no captured telemetry argument is one of the private errors`).toBe(0);
+
+    // The attempt rolled back: nothing durable.
+    expect(await lifecycleQueueAndStagingAnywhere(), `${label}: the rejected transaction left no queue row and no staging`).toEqual({ queue: [], staging: [] });
+  });
+});
