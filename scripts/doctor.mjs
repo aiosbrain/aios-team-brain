@@ -163,11 +163,15 @@ export function checkPgSsl(env) {
   try {
     tls = resolvePgTls(url, { legacyTls: shouldUseSsl(url, env), env });
   } catch (err) {
-    return {
-      status: FAIL,
-      detail: `PG_CA_CERT/PG_TLS_VERIFY_HOSTNAME rejected — every connection will refuse: ${err instanceof Error ? err.message : err}`,
-      fix: "set PG_CA_CERT to the server's CA certificate (PEM or base64 PEM), or unset it — see docs/OPS.md § Postgres TLS",
-    };
+    const message = err instanceof Error ? err.message : String(err);
+    if (/PG_CA_CERT|PG_TLS_VERIFY_HOSTNAME/.test(message)) {
+      return {
+        status: FAIL,
+        detail: `TLS settings rejected — every connection will refuse: ${message}`,
+        fix: "set PG_CA_CERT to the server's CA certificate (PEM or base64 PEM), or unset it — see docs/OPS.md § 13",
+      };
+    }
+    return { status: FAIL, detail: "DATABASE_URL could not be parsed by node-postgres (value redacted)", fix: "check the connection string and any sslrootcert path" };
   }
   const from =
     tls.source === "url" ? " (set by sslmode/ssl in DATABASE_URL)" : tls.source === "env" ? " (set by PGSSLMODE)" : "";
@@ -183,7 +187,7 @@ export function checkPgSsl(env) {
       return {
         status: WARN,
         detail: "unverified — TLS is on but the server certificate is NOT checked (encrypted, not authenticated)" + from,
-        fix: "set PG_CA_CERT to the Postgres CA (docs/OPS.md § Postgres TLS) to verify the server",
+        fix: "set PG_CA_CERT to the Postgres CA (docs/OPS.md § 13) to verify the server",
       };
     default:
       if (local || tls.source === "loopback") return { status: OK, detail: "disabled — local database, TLS not needed" };
@@ -286,6 +290,9 @@ async function probeDatabase(env) {
 async function main() {
   const skipDb = process.argv.includes("--no-db");
   const { env, usedFile } = loadEnv();
+  // node-postgres reads PGHOST/PGSSLMODE/... from process.env itself, so file-only values must be
+  // visible there too, or doctor would classify a different connection than the app makes.
+  for (const [k, v] of Object.entries(env)) if (process.env[k] === undefined) process.env[k] = v;
 
   console.log("AIOS Team Brain — doctor");
   console.log(usedFile ? "reading .env.local (real environment wins)\n" : "no .env.local found; reading the environment\n");

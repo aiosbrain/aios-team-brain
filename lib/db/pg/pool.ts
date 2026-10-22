@@ -83,7 +83,7 @@ export function getPool(): Pool {
   const { mode } = resolvePgTls(url, { legacyTls: shouldUseSsl(url, process.env), env: process.env });
   if (mode === "unverified") {
     console.warn(
-      "[pg] TLS is ON but the server certificate is NOT verified — set PG_CA_CERT to the Postgres CA (docs/OPS.md § Postgres TLS)"
+      "[pg] TLS is ON but the server certificate is NOT verified — set PG_CA_CERT to the Postgres CA (docs/OPS.md § 13)"
     );
   }
 
