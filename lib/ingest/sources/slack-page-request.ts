@@ -133,7 +133,12 @@ export interface SlackPage {
   readonly messages?: SlackMessage[];
   /** `has_more` exactly as sent; absent is false, which is what Slack means by omitting it. */
   readonly hasMore: boolean;
-  /** `response_metadata.next_cursor`; Slack's empty string means "no more" and reads as null. */
+  /**
+   * `response_metadata.next_cursor`, VALIDATED before it gets here: absent metadata, metadata with no
+   * cursor, and Slack's empty string all read as null; any other value is a non-blank string of at
+   * most 1,024 UTF-16 code units with no control character, kept byte for byte. A malformed value
+   * never becomes null — the whole response is refused instead (see `readNextCursor`).
+   */
   readonly nextCursor: string | null;
 }
 
@@ -257,23 +262,66 @@ function assertParams(params: SlackRequestParams): void {
   }
 }
 
-/** The paging trio, read off whatever Slack returned. Absent fields are absent, never invented. */
+/** The longest continuation cursor this path accepts, in JavaScript UTF-16 code units (`.length`). */
+const MAX_CURSOR_LENGTH = 1_024;
+/** C0 controls and DEL. C1 controls are outside the accepted rule and are not refused here. */
+const CURSOR_CONTROL_CHARACTER = /[\x00-\x1f\x7f]/;
+/** The one way the cursor reader says "this response's pagination cannot be trusted". */
+const MALFORMED_PAGINATION = Symbol("malformed pagination metadata");
+
+/** An OWN property of a parsed JSON object, or undefined. Nothing is read off a prototype. */
+function ownField(record: object, key: string): unknown {
+  return Object.prototype.hasOwnProperty.call(record, key) ? (record as Record<string, unknown>)[key] : undefined;
+}
+
+/**
+ * `response_metadata.next_cursor`, validated from the RAW body (AIO-1170 AM-F3).
+ *
+ * ⚠️ A MALFORMED VALUE IS NEVER "NO CURSOR". A history scan certifies its interval on the page that
+ * says there is no more; reading a broken container or a non-string cursor as null would turn a
+ * response nobody can continue into the end of the channel. So:
+ *  - `response_metadata` absent → null; a plain object without `next_cursor` (for example one that
+ *    carries only `warnings`) → null; present but null, an array or a primitive → MALFORMED;
+ *  - `next_cursor` `""` → null, which is Slack's own "no more"; any other non-string → MALFORMED;
+ *  - a string that is blank by `.trim()`, carries a C0 control or DEL, or is longer than 1,024 UTF-16
+ *    code units → MALFORMED;
+ *  - anything else is returned EXACTLY as received: not trimmed, not normalized, not re-encoded. A
+ *    cursor is the provider's opaque token, and a "cleaned" one is a different token.
+ * The rejected value is never returned, quoted or attached to anything.
+ */
+function readNextCursor(body: Record<string, unknown>): string | null | typeof MALFORMED_PAGINATION {
+  const metadata = ownField(body, "response_metadata");
+  if (metadata === undefined) return null;
+  if (metadata === null || typeof metadata !== "object" || Array.isArray(metadata)) return MALFORMED_PAGINATION;
+  const cursor = ownField(metadata, "next_cursor");
+  if (cursor === undefined) return null;
+  if (typeof cursor !== "string") return MALFORMED_PAGINATION;
+  if (cursor === "") return null;
+  if (cursor.trim().length === 0 || CURSOR_CONTROL_CHARACTER.test(cursor) || cursor.length > MAX_CURSOR_LENGTH) {
+    return MALFORMED_PAGINATION;
+  }
+  return cursor;
+}
+
+/**
+ * The paging trio, read off a SUCCESSFUL body (2xx and `ok: true`) — or null when its pagination
+ * metadata is malformed, which the caller turns into the static `malformed_response_<status>`.
+ * Absent fields are absent, never invented. Every method reads through here, so a non-paged method
+ * is held to the same metadata rules; absent or warning-only metadata is valid for all of them.
+ */
 function readPage(body: Record<string, unknown>): SlackPage | null {
   // A present non-boolean must not become false: that would certify a malformed history response as
   // terminal even when Slack also supplied a continuation cursor.
-  if (body.has_more !== undefined && typeof body.has_more !== "boolean") return null;
+  const hasMore = ownField(body, "has_more");
+  if (hasMore !== undefined && typeof hasMore !== "boolean") return null;
+  const nextCursor = readNextCursor(body);
+  if (nextCursor === MALFORMED_PAGINATION) return null;
   const messages = Array.isArray(body.messages) ? (body.messages as SlackMessage[]) : undefined;
-  const metadata = body.response_metadata;
-  const rawCursor =
-    metadata && typeof metadata === "object"
-      ? (metadata as { next_cursor?: unknown }).next_cursor
-      : undefined;
-  const nextCursor = typeof rawCursor === "string" && rawCursor !== "" ? rawCursor : null;
   return {
     // A successful empty array IS provider data — "this page has no messages" — and must stay
     // distinguishable from a method that returns no messages at all. Neither is a failure fallback.
     ...(messages === undefined ? {} : { messages }),
-    hasMore: body.has_more === true,
+    hasMore: hasMore === true,
     nextCursor,
   };
 }
