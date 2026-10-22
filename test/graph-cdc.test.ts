@@ -781,7 +781,10 @@ describe("CDCCHURN-1: in-place same-length churn is the number of chunks the edi
  * `--exclude` is load-bearing: the design documents are the corpus, so a document publishing a
  * distribution is inside it — an earlier draft's table had already gone stale by the time it was read.
  */
-describe("CDCAPPEND-1: append churn is a bound, not a number", () => {
+// The LIVE CORPUS sweeps below are CPU-bound over every repo doc and grow with the repo. Under V8 coverage
+// on Node 22 they run ~4.5x slower than on Node 20 (1.2s -> 5.3s in CI for the slowest; plain runs are
+// ~0.6s on both), past vitest's 5s default. These tests bound correctness, not speed.
+describe("CDCAPPEND-1: append churn is a bound, not a number", { timeout: 30_000 }, () => {
   const changedCount = (before: string[], after: string[]): number => {
     const seen = new Set(before);
     return after.filter((c) => !seen.has(c)).length;
@@ -896,9 +899,7 @@ describe("CDCAPPEND-1: append churn is a bound, not a number", () => {
           observed = Math.max(observed, depth);
         }
     expect(observed, "no boundary moved at all — the assertion above ran on nothing").toBeGreaterThan(0);
-    // A CPU-bound sweep over every repo doc: it grows with the repo, and under V8 coverage on Node 22 it
-    // ran ~5.5s in CI (vs under 5s on Node 20), past vitest's default. The bound is on correctness, not speed.
-  }, 30_000);
+  });
 
   it("CAPPED FIXTURE: the SHARED PREFIX must reach the cap — 'the document is past the cap' does not", () => {
     // The characterisation this fixture exists to kill was in the proposed replacement row, which would
