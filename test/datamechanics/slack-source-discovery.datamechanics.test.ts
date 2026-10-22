@@ -573,6 +573,93 @@ describe("a page that cannot be trusted advances nothing", () => {
     expect(after?.completed_upper_ts).toBeNull();
     expect(after?.historical_floor_reached).toBe(false);
   });
+
+  /**
+   * AM-F3 RED EVIDENCE, group 5 — actual transport → history → persisted state, for a continuation
+   * page whose RAW pagination metadata is malformed (accepted amendment
+   * `aio1170-f3-accepted-amendment-20261022`).
+   *
+   * The scan is real: a partial initial historical page leaves cursor `cursor-1` and one root, and an
+   * empty newest catch-up passes the turn back. The historical continuation is then answered with a
+   * LITERAL body, written out here rather than built with a shared helper. The adjudicated contract:
+   * the transport refuses it as the static `transport_error` / `malformed_response_200`, so the pass
+   * reports it `delayed`, records that category, enqueues nothing and moves no anchor, cursor, bound
+   * or certified interval. The request WAS sent, so its slot is used and the turn passes to the other
+   * lane. Only the retry, lease and turn bookkeeping columns may differ from before.
+   *
+   * EXPECTED RED on the current source, each in its own way:
+   *  - numeric `next_cursor` with `has_more` absent or false: read as a TERMINAL page, so the
+   *    interval is certified and the historical floor is marked reached;
+   *  - a control-character cursor: accepted, and the bad cursor is persisted;
+   *  - a whitespace-only or over-bound cursor: accepted by the transport and then refused by the
+   *    channel writer, which THROWS out of the pass. The pass is captured as settled-or-thrown so that
+   *    this shows as a failed assertion, not as an unrelated error.
+   */
+  const F3_CANARY = "xoxb-F3-CANARY-history-71e2";
+  /** The columns a refused-and-released page may change: retry, lease and turn bookkeeping only. */
+  const BOOKKEEPING = ["next_lane", "claimed_lane", "lease_owner", "lease_generation", "lease_expires_at", "due_at", "attempts", "last_error_code", "updated_at"];
+  const withoutBookkeeping = (row: Record<string, unknown> | null): Record<string, unknown> =>
+    Object.fromEntries(Object.entries(row ?? {}).filter(([key]) => !BOOKKEEPING.includes(key)));
+
+  it.each<[string, Record<string, unknown>]>([
+    ["a numeric next_cursor with has_more absent", { ok: true, messages: [rootMessage("1718900000.000500")], response_metadata: { next_cursor: 7 } }],
+    ["a numeric next_cursor with has_more false", { ok: true, messages: [rootMessage("1718900000.000500")], has_more: false, response_metadata: { next_cursor: 7 } }],
+    ["a control-character cursor", { ok: true, messages: [rootMessage("1718900000.000500")], has_more: true, response_metadata: { next_cursor: `${F3_CANARY}\u0001` } }],
+    ["a whitespace-only cursor", { ok: true, messages: [rootMessage("1718900000.000500")], has_more: true, response_metadata: { next_cursor: "  \t " } }],
+    ["an over-bound cursor", { ok: true, messages: [rootMessage("1718900000.000500")], has_more: true, response_metadata: { next_cursor: `${F3_CANARY}${"c".repeat(1024)}` } }],
+  ])("F3 RED: a continuation answered with %s is delayed as malformed_response_200 and advances nothing", async (_label, malformedBody) => {
+    const seed = await seedTeam();
+    const integrationId = await setup(seed);
+    const fake = pass((call) => {
+      if (isCatchUp(call)) return slackJson({ ok: true, messages: [], has_more: false });
+      if (call.params.get("cursor") === null) {
+        return slackJson({ ok: true, messages: [rootMessage("1718900000.000900")], has_more: true, response_metadata: { next_cursor: "cursor-1" } });
+      }
+      // The continuation of `cursor-1`: the literal malformed body under test.
+      return slackJson(malformedBody);
+    });
+
+    await discover(seed, integrationId, fake); // initial historical page, partial
+    await elapse(seed.teamId);
+    await discover(seed, integrationId, fake); // newest catch-up, terminal and empty
+    await elapse(seed.teamId);
+    const before = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    const rootsBefore = await threadRootTs(seed.teamId);
+    const historyBefore = fake.countOf("conversations.history");
+    expect(before).toMatchObject({ historical_cursor: "cursor-1", next_lane: "historical", completed_lower_ts: null, historical_floor_reached: false });
+    expect(rootsBefore).toEqual(["1718900000.000900"]);
+
+    const settled = await discover(seed, integrationId, fake).then(
+      (result) => ({ result }),
+      (error: unknown) => ({ thrown: error instanceof Error ? error.name : "non-error" })
+    );
+    expect(settled, "the pass completes; a malformed page is a delay, not an exception").not.toHaveProperty("thrown");
+    if (!("result" in settled)) return;
+
+    // The request was really sent, once, with the stored cursor.
+    expect(fake.countOf("conversations.history")).toBe(historyBefore + 1);
+    expect(fake.paramsOf("conversations.history").at(-1)?.get("cursor")).toBe("cursor-1");
+    // Static categorization: one delayed history step, the existing malformed-response category.
+    expect(settled.result.steps.filter((s) => s.stage === "history").map((s) => [s.result, s.category])).toEqual([
+      ["delayed", "malformed_response_200"],
+    ]);
+    const after = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    expect(after).toMatchObject({
+      last_error_code: "malformed_response_200",
+      // Sent, so the slot was used and the turn PASSES to the other lane.
+      next_lane: "newest",
+      claimed_lane: null,
+      lease_owner: null,
+    });
+    // Everything else exactly as it was: no anchor, cursor, bound, oldest-seen or certified-interval
+    // change, and no floor reached.
+    expect(withoutBookkeeping(after)).toEqual(withoutBookkeeping(before));
+    expect(await threadRootTs(seed.teamId)).toEqual(rootsBefore);
+    // No canary in anything reported or persisted.
+    expect(JSON.stringify(settled.result.steps)).not.toContain(F3_CANARY);
+    expect(JSON.stringify(after)).not.toContain(F3_CANARY);
+    expect(JSON.stringify(await threadRows(seed.teamId))).not.toContain(F3_CANARY);
+  });
 });
 
 // ── replay ───────────────────────────────────────────────────────────────────

@@ -45,7 +45,8 @@ vi.mock("@/lib/ingest/slack-method-budget", async (importOriginal) => {
 // already sees the stubbed budget functions.
 import * as pageRequestModule from "@/lib/ingest/sources/slack-page-request";
 import { slackReservedRequest } from "@/lib/ingest/sources/slack-page-request";
-import { classifySlackCall } from "@/lib/ingest/slack-source-discovery";
+import { classifySlackCall, validateSlackHistoryPage } from "@/lib/ingest/slack-source-discovery";
+import { validateSlackRepliesPage } from "@/lib/ingest/slack-thread-hydrator";
 
 const TEAM = "3f1a0b2c-4d5e-4f60-8a7b-9c0d1e2f3a4b";
 const SCOPE: SlackMethodScope = {
@@ -306,87 +307,193 @@ describe("slackReservedRequest — reserve, commit, then exactly one request", (
   });
 
   /**
-   * F2/F3 RED (AIO-1170 final review, Astra-adjudicated F3 MEDIUM): STRICT RAW PAGINATION METADATA.
+   * AM-F3 RED EVIDENCE — STRICT RAW PAGINATION METADATA (accepted amendment
+   * `aio1170-f3-accepted-amendment-20261022`, groups 1 to 4 of its required red evidence).
    *
    * `SlackPage.nextCursor` is `string | null` only after the RAW provider fields have been validated.
-   * Today `readPage` reads any non-object `response_metadata`, and any non-string `next_cursor`, as
-   * "no cursor" — and a missing cursor with `has_more` absent or false is exactly what a history scan
-   * certifies as the end of the channel. A malformed answer must instead be the existing
-   * `transport_error` / `malformed_response_<status>` outcome, carrying nothing it received.
+   * Today the private `readPage` reads any non-object `response_metadata`, and any non-string
+   * `next_cursor`, as "no cursor", and keeps any string cursor as it is — so a missing or broken cursor
+   * with `has_more` absent or false is what a history scan certifies as the end of the channel. A
+   * malformed answer must instead be the existing static `transport_error` / `malformed_response_200`
+   * outcome, which carries nothing it received.
    *
-   * Contract, as adjudicated:
-   *  - `response_metadata` absent, or an object without `next_cursor`, means no cursor; an empty
-   *    string means no cursor; a valid non-empty string is kept byte for byte;
-   *  - `response_metadata` null, an array or a primitive is malformed;
-   *  - `next_cursor` null, a number, a boolean, an array or an object is malformed;
-   *  - a whitespace-only cursor, a cursor longer than 1,024 characters, or one with a control
-   *    character is malformed;
-   *  - `has_more` absent means false, a boolean is kept, and every other present value is malformed.
+   * WHAT IS EXPECTED RED on the current source, and what is not:
+   *  - RED: every row of the malformed metadata/cursor matrix, under each of `has_more` absent, false
+   *    and true. Today each is an `ok` page.
+   *  - RED: the U+00A0-only cursor and the over-bound non-BMP cursor.
+   *  - PASSING NOW, as regression guards: the malformed `has_more` rows (the reader already refuses a
+   *    present non-boolean), every valid control, both consistency contradictions, the precedence
+   *    guards and the non-pagination controls.
    *
-   * EXPECTED RED on the current source for the `response_metadata` and `next_cursor` rows and the
-   * whitespace, control-character and overlength rows: today each is an `ok` page with `nextCursor`
-   * null or with the bad string kept. The `has_more` rows and the controls are expected to pass now.
+   * "Byte for byte" below means the identical UTF-16 code units, compared as UTF-8 bytes: neither
+   * trimmed nor normalized.
    */
   const F3_CANARY = "xoxb-F3-CANARY-cursor-4b1d";
   const VALID_CURSOR = "dXNlcjpVMDYxTkZUVDI=/+_-.~";
   const LONGEST_CURSOR = "c".repeat(1024);
+  /** 512 copies of one non-BMP character: 1,024 UTF-16 code units, 512 code points. */
+  const LONGEST_NON_BMP_CURSOR = "\u{1F600}".repeat(512);
 
-  async function readHistoryPage(body: Record<string, unknown>) {
+  async function readPageOf(method: "conversations.history" | "conversations.replies" | "auth.test" | "bots.info" | "conversations.info", body: Record<string, unknown>, status = 200) {
     granted();
-    const { impl } = fetchStub(() => json(body));
-    return slackReservedRequest(
-      { db: fakeDb(), scope: SCOPE, token: TOKEN },
-      "conversations.history",
-      { channel: "C0UNIT001" },
-      { fetchImpl: impl }
-    );
+    const { impl } = fetchStub(() => json(body, status));
+    return slackReservedRequest({ db: fakeDb(), scope: SCOPE, token: TOKEN }, method, method === "auth.test" ? {} : { channel: "C0UNIT001" }, { fetchImpl: impl });
   }
+  const readHistoryPage = (body: Record<string, unknown>) => readPageOf("conversations.history", body);
+  const sameBytes = (a: string | null, b: string): boolean => a !== null && Buffer.from(a, "utf8").equals(Buffer.from(b, "utf8"));
+
+  // ── group 1: valid controls ────────────────────────────────────────────────
 
   it.each<[string, Record<string, unknown>, { hasMore: boolean; nextCursor: string | null }]>([
     ["response_metadata absent", { ok: true, messages: [] }, { hasMore: false, nextCursor: null }],
     ["response_metadata an object without next_cursor", { ok: true, messages: [], response_metadata: {} }, { hasMore: false, nextCursor: null }],
+    ["response_metadata carrying only warnings", { ok: true, messages: [], response_metadata: { warnings: ["superfluous_charset"] } }, { hasMore: false, nextCursor: null }],
     ["an empty next_cursor", { ok: true, messages: [], response_metadata: { next_cursor: "" } }, { hasMore: false, nextCursor: null }],
-    ["a valid cursor, kept byte for byte", { ok: true, messages: [], has_more: true, response_metadata: { next_cursor: VALID_CURSOR } }, { hasMore: true, nextCursor: VALID_CURSOR }],
-    ["a cursor of exactly 1,024 characters", { ok: true, messages: [], has_more: true, response_metadata: { next_cursor: LONGEST_CURSOR } }, { hasMore: true, nextCursor: LONGEST_CURSOR }],
-    ["has_more absent with a cursor", { ok: true, messages: [], response_metadata: { next_cursor: VALID_CURSOR } }, { hasMore: false, nextCursor: VALID_CURSOR }],
+    ["a valid continuation cursor", { ok: true, messages: [], has_more: true, response_metadata: { next_cursor: VALID_CURSOR } }, { hasMore: true, nextCursor: VALID_CURSOR }],
     ["has_more false, kept", { ok: true, messages: [], has_more: false }, { hasMore: false, nextCursor: null }],
-  ])("F3: reads %s as a valid page (control)", async (_label, body, page) => {
+    ["has_more true, kept", { ok: true, messages: [], has_more: true, response_metadata: { next_cursor: VALID_CURSOR } }, { hasMore: true, nextCursor: VALID_CURSOR }],
+  ])("F3 control: reads %s as a valid page", async (_label, body, page) => {
     const result = await readHistoryPage(body);
     expect(result).toMatchObject({ outcome: "ok", page });
-    if (result.outcome === "ok" && page.nextCursor !== null) {
-      // Byte for byte: the same UTF-16 code units, not a normalized or trimmed copy.
-      expect(Buffer.from(result.page.nextCursor ?? "", "utf8").equals(Buffer.from(page.nextCursor, "utf8"))).toBe(true);
-    }
   });
 
-  it.each<[string, Record<string, unknown>]>([
-    ["response_metadata null", { response_metadata: null }],
-    ["response_metadata an array", { response_metadata: [{ next_cursor: VALID_CURSOR }] }],
-    ["response_metadata a string", { response_metadata: F3_CANARY }],
-    ["response_metadata a number", { response_metadata: 7 }],
-    ["response_metadata a boolean", { response_metadata: true }],
-    ["next_cursor null", { response_metadata: { next_cursor: null } }],
-    ["next_cursor a number", { response_metadata: { next_cursor: 15 } }],
-    ["next_cursor a boolean", { response_metadata: { next_cursor: true } }],
-    ["next_cursor an array", { response_metadata: { next_cursor: [VALID_CURSOR] } }],
-    ["next_cursor an object", { response_metadata: { next_cursor: { cursor: F3_CANARY } } }],
-    ["a whitespace-only cursor", { response_metadata: { next_cursor: " \t " } }],
-    ["a cursor of 1,025 characters", { response_metadata: { next_cursor: `${LONGEST_CURSOR}c` } }],
-    ["a cursor carrying a NUL", { response_metadata: { next_cursor: `${F3_CANARY}\u0000` } }],
-    ["a cursor carrying a newline", { response_metadata: { next_cursor: `${F3_CANARY}\n` } }],
-    ["a cursor carrying DEL", { response_metadata: { next_cursor: `${F3_CANARY}\u007f` } }],
-    ["has_more as the string false", { has_more: "false" }],
-    ["has_more as zero", { has_more: 0 }],
-    ["has_more as an object", { has_more: {} }],
-  ])("F3 RED: refuses %s as the existing malformed_response transport error, quoting nothing", async (_label, fields) => {
+  // ── group 2: opaque strings, Unicode whitespace and the UTF-16 bound ──────
+
+  it.each<[string, string]>([
+    ["leading and trailing spaces", `  ${VALID_CURSOR}  `],
+    ["a precomposed e-acute (NFC)", "café-cursor"],
+    ["a decomposed e plus combining acute (NFD)", "café-cursor"],
+    ["exactly 1,024 ASCII code units", LONGEST_CURSOR],
+    ["exactly 1,024 UTF-16 code units of non-BMP characters", LONGEST_NON_BMP_CURSOR],
+  ])("F3 control: keeps a cursor with %s byte for byte", async (_label, cursor) => {
+    const result = await readHistoryPage({ ok: true, messages: [], has_more: true, response_metadata: { next_cursor: cursor } });
+    expect(result.outcome).toBe("ok");
+    if (result.outcome !== "ok") return;
+    expect(sameBytes(result.page.nextCursor, cursor)).toBe(true);
+    expect(result.page.nextCursor?.length).toBe(cursor.length);
+  });
+
+  it("F3 control: the NFC and NFD cursors stay DISTINCT — neither is normalized into the other", async () => {
+    const nfc = await readHistoryPage({ ok: true, messages: [], has_more: true, response_metadata: { next_cursor: "café-cursor" } });
+    const nfd = await readHistoryPage({ ok: true, messages: [], has_more: true, response_metadata: { next_cursor: "café-cursor" } });
+    if (nfc.outcome !== "ok" || nfd.outcome !== "ok") throw new Error("fixture: both cursors must be valid pages");
+    expect(nfc.page.nextCursor).not.toBe(nfd.page.nextCursor);
+    expect(nfc.page.nextCursor?.normalize("NFC")).toBe(nfd.page.nextCursor?.normalize("NFC"));
+  });
+
+  it("F3 fixture: the boundary cursors have the lengths the contract counts in", () => {
+    expect([LONGEST_CURSOR.length, LONGEST_NON_BMP_CURSOR.length, [...LONGEST_NON_BMP_CURSOR].length]).toEqual([1024, 1024, 512]);
+    expect(["  ".trim().length, `${LONGEST_NON_BMP_CURSOR}c`.length]).toEqual([0, 1025]);
+  });
+
+  // ── group 1 and 2: the malformed matrix, under each has_more ──────────────
+
+  /** Every malformed metadata container and cursor value the amendment names. */
+  const MALFORMED_METADATA: [string, unknown][] = [
+    ["response_metadata null", null],
+    ["response_metadata an array", [{ next_cursor: VALID_CURSOR }]],
+    ["response_metadata a string", F3_CANARY],
+    ["response_metadata a number", 7],
+    ["response_metadata a boolean", true],
+    ["next_cursor null", { next_cursor: null }],
+    ["next_cursor a number", { next_cursor: 7 }],
+    ["next_cursor a boolean", { next_cursor: false }],
+    ["next_cursor an array", { next_cursor: [VALID_CURSOR] }],
+    ["next_cursor an object", { next_cursor: { cursor: F3_CANARY } }],
+    ["an ASCII whitespace-only cursor", { next_cursor: " \t " }],
+    ["a U+00A0 whitespace-only cursor", { next_cursor: "  " }],
+    ["a cursor of 1,025 ASCII code units", { next_cursor: `${LONGEST_CURSOR}c` }],
+    ["a cursor of 1,025 UTF-16 code units with non-BMP characters", { next_cursor: `${LONGEST_NON_BMP_CURSOR}c` }],
+    ["a cursor carrying a NUL", { next_cursor: `${F3_CANARY}\u0000` }],
+    ["a cursor carrying a newline", { next_cursor: `${F3_CANARY}\n` }],
+    ["a cursor carrying a unit separator", { next_cursor: `${F3_CANARY}\u001f` }],
+    ["a cursor carrying DEL", { next_cursor: `${F3_CANARY}\u007f` }],
+  ];
+  const HAS_MORE: [string, Record<string, unknown>][] = [
+    ["has_more absent", {}],
+    ["has_more false", { has_more: false }],
+    ["has_more true", { has_more: true }],
+  ];
+  const MATRIX = MALFORMED_METADATA.flatMap(([shape, metadata]) =>
+    HAS_MORE.map(([flag, fields]) => [`${shape}, ${flag}`, { ...fields, response_metadata: metadata }] as [string, Record<string, unknown>])
+  );
+
+  it.each(MATRIX)("F3 RED: refuses %s as the static malformed_response transport error, quoting nothing", async (_label, fields) => {
     const result = await readHistoryPage({ ok: true, messages: [{ ts: "1718900000.000100" }], ...fields });
     // Exact equality: no page, no body, and no copy of the canary or of anything else it received.
-    expect(result).toEqual({
-      outcome: "transport_error",
-      method: "conversations.history",
-      category: "malformed_response_200",
-    });
+    expect(result).toEqual({ outcome: "transport_error", method: "conversations.history", category: "malformed_response_200" });
     expect(JSON.stringify(result)).not.toContain(F3_CANARY);
+  });
+
+  it.each<[string, unknown]>([
+    ["the string false", "false"],
+    ["zero", 0],
+    ["an object", {}],
+    ["null", null],
+  ])("F3 regression guard (passes now): refuses has_more as %s", async (_label, hasMore) => {
+    const result = await readHistoryPage({ ok: true, messages: [], has_more: hasMore });
+    expect(result).toEqual({ outcome: "transport_error", method: "conversations.history", category: "malformed_response_200" });
+  });
+
+  it("F3 RED: the replies method reads through the same strict reader", async () => {
+    const result = await readPageOf("conversations.replies", { ok: true, messages: [{ ts: "1718900000.000100" }], has_more: false, response_metadata: { next_cursor: 7 } });
+    expect(result).toEqual({ outcome: "transport_error", method: "conversations.replies", category: "malformed_response_200" });
+  });
+
+  // ── group 1: both consistency contradictions stay the CALLER's refusal ────
+
+  it("F3 control: a well-formed contradiction is a valid transport page, refused as pagination_incomplete by both callers", async () => {
+    const noCursor = await readHistoryPage({ ok: true, messages: [{ ts: "1718900000.000100" }], has_more: true });
+    const liveCursor = await readHistoryPage({ ok: true, messages: [{ ts: "1718900000.000100" }], has_more: false, response_metadata: { next_cursor: VALID_CURSOR } });
+    if (noCursor.outcome !== "ok" || liveCursor.outcome !== "ok") throw new Error("fixture: both contradictions are well-formed pages");
+    expect([noCursor.page, liveCursor.page].map((page) => validateSlackHistoryPage(page, { sentCursor: null }))).toEqual([
+      { ok: false, category: "pagination_incomplete" }, { ok: false, category: "pagination_incomplete" },
+    ]);
+    expect([noCursor.page, liveCursor.page].map((page) => validateSlackRepliesPage(page, "1718900000.000100", null))).toEqual([
+      { ok: false, category: "pagination_incomplete" }, { ok: false, category: "pagination_incomplete" },
+    ]);
+  });
+
+  // ── group 3: response precedence is unchanged by malformed metadata ───────
+
+  it("F3 regression guard (passes now): a 429 carrying malformed metadata is still rate_limited, with its cooldown persisted", async () => {
+    granted();
+    extendSlackMethodBackoff.mockResolvedValue({ scope: SCOPE, method: "conversations.history", nextPermittedAt: NEXT, retryAfterMs: 30_000 });
+    const { impl } = fetchStub(() => json({ ok: true, messages: [], response_metadata: { next_cursor: 7 } }, 429, { "retry-after": "30" }));
+    const result = await slackReservedRequest({ db: fakeDb(), scope: SCOPE, token: TOKEN }, "conversations.history", { channel: "C0UNIT001" }, { fetchImpl: impl });
+    expect(result).toEqual({ outcome: "rate_limited", method: "conversations.history", category: "rate_limited", nextPermittedAt: NEXT, retryAfterMs: 30_000 });
+    expect(extendSlackMethodBackoff).toHaveBeenCalledTimes(1);
+  });
+
+  it.each<[string, number, Record<string, unknown>, unknown, ReturnType<typeof classifySlackCall>]>([
+    ["ok:false invalid_cursor", 200, { ok: false, error: "invalid_cursor", response_metadata: null },
+      { outcome: "provider_error", method: "conversations.history", category: "invalid_cursor" }, { kind: "refused", category: "invalid_cursor" }],
+    ["an HTTP 503", 503, { ok: true, messages: [], response_metadata: { next_cursor: 7 } },
+      { outcome: "provider_error", method: "conversations.history", category: "http_503" }, { kind: "transient", category: "http_503" }],
+    ["an auth error", 200, { ok: false, error: "invalid_auth", response_metadata: [F3_CANARY] },
+      { outcome: "auth_error", method: "conversations.history", category: "invalid_auth" }, { kind: "blocked", category: "invalid_auth" }],
+  ])("F3 regression guard (passes now): %s carrying malformed metadata keeps its own outcome and recovery category", async (_label, status, body, outcome, disposition) => {
+    const result = await readPageOf("conversations.history", body, status);
+    expect(result).toEqual(outcome);
+    // The recovery a source takes is decided by this disposition: `invalid_cursor` restarts the scan,
+    // a 5xx is a blip, an auth error blocks. Malformed metadata must not turn any of them into a
+    // malformed-response transport error.
+    expect(classifySlackCall(result)).toEqual(disposition);
+    expect(JSON.stringify(result)).not.toContain(F3_CANARY);
+  });
+
+  // ── group 4: non-pagination methods share the reader ──────────────────────
+
+  it.each<[string, "auth.test" | "bots.info" | "conversations.info", Record<string, unknown>]>([
+    ["auth.test", "auth.test", { ok: true, team_id: "T0UNIT001", user_id: "U0UNIT001", bot_id: "B0UNIT001" }],
+    ["bots.info", "bots.info", { ok: true, bot: { id: "B0UNIT001", app_id: "A0UNIT001" } }],
+    ["conversations.info", "conversations.info", { ok: true, channel: { id: "C0UNIT001", is_channel: true, is_private: false } }],
+  ])("F3 control (passes now, must keep passing): %s succeeds with absent and with warning-only metadata", async (_label, method, body) => {
+    for (const metadata of [{}, { response_metadata: { warnings: ["missing_charset"] } }]) {
+      const result = await readPageOf(method, { ...body, ...metadata });
+      expect(result).toMatchObject({ outcome: "ok", method, page: { hasMore: false, nextCursor: null } });
+      if (result.outcome === "ok") expect("messages" in result.page).toBe(false);
+    }
   });
 
   it("reads an empty page as provider data, and Slack's empty cursor as no cursor", async () => {

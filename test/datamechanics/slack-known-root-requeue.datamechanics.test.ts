@@ -36,6 +36,7 @@ import {
   writeSlackThreadSnapshot,
   type SlackThreadClaim,
 } from "@/lib/ingest/slack-thread-state";
+import { hydrateOneSlackThread } from "@/lib/ingest/slack-thread-hydrator";
 import type { SlackMessage } from "@/lib/ingest/sources/slack";
 import { parseSlackTimestamp, type SlackEvidenceUser } from "@/lib/ingest/sources/slack-message-evidence";
 import { scopedSlackItemPath } from "@/lib/ingest/sources/slack-namespace";
@@ -9273,5 +9274,89 @@ describe("KR-16 stored projections on real Postgres — NULL past a byte or type
     expect((await query<{ frontmatter: string }>(`select frontmatter::text as frontmatter from items where team_id = $1 and id = $2::uuid`, [teamId, f.itemId]))[0].frontmatter,
       `${label}: fixture: the stored frontmatter was put back exactly`).toBe(original.frontmatter);
     expect(await lifecycleQueueAndStagingAnywhere(), `${label}: no variant enqueued anything`).toEqual({ queue: [], staging: [] });
+  });
+});
+
+/**
+ * AM-F3 RED EVIDENCE, group 6, the PUBLISHED-EVIDENCE half (accepted amendment
+ * `aio1170-f3-accepted-amendment-20261022`): actual transport → replies → persisted staging for a
+ * root whose evidence is ALREADY PUBLISHED. The staging-only half is in
+ * `slack-thread-state.datamechanics.test.ts`.
+ *
+ * The fixture is this file's real publication: `publishOldRoot` leaves a canonical item, its version
+ * and its ledger rows, and no queue row. The root is then enqueued again — as a later sweep would —
+ * and the real hydrator stages a PARTIAL first page (root and reply, continuation `page-2`). The
+ * continuation is answered with a LITERAL body whose `next_cursor` is the number 7 and whose
+ * `has_more` is false, or absent.
+ *
+ * The adjudicated contract: the transport refuses it as the static `transport_error` /
+ * `malformed_response_200`. So the staging never becomes COMPLETE — the state a publisher would take
+ * as publication-eligible — nothing staged is replaced or deleted, and the published item, its
+ * versions, its ledger rows and the team's generations are byte-identical. No canary reaches any of
+ * them.
+ *
+ * EXPECTED RED on the current source: the continuation is read as a terminal page, the hydrator
+ * returns `progressed`, and the staging becomes complete with the cursor cleared. The published
+ * evidence itself is expected unchanged either way: the hydrator never publishes.
+ */
+describe("AM-F3 malformed replies pagination with already-published evidence (real Postgres)", () => {
+  const F3_CANARY = "xoxb-F3-CANARY-published-3d8a";
+
+  /** The published evidence of a team, as the database renders every row of it. */
+  async function publishedEvidence(teamId: string): Promise<Record<string, string>> {
+    const out: Record<string, string> = {};
+    for (const [name, text] of [
+      ["items", `select coalesce(jsonb_agg(to_jsonb(t) order by t.id), '[]'::jsonb)::text as rows from items t where t.team_id = $1`],
+      ["item_versions", `select coalesce(jsonb_agg(to_jsonb(v) order by to_jsonb(v)::text), '[]'::jsonb)::text as rows from item_versions v join items i on i.id = v.item_id where i.team_id = $1`],
+      ["slack_messages", `select coalesce(jsonb_agg(to_jsonb(m) order by to_jsonb(m)::text), '[]'::jsonb)::text as rows from slack_messages m where m.team_id = $1`],
+      ["slack_team_state", `select coalesce(jsonb_agg(to_jsonb(s) order by to_jsonb(s)::text), '[]'::jsonb)::text as rows from slack_team_state s where s.team_id = $1`],
+    ] as const) {
+      out[name] = (await query<{ rows: string }>(text, [teamId]))[0].rows;
+    }
+    return out;
+  }
+  async function wholeSnapshotRow(teamId: string): Promise<Row | null> {
+    return (await query(`select * from slack_thread_snapshots where team_id = $1 and root_ts = $2`, [teamId, OLD_ROOT]))[0] ?? null;
+  }
+
+  it.each<[string, Record<string, unknown>]>([
+    ["has_more false", { has_more: false }],
+    ["has_more absent", {}],
+  ])("F3 RED: a numeric next_cursor with %s neither completes the staging nor touches the published evidence", async (_label, hasMore) => {
+    const f = await publishOldRoot();
+    const teamId = f.seed.teamId;
+    const scope = { teamId, workspaceId: WORKSPACE, channelId: CHANNEL, rootTs: OLD_ROOT };
+    const methodScope = { kind: "verified" as const, teamId, workspaceId: WORKSPACE, appId: "A0SOURCE1" };
+    const hydrate = (body: Record<string, unknown>) => hydrateOneSlackThread(
+      { db: db(), teamId, token: "xoxb-synthetic-known-root", methodScope },
+      { fetchImpl: (async () => new Response(JSON.stringify(body), { status: 200 })) as unknown as typeof fetch, random: () => 0 }
+    );
+    expect((await publishedEvidence(teamId)).slack_messages, "fixture: the root's ledger is published").not.toBe("[]");
+
+    // A later sweep's pending work for the same root, and a real PARTIAL first page.
+    await tx((s) => enqueueSlackThread(s, scope));
+    expect(await hydrate({ ok: true, messages: [ROOT_MESSAGE, REPLY_MESSAGE], has_more: true, response_metadata: { next_cursor: "page-2" } }))
+      .toEqual({ outcome: "progressed" });
+    // FIXTURE CLOCK: the lease has expired and the replies budget allows the next request.
+    await query(`update slack_sync_threads set lease_expires_at = clock_timestamp() - interval '1 second' where team_id = $1 and lease_owner is not null`, [teamId]);
+    await query(`update slack_method_budgets set next_permitted_at = clock_timestamp() - interval '1 second' where team_id = $1`, [teamId]);
+    const snapshotBefore = await wholeSnapshotRow(teamId);
+    const evidenceBefore = await publishedEvidence(teamId);
+    expect(snapshotBefore, "fixture: the first page staged a partial thread").toMatchObject({ complete: false, seen_cursors: ["page-2"] });
+
+    const result = await hydrate({
+      ok: true, messages: [{ ts: "1718900000.000102", thread_ts: OLD_ROOT, user: "U1", text: F3_CANARY }],
+      ...hasMore, response_metadata: { next_cursor: 7 },
+    });
+
+    expect(result).toEqual({ outcome: "failed", category: "transport_error" });
+    // Never complete, so never publication-eligible; nothing staged replaced or deleted.
+    expect(await wholeSnapshotRow(teamId)).toEqual(snapshotBefore);
+    const [queued] = await query(`select status, page_cursor from slack_sync_threads where team_id = $1 and root_ts = $2`, [teamId, OLD_ROOT]);
+    expect(queued).toEqual({ status: "queued", page_cursor: "page-2" });
+    // The published evidence is byte-identical, and holds no canary.
+    const evidenceAfter = await publishedEvidence(teamId);
+    expect(evidenceAfter).toEqual(evidenceBefore);
+    expect(JSON.stringify([evidenceAfter, await wholeSnapshotRow(teamId)])).not.toContain(F3_CANARY);
   });
 });

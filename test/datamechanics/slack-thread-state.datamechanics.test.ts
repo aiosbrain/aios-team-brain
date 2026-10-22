@@ -131,44 +131,80 @@ describe("inactive replies staging — resume, fencing and retention", () => {
   });
 
   /**
-   * F3 RED (AIO-1170 final review, Astra-adjudicated F3 MEDIUM): MALFORMED REPLIES PAGINATION IS NOT
-   * A TERMINAL PAGE. Today the transport reads a non-string `next_cursor`, or a non-object
-   * `response_metadata`, as "no cursor"; with `has_more: false` the hydrator then stages the thread as
-   * COMPLETE and checkpoints its cursor to null — a truncated conversation the future publisher would
-   * publish as the whole thread. The adjudicated contract: the transport refuses it as the existing
-   * `transport_error` / `malformed_response_<status>`, so the hydrator requeues it as a transport
-   * failure and nothing is staged, completed, advanced or deleted. The partial evidence already
-   * staged by the first page is preserved exactly.
+   * AM-F3 RED EVIDENCE, group 6 — actual transport → replies → persisted staging, for a continuation
+   * page whose RAW pagination metadata is malformed (accepted amendment
+   * `aio1170-f3-accepted-amendment-20261022`). The published-evidence half of group 6 is the case
+   * "F3 RED: … published evidence …" in `slack-known-root-requeue.datamechanics.test.ts`, which has
+   * the real publication fixture this file does not.
    *
-   * EXPECTED RED on the current source: the second call returns `progressed` and the snapshot
-   * becomes complete with the cursor cleared.
+   * A first page really stages the root and one reply, with continuation `page-2`. The continuation
+   * is answered with a LITERAL body. The adjudicated contract: the transport refuses it as the static
+   * `transport_error` / `malformed_response_200`; the hydrator requeues it as a transport failure, so
+   * nothing is staged, replaced, completed or deleted, the cursor stays `page-2`, and neither the
+   * snapshot row nor the queue row carries anything from the refused body.
+   *
+   * The staged snapshot is compared as its WHOLE row — messages, `seen_cursors`, `stored_bytes`,
+   * `complete`, generation and `expires_at` — read with `select *`; the narrower `staged()` helper of
+   * this suite is not a whole-row comparison. The queue row is compared whole except for the columns
+   * a transient requeue is meant to change: status, lease, due time, attempts, error code and update
+   * time.
+   *
+   * EXPECTED RED on the current source:
+   *  - numeric `next_cursor` (has_more false or absent), `response_metadata` null or an array: the call
+   *    returns `progressed`, and the snapshot becomes COMPLETE with the cursor cleared;
+   *  - a control-character cursor with has_more true: already refused today, but by the hydrator, as
+   *    `malformed_page` — so only the expected category, `transport_error`, is red; the staging
+   *    assertions pass now and must keep passing.
    */
+  const F3_CANARY = "xoxb-F3-CANARY-replies-5c90";
+  const QUEUE_BOOKKEEPING = ["status", "lease_owner", "lease_generation", "lease_expires_at", "due_at", "attempts", "last_error_code", "updated_at"];
+  const withoutQueueBookkeeping = (stored: ThreadRow): ThreadRow =>
+    Object.fromEntries(Object.entries(stored).filter(([key]) => !QUEUE_BOOKKEEPING.includes(key)));
+  async function wholeSnapshotRow(scope: SlackThreadScope): Promise<ThreadRow | null> {
+    const c = await sql();
+    const { rows } = await c.query<ThreadRow>(
+      `select * from slack_thread_snapshots where team_id=$1 and workspace_id=$2 and channel_id=$3 and root_ts=$4`,
+      [scope.teamId, scope.workspaceId, scope.channelId, scope.rootTs]
+    );
+    return rows[0] ?? null;
+  }
+
   it.each<[string, Record<string, unknown>]>([
-    ["a numeric next_cursor", { response_metadata: { next_cursor: 7 } }],
-    ["response_metadata null", { response_metadata: null }],
-    ["response_metadata an array", { response_metadata: [] }],
+    ["a numeric next_cursor and has_more false", { has_more: false, response_metadata: { next_cursor: 7 } }],
+    ["a numeric next_cursor and has_more absent", { response_metadata: { next_cursor: 7 } }],
+    ["response_metadata null and has_more false", { has_more: false, response_metadata: null }],
+    ["response_metadata an array and has_more false", { has_more: false, response_metadata: [] }],
+    ["a control-character cursor and has_more true", { has_more: true, response_metadata: { next_cursor: `${F3_CANARY}\u0007` } }],
   ])("F3 RED: refuses a continuation page with %s and keeps the staged partial thread exactly as it was", async (_label, metadata) => {
     const seed = await seedTeam(); const scope = scopeFor(seed);
     await enqueue(scope);
     expect(await hydrateOneSlackThread(input(seed.teamId), { fetchImpl: page([rootMessage, replyOne], true, "page-2") }))
       .toEqual({ outcome: "progressed" });
-    const stagedBefore = await staged(scope);
-    const rowBefore = await row(scope);
-    expect(stagedBefore).toMatchObject({ complete: false, snapshot_generation: "1" });
-    expect(rowBefore.page_cursor).toBe("page-2");
     await expireLease(scope); await freeMethod(seed.teamId);
+    const snapshotBefore = await wholeSnapshotRow(scope);
+    const rowBefore = await row(scope);
+    expect(snapshotBefore).toMatchObject({ complete: false, snapshot_generation: "1", seen_cursors: ["page-2"] });
+    expect(rowBefore.page_cursor).toBe("page-2");
 
-    const malformed = (async () => new Response(JSON.stringify({ ok: true, messages: [replyTwo], has_more: false, ...metadata }),
-      { status: 200 })) as typeof fetch;
+    // The refused body carries a canary in a reply as well, so a staged copy of any of it would show.
+    const canaryReply = { ts: "1718900002.000300", text: F3_CANARY };
+    let requestedCursor: string | null = "unset";
+    const malformed = (async (url: string) => {
+      requestedCursor = new URL(url).searchParams.get("cursor");
+      return new Response(JSON.stringify({ ok: true, messages: [canaryReply], ...metadata }), { status: 200 });
+    }) as typeof fetch;
     expect(await hydrateOneSlackThread(input(seed.teamId), { fetchImpl: malformed, random: () => 0 }))
       .toEqual({ outcome: "failed", category: "transport_error" });
+    expect(requestedCursor).toBe("page-2");
 
-    // Nothing staged, nothing completed, nothing advanced, nothing deleted.
-    expect(await staged(scope)).toEqual(stagedBefore);
+    // Nothing staged, replaced, completed or deleted: the WHOLE snapshot row is unchanged.
+    expect(await wholeSnapshotRow(scope)).toEqual(snapshotBefore);
+    // The queue row: still the partial thread at `page-2`, requeued, with only its retry bookkeeping moved.
     const rowAfter = await row(scope);
-    expect(rowAfter.page_cursor).toBe("page-2");
-    expect(rowAfter.snapshot_generation).toBe("1");
-    expect(rowAfter.status).toBe("queued");
+    expect(rowAfter).toMatchObject({ status: "queued", page_cursor: "page-2", snapshot_generation: "1" });
+    expect(withoutQueueBookkeeping(rowAfter)).toEqual(withoutQueueBookkeeping(rowBefore));
+    // No canary persisted anywhere this path writes.
+    expect(JSON.stringify([await wholeSnapshotRow(scope), rowAfter])).not.toContain(F3_CANARY);
   });
 
   it("does not reclaim a complete live snapshot or touch another workspace's older due root", async () => {
