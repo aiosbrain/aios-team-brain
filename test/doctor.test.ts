@@ -233,3 +233,25 @@ describe("summarize", () => {
     expect(summarize([{ status: OK }, { status: FAIL }]).exitCode).toBe(1);
   });
 });
+
+describe("the doctor CLI runs end to end", () => {
+  // Unit tests import the checks; nothing else executes the script. A re-export that never bound
+  // `checkNode` locally passed every import-level test and crashed `npm run doctor` (review r4).
+  it("prints the node line and never the crash banner", () => {
+    let out = "";
+    try {
+      out = execFileSync(process.execPath, [path.join(ROOT, "scripts", "doctor.mjs"), "--no-db"], {
+        cwd: ROOT,
+        encoding: "utf8",
+        env: { PATH: process.env.PATH ?? "" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (err) {
+      // Exit 1 is a legitimate "not ready" verdict on a bare environment; only the output matters.
+      const e = err as { stdout?: string; stderr?: string };
+      out = `${e.stdout ?? ""}${e.stderr ?? ""}`;
+    }
+    expect(out).not.toMatch(/doctor failed/);
+    expect(out).toMatch(/node\s+node \d+\.\d+\.\d+/);
+  });
+});

@@ -41,7 +41,7 @@ have git || die "git is required. Install it, then re-run."
 have node || die "Node 22.23.4+ (or 24.22.1+ / 26.12.1+) is required to run the setup wizard. See https://nodejs.org"
 
 # Per-line floors: the first release whose built-in trust store rejects the eMudhra intermediates with
-# recoverable keys (2026-10-20). Same table as scripts/doctor.mjs NODE_TLS_FLOORS and the Dockerfile.
+# recoverable keys (2026-10-20). Same table as scripts/node-tls-floor.mjs NODE_TLS_FLOORS and the Dockerfile.
 NODE_VERSION="$(node -p 'process.versions.node' 2>/dev/null || echo 0.0.0)"
 case "${NODE_VERSION%%.*}" in
   22) floor=22.23.4 ;;

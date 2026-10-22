@@ -65,7 +65,8 @@ export function parseEnvFile(text) {
   return out;
 }
 
-export { NODE_TLS_FLOORS, checkNode } from "./node-tls-floor.mjs";
+import { NODE_TLS_FLOORS, checkNode } from "./node-tls-floor.mjs";
+export { NODE_TLS_FLOORS, checkNode };
 
 export function checkDatabaseUrl(value) {
   if (!value) {
