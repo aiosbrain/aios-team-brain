@@ -1,4 +1,6 @@
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { cpSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
@@ -21,5 +23,29 @@ describe("credential-carrying workflows refuse a pre-fix Node", () => {
     // The first line that invokes `node` (a `run: node …` step or a heredoc body) is the floor check.
     const firstNode = text.match(/^\s+(?:run: )?node(?:\s.*)?$/m);
     expect(firstNode?.[0].trim()).toBe("run: node scripts/check-node-tls-floor.mjs");
+  });
+});
+
+describe("the floor check runs with no installed dependencies", () => {
+  // Those workflows never run `npm ci`. A transitive import of an npm package (doctor.mjs gained
+  // one: pg, via lib/db/pg/ssl.mjs) would fail every run with ERR_MODULE_NOT_FOUND, and a test run
+  // from this checkout cannot see that because node_modules is right here.
+  it("check-node-tls-floor.mjs and its imports resolve from a bare copy of scripts/", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "tls-floor-"));
+    try {
+      for (const f of ["check-node-tls-floor.mjs", "node-tls-floor.mjs"]) {
+        cpSync(path.join(ROOT, "scripts", f), path.join(dir, f));
+      }
+      const out = execFileSync(process.execPath, [path.join(dir, "check-node-tls-floor.mjs")], { cwd: dir, encoding: "utf8" });
+      expect(out).toMatch(/^node TLS floor: node \d+\.\d+\.\d+/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("node-tls-floor.mjs imports nothing but node built-ins", () => {
+    const text = readFileSync(path.join(ROOT, "scripts", "node-tls-floor.mjs"), "utf8");
+    const specifiers = [...text.matchAll(/\bfrom\s+["']([^"']+)["']|import\(\s*["']([^"']+)["']/g)].map((m) => m[1] ?? m[2]);
+    expect(specifiers.filter((s) => !s.startsWith("node:"))).toEqual([]);
   });
 });
