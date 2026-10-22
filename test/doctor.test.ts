@@ -215,6 +215,12 @@ describe("node runtime", () => {
       expect(dockerfile).toContain(`${major}:"${floor}"`);
       expect(install).toContain(`${major}) floor=${floor}`);
     }
+    // …and neither carries a line the table doesn't, nor package.json's engines.
+    const n = Object.keys(NODE_TLS_FLOORS).length;
+    expect(dockerfile.match(/\d+:"\d+\.\d+\.\d+"/g)).toHaveLength(n);
+    expect(install.match(/^\s*\d+\) floor=/gm)).toHaveLength(n);
+    const engines = JSON.parse(readFileSync(path.join(ROOT, "package.json"), "utf8")).engines.node;
+    expect(engines).toBe(Object.values(NODE_TLS_FLOORS).map((f) => `^${f}`).join(" || "));
   });
 });
 
