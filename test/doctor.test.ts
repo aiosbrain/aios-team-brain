@@ -19,11 +19,14 @@ import {
   checkMailer,
   checkModelProvider,
   checkNode,
+  NODE_TLS_FLOORS,
   checkPgSsl,
   checkSecretsKey,
   parseEnvFile,
   summarize,
 } from "../scripts/doctor.mjs";
+
+const ROOT = path.resolve(__dirname, "..");
 
 describe("parseEnvFile", () => {
   it("agrees with `sh` on the forms .env.local actually uses", () => {
@@ -193,10 +196,25 @@ describe("embeddings width — a mismatch degrades silently at query time", () =
 });
 
 describe("node runtime", () => {
-  it("requires >=20 per package.json engines", () => {
+  it("requires a supported line at or past its eMudhra trust-store fix", () => {
     expect(checkNode("18.19.0").status).toBe(FAIL);
-    expect(checkNode("20.11.0").status).toBe(OK);
-    expect(checkNode("22.3.0").status).toBe(OK);
+    expect(checkNode("20.19.0").status).toBe(FAIL); // EOL: never gets the fix
+    expect(checkNode("22.23.3").status).toBe(FAIL);
+    expect(checkNode("22.23.4").status).toBe(OK);
+    expect(checkNode("v22.30.0").status).toBe(OK);
+    expect(checkNode("23.11.0").status).toBe(FAIL);
+    expect(checkNode("24.19.0").status).toBe(FAIL);
+    expect(checkNode("24.22.1").status).toBe(OK);
+    expect(checkNode("26.12.1").status).toBe(OK);
+  });
+
+  it("is the same floor table the Dockerfile and install.sh enforce", () => {
+    const dockerfile = readFileSync(path.join(ROOT, "Dockerfile"), "utf8");
+    const install = readFileSync(path.join(ROOT, "install.sh"), "utf8");
+    for (const [major, floor] of Object.entries(NODE_TLS_FLOORS)) {
+      expect(dockerfile).toContain(`${major}:"${floor}"`);
+      expect(install).toContain(`${major}) floor=${floor}`);
+    }
   });
 });
 

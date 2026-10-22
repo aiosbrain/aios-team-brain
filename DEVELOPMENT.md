@@ -7,7 +7,8 @@ lives is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); the conventions an agen
 
 ## Prerequisites
 
-- **Node 20+** (Next.js 16 / App Router).
+- **Node 22.23.4+** (or 24.22.1+ / 26.12.1+) — Next.js 16 / App Router; earlier patches still trust the
+  eMudhra intermediates disclosed as compromised on 2026-10-20.
 - **Docker** — only for the ephemeral test Postgres (`npm run db:test:up`) and, if you don't have
   a Postgres handy, for local dev too.
 - **git**, and (recommended) the `gh` CLI for PRs.

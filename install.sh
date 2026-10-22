@@ -38,10 +38,19 @@ printf '\n  AIOS Team Brain installer\n\n'
 
 # 1. Prerequisites, named precisely — "command not found" three layers deep is not a diagnosis.
 have git || die "git is required. Install it, then re-run."
-have node || die "Node 20+ is required to run the setup wizard. See https://nodejs.org"
+have node || die "Node 22.23.4+ (or 24.22.1+ / 26.12.1+) is required to run the setup wizard. See https://nodejs.org"
 
-NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
-[ "$NODE_MAJOR" -ge 20 ] || die "Node 20+ is required (found $(node -v)). Upgrade, then re-run."
+# Per-line floors: the first release whose built-in trust store rejects the eMudhra intermediates with
+# recoverable keys (2026-10-20). Same table as scripts/doctor.mjs NODE_TLS_FLOORS and the Dockerfile.
+NODE_VERSION="$(node -p 'process.versions.node' 2>/dev/null || echo 0.0.0)"
+case "${NODE_VERSION%%.*}" in
+  22) floor=22.23.4 ;;
+  24) floor=24.22.1 ;;
+  26) floor=26.12.1 ;;
+  *) die "Node $NODE_VERSION is not a supported line. Install 22.23.4+, 24.22.1+ or 26.12.1+, then re-run." ;;
+esac
+[ "$(printf '%s\n%s\n' "$floor" "$NODE_VERSION" | sort -t. -k1,1n -k2,2n -k3,3n | head -1)" = "$floor" ] ||
+  die "Node $NODE_VERSION predates the eMudhra trust-store fix (need >=$floor). Upgrade, then re-run."
 
 # Docker is needed only for the local/demo targets, so this is a note rather than a hard stop —
 # the wizard checks the daemon properly (not just the binary) and can still do the Railway path.

@@ -23,6 +23,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
+          check-latest: true # runner caches can predate the eMudhra trust-store fix (22.23.4)
       - run: node scripts/check-docs-drift.mjs
 
   static-checks:
@@ -33,6 +34,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
+          check-latest: true # runner caches can predate the eMudhra trust-store fix (22.23.4)
           cache: "npm"
       - run: npm ci
       - run: npm run lint
@@ -62,6 +64,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
+          check-latest: true # runner caches can predate the eMudhra trust-store fix (22.23.4)
           cache: "npm"
       # python3 is a HARD dependency of the unit tier, not an incidental one:
       # test/guards/graphiti-patch-same-item.test.ts runs the committed patch script and EXECUTES the
@@ -134,6 +137,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
+          check-latest: true # runner caches can predate the eMudhra trust-store fix (22.23.4)
           cache: "npm"
       # The ubuntu-latest runner carried the Postgres client tools for free; this job container does
       # not. `node:20-bookworm` is the FULL image, so git and bash come with it (buildpack-deps base),
@@ -219,6 +223,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
+          check-latest: true # runner caches can predate the eMudhra trust-store fix (22.23.4)
           cache: "npm"
       - run: npm ci
       - run: DATABASE_URL="$DATABASE_TEST_URL" npm run pg:schema
@@ -286,6 +291,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
+          check-latest: true # runner caches can predate the eMudhra trust-store fix (22.23.4)
           cache: "npm"
       - run: npm ci
       - run: npm run test:neo4j

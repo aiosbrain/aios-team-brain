@@ -54,7 +54,8 @@ ENV GRAPHITI_TELEMETRY_ENABLED=false
 # neo4j, tenacity and posthog would still resolve fresh at whatever moment the platform builds — so
 # the image verified here would not be the image that ships, and a new `openai` release could land
 # untested under the patched client. `constraints.txt` is `pip freeze` of the image this change was
-# actually validated against; regenerate it deliberately, not incidentally.
+# actually validated against; regenerate it deliberately, not incidentally. One hand-edit on top of the
+# freeze: certifi is pinned to 2026.10.19 (eMudhra CA compromise) — keep it at least that on regeneration.
 # The image's venv is uv-built and ships NO pip, so bootstrap it with ensurepip first. Installing
 # with the SYSTEM pip would land the library in /usr/local/lib/python3.12/site-packages — which is
 # exactly the unused copy Trap 1 is about, and the server would keep importing 0.13.2 from the venv.
