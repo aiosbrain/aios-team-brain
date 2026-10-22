@@ -467,12 +467,147 @@ describe("guard: pr-task-link.yml specifically", () => {
     expect(triggers(doc())).toEqual(["pull_request_target"]);
   });
 
-  it("is pinned to `main`, which is what the environment's branch policy allows", () => {
-    // On pull_request_target the run's ref is the PR's BASE branch, and `trusted-automation` only
-    // permits `main`. A PR into any other branch would be refused the environment and go RED — and
-    // this check is advisory, so it is never allowed to go red. The two settings move together.
+  /**
+   * THE REFUTED pull_request_target MODEL MUST BE GONE AS A CLAIM, not as a phrase and not as a line.
+   *
+   * THREE VERSIONS, and each hole was found by a different reviewer, so the history is the spec:
+   *   v1 forbade two exact strings. Fable: green over a file asserting the same model four lines up
+   *      in different words. A phrase pin proves the text changed, not the model.
+   *   v2 forbade a FAMILY of phrasings, and stripped whole LINES carrying a retraction word so the
+   *      corrections could quote the old claim in order to retract it. gpt-6-astra broke it with one
+   *      line: `# The main-only policy is obsolete; the ref is always the base branch.` — "obsolete"
+   *      strips the line, live assertion and all. It also showed the positive half was satisfiable by
+   *      deleting every explanation and keeping the literal date.
+   *   v3 (this one) exempts QUOTED and PARENTHETICAL spans instead of whole lines, on a rule that is
+   *      easy to follow and easy to check: **history goes in quotes or parentheses; assertions do
+   *      not.** An unquoted, unparenthesised assertion is always caught, however it is worded, and
+   *      whatever retraction words share its line.
+   */
+  /**
+   * v4. THE v3 STRIPPER WAS BLIND TO A THIRD OF THE FILE IT CERTIFIED, and Fable measured it: 35.3% of
+   * `pr-task-link.yml`. `/"[^"]*"/` lets `[^"]*` cross NEWLINES, and the `run:` heredoc contains odd
+   * numbers of `"` per line, so quote pairing ran away — two spans of 16 and 18 lines, executable code
+   * included, were being deleted before matching. An assertion inserted anywhere inside them was
+   * invisible. An unbalanced `(` in any comment did the same thing until the next `)`.
+   *
+   * Two changes, both narrowing: only COMMENT lines are considered at all (an assertion about the
+   * event model lives in a comment, never in code), and a span may not cross a line.
+   */
+  const COMMENT_LINE = /^\s*(#|\/\/)/;
+  const HISTORY_SPAN = /"[^"\n]*"|\([^)\n]*\)/g;   // quoted or parenthetical, WITHIN ONE LINE
+  /**
+   * v5 — TRAILING comments count. v4 filtered to lines that BEGIN with a marker, so
+   * `statuses: write # …the ref is always the base branch` was structurally invisible. That is not a
+   * hypothetical: `nda-gate.yml:19` was an actual carrier hiding in exactly that shape, and the file
+   * asserted the corrected model 80 lines lower — one file saying both. A comment is a comment
+   * wherever it sits.
+   *
+   * Over-inclusion is the safe direction here: a `#` inside a shell string in a `run:` body gets
+   * treated as a comment tail, which can only cause a FALSE RED — loud, and fixable by quoting.
+   * Under-inclusion is what just hid a carrier.
+   */
+  const commentPart = (line: string): string =>
+    COMMENT_LINE.test(line) ? line : (line.match(/\s(?:#|\/\/)\s?(.*)$/)?.[1] ?? "");
+  const OLD_MODEL: readonly [RegExp, string][] = [
+    [/ref is (?:always |ALWAYS )?the (?:pull request's )?base branch/i, "ref is the base branch"],
+    [/run's ref is the pull request's target branch/i, "ref is the target branch"],
+    [/(?:runs|executes) the BASE branch's/i, "code comes from the base branch"],
+    [/default is the base branch/i, "checkout default is the base branch"],
+    [/base.branch (?:code|scanner) only/i, "base-branch-code-only rule"],
+    [/policy allows\s+`main`\s+only/i, "policy allows main only"],
+    // "base SHA" — the vocabulary the EIGHTH carrier used. Fable found the text AND the gap: fixing
+    // the line without adding the pattern leaves the guard unable to catch its return (mutation M16
+    // SURVIVED until this row existed).
+    [/base SHA/i, "check attaches to the base SHA"],
+  ];
+  /** The claim that must be POSITIVELY made — a date alone certifies nothing. */
+  const CURRENT_MODEL = /default branch,? regardless of the pull request's base|evaluate against the default branch|ref is the DEFAULT branch|from the DEFAULT branch/;
+  const assertions = (src: string) =>
+    src.split("\n").map(commentPart).map((l) => l.replace(HISTORY_SPAN, " ")).join("\n");
+
+  // FOUR files carry claims about these mechanics; ALL must be free of the refuted model.
+  it.each([["pr-task-link.yml"], ["aios-work-sync.yml"], ["nda-gate.yml"], ["scan-on-merge.yml"]])(
+    "%s never asserts the refuted model",
+    (file) => {
+      const live = assertions(text(file));
+      for (const [re, label] of OLD_MODEL) {
+        expect(live, `refuted model survives as an assertion: ${label}`).not.toMatch(re);
+      }
+    }
+  );
+
+  // Only the THREE `pull_request_target` workflows must positively state that model. `scan-on-merge`
+  // is a `push` workflow — requiring it to state a rule that does not govern it would be the guard
+  // teaching the wrong thing, so it gets its own assertion below.
+  it.each([["pr-task-link.yml"], ["aios-work-sync.yml"], ["nda-gate.yml"]])(
+    "%s states the CURRENT model, not merely a date",
+    (file) => expect(text(file), "the current model must be STATED").toMatch(CURRENT_MODEL)
+  );
+
+  it("scan-on-merge.yml states that it is a `push` trigger and the change does NOT govern it", () => {
+    // The distinction is the thing most likely to be flattened by a future reader "tidying" these
+    // comments into agreement — and flattening it in either direction is a real error: the 2025-12-08
+    // change moved `pull_request_target` to the default branch and left `push` alone.
+    const src = text("scan-on-merge.yml");
+    expect(src, "must name its own trigger semantics").toMatch(/ref is the PUSHED BRANCH|run's ref is the pushed branch/i);
+    expect(src, "and must say the pull_request_target change does not apply").toMatch(/does NOT apply here|not that event/i);
+  });
+
+  it("is NON-VACUOUS in both directions, including the two evasions astra found", () => {
+    // Direction 1 — a live assertion is caught however it is dressed.
+    const plain = "# On pull_request_target the ref is always the base branch, so the policy is satisfied.";
+    const astraM10 = "# The main-only policy is obsolete; the ref is always the base branch.";
+    for (const line of [plain, astraM10]) {
+      expect(assertions(line), `must be caught: ${line}`).toMatch(OLD_MODEL[0][0]);
+    }
+    // Direction 2 — a genuine retraction is exempt, so the rule does not push authors to delete history.
+    for (const line of ['# It said "the ref is always the base branch"; that was the pre-2025-12-08 model.',
+                        "# The ref is the DEFAULT branch (it was the base branch until 2025-12-08)."]) {
+      expect(assertions(line), `must be exempt: ${line}`).not.toMatch(OLD_MODEL[0][0]);
+    }
+    // astra M11 — deleting the prose and keeping the date must NOT satisfy the positive half.
+    expect("# 2025-12-08", "a bare date certifies nothing").not.toMatch(CURRENT_MODEL);
+
+    // FABLE's v3 BREAK, as a standing control. An assertion placed deep in the `run:` body — inside
+    // what the runaway quote-span used to swallow — must be seen. Reconstructed rather than described:
+    // a line with an odd `"` upstream, then the assertion many lines later.
+    // THE REAL SHAPE, not a paraphrase of it. A first version of this control had only ONE `"`, so
+    // `/"[^"]*"/` never closed and nothing was stripped — it passed under the BROKEN stripper too,
+    // which is a control that controls nothing. The bug needs a quote that OPENS before the assertion
+    // and CLOSES after it, so the runaway span swallows the line in between.
+    const runawayQuote = [
+      '      # the script prints "Found work key(s)',
+      "      - run: node scripts/pr-work-keys.mjs",
+      "      # On pull_request_target the ref is always the base branch, so any author satisfies it.",
+      '      # …and the log line ends with a closing " here',
+    ].join("\n");
+    expect(assertions(runawayQuote), "a runaway quote must not hide a later assertion").toMatch(OLD_MODEL[0][0]);
+    // …and code lines are ignored entirely, so a string literal in a script cannot trip the guard.
+    expect(assertions('      - run: echo "the ref is always the base branch"'), "code is not a claim").not.toMatch(OLD_MODEL[0][0]);
+
+    // v5 control — Fable's EIGHTH carrier, which lived in a TRAILING comment and was structurally
+    // invisible to v4. `nda-gate.yml:19` was exactly this shape.
+    const trailing = "  statuses: write # on pull_request_target the ref is always the base branch";
+    expect(assertions(trailing), "a trailing comment is still a comment").toMatch(OLD_MODEL[0][0]);
+    // …and a trailing comment can retract, like any other.
+    expect(assertions('  statuses: write # it said "the ref is always the base branch" until 2025-12-08'),
+      "a trailing retraction is exempt").not.toMatch(OLD_MODEL[0][0]);
+  });
+
+  it("fires on exactly the release branch and the contribution base", () => {
+    // WAS "pinned to `main`, which is what the environment's branch policy allows", and the
+    // rationale under it was the pre-2025-12-08 event model: it said the run's ref is the PR's BASE
+    // branch, so a PR into any other branch would be refused a `main`-only environment and go red.
+    //
+    // GitHub changed that effective 2025-12-08 — "For `pull_request_target`, environment rules
+    // evaluate against the default branch" — so the base branch never decides the environment check,
+    // and the trigger list and the policy are INDEPENDENT. The assertion below was always right; only
+    // its reason was wrong, which is the more dangerous half to leave standing.
+    //
+    // What keeps this advisory check off red now is the `trusted-automation` policy containing the
+    // DEFAULT branch (widened to `[main, staging]` before the default moved at the cutover).
     const on = doc().on as Record<string, { branches?: unknown; types?: unknown }>;
-    expect(on.pull_request_target.branches).toEqual(["main"]);
+    expect(on.pull_request_target.branches).toEqual(["main", "staging"]);
     expect(on.pull_request_target.types).toEqual(["opened", "edited", "synchronize", "reopened"]);
   });
 
@@ -604,8 +739,10 @@ describe("guard: aios-work-sync.yml specifically", () => {
 
   it("takes its credentials from the `trusted-automation` environment", () => {
     // The third and last `AIOS_*` consumer to enrol, which is what unblocks deleting the
-    // repository-level copies. NOT a fork boundary: on pull_request_target the ref is always the
-    // base branch, so a fork pull request satisfies a `main`-only policy too. See the file header.
+    // repository-level copies. NOT a fork boundary: on `pull_request_target` the ref is the DEFAULT
+    // branch (GitHub, effective 2025-12-08), so every author — fork or not — satisfies the policy
+    // identically. An earlier version of this line said "always the base branch"; same conclusion,
+    // obsolete mechanism. See the file header.
     expect(job().environment).toBe("trusted-automation");
     expect(secretRefs(job())).toEqual(["AIOS_API_KEY", "AIOS_BRAIN_URL", "AIOS_TEAM"]);
   });

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import Ajv from "ajv";
+import Ajv from "ajv-draft7";
 
 // Proposed contracts only. These checks do not assert runtime route conformance.
 const directory = join(import.meta.dirname, "..", "fixtures", "mcp-next-v1");

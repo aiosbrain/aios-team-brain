@@ -431,6 +431,15 @@ export function startIngestScheduler(): void {
   }
 
   async function runMeetingNotesBackfill(db: ReturnType<typeof adminClient>): Promise<void> {
+    // M9: check ONCE, before the per-team loop. Every team's `resolveAnsweringKeys` throws under the
+    // copied-staging spend policy, and the per-team catch below turns each throw into a recorded
+    // FAILED ingest run — so a deployment that is working exactly as designed would paint the
+    // dashboard with recurring meeting-notes failures and hide any real one among them.
+    const { modelFeaturesEnabled } = await import("@/lib/staging/model-features");
+    if (!modelFeaturesEnabled("background")) {
+      console.info("[ingest] meeting-notes backfill skipped: model-backed extraction is disabled on this deployment");
+      return;
+    }
     try {
       const { backfillMeetingNotesFromItems } = await import("@/lib/meetings/from-items");
       const { resolveAnsweringKeys } = await import("@/lib/query/answering");

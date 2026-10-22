@@ -57,11 +57,13 @@ function cursorFromMeta(meta: unknown): string | null {
  * timestamp (`lib/ingest/pipeline-health` had to learn the same lesson), and without the second key
  * the resume point is arbitrary between same-millisecond rows.
  *
- * `trigger='scheduler'` only. Today neither the admin "backfill now" action
- * (`app/t/[team]/admin/access/actions.ts`) nor `drainTeamContext` records an `ingest_runs` row at all
- * — verified, after an earlier version of this comment claimed they did — so there is no pollution to
- * filter yet. The filter is kept because it costs nothing and because the moment either one starts
- * recording, an unfiltered read would resume the scheduler from somebody else's position.
+ * `trigger='scheduler'` only, and since AUDITFIX-14 that filter is LOAD-BEARING rather than merely
+ * prudent: `lib/ingest/manual-context` records a `context_backfill` row with `trigger:'manual'` on
+ * every chat `/sync` and admin "Run now", carrying that pass's own informational cursor. An
+ * unfiltered read would resume the scheduler from a manual pass's position — i.e. from `null` or from
+ * item 25 of a candidate page — skipping the tail of the scheduler's own sweep. (The admin "backfill
+ * now" action in `app/t/[team]/admin/access/actions.ts` and `drainTeamContext` still record no row at
+ * all — verified, after an earlier version of this comment claimed they did.)
  *
  * Best-effort by design — a read failure yields a null cursor, which restarts the sweep from the top.
  * That is wasteful but always CORRECT (the reconcile is idempotent); the opposite bias, guessing a

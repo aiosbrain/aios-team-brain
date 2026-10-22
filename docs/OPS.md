@@ -354,7 +354,7 @@ chooses to adopt.
 ## 7. Upgrading across a brain-api contract bump
 
 The brain-api wire contract is versioned in **`aios-workspace/docs/brain-api.md`** (this server
-declares **v1.23** — `lib/api/version.ts`; this paragraph said v1.21 until 2026-08-25, which is the
+declares **v1.28** — `lib/api/version.ts`; this paragraph said v1.21 until 2026-08-25, which is the
 drift the table below exists to prevent and did not) — the single pinned contract both `aios-workspace` (the CLI/MCP client) and
 `aios-team-brain` (this server) build against. Per that doc's own change policy: a **breaking**
 change requires a **major version bump** (`/api/v2`); **additive** changes (new endpoints, new
@@ -630,6 +630,107 @@ outright — nothing was ever pushed, so there is nothing to retry.
 
 ## 11. Staging refresh — prod-shaped data in staging (`scripts/staging-refresh.sh`)
 
+### Paired encrypted refresh (implemented, NOT ACTIVATED)
+
+The preferred `copy-ready` path is the executable design in `docs/design/staging-workflow-hardening.md`. It adds two pinned, branchless runner services: `aios-staging-export` on the production private network and `aios-staging-import` on the staging private network. The former has read-only production Postgres/fixed-read Neo4j access plus write-only source-bundle storage; the latter has read-only source storage, importer-owned durable rollback storage, and staging-only database/lifecycle identities. `config/staging-ops/schedules.json` is the concrete, disabled-by-default service/schedule/storage contract: weekly export, five-minute importer polling, fourteen-day source-bundle lifecycle, and rollback-owner cleanup only after a replacement is ready. Provisioning the services, object-store lifecycle/IAM, secrets, and GitHub/Railway policy is a later authorized activation. They add two small scheduled compute services plus encrypted storage/possible egress and therefore may add infrastructure cost. Copied staging makes **zero** model/extraction calls, and there is no configuration that changes that in this build. The design allows an OPTIONAL separately budgeted interactive-query mode; it is **not implemented**. `STAGING_QUERY_LLM_ENABLED` / `STAGING_QUERY_LLM_BUDGET_USD` used to flip the gate on `Number(budget) > 0` alone — which also accepted `Infinity` — while nothing anywhere metered, reserved or refused spend against that amount, so it was a permission bit shaped like a ceiling rather than a cap. Setting them now produces the named `staging-budgeted-interactive-query-unsupported` refusal (`answering: "unsupported-budgeted-mode"` on the privileged health probe) and still yields zero outbound calls. What copied staging DOES serve is the baseline: direct Neo4j graph-backed reads and Postgres FTS. Enabling the optional mode requires an enforced provider/query budget contract, built and reviewed separately; do not treat an external provider-side cap or an operator's assurance as that contract.
+
+Connector INGESTION is disabled there as a whole operation, not leg by leg. The poller never starts (`instrumentation.ts`), and the manual triggers — chat `/sync`, the four Admin → Integrations "Run now" actions, and `scripts/connectors.ts` — refuse at their own entrypoint with `ingestion_disabled` (`lib/staging/ingest-policy.ts`), after authorization and before anything runs: no connector call, no Linear inbound stage, no AUDITFIX-14 project-context pass, no `ingest_runs` row, no revalidation. The whole-operation shape is the point. Since AUDITFIX-14 a manual entrypoint reconciles even when its import threw — correct in production, where a thrown leg is not evidence that nothing was committed — so a per-leg refusal here would have made "the connector was refused" the trigger for the rest of a disabled operation. The mode read is the fail-closed one: a pinned staging deployment whose marker or journal cannot be read refuses too.
+
+`docker/staging-ops.Dockerfile` pins Postgres 18 clients. `compose.test.staging-pair.yml` supplies isolated production/staging Postgres and Neo4j networks, authenticated source/rollback S3-compatible services, and a measured outbound-request spy, all under randomized Compose project ownership with no host ports. Exporter and importer containers have disjoint networks and read-only mounts containing only their role's keys; the fixture controller alone can seed both sides. The harness invokes the actual exporter and importer CLIs, boots the real Next application behind the startup fence, and verifies its internal/external API reads. It also proves SigV4 and operation-level storage denials, unroutable opposite-side hosts, retry/recovery/concurrency behavior, PG/graph fault rollback, failed rollback remaining stopped, shared-lock exclusion, and staging-head catch-up without another data copy.
+
+**Failure scenarios are asserted by RECEIPT, not by an exit status.** "The command exited non-zero and the prior data is still there" is satisfied identically by a preflight refusal, a container that never started and the fault the scenario is about — and the prior data was already installed before the scenario ran. So the importer emits one greppable, credential-free line per checkpoint (`scripts/staging-ops/receipts.mjs`: `postgres-restored`, `graph-restored`, `fault-injected`, `prior-pair-restored`, `recovery-required`), each carrying the run it belongs to, and each scenario requires the exact ones its story needs plus the journal transition. A `before-drain` fault is the standing NEGATIVE CONTROL: it replaces nothing, so it must fail the recovery scenario — which under the old assertion it passed. The interruption test waits for run-3's own `postgres-restored` receipt rather than for `state=importing`, which is written before the restore begins and could therefore be killed on with no candidate data written at all. The graph is part of the version oracle too (the fixture stamps the capture version into every fact), the after-graph fault exercises a recovery that must undo BOTH stores, and the last step corrupts only the installed graph's fact versions to prove the oracle can refuse. The exit trap copies the command logs and receipts to `.staging-pair-artifacts/` with harness secrets, URL credentials and bearer tokens masked (`redact-artifacts.mjs`) — never the generated key material — and CI uploads that directory, because the harness root is a `mktemp` directory the trap deletes.
+
+**The ops image's own reaping is proved by an out-of-band DIAGNOSTIC, not by the harness or by CI.** `compose.test.staging-pair.yml` sets `init: true`, so docker-init reaps there and masks the image's behaviour completely, and the unit guard on `docker/staging-ops.Dockerfile` pins the ENTRYPOINT argv — which still passes against a tini that does not adopt, a dropped `-s`, or a base image whose `/usr/bin/tini` is a stub. `bash scripts/staging-ops-reaper-check.sh` therefore EXECUTES the deployed launch path three ways: the image ENTRYPOINT, the Railway override command read out of `config/staging-ops/schedules.json` (the hosted path, which never runs the ENTRYPOINT), and a `--entrypoint node` negative control that must FAIL to reap. Run it when the ops image, its base or the scheduled command changes; it builds an image and takes minutes, so nothing in CI depends on it. It must run on bash 3.2 — the macOS system bash, measured 3.2.57 — so no `mapfile`/`readarray`. Every artefact it creates is named for the invocation's PID, each run keeps its three lane results under `.staging-ops-reaper-checks/<run-id>/` (git-ignored; PID/process-state facts only, no configuration and no credentials), and nothing is removed by wildcard, so concurrent invocations cannot delete each other's evidence. `test/guards/staging-ops-reaper-check.test.ts` pins those properties: a command CI never runs has no other way to stay runnable.
+
+`scripts/staging-ops/exporter.mjs` holds one read-only repeatable-read snapshot, produces the sanitized public dump/auth projection and fixed-read typed graph, signs the canonical manifest, and encrypts the payload. `scripts/staging-ops/importer.mjs` verifies and privately pins the immutable object before drain, requires the last-ready rollback pair, stops only read-back-identified pinned staging app/Graphiti deployments through the sole Railway adapter, holds the exclusive data lock, installs both stores, reapplies allowlisted tester passwords, verifies sanitation, boots the exact observed staging head, and advances ready only after an authenticated boot probe plus durable candidate readback. It repairs stale ready bookkeeping on a same-run retry. Entering drain snapshots the prior pair into `rollback_target_*`; that target and the candidate/source objects are retained until the new ready identity's pointer, watermark, catch-up state, and durable readback have all reconciled—not merely until health returned. A post-ready bookkeeping failure leaves the verified deployment serving and emits `ready-bookkeeping-pending`; it is repair work, not permission to stop. Catch-up is persisted when staging advances during maintenance. The Railway adapter reads the schema-supported auto-deploy status, enumerates every deployment page, rejects unknown statuses/ambiguous source commits, treats `REMOVING` as poll-only, and handles `NEEDS_APPROVAL` through the cancel path.
+
+The graph ledger check binds completed Postgres rows to the graph by `(group_id, episode_uuid)` and
+then to the retained source/chunk name. Matching names or counts cannot hide a substituted UUID or a
+cross-group episode. Pending rows without a UUID, deferred/blank rows, and a completed row pointing
+to a legitimate nonzero chunk keep their intended semantics.
+
+All runner budgets are finite integers and are validated before database or lifecycle work:
+`STAGING_OPERATION_TIMEOUT_MS` (15 minutes), `STAGING_CAPTURE_TIMEOUT_MS` (defaults to the operation
+budget), `STAGING_RECOVERY_TIMEOUT_MS` (10 minutes), `STAGING_CLEANUP_TIMEOUT_MS` (2 minutes),
+`STAGING_DB_CONNECT_TIMEOUT_MS` (the lesser of 10 seconds and the operation budget), and
+`STAGING_TERMINATE_GRACE_MS` (2 seconds). Postgres cancellation is server-side; a client-only promise
+timeout is not accepted as proof that a statement stopped. Timed-out PG utilities terminate their
+owned process group, escalate to KILL, and must report `close` before rollback begins. Graph work uses
+finite transaction timeouts. Recovery gets a distinct bounded budget on the same session so the
+exclusive advisory lock remains continuous. If process or query termination cannot be confirmed,
+containment stays held instead of reporting a safe release while work may survive. The daemon has no
+finite lifetime: every tick is rebudgeted independently. These are monotonic **total phase budgets**,
+not fresh allowances per query: every later Postgres/Neo4j/subprocess step is capped by the remaining
+run time, and the one capture retry consumes the same capture/run allowance. Recovery and terminal
+cleanup each start one separate non-renewing reserve. Cleanup actively terminates an owned resource
+and awaits settlement; if settlement cannot be confirmed inside the finite grace, the worker exits
+without continuing through lock-release code and leaves durable reconciliation required.
+
+An exporter may retry exactly once only when the complete private capture fails with a classified
+transient storage/database/graph or online-correspondence condition. The retry takes a fresh PG
+snapshot and fresh Neo4j session and rebuilds the entire private payload. Permanent failures stop
+after one attempt; transient exhaustion stops after two. Signing, encryption, and the no-clobber
+immutable write happen once and only after success, so retries never publish partial data or new
+ciphertext beneath an existing object key. Import promotion is never retried blindly.
+
+**Declare the mode BEFORE the fence-capable baseline lands.** `STAGING_DATA_MODE` is a declaration, and an undeclared mode on a database that has the `staging_marker` fails CLOSED — `readStagingRuntimeState` returns `copy-safe-refusal` and `/api/health` answers 503, which on a Railway healthcheck is a failed deployment. That refusal is correct and stays, so the ORDER is the prerequisite: set `STAGING_DATA_MODE=legacy-pg-only` on the staging service and **read it back** from the deployed environment first; only then deploy the baseline that carries the startup fence. This is a rollout step, not an optional one.
+
+Before activation: verify all pinned IDs/internal hosts/reference descriptions and distinct credential HMACs; each required production/staging pair (`auth-secret`, `secrets-key`, `neo4j-credential`) must be a well-formed tuple with the same fingerprint version, comparison-key ID, and credential class before unequal MACs count as separation. Missing, malformed, or mismatched-key evidence refuses before drain. Importer-owned rollback bundles are staging artifacts and are intentionally not compared against staging itself. Apply the source-store fourteen-day lifecycle independently of rollback storage; install `staging_ops` only with `importer.mjs install-ops`; declare and read back `legacy-pg-only` as above; deploy the fence-capable app baseline; configure stable health/tester secrets; create and durably verify a `bootstrap-rollback` pair while the existing app remains in its measured mode; then change the staging app's declared data mode to `copy-ready` before the first manual import. The journal's authenticated candidate/last-ready mode preserves graph-disabled behavior if that first import has to restore a legacy checkpoint even though the service is now fence-enabled. Rehearse rollback; run `--census`; run `npm run test:staging-pair`; verify the live negative runner-network/IAM tests and zero outbound extraction; then set the schedules active. Missing/corrupt/expired prior data, incompatible loader identity, wrong environment/token/host/database, shared graph credentials, active readers, or failed health leaves staging stopped/failed. Never substitute the legacy PG-only path after a paired failure.
+
+Four properties of the lifecycle are easy to get wrong and are therefore stated outright:
+
+- **A shutdown signal stops NEW destructive work; it never withholds recovery.** SIGTERM/SIGINT are checked before the importer reads a source object and again immediately before the destructive install admission, and a manual `rollback` of a **ready** pair refuses outright — a shutdown may not open a maintenance window. It is deliberately NOT checked in front of the interrupted-run recovery branch, the already-ready reconciliation, or a rollback from a non-ready state: those are how staging gets back to serving. An idle `daemon` races its five-minute wait against the signal and exits promptly instead of sleeping through it. **Once the destructive window has been entered, recovery runs on a FRESH cancellation scope** (`createSessionWatchdogOwner.transferTo`) that does not inherit the aborted shutdown signal: inheriting it aborted every recovery subprocess on its first spawn, so the rollback never ran and the journal landed `recovery-required` with staging stopped. The recovery budget bounds it instead. Repeated signals route into the same idempotent shutdown and cannot drop the fencing session, and nothing here releases a lock before owned work is proven contained.
+- **Only a validated full staging checkpoint keeps its own credentials.** Restoring an importer-authenticated `staging-rollback` bundle with `databaseMode: full` restores the staging authentication state captured in it and does NOT reapply the configured testers — those testers are configured for incoming SOURCE data, their member identities need not exist in a captured baseline, and reapplying them would either fail the restore of a good baseline or mint identities this restore has no authority to create. Every other install — a sanitized source bundle, a sanitized staging rollback checkpoint — reapplies the allowlisted staging-only tester credentials strictly through the existing admin writer, verifying each configured tester's identity, active status, role and posture. The exception is selected by all three of: manifest kind, `databaseMode: full`, **and** an opaque provenance token minted only by an open that verified the importer-owned rollback signing key. Two of those are signed claims and the third cannot be spelled by a manifest at all, so a forged source manifest declaring `full` gets neither the whole-database restore path nor the credential exemption. There is no environment escape and no "the tester check failed, so keep what was there" fallback.
+
+- **Admission is one activation-aware decision, shared.** The schema loader (Railway's `preDeployCommand`) and startup fence both call `fence-admission.mjs`, which scopes staging through the matching pinned ops environment ID and derives durable enrollment from a real journal run/boot/candidate/last-ready identity. The absent control schema and installer-created empty journal remain genuine preactivation compatibility. Once enrolled—or when `copy-ready` / `STAGING_COPY_MODE_ACTIVATED=true` demands strict treatment—a missing or invalid mode refuses before schema SQL or child spawn. Supported `legacy-pg-only` rollback remains fenced. The shared boot verdict admits `ready`, or exactly the run/SHA this refresh recorded in `boot_run_id`/`boot_commit`; the importer's injected schema loader instead proves the same session owns the exclusive data-use lock. The importer deploys while the journal says `booting`, so a ready-only gate would fail the predeploy it is waiting for. `boot_commit` remains separate from `catchup_commit`, which is an outstanding branch head.
+- **Ready is a commit boundary; rollback identity is explicit.** `markReady` commits the canonical serving run only after health and durable candidate readback. Fallible pointer/watermark/head/catch-up work runs afterward; failure retains the serving deployment, ready journal, new durable artifact, and preserved `rollback_target_*`. A later same-run tick reconciles those facts. Deliberate rollback from `ready` is allowed only while that preserved prior target exists and only after the journal has durably accepted `ready → draining`; a refused transition performs zero lifecycle mutation.
+- **A healthy fence is never released on an unverified stop.** The startup supervisor owns the payload process group. A zero-exiting wrapper, failed signal delivery, or surviving descendant is `containment-pending`: the supervisor stays alive with its shared-lock session and retries bounded stop/verification attempts. Only verified group absence releases that healthy session. If Postgres actually loses the session, the lock is already gone; the supervisor terminates promptly and reports a surviving workload without pretending continuous protection. Operator recovery must restore containment before another install—never infer safety from the wrapper's exit code.
+  - **Repeated signals stay handled.** TERM/INT handlers are installed with `process.on`, not `process.once`, and are removed only after cleanup completes. With `once`, delivery removed the handler before invoking it, so a SECOND identical signal during the retry loop above took Node's default action and killed the lock-owning supervisor while its payload — which owns a SEPARATE process group and cannot be reached by signalling the supervisor's — could still be alive and serving. Every signal, repeated or alternating, routes into the one idempotent shutdown. This is reachable through ordinary retries: a failed verification resets the workload's memoized stop, so a later stop request, deploy stop-first attempt or controller shutdown sends TERM again.
+  - **A container reaper is a prerequisite, on every start path.** `groupAlive` asks `kill(-pgid, 0)`, and Linux answers success for an unreaped ZOMBIE group — which SIGKILL cannot remove. Under a PID 1 that does not reap (`node` as ENTRYPOINT), an orphaned grandchild of the payload chain leaves the group permanently "alive", so a stop that has actually completed is refused forever and the fence holds its shared lock: correct fail-closed behaviour, permanently blocking every refresh. Measured in an isolated container: without an init a sole Z-state member survived escalation; with one the group was empty and the stop verified in 25 ms. So `tini -s` is an ancestor of the fence on **both** effective start paths — the image ENTRYPOINT (`docker/entrypoint.sh`) and, separately, `scripts/railway-start.sh`, because Railway overrides ENTRYPOINT/CMD with `railway.json`'s startCommand and an entrypoint-only init would not appear on the hosted path at all. The local maintenance service gets the same guarantee via compose `init: true`. `-s` (subreaper) so adoption does not depend on tini actually being PID 1. None of this relaxes the group-gone verification or the lock-retention rule.
+    - **The OPS RUNNER image needs it for the same reason, and it is the runner that holds the locks.** `docker/staging-ops.Dockerfile` shipped `ENTRYPOINT ["node"]`, and `runBoundedProcess` proves containment with the same `kill(-pgid, 0)` — looping until the group is empty rather than returning on a deadline, because a fence must not be released while a descendant is unproven. The importer's one multi-level chain is `reapplyTesters` (`npx` → `tsx` → `node`), so a terminated tester reapply inside the destructive window could leave an unreapable zombie, and the importer would spin in containment holding BOTH the coordinator and exclusive data-use locks with staging stopped. The image now installs `tini`, asserts it at build time, and runs `ENTRYPOINT ["/usr/bin/tini", "-s", "--", "node"]` — and `config/staging-ops/schedules.json` carries the same prefix, because Railway's scheduled services run that command and never the image ENTRYPOINT (exactly as `railway.json`'s `startCommand` overrides the app image's). Guarded by `test/guards/staging-pair-harness.test.ts`. CI cannot observe the defect: compose supplies `init: true`, which is why this needs a **runtime** check at activation — start the pinned runner image, orphan a grandchild, and confirm PID 1 reaps it — rather than only the static guard.
+- **Admission never waits for the import it is refused by.** Both ordinary admission sites — the startup fence and the schema loader Railway runs as `preDeployCommand` — acquire the shared data-use lock NON-BLOCKING and refuse by name (`staging maintenance holds the exclusive data-use lock`) when maintenance owns it exclusively. Waiting is not a refusal: it is the same outage with no diagnostic. The deploy retries. The importer's own injected loader path is unchanged — it proves the same session already holds the EXCLUSIVE lock — and both refresh paths release that exclusive lock before deploying the app, so an ordinary refresh's predeploy is never the contender.
+- **The app's shutdown behaviour applies to production too.** `startup-fence.mjs` supervises the payload whether or not a staging fence is required, so production inherits the same five-second default grace, owned-group escalation and verified-completion stop on its next release. Relate that to the platform's own stop window when planning a rollout; this repository records no measured Railway stop timeout, and no number should be invented for one.
+- **An interrupted FIRST bootstrap is recoverable, because it writes its baseline down first.** `bootstrap-rollback` persists an importer-owned recovery record — run, phase, the exact measured app deployment and commit, the supported mode, and the pinned environment/app-service identity — **before** it transitions to draining and before it stops anything. It must be before: after `stopAndVerifyAll()` returns, the platform reports no active deployment (that is what a verified stop means), so the baseline is no longer measurable by anyone. Without the record, a SIGKILL in that window left both stores intact and correct and staging stopped and fenced with no supplied command able to return it — there is no `last_ready` and no preserved prior pair on a first bootstrap, so neither `importer rollback` nor an ordinary install can recover, and the killed worker's in-memory measurement is gone. The record advances to `captured` the moment the checkpoint is published, verified and read back, so a kill before the journal advances lets a replacement ADOPT that object instead of orphaning it. The record and the `draining` transition are written in ONE statement (`beginBootstrapDraining`), because resumption requires the record's run to equal the journal's current run: written separately, a kill between them left a recorded bootstrap that every later run refused as "not the journal's current run", with nothing stopped and no command able to clear it. Re-run `importer bootstrap-rollback`: a fresh worker reconciles the record under the same coordinator lock, validates the recorded subject against its own pins, and resumes. **A resume always re-enters `draining` and re-runs `stopAndVerifyAll` before taking the exclusive lock.** It must, and an earlier version did not: the record survives an ORDINARY failure too, and ordinary failure deliberately REDEPLOYS the baseline before leaving the journal `failed` — so a resume that took the exclusive lock directly met a live fenced app, timed out, and could never reach `booting`, whose transition admitted only `draining`/`booting`. Re-proving the stop also removes the assumption that a killed worker's "verified stop" still holds (a SIGKILL *during* `stopAndVerifyAll` leaves Graphiti possibly running). The resumed run keeps its ORIGINAL identity and its original published checkpoint; retrying an ordinary failure reaches `ready` under that same identity. Exact boot admission is unchanged, and the record is cleared in exactly one place — after `markReady` commits. A record about a different environment or app service, an inexact commit, an unsupported mode, or a claimed publication with no canonical object identity all REFUSE and leave staging fenced and unmutated; none of them manufactures a last-ready, guesses a branch head, clears enrollment or touches a database the bootstrap only read.
+- **A failed source is not retried unattended.** Entry into draining durably records a destructive install attempt against the immutable object identity, in `staging_ops.source_install_attempts` — which the paired install does not restore, so it survives both the rollback and the ready transition that erase every other trace. A candidate that fails AFTER draining is rolled back, staging returns to ready, and the success watermark is deliberately not advanced past it — so the next automatic tick used to rediscover exactly that object and drain, stop and restore staging again, bounded only by the bundle's fourteen-day expiry. The automatic `tick`/`daemon` path now refuses a source whose recorded attempt ended `failed` or was left `attempted` (the killed-in-flight case), before any drain. Only `importer install <immutable-object-id>` — an explicit operator naming the object — authorises another attempt, and it keeps every signature, expiry, credential, loader, watermark, prior-pair and fence check. Discovery is deliberately NOT filtered: excluding the blocked identity would select an older eligible bundle and reintroduce the oscillation the watermark exists to prevent, so the newest identity stays selected and stays reported as blocked. A failure proven to be BEFORE the drain withdraws the record **only when this invocation created it** — no record existed for that object beforehand and this run's `recordSourceAttempt` returned. A failure earlier than that write created nothing to withdraw, and a failure on an object that already carried an `attempted`/`failed` record only incremented someone else's evidence; withdrawing in either case discards a prior attempt (typically a killed-in-flight automatic one) and hands the candidate straight back to the unattended drain loop the record exists to stop.
+- **OPEN, low severity — a preserved rollback target can outlive its own usefulness (L6, deferred).** Recovery records `ready` before the pointer write and `clearRollbackTarget`, and its ready-bookkeeping catch can leave the preserved target equal to the pair that is now serving. A later manual `importer rollback` then sees a non-empty preserved target and can reinstall that same healthy pair — a needless maintenance window, not data loss, and never a rollback to a WRONG pair. The fix (not implemented): a narrow under-coordinator-lock reconciliation that, when the preserved target exactly equals the verified serving last-ready identity (run **and** object **and** digest **and** commit **and** mode — never run ID alone), completes the pointer bookkeeping and clears the redundant target, at ready admission and at explicit rollback. It must never clear a DISTINCT preserved prior. Until then: before running a manual rollback, compare the preserved target's identity with the serving one, and do not roll back healthy state to solve bookkeeping.
+- **A refused stop REQUEST is retried inside the same bounded deadline; a refused stop is never a claimed one.** Both maintenance adapters' `stopAndVerifyAll` re-list and re-request every `pollMs` until their deadline, and the LISTING is the sole arbiter of "stopped". A stop request that the controller refuses because it could not VERIFY containment — measured as `409 stop-unverified` 7,049 ms into the initial bootstrap stop — used to throw straight out of that loop on the first attempt and fail the whole refresh, even though the next poll would very likely have observed the workload gone. It is now recorded (`stop-request-retrying` receipt) and retried; if it never clears, the operation still fails at the deadline, and the timeout message names the last request failure so a permanently refused stop cannot read as "the children just took a while". Two refusals are exempt and surface immediately, because waiting cannot make them false: a deployment outside the pinned app/Graphiti allowlist, and a status with no safe stop transition (`scripts/staging-ops/maintenance-refusal.mjs`). Nothing about what counts as stopped changed — absorbing a failed request can only give the next poll a chance to observe a real stop, never manufacture one.
+- **Catch-up is verified against `ready`, not `booting`.** A catch-up never leaves the journal, so the app answers 200 with its mode, commit and installed run. The install path's 202-booted probe cannot be satisfied by a caught-up app.
+- **Discovery uses a durable monotonic watermark.** "Newest capture already installed" means IDLE. Selecting the newest run that merely is not the installed one selects an OLDER bundle whenever the newest is installed, and staging oscillates between two weekly bundles forever. A tie on capture end is ambiguous and refuses.
+- **An unreadable journal temporarily refuses staging mutation and privileged readiness — that is the intended behaviour, and it is a behaviour CHANGE worth stating.** `readStagingRuntimeState` (`lib/staging/runtime-policy.ts`) now issues a journal query on every call for staging, including legacy staging, and returns `copy-safe-refusal` for **any** failure other than undefined-table. So a transient database error — a pool blip, a lock timeout, a restart — refuses manual sync, graph projection and the privileged health probe on legacy staging until the read succeeds again, where previously a declared legacy mode alone answered ready. This is deliberate: "I could not read the journal" is not evidence that a refresh is not in flight, and the cost of guessing wrong is a write into a database being replaced. The refusal is momentary and self-clearing; nothing is fenced durably by it. **The pre-activation exception is narrow on purpose:** only SQLSTATE `42P01` (undefined table), and only when the declared mode is `legacy-pg-only` with `STAGING_COPY_MODE_ACTIVATED` unset, is treated as "the control schema is not installed yet". Widening it to any error, or caching a previous answer to avoid the query, would convert exactly the failures this refuses on into a pass. **Production is not part of this**: a production instance has no marker and no declared staging mode, and its two marker reads per projection run are deliberately left alone — no cache is added there, because a cached "this is not staging" is the one answer that must never be stale.
+- **Loader compatibility is the runner image's own capability**, never the live target catalog: the catalog is the thing being replaced, and reading it there blocks legitimate staging-only schema changes and makes a half-installed target unrecoverable. The payload's declared catalog digest is instead checked against the INSTALLED result, and a difference is reported as a named diagnostic rather than reconciled by an invented upgrade path.
+
+**The destination check needs a DIRECT connection, so some specs cannot run over a published port.** Before any drain, `assertLivePostgresTarget` requires the lock-owning session's socket peer to equal the server's own `inet_server_addr()`. A host-published Docker port is NAT, so the server sees the gateway and the check correctly refuses — which means every ordinary local data-mechanics path (`npm run db:test:up` on 5434, `test:datamechanics:local`, `test:datamechanics:iso`) fails the affected specs for a reason unrelated to the code. Do **not** relax the check for local runs; reach the service the way production does. CI already does: `datamechanics-tests` runs in a job container on the service network at `postgres:5432`. Locally, the same shape is `npm run test:datamechanics:network` (`scripts/dm-network-attached.sh` — a per-worktree network and Postgres with no published port, tests executed inside the `docker/staging-ops.Dockerfile` runner; `npm run db:test:network:down` removes it). Ordinary local data-mechanics runs are unchanged. ⚠️ **That is not the Railway proof.** It exercises the peer check over an IPv4 bridge; Railway private networking is IPv6-only and the address family a live backend reports is **unmeasured**. `assertPinnedPostgresTarget` and the peer check therefore remain activation prerequisites: run **`node scripts/staging-ops/importer.mjs verify-target`** against the live staging service on Railway's own private network and confirm the destination check passes there before enabling any schedule. That is a **different command from `verify`**, and the distinction is the point: `verify` verifies and pins a source BUNDLE — its preflight deliberately omits the runtime/provider pins and its maintenance adapter is null, so it cannot measure a destination at all, and this paragraph used to name it. `verify-target` is read-only: it requires the pinned project/environment/Postgres/importer identities, performs the same live peer check and the same provider service-instance/endpoint/variable-reference reads the drain path performs, and returns the measured target. It never drains, transitions the journal, stops a deployment, restores a store or deletes a graph, and it does not fall back to a green verdict when a pin is missing — an absent pin refuses in preflight. On the local harness adapter there is no provider to measure and the result says so (`proof: "local-harness"`); only `proof: "provider-measured"` on the live staging service is the activation evidence.
+
+**The staging discriminator is control state and survives the restore.** `public.staging_marker` is deliberately absent from `postgres/schema.sql` and every migration, so nothing recreates it: not a production archive (which never contained it) and not `loadSchema`. Restore therefore enumerates and drops the non-extension public application objects explicitly — with `RESTRICT`, in one transaction, on the exclusive-lock-owning client — and excludes the marker from that set. `pg_restore --clean --section=pre-data` cannot be used: FK drops live in POST-data, so a pre-data clean leaves them and the replay fails on dependency errors. The archive's own `SCHEMA public` / schema COMMENT / schema ACL entries and any entry naming the preserved marker are omitted structurally from the restore list, so a rollback archive can neither duplicate nor clean it. Marker presence and contents are verified before boot; re-materialisation happens only after the pinned staging identity has been independently proven.
+
+**Activation is verified by a callable read-only check, not by a runbook checkbox.** First run `node scripts/staging-ops/exporter.mjs activation-evidence` in the production exporter role. It authenticates its production environment-scoped token before any value read, binds the pinned app/exporter deployments and deployment snapshots, and publishes only a fresh purpose/audience-bound Ed25519-signed allowlist envelope to the existing private source prefix. Then set the returned immutable ID as `ACTIVATION_EVIDENCE_OBJECT_ID` in the importer invocation and run `node scripts/staging-ops/importer.mjs activation-preflight`. The importer has **no production provider token**: it verifies the signed evidence and measures staging with its staging-only token, including deployment-bound app credentials, repository triggers, complete service references, private endpoints, pinned importer/Graphiti deployments and Graphiti provider-key name absence. It separately binds the privileged health answer to that exact staging deployment and reads the shipped schedules contract.
+
+**The consumer decides whose production the evidence describes.** A signature proves who supplied an observation; it does not prove the observation is about the subject the consumer expects. The exporter validates its OWN topology document, and the importer holds an independent one — so ordinary configuration drift (a replaced service, a corrected pin) produced `READY TO ACTIVATE` from measurements of DIFFERENT production services, and certified their credential separation too. At the verified-evidence boundary the importer now compares the signed `production.app.serviceId`, `production.resources.postgres.serviceId` and `production.resources.neo4j.serviceId`, plus the already-required project/environment scope, against its own pinned production identities. A mismatch FAILS (`production-subject-identity`), a missing subject or missing pin is UNVERIFIED, and neither can leave `credential-separation` passing. Scope is not subject: two different services in the same correctly scoped production environment satisfy every scope check there is. Production Graphiti is not bound because the evidence schema carries no production Graphiti measurement; the production exporter subject is bound by the runner checks.
+
+**Runner image evidence is about the artifact RUNNING, not the one configured.** `serviceInstance.source.image` is service configuration, and Railway documents staged changes that can be committed without triggering a redeploy — so a correct configured reference plus a correct pinned active deployment ID still says nothing about the executing artifact. Both roles therefore require their pinned successful active runner deployment's own `meta.imageDigest` to be a well-formed `sha256:<64 hex>` equal to the digest suffix of their expected immutable reference, and the exporter signs that measurement alongside (never in place of) the configured image and the deployment/snapshot identity. Missing, null or malformed metadata is UNVERIFIED; a well-formed different digest is a refusal. There is no fallback to `meta.image`, to configuration, or to a tag resolved fresh at activation, and an envelope predating the field is rejected rather than defaulted to success. ⚠️ **Evidence limits, which bound what this may be claimed to prove:** `Deployment.meta` is an opaque scalar in Railway's public GraphQL schema with no documented members, so this is a **provider-observed contract with an inference**, not a formal guarantee — it was read live from two Railway environments and independently correlated against the public registry (a `neo4j:5.26.2` deployment's digest equalled that tag's `Docker-Content-Digest` exactly). The observed value identified the source INDEX digest, not the architecture-specific child actually executed; an index digest is what a `@sha256:` reference names, which is why it is compared against the reference's own suffix. No digest-pinned ops-runner deployment was available in the authorized read set, so **commissioning a real digest-pinned runner and confirming this exact field under each role's own scoped acquisition remains an activation prerequisite** — a fixture pass is not live provider authorization.
+
+**Deferred to activation measurement, deliberately not implemented as a speculative refusal:**
+- **Neo4j target schema (M7).** `neo4j-replace` retains the target's existing schema while replacing data and adding allowlisted indexes. An incompatible target constraint could plausibly reject a valid replay, but no measured constraint on the pinned staging database was supplied, and "refuse any constraint on a supported label" is broader than the spec's retain-compatible-schema contract and would reject compatible schemas. Before the first refresh, inspect `SHOW CONSTRAINTS` / `SHOW INDEXES` on the pinned database and compare with the supported replay schema; record unknown or incompatible target schema as NOT READY and adjudicate any measured mismatch before enabling. Nothing here claims the live database has passed.
+- **Custom entity attributes.** `sanitizeGraphExport` clears summary and summary_embedding exactly as specified and copies other supported entity properties, which is the accepted fidelity contract. No installed custom entity schema, surviving sensitive field or reachable disclosure has been identified. At activation, inspect the source schema: if custom derived attributes exist, determine their provenance and sanitation policy before accepting them. A measured cross-tier leak is a separate escalation, not a reason to pre-emptively drop fields.
+- **Discovery download cost.** `discoverLatestSource` rejects non-canonical object IDs before reading but still downloads canonical old objects and activation envelopes. Retention bounds history and no measured cost or ceiling failure exists, so this is an optimization, not a release requirement. If it is ever taken: do not select by filename timestamp (capture end is authenticated metadata), do not add a second index protocol, and do not make cache state authoritative.
+
+Three properties are the point, and each replaces something weaker:
+
+- **Every check reports a status, and an unmeasured one is `UNVERIFIED`.** The overall verdict is `READY TO ACTIVATE`, `NOT ACTIVATED` (we looked and it is wrong) or `UNVERIFIED` (we could not look) — and `assertActivationPreflightReady` refuses the last two alike. **The best outcome is deliberately not called `ACTIVATED`**, because the schedule check reads the shipped contract FILE and passes only while that file declares the automation off: an all-green run certifies that the measurable controls are correct, and nothing more. It does **not** certify that the system is still inert — that is a claim about live platform schedules, which this build never reads; the contract file states an intent, not a measurement. The previous `assertStagingTopology` could express none of this: it validated a supplied JSON document, had no production caller, and a document says whatever it is written to say.
+- **Operator claims are recorded and satisfy nothing.** `ACTIVATION_CLAIM_*` variables appear in the report labelled *not evidence*. Nothing an operator asserts moves a check to `pass`. (`STAGING_COPY_MODE_ACTIVATED` remains a claim that can only make validation STRICTER, never permit anything.) The topology file supplies expected pins only; provider read-backs and the signed production envelope establish provenance. `schedules-disabled-in-contract-file` reads the shipped contract file and is never evidence about a live platform schedule.
+- **It cannot mutate provider state.** Only fixed allowlisted read-only GraphQL documents may be issued; mutations and unlisted documents refuse before network I/O. The sole write is publication of the small signed evidence object through the exporter's existing write-only private prefix. The opaque provider variable maps are reduced inside the collector and never returned to the evaluator.
+- **The privileged health token is bound BEFORE it is sent, and to the WHOLE identity.** A provider-returned hostname is not enough: `healthProbeBinding` requires the staging read token's own measured project/environment scope to be the pinned staging one, the newest deployment to be that pinned environment AND service, `SUCCESS`, carrying a valid 40-hex commit, with a measured domain — and a supplied `STAGING_ORIGIN` to be a usable origin that agrees with it (an unparseable one is refused, not ignored). Any of those failing means **zero health requests**, because a comparison performed after the fact cannot un-send a credential. A refusal is reported as a FAILURE when something measured disagrees and as UNVERIFIED when a prerequisite is absent; neither can pass. The answer must then come back from that origin, report `ok`, and carry the observed deployment's commit — a bound `ok:false` answer, or a `copy-ready` claim with no `refreshRunId`, is a refusal and not a health verdict.
+
+**Limits remain explicit.** The Railway API returns whole value maps, not key-selective reads. Under the accepted H5 decision the production-local collector may transiently receive that response only after exact token/project/environment/service/deployment binding; it immediately derives the three allowlisted fingerprints and public descriptions. App provider values are not inherited into runner configuration, persisted, logged, sent to staging, or used. Required sealed/null/unresolved values and current-versus-snapshot drift are `UNVERIFIED`, never placeholder fingerprints. The snapshot contract cannot prove arbitrary baked-in or file-mounted secrets, DNS reachability, live schedules, or the app's entire outbound posture; retain the independent image/protocol, network, health and activation rehearsals. `app-no-model-spend` still describes one health field, not every outbound class. READY means the implemented preflight passed, not that activation occurred.
+
+**"Distinct identities" means distinct service INSTANCES, not distinct service definitions.** A Railway service ID is global to its project: the same service is deployed into every environment, and both deployments carry that one ID while differing in `environmentId`. So the identity the topology preflight compares is the tuple `(projectId, environmentId, serviceId)`. Staging and production **environment** IDs must differ; their project and global service IDs may match, and in the measured topology they do — the earlier per-role rule ("staging and production `appServiceId` must be distinct") refused that correct configuration with four errors and would have forced duplicate services to satisfy a check about the wrong noun. Distinctness is still enforced where it means something: within one environment, two incompatible roles may not resolve to the same instance. Private DNS names are deliberately NOT compared across sides — Railway's internal DNS is environment-scoped, so `postgres.railway.internal` addresses a different database in each environment; identical names are not evidence of a shared database, and distinct names would not be evidence of separation either. That question is settled by the environment-bound provider read-back, not by comparing strings.
+
+**Every action validates its own prerequisites before anything drains.** Origin, health token and tester credentials are checked by `scripts/staging-ops/action-preflight.mjs` at the start of `install` / `tick` / `daemon` / `rollback` / `bootstrap-rollback` — they were previously first read after the app had been stopped and Postgres replaced, and automatic rollback then re-entered the same path with the same invalid values and failed a second time. GitHub head credentials are required only by the actions that actually read the branch head, so recovery gains no dependency it does not need.
+
+The narrow policy amendment is explicit: only the reviewed, activated staging-maintenance controller may call `deploymentStop`, `deploymentCancel`, `deploymentRestart`, or exact-commit `serviceInstanceDeployV2` for the two pinned staging app/Graphiti services, and the importer alone may replace the pinned staging Neo4j graph while both locks are held and those deployments are stopped. This does not permit agent Railway lifecycle CLI commands, `railway ssh`, production lifecycle calls, database-service lifecycle calls, arbitrary GraphQL, moving-source deploys, or another `/clear` caller.
+
+The legacy procedure below remains transitional `legacy-pg-only`: it empties/clears graph state and can never attest paired-refresh acceptance or silently become `copy-ready`.
+
 Copies **production's** Postgres into **staging's own** Postgres so a branch can be looked at against
 real data. Design + the reasoning behind every refusal: `docs/design/staging-prod-shaped-data.md`
 (STAGING-1). Staging URL: `https://aios-team-brain-staging.up.railway.app`.
@@ -802,6 +903,87 @@ build. Please leave it as prose.
 > — which is what makes narrative arcs render there — is STGENV-4, and it re-frames the variable table
 > above. Do not set them from this section.
 
+#### Clearing staging's GRAPH after a refresh — required before re-projecting
+
+The refresh touches **one database**. It empties `graph_episodes`, and **nothing resets Neo4j**. Once
+staging's graph is wired, skipping this step means: every fact a previous run extracted stays in the
+graph with no ledger row owning it (and every delete path we have iterates that ledger, so nothing can
+ever clean it), and the next bounded run re-pushes the overlap — `addEpisodes` does not overwrite by
+name — so you pay for the same extraction twice and get two copies of every fact.
+
+Run these **in this order**:
+
+1. **Refresh Postgres** — `scripts/staging-refresh.sh`. The ledger comes back empty.
+2. **Clear staging's graph.** Human-only, one command:
+
+   ```
+   railway ssh -e staging -s aios-team-brain -- 'node scripts/staging-graph-clear.mjs'
+   ```
+
+   **Pass the remote command as ONE quoted argument.** The CLI joins everything after `--` with
+   spaces and wraps the result in its own `sh -c`, so a multi-word command loses its quoting. An
+   earlier version of this runbook used a `sh -c '…'` prefix; the pre-push review proved it executed
+   `sh -c 'sh -c echo …'`, ran a bare `echo`, and printed a refusal on a **correctly configured**
+   staging. It failed closed, and it never worked. There is also **no `curl` in the image**
+   (`node:20-bookworm-slim`, no `apt-get`) — the script uses Node's own `fetch`.
+
+   **What it does** (`scripts/staging-graph-clear.mjs`, unit-tested in
+   `test/staging-graph-clear.test.ts`): it refuses unless **BOTH** hold —
+   `RAILWAY_ENVIRONMENT_NAME` is `staging`, **and** `GRAPHITI_URL`'s host ends in
+   `.railway.internal` — then `POST`s `/clear`. Either being unset is a refusal, not an assumption.
+   Exit codes are distinct because a failure message must not lie: **0** cleared · **1** the request
+   failed (re-run and see) · **2** refused.
+
+   **Both checks are the safety argument, and neither is sufficient alone.** The host proves the
+   target is a *private* sidecar; the environment proves *which* one. In a production shell
+   `graphiti.railway.internal` is production's own sidecar and passes the host check — the first
+   version of this script shipped with only that, and review caught it. `POST /clear` is an
+   **unscoped whole-graph wipe** and the sidecar has **no authentication** — the credential you are
+   thinking of (`NEO4J_AUTH`) is Neo4j's, not the REST server's. Railway's private DNS is
+   environment-scoped, so a `*.railway.internal` host can only be *this* environment's sidecar; a
+   production one would need a public domain, which cannot spell that host. The check **parses** the
+   URL rather than matching a substring, so `https://evil.com/?x=.railway.internal` and
+   `http://a.railway.internal.evil.com` are both refused.
+
+   Both defend against **accident, not intent**: setting the environment variable by hand in a
+   production shell is a deliberate act and nothing here stops it.
+
+   **Before relying on this the first time**, confirm the shell carries the service's environment —
+   the CLI docs do not promise it, and either variable being unset is an exit-2 refusal:
+
+   ```
+   railway ssh -e staging -s aios-team-brain -- \
+     'node -p "[process.env.RAILWAY_ENVIRONMENT_NAME, process.env.GRAPHITI_URL]"'
+   ```
+
+   Both must be populated. If `RAILWAY_ENVIRONMENT_NAME` is missing, the fix is to make the shell
+   carry the service environment — **not** to set it by hand, which defeats the check.
+
+   *Not verified here:* that CLI verb is denied to agents (`.claude/settings.json`), so this
+   invocation has never been executed from this repo's tooling. The script's own logic is tested; the
+   plumbing around it is yours to confirm once.
+3. **Restart the staging app** (dashboard redeploy, or any push). Arcs are served **memory-first** and
+   a warm process keeps a non-empty prior for up to **48 hours** even after its cache row is gone, so
+   without a restart staging will show pre-reset arcs as fresh for two days.
+4. **Then** set `GRAPH_PROJECT_WINDOW_DAYS` and let the projector run.
+
+**Why that order.** Clearing *before* the refresh leaves ledger rows whose graph content is gone —
+reconcile reads that as mass disappearance and re-extracts. Clearing *after* re-projecting throws away
+extraction you just paid for.
+
+**What this step does NOT do, stated plainly:**
+
+- `POST /clear` wipes the **whole graph** on that sidecar, not one group. That is correct for staging
+  and is exactly why it must never become an application code path — a guard
+  (`test/guards/graph-clear-unreachable.test.ts`) fails the build if `/clear` ever becomes a request
+  path in `lib/` or `scripts/`, and `railway ssh` is denied to agents in `.claude/settings.json`.
+- It cannot be run safely while the sidecar's worker is still draining a pre-refresh queue: a late
+  `add_episode` will MERGE its nodes back. There is no quiescence signal today — re-run the script and
+  see whether content reappears.
+- It is **not automated and not scheduled**. Automating it is STGENV-5, and needs a real runner plus
+  identity conditions that bind the *graph* being deleted, which this manual step gets from the
+  operator instead. The reasoning is in `docs/design/staging-graph-reset.md`.
+
 ### Builtin materialization during deploy and attended recovery
 
 **STAGINGMARK-2 repairs markerless fleets during PRET-6 preDeploy**, including teams with
@@ -897,3 +1079,1010 @@ so running it against a healthy fleet is harmless.
 previous release in the Railway dashboard (never `railway up` — the Railway CLI is read-only here;
 see §4 "Railway deploy safety"). That release boots, its startup materialization stamps the marker, and the blocked deploy then applies. This
 is an older-release recovery option; current STAGINGMARK-2 deployments perform marker repair themselves.
+
+---
+
+## 12. Publishing the ops runner image — `staging-ops-image.yml` (AIO-997)
+
+The ops runner (`docker/staging-ops.Dockerfile` — Node 20, PG18 clients, `tini` as a child subreaper)
+is what holds the fences during a paired refresh. Commissioning it on Railway requires **branchless
+runners pinned to immutable registry digests**; a local test image and a Railway source build are
+neither published nor addressable by digest. This workflow is the one path that produces that
+artifact.
+
+**⚠️ Publishing an image is not activation.** Nothing here deploys, promotes, restarts a service,
+changes a schedule or a service variable, moves a ref, or spends on a model — and it holds no
+credential that could. `config/staging-ops/schedules.json` stays disabled. The output is a
+**candidate** commissioning artifact until the role-specific runtime digest/identity, private
+networking and activation checks in §11 pass against it.
+
+### Running it
+
+1. **Pick the commit first, not the branch.** The workflow takes **no inputs**: the only source it
+   will publish is the immutable `github.sha` of a manual dispatch on `staging`. Dispatch only after
+   the staging commit you intend to publish has its required checks accepted, and **record which
+   commit that was** — a later push to `staging` changes neither the artifact this run built nor
+   anything already deployed.
+2. Actions → **Staging ops image publisher** → *Run workflow* → branch **`staging`**. Any other
+   branch fails in the first step, by name, before the registry is touched. That step is a red
+   failure and not a skipped job, deliberately: a green skip looks like a successful no-op.
+3. **Download the receipt artifact** (`staging-ops-image-receipt-<run>.<attempt>`) into the durable
+   commissioning packet. Its retention is **30 days** — GitHub is not the archive.
+
+### Reading the receipt
+
+The receipt names the repository, source SHA, `workflow_ref`/`workflow_sha`, run URL, platform,
+Dockerfile, package, the run-unique tag, the **registry digest**, the full `…@sha256:…` reference,
+the confirmed media type and readback status, and the measured package visibility and repository
+linkage. It carries no token, environment dump or Docker auth config.
+
+**`packageVisibility` and `packageLinkage` hold a measurement or the literal `unmeasured`** — never
+a verdict. When the metadata read answered `404` or was refused, nothing about the package's
+visibility or linkage was observed, and `unmeasured` says exactly that. The publication verdict is
+in `status`; the reason it came out that way is in `note`.
+
+- **`status: published`** — the image is in the registry at that digest, the registry served that
+  exact by-digest reference back, and the package measured **private** and linked to
+  `aiosbrain/aios-team-brain`.
+- **`status: published-unverified`** — the push SUCCEEDED and the privacy/linkage check did not.
+  The workflow FAILS and says so. The image is **not** deleted and the package is **not** made
+  public to force a pass; take it to the coordinator. Reporting this as "no write happened" would
+  be false.
+- **`status: partially-published`** — pushed, then a later step failed. A retry publishes a **new**
+  run-attempt tag; it does not roll the earlier publication back.
+- **`status: failed`** — no confirmed registry digest was produced, and nothing is claimed to have
+  been published.
+- **No receipt at all** — the run was refused by the first step, before the checkout, so the helper
+  that writes a record was not yet on disk. That refusal is the red step to read; the upload step
+  warns about the missing file rather than adding a second, less informative failure.
+
+### When the evidence does not arrive
+
+**Registry publication and evidence delivery are different facts.** A receipt can be true and still
+never reach you: the artifact upload can fail after a verified publication, or the receipt JSON can
+be written and then fail on its way into the job summary. The last step of the job — the only one
+*after* the upload — prints a **`partially-published`** workflow outcome for exactly that case, and
+states the two facts separately:
+
+- `registry publication: confirmed` (the manifest was recomputed from registry bytes and the package
+  measured private and linked, naming the by-digest reference) or `unverified` (the push succeeded,
+  so an image may be in the registry, but this run did not confirm it — `published-unverified` keeps
+  its stronger, more specific status).
+- `evidence delivery: incomplete`, naming which step failed.
+
+It **reports, it does not repair.** The measured receipt is not rewritten or demoted, nothing is
+deleted, rolled back or re-pushed, and the run stays red for its original reason. A retry publishes a
+**new** run-attempt tag. The warning always goes to the **job log**; appending it to the job summary
+is best effort, because the summary is one of the transports that may be what failed.
+
+⚠️ **A cancelled or interrupted run is UNVERIFIED, not "nothing happened."** GitHub cancellation can
+stop the runner before any later step executes — `failure()` is not true for it, and no end-of-run
+artifact delivery is promised for a forcibly terminated job. A cancelled run is not a successful
+commissioning outcome even if a registry write already occurred, and **a missing receipt never proves
+there is no image in the registry.** Before retrying, reconcile the actual run, tag and digest
+against the package itself.
+
+**Verify the run, not just the receipt.** A divergent copy of this workflow on another ref could
+delete its own guards, so the receipt's `workflow_ref`/`workflow_sha` are there to be checked
+against the actual GitHub run and against the reviewed staging source before any digest is
+commissioned. The receipt is traceability evidence; it is not a signed attestation.
+
+### What the digest does and does not prove
+
+The tag exists to be discoverable (`sha-<source-sha>-run-<id>.<attempt>` — no `latest`, and a re-run
+cannot overwrite an earlier run's tag). **Nothing follows a tag**: runners are pinned by digest.
+
+Rebuilding the identical source can legitimately produce a **different** digest, because `apt` and
+the base image move under it. Each build is its own record; a source-SHA tag is **not** immutable
+and must never be described as one.
+
+**`platform` in the receipt is the REQUESTED build target**, not a measured runtime fact. It records
+that `linux/amd64` was asked for and that the push produced a single image manifest — the platform
+recorded in `ops-image-build-state.json` for the commissioning image. Whether the pulled image's
+config actually declares that architecture/OS, and whether it runs on the target runtime, is
+established by the **live pull and smoke check** below, not by this field.
+
+⚠️ **Still live commissioning prerequisites**, in the order they get answered:
+
+- An **authenticated pull by that exact digest** succeeds, and the pulled image's config reports
+  `linux/amd64`. Smoke-check Node, the PG18 client, `tini` and the entrypoint, and check the
+  `org.opencontainers.image.source`/`revision` labels against the published source SHA.
+- Whether Railway reports this single-manifest digest in a deployment's `meta.imageDigest`. The
+  receipt records the media type so that comparison can be made honestly later. Do not substitute an
+  image/config/file hash to force the match.
+
+### Account prerequisites — not yet measured
+
+These are concrete capabilities of the GitHub organization and of Railway, and they stay explicit
+until someone measures them:
+
+- The Actions `GITHUB_TOKEN` must be permitted to **create and push** `aios-staging-ops` in the
+  `aiosbrain` namespace, and to **read that package's metadata back**. A local-token `404` says
+  *absent or inaccessible* — it is not evidence the job token can create the package.
+- Railway must be able to **pull the private package by digest** with a scoped registry credential,
+  provisioned through the existing authorized provider workflow. That credential never appears in a
+  receipt.
+
+**Do not "fix" any of these by broadening token scopes, adding a PAT, or making the package
+public.** If a prerequisite fails, the workflow refusing is the correct outcome.
+
+---
+
+## 13. Auditing the ops runner image before making it public — `staging-ops-image-audit.yml` (AIO-997)
+
+The user's authorization to make `ghcr.io/aiosbrain/aios-staging-ops` **public** is conditional: the
+artifact must first be verified to contain no secrets or private content. This workflow is that
+verification. Data, snapshots, backups and credentials stay private regardless of its outcome.
+
+**⚠️ Making a package public is IRREVERSIBLE.** GitHub does not offer a public → private transition
+for a package. Nothing below is reached until the evidence is accepted.
+
+### What it audits, and what it cannot claim
+
+It audits **one existing digest**, pinned in reviewed source
+(`scripts/staging-ops/image-audit/subject.mjs`) as a tuple: the digest, the source revision
+`11eb039b…`, the original publication run `34398108263.1`, and that run's immutable receipt tag.
+There is **no input** — auditing a different digest is a reviewed edit to that file, not a dispatch
+parameter, and another approved digest needs a scoped subject update.
+
+- It **pulls and exports** that image and never runs it. No entrypoint, no npm script, no container.
+- It verifies the whole identity chain: registry bytes → the pinned manifest digest → the config
+  descriptor → each ordered layer's descriptor → each `rootfs.diff_ids` entry.
+- It inspects **every layer**, including files a later layer deletes or overwrites. Inspecting a
+  started container or a merged root filesystem would miss exactly those, and they remain fully
+  distributed to anyone who pulls the digest.
+- It compares `/app` byte-for-byte against the **original public source revision**, fetched into a
+  separate directory. `.dockerignore` filters the *expected* set only: an image file at an excluded
+  source path is a **finding**, never a scan skip.
+- **A PASS is not a proof of absence.** It means: no finding under the recorded scanner rules and the
+  recorded coverage. It cannot prove the absence of arbitrary private prose, an unknown credential
+  format, or an encoded secret. The recipe assertions are evidence about *configured inputs*, **not**
+  a hermeticity claim — `apt`, `curl` and `npm ci` all reach the network during the build.
+
+### Running it
+
+1. Actions → **Staging ops image audit** → *Run workflow* → branch **`staging`**. Any other branch,
+   event or repository fails in the first step, by name, before the registry is touched.
+2. It shares the publisher's concurrency group, so an audit and a publication cannot interleave.
+   **Pause publisher dispatches** for the whole inventory-to-transition window — the concurrency
+   group does *not* cover the manual browser step at the end.
+3. **Download `staging-ops-image-audit-<run>.<attempt>`** into the durable coordinator packet.
+   Retention is **30 days**; GitHub is not the archive.
+
+### Reading the evidence
+
+The artifact is built from an allowlist, so what is *absent* is deliberate. Raw layer content,
+extracted files, the full config/history and every scanner match stay in ephemeral runner scratch and
+are never uploaded or printed — **this repository is public, and an Actions artifact is potentially
+public evidence.**
+
+- **`transitionReady`** is the only field the operator gate should read. It is **derived**, not
+  asserted: any finding *or* any unmeasured thing sets it false, because "we found nothing" and "we
+  did not look" must not read the same.
+- **`blockers`** lists every reason in one pass.
+- **`coverage.limitations`** names anything that could not be fully inspected — an unexpandable
+  archive format, an oversized member, an exhausted per-layer or **cumulative** staging budget
+  (`total-staging-budget-exhausted`; `coverage.stagedBytes` against `stagedByteLimit` is the measured
+  total across every layer and nested expansion). A bounded-coverage result can be accepted only with
+  an **explicit coordinator adjudication of the recorded gap**. An opaque-byte scan is not decoded
+  archive inspection. Blockers describe a gap by **kind, layer and count** only — never by an
+  archive-derived extension, reason or byte count.
+  - An unexpandable container is recognised by its **magic at the start of content**, at every
+    depth, not only by its name: a ZIP that is extensionless, renamed, or wrapped in a gzip (whose
+    inflated payload has no name at all) is a recorded `unexpanded-archive-format` gap. The label is
+    `extension` when the NAME was recognised and `format` when the BYTES were, each from a closed
+    vocabulary in reviewed source — neither is derived from the member.
+  - **The archive surface is scanned too** (scan representation **v2**, AIO-1112). Every byte of a
+    decoded layer or gzip-decoded nested tar that is not member content — headers, PAX/GNU metadata,
+    link targets, padding, unsupported-member bodies, end blocks and trailing bytes — is staged as
+    whole ranges under a fixed `archive-metadata` category (never a path) and counted in
+    `coverage.archiveSurfaceBytes`. A range too large for one surface file is an
+    `archive-surface-range-unstageable` gap, never a split. **Non-zero bytes after a layer's or
+    nested tar's end blocks** are staged but are also an `archive-trailer-nonzero` gap: opaque
+    scanning is not decoding, and a gzip stream, ZIP or second tar can sit there. Zero padding is fine.
+    A nested member is treated as a tar when its first block is a header **the reader itself would
+    accept** (ustar or magic-less V7, by the same checksum rule), when it opens with **two zero
+    blocks** (the canonical empty archive), or when its name is `.tar`/`.tgz`/`.tar.gz` — a declared
+    tar that does not parse is a `nested-archive-undecodable` gap (its inflated bytes are not staged,
+    so this blocks rather than being scanned). An ordinary `.gz` still inflates.
+  - **Member names are compared CANONICALLY**, after ustar/PAX/GNU resolution — where only a POSIX
+    ustar header's bytes 345–500 are a name prefix; a GNU, V7 or STAR header carrying anything there
+    refuses the run rather than being named two ways: repeated `/` and `.`
+    segments collapse (`././app/x`, `.//app/x` and `app/./x` are all `app/x`), Unicode and case are
+    kept. The inventory, whiteout merge, build-output categories and public path lookup all use that
+    one form. A name that depends on the host — absolute, drive-letter, traversing, NUL-bearing, empty,
+    or a file/link with a trailing `/` — is an `unsafe-member-path` gap at any depth: its content is
+    scanned, and the record says the inventory could not account for it. **A backslash is refused the
+    same way even though it is a legal Linux filename byte** (e.g. systemd's `\x2d` unit names): a
+    deliberate, conservative limitation — an image containing one records the gap and cannot reach
+    ready without coordinator adjudication.
+  - **Numeric header fields** (checksum, size, mode) trim NUL and space at both ends and must be octal
+    inside; an interior NUL or other byte refuses the run instead of truncating the value.
+  - **Whiteouts are merged per layer before that layer's own entries**: a `.wh.<dir>` removes the
+    directory, its trailing-slash spelling and everything beneath it (never a sibling that merely shares
+    the prefix), and an expected `/app` file under a deleted directory is reported missing. Deleted
+    bytes are still scanned. A **root** opaque marker (`.wh..wh..opq` at the top level) empties every
+    lower entry. An ordinary whiteout that overlaps an entry of **its own layer** — the entry, its
+    directory spelling or a descendant — is a `merged-type-conflict` gap in either tar order: OCI
+    applies whiteouts to lower layers only, containerd removes the entry when the whiteout follows it,
+    and the audit does not pick one (it accounts the whiteout lower-only). An opaque marker beside its
+    own layer's children is supported. A whiteout is recognised by its basename whatever the entry's
+    type (as extractors do), but only an **empty regular file** is a valid marker: any other is applied
+    and recorded as a `malformed-whiteout` gap, and one naming nothing, `.` or `..` (`.wh.`, `.wh..`,
+    `.wh...`) deletes nothing and is recorded the same way.
+  - **Member paths are bounded** at 4,096 UTF-8 bytes and 128 segments — the audit's own supported
+    input, not a claim about any extractor's limit. A longer name refuses the run with
+    `AUDIT_TAR_LIMIT_EXCEEDED` before any path work.
+  - **Two independent authorities bound the path work.** A shared **retained-state budget** charges the
+    logical bytes of everything the run keeps — paths, symlinks, `/app` records, private staged records,
+    limitations, the merged view and its ancestor index — before each insertion, with a 256 MiB ceiling
+    and a secondary 500,000-relation ceiling. It is **monotonic**: deleting, overwriting or finishing a
+    layer never refunds, so churn cannot buy more state. A separate **work budget** counts CPU steps and
+    consults the deadline, including for names with no ancestors. Either one exceeded refuses the run
+    with `AUDIT_TAR_LIMIT_EXCEEDED` and a sanitized record. The 256 MiB figure is a conservative
+    supported-input boundary, **not a measured heap guarantee**: the per-item charges deliberately
+    over-estimate real object sizes.
+  - **An opaque marker's position in its layer matters.** If an ordinary entry written *earlier in the
+    same layer* sits beneath the marker's directory and depends on an intermediate directory that was
+    never declared as its own entry before the marker, the layer records `merged-type-conflict`: the
+    pinned runtime's overlay converter keeps such an entry while its non-overlay converter can remove
+    it, and the audit does not pick one. A marker that comes first, an earlier direct child, a complete
+    intermediate chain declared before the marker, and unrelated or prefix-sharing siblings are all
+    unaffected. This is a conservative accepted-format boundary, not extraction emulation.
+  - **Type changes replace, not merge** (OCI "changeset over existing files"): a file or link replacing a
+    lower directory removes that directory's whole subtree, a directory replacing a lower file removes
+    the file, and directories merge. A directory's identity is its type, so `app` and `app/` written as
+    directories are one entry. A layer the extractors would not agree on — a file and a directory of one
+    name, a non-directory with entries beneath it, or entries beneath a lower non-directory — is a
+    `merged-type-conflict` gap, and a file or link named exactly `app` is an
+    `inventory-root-not-directory` gap; either way the affected `/app` files are reported missing.
+  - **A member beneath a symlink is a gap.** An extractor follows a parent symlink inside the rootfs,
+    so `side -> app` then `side/planted.js` writes `/app/planted.js` — outside the `/app` names the
+    inventory compares. The audit never follows a link; it records any member whose parent path is, or
+    was in that layer or a lower one, a symlink anywhere in the image as `member-through-symlink`. This
+    is conservative: a link that was later replaced still counts. The bytes are still scanned.
+  - These gap kinds carry only the layer index, never a path or link target, and each blocks readiness
+    until a coordinator adjudicates it.
+  - **Ambiguous extended metadata refuses the run**: a repeated local PAX header, a global PAX header
+    while member metadata is pending, a GNU long name together with a PAX `path` (or long link with
+    `linkpath`) in either order, a repeated GNU long name/link, and any `GNU.sparse.*` key. The claim is about the **decoded tar
+    bytes**: original registry-layer gzip framing (`FNAME`/`FCOMMENT`/`FEXTRA`, bytes after the
+    stream), which a `docker save` export may not contain, is outside it.
+  - **Malformed archives refuse the run** with a fixed code: `AUDIT_TAR_STRUCTURE_INVALID` (short,
+    truncated or unterminated input, a header-only member declaring a body, a global PAX
+    path/linkpath/size override, an empty or NUL-bearing PAX `path`/`linkpath`, an empty GNU long
+    name/link, a non-zero
+    trailer on the outer export) or `AUDIT_TAR_LIMIT_EXCEEDED`
+    (a metadata body, accumulated metadata or physical-header count past its reviewed bound). A broken
+    *nested* tar is a `nested-archive-undecodable` gap instead.
+- **`provenance.recipe`** is measured *and* gates the verdict: a `violated` or `unverified` assertion
+  blocks `transitionReady` and lands the verdict on **`unresolved`** — a question for coordinator
+  adjudication, deliberately *not* re-labelled as secret presence. A missing recipe blocks too, so a
+  wiring slip can only ever cost a false block. The lockfile rows measure the **npm registry origin**,
+  **absent embedded credentials** and **integrity presence** separately, as counts against the named
+  expected origin; a foreign host, a package path or a URL is never emitted.
+- **`scanner.settings`** records the coverage-relevant flags read back from the invocation that ran:
+  no file-size cap (`--max-target-megabytes 0`), and the scanner's own archive traversal left at the
+  8.28.0 default of disabled — the audit expands one nested level itself and records every format it
+  could not expand. These must **equal the reviewed policy** (`SCANNER_SETTINGS_POLICY`): the run
+  refuses with `AUDIT_SCANNER_SETTINGS_UNSUPPORTED` otherwise, and reconciliation refuses a record
+  that reports anything else.
+- **`scanner.capabilityCanary`** is measured on three private synthetic fixtures before the real scan,
+  with the same binary, config and isolation: the wrapped ELF case, its unwrapped negative control,
+  and a wrapped NUL-padded 512-byte **archive-metadata** block whose value is NUL-terminated, as a
+  real header field is. Verified means both wrapped fixtures were detected
+  (`archiveSurfaceDetected: true`); a miss of either — or no canary at all — is `unverified`, a
+  coverage gap that blocks. Its `reason`/`note` are fixed strings, and reconciliation refuses any other. The archive-metadata case has **not yet been measured on the live 8.28.0 binary** — the
+  first real run establishes it, and a miss blocks rather than passes.
+- **`failure`** appears only on a refused run, and carries a fixed `stage` from a closed vocabulary
+  plus an error **code**, never a message. `AUDIT_SUBPROCESS_TIMEOUT`, `AUDIT_SUBPROCESS_LOG_OVERFLOW`
+  and `AUDIT_SUBPROCESS_START` are distinct because the remedies are. A prerequisite refusal
+  (`stage: "prerequisites"`) writes this record even though scratch never existed — an absent
+  artifact would be indistinguishable from a runner that died.
+- **`findings`** is grouped by rule, with a random **per-run `occurrenceId`** per occurrence. A clear
+  `path` appears only where the location was independently established as public source/dependency
+  content that is not itself sensitive. Unsalted hashes of sensitive paths are *not* redaction and
+  are never emitted. To resolve an occurrence id, arrange a **bounded rerun / private read-only
+  inspection** through an approved channel — that is a concrete access limitation to report, never a
+  reason to clear the finding. **Public origin never clears a real credential.**
+- **`packageInventory.status`** must be `verified`. A `403`, a `404`, incomplete pagination or a
+  missing linkage is **`unverified`** — *not* an empty package. If the Actions token cannot
+  enumerate, a signed-in package administrator may supply a timestamped, complete read-only UI
+  inventory covering **all pages, tagged AND untagged version ids, and full immutable digests**; a
+  count, a screenshot of only the tagged tab, or a truncated digest is insufficient. That evidence can
+  satisfy the gate, and `apiStatus` still records that the workflow's own read failed.
+  - That route is the `reconcile` command (`node scripts/staging-ops/image-audit.mjs reconcile
+    --evidence <audit.json> --operator <inventory.json>`), and it **validates the audit record
+    first**: schema, exact subject binding, every required measurement (including the persisted
+    `provenance.identityVerified`, the pinned `scanner.configSha256`, the reviewed
+    `scanner.settings`, the v2 `scanner.representation`, the `capabilityCanary` and
+    `coverage.representation`), and internal consistency. A **v1 original** (captured before the
+    archive surface was scanned) is refused as `original-scan-representation-unsupported` and needs a
+    fresh audit — no operator inventory can grandfather it. An absent, foreign, incomplete,
+    self-contradictory or itself-`refused` record is **refused** — verdict `refused`,
+    `transitionReady: false`, fixed codes in `provenance.refusal.codes`, and no reconciled
+    measurements at all. Readiness is then RECOMPUTED from the validated measurements by the same
+    function the audit used, with only the package-inventory dimension substituted: an operator
+    inventory can never clear a coverage, identity, recipe or scanner blocker, and a missing blocker
+    list is not an absent blocker. It is a local evidence helper — it verifies no signature, so the
+    coordinator still confirms the original run and artifact independently.
+- **Any additional version stops the transition.** A clean audit of one digest does not authorize
+  exposing unaudited digests in the same package; `additionalSubjects` lists them for a bounded audit.
+  Nothing is deleted, and no alternate public package or public-push workaround is implied.
+
+If actual private content is found: **keep the package private** and take a bounded remediation
+proposal to the coordinator. Do not delete package versions or rotate credentials from this stage.
+
+### The transition, and why the publisher then refuses
+
+Order, and none of it is optional:
+
+1. Review and merge the audit-only code; run the audit on the pinned digest.
+2. Complete the package inventory and the coordinator's content adjudication.
+3. **Re-check the inventory** immediately before the operator action — a changed digest set requires
+   renewed coverage.
+4. The signed-in user with package-admin rights changes **this one package** to public in GitHub's
+   package settings, having seen the irreversibility notice. **The workflow never changes
+   visibility**; it holds `packages: read`.
+5. Record measured public visibility and linkage, plus a fresh **unauthenticated** exact-digest
+   pull/manifest readback.
+
+**The existing publisher then refuses to publish again, deliberately.** Its OP-06 precheck requires
+the package to be **private** before and after a push, and that check is unchanged by this work — so
+after the transition it fails before login/build/push. Pulling the audited public digest still works.
+Restoring publication needs a *separately specified and reviewed* build-once, inspect-before-push
+continuation; it must never push public content and audit afterwards. That PR is not a prerequisite
+for auditing or exposing the currently covered package.
+
+### Unmeasured prerequisites — the workflow refuses until these are recorded
+
+- **The scanner's download checksum — RECORDED.** `scripts/staging-ops/image-audit/scanner.mjs` pins
+  gitleaks **8.28.0** and the sha256 of `gitleaks_8.28.0_linux_x64.tar.gz`
+  (`a65b5253…6a840eb`), taken from the release's official checksums file with the downloaded asset
+  agreeing. The fail-closed sentinel is **retained** — an unrecorded or malformed pin still refuses,
+  with code `AUDIT_SCANNER_UNPINNED`, before any pull or export — and the negative cases are injected
+  in tests rather than shipped. The runner **re-verifies** the checksum and measures the binary's own
+  `version` and `detect --help` before scanning, because the flags were probed on the darwin asset of
+  the same version and executing this exact linux_x64 binary is a separate measurement. The repo's
+  `ci.yml` gitleaks download is unpinned by checksum and on an older version — it is **not** evidence
+  for this one.
+- **The scanner CONFIG digest — PINNED.** `SCANNER.configSha256` holds the sha256 of
+  `config/staging-ops/image-audit-gitleaks.toml` (`1bd01cf2…d73ec`). `test/guards/image-audit-config-digest.test.ts`
+  fails the build if the tracked file drifts from it, the run refuses with
+  `AUDIT_SCANNER_CONFIG_MISMATCH` before any scan if the bytes it would use differ, and reconciliation
+  refuses any other reported digest. Editing the config means re-pinning the constant in the same
+  reviewed change.
+- **The `docker save` export form.** How a layer is decoded is decided by its **declared media type**,
+  never by which digest the export happens to contain: for an uncompressed `…layer.v1.tar` layer the
+  descriptor digest *is* the `diff_id`, so "the export has a member hashing to the descriptor" is true
+  of a plain tar and cannot mean "this is compressed". The inspector accepts exactly the two forms
+  whose layer identity it can *prove* by hash — the compressed registry blob (verified against its
+  descriptor, then gunzipped to its `diff_id`) and the uncompressed diff (copied raw, then re-hashed
+  to its `diff_id`). Anything else fails as `unsupported-export-form`, and an uncompressed layer whose
+  descriptor digest is not its `diff_id` fails as an inconsistent manifest/config pair.
+- **Package-metadata access.** The job token must be able to pull this linked private package and
+  enumerate its versions. A failure is an explicit permission prerequisite. **Do not create a PAT,
+  broaden scopes, or make the package public to get past it.**
+
+---
+
+## 14. Release-policy commissioning runbook — `release-policy-commissioning.yml` (AIO-1124)
+
+The harness, what it cannot do, and the phase sequence are in `docs/RELEASING.md` §5. This section is
+the operational half: what must exist before a run, what each of the three roles holds, and the two
+places where an honest result is `unverified` rather than a pass.
+
+**⚠️ Commissioning is not activation.** Nothing here promotes `main`, changes `main`/`staging`
+protection, cuts a tag, deploys, restarts a service or accepts a release — and no job in it holds a
+credential that could. The output is one sanitized evidence packet.
+
+**One local file in that packet is PRIVATE and must stay local.**
+`commissioning-<run>-<attempt>-production-inputs.json` is written mode-0600 by `setup` and holds the
+exact twelve-context producer map plus the raw `buildMainRulesets` subject it generates. It exists so
+`check-evidence` can **regenerate** the production subject and its hash instead of comparing the
+packet's own copies of a digest with each other, and its digest is anchored in the resource journal so
+a swapped file refuses on resume. It is not in any upload path, dispatch envelope, published manifest
+or log, and the published intent continues to expose only the producer-map **digest**. Do not attach
+it to a ticket; attach the sanitized packet.
+
+### Prerequisites — all of them, or the run measures nothing
+
+| Prerequisite | Why a run without it is not evidence |
+|---|---|
+| Distinct normal + emergency GitHub Apps, installed on **this repository only** | The runner refuses identical App IDs, and each protected job MEASURES its own App with the App JWT before exercising anything: `GET /app` for the App's declared permissions, `GET /app/installations/<id>` for that installation's granted permissions, `repository_selection` and `suspended_at`. An org-wide, suspended or wrongly-owned installation refuses there. |
+| The exact grants: **normal** = `contents: write`, `checks: write`, `metadata: read`; **emergency** = `contents: write`, `metadata: read` | `ROLE_APP_PERMISSIONS` in the runner is closed BOTH ways — an extra grant, a missing one, and a grant at the wrong level are each a refusal, and all three happen **before the first write**. An over-granted release identity would make an acceptance in the matrix a statement about the grant rather than about the policy. The emergency App must not hold `checks: write`: the identity that can mint a required check must not also be the one whose bypass makes that check irrelevant. |
+| Their keys in `staging-release` / `staging-emergency`, **each in its own environment** | The protected jobs assert they cannot see the counterpart key. Both in one environment is one identity, not two. |
+| John as required reviewer, `prevent_self_review = true`, staging-only branch policy, administrators cannot bypass | These are the PC-06 controls. Read them back in the UI where the API omits the field. |
+| A **distinct dispatcher identity** (the dispatch-only App) | `GITHUB_ACTOR` is the dispatcher and may be a bot. If the dispatcher is also the approver, `check-evidence` reports a **self-review failure** — the run happened, but it is not two-identity evidence. |
+| Repository variables `COMMISSIONING_REPOSITORY_ID`, `COMMISSIONING_NORMAL_APP_ID`, `COMMISSIONING_EMERGENCY_APP_ID`, `COMMISSIONING_PRODUCER_IDS_JSON` | Nonsecret numeric identities. The producer map must be **complete** — all twelve real contexts. A partial map is exit 3; the runner refuses to invent a producer ID. |
+| Repository variables `COMMISSIONING_NORMAL_INSTALLATION_ID`, `COMMISSIONING_EMERGENCY_INSTALLATION_ID` | The **planned** installation identities, and they must be positive and **distinct**. They are nonsecret numeric identifiers, not keys, and they go in the credential-free intent deliberately: without a plan the only available "expectation" was the value the protected job was configured with, and `measureAppGrants` recorded that requested value back as though it had been measured. With the plan, the runner compares the job's configuration to it **before** the credential exchange and the provider's **returned** `installation.id` to it after. Absent values refuse at run time rather than defaulting — provisioning them is an owner prerequisite. |
+| Local `gh` admin identity — **exactly `johnellison`, numeric ID `5806135`, type `User`** | Administers the disposable resources, runs the human/admin cases, and is the **complete-policy measurement authority** for the witness protocol. All three of the ID, the login and the account type are required: a second administrator, or a machine account holding admin, would satisfy an any-admin check while producing evidence about a different identity. It is never uploaded into Actions, and no new long-lived admin token is created. |
+| That same local identity can **dispatch this workflow** | The witness protocol needs it to dispatch `policy-witness` mode. Measure that prerequisite with the separately approved, non-privileged **transport rehearsal** (mode `transport-rehearsal`) — absence is `incomplete`, never grounds for a new grant. |
+| A **quiet commissioning window**: no concurrent policy writer | The pre/post witness pair is a bounded contemporaneous measurement under administrative quiescence, **not** an atomic policy-at-mutation proof. A known concurrent policy writer interrupts the run. |
+| `staging` is the repository's default branch, and the reviewed workflow is merged to it | Dispatch uses the fixed workflow path at ref `staging`. Original dispatch, witness dispatch, publisher execution and response consumption all resolve `staging` and require the **original** trusted workflow SHA; movement interrupts the attempt with cleanup and root reconciliation, rather than continuing against a tree nobody reviewed. |
+| No release in progress | Cleanup asserts the SHAs, classic protections and resolved applicable-ruleset definitions of **both `main` and `staging`**, plus every `v*` tag ruleset, are unchanged. Every list is read to complete pagination and refuses a full final page rather than assuming it was the last. Concurrent legitimate movement is an **interrupted** result needing reconciliation, never an automatic rollback of somebody else's change. |
+
+### The three modes, the three roles, and the three jobs that are not actors
+
+`mode` is a closed dispatch input, and each job is admitted in **exactly one** of its three values by
+an equality condition — so an unknown or empty mode is admitted by no job at all. There is
+deliberately no `!= 'policy-witness'` anywhere: a negative condition is how an unrecognised mode would
+fall through into commissioning.
+
+| Mode | What may run |
+|---|---|
+| `commission` (default) | `intent`, `fixture`, and the two protected actor jobs. |
+| `policy-witness` | The one non-protected `policy-witness` publisher job, alone. |
+| `transport-rehearsal` | The one non-protected, no-secrets `transport-rehearsal` job, alone. |
+
+- **local** — the operator's existing `gh` identity. Creates and removes the disposable graph, refs,
+  rulesets and its one synthetic PR; runs the human/admin cases; owns cleanup and the resource journal;
+  and runs the **witness** process that measures the complete policy for the cloud cases.
+- **normal** — the `staging-release` job. Holds only the three normal-App secrets. Its
+  **installation-level positive control** is its TEST-ONLY check publication, once, before its first
+  case; it is the actor for the missing / red / wrong-producer / all-green cases.
+- **emergency** — the `staging-emergency` job. Holds only its own three secrets. Its acceptance with
+  checks absent is both a case and the installation-level liveness proof for that identity.
+- **fixture** — `checks: write` and **no App secret**. It is the second, independently measured
+  producer (the GitHub Actions app) that makes a wrong-producer control case possible at all. It waits
+  a bounded time for local setup to publish the manifest, then refuses rather than hanging, so its
+  `always()` artifact upload still runs.
+- **policy-witness** — no App secret, no protected environment, no write scope, and no `npm ci`. It
+  republishes the exact bytes of a witness envelope as a single-entry artifact named from a step output
+  that reviewed code derived. It is the only job admitted in its mode, and a re-run of it is refused —
+  a publisher re-run would republish a nonce that is consumed once.
+- **transport-rehearsal** — no App secret, no ref, no synthetic graph, no resource journal and no
+  policy. Its target is the literal `rehearsal` and its domain is `rehearsal`; every actor consumer
+  rejects that source mode, domain, case and target before credentials. It exists to measure the
+  transport's queue, clock and serialization viability **before** any protected approval exists.
+
+> ⚠️ **Installation-level, not per-token.** Positive-write liveness is established once per attempt at
+> the installation level. It is **not** a claim that every later token performed a successful write:
+> each freshly minted token proves its exact intended App, installation, repository, grant set and one
+> successful scoped READ, and every denied case still requires its own policy-enforcement diagnostics
+> and an unchanged ref.
+
+### The witness protocol, and its bounds
+
+Per cloud case, five FIXED workflow steps — the runner owns three, and two are official upload steps
+because only an Actions step can publish an artifact:
+
+1. `prepare` — verify the prior case finalized, the journaled graph/ref/check preconditions and this
+   job's own role/mode/job binding; persist bounded private state; create a 256-bit **pre**-nonce.
+2. upload the pre challenge.
+3. `await-and-execute` — consume exactly one fresh pre-witness, run the production verifier on its
+   complete governed policy, re-check ref/check state, mint the actor token **just in time**, fsync a
+   mutation-used marker, issue **exactly one** mutation, read back independently, create the post-nonce.
+4. upload the post challenge.
+5. `await-and-finalize` — consume the post-witness, require the complete governed policy and the
+   classic representation to be **equal** across the window, and record the case result.
+
+There are exactly **seven normal and four emergency** cloud cases, so a complete attempt requires
+exactly **22** distinct successful witness publications — one pre and one post per case. Missing,
+extra or duplicate responses refuse; `64` is a bounded *discovery* ceiling, not permission to publish
+that many. The separate rehearsal source run requires exactly one response and **cannot** contribute
+to the 22.
+
+Every bound fails closed and none of them promises hosted-runner capacity: a 180-second challenge
+lifetime inclusive of queue and upload latency (never extended, never restamped); a 15-second ceiling
+on the complete local policy read; 90 seconds from the pre-observation to the mutation and from the
+readback to the post-observation; five-second polling with a finite deadline; a 60,000-byte cap on the
+whole serialized dispatch envelope including JSON overhead; one artifact, one ZIP entry, 60,000
+uncompressed bytes, a 128 KiB archive; 10 pages of 100 objects per endpoint with a terminal page
+required; and a 30-minute ceiling on both the witness process and each job. Queue latency can make a
+legitimate run **incomplete** — and that is the reported result, never one concealed by extending a
+window or retrying a case.
+
+**An ambiguous mutation is never retried.** A crash after the fsynced marker, a missing or changed
+post-witness, or an unexpected force/delete success stops further actor mutations in that attempt; the
+state machine refuses a second mutation for a case, and a halt is terminal for the whole role. A case
+may also only begin after its predecessor recorded its EXPECTED OUTCOME — `finalized` is not enough,
+because finalization writes that state and then throws for an inconclusive verdict, which would leave
+the next case measuring against a ref state nobody established.
+
+A request whose response never arrived (status 0) is **inconclusive and halts, whatever the readback
+shows**. A readback at the requested commit is kept as reconciliation evidence, but it proves where the
+ref is, not that this request put it there — so it is never recorded as an acceptance, at runtime or
+by `check-evidence`, and no later actor case starts.
+
+The same holds for a response that arrived but did **not complete**. Both transports (`gh` and the
+App token) hold every JSON answer to one bounded completed-response contract: a finished status line
+and head, the whole body collected under the 1 MiB bound (collection stops at the bound), a body read
+or `gh` exit that finished, strict UTF-8, a JSON body — or an *empty* 204 — and the endpoint's
+documented success shape. A body read that failed, malformed or oversize JSON, a `gh` exit that does
+not match its status, or a refusal whose text was cut off is recorded as status 0 with the reason
+(`response_incomplete`) and the status line it did see (`measured_status`), and it is never read as a
+policy denial. Every journal, case-state, post-challenge and evidence record carries
+`response_complete` beside the status; a record without it is ambiguous, not a status to trust.
+
+The halt and the exit code are separate facts. A halted matrix whose failing cases are all
+inconclusive or not-run exits **3** (`incomplete`); a matrix with any measured failure — an
+unexpected success, denial or mutation, including a must-deny ref that moved while its response was
+cut off — exits **1** (`failed`), whatever inconclusive cases sit beside it.
+
+The local **human** cases obey the same rule through the verified resource journal rather than a
+per-job state file. Each case is admitted from its journaled intent → result → readback → outcome
+history before any request: a case with any history is never issued again. Re-running `human-tests`
+takes a settled case's outcome from that history, and an unresolved one (a crash after the intent, a
+readback that failed after the request) or a halting one stops every later human case. `check-evidence`
+joins every human case record to its one journaled history, so a duplicate, unresolved, hidden or
+rewritten attempt refuses even when the derived `human` evidence file shows a single clean record.
+
+**Witness timing has no tolerance.** A response is accepted only when challenge creation ≤ observation
+start ≤ observation completion ≤ response creation ≤ actual receipt ≤ challenge expiry, with the
+response echoing the challenge's exact expiry. The receipt instant is read after the response artifact
+has been completely acquired — so time spent on the lookup and download counts against the lifetime —
+and `check-evidence` re-applies the same order to the retained timestamps.
+
+**The witness serves READY WORK ACROSS ROLES, in each role's own order.** The two protected jobs are
+independent — `emergency` needs only `intent` — so whichever human approves first is the role whose
+challenge appears first, and that is a supported ordering rather than a misuse. A role whose next
+item has no challenge published yet is SKIPPED for this pass, never waited on, so an independently
+approved emergency job cannot starve behind normal's fourteen responses and expire unserved. Per-role
+sequence, once-only nonce consumption, the 180-second lifetime and the approval requirement are
+unchanged; nothing is served out of its own role's order.
+
+**A restart never re-dispatches a nonce.** Before any new measurement or POST, the witness reads its
+own journal for a `dispatch-intent` with no reconciled publication. A dispatch already in flight is
+reconciled against the exact expected artifact through the SAME provenance, byte and binding rules a
+consumer applies — never from a listing row under a matching name — and if the artifact has not
+landed yet the item stays PENDING within its ORIGINAL expiry. Known-pending, measured-absent, refused
+and ambiguous stay four different states; none of them is resolved by dispatching again.
+
+### Reading the packet
+
+Ten files feed the assessment — `commissioning-<runId>-<attempt>-<slug>.json`, mode 0600, one per
+phase plus the local witness process's own summary and the operator-supplied environment controls;
+`collect` and `check-evidence` write their own summaries alongside. The publisher and the rehearsal
+write their own records too, and neither feeds a commissioning gate: a rehearsal response can satisfy
+no actor case.
+
+**Nothing in a file is trusted because of its filename.** Each of the nine is checked for its schema
+version, run, attempt, phase, a CLOSED list of required fields, and agreement with the run's immutable
+workflow SHA — before any gate reads a field out of it. A file that fails is discarded and reported
+`invalid`, and the coverage it was carrying is reported LOST rather than quietly assessed as fewer
+cases than the matrix has. Beyond that:
+
+- **Case outcomes are DERIVED from the run's FROZEN GRAPH, not read.** `passed: true` is a claim a file
+  makes about itself, and so is every SHA in it. Each case's before/requested identities must be the
+  journaled synthetic nodes its own case declares, and the RELATION between them must be the one the
+  operation needs: an `update` to a strict descendant, a `force` to a real ancestor or a divergent
+  commit, never a target the ref is already at. A no-op recorded as a permitted write, and a force flag
+  on a ref that never moved recorded as a denied non-fast-forward, are both blockers.
+- **The diagnostic is RE-CLASSIFIED, not believed.** `policyDenial` in a file is a caller-supplied
+  boolean, so the recorded diagnostic CATEGORY is looked up in this build's closed table instead. An
+  invented category, or a `credential-failure` dressed as a policy denial, is a blocker.
+- **The declared check state is RECOMPUTED** from its own per-context measurement. `measured: true`
+  beside a measurement that contradicts the expectation next to it is not sufficient for anything.
+- **A case is only counted from its own actor's file.** A `passed: true` for a normal-App case sitting
+  in the human evidence is not that case's outcome.
+- **The witness transport is JOINED across four sources, not counted.** Both hash-chained journals
+  are verified — the resource journal AND the separate witness journal — and the exact eleven cloud
+  cases × two directions are then joined across the immutable intent's derived plan, each actor
+  job's own consumed evidence, the resource journal's synthetic graph and the witness journal's
+  observed challenges and reconciled publications. A publication whose case/direction pair is not
+  one of the closed 22 is an invented case; one whose artifact the witness journal does not record
+  reconciling is a claim with no counterparty; one naming no publisher run has no provenance to
+  re-derive. Counting distinct IDs and checking digest SYNTAX is not this, and was what let a
+  packet with invented case names, absent publisher runs and no witness journal at all pass.
+- **Each case's own proof is re-derived, not the first case's.** Per case and per direction the
+  assessment re-runs the same governed projection validator and compares the retained bounded
+  projection against the disposable policy it derives for itself; it re-checks that case's OWN
+  token/installation proof (repository by NUMERIC ID, exactly one reachable repository), that
+  case's OWN measured grants, its manifest and graph bindings, and its pre==post governed digest.
+  A measured interval must be an actual finite number: an absent timing is not a zero one.
+  Every policy record must carry the bounded pre/post guarantee verbatim; a packet that drops it or
+  restates it as an atomicity claim is `invalid`.
+- **Cleanup drift is RECOMPUTED from the two baselines the file carries**, not read from its
+  `production_drift`. Different before/after SHAs beside an empty drift list is a measured failure, and
+  the "before" baseline must be the one the verified journal recorded at the start of the run.
+- **Cleanup coverage comes from the verified journal**, not from the cleanup file's own list. An
+  `outcomes: []` satisfies nothing; each journaled ref, ruleset and pull request must have an outcome,
+  and an outcome for a resource the journal does not record this run creating is `invalid`. Every
+  journaled ruleset must also have a measured provider-shape fingerprint, and any create intent whose
+  outcome the journal cannot account for blocks.
+- **The App grants must be the measured object**, matching `ROLE_APP_PERMISSIONS` — *and* the two App
+  identities must be **distinct** and be the ones the immutable intent configured. A packet naming the
+  same unrelated App for both actors agrees with itself perfectly, which is why self-agreement is not
+  the check.
+- **The approval must be the configured HUMAN reviewer, by numeric identity**, distinct from the
+  dispatcher measured from the provider's own run metadata, with the protected job concluding
+  **success in this exact attempt**. A bot login, a `completed` job that failed, or a success borrowed
+  from another attempt is a blocker.
+
+Three blocker kinds, and they mean different things. **`failed`** is a measured statement about the
+subject. **`unverified`** is "we could not look, or nobody has looked yet". **`invalid`** is "a file
+claiming to be this evidence is not this evidence". Only an empty blocker list is a pass.
+
+### The one thing that is honestly unverified
+
+**The protected-environment negative controls.** This harness cannot impersonate a second reviewer,
+cannot read `prevent_self_review` back from the environments API, and a skipped off-branch job proves
+workflow *admission* rather than environment branch policy — PC-06's own instruction for that last
+case is to report it unverified rather than widen admission to arbitrary refs. So each control is
+operator-supplied evidence in `commissioning-<runId>-<attempt>-environment-controls.json`.
+
+Because it is operator-supplied, the SHAPE of it is checked hard — and **a digest alone is not
+evidence**. It proves which bytes were retained; it says nothing about whether the control passed,
+which control it was, or when. So every verified record must carry, against its OWN closed schema
+(`ENVIRONMENT_CONTROL_SCHEMAS`):
+
+- the control's `expected` outcome, **equal** to this build's declared one — a record cannot bring its
+  own weaker expectation;
+- a `measured` value that **equals** that expectation, so a measurement showing the control OFF is a
+  blocker rather than an accepted observation;
+- the exact `environment_name` **and** numeric `environment_id` it was measured on;
+- a `measured_at` inside this run's window — a historical capture is not this run's evidence, however
+  correctly it is hashed;
+- `run_id`/`attempt` for the three run-bound negative controls, because an attempt outcome belongs to
+  an attempt;
+- a retained artifact inside the evidence directory whose SHA-256 `check-evidence` recomputes from
+  disk **and** whose parsed content names the same control, the same environment and the same measured
+  value — which is what makes reusing one file across controls a refusal rather than a pass;
+- **its own provenance inside that artifact.** The retained observation is a closed object carrying
+  `control`, `environment`, `environment_id`, `source`, `measured_at`, `measured` and, for a run-bound
+  control, `run_id`/`attempt` — nothing else. Every one is required in the bytes, and the outer record
+  may only repeat it exactly. A stale observation from another run, attempt, environment or year inside
+  a freshly stamped record is refused however honestly its digest matches: the digest proves which
+  stale bytes were kept, and a wrapper cannot supply provenance its observation lacks or contradicts.
+  All accepted observations of one environment must agree on its numeric ID.
+
+`administrators_cannot_bypass` is deliberately **UI-only**: the environments API does not return that
+field, so a `provider-api` claim about it would be a claim about something nobody read.
+
+Coverage is the **cross product** of the seven controls and the two protected environments — fourteen
+records. The environments are configured separately; one of them being right says nothing whatever
+about the other, and a single record covering "the environments" would hide exactly that.
+
+```json
+{
+  "schema_version": 1, "phase": "environment-controls", "run_id": "…", "attempt": "…",
+  "controls": {
+    "prevent_self_review_enabled": {
+      "staging-release": {
+        "status": "verified",
+        "source": "provider-ui",
+        "environment_name": "staging-release",
+        "environment_id": 4401,
+        "expected": { "prevent_self_review": true },
+        "measured": { "prevent_self_review": true },
+        "measured_at": "2026-09-10T09:00:00.000Z",
+        "artifact": "env-prevent-self-review-staging-release.json",
+        "artifact_sha256": "<64 hex, recomputed from that file>"
+      },
+      "staging-emergency": { "…": "…" }
+    },
+    "self_review_refused": {
+      "staging-release": {
+        "status": "verified", "source": "provider-ui",
+        "environment_name": "staging-release", "environment_id": 4401,
+        "expected": { "attempt_outcome": "refused" }, "measured": { "attempt_outcome": "refused" },
+        "measured_at": "2026-09-10T09:05:00.000Z",
+        "run_id": "…", "attempt": "…",
+        "artifact": "env-self-review-refused-staging-release.json",
+        "artifact_sha256": "<64 hex>"
+      },
+      "staging-emergency": { "…": "…" }
+    },
+    "unauthorized_reviewer_refused": {
+      "staging-release":   { "status": "unverified", "note": "no second reviewer identity is available" },
+      "staging-emergency": { "status": "unverified", "note": "no second reviewer identity is available" }
+    }
+  }
+}
+```
+
+Each named artifact is a small closed JSON observation, written when the control is measured, so its
+content and provenance can be bound rather than merely hashed: `{"control":
+"prevent_self_review_enabled", "environment": "staging-release", "environment_id": 4401, "source":
+"provider-ui", "measured_at": "2026-09-10T09:00:00.000Z", "measured": {"prevent_self_review":
+true}}` (plus `"run_id"`/`"attempt"` for a run-bound control), alongside whatever screenshot or export
+the operator retains next to it. The record above repeats those values; it never supplies them.
+
+If the second identity does not exist, leave that control `unverified` — it blocks full activation,
+which is the correct outcome, and per-control granularity is the whole reason it does not drag the
+other six down with a single flag.
+
+### The staged off-branch probe — `release-environment-negative-probe.yml` (PC-06)
+
+`off_branch_environment_reference_refused` is the one control that can be measured honestly without
+widening the commissioning workflow's admission: a SEPARATE inert workflow, dispatched once from one
+fixed disposable ref, whose two jobs target `staging-release` and `staging-emergency`. Both
+environments admit only the branch `staging`, so the expected result is a provider refusal before any
+runner exists. It is API-only: UI denial evidence has no reviewed closed schema and stays unverified.
+
+**Prerequisite, before the commissioning attempt is dispatched.** The workflow must already be merged
+to the default branch (`staging`) through a normal reviewed PR, because `workflow_dispatch` needs the
+file on the default branch. The probe's source is the ORIGINAL attempt's trusted workflow SHA, so the
+commit that commissioning dispatches from must carry the reviewed probe bytes (`PROBE_WORKFLOW_SHA256`).
+`stage` refuses a registration newer than the original attempt's journal window.
+
+**Sequence** — all while the original attempt is active and its protected jobs are UNAPPROVED, after
+`setup` recorded the baseline, and before approving anything:
+
+```bash
+P=scripts/staging-ops/offbranch-probe-operator.mjs
+A="--run-id <original run> --attempt <its attempt> --evidence-dir <the same private dir>"
+node $P stage    $A   # registration + reviewed bytes, no induced automation, ref ABSENT, baseline policies,
+                      # create-once intent, linked into the ORIGINAL journal, probe journal opened
+node $P dispatch $A   # create the ref once, before-probe policies, dispatch once (10-minute deadline)
+node $P collect  $A   # one eligible run; terminal or cancel at the deadline; raw captures; observations
+node $P cleanup  $A   # exact-SHA lease deletion via local git; verified absence; journal closed
+node $P cancel   $A   # operator abort: cancels ONLY the identified probe run, confirms terminal
+```
+
+Each phase validates the original intent, its prior resource-journal link and the complete probe
+history. Before launch, the provider's full original run/attempt/repository identity must agree with
+that intent. The original declared dispatcher login is checked against a separately retained provider
+actor tuple; the triggering actor has its own tuple and need not be the dispatcher. Neither is
+required to be the probe operator. Later original identity contradictions remain disqualifying.
+
+Qualification and recovery have separate admission rules. An unavailable original/source read,
+completed original run or expired capture window cannot authorize another launch or positive
+measurement. Authenticated retained original identity plus fresh exact owned-run/ref evidence can
+still authorize cancellation and cleanup, without renewing either deadline. Each unavailable or invalid
+qualification read during recovery is recorded as a typed `qualification-incomplete` event before
+cleanup continues. Both environment validators reject that history even if a later read succeeds;
+unavailable source evidence is never described as measured source movement.
+
+Every phase writer completes missing reconciliation from the original authenticated durable effect:
+a complete fixed-ref absence, an exactly bound unique run selection, or a retained terminal run
+observation. A process cut between those facts and their bookkeeping does not require another
+mutation. Result-row presence alone does not resolve an unknown effect. Existing ownership
+contradictions remain binding, and recovery never extends the original selection/cancellation bound.
+
+If terminal collection stops during diagnostics, retained run/jobs/pages remain in the journal.
+Identity-bound execution evidence records a failed control before optional diagnostic reads. Invoke
+`cancel` to explicitly end incomplete terminal qualification, then `cleanup`: terminal abort sends no
+provider cancellation and returns `terminal-aborted`, with failed admission taking precedence over
+inconclusive evidence. Cleanup does not silently choose this abort. A fully completed paired
+collection followed by `cancel` returns `already-terminal` and preserves its original observations.
+
+A closed probe never reopens. Stage, dispatch and collect refuse it; cancel and cleanup report
+`already-closed` without appending or taking a writer lock. A leftover lock after a durable close is
+left intact; explicit lock recovery remains restricted to open probes. A create intent whose result
+was lost is reconciled through retained fixed-ref reads: absence can close inconclusive, while any
+observed presence leaves ownership uncertain and never permits adoption or deletion.
+
+Exit codes follow the commissioning CLI: 1 = a measured failure (an admitted job or a changed ref),
+3 = incomplete (lost answers, a non-204 dispatch response, no eligible run, cancellation, policy
+drift), 2 = usage. No command takes a ref, workflow, URL or environment; there is nothing to point elsewhere.
+
+**What never happens.** No approval, rejection or bypass of a deployment review; no environment,
+policy, reviewer, App or protection change; no run records deleted. A lost create, dispatch or
+deletion answer is reconciled by readback and never retried or adopted: a probe ref of uncertain
+ownership is neither dispatched nor deleted (root reconciles it), a second eligible run is refused
+rather than selected, and a changed ref is left untouched because the deletion carries an
+expected-old-SHA lease (`git push --force-with-lease=<ref>:<sha> … :<ref>`), not a GET followed by a
+DELETE. A run still nonterminal two minutes after cancellation blocks cleanup and claims nothing.
+
+**What the journal permits is DERIVED from all of it, not from its newest row.** Both the operator
+and the offline assessment read the probe journal through one shared derivation
+(`assessProbePhaseState` / `assessRefOwnership` / `assessRunContinuity` / `assessSourceContinuity`), so a refusal cannot be walked back by appending
+something later:
+
+- **A deletion this probe recorded as SUCCESSFUL ends that creation's ownership for good.** If the
+  ref is PRESENT afterwards, that is a contradiction and never continuity — an equal SHA is equal
+  bytes, and a same-SHA recreation belongs to whoever made it. `cleanup` refuses from then on, in
+  this process and every later one, and `check-evidence` refuses the observations too. The
+  reconciliation row that refusal writes is a fact about the ref, not a permission to try again.
+- **A ref measured at another SHA is not revived by being put back** at the reviewed SHA.
+- **Exact absence can reconcile a lost deletion answer**, with no second deletion. A same-SHA
+  presence cannot distinguish an unapplied deletion from deletion followed by another creation;
+  it stays unresolved and never authorizes another lease deletion.
+- **An empty run listing does not prove the dispatch never applied.** Missing results and complete
+  non-204 responses (including 5xx) remain unresolved until the exact owned run is established.
+  Zero, duplicate or foreign candidates authorize neither deletion nor closure, and never redispatch.
+- **Historical terminal evidence is refreshed at cancellation, deletion and closure.** Each complete
+  run observation is retained before identity checks; an observed rerun, foreign identity or change
+  from terminal state remains a contradiction after later restoration. Each complete ref read is
+  likewise retained, including a present immediate readback after acknowledged deletion.
+- **A measured move of the live `staging` head interrupts the attempt permanently.** Every phase
+  records what it measured (`source-observed`), so a head that returns to the trusted source does
+  not erase it and a fresh process re-derives it. `collect` then refuses to measure; `cancel` and
+  `cleanup` deliberately still run — removing what the run created is exactly what must not be
+  blocked — but the journal closes `inconclusive`, never `measured`, and offline acceptance refuses.
+  Root reconciles.
+
+**Recovering an interrupted local writer.** The shared `recoverJournalLock` API accepts the probe
+journal kind only with explicit verified-gone-owner evidence, its exact original journal/intent/source
+binding, and provider reconciliation of every recorded create, dispatch, cancel and cleanup intent.
+Its closed `lock-recovered` event concerns exclusive local ownership only; it cannot resolve a
+resource outcome, authorize retries or adopt a ref. A failed callback leaves the old lock in place;
+a failed append releases the replacement lock. Subsequent public phases re-establish provider facts
+under the original deadlines. Do not manually delete a lock or edit retained journal history.
+
+**What `collect` writes.** One create-once, mode-0600 observation per environment
+(`commissioning-<run>-<attempt>-offbranch-observation-<environment>.json`), only when the refusal is
+re-derived from the retained raw responses, plus the exact `environment-controls` record to file for
+each. That record carries `offbranch_schema_version: 1` and the `commissioning` identity, and its
+`run_id`/`attempt` name the PROBE run (attempt `"1"`) — the only control where they may differ from
+the commissioning run. `check-evidence` re-derives everything: the forward link, the probe journal's
+reconciled lifecycle, the one eligible run, the run → job → `check_run_url` → check → suite/producer/
+deployment joins, the exact branch-policy annotation for this branch and environment, unchanged
+policies (baseline = before = after, agreeing with the other controls), original times in order, and
+cleanup completed before any original protected approval. A passing probe is still not PC-06 on its
+own; actual human approval of the original protected jobs remains separately required.
+
+**What it cannot claim.** Captures are taken under the trusted local operator boundary: hashes and
+local JSON are not a provider signature, `check-evidence` does not re-contact GitHub, and
+before/after equality shows the endpoints agreed, not that the policy was continuously immutable.
+
+> **A note on what changed here.** An earlier version of this section claimed the two release Apps'
+> installation permission sets were "an owner provisioning fact this harness does not measure", and
+> asked for them as two more attested controls. That was wrong: each protected job already holds its
+> own App private key and can therefore sign an App JWT, and GitHub documents `GET /app` and
+> `GET /app/installations/{installation_id}` as reporting exactly those grants. They are now MEASURED,
+> in the job, before any credential is exercised — see the prerequisites table above. The two
+> `*_app_permissions_confirmed` controls no longer exist.
+
+### What the protected jobs can and cannot read — and what replaced the guess
+
+> **A note on what changed here, because the previous version of this section was wrong in a way that
+> mattered.** It listed "the protected jobs must be able to read ruleset definitions" as a live
+> prerequisite nobody could settle from a mocked run, and had the actor jobs feed those read-only
+> bodies into the production verifier while passing `classicProtection: null` for a dimension they had
+> not measured. That produced a `compatible` verdict about a policy the job had not seen. It is not an
+> unknown: GitHub **documents** that `GET /repos/{repo}/rulesets/{id}` returns `bypass_actors` only to
+> a caller with write access to the ruleset, so a 200 with the bypass matrix absent is the CORRECT
+> response to `metadata: read` — and the emergency App's entire acceptance depends on that matrix.
+
+- **The complete governed policy comes from the local witness**, measured under the operator's admin
+  identity, per case, and bound to that case's private nonce, the immutable source and a 180-second
+  window. The actor runs the unchanged production verifier on the inverse-transformed **full** governed
+  set plus the measured classic representation. Its record states the guarantee it is limited to:
+  a bounded contemporaneous pre/post measurement under administrative quiescence, **not** an atomic
+  policy-at-mutation proof.
+- **What the actor job's own read-only token still does** is measure the applicability SUMMARY — which
+  planned rulesets apply to its ref, their targets and their enforcement mode, all of which
+  `metadata: read` genuinely exposes. That is recorded as `verdict: "applicability-only"` with
+  `bypass_visibility: "redacted-to-this-credential-by-documented-provider-contract"`, so nobody can
+  read it as the compatibility verdict.
+- **Only a measured no-classic-protection 404 is publishable.** If the tested branch reports classic
+  protection, the local process records a mismatch or measurement-incomplete and stops **before** the
+  witness dispatch. That deliberately narrows what this bounded commissioning can measure — it is not
+  a compatibility waiver, and it must not be reported as one.
+- **The narrow disclosure refuses rather than redacts.** An unexpected bypass identity, an arbitrary
+  team name, a condition the harness does not govern or a rule parameter outside the closed schema
+  stops the run before publication. The initial bounded commissioning may therefore refuse an
+  additional inherited policy that might have been compatible; it must not claim a compatibility it
+  cannot safely publish.
+
+### The live prerequisite that remains
+
+**Whether the local identity can dispatch this workflow, and whether the queue meets the bounds.**
+Both are facts about the live repository and the hosted runners, not something a mocked run settles —
+which is exactly what the `transport-rehearsal` mode is for. Run it FIRST, before spending two human
+approvals: it exposes no App key, modifies no policy or ref, produces no enforcement verdict, and
+measures the dispatch → publish → download → bind path against the same clock and serialization
+checks the real cases use. A failed rehearsal does not authorize broader infrastructure or relaxed
+bounds — and its response can satisfy no actor case.
+
+### If something goes wrong
+
+- **An actor unexpectedly SUCCEEDS at a force or delete.** That actor's remaining cases are recorded
+  `not-run` and nothing further is attempted with a credential just shown to be over-privileged. Run
+  `cleanup` — it removes only journaled resources — and stop.
+- **A partial setup.** Re-run `setup` for the same run and attempt. It resumes from the verified
+  journal, reading each journaled resource back before adopting it, and refuses a collision rather
+  than adopting or deleting anything it did not create. A **rerun attempt** derives a fresh suffix and
+  reuses nothing.
+- **A create whose RESPONSE was lost.** The create RESULT and its returned identity are fsynced before
+  any further fallible read, so a `201` followed by a failed readback still leaves the resource's exact
+  ID in the journal. A resume RECONCILES that intent — by the exact name or ref the intent recorded, in
+  a run/attempt-scoped namespace whose absence the collision check already proved — and never by
+  re-issuing the POST or by matching a name prefix. If reconciliation cannot settle it, the state stays
+  explicitly unresolved and `cleanup` reports it rather than claiming the run left nothing behind.
+- **A witness response that never arrives.** The case exits `incomplete` when its 180-second challenge
+  expires. The expiry is never extended, the observation is never restamped, and the case is not
+  retried; check the witness process is running (step 2 of the sequence) and whether the rehearsal
+  still passes before re-dispatching a fresh attempt.
+- **A witness dispatch whose response is ambiguous.** A dispatch returns `204` with no body, so even a
+  clean success says nothing about which run it created. The witness always answers the same way —
+  look for the exact expected artifact — and it journals intent-then-result, so a restarted witness
+  reconciles an existing publication instead of publishing a second response for a consumed nonce.
+  Only a *complete* refusal stops a dispatch; a 5xx, a 204 carrying stray bytes or a cut-off refusal
+  stays pending and is reconciled by the exact artifact, never dispatched again.
+- **The complete governed policy changed across a case's window.** The case stops. That is the pre/post
+  pair doing its job — and it is worth being precise about what it does not do: a change made and
+  reverted inside the window is outside the guarantee, which is why the quiet-window prerequisite is a
+  prerequisite and not a nicety.
+- **A stale lock.** Not removed on elapsed time alone: a slow provider call and a dead process look
+  identical by clock. Recovery needs positive evidence the owner is gone *and* a provider readback
+  that reconciles its last recorded mutation.
+- **`cleanup` reports a refusal.** A ruleset is deleted only if its COMPLETE governed fingerprint —
+  name, target, enforcement, conditions, bypass actors and rules, hashed from the readback journaled
+  at creation — still matches. A body edited at the same ID, name and target is a different policy and
+  is left in place for a human. Nothing is ever deleted by wildcard or by prefix sweep, and an owned
+  leftover is reported as a cleanup refusal rather than as production drift.
+- **An UNPROVABLE first fingerprint is an ownership gap, never a fresh one.** When a create was
+  durable but its first fingerprint readback failed — a 201 followed by a 503 — the resource is
+  owned and has no measured fingerprint. Measuring it NOW and trusting that value would make a
+  ruleset edited after creation its own evidence of identity, and then delete it. So the current
+  body is proved against the intended policy recomputed from the immutable intent, allowing only
+  provider default expansion and key ordering; if that cannot be proved, an `ownership-unprovable`
+  reconciliation is journalled, the resource is REFUSED and left in place for root, and the run
+  does not claim it left nothing behind. Never make a deletion safe by first trusting the value
+  being deleted.
+- **Cleanup runs under the SAME named-operator admission as every other local phase.** Opening a
+  local session — setup, human tests, cleanup, collect — measures `/user` for the numeric ID, the
+  login, the account type and current repository admin. The identity that created the journal is
+  not evidence about the identity now deleting things, and the operator who ran cleanup is recorded
+  in its evidence so the final assessment can require it.
+- **A crashed cleanup.** Recovery reconciles a pending `cleanup-intent` as well as a pending
+  mutation — an interrupted DELETE is the most consequential thing a crashed cleanup leaves behind,
+  and it is the one a resumed run most needs read back before deciding anything. Recoveries are
+  serialised by their own lock, and a recovery whose original lock was replaced while it was
+  reconciling refuses rather than removing the new owner's lock.
+
+### Reviewer negative probes — diagnostic collection only (PC-06)
+
+The separate `release-reviewer-negative-probe.yml` workflow is inert: its two one-minute jobs run
+only `:` after their staging environment gates. It has no credentials, checkout, action or candidate
+code. The local collector under `scripts/staging-ops/reviewer-negative-probe-operator.mjs` measures two
+*different* runs: John's own UI review attempt first, then an unauthorized deployment-only App
+request. Neither observation satisfies PC-06. The accepted collector format always reports
+`diagnostic-unverified`; no refusal parser or positive human approval path exists in this version.
+The original protected commissioning run remains active and unapproved while these are measured.
+
+After the inert workflow and collector have passed ordinary review/CI and are registered on the exact
+reviewed staging source, create a private mode-0700 evidence directory for the original commissioning
+run. The original intent and active run, baseline policy, source and original journal must already be
+there. Retain both environments' original UI administrator-bypass observations at the fixed names
+`reviewer-<run>-<attempt>-staging-release-admin-bypass.json` and
+`reviewer-<run>-<attempt>-staging-emergency-admin-bypass.json`, mode 0600, with exact
+`{"environment":"staging-release","can_admins_bypass":false}` (and the matching emergency name).
+These are real UI observations; the API does not supply that fact. Do not create them from an API
+boolean. Keep the original evidence and diagnostic captures private for at least 30 days.
+
+From the checkout containing the exact reviewed staging commit, use only the original run ID,
+attempt and absolute private evidence directory as CLI arguments:
+
+```sh
+node scripts/staging-ops/reviewer-negative-probe-operator.mjs stage-self --run-id <original-run> --attempt 1 --evidence-dir <private-dir>
+node scripts/staging-ops/reviewer-negative-probe-operator.mjs dispatch-self --run-id <original-run> --attempt 1 --evidence-dir <private-dir>
+node scripts/staging-ops/reviewer-negative-probe-operator.mjs collect-self --run-id <original-run> --attempt 1 --evidence-dir <private-dir>
+```
+
+`stage-self` retains a source/policy/trigger baseline and an immutable intent before the single
+fixed dispatch. `collect-self` discovers exactly one new John-dispatched run, confirms the two
+waiting jobs, issues one 15-second UI slot at a time, and prints the fixed job URL and filenames.
+John must personally use the authenticated GitHub UI during that slot. For each environment he
+supplies an original PNG screenshot, exact UI text transcription, original UI session identity record
+and a contemporaneous communication saying he personally acted on the named run/environment and
+slot digest. The files must use the names printed by the command and be mode 0600. An agent's `gh`
+identity or screenshot inspection is not participation. Missing or late evidence consumes the slot;
+no interaction is retried. The collector deliberately cancels only its identified inert run and
+confirms terminal jobs. A lost dispatch or cancel response is reconciled by reads, never resent.
+
+The separately owner-adjudicated nonsecret `diagnostic-provisioning.json` and
+`diagnostic-owner-decision.json` must be copied as original bytes into the same private directory
+before the App stage; the collector checks their pinned hashes and measures live App, installation,
+repository selection and permission records again. The App's private key path is provided only to
+the isolated `collect-app` process through `AIOS_REVIEWER_DIAGNOSTIC_APP_KEY_PATH`; do not pass key
+bytes or an installation token through argv, Actions, logs or evidence files. The root operator must
+make the provisioning decision and copy the record; the collector never creates or removes an App.
+
+```sh
+node scripts/staging-ops/reviewer-negative-probe-operator.mjs stage-app --run-id <original-run> --attempt 1 --evidence-dir <private-dir>
+node scripts/staging-ops/reviewer-negative-probe-operator.mjs dispatch-app --run-id <original-run> --attempt 1 --evidence-dir <private-dir>
+AIOS_REVIEWER_DIAGNOSTIC_APP_KEY_PATH=<local-private-key-path> node scripts/staging-ops/reviewer-negative-probe-operator.mjs collect-app --run-id <original-run> --attempt 1 --evidence-dir <private-dir>
+node scripts/staging-ops/reviewer-negative-probe-operator.mjs assess --run-id <original-run> --attempt 1 --evidence-dir <private-dir>
+```
+
+The App process mints only one selected-repository deployments-write installation token, checks
+its live single-repository scope, and may submit one fixed review body to a waiting inert run. The
+first unknown non-2xx response, including a generic 403, stops further submissions; a 2xx is
+unexpected admission and also stops. It cancels the owned run, then revokes only the in-memory
+owned token after a durable one-use marker. A lost response or crash consumes that marker; a later
+process never blindly mints, submits or revokes again. Observed passage of the token's actual
+recorded expiry can resolve token cleanup only after that deadline. It does not remove the App grant.
+
+If an explicit `cancel-self` or `cancel-app` is needed, use the same three arguments. `recover-self`
+/ `recover-app` can clear an orphan local lock only after the recorded local PID is demonstrably gone
+and exact provider readbacks reconcile the journal; recovery is cleanup-only. Never remove a lock
+by elapsed time or start another original attempt under its consumed marker. An unresolved run,
+active job, changed source/policy/trigger inventory, lost token identity or failed terminal
+confirmation leaves cleanup blocked and the original commissioning assessment unverified. The
+original bot-dispatched run still needs John's genuine independent approvals and successful
+protected jobs for a future positive release decision.

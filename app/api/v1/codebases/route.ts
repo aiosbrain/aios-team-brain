@@ -2,6 +2,11 @@ import { NextRequest } from "next/server";
 import { adminClient } from "@/lib/db/admin";
 import { authenticateApiKey } from "@/lib/api/auth";
 import { rateLimitWithReset } from "@/lib/api/rate-limit";
+import { readBoundedJson } from "@/lib/api/bounded-json";
+import {
+  MAX_SCAN_BODY_BYTES,
+  SCAN_BODY_LIMIT_MESSAGE,
+} from "@/lib/api/codebase-request-limits";
 import { codebaseScanPayloadSchema, errorResponse } from "@/lib/api/schemas";
 import { ingestCodebaseScan } from "@/lib/codebases/ingest";
 import { recordIngestRun, type IngestTrigger } from "@/lib/ingest/runs";
@@ -10,8 +15,6 @@ import { recordIngestRun, type IngestTrigger } from "@/lib/ingest/runs";
 const KNOWN_TRIGGERS = new Set<IngestTrigger>(["scheduler", "manual", "merge", "cli", "api"]);
 
 export const runtime = "nodejs";
-
-const MAX_PAYLOAD = 2_000_000; // 2 MB — scans carry per-author/day rollups + issues
 
 export async function POST(req: NextRequest) {
   const auth = await authenticateApiKey(req);
@@ -30,17 +33,19 @@ export async function POST(req: NextRequest) {
     return response;
   }
 
-  const len = parseInt(req.headers.get("content-length") || "0", 10);
-  if (len > MAX_PAYLOAD * 1.2) return errorResponse("payload_too_large", "max 2 MB", 413);
-
-  let json: unknown;
-  try {
-    json = await req.json();
-  } catch {
-    return errorResponse("invalid_payload", "body must be JSON", 422);
+  // Bounded body read — AFTER auth/tier/rate limiting, so 401/403/429 keep their precedence and
+  // none of them consumes the body. An oversized body then outranks malformed JSON and every
+  // schema issue, because admission is decided before anything is parsed. Nothing below this
+  // line is reached on rejection, so no scan-domain write happens: no `ingestCodebaseScan`, no
+  // projected commits, no `codebase.scanned` audit row and no `ingest_runs` row.
+  const body = await readBoundedJson(req, MAX_SCAN_BODY_BYTES);
+  if (!body.ok) {
+    return body.failure === "payload_too_large"
+      ? errorResponse("payload_too_large", SCAN_BODY_LIMIT_MESSAGE, 413)
+      : errorResponse("invalid_payload", "body must be JSON", 422);
   }
 
-  const parsed = codebaseScanPayloadSchema.safeParse(json);
+  const parsed = codebaseScanPayloadSchema.safeParse(body.value);
   if (!parsed.success) {
     return errorResponse("invalid_payload", parsed.error.issues[0]?.message ?? "invalid", 422);
   }

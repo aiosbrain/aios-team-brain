@@ -1,0 +1,143 @@
+name: Staging release controller
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: validate, promote, or emergency
+        required: true
+        type: choice
+        options: [validate, promote, emergency]
+      tag:
+        description: Exact annotated vX.Y.Z tag (normal path)
+        required: false
+        type: string
+      deployment_id:
+        description: Exact staging Railway deployment ID
+        required: false
+        type: string
+      mode:
+        description: Explicit staging data mode
+        required: true
+        type: choice
+        options: [copy-ready, legacy-pg-only]
+      notes:
+        description: Human validation notes or emergency reason
+        required: true
+        type: string
+      incident_url:
+        description: Required incident/issue URL for emergency
+        required: false
+        type: string
+      emergency_sha:
+        description: Full descendant SHA for emergency update
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aios-main-promotion
+  cancel-in-progress: false
+
+jobs:
+  normal:
+    name: Release controller dispatch
+    if: inputs.action != 'emergency' && github.ref == 'refs/heads/staging'
+    runs-on: ubuntu-latest
+    environment: staging-release
+    steps:
+      # The TRUSTED IMMUTABLE dispatch SHA, not the moving `staging` ref. The `if` above already
+      # pins the dispatch to refs/heads/staging; checking out the branch NAME would then run
+      # whatever landed on it between dispatch and job start, with this environment's App
+      # credentials in scope. Never the candidate tag's tree.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Measure and authorize exact candidate
+        env:
+          RELEASE_ACTION: ${{ inputs.action }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_DEPLOYMENT_ID: ${{ inputs.deployment_id }}
+          RELEASE_MODE: ${{ inputs.mode }}
+          RELEASE_NOTES: ${{ inputs.notes }}
+          RELEASE_AUDIT_PATH: release-audit.json
+          RELEASE_PRODUCER_IDS_JSON: ${{ vars.RELEASE_PRODUCER_IDS_JSON }}
+          STAGING_ORIGIN: ${{ vars.STAGING_ORIGIN }}
+          STAGING_COPY_MODE_ACTIVATED: ${{ vars.STAGING_COPY_MODE_ACTIVATED }}
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          STAGING_HEALTH_TOKEN: ${{ secrets.STAGING_HEALTH_TOKEN }}
+          RAILWAY_STAGING_READ_TOKEN: ${{ secrets.RAILWAY_STAGING_READ_TOKEN }}
+          RAILWAY_PRODUCTION_READ_TOKEN: ${{ secrets.RAILWAY_PRODUCTION_READ_TOKEN }}
+          RAILWAY_PRODUCTION_ENVIRONMENT_ID: ${{ vars.RAILWAY_PRODUCTION_ENVIRONMENT_ID }}
+          RAILWAY_PRODUCTION_APP_SERVICE_ID: ${{ vars.RAILWAY_PRODUCTION_APP_SERVICE_ID }}
+          # Bind candidate deployment evidence to the pinned staging service/environment: a
+          # deployment ID alone does not identify a STAGING deployment.
+          RAILWAY_STAGING_ENVIRONMENT_ID: ${{ vars.RAILWAY_STAGING_ENVIRONMENT_ID }}
+          RAILWAY_STAGING_APP_SERVICE_ID: ${{ vars.RAILWAY_STAGING_APP_SERVICE_ID }}
+          # STAGING_VERIFIED_DOMAIN / PRODUCTION_VERIFIED_DOMAIN are deliberately GONE. They were a
+          # repository variable described as an "independently verified domain" — i.e. a value an
+          # operator typed, standing in for the one fact the promotion evidence must MEASURE. When
+          # Railway reports no deployment domain the evidence is unmeasured and the controller
+          # refuses; it does not accept a claim in its place.
+        run: node scripts/staging-ops/release-controller.mjs --run
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-audit-${{ github.run_id }}
+          path: release-audit.json
+          if-no-files-found: error
+          retention-days: 90
+
+  emergency:
+    name: Emergency release controller dispatch
+    if: inputs.action == 'emergency' && github.ref == 'refs/heads/staging'
+    runs-on: ubuntu-latest
+    environment: staging-emergency
+    steps:
+      # Same trusted immutable dispatch SHA as the normal job — a break-glass path is exactly where
+      # a moving ref would be worst.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Record break-glass authorization before update
+        env:
+          RELEASE_ACTION: emergency
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_INCIDENT_URL: ${{ inputs.incident_url }}
+          RELEASE_EMERGENCY_SHA: ${{ inputs.emergency_sha }}
+          RELEASE_NOTES: ${{ inputs.notes }}
+          RELEASE_AUDIT_PATH: release-audit.json
+          EMERGENCY_APP_ID: ${{ secrets.EMERGENCY_APP_ID }}
+          EMERGENCY_APP_INSTALLATION_ID: ${{ secrets.EMERGENCY_APP_INSTALLATION_ID }}
+          EMERGENCY_APP_PRIVATE_KEY: ${{ secrets.EMERGENCY_APP_PRIVATE_KEY }}
+          # Break-glass waives candidate evidence, not post-update production observation.
+          RAILWAY_PRODUCTION_READ_TOKEN: ${{ secrets.RAILWAY_PRODUCTION_READ_TOKEN }}
+          RAILWAY_PRODUCTION_ENVIRONMENT_ID: ${{ vars.RAILWAY_PRODUCTION_ENVIRONMENT_ID }}
+          RAILWAY_PRODUCTION_APP_SERVICE_ID: ${{ vars.RAILWAY_PRODUCTION_APP_SERVICE_ID }}
+        run: node scripts/staging-ops/release-controller.mjs --run
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: emergency-release-audit-${{ github.run_id }}
+          path: release-audit.json
+          if-no-files-found: error
+          retention-days: 365

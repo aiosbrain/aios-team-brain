@@ -1,0 +1,465 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aios.dev/contracts/brain-api/1.24/codebase-payload.schema.json",
+  "title": "AIOS Brain API 1.24 codebase scan payload (POST /api/v1/codebases)",
+  "description": "Machine-readable contract for POST /api/v1/codebases. Revision 1.24 adds the two optional scanner-identity fields - `metrics.scanner_version` and `metrics.scanner_sha` (AIO-1011) - on top of the 1.23 commit-classification / fix-analysis contract and the 1.22 coverage denominator. Strictness is deliberately scoped: codebase_health plus the two analytical commit objects are closed; the surrounding codebase, metrics, and recent-commit shapes stay open for additive scanner fields. The full raw-metrics block remains required because its upsert replaces the row on (codebase_id, head_sha). JSON Schema 2020-12 cannot compare sibling sums, so coverage and fix-analysis numeric coherence rules are normative in docs/brain-api.md and enforced by the brain boundary. SECOND LIMIT, new at 1.24 and deliberate: the scanner-identity fields are typed loosely (string or null, bounded length) and carry NO `pattern`. Their SHAPE is the scanner's promise, not the brain's gate. A malformed version string must never 422 a scan - a rejected payload drops the repo's whole scan, findings and contributions included, and returns before the ingest run is even logged - so the brain accepts any bounded string and NORMALIZES an unparseable one to the unknown state at read time. Pinning a pattern here would make the canonical contract STRICTER than the implementation, which is the same class of drift as 1.22's looser-than-implementation gap, pointed the other way.",
+  "type": "object",
+  "required": [
+    "codebase",
+    "metrics"
+  ],
+  "properties": {
+    "codebase": {
+      "type": "object",
+      "required": [
+        "slug"
+      ],
+      "properties": {
+        "slug": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "full_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 250
+        },
+        "provider": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        }
+      },
+      "additionalProperties": true
+    },
+    "metrics": {
+      "type": "object",
+      "required": [
+        "head_sha",
+        "loc",
+        "files",
+        "commits_window",
+        "ai_commits_window",
+        "additions_window",
+        "deletions_window",
+        "recent_commits",
+        "has_claude_md",
+        "has_agents_md",
+        "agents_md_count",
+        "skills_count",
+        "commands_count"
+      ],
+      "properties": {
+        "head_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{7,40}$"
+        },
+        "window_days": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "loc": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "files": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "commits_window": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ai_commits_window": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "additions_window": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "deletions_window": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "recent_commits": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "sha"
+            ],
+            "properties": {
+              "sha": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{7,40}$"
+              },
+              "author": {
+                "type": "string",
+                "maxLength": 120
+              },
+              "ai": {
+                "type": "boolean"
+              },
+              "committed_at": {
+                "type": "string",
+                "maxLength": 40
+              },
+              "commit_classification": {
+                "$ref": "#/$defs/commitClassification"
+              },
+              "fix_analysis": {
+                "$ref": "#/$defs/fixAnalysis"
+              }
+            },
+            "additionalProperties": true,
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "fix_analysis": {}
+                  },
+                  "required": [
+                    "fix_analysis"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "commit_classification"
+                  ],
+                  "properties": {
+                    "commit_classification": {
+                      "type": "object",
+                      "properties": {
+                        "type": {
+                          "const": "fix"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "has_claude_md": {
+          "type": "boolean"
+        },
+        "has_agents_md": {
+          "type": "boolean"
+        },
+        "agents_md_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skills_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "commands_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "test_coverage_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 100
+        },
+        "test_coverage_lines_total": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "1.22. Instrumented lines the coverage report measured - the DENOMINATOR test_coverage_pct was computed over. null = UNKNOWN, never zero and never 'the whole repo'."
+        },
+        "test_coverage_lines_covered": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "1.22. Of test_coverage_lines_total, how many were hit. null = UNKNOWN."
+        },
+        "tests_total": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "1.22. Run integrity: the number of test cases the run collected. null = no test-result report, which is UNKNOWN and must not be read as zero."
+        },
+        "tests_passed": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "1.22. Run integrity: how many passed. null = no test-result report, which is UNKNOWN and must not be read as zero."
+        },
+        "tests_skipped": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "1.22. Run integrity: how many were skipped - non-zero marks the run partial. null = no test-result report, which is UNKNOWN and must not be read as zero."
+        },
+        "tests_failed": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "1.22. Run integrity: how many failed (JUnit failures + errors). null = no test-result report, which is UNKNOWN and must not be read as zero."
+        },
+        "readiness_level": {
+          "type": "string",
+          "pattern": "^L[1-5]$"
+        },
+        "readiness_pct": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "readiness_pillars": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "passed",
+              "total"
+            ],
+            "properties": {
+              "passed": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "total": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "readiness_rubric_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "codebase_health": {
+          "$ref": "#/$defs/codebaseHealth"
+        },
+        "scanner_version": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 64,
+          "description": "brain-api 1.24 (AIO-1011). The version of the ingestion package that BUILT this payload - `aios_ingest.__version__`, a dotted semver such as \"0.2.0\". null or absent = UNKNOWN scanner build, which is what every scan produced before 1.24 reports; it is never read as \"current\". The brain compares it against the contract's declared `minScannerVersion` (see brain-contract.json's codebasePayloadContract block) to decide whether a repo's scanner predates what the current contract needs, and says so at the point of confusion instead of rendering an unexplained \"(scope unknown)\". A value the brain cannot parse as a version is treated as unknown, not rejected."
+        },
+        "scanner_sha": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 64,
+          "description": "brain-api 1.24 (AIO-1011). PROVENANCE ONLY: the git commit of the aios-team-brain checkout the scanner ran from, when it is knowable - `.github/scripts/fetch-brain-scanner.sh` leaves a real detached checkout at the pinned BRAIN_SHA, so the scanner can read its own build. null when the scanner was installed without git history (a future package install). Never used to compute staleness: commit identity is not ordered, is meaningless across branches, and stops existing the moment the scanner ships as a package. It exists so a stale repo's pin can be located and bumped without guessing."
+        }
+      },
+      "additionalProperties": true
+    },
+    "contributions": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "issues": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "commitClassification": {
+      "title": "Commit classification (document revision 1.23, optional)",
+      "description": "Versioned Conventional Commit classification. `unparseable` is a measured class and remains in the all-observed denominator; it is not silently dropped.",
+      "type": "object",
+      "required": [
+        "scheme",
+        "type"
+      ],
+      "properties": {
+        "scheme": {
+          "const": "conventional-commit-v1"
+        },
+        "type": {
+          "enum": [
+            "fix",
+            "feat",
+            "other",
+            "unparseable"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "fixAnalysis": {
+      "title": "Fix analysis (document revision 1.23, optional)",
+      "description": "First-parent line-blame counts for a fix commit. Normative brain-enforced invariants: the age-bucket sum equals blamed_parent_lines; blamed_parent_lines is no greater than candidate_parent_lines; prior_fix_parent_lines is no greater than blamed_parent_lines. Counts only: no paths, patch text, line content, or source-sensitive material.",
+      "type": "object",
+      "required": [
+        "method",
+        "candidate_parent_lines",
+        "blamed_parent_lines",
+        "age_buckets",
+        "prior_fix_parent_lines"
+      ],
+      "properties": {
+        "method": {
+          "const": "first-parent-line-blame-v1"
+        },
+        "candidate_parent_lines": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "blamed_parent_lines": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "age_buckets": {
+          "type": "object",
+          "required": [
+            "0_1d",
+            "2_7d",
+            "8_30d",
+            "31_90d",
+            "91_365d",
+            "366d_plus"
+          ],
+          "properties": {
+            "0_1d": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "2_7d": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "8_30d": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "31_90d": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "91_365d": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "366d_plus": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false
+        },
+        "prior_fix_parent_lines": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "codebaseHealth": {
+      "title": "codebase_health (document revision 1.15, optional, provenance-only)",
+      "description": "Scalar-only workspace-governance health snapshot, scored scanner-side; the brain persists it verbatim and never recomputes it. All fields are required when the object is present. No file paths, no source text, no contributor identity — failed_invariant_ids are short rubric ids, never paths or findings text.",
+      "type": "object",
+      "required": [
+        "schema_version",
+        "rubric_version",
+        "head_sha",
+        "score_pct",
+        "status",
+        "dimensions",
+        "failed_invariant_ids",
+        "measured_at"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20
+        },
+        "rubric_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "head_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{7,40}$"
+        },
+        "score_pct": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "status": {
+          "enum": [
+            "pass",
+            "warn",
+            "fail"
+          ]
+        },
+        "dimensions": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "passed",
+              "total"
+            ],
+            "properties": {
+              "passed": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "total": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "failed_invariant_ids": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+          }
+        },
+        "measured_at": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

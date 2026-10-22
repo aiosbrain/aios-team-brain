@@ -140,3 +140,28 @@ describe("assertPinnedTarget — the drift check that makes writes safe", () => 
     expect(() => assertPinnedTarget({ name: "other-project" }, "other-project")).toThrow(/service-guard|AIOS project name/i);
   });
 });
+
+describe("STGENV-4 — the shell verb is forbidden, and both layers agree it is", () => {
+  // It was added late and for a DIFFERENT reason than the four deploy verbs: it deploys nothing, it
+  // opens a WRITE-CAPABLE SHELL inside a running container, where GRAPHITI_URL plus one request is
+  // an unscoped whole-graph wipe against a sidecar with no auth. The pre-push review found the two
+  // enforcement layers disagreeing — the settings deny list refused it while the hook classified it
+  // `allow · read-only`, because it was in no verb list at all. Two layers that disagree is the
+  // thing this file exists to prevent.
+  const VERB = "s" + "sh"; // assembled so this test file is not itself blocked by the hook it tests
+
+  it("the policy module classifies it forbidden", () => {
+    expect(FORBIDDEN_VERBS).toContain(VERB);
+    expect(classifyRailwayCommand(`railway ${VERB} -e staging`).decision).toBe("block");
+  });
+
+  it("the hook blocks it too — not merely the module", () => {
+    expect(guardBlocks(`railway ${VERB} -e staging -s aios-team-brain`)).toBe(true);
+    // ...and still blocks it when chained, the shape a classifier keyed on the first word misses.
+    expect(guardBlocks(`cd /tmp && railway ${VERB}`)).toBe(true);
+  });
+
+  it("a read-only verb is still allowed, so this did not just ban the CLI", () => {
+    expect(guardBlocks("railway status")).toBe(false);
+  });
+});

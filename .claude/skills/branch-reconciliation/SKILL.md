@@ -22,7 +22,7 @@ cheap-to-expensive verification ladder that catches it.
 
 ## Steps
 
-Use the contribution base (currently `main`, declared in `scripts/branches.mjs`).
+Use the contribution base (currently `staging`, declared in `scripts/branches.mjs`).
 
 Run the cheap passes on every branch before spending a real read on any of them.
 

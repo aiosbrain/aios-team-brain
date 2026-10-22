@@ -92,7 +92,7 @@ function txDb(c: PoolClient): { db: DbClient; query: TransactionQuery } {
     const r = await c.query(sql, values);
     return { rows: r.rows as T[], rowCount: r.rowCount ?? 0 };
   };
-  return { query, db: new PgClient(query) };
+  return { query, db: new PgClient({ executor: query, bound: true }) };
 }
 async function identityLock(c: PoolClient, key: string) {
   return (

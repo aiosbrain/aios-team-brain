@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aios.dev/contracts/brain-api/1.26/debt-intake-events-v1-ack.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "accepted_event_ids",
+    "duplicate_event_ids"
+  ],
+  "properties": {
+    "status": {
+      "const": "ok"
+    },
+    "accepted_event_ids": {
+      "type": "array",
+      "maxItems": 256,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
+      }
+    },
+    "duplicate_event_ids": {
+      "type": "array",
+      "maxItems": 256,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
+      }
+    }
+  }
+}

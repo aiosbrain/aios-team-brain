@@ -40,7 +40,12 @@ function deriveRoutes() {
       .replace(/\/route\.ts$/, "")
       .replace(/\[(\w+)\]/g, ":$1");
     const src = readFileSync(file, "utf8");
-    for (const m of src.matchAll(/export\s+async\s+function\s+(GET|POST|PUT|PATCH|DELETE)\b/g)) {
+    // `async` is OPTIONAL. Next's own generated route validation accepts
+    // `Response | void | Promise<Response | void>`, so a handler that has nothing to await is a real
+    // route — and one existed (`GET /api/internal/staging-build-metadata`) that this extractor could
+    // not see. A ground-truth extractor that under-reports is worse than a missing guard: the
+    // inventory goes green while the route is absent from the map.
+    for (const m of src.matchAll(/export\s+(?:async\s+)?function\s+(GET|POST|PUT|PATCH|DELETE)\b/g)) {
       routes.add(`${m[1]} ${path}`);
     }
   }

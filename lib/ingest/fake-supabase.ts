@@ -7,15 +7,24 @@
 type Row = Record<string, unknown>;
 type Filter =
   | { kind: "eq"; col: string; val: unknown }
+  | { kind: "in"; col: string; val: unknown[] }
   | { kind: "notNull"; col: string }
   | { kind: "isNull"; col: string };
 
 // Real UUIDs, not `id-<n>` (PCCC-4): ingestItem now mints graph partition pointers whose scheme
 // asserts canonical-UUID inputs (a reviewed fail-loud invariant a fixture must satisfy, not weaken).
 import { randomUUID } from "node:crypto";
+import type { TransactionSession } from "@/lib/db/types";
+import { bindTransactionSessionAlias } from "@/lib/db/pg/tx";
 const nextId = () => randomUUID();
 
 export class FakeSupabase {
+  private readonly bound: boolean;
+
+  constructor(bound = false) {
+    this.bound = bound;
+  }
+
   tables: Record<string, Row[]> = {
     projects: [],
     items: [],
@@ -23,11 +32,113 @@ export class FakeSupabase {
     tasks: [],
     decisions: [],
     audit_log: [],
+    project_context_units: [],
+    project_context_memberships: [],
+    project_groups: [],
+    groups: [],
   };
 
   from(table: string) {
     this.tables[table] ??= [];
     return new Builder(this.tables[table]);
+  }
+
+  /**
+   * Explicit orchestration-only transaction fixture. Row locking is a no-op: this proves neither
+   * PostgreSQL atomicity nor concurrency. The SQL executor recognizes only ingest/context control
+   * statements and rejects everything else instead of pretending to be a database.
+   */
+  async transaction<T>(
+    fn: (session: {
+      db: FakeSupabase;
+      executeSql: <R = Row>(text: string, params?: unknown[]) => Promise<{ rows: R[]; rowCount: number }>;
+      optionalAudit<R>(operation: () => Promise<R>, fallback: R): Promise<R>;
+    }) => Promise<T>
+  ): Promise<T> {
+    if (this.bound) throw new Error("transaction-session-already-bound");
+    const snapshot = structuredClone(this.tables);
+    const sessionDb = new FakeSupabase(true);
+    sessionDb.tables = this.tables;
+    let active = true;
+    const executeSql = async <R = Row>(text: string, params: unknown[] = []) => {
+      if (!active) throw new Error("transaction-session-completed");
+      const normalized = text.replace(/\s+/g, " ").trim().toLowerCase();
+      if (normalized === "show lock_timeout") {
+        return { rows: [{ lock_timeout: "0" } as R], rowCount: 1 };
+      }
+      if (normalized.startsWith("select set_config('lock_timeout'")) {
+        return { rows: [] as R[], rowCount: 1 };
+      }
+      if (normalized.startsWith("select pg_advisory_xact_lock")) {
+        return { rows: [] as R[], rowCount: 1 };
+      }
+      if (normalized.includes(" from items ") && normalized.includes("for update")) {
+        const byPath = normalized.includes("project_id = $2 and path = $3");
+        const rows = this.tables.items.filter((row) =>
+          byPath
+            ? row.team_id === params[0] && row.project_id === params[1] && row.path === params[2]
+            : row.team_id === params[0] && row.id === params[1]
+        );
+        return { rows: rows as R[], rowCount: rows.length };
+      }
+      if (normalized.includes(" from items ") && normalized.includes("where team_id = $1 and id = $2")) {
+        const rows = this.tables.items.filter(
+          (row) => row.team_id === params[0] && row.id === params[1]
+        );
+        return { rows: rows as R[], rowCount: rows.length };
+      }
+      if (normalized.startsWith("update project_context_units u")) {
+        const unit = this.tables.project_context_units.find(
+          (row) => row.id === params[0] && row.team_id === params[1]
+        );
+        const item = this.tables.items.find(
+          (row) => row.id === params[2] && row.team_id === params[1]
+        );
+        if (!unit || !item || unit.source_item_id !== item.id || unit.unit_kind !== "item") {
+          return { rows: [] as R[], rowCount: 0 };
+        }
+        Object.assign(unit, {
+          audience: item.access,
+          content_sha256: item.content_sha256,
+          occurred_at: item.work_at,
+          updated_at: new Date().toISOString(),
+        });
+        return { rows: [{ audience: unit.audience } as R], rowCount: 1 };
+      }
+      throw new Error(`fake transaction executor: unsupported SQL: ${normalized}`);
+    };
+    let fakeSession: (TransactionSession & { active: boolean }) | undefined;
+    try {
+      fakeSession = {
+        db: sessionDb,
+        executeSql,
+        active: true,
+        async optionalAudit<R>(operation: () => Promise<R>, fallback: R): Promise<R> {
+          const auditSnapshot = structuredClone(sessionDb.tables.audit_log);
+          try {
+            return await operation();
+          } catch {
+            sessionDb.tables.audit_log = auditSnapshot;
+            return fallback;
+          }
+        },
+      };
+      bindTransactionSessionAlias(sessionDb, fakeSession);
+      const result = await fn(fakeSession);
+      if (result && typeof result === "object" && (result as { ok?: unknown }).ok === false) {
+        // Deliberate fake limitation: every ok:false restores the snapshot. Production may commit
+        // the protected-human refusal standing state, whose persistence is authoritative only in
+        // the real PostgreSQL A13-08/A13-09 data-mechanics coverage.
+        this.tables = snapshot;
+      }
+      return result;
+    } catch (error) {
+      this.tables = snapshot;
+      throw error;
+    } finally {
+      active = false;
+      if (fakeSession) fakeSession.active = false;
+    }
   }
 }
 
@@ -71,6 +182,10 @@ class Builder implements PromiseLike<{ data: unknown; error: null }> {
     this.filters.push({ kind: "eq", col, val });
     return this;
   }
+  in(col: string, val: unknown[]) {
+    this.filters.push({ kind: "in", col, val });
+    return this;
+  }
   not(col: string, _op: "is", _val: null) {
     this.filters.push({ kind: "notNull", col });
     return this;
@@ -101,6 +216,7 @@ class Builder implements PromiseLike<{ data: unknown; error: null }> {
   private match(row: Row): boolean {
     return this.filters.every((f) => {
       if (f.kind === "eq") return row[f.col] === f.val;
+      if (f.kind === "in") return f.val.includes(row[f.col]);
       if (f.kind === "isNull") return row[f.col] === null || row[f.col] === undefined;
       return row[f.col] !== null && row[f.col] !== undefined;
     });

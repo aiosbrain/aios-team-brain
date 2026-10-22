@@ -69,7 +69,7 @@ it("predeployed mode still provisions an operator and preserves an existing cred
     TEAM_NAME: "Startup fixture",
     ADMIN_EMAIL: "startup@example.test",
     ADMIN_NAME: "Operator",
-    ADMIN_PASSWORD: "synthetic-startup-password",
+    ADMIN_PASSWORD: "synthetic-startup-password", // aios-secret-fixture:synthetic-startup-password
   };
   const db = new Client({ connectionString: process.env.DATABASE_TEST_URL });
   await db.connect();
@@ -89,7 +89,7 @@ it("predeployed mode still provisions an operator and preserves an existing cred
       process.execPath,
       ["docker/bootstrap.mjs", "--schema=predeployed"],
       {
-        env: { ...setup, ADMIN_PASSWORD: "synthetic-replacement-password" },
+        env: { ...setup, ADMIN_PASSWORD: "synthetic-replacement-password" }, // aios-secret-fixture:synthetic-replacement-password
         timeout: 15000,
       },
     );

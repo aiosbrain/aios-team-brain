@@ -1,6 +1,28 @@
 # Releasing AIOS Team Brain
 
-**Status: there is no release process yet, and this file is the first half of building one.**
+**Status: the staging-first controller and enforcement contract are implemented but NOT ACTIVATED.**
+Until the activation checklist below is evidenced, the old manual procedure remains descriptive history and must not be represented as enforced.
+
+The target workflow is: merge features to `staging`, validate the exact annotated tag against its exact successful staging deployment, then dispatch `.github/workflows/release-controller.yml`. The protected `staging-release` environment supplies the normal GitHub App credential; `GITHUB_TOKEN` remains contents-read. The controller remeasures tag immutability, **eleven** producer-pinned prerequisite checks, main ancestry, deployment SHA and authenticated health immediately before a non-force main update. Eleven, not twelve: `PREVALIDATION_CONTEXTS` removes `Staging candidate validation` from the twelve-context main policy, because that twelfth check is the one the controller itself PUBLISHES — requiring it as a prerequisite of its own run would be a self-dependency. The main-branch contract is still the twelve contexts in `scripts/staging-ops/main-policy.mjs`; only the controller's prerequisite set is eleven. It then observes production to the same SHA and healthy state within a finite deadline; a successful push with a failed/missing deployment is reported as `promoted-but-deployment-failed` or `promoted-but-deployment-unverified`, never rolled back by rewriting main.
+
+**Two health contracts, deliberately different.** The candidate probe is the PRIVILEGED staging one: it presents `x-aios-staging-health-token` and binds the declared mode and the ready refresh run. The production observation uses the ORDINARY public endpoint — a bounded Postgres probe answering `{ ok, commit }` with no token at all. `STAGING_HEALTH_TOKEN` is a staging environment secret; production does not hold it, so a staging-shaped header sent there can only produce a 401 and, through it, report a good release as failed. Configure `RAILWAY_STAGING_ENVIRONMENT_ID` and `RAILWAY_STAGING_APP_SERVICE_ID` so candidate deployment evidence is bound to the pinned service and environment; a deployment ID alone does not identify a staging deployment. **Two Railway read tokens, one kind, two environments.** `RAILWAY_STAGING_READ_TOKEN` (candidate binding) and `RAILWAY_PRODUCTION_READ_TOKEN` (post-promotion observation) are both Railway environment-scoped **project** tokens presented as `Project-Access-Token`, and they are **separate secrets** — one token covering both environments would give the staging-scoped readers production reach. The production token's kind was previously undefined while its reader sent `Authorization: Bearer`; a token provisioned as the documented kind authenticated nothing, so the AC-03 observation could never verify and promotion would report `promoted-but-deployment-unverified` after `main` had already moved. Railway reports `staticUrl` as a BARE HOSTNAME — it is normalised to an https origin, and when Railway reports none, promotion REFUSES: the evidence is unmeasured, and nothing may stand in for it. The former `STAGING_VERIFIED_DOMAIN` / `PRODUCTION_VERIFIED_DOMAIN` repository variables are removed. They were described as supplying "an independently verified domain", but a repository variable records what an operator typed — a claim, not a measurement — and it sat on the exact path whose purpose is to refuse an unverified origin, so it re-admitted the substitution it was written to prevent. Substituting the probed origin for the missing deployment domain would equally make the probe prove the value it was handed. If a deployment legitimately serves only a custom domain, the fix is to MEASURE that domain from the provider, not to configure it.
+
+**Bind the domain BEFORE the token is presented.** The candidate health probe used to run in the same parallel batch as the Railway deployment read, aimed at the configured `STAGING_ORIGIN`, with the domain comparison performed on the result. That ordering cannot prevent what it checks: by the time the mismatch is noticed, the privileged staging token has already been sent to a host nothing bound. The deployment is now read first, an absent domain refuses with no health request at all, and the probe is CALLED WITH the measured origin. `STAGING_ORIGIN` survives only as an operator assertion that may agree or refuse — if it names a different host, the controller refuses rather than probing either one — and a probe result reporting some other origin is a refusal, not an unhealthy verdict.
+
+Activation must install and verify the three rulesets emitted by `scripts/staging-ops/main-policy.mjs`: `main-integrity` has no bypass; `main-release-evidence` permits only the emergency App; `main-release-writer` permits only the distinct normal and emergency Apps. Remove conflicting classic PR/check constraints only after the active rulesets preserve every existing check. Test human/admin/normal/emergency operations on a disposable protected branch. Configure protected environment reviewers, prevent self-review, and restrict controller deployment branches to exactly `staging`. This PR performs none of those provider writes.
+
+Emergency is a separate `staging-emergency` environment and App. It requires an HTTPS incident URL, concrete reason, human authorization and a non-force descendant; that incident URL is retained in every authorization and terminal audit record. Back-merge the hotfix through a reviewed staging PR and cut a new normal release. Never reuse emergency credentials for ordinary promotion.
+
+**Every authorized controller run receives a terminal audit outcome.** Token exchange, candidate-check,
+and other pre-update failures finish as `refused` with their phase and whether an update was attempted.
+The GitHub API calls, including the uncertainty read-back, have finite request deadlines. If the one
+non-force PATCH errors, the controller reads `main` back exactly once and never retries the PATCH: a
+candidate match is a confirmed promotion; any other or unreadable result is
+`promotion-outcome-ambiguous`. Operators must investigate that state, not dispatch another blind
+promotion. Once a promotion is confirmed, a failed or incomplete Railway observation is terminally
+recorded as `promoted-but-deployment-failed` or `promoted-but-deployment-unverified`, with the
+promoted SHA preserved. It is never relabelled as a pre-update refusal and never triggers a branch
+rewrite.
 
 What exists today: four tags (`v0.7.0` … `v0.10.0`), the newest cut **2026-08-03**, with `main`
 **166 commits and 34 migration files (29 added, 5 modified)** past it and `package.json` still reading
@@ -55,15 +77,38 @@ runs, today and at every future rebuild — and that branch is trunk.
    the guard, not aspirational.)
 4. **Cut the tag on the release commit** and push it. **Pushing a tag now runs the release-candidate
    gate** (`.github/workflows/release-candidate.yml`, RELPTR-3) — `ci.yml` still fires on branches
-   only, but the gate fires on `v*` and its result attaches to the tagged commit. **Watch it**: until
-   the cutover it is expected to fail assertion D (the candidate is not yet reachable from the
-   integration branch — constraint 8), which blocks nothing because the context is not required, but a
-   failure on A, B or C means the tag itself is wrong. Do not publish past a red A/B/C. The migration lane picks the new tag up on the **next** PR or branch push, and that is the
+   only, but the gate fires on `v*` and its result attaches to the tagged commit. **Watch it**: all
+   four assertions should now pass. (Before the 2026-09-06 cutover, D was expected to fail because the
+   candidate was not reachable from the integration branch; `main` is now an ancestor of `staging`, so
+   a red D means something real.) A failure on A, B or C means the tag itself is wrong. Do not publish
+   past a red assertion.
+5. **Fast-forward `main` onto the tagged commit — THE STEP THAT MAKES IT A RELEASE.** Everything above
+   produces a tag; nothing above moves what installers deploy. Post-cutover `main` advances ONLY this
+   way, and it was missing from this ritual entirely until Fable's review of RELPTR-7 found that
+   following §2 as written would leave installers on the pre-cutover `main` forever.
+
+   ```bash
+   git push origin "v<X.Y.Z>^{commit}:$(node scripts/branches.mjs --print release)"
+   ```
+
+   **Order matters and §3.1a records why:** push the tag, WAIT for `Release candidate gate` to go
+   green on that commit, *then* fast-forward.
+
+   ⚠️ **THE WAIT IS HUMAN DISCIPLINE TODAY — NOTHING ENFORCES IT**, and an earlier draft of this step
+   implied otherwise. Measured on `main` 2026-09-06: `Release candidate gate` is **not** a required
+   context, `required_pull_request_reviews` is present, `enforce_admins` is `false`, and there is no
+   bypass allowance. So a non-admin's fast-forward is refused by "require a pull request" whatever the
+   contexts say, and an **admin's push bypasses everything — including a pending or red gate**. The
+   sentence this replaced ("a fast-forward attempted while the context is still pending is rejected")
+   is true for neither actor.
+
+   To make the wait real, make `Release candidate gate` required on `main` and add a bypass allowance
+   for the release actor — §3.2's `release-actor-protection` pair, still open. The migration lane picks the new tag up on the **next** PR or branch push, and that is the
    check that the release is installable from an existing database. For `v0.11.0` it is the largest
    step the lane has ever taken (**34 migration files touched: 29 added, 5 modified**;
    `postgres/schema.sql` +831/−14), so expect it to be slow and read its output. A `v*`-triggered
    verification workflow was named as follow-on work there; **RELPTR-3 shipped it** — see §3.1a.
-5. **Publish the GitHub Release** from the tag, with the CHANGELOG section as its body.
+6. **Publish the GitHub Release** from the tag, with the CHANGELOG section as its body.
 
 **Roll forward, never back.** At least one shipped migration is explicitly one-way —
 `postgres/migrations/20260819180000_task_status_in_review.sql` adds an enum value and says so: *"ONE-WAY.
@@ -72,11 +117,26 @@ checkpoint you can return to once its migrations have run.
 
 ---
 
-## 3. The cutover that has not happened yet
+## 3. The cutover — EXECUTED 2026-09-06 (RELPTR-7)
 
-The repository still deploys trunk to production and still hands trunk to installers. Fixing that
-means choosing a branch model and executing a coordinated cutover. **The design work is done and
-recorded** in `design/release-pointer-stable-branch.md`; the decision and the execution are not.
+**Option B is live.** `staging` is the default branch and the contribution base; `main` is the release
+branch and advances only by fast-forward to a tagged commit. `scripts/branches.mjs` answers `staging`
+for `--print contribution`. The design is in `design/release-pointer-stable-branch.md`; the execution
+is `design/cutover-execution.md`.
+
+**What was measured on the day, because two of these were surprises:**
+
+- `main` was **not an ancestor of `staging`** — three reviewed commits had landed on `main` after the
+  default branch moved, so no release candidate could satisfy both guard assertions at once. Fixed by
+  a back-merge (#681) *before* anything else; the ancestry that makes a fast-forward release possible
+  is a precondition, not a consequence.
+- `scan-on-merge` went red in 3 seconds with **zero steps run**, twice, because the
+  `trusted-automation` environment still permitted `main` only. That is a `push` trigger, whose ref is
+  the pushed branch — see §3.1c item 4 for why its two `pull_request_target` siblings behave
+  differently.
+
+The rest of this section is kept in its original tense where it records *why* the model was chosen,
+and corrected where it made claims that the execution disproved.
 
 The recommendation there is **option B — `main` becomes the release branch, `staging` becomes the
 integration branch** — because every artefact that names a branch today already names `main`: the
@@ -94,13 +154,13 @@ completeness.**
 | # | Constraint | Where it bites |
 |---|---|---|
 | 1 | A fast-forward push to `main` can be **rejected by a required check the candidate cannot acquire** — but this is **one context, not ten**. **MEASURED 2026-08-26** on the real merge commit `6dfddfc7` (a push to `main`): **9 of the 10 required contexts are present**, because `ci.yml` and `nda-gate.yml` both fire on `push`. The sole exception is **`PR records a diff review`**, emitted only on `pull_request` (`.github/workflows/pr-review-gate.yml`). The cutover therefore needs that one context **relocated** to the integration branch — not a release-actor bypass that defeats the other nine. *(A dated measurement, not an invariant: if protection gains an eleventh context, re-measure rather than trusting this row.)* | live protection on `main`; check-runs on `6dfddfc7` |
-| 2 | **Dependabot follows the default branch.** Three ecosystems, zero `target-branch` overrides (`.github/dependabot.yml`), so its PRs target the default; and security updates and alerts always follow the default branch, so a vulnerability introduced on the integration branch stays invisible until release. | `.github/dependabot.yml` |
+| 2 | **✅ SATISFIED 2026-09-06 (RELPTR-7): all three ecosystems now carry `target-branch: "staging"`, pinned universally by `test/guards/branch-roles.test.ts`. The measurement below is what was true BEFORE the cutover.** **Dependabot follows the default branch.** Three ecosystems, zero `target-branch` overrides (`.github/dependabot.yml`), so its PRs target the default; and security updates and alerts always follow the default branch, so a vulnerability introduced on the integration branch stays invisible until release. | `.github/dependabot.yml` |
 | 3 | **PREPARED (RELPTR-4).** `aios-work-sync` fired on `pull_request` closed against `main` only, so merges elsewhere would have emitted nothing and **nothing would have closed a ticket**. It now fires on both `main` and `staging`, landed early because it is near-inert until contributions move. `scan-on-merge` was widened for the same reason — otherwise codebase readiness silently drops from per-merge to per-release. **The decision constraint 3 demanded is made: a ticket closes at INTEGRATION, not at release** (see §3.1b). **Still human at cutover:** nothing for this constraint. | `.github/workflows/aios-work-sync.yml` |
 | 4 | **PREPARED (RELPTR-5).** A review against the release branch after contributions move carries every unreleased commit. The review gate and attestation instructions now fetch and diff the same resolved contribution base from `scripts/branches.mjs`. **Still human at cutover:** change `CONTRIBUTION_BASE` and the enumerated prose that names a branch (§3.1c); the invariant is a fresh contribution-base diff. | `CLAUDE.md` §Review gate |
-| 5 | **`staging` is behind `main` and 0 ahead** (249 when slice 1 measured it; **257** on 2026-08-26 — it drifts further with every merge), and is branch-protected with its own (smaller) required set, so any strategy that gives it a new role begins with a fast-forward that protection has to be opened for. | `docs/CI-ARCHITECTURE.md` §Environments |
+| 5 | **✅ SATISFIED: `staging` was fast-forwarded 2026-09-05 and `main` back-merged into it 2026-09-06 (#681); `main` is now an ANCESTOR of `staging`, 0 ahead. Historical measurement follows.** **`staging` is behind `main` and 0 ahead** (249 when slice 1 measured it; **257** on 2026-08-26 — it drifts further with every merge), and is branch-protected with its own (smaller) required set, so any strategy that gives it a new role begins with a fast-forward that protection has to be opened for. | `docs/CI-ARCHITECTURE.md` §Environments |
 | 6 | **Bare `gh pr create` targets the default branch** absent a `branch.<name>.gh-merge-base` override (none is set here), and this repo's own attestation skill calls it without `--base`. Whatever the default is, tooling will follow it. | `.agents/skills/pr-review-attestation/SKILL.md` |
-| 7 | **Tags are deletable and re-pointable by anyone with write access.** Measured 2026-08-26: **zero** repository rulesets, and `repos/.../tags/protection` returns 404. Nothing in the repository can defend the facts the release-candidate gate reads — delete or move `v0.12.0` and assertions A and B are reading a different world. A **ruleset on `refs/tags/v*` denying deletion and update** is required. And note the sharp edge: installing it later does **not** invalidate a green context already minted, so it must exist **before the first candidate context is issued**. | live rulesets API (empty); `tags/protection` → 404 |
-| 8 | **Assertion D is false until `staging` is fast-forwarded.** The gate's fourth assertion — the candidate must be reachable from the integration branch — is what distinguishes "the release" from "some descendant of `main`". `staging` is **257 behind / 0 ahead**, so today every candidate fails D. That is correct and blocks nothing (the context is not required yet), but it means the fast-forward must happen **before the first release tag is cut**, or the first candidate reddens. | `scripts/release-candidate-guard.mjs`; live `git rev-list` |
+| 7 | **✅ SATISFIED 2026-09-06: a ruleset on `refs/tags/v*` (deletion / update / non-fast-forward) is `enforcement: active`. NOTE — it was first created `disabled`, which protects nothing; creating a ruleset is not enabling it. Historical measurement follows.** **Tags are deletable and re-pointable by anyone with write access.** Measured 2026-08-26: **zero** repository rulesets, and `repos/.../tags/protection` returns 404. Nothing in the repository can defend the facts the release-candidate gate reads — delete or move `v0.12.0` and assertions A and B are reading a different world. A **ruleset on `refs/tags/v*` denying deletion and update** is required. And note the sharp edge: installing it later does **not** invalidate a green context already minted, so it must exist **before the first candidate context is issued**. | live rulesets API (empty); `tags/protection` → 404 |
+| 8 | **✅ SATISFIED: `main` is an ancestor of `staging`, so a candidate reachable from `staging` satisfies both C and D. Historical measurement follows.** **Assertion D is false until `staging` is fast-forwarded.** The gate's fourth assertion — the candidate must be reachable from the integration branch — is what distinguishes "the release" from "some descendant of `main`". `staging` is **257 behind / 0 ahead**, so today every candidate fails D. That is correct and blocks nothing (the context is not required yet), but it means the fast-forward must happen **before the first release tag is cut**, or the first candidate reddens. | `scripts/release-candidate-guard.mjs`; live `git rev-list` |
 | 9 | **`statuses: write` is a third context-forging route, and it is how `nda-gate.yml` already works.** A workflow holding it can POST a commit status with ANY context name onto ANY sha, and commit statuses share the namespace branch protection reads. So a same-repository pull request adding a `pull_request` workflow that requests `statuses: write` could mint `Release candidate gate` on a commit the gate never examined, during its own PR run — structurally identical to the `contents: write` route. Mitigations today: the repo default is `read`, and `test/guards/workflow-permissions.test.ts` fails the build on any unallowlisted `contents`/`statuses`/`checks` write grant — the exemption for `nda-gate.yml` is **conditional on it keeping a `pull_request_target`-only trigger**, so a pull request that adds `pull_request:` to that file to run its own edited copy loses the exemption and reddens. **App pinning is NOT a mitigation here, and an earlier draft of this row wrongly said it was**: `GITHUB_TOKEN` is an installation token for the repository's GitHub Actions app, so a forged status and the genuine check carry the SAME app identity. Keep the app pinning for what it does buy (a third-party app cannot satisfy the context) and re-audit these grants when the gate becomes required. | `.github/workflows/nda-gate.yml`; live protection (app-pinned contexts) |
 
 ### 3.1a The release-candidate gate, and what making it required costs
@@ -129,8 +189,13 @@ in advance:
 > switch is thrown, not discovered during the first incident.
 
 **Operational note:** the tag push and the fast-forward are two acts, and the check needs time. Push
-the tag, wait for `Release candidate gate` to go green on that commit, *then* fast-forward `main`. A
-fast-forward attempted while the context is still pending is rejected.
+the tag, wait for `Release candidate gate` to go green on that commit, *then* fast-forward `main`.
+
+⚠️ **This paragraph used to end "a fast-forward attempted while the context is still pending is
+rejected", and that is FALSE for both actors** — §2 step 5 carries the measurement. The gate is not a
+required context on `main`, `enforce_admins` is false, and there is no bypass allowance: a non-admin
+is refused by "require a pull request" regardless of contexts, and an admin bypasses everything
+including a pending or red gate. The wait is discipline until RELPTR-8 lands.
 
 ### 3.1b When a ticket closes, and what this repo's automation actually does
 
@@ -166,33 +231,42 @@ file a human must change:
 2. **Prose that NAMES a branch** rather than pointing at the module — undetectable by any guard,
    because `main` is a legitimate token everywhere.
 3. **Every branch-protection change** — the release actor, making `Release candidate gate` required,
-   relocating `PR records a diff review`.
-4. **The `trusted-automation` environment's deployment branch policy — `main` only today — and it now
+   relocating `PR records a diff review`. **Status 2026-09-06:** `PR records a diff review` is
+   relocated (required on `staging`, removed from `main`) and `main` has `enforce_admins: false` so an
+   admin can perform the release fast-forward. **NOT done:** `Release candidate gate` is still not a
+   required context, and there is no bypass allowance — see §2 step 5 for what that means in practice.
+4. **The `trusted-automation` environment's deployment branch policy — now `[main, staging]`, widened 2026-09-06 BEFORE the default branch moved — and it
    gates all three `AIOS_*` consumers.** This entry has grown, and the earlier version of it is now
    wrong in a way worth naming: it said `aios-work-sync` and `scan-on-merge` "were deliberately
    pre-widened to both branches so cutover day would not have to remember them". The trigger lists
    still are. The **environment** is not, and after the credential-isolation fix all three workflows
    name it, so the policy is a cutover-day edit for every one of them:
 
-   - **`pr-task-link.yml`** — the trigger list AND the policy move together. It runs on
-     `pull_request_target`, so the run's ref is the pull request's target branch; once the environment
-     holds the credentials a `staging`-based run would be refused a `main`-only policy and go red — on
-     an advisory check that is never allowed to go red. Leaving its trigger at `[main]` instead makes
-     it go **dark** for `staging` pull requests: the safer failure, still a loss nobody would notice.
-     `test/guards/pr-task-link-credential-isolation.test.ts` pins that trigger to exactly `["main"]`
-     so the widening has to be deliberate.
-   - **`aios-work-sync.yml`** — trigger already `[main, staging]`, but it moved from `pull_request` to
-     `pull_request_target` to close the credential hole (the `merged == true` gate used to live in a
-     file the pull request could rewrite). Same consequence: the run's ref is the target branch, so a
-     `staging` merge would be refused the environment and go red having run zero steps, and **no work
-     event would post**. Loud, not silent — and inert only while nothing targets `staging`.
-   - **`scan-on-merge.yml`** — trigger already `[main, staging]`, on `push`, so the run's ref is the
-     pushed branch. A `staging` push would be refused the environment the same way. Nothing has pushed
-     `staging` since 2026-07-25.
+   ⚠️ **THE MECHANISM BELOW WAS WRONG FOR THE TWO `pull_request_target` WORKFLOWS, and the correction
+   changes what the ordering pair protects.** The original text said their run ref is *the pull
+   request's target branch*, so a `staging`-based run would be refused a `main`-only policy. GitHub
+   changed that effective **2025-12-08**: *"The workflow file and checkout commit will always be taken
+   from the repository's default branch, regardless of the pull request's base branch"*, and *"For
+   `pull_request_target`, environment rules evaluate against the default branch."*
+   ([changelog](https://github.blog/changelog/2025-11-07-actions-pull_request_target-and-environment-branch-protections-changes/))
 
-   So the cutover-day edit is one policy change (add `staging` to the environment's branch policy)
-   plus `pr-task-link.yml`'s trigger list. Do the policy **first**: widening it is inert until a
-   branch is actually used, whereas doing it late means red merge automation on the day.
+   - **`pr-task-link.yml`** (`pull_request_target`) — the environment is evaluated against the
+     **default** branch, so the base of a pull request never decides it, and the trigger list and the
+     policy are **independent**. Widening the trigger early was therefore harmless; leaving it at
+     `[main]` after the default moved made it go **dark** for `staging` pull requests — the safer
+     failure, still a loss nobody would notice. Now `[main, staging]`.
+   - **`aios-work-sync.yml`** (`pull_request_target`) — same evaluation, same conclusion. Its move from
+     `pull_request` closed a credential hole (the `merged == true` gate used to live in a file the pull
+     request could rewrite) and is unrelated to the branch question.
+   - **`scan-on-merge.yml`** (`push`) — **the one the old mechanism was right about.** A `push` run's
+     ref IS the pushed branch, and the 2025-12-08 change does not touch `push`. MEASURED 2026-09-05:
+     two `staging` pushes were refused a `main`-only policy and went red in 3 seconds having run zero
+     steps, with no scan posted.
+
+   So the real hazard is not the trigger widening at all — it is the **default-branch move**, after
+   which *every* `pull_request_target` run evaluates against the new default and a policy lacking it
+   refuses all of them at once. Do the policy **first**: widening it is inert until the default moves
+   or a branch is actually pushed, whereas doing it late means red automation across the whole repo.
 
    A related manual step, **not** a cutover item and **not** to be done in the pull request that
    enrolled these workflows: the three values still exist as repository-level secrets, which GitHub
@@ -238,8 +312,10 @@ read failures are fatal. Exclusions: `docs/design/**` and `docs/archive/**` (his
 Not a total order — these are the adjacencies where getting it backwards causes the incident:
 
 ```yaml
-cutover: pending
+cutover: done                      # 2026-09-06, RELPTR-7
 order:
+  - widen-trusted-automation-policy: BEFORE the default branch moves   # the one that bit us
+  - reconcile-main-into-staging: before any release candidate          # main must be an ANCESTOR
   - fast-forward-staging: before retargeting any contribution flow
   - declare-tag-in-DEFAULT_TAGS: before cutting the tag
   - release-actor-protection: before the first fast-forward push to main
@@ -251,6 +327,11 @@ order:
   - fast-forward-staging: before any candidate tag is pushed
   - work-sync-and-scan-widened: DONE (RELPTR-4), before contributions move
   - dependabot-target-branch: at the cutover, never before (it would aim at a stale branch)
+  - tag-ruleset-ENFORCEMENT-active: DONE 2026-09-06   # shipped `disabled`; creating is not enabling
+  # CONSEQUENCE, now live: ruleset 22363258 over refs/tags/v* denies deletion, update and
+  # non-fast-forward with ZERO bypass actors — so a pushed `v*` tag is PERMANENT for everyone,
+  # admins included. A tag that reddens the gate burns that version number; fix forward to the next
+  # patch. `.claude/skills/cut-release` verifies B/C/D LOCALLY before the push for this reason.
 ```
 
 The `workflow-on-main` pair is this repository's own scar tissue: `docs/CI-ARCHITECTURE.md` records that switching on
@@ -374,3 +455,149 @@ Two limits worth stating rather than discovering, both found in review:
 That rule is not a nuisance. Its own comment explains it: a hardcoded list *"rots SILENTLY — the lane
 would keep upgrading from an ever-staler state and stay green, which is the exact failure shape this
 file exists to remove."*
+
+---
+
+## 5. Before main's release policy is armed — the commissioning run (AIO-1124)
+
+`scripts/staging-ops/main-policy.mjs` builds main's three release rulesets, and
+`verifyEffectiveMainPolicy` evaluates them. Everything that has ever been said about what those
+rules DO, however, has been said by a test asserting a **model** of GitHub's rules. Nothing has
+measured what the provider actually does when the normal App, the emergency App and a human admin
+each push, force-push, delete and merge against that policy — so arming it on `main` would be the
+first time anyone found out.
+
+The commissioning harness is one bounded, manually dispatched, disposable experiment that measures
+it, and then deletes everything it made:
+
+| Piece | What it is |
+|---|---|
+| `.github/workflows/release-policy-commissioning.yml` | The manual protected workflow. A closed three-way `mode` input selects one of three reviewed job sets: `commission` (credential-free `intent`, the `fixture` check producer, and the two protected actor jobs), `policy-witness` (one non-protected publisher job, alone) or `transport-rehearsal` (one inert, no-secrets job, alone). |
+| `scripts/staging-ops/policy-commissioning.mjs` | The closed-CLI runner. Nine phases, three flags, no ref/repo/endpoint/actor override anywhere. |
+| `scripts/staging-ops/commissioning-witness.mjs` | The local policy witness's challenge/response contract, its narrow governed-policy projection, and its bounded single-entry archive reader. |
+| `scripts/staging-ops/commissioning-case.mjs` | The closed per-case stage enum and the private per-job state store that carries a case's nonce and fsynced mutation marker between steps. |
+| `scripts/staging-ops/commissioning-journal.mjs` | Two mode-0600 append-only hash-chained local journals — the resource journal and the witness journal — each with its own run-scoped lock. |
+
+**Why the actor jobs measure the policy through a LOCAL WITNESS.** GitHub documents that
+`GET /repos/{repo}/rulesets/{id}` returns `bypass_actors` only to a caller with **write access to the
+ruleset**, and the protected jobs hold `metadata: read` by design. A 200 with the bypass matrix absent
+is therefore the correct response to that credential — not a transient failure — so a protected job
+**cannot** measure the complete policy it is being tested against, and the emergency App's whole
+acceptance depends on that bypass matrix. The rejected alternatives are worth naming: granting the
+release Apps repository Administration would give a release identity power over the policy it is being
+tested against; granting them `actions: write` to self-dispatch would let the subject trigger its own
+examination; a third attestor App is a new credential the spec forbids.
+
+So the existing **local `johnellison` identity**, which already holds admin, is the complete-policy
+measurement authority. Per case: the actor job publishes a challenge carrying a fresh private 256-bit
+nonce; the local witness reads it, measures the full governed policy under admin, and dispatches this
+same reviewed workflow in `policy-witness` mode with a bounded response envelope; the one publisher job
+republishes those exact bytes as a single-entry artifact; the actor downloads it, binds it to its own
+nonce and source, runs the production verifier on the complete governed set, and only then mutates. The
+pair of observations (before and after the mutation) is what bounds the measurement.
+
+> ⚠️ **This is a bounded contemporaneous pre/post measurement under administrative quiescence, NOT an
+> atomic policy-at-mutation proof.** An undetected transient policy change followed by restoration is
+> outside the guarantee. Root must establish a quiet commissioning window; a known concurrent policy
+> writer interrupts the run. Every policy record in the packet carries that sentence, and
+> `check-evidence` refuses a packet that drops it or restates it as an atomicity claim.
+>
+> GitHub authenticates the publisher's actor, the immutable source it ran and the artifact bytes. It
+> does **not** attest that John's report is true. The nonce is a one-use CORRELATION value whose
+> artifact is readable — not a secret — and publication is an explicit narrow disclosure of the
+> commissioning policies' nonsecret governed fields, visible to anyone with Actions artifact access.
+
+**What it cannot do, by construction.** It never promotes `main`, never mutates `main`/`staging`
+protection, never cuts a tag, never deploys Railway and never accepts a release. Every mutable target
+is DERIVED inside the runner from the GitHub run ID and attempt
+(`refs/heads/aios-policy-commissioning/run-<runId>-<attempt>-{normal,emergency,human,pr-head}`), and
+an independent request boundary enforces a verb + endpoint + body allowlist, so routing a call through
+a helper cannot reach a target the guard would refuse. There is no input to type a target into.
+
+**Four things it measures rather than assumes**, because each was a place where a green result would
+otherwise have meant less than it appeared to:
+
+- **The App grants, before any credential is exercised.** Each protected job signs an App JWT from its
+  own private key and reads `GET /app` and `GET /app/installations/<id>`; the installation's granted
+  permissions must equal the closed set for that role exactly, and the installation must be
+  selected-repository and unsuspended. An extra grant refuses there, before the first write.
+- **The policy in force on its own ref, by BODY — from the local witness.** The job re-derives the plan
+  and requires the manifest to agree with that derivation, then runs the complete inverse-transformed
+  compatibility check on the witness's **full governed measurement** (bypass matrix included) plus its
+  measured classic-protection representation. A same-named ruleset whose rules were rewritten after the
+  human approved is refused, not accepted, and the pre/post pair must agree — a complete governed
+  policy that changed across the mutation window stops the case.
+- **The pull request's current target, immediately before the merge attempt.** Both repositories, both
+  refs, the state and the head SHA — and the merge itself carries that head SHA as a condition. A
+  retargeted pull request would otherwise put a real merge into a production ref under the local admin
+  credential, and the case's own readback of the disposable ref could not have detected it.
+- **Both `main` and `staging`**, resolved to complete ruleset definitions over complete pagination.
+  Staging is the dispatch branch and the contribution base; measuring only main and then reporting
+  "production unchanged" would be a claim about half of production.
+
+**The operator sequence.** Root dispatches the workflow, reads the exact run, and drives the local
+phases with the MEASURED run ID and attempt — never a guessed one:
+
+```sh
+# 0. THE TRANSPORT REHEARSAL, first and separately. Actions → Run workflow → branch `staging`,
+#    mode `transport-rehearsal`. It is inert: no App key, no ref, no policy, no enforcement
+#    verdict — it measures only whether the dispatch → publish → download → bind path works
+#    inside this harness's queue and clock bounds, BEFORE any protected approval exists. Serve it
+#    with the local witness below, using that rehearsal run's own ID. A failed rehearsal does not
+#    authorize broader infrastructure or relaxed bounds; its response can satisfy no actor case.
+
+# 1. Actions → "Release policy commissioning (AIO-1124)" → Run workflow → branch `staging`,
+#    mode `commission`. Then download the intent artifact into $COMMISSIONING_EVIDENCE_DIR
+#    (an absolute private 0700 dir).
+node scripts/staging-ops/policy-commissioning.mjs setup         --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --evidence-dir "$COMMISSIONING_EVIDENCE_DIR"
+
+# 2. START THE LOCAL WITNESS, in its own shell, BEFORE the approvals. It holds its own read-only
+#    journal lock, so it runs concurrently with `human-tests` rather than blocking on it, and it
+#    polls for work that does not exist yet — that is the normal beginning of a run. It serves
+#    READY WORK ACROSS BOTH ROLES: approving emergency before normal is a supported ordering, and
+#    a role with nothing published yet is skipped rather than waited on, so neither role's
+#    challenges can expire queued behind the other's. Its exit 0 means all 22 assigned cloud-case
+#    responses were published and reconciled; it is never a pass. If it is restarted, it reconciles
+#    any dispatch already in flight from its own journal and never re-sends a consumed nonce.
+node scripts/staging-ops/policy-commissioning.mjs witness       --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --evidence-dir "$COMMISSIONING_EVIDENCE_DIR" &
+
+# 3. Inspect the setup readback and the exact immutable runner code, THEN approve the two
+#    protected environments in the GitHub UI. That approval is the PC-06 evidence; nothing
+#    in the workflow can produce it.
+node scripts/staging-ops/policy-commissioning.mjs human-tests    --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --evidence-dir "$COMMISSIONING_EVIDENCE_DIR"
+
+# 4. Stop the witness once both actor jobs have finished, then collect and clean up. Every local
+#    phase — including cleanup and collect — re-measures the named operator (`johnellison`,
+#    #5806135, type User, repository admin) before it can reach the journal or the transport.
+node scripts/staging-ops/policy-commissioning.mjs collect        --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --evidence-dir "$COMMISSIONING_EVIDENCE_DIR"
+node scripts/staging-ops/policy-commissioning.mjs cleanup        --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --evidence-dir "$COMMISSIONING_EVIDENCE_DIR"
+node scripts/staging-ops/policy-commissioning.mjs check-evidence --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --evidence-dir "$COMMISSIONING_EVIDENCE_DIR"
+```
+
+**The witness is a prerequisite, not an optional extra.** Each cloud case blocks on its pre and post
+witness responses within a 180-second challenge lifetime that is never extended. If the witness is not
+running, every case times out as `incomplete` after two human approvals have already been spent — which
+is why step 0 exists and why step 2 comes before step 3.
+
+**Read each phase's exit code.** `0` is that phase's affirmative success, `1` a measured assertion
+failure, `2` an invalid invocation, `3` incomplete or ambiguous evidence. Do NOT chain these with
+`&&`/`;` and read the last line: `collect` before cleanup is *expected* to exit 3, and the difference
+between 1 and 3 is the difference between "the policy is wrong" and "we could not look".
+
+**`check-evidence` is the authoritative gate, it trusts nothing for its filename, and passing it is
+still not authorization.** It re-derives every case outcome from the run's own **frozen synthetic
+graph** — so a no-op recorded as a permitted write, or a force flag on a ref that never moved, is a
+blocker rather than a pass — re-classifies each recorded diagnostic against this build's closed table
+rather than reading the record's `policyDenial` boolean, recomputes each declared check expectation
+from its per-context measurement, counts a case only from its own actor's file, requires exactly 22
+distinct witness publications with distinct nonces and artifacts, recomputes cleanup drift from the two
+baselines the file carries rather than reading its `production_drift`, compares the reported resource
+inventory against the verified journal, requires the two App identities to be distinct and to be the
+ones the immutable intent configured, requires the human reviewer's numeric identity and a successful
+protected job in the exact attempt, and re-hashes each PC-06 environment proof from the artifact on
+disk — including that the artifact's own recorded observation is about that control, on that
+environment, with that measured value. And
+then: a complete actor matrix says the mechanics behave as designed on disposable refs. It does not say
+the twelve real production context producers ran, and it is not a decision to change main's policy —
+that remains a separate, root-owned step with its own gates. The runbook, the prerequisites, and what a
+DELIBERATELY-unverified PC-06 control looks like are in `docs/OPS.md` §14.

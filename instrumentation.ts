@@ -7,6 +7,11 @@
 import * as Sentry from "@sentry/nextjs";
 
 export async function register() {
+  const { isCopiedStagingRuntime } = await import("@/lib/staging/runtime-policy");
+  if (isCopiedStagingRuntime()) {
+    console.info("[boot] copied staging: all in-process schedulers and telemetry transports are disabled");
+    return;
+  }
   // Initialize the runtime-appropriate Sentry SDK. Each config is a no-op
   // unless its DSN env var is set, so this is inert without configuration.
   if (process.env.NEXT_RUNTIME === "nodejs") {

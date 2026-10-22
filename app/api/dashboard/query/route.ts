@@ -15,6 +15,8 @@ import {
   appendMessage,
 } from "@/lib/chat/store";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
+import { copiedStagingSpendAllowed } from "@/lib/staging/runtime-policy";
+import { INGEST_DISABLED_CODE, INGEST_DISABLED_MESSAGE, manualIngestionVerdict } from "@/lib/staging/ingest-policy";
 import { runAnswerTurn } from "@/lib/query/stream-persist";
 import { createRun } from "@/lib/query/turn-runs";
 import { isSyncCommand, runManualSync } from "@/lib/ingest/manual-sync";
@@ -142,10 +144,31 @@ export async function POST(req: NextRequest) {
     if (isRestrictedTier(memberTier)) {
       return errorResponse("forbidden", "scraping is available to team members only", 403);
     }
+    // AC-07: connector ingestion is disabled on a copied staging deployment. Named JSON refusal
+    // rather than an SSE stream whose only content is the refusal, and BEFORE the rate limit — a
+    // request that cannot run must not consume the caller's scrape allowance. `runManualSync` refuses
+    // again underneath (it is also reachable from the CLI); this one exists so the surface says so.
+    const ingestGate = await manualIngestionVerdict();
+    if (!ingestGate.allowed) {
+      return errorResponse(INGEST_DISABLED_CODE, ingestGate.message ?? INGEST_DISABLED_MESSAGE, 503);
+    }
     if (!(await rateLimit(db, `${me.id}:sync`, 2))) {
       return errorResponse("rate_limited", "2 scrapes/min per member — try again shortly", 429);
     }
     return syncResponse(db, team.id, me.id);
+  }
+
+  // AC-07 (M9): the same explicit disabled outcome the API route returns, in the same position —
+  // after session auth, membership and posture are resolved (so it leaks nothing to a stranger),
+  // and before the rate-limit/daily-quota reads and the `query_log` insert (so a disabled feature
+  // does not spend the member's budget). Placed after the `/sync` branch so the non-LLM scrape
+  // command keeps its own existing tier and rate rules.
+  if (!copiedStagingSpendAllowed("interactive-query")) {
+    return errorResponse(
+      "answering_disabled",
+      "this deployment is a copied staging environment: model-backed answering is disabled; graph-backed and full-text reads remain available",
+      503,
+    );
   }
 
   if (!(await rateLimit(db, `${me.id}:query`, 10))) {
@@ -218,7 +241,7 @@ export async function POST(req: NextRequest) {
 
   // Per-team provider keys + models + the explicit answering-backend override (null fields → env
   // fallback in streamAnswer; `activeProvider` forces a backend, else selectLlmBackend precedence).
-  const keys = await resolveAnsweringKeys(db, team.id);
+  const keys = await resolveAnsweringKeys(db, team.id, "interactive-query");
 
   // DEFERRED, deliberately (review: "no idempotency or active-run guard"). Two tabs — or a client that
   // re-POSTs after losing the SSE — start two turns in one conversation: two answers, two spend rows,

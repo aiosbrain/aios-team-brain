@@ -1,6 +1,6 @@
 [project]
 name = "aios-ingest"
-version = "0.1.0"
+version = "0.2.0"
 description = "AIOS Team Brain ingestion sidecar — imports open-source readers (LlamaHub, Unstructured) and pushes normalized content into the brain over HTTP."
 readme = "README.md"
 requires-python = ">=3.11"
