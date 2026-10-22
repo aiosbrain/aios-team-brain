@@ -376,7 +376,10 @@ export function scanRange(terms, rangeSpec, { revealLines = false, cwd = process
     }
     const destinationPaths = [...new Set(changedEntries.map((entry) => entry.path))];
     changedPathCount += destinationPaths.length;
-    if (changedPathCount > 2_000) throw new Error("confidential-pattern scan could not run");
+    // A runaway-scan bound, not a coverage choice. 2,000 refused the v0.13.0 promotion range
+    // (3,483 cumulative paths; merge commits count against both parents), which a GNU-grep run of
+    // this scanner covers in about 4 minutes, inside the gate job's 10-minute timeout.
+    if (changedPathCount > 5_000) throw new Error("confidential-pattern scan could not run");
     const currentSubmodules = new Set(submodulePaths(cwd, commit));
 
     const corpus = [];
