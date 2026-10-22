@@ -896,7 +896,9 @@ describe("CDCAPPEND-1: append churn is a bound, not a number", () => {
           observed = Math.max(observed, depth);
         }
     expect(observed, "no boundary moved at all — the assertion above ran on nothing").toBeGreaterThan(0);
-  });
+    // A CPU-bound sweep over every repo doc: it grows with the repo, and under V8 coverage on Node 22 it
+    // ran ~5.5s in CI (vs under 5s on Node 20), past vitest's default. The bound is on correctness, not speed.
+  }, 30_000);
 
   it("CAPPED FIXTURE: the SHARED PREFIX must reach the cap — 'the document is past the cap' does not", () => {
     // The characterisation this fixture exists to kill was in the proposed replacement row, which would
