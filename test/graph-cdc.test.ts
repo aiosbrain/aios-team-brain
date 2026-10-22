@@ -781,7 +781,10 @@ describe("CDCCHURN-1: in-place same-length churn is the number of chunks the edi
  * `--exclude` is load-bearing: the design documents are the corpus, so a document publishing a
  * distribution is inside it — an earlier draft's table had already gone stale by the time it was read.
  */
-describe("CDCAPPEND-1: append churn is a bound, not a number", () => {
+// The LIVE CORPUS sweeps below are CPU-bound over every repo doc and grow with the repo. Under V8 coverage
+// on Node 22 they run ~4.5x slower than on Node 20 (1.2s -> 5.3s in CI for the slowest; plain runs are
+// ~0.6s on both), past vitest's 5s default. These tests bound correctness, not speed.
+describe("CDCAPPEND-1: append churn is a bound, not a number", { timeout: 30_000 }, () => {
   const changedCount = (before: string[], after: string[]): number => {
     const seen = new Set(before);
     return after.filter((c) => !seen.has(c)).length;

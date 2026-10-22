@@ -153,7 +153,7 @@ describe("paired refresh isolated harness", () => {
       .toBeLessThan(dockerfile.indexOf("USER node"));
     // This is the HARNESS image. The production Dockerfile is a different file and is untouched —
     // it does not run `next dev` and never had this failure.
-    expect(dockerfile).toContain("FROM node:20-bookworm-slim");
+    expect(dockerfile).toContain("FROM node:22-bookworm-slim");
   });
 
   it("role containers cannot route to the opposite database network", () => {

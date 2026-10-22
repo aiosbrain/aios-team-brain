@@ -925,7 +925,7 @@ Run these **in this order**:
    earlier version of this runbook used a `sh -c '…'` prefix; the pre-push review proved it executed
    `sh -c 'sh -c echo …'`, ran a bare `echo`, and printed a refusal on a **correctly configured**
    staging. It failed closed, and it never worked. There is also **no `curl` in the image**
-   (`node:20-bookworm-slim`, no `apt-get`) — the script uses Node's own `fetch`.
+   (`node:22-bookworm-slim`, no `apt-get`) — the script uses Node's own `fetch`.
 
    **What it does** (`scripts/staging-graph-clear.mjs`, unit-tested in
    `test/staging-graph-clear.test.ts`): it refuses unless **BOTH** hold —
@@ -1084,7 +1084,7 @@ is an older-release recovery option; current STAGINGMARK-2 deployments perform m
 
 ## 12. Publishing the ops runner image — `staging-ops-image.yml` (AIO-997)
 
-The ops runner (`docker/staging-ops.Dockerfile` — Node 20, PG18 clients, `tini` as a child subreaper)
+The ops runner (`docker/staging-ops.Dockerfile` — Node 22 (≥22.23.4, floor-checked at build), PG18 clients, `tini` as a child subreaper)
 is what holds the fences during a paired refresh. Commissioning it on Railway requires **branchless
 runners pinned to immutable registry digests**; a local test image and a Railway source build are
 neither published nor addressable by digest. This workflow is the one path that produces that

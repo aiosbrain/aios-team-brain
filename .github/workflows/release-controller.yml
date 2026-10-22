@@ -59,7 +59,8 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "22"
+          check-latest: true # runner caches can predate the eMudhra trust-store fix (22.23.4)
           cache: npm
       - run: npm ci --ignore-scripts
       - name: Measure and authorize exact candidate
@@ -115,7 +116,8 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "22"
+          check-latest: true # runner caches can predate the eMudhra trust-store fix (22.23.4)
           cache: npm
       - run: npm ci --ignore-scripts
       - name: Record break-glass authorization before update

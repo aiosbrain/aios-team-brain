@@ -65,13 +65,8 @@ export function parseEnvFile(text) {
   return out;
 }
 
-export function checkNode(version = process.versions.node) {
-  const major = Number.parseInt(String(version).split(".")[0], 10);
-  if (!Number.isFinite(major)) return { status: FAIL, detail: `unrecognized node version ${version}` };
-  return major >= 20
-    ? { status: OK, detail: `node ${version}` }
-    : { status: FAIL, detail: `node ${version} — package.json requires >=20`, fix: "install Node 20 or newer" };
-}
+import { NODE_TLS_FLOORS, checkNode } from "./node-tls-floor.mjs";
+export { NODE_TLS_FLOORS, checkNode };
 
 export function checkDatabaseUrl(value) {
   if (!value) {

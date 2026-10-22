@@ -19,11 +19,14 @@ import {
   checkMailer,
   checkModelProvider,
   checkNode,
+  NODE_TLS_FLOORS,
   checkPgSsl,
   checkSecretsKey,
   parseEnvFile,
   summarize,
 } from "../scripts/doctor.mjs";
+
+const ROOT = path.resolve(__dirname, "..");
 
 describe("parseEnvFile", () => {
   it("agrees with `sh` on the forms .env.local actually uses", () => {
@@ -193,10 +196,34 @@ describe("embeddings width — a mismatch degrades silently at query time", () =
 });
 
 describe("node runtime", () => {
-  it("requires >=20 per package.json engines", () => {
+  it("requires a supported line at or past its eMudhra trust-store fix", () => {
     expect(checkNode("18.19.0").status).toBe(FAIL);
-    expect(checkNode("20.11.0").status).toBe(OK);
-    expect(checkNode("22.3.0").status).toBe(OK);
+    expect(checkNode("20.19.0").status).toBe(FAIL); // EOL: never gets the fix
+    expect(checkNode("22.23.3").status).toBe(FAIL);
+    expect(checkNode("22.23.4").status).toBe(OK);
+    expect(checkNode("v22.30.0").status).toBe(OK);
+    expect(checkNode("23.11.0").status).toBe(FAIL);
+    expect(checkNode("24.19.0").status).toBe(FAIL);
+    expect(checkNode("24.22.1").status).toBe(OK);
+    expect(checkNode("26.12.1").status).toBe(OK);
+  });
+
+  it("is the same floor table the Dockerfile and install.sh enforce", () => {
+    const dockerfile = readFileSync(path.join(ROOT, "Dockerfile"), "utf8");
+    const opsDockerfile = readFileSync(path.join(ROOT, "docker", "staging-ops.Dockerfile"), "utf8");
+    const install = readFileSync(path.join(ROOT, "install.sh"), "utf8");
+    for (const [major, floor] of Object.entries(NODE_TLS_FLOORS)) {
+      expect(dockerfile).toContain(`${major}:"${floor}"`);
+      expect(opsDockerfile).toContain(`${major}:"${floor}"`);
+      expect(install).toContain(`${major}) floor=${floor}`);
+    }
+    // …and neither carries a line the table doesn't, nor package.json's engines.
+    const n = Object.keys(NODE_TLS_FLOORS).length;
+    expect(dockerfile.match(/\d+:"\d+\.\d+\.\d+"/g)).toHaveLength(n);
+    expect(opsDockerfile.match(/\d+:"\d+\.\d+\.\d+"/g)).toHaveLength(n);
+    expect(install.match(/^\s*\d+\) floor=/gm)).toHaveLength(n);
+    const engines = JSON.parse(readFileSync(path.join(ROOT, "package.json"), "utf8")).engines.node;
+    expect(engines).toBe(Object.values(NODE_TLS_FLOORS).map((f) => `^${f}`).join(" || "));
   });
 });
 
@@ -204,5 +231,27 @@ describe("summarize", () => {
   it("exits non-zero only on failures, so warnings never block a valid install", () => {
     expect(summarize([{ status: OK }, { status: WARN }]).exitCode).toBe(0);
     expect(summarize([{ status: OK }, { status: FAIL }]).exitCode).toBe(1);
+  });
+});
+
+describe("the doctor CLI runs end to end", () => {
+  // Unit tests import the checks; nothing else executes the script. A re-export that never bound
+  // `checkNode` locally passed every import-level test and crashed `npm run doctor` (review r4).
+  it("prints the node line and never the crash banner", () => {
+    let out = "";
+    try {
+      out = execFileSync(process.execPath, [path.join(ROOT, "scripts", "doctor.mjs"), "--no-db"], {
+        cwd: ROOT,
+        encoding: "utf8",
+        env: { PATH: process.env.PATH ?? "" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (err) {
+      // Exit 1 is a legitimate "not ready" verdict on a bare environment; only the output matters.
+      const e = err as { stdout?: string; stderr?: string };
+      out = `${e.stdout ?? ""}${e.stderr ?? ""}`;
+    }
+    expect(out).not.toMatch(/doctor failed/);
+    expect(out).toMatch(/node\s+node \d+\.\d+\.\d+/);
   });
 });

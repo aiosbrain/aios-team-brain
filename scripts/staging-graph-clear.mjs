@@ -6,7 +6,7 @@
  * review proved it never fired: `railway ssh -- sh -c '…'` joins argv with spaces and wraps the
  * RESULT in its own `sh -c`, so the inner `sh -c echo "$GRAPHITI_URL" | grep …` ran a bare `echo`,
  * the grep saw an empty line, and the command printed "REFUSED" and exited 0 on a correctly
- * configured staging. `curl` is not in the image either (`node:20-bookworm-slim`, no `apt-get`).
+ * configured staging. `curl` is not in the image either (`node:22-bookworm-slim`, no `apt-get`).
  * A one-liner in a doc cannot be tested; this can, and is.
  *
  * WHY IT IS PURE NODE WITH `fetch` AND NOTHING ELSE. It needs no database and no bolt driver — the

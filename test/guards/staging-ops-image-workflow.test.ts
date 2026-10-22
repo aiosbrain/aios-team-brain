@@ -396,6 +396,8 @@ describe("guard: the publisher stays separate from the release and CI lanes", ()
     const used = (raw.match(/uses:\s*(\S+)/g) ?? []).map((m) => m.replace(/uses:\s*/, ""));
     expect(new Set(used)).toEqual(new Set([
       "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1", // v7, the revision already pinned elsewhere in this repo
+      // v7, the revision nda-gate.yml pins; installs a Node carrying the eMudhra trust-store fix
+      "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
       "docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f", // v3
       "docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9", // v3
       "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8", // v6

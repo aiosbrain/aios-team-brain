@@ -1,7 +1,8 @@
 # Third-party licenses
 
 `aios-ingest` is **Apache-2.0** licensed. It imports the following open-source components. All are
-permissive (MIT / Apache-2.0 / BSD) and compatible with redistribution under Apache-2.0.
+permissive (MIT / Apache-2.0 / BSD) or, for certifi, MPL-2.0 used unmodified — all compatible with
+redistribution under Apache-2.0.
 
 | Component | Purpose | License |
 |-----------|---------|---------|
@@ -11,6 +12,7 @@ permissive (MIT / Apache-2.0 / BSD) and compatible with redistribution under Apa
 | llama-index-core (transitive) | reader runtime | MIT |
 | unstructured | binary/document text extraction | Apache-2.0 |
 | httpx | HTTP client | BSD-3-Clause |
+| certifi | CA bundle (floored at 2026.10.19 for the eMudhra fix) | MPL-2.0 (unmodified, file-level copyleft) |
 | pydantic | payload validation | MIT |
 | fastapi | webhook receiver | MIT |
 | uvicorn | ASGI server | BSD-3-Clause |

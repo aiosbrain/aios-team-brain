@@ -12,9 +12,18 @@
 # slimmer `--omit=dev` runtime would need `output: "standalone"` in next.config.ts and a
 # separate seeding image — that is DOCKERPROD-1, deliberately not this slice.
 
-FROM node:20-bookworm-slim AS base
+FROM node:22-bookworm-slim AS base
 WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
+
+# Node TRUST-STORE FLOOR. Node verifies TLS against its OWN compiled-in root store, not Debian's, so
+# the only way to drop a compromised CA is to run a Node that has dropped it. 22.23.4 is the first 22.x
+# that rejects the eMudhra intermediates whose private keys were recovered from their public
+# certificates (disclosed 2026-10-20; anyone can mint a "valid" cert for any host under them). Node 20
+# is EOL and will never get that fix. The floating tag above is what keeps future fixes arriving; this
+# line is what stops a cached base layer from quietly shipping an older 22.x. Same table as
+# scripts/doctor.mjs NODE_TLS_FLOORS and install.sh (test/doctor.test.ts fails if they drift).
+RUN node -e 'const floors={22:"22.23.4",24:"24.22.1",26:"26.12.1"}; const v=process.versions.node; const f=floors[v.split(".")[0]]; const n=s=>s.split(".").map(Number); const [a,b]=[n(v),f?n(f):null]; const ok=f && (a[1]>b[1] || (a[1]===b[1] && a[2]>=b[2])); if (!ok) { console.error(f ? "node "+v+" predates the eMudhra trust-store fix (need >="+f+")" : "node "+v+" is not a supported line (need one of "+Object.values(floors).join(" / ")+"); add its first fixed release to this table and scripts/node-tls-floor.mjs"); process.exit(1); }'
 
 # ── deps: cached on the lockfile alone, so source edits don't reinstall ──────
 FROM base AS deps

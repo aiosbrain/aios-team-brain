@@ -113,7 +113,7 @@ concluding the product is broken:
 
 | | |
 |---|---|
-| **1 · A host** | anything that builds a Next.js app — **Node ≥ 20**. We recommend **Railway**: it detects the app, ships Postgres with pgvector already enabled, and adds Neo4j in one click if you later want the context engine. Nothing in the code depends on it |
+| **1 · A host** | anything that builds a Next.js app — **Node 22.23.4+** (or 24.22.1+ / 26.12.1+). We recommend **Railway**: it detects the app, ships Postgres with pgvector already enabled, and adds Neo4j in one click if you later want the context engine. Nothing in the code depends on it |
 | **2 · Postgres 16+** | the source of truth — every item, task, decision and attribution |
 | **3 · Two secrets** | `AUTH_SECRET` signs sessions, `SECRETS_KEY` encrypts connector tokens at rest. Each is one generated command |
 
@@ -184,7 +184,7 @@ Everything below is that sequence in dependency order, with the failure modes ca
 
 ### 1.1 Runtime and tooling
 
-**To deploy it**, your host needs to build a standard Next.js app — **Node ≥ 20** — and give it a
+**To deploy it**, your host needs to build a standard Next.js app — **Node 22.23.4+** (or 24.22.1+ / 26.12.1+; older patches trust the compromised eMudhra CAs) — and give it a
 **Postgres 16 or newer** database. Nothing else. Railway and Render detect this automatically.
 
 **On your own machine** you only need tooling if you're going to run the admin CLI, the ingestion
@@ -192,7 +192,7 @@ sidecar, or the app itself:
 
 | Tool | Version | Needed for |
 |---|---|---|
-| **Node** | **≥ 20** (`package.json` engines; CI pins 20) | the admin CLI, and local development |
+| **Node** | **22.23.4+**, 24.22.1+ or 26.12.1+ (`package.json` engines; CI pins 22; `npm run doctor` checks it) | the admin CLI, and local development |
 | **npm** | bundled with Node | no pnpm/yarn lockfile — `package-lock.json` only |
 | **psql** | any recent | diagnostics; required by `scripts/e2e.sh` |
 | **Docker** | any recent | local Postgres, the test tiers, and the Graphiti stack |

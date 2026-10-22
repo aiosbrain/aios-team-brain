@@ -98,7 +98,7 @@ slice put the whole thing inline in the runbook. The pre-push review proved — 
 never fired: the CLI joins everything after `--` with spaces and wraps the result in its own `sh -c`,
 so an inner `sh -c 'echo … | grep … && curl …'` executed a bare `echo`, the grep saw an empty line, and
 a **correctly configured** staging printed a refusal and exited 0. `curl` is not in the image either
-(`node:20-bookworm-slim`, no `apt-get`). And `A && B || C` reported every request failure — sidecar
+(`node:22-bookworm-slim`, no `apt-get`). And `A && B || C` reported every request failure — sidecar
 down, 5xx, missing binary — as "REFUSED: not an internal host", so the line called the whole safety
 argument was also the line whose failure message lied.
 

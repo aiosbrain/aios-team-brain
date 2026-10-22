@@ -1,4 +1,6 @@
-FROM node:20-bookworm-slim
+FROM node:22-bookworm-slim
+# Node 22.23.4 is the first 22.x with the eMudhra trust-store fix; a stale base layer fails the build.
+RUN node -e 'const floors={22:"22.23.4",24:"24.22.1",26:"26.12.1"}; const v=process.versions.node; const f=floors[v.split(".")[0]]; const n=s=>s.split(".").map(Number); const [a,b]=[n(v),f?n(f):null]; const ok=f && (a[1]>b[1] || (a[1]===b[1] && a[2]>=b[2])); if (!ok) { console.error(f ? "node "+v+" predates the eMudhra trust-store fix (need >="+f+")" : "node "+v+" is not a supported line (need one of "+Object.values(floors).join(" / ")+"); add its first fixed release to this table and scripts/node-tls-floor.mjs"); process.exit(1); }'
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl gnupg \

@@ -26,7 +26,7 @@ Each component is independent — adopt only the layers you want.
 - **RAM matters.** A 7–8B model at 64k context ≈ 13 GB; a 35B reasoning model
   ≈ 21–25 GB. On 32–36 GB, prefer an 8B as the everyday driver. Watch memory
   with `ollama ps` and `memory_pressure`.
-- Tools: `git`, `node 20+`, `ollama`, `bun` (for GBrain), `brew` (for llama.cpp),
+- Tools: `git`, `node 22.23.4+`, `ollama`, `bun` (for GBrain), `brew` (for llama.cpp),
   and `tailscale` (for the private gateway).
 
 ---

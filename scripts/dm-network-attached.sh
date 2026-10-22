@@ -20,7 +20,7 @@
 # only; nothing here changes `test:datamechanics{,:local,:iso}`.
 #
 # The runner image is `docker/staging-ops.Dockerfile`, reused rather than reinvented: it is already
-# Linux node 20 with a Linux `npm ci` and the Postgres client binaries the staging specs spawn.
+# Linux node 22 with a Linux `npm ci` and the Postgres client binaries the staging specs spawn.
 #
 # USAGE:
 #   bash scripts/dm-network-attached.sh                       # the affected specs (default set below)

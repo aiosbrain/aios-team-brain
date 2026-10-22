@@ -231,6 +231,7 @@ describe("guard: bounds, serialization and evidence (PUB-01, PUB-04)", () => {
     const used = (raw.match(/uses:\s*(\S+)/g) ?? []).map((m) => m.replace(/uses:\s*/, ""));
     expect(new Set(used)).toEqual(new Set([
       "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1", // v7
+      "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020", // v7; installs a Node carrying the eMudhra trust-store fix
       "docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f", // v3
       "docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9", // v3
       "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02", // v4

@@ -71,14 +71,20 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "22"
+          check-latest: true # the runner image's preinstalled Node can predate the eMudhra trust-store fix
+      - name: Refuse a Node that predates the eMudhra trust-store fix
+        run: node scripts/check-node-tls-floor.mjs
 
       # Now that the trusted tree IS the tree, re-assert the same context AND measure what actually
       # got checked out: "we asked for the immutable SHA" and "we are standing on it" are different
       # claims, and only the second one is evidence.
       #
-      # The helper is dependency-free (node builtins only) and runs on the runner's preinstalled
-      # Node, so there is no `setup-node`, no `npm ci`, and no third-party code executing outside
-      # the Dockerfile with `packages: write` in scope.
+      # The helper is dependency-free (node builtins only) and runs on GitHub's own `actions/setup-node`
+      # (SHA-pinned, floor-checked above: the runner's preinstalled Node can predate the eMudhra fix), with
+      # no `npm ci` and no third-party code executing outside the Dockerfile with `packages: write` in scope.
       - name: Verify the checkout is the dispatch commit
         run: node scripts/staging-ops/image-publication.mjs verify-context
 
