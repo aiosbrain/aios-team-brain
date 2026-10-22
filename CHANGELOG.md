@@ -9,7 +9,38 @@ line go stale while the code moved on, so it is not restated.
 
 ## [Unreleased]
 
+## [0.13.1] — 2026-10-22
+
+### Security
+
+- **AIO-1238 — patched trust stores for the eMudhra CA compromise (#746).** Eight eMudhra
+  intermediate CAs have recoverable private keys, so an unpatched client trusts a forged certificate
+  for any domain. The app image moves from Node 20 (EOL, never patched) to Node 22 with a build-time
+  floor of 22.23.4 (24.22.1 / 26.12.1 on other lines); `npm run doctor`, `install.sh` and
+  `engines` enforce the same table. Graphiti and ingestion pin certifi 2026.10.19. Staging's release,
+  commissioning and ops-image workflows, and the four workflows that carry a credential without
+  `npm ci`, install a current Node and refuse an older one before their first `node` step.
+- **Postgres TLS can verify against a pinned CA (#751).** `lib/db/pg/ssl.mjs` is the single owner of
+  every connection's `ssl` option. With `PG_CA_CERT` set it verifies the chain against that CA
+  (libpq `verify-ca`; `PG_TLS_VERIFY_HOSTNAME=1` or `sslmode=verify-full` adds the hostname);
+  without it, behavior is unchanged and `doctor` warns. Railway's Postgres presents a per-environment
+  private CA over a `localhost` leaf, so verify-ca is the strongest mode it supports. See
+  `docs/OPS.md` §15.
+- **Access hardening (#736, #737, #740, #741):** member reads are membership-only with harder
+  partition boundaries; agent-token issuance needs an explicit scope; dev-login admission is
+  local-only and proven; browser-admin authority is hardened and every API route is in an enforced
+  auth inventory.
+
 ### Changed
+
+- **NDA gate range bounds (#750, #753):** 5,000 changed paths / 256 MiB scanned, both still
+  fail-closed and each refusal naming its bound, so a release range can be scanned at all.
+- **Migration lane (#750):** an undeclared tag that HEAD cannot reach is another branch's release,
+  not a stale list (`tagsInScope`).
+
+## [0.13.0] — 2026-09-26
+
+### Changed (listed late: shipped in 0.13.0, left under Unreleased when the tag was cut)
 
 - **STAGINGMARK-2 — the PRET-6 migration now repairs a markerless fleet instead of only refusing
   it.** `materialize_builtin_membership_once()` is defined once in `postgres/schema.sql` and called
@@ -20,8 +51,6 @@ line go stale while the code moved on, so it is not restated.
   new and more specific error, because repairing membership is not the same as repairing visibility:
   enforcement fails closed for an unpartitioned item and the only UNATTENDED partitioner is budgeted, so such a
   fleet would deploy "successfully" over a dark corpus. `lib/access/groups.ts` is unchanged.
-
-## [0.13.0] — 2026-09-26
 
 ### Added
 
