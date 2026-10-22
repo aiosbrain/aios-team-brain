@@ -28,6 +28,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { pgConnectionConfig, resolvePgTls, shouldUseSsl } from "../lib/db/pg/ssl.mjs";
 
 export const OK = "ok";
 export const WARN = "warn";
@@ -156,15 +157,41 @@ export function checkPgSsl(env) {
   const url = env.DATABASE_URL || "";
   if (!url) return { status: WARN, detail: "no DATABASE_URL to assess" };
   const local = /@(localhost|127\.0\.0\.1|postgres|db)[:/]/.test(url);
-  const ssl = /\bsslmode=require\b/.test(url) || env.PGSSL === "require" || env.PGSSLMODE === "require";
-  if (local) return { status: OK, detail: ssl ? "TLS on (local)" : "local database, TLS not needed" };
-  return ssl
-    ? { status: OK, detail: "TLS required" }
-    : {
-        status: WARN,
-        detail: "remote DATABASE_URL without TLS — managed providers usually reject this",
-        fix: "set PGSSL=require",
+  // The SAME resolution the app/deploy hooks use (lib/db/pg/ssl.mjs), so doctor reports the posture
+  // a real connection gets — including a malformed PG_CA_CERT, which fails closed there too.
+  let tls;
+  try {
+    tls = resolvePgTls(url, { legacyTls: shouldUseSsl(url, env), env });
+  } catch (err) {
+    return {
+      status: FAIL,
+      detail: `PG_CA_CERT/PG_TLS_VERIFY_HOSTNAME rejected — every connection will refuse: ${err instanceof Error ? err.message : err}`,
+      fix: "set PG_CA_CERT to the server's CA certificate (PEM or base64 PEM), or unset it — see docs/OPS.md § Postgres TLS",
+    };
+  }
+  const from = tls.source === "url" ? " (set by sslmode/ssl in DATABASE_URL)" : "";
+  switch (tls.mode) {
+    case "verify-ca":
+      return { status: OK, detail: "verify-ca — chain verified against PG_CA_CERT (hostname not checked)" + from };
+    case "verify-full":
+      return {
+        status: OK,
+        detail: (tls.pinned ? "verify-full — chain against PG_CA_CERT + hostname" : "verify-full — system CAs + hostname") + from,
       };
+    case "unverified":
+      return {
+        status: WARN,
+        detail: "unverified — TLS is on but the server certificate is NOT checked (encrypted, not authenticated)" + from,
+        fix: "set PG_CA_CERT to the Postgres CA (docs/OPS.md § Postgres TLS) to verify the server",
+      };
+    default:
+      if (local || tls.source === "loopback") return { status: OK, detail: "disabled — local database, TLS not needed" };
+      return {
+        status: WARN,
+        detail: "disabled — remote DATABASE_URL without TLS" + from,
+        fix: "set PG_CA_CERT (verified TLS), or at least PGSSL=require",
+      };
+  }
 }
 
 /** One text-generation path must resolve, or queries cannot be answered. */
@@ -240,10 +267,8 @@ function line(name, r) {
 
 async function probeDatabase(env) {
   const { default: pg } = await import("pg");
-  const { shouldUseSsl } = await import("./pg-load-schema.mjs");
   const client = new pg.Client({
-    connectionString: env.DATABASE_URL,
-    ssl: shouldUseSsl(env.DATABASE_URL, env) ? { rejectUnauthorized: false } : undefined,
+    ...pgConnectionConfig(env.DATABASE_URL, { legacyTls: shouldUseSsl(env.DATABASE_URL, env), env }),
     connectionTimeoutMillis: 5000,
   });
   await client.connect();

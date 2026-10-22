@@ -1,11 +1,13 @@
 import "server-only";
 import { Pool, types, type PoolConfig } from "pg";
 import type { SqlQueryResult } from "@/lib/db/types";
+import { resolvePgTls, shouldUseSsl } from "@/lib/db/pg/ssl.mjs";
 
 /**
  * Singleton pg Pool for DB_BACKEND=postgres. Reads DATABASE_URL (Railway/any
- * standard Postgres). SSL is enabled when the URL asks for it or PGSSL=require,
- * with relaxed verification for managed providers that use self-signed chains.
+ * standard Postgres). TLS posture comes from the ONE shared helper `lib/db/pg/ssl.mjs`: verified
+ * against the pinned `PG_CA_CERT` when set (verify-ca, or verify-full with PG_TLS_VERIFY_HOSTNAME=1),
+ * otherwise the legacy unverified TLS when the URL/env asks for it (reported by `npm run doctor`).
  */
 
 // Override date/time type parsers to return strings instead of Date objects.
@@ -55,14 +57,11 @@ export function buildPoolConfig(env: NodeJS.ProcessEnv = process.env): PoolConfi
     );
   }
 
-  const wantsSsl =
-    /\bsslmode=require\b/.test(connectionString) ||
-    env.PGSSL === "require" ||
-    env.PGSSLMODE === "require";
+  const tls = resolvePgTls(connectionString, { legacyTls: shouldUseSsl(connectionString, env), env });
 
   return {
-    connectionString,
-    ssl: wantsSsl ? { rejectUnauthorized: false } : undefined,
+    connectionString: tls.connectionString,
+    ssl: tls.ssl,
     max: intFromEnv(env.PG_POOL_MAX, 10),
     idleTimeoutMillis: 30_000,
     // App queries are all short; a leaked/zombie transaction is the failure mode we cap.
@@ -78,6 +77,15 @@ export function getPool(): Pool {
   if (pool) return pool;
 
   pool = new Pool(buildPoolConfig());
+
+  // Make the unauthenticated posture visible in the server log once, not only in `npm run doctor`.
+  const url = process.env.DATABASE_URL ?? "";
+  const { mode } = resolvePgTls(url, { legacyTls: shouldUseSsl(url, process.env), env: process.env });
+  if (mode === "unverified") {
+    console.warn(
+      "[pg] TLS is ON but the server certificate is NOT verified — set PG_CA_CERT to the Postgres CA (docs/OPS.md § Postgres TLS)"
+    );
+  }
 
   pool.on("error", (err) => {
     // A pooled idle client errored (e.g. server restart). Log; pg will recycle.

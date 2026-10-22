@@ -4,6 +4,10 @@
 // not from what the implementation currently does.
 import { describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import {
   FAIL,
   OK,
@@ -98,9 +102,35 @@ describe("postgres TLS", () => {
     expect(checkPgSsl({ DATABASE_URL: "postgres://u:p@db.railway.app:5432/rw" }).status).toBe(WARN);
   });
 
-  it("is satisfied by PGSSL=require or sslmode in the URL", () => {
-    expect(checkPgSsl({ DATABASE_URL: "postgres://u:p@db.railway.app:5432/rw", PGSSL: "require" }).status).toBe(OK);
-    expect(checkPgSsl({ DATABASE_URL: "postgres://u:p@db.railway.app:5432/rw?sslmode=require" }).status).toBe(OK);
+  it("WARNS when TLS is on but the server certificate is not verified (PGSSL=require, no PG_CA_CERT)", () => {
+    const r = checkPgSsl({ DATABASE_URL: "postgres://u:p@db.railway.app:5432/rw", PGSSL: "require" });
+    expect(r.status).toBe(WARN);
+    expect(r.detail).toMatch(/^unverified/);
+  });
+
+  it("reports verify-ca with a pinned CA and verify-full with the hostname flag", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "doctor-ca-"));
+    execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", "/CN=root-ca",
+      "-keyout", path.join(dir, "k"), "-out", path.join(dir, "ca.pem")], { stdio: "ignore" });
+    const ca = readFileSync(path.join(dir, "ca.pem"), "utf8");
+    rmSync(dir, { recursive: true, force: true });
+    const url = "postgres://u:p@postgres.railway.internal:5432/railway";
+    expect(checkPgSsl({ DATABASE_URL: url, PG_CA_CERT: ca })).toMatchObject({ status: OK, detail: expect.stringMatching(/^verify-ca/) });
+    expect(checkPgSsl({ DATABASE_URL: url, PG_CA_CERT: ca, PG_TLS_VERIFY_HOSTNAME: "1" })).toMatchObject({
+      status: OK,
+      detail: expect.stringMatching(/^verify-full/),
+    });
+  });
+
+  it("FAILS on a malformed PG_CA_CERT instead of reporting a downgrade", () => {
+    const r = checkPgSsl({ DATABASE_URL: "postgres://u:p@db.railway.app:5432/rw", PG_CA_CERT: "nope!" });
+    expect(r.status).toBe(FAIL);
+  });
+
+  it("sslmode=require in the URL is node-postgres verify-full (system CAs), not unverified", () => {
+    const r = checkPgSsl({ DATABASE_URL: "postgres://u:p@db.railway.app:5432/rw?sslmode=require" });
+    expect(r.status).toBe(OK);
+    expect(r.detail).toMatch(/^verify-full/);
   });
 
   it("does not nag about a local database", () => {

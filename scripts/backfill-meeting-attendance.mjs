@@ -21,6 +21,7 @@
  *   DATABASE_URL=… node scripts/backfill-meeting-attendance.mjs --apply
  */
 import pg from "pg";
+import { pgConnectionConfig } from "../lib/db/pg/ssl.mjs";
 
 const APPLY = process.argv.includes("--apply");
 const url = process.env.DATABASE_URL;
@@ -96,7 +97,7 @@ function matchAsserted(names, roster) {
   return { memberIds, unresolved };
 }
 
-const db = new pg.Client({ connectionString: url, ssl: url.includes("localhost") ? false : { rejectUnauthorized: false } });
+const db = new pg.Client(pgConnectionConfig(url, { legacyTls: !url.includes("localhost"), legacySslOff: false }));
 await db.connect();
 
 const { rows: notes } = await db.query(`

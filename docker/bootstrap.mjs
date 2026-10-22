@@ -25,7 +25,7 @@ import { fileURLToPath } from "node:url";
 const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 import { randomBytes } from "node:crypto";
 import pg from "pg";
-import { shouldUseSsl } from "../scripts/pg-load-schema.mjs";
+import { pgConnectionConfig, shouldUseSsl } from "../lib/db/pg/ssl.mjs";
 import { credentialPlan, credentialSummary } from "../scripts/setup/credential-plan.mjs";
 import { demoSeedDecision, normalizeTeamSlug } from "../scripts/setup/deploy-policy.mjs";
 
@@ -44,7 +44,8 @@ const DEMO_PASSWORD =
   process.env.DEMO_PASSWORD || (DEMO.publicProduction ? randomBytes(12).toString("base64url") : "aios-demo-password");
 const WAIT_TIMEOUT_MS = Number(process.env.DB_WAIT_TIMEOUT_MS || 60_000);
 
-const ssl = shouldUseSsl(DATABASE_URL) ? { rejectUnauthorized: false } : undefined;
+// Resolved once, up front: a malformed PG_CA_CERT fails the boot here with a clear message.
+const PG_CONN = pgConnectionConfig(DATABASE_URL, { legacyTls: shouldUseSsl(DATABASE_URL) });
 
 function run(cmd, args) {
   const r = spawnSync(cmd, args, { stdio: "inherit", cwd: APP_ROOT });
@@ -62,7 +63,7 @@ async function waitForDatabase() {
   const deadline = Date.now() + WAIT_TIMEOUT_MS;
   let lastErr;
   while (Date.now() < deadline) {
-    const client = new pg.Client({ connectionString: DATABASE_URL, ssl, connectionTimeoutMillis: 3000 });
+    const client = new pg.Client({ ...PG_CONN, connectionTimeoutMillis: 3000 });
     try {
       await client.connect();
       await client.query("select 1");
@@ -79,7 +80,7 @@ async function waitForDatabase() {
 }
 
 async function teamCount() {
-  const client = new pg.Client({ connectionString: DATABASE_URL, ssl });
+  const client = new pg.Client(PG_CONN);
   await client.connect();
   try {
     const { rows } = await client.query("select count(*)::int as n from teams");
@@ -139,7 +140,7 @@ function parseShellEnv(text) {
 
 /** Does this email already have a usable login? Drives whether we set a password at all. */
 async function hasCredential(email) {
-  const client = new pg.Client({ connectionString: DATABASE_URL, ssl });
+  const client = new pg.Client(PG_CONN);
   await client.connect();
   try {
     const { rows } = await client.query(

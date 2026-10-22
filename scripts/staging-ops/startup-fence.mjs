@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { Client } from "pg";
-import { shouldUseSsl } from "../pg-load-schema.mjs";
+import { pgConnectionConfig, shouldUseSsl } from "../../lib/db/pg/ssl.mjs";
 import { isDirectEntry } from "./direct-entry.mjs";
 import { acquireDataUseLock } from "./journal.mjs";
 import { classifyFenceAdmission, stagingFenceScope } from "./fence-admission.mjs";
@@ -16,8 +16,7 @@ export async function acquireStartupFence({ env = process.env, createClient = (c
   if (!copyFenceRequired(env)) return null;
   if (!env.DATABASE_URL) throw new Error("staging startup fence requires DATABASE_URL");
   const client = createClient({
-    connectionString: env.DATABASE_URL,
-    ssl: shouldUseSsl(env.DATABASE_URL, env) ? { rejectUnauthorized: false } : undefined,
+    ...pgConnectionConfig(env.DATABASE_URL, { legacyTls: shouldUseSsl(env.DATABASE_URL, env), env }),
     connectionTimeoutMillis: 10_000,
   });
   await client.connect();

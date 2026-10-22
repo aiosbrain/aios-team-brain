@@ -41,11 +41,20 @@ back-port branch yet. Run the latest `main` (or the latest tagged release once o
 
 ## Self-hosting deployment notes
 
-- **Postgres TLS.** `lib/db/pg/pool.ts` connects with `ssl: { rejectUnauthorized: false }` when
-  TLS is requested (`PGSSL=require` / `sslmode=require`). This is acceptable for managed providers
-  that present provider-managed certificates (e.g. Railway). If you self-host Postgres elsewhere,
-  prefer a pinned CA bundle / `sslmode=verify-full` so the connection is authenticated, not just
-  encrypted.
+- **Postgres TLS.** Every Postgres connection (the app pool, the schema pre-deploy hook, bootstrap,
+  doctor, and the operator scripts) takes its `ssl` option from one helper, `lib/db/pg/ssl.mjs`
+  (guard: `test/guards/pg-tls-single-owner.test.ts`).
+  - **`PG_CA_CERT` set (recommended):** TLS is on and the server chain must verify against that
+    pinned CA — libpq `verify-ca`. The hostname is not checked, because Railway's Postgres presents a
+    leaf issued for `localhost` under a per-database self-signed `CN=root-ca`; a hostname check can
+    never pass there, the chain check can. Add `PG_TLS_VERIFY_HOSTNAME=1` for `verify-full` where the
+    leaf names the host you dial. A malformed `PG_CA_CERT` refuses to connect; it never downgrades.
+  - **`PG_CA_CERT` unset:** the pre-existing behaviour is kept so one-click installs do not break:
+    `PGSSL=require` / `sslmode=require` gives TLS **without** certificate verification (encrypted,
+    not authenticated), and no TLS setting gives plaintext. `npm run doctor` reports the mode
+    (`verify-ca` / `verify-full` / `unverified` / `disabled`) and warns on `unverified`; the app logs
+    one warning at pool creation.
+  - How to obtain the CA and set it per environment: `docs/OPS.md` § 13.
 - **Keep the database private.** The app enforces tier isolation in code; do not expose the
   Postgres port publicly, and run the brain behind your own auth/network boundary.
 - **Sentry / external error reporting** is opt-in and inert unless a DSN is configured; review
