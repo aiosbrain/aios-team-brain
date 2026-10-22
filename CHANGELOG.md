@@ -9,7 +9,68 @@ line go stale while the code moved on, so it is not restated.
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-10-22
+
+> **⚠️ Before upgrading — operator review is REQUIRED (TIERRET-1, #736).** Membership becomes the only
+> member content read rule, and grants take effect **immediately on deploy** (no migration):
+>
+> - **Exposure:** hand-entered tasks and decisions already filed in a project granted to a
+>   non-Everyone group (custom/client groups, person groups, builtin External, including
+>   `external-shared`) become readable by that group's members, as do TEAM-labelled items sourced
+>   from content a granted collaborator can see.
+> - **Narrowing:** a standing agent that relied on a builtin Everyone row sees hand-entered rows only
+>   in projects granted to it through non-builtin groups; agent keys pulling `GET /api/v1/tasks`
+>   stop receiving dashboard-created rows outside those projects.
+> - **Before deploying, for every team**, work through "REQUIRED before rollout" in
+>   [`docs/RELEASE-NOTES-tierret1.md`](docs/RELEASE-NOTES-tierret1.md):
+>   1. `npm run admin -- access-health <team-slug>` must report no unsanctioned edges on system
+>      projects; repair any with `repair-system-edge`. Otherwise the new `system-integrity` placement
+>      gate refuses pushes into General / `external-shared` and ingestion can stall.
+>   2. Resolve each "active external-tier human member(s) in the builtin Everyone group" it reports.
+>   3. Run the read-only impact census (queries A and B) and act on it: re-file rows, adjust grants,
+>      grant agents.
+> - **After deploying:** workspaces must reset their pull cursor to receive older rows they were
+>   newly granted. The rollback / roll-forward timeline-cache step is in the same file.
+>
+> **Also breaking:** Node 20 is dropped. The image requires Node ≥ 22.23.4, and a source install accepts only `^22.23.4 || ^24.22.1 || ^26.12.1` (`engines`, `install.sh`, `npm run doctor`); minting an agent token
+> now refuses a request with no explicit issuance scope (#737); `/auth/dev-login` now needs
+> `AIOS_DEV_LOGIN=1` and a loopback host (`npm run dev:login`), not merely a non-production build (#740).
+
+### Security
+
+- **AIO-1238 — patched trust stores for the eMudhra CA compromise (#746).** Eight eMudhra
+  intermediate CAs have recoverable private keys, so an unpatched client trusts a forged certificate
+  for any domain. The app image moves from Node 20 (EOL, never patched) to Node 22 with a build-time
+  floor of 22.23.4 (24.22.1 / 26.12.1 on other lines); `npm run doctor`, `install.sh` and
+  `engines` enforce the same table. Graphiti and ingestion pin certifi 2026.10.19. CI and staging's
+  release, commissioning and ops-image workflows install the latest Node 22 (`check-latest`); the
+  four workflows that carry a credential without `npm ci` additionally refuse an older Node before
+  their first `node` step.
+- **Postgres TLS can verify against a pinned CA (#751).** `lib/db/pg/ssl.mjs` is the single owner of
+  every connection's `ssl` option. With `PG_CA_CERT` set it verifies the chain against that CA
+  (libpq `verify-ca`; `PG_TLS_VERIFY_HOSTNAME=1` or `sslmode=verify-full` adds the hostname);
+  without it, behavior is unchanged and `doctor` warns. Railway's Postgres presents a per-environment
+  private CA over a `localhost` leaf, so verify-ca is the strongest mode it supports. See
+  `docs/OPS.md` §15.
+- **TIERRET-1 — membership is the only member content read rule (#736, AIO-1045).** See the
+  upgrade block above and `docs/RELEASE-NOTES-tierret1.md`. Edits stay on the pre-release row rule, so
+  a newly readable row is read-only for that member, and a crafted edit of an unreachable row is now
+  refused.
+- **Agent-token issuance requires an explicit scope (#737).**
+- **Dev-login is local-only (#740, AIO-1210):** `AIOS_DEV_LOGIN=1` plus a loopback `Host`; refused
+  in any production build.
+- **Browser-admin authority hardened; every API route is in an enforced auth inventory (#741).**
+
 ### Changed
+
+- **NDA gate range bounds (#750, #753):** 5,000 changed paths / 256 MiB scanned, both still
+  fail-closed and each refusal naming its bound, so a release range can be scanned at all.
+- **Migration lane (#750):** an undeclared tag that HEAD cannot reach is another branch's release,
+  not a stale list (`tagsInScope`).
+
+## [0.13.0] — 2026-09-26
+
+### Changed (listed late: shipped in 0.13.0, left under Unreleased when the tag was cut)
 
 - **STAGINGMARK-2 — the PRET-6 migration now repairs a markerless fleet instead of only refusing
   it.** `materialize_builtin_membership_once()` is defined once in `postgres/schema.sql` and called
@@ -20,8 +81,6 @@ line go stale while the code moved on, so it is not restated.
   new and more specific error, because repairing membership is not the same as repairing visibility:
   enforcement fails closed for an unpartitioned item and the only UNATTENDED partitioner is budgeted, so such a
   fleet would deploy "successfully" over a dark corpus. `lib/access/groups.ts` is unchanged.
-
-## [0.13.0] — 2026-09-26
 
 ### Added
 
@@ -34,6 +93,8 @@ line go stale while the code moved on, so it is not restated.
 - This version is an **unpromoted validation candidate** for measuring the protected validation
   check producer. It is not a production release. A later accepting-parser change requires a new
   reviewed version and candidate.
+- **Update 2026-10-22:** v0.13.0 was merged into `main` (#752) to bring the release branch level
+  with the integration branch, and it is what production runs ahead of 0.14.0.
 
 ## [0.12.0] — 2026-08-26
 
