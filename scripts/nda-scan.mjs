@@ -376,7 +376,14 @@ export function scanRange(terms, rangeSpec, { revealLines = false, cwd = process
     }
     const destinationPaths = [...new Set(changedEntries.map((entry) => entry.path))];
     changedPathCount += destinationPaths.length;
-    if (changedPathCount > 2_000) throw new Error("confidential-pattern scan could not run");
+    // Runaway-scan bounds, not coverage choices. The v0.13.0 promotion range (main..v0.13.0) is
+    // 3,483 cumulative paths and ~145 MiB (merge commits count against both parents); 2,000 paths /
+    // 64 MiB refused it. With both bounds lifted a GNU-grep run of this scanner covers it in about
+    // 4 minutes, inside the gate job's 10-minute timeout. Each refusal names its bound (never a
+    // count or a term) so an operator can tell which one tripped.
+    if (changedPathCount > 5_000) {
+      throw new Error("confidential-pattern scan could not run: range exceeds the 5,000 changed-path bound");
+    }
     const currentSubmodules = new Set(submodulePaths(cwd, commit));
 
     const corpus = [];
@@ -385,7 +392,9 @@ export function scanRange(terms, rangeSpec, { revealLines = false, cwd = process
       const existing = corpusIndexes.get(value);
       if (existing !== undefined) return existing;
       scannedByteCount += Buffer.byteLength(value);
-      if (scannedByteCount > 64 * 1024 * 1024) throw new Error("confidential-pattern scan could not run");
+      if (scannedByteCount > 256 * 1024 * 1024) {
+        throw new Error("confidential-pattern scan could not run: range exceeds the 256 MiB scanned-byte bound");
+      }
       const index = corpus.length;
       corpus.push(value);
       corpusIndexes.set(value, index);

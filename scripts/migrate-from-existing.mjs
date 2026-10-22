@@ -113,6 +113,17 @@ const RELEASE_TAG_RE = /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
  * @returns {{ usable: string[], pending: string|null, notice: string|null }}
  * @throws  on a hole in the middle, or on a stale list
  */
+/**
+ * The tags `nextTagPolicy` should see: every tag reachable from HEAD, plus every DECLARED tag. An
+ * undeclared tag that HEAD cannot reach is another branch's release (v0.13.0 was cut on the
+ * integration branch while the release branch still sat behind it), not evidence that this
+ * branch's list is stale, and upgrading from it here would test a downgrade.
+ */
+export function tagsInScope(all, reachable, declared) {
+  const reach = new Set(reachable);
+  return all.filter((t) => reach.has(t) || declared.includes(t));
+}
+
 export function nextTagPolicy(declared, existing, { allowPending = true } = {}) {
   const known = new Set(existing ?? []);
   const list = [...(declared ?? [])];
@@ -517,7 +528,16 @@ export async function main(argv = process.argv.slice(2)) {
   // Tags are dereferenced to COMMITS by `--sort=-v:refname` listing plus git's own peeling downstream;
   // what matters here is the NAME set. This repo's tags are mixed (v0.7.0/v0.9.0 annotated,
   // v0.8.0/v0.10.0 lightweight), so any comparison by object id must peel — see nextTagPolicy's tests.
-  const known = git(["tag", "--sort=-v:refname"]).split("\n").filter(Boolean);
+  // A tag that is neither declared nor reachable from HEAD is another branch's release, not this
+  // branch's stale list: v0.13.0 was cut on the integration branch, and counting it on the release
+  // branch failed every pull request there with "DEFAULT_TAGS is stale" while upgrading FROM it would
+  // be a downgrade test (its schema is newer than this tree's). Declared tags are always kept, so a
+  // declared-but-unreachable tag (v0.11.0) is still exercised and a missing one is still a hole.
+  const known = tagsInScope(
+    git(["tag", "--sort=-v:refname"]).split("\n").filter(Boolean),
+    git(["tag", "--merged", "HEAD"]).split("\n").filter(Boolean),
+    tags,
+  );
   // `allowPending` only for the declaration. An explicit `--tags` is the operator's request, and a
   // request naming a tag that does not exist is an error, not a release being prepared.
   const usingDeclaration = !argv.includes("--tags");
