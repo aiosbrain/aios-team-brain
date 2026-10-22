@@ -1537,8 +1537,12 @@ guard enforces it, it's named.
   (`{ rejectUnauthorized: false }` when it asked for TLS, else plaintext), reported as `unverified` by
   `npm run doctor`. Malformed input throws (fail closed); URL ssl params are stripped when pinning,
   because node-postgres merges the parsed URL OVER the passed `ssl` object. Loopback/unix-socket
-  connections that never asked for TLS stay plaintext. Runbook: `docs/OPS.md` § 13.
-  _Guards:_ `test/guards/pg-tls-single-owner.test.ts` (no `rejectUnauthorized` elsewhere),
+  connections that never asked for TLS stay plaintext; with a pin, the final string is re-parsed by
+  pg's own `ConnectionParameters` and must yield exactly the pinned object, or it throws. NOT routed
+  (reviewed list in the guard): `scripts/staging-ops/{exporter,importer,staging-pair-fixture}.mjs`
+  (own canonical target contract, two databases) and the scratch-DB harnesses. Runbook: `docs/OPS.md` § 13.
+  _Guards:_ `test/guards/pg-tls-single-owner.test.ts` (no `rejectUnauthorized` elsewhere; every
+  pg Client/Pool constructor imports the helper or is on the reviewed list),
   `test/pg-ssl.test.ts`, `test/pg-tls-handshake.test.ts` (wrong CA refused / right CA accepted with a
   hostname mismatch, over a real SSLRequest handshake).
 - **DB connections have liveness timeouts — a wedged one can't hold locks forever** (2026-07-13

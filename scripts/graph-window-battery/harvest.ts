@@ -10,6 +10,7 @@
  * Usage: npx tsx --conditions react-server scripts/graph-window-battery/harvest.ts
  */
 import { Client } from "pg";
+import { pgConnectionConfig } from "../../lib/db/pg/ssl.mjs";
 import { entityYield, dupeShare, crossChunkContinuity, peopleMetrics, memberPresence, episodicCount, entityNameCounts, summaryRows, temporalEdges } from "./measure";
 // The pure scorers own what "healthy" and "dated" mean; this file only supplies their inputs, so the
 // readout and the judged definition cannot drift apart.
@@ -20,7 +21,7 @@ import { countFromBody } from "./corpus.mjs";
 async function main(): Promise<void> {
   const GROUP_ID = process.env.GROUP_ID ?? "aios_team";
 
-  const pg = new Client({ connectionString: process.env.DATABASE_URL });
+  const pg = new Client(pgConnectionConfig(process.env.DATABASE_URL ?? "", { legacyTls: false }));
   await pg.connect();
 
   // The corpus as seeded — every projectable team-tier item in this database IS the corpus, by

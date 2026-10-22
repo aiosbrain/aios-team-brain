@@ -2092,7 +2092,8 @@ protected jobs for a future positive release decision.
 ## 13. Postgres TLS — pinning the server CA (`PG_CA_CERT`)
 
 **What it does.** With `PG_CA_CERT` set, every Postgres connection (app pool, `pg:schema`
-pre-deploy hook, bootstrap, doctor, operator scripts — all via `lib/db/pg/ssl.mjs`) turns TLS on
+pre-deploy hook, bootstrap, doctor, operator scripts — all via `lib/db/pg/ssl.mjs`; the staging
+copy plane in `scripts/staging-ops/` is the reviewed exception and keeps its own target contract) turns TLS on
 and verifies the server chain against that CA: libpq **`verify-ca`**. The hostname is not checked.
 `PG_TLS_VERIFY_HOSTNAME=1` adds the hostname check (**`verify-full`**). Without `PG_CA_CERT` the old
 posture stays: `PGSSL=require`/`sslmode=require` is TLS without verification, nothing is plaintext.
@@ -2104,6 +2105,10 @@ issued by a self-signed `CN=root-ca` that is generated **per database**. The hos
 never `localhost`, so verify-full can never pass; the chain to that database's `root-ca` can. Each
 environment has its own `root-ca`, so `PG_CA_CERT` is a **per-environment** value. A wrong CA fails
 the connection (`SELF_SIGNED_CERT_IN_CHAIN` / `CERT_SIGNATURE_FAILURE`), it never downgrades.
+`PG_TLS_VERIFY_HOSTNAME=1` without `PG_CA_CERT` refuses to connect, and so does a `DATABASE_URL`
+ssl parameter that would replace the pinned settings (e.g. `sslnegotiation=direct`); `sslmode=*`,
+`ssl=*`, `sslrootcert` and `uselibpqcompat` are stripped (an explicit `sslmode=verify-full` keeps
+the hostname check).
 
 **Note on the internal URL.** The internal `DATABASE_URL` carries no `sslmode` and the AIOS
 environments set no `PGSSL`, so before `PG_CA_CERT` they spoke **plaintext** on the private network.

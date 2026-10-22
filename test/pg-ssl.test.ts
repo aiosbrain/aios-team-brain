@@ -111,6 +111,44 @@ describe("resolvePgTls — PG_CA_CERT set", () => {
     expect(effective.rejectUnauthorized).toBe(true);
   });
 
+  it.each([
+    [`${REMOTE}?sslmode=no-verify&application_name=a@b`],
+    [`${REMOTE}?ssl=no-verify&x=a@b`],
+    [`${REMOTE}?sslmode=no-verify#x@y`],
+    [`${REMOTE}?sslmode=require&sslmode=no-verify`],
+    [`${REMOTE}?uselibpqcompat=true&sslmode=require`],
+  ])("a pinned CA is what node-postgres actually uses for %s (no downgrade via URL params)", (url) => {
+    const cfg = pgConnectionConfig(url, { legacyTls: true, env: { PG_CA_CERT: caPem } });
+    const effective = new ConnectionParameters(cfg).ssl as { ca?: string; rejectUnauthorized?: boolean };
+    expect(effective.rejectUnauthorized).toBe(true);
+    expect(effective.ca).toContain("BEGIN CERTIFICATE");
+  });
+
+  it("refuses URL params that would REPLACE the pinned object (sslnegotiation=direct)", () => {
+    expect(() =>
+      resolvePgTls(`${REMOTE}?sslnegotiation=direct`, { legacyTls: true, env: { PG_CA_CERT: caPem } })
+    ).toThrow(/replace the pinned TLS/);
+  });
+
+  it("an explicit sslmode=verify-full in the URL keeps the hostname check when pinning", () => {
+    const r = resolvePgTls(`${REMOTE}?sslmode=verify-full`, { legacyTls: true, env: { PG_CA_CERT: caPem } });
+    expect(r.mode).toBe("verify-full");
+    expect((r.ssl as Record<string, unknown>).checkServerIdentity).toBeUndefined();
+  });
+
+  it("only loopback LITERALS are exempt: a DNS name starting 127. and an empty host with a remote PGHOST get TLS", () => {
+    const env = { PG_CA_CERT: caPem };
+    expect(resolvePgTls("postgres://a:b@127.0.0.1.nip.io/x", { legacyTls: false, env }).mode).toBe("verify-ca");
+    expect(resolvePgTls("postgres://a:b@/x", { legacyTls: false, env: { ...env, PGHOST: "db.example.com" } }).mode).toBe(
+      "verify-ca"
+    );
+    expect(resolvePgTls("postgres://a:b@/x", { legacyTls: false, env }).ssl).toBeUndefined(); // → localhost
+  });
+
+  it("PG_TLS_VERIFY_HOSTNAME=1 without PG_CA_CERT refuses (verification was asked for and cannot happen)", () => {
+    expect(() => resolvePgTls(REMOTE, { legacyTls: true, env: { PG_TLS_VERIFY_HOSTNAME: "1" } })).toThrow(/needs PG_CA_CERT/);
+  });
+
   it("rejects an unknown PG_TLS_VERIFY_HOSTNAME instead of guessing", () => {
     expect(() => parseVerifyHostname("yes-please")).toThrow(/PG_TLS_VERIFY_HOSTNAME/);
     expect(parseVerifyHostname(undefined)).toBe(false);
@@ -144,6 +182,7 @@ describe("resolvePgTls — PG_CA_CERT unset keeps each call site's behaviour", (
     [`${REMOTE}?sslmode=disable`, true],
     [`${REMOTE}?ssl=true`, false],
     [`${REMOTE}?uselibpqcompat=true&sslmode=require`, true],
+    [`${REMOTE}?sslmode=require&sslmode=no-verify`, true],
     [REMOTE, true],
     [REMOTE, false],
   ])("reports the mode node-postgres actually applies for %s (legacyTls=%s)", (url, legacyTls) => {

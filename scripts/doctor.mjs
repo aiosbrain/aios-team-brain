@@ -169,7 +169,8 @@ export function checkPgSsl(env) {
       fix: "set PG_CA_CERT to the server's CA certificate (PEM or base64 PEM), or unset it — see docs/OPS.md § Postgres TLS",
     };
   }
-  const from = tls.source === "url" ? " (set by sslmode/ssl in DATABASE_URL)" : "";
+  const from =
+    tls.source === "url" ? " (set by sslmode/ssl in DATABASE_URL)" : tls.source === "env" ? " (set by PGSSLMODE)" : "";
   switch (tls.mode) {
     case "verify-ca":
       return { status: OK, detail: "verify-ca — chain verified against PG_CA_CERT (hostname not checked)" + from };

@@ -43,7 +43,9 @@ back-port branch yet. Run the latest `main` (or the latest tagged release once o
 
 - **Postgres TLS.** Every Postgres connection (the app pool, the schema pre-deploy hook, bootstrap,
   doctor, and the operator scripts) takes its `ssl` option from one helper, `lib/db/pg/ssl.mjs`
-  (guard: `test/guards/pg-tls-single-owner.test.ts`).
+  (guard: `test/guards/pg-tls-single-owner.test.ts`). Reviewed exceptions: the staging copy plane
+  (`scripts/staging-ops/` exporter/importer, which has its own target contract and dials two
+  databases) and local scratch-database harnesses.
   - **`PG_CA_CERT` set (recommended):** TLS is on and the server chain must verify against that
     pinned CA — libpq `verify-ca`. The hostname is not checked, because Railway's Postgres presents a
     leaf issued for `localhost` under a per-database self-signed `CN=root-ca`; a hostname check can
