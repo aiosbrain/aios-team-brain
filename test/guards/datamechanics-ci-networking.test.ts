@@ -10,7 +10,7 @@ describe("data-mechanics CI uses the direct Postgres service destination", () =>
 
   it("runs inside the full Node 20 Bookworm image on the Postgres service network", () => {
     expect(job.name, "the required branch-protection check name changed").toBe("Data-mechanics tests (real Postgres)");
-    expect(job.container).toEqual({ image: "node:20-bookworm", options: "--init" });
+    expect(job.container).toEqual({ image: "node:22-bookworm", options: "--init" });
     expect(job.env.DATABASE_TEST_URL).toBe("postgres://app:app@postgres:5432/app_test");
     expect(job.services.postgres.ports, "a job-container service does not need a host NAT mapping").toBeUndefined();
   });

@@ -925,7 +925,7 @@ Run these **in this order**:
    earlier version of this runbook used a `sh -c '…'` prefix; the pre-push review proved it executed
    `sh -c 'sh -c echo …'`, ran a bare `echo`, and printed a refusal on a **correctly configured**
    staging. It failed closed, and it never worked. There is also **no `curl` in the image**
-   (`node:20-bookworm-slim`, no `apt-get`) — the script uses Node's own `fetch`.
+   (`node:22-bookworm-slim`, no `apt-get`) — the script uses Node's own `fetch`.
 
    **What it does** (`scripts/staging-graph-clear.mjs`, unit-tested in
    `test/staging-graph-clear.test.ts`): it refuses unless **BOTH** hold —

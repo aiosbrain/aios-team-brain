@@ -88,13 +88,13 @@ jobs:
     # address and port. Keep this job on the service network: a host-published localhost path is
     # Docker NAT, not the direct Postgres destination that production requires.
     container:
-      image: node:20-bookworm
+      image: node:22-bookworm
       options: --init
     # A job CONTAINER changes which shell an implicit `run` gets: the step executes inside the image,
     # where /bin/sh is Debian's dash, and dash has no `pipefail` — `set -euo pipefail` dies at `set`
     # with "Illegal option -o pipefail" and exit 2, BEFORE the toolchain steps below run a single
     # command. Measured on a cached Debian bookworm image (the staging-ops runner), not on this
-    # node:20-bookworm job image: `sh -c 'set -euo pipefail'` exits 2, `bash -c` exits 0. Both derive
+    # node:22-bookworm job image: `sh -c 'set -euo pipefail'` exits 2, `bash -c` exits 0. Both derive
     # from bookworm and both use dash as /bin/sh, so the shell is declared rather than inherited.
     # GitHub's `bash` shell is `bash --noprofile --norc -eo pipefail {0}`, strictly more fail-closed
     # than the implicit default for the plain `npm …` steps too. Pinned by
@@ -122,7 +122,7 @@ jobs:
           # (`git show v0.7.0:postgres/schema.sql`) instead of maintaining fixture files, so it
           # needs the full history and the TAGS. The default shallow, tagless checkout would make
           # it fail with "unknown git tag" rather than silently pass. In a job container that also
-          # requires `git` IN the image (`node:20-bookworm` has it): without it checkout degrades to
+          # requires `git` IN the image (`node:22-bookworm` has it): without it checkout degrades to
           # an archive download, which has no history for that lane to read at all.
           fetch-depth: 0
       # The checkout is bind-mounted into this ephemeral job container with host-runner ownership.
@@ -140,7 +140,7 @@ jobs:
           check-latest: true # runner caches can predate the eMudhra trust-store fix (22.23.4)
           cache: "npm"
       # The ubuntu-latest runner carried the Postgres client tools for free; this job container does
-      # not. `node:20-bookworm` is the FULL image, so git and bash come with it (buildpack-deps base),
+      # not. `node:22-bookworm` is the FULL image, so git and bash come with it (buildpack-deps base),
       # but no `psql`/`pg_dump`/`pg_restore` — and the staging data-mechanics specs spawn the real
       # ones. Each of those specs stubs only the single binary whose stall it pins (`pg_dump` for the
       # deadline capture, `pg_restore` for the cancellation); the rollback restore's two `\copy`
@@ -311,7 +311,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "22"
+          check-latest: true # runner caches can predate the eMudhra trust-store fix (22.23.4)
           cache: "npm"
       - run: npm ci
       - name: Run isolated four-database exporter/importer harness
