@@ -352,7 +352,33 @@ exec "$NDA_TEST_REAL_GREP" "$@"
     }
   });
 
-  it("keeps the range budget fail-closed for distinct content and cannot raise the 64 MiB cap", () => {
+  it("keeps the changed-path bound fail-closed and cannot raise the 5,000 cap", () => {
+    // The bound decides whether a release range (main..v0.13.0 was 3,483 paths) can be scanned at
+    // all; a silent drop back to 2,000 would re-freeze promotion, so pin both sides of it.
+    const dir = mkdtempSync(join(tmpdir(), "nda-gate-path-bound-"));
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8" });
+    try {
+      git("init", "-q");
+      git("config", "user.email", "t@t.local");
+      git("config", "user.name", "t");
+      git("commit", "-qm", "base", "--allow-empty");
+      const base = git("rev-parse", "HEAD").trim();
+      for (const name of ["a", "b", "c"]) writeFileSync(join(dir, `${name}.txt`), `${name}\n`);
+      git("add", ".");
+      git("commit", "-qm", "three paths");
+      const scan = (maxChangedPaths: number) =>
+        scanRange(["SYNTHETIC_NEVER_PRESENT"], `${base}..HEAD`, { cwd: dir, maxChangedPaths });
+
+      expect(() => scan(3)).not.toThrow();
+      expect(() => scan(2)).toThrow(/2-path changed-path bound/);
+      expect(() => scan(5_001)).toThrow(/scan could not run/i); // cannot be raised past the cap
+      expect(() => scan(5_000)).not.toThrow(); // …and the cap itself is accepted (2,000 would not be)
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the range budget fail-closed for distinct content and cannot raise the 256 MiB cap", () => {
     const dir = mkdtempSync(join(tmpdir(), "nda-gate-range-budget-"));
     const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8" });
     try {
@@ -374,8 +400,13 @@ exec "$NDA_TEST_REAL_GREP" "$@"
       })).toThrow(/scan could not run/i);
       expect(() => scanRange(["SYNTHETIC_NEVER_PRESENT"], `${base}..HEAD`, {
         cwd: dir,
-        maxScannedBytes: 64 * 1024 * 1024 + 1,
+        maxScannedBytes: 256 * 1024 * 1024 + 1, // one byte over RANGE_SCANNED_BYTE_LIMIT: refused, not silently raised
       })).toThrow(/scan could not run/i);
+      // …and the cap itself is accepted, so a lowered cap (the old 64 MiB) reddens this line.
+      expect(() => scanRange(["SYNTHETIC_NEVER_PRESENT"], `${base}..HEAD`, {
+        cwd: dir,
+        maxScannedBytes: 256 * 1024 * 1024,
+      })).not.toThrow();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
