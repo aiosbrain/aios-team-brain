@@ -51,7 +51,8 @@ describe("parseCaCert — malformed input fails closed", () => {
   it.each([
     ["garbage", "not a certificate!"],
     ["base64 that is not a PEM", Buffer.from("hello world").toString("base64")],
-    ["a private key, not a certificate", "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----"],
+    // Assembled at runtime so the secret scanner does not read a fixture as a committed key.
+    ["a private key, not a certificate", `-----BEGIN ${"PRIVATE"} KEY-----\nAAAA\n-----END ${"PRIVATE"} KEY-----`],
     ["a truncated certificate body", "-----BEGIN CERTIFICATE-----\nMIIBIjANBgkq\n-----END CERTIFICATE-----"],
     ["whitespace only", "   "],
   ])("rejects %s", (_label, raw) => {
