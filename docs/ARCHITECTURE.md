@@ -1464,7 +1464,7 @@ guard enforces it, it's named.
   `before..sha` range too, so add-then-scrub history cannot disappear behind a clean final tree.
   Untrusted PR ranges carry an explicit 500-commit ceiling; exceeding it fails closed with a distinct,
   actionable count/limit verdict, while the trusted recreated-protected-branch fallback remains an
-  uncapped full-history scan. The separate 2,000-path and 64 MiB range ceilings remain fail-closed.
+  uncapped full-history scan. The separate 5,000-path and 256 MiB range ceilings remain fail-closed, each refusing with a message that names its bound (sized so a release range such as `main..v0.13.0`, 3,483 paths / ~145 MiB, can be scanned).
   Matching uses one POSIX ERE engine throughout. Public CI emits only the unavoidable pass/fail bit:
   it never includes matching text, locations, counts, a term, an index, or the private list size;
   `--reveal` is disabled in CI. The gate **fails closed** whenever the list or scanner is unavailable,

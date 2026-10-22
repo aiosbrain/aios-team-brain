@@ -67,7 +67,8 @@ const parsedMaxCommits = maxCommitsRaw !== null && /^[1-9]\d*$/.test(maxCommitsR
   ? Number(maxCommitsRaw)
   : null;
 const maxCommits = Number.isSafeInteger(parsedMaxCommits) ? parsedMaxCommits : null;
-const RANGE_SCANNED_BYTE_LIMIT = 64 * 1024 * 1024;
+const RANGE_SCANNED_BYTE_LIMIT = 256 * 1024 * 1024;
+const RANGE_CHANGED_PATH_LIMIT = 5_000;
 
 class CommitRangeLimitError extends Error {
   constructor(commitCount, limit) {
@@ -365,6 +366,8 @@ export function scanRange(
     // Focused tests may tighten this bound to exercise resource behavior without allocating tens
     // of MiB. It cannot raise or disable the production limit, and the CLI never exposes it.
     maxScannedBytes = RANGE_SCANNED_BYTE_LIMIT,
+    // Same contract as maxScannedBytes: tests may tighten the path bound, never raise it.
+    maxChangedPaths = RANGE_CHANGED_PATH_LIMIT,
   } = {}
 ) {
   if (terms.length === 0) throw new Error("no active NDA terms — refusing to report a pass");
@@ -373,6 +376,9 @@ export function scanRange(
     throw new Error("confidential-pattern scan could not run");
   }
   if (!Number.isSafeInteger(maxScannedBytes) || maxScannedBytes < 1 || maxScannedBytes > RANGE_SCANNED_BYTE_LIMIT) {
+    throw new Error("confidential-pattern scan could not run");
+  }
+  if (!Number.isSafeInteger(maxChangedPaths) || maxChangedPaths < 1 || maxChangedPaths > RANGE_CHANGED_PATH_LIMIT) {
     throw new Error("confidential-pattern scan could not run");
   }
   if (maxCommits !== null) {
@@ -392,7 +398,7 @@ export function scanRange(
   let scannedByteCount = 0;
   // Exact normalized text owns its complete term-index result for this invocation only. The key is
   // the text itself (never a collision-prone digest), the term set is fixed above, and consumers
-  // only inspect the cached Sets. The existing 64 MiB bound therefore caps unique matching input
+  // only inspect the cached Sets. The existing 256 MiB bound therefore caps unique matching input
   // while unchanged content revisited across commits and merge parents does not spend the budget
   // repeatedly.
   const rangeMatches = new Map();
@@ -424,7 +430,14 @@ export function scanRange(
     }
     const destinationPaths = [...new Set(changedEntries.map((entry) => entry.path))];
     changedPathCount += destinationPaths.length;
-    if (changedPathCount > 2_000) throw new Error("confidential-pattern scan could not run");
+    // Runaway-scan bounds, not coverage choices. The v0.13.0 promotion range (main..v0.13.0) is
+    // 3,483 cumulative paths and ~145 MiB (merge commits count against both parents); 2,000 paths /
+    // 64 MiB refused it. With both bounds lifted a GNU-grep run of this scanner covers it in about
+    // 4 minutes, inside the gate job's 10-minute timeout. Each refusal names its bound (never a
+    // count or a term) so an operator can tell which one tripped.
+    if (changedPathCount > maxChangedPaths) {
+      throw new Error(`confidential-pattern scan could not run: range exceeds the ${maxChangedPaths}-path changed-path bound`);
+    }
     const currentSubmodules = new Set(submodulePaths(cwd, commit));
 
     const corpus = [];
@@ -433,7 +446,9 @@ export function scanRange(
       if (corpusValues.has(value)) return;
       if (!rangeMatches.has(value)) {
         scannedByteCount += Buffer.byteLength(value);
-        if (scannedByteCount > maxScannedBytes) throw new Error("confidential-pattern scan could not run");
+        if (scannedByteCount > maxScannedBytes) {
+          throw new Error(`confidential-pattern scan could not run: range exceeds the ${maxScannedBytes}-byte scanned-byte bound`);
+        }
       }
       corpus.push(value);
       corpusValues.add(value);
