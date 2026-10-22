@@ -191,6 +191,14 @@ describe("release candidate — the entry path is wired (criteria 5, 12, 16)", (
     expect(SRC).not.toMatch(/import\.meta\.url\s*===/);
   });
 
+  it("keeps the reusable verdict in an entrypoint-free module", () => {
+    const pure = readFileSync("scripts/release-candidate-verdict.mjs", "utf8");
+    expect(pure).toContain("export function releaseCandidateVerdict");
+    expect(pure).not.toContain("process.argv");
+    expect(pure).not.toContain("process.exit");
+    expect(SRC).toContain('from "./release-candidate-verdict.mjs"');
+  });
+
   it("refuses any ref that is not a tag", () => {
     expect(SRC).toMatch(/runs on tag pushes only/);
   });

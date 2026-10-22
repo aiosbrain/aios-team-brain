@@ -160,6 +160,12 @@ const TITLE_SURFACE_WIRING: [string, RegExp][] = [
   // the §2.1 resolution the round-2 BLOCKER-1 conflation would replace).
   ["app/t/[team]/tasks/page.tsx", /await visibleProjectRows\(adminClient\(\)/],
   ["app/t/[team]/decisions/page.tsx", /await visibleProjectRows\(adminClient\(\)/],
+  // AGENTUI-1: the agent-token mint form's project picker. An admin's authority is to MANAGE, not
+  // to bypass the access chain — so the scope options are the admin's OWN row-visible projects, and
+  // an admin cannot scope a token to a project they cannot see. Both pins: the resolution, and the
+  // `.in(...)` that applies it (the resolution alone shipped green once before — see M4 above).
+  ["app/t/[team]/admin/agents/page.tsx", /await visibleProjectRows\(db, \{ teamId: ctx\.teamId/],
+  ["app/t/[team]/admin/agents/page.tsx", /\.in\("id", \[\.\.\.visible\.ids\]\)/],
   // The adjacent WRITE routes (Fable diff HIGH 2): filing a hand-typed row into a container
   // un-hides it (§2.1 content arms), so both create actions gate on the same row visibility.
   ["app/actions/tasks.ts", /await canSeeProjectRow\(adminClient\(\)/],

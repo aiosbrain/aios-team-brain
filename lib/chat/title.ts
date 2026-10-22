@@ -39,6 +39,8 @@ export async function generateTitle(
   keys: ProviderKeys = {},
   meter?: LlmMeterCtx
 ): Promise<string | null> {
+  const { copiedStagingSpendAllowed } = await import("@/lib/staging/runtime-policy");
+  if (!copiedStagingSpendAllowed("background")) return null;
   const prompt = `Question: ${question.trim()}\n\nAnswer: ${answer.trim().slice(0, 600)}\n\nTitle:`;
   try {
     // Same backend the answer used (OpenRouter → LLM_BASE_URL → Anthropic), so titles never diverge.

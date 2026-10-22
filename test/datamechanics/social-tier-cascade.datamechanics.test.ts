@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   createOpportunity,
@@ -7,7 +8,10 @@ import {
   narrowSocialChainForItem,
 } from "@/lib/social/store";
 import { Client } from "pg";
-import { db, ingest, seedTeam } from "./helpers";
+import { ingestItem } from "@/lib/ingest";
+import { PgClient } from "@/lib/db/pg/client";
+import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
+import { db, ingest, seedTeam, sha } from "./helpers";
 
 /**
  * Spec (Pass-1 review, Wave 0 follow-on): the social chain's evidence→tier ceiling must survive a
@@ -202,6 +206,232 @@ describe("social chain follows a narrowed evidence item (real Postgres)", () => 
       .eq("action", "social.tier_narrowed");
     expect((data ?? []).length).toBe(1); // recorded despite the failure that followed
   });
+
+  it("A13-13: ingest-bound cascade failure rolls back the chain and early audit; retry commits both", async () => {
+    const seed = await seedTeam();
+    const item = await ingest(seed, {
+      kind: "deliverable",
+      path: "docs/atomic-social.md",
+      body: "external evidence",
+      access: "external",
+    });
+    await seedChain(seed.teamId, "external", item.id, "opp-atomic-ingest");
+
+    const raw = new Client({ connectionString: process.env.DATABASE_URL });
+    await raw.connect();
+    await raw.query(
+      `create or replace function _a13_fail_plans() returns trigger as $$ begin raise exception 'a13 plan failure'; end $$ language plpgsql;
+       create trigger _a13_t_fail_plans before update on content_plans for each row execute function _a13_fail_plans();`
+    );
+    try {
+      await expect(
+        ingest(seed, {
+          kind: "deliverable",
+          path: "docs/atomic-social.md",
+          body: "external evidence",
+          access: "team",
+        })
+      ).rejects.toThrow(/a13 plan failure/);
+      const { data: stored } = await db()
+        .from("items")
+        .select("access")
+        .eq("team_id", seed.teamId)
+        .eq("id", item.id)
+        .single();
+      expect((stored as { access: string }).access).toBe("external");
+      expect(await chainAccess(seed.teamId)).toEqual({
+        opportunities: ["external"],
+        plans: ["external"],
+        variants: ["external"],
+        approvals: ["external"],
+        media: ["external"],
+        publications: ["external"],
+        analytics: ["external"],
+      });
+      const { data: audits } = await db()
+        .from("audit_log")
+        .select("id")
+        .eq("team_id", seed.teamId)
+        .eq("action", "social.tier_narrowed");
+      expect(audits ?? []).toHaveLength(0);
+    } finally {
+      await raw
+        .query(
+          `drop trigger if exists _a13_t_fail_plans on content_plans; drop function if exists _a13_fail_plans();`
+        )
+        .catch(() => {});
+      await raw.end().catch(() => {});
+    }
+
+    await ingest(seed, {
+      kind: "deliverable",
+      path: "docs/atomic-social.md",
+      body: "external evidence",
+      access: "team",
+    });
+    expect((await chainAccess(seed.teamId)).opportunities).toEqual(["team"]);
+    const { data: audits } = await db()
+      .from("audit_log")
+      .select("id")
+      .eq("team_id", seed.teamId)
+      .eq("action", "social.tier_narrowed");
+    expect(audits ?? []).toHaveLength(1);
+  });
+
+  it("A13-13: an actual social audit INSERT deadlock is savepoint-local and the bound cascade commits once", async () => {
+    const seed = await seedTeam();
+    const item = await ingest(seed, {
+      kind: "deliverable",
+      path: "docs/audit-savepoint-social.md",
+      body: "external evidence for audit recovery",
+      access: "external",
+    });
+    await seedChain(seed.teamId, "external", item.id, "opp-audit-savepoint");
+    let attempts = 0;
+    let fired = 0;
+    const faulted = new PgClient({
+      decorateSessionExecutor: (execute) => {
+        attempts++;
+        return async <T>(text: string, params: unknown[] = []) => {
+          if (fired === 0 && /^INSERT INTO audit_log /i.test(text.replace(/\s+/g, " ").trim())) {
+            fired++;
+            await execute(
+              "do $a13$ begin raise exception 'social audit deadlock' using errcode = '40P01'; end $a13$"
+            );
+          }
+          return execute<T>(text, params);
+        };
+      },
+    });
+    const body = "external evidence for audit recovery";
+    const result = await ingestItem(
+      faulted,
+      { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: randomUUID() },
+      {
+        project: "acme",
+        kind: "deliverable",
+        actor: "tester",
+        frontmatter: {},
+        path: "docs/audit-savepoint-social.md",
+        body,
+        content_sha256: sha(body),
+      },
+      "team"
+    );
+
+    expect(result.accessChanged).toBe(true);
+    expect(fired, "the social.tier_narrowed audit INSERT fault fired").toBe(1);
+    expect(attempts, "the recovered audit deadlock did not replay ingest").toBe(1);
+    expect(await chainAccess(seed.teamId)).toEqual({
+      opportunities: ["team"],
+      plans: ["team"],
+      variants: ["team"],
+      approvals: ["team"],
+      media: ["team"],
+      publications: ["team"],
+      analytics: ["team"],
+    });
+    const { data: missedAudit } = await db()
+      .from("audit_log")
+      .select("id")
+      .eq("team_id", seed.teamId)
+      .eq("action", "social.tier_narrowed");
+    expect(missedAudit ?? []).toHaveLength(0);
+  });
+
+  it.each([
+    { pathKind: "unchanged-body", changed: false },
+    { pathKind: "changed-body", changed: true },
+  ])(
+    "A13-08/13: settled no-widening refusal performs no inherited/social cascade ($pathKind)",
+    async ({ pathKind, changed }) => {
+      const seed = await seedTeam();
+      const boot = await ensureAccessBootstrap(db(), seed.teamId);
+      if (!boot.ok) throw new Error(`bootstrap fixture failed: ${boot.error}`);
+      const originalBody = `external evidence for ${pathKind}`;
+      const path = `docs/no-widening-social-${pathKind}.md`;
+      const item = await ingest(seed, {
+        kind: "deliverable",
+        path,
+        body: originalBody,
+        access: "external",
+      });
+      await seedChain(seed.teamId, "external", item.id, `opp-no-widening-${pathKind}`);
+      const { data: general, error: projectError } = await db()
+        .from("projects")
+        .select("id")
+        .eq("team_id", seed.teamId)
+        .eq("kind", "system")
+        .eq("slug", "general")
+        .single();
+      const { data: externalGroup, error: groupError } = await db()
+        .from("groups")
+        .select("id")
+        .eq("team_id", seed.teamId)
+        .eq("slug", "external")
+        .eq("is_builtin", true)
+        .single();
+      if (projectError || groupError || !general || !externalGroup) {
+        throw new Error("no-widening fixture topology missing");
+      }
+      const { error: grantError } = await db().from("project_groups").insert({
+        team_id: seed.teamId,
+        project_id: general.id,
+        group_id: externalGroup.id,
+      });
+      if (grantError) throw new Error(`invalid topology fixture failed: ${grantError.message}`);
+
+      let cascadeWrites = 0;
+      const traced = new PgClient({
+        decorateSessionExecutor: (execute) => async <T>(text: string, params: unknown[] = []) => {
+          const normalized = text.replace(/\s+/g, " ").trim();
+          if (
+            /^UPDATE (tasks|extracted_facts|stakeholder_mentions|social_opportunities|content_plans|content_variants|content_approvals|media_assets|social_publications|publication_analytics) /i.test(
+              normalized
+            )
+          ) {
+            cascadeWrites++;
+          }
+          return execute<T>(text, params);
+        },
+      });
+      const attemptedBody = changed ? `${originalBody}\nrejected edit` : originalBody;
+      await expect(
+        ingestItem(
+          traced,
+          { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: randomUUID() },
+          {
+            project: "acme",
+            kind: "deliverable",
+            actor: "tester",
+            frontmatter: {},
+            path,
+            body: attemptedBody,
+            content_sha256: sha(attemptedBody),
+          },
+          "team"
+        )
+      ).rejects.toThrow(/context gate refusal|no-widening/i);
+
+      expect(cascadeWrites, "early desired-audience gate runs before expensive cascade writes").toBe(0);
+      const { data: stored } = await db()
+        .from("items")
+        .select("access, body")
+        .eq("team_id", seed.teamId)
+        .eq("id", item.id)
+        .single();
+      expect(stored).toMatchObject({ access: "external", body: originalBody });
+      expect(await chainAccess(seed.teamId)).toEqual({
+        opportunities: ["external"],
+        plans: ["external"],
+        variants: ["external"],
+        approvals: ["external"],
+        media: ["external"],
+        publications: ["external"],
+        analytics: ["external"],
+      });
+    }
+  );
 
   it("stops serving it on the external read path — the observable leak", async () => {
     const seed = await seedTeam();

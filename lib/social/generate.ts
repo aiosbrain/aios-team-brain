@@ -4,6 +4,7 @@ import { getBrandProfile } from "@/lib/brand/manage";
 import { listBrandAssets } from "@/lib/brand/assets";
 import { visibleByAccess } from "@/lib/auth/visibility";
 import { completeText, resolveProviderKeys, type CompleteArgs } from "./llm";
+import { modelFeatureVerdict, modelFeaturesEnabled } from "@/lib/staging/model-features";
 import { governanceFromBrand, validateContent, type ContentFinding } from "./validate";
 import { getOpportunity, getPlan, getVariant, listVariants, setVariantGeneration, setVariantStatus } from "./store";
 import type { BrandProfileRecord } from "@/lib/brand/manage";
@@ -131,6 +132,14 @@ export async function generateVariantText(
 ): Promise<GenerateResult> {
   const variant = await getVariant(db, teamId, variantId);
   if (!variant) throw new Error(`generateVariantText: variant ${variantId} not found for team`);
+  // M9: before ANY status write. Without this, key resolution threw from inside the completer —
+  // after `setVariantStatus(…, "generating")` — so a deployment-level condition left a trail of
+  // variants marked `failed`, as if the model had produced something unusable. An INJECTED
+  // completer (`opts.complete`, used by tests and by any future non-provider path) is not gated:
+  // the policy is about provider spend, and the central resolver remains the backstop for it.
+  if (!opts.complete && !modelFeaturesEnabled("background")) {
+    throw new Error(`generateVariantText: ${modelFeatureVerdict("background").message}`);
+  }
   // Guard at the writer, not just the caller loop (CLAUDE.md §2): never overwrite a variant that has
   // advanced past drafting — a regenerated, possibly gate-rejected body must not replace one that can
   // still fire (audit #3). First generation is from `planned`; `failed`/`rejected` may be retried.

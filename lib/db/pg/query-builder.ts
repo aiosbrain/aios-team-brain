@@ -1,6 +1,7 @@
 import "server-only";
 import { runSql } from "./pool";
 import { lookupRelationship } from "./relationships";
+import type { SqlExecutor } from "@/lib/db/types";
 
 /**
  * A PostgREST-compatible query builder over `pg`, supporting exactly the subset
@@ -18,6 +19,17 @@ export interface PgResult<T = unknown> {
   error: { message: string } | null;
   count: number | null;
 }
+
+export interface PgEnvelopeContext {
+  table: string;
+  operation: "select" | "insert" | "update" | "upsert" | "delete";
+  sql?: string;
+}
+
+export type PgEnvelopeInterceptor = (
+  context: PgEnvelopeContext,
+  result: PgResult<unknown>
+) => PgResult<unknown> | Promise<PgResult<unknown>>;
 
 type FilterOp = "eq" | "neq" | "gt" | "gte" | "lt" | "lte" | "in" | "is" | "like";
 interface Filter {
@@ -91,8 +103,14 @@ export class PgQuery<T = unknown> implements PromiseLike<PgResult<T>> {
   private payload?: unknown;
   private conflictCols?: string;
   private textSearchSpec?: { col: string; query: string; config: string };
+  private currentSql: string | undefined;
 
-  constructor(private readonly table: string, private readonly executeSql: typeof runSql = runSql) {}
+  constructor(
+    private readonly table: string,
+    private readonly executor: SqlExecutor = runSql,
+    private readonly reportFailure?: (error: unknown, sql?: string) => void,
+    private readonly interceptEnvelope?: PgEnvelopeInterceptor
+  ) {}
 
   // ── shape ──────────────────────────────────────────────────────────────────
   select(spec = "*", opts?: { count?: "exact"; head?: boolean }): this {
@@ -207,22 +225,50 @@ export class PgQuery<T = unknown> implements PromiseLike<PgResult<T>> {
 
   private async execute(): Promise<PgResult<T>> {
     try {
+      let result: PgResult<T>;
       switch (this.op) {
         case "select":
-          return await this.runSelect();
+          result = await this.runSelect();
+          break;
         case "insert":
         case "upsert":
-          return await this.runInsert();
+          result = await this.runInsert();
+          break;
         case "update":
-          return await this.runUpdate();
+          result = await this.runUpdate();
+          break;
         case "delete":
-          return await this.runDelete();
+          result = await this.runDelete();
+          break;
       }
+      // Native adapter validation errors (for example .single() receiving multiple rows) happen
+      // after healthy SQL, so report them before an early return or interceptor can otherwise let
+      // an ignored error manufacture a successful transaction commit.
+      if (result.error) {
+        this.reportFailure?.(new Error(result.error.message), this.currentSql);
+      }
+      if (!this.interceptEnvelope) return result;
+      const intercepted = (await this.interceptEnvelope(
+        { table: this.table, operation: this.op, sql: this.currentSql },
+        result as PgResult<unknown>
+      )) as PgResult<T>;
+      // A test/decorator-produced returned error is just as fatal to a transaction as an executor
+      // throw. Recording it here prevents an instrumented envelope from manufacturing a commit.
+      if (!result.error && intercepted.error) {
+        this.reportFailure?.(new Error(intercepted.error.message), this.currentSql);
+      }
+      return intercepted;
     } catch (err) {
+      this.reportFailure?.(err, this.currentSql);
       const message = err instanceof Error ? err.message : "pg query failed";
       console.error(`[pg] ${this.op} ${this.table}: ${message}`);
       return { data: null, error: { message }, count: null };
     }
+  }
+
+  private async executeSql<R>(text: string, params: unknown[]): Promise<{ rows: R[]; rowCount: number }> {
+    this.currentSql = text;
+    return this.executor<R>(text, params);
   }
 
   private whereClause(p: Params): string {

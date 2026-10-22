@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { ingestItem } from "@/lib/ingest";
 import type { ItemPayload } from "@/lib/api/schemas";
 import type { DbClient } from "@/lib/db/types";
-import { db, seedTeam, sha } from "./helpers";
+import { db, seedTeam, sha, transactionDecoratedDb } from "./helpers";
 
 /**
  * Spec for audit finding H4: the item write and the task/decision materialize are not one
@@ -15,9 +15,9 @@ import { db, seedTeam, sha } from "./helpers";
 
 /** Real client, but the tasks upsert throws — simulates a DB failure mid-materialize. */
 function failTasksUpsert(real: DbClient): DbClient {
-  return {
+  return transactionDecoratedDb(real, (bound) => ({
     from(table: string) {
-      const builder = real.from(table);
+      const builder = bound.from(table);
       if (table !== "tasks") return builder;
       return new Proxy(builder, {
         get(target, prop, recv) {
@@ -31,8 +31,8 @@ function failTasksUpsert(real: DbClient): DbClient {
         },
       }) as unknown as ReturnType<DbClient["from"]>;
     },
-    rpc: real.rpc.bind(real),
-  };
+    rpc: bound.rpc.bind(bound),
+  }));
 }
 
 describe("ingest atomicity under mid-materialize failure (real Postgres)", () => {
@@ -54,15 +54,19 @@ describe("ingest atomicity under mid-materialize failure (real Postgres)", () =>
     // 1) Push with the faulty client — materialize throws, so ingestItem must throw.
     await expect(ingestItem(failTasksUpsert(db()), auth, payload, "team")).rejects.toThrow();
 
-    // 2) The item exists but is NOT marked synced (sha withheld), and no task row materialized.
+    // 2) A failed first ingest is fully atomic: no item/version/task survives.
     const { data: item } = await db()
       .from("items")
       .select("id, content_sha256")
       .eq("team_id", seed.teamId)
       .eq("path", "board.md")
       .maybeSingle();
-    expect(item).toBeTruthy();
-    expect((item as { content_sha256: string }).content_sha256).not.toBe(sha(body));
+    expect(item).toBeNull();
+    const { data: versionsAfterFail } = await db()
+      .from("item_versions")
+      .select("id")
+      .eq("content_sha256", sha(body));
+    expect(versionsAfterFail ?? []).toHaveLength(0);
     const { data: tasksAfterFail } = await db()
       .from("tasks")
       .select("row_key")
@@ -70,10 +74,9 @@ describe("ingest atomicity under mid-materialize failure (real Postgres)", () =>
       .eq("row_key", "T-1");
     expect(tasksAfterFail ?? []).toHaveLength(0);
 
-    // 3) Retry with a healthy client — because the sha was never committed, it reprocesses (not a
-    //    no-op "unchanged"), materializes the task, and commits the sha.
+    // 3) Retry with a healthy client creates and materializes successfully.
     const res = await ingestItem(db(), auth, payload, "team");
-    expect(res.status).not.toBe("unchanged");
+    expect(res.status).toBe("created");
     const { data: itemOk } = await db()
       .from("items")
       .select("content_sha256")

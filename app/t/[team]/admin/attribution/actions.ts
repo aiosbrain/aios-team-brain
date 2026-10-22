@@ -7,6 +7,7 @@ import { bustTeamLearningCaches } from "@/lib/ingest/reconcile-attribution";
 import { adminClient } from "@/lib/db/admin";
 import { requireTeamAdmin } from "@/lib/auth/guard";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
+import { modelFeatureVerdict, modelFeaturesEnabled } from "@/lib/staging/model-features";
 import {
   buildCorrectionContext,
   parseCorrectionPlan,
@@ -32,6 +33,13 @@ export async function previewAttributionCorrectionAction(
   if (!ctx) return { ok: false, error: "admins only" };
   const trimmed = instruction.trim();
   if (!trimmed) return { ok: false, error: "describe the correction" };
+
+  // M9: the instruction is PARSED by a model — there is no non-model reading of free text, so this
+  // refuses by name. After the admin gate, before the eager key resolution, and before the
+  // correction context is built (a read that would otherwise be performed for nothing).
+  if (!modelFeaturesEnabled("background")) {
+    return { ok: false, error: modelFeatureVerdict("background").message ?? "model-backed answering is disabled" };
+  }
 
   try {
     const db = adminClient();

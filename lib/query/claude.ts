@@ -288,6 +288,8 @@ export async function* streamAnswer(
   timeZone: string = "UTC",
   retryOpts: StreamRetryOptions = {}
 ): AsyncGenerator<StreamAnswerEvent> {
+  const { assertCopiedStagingSpendAllowed } = await import("@/lib/staging/runtime-policy");
+  assertCopiedStagingSpendAllowed("interactive-query");
   yield* withStreamRetry(
     () => streamAnswerOnce(ctx, question, keys, history, caller, timeZone),
     // ANY yielded event commits the stream: once the client has received anything — a delta OR the

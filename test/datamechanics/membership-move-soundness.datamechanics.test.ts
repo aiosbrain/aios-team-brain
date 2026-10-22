@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { db, ingest, seedTeam, type Seed } from "./helpers";
+import {
+  db,
+  ingest,
+  seedTeam,
+  transactionDecoratedDb,
+  transactionSessionDecoratedDb,
+  type Seed,
+} from "./helpers";
 import { reconcileItemContext } from "@/lib/projects/context/reconcile-item";
 import { closeMembershipInto } from "@/lib/projects/context/memberships";
 import { reconcileItemUnit } from "@/lib/projects/context/units";
@@ -52,7 +59,7 @@ function clientWithFailingRead(table: string, opts: { skip?: number } = {}) {
   const real = db();
   let seen = 0;
   const skip = opts.skip ?? 0;
-  return new Proxy(real as object, {
+  return transactionDecoratedDb(real, (base) => new Proxy(base as object, {
     get(target, prop, recv) {
       if (prop !== "from") return Reflect.get(target, prop, recv);
       return (name: string) => {
@@ -72,7 +79,7 @@ function clientWithFailingRead(table: string, opts: { skip?: number } = {}) {
         });
       };
     },
-  }) as ReturnType<typeof db>;
+  }) as ReturnType<typeof db>);
 }
 
 describe("AUDITFIX-4: a membership move that did not move must not report success", () => {
@@ -103,7 +110,7 @@ describe("AUDITFIX-4: a membership move that did not move must not report succes
 
     // Now hand the close a client whose FIRST membership read yields the stale A.
     let firstRead = true;
-    const stale = new Proxy(db() as object, {
+    const stale = transactionDecoratedDb(db(), (base) => new Proxy(base as object, {
       get(t, prop, recv) {
         if (prop !== "from") return Reflect.get(t, prop, recv);
         return (name: string) => {
@@ -129,7 +136,7 @@ describe("AUDITFIX-4: a membership move that did not move must not report succes
           });
         };
       },
-    }) as ReturnType<typeof db>;
+    }) as ReturnType<typeof db>);
 
     const res = await closeMembershipInto(stale, seed.teamId, unit, general);
     const finalRows = await currentRows(seed, general, unit);
@@ -161,7 +168,7 @@ describe("AUDITFIX-4: a membership move that did not move must not report succes
 
     // …but the close is handed a classification read that still shows it as a closable include.
     let firstRead = true;
-    const stale = new Proxy(db() as object, {
+    const stale = transactionDecoratedDb(db(), (base) => new Proxy(base as object, {
       get(t, prop, recv) {
         if (prop !== "from") return Reflect.get(t, prop, recv);
         return (name: string) => {
@@ -188,7 +195,7 @@ describe("AUDITFIX-4: a membership move that did not move must not report succes
           });
         };
       },
-    }) as ReturnType<typeof db>;
+    }) as ReturnType<typeof db>);
 
     const res = await closeMembershipInto(stale, seed.teamId, unit, general);
 
@@ -240,7 +247,7 @@ describe("AUDITFIX-4: a membership move that did not move must not report succes
     await plant(seed, general, unit, "include", "auto"); // A replaced by B → the update matches 0
 
     let read = 0;
-    const faultReread = new Proxy(db() as object, {
+    const faultReread = transactionDecoratedDb(db(), (base) => new Proxy(base as object, {
       get(t, prop, recv) {
         if (prop !== "from") return Reflect.get(t, prop, recv);
         return (name: string) => {
@@ -271,7 +278,7 @@ describe("AUDITFIX-4: a membership move that did not move must not report succes
           });
         };
       },
-    }) as ReturnType<typeof db>;
+    }) as ReturnType<typeof db>);
 
     const res = await closeMembershipInto(faultReread, seed.teamId, unit, general);
     expect(res.ok, "a reread that failed cannot be read as convergence").toBe(false);
@@ -340,43 +347,32 @@ describe("AUDITFIX-4: a membership move that did not move must not report succes
     const unit = await unitOf(seed, item.id);
 
     // The reconciler's FIRST read (items) yields a stale `external`; the row really says `team`.
-    let itemsRead = true;
-    const staleItem = new Proxy(db() as object, {
-      get(t, prop, recv) {
-        if (prop !== "from") return Reflect.get(t, prop, recv);
-        return (name: string) => {
-          const q = (t as { from: (n: string) => unknown }).from(name);
-          if (name !== "items") return q;
-          return new Proxy(q as object, {
-            get(qt, qp, qr) {
-              const v = Reflect.get(qt, qp, qr);
-              if (qp !== "then") {
-                return typeof v === "function"
-                  ? (...a: unknown[]) => {
-                      const r = (v as (...x: unknown[]) => unknown).apply(qt, a);
-                      return r === qt ? qr : r;
-                    }
-                  : v;
-              }
-              if (itemsRead) {
-                itemsRead = false;
-                return (res: (x: unknown) => unknown) =>
-                  res({
-                    data: { id: item.id, access: "external", content_sha256: "stale", work_at: new Date(0).toISOString() },
-                    error: null,
-                  });
-              }
-              return v;
-            },
-          });
-        };
+    let injected = false;
+    const staleItem = transactionSessionDecoratedDb(db(), (session) => ({
+      ...session,
+      executeSql: async <T>(text: string, params: unknown[] = []) => {
+        const result = await session.executeSql<T>(text, params);
+        if (!injected && /from items[\s\S]*for update/i.test(text)) {
+          injected = true;
+          return {
+            ...result,
+            rows: result.rows.map((row) => ({
+              ...(row as object),
+              access: "external",
+              content_sha256: "stale",
+              work_at: new Date(0).toISOString(),
+            })) as T[],
+          };
+        }
+        return result;
       },
-    }) as ReturnType<typeof db>;
+    }));
 
     const res = await reconcileItemUnit(staleItem, seed.teamId, item.id);
 
     // THE PROPERTY: the audience the caller routes on is the item's TRUE access, never the stale read.
     expect(res.ok, res.error).toBe(true);
+    expect(injected, "the stale-result executor seam fired at the locked item read").toBe(true);
     expect(res.audience, "routes on the item version that authorized it, not the stale read").toBe("team");
 
     const { data: after } = await db().from("project_context_units").select("audience")
@@ -384,15 +380,10 @@ describe("AUDITFIX-4: a membership move that did not move must not report succes
     expect((after as { audience: string }).audience, "and the row itself was not moved to the stale value").toBe("team");
   });
 
-  it("AC5: a NARROWING move whose SECOND write fails leaves DENIAL, not external exposure", async () => {
-    // THE PIN for close-before-open (spec §3a). Fable's HIGH 2: without it the entire `if (narrowing)`
-    // branch — "the part that actually removes the exposure" — can be deleted with the whole suite
-    // green, because every other test either drives the writers directly or asserts an
-    // order-insensitive final state.
-    //
-    // The property is asserted through visibleItemIds, the access primitive, not through the rows:
-    // "still externally readable" is the outcome that matters, and a row-level assertion would pass
-    // an implementation that merely rearranged the rows.
+  it("AC5/A13-05: a standalone narrowing move whose second write fails rolls back the close", async () => {
+    // AUDITFIX-13 makes the whole context operation atomic. This fixture deliberately plants a
+    // pre-existing item/membership inconsistency outside the owner; a failed repair preserves that
+    // pre-attempt state instead of committing AUDITFIX-4's former half-move denial.
     const seed = await seedTeam();
     const item = await ingest(seed, { path: "m/g.md", body: "g", access: "external", project: "mproj" });
     const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
@@ -412,7 +403,7 @@ describe("AUDITFIX-4: a membership move that did not move must not report succes
     // Narrow it, and fault the SECOND write of the move (the open of General).
     await db().from("items").update({ access: "team" }).eq("id", item.id).eq("team_id", seed.teamId);
     let inserts = 0;
-    const faultSecondWrite = new Proxy(db() as object, {
+    const faultSecondWrite = transactionDecoratedDb(db(), (base) => new Proxy(base as object, {
       get(t, prop, recv) {
         if (prop !== "from") return Reflect.get(t, prop, recv);
         return (name: string) => {
@@ -440,16 +431,16 @@ describe("AUDITFIX-4: a membership move that did not move must not report succes
           });
         };
       },
-    }) as ReturnType<typeof db>;
+    }) as ReturnType<typeof db>);
 
     const r = await reconcileItemContext(faultSecondWrite, seed.teamId, item.id);
     expect(r.ok, "the move must report failure when its second write fails").toBe(false);
     expect(inserts, "fixture: the open was actually attempted").toBeGreaterThan(0);
 
-    // THE OUTCOME: the external reader must NOT still be able to read it. Under open-then-close the
-    // close never runs, the external-shared include survives, and this assertion fails.
+    // THE OUTCOME: no partial close committed. A later successful reconcile repairs this planted
+    // inconsistency; the failed attempt cannot claim convergence.
     const after = await visibleItemIds(db(), { teamId: seed.teamId, memberId: outsider });
-    expect(after.ids.has(item.id), "a failed narrowing must DENY, never leave external exposure").toBe(false);
+    expect(after.ids.has(item.id), "rollback preserves the pre-attempt external membership").toBe(true);
   });
 
   it("AC9d: a NARROWING move does not destroy the old membership when the gate cannot answer", async () => {

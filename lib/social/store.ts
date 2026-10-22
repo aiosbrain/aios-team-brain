@@ -461,9 +461,9 @@ async function idsIn(
  *
  * NOT best-effort: a row left at the old tier IS the leak, so failures propagate to the caller — and
  * because the walk is anchored on the evidence match rather than on the rows' current tier, it is
- * IDEMPOTENT: whatever a failed attempt already narrowed, the retry simply re-narrows. That, not the
- * write order, is what makes a partial failure recoverable (each statement autocommits; there is no
- * enclosing transaction).
+ * IDEMPOTENT. Standalone calls autocommit statement-by-statement, so the early audit survives a later
+ * partial write and retry re-walks the chain. In ingest it receives the bound client: the early audit
+ * and all cascade writes commit or roll back together with the item/context transition.
  *
  * Each table is narrowed by ITS OWN single-writer module (`lib/media/store`, `lib/social/publications`,
  * `lib/social/analytics`) rather than from here — writing them directly would work, and would even slip
@@ -483,12 +483,12 @@ export async function narrowSocialChainForItem(
 ): Promise<number> {
   // The scan is anchored on the EVIDENCE MATCH ALONE — deliberately NOT on `access = 'external'`.
   //
-  // These statements each autocommit (no enclosing transaction), so a mid-walk failure is real: the
+  // Standalone these statements autocommit, so a mid-walk failure is real: the
   // opportunity narrows, then the plan update throws. If the anchor also required the opportunity to be
   // `external`, the retry would find nothing citing this item, return 0, and leave the plan/variant —
   // the actual derived post body, still publishable — at `external` FOREVER. Anchoring on the evidence
   // makes the whole walk idempotent, so every retry re-narrows the full chain regardless of how far the
-  // previous attempt got. (Verified to that outcome by a spec that simulates the crash point.)
+  // previous attempt got. During ingest the same code is connection-bound and atomic instead.
   const { data, error } = await db
     .from("social_opportunities")
     .select("id, evidence, access")

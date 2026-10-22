@@ -249,6 +249,10 @@ have the fix. Reviewer should rule.
 | `.claude/skills/{adversarial-build,adversarial-build-astra,branch-reconciliation,pr-review-attestation,test-ci-wiring-audit}/**` | `currently \`main\`` → `currently \`staging\`` |
 | `.agents/**`, `.opencode/**`, `.cursor/**` | REGENERATED ONLY, by `scripts/sync-skill-runtimes.sh` |
 | `docs/RELEASING.md` | §3 cutover status, constraint rows 1/4/5/7/8, §3.2 ordering pairs |
+| `CLAUDE.md` | **ADDED to Scope by Fable's RELPTR-7 diff review.** §6 said "Deploys happen ONLY by merging to `main`", so post-cutover an agent merging to `staging` would run the **production** schema load for code not on `main`. Out of the original fence, in-scope now: it is the file every session reads and the one stale claim with an operational blast radius |
+| `docs/CI-ARCHITECTURE.md` | **ADDED to Scope by the same review** — a FIFTH carrier of the superseded `pull_request_target` model (open finding 7 said four). Three sites: the `evil2 → evil` base-branch claim, the "run's ref is the PR's target branch" cost paragraph, and `scan-on-merge`'s `main`-only note |
+| `test/guards/releasing-runbook.test.ts` | **ADDED to Scope during the build.** It pinned §2's pre-cutover statement that a candidate is "expected to fail assertion D" — true while `main` was not an ancestor of `staging`, and the opposite of the truth now. Updated to assert the post-cutover expectation, plus new coverage for the fast-forward step Fable found missing |
+| `.github/workflows/nda-gate.yml`, `docs/ARCHITECTURE.md` | **ADDED to Scope by astra's cold review** — the SIXTH and SEVENTH carriers of the superseded `pull_request_target` model, where this spec had said four |
 | `docs/design/cutover-execution.md` | this spec |
 
 A change to any file not in this table is a finding, not a tidy-up.
@@ -369,3 +373,102 @@ Before contributions reopen, these must be observed rather than assumed:
 
 Re-triggering a deploy is a Railway **dashboard** action and stays a human step. Verifying the
 resulting state is an acceptance criterion of the cutover.
+
+
+---
+
+## RELPTR-7 diff review — what Fable found, and what it changes
+
+**Verdict: CLEAR-WITH-CONDITIONS.** All conditions folded before push. The findings worth carrying
+forward, because each names a defect class rather than a typo:
+
+1. **HIGH — an inverse guard that pinned PHRASES, not the CLAIM.** The first version forbade two exact
+   strings and was green over a file that asserted the same refuted model four lines higher ("the ref
+   is always the base branch"). *A guard that pins phrasing proves the text changed, not that the model
+   did.* Rewritten to forbid a family of assertions across BOTH `pull_request_target` workflows — with
+   a deliberate subtlety: the corrections **quote** the old claim in order to retract it, so retracted
+   lines are stripped before matching, and a dedicated test proves the stripping catches an unmarked
+   assertion while sparing a marked quotation.
+2. **A guard nobody could keep.** The first Dependabot test asserted every `package-ecosystem` value
+   was unique — a property Dependabot does not have (the same ecosystem in two directories is ordinary
+   config). It would have reddened on a legitimate change, which is how a guard gets deleted rather
+   than fixed. Replaced with a role-pin plus a per-entry count.
+3. **The release ritual never advanced `main`.** §2 produced a tag and stopped; the fast-forward that
+   makes a tag a release existed only as an aside in §3.1a. Following §2 as written would have left
+   installers on the pre-cutover `main` **forever**. Now step 5, with the ordering constraint.
+4. **Measured facts stated in the present tense go false silently.** Constraint rows 2/5/7/8 read as
+   current state; all four had been satisfied. Marked satisfied with the date, historical measurement
+   retained.
+5. **The four-carrier enumeration was wrong — there were five**, and the fifth was in the file that
+   documents CI itself.
+
+
+## RELPTR-7 cold review (gpt-6-astra) — BLOCKED, folded
+
+Four findings, all re-derived and all real. The two HIGHs were defects in the *folds*, which is the
+class the second reviewer exists for.
+
+1. **HIGH — the deploy fold I wrote permitted unreleased migrations against production.** `CLAUDE.md`
+   said to run `npm run pg:schema` against prod after the release fast-forward. `railway.json` already
+   runs it as the `preDeployCommand` **from the deployed artifact**, while a manual run reads YOUR
+   checkout (`loadSchema({ cwd = process.cwd() })`). Post-cutover the local checkout is routinely AHEAD
+   of the release: tag `A` ships, local `staging` is at `B`, and the manual run applies **B's
+   unreleased migrations to production**. Pre-cutover this was near-safe because `main` was what you
+   had just merged — *the cutover is what made the old instruction dangerous, and my fold repeated it*.
+   Now: do not run it by hand; verify the release's preDeploy step instead.
+2. **HIGH — the carrier sweep was incomplete and the new guard falsely certified it.** Live assertions
+   survived in `pr-task-link.yml`, `aios-work-sync.yml` and `docs/CI-ARCHITECTURE.md`, and there was a
+   **sixth** carrier (`.github/workflows/nda-gate.yml`) and a seventh (`docs/ARCHITECTURE.md`) where
+   this spec had said four. Worse, two evasions of the guard itself: a line carrying a retraction word
+   AND a live assertion was stripped whole (`# The main-only policy is obsolete; the ref is always the
+   base branch.`), and the positive half was satisfied by the literal date with every explanation
+   deleted. **Fixed by changing the exemption from lines to SPANS**, on a rule that is checkable:
+   *history goes in quotes or parentheses; assertions do not.* Both evasions are now explicit tests.
+3. **MEDIUM — Dependabot coverage could vanish while both guards passed**, because the expected count
+   was derived from the same list being checked. Required (ecosystem, directory) pairs are now pinned
+   explicitly; extra entries and repeated ecosystems in different directories remain legal.
+4. **MEDIUM — the new identity trap, demonstrated.** `CONTRIBUTION_BASE === INTEGRATION_BRANCH ===
+   "staging"`, so substituting one role for the other in the Dependabot assertions passed. A
+   source-token pin now discriminates them, with the same honest caveat RELPTR-6 recorded: it is
+   evadable by an equivalent spelling, and an evadable pin beats none when no value assertion can see
+   the difference.
+
+**One mutation SURVIVED and is recorded rather than hidden:** stripping three of the seven statements
+of the current model from `pr-task-link.yml` leaves the guard green — because four remain. The claim
+astra actually made (a bare date satisfies the positive half) is closed and unit-proven:
+`CURRENT_MODEL` rejects `# 2025-12-08`, and stripping *every* statement reddens.
+
+
+## RELPTR-7 re-clear (Fable, round 2) — BLOCKED, folded
+
+The round that mattered most, because it attacked the *folds*.
+
+1. **HIGH — the guard certifying the whole sweep was blind to a third of the file it read.** v3 exempted
+   history by SPAN, but `/"[^"]*"/` lets the span cross NEWLINES, and `pr-task-link.yml`'s `run:` heredoc
+   has odd numbers of `"` per line. Measured: **35.3% of the file stripped**, including two spans of 16
+   and 18 lines of executable code. An assertion placed anywhere inside them was invisible; an unbalanced
+   `(` in any comment did the same until the next `)`. *The instrument certifying "seven carriers, all
+   fixed" could not see a third of one file.* **v4:** only COMMENT lines are considered at all, and a
+   span may not cross a line. Fable's injection is now a standing negative control.
+2. **HIGH — the production-safety fix was incomplete.** `DEVELOPMENT.md` still instructed the manual prod
+   `pg:schema` run verbatim, and `CLAUDE.md` §6 twice plus `scripts/pg-load-schema.mjs`'s own header still
+   called it "the prod rollout step" — contradicting the ⛔ forty lines below, and contradicting
+   `docs/OPS.md` and the `railway-deploy-verify` skill, which already said never to do it. All four fixed.
+3. **HIGH — three surviving carriers**, two in text this slice had already edited: `CI-ARCHITECTURE.md`
+   ("the trigger here is pinned to `[main]`… the trigger list and the branch policy move together" — both
+   false), `scan-on-merge.yml` ("policy allows `main` only"), `RELEASING.md` §3.1c's item-4 heading. The
+   guard now covers **four** files, and `scan-on-merge.yml` — a `push` workflow — gets its own assertion
+   rather than being forced to state a rule that does not govern it.
+4. **MEDIUM — §2 step 5 described enforcement that does not exist.** Measured on `main`: `Release
+   candidate gate` is NOT required, `enforce_admins: false`, no bypass allowance. So a non-admin's
+   fast-forward is refused by "require a pull request" whatever the contexts say, and an **admin's push
+   bypasses everything, including a pending or red gate**. The step now says the wait is human discipline
+   and names what would make it real.
+5. **MEDIUM — the `branches.mjs` header moved to past tense; its two readers did not.** Retired in
+   `branch-roles.test.ts` and `release-candidate-guard.mjs`.
+
+**The generalisable lesson, which is why this is written down rather than summarised:** across three
+rounds the same defect recurred at three levels — a guard pinning a PHRASE, then a guard pinning a LINE,
+then a guard whose exemption SPAN ran away. Each version looked stricter than the last and each was
+blind in a way only an adversarial reader found. A guard over prose needs its blind spot measured, not
+argued.

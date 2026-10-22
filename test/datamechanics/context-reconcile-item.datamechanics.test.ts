@@ -139,8 +139,7 @@ describe("reconcileItemContext (the shared per-item core)", () => {
     expect(projects, "the initiative membership must survive the tier-flip move").toContain(initiative!.id);
   });
 
-  it("a NON-push tier change (settleReclassification) re-partitions the item (Codex HIGH — the fan-out point)", async () => {
-    const { settleReclassification } = await import("@/lib/ingest/reclassify");
+  it("a non-HTTP ingestItem reclassification transaction re-partitions the item", async () => {
     const seed = await seedTeam();
     await ensureAccessBootstrap(db(), seed.teamId);
     const item = await ingest(seed, { path: "n.md", body: "n", access: "external", project: "src" });
@@ -148,10 +147,16 @@ describe("reconcileItemContext (the shared per-item core)", () => {
     const s = await sys(seed);
     expect(await membershipProjects(seed, item.id)).toEqual([s.externalShared]);
 
-    // Simulate a reclassification that did NOT go through the push route: flip access, then call
-    // the fan-out directly (as a connector re-sync would via ingestItem).
-    await db().from("items").update({ access: "team" }).eq("id", item.id).eq("team_id", seed.teamId);
-    await settleReclassification(db(), seed.teamSlug, { teamId: seed.teamId, itemId: item.id, from: "external", to: "team", source: null });
+    // The internal helper is a real non-HTTP caller of the public ingest owner. Same body exercises
+    // the unchanged-body access-heal path whose item/context move is now transaction-owned.
+    const narrowed = await ingest(seed, {
+      path: "n.md",
+      body: "n",
+      access: "team",
+      project: "src",
+    });
+    expect(narrowed.status).toBe("unchanged");
+    expect(narrowed.accessChanged).toBe(true);
     const after = await membershipProjects(seed, item.id);
     expect(after).toEqual([s.general]);
     expect(after, "the reclassification fan-out must move it off external-shared").not.toContain(s.externalShared);

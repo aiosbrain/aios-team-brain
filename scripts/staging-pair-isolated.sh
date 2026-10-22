@@ -1,0 +1,689 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Required mode (the CI lane sets it): a missing engine is a FAILURE, never a quiet pass. Without
+# this, "docker is not installed" and "every assertion held" are the same green tick.
+if [[ "${STAGING_PAIR_REQUIRED:-}" == "1" ]]; then
+  for binary in docker node; do
+    command -v "$binary" >/dev/null 2>&1 || { echo "staging paired refresh lane requires $binary" >&2; exit 1; }
+  done
+  docker compose version >/dev/null 2>&1 || { echo "staging paired refresh lane requires the docker compose plugin" >&2; exit 1; }
+  docker info >/dev/null 2>&1 || { echo "staging paired refresh lane requires a running Docker engine" >&2; exit 1; }
+fi
+
+project="aios-staging-pair-${USER:-runner}-$$"
+harness_root="$(mktemp -d "${TMPDIR:-/tmp}/aios-staging-pair.XXXXXX")"
+baseline_mode="${STAGING_PAIR_BASELINE_MODE:-legacy-pg-only}"
+case "$baseline_mode" in
+  legacy-pg-only|copy-ready) ;;
+  *) echo "STAGING_PAIR_BASELINE_MODE must be legacy-pg-only or copy-ready" >&2; exit 1 ;;
+esac
+export STAGING_PAIR_BASELINE_MODE="$baseline_mode"
+export STAGING_HARNESS_SECRETS_DIR="$harness_root/secrets"
+node scripts/staging-ops/generate-harness-secrets.mjs "$STAGING_HARNESS_SECRETS_DIR"
+export STAGING_COMPARISON_KEY_BASE64="$(tr -d '\n' < "$STAGING_HARNESS_SECRETS_DIR/exporter/comparison-key")"
+compose=(docker compose -p "$project" -f compose.test.staging-pair.yml)
+
+# Durable, REDACTED evidence. The harness root is a mktemp dir the trap deletes, so every failure
+# receipt and command log used to die with the run — on CI, the only record of why a required lane
+# failed. It also holds the generated keys, so "keep the directory" is not the fix: only `*.log`
+# files are copied, with harness secrets, URL credentials and bearer tokens masked.
+artifacts="${STAGING_PAIR_ARTIFACT_DIR:-$PWD/.staging-pair-artifacts}"
+
+# SERVICE LOGS, BEFORE TEARDOWN. `compose down` removes the containers and the artifact copy runs
+# after it — so on the runtime-4 failure the only things that survived were the cleanup output and
+# empty receipts. `maintenance` matters most: it spawns its children with `stdio: "inherit"`, so it
+# is the only place the app's own stdout/stderr exists at all. Everything written here goes through
+# the same secret-aware redactor as every other `*.log`. `logs` without `-f` returns on its own, and
+# a failure to read one service is reported and skipped rather than aborting the cleanup after it.
+capture_service_logs() {
+  for service in maintenance staging-pg prod-pg staging-neo4j prod-neo4j source-object-store rollback-object-store network-spy; do
+    if ! "${compose[@]}" logs --no-color --timestamps --tail 2000 "$service" >"$harness_root/service-$service.log" 2>&1; then
+      echo "harness diagnostics: could not read '$service' logs" >&2
+      echo "harness diagnostics: 'compose logs $service' failed" >>"$harness_root/service-$service.log"
+    fi
+  done
+}
+
+# Cleanup REPORTS what it could not clean up. `down … >/dev/null 2>&1 || true` silently tolerated a
+# failed teardown, and a run whose `up` died part-way left containers behind in `Created` with no
+# mention of it anywhere — so the next run inherited them and the failure looked like a new one.
+cleanup() {
+  # Collected FIRST, and never allowed to abort or replace the cleanup that follows it.
+  capture_service_logs || echo "harness diagnostics: service log capture failed" >&2
+  if ! "${compose[@]}" down -v --remove-orphans >"$harness_root/cleanup.log" 2>&1; then
+    echo "harness cleanup: 'compose down' failed for project $project" >&2
+    sed -n '1,40p' "$harness_root/cleanup.log" >&2
+  fi
+  # Anything still labelled with THIS project — a `Created` container from a half-finished `up`, or a
+  # `run --name` container from an interrupted step — removed by ID, scoped to this project only.
+  local leftovers
+  leftovers="$(docker ps -aq --filter "label=com.docker.compose.project=$project" 2>/dev/null || true)"
+  if [[ -n "$leftovers" ]]; then
+    echo "harness cleanup: removing leftover container(s) of project $project" >&2
+    # shellcheck disable=SC2086 -- deliberate word splitting: one ID per line
+    docker rm -f $leftovers >>"$harness_root/cleanup.log" 2>&1 || echo "harness cleanup: could not remove every container of project $project" >&2
+  fi
+  # A redaction failure must be VISIBLE: silently discarding it is how a run ends with no evidence
+  # and no explanation. The raw harness root is still removed either way — it holds the keys.
+  if ! node scripts/staging-ops/redact-artifacts.mjs "$harness_root" "$STAGING_HARNESS_SECRETS_DIR" "$artifacts" >"$harness_root/redact.log" 2>&1; then
+    echo "harness diagnostics: artifact redaction failed; no evidence was preserved for this run" >&2
+    sed -n '1,20p' "$harness_root/redact.log" >&2
+  fi
+  rm -rf -- "$harness_root"
+}
+trap cleanup EXIT INT TERM
+
+expect_failure() {
+  local label="$1"
+  shift
+  if "$@" >"$harness_root/$label.log" 2>&1; then
+    echo "expected denial unexpectedly succeeded: $label" >&2
+    return 1
+  fi
+  echo "verified denial: $label"
+}
+
+# ── Receipts ────────────────────────────────────────────────────────────────────────────────────
+# `expect_failure` alone asserts "this exited non-zero", which a preflight refusal, a container that
+# never started and a discovery error satisfy exactly as well as the fault the scenario is about —
+# and the follow-up `assert vN` passes because the prior pair was ALREADY installed before the
+# scenario ran. So each failure scenario now also demands the specific receipts the intended
+# checkpoint emits (`scripts/staging-ops/receipts.mjs`), tied to the candidate run id.
+#
+# THE ARGUMENT IS A FILENAME, and it must say so. `expect_failure` takes a LABEL and appends `.log`;
+# these three open `$harness_root/$log` verbatim. Every caller passed the label, so `require_receipt
+# pre-drain-control …` read a file that does not exist — `grep` reported "No such file", the helper
+# returned 1, and stage 8 failed while the retained `pre-drain-control.log` showed the intended fault
+# had happened exactly as designed. A missing file is not an absent receipt, and `refuse_receipt`
+# would have "verified" the absence of a receipt in a file it never opened.
+#
+# So the file must EXIST, and the name must carry its extension. Both are refusals rather than
+# leniency: a helper that silently appended `.log` would hide a genuinely wrong filename, which is
+# the same class of bug one level along.
+receipt() {
+  local log="$1" kind="$2" pattern="$3"
+  [[ "$log" == *.log ]] || { echo "receipt helper needs an explicit .log FILENAME, got the label '$log'" >&2; return 2; }
+  [[ -f "$harness_root/$log" ]] || { echo "receipt helper: '$log' does not exist in the harness root; a missing file is not an absent receipt" >&2; return 2; }
+  grep -F "staging-ops-receipt $kind " "$harness_root/$log" | grep -Eq "$pattern"
+}
+
+require_receipt() {
+  local log="$1" kind="$2" pattern="$3" why="$4" status=0
+  receipt "$log" "$kind" "$pattern" || status=$?
+  if [[ "$status" -eq 0 ]]; then echo "verified receipt: $why"; return 0; fi
+  echo "missing receipt: $why (expected '$kind' matching $pattern in $log)" >&2
+  [[ -f "$harness_root/$log" ]] && sed -n '1,80p' "$harness_root/$log" >&2
+  return 1
+}
+
+refuse_receipt() {
+  local log="$1" kind="$2" pattern="$3" why="$4" status=0
+  receipt "$log" "$kind" "$pattern" || status=$?
+  # EXIT 2 IS "COULD NOT LOOK", and it must never read as "it is not there" — that is precisely how
+  # an unreadable filename would have turned into a verified absence.
+  if [[ "$status" -eq 2 ]]; then echo "cannot refuse a receipt in an unreadable log: $why" >&2; return 1; fi
+  if [[ "$status" -eq 0 ]]; then
+    echo "unexpected receipt: $why (found '$kind' matching $pattern in $log)" >&2
+    return 1
+  fi
+  echo "verified absence: $why"
+}
+
+journal_field() {
+  "${compose[@]}" exec -T staging-pg psql -U app -d brain -Atc \
+    "select coalesce($1::text,'') from staging_ops.refresh_journal where singleton=true" 2>/dev/null || true
+}
+
+require_journal() {
+  local field="$1" expected="$2" why="$3"
+  local observed
+  observed="$(journal_field "$field")"
+  if [[ "$observed" != "$expected" ]]; then
+    echo "journal $field is '$observed', expected '$expected' ($why)" >&2
+    return 1
+  fi
+  echo "verified journal: $field=$expected ($why)"
+}
+
+echo "[1/11] build and start isolated Postgres 18, Neo4j 5.26.2, and ACL object stores"
+"${compose[@]}" build exporter importer fixture-controller maintenance source-object-store rollback-object-store network-spy
+"${compose[@]}" up -d --wait --wait-timeout 180 prod-pg staging-pg prod-neo4j staging-neo4j source-object-store rollback-object-store network-spy
+"${compose[@]}" run --rm fixture-controller seed
+"${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs install-ops
+"${compose[@]}" up -d maintenance
+maintenance_ready=0
+for _ in $(seq 1 30); do
+  if "${compose[@]}" exec -T maintenance curl -fsS -H 'authorization: Bearer local-maintenance-token' http://127.0.0.1:8080/identity >/dev/null 2>&1; then
+    maintenance_ready=1
+    break
+  fi
+  sleep 1
+done
+if [[ "$maintenance_ready" -ne 1 ]]; then
+  echo "local maintenance controller did not start within 30 seconds" >&2
+  exit 1
+fi
+
+echo "[2/11] prove role network and mounted-key boundaries with non-vacuous positive controls"
+"${compose[@]}" run --rm --no-deps exporter scripts/staging-ops/network-boundary-probe.mjs allow prod-pg.railway.internal
+"${compose[@]}" run --rm --no-deps exporter scripts/staging-ops/network-boundary-probe.mjs allow source-object-store
+"${compose[@]}" run --rm --no-deps exporter scripts/staging-ops/network-boundary-probe.mjs deny staging-pg.railway.internal
+"${compose[@]}" run --rm --no-deps exporter scripts/staging-ops/network-boundary-probe.mjs deny rollback-object-store
+"${compose[@]}" run --rm --no-deps importer scripts/staging-ops/network-boundary-probe.mjs allow staging-pg.railway.internal
+"${compose[@]}" run --rm --no-deps importer scripts/staging-ops/network-boundary-probe.mjs allow source-object-store
+"${compose[@]}" run --rm --no-deps importer scripts/staging-ops/network-boundary-probe.mjs allow rollback-object-store
+"${compose[@]}" run --rm --no-deps importer scripts/staging-ops/network-boundary-probe.mjs deny prod-pg.railway.internal
+"${compose[@]}" run --rm --no-deps exporter scripts/staging-ops/secret-boundary-probe.mjs exporter
+"${compose[@]}" run --rm --no-deps importer scripts/staging-ops/secret-boundary-probe.mjs importer
+
+echo "[3/11] bootstrap a durable staging-owned rollback pair through the importer CLI"
+
+# ── H2: THE INTERRUPTED FIRST BOOTSTRAP, both windows, before the successful run ────────────────
+#
+# The gap: after `stopAndVerifyAll()` returns, the platform reports NO active deployment — that is
+# what a verified stop means — so a replacement worker cannot re-measure the baseline. There is no
+# last-ready and no preserved prior pair, so neither `importer rollback` nor an ordinary install can
+# restore anything, and the killed worker's in-memory `current` is gone. Both stores stay intact and
+# correct while staging stays stopped and fenced, with no supplied command able to return it.
+#
+# `run --rm` gives each attempt its OWN container, so the replacement genuinely has no retained
+# memory. SIGKILL, not a thrown fault: the catch is precisely what does not run.
+#
+# Each recovery must converge with NO external deployment or journal surgery between the attempts —
+# nothing below touches the maintenance API or the journal, which is what makes it a recovery test
+# rather than a demonstration that an operator can repair state by hand.
+bootstrap_interrupt() {
+  local point="$1" name="$2"
+  expect_failure "$name" "${compose[@]}" run --rm -e STAGING_FAULT_POINT="$point" \
+    importer scripts/staging-ops/importer.mjs bootstrap-rollback
+  require_receipt "$name.log" fault-injected "\"point\":\"$point\".*\"kill\":\"SIGKILL\"" \
+    "the interrupted-bootstrap scenario reached its intended window and was killed there"
+  # The baseline stores were only READ by a bootstrap, so an interruption must leave them untouched.
+  "${compose[@]}" run --rm fixture-controller assert-source
+}
+
+# EVERY FAILURE MODE IS CHAINED INTO ONE BOOTSTRAP LIFECYCLE, deliberately. `bootstrap-rollback` is
+# one-time — it refuses once `last_ready` exists — so a resume that ran to completion would make the
+# later scenarios unreachable in this harness. Attempt 1 dies after the stop; attempt 2 resumes from
+# that record and dies after publication; attempt 3 resumes and FAILS ORDINARILY, so its catch
+# restores the baseline; attempt 4 must therefore stop a serving pair again before it can adopt the
+# published object and complete. Each attempt is a separate `run --rm` container, and nothing
+# between them touches the maintenance API, the object stores or the journal.
+#
+# The ordinary failure cannot come FIRST: the `bootstrap-after-stop` SIGKILL window lives in the
+# non-resume branch, so any attempt following an ordinary failure resumes and could never reach it.
+bootstrap_interrupt bootstrap-after-stop bootstrap-killed-after-stop
+require_journal state draining "a bootstrap killed after its verified stop leaves staging fenced, not ready"
+[[ "$(journal_field last_ready_run_id)" == "" ]] || { echo "the interrupted bootstrap manufactured a last-ready pointer" >&2; exit 1; }
+interrupted_run="$(journal_field bootstrap_run_id)"
+[[ "$interrupted_run" == bootstrap-* ]] || { echo "no interrupted-bootstrap recovery record survived the kill: '$interrupted_run'" >&2; exit 1; }
+
+# WINDOW 2, reached BY the replacement worker: it resumes the recorded run with the platform still
+# reporting nothing serving — which is only possible from the durable record, since there is no
+# deployment left to measure — captures, publishes, and is killed before the journal advances.
+bootstrap_interrupt bootstrap-after-publish bootstrap-killed-after-publish
+require_receipt bootstrap-killed-after-publish.log bootstrap-phase '"phase":"resume-interrupted-bootstrap".*"resumedPhase":"stopping"' \
+  "the replacement resumed the RECORDED interrupted bootstrap instead of requiring a serving deployment"
+require_journal state draining "publication alone does not advance the journal"
+[[ "$(journal_field bootstrap_run_id)" == "$interrupted_run" ]] || { echo "the resumed bootstrap did not keep its recorded run identity" >&2; exit 1; }
+published_object="$(journal_field bootstrap_object_id)"
+[[ -n "$published_object" ]] || { echo "the published bootstrap checkpoint was not recorded before the kill" >&2; exit 1; }
+
+# ── H2, THE OTHER HALF: AN ORDINARY FAILURE, AND THE RETRY THAT MUST STOP A SERVING BASELINE ────
+#
+# Both windows above are SIGKILLs, so the catch never ran and staging stayed stopped. The failure
+# mode the resume fix actually exists for is the opposite one: an ORDINARY in-band failure runs the
+# catch, which redeploys the untouched baseline and leaves the journal `failed` — so the documented
+# remedy ("re-run bootstrap-rollback") meets a LIVE app holding a shared reader lock. The old resume
+# branch went straight for the exclusive lock and blocked there until its deadline, and nothing
+# cleared the record either (`clearBootstrapRecovery` requires `ready`), so the bootstrap was
+# unrecoverable by any supplied command.
+#
+# ATTEMPT 3 is that ordinary failure, injected AFTER the verified stop and BEFORE the exclusive lock
+# — so the retry below can only ever be blocked by the SERVING pair, never by a lock this attempt
+# leaked. It resumes the `captured` record from window 2, which is retained across it.
+expect_failure bootstrap-ordinary-failure \
+  "${compose[@]}" run --rm -e STAGING_FAULT_POINT=bootstrap-after-stop-throw \
+  importer scripts/staging-ops/importer.mjs bootstrap-rollback
+require_receipt bootstrap-ordinary-failure.log fault-injected '"point":"bootstrap-after-stop-throw".*"thrown":true' \
+  "the ordinary-failure scenario threw after its verified stop rather than being killed"
+require_receipt bootstrap-ordinary-failure.log bootstrap-phase '"phase":"stop-and-verify-all".*"resumed":true' \
+  "the failing attempt re-proved the stop on the resume branch, which is where the fault fired"
+require_receipt bootstrap-ordinary-failure.log bootstrap-phase '"phase":"recovery-restart-deployment".*"measuredDeployment":true' \
+  "the ordinary catch ran — a SIGKILL scenario cannot produce this receipt"
+grep -q "prior staging deployment restored unchanged" "$harness_root/bootstrap-ordinary-failure.log" || {
+  echo "the ordinary bootstrap failure did not restore the baseline deployment it had stopped" >&2
+  sed -n '1,120p' "$harness_root/bootstrap-ordinary-failure.log" >&2
+  exit 1
+}
+# THE BASELINE IS SERVING AGAIN — measured at the maintenance API, not inferred from the message.
+# This is what makes the retry below a real re-stop rather than a resume of a stopped world.
+restored_app="$("${compose[@]}" exec -T maintenance curl -fsS -H 'authorization: Bearer local-maintenance-token' 'http://127.0.0.1:8080/deployments?serviceId=app-local')"
+node -e 'const x=JSON.parse(process.argv[1]);if(!x.deployments.length){console.error("the ordinary bootstrap failure left no serving app deployment");process.exit(1)}' "$restored_app"
+require_journal state failed "an ordinary bootstrap failure leaves the journal failed, with the baseline restored"
+require_journal last_safe_checkpoint bootstrap-failed-prior-restored "the failed bootstrap recorded that the prior deployment came back"
+# THE RECORD SURVIVES THE ORDINARY FAILURE. It is cleared in exactly one place — after ready is
+# committed — because an ordinary failure leaves the same baseline identity a kill would have, and
+# the retry needs it for the same reason.
+[[ "$(journal_field bootstrap_run_id)" == "$interrupted_run" ]] || {
+  echo "the ordinary bootstrap failure discarded the interruption record the retry depends on" >&2
+  exit 1
+}
+[[ "$(journal_field bootstrap_object_id)" == "$published_object" ]] || {
+  echo "the ordinary bootstrap failure discarded the published checkpoint identity" >&2
+  exit 1
+}
+[[ "$(journal_field last_ready_run_id)" == "" ]] || { echo "the failed bootstrap manufactured a last-ready pointer" >&2; exit 1; }
+"${compose[@]}" run --rm fixture-controller assert-source
+
+# ATTEMPT 4: the retry. It adopts the published object and converges — and to get there it must
+# re-enter `draining` and re-run `stopAndVerifyAll` FIRST, because the app it has to displace is the
+# one attempt 3's recovery put back. No external deployment or journal surgery has happened at any
+# point in this sequence.
+"${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs bootstrap-rollback \
+  >"$harness_root/bootstrap-resume-after-publish.log" 2>&1 || {
+  echo "a replacement worker could not resume the bootstrap interrupted after publication" >&2
+  sed -n '1,120p' "$harness_root/bootstrap-resume-after-publish.log" >&2
+  exit 1
+}
+cat "$harness_root/bootstrap-resume-after-publish.log"
+require_receipt bootstrap-resume-after-publish.log bootstrap-phase '"phase":"adopted-published-checkpoint"' \
+  "the final worker ADOPTED the already-published checkpoint rather than orphaning it and capturing a second one"
+# THE ORDERING IS THE FIX, so it is asserted as an ordering and not as three independent greps. A
+# resume that took the exclusive lock first would emit `acquire-exclusive-data-lock` before the
+# re-stop — and against the serving baseline attempt 3 restored, it would never emit anything after
+# it. The checker is a file, not `node -e`, so the parser itself is exercised by a unit test in both
+# directions rather than being trusted to have matched anything.
+# TWO CHECKS, because exit status alone is not proof that anything was checked (M2). A CLI whose
+# entry test answers "no" runs no body and exits 0 having printed nothing — indistinguishable from a
+# verified ordering to a caller reading only `$?`. So the success verdict is required as well.
+resume_order_verdict="$(node scripts/staging-ops/assert-bootstrap-resume-order.mjs "$harness_root/bootstrap-resume-after-publish.log")"
+printf '%s\n' "$resume_order_verdict"
+grep -q "verified resume ordering" <<<"$resume_order_verdict" || {
+  echo "the resume-order checker exited zero without emitting its success verdict; it may not have run at all" >&2
+  exit 1
+}
+require_journal state ready "the resumed bootstrap reached a verified prior pair and a serving baseline"
+require_journal last_ready_mode "$baseline_mode" "the resumed bootstrap retained the configured baseline mode"
+[[ "$(journal_field last_ready_run_id)" == "$interrupted_run" ]] || { echo "the recovered bootstrap did not retain its original run identity" >&2; exit 1; }
+[[ "$(journal_field last_ready_object_id)" == "$published_object" ]] || { echo "the recovered bootstrap did not adopt the object it had already published" >&2; exit 1; }
+[[ "$(journal_field bootstrap_run_id)" == "" ]] || { echo "the interruption record was not cleared after ready was committed" >&2; exit 1; }
+"${compose[@]}" run --rm fixture-controller assert-bootstrap "$baseline_mode" "$interrupted_run"
+"${compose[@]}" run --rm fixture-controller assert-source
+# The bootstrap is COMPLETE at this point — attempt 3 above is the run that reached ready, and the
+# command is one-time, so invoking it again here would only prove that it refuses. Its refusal IS
+# still worth pinning, because "one-time" is the guard that stops a bootstrap from stopping a
+# healthy staging: re-running it must refuse without touching anything.
+expect_failure bootstrap-is-one-time "${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs bootstrap-rollback
+grep -q "last-ready already exists" "$harness_root/bootstrap-is-one-time.log" || {
+  echo "a repeated bootstrap refused for some other reason than being one-time" >&2
+  sed -n '1,40p' "$harness_root/bootstrap-is-one-time.log" >&2
+  exit 1
+}
+require_journal state ready "a refused repeat bootstrap left the serving baseline alone"
+
+"${compose[@]}" exec -T maintenance curl -fsS -H 'authorization: Bearer local-maintenance-token' -H 'content-type: application/json' \
+  -d '{"mode":"copy-ready"}' http://127.0.0.1:8080/runtime-mode >/dev/null
+
+echo "[4/11] export and install the first pair through separate role CLI containers"
+# THE SOURCE-SIDE ORACLE, BEFORE THE EXPORT. Every application assertion in this harness was about
+# the RESTORED pair, so a source that was never readable produced a green restore and an empty page —
+# which is exactly what happened: the seed created items and project grants and zero context units,
+# and `GET /api/v1/items` intersects with current include memberships. Asking the real handler here,
+# against the source database, is what makes every later "the copied pair is readable" claim mean
+# something. It runs against PROD_DATABASE_URL inside the fixture container; no app is deployed there.
+"${compose[@]}" run --rm fixture-controller assert-source
+# ITS OWN NEGATIVE CONTROL, against the same real handler: close ONE include membership in the
+# source and require the oracle to REFUSE, then reopen it and require it to pass again. An oracle
+# that cannot fail proves nothing — and this one used to report `internal=0, external=0` as success.
+# `valid_to` is set rather than deleting the row; reopen creates a new current membership while the
+# closed historical membership remains part of the exported substrate.
+"${compose[@]}" run --rm fixture-controller close-membership private
+expect_failure source-oracle-refuses-narrowed "${compose[@]}" run --rm fixture-controller assert-source
+grep -q "missing" "$harness_root/source-oracle-refuses-narrowed.log" || {
+  echo "the source oracle failed for some other reason than the narrowed visible set" >&2
+  sed -n '1,40p' "$harness_root/source-oracle-refuses-narrowed.log" >&2
+  exit 1
+}
+"${compose[@]}" run --rm fixture-controller open-membership private
+"${compose[@]}" run --rm fixture-controller assert-reopened-substrate
+"${compose[@]}" run --rm fixture-controller assert-source
+"${compose[@]}" run --rm -e STAGING_BUNDLE_RUN_ID=run-1 exporter | tee "$harness_root/run-1.log"
+run1_object="$(tail -n 1 "$harness_root/run-1.log" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).objectId))')"
+"${compose[@]}" run --rm --no-deps \
+  -e PROBE_S3_ENDPOINT=http://source-object-store:9000 -e PROBE_S3_ACCESS_KEY_ID=source-read -e PROBE_S3_SECRET_ACCESS_KEY=source-read-secret \
+  -e PROBE_S3_BUCKET=staging-pair -e PROBE_S3_KEY="source/$run1_object.bundle" importer scripts/staging-ops/object-store-acl-probe.mjs get
+"${compose[@]}" run --rm --no-deps \
+  -e PROBE_S3_ENDPOINT=http://source-object-store:9000 -e PROBE_S3_ACCESS_KEY_ID=source-publish -e PROBE_S3_SECRET_ACCESS_KEY=source-publish-secret \
+  -e PROBE_S3_BUCKET=staging-pair -e PROBE_S3_KEY="source/$run1_object.bundle" exporter scripts/staging-ops/object-store-acl-probe.mjs expect-access-denied-get
+"${compose[@]}" run --rm --no-deps \
+  -e PROBE_S3_ENDPOINT=http://source-object-store:9000 -e PROBE_S3_ACCESS_KEY_ID=source-read -e PROBE_S3_SECRET_ACCESS_KEY=source-read-secret \
+  -e PROBE_S3_BUCKET=staging-pair -e PROBE_S3_KEY=source/forbidden.bundle importer scripts/staging-ops/object-store-acl-probe.mjs expect-access-denied-put
+"${compose[@]}" run --rm --no-deps \
+  -e PROBE_S3_ENDPOINT=http://source-object-store:9000 -e PROBE_S3_ACCESS_KEY_ID=source-read -e PROBE_S3_SECRET_ACCESS_KEY=wrong-secret \
+  -e PROBE_S3_BUCKET=staging-pair -e PROBE_S3_KEY="source/$run1_object.bundle" importer scripts/staging-ops/object-store-acl-probe.mjs expect-access-denied-get
+"${compose[@]}" run --rm --no-deps -e PROBE_S3_URL="http://source-object-store:9000/staging-pair/source/$run1_object.bundle" importer scripts/staging-ops/forged-s3-auth-probe.mjs
+
+# FIRST IMPORT, before any production-source pair has ever installed successfully. Fail only after
+# the real Postgres restore, then require the importer-owned bootstrap pair — not manufactured
+# production fingerprint evidence — to restore BOTH real stores and the serving ready identity.
+expect_failure bootstrap-first-import-recovers "${compose[@]}" run --rm -e STAGING_FAULT_POINT=after-postgres importer scripts/staging-ops/importer.mjs tick
+require_receipt bootstrap-first-import-recovers.log postgres-restored '"runId":"run-1"' "the first production source wrote Postgres before failing"
+require_receipt bootstrap-first-import-recovers.log fault-injected '"point":"after-postgres".*"runId":"run-1"' "the first import failed at its genuine post-write marker"
+require_receipt bootstrap-first-import-recovers.log prior-pair-restored '"failedRunId":"run-1".*"priorKind":"rollback".*"postgres":true.*"graph":true.*"ready":true' "the authenticated bootstrap pair restored both stores and serving readiness"
+require_journal state ready "the bootstrap recovery returned staging to ready"
+require_journal last_ready_mode "$baseline_mode" "first-import recovery retained the recorded bootstrap mode"
+bootstrap_run="$(journal_field last_ready_run_id)"
+[[ "$bootstrap_run" == "$interrupted_run" ]] || {
+  echo "first-import recovery changed the original bootstrap run identity: expected '$interrupted_run', got '$bootstrap_run'" >&2
+  exit 1
+}
+"${compose[@]}" run --rm fixture-controller assert-bootstrap "$baseline_mode" "$interrupted_run"
+
+# ⚠️ THE AUTOMATIC PATH MUST REFUSE run-1 HERE, AND THIS STEP USED TO INVOKE IT.
+#
+# run-1's destructive install failed above (the deliberate `after-postgres` fault) and was rolled
+# back, so `staging_ops.source_install_attempts` carries a `failed` record for that immutable object
+# and the success watermark was deliberately not advanced past it. `sourceAttemptAdmission` therefore
+# blocks the unattended tick — which is the whole point of the record: without it the daemon
+# rediscovers exactly this object every five minutes and drains, stops and restores staging again for
+# a candidate already known to fail. The harness called `tick` here anyway, so a correct refusal
+# would have failed the lane and the step only passed because the automatic path admitted it.
+#
+# The negative control comes FIRST and asserts no mutation, then the retry is made the way the
+# accepted design says it must be: an explicit operator naming the object.
+expect_failure run1-automatic-retry-denied "${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs tick
+grep -q "automatic refresh will not drain staging again for it" "$harness_root/run1-automatic-retry-denied.log" || {
+  echo "the automatic tick was refused for some other reason than the recorded failed attempt" >&2
+  sed -n '1,40p' "$harness_root/run1-automatic-retry-denied.log" >&2
+  exit 1
+}
+# NOTHING MOVED. The refusal sits before the drain, so the bootstrap pair the recovery restored is
+# still the serving one and no receipt of a new maintenance window exists.
+require_journal state ready "the denied automatic retry left the serving pair alone"
+[[ "$(journal_field last_ready_run_id)" == "$bootstrap_run" ]] || {
+  echo "the denied automatic retry changed the serving identity" >&2
+  exit 1
+}
+refuse_receipt run1-automatic-retry-denied.log postgres-restored '"runId":"run-1"' \
+  "a denied automatic retry restored Postgres anyway"
+refuse_receipt run1-automatic-retry-denied.log prior-pair-restored '"failedRunId"' \
+  "a denied automatic retry entered recovery, which means it had drained"
+
+# THE EXPLICIT OPERATOR RETRY — the one sanctioned way to re-attempt a source whose destructive
+# install already failed. It keeps every signature, expiry, credential, loader, watermark, prior-pair
+# and fence check; only the automatic admission differs.
+"${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs install "$run1_object"
+# SOURCE↔RESTORED SUBSTRATE, before anything repairs staging. `GET /api/v1/items` intersects results
+# with the caller's current include memberships, so the copied pair's application reads are only
+# meaningful if that substrate survived the round trip byte-for-byte. If the source reads pass and
+# the copied reads fail, THIS is the diagnostic that separates a restore/sanitizer defect from a
+# fixture one — so it runs before any later step could paper over it.
+"${compose[@]}" run --rm fixture-controller compare-substrate
+"${compose[@]}" run --rm fixture-controller assert v1
+"${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs install "$run1_object"
+
+echo "[5/11] exercise second-run discovery, chunks/corrections, and a newly appearing Graphiti deployment"
+"${compose[@]}" run --rm fixture-controller mutate v2
+"${compose[@]}" run --rm -e STAGING_BUNDLE_RUN_ID=run-2 exporter
+stale_graph="$("${compose[@]}" exec -T maintenance curl -fsS -H 'authorization: Bearer local-maintenance-token' -H 'content-type: application/json' \
+  -d '{"serviceId":"graphiti-local"}' http://127.0.0.1:8080/inject-deployment | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).id))')"
+"${compose[@]}" exec -T maintenance curl -fsS -H 'authorization: Bearer local-maintenance-token' -X POST \
+  "http://127.0.0.1:8080/deployments/$stale_graph/stop" >/dev/null
+"${compose[@]}" exec -T maintenance curl -fsS -H 'authorization: Bearer local-maintenance-token' -H 'content-type: application/json' \
+  -d '{"serviceId":"graphiti-local"}' http://127.0.0.1:8080/inject-deployment >/dev/null
+"${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs tick
+"${compose[@]}" run --rm fixture-controller assert v2
+
+echo "[6/11] advance staging head and catch up code without copying data again"
+"${compose[@]}" exec -T maintenance curl -fsS -H 'authorization: Bearer local-maintenance-token' -H 'content-type: application/json' \
+  -d '{"commit":"dddddddddddddddddddddddddddddddddddddddd"}' http://127.0.0.1:8080/branch-head >/dev/null
+"${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs tick
+"${compose[@]}" run --rm fixture-controller assert v2
+
+echo "[7/11] kill an importer AFTER a real Postgres write and reconcile the journal on the next worker"
+"${compose[@]}" run --rm fixture-controller mutate v3
+"${compose[@]}" run --rm -e STAGING_BUNDLE_RUN_ID=run-3 exporter | tee "$harness_root/run-3.log"
+# The EXPORTER'S OWN returned identity, read the same way run-1 and run-4 read theirs. The explicit
+# retry below addresses the immutable object by ID, and the ONLY admissible ID is the one the
+# publishing run reported: a reconstructed digest or a re-published bundle would be a different
+# object, which admission would accept for the wrong reason.
+run3_object="$(tail -n 1 "$harness_root/run-3.log" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).objectId))')"
+interrupted_container="${project}-interrupted-importer"
+"${compose[@]}" run --name "$interrupted_container" -e STAGING_HARNESS_PAUSE_AFTER_POSTGRES_MS=120000 importer scripts/staging-ops/importer.mjs tick >"$harness_root/interrupted.log" 2>&1 & interrupted_pid=$!
+# THE BARRIER IS THE POSTGRES WRITE, NOT THE JOURNAL STATE. `state=importing` is written BEFORE the
+# restore begins, so killing on it can land before a single byte of candidate data exists — and a
+# "recovery" from that is a recovery from nothing. Wait for run-3's own `postgres-restored` receipt
+# (the importer then holds at the bounded pause), and independently confirm the two stores are in
+# the state the scenario claims: candidate v3 body in Postgres, PRIOR v2 facts still in the graph.
+observed_after_postgres=0
+for _ in $(seq 1 90); do
+  if receipt interrupted.log postgres-restored '"runId":"run-3"'; then observed_after_postgres=1; break; fi
+  sleep 1
+done
+if [[ "$observed_after_postgres" -ne 1 ]]; then
+  echo "interrupted importer never reached the post-Postgres barrier for run-3" >&2
+  sed -n '1,80p' "$harness_root/interrupted.log" >&2
+  exit 1
+fi
+staged_body="$("${compose[@]}" exec -T staging-pg psql -U app -d brain -Atc \
+  "select body from items where id='33333333-3333-4333-8333-333333333331'" 2>/dev/null || true)"
+if [[ "$staged_body" != "team body v3" ]]; then
+  echo "expected the candidate v3 Postgres write before the kill, observed '$staged_body'" >&2
+  exit 1
+fi
+"${compose[@]}" run --rm fixture-controller assert-graph-version v2
+docker kill --signal KILL "$interrupted_container" >/dev/null
+wait "$interrupted_pid" || true
+docker rm -f "$interrupted_container" >/dev/null 2>&1 || true
+# THE FIRST POST-KILL TICK IS THE RECOVERY, and it must stay a `tick`. Interrupted-run recovery sits
+# BEFORE destructive-attempt admission in the importer, so this is the only thing that returns the
+# journal to a serving prior pair — replacing it with an explicit install would delete the test of
+# recovery-before-admission entirely. Its output is captured because `run --rm` stdout appears in no
+# service log, and because the recovery identity (run-3 undone, run-2 restored) is the evidence.
+"${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs tick >"$harness_root/interrupted-recovery.log" 2>&1 || {
+  echo "the replacement worker could not recover the interrupted run-3 install" >&2
+  sed -n '1,120p' "$harness_root/interrupted-recovery.log" >&2
+  exit 1
+}
+cat "$harness_root/interrupted-recovery.log"
+require_receipt interrupted-recovery.log prior-pair-restored '"failedRunId":"run-3".*"priorRunId":"run-2".*"postgres":true.*"graph":true.*"ready":true' \
+  "the replacement undid the killed run-3 write and restored the run-2 pair in BOTH stores"
+grep -q '"status":"interrupted-run-recovered".*"interruptedRunId":"run-3"' "$harness_root/interrupted-recovery.log" || {
+  echo "the post-kill tick returned some other outcome than recovering the interrupted run-3" >&2
+  sed -n '1,120p' "$harness_root/interrupted-recovery.log" >&2
+  exit 1
+}
+"${compose[@]}" run --rm fixture-controller assert v2
+# Captured, not hardcoded — but required to be a real identity, or the "unchanged" check below would
+# be satisfied by two empty reads.
+recovered_run="$(journal_field last_ready_run_id)"
+[[ -n "$recovered_run" ]] || { echo "recovery left no serving run identity to compare against" >&2; exit 1; }
+
+# ⚠️ THE SECOND AUTOMATIC TICK MUST REFUSE run-3, AND THIS STEP USED TO ASSUME IT WOULD INSTALL IT.
+#
+# The killed worker could not record a terminal result, so `staging_ops.source_install_attempts`
+# holds run-3 as `attempted` — deliberately conservative, because a destructive install that got as
+# far as a real Postgres write may have failed for a reason that will repeat. Recovery clears the
+# interruption, not the attempt: releasing admission automatically here would put the five-minute
+# daemon back to draining staging for a candidate already known to have failed once.
+expect_failure run3-automatic-retry-denied "${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs tick
+grep -q "immutable source $run3_object already made .* automatic refresh will not drain staging again for it" \
+  "$harness_root/run3-automatic-retry-denied.log" || {
+  echo "the automatic tick was refused for some other reason than the recorded run-3 attempt" >&2
+  sed -n '1,40p' "$harness_root/run3-automatic-retry-denied.log" >&2
+  exit 1
+}
+# NO CANDIDATE DATA INSTALL OR RECOVERY: the refusal sits before the drain, so the recovered run-2
+# pair remains the ready data run — neither a candidate write nor a second recovery. The tick runs
+# `serviceCatchup` first, so deployment metadata or code catch-up may legitimately progress; the
+# receipts below deny the DATA drain, not every journal change.
+refuse_receipt run3-automatic-retry-denied.log postgres-restored '"runId":"run-3"' \
+  "a denied automatic retry wrote candidate Postgres anyway"
+refuse_receipt run3-automatic-retry-denied.log prior-pair-restored '"failedRunId"' \
+  "a denied automatic retry entered recovery, which means it had drained"
+require_journal state ready "the denied automatic retry left the recovered prior pair serving"
+[[ "$(journal_field last_ready_run_id)" == "$recovered_run" ]] || {
+  echo "the denied automatic retry changed the serving identity" >&2
+  exit 1
+}
+"${compose[@]}" run --rm fixture-controller assert v2
+
+# THE EXPLICIT OPERATOR RETRY of the SAME immutable object the exporter published — the one
+# sanctioned way to re-attempt a source whose destructive install already failed, and the positive
+# control for the refusal above: same object, same environment, admitted only because it is explicit.
+"${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs install "$run3_object"
+"${compose[@]}" run --rm fixture-controller assert v3
+
+echo "[8/11] inject handled mid-install faults after EACH store and prove prior-pair recovery"
+"${compose[@]}" run --rm fixture-controller mutate v4
+"${compose[@]}" run --rm -e STAGING_BUNDLE_RUN_ID=run-4 exporter | tee "$harness_root/run-4.log"
+# Captured because the scenarios below now split into AUTOMATIC and EXPLICIT paths, and the explicit
+# operator retry is addressed by immutable object ID. See the attempt-admission block.
+run4_object="$(tail -n 1 "$harness_root/run-4.log" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).objectId))')"
+# NEGATIVE CONTROL FIRST. A fault BEFORE the drain replaces nothing, so it must not be able to
+# satisfy this scenario — under the old assertion ("exited non-zero" + "v3 is still installed") it
+# did, because v3 was already installed and nothing had been touched. The receipts below are what
+# tell the two apart, so their discriminating power is demonstrated here rather than assumed.
+expect_failure pre-drain-control "${compose[@]}" run --rm -e STAGING_FAULT_POINT=before-drain importer scripts/staging-ops/importer.mjs tick
+require_receipt pre-drain-control.log fault-injected '"point":"before-drain".*"runId":"run-4"' "the control failed at the point it claims"
+refuse_receipt pre-drain-control.log postgres-restored '"runId":"run-4"' "a pre-drain failure wrote no candidate Postgres"
+refuse_receipt pre-drain-control.log prior-pair-restored '"failedRunId":"run-4"' "a pre-drain failure triggers no recovery, so it cannot pass the recovery scenario"
+"${compose[@]}" run --rm fixture-controller assert v3
+
+# THE REAL SCENARIO: fail after the Postgres restore, and require the exact receipts — the fault at
+# the named point for THIS candidate run, and a recovery that restored BOTH stores to the prior
+# identity and booted it ready — plus the journal transition and the prior data itself.
+expect_failure install-fault-recovers "${compose[@]}" run --rm -e STAGING_FAULT_POINT=after-postgres importer scripts/staging-ops/importer.mjs tick
+require_receipt install-fault-recovers.log postgres-restored '"runId":"run-4"' "the candidate Postgres restore actually happened"
+require_receipt install-fault-recovers.log fault-injected '"point":"after-postgres".*"runId":"run-4"' "the injected fault fired after Postgres, not earlier"
+require_receipt install-fault-recovers.log prior-pair-restored '"failedRunId":"run-4".*"postgres":true.*"graph":true.*"ready":true' "recovery restored BOTH stores and booted the prior pair ready"
+require_journal state ready "staging is serving again after the handled fault"
+"${compose[@]}" run --rm fixture-controller assert v3
+
+# ── Fable HIGH-1: THE SECOND AUTOMATIC TICK MUST NOT DRAIN STAGING AGAIN ────────────────────────
+#
+# run-4 has just failed AFTER entering draining, and its rollback restored the prior and marked it
+# ready — which clears `recovery-required` and does NOT advance the source watermark past run-4. So
+# discovery still selects exactly this object, every pre-drain check still passes, and the automatic
+# path used to stop, drain and restore staging again for a candidate already known to fail. Bounded
+# only by the bundle's fourteen-day expiry: hundreds of avoidable maintenance cycles.
+expect_failure attempted-source-blocks-automatic "${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs tick
+grep -q "already made" "$harness_root/attempted-source-blocks-automatic.log" || {
+  echo "the second automatic tick refused for some other reason than a recorded destructive attempt" >&2
+  sed -n '1,40p' "$harness_root/attempted-source-blocks-automatic.log" >&2
+  exit 1
+}
+# THE REFUSAL IS BEFORE THE DRAIN, which is the entire point — an outage that ends in a successful
+# rollback is still an outage. No stop, no candidate write, no recovery.
+refuse_receipt attempted-source-blocks-automatic.log postgres-restored '"runId":"run-4"' "the blocked tick wrote no candidate Postgres"
+refuse_receipt attempted-source-blocks-automatic.log prior-pair-restored '"failedRunId":"run-4"' "the blocked tick triggered no recovery, because it drained nothing"
+require_journal state ready "the blocked tick left the serving prior pair untouched"
+"${compose[@]}" run --rm fixture-controller assert v3
+# …and it does NOT fall back to an older eligible bundle. The blocked identity stays the selection.
+[[ "$(journal_field last_ready_run_id)" != "run-4" ]] || { echo "the blocked candidate was installed anyway" >&2; exit 1; }
+
+# AND AFTER THE GRAPH, which the previous single scenario never exercised: the candidate had already
+# replaced both stores, so recovery has to undo two of them, and the graph half of the oracle is the
+# only thing that can see the difference.
+#
+# EXPLICIT `install`, not `tick`: an operator naming the immutable object IS the authorised retry of
+# a failed source, and it is the only thing that is. That makes this scenario a positive control for
+# the refusal above — same object, same environment, admitted only because the invocation is
+# explicit — as well as the graph-stage recovery test it already was.
+expect_failure graph-fault-recovers "${compose[@]}" run --rm -e STAGING_FAULT_POINT=after-graph importer scripts/staging-ops/importer.mjs install "$run4_object"
+require_receipt graph-fault-recovers.log graph-restored '"runId":"run-4"' "the candidate graph restore actually happened"
+require_receipt graph-fault-recovers.log fault-injected '"point":"after-graph".*"runId":"run-4"' "the injected fault fired after the graph restore"
+require_receipt graph-fault-recovers.log prior-pair-restored '"failedRunId":"run-4".*"postgres":true.*"graph":true.*"ready":true' "recovery restored BOTH stores after a graph-stage fault"
+"${compose[@]}" run --rm fixture-controller assert v3
+"${compose[@]}" run --rm fixture-controller assert-graph-version v3
+
+# AND THE FAILURE `resetSessionTransactionState` ACTUALLY EXISTS FOR. Both faults above are plain
+# JavaScript throws, so recovery began on a perfectly usable connection — they prove the ORDERING of
+# the reset, never that the reset works. This one runs a REAL `BEGIN` + `SELECT 1/0` on the
+# importer's OWN lock-owning session and lets the genuine 22012 propagate with the transaction still
+# aborted, which is the state in which the journal write, the lock release and the marker read all
+# fail with 25P02. Same candidate (run-4, v4) as above, so it costs one extra attempt, not a new
+# lane — and it is the EXPLICIT path for the same reason the graph-stage scenario above is.
+expect_failure sql-abort-recovers "${compose[@]}" run --rm -e STAGING_FAULT_POINT=after-graph-sql-abort importer scripts/staging-ops/importer.mjs install "$run4_object"
+require_receipt sql-abort-recovers.log postgres-restored '"runId":"run-4"' "the candidate Postgres restore happened before the abort"
+require_receipt sql-abort-recovers.log graph-restored '"runId":"run-4"' "the candidate graph restore happened before the abort"
+require_receipt sql-abort-recovers.log candidate-observed '"runId":"run-4".*"pgVersion":"v4".*"graphVersions":"v4"' "BOTH stores held the candidate v4 capture at the abort boundary, so the undo below is a real two-store undo"
+require_receipt sql-abort-recovers.log fault-injected '"point":"after-graph-sql-abort".*"runId":"run-4".*"sqlstate":"22012".*"transactionAborted":true' "a real division-by-zero left the importer session in an aborted transaction"
+require_receipt sql-abort-recovers.log session-continuity '"checkpoint":"install-reset".*"coordinatorLockHeld":true.*"exclusiveDataLockHeld":true' "the install reset kept this session AND its locks — no reconnect, no DISCARD ALL"
+require_receipt sql-abort-recovers.log session-continuity '"checkpoint":"rollback-reset".*"coordinatorLockHeld":true' "the rollback path ran on that same fenced session"
+require_receipt sql-abort-recovers.log prior-pair-restored '"failedRunId":"run-4".*"postgres":true.*"graph":true.*"ready":true' "recovery restored BOTH stores and booted the prior pair ready THROUGH an aborted transaction"
+require_journal state ready "staging is serving again after the aborted-transaction fault"
+# One backend for the whole path. A reconnect would recover just as visibly while dropping the
+# advisory locks the fence depends on, so the PID is asserted, not assumed.
+node -e '
+const fs = require("node:fs");
+const pids = [...fs.readFileSync(process.argv[1], "utf8").matchAll(/staging-ops-receipt (?:candidate-observed|fault-injected|session-continuity) (\{.*\})/g)].map((m) => JSON.parse(m[1]).backendPid);
+if (pids.length !== 4) { console.error("expected 4 session-identity receipts (candidate, fault, two resets), saw " + pids.length); process.exit(1); }
+if (!Number.isFinite(pids[0]) || new Set(pids).size !== 1) { console.error("recovery did not stay on ONE backend: " + pids.join(",")); process.exit(1); }
+console.log("verified session continuity: backend pid " + pids[0] + " across the abort and both reset checkpoints");
+' "$harness_root/sql-abort-recovers.log"
+"${compose[@]}" run --rm fixture-controller assert v3
+"${compose[@]}" run --rm fixture-controller assert-graph-version v3
+
+echo "[9/11] prove lock loss kills the serving child, then recover through an exact deployment"
+"${compose[@]}" run --rm fixture-controller kill-reader-lock
+sleep 2
+active_app="$("${compose[@]}" exec -T maintenance curl -fsS -H 'authorization: Bearer local-maintenance-token' 'http://127.0.0.1:8080/deployments?serviceId=app-local')"
+node -e 'const x=JSON.parse(process.argv[1]);if(x.deployments.length)process.exit(1)' "$active_app"
+"${compose[@]}" exec -T maintenance curl -fsS -H 'authorization: Bearer local-maintenance-token' -H 'content-type: application/json' \
+  -d '{"serviceId":"app-local","commitSha":"dddddddddddddddddddddddddddddddddddddddd"}' http://127.0.0.1:8080/deploy >/dev/null
+
+echo "[10/11] prove failed rollback stays stopped, recover, then race concurrent importers"
+"${compose[@]}" run --rm fixture-controller mutate v5
+"${compose[@]}" run --rm -e STAGING_BUNDLE_RUN_ID=run-5 exporter
+expect_failure failed-rollback-stays-stopped "${compose[@]}" run --rm -e STAGING_FAULT_POINT=after-postgres -e STAGING_FAULT_ROLLBACK=1 importer scripts/staging-ops/importer.mjs tick
+# The intended checkpoint, again by receipt: the install fault fired where it claims, the ROLLBACK
+# then failed, and the journal is fenced at `recovery-required` — not merely "the app is stopped",
+# which a failure anywhere before the drain would also produce.
+require_receipt failed-rollback-stays-stopped.log fault-injected '"point":"after-postgres".*"runId":"run-5"' "the rollback-failure scenario failed mid-install, for this run"
+require_receipt failed-rollback-stays-stopped.log recovery-required '"failedRunId":"run-5".*"rollbackAttempted":true' "the rollback was attempted and failed, leaving staging fenced"
+refuse_receipt failed-rollback-stays-stopped.log prior-pair-restored '"failedRunId":"run-5"' "a failed rollback must not report a restored prior pair"
+require_journal state failed "a failed rollback leaves the journal failed"
+require_journal last_safe_checkpoint recovery-required "a failed rollback fences staging until an explicit recovery"
+active_app="$("${compose[@]}" exec -T maintenance curl -fsS -H 'authorization: Bearer local-maintenance-token' 'http://127.0.0.1:8080/deployments?serviceId=app-local')"
+node -e 'const x=JSON.parse(process.argv[1]);if(x.deployments.length)process.exit(1)' "$active_app"
+# The PINNED SET, not just the app: a Graphiti deployment left running would still be able to write
+# to the graph while staging is supposed to be fenced.
+active_graphiti="$("${compose[@]}" exec -T maintenance curl -fsS -H 'authorization: Bearer local-maintenance-token' 'http://127.0.0.1:8080/deployments?serviceId=graphiti-local')"
+node -e 'const x=JSON.parse(process.argv[1]);if(x.deployments.length)process.exit(1)' "$active_graphiti"
+"${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs rollback recovery-after-injected-failure >"$harness_root/explicit-recovery.log" 2>&1
+require_receipt explicit-recovery.log prior-pair-restored '"postgres":true.*"graph":true.*"ready":true' "the explicit recovery restored BOTH stores and booted ready"
+require_journal state ready "explicit recovery returns staging to ready"
+"${compose[@]}" run --rm fixture-controller assert v3
+"${compose[@]}" run --rm fixture-controller assert-graph-version v3
+"${compose[@]}" run --rm fixture-controller mutate v6
+"${compose[@]}" run --rm -e STAGING_BUNDLE_RUN_ID=run-6 exporter
+set +e
+"${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs tick >"$harness_root/concurrent-a.log" 2>&1 & first=$!
+"${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs tick >"$harness_root/concurrent-b.log" 2>&1 & second=$!
+wait "$first"; first_status=$?
+wait "$second"; second_status=$?
+set -e
+if [[ "$first_status" -ne 0 && "$second_status" -ne 0 ]]; then
+  echo "both concurrent importers failed" >&2
+  sed -n '1,160p' "$harness_root/concurrent-a.log" >&2
+  sed -n '1,160p' "$harness_root/concurrent-b.log" >&2
+  exit 1
+fi
+"${compose[@]}" run --rm fixture-controller assert v6
+
+echo "[11/11] prove the graph version oracle can actually refuse"
+# Every assertion above that says "the prior/candidate pair is installed" now depends on the graph
+# half of the oracle, and an oracle that never refuses proves nothing. Rewrite ONLY the installed
+# graph's fact versions — Postgres untouched — and require the assert to fail. This is deliberately
+# last: it leaves the graph corrupted, and the harness is finished with it.
+"${compose[@]}" run --rm fixture-controller corrupt-graph-version v99
+expect_failure graph-version-oracle-refuses "${compose[@]}" run --rm fixture-controller assert v6
+grep -q "graph facts from another capture survived" "$harness_root/graph-version-oracle-refuses.log" || {
+  echo "the assert failed for some other reason than the graph version" >&2
+  sed -n '1,40p' "$harness_root/graph-version-oracle-refuses.log" >&2
+  exit 1
+}
+echo "staging paired refresh harness passed: isolated roles, S3 ACLs, CLI bootstrap/export/install/retry/catch-up/fault receipts/two-store recovery/rollback/lock-loss/concurrency, a graph version oracle proven able to refuse, and real application oracle reads"

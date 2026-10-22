@@ -60,6 +60,8 @@ export async function generateVariantImage(
   variantId: string,
   opts: GenerateImageOptions = {}
 ): Promise<MediaAssetMeta> {
+  const { assertCopiedStagingSpendAllowed } = await import("@/lib/staging/runtime-policy");
+  assertCopiedStagingSpendAllowed("image");
   const now = opts.now ?? new Date();
   const variant = await getVariant(db, teamId, variantId);
   if (!variant) throw new Error(`generateVariantImage: variant ${variantId} not found for team`);

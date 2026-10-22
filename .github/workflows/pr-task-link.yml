@@ -25,8 +25,10 @@ name: PR task link (advisory)
 # Fork safety was real and it was irrelevant; the reasoning stopped one branch short.
 #
 # WHAT MAKES THIS SHAPE SAFE. On `pull_request_target` GitHub runs the workflow file AND
-# `actions/checkout`'s default ref from the BASE branch, which no pull request can edit. Every
-# line of code that executes here is trusted `main` code. The pull request contributes DATA
+# `actions/checkout`'s default ref from the DEFAULT branch, which no pull request can edit. (This
+# said BASE branch, correct until GitHub's 2025-12-08 change; the default branch is strictly
+# stronger, since a base is contributor-selectable and a default is not.) Every line of code that
+# executes here is trusted default-branch code. The pull request contributes DATA
 # only — its title, body, branch name and number, read out of the event payload — and that data
 # is treated as attacker-controlled throughout: it is never interpolated into a `run:` block,
 # never used to construct a shell command, and never used to select what to check out or fetch.
@@ -40,17 +42,24 @@ name: PR task link (advisory)
 #
 # WHAT THE ENVIRONMENT IS, AND — MORE IMPORTANTLY — WHAT IT IS NOT.
 # `environment: trusted-automation` is a repository Environment whose deployment branch policy allows
-# `main` only. It is a BLAST-RADIUS control over WHICH WORKFLOWS can reach the credential. It is NOT
-# a trust boundary against untrusted AUTHORS, and reading it as one would repeat this file's original
-# mistake in a new place. Measured in a disposable repository rather than assumed:
+# `[main, staging]`. It is a BLAST-RADIUS control over WHICH WORKFLOWS can reach the credential. It is
+# NOT a trust boundary against untrusted AUTHORS, and reading it as one would repeat this file's
+# original mistake in a new place:
 #
-#   * a `pull_request_target` run has `GITHUB_REF=refs/heads/main`, satisfies the `main`-only policy,
-#     and DOES receive the environment's secrets — so the check keeps working; and
-#   * a FORK pull request gets them too. On `pull_request_target` the ref is always the base branch,
-#     so every author trivially satisfies the branch policy regardless of who they are.
+#   * a `pull_request_target` run has `GITHUB_REF` = the DEFAULT branch (`staging` since the cutover),
+#     satisfies the policy because the policy contains it, and DOES receive the environment's
+#     secrets — so the check keeps working; and
+#   * a FORK pull request gets them too. The ref is the DEFAULT branch for every author, so all of
+#     them satisfy the branch policy equally regardless of who they are.
+#
+# THE TWO BULLETS ABOVE USED TO SAY `refs/heads/main` AND "the ref is always the base branch", and
+# both were measured in a disposable repository — correctly, under the model of the time. GitHub
+# changed it effective 2025-12-08 (see the paragraph below), so the ref is the DEFAULT branch, not
+# the base. The conclusion — the environment is not an author boundary — is unchanged; only the
+# mechanism moved, and a stale mechanism is the half that gets re-derived into a wrong ordering.
 #
 # So the environment cannot be the thing protecting this key. THE ONLY THING PROTECTING IT IS THE RULE
-# ABOVE: base-branch code only, no PR-head checkout/fetch/import/execute, and no attacker-controlled
+# ABOVE: default-branch code only, no PR-head checkout/fetch/import/execute, and no attacker-controlled
 # value interpolated into a `run:` body. Treat that rule as load-bearing, because it is the whole of
 # the defence.
 #
@@ -58,9 +67,10 @@ name: PR task link (advisory)
 # GitHub hands those to every job whether or not it names an environment — an environment secret only
 # SHADOWS a repository secret of the same name, it does not revoke access to one. Connecting the layer
 # means entering the values into the environment and DELETING the repository-level copies, which is
-# blocked on rewriting `aios-work-sync.yml` (it reads the same three from a `pull_request: closed`
-# run, whose ref IS `refs/pull/N/merge`, and a `main`-only policy would refuse it). Until then this
-# job reads the repository-level values and really does call the brain.
+# no longer blocked on `aios-work-sync.yml`: #673 moved that workflow to `pull_request_target`, so it
+# no longer runs with a `refs/pull/N/merge` ref, and the policy now contains both live branches. All
+# three `AIOS_*` consumers are enrolled. Until the repository-level copies are deleted — a
+# repository-admin action — this job reads those values and really does call the brain.
 #
 # THE FAILURE MODE OF A MISMATCHED POLICY IS LOUD, NOT SILENT: `Branch "x" is not allowed to deploy to
 # trusted-automation`, and the job fails having run ZERO steps. It is not an empty-secret shrug. The
@@ -68,17 +78,31 @@ name: PR task link (advisory)
 # window where the repository copies are gone and John has not yet entered the values, and it names
 # the missing variables so that window is distinguishable in the log from any other quiet outcome.
 #
-# On `pull_request_target` the run's ref is NOT `refs/pull/N/merge` — GitHub's event table words it as
-# the default branch, the security guidance as the base of the pull request, and the trigger below is
-# pinned to `branches: [main]` so the two coincide and neither reading can surprise us. That pin is
-# also what keeps this advisory once the environment IS load-bearing: a pull request into any other
-# branch would be refused the environment and go red, and a nudge about board hygiene is never
-# allowed to go red. If the contribution base ever moves (RELPTR-4), the trigger list and the
-# environment's branch policy have to move together — `docs/RELEASING.md` §3.1c carries that entry.
+# ON `pull_request_target`, THE REF IS THE DEFAULT BRANCH — AND THIS PARAGRAPH USED TO HEDGE.
+# It said the event table words it as the default branch and the security guidance as the base of the
+# pull request, and that pinning `branches: [main]` made the two coincide "so neither reading can
+# surprise us". That hedge is obsolete: GitHub settled it, effective 2025-12-08 —
+#
+#   "The workflow file and checkout commit will always be taken from the repository's default branch,
+#    regardless of the pull request's base branch", and "For `pull_request_target`, environment rules
+#    evaluate against the default branch."
+#   github.blog/changelog/2025-11-07-actions-pull_request_target-and-environment-branch-protections-changes/
+#
+# TWO CONSEQUENCES, and the second is why this trigger could safely widen:
+#   * The BASE branch controls neither the workflow file nor the environment evaluation. A same-repo
+#     collaborator cannot edit this file's copy by pushing a branch and opening a pull request into it.
+#   * The environment is evaluated against the DEFAULT branch, so widening this trigger does NOT make
+#     a `staging`-based pull request go red. The old fear — "a pull request into any other branch
+#     would be refused the environment" — was true only under the pre-2025-12-08 model.
+#
+# WHAT REPLACES THAT FEAR, because the hazard moved rather than vanished: the environment now follows
+# the DEFAULT branch, so the `trusted-automation` branch policy must contain whatever the default is.
+# It was widened to `[main, staging]` before the default moved to `staging` at the cutover; had it not
+# been, EVERY `pull_request_target` run in the repo would have been refused at once.
 # ─────────────────────────────────────────────────────────────────────────────────────────
 on:
   pull_request_target:
-    branches: [main]
+    branches: [main, staging]
     types: [opened, edited, synchronize, reopened]
 
 # `contents: read` and nothing else, forever. `statuses: write`/`checks: write` would let this
@@ -103,9 +127,11 @@ jobs:
     # change and `main`.
     #
     # STATED COST, because it cuts both ways: this also masks a LOUD environment refusal (a branch
-    # policy that does not match fails the job with zero steps run). The `branches: [main]` pin above
-    # is what makes that path unreachable rather than merely hidden — if you widen the trigger, you
-    # are relying on this line to hide a broken job, which is not what it is for.
+    # policy that does not match fails the job with zero steps run). That path is kept unreachable by
+    # the `trusted-automation` branch policy containing the DEFAULT branch — not, as this comment used
+    # to say, by pinning the trigger to `[main]`. Under the post-2025-12-08 model the trigger list and
+    # the environment evaluation are independent: the ref is the default branch either way. Keep the
+    # policy correct and this line never has to hide anything.
     continue-on-error: true
     # A blast-radius control over which WORKFLOWS reach the credential — not a trust boundary against
     # untrusted authors. See the header: a fork PR satisfies this policy too.
@@ -118,7 +144,8 @@ jobs:
       AIOS_API_KEY: ${{ secrets.AIOS_API_KEY }}
       AIOS_TEAM: ${{ secrets.AIOS_TEAM }}
     steps:
-      # NO `ref:`. On `pull_request_target` the default is the base branch — the trusted copy.
+      # NO `ref:`. On `pull_request_target` the default ref is the DEFAULT branch — the trusted copy.
+      # (Was the base branch until 2025-12-08; see the header.)
       # Adding `ref: ${{ github.event.pull_request.head.sha }}` here is precisely the vulnerability
       # this workflow was rewritten to close.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

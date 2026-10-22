@@ -2,16 +2,27 @@
   "version": 1,
   "canonical": ".claude/skills",
   "published": [
-    "astra-spec-opus-build",
-    "astra-spec-sol-build",
+    "astra-spec-claude-build",
+    "astra-spec-codex-build",
     "connect",
+    "cut-release",
     "pr-review-attestation",
     "railway-deploy-verify",
+    "review-recent-prs",
     "setup-brain"
   ],
   "targets": {
-    "codex": { "path": ".agents/skills", "format": "directory" },
-    "opencode": { "path": ".opencode/skills", "format": "directory" },
-    "cursor": { "path": ".cursor/rules", "format": "cursor-rule" }
+    "codex": {
+      "path": ".agents/skills",
+      "format": "directory"
+    },
+    "opencode": {
+      "path": ".opencode/skills",
+      "format": "directory"
+    },
+    "cursor": {
+      "path": ".cursor/rules",
+      "format": "cursor-rule"
+    }
   }
 }

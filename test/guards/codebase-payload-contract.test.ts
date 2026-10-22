@@ -2,10 +2,11 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
+import { scannerStaleness } from "@/lib/codebases/scanner-version";
 import { codebaseScanPayloadSchema } from "@/lib/api/schemas";
 
 /**
- * Server-side conformance guard for the Brain API 1.23 codebase-scan payload
+ * Server-side conformance guard for the Brain API 1.25 codebase-scan payload
  * (POST /api/v1/codebases, incl. the optional provenance-only `metrics.codebase_health`
  * object — AIO-609). Mirror of aios-workspace/test/codebase-payload-contract.test.mjs,
  * run against vendored copies of the shared contract artifacts
@@ -28,17 +29,17 @@ import { codebaseScanPayloadSchema } from "@/lib/api/schemas";
 const CONTRACT_DIR = join(import.meta.dirname, "..", "fixtures", "contract");
 
 const PINNED = {
-  "codebase-payload-1.23.schema.json":
-    "0bcb686042369d31bfc7299c2ce5ea6b0257cc6a17995959ba02bf6d14d10c55",
-  "codebase-payload-1.23-fixtures.json":
-    "3d495a7892a7ac6c53334b3fa7f323fa89523ffae663bcc0086bf6f5d0abb4d6",
+  "codebase-payload-1.25.schema.json":
+    "79cd93c4b46b7ded3af73ac0e320498036bc1e39d7677cad18a6554b1d620d66",
+  "codebase-payload-1.25-fixtures.json":
+    "d053f4aa12e9afb5d4b8c7a636f399b177ba51f1871f9c2472cab713b4f76b7e",
   "codebase-health-v2.schema.json":
     "38de45de129c9ff3a346fb96346f905d79532b053e824a4ac85bb26a88b4371d",
 } as const;
 
 const fixtures = JSON.parse(
   readFileSync(
-    join(CONTRACT_DIR, "codebase-payload-1.23-fixtures.json"),
+    join(CONTRACT_DIR, "codebase-payload-1.25-fixtures.json"),
     "utf8",
   ),
 ) as {
@@ -51,13 +52,30 @@ const fixtures = JSON.parse(
     readonly name: string;
     readonly payload: unknown;
   }[];
+  readonly coverage_invalid: readonly {
+    readonly name: string;
+    readonly payload: unknown;
+  }[];
   readonly brain_invalid: readonly {
     readonly name: string;
     readonly payload: unknown;
   }[];
+  // brain-api 1.24 (AIO-1011). Consumer-READING vectors: JSON Schema pins the wire shape of
+  // `scanner_version`, but it cannot express what a reader must CONCLUDE from it. `scanner_version`
+  // is OPTIONAL on the vector on purpose — an absent key models a pre-1.24 payload that never
+  // carried the field, which is a different input from an explicit `null`, and both must read
+  // "unknown".
+  readonly scanner_state: {
+    readonly _note: string;
+    readonly vectors: readonly {
+      readonly name: string;
+      readonly scanner_version?: string | null;
+      readonly state: "unknown" | "stale" | "current";
+    }[];
+  };
 };
 
-describe("brain-api 1.23 codebase-payload conformance", () => {
+describe("brain-api 1.25 codebase-payload conformance", () => {
   it("vendored contract artifacts are byte-identical to the pinned canonical revision", () => {
     for (const [file, sha] of Object.entries(PINNED)) {
       const bytes = readFileSync(join(CONTRACT_DIR, file));
@@ -65,8 +83,82 @@ describe("brain-api 1.23 codebase-payload conformance", () => {
     }
   });
 
-  it("fixtures file tracks the 1.23 contract revision, both buckets populated", () => {
-    expect(fixtures.version).toBe("1.23");
+  // The hashes above are also DECLARED by the contract itself, inside its own hashed content set
+  // (brain-contract.json → codebasePayloadContract, hashed since 1.24). Checking against that
+  // declaration as well means a re-vendor that updates the files and the local PINNED table but
+  // forgets brain-contract.json cannot pass: the canonical statement and the bytes must agree.
+  // brain-api 1.24 (AIO-1011). The upstream `scanner_state` vectors are the EXECUTABLE form of
+  // the three-state truth table. Driving the reading off them — rather than off a table retyped
+  // in this repo — is what makes the two repos agree by construction instead of by two people
+  // reading the same paragraph. The contract deliberately omits parser-grammar edge cases
+  // ("0.2", "v0.2.0-dirty"): the grammar is the READER's, and anything it cannot read normalizes
+  // to unknown by the rule below, so pinning them upstream would make the contract stricter than
+  // the brain — the 1.22 drift, pointed the other way.
+  describe("scanner-identity reading conforms to the canonical vectors", () => {
+    const vectors = fixtures.scanner_state.vectors;
+
+    it("the vector set is populated and covers all three states (non-vacuous)", () => {
+      expect(vectors.length).toBeGreaterThanOrEqual(10);
+      expect(new Set(vectors.map((v) => v.state))).toEqual(
+        new Set(["unknown", "stale", "current"]),
+      );
+    });
+
+    it.each(vectors.map((v) => [v.name, v] as const))("%s", (_name, v) => {
+      // An ABSENT key and an explicit null are different inputs that must reach the same
+      // verdict, so the absent case is passed as `undefined` rather than coerced to null.
+      const declared = "scanner_version" in v ? v.scanner_version : undefined;
+      expect(scannerStaleness(declared)).toBe(v.state);
+    });
+
+    it("UNPARSEABLE resolves to unknown and is NEVER ordered against the minimum", () => {
+      // The load-bearing rule, asserted directly rather than inferred from the loop above:
+      // every vector the contract calls unreadable must land in `unknown`, and none of them may
+      // fall through to `stale` — "the scan did not tell us" is a different statement from
+      // "the scan told us it is old", and collapsing them is the defect 1.24 exists to remove.
+      const unreadable = vectors.filter(
+        (v) =>
+          v.state === "unknown" &&
+          "scanner_version" in v &&
+          typeof v.scanner_version === "string",
+      );
+      expect(unreadable.length).toBeGreaterThan(0);
+      for (const v of unreadable) {
+        expect(scannerStaleness(v.scanner_version), v.name).toBe("unknown");
+        expect(scannerStaleness(v.scanner_version), v.name).not.toBe("stale");
+      }
+    });
+
+    it("absence and explicit null agree, and neither is ever 'current'", () => {
+      expect(scannerStaleness(undefined)).toBe("unknown");
+      expect(scannerStaleness(null)).toBe("unknown");
+      expect(scannerStaleness(undefined)).not.toBe("current");
+    });
+  });
+
+  it("the vendored payload artifacts match the hashes the CONTRACT declares for them", () => {
+    const brainContract = JSON.parse(
+      readFileSync(join(CONTRACT_DIR, "brain-contract.json"), "utf8"),
+    ) as {
+      readonly codebasePayloadContract: {
+        readonly version: string;
+        readonly minScannerVersion: string;
+        readonly schema: { readonly path: string; readonly sha256: string };
+        readonly fixtures: { readonly path: string; readonly sha256: string };
+      };
+    };
+    const block = brainContract.codebasePayloadContract;
+    expect(block.version).toBe("1.25");
+    for (const ref of [block.schema, block.fixtures]) {
+      const bytes = readFileSync(join(CONTRACT_DIR, ref.path));
+      expect(createHash("sha256").update(bytes).digest("hex"), ref.path).toBe(
+        ref.sha256,
+      );
+    }
+  });
+
+  it("fixtures file tracks the 1.25 contract revision, both buckets populated", () => {
+    expect(fixtures.version).toBe("1.25");
     expect(fixtures.valid.length).toBeGreaterThanOrEqual(3);
     expect(fixtures.invalid.length).toBeGreaterThanOrEqual(3);
   });
@@ -178,4 +270,58 @@ describe("brain-api 1.23 codebase-payload conformance", () => {
     )[0].fingerprint;
     expect(codebaseScanPayloadSchema.safeParse(malformed).success).toBe(false);
   });
+});
+
+describe("health v3 semantic census invariants", () => {
+  it.each(fixtures.coverage_invalid.map((f) => [f.name, f.payload] as const))(
+    "rejects %s",
+    (_name, payload) => {
+      const scenario = structuredClone(payload) as {
+        metrics: { head_sha: string; codebase_health: { head_sha: string } };
+      };
+      scenario.metrics.head_sha = scenario.metrics.codebase_health.head_sha;
+      expect(codebaseScanPayloadSchema.safeParse(scenario).success).toBe(false);
+    },
+  );
+  it("preserves every v3 fixture as a whole object", () => {
+    for (const f of fixtures.valid.filter((f) =>
+      f.name.startsWith("valid-v3"),
+    )) {
+      const parsed = codebaseScanPayloadSchema.parse(f.payload);
+      expect(parsed.metrics.codebase_health).toEqual(
+        (f.payload as { metrics: { codebase_health: unknown } }).metrics
+          .codebase_health,
+      );
+    }
+  });
+});
+
+it("v3 inherits evidence/head constraints and cannot fall through the legacy schema", () => {
+  const entry = fixtures.valid.find((f) => f.name === "valid-v3-complete")!;
+  const payload = structuredClone(entry.payload) as {
+    metrics: { head_sha: string; codebase_health: Record<string, unknown> };
+  };
+  payload.metrics.head_sha = payload.metrics.codebase_health.head_sha as string;
+  expect(codebaseScanPayloadSchema.safeParse(payload).success).toBe(true);
+  for (const patch of [
+    { quality_gate: "pass", evidence_status: "partial" },
+    { quality_gate: "unknown", evidence_status: "complete" },
+    { automation_eligible: true, status: "fail" },
+    { head_sha: "f".repeat(40) },
+    { source: "/private/source.ts" },
+  ]) {
+    const invalid = structuredClone(payload);
+    Object.assign(invalid.metrics.codebase_health, patch);
+    expect(codebaseScanPayloadSchema.safeParse(invalid).success).toBe(false);
+  }
+  const legacy = structuredClone(
+    fixtures.valid.find((f) => f.name.startsWith("valid-with-health:"))!
+      .payload,
+  ) as typeof payload;
+  legacy.metrics.codebase_health.schema_version = "3";
+  legacy.metrics.head_sha = legacy.metrics.codebase_health.head_sha as string;
+  expect(codebaseScanPayloadSchema.safeParse(legacy).success).toBe(false);
+  const missing = structuredClone(payload);
+  delete missing.metrics.codebase_health.check_coverage;
+  expect(codebaseScanPayloadSchema.safeParse(missing).success).toBe(false);
 });

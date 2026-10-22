@@ -81,7 +81,14 @@ export async function getFusedArcs(
   teamId: string,
   teamSlug: string,
   groups: readonly string[],
-  keys: ProviderKeys
+  /**
+   * M9: `null` means "this deployment has no model" — a copied staging environment, where the
+   * central spend policy denies every provider call. It is an EXPLICIT absence, not a placeholder
+   * credential: fusion then reads the cached partition rows and performs neither the inline
+   * synthesis nor the background warm, so the panel degrades to what is already stored instead of
+   * throwing out of the eager key resolution the route used to do first.
+   */
+  keys: ProviderKeys | null
 ): Promise<FusedArcPanel> {
   if (groups.length === 0) return { arcs: [], warmScheduled: 0, freshness: computedNow(), covered: 0, total: 0 };
 
@@ -102,8 +109,8 @@ export async function getFusedArcs(
   // served immediately and revalidated via the background warm below (they never synthesize
   // inline) — an earlier comment here claimed getArcs would SWR them, but this path reads rows
   // directly and must own its own revalidation (Fable PPARC-3 High 2).
-  const inlineTarget = rankedGroups.find((g) => entries.find((e) => e.group === g)?.entry == null);
-  if (inlineTarget) {
+  const inlineTarget = keys == null ? undefined : rankedGroups.find((g) => entries.find((e) => e.group === g)?.entry == null);
+  if (inlineTarget && keys) {
     const { arcs, freshness: inlineFreshness } = await getArcs(db, teamId, teamSlug, [inlineTarget], keys, {
       scopeKey: `g:${inlineTarget}`,
     });
@@ -131,6 +138,9 @@ export async function getFusedArcs(
   const now = Date.now();
   let warmScheduled = 0;
   for (const e of entries) {
+    // No model ⇒ no warming. Scheduling refreshes that must fail is not a degradation, it is a
+    // queue of guaranteed errors against a database that is meant to cost nothing.
+    if (keys == null) break;
     if (e.group === inlineTarget) continue;
     if (warmScheduled >= PPARC_SYNTH_BUDGET_PER_READ) break;
     const isFresh =

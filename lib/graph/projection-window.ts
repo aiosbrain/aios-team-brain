@@ -22,7 +22,12 @@ export type RefusalReason =
   /** D3e's detector could not answer. DISTINCT from `window-with-fanout` on purpose: the durable
    *  discriminator in `ingest_runs.meta.refused` has to tell "an initiative exists, unset the window"
    *  apart from "the read failed", or the operator is sent to fix the wrong thing. */
-  | "fanout-state-unknown";
+  | "fanout-state-unknown"
+  /** M3: this runtime is a COPIED staging instance (or one whose staging posture cannot be
+   *  established), so graph projection is not its work to do at all. Distinct from the window
+   *  reasons above because it is a statement about the RUNTIME, not about the window: no window
+   *  setting makes it proceed, and it is decided before any corpus read, lease or ledger write. */
+  | "copied-staging-runtime";
 
 export type MarkerRead = { ok: true; marker: boolean } | { ok: false; error: string };
 

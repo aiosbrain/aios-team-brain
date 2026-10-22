@@ -11,17 +11,22 @@
  *
  * They are three different jobs, and only ONE of them moves:
  *
- *   CONTRIBUTION_BASE   the branch pull requests target.  `main` TODAY → becomes `staging` at cutover.
+ *   CONTRIBUTION_BASE   the branch pull requests target.  `staging` — MOVED at the cutover, 2026-09-06.
  *   INTEGRATION_BRANCH  where work accumulates before release.  `staging`, and ALREADY `staging`.
  *   RELEASE_BRANCH      what installers deploy; advances only by fast-forward to a tagged commit.  `main`.
  *
- * ⚠️ TODAY `RELEASE_BRANCH === CONTRIBUTION_BASE === "main"`, AND THAT IS A TRAP. Wiring a consumer to
- * the wrong one of those two is invisible to every value assertion — both reviewers found this, and
- * neither a "resolves to main" test nor a "derives from the shared constants" test can see it. It would
- * surface on cutover day, when `CONTRIBUTION_BASE` moves and the consumer silently follows it. The
- * identity pin in `test/guards/branch-roles.test.ts` stubs `CONTRIBUTION_BASE` to a sentinel and
- * asserts the release guard's refs do not move; that is the only thing standing between a one-token
- * typo and a broken release check months from now.
+ * ⚠️ THE TRAP THIS HEADER WARNED ABOUT HAS NOW SPRUNG, and it is worth reading in the past tense.
+ * Until 2026-09-06 `RELEASE_BRANCH === CONTRIBUTION_BASE === "main"`, so a consumer wired to the wrong
+ * one of those two passed every value assertion — neither a "resolves to main" test nor a "derives from
+ * the shared constants" test could see it. RELPTR-6 found exactly that defect in two workflow-trigger
+ * assertions pinned to `[CONTRIBUTION_BASE, INTEGRATION_BRANCH]`: correct-looking, and they would have
+ * reddened against correct files the moment this line moved. They now read
+ * `[RELEASE_BRANCH, INTEGRATION_BRANCH]`, which is the only role pair distinct in BOTH worlds.
+ *
+ * The identity pin in `test/guards/branch-roles.test.ts` stubs `CONTRIBUTION_BASE` to a sentinel and
+ * asserts the release guard's refs do not move. Post-cutover it guards the mirror-image mistake:
+ * `CONTRIBUTION_BASE` and `INTEGRATION_BRANCH` are now BOTH `staging`, so a consumer wired to the wrong
+ * one of THOSE is the invisible pair from here on.
  *
  * WHAT THIS DOES NOT BUY. It is NOT "the cutover is one edit". It makes the Node and instruction
  * consumers one edit. YAML cannot import a module, so `.github/dependabot.yml`'s `target-branch`,
@@ -31,7 +36,7 @@
  */
 
 /** The branch pull requests target. **This is the one that moves at the cutover.** */
-export const CONTRIBUTION_BASE = "main";
+export const CONTRIBUTION_BASE = "staging";
 
 /** Where work accumulates before a release. Fixed — RELPTR-3's assertion D already reads it. */
 export const INTEGRATION_BRANCH = "staging";

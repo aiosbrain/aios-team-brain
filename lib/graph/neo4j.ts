@@ -86,11 +86,17 @@ export function readTxConfig(env: NodeJS.ProcessEnv = process.env): { timeout: n
  */
 export async function runRead<T = Record<string, unknown>>(
   cypher: string,
-  params: Record<string, unknown> = {}
+  params: Record<string, unknown> = {},
+  opts: { timeoutMs?: number } = {}
 ): Promise<T[]> {
   const session = getDriver().session({ defaultAccessMode: neo4j.session.READ });
   try {
-    const res = await session.executeRead((tx) => tx.run(cypher, params), readTxConfig());
+    const configured = readTxConfig();
+    const timeout = Number(opts.timeoutMs);
+    const res = await session.executeRead(
+      (tx) => tx.run(cypher, params),
+      { timeout: Number.isFinite(timeout) && timeout > 0 ? timeout : configured.timeout }
+    );
     return res.records.map((r) => plain(r.toObject()) as T);
   } finally {
     await session.close();

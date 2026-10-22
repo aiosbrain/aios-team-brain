@@ -53,3 +53,42 @@ export interface DbClient {
     args?: Record<string, unknown>
   ): Promise<{ data: any; error: { message: string } | null }>;
 }
+
+/** Result shape shared by the pool and a connection-bound SQL executor. */
+export interface SqlQueryResult<T = Record<string, unknown>> {
+  rows: T[];
+  rowCount: number;
+}
+
+/**
+ * The narrow execution capability used by transaction-bound adapters.  It is structural on
+ * purpose: tests and instrumented wrappers may decorate it without reconstructing PgClient or
+ * reaching for the process-wide pool.
+ */
+export type SqlExecutor = <T = Record<string, unknown>>(
+  text: string,
+  params?: unknown[]
+) => Promise<SqlQueryResult<T>>;
+
+export interface TransactionSession {
+  /** A PostgREST-shaped client whose every statement uses this session's one connection. */
+  readonly db: DbClient;
+  /** Raw SQL on the same connection (used only by owners whose query is not builder-expressible). */
+  readonly executeSql: SqlExecutor;
+  /**
+   * Run exactly one best-effort audit statement/read behind a savepoint.  A successfully recovered
+   * statement failure returns `fallback`; broken savepoint/session control remains fatal.
+   */
+  optionalAudit<T>(operation: () => Promise<T>, fallback: T): Promise<T>;
+}
+
+/** Explicit capability required by item/context operations. Plain DbClient wrappers fail closed. */
+export interface TransactionCapableDbClient extends DbClient {
+  transaction<T>(fn: (session: TransactionSession) => Promise<T>): Promise<T>;
+}
+
+export function isTransactionCapableDbClient(
+  db: DbClient
+): db is TransactionCapableDbClient {
+  return typeof (db as Partial<TransactionCapableDbClient>).transaction === "function";
+}

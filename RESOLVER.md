@@ -31,14 +31,16 @@ gates (AIOS hub, Tessera root) apply in addition.
 
 | Trigger | Skill |
 |---|---|
-| Requested Astra-spec/Sol-build workflow | `.claude/skills/astra-spec-sol-build/SKILL.md` — same lifecycle and reviews, GPT-5.6 Sol implements |
-| Requested Astra-spec/Opus-build workflow | `.claude/skills/astra-spec-opus-build/SKILL.md` — Linear ticket first; agreed spec attached before implementation |
+| Review recent PRs or audit recent merges | `.claude/skills/review-recent-prs/SKILL.md` |
+| Requested Astra-spec/Codex-build workflow (formerly Sol-build) | `.claude/skills/astra-spec-codex-build/SKILL.md` — Terra/Sol implementation; AIOS CLI Linear lifecycle |
+| Requested Astra-spec/Claude-build workflow (formerly Opus-build) | `.claude/skills/astra-spec-claude-build/SKILL.md` — Sonnet/Opus implementation; AIOS CLI Linear lifecycle |
 | Admin/ops tasks on the brain instance | `.claude/skills/admin/SKILL.md` |
 | Branches diverged / reconcile a fork | `.claude/skills/branch-reconciliation/SKILL.md` |
 | "Is this test actually wired into CI" | `.claude/skills/test-ci-wiring-audit/SKILL.md` |
 | Building a feature slice end-to-end ("build the next phase/slice", dual adversarial reviews) | `.claude/skills/adversarial-build/SKILL.md` — its steps 2–5 satisfy the Review gate; don't stack the attestation protocol on top |
 | About to push a PR branch / "did this get reviewed" / attest a PR | `.claude/skills/pr-review-attestation/SKILL.md` |
 | Just merged to main / "did the deploy go out" / check Railway | `.claude/skills/railway-deploy-verify/SKILL.md` |
+| Cut/ship a release, tag a version, promote staging → main | `.claude/skills/cut-release/SKILL.md` — a pushed `v*` tag is PERMANENT (no bypass), so its local pre-push check is the last cheap moment |
 | PM projection questions (brain→Linear) | `lib/pm-sync/` — the brain's tasks table is canonical, projection is one-way; reconcile reads live status surface-only |
 
 ## Agent Roles

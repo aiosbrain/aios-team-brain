@@ -279,8 +279,11 @@ export async function getEnabledIntegrationsWithSecrets(
 export async function getProviderKey(
   db: DbClient,
   teamId: string,
-  type: ProviderIntegrationType
+  type: ProviderIntegrationType,
+  purpose: "interactive-query" | "background" | "embedding" | "image" = "background"
 ): Promise<string | null> {
+  const { assertCopiedStagingSpendAllowed } = await import("@/lib/staging/runtime-policy");
+  assertCopiedStagingSpendAllowed(purpose);
   const { data, error } = await db
     .from("integrations")
     .select("secret_ciphertext")

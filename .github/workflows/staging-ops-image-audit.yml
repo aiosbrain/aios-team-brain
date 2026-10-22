@@ -1,0 +1,134 @@
+name: Staging ops image audit
+
+# AIO-997 — a READ-ONLY audit of ONE existing, already-published private image.
+#
+# WHAT IT IS FOR. The user's authorization to make the ops runner package public is conditional on
+# verifying that the artifact contains no secrets or private content. This workflow performs that
+# verification against the exact digest pinned in reviewed source, and produces one redacted evidence
+# artifact for the coordinator to adjudicate.
+#
+# WHAT IT CANNOT DO. It holds `packages: read`, not write. It does not build, push, tag, delete or
+# re-publish anything; it does not change a package's visibility (the operator does that by hand,
+# afterwards, only once the evidence is accepted); it does not deploy, promote, move a ref, touch a
+# schedule or spend on a model; and it never RUNS the image — the export is read as bytes.
+#
+# NO SOURCE INPUT, deliberately, exactly as the publisher has none. The subject is a tuple in
+# `scripts/staging-ops/image-audit/subject.mjs`: auditing a different digest is a reviewed edit to
+# that file, not something an operator can select at dispatch time.
+#
+# THIS REPOSITORY IS PUBLIC. Treat this run's logs and artifacts as potentially public evidence. Raw
+# layer content, extracted files, the full config/history and every scanner match stay in ephemeral
+# runner scratch and are never uploaded or printed.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# SHARED WITH THE PUBLISHER, on purpose: an audit and a publication of the same package must not
+# interleave. `cancel-in-progress: false` because cancelling an audit mid-run would leave a partial
+# account, and a cancelled run is unverified rather than clean.
+#
+# It does NOT cover the manual visibility transition that happens later in a browser — that window is
+# an operator procedure (docs/OPS.md §13), and no workflow-level lock can enforce it.
+concurrency:
+  group: staging-ops-image-publish
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: Audit the pinned staging ops runner image
+    runs-on: ubuntu-latest
+    # The internal deadline in `AUDIT_LIMITS` is 45 minutes, so the job's remaining quarter-hour is
+    # reserved for writing a sanitized incomplete record and letting the always-conditioned upload
+    # run. A hard runner termination can still prevent that upload — which is why the evidence never
+    # claims a delivery it did not measure.
+    timeout-minutes: 60
+    permissions:
+      # THE WHOLE GRANT. `packages: read` — enough to pull the existing private image and enumerate
+      # the package's versions, and not enough to push, delete or re-tag one. No `packages: write`,
+      # no `id-token`, no `attestations`, no `statuses`/`checks`/`contents` write (the scopes that
+      # mint a required context or move a ref — see test/guards/workflow-permissions.test.ts).
+      contents: read
+      packages: read
+    steps:
+      # BEFORE checkout, and context-only: the repository's own helper code is not on disk yet, and
+      # running it to decide whether to trust the context would be backwards. Values arrive through
+      # `env:`, never interpolated into the script body.
+      #
+      # The expected workflow ref is THIS FILE's path. Reusing the publisher's would accept a run of
+      # the wrong workflow as though it were the audit.
+      - name: Refuse an untrusted dispatch context
+        env:
+          CTX_REPOSITORY: ${{ github.repository }}
+          CTX_EVENT: ${{ github.event_name }}
+          CTX_REF: ${{ github.ref }}
+          CTX_SHA: ${{ github.sha }}
+          CTX_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          CTX_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -eu
+          # Tracing OFF, explicitly: `set -x` would echo every value below into a public job log.
+          set +x
+          expected_workflow_ref="aiosbrain/aios-team-brain/.github/workflows/staging-ops-image-audit.yml@refs/heads/staging"
+          refused=0
+          note() { echo "::error::staging ops image audit: $1"; refused=1; }
+          [ "$CTX_REPOSITORY" = "aiosbrain/aios-team-brain" ] || note "repository is '$CTX_REPOSITORY', expected aiosbrain/aios-team-brain"
+          [ "$CTX_EVENT" = "workflow_dispatch" ] || note "event is '$CTX_EVENT', expected workflow_dispatch"
+          [ "$CTX_REF" = "refs/heads/staging" ] || note "ref is '$CTX_REF', expected refs/heads/staging"
+          printf '%s' "$CTX_SHA" | grep -Eq '^[0-9a-f]{40}$' || note "audit sha '$CTX_SHA' is not a full 40-hex commit"
+          [ "$CTX_WORKFLOW_SHA" = "$CTX_SHA" ] || note "workflow sha '$CTX_WORKFLOW_SHA' differs from audit sha '$CTX_SHA'"
+          [ "$CTX_WORKFLOW_REF" = "$expected_workflow_ref" ] || note "workflow ref is '$CTX_WORKFLOW_REF', expected $expected_workflow_ref"
+          [ "$refused" -eq 0 ] || { echo "refusing to audit from an untrusted dispatch context" >&2; exit 1; }
+          echo "dispatch context accepted for audit code $CTX_SHA"
+
+      # The TRUSTED IMMUTABLE dispatch SHA. This identifies AUDIT CODE and nothing else — the image's
+      # own source revision is pinned in `subject.mjs` and is a different commit.
+      - name: Checkout the immutable dispatch commit
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      # "We asked for the immutable SHA" and "we are standing on it" are different claims, and only
+      # the second one is evidence. Dependency-free helper on the runner's preinstalled Node: no
+      # `setup-node`, no `npm ci`, no third-party code running beside a registry credential.
+      - name: Verify the checkout is the dispatch commit
+        run: node scripts/staging-ops/image-audit.mjs verify-context
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      # The standard ephemeral-token login. The auth file it writes is never printed, never copied
+      # into scratch, and never reaches the evidence artifact.
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # The audit itself. It fails the job when the verdict is anything but a clean, transition-ready
+      # result — a red run here means "do not expose this package", which is the outcome that must be
+      # impossible to miss.
+      - name: Audit the pinned image
+        id: audit
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          AUDIT_EVIDENCE_PATH: staging-ops-image-audit.json
+        run: node scripts/staging-ops/image-audit.mjs run
+
+      # `always()`, because a REFUSED audit's sanitized record is the evidence that matters most, and
+      # `warn` because a refusal in the pre-checkout guard happens before the helper that writes one
+      # exists on disk. The artifact EXPIRES — download it into the durable coordinator packet.
+      - name: Upload the audit evidence
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: staging-ops-image-audit-${{ github.run_id }}.${{ github.run_attempt }}
+          path: staging-ops-image-audit.json
+          if-no-files-found: warn
+          retention-days: 30

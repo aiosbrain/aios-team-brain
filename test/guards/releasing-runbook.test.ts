@@ -113,7 +113,25 @@ describe("guard: the cost of requiring the gate is written down (criterion 14)",
     // An operator following the old §2 would ignore the new gate's red result and publish anyway.
     expect(RUNBOOK, "the stale claim must be gone").not.toMatch(/\*\*Pushing a tag triggers nothing\*\*/);
     expect(RUNBOOK).toMatch(/Pushing a tag now runs the release-candidate/);
-    expect(RUNBOOK, "and it must say what a red D means before the cutover").toMatch(/expected to fail assertion D/);
+    // WAS `/expected to fail assertion D/`, and RELPTR-7 made that stale rather than wrong: assertion
+    // D (the candidate is reachable from the integration branch) was EXPECTED to fail pre-cutover,
+    // because `main` was not an ancestor of `staging`. It is now, so a red D means something real —
+    // the opposite instruction. Keeping the old pin would have taught an operator to shrug at the one
+    // assertion that distinguishes "the release" from "some descendant of main".
+    expect(RUNBOOK, "§2 must say what a red D means NOW").toMatch(/all\s*\n?\s*four assertions should now pass/);
+    expect(RUNBOOK, "and must not still tell the operator to expect a red D").not.toMatch(/expected to fail assertion D/);
+  });
+
+  it("§2 contains the step that actually makes a tag a release", () => {
+    // RELPTR-7, found by Fable's diff review: §2 declared, bumped, changelogged, tagged and published
+    // — and never advanced `main`. Post-cutover `main` moves ONLY by fast-forward, so following §2 as
+    // written would have left installers on the pre-cutover `main` indefinitely, with every check green.
+    expect(RUNBOOK, "the fast-forward must be a numbered step").toMatch(/Fast-forward `main` onto the tagged commit/);
+    // It must resolve the role rather than hardcode `main`, like every other command in the corpus.
+    expect(RUNBOOK).toMatch(/branches\.mjs --print release/);
+    // …and carry the ordering constraint, which is the half that bites: protection rejects a
+    // fast-forward whose required contexts are still pending.
+    expect(RUNBOOK, "the wait is the part operators skip").toMatch(/WAIT for `Release candidate gate`/);
   });
 
   it("points at the files that implement the gate, so the section cannot describe a ghost", () => {

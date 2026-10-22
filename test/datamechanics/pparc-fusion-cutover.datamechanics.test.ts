@@ -112,7 +112,23 @@ describe("PPARC-3 — the p:→g: corrections migration (criterion 5, moved from
     await runSql("delete from migration_markers where name = 'pparc3_g_wipe'");
     await runSql(MIG); // first run stamps the marker + wipes pre-cutover rows
     await writeArcCache(db(), seed.teamId, "g:post-cutover", arcRow("y", "post-cutover") as never, "h");
+    // The writer uses JavaScript milliseconds; the marker has PostgreSQL microseconds. Even a
+    // subsequent write can compare earlier within the same millisecond. Set this fixture's
+    // intended post-cutover ordering explicitly, without depending on scheduler/clock precision.
+    const markerBefore = await runSql<{ at: string }>("select at::text from migration_markers where name = 'pparc3_g_wipe'");
+    expect(markerBefore.rows).toHaveLength(1);
+    const postCutover = await runSql<{ after_marker: boolean }>(
+      `update arc_cache set computed_at = (select at + interval '1 second' from migration_markers where name = 'pparc3_g_wipe')
+       where team_id = $1 and group_key = 'g:post-cutover'
+       returning computed_at > (select at from migration_markers where name = 'pparc3_g_wipe') as after_marker`,
+      [seed.teamId]
+    );
+    expect(postCutover.rowCount).toBe(1);
+    expect(postCutover.rows).toEqual([{ after_marker: true }]);
     await runSql(MIG); // replay-safe: the marker never restamps
+    // The future-offset fixture alone would not detect a near-immediate erroneous restamp.
+    const markerAfter = await runSql<{ at: string }>("select at::text from migration_markers where name = 'pparc3_g_wipe'");
+    expect(markerAfter.rows).toEqual(markerBefore.rows);
 
     const rows = await runSql<{ arc_id: string; group_key: string }>(
       "select arc_id, group_key from arc_corrections where team_id = $1 order by arc_id",

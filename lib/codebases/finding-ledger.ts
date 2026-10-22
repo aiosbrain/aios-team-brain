@@ -76,15 +76,24 @@ export function decideFindingTransition(input: {
 
   if (olderThanCurrent) {
     if (currentStatus) {
-      return { status: currentStatus, event: "stale_analysis", mutatesCurrent: false };
+      return {
+        status: currentStatus,
+        event: "stale_analysis",
+        mutatesCurrent: false,
+      };
     }
     return present
-      ? { status: "stale_analysis", event: "stale_analysis", mutatesCurrent: false }
+      ? {
+          status: "stale_analysis",
+          event: "stale_analysis",
+          mutatesCurrent: false,
+        }
       : null;
   }
 
   if (present) {
-    if (!currentStatus) return { status: "open", event: "detected", mutatesCurrent: true };
+    if (!currentStatus)
+      return { status: "open", event: "detected", mutatesCurrent: true };
     if (currentStatus === "resolved" || currentStatus === "stale_analysis") {
       return { status: "reopened", event: "reopened", mutatesCurrent: true };
     }
@@ -118,7 +127,7 @@ const EMPTY_RESULT: FindingReconcileResult = {
   stale: 0,
 };
 
-/** Atomically project one validated v2 snapshot into current state + append-only history. */
+/** Atomically project one validated v2/v3 snapshot into current state + append-only history. */
 export async function reconcileCodebaseFindings(
   db: DbClient,
   input: {
@@ -126,9 +135,13 @@ export async function reconcileCodebaseFindings(
     codebaseId: string;
     metricsId: string;
     health: CodebaseHealth | undefined;
-  }
+  },
 ): Promise<FindingReconcileResult> {
-  if (!input.health || input.health.schema_version !== "2") return EMPTY_RESULT;
+  if (
+    !input.health ||
+    (input.health.schema_version !== "2" && input.health.schema_version !== "3")
+  )
+    return EMPTY_RESULT;
 
   const { data, error } = await db.rpc("reconcile_codebase_findings", {
     p_team_id: input.teamId,
@@ -147,7 +160,7 @@ export async function decideCodebaseFinding(
     teamId: string;
     codebaseId: string;
     actorMemberId: string;
-  }
+  },
 ): Promise<{ findingId: string; status: FindingDecision["status"] }> {
   const decision = findingDecisionSchema.parse(input);
   const { data, error } = await db.rpc("decide_codebase_finding", {

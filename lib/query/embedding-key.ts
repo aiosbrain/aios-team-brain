@@ -36,6 +36,8 @@ export async function resolveEmbeddingBackend(
   teamId: string,
   db: DbClient = adminClient()
 ): Promise<EmbeddingBackend | null> {
+  const { copiedStagingSpendAllowed } = await import("@/lib/staging/runtime-policy");
+  if (!copiedStagingSpendAllowed("embedding")) return null;
   let activeProvider: EmbeddingProvider | null = null;
   let model: string | null = null;
   let openaiKey: string | null = null;

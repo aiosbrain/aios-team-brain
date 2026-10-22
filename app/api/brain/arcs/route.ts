@@ -5,6 +5,7 @@ import { adminClient } from "@/lib/db/admin";
 import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
+import { modelFeatureVerdict } from "@/lib/staging/model-features";
 import { getFusedArcs } from "@/lib/graph/arc-fusion";
 import { resolveArcScope } from "@/lib/graph/partition-read";
 import { memberEnforcement } from "@/lib/access/enforce";
@@ -53,7 +54,12 @@ export async function POST(req: NextRequest) {
   const { resolveViewerPosture } = await import("@/lib/access/posture");
   const tier = await resolveViewerPosture(adminClient(), team.id, memberId);
   const admin = adminClient();
-  const keys = await resolveAnsweringKeys(admin, team.id);
+  // M9: AFTER membership and posture, BEFORE the eager key resolution — which throws
+  // `copied-staging-no-spend` on a copied staging deployment and surfaced as a generic 500 with the
+  // arcs panel behind it, even though the panel's rows are already in `arc_cache` and need no
+  // model to READ. `null` keys means exactly that: serve the stored partitions, synthesize nothing.
+  const answering = modelFeatureVerdict();
+  const keys = answering.enabled ? await resolveAnsweringKeys(admin, team.id) : null;
 
   // Access enforcement — resolved BEFORE the read, because the read's SCOPE depends on it. The
   // resolution fails CLOSED: a substrate error throws → 500, never the unfiltered set; a
@@ -97,7 +103,7 @@ export async function POST(req: NextRequest) {
     // to report, and stamping the tier row's real time is the §5.7 leak.
     // Coverage pair on EVERY branch (Codex M4: 'universal' meant universal — a branch-dependent
     // shape is a false wire claim even when no consumer discriminates on it today).
-    return Response.json({ arcs, reason: null, note: undefined, coveredPartitions: covered, totalPartitions: total, ...freshnessWire(computedNow()) });
+    return Response.json({ arcs, reason: null, note: undefined, coveredPartitions: covered, totalPartitions: total, answering: answering.posture, ...freshnessWire(computedNow()) });
   }
   return Response.json({
     arcs,
@@ -105,6 +111,11 @@ export async function POST(req: NextRequest) {
     // so every client receives the pair (spec M4: an ADDITIVE gain for former tier-path clients).
     coveredPartitions: covered,
     totalPartitions: total,
+    // On EVERY branch, like the coverage pair above and for the same reason: whether this
+    // deployment can synthesize is a property of the deployment, identical for every reader, so a
+    // branch-dependent shape would be a false wire claim. `disabled` here means the panel is
+    // whatever is cached — nothing was synthesized or warmed for it.
+    answering: answering.posture,
     // `degraded` is the ENVELOPE's (R2/M6): "a leg this payload depended on failed" — incl. the
     // dangerous non-empty-but-degraded case (H11). The retired diagnostic's model-failing
     // contribution died with it (that flag was only ever true on the empty path, which the
