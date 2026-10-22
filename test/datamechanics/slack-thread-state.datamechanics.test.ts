@@ -130,6 +130,47 @@ describe("inactive replies staging — resume, fencing and retention", () => {
     expect((await row(scope)).page_cursor).toBeNull();
   });
 
+  /**
+   * F3 RED (AIO-1170 final review, Astra-adjudicated F3 MEDIUM): MALFORMED REPLIES PAGINATION IS NOT
+   * A TERMINAL PAGE. Today the transport reads a non-string `next_cursor`, or a non-object
+   * `response_metadata`, as "no cursor"; with `has_more: false` the hydrator then stages the thread as
+   * COMPLETE and checkpoints its cursor to null — a truncated conversation the future publisher would
+   * publish as the whole thread. The adjudicated contract: the transport refuses it as the existing
+   * `transport_error` / `malformed_response_<status>`, so the hydrator requeues it as a transport
+   * failure and nothing is staged, completed, advanced or deleted. The partial evidence already
+   * staged by the first page is preserved exactly.
+   *
+   * EXPECTED RED on the current source: the second call returns `progressed` and the snapshot
+   * becomes complete with the cursor cleared.
+   */
+  it.each<[string, Record<string, unknown>]>([
+    ["a numeric next_cursor", { response_metadata: { next_cursor: 7 } }],
+    ["response_metadata null", { response_metadata: null }],
+    ["response_metadata an array", { response_metadata: [] }],
+  ])("F3 RED: refuses a continuation page with %s and keeps the staged partial thread exactly as it was", async (_label, metadata) => {
+    const seed = await seedTeam(); const scope = scopeFor(seed);
+    await enqueue(scope);
+    expect(await hydrateOneSlackThread(input(seed.teamId), { fetchImpl: page([rootMessage, replyOne], true, "page-2") }))
+      .toEqual({ outcome: "progressed" });
+    const stagedBefore = await staged(scope);
+    const rowBefore = await row(scope);
+    expect(stagedBefore).toMatchObject({ complete: false, snapshot_generation: "1" });
+    expect(rowBefore.page_cursor).toBe("page-2");
+    await expireLease(scope); await freeMethod(seed.teamId);
+
+    const malformed = (async () => new Response(JSON.stringify({ ok: true, messages: [replyTwo], has_more: false, ...metadata }),
+      { status: 200 })) as typeof fetch;
+    expect(await hydrateOneSlackThread(input(seed.teamId), { fetchImpl: malformed, random: () => 0 }))
+      .toEqual({ outcome: "failed", category: "transport_error" });
+
+    // Nothing staged, nothing completed, nothing advanced, nothing deleted.
+    expect(await staged(scope)).toEqual(stagedBefore);
+    const rowAfter = await row(scope);
+    expect(rowAfter.page_cursor).toBe("page-2");
+    expect(rowAfter.snapshot_generation).toBe("1");
+    expect(rowAfter.status).toBe("queued");
+  });
+
   it("does not reclaim a complete live snapshot or touch another workspace's older due root", async () => {
     const seed = await seedTeam();
     const scope = scopeFor(seed);

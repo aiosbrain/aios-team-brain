@@ -305,6 +305,90 @@ describe("slackReservedRequest — reserve, commit, then exactly one request", (
     });
   });
 
+  /**
+   * F2/F3 RED (AIO-1170 final review, Astra-adjudicated F3 MEDIUM): STRICT RAW PAGINATION METADATA.
+   *
+   * `SlackPage.nextCursor` is `string | null` only after the RAW provider fields have been validated.
+   * Today `readPage` reads any non-object `response_metadata`, and any non-string `next_cursor`, as
+   * "no cursor" — and a missing cursor with `has_more` absent or false is exactly what a history scan
+   * certifies as the end of the channel. A malformed answer must instead be the existing
+   * `transport_error` / `malformed_response_<status>` outcome, carrying nothing it received.
+   *
+   * Contract, as adjudicated:
+   *  - `response_metadata` absent, or an object without `next_cursor`, means no cursor; an empty
+   *    string means no cursor; a valid non-empty string is kept byte for byte;
+   *  - `response_metadata` null, an array or a primitive is malformed;
+   *  - `next_cursor` null, a number, a boolean, an array or an object is malformed;
+   *  - a whitespace-only cursor, a cursor longer than 1,024 characters, or one with a control
+   *    character is malformed;
+   *  - `has_more` absent means false, a boolean is kept, and every other present value is malformed.
+   *
+   * EXPECTED RED on the current source for the `response_metadata` and `next_cursor` rows and the
+   * whitespace, control-character and overlength rows: today each is an `ok` page with `nextCursor`
+   * null or with the bad string kept. The `has_more` rows and the controls are expected to pass now.
+   */
+  const F3_CANARY = "xoxb-F3-CANARY-cursor-4b1d";
+  const VALID_CURSOR = "dXNlcjpVMDYxTkZUVDI=/+_-.~";
+  const LONGEST_CURSOR = "c".repeat(1024);
+
+  async function readHistoryPage(body: Record<string, unknown>) {
+    granted();
+    const { impl } = fetchStub(() => json(body));
+    return slackReservedRequest(
+      { db: fakeDb(), scope: SCOPE, token: TOKEN },
+      "conversations.history",
+      { channel: "C0UNIT001" },
+      { fetchImpl: impl }
+    );
+  }
+
+  it.each<[string, Record<string, unknown>, { hasMore: boolean; nextCursor: string | null }]>([
+    ["response_metadata absent", { ok: true, messages: [] }, { hasMore: false, nextCursor: null }],
+    ["response_metadata an object without next_cursor", { ok: true, messages: [], response_metadata: {} }, { hasMore: false, nextCursor: null }],
+    ["an empty next_cursor", { ok: true, messages: [], response_metadata: { next_cursor: "" } }, { hasMore: false, nextCursor: null }],
+    ["a valid cursor, kept byte for byte", { ok: true, messages: [], has_more: true, response_metadata: { next_cursor: VALID_CURSOR } }, { hasMore: true, nextCursor: VALID_CURSOR }],
+    ["a cursor of exactly 1,024 characters", { ok: true, messages: [], has_more: true, response_metadata: { next_cursor: LONGEST_CURSOR } }, { hasMore: true, nextCursor: LONGEST_CURSOR }],
+    ["has_more absent with a cursor", { ok: true, messages: [], response_metadata: { next_cursor: VALID_CURSOR } }, { hasMore: false, nextCursor: VALID_CURSOR }],
+    ["has_more false, kept", { ok: true, messages: [], has_more: false }, { hasMore: false, nextCursor: null }],
+  ])("F3: reads %s as a valid page (control)", async (_label, body, page) => {
+    const result = await readHistoryPage(body);
+    expect(result).toMatchObject({ outcome: "ok", page });
+    if (result.outcome === "ok" && page.nextCursor !== null) {
+      // Byte for byte: the same UTF-16 code units, not a normalized or trimmed copy.
+      expect(Buffer.from(result.page.nextCursor ?? "", "utf8").equals(Buffer.from(page.nextCursor, "utf8"))).toBe(true);
+    }
+  });
+
+  it.each<[string, Record<string, unknown>]>([
+    ["response_metadata null", { response_metadata: null }],
+    ["response_metadata an array", { response_metadata: [{ next_cursor: VALID_CURSOR }] }],
+    ["response_metadata a string", { response_metadata: F3_CANARY }],
+    ["response_metadata a number", { response_metadata: 7 }],
+    ["response_metadata a boolean", { response_metadata: true }],
+    ["next_cursor null", { response_metadata: { next_cursor: null } }],
+    ["next_cursor a number", { response_metadata: { next_cursor: 15 } }],
+    ["next_cursor a boolean", { response_metadata: { next_cursor: true } }],
+    ["next_cursor an array", { response_metadata: { next_cursor: [VALID_CURSOR] } }],
+    ["next_cursor an object", { response_metadata: { next_cursor: { cursor: F3_CANARY } } }],
+    ["a whitespace-only cursor", { response_metadata: { next_cursor: " \t " } }],
+    ["a cursor of 1,025 characters", { response_metadata: { next_cursor: `${LONGEST_CURSOR}c` } }],
+    ["a cursor carrying a NUL", { response_metadata: { next_cursor: `${F3_CANARY}\u0000` } }],
+    ["a cursor carrying a newline", { response_metadata: { next_cursor: `${F3_CANARY}\n` } }],
+    ["a cursor carrying DEL", { response_metadata: { next_cursor: `${F3_CANARY}\u007f` } }],
+    ["has_more as the string false", { has_more: "false" }],
+    ["has_more as zero", { has_more: 0 }],
+    ["has_more as an object", { has_more: {} }],
+  ])("F3 RED: refuses %s as the existing malformed_response transport error, quoting nothing", async (_label, fields) => {
+    const result = await readHistoryPage({ ok: true, messages: [{ ts: "1718900000.000100" }], ...fields });
+    // Exact equality: no page, no body, and no copy of the canary or of anything else it received.
+    expect(result).toEqual({
+      outcome: "transport_error",
+      method: "conversations.history",
+      category: "malformed_response_200",
+    });
+    expect(JSON.stringify(result)).not.toContain(F3_CANARY);
+  });
+
   it("reads an empty page as provider data, and Slack's empty cursor as no cursor", async () => {
     granted();
     const { impl } = fetchStub(() =>
