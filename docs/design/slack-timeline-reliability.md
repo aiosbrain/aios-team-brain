@@ -174,3 +174,36 @@ Build-with: Claude Opus only, subscription-authenticated; Fable 5.1 spec and cod
 ## Tier safety
 
 Every source-message read is team-scoped and joined to current item visibility through the existing membership oracle before filtering/counting/pagination. Identity context preserves its existing viewer gate; diagnostics and historical repair are admin-gated. Identity links never grant access. AC-11 tests current authorization on fresh, persisted, in-memory and stale evidence plus summaries/citations.
+
+## Final-review amendments — recorded 2026-10-22
+
+These sections add to the accepted baseline above; they do not rewrite it. The sections above stay as accepted.
+
+### AM-F3: strict raw Slack pagination (accepted; implemented on the inactive contract)
+
+Accepted F3-only amendment, attached to Linear AIO-1170: 6,144 bytes, SHA-256 `2445601cf50baeb2c42704ef00a7fd7e923511f65c2f4587d7ef7bca8bb6b0d9`, exact readback comment `eba0a9e6-2d8f-48a0-bef3-efaf00e8ce92`. Readiness: independent Opus 5.5 high session `fa79d8aa-71f8-44a9-b8ca-ff7b651c1b1d`, READY, with its clarifications incorporated. It applies only to the inactive, unwired Slack source contract.
+
+The common Slack transport reader (`lib/ingest/sources/slack-page-request.ts`) builds `SlackPage.nextCursor: string | null` only after validating the RAW provider body:
+
+- `response_metadata` absent, or a plain object without `next_cursor` (for example warnings only), means `nextCursor: null`. `next_cursor: ""` means null.
+- A present `response_metadata` that is null, an array or a primitive is malformed. A present `next_cursor` that is null, a number, a boolean, an array or an object is malformed.
+- A cursor that is blank by JavaScript `.trim()` (its Unicode whitespace set, including U+00A0), contains a C0 control or DEL (`/[\x00-\x1f\x7f]/`), or is longer than 1,024 UTF-16 code units (`.length`) is malformed. A 1,024-unit cursor is valid. C1 controls are outside this rule.
+- Every other non-empty string is preserved byte for byte: never trimmed, normalized or re-encoded, including leading/trailing whitespace, distinct Unicode normalization forms and non-BMP content.
+- `has_more` absent means false, a boolean is preserved, and any other present value is malformed.
+- PRECEDENCE IS UNCHANGED. HTTP 429 is handled first; then any non-2xx or `ok !== true` response keeps its provider, auth or HTTP classification. Pagination is validated only on a 2xx `ok: true` body. So `invalid_cursor` restart and the auth and 5xx categories cannot be hidden by malformed metadata.
+- A malformed successful response returns the existing static `transport_error / malformed_response_<status>`, carrying only the outcome, the method and that category: no body, no page and no rejected value. Missing `messages` stays missing, never `[]`.
+- The rules apply to every method that reads through the common transport, including the non-paged metadata methods. Absent or warning-only metadata stays valid for them.
+- History and replies keep their consistency rules. `has_more: true` needs a valid non-empty cursor, and `has_more: false` needs none. A contradiction is `pagination_incomplete`, never terminal success.
+- A malformed response never enqueues roots, advances coverage or a frontier, replaces staged replies, creates a complete snapshot, makes evidence publication-eligible or deletes evidence. The provider reservation stays consumed, and retry classification and fences are unchanged.
+
+Status: implemented and verified at production checkpoint `8efac4ae`, which changes only the transport file. The evidence is in the build record. Proving that a malformed response never enters AM-F2 cursor history is deferred with AM-F2.
+
+### AM-F2: durable cross-wake cursor-repetition history (PROPOSED, HELD)
+
+The history pager today refuses only an IMMEDIATE repeat (`cursor_repeated`, where the returned cursor equals the cursor sent). A persisted A → B → A cycle, or a longer one, can survive across fresh discovery invocations. The proposed correction is bounded, durable, exact-string repetition history for each team, workspace, channel, lane and scan generation, owned by channel state.
+
+It is PROPOSED ONLY. It has not been reviewed for readiness, has not been attached to Linear as accepted, and is held, because the live PR 743 branch owns `postgres/schema.sql`. No migration exists, and no migration number has been reserved or created. Schema ownership for AM-F2 needs a verified human or existing-owner decision before review, Linear attachment or implementation; there is no cross-chat owner agreement today.
+
+The pre-activation packet's no-schema boundary was accurate when that packet was recorded. If AM-F2 is unheld, it would be a later correction packet. It is not a retroactive claim on the pre-activation packet.
+
+A possible later follow-up, kept beside AM-F2: a cursor containing an unpaired UTF-16 surrogate was not verified and is outside AM-F3. It might be re-encoded, or fail storage. This was the AM-F3 implementation review's non-blocking LOW, and it is not a confirmed defect.

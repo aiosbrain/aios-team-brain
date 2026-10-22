@@ -2,6 +2,16 @@
 
 Status: **prepared, not executed, not reviewed.** Author: Sonnet 5 (coordinating session). Date: 2026-09-21. This is a checklist for a person, not a script. Every step cites the accepted spec (`docs/design/slack-timeline-reliability.md`, "spec" below) and is otherwise marked **OPEN**. Nothing here has been run, and nothing in it may be reported as verified until someone runs it and records the result.
 
+**Current code status, recorded 2026-10-22.** This supersedes nothing below; it only says where the code stands, and nothing in this runbook has been run.
+
+- **The exact code checkpoint is `8efac4ae`.** At it, every bounded AC-02 acceptance row KR-01 to KR-16, and the accepted AM-F3 strict raw pagination amendment, are complete on the INACTIVE, unwired contract. The pipeline is still not wired or activated.
+- **AM-F2 blocks final code approval.** That is the durable cross-wake cursor-repetition history in `slack-timeline-reliability.md` ("Final-review amendments"). It is proposed and held on schema ownership (PR 743 owns `postgres/schema.sql`). KR-17 remains preserved as accepted and excluded from further PostgreSQL runs.
+- **The final reviews come later, on one stable snapshot.** The final whole-scope Opus completion review (including source-pipeline partition 2), a fresh Astra high review, the blind exact GPT-6.1 Sol high review and the final checks run only after AM-F2 is dispositioned and fixed, or explicitly adjudicated by its owner.
+- **The PA-1 to PA-5 pre-activation corrections were completed and reviewed on 2026-10-05.** So the "**OPEN today**" mark on the first section 1 precondition, and "the next build after PA-1 to PA-5" in section 2 step 5, are historical. The "reviewed by Fable" wording in section 1 is historical too: the accepted workflow has recorded its replacement reviewers. Every OTHER section 1 activation precondition remains open.
+- **The whole-scope final-review round on `b0067a2c` failed and satisfied no gate.** It is recorded in `aio-1170-resume.md` and the build record. No final review has yet reviewed `8efac4ae`.
+- **AC-02 and AIO-1170 are incomplete**, and so are the remaining section 1 preconditions below.
+- **Nothing is authorized here.** PR 714 stays draft against `staging`. No activation, wiring, PR 743 integration, merge or deployment is authorized by this note.
+
 Why it exists: the code for the new Slack pipeline is built and tested but deliberately **inactive** (`test/guards/slack-source-not-wired.test.ts`). Turning it on, migrating identities, and proving the timeline against a real workspace all need a person, a real workspace, or production authorization, and none can be done by an unattended session. This document makes that last mile a checklist.
 
 ## 0. Boundaries: who may do what

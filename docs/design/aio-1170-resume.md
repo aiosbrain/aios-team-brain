@@ -1,6 +1,37 @@
 # AIO-1170 recovery and resume record
 
-Last updated: 2026-10-08. This is the tracked recovery record for draft [PR 714](https://github.com/aiosbrain/aios-team-brain/pull/714), targeting `staging`. It records a deliberate stop after the KR-12 tests reached a reviewed and passing checkpoint. It does not claim AC-02 or AIO-1170 complete.
+Last updated: 2026-10-22. The current state comes first. Everything from "Exact repository state" on is the 2026-10-08 stop record, kept as it was written; where the two disagree, the current state governs. This is the tracked recovery record for draft [PR 714](https://github.com/aiosbrain/aios-team-brain/pull/714), targeting `staging`. It does not claim AC-02 or AIO-1170 complete.
+
+## Current state — 2026-10-22
+
+- **Exact code checkpoint `8efac4ae`.** This is the AM-F3 production fix. Its red-test base is `8a16bb35` and its staging base is `c5e832c2`. Every bounded AC-02 acceptance row KR-01 to KR-16, and AM-F3 strict raw Slack pagination, are complete on the INACTIVE, unwired contract. The pipeline is not wired or activated.
+- **AM-F3** is the accepted F3-only amendment on Linear AIO-1170: 6,144 bytes, SHA-256 `2445601cf50baeb2c42704ef00a7fd7e923511f65c2f4587d7ef7bca8bb6b0d9`, readback comment `eba0a9e6-2d8f-48a0-bef3-efaf00e8ce92`. Its contract is in `slack-timeline-reliability.md` ("Final-review amendments"), and its evidence is in the build record.
+- **AM-F2 blocks final code approval.** It is the durable cross-wake cursor-repetition history, and it is PROPOSED and HELD. It has not been reviewed for readiness and is not attached to Linear as accepted. PR 743's live branch owns `postgres/schema.sql`. No migration exists and no migration number is reserved. AM-F2 needs a verified human or existing-owner schema-ownership decision before review, Linear attachment or implementation; there is no cross-chat owner agreement today.
+- **KR-17** stays preserved exactly as accepted and excluded from further PostgreSQL runs.
+- **The failed whole-scope final-review round satisfied NO final gate.** It ran on exact snapshot `b0067a2cd203d932d5c30eeffd4f30a55e14d3f8`, base `c5e832c2ff179ee5c99f95966fba1ed9ce77ae3e`.
+  - **Opus:** fresh whole-scope session `bcb7da03-e4e7-4824-9bcf-deff09fdbd6a` returned NOT PASS, with an F1 generation-churn MEDIUM and three LOW. Its source-pipeline partition 2 was sampled, not complete.
+  - **Astra:** the fresh high final review returned NOT PASS on the cross-wake A → B → A cycle, now F2.
+  - **Sol, CLI route:** the exact GPT-6.1 Sol high launch failed with HTTP 400, as unsupported on the signed-in ChatGPT CLI route. That is a route limitation, not a review verdict.
+  - **Sol, collaboration route:** a separate exact-model collaboration review (`gpt-6.1-sol`, high, fresh read-only context; canonical task `aio1170_blind_sol_final_retry`, and no other local identifier exists) reviewed the whole contract. It verified all 168 manifest entries and the exact 73,266-line frozen diff, and returned NOT PASS. It independently confirmed F2 and raised F3, malformed raw pagination metadata. This successful result is kept separate from the failed CLI launch.
+  - **Astra owner adjudication, 2026-10-22:**
+    - F1 is REJECTED as a MEDIUM, with evidence; a LOW availability follow-up is retained.
+    - F2 and F3 are ACCEPTED as MEDIUM.
+    - The stale activation and recovery docs are ACCEPTED as a LOW for this packet.
+    - The disable/link race is REJECTED, on lock and foreign-key evidence.
+    - The unbounded channel lookup is RETAINED as a separate, non-blocking LOW.
+
+    Rejected findings are not reopened without new evidence.
+  - **No blind final review has yet reviewed `8efac4ae`** or any later documentation snapshot.
+- **Held LOW items:**
+  - the stale comment in `lib/dashboard/timeline-cache.ts` is an accepted LOW, held because PR 743 owns that file;
+  - the accepted unbounded channel-lookup LOW is a separate, non-blocking follow-up;
+  - the F1 availability LOW, retained by the owner adjudication, is a non-blocking follow-up;
+  - the AM-F3 implementation review's non-blocking LOW is a possible later follow-up, kept beside AM-F2. A cursor with an unpaired UTF-16 surrogate was not verified and is outside AM-F3: it might be re-encoded, or fail storage. This is not a confirmed defect.
+- **Next actions:**
+  1. Obtain the AM-F2 schema-ownership decision from a human or the existing owner.
+  2. Then either review, attach and implement AM-F2 red-first through the same writer, or record the owner's explicit adjudication.
+  3. Only then pin one later stable snapshot for the final whole-scope Opus completion review (including source-pipeline partition 2), a fresh Astra high review, the blind exact GPT-6.1 Sol high review and the final checks.
+- **Nothing is authorized here.** PR 714 stays draft against `staging`. No activation, wiring, PR 743 integration, merge or deployment is authorized.
 
 ## Exact repository state
 
