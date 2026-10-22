@@ -21,11 +21,18 @@ line go stale while the code moved on, so it is not restated.
 > - **Narrowing:** a standing agent that relied on a builtin Everyone row sees hand-entered rows only
 >   in projects granted to it through non-builtin groups; agent keys pulling `GET /api/v1/tasks`
 >   stop receiving dashboard-created rows outside those projects.
-> - Run the read-only per-team census in [`docs/RELEASE-NOTES-tierret1.md`](docs/RELEASE-NOTES-tierret1.md)
->   and act on it (re-file rows, adjust grants, grant agents) **before** deploying. Its rollback and
->   roll-forward steps (timeline cache, workspace pull-cursor reset) are in the same file.
+> - **Before deploying, for every team**, work through "REQUIRED before rollout" in
+>   [`docs/RELEASE-NOTES-tierret1.md`](docs/RELEASE-NOTES-tierret1.md):
+>   1. `npm run admin -- access-health <team-slug>` must report no unsanctioned edges on system
+>      projects; repair any with `repair-system-edge`. Otherwise the new `system-integrity` placement
+>      gate refuses pushes into General / `external-shared` and ingestion can stall.
+>   2. Resolve each "active external-tier human member(s) in the builtin Everyone group" it reports.
+>   3. Run the read-only impact census (queries A and B) and act on it: re-file rows, adjust grants,
+>      grant agents.
+> - **After deploying:** workspaces must reset their pull cursor to receive older rows they were
+>   newly granted. The rollback / roll-forward timeline-cache step is in the same file.
 >
-> **Also breaking:** the image requires Node ≥ 22.23.4 (Node 20 is dropped); minting an agent token
+> **Also breaking:** Node 20 is dropped. The image requires Node ≥ 22.23.4, and a source install accepts only `^22.23.4 || ^24.22.1 || ^26.12.1` (`engines`, `install.sh`, `npm run doctor`); minting an agent token
 > now refuses a request with no explicit issuance scope (#737); `/auth/dev-login` now needs
 > `AIOS_DEV_LOGIN=1` and a loopback host (`npm run dev:login`), not merely a non-production build (#740).
 
@@ -86,6 +93,8 @@ line go stale while the code moved on, so it is not restated.
 - This version is an **unpromoted validation candidate** for measuring the protected validation
   check producer. It is not a production release. A later accepting-parser change requires a new
   reviewed version and candidate.
+- **Update 2026-10-22:** v0.13.0 was merged into `main` (#752) to bring the release branch level
+  with the integration branch, and it is what production runs ahead of 0.14.0.
 
 ## [0.12.0] — 2026-08-26
 
