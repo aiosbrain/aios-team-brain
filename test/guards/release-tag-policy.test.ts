@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { DEFAULT_TAGS, nextTagPolicy } from "../../scripts/migrate-from-existing.mjs";
+import { DEFAULT_TAGS, nextTagPolicy, tagsInScope } from "../../scripts/migrate-from-existing.mjs";
 
 /**
  * RELPTR-1 — cutting a release used to be impossible without freezing the repo.
@@ -121,7 +121,9 @@ describe("release tag policy — the anti-rot rule survives (criteria 3, 4, 5)",
     // a release is prepared); an illegal one is a middle hole or a stale list. Asserting legality holds
     // between releases AND during one, so declaring a release can never redden this file.
     expect(gitTags).toContain("v0.10.0");
-    expect(() => nextTagPolicy(DEFAULT_TAGS, gitTags)).not.toThrow();
+    // The lane's own view: tags reachable from HEAD plus declared ones (see tagsInScope).
+    const reachable = execFileSync("git", ["tag", "--merged", "HEAD"], { cwd: ROOT, encoding: "utf8" }).split("\n").filter(Boolean);
+    expect(() => nextTagPolicy(DEFAULT_TAGS, tagsInScope(gitTags, reachable, DEFAULT_TAGS))).not.toThrow();
     // …and still non-vacuous against live git: a newer real tag nobody declared is a stale list.
     expect(() => nextTagPolicy(DEFAULT_TAGS, ["v0.99.0", ...gitTags])).toThrow(/stale: v0\.99\.0/);
   });
@@ -450,5 +452,24 @@ describe("release tag policy — the lane's preconditions (criteria 7, 8, 9)", (
     expect(sh, "must say the default is trunk").toMatch(/default is trunk/);
     expect(sh, "must show how to install a release").toMatch(/AIOS_REF=vX\.Y\.Z/);
     expect(sh, "must point at the release process").toMatch(/docs\/RELEASING\.md/);
+  });
+});
+
+describe("tagsInScope — another branch's release is not this branch's stale list", () => {
+  it("drops an undeclared tag HEAD cannot reach, so it neither reddens the stale check nor gets upgraded from", () => {
+    const all = ["v0.13.0", "v0.12.0", "v0.11.0", "v0.10.0"];
+    const reachable = ["v0.12.0", "v0.10.0"];
+    const declared = ["v0.10.0", "v0.11.0", "v0.12.0"];
+    expect(tagsInScope(all, reachable, declared)).toEqual(["v0.12.0", "v0.11.0", "v0.10.0"]);
+    expect(() => nextTagPolicy(declared, tagsInScope(all, reachable, declared))).not.toThrow();
+  });
+
+  it("keeps a reachable undeclared tag, so a release merged into HEAD still marks the list stale", () => {
+    expect(() => nextTagPolicy(["v0.12.0"], tagsInScope(["v0.13.0", "v0.12.0"], ["v0.13.0", "v0.12.0"], ["v0.12.0"])))
+      .toThrow(/stale: v0\.13\.0/);
+  });
+
+  it("keeps a declared tag HEAD cannot reach, so it is still exercised rather than becoming a hole", () => {
+    expect(tagsInScope(["v0.11.0", "v0.10.0"], ["v0.10.0"], ["v0.10.0", "v0.11.0"])).toEqual(["v0.11.0", "v0.10.0"]);
   });
 });
