@@ -517,7 +517,16 @@ export async function main(argv = process.argv.slice(2)) {
   // Tags are dereferenced to COMMITS by `--sort=-v:refname` listing plus git's own peeling downstream;
   // what matters here is the NAME set. This repo's tags are mixed (v0.7.0/v0.9.0 annotated,
   // v0.8.0/v0.10.0 lightweight), so any comparison by object id must peel — see nextTagPolicy's tests.
-  const known = git(["tag", "--sort=-v:refname"]).split("\n").filter(Boolean);
+  // A tag that is neither declared nor reachable from HEAD is another branch's release, not this
+  // branch's stale list: v0.13.0 was cut on the integration branch, and counting it on the release
+  // branch failed every pull request there with "DEFAULT_TAGS is stale" while upgrading FROM it would
+  // be a downgrade test (its schema is newer than this tree's). Declared tags are always kept, so a
+  // declared-but-unreachable tag (v0.11.0) is still exercised and a missing one is still a hole.
+  const reachable = new Set(git(["tag", "--merged", "HEAD"]).split("\n").filter(Boolean));
+  const known = git(["tag", "--sort=-v:refname"])
+    .split("\n")
+    .filter(Boolean)
+    .filter((t) => reachable.has(t) || tags.includes(t));
   // `allowPending` only for the declaration. An explicit `--tags` is the operator's request, and a
   // request naming a tag that does not exist is an error, not a release being prepared.
   const usingDeclaration = !argv.includes("--tags");
