@@ -23,12 +23,12 @@ import { DEFAULT_TAGS, nextTagPolicy } from "../../scripts/migrate-from-existing
  */
 
 const ROOT = join(__dirname, "..", "..");
-const REAL_TAGS = ["v0.11.0", "v0.10.0", "v0.9.0", "v0.8.0", "v0.7.0"]; // newest-first, as git reports them
+const REAL_TAGS = ["v0.12.0", "v0.11.0", "v0.10.0", "v0.9.0", "v0.8.0", "v0.7.0"]; // newest-first, as git reports them
 
 /** A fully-CUT declared list, for policy semantics. Deliberately NOT `DEFAULT_TAGS`: the live list
  *  legitimately carries a declared-but-uncut release during preparation, and assertions that assumed
  *  otherwise turned red the moment a release was declared. */
-const CUT_FIXTURE = ["v0.7.0", "v0.8.0", "v0.9.0", "v0.10.0", "v0.11.0"];
+const CUT_FIXTURE = ["v0.7.0", "v0.8.0", "v0.9.0", "v0.10.0", "v0.11.0", "v0.12.0"];
 
 /**
  * Does THIS checkout have the release tags?
@@ -104,8 +104,8 @@ describe("release tag policy — the prepared release (criteria 1, 2, 5)", () =>
 describe("release tag policy — the anti-rot rule survives (criteria 3, 4, 5)", () => {
   it("THROWS when a tag EXISTS that is newer than everything declared", () => {
     // The newest EXISTING tag is whatever REAL_TAGS says today — asserted by name so the message is
-    // pinned, and updated deliberately when a release is cut (it was v0.10.0 before v0.11.0 existed).
-    expect(() => nextTagPolicy(["v0.7.0", "v0.8.0"], REAL_TAGS)).toThrow(/DEFAULT_TAGS is stale: v0\.11\.0/);
+    // pinned, and updated deliberately when a release is cut. v0.12.0 is provider-proven cut.
+    expect(() => nextTagPolicy(["v0.7.0", "v0.8.0"], REAL_TAGS)).toThrow(/DEFAULT_TAGS is stale: v0\.12\.0/);
   });
 
   it("is NON-VACUOUS in both directions against the SHIPPED list", () => {

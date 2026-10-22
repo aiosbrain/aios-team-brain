@@ -21,6 +21,20 @@ line go stale while the code moved on, so it is not restated.
   enforcement fails closed for an unpartitioned item and the only UNATTENDED partitioner is budgeted, so such a
   fleet would deploy "successfully" over a dark corpus. `lib/access/groups.ts` is unchanged.
 
+## [0.13.0] — 2026-09-26
+
+### Added
+
+- **AIO-1124 — diagnostic reviewer probes.** A separate inert staging workflow and private collector
+  retain self-review and unauthorized-App observations for later fixture review. These observations
+  remain unverified and cannot satisfy production policy commissioning.
+
+### Release status
+
+- This version is an **unpromoted validation candidate** for measuring the protected validation
+  check producer. It is not a production release. A later accepting-parser change requires a new
+  reviewed version and candidate.
+
 ## [0.12.0] — 2026-08-26
 
 ### Removed
