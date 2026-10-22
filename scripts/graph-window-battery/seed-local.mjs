@@ -29,6 +29,7 @@
  *   node scripts/graph-window-battery/seed-local.mjs
  */
 import { Client } from "pg";
+import { pgConnectionConfig } from "../../lib/db/pg/ssl.mjs";
 import { spawnSync } from "node:child_process";
 import { selectCorpus, verifyCorpus, countFromBody, CANDIDATE_SQL, PROJECTABLE_KINDS } from "./corpus.mjs";
 
@@ -36,7 +37,7 @@ import { selectCorpus, verifyCorpus, countFromBody, CANDIDATE_SQL, PROJECTABLE_K
 const connect = async (url, label) => {
   if (!url) throw new Error(`${label} is required`);
   const needsSsl = /\bsslmode=require\b/.test(url) || /rlwy\.net|railway/.test(url);
-  const c = new Client({ connectionString: url, ...(needsSsl ? { ssl: { rejectUnauthorized: false } } : {}) });
+  const c = new Client(pgConnectionConfig(url, { legacyTls: needsSsl }));
   await c.connect();
   return c;
 };

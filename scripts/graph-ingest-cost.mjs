@@ -53,6 +53,7 @@
  * Pure node + `pg` (no tsx), so it runs anywhere the app does, including against prod read-only.
  */
 import { Client } from "pg";
+import { pgConnectionConfig } from "../lib/db/pg/ssl.mjs";
 
 /** Minutes of quiet required at each edge before a window is trustworthy. Graphiti's queue drains at
  *  LLM speed (~1-30s per call), so a gap this size means the burst genuinely ended. */
@@ -194,7 +195,7 @@ async function main() {
     process.exit(2);
   }
 
-  const client = new Client({ connectionString: url, ssl: /\bsslmode=require\b/.test(url) ? { rejectUnauthorized: false } : undefined });
+  const client = new Client(pgConnectionConfig(url, { legacyTls: /\bsslmode=require\b/.test(url) }));
   await client.connect();
   try {
     const drain = `${drainMinutes} minutes`;

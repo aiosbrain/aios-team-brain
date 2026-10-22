@@ -195,7 +195,8 @@ if (process.argv[1]?.includes("judge.mjs")) {
     process.exit(1);
   }
   const { Client } = await import("pg");
-  const pg = new Client({ connectionString: process.env.DATABASE_URL });
+  const { pgConnectionConfig } = await import("../../lib/db/pg/ssl.mjs");
+  const pg = new Client(pgConnectionConfig(process.env.DATABASE_URL, { legacyTls: false }));
   await pg.connect();
   const { rows: items } = await pg.query("select id, body from items where access = 'team'");
   await pg.end();

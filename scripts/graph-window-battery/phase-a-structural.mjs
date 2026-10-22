@@ -20,13 +20,14 @@
  *   DATABASE_URL=<prod public URL> node scripts/graph-window-battery/phase-a-structural.mjs
  */
 import { Client } from "pg";
+import { pgConnectionConfig } from "../../lib/db/pg/ssl.mjs";
 import { selectCorpus, CANDIDATE_SQL, CHUNK_CHARS, MAX_EPISODE_CHUNKS, blankBodySql, PROJECTABLE_KINDS } from "./corpus.mjs";
 
 const KINDS = PROJECTABLE_KINDS;
 // Gate SSL the way the sibling scripts do, so this also runs against a plain local Postgres.
 const url = process.env.DATABASE_URL ?? "";
 const needsSsl = /\bsslmode=require\b/.test(url) || /\.rlwy\.net|proxy\.rlwy\.net|railway/.test(url);
-const c = new Client({ connectionString: url, ...(needsSsl ? { ssl: { rejectUnauthorized: false } } : {}) });
+const c = new Client(pgConnectionConfig(url, { legacyTls: needsSsl }));
 await c.connect();
 
 // Deterministic: `limit 1` with no ORDER BY picks an arbitrary row on a multi-team install.

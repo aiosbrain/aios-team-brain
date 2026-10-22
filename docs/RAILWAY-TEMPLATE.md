@@ -32,6 +32,7 @@ that will own the deployment.
 |---|---|
 | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` reference |
 | `PGSSL` | fixed to `require` |
+| `PG_CA_CERT` | not set by the template (the CA is generated per database, after deploy). Without it TLS is encrypted but unverified; `npm run doctor` warns. Set it after first deploy — `docs/OPS.md` § 15 (Postgres TLS) |
 | `APP_URL` | `https://${{RAILWAY_PUBLIC_DOMAIN}}` |
 | `AUTH_SECRET` | generated with `${{ secret(64, "0123456789abcdef") }}` |
 | `GRAPH_LLM_PROXY_SECRET` | generated secret shared with Graphiti; authenticates its calls to Team Brain's internal LLM proxy |

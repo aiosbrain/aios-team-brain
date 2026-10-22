@@ -18,17 +18,14 @@ import { readFileSync, existsSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "pg";
+import { pgConnectionConfig, shouldUseSsl } from "../lib/db/pg/ssl.mjs";
 import { assertServiceIdentity } from "./service-guard.mjs";
 import { acquireDataUseLock, hasExclusiveDataUseLock } from "./staging-ops/journal.mjs";
 import { classifyFenceAdmission, stagingFenceScope } from "./staging-ops/fence-admission.mjs";
 
-export function shouldUseSsl(databaseUrl, env = process.env) {
-  return (
-    /\bsslmode=require\b/.test(databaseUrl) ||
-    env.PGSSL === "require" ||
-    env.PGSSLMODE === "require"
-  );
-}
+// The TLS predicate + posture live in the ONE shared helper; re-exported here because bootstrap,
+// doctor and the startup fence have always imported it from the loader.
+export { shouldUseSsl };
 
 export async function loadSchema({
   cwd = process.cwd(),
@@ -51,13 +48,10 @@ export async function loadSchema({
 
   const pgDir = path.join(cwd, "postgres");
   const sql = readFile(path.join(pgDir, "schema.sql"), "utf8");
-  const useSsl = shouldUseSsl(databaseUrl, env);
-
   const makeClient = createClient ?? ((config) => new Client(config));
-  const client = connectedClient ?? makeClient({
-    connectionString: databaseUrl,
-    ssl: useSsl ? { rejectUnauthorized: false } : undefined,
-  });
+  const client = connectedClient ?? makeClient(
+    pgConnectionConfig(databaseUrl, { legacyTls: shouldUseSsl(databaseUrl, env), env })
+  );
   // Surface RAISE NOTICE output in the deploy log (PPARC-3): node-pg DISCARDS notices without a
   // listener, which made a migration's "reported count" claim false on the only rollout path —
   // the stranded-corrections report is a documented decision input, not decoration.

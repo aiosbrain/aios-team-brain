@@ -9,6 +9,7 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { Client } from "pg";
+import { pgConnectionConfig, shouldUseSsl } from "../lib/db/pg/ssl.mjs";
 import { assertServiceIdentity } from "./service-guard.mjs";
 
 async function main() {
@@ -21,15 +22,7 @@ async function main() {
 
   const file = path.join(process.cwd(), "postgres", "optional", "pgvector.sql");
   const sql = readFileSync(file, "utf8");
-  const useSsl =
-    /\bsslmode=require\b/.test(url) ||
-    process.env.PGSSL === "require" ||
-    process.env.PGSSLMODE === "require";
-
-  const client = new Client({
-    connectionString: url,
-    ssl: useSsl ? { rejectUnauthorized: false } : undefined,
-  });
+  const client = new Client(pgConnectionConfig(url, { legacyTls: shouldUseSsl(url) }));
   await client.connect();
   try {
     await client.query(sql);

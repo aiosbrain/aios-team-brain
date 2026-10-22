@@ -2086,3 +2086,82 @@ active job, changed source/policy/trigger inventory, lost token identity or fail
 confirmation leaves cleanup blocked and the original commissioning assessment unverified. The
 original bot-dispatched run still needs John's genuine independent approvals and successful
 protected jobs for a future positive release decision.
+
+---
+
+## 15. Postgres TLS — pinning the server CA (`PG_CA_CERT`)
+
+**What it does.** With `PG_CA_CERT` set, every Postgres connection (app pool, `pg:schema`
+pre-deploy hook, bootstrap, doctor, operator scripts — all via `lib/db/pg/ssl.mjs`; the staging
+copy plane in `scripts/staging-ops/` is the reviewed exception and keeps its own target contract) turns TLS on
+and verifies the server chain against that CA: libpq **`verify-ca`**. The hostname is not checked.
+`PG_TLS_VERIFY_HOSTNAME=1` adds the hostname check (**`verify-full`**). Without `PG_CA_CERT` the old
+posture stays: `PGSSL=require`/`sslmode=require` is TLS without verification, nothing is plaintext.
+`npm run doctor` prints which one you have.
+
+**Why verify-ca, not verify-full, on Railway.** Railway's Postgres (measured 2026-10-22) accepts the
+SSLRequest on `postgres.railway.internal:5432` and presents leaf `CN=localhost` (SAN `DNS:localhost`)
+issued by a self-signed `CN=root-ca` that is generated **per database**. The hostname you dial is
+never `localhost`, so verify-full can never pass; the chain to that database's `root-ca` can. Each
+environment has its own `root-ca`, so `PG_CA_CERT` is a **per-environment** value. A wrong CA fails
+the connection (`SELF_SIGNED_CERT_IN_CHAIN` / `CERT_SIGNATURE_FAILURE`), it never downgrades.
+`PG_TLS_VERIFY_HOSTNAME=1` without `PG_CA_CERT` refuses to connect, and so does a `DATABASE_URL`
+ssl parameter that would replace the pinned settings (e.g. `sslnegotiation=direct`); `sslmode=*`,
+`ssl=*`, `sslrootcert` and `uselibpqcompat` are stripped (an explicit `sslmode=verify-full` keeps
+the hostname check).
+
+**Note on the internal URL.** The internal `DATABASE_URL` carries no `sslmode` and the AIOS
+environments set no `PGSSL`, so before `PG_CA_CERT` they spoke **plaintext** on the private network.
+Setting `PG_CA_CERT` is what turns TLS on for them; it does not need `PGSSL` as well.
+
+### 1. Obtain the CA
+
+The CA certificate is public, not a secret. Fetch it from the network the app uses, then compare the
+fingerprint with one obtained over a second path (for example the public TCP proxy) before trusting
+it. Either:
+
+```bash
+# OpenSSL 1.1.1+ — prints the chain; the LAST certificate is CN=root-ca
+openssl s_client -starttls postgres -connect postgres.railway.internal:5432 -showcerts </dev/null
+```
+
+or, where only Node is available (the app container), this prints the root as PEM:
+
+```js
+// node get-pg-ca.js <host> <port>
+const net = require("net"), tls = require("tls");
+const [host, port = "5432"] = process.argv.slice(2);
+const s = net.connect(Number(port), host, () => {
+  const b = Buffer.alloc(8); b.writeInt32BE(8, 0); b.writeInt32BE(80877103, 4); s.write(b); // SSLRequest
+});
+s.once("data", (d) => {
+  if (d[0] !== 0x53) throw new Error("server refused TLS");
+  const t = tls.connect({ socket: s, rejectUnauthorized: false, servername: host }, () => {
+    let c = t.getPeerCertificate(true);
+    while (c.issuerCertificate && c.issuerCertificate !== c) c = c.issuerCertificate;
+    console.error("root", c.subject.CN, c.fingerprint256, "valid to", c.valid_to);
+    console.log(`-----BEGIN CERTIFICATE-----\n${c.raw.toString("base64").match(/.{1,64}/g).join("\n")}\n-----END CERTIFICATE-----`);
+    t.end();
+  });
+});
+```
+
+From a laptop, the same script works against the Postgres service's public TCP proxy
+(`DATABASE_PUBLIC_URL` host and port): the proxy passes TLS through, so it presents the same chain.
+Check the fingerprint: `openssl x509 -in root-ca.pem -noout -fingerprint -sha256` (do not combine it
+with `-ext` on OpenSSL 4, which prints a different digest).
+
+### 2. Set it per environment
+
+Set `PG_CA_CERT` on the **app service** of each environment to that environment's PEM (a multi-line
+value is fine; base64 of the PEM also works: `base64 < root-ca.pem | tr -d '\n'`). Setting a
+variable redeploys the service; the pre-deploy `pg:schema` hook is the first connection to use it,
+so a wrong CA fails the release before the new version goes live rather than at runtime. Then:
+
+```bash
+npm run doctor   # "postgres TLS  verify-ca — chain verified against PG_CA_CERT"
+```
+
+**Rotation.** The `root-ca` expires (production's: 2028-09-12). If Railway regenerates it, the
+connection fails closed with a certificate error: re-fetch and re-set `PG_CA_CERT`. To rotate
+without downtime, set a bundle of both PEMs (old + new, concatenated) first, then drop the old one.

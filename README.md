@@ -762,6 +762,8 @@ shipping app code ahead of its database.
 | `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` / `SLACK_OAUTH_REDIRECT` | unset | Per-member Slack OAuth ("act as me"), **not** ingestion |
 | `GITHUB_TOKEN` | unset | Member provisioning, profile sync, codebase scans — **not** the ingest runner |
 | `PGSSL` / `PGSSLMODE` | unset | Set to `require` for managed Postgres |
+| `PG_CA_CERT` | unset | Postgres server CA (PEM or base64 PEM). Turns TLS on and verifies the chain (`verify-ca`); without it TLS is unverified. See `docs/OPS.md` § 15 (Postgres TLS) |
+| `PG_TLS_VERIFY_HOSTNAME` | unset | `1` = also verify the hostname (`verify-full`) |
 | `SENTRY_DSN`, `NEXT_PUBLIC_SENTRY_DSN`, … | unset | Fully inert when unset |
 | `DOC_TASK_INFER_INTERVAL_HOURS` | `12` | Cooldown on the paid doc→task inference pass |
 | `AIOS_DEV_LOGIN` | `0` → off | **Local development only.** Exactly `1` enables the `/auth/dev-login` bypass on a non-production server for strictly local requests; production always refuses. Don't persist `1` — use `npm run dev:login` (§2.7). Not a secret. |
