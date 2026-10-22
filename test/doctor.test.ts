@@ -210,14 +210,17 @@ describe("node runtime", () => {
 
   it("is the same floor table the Dockerfile and install.sh enforce", () => {
     const dockerfile = readFileSync(path.join(ROOT, "Dockerfile"), "utf8");
+    const opsDockerfile = readFileSync(path.join(ROOT, "docker", "staging-ops.Dockerfile"), "utf8");
     const install = readFileSync(path.join(ROOT, "install.sh"), "utf8");
     for (const [major, floor] of Object.entries(NODE_TLS_FLOORS)) {
       expect(dockerfile).toContain(`${major}:"${floor}"`);
+      expect(opsDockerfile).toContain(`${major}:"${floor}"`);
       expect(install).toContain(`${major}) floor=${floor}`);
     }
     // …and neither carries a line the table doesn't, nor package.json's engines.
     const n = Object.keys(NODE_TLS_FLOORS).length;
     expect(dockerfile.match(/\d+:"\d+\.\d+\.\d+"/g)).toHaveLength(n);
+    expect(opsDockerfile.match(/\d+:"\d+\.\d+\.\d+"/g)).toHaveLength(n);
     expect(install.match(/^\s*\d+\) floor=/gm)).toHaveLength(n);
     const engines = JSON.parse(readFileSync(path.join(ROOT, "package.json"), "utf8")).engines.node;
     expect(engines).toBe(Object.values(NODE_TLS_FLOORS).map((f) => `^${f}`).join(" || "));

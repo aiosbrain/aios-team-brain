@@ -1109,7 +1109,10 @@ describe("route-auth checker: public protocol exceptions (AC-05)", () => {
   });
 });
 
-describe("route-auth checker: real-source mutants, in memory only (AC-03, AC-04)", () => {
+// Each case re-checks the WHOLE real route inventory in memory, which ran past vitest's 5s default
+// under CI coverage on Node 22 (two generator cases timed out, no assertion failed). A correctness
+// failure still fails fast; the bound only keeps a slow runner from reading as one.
+describe("route-auth checker: real-source mutants, in memory only (AC-03, AC-04)", { timeout: 30_000 }, () => {
   /** A copy of the real inventory with ONE occurrence of `needle` in `path` replaced. */
   function mutant(path: string, needle: string, replacement: string, occurrence: "only" | "last" = "only"): RepoView {
     const source = REAL.routeSources.get(path);
