@@ -168,7 +168,7 @@ export function checkPgSsl(env) {
       return {
         status: FAIL,
         detail: `TLS settings rejected — every connection will refuse: ${message}`,
-        fix: "set PG_CA_CERT to the server's CA certificate (PEM or base64 PEM), or unset it — see docs/OPS.md § 13",
+        fix: "set PG_CA_CERT to the server's CA certificate (PEM or base64 PEM), or unset it — see docs/OPS.md § 15 (Postgres TLS)",
       };
     }
     return { status: FAIL, detail: "DATABASE_URL could not be parsed by node-postgres (value redacted)", fix: "check the connection string and any sslrootcert path" };
@@ -187,7 +187,7 @@ export function checkPgSsl(env) {
       return {
         status: WARN,
         detail: "unverified — TLS is on but the server certificate is NOT checked (encrypted, not authenticated)" + from,
-        fix: "set PG_CA_CERT to the Postgres CA (docs/OPS.md § 13) to verify the server",
+        fix: "set PG_CA_CERT to the Postgres CA (docs/OPS.md § 15, Postgres TLS) to verify the server",
       };
     default:
       if (local || tls.source === "loopback") return { status: OK, detail: "disabled — local database, TLS not needed" };

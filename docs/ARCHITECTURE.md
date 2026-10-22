@@ -1540,7 +1540,7 @@ guard enforces it, it's named.
   connections that never asked for TLS stay plaintext; with a pin, the final string is re-parsed by
   pg's own `ConnectionParameters` and must yield exactly the pinned object, or it throws. NOT routed
   (reviewed list in the guard): `scripts/staging-ops/{exporter,importer,staging-pair-fixture}.mjs`
-  (own canonical target contract, two databases) and the scratch-DB harnesses. Runbook: `docs/OPS.md` § 13.
+  (own canonical target contract, two databases) and the scratch-DB harnesses. Runbook: `docs/OPS.md` § 15 (Postgres TLS).
   _Guards:_ `test/guards/pg-tls-single-owner.test.ts` (no `rejectUnauthorized` elsewhere; every
   pg Client/Pool constructor imports the helper or is on the reviewed list),
   `test/pg-ssl.test.ts`, `test/pg-tls-handshake.test.ts` (wrong CA refused / right CA accepted with a

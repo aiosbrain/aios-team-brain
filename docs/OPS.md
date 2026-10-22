@@ -2089,7 +2089,7 @@ protected jobs for a future positive release decision.
 
 ---
 
-## 13. Postgres TLS — pinning the server CA (`PG_CA_CERT`)
+## 15. Postgres TLS — pinning the server CA (`PG_CA_CERT`)
 
 **What it does.** With `PG_CA_CERT` set, every Postgres connection (app pool, `pg:schema`
 pre-deploy hook, bootstrap, doctor, operator scripts — all via `lib/db/pg/ssl.mjs`; the staging

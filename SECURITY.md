@@ -56,7 +56,7 @@ back-port branch yet. Run the latest `main` (or the latest tagged release once o
     not authenticated), and no TLS setting gives plaintext. `npm run doctor` reports the mode
     (`verify-ca` / `verify-full` / `unverified` / `disabled`) and warns on `unverified`; the app logs
     one warning at pool creation.
-  - How to obtain the CA and set it per environment: `docs/OPS.md` § 13.
+  - How to obtain the CA and set it per environment: `docs/OPS.md` § 15 (Postgres TLS).
 - **Keep the database private.** The app enforces tier isolation in code; do not expose the
   Postgres port publicly, and run the brain behind your own auth/network boundary.
 - **Sentry / external error reporting** is opt-in and inert unless a DSN is configured; review

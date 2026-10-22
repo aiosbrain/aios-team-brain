@@ -127,6 +127,13 @@ describe("postgres TLS", () => {
     expect(r.status).toBe(FAIL);
   });
 
+  it("names an unparseable DATABASE_URL as such, without echoing it", () => {
+    const r = checkPgSsl({ DATABASE_URL: "postgres://u:s3cret@[bad/x" });
+    expect(r.status).toBe(FAIL);
+    expect(r.detail).toMatch(/DATABASE_URL could not be parsed/);
+    expect(r.detail).not.toContain("s3cret");
+  });
+
   it("sslmode=require in the URL is node-postgres verify-full (system CAs), not unverified", () => {
     const r = checkPgSsl({ DATABASE_URL: "postgres://u:p@db.railway.app:5432/rw?sslmode=require" });
     expect(r.status).toBe(OK);
