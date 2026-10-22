@@ -42,7 +42,7 @@ jobs:
           fetch-depth: 0 # prior schema states come from git tags, not fixture files
       - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
       - run: npm ci
       - run: npm run test:migrate-from-existing:sweep

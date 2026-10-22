@@ -12,9 +12,17 @@
 # slimmer `--omit=dev` runtime would need `output: "standalone"` in next.config.ts and a
 # separate seeding image — that is DOCKERPROD-1, deliberately not this slice.
 
-FROM node:20-bookworm-slim AS base
+FROM node:22-bookworm-slim AS base
 WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
+
+# Node TRUST-STORE FLOOR. Node verifies TLS against its OWN compiled-in root store, not Debian's, so
+# the only way to drop a compromised CA is to run a Node that has dropped it. 22.23.4 is the first 22.x
+# that rejects the eMudhra intermediates whose private keys were recovered from their public
+# certificates (disclosed 2026-10-20; anyone can mint a "valid" cert for any host under them). Node 20
+# is EOL and will never get that fix. The floating tag above is what keeps future fixes arriving; this
+# line is what stops a cached base layer from quietly shipping an older 22.x.
+RUN node -e 'const [a,b,c]=process.versions.node.split(".").map(Number); if (a!==22 || b<23 || (b===23 && c<4)) { console.error("node " + process.versions.node + " predates the eMudhra trust-store fix (need >=22.23.4)"); process.exit(1); }'
 
 # ── deps: cached on the lockfile alone, so source edits don't reinstall ──────
 FROM base AS deps

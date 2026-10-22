@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "22"
       - run: node scripts/check-docs-drift.mjs
 
   static-checks:
@@ -32,7 +32,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
       - run: npm ci
       - run: npm run lint
@@ -61,7 +61,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
       # python3 is a HARD dependency of the unit tier, not an incidental one:
       # test/guards/graphiti-patch-same-item.test.ts runs the committed patch script and EXECUTES the
@@ -133,7 +133,7 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
       # The ubuntu-latest runner carried the Postgres client tools for free; this job container does
       # not. `node:20-bookworm` is the FULL image, so git and bash come with it (buildpack-deps base),
@@ -218,7 +218,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
       - run: npm ci
       - run: DATABASE_URL="$DATABASE_TEST_URL" npm run pg:schema
@@ -285,7 +285,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
       - run: npm ci
       - run: npm run test:neo4j
