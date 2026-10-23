@@ -44,7 +44,9 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
  * Scalar bookkeeping (generations, lease fields, bounds, planted metadata) is literal, non-secret
  * fixture data.
  *
- * WHAT THIS PACKET PROVES, and which assertions are RED by intent at base ff2cfcb6:
+ * WHAT THIS FILE PROVES. Status is stated against production at 83162b68, where the constraint-kind
+ * guard and the corrected schema comment have landed, so EVERY test below is expected GREEN. The
+ * refusal-surface matrix (packet 4) is proof-only unless its run says otherwise:
  *  - MR-02 catalog identity: the loader-path catalog (schema.sql plus every effective migration, as
  *    `scripts/pg-load-schema.mjs` loads them) and the direct-migration catalog both carry:
  *    · exactly the eight columns;
@@ -55,12 +57,44 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
  *    Expected GREEN today.
  *  - MR-04 helper conflict: a validator with the accepted identity but a DEFAULTED argument is
  *    refused with static P0001 / AM_F2_UPGRADE_INVALID_STATE, all-or-nothing. Expected GREEN today.
- *  - MR-04 wrong-kind constraint conflict: an accepted CHECK name already used by a NON-CHECK
- *    constraint must be refused, AM_F2 for a history name and AC02 for a progress name, before any
- *    drop. **RED by intent**: the current block guards each drop by name only, so it silently drops
- *    the foreign UNIQUE constraint and commits. That deletes an object the upgrade does not own, and
- *    §9 requires incompatible catalog objects to be conflicts. The named failing assertion is
- *    "wrong-kind … is refused with the static … error".
+ *  - MR-04 REFUSAL-SURFACE MATRIX (packet 4). Each case starts from a reset table and plants a
+ *    baseline:
+ *    · one channel row with a CANARY cursor and distinctive non-default safe metadata;
+ *    · one unrelated queued `slack_sync_threads` row, with non-vacuity asserted.
+ *    It then builds exactly one conflict and asserts that conflict as a literal FIXTURE FACT, so a
+ *    setup that silently built nothing cannot pass. It then requires:
+ *    · a static P0001 refusal by name family, with no NOTICE, no value-bearing field and no canary;
+ *    · from the second session, the table's complete column and constraint catalog, every routine
+ *      named like the validator, the owned functions, the channel rows and the thread rows all
+ *      exactly as before the run.
+ *    Families:
+ *    · wrong kind: each of the FOUR reserved CHECK names held by a UNIQUE and by a FOREIGN KEY
+ *      constraint (8). A cursor-history name maps to AM_F2, a progress name to AC02.
+ *    · partial segment units: one-of-three and two-of-three present, for each lane (4, AC02).
+ *    · present-column metadata, on an F2 schema state: a domain, a wrong default, wrong
+ *      nullability and GENERATED, each for a history column (AM_F2) and a progress column
+ *      (AC02) (8).
+ *    · validator identity: security definer; no search_path; another search_path; stable
+ *      volatility; not strict; parallel restricted; plpgsql; integer return; set-returning;
+ *      argument name; text argument type; leakproof; support function; procedure kind (14,
+ *      AM_F2). Each also asserts the exact list of metadata keys in which its fixture differs
+ *      from the accepted validator.
+ *    ENTRYPOINTS. The whole matrix (34) runs through the migration file. The byte-identical marked
+ *    statement extracted from `schema.sql` runs a representative cross-entrypoint set (7): one
+ *    wrong-kind FK (AM_F2), one partial unit (AC02), two metadata conflicts (AC02, AM_F2), one
+ *    validator conflict (AM_F2), one state rejection (AC02) and one restart-hiding prevalidation
+ *    (AC02). Both paths use the same runner, the same expected static error and the same
+ *    rollback evidence. Running the WHOLE `schema.sql` file as a refusal entrypoint is not claimed.
+ *    POSTGRESQL 16 REPRESENTABILITY:
+ *    · an IDENTITY column must be smallint/integer/bigint, so it cannot be built on an owned jsonb
+ *      or text column; GENERATED is covered instead;
+ *    · an explicit DEFAULT NULL stores no pg_attrdef row, so it is not a distinct conflict;
+ *    · a PROCEDURE cannot carry a return type, volatility, strictness or parallel marking, so
+ *      object kind cannot vary alone; its fixture asserts its exact diff (kind, parallel, returns,
+ *      strict, volatility);
+ *    · LEAKPROOF and SUPPORT need a superuser, which the isolated runner's `app` role is (the
+ *      `postgres:16` container's POSTGRES_USER).
+ *    Expected GREEN; any failure is a newly found production gap.
  *  - MR-04 / §4 state rejection matrix: refused with static errors and full rollback:
  *    · an inactive historical lane carrying an attempt-oldest (AC02);
  *    · an active newest lane with no logical lower B (AC02);
@@ -106,11 +140,20 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
  *    `slack_sync_channels` must not claim, in any wording, that the two paths share a catalog
  *    ("same"/"identical"/"equal"/"agree" … "catalog"). Only the executable statement's byte
  *    identity is guaranteed, and from-zero columns sit in different attribute positions from
- *    upgraded ones. **RED by intent** until the comment is corrected (this packet does not edit
- *    it). The named failing assertion is "schema comment … claims catalog sameness".
+ *    upgraded ones. GREEN since the comment was corrected at 83162b68.
  *
- * TEST COUNT: 23 (4 static, 19 database). Intended REDs at ff2cfcb6: exactly 3 (both wrong-kind
- * cases and the schema comment). Everything else is expected GREEN.
+ * TEST COUNT: 62 = 4 static + 58 database. The database tests are:
+ *  - 17 earlier: loader catalog, direct catalog, defaulted helper, 3 state rejections, 5 persisted
+ *    histories, 2 restart-hiding, validator truth table, CHECK matrix, union restart, one-lane
+ *    replay;
+ *  - 34 in the migration refusal matrix;
+ *  - 7 in the schema-mirror refusal set.
+ * The two earlier UNIQUE-only wrong-kind cases are absorbed into the matrix. Intended REDs at
+ * 83162b68: none.
+ *
+ * SEPARATE PRODUCTION-COMMENT CLEANUP (not done here; tests never edit production): the migration
+ * header's ordered-step comment does not yet list the constraint-kind guard. That belongs to a
+ * later production packet.
  *
  * WHAT REMAINS, NOT claimed here:
  *  - MR-02: schema-only vs schema-plus-all-migrations fingerprints; empty-search-path dump/restore
@@ -120,11 +163,10 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
  *    · a COMMITTING segment-only introduction on an F2-only SCHEMA state (only its refusal is here);
  *    · staged/published/ledger evidence rows.
  *  - MR-04 refusals not yet exercised:
- *    · a PARTIAL segment-column set (one or two of a lane's three present);
- *    · present-column metadata conflicts: a domain over jsonb/text, a wrong default, wrong
- *      nullability, generated/identity;
  *    · revalidation of a stored invalid progress tuple on a PURE replay (every column present);
- *    · every refusal through the SCHEMA-MIRROR path (`schema.sql` as loaded), not only the migration;
+ *    · the WHOLE `schema.sql` file as a refusal entrypoint, and exhaustive (not representative)
+ *      mirror-statement coverage;
+ *    · identity metadata (not representable on PostgreSQL 16; see above);
  *    · the HISTORICAL-lane null-anchor/non-null-cursor legacy case;
  *    · a same-name CHECK with a DIFFERENT definition: replaced without a value-bearing failing-row
  *      DETAIL, with no rollback hazard;
@@ -334,7 +376,19 @@ const PLANTED: Record<string, Record<string, unknown>> = {
     binding_integration_id: INTEGRATION_ID, binding_config_revision: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     due_at: "2026-01-08 00:00:00+00", created_at: "2025-12-27 00:00:00+00",
   },
+  // The refusal matrix's baseline row.
+  C0MATRIX0001: {
+    attempts: 3, last_error_code: "provider_error", last_read_at: "2026-01-01 08:00:00+00",
+    completed_lower_ts: "1718895000.000000", completed_upper_ts: "1718895100.000000", historical_floor_reached: true,
+    newest_catchup_upper_ts: "1718900800.000000", metadata_attempt_owner: "metadata-owner-mx", metadata_attempt_generation: 2,
+    public_state: "private", public_checked_at: "2026-01-01 04:00:00+00",
+    binding_integration_id: INTEGRATION_ID, binding_config_revision: "9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f",
+    due_at: "2026-01-09 00:00:00+00", created_at: "2025-12-26 00:00:00+00",
+  },
 };
+/** The refusal matrix's baseline channel and its unrelated queued thread. */
+const BASE_CHANNEL = "C0MATRIX0001";
+const BASE_THREAD_ROOT = "1718900200.000200";
 
 /** A fixture statement's failure, redacted to SQLSTATE and constraint name: never a failing-row DETAIL. */
 class FixtureError extends Error {
@@ -426,6 +480,8 @@ function markedStatement(text: string): string {
   return start >= 0 && stop > start ? text.slice(start + begin.length, stop) : "";
 }
 const withoutLineComments = (sql: string): string => sql.replace(/--[^\n]*/g, "");
+/** The schema mirror's executable entrypoint: its marked DO statement, exactly as extracted for parity. */
+const MIRROR_STATEMENT = markedStatement(schemaText);
 
 describe("AM-F2 + AC-02 history/segment block — static source fences (DH-11, MR-02 parity)", () => {
   it("DH-11 each file carries exactly one marker pair in order, the migration has nothing executable outside it, and both statements are byte-identical", () => {
@@ -491,7 +547,7 @@ describe("AM-F2 + AC-02 history/segment block — static source fences (DH-11, M
   });
 
   it("schema comment precision: the from-zero column comment does not claim catalog sameness", () => {
-    // RED by intent at ff2cfcb6. Only the executable statement's bytes are guaranteed identical;
+    // GREEN since the comment was corrected at 83162b68. Only the executable statement's bytes are guaranteed identical;
     // from-zero columns occupy different attribute positions than upgraded ones, so a claim that the
     // two paths share a catalog overstates what either path proves.
     const tableStart = schemaText.indexOf("create table if not exists slack_sync_channels (");
@@ -571,21 +627,26 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
     columns: EXPECTED_COLUMNS, constraintNames: POST_F2_CONSTRAINT_NAMES, namedChecks: EXPECTED_NAMED_CHECKS,
     functions: POST_F2_OWNED_FUNCTIONS, validator: EXPECTED_VALIDATOR,
   };
+  /** Every queued thread row, digested the same way (the rows carry no cursor in these fixtures). */
+  const threadsDigest = async (): Promise<string> => (await probe.query<{ digest: string }>(
+    `select coalesce(pg_catalog.md5(pg_catalog.string_agg(pg_catalog.to_jsonb(t)::text, '|' order by t.root_ts collate "C")), 'no rows') as digest
+       from public.slack_sync_threads t`
+  )).rows[0].digest;
   /** Every channel row, digested: equality proves byte-identical rows without printing one. */
   const rowsDigest = async (): Promise<string> => (await probe.query<{ digest: string }>(
     `select coalesce(pg_catalog.md5(pg_catalog.string_agg(pg_catalog.to_jsonb(s)::text, '|' order by s.channel_id collate "C")), 'no rows') as digest
        from public.slack_sync_channels s`
   )).rows[0].digest;
 
-  /** One execution of the real migration file; notices captured only for its duration. */
-  const applyMigration = async (): Promise<{ error: unknown; notices: string[] }> => {
+  /** One execution of an entrypoint's SQL; notices captured only for its duration. */
+  const applyStatement = async (sql: string): Promise<{ error: unknown; notices: string[] }> => {
     const notices: string[] = [];
     const onNotice = (notice: { message?: string }): void => {
       notices.push(notice.message ?? "");
     };
     c.on("notice", onNotice);
     try {
-      await c.query(migration);
+      await c.query(sql);
       return { error: null, notices };
     } catch (error) {
       return { error, notices };
@@ -593,6 +654,12 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
       c.removeListener("notice", onNotice);
     }
   };
+  /** One execution of the real migration file. */
+  const applyMigration = (): Promise<{ error: unknown; notices: string[] }> => applyStatement(migration);
+  /** The refusal matrix's two executable entrypoints. */
+  type Entry = "migration" | "schema mirror";
+  const applyEntry = (entry: Entry): Promise<{ error: unknown; notices: string[] }> =>
+    applyStatement(entry === "migration" ? migration : MIRROR_STATEMENT);
 
   /** A fixture DML statement whose failure is redacted (FixtureError), so a seeded canary never prints. */
   const runFixture = async (sql: string, params: unknown[] = []): Promise<void> => {
@@ -641,16 +708,20 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
   /** FIXTURE DDL on this scratch database only: back to the exact pre-F2 table, with no rows. */
   const resetToPreF2 = async (): Promise<void> => {
     await c.query("delete from public.slack_sync_channels");
+    await c.query("delete from public.slack_sync_threads");
     for (const name of NAMED_CHECKS) {
       await c.query(`alter table public.slack_sync_channels drop constraint if exists ${name}`);
     }
     await c.query(`alter table public.slack_sync_channels ${NEW_COLUMNS.map((column) => `drop column if exists ${column}`).join(", ")}`);
-    await c.query("drop function if exists public.slack_channel_cursor_history_valid(jsonb)");
+    // Any routine a conflict fixture left under the validator's name (function or procedure, either signature).
+    await c.query("drop routine if exists public.slack_channel_cursor_history_valid(jsonb)");
+    await c.query("drop routine if exists public.slack_channel_cursor_history_valid(text)");
+    await c.query("drop domain if exists public.slack_conflict_jsonb, public.slack_conflict_text");
     expect({
       columns: await newColumns(), namedChecks: await namedConstraints(), validator: await validator(),
-      rows: await rowsDigest(),
-    }, "fixture: the table is back to pre-F2 — no new column, named CHECK or validator, and no rows").toEqual({
-      columns: [], namedChecks: [], validator: [], rows: "no rows",
+      rows: await rowsDigest(), threads: await threadsDigest(),
+    }, "fixture: the table is back to pre-F2 — no new column, named CHECK or validator, and no channel or thread rows").toEqual({
+      columns: [], namedChecks: [], validator: [], rows: "no rows", threads: "no rows",
     });
   };
   /** The rollback evidence for a refused pre-F2 introduction. */
@@ -733,23 +804,285 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
     });
   }, SCRATCH_TIMEOUT);
 
-  it.each([
-    { label: "a history CHECK name", name: "slack_sync_channels_newest_cursor_history_check", message: AM_F2 },
-    { label: "a progress CHECK name", name: "slack_sync_channels_historical_progress_check", message: AC02 },
-  ])("MR-04 wrong-kind: $label held by a UNIQUE constraint is refused before any drop (RED until the kind guard lands)", async ({ name, message }) => {
-    await resetToPreF2();
-    await insertChannel({ channel_id: "C0WRONGKIND1", historical_anchor_ts: "1718900500.000000", historical_cursor: "CANARY-wrongkind-1", updated_at: SEEDED_UPDATED_AT });
-    await c.query(`alter table public.slack_sync_channels add constraint ${name} unique (id)`);
-    const before = await rowsDigest();
-    const { error, notices } = await applyMigration();
-    expect(notices, "no skip NOTICE or WARNING").toEqual([]);
-    // THE INTENDED RED: today the name-only guard drops the foreign UNIQUE constraint and commits.
-    expect(refusalOf(error), `wrong-kind ${name} is refused with the static ${message} error and no value-bearing or constraint field`).toEqual(refusedWith(message));
-    expect(carriesCanary(error), "no error field carries the planted cursor canary").toBe(false);
-    expect({ shape: await preF2Shape(), held: (await namedConstraints()).map((row) => ({ name: row.name, kind: row.kind })) },
-      "rollback: still pre-F2, rows unchanged, and the foreign UNIQUE constraint still holds its name").toEqual({
-      shape: { columns: [], validator: 0, rows: before }, held: [{ name, kind: "u" }],
+  // ── MR-04 REFUSAL-SURFACE MATRIX (packet 4) ──
+
+  /**
+   * One refusal case. `setup` runs after the reset and the planted baseline and builds exactly one
+   * conflict. Its literal `fact` proves the conflict really exists, so a no-op setup fails here
+   * rather than passing as a refusal.
+   */
+  interface Refusal {
+    id: string;
+    message: string;
+    state: "pre-F2" | "F2";
+    setup: () => Promise<unknown>;
+    fact: unknown;
+  }
+
+  /** Everything a refused run must leave exactly as it found it, read from the SECOND session. */
+  const refusalEvidence = async () => ({
+    columns: (await probe.query(
+      `select a.attname as name, pg_catalog.format_type(a.atttypid, a.atttypmod) as type, a.attnotnull as not_null,
+              pg_catalog.pg_get_expr(d.adbin, d.adrelid) as default_expr,
+              a.attgenerated::text as generated, a.attidentity::text as identity
+         from pg_catalog.pg_attribute a
+         left join pg_catalog.pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum
+        where a.attrelid = 'public.slack_sync_channels'::regclass and a.attnum > 0 and not a.attisdropped
+        order by a.attname collate "C"`
+    )).rows,
+    constraints: (await probe.query(
+      `select conname as name, contype::text as kind, pg_catalog.pg_get_constraintdef(oid) as definition, convalidated as validated
+         from pg_catalog.pg_constraint where conrelid = 'public.slack_sync_channels'::regclass
+        order by conname collate "C"`
+    )).rows,
+    routines: await validator(),
+    functions: await ownedFunctions(),
+    channels: await rowsDigest(),
+    threads: await threadsDigest(),
+  });
+
+  /**
+   * The baseline every refusal case plants: one channel row carrying a CANARY cursor and the
+   * C0MATRIX0001 planted metadata (pre-F2 shape, or a valid initialized-historical F2 shape), plus
+   * one unrelated queued thread row.
+   */
+  const plantBaseline = async (state: "pre-F2" | "F2"): Promise<void> => {
+    await insertChannel({
+      channel_id: BASE_CHANNEL, historical_anchor_ts: "1718900500.000000", historical_cursor: "CANARY-matrix-h",
+      historical_scan_generation: 2, updated_at: SEEDED_UPDATED_AT, ...PLANTED[BASE_CHANNEL],
+      ...(state === "F2" ? {
+        historical_segment_lower_ts: "0.000000", historical_segment_upper_ts: "1718900300.000000",
+        historical_cursor_history: JSON.stringify(["CANARY-matrix-h"]),
+      } : {}),
     });
+    await runFixture(
+      `insert into public.slack_sync_threads (team_id, workspace_id, channel_id, root_ts, due_at, attempts)
+       values ($1, $2, $3, $4, '2026-01-09 00:00:00+00', 2)`,
+      [TEAM_ID, WORKSPACE, BASE_CHANNEL, BASE_THREAD_ROOT]
+    );
+    expect({
+      planted: await plantedProjection([BASE_CHANNEL]),
+      threads: (await probe.query<{ n: number }>("select pg_catalog.count(*)::int as n from public.slack_sync_threads")).rows[0].n,
+    }, "fixture: the baseline channel carries its planted metadata and one unrelated queued thread exists").toEqual({
+      planted: expectedPlanted([BASE_CHANNEL]), threads: 1,
+    });
+  };
+
+  /** Build the case, then require a static refusal that leaves every piece of evidence untouched. */
+  const runRefusal = async (refusal: Refusal, entry: Entry): Promise<void> => {
+    await resetToPreF2();
+    if (refusal.state === "F2") {
+      expect(refusalOf((await applyMigration()).error), "setup: the introduction commits on an empty table").toEqual({ outcome: "the migration committed" });
+    }
+    await plantBaseline(refusal.state);
+    expect(await refusal.setup(), `fixture: ${refusal.id} is really in place`).toEqual(refusal.fact);
+    const before = await refusalEvidence();
+    const { error, notices } = await applyEntry(entry);
+    expect(notices, `${entry}: no NOTICE or WARNING on refusal`).toEqual([]);
+    expect(refusalOf(error), `${entry}: ${refusal.id} is refused with the static ${refusal.message} error and no value-bearing field`).toEqual(refusedWith(refusal.message));
+    expect(carriesCanary(error), `${entry}: no error field carries the planted cursor canary`).toBe(false);
+    expect(await refusalEvidence(),
+      `${entry}: rollback from a fresh session — every column and constraint, validator-name routine, owned function, channel row and thread row exactly as before`).toEqual(before);
+  };
+
+  /** The named reserved constraints present, as name and kind only. */
+  const namedKinds = async () => (await namedConstraints()).map((row) => ({ name: row.name, kind: row.kind }));
+  /** One owned column's single metadata field, or "absent". */
+  const columnFact = async (column: string, field: string): Promise<unknown> => {
+    const row = (await newColumns()).find((candidate) => candidate.name === column);
+    return { [column]: row ? row[field] : "absent" };
+  };
+  /** The metadata keys (never values) in which the routine under the validator's name differs from the accepted one. */
+  const validatorDiff = async (): Promise<unknown> => {
+    const rows = await validator();
+    if (rows.length !== 1) return { routinesUnderTheName: rows.length };
+    const accepted = EXPECTED_VALIDATOR[0] as Record<string, unknown>;
+    return Object.keys(accepted)
+      .filter((key) => key !== "source" && JSON.stringify(rows[0][key]) !== JSON.stringify(accepted[key]))
+      .sort();
+  };
+  const alter = (clause: string): string => `alter table public.slack_sync_channels ${clause}`;
+  const runDdl = async (statements: string[]): Promise<void> => {
+    for (const statement of statements) await c.query(statement);
+  };
+
+  const WRONG_KIND: Refusal[] = NAMED_CHECKS.flatMap((name) => [
+    { label: "UNIQUE", kind: "u", clause: "unique (id)" },
+    { label: "FOREIGN KEY", kind: "f", clause: "foreign key (team_id) references public.teams (id)" },
+  ].map(({ label, kind, clause }) => ({
+    id: `wrong-kind ${label} holding ${name}`,
+    message: name.includes("cursor_history") ? AM_F2 : AC02,
+    state: "pre-F2" as const,
+    setup: async () => {
+      await c.query(alter(`add constraint ${name} ${clause}`));
+      return namedKinds();
+    },
+    fact: [{ name, kind }],
+  })));
+
+  const PARTIAL_UNITS: Refusal[] = [
+    { lane: "newest", present: ["newest_request_lower_ts"] },
+    { lane: "newest", present: ["newest_segment_lower_ts", "newest_segment_upper_ts"] },
+    { lane: "historical", present: ["historical_completed_segments_oldest_ts"] },
+    { lane: "historical", present: ["historical_segment_lower_ts", "historical_segment_upper_ts"] },
+  ].map(({ lane, present }) => ({
+    id: `partial ${lane} segment unit, ${present.length} of 3 present`,
+    message: AC02,
+    state: "pre-F2" as const,
+    setup: async () => {
+      await c.query(alter(present.map((column) => `add column ${column} pg_catalog.text`).join(", ")));
+      return (await newColumns()).map((row) => row.name);
+    },
+    fact: present,
+  }));
+
+  const METADATA: Refusal[] = [
+    {
+      conflict: "history column over a jsonb DOMAIN", message: AM_F2, column: "newest_cursor_history", field: "type", value: "slack_conflict_jsonb",
+      ddl: ["create domain public.slack_conflict_jsonb as pg_catalog.jsonb", alter("drop column newest_cursor_history"),
+        alter("add column newest_cursor_history public.slack_conflict_jsonb not null default '[]'::jsonb")],
+    },
+    {
+      conflict: "progress column over a text DOMAIN", message: AC02, column: "newest_request_lower_ts", field: "type", value: "slack_conflict_text",
+      ddl: ["create domain public.slack_conflict_text as pg_catalog.text", alter("drop column newest_request_lower_ts"),
+        alter("add column newest_request_lower_ts public.slack_conflict_text")],
+    },
+    {
+      conflict: "history column with a wrong default", message: AM_F2, column: "historical_cursor_history", field: "default_expr", value: "'{}'::jsonb",
+      ddl: [alter("alter column historical_cursor_history set default '{}'::jsonb")],
+    },
+    {
+      conflict: "progress column with a default", message: AC02, column: "newest_segment_upper_ts", field: "default_expr", value: "'1718900800.000000'::text",
+      ddl: [alter("alter column newest_segment_upper_ts set default '1718900800.000000'")],
+    },
+    {
+      conflict: "nullable history column", message: AM_F2, column: "newest_cursor_history", field: "not_null", value: false,
+      ddl: [alter("alter column newest_cursor_history drop not null")],
+    },
+    {
+      conflict: "NOT NULL progress column", message: AC02, column: "historical_segment_lower_ts", field: "not_null", value: true,
+      ddl: [alter("alter column historical_segment_lower_ts set not null")],
+    },
+    {
+      conflict: "GENERATED history column", message: AM_F2, column: "newest_cursor_history", field: "generated", value: "s",
+      ddl: [alter("drop column newest_cursor_history"),
+        alter("add column newest_cursor_history pg_catalog.jsonb not null generated always as ('[]'::jsonb) stored")],
+    },
+    {
+      conflict: "GENERATED progress column", message: AC02, column: "historical_completed_segments_oldest_ts", field: "generated", value: "s",
+      ddl: [alter("drop column historical_completed_segments_oldest_ts"),
+        alter("add column historical_completed_segments_oldest_ts pg_catalog.text generated always as (null::text) stored")],
+    },
+  ].map(({ conflict, message, column, field, value, ddl }) => ({
+    id: `metadata ${conflict}`,
+    message,
+    state: "F2" as const,
+    setup: async () => {
+      await runDdl(ddl);
+      return columnFact(column, field);
+    },
+    fact: { [column]: value },
+  }));
+
+  /** A validator fixture: the accepted identity, with exactly the named overrides. */
+  const validatorDdl = (o: {
+    args?: string; returns?: string; language?: string; volatility?: string; strict?: string; parallel?: string;
+    security?: string; extra?: string; config?: string; body?: string;
+  } = {}): string =>
+    `create function public.slack_channel_cursor_history_valid(${o.args ?? "history jsonb"}) returns ${o.returns ?? "boolean"}
+       language ${o.language ?? "sql"} ${o.volatility ?? "immutable"} ${o.strict ?? "strict"} parallel ${o.parallel ?? "safe"}
+       security ${o.security ?? "invoker"} ${o.extra ?? ""} ${o.config ?? "set search_path = pg_catalog"}
+       as $$ ${o.body ?? "select true"} $$`;
+  const VALIDATOR_CONFLICTS: Refusal[] = [
+    { dimension: "security definer", ddl: validatorDdl({ security: "definer" }), differs: ["security_definer"] },
+    { dimension: "no search_path", ddl: validatorDdl({ config: "" }), differs: ["config"] },
+    { dimension: "another search_path", ddl: validatorDdl({ config: "set search_path = public" }), differs: ["config"] },
+    { dimension: "stable volatility", ddl: validatorDdl({ volatility: "stable" }), differs: ["volatility"] },
+    { dimension: "not strict", ddl: validatorDdl({ strict: "called on null input" }), differs: ["strict"] },
+    { dimension: "parallel restricted", ddl: validatorDdl({ parallel: "restricted" }), differs: ["parallel"] },
+    { dimension: "plpgsql language", ddl: validatorDdl({ language: "plpgsql", body: "begin return true; end" }), differs: ["language"] },
+    { dimension: "integer return type", ddl: validatorDdl({ returns: "integer", body: "select 1" }), differs: ["returns"] },
+    { dimension: "set-returning", ddl: validatorDdl({ returns: "setof boolean" }), differs: ["returns_set"] },
+    { dimension: "argument name", ddl: validatorDdl({ args: "h jsonb" }), differs: ["arg_names", "args"] },
+    { dimension: "text argument type", ddl: validatorDdl({ args: "history text" }), differs: ["args"] },
+    { dimension: "leakproof", ddl: validatorDdl({ extra: "leakproof" }), differs: ["leakproof"] },
+    { dimension: "support function", ddl: validatorDdl({ extra: "support pg_catalog.textlike_support" }), differs: ["support"] },
+    {
+      // PostgreSQL 16: a procedure cannot carry a return type, volatility, strictness or parallel
+      // marking, so object kind cannot vary alone; the exact resulting diff is asserted instead.
+      dimension: "procedure kind",
+      ddl: "create procedure public.slack_channel_cursor_history_valid(history jsonb) language sql set search_path = pg_catalog as $$ select 1 $$",
+      differs: ["kind", "parallel", "returns", "strict", "volatility"],
+    },
+  ].map(({ dimension, ddl, differs }) => ({
+    id: `validator ${dimension}`,
+    message: AM_F2,
+    state: "pre-F2" as const,
+    setup: async () => {
+      await c.query(ddl);
+      return validatorDiff();
+    },
+    fact: differs,
+  }));
+
+  /** Cross-entrypoint-only state cases: their migration-path twins are the earlier dedicated tests. */
+  const STATE_REFUSALS: Refusal[] = [
+    {
+      id: "state inactive historical lane carrying an attempt-oldest",
+      message: AC02,
+      state: "pre-F2",
+      setup: async () => {
+        await insertChannel({ channel_id: "C0MATRIXOLD1", historical_oldest_seen_ts: "1718900100.000100", updated_at: SEEDED_UPDATED_AT });
+        return (await probe.query<{ n: number }>(
+          "select pg_catalog.count(*)::int as n from public.slack_sync_channels where historical_anchor_ts is null and historical_oldest_seen_ts is not null"
+        )).rows[0].n;
+      },
+      fact: 1,
+    },
+    {
+      id: "restart-hiding history-only introduction with an attempt-oldest above U",
+      message: AC02,
+      state: "F2",
+      setup: async () => {
+        await c.query(alter("drop column historical_cursor_history"));
+        await c.query(alter("drop constraint slack_sync_channels_historical_progress_check"));
+        await runFixture("update public.slack_sync_channels set historical_oldest_seen_ts = '1718900400.000000' where channel_id = $1", [BASE_CHANNEL]);
+        return {
+          historyColumn: await columnFact("historical_cursor_history", "type"),
+          outside: (await probe.query<{ outside: boolean }>(
+            `select historical_oldest_seen_ts::numeric > historical_segment_upper_ts::numeric as outside
+               from public.slack_sync_channels where channel_id = $1`, [BASE_CHANNEL]
+          )).rows[0].outside,
+        };
+      },
+      fact: { historyColumn: { historical_cursor_history: "absent" }, outside: true },
+    },
+  ];
+
+  const MIGRATION_MATRIX: Refusal[] = [...WRONG_KIND, ...PARTIAL_UNITS, ...METADATA, ...VALIDATOR_CONFLICTS];
+  const MIRROR_REPRESENTATIVE_IDS = [
+    "wrong-kind FOREIGN KEY holding slack_sync_channels_historical_cursor_history_check",
+    "partial newest segment unit, 2 of 3 present",
+    "metadata progress column over a text DOMAIN",
+    "metadata GENERATED history column",
+    "validator security definer",
+  ];
+  const MIRROR_SET: Refusal[] = [
+    ...MIRROR_REPRESENTATIVE_IDS.map((id) => {
+      const found = MIGRATION_MATRIX.find((refusal) => refusal.id === id);
+      if (!found) throw new Error(`refusal matrix: no case named ${id}`);
+      return found;
+    }),
+    ...STATE_REFUSALS,
+  ];
+
+  it.each(MIGRATION_MATRIX)("MR-04 migration refuses $id statically before any mutation and rolls back whole", async (refusal) => {
+    await runRefusal(refusal, "migration");
+  }, SCRATCH_TIMEOUT);
+
+  it.each(MIRROR_SET)("MR-04 schema-mirror statement refuses $id with the same static error and whole rollback", async (refusal) => {
+    expect(MIRROR_STATEMENT.startsWith("do $slack_channel_history_segments$\n"), "fixture: the schema mirror's marked DO statement was extracted").toBe(true);
+    await runRefusal(refusal, "schema mirror");
   }, SCRATCH_TIMEOUT);
 
   // ── MR-04 / §4 STATE REJECTION MATRIX, pre-F2 introduction ──
