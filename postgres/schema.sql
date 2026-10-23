@@ -3513,6 +3513,29 @@ begin
   ) then
     raise exception using errcode = 'P0001', message = 'AC02_PROGRESS_UPGRADE_INVALID_STATE';
   end if;
+  -- The same facts through information_schema: built-in types (never a domain) and exact defaults.
+  if exists (
+    select 1 from information_schema.columns c
+     where c.table_schema = 'public' and c.table_name = 'slack_sync_channels'
+       and c.column_name in ('newest_cursor_history', 'historical_cursor_history')
+       and not coalesce(c.data_type = 'jsonb' and c.udt_schema = 'pg_catalog' and c.udt_name = 'jsonb'
+                and c.domain_name is null and c.is_nullable = 'NO' and c.column_default = '''[]''::jsonb'
+                and c.is_generated = 'NEVER' and c.is_identity = 'NO', false)
+  ) then
+    raise exception using errcode = 'P0001', message = 'AM_F2_UPGRADE_INVALID_STATE';
+  end if;
+  if exists (
+    select 1 from information_schema.columns c
+     where c.table_schema = 'public' and c.table_name = 'slack_sync_channels'
+       and c.column_name in ('newest_request_lower_ts', 'newest_segment_lower_ts', 'newest_segment_upper_ts',
+                             'historical_segment_lower_ts', 'historical_segment_upper_ts',
+                             'historical_completed_segments_oldest_ts')
+       and not coalesce(c.data_type = 'text' and c.udt_schema = 'pg_catalog' and c.udt_name = 'text'
+                and c.domain_name is null and c.is_nullable = 'YES' and c.column_default is null
+                and c.is_generated = 'NEVER' and c.is_identity = 'NO', false)
+  ) then
+    raise exception using errcode = 'P0001', message = 'AC02_PROGRESS_UPGRADE_INVALID_STATE';
+  end if;
 
   select pg_catalog.count(*) = 1 into newest_history_present from pg_catalog.pg_attribute
    where attrelid = 'public.slack_sync_channels'::pg_catalog.regclass and attnum > 0 and not attisdropped
@@ -3611,6 +3634,75 @@ begin
     end if;
   end if;
 
+  -- Present progress tuples are validated now too, against the same predicates the named progress
+  -- CHECKs install below. They never read a history column, so they also hold where it is absent.
+  if newest_segment_columns = 3 then
+    if exists (
+      select 1 from public.slack_sync_channels
+       where not coalesce(case
+         when newest_anchor_ts is null then
+           newest_request_lower_ts is null and newest_segment_lower_ts is null and newest_segment_upper_ts is null
+         when newest_request_lower_ts is null and newest_segment_lower_ts is null and newest_segment_upper_ts is null then
+           newest_cursor is null
+         when newest_request_lower_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
+              and newest_segment_lower_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
+              and newest_segment_upper_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
+              and newest_anchor_ts ~ '^[0-9]+[.][0-9]{1,6}$'
+              and pg_catalog.char_length(pg_catalog.ltrim(pg_catalog.split_part(newest_anchor_ts, '.', 1), '0')) <= 12
+              and newest_lower_ts ~ '^[0-9]+[.][0-9]{1,6}$' then
+           newest_segment_upper_ts::pg_catalog.numeric <= 253402300799.999999
+           and newest_request_lower_ts::pg_catalog.numeric <= newest_segment_lower_ts::pg_catalog.numeric
+           and newest_segment_lower_ts::pg_catalog.numeric <= newest_segment_upper_ts::pg_catalog.numeric
+           and newest_segment_upper_ts::pg_catalog.numeric <= newest_anchor_ts::pg_catalog.numeric
+           and case
+                 when pg_catalog.char_length(pg_catalog.ltrim(pg_catalog.split_part(newest_lower_ts, '.', 1), '0')) > 12 then true
+                 else newest_request_lower_ts::pg_catalog.numeric <= newest_lower_ts::pg_catalog.numeric
+               end
+         else false
+       end, false)
+    ) then
+      raise exception using errcode = 'P0001', message = 'AC02_PROGRESS_UPGRADE_INVALID_STATE';
+    end if;
+  end if;
+  if historical_segment_columns = 3 then
+    if exists (
+      select 1 from public.slack_sync_channels
+       where not coalesce(case
+         when historical_anchor_ts is null then
+           historical_segment_lower_ts is null and historical_segment_upper_ts is null
+           and historical_completed_segments_oldest_ts is null
+         when historical_segment_lower_ts is null and historical_segment_upper_ts is null then
+           historical_completed_segments_oldest_ts is null and historical_oldest_seen_ts is null and historical_cursor is null
+         when historical_segment_lower_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
+              and historical_segment_upper_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
+              and historical_anchor_ts ~ '^[0-9]+[.][0-9]{1,6}$'
+              and pg_catalog.char_length(pg_catalog.ltrim(pg_catalog.split_part(historical_anchor_ts, '.', 1), '0')) <= 12
+              and (historical_oldest_seen_ts is null
+                   or (historical_oldest_seen_ts ~ '^[0-9]+[.][0-9]{1,6}$'
+                       and pg_catalog.char_length(pg_catalog.ltrim(pg_catalog.split_part(historical_oldest_seen_ts, '.', 1), '0')) <= 12))
+              and (historical_completed_segments_oldest_ts is null
+                   or (historical_completed_segments_oldest_ts ~ '^[0-9]+[.][0-9]{1,6}$'
+                       and pg_catalog.char_length(pg_catalog.ltrim(pg_catalog.split_part(historical_completed_segments_oldest_ts, '.', 1), '0')) <= 12)) then
+           historical_segment_upper_ts::pg_catalog.numeric <= 253402300799.999999
+           and historical_segment_lower_ts::pg_catalog.numeric <= historical_segment_upper_ts::pg_catalog.numeric
+           and historical_segment_upper_ts::pg_catalog.numeric <= historical_anchor_ts::pg_catalog.numeric
+           and case
+                 when historical_oldest_seen_ts is null then true
+                 else historical_segment_lower_ts::pg_catalog.numeric <= historical_oldest_seen_ts::pg_catalog.numeric
+                      and historical_oldest_seen_ts::pg_catalog.numeric <= historical_segment_upper_ts::pg_catalog.numeric
+               end
+           and case
+                 when historical_completed_segments_oldest_ts is null then true
+                 else historical_segment_upper_ts::pg_catalog.numeric < historical_completed_segments_oldest_ts::pg_catalog.numeric
+                      and historical_completed_segments_oldest_ts::pg_catalog.numeric <= historical_anchor_ts::pg_catalog.numeric
+               end
+         else false
+       end, false)
+    ) then
+      raise exception using errcode = 'P0001', message = 'AC02_PROGRESS_UPGRADE_INVALID_STATE';
+    end if;
+  end if;
+
   -- ── Introduction: each absent unit is added once; a lane is affected if either of its units was absent. ──
   newest_affected := not newest_history_present or newest_segment_columns = 0;
   historical_affected := not historical_history_present or historical_segment_columns = 0;
@@ -3637,33 +3729,47 @@ begin
   -- Clears that lane's cursor, history and attempt-oldest and increments its generation; preserves the
   -- anchor, logical lower, segment bounds and aggregate as they are (newly introduced ones are null).
   -- A claim on the restarted lane is invalidated: lease cleared, lease generation incremented, and the
-  -- turn handed to that lane. Any other claim and turn are preserved. Only restarted rows move updated_at.
-  if newest_affected then
+  -- turn handed to that lane. Any other claim and turn are preserved. Only restarted rows move updated_at,
+  -- and ONE union update writes each row once even when both of its lanes restart.
+  if newest_affected or historical_affected then
     update public.slack_sync_channels set
-      newest_cursor = null,
-      newest_cursor_history = '[]'::pg_catalog.jsonb,
-      newest_scan_generation = newest_scan_generation + 1,
-      lease_owner = case when claimed_lane = 'newest' then null else lease_owner end,
-      lease_expires_at = case when claimed_lane = 'newest' then null else lease_expires_at end,
-      lease_generation = case when claimed_lane = 'newest' then lease_generation + 1 else lease_generation end,
-      next_lane = case when claimed_lane = 'newest' then 'newest' else next_lane end,
-      claimed_lane = case when claimed_lane = 'newest' then null else claimed_lane end,
+      newest_cursor = case when newest_affected and newest_anchor_ts is not null
+        then null else newest_cursor end,
+      newest_cursor_history = case when newest_affected and newest_anchor_ts is not null
+        then '[]'::pg_catalog.jsonb else newest_cursor_history end,
+      newest_scan_generation = case when newest_affected and newest_anchor_ts is not null
+        then newest_scan_generation + 1 else newest_scan_generation end,
+      historical_cursor = case when historical_affected and historical_anchor_ts is not null
+        then null else historical_cursor end,
+      historical_cursor_history = case when historical_affected and historical_anchor_ts is not null
+        then '[]'::pg_catalog.jsonb else historical_cursor_history end,
+      historical_oldest_seen_ts = case when historical_affected and historical_anchor_ts is not null
+        then null else historical_oldest_seen_ts end,
+      historical_scan_generation = case when historical_affected and historical_anchor_ts is not null
+        then historical_scan_generation + 1 else historical_scan_generation end,
+      lease_owner = case
+        when (claimed_lane = 'newest' and newest_affected and newest_anchor_ts is not null)
+          or (claimed_lane = 'historical' and historical_affected and historical_anchor_ts is not null)
+        then null else lease_owner end,
+      lease_expires_at = case
+        when (claimed_lane = 'newest' and newest_affected and newest_anchor_ts is not null)
+          or (claimed_lane = 'historical' and historical_affected and historical_anchor_ts is not null)
+        then null else lease_expires_at end,
+      lease_generation = case
+        when (claimed_lane = 'newest' and newest_affected and newest_anchor_ts is not null)
+          or (claimed_lane = 'historical' and historical_affected and historical_anchor_ts is not null)
+        then lease_generation + 1 else lease_generation end,
+      next_lane = case
+        when (claimed_lane = 'newest' and newest_affected and newest_anchor_ts is not null)
+          or (claimed_lane = 'historical' and historical_affected and historical_anchor_ts is not null)
+        then claimed_lane else next_lane end,
+      claimed_lane = case
+        when (claimed_lane = 'newest' and newest_affected and newest_anchor_ts is not null)
+          or (claimed_lane = 'historical' and historical_affected and historical_anchor_ts is not null)
+        then null else claimed_lane end,
       updated_at = pg_catalog.clock_timestamp()
-     where newest_anchor_ts is not null;
-  end if;
-  if historical_affected then
-    update public.slack_sync_channels set
-      historical_cursor = null,
-      historical_cursor_history = '[]'::pg_catalog.jsonb,
-      historical_oldest_seen_ts = null,
-      historical_scan_generation = historical_scan_generation + 1,
-      lease_owner = case when claimed_lane = 'historical' then null else lease_owner end,
-      lease_expires_at = case when claimed_lane = 'historical' then null else lease_expires_at end,
-      lease_generation = case when claimed_lane = 'historical' then lease_generation + 1 else lease_generation end,
-      next_lane = case when claimed_lane = 'historical' then 'historical' else next_lane end,
-      claimed_lane = case when claimed_lane = 'historical' then null else claimed_lane end,
-      updated_at = pg_catalog.clock_timestamp()
-     where historical_anchor_ts is not null;
+     where (newest_affected and newest_anchor_ts is not null)
+        or (historical_affected and historical_anchor_ts is not null);
   end if;
 
   -- ── Explicit validation of every row BEFORE the named CHECKs are installed. ──
@@ -3683,6 +3789,64 @@ begin
            else false end, false)
   ) then
     raise exception using errcode = 'P0001', message = 'AM_F2_UPGRADE_INVALID_STATE';
+  end if;
+
+  if exists (
+    select 1 from public.slack_sync_channels
+     where not coalesce(case
+       when newest_anchor_ts is null then
+         newest_request_lower_ts is null and newest_segment_lower_ts is null and newest_segment_upper_ts is null
+       when newest_request_lower_ts is null and newest_segment_lower_ts is null and newest_segment_upper_ts is null then
+         newest_cursor is null
+       when newest_request_lower_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
+            and newest_segment_lower_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
+            and newest_segment_upper_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
+            and newest_anchor_ts ~ '^[0-9]+[.][0-9]{1,6}$'
+            and pg_catalog.char_length(pg_catalog.ltrim(pg_catalog.split_part(newest_anchor_ts, '.', 1), '0')) <= 12
+            and newest_lower_ts ~ '^[0-9]+[.][0-9]{1,6}$' then
+         newest_segment_upper_ts::pg_catalog.numeric <= 253402300799.999999
+         and newest_request_lower_ts::pg_catalog.numeric <= newest_segment_lower_ts::pg_catalog.numeric
+         and newest_segment_lower_ts::pg_catalog.numeric <= newest_segment_upper_ts::pg_catalog.numeric
+         and newest_segment_upper_ts::pg_catalog.numeric <= newest_anchor_ts::pg_catalog.numeric
+         and case
+               when pg_catalog.char_length(pg_catalog.ltrim(pg_catalog.split_part(newest_lower_ts, '.', 1), '0')) > 12 then true
+               else newest_request_lower_ts::pg_catalog.numeric <= newest_lower_ts::pg_catalog.numeric
+             end
+       else false
+     end, false)
+        or not coalesce(case
+       when historical_anchor_ts is null then
+         historical_segment_lower_ts is null and historical_segment_upper_ts is null
+         and historical_completed_segments_oldest_ts is null
+       when historical_segment_lower_ts is null and historical_segment_upper_ts is null then
+         historical_completed_segments_oldest_ts is null and historical_oldest_seen_ts is null and historical_cursor is null
+       when historical_segment_lower_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
+            and historical_segment_upper_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
+            and historical_anchor_ts ~ '^[0-9]+[.][0-9]{1,6}$'
+            and pg_catalog.char_length(pg_catalog.ltrim(pg_catalog.split_part(historical_anchor_ts, '.', 1), '0')) <= 12
+            and (historical_oldest_seen_ts is null
+                 or (historical_oldest_seen_ts ~ '^[0-9]+[.][0-9]{1,6}$'
+                     and pg_catalog.char_length(pg_catalog.ltrim(pg_catalog.split_part(historical_oldest_seen_ts, '.', 1), '0')) <= 12))
+            and (historical_completed_segments_oldest_ts is null
+                 or (historical_completed_segments_oldest_ts ~ '^[0-9]+[.][0-9]{1,6}$'
+                     and pg_catalog.char_length(pg_catalog.ltrim(pg_catalog.split_part(historical_completed_segments_oldest_ts, '.', 1), '0')) <= 12)) then
+         historical_segment_upper_ts::pg_catalog.numeric <= 253402300799.999999
+         and historical_segment_lower_ts::pg_catalog.numeric <= historical_segment_upper_ts::pg_catalog.numeric
+         and historical_segment_upper_ts::pg_catalog.numeric <= historical_anchor_ts::pg_catalog.numeric
+         and case
+               when historical_oldest_seen_ts is null then true
+               else historical_segment_lower_ts::pg_catalog.numeric <= historical_oldest_seen_ts::pg_catalog.numeric
+                    and historical_oldest_seen_ts::pg_catalog.numeric <= historical_segment_upper_ts::pg_catalog.numeric
+             end
+         and case
+               when historical_completed_segments_oldest_ts is null then true
+               else historical_segment_upper_ts::pg_catalog.numeric < historical_completed_segments_oldest_ts::pg_catalog.numeric
+                    and historical_completed_segments_oldest_ts::pg_catalog.numeric <= historical_anchor_ts::pg_catalog.numeric
+             end
+       else false
+     end, false)
+  ) then
+    raise exception using errcode = 'P0001', message = 'AC02_PROGRESS_UPGRADE_INVALID_STATE';
   end if;
 
   -- ── Named history CHECKs: dropped only when present (no skip NOTICE), then re-added identically. ──
@@ -3711,6 +3875,75 @@ begin
                 and pg_catalog.jsonb_array_length(historical_cursor_history) > 0
                 and (historical_cursor_history -> -1) = pg_catalog.to_jsonb(historical_cursor) end
     else false end
+  );
+
+  -- ── Named progress CHECKs (§4): inactive, all-null initialization and initialized branches, every
+  -- bound shape-guarded before an exact numeric cast, and every other shape false — never SQL NULL. ──
+  if exists (select 1 from pg_catalog.pg_constraint
+              where conrelid = 'public.slack_sync_channels'::pg_catalog.regclass
+                and conname = 'slack_sync_channels_newest_progress_check') then
+    alter table public.slack_sync_channels drop constraint slack_sync_channels_newest_progress_check;
+  end if;
+  if exists (select 1 from pg_catalog.pg_constraint
+              where conrelid = 'public.slack_sync_channels'::pg_catalog.regclass
+                and conname = 'slack_sync_channels_historical_progress_check') then
+    alter table public.slack_sync_channels drop constraint slack_sync_channels_historical_progress_check;
+  end if;
+  alter table public.slack_sync_channels add constraint slack_sync_channels_newest_progress_check check (
+    case
+      when newest_anchor_ts is null then
+        newest_request_lower_ts is null and newest_segment_lower_ts is null and newest_segment_upper_ts is null
+      when newest_request_lower_ts is null and newest_segment_lower_ts is null and newest_segment_upper_ts is null then
+        newest_cursor is null
+      when newest_request_lower_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
+           and newest_segment_lower_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
+           and newest_segment_upper_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
+           and newest_anchor_ts ~ '^[0-9]+[.][0-9]{1,6}$'
+           and pg_catalog.char_length(pg_catalog.ltrim(pg_catalog.split_part(newest_anchor_ts, '.', 1), '0')) <= 12
+           and newest_lower_ts ~ '^[0-9]+[.][0-9]{1,6}$' then
+        newest_segment_upper_ts::pg_catalog.numeric <= 253402300799.999999
+        and newest_request_lower_ts::pg_catalog.numeric <= newest_segment_lower_ts::pg_catalog.numeric
+        and newest_segment_lower_ts::pg_catalog.numeric <= newest_segment_upper_ts::pg_catalog.numeric
+        and newest_segment_upper_ts::pg_catalog.numeric <= newest_anchor_ts::pg_catalog.numeric
+        and case
+              when pg_catalog.char_length(pg_catalog.ltrim(pg_catalog.split_part(newest_lower_ts, '.', 1), '0')) > 12 then true
+              else newest_request_lower_ts::pg_catalog.numeric <= newest_lower_ts::pg_catalog.numeric
+            end
+      else false
+    end
+  );
+  alter table public.slack_sync_channels add constraint slack_sync_channels_historical_progress_check check (
+    case
+      when historical_anchor_ts is null then
+        historical_segment_lower_ts is null and historical_segment_upper_ts is null
+        and historical_completed_segments_oldest_ts is null
+      when historical_segment_lower_ts is null and historical_segment_upper_ts is null then
+        historical_completed_segments_oldest_ts is null and historical_oldest_seen_ts is null and historical_cursor is null
+      when historical_segment_lower_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
+           and historical_segment_upper_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
+           and historical_anchor_ts ~ '^[0-9]+[.][0-9]{1,6}$'
+           and pg_catalog.char_length(pg_catalog.ltrim(pg_catalog.split_part(historical_anchor_ts, '.', 1), '0')) <= 12
+           and (historical_oldest_seen_ts is null
+                or (historical_oldest_seen_ts ~ '^[0-9]+[.][0-9]{1,6}$'
+                    and pg_catalog.char_length(pg_catalog.ltrim(pg_catalog.split_part(historical_oldest_seen_ts, '.', 1), '0')) <= 12))
+           and (historical_completed_segments_oldest_ts is null
+                or (historical_completed_segments_oldest_ts ~ '^[0-9]+[.][0-9]{1,6}$'
+                    and pg_catalog.char_length(pg_catalog.ltrim(pg_catalog.split_part(historical_completed_segments_oldest_ts, '.', 1), '0')) <= 12)) then
+        historical_segment_upper_ts::pg_catalog.numeric <= 253402300799.999999
+        and historical_segment_lower_ts::pg_catalog.numeric <= historical_segment_upper_ts::pg_catalog.numeric
+        and historical_segment_upper_ts::pg_catalog.numeric <= historical_anchor_ts::pg_catalog.numeric
+        and case
+              when historical_oldest_seen_ts is null then true
+              else historical_segment_lower_ts::pg_catalog.numeric <= historical_oldest_seen_ts::pg_catalog.numeric
+                   and historical_oldest_seen_ts::pg_catalog.numeric <= historical_segment_upper_ts::pg_catalog.numeric
+            end
+        and case
+              when historical_completed_segments_oldest_ts is null then true
+              else historical_segment_upper_ts::pg_catalog.numeric < historical_completed_segments_oldest_ts::pg_catalog.numeric
+                   and historical_completed_segments_oldest_ts::pg_catalog.numeric <= historical_anchor_ts::pg_catalog.numeric
+            end
+      else false
+    end
   );
 end
 $slack_channel_history_segments$;
