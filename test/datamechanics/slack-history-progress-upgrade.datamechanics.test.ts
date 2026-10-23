@@ -165,13 +165,21 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *    A3 · staged-snapshot, published-item and ledger evidence rows from the actual current tables,
  *         preserved exactly across first execution and every replay (only queued thread rows
  *         here);
- *    A4 · a full loader (`loadSchema`) / whole-`schema.sql` replay over the POPULATED, progressed
- *         rows of the order databases (only the two marked statements replay here; the
- *         whole-file mirror entrypoint stays HELD until that replay is proved);
- *    B5 · MR-04 pure replay (every column present) refusing a stored invalid progress tuple,
- *         statically and with full rollback;
- *    B6 · MR-04 historical-lane null-anchor/non-null-cursor legacy refusal, and a same-name CHECK
- *         with a different definition replaced with no value-bearing failing-row DETAIL;
+ *    A4 · DONE (continuation 2). After the progressed replays, the real deploy loader
+ *         (`loadSchema`: schema.sql then every migration, on its own fresh session) is replayed
+ *         over the POPULATED, progressed rows:
+ *         · of all four statement-order databases;
+ *         · of every introduction-variant database.
+ *         Complete rows (updated_at included) and the Slack catalog must stay exact. The loader's
+ *         own notices are not asserted, since schema.sql's `if not exists` DDL may notice. A
+ *         whole-schema REFUSAL entrypoint is still not exercised;
+ *    B5 · DONE (continuation 2), in `slack-history-progress-conflicts`: a pure replay refusing a
+ *         stored invalid progress tuple, via both entrypoints;
+ *    B6 · DONE (continuation 2), in `slack-history-progress-conflicts`, via both entrypoints:
+ *         · the historical null-anchor/non-null-cursor refusal;
+ *         · a same-name weaker CHECK over a row the canonical rejects, refused statically before
+ *           any drop;
+ *         · a same-name CHECK with a different definition over valid rows, replaced canonically;
  *    B7 · MR-04 injected cancellation before the block completes, real two-connection
  *         serialization, and the later-query-failure retry (committed Slack state kept, no second
  *         restart; no global-rollback claim);
@@ -906,6 +914,11 @@ describe("AM-F2 + AC-02 history/segment block — MR-03 statement order: migrati
               expect(exactRows(await orderEvidence(c)), `${label}: after the ${entry} replay over progress and maximum histories, every row is exact, updated_at included`).toEqual(exactRows(progressed));
               expect(await slackCatalog(c), `${label}: after the ${entry} replay over progress, the Slack catalog is unchanged`).toEqual(progressedCatalog);
             }
+            // ── The FULL deploy loader (schema.sql, then every migration) replayed over the populated, progressed rows. ──
+            // The loader opens its OWN fresh session; this session is idle, so it holds no lock the loader needs.
+            await loadSchema({ cwd: process.cwd(), databaseUrl: scratch.url, logger: { log: () => {} } });
+            expect(exactRows(await orderEvidence(c)), `${label}: after a full-loader replay over progress and maximum histories, every row is exact, updated_at included`).toEqual(exactRows(progressed));
+            expect(await slackCatalog(c), `${label}: after a full-loader replay over progress, the Slack catalog is unchanged`).toEqual(progressedCatalog);
 
             runs[label] = {
               introducedLogical: logicalRows(introduced), introducedCatalog,
@@ -1365,7 +1378,8 @@ async function runIntroductionVariant(variant: IntroductionVariant): Promise<voi
       ["migration_then_mirror", "migration", "mirror"],
     ] as Array<[string, OrderEntry, OrderEntry]>) {
       const run = `${variant.label}/${label}`;
-      const c = new Client({ connectionString: await newLoadedScratch(label) });
+      const url = await newLoadedScratch(label);
+      const c = new Client({ connectionString: url });
       await c.connect();
       try {
         await c.query("set time zone 'UTC'");
@@ -1420,6 +1434,10 @@ async function runIntroductionVariant(variant: IntroductionVariant): Promise<voi
           expect(exactRows(await orderEvidence(c)), `${run}: after the ${entry} replay over progress and maximum histories, every row is exact, updated_at included`).toEqual(exactRows(progressed));
           expect(await slackCatalog(c), `${run}: after the ${entry} replay over progress, the Slack catalog is still the accepted one`).toEqual(referenceCatalog);
         }
+        // ── The FULL deploy loader replayed over the populated, progressed rows, on its own fresh session. ──
+        await loadSchema({ cwd: process.cwd(), databaseUrl: url, logger: { log: () => {} } });
+        expect(exactRows(await orderEvidence(c)), `${run}: after a full-loader replay over progress, every row is exact, updated_at included`).toEqual(exactRows(progressed));
+        expect(await slackCatalog(c), `${run}: after a full-loader replay over progress, the Slack catalog is still the accepted one`).toEqual(referenceCatalog);
         runs[label] = {
           logical: {
             channels: introduced.channels.map((row) => ({

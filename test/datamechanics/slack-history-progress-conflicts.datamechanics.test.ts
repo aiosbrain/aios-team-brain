@@ -145,12 +145,21 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *    identity is guaranteed, and from-zero columns sit in different attribute positions from
  *    upgraded ones. GREEN since the comment was corrected at 83162b68.
  *
- * TEST COUNT: 62 = 4 static + 58 database. The database tests are:
+ * TEST COUNT: 70 = 4 static + 66 database. The database tests are:
  *  - 17 earlier: loader catalog, direct catalog, defaulted helper, 3 state rejections, 5 persisted
  *    histories, 2 restart-hiding, validator truth table, CHECK matrix, union restart, one-lane
  *    replay;
  *  - 34 in the migration refusal matrix;
- *  - 7 in the schema-mirror refusal set.
+ *  - 7 in the schema-mirror refusal set;
+ *  - 8 replay-time cases (B5/B6), each run through BOTH the migration and the marked mirror
+ *    statement:
+ *    · a pure replay (all eight columns present) refusing a stored invalid progress tuple left
+ *      behind a removed CHECK (AC02);
+ *    · the historical-lane legacy null-anchor/non-null-cursor refusal (AM_F2);
+ *    · a same-name WEAKER CHECK over a row the canonical one rejects, refused statically BEFORE
+ *      any drop, so no value-bearing 23514 failing-row DETAIL can surface (AC02);
+ *    · a same-name CHECK with a different definition over VALID rows, replaced by the canonical
+ *      one, committing notice-free with no row change.
  * The two earlier UNIQUE-only wrong-kind cases are absorbed into the matrix. Intended REDs at
  * 83162b68: none.
  *
@@ -172,13 +181,9 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *    · a COMMITTING segment-only introduction on an F2-only SCHEMA state (only its refusal is here);
  *    · staged/published/ledger evidence rows.
  *  - MR-04 refusals not yet exercised:
- *    · revalidation of a stored invalid progress tuple on a PURE replay (every column present);
  *    · the WHOLE `schema.sql` file as a refusal entrypoint, and exhaustive (not representative)
  *      mirror-statement coverage;
  *    · identity metadata (not representable on PostgreSQL 16; see above);
- *    · the HISTORICAL-lane null-anchor/non-null-cursor legacy case;
- *    · a same-name CHECK with a DIFFERENT definition: replaced without a value-bearing failing-row
- *      DETAIL, with no rollback hazard;
  *    · injected cancellation, real concurrent sessions (serialization) and retry after a later
  *      migration query fails.
  *  - DH-11: the §9 named tests in the source-fences/upgrade files, including renaming the legacy
@@ -1067,6 +1072,82 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
     expect(MIRROR_STATEMENT.startsWith("do $slack_channel_history_segments$\n"), "fixture: the schema mirror's marked DO statement was extracted").toBe(true);
     await runRefusal(refusal, "schema mirror");
   }, SCRATCH_TIMEOUT);
+
+  // ── MR-04 REPLAY-TIME REFUSALS (B5/B6), through BOTH entrypoints ──
+
+  const outsideHistoricalSegment = async (): Promise<boolean> => (await probe.query<{ outside: boolean }>(
+    `select historical_oldest_seen_ts::numeric > historical_segment_upper_ts::numeric as outside
+       from public.slack_sync_channels where channel_id = $1`, [BASE_CHANNEL]
+  )).rows[0].outside;
+  const REPLAY_REFUSALS: Refusal[] = [
+    {
+      // B5: every column present, so nothing restarts; the stored tuple must still be revalidated.
+      id: "a pure replay over a stored invalid progress tuple left behind a removed CHECK",
+      message: AC02,
+      state: "F2",
+      setup: async () => {
+        await c.query(alter("drop constraint slack_sync_channels_historical_progress_check"));
+        await runFixture("update public.slack_sync_channels set historical_oldest_seen_ts = '1718900400.000000' where channel_id = $1", [BASE_CHANNEL]);
+        return { presentColumns: (await newColumns()).length, outside: await outsideHistoricalSegment() };
+      },
+      fact: { presentColumns: 8, outside: true },
+    },
+    {
+      // B6: the historical-lane twin of the legacy null-anchor/non-null-cursor refusal.
+      id: "a legacy historical null-anchor lane with a non-null cursor",
+      message: AM_F2,
+      state: "pre-F2",
+      setup: async () => {
+        await insertChannel({ channel_id: "C0MATRIXHNA1", historical_cursor: "CANARY-historical-null-anchor", updated_at: SEEDED_UPDATED_AT });
+        return (await probe.query<{ n: number }>(
+          "select pg_catalog.count(*)::int as n from public.slack_sync_channels where historical_anchor_ts is null and historical_cursor is not null"
+        )).rows[0].n;
+      },
+      fact: 1,
+    },
+    {
+      // B6: a same-name CHECK with a DIFFERENT, weaker definition, over a row the canonical one
+      // rejects. The block must refuse statically, BEFORE dropping it; it must never surface
+      // PostgreSQL's value-bearing 23514 failing-row DETAIL by re-adding the canonical CHECK over
+      // that row.
+      id: "a same-name weaker CHECK over a stored row the canonical CHECK rejects",
+      message: AC02,
+      state: "F2",
+      setup: async () => {
+        await c.query(alter("drop constraint slack_sync_channels_historical_progress_check"));
+        await c.query(alter("add constraint slack_sync_channels_historical_progress_check check (true)"));
+        await runFixture("update public.slack_sync_channels set historical_oldest_seen_ts = '1718900400.000000' where channel_id = $1", [BASE_CHANNEL]);
+        return {
+          weaker: (await namedConstraints()).filter((row) => row.name === "slack_sync_channels_historical_progress_check")
+            .map((row) => ({ kind: row.kind, definition: row.definition })),
+          outside: await outsideHistoricalSegment(),
+        };
+      },
+      fact: { weaker: [{ kind: "c", definition: "CHECK (true)" }], outside: true },
+    },
+  ];
+  it.each(REPLAY_REFUSALS.flatMap((refusal) => (["migration", "schema mirror"] as Entry[]).map((entry) => ({ ...refusal, entry }))))(
+    "MR-04 $entry refuses $id statically and rolls back whole", async (refusal) => {
+      await runRefusal(refusal, refusal.entry);
+    }, SCRATCH_TIMEOUT);
+
+  it.each(["migration", "schema mirror"] as Entry[])(
+    "MR-04 %s replaces a same-name CHECK with a different definition by the canonical one, committing with no NOTICE and no row change",
+    async (entry) => {
+      await resetToPreF2();
+      expect(refusalOf((await applyMigration()).error), "setup: the introduction commits on an empty table").toEqual({ outcome: "the migration committed" });
+      await plantBaseline("F2");
+      await c.query(alter("drop constraint slack_sync_channels_newest_progress_check"));
+      await c.query(alter("add constraint slack_sync_channels_newest_progress_check check (true)"));
+      expect((await namedConstraints()).filter((row) => row.name === "slack_sync_channels_newest_progress_check").map((row) => row.definition),
+        "fixture: the same-name CHECK carries a different definition").toEqual(["CHECK (true)"]);
+      const before = { channels: await rowsDigest(), threads: await threadsDigest() };
+      const { error, notices } = await applyEntry(entry);
+      expect(notices, `${entry}: no NOTICE or WARNING`).toEqual([]);
+      expect(refusalOf(error), `${entry}: the replacement commits`).toEqual({ outcome: "the migration committed" });
+      expect(await namedConstraints(), `${entry}: all four named CHECKs are exactly the accepted definitions, validated`).toEqual(EXPECTED_NAMED_CHECKS);
+      expect({ channels: await rowsDigest(), threads: await threadsDigest() }, `${entry}: every channel and thread row is unchanged`).toEqual(before);
+    }, SCRATCH_TIMEOUT);
 
   // ── MR-04 / §4 STATE REJECTION MATRIX, pre-F2 introduction ──
 
