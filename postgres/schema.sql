@@ -3396,7 +3396,8 @@ create table if not exists slack_sync_channels (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   -- AM-F2 / AC-02 deep history (slack-channel-history-segments-upgrade below owns their CHECKs).
-  -- From-zero tables get the same final catalog and behavior that the upgrade block gives existing ones.
+  -- That block's DO statement is mirrored byte-for-byte from the numbered migration. These declarations
+  -- only give a new table the columns; the block then validates them and installs their CHECKs.
   newest_cursor_history jsonb not null default '[]'::jsonb,
   historical_cursor_history jsonb not null default '[]'::jsonb,
   newest_request_lower_ts text,
@@ -3552,6 +3553,27 @@ begin
                      'historical_completed_segments_oldest_ts');
   -- A lane's segment columns are ONE introduction unit: all absent, or all present.
   if newest_segment_columns not in (0, 3) or historical_segment_columns not in (0, 3) then
+    raise exception using errcode = 'P0001', message = 'AC02_PROGRESS_UPGRADE_INVALID_STATE';
+  end if;
+
+  -- ── Named-constraint kind: an accepted CHECK name held by any other kind of constraint is a
+  -- conflict, refused here, before any mutation, rather than dropped later as if it were ours. ──
+  if exists (
+    select 1 from pg_catalog.pg_constraint
+     where conrelid = 'public.slack_sync_channels'::pg_catalog.regclass
+       and conname in ('slack_sync_channels_newest_cursor_history_check',
+                       'slack_sync_channels_historical_cursor_history_check')
+       and contype <> 'c'
+  ) then
+    raise exception using errcode = 'P0001', message = 'AM_F2_UPGRADE_INVALID_STATE';
+  end if;
+  if exists (
+    select 1 from pg_catalog.pg_constraint
+     where conrelid = 'public.slack_sync_channels'::pg_catalog.regclass
+       and conname in ('slack_sync_channels_newest_progress_check',
+                       'slack_sync_channels_historical_progress_check')
+       and contype <> 'c'
+  ) then
     raise exception using errcode = 'P0001', message = 'AC02_PROGRESS_UPGRADE_INVALID_STATE';
   end if;
 

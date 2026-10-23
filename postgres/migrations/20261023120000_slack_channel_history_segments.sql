@@ -98,6 +98,27 @@ begin
     raise exception using errcode = 'P0001', message = 'AC02_PROGRESS_UPGRADE_INVALID_STATE';
   end if;
 
+  -- ── Named-constraint kind: an accepted CHECK name held by any other kind of constraint is a
+  -- conflict, refused here, before any mutation, rather than dropped later as if it were ours. ──
+  if exists (
+    select 1 from pg_catalog.pg_constraint
+     where conrelid = 'public.slack_sync_channels'::pg_catalog.regclass
+       and conname in ('slack_sync_channels_newest_cursor_history_check',
+                       'slack_sync_channels_historical_cursor_history_check')
+       and contype <> 'c'
+  ) then
+    raise exception using errcode = 'P0001', message = 'AM_F2_UPGRADE_INVALID_STATE';
+  end if;
+  if exists (
+    select 1 from pg_catalog.pg_constraint
+     where conrelid = 'public.slack_sync_channels'::pg_catalog.regclass
+       and conname in ('slack_sync_channels_newest_progress_check',
+                       'slack_sync_channels_historical_progress_check')
+       and contype <> 'c'
+  ) then
+    raise exception using errcode = 'P0001', message = 'AC02_PROGRESS_UPGRADE_INVALID_STATE';
+  end if;
+
   -- ── Helper metadata: an existing validator must be exactly the accepted one before replacement. ──
   if exists (
     select 1 from pg_catalog.pg_proc p
