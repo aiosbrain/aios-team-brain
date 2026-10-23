@@ -20,7 +20,7 @@
  */
 
 /** The largest supported instant, `253402300799.999999`, in microsecond ticks. */
-export const SLACK_SEGMENT_MAX_TICKS = 253_402_300_799_999_999n;
+export const SLACK_SEGMENT_MAX_TICKS = BigInt("253402300799999999");
 
 /** One inclusive request interval `[lower, upper]`, in microsecond ticks. */
 export interface SlackSegment {
@@ -49,7 +49,7 @@ export function splitSlackSegment(segment: SlackSegment): SlackSegment | null {
  */
 export function nextSlackSegmentAfterTerminal(envelopeLower: bigint, completed: SlackSegment): SlackSegment | null {
   if (completed.lower <= envelopeLower) return null;
-  return { lower: envelopeLower, upper: completed.lower - 1n };
+  return { lower: envelopeLower, upper: completed.lower - BigInt(1) };
 }
 
 /**
