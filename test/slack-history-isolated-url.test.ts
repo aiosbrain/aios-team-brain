@@ -19,6 +19,8 @@ import {
  *  - CI: exactly `postgres:5432`, only when `GITHUB_ACTIONS` is exactly `"true"`;
  *  - both modes: `postgres:`/`postgresql:` scheme, database exactly `/app_test`, an explicit port,
  *    no query string and no fragment;
+ *  - printable-ASCII raw input only, and credentials whose percent-encoding decodes cleanly;
+ *  - an accepted URL is RETURNED in `URL`'s canonical form (`parsed.href`), never raw;
  *  - one static, URL-free refusal message, and no `DATABASE_URL` fallback;
  *  - the guard runs before any client exists.
  */
@@ -32,14 +34,18 @@ const SUITES = [
   "test/datamechanics/slack-history-progress-catalog.datamechanics.test.ts",
 ];
 
-/** The guard's verdict: "accepted", or its refusal message (which must be the static one). */
+/**
+ * The guard's verdict: `accepted <the canonical value it returned>`, or its refusal message (which
+ * must be the static one).
+ */
 const verdict = (raw: string | undefined, env: Record<string, string | undefined> = {}): string => {
   try {
-    return requireIsolatedTestUrl(raw, env) === raw ? "accepted" : "accepted a different value";
+    return `accepted ${requireIsolatedTestUrl(raw, env)}`;
   } catch (error) {
     return error instanceof Error ? error.message : "non-Error refusal";
   }
 };
+const accepted = (canonical: string): string => `accepted ${canonical}`;
 
 describe("Slack history data-mechanics DATABASE_TEST_URL guard", () => {
   it("accepts the exact CI service URL only when GITHUB_ACTIONS is exactly \"true\"", () => {
@@ -52,21 +58,25 @@ describe("Slack history data-mechanics DATABASE_TEST_URL guard", () => {
       empty: verdict(CI_URL, { GITHUB_ACTIONS: "" }),
       postgresqlScheme: verdict("postgresql://app:app@postgres:5432/app_test", CI_ENV),
     }).toEqual({
-      true: "accepted", missing: ISOLATED_URL_REFUSAL, false: ISOLATED_URL_REFUSAL, one: ISOLATED_URL_REFUSAL,
-      upper: ISOLATED_URL_REFUSAL, empty: ISOLATED_URL_REFUSAL, postgresqlScheme: "accepted",
+      true: accepted(CI_URL), missing: ISOLATED_URL_REFUSAL, false: ISOLATED_URL_REFUSAL, one: ISOLATED_URL_REFUSAL,
+      upper: ISOLATED_URL_REFUSAL, empty: ISOLATED_URL_REFUSAL,
+      postgresqlScheme: accepted("postgresql://app:app@postgres:5432/app_test"),
     });
   });
 
-  it("accepts the local isolated runner on localhost, IPv4 and bracketed IPv6 loopback with explicit permitted ports", () => {
-    const local = [
-      "postgres://app:app@localhost:55012/app_test",
-      "postgres://app:app@127.0.0.1:5433/app_test",
-      "postgres://app:app@[::1]:55012/app_test",
-      "postgres://app:app@[0:0:0:0:0:0:0:1]:55012/app_test", // URL normalizes this to [::1]
-      "postgresql://app:app@localhost:5432/app_test",
+  it("accepts the local isolated runner on localhost, IPv4 and bracketed IPv6 loopback with explicit permitted ports, returning the canonical URL", () => {
+    // [raw input, the canonical value the guard must RETURN]. Already-canonical inputs come back
+    // unchanged; the long-form IPv6 loopback comes back as `[::1]`.
+    const local: Array<[string, string]> = [
+      ["postgres://app:app@localhost:55012/app_test", "postgres://app:app@localhost:55012/app_test"],
+      ["postgres://app:app@127.0.0.1:5433/app_test", "postgres://app:app@127.0.0.1:5433/app_test"],
+      ["postgres://app:app@[::1]:55012/app_test", "postgres://app:app@[::1]:55012/app_test"],
+      ["postgres://app:app@[0:0:0:0:0:0:0:1]:55012/app_test", "postgres://app:app@[::1]:55012/app_test"],
+      ["postgresql://app:app@localhost:5432/app_test", "postgresql://app:app@localhost:5432/app_test"],
+      ["postgres://app:p%40ss@localhost:5433/app_test", "postgres://app:p%40ss@localhost:5433/app_test"],
     ];
-    for (const raw of local) {
-      expect({ raw, local: verdict(raw, {}), underCi: verdict(raw, CI_ENV) }).toEqual({ raw, local: "accepted", underCi: "accepted" });
+    for (const [raw, canonical] of local) {
+      expect({ raw, local: verdict(raw, {}), underCi: verdict(raw, CI_ENV) }).toEqual({ raw, local: accepted(canonical), underCi: accepted(canonical) });
     }
   });
 
@@ -107,6 +117,18 @@ describe("Slack history data-mechanics DATABASE_TEST_URL guard", () => {
     ["leading whitespace", " postgres://app:app@localhost:5433/app_test"],
     ["trailing whitespace", "postgres://app:app@localhost:5433/app_test "],
     ["a backslash", "postgres://app:app@localhost:5433\\@evil.test/app_test"],
+    // WHATWG `URL` silently strips leading/trailing C0 controls; a driver reading the raw string does not.
+    ["a leading C0 control with malformed percent credentials", "\x01postgres://app:%zz@localhost:5433/app_test"],
+    ["a leading C0 control", "\x01postgres://app:app@localhost:5433/app_test"],
+    ["a trailing C0 control", "postgres://app:app@localhost:5433/app_test\x1f"],
+    ["a trailing DEL", "postgres://app:app@localhost:5433/app_test\x7f"],
+    ["an embedded NUL", "postgres://app:app@local\x00host:5433/app_test"],
+    ["an embedded tab", "postgres://app:app@local\thost:5433/app_test"],
+    ["a non-ASCII homoglyph host", "postgres://app:app@lоcalhost:5433/app_test"],
+    ["a non-ASCII credential", "postgres://app:päss@localhost:5433/app_test"],
+    ["malformed percent credentials", "postgres://app:%zz@localhost:5433/app_test"],
+    ["a truncated percent escape in the username", "postgres://%E0%A4%A@localhost:5433/app_test"],
+    ["malformed percent credentials on the CI host", "postgres://app:%zz@postgres:5432/app_test"],
   ])("refuses %s in both modes with the static, URL-free message", (_label, raw) => {
     expect({ local: verdict(raw, {}), underCi: verdict(raw, CI_ENV) }).toEqual({ local: ISOLATED_URL_REFUSAL, underCi: ISOLATED_URL_REFUSAL });
     expect(ISOLATED_URL_REFUSAL.includes("://")).toBe(false);
@@ -171,7 +193,7 @@ describe("Slack history data-mechanics DATABASE_TEST_URL guard", () => {
     expect({
       declared, acceptedUnderCi: verdict(declared, CI_ENV),
       runsTier: /^\s*- run: npm run test:datamechanics\s*$/m.test(workflow),
-    }).toEqual({ declared: CI_URL, acceptedUnderCi: "accepted", runsTier: true });
+    }).toEqual({ declared: CI_URL, acceptedUnderCi: accepted(CI_URL), runsTier: true });
     const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")) as { scripts: Record<string, string> };
     expect(pkg.scripts["test:datamechanics"]).toBe("vitest run --config vitest.datamechanics.config.ts");
     const config = readFileSync(join(ROOT, "vitest.datamechanics.config.ts"), "utf8");

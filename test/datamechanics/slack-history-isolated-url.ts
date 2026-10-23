@@ -13,7 +13,14 @@ import { Client } from "pg";
  *  - the database is exactly `/app_test`;
  *  - the port is explicit;
  *  - there is no query string and no fragment;
- *  - the raw value carries no whitespace, backslash, `?` or `#`.
+ *  - every raw character is printable ASCII (`!`–`~`) other than backslash, `?` or `#`. This
+ *    refuses every whitespace, C0/DEL control and non-ASCII character, so WHATWG `URL`'s silent
+ *    stripping of leading/trailing controls cannot make it parse a different string from the one a
+ *    driver would read;
+ *  - any username/password percent-encoding decodes cleanly.
+ * The ACCEPTED value returned is `URL`'s canonical serialization (`parsed.href`), never the raw
+ * input, so callers connect with exactly the representation that was checked. The long-form IPv6
+ * loopback, for example, comes back as `[::1]`.
  *
  * Modes:
  *  - LOCAL (`scripts/dm-isolated.sh`): host `localhost`, `127.0.0.1` or `[::1]` (IPv6 loopback as
@@ -32,10 +39,12 @@ export function requireIsolatedTestUrl(raw: string | undefined, env: Record<stri
   const refuse = (): never => {
     throw new Error(ISOLATED_URL_REFUSAL);
   };
-  if (typeof raw !== "string" || raw === "" || /[\s\\?#]/.test(raw)) return refuse();
+  if (typeof raw !== "string" || raw === "" || /[^\x21-\x7e]|[\\?#]/.test(raw)) return refuse();
   let parsed: URL;
   try {
     parsed = new URL(raw);
+    decodeURIComponent(parsed.username);
+    decodeURIComponent(parsed.password);
   } catch {
     return refuse();
   }
@@ -44,7 +53,7 @@ export function requireIsolatedTestUrl(raw: string | undefined, env: Record<stri
   const local = LOOPBACK_HOSTS.has(parsed.hostname) && parsed.port !== "5434";
   const ci = parsed.hostname === "postgres" && parsed.port === "5432" && env.GITHUB_ACTIONS === "true";
   if (!local && !ci) return refuse();
-  return raw;
+  return parsed.href;
 }
 
 /** The narrow admin-client surface the scratch-database creator needs (injectable for its own tests). */

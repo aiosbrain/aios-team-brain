@@ -34,14 +34,17 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *     Both are read by the repository's catalog fingerprint (`scripts/schema-fingerprint.mjs`).
  *     The fingerprint covers relation, columns (type/default/nullability/identity/generated/
  *     collation, NOT attnum), indexes, constraints, functions (`pg_get_functiondef`) and triggers.
- *     Every Slack-owned line must be identical: every relation, column, index, constraint,
- *     trigger, function, enum, domain or sequence whose identity starts with `slack_` (so every
- *     `slack_*` table, not only `slack_sync_channels`, and every `slack_*` function and type). A
- *     whitespace-exact second
+ *     Every Slack-owned line must be identical. Two exact rules (`isSlackOwned`) select them:
+ *     · every relation, column, index, constraint, trigger, function, enum, domain or sequence
+ *       whose identity STARTS with `slack_`: every `slack_*` table with its dependents, not only
+ *       `slack_sync_channels`, and every `slack_*` function and type;
+ *     · every FUNCTION whose name CONTAINS `slack_`: today the four verb- or predicate-prefixed
+ *       Slack functions, pinned in REQUIRED_IDENTS.
+ *     A whitespace-exact second
  *     read also compares the four named CHECKs (`pg_get_constraintdef`, validated) and the
  *     validator's metadata and `prosrc`, because the fingerprint collapses whitespace inside
- *     bodies. Non-vacuity: every accepted identity (8 columns, 4 CHECKs, the validator, the
- *     trigger and its function) must appear on both sides.
+ *     bodies. Non-vacuity: every pinned identity must appear on both sides. That is 8 columns, 4
+ *     CHECKs, the validator, the trigger and its function, plus the four rule-2 functions.
  *  2. MR-02 DUMP → RESTORE → REPLAY. The loader-path database is seeded with synthetic rows:
  *     · a populated channel with initialized segments on both lanes, both histories and the
  *       aggregate;
@@ -151,16 +154,32 @@ const REQUIRED_IDENTS = [
   "function\tslack_channel_cursor_history_valid(history jsonb)",
   "function\tslack_sync_channels_clear_deleted_binding()",
   "trigger\tslack_sync_channels.slack_sync_channels_clear_deleted_binding",
+  // Rule 2 of isSlackOwned: Slack functions whose names do not START with `slack_`.
+  "function\tis_slack_identity_provider(provider text)",
+  "function\tenforce_slack_identity_cutover()",
+  "function\tprotect_slack_identity_cutover_marker()",
+  "function\tprotect_slack_workspace_observation()",
 ];
 
 const identOf = (line: string): string => line.split("\t").slice(0, 2).join("\t");
 /**
- * Every Slack-owned fingerprint line. Every fingerprint identity is either a top-level name
- * (relation, function `name(args)`, enum, domain, sequence) or `table.object` (column, index,
- * constraint, trigger, policy), so one `slack_` prefix selects every `slack_*` relation with its
- * dependents, every `slack_*` function and every `slack_*` type.
+ * The Slack-owned fingerprint lines, by exactly two rules:
+ *  1. the identity STARTS with `slack_`. Every fingerprint identity is either a top-level name
+ *     (relation, function `name(args)`, enum, domain, sequence) or `table.object` (column, index,
+ *     constraint, trigger, policy), so this selects every `slack_*` relation with all its
+ *     dependents, and every `slack_*` function and type;
+ *  2. a FUNCTION whose name CONTAINS `slack_` (the identity text before `(`). This adds the Slack
+ *     functions named with a verb or predicate prefix: today exactly `is_slack_identity_provider`,
+ *     `enforce_slack_identity_cutover`, `protect_slack_identity_cutover_marker` and
+ *     `protect_slack_workspace_observation`, pinned in REQUIRED_IDENTS.
+ * Nothing else is inferred: no table name containing `slack_` mid-word, and no object of another
+ * kind, is selected by rule 2.
  */
-const isSlackOwned = (line: string): boolean => (line.split("\t")[1] ?? "").startsWith("slack_");
+const isSlackOwned = (line: string): boolean => {
+  const [kind = "", ident = ""] = line.split("\t");
+  if (ident.startsWith("slack_")) return true;
+  return kind === "function" && ident.slice(0, ident.indexOf("(")).includes("slack_");
+};
 /** `scripts/migrate-from-existing.mjs` `MIRROR_EXCEPTIONS`, key for key, exactly as its source spells them. */
 const EXPECTED_MIRROR_EXCEPTION_KEYS = [
   "index\\tchat_messages.chat_messages_search_idx",
