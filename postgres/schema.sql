@@ -3396,7 +3396,7 @@ create table if not exists slack_sync_channels (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   -- AM-F2 / AC-02 deep history (slack-channel-history-segments-upgrade below owns their CHECKs).
-  -- Declared last, in the order the upgrade adds them, so from-zero and upgraded tables agree.
+  -- From-zero tables get the same final catalog and behavior that the upgrade block gives existing ones.
   newest_cursor_history jsonb not null default '[]'::jsonb,
   historical_cursor_history jsonb not null default '[]'::jsonb,
   newest_request_lower_ts text,
@@ -3560,7 +3560,8 @@ begin
     select 1 from pg_catalog.pg_proc p
       join pg_catalog.pg_namespace n on n.oid = p.pronamespace
      where n.nspname = 'public' and p.proname = 'slack_channel_cursor_history_valid'
-       and not coalesce(p.prokind = 'f' and p.pronargs = 1
+       and not coalesce(p.prokind = 'f' and p.pronargs = 1 and p.pronargdefaults = 0
+                and p.prosupport::pg_catalog.oid = 0::pg_catalog.oid
                 and p.proargtypes[0] = 'pg_catalog.jsonb'::pg_catalog.regtype
                 and p.proargnames = array['history']::text[]
                 and p.prorettype = 'pg_catalog.bool'::pg_catalog.regtype
@@ -3643,7 +3644,7 @@ begin
          when newest_anchor_ts is null then
            newest_request_lower_ts is null and newest_segment_lower_ts is null and newest_segment_upper_ts is null
          when newest_request_lower_ts is null and newest_segment_lower_ts is null and newest_segment_upper_ts is null then
-           newest_cursor is null
+           newest_cursor is null and newest_lower_ts is not null
          when newest_request_lower_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
               and newest_segment_lower_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
               and newest_segment_upper_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
@@ -3670,7 +3671,7 @@ begin
        where not coalesce(case
          when historical_anchor_ts is null then
            historical_segment_lower_ts is null and historical_segment_upper_ts is null
-           and historical_completed_segments_oldest_ts is null
+           and historical_completed_segments_oldest_ts is null and historical_oldest_seen_ts is null
          when historical_segment_lower_ts is null and historical_segment_upper_ts is null then
            historical_completed_segments_oldest_ts is null and historical_oldest_seen_ts is null and historical_cursor is null
          when historical_segment_lower_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
@@ -3723,6 +3724,30 @@ begin
       add column historical_segment_lower_ts pg_catalog.text,
       add column historical_segment_upper_ts pg_catalog.text,
       add column historical_completed_segments_oldest_ts pg_catalog.text;
+  end if;
+
+  -- ── Any prior copy of the four named CHECKs is dropped here, catalog-guarded (no skip NOTICE), so a
+  -- conflicting same-named CHECK cannot fail the restart with a value-bearing failing-row DETAIL. The
+  -- explicit validation below still gates their canonical reinstallation. ──
+  if exists (select 1 from pg_catalog.pg_constraint
+              where conrelid = 'public.slack_sync_channels'::pg_catalog.regclass
+                and conname = 'slack_sync_channels_newest_cursor_history_check') then
+    alter table public.slack_sync_channels drop constraint slack_sync_channels_newest_cursor_history_check;
+  end if;
+  if exists (select 1 from pg_catalog.pg_constraint
+              where conrelid = 'public.slack_sync_channels'::pg_catalog.regclass
+                and conname = 'slack_sync_channels_historical_cursor_history_check') then
+    alter table public.slack_sync_channels drop constraint slack_sync_channels_historical_cursor_history_check;
+  end if;
+  if exists (select 1 from pg_catalog.pg_constraint
+              where conrelid = 'public.slack_sync_channels'::pg_catalog.regclass
+                and conname = 'slack_sync_channels_newest_progress_check') then
+    alter table public.slack_sync_channels drop constraint slack_sync_channels_newest_progress_check;
+  end if;
+  if exists (select 1 from pg_catalog.pg_constraint
+              where conrelid = 'public.slack_sync_channels'::pg_catalog.regclass
+                and conname = 'slack_sync_channels_historical_progress_check') then
+    alter table public.slack_sync_channels drop constraint slack_sync_channels_historical_progress_check;
   end if;
 
   -- ── The once-only restart of each affected ACTIVE lane (anchor present, cursor-null claims included).
@@ -3797,7 +3822,7 @@ begin
        when newest_anchor_ts is null then
          newest_request_lower_ts is null and newest_segment_lower_ts is null and newest_segment_upper_ts is null
        when newest_request_lower_ts is null and newest_segment_lower_ts is null and newest_segment_upper_ts is null then
-         newest_cursor is null
+         newest_cursor is null and newest_lower_ts is not null
        when newest_request_lower_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
             and newest_segment_lower_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
             and newest_segment_upper_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
@@ -3817,7 +3842,7 @@ begin
         or not coalesce(case
        when historical_anchor_ts is null then
          historical_segment_lower_ts is null and historical_segment_upper_ts is null
-         and historical_completed_segments_oldest_ts is null
+         and historical_completed_segments_oldest_ts is null and historical_oldest_seen_ts is null
        when historical_segment_lower_ts is null and historical_segment_upper_ts is null then
          historical_completed_segments_oldest_ts is null and historical_oldest_seen_ts is null and historical_cursor is null
        when historical_segment_lower_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
@@ -3849,17 +3874,7 @@ begin
     raise exception using errcode = 'P0001', message = 'AC02_PROGRESS_UPGRADE_INVALID_STATE';
   end if;
 
-  -- ── Named history CHECKs: dropped only when present (no skip NOTICE), then re-added identically. ──
-  if exists (select 1 from pg_catalog.pg_constraint
-              where conrelid = 'public.slack_sync_channels'::pg_catalog.regclass
-                and conname = 'slack_sync_channels_newest_cursor_history_check') then
-    alter table public.slack_sync_channels drop constraint slack_sync_channels_newest_cursor_history_check;
-  end if;
-  if exists (select 1 from pg_catalog.pg_constraint
-              where conrelid = 'public.slack_sync_channels'::pg_catalog.regclass
-                and conname = 'slack_sync_channels_historical_cursor_history_check') then
-    alter table public.slack_sync_channels drop constraint slack_sync_channels_historical_cursor_history_check;
-  end if;
+  -- ── Named history CHECKs, reinstalled canonically (any prior copy was dropped before the restart). ──
   alter table public.slack_sync_channels add constraint slack_sync_channels_newest_cursor_history_check check (
     case when public.slack_channel_cursor_history_valid(newest_cursor_history) then
       case when newest_cursor is null then newest_cursor_history = '[]'::pg_catalog.jsonb
@@ -3879,22 +3894,12 @@ begin
 
   -- ── Named progress CHECKs (§4): inactive, all-null initialization and initialized branches, every
   -- bound shape-guarded before an exact numeric cast, and every other shape false — never SQL NULL. ──
-  if exists (select 1 from pg_catalog.pg_constraint
-              where conrelid = 'public.slack_sync_channels'::pg_catalog.regclass
-                and conname = 'slack_sync_channels_newest_progress_check') then
-    alter table public.slack_sync_channels drop constraint slack_sync_channels_newest_progress_check;
-  end if;
-  if exists (select 1 from pg_catalog.pg_constraint
-              where conrelid = 'public.slack_sync_channels'::pg_catalog.regclass
-                and conname = 'slack_sync_channels_historical_progress_check') then
-    alter table public.slack_sync_channels drop constraint slack_sync_channels_historical_progress_check;
-  end if;
   alter table public.slack_sync_channels add constraint slack_sync_channels_newest_progress_check check (
     case
       when newest_anchor_ts is null then
         newest_request_lower_ts is null and newest_segment_lower_ts is null and newest_segment_upper_ts is null
       when newest_request_lower_ts is null and newest_segment_lower_ts is null and newest_segment_upper_ts is null then
-        newest_cursor is null
+        newest_cursor is null and newest_lower_ts is not null
       when newest_request_lower_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
            and newest_segment_lower_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
            and newest_segment_upper_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
@@ -3916,7 +3921,7 @@ begin
     case
       when historical_anchor_ts is null then
         historical_segment_lower_ts is null and historical_segment_upper_ts is null
-        and historical_completed_segments_oldest_ts is null
+        and historical_completed_segments_oldest_ts is null and historical_oldest_seen_ts is null
       when historical_segment_lower_ts is null and historical_segment_upper_ts is null then
         historical_completed_segments_oldest_ts is null and historical_oldest_seen_ts is null and historical_cursor is null
       when historical_segment_lower_ts ~ '^(0|[1-9][0-9]{0,11})[.][0-9]{6}$'
