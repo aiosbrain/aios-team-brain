@@ -86,7 +86,10 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *    wrong-kind FK (AM_F2), one partial unit (AC02), two metadata conflicts (AC02, AM_F2), one
  *    validator conflict (AM_F2), one state rejection (AC02) and one restart-hiding prevalidation
  *    (AC02). Both paths use the same runner, the same expected static error and the same
- *    rollback evidence. Running the WHOLE `schema.sql` file as a refusal entrypoint is not claimed.
+ *    rollback evidence. B8 (continuation 4) makes the mirror EXHAUSTIVE: every matrix case, the
+ *    state refusals, and literal twins of the dedicated migration-only refusals. The REAL deploy
+ *    loader (whole `schema.sql`, one atomic query, run before any migration) refuses a
+ *    representative set. Its notices go to its own logger and are not asserted.
  *    POSTGRESQL 16 REPRESENTABILITY:
  *    · an IDENTITY column must be smallint/integer/bigint, so it cannot be built on an owned jsonb
  *      or text column; GENERATED is covered instead;
@@ -145,12 +148,17 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *    identity is guaranteed, and from-zero columns sit in different attribute positions from
  *    upgraded ones. GREEN since the comment was corrected at 83162b68.
  *
- * TEST COUNT: 74 = 4 static + 70 database. The database tests are:
+ * TEST COUNT: 117 = 4 static + 113 database. The database tests are:
  *  - 17 earlier: loader catalog, direct catalog, defaulted helper, 3 state rejections, 5 persisted
  *    histories, 2 restart-hiding, validator truth table, CHECK matrix, union restart, one-lane
  *    replay;
  *  - 34 in the migration refusal matrix;
- *  - 7 in the schema-mirror refusal set;
+ *  - 45 in the EXHAUSTIVE schema-mirror refusal set:
+ *    · the 34 matrix cases;
+ *    · 2 state refusals;
+ *    · 9 literal twins of the dedicated migration-only refusals (defaulted helper, the two
+ *      newest-lane state rejections, five persisted-history defects, segment-only restart-hiding);
+ *  - 5 whole-schema refusals through the REAL deploy loader (representative set);
  *  - 8 replay-time cases (B5/B6), each run through BOTH the migration and the marked mirror
  *    statement:
  *    · a pure replay (all eight columns present) refusing a stored invalid progress tuple left
@@ -192,8 +200,10 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *    · a COMMITTING segment-only introduction on an F2-only SCHEMA state (only its refusal is here);
  *    · staged/published/ledger evidence rows.
  *  - MR-04 refusals not yet exercised:
- *    · the WHOLE `schema.sql` file as a refusal entrypoint, and exhaustive (not representative)
- *      mirror-statement coverage;
+ *    · whole-schema (full-loader) refusal for the REST of the matrix (only a representative five
+ *      run through the real loader);
+ *    · mirror twins of the B5/B6 replay-time and B7 cases are already in place, since those run
+ *      through both entrypoints;
  *    · identity metadata (not representable on PostgreSQL 16; see above).
  *  - DH-11: the §9 named tests in the source-fences/upgrade files, including renaming the legacy
  *    three-column replay test to `re-adds the three legacy metadata/provisional columns without
@@ -581,6 +591,7 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
   let probe: Client; // a second session: every post-migration inspection
   let fromZero: Record<string, unknown> = {};
   let scratchUrl = ""; // the scratch database, for the extra sessions the MR-04 B7 cases open
+  let loadSchemaFn: unknown = null; // the real deploy loader, for the whole-schema refusal entrypoint
   const migration = migrationText;
 
   const newColumns = async () => (await probe.query(
@@ -661,9 +672,24 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
   /** One execution of the real migration file. */
   const applyMigration = (): Promise<{ error: unknown; notices: string[] }> => applyStatement(migration);
   /** The refusal matrix's two executable entrypoints. */
-  type Entry = "migration" | "schema mirror";
-  const applyEntry = (entry: Entry): Promise<{ error: unknown; notices: string[] }> =>
-    applyStatement(entry === "migration" ? migration : MIRROR_STATEMENT);
+  type Entry = "migration" | "schema mirror" | "full loader";
+  /**
+   * The executable entrypoints:
+   *  - the migration file;
+   *  - the marked mirror statement;
+   *  - the REAL deploy loader (`loadSchema`: the whole `schema.sql` as ONE atomic query, then every
+   *    migration, on its own fresh session). Its notices go to its own logger, so they are NOT
+   *    captured or asserted for the loader.
+   */
+  const applyEntry = async (entry: Entry): Promise<{ error: unknown; notices: string[] }> => {
+    if (entry !== "full loader") return applyStatement(entry === "migration" ? migration : MIRROR_STATEMENT);
+    try {
+      await (loadSchemaFn as (options: Record<string, unknown>) => Promise<void>)({ cwd: process.cwd(), databaseUrl: scratchUrl, logger: { log: () => {} } });
+      return { error: null, notices: [] };
+    } catch (error) {
+      return { error, notices: [] };
+    }
+  };
 
   /** A fixture DML statement whose failure is redacted (FixtureError), so a seeded canary never prints. */
   const runFixture = async (sql: string, params: unknown[] = []): Promise<void> => {
@@ -733,6 +759,7 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
 
   beforeAll(async () => {
     const { loadSchema } = await import("@/scripts/pg-load-schema.mjs");
+    loadSchemaFn = loadSchema;
     // The shared guard refuses BEFORE any connection or database creation (slack-history-isolated-url.ts).
     const name = `slackconflict_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
     const created = await createIsolatedScratchDatabase(name);
@@ -876,7 +903,7 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
     expect(await refusal.setup(), `fixture: ${refusal.id} is really in place`).toEqual(refusal.fact);
     const before = await refusalEvidence();
     const { error, notices } = await applyEntry(entry);
-    expect(notices, `${entry}: no NOTICE or WARNING on refusal`).toEqual([]);
+    if (entry !== "full loader") expect(notices, `${entry}: no NOTICE or WARNING on refusal`).toEqual([]);
     expect(refusalOf(error), `${entry}: ${refusal.id} is refused with the static ${refusal.message} error and no value-bearing field`).toEqual(refusedWith(refusal.message));
     expect(carriesCanary(error), `${entry}: no error field carries the planted cursor canary`).toBe(false);
     expect(await refusalEvidence(),
@@ -1059,21 +1086,99 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
   ];
 
   const MIGRATION_MATRIX: Refusal[] = [...WRONG_KIND, ...PARTIAL_UNITS, ...METADATA, ...VALIDATOR_CONFLICTS];
-  const MIRROR_REPRESENTATIVE_IDS = [
+  /**
+   * B8: marked-mirror TWINS of the dedicated migration-only refusal tests below. Each uses the
+   * same literal defect as its migration twin, rebuilt as a Refusal so it runs through the shared
+   * baseline, fact, privacy and whole-rollback oracle.
+   */
+  /** The same literal initialized newest tuple as NEWEST_INITIALIZED below (declared here, before first use). */
+  const NEWEST_INITIALIZED_FOR_TWINS = {
+    newest_anchor_ts: "1718900800.000000", newest_lower_ts: "1718900700.000000",
+    newest_request_lower_ts: "1718900640.000000", newest_segment_lower_ts: "1718900640.000000",
+    newest_segment_upper_ts: "1718900800.000000",
+  };
+  const linkageRow = { channel_id: "C0LINKAGE001", ...NEWEST_INITIALIZED_FOR_TWINS, newest_cursor: "CANARY-c-1", newest_cursor_history: JSON.stringify(["CANARY-c-1"]) };
+  const PERSISTED_HISTORY_TWINS: Array<{ label: string; history: unknown; cursor: string | null }> = [
+    { label: "a duplicate history", history: ["CANARY-c-1", "CANARY-c-1"], cursor: "CANARY-c-1" },
+    { label: "a history whose final element is not the cursor", history: ["CANARY-c-1", "CANARY-c-2"], cursor: "CANARY-c-1" },
+    { label: "an empty history under a non-null cursor", history: [], cursor: "CANARY-c-1" },
+    { label: "a non-array history", history: { CANARY: 1 }, cursor: null },
+    { label: "a history over the 1,000-entry cap", history: Array.from({ length: 1001 }, (_, i) => `CANARY-${i}`), cursor: "CANARY-1000" },
+  ];
+  const MIGRATION_ONLY_TWINS: Refusal[] = [
+    {
+      id: "twin: a pre-existing validator with a DEFAULTED argument", message: AM_F2, state: "pre-F2",
+      setup: async () => {
+        await c.query(`create function public.slack_channel_cursor_history_valid(history jsonb default '[]'::jsonb) returns boolean
+                       language sql immutable strict parallel safe security invoker set search_path = pg_catalog as $$ select true $$`);
+        return validatorDiff();
+      },
+      fact: ["arg_defaults"],
+    },
+    {
+      id: "twin: an active newest lane with no logical lower B", message: AC02, state: "pre-F2",
+      setup: async () => {
+        await insertChannel({ channel_id: "C0NEWNOLOW01", newest_anchor_ts: "1718900800.000000", newest_cursor: "CANARY-newest-b", updated_at: SEEDED_UPDATED_AT });
+        return (await probe.query<{ n: number }>(
+          "select pg_catalog.count(*)::int as n from public.slack_sync_channels where newest_anchor_ts is not null and newest_lower_ts is null"
+        )).rows[0].n;
+      },
+      fact: 1,
+    },
+    {
+      id: "twin: a legacy newest null-anchor lane with a non-null cursor", message: AM_F2, state: "pre-F2",
+      setup: async () => {
+        await insertChannel({ channel_id: "C0NULLANCH01", newest_cursor: "CANARY-newest-c", updated_at: SEEDED_UPDATED_AT });
+        return (await probe.query<{ n: number }>(
+          "select pg_catalog.count(*)::int as n from public.slack_sync_channels where newest_anchor_ts is null and newest_cursor is not null"
+        )).rows[0].n;
+      },
+      fact: 1,
+    },
+    ...PERSISTED_HISTORY_TWINS.map(({ label, history, cursor }): Refusal => ({
+      id: `twin: replay over ${label} left behind its removed CHECK`, message: AM_F2, state: "F2",
+      setup: async () => {
+        await insertChannel(linkageRow);
+        await c.query(alter("drop constraint slack_sync_channels_newest_cursor_history_check"));
+        await runFixture("update public.slack_sync_channels set newest_cursor_history = $1::jsonb, newest_cursor = $2 where channel_id = 'C0LINKAGE001'",
+          [JSON.stringify(history), cursor]);
+        return (await namedConstraints()).map((row) => row.name).includes("slack_sync_channels_newest_cursor_history_check");
+      },
+      fact: false,
+    })),
+    {
+      id: "twin: a segment-only introduction over a terminal-mismatched newest history", message: AM_F2, state: "F2",
+      setup: async () => {
+        await insertChannel({ channel_id: "C0HIDEHIST01", ...NEWEST_INITIALIZED_FOR_TWINS, newest_cursor: "CANARY-c-1", newest_cursor_history: JSON.stringify(["CANARY-c-1"]) });
+        await c.query(alter("drop column newest_request_lower_ts, drop column newest_segment_lower_ts, drop column newest_segment_upper_ts"));
+        await c.query(alter("drop constraint slack_sync_channels_newest_cursor_history_check"));
+        await runFixture("update public.slack_sync_channels set newest_cursor_history = $1::jsonb where channel_id = 'C0HIDEHIST01'",
+          [JSON.stringify(["CANARY-c-1", "CANARY-c-2"])]);
+        return (await newColumns()).map((row) => row.name);
+      },
+      fact: NEW_COLUMNS.filter((column) => !["newest_request_lower_ts", "newest_segment_lower_ts", "newest_segment_upper_ts"].includes(column)),
+    },
+  ];
+  /** EXHAUSTIVE: every migration refusal of the matrix, the state refusals, and the migration-only twins. */
+  const MIRROR_SET: Refusal[] = [...MIGRATION_MATRIX, ...STATE_REFUSALS, ...MIGRATION_ONLY_TWINS];
+  /**
+   * The REAL deploy loader as a refusal entrypoint, on a representative set. It reaches a planted
+   * state because `loadSchema` runs the whole `schema.sql` FIRST, as one atomic query, and the
+   * mirrored block inside it refuses before any migration file runs. So the rollback unit is the
+   * whole schema query.
+   */
+  const LOADER_REPRESENTATIVE_IDS = [
     "wrong-kind FOREIGN KEY holding slack_sync_channels_historical_cursor_history_check",
     "partial newest segment unit, 2 of 3 present",
     "metadata progress column over a text DOMAIN",
-    "metadata GENERATED history column",
     "validator security definer",
+    "state inactive historical lane carrying an attempt-oldest",
   ];
-  const MIRROR_SET: Refusal[] = [
-    ...MIRROR_REPRESENTATIVE_IDS.map((id) => {
-      const found = MIGRATION_MATRIX.find((refusal) => refusal.id === id);
-      if (!found) throw new Error(`refusal matrix: no case named ${id}`);
-      return found;
-    }),
-    ...STATE_REFUSALS,
-  ];
+  const LOADER_SET: Refusal[] = LOADER_REPRESENTATIVE_IDS.map((id) => {
+    const found = MIRROR_SET.find((refusal) => refusal.id === id);
+    if (!found) throw new Error(`refusal matrix: no case named ${id}`);
+    return found;
+  });
 
   it.each(MIGRATION_MATRIX)("MR-04 migration refuses $id statically before any mutation and rolls back whole", async (refusal) => {
     await runRefusal(refusal, "migration");
@@ -1082,6 +1187,10 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
   it.each(MIRROR_SET)("MR-04 schema-mirror statement refuses $id with the same static error and whole rollback", async (refusal) => {
     expect(MIRROR_STATEMENT.startsWith("do $slack_channel_history_segments$\n"), "fixture: the schema mirror's marked DO statement was extracted").toBe(true);
     await runRefusal(refusal, "schema mirror");
+  }, SCRATCH_TIMEOUT);
+
+  it.each(LOADER_SET)("MR-04 the real deploy loader (whole schema.sql) refuses $id with the same static error and whole rollback", async (refusal) => {
+    await runRefusal(refusal, "full loader");
   }, SCRATCH_TIMEOUT);
 
   // ── MR-04 REPLAY-TIME REFUSALS (B5/B6), through BOTH entrypoints ──

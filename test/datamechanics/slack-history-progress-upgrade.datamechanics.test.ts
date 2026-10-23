@@ -186,8 +186,10 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *         · real two-session serialization, with exactly one restart;
  *         · a committed mirror statement surviving a later failing migration query, then a retry
  *           with no second restart;
- *    B8 · MR-04 marked-mirror refusal parity for the whole refusal matrix (it is representative
- *         today, in `slack-history-progress-conflicts`);
+ *    B8 · DONE (continuation 4), in `slack-history-progress-conflicts`. Marked-mirror refusal is
+ *         EXHAUSTIVE: the matrix, the state refusals, and twins of every dedicated migration-only
+ *         refusal. The REAL deploy loader refuses a representative five (whole-loader refusal for
+ *         the rest of the matrix stays open);
  *    C9 · DH-11: the legacy three-column test, renamed to `re-adds the three legacy
  *         metadata/provisional columns without restarting an initialized segment`, and maximum
  *         histories through the unrelated writers;
