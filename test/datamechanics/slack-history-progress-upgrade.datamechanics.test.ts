@@ -23,11 +23,21 @@ import { describe, expect, it } from "vitest";
  * THE PRE-F2 STATE. The loader builds the CURRENT schema. Today that is already pre-F2. Once the
  * mirror lands in `schema.sql` it will not be, so the case then reconstructs pre-F2 with FIXTURE DDL on
  * this throwaway database only — the contract permits test-only reconstruction of legacy schema states
- * in disposable isolated databases (§9.3) — and asserts that it got there before seeding.
+ * in disposable isolated databases (§9.3). Before seeding, it asserts that the table IS the pre-F2
+ * table, exactly: every column with its type, nullability and default; every table constraint by
+ * name, definition and validation state; and every public function and trigger owned by the table,
+ * all against LITERAL expectations written out below, never read back from the catalog. A progress
+ * helper or constraint the fixture failed to remove, or a lost pre-F2 CHECK, is a mismatch.
  *
- * THE ONE NARROW CASE (MR-03 / F2-12): one channel row whose HISTORICAL lane is active — anchor, a
- * saved cursor and an attempt-oldest — with no live claim, and whose NEWEST lane is idle; plus one
- * unrelated queued thread row. Applying the migration once is a UNION introduction (both histories
+ * ISOLATION. Before anything is created, the URL must be the isolated runner's shape: a loopback
+ * host, a port other than the shared 5434 service, and the `app_test` database. Anything else is
+ * refused with a static error that does not print the URL.
+ *
+ * THE ONE NARROW CASE (one row of MR-03 / F2-12, not either whole): one channel row whose HISTORICAL
+ * lane is active — anchor, a saved cursor and an attempt-oldest — with no live claim, and whose NEWEST
+ * lane is idle; plus one unrelated queued thread row. The row also carries a provisional catch-up top,
+ * a metadata attempt owner and `next_lane = 'newest'`, so that their preservation is observable: an
+ * implementation that forced the turn to the restarted lane without a claim would be caught. Applying the migration once is a UNION introduction (both histories
  * and every segment column absent), so per §9:
  *  - the active historical lane restarts EXACTLY ONCE: its cursor and attempt-oldest clear, its
  *    history is `[]` (never seeded from the saved cursor), its scan generation increments by one, and
@@ -42,12 +52,27 @@ import { describe, expect, it } from "vitest";
  * A second application must then leave the FULL row exactly as the first left it, `updated_at`
  * included, with no further restart and no notice.
  *
- * WHAT REMAINS for later packets, and is NOT claimed here: MR-02 mirror byte-parity and from-zero/
- * upgraded fingerprints and dump/restore; the rest of the MR-03 matrix (history-only and segment-only
- * introduction, one-lane introduction, idle and active lanes together, a cursor-null live claim, an
- * unaffected opposite live claim, mirror-only and both execution orders, replay after initialized
- * segment progress and maximum histories); MR-04 static failures, rollback, cancellation and
- * concurrency; MR-05's existing structural sweeps; the named DH-11 source-fences tests; and MR-06.
+ * WHAT REMAINS for later packets, and is NOT claimed here. This case does not complete F2-12, DH-11
+ * or any MR row. Deferred, explicitly:
+ *  - MR-02: mirror byte-parity, from-zero/upgraded fingerprints, dump/restore, and the EXACT
+ *    definitions and validation state of the new history and progress CHECKs (this case checks only
+ *    that the two named history CHECKs exist, and the PRE-F2 constraints exactly);
+ *  - MR-03 / F2-12 edges:
+ *    · a RESTARTED lane carrying a live claim with a nonnull cursor, where the claim must be
+ *      invalidated (lease cleared, lease generation incremented, turn set to that lane), including
+ *      the omitted-lease-invalidation mutant;
+ *    · an expired claim;
+ *    · a cursor-null live claim (an in-flight first page);
+ *    · an unaffected opposite-lane live claim;
+ *    · an anchored lane with a null cursor and no claim;
+ *    · staged-snapshot, published-item and ledger evidence rows (only one queued thread row is here);
+ *    · history-only and segment-only introduction, one-lane introduction, both lanes active;
+ *    · mirror-only execution and both execution orders;
+ *    · replay after initialized segment progress, and with maximum histories;
+ *  - MR-04: static failures, rollback, cancellation and concurrency;
+ *  - MR-05: the existing structural sweeps;
+ *  - the named DH-11 source-fences tests;
+ *  - MR-06.
  */
 
 const SCRATCH_TIMEOUT = 300_000;
@@ -91,6 +116,125 @@ const EXPECTED_CATALOG = {
   }],
 };
 
+// ── THE PRE-F2 TABLE, written out from `postgres/schema.sql` as it stood before AM-F2 ──
+
+/** One column's catalog facts. `generated` and `identity` are empty for an ordinary column. */
+const col = (name: string, type: string, notNull: boolean, defaultExpr: string | null) =>
+  ({ name, type, not_null: notNull, default_expr: defaultExpr, generated: "", identity: "" });
+const TSTZ = "timestamp with time zone";
+/** Every column of the pre-F2 table, in name order. */
+const PRE_F2_COLUMNS = [
+  col("attempts", "integer", true, "0"),
+  col("binding_config_revision", "text", false, null),
+  col("binding_integration_id", "uuid", false, null),
+  col("channel_id", "text", true, null),
+  col("claimed_lane", "text", false, null),
+  col("completed_lower_ts", "text", false, null),
+  col("completed_upper_ts", "text", false, null),
+  col("created_at", TSTZ, true, "now()"),
+  col("due_at", TSTZ, true, "now()"),
+  col("historical_anchor_ts", "text", false, null),
+  col("historical_cursor", "text", false, null),
+  col("historical_floor_reached", "boolean", true, "false"),
+  col("historical_oldest_seen_ts", "text", false, null),
+  col("historical_scan_generation", "bigint", true, "0"),
+  col("id", "uuid", true, "gen_random_uuid()"),
+  col("last_error_code", "text", false, null),
+  col("last_read_at", TSTZ, false, null),
+  col("lease_expires_at", TSTZ, false, null),
+  col("lease_generation", "bigint", true, "0"),
+  col("lease_owner", "text", false, null),
+  col("metadata_attempt_generation", "bigint", true, "0"),
+  col("metadata_attempt_owner", "text", false, null),
+  col("newest_anchor_ts", "text", false, null),
+  col("newest_catchup_upper_ts", "text", false, null),
+  col("newest_cursor", "text", false, null),
+  col("newest_lower_ts", "text", false, null),
+  col("newest_scan_generation", "bigint", true, "0"),
+  col("next_lane", "text", true, "'newest'::text"),
+  col("public_checked_at", TSTZ, false, null),
+  col("public_state", "text", true, "'unknown'::text"),
+  col("team_id", "uuid", true, null),
+  col("updated_at", TSTZ, true, "now()"),
+  col("workspace_id", "text", true, null),
+];
+
+/** PostgreSQL's own rendering (`pg_get_constraintdef`) of the pre-F2 constraints, built from literals. */
+const nonBlankBoundedCursor = (column: string): string =>
+  `CHECK (((${column} IS NULL) OR ((btrim(${column}) <> ''::text) AND (length(${column}) <= 1024))))`;
+const nonNegative = (column: string): string => `CHECK ((${column} >= 0))`;
+const TS_COLUMNS = [
+  "newest_anchor_ts", "newest_lower_ts", "historical_anchor_ts", "historical_oldest_seen_ts",
+  "completed_lower_ts", "completed_upper_ts", "newest_catchup_upper_ts",
+];
+const TS_SYNTAX = `CHECK ((${TS_COLUMNS.map((column) => `((${column} IS NULL) OR (${column} ~ '^[0-9]+[.][0-9]{1,6}$'::text))`).join(" AND ")}))`;
+/**
+ * Every pre-F2 table constraint, in name order, VALIDATED. Not-null constraints (which recent
+ * PostgreSQL versions also list in `pg_constraint`) are excluded from this list by query; the column
+ * list above states nullability.
+ */
+const PRE_F2_CONSTRAINTS = [
+  ["slack_sync_channels_attempts_check", nonNegative("attempts")],
+  ["slack_sync_channels_binding_codec", "CHECK (((binding_integration_id IS NULL) = (binding_config_revision IS NULL)))"],
+  ["slack_sync_channels_binding_config_revision_check", "CHECK ((binding_config_revision ~ '^[0-9a-f]{64}$'::text))"],
+  ["slack_sync_channels_binding_integration_id_fkey", "FOREIGN KEY (binding_integration_id) REFERENCES integrations(id) ON DELETE SET NULL"],
+  ["slack_sync_channels_channel_id_check", "CHECK ((channel_id ~ '^[A-Za-z0-9]+$'::text))"],
+  ["slack_sync_channels_claimed_lane_check", "CHECK (((claimed_lane IS NULL) OR (claimed_lane = ANY (ARRAY['newest'::text, 'historical'::text]))))"],
+  ["slack_sync_channels_historical_cursor_check", nonBlankBoundedCursor("historical_cursor")],
+  ["slack_sync_channels_historical_scan_generation_check", nonNegative("historical_scan_generation")],
+  ["slack_sync_channels_interval_codec", "CHECK (((completed_lower_ts IS NULL) = (completed_upper_ts IS NULL)))"],
+  ["slack_sync_channels_last_error_code_check", "CHECK (((last_error_code IS NULL) OR (last_error_code ~ '^[a-z][a-z0-9_]{0,39}$'::text)))"],
+  ["slack_sync_channels_lease_codec", "CHECK ((((lease_owner IS NULL) = (lease_expires_at IS NULL)) AND ((lease_owner IS NULL) = (claimed_lane IS NULL))))"],
+  ["slack_sync_channels_lease_generation_check", nonNegative("lease_generation")],
+  ["slack_sync_channels_lease_owner_check", "CHECK (((lease_owner IS NULL) OR ((length(lease_owner) >= 8) AND (length(lease_owner) <= 128) AND (lease_owner !~ '[[:space:]]'::text))))"],
+  ["slack_sync_channels_lease_owner_key", "UNIQUE (lease_owner)"],
+  ["slack_sync_channels_metadata_attempt_generation_check", nonNegative("metadata_attempt_generation")],
+  ["slack_sync_channels_newest_cursor_check", nonBlankBoundedCursor("newest_cursor")],
+  ["slack_sync_channels_newest_scan_generation_check", nonNegative("newest_scan_generation")],
+  ["slack_sync_channels_next_lane_check", "CHECK ((next_lane = ANY (ARRAY['newest'::text, 'historical'::text])))"],
+  ["slack_sync_channels_pkey", "PRIMARY KEY (id)"],
+  ["slack_sync_channels_public_codec", "CHECK (((public_state = 'unknown'::text) = (public_checked_at IS NULL)))"],
+  ["slack_sync_channels_public_state_check", "CHECK ((public_state = ANY (ARRAY['unknown'::text, 'public'::text, 'private'::text, 'unverifiable'::text])))"],
+  ["slack_sync_channels_team_id_fkey", "FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE"],
+  ["slack_sync_channels_team_id_workspace_id_channel_id_key", "UNIQUE (team_id, workspace_id, channel_id)"],
+  ["slack_sync_channels_ts_syntax", TS_SYNTAX],
+  ["slack_sync_channels_workspace_id_check", "CHECK ((workspace_id ~ '^[A-Za-z0-9]+$'::text))"],
+].map(([name, definition]) => ({ name, definition, validated: true }));
+
+/**
+ * Every public function this table owns, by its naming families (`slack_sync_channels_*`,
+ * `slack_channel_*`), with its whole body. Before F2 that is the deleted-binding trigger function
+ * only; a progress or history helper left behind by the fixture would appear here.
+ */
+const PRE_F2_FUNCTIONS = [{
+  name: "slack_sync_channels_clear_deleted_binding", args: "", returns: "trigger", language: "plpgsql",
+  volatility: "v", strict: false, parallel: "u", security_definer: false, returns_set: false, leakproof: false,
+  config: null,
+  source: "\nbegin\n  if new.binding_integration_id is null then\n    new.binding_config_revision := null;\n  end if;\n  return new;\nend;\n",
+}];
+/** Every user trigger on the table. */
+const PRE_F2_TRIGGERS = [{ name: "slack_sync_channels_clear_deleted_binding", function: "slack_sync_channels_clear_deleted_binding", enabled: "O" }];
+
+/**
+ * The isolated runner's URL shape, and nothing else: a loopback host, a port that is present and is
+ * not the shared 5434 service, and the `app_test` database. The error never prints the URL.
+ */
+function requireIsolatedTestUrl(raw: string | undefined): string {
+  const refuse = (): never => {
+    throw new Error("refusing to run: DATABASE_TEST_URL is not the isolated data-mechanics runner's database");
+  };
+  if (!raw) return refuse();
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return refuse();
+  }
+  const loopback = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(parsed.hostname);
+  if (!loopback || parsed.port === "" || parsed.port === "5434" || parsed.pathname !== "/app_test") return refuse();
+  return raw;
+}
+
 /** Literal fixture identity and state. Nothing is generated except the scratch database's name. */
 const TEAM_ID = "5a1b2c3d-4e5f-4a6b-8c7d-0e1f2a3b4c5d";
 const WORKSPACE = "T0UPGRADE1";
@@ -102,8 +246,8 @@ describe("AM-F2 + AC-02 history/segment migration — direct populated pre-F2 up
     "MR-03 introduces history and segment columns on a populated pre-F2 table with one restart of the active lane, and replays exactly",
     async () => {
       const { loadSchema } = await import("@/scripts/pg-load-schema.mjs");
-      const adminUrl = process.env.DATABASE_TEST_URL;
-      if (!adminUrl) throw new Error("DATABASE_TEST_URL required: run through the isolated data-mechanics runner");
+      // Refused BEFORE any connection or database creation.
+      const adminUrl = requireIsolatedTestUrl(process.env.DATABASE_TEST_URL);
       const name = `slackhistory_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
       const admin = new Client({ connectionString: adminUrl });
       await admin.connect();
@@ -160,8 +304,50 @@ describe("AM-F2 + AC-02 history/segment migration — direct populated pre-F2 up
         }
         await c.query(`alter table public.slack_sync_channels ${NEW_COLUMNS.map((column) => `drop column if exists ${column}`).join(", ")}`);
         await c.query(`drop function if exists public.slack_channel_cursor_history_valid(jsonb)`);
-        expect(await catalog(), "fixture: the table is pre-F2 — none of the accepted objects exists before the migration").toEqual({
+        expect(await catalog(), "fixture: none of the accepted objects exists before the migration").toEqual({
           columns: [], historyChecks: [], validator: [],
+        });
+
+        // ── THE EXACT PRE-F2 TABLE, against literal expectations: nothing extra, nothing lost. ──
+        const preF2Catalog = async () => ({
+          columns: (await c.query(
+            `select a.attname as name, pg_catalog.format_type(a.atttypid, a.atttypmod) as type, a.attnotnull as not_null,
+                    pg_catalog.pg_get_expr(d.adbin, d.adrelid) as default_expr,
+                    a.attgenerated::text as generated, a.attidentity::text as identity
+               from pg_catalog.pg_attribute a
+               left join pg_catalog.pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum
+              where a.attrelid = 'public.slack_sync_channels'::regclass and a.attnum > 0 and not a.attisdropped
+              order by a.attname`
+          )).rows,
+          constraints: (await c.query(
+            `select conname as name, pg_catalog.pg_get_constraintdef(oid) as definition, convalidated as validated
+               from pg_catalog.pg_constraint
+              where conrelid = 'public.slack_sync_channels'::regclass and contype <> 'n'
+              order by conname`
+          )).rows,
+          functions: (await c.query(
+            `select p.proname as name, pg_catalog.pg_get_function_identity_arguments(p.oid) as args,
+                    pg_catalog.format_type(p.prorettype, null) as returns, l.lanname as language,
+                    p.provolatile::text as volatility, p.proisstrict as strict, p.proparallel::text as parallel,
+                    p.prosecdef as security_definer, p.proretset as returns_set, p.proleakproof as leakproof,
+                    p.proconfig as config, p.prosrc as source
+               from pg_catalog.pg_proc p
+               join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+               join pg_catalog.pg_language l on l.oid = p.prolang
+              where n.nspname = 'public'
+                and (p.proname like 'slack\\_sync\\_channels\\_%' or p.proname like 'slack\\_channel\\_%')
+              order by p.proname, pg_catalog.pg_get_function_identity_arguments(p.oid)`
+          )).rows,
+          triggers: (await c.query(
+            `select t.tgname as name, p.proname as function, t.tgenabled::text as enabled
+               from pg_catalog.pg_trigger t
+               join pg_catalog.pg_proc p on p.oid = t.tgfoid
+              where t.tgrelid = 'public.slack_sync_channels'::regclass and not t.tgisinternal
+              order by t.tgname`
+          )).rows,
+        });
+        expect(await preF2Catalog(), "fixture: the reconstructed table is EXACTLY the pre-F2 table — columns, constraints, owned functions and triggers").toEqual({
+          columns: PRE_F2_COLUMNS, constraints: PRE_F2_CONSTRAINTS, functions: PRE_F2_FUNCTIONS, triggers: PRE_F2_TRIGGERS,
         });
 
         // ── THE POPULATED PRE-F2 STATE, every value literal. ──
@@ -178,8 +364,8 @@ describe("AM-F2 + AC-02 history/segment migration — direct populated pre-F2 up
            values ($1, $2, $3, 'public', '2026-01-01 00:00:00+00',
                    null, null, null, 0,
                    '1718900500.000000', 'legacy-cursor-1', 3, '1718900100.000100',
-                   false, null, null, null,
-                   null, 2, null, 'historical',
+                   false, null, null, '1718900400.000000',
+                   'metadata-owner-1', 2, null, 'newest',
                    null, 7, null, '2026-01-02 00:00:00+00', 5, 'invocation_budget',
                    '2026-01-01 12:00:00+00', '2025-12-31 00:00:00+00', '2026-01-02 03:04:05+00')`,
           [TEAM_ID, WORKSPACE, CHANNEL]
@@ -195,6 +381,14 @@ describe("AM-F2 + AC-02 history/segment migration — direct populated pre-F2 up
           (await c.query<{ row: unknown }>(`select to_jsonb(t) as row from slack_sync_threads t where team_id = $1 order by root_ts`, [TEAM_ID])).rows.map((r) => r.row);
         const before = await channelRow();
         const threadsBefore = await threadRows();
+        // Nonvacuity: the values whose preservation is asserted below are really there.
+        expect({
+          newest_catchup_upper_ts: before.newest_catchup_upper_ts, metadata_attempt_owner: before.metadata_attempt_owner,
+          next_lane: before.next_lane, claimed_lane: before.claimed_lane, lease_owner: before.lease_owner,
+        }, "fixture: a provisional catch-up top, a metadata owner, and an unclaimed row whose turn is NOT the restarted lane").toEqual({
+          newest_catchup_upper_ts: "1718900400.000000", metadata_attempt_owner: "metadata-owner-1",
+          next_lane: "newest", claimed_lane: null, lease_owner: null,
+        });
 
         // ── THE MIGRATION, applied directly: the real file, read from disk. ──
         const migration = readFileSync(MIGRATION, "utf8");
@@ -202,9 +396,16 @@ describe("AM-F2 + AC-02 history/segment migration — direct populated pre-F2 up
         const onNotice = (notice: { message?: string }): void => {
           notices.push(notice.message ?? "");
         };
-        c.on("notice", onNotice);
-        await c.query(migration);
-        c.removeListener("notice", onNotice);
+        /** One execution of the migration with its notices captured; the listener never outlives it. */
+        const applyMigration = async (): Promise<void> => {
+          c.on("notice", onNotice);
+          try {
+            await c.query(migration);
+          } finally {
+            c.removeListener("notice", onNotice);
+          }
+        };
+        await applyMigration();
 
         // ── THE CATALOG GATE. Today: a named mismatch, the comment-only file created nothing. ──
         expect(await catalog(), "the migration created every accepted history/segment column, both named history CHECKs and the exact validator").toEqual(EXPECTED_CATALOG);
@@ -232,22 +433,18 @@ describe("AM-F2 + AC-02 history/segment migration — direct populated pre-F2 up
         expect(notices, "the Slack block emitted no NOTICE or WARNING on introduction").toEqual([]);
 
         // ── REPLAY: the second execution changes nothing at all. ──
-        c.on("notice", onNotice);
-        await c.query(migration);
-        c.removeListener("notice", onNotice);
+        await applyMigration();
         expect(await catalog(), "replay keeps the same catalog").toEqual(EXPECTED_CATALOG);
         expect(await channelRow(), "replay: the FULL row, updated_at included, is exactly as the first execution left it").toEqual(after);
         expect(await threadRows(), "replay: the thread row is still byte-identical").toEqual(threadsBefore);
         expect(notices, "the Slack block emitted no NOTICE or WARNING on replay").toEqual([]);
       } finally {
         await c.end().catch(() => {});
+        // Cleanup never replaces the primary failure: every step is caught, as the repository precedent does.
         const dropper = new Client({ connectionString: adminUrl });
-        await dropper.connect();
-        try {
-          await dropper.query(`drop database if exists ${name} with (force)`);
-        } finally {
-          await dropper.end().catch(() => {});
-        }
+        await dropper.connect().catch(() => {});
+        await dropper.query(`drop database if exists ${name} with (force)`).catch(() => {});
+        await dropper.end().catch(() => {});
       }
     },
     SCRATCH_TIMEOUT
