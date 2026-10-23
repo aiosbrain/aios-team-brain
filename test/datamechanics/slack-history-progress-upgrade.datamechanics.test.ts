@@ -11,14 +11,14 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  * (accepted consolidated contract `aio1170-am-f2-deep-history-consolidated-accepted-spec-migration-v1-20261023.md`,
  * §3.1, §4, §9, §9.3 MR-02/MR-03/MR-05, §10 DH-11, §10.1 F2-12, §12).
  *
- * TWO DESCRIBES.
+ * THREE DESCRIBES.
  *  - The first, RED PACKET 2's case, was written against the comment-only scaffold. It is GREEN
  *    since the reserved migration `postgres/migrations/20261023120000_slack_channel_history_segments.sql`
  *    gained its executable block. It applies that migration to a populated pre-F2 table and
  *    requires the catalog it creates. Its catalog readers query only `pg_attribute`,
  *    `pg_constraint` and `pg_proc`.
- *  - The second, MR-03 ENTRYPOINT ORDER (packet 6), is described after the first case's notes
- *    below.
+ *  - The second, MR-03 STATEMENT ORDER (packet 6), and the third, MR-03 INTRODUCTION VARIANTS
+ *    (packet 7), are described after the first case's notes below.
  *
  * ON ITS OWN SCRATCH DATABASE, created and dropped here under the isolated data-mechanics URL
  * (`DATABASE_TEST_URL`, provided by `scripts/dm-isolated.sh`), exactly as the existing rollout case in
@@ -92,6 +92,29 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *    exception at all.
  * Row content is compared only by md5 digest, so no cursor or history prints.
  *
+ * MR-03 INTRODUCTION VARIANTS (packet 7, the third describe). These are the two remaining
+ * presence-rule introductions, each under all four statement orders, in independent loader-built
+ * databases with identical literal fixtures:
+ *  - SEGMENT-ONLY, COMMITTING, on an F2-only SCHEMA: both histories, the validator and both history
+ *    CHECKs are present and valid; the six segment/progress columns and both progress CHECKs are
+ *    absent. Every active lane restarts once: an active historical lane with history, both lanes
+ *    under a live newest claim with a cursor-null historical lane, and a MAXIMUM-history lane under
+ *    a live historical claim. Claims on restarted lanes are fenced; an idle row is untouched.
+ *  - ONE-LANE HISTORY-ONLY: initialized segment progress on both lanes, a MAXIMUM newest history
+ *    and three named CHECKs are present; only `historical_cursor_history` is absent. Only anchored
+ *    historical lanes restart, KEEPING their segment bounds and completed-segment aggregate. The
+ *    opposite live newest claim and its maximum history are preserved exactly; a live HISTORICAL
+ *    claim is fenced; idle and newest-only rows are untouched.
+ * For each variant and order:
+ *  - the pre-introduction presence and maximum histories are pinned literally;
+ *  - the first entrypoint commits notice-free with exact literal facts (lane generations, the
+ *    whole lease tuple, cleared lanes, and whether `updated_at` kept its seed);
+ *  - restarted rows are byte-identical outside their PERMITTED restart fields; unrestarted rows
+ *    and thread rows are exact, `updated_at` included;
+ *  - the final Slack catalog equals an untouched loader-built database's catalog exactly;
+ *  - the second entrypoint and replays of both compare COMPLETE rows exactly, and keep that catalog.
+ * Across orders, rows match migration-only with ONLY a restarted row's `updated_at` excepted.
+ *
  * SIBLING RESPONSIBILITIES, not duplicated here. `slack-history-progress-conflicts` owns the
  * migration-path MR-03 / F2-12 edges:
  *  - the union restart's claim/idle edges with planted metadata;
@@ -100,9 +123,9 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *  - every catalog and state conflict.
  * `slack-history-progress-catalog` owns MR-02.
  *
- * WHAT REMAINS for later packets, and is NOT claimed here. Neither describe completes F2-12, DH-11
- * or any MR row. Deferred, explicitly. Items since covered by the siblings or by the order
- * describe above are marked as such.
+ * WHAT REMAINS for later packets, and is NOT claimed here. No describe completes F2-12, DH-11 or any
+ * MR row. Deferred, explicitly. Items since covered by the siblings or by the order and variant
+ * describes above are marked as such.
  *  - MR-02: NOT claimed by this case (it checks only that the two named history CHECKs exist, and
  *    the PRE-F2 constraints exactly). Packet 5 since covered it in siblings:
  *    · `slack-history-progress-conflicts`: exact CHECK definitions and validation, and mirror byte
@@ -116,11 +139,14 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *      and migration replay after progress and maximum histories;
  *    · in the statement-order describe here: statement-level mirror-only execution, both
  *      statement orders, and statement-order replay after progress and maximum histories, for the
- *      populated UNION introduction.
+ *      populated UNION introduction;
+ *    · in the introduction-variants describe here: a COMMITTING segment-only introduction on an
+ *      F2-only SCHEMA, and the one-lane history-only introduction. Each runs under statement-level
+ *      mirror-only and both statement orders, with exact replay.
  *  - MR-03 / F2-12, STILL OPEN:
- *    · a COMMITTING segment-only introduction on an F2-only SCHEMA fixture;
- *    · the statement-level mirror-only and statement-order proofs repeated for the history-only,
- *      segment-only and one-lane introduction states, which only the union introduction has here;
+ *    · progress writes AFTER a variant introduction followed by replay, for the two variants (only
+ *      the union introduction has that here; the history-only variant does begin with progress
+ *      and a maximum history, and preserves them);
  *    · staged-snapshot, published-item and ledger evidence rows (only queued thread rows here);
  *    · the omitted-lease-invalidation mutant, which is not measured;
  *    · the WHOLE `schema.sql` file as the mirror entrypoint: HELD, since only its marked statement
@@ -884,6 +910,366 @@ describe("AM-F2 + AC-02 history/segment block — MR-03 statement order: migrati
           await dropper.end().catch(() => {});
         }
       }
+    },
+    ORDER_TIMEOUT
+  );
+});
+
+// ── MR-03 INTRODUCTION VARIANTS (packet 7): segment-only and one-lane history-only, every statement order ──
+
+/**
+ * The two executable entrypoints, after the same parity proof Packet 6 makes: the MIRROR is
+ * schema.sql's ONE marked DO statement, byte-identical to the migration's own marked statement.
+ */
+function assertedEntrypoints(): (entry: OrderEntry) => string {
+  const migrationSql = readFileSync(MIGRATION, "utf8");
+  const schemaSql = readFileSync(SCHEMA_PATH, "utf8");
+  const migrationStatement = markedStatement(migrationSql);
+  const mirrorStatement = markedStatement(schemaSql);
+  expect({
+    markers: [occurrences(migrationSql, `${MARKER}:begin`), occurrences(migrationSql, `${MARKER}:end`),
+      occurrences(schemaSql, `${MARKER}:begin`), occurrences(schemaSql, `${MARKER}:end`)],
+    oneStatement: mirrorStatement.startsWith("do $slack_channel_history_segments$\n")
+      && mirrorStatement.endsWith("\nend\n$slack_channel_history_segments$;"),
+    dollarTagCount: occurrences(mirrorStatement, "$slack_channel_history_segments$"),
+    identical: mirrorStatement.length > 0 && mirrorStatement === migrationStatement,
+  }, "the mirror entrypoint is schema.sql's ONE marked DO statement, byte-identical to the migration's").toEqual({
+    markers: [1, 1, 1, 1], oneStatement: true, dollarTagCount: 2, identical: true,
+  });
+  return (entry) => (entry === "migration" ? migrationSql : mirrorStatement);
+}
+/** One execution of an entrypoint on `client`, notices captured; failure redacted to its SQLSTATE. */
+async function applyEntrySql(client: Client, sql: string): Promise<{ outcome: string; notices: string[] }> {
+  const notices: string[] = [];
+  const onNotice = (notice: { message?: string }): void => {
+    notices.push(notice.message ?? "");
+  };
+  client.on("notice", onNotice);
+  try {
+    await client.query(sql);
+    return { outcome: "committed", notices };
+  } catch (error) {
+    return { outcome: `refused (${String((error as { code?: unknown })?.code)})`, notices };
+  } finally {
+    client.removeListener("notice", onNotice);
+  }
+}
+/** Each channel row digested WITHOUT the named columns (md5 only). */
+async function digestsExcept(client: Client, excluded: string[]) {
+  return (await client.query<{ channel_id: string; digest: string }>(
+    `select channel_id, pg_catalog.md5((pg_catalog.to_jsonb(s) - $1::text[])::text) as digest
+       from public.slack_sync_channels s order by channel_id collate "C"`, [excluded]
+  )).rows;
+}
+/** Which of the eight accepted columns and four named CHECKs exist, plus the validator count. */
+async function introductionPresence(client: Client) {
+  return {
+    columns: (await client.query<{ name: string }>(
+      `select attname as name from pg_catalog.pg_attribute
+        where attrelid = 'public.slack_sync_channels'::regclass and attnum > 0 and not attisdropped and attname = any($1::text[])
+        order by attname collate "C"`, [NEW_COLUMNS]
+    )).rows.map((row) => row.name),
+    checks: (await client.query<{ name: string }>(
+      `select conname as name from pg_catalog.pg_constraint
+        where conrelid = 'public.slack_sync_channels'::regclass and conname = any($1::text[]) order by conname collate "C"`,
+      [["slack_sync_channels_historical_cursor_history_check", "slack_sync_channels_historical_progress_check",
+        "slack_sync_channels_newest_cursor_history_check", "slack_sync_channels_newest_progress_check"]]
+    )).rows.map((row) => row.name),
+    validators: (await client.query<{ n: number }>(
+      `select pg_catalog.count(*)::int as n from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+        where n.nspname = 'public' and p.proname = 'slack_channel_cursor_history_valid'`
+    )).rows[0].n,
+  };
+}
+/** Exact restart/fence facts per row: lane generations, the whole lease tuple, cleared lanes, seeded updated_at. */
+async function variantFacts(client: Client) {
+  return (await client.query(
+    `select channel_id, newest_scan_generation::int as newest_generation, historical_scan_generation::int as historical_generation,
+            lease_generation::int as lease_generation, next_lane, claimed_lane, lease_owner, lease_expires_at::text as lease_expires_at,
+            (newest_cursor is null and newest_cursor_history = '[]'::jsonb) as newest_cleared,
+            (historical_cursor is null and historical_cursor_history = '[]'::jsonb and historical_oldest_seen_ts is null) as historical_cleared,
+            updated_at = $1::timestamptz as updated_at_seeded
+       from public.slack_sync_channels order by channel_id collate "C"`, [ORDER_SEEDED_UPDATED_AT]
+  )).rows;
+}
+/** A stored history's serialized bytes and entry count; `column` is one of two literal names, never input. */
+async function storedHistorySize(client: Client, channel: string, column: "newest_cursor_history" | "historical_cursor_history") {
+  return (await client.query<{ bytes: number; entries: number }>(
+    `select pg_catalog.octet_length(${column}::text) as bytes, pg_catalog.jsonb_array_length(${column}) as entries
+       from public.slack_sync_channels where channel_id = $1`, [channel]
+  )).rows[0];
+}
+
+/** One schema-introduction variant: how its pre-introduction state is built, and its exact literal outcome. */
+interface IntroductionVariant {
+  label: string;
+  /** Fixture DDL turning the loader's full schema into the variant's pre-introduction schema. */
+  strip: string[];
+  /** Whether the literal rows are written BEFORE the strip DDL (true) or after it (false). */
+  insertBeforeStrip: boolean;
+  channels: Array<Record<string, unknown>>;
+  /** The pre-introduction presence, literally. */
+  presence: { columns: string[]; checks: string[]; validators: number };
+  /** Maximum histories present before introduction, and those that must still be present after it. */
+  maxBefore: Array<[string, "newest_cursor_history" | "historical_cursor_history"]>;
+  maxAfter: Array<[string, "newest_cursor_history" | "historical_cursor_history"]>;
+  restarted: Set<string>;
+  /** The ONLY columns a restarted row may change; every other column must be byte-identical. */
+  permitted: string[];
+  /** The columns this introduction adds (absent before, so excluded from before/after digests). */
+  introduced: string[];
+  facts: Array<Record<string, unknown>>;
+}
+
+const SEGMENT_COLUMNS = NEW_COLUMNS.filter((column) => !column.endsWith("_cursor_history"));
+const BOTH_LANE_RESTART_FIELDS = [
+  "newest_cursor", "newest_cursor_history", "newest_scan_generation",
+  "historical_cursor", "historical_cursor_history", "historical_scan_generation", "historical_oldest_seen_ts",
+  "claimed_lane", "lease_owner", "lease_expires_at", "lease_generation", "next_lane", "updated_at",
+];
+const HISTORICAL_RESTART_FIELDS = [
+  "historical_cursor", "historical_cursor_history", "historical_scan_generation", "historical_oldest_seen_ts",
+  "claimed_lane", "lease_owner", "lease_expires_at", "lease_generation", "next_lane", "updated_at",
+];
+const variantRow = (row: Record<string, unknown>): Record<string, unknown> =>
+  ({ team_id: ORDER_TEAM_ID, workspace_id: ORDER_WORKSPACE, updated_at: ORDER_SEEDED_UPDATED_AT, ...row });
+const LIVE = "2030-01-01 00:00:00+00";
+const fact = (channel: string, newest: number, historical: number, lease: number, next: string,
+  claim: { lane: string | null; owner: string | null; expires: string | null }, newestCleared: boolean, historicalCleared: boolean, seeded: boolean) => ({
+  channel_id: channel, newest_generation: newest, historical_generation: historical, lease_generation: lease, next_lane: next,
+  claimed_lane: claim.lane, lease_owner: claim.owner, lease_expires_at: claim.expires,
+  newest_cleared: newestCleared, historical_cleared: historicalCleared, updated_at_seeded: seeded,
+});
+const NO_CLAIM = { lane: null, owner: null, expires: null };
+
+/**
+ * SEGMENT-ONLY introduction on an F2-only SCHEMA. Both histories, the validator and both history
+ * CHECKs exist and are valid; the six segment/progress columns and both progress CHECKs are absent.
+ * Both lanes' segment units are absent, so EVERY active lane restarts, including the
+ * maximum-history lane and the cursor-null live claim.
+ */
+const segmentOnlyVariant = (historicalMax: string[]): IntroductionVariant => ({
+  label: "segment_only",
+  strip: [`alter table public.slack_sync_channels ${SEGMENT_COLUMNS.map((column) => `drop column ${column}`).join(", ")}`],
+  insertBeforeStrip: false,
+  channels: [
+    { id: "0f000000-0000-4000-8000-0000000000b1", channel_id: "C0SEGONLY001", historical_anchor_ts: "1718900500.000000",
+      historical_cursor: "syn-seg-h-2", historical_cursor_history: JSON.stringify(["syn-seg-h-1", "syn-seg-h-2"]), historical_scan_generation: 3,
+      historical_oldest_seen_ts: "1718900100.000100", lease_generation: 7, next_lane: "newest", attempts: 3, last_error_code: "rate_limited",
+      due_at: "2026-01-02 00:00:00+00", created_at: "2025-12-31 00:00:00+00" },
+    { id: "0f000000-0000-4000-8000-0000000000b2", channel_id: "C0SEGONLY002", newest_anchor_ts: "1718900800.000000",
+      newest_lower_ts: "1718900700.000000", newest_cursor: "syn-seg-n-1", newest_cursor_history: JSON.stringify(["syn-seg-n-1"]),
+      newest_scan_generation: 5, historical_anchor_ts: "1718900500.000000", historical_scan_generation: 4,
+      claimed_lane: "newest", lease_owner: "lease-seg-r2", lease_expires_at: LIVE, lease_generation: 21, next_lane: "historical",
+      due_at: "2026-01-05 00:00:00+00", created_at: "2025-12-30 00:00:00+00" },
+    { id: "0f000000-0000-4000-8000-0000000000b3", channel_id: "C0SEGONLY003", lease_generation: 4, next_lane: "historical",
+      due_at: "2026-01-06 00:00:00+00", created_at: "2025-12-29 00:00:00+00" },
+    { id: "0f000000-0000-4000-8000-0000000000b4", channel_id: "C0SEGONLY004", historical_anchor_ts: "1718900500.000000",
+      historical_cursor: historicalMax[999], historical_cursor_history: JSON.stringify(historicalMax), historical_scan_generation: 2,
+      claimed_lane: "historical", lease_owner: "lease-seg-r4", lease_expires_at: LIVE, lease_generation: 11, next_lane: "newest",
+      due_at: "2026-01-07 00:00:00+00", created_at: "2025-12-28 00:00:00+00" },
+  ].map(variantRow),
+  presence: {
+    columns: ["historical_cursor_history", "newest_cursor_history"],
+    checks: ["slack_sync_channels_historical_cursor_history_check", "slack_sync_channels_newest_cursor_history_check"],
+    validators: 1,
+  },
+  maxBefore: [["C0SEGONLY004", "historical_cursor_history"]],
+  maxAfter: [],
+  restarted: new Set(["C0SEGONLY001", "C0SEGONLY002", "C0SEGONLY004"]),
+  permitted: BOTH_LANE_RESTART_FIELDS,
+  introduced: SEGMENT_COLUMNS,
+  facts: [
+    fact("C0SEGONLY001", 0, 4, 7, "newest", NO_CLAIM, true, true, false),
+    fact("C0SEGONLY002", 6, 5, 22, "newest", NO_CLAIM, true, true, false),
+    fact("C0SEGONLY003", 0, 0, 4, "historical", NO_CLAIM, true, true, true),
+    fact("C0SEGONLY004", 0, 3, 12, "historical", NO_CLAIM, true, true, false),
+  ],
+});
+
+/**
+ * One-lane HISTORY-ONLY introduction. Every segment/progress column, the newest history, the
+ * validator and three named CHECKs exist with valid initialized progress, including a MAXIMUM
+ * newest history; only `historical_cursor_history` (with its CHECK) is absent. ONLY anchored
+ * historical lanes restart, keeping their segment bounds and aggregate. The opposite newest live
+ * claim and its maximum history are preserved exactly, and a live HISTORICAL claim is fenced.
+ */
+const historyOnlyVariant = (newestMax: string[]): IntroductionVariant => ({
+  label: "history_only",
+  strip: ["alter table public.slack_sync_channels drop column historical_cursor_history"],
+  insertBeforeStrip: true,
+  channels: [
+    { id: "0f000000-0000-4000-8000-0000000000c1", channel_id: "C0HISONLY001",
+      newest_anchor_ts: "1718900800.000000", newest_lower_ts: "1718900700.000000", newest_request_lower_ts: "1718900640.000000",
+      newest_segment_lower_ts: "1718900640.000000", newest_segment_upper_ts: "1718900800.000000",
+      newest_cursor: newestMax[999], newest_cursor_history: JSON.stringify(newestMax), newest_scan_generation: 7,
+      historical_anchor_ts: "1718900500.000000", historical_segment_lower_ts: "0.000000", historical_segment_upper_ts: "1718900300.000000",
+      historical_completed_segments_oldest_ts: "1718900350.5", historical_oldest_seen_ts: "1718900250.000100",
+      historical_cursor: "syn-his-h-1", historical_cursor_history: JSON.stringify(["syn-his-h-1"]), historical_scan_generation: 3,
+      claimed_lane: "newest", lease_owner: "lease-his-r1", lease_expires_at: LIVE, lease_generation: 31, next_lane: "historical",
+      due_at: "2026-01-02 00:00:00+00", created_at: "2025-12-31 00:00:00+00" },
+    { id: "0f000000-0000-4000-8000-0000000000c2", channel_id: "C0HISONLY002",
+      historical_anchor_ts: "1718900500.000000", historical_segment_lower_ts: "1718900100.000000", historical_segment_upper_ts: "1718900300.000000",
+      historical_oldest_seen_ts: "1718900200.000000", historical_cursor: "syn-his-h-2",
+      historical_cursor_history: JSON.stringify(["syn-his-h-0", "syn-his-h-2"]), historical_scan_generation: 2,
+      claimed_lane: "historical", lease_owner: "lease-his-r2", lease_expires_at: LIVE, lease_generation: 41, next_lane: "newest",
+      due_at: "2026-01-05 00:00:00+00", created_at: "2025-12-30 00:00:00+00" },
+    { id: "0f000000-0000-4000-8000-0000000000c3", channel_id: "C0HISONLY003", lease_generation: 4, next_lane: "historical",
+      due_at: "2026-01-06 00:00:00+00", created_at: "2025-12-29 00:00:00+00" },
+    { id: "0f000000-0000-4000-8000-0000000000c4", channel_id: "C0HISONLY004",
+      newest_anchor_ts: "1718900800.000000", newest_lower_ts: "1718900700.000000", newest_request_lower_ts: "1718900640.000000",
+      newest_segment_lower_ts: "1718900640.000000", newest_segment_upper_ts: "1718900800.000000", newest_scan_generation: 2,
+      lease_generation: 5, next_lane: "newest", due_at: "2026-01-07 00:00:00+00", created_at: "2025-12-28 00:00:00+00" },
+  ].map(variantRow),
+  presence: {
+    columns: NEW_COLUMNS.filter((column) => column !== "historical_cursor_history"),
+    checks: ["slack_sync_channels_historical_progress_check", "slack_sync_channels_newest_cursor_history_check", "slack_sync_channels_newest_progress_check"],
+    validators: 1,
+  },
+  maxBefore: [["C0HISONLY001", "newest_cursor_history"]],
+  maxAfter: [["C0HISONLY001", "newest_cursor_history"]],
+  restarted: new Set(["C0HISONLY001", "C0HISONLY002"]),
+  permitted: HISTORICAL_RESTART_FIELDS,
+  introduced: ["historical_cursor_history"],
+  facts: [
+    fact("C0HISONLY001", 7, 4, 31, "historical", { lane: "newest", owner: "lease-his-r1", expires: LIVE }, false, true, false),
+    fact("C0HISONLY002", 0, 3, 42, "historical", NO_CLAIM, true, true, false),
+    fact("C0HISONLY003", 0, 0, 4, "historical", NO_CLAIM, true, true, true),
+    fact("C0HISONLY004", 2, 0, 5, "newest", NO_CLAIM, true, true, true),
+  ],
+});
+
+/**
+ * Run one variant through all four statement orders, each in its own loader-built database
+ * seeded with the variant's identical literal fixture. A fifth, untouched loader-built database
+ * supplies the exact accepted final Slack catalog.
+ */
+async function runIntroductionVariant(variant: IntroductionVariant): Promise<void> {
+  const { loadSchema } = await import("@/scripts/pg-load-schema.mjs");
+  const sqlFor = assertedEntrypoints();
+  const created: Array<{ adminUrl: string; name: string }> = [];
+  const newLoadedScratch = async (role: string): Promise<string> => {
+    const name = `slackvar_${variant.label}_${role}_${randomUUID().replace(/-/g, "").slice(0, 8)}`;
+    // The shared guard refuses BEFORE any connection or database creation.
+    const scratch = await createIsolatedScratchDatabase(name);
+    created.push({ adminUrl: scratch.adminUrl, name });
+    await loadSchema({ cwd: process.cwd(), databaseUrl: scratch.url, logger: { log: () => {} } });
+    return scratch.url;
+  };
+  const runs: Record<string, { logical: unknown; catalog: unknown }> = {};
+  try {
+    // ── The exact accepted final catalog, from an untouched loader-built database. ──
+    const referenceUrl = await newLoadedScratch("reference");
+    const referenceCatalog = await (async () => {
+      const referenceClient = new Client({ connectionString: referenceUrl });
+      await referenceClient.connect();
+      try {
+        return await slackCatalog(referenceClient);
+      } finally {
+        await referenceClient.end().catch(() => {});
+      }
+    })();
+    expect({ lines: referenceCatalog.lines.length > 0, checks: referenceCatalog.checks.length, validators: referenceCatalog.validator.length },
+      `${variant.label}: the reference loader catalog is non-empty, with four named CHECKs and one validator`).toEqual({ lines: true, checks: 4, validators: 1 });
+
+    for (const [label, first, second] of [
+      ["migration_only", "migration", "migration"],
+      ["mirror_only", "mirror", "mirror"],
+      ["mirror_then_migration", "mirror", "migration"],
+      ["migration_then_mirror", "migration", "mirror"],
+    ] as Array<[string, OrderEntry, OrderEntry]>) {
+      const run = `${variant.label}/${label}`;
+      const c = new Client({ connectionString: await newLoadedScratch(label) });
+      await c.connect();
+      try {
+        await c.query("set time zone 'UTC'");
+        // ── The identical literal pre-introduction fixture. ──
+        await orderFixture(c, `insert into teams (id, slug, name) values ($1, 'variant-team', 'Variant Team')`, [ORDER_TEAM_ID]);
+        if (!variant.insertBeforeStrip) for (const ddl of variant.strip) await c.query(ddl);
+        for (const row of variant.channels) await insertLiteralRow(c, "slack_sync_channels", row);
+        for (const row of ORDER_THREADS) await insertLiteralRow(c, "slack_sync_threads", row);
+        if (variant.insertBeforeStrip) for (const ddl of variant.strip) await c.query(ddl);
+        expect(await introductionPresence(c), `${run} fixture: the pre-introduction schema is exactly the variant's`).toEqual(variant.presence);
+        for (const [channel, column] of variant.maxBefore) {
+          expect(await storedHistorySize(c, channel, column), `${run} fixture: a maximum history is stored before introduction`).toEqual({ bytes: 1048576, entries: 1000 });
+        }
+        const seeded = await orderEvidence(c);
+        const seededPreserved = await digestsExcept(c, [...variant.permitted, ...variant.introduced]);
+        const seededComplete = await digestsExcept(c, variant.introduced);
+
+        // ── FIRST entrypoint: the variant's one-time introduction. ──
+        expect(await applyEntrySql(c, sqlFor(first)), `${run}: the first entrypoint (${first}) commits with no NOTICE`).toEqual({ outcome: "committed", notices: [] });
+        expect(await variantFacts(c), `${run}: exact restart/fence facts; updated_at moved ONLY on the restarted rows`).toEqual(variant.facts);
+        const introducedPreserved = await digestsExcept(c, [...variant.permitted, ...variant.introduced]);
+        const introducedComplete = await digestsExcept(c, variant.introduced);
+        expect({
+          restarted: introducedPreserved.filter((row) => variant.restarted.has(row.channel_id)),
+          unrestarted: introducedComplete.filter((row) => !variant.restarted.has(row.channel_id)),
+        }, `${run}: restarted rows changed ONLY permitted fields; unrestarted rows are exactly as seeded, updated_at included`).toEqual({
+          restarted: seededPreserved.filter((row) => variant.restarted.has(row.channel_id)),
+          unrestarted: seededComplete.filter((row) => !variant.restarted.has(row.channel_id)),
+        });
+        for (const [channel, column] of variant.maxAfter) {
+          expect(await storedHistorySize(c, channel, column), `${run}: the preserved maximum history is still exactly the maximum`).toEqual({ bytes: 1048576, entries: 1000 });
+        }
+        const introduced = await orderEvidence(c);
+        expect(introduced.threads, `${run}: the thread rows are exactly as seeded`).toEqual(seeded.threads);
+        expect(await slackCatalog(c), `${run}: the final Slack catalog is exactly the accepted loader catalog`).toEqual(referenceCatalog);
+
+        // ── SECOND entrypoint, then replays of both: complete rows exact, updated_at included. ──
+        for (const [step, entry] of [["second", second], ["replay", first], ["replay", second]] as Array<[string, OrderEntry]>) {
+          expect(await applyEntrySql(c, sqlFor(entry)), `${run}: ${step} ${entry} commits with no NOTICE`).toEqual({ outcome: "committed", notices: [] });
+          expect(exactRows(await orderEvidence(c)), `${run}: after the ${step} ${entry}, every channel and thread row is exact, updated_at included`).toEqual(exactRows(introduced));
+          expect(await slackCatalog(c), `${run}: after the ${step} ${entry}, the Slack catalog is still the accepted one`).toEqual(referenceCatalog);
+        }
+        runs[label] = {
+          logical: {
+            channels: introduced.channels.map((row) => ({
+              channel_id: row.channel_id, digest: variant.restarted.has(row.channel_id) ? row.without_updated_at : row.full_row,
+            })),
+            threads: introduced.threads,
+          },
+          catalog: await slackCatalog(c),
+        };
+      } finally {
+        await c.end().catch(() => {});
+      }
+    }
+
+    // ── ACROSS the four independent databases: restarted rows differ ONLY in clock-varying updated_at. ──
+    for (const label of ["mirror_only", "mirror_then_migration", "migration_then_mirror"]) {
+      expect(runs[label].catalog, `${variant.label}: ${label} vs migration_only, identical Slack catalog`).toEqual(runs.migration_only.catalog);
+      expect(runs[label].logical,
+        `${variant.label}: ${label} vs migration_only, identical channel and thread rows (restarted rows differ ONLY in updated_at)`).toEqual(runs.migration_only.logical);
+    }
+  } finally {
+    // Cleanup never replaces the primary failure: every step is caught, as the repository precedent does.
+    for (const { adminUrl, name } of created) {
+      const dropper = new Client({ connectionString: adminUrl });
+      await dropper.connect().catch(() => {});
+      await dropper.query(`drop database if exists ${name} with (force)`).catch(() => {});
+      await dropper.end().catch(() => {});
+    }
+  }
+}
+
+describe("AM-F2 + AC-02 history/segment block — MR-03 introduction variants under every statement order (real Postgres)", () => {
+  it(
+    "MR-03 a committing segment-only introduction on an F2-only schema restarts every active lane once, under every statement order, and replays exactly",
+    async () => {
+      const historicalMax = orderMaxHistory("s");
+      expect([historicalMax.length, jsonbTextBytes(historicalMax)], "fixture: the maximum history is 1,000 entries of exactly 1,048,576 bytes").toEqual([1000, 1048576]);
+      await runIntroductionVariant(segmentOnlyVariant(historicalMax));
+    },
+    ORDER_TIMEOUT
+  );
+
+  it(
+    "MR-03 a one-lane history-only introduction restarts only historical lanes, preserving progress, the opposite live claim and its maximum history, under every statement order",
+    async () => {
+      const newestMax = orderMaxHistory("m");
+      expect([newestMax.length, jsonbTextBytes(newestMax)], "fixture: the maximum history is 1,000 entries of exactly 1,048,576 bytes").toEqual([1000, 1048576]);
+      await runIntroductionVariant(historyOnlyVariant(newestMax));
     },
     ORDER_TIMEOUT
   );
