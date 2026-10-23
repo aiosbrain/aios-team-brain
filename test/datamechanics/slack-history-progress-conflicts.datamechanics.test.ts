@@ -208,8 +208,10 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *  - MR-04 refusals not yet exercised:
  *    · whole-schema (full-loader) refusal for the REST of the matrix (only a representative five
  *      run through the real loader);
- *    · mirror twins of the B5/B6 replay-time and B7 cases are already in place, since those run
- *      through both entrypoints;
+ *    · (not missing, for clarity: the B5/B6 replay-time cases run through both the migration and
+ *      the marked mirror. Of the B7 cases, only cancellation does; concurrency uses two migration
+ *      executions, and the later-query retry starts from the complete loader, then uses migration
+ *      failure and migration retry, as itemized above);
  *    · identity metadata (not representable on PostgreSQL 16; see above).
  *  - DH-11: the §9 named tests in the source-fences/upgrade files, including renaming the legacy
  *    three-column replay test to `re-adds the three legacy metadata/provisional columns without
