@@ -10,7 +10,8 @@
 -- at this red checkpoint. The file exists so that direct-upgrade red evidence fails on missing
 -- catalog and state effects with the file readable, never on file access or parsing (MR-05).
 --
--- This scaffold is NOT a completed migration. It must be replaced by the full reviewed
--- implementation before any green checkpoint or publication. Ownership: PR714 owns this file and
+-- This scaffold is NOT a completed migration. Its full reviewed executable body must be present
+-- before the migration / DH-11 / MR-01–MR-05 green checkpoint, and before any publication. Earlier
+-- packets that are green only for the pure helpers do not need it. Ownership: PR714 owns this file and
 -- the bounded Slack history/segment block it will carry; PR743 retains Drive schema/migrations and
 -- the loader/pool. Nothing here is wired or activated.

@@ -35,12 +35,17 @@ export interface SlackSegment {
  * The upper half of a non-singleton segment after a capacity, unrepresentable-cursor or actual
  * `invalid_cursor` refusal: `M = floor((S+U)/2)`, next `[M+1, U]`. A message at `M` stays in the
  * older remainder; one at `M+1` belongs to the upper half. `U` never moves. `null` for a singleton
- * (`S >= U`), which cannot be divided.
+ * (`S = U`), which cannot be divided.
  *
- * Bounds are nonnegative ticks, so `bigint` division (which truncates) is exactly `floor`.
+ * A negative or inverted segment is corrupt state, not a singleton: it throws a static
+ * `RangeError` rather than reading as "nothing left to divide". With nonnegative bounds, `bigint`
+ * division (which truncates) is exactly `floor`.
  */
 export function splitSlackSegment(segment: SlackSegment): SlackSegment | null {
-  if (segment.lower >= segment.upper) return null;
+  if (segment.lower < ZERO || segment.upper < ZERO || segment.lower > segment.upper) {
+    throw new RangeError("slack history segment: invalid segment bounds");
+  }
+  if (segment.lower === segment.upper) return null;
   const midpoint = (segment.lower + segment.upper) / TWO;
   return { lower: midpoint + ONE, upper: segment.upper };
 }
@@ -48,11 +53,20 @@ export function splitSlackSegment(segment: SlackSegment): SlackSegment | null {
 /**
  * The next segment after a GENUINELY TERMINAL response finished `[S, U]` inside an envelope whose
  * lower bound is `envelopeLower` (L): `W = U − S + 1`, next `[max(L, S − 2W), S − 1]` — adjacent,
- * older, and up to twice the width that just fitted. `null` when `S <= L`: the whole envelope is
+ * older, and up to twice the width that just fitted. `null` when `S = L`: the whole envelope is
  * finished, and only then may the lane's certification rules apply.
+ *
+ * A negative bound, an inverted completed segment, or a completed segment that starts BELOW the
+ * envelope lower is corrupt state, never completion: it throws a static `RangeError`.
  */
 export function nextSlackSegmentAfterTerminal(envelopeLower: bigint, completed: SlackSegment): SlackSegment | null {
-  if (completed.lower <= envelopeLower) return null;
+  if (
+    envelopeLower < ZERO || completed.lower < ZERO || completed.upper < ZERO ||
+    completed.lower > completed.upper || completed.lower < envelopeLower
+  ) {
+    throw new RangeError("slack history segment: invalid completed segment");
+  }
+  if (completed.lower === envelopeLower) return null;
   const width = completed.upper - completed.lower + ONE;
   const doubled = completed.lower - TWO * width;
   return {

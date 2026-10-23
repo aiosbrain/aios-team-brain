@@ -234,6 +234,15 @@ describe("DH-04 exact segment arithmetic — midpoint split, adjacent doubling, 
     expect(splitSlackSegment(segment)).toEqual(expected);
   });
 
+  // Corrupt shapes are REFUSED, never read as a singleton: only lower = upper means "cannot divide".
+  it.each<[string, SlackSegment]>([
+    ["an inverted segment", { lower: 5n, upper: 4n }],
+    ["a negative lower bound", { lower: -1n, upper: 4n }],
+    ["a negative upper bound", { lower: -2n, upper: -1n }],
+  ])("DH-04 split refuses %s with a static RangeError", (_label, segment) => {
+    expect(() => splitSlackSegment(segment)).toThrow(new RangeError("slack history segment: invalid segment bounds"));
+  });
+
   it.each<[string, bigint, SlackSegment, SlackSegment | null]>([
     ["after [100, 109] (W = 10): the adjacent older segment has width 2W", 0n, { lower: 100n, upper: 109n }, { lower: 80n, upper: 99n }],
     ["after the upper half [64, 127] (W = 64): clamped at L = 0", 0n, { lower: 64n, upper: 127n }, { lower: 0n, upper: 63n }],
@@ -245,6 +254,27 @@ describe("DH-04 exact segment arithmetic — midpoint split, adjacent doubling, 
       0n, { lower: SLACK_SEGMENT_MAX_TICKS - 9n, upper: SLACK_SEGMENT_MAX_TICKS },
       { lower: SLACK_SEGMENT_MAX_TICKS - 29n, upper: SLACK_SEGMENT_MAX_TICKS - 10n }],
   ])("DH-04 next segment: %s", (_label, envelopeLower, completed, expected) => {
+    expect(nextSlackSegmentAfterTerminal(envelopeLower, completed)).toEqual(expected);
+  });
+
+  // Corrupt shapes are REFUSED, never read as a finished envelope: only completed.lower = L means "done".
+  it.each<[string, bigint, SlackSegment]>([
+    ["a completed segment that starts below the envelope lower", 10n, { lower: 5n, upper: 20n }],
+    ["an inverted completed segment", 0n, { lower: 20n, upper: 10n }],
+    ["a negative envelope lower", -1n, { lower: 10n, upper: 20n }],
+    ["a negative completed lower bound", 0n, { lower: -5n, upper: 20n }],
+    ["a negative completed upper bound", -10n, { lower: -5n, upper: -1n }],
+  ])("DH-04 next segment refuses %s with a static RangeError", (_label, envelopeLower, completed) => {
+    expect(() => nextSlackSegmentAfterTerminal(envelopeLower, completed)).toThrow(new RangeError("slack history segment: invalid completed segment"));
+  });
+
+  it("DH-04 next segment at the refusal boundary: a completed segment starting exactly at the envelope lower finishes it", () => {
+    expect(nextSlackSegmentAfterTerminal(10n, { lower: 10n, upper: 20n })).toBeNull();
+  });
+
+  it.each<[string, bigint, SlackSegment, SlackSegment | null]>([
+    ["one tick above the envelope lower: the adjacent older range is just the lower singleton", 10n, { lower: 11n, upper: 20n }, { lower: 10n, upper: 10n }],
+  ])("DH-04 next segment at the refusal boundary: %s", (_label, envelopeLower, completed, expected) => {
     expect(nextSlackSegmentAfterTerminal(envelopeLower, completed)).toEqual(expected);
   });
 
@@ -280,6 +310,20 @@ describe("DH-04 exact segment arithmetic — midpoint split, adjacent doubling, 
     ["no fraction at all", "1718900000", null],
     ["past the largest supported second", "253402300800.000000", null],
     ["text that is not a timestamp", "not-a-ts", null],
+    // Parity with the shared exact parser: strictly positive seconds, the exact grammar, nothing around it.
+    ["a zero-second instant with a six-digit fraction", "0.000001", null],
+    ["a zero-second instant with a short fraction", "0.1", null],
+    ["zero itself", "0.000000", null],
+    ["a leading plus sign", "+1718900000.1", null],
+    ["a leading minus sign", "-1718900000.1", null],
+    ["leading whitespace", " 1718900000.1", null],
+    ["trailing whitespace", "1718900000.1 ", null],
+    ["a trailing newline", "1718900000.1\n", null],
+    ["no seconds before the dot", ".5", null],
+    ["no fraction after the dot", "1.", null],
+    ["an exponent", "1718900000.1e3", null],
+    ["an empty string", "", null],
+    ["the smallest positive second, as a positive control", "1.000000", 1_000_000n],
   ])("DH-04 provider timestamp ticks: %s", (_label, ts, expected) => {
     expect(slackTimestampTicks(ts)).toBe(expected);
   });
