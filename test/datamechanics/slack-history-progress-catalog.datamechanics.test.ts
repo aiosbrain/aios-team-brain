@@ -1,9 +1,9 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { accessSync, constants, readdirSync, readFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { promisify } from "node:util";
 import { Client } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -68,13 +68,25 @@ import { filterRestoreList } from "../../scripts/staging-ops/pg-paired.mjs";
  * `check-constraint-dump-roundtrip` re-parses every public CHECK's deparsed text. This file adds
  * the AIO-1170-specific exact reads and the REAL dump/restore those do not perform.
  *
- * TOOLCHAIN. `pg_dump`/`pg_restore` must be on PATH at a major version ≥ the server's (pg_dump
- * refuses a newer server). CI's datamechanics job installs `postgresql-client-16` against the
- * `postgres:16` service. The isolated runner (`scripts/dm-isolated.sh`) runs vitest on the host,
- * so the host needs PostgreSQL ≥ 16 client tools. The test asserts this precondition by name
- * before dumping, so a missing tool fails as a stated precondition, not as evidence. PG* variables
- * are scrubbed from the child environment, and the archive lives in a disposable temp directory
- * removed afterwards.
+ * TOOLCHAIN. pg_dump refuses a server newer than itself, so the test resolves ONE compatible
+ * client pair before dumping. It follows `scripts/staging-refresh.sh`'s discipline (explicit pin,
+ * Homebrew keg, PATH), tightened so that no incompatible pair is ever used:
+ *  - `PG_BIN`, when set, is the only candidate: an explicit pin is honored or refused, never
+ *    silently overridden;
+ *  - otherwise each PATH directory is tried, in PATH order;
+ *  - then each INSTALLED Homebrew versioned keg (`/opt/homebrew/opt/postgresql@N/bin`, or
+ *    `/usr/local/opt/...` on Intel) with N ≥ the server's major, ascending.
+ *  A candidate qualifies only if the SAME directory holds both `pg_dump` and `pg_restore`, both
+ *  report the same major, and that major is ≥ the server's. The first qualifying pair is used for
+ *  every dump/restore call. An incompatible pair, such as PostgreSQL 14 tools first on PATH against
+ *  the 16 server, is recorded and skipped, never used. Discovery is offline: no download, install
+ *  or network.
+ * If nothing qualifies, a named precondition fails, listing every directory and major it examined:
+ * a missing or old toolchain is a stated precondition, not evidence. CI's datamechanics job
+ * installs `postgresql-client-16` (on PATH) against the `postgres:16` service. The isolated runner
+ * (`scripts/dm-isolated.sh`) runs vitest on the host, which may carry an older PATH pair beside a
+ * Homebrew `postgresql@16+` keg. PG* variables are scrubbed from every child environment, and the
+ * archive lives in a disposable temp directory removed afterwards.
  *
  * PRIVACY. Rows hold only synthetic cursor/history values, and rows are compared only by md5
  * digest. A failing tool is reported with its exit code and its `error:` lines only, with database
@@ -158,9 +170,80 @@ async function runTool(tool: string, args: string[]): Promise<string> {
   }
 }
 const toolMajor = async (tool: string): Promise<number | null> => {
-  const match = /\(PostgreSQL\)\s+(\d+)/.exec(await runTool(tool, ["--version"]));
-  return match ? Number(match[1]) : null;
+  try {
+    const match = /\(PostgreSQL\)\s+(\d+)/.exec(await runTool(tool, ["--version"]));
+    return match ? Number(match[1]) : null;
+  } catch {
+    return null;
+  }
 };
+
+/** One pg_dump/pg_restore PAIR from a single bin directory, with both reported majors. */
+interface PgClientPair {
+  bin: string;
+  source: string;
+  dumpMajor: number;
+  restoreMajor: number;
+}
+const isExecutable = (file: string): boolean => {
+  try {
+    accessSync(file, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+};
+/**
+ * Candidate bin directories, in the order they are tried, after `scripts/staging-refresh.sh`'s
+ * client discipline:
+ *  - `PG_BIN` when set is an explicit pin and the ONLY candidate (never silently overridden);
+ *  - else every PATH directory, in PATH order;
+ *  - else every INSTALLED Homebrew versioned keg (`/opt/homebrew/opt` or `/usr/local/opt`,
+ *    `postgresql@N` with N ≥ the server's major), ascending, so an exact server-major keg comes
+ *    first.
+ * Bounded and offline: two directory listings, no download, no install, no network.
+ */
+function candidateBins(serverMajor: number): Array<{ bin: string; source: string }> {
+  const pinned = process.env.PG_BIN;
+  if (pinned) return [{ bin: pinned, source: "PG_BIN" }];
+  const candidates = (process.env.PATH ?? "").split(delimiter).filter(Boolean).map((bin) => ({ bin, source: "PATH" }));
+  for (const prefix of ["/opt/homebrew/opt", "/usr/local/opt"]) {
+    let entries: string[] = [];
+    try {
+      entries = readdirSync(prefix);
+    } catch {
+      continue;
+    }
+    const majors = entries
+      .map((entry) => /^postgresql@(\d+)$/.exec(entry))
+      .flatMap((match) => (match ? [Number(match[1])] : []))
+      .filter((major) => major >= serverMajor)
+      .sort((a, b) => a - b);
+    for (const major of majors) candidates.push({ bin: join(prefix, `postgresql@${major}`, "bin"), source: `Homebrew postgresql@${major}` });
+  }
+  return candidates;
+}
+/**
+ * The FIRST candidate directory holding BOTH executables whose reported majors are equal and ≥ the
+ * server's. An incompatible pair is recorded and skipped, never used. `examined` lists every pair
+ * that was inspected (directory and majors only), for the precondition's failure message.
+ */
+async function resolvePgClients(serverMajor: number): Promise<{ pair: PgClientPair | null; examined: string[] }> {
+  const examined: string[] = [];
+  const seen = new Set<string>();
+  for (const { bin, source } of candidateBins(serverMajor)) {
+    if (seen.has(bin)) continue;
+    seen.add(bin);
+    if (!isExecutable(join(bin, "pg_dump")) || !isExecutable(join(bin, "pg_restore"))) continue;
+    const dumpMajor = await toolMajor(join(bin, "pg_dump"));
+    const restoreMajor = await toolMajor(join(bin, "pg_restore"));
+    examined.push(`${source} ${bin}: pg_dump ${dumpMajor ?? "unreadable"}, pg_restore ${restoreMajor ?? "unreadable"}`);
+    if (dumpMajor !== null && restoreMajor !== null && dumpMajor === restoreMajor && dumpMajor >= serverMajor) {
+      return { pair: { bin, source, dumpMajor, restoreMajor }, examined };
+    }
+  }
+  return { pair: null, examined };
+}
 
 /** The whitespace-exact reads the fingerprint's collapsing would blur. */
 const exactSlackCatalog = async (client: Client) => ({
@@ -326,20 +409,26 @@ describe("AM-F2 + AC-02 history/segment block — MR-02 catalog fidelity (real P
     // ── Toolchain precondition, stated by name. ──
     const serverMajor = await withClient(urls.loader, async (client) =>
       (await client.query<{ major: number }>("select (pg_catalog.current_setting('server_version_num')::int / 10000) as major")).rows[0].major);
-    const dumpMajor = await toolMajor("pg_dump");
-    const restoreMajor = await toolMajor("pg_restore");
-    expect({ pgDumpAtLeastServer: (dumpMajor ?? 0) >= serverMajor, pgRestoreAtLeastServer: (restoreMajor ?? 0) >= serverMajor },
-      `toolchain precondition: pg_dump/pg_restore on PATH must be PostgreSQL >= the server's major ${serverMajor}`).toEqual({
-      pgDumpAtLeastServer: true, pgRestoreAtLeastServer: true,
+    const { pair, examined } = await resolvePgClients(serverMajor);
+    expect({
+      compatiblePair: pair !== null,
+      pgDumpAtLeastServer: (pair?.dumpMajor ?? 0) >= serverMajor,
+      pgRestoreAtLeastServer: (pair?.restoreMajor ?? 0) >= serverMajor,
+      sameMajor: pair !== null && pair.dumpMajor === pair.restoreMajor,
+    }, `toolchain precondition: one bin directory must hold pg_dump AND pg_restore of the same PostgreSQL major >= the server's ${serverMajor} `
+      + `(PG_BIN, else PATH, else installed Homebrew postgresql@N). Examined: ${examined.join("; ") || "no directory held both tools"}`).toEqual({
+      compatiblePair: true, pgDumpAtLeastServer: true, pgRestoreAtLeastServer: true, sameMajor: true,
     });
+    const pgDump = join((pair as PgClientPair).bin, "pg_dump");
+    const pgRestore = join((pair as PgClientPair).bin, "pg_restore");
 
     const directory = await mkdtemp(join(tmpdir(), "slack-mr02-"));
     try {
       // ── The REAL dump, in the staging rollback path's archive shape. ──
       const archive = join(directory, "slack-mr02.dump");
-      await runTool("pg_dump", ["--format=custom", "--schema=public", `--file=${archive}`, urls.loader]);
+      await runTool(pgDump, ["--format=custom", "--schema=public", `--file=${archive}`, urls.loader]);
       // The restore's DDL (no data): an EMPTY search_path, and the schema-qualified validator in the CHECKs.
-      const ddl = await runTool("pg_restore", ["--schema-only", "--file=-", archive]);
+      const ddl = await runTool(pgRestore, ["--schema-only", "--file=-", archive]);
       expect({
         emptySearchPath: ddl.includes("SELECT pg_catalog.set_config('search_path', '', false);"),
         // Only a CHECK body renders the call after WHEN; the function's own CREATE does not.
@@ -350,14 +439,14 @@ describe("AM-F2 + AC-02 history/segment block — MR-02 catalog fidelity (real P
       });
       // The staging path's own TOC filter: the fresh database already has `public`.
       const listPath = join(directory, "slack-mr02.list");
-      await writeFile(listPath, filterRestoreList(await runTool("pg_restore", ["--list", archive])).text, { mode: 0o600 });
+      await writeFile(listPath, filterRestoreList(await runTool(pgRestore, ["--list", archive])).text, { mode: 0o600 });
 
       // ── The REAL restore into a fresh database (citext pre-installed, as schema.sql would). ──
       const restoredUrl = await createScratch("restored");
       await withClient(restoredUrl, async (client) => {
         await client.query("create extension if not exists citext");
       });
-      await runTool("pg_restore", [
+      await runTool(pgRestore, [
         "--exit-on-error", "--single-transaction", "--no-owner", "--no-privileges",
         `--use-list=${listPath}`, `--dbname=${restoredUrl}`, archive,
       ]);
