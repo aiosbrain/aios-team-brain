@@ -61,8 +61,9 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  * A second application must then leave the FULL row exactly as the first left it, `updated_at`
  * included, with no further restart and no notice.
  *
- * MR-03 ENTRYPOINT ORDER (packet 6, the second describe). The MIRROR entrypoint is the ONE marked
- * DO statement of `postgres/schema.sql`. It is extracted between its unique
+ * MR-03 STATEMENT ORDER (packet 6, the second describe). This is STATEMENT-LEVEL mirror-only
+ * execution and statement orders: the MIRROR entrypoint is only the ONE marked DO statement of
+ * `postgres/schema.sql`, never the whole file. It is extracted between its unique
  * `slack-channel-history-segments-upgrade` marker pair, and used only after it is proved
  * byte-identical to the migration's own marked statement.
  *
@@ -72,7 +73,8 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *  - three restarted lanes (no claim; both lanes with a live newest claim; a cursor-null live
  *    claim) and one idle row;
  *  - two queued thread rows.
- * The four orders are migration-only, mirror-only, mirror→migration and migration→mirror. In each
+ * The four statement orders are migration-only, statement-level mirror-only, mirror
+ * statement→migration and migration→mirror statement. In each
  * database:
  *  - the first entrypoint commits notice-free with exact literal restart/fence facts. `updated_at`
  *    moves ONLY on the three restarted rows; the idle row and both thread rows stay exactly as
@@ -112,19 +114,25 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *      claim, a cursor-null live claim, an anchored null-cursor lane with no claim, both lanes
  *      active, the history-only one-lane introduction with its unaffected opposite live claim,
  *      and migration replay after progress and maximum histories;
- *    · in the order describe here: mirror-only execution, both execution orders, and order/replay
- *      after progress and maximum histories, for the populated UNION introduction.
+ *    · in the statement-order describe here: statement-level mirror-only execution, both
+ *      statement orders, and statement-order replay after progress and maximum histories, for the
+ *      populated UNION introduction.
  *  - MR-03 / F2-12, STILL OPEN:
  *    · a COMMITTING segment-only introduction on an F2-only SCHEMA fixture;
- *    · the mirror-only and order proofs repeated for the history-only, segment-only and one-lane
- *      introduction states, which only the union introduction has here;
+ *    · the statement-level mirror-only and statement-order proofs repeated for the history-only,
+ *      segment-only and one-lane introduction states, which only the union introduction has here;
  *    · staged-snapshot, published-item and ledger evidence rows (only queued thread rows here);
  *    · the omitted-lease-invalidation mutant, which is not measured;
- *    · the WHOLE `schema.sql` file as the mirror entrypoint (here only its marked statement).
- *  - MR-04: cancellation, real concurrent sessions and retry after a later migration fails (static
- *    refusals and rollback are in `slack-history-progress-conflicts`);
+ *    · the WHOLE `schema.sql` file as the mirror entrypoint: HELD, since only its marked statement
+ *      runs here;
+ *    · a full loader/`schema.sql` replay over the POPULATED, progressed rows of these order
+ *      databases (only the two marked statements replay here).
+ *  - MR-04: the refusals still listed in `slack-history-progress-conflicts`' WHAT REMAINS ledger
+ *    (its static refusal matrix is not complete), plus cancellation, real concurrent sessions and
+ *    retry after a later migration fails;
  *  - MR-05: the existing structural sweeps;
- *  - DH-11: the §9 named source-fences/upgrade tests and the legacy three-column rename;
+ *  - DH-11: the §9 named source-fences/upgrade tests, the legacy three-column rename, and maximum
+ *    histories through unrelated writers;
  *  - MR-06 (held until PR743 staging).
  */
 
@@ -474,7 +482,7 @@ describe("AM-F2 + AC-02 history/segment migration — direct populated pre-F2 up
   );
 });
 
-// ── MR-03 ENTRYPOINT ORDER (packet 6): migration-only, mirror-only and both execution orders ──
+// ── MR-03 STATEMENT ORDER (packet 6): migration-only, statement-level mirror-only, and both statement orders ──
 
 const ORDER_TIMEOUT = 900_000;
 const SCHEMA_PATH = join(process.cwd(), "postgres", "schema.sql");
@@ -696,9 +704,9 @@ const logicalRows = (evidence: OrderEvidence) => ({
 type OrderEntry = "migration" | "mirror";
 type OrderRun = { introducedLogical: unknown; introducedCatalog: unknown; progressedRows: unknown; progressedCatalog: unknown };
 
-describe("AM-F2 + AC-02 history/segment block — MR-03 entrypoint order: migration-only, mirror-only, mirror→migration, migration→mirror (real Postgres)", () => {
+describe("AM-F2 + AC-02 history/segment block — MR-03 statement order: migration-only, statement-level mirror-only, mirror statement→migration, migration→mirror statement (real Postgres)", () => {
   it(
-    "MR-03 every entrypoint order reaches the same Slack catalog and rows; each second execution and replay is exact, including after progress and maximum histories",
+    "MR-03 every statement order reaches the same Slack catalog and rows; each second execution and replay is exact, including after progress and maximum histories",
     async () => {
       const { loadSchema } = await import("@/scripts/pg-load-schema.mjs");
       const migrationSql = readFileSync(MIGRATION, "utf8");
@@ -712,9 +720,10 @@ describe("AM-F2 + AC-02 history/segment block — MR-03 entrypoint order: migrat
           occurrences(schemaSql, `${MARKER}:begin`), occurrences(schemaSql, `${MARKER}:end`)],
         oneStatement: mirrorStatement.startsWith("do $slack_channel_history_segments$\n")
           && mirrorStatement.endsWith("\nend\n$slack_channel_history_segments$;"),
+        dollarTagCount: occurrences(mirrorStatement, "$slack_channel_history_segments$"),
         identical: mirrorStatement.length > 0 && mirrorStatement === migrationStatement,
       }, "the mirror entrypoint is schema.sql's ONE marked DO statement, byte-identical to the migration's").toEqual({
-        markers: [1, 1, 1, 1], oneStatement: true, identical: true,
+        markers: [1, 1, 1, 1], oneStatement: true, dollarTagCount: 2, identical: true,
       });
       const sqlFor = (entry: OrderEntry): string => (entry === "migration" ? migrationSql : mirrorStatement);
 
@@ -793,6 +802,14 @@ describe("AM-F2 + AC-02 history/segment block — MR-03 entrypoint order: migrat
               threads: seeded.threads,
             });
             const introducedCatalog = await slackCatalog(c);
+            // Absolute non-vacuity, per database: cross-database equality is not the only oracle.
+            expect({
+              fingerprintLines: introducedCatalog.lines.length > 0,
+              namedChecks: introducedCatalog.checks.length,
+              validators: introducedCatalog.validator.length,
+            }, `${label}: after introduction the Slack catalog is non-empty, with four named CHECKs and one validator`).toEqual({
+              fingerprintLines: true, namedChecks: 4, validators: 1,
+            });
 
             // ── SECOND entrypoint, then replays of both: complete rows exact, updated_at included. ──
             for (const [step, entry] of [["second", second], ["replay", first], ["replay", second]] as Array<[string, OrderEntry]>) {
