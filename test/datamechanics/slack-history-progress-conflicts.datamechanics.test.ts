@@ -157,8 +157,12 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
  * later production packet.
  *
  * WHAT REMAINS, NOT claimed here:
- *  - MR-02: schema-only vs schema-plus-all-migrations fingerprints; empty-search-path dump/restore
- *    and replay after restore.
+ *  - MR-02: CLOSED for the Slack-owned objects by the sibling
+ *    `slack-history-progress-catalog.datamechanics.test.ts`:
+ *    · schema-only vs schema-plus-all-migrations fingerprint parity;
+ *    · a real empty-search-path pg_dump/pg_restore;
+ *    · replay after restore.
+ *    Repo-wide parity stays with `npm run test:migrate-from-existing`.
  *  - MR-03:
  *    · mirror-only execution and both execution orders on independent fixtures;
  *    · a COMMITTING segment-only introduction on an F2-only SCHEMA state (only its refusal is here);
