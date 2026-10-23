@@ -10,11 +10,19 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { loadSchema } from "../../scripts/pg-load-schema.mjs";
 import { diffFingerprints, fingerprint } from "../../scripts/schema-fingerprint.mjs";
 import { filterRestoreList } from "../../scripts/staging-ops/pg-paired.mjs";
+import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
 
 /**
  * AIO-1170 AM-F2 + AC-02 deep history — MR-02 catalog fidelity for the Slack-owned objects
  * (accepted consolidated contract `aio1170-am-f2-deep-history-consolidated-accepted-spec-migration-v1-20261023.md`,
  * §9.3 MR-02, §10 DH-11).
+ *
+ * PLACEMENT: this sibling is the Astra-approved Packet 5 placement amendment, for MR-02 ONLY. It does
+ * not complete MR-06 (held until PR743 staging) and does not widen production scope.
+ *
+ * ISOLATION: every scratch database is created only after the shared `DATABASE_TEST_URL` guard
+ * (`./slack-history-isolated-url.ts`, tested by `test/slack-history-isolated-url.test.ts`) accepts
+ * the URL: the isolated local runner, or CI's `postgres:5432` service under `GITHUB_ACTIONS=true`.
  *
  * WHAT THIS FILE PROVES (three tests):
  *  1. MR-02 FROM-ZERO PARITY. Two scratch databases are built by the REAL loader
@@ -26,8 +34,10 @@ import { filterRestoreList } from "../../scripts/staging-ops/pg-paired.mjs";
  *     Both are read by the repository's catalog fingerprint (`scripts/schema-fingerprint.mjs`).
  *     The fingerprint covers relation, columns (type/default/nullability/identity/generated/
  *     collation, NOT attnum), indexes, constraints, functions (`pg_get_functiondef`) and triggers.
- *     Every line owned by `slack_sync_channels`, `slack_channel_cursor_history_valid(…)` or
- *     `slack_sync_channels_clear_deleted_binding(…)` must be identical. A whitespace-exact second
+ *     Every Slack-owned line must be identical: every relation, column, index, constraint,
+ *     trigger, function, enum, domain or sequence whose identity starts with `slack_` (so every
+ *     `slack_*` table, not only `slack_sync_channels`, and every `slack_*` function and type). A
+ *     whitespace-exact second
  *     read also compares the four named CHECKs (`pg_get_constraintdef`, validated) and the
  *     validator's metadata and `prosrc`, because the fingerprint collapses whitespace inside
  *     bodies. Non-vacuity: every accepted identity (8 columns, 4 CHECKs, the validator, the
@@ -48,19 +58,24 @@ import { filterRestoreList } from "../../scripts/staging-ops/pg-paired.mjs";
  *     · the exact CHECK definitions;
  *     · the validator's metadata and body;
  *     · the whole channel and thread rows (md5 digests only).
- *     Then the EXACT migration file is replayed on another fresh session. It must commit with no
- *     NOTICE, and leave the restored catalog and rows byte-identical.
+ *     Then two replays run, each on fresh sessions, and each must leave the restored Slack
+ *     fingerprint, the exact reads and the row digests byte-identical:
+ *     · the EXACT migration file, which must commit with no NOTICE;
+ *     · the deploy loader (`loadSchema`: `schema.sql`, then every migration). Its notices are not
+ *       asserted, because `schema.sql`'s own `if not exists` DDL is allowed to notice.
  *  3. MR-02 / DH-11 "NO NEW MIRROR EXCEPTION": `MIRROR_EXCEPTIONS` in
- *     `scripts/migrate-from-existing.mjs` names no Slack history/segment object. The file is read
- *     as text: importing it would install its SIGINT/SIGTERM handlers in the test worker.
+ *     `scripts/migrate-from-existing.mjs` holds EXACTLY its five current keys (three indexes and two
+ *     CHECKs, none Slack-owned). Any added, removed or renamed key, Slack or not, fails here and
+ *     needs review. The file is read as text: importing it would install its SIGINT/SIGTERM
+ *     handlers in the test worker.
  *
- * MUTATION REACH. Each of these turns a named assertion red:
- *  - drift in the mirrored block or in the from-zero columns: the schema-only build differs from
- *    the loader build, or the migration refuses the drifted catalog and the loader fails;
- *  - drift in a validator attribute or body: the metadata/`prosrc` read, or the guard's refusal;
- *  - drift in a CHECK's text: the exact `pg_get_constraintdef` read, on either test;
- *  - anything a dump or restore loses or re-parses differently: the restored-vs-source reads;
- *  - a non-idempotent replay: the post-replay reads, or the notice capture.
+ * MUTATION REACH, stated by design and NOT measured by a mutation harness. These are the
+ * assertions intended to catch each class:
+ *  - drift between the mirrored block or from-zero columns and the migration: test 1's
+ *    fingerprint diff or exact reads, or a refusal that fails the loader build in `beforeAll`;
+ *  - drift in a validator attribute or body, or in a CHECK's text: test 1's exact reads;
+ *  - a dump or restore that loses or re-parses an object or row: test 2's restored-vs-source reads;
+ *  - a non-idempotent replay: test 2's post-replay reads, or its migration-replay notice capture.
  *
  * COMPLEMENTARY GLOBAL EVIDENCE (not duplicated here): `npm run test:migrate-from-existing`
  * (`--mirror-check`) diffs the WHOLE schema-only and loader fingerprints, under its documented
@@ -99,8 +114,9 @@ import { filterRestoreList } from "../../scripts/staging-ops/pg-paired.mjs";
  *     Nothing in the archive is edited or stripped.
  * CI's datamechanics job has `postgresql-client-16` on PATH against the `postgres:16` service, so
  * the PATH pair remains its first successful route. If no route qualifies, a named precondition
- * fails, listing each directory or container fact it examined (paths, names, images, majors and
- * booleans; never URLs or credentials). PG* variables are scrubbed from every child environment, and
+ * fails. It lists every host directory that held BOTH tools, with their majors (a directory missing
+ * either tool is skipped silently), and every container fact checked (count, name, image, booleans
+ * and majors); never URLs or credentials. PG* variables are scrubbed from every child environment, and
  * the host temp directory is removed afterwards.
  *
  * PRIVACY. Rows hold only synthetic cursor/history values, and rows are compared only by md5
@@ -138,36 +154,25 @@ const REQUIRED_IDENTS = [
 ];
 
 const identOf = (line: string): string => line.split("\t").slice(0, 2).join("\t");
-/** The fingerprint lines this block owns or touches: the table's own objects and its two functions. */
-const isSlackOwned = (line: string): boolean => {
-  const ident = line.split("\t")[1] ?? "";
-  return ident === "slack_sync_channels" || ident.startsWith("slack_sync_channels.")
-    || ident.startsWith("slack_channel_cursor_history_valid(") || ident.startsWith("slack_sync_channels_clear_deleted_binding(");
-};
+/**
+ * Every Slack-owned fingerprint line. Every fingerprint identity is either a top-level name
+ * (relation, function `name(args)`, enum, domain, sequence) or `table.object` (column, index,
+ * constraint, trigger, policy), so one `slack_` prefix selects every `slack_*` relation with its
+ * dependents, every `slack_*` function and every `slack_*` type.
+ */
+const isSlackOwned = (line: string): boolean => (line.split("\t")[1] ?? "").startsWith("slack_");
+/** `scripts/migrate-from-existing.mjs` `MIRROR_EXCEPTIONS`, key for key, exactly as its source spells them. */
+const EXPECTED_MIRROR_EXCEPTION_KEYS = [
+  "index\\tchat_messages.chat_messages_search_idx",
+  "index\\tgraph_episodes.graph_episodes_pending_delete_idx",
+  "index\\titems.items_team_work_at_idx",
+  "constraint\\tmembers.members_kind_check",
+  "constraint\\tprojects.projects_kind_check",
+];
 const missingRequired = (lines: string[]): string[] => {
   const present = new Set(lines.map(identOf));
   return REQUIRED_IDENTS.filter((ident) => !present.has(ident));
 };
-
-/**
- * The isolated runner's URL shape, and nothing else: a loopback host, a port that is present and is
- * not the shared 5434 service, and the `app_test` database. The error never prints the URL.
- */
-function requireIsolatedTestUrl(raw: string | undefined): string {
-  const refuse = (): never => {
-    throw new Error("refusing to run: DATABASE_TEST_URL is not the isolated data-mechanics runner's database");
-  };
-  if (!raw) return refuse();
-  let parsed: URL;
-  try {
-    parsed = new URL(raw);
-  } catch {
-    return refuse();
-  }
-  const loopback = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(parsed.hostname);
-  if (!loopback || parsed.port === "" || parsed.port === "5434" || parsed.pathname !== "/app_test") return refuse();
-  return raw;
-}
 
 const execFileAsync = promisify(execFile);
 /**
@@ -394,14 +399,16 @@ const rowDigests = async (client: Client) => (await client.query<{ channels: str
 )).rows[0];
 
 describe("AM-F2 + AC-02 history/segment block — mirror-exception fence (MR-02 / DH-11, static)", () => {
-  it("MR-02 MIRROR_EXCEPTIONS excuses no Slack history/segment object", () => {
+  it("MR-02 MIRROR_EXCEPTIONS holds exactly its five current keys, none Slack-owned", () => {
     const source = readFileSync(MIGRATE_FROM_EXISTING_PATH, "utf8");
     const start = source.indexOf("export const MIRROR_EXCEPTIONS = {");
     const end = source.indexOf("\n};", start);
     const block = start >= 0 && end > start ? source.slice(start, end) : "";
-    expect({ found: block.length > 0, entries: (block.match(/^\s*"[a-z]+\\t/gm) ?? []).length > 0 },
-      "fixture: the MIRROR_EXCEPTIONS allowlist was located and is non-empty").toEqual({ found: true, entries: true });
-    expect(/slack_sync_channels|slack_channel_/.test(block), "MIRROR_EXCEPTIONS names a Slack history/segment object").toBe(false);
+    expect(block.length > 0, "fixture: the MIRROR_EXCEPTIONS allowlist was located").toBe(true);
+    // Every key line is `  "<kind>\t<ident>":`; values are concatenated strings on later lines.
+    const keys = [...block.matchAll(/^\s*"([a-z]+\\t[^"]+)":/gm)].map((match) => match[1]);
+    expect(keys, "MIRROR_EXCEPTIONS keys changed: a new exception needs review, and none may excuse a Slack-owned object").toEqual(EXPECTED_MIRROR_EXCEPTION_KEYS);
+    expect(keys.some((key) => key.split("\\t")[1]?.startsWith("slack_")), "a mirror exception excuses a Slack-owned object").toBe(false);
   });
 });
 
@@ -410,22 +417,13 @@ describe("AM-F2 + AC-02 history/segment block — MR-02 catalog fidelity (real P
   const created: string[] = [];
   const urls: Record<"schemaOnly" | "loader", string> = { schemaOnly: "", loader: "" };
 
-  const urlFor = (database: string): string => {
-    const target = new URL(adminUrl);
-    target.pathname = `/${database}`;
-    return target.toString();
-  };
+  /** Every scratch database goes through the shared guard, which refuses before any connection. */
   const createScratch = async (role: string): Promise<string> => {
     const name = `slackmr02_${role}_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
-    const admin = new Client({ connectionString: adminUrl });
-    await admin.connect();
-    try {
-      await admin.query(`create database ${name}`);
-    } finally {
-      await admin.end().catch(() => {});
-    }
+    const scratch = await createIsolatedScratchDatabase(name);
+    adminUrl = scratch.adminUrl;
     created.push(name);
-    return urlFor(name);
+    return scratch.url;
   };
   /** A FRESH session for every read, so nothing is observed through a session that wrote it. */
   const withClient = async <T,>(url: string, run: (client: Client) => Promise<T>): Promise<T> => {
@@ -442,7 +440,6 @@ describe("AM-F2 + AC-02 history/segment block — MR-02 catalog fidelity (real P
 
   beforeAll(async () => {
     // Refused BEFORE any connection or database creation.
-    adminUrl = requireIsolatedTestUrl(process.env.DATABASE_TEST_URL);
     urls.schemaOnly = await createScratch("schema");
     urls.loader = await createScratch("loader");
     const quiet = { log: () => {} };
@@ -608,6 +605,14 @@ describe("AM-F2 + AC-02 history/segment block — MR-02 catalog fidelity (real P
         `Slack-owned fingerprint drift caused by the replay:\n${replayDrift.text}`).toEqual({ lost: [], gained: [] });
       expect(await withClient(restoredUrl, exactSlackCatalog), "after replay: CHECK definitions and validator metadata/body unchanged").toEqual(sourceExact);
       expect(await withClient(restoredUrl, rowDigests), "after replay: every channel and thread row byte-identical, updated_at included").toEqual(sourceRows);
+
+      // ── Replay the DEPLOY LOADER over the restored database: schema.sql, then every migration. ──
+      await loadSchema({ cwd: ROOT, databaseUrl: restoredUrl, logger: { log: () => {} } });
+      const loaderReplayDrift = diffFingerprints(restoredFingerprint, await slackFingerprint(restoredUrl));
+      expect({ lost: loaderReplayDrift.missing, gained: loaderReplayDrift.extra },
+        `Slack-owned fingerprint drift caused by the deploy-loader replay:\n${loaderReplayDrift.text}`).toEqual({ lost: [], gained: [] });
+      expect(await withClient(restoredUrl, exactSlackCatalog), "after the deploy-loader replay: CHECK definitions and validator metadata/body unchanged").toEqual(sourceExact);
+      expect(await withClient(restoredUrl, rowDigests), "after the deploy-loader replay: every channel and thread row byte-identical, updated_at included").toEqual(sourceRows);
     } finally {
       // The container route's private directory first, then the host temp directory; neither
       // cleanup can replace the primary failure.

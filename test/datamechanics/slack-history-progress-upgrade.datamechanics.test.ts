@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { Client } from "pg";
 import { describe, expect, it } from "vitest";
+import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
 
 /**
  * AIO-1170 AM-F2 + AC-02 deep history — the numbered migration's direct, populated upgrade
@@ -29,9 +30,13 @@ import { describe, expect, it } from "vitest";
  * all against LITERAL expectations written out below, never read back from the catalog. A progress
  * helper or constraint the fixture failed to remove, or a lost pre-F2 CHECK, is a mismatch.
  *
- * ISOLATION. Before anything is created, the URL must be the isolated runner's shape: a loopback
- * host, a port other than the shared 5434 service, and the `app_test` database. Anything else is
- * refused with a static error that does not print the URL.
+ * ISOLATION. Before anything is created, the shared guard (`./slack-history-isolated-url.ts`, tested
+ * by `test/slack-history-isolated-url.test.ts`) requires one of two runner shapes for the `app_test`
+ * database:
+ *  - the isolated local runner: a loopback host on an explicit port other than the shared 5434
+ *    service;
+ *  - CI's service container: exactly `postgres:5432`, and only under `GITHUB_ACTIONS=true`.
+ * Anything else is refused with a static error that does not print the URL.
  *
  * THE ONE NARROW CASE (one row of MR-03 / F2-12, not either whole): one channel row whose HISTORICAL
  * lane is active — anchor, a saved cursor and an attempt-oldest — with no live claim, and whose NEWEST
@@ -54,9 +59,12 @@ import { describe, expect, it } from "vitest";
  *
  * WHAT REMAINS for later packets, and is NOT claimed here. This case does not complete F2-12, DH-11
  * or any MR row. Deferred, explicitly:
- *  - MR-02: mirror byte-parity, from-zero/upgraded fingerprints, dump/restore, and the EXACT
- *    definitions and validation state of the new history and progress CHECKs (this case checks only
- *    that the two named history CHECKs exist, and the PRE-F2 constraints exactly);
+ *  - MR-02: NOT claimed by this case (it checks only that the two named history CHECKs exist, and
+ *    the PRE-F2 constraints exactly). Packet 5 since covered it in siblings:
+ *    · `slack-history-progress-conflicts`: exact CHECK definitions and validation, and mirror byte
+ *      parity;
+ *    · `slack-history-progress-catalog`: from-zero/loader fingerprints, a real dump/restore and the
+ *      replays (the Astra-approved MR-02 placement amendment).
  *  - MR-03 / F2-12 edges:
  *    · a RESTARTED lane carrying a live claim with a nonnull cursor, where the claim must be
  *      invalidated (lease cleared, lease generation incremented, turn set to that lane), including
@@ -215,26 +223,6 @@ const PRE_F2_FUNCTIONS = [{
 /** Every user trigger on the table. */
 const PRE_F2_TRIGGERS = [{ name: "slack_sync_channels_clear_deleted_binding", function: "slack_sync_channels_clear_deleted_binding", enabled: "O" }];
 
-/**
- * The isolated runner's URL shape, and nothing else: a loopback host, a port that is present and is
- * not the shared 5434 service, and the `app_test` database. The error never prints the URL.
- */
-function requireIsolatedTestUrl(raw: string | undefined): string {
-  const refuse = (): never => {
-    throw new Error("refusing to run: DATABASE_TEST_URL is not the isolated data-mechanics runner's database");
-  };
-  if (!raw) return refuse();
-  let parsed: URL;
-  try {
-    parsed = new URL(raw);
-  } catch {
-    return refuse();
-  }
-  const loopback = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(parsed.hostname);
-  if (!loopback || parsed.port === "" || parsed.port === "5434" || parsed.pathname !== "/app_test") return refuse();
-  return raw;
-}
-
 /** Literal fixture identity and state. Nothing is generated except the scratch database's name. */
 const TEAM_ID = "5a1b2c3d-4e5f-4a6b-8c7d-0e1f2a3b4c5d";
 const WORKSPACE = "T0UPGRADE1";
@@ -246,19 +234,9 @@ describe("AM-F2 + AC-02 history/segment migration — direct populated pre-F2 up
     "MR-03 introduces history and segment columns on a populated pre-F2 table with one restart of the active lane, and replays exactly",
     async () => {
       const { loadSchema } = await import("@/scripts/pg-load-schema.mjs");
-      // Refused BEFORE any connection or database creation.
-      const adminUrl = requireIsolatedTestUrl(process.env.DATABASE_TEST_URL);
+      // The shared guard refuses BEFORE any connection or database creation (slack-history-isolated-url.ts).
       const name = `slackhistory_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
-      const admin = new Client({ connectionString: adminUrl });
-      await admin.connect();
-      try {
-        await admin.query(`create database ${name}`);
-      } finally {
-        await admin.end().catch(() => {});
-      }
-      const target = new URL(adminUrl);
-      target.pathname = `/${name}`;
-      const url = target.toString();
+      const { adminUrl, url } = await createIsolatedScratchDatabase(name);
 
       const c = new Client({ connectionString: url });
       await c.connect();

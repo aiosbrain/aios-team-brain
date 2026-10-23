@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { Client } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
 
 /**
  * AIO-1170 AM-F2 + AC-02 deep history — RED PACKET 3: catalog identity, conflicts, the state
@@ -11,9 +12,10 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
  * §3.1, §4, §9, §9.3 MR-02/MR-03/MR-04, §10 DH-11, §10.1 F2-12).
  *
  * Sibling of `slack-history-progress-upgrade.datamechanics.test.ts`, which keeps its one narrow
- * populated-union case unchanged. This file uses ONE scratch database per run, created and dropped
- * here under the isolated data-mechanics URL exactly as that file does, loaded once by the real
- * loader. Every database case first rebuilds the pre-F2 table with FIXTURE DDL on that throwaway
+ * populated-union case unchanged. This file uses ONE scratch database per run. It is created and
+ * dropped here only after the shared `DATABASE_TEST_URL` guard (`./slack-history-isolated-url.ts`:
+ * the isolated local runner, or CI's `postgres:5432` service under `GITHUB_ACTIONS=true`) accepts
+ * the URL, and it is loaded once by the real loader. Every database case first rebuilds the pre-F2 table with FIXTURE DDL on that throwaway
  * database only (§9.3 permits test-only legacy reconstruction) and asserts it is pre-F2 before
  * seeding. Migrations run on one session; every inspection after them runs on a SECOND session, so
  * rollback evidence is read from a fresh, usable connection (§9 / MR-04).
@@ -157,11 +159,13 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
  * later production packet.
  *
  * WHAT REMAINS, NOT claimed here:
- *  - MR-02: CLOSED for the Slack-owned objects by the sibling
- *    `slack-history-progress-catalog.datamechanics.test.ts`:
- *    · schema-only vs schema-plus-all-migrations fingerprint parity;
- *    · a real empty-search-path pg_dump/pg_restore;
- *    · replay after restore.
+ *  - MR-02: covered for the Slack-owned objects by the sibling
+ *    `slack-history-progress-catalog.datamechanics.test.ts`. That sibling is the Astra-approved
+ *    Packet 5 placement amendment, for MR-02 only. It does NOT complete MR-06 or widen production
+ *    scope. It proves:
+ *    · schema-only vs loader-path fingerprint parity;
+ *    · a real custom-format pg_dump and a real pg_restore under an empty search_path;
+ *    · after the restore, an exact migration replay and a deploy-loader (`loadSchema`) replay.
  *    Repo-wide parity stays with `npm run test:migrate-from-existing`.
  *  - MR-03:
  *    · mirror-only execution and both execution orders on independent fixtures;
@@ -425,26 +429,6 @@ function maxHistory(prefix: string, overByOne = false): string[] {
 /** The independent byte oracle for the jsonb text form of an array of plain strings. */
 function jsonbTextBytes(entries: string[]): number {
   return 2 + entries.reduce((sum, entry) => sum + Buffer.byteLength(entry, "utf8") + 2, 0) + 2 * (entries.length - 1);
-}
-
-/**
- * The isolated runner's URL shape, and nothing else: a loopback host, a port that is present and is
- * not the shared 5434 service, and the `app_test` database. The error never prints the URL.
- */
-function requireIsolatedTestUrl(raw: string | undefined): string {
-  const refuse = (): never => {
-    throw new Error("refusing to run: DATABASE_TEST_URL is not the isolated data-mechanics runner's database");
-  };
-  if (!raw) return refuse();
-  let parsed: URL;
-  try {
-    parsed = new URL(raw);
-  } catch {
-    return refuse();
-  }
-  const loopback = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(parsed.hostname);
-  if (!loopback || parsed.port === "" || parsed.port === "5434" || parsed.pathname !== "/app_test") return refuse();
-  return raw;
 }
 
 const STATIC_MESSAGES = new Set([AM_F2, AC02]);
@@ -734,19 +718,12 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
 
   beforeAll(async () => {
     const { loadSchema } = await import("@/scripts/pg-load-schema.mjs");
-    // Refused BEFORE any connection or database creation.
-    adminUrl = requireIsolatedTestUrl(process.env.DATABASE_TEST_URL);
-    scratch = `slackconflict_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
-    const admin = new Client({ connectionString: adminUrl });
-    await admin.connect();
-    try {
-      await admin.query(`create database ${scratch}`);
-    } finally {
-      await admin.end().catch(() => {});
-    }
-    const target = new URL(adminUrl);
-    target.pathname = `/${scratch}`;
-    const url = target.toString();
+    // The shared guard refuses BEFORE any connection or database creation (slack-history-isolated-url.ts).
+    const name = `slackconflict_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    const created = await createIsolatedScratchDatabase(name);
+    adminUrl = created.adminUrl;
+    scratch = name;
+    const url = created.url;
     await loadSchema({ cwd: process.cwd(), databaseUrl: url, logger: { log: () => {} } });
     c = new Client({ connectionString: url });
     probe = new Client({ connectionString: url });
