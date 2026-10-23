@@ -89,9 +89,10 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
  *    · an IDENTITY column must be smallint/integer/bigint, so it cannot be built on an owned jsonb
  *      or text column; GENERATED is covered instead;
  *    · an explicit DEFAULT NULL stores no pg_attrdef row, so it is not a distinct conflict;
- *    · a PROCEDURE cannot carry a return type, volatility, strictness or parallel marking, so
- *      object kind cannot vary alone; its fixture asserts its exact diff (kind, parallel, returns,
- *      strict, volatility);
+ *    · a PROCEDURE cannot carry a return type, volatility, strictness or parallel marking, and
+ *      `pg_get_function_identity_arguments` renders its argument signature differently from a
+ *      function's, so object kind cannot vary alone; its fixture asserts its exact diff (args,
+ *      kind, parallel, returns, strict, volatility);
  *    · LEAKPROOF and SUPPORT need a superuser, which the isolated runner's `app` role is (the
  *      `postgres:16` container's POSTGRES_USER).
  *    Expected GREEN; any failure is a newly found production gap.
@@ -1009,10 +1010,11 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
     { dimension: "support function", ddl: validatorDdl({ extra: "support pg_catalog.textlike_support" }), differs: ["support"] },
     {
       // PostgreSQL 16: a procedure cannot carry a return type, volatility, strictness or parallel
-      // marking, so object kind cannot vary alone; the exact resulting diff is asserted instead.
+      // marking, and its identity-argument rendering differs from a function's, so object kind
+      // cannot vary alone; the exact resulting diff is asserted instead.
       dimension: "procedure kind",
       ddl: "create procedure public.slack_channel_cursor_history_valid(history jsonb) language sql set search_path = pg_catalog as $$ select 1 $$",
-      differs: ["kind", "parallel", "returns", "strict", "volatility"],
+      differs: ["args", "kind", "parallel", "returns", "strict", "volatility"],
     },
   ].map(({ dimension, ddl, differs }) => ({
     id: `validator ${dimension}`,
