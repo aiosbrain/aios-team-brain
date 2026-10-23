@@ -54,7 +54,9 @@ export function nextSlackSegmentAfterTerminal(envelopeLower: bigint, completed: 
 
 /**
  * The canonical stored text of a bound: decimal seconds without leading zeroes, a dot, exactly six
- * fractional digits, within `[0, SLACK_SEGMENT_MAX_TICKS]`. `null` outside that domain.
+ * fractional digits, within `[0, SLACK_SEGMENT_MAX_TICKS]`. `null` outside that domain. This codec
+ * is used for STORED and REQUEST bounds, not only for anything derived from a message, so it permits
+ * zero: the historical envelope's lower bound and a margin clamped at zero are both `0.000000`.
  *
  * RED PLACEHOLDER: renders the bare tick count and refuses nothing.
  */
@@ -63,9 +65,11 @@ export function canonicalSlackBound(ticks: bigint): string | null {
 }
 
 /**
- * The exact tick value of a provider timestamp spelling (`<seconds>.<1–6 fractional digits>`, as the
- * shared exact parser accepts it, leading zeroes included), or `null`. The original string is never
- * rewritten by this; it only yields the value to compare and to render canonically.
+ * The exact tick value of a PROVIDER MESSAGE timestamp spelling (`<seconds>.<1–6 fractional digits>`),
+ * or `null`. It accepts exactly what the shared exact parser accepts — leading zeroes included, and
+ * STRICTLY POSITIVE seconds only, up to the supported maximum — so it is not the parser for a stored
+ * bound, which may be zero (see `canonicalSlackBound`). The original string is never rewritten by
+ * this; it only yields the value to compare and to render canonically.
  *
  * RED PLACEHOLDER: parses nothing.
  */

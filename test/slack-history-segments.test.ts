@@ -48,9 +48,13 @@ interface ModelResult {
  * ticks 0n..127n, L = 0n, A = 127n, page size 2, continuation-entry cap K = 3, no unrelated faults,
  * empty pages, duplicates or delays. The provider returns the inclusive range [S, U] descending.
  *
- * The cursor is an opaque token held ONLY by this fake provider, mapped there to an offset; the
- * algorithm never reads a timestamp or an offset out of it. Every request is counted before its
- * response, failed and rejected ones included.
+ * The cursor is opaque. This fake provider models the position an opaque token would carry with its
+ * own local `offset`; there is no literal token-to-offset map, and the algorithm never reads a
+ * timestamp or an offset out of a token — the tokens below only fill the bounded history. Every
+ * request is counted before its response, failed and rejected ones included.
+ *
+ * The run stops as soon as an invariant breaks, recording which one, so a wildly wrong helper fails
+ * a named assertion instead of building an enormous range or running into a timeout.
  *
  * Only the ADAPTIVE path calls the production helpers. The full-remainder comparison path is the
  * test's own arithmetic — `floor((S+U)/2)+1` and `S_new = L` — so that path is a control of this
@@ -72,9 +76,17 @@ function runModel(sizing: Sizing, mode: Mode, cap = 3): ModelResult {
   let requests = 0;
   let splits = 0;
   let segments = 0;
-  const checkInvariants = (where: string): void => {
-    if (!(L <= S && S <= U && U <= A)) violations.push(`${where}: bounds left 0 <= S <= U <= 127`);
-    if (history.length > cap) violations.push(`${where}: history exceeded the cap`);
+  /** True when every invariant holds; otherwise records the broken one and returns false, which stops the run. */
+  const invariantsHold = (where: string): boolean => {
+    if (!(L <= S && S <= U && U <= A)) {
+      violations.push(`${where}: bounds left 0 <= S <= U <= 127`);
+      return false;
+    }
+    if (history.length > cap) {
+      violations.push(`${where}: history exceeded the cap`);
+      return false;
+    }
+    return true;
   };
 
   for (;;) {
@@ -82,6 +94,8 @@ function runModel(sizing: Sizing, mode: Mode, cap = 3): ModelResult {
       violations.push("the run did not finish within 2,000 requests");
       break;
     }
+    // Checked BEFORE the range below is materialized: an out-of-domain bound never builds an array.
+    if (!invariantsHold("before a request")) break;
     requests += 1;
     const values: bigint[] = [];
     for (let tick = U; tick >= S; tick -= 1n) values.push(tick);
@@ -108,7 +122,7 @@ function runModel(sizing: Sizing, mode: Mode, cap = 3): ModelResult {
       offset = 0;
       history = [];
       splits += 1;
-      checkInvariants("after a split");
+      if (!invariantsHold("after a split")) break;
       continue;
     }
     for (const value of page) roots.add(value);
@@ -116,7 +130,7 @@ function runModel(sizing: Sizing, mode: Mode, cap = 3): ModelResult {
       offset += page.length;
       tokens += 1;
       history.push(`opaque-cursor-${tokens}`);
-      checkInvariants("after a continuation");
+      if (!invariantsHold("after a continuation")) break;
       continue;
     }
     // A genuinely terminal response finishes [S, U].
@@ -137,7 +151,7 @@ function runModel(sizing: Sizing, mode: Mode, cap = 3): ModelResult {
     }
     offset = 0;
     history = [];
-    checkInvariants("after a terminal segment");
+    if (!invariantsHold("after a terminal segment")) break;
   }
 
   return {
@@ -208,7 +222,9 @@ const T = 1_718_900_000_123_456n;
 describe("DH-04 exact segment arithmetic — midpoint split, adjacent doubling, canonical bounds", () => {
   it.each<[string, SlackSegment, SlackSegment | null]>([
     ["the §11 envelope [0, 127]: M = 63, so the upper half starts at 64", { lower: 0n, upper: 127n }, { lower: 64n, upper: 127n }],
-    ["an odd-width range [3, 4]: M = 3, so the upper half is the singleton 4", { lower: 3n, upper: 4n }, { lower: 4n, upper: 4n }],
+    ["an even-width (width-2) range [3, 4]: M = 3, so the upper half is the singleton 4", { lower: 3n, upper: 4n }, { lower: 4n, upper: 4n }],
+    ["an odd-width (width-3) range [0, 2]: M = 1, so the upper half is the singleton 2", { lower: 0n, upper: 2n }, { lower: 2n, upper: 2n }],
+    ["an odd-width (width-3) range [T, T + 2]: M = T + 1, so the upper half is the singleton T + 2", { lower: T, upper: T + 2n }, { lower: T + 2n, upper: T + 2n }],
     ["a width-2 range one microsecond apart: the message at M stays below, M+1 goes up", { lower: T, upper: T + 1n }, { lower: T + 1n, upper: T + 1n }],
     ["an even width, [T, T + 999]: M = T + 499, upper half from T + 500", { lower: T, upper: T + 999n }, { lower: T + 500n, upper: T + 999n }],
     ["the whole supported domain [0, max]: exact bigint midpoint, no float rounding",
@@ -245,6 +261,8 @@ describe("DH-04 exact segment arithmetic — midpoint split, adjacent doubling, 
     ["one microsecond below a second", 999_999n, "0.999999"],
     ["the microsecond carry into a whole second", 1_000_000n, "1.000000"],
     ["a provider-looking instant", 1_718_900_000_100_000n, "1718900000.100000"],
+    ["microseconds zero-padded to six digits", 1_718_900_000_000_100n, "1718900000.000100"],
+    ["all six microsecond digits significant", T, "1718900000.123456"],
     ["the second carry after .999999", 1_718_900_000_999_999n + 1n, "1718900001.000000"],
     ["the largest supported instant", SLACK_SEGMENT_MAX_TICKS, "253402300799.999999"],
     ["one microsecond past the largest supported instant", SLACK_SEGMENT_MAX_TICKS + 1n, null],
