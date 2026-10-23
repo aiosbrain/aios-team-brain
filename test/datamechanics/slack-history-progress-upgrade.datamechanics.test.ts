@@ -364,7 +364,7 @@ describe("AM-F2 + AC-02 history/segment migration — direct populated pre-F2 up
            values ($1, $2, $3, 'public', '2026-01-01 00:00:00+00',
                    null, null, null, 0,
                    '1718900500.000000', 'legacy-cursor-1', 3, '1718900100.000100',
-                   false, null, null, '1718900400.000000',
+                   false, null, null, '1718900600.000000',
                    'metadata-owner-1', 2, null, 'newest',
                    null, 7, null, '2026-01-02 00:00:00+00', 5, 'invocation_budget',
                    '2026-01-01 12:00:00+00', '2025-12-31 00:00:00+00', '2026-01-02 03:04:05+00')`,
@@ -386,7 +386,7 @@ describe("AM-F2 + AC-02 history/segment migration — direct populated pre-F2 up
           newest_catchup_upper_ts: before.newest_catchup_upper_ts, metadata_attempt_owner: before.metadata_attempt_owner,
           next_lane: before.next_lane, claimed_lane: before.claimed_lane, lease_owner: before.lease_owner,
         }, "fixture: a provisional catch-up top, a metadata owner, and an unclaimed row whose turn is NOT the restarted lane").toEqual({
-          newest_catchup_upper_ts: "1718900400.000000", metadata_attempt_owner: "metadata-owner-1",
+          newest_catchup_upper_ts: "1718900600.000000", metadata_attempt_owner: "metadata-owner-1",
           next_lane: "newest", claimed_lane: null, lease_owner: null,
         });
 
