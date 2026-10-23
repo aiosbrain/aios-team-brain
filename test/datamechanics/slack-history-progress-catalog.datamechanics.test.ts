@@ -68,25 +68,40 @@ import { filterRestoreList } from "../../scripts/staging-ops/pg-paired.mjs";
  * `check-constraint-dump-roundtrip` re-parses every public CHECK's deparsed text. This file adds
  * the AIO-1170-specific exact reads and the REAL dump/restore those do not perform.
  *
- * TOOLCHAIN. pg_dump refuses a server newer than itself, so the test resolves ONE compatible
- * client pair before dumping. It follows `scripts/staging-refresh.sh`'s discipline (explicit pin,
- * Homebrew keg, PATH), tightened so that no incompatible pair is ever used:
- *  - `PG_BIN`, when set, is the only candidate: an explicit pin is honored or refused, never
- *    silently overridden;
- *  - otherwise each PATH directory is tried, in PATH order;
- *  - then each INSTALLED Homebrew versioned keg (`/opt/homebrew/opt/postgresql@N/bin`, or
- *    `/usr/local/opt/...` on Intel) with N ≥ the server's major, ascending.
- *  A candidate qualifies only if the SAME directory holds both `pg_dump` and `pg_restore`, both
- *  report the same major, and that major is ≥ the server's. The first qualifying pair is used for
- *  every dump/restore call. An incompatible pair, such as PostgreSQL 14 tools first on PATH against
- *  the 16 server, is recorded and skipped, never used. Discovery is offline: no download, install
- *  or network.
- * If nothing qualifies, a named precondition fails, listing every directory and major it examined:
- * a missing or old toolchain is a stated precondition, not evidence. CI's datamechanics job
- * installs `postgresql-client-16` (on PATH) against the `postgres:16` service. The isolated runner
- * (`scripts/dm-isolated.sh`) runs vitest on the host, which may carry an older PATH pair beside a
- * Homebrew `postgresql@16+` keg. PG* variables are scrubbed from every child environment, and the
- * archive lives in a disposable temp directory removed afterwards.
+ * TOOLCHAIN. The round trip needs pg_dump and pg_restore of EXACTLY the server's major:
+ *  - an older pg_dump refuses to dump the newer server;
+ *  - a newer one writes session settings the older server rejects on restore (PostgreSQL 18
+ *    tools against a 16 server fail on `transaction_timeout`).
+ * Neither failure is product evidence. Selection, in order:
+ *  1. Host pairs, after `scripts/staging-refresh.sh`'s discipline:
+ *     · `PG_BIN` when set is the ONLY host candidate (an explicit pin is honored or refused, and
+ *       never silently overridden);
+ *     · otherwise each PATH directory, in PATH order;
+ *     · then the installed Homebrew keg of exactly the server's major
+ *       (`/opt/homebrew/opt/postgresql@<major>/bin`, or `/usr/local/opt/...`).
+ *     A host candidate qualifies only if ONE directory holds both tools and both report exactly
+ *     the server's major. A mismatched pair (PATH 14, Homebrew 18) is recorded and skipped, never
+ *     used. Host discovery is offline: two directory listings, no download, no install.
+ *  2. Otherwise, unless `PG_BIN` pins the host, the client tools INSIDE the isolated data-mechanics
+ *     container that owns `DATABASE_TEST_URL`. It is identified only from the runner's own facts:
+ *     · exactly ONE running container publishes the URL's host port as `->5432/tcp`
+ *       (`scripts/dm-isolated.sh` uses `-p 0:5432`);
+ *     · it has the runner's `aios-dm-<8 hex>` name shape (no worktree hash assumed);
+ *     · its image is `postgres:<major>`;
+ *     · its cluster `system_identifier` equals the one read through `DATABASE_TEST_URL`;
+ *     · its own `pg_dump` and `pg_restore` both report exactly the server's major.
+ *     Any ambiguity or mismatch refuses this route. Its proof is still a REAL custom-format
+ *     `pg_dump` and a REAL `pg_restore`, run by `docker exec` against the SAME scratch databases
+ *     through the container's own loopback (`127.0.0.1:5432`):
+ *     · the archive is written into a private `mkdir -m 700` directory inside that container;
+ *     · the filtered TOC list is written on the host and `docker cp`'d in;
+ *     · the directory is removed in `finally`.
+ *     Nothing in the archive is edited or stripped.
+ * CI's datamechanics job has `postgresql-client-16` on PATH against the `postgres:16` service, so
+ * the PATH pair remains its first successful route. If no route qualifies, a named precondition
+ * fails, listing each directory or container fact it examined (paths, names, images, majors and
+ * booleans; never URLs or credentials). PG* variables are scrubbed from every child environment, and
+ * the host temp directory is removed afterwards.
  *
  * PRIVACY. Rows hold only synthetic cursor/history values, and rows are compared only by md5
  * digest. A failing tool is reported with its exit code and its `error:` lines only, with database
@@ -155,8 +170,12 @@ function requireIsolatedTestUrl(raw: string | undefined): string {
 }
 
 const execFileAsync = promisify(execFile);
-/** A real client tool, PG* scrubbed; failure reports exit code and redacted `error:` lines only. */
-async function runTool(tool: string, args: string[]): Promise<string> {
+/**
+ * A real process (a host client tool, or `docker`), PG* scrubbed from its environment. Failure
+ * reports a bounded label, the exit code and the redacted `error:` lines only: never a URL, never
+ * COPY/row context.
+ */
+async function runTool(tool: string, args: string[], label = tool): Promise<string> {
   const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith("PG")));
   try {
     const { stdout } = await execFileAsync(tool, args, { env, encoding: "utf8", maxBuffer: 256 * 1024 * 1024, timeout: 240_000 });
@@ -164,14 +183,15 @@ async function runTool(tool: string, args: string[]): Promise<string> {
   } catch (error) {
     const e = (error ?? {}) as { code?: unknown; stderr?: unknown };
     const errors = String(e.stderr ?? "").split("\n")
-      .filter((line) => /^(pg_dump|pg_restore): error:/.test(line) && !/COPY|Failing row|line \d+:/i.test(line))
+      .filter((line) => /^(pg_dump|pg_restore|psql): error:|^Error( response from daemon)?:/.test(line) && !/COPY|Failing row|line \d+:/i.test(line))
       .map((line) => line.replace(/postgres(?:ql)?:\/\/\S+/gi, "[redacted database URL]").slice(0, 300));
-    throw new Error(`${tool} failed (exit ${String(e.code)}): ${errors.join(" | ") || "no error line"}`);
+    throw new Error(`${label} failed (exit ${String(e.code)}): ${errors.join(" | ") || "no error line"}`);
   }
 }
-const toolMajor = async (tool: string): Promise<number | null> => {
+/** The PostgreSQL major a `--version` invocation reports, or null if it cannot be read. */
+const toolMajor = async (tool: string, prefix: string[] = []): Promise<number | null> => {
   try {
-    const match = /\(PostgreSQL\)\s+(\d+)/.exec(await runTool(tool, ["--version"]));
+    const match = /\(PostgreSQL\)\s+(\d+)/.exec(await runTool(tool, [...prefix, "--version"]));
     return match ? Number(match[1]) : null;
   } catch {
     return null;
@@ -194,13 +214,12 @@ const isExecutable = (file: string): boolean => {
   }
 };
 /**
- * Candidate bin directories, in the order they are tried, after `scripts/staging-refresh.sh`'s
+ * Candidate HOST bin directories, in the order they are tried, after `scripts/staging-refresh.sh`'s
  * client discipline:
  *  - `PG_BIN` when set is an explicit pin and the ONLY candidate (never silently overridden);
  *  - else every PATH directory, in PATH order;
- *  - else every INSTALLED Homebrew versioned keg (`/opt/homebrew/opt` or `/usr/local/opt`,
- *    `postgresql@N` with N ≥ the server's major), ascending, so an exact server-major keg comes
- *    first.
+ *  - else the INSTALLED Homebrew keg of EXACTLY the server's major (`/opt/homebrew/opt` or
+ *    `/usr/local/opt`, `postgresql@<server major>`).
  * Bounded and offline: two directory listings, no download, no install, no network.
  */
 function candidateBins(serverMajor: number): Array<{ bin: string; source: string }> {
@@ -217,16 +236,17 @@ function candidateBins(serverMajor: number): Array<{ bin: string; source: string
     const majors = entries
       .map((entry) => /^postgresql@(\d+)$/.exec(entry))
       .flatMap((match) => (match ? [Number(match[1])] : []))
-      .filter((major) => major >= serverMajor)
-      .sort((a, b) => a - b);
+      .filter((major) => major === serverMajor);
     for (const major of majors) candidates.push({ bin: join(prefix, `postgresql@${major}`, "bin"), source: `Homebrew postgresql@${major}` });
   }
   return candidates;
 }
 /**
- * The FIRST candidate directory holding BOTH executables whose reported majors are equal and ≥ the
- * server's. An incompatible pair is recorded and skipped, never used. `examined` lists every pair
- * that was inspected (directory and majors only), for the precondition's failure message.
+ * The FIRST candidate directory holding BOTH executables whose reported majors are BOTH exactly the
+ * server's. EXACT, not ≥: a newer pg_dump emits session settings an older server rejects on restore
+ * (PostgreSQL 17+ archives carry `transaction_timeout`, which a 16 server refuses), and an older one
+ * refuses to dump. A mismatched pair is recorded and skipped, never used. `examined` lists every
+ * pair inspected (directory and majors only), for the precondition's failure message.
  */
 async function resolvePgClients(serverMajor: number): Promise<{ pair: PgClientPair | null; examined: string[] }> {
   const examined: string[] = [];
@@ -238,11 +258,108 @@ async function resolvePgClients(serverMajor: number): Promise<{ pair: PgClientPa
     const dumpMajor = await toolMajor(join(bin, "pg_dump"));
     const restoreMajor = await toolMajor(join(bin, "pg_restore"));
     examined.push(`${source} ${bin}: pg_dump ${dumpMajor ?? "unreadable"}, pg_restore ${restoreMajor ?? "unreadable"}`);
-    if (dumpMajor !== null && restoreMajor !== null && dumpMajor === restoreMajor && dumpMajor >= serverMajor) {
+    if (dumpMajor === serverMajor && restoreMajor === serverMajor) {
       return { pair: { bin, source, dumpMajor, restoreMajor }, examined };
     }
   }
   return { pair: null, examined };
+}
+
+/**
+ * The isolated data-mechanics container that OWNS `DATABASE_TEST_URL`, found only from the
+ * runner's own facts and refused on any ambiguity. Every check must hold:
+ *  - exactly ONE running container publishes the URL's loopback host port as `->5432/tcp`
+ *    (`scripts/dm-isolated.sh` runs `-p 0:5432`);
+ *  - its name has the runner's shape (`aios-dm-<8 hex>`), with no worktree hash assumed;
+ *  - its image is `postgres:<server major>`;
+ *  - its cluster `system_identifier`, read inside it, equals the one read through
+ *    `DATABASE_TEST_URL` (the SAME server, not a look-alike);
+ *  - its own `pg_dump` and `pg_restore` both report exactly the server's major.
+ * `facts` is a bounded record (counts, container name, image, booleans, majors) for the
+ * precondition message. It never holds a URL or a credential.
+ */
+async function discoverIsolatedContainer(
+  adminUrl: string, serverMajor: number, hostSystemId: string,
+): Promise<{ container: { id: string; name: string } | null; facts: string[] }> {
+  const facts: string[] = [];
+  const port = new URL(adminUrl).port;
+  let listing = "";
+  try {
+    listing = await runTool("docker", ["ps", "--filter", "status=running", "--no-trunc", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Ports}}"], "docker ps");
+  } catch {
+    facts.push("isolated container: docker unavailable");
+    return { container: null, facts };
+  }
+  const publishes = new RegExp(`(?:^|[\\s,])[^\\s,]*:${port}->5432/tcp(?=$|[\\s,])`);
+  const matches = listing.split("\n").filter(Boolean).map((line) => line.split("\t"))
+    .filter((columns) => columns.length >= 4 && publishes.test(columns[3]));
+  facts.push(`isolated container: ${matches.length} running container(s) publish host port ${port} as 5432/tcp`
+    + (matches.length ? ` (${matches.slice(0, 5).map((columns) => columns[1]).join(", ")})` : ""));
+  if (matches.length !== 1) return { container: null, facts };
+  const [id, name, image] = matches[0];
+  const runnerNamed = /^aios-dm-[0-9a-f]{8}$/.test(name);
+  const exactImage = image === `postgres:${serverMajor}`;
+  facts.push(`${name}: runner-named ${runnerNamed}, image postgres:${serverMajor} ${exactImage}`);
+  if (!runnerNamed || !exactImage) return { container: null, facts };
+  const inside = inContainerUrl(adminUrl);
+  const containerSystemId = (await runTool("docker",
+    ["exec", id, "psql", "-X", "-tA", "-c", "select system_identifier::text from pg_catalog.pg_control_system()", inside],
+    `psql in ${name}`).catch(() => "")).trim();
+  const sameCluster = containerSystemId !== "" && containerSystemId === hostSystemId;
+  facts.push(`${name}: same cluster as DATABASE_TEST_URL ${sameCluster}`);
+  if (!sameCluster) return { container: null, facts };
+  const dumpMajor = await toolMajor("docker", ["exec", id, "pg_dump"]);
+  const restoreMajor = await toolMajor("docker", ["exec", id, "pg_restore"]);
+  facts.push(`${name}: pg_dump ${dumpMajor ?? "unreadable"}, pg_restore ${restoreMajor ?? "unreadable"}`);
+  if (dumpMajor !== serverMajor || restoreMajor !== serverMajor) return { container: null, facts };
+  return { container: { id, name }, facts };
+}
+/** The same database as the container itself reaches it: its own loopback on the server port. */
+function inContainerUrl(hostUrl: string): string {
+  const url = new URL(hostUrl);
+  url.hostname = "127.0.0.1";
+  url.port = "5432";
+  return url.toString();
+}
+
+/** The selected REAL pg_dump/pg_restore pair, wherever it runs. */
+interface PgClients {
+  /** Bounded identity for messages: the directory or container name, and the major. */
+  identity: string;
+  run(tool: "pg_dump" | "pg_restore", args: string[]): Promise<string>;
+  /** A scratch database's URL as the tools must use it. */
+  url(hostUrl: string): string;
+  /** Where the tools read and write a disposable artifact. */
+  path(name: string): string;
+  /** Make the host-written file `hostFile` readable by the tools at `path(name)`. */
+  stage(hostFile: string, name: string): Promise<void>;
+  /** Remove every artifact the tools wrote outside the host temp directory. */
+  cleanup(): Promise<void>;
+}
+const hostClients = (pair: PgClientPair, hostDirectory: string): PgClients => ({
+  identity: `${pair.source} ${pair.bin} (PostgreSQL ${pair.dumpMajor})`,
+  run: (tool, args) => runTool(join(pair.bin, tool), args, tool),
+  url: (hostUrl) => hostUrl,
+  path: (name) => join(hostDirectory, name),
+  stage: async () => {},
+  cleanup: async () => {},
+});
+/** The container route: archive and list live in a private directory inside that exact container. */
+async function containerClients(container: { id: string; name: string }, serverMajor: number): Promise<PgClients> {
+  const workdir = `/tmp/slack-mr02-${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+  await runTool("docker", ["exec", container.id, "mkdir", "-m", "700", workdir], `mkdir in ${container.name}`);
+  return {
+    identity: `isolated container ${container.name} (PostgreSQL ${serverMajor})`,
+    run: (tool, args) => runTool("docker", ["exec", container.id, tool, ...args], `${tool} in ${container.name}`),
+    url: inContainerUrl,
+    path: (name) => `${workdir}/${name}`,
+    stage: async (hostFile, name) => {
+      await runTool("docker", ["cp", hostFile, `${container.id}:${workdir}/${name}`], `docker cp into ${container.name}`);
+    },
+    cleanup: async () => {
+      await runTool("docker", ["exec", container.id, "rm", "-rf", workdir], `cleanup in ${container.name}`).catch(() => "");
+    },
+  };
 }
 
 /** The whitespace-exact reads the fingerprint's collapsing would blur. */
@@ -409,26 +526,35 @@ describe("AM-F2 + AC-02 history/segment block — MR-02 catalog fidelity (real P
     // ── Toolchain precondition, stated by name. ──
     const serverMajor = await withClient(urls.loader, async (client) =>
       (await client.query<{ major: number }>("select (pg_catalog.current_setting('server_version_num')::int / 10000) as major")).rows[0].major);
+    // An EXACT-major host pair first (PG_BIN, else PATH, else the Homebrew keg); else, unless PG_BIN
+    // pins the host, the exact-major client inside the isolated container that owns DATABASE_TEST_URL.
     const { pair, examined } = await resolvePgClients(serverMajor);
-    expect({
-      compatiblePair: pair !== null,
-      pgDumpAtLeastServer: (pair?.dumpMajor ?? 0) >= serverMajor,
-      pgRestoreAtLeastServer: (pair?.restoreMajor ?? 0) >= serverMajor,
-      sameMajor: pair !== null && pair.dumpMajor === pair.restoreMajor,
-    }, `toolchain precondition: one bin directory must hold pg_dump AND pg_restore of the same PostgreSQL major >= the server's ${serverMajor} `
-      + `(PG_BIN, else PATH, else installed Homebrew postgresql@N). Examined: ${examined.join("; ") || "no directory held both tools"}`).toEqual({
-      compatiblePair: true, pgDumpAtLeastServer: true, pgRestoreAtLeastServer: true, sameMajor: true,
-    });
-    const pgDump = join((pair as PgClientPair).bin, "pg_dump");
-    const pgRestore = join((pair as PgClientPair).bin, "pg_restore");
-
+    const facts = [...examined];
     const directory = await mkdtemp(join(tmpdir(), "slack-mr02-"));
+    let clients: PgClients | null = null;
     try {
-      // ── The REAL dump, in the staging rollback path's archive shape. ──
-      const archive = join(directory, "slack-mr02.dump");
-      await runTool(pgDump, ["--format=custom", "--schema=public", `--file=${archive}`, urls.loader]);
+      if (pair) {
+        clients = hostClients(pair, directory);
+      } else if (process.env.PG_BIN) {
+        facts.push("PG_BIN pins the host toolchain, so the isolated-container client is not considered");
+      } else {
+        const hostSystemId = await withClient(adminUrl, async (client) =>
+          (await client.query<{ id: string }>("select system_identifier::text as id from pg_catalog.pg_control_system()")).rows[0].id);
+        const { container, facts: containerFacts } = await discoverIsolatedContainer(adminUrl, serverMajor, hostSystemId);
+        facts.push(...containerFacts);
+        if (container) clients = await containerClients(container, serverMajor);
+      }
+      expect({ exactMajorPair: clients !== null },
+        `toolchain precondition: pg_dump AND pg_restore of EXACTLY the server's PostgreSQL major ${serverMajor}, from one host bin `
+        + `directory (PG_BIN, else PATH, else installed Homebrew postgresql@${serverMajor}) or from the isolated container that owns `
+        + `DATABASE_TEST_URL. Examined: ${facts.join("; ") || "no directory held both tools"}`).toEqual({ exactMajorPair: true });
+      const tools = clients as PgClients;
+
+      // ── The REAL dump, in the staging rollback path's archive shape, by the selected pair. ──
+      const archive = tools.path("slack-mr02.dump");
+      await tools.run("pg_dump", ["--format=custom", "--schema=public", `--file=${archive}`, tools.url(urls.loader)]);
       // The restore's DDL (no data): an EMPTY search_path, and the schema-qualified validator in the CHECKs.
-      const ddl = await runTool(pgRestore, ["--schema-only", "--file=-", archive]);
+      const ddl = await tools.run("pg_restore", ["--schema-only", "--file=-", archive]);
       expect({
         emptySearchPath: ddl.includes("SELECT pg_catalog.set_config('search_path', '', false);"),
         // Only a CHECK body renders the call after WHEN; the function's own CREATE does not.
@@ -437,18 +563,20 @@ describe("AM-F2 + AC-02 history/segment block — MR-02 catalog fidelity (real P
       }, "the archive restores under an empty search_path, with the qualified validator and every named CHECK").toEqual({
         emptySearchPath: true, qualifiedValidator: true, namesEveryCheck: true,
       });
-      // The staging path's own TOC filter: the fresh database already has `public`.
-      const listPath = join(directory, "slack-mr02.list");
-      await writeFile(listPath, filterRestoreList(await runTool(pgRestore, ["--list", archive])).text, { mode: 0o600 });
+      // The staging path's own TOC filter: the fresh database already has `public`. The filtered
+      // list is written on the host, then staged where the selected pg_restore can read it.
+      const hostListPath = join(directory, "slack-mr02.list");
+      await writeFile(hostListPath, filterRestoreList(await tools.run("pg_restore", ["--list", archive])).text, { mode: 0o600 });
+      await tools.stage(hostListPath, "slack-mr02.list");
 
       // ── The REAL restore into a fresh database (citext pre-installed, as schema.sql would). ──
       const restoredUrl = await createScratch("restored");
       await withClient(restoredUrl, async (client) => {
         await client.query("create extension if not exists citext");
       });
-      await runTool(pgRestore, [
+      await tools.run("pg_restore", [
         "--exit-on-error", "--single-transaction", "--no-owner", "--no-privileges",
-        `--use-list=${listPath}`, `--dbname=${restoredUrl}`, archive,
+        `--use-list=${tools.path("slack-mr02.list")}`, `--dbname=${tools.url(restoredUrl)}`, archive,
       ]);
 
       // ── Restored == source, read on fresh sessions. ──
@@ -481,6 +609,9 @@ describe("AM-F2 + AC-02 history/segment block — MR-02 catalog fidelity (real P
       expect(await withClient(restoredUrl, exactSlackCatalog), "after replay: CHECK definitions and validator metadata/body unchanged").toEqual(sourceExact);
       expect(await withClient(restoredUrl, rowDigests), "after replay: every channel and thread row byte-identical, updated_at included").toEqual(sourceRows);
     } finally {
+      // The container route's private directory first, then the host temp directory; neither
+      // cleanup can replace the primary failure.
+      await clients?.cleanup().catch(() => {});
       await rm(directory, { recursive: true, force: true }).catch(() => {});
     }
   }, SCRATCH_TIMEOUT);
