@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { Client } from "pg";
 import { describe, expect, it } from "vitest";
@@ -193,19 +193,40 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *         presence;
  *    B8 · DONE (continuation 4), in `slack-history-progress-conflicts`. Marked-mirror refusal is
  *         EXHAUSTIVE: the matrix, the state refusals, and twins of every dedicated migration-only
- *         refusal. The REAL deploy loader refuses a representative five (whole-loader refusal for
- *         the rest of the matrix stays open);
+ *         refusal. The B8 TAIL is DONE in continuation 6: the REAL deploy loader refuses EVERY
+ *         one of those fixtures, plus the three replay-time refusals. No fixture is excluded; the
+ *         source-backed reachability is noted at the conflicts suite's LOADER_SET;
  *    C9 · DH-11: the legacy three-column test, renamed to `re-adds the three legacy
  *         metadata/provisional columns without restarting an initialized segment`, and maximum
  *         histories through the unrelated writers;
- *    C10 · MR-05: tracked oracles for the comment-only-migration and mirror-drift mutations; the
- *         structural sweeps stay coordinator-run;
+ *    C10 · DONE (continuation 6): tracked, restorable MR-05 mutation HOOKS, with no production
+ *         edit. An ABSOLUTE path in an environment variable redirects the source the tests read:
+ *         · `AIO1170_MR05_MIGRATION_FILE` (this file and the conflicts suite): a comment-only
+ *           migration copy must fail this file's migration-only legacy case on its CATALOG
+ *           assertion;
+ *         · `AIO1170_MR05_SCHEMA_FILE` (the conflicts suite): a mirror-block-only drifted schema
+ *           copy must fail the static parity assertion.
+ *         A static guard test in each file fails any run with a hook set. The coordinator still
+ *         executes baseline, mutant and restored runs, and the structural sweeps;
  *    and, not scheduled here: the omitted-lease-invalidation mutant (not measured), the §9 named
  *    DH-11 source-fence tests, and MR-06 (held until PR743 staging).
  */
 
 const SCRATCH_TIMEOUT = 300_000;
-const MIGRATION = join(process.cwd(), "postgres", "migrations", "20261023120000_slack_channel_history_segments.sql");
+/**
+ * MR-05 controlled-mutation hook (C10). An ABSOLUTE path in `AIO1170_MR05_MIGRATION_FILE`
+ * replaces the migration SOURCE these cases read. A readable COMMENT-ONLY copy then executes as
+ * an empty statement, so the migration-only legacy case fails on its CATALOG assertion, not on
+ * file access or parsing, while every schema-first build stays green. Restoring is unsetting the
+ * variable. The guard test below fails ANY run where the hook is set.
+ */
+function migrationOverride(fallback: string): string {
+  const value = process.env.AIO1170_MR05_MIGRATION_FILE;
+  if (value === undefined || value === "") return fallback;
+  if (!isAbsolute(value)) throw new Error("AIO1170_MR05_MIGRATION_FILE must be an absolute path");
+  return value;
+}
+const MIGRATION = migrationOverride(join(process.cwd(), "postgres", "migrations", "20261023120000_slack_channel_history_segments.sql"));
 
 /** The eight columns §3.1 and §4 add, in name order. */
 const NEW_COLUMNS = [
@@ -349,6 +370,12 @@ const TEAM_ID = "5a1b2c3d-4e5f-4a6b-8c7d-0e1f2a3b4c5d";
 const WORKSPACE = "T0UPGRADE1";
 const CHANNEL = "C0UPGRADE1";
 const ROOT = "1718900200.000200";
+
+describe("AM-F2 + AC-02 history/segment migration — MR-05 mutation-hook guard (static)", () => {
+  it("MR-05 the controlled-mutation hook is unset, so this run reads the real migration", () => {
+    expect(process.env.AIO1170_MR05_MIGRATION_FILE ?? "", "AIO1170_MR05_MIGRATION_FILE is set: this is a mutation run, not a normal one").toBe("");
+  });
+});
 
 describe("AM-F2 + AC-02 history/segment migration — direct populated pre-F2 upgrade (real Postgres)", () => {
   it(

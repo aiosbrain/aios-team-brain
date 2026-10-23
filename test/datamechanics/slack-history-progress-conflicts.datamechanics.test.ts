@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { Client } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -88,8 +88,9 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *    (AC02). Both paths use the same runner, the same expected static error and the same
  *    rollback evidence. B8 (continuation 4) makes the mirror EXHAUSTIVE: every matrix case, the
  *    state refusals, and literal twins of the dedicated migration-only refusals. The REAL deploy
- *    loader (whole `schema.sql`, one atomic query, run before any migration) refuses a
- *    representative set. Its notices go to its own logger and are not asserted.
+ *    loader (whole `schema.sql`, one atomic query, run before any migration) refuses EVERY one of
+ *    those fixtures (B8 tail, continuation 6), with the source-backed reachability noted at
+ *    LOADER_SET. Its notices go to its own logger and are not asserted.
  *    POSTGRESQL 16 REPRESENTABILITY:
  *    · an IDENTITY column must be smallint/integer/bigint, so it cannot be built on an owned jsonb
  *      or text column; GENERATED is covered instead;
@@ -148,7 +149,8 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *    identity is guaranteed, and from-zero columns sit in different attribute positions from
  *    upgraded ones. GREEN since the comment was corrected at 83162b68.
  *
- * TEST COUNT: 117 = 4 static + 113 database. The database tests are:
+ * TEST COUNT: 161 = 5 static (including the MR-05 mutation-hook guard) + 156 database. The
+ * database tests are:
  *  - 17 earlier: loader catalog, direct catalog, defaulted helper, 3 state rejections, 5 persisted
  *    histories, 2 restart-hiding, validator truth table, CHECK matrix, union restart, one-lane
  *    replay;
@@ -158,9 +160,11 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *    · 2 state refusals;
  *    · 9 literal twins of the dedicated migration-only refusals (defaulted helper, the two
  *      newest-lane state rejections, five persisted-history defects, segment-only restart-hiding);
- *  - 5 whole-schema refusals through the REAL deploy loader (representative set);
- *  - 8 replay-time cases (B5/B6), each run through BOTH the migration and the marked mirror
- *    statement:
+ *  - 45 whole-schema refusals through the REAL deploy loader: the same exhaustive set, every
+ *    fixture reachable;
+ *  - 11 replay-time cases (B5/B6). The three refusals run through the migration, the marked mirror
+ *    AND the real loader (9), and the committing replacement runs through the migration and the
+ *    mirror (2):
  *    · a pure replay (all eight columns present) refusing a stored invalid progress tuple left
  *      behind a removed CHECK (AC02);
  *    · the historical-lane legacy null-anchor/non-null-cursor refusal (AM_F2);
@@ -206,8 +210,6 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *    · a COMMITTING segment-only introduction on an F2-only SCHEMA state (only its refusal is here);
  *    · staged/published/ledger evidence rows.
  *  - MR-04 refusals not yet exercised:
- *    · whole-schema (full-loader) refusal for the REST of the matrix (only a representative five
- *      run through the real loader);
  *    · (not missing, for clarity: the B5/B6 replay-time cases run through both the migration and
  *      the marked mirror. Of the B7 cases, only cancellation does; concurrency uses two migration
  *      executions, and the later-query retry starts from the complete loader, then uses migration
@@ -222,8 +224,24 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
 
 const SCRATCH_TIMEOUT = 300_000;
 const ROOT = process.cwd();
-const MIGRATION_PATH = join(ROOT, "postgres", "migrations", "20261023120000_slack_channel_history_segments.sql");
-const SCHEMA_PATH = join(ROOT, "postgres", "schema.sql");
+/**
+ * MR-05 controlled-mutation hooks (C10). An ABSOLUTE path in `AIO1170_MR05_MIGRATION_FILE` /
+ * `AIO1170_MR05_SCHEMA_FILE` replaces the migration / schema SOURCE this file reads, so the
+ * coordinator can run a mutant from a scratch copy without touching production files:
+ *  - a mirror-block-only drift in a schema copy must fail the static parity assertion;
+ *  - a comment-only migration copy must fail the migration-path catalog/state assertions.
+ * Restoring is unsetting the variable. The full-loader entrypoint always reads the real tree.
+ * The guard test below fails ANY run where a hook is set, so a normal or CI run cannot pass
+ * through an override.
+ */
+function mutationOverride(variable: string, fallback: string): string {
+  const value = process.env[variable];
+  if (value === undefined || value === "") return fallback;
+  if (!isAbsolute(value)) throw new Error(`${variable} must be an absolute path`);
+  return value;
+}
+const MIGRATION_PATH = mutationOverride("AIO1170_MR05_MIGRATION_FILE", join(ROOT, "postgres", "migrations", "20261023120000_slack_channel_history_segments.sql"));
+const SCHEMA_PATH = mutationOverride("AIO1170_MR05_SCHEMA_FILE", join(ROOT, "postgres", "schema.sql"));
 const MARKER = "slack-channel-history-segments-upgrade";
 const AM_F2 = "AM_F2_UPGRADE_INVALID_STATE";
 const AC02 = "AC02_PROGRESS_UPGRADE_INVALID_STATE";
@@ -505,6 +523,12 @@ const withoutLineComments = (sql: string): string => sql.replace(/--[^\n]*/g, ""
 const MIRROR_STATEMENT = markedStatement(schemaText);
 
 describe("AM-F2 + AC-02 history/segment block — static source fences (DH-11, MR-02 parity)", () => {
+  it("MR-05 the controlled-mutation hooks are unset, so this run reads the real migration and schema", () => {
+    expect({
+      migration: process.env.AIO1170_MR05_MIGRATION_FILE ?? "", schema: process.env.AIO1170_MR05_SCHEMA_FILE ?? "",
+    }, "an AIO1170_MR05_* hook is set: this is a mutation run, not a normal one").toEqual({ migration: "", schema: "" });
+  });
+
   it("DH-11 each file carries exactly one marker pair in order, the migration has nothing executable outside it, and both statements are byte-identical", () => {
     const counts = (text: string) => ({
       begin: occurrences(text, `${MARKER}:begin`), end: occurrences(text, `${MARKER}:end`),
@@ -1170,23 +1194,22 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
   /** EXHAUSTIVE: every migration refusal of the matrix, the state refusals, and the migration-only twins. */
   const MIRROR_SET: Refusal[] = [...MIGRATION_MATRIX, ...STATE_REFUSALS, ...MIGRATION_ONLY_TWINS];
   /**
-   * The REAL deploy loader as a refusal entrypoint, on a representative set. It reaches a planted
-   * state because `loadSchema` runs the whole `schema.sql` FIRST, as one atomic query, and the
-   * mirrored block inside it refuses before any migration file runs. So the rollback unit is the
-   * whole schema query.
+   * The REAL deploy loader as a refusal entrypoint, for EVERY refusal fixture (B8 tail). It
+   * reaches each planted state because `loadSchema` runs the whole `schema.sql` FIRST, as one
+   * atomic query, and the mirrored block inside it refuses before any migration file runs. So the
+   * rollback unit is the whole schema query.
+   *
+   * Source-backed reachability: nothing in `schema.sql` BEFORE the marked block references the
+   * eight owned columns, the validator or the four named CHECKs. Its only earlier
+   * `slack_sync_channels` DDL is:
+   *  - the no-op `create table if not exists`;
+   *  - the legacy three-column `add column if not exists`;
+   *  - the binding trigger;
+   *  - two indexes;
+   *  - the `ts_syntax` drop and re-add, which every fixture row satisfies.
+   * So no fixture is excluded.
    */
-  const LOADER_REPRESENTATIVE_IDS = [
-    "wrong-kind FOREIGN KEY holding slack_sync_channels_historical_cursor_history_check",
-    "partial newest segment unit, 2 of 3 present",
-    "metadata progress column over a text DOMAIN",
-    "validator security definer",
-    "state inactive historical lane carrying an attempt-oldest",
-  ];
-  const LOADER_SET: Refusal[] = LOADER_REPRESENTATIVE_IDS.map((id) => {
-    const found = MIRROR_SET.find((refusal) => refusal.id === id);
-    if (!found) throw new Error(`refusal matrix: no case named ${id}`);
-    return found;
-  });
+  const LOADER_SET: Refusal[] = MIRROR_SET;
 
   it.each(MIGRATION_MATRIX)("MR-04 migration refuses $id statically before any mutation and rolls back whole", async (refusal) => {
     await runRefusal(refusal, "migration");
@@ -1254,7 +1277,7 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
       fact: { weaker: [{ kind: "c", definition: "CHECK (true)" }], outside: true },
     },
   ];
-  it.each(REPLAY_REFUSALS.flatMap((refusal) => (["migration", "schema mirror"] as Entry[]).map((entry) => ({ ...refusal, entry }))))(
+  it.each(REPLAY_REFUSALS.flatMap((refusal) => (["migration", "schema mirror", "full loader"] as Entry[]).map((entry) => ({ ...refusal, entry }))))(
     "MR-04 $entry refuses $id statically and rolls back whole", async (refusal) => {
       await runRefusal(refusal, refusal.entry);
     }, SCRATCH_TIMEOUT);
