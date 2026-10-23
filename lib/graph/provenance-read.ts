@@ -1,6 +1,6 @@
 import "server-only";
 
-import { authorizationEpoch } from "@/lib/access/authorization-epoch";
+import { revocationEpoch } from "@/lib/access/authorization-epoch";
 import type { DbClient } from "@/lib/db/types";
 import {
   authorizedArcFacts,
@@ -111,7 +111,9 @@ export async function readAuthorizedGraphFactsResult(
   const terms = queryTerms(args.query ?? "");
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const epoch = await authorizationEpoch(db, args.teamId);
+    // Graph facts carry no person attribution, so a pending attribution repair does not gate them;
+    // the revocation barrier still binds read, provenance resolution and publication.
+    const epoch = await revocationEpoch(db, args.teamId);
     try {
       const authorized: PositionedFact[] = [];
       let checked = 0;
@@ -155,7 +157,7 @@ export async function readAuthorizedGraphFactsResult(
         more = graph.facts.length === take;
         if (!more) break;
       }
-      if (await authorizationEpoch(db, args.teamId) !== epoch) {
+      if (await revocationEpoch(db, args.teamId) !== epoch) {
         throw new ArcSynthesisAuthorizationChangedError();
       }
       const { facts, overflowAt } = selectPrefix(authorized, args.query ?? "", limit);

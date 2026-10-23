@@ -667,6 +667,23 @@ class StateStore:
             return None
         return int(row["dirty_seq"])
 
+    def pending_hint_connections(self, team: str) -> dict[str, int]:
+        """Connections of ``team`` with any unacknowledged stream hint, each with a marker that grows
+        with every notification on any of its streams (the sum of their dirty sequences).
+
+        The scheduler's coalesced wake-up reads this: one entry per connection however many streams
+        or notifications are dirty, so a burst of notifications is one triggered run, and a marker
+        it has already acted on does not trigger another.
+        """
+        rows = self._db.execute(
+            "SELECT connection_id, SUM(dirty_seq) AS seq FROM stream_hints "
+            "WHERE team=? GROUP BY connection_id "
+            "HAVING SUM(CASE WHEN dirty_seq>acked_seq THEN 1 ELSE 0 END) > 0 "
+            "ORDER BY connection_id",
+            (team,),
+        ).fetchall()
+        return {str(row["connection_id"]): int(row["seq"]) for row in rows}
+
     def ack_stream_hint(self, key: StreamKey, observed_seq: int) -> None:
         """Acknowledge exactly what a drain observed before it began reading.
 
@@ -1565,6 +1582,17 @@ class StateStore:
         upsert it supersedes, for a document the replacement does not hold, is owed no longer and
         is no claim.
         """
+        return bool(self.streams_claiming(connection_id, generation, namespace, provider_id))
+
+    def streams_claiming(
+        self, connection_id: str, generation: int, namespace: str, provider_id: str,
+    ) -> list[str]:
+        """The namespaces of the other streams that claim one document (see ``claimed_elsewhere``).
+
+        Which streams matter as well as whether: a claim held by a stream that cannot read its own
+        change log is retained evidence, not a current observation.
+        """
+        claimants: list[str] = []
         for row in self._db.execute(
             "SELECT namespace,active_snapshot,building_snapshot FROM stream_progress "
             "WHERE connection_id=? AND generation=? AND namespace<>?",
@@ -1575,18 +1603,18 @@ class StateStore:
                 "WHERE namespace=? AND generation=? AND status='superseded'",
                 (row["namespace"], generation),
             ).fetchall()]
-            for snapshot in (row["active_snapshot"], row["building_snapshot"], *superseded):
-                if snapshot is not None and self.has_membership(
+            if any(
+                snapshot is not None and self.has_membership(
                     row["namespace"], generation, provider_id, snapshot_id=int(snapshot),
-                ):
-                    return True
-            if self._db.execute(
+                )
+                for snapshot in (row["active_snapshot"], row["building_snapshot"], *superseded)
+            ) or self._db.execute(
                 "SELECT 1 FROM pending_work WHERE namespace=? AND generation=? AND item_key=? "
                 "AND action='upsert' AND acknowledged_at IS NULL AND superseded_at IS NULL",
                 (row["namespace"], generation, provider_id),
             ).fetchone() is not None:
-                return True
-        return False
+                claimants.append(str(row["namespace"]))
+        return claimants
 
     def remove_membership(self, namespace: str, generation: int, provider_id: str,
                           *, snapshot_id: int | None = None) -> bool:

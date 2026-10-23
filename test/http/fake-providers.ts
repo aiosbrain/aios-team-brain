@@ -1,10 +1,14 @@
+import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { resolve } from "node:path";
+import { parse as parseYaml } from "yaml";
 // Type-only and erased at runtime (the global setup must not load vitest's runtime). A `declare module`
 // augmentation never adds its target to the TS program, and `test/` is tsconfig-excluded, so this import
 // is what makes `vitest` resolvable for the ProvidedContext augmentation below under `tsc --noEmit`.
 import type {} from "vitest";
 import { scrubbedEnv } from "../../scripts/test-env-scrub";
+import { expectedScriptEnv } from "../../scripts/neo4j-tier-wiring.mjs";
 
 /**
  * TEST-ONLY loopback fakes for the opt-in TIERRET-1 query harness (`vitest.tierret1-query.config.ts`).
@@ -15,7 +19,15 @@ import { scrubbedEnv } from "../../scripts/test-env-scrub";
  *     path). Every request body is captured. `/__anthropic_trap/*` is where the server's
  *     ANTHROPIC_BASE_URL points, so an Anthropic fallback is RECORDED and refused instead of leaving the
  *     machine.
- *   - fake Graphiti: `POST /search` captured and answered `{ facts: [] }`; `/healthcheck` ok.
+ *   - fake Graphiti: `GRAPHITI_URL` is what switches retrieval's graph leg on, so it must point at
+ *     something; graph READS no longer use Graphiti (AIO-1167: `/search` carries no source episodes, so
+ *     retrieval reads Neo4j directly and checks every fact's provenance). `POST /search` is still
+ *     captured — and must stay EMPTY, which the suite asserts — and answered `{ facts: [] }`;
+ *     `/healthcheck` ok.
+ *
+ * The graph itself is the isolated TEST Neo4j (`neo4jTestTarget` below) — not a fake: compose's
+ * `neo4j:5.26.2` on loopback bolt 7688 with the compose test credentials, started locally by
+ * `npm run db:test:neo4j:up` and in CI by the HTTP job's `neo4j` service.
  *
  * Both bind 127.0.0.1 on an ephemeral port and expose `GET /__fake/captured` + `POST /__fake/reset` so the
  * test worker (a different process from the global setup that owns them) can read what the server sent.
@@ -25,6 +37,8 @@ declare module "vitest" {
   export interface ProvidedContext {
     tierret1FakeLlmUrl: string;
     tierret1FakeGraphitiUrl: string;
+    /** The SAME compose-derived loopback target the server was pinned to — the worker seeds there. */
+    tierret1Neo4j: Neo4jTestTarget;
   }
 }
 
@@ -148,16 +162,48 @@ function assertLoopback(name: string, value: string): void {
   if (new URL(value).hostname !== "127.0.0.1") throw new Error(`TIERRET-1 query harness: ${name} must be loopback, got ${value}`);
 }
 
+export interface Neo4jTestTarget {
+  url: string;
+  user: string;
+  password: string;
+}
+
+/**
+ * The isolated test Neo4j, DERIVED from `compose.test.neo4j.yml` through the same derivation the
+ * Neo4j tier's wiring guard uses (`expectedScriptEnv`) — compose is the single owner of its bolt port
+ * and test credentials, and CI's service mirrors it (pinned by test/guards/neo4j-tier-wiring.test.ts).
+ * Never read from the environment, so no inherited NEO4J_URL can redirect this harness, and pinned to
+ * 127.0.0.1: the seeding process and the server only ever reach the loopback test service.
+ */
+export function neo4jTestTarget(): Neo4jTestTarget {
+  const compose = parseYaml(readFileSync(resolve("compose.test.neo4j.yml"), "utf8")) as unknown;
+  const derived = expectedScriptEnv(compose) as { NEO4J_URL: string; NEO4J_USER: string; NEO4J_PASSWORD: string };
+  const bolt = /^bolt:\/\/localhost:(\d+)$/.exec(derived.NEO4J_URL);
+  if (!bolt || !derived.NEO4J_USER || !derived.NEO4J_PASSWORD) {
+    throw new Error("TIERRET-1 query harness: compose.test.neo4j.yml no longer yields a loopback bolt port and test credentials");
+  }
+  const url = `bolt://127.0.0.1:${bolt[1]}`;
+  assertLoopback("NEO4J_URL", url);
+  return { url, user: derived.NEO4J_USER, password: derived.NEO4J_PASSWORD };
+}
+
 /** The exact environment the `next start` child receives. Pins every model/graph endpoint to loopback. */
 export function queryServerEnv(base: NodeJS.ProcessEnv, fakes: { llmUrl: string; graphitiUrl: string }, port: string): NodeJS.ProcessEnv {
+  const neo4j = neo4jTestTarget();
   const pins = {
     // Answering: `teams.answering_provider = 'local'` + this non-empty LLM_BASE_URL selects the fake.
     LLM_BASE_URL: `${fakes.llmUrl}/v1`,
     LLM_MODEL: FAKE_MODEL,
     // Any Anthropic fallback (e.g. an empty local URL) lands on the recorded trap, never the network.
     ANTHROPIC_BASE_URL: `${fakes.llmUrl}/__anthropic_trap`,
-    // Graph read leg → the fake /search spy. The projector stays off: this harness tests reads only.
+    // Graph read leg ON (GRAPHITI_URL is its switch) and read from the isolated test Neo4j — the
+    // provenance-complete path production uses. `scrubbedEnv` (applied below) blanks any inherited
+    // NEO4J_*; only these compose-derived loopback test values are put back over it, for this child
+    // alone. The projector stays off: reads only.
     GRAPHITI_URL: fakes.graphitiUrl,
+    NEO4J_URL: neo4j.url,
+    NEO4J_USER: neo4j.user,
+    NEO4J_PASSWORD: neo4j.password,
     GRAPH_PROJECT_ENABLED: "false",
     INGEST_POLL_ENABLED: "false",
     ATTRIBUTION_REPAIR_POLL_ENABLED: "false",
@@ -167,5 +213,6 @@ export function queryServerEnv(base: NodeJS.ProcessEnv, fakes: { llmUrl: string;
   assertLoopback("LLM_BASE_URL", pins.LLM_BASE_URL);
   assertLoopback("ANTHROPIC_BASE_URL", pins.ANTHROPIC_BASE_URL);
   assertLoopback("GRAPHITI_URL", pins.GRAPHITI_URL);
+  assertLoopback("NEO4J_URL", pins.NEO4J_URL);
   return { ...base, ...scrubbedEnv(base), ...pins, PORT: port };
 }

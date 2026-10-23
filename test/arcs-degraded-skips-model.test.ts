@@ -58,6 +58,8 @@ vi.mock("@/lib/graph/arc-input-authorization", async (importOriginal) => ({
 vi.mock("@/lib/access/authorization-epoch", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/access/authorization-epoch")>()),
   authorizationEpoch: vi.fn(async () => epochMock.current),
+  // The same durable counter without the attribution-repair gate.
+  revocationEpoch: vi.fn(async () => epochMock.current),
   lockedAuthorizationEpoch: vi.fn(async () => epochMock.current),
   withLockedAuthorizationEpoch: vi.fn(async (_teamId, fn) => fn(epochMock.current)),
 }));

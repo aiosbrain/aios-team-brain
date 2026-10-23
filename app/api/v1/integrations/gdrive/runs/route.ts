@@ -23,7 +23,8 @@ const outcomeFields = {
   error: z.string().max(500).optional(),
 };
 const outcomeSchema = z.union([
-  z.object({ requestId: z.string().uuid(), ...outcomeFields }).strict(),
+  // A claimed request is reported only with the attempt token its claim returned.
+  z.object({ requestId: z.string().uuid(), attemptToken: z.string().uuid(), ...outcomeFields }).strict(),
   z.object({ reportId: z.string().uuid(), integrationId: z.string().uuid(), trigger: z.literal("scheduler"),
     startedAt: z.string().datetime(), ...outcomeFields }).strict(),
 ]);
@@ -80,11 +81,11 @@ export async function POST(req: NextRequest) {
     }
   }
   const completed = await completeGdriveRun({
-    requestId: outcome.requestId, teamId: auth.teamId,
+    requestId: outcome.requestId, attemptToken: outcome.attemptToken, teamId: auth.teamId,
     apiKeyId: auth.apiKeyId, memberId: auth.memberId,
     status: outcome.status, summary, error: outcome.error,
   });
-  if (!completed) return errorResponse("stale_execution", "Google Drive run request is no longer active", 409);
+  if (!completed) return errorResponse("stale_execution", "Google Drive run attempt is no longer current", 409);
   if (completed.newly_completed) await recordIngestRun(adminClient(), {
     teamId: auth.teamId, source: "gdrive", trigger: "manual",
     ok: outcome.status === "complete" && outcome.failed === 0,

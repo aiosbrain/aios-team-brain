@@ -6,6 +6,7 @@ import { canSeeItem } from "@/lib/access/enforce";
 import { addMemberToGroup, createGroup, grantProjectToGroup } from "@/lib/access/groups";
 import { runSql } from "@/lib/db/pg/pool";
 import { stageGdriveReconciliation } from "@/lib/ingest/source-reconcile";
+import { saveGdriveConnectionConfig } from "@/lib/integrations/gdrive-authority";
 import { upsertIntegration } from "@/lib/integrations/manage";
 import { recordGdriveItemClaim, reconcileGdriveItemClaims } from "@/lib/projects/context/gdrive-claims";
 import {
@@ -404,6 +405,36 @@ describe("Drive claim placement: revocation and generation fencing", () => {
     expect(await sees(seed, seed.memberId, itemId)).toBe(true);
   });
 
+  it("a claim cannot open a destination its connection's CURRENT audience no longer approves", async () => {
+    const { seed, system } = await converged();
+    const { projectId: initiative } = await grantedInitiative(seed);
+    const integrationId = await connection(seed, [system.general, initiative]);
+    const itemId = await driveItem(seed, "doc-unapproved");
+    await claim(seed, integrationId, "doc-unapproved", itemId, [system.general, initiative]);
+    const unitId = await unitOf(seed, itemId);
+    await db().from("project_context_memberships").update({ valid_to: new Date().toISOString() })
+      .eq("team_id", seed.teamId).eq("context_unit_id", unitId).is("valid_to", null);
+    // Narrow the audience, then pin the generation back so the claim is still "current": this
+    // isolates the audience check from generation fencing. The claim still names the initiative and
+    // must still be refused, because the connection no longer approves it.
+    await db().from("integrations").update({
+      config: {
+        fileIds: ["doc"], folderIds: [], sharedDriveIds: [], recursive: false,
+        selectionState: "selected", authMode: "service_account", audienceProjectIds: [system.general],
+      },
+    }).eq("id", integrationId);
+    await runSql("update gdrive_connection_authority set generation = 1 where integration_id = $1", [integrationId]);
+
+    expect(await ensureGdriveClaimMembership(db(), seed.teamId, {
+      projectId: initiative, contextUnitId: unitId, integrationId, providerId: "doc-unapproved",
+    })).toMatchObject({ ok: false, refused: true, refusalReason: "gdrive-claim-unverified" });
+    // Control: the destination the audience still approves opens from the same claim.
+    expect(await ensureGdriveClaimMembership(db(), seed.teamId, {
+      projectId: system.general, contextUnitId: unitId, integrationId, providerId: "doc-unapproved",
+    })).toMatchObject({ ok: true, created: true });
+    expect(await includes(seed, itemId)).toEqual({ [system.general]: "gdrive_claim" });
+  });
+
   it("a PAUSED connection's claim keeps its placement but cannot open a new one", async () => {
     const { seed, system } = await converged();
     const integrationId = await connection(seed, [system.general]);
@@ -422,5 +453,154 @@ describe("Drive claim placement: revocation and generation fencing", () => {
       projectId: system.general, contextUnitId: unitId, integrationId, providerId: "doc-paused",
     })).toMatchObject({ ok: false, refused: true, refusalReason: "gdrive-claim-unverified" });
     expect(await includes(seed, itemId)).toEqual({});
+  });
+});
+
+/**
+ * AUDIENCE NARROWING (AIO-1167 AC-05/AC-06). Spec: when an Admin removes a project from a
+ * connection's approved audience, that project's members lose access to every document the
+ * connection placed there WHEN THE SAVE SUCCEEDS — not when each document is next re-ingested, which
+ * a paused connection never does. The revocation barrier (authorization epoch) advances in the same
+ * commit. Narrowing never widens: a destination still approved by another connection stays, and
+ * re-approving a dropped destination restores nothing until a fenced sync records the claim again.
+ */
+describe("Drive claim placement: narrowing a connection's audience", () => {
+  const driveConfig = (audienceProjectIds: string[]) => ({
+    fileIds: ["doc"], folderIds: [], sharedDriveIds: [], recursive: false,
+    selectionState: "selected", authMode: "service_account", audienceProjectIds,
+  });
+
+  async function nameOf(integrationId: string): Promise<string> {
+    const { rows } = await runSql<{ name: string }>("select name from integrations where id = $1", [integrationId]);
+    return rows[0].name;
+  }
+
+  async function narrow(seed: Seed, integrationId: string, audience: string[]): Promise<void> {
+    await saveGdriveConnectionConfig(db(), { teamId: seed.teamId, memberId: seed.memberId }, {
+      name: await nameOf(integrationId), config: driveConfig(audience),
+    });
+  }
+
+  async function epoch(seed: Seed): Promise<number> {
+    const { rows } = await runSql<{ epoch: string | number }>(
+      "select epoch from team_authorization_epochs where team_id = $1", [seed.teamId]);
+    return rows[0] ? Number(rows[0].epoch) : 1;
+  }
+
+  async function claimProjects(integrationId: string, providerId: string): Promise<string[]> {
+    const { rows } = await runSql<{ project_id: string }>(
+      `select project_id from gdrive_item_claim_projects
+        where integration_id = $1 and provider_id = $2 order by project_id`,
+      [integrationId, providerId]);
+    return rows.map((row) => row.project_id);
+  }
+
+  async function generationOf(integrationId: string): Promise<number> {
+    const { rows } = await runSql<{ generation: string | number }>(
+      "select generation from gdrive_connection_authority where integration_id = $1", [integrationId]);
+    return Number(rows[0].generation);
+  }
+
+  it("ENABLED: the dropped project's members lose access when the save returns; re-widening restores nothing", async () => {
+    const { seed } = await converged();
+    const kept = await grantedInitiative(seed);
+    const dropped = await grantedInitiative(seed);
+    const integrationId = await connection(seed, [kept.projectId, dropped.projectId]);
+    const itemId = await driveItem(seed, "doc-narrow");
+    await claim(seed, integrationId, "doc-narrow", itemId, [kept.projectId, dropped.projectId]);
+    expect(await sees(seed, dropped.memberId, itemId)).toBe(true);
+    const before = await epoch(seed);
+
+    await narrow(seed, integrationId, [kept.projectId]);
+
+    expect(await includes(seed, itemId)).toEqual({ [kept.projectId]: "gdrive_claim" });
+    expect(await sees(seed, dropped.memberId, itemId), "removed audience reads nothing").toBe(false);
+    expect(await sees(seed, kept.memberId, itemId), "remaining audience keeps access").toBe(true);
+    expect(await epoch(seed), "revocation barrier advanced in the save's commit").toBeGreaterThan(before);
+    expect(await claimProjects(integrationId, "doc-narrow")).toEqual([kept.projectId]);
+
+    // A save that narrows nothing touches nothing — no needless team-wide cache invalidation.
+    const settled = await epoch(seed);
+    await narrow(seed, integrationId, [kept.projectId]);
+    expect(await epoch(seed)).toBe(settled);
+
+    // Re-approving the dropped project is not a placement: only a fenced sync re-records the claim.
+    await narrow(seed, integrationId, [kept.projectId, dropped.projectId]);
+    expect(await includes(seed, itemId)).toEqual({ [kept.projectId]: "gdrive_claim" });
+    expect(await sees(seed, dropped.memberId, itemId)).toBe(false);
+    await claim(seed, integrationId, "doc-narrow", itemId, [kept.projectId, dropped.projectId],
+      await generationOf(integrationId));
+    expect(await sees(seed, dropped.memberId, itemId), "positive control: the fenced re-record opens it").toBe(true);
+  });
+
+  it("PAUSED: narrowing applies to retained content at once, and the save does not resume the connection", async () => {
+    const { seed } = await converged();
+    const kept = await grantedInitiative(seed);
+    const dropped = await grantedInitiative(seed);
+    const integrationId = await connection(seed, [kept.projectId, dropped.projectId]);
+    const itemId = await driveItem(seed, "doc-narrow-paused");
+    await claim(seed, integrationId, "doc-narrow-paused", itemId, [kept.projectId, dropped.projectId]);
+    await db().from("integrations").update({ status: "disabled" }).eq("id", integrationId);
+    expect(await sees(seed, dropped.memberId, itemId), "pausing alone retains placement").toBe(true);
+    const before = await epoch(seed);
+
+    await narrow(seed, integrationId, [kept.projectId]);
+
+    expect(await includes(seed, itemId)).toEqual({ [kept.projectId]: "gdrive_claim" });
+    expect(await sees(seed, dropped.memberId, itemId)).toBe(false);
+    expect(await sees(seed, kept.memberId, itemId), "retained content stays readable by its audience").toBe(true);
+    expect(await epoch(seed)).toBeGreaterThan(before);
+    const { rows } = await runSql<{ status: string }>("select status from integrations where id = $1", [integrationId]);
+    expect(rows[0].status, "a selection save is not a resume").toBe("disabled");
+  });
+
+  it("OVERLAP: a destination another connection still approves stays open", async () => {
+    const { seed } = await converged();
+    const kept = await grantedInitiative(seed);
+    const shared = await grantedInitiative(seed);
+    const a = await connection(seed, [kept.projectId, shared.projectId]);
+    const b = await connection(seed, [shared.projectId]);
+    const itemId = await driveItem(seed, "doc-narrow-overlap");
+    await claim(seed, a, "doc-narrow-overlap", itemId, [kept.projectId, shared.projectId]);
+    await claim(seed, b, "doc-narrow-overlap", itemId, [shared.projectId]);
+
+    await narrow(seed, a, [kept.projectId]);
+
+    expect(await includes(seed, itemId)).toEqual({
+      [kept.projectId]: "gdrive_claim",
+      [shared.projectId]: "gdrive_claim",
+    });
+    expect(await sees(seed, shared.memberId, itemId), "B's approval is B's, not A's to withdraw").toBe(true);
+  });
+
+  it("REPLACED: an audience that no longer names any claimed destination places the document nowhere, without purging it", async () => {
+    const { seed } = await converged();
+    const before = await grantedInitiative(seed);
+    const after = await grantedInitiative(seed);
+    const other = await grantedInitiative(seed);
+    const a = await connection(seed, [before.projectId]);
+    const b = await connection(seed, [other.projectId]);
+    const itemId = await driveItem(seed, "doc-narrow-replaced");
+    await claim(seed, a, "doc-narrow-replaced", itemId, [before.projectId]);
+
+    await narrow(seed, a, [after.projectId]);
+
+    expect(await includes(seed, itemId)).toEqual({});
+    expect(await sees(seed, before.memberId, itemId)).toBe(false);
+    expect(await sees(seed, after.memberId, itemId), "a newly approved project is not widened into").toBe(false);
+    const { data: item } = await db().from("items").select("id").eq("id", itemId).maybeSingle();
+    expect(item, "narrowing retains content; it is not a purge").not.toBeNull();
+    const { rows: obligations } = await runSql<{ n: number }>(
+      "select count(*)::int as n from gdrive_cleanup_obligations where team_id = $1", [seed.teamId]);
+    expect(obligations[0].n).toBe(0);
+
+    // The unplaced survivor must not block ANOTHER connection's revocation of the same document.
+    await claim(seed, b, "doc-narrow-replaced", itemId, [other.projectId]);
+    expect(await sees(seed, other.memberId, itemId)).toBe(true);
+    await expect(stageGdriveReconciliation(db(), seed.teamId, {
+      connectionId: b, removedProviderIds: ["doc-narrow-replaced"], reason: "connection B lost access",
+    })).resolves.toMatchObject({ candidates: 1, cleanupQueued: 0 });
+    expect(await includes(seed, itemId)).toEqual({});
+    expect(await sees(seed, other.memberId, itemId)).toBe(false);
   });
 });

@@ -279,7 +279,8 @@ export async function drainGdriveCleanupObligations(
           [teamId, obligation.provider_id, obligation.item_id],
         );
         if (activeRows[0]?.active) {
-          await reconcileGdriveItemClaims(db, teamId, obligation.item_id);
+          // Retained by a live claim; reactivated only if that claim still has an approved destination.
+          await reconcileGdriveItemClaims(db, teamId, obligation.item_id, { allowUnplaced: true });
           await runSql(
             `delete from gdrive_cleanup_obligations where team_id=$1 and provider_id=$2`,
             [teamId, obligation.provider_id],
@@ -319,6 +320,60 @@ export async function drainGdriveCleanupObligations(
     [teamId],
   );
   return { items, episodes, restored, failed, pending: Number(pendingRows[0]?.count ?? 0) };
+}
+
+/** Teams one scheduled continuation pass serves. More owing teams simply take more passes. */
+export const GDRIVE_CLEANUP_TEAMS_PER_PASS = 20;
+
+export interface PendingGdriveCleanupPass {
+  teams: number;
+  items: number;
+  episodes: number;
+  restored: number;
+  failed: number;
+  pending: number;
+  errors: string[];
+}
+
+/**
+ * The scheduled continuation of the cleanup queue — no source-reconcile request needed. A
+ * revocation's suppression barrier commits before its obligation exists, so nothing here decides
+ * access: this only finishes physical cleanup that was owed, after a restart or while the connection
+ * is paused or disconnected and sends nothing more. The queue IS `gdrive_cleanup_obligations`;
+ * there is no second one. Each pass serves the teams that have waited longest, a bounded batch per
+ * team, through the same drain the route uses: the provider lock and the restored-claim recheck
+ * still decide every obligation, a failure keeps its attempt count and error, and the touched row
+ * goes to the back of the order. A team whose drain throws is reported and does not stop the rest.
+ */
+export async function drainPendingGdriveCleanup(
+  db: DbClient,
+  options: {
+    teams?: number;
+    perTeam?: number;
+    testHooks?: { purgeItemIds?: typeof purgeItemIds };
+  } = {},
+): Promise<PendingGdriveCleanupPass> {
+  const { rows: owing } = await runSql<{ team_id: string }>(
+    `select team_id from gdrive_cleanup_obligations
+      group by team_id order by min(updated_at),team_id limit $1`,
+    [Math.max(1, options.teams ?? GDRIVE_CLEANUP_TEAMS_PER_PASS)],
+  );
+  const pass: PendingGdriveCleanupPass = {
+    teams: owing.length, items: 0, episodes: 0, restored: 0, failed: 0, pending: 0, errors: [],
+  };
+  for (const { team_id: teamId } of owing) {
+    try {
+      const drained = await drainGdriveCleanupObligations(db, teamId, options.perTeam, options.testHooks);
+      pass.items += drained.items;
+      pass.episodes += drained.episodes;
+      pass.restored += drained.restored;
+      pass.failed += drained.failed;
+      pass.pending += drained.pending;
+    } catch (error) {
+      pass.errors.push(`${teamId}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return pass;
 }
 
 /** Convenience for non-route callers: stage first, then drain in a distinct transaction. */

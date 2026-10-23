@@ -9,6 +9,8 @@ import type { DbClient } from "@/lib/db/types";
 import { withBoundedLockWaits } from "@/lib/db/pg/bounded-lock";
 import { runSql, withTransaction } from "@/lib/db/pg/pool";
 import { lockIdentityAuthority, lockIdentityMutationAuthorities } from "@/lib/identity/authority";
+import { setIntegrationSecret, upsertIntegration } from "@/lib/integrations/manage";
+import { applyGdriveConnectionAudience } from "@/lib/projects/context/gdrive-claims";
 import { lockProjectRows } from "@/lib/projects/project-row-locks";
 import { decryptSecret } from "@/lib/secrets/crypto";
 import { validateIntegrationConfig } from "@/lib/api/schemas";
@@ -344,6 +346,8 @@ export async function publishGdriveVerifiedConfig(
     if (!rows[0]) {
       throw new GdriveAuthorityError("admin_authority_changed", "Google Drive connection changed", 409);
     }
+    // A narrowed audience governs from this commit, under the connection rows held above.
+    await applyGdriveConnectionAudience(adminClient(), authority.teamId, authority.integrationId);
     await audit(adminClient(), {
       team_id: authority.teamId,
       actor_kind: "member",
@@ -353,6 +357,40 @@ export async function publishGdriveVerifiedConfig(
       target_id: authority.integrationId,
       meta: { configKeys: Object.keys(config), credentialRevision: authority.credentialRevision },
     });
+  });
+}
+
+/**
+ * The Admin save of a Drive connection that needs no provider verification (removed roots, an
+ * audience change, service-account roots, or a new connection). The caller has passed
+ * `requireTeamAdmin` and validated the audience.
+ *
+ * An existing connection is saved under its connection rows, taken in the shared order
+ * (`lockedAuthority`) BEFORE the config write, and its approved audience is applied to every claimed
+ * document in the same transaction (`applyGdriveConnectionAudience`): a narrowing is in force when
+ * this returns, paused or not. A save never changes the connection's status — resuming is its own
+ * action — so narrowing a paused connection's audience does not restart its reads.
+ */
+export async function saveGdriveConnectionConfig(
+  db: DbClient,
+  auth: { teamId: string; memberId: string },
+  input: { name: string; config: Record<string, unknown>; secret?: string },
+): Promise<{ id: string }> {
+  return withTransaction(async () => {
+    const { rows: named } = await runSql<{ id: string }>(
+      `select id from integrations where team_id=$1 and type='gdrive' and name=$2`,
+      [auth.teamId, input.name],
+    );
+    const existing = named[0] ? await lockedAuthority(named[0].id, auth.teamId) : null;
+    const { id } = await upsertIntegration(db, auth, {
+      type: "gdrive",
+      name: input.name,
+      config: input.config,
+      status: existing?.status === "disabled" ? "disabled" : "enabled",
+    });
+    if (input.secret) await setIntegrationSecret(db, auth, id, input.secret);
+    if (existing) await applyGdriveConnectionAudience(db, auth.teamId, id);
+    return { id };
   });
 }
 

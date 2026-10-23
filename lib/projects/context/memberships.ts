@@ -303,7 +303,8 @@ function claimRefusal(detail: string): WriteResult {
  *   · team + integration + provider + item — a claim for another document, or the same provider id
  *     under another connection or team, authorizes nothing here;
  *   · `active` — a retired claim is history, not authority;
- *   · the destination row — a claim covers the projects its connection's audience named, no others;
+ *   · the destination row — a claim covers the projects its connection's audience named, no others,
+ *     and only while the connection's CURRENT approved audience still names that destination;
  *   · generation — a claim is stamped only by a fenced execution commit. A scope, credential or
  *     audience change advances the connection's generation, and a claim last seen under an earlier
  *     one keeps whatever placement it already has but cannot open a new one;
@@ -328,6 +329,12 @@ async function verifyGdriveClaim(
                 select 1 from gdrive_item_claim_projects cp
                  where cp.team_id = c.team_id and cp.integration_id = c.integration_id
                    and cp.provider_id = c.provider_id and cp.project_id = $5
+              )
+              and exists (
+                select 1 from jsonb_array_elements_text(
+                  case when jsonb_typeof(i.config->'audienceProjectIds') = 'array'
+                       then i.config->'audienceProjectIds' else '[]'::jsonb end) approved(project_id)
+                 where lower(approved.project_id) = $5::text
               )) as live
        from gdrive_item_claims c
        join gdrive_connection_authority a

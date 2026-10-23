@@ -1116,6 +1116,11 @@ counts, nullable backlog/cursor age, and an explicit authoritative-complete bit;
 the request instead of claiming success, and only a fully drained/reconciled snapshot advances proven
 success. Completion delivery is idempotent for lost HTTP responses. Concurrent requests coalesce per
 integration and interrupted claims become retryable after the coordinator lease window.
+A validated Drive notification only marks its stream dirty (`stream_hints` in the sidecar state); the
+scheduler's `gdrive-notification-hints` sweep (5–15s) turns pending hints into one ordinary
+coordinator run per connection — coalesced per notification burst, bounded per sweep, re-reading
+Admin state first — so the brain's lease/fence still decides whether anything is read or written.
+Polling remains the repair path for a refused or failed hint run.
 
 Graph query discovery is query-aware and pages through a bounded candidate corpus before applying
 the complete source-provenance authorization gate. Unauthorized high-ranked candidates are refilled
@@ -1271,6 +1276,16 @@ authority before the member row, so neither side relies on deadlock detection or
 Timeline and arc cache reads/publications require both the current shared authorization epoch and
 `repair_status='complete'`; pending/failed repairs are retryable-unavailable, never a healthy partial
 replacement. Completion validates the same mapping revision and advances the cache epoch atomically.
+The gate applies only to person-attributed payloads (`authorizationEpoch` in
+`lib/access/authorization-epoch.ts`): the Timeline routes (dashboard, team-work, `/api/v1/timeline`),
+the arcs panel and the participant-attributed events feed answer a pending repair with 503
+`temporarily_unavailable`. That includes the dashboard Timeline's uncached `days > 7` build, which
+reads the gated epoch before building and again at a locked publication point after it; one epoch
+change rebuilds once, and a second is the same retryable 503. The arcs recompute route maps its
+epoch reads the same way. Reads that publish no person attribution — graph-fact provenance
+(`lib/graph/provenance-read.ts`, and so retrieval's graph leg), arc-partition item authority and the
+facts feed — bind to the same counter through `revocationEpoch`, which keeps the revocation barrier
+without the repair gate.
 
 The Timeline reads Drive evidence through a stable seek-paginated ledger independent of the generic
 item cap, re-resolves against complete current identity reads, and reapplies manual correction locks.
@@ -1303,6 +1318,18 @@ nothing: the ordinary entry refuses it, and the claim entry writes it (including
 automatic exclude) so that retiring the claim can find and close the row. Destinations are placed
 all-or-nothing within the surrounding transaction; a destination named only by a superseded-generation
 or paused connection keeps an existing placement but is never newly opened.
+
+A claim's effective destinations are its projects **intersected with its connection's current
+approved audience**: the placement reconcile and the claim-authorized entry both read the live
+`audienceProjectIds`. Every Admin config write of a Drive connection (`saveGdriveConnectionConfig`,
+`publishGdriveVerifiedConfig` in `lib/integrations/gdrive-authority.ts`) runs
+`applyGdriveConnectionAudience` in the same transaction, under the connection rows and the
+source-reconciliation lock order: dropped destinations are removed from that connection's claims,
+each affected document is re-derived from its surviving claims (another connection's approval
+stands), a document left with no approved destination is placed nowhere without being purged, and
+the authorization epoch advances before the save returns — paused or not. A save never changes the
+connection's status. Re-approving a dropped project restores nothing until a fenced sync re-records
+the claim.
 
 Every ingest is **project-before-item**, and takes its locks in one order: identity
 authority/revision → connection authority → project rows → provider identity (and its mapping row) →

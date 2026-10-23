@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { canSeeItem } from "@/lib/access/enforce";
 import { setIntegrationSecret, setIntegrationStatus, upsertIntegration } from "@/lib/integrations/manage";
-import { approvedAudienceProject, db, seedTeam, type Seed } from "./helpers";
+import { recordGdriveItemClaim } from "@/lib/projects/context/gdrive-claims";
+import { approvedAudienceProject, db, externalMember, ingest, seedTeam, type Seed } from "./helpers";
 
 const adminContext = vi.hoisted(() => ({ teamId: "", memberId: "" }));
 
@@ -184,5 +186,44 @@ describe("AIO-1167 Admin Google Drive test authority", () => {
       .toMatchObject({ ok: true });
     expect(await testGoogleDriveConnection(seed.teamSlug, "local-service"))
       .toMatchObject({ ok: false, error: expect.stringContaining("not completed") });
+  });
+
+  it("an Admin save that narrows a PAUSED connection's audience revokes the dropped audience before it returns", async () => {
+    const seed = await seedTeam();
+    await db().from("members").update({ role: "admin" }).eq("id", seed.memberId).eq("team_id", seed.teamId);
+    const general = await approvedAudienceProject(seed);
+    const externalShared = await approvedAudienceProject(seed, "external");
+    adminContext.teamId = seed.teamId;
+    adminContext.memberId = seed.memberId;
+    const selection = (audience: string[]) =>
+      `fileIds=doc-narrow, audienceProjectIds=${audience.join("|")}, authMode=service_account`;
+    expect(await saveIntegration(seed.teamSlug, {
+      type: "gdrive", name: "narrowed", selection: selection([general, externalShared]), secret: "",
+    })).toEqual({ ok: true });
+    const { data: row } = await db().from("integrations").select("id")
+      .eq("team_id", seed.teamId).eq("name", "narrowed").single();
+    const integrationId = (row as { id: string }).id;
+    const item = await ingest(seed, {
+      project: "drive-storage", path: "gdrive/doc-narrow.md", body: "narrowed Drive body",
+      access: "external", frontmatter: { source: "gdrive", source_id: "doc-narrow" },
+    });
+    await recordGdriveItemClaim(db(), {
+      teamId: seed.teamId, integrationId, providerId: "doc-narrow", itemId: item.id,
+      generation: 1, audienceProjectIds: [general, externalShared],
+    });
+    const outsider = await externalMember(seed);
+    expect(await canSeeItem(db(), { teamId: seed.teamId, memberId: outsider }, item.id)).toBe(true);
+    await setIntegrationStatus(db(), { teamId: seed.teamId, memberId: seed.memberId }, integrationId, "disabled");
+
+    expect(await saveIntegration(seed.teamSlug, {
+      type: "gdrive", name: "narrowed", selection: selection([general]), secret: "",
+    })).toEqual({ ok: true });
+
+    expect(await canSeeItem(db(), { teamId: seed.teamId, memberId: outsider }, item.id),
+      "the removed external-shared audience reads nothing").toBe(false);
+    expect(await canSeeItem(db(), { teamId: seed.teamId, memberId: seed.memberId }, item.id),
+      "the remaining General audience keeps the retained document").toBe(true);
+    const { data: after } = await db().from("integrations").select("status").eq("id", integrationId).single();
+    expect((after as { status: string }).status, "saving the selection does not resume it").toBe("disabled");
   });
 });

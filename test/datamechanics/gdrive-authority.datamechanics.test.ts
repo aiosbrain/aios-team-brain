@@ -150,18 +150,21 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
     expect((await runsGET(getRequest("http://test/api/v1/integrations/gdrive/runs", ordinary.key, seed.teamSlug))).status).toBe(401);
     const claimed = await runsGET(getRequest("http://test/api/v1/integrations/gdrive/runs", trusted.key, seed.teamSlug));
     expect(claimed.status).toBe(200);
-    expect(await claimed.json()).toMatchObject({ request: { id: (queued as { id: string }).id, integration_id: integrationId } });
+    const claimedBody = await claimed.json();
+    expect(claimedBody).toMatchObject({ request: { id: (queued as { id: string }).id, integration_id: integrationId } });
+    const attemptToken = claimedBody.request.attempt_token as string;
+    expect(attemptToken).toMatch(/^[0-9a-f-]{36}$/);
     expect(await (await runsGET(getRequest("http://test/api/v1/integrations/gdrive/runs", trusted.key, seed.teamSlug))).json())
       .toEqual({ request: null });
 
     const completed = await runsPOST(request(
       "http://test/api/v1/integrations/gdrive/runs", trusted.key, seed.teamSlug,
-      { requestId: (queued as { id: string }).id, status: "complete", created: 2, updated: 1, unchanged: 3, removed: 1, failed: 0, backlog: 0, authoritativeComplete: true },
+      { requestId: (queued as { id: string }).id, attemptToken, status: "complete", created: 2, updated: 1, unchanged: 3, removed: 1, failed: 0, backlog: 0, authoritativeComplete: true },
     ));
     expect(completed.status).toBe(200);
     const replay = await runsPOST(request(
       "http://test/api/v1/integrations/gdrive/runs", trusted.key, seed.teamSlug,
-      { requestId: (queued as { id: string }).id, status: "complete", created: 2, updated: 1,
+      { requestId: (queued as { id: string }).id, attemptToken, status: "complete", created: 2, updated: 1,
         unchanged: 3, removed: 1, failed: 0, backlog: 0, authoritativeComplete: true },
     ));
     expect(replay.status).toBe(200);
@@ -173,6 +176,194 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
     expect(runs).toHaveLength(1);
     const run = runs?.[0];
     expect(run).toMatchObject({ source: "gdrive", trigger: "manual", ok: true, created: 2, updated: 1, unchanged: 3 });
+  });
+
+  // ── Attempt ownership: only the attempt holding a request's current token speaks for it ──────────
+  const RUNS = "http://test/api/v1/integrations/gdrive/runs";
+  type Claim = { id: string; attempt_token: string };
+  async function claimRun(seed: Seed, key: string): Promise<Claim | null> {
+    const response = await runsGET(getRequest(RUNS, key, seed.teamSlug));
+    expect(response.status).toBe(200);
+    return (await response.json()).request as Claim | null;
+  }
+  async function report(seed: Seed, key: string, body: Record<string, unknown>) {
+    const response = await runsPOST(request(RUNS, key, seed.teamSlug, body));
+    return { status: response.status, body: await response.json() };
+  }
+  async function queueRun(seed: Seed, integrationId: string): Promise<string> {
+    const { data, error } = await db().from("gdrive_run_requests").insert({
+      team_id: seed.teamId, integration_id: integrationId, requested_by: seed.memberId,
+      trigger: "manual", status: "pending",
+    }).select("id").single();
+    if (error || !data) throw new Error(error?.message);
+    return (data as { id: string }).id;
+  }
+  async function runRow(id: string) {
+    const { data } = await db().from("gdrive_run_requests")
+      .select("status,attempt_token,started_at,finished_at,summary,error").eq("id", id).single();
+    return data as {
+      status: string; attempt_token: string | null; started_at: string | null; finished_at: string | null;
+      summary: Record<string, unknown>; error: string | null;
+    };
+  }
+  async function manualLedger(seed: Seed) {
+    const { data } = await db().from("ingest_runs").select("trigger,created,meta")
+      .eq("team_id", seed.teamId).eq("source", "gdrive");
+    return (data ?? []) as Array<{ trigger: string; created: number; meta: Record<string, unknown> }>;
+  }
+  /** Deterministically past the interruption threshold — no sleeping. */
+  async function ageRun(id: string) {
+    const { error } = await db().from("gdrive_run_requests")
+      .update({ started_at: new Date(Date.now() - 20 * 60_000).toISOString() }).eq("id", id);
+    if (error) throw new Error(error.message);
+  }
+  async function endLease(
+    mode: "released" | "expired", key: string, seed: Seed, integrationId: string,
+    active: Awaited<ReturnType<typeof acquire>>,
+  ) {
+    if (mode === "released") {
+      const released = await executionPOST(request("http://test/api/v1/integrations/gdrive/execution", key, seed.teamSlug, {
+        action: "release", integration_id: integrationId, owner: active.owner,
+        generation: active.body.generation, fence: active.body.fence,
+      }));
+      expect(released.status).toBe(200);
+      return;
+    }
+    const { error } = await db().from("gdrive_connection_authority")
+      .update({ lease_until: new Date(Date.now() - 1_000).toISOString() }).eq("integration_id", integrationId);
+    if (error) throw new Error(error.message);
+  }
+  const outcome = (requestId: string, attemptToken: string, over: Record<string, unknown> = {}) => ({
+    requestId, attemptToken, status: "complete", created: 1, unchanged: 2, backlog: 0,
+    authoritativeComplete: true, ...over,
+  });
+
+  it.each(["released", "expired"] as const)(
+    "a live Drive lease keeps an aged attempt; once %s, a successor's token alone completes the request",
+    async (mode) => {
+      const seed = await seedTeam();
+      const integrationId = await integration(seed, `attempts-${mode}`);
+      const trusted = await provision(seed, integrationId);
+      const requestId = await queueRun(seed, integrationId);
+
+      // Attempt A claims the request and holds the connection's execution lease.
+      const a = await claimRun(seed, trusted.key);
+      expect(a?.id).toBe(requestId);
+      const active = await acquire(trusted.key, seed, integrationId);
+      expect(active.response.status).toBe(200);
+
+      // Aged past the threshold, but its execution is demonstrably live: not reclaimed.
+      await ageRun(requestId);
+      expect(await claimRun(seed, trusted.key)).toBeNull();
+      expect(await runRow(requestId)).toMatchObject({ status: "running", attempt_token: a!.attempt_token });
+
+      // The lease ends: the interrupted attempt is recovered, and B claims it under a new token.
+      await endLease(mode, trusted.key, seed, integrationId, active);
+      const b = await claimRun(seed, trusted.key);
+      expect(b?.id).toBe(requestId);
+      expect(b!.attempt_token).not.toBe(a!.attempt_token);
+      const running = await runRow(requestId);
+      expect(running).toMatchObject({ status: "running", attempt_token: b!.attempt_token, finished_at: null });
+
+      // A's delayed completion and deferral both fail, and change nothing of B's attempt.
+      const staleComplete = await report(seed, trusted.key, outcome(requestId, a!.attempt_token, { created: 9 }));
+      expect(staleComplete.status).toBe(409);
+      expect(staleComplete.body.error.code).toBe("stale_execution");
+      const staleDefer = await report(seed, trusted.key, outcome(requestId, a!.attempt_token, {
+        status: "deferred", skipped: 1, error: "coordinator busy", authoritativeComplete: false, backlog: null,
+      }));
+      expect(staleDefer.status).toBe(409);
+      expect(await runRow(requestId)).toEqual(running);
+      expect(await manualLedger(seed)).toEqual([]);
+
+      // B completes; its exact replay is idempotent, a conflicting one is refused.
+      expect((await report(seed, trusted.key, outcome(requestId, b!.attempt_token))).status).toBe(200);
+      const finished = await runRow(requestId);
+      expect(finished).toMatchObject({
+        status: "complete", attempt_token: b!.attempt_token, started_at: running.started_at,
+        error: null, summary: expect.objectContaining({ created: 1, unchanged: 2 }),
+      });
+      expect(finished.finished_at).not.toBeNull();
+      expect((await report(seed, trusted.key, outcome(requestId, b!.attempt_token))).status).toBe(200);
+      expect((await report(seed, trusted.key, outcome(requestId, b!.attempt_token, { created: 5 }))).status).toBe(409);
+      // A stays stale after B finished, too.
+      expect((await report(seed, trusted.key, outcome(requestId, a!.attempt_token))).status).toBe(409);
+      expect(await runRow(requestId)).toEqual(finished);
+      const ledger = await manualLedger(seed);
+      expect(ledger).toHaveLength(1);
+      expect(ledger[0]).toMatchObject({ trigger: "manual", created: 1, meta: expect.objectContaining({ requestId }) });
+    },
+  );
+
+  it("an aged attempt with no execution lease at all is recovered under a new token", async () => {
+    const seed = await seedTeam();
+    const integrationId = await integration(seed, "attempts-interrupted");
+    const trusted = await provision(seed, integrationId);
+    const requestId = await queueRun(seed, integrationId);
+    const a = await claimRun(seed, trusted.key);
+
+    // Not yet aged: a running attempt is never taken from, whatever its lease.
+    expect(await claimRun(seed, trusted.key)).toBeNull();
+    await ageRun(requestId);
+    const b = await claimRun(seed, trusted.key);
+    expect(b?.id).toBe(requestId);
+    expect(b!.attempt_token).not.toBe(a!.attempt_token);
+    expect((await report(seed, trusted.key, outcome(requestId, a!.attempt_token))).status).toBe(409);
+    expect(await runRow(requestId)).toMatchObject({ status: "running", attempt_token: b!.attempt_token });
+  });
+
+  it("a current deferral returns the request to pending idempotently, and the next claim gets a new token", async () => {
+    const seed = await seedTeam();
+    const integrationId = await integration(seed, "attempts-deferred");
+    const trusted = await provision(seed, integrationId);
+    const requestId = await queueRun(seed, integrationId);
+    const a = await claimRun(seed, trusted.key);
+    const deferral = outcome(requestId, a!.attempt_token, {
+      status: "deferred", created: 0, unchanged: 0, skipped: 1, error: "coordinator busy",
+      authoritativeComplete: false, backlog: null,
+    });
+
+    expect((await report(seed, trusted.key, deferral)).status).toBe(200);
+    const pending = await runRow(requestId);
+    expect(pending).toMatchObject({
+      status: "pending", started_at: null, finished_at: null, error: "coordinator busy",
+      summary: expect.objectContaining({ skipped: 1 }),
+    });
+    // Exact replay is accepted; a conflicting one, or a terminal report from the deferred attempt, is not.
+    expect((await report(seed, trusted.key, deferral)).status).toBe(200);
+    expect((await report(seed, trusted.key, { ...deferral, error: "something else" })).status).toBe(409);
+    expect((await report(seed, trusted.key, outcome(requestId, a!.attempt_token))).status).toBe(409);
+    expect(await runRow(requestId)).toEqual(pending);
+
+    const b = await claimRun(seed, trusted.key);
+    expect(b?.id).toBe(requestId);
+    expect(b!.attempt_token).not.toBe(a!.attempt_token);
+    // Once re-claimed, even A's exact deferral replay is stale.
+    expect((await report(seed, trusted.key, deferral)).status).toBe(409);
+    expect(await runRow(requestId)).toMatchObject({ status: "running", attempt_token: b!.attempt_token, error: null });
+    expect(await manualLedger(seed)).toEqual([]);
+  });
+
+  it("requires a well-formed attempt token on request outcomes and none on scheduled reports", async () => {
+    const seed = await seedTeam();
+    const integrationId = await integration(seed, "attempts-contract");
+    const trusted = await provision(seed, integrationId);
+    const requestId = await queueRun(seed, integrationId);
+    const a = await claimRun(seed, trusted.key);
+    const before = await runRow(requestId);
+
+    const tokenless: Record<string, unknown> = outcome(requestId, a!.attempt_token);
+    delete tokenless.attemptToken;
+    expect((await report(seed, trusted.key, tokenless)).status).toBe(422);
+    expect((await report(seed, trusted.key, outcome(requestId, "not-a-token"))).status).toBe(422);
+    // Well-formed but never issued for this request.
+    expect((await report(seed, trusted.key, outcome(requestId, randomUUID()))).status).toBe(409);
+    expect((await report(seed, trusted.key, {
+      reportId: randomUUID(), integrationId, trigger: "scheduler", startedAt: new Date().toISOString(),
+      attemptToken: a!.attempt_token, status: "complete", authoritativeComplete: true,
+    })).status).toBe(422);
+    expect(await runRow(requestId)).toEqual(before);
+    expect(await manualLedger(seed)).toEqual([]);
   });
 
   it("records scheduled coordinator outcomes idempotently in the same run ledger", async () => {

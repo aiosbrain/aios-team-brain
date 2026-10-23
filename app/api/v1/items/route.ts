@@ -18,8 +18,37 @@ import {
   shouldScheduleMeetingBackfill,
 } from "@/lib/meetings/schedule-backfill";
 import { GdriveAuthorityError } from "@/lib/integrations/gdrive-authority";
+import { IdentitySnapshotChangedError } from "@/lib/identity/authority";
+import { ProjectPlanChangedError } from "@/lib/projects/project-row-locks";
+import { GdriveIngestStateChangedError } from "@/lib/ingest/gdrive-commit-locks";
 
 export const runtime = "nodejs";
+
+/**
+ * A push that lost a race, not a broken push: the identity revision or a planned project changed
+ * under its locks, a Drive plan stayed stale after its one re-plan, or a bounded lock wait ran out
+ * (55P03). Each attempt rolled back whole, so the same push may simply be sent again. The sidecar
+ * retries 429/5xx within its own bound and treats every other 4xx as permanent, so this is a 503,
+ * never a 409 — and the route itself does not retry. The transaction layer may wrap the PostgreSQL
+ * error, so the cause chain is searched (bounded).
+ */
+function isRetryableIngestConflict(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current && typeof current === "object"; depth++) {
+    if (
+      current instanceof IdentitySnapshotChangedError ||
+      current instanceof ProjectPlanChangedError ||
+      current instanceof GdriveIngestStateChangedError ||
+      (current as { code?: unknown }).code === "55P03"
+    ) {
+      return true;
+    }
+    const cause = (current as { cause?: unknown }).cause;
+    if (cause === current) break;
+    current = cause;
+  }
+  return false;
+}
 
 /** The per-item `body` cap. Also enforced by `commonItemFields.body` in the payload schema. */
 const MAX_PAYLOAD = 1_000_000; // 1 MB per contract
@@ -216,7 +245,13 @@ export async function POST(req: NextRequest) {
     if (e instanceof GdriveAuthorityError) {
       return errorResponse(e.code, e.message, e.status);
     }
-    return errorResponse("internal", e instanceof Error ? e.message : "ingest failed", 500);
+    // Fixed messages from here on: an exception's own text can carry SQL, lock and relation detail.
+    if (isRetryableIngestConflict(e)) {
+      return errorResponse("temporarily_unavailable", "ingest conflicted with a concurrent change; retry shortly", 503);
+    }
+    // Full detail stays in the server log; the caller gets the fixed message.
+    console.error("[items] push failed:", e instanceof Error ? e.message : e);
+    return errorResponse("internal", "ingest failed", 500);
   }
 }
 

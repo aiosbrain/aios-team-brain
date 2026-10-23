@@ -3,9 +3,11 @@ import httpConfig from "./vitest.http.config";
 import { scrubbedEnv } from "./scripts/test-env-scrub";
 
 // The real `/api/v1/query` route over a real socket (TIERRET-1 AC-03/AC-05/AC-11), answered by a
-// test-only loopback fake OpenAI-compatible endpoint and spied on by a loopback fake Graphiti. Inherits
-// the HTTP tier's DATABASE_TEST_URL guard and pins, but swaps in its own global setup
-// (test/http/tierret1-query-global-setup.ts), which pins LLM_BASE_URL/GRAPHITI_URL to the fakes in the
+// test-only loopback fake OpenAI-compatible endpoint, with its graph leg reading the isolated test
+// Neo4j (AIO-1167: provenance-complete reads; compose.test.neo4j.yml — locally `npm run
+// db:test:neo4j:up`, in CI the HTTP job's `neo4j` service). Inherits the HTTP tier's DATABASE_TEST_URL
+// guard and pins, but swaps in its own global setup (test/http/tierret1-query-global-setup.ts), which
+// pins LLM_BASE_URL/GRAPHITI_URL to the fakes and NEO4J_* to the loopback test service in the
 // `next start` child only. The ordinary HTTP tier (vitest.http.config.ts → *.http.test.ts) is untouched
 // and keeps its no-LLM server; its include glob does not match this file, nor do the unit/dm configs.
 // Run by `npm run test:http:tierret1-query` (a separate, sequential step of the CI HTTP job, after the

@@ -38,6 +38,11 @@ export function startIngestScheduler(): void {
     // bounded drain is the restart backstop for post-response/manual attempts and never trusts a
     // process-local coalescer as completion authority.
     await runIdentityRepair(db);
+    // Durable Google Drive cleanup (AIO-1167). A revocation commits its suppression barrier first and
+    // leaves physical cleanup as an obligation; this bounded pass continues that queue on its own, so
+    // a failed cleanup does not wait for another source-reconcile request — after a restart, or while
+    // the connection is paused or disconnected. Never decides access; a restored claim cancels it.
+    await runGdriveCleanup(db);
     // §11 access-bootstrap convergence: built-in groups/system projects/grants for every team.
     // Idempotent and cheap when converged; this is also how PRE-EXISTING teams get bootstrapped
     // on first deploy (SQL migrations cannot seed the edge tables — the single-writer guard
@@ -505,6 +510,22 @@ export function startIngestScheduler(): void {
       }
     } catch (err) {
       console.error("[ingest] identity repair tick failed:", err instanceof Error ? err.message : err);
+    }
+  }
+
+  async function runGdriveCleanup(db: ReturnType<typeof adminClient>): Promise<void> {
+    try {
+      const { drainPendingGdriveCleanup } = await import("@/lib/ingest/source-reconcile");
+      const pass = await drainPendingGdriveCleanup(db);
+      if (pass.teams) {
+        console.info(
+          `[ingest] gdrive-cleanup: ${pass.items} purged, ${pass.restored} restored, ${pass.failed} failed, ` +
+            `${pass.pending} pending (${pass.teams} teams)` +
+            (pass.errors.length ? ` errors: ${pass.errors.join("; ")}` : ""),
+        );
+      }
+    } catch (err) {
+      console.error("[ingest] gdrive cleanup tick failed:", err instanceof Error ? err.message : err);
     }
   }
 

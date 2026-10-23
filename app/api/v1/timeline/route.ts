@@ -3,7 +3,8 @@ import { adminClient } from "@/lib/db/admin";
 import { authenticateApiKey } from "@/lib/api/auth";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { errorResponse } from "@/lib/api/schemas";
-import { getCachedWorkTimeline } from "@/lib/dashboard/timeline-cache";
+import { getCachedWorkTimeline, TimelineAuthorizationChangedError } from "@/lib/dashboard/timeline-cache";
+import { AttributionRepairPendingError } from "@/lib/access/authorization-epoch";
 
 export const runtime = "nodejs";
 
@@ -42,6 +43,14 @@ export async function GET(req: NextRequest) {
     const { days } = await getCachedWorkTimeline(db, auth.teamId, auth.memberTier, auth.memberId);
     return Response.json({ window_days: 7, days });
   } catch (err) {
+    // Person attribution is mid-repair: retryable, and neither the old ledger nor a partial rebuild.
+    if (err instanceof AttributionRepairPendingError) {
+      return errorResponse("temporarily_unavailable", "attribution repair is in progress; retry shortly", 503);
+    }
+    // Authorization moved under both attempts of the read: retryable, never a 500.
+    if (err instanceof TimelineAuthorizationChangedError) {
+      return errorResponse("temporarily_unavailable", "timeline authorization changed; retry the request", 503);
+    }
     return errorResponse("internal", err instanceof Error ? err.message : "timeline read failed", 500);
   }
 }

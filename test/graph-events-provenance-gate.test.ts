@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   groups: ["g-visible"],
   visibleItems: new Set<string>(),
   epoch: 1,
+  repairPending: false,
   resolveHumanActorsByItem: vi.fn(),
 }));
 
@@ -57,8 +58,15 @@ vi.mock("@/lib/graph/provenance-read", async (importOriginal) => ({
 vi.mock("@/lib/access/enforce", () => ({
   visibleItemIdsForProjects: vi.fn(async () => ({ ids: mocks.visibleItems, error: false })),
 }));
-vi.mock("@/lib/access/authorization-epoch", () => ({
-  authorizationEpoch: vi.fn(async () => mocks.epoch),
+vi.mock("@/lib/access/authorization-epoch", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/access/authorization-epoch")>()),
+  authorizationEpoch: vi.fn(async () => {
+    if (mocks.repairPending) {
+      const { AttributionRepairPendingError } = await importOriginal<typeof import("@/lib/access/authorization-epoch")>();
+      throw new AttributionRepairPendingError();
+    }
+    return mocks.epoch;
+  }),
 }));
 vi.mock("@/lib/graph/human-actors", () => ({
   resolveHumanActorsByItem: mocks.resolveHumanActorsByItem,
@@ -73,6 +81,7 @@ describe("authenticated events provenance boundary", () => {
     mocks.visibleItems.clear();
     mocks.visibleItems.add("item-visible");
     mocks.epoch = 1;
+    mocks.repairPending = false;
     mocks.resolveHumanActorsByItem.mockReset();
     mocks.resolveHumanActorsByItem.mockImplementation(async () => new Map<string, string>());
     mocks.recentEventsWithStatus.mockResolvedValue({
@@ -120,6 +129,22 @@ describe("authenticated events provenance boundary", () => {
     const response = await GET(new Request("http://test/api/brain/events?team=acme") as never);
     expect(response.status).toBe(503);
     expect(await response.json()).toMatchObject({ error: { code: "temporarily_unavailable" } });
+  });
+
+  it("a pending attribution repair is a retryable 503 that publishes no event or participant", async () => {
+    mocks.repairPending = true;
+    const { GET } = await import("@/app/api/brain/events/route");
+    const response = await GET(new Request("http://test/api/brain/events?team=acme") as never);
+    expect(response.status).toBe(503);
+    const body = await response.json();
+    expect(body).toMatchObject({
+      error: { code: "temporarily_unavailable", message: "attribution repair is in progress; retry shortly" },
+    });
+    const wire = JSON.stringify(body);
+    for (const restricted of ["Authorized title", "visible prose", "Authorized participant"]) {
+      expect(wire).not.toContain(restricted);
+    }
+    expect(mocks.resolveHumanActorsByItem).not.toHaveBeenCalled();
   });
 
   it("discards a candidate when a revocation lands during participant attribution", async () => {

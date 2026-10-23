@@ -97,6 +97,18 @@ def build_scheduler(
             max_instances=1,
             coalesce=True,
         )
+        # Validated Drive notifications wake the same coordinator within seconds instead of waiting
+        # for the poll interval. One run per connection per burst; the poll still repairs anything
+        # a notification missed.
+        sched.add_job(
+            _gdrive_hint_job,
+            "interval",
+            seconds=min(15, max(5, poll_interval)),
+            id="gdrive-notification-hints",
+            args=[settings, connections, state, {}],
+            max_instances=1,
+            coalesce=True,
+        )
 
     if bootstrap_remote_gdrive:
         sched.add_job(
@@ -199,6 +211,56 @@ async def _manual_gdrive_job(
         error = type(exc).__name__
     async with BrainClient(settings.base_url, settings.api_key, settings.team) as client:
         await client.complete_gdrive_run_request(request, summary, status=status, error=error)
+
+
+# At most this many connections are woken by one hint sweep; the rest wait for the next sweep.
+_HINT_RUNS_PER_SWEEP = 4
+
+
+async def _gdrive_hint_job(
+    settings: BrainSettings, connections: list[Connection], state: StateStore,
+    attempted: dict[str, int], *, limit: int = _HINT_RUNS_PER_SWEEP,
+) -> None:
+    """Drain Drive streams that a validated notification marked dirty, without waiting for the poll.
+
+    A notification is only a hint (``stream_hints``): the webhook never reads the provider. This
+    sweep turns pending hints into ONE ordinary coordinator run per connection — the same
+    ``_poll_job`` → ``run_gdrive_stream`` path as scheduled polling, so the brain's execution lease,
+    generation fence and connection state still decide whether anything is read or written, and a
+    run already holding the lease simply refuses this one. That run reads the change stream, which
+    acknowledges exactly the hints it observed.
+
+    Coalesced and bounded: a connection is woken only when its hint marker has grown since the last
+    wake (``attempted``, updated BEFORE the run, so a failed or refused run is not retried every
+    sweep — the next notification or the regular poll retries it), at most ``limit`` connections per
+    sweep. Admin state is re-read first: a paused, disconnected or unknown connection is not woken,
+    and a selection read failure wakes nothing.
+    """
+    pending = state.pending_hint_connections(settings.team)
+    due = [(cid, marker) for cid, marker in pending.items() if marker > attempted.get(cid, 0)]
+    if not due:
+        return
+    from .brain_client import BrainClient
+    async with BrainClient(settings.base_url, settings.api_key, settings.team) as client:
+        remote = await client.fetch_integration_selections(include_disabled=True)
+    by_id = {str(row.get("id")): row for row in remote if row.get("type") == "gdrive"}
+    for cid, marker in due[:limit]:
+        attempted[cid] = marker
+        row = by_id.get(cid)
+        if not row or row.get("status") != "enabled":
+            continue
+        configured = next(
+            (conn for conn in connections if conn.source == "gdrive" and conn.name == row.get("name")),
+            None,
+        )
+        connection = configured or next(iter(merge_selections([], [row])), None)
+        if connection is None:
+            continue
+        try:
+            await _poll_job(settings, connection, state)
+        except Exception as exc:
+            # One connection's failure must not starve the others; its hint stays pending.
+            log.warning("Drive notification drain for %s failed: %s", connection.name, type(exc).__name__)
 
 
 def _gdrive_outcome_status(summary) -> str:

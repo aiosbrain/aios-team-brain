@@ -1,6 +1,6 @@
 import "server-only";
 
-import { authorizationEpoch } from "@/lib/access/authorization-epoch";
+import { revocationEpoch } from "@/lib/access/authorization-epoch";
 import { visibleItemIdsForProjects } from "@/lib/access/enforce";
 import type { DbClient } from "@/lib/db/types";
 import type { AtomicFact } from "./learning";
@@ -55,8 +55,10 @@ export async function authorizedItemIdsForArcPartition(
     expectedAuthorizationEpoch: number;
   },
 ): Promise<ReadonlySet<string>> {
+  // Item authority is attribution-independent: compare against the revocation barrier alone. An
+  // attributed publication (arcs) passes the repair-gated epoch at its own publish/serve boundary.
   const assertEpoch = async () => {
-    if (await authorizationEpoch(db, args.teamId) !== args.expectedAuthorizationEpoch) {
+    if (await revocationEpoch(db, args.teamId) !== args.expectedAuthorizationEpoch) {
       throw new ArcSynthesisAuthorizationChangedError();
     }
   };
@@ -103,7 +105,7 @@ export async function authorizedArcFacts(
   // Legacy pure unit fakes do not model the context substrate. Production and real-PG tests always
   // have DATABASE_URL and take the authoritative path; the pure filter remains separately pinned.
   if (process.env.NODE_ENV === "test" && !process.env.DATABASE_URL) {
-    if (await authorizationEpoch(db, args.teamId) !== args.expectedAuthorizationEpoch) {
+    if (await revocationEpoch(db, args.teamId) !== args.expectedAuthorizationEpoch) {
       throw new ArcSynthesisAuthorizationChangedError();
     }
     const allResolved = new Set(

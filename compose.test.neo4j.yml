@@ -2,6 +2,10 @@ name: aios-brain-test-neo4j
 # Throwaway Neo4j for the Graphiti-graph read tests (lib/graph/neo4j + learning). Bolt on 7688 /
 # HTTP on 7475 to avoid colliding with a local dev Neo4j (7687/7474). Used by
 # `npm run db:test:neo4j:up` + `test:neo4j`; the test self-skips unless NEO4J_TEST=1 (and in CI the neo4j-tier-tests job makes that skip a failure).
+# Also the graph behind `npm run test:http:tierret1-query` (AIO-1167): that harness derives its loopback
+# URL and test credentials from THIS file, seeds only its own teams' group ids and deletes only those
+# (it never wipes); in CI the HTTP job runs this image as a service. The `test:neo4j` tier DOES wipe —
+# run the two sequentially, as CI does (separate jobs, separate containers).
 services:
   neo4j:
     image: neo4j:5.26.2

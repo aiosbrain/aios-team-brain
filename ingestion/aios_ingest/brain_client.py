@@ -73,6 +73,8 @@ class GdriveRunRequest:
     name: str
     trigger: str
     created_at: str
+    # The opaque token of this claim. Only the attempt holding it may complete or defer the request.
+    attempt_token: str
 
 
 class BrainError(RuntimeError):
@@ -426,16 +428,26 @@ class BrainClient:
         row = resp.json().get("request")
         if not isinstance(row, dict):
             return None
+        # Fail closed on a claim this attempt could never report: the brain recovers the request
+        # once its Drive execution is no longer live, rather than this run working without a token.
+        token = row.get("attempt_token")
+        try:
+            if not isinstance(token, str):
+                raise ValueError(token)
+            uuid.UUID(token)
+        except ValueError:
+            raise BrainError(502, "invalid_run_claim", "Drive run claim carried no valid attempt token")
         return GdriveRunRequest(
             id=str(row["id"]), integration_id=str(row["integration_id"]),
             name=str(row["name"]), trigger=str(row["trigger"]), created_at=str(row["created_at"]),
+            attempt_token=token,
         )
 
     async def complete_gdrive_run_request(
         self, request: GdriveRunRequest, summary: Any, *, status: str, error: str | None = None,
     ) -> None:
         payload = {
-            "requestId": request.id, "status": status,
+            "requestId": request.id, "attemptToken": request.attempt_token, "status": status,
             "created": int(getattr(summary, "created", 0)),
             "updated": int(getattr(summary, "updated", 0)),
             "unchanged": int(getattr(summary, "unchanged", 0)),

@@ -5,12 +5,31 @@ the Docs tabs contract.  This module consumes ``documents.get(includeTabsContent
 responses directly and produces readable Markdown plus an explicit completeness report.
 Unknown elements are disclosed without making otherwise-readable extraction incomplete;
 malformed/missing required content and configured limits do make it incomplete.
+
+Provenance. Every tab boundary in the text is a stable anchor line, ``<!-- gdrive-tab:<id> -->``,
+written before the tab's title heading, so a tab is told apart from an ordinary heading and from
+another tab with the same title by its Docs tab id. The tab manifest is the authoritative map from
+text back to the document: per tab, where its anchor, content and end fall in the text, and per
+top-level structural block (and footnote) its text span plus its position in the tab's
+``body.content`` and the provider's own ``startIndex``. Offsets count Unicode code points of the
+returned text. The block map is bounded; a document past the bound says so explicitly.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Iterable
+from urllib.parse import quote
+
+# Block-span entries recorded per document. Past this the map is disclosed as incomplete (a
+# non-blocking issue): the text itself is unaffected, and frontmatter stays bounded.
+MAX_BLOCK_ENTRIES = 5000
+
+
+def tab_anchor(tab_id: str) -> str:
+    """The text marker for one tab boundary. The id is percent-encoded (``-`` included), so an
+    anchor can never close its HTML comment or be confused with another tab's."""
+    return "gdrive-tab:" + quote(tab_id, safe="._~").replace("-", "%2D")
 
 
 @dataclass(frozen=True)
@@ -27,6 +46,8 @@ class DocsExtraction:
     complete: bool
     tabs: list[dict[str, Any]]
     issues: list[ExtractionIssue] = field(default_factory=list)
+    # False when the bounded block map stopped recording (see ``MAX_BLOCK_ENTRIES``).
+    block_map_complete: bool = True
 
 
 class _Renderer:
@@ -36,6 +57,21 @@ class _Renderer:
         self.issues: list[ExtractionIssue] = []
         self.length = 0
         self.truncated = False
+        self.block_entries = 0
+        self.block_map_truncated = False
+
+    def record_span(self, sink: list[list[Any]] | None, entry: list[Any], location: str) -> None:
+        """Append one bounded provenance span; past the bound, disclose once and stop."""
+        if sink is None:
+            return
+        if self.block_entries >= MAX_BLOCK_ENTRIES:
+            if not self.block_map_truncated:
+                self.block_map_truncated = True
+                self.issue("block_map_truncated", location,
+                           f"block provenance recorded for the first {MAX_BLOCK_ENTRIES} blocks only")
+            return
+        self.block_entries += 1
+        sink.append(entry)
 
     def add(self, text: str, location: str) -> None:
         if not text or self.truncated:
@@ -63,7 +99,10 @@ class _Renderer:
         *,
         location: str,
         footnotes: dict[str, Any] | None = None,
+        blocks: list[list[Any]] | None = None,
     ) -> None:
+        """Render structural elements; with ``blocks``, record each rendered top-level element as
+        ``[index in content, text start, text end, provider startIndex or None]``."""
         if not isinstance(content, list):
             self.issue("missing_content", location, "body.content is missing or malformed", True)
             return
@@ -72,6 +111,7 @@ class _Renderer:
             if not isinstance(element, dict):
                 self.issue("malformed_block", loc, "structural element is not an object", True)
                 continue
+            start = self.length
             if "paragraph" in element:
                 self.render_paragraph(element["paragraph"], location=loc, footnotes=footnotes or {})
             elif "table" in element:
@@ -84,6 +124,12 @@ class _Renderer:
                 continue
             else:
                 self.issue("unsupported_element", loc, f"unsupported structural keys: {sorted(element)}")
+            if self.length > start:
+                provider_start = element.get("startIndex")
+                self.record_span(blocks, [
+                    index, start, self.length,
+                    provider_start if isinstance(provider_start, int) else None,
+                ], loc)
 
     def render_paragraph(self, paragraph: Any, *, location: str, footnotes: dict[str, Any]) -> None:
         if not isinstance(paragraph, dict):
@@ -251,14 +297,25 @@ def extract_google_doc(document: dict[str, Any], *, max_chars: int = 2_000_000) 
         if not isinstance(doc_tab, dict):
             renderer.issue("missing_tab_content", location, "documentTab is missing", True)
             continue
-        tab_manifest.append({
+        anchor = tab_anchor(tab_id or str(order))
+        entry: dict[str, Any] = {
             "id": tab_id,
             "title": title,
             "order": order,
             "parent_id": str(props.get("parentTabId") or "") or None,
             "nesting_level": props.get("nestingLevel") if isinstance(props.get("nestingLevel"), int) else 0,
-        })
-        renderer.add(f"\n## {title}\n\n", location)
+            "anchor": anchor,
+        }
+        tab_manifest.append(entry)
+        # The boundary is the anchor line, not the heading: a body heading, or another tab with the
+        # same title, renders the same heading but never this tab's anchor.
+        entry["text_start"] = renderer.length + 1
+        renderer.add(f"\n<!-- {anchor} -->\n## {title}\n\n", location)
+        entry["content_start"] = renderer.length
+        blocks: list[list[Any]] = []
+        footnote_spans: list[list[Any]] = []
+        entry["blocks"] = blocks
+        entry["footnotes"] = footnote_spans
         footnotes_supplied = "footnotes" in doc_tab
         raw_footnotes = doc_tab.get("footnotes")
         if footnotes_supplied and not isinstance(raw_footnotes, dict):
@@ -271,11 +328,31 @@ def extract_google_doc(document: dict[str, Any], *, max_chars: int = 2_000_000) 
             footnotes = raw_footnotes or {}
         body = doc_tab.get("body")
         renderer.render_content(body.get("content") if isinstance(body, dict) else None,
-                                location=location, footnotes=footnotes)
+                                location=location, footnotes=footnotes, blocks=blocks)
         for fid, footnote in footnotes.items():
+            footnote_start = renderer.length
             renderer.add(f"\n[^{fid}]: ", f"{location}/footnote:{fid}")
             renderer.render_content(footnote.get("content") if isinstance(footnote, dict) else None,
                                     location=f"{location}/footnote:{fid}", footnotes={})
+            renderer.record_span(footnote_spans, [str(fid), footnote_start, renderer.length],
+                                 f"{location}/footnote:{fid}")
+        entry["text_end"] = renderer.length
+
+    raw = "".join(renderer.parts)
+    text = raw.strip()
+    # Offsets were taken against the unstripped text; rebase them onto what is returned.
+    lead = len(raw) - len(raw.lstrip())
+
+    def rebase(offset: int) -> int:
+        return max(0, min(len(text), offset - lead))
+
+    for entry in tab_manifest:
+        for key in ("text_start", "content_start", "text_end"):
+            entry[key] = rebase(entry[key])
+        entry["blocks"] = [[index, rebase(start), rebase(end), provider]
+                           for index, start, end, provider in entry["blocks"]]
+        entry["footnotes"] = [[fid, rebase(start), rebase(end)] for fid, start, end in entry["footnotes"]]
 
     complete = bool(tab_manifest) and not any(issue.blocking for issue in renderer.issues)
-    return DocsExtraction("".join(renderer.parts).strip(), complete, tab_manifest, renderer.issues)
+    return DocsExtraction(text, complete, tab_manifest, renderer.issues,
+                          block_map_complete=not renderer.block_map_truncated)

@@ -6,7 +6,7 @@ import { errorResponse } from "@/lib/api/schemas";
 import { recentEventsWithStatus, type GraphEvent } from "@/lib/graph/learning";
 import { resolveHumanActorsByItem } from "@/lib/graph/human-actors";
 import { attributeEventParticipants } from "@/lib/graph/arc-attribution";
-import { authorizationEpoch } from "@/lib/access/authorization-epoch";
+import { AttributionRepairPendingError, authorizationEpoch } from "@/lib/access/authorization-epoch";
 import { visibleItemIdsForProjects } from "@/lib/access/enforce";
 import { GraphProvenanceUnavailableError, readAuthorizedGraphFacts } from "@/lib/graph/provenance-read";
 
@@ -131,6 +131,11 @@ export async function GET(req: NextRequest) {
   } catch (error) {
     if (error instanceof GraphProvenanceUnavailableError) {
       return errorResponse("temporarily_unavailable", "graph provenance authorization is temporarily unavailable", 503);
+    }
+    // Participants are attributed to people, so a pending attribution repair withholds the feed —
+    // as a retryable refusal, never a 500 or a plausible-but-partial attribution.
+    if (error instanceof AttributionRepairPendingError) {
+      return errorResponse("temporarily_unavailable", "attribution repair is in progress; retry shortly", 503);
     }
     throw error;
   }

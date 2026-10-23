@@ -61,11 +61,19 @@ describe("AIO-1167 authenticated HTTP connector authority", () => {
     }).select("id").single();
     const claim = await fetch(`${BASE_URL}/api/v1/integrations/gdrive/runs`, { headers });
     expect(claim.status).toBe(200);
-    expect(await claim.json()).toMatchObject({ request: { id: (first as { id: string }).id } });
+    const claimed = await claim.json();
+    expect(claimed).toMatchObject({ request: { id: (first as { id: string }).id } });
     const completion = {
-      requestId: (first as { id: string }).id, status: "complete", unchanged: 1,
-      backlog: 0, authoritativeComplete: true,
+      requestId: (first as { id: string }).id, attemptToken: claimed.request.attempt_token as string,
+      status: "complete", unchanged: 1, backlog: 0, authoritativeComplete: true,
     };
+    // A request outcome without its attempt token never reaches the request.
+    const tokenless: Record<string, unknown> = { ...completion };
+    delete tokenless.attemptToken;
+    const refused = await fetch(`${BASE_URL}/api/v1/integrations/gdrive/runs`, {
+      method: "POST", headers, body: JSON.stringify(tokenless),
+    });
+    expect(refused.status).toBe(422);
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const response = await fetch(`${BASE_URL}/api/v1/integrations/gdrive/runs`, {
         method: "POST", headers, body: JSON.stringify(completion),
@@ -73,17 +81,27 @@ describe("AIO-1167 authenticated HTTP connector authority", () => {
       expect(response.status).toBe(200);
     }
 
+    // An attempt interrupted long ago, with no live Drive execution lease, is recovered under a new token.
     const interruptedId = randomUUID();
+    const interruptedToken = randomUUID();
     await db().from("gdrive_run_requests").insert({
-      id: interruptedId, team_id: seed.teamId, integration_id: integrationId,
+      id: interruptedId, team_id: seed.teamId, integration_id: integrationId, attempt_token: interruptedToken,
       trigger: "retry", status: "running", started_at: new Date(Date.now() - 20 * 60_000).toISOString(),
     });
-    const recovered = await fetch(`${BASE_URL}/api/v1/integrations/gdrive/runs`, { headers });
-    expect(await recovered.json()).toMatchObject({ request: { id: interruptedId } });
+    const recoveredClaim = await (await fetch(`${BASE_URL}/api/v1/integrations/gdrive/runs`, { headers })).json();
+    expect(recoveredClaim).toMatchObject({ request: { id: interruptedId } });
+    expect(recoveredClaim.request.attempt_token).not.toBe(interruptedToken);
+    const interruptedReport = {
+      requestId: interruptedId, status: "failed", failed: 1, error: "provider_timeout",
+      backlog: null, authoritativeComplete: false,
+    };
+    const stale = await fetch(`${BASE_URL}/api/v1/integrations/gdrive/runs`, {
+      method: "POST", headers, body: JSON.stringify({ ...interruptedReport, attemptToken: interruptedToken }),
+    });
+    expect(stale.status).toBe(409);
     const failed = await fetch(`${BASE_URL}/api/v1/integrations/gdrive/runs`, {
       method: "POST", headers, body: JSON.stringify({
-        requestId: interruptedId, status: "failed", failed: 1, error: "provider_timeout",
-        backlog: null, authoritativeComplete: false,
+        ...interruptedReport, attemptToken: recoveredClaim.request.attempt_token,
       }),
     });
     expect(failed.status).toBe(200);

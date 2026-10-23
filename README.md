@@ -726,7 +726,9 @@ answering from a graph it cannot verify, and `/api/v1/graph-query` reports Neo4j
 (`503`). That is deliberate, not a degraded mode, and it does not clear until `NEO4J_URL` is set. Set
 all four variables for graph projection and conversational graph retrieval. Leaving
 `GRAPHITI_URL` unset disables those paths, while direct `/api/v1/graph-query` reads remain available
-when `NEO4J_URL` is configured.
+when `NEO4J_URL` is configured. `npm run doctor` warns about `GRAPHITI_URL` without `NEO4J_URL`, and
+the server logs the same `[boot]` warning at startup. The warning changes nothing at request time:
+the reads still fail closed until `NEO4J_URL` is set.
 
 **2.8d. Understand the extraction limits.** Items are **chunked**, not truncated:
 

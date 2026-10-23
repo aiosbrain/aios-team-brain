@@ -52,6 +52,7 @@ function mockStableArcAuthorization(): void {
   vi.doMock("@/lib/access/authorization-epoch", async (importOriginal) => ({
     ...(await importOriginal<typeof import("@/lib/access/authorization-epoch")>()),
     authorizationEpoch: async () => 1,
+    revocationEpoch: async () => 1,
   }));
   vi.doMock("@/lib/graph/arc-corrections", async (importOriginal) => ({
     ...(await importOriginal<typeof import("@/lib/graph/arc-corrections")>()),

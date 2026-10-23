@@ -29,6 +29,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { pgConnectionConfig, resolvePgTls, shouldUseSsl } from "../lib/db/pg/ssl.mjs";
+import { checkGraphStores } from "../lib/graph/config-check.mjs";
 
 export const OK = "ok";
 export const WARN = "warn";
@@ -67,6 +68,8 @@ export function parseEnvFile(text) {
 
 import { NODE_TLS_FLOORS, checkNode } from "./node-tls-floor.mjs";
 export { NODE_TLS_FLOORS, checkNode };
+// Shared with the boot hook (instrumentation.ts), so doctor and the deploy log say the same thing.
+export { checkGraphStores };
 
 export function checkDatabaseUrl(value) {
   if (!value) {
@@ -307,6 +310,7 @@ async function main() {
   run("model provider", checkModelProvider(env));
   run("mail transport", checkMailer(env));
   run("embeddings", checkEmbeddings(env));
+  run("graph stores", checkGraphStores(env));
 
   if (!skipDb && env.DATABASE_URL) {
     try {

@@ -3175,7 +3175,12 @@ create table if not exists gdrive_run_requests (
   started_at timestamptz,
   finished_at timestamptz,
   summary jsonb not null default '{}'::jsonb,
-  error text
+  error text,
+  -- The opaque token of the attempt that last claimed the request (AIO-1167). Only that attempt may
+  -- complete or defer it; a running request always has one. Mirrored in
+  -- postgres/migrations/20261021120000_gdrive_run_attempt_tokens.sql.
+  attempt_token uuid,
+  constraint gdrive_run_requests_running_attempt_check check (status <> 'running' or attempt_token is not null)
 );
 create index if not exists gdrive_run_requests_claim_idx
   on gdrive_run_requests (team_id, integration_id, status, created_at);

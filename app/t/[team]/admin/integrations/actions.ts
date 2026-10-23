@@ -62,6 +62,7 @@ import {
   provisionGdriveConnectorPrincipal,
   publishGdriveVerifiedSelection,
   publishGdriveVerifiedConfig,
+  saveGdriveConnectionConfig,
   validateGdriveAudienceProjects,
   type GdriveAdminTestAuthority,
 } from "@/lib/integrations/gdrive-authority";
@@ -285,6 +286,11 @@ export async function saveIntegration(
           return { ok: true };
         }
       }
+      // Locked save: a narrowed audience is applied to every claimed document before this returns,
+      // and the connection keeps its paused/enabled status.
+      await saveGdriveConnectionConfig(adminClient(), auth, { name, config, secret: form.secret });
+      revalidatePath(`/t/${teamSlug}/admin/integrations`);
+      return { ok: true };
     }
     // Only channels PUBLIC to the workspace may be ingested — refuse the save rather than accept a
     // private channel the ingester will silently skip forever (see `slack-validate`).

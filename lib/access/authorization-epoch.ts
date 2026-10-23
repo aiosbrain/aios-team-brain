@@ -19,23 +19,47 @@ async function assertAttributionRepairComplete(db: DbClient, teamId: string): Pr
   }
 }
 
+async function readEpoch(db: DbClient, teamId: string): Promise<number> {
+  const { data, error } = await db.from("team_authorization_epochs").select("epoch")
+    .eq("team_id", teamId).maybeSingle();
+  if (error) throw new Error(`authorization epoch read failed: ${error.message}`);
+  return data ? Number((data as { epoch: string | number }).epoch) : 1;
+}
+
 /**
- * Current durable visibility generation. The schema migration seeds existing teams and the first
- * revocation upserts future teams. A missing row is therefore the canonical initial epoch; reads do
- * not need to perform a write (important for read-only/cache paths and transaction composition).
+ * Current durable visibility generation, gated on identity-attribution repair. The schema migration
+ * seeds existing teams and the first revocation upserts future teams. A missing row is therefore the
+ * canonical initial epoch; reads do not need to perform a write (important for read-only/cache paths
+ * and transaction composition).
+ *
+ * For ATTRIBUTION-DEPENDENT payloads (Timeline, arcs, participant-attributed events): a newer epoch
+ * prevents serving the old payload, while the repair state prevents publishing a plausible-but-
+ * partial replacement before every attribution effect has committed. Reads whose output carries no
+ * person attribution use `revocationEpoch` instead, so a pending repair does not take them down.
  */
 export async function authorizationEpoch(db: DbClient, teamId: string): Promise<number> {
   try {
-    // A newer epoch prevents serving the old payload, while the repair state prevents publishing a
-    // plausible-but-partial replacement before every attribution effect has committed.
     await assertAttributionRepairComplete(db, teamId);
-    const { data, error } = await db.from("team_authorization_epochs").select("epoch")
-      .eq("team_id", teamId).maybeSingle();
-    if (error) throw new Error(`authorization epoch read failed: ${error.message}`);
-    return data ? Number((data as { epoch: string | number }).epoch) : 1;
+    return await readEpoch(db, teamId);
   } catch (error) {
     // Pure unit DbClient fakes predate this table and deliberately implement only the query under
     // test. The real-PG tier exercises the barrier; production must never degrade around it.
+    if (process.env.NODE_ENV === "test" && !process.env.DATABASE_URL) return 1;
+    throw error;
+  }
+}
+
+/**
+ * The same durable epoch WITHOUT the attribution-repair gate: the revocation barrier alone, for
+ * reads that publish no person attribution (graph-fact provenance, arc-partition item authority).
+ * It is the identical counter, so a caller comparing it before and after a read still observes every
+ * revocation; it only stops an unrelated pending repair from failing the read. A caller that goes on
+ * to publish attributed output must still pass the gated `authorizationEpoch` for that publication.
+ */
+export async function revocationEpoch(db: DbClient, teamId: string): Promise<number> {
+  try {
+    return await readEpoch(db, teamId);
+  } catch (error) {
     if (process.env.NODE_ENV === "test" && !process.env.DATABASE_URL) return 1;
     throw error;
   }

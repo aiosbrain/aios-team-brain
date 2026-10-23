@@ -121,6 +121,12 @@ describe("timeline enforcement wiring (Phase B slice 4, §5.8)", () => {
     expect(src).toMatch(/getCachedWorkTimeline\(adminClient\(\),\s*team\.id,\s*tier,\s*memberId\s*\)/);
     // TIERRET-1: the fresh-build arm carries the READER too (the cached arm resolves it inside).
     expect(src).toMatch(/getWorkTimeline\([^;]*days,\s*await\s+contentTimelineEnforcement\(/);
+    // AIO-1167: the fresh-build arm is bound to the attribution gate — gated epoch before the build,
+    // locked publication check after it — and is the arm the route actually takes for days > 7.
+    expect(src).toMatch(
+      /async function freshWorkTimeline[\s\S]*?await authorizationEpoch\(adminClient\(\), teamId\)[\s\S]*?getWorkTimeline\([\s\S]*?withLockedAuthorizationEpoch\(teamId,/
+    );
+    expect(src).toMatch(/:\s*await freshWorkTimeline\(team\.id,\s*tier,\s*days,\s*memberId\)/);
   });
   it("the cache layer fails closed: no principal on an enforcing team throws", () => {
     expect(read("lib/dashboard/timeline-cache.ts")).toMatch(/timeline read without a principal/); // PRET-6: always throws

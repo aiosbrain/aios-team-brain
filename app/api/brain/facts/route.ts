@@ -6,7 +6,7 @@ import { adminClient } from "@/lib/db/admin";
 import { recentFacts, resolveEpisodeItems } from "@/lib/graph/learning";
 import { filterArcFactsByAuthorizedItems } from "@/lib/graph/arc-input-authorization";
 import { visibleItemIdsForProjects } from "@/lib/access/enforce";
-import { authorizationEpoch } from "@/lib/access/authorization-epoch";
+import { revocationEpoch } from "@/lib/access/authorization-epoch";
 
 export const runtime = "nodejs";
 
@@ -93,12 +93,14 @@ export async function GET(req: NextRequest) {
   }
 
   const admin = adminClient();
-  const epoch = await authorizationEpoch(admin, team.id);
+  // Facts publish no person attribution, so a pending attribution repair does not gate them; the
+  // revocation barrier still brackets the provenance read.
+  const epoch = await revocationEpoch(admin, team.id);
   const since = new Date(Date.now() - WINDOW_HOURS * 3600 * 1000).toISOString();
   const { facts, ok } = await recentFacts(groups, since, LIMIT);
   const episodes = await resolveEpisodeItems(groups, facts.flatMap((fact) => fact.episodeUuids), LIMIT * 8);
   const visible = await visibleItemIdsForProjects(admin, team.id, oracle.set.projectIds);
-  const authorityOk = episodes.ok && !visible.error && await authorizationEpoch(admin, team.id) === epoch;
+  const authorityOk = episodes.ok && !visible.error && await revocationEpoch(admin, team.id) === epoch;
   const authorizedFacts = authorityOk
     ? filterArcFactsByAuthorizedItems(facts, episodes.items, visible.ids)
     : [];

@@ -31,6 +31,7 @@ from .sources.gdrive import (
     IncompleteExtractionError,
     ProviderCursorInvalid,
     ProviderDeferred,
+    is_drive_rate_limit,
 )
 from .state import StateStore, StreamKey, PendingWork, MaterializedPage
 from .selections import effective_gdrive_connection
@@ -160,7 +161,9 @@ def _capture_start_token(source: GoogleDriveSource, drive: Any, drive_id: str) -
     root shared without its drive, or a drive since lost. That is ``StreamStartUnavailable`` at
     every site alike — a new stream, the recovery of local state, the recovery of an invalid
     cursor — so none of them can turn one stream's failure into the run's. My Drive, authority
-    and provider deferrals, and every other status are raised exactly as they came.
+    and provider deferrals, and every other status are raised exactly as they came. A 403 that
+    names a rate-limit reason is a quota answer, not an inaccessible drive: the provider call
+    retries and defers it as ``rate_limited``, and should one ever reach here it is raised as is.
     """
     kwargs = {"supportsAllDrives": True}
     if drive_id != "my-drive":
@@ -171,7 +174,9 @@ def _capture_start_token(source: GoogleDriveSource, drive: Any, drive_id: str) -
         raise
     except Exception as exc:
         status = _provider_status(exc)
-        if drive_id == "my-drive" or status not in (403, 404):
+        # The module function, not ``GoogleDriveSource``: the source class in hand may be any
+        # provider-shaped object, and classification must not depend on it.
+        if drive_id == "my-drive" or status not in (403, 404) or is_drive_rate_limit(exc):
             raise
         raise StreamStartUnavailable(drive_id, status) from exc
 
@@ -1953,6 +1958,15 @@ async def _push_doc(
         if work:
             state.fail_work(work, _validation_detail(exc), not_before=_defer_until())
         return True
+    text_map = item.frontmatter.get("gdrive_text_map")
+    if isinstance(text_map, dict):
+        # Tab/block offsets are into the extracted text; the stored body leads with the title line.
+        # Record exactly where that text starts in the body the brain stores, or that it could not
+        # be located — never a guessed offset.
+        located = item.body.endswith(doc.body)
+        item.frontmatter["gdrive_text_map"] = {
+            **text_map, "body_offset": len(item.body) - len(doc.body) if located else None,
+        }
     try:
         result = await client.push(item, execution=execution)
         setattr(summary, result.status, getattr(summary, result.status) + 1)
@@ -2117,19 +2131,22 @@ def _cross_stream_removal(
     every other stream of the roster — including one the brain holds and local state does not,
     and the destination of a root that is still on its way:
 
-      · ``claimed`` — another stream holds the document (in its published snapshot, in one it is
-        building, or as an upsert it still owes). Only this stream's membership ended.
-      · ``withheld`` — no other stream holds it, but one may not have read that far. Each peer is
-        given a durable barrier when it is first known for this removal — at once, or runs later
-        when a relocation makes a new one — and the obligation stays until every peer has
+      · ``claimed`` — another stream that can read its change log holds the document (in its
+        published snapshot, in one it is building, or as an upsert it still owes), and the
+        provider does not say it is gone. Only this stream's membership ended.
+      · ``withheld`` — no readable stream holds it, but one may not have read that far. Each peer
+        is given a durable barrier when it is first known for this removal — at once, or runs
+        later when a relocation makes a new one — and the obligation stays until every peer has
         finished a drain that began after its barrier. A peer with no barrier is one nothing is
         known about, across any restart.
       · ``absent`` — every peer has, and none holds it. The removal is the connection's.
 
     A peer that cannot be read — it has no local state yet, holds no token, or waits on one for
-    its recovery — may never pass its barrier. Behind such a peer the removal stays withheld
-    while it is ambiguous, but the document itself is read: gone at the provider, it is absent
-    now, without waiting for a snapshot that peer may never complete.
+    its recovery — may never pass its barrier, and what it holds is what it held when it could
+    last read: it cannot observe the document leaving it. Behind such a peer, claiming the
+    document or not, the removal stays withheld while it is ambiguous, but the document itself
+    is read: gone at the provider, it is absent now, without waiting for a snapshot that peer may
+    never complete.
 
     A connection with one stream has nothing to wait for: its removals are ``absent`` at once.
     """
@@ -2154,7 +2171,16 @@ def _cross_stream_removal(
         }
     if not peers:
         return "absent"
-    if state.claimed_elsewhere(connection_id, work.generation, work.namespace, work.item_key):
+    by_namespace = {progress.namespace: progress for progress in local.values()}
+    claimants = state.streams_claiming(
+        connection_id, work.generation, work.namespace, work.item_key,
+    )
+    # A claim is membership a stream recorded, not an observation that the document survived the
+    # removal — even where that stream's change log can be read now. So the provider's own answer
+    # is read before any claim is honoured, and read once: gone at the provider, no claim keeps it.
+    if claimants and _document_loss_verified(source, work.item_key):
+        return "absent"
+    if any(not _cannot_read(by_namespace.get(namespace)) for namespace in claimants):
         return "claimed"
     barriers: dict[str, str] = {}
     for drive_id, key in peers.items():
@@ -2165,20 +2191,24 @@ def _cross_stream_removal(
             state.raise_removal_barrier(work, key, renew=True)
             barrier = "standing"
         barriers[drive_id] = barrier
-    if all(barrier == "passed" for barrier in barriers.values()):
+    if not claimants and all(barrier == "passed" for barrier in barriers.values()):
         return "absent"
     unreadable = [
         drive_id for drive_id, barrier in barriers.items()
-        if barrier != "passed" and (
-            local.get(drive_id) is None or _unstarted(local[drive_id])
-            or _start_recovery_blocked(local[drive_id])
-        )
+        if barrier != "passed" and _cannot_read(local.get(drive_id))
     ]
-    if unreadable and _document_loss_verified(source, work.item_key):
+    # Behind an unreadable stream that claims nothing, the document is read for itself here; a
+    # claim was already weighed against the provider's answer above, and is not read again.
+    if not claimants and unreadable and _document_loss_verified(source, work.item_key):
         return "absent"
     # Attempted again each run, behind retries that have waited less.
     state.fail_work(work, f"{_CROSS_STREAM_PENDING}: awaiting the other streams' next drain")
     return "withheld"
+
+
+def _cannot_read(progress: Any) -> bool:
+    """A peer stream with no local state, no token, or a recovery waiting on its start token."""
+    return progress is None or _unstarted(progress) or _start_recovery_blocked(progress)
 
 
 def _run_deadline_reached(execution: GdriveExecution) -> bool:

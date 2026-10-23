@@ -4,8 +4,9 @@ import { adminClient } from "@/lib/db/admin";
 import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
 import { freshnessWire } from "@/lib/freshness";
-import { getCachedWorkTimeline } from "@/lib/dashboard/timeline-cache";
+import { getCachedWorkTimeline, TimelineAuthorizationChangedError } from "@/lib/dashboard/timeline-cache";
 import { mostRecentPerPerson } from "@/lib/dashboard/timeline-group";
+import { AttributionRepairPendingError } from "@/lib/access/authorization-epoch";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -40,7 +41,21 @@ export async function GET(req: NextRequest) {
   const { resolveViewerPosture } = await import("@/lib/access/posture");
   const tier = await resolveViewerPosture(adminClient(), team.id, (me as { id: string }).id);
   // §5.8: the session member is the principal — an enforcing team serves their visibility variant.
-  const { days, freshness } = await getCachedWorkTimeline(adminClient(), team.id, tier, (me as { id: string }).id);
+  let cached: Awaited<ReturnType<typeof getCachedWorkTimeline>>;
+  try {
+    cached = await getCachedWorkTimeline(adminClient(), team.id, tier, (me as { id: string }).id);
+  } catch (error) {
+    // Person attribution is mid-repair: neither the old ledger nor a partial rebuild may be served.
+    if (error instanceof AttributionRepairPendingError) {
+      return errorResponse("temporarily_unavailable", "attribution repair is in progress; retry shortly", 503);
+    }
+    // Authorization moved under both attempts of the read: retryable, never a raw 500.
+    if (error instanceof TimelineAuthorizationChangedError) {
+      return errorResponse("temporarily_unavailable", "timeline authorization changed; retry the request", 503);
+    }
+    throw error;
+  }
+  const { days, freshness } = cached;
   const people = mostRecentPerPerson(days);
   // WAS `new Date()` over a 5-min-TTL cache that also serves PAST the TTL while rebuilding — so this
   // reported a stale ledger as current. Now the cache row's own time (R2/M6).

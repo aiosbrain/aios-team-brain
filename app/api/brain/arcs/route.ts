@@ -14,6 +14,7 @@ import { resolveArcScope } from "@/lib/graph/partition-read";
 import { memberEnforcement } from "@/lib/access/enforce";
 import { freshnessWire, computedNow } from "@/lib/freshness";
 import { ArcInputAuthorizationUnavailableError } from "@/lib/graph/arc-input-authorization";
+import { AttributionRepairPendingError } from "@/lib/access/authorization-epoch";
 
 export const runtime = "nodejs";
 // Arc synthesis with a reasoning model can be slow (it reasons over ~200 facts). Give the inline
@@ -81,6 +82,10 @@ export async function POST(req: NextRequest) {
   } catch (error) {
     if (error instanceof ArcFusionAuthorizationChangedError || error instanceof ArcInputAuthorizationUnavailableError) {
       return errorResponse("temporarily_unavailable", "arc authorization changed; retry the request", 503);
+    }
+    // Arc participants are attributed to people: withheld while attribution repair is pending.
+    if (error instanceof AttributionRepairPendingError) {
+      return errorResponse("temporarily_unavailable", "attribution repair is in progress; retry shortly", 503);
     }
     return errorResponse("internal", "enforcement check failed", 500);
   }

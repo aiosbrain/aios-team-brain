@@ -1,11 +1,12 @@
 from aios_ingest.config import BrainSettings, Connection
 from aios_ingest.scheduler import (
     build_scheduler, due_for_renewal, _renewal_job, _gdrive_outcome_status,
-    _manual_gdrive_job, _remote_gdrive_poll_job,
+    _manual_gdrive_job, _poll_job, _remote_gdrive_poll_job, _gdrive_hint_job,
 )
 from aios_ingest.engine import IngestSummary
+from aios_ingest.normalize import RawDoc
 from aios_ingest.state import Channel, StateStore, StreamKey
-from aios_ingest.brain_client import BrainError, GdriveExecution, GdriveRunRequest
+from aios_ingest.brain_client import BrainError, GdriveExecution, GdriveRunRequest, IngestResult
 import pytest
 
 SETTINGS = BrainSettings(base_url="http://brain", api_key="aios_a_b", team="demo")
@@ -54,7 +55,7 @@ def test_build_scheduler_adds_renewal_when_watch_manager_present(tmp_path):
 
     sched = build_scheduler(SETTINGS, conns, state=state, watch_manager=FakeWatch())
     ids = {j.id for j in sched.get_jobs()}
-    assert ids == {"poll:gd", "gdrive-manual-queue", "renewal-sweep"}
+    assert ids == {"poll:gd", "gdrive-manual-queue", "gdrive-notification-hints", "renewal-sweep"}
     state.close()
 
 
@@ -62,7 +63,248 @@ def test_build_scheduler_bootstraps_remote_gdrive_without_a_local_connection(tmp
     state = StateStore(str(tmp_path / "s.sqlite"))
     assert build_scheduler(SETTINGS, [], state=state).get_jobs() == []
     sched = build_scheduler(SETTINGS, [], state=state, bootstrap_remote_gdrive=True)
-    assert {j.id for j in sched.get_jobs()} == {"gdrive-manual-queue", "gdrive-remote-poll"}
+    assert {j.id for j in sched.get_jobs()} == {
+        "gdrive-manual-queue", "gdrive-notification-hints", "gdrive-remote-poll",
+    }
+    state.close()
+
+
+def test_notification_hints_are_swept_far_more_often_than_the_poll(tmp_path):
+    state = StateStore(str(tmp_path / "s.sqlite"))
+    sched = build_scheduler(SETTINGS, [], state=state, poll_interval=300, bootstrap_remote_gdrive=True)
+    jobs = {j.id: j for j in sched.get_jobs()}
+    hint = jobs["gdrive-notification-hints"].trigger.interval.total_seconds()
+    poll = jobs["gdrive-remote-poll"].trigger.interval.total_seconds()
+    assert hint <= 15 and poll == 300
+    # One sweep at a time, and a missed tick is coalesced rather than queued.
+    assert jobs["gdrive-notification-hints"].max_instances == 1
+    assert jobs["gdrive-notification-hints"].coalesce is True
+    state.close()
+
+
+def _hint_world(monkeypatch, rows, *, fail_selections=False):
+    ran, reported = [], []
+
+    class Client:
+        def __init__(self, *args, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def fetch_integration_selections(self, **kwargs):
+            assert kwargs == {"include_disabled": True}
+            if fail_selections:
+                raise BrainError(503, "unavailable", "selection read failed")
+            return rows
+        async def report_scheduled_gdrive_run(self, report_id, integration_id, started, summary, **kwargs):
+            reported.append((integration_id, kwargs["status"]))
+
+    async def run(_settings, conn, _state):
+        ran.append(conn)
+        return IngestSummary(conn.name, backlog=0, authoritative_complete=True,
+                             integration_id=conn.options.get("integration_id"))
+
+    monkeypatch.setattr("aios_ingest.brain_client.BrainClient", Client)
+    monkeypatch.setattr("aios_ingest.scheduler.run_gdrive_stream", run)
+    return ran, reported
+
+
+async def test_a_validated_notification_wakes_the_coordinator_without_waiting_for_the_poll(
+    tmp_path, monkeypatch,
+):
+    """Webhook → hint → the next hint sweep runs the ordinary coordinator for that connection."""
+    from aios_ingest.state import verification_hash
+    from aios_ingest.webhook_app import _gdrive_notification
+
+    path = tmp_path / "hint-wake.sqlite"
+    monkeypatch.setenv("AIOS_INGEST_STATE", str(path))
+    integration_id = "00000000-0000-0000-0000-00000000000a"
+    key = StreamKey(SETTINGS.team, integration_id, "subject:google-123", "my-drive")
+    state = StateStore(str(path))
+    progress = state.begin_generation(key, 3, start_token="start")
+    state.save_channel(Channel(
+        "admin-docs", "chan-1", "res-1", "2099-01-01T00:00:00Z", progress.namespace,
+        verification_hash("secret"),
+    ))
+    ran, reported = _hint_world(monkeypatch, [_oauth_row(integration_id, "admin-docs")])
+    attempted: dict[str, int] = {}
+
+    # Nothing pending: the sweep reads nothing and runs nothing.
+    await _gdrive_hint_job(SETTINGS, [], state, attempted)
+    assert ran == []
+
+    # A burst of validated notifications is one triggered run, through the same coordinator path
+    # (and the same run report) as a scheduled poll.
+    for number in range(5):
+        assert _gdrive_notification({
+            "x-goog-channel-id": "chan-1", "x-goog-resource-id": "res-1",
+            "x-goog-channel-token": "secret", "x-goog-message-number": str(number),
+        }).status_code == 202
+    await _gdrive_hint_job(SETTINGS, [], state, attempted)
+    assert [conn.options["integration_id"] for conn in ran] == [integration_id]
+    assert reported == [(integration_id, "complete")]
+
+    # Coalesced: a sweep with no NEW notification does not run it again, even though the fake run
+    # acknowledged nothing — the regular poll remains the repair path for that.
+    await _gdrive_hint_job(SETTINGS, [], state, attempted)
+    assert len(ran) == 1
+
+    # A later notification wakes it once more.
+    _gdrive_notification({
+        "x-goog-channel-id": "chan-1", "x-goog-resource-id": "res-1",
+        "x-goog-channel-token": "secret", "x-goog-message-number": "9",
+    })
+    await _gdrive_hint_job(SETTINGS, [], state, attempted)
+    assert len(ran) == 2
+
+    # An invalid notification records no hint and wakes nothing.
+    assert _gdrive_notification({
+        "x-goog-channel-id": "chan-1", "x-goog-resource-id": "res-1",
+        "x-goog-channel-token": "wrong", "x-goog-message-number": "10",
+    }).status_code == 401
+    await _gdrive_hint_job(SETTINGS, [], state, attempted)
+    assert len(ran) == 2
+    state.close()
+
+
+async def test_an_acknowledged_hint_is_not_pending(tmp_path, monkeypatch):
+    state = StateStore(str(tmp_path / "hint-acked.sqlite"))
+    integration_id = "00000000-0000-0000-0000-00000000000a"
+    key = StreamKey(SETTINGS.team, integration_id, "subject:google-123", "my-drive")
+    observed = state.record_stream_hint(key)
+    state.ack_stream_hint(key, observed)
+    ran, _ = _hint_world(monkeypatch, [_oauth_row(integration_id, "admin-docs")])
+    await _gdrive_hint_job(SETTINGS, [], state, {})
+    assert ran == []
+    state.close()
+
+
+async def test_hint_sweep_honors_admin_state_and_keeps_local_connections(tmp_path, monkeypatch):
+    state = StateStore(str(tmp_path / "hint-admin.sqlite"))
+    enabled = "00000000-0000-0000-0000-00000000000a"
+    paused = "00000000-0000-0000-0000-00000000000b"
+    unknown = "00000000-0000-0000-0000-00000000000c"
+    local_id = "00000000-0000-0000-0000-00000000000d"
+    for cid in (enabled, paused, unknown, local_id):
+        state.record_stream_hint(StreamKey(SETTINGS.team, cid, "account", "my-drive"))
+    # Another team's hint in the same state file is never this sweep's.
+    state.record_stream_hint(StreamKey("other-team", enabled, "account", "my-drive"))
+    local = Connection("local-docs", "gdrive", options={"service_account_key_path": "local.json"})
+    ran, _ = _hint_world(monkeypatch, [
+        _oauth_row(enabled, "admin-docs"),
+        _oauth_row(paused, "paused-docs", status="disabled"),
+        _oauth_row(local_id, "local-docs"),
+    ])
+    await _gdrive_hint_job(SETTINGS, [local], state, {})
+    # Paused and unknown connections are not woken; a locally configured name runs as itself.
+    assert [conn.name for conn in ran] == ["admin-docs", "local-docs"]
+    assert ran[1] is local
+    state.close()
+
+
+async def test_hint_sweep_fails_closed_when_admin_state_is_unreadable(tmp_path, monkeypatch):
+    state = StateStore(str(tmp_path / "hint-unreadable.sqlite"))
+    state.record_stream_hint(StreamKey(SETTINGS.team, "00000000-0000-0000-0000-00000000000a", "a", "my-drive"))
+    ran, _ = _hint_world(monkeypatch, [], fail_selections=True)
+    with pytest.raises(BrainError):
+        await _gdrive_hint_job(SETTINGS, [], state, {})
+    assert ran == []
+    state.close()
+
+
+async def test_hint_sweep_is_bounded_per_tick_and_reaches_the_rest_next_tick(tmp_path, monkeypatch):
+    state = StateStore(str(tmp_path / "hint-bounded.sqlite"))
+    ids = [f"00000000-0000-0000-0000-00000000001{index}" for index in range(6)]
+    for cid in ids:
+        state.record_stream_hint(StreamKey(SETTINGS.team, cid, "account", "my-drive"))
+    ran, _ = _hint_world(monkeypatch, [_oauth_row(cid, f"docs-{index}") for index, cid in enumerate(ids)])
+    attempted: dict[str, int] = {}
+    await _gdrive_hint_job(SETTINGS, [], state, attempted, limit=4)
+    assert [conn.options["integration_id"] for conn in ran] == ids[:4]
+    await _gdrive_hint_job(SETTINGS, [], state, attempted, limit=4)
+    assert [conn.options["integration_id"] for conn in ran] == ids
+    state.close()
+
+
+async def test_one_failing_hint_run_does_not_starve_the_next(tmp_path, monkeypatch):
+    state = StateStore(str(tmp_path / "hint-failure.sqlite"))
+    first, second = "00000000-0000-0000-0000-00000000000a", "00000000-0000-0000-0000-00000000000b"
+    for cid in (first, second):
+        state.record_stream_hint(StreamKey(SETTINGS.team, cid, "account", "my-drive"))
+    ran, _ = _hint_world(monkeypatch, [_oauth_row(first, "first"), _oauth_row(second, "second")])
+
+    async def run(_settings, conn, _state):
+        ran.append(conn)
+        if conn.name == "first":
+            # e.g. the brain refused the lease because a scheduled poll holds it.
+            raise BrainError(409, "execution_busy", "another coordinator holds the lease")
+        return IngestSummary(conn.name, backlog=0, authoritative_complete=True,
+                             integration_id=conn.options.get("integration_id"))
+
+    monkeypatch.setattr("aios_ingest.scheduler.run_gdrive_stream", run)
+    await _gdrive_hint_job(SETTINGS, [], state, {})
+    assert [conn.name for conn in ran] == ["first", "second"]
+    # The refused stream's hint is still pending for the poll (or the next notification) to drain.
+    assert state.pending_stream_hint(StreamKey(SETTINGS.team, first, "account", "my-drive")) == 1
+    state.close()
+
+
+_PREVIOUS_CURSOR = "2026-01-01T00:00:00+00:00"
+
+
+def _generic_poll_world(monkeypatch, total, *, failing=None):
+    """A replaying generic source of ``total`` documents and a sink that fails ``failing`` once."""
+    fetched, pushed = [], []
+
+    class Source:
+        def fetch(self, since=None):
+            fetched.append(since)
+            for index in range(1, total + 1):
+                yield RawDoc(source="github", external_id=f"o/r/doc-{index}.md", body=str(index))
+
+    class Client:
+        def __init__(self, *args, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def push(self, item, *, execution=None):
+            pushed.append(item.path)
+            if item.path == failing:
+                raise BrainError(503, "sink_unavailable", "retry")
+            return IngestResult("created", "item", item.path)
+
+    monkeypatch.setattr("aios_ingest.engine.build_source", lambda *_args: Source())
+    monkeypatch.setattr("aios_ingest.engine.BrainClient", Client)
+    return fetched, pushed
+
+
+async def test_generic_poll_past_five_thousand_documents_completes_and_advances_its_cursor(
+    tmp_path, monkeypatch,
+):
+    state = StateStore(str(tmp_path / "generic-cursor.sqlite"))
+    conn = Connection(name="nt", source="notion", options={"token": "t", "page_ids": ["p"]})
+    state.set_cursor(conn.name, _PREVIOUS_CURSOR)
+    fetched, pushed = _generic_poll_world(monkeypatch, 5_001)
+
+    await _poll_job(SETTINGS, conn, state)
+
+    # The whole source was read in the one run, and nothing about its length was a failure…
+    assert fetched == [_PREVIOUS_CURSOR]
+    assert len(pushed) == 5_001 and pushed[-1] == "github/o/r/doc-5001.md"
+    # …so the cursor moved on.
+    advanced = state.get_cursor(conn.name)
+    assert advanced is not None and advanced > _PREVIOUS_CURSOR
+    state.close()
+
+
+async def test_generic_poll_with_a_sink_failure_keeps_its_cursor(tmp_path, monkeypatch):
+    state = StateStore(str(tmp_path / "generic-cursor-failure.sqlite"))
+    conn = Connection(name="nt", source="notion", options={"token": "t", "page_ids": ["p"]})
+    state.set_cursor(conn.name, _PREVIOUS_CURSOR)
+    fetched, pushed = _generic_poll_world(monkeypatch, 40, failing="github/o/r/doc-7.md")
+
+    await _poll_job(SETTINGS, conn, state)
+
+    assert fetched == [_PREVIOUS_CURSOR] and len(pushed) == 40
+    # A document the brain did not take is re-polled: the cursor stays where it was.
+    assert state.get_cursor(conn.name) == _PREVIOUS_CURSOR
     state.close()
 
 
@@ -151,7 +393,9 @@ async def test_manual_request_runs_oauth_only_connection_without_a_local_stub(
 ):
     state = StateStore(str(tmp_path / "manual.sqlite"))
     integration_id = "00000000-0000-0000-0000-00000000000a"
-    request = GdriveRunRequest("request-1", integration_id, "admin-docs", "manual", NOW)
+    request = GdriveRunRequest(
+        "request-1", integration_id, "admin-docs", "manual", NOW, "00000000-0000-0000-0000-0000000000a1",
+    )
     local = Connection("admin-docs", "gdrive", options={"service_account_key_path": "local.json"})
     other = Connection("other-docs", "gdrive", options={"service_account_key_path": "other.json"})
     ran, completed = [], []

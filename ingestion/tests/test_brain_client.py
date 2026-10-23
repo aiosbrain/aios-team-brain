@@ -27,16 +27,60 @@ async def test_gdrive_completion_omits_absent_error_and_reports_explicit_outcome
     request = GdriveRunRequest(
         "11111111-1111-1111-1111-111111111111",
         "22222222-2222-2222-2222-222222222222", "drive", "manual", "now",
+        "33333333-3333-3333-3333-333333333333",
     )
     async with _client(httpx.MockTransport(handler)) as client:
         await client.complete_gdrive_run_request(request, summary, status="complete")
 
     assert "error" not in seen
     assert seen == {
-        "requestId": request.id, "status": "complete", "created": 0, "updated": 0,
-        "unchanged": 2, "removed": 0, "failed": 0, "skipped": 1,
+        "requestId": request.id, "attemptToken": request.attempt_token, "status": "complete",
+        "created": 0, "updated": 0, "unchanged": 2, "removed": 0, "failed": 0, "skipped": 1,
         "backlog": 0, "cursorAgeSeconds": 12.5, "authoritativeComplete": True,
     }
+
+
+_CLAIMED = {
+    "id": "11111111-1111-1111-1111-111111111111",
+    "integration_id": "22222222-2222-2222-2222-222222222222",
+    "name": "drive", "trigger": "manual", "created_at": "now",
+}
+
+
+async def test_gdrive_claim_carries_its_attempt_token_into_the_deferred_report():
+    token = "44444444-4444-4444-4444-444444444444"
+    sent = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET":
+            return httpx.Response(200, json={"request": {**_CLAIMED, "attempt_token": token}})
+        sent.append(json.loads(req.content))
+        return httpx.Response(200, json={"ok": True})
+
+    async with _client(httpx.MockTransport(handler)) as client:
+        claimed = await client.claim_gdrive_run_request()
+        await client.complete_gdrive_run_request(
+            claimed, IngestSummary("drive", skipped=1, deferred=True), status="deferred", error="busy",
+        )
+
+    assert claimed == GdriveRunRequest(**_CLAIMED, attempt_token=token)
+    assert [(body["requestId"], body["attemptToken"], body["status"]) for body in sent] == [
+        (_CLAIMED["id"], token, "deferred"),
+    ]
+
+
+@pytest.mark.parametrize("token", ["absent", None, "", "not-a-uuid", 42])
+async def test_gdrive_claim_without_a_valid_attempt_token_fails_closed(token):
+    claim = dict(_CLAIMED) if token == "absent" else {**_CLAIMED, "attempt_token": token}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.method == "GET", "nothing is reported for a claim without a token"
+        return httpx.Response(200, json={"request": claim})
+
+    async with _client(httpx.MockTransport(handler)) as client:
+        with pytest.raises(BrainError) as raised:
+            await client.claim_gdrive_run_request()
+    assert raised.value.code == "invalid_run_claim"
 
 
 def _client(transport: httpx.MockTransport) -> BrainClient:

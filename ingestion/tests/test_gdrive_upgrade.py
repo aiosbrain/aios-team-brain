@@ -140,6 +140,113 @@ def test_docs_extraction_preserves_nested_tabs_tables_links_footnotes_and_unicod
     assert "## Details" in result.text
 
 
+def _multi_tab_with_duplicate_titles():
+    """Two tabs titled "Notes" (one nested), a body heading that also reads "## Notes", a table,
+    a footnote and non-ASCII text — every way a heading-only boundary would be ambiguous."""
+    notes_a = {"paragraph": {"elements": [{"textRun": {"content": "Notes\n"}}],
+                             "paragraphStyle": {"namedStyleType": "HEADING_2"}}, "startIndex": 1}
+    return {"title": "Plan", "tabs": [
+        {
+            "tabProperties": {"tabId": "t.0", "title": "Notes"},
+            "documentTab": {
+                "body": {"content": [
+                    {"sectionBreak": {}, "startIndex": 0},
+                    notes_a,
+                    {**_paragraph("Alpha 東京 first\n"), "startIndex": 7},
+                    {"table": {"tableRows": [
+                        {"tableCells": [{"content": [_paragraph("K\n")]}, {"content": [_paragraph("V\n")]}]},
+                    ]}, "startIndex": 24},
+                    {"paragraph": {"elements": [
+                        {"textRun": {"content": "cited"}},
+                        {"footnoteReference": {"footnoteId": "fn-1"}},
+                        {"textRun": {"content": "\n"}},
+                    ]}, "startIndex": 40},
+                ]},
+                "footnotes": {"fn-1": {"content": [_paragraph("Source note\n")]}},
+            },
+            "childTabs": [{
+                "tabProperties": {"tabId": "t.1", "title": "Notes", "parentTabId": "t.0", "nestingLevel": 1},
+                "documentTab": {"body": {"content": [{**_paragraph("Beta second\n"), "startIndex": 1}]}},
+            }],
+        },
+        {
+            "tabProperties": {"tabId": "t.--odd>", "title": "Appendix"},
+            "documentTab": {"body": {"content": [{**_paragraph("Gamma third\n"), "startIndex": 1}]}},
+        },
+    ]}
+
+
+def test_tab_boundaries_are_stable_id_anchors_distinct_from_headings_and_duplicate_titles():
+    result = extract_google_doc(_multi_tab_with_duplicate_titles())
+
+    assert result.complete is True and result.block_map_complete is True
+    assert [(t["id"], t["title"], t["order"], t["parent_id"]) for t in result.tabs] == [
+        ("t.0", "Notes", 0, None), ("t.1", "Notes", 1, "t.0"), ("t.--odd>", "Appendix", 2, None),
+    ]
+    # One anchor per tab, by id, in document order — the three "## Notes" headings (two tab
+    # titles, one body heading) are not boundaries.
+    anchors = [t["anchor"] for t in result.tabs]
+    assert anchors == ["gdrive-tab:t.0", "gdrive-tab:t.1", "gdrive-tab:t.%2D%2Dodd%3E"]
+    assert result.text.count("## Notes") == 3
+    assert [result.text.count(f"<!-- {anchor} -->") for anchor in anchors] == [1, 1, 1]
+    positions = [result.text.index(f"<!-- {anchor} -->") for anchor in anchors]
+    assert positions == sorted(positions)
+    # A hostile tab id can neither close its comment nor smuggle a second marker.
+    assert "--odd>" not in result.text
+
+    for tab in result.tabs:
+        # The manifest is authoritative: the anchor sits exactly at the tab's recorded start, and
+        # its content follows its own title heading.
+        assert result.text[tab["text_start"]:].startswith(f"<!-- {tab['anchor']} -->\n## {tab['title']}\n\n")
+        assert tab["text_start"] < tab["content_start"] <= tab["text_end"]
+    first, child, appendix = result.tabs
+    assert first["text_end"] <= child["text_start"] and child["text_end"] <= appendix["text_start"]
+    tab_text = lambda tab: result.text[tab["content_start"]:tab["text_end"]]  # noqa: E731
+    assert "Alpha 東京 first" in tab_text(first) and "Alpha" not in tab_text(child)
+    assert "Beta second" in tab_text(child) and "Beta" not in tab_text(first)
+    assert "Gamma third" in tab_text(appendix)
+
+
+def test_block_spans_map_text_back_to_tab_content_and_provider_indexes():
+    result = extract_google_doc(_multi_tab_with_duplicate_titles())
+    first, child, appendix = result.tabs
+    span = lambda block: result.text[block[1]:block[2]]  # noqa: E731
+
+    # Rendered top-level blocks only (the section break renders nothing), by their index in the
+    # tab's body.content, each with the provider's own startIndex.
+    assert [(b[0], b[3]) for b in first["blocks"]] == [(1, 1), (2, 7), (3, 24), (4, 40)]
+    assert span(first["blocks"][0]) == "## Notes\n"
+    assert span(first["blocks"][1]) == "Alpha 東京 first\n"
+    assert span(first["blocks"][2]).startswith("| K | V |")
+    assert span(first["blocks"][3]) == "cited[^fn-1]\n"
+    # Spans are in order, inside their tab, and never overlap.
+    for tab in result.tabs:
+        ends = [tab["content_start"]]
+        for block in tab["blocks"]:
+            assert block[1] >= ends[-1] and block[2] <= tab["text_end"]
+            ends.append(block[2])
+    # Footnotes are mapped too, to the tab that cites them.
+    ((fid, start, end),) = first["footnotes"]
+    assert fid == "fn-1" and "[^fn-1]: Source note" in result.text[start:end]
+    assert child["footnotes"] == [] and [span(b) for b in child["blocks"]] == ["Beta second\n"]
+    # The final block loses only the trailing newline the returned text trims.
+    assert [span(b) for b in appendix["blocks"]] == ["Gamma third"]
+    # Offsets are code points: the non-ASCII span slices exactly in Python.
+    assert "東京" in span(first["blocks"][1])
+
+
+def test_block_map_is_bounded_and_discloses_truncation_without_failing_extraction(monkeypatch):
+    monkeypatch.setattr("aios_ingest.sources.gdrive_docs.MAX_BLOCK_ENTRIES", 3)
+    result = extract_google_doc({"tabs": [{
+        "tabProperties": {"tabId": "t.0", "title": "Long"},
+        "documentTab": {"body": {"content": [_paragraph(f"line {n}\n") for n in range(10)]}},
+    }]})
+    assert result.complete is True and "line 9" in result.text
+    assert len(result.tabs[0]["blocks"]) == 3 and result.block_map_complete is False
+    truncated = [issue for issue in result.issues if issue.code == "block_map_truncated"]
+    assert len(truncated) == 1 and truncated[0].blocking is False
+
+
 def test_docs_extraction_marks_required_missing_content_and_limits_incomplete():
     missing = extract_google_doc({"tabs": [{"tabProperties": {"tabId": "x", "title": "X"}}]})
     assert missing.complete is False
@@ -417,6 +524,199 @@ def test_service_account_and_owner_metadata_never_become_human_authorship_or_wor
     assert {row["code"] for row in doc.extra_frontmatter["attribution_diagnostics"]} >= {
         "owner_not_authorship", "service_account_not_authorship",
     }
+
+
+class _GoogleHttpError(Exception):
+    """A Google API error as googleapiclient raises it: status on ``resp``, reasons in the body."""
+
+    def __init__(self, status, reason=None):
+        super().__init__(f"HTTP {status}")
+        self.resp = type("Response", (), {"status": status})()
+        self.content = json.dumps({"error": {
+            "code": status, "errors": [{"reason": reason}] if reason else [],
+        }}).encode()
+
+
+class _Raising:
+    def __init__(self, error):
+        self.error = error
+
+    def execute(self):
+        raise self.error
+
+
+class _Revisions:
+    def __init__(self, pages):
+        self.pages, self.calls = list(pages), []
+
+    def list(self, **kwargs):
+        self.calls.append(kwargs)
+        page = self.pages.pop(0)
+        return _Raising(page) if isinstance(page, Exception) else _Request(page)
+
+
+class _DriveWithHistory(_Drive):
+    def __init__(self, metadata, revision_pages):
+        super().__init__([], metadata)
+        self.history = _Revisions(revision_pages)
+
+    def revisions(self):
+        return self.history
+
+
+class _PayloadBrain:
+    def __init__(self):
+        self.payloads, self.revision = [], 0
+
+    async def push(self, payload, *, execution):
+        self.payloads.append(payload)
+        return IngestResult("created", "item", payload.path)
+
+    async def checkpoint_gdrive_execution(self, execution, progress):
+        self.revision += 1
+        return {"progress_revision": self.revision, "progress": progress}
+
+
+def _readable_doc_owed_an_upsert(tmp_path, name):
+    state = StateStore(str(tmp_path / name))
+    progress = state.begin_generation(
+        StreamKey("team", "connection", "account"), 9, start_token="start",
+    )
+    snapshot = state.begin_selection_snapshot(
+        progress.namespace, 9, [("doc", "file", "my-drive", False)],
+    )
+    state.publish_selection_snapshot(progress.namespace, 9, snapshot)
+    state.materialize_page(
+        progress.namespace, 9, "upsert-page", "changes", "a", "b", None,
+        [("doc", "upsert", {"file_id": "doc"})], snapshot_id=snapshot,
+        membership_additions=[("doc", "doc", "my-drive")],
+    )
+    return state, progress.namespace
+
+
+def _history_source(revision_pages, **kwargs):
+    drive = _DriveWithHistory({"doc": {
+        "id": "doc", "name": "Readable", "mimeType": "application/vnd.google-apps.document",
+        "modifiedTime": "2026-09-02T01:02:03Z",
+        "lastModifyingUser": {"permissionId": "perm-b", "emailAddress": "b@example.com"},
+    }}, revision_pages)
+    docs = _Docs({"doc": {"title": "Readable", "tabs": [{
+        "tabProperties": {"tabId": "root", "title": "Root"},
+        "documentTab": {"body": {"content": [_paragraph("Readable body\n")]}},
+    }]}})
+    source = GoogleDriveSource(
+        file_ids=["doc"], api_mode="docs", drive_service=drive, docs_service=docs,
+        provider_retry_attempts=1, **kwargs,
+    )
+    return source, drive, docs
+
+
+async def _drain_one(source, state, namespace, client):
+    summary = IngestSummary("docs", failure_categories={})
+    consumed = await _drain_pending(
+        client, GdriveExecution("connection", 9, 1, "owner", "later", "scope", {}),
+        source, Connection("docs", "gdrive"), state, namespace, 9, summary, 1,
+    )
+    return consumed, summary
+
+
+@pytest.mark.asyncio
+async def test_readable_doc_whose_revision_history_is_denied_ingests_with_latest_editor_evidence(tmp_path):
+    state, namespace = _readable_doc_owed_an_upsert(tmp_path, "history-denied.sqlite")
+    source, drive, docs = _history_source([_GoogleHttpError(403, "insufficientFilePermissions")])
+    client = _PayloadBrain()
+
+    consumed, summary = await _drain_one(source, state, namespace, client)
+
+    # The body and metadata were read, the history once, and its denial did not stop ingestion.
+    assert consumed == 1 and len(drive.history.calls) == 1 and len(docs.api.calls) == 1
+    (payload,) = client.payloads
+    assert "Readable body" in payload.body
+    assert payload.frontmatter["extraction_complete"] is True
+    # Only the verified latest editor and time, with the limitation disclosed.
+    assert payload.frontmatter["contributions"] == [{
+        "provider": "gdrive", "role": "editor", "external_id": "permission:perm-b",
+        "email": "b@example.com", "at": "2026-09-02T01:02:03.000Z",
+    }]
+    assert payload.frontmatter["authors"][0]["external_id"] == "permission:perm-b"
+    codes = [row["code"] for row in payload.frontmatter["attribution_diagnostics"]]
+    assert "revision_history_unavailable" in codes and "latest_editor_only" in codes
+    # The obligation completed like any other ingestion.
+    assert summary.created == 1 and summary.failed == 0 and summary.failure_categories == {}
+    assert state.pending_count(namespace, 9) == 0
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_materialized_body_carries_tab_anchors_and_an_exact_offset_map(tmp_path):
+    state, namespace = _readable_doc_owed_an_upsert(tmp_path, "provenance-map.sqlite")
+    source, _drive, _docs = _history_source([{"revisions": []}])
+    client = _PayloadBrain()
+
+    consumed, summary = await _drain_one(source, state, namespace, client)
+
+    assert consumed == 1 and summary.failed == 0
+    (payload,) = client.payloads
+    text_map = payload.frontmatter["gdrive_text_map"]
+    assert text_map["unit"] == "codepoint" and text_map["block_map_complete"] is True
+    # The stored body leads with the title line; the map says exactly where the extracted text starts.
+    assert text_map["body_offset"] == len("# Readable\n\n")
+    offset = text_map["body_offset"]
+    ((tab,),) = [payload.frontmatter["gdrive_tabs"]]
+    assert tab["id"] == "root" and tab["anchor"] == "gdrive-tab:root"
+    assert payload.body[offset + tab["text_start"]:].startswith("<!-- gdrive-tab:root -->\n## Root\n\n")
+    ((_index, start, end, _provider),) = tab["blocks"]
+    # The document's final newline is trimmed from the text, so the last span ends at the text's end.
+    assert payload.body[offset + start:offset + end] == "Readable body"
+    state.close()
+
+
+@pytest.mark.parametrize("pages,category", [
+    ([_GoogleHttpError(403, "insufficientPermissions")], "provider_read"),
+    ([_GoogleHttpError(403, "appNotAuthorizedToFile")], "provider_read"),
+    # Drive's 403 rate-limit reasons are quota answers: deferred as rate limits, never read failures.
+    ([_GoogleHttpError(403, "userRateLimitExceeded")], "rate_limited"),
+    ([_GoogleHttpError(403, "rateLimitExceeded")], "rate_limited"),
+    ([_GoogleHttpError(403, "domainPolicy")], "provider_read"),
+    ([_GoogleHttpError(403)], "provider_read"),
+    ([_GoogleHttpError(429)], "rate_limited"),
+    ([_GoogleHttpError(503)], "provider_unavailable"),
+    # Denied part-way through: pages were read, so this is a failed read, not an unreadable history.
+    ([{"revisions": [{"modifiedTime": "2026-09-01T00:00:00Z", "lastModifyingUser": {
+        "permissionId": "perm-a"}}], "nextPageToken": "p2"},
+      _GoogleHttpError(403, "insufficientFilePermissions")], "provider_read"),
+], ids=["scope", "app-not-authorized", "user-rate", "project-rate", "policy", "unspecified", "rate",
+        "unavailable", "denied-mid-history"])
+@pytest.mark.asyncio
+async def test_other_revision_history_failures_still_fail_closed_and_stay_retryable(
+    tmp_path, pages, category,
+):
+    state, namespace = _readable_doc_owed_an_upsert(tmp_path, f"history-{category}.sqlite")
+    source, _drive, _docs = _history_source(pages)
+    client = _PayloadBrain()
+
+    consumed, summary = await _drain_one(source, state, namespace, client)
+
+    assert consumed == 1 and client.payloads == []
+    assert summary.failed == 1 and summary.failure_categories == {category: 1}
+    ((item_key, attempts, not_before, last_error),) = _pending_rows(state, namespace)
+    assert (item_key, attempts) == ("doc", 1)
+    assert not_before is not None and last_error
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_rejected_credential_on_revision_history_is_run_terminal_not_a_fallback(tmp_path):
+    state, namespace = _readable_doc_owed_an_upsert(tmp_path, "history-credential.sqlite")
+    source, _drive, _docs = _history_source([_GoogleHttpError(401)])
+    client = _PayloadBrain()
+
+    with pytest.raises(BrainError, match="replacement token"):
+        await _drain_one(source, state, namespace, client)
+
+    assert client.payloads == []
+    assert [row[:2] for row in _pending_rows(state, namespace)] == [("doc", 0)]
+    state.close()
 
 
 def test_provider_authority_is_checked_between_metadata_and_docs_reads():
@@ -1589,6 +1889,197 @@ def test_provider_retry_after_beyond_deadline_defers_without_busy_loop(monkeypat
     assert type(raised.value).__name__ == "ProviderDeferred"
     assert getattr(raised.value, "category") == "rate_limited"
     assert len(calls) == 1
+
+
+class _RateLimited403(_GoogleHttpError):
+    """Drive's documented 403 rate-limit answer, optionally with Retry-After."""
+
+    def __init__(self, reason, retry_after=None):
+        super().__init__(403, reason)
+        headers = {"Retry-After": retry_after} if retry_after is not None else {}
+        self.resp = type("Response", (), {"status": 403, "headers": headers})()
+
+
+@pytest.mark.parametrize("reason", ["userRateLimitExceeded", "rateLimitExceeded"])
+def test_drive_403_rate_limit_retries_with_backoff_then_succeeds(monkeypatch, reason):
+    delays = []
+    monkeypatch.setattr("aios_ingest.sources.gdrive.time.sleep", delays.append)
+    monkeypatch.setattr("aios_ingest.sources.gdrive.random.uniform", lambda *_args: 0)
+    source = GoogleDriveSource(
+        file_ids=["doc"], api_mode="docs", drive_service=object(), docs_service=object(),
+        request_deadline_seconds=30, provider_retry_attempts=4,
+    )
+    answers = [_RateLimited403(reason), _RateLimited403(reason), {"ok": True}]
+
+    def request():
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    assert source._provider_call(request) == {"ok": True}
+    # Two exponential backoffs, no busy loop, and the same call succeeded on the third attempt.
+    assert delays == [0.25, 0.5] and answers == []
+
+
+@pytest.mark.parametrize("reason", ["userRateLimitExceeded", "rateLimitExceeded"])
+def test_drive_403_rate_limit_honors_retry_after_and_defers_as_rate_limited(monkeypatch, reason):
+    calls = []
+    monkeypatch.setattr("aios_ingest.sources.gdrive.time.sleep", lambda _delay: pytest.fail("must defer, not sleep"))
+    source = GoogleDriveSource(
+        file_ids=["doc"], api_mode="docs", drive_service=object(), docs_service=object(),
+        request_deadline_seconds=1, provider_retry_attempts=5,
+    )
+
+    def request():
+        calls.append(1)
+        raise _RateLimited403(reason, retry_after="120")
+
+    with pytest.raises(ProviderDeferred) as raised:
+        source._provider_call(request)
+    assert raised.value.category == "rate_limited"
+    # Not before the provider's own delay; one call, no retry inside a budget it cannot cover.
+    not_before = datetime.fromisoformat(raised.value.not_before)
+    assert not_before >= datetime.now(timezone.utc) + timedelta(seconds=110)
+    assert len(calls) == 1
+
+
+def test_drive_403_rate_limit_exhausted_retries_is_rate_limited_not_unavailable(monkeypatch):
+    monkeypatch.setattr("aios_ingest.sources.gdrive.time.sleep", lambda _delay: None)
+    monkeypatch.setattr("aios_ingest.sources.gdrive.random.uniform", lambda *_args: 0)
+    source = GoogleDriveSource(
+        file_ids=["doc"], api_mode="docs", drive_service=object(), docs_service=object(),
+        request_deadline_seconds=30, provider_retry_attempts=3,
+    )
+    calls = []
+
+    def request():
+        calls.append(1)
+        raise _RateLimited403("userRateLimitExceeded")
+
+    with pytest.raises(ProviderDeferred) as raised:
+        source._provider_call(request)
+    assert raised.value.category == "rate_limited" and len(calls) == 3
+
+
+@pytest.mark.parametrize("reason", ["insufficientPermissions", "insufficientFilePermissions", None])
+def test_drive_403_permission_answers_are_not_retried_as_rate_limits(monkeypatch, reason):
+    monkeypatch.setattr("aios_ingest.sources.gdrive.time.sleep", lambda _delay: pytest.fail("no retry"))
+    source = GoogleDriveSource(
+        file_ids=["doc"], api_mode="docs", drive_service=object(), docs_service=object(),
+        request_deadline_seconds=30, provider_retry_attempts=3,
+    )
+    calls = []
+    denied = _GoogleHttpError(403, reason)
+
+    def request():
+        calls.append(1)
+        raise denied
+
+    with pytest.raises(_GoogleHttpError) as raised:
+        source._provider_call(request)
+    assert raised.value is denied and len(calls) == 1
+
+
+class _StartTokenDrive:
+    """A Drive whose getStartPageToken request answers from a script, one answer per execution
+    (a provider retry re-executes the same request)."""
+
+    def __init__(self, answers):
+        self.answers, self.calls, self.executions = list(answers), [], 0
+
+    def changes(self):
+        return self
+
+    def getStartPageToken(self, **kwargs):
+        self.calls.append(kwargs)
+        return self
+
+    def execute(self):
+        self.executions += 1
+        answer = self.answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+
+def test_shared_drive_start_token_rate_limit_is_deferred_not_an_inaccessible_drive(monkeypatch):
+    from aios_ingest.gdrive_sync import StreamStartUnavailable, _capture_start_token
+
+    monkeypatch.setattr("aios_ingest.sources.gdrive.time.sleep", lambda _delay: None)
+    monkeypatch.setattr("aios_ingest.sources.gdrive.random.uniform", lambda *_args: 0)
+    # A transient quota answer is retried and the token is captured.
+    drive = _StartTokenDrive([_RateLimited403("rateLimitExceeded"), {"startPageToken": "start-x"}])
+    source = GoogleDriveSource(
+        file_ids=["doc"], api_mode="docs", drive_service=drive, docs_service=object(),
+        request_deadline_seconds=30, provider_retry_attempts=3,
+    )
+    assert _capture_start_token(source, drive, "shared-x") == "start-x"
+    assert [call["driveId"] for call in drive.calls] == ["shared-x"] and drive.executions == 2
+
+    # A persistent one defers the stream as rate limited — never StreamStartUnavailable.
+    drive = _StartTokenDrive([_RateLimited403("userRateLimitExceeded")] * 3)
+    source = GoogleDriveSource(
+        file_ids=["doc"], api_mode="docs", drive_service=drive, docs_service=object(),
+        request_deadline_seconds=30, provider_retry_attempts=3,
+    )
+    with pytest.raises(ProviderDeferred) as raised:
+        _capture_start_token(source, drive, "shared-x")
+    assert not isinstance(raised.value, StreamStartUnavailable)
+    assert raised.value.category == "rate_limited"
+
+    # Control: a real access denial on the same Shared Drive is still that stream's failure.
+    drive = _StartTokenDrive([_GoogleHttpError(403, "insufficientFilePermissions")])
+    source = GoogleDriveSource(
+        file_ids=["doc"], api_mode="docs", drive_service=drive, docs_service=object(),
+        request_deadline_seconds=30, provider_retry_attempts=3,
+    )
+    with pytest.raises(StreamStartUnavailable):
+        _capture_start_token(source, drive, "shared-x")
+
+
+def test_start_token_classifier_never_turns_a_rate_limit_into_stream_unavailable():
+    """Even an un-retried rate-limited 403 reaching the classifier is raised as it came."""
+    from aios_ingest.gdrive_sync import StreamStartUnavailable, _capture_start_token
+
+    error = _RateLimited403("userRateLimitExceeded")
+
+    class Direct:
+        def _execute(self, _request):
+            raise error
+
+    with pytest.raises(_RateLimited403) as raised:
+        _capture_start_token(Direct(), _StartTokenDrive([{}]), "shared-x")
+    assert raised.value is error and not isinstance(raised.value, StreamStartUnavailable)
+
+
+@pytest.mark.parametrize("error,expected", [
+    (_GoogleHttpError(403, "insufficientFilePermissions"), "unavailable"),
+    (_GoogleHttpError(403), "unavailable"),
+    (_GoogleHttpError(404, "notFound"), "unavailable"),
+    (_RateLimited403("userRateLimitExceeded"), "raised"),
+    (_RateLimited403("rateLimitExceeded"), "raised"),
+], ids=["denied-403", "bare-403", "missing-404", "user-rate", "project-rate"])
+def test_start_token_classification_does_not_depend_on_the_injected_source_class(
+    monkeypatch, error, expected,
+):
+    """Coordinator harnesses replace ``gdrive_sync.GoogleDriveSource`` with a minimal provider-shaped
+    class. Classifying a Shared Drive start-token failure must not reach through that name."""
+    from aios_ingest.gdrive_sync import StreamStartUnavailable, _capture_start_token
+
+    class MinimalSource:  # no _rate_limited, _status or _error_reasons
+        def _execute(self, _request):
+            raise error
+
+    monkeypatch.setattr("aios_ingest.gdrive_sync.GoogleDriveSource", MinimalSource)
+    if expected == "unavailable":
+        with pytest.raises(StreamStartUnavailable) as raised:
+            _capture_start_token(MinimalSource(), _StartTokenDrive([{}]), "shared-x")
+        assert raised.value.status == error.resp.status and raised.value.__cause__ is error
+    else:
+        with pytest.raises(_RateLimited403) as raised:
+            _capture_start_token(MinimalSource(), _StartTokenDrive([{}]), "shared-x")
+        assert raised.value is error
 
 
 def test_provider_timeout_retries_are_bounded_and_classified(monkeypatch):
@@ -4517,6 +5008,8 @@ class _DriveWorld:
         # a callable given the payload, returning the error to raise, once; and the brain's record
         # of which connection claims what, when more than one connection is modelled.
         self.malformed, self.checkpoint_faults, self.ledger = set(), [], None
+        # Failures to raise, once each, from the next reconciliations that name removals.
+        self.removal_faults = []
 
     def put(self, file_id, *, drive, parent=None, folder=False):
         self.files[file_id] = {
@@ -4649,6 +5142,8 @@ class _DriveWorld:
                 return IngestResult("created", "item", payload.path)
 
             async def reconcile_gdrive(self, execution, **kwargs):
+                if kwargs.get("removed_provider_ids") and world.removal_faults:
+                    raise world.removal_faults.pop(0)
                 world.removed.extend(kwargs.get("removed_provider_ids") or [])
                 if kwargs.get("complete_snapshot_ids") is not None:
                     world.reconciled.append(list(kwargs["complete_snapshot_ids"]))
@@ -6722,6 +7217,338 @@ async def test_deletion_the_provider_would_not_confirm_is_removed_once_the_unope
     state.close()
 
 
+async def _document_still_held_by_a_peer_whose_recovery_is_blocked(tmp_path, monkeypatch, name):
+    """doc-1 is published by shared-b's stream, which then cannot recover, and moves to shared-a.
+
+    shared-b cannot read the change that took the document away, so its published snapshot still
+    holds it; shared-a read the move and holds it too. Another connection of the team claims the
+    same document through its own selection.
+    """
+    world = _DriveWorld(folder_ids=["folder-a", "folder-b"]).install(monkeypatch)
+    world.ledger = _ClaimLedger()
+    world.ledger.push(_SECOND_INTEGRATION, "doc-1")
+    world.put("folder-a", drive="shared-a", folder=True)
+    world.put("doc-ka", drive="shared-a", parent="folder-a")
+    world.put("folder-b", drive="shared-b", folder=True)
+    world.put("doc-1", drive="shared-b", parent="folder-b")
+    world.put("doc-kb", drive="shared-b", parent="folder-b")
+    path = str(tmp_path / name)
+    state = StateStore(path)
+    assert (await world.run(state)).authoritative_complete is True
+    assert world.reconciled == [["doc-1", "doc-ka", "doc-kb"]]
+
+    # shared-b owes a controlled recovery, and its drive refuses the start token it begins with.
+    world.progress["streams"]["shared-b"]["checkpoint_id"] = "page-this-sidecar-never-retired"
+    world.revision += 1
+    world.token_errors["shared-b"] = _ProviderHttpError(403)
+    world.move("doc-1", source="shared-b", destination="shared-a", parent="folder-a")
+    moved = await world.run(state)
+
+    origin = world.namespace("shared-a")
+    assert moved.authoritative_complete is False
+    assert state.membership_ids(origin, 9) == ["doc-1", "doc-ka"]
+    assert state.pending_count(origin, 9) == 0
+    _assert_peer_recovery_blocked_holding_doc_1(world, state)
+    assert state.claimed_elsewhere(world.integration_id, 9, origin, "doc-1") is True
+    assert world.removed == [] and world.reconciled == [["doc-1", "doc-ka", "doc-kb"]]
+    return world, path, state
+
+
+def _assert_peer_recovery_blocked_holding_doc_1(world, state):
+    peer = state.get_progress(world.namespace("shared-b"))
+    assert peer.recovery_required is True
+    assert peer.last_error == _start_diagnostic("shared-b", 403)
+    assert peer.active_snapshot is not None and peer.baseline_start_token
+    assert state.membership_ids(world.namespace("shared-b"), 9) == ["doc-1", "doc-kb"]
+
+
+@pytest.mark.parametrize("sink", ["accepts", "fails-once"])
+@pytest.mark.parametrize("loss", ["trashed", "deleted", "access-lost"])
+@pytest.mark.asyncio
+async def test_stale_claim_of_a_recovery_blocked_peer_does_not_swallow_a_confirmed_deletion(
+    tmp_path, monkeypatch, loss, sink,
+):
+    world, path, state = await _document_still_held_by_a_peer_whose_recovery_is_blocked(
+        tmp_path, monkeypatch, f"blocked-claimant-{loss}-{sink}.sqlite",
+    )
+    origin = world.namespace("shared-a")
+
+    if loss == "trashed":
+        world.files["doc-1"]["trashed"] = True
+        world.logs["shared-a"].append({"fileId": "doc-1", "file": dict(world.files["doc-1"])})
+    else:
+        if loss == "deleted":
+            del world.files["doc-1"]
+        else:
+            # The account no longer has the document: Drive answers as if it did not exist.
+            world.unreadable["doc-1"] = _ProviderHttpError(404)
+        world.logs["shared-a"].append({"fileId": "doc-1", "removed": True})
+    if sink == "fails-once":
+        world.removal_faults.append(BrainError(503, "cleanup_unavailable", "retry"))
+
+        # The provider confirmed the loss, so the removal went to the brain despite the stale
+        # claim — and the brain's failure leaves it durable and retryable, removing nothing.
+        failed = await world.run(state)
+        assert failed.failure_categories.get("cleanup_unavailable") == 1
+        assert world.removed == []
+        # Owed, attempted once, and deferred: not yet due, so not part of what a drain takes now.
+        assert _owed(state, origin) == [("doc-1", "remove", 1, True)]
+        assert state.list_pending(origin, 9) == []
+        assert world.ledger.claims["doc-1"] == {_WORLD_INTEGRATION, _SECOND_INTEGRATION}
+        _assert_peer_recovery_blocked_holding_doc_1(world, state)
+        state.close()
+
+        # A restart before the retry is due neither reconciles it nor lets it go.
+        state = StateStore(path)
+        await world.run(state)
+        assert world.removed == []
+        assert _owed(state, origin) == [("doc-1", "remove", 1, True)]
+        assert world.ledger.claims["doc-1"] == {_WORLD_INTEGRATION, _SECOND_INTEGRATION}
+        _retry_at(state, origin, "doc-1", None)
+
+    world.calls.clear()
+    promptly = await world.run(state)
+
+    # The document was read for itself, the provider's answer made the removal the connection's,
+    # and it was reconciled while the peer still holds it and still cannot recover.
+    assert ("metadata", "doc-1") in world.calls
+    assert world.removed == ["doc-1"]
+    assert state.pending_count(origin, 9) == 0 and _barrier_peers(state, origin) == []
+    assert state.membership_ids(origin, 9) == ["doc-ka"]
+    assert "cross_stream_move_pending" not in promptly.failure_categories
+    assert promptly.authoritative_complete is False
+    _assert_peer_recovery_blocked_holding_doc_1(world, state)
+    # Only this connection's claim ended; the other connection's claim keeps the document.
+    assert world.ledger.claims["doc-1"] == {_SECOND_INTEGRATION}
+    assert world.ledger.retired == [(_WORLD_INTEGRATION, "doc-1")]
+    assert world.ledger.deleted == []
+    state.close()
+
+    # A restart removes nothing again and concludes nothing else.
+    state = StateStore(path)
+    again = await world.run(state)
+    assert world.removed == ["doc-1"] and world.reconciled == [["doc-1", "doc-ka", "doc-kb"]]
+    assert state.pending_count(origin, 9) == 0
+    assert again.authoritative_complete is False
+    assert world.ledger.claims["doc-1"] == {_SECOND_INTEGRATION}
+    _assert_peer_recovery_blocked_holding_doc_1(world, state)
+    state.close()
+
+
+@pytest.mark.parametrize("ambiguity", ["readable-elsewhere", "refused"])
+@pytest.mark.asyncio
+async def test_ambiguous_removal_stays_withheld_behind_a_recovery_blocked_peer_that_still_claims_it(
+    tmp_path, monkeypatch, ambiguity,
+):
+    world, path, state = await _document_still_held_by_a_peer_whose_recovery_is_blocked(
+        tmp_path, monkeypatch, f"blocked-claimant-{ambiguity}.sqlite",
+    )
+    origin = world.namespace("shared-a")
+
+    if ambiguity == "readable-elsewhere":
+        # Moved back under the folder of the drive that cannot be read: still there to be read.
+        world.move("doc-1", source="shared-a", destination="shared-b", parent="folder-b")
+    else:
+        # Gone, but reading it for itself is refused in a way that says nothing about it.
+        del world.files["doc-1"]
+        world.unreadable["doc-1"] = _ProviderHttpError(403)
+        world.logs["shared-a"].append({"fileId": "doc-1", "removed": True})
+
+    for _run in range(3):
+        world.calls.clear()
+        withheld = await world.run(state)
+
+        # Neither acknowledged as claimed nor taken as absence: the obligation is durable.
+        assert ("metadata", "doc-1") in world.calls
+        assert world.removed == [] and world.reconciled == [["doc-1", "doc-ka", "doc-kb"]]
+        assert [(work.item_key, work.action) for work in state.list_pending(origin, 9)] == [
+            ("doc-1", "remove"),
+        ]
+        assert _barrier_peers(state, origin) == ["shared-b"]
+        assert withheld.failure_categories == {
+            "stream_start_unavailable": 1, "cross_stream_move_pending": 1,
+        }
+        assert withheld.authoritative_complete is False
+        assert world.ledger.claims["doc-1"] == {_WORLD_INTEGRATION, _SECOND_INTEGRATION}
+        _assert_peer_recovery_blocked_holding_doc_1(world, state)
+        state.close()
+        state = StateStore(path)
+
+    # The drive issues a token again and shared-b recovers.
+    del world.token_errors["shared-b"]
+    summary = None
+    for _run in range(4):
+        summary = await world.run(state)
+        if ambiguity == "readable-elsewhere":
+            assert world.removed == []
+        state.close()
+        state = StateStore(path)
+        if summary.authoritative_complete:
+            break
+
+    assert summary.authoritative_complete is True and summary.backlog == 0
+    assert state.pending_count(origin, 9) == 0 and _barrier_peers(state, origin) == []
+    assert state.membership_ids(origin, 9) == ["doc-ka"]
+    if ambiguity == "readable-elsewhere":
+        # Its recovered stream found it and claims it: it was never removed.
+        assert state.membership_ids(world.namespace("shared-b"), 9) == ["doc-1", "doc-kb"]
+        assert world.reconciled[-1] == ["doc-1", "doc-ka", "doc-kb"]
+        assert world.ledger.claims["doc-1"] == {_WORLD_INTEGRATION, _SECOND_INTEGRATION}
+    else:
+        # Only the recovered stream's verified snapshot ended this connection's claim.
+        assert state.membership_ids(world.namespace("shared-b"), 9) == ["doc-kb"]
+        assert world.reconciled[-1] == ["doc-ka", "doc-kb"]
+        assert world.ledger.claims["doc-1"] == {_SECOND_INTEGRATION}
+        assert world.ledger.deleted == []
+    state.close()
+
+
+def _next_run_starts_with(state, world, drive_id):
+    state._db.execute(
+        "update connection_stream_schedule set next_drive_id=? where connection_id=? and generation=?",
+        (drive_id, world.integration_id, world.generation),
+    )
+    state._db.commit()
+
+
+async def _removal_owed_while_a_readable_stream_claims_the_document(
+    tmp_path, monkeypatch, name, *, blocked_claimant,
+):
+    """shared-a owes doc-1's removal; shared-b, which reads its change log, claims doc-1.
+
+    doc-1 moved from shared-a to shared-b, and shared-a read the move first: its removal was
+    withheld, then shared-b read the move and claimed the document. With ``blocked_claimant``,
+    doc-1 came to shared-a from shared-c, whose recovery is blocked and which still holds it too.
+    Another connection of the team claims the same document through its own selection.
+    """
+    world = _DriveWorld(folder_ids=["folder-a", "folder-b", "folder-c"]).install(monkeypatch)
+    world.ledger = _SequencedLedger(world.calls)
+    world.ledger.push(_SECOND_INTEGRATION, "doc-1")
+    for drive in ("a", "b", "c"):
+        world.put(f"folder-{drive}", drive=f"shared-{drive}", folder=True)
+        world.put(f"doc-k{drive}", drive=f"shared-{drive}", parent=f"folder-{drive}")
+    home = "c" if blocked_claimant else "a"
+    world.put("doc-1", drive=f"shared-{home}", parent=f"folder-{home}")
+    path = str(tmp_path / name)
+    state = StateStore(path)
+    assert (await world.run(state)).authoritative_complete is True
+    assert world.reconciled == [["doc-1", "doc-ka", "doc-kb", "doc-kc"]]
+    origin, claimant = world.namespace("shared-a"), world.namespace("shared-b")
+
+    if blocked_claimant:
+        # shared-c owes a controlled recovery its drive will not issue a start token for, so it
+        # never reads doc-1 leaving it for shared-a. Any other stream's checkpoint rewrites every
+        # local stream into the brain's copy, so shared-c runs first, while the mismatch stands.
+        world.progress["streams"]["shared-c"]["checkpoint_id"] = "page-this-sidecar-never-retired"
+        world.revision += 1
+        world.token_errors["shared-c"] = _ProviderHttpError(403)
+        world.move("doc-1", source="shared-c", destination="shared-a", parent="folder-a")
+        _next_run_starts_with(state, world, "shared-c")
+        await world.run(state)
+        assert state.membership_ids(origin, 9) == ["doc-1", "doc-ka"]
+        _assert_recovery_blocked_shared_c_holds_doc_1(world, state)
+
+    _next_run_starts_with(state, world, "shared-a")
+    world.move("doc-1", source="shared-a", destination="shared-b", parent="folder-b")
+    await world.run(state)
+
+    assert world.removed == []
+    assert _owed(state, origin) == [("doc-1", "remove", 1, False)]
+    assert state.membership_ids(claimant, 9) == ["doc-1", "doc-kb"]
+    assert state.get_progress(claimant).recovery_required is False
+    assert world.ledger.claims["doc-1"] == {_WORLD_INTEGRATION, _SECOND_INTEGRATION}
+    return world, state
+
+
+def _assert_recovery_blocked_shared_c_holds_doc_1(world, state):
+    peer = state.get_progress(world.namespace("shared-c"))
+    assert peer.recovery_required is True
+    assert peer.last_error == _start_diagnostic("shared-c", 403)
+    assert state.membership_ids(world.namespace("shared-c"), 9) == ["doc-1", "doc-kc"]
+
+
+def _first(calls, *prefix):
+    return next(index for index, call in enumerate(calls) if call[:len(prefix)] == prefix)
+
+
+@pytest.mark.parametrize("claimants", ["readable", "readable-and-recovery-blocked"])
+@pytest.mark.parametrize("loss", ["trashed", "deleted", "access-lost"])
+@pytest.mark.asyncio
+async def test_claim_of_a_readable_stream_that_has_not_read_the_loss_does_not_swallow_a_confirmed_deletion(
+    tmp_path, monkeypatch, loss, claimants,
+):
+    blocked = claimants == "readable-and-recovery-blocked"
+    world, state = await _removal_owed_while_a_readable_stream_claims_the_document(
+        tmp_path, monkeypatch, f"readable-claimant-{loss}-{claimants}.sqlite",
+        blocked_claimant=blocked,
+    )
+    origin = world.namespace("shared-a")
+
+    # The document is lost in shared-b, and shared-a's withheld removal is retried before shared-b
+    # reads that: shared-b's claim is membership it recorded, not an observation of the document.
+    if loss == "trashed":
+        world.files["doc-1"]["trashed"] = True
+        world.logs["shared-b"].append({"fileId": "doc-1", "file": dict(world.files["doc-1"])})
+    else:
+        if loss == "deleted":
+            del world.files["doc-1"]
+        else:
+            world.unreadable["doc-1"] = _ProviderHttpError(404)
+        world.logs["shared-b"].append({"fileId": "doc-1", "removed": True})
+    _next_run_starts_with(state, world, "shared-a")
+    world.calls.clear()
+    await world.run(state)
+
+    # The document was read for itself before anything was concluded, the provider's answer made
+    # the removal the connection's, and it was reconciled — all before either stream read a change.
+    read = _first(world.calls, "metadata", "doc-1")
+    removed = _first(world.calls, "removal", _WORLD_INTEGRATION, "doc-1")
+    assert read < removed < _first(world.calls, "changes", "shared-a") < _first(world.calls, "changes", "shared-b")
+    assert world.removed[0] == "doc-1"
+    assert _owed(state, origin) == [] and state.membership_ids(origin, 9) == ["doc-ka"]
+    if blocked:
+        _assert_recovery_blocked_shared_c_holds_doc_1(world, state)
+    # Only this connection's claim ended; the other connection's claim keeps the document.
+    assert world.ledger.claims["doc-1"] == {_SECOND_INTEGRATION}
+    assert world.ledger.retired[0] == (_WORLD_INTEGRATION, "doc-1")
+    assert world.ledger.deleted == []
+    state.close()
+
+
+@pytest.mark.parametrize("claimants", ["readable", "readable-and-recovery-blocked"])
+@pytest.mark.parametrize("answer", ["readable", "refused"])
+@pytest.mark.asyncio
+async def test_claim_of_a_readable_stream_still_ends_only_the_origins_membership_when_no_loss_is_confirmed(
+    tmp_path, monkeypatch, answer, claimants,
+):
+    blocked = claimants == "readable-and-recovery-blocked"
+    world, state = await _removal_owed_while_a_readable_stream_claims_the_document(
+        tmp_path, monkeypatch, f"readable-claimant-{answer}-{claimants}.sqlite",
+        blocked_claimant=blocked,
+    )
+    origin = world.namespace("shared-a")
+
+    if answer == "refused":
+        # Reading the document for itself is refused in a way that says nothing about it.
+        world.unreadable["doc-1"] = _ProviderHttpError(403)
+    _next_run_starts_with(state, world, "shared-a")
+    world.calls.clear()
+    await world.run(state)
+
+    # The document was read for itself first; nothing confirmed a loss, so shared-b's claim keeps
+    # it and only shared-a's own membership ended.
+    assert _first(world.calls, "metadata", "doc-1") < _first(world.calls, "changes", "shared-a")
+    assert not [call for call in world.calls if call[0] == "removal"]
+    assert world.removed == []
+    assert _owed(state, origin) == [] and state.membership_ids(origin, 9) == ["doc-ka"]
+    assert state.membership_ids(world.namespace("shared-b"), 9) == ["doc-1", "doc-kb"]
+    if blocked:
+        _assert_recovery_blocked_shared_c_holds_doc_1(world, state)
+    assert world.ledger.claims["doc-1"] == {_WORLD_INTEGRATION, _SECOND_INTEGRATION}
+    assert world.ledger.retired == []
+    state.close()
+
+
 # ---------------------------------------------------------------------------------------------
 # A retired orphan stream leaves the brain's record, not just this run's copy of it
 # ---------------------------------------------------------------------------------------------
@@ -6820,6 +7647,19 @@ class _ClaimLedger:
                     self.deleted.append(provider_id)
 
 
+class _SequencedLedger(_ClaimLedger):
+    """A claim ledger that also records, among the provider calls, each removal reconciled."""
+
+    def __init__(self, calls):
+        super().__init__()
+        self.calls = calls
+
+    def reconcile(self, connection_id, *, removed=(), complete=None):
+        for provider_id in removed:
+            self.calls.append(("removal", connection_id, provider_id))
+        super().reconcile(connection_id, removed=removed, complete=complete)
+
+
 def _listing_fails():
     raise _ProviderHttpError(500)
 
@@ -6831,6 +7671,18 @@ def _retry_at(state, namespace, item_key, not_before):
         (not_before, namespace, item_key),
     )
     state._db.commit()
+
+
+def _owed(state, namespace):
+    """``(item, action, attempts, deferred)`` of each obligation still owed, due or not."""
+    return [
+        (row["item_key"], row["action"], row["attempts"], row["not_before"] is not None)
+        for row in state._db.execute(
+            "select item_key,action,attempts,not_before from pending_work where namespace=? "
+            "and acknowledged_at is null and superseded_at is null order by item_key",
+            (namespace,),
+        ).fetchall()
+    ]
 
 
 def _upsert_rows(state, namespace, item_key):

@@ -1,11 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { describe, expect, inject, it } from "vitest";
+import { afterAll, afterEach, describe, expect, inject, it } from "vitest";
+import neo4j, { type Driver } from "neo4j-driver";
 import { issueApiKey } from "@/lib/admin/keys";
 import { createMember } from "@/lib/admin/members";
 import { createGroup, addMemberToGroup, grantProjectToGroup } from "@/lib/access/groups";
-import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
+import { ensureAccessBootstrap, GENERAL_SLUG } from "@/lib/access/bootstrap";
 import { createConversation } from "@/lib/chat/store";
-import { ingest } from "../datamechanics/helpers";
+import { episodeName } from "@/lib/graph/episode-name";
+import { projectGroupId } from "@/lib/graph/group";
+import { convergeIdentityAttribution, ingest } from "../datamechanics/helpers";
 import { BASE_URL, convergeTeam, db, keyHeaders, seedTeam, type Seed } from "./http-helpers";
 import { FAKE_ANSWER, FAKE_MODEL, type GraphCaptured, type LlmCaptured } from "./fake-providers";
 
@@ -13,28 +16,136 @@ import { FAKE_ANSWER, FAKE_MODEL, type GraphCaptured, type LlmCaptured } from ".
  * TIERRET-1 AC-03 / AC-05 / AC-11 — the REAL `/api/v1/query` route over a real socket (`next start` +
  * the shared test Postgres), drained through `done`. OPT-IN: runs only under
  * `vitest.tierret1-query.config.ts`, whose global setup pins the server's LLM_BASE_URL to a test-only
- * loopback fake OpenAI-compatible endpoint and GRAPHITI_URL to a loopback /search spy, with every cloud
- * credential blanked and ANTHROPIC_BASE_URL pointed at a recorded trap. No paid or external call.
+ * loopback fake OpenAI-compatible endpoint, GRAPHITI_URL (the graph leg's switch) to a loopback stub,
+ * and NEO4J_* to the isolated loopback TEST Neo4j, with every cloud credential blanked and
+ * ANTHROPIC_BASE_URL pointed at a recorded trap. No paid or external call.
+ *
+ * LOCAL PREREQUISITE: `npm run db:test:neo4j:up` (compose.test.neo4j.yml); CI's HTTP job runs it as a
+ * service. The graph is read the way production reads it (AIO-1167): straight from Neo4j, every fact
+ * kept only when EVERY source episode resolves to an item in that fact's own partition — never through
+ * Graphiti `/search`, whose captures must stay empty. Each test seeds provenance-linked facts under its
+ * OWN team's partitions only, keyed to its real item ids, and deletes exactly those afterwards; the
+ * shared test Neo4j is never wiped.
  *
  * What is asserted is the model INPUT the production route actually assembled (the captured user
- * message: `<structured_context>` + `<source>` blocks) and the graph partitions it actually searched —
- * spec-derived fixture truth, not parity:
- *   - a granted external-posture human: granted sourced + granted hand-entered tasks/decisions and the
- *     granted item's source block; no hidden markers; never the General graph partition;
+ * message: `<structured_context>` — which carries the graph facts — and `<source>` blocks) — spec-derived
+ * fixture truth, not parity:
+ *   - a granted external-posture human: granted sourced + granted hand-entered tasks/decisions, the
+ *     granted item's source block, and the fact proven by the granted item in the granted initiative's
+ *     partition; never a hidden marker (including a fact that also cites the hidden item), never a
+ *     General fact;
  *   - a legacy connector with a planted Everyone row: its BASELINE (hand-entered rows in both containers,
- *     actors + REPORTS_TO) and nothing sourced, no item sources, zero graph searches;
- *   - an external legacy (offroster) key: nothing new, zero graph searches;
+ *     actors + REPORTS_TO) and nothing sourced, no item sources, no graph facts;
+ *   - an external legacy (offroster) key: nothing new, no graph facts;
  *   - an admitted Everyone human on a clean team (ready builtin partitions, no restriction debt): the
- *     POSITIVE control proving the /search spy is live — so the legacy zeros are not vacuous.
+ *     POSITIVE control — it receives the General fact, so the legacy keys' absence of that same fact,
+ *     on the same team and partition, is not vacuous.
  */
 
 const llmUrl = inject("tierret1FakeLlmUrl");
 const graphitiUrl = inject("tierret1FakeGraphitiUrl");
+const neo4jTarget = inject("tierret1Neo4j");
 
 const HIDDEN = "zirconmothhidden"; // appears only in content the external member must never receive
 const SRC_HAND = "basaltwrenhand"; // a hand-entered row in the UNGRANTED ingest container
 const ACTOR_A = "tierret1-actor-alpha";
 const ACTOR_B = "tierret1-actor-beta";
+const GRAPH_GRANTED = "garnetgraphgranted"; // a graph fact proven by the granted item, in its partition
+const GRAPH_GENERAL = "jaspergraphgeneral"; // a graph fact proven by a General item, in General
+const GRAPH_SECTION = "## Graph memory";
+
+/* ── The isolated test Neo4j: seeded per test, under that test's own partitions, then cleaned ── */
+
+let graphDriver: Driver | null = null;
+const seededGroups = new Set<string>();
+
+function graphDb(): Driver {
+  graphDriver ??= neo4j.driver(neo4jTarget.url, neo4j.auth.basic(neo4jTarget.user, neo4jTarget.password));
+  return graphDriver;
+}
+
+afterEach(async () => {
+  if (seededGroups.size === 0) return;
+  const groups = [...seededGroups];
+  seededGroups.clear();
+  const session = graphDb().session();
+  try {
+    // Only this suite's own partitions — never a blanket wipe of the shared test service.
+    await session.run("MATCH (n) WHERE n.group_id IN $groups DETACH DELETE n", { groups });
+  } finally {
+    await session.close();
+  }
+});
+
+afterAll(async () => {
+  await graphDriver?.close();
+});
+
+/**
+ * One fact exactly as Graphiti writes it and `readAuthorizedGraphFacts` reads it:
+ * `(:Entity)-[:RELATES_TO {uuid, fact, created_at, group_id, episodes}]->(:Entity)` in `group`, its
+ * `episodes` naming `(:Episodic {uuid, name: "items:<item-id>", group_id})` nodes in the same group.
+ * Nothing here decides visibility: the route resolves each episode to its item and keeps the fact only
+ * if every item is in `group`'s own project for this reader (Postgres), exactly as in production.
+ */
+async function seedGraphFact(group: string, fact: string, itemIds: readonly string[]): Promise<void> {
+  seededGroups.add(group);
+  const episodes = itemIds.map((itemId) => ({ uuid: `tierret1-ep-${randomUUID()}`, name: episodeName(itemId, 0, 1) }));
+  const session = graphDb().session();
+  try {
+    await session.executeWrite(async (tx) => {
+      await tx.run(
+        `UNWIND $episodes AS ep
+         CREATE (:Episodic {uuid: ep.uuid, name: ep.name, source: 'text', source_description: 'tierret1 fixture',
+                            created_at: datetime(), group_id: $group})`,
+        { episodes, group },
+      );
+      await tx.run(
+        `CREATE (a:Entity:Person {uuid: $subject, name: 'Fixture Lead', group_id: $group})
+         CREATE (b:Entity {uuid: $object, name: 'Fixture Topic', group_id: $group})
+         CREATE (a)-[:RELATES_TO {uuid: $fact_id, name: 'RELATES_TO', fact: $fact, created_at: datetime(),
+                                  group_id: $group, episodes: $episode_uuids}]->(b)`,
+        {
+          subject: `tierret1-entity-${randomUUID()}`, object: `tierret1-entity-${randomUUID()}`,
+          fact_id: `tierret1-fact-${randomUUID()}`, fact, group, episode_uuids: episodes.map((e) => e.uuid),
+        },
+      );
+    });
+  } finally {
+    await session.close();
+  }
+}
+
+/** A built-in's partition, read from its STORED pointer (the access contract), never slug-derived. */
+async function systemGroup(seed: Seed, slug: string): Promise<string> {
+  const { data, error } = await db().from("projects").select("graph_group_id")
+    .eq("team_id", seed.teamId).eq("slug", slug).eq("kind", "system").single();
+  if (error || !(data as { graph_group_id: string | null } | null)?.graph_group_id) {
+    throw new Error(`system partition missing for ${slug}: ${error?.message ?? "no pointer"}`);
+  }
+  return (data as { graph_group_id: string }).graph_group_id;
+}
+
+/** An initiative's per-project partition pointer — the id production mints for it. */
+async function initiativeGroup(seed: Seed, projectId: string): Promise<string> {
+  const group = projectGroupId(seed.teamId, projectId);
+  const { error } = await db().from("projects").update({ graph_group_id: group }).eq("id", projectId).eq("team_id", seed.teamId);
+  if (error) throw new Error(`initiative pointer failed: ${error.message}`);
+  return group;
+}
+
+/**
+ * Armed and read-ready (the leak suite's fixture shape): arming takes the arm-time snapshot, and its
+ * ledger rows are marked landed so the readiness latch sets on the next enforced read. This is the
+ * partition-READINESS precondition only — provenance is still checked per fact at read time.
+ */
+async function readyInitiative(seed: Seed, projectId: string, group: string): Promise<void> {
+  const { armProjectsForPrincipal } = await import("@/lib/graph/arming");
+  await armProjectsForPrincipal(db(), { teamId: seed.teamId, projectIds: [projectId] });
+  const { error } = await db().from("graph_episodes").update({ content_sha256: "tierret1-landed", episode_uuid: "tierret1-landed" })
+    .eq("team_id", seed.teamId).eq("group_id", group);
+  if (error) throw new Error(`readiness fixture failed: ${error.message}`);
+}
 
 async function reset(url: string): Promise<void> {
   expect((await fetch(`${url}/__fake/reset`, { method: "POST" })).status).toBe(200);
@@ -52,13 +163,18 @@ interface SseEvent {
 }
 
 /** POST the real query route and drain the SSE stream to its end. */
-async function query(seed: Seed, key: string, conversationId: string, question: string): Promise<{ status: number; events: SseEvent[] }> {
+async function query(seed: Seed, key: string, conversationId: string, question: string): Promise<{ status: number; events: SseEvent[]; failure: string }> {
   const res = await fetch(`${BASE_URL}/api/v1/query`, {
     method: "POST",
     headers: keyHeaders(key, seed.teamSlug),
     body: JSON.stringify({ question, conversation_id: conversationId }),
   });
   const text = await res.text(); // the route closes the stream after `done` (or `error`)
+  // A refusal is the route's JSON error envelope, not SSE: keep its code/message for the assertion
+  // message (the envelope carries no raw exception detail by contract).
+  if (!(res.headers.get("content-type") ?? "").includes("text/event-stream")) {
+    return { status: res.status, events: [], failure: text.slice(0, 500) };
+  }
   const events = text
     .split("\n\n")
     .filter((b) => b.trim())
@@ -67,7 +183,7 @@ async function query(seed: Seed, key: string, conversationId: string, question: 
       const raw = /^data: (.*)$/m.exec(block)?.[1] ?? "null";
       return { event: ev, data: JSON.parse(raw) as unknown };
     });
-  return { status: res.status, events };
+  return { status: res.status, events, failure: "" };
 }
 
 /**
@@ -77,8 +193,8 @@ async function query(seed: Seed, key: string, conversationId: string, question: 
 async function observe(seed: Seed, key: string, conversationId: string, question: string) {
   await reset(llmUrl);
   await reset(graphitiUrl);
-  const { status, events } = await query(seed, key, conversationId, question);
-  expect(status).toBe(200);
+  const { status, events, failure } = await query(seed, key, conversationId, question);
+  expect(status, `/api/v1/query refused: ${failure}`).toBe(200);
   const names = events.map((e) => e.event);
   expect(names, "no error frame on the wire").not.toContain("error");
   expect(names, "drained through done").toContain("done");
@@ -98,7 +214,10 @@ async function observe(seed: Seed, key: string, conversationId: string, question
   const user = streamed[0].body.messages?.find((m) => m.role === "user")?.content ?? "";
   expect(user, "the captured user message carries the structured context").toContain("<structured_context>");
   const structured = user.slice(user.indexOf("<structured_context>"), user.indexOf("</structured_context>"));
-  return { user, structured, graph: await graphCaptured() };
+  const graph = await graphCaptured();
+  // Graph reads go to Neo4j with provenance checks; Graphiti's provenance-free /search is never used.
+  expect(graph.search, "no Graphiti /search request — graph facts come only from the Neo4j read").toEqual([]);
+  return { user, structured };
 }
 
 async function rawMember(seed: Seed, over: Partial<{ kind: string; tier: string; is_connector: boolean }>): Promise<string> {
@@ -177,17 +296,22 @@ async function seedOrgStructure(seed: Seed): Promise<void> {
 }
 
 describe("TIERRET-1 over HTTP — /api/v1/query model input and graph scope (fake loopback provider)", () => {
-  it("granted external human: granted items/tasks/decisions reach the model, hidden markers never do; legacy keys gain nothing and never search the graph", async () => {
+  it("granted external human: granted items/tasks/decisions and its granted graph fact reach the model, hidden markers and General facts never do; legacy keys gain nothing and receive no graph facts", async () => {
     const seed = await seedTeam();
     await answerLocally(seed);
     const granted = await ingest(seed, { path: "granted.md", body: "granted wire body obsidianquill", access: "team", project: "src" });
     const hidden = await ingest(seed, { path: "hidden.md", body: `hidden wire body ${HIDDEN}`, access: "team", project: "src" });
+    // Stays in General: the provenance behind the General fact an Everyone member could read.
+    const general = await ingest(seed, { path: "general.md", body: "general wire body lapisgeneral", access: "team", project: "src" });
     await convergeTeam(seed);
     expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
     const X = await mkInitiative(seed, "qx");
     const Y = await mkInitiative(seed, "qy");
+    const groupX = await initiativeGroup(seed, X);
+    const groupY = await initiativeGroup(seed, Y);
     await place(seed, granted.id, X);
     await place(seed, hidden.id, Y);
+    await readyInitiative(seed, X, groupX);
     const src = granted.projectId!;
     const today = new Date().toISOString().slice(0, 10);
     await insertRows("tasks", [
@@ -214,6 +338,17 @@ describe("TIERRET-1 over HTTP — /api/v1/query model input and graph scope (fak
     const connector = await rawMember(seed, { is_connector: true });
     await plantEveryone(seed, connector);
     const offroster = await rawMember(seed, { kind: "offroster", tier: "external" });
+    // The roster writes above leave identity attribution repair pending, and the graph read's
+    // authorization epoch rightly refuses to serve until it converges (the route's fail-closed 503).
+    await convergeIdentityAttribution(seed);
+
+    // Provenance-linked graph facts, each in a real partition of this team and cited by real items.
+    const generalGroup = await systemGroup(seed, GENERAL_SLUG);
+    await seedGraphFact(groupX, `Fixture Lead owns the granted wire body ${GRAPH_GRANTED}`, [granted.id]);
+    // In the GRANTED partition, but also citing the hidden item, which is not in that partition.
+    await seedGraphFact(groupX, `Fixture Lead merged the granted wire body with ${HIDDEN} laundered`, [granted.id, hidden.id]);
+    await seedGraphFact(groupY, `Fixture Lead keeps the hidden wire body ${HIDDEN} graph`, [hidden.id]);
+    await seedGraphFact(generalGroup, `Fixture Lead edits the general wire body ${GRAPH_GENERAL}`, [general.id]);
 
     const question = "What does the granted wire body say?";
 
@@ -227,9 +362,12 @@ describe("TIERRET-1 over HTTP — /api/v1/query model input and graph scope (fak
     expect(e.user, "the hidden item is not a source block").not.toContain('path="hidden.md"');
     expect(e.user, "no hidden marker anywhere in the model input").not.toContain(HIDDEN);
     expect(e.user).not.toContain(SRC_HAND);
-    for (const s of e.graph.search) {
-      expect(s.group_ids, "an external member's graph scope never includes General").not.toContain(`${seed.teamSlug}_team`);
-    }
+    // The graph leg, read from Neo4j: the fact its granted item proves in the granted partition…
+    expect(e.structured, "the granted partition's proven fact reaches the model").toContain(GRAPH_GRANTED);
+    expect(e.structured).toContain(GRAPH_SECTION);
+    // …never the fact that also cites the hidden item (asserted by the HIDDEN check above, which covers
+    // it and the hidden partition's fact), and never General's: General is not in this member's scope.
+    expect(e.user, "an external member never receives a General graph fact").not.toContain(GRAPH_GENERAL);
 
     // 2. Legacy connector WITH a planted Everyone row: baseline preserved (hand-entered rows in BOTH
     //    containers + org structure), nothing sourced, no item sources, no graph scope.
@@ -242,7 +380,9 @@ describe("TIERRET-1 over HTTP — /api/v1/query model input and graph scope (fak
     expect(c.user, "no item source for a non-principal").toContain("<no document sources matched>");
     expect(c.user).not.toContain("obsidianquill");
     expect(c.user).not.toContain(HIDDEN);
-    expect(c.graph.search, "legacy connector: zero graph searches").toEqual([]);
+    for (const marker of [GRAPH_GRANTED, GRAPH_GENERAL, GRAPH_SECTION]) {
+      expect(c.user, `legacy connector: no graph scope (${marker})`).not.toContain(marker);
+    }
 
     // 3. External legacy (offroster): nothing new — no sourced, no hand-entered, no items, no graph.
     const O = await key(seed, offroster, "offroster");
@@ -251,31 +391,37 @@ describe("TIERRET-1 over HTTP — /api/v1/query model input and graph scope (fak
     expect(o.structured, "baseline actors leg (pre-existing, not a gain)").toContain(`${ACTOR_A}: Alpha Marker`);
     expect(o.user).toContain("<no document sources matched>");
     expect(o.user).not.toContain("obsidianquill");
-    expect(o.graph.search, "offroster: zero graph searches").toEqual([]);
+    expect(o.user).not.toContain(HIDDEN);
+    for (const marker of [GRAPH_GRANTED, GRAPH_GENERAL, GRAPH_SECTION]) {
+      expect(o.user, `offroster: no graph scope (${marker})`).not.toContain(marker);
+    }
   });
 
-  it("graph scope: an admitted Everyone human on a clean team searches the ready General partition (spy live); legacy connector/offroster keys make zero searches", async () => {
+  it("graph scope: an admitted Everyone human on a clean team receives the ready General partition's proven fact; legacy connector/offroster keys receive no graph facts", async () => {
     // Readiness shape reused from enfb-graph-query-scope (ingest → bootstrap → backfill, no moves out
     // of General, so no restriction debt): the builtin partition is served by its stored pointer.
     const seed = await seedTeam();
     await answerLocally(seed);
-    await ingest(seed, { path: "g.md", body: "graph seed body tourmalinekite", access: "team", project: "src" });
+    const g = await ingest(seed, { path: "g.md", body: "graph seed body tourmalinekite", access: "team", project: "src" });
     expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
     await convergeTeam(seed);
     const connector = await rawMember(seed, { is_connector: true });
     await plantEveryone(seed, connector);
     const offroster = await rawMember(seed, { kind: "offroster", tier: "external" });
+    await convergeIdentityAttribution(seed);
+    await seedGraphFact(await systemGroup(seed, GENERAL_SLUG), `Fixture Lead curates the tourmalinekite graph seed ${GRAPH_GENERAL}`, [g.id]);
     const question = "What does the tourmalinekite graph seed say?";
 
     const M = await key(seed, seed.memberId, "everyone");
     const m = await observe(seed, M.key, M.conversationId, question);
-    expect(m.graph.search.length, "POSITIVE control: the /search spy is live for an admitted member").toBeGreaterThan(0);
-    expect(m.graph.search.flatMap((s) => s.group_ids), "the ready builtin General partition is searched").toContain(`${seed.teamSlug}_team`);
+    expect(m.structured, "POSITIVE control: the General partition's proven fact reaches an admitted member").toContain(GRAPH_GENERAL);
+    expect(m.structured).toContain(GRAPH_SECTION);
 
     for (const [id, label] of [[connector, "connector"], [offroster, "offroster"]] as const) {
       const L = await key(seed, id, label);
       const l = await observe(seed, L.key, L.conversationId, question);
-      expect(l.graph.search, `${label}: a legacy key acquires no graph scope`).toEqual([]);
+      expect(l.user, `${label}: a legacy key acquires no graph scope`).not.toContain(GRAPH_GENERAL);
+      expect(l.user).not.toContain(GRAPH_SECTION);
     }
   });
 });

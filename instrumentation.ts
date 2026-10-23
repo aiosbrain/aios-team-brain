@@ -42,6 +42,16 @@ export async function register() {
     );
   }
 
+  // Same reasoning for the graph stores (AIO-1167): an install that set only GRAPHITI_URL — which
+  // used to be enough — now answers every graph-scoped query with 503, because provenance-checked
+  // graph reads go to Neo4j and fail closed without NEO4J_URL. A warning, not a throw, and nothing
+  // about request handling changes: it only puts the cause in the deploy log on the first boot.
+  const { checkGraphStores } = await import("@/lib/graph/config-check.mjs");
+  const graphStores = checkGraphStores(process.env);
+  if (graphStores.status !== "ok") {
+    console.warn(`[boot] ${graphStores.detail}.${graphStores.fix ? ` Fix: ${graphStores.fix}.` : ""}`);
+  }
+
   // PRET-4 one-time builtin materialization (spec §3.2, cold-read H2/L1): run at BOOT, awaited
   // BEFORE the scheduler starts, so on a healthy boot the fleet's builtin posture rows are
   // explicit before any tick assesses or serves against them. Failure is loud but never fails

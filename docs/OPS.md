@@ -988,7 +988,23 @@ extraction you just paid for.
 
 Attribution-dependent reads (the work timeline, narrative arcs, their caches) are **fenced** for a
 team while its identity-attribution repair is unfinished: `team_identity_authority.repair_status` is
-anything but `complete`. In production an in-process scheduler finishes that repair within seconds.
+anything but `complete`. In production an in-process scheduler (`lib/ingest/attribution-repair-scheduler.ts`)
+continues that repair on its own, one bounded batch per team turn, polling every 5 s when idle. **How
+long that takes on a production-sized team has not been measured.** The upgrade seeds every team as
+pending, so those reads (and their `/api/v1/timeline`, team-work and arcs routes) answer the retryable
+`503 temporarily_unavailable` from the deploy until each team's repair drains. Before release, measure
+on a production-sized copy and record with the PR: the drain time per team after the upgrade and
+after one roster change; batch duration; how long ingest, connector runs and Drive commits wait
+behind the repair, including connection-pool pressure; and how often `POST /api/v1/items` returns
+its retryable 503. Until those numbers exist, treat the length of the fenced window as unknown.
+
+The identity-authority advisory lock stays **exclusive**: revision validation also locks the
+authority row `FOR UPDATE`, and the Drive lock order depends on it. Waits on it are bounded, but
+not uniformly. The Drive commit path bounds each lock acquisition to 10 s (`lock_timeout`, 55P03).
+Other callers are bounded by the pool's `statement_timeout` (30 s by default, `PG_STATEMENT_TIMEOUT_MS`),
+and a caller waiting for a free connection gives up after the 10 s checkout timeout
+(`PG_CONNECT_TIMEOUT_MS`). An environment may override any of these.
+
 **On a copied-staging runtime it does not run** — every in-process scheduler is suppressed there on
 purpose (`instrumentation.ts`), and nothing else continues a repair in the background. The fence is
 not lifted, exempted or auto-completed; the repair converges only when an admin runs it.

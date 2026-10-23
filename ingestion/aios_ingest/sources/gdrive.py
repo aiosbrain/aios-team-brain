@@ -455,6 +455,42 @@ class GoogleDriveSource(PullOnlySource, Source):
             return None
 
     @staticmethod
+    def _error_reasons(exc: Exception) -> set[str]:
+        """The machine-readable reasons a Google error names, from parsed details or its body."""
+        entries: list[Any] = []
+        details = getattr(exc, "error_details", None)
+        if isinstance(details, list):
+            entries.extend(details)
+        content = getattr(exc, "content", None)
+        if isinstance(content, (bytes, bytearray)):
+            content = content.decode("utf-8", "replace")
+        if isinstance(content, str) and content:
+            try:
+                body = json.loads(content)
+            except ValueError:
+                body = None
+            error = body.get("error") if isinstance(body, dict) else None
+            if isinstance(error, dict):
+                for key in ("errors", "details"):
+                    if isinstance(error.get(key), list):
+                        entries.extend(error[key])
+        return {
+            str(entry["reason"]) for entry in entries
+            if isinstance(entry, dict) and isinstance(entry.get("reason"), str)
+        }
+
+    @classmethod
+    def _history_access_denied(cls, exc: Exception) -> bool:
+        """Whether Drive refused this document's revision history, and only that.
+
+        A reader without revision access is answered 403 ``insufficientFilePermissions`` for the
+        one file. Every other 403 — missing scopes, an app not authorized for the file, quota and
+        rate limits, domain policy, or a 403 that names no reason — says something about the
+        credential, the connection or the provider, not about this document's history.
+        """
+        return cls._status(exc) == 403 and cls._error_reasons(exc) == {"insufficientFilePermissions"}
+
+    @staticmethod
     def _retry_after(exc: Exception) -> float | None:
         response = getattr(exc, "resp", None) or getattr(exc, "response", None)
         headers = getattr(response, "headers", None)
@@ -480,10 +516,22 @@ class GoogleDriveSource(PullOnlySource, Source):
             except (TypeError, ValueError, OverflowError):
                 return None
 
+    # Drive's documented quota/rate-limit reasons. Drive often sends these as 403, not 429; they say
+    # nothing about access to the file or drive, so they are retried with backoff (honoring
+    # Retry-After) and reported as ``rate_limited`` — never as a permission failure.
+    _RATE_LIMIT_REASONS = frozenset({"userRateLimitExceeded", "rateLimitExceeded", "dailyLimitExceeded"})
+
+    @classmethod
+    def _rate_limited(cls, exc: Exception) -> bool:
+        status = cls._status(exc)
+        return status == 429 or (
+            status == 403 and bool(cls._error_reasons(exc) & cls._RATE_LIMIT_REASONS)
+        )
+
     @classmethod
     def _retryable(cls, exc: Exception) -> bool:
         status = cls._status(exc)
-        if status == 429 or (status is not None and status >= 500):
+        if cls._rate_limited(exc) or (status is not None and status >= 500):
             return True
         return isinstance(exc, (TimeoutError, ConnectionError)) or "timeout" in type(exc).__name__.lower()
 
@@ -598,7 +646,7 @@ class GoogleDriveSource(PullOnlySource, Source):
                     not_before = datetime.fromtimestamp(
                         datetime.now(timezone.utc).timestamp() + max(0.0, delay), timezone.utc
                     ).isoformat()
-                    category = "rate_limited" if status == 429 else (
+                    category = "rate_limited" if self._rate_limited(exc) else (
                         "provider_timeout" if status is None else "provider_unavailable"
                     )
                     raise ProviderDeferred(
@@ -696,21 +744,40 @@ class GoogleDriveSource(PullOnlySource, Source):
             fields="id,name,mimeType,webViewLink,createdTime,modifiedTime,trashed,driveId,parents,owners(permissionId,emailAddress,displayName),lastModifyingUser(permissionId,emailAddress,displayName)",
         ))
 
-    def _revisions(self, file_id: str) -> list[dict[str, Any]]:
+    def _revisions(self, file_id: str) -> list[dict[str, Any]] | None:
+        """Every revision of one document, or ``None`` when Drive denies its history outright.
+
+        Only a denial of the first page is "this history is not readable": a refusal after pages
+        were read is a read that failed part-way, and is raised like any other failure.
+        """
         if self._revisions_loader:
-            return self._provider_call(lambda: self._revisions_loader(file_id))
+            try:
+                return self._provider_call(lambda: self._revisions_loader(file_id))
+            except (ProviderDeferred, ProviderCursorInvalid, BrainError):
+                raise
+            except Exception as exc:
+                if self._history_access_denied(exc):
+                    return None
+                raise
         drive, _ = self._services()
         out: list[dict[str, Any]] = []
         if not hasattr(drive, "revisions"):
             return out
         token: str | None = None
         while True:
-            response = self._request(lambda: drive.revisions().list(
-                fileId=file_id,
-                pageToken=token,
-                pageSize=1000,
-                fields="nextPageToken,revisions(id,modifiedTime,lastModifyingUser(permissionId,emailAddress,displayName))",
-            ))
+            try:
+                response = self._request(lambda: drive.revisions().list(
+                    fileId=file_id,
+                    pageToken=token,
+                    pageSize=1000,
+                    fields="nextPageToken,revisions(id,modifiedTime,lastModifyingUser(permissionId,emailAddress,displayName))",
+                ))
+            except (ProviderDeferred, ProviderCursorInvalid, BrainError):
+                raise
+            except Exception as exc:
+                if token is None and self._history_access_denied(exc):
+                    return None
+                raise
             out.extend(response.get("revisions") or [])
             token = response.get("nextPageToken")
             if not token:
@@ -821,6 +888,15 @@ class GoogleDriveSource(PullOnlySource, Source):
         contributions: list[dict[str, str]] = []
         seen_contributions: set[tuple[str, str, str]] = set()
         revisions = self._revisions(file_id)
+        if revisions is None:
+            # The body and metadata are readable but the history is not for this reader. That is a
+            # disclosed limitation of the evidence, not a failed read: what the brain already holds
+            # from earlier observations is merged with, never replaced by, what follows.
+            revisions = []
+            attribution_diagnostics.append({
+                "code": "revision_history_unavailable", "role": "editor",
+                "identity": "unresolved",
+            })
         if not revisions and editor and meta.get("modifiedTime"):
             revisions = [{"modifiedTime": meta.get("modifiedTime"), "lastModifyingUser": meta.get("lastModifyingUser")}]
             attribution_diagnostics.append({
@@ -866,6 +942,15 @@ class GoogleDriveSource(PullOnlySource, Source):
                 "drive_id": meta.get("driveId"),
                 "parent_ids": meta.get("parents") or [],
                 "gdrive_tabs": extracted.tabs,
+                # How to read the offsets in ``gdrive_tabs``: Unicode code points into this
+                # extracted text, which the stored body carries after ``body_offset`` characters
+                # (the sink stamps the exact prefix length when it materializes the item).
+                "gdrive_text_map": {
+                    "version": 1,
+                    "unit": "codepoint",
+                    "body_offset": 0,
+                    "block_map_complete": extracted.block_map_complete,
+                },
                 "extraction_complete": extracted.complete,
                 "extraction_issues": [
                     {
@@ -907,3 +992,12 @@ class GoogleDriveSource(PullOnlySource, Source):
             return
         for meta in self._selected_files():
             yield self._raw_doc(meta)
+
+
+def is_drive_rate_limit(exc: Exception) -> bool:
+    """Whether a Google error is Drive's rate/quota answer (429, or 403 with a documented reason).
+
+    The one classifier, exported as a function so a caller outside this module never resolves it
+    through whatever source class that caller happens to hold.
+    """
+    return GoogleDriveSource._rate_limited(exc)

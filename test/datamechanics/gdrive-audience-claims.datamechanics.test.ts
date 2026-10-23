@@ -21,6 +21,7 @@ import { readTimelineCache, timelineViewKey, writeTimelineCache } from "@/lib/da
 import { recordGdriveItemClaim } from "@/lib/projects/context/gdrive-claims";
 import {
   drainGdriveCleanupObligations,
+  drainPendingGdriveCleanup,
   reconcileGdriveItems,
   stageGdriveReconciliation,
 } from "@/lib/ingest/source-reconcile";
@@ -59,13 +60,13 @@ async function privateAudience(seed: Seed, memberId: string, slug: string): Prom
   return (project as { id: string }).id;
 }
 
-async function connection(seed: Seed, name: string, audienceProjectId: string): Promise<string> {
+async function connection(seed: Seed, name: string, ...audienceProjectIds: string[]): Promise<string> {
   const row = await upsertIntegration(db(), { teamId: seed.teamId, memberId: seed.memberId }, {
     type: "gdrive", name, status: "enabled",
     config: {
       fileIds: ["shared-doc"], folderIds: [], sharedDriveIds: [], recursive: false,
       selectionState: "selected", authMode: "service_account",
-      audienceProjectIds: [audienceProjectId],
+      audienceProjectIds,
     },
   });
   return row.id;
@@ -612,11 +613,79 @@ describe("AIO-1167 Drive audience claims (real Postgres)", () => {
       .toEqual(expect.objectContaining({ state: "active" }));
   });
 
+  it("continues failed cleanup from the scheduled pass after a restart, without a source reconcile, never past a restored claim", async () => {
+    const seed = await seedTeam();
+    const project = await privateAudience(seed, seed.memberId, "scheduled-cleanup");
+    const integrationId = await connection(seed, "scheduled-cleanup", project);
+    const gone = await claimedItem(seed, "scheduled-gone", [integrationId], project);
+    const reclaimed = await claimedItem(seed, "scheduled-reclaimed", [integrationId], project);
+    const reactivated = await claimedItem(seed, "scheduled-reactivated", [integrationId], project);
+    const providers = ["scheduled-gone", "scheduled-reclaimed", "scheduled-reactivated"];
+    await stageGdriveReconciliation(db(), seed.teamId, {
+      connectionId: integrationId, removedProviderIds: providers, reason: "access lost",
+    });
+    // The pass serves the longest-waiting teams first; make this team's obligations the oldest so a
+    // one-team pass is deterministic beside other suites' leftover obligations.
+    const longestWaiting = () => runSql(
+      `update gdrive_cleanup_obligations set updated_at='2000-01-01T00:00:00Z' where team_id=$1`,
+      [seed.teamId],
+    );
+    const obligations = async () => (await runSql<{ provider_id: string; attempt_count: number; last_error: string | null }>(
+      `select provider_id,attempt_count,last_error from gdrive_cleanup_obligations
+        where team_id=$1 order by provider_id`,
+      [seed.teamId],
+    )).rows;
+    const exists = async (id: string) =>
+      (await db().from("items").select("id").eq("id", id).maybeSingle()).data !== null;
+
+    // The scheduled pass fails: everything stays owed, with its attempt recorded.
+    await longestWaiting();
+    const failed = await drainPendingGdriveCleanup(db(), {
+      teams: 1,
+      testHooks: { purgeItemIds: async () => { throw new Error("graph cleanup unavailable"); } },
+    });
+    expect(failed).toEqual(expect.objectContaining({ teams: 1, items: 0, failed: 3, pending: 3, errors: [] }));
+    expect(await obligations()).toEqual(providers.slice().sort().map((provider_id) => ({
+      provider_id, attempt_count: 1, last_error: "graph cleanup unavailable",
+    })));
+    for (const item of [gone, reclaimed, reactivated]) expect(await exists(item.id)).toBe(true);
+
+    // Before the next pass — a new process, nothing in memory, no Drive request of any kind — one
+    // document is claimed again through the claim writer, and another's claim is found active again
+    // while its obligation is still queued.
+    await recordGdriveItemClaim(db(), {
+      teamId: seed.teamId, integrationId, providerId: "scheduled-reclaimed", itemId: reclaimed.id,
+      generation: 1, audienceProjectIds: [project],
+    });
+    await runSql(
+      `update gdrive_item_claims set active=true,revoked_at=null
+        where team_id=$1 and integration_id=$2 and provider_id=$3`,
+      [seed.teamId, integrationId, "scheduled-reactivated"],
+    );
+    await longestWaiting();
+    const continued = await drainPendingGdriveCleanup(db(), { teams: 1 });
+
+    // Only the document nothing claims was purged; the still-authorized ones were kept.
+    expect(continued).toEqual(expect.objectContaining({
+      teams: 1, items: 1, restored: 1, failed: 0, pending: 0, errors: [],
+    }));
+    expect(await obligations()).toEqual([]);
+    expect(await exists(gone.id)).toBe(false);
+    for (const item of [reclaimed, reactivated]) {
+      expect(await exists(item.id)).toBe(true);
+      expect((await db().from("project_context_units").select("state")
+        .eq("team_id", seed.teamId).eq("source_item_id", item.id).single()).data)
+        .toEqual(expect.objectContaining({ state: "active" }));
+    }
+  });
+
   it("keeps retire versus audience restore coherent under the canonical provider lock", async () => {
     const seed = await seedTeam();
     const projectA = await privateAudience(seed, seed.memberId, "audience-race-a");
     const projectB = await privateAudience(seed, seed.memberId, "audience-race-b");
-    const integrationId = await connection(seed, "audience-race", projectA);
+    // The restore names projectB, so the connection must approve it: a claim can only place a
+    // document in a destination its connection's current audience approves.
+    const integrationId = await connection(seed, "audience-race", projectA, projectB);
     const providerId = "audience-race-provider";
     const item = await claimedItem(seed, providerId, [integrationId], projectA);
 

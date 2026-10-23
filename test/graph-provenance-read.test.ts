@@ -7,7 +7,14 @@ const mocks = vi.hoisted(() => ({
   authorize: vi.fn(),
 }));
 
-vi.mock("@/lib/access/authorization-epoch", () => ({ authorizationEpoch: mocks.epoch }));
+// Graph facts carry no person attribution: the reader binds to the revocation barrier only. The
+// repair-gated epoch throws if anything calls it, so a regression back to it fails these tests.
+vi.mock("@/lib/access/authorization-epoch", () => ({
+  revocationEpoch: mocks.epoch,
+  authorizationEpoch: vi.fn(async () => {
+    throw new Error("graph provenance must not be gated on attribution repair");
+  }),
+}));
 vi.mock("@/lib/graph/neo4j", () => ({ neo4jConfigured: () => true }));
 vi.mock("@/lib/graph/learning", () => ({
   recentFacts: mocks.recent,

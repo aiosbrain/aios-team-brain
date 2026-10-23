@@ -215,6 +215,20 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U app -d app_test"
           --health-interval 2s --health-timeout 3s --health-retries 30
+      # The isolated test Neo4j for the TIERRET-1 query step below ONLY (AIO-1167): retrieval's graph
+      # leg reads Neo4j directly (provenance-complete), so that suite's positive graph/privacy contract
+      # needs a real one. Mirrors compose.test.neo4j.yml exactly (image, test auth, loopback bolt 7688,
+      # authenticated health probe) — pinned by test/guards/neo4j-tier-wiring.test.ts. The suite derives
+      # its URL/credentials from that compose file and seeds/cleans only its own team's group ids; no
+      # other step of this job is given a NEO4J_URL.
+      neo4j:
+        image: neo4j:5.26.2
+        env:
+          NEO4J_AUTH: neo4j/testtest1
+        ports: ["7688:7687"]
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p testtest1 'RETURN 1' || exit 1"
+          --health-interval 3s --health-timeout 5s --health-retries 40
     env:
       # Both the test process (seeding via lib/ingest) and the spawned next server read this.
       DATABASE_TEST_URL: postgres://app:app@localhost:5434/app_test
@@ -245,11 +259,12 @@ jobs:
       - run: npm run test:http:dev-login:build
       - run: npm run test:http
       - run: npm run test:http:gateway-approval
-      # TIERRET-1 (AC-03/05/11): the real /api/v1/query route against loopback fake answering +
-      # Graphiti spies, with its OWN global setup (it refuses to attach to an already-serving port
-      # and tears its server down). Sequential after the ordinary tier — same port and test DB; the
-      # ordinary tier's no-model server contract is untouched. No skip path: a missing build, fake
-      # setup, capture or assertion fails the step.
+      # TIERRET-1 (AC-03/05/11): the real /api/v1/query route against loopback fake answering, a
+      # configured-Graphiti stub and the isolated test Neo4j service above (provenance-checked graph
+      # reads), with its OWN global setup (it refuses to attach to an already-serving port, checks the
+      # Neo4j service is reachable, and tears its server down). Sequential after the ordinary tier —
+      # same port and test DB; the ordinary tier's no-model server contract is untouched. No skip
+      # path: a missing build, unreachable Neo4j, fake setup, capture or assertion fails the step.
       - run: npm run test:http:tierret1-query
       # AIO-1210: /auth/dev-login over a real loopback socket, with its OWN owned children — the
       # production build from this job under NODE_ENV=production and under NODE_ENV=development
