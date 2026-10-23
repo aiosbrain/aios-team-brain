@@ -189,3 +189,81 @@ describe("POST /api/v1/items/source-reconcile staged snapshot continuation", () 
     expect(h.stage).not.toHaveBeenCalled();
   });
 });
+
+describe("POST /api/v1/items/source-reconcile failure responses (AIO-1167 F2)", () => {
+  // Non-hex, so it cannot collide with a random request_id.
+  const MARKER = "PRIVATE-MARKER-relation-gdrive_item_claims-tuple-zq";
+  const lockTimeout = () => Object.assign(new Error(`canceling statement due to lock timeout ${MARKER}`), { code: "55P03" });
+
+  async function read(response: Response) {
+    const text = await response.text();
+    return { status: response.status, text, json: JSON.parse(text) as Record<string, unknown> };
+  }
+
+  it.each([
+    ["raw", lockTimeout],
+    ["wrapped by the transaction layer", () => Object.assign(new Error(`statement failed ${MARKER}`), { cause: lockTimeout() })],
+  ])("a 55P03 (%s) from the fenced transaction is a sanitized retryable 503", async (_name, make) => {
+    h.commit.mockRejectedValue(make());
+
+    const { status, json, text } = await read(await post());
+
+    expect(status).toBe(503);
+    expect(json).toEqual({
+      error: {
+        code: "temporarily_unavailable",
+        message: "reconciliation is temporarily unavailable; retry shortly",
+        request_id: expect.any(String),
+      },
+    });
+    expect(text).not.toContain(MARKER);
+    // Rolled back before suppression: nothing to drain.
+    expect(h.drain).not.toHaveBeenCalled();
+  });
+
+  it("an unmatched code or message alone is not a lock timeout: a fixed 500", async () => {
+    for (const error of [
+      new Error(`lock timeout 55P03 ${MARKER}`),
+      Object.assign(new Error(`deadlock ${MARKER}`), { code: "40P01" }),
+      MARKER,
+    ]) {
+      h.commit.mockRejectedValueOnce(error);
+      const { status, json, text } = await read(await post());
+      expect(status).toBe(500);
+      expect(json).toEqual({ error: { code: "internal", message: "reconciliation failed", request_id: expect.any(String) } });
+      expect(text).not.toContain(MARKER);
+    }
+  });
+
+  it("a cleanup failure after suppression committed is a fixed 500 and never reports the suppression undone", async () => {
+    h.drain.mockRejectedValue(new Error(`graph purge failed ${MARKER}`));
+
+    const { status, json, text } = await read(await post());
+
+    expect(status).toBe(500);
+    expect(json).toEqual({ error: { code: "internal", message: "reconciliation failed", request_id: expect.any(String) } });
+    expect(text).not.toContain(MARKER);
+    expect(h.stage).toHaveBeenCalledTimes(1);
+  });
+
+  it("a replay after the 503 succeeds", async () => {
+    h.commit.mockRejectedValueOnce(lockTimeout());
+    expect((await post()).status).toBe(503);
+
+    const replay = await post();
+    expect(replay.status).toBe(200);
+    expect(h.stage).toHaveBeenCalledTimes(1);
+    expect(h.drain).toHaveBeenCalledTimes(1);
+  });
+
+  it("typed authority and snapshot refusals keep their own code, message and status", async () => {
+    h.commit.mockRejectedValueOnce(new h.GdriveAuthorityError("stale_execution", "Google Drive execution is stale", 409));
+    expect(await read(await post())).toMatchObject({
+      status: 409, json: { error: { code: "stale_execution", message: "Google Drive execution is stale" } },
+    });
+    h.stage.mockRejectedValueOnce(new h.GdriveSnapshotError("snapshot_incomplete", "snapshot is not complete", 409));
+    expect(await read(await post())).toMatchObject({
+      status: 409, json: { error: { code: "snapshot_incomplete", message: "snapshot is not complete" } },
+    });
+  });
+});

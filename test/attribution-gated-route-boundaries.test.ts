@@ -264,6 +264,18 @@ describe("GET /api/dashboard/timeline — the days>7 fresh-build arm is attribut
     }
   });
 
+  it("/api/v1/timeline answers any other failure with a fixed 500 that never echoes the exception (F2)", async () => {
+    const marker = "PRIVATE-MARKER-relation-work_timeline_cache-zq";
+    h.cachedError = new Error(`admission read failed: ${marker}`);
+    const res = await v1TimelineRoute.GET(new Request("http://test/api/v1/timeline", {
+      headers: { authorization: "Bearer aios_key1_secret" },
+    }) as unknown as NextRequest);
+    const { status, json, text } = await read(res);
+    expect(status).toBe(500);
+    expect(json).toEqual({ error: { code: "internal", message: "timeline read failed", request_id: expect.any(String) } });
+    expect(text).not.toContain(marker);
+  });
+
   it("authentication and membership statuses are unchanged, and are decided before any authority read", async () => {
     h.authority.pending = true;
     h.user = null;

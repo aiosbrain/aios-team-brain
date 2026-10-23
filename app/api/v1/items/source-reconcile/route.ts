@@ -15,6 +15,22 @@ import { GdriveAuthorityError, withGdriveExecutionCommit } from "@/lib/integrati
 
 export const runtime = "nodejs";
 
+/**
+ * PostgreSQL 55P03 (lock_not_available): a bounded lock acquisition ran out, here or wrapped by the
+ * transaction layer (searched through a bounded cause chain by SQLSTATE, never by message text). The
+ * reconciliation transaction rolled back whole, so the same request may simply be sent again.
+ */
+function isLockTimeout(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current && typeof current === "object"; depth++) {
+    if ((current as { code?: unknown }).code === "55P03") return true;
+    const cause = (current as { cause?: unknown }).cause;
+    if (cause === current) break;
+    current = cause;
+  }
+  return false;
+}
+
 const requestSchema = z.object({
   source: z.literal("gdrive"),
   integration_id: z.string().uuid(),
@@ -113,6 +129,11 @@ export async function POST(req: NextRequest) {
     if (error instanceof GdriveAuthorityError || error instanceof GdriveSnapshotError) {
       return errorResponse(error.code, error.message, error.status);
     }
-    return errorResponse("internal", error instanceof Error ? error.message : "reconciliation failed", 500);
+    // Fixed messages from here on: an exception's own text can carry SQL, lock and relation detail.
+    if (isLockTimeout(error)) {
+      return errorResponse("temporarily_unavailable", "reconciliation is temporarily unavailable; retry shortly", 503);
+    }
+    console.error("[source-reconcile] failed:", error instanceof Error ? error.message : error);
+    return errorResponse("internal", "reconciliation failed", 500);
   }
 }

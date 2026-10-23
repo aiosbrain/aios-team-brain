@@ -157,6 +157,53 @@ function selection(): string[][] {
   ];
 }
 
+describe("AIO-1167 F2: a lock timeout in reconciliation is a sanitized retryable 503 (real Postgres)", () => {
+  it("a held connection authority times the reconciliation out (55P03): 503, nothing suppressed; the replay then retires the claim", async () => {
+    const c = await connector();
+    await claimDocument(c, "removed-doc");
+    await claimDocument(c, "kept-doc");
+    const removal = () => reconcilePOST(request("http://test/api/v1/items/source-reconcile", c, {
+      source: "gdrive", integration_id: c.integrationId, ...c.execution,
+      removed_provider_ids: ["removed-doc"], reason: "removed upstream",
+    }));
+
+    const holder = await getPool().connect();
+    let timedOut: Response;
+    try {
+      // Another transaction holds the connection's authority row, which every fenced commit locks
+      // with a bounded wait before it can stage anything.
+      await holder.query("begin");
+      await holder.query(
+        "select 1 from gdrive_connection_authority where team_id=$1 and integration_id=$2 for update",
+        [c.seed.teamId, c.integrationId]);
+      timedOut = await removal();
+    } finally {
+      await holder.query("rollback").catch(() => undefined);
+      holder.release();
+    }
+    const text = await timedOut.text();
+    expect(timedOut.status).toBe(503);
+    expect(JSON.parse(text)).toEqual({
+      error: {
+        code: "temporarily_unavailable",
+        message: "reconciliation is temporarily unavailable; retry shortly",
+        request_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      },
+    });
+    expect(text).not.toMatch(/lock timeout|gdrive_connection_authority|canceling statement/i);
+    // Rolled back before suppression: the claim is untouched and nothing is queued for cleanup.
+    expect(await activeClaims(c)).toEqual(["kept-doc", "removed-doc"]);
+    const { rows: obligations } = await getPool().query(
+      "select 1 from gdrive_cleanup_obligations where team_id=$1 and provider_id='removed-doc'", [c.seed.teamId]);
+    expect(obligations).toEqual([]);
+
+    // The same request, sent again once the lock is free, succeeds.
+    const replay = await removal();
+    expect(replay.status).toBe(200);
+    expect(await activeClaims(c)).toEqual(["kept-doc"]);
+  }, 45_000);
+});
+
 describe("AIO-1167 source reconciliation above 10,000 selected documents (real Postgres)", () => {
   it("stages the membership in bounded pages and retires exactly the absent claim on finalization", async () => {
     const c = await connector();

@@ -51,6 +51,8 @@ export async function GET(req: NextRequest) {
     if (err instanceof TimelineAuthorizationChangedError) {
       return errorResponse("temporarily_unavailable", "timeline authorization changed; retry the request", 503);
     }
-    return errorResponse("internal", err instanceof Error ? err.message : "timeline read failed", 500);
+    // Fixed message: an exception's own text can carry SQL, relation or admission detail.
+    console.error("[timeline] read failed:", err instanceof Error ? err.message : err);
+    return errorResponse("internal", "timeline read failed", 500);
   }
 }

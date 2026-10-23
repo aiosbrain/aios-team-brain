@@ -29,6 +29,24 @@ const outcomeSchema = z.union([
     startedAt: z.string().datetime(), ...outcomeFields }).strict(),
 ]);
 
+type Outcome = z.infer<typeof outcomeSchema>;
+
+/**
+ * A scheduled or notification run that never started because another coordinator held the
+ * connection's execution lease (`execution_busy`). It read and wrote nothing: the other run owns the
+ * work, and any undrained hint stays pending for it. It is neither a success nor a failure, so it
+ * appends nothing to the Admin run ledger — an `ok:false` row would let two busy wakes confirm a
+ * failure banner, and an `ok:true` row could clear a real one. Only the exact busy shape is exempt:
+ * a deferral that also reports failures, work or a different cause is not.
+ */
+function isVerifiedBusyDeferral(outcome: Outcome): boolean {
+  return outcome.status === "deferred"
+    && outcome.error === "execution_busy"
+    && outcome.failed === 0
+    && outcome.created === 0 && outcome.updated === 0 && outcome.unchanged === 0 && outcome.removed === 0
+    && !outcome.authoritativeComplete;
+}
+
 async function connector(req: NextRequest) {
   const auth = await authenticateApiKey(req);
   if (!auth || !auth.isConnector || auth.actorHandle !== "gdrive-sync" || auth.memberTier !== "team") return null;
@@ -65,7 +83,8 @@ export async function POST(req: NextRequest) {
         apiKeyId: auth.apiKeyId, memberId: auth.memberId, status: outcome.status,
         summary, error: outcome.error, startedAt: outcome.startedAt,
       });
-      if (completed.newly_completed) await recordIngestRun(adminClient(), {
+      // The durable deferred report above is kept either way; only the ledger append is skipped.
+      if (completed.newly_completed && !isVerifiedBusyDeferral(outcome)) await recordIngestRun(adminClient(), {
         teamId: auth.teamId, source: "gdrive", trigger: "scheduler",
         ok: outcome.status === "complete" && outcome.failed === 0,
         created: outcome.created, updated: outcome.updated, unchanged: outcome.unchanged,

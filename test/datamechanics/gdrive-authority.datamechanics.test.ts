@@ -108,6 +108,95 @@ async function acquire(key: string, seed: Seed, integrationId: string, owner = r
   return { response, body: await response.json(), owner };
 }
 
+describe("AIO-1167 F1: a busy scheduled/notification deferral is neutral in the Admin run ledger (real Postgres)", () => {
+  type Report = Record<string, unknown>;
+  const BUSY: Report = {
+    status: "deferred", error: "execution_busy", created: 0, updated: 0, unchanged: 0, removed: 0,
+    failed: 0, skipped: 1, backlog: null, authoritativeComplete: false,
+  };
+
+  async function scheduled() {
+    const seed = await seedTeam();
+    const integrationId = await integration(seed, `scheduled-${randomUUID().slice(0, 8)}`);
+    const trusted = await provision(seed, integrationId);
+    const report = async (fields: Report, reportId = randomUUID()) => {
+      const response = await runsPOST(request("http://test/api/v1/integrations/gdrive/runs", trusted.key, seed.teamSlug, {
+        reportId, integrationId, trigger: "scheduler", startedAt: new Date().toISOString(), ...fields,
+      }));
+      return { status: response.status, reportId };
+    };
+    const ledger = async () => ((await db().from("ingest_runs").select("id,ok,errors,meta")
+      .eq("team_id", seed.teamId).eq("source", "gdrive").order("id", { ascending: true })).data ?? []) as
+      { ok: boolean; errors: string[]; meta: Record<string, unknown> }[];
+    const reports = async () => ((await db().from("gdrive_run_requests").select("id,status,error")
+      .eq("team_id", seed.teamId).eq("integration_id", integrationId).eq("trigger", "scheduler")).data ?? []) as
+      { id: string; status: string; error: string | null }[];
+    return { seed, report, ledger, reports };
+  }
+
+  it("two distinct busy notifications persist deferred reports and append no failure", async () => {
+    const s = await scheduled();
+    const first = await s.report(BUSY);
+    const second = await s.report(BUSY);
+    expect([first.status, second.status]).toEqual([200, 200]);
+    // Both durable deferred reports are kept…
+    expect((await s.reports()).map((r) => [r.id, r.status, r.error]).sort())
+      .toEqual([[first.reportId, "deferred", "execution_busy"], [second.reportId, "deferred", "execution_busy"]].sort());
+    // …and the ledger neither confirms a failure nor records a success.
+    expect(await s.ledger()).toEqual([]);
+  });
+
+  it("a replayed busy report is idempotent and still appends nothing", async () => {
+    const s = await scheduled();
+    const first = await s.report(BUSY);
+    expect((await s.report(BUSY, first.reportId)).status).toBe(200);
+    expect(await s.reports()).toHaveLength(1);
+    expect(await s.ledger()).toEqual([]);
+  });
+
+  it("genuine failures separated by busy deferrals stay consecutive failures; a busy wake never clears them", async () => {
+    const s = await scheduled();
+    const failed = { ...BUSY, status: "failed", error: "provider_unavailable", skipped: 0, failed: 1 };
+    await s.report(failed);
+    await s.report(BUSY);
+    await s.report(BUSY);
+    await s.report(failed);
+    const rows = await s.ledger();
+    expect(rows.map((row) => row.ok)).toEqual([false, false]);
+    expect(rows.every((row) => row.errors.includes("provider_unavailable"))).toBe(true);
+    // No complete report exists: a busy wake did not advance the last complete success.
+    expect((await s.reports()).some((r) => r.status === "complete")).toBe(false);
+  });
+
+  it("an actual completion after busy wakes records a success normally", async () => {
+    const s = await scheduled();
+    await s.report({ ...BUSY, status: "failed", error: "provider_unavailable", skipped: 0, failed: 1 });
+    await s.report(BUSY);
+    await s.report({ ...BUSY, status: "complete", error: undefined, skipped: 0, created: 1, backlog: 0, authoritativeComplete: true });
+    expect((await s.ledger()).map((row) => row.ok)).toEqual([false, true]);
+  });
+
+  it.each([
+    ["a deferral that also reports failed work", { ...BUSY, failed: 2 }],
+    ["a deferral that also wrote items", { ...BUSY, created: 1 }],
+    ["a deferral with another cause", { ...BUSY, error: "rate_limited" }],
+    ["a deferral with mixed causes", { ...BUSY, error: "execution_busy, rate_limited" }],
+    ["a deferral with no cause", { ...BUSY, error: undefined }],
+  ])("%s is not exempt: it is appended as not-ok", async (_name, fields) => {
+    const s = await scheduled();
+    expect((await s.report(fields)).status).toBe(200);
+    expect((await s.ledger()).map((row) => row.ok)).toEqual([false]);
+  });
+
+  it("a healthy partial run keeps its existing ledger semantics", async () => {
+    const s = await scheduled();
+    await s.report({ ...BUSY, status: "partial", error: undefined, skipped: 0, created: 3, backlog: 2 });
+    const rows = await s.ledger();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ ok: false, meta: { status: "partial", backlog: 2 } });
+  });
+});
+
 describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres)", () => {
   it("publishes service-account verification only through its current fenced principal", async () => {
     const seed = await seedTeam();
