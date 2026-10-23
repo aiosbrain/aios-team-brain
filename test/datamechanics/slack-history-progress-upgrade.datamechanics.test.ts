@@ -105,10 +105,17 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *    historical lanes restart, KEEPING their segment bounds and completed-segment aggregate. The
  *    opposite live newest claim and its maximum history are preserved exactly; a live HISTORICAL
  *    claim is fenced; idle and newest-only rows are untouched.
- * For each variant and order:
- *  - the pre-introduction presence and maximum histories are pinned literally;
- *  - the first entrypoint commits notice-free with exact literal facts (lane generations, the
- *    whole lease tuple, cleared lanes, and whether `updated_at` kept its seed);
+ * Each variant has its own two literal queued thread rows: one on a restarted channel and one on
+ * an unrestarted channel. For each variant and order:
+ *  - the pre-introduction presence is pinned literally: which accepted columns exist, which named
+ *    CHECKs exist (by name, kind and VALIDATED state, as the loader left them; their definitions
+ *    are asserted only after introduction, by catalog equality), the validator count, and the
+ *    starting maximum histories;
+ *  - the first entrypoint commits notice-free with exact literal facts:
+ *    · lane generations and the whole lease tuple;
+ *    · ALL SIX segment/progress values, read directly: all null on every row for segment-only;
+ *      every seeded literal unchanged on every row for history-only;
+ *    · cleared lanes, and whether `updated_at` kept its seed;
  *  - restarted rows are byte-identical outside their PERMITTED restart fields; unrestarted rows
  *    and thread rows are exact, `updated_at` included;
  *  - the final Slack catalog equals an untouched loader-built database's catalog exactly;
@@ -144,6 +151,9 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *      F2-only SCHEMA, and the one-lane history-only introduction. Each runs under statement-level
  *      mirror-only and both statement orders, with exact replay.
  *  - MR-03 / F2-12, STILL OPEN:
+ *    · a COMMITTING single-lane segment-unit introduction: one lane's three segment columns
+ *      absent, for example only newest's (`newest_request_lower_ts`, `newest_segment_lower_ts`,
+ *      `newest_segment_upper_ts`), with the other lane's unit and both histories present;
  *    · progress writes AFTER a variant introduction followed by replay, for the two variants (only
  *      the union introduction has that here; the history-only variant does begin with progress
  *      and a maximum history, and preserves them);
@@ -969,23 +979,30 @@ async function introductionPresence(client: Client) {
         where attrelid = 'public.slack_sync_channels'::regclass and attnum > 0 and not attisdropped and attname = any($1::text[])
         order by attname collate "C"`, [NEW_COLUMNS]
     )).rows.map((row) => row.name),
-    checks: (await client.query<{ name: string }>(
-      `select conname as name from pg_catalog.pg_constraint
+    checks: (await client.query<{ name: string; kind: string; validated: boolean }>(
+      `select conname as name, contype::text as kind, convalidated as validated from pg_catalog.pg_constraint
         where conrelid = 'public.slack_sync_channels'::regclass and conname = any($1::text[]) order by conname collate "C"`,
       [["slack_sync_channels_historical_cursor_history_check", "slack_sync_channels_historical_progress_check",
         "slack_sync_channels_newest_cursor_history_check", "slack_sync_channels_newest_progress_check"]]
-    )).rows.map((row) => row.name),
+    )).rows.map((row) => ({ name: row.name, kind: row.kind, validated: row.validated })),
     validators: (await client.query<{ n: number }>(
       `select pg_catalog.count(*)::int as n from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace
         where n.nspname = 'public' and p.proname = 'slack_channel_cursor_history_valid'`
     )).rows[0].n,
   };
 }
-/** Exact restart/fence facts per row: lane generations, the whole lease tuple, cleared lanes, seeded updated_at. */
+/**
+ * Exact facts per row:
+ *  - lane generations and the whole lease tuple;
+ *  - all six segment/progress values, read directly;
+ *  - whether each lane is cleared, and whether `updated_at` kept its seed.
+ */
 async function variantFacts(client: Client) {
   return (await client.query(
     `select channel_id, newest_scan_generation::int as newest_generation, historical_scan_generation::int as historical_generation,
             lease_generation::int as lease_generation, next_lane, claimed_lane, lease_owner, lease_expires_at::text as lease_expires_at,
+            newest_request_lower_ts, newest_segment_lower_ts, newest_segment_upper_ts,
+            historical_segment_lower_ts, historical_segment_upper_ts, historical_completed_segments_oldest_ts,
             (newest_cursor is null and newest_cursor_history = '[]'::jsonb) as newest_cleared,
             (historical_cursor is null and historical_cursor_history = '[]'::jsonb and historical_oldest_seen_ts is null) as historical_cleared,
             updated_at = $1::timestamptz as updated_at_seeded
@@ -1008,8 +1025,10 @@ interface IntroductionVariant {
   /** Whether the literal rows are written BEFORE the strip DDL (true) or after it (false). */
   insertBeforeStrip: boolean;
   channels: Array<Record<string, unknown>>;
-  /** The pre-introduction presence, literally. */
-  presence: { columns: string[]; checks: string[]; validators: number };
+  /** Queued thread rows: one on a restarted channel, one on an unrestarted channel of THIS variant. */
+  threads: Array<Record<string, unknown>>;
+  /** The pre-introduction presence, literally (each present named CHECK by name, kind and validation). */
+  presence: { columns: string[]; checks: Array<{ name: string; kind: string; validated: boolean }>; validators: number };
   /** Maximum histories present before introduction, and those that must still be present after it. */
   maxBefore: Array<[string, "newest_cursor_history" | "historical_cursor_history"]>;
   maxAfter: Array<[string, "newest_cursor_history" | "historical_cursor_history"]>;
@@ -1034,13 +1053,30 @@ const HISTORICAL_RESTART_FIELDS = [
 const variantRow = (row: Record<string, unknown>): Record<string, unknown> =>
   ({ team_id: ORDER_TEAM_ID, workspace_id: ORDER_WORKSPACE, updated_at: ORDER_SEEDED_UPDATED_AT, ...row });
 const LIVE = "2030-01-01 00:00:00+00";
+/** The six segment/progress values of one row, literally. */
+type SegmentValues = {
+  newest_request_lower_ts: string | null; newest_segment_lower_ts: string | null; newest_segment_upper_ts: string | null;
+  historical_segment_lower_ts: string | null; historical_segment_upper_ts: string | null; historical_completed_segments_oldest_ts: string | null;
+};
+const NO_SEGMENTS: SegmentValues = {
+  newest_request_lower_ts: null, newest_segment_lower_ts: null, newest_segment_upper_ts: null,
+  historical_segment_lower_ts: null, historical_segment_upper_ts: null, historical_completed_segments_oldest_ts: null,
+};
+/** The history-only variant's seeded newest segment literals, which must survive unchanged. */
+const NEWEST_SEGMENTS = { newest_request_lower_ts: "1718900640.000000", newest_segment_lower_ts: "1718900640.000000", newest_segment_upper_ts: "1718900800.000000" };
 const fact = (channel: string, newest: number, historical: number, lease: number, next: string,
-  claim: { lane: string | null; owner: string | null; expires: string | null }, newestCleared: boolean, historicalCleared: boolean, seeded: boolean) => ({
+  claim: { lane: string | null; owner: string | null; expires: string | null }, segments: SegmentValues,
+  newestCleared: boolean, historicalCleared: boolean, seeded: boolean) => ({
   channel_id: channel, newest_generation: newest, historical_generation: historical, lease_generation: lease, next_lane: next,
-  claimed_lane: claim.lane, lease_owner: claim.owner, lease_expires_at: claim.expires,
+  claimed_lane: claim.lane, lease_owner: claim.owner, lease_expires_at: claim.expires, ...segments,
   newest_cleared: newestCleared, historical_cleared: historicalCleared, updated_at_seeded: seeded,
 });
 const NO_CLAIM = { lane: null, owner: null, expires: null };
+/** A queued thread row for a variant: every non-constant default explicit. */
+const variantThread = (id: string, channel: string, root: string, due: string, created: string): Record<string, unknown> => ({
+  id, team_id: ORDER_TEAM_ID, workspace_id: ORDER_WORKSPACE, channel_id: channel, root_ts: root, attempts: 1,
+  due_at: due, created_at: created, updated_at: ORDER_SEEDED_UPDATED_AT,
+});
 
 /**
  * SEGMENT-ONLY introduction on an F2-only SCHEMA. Both histories, the validator and both history
@@ -1069,9 +1105,16 @@ const segmentOnlyVariant = (historicalMax: string[]): IntroductionVariant => ({
       claimed_lane: "historical", lease_owner: "lease-seg-r4", lease_expires_at: LIVE, lease_generation: 11, next_lane: "newest",
       due_at: "2026-01-07 00:00:00+00", created_at: "2025-12-28 00:00:00+00" },
   ].map(variantRow),
+  threads: [
+    variantThread("0f000000-0000-4000-8000-0000000000d1", "C0SEGONLY001", "1718900210.000210", "2026-01-03 00:00:00+00", "2025-12-31 01:00:00+00"),
+    variantThread("0f000000-0000-4000-8000-0000000000d2", "C0SEGONLY003", "1718900310.000310", "2026-01-04 00:00:00+00", "2025-12-31 02:00:00+00"),
+  ],
   presence: {
     columns: ["historical_cursor_history", "newest_cursor_history"],
-    checks: ["slack_sync_channels_historical_cursor_history_check", "slack_sync_channels_newest_cursor_history_check"],
+    checks: [
+      { name: "slack_sync_channels_historical_cursor_history_check", kind: "c", validated: true },
+      { name: "slack_sync_channels_newest_cursor_history_check", kind: "c", validated: true },
+    ],
     validators: 1,
   },
   maxBefore: [["C0SEGONLY004", "historical_cursor_history"]],
@@ -1079,11 +1122,12 @@ const segmentOnlyVariant = (historicalMax: string[]): IntroductionVariant => ({
   restarted: new Set(["C0SEGONLY001", "C0SEGONLY002", "C0SEGONLY004"]),
   permitted: BOTH_LANE_RESTART_FIELDS,
   introduced: SEGMENT_COLUMNS,
+  // Every newly introduced segment/progress value is null on EVERY row: the all-null initialization tuple.
   facts: [
-    fact("C0SEGONLY001", 0, 4, 7, "newest", NO_CLAIM, true, true, false),
-    fact("C0SEGONLY002", 6, 5, 22, "newest", NO_CLAIM, true, true, false),
-    fact("C0SEGONLY003", 0, 0, 4, "historical", NO_CLAIM, true, true, true),
-    fact("C0SEGONLY004", 0, 3, 12, "historical", NO_CLAIM, true, true, false),
+    fact("C0SEGONLY001", 0, 4, 7, "newest", NO_CLAIM, NO_SEGMENTS, true, true, false),
+    fact("C0SEGONLY002", 6, 5, 22, "newest", NO_CLAIM, NO_SEGMENTS, true, true, false),
+    fact("C0SEGONLY003", 0, 0, 4, "historical", NO_CLAIM, NO_SEGMENTS, true, true, true),
+    fact("C0SEGONLY004", 0, 3, 12, "historical", NO_CLAIM, NO_SEGMENTS, true, true, false),
   ],
 });
 
@@ -1121,9 +1165,17 @@ const historyOnlyVariant = (newestMax: string[]): IntroductionVariant => ({
       newest_segment_lower_ts: "1718900640.000000", newest_segment_upper_ts: "1718900800.000000", newest_scan_generation: 2,
       lease_generation: 5, next_lane: "newest", due_at: "2026-01-07 00:00:00+00", created_at: "2025-12-28 00:00:00+00" },
   ].map(variantRow),
+  threads: [
+    variantThread("0f000000-0000-4000-8000-0000000000e1", "C0HISONLY001", "1718900220.000220", "2026-01-03 00:00:00+00", "2025-12-31 01:00:00+00"),
+    variantThread("0f000000-0000-4000-8000-0000000000e2", "C0HISONLY003", "1718900320.000320", "2026-01-04 00:00:00+00", "2025-12-31 02:00:00+00"),
+  ],
   presence: {
     columns: NEW_COLUMNS.filter((column) => column !== "historical_cursor_history"),
-    checks: ["slack_sync_channels_historical_progress_check", "slack_sync_channels_newest_cursor_history_check", "slack_sync_channels_newest_progress_check"],
+    checks: [
+      { name: "slack_sync_channels_historical_progress_check", kind: "c", validated: true },
+      { name: "slack_sync_channels_newest_cursor_history_check", kind: "c", validated: true },
+      { name: "slack_sync_channels_newest_progress_check", kind: "c", validated: true },
+    ],
     validators: 1,
   },
   maxBefore: [["C0HISONLY001", "newest_cursor_history"]],
@@ -1131,11 +1183,17 @@ const historyOnlyVariant = (newestMax: string[]): IntroductionVariant => ({
   restarted: new Set(["C0HISONLY001", "C0HISONLY002"]),
   permitted: HISTORICAL_RESTART_FIELDS,
   introduced: ["historical_cursor_history"],
+  // Every seeded segment/progress literal is unchanged on EVERY row, restarted or not.
   facts: [
-    fact("C0HISONLY001", 7, 4, 31, "historical", { lane: "newest", owner: "lease-his-r1", expires: LIVE }, false, true, false),
-    fact("C0HISONLY002", 0, 3, 42, "historical", NO_CLAIM, true, true, false),
-    fact("C0HISONLY003", 0, 0, 4, "historical", NO_CLAIM, true, true, true),
-    fact("C0HISONLY004", 2, 0, 5, "newest", NO_CLAIM, true, true, true),
+    fact("C0HISONLY001", 7, 4, 31, "historical", { lane: "newest", owner: "lease-his-r1", expires: LIVE }, {
+      ...NEWEST_SEGMENTS, historical_segment_lower_ts: "0.000000", historical_segment_upper_ts: "1718900300.000000",
+      historical_completed_segments_oldest_ts: "1718900350.5",
+    }, false, true, false),
+    fact("C0HISONLY002", 0, 3, 42, "historical", NO_CLAIM, {
+      ...NO_SEGMENTS, historical_segment_lower_ts: "1718900100.000000", historical_segment_upper_ts: "1718900300.000000",
+    }, true, true, false),
+    fact("C0HISONLY003", 0, 0, 4, "historical", NO_CLAIM, NO_SEGMENTS, true, true, true),
+    fact("C0HISONLY004", 2, 0, 5, "newest", NO_CLAIM, { ...NO_SEGMENTS, ...NEWEST_SEGMENTS }, true, true, true),
   ],
 });
 
@@ -1187,7 +1245,7 @@ async function runIntroductionVariant(variant: IntroductionVariant): Promise<voi
         await orderFixture(c, `insert into teams (id, slug, name) values ($1, 'variant-team', 'Variant Team')`, [ORDER_TEAM_ID]);
         if (!variant.insertBeforeStrip) for (const ddl of variant.strip) await c.query(ddl);
         for (const row of variant.channels) await insertLiteralRow(c, "slack_sync_channels", row);
-        for (const row of ORDER_THREADS) await insertLiteralRow(c, "slack_sync_threads", row);
+        for (const row of variant.threads) await insertLiteralRow(c, "slack_sync_threads", row);
         if (variant.insertBeforeStrip) for (const ddl of variant.strip) await c.query(ddl);
         expect(await introductionPresence(c), `${run} fixture: the pre-introduction schema is exactly the variant's`).toEqual(variant.presence);
         for (const [channel, column] of variant.maxBefore) {
