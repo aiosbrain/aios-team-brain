@@ -24,19 +24,35 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
  * the migration or the schema under test. The static source fences read those files only as the
  * subject of the parity/discipline rules they state.
  *
+ * LITERAL-ORACLE DISCIPLINE. The CHECK renderings and the validator body are exact change detectors
+ * for the isolated runner's PostgreSQL 16 (`scripts/dm-isolated.sh` pins `postgres:16`). They are
+ * not contract text. A mismatch is evidence to adjudicate, never a value to paste back:
+ *  - a deparse-only difference under another server version needs a reviewed literal update;
+ *  - any semantic difference is a production finding.
+ * The owned-function inventory pins the validator and the deleted-binding trigger function, and
+ * forbids any other function in the table's naming families EXCEPT a `…progress…` helper. §9
+ * permits one if it is narrowly scoped; adding one requires its own exact metadata/body pin here.
+ *
  * PRIVACY. Assertions never print a cursor, a history or an error's free text:
  *  - refusals are projected to SQLSTATE, a message that is either one of the two accepted static
  *    messages or a fixed placeholder, and the PRESENCE (never the content) of every
  *    value-bearing error field;
- *  - cursor/history contents and whole rows are compared only by md5 digests;
+ *  - cursors and histories are compared by SQL equality (booleans) or as part of a whole-row
+ *    digest, never as their own hash;
+ *  - row preservation is reported as the NAMES of changed columns, never their values;
  *  - refusal cases plant `CANARY` cursors and require that no error field carries one.
- * Scalar bookkeeping (generations, lease fields, bounds) is literal, non-secret fixture data.
+ * Scalar bookkeeping (generations, lease fields, bounds, planted metadata) is literal, non-secret
+ * fixture data.
  *
- * WHAT THIS PACKET PROVES, and which assertions are RED by intent at base 1f7902a2:
- *  - MR-02 catalog identity: the from-zero catalog (schema mirror) and the direct-migration catalog
- *    both carry exactly the eight columns, exactly the 25 pre-F2 constraints plus the four named
- *    CHECKs (each with its exact definition, validated), no other owned function, and the exact
- *    validator (metadata AND body). Expected GREEN today.
+ * WHAT THIS PACKET PROVES, and which assertions are RED by intent at base ff2cfcb6:
+ *  - MR-02 catalog identity: the loader-path catalog (schema.sql plus every effective migration, as
+ *    `scripts/pg-load-schema.mjs` loads them) and the direct-migration catalog both carry:
+ *    · exactly the eight columns;
+ *    · exactly the 25 pre-F2 constraints plus the four named CHECKs, each with its exact definition
+ *      and validated;
+ *    · no other owned function;
+ *    · the exact validator, metadata AND body.
+ *    Expected GREEN today.
  *  - MR-04 helper conflict: a validator with the accepted identity but a DEFAULTED argument is
  *    refused with static P0001 / AM_F2_UPGRADE_INVALID_STATE, all-or-nothing. Expected GREEN today.
  *  - MR-04 wrong-kind constraint conflict: an accepted CHECK name already used by a NON-CHECK
@@ -52,6 +68,12 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
  *    · persisted histories that are duplicate, terminal-mismatched, empty under a non-null cursor,
  *      non-array or over the entry cap (AM_F2).
  *    Expected GREEN today.
+ *  - MR-04 restart-hiding prevalidation: a defect that the one-time restart would itself erase
+ *    must be refused BEFORE the restart:
+ *    · a history-only introduction whose historical attempt-oldest lies outside [S,U] (AC02);
+ *    · a segment-only introduction over a terminal-mismatched newest history (AM_F2).
+ *    Each is refused statically, rolls back whole-row from a fresh session, and leaves the absent
+ *    columns absent. Expected GREEN today.
  *  - The exact validator's truth table: trim set, C0/DEL, C1, UTF-16 units, distinctness, element
  *    and container types, and the exact inclusive entry/byte caps, including a 1000-entry history
  *    of exactly 1,048,576 serialized bytes. The installed CHECKs enforce linkage and the §4 progress
@@ -62,10 +84,14 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
  *    · both lanes active with a claim (both restarted, fenced once);
  *    · an anchored null-cursor lane with no claim (restarted, turn kept);
  *    · an idle row, fully untouched including `updated_at`;
- *    · every non-permitted column unchanged.
+ *    · every non-permitted column unchanged, on rows that carry PLANTED non-default values for
+ *      attempts, error/success metadata, certification/catch-up state, the metadata owner, the
+ *      public proof, the binding, the due time and the created time (non-vacuity asserted first).
  *    Then a history-only one-lane introduction that preserves the opposite live claim and the
- *    restarted lane's segment bounds and aggregate. Then replay after segment progress and MAXIMUM
- *    histories on both lanes, which must leave every row byte-identical. Expected GREEN today.
+ *    restarted lane's segment bounds and aggregate. Its whole row, every planted value included,
+ *    is preserved except for the five permitted historical restart fields. Then replay after
+ *    segment progress and MAXIMUM histories on both lanes, which must leave every row
+ *    byte-identical. Expected GREEN today.
  *  - DH-11 source fences (static, no database):
  *    · exactly one marker pair per file;
  *    · nothing executable outside the migration's marked DO;
@@ -76,19 +102,37 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
  *    · only the two static errors;
  *    · the table lock before any catalog observation.
  *    Expected GREEN today.
- *  - Schema comment precision: the comment above the eight from-zero columns must not claim the two
- *    paths have the "same final catalog". Only the executable statement's byte identity is
- *    guaranteed, and from-zero columns sit in different attribute positions from upgraded ones.
- *    **RED by intent** until the comment is corrected (this packet does not edit it). The named
- *    failing assertion is "schema comment … same final catalog".
+ *  - Schema comment precision: the comment block directly above the eight from-zero columns in
+ *    `slack_sync_channels` must not claim, in any wording, that the two paths share a catalog
+ *    ("same"/"identical"/"equal"/"agree" … "catalog"). Only the executable statement's byte
+ *    identity is guaranteed, and from-zero columns sit in different attribute positions from
+ *    upgraded ones. **RED by intent** until the comment is corrected (this packet does not edit
+ *    it). The named failing assertion is "schema comment … claims catalog sameness".
+ *
+ * TEST COUNT: 23 (4 static, 19 database). Intended REDs at ff2cfcb6: exactly 3 (both wrong-kind
+ * cases and the schema comment). Everything else is expected GREEN.
  *
  * WHAT REMAINS, NOT claimed here:
- *  - MR-02: from-zero vs schema-plus-all-migrations fingerprints, empty-search-path dump/restore and
- *    replay after restore;
- *  - MR-03: mirror-only execution and both execution orders on independent fixtures; segment-only
- *    introduction on an F2-only SCHEMA state; staged/published/ledger evidence rows;
- *  - MR-04: injected cancellation, real concurrent sessions (serialization), the failed-later-
- *    migration retry case;
+ *  - MR-02: schema-only vs schema-plus-all-migrations fingerprints; empty-search-path dump/restore
+ *    and replay after restore.
+ *  - MR-03:
+ *    · mirror-only execution and both execution orders on independent fixtures;
+ *    · a COMMITTING segment-only introduction on an F2-only SCHEMA state (only its refusal is here);
+ *    · staged/published/ledger evidence rows.
+ *  - MR-04 refusals not yet exercised:
+ *    · a PARTIAL segment-column set (one or two of a lane's three present);
+ *    · present-column metadata conflicts: a domain over jsonb/text, a wrong default, wrong
+ *      nullability, generated/identity;
+ *    · revalidation of a stored invalid progress tuple on a PURE replay (every column present);
+ *    · every refusal through the SCHEMA-MIRROR path (`schema.sql` as loaded), not only the migration;
+ *    · the HISTORICAL-lane null-anchor/non-null-cursor legacy case;
+ *    · a same-name CHECK with a DIFFERENT definition: replaced without a value-bearing failing-row
+ *      DETAIL, with no rollback hazard;
+ *    · injected cancellation, real concurrent sessions (serialization) and retry after a later
+ *      migration query fails.
+ *  - DH-11: the §9 named tests in the source-fences/upgrade files, including renaming the legacy
+ *    three-column replay test to `re-adds the three legacy metadata/provisional columns without
+ *    restarting an initialized segment`, and maximum histories through unrelated writers.
  *  - MR-05 structural sweeps; MR-06 (held until PR743 staging); every runtime/DH-12/DH-13 behavior,
  *    which needs the not-yet-wired writer and is not claimed by this migration packet.
  */
@@ -237,7 +281,11 @@ const EXPECTED_VALIDATOR = [{
   volatility: "i", strict: true, parallel: "s", security_definer: false, returns_set: false, leakproof: false,
   config: ["search_path=pg_catalog"], arg_names: ["history"], arg_defaults: 0, support: "-", source: VALIDATOR_SOURCE,
 }];
-/** Every public function in the table's naming families once F2 is in: no progress helper exists. */
+/**
+ * Every public function in the table's naming families once F2 is in, apart from any `…progress…`
+ * helper. §9 permits a narrowly scoped one; it is excluded from this inventory, not forbidden, and
+ * adding one requires its own exact pin here.
+ */
 const POST_F2_OWNED_FUNCTIONS = ["slack_channel_cursor_history_valid", "slack_sync_channels_clear_deleted_binding"];
 
 // ── FIXTURE IDENTITY, literal ──
@@ -247,6 +295,57 @@ const WORKSPACE = "T0CONFLICT1";
 const SEEDED_UPDATED_AT = "2026-01-02 03:04:05+00";
 const LIVE_EXPIRY = "2030-01-01 00:00:00+00";
 const PAST_EXPIRY = "2020-01-01 00:00:00+00";
+const INTEGRATION_ID = "7c3d4e5f-6071-4c8d-8e9f-2a3b4c5d6e7f";
+
+/**
+ * PLANTED, distinctive, valid non-default values for every column the restart must NOT touch, one
+ * set per row, so "unchanged" is never a comparison of nulls and defaults.
+ */
+const PLANTED: Record<string, Record<string, unknown>> = {
+  C0BOTHLANE01: {
+    attempts: 7, last_error_code: "rate_limited", last_read_at: "2026-01-01 10:00:00+00",
+    completed_lower_ts: "1718899000.000000", completed_upper_ts: "1718899100.000000", historical_floor_reached: false,
+    newest_catchup_upper_ts: "1718900900.000000", metadata_attempt_owner: "metadata-owner-r2", metadata_attempt_generation: 5,
+    public_state: "public", public_checked_at: "2026-01-01 00:00:00+00",
+    binding_integration_id: INTEGRATION_ID, binding_config_revision: "abababababababababababababababababababababababababababababababab",
+    due_at: "2026-01-05 00:00:00+00", created_at: "2025-12-30 00:00:00+00",
+  },
+  C0CLAIMHIST1: {
+    attempts: 2, last_error_code: "invocation_budget", last_read_at: "2026-01-01 11:00:00+00",
+    completed_lower_ts: "1718898000.000000", completed_upper_ts: "1718898100.000000", historical_floor_reached: true,
+    newest_catchup_upper_ts: "1718900950.000000", metadata_attempt_owner: "metadata-owner-r1", metadata_attempt_generation: 3,
+    public_state: "private", public_checked_at: "2026-01-01 01:00:00+00",
+    binding_integration_id: INTEGRATION_ID, binding_config_revision: "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+    due_at: "2026-01-06 00:00:00+00", created_at: "2025-12-29 00:00:00+00",
+  },
+  C0EXPIRED001: {
+    attempts: 9, last_error_code: "provider_error", last_read_at: "2026-01-01 12:30:00+00",
+    completed_lower_ts: "1718897000.000000", completed_upper_ts: "1718897100.000000", historical_floor_reached: true,
+    newest_catchup_upper_ts: "1718900990.000000", metadata_attempt_owner: "metadata-owner-r5", metadata_attempt_generation: 8,
+    public_state: "unverifiable", public_checked_at: "2026-01-01 02:00:00+00",
+    binding_integration_id: INTEGRATION_ID, binding_config_revision: "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+    due_at: "2026-01-07 00:00:00+00", created_at: "2025-12-28 00:00:00+00",
+  },
+  C0ONELANE001: {
+    attempts: 4, last_error_code: "rate_limited", last_read_at: "2026-01-01 09:00:00+00",
+    completed_lower_ts: "1718896000.000000", completed_upper_ts: "1718896100.000000", historical_floor_reached: true,
+    newest_catchup_upper_ts: "1718900850.000000", metadata_attempt_owner: "metadata-owner-r6", metadata_attempt_generation: 6,
+    public_state: "public", public_checked_at: "2026-01-01 03:00:00+00",
+    binding_integration_id: INTEGRATION_ID, binding_config_revision: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    due_at: "2026-01-08 00:00:00+00", created_at: "2025-12-27 00:00:00+00",
+  },
+};
+
+/** A fixture statement's failure, redacted to SQLSTATE and constraint name: never a failing-row DETAIL. */
+class FixtureError extends Error {
+  readonly code: unknown;
+  readonly constraint: unknown;
+  constructor(code: unknown, constraint: unknown) {
+    super(`fixture statement failed (SQLSTATE ${String(code)}${constraint ? `, constraint ${String(constraint)}` : ""})`);
+    this.code = code;
+    this.constraint = constraint;
+  }
+}
 
 /**
  * A maximum accepted history (§3.1): 1,000 distinct valid entries serialized as EXACTLY 1,048,576
@@ -391,11 +490,26 @@ describe("AM-F2 + AC-02 history/segment block — static source fences (DH-11, M
     });
   });
 
-  it("schema comment precision: the from-zero column comment does not claim the same final catalog", () => {
-    // RED by intent at 1f7902a2. Only the executable statement's bytes are guaranteed identical;
-    // from-zero columns occupy different attribute positions than upgraded ones, so "same final
-    // catalog" overstates what either path proves.
-    expect(schemaText.includes("same final catalog"), "schema comment above the eight from-zero columns claims the same final catalog").toBe(false);
+  it("schema comment precision: the from-zero column comment does not claim catalog sameness", () => {
+    // RED by intent at ff2cfcb6. Only the executable statement's bytes are guaranteed identical;
+    // from-zero columns occupy different attribute positions than upgraded ones, so a claim that the
+    // two paths share a catalog overstates what either path proves.
+    const tableStart = schemaText.indexOf("create table if not exists slack_sync_channels (");
+    const firstNewColumn = "  newest_cursor_history jsonb not null default '[]'::jsonb,\n";
+    const columnAt = schemaText.indexOf(firstNewColumn, tableStart);
+    const lines = schemaText.slice(tableStart, columnAt).split("\n");
+    lines.pop(); // the empty remainder after the last newline before the column line
+    const comment: string[] = [];
+    while (lines.length > 0 && /^\s*--/.test(lines[lines.length - 1])) comment.unshift(lines.pop() as string);
+    const text = comment.join("\n");
+    expect({
+      tableFound: tableStart >= 0, columnInTable: columnAt > tableStart, columnOnce: occurrences(schemaText, firstNewColumn),
+      commentLines: comment.length > 0, namesTheBlock: text.includes(MARKER),
+    }, "fixture: the Slack from-zero column block and its comment are where this check looks").toEqual({
+      tableFound: true, columnInTable: true, columnOnce: 1, commentLines: true, namesTheBlock: true,
+    });
+    expect(/(same|identical|equal|agree)[^.]*catalog|catalog[^.]*(same|identical|equal|agree)/i.test(text),
+      "schema comment above the eight from-zero columns claims catalog sameness").toBe(false);
   });
 });
 
@@ -451,7 +565,7 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
   )).rows.map((row) => row.name);
   const fullCatalog = async () => ({
     columns: await newColumns(), constraintNames: await constraintNames(), namedChecks: await namedConstraints(),
-    functions: await ownedFunctions(), validator: await validator(),
+    functions: (await ownedFunctions()).filter((name) => !name.includes("progress")), validator: await validator(),
   });
   const EXPECTED_FULL_CATALOG = {
     columns: EXPECTED_COLUMNS, constraintNames: POST_F2_CONSTRAINT_NAMES, namedChecks: EXPECTED_NAMED_CHECKS,
@@ -480,15 +594,49 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
     }
   };
 
+  /** A fixture DML statement whose failure is redacted (FixtureError), so a seeded canary never prints. */
+  const runFixture = async (sql: string, params: unknown[] = []): Promise<void> => {
+    try {
+      await c.query(sql, params);
+    } catch (error) {
+      const e = (error ?? {}) as Record<string, unknown>;
+      throw new FixtureError(e.code ?? null, e.constraint ?? null);
+    }
+  };
   /** Insert one channel row from literal column values (histories as JSON text). */
   const insertChannel = async (row: Record<string, unknown>): Promise<void> => {
     const columns = ["team_id", "workspace_id", ...Object.keys(row)];
     const values = [TEAM_ID, WORKSPACE, ...Object.values(row)];
-    await c.query(
+    await runFixture(
       `insert into public.slack_sync_channels (${columns.join(", ")}) values (${values.map((_, i) => `$${i + 1}`).join(", ")})`,
       values
     );
   };
+  /** The planted columns of the named rows, projected literally (timestamps as UTC text). */
+  const plantedProjection = async (channels: string[]) => (await probe.query(
+    `select channel_id, attempts, last_error_code, last_read_at::text as last_read_at,
+            completed_lower_ts, completed_upper_ts, historical_floor_reached, newest_catchup_upper_ts,
+            metadata_attempt_owner, metadata_attempt_generation::int as metadata_attempt_generation,
+            public_state, public_checked_at::text as public_checked_at,
+            binding_integration_id::text as binding_integration_id, binding_config_revision,
+            due_at::text as due_at, created_at::text as created_at
+       from public.slack_sync_channels where channel_id = any($1::text[]) order by channel_id collate "C"`, [channels]
+  )).rows;
+  const expectedPlanted = (channels: string[]) => [...channels].sort().map((channel) => ({ channel_id: channel, ...PLANTED[channel] }));
+  /** One row as jsonb text without the excluded columns — kept in memory only, never asserted directly. */
+  const rowExcept = async (channel: string, excluded: string[]): Promise<string> => (await probe.query<{ row: string }>(
+    `select (pg_catalog.to_jsonb(s) - $2::text[])::text as row from public.slack_sync_channels s where s.channel_id = $1`,
+    [channel, excluded]
+  )).rows[0].row;
+  /** The NAMES (never the values) of the columns whose value differs from `before`, excluded columns aside. */
+  const changedColumns = async (channel: string, before: string, excluded: string[]): Promise<string[]> => (await probe.query<{ changed: string[] }>(
+    `select coalesce(pg_catalog.array_agg(coalesce(b.key, a.key) order by coalesce(b.key, a.key) collate "C"), '{}'::text[]) as changed
+       from pg_catalog.jsonb_each($2::jsonb) as b
+       full join pg_catalog.jsonb_each((select pg_catalog.to_jsonb(s) - $3::text[] from public.slack_sync_channels s where s.channel_id = $1)) as a
+         on a.key = b.key
+      where a.value is distinct from b.value`,
+    [channel, before, excluded]
+  )).rows[0].changed;
 
   /** FIXTURE DDL on this scratch database only: back to the exact pre-F2 table, with no rows. */
   const resetToPreF2 = async (): Promise<void> => {
@@ -530,9 +678,11 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
     await probe.connect();
     await c.query("set time zone 'UTC'");
     await probe.query("set time zone 'UTC'");
-    // The from-zero catalog, captured before any fixture DDL touches it.
+    // The loader-path catalog (schema.sql, then every effective migration), captured before any fixture DDL.
     fromZero = await fullCatalog();
     await c.query(`insert into teams (id, slug, name) values ($1, 'conflict-team', 'Conflict Team')`, [TEAM_ID]);
+    // The binder the planted binding proofs point at; channel rows are deleted per case, this is not.
+    await c.query(`insert into integrations (id, team_id, type, name) values ($1, $2, 'slack', 'conflict-slack')`, [INTEGRATION_ID, TEAM_ID]);
   }, SCRATCH_TIMEOUT);
 
   afterAll(async () => {
@@ -548,8 +698,8 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
 
   // ── MR-02 CATALOG IDENTITY ──
 
-  it("MR-02 the from-zero schema carries the exact accepted columns, constraints, four named CHECK definitions and validator", () => {
-    expect(fromZero, "from-zero catalog: columns, every constraint, the four named CHECK definitions (validated), owned functions and the exact validator").toEqual(EXPECTED_FULL_CATALOG);
+  it("MR-02 the loader path (schema.sql plus every effective migration) carries the exact accepted columns, constraints, four named CHECK definitions and validator", () => {
+    expect(fromZero, "loader-path catalog (schema plus migrations): columns, every constraint, the four named CHECK definitions (validated), owned functions and the exact validator").toEqual(EXPECTED_FULL_CATALOG);
   }, SCRATCH_TIMEOUT);
 
   it("MR-02 the direct migration on a pre-F2 table installs the same exact catalog, with no notice", async () => {
@@ -650,7 +800,7 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
     await insertChannel({ channel_id: "C0LINKAGE001", ...NEWEST_INITIALIZED, newest_cursor: "CANARY-c-1", newest_cursor_history: JSON.stringify(["CANARY-c-1"]) });
     // FIXTURE DDL: the state an operator's manual repair could leave — a present history whose CHECK is gone.
     await c.query("alter table public.slack_sync_channels drop constraint slack_sync_channels_newest_cursor_history_check");
-    await c.query(
+    await runFixture(
       "update public.slack_sync_channels set newest_cursor_history = $1::jsonb, newest_cursor = $2 where channel_id = 'C0LINKAGE001'",
       [JSON.stringify(history), cursor]
     );
@@ -663,6 +813,68 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
       "rollback: rows unchanged, the removed CHECK not reinstalled, the validator exactly as it was").toEqual({
       rows: before, validator: EXPECTED_VALIDATOR,
       checks: ["slack_sync_channels_historical_cursor_history_check", "slack_sync_channels_historical_progress_check", "slack_sync_channels_newest_progress_check"],
+    });
+  }, SCRATCH_TIMEOUT);
+
+  // ── MR-04 / §9 RESTART-HIDING PREVALIDATION: refused BEFORE the restart could erase the defect ──
+
+  it("MR-04 a history-only introduction refuses an attempt-oldest outside [S,U] before the restart could clear it (AC02)", async () => {
+    await resetToPreF2();
+    expect(refusalOf((await applyMigration()).error), "setup: the introduction commits on an empty table").toEqual({ outcome: "the migration committed" });
+    await insertChannel({
+      channel_id: "C0HIDEOLDEST",
+      historical_anchor_ts: "1718900500.000000", historical_segment_lower_ts: "1718900100.000000", historical_segment_upper_ts: "1718900300.000000",
+      historical_oldest_seen_ts: "1718900200.000000", historical_cursor: "CANARY-h-hide", historical_cursor_history: JSON.stringify(["CANARY-h-hide"]),
+      historical_scan_generation: 2, updated_at: SEEDED_UPDATED_AT,
+    });
+    // FIXTURE DDL: the historical history column is absent (history-only introduction) and the
+    // progress CHECK is gone, so the attempt-oldest can sit BELOW S. The restart this introduction
+    // performs clears exactly that field: only prevalidation can still see the defect.
+    await c.query("alter table public.slack_sync_channels drop column historical_cursor_history");
+    await c.query("alter table public.slack_sync_channels drop constraint slack_sync_channels_historical_progress_check");
+    await runFixture("update public.slack_sync_channels set historical_oldest_seen_ts = '1718900050.000000' where channel_id = 'C0HIDEOLDEST'");
+    const before = await rowsDigest();
+    const { error, notices } = await applyMigration();
+    expect(notices, "no NOTICE or WARNING on refusal").toEqual([]);
+    expect(refusalOf(error), "refused with the static AC02 error and no value-bearing field").toEqual(refusedWith(AC02));
+    expect(carriesCanary(error), "no error field carries a planted cursor canary").toBe(false);
+    expect({
+      rows: await rowsDigest(), columns: (await newColumns()).map((row) => row.name),
+      checks: (await namedConstraints()).map((row) => row.name),
+    }, "rollback from a fresh session: the row is byte-identical, the history column is still absent, no CHECK reinstalled").toEqual({
+      rows: before, columns: NEW_COLUMNS.filter((column) => column !== "historical_cursor_history"),
+      checks: ["slack_sync_channels_newest_cursor_history_check", "slack_sync_channels_newest_progress_check"],
+    });
+  }, SCRATCH_TIMEOUT);
+
+  it("MR-04 a segment-only introduction refuses a terminal-mismatched newest history before the restart could clear it (AM_F2)", async () => {
+    await resetToPreF2();
+    expect(refusalOf((await applyMigration()).error), "setup: the introduction commits on an empty table").toEqual({ outcome: "the migration committed" });
+    await insertChannel({
+      channel_id: "C0HIDEHIST01", ...NEWEST_INITIALIZED,
+      newest_cursor: "CANARY-c-1", newest_cursor_history: JSON.stringify(["CANARY-c-1"]), updated_at: SEEDED_UPDATED_AT,
+    });
+    // FIXTURE DDL: an F2-only SCHEMA state — the newest segment columns are absent (segment-only
+    // introduction) — whose history CHECK is gone, so the stored history can end in another cursor.
+    // The restart clears C/H: only prevalidation can still see the defect.
+    await c.query("alter table public.slack_sync_channels drop column newest_request_lower_ts, drop column newest_segment_lower_ts, drop column newest_segment_upper_ts");
+    await c.query("alter table public.slack_sync_channels drop constraint slack_sync_channels_newest_cursor_history_check");
+    await runFixture(
+      "update public.slack_sync_channels set newest_cursor_history = $1::jsonb where channel_id = 'C0HIDEHIST01'",
+      [JSON.stringify(["CANARY-c-1", "CANARY-c-2"])]
+    );
+    const before = await rowsDigest();
+    const { error, notices } = await applyMigration();
+    expect(notices, "no NOTICE or WARNING on refusal").toEqual([]);
+    expect(refusalOf(error), "refused with the static AM_F2 error and no value-bearing field").toEqual(refusedWith(AM_F2));
+    expect(carriesCanary(error), "no error field carries a planted cursor canary").toBe(false);
+    expect({
+      rows: await rowsDigest(), columns: (await newColumns()).map((row) => row.name),
+      checks: (await namedConstraints()).map((row) => row.name),
+    }, "rollback from a fresh session: the row is byte-identical, the segment columns are still absent, no CHECK reinstalled").toEqual({
+      rows: before,
+      columns: NEW_COLUMNS.filter((column) => !["newest_request_lower_ts", "newest_segment_lower_ts", "newest_segment_upper_ts"].includes(column)),
+      checks: ["slack_sync_channels_historical_cursor_history_check", "slack_sync_channels_historical_progress_check"],
     });
   }, SCRATCH_TIMEOUT);
 
@@ -682,14 +894,20 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
     )).rows[0];
     expect(serialized, "fixture: PostgreSQL serializes the fixtures to the oracle's byte counts").toEqual({ at_cap: 1048576, over: 1048577 });
 
+    /** Explicit code points, so no fixture depends on how an invisible character was saved. */
+    const cp = (...points: number[]): string => String.fromCodePoint(...points);
     const cases: Record<string, unknown> = {
+      loneC1U0085: [cp(0x85)],
+      blankU2001toU2009: [cp(0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009)],
+      c0U0001: [cp(0x61, 0x01)],
+      c0TabInside: [cp(0x61, 0x09, 0x62)],
       empty: [],
       plain: ["a"],
       edgeWhitespaceKept: [" a "],
       caseDistinct: ["a", "A"],
-      nfdNfcDistinct: ["é", "é"],
-      notTrimU180E: ["᠎"],
-      notTrimU200B: ["​"],
+      nfdNfcDistinct: [cp(0x65, 0x301), cp(0xe9)], // the same code points as first written: ["é", "é"],
+      notTrimU180E: [cp(0x180e)],
+      notTrimU200B: [cp(0x200b)],
       c1Allowed: ["a\u0085"],
       bmp1024: ["a".repeat(1024)],
       astral512: ["\u{1F600}".repeat(512)],
@@ -697,12 +915,15 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
       duplicate: ["a", "a"],
       blankEmpty: [""],
       blankSpace: [" "],
-      blankNbspIdeographic: [" 　"],
-      blankU1680: [" "],
-      blankU2000toU200A: ["  "],
-      blankU2028U2029: ["  "],
-      blankU202FU205F: ["  "],
-      blankFEFF: ["﻿"],
+      blankNbspIdeographic: [cp(0xa0, 0x3000)], // the same code points as first written: [" 　"],
+      blankU1680: [cp(0x1680)], // the same code point as first written: [" "],
+      blankU2000toU200A: [cp(0x2000, 0x200a)], // the same code points as first written: ["  "],
+      blankU2028U2029: [cp(0x2028, 0x2029)],
+      // U+2028/U+2029 end a JavaScript line comment, so the originally written raw literal stays a
+      // string sample (valid since ES2019) rather than a comment; it holds the same two code points.
+      blankU2028U2029AsWritten: ["  "],
+      blankU202FU205F: [cp(0x202f, 0x205f)], // the same code points as first written: ["  "],
+      blankFEFF: [cp(0xfeff)],
       c0Control: ["a\u001f"],
       del: ["a\u007f"],
       bmp1025: ["a".repeat(1025)],
@@ -727,10 +948,11 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
       "select public.slack_channel_cursor_history_valid(null::jsonb) as valid"
     )).rows[0].valid;
     expect(decided, "the validator's exact decisions").toEqual({
+      loneC1U0085: true, blankU2001toU2009: false, c0U0001: false, c0TabInside: false,
       empty: true, plain: true, edgeWhitespaceKept: true, caseDistinct: true, nfdNfcDistinct: true,
       notTrimU180E: true, notTrimU200B: true, c1Allowed: true, bmp1024: true, astral512: true, entries1000AtByteCap: true,
       duplicate: false, blankEmpty: false, blankSpace: false, blankNbspIdeographic: false, blankU1680: false,
-      blankU2000toU200A: false, blankU2028U2029: false, blankU202FU205F: false, blankFEFF: false,
+      blankU2000toU200A: false, blankU2028U2029: false, blankU2028U2029AsWritten: false, blankU202FU205F: false, blankFEFF: false,
       c0Control: false, del: false, bmp1025: false, astral513: false, utf16NotCodePoints: false,
       entries1001: false, bytesOverCap: false, numberElement: false, nullElement: false, nestedElement: false,
       objectContainer: false, stringScalar: false, jsonNull: false, sqlNull: null,
@@ -853,20 +1075,23 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
       historical_anchor_ts: "1718900500.000000", historical_cursor: "CANARY-h-2", historical_scan_generation: 4,
       historical_oldest_seen_ts: "1718900200.000000",
       claimed_lane: "newest", lease_owner: "lease-owner-r2", lease_expires_at: LIVE_EXPIRY, lease_generation: 21, next_lane: "historical",
-      updated_at: SEEDED_UPDATED_AT,
+      updated_at: SEEDED_UPDATED_AT, ...PLANTED.C0BOTHLANE01,
     });
     await insertChannel({
       channel_id: "C0CLAIMHIST1", historical_anchor_ts: "1718900500.000000", historical_scan_generation: 2,
       claimed_lane: "historical", lease_owner: "lease-owner-r1", lease_expires_at: LIVE_EXPIRY, lease_generation: 11, next_lane: "newest",
-      updated_at: SEEDED_UPDATED_AT,
+      updated_at: SEEDED_UPDATED_AT, ...PLANTED.C0CLAIMHIST1,
     });
     await insertChannel({
       channel_id: "C0EXPIRED001", historical_anchor_ts: "1718900500.000000", historical_cursor: "CANARY-h-5", historical_scan_generation: 1,
       historical_oldest_seen_ts: "1718900300.000000",
       claimed_lane: "historical", lease_owner: "lease-owner-r5", lease_expires_at: PAST_EXPIRY, lease_generation: 9, next_lane: "newest",
-      updated_at: SEEDED_UPDATED_AT,
+      updated_at: SEEDED_UPDATED_AT, ...PLANTED.C0EXPIRED001,
     });
     await insertChannel({ channel_id: "C0IDLE000001", lease_generation: 4, next_lane: "historical", updated_at: SEEDED_UPDATED_AT });
+    const claimRows = ["C0BOTHLANE01", "C0CLAIMHIST1", "C0EXPIRED001"];
+    // Non-vacuity: the claim rows really carry the planted non-default values the digest preserves.
+    expect(await plantedProjection(claimRows), "fixture: the claim rows carry their planted attempts, error/success, certification, catch-up, metadata-owner, public, binding, due and created values").toEqual(expectedPlanted(claimRows));
     const restBefore = await unpermittedDigests();
 
     const { error, notices } = await applyMigration();
@@ -890,6 +1115,7 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
         claim: { lane: null, owner: null, expires: null, generation: 4, next: "historical" }, seeded: true }),
     ]);
     expect(await unpermittedDigests(), "every column outside the permitted restart fields is byte-identical").toEqual(restBefore);
+    expect(await plantedProjection(claimRows), "fencing kept every planted value on the claim rows").toEqual(expectedPlanted(claimRows));
 
     const afterFirst = await rowsDigest();
     const replay = await applyMigration();
@@ -908,13 +1134,27 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
       historical_completed_segments_oldest_ts: "1718900350.5", historical_oldest_seen_ts: "1718900250.000100",
       historical_cursor: "CANARY-h-1", historical_cursor_history: JSON.stringify(["CANARY-h-1"]), historical_scan_generation: 3,
       claimed_lane: "newest", lease_owner: "lease-owner-r6", lease_expires_at: LIVE_EXPIRY, lease_generation: 31, next_lane: "historical",
-      updated_at: SEEDED_UPDATED_AT,
+      updated_at: SEEDED_UPDATED_AT, ...PLANTED.C0ONELANE001,
     });
-    const newestDigest = async () => (await probe.query(
-      `select pg_catalog.md5(newest_cursor) as cursor, pg_catalog.md5(newest_cursor_history::text) as history
-         from public.slack_sync_channels where channel_id = 'C0ONELANE001'`
+    /** The newest cursor and history by SQL equality with their literals — booleans, never a hash. */
+    const newestKept = async () => (await probe.query(
+      `select newest_cursor = $2 as cursor_kept, newest_cursor_history = $3::jsonb as history_kept
+         from public.slack_sync_channels where channel_id = $1`,
+      ["C0ONELANE001", "CANARY-n-2", JSON.stringify(["CANARY-n-1", "CANARY-n-2"])]
     )).rows[0];
-    const newestBefore = await newestDigest();
+    // The ONLY columns §9 lets a history-only historical restart change.
+    const HISTORICAL_RESTART_FIELDS = ["historical_cursor", "historical_cursor_history", "historical_scan_generation", "historical_oldest_seen_ts", "updated_at"];
+    // Non-vacuity: every preservation-relevant column carries a distinctive value before the upgrade.
+    expect({
+      planted: await plantedProjection(["C0ONELANE001"]), newest: await newestKept(),
+      anchors: (await probe.query(
+        `select newest_anchor_ts, newest_lower_ts, historical_anchor_ts from public.slack_sync_channels where channel_id = 'C0ONELANE001'`
+      )).rows[0],
+    }, "fixture: the one-lane row carries its planted metadata, its newest history and both anchors").toEqual({
+      planted: expectedPlanted(["C0ONELANE001"]), newest: { cursor_kept: true, history_kept: true },
+      anchors: { newest_anchor_ts: "1718900800.000000", newest_lower_ts: "1718900700.000000", historical_anchor_ts: "1718900500.000000" },
+    });
+    const preserved = await rowExcept("C0ONELANE001", HISTORICAL_RESTART_FIELDS);
     // FIXTURE DDL: an F2 SCHEMA state missing only the historical history column (§9 history-only introduction).
     await c.query("alter table public.slack_sync_channels drop column historical_cursor_history");
 
@@ -930,13 +1170,15 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
       claimed_lane: "newest", lease_owner: "lease-owner-r6", lease_expires_at: LIVE_EXPIRY, lease_generation: 31, next_lane: "historical",
       updated_at_seeded: false,
     }]);
-    expect(await newestDigest(), "the newest cursor and history are byte-identical").toEqual(newestBefore);
+    expect(await newestKept(), "the newest cursor and history are exactly as seeded").toEqual({ cursor_kept: true, history_kept: true });
+    expect(await changedColumns("C0ONELANE001", preserved, HISTORICAL_RESTART_FIELDS),
+      "whole row: no column outside the five permitted historical restart fields changed (anchors, newest history/segments, historical bounds/aggregate and every planted value included)").toEqual([]);
     expect(await fullCatalog(), "the one-lane introduction ends at the exact accepted catalog").toEqual(EXPECTED_FULL_CATALOG);
 
     // Segment progress and MAXIMUM histories on BOTH lanes, written under the installed CHECKs.
     const newestMax = maxHistory("n");
     const historicalMax = maxHistory("h");
-    await c.query(
+    await runFixture(
       `update public.slack_sync_channels
           set newest_cursor_history = $1::jsonb, newest_cursor = $2,
               historical_cursor_history = $3::jsonb, historical_cursor = $4, historical_oldest_seen_ts = '1718900280.000000'
