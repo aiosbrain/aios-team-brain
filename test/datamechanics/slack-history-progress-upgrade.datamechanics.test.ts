@@ -180,9 +180,12 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *         · a same-name weaker CHECK over a row the canonical rejects, refused statically before
  *           any drop;
  *         · a same-name CHECK with a different definition over valid rows, replaced canonically;
- *    B7 · MR-04 injected cancellation before the block completes, real two-connection
- *         serialization, and the later-query-failure retry (committed Slack state kept, no second
- *         restart; no global-rollback claim);
+ *    B7 · DONE (continuation 3), in `slack-history-progress-conflicts`:
+ *         · cancellation INSIDE the block via both entrypoints, with rollback seen from a fresh
+ *           session;
+ *         · real two-session serialization, with exactly one restart;
+ *         · a committed mirror statement surviving a later failing migration query, then a retry
+ *           with no second restart;
  *    B8 · MR-04 marked-mirror refusal parity for the whole refusal matrix (it is representative
  *         today, in `slack-history-progress-conflicts`);
  *    C9 · DH-11: the legacy three-column test, renamed to `re-adds the three legacy

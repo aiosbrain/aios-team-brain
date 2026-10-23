@@ -145,7 +145,7 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *    identity is guaranteed, and from-zero columns sit in different attribute positions from
  *    upgraded ones. GREEN since the comment was corrected at 83162b68.
  *
- * TEST COUNT: 70 = 4 static + 66 database. The database tests are:
+ * TEST COUNT: 74 = 4 static + 70 database. The database tests are:
  *  - 17 earlier: loader catalog, direct catalog, defaulted helper, 3 state rejections, 5 persisted
  *    histories, 2 restart-hiding, validator truth table, CHECK matrix, union restart, one-lane
  *    replay;
@@ -159,7 +159,18 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *    · a same-name WEAKER CHECK over a row the canonical one rejects, refused statically BEFORE
  *      any drop, so no value-bearing 23514 failing-row DETAIL can surface (AC02);
  *    · a same-name CHECK with a different definition over VALID rows, replaced by the canonical
- *      one, committing notice-free with no row change.
+ *      one, committing notice-free with no row change;
+ *  - 4 B7 atomicity/serialization cases, with PostgreSQL-native coordination: an advisory lock, a
+ *    held table lock, and `pg_stat_activity` used only as a bounded readiness probe:
+ *    · cancellation INSIDE the block, via both entrypoints. A fixture trigger blocks the restart
+ *      UPDATE after the column introduction; `pg_cancel_backend` then gives 57014. A FRESH session
+ *      sees no introduced column, the cancelled session is usable, and every column, constraint,
+ *      routine, channel and thread row is as before;
+ *    · two REAL concurrent sessions queued on one held lock. Both commit, the active lane restarts
+ *      EXACTLY once, and the catalog is exactly the accepted one;
+ *    · a committed mirror statement, then a LATER separate failing migration query (the migration
+ *      plus a deliberate 22012). Only that query rolls back, the committed state is kept exactly,
+ *      and the retry commits with no second restart. No global rollback is claimed.
  * The two earlier UNIQUE-only wrong-kind cases are absorbed into the matrix. Intended REDs at
  * 83162b68: none.
  *
@@ -183,9 +194,7 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *  - MR-04 refusals not yet exercised:
  *    · the WHOLE `schema.sql` file as a refusal entrypoint, and exhaustive (not representative)
  *      mirror-statement coverage;
- *    · identity metadata (not representable on PostgreSQL 16; see above);
- *    · injected cancellation, real concurrent sessions (serialization) and retry after a later
- *      migration query fails.
+ *    · identity metadata (not representable on PostgreSQL 16; see above).
  *  - DH-11: the §9 named tests in the source-fences/upgrade files, including renaming the legacy
  *    three-column replay test to `re-adds the three legacy metadata/provisional columns without
  *    restarting an initialized segment`, and maximum histories through unrelated writers.
@@ -571,6 +580,7 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
   let c: Client; // runs the migration (notices captured here)
   let probe: Client; // a second session: every post-migration inspection
   let fromZero: Record<string, unknown> = {};
+  let scratchUrl = ""; // the scratch database, for the extra sessions the MR-04 B7 cases open
   const migration = migrationText;
 
   const newColumns = async () => (await probe.query(
@@ -729,6 +739,7 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
     adminUrl = created.adminUrl;
     scratch = name;
     const url = created.url;
+    scratchUrl = url;
     await loadSchema({ cwd: process.cwd(), databaseUrl: url, logger: { log: () => {} } });
     c = new Client({ connectionString: url });
     probe = new Client({ connectionString: url });
@@ -1148,6 +1159,147 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
       expect(await namedConstraints(), `${entry}: all four named CHECKs are exactly the accepted definitions, validated`).toEqual(EXPECTED_NAMED_CHECKS);
       expect({ channels: await rowsDigest(), threads: await threadsDigest() }, `${entry}: every channel and thread row is unchanged`).toEqual(before);
     }, SCRATCH_TIMEOUT);
+
+  // ── MR-04 B7: interruption inside the block, real two-session serialization, and a later failing query ──
+
+  /**
+   * Bounded readiness probe: is backend `pid` waiting on a lock of class `wait`? It only decides
+   * WHEN to act. The oracles are the committed or rolled-back catalog and rows read afterwards.
+   */
+  const waitForLockWait = async (pid: number, wait: "advisory" | "relation"): Promise<boolean> => {
+    for (let attempt = 0; attempt < 400; attempt += 1) {
+      const { rows } = await probe.query<{ waiting: boolean }>(
+        `select exists (select 1 from pg_catalog.pg_stat_activity
+                         where pid = $1 and wait_event_type = 'Lock' and wait_event = $2) as waiting`, [pid, wait]);
+      if (rows[0].waiting) return true;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return false;
+  };
+  const backendPid = async (client: Client): Promise<number> =>
+    (await client.query<{ pid: number }>("select pg_catalog.pg_backend_pid() as pid")).rows[0].pid;
+  const historicalGeneration = async (): Promise<number> => (await probe.query<{ g: number }>(
+    "select historical_scan_generation::int as g from public.slack_sync_channels where channel_id = $1", [BASE_CHANNEL]
+  )).rows[0].g;
+  /** One execution of `sql` on `client`, notices captured; the error object is returned, never printed. */
+  const runOn = async (client: Client, sql: string): Promise<{ error: unknown; notices: string[] }> => {
+    const notices: string[] = [];
+    const onNotice = (notice: { message?: string }): void => {
+      notices.push(notice.message ?? "");
+    };
+    client.on("notice", onNotice);
+    try {
+      await client.query(sql);
+      return { error: null, notices };
+    } catch (error) {
+      return { error, notices };
+    } finally {
+      client.removeListener("notice", onNotice);
+    }
+  };
+  const codeOf = (error: unknown): unknown => (error === null ? "committed" : (error as { code?: unknown })?.code ?? null);
+
+  it.each(["migration", "schema mirror"] as Entry[])(
+    "MR-04 B7 %s cancelled INSIDE the block, after it has added columns, rolls back whole, observed from a fresh usable session",
+    async (entry) => {
+      await resetToPreF2();
+      await plantBaseline("pre-F2");
+      const holder = new Client({ connectionString: scratchUrl });
+      await holder.connect();
+      try {
+        // FIXTURE: a row trigger that waits on a transaction advisory lock, so the block blocks
+        // inside its restart UPDATE, after its column introduction and constraint drops.
+        await c.query(`create function public.mr04_fixture_wait() returns trigger language plpgsql
+                         as $$ begin perform pg_catalog.pg_advisory_xact_lock(711170); return new; end $$`);
+        await c.query("create trigger mr04_fixture_wait before update on public.slack_sync_channels for each row execute function public.mr04_fixture_wait()");
+        const before = await refusalEvidence();
+        await holder.query("begin");
+        await holder.query("select pg_catalog.pg_advisory_xact_lock(711170)");
+        const pid = await backendPid(c);
+        const pending = applyEntry(entry);
+        expect(await waitForLockWait(pid, "advisory"), `${entry}: the block reached its restart UPDATE and is blocked inside it`).toBe(true);
+        expect((await probe.query<{ cancelled: boolean }>("select pg_catalog.pg_cancel_backend($1) as cancelled", [pid])).rows[0].cancelled,
+          `${entry}: the backend was cancelled`).toBe(true);
+        const { error, notices } = await pending;
+        await holder.query("rollback");
+        expect({ code: codeOf(error), canary: carriesCanary(error), notices }, `${entry}: the statement was cancelled (57014), with no canary and no notice`).toEqual({
+          code: "57014", canary: false, notices: [],
+        });
+        // A FRESH session sees nothing of the interrupted block, and the cancelled session is still usable.
+        const fresh = new Client({ connectionString: scratchUrl });
+        await fresh.connect();
+        try {
+          expect((await fresh.query<{ n: number }>(
+            `select pg_catalog.count(*)::int as n from pg_catalog.pg_attribute
+              where attrelid = 'public.slack_sync_channels'::regclass and not attisdropped and attname = any($1::text[])`, [NEW_COLUMNS]
+          )).rows[0].n, `${entry}: a fresh session sees none of the eight introduced columns`).toBe(0);
+        } finally {
+          await fresh.end().catch(() => {});
+        }
+        expect((await c.query<{ ok: number }>("select 1 as ok")).rows[0].ok, `${entry}: the cancelled session is usable`).toBe(1);
+        expect(await refusalEvidence(), `${entry}: rollback — every column, constraint, routine, owned function, channel and thread row as before`).toEqual(before);
+      } finally {
+        await holder.query("rollback").catch(() => {});
+        await holder.end().catch(() => {});
+        await c.query("drop trigger if exists mr04_fixture_wait on public.slack_sync_channels").catch(() => {});
+        await c.query("drop function if exists public.mr04_fixture_wait()").catch(() => {});
+      }
+    }, SCRATCH_TIMEOUT);
+
+  it("MR-04 B7 two concurrent migrations serialize on the table lock: both commit and the active lane restarts EXACTLY once", async () => {
+    await resetToPreF2();
+    await plantBaseline("pre-F2");
+    const generationBefore = await historicalGeneration();
+    const blocker = new Client({ connectionString: scratchUrl });
+    const second = new Client({ connectionString: scratchUrl });
+    await blocker.connect();
+    await second.connect();
+    try {
+      // Both executions queue behind one held ACCESS SHARE lock, then race for ACCESS EXCLUSIVE.
+      await blocker.query("begin");
+      await blocker.query("lock table public.slack_sync_channels in access share mode");
+      const firstPid = await backendPid(c);
+      const secondPid = await backendPid(second);
+      const first = runOn(c, migration);
+      const other = runOn(second, migration);
+      expect({ first: await waitForLockWait(firstPid, "relation"), second: await waitForLockWait(secondPid, "relation") },
+        "both executions are waiting on the table lock").toEqual({ first: true, second: true });
+      await blocker.query("commit");
+      const [a, b] = await Promise.all([first, other]);
+      expect({ first: codeOf(a.error), second: codeOf(b.error), notices: [...a.notices, ...b.notices] },
+        "both serialized executions commit with no notice").toEqual({ first: "committed", second: "committed", notices: [] });
+      expect(await historicalGeneration(), "the active historical lane restarted EXACTLY once").toBe(generationBefore + 1);
+      expect(await fullCatalog(), "the serialized pair leaves exactly the accepted catalog").toEqual(EXPECTED_FULL_CATALOG);
+      expect(await plantedProjection([BASE_CHANNEL]), "the planted metadata survived both executions").toEqual(expectedPlanted([BASE_CHANNEL]));
+    } finally {
+      await blocker.query("rollback").catch(() => {});
+      await blocker.end().catch(() => {});
+      await second.end().catch(() => {});
+    }
+  }, SCRATCH_TIMEOUT);
+
+  it("MR-04 B7 a committed mirror statement survives a LATER failing migration query, and the retry commits with no second restart", async () => {
+    await resetToPreF2();
+    await plantBaseline("pre-F2");
+    const generationBefore = await historicalGeneration();
+    // 1. The mirror statement commits: the one-time introduction and restart.
+    expect(codeOf((await applyEntry("schema mirror")).error), "the mirror statement commits").toBe("committed");
+    const committed = { channels: await rowsDigest(), threads: await threadsDigest(), catalog: await fullCatalog() };
+    expect({ generation: await historicalGeneration(), catalog: committed.catalog }, "the committed introduction restarted once and left the accepted catalog").toEqual({
+      generation: generationBefore + 1, catalog: EXPECTED_FULL_CATALOG,
+    });
+    // 2. A LATER, separate migration query fails deliberately: the migration file followed by a failing statement.
+    const failing = await runOn(c, `${migration}\nselect pg_catalog.int4div(1, 0);\n`);
+    expect({ code: codeOf(failing.error), canary: carriesCanary(failing.error) }, "the later query fails on its own deliberate error").toEqual({ code: "22012", canary: false });
+    // Only THAT query rolled back; the earlier committed query is untouched. No global rollback is claimed.
+    expect({ channels: await rowsDigest(), threads: await threadsDigest(), catalog: await fullCatalog() },
+      "the committed Slack state survives the later failure exactly, updated_at included").toEqual(committed);
+    // 3. The retry commits with no second restart: complete rows exact.
+    const retry = await applyEntry("migration");
+    expect({ code: codeOf(retry.error), notices: retry.notices }, "the retry commits with no notice").toEqual({ code: "committed", notices: [] });
+    expect({ channels: await rowsDigest(), threads: await threadsDigest(), catalog: await fullCatalog(), generation: await historicalGeneration() },
+      "after the retry every row is exact (no second restart) and the catalog is the accepted one").toEqual({ ...committed, generation: generationBefore + 1 });
+  }, SCRATCH_TIMEOUT);
 
   // ── MR-04 / §4 STATE REJECTION MATRIX, pre-F2 introduction ──
 
