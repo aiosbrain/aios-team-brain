@@ -1,0 +1,16 @@
+-- AIO-1170 AM-F2 + AC-02 deep history: bounded Slack cursor histories and timestamp segments
+-- for public.slack_sync_channels (accepted consolidated contract
+-- `aio1170-am-f2-deep-history-consolidated-accepted-spec-migration-v1-20261023.md`, §9 and §9.3).
+--
+-- RED CHECKPOINT SCAFFOLD — THIS FILE IS INTENTIONALLY COMMENT-ONLY.
+--
+-- Its executable body — ONE self-contained atomic DO statement, byte-identical to the block
+-- between `-- slack-channel-history-segments-upgrade:begin` and
+-- `-- slack-channel-history-segments-upgrade:end` in postgres/schema.sql — is deliberately absent
+-- at this red checkpoint. The file exists so that direct-upgrade red evidence fails on missing
+-- catalog and state effects with the file readable, never on file access or parsing (MR-05).
+--
+-- This scaffold is NOT a completed migration. It must be replaced by the full reviewed
+-- implementation before any green checkpoint or publication. Ownership: PR714 owns this file and
+-- the bounded Slack history/segment block it will carry; PR743 retains Drive schema/migrations and
+-- the loader/pool. Nothing here is wired or activated.
