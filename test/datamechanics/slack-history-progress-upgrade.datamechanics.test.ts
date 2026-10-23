@@ -1081,8 +1081,9 @@ const variantThread = (id: string, channel: string, root: string, due: string, c
 /**
  * SEGMENT-ONLY introduction on an F2-only SCHEMA. Both histories, the validator and both history
  * CHECKs exist and are valid; the six segment/progress columns and both progress CHECKs are absent.
- * Both lanes' segment units are absent, so EVERY active lane restarts, including the
- * maximum-history lane and the cursor-null live claim.
+ * Both lanes' segment units are absent, so EVERY active lane restarts. One row restarts both lanes
+ * under a live newest claim while its historical lane is cursor-null; the maximum-history lane,
+ * under a live historical claim, is covered too.
  */
 const segmentOnlyVariant = (historicalMax: string[]): IntroductionVariant => ({
   label: "segment_only",
