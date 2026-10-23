@@ -170,15 +170,21 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *      one, committing notice-free with no row change;
  *  - 4 B7 atomicity/serialization cases, with PostgreSQL-native coordination: an advisory lock, a
  *    held table lock, and `pg_stat_activity` used only as a bounded readiness probe:
- *    · cancellation INSIDE the block, via both entrypoints. A fixture trigger blocks the restart
- *      UPDATE after the column introduction; `pg_cancel_backend` then gives 57014. A FRESH session
- *      sees no introduced column, the cancelled session is usable, and every column, constraint,
- *      routine, channel and thread row is as before;
- *    · two REAL concurrent sessions queued on one held lock. Both commit, the active lane restarts
- *      EXACTLY once, and the catalog is exactly the accepted one;
- *    · a committed mirror statement, then a LATER separate failing migration query (the migration
- *      plus a deliberate 22012). Only that query rolls back, the committed state is kept exactly,
- *      and the retry commits with no second restart. No global rollback is claimed.
+ *    · cancellation INSIDE the block (2 tests: the migration file, and the marked mirror
+ *      statement). A fixture trigger blocks the restart UPDATE after the column introduction;
+ *      `pg_cancel_backend` then gives 57014. A FRESH session sees no introduced column, the
+ *      cancelled session is usable, and every column, constraint, routine, channel and thread row
+ *      is as before;
+ *    · concurrency (1 test): TWO MIGRATION-FILE executions in two real sessions, queued on one
+ *      held lock. Both commit, the active lane restarts EXACTLY once, and the catalog is exactly
+ *      the accepted one. The mirror statement is not in this case;
+ *    · later-query failure (1 test), in three steps:
+ *      1. the repository's COMPLETE real deploy-loader query (whole schema.sql, then every
+ *         migration) commits the introduction;
+ *      2. a SEPARATE later query, the migration file plus a deliberate 22012, fails. Only that
+ *         query rolls back, and the loader-committed state is kept exactly;
+ *      3. a MIGRATION-FILE retry commits with no second restart.
+ *      No global rollback is claimed. Failures surface only as SQLSTATEs.
  * The two earlier UNIQUE-only wrong-kind cases are absorbed into the matrix. Intended REDs at
  * 83162b68: none.
  *
@@ -1387,12 +1393,14 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
     }
   }, SCRATCH_TIMEOUT);
 
-  it("MR-04 B7 a committed mirror statement survives a LATER failing migration query, and the retry commits with no second restart", async () => {
+  it("MR-04 B7 a committed COMPLETE deploy-loader query survives a LATER failing migration query, and the retry commits with no second restart", async () => {
     await resetToPreF2();
     await plantBaseline("pre-F2");
     const generationBefore = await historicalGeneration();
-    // 1. The mirror statement commits: the one-time introduction and restart.
-    expect(codeOf((await applyEntry("schema mirror")).error), "the mirror statement commits").toBe("committed");
+    // 1. The repository's COMPLETE real deploy loader commits: the whole schema.sql, whose mirrored
+    //    block performs the one-time introduction and restart, then every migration. A loader
+    //    failure is reduced to its SQLSTATE by codeOf: the raw error never prints.
+    expect(codeOf((await applyEntry("full loader")).error), "the complete deploy-loader query commits").toBe("committed");
     const committed = { channels: await rowsDigest(), threads: await threadsDigest(), catalog: await fullCatalog() };
     expect({ generation: await historicalGeneration(), catalog: committed.catalog }, "the committed introduction restarted once and left the accepted catalog").toEqual({
       generation: generationBefore + 1, catalog: EXPECTED_FULL_CATALOG,
@@ -1400,7 +1408,7 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
     // 2. A LATER, separate migration query fails deliberately: the migration file followed by a failing statement.
     const failing = await runOn(c, `${migration}\nselect pg_catalog.int4div(1, 0);\n`);
     expect({ code: codeOf(failing.error), canary: carriesCanary(failing.error) }, "the later query fails on its own deliberate error").toEqual({ code: "22012", canary: false });
-    // Only THAT query rolled back; the earlier committed query is untouched. No global rollback is claimed.
+    // Only THAT query rolled back; the earlier committed loader query is untouched. No global rollback is claimed.
     expect({ channels: await rowsDigest(), threads: await threadsDigest(), catalog: await fullCatalog() },
       "the committed Slack state survives the later failure exactly, updated_at included").toEqual(committed);
     // 3. The retry commits with no second restart: complete rows exact.

@@ -180,12 +180,17 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *         · a same-name weaker CHECK over a row the canonical rejects, refused statically before
  *           any drop;
  *         · a same-name CHECK with a different definition over valid rows, replaced canonically;
- *    B7 · DONE (continuation 3), in `slack-history-progress-conflicts`:
- *         · cancellation INSIDE the block via both entrypoints, with rollback seen from a fresh
- *           session;
- *         · real two-session serialization, with exactly one restart;
- *         · a committed mirror statement surviving a later failing migration query, then a retry
- *           with no second restart;
+ *    B7 · DONE (continuations 3 and 5), in `slack-history-progress-conflicts`:
+ *         · cancellation INSIDE the block through the migration file AND the marked mirror
+ *           statement, with rollback seen from a fresh session;
+ *         · concurrency through TWO MIGRATION-FILE executions in real sessions, with exactly one
+ *           restart;
+ *         · later-query failure: a committed COMPLETE deploy-loader query, then a separate failing
+ *           migration+22012 query that rolls back only itself, then a migration-file retry with
+ *           no second restart.
+ *         Not every B7 case runs through both entrypoints. The populated full-loader replays in
+ *         this file go through a sanitized wrapper that reports only success, SQLSTATE and field
+ *         presence;
  *    B8 · DONE (continuation 4), in `slack-history-progress-conflicts`. Marked-mirror refusal is
  *         EXHAUSTIVE: the matrix, the state refusals, and twins of every dedicated migration-only
  *         refusal. The REAL deploy loader refuses a representative five (whole-loader refusal for
@@ -764,6 +769,28 @@ const logicalRows = (evidence: OrderEvidence) => ({
   threads: evidence.threads,
 });
 
+/**
+ * A populated FULL-LOADER replay whose failure can never print data. On error, the raw
+ * PostgreSQL error stays in memory only. The returned diagnostic carries at most the SQLSTATE
+ * and the PRESENCE (booleans) of its diagnostic fields, never a message, detail, hint, query,
+ * row, cursor, token or member value. Success is exactly `{ outcome: "committed" }`.
+ */
+async function sanitizedLoaderReplay(
+  loadSchema: (options: Record<string, unknown>) => Promise<void>, databaseUrl: string,
+): Promise<Record<string, unknown>> {
+  try {
+    await loadSchema({ cwd: process.cwd(), databaseUrl, logger: { log: () => {} } });
+    return { outcome: "committed" };
+  } catch (error) {
+    const e = (error ?? {}) as Record<string, unknown>;
+    return {
+      outcome: "failed", code: typeof e.code === "string" ? e.code : null,
+      detail: e.detail !== undefined, hint: e.hint !== undefined, schema: e.schema !== undefined, table: e.table !== undefined,
+      column: e.column !== undefined, dataType: e.dataType !== undefined, constraint: e.constraint !== undefined,
+    };
+  }
+}
+
 type OrderEntry = "migration" | "mirror";
 type OrderRun = { introducedLogical: unknown; introducedCatalog: unknown; progressedRows: unknown; progressedCatalog: unknown };
 
@@ -921,7 +948,7 @@ describe("AM-F2 + AC-02 history/segment block — MR-03 statement order: migrati
             }
             // ── The FULL deploy loader (schema.sql, then every migration) replayed over the populated, progressed rows. ──
             // The loader opens its OWN fresh session; this session is idle, so it holds no lock the loader needs.
-            await loadSchema({ cwd: process.cwd(), databaseUrl: scratch.url, logger: { log: () => {} } });
+            expect(await sanitizedLoaderReplay(loadSchema, scratch.url), `${label}: the full-loader replay over progress commits`).toEqual({ outcome: "committed" });
             expect(exactRows(await orderEvidence(c)), `${label}: after a full-loader replay over progress and maximum histories, every row is exact, updated_at included`).toEqual(exactRows(progressed));
             expect(await slackCatalog(c), `${label}: after a full-loader replay over progress, the Slack catalog is unchanged`).toEqual(progressedCatalog);
 
@@ -1440,7 +1467,7 @@ async function runIntroductionVariant(variant: IntroductionVariant): Promise<voi
           expect(await slackCatalog(c), `${run}: after the ${entry} replay over progress, the Slack catalog is still the accepted one`).toEqual(referenceCatalog);
         }
         // ── The FULL deploy loader replayed over the populated, progressed rows, on its own fresh session. ──
-        await loadSchema({ cwd: process.cwd(), databaseUrl: url, logger: { log: () => {} } });
+        expect(await sanitizedLoaderReplay(loadSchema, url), `${run}: the full-loader replay over progress commits`).toEqual({ outcome: "committed" });
         expect(exactRows(await orderEvidence(c)), `${run}: after a full-loader replay over progress, every row is exact, updated_at included`).toEqual(exactRows(progressed));
         expect(await slackCatalog(c), `${run}: after a full-loader replay over progress, the Slack catalog is still the accepted one`).toEqual(referenceCatalog);
         runs[label] = {
