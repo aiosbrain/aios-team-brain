@@ -131,11 +131,71 @@ interface GdriveIngestCommit {
 interface IngestInternalOptions {
   transactionBound?: boolean;
   concurrencyHooks?: IngestConcurrencyHooks;
-  /** Set only by `ingestGdriveApiItem`. Named, so it never competes for a positional slot. */
+  /** Set only by `ingestGdriveApiItem`. Named, so it never competes for a positional slot. It is
+   * authority only when it is a commit that owner minted (`fencedDriveCommits`); a lookalike object
+   * is refused. */
   gdrive?: GdriveIngestCommit;
-  /** Set only by `ingestApiItem` for a payload that is not Drive-sourced: the refusal to raise when
-   * the row this ingest locks turns out to be Drive-owned. */
-  refuseDriveOwnedTarget?: () => Error;
+  /** The ERROR to raise when the locked target is Drive-owned — its shape only. The refusal itself is
+   * unconditional for every writer that is not a fenced Drive commit; omitting this changes nothing
+   * but the error (`connector_principal_required`). */
+  driveOwnedRefusal?: () => Error;
+}
+
+/**
+ * The Drive commits `ingestGdriveApiItem` minted inside a validated `withGdriveExecutionCommit`.
+ * Module-private: no other caller can obtain or forge a member, so passing `_internal.gdrive` is not
+ * itself authority — being minted here is.
+ */
+const fencedDriveCommits = new WeakSet<GdriveIngestCommit>();
+
+/**
+ * THE Drive-ownership refusal of the common writer (AIO-1167). Every write that is not a fenced
+ * Drive commit — a direct internal caller (`note.create`, meetings, connectors, the scanner), the
+ * public owner for a non-Drive payload, or a direct Drive-sourced payload — is refused when its
+ * canonical target belongs to Google Drive. Decided on the row this transaction has just locked,
+ * before any changed or unchanged item, version, provenance, audience or attribution write; a refusal
+ * rolls back everything the attempt had already done (project timestamp, pointer, mapping metadata).
+ *
+ * Refused when any of:
+ *   · the PAYLOAD is Drive content (`frontmatter.source === 'gdrive'`) — always, whether it would
+ *     update, create a never-seen document under an id this transaction minted, or restore a
+ *     tombstone. Every Drive content write goes through the fenced commit; a minted id is not authority;
+ *   · the locked row's STORED provenance says `gdrive`;
+ *   · a same-team `source_item_mappings(source='gdrive')` row names the item — whatever its legacy
+ *     `connection_id` (null for every claimed document), whatever the row's own frontmatter now says
+ *     (missing or relabelled), and whether or not any claim is active or its connector is enabled.
+ * Incoming provenance, action policy, an API key and a caller-set option are never authority.
+ */
+async function assertNotDriveOwnedTarget(
+  db: DbClient,
+  input: {
+    teamId: string;
+    existing: { id: string; frontmatter: unknown } | null;
+    driveProvenance: boolean;
+    refusal: () => Error;
+  },
+): Promise<void> {
+  let owned: boolean;
+  if (input.driveProvenance) {
+    owned = true;
+  } else if (!input.existing) {
+    // A fresh id minted for a non-Drive create: nothing can map it.
+    owned = false;
+  } else {
+    const stored = isRecord(input.existing.frontmatter) ? input.existing.frontmatter : {};
+    owned = stored.source === "gdrive";
+    if (!owned) {
+      const { data, error } = await db
+        .from("source_item_mappings")
+        .select("provider_id")
+        .eq("team_id", input.teamId)
+        .eq("source", "gdrive")
+        .eq("item_id", input.existing.id);
+      if (error) throw new Error(`Drive ownership read failed: ${error.message}`);
+      owned = ((data ?? []) as unknown[]).length > 0;
+    }
+  }
+  if (owned) throw input.refusal();
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -198,9 +258,10 @@ export async function ingestApiItem(
   //
   // So this read is unlocked, and it may only REFUSE: a Drive-owned row at the path is turned away
   // before any project is touched. It authorizes nothing. The decision that counts is made by
-  // `ingestItem` on the row it has locked (`refuseDriveOwnedTarget`), inside the project → path →
-  // attribution → item boundary. Ownership is the provider mapping (whatever its legacy
-  // `connection_id`, which is null for every claimed document) or the stored provenance.
+  // `ingestItem` for EVERY writer on the row it has locked (`assertNotDriveOwnedTarget`), inside the
+  // project → path → attribution → item boundary; this wrapper only chooses the error's shape.
+  // Ownership is the provider mapping (whatever its legacy `connection_id`, which is null for every
+  // claimed document) or the stored provenance.
   const { rows } = await runSql<{ item_source: string | null; drive_mapped: boolean }>(
     `select i.frontmatter->>'source' as item_source,
             exists(select 1 from source_item_mappings m
@@ -214,7 +275,7 @@ export async function ingestApiItem(
   }
   return ingestItem(db,auth,rawPayload,access,opts,pusherTier,undefined,{
     concurrencyHooks,
-    refuseDriveOwnedTarget:()=>driveOwnedTargetRefusal(execution),
+    driveOwnedRefusal:()=>driveOwnedTargetRefusal(execution),
   });
 }
 
@@ -336,6 +397,19 @@ async function ingestGdriveApiItem(
         lockedProjectIds: new Set(audience.lockedProjects.keys()),
         hooks: concurrencyHooks,
       });
+      // Minted HERE, inside the validated execution commit, and nowhere else: the one capability
+      // the common writer accepts as Drive content-write authority.
+      const gdriveCommit: GdriveIngestCommit = {
+        claim: {
+          integrationId: ref.integrationId,
+          providerId,
+          generation: ref.generation,
+          audienceProjectIds: audience.projectIds,
+        },
+        storageProjectId,
+        locks,
+      };
+      fencedDriveCommits.add(gdriveCommit);
       return ingestItem(
         db,
         auth,
@@ -350,16 +424,7 @@ async function ingestGdriveApiItem(
         {
           transactionBound: true,
           concurrencyHooks: { afterAttributionRead: concurrencyHooks.afterAttributionRead },
-          gdrive: {
-            claim: {
-              integrationId: ref.integrationId,
-              providerId,
-              generation: ref.generation,
-              audienceProjectIds: audience.projectIds,
-            },
-            storageProjectId,
-            locks,
-          },
+          gdrive: gdriveCommit,
         },
       );
     }, {
@@ -452,6 +517,10 @@ export async function ingestItem(
   _internal: IngestInternalOptions = {},
 ): Promise<IngestResult> {
   const mappingRevision=opts?.mappingRevision;
+  // Drive content-write authority is a commit the fenced owner minted, never an object a caller built.
+  if (_internal.gdrive && !fencedDriveCommits.has(_internal.gdrive)) {
+    throw driveOwnedTargetRefusal(undefined);
+  }
   const gdriveCommit = _internal.gdrive;
   // Every production caller receives one transaction. It is the lifetime of both the canonical item
   // attribution lock and all item/version/contribution writes. Unit DbClient fakes deliberately skip
@@ -537,7 +606,9 @@ export async function ingestItem(
         // (It used to take its path first and reach the mapping afterwards: against a fenced
         // commit requested from another project, each then held what the other needed next.)
         // No connection authority is taken, and no claim is touched: this is not a commit. A plan
-        // its locks do not confirm abandons the ingest; nothing here retries it.
+        // its locks do not confirm abandons the ingest; nothing here retries it. Having taken them,
+        // it is REFUSED on its locked target (`assertNotDriveOwnedTarget`) — a direct writer never
+        // writes Drive content, not even a first creation — and everything it did rolls back.
         driveLocks = await lockGdriveIngestIdentities({
           plan: acquired.drivePlan,
           lockedProjectIds,
@@ -816,23 +887,19 @@ export async function ingestItem(
   if (_internal.transactionBound) {
     await _internal.concurrencyHooks?.afterAttributionRead?.(canonicalItemId);
   }
-  if (existing && _internal.refuseDriveOwnedTarget) {
-    // AUTHORITATIVE Drive-ownership decision for a payload that is not Drive-sourced, made on the
-    // row this ingest has locked — not on the public owner's unlocked pre-read. Ownership is the
-    // provider MAPPING for this item, not what the row says about itself: stored provenance can be
-    // missing or altered, and a mapping's legacy `connection_id` is null for every document a
-    // connection has claimed since claims existed. Either signal alone is enough to refuse.
-    const lockedFrontmatter = isRecord(existing.frontmatter) ? existing.frontmatter : {};
-    let driveOwned = lockedFrontmatter.source === "gdrive";
-    if (!driveOwned) {
-      const { rows: mappings } = await session.executeSql<{ provider_id: string }>(
-        `select provider_id from source_item_mappings
-          where team_id=$1 and source='gdrive' and item_id=$2`,
-        [auth.teamId, existing.id],
-      );
-      driveOwned = mappings.length > 0;
-    }
-    if (driveOwned) throw _internal.refuseDriveOwnedTarget();
+  if (!gdriveCommit) {
+    // AUTHORITATIVE and UNCONDITIONAL: the common writer's Drive-ownership decision, made on the row
+    // this ingest has just locked — not on any caller's unlocked pre-read, and not left to a caller
+    // to remember. Only a fenced Drive commit (above) writes Drive content or a Drive-owned item —
+    // a Drive-sourced payload is refused here even for a first creation or a tombstone restore, after
+    // taking the same locks a fenced commit takes. Nothing below this line has written the item, its
+    // versions, provenance, audience or attribution yet; what was written above rolls back.
+    await assertNotDriveOwnedTarget(db, {
+      teamId: auth.teamId,
+      existing,
+      driveProvenance: requestedPayload.frontmatter?.source === "gdrive",
+      refusal: _internal.driveOwnedRefusal ?? (() => driveOwnedTargetRefusal(undefined)),
+    });
   }
   if (driveLocks && !existing
       && !driveLocks.pathKeys.has(

@@ -1203,9 +1203,13 @@ describe("a DIRECT Drive ingest takes the fenced order: provider → mapping →
     expect(which(work, (e) => /gdrive_item_claims|gdrive_item_claim_projects|gdrive_connection_authority/.test(e.sql))).toEqual([]);
   };
 
-  it("ABSENT MAPPING: provider advisory, then the (absent) mapping row, then both paths — and only then is the mapping created, with no connection id", async () => {
+  it("ABSENT MAPPING: provider advisory, then the (absent) mapping row, then both paths — and only then is the (rolled-back) mapping written, with no connection id, before the refusal", async () => {
     const c = use(new ScriptedConnection(directDatabase()));
-    await direct();
+    const outcome = await direct();
+    // AIO-1167: having taken the fenced order, the direct writer is refused on its locked target —
+    // even for a first creation under an id it minted — and commits nothing.
+    expect(outcome).toMatchObject({ code: "connector_principal_required", status: 403 });
+    expect(c.count("commit")).toBe(0);
 
     const work = c.work;
     const order = [

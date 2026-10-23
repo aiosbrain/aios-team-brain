@@ -19,6 +19,7 @@ import {
   ingest,
   seedTeam,
   transactionSessionDecoratedDb,
+  driveFixture,
   type Seed,
 } from "./helpers";
 
@@ -102,10 +103,11 @@ interface DriveDoc { itemId: string; providerId: string; integrationId: string }
 async function claimedDriveDoc(seed: Seed, audienceProjectId: string): Promise<DriveDoc> {
   const providerId = `doc-${randomUUID().slice(0, 12)}`;
   const integrationId = await connection(seed, audienceProjectId);
-  const item = await ingest(seed, {
+  // Written by the fenced commit (the one Drive content writer); the claim under test is recorded below.
+  const item = await driveFixture(seed, {
     project: "drive-storage", path: `gdrive/${providerId}.md`, body: `Drive body ${providerId}`,
-    access: "external", frontmatter: { source: "gdrive", source_id: providerId, title: providerId },
-  });
+    frontmatter: { source: "gdrive", source_id: providerId, title: providerId },
+  }, { unclaimed: true });
   await recordGdriveItemClaim(db(), {
     teamId: seed.teamId, integrationId, providerId, itemId: item.id, generation: 1,
     audienceProjectIds: [audienceProjectId],

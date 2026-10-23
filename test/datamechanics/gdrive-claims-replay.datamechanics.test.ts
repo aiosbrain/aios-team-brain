@@ -118,21 +118,35 @@ async function pushDoc(c: Connection, providerId: string, body: string) {
 }
 
 /**
- * A Drive document as it was stored BEFORE claims existed: team tier, written by an ordinary
- * principal, its provider mapping carrying (or not) the connection it came through.
+ * A Drive document as it was stored BEFORE claims existed: team tier, no claim, no claim placement,
+ * no connection in its provenance, its provider mapping carrying (or not) the connection it came
+ * through. The content is written by the fenced commit — the only Drive content writer (AIO-1167) —
+ * and then reduced to that legacy shape: its claim and claim placement deleted, its tier
+ * and provenance set back to what a pre-claims writer left.
  */
-async function preClaimsDoc(seed: Seed, providerId: string, connectionId: string | null): Promise<string> {
+async function preClaimsDoc(c: Connection, seed: Seed, providerId: string, connectionId: string | null): Promise<string> {
   const body = `pre-claims ${providerId}`;
-  const result = await ingestItem(
-    db(), { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: randomUUID() },
-    {
-      project: "drive-legacy", path: `gdrive/${providerId}.md`, kind: "deliverable", access: "team", actor: "legacy",
-      body, content_sha256: sha(body), frontmatter: driveFrontmatter(providerId, editor()),
-    } as ItemPayload,
-    "team",
-  );
-  await getPool().query("update items set access='team' where id=$1", [result.id]);
-  await getPool().query(
+  const payload = {
+    project: "drive-legacy", path: `gdrive/${providerId}.md`, kind: "deliverable", access: "team", actor: "legacy",
+    body, content_sha256: sha(body), frontmatter: driveFrontmatter(providerId, editor(), c.integrationId),
+  } as ItemPayload;
+  const result = await ingestApiItem(db(), c.auth, payload, "team", { authorMemberId: seed.memberId }, "team", c.execution);
+  const pool = getPool();
+  await pool.query("delete from gdrive_item_claims where team_id=$1 and provider_id=$2", [seed.teamId, providerId]);
+  await pool.query(
+    `delete from project_context_memberships m
+      using project_context_units u
+      where u.team_id=m.team_id and u.id=m.context_unit_id and u.team_id=$1 and u.source_item_id=$2
+        and m.method='gdrive_claim'`,
+    [seed.teamId, result.id]);
+  await pool.query(
+    "update items set access='team', frontmatter=frontmatter - 'connection_id' where id=$1", [result.id]);
+  await pool.query(
+    "update item_versions set frontmatter=frontmatter - 'connection_id' where item_id=$1", [result.id]);
+  await pool.query(
+    "update project_context_units set audience='team' where team_id=$1 and source_item_id=$2",
+    [seed.teamId, result.id]);
+  await pool.query(
     "update source_item_mappings set connection_id=$3 where team_id=$1 and source='gdrive' and provider_id=$2",
     [seed.teamId, providerId, connectionId]);
   return result.id;
@@ -191,9 +205,9 @@ describe("AIO-1167 the claims migration replays as a no-op over converged active
     ));
     // Pre-claims rows, all TEAM tier: one the migration adopts (its mapping names the connection),
     // one it cannot (no connection on the mapping), and one with only an INACTIVE claim.
-    const adoptable = await preClaimsDoc(seed, "adoptable", c.integrationId);
-    const unclaimed = await preClaimsDoc(seed, "unclaimed", null);
-    const inactiveOnly = await preClaimsDoc(seed, "inactive-only", null);
+    const adoptable = await preClaimsDoc(c, seed, "adoptable", c.integrationId);
+    const unclaimed = await preClaimsDoc(c, seed, "unclaimed", null);
+    const inactiveOnly = await preClaimsDoc(c, seed, "inactive-only", null);
     await getPool().query(
       `insert into gdrive_item_claims (team_id, integration_id, provider_id, item_id, active, generation, revoked_at)
        values ($1, $2, 'inactive-only', $3, false, $4, now())`,

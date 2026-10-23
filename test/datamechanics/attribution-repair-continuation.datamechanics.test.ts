@@ -17,7 +17,7 @@ import {
   runAttributionRepairTurn,
   runScheduledAttributionRepairTurn,
 } from "@/lib/ingest/reconcile-attribution";
-import { db, ingest, seedTeam, type Seed } from "./helpers";
+import { db, driveFixture, ingest, seedTeam, type Seed } from "./helpers";
 
 /**
  * PROMPT, BOUNDED CONTINUATION of the team-wide attribution repair, against real PostgreSQL
@@ -613,15 +613,16 @@ describe("AIO-1167 attribution repair continues promptly from durable state (rea
     const seed = await seedTeam();
     const alice = await member(seed, "Alice");
     const editor = { key: `permission:editor-${randomUUID().slice(0, 8)}`, email: authorAddress() };
-    // A Drive document: its repair writes contribution evidence as well as credit.
-    const drive = await ingest(seed, {
-      project: "drive-repair", path: `gdrive/${randomUUID()}.md`, access: "team", body: "drive body",
+    // A Drive document: its repair writes contribution evidence as well as credit. Written by the
+    // fenced commit, the one Drive content writer (AIO-1167).
+    const drive = await driveFixture(seed, {
+      project: "drive-repair", path: `gdrive/${randomUUID()}.md`, body: "drive body",
       frontmatter: {
         source: "gdrive", source_id: `doc-${randomUUID().slice(0, 8)}`, title: "Drive doc",
         authors: [{ provider: "gdrive", external_id: editor.key, email: editor.email, role: "editor" }],
         contributions: [{ external_id: editor.key, email: editor.email, role: "editor", at: new Date().toISOString() }],
       },
-    });
+    }, { unclaimed: true, access: "team", attribution: { authorMemberId: null } });
     await getPool().query("update items set member_id=null where id=$1", [drive.id]);
     await getPool().query("update item_versions set member_id=null where item_id=$1", [drive.id]);
     await addAuthorAlias(db(), seed.teamId, alice.id, editor.email);

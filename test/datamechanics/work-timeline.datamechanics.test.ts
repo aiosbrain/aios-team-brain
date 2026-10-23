@@ -5,7 +5,7 @@ import type { TimelineDay } from "@/lib/dashboard/timeline-group";
 import { recordGdriveItemClaim } from "@/lib/projects/context/gdrive-claims";
 import { upsertIntegration } from "@/lib/integrations/manage";
 import { setMemberIdentity } from "@/lib/identity/member-identities";
-import { approvedAudienceProject, db, seedTeam, ingest, viewFor, type Seed } from "./helpers";
+import { approvedAudienceProject, db, driveFixture, seedTeam, ingest, viewFor, type Seed } from "./helpers";
 
 // Spec: the Learning Timeline reads Postgres items+tasks into a day → person → (tasks + Other) ledger.
 // A task appears iff ≥1 of the person's in-window evidence references it (EVIDENCE-GATED) — empty headers
@@ -329,14 +329,15 @@ describe("work timeline — attributed docs (Notion / Google Docs / deliverables
         audienceProjectIds: [audienceProjectId],
       },
     });
-    const driveItem = await ingest(seed, {
-      kind: "deliverable", path: `drive/spaced-${randomUUID()}.md`, access: "external", body: "d",
+    // Written by the fenced commit (the one Drive content writer); the claim is this test's own.
+    const driveItem = await driveFixture(seed, {
+      kind: "deliverable", path: `drive/spaced-${randomUUID()}.md`, body: "d",
       frontmatter: {
         source: "gdrive", source_id: "timeline-drive-doc",
         title: "Drive doc spaced key AIO-21", "modified at": day1ago,
         contributions: [{ external_id: "permission:timeline-spelling", role: "editor", at: day1ago }],
       },
-    });
+    }, { unclaimed: true });
     await recordGdriveItemClaim(db(), {
       teamId: seed.teamId, integrationId: driveIntegration.id,
       providerId: "timeline-drive-doc", itemId: driveItem.id, generation: 1,

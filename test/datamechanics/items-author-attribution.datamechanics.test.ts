@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { attributeIncomingItem } from "@/lib/attribution/resolve-authors";
 import { ingestItem } from "@/lib/ingest";
 import type { ItemPayload } from "@/lib/api/schemas";
-import { db, seedTeam, sha, type Seed } from "./helpers";
+import { db, fencedDriveWriter, seedTeam, sha, type Seed } from "./helpers";
 import { setMemberIdentity } from "@/lib/identity/member-identities";
 import { drainIdentityRepairs } from "@/lib/ingest/identity-repair";
 import { repairAttributionNow } from "@/lib/ingest/reconcile-attribution";
@@ -90,12 +90,19 @@ describe("author attribution at ingest → stored member_id (real Postgres)", ()
 
   it("leaves a CONNECTOR push with an unresolvable author UNATTRIBUTED (null), never the connector", async () => {
     const seed = await seedTeam();
-    const connectorId = await addConnector(seed.teamId);
-    const stored = await ingestAs(seed, connectorId, {
-      source: "gdrive",
+    // A Google Drive document's connector push is the fenced commit (AIO-1167): its bound connector
+    // principal, attribution derived exactly as the route derives it.
+    const writer = await fencedDriveWriter(seed);
+    const p = payload({
+      source: "gdrive", source_id: `doc-${randomUUID().slice(0, 8)}`,
       authors: [{ role: "author", email: "stranger@elsewhere.com" }],
     });
+    const { opts } = await attributeIncomingItem(db(), seed.teamId, p, writer.auth.memberId);
+    const res = await writer.push({ ...p, frontmatter: p.frontmatter ?? {} }, opts);
+    const { data } = await db().from("items").select("member_id").eq("id", res.id).single();
+    const stored = (data as { member_id: string | null }).member_id;
     expect(stored).toBeNull(); // not the connector, not a wrong human
+    expect(stored).not.toBe(writer.auth.memberId);
   });
 
   it("keeps a HUMAN self-push attributed to the pusher even with an incidental, unmappable author", async () => {

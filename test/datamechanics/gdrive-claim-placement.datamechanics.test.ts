@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { db, externalMember, ingest, seedTeam, type Seed } from "./helpers";
+import { db, driveFixture, externalMember, ingest, seedTeam, type Seed } from "./helpers";
 import { ensureAccessBootstrap, EXTERNAL_SHARED_SLUG, GENERAL_SLUG } from "@/lib/access/bootstrap";
 import { canSeeItem } from "@/lib/access/enforce";
 import { addMemberToGroup, createGroup, grantProjectToGroup } from "@/lib/access/groups";
@@ -76,12 +76,15 @@ async function connection(seed: Seed, audienceProjectIds: string[]): Promise<str
   return row.id;
 }
 
-/** A Drive document as the connector stores it: external tier, exact provider id, no placement yet. */
+/**
+ * A Drive document as the connector stores it: external tier, exact provider id, no placement yet —
+ * written by the fenced commit (the one Drive content writer), its own claim and placement removed.
+ */
 async function driveItem(seed: Seed, providerId: string): Promise<string> {
-  const item = await ingest(seed, {
+  const item = await driveFixture(seed, {
     project: "drive-storage", path: `gdrive/${providerId}.md`, body: `Drive body ${providerId}`,
-    access: "external", frontmatter: { source: "gdrive", source_id: providerId },
-  });
+    frontmatter: { source: "gdrive", source_id: providerId },
+  }, { unclaimed: true });
   return item.id;
 }
 

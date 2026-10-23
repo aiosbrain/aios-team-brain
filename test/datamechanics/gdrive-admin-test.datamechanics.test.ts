@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { canSeeItem } from "@/lib/access/enforce";
 import { setIntegrationSecret, setIntegrationStatus, upsertIntegration } from "@/lib/integrations/manage";
 import { recordGdriveItemClaim } from "@/lib/projects/context/gdrive-claims";
-import { approvedAudienceProject, db, externalMember, ingest, seedTeam, type Seed } from "./helpers";
+import { approvedAudienceProject, db, driveFixture, externalMember, seedTeam, type Seed } from "./helpers";
 
 const adminContext = vi.hoisted(() => ({ teamId: "", memberId: "" }));
 
@@ -203,10 +203,11 @@ describe("AIO-1167 Admin Google Drive test authority", () => {
     const { data: row } = await db().from("integrations").select("id")
       .eq("team_id", seed.teamId).eq("name", "narrowed").single();
     const integrationId = (row as { id: string }).id;
-    const item = await ingest(seed, {
+    // Written by the fenced commit; the only claim left is the one this test records for "narrowed".
+    const item = await driveFixture(seed, {
       project: "drive-storage", path: "gdrive/doc-narrow.md", body: "narrowed Drive body",
-      access: "external", frontmatter: { source: "gdrive", source_id: "doc-narrow" },
-    });
+      frontmatter: { source: "gdrive", source_id: "doc-narrow" },
+    }, { unclaimed: true });
     await recordGdriveItemClaim(db(), {
       teamId: seed.teamId, integrationId, providerId: "doc-narrow", itemId: item.id,
       generation: 1, audienceProjectIds: [general, externalShared],

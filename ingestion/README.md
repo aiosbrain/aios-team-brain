@@ -202,6 +202,15 @@ reporting ledger with scheduled runs. The Admin status shows last attempt/proven
 counts including skipped, nullable backlog and cursor age, and reconnect/pause state. A busy worker is
 deferred; zero counters never imply completion without terminal stream/snapshot/drain evidence.
 
+**Cursor age** is the time since the *stalest* required stream of the current generation last
+completed a durable drain the brain acknowledged: its terminal drain was clean, its checkpoint was
+acknowledged, and the all-stream reconciliation was acknowledged (or an empty selection's drain
+finished). It is read from each stream's `last_success_at`, which survives restart and is restored
+from the brain's checkpoint. It is never the time of the last attempt — run entry, retries and
+failures do not refresh it — and one healthy stream cannot hide a stale one. It is unknown (not zero)
+when any required stream has never succeeded in this generation or its success time is missing or
+malformed.
+
 ## How content maps (the "unit of knowledge")
 
 | source | brain `kind` | `path` | `access` |

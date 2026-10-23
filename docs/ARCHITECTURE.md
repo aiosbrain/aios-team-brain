@@ -1273,6 +1273,12 @@ advisory/row locks, then target-member validation with `FOR SHARE`, then version
 keeps active/non-connector status stable against deactivation or deletion while remaining compatible
 with the `KEY SHARE` acquired by ingest's member foreign key; roster lifecycle writers take identity
 authority before the member row, so neither side relies on deadlock detection or retry.
+A correction (named or credit-nobody) then advances the shared authorization epoch in the same
+transaction, after its item/version/evidence writes and before commit, so every process's warm
+Timeline/arc memory, the persisted rows and any rebuild that read the old credit stop being servable
+at commit; if the epoch cannot advance the correction rolls back. It opens no new mapping revision or
+repair (it writes every effect itself), and the admin action's post-commit cache eviction is only an
+acceleration.
 Timeline and arc cache reads/publications require both the current shared authorization epoch and
 `repair_status='complete'`; pending/failed repairs are retryable-unavailable, never a healthy partial
 replacement. Completion validates the same mapping revision and advances the cache epoch atomically.
@@ -2418,7 +2424,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/internal/executor-gateway/v1/admin/:teamSlug/service-identities/:serviceIdentityId/credentials` — list non-secret credential metadata
 - `POST /api/internal/executor-gateway/v1/admin/:teamSlug/service-identities/:serviceIdentityId/credentials` — add a client-generated overlapping credential without returning its secret
 - `POST /api/internal/executor-gateway/v1/admin/:teamSlug/service-identities/:serviceIdentityId/credentials/:credentialId/revoke` — advisory-lock-linearized credential revocation
-- `POST /api/v1/items` — upsert synced content; its ingest owner transaction locks candidate path/provider identities and requires the current Drive execution when incoming provenance OR the persisted item/mapping is Drive-owned, so omission/relabel and first-create races cannot bypass the fence
+- `POST /api/v1/items` — upsert synced content; its ingest owner transaction locks candidate path/provider identities and requires the current Drive execution when incoming provenance OR the persisted item/mapping is Drive-owned, so omission/relabel and first-create races cannot bypass the fence. The refusal itself lives in the common writer (`ingestItem` → `assertNotDriveOwnedTarget`), on the locked canonical row and before any changed or unchanged mutation, for EVERY caller that is not the fenced commit — `note.create` via `POST /api/v1/actions` or an approval, meetings, connectors, the scanner and seeding included. Only a commit minted inside `ingestGdriveApiItem`'s validated `withGdriveExecutionCommit` (a module-private capability) may write Drive content or a Drive-owned item — an unfenced `source: 'gdrive'` payload is refused even for a first creation or a tombstone restore; a Drive-sourced payload, action policy, an API key or an internal option is not authority, and a paused or disconnected connection writes nothing
 - `POST /api/v1/items/source-reconcile` — authenticated gdrive tombstone/complete-snapshot reconciliation through the shared ingest purge owner; incomplete snapshots never delete; a snapshot above 10,000 ids is staged in pages and finalized atomically
 - `GET /api/v1/items` — tier-filtered, keyset-paginated pull
 - `GET /api/v1/items/:id` — single item fetch

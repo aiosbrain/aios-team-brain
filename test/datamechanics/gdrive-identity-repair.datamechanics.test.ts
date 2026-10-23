@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { db, externalMember, ingest, seedTeam, type Seed } from "./helpers";
+import { db, driveFixture, externalMember, seedTeam, type Seed } from "./helpers";
 import { setMemberIdentity, removeMemberIdentity } from "@/lib/identity/member-identities";
 import {
   drainIdentityRepairs,
@@ -37,10 +37,11 @@ async function member(seed: Seed, name: string, email = `${randomUUID()}@test.lo
 }
 
 async function driveItem(seed: Seed, suffix: string, at = "2026-09-21T04:30:00-04:00") {
-  const result = await ingest(seed, {
+  // Written by the fenced commit — the only Drive content writer (AIO-1167) — and left as the
+  // unclaimed, team-tier row these repair cases are about.
+  const result = await driveFixture(seed, {
     project: "drive-repair",
     path: `gdrive/${suffix}-${randomUUID()}.md`,
-    access: "team",
     body: `body ${suffix}`,
     frontmatter: {
       source: "gdrive",
@@ -60,8 +61,8 @@ async function driveItem(seed: Seed, suffix: string, at = "2026-09-21T04:30:00-0
         at,
       }],
     },
-  });
-  // The helper's direct ingest principal is only transport authority, not source authorship.
+  }, { unclaimed: true, access: "team", attribution: { authorMemberId: null } });
+  // Transport authority is not source authorship: no stored credit until a repair decides it.
   await db().from("items").update({ member_id: null }).eq("id", result.id);
   await db().from("item_versions").update({ member_id: null }).eq("item_id", result.id);
   return result.id;

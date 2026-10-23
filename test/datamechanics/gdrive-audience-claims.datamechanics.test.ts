@@ -31,7 +31,7 @@ import { runSql } from "@/lib/db/pg/pool";
 import { ensureProjectGraphPointer } from "@/lib/graph/project-pointer";
 import { listAuthorizedArcCorrections, recordArcCorrections } from "@/lib/graph/arc-corrections";
 import { setMemberIdentity } from "@/lib/identity/member-identities";
-import { db, ingest, seedTeam, visOf, type Seed } from "./helpers";
+import { db, driveFixture, fencedDriveWriter, ingest, seedTeam, visOf, type Seed } from "./helpers";
 
 afterEach(async () => {
   await settleArcRefreshes();
@@ -74,10 +74,12 @@ async function connection(seed: Seed, name: string, ...audienceProjectIds: strin
 
 describe("AIO-1167 Drive audience claims (real Postgres)", () => {
   async function claimedItem(seed: Seed, providerId: string, connections: string[], projectId: string) {
-    const item = await ingest(seed, {
+    // Written by the fenced commit (the one Drive content writer); its own claim is withdrawn so the
+    // claims under test are exactly the ones recorded below.
+    const item = await driveFixture(seed, {
       project: "drive-claims", path: `gdrive/${providerId}.md`, body: `Drive ${providerId}`,
-      access: "external", frontmatter: { source: "gdrive", source_id: providerId },
-    });
+      frontmatter: { source: "gdrive", source_id: providerId },
+    }, { unclaimed: true });
     for (const integrationId of connections) {
       await recordGdriveItemClaim(db(), {
         teamId: seed.teamId, integrationId, providerId, itemId: item.id,
@@ -104,16 +106,16 @@ describe("AIO-1167 Drive audience claims (real Postgres)", () => {
       const connectionA = await connection(seed, "connection-a", projectA);
       const connectionB = await connection(seed, "connection-b", projectB);
       const sourceAt = new Date(Date.now() - 86_400_000).toISOString();
-      const item = await ingest(seed, {
+      const item = await driveFixture(seed, {
         project: "drive-storage", path: "gdrive/shared-doc.md",
-        body: "one canonical waffleberry body for AIO-1167", access: "external",
+        body: "one canonical waffleberry body for AIO-1167",
         frontmatter: {
           source: "gdrive", source_id: "shared-doc", title: "Shared Drive evidence AIO-1167",
           source_ts: sourceAt,
           authors: [{ provider: "gdrive", external_id: "permission:audience-author", role: "editor" }],
           contributions: [{ external_id: "permission:audience-author", role: "editor", at: sourceAt }],
         },
-      });
+      }, { unclaimed: true });
       await db().from("items").update({ member_id: seed.memberId }).eq("id", item.id);
       await db().from("tasks").insert({
         team_id: seed.teamId, project_id: item.projectId, row_key: "AIO-1167",
@@ -203,8 +205,13 @@ describe("AIO-1167 Drive audience claims (real Postgres)", () => {
       project: "docs", path: "gdrive/Quarterly Plan.md", body: "local content", access: "team",
       frontmatter: { source: "local" },
     });
-    const drive = await ingest(seed, {
-      project: "docs", path: "gdrive/Quarterly Plan.md", body: "Drive content", access: "external",
+    // Every write of the Drive documents goes through the one Drive content-write authority, the
+    // fenced commit (AIO-1167): the direct writer refuses an existing Drive document.
+    const fenced = await fencedDriveWriter(seed);
+    const ingestDrive = (payload: { project: string; path: string; body: string; frontmatter: Record<string, unknown> }) =>
+      fenced.push(payload);
+    const drive = await ingestDrive({
+      project: "docs", path: "gdrive/Quarterly Plan.md", body: "Drive content",
       frontmatter: { source: "gdrive", source_id: "Case/Sanitized:ID" },
     });
     const { data: canonicalBefore } = await db().from("items").select("path,project_id")
@@ -214,13 +221,13 @@ describe("AIO-1167 Drive audience claims (real Postgres)", () => {
 
     // Neither an unchanged metadata replay nor a changed/renamed source implicitly moves the canonical
     // row back onto the colliding requested path (or into a newly requested project).
-    const unchanged = await ingest(seed, {
-      project: "renamed-project", path: "gdrive/Renamed Plan.md", body: "Drive content", access: "external",
+    const unchanged = await ingestDrive({
+      project: "renamed-project", path: "gdrive/Renamed Plan.md", body: "Drive content",
       frontmatter: { source: "gdrive", source_id: "Case/Sanitized:ID", title: "Renamed" },
     });
     expect(unchanged).toEqual(expect.objectContaining({ status: "unchanged", id: drive.id, projectId: canonicalProject }));
-    const changed = await ingest(seed, {
-      project: "renamed-project", path: "gdrive/Renamed Plan.md", body: "Drive content changed", access: "external",
+    const changed = await ingestDrive({
+      project: "renamed-project", path: "gdrive/Renamed Plan.md", body: "Drive content changed",
       frontmatter: { source: "gdrive", source_id: "Case/Sanitized:ID", title: "Renamed again" },
     });
     expect(changed).toEqual(expect.objectContaining({ status: "updated", id: drive.id, projectId: canonicalProject }));
@@ -232,8 +239,8 @@ describe("AIO-1167 Drive audience claims (real Postgres)", () => {
     const { data: versions } = await db().from("item_versions").select("id").eq("item_id", drive.id);
     expect(versions).toHaveLength(2);
 
-    const caseCollision = await ingest(seed, {
-      project: "docs", path: "gdrive/Quarterly Plan.md", body: "Other Drive content", access: "external",
+    const caseCollision = await ingestDrive({
+      project: "docs", path: "gdrive/Quarterly Plan.md", body: "Other Drive content",
       frontmatter: { source: "gdrive", source_id: "case/sanitized:id" },
     });
     expect(drive.id).not.toBe(original.id);
@@ -257,8 +264,15 @@ describe("AIO-1167 Drive audience claims (real Postgres)", () => {
       .eq("team_id", seed.teamId).eq("source", "gdrive").eq("provider_id", "Case/Sanitized:ID").single();
     expect(mapping).toEqual(expect.objectContaining({ canonical_path: canonicalPath, project_id: canonicalProject }));
     await db().from("items").delete().eq("id", drive.id);
-    const reconnected = await ingest(seed, {
-      project: "renamed-project", path: "gdrive/Renamed Plan.md", body: "Drive content restored", access: "external",
+    // A DIRECT restore of the tombstoned document is refused — the retained mapping is Drive
+    // ownership — and changes nothing. The fenced commit then restores it in place.
+    await expect(ingest(seed, {
+      project: "renamed-project", path: "gdrive/Renamed Plan.md", body: "Drive content forged", access: "external",
+      frontmatter: { source: "gdrive", source_id: "Case/Sanitized:ID", title: "Forged" },
+    })).rejects.toMatchObject({ code: "connector_principal_required", status: 403 });
+    expect((await db().from("items").select("id").eq("id", drive.id).maybeSingle()).data).toBeNull();
+    const reconnected = await ingestDrive({
+      project: "renamed-project", path: "gdrive/Renamed Plan.md", body: "Drive content restored",
       frontmatter: { source: "gdrive", source_id: "Case/Sanitized:ID", title: "Restored" },
     });
     expect(reconnected).toEqual(expect.objectContaining({ id: drive.id, projectId: canonicalProject }));
@@ -720,10 +734,11 @@ describe("AIO-1167 Drive audience claims (real Postgres)", () => {
     const noDrive = await seedTeam();
 
     const legacy = async (seed: Seed, providerId: string, adopt: boolean) => {
-      const item = await ingest(seed, {
+      // A legacy (pre-claims) Drive row: written by the fenced commit, then its claim withdrawn.
+      const item = await driveFixture(seed, {
         project: `legacy-${providerId}`, path: `gdrive/${providerId}.md`, body: providerId,
-        access: "external", frontmatter: { source: "gdrive", source_id: providerId },
-      });
+        frontmatter: { source: "gdrive", source_id: providerId },
+      }, { unclaimed: true });
       await db().from("project_context_units").insert({
         team_id: seed.teamId, source_item_id: item.id, unit_key: `legacy:${providerId}`,
         audience: "external", content_sha256: "a".repeat(64), state: "active",

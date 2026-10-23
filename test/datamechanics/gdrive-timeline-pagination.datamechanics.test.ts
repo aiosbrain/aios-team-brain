@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
-  convergeIdentityAttribution, db, ingest, placeMemberByTier, seedTeam, type Seed,
+  convergeIdentityAttribution, db, driveFixture, ingest, placeMemberByTier, seedTeam, type Seed,
 } from "./helpers";
 import { setMemberIdentity } from "@/lib/identity/member-identities";
 import type { EvidenceItem, TimelineDay } from "@/lib/dashboard/timeline-group";
@@ -23,10 +23,10 @@ async function driveEditor(seed: Seed, permission: string): Promise<string> {
 async function driveDoc(
   seed: Seed, slug: string, title: string, contributions: Array<{ permission: string; at: string }>,
 ) {
-  return ingest(seed, {
+  // Drive content is written only by the fenced commit (AIO-1167).
+  return driveFixture(seed, {
     project: "drive-timeline",
     path: `gdrive/${slug}-${randomUUID()}.md`,
-    access: "team",
     body: `${title} body`,
     frontmatter: {
       source: "gdrive",
@@ -90,10 +90,9 @@ describe("AIO-1167 Drive Timeline pagination (real Postgres)", () => {
     const visible = new Set<string>();
     const driveCount = ITEM_LIMIT + 5;
     for (let index = 0; index < driveCount; index++) {
-      const item = await ingest(seed, {
+      const item = await driveFixture(seed, {
         project: "drive-timeline",
         path: `gdrive/page-${index}-${randomUUID()}.md`,
-        access: "team",
         body: `Drive body ${index}`,
         frontmatter: {
           source: "gdrive",
@@ -174,10 +173,9 @@ describe("AIO-1167 Drive Timeline pagination (real Postgres)", () => {
     const newerAt = new Date(Date.now() - 86_400_000).toISOString();
     const driveCount = ITEM_LIMIT + 3;
     for (let index = 0; index < driveCount; index++) {
-      const item = await ingest(seed, {
+      const item = await driveFixture(seed, {
         project: "drive-timeline",
         path: `gdrive/saturation-${index}-${randomUUID()}.md`,
-        access: "team",
         body: `Drive saturation ${index}`,
         frontmatter: {
           source: "gdrive",

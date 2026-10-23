@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { getPool } from "@/lib/db/pg/pool";
 import { setMemberIdentity } from "@/lib/identity/member-identities";
-import { db, ingest, seedTeam, type Seed } from "./helpers";
+import { db, fencedDriveWriter, seedTeam, type Seed } from "./helpers";
 
 /**
  * Drive contribution evidence: one ledger row per observation (AIO-1167, real Postgres).
@@ -23,9 +23,15 @@ const AT_RESPELLED = AT.replace("Z", "+00:00");
 const legacyKey = (email: string, raw: string) =>
   createHash("md5").update(`${PERSON}\u001f${email}\u001feditor\u001f${raw}`).digest("hex");
 
+/** The fenced Drive writer each seeded team pushes through — the one Drive content-write authority. */
+const writers = new Map<string, Awaited<ReturnType<typeof fencedDriveWriter>>>();
+
+/** The connector's push of the one document: every replay goes through the fenced commit (AIO-1167). */
 function push(seed: Seed, body: string, contribution: { email: string; at: string }) {
-  return ingest(seed, {
-    project: "drive-identity", path: "gdrive/identity-doc.md", access: "team", body,
+  const writer = writers.get(seed.teamId);
+  if (!writer) throw new Error("seed has no fenced Drive writer");
+  return writer.push({
+    project: "drive-identity", path: "gdrive/identity-doc.md", body,
     frontmatter: {
       source: "gdrive", source_id: "identity-doc", title: "Identity doc", source_ts: AT,
       source_url: "https://docs.google.com/document/d/identity-doc/edit",
@@ -78,6 +84,7 @@ async function driveTimelineCount(seed: Seed, itemId: string): Promise<number[]>
 async function seededPerson(): Promise<Seed> {
   const seed = await seedTeam();
   await setMemberIdentity(db(), seed.teamId, seed.memberId, { provider: "gdrive", externalId: PERSON });
+  writers.set(seed.teamId, await fencedDriveWriter(seed));
   return seed;
 }
 

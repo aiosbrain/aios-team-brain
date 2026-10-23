@@ -60,7 +60,9 @@ import { db, ingest, seedTeam, sha, type Seed } from "./helpers";
  *   9. OWNERSHIP IS DECIDED UNDER THE ITEM LOCK. A public push is refused when the row it has
  *      locked has a Drive provider mapping — whatever that mapping's (nullable) connection id, and
  *      whatever the row's stored provenance says, including a mapping that appeared after the
- *      push's unlocked pre-check.
+ *      push's unlocked pre-check. The same refusal binds EVERY writer that is not a fenced Drive
+ *      commit — a direct internal caller, and a direct Drive-sourced payload updating or restoring a
+ *      Drive document — after it has taken the shared order.
  *
  * Lock state is read from `pg_stat_activity` / `pg_locks` on a pool connection of its own, so the
  * assertions are about what the backends hold — not about what the code under test reports.
@@ -539,20 +541,24 @@ describe("AIO-1167 shared ingest order: project before item (real Postgres)", ()
     }
   }, 60_000);
 
-  it("DIRECT internal ingest × DRIVE canonical-item update: both orders wait at the project and finish", async () => {
+  it("DIRECT internal ingest × DRIVE canonical-item update: both orders wait at the project and finish — the direct writer by refusal on its locked row", async () => {
     const seed = await adminSeed();
     const c = await driveConnection(seed, [(await audienceProject(seed)).id]);
     const created = await push(c, drivePayload(c, "canon", "drive v1"));
     expect(created.status).toBe("created");
-    // The same document through the sole writer directly: no connection, no claim, same item.
+    // The same document through the sole writer directly: no connection, no claim, same item. Its
+    // Drive-sourced payload is not authority (AIO-1167): it takes the shared order and is refused
+    // on the row it locks. Settled to its error so both orders still prove the locks.
     const direct = (body: string, hooks?: IngestConcurrencyHooks) =>
-      directPush(seed, drivePayload(c, "canon", body), "external", hooks);
+      directPush(seed, drivePayload(c, "canon", body), "external", hooks)
+        .then((result) => result as unknown, (caught: unknown) => caught);
+    const refusedDirect = { code: "connector_principal_required", status: 403 };
 
     const [direct1, drive1] = await secondWaitsAtTheProject(
       (hooks) => direct("direct v2", hooks),
       () => push(c, drivePayload(c, "canon", "drive v3")),
     );
-    expect(direct1).toMatchObject({ status: "updated", id: created.id });
+    expect(direct1).toMatchObject(refusedDirect);
     expect(drive1).toMatchObject({ status: "updated", id: created.id });
 
     const [drive2, direct2] = await secondWaitsAtTheProject(
@@ -560,11 +566,13 @@ describe("AIO-1167 shared ingest order: project before item (real Postgres)", ()
       () => direct("direct v5"),
     );
     expect(drive2).toMatchObject({ status: "updated", id: created.id });
-    expect(direct2).toMatchObject({ status: "updated", id: created.id });
+    expect(direct2).toMatchObject(refusedDirect);
 
     expect(await driveItemCount(seed, "canon")).toBe(1);
     const { data: stored } = await db().from("items").select("body").eq("id", created.id).single();
-    expect(stored).toMatchObject({ body: "direct v5" });
+    expect(stored).toMatchObject({ body: "drive v4" });
+    const { data: versions } = await db().from("item_versions").select("id").eq("item_id", created.id);
+    expect(versions, "only the three fenced writes are versions").toHaveLength(3);
     // The connection's claim on the document is untouched by the direct writes.
     const { rows: claims } = await getPool().query(
       "select 1 from gdrive_item_claims where team_id=$1 and provider_id='canon' and item_id=$2 and active",
@@ -1177,7 +1185,7 @@ describe("AIO-1167 shared ingest order: project before item (real Postgres)", ()
         order by c.integration_id`, [seed.teamId, providerId])).rows;
   }
 
-  it("DIRECT × FENCED Drive writers of one document from DIFFERENT projects: either order waits at the provider identity, owning no path, and both finish", async () => {
+  it("DIRECT × FENCED Drive writers of one document from DIFFERENT projects: either order waits at the provider identity, owning no path, and both finish — the direct one refused", async () => {
     const seed = await adminSeed();
     const audience = await audienceProject(seed); // a third project: the claim's destination
     const c = await driveConnection(seed, [audience.id]);
@@ -1211,7 +1219,9 @@ describe("AIO-1167 shared ingest order: project before item (real Postgres)", ()
       await Promise.allSettled([commit1, ...(direct1 ? [direct1] : [])]);
     }
     await expect(commit1).resolves.toMatchObject({ status: "updated", id: home.id });
-    await expect(direct1).resolves.toMatchObject({ status: "updated", id: home.id });
+    // AIO-1167: a Drive-sourced payload is not Drive authority. The direct writer still takes the
+    // shared order (asserted above) and is refused on the row it then locks.
+    await expect(direct1).rejects.toMatchObject({ code: "connector_principal_required", status: 403 });
 
     // Order 2 — the direct writer holds everything, the provider identity included. The commit,
     // past its connection and its projects, queues at the provider with no path of its own.
@@ -1228,14 +1238,19 @@ describe("AIO-1167 shared ingest order: project before item (real Postgres)", ()
       directFirst.release();
       await Promise.allSettled([direct2, ...(commit2 ? [commit2] : [])]);
     }
-    await expect(direct2).resolves.toMatchObject({ status: "updated", id: home.id });
+    await expect(direct2).rejects.toMatchObject({ code: "connector_principal_required", status: 403 });
     await expect(commit2).resolves.toMatchObject({ status: "updated", id: home.id });
 
-    // Unpaused, repeatedly: no round may lose a writer to a deadlock (40P01) or anything else.
+    // Unpaused, repeatedly: no round may lose a writer to a deadlock (40P01) or anything else. The
+    // fenced commit always lands; the direct writer is always refused by ownership — never by a
+    // lock failure.
     for (let round = 1; round <= 4; round++) {
       const settled = await Promise.allSettled([direct(`direct r${round}`), fenced(`fenced r${round}`)]);
-      expect(settled.map((outcome) => outcome.status), JSON.stringify(settled)).toEqual(["fulfilled", "fulfilled"]);
+      expect(settled.map((outcome) => outcome.status), JSON.stringify(settled)).toEqual(["rejected", "fulfilled"]);
+      expect((settled[0] as PromiseRejectedResult).reason).toMatchObject({ code: "connector_principal_required" });
     }
+    const { data: latest } = await db().from("items").select("body").eq("id", home.id).single();
+    expect(latest).toMatchObject({ body: "fenced r4" });
 
     // ONE canonical item, where it always was; ONE mapping, still without a connection id.
     expect(await driveItemCount(seed, provider)).toBe(1);
@@ -1247,7 +1262,7 @@ describe("AIO-1167 shared ingest order: project before item (real Postgres)", ()
     expect(await claimsOf(seed, provider)).toEqual(claimsBefore);
   }, 90_000);
 
-  it("ABSENT MAPPING, direct first: the commit queues at the provider, then replans onto the document the direct writer created — one item, one mapping", async () => {
+  it("ABSENT MAPPING, direct first: the commit queues at the provider; the direct CREATE is refused and rolled back, and the commit creates the one item and mapping", async () => {
     const seed = await adminSeed();
     const c = await driveConnection(seed, [(await audienceProject(seed)).id]);
     const provider = `fresh-${randomUUID().slice(0, 8)}`;
@@ -1269,16 +1284,21 @@ describe("AIO-1167 shared ingest order: project before item (real Postgres)", ()
       directFirst.release();
       await Promise.allSettled([created, ...(commit ? [commit] : [])]);
     }
-    const first = await created;
-    expect(first.status).toBe("created");
-    // Under the provider advisory the mapping's absence no longer holds: the whole attempt is
-    // abandoned and planned again — onto the direct writer's item, in the direct writer's project.
-    await expect(commit).resolves.toMatchObject({ status: "updated", id: first.id, projectId: first.projectId });
-    expect(attempts).toEqual([1, 2]);
+    // AIO-1167: a direct writer never writes Drive content — not even a first creation under an id
+    // it minted itself. It took the fenced order (above), was refused on its locked target, and
+    // rolled back whole: its project, its mapping and its row are gone.
+    await expect(created).rejects.toMatchObject({ code: "connector_principal_required", status: 403 });
+    const { rows: directProject } = await getPool().query(
+      "select 1 from projects where team_id=$1 and slug='fresh-a'", [seed.teamId]);
+    expect(directProject).toEqual([]);
+    // Under the provider advisory the commit's planned absence still holds — nothing was left to
+    // adopt — so it creates the document on its first attempt.
+    const committed = await commit!;
+    expect(committed.status).toBe("created");
+    expect(attempts).toEqual([1]);
     expect(await driveItemCount(seed, provider)).toBe(1);
-    expect(await mappingsOf(seed, provider)).toEqual([{ item_id: first.id, connection_id: null, canonical_path: `gdrive/${provider}.md` }]);
-    // The direct write published no claim; the one that exists is the commit's.
-    expect(await claimsOf(seed, provider)).toMatchObject([{ integration_id: c.integrationId, item_id: first.id, active: true }]);
+    expect(await mappingsOf(seed, provider)).toEqual([{ item_id: committed.id, connection_id: null, canonical_path: "gdrive/from-b.md" }]);
+    expect(await claimsOf(seed, provider)).toMatchObject([{ integration_id: c.integrationId, item_id: committed.id, active: true }]);
   }, 60_000);
 
   it("CHANGED PLAN, fenced first: a direct ingest whose planned absence did not survive the provider advisory is abandoned by name — once, leaving nothing", async () => {
@@ -1321,7 +1341,7 @@ describe("AIO-1167 shared ingest order: project before item (real Postgres)", ()
     expect(stored).toMatchObject({ body: "fenced v1" });
   }, 60_000);
 
-  it("TOMBSTONE: a direct restore holds the retained canonical location — after the provider — and restores there, not where it was requested", async () => {
+  it("TOMBSTONE: a direct restore holds the retained canonical location — after the provider — and is then refused: a retained mapping is Drive ownership", async () => {
     const seed = await adminSeed();
     const c = await driveConnection(seed, [(await audienceProject(seed)).id]);
     const provider = `tomb-${randomUUID().slice(0, 8)}`;
@@ -1364,23 +1384,36 @@ describe("AIO-1167 shared ingest order: project before item (real Postgres)", ()
       holder.release();
       if (restore) await restore.catch(() => undefined);
     }
-    // Restored under its own id, at its own location.
-    await expect(restore).resolves.toMatchObject({ status: "created", id: original.id, projectId: original.projectId });
-    const { data: stored } = await db().from("items").select("path, body").eq("id", original.id).single();
-    expect(stored).toMatchObject({ path: home.path, body: "v2" });
+    // AIO-1167: restoring a Drive document is a Drive content write. Without a fenced commit the
+    // direct writer is refused on the canonical identity it locked — nothing is restored, and the
+    // tombstone keeps naming the retained location.
+    await expect(restore).rejects.toMatchObject({ code: "connector_principal_required", status: 403 });
+    expect(await driveItemCount(seed, provider)).toBe(0);
+    const { rows: restored } = await getPool().query("select 1 from items where id=$1", [original.id]);
+    expect(restored).toEqual([]);
     expect(await mappingsOf(seed, provider)).toEqual([{ item_id: original.id, connection_id: null, canonical_path: home.path }]);
+    const { rows: elsewhere } = await getPool().query(
+      "select 1 from projects where team_id=$1 and slug='tomb-elsewhere'", [seed.teamId]);
+    expect(elsewhere, "the refused restore rolled back the project it created").toEqual([]);
     // A direct restore reactivates no claim.
     expect(await claimsOf(seed, provider)).toEqual(claimsBefore);
   }, 60_000);
 
-  it("NULL CONNECTION ID: a document a DIRECT ingest created — no claim, no connection on its mapping — is still refused to a public non-Drive push", async () => {
+  it("NULL CONNECTION ID: an UNCLAIMED Drive document — no claim, no connection on its mapping — is still refused to a public non-Drive push", async () => {
     const seed = await adminSeed();
     const c = await driveConnection(seed, [(await audienceProject(seed)).id]);
     const ordinary = ordinaryAuth(seed);
     const provider = `direct-owned-${randomUUID().slice(0, 8)}`;
     const at = { project: "direct-owned", path: `gdrive/${provider}.md` };
-    const owned = await directPush(seed, drivePayload(c, provider, "direct v1", at), "external");
+    // A direct writer cannot create Drive content any more (AIO-1167)…
+    await expect(directPush(seed, drivePayload(c, provider, "direct v0", at), "external"))
+      .rejects.toMatchObject({ code: "connector_principal_required", status: 403 });
+    expect(await driveItemCount(seed, provider)).toBe(0);
+    // …so the document is written by the fenced commit, and its claim is then withdrawn: what is
+    // left is an unclaimed Drive row whose mapping names no connection.
+    const owned = await push(c, drivePayload(c, provider, "direct v1", at));
     expect(owned.status).toBe("created");
+    await getPool().query("delete from gdrive_item_claims where team_id=$1 and provider_id=$2", [seed.teamId, provider]);
     expect(await mappingsOf(seed, provider)).toEqual([{ item_id: owned.id, connection_id: null, canonical_path: at.path }]);
     expect(await claimsOf(seed, provider)).toEqual([]);
 

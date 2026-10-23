@@ -238,6 +238,137 @@ export async function convergeIdentityAttribution(seed: Seed): Promise<void> {
   await repairAttributionNow(db(),seed.teamId,seed.teamSlug,{maxBatches:20,batchSize:100});
 }
 
+export interface FencedDriveWriter {
+  integrationId: string;
+  auth: import("@/lib/api/auth").ApiAuth;
+  execution: import("@/lib/integrations/gdrive-authority").GdriveExecutionRef;
+  push(
+    payload: Partial<ItemPayload> & { body: string; path: string; project: string; frontmatter: Record<string, unknown> },
+    opts?: import("@/lib/ingest").AttributionOverride,
+    hooks?: import("@/lib/ingest").IngestConcurrencyHooks,
+  ): Promise<{ status: string; id: string; projectId?: string }>;
+}
+
+/**
+ * A Google Drive connection with its bound connector principal and a live execution — exactly what the
+ * sidecar holds — and a `push` that writes through the ONE Drive content-write authority, the fenced
+ * commit (`ingestApiItem` with execution → `ingestGdriveApiItem` → `withGdriveExecutionCommit`).
+ * AIO-1167: the generic writer refuses EVERY Drive content write — creation, update and tombstone
+ * restore alike — so every Drive fixture is written through here. There is no test-only bypass.
+ *
+ * The seed member becomes the team admin that provisioning requires (`role` is not an attribution
+ * input). Provisioning adds the connector principal to the roster; when the team's identity repair
+ * was complete before this call it is converged again, so creating a writer never leaves a fixture
+ * in a repair-pending state it was not already in.
+ */
+export async function fencedDriveWriter(
+  seed: Seed,
+  audienceProjectIds?: string[],
+): Promise<FencedDriveWriter> {
+  const { upsertIntegration } = await import("@/lib/integrations/manage");
+  const { acquireGdriveExecution, provisionGdriveConnectorPrincipal } = await import("@/lib/integrations/gdrive-authority");
+  const { ingestApiItem } = await import("@/lib/ingest");
+  const { data: authorityBefore } = await db().from("team_identity_authority").select("repair_status")
+    .eq("team_id", seed.teamId).maybeSingle();
+  const repairWasComplete = ((authorityBefore as { repair_status?: string } | null)?.repair_status ?? "complete") === "complete";
+  await db().from("members").update({ role: "admin" }).eq("id", seed.memberId).eq("team_id", seed.teamId);
+  const audience = audienceProjectIds ?? [await approvedAudienceProject(seed)];
+  const row = await upsertIntegration(db(), { teamId: seed.teamId, memberId: seed.memberId }, {
+    type: "gdrive", name: `drive-${randomUUID().slice(0, 8)}`, status: "enabled",
+    config: {
+      fileIds: ["doc"], folderIds: [], sharedDriveIds: [], recursive: false,
+      selectionState: "selected", authMode: "service_account", audienceProjectIds: audience,
+    },
+  });
+  const issued = await provisionGdriveConnectorPrincipal({
+    teamId: seed.teamId, integrationId: row.id, actorMemberId: seed.memberId,
+  });
+  const { data: keyRow, error: keyError } = await db().from("api_keys").select("id").eq("key_id", issued.keyId).single();
+  if (keyError || !keyRow) throw new Error(`connector key lookup failed: ${keyError?.message}`);
+  const auth = {
+    teamId: seed.teamId, memberId: issued.memberId, memberTier: "team" as const, memberRole: "member",
+    apiKeyId: (keyRow as { id: string }).id, actorHandle: "gdrive-sync",
+    displayName: "Google Drive Sync", email: null, isConnector: true,
+  } as import("@/lib/api/auth").ApiAuth;
+  const acquired = await acquireGdriveExecution(auth, row.id, randomUUID());
+  const execution = { integrationId: row.id, generation: acquired.generation, fence: acquired.fence, owner: acquired.owner };
+  if (repairWasComplete) await convergeIdentityAttribution(seed);
+  return {
+    integrationId: row.id,
+    auth,
+    execution,
+    // Unresolved by default, as the route leaves a connector push it cannot attribute — never the connector.
+    push: (payload, opts = { authorMemberId: null }, hooks = {}) => ingestApiItem(db(), auth, {
+      kind: "deliverable", access: "external", actor: "gdrive-sync", content_sha256: sha(payload.body),
+      ...payload,
+      frontmatter: { ...payload.frontmatter, source: "gdrive", connection_id: row.id },
+    } as ItemPayload, "external", opts, "team", execution, hooks),
+  };
+}
+
+/** One fenced writer per seeded team, created on first use (`driveFixture`). */
+const driveFixtureWriters = new Map<string, Promise<FencedDriveWriter>>();
+
+export function driveFixtureWriter(seed: Seed): Promise<FencedDriveWriter> {
+  let writer = driveFixtureWriters.get(seed.teamId);
+  if (!writer) {
+    writer = fencedDriveWriter(seed);
+    driveFixtureWriters.set(seed.teamId, writer);
+  }
+  return writer;
+}
+
+/**
+ * Write a Google Drive document fixture through the fenced commit — the only Drive content-write
+ * authority (AIO-1167). Drop-in for what `ingest()` used to do for a `source: 'gdrive'` payload:
+ *   · attribution defaults to the seed member, as `ingest()` credited its own actor; pass
+ *     `attribution` for anything else;
+ *   · the commit stores Drive content at the `external` tier and claims it for the writer's
+ *     connection (General). `access: 'team'` re-labels the stored row and its context unit afterwards,
+ *     for a fixture whose subject is a team-tier legacy row;
+ *   · `unclaimed: true` then removes the writer's OWN claim and the placement it made, leaving
+ *     exactly the unclaimed Drive row a fixture sets claims on itself. The content itself was written
+ *     by the fenced commit either way.
+ */
+export async function driveFixture(
+  seed: Seed,
+  over: Partial<ItemPayload> & { body: string; path: string; frontmatter: Record<string, unknown> },
+  opts: {
+    unclaimed?: boolean;
+    access?: "team" | "external";
+    attribution?: import("@/lib/ingest").AttributionOverride;
+    hooks?: import("@/lib/ingest").IngestConcurrencyHooks;
+  } = {},
+): Promise<{ status: string; id: string; projectId?: string }> {
+  const writer = await driveFixtureWriter(seed);
+  const result = await writer.push(
+    { ...over, project: over.project ?? "acme", frontmatter: over.frontmatter },
+    opts.attribution ?? { authorMemberId: seed.memberId },
+    opts.hooks,
+  );
+  const { getPool } = await import("@/lib/db/pg/pool");
+  if (opts.unclaimed) {
+    const providerId = String(over.frontmatter.source_id ?? "");
+    await getPool().query(
+      "delete from gdrive_item_claims where team_id=$1 and integration_id=$2 and provider_id=$3",
+      [seed.teamId, writer.integrationId, providerId]);
+    // Deleted, not closed: the fixture is a row that was never placed by this writer.
+    await getPool().query(
+      `delete from project_context_memberships m
+        using project_context_units u
+        where u.team_id=m.team_id and u.id=m.context_unit_id and u.team_id=$1 and u.source_item_id=$2
+          and m.method='gdrive_claim'`,
+      [seed.teamId, result.id]);
+  }
+  if (opts.access === "team") {
+    await getPool().query("update items set access='team' where team_id=$1 and id=$2", [seed.teamId, result.id]);
+    await getPool().query(
+      "update project_context_units set audience='team' where team_id=$1 and source_item_id=$2",
+      [seed.teamId, result.id]);
+  }
+  return result;
+}
+
 /** Ingest one item through the real lib/ingest path against the real DB. */
 export async function ingest(
   seed: Seed,

@@ -16,6 +16,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from collections.abc import Iterable
 from typing import Any
 
 from pydantic import ValidationError
@@ -572,6 +573,12 @@ async def run_gdrive_stream(
                     # reconciliation is acknowledged — deferred or failed, that reconciliation is
                     # the outstanding work. Unmeasured would report the run failed; zero, done.
                     total.backlog = 1
+                # An empty selection's one stream: fresh only once its empty drain was finalized
+                # after the acknowledged reconciliation; otherwise its previous success, or unknown.
+                total.cursor_age_seconds = _roster_cursor_age_seconds(
+                    state, settings.team, integration_id, credential_identity(options),
+                    execution.generation, ["my-drive"],
+                )
                 return total
             auth_mode = str(options.get("auth_mode") or "oauth")
             token_provider = None
@@ -859,13 +866,11 @@ async def run_gdrive_stream(
                     # Absence is not established until its final acknowledgment, so that
                     # reconciliation is the outstanding work: zero would report it done.
                     total.backlog = 1
-                attempts = [progress.last_attempt_at for progress in progresses if progress.last_attempt_at]
-                if attempts:
-                    try:
-                        newest = max(datetime.fromisoformat(value.replace("Z", "+00:00")) for value in attempts)
-                        total.cursor_age_seconds = max(0.0, (datetime.now(timezone.utc) - newest).total_seconds())
-                    except (TypeError, ValueError):
-                        total.cursor_age_seconds = None
+            # Cursor age is NOT an attempt clock: it is the age of the stalest required stream's
+            # last acknowledged durable drain, over exactly this generation's roster, or unknown.
+            total.cursor_age_seconds = _roster_cursor_age_seconds(
+                state, settings.team, integration_id, credential_identity(options), generation, streams,
+            )
             return total
         finally:
             # A pause, replacement, or key revocation may already have invalidated this lease. It
@@ -2427,3 +2432,77 @@ def _defer_until(seconds: int = 60) -> str:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _utcnow() -> datetime:
+    """The same clock as ``_now`` (tests replace ``_now`` to make both deterministic)."""
+    return datetime.fromisoformat(_now().replace("Z", "+00:00"))
+
+
+def _durable_success_instant(value: Any) -> datetime | None:
+    """A stream's ``last_success_at`` as an aware instant, or ``None`` when it is not valid evidence.
+
+    Missing, blank, unparseable and offset-less (naive) values are all "no evidence": a naive time
+    cannot be placed on the clock it is compared with, and guessing a zone would invent freshness.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        instant = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return instant if instant.tzinfo is not None else None
+
+
+def _stream_cursor_age_seconds(progresses: Iterable[Any], *, now: datetime) -> float | None:
+    """AC-07 cursor age: seconds since the STALEST required stream's last durable success.
+
+    Each element is one required stream's progress (``None`` when the roster names a stream with no
+    progress). A stream's ``last_success_at`` is written only by ``_checkpoint_progress`` — the brain
+    acknowledges the checkpoint first, then it is mirrored locally — and only when the stream's
+    terminal drain is clean and the all-stream reconciliation was acknowledged (``finalize``), or an
+    empty selection's drain completed. It is mirrored back from the brain's checkpoint on recovery
+    and survives restart in local state. Run entry and every attempt write ``last_attempt_at``,
+    which this never reads.
+
+    The oldest success across the roster is the honest answer: one healthy stream must not hide a
+    stale one. Unknown (``None``) — never zero — when the roster is empty, any required stream has no
+    progress or no valid success time, or a success time lies in the future.
+    """
+    oldest: datetime | None = None
+    counted = 0
+    for progress in progresses:
+        counted += 1
+        instant = _durable_success_instant(getattr(progress, "last_success_at", None)) if progress is not None else None
+        # Every required timestamp is validated against `now` on its own, before any is chosen as
+        # the oldest: a future success on one stream is invalid evidence even when another stream's
+        # older, valid success would otherwise be the one reported.
+        if instant is None or instant > now:
+            return None
+        if oldest is None or instant < oldest:
+            oldest = instant
+    if counted == 0 or oldest is None:
+        return None
+    return (now - oldest).total_seconds()
+
+
+def _roster_cursor_age_seconds(
+    state: StateStore,
+    team: str,
+    integration_id: str,
+    credential: str,
+    generation: int,
+    drive_ids: Iterable[Any],
+    *,
+    now: datetime | None = None,
+) -> float | None:
+    """Cursor age over exactly this generation's required roster (see ``_stream_cursor_age_seconds``).
+
+    Each stream is looked up by its own current-generation key, so another generation's or another
+    credential's progress can never stand in for a required stream.
+    """
+    progresses = [
+        state.get_progress(StreamKey(team, integration_id, credential, str(drive_id)).namespace(generation))
+        for drive_id in drive_ids
+    ]
+    return _stream_cursor_age_seconds(progresses, now=now if now is not None else _utcnow())

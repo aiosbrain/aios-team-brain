@@ -6,6 +6,7 @@ import { resolveCorrection, type CorrectionPlan } from "@/lib/attribution/correc
 import { runSql, withTransaction } from "@/lib/db/pg/pool";
 import { lockItemAttribution } from "@/lib/ingest/item-attribution-lock";
 import { lockIdentityAuthority } from "@/lib/identity/authority";
+import { advanceAuthorizationEpoch } from "@/lib/access/authorization-epoch";
 
 /**
  * Apply a natural-language attribution correction (parsed + previewed in `lib/attribution/correction`).
@@ -108,6 +109,15 @@ export async function applyAttributionCorrection(
         where team_id=$1 and item_id=any($2::uuid[])`,
       [teamId,ids,r.target.memberId],
     );
+    // THE cache-generation barrier for this credit change (AIO-1167, AC-09). Timeline and arc caches
+    // — persisted rows, every process's memory, and any rebuild that read the old credit before this
+    // commit — are only served or published at the epoch they were built under. Advancing it here,
+    // in this transaction and after every primary attribution write, makes old mapped credit
+    // unservable everywhere the moment the correction commits; a failure to advance rolls the whole
+    // correction back. Lock order: identity authority → items → versions → evidence → epoch row, the
+    // order repair completion uses. No revision or repair is opened: every effect is written here.
+    // The caller's post-commit cache eviction remains an acceleration, not the barrier.
+    await advanceAuthorizationEpoch(teamId);
     const changes=ids
       .map((id)=>({itemId:id,from:priorOwner.get(id) ?? null,to:r.target.memberId}))
       .filter((change): change is {itemId:string;from:string;to:string|null}=>(

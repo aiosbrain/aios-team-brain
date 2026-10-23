@@ -8,7 +8,8 @@ import { buildIdentityAuthoritySnapshot } from "@/lib/identity/authority";
 import { setMemberIdentity } from "@/lib/identity/member-identities";
 import { createMember, deleteMember, rollbackMemberCreation } from "@/lib/admin/members";
 import { activateInvitedMembership, ensureAuthUser, linkMemberByEmail } from "@/lib/auth/pg-login";
-import { convergeIdentityAttribution, db, seedTeam, type Seed } from "./helpers";
+import { getPool } from "@/lib/db/pg/pool";
+import { convergeIdentityAttribution, db, fencedDriveWriter, seedTeam, type Seed } from "./helpers";
 
 const sha=(body:string)=>createHash("sha256").update(body).digest("hex");
 
@@ -21,15 +22,42 @@ async function addMember(seed:Seed,name:string,email=`${randomUUID()}@test.local
   return (data as {id:string}).id;
 }
 
-function payload(sourceId:string,body:string,path=`gdrive/${sourceId}.md`):ItemPayload{
+/**
+ * An ordinary (non-Drive) document: the COMMON writer's own serialization with corrections and
+ * repair is proven on it. A Drive document cannot be the second write here — after creation only the
+ * fenced commit may write it (AIO-1167), and that commit takes the team identity authority first,
+ * so it serializes with a correction at the head of the order instead (see the Drive cases below and
+ * `gdrive-lock-order`'s ATTRIBUTION CORRECTION × DRIVE commit).
+ */
+function payload(sourceId:string,body:string,path=`notes/${sourceId}.md`):ItemPayload{
   return {
-    project:"drive-serialization",path,kind:"artifact",access:"team",actor:"gdrive-sync",
+    project:"common-serialization",path,kind:"artifact",access:"team",actor:"notion-sync",
     body,content_sha256:sha(body),frontmatter:{
+      source:"notion",source_id:sourceId,title:`Doc ${sourceId}`,
+    },
+  } as ItemPayload;
+}
+
+/** The Drive document the fenced writer pushes: provenance, authors and contribution evidence. */
+function drivePayload(sourceId:string,body:string){
+  return {
+    project:"drive-serialization",path:`gdrive/${sourceId}.md`,kind:"artifact" as const,body,frontmatter:{
       source:"gdrive",source_id:sourceId,title:`Doc ${sourceId}`,
       authors:[{provider:"gdrive",external_id:`permission:${sourceId}`,role:"editor"}],
       contributions:[{external_id:`permission:${sourceId}`,role:"editor",at:"2026-09-21T12:00:00Z"}],
     },
-  } as ItemPayload;
+  };
+}
+
+/** Wait until exactly `expected` backends are queued on a lock (the fenced commit's identity authority). */
+async function untilLockWaiters(expected:number){
+  for(let tries=0;tries<320;tries++){
+    const {rows}=await getPool().query<{n:number}>(
+      `select count(*)::int as n from pg_stat_activity where datname=current_database() and wait_event_type='Lock'`);
+    if(rows[0].n===expected) return;
+    await new Promise((resolve)=>setTimeout(resolve,25));
+  }
+  throw new Error(`expected ${expected} backend(s) waiting on a lock`);
 }
 
 async function state(itemId:string){
@@ -117,9 +145,71 @@ describe("common ingest attribution serialization (real Postgres)",()=>{
     expect(stored.item).toMatchObject({member_id:namedId,member_id_locked:true});
     expect(stored.versions.length).toBe(changed ? 2 : 1);
     expect(stored.versions.every((row)=>row.member_id===namedId)).toBe(true);
+    // An ordinary document carries no Drive contribution evidence; the Drive ledger's half of this
+    // contract is the fenced case below.
+    expect(stored.evidence).toEqual([]);
+  });
+
+  it.each([
+    {label:"changed credit-nobody",changed:true,named:false},
+    {label:"unchanged credit-nobody",changed:false,named:false},
+    {label:"changed named correction",changed:true,named:true},
+    {label:"unchanged named correction",changed:false,named:true},
+  ])("a fenced Drive replay after a correction preserves it in every ledger, contribution evidence included: $label",async({changed,named})=>{
+    const seed=await seedTeam();
+    const namedId=named ? await addMember(seed,"Named Correction") : null;
+    const writer=await fencedDriveWriter(seed);
+    const sourceId=`fenced-${randomUUID()}`;
+    const first=await writer.push(drivePayload(sourceId,"first body"),{authorMemberId:seed.memberId});
+    await correct(seed,first.id,named ? "Named Correction" : "nobody");
+
+    // The connector's next pass — the one writer that may touch a Drive document — rereads the
+    // corrected, locked attribution under its row lock and keeps it.
+    const replay=await writer.push(drivePayload(sourceId,changed ? "changed body" : "first body"),{authorMemberId:seed.memberId});
+    expect(replay).toMatchObject({id:first.id,status:changed ? "updated" : "unchanged"});
+
+    const stored=await state(first.id);
+    expect(stored.item).toMatchObject({member_id:namedId,member_id_locked:true});
+    expect(stored.versions.length).toBe(changed ? 2 : 1);
+    expect(stored.versions.every((row)=>row.member_id===namedId)).toBe(true);
     expect(stored.evidence.length).toBeGreaterThan(0);
     expect(stored.evidence.every((row)=>row.member_id===namedId)).toBe(true);
     expect(stored.evidence.every((row)=>row.diagnostic===(named ? "manual_attribution" : "manual_credit_nobody"))).toBe(true);
+  });
+
+  it("a fenced Drive commit holding its locks makes a correction wait at the identity authority, then the correction wins every ledger",async()=>{
+    const seed=await seedTeam();
+    const writer=await fencedDriveWriter(seed);
+    const sourceId=`fenced-reverse-${randomUUID()}`;
+    const first=await writer.push(drivePayload(sourceId,"first body"),{authorMemberId:seed.memberId});
+
+    let release!:()=>void;
+    let locked!:()=>void;
+    const gate=new Promise<void>((resolve)=>{release=resolve;});
+    const ready=new Promise<void>((resolve)=>{locked=resolve;});
+    const worker=writer.push(drivePayload(sourceId,"second body"),{authorMemberId:seed.memberId},{
+      afterAttributionRead:async()=>{locked();await gate;},
+    });
+    worker.catch(()=>undefined);
+    await ready;
+    let correctionLocked=false;
+    const correction=correct(seed,first.id,"nobody",{afterItemLock:async()=>{correctionLocked=true;}});
+    correction.catch(()=>undefined);
+    try{
+      // The commit holds the team identity authority: the correction queues there, before any item lock.
+      await untilLockWaiters(1);
+      expect(correctionLocked).toBe(false);
+    }finally{
+      release();
+    }
+    await expect(worker).resolves.toMatchObject({status:"updated"});
+    await correction;
+
+    const stored=await state(first.id);
+    expect(stored.item).toMatchObject({member_id:null,member_id_locked:true,body:"second body"});
+    expect(stored.versions.every((row)=>row.member_id===null)).toBe(true);
+    expect(stored.evidence.length).toBeGreaterThan(0);
+    expect(stored.evidence.every((row)=>row.member_id===null&&row.diagnostic==="manual_credit_nobody")).toBe(true);
   });
 
   it("makes a reverse-order correction wait for ingest, then lets the correction win every ledger",async()=>{
@@ -154,7 +244,6 @@ describe("common ingest attribution serialization (real Postgres)",()=>{
     const stored=await state(first.id);
     expect(stored.item).toMatchObject({member_id:null,member_id_locked:true,body:"second body"});
     expect(stored.versions.every((row)=>row.member_id===null)).toBe(true);
-    expect(stored.evidence.every((row)=>row.member_id===null&&row.diagnostic==="manual_credit_nobody")).toBe(true);
   });
 
   it("lets changed ingest finish its target-member version before a waiting named correction",async()=>{
@@ -248,7 +337,7 @@ describe("common ingest attribution serialization (real Postgres)",()=>{
     let waitingOnHeld!:()=>void;
     const waiting=new Promise<void>((resolve)=>{waitingOnHeld=resolve;});
     const correction=applyAttributionCorrection(db(),seed.teamId,{
-      kind:"reassign",match:{source:"gdrive"},toMember:"Multi Target",
+      kind:"reassign",match:{source:"notion"},toMember:"Multi Target",
     },{memberId:seed.memberId},2,{
       beforeItemLock:async(id)=>{if(id===held.result.id) waitingOnHeld();},
     });
@@ -488,32 +577,35 @@ describe("common ingest attribution serialization (real Postgres)",()=>{
     const externalId=`permission:${sourceId}`;
     const mapped=await addMember(seed,"Mapped Author");
     await setMemberIdentity(db(),seed.teamId,mapped,{provider:"gdrive",externalId});
+    // The Drive document's writes are the fenced commit's (AIO-1167). Provisioning its connector
+    // principal is a roster change, so the repair snapshot is taken after it.
+    const writer=await fencedDriveWriter(seed);
     const snapshot=await buildIdentityAuthoritySnapshot(db(),seed.teamId);
-    const firstPayload=payload(sourceId,"first body");
-    const auth={teamId:seed.teamId,memberId:seed.memberId,apiKeyId:randomUUID()};
-    const first=await ingestItem(db(),auth,firstPayload,"team",{authorMemberId:mapped});
+    const first=await writer.push(drivePayload(sourceId,"first body"),{authorMemberId:mapped});
 
     let release!:()=>void;
     let ingestLocked!:()=>void;
     const gate=new Promise<void>((resolve)=>{release=resolve;});
     const ready=new Promise<void>((resolve)=>{ingestLocked=resolve;});
-    // Use explicit current credit here so the mapping repair can reach the canonical item lock; a
-    // mappingRevision-derived ingest also holds the broader identity-authority lock and therefore
-    // serializes even earlier by design.
-    const ingest=ingestItem(db(),auth,payload(sourceId,"mapped update",firstPayload.path),"team",
-      {authorMemberId:mapped},"team",undefined,{
-        concurrencyHooks:{afterAttributionRead:async()=>{ingestLocked();await gate;}},
-      });
-    await ready;
-    let repairAttempted!:()=>void;
-    let repairLocked=false;
-    const attempted=new Promise<void>((resolve)=>{repairAttempted=resolve;});
-    const repair=repairAttributionItem(db(),snapshot,first.id,{
-      beforeItemLock:async()=>{repairAttempted();},afterItemLock:async()=>{repairLocked=true;},
+    // Explicit current credit. The fenced commit holds the team identity authority as well as the
+    // canonical item lock, so the repair serializes behind it at the head of the order — earlier than
+    // the item lock, by design.
+    const ingest=writer.push(drivePayload(sourceId,"mapped update"),{authorMemberId:mapped},{
+      afterAttributionRead:async()=>{ingestLocked();await gate;},
     });
-    await attempted;
-    expect(repairLocked).toBe(false);
-    release();
+    ingest.catch(()=>undefined);
+    await ready;
+    let repairLocked=false;
+    const repair=repairAttributionItem(db(),snapshot,first.id,{
+      afterItemLock:async()=>{repairLocked=true;},
+    });
+    repair.catch(()=>undefined);
+    try{
+      await untilLockWaiters(1);
+      expect(repairLocked).toBe(false);
+    }finally{
+      release();
+    }
     await ingest;
     await repair;
 
