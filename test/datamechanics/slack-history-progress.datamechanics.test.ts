@@ -1818,6 +1818,151 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
     });
   });
 
+  // ── PACKET 8b: exact bigint midpoints just below the maximum epoch, DH-04 ─────────────────────────
+  // A CONSTRUCTED, CHECK-valid literal, written directly; it is not reached here by a provider
+  // traversal. A = 253402300799.999999 (the largest supported instant), S = …999800, U = …999900,
+  // a completed-segments aggregate …999950 in (U, A] and an attempt-oldest …999850 in [S, U]. Here
+  // S + U exceeds 2^53 microsecond ticks, so only exact bigint arithmetic gives M + 1 = …999851.
+  // H is 1,000 distinct entries (the entry cap) whose FIRST is the older entry, so every returned
+  // value's no-leak check is live, and whose last is the cursor.
+
+  const HIGH_EPOCH = {
+    anchor: "253402300799.999999", lower: "253402300799.999800", upper: "253402300799.999900",
+    aggregate: "253402300799.999950", attemptOldest: "253402300799.999850", pageOldest: "253402300799.999870",
+  } as const;
+  /** 1,000 distinct entries: the older entry first, then `cap001`…`cap999`; the cursor is the last. */
+  const highEpochHistory = (): string[] => [OLDER_ENTRY, ...entryCapHistory().slice(1)];
+  /** The capacity subdivision may change exactly what the invalid_cursor subdivision may: S, C/H, attempt-oldest, G and the release. */
+  const CAPACITY_SUBDIVISION_PERMITTED = INVALID_CURSOR_PERMITTED;
+
+  /** Seed the wide fixture at the entry cap, then write the high-epoch literal and assert it as a PRECONDITION. */
+  async function seedHighEpoch(): Promise<Seeded> {
+    const seeded = await seedWideSegment(highEpochHistory());
+    await tx((session) => session.executeSql(
+      `update slack_sync_channels
+          set historical_anchor_ts = $2, historical_segment_lower_ts = $3, historical_segment_upper_ts = $4,
+              historical_completed_segments_oldest_ts = $5, historical_oldest_seen_ts = $6
+        where team_id = $1`,
+      [seeded.scope.teamId, HIGH_EPOCH.anchor, HIGH_EPOCH.lower, HIGH_EPOCH.upper, HIGH_EPOCH.aggregate, HIGH_EPOCH.attemptOldest]
+    ));
+    expect(await tx(async (session) => (await session.executeSql<Record<string, unknown>>(
+      `select historical_anchor_ts = $2 and historical_segment_lower_ts = $3 and historical_segment_upper_ts = $4 as bounds_seeded,
+              historical_completed_segments_oldest_ts = $5 and historical_oldest_seen_ts = $6 as progress_seeded,
+              pg_catalog.jsonb_array_length(historical_cursor_history)::int as entries,
+              (historical_cursor_history -> -1) = pg_catalog.to_jsonb(historical_cursor) as linked,
+              completed_lower_ts is null and completed_upper_ts is null and newest_catchup_upper_ts is null
+                and not historical_floor_reached as uncertified
+         from slack_sync_channels where team_id = $1`,
+      [seeded.scope.teamId, HIGH_EPOCH.anchor, HIGH_EPOCH.lower, HIGH_EPOCH.upper, HIGH_EPOCH.aggregate, HIGH_EPOCH.attemptOldest]
+    )).rows[0]), "fixture: the high-epoch literal is stored at the entry cap, linked and uncertified").toEqual({
+      bounds_seeded: true, progress_seeded: true, entries: 1000, linked: true, uncertified: true,
+    });
+    return seeded;
+  }
+  /** The test's OWN M + 1 from the literal S and U, in exact BigInt ticks. */
+  const highEpochMidpointPlusOne = () =>
+    renderTicks((exactOracleTicks(HIGH_EPOCH.lower) + exactOracleTicks(HIGH_EPOCH.upper)) / BigInt(2) + BigInt(1));
+  /** The historical lane after a high-epoch subdivision, against literal expectations (booleans only). */
+  async function highEpochFacts(scope: SlackChannelScope, lower: string) {
+    return tx(async (session) => (await session.executeSql<Record<string, unknown>>(
+      `select historical_segment_lower_ts is not distinct from $4 as lower_is_exact_midpoint_plus_one,
+              historical_segment_upper_ts is not distinct from $5 as upper_kept,
+              historical_anchor_ts is not distinct from $6 as anchor_kept,
+              historical_completed_segments_oldest_ts is not distinct from $7 as aggregate_byte_identical,
+              historical_oldest_seen_ts is null as attempt_oldest_cleared,
+              historical_cursor is null and historical_cursor_history = '[]'::jsonb as cursor_history_cleared,
+              historical_scan_generation::int as generation,
+              completed_lower_ts is null and completed_upper_ts is null and newest_catchup_upper_ts is null
+                and not historical_floor_reached as coverage_unchanged,
+              lease_owner is null and lease_expires_at is null and claimed_lane is null as released, next_lane, last_error_code
+         from slack_sync_channels where team_id = $1 and workspace_id = $2 and channel_id = $3`,
+      [scope.teamId, scope.workspaceId, scope.channelId, lower, HIGH_EPOCH.upper, HIGH_EPOCH.anchor, HIGH_EPOCH.aggregate]
+    )).rows[0]);
+  }
+  const HIGH_EPOCH_FACTS = {
+    lower_is_exact_midpoint_plus_one: true, upper_kept: true, anchor_kept: true, aggregate_byte_identical: true,
+    attempt_oldest_cleared: true, cursor_history_cleared: true, generation: 5, coverage_unchanged: true, released: true,
+    next_lane: "newest",
+  };
+
+  it("§5 high-epoch capacity subdivision / DH-04: an over-cap continuation on a WIDE segment just below the maximum epoch stores the exact bigint midpoint S = M + 1 and preserves the completed-segments aggregate byte for byte", async () => {
+    const seeded = await seedHighEpoch();
+    const midpointPlusOne = highEpochMidpointPlusOne();
+    expect(midpointPlusOne, "fixture: oracle").toBe("253402300799.999851");
+    const claim = await claimHistorical(seeded);
+    const before = await rowDigestExcept(seeded.scope, CAPACITY_SUBDIVISION_PERMITTED);
+    // A NEW cursor on a 1,000-entry H: the candidate has 1,001 entries, so the wide segment subdivides.
+    const outcome = await admit(claim, { terminal: false, nextCursor: "cap-new", oldestTs: HIGH_EPOCH.pageOldest });
+    expect({
+      outcome,
+      facts: await highEpochFacts(seeded.scope, midpointPlusOne),
+      newestLaneUnchanged: await newestLaneExact(seeded.scope),
+      unrelatedUnchanged: (await rowDigestExcept(seeded.scope, CAPACITY_SUBDIVISION_PERMITTED)) === before,
+    }, "typed capacity subdivision at the exact bigint midpoint; U, A and the aggregate kept; C/H/attempt-oldest cleared; G + 1; released").toEqual({
+      outcome: { accept: { outcome: "subdivided", category: "cursor_history_entries_exceeded" } },
+      facts: { ...HIGH_EPOCH_FACTS, last_error_code: "cursor_history_entries_exceeded" },
+      newestLaneUnchanged: true,
+      unrelatedUnchanged: true,
+    });
+  });
+
+  it("§5 high-epoch invalid_cursor / DH-04: the restart writer subdivides a WIDE segment just below the maximum epoch at the exact bigint midpoint and preserves U, A, the aggregate and coverage", async () => {
+    const seeded = await seedHighEpoch();
+    const midpointPlusOne = highEpochMidpointPlusOne();
+    expect(midpointPlusOne, "fixture: oracle").toBe("253402300799.999851");
+    const claim = await claimHistorical(seeded);
+    const before = await rowDigestExcept(seeded.scope, INVALID_CURSOR_PERMITTED);
+    const outcome = await restartOutcome(claim);
+    expect({
+      outcome,
+      facts: await highEpochFacts(seeded.scope, midpointPlusOne),
+      newestLaneUnchanged: await newestLaneExact(seeded.scope),
+      unrelatedUnchanged: (await rowDigestExcept(seeded.scope, INVALID_CURSOR_PERMITTED)) === before,
+    }, "typed subdivided at the exact bigint midpoint; U, A, the aggregate and coverage kept; C/H/attempt-oldest cleared; G + 1; released").toEqual({
+      outcome: { outcome: "subdivided", leaked: false },
+      facts: { ...HIGH_EPOCH_FACTS, last_error_code: "invalid_cursor" },
+      newestLaneUnchanged: true,
+      unrelatedUnchanged: true,
+    });
+  });
+
+  // ── PACKET 8c: membership spans the WHOLE history, including its oldest entry, DH-06 ─────────────
+  // The existing at-cap case repeats a MIDDLE entry; this one repeats H[0]. Without H[0] in the
+  // membership test the candidate would have 1,001 entries and the WIDE segment would subdivide before
+  // any append, so the discriminating outcome is typed and no duplicate-history CHECK is involved.
+
+  it("F2-01 (partial) / F2-04 / DH-06 repetition of the OLDEST entry H[0] at the entry cap on a WIDE segment is still cursor_repeated (membership spans the whole history; never subdivided)", async () => {
+    const history = entryCapHistory();
+    const seeded = await seedWideSegment(history);
+    const { scope } = seeded;
+    expect(await tx(async (session) => (await session.executeSql<Record<string, unknown>>(
+      `select pg_catalog.jsonb_array_length(historical_cursor_history)::int as entries,
+              (historical_cursor_history -> 0) = pg_catalog.to_jsonb($2::text) as oldest_is_first,
+              historical_cursor = $3 and (historical_cursor_history -> -1) = pg_catalog.to_jsonb(historical_cursor) as current_is_last
+         from slack_sync_channels where team_id = $1`,
+      [scope.teamId, history[0], history[999]]
+    )).rows[0]), "fixture: 1,000 distinct entries, H[0] oldest, the cursor H[999]").toEqual({
+      entries: 1000, oldest_is_first: true, current_is_last: true,
+    });
+    const claim = await claimHistorical(seeded);
+    const before = await rowDigestExcept(scope, RELEASE_PERMITTED);
+    const outcome = await admit(claim, { terminal: false, nextCursor: history[0], oldestTs: seeded.pageOldest });
+    expect({
+      outcome,
+      bookkeeping: await bookkeeping(scope, null),
+      facts: await historicalFacts(scope, history[999], history),
+      onlyReleaseFieldsMoved: (await rowDigestExcept(scope, RELEASE_PERMITTED)) === before,
+    }, "a repeated OLDEST entry at the cap is repetition: typed cursor_repeated, release only, H and the segment untouched").toEqual({
+      outcome: { accept: { outcome: "rejected", category: "cursor_repeated" }, release: "written" },
+      bookkeeping: {
+        next_lane: "newest", claimed_lane: null, lease_cleared: true, last_read_set: false, last_error_code: "cursor_repeated",
+        attempt_oldest_is_expected: true,
+      },
+      facts: { cursor_is_expected: true, history_is_expected: true, entries: 1000, generation: 4, newest_lane_unchanged: true },
+      onlyReleaseFieldsMoved: true,
+    });
+  });
+
   // ── PACKET 7: §3.4 / F2-10 maximum-history compatibility writers ────────────────────────────────
   // PostgreSQL rechecks BOTH history CHECKs on every update of the row. Each writer below therefore
   // runs against a FRESH row whose two histories sit at their exact maximum accepted shape (1,000
