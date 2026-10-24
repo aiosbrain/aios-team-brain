@@ -169,7 +169,14 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *         · PUBLISHED ITEM: `items`, under a `projects` row;
  *         · LEDGER: `slack_messages`, FK `(team_id, item_id)` to that item.
  *         Literal rows (1 project, 1 item, 2 ledger rows, 1 staged snapshot) are seeded in each
- *         of the four order databases. Each table is md5-digested whole and must be byte-identical
+ *         of the four order databases.
+ *         · The project FK support row is seeded WITH the canonical `graph_group_id`, the exact
+ *           value `20260815140000_projects_graph_group_id.sql` mints. Its replay backfill is
+ *           guarded on a null pointer and is therefore a no-op, rather than legitimately rewriting
+ *           a pointer-less row on the full-loader replay.
+ *         · Its identity and that canonical pointer are asserted literally.
+ *         Each table, the project included, is md5-digested whole with no column excluded, and
+ *         must be byte-identical
  *         after the first introduction, after the second entrypoint and every replay, after the
  *         replays over progress, and after the full-loader replay. They are compared WITHIN each
  *         database, not across databases, because later migrations may add `now()`-defaulted
@@ -839,15 +846,28 @@ async function slackEvidence(client: Client) {
        (select pg_catalog.count(*) from public.slack_thread_snapshots where team_id = $1) as counts`, [ORDER_TEAM_ID]
   )).rows[0];
 }
+/**
+ * The project's Graphiti partition pointer, exactly as
+ * `postgres/migrations/20260815140000_projects_graph_group_id.sql` MINTS it for a non-system
+ * project: `'g_' || replace(team_id::text, '-', '') || '_p_' || replace(id::text, '-', '')`. That
+ * migration's backfill is guarded on `graph_group_id is null`. A project seeded WITHOUT a pointer
+ * is therefore legitimately rewritten by the next full-loader replay; that was the one observed
+ * `projects` digest change, and it was not evidence mutation. Seeding the canonical pointer makes
+ * the guarded backfill a no-op, so the project row keeps EXACT whole-row hashing with nothing
+ * excluded.
+ */
+const ORDER_PROJECT_ID = "0f000000-0000-4000-8000-000000000a01";
+const ORDER_PROJECT_GRAPH_GROUP_ID = "g_7e8f9a0b1c2d4e3f8a4b5c6d7e8f9a0b_p_0f000000000040008000000000000a01";
 /** Literal staged-snapshot, published-item and ledger rows, with valid FKs, for the order fixture. */
 async function seedSlackEvidence(client: Client): Promise<void> {
   await orderFixture(client,
-    `insert into public.projects (id, team_id, slug, name, created_at)
-     values ('0f000000-0000-4000-8000-000000000a01', $1, 'order-evidence', 'Order Evidence', '2026-01-01 00:00:00+00')`, [ORDER_TEAM_ID]);
+    `insert into public.projects (id, team_id, slug, name, graph_group_id, created_at)
+     values ($2, $1, 'order-evidence', 'Order Evidence', $3, '2026-01-01 00:00:00+00')`,
+    [ORDER_TEAM_ID, ORDER_PROJECT_ID, ORDER_PROJECT_GRAPH_GROUP_ID]);
   await orderFixture(client,
     `insert into public.items (id, team_id, project_id, path, kind, access, frontmatter, body, content_sha256, actor,
                                created_at, work_at, work_at_from_source, synced_at, updated_at)
-     values ('0f000000-0000-4000-8000-000000000a02', $1, '0f000000-0000-4000-8000-000000000a01',
+     values ('0f000000-0000-4000-8000-000000000a02', $1, '${ORDER_PROJECT_ID}',
              'slack/T0ORDER001/C0ORDER0001/1718900200.000200.md', 'artifact', 'team', '{"source": "slack"}'::jsonb,
              'synthetic order evidence body', $2, 'slack',
              '2026-01-01 00:00:00+00', '2024-06-20 16:16:40+00', true, '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00')`,
@@ -993,6 +1013,15 @@ describe("AM-F2 + AC-02 history/segment block — MR-03 statement order: migrati
             await seedSlackEvidence(c);
             const seededEvidence = await slackEvidence(c);
             expect(seededEvidence.counts, `${label} fixture: 1 project, 1 published item, 2 ledger rows and 1 staged snapshot are present`).toBe("1/1/2/1");
+            // Non-vacuity of the project row: its identity and the canonical pointer the loader's backfill would mint.
+            expect((await c.query(
+              `select id::text as id, team_id::text as team_id, slug, name, graph_group_id,
+                      graph_group_id = 'g_' || replace(team_id::text, '-', '') || '_p_' || replace(id::text, '-', '') as pointer_is_canonical
+                 from public.projects where id = $1`, [ORDER_PROJECT_ID]
+            )).rows, `${label} fixture: the project carries its literal identity and the canonical graph pointer`).toEqual([{
+              id: ORDER_PROJECT_ID, team_id: ORDER_TEAM_ID, slug: "order-evidence", name: "Order Evidence",
+              graph_group_id: ORDER_PROJECT_GRAPH_GROUP_ID, pointer_is_canonical: true,
+            }]);
             const seeded = await orderEvidence(c);
 
             // ── FIRST entrypoint: the one-time union introduction. ──
