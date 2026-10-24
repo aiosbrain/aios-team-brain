@@ -215,7 +215,8 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *   - the §9.1/§9.2 fixture corrections: FX-01–FX-13, the bootstrap progress inventory with its
  *     own-property and oracle checks, and the §9 census seed at `95c2e041`.
  *  CALLER TRANSACTION SEMANTICS, discovery suite packet 5 (11 behavioral REDs and 3 GREEN controls),
- *  plus 2 pure-validator REDs in `test/slack-source-discovery.test.ts`:
+ *  plus 1 pure-validator RED in `test/slack-source-discovery.test.ts` (repeat + out-of-range/malformed
+ *  precedence; the §9.1 standalone `cursor_repeated` assertion is preserved):
  *   - repetition, durable and immediate: `delayed / cursor_repeated`, released in the same pass,
  *     with identical detail and row effects;
  *   - structural precedence over repetition: out-of-segment and malformed timestamps;

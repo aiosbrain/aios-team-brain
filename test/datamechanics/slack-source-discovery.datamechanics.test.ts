@@ -1574,15 +1574,16 @@ describe("AIO-1170 DH-09 / DH-13: claim-local delay end to end, and the page ran
       released: {
         nextLane: after?.next_lane ?? null,
         claimedLane: after?.claimed_lane ?? null,
-        lease: after?.lease_owner ?? null,
-        leaseExpiresAt: after?.lease_expires_at ?? null,
+        // Booleans, so no lease owner or expiry value lands in failure output.
+        leaseCleared: after?.lease_owner === null,
+        leaseExpiryCleared: after?.lease_expires_at === null,
         error: after?.last_error_code ?? null,
       },
     }, "the whole page is refused before any root or state write; only the fenced claim is released, turn passed").toEqual({
       outcome: { steps: [{ result: "delayed", category: "page_outside_segment", detail: OUTSIDE_DETAIL, channelId: CHANNEL }] },
       roots: rootsBefore,
       onlyRelease: true,
-      released: { nextLane: passedTurnTo, claimedLane: null, lease: null, leaseExpiresAt: null, error: "page_outside_segment" },
+      released: { nextLane: passedTurnTo, claimedLane: null, leaseCleared: true, leaseExpiryCleared: true, error: "page_outside_segment" },
     });
   }
 
@@ -1755,8 +1756,11 @@ describe("AIO-1170 DH-09 / DH-13: claim-local delay end to end, and the page ran
  * Fixture routing is by the CLAIMED lane, never by whether `oldest` is present.
  * Privacy: steps are projected to { result, category, detail, keysAllowed }, and any key outside the
  * step schema fails. Roots, bounds and histories are compared as booleans and counts, so no cursor,
- * bound or payload lands in failure output. The release counter matches the release statement
- * whatever its parameter number.
+ * bound or payload lands in failure output. The release counter matches only the CHANNEL release
+ * statement, whatever its parameter numbers.
+ * For rejected cases it also records whether that release ran on the SAME transaction session as the
+ * acceptance writer's locking read, which is the direct proof of a same-transaction release. Cases
+ * 1–4 (1b, 1c, 1d and 2 included) assert that exactly one decisive historical continuation ran.
  */
 describe("AIO-1170 §3.2/§5: the discovery caller's acceptance transaction", () => {
   const REPEAT_DETAIL = "The page repeated a saved cursor; no roots or coverage were accepted.";
@@ -1822,30 +1826,50 @@ describe("AIO-1170 §3.2/§5: the discovery caller's acceptance transaction", ()
     await elapse(seed.teamId);
     expect(await row(seed), "fixture: the historical continuation is next").toMatchObject({ historical_cursor: "c-1", next_lane: "historical" });
   }
-  /** The release writer's statement, recognized by its unique due-at clause, whatever its parameter number. */
-  const RELEASE_STATEMENT = /due_at\s*=\s*coalesce\(\$\d+::timestamptz,\s*clock_timestamp\(\)\)/;
   /**
-   * A db client that COUNTS release statements (a count only; no SQL text or value is kept). With
-   * `expireBeforeRelease`, the FIRST release statement is preceded, on the SAME session, by expiring
-   * this team's claim. That is a lease expiring after the writer's verdict but before the caller's
-   * release.
+   * The CHANNEL release writer's statement, matched whatever its parameter numbers. It is an update of
+   * `slack_sync_channels` that clears `lease_owner` and sets the due-at clause. A binding delay or any
+   * other writer cannot match it, nor trigger the expiry injection below.
    */
-  function countingReleases(counter: { releases: number }, opts: { expireBeforeRelease?: string } = {}) {
-    return transactionSessionDecoratedDb(db(), (session) => ({
-      ...session,
-      executeSql: (async (text: string, params?: unknown[]) => {
-        if (RELEASE_STATEMENT.test(text)) {
-          counter.releases += 1;
-          if (opts.expireBeforeRelease && counter.releases === 1) {
-            await session.executeSql(
-              "update slack_sync_channels set lease_expires_at = clock_timestamp() - interval '1 second' where team_id = $1",
-              [opts.expireBeforeRelease]
-            );
+  const RELEASE_STATEMENT =
+    /update\s+slack_sync_channels[\s\S]*lease_owner\s*=\s*null[\s\S]*due_at\s*=\s*coalesce\(\$\d+::timestamptz,\s*clock_timestamp\(\)\)/i;
+  /**
+   * The acceptance writer's own locking read on this session, recognized by the stored-history
+   * validity check only that read performs (a SQL-local function name, never a value).
+   */
+  const ACCEPTANCE_LOCK = /slack_channel_cursor_history_valid\([\s\S]*for\s+update/i;
+  type ReleaseCounter = { releases: number; releasesInAcceptanceTx: number };
+  const newCounter = (): ReleaseCounter => ({ releases: 0, releasesInAcceptanceTx: 0 });
+  /**
+   * A db client that COUNTS channel release statements (counts only; no SQL text or value is kept).
+   * `decorate` runs once per TRANSACTION, so `acceptedHere` is per session. A release counted in
+   * `releasesInAcceptanceTx` ran on the SAME transaction session as the acceptance writer's locking
+   * read. That is the same-transaction release §3.2 requires.
+   *
+   * With `expireBeforeRelease`, the FIRST release is preceded, on that same session, by expiring this
+   * team's claim: a lease expiring after the writer's verdict but before the caller's release.
+   */
+  function countingReleases(counter: ReleaseCounter, opts: { expireBeforeRelease?: string } = {}) {
+    return transactionSessionDecoratedDb(db(), (session) => {
+      let acceptedHere = false;
+      return {
+        ...session,
+        executeSql: (async (text: string, params?: unknown[]) => {
+          if (ACCEPTANCE_LOCK.test(text)) acceptedHere = true;
+          if (RELEASE_STATEMENT.test(text)) {
+            counter.releases += 1;
+            if (acceptedHere) counter.releasesInAcceptanceTx += 1;
+            if (opts.expireBeforeRelease && counter.releases === 1) {
+              await session.executeSql(
+                "update slack_sync_channels set lease_expires_at = clock_timestamp() - interval '1 second' where team_id = $1",
+                [opts.expireBeforeRelease]
+              );
+            }
           }
-        }
-        return session.executeSql(text, params);
-      }) as TransactionSession["executeSql"],
-    }));
+          return session.executeSql(text, params);
+        }) as TransactionSession["executeSql"],
+      };
+    });
   }
   /** Supersede the in-flight claim the way a reclaim leaves it: a new owner and a bumped fence. */
   async function successorReclaim(seed: Seed): Promise<void> {
@@ -1874,17 +1898,20 @@ describe("AIO-1170 §3.2/§5: the discovery caller's acceptance transaction", ()
     await discover(seed, integrationId, fake); // newest, empty
     await elapse(seed.teamId);
     const rootsBefore = await threadRootTs(seed.teamId);
-    const counter = { releases: 0 };
+    inFlight.continuations = 0; // count only the decisive pass's continuation
+    const counter = newCounter();
     const outcome = await settle(discover(seed, integrationId, fake, { client: countingReleases(counter) })); // c-2 → c-1
     const after = await row(seed);
+    expect({ continuationRan: inFlight.continuations }, "fixture: exactly the decisive historical continuation ran").toEqual({ continuationRan: 1 });
     expect({
-      outcome, releases: counter.releases, roots: await rootFacts(seed, rootsBefore),
+      outcome, releases: counter.releases, sameTransactionReleases: counter.releasesInAcceptanceTx,
+      roots: await rootFacts(seed, rootsBefore),
       onlyRelease: without(after, RELEASE) === without(inFlight.row, RELEASE),
-      released: { next: after?.next_lane, lease: after?.lease_owner, claimed: after?.claimed_lane, error: after?.last_error_code },
-    }, "durable repetition: typed rejection, one same-pass release, no root, nothing else moved").toEqual({
+      released: { next: after?.next_lane, leaseCleared: after?.lease_owner === null, claimedCleared: after?.claimed_lane === null, error: after?.last_error_code },
+    }, "durable repetition: typed rejection, one same-transaction release, no root, nothing else moved").toEqual({
       outcome: { steps: [{ result: "delayed", category: "cursor_repeated", detail: REPEAT_DETAIL, keysAllowed: true }] },
-      releases: 1, roots: { count: rootsBefore.length, exact: true }, onlyRelease: true,
-      released: { next: "newest", lease: null, claimed: null, error: "cursor_repeated" },
+      releases: 1, sameTransactionReleases: 1, roots: { count: rootsBefore.length, exact: true }, onlyRelease: true,
+      released: { next: "newest", leaseCleared: true, claimedCleared: true, error: "cursor_repeated" },
     });
   });
 
@@ -1897,17 +1924,19 @@ describe("AIO-1170 §3.2/§5: the discovery caller's acceptance transaction", ()
     ["1718900000.000900"]);
     await startedScan(seed, integrationId, fake);
     const rootsBefore = await threadRootTs(seed.teamId);
-    const counter = { releases: 0 };
+    const counter = newCounter();
     const outcome = await settle(discover(seed, integrationId, fake, { client: countingReleases(counter) }));
     const after = await row(seed);
+    expect({ continuationRan: inFlight.continuations }, "fixture: exactly the decisive historical continuation ran").toEqual({ continuationRan: 1 });
     expect({
-      outcome, releases: counter.releases, roots: await rootFacts(seed, rootsBefore),
+      outcome, releases: counter.releases, sameTransactionReleases: counter.releasesInAcceptanceTx,
+      roots: await rootFacts(seed, rootsBefore),
       onlyRelease: without(after, RELEASE) === without(inFlight.row, RELEASE),
-      released: { next: after?.next_lane, lease: after?.lease_owner, error: after?.last_error_code },
+      released: { next: after?.next_lane, leaseCleared: after?.lease_owner === null, error: after?.last_error_code },
     }, "an early repeat must be indistinguishable from the durable one").toEqual({
       outcome: { steps: [{ result: "delayed", category: "cursor_repeated", detail: REPEAT_DETAIL, keysAllowed: true }] },
-      releases: 1, roots: { count: rootsBefore.length, exact: true }, onlyRelease: true,
-      released: { next: "newest", lease: null, error: "cursor_repeated" },
+      releases: 1, sameTransactionReleases: 1, roots: { count: rootsBefore.length, exact: true }, onlyRelease: true,
+      released: { next: "newest", leaseCleared: true, error: "cursor_repeated" },
     });
   });
 
@@ -1932,6 +1961,7 @@ describe("AIO-1170 §3.2/§5: the discovery caller's acceptance transaction", ()
     const rootsBefore = await threadRootTs(seed.teamId);
     const outcome = await settle(discover(seed, integrationId, fake));
     const after = await row(seed);
+    expect({ continuationRan: inFlight.continuations }, "fixture: exactly the decisive historical continuation ran").toEqual({ continuationRan: 1 });
     expect({
       outcome, roots: await rootFacts(seed, rootsBefore),
       onlyRelease: without(after, RELEASE) === without(inFlight.row, RELEASE),
@@ -1957,19 +1987,22 @@ describe("AIO-1170 §3.2/§5: the discovery caller's acceptance transaction", ()
     await discover(seed, integrationId, fake); // newest, empty
     await elapse(seed.teamId);
     const rootsBefore = await threadRootTs(seed.teamId);
-    const counter = { releases: 0 };
+    inFlight.continuations = 0; // count only the decisive pass's continuation
+    const counter = newCounter();
     const outcome = await settle(discover(seed, integrationId, fake, {
       client: countingReleases(counter, { expireBeforeRelease: seed.teamId }),
     }));
     const after = await row(seed);
+    expect({ continuationRan: inFlight.continuations }, "fixture: exactly the decisive historical continuation ran").toEqual({ continuationRan: 1 });
     expect({
-      outcome, releases: counter.releases, roots: await rootFacts(seed, rootsBefore),
+      outcome, releases: counter.releases, sameTransactionReleases: counter.releasesInAcceptanceTx,
+      roots: await rootFacts(seed, rootsBefore),
       // The expired claim is NOT released: everything but the expiry itself is the in-flight row.
       onlyExpiryMoved: without(after, ["lease_expires_at"]) === without(inFlight.row, ["lease_expires_at"]),
       leaseStillOwned: after?.lease_owner === inFlight.row?.lease_owner && after?.lease_owner !== null,
     }, "a stale release reports refusal and never overwrites the row").toEqual({
       outcome: { steps: [{ result: "refused", category: "stale_channel_lease", detail: "The world changed while the page was in flight; no root was queued and no cursor moved.", keysAllowed: true }] },
-      releases: 1, roots: { count: rootsBefore.length, exact: true }, onlyExpiryMoved: true, leaseStillOwned: true,
+      releases: 1, sameTransactionReleases: 1, roots: { count: rootsBefore.length, exact: true }, onlyExpiryMoved: true, leaseStillOwned: true,
     });
   });
 
@@ -2001,6 +2034,7 @@ describe("AIO-1170 §3.2/§5: the discovery caller's acceptance transaction", ()
     const rootsBefore = await threadRootTs(seed.teamId);
     const outcome = await settle(discover(seed, integrationId, fake));
     const after = await row(seed);
+    expect({ continuationRan: inFlight.continuations }, "fixture: exactly the decisive historical continuation ran").toEqual({ continuationRan: 1 });
     expect({
       outcome, roots: await rootFacts(seed, rootsBefore),
       // A superseded lease leaves the SUCCESSOR's row exactly; a stale selection may only release.
@@ -2024,7 +2058,7 @@ describe("AIO-1170 §3.2/§5: the discovery caller's acceptance transaction", ()
     // At the 1,000-entry cap on the wide [0, A] segment: 999 fillers, then the current cursor c-1.
     await c.query(`update slack_sync_channels set historical_cursor_history = $2::jsonb where team_id = $1`,
       [seed.teamId, JSON.stringify([...fillers(999), "c-1"])]);
-    const counter = { releases: 0 };
+    const counter = newCounter();
     const outcome = await settle(discover(seed, integrationId, fake, { client: countingReleases(counter) }));
     const after = await row(seed);
     const upper = tsMicros(String(inFlight.row?.historical_segment_upper_ts));
@@ -2072,7 +2106,7 @@ describe("AIO-1170 §3.2/§5: the discovery caller's acceptance transaction", ()
         where team_id = $1`,
       [seed.teamId, JSON.stringify([...fillers(999), "c-1"])]
     );
-    const counter = { releases: 0 };
+    const counter = newCounter();
     const outcome = await settle(discover(seed, integrationId, fake, { client: countingReleases(counter) }));
     const after = await row(seed);
     // Fixture proof that the HISTORICAL continuation really ran, with S = U and cursor c-1 in flight
@@ -2087,13 +2121,14 @@ describe("AIO-1170 §3.2/§5: the discovery caller's acceptance transaction", ()
       continuationRan: true, claimedHistorical: true, singleton: true, cursorInFlight: true, historyAtCap: true,
     });
     expect({
-      outcome, releases: counter.releases, roots: await rootFacts(seed, []),
+      outcome, releases: counter.releases, sameTransactionReleases: counter.releasesInAcceptanceTx,
+      roots: await rootFacts(seed, []),
       onlyRelease: without(after, RELEASE) === without(inFlight.row, RELEASE),
-      released: { next: after?.next_lane, lease: after?.lease_owner, error: after?.last_error_code },
-    }, "an unsplittable range: typed rejection, one same-pass release, nothing else moved").toEqual({
+      released: { next: after?.next_lane, leaseCleared: after?.lease_owner === null, error: after?.last_error_code },
+    }, "an unsplittable range: typed rejection, one same-transaction release, nothing else moved").toEqual({
       outcome: { steps: [{ result: "delayed", category: "cursor_history_entries_exceeded", detail: UNSPLITTABLE_DETAIL, keysAllowed: true }] },
-      releases: 1, roots: { count: 0, exact: true }, onlyRelease: true,
-      released: { next: "newest", lease: null, error: "cursor_history_entries_exceeded" },
+      releases: 1, sameTransactionReleases: 1, roots: { count: 0, exact: true }, onlyRelease: true,
+      released: { next: "newest", leaseCleared: true, error: "cursor_history_entries_exceeded" },
     });
   });
 

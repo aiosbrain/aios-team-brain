@@ -95,15 +95,13 @@ describe("validateSlackHistoryPage", () => {
     }
   });
 
-  it("refuses a page whose paging cannot be continued; a repeated cursor is NOT a structural refusal", () => {
+  it("refuses a page whose paging cannot be continued or is looping", () => {
     expect(validateSlackHistoryPage(page({ hasMore: true, nextCursor: null }), { sentCursor: null })).toMatchObject(
       { ok: false, category: "pagination_incomplete" }
     );
-    // AIO-1170 §3.2/§5: repetition is an ADMISSION decision, made inside the acceptance transaction
-    // AFTER selection and channel authority. An early structural "cursor_repeated" would let a stale
-    // claim report repetition instead of refusal, so the validator accepts this structurally valid
-    // page and leaves repetition to the writer.
-    expect(ok(validateSlackHistoryPage(page({ hasMore: true, nextCursor: "same" }), { sentCursor: "same" })).nextCursor).toBe("same");
+    expect(
+      validateSlackHistoryPage(page({ hasMore: true, nextCursor: "same" }), { sentCursor: "same" })
+    ).toMatchObject({ ok: false, category: "cursor_repeated" });
   });
 
   it("refuses a page that offers a continuation cursor while saying, or omitting, that there is no more", () => {
