@@ -295,6 +295,22 @@ import { agePublicProof, closeRawSql, elapse, expireChannelLease } from "./slack
  *  - two-session claim/accept races;
  *  - the controlled mutants;
  *  - MR-06.
+ * PACKET 8 — PERMANENT DISCRIMINATORS FOR THE 11 CONTROLLED-MUTATION GUARDS the runtime campaign
+ * recorded UNAVAILABLE (9 tests). They use constructed, CHECK-valid literals written directly, not
+ * provider-traversal evidence, and are expected GREEN on current source. Each guard's KILL is PENDING
+ * coordinator execution of these tests and a labeled controlled mutation rerun; nothing here claims it:
+ *  - 8a, after packet 6a: a historical INNER terminal (S > L) stores the exact adjacent doubled next
+ *    segment, merges the aggregate, keeps the anchor and certifies nothing; the written outcome's
+ *    `completion` is kept in the projection (P2b, P4c, P4d, S1a);
+ *  - 8b: exact bigint midpoints just below the maximum epoch, for the capacity subdivision (P3c, and
+ *    the aggregate's preservation, S3a) and for the restart writer (P3d);
+ *  - 8c: repetition of the OLDEST entry H[0] at the entry cap is cursor_repeated (A3);
+ *  - 8d: the NEWEST lane's frozen L and logical B as fence values, each for acceptance and for the
+ *    restart writer (FN13, FN14);
+ *  - 8e, beside packet 3's eligibility matrix: a binding moved to a second valid integration at the
+ *    same revision makes the old integration's claim of an L > A candidate null (FN16).
+ *  Not claimed by packet 8: the newest lane's inner terminal and terminal rules, full segment
+ *  application across a provider traversal, MR-06, and any final acceptance.
  *
  * PRIVACY: cursors and histories are synthetic. They are compared only by SQL equality (booleans),
  * row md5 digests or SQL-computed counts and byte lengths. Errors are projected to SQLSTATE/name.
@@ -315,7 +331,8 @@ import { agePublicProof, closeRawSql, elapse, expireChannelLease } from "./slack
  *     columns, so seeding without this hit 42703. It is an idempotent replay.
  *
  * DEFERRED, NOT covered here:
- *  - the NEWEST lane as the claimed lane: its fences on B, L and its segment, and its terminal rules;
+ *  - the NEWEST lane as the claimed lane: its segment fences and its terminal rules (its B and L fences
+ *    are packet 8d);
  *  - durable cycles A→A, A→B→A and A→B→C→D→B across separate connections and invocations, on both
  *    interleaved lanes, with a new-root canary (F2-01 remainder, DH-06);
  *  - F2-02 (same cursor valid in another lane, channel, workspace, team, segment or generation;
@@ -335,7 +352,9 @@ import { agePublicProof, closeRawSql, elapse, expireChannelLease } from "./slack
  *    authority and `lockSlackChannelForAcceptance` are exercised in the discovery suite;
  *  - surrogate variants through actual transport/discovery and URL parameterization (F2-09
  *    remainder, DH-03);
- *  - subdivision, the S > L internal terminal, and segment application (DH-01/02/03/04/05).
+ *  - the NEWEST lane's S > L internal terminal, and segment application across a real provider
+ *    traversal (DH-01/02/03/04/05). The historical inner terminal and the exact high-epoch capacity
+ *    and restart subdivisions are constructed-literal cases in packet 8.
  *    Claim-time initialization is covered by packet 2 (historical) and packet 3 (newest, including
  *    the L > A typed delay);
  *  - OUTSIDE THIS FILE, covered by the caller packet in other suites (still RED where production is
@@ -1494,6 +1513,39 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
       "an ineligible row returns null with no delay bookkeeping").toEqual({ claim: null, rowUnchanged: true });
   });
 
+  // PACKET 8e: the binding INTEGRATION alone. The same CHECK-valid L > A anchored candidate is rebound
+  // to a SECOND valid Slack integration of the same team, at the SAME revision, and then claimed with the
+  // OLD integration id. Only the locking read's integration predicate makes it ineligible: an ordinary
+  // valid-bounds candidate would not discriminate it, because the claim UPDATE repeats the predicate,
+  // but the L > A delay is decided by the locking read alone.
+  it("§5 newest init control: ELIGIBILITY precedes the L > A evaluation — a row rebound to a second valid Slack integration at the same revision is not claimed by the old integration, not delayed, and byte-identical", async () => {
+    const { scope, integrationId } = await seedNewestCandidate({
+      newest_anchor_ts: "1718900800.000000", newest_lower_ts: "1718900900.000000",
+      completed_lower_ts: "1718800000.000001", completed_upper_ts: "1718900000.000000", historical_floor_reached: true,
+    });
+    const otherIntegrationId = await tx(async (session) => (await session.executeSql<{ id: string }>(
+      `insert into integrations (team_id, type, name) values ($1, 'slack', 'newest-init-second-binder') returning id::text as id`, [scope.teamId]
+    )).rows[0].id);
+    await tx((session) => session.executeSql(
+      "update slack_sync_channels set binding_integration_id = $2::uuid where team_id = $1", [scope.teamId, otherIntegrationId]
+    ));
+    expect(await tx(async (session) => (await session.executeSql<Record<string, unknown>>(
+      `select s.binding_integration_id = $2::uuid as rebound, s.binding_config_revision = $3 as revision_kept,
+              s.binding_integration_id <> $4::uuid as old_binding_gone,
+              i.type = 'slack' and i.team_id = s.team_id as second_integration_valid,
+              s.public_state = 'public' and s.due_at <= clock_timestamp() and s.lease_owner is null as otherwise_eligible
+         from slack_sync_channels s join integrations i on i.id = s.binding_integration_id
+        where s.team_id = $1`,
+      [scope.teamId, otherIntegrationId, REVISION, integrationId]
+    )).rows[0]), "fixture: only the binding integration moved, to a second valid Slack integration, at the same revision").toEqual({
+      rebound: true, revision_kept: true, old_binding_gone: true, second_integration_valid: true, otherwise_eligible: true,
+    });
+    const before = await rowDigestExcept(scope, []);
+    const claim = await claimNewest(scope, integrationId, 60_000);
+    expect({ claim, rowUnchanged: (await rowDigestExcept(scope, [])) === before },
+      "a claim under the old integration finds no eligible row: null, with no delay bookkeeping").toEqual({ claim: null, rowUnchanged: true });
+  });
+
   // ── PACKET 4a: direct claim safety (default, invalid and out-of-domain allowance/bounds) ───────────
 
   it("§5 claim safety: an OMITTED skewAllowanceMs is exactly 60,000 ms (independent BigInt oracle)", async () => {
@@ -1960,6 +2012,92 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
       },
       facts: { cursor_is_expected: true, history_is_expected: true, entries: 1000, generation: 4, newest_lane_unchanged: true },
       onlyReleaseFieldsMoved: true,
+    });
+  });
+
+  // ── PACKET 8d: the NEWEST lane's frozen L and logical B are fence values, DH-08 ──────────────────
+  // A fresh row per test: both lanes initialized (the shared seed), `next_lane` moved to newest, and the
+  // newest lane CLAIMED (it resumes the fixture's segment [L = S = 1718900440, U = A = 1718900800] with
+  // B = 1718900500, C = syn-n-1, H = [syn-n-1], G 2). Then ONLY one bound drifts by one canonical
+  // microsecond, keeping L ≤ S and L ≤ B, so the row stays CHECK-valid and every other fence matches:
+  //  - L down to 1718900439.999999;
+  //  - B up to 1718900500.000001.
+  // Acceptance offers a REPEATED continuation (syn-n-1), so a missing L/B fence would surface as
+  // cursor_repeated; the restart writer would subdivide the wide segment. Both must refuse instead, and
+  // the live (post-drift) row must stay byte-identical, the historical lane included.
+
+  const NEWEST_DRIFT = {
+    requestLower: { column: "newest_request_lower_ts", drifted: "1718900439.999999" },
+    logicalLower: { column: "newest_lower_ts", drifted: "1718900500.000001" },
+  } as const;
+
+  /** Seed both lanes, hand the turn to newest, claim it, drift one bound, and assert each step as a PRECONDITION. */
+  async function claimedNewestWithDrift(bound: keyof typeof NEWEST_DRIFT): Promise<{ seeded: Seeded; claim: SlackChannelClaim }> {
+    const seeded = await seedWideSegment([OLDER_ENTRY, "syn-h-2"]);
+    await tx((session) => session.executeSql("update slack_sync_channels set next_lane = 'newest' where team_id = $1", [seeded.scope.teamId]));
+    const result = await tx((session) => claimSlackChannelPage(session, seeded.scope, {
+      bindingIntegrationId: seeded.integrationId, bindingConfigRevision: REVISION,
+    }));
+    const claim = result !== null && !("outcome" in result) ? result : null;
+    expect(claimBounds(claim), "fixture: the initialized newest lane is claimed and resumes its exact segment").toEqual({
+      lane: "newest", anchorTs: NEWEST_FIXTURE.newest_anchor_ts, requestLowerTs: NEWEST_FIXTURE.newest_request_lower_ts,
+      segmentLowerTs: NEWEST_FIXTURE.newest_segment_lower_ts, segmentUpperTs: NEWEST_FIXTURE.newest_segment_upper_ts,
+      scanGeneration: NEWEST_FIXTURE.newest_scan_generation, lowerTs: NEWEST_FIXTURE.newest_lower_ts, cursorNull: false,
+    });
+    const drift = NEWEST_DRIFT[bound];
+    // The column name is one of the two literals above, never an input.
+    await tx((session) => session.executeSql(`update slack_sync_channels set ${drift.column} = $2 where team_id = $1`, [seeded.scope.teamId, drift.drifted]));
+    expect(await tx(async (session) => (await session.executeSql<Record<string, unknown>>(
+      `select ${drift.column} = $2 as drifted,
+              newest_request_lower_ts::numeric <= newest_segment_lower_ts::numeric
+                and newest_request_lower_ts::numeric <= newest_lower_ts::numeric as bounds_ordered,
+              newest_segment_lower_ts = $3 and newest_segment_upper_ts = $4 and newest_anchor_ts = $4
+                and newest_cursor = 'syn-n-1' and newest_scan_generation = 2 as other_newest_fences_kept,
+              claimed_lane = 'newest' and lease_owner is not null and lease_expires_at > clock_timestamp() as lease_live
+         from slack_sync_channels where team_id = $1`,
+      [seeded.scope.teamId, drift.drifted, NEWEST_FIXTURE.newest_segment_lower_ts, NEWEST_FIXTURE.newest_anchor_ts]
+    )).rows[0]), "fixture: only the one bound drifted, CHECK-valid, under a live newest lease").toEqual({
+      drifted: true, bounds_ordered: true, other_newest_fences_kept: true, lease_live: true,
+    });
+    return { seeded, claim: claim as SlackChannelClaim };
+  }
+
+  /** Acceptance of a REPEATED newest continuation after the drift: refused, and the live row exact. */
+  async function newestDriftAcceptance(bound: keyof typeof NEWEST_DRIFT) {
+    const { seeded, claim } = await claimedNewestWithDrift(bound);
+    const before = await rowDigestExcept(seeded.scope, []);
+    const outcome = await admit(claim, { terminal: false, nextCursor: "syn-n-1", oldestTs: HISTORICAL_ANCHOR });
+    return { outcome, rowUnchanged: (await rowDigestExcept(seeded.scope, [])) === before };
+  }
+  /** The restart writer after the drift: refused, and the live row exact. */
+  async function newestDriftRestart(bound: keyof typeof NEWEST_DRIFT) {
+    const { seeded, claim } = await claimedNewestWithDrift(bound);
+    const before = await rowDigestExcept(seeded.scope, []);
+    const outcome = await restartOutcome(claim);
+    return { outcome, rowUnchanged: (await rowDigestExcept(seeded.scope, [])) === before };
+  }
+
+  it("F2-11/DH-08 newest channel fence: the frozen request lower L drifted by one microsecond refuses a repeated continuation before cursor classification, and the live row is exact", async () => {
+    expect(await newestDriftAcceptance("requestLower"), "the newest fence includes L: stale authority is refused before any cursor category").toEqual({
+      outcome: { accept: { outcome: "refused" } }, rowUnchanged: true,
+    });
+  });
+
+  it("F2-11/DH-08 newest channel fence: the logical lower B drifted by one microsecond refuses a repeated continuation before cursor classification, and the live row is exact", async () => {
+    expect(await newestDriftAcceptance("logicalLower"), "the newest fence includes B: stale authority is refused before any cursor category").toEqual({
+      outcome: { accept: { outcome: "refused" } }, rowUnchanged: true,
+    });
+  });
+
+  it("§5/§8 newest invalid_cursor fence: the frozen request lower L drifted by one microsecond makes the restart writer return typed refused, and the live row is exact", async () => {
+    expect(await newestDriftRestart("requestLower"), "the newest invalid_cursor transition is fenced on L exactly like acceptance").toEqual({
+      outcome: { outcome: "refused", leaked: false }, rowUnchanged: true,
+    });
+  });
+
+  it("§5/§8 newest invalid_cursor fence: the logical lower B drifted by one microsecond makes the restart writer return typed refused, and the live row is exact", async () => {
+    expect(await newestDriftRestart("logicalLower"), "the newest invalid_cursor transition is fenced on B exactly like acceptance").toEqual({
+      outcome: { outcome: "refused", leaked: false }, rowUnchanged: true,
     });
   });
 
