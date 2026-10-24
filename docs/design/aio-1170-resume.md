@@ -2,6 +2,54 @@
 
 Last updated: 2026-10-24. The newest current-state section governs. Older sections are preserved as historical stop records and may describe gates that have since been cleared. This is the tracked recovery record for draft [PR 714](https://github.com/aiosbrain/aios-team-brain/pull/714), targeting `staging`. It does not claim AC-02 or AIO-1170 complete.
 
+## Current state — 2026-10-24, §3.4 maximum-history compatibility packet 7
+
+This section is newer than the invalid-cursor GREEN section below and supersedes its "exact next stage" bullet.
+
+- **Test checkpoint:** commits `2f553eb6` (initial) and `542f48c5` (review corrections), on the remotely verified GREEN base `9fcc04d6`.
+  - Only `test/datamechanics/slack-history-progress.datamechanics.test.ts` changed. It adds 13 new cases.
+  - Production is unchanged.
+- **Fixture:** each case uses a fresh row with BOTH lanes seeded at once, at exactly 1,000 entries and 1,048,576 bytes, with linked cursors. The row also carries legal, non-vacuous progress, certification and bookkeeping facts:
+  - a provisional newest catch-up top equal to the newest lane's B;
+  - a historical attempt-oldest inside [S, U];
+  - a completed-segments aggregate in (U, A], on the final segment with U < A;
+  - `last_read_at` and a prior `last_error_code`.
+
+  SQL proves these facts as a precondition before each action.
+- **Coverage, on real PostgreSQL:**
+  - claim, release, metadata begin, public-state record and delay;
+  - the integration-delete FK and binding-clear trigger;
+  - the opposite-lane terminal accept (exact §6 certification and full release bookkeeping);
+  - the opposite-lane segment-aware `invalid_cursor` restart;
+  - the fenced rejection/release;
+  - the test-only elapse, expire and age helpers;
+  - ensure's do-nothing path, plus an unchanged `xmin`.
+
+  Each case asserts its exact permitted effects, and a digest proves everything else on the row is preserved. Result projections are sanitized.
+- **Evidence:**
+  - Corrected focused PostgreSQL run: 96/96 pass. Log `.context/aio-1170-resume/aio1170-compatibility-writers-review-fixes-observed.log`, SHA-256 `89ebbc15419b839ec66e856840bc927f9e5a81bf4a3f9180a6e384f712b7cb81`.
+  - Typecheck, targeted ESLint and diff check pass.
+- **Reviews:**
+  - The initial Opus 5.5 HIGH review returned NOT READY with three findings:
+    - HIGH: the terminal accept was under-asserted;
+    - MEDIUM: the restart's release was under-asserted;
+    - MEDIUM: the fixture was vacuous.
+
+    The same writer corrected all three, plus bounded LOW changes (privacy sentinels, ledger, `xmin`).
+  - The affected-scope re-review returned `COMPATIBILITY PACKET READY`, with no blocker, HIGH or MEDIUM. Its retained non-gating LOWs are not claimed covered:
+    - the rejection case does not independently assert lease expiry or due time; the standalone release case does;
+    - if a writer fails unwrapped on the synthetic maximum histories, PostgreSQL could emit a huge synthetic failing-row detail;
+    - the newest lane as the claimed lane, the public/binder variants, the 200-channel projection and long-cycle detection remain explicitly deferred.
+  - The exact-dispatch `gpt-6.1-sol` HIGH task `/root/ac02_sol_finish_coordinator/aio1170_compatibility_prepush_review` returned `PASS — SAFE TO PUSH COMPATIBILITY CHECKPOINT`, with no blocker, HIGH or MEDIUM.
+    - Its one LOW is tracked here without another review loop. The privacy comment overstates detection: the sentinels sample only two non-current entries per lane, not every entry.
+- **Capacity, latest:** 12% five-hour / 42% seven-day, subscription only, no API key, overage off.
+- **Exact next stage, after remote backup and readback:**
+  1. Controlled mutation evidence for the remaining accepted runtime transitions, batched coherently.
+  2. Then, once the finite runtime matrix is complete, the required whole-scope reviews and checks.
+
+  MR-06 still waits for PR 743's staging checkpoint.
+- **Held gates:** no activation, wiring, PR 743 edit, merge or deploy.
+
 ## Current state — 2026-10-24, invalid-cursor GREEN checkpoint
 
 This section is newer than the RED section below and supersedes its "exact next stage" bullet.
