@@ -118,6 +118,19 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *  - §3.1 claim/ensured/due/release projection boundary;
  *  - §3.1 `STATE_COLUMNS` source boundary.
  *
+ * PACKET 2 — CLAIM-TIME SEGMENT INITIALIZATION (6 tests, appended at the end of the describe). The
+ * historical lane is claimed directly; the newest lane's initialization needs the configured skew
+ * allowance and is pinned through discovery in `slack-source-discovery.datamechanics.test.ts`. "Today"
+ * for this packet is checkpoint `06528f96`, where the 37 packet-1 tests and 3 precedence tests are
+ * GREEN.
+ *  - RED today (4), because today's claim freezes A but initializes no segment:
+ *     - the first claim initializes S = L = 0, U = A, C = null, H = [] and carries those bounds;
+ *     - a NEW anchor from a noncanonical completed_lower_ts is stored canonically, with U = A;
+ *     - an already-anchored uninitialized lane keeps its anchor bytes, with U = canonical(A);
+ *     - a reclaim after expiry resumes the initialized segment without reinitializing it.
+ *  - GREEN today (2), controls: an existing narrower segment is preserved by its claim; an ineligible
+ *    (private) row is neither claimed nor initialized.
+ *
  * PRIVACY: cursors and histories are synthetic. They are compared only by SQL equality (booleans),
  * row md5 digests or SQL-computed counts and byte lengths. Errors are projected to SQLSTATE/name.
  * The unrepresentable-cursor recorder intercepts `pg.Client.prototype.query` for exactly one
@@ -154,8 +167,8 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *    caller's selection/config/token authority, and `lockSlackChannelForAcceptance`;
  *  - surrogate variants through actual transport/discovery and URL parameterization (F2-09
  *    remainder, DH-03);
- *  - subdivision, the S > L internal terminal, initialization before HTTP, and segment application
- *    (DH-01/02/03/04/05);
+ *  - subdivision, the S > L internal terminal, and segment application (DH-01/02/03/04/05); claim-time
+ *    initialization is packet 2 below, plus the discovery suite's integration block;
  *  - discovery's structural validation order, root-enqueue atomicity/rollback, and static detail
  *    messages;
  *  - the §3.4 maximum-history compatibility writers;
@@ -970,4 +983,159 @@ describe("AM-F2 runtime packet 1 — state-writer history admission (real Postgr
     expect({ found: projection.includes("newest_cursor") && projection.includes("historical_cursor"), selectsHistory: projection.includes("cursor_history") },
       "STATE_COLUMNS is located and selects the cursors but neither history").toEqual({ found: true, selectsHistory: false });
   });
+
+  // ── PACKET 2: claim-time segment initialization, historical lane, direct claim (§4, §5) ────────
+  // Inside this describe ON PURPOSE, so the guard-first real-loader upgrade above has already run.
+
+  it("§5 init: the FIRST historical claim freezes A at the DB clock and initializes S = L = 0, U = A, C = null, H = [] under its lock; nothing else moves", async () => {
+    const { scope, integrationId } = await seedUnsegmentedChannel({});
+    const before = await rowDigestExcept(scope, CLAIM_PERMITTED);
+    const claim = await tx((session) => claimSlackChannelPage(session, scope, { bindingIntegrationId: integrationId, bindingConfigRevision: REVISION }));
+    const bounds = claimBounds(claim);
+    expect({
+      bounds: { ...bounds, anchorTs: undefined },
+      anchorCanonical: typeof bounds.anchorTs === "string" && CANONICAL_BOUND.test(bounds.anchorTs),
+      upperIsAnchor: bounds.segmentUpperTs === bounds.anchorTs,
+      stored: await historicalInitFacts(scope, typeof bounds.anchorTs === "string" ? bounds.anchorTs : "", typeof bounds.anchorTs === "string" ? bounds.anchorTs : ""),
+      unrelatedUnchanged: (await rowDigestExcept(scope, CLAIM_PERMITTED)) === before,
+    }, "the historical envelope [0, A] is the first segment; the claim carries its exact bounds").toEqual({
+      bounds: { lane: "historical", requestLowerTs: null, segmentLowerTs: "0.000000", segmentUpperTs: bounds.anchorTs, anchorTs: undefined },
+      anchorCanonical: true, upperIsAnchor: true,
+      stored: { anchor_is_expected: true, lower_is_floor: true, upper_is_expected: true, cursor_history_empty: true, newest_inactive: true },
+      unrelatedUnchanged: true,
+    });
+  });
+
+  it("§4/§5 init: a NEW historical anchor taken from a noncanonical completed_lower_ts is stored canonically, and U = canonical(A)", async () => {
+    const { scope, integrationId } = await seedUnsegmentedChannel({
+      completed_lower_ts: "1718900000.1", completed_upper_ts: "1718900500.000000", next_lane: "historical",
+    });
+    const before = await rowDigestExcept(scope, CLAIM_PERMITTED);
+    const claim = await tx((session) => claimSlackChannelPage(session, scope, { bindingIntegrationId: integrationId, bindingConfigRevision: REVISION }));
+    expect({
+      bounds: claimBounds(claim),
+      stored: await historicalInitFacts(scope, "1718900000.100000", "1718900000.100000"),
+      unrelatedUnchanged: (await rowDigestExcept(scope, CLAIM_PERMITTED)) === before,
+    }, "A = canonical(completed_lower_ts) = U; the certified interval itself is untouched").toEqual({
+      bounds: { lane: "historical", anchorTs: "1718900000.100000", requestLowerTs: null, segmentLowerTs: "0.000000", segmentUpperTs: "1718900000.100000" },
+      stored: { anchor_is_expected: true, lower_is_floor: true, upper_is_expected: true, cursor_history_empty: true, newest_inactive: true },
+      unrelatedUnchanged: true,
+    });
+  });
+
+  it("§4/§5 init: an ALREADY-ANCHORED uninitialized historical lane keeps its anchor bytes, and U = canonical(A)", async () => {
+    const { scope, integrationId } = await seedUnsegmentedChannel({ historical_anchor_ts: "1718900400.5", next_lane: "historical" });
+    const before = await rowDigestExcept(scope, CLAIM_PERMITTED);
+    const claim = await tx((session) => claimSlackChannelPage(session, scope, { bindingIntegrationId: integrationId, bindingConfigRevision: REVISION }));
+    expect({
+      bounds: claimBounds(claim),
+      stored: await historicalInitFacts(scope, "1718900400.5", "1718900400.500000"),
+      unrelatedUnchanged: (await rowDigestExcept(scope, CLAIM_PERMITTED)) === before,
+    }, "the preserved anchor is never re-rendered; only U is canonical").toEqual({
+      bounds: { lane: "historical", anchorTs: "1718900400.5", requestLowerTs: null, segmentLowerTs: "0.000000", segmentUpperTs: "1718900400.500000" },
+      stored: { anchor_is_expected: true, lower_is_floor: true, upper_is_expected: true, cursor_history_empty: true, newest_inactive: true },
+      unrelatedUnchanged: true,
+    });
+  });
+
+  it("§5 init: a reclaim after expiry RESUMES the initialized segment; it never reinitializes A, S, U, C, H or G", async () => {
+    const { scope, integrationId } = await seedUnsegmentedChannel({});
+    const first = await tx((session) => claimSlackChannelPage(session, scope, { bindingIntegrationId: integrationId, bindingConfigRevision: REVISION }));
+    const firstBounds = claimBounds(first);
+    const initialized = firstBounds.segmentLowerTs === "0.000000" && firstBounds.segmentUpperTs === firstBounds.anchorTs;
+    const afterFirst = await rowDigestExcept(scope, LEASE_BOOKKEEPING);
+    await tx((session) => session.executeSql(
+      "update slack_sync_channels set lease_expires_at = clock_timestamp() - interval '1 second' where team_id = $1", [scope.teamId]
+    ));
+    const second = await tx((session) => claimSlackChannelPage(session, scope, { bindingIntegrationId: integrationId, bindingConfigRevision: REVISION }));
+    expect({
+      initialized,
+      sameBounds: JSON.stringify(claimBounds(second)) === JSON.stringify(firstBounds),
+      laneUnchanged: (await rowDigestExcept(scope, LEASE_BOOKKEEPING)) === afterFirst,
+    }, "only the lease bookkeeping moves on a reclaim").toEqual({ initialized: true, sameBounds: true, laneUnchanged: true });
+  });
+
+  it("§5 init control: a claim of an EXISTING narrower segment with a stored cursor preserves it and carries its exact bounds", async () => {
+    const seeded = await seedSingletonSegment(["syn-h-1"]);
+    const before = await rowDigestExcept(seeded.scope, LEASE_BOOKKEEPING);
+    const claim = await claimHistorical(seeded);
+    expect({ bounds: claimBounds(claim), laneUnchanged: (await rowDigestExcept(seeded.scope, LEASE_BOOKKEEPING)) === before },
+      "an initialized segment is resumed exactly").toEqual({
+      bounds: { lane: "historical", anchorTs: HISTORICAL_ANCHOR, requestLowerTs: null, segmentLowerTs: HISTORICAL_ANCHOR, segmentUpperTs: HISTORICAL_ANCHOR },
+      laneUnchanged: true,
+    });
+  });
+
+  it("§5 init control: an INELIGIBLE row (not public) is not claimed and not initialized; it is byte-identical", async () => {
+    const { scope, integrationId } = await seedUnsegmentedChannel({ public_state: "private", historical_anchor_ts: "1718900400.5", next_lane: "historical" });
+    const before = await rowDigestExcept(scope, []);
+    const claim = await tx((session) => claimSlackChannelPage(session, scope, { bindingIntegrationId: integrationId, bindingConfigRevision: REVISION }));
+    expect({ claim, rowUnchanged: (await rowDigestExcept(scope, [])) === before }, "eligibility precedes initialization").toEqual({
+      claim: null, rowUnchanged: true,
+    });
+  });
 });
+
+/** Columns a historical claim may change: lease bookkeeping, the frozen anchor, attempt-oldest reset, and S/U. */
+const CLAIM_PERMITTED = [
+  "claimed_lane", "lease_owner", "lease_generation", "lease_expires_at", "attempts", "updated_at",
+  "historical_anchor_ts", "historical_oldest_seen_ts", "historical_segment_lower_ts", "historical_segment_upper_ts",
+];
+/** Columns a claim of an already-initialized lane may change: lease bookkeeping only. */
+const LEASE_BOOKKEEPING = ["claimed_lane", "lease_owner", "lease_generation", "lease_expires_at", "attempts", "updated_at"];
+/** The canonical bound spelling (§4): seconds without leading zeroes, a dot, six digits. */
+const CANONICAL_BOUND = /^(0|[1-9][0-9]{0,11})[.][0-9]{6}$/;
+
+/**
+ * The claim's fence bounds, read from an `unknown` so the expectation does not depend on how a later
+ * typed claim result is spelled. Only bound strings and the lane are kept; no cursor.
+ */
+function claimBounds(claim: unknown): Record<string, unknown> {
+  const value = (claim ?? {}) as Record<string, unknown>;
+  return {
+    lane: value.lane, anchorTs: value.anchorTs, requestLowerTs: value.requestLowerTs,
+    segmentLowerTs: value.segmentLowerTs, segmentUpperTs: value.segmentUpperTs,
+  };
+}
+
+/**
+ * A public, bound, due channel whose lanes have NO segment: both inactive unless `historical_anchor_ts`
+ * anchors the historical lane, which is the all-null initialization tuple §4 permits. Only the named
+ * columns may be overridden.
+ */
+async function seedUnsegmentedChannel(over: {
+  public_state?: "public" | "private";
+  historical_anchor_ts?: string;
+  completed_lower_ts?: string;
+  completed_upper_ts?: string;
+  next_lane?: "newest" | "historical";
+}): Promise<{ scope: SlackChannelScope; integrationId: string }> {
+  const seed = await seedTeam();
+  const scope = { teamId: seed.teamId, workspaceId: WORKSPACE, channelId: CHANNEL };
+  const integrationId = await tx(async (session) => (await session.executeSql<{ id: string }>(
+    `insert into integrations (team_id, type, name) values ($1, 'slack', 'history-init-binder') returning id::text as id`, [seed.teamId]
+  )).rows[0].id);
+  await tx((session) => session.executeSql(
+    `insert into slack_sync_channels
+       (team_id, workspace_id, channel_id, public_state, public_checked_at, binding_integration_id, binding_config_revision,
+        historical_anchor_ts, completed_lower_ts, completed_upper_ts, next_lane, due_at)
+     values ($1, $2, $3, $4, '2026-01-01 00:00:00+00', $5::uuid, $6, $7, $8, $9, $10, '2020-01-01 00:00:00+00')`,
+    [seed.teamId, WORKSPACE, CHANNEL, over.public_state ?? "public", integrationId, REVISION,
+      over.historical_anchor_ts ?? null, over.completed_lower_ts ?? null, over.completed_upper_ts ?? null, over.next_lane ?? "historical"]
+  ));
+  return { scope, integrationId };
+}
+
+/** The stored historical initialization, as booleans against literal expectations. */
+async function historicalInitFacts(scope: SlackChannelScope, anchor: string, upper: string) {
+  return tx(async (session) => (await session.executeSql<Record<string, unknown>>(
+    `select historical_anchor_ts is not distinct from $4 as anchor_is_expected,
+            historical_segment_lower_ts is not distinct from '0.000000' as lower_is_floor,
+            historical_segment_upper_ts is not distinct from $5 as upper_is_expected,
+            historical_cursor is null and historical_cursor_history = '[]'::jsonb as cursor_history_empty,
+            newest_anchor_ts is null and newest_request_lower_ts is null and newest_segment_lower_ts is null
+              and newest_segment_upper_ts is null and newest_cursor is null and newest_cursor_history = '[]'::jsonb as newest_inactive
+       from slack_sync_channels where team_id = $1 and workspace_id = $2 and channel_id = $3`,
+    [scope.teamId, scope.workspaceId, scope.channelId, anchor, upper]
+  )).rows[0]);
+}
