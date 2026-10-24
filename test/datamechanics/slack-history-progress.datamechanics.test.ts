@@ -1715,6 +1715,109 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
     });
   });
 
+  // ── PACKET 8a: the historical INNER terminal (S > L), DH-04/DH-05 ─────────────────────────────────
+  // A CONSTRUCTED, CHECK-valid literal, written directly; it is not reached here by a provider
+  // traversal. L = 0 (historical), S = 61.000100, U = 61.000109 (W = 10), A = 61.000199, a prior
+  // completed-segments aggregate 61.000150 in (U, A], and an attempt-oldest 61.000105 in [S, U]. A
+  // genuinely terminal page with oldest 61.000107 then finishes ONLY this inner segment:
+  //  - next segment [max(L, S − 2W), S − 1] = [61.000080, 61.000099] (adjacent, doubled);
+  //  - aggregate = oldest of (61.000150, 61.000105, 61.000107) = 61.000105, still above the next U;
+  //  - anchor kept, attempt-oldest/C/H cleared, G + 1, the turn passed, and NO coverage field moved.
+
+  const INNER = {
+    anchor: "61.000199", lower: "61.000100", upper: "61.000109",
+    aggregate: "61.000150", attemptOldest: "61.000105", pageOldest: "61.000107",
+  } as const;
+  /** Columns an inner terminal may change: the lane's segment, C/H, attempt-oldest, aggregate, G, and the release. */
+  const INNER_TERMINAL_PERMITTED = [
+    "historical_segment_lower_ts", "historical_segment_upper_ts", "historical_cursor", "historical_cursor_history",
+    "historical_oldest_seen_ts", "historical_completed_segments_oldest_ts", "historical_scan_generation",
+    "next_lane", "claimed_lane", "lease_owner", "lease_expires_at", "last_error_code", "last_read_at", "due_at", "updated_at",
+  ];
+
+  /**
+   * Accept one page in ONE transaction, projected like `admit` but KEEPING the written outcome's
+   * `completion` (segment or envelope). Any exception is sanitized, so it is never a typed outcome.
+   */
+  async function admitKeepingCompletion(claim: SlackChannelClaim, page: Page): Promise<Record<string, unknown>> {
+    try {
+      return await tx(async (session) => {
+        const accepted = await acceptSlackChannelPage(session, claim, page);
+        const completion = (accepted as unknown as { completion?: unknown }).completion;
+        return { ...project(accepted), completion: typeof completion === "string" ? completion : null };
+      });
+    } catch (error) {
+      return sanitized(error);
+    }
+  }
+
+  it("§5 inner terminal (S > L) / DH-04/DH-05: a historical TERMINAL page on an INNER segment stores the exact adjacent doubled next segment, merges the aggregate, keeps the anchor and certifies nothing", async () => {
+    // The older H entry makes the outcome's no-leak check LIVE.
+    const seeded = await seedWideSegment([OLDER_ENTRY, "syn-h-2"]);
+    await tx((session) => session.executeSql(
+      `update slack_sync_channels
+          set historical_anchor_ts = $2, historical_segment_lower_ts = $3, historical_segment_upper_ts = $4,
+              historical_completed_segments_oldest_ts = $5, historical_oldest_seen_ts = $6, last_error_code = 'prior_failure'
+        where team_id = $1`,
+      [seeded.scope.teamId, INNER.anchor, INNER.lower, INNER.upper, INNER.aggregate, INNER.attemptOldest]
+    ));
+    expect(await tx(async (session) => (await session.executeSql<Record<string, unknown>>(
+      `select historical_anchor_ts = $2 and historical_segment_lower_ts = $3 and historical_segment_upper_ts = $4 as bounds_seeded,
+              historical_completed_segments_oldest_ts = $5 and historical_oldest_seen_ts = $6 as progress_seeded,
+              completed_lower_ts is null and completed_upper_ts is null and newest_catchup_upper_ts is null
+                and not historical_floor_reached as uncertified,
+              historical_cursor is not null and last_error_code = 'prior_failure' as cursor_and_diagnostic
+         from slack_sync_channels where team_id = $1`,
+      [seeded.scope.teamId, INNER.anchor, INNER.lower, INNER.upper, INNER.aggregate, INNER.attemptOldest]
+    )).rows[0]), "fixture: the constructed inner-segment literal is stored").toEqual({
+      bounds_seeded: true, progress_seeded: true, uncertified: true, cursor_and_diagnostic: true,
+    });
+
+    // The test's OWN oracle: W = U − S + 1; next = [max(0, S − 2W), S − 1]; aggregate = the oldest of three.
+    const S = exactOracleTicks(INNER.lower);
+    const width = exactOracleTicks(INNER.upper) - S + BigInt(1);
+    const doubled = S - BigInt(2) * width;
+    const oracle = {
+      nextLower: renderTicks(doubled > BigInt(0) ? doubled : BigInt(0)),
+      nextUpper: renderTicks(S - BigInt(1)),
+      aggregate: [INNER.aggregate, INNER.attemptOldest, INNER.pageOldest].reduce((a, b) => (exactOracleTicks(a) <= exactOracleTicks(b) ? a : b)),
+    };
+    expect(oracle, "fixture: oracle").toEqual({ nextLower: "61.000080", nextUpper: "61.000099", aggregate: "61.000105" });
+
+    const claim = await claimHistorical(seeded);
+    const before = await rowDigestExcept(seeded.scope, INNER_TERMINAL_PERMITTED);
+    const outcome = await admitKeepingCompletion(claim, { terminal: true, nextCursor: null, oldestTs: INNER.pageOldest });
+    const facts = await tx(async (session) => (await session.executeSql<Record<string, unknown>>(
+      `select historical_segment_lower_ts is not distinct from $4 as next_lower_is_canonical,
+              historical_segment_upper_ts is not distinct from $5 as next_upper_is_adjacent,
+              historical_anchor_ts is not distinct from $6 as anchor_retained,
+              historical_completed_segments_oldest_ts is not distinct from $7 as aggregate_merged,
+              historical_oldest_seen_ts is null as attempt_oldest_cleared,
+              historical_cursor is null and historical_cursor_history = '[]'::jsonb as cursor_history_cleared,
+              historical_scan_generation::int as generation,
+              completed_lower_ts is null and completed_upper_ts is null and newest_catchup_upper_ts is null
+                and not historical_floor_reached as nothing_certified,
+              next_lane, lease_owner is null and lease_expires_at is null and claimed_lane is null as released,
+              last_error_code, last_read_at is not null as last_read_set
+         from slack_sync_channels where team_id = $1 and workspace_id = $2 and channel_id = $3`,
+      [seeded.scope.teamId, seeded.scope.workspaceId, seeded.scope.channelId, oracle.nextLower, oracle.nextUpper, INNER.anchor, oracle.aggregate]
+    )).rows[0]);
+    expect({
+      outcome, facts,
+      newestLaneUnchanged: await newestLaneExact(seeded.scope),
+      unrelatedUnchanged: (await rowDigestExcept(seeded.scope, INNER_TERMINAL_PERMITTED)) === before,
+    }, "an inner terminal finishes only its segment: exact adjacent doubled next bounds, merged aggregate, anchor kept, nothing certified, turn passed").toEqual({
+      outcome: { outcome: "written", completion: "segment" },
+      facts: {
+        next_lower_is_canonical: true, next_upper_is_adjacent: true, anchor_retained: true, aggregate_merged: true,
+        attempt_oldest_cleared: true, cursor_history_cleared: true, generation: 5, nothing_certified: true,
+        next_lane: "newest", released: true, last_error_code: null, last_read_set: true,
+      },
+      newestLaneUnchanged: true,
+      unrelatedUnchanged: true,
+    });
+  });
+
   // ── PACKET 7: §3.4 / F2-10 maximum-history compatibility writers ────────────────────────────────
   // PostgreSQL rechecks BOTH history CHECKs on every update of the row. Each writer below therefore
   // runs against a FRESH row whose two histories sit at their exact maximum accepted shape (1,000
