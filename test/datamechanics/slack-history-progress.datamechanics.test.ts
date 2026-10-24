@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { Client } from "pg";
 import { beforeAll, describe, expect, it } from "vitest";
+import { loadSchema } from "../../scripts/pg-load-schema.mjs";
 import type { TransactionSession } from "@/lib/db/types";
 import {
   acceptSlackChannelPage,
@@ -65,9 +67,16 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  * row md5 digests or counts. Errors are projected to SQLSTATE/name. The lone-surrogate recorder
  * stores a boolean, never a value.
  *
- * ISOLATION: runs on the data-mechanics tier database, truncated per test by `setup.ts`. The shared
- * `DATABASE_TEST_URL` guard (`./slack-history-isolated-url.ts`) refuses anything but the isolated
- * local runner or CI's service.
+ * ISOLATION AND SCHEMA: runs on the data-mechanics tier database, truncated per test by
+ * `setup.ts`. In `beforeAll`, in this order:
+ *  1. the shared `DATABASE_TEST_URL` guard (`./slack-history-isolated-url.ts`) refuses anything but
+ *     the isolated local runner or CI's service;
+ *  2. `slack_sync_channels` is emptied (nothing references it), so leftover rows cannot affect the
+ *     upgrade;
+ *  3. the REAL deploy loader (`scripts/pg-load-schema.mjs`: schema.sql, whose marked block is the
+ *     owned upgrade, then every migration) brings that GUARDED database to the current F2/DH
+ *     shape. This is the `slack-method-budget` pattern. The tier container may predate the new
+ *     columns, so seeding without this hit 42703. It is an idempotent replay.
  *
  * LATER RUNTIME PACKETS, NOT covered here:
  *  - discovery's structural validation order (malformed_page → pagination_incomplete →
@@ -250,10 +259,25 @@ function nearByteCapHistory(): string[] {
 }
 
 describe("AM-F2 runtime packet 1 — state-writer history admission (real Postgres)", () => {
-  beforeAll(() => {
-    // The shared guard: only the isolated local runner or CI's service; the error never prints the URL.
-    requireIsolatedTestUrl(process.env.DATABASE_TEST_URL);
-  });
+  beforeAll(async () => {
+    // 1. The shared guard FIRST: only the isolated local runner or CI's service. The error never
+    //    prints the URL, and nothing below runs unless the URL is accepted.
+    const guardedUrl = requireIsolatedTestUrl(process.env.DATABASE_TEST_URL);
+    // 2. Empty the ONE table the upgrade block validates, so a previous suite's leftover rows (setup.ts
+    //    truncates before each TEST, not before this hook) cannot decide the upgrade.
+    const client = new Client({ connectionString: guardedUrl });
+    await client.connect();
+    try {
+      await client.query("truncate table public.slack_sync_channels");
+    } finally {
+      await client.end().catch(() => {});
+    }
+    // 3. Bring the tier database to the CURRENT F2/DH schema with the REAL deploy loader, exactly as
+    //    `slack-method-budget` does. It runs schema.sql, whose byte-identical marked block upgrades
+    //    `slack_sync_channels`, then every migration. Replay is idempotent, and it runs against the
+    //    GUARDED url only. Its notices print to stdout and are not asserted.
+    await loadSchema({ cwd: process.cwd(), databaseUrl: guardedUrl, logger: { log: () => {} } });
+  }, 300_000);
 
   it("F2-01 a partial continuation APPENDS the exact decoded cursor after the lane's prior entries; the other lane and unrelated state stay exact", async () => {
     const { scope, integrationId } = await seedChannel(["syn-h-1", "syn-h-2"]);
