@@ -14,58 +14,99 @@ import {
   type SlackChannelScope,
 } from "@/lib/ingest/slack-channel-state";
 import { transactionCapability } from "@/lib/projects/context/transaction";
-import { db, seedTeam, transactionSessionDecoratedDb } from "./helpers";
+import { db, seedTeam } from "./helpers";
 import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
 
 /**
  * AIO-1170 AM-F2 — RED-FIRST RUNTIME PACKET 1: STATE-WRITER HISTORY ADMISSION
  * (accepted consolidated contract `aio1170-am-f2-deep-history-consolidated-accepted-spec-migration-v1-20261023.md`,
- * §3.1–§3.3, §4, F2-01–F2-08, DH-02/03/05/06/08).
+ * §3.1–§3.3, §4, §5, §6; PARTIAL coverage of F2-01/04/05/06/09/10/11 and DH-02/06/08).
  *
- * ONE SEAM: `acceptSlackChannelPage` as the SQL authority over a lane's SQL-local cursor history H.
- * It is exercised on the real data-mechanics PostgreSQL, with the now-installed history and
- * progress CHECKs, through the real claim and release writers. Every channel row is a literal
- * fixture with valid FKs:
- *  - initialized segments on both lanes;
- *  - a synthetic historical history and a newest history.
+ * ONE SEAM: `acceptSlackChannelPage`, called directly, as the SQL authority over the HISTORICAL
+ * lane's SQL-local cursor history H. It runs on the real data-mechanics PostgreSQL, with the
+ * installed history and progress CHECKs, through the real claim and release writers. Every channel
+ * row is a literal fixture with valid FKs:
+ *  - both lanes are initialized;
+ *  - the newest lane is a coherent, distinct tuple: B = the historical anchor, L = S < B < U = A;
+ *  - the historical segment WIDTH is explicit. A WIDE segment has S = L = 0 < U = A; a SINGLETON
+ *    segment has S = U = A. Each seed helper asserts its width in SQL.
  *
- * WHY THE CURRENT IMPLEMENTATION IS RED, by behavior rather than by a missing export: today's
- * writer moves the lane cursor but never touches H. Under the installed linkage CHECK, a partial,
- * repeated, unrepresentable or terminal acceptance therefore fails inside PostgreSQL with 23514.
- * Each case captures its outcome as a SANITIZED projection:
+ * WIDTH DECIDES CAPACITY AND UNREPRESENTABLE BEHAVIOR (§5). With S < U, an over-cap or lone-surrogate
+ * continuation is `subdivided`. That is a later packet, so every TRUE-REJECTION case for those
+ * three categories uses a SINGLETON segment, where the contract outcome is `rejected` with the
+ * original category and a release-only row change. Repetition is width-independent and never
+ * subdivides, so its cases use a WIDE segment.
+ *
+ * WHY TODAY'S WRITER IS RED, by behavior rather than by a missing export: it moves the lane cursor
+ * but never touches H, so a partial or terminal acceptance violates the installed CHECKs inside
+ * PostgreSQL (23514). It also sends the raw cursor as a SQL parameter before its fence, and its
+ * UPDATE fences neither the binding integration, the public proof nor the segment bounds. Every
+ * outcome is captured as a SANITIZED projection:
  *  - `{ outcome, category }` for a typed result;
  *  - `{ threw: true, code, name }` for an exception.
- * The intended RED is always an assertion mismatch on that projection, never an escaped
- * constraint error, a missing export, ENOENT or a parse failure. No assertion expects a raw SQL
- * error as an application outcome.
+ * An intended RED is therefore always an assertion mismatch on a projection, a row fact or a
+ * recorder boolean. It is never an escaped constraint error, a missing export, ENOENT, a parse
+ * failure or a fixture error. No assertion expects a raw SQL error as an application outcome.
  *
- * EXPECTED, per the contract:
- *  1. a partial accepted continuation APPENDS the exact decoded cursor (C becomes H's final element)
- *     after the lane's prior entries; the other lane and all unrelated state stay exact (F2-01);
- *  2. exact repetition is a typed `rejected` / `cursor_repeated`. The caller's SAME-transaction
- *     passed-turn `releaseSlackChannelForRetry` is then the only change: H, C, G, progress and
- *     certification are untouched (F2-02, §3.2). Repetition at the entry cap is still
- *     repetition (precedence);
- *  3. entry overflow and byte overflow are DISTINCT categories, computed by SQL on the actual
- *     candidate JSONB (`jsonb_array_length`, `octet_length(candidate::text)`). Overflowing both
- *     caps is `entries`. A TERMINAL page at either exact cap is written, because it appends no
- *     cursor (F2-03/04, §3.1);
- *  4. a lone surrogate is `cursor_unrepresentable`, and the raw value is NEVER sent as a SQL
- *     parameter. A valid surrogate pair and a literal U+FFFD are positive controls, appended
- *     exactly (F2-05, §3.3);
- *  5. stale authority beats cursor classification. A stale lease, binding, public proof or
- *     segment returns `refused` and leaves the row byte-identical (F2-06, DH-08);
- *  6. histories are NOT in `SlackChannelState`, `SlackChannelClaim`, due projections or returned
- *     written state (§3.1). This is behavioral (an older H entry never appears in any returned
- *     object), plus one precise source check of `STATE_COLUMNS`.
+ * LEDGER. Each test's label carries its contract ID. "Today" is the implementation at this file's
+ * base checkpoint.
  *
- * EXPECTED GREEN TODAY (not RED): the stale-LEASE and stale-BINDING refusals, which today's UPDATE
- * already fences, and the boundary checks in 6. EXPECTED RED: everything else listed in the
- * coordinator report.
+ * RED today (28). Each fails on its behavioral `expect`.
+ *  - §5 row 1, ordinary continuation (1). Appends the exact cursor as H's last element and records
+ *    attempt-oldest. Turn passed, lease cleared, last_read_at set, last_error_code null; the newest
+ *    lane is exact. Today: 23514.
+ *  - F2-01 (partial) / F2-06, repetition (2), wide segment:
+ *     - `rejected/cursor_repeated` plus the same-transaction release, which is the only change;
+ *     - repetition at the entry cap, which is repetition and not overflow (F2-04).
+ *    Today: 23514.
+ *  - F2-04/F2-05 singleton overflow (3): entries; bytes only; both caps resolving to entries. Each
+ *    is SQL-sized, and the release is the only change. Today: 23514.
+ *  - F2-05 byte boundary (3), singleton, SQL-asserted candidate bytes:
+ *     - 1,048,575 is written;
+ *     - 1,048,576 is written;
+ *     - 1,048,577 is `rejected/cursor_history_bytes_exceeded`.
+ *    Today: 23514.
+ *  - F2-04 entry boundary (1): 999 → 1,000 entries is written, singleton. Today: 23514.
+ *  - §5 final terminal (S = L) / §6 / F2-04/F2-05 terminal at either cap (2). This is real envelope
+ *    completion:
+ *     - historical A, S, U, attempt-oldest and aggregate are null; C and H are cleared;
+ *     - G = 5; floor true;
+ *     - completed bounds are [page oldest, A] and provisional is null;
+ *     - the newest lane is exact.
+ *    Today: 23514.
+ *  - F2-09 (partial: direct writer only) lone surrogates, singleton (4): the primary embedded lone
+ *    HIGH, then lone LOW, trailing HIGH and isolated leading LOW. Each must be
+ *    `rejected/cursor_unrepresentable`, with the release as the only change and no unrepresentable
+ *    cursor reaching any SQL statement. Today the raw cursor is a SQL parameter, then 23514.
+ *  - F2-09 positive controls (2): a surrogate pair and a literal U+FFFD are appended exactly. Today:
+ *    23514.
+ *  - F2-11/DH-08 (partial) channel-fence matrix (4 of 9): binding integration changed, public proof
+ *    revoked, segment upper moved, segment lower moved. Each must be `refused` with the row exact.
+ *    Today the UPDATE does not fence these predicates, and the unfenced write then fails with 23514.
+ *  - F2-11/DH-08 + F2-09 authority before early classification (5 of 6):
+ *     - a lone surrogate under an expired lease, a revoked public proof or a moved segment must be
+ *       `refused`, with the row exact and NO unrepresentable cursor in SQL. Today the cursor is a
+ *       parameter, and for public/segment the unfenced write also fails with 23514;
+ *     - an entry overflow under a revoked public proof or a moved segment must be `refused` with the
+ *       row exact. Today: 23514.
+ *  - §3.1 / F2-10 (partial), written-state boundary (1): an accepted `written` state carries no
+ *    history key and no older entry. Today: 23514.
+ *
+ * GREEN today (9), passing controls:
+ *  - F2-09 recorder calibration: SQL text, nested parameters and the query-builder surface are seen;
+ *    pure surrogate variants are classified; the pg prototype is restored;
+ *  - the channel-fence matrix (5 of 9), each already fenced by today's UPDATE: lease expired,
+ *    binding revision changed, scan generation drift, cursor drift, successor reclaim after expiry;
+ *  - entry overflow under an expired lease (1 of 6);
+ *  - §3.1 claim/ensured/due/release projection boundary;
+ *  - §3.1 `STATE_COLUMNS` source boundary.
  *
  * PRIVACY: cursors and histories are synthetic. They are compared only by SQL equality (booleans),
- * row md5 digests or counts. Errors are projected to SQLSTATE/name. The lone-surrogate recorder
- * stores a boolean, never a value.
+ * row md5 digests or SQL-computed counts and byte lengths. Errors are projected to SQLSTATE/name.
+ * The unrepresentable-cursor recorder intercepts `pg.Client.prototype.query` for exactly one
+ * transaction and restores it in `finally`. It scans SQL text and every argument recursively by
+ * UTF-16 code unit and by a synthetic marker, and stores only a boolean and a statement count. It
+ * never stringifies, copies or prints a value.
  *
  * ISOLATION AND SCHEMA: runs on the data-mechanics tier database, truncated per test by
  * `setup.ts`. In `beforeAll`, in this order:
@@ -78,13 +119,25 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *     shape. This is the `slack-method-budget` pattern. The tier container may predate the new
  *     columns, so seeding without this hit 42703. It is an idempotent replay.
  *
- * LATER RUNTIME PACKETS, NOT covered here:
- *  - discovery's structural validation order (malformed_page → pagination_incomplete →
- *    malformed_timestamp → page_outside_segment) and root-enqueue atomicity/rollback;
- *  - segment subdivision, initialization before HTTP, and segment application (DH-01/02/03);
- *  - the maximum-history compatibility writers of §3.4;
- *  - the §9.1/§9.2 source-fence and bootstrap fixture corrections;
- *  - DH-09 scheduling/fairness;
+ * DEFERRED, NOT covered here:
+ *  - the NEWEST lane as the claimed lane: its fences on B, L and its segment, and its terminal rules;
+ *  - durable cycles A→A, A→B→A and A→B→C→D→B across separate connections and invocations, on both
+ *    interleaved lanes, with a new-root canary (F2-01 remainder, DH-06);
+ *  - F2-02 (same cursor valid in another lane, channel, workspace, team, segment or generation;
+ *    binder takeover);
+ *  - F2-03 (cursor grammar, length and round-trip edges, and malformed direct arrays);
+ *  - stored-state fail-closed validation of a malformed or inconsistent persisted H;
+ *  - two-session races and expiry between lock and write; stale-release successor protection;
+ *  - the remaining fence predicates: claimed_lane, lease_generation alone, anchor drift, the
+ *    caller's selection/config/token authority, and `lockSlackChannelForAcceptance`;
+ *  - surrogate variants through actual transport/discovery and URL parameterization (F2-09
+ *    remainder, DH-03);
+ *  - subdivision, the S > L internal terminal, initialization before HTTP, and segment application
+ *    (DH-01/02/03/04/05);
+ *  - discovery's structural validation order, root-enqueue atomicity/rollback, and static detail
+ *    messages;
+ *  - the §3.4 maximum-history compatibility writers;
+ *  - the §9.1/§9.2 fixture corrections; DH-09 scheduling/fairness;
  *  - the full DH-11/12/13 matrices and the controlled mutants.
  */
 
@@ -92,14 +145,31 @@ const WORKSPACE = "T0HISTADM1";
 const CHANNEL = "C0HISTADM1";
 const REVISION = "ad".repeat(32);
 const OTHER_REVISION = "be".repeat(32);
+const HISTORICAL_ANCHOR = "1718900500.000000";
 
-/** Lane literals: initialized segments on BOTH lanes; the historical lane is the one claimed. */
+/**
+ * The newest lane, initialized and NOT claimed, with every field distinct and contract-coherent:
+ * B = the historical anchor (the claim rule's catch-up lower), L = S = B − 60 s, U = A.
+ */
 const NEWEST_FIXTURE = {
-  newest_anchor_ts: "1718900800.000000", newest_lower_ts: "1718900700.000000", newest_request_lower_ts: "1718900640.000000",
-  newest_segment_lower_ts: "1718900640.000000", newest_segment_upper_ts: "1718900800.000000",
+  newest_anchor_ts: "1718900800.000000", newest_lower_ts: HISTORICAL_ANCHOR, newest_request_lower_ts: "1718900440.000000",
+  newest_segment_lower_ts: "1718900440.000000", newest_segment_upper_ts: "1718900800.000000",
   newest_cursor: "syn-n-1", newest_cursor_history: JSON.stringify(["syn-n-1"]), newest_scan_generation: 2,
 };
-const HISTORICAL_ANCHOR = "1718900500.000000";
+
+/** The historical segment WIDTH, explicit per fixture. Historical L is the implicit 0. */
+type SegmentWidth = "wide" | "singleton";
+const HISTORICAL_SEGMENTS: Record<SegmentWidth, { lower: string; upper: string; pageOldest: string }> = {
+  // S = L = 0 < U = A: an over-cap or unrepresentable continuation SUBDIVIDES here (later packet).
+  wide: { lower: "0.000000", upper: HISTORICAL_ANCHOR, pageOldest: "1718900400.000000" },
+  // S = U = A: an over-cap or unrepresentable continuation is a TRUE rejection.
+  singleton: { lower: HISTORICAL_ANCHOR, upper: HISTORICAL_ANCHOR, pageOldest: HISTORICAL_ANCHOR },
+};
+
+/** The only cursors that must never reach SQL carry this synthetic marker. */
+const UNREPRESENTABLE_MARKER = "syn-unrep-";
+const OLDER_ENTRY = "syn-h-older";
+const PG_QUERY = Client.prototype.query;
 
 function tx<T>(fn: (session: TransactionSession) => Promise<T>): Promise<T> {
   return transactionCapability(db()).transaction(fn);
@@ -120,16 +190,54 @@ function hasLoneSurrogate(value: string): boolean {
   return false;
 }
 
-/** A transaction whose every SQL parameter is checked for a lone surrogate; only a boolean is kept. */
-function recordingTx<T>(recorder: { loneSurrogateSent: boolean }, fn: (session: TransactionSession) => Promise<T>): Promise<T> {
-  const decorated = transactionSessionDecoratedDb(db(), (session) => ({
-    ...session,
-    executeSql: (async (sql: string, params?: readonly unknown[]) => {
-      if ((params ?? []).some((param) => typeof param === "string" && hasLoneSurrogate(param))) recorder.loneSurrogateSent = true;
-      return session.executeSql(sql, params as unknown[]);
-    }) as TransactionSession["executeSql"],
-  }));
-  return transactionCapability(decorated).transaction(fn);
+/**
+ * True if `value` carries an unrepresentable cursor anywhere: a string with a lone surrogate or the
+ * synthetic marker (which also catches a U+FFFD-replaced or JSON-escaped copy), searched
+ * recursively through arrays, objects, maps, sets and byte buffers. Scans code units and bytes
+ * only; never stringifies or keeps a value. Anything it cannot inspect (too deep, or a `toPostgres`
+ * value serialized later by pg) fails CLOSED as carrying.
+ */
+function carriesUnrepresentableCursor(value: unknown, seen: WeakSet<object> = new WeakSet(), depth = 0): boolean {
+  if (typeof value === "string") return value.includes(UNREPRESENTABLE_MARKER) || hasLoneSurrogate(value);
+  if (value === null || typeof value !== "object") return false;
+  if (depth > 32) return true;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  if (value instanceof Uint8Array) return Buffer.from(value.buffer, value.byteOffset, value.byteLength).includes(UNREPRESENTABLE_MARKER);
+  if (value instanceof Date) return false;
+  if (typeof (value as { toPostgres?: unknown }).toPostgres === "function") return true;
+  const items: unknown[] = value instanceof Map ? [...value.keys(), ...value.values()]
+    : value instanceof Set ? [...value.values()]
+      : Array.isArray(value) ? value : Object.values(value);
+  return items.some((item) => carriesUnrepresentableCursor(item, seen, depth + 1));
+}
+
+type SqlRecorder = { unrepresentableCursorSent: boolean; statements: number };
+const newRecorder = (): SqlRecorder => ({ unrepresentableCursorSent: false, statements: 0 });
+
+/**
+ * One transaction with the pg QUERY BOUNDARY recorded. Every surface reaches `pg.Client.prototype.query`:
+ *  - `executeSql`;
+ *  - the session's query builder;
+ *  - control statements;
+ *  - pool queries.
+ * The interception is installed only for this transaction and restored in `finally`. It refuses to
+ * nest. Only a boolean and a statement count are kept.
+ */
+async function recordingTx<T>(recorder: SqlRecorder, fn: (session: TransactionSession) => Promise<T>): Promise<T> {
+  const proto = Client.prototype as unknown as { query: (...args: unknown[]) => unknown };
+  const original = proto.query;
+  if (original !== (PG_QUERY as unknown)) throw new Error("fixture: the pg query recorder is already installed");
+  proto.query = function recordedQuery(this: unknown, ...args: unknown[]) {
+    recorder.statements += 1;
+    if (carriesUnrepresentableCursor(args)) recorder.unrepresentableCursorSent = true;
+    return original.apply(this, args);
+  };
+  try {
+    return await tx(fn);
+  } finally {
+    proto.query = original;
+  }
 }
 
 /** A typed outcome reduced to `{ outcome, category? }`; nothing else (no state, no cursor) is kept. */
@@ -138,16 +246,26 @@ function project(result: unknown): Record<string, unknown> {
   return value.category === undefined ? { outcome: value.outcome } : { outcome: value.outcome, category: value.category };
 }
 
+/** Any exception reduced to SQLSTATE and name; nothing value-bearing is kept. */
+function sanitized(error: unknown): Record<string, unknown> {
+  const e = (error ?? {}) as { code?: unknown; name?: unknown };
+  return { threw: true, code: typeof e.code === "string" ? e.code : null, name: typeof e.name === "string" ? e.name : null };
+}
+
+/** Booleans only: does a returned value name a history, or carry the older H entry? */
+function leaks(value: unknown): { historyKey: boolean; olderEntry: boolean } {
+  const text = JSON.stringify(value) ?? "";
+  return { historyKey: /history/i.test(text), olderEntry: text.includes(OLDER_ENTRY) };
+}
+
 type Page = { terminal: boolean; nextCursor: string | null; oldestTs: string | null };
 
 /**
  * Accept one page in ONE transaction. For a typed `rejected` result, the caller's SAME-transaction
- * passed-turn release follows (§3.2). Any exception is reduced to its SQLSTATE and name, so an
- * intended RED is an assertion mismatch and nothing value-bearing prints.
+ * passed-turn release follows (§3.2). Any exception is sanitized, so an intended RED is an
+ * assertion mismatch and nothing value-bearing prints.
  */
-async function admit(
-  claim: SlackChannelClaim, page: Page, recorder?: { loneSurrogateSent: boolean },
-): Promise<Record<string, unknown>> {
+async function admit(claim: SlackChannelClaim, page: Page, recorder?: SqlRecorder): Promise<Record<string, unknown>> {
   const run = async (session: TransactionSession) => {
     const accepted = await acceptSlackChannelPage(session, claim, page);
     const view = accepted as unknown as { outcome: string; category?: string };
@@ -160,19 +278,25 @@ async function admit(
   try {
     return await (recorder ? recordingTx(recorder, run) : tx(run));
   } catch (error) {
-    const e = (error ?? {}) as { code?: unknown; name?: unknown };
-    return { threw: true, code: typeof e.code === "string" ? e.code : null, name: typeof e.name === "string" ? e.name : null };
+    return sanitized(error);
   }
 }
 
-/** Seed a team, a Slack integration and ONE claimable channel whose historical lane holds `history`. */
-async function seedChannel(history: string[]): Promise<{ scope: SlackChannelScope; integrationId: string }> {
+type Seeded = { scope: SlackChannelScope; integrationId: string; width: SegmentWidth; pageOldest: string };
+
+/**
+ * Seed a team, a Slack integration and ONE claimable channel. Its historical lane holds `history` in a
+ * segment of the given WIDTH, and the width is then asserted from the stored row. Use
+ * `seedWideSegment` or `seedSingletonSegment`; never this directly.
+ */
+async function seedChannel(width: SegmentWidth, history: string[]): Promise<Seeded> {
+  const segment = HISTORICAL_SEGMENTS[width];
   const seed = await seedTeam();
   const scope = { teamId: seed.teamId, workspaceId: WORKSPACE, channelId: CHANNEL };
   const integrationId = await tx(async (session) => (await session.executeSql<{ id: string }>(
     `insert into integrations (team_id, type, name) values ($1, 'slack', 'history-admission-binder') returning id::text as id`, [seed.teamId]
   )).rows[0].id);
-  await tx(async (session) => {
+  const stored = await tx(async (session) => {
     await session.executeSql(
       `insert into slack_sync_channels
          (team_id, workspace_id, channel_id, public_state, public_checked_at, binding_integration_id, binding_config_revision,
@@ -183,18 +307,32 @@ async function seedChannel(history: string[]): Promise<{ scope: SlackChannelScop
           next_lane, due_at)
        values ($1, $2, $3, 'public', '2026-01-01 00:00:00+00', $4::uuid, $5,
                $6, $7, $8, $9, $10, $11, $12::jsonb, $13,
-               $14, '0.000000', $14, $15, $16::jsonb, 4,
+               $14, $15, $16, $17, $18::jsonb, 4,
                'historical', '2020-01-01 00:00:00+00')`,
       [seed.teamId, WORKSPACE, CHANNEL, integrationId, REVISION,
         NEWEST_FIXTURE.newest_anchor_ts, NEWEST_FIXTURE.newest_lower_ts, NEWEST_FIXTURE.newest_request_lower_ts,
         NEWEST_FIXTURE.newest_segment_lower_ts, NEWEST_FIXTURE.newest_segment_upper_ts,
         NEWEST_FIXTURE.newest_cursor, NEWEST_FIXTURE.newest_cursor_history, NEWEST_FIXTURE.newest_scan_generation,
-        HISTORICAL_ANCHOR, history.length > 0 ? history[history.length - 1] : null, JSON.stringify(history)]
+        HISTORICAL_ANCHOR, segment.lower, segment.upper,
+        history.length > 0 ? history[history.length - 1] : null, JSON.stringify(history)]
     );
+    return (await session.executeSql<{ width: string }>(
+      `select case when historical_segment_lower_ts::numeric = historical_segment_upper_ts::numeric then 'singleton'
+                   when historical_segment_lower_ts::numeric < historical_segment_upper_ts::numeric then 'wide'
+                   else 'invalid' end as width
+         from slack_sync_channels where team_id = $1 and workspace_id = $2 and channel_id = $3`,
+      [scope.teamId, scope.workspaceId, scope.channelId]
+    )).rows[0].width;
   });
-  return { scope, integrationId };
+  expect(stored, `fixture: the historical segment is ${width}`).toBe(width);
+  return { scope, integrationId, width, pageOldest: segment.pageOldest };
 }
-async function claimHistorical(scope: SlackChannelScope, integrationId: string): Promise<SlackChannelClaim> {
+/** S = L = 0 < U = A. For appends, repetition, terminal completion, controls and the fence matrix. */
+const seedWideSegment = (history: string[]) => seedChannel("wide", history);
+/** S = U = A. For EVERY capacity or unrepresentable true rejection, and its boundaries. */
+const seedSingletonSegment = (history: string[]) => seedChannel("singleton", history);
+
+async function claimHistorical({ scope, integrationId }: Seeded): Promise<SlackChannelClaim> {
   const claim = await tx((session) => claimSlackChannelPage(session, scope, { bindingIntegrationId: integrationId, bindingConfigRevision: REVISION }));
   expect({ claimed: claim !== null, lane: claim?.lane, generation: claim?.scanGeneration }, "fixture: the historical lane is claimed at generation 4").toEqual({
     claimed: true, lane: "historical", generation: 4,
@@ -209,18 +347,60 @@ async function rowDigestExcept(scope: SlackChannelScope, excluded: string[]): Pr
     [scope.teamId, scope.workspaceId, scope.channelId, excluded]
   )).rows[0].digest);
 }
+/** Every newest-lane field equals the fixture literal (one boolean). */
+async function newestLaneExact(scope: SlackChannelScope): Promise<boolean> {
+  return tx(async (session) => (await session.executeSql<{ exact: boolean }>(
+    `select coalesce(newest_anchor_ts = $4 and newest_lower_ts = $5 and newest_request_lower_ts = $6
+                     and newest_segment_lower_ts = $7 and newest_segment_upper_ts = $8
+                     and newest_cursor = $9 and newest_cursor_history = $10::jsonb
+                     and newest_scan_generation = $11::bigint, false) as exact
+       from slack_sync_channels where team_id = $1 and workspace_id = $2 and channel_id = $3`,
+    [scope.teamId, scope.workspaceId, scope.channelId,
+      NEWEST_FIXTURE.newest_anchor_ts, NEWEST_FIXTURE.newest_lower_ts, NEWEST_FIXTURE.newest_request_lower_ts,
+      NEWEST_FIXTURE.newest_segment_lower_ts, NEWEST_FIXTURE.newest_segment_upper_ts,
+      NEWEST_FIXTURE.newest_cursor, NEWEST_FIXTURE.newest_cursor_history, NEWEST_FIXTURE.newest_scan_generation]
+  )).rows[0].exact);
+}
 /** Boolean facts about the stored historical lane against literal expectations; values never print. */
 async function historicalFacts(scope: SlackChannelScope, cursor: string | null, history: string[]) {
-  return tx(async (session) => (await session.executeSql<Record<string, unknown>>(
+  const row = await tx(async (session) => (await session.executeSql<Record<string, unknown>>(
     `select historical_cursor is not distinct from $4 as cursor_is_expected,
             historical_cursor_history = $5::jsonb as history_is_expected,
             pg_catalog.jsonb_array_length(historical_cursor_history)::int as entries,
-            historical_scan_generation::int as generation,
-            newest_cursor_history = $6::jsonb and newest_cursor = $7 as newest_lane_unchanged
+            historical_scan_generation::int as generation
        from slack_sync_channels where team_id = $1 and workspace_id = $2 and channel_id = $3`,
-    [scope.teamId, scope.workspaceId, scope.channelId, cursor, JSON.stringify(history),
-      NEWEST_FIXTURE.newest_cursor_history, NEWEST_FIXTURE.newest_cursor]
+    [scope.teamId, scope.workspaceId, scope.channelId, cursor, JSON.stringify(history)]
   )).rows[0]);
+  return { ...row, newest_lane_unchanged: await newestLaneExact(scope) };
+}
+/** Turn, lease, read and diagnostic bookkeeping, plus the historical attempt-oldest against a literal. */
+async function bookkeeping(scope: SlackChannelScope, attemptOldest: string | null) {
+  return tx(async (session) => (await session.executeSql<Record<string, unknown>>(
+    `select next_lane, claimed_lane, lease_owner is null and lease_expires_at is null as lease_cleared,
+            last_read_at is not null as last_read_set, last_error_code,
+            historical_oldest_seen_ts is not distinct from $4 as attempt_oldest_is_expected
+       from slack_sync_channels where team_id = $1 and workspace_id = $2 and channel_id = $3`,
+    [scope.teamId, scope.workspaceId, scope.channelId, attemptOldest]
+  )).rows[0]);
+}
+/** §5 final terminal / §6 envelope completion facts for the historical lane (booleans and G only). */
+async function historicalCompletion(scope: SlackChannelScope, completedLower: string, completedUpper: string) {
+  const row = await tx(async (session) => (await session.executeSql<Record<string, unknown>>(
+    `select historical_anchor_ts is null as anchor_cleared,
+            historical_segment_lower_ts is null and historical_segment_upper_ts is null as segment_cleared,
+            historical_oldest_seen_ts is null as attempt_oldest_cleared,
+            historical_completed_segments_oldest_ts is null as aggregate_cleared,
+            historical_cursor is null as cursor_cleared,
+            historical_cursor_history = '[]'::jsonb as history_cleared,
+            historical_scan_generation::int as generation,
+            historical_floor_reached as floor_reached,
+            completed_lower_ts is not distinct from $4 as completed_lower_is_expected,
+            completed_upper_ts is not distinct from $5 as completed_upper_is_expected,
+            newest_catchup_upper_ts is null as provisional_cleared
+       from slack_sync_channels where team_id = $1 and workspace_id = $2 and channel_id = $3`,
+    [scope.teamId, scope.workspaceId, scope.channelId, completedLower, completedUpper]
+  )).rows[0]);
+  return { ...row, newest_lane_unchanged: await newestLaneExact(scope) };
 }
 async function storedHistoricalSize(scope: SlackChannelScope) {
   return tx(async (session) => (await session.executeSql<{ entries: number; bytes: number }>(
@@ -230,6 +410,23 @@ async function storedHistoricalSize(scope: SlackChannelScope) {
     [scope.teamId, scope.workspaceId, scope.channelId]
   )).rows[0]);
 }
+/** The CANDIDATE history (stored H plus one synthetic ASCII cursor), sized by SQL's own definition. */
+async function candidateHistoricalSize(scope: SlackChannelScope, cursor: string) {
+  return tx(async (session) => (await session.executeSql<{ entries: number; bytes: number }>(
+    `select pg_catalog.jsonb_array_length(c)::int as entries, pg_catalog.octet_length(c::text)::int as bytes
+       from (select historical_cursor_history || pg_catalog.jsonb_build_array($4::text) as c
+               from slack_sync_channels where team_id = $1 and workspace_id = $2 and channel_id = $3) candidate`,
+    [scope.teamId, scope.workspaceId, scope.channelId, cursor]
+  )).rows[0]);
+}
+
+type Mutation = (seeded: Seeded) => Promise<void>;
+/** A stale-authority mutation applied AFTER the claim; `$1` is the seeded team. */
+const sqlMutation = (sql: string): Mutation => async ({ scope }) => {
+  await tx((session) => session.executeSql(sql, [scope.teamId]));
+};
+const EXPIRE_LEASE = sqlMutation("update slack_sync_channels set lease_expires_at = clock_timestamp() - interval '1 second' where team_id = $1");
+const REVOKE_PUBLIC = sqlMutation("update slack_sync_channels set public_state = 'private' where team_id = $1");
 
 /** Columns a PARTIAL acceptance may change; every other column must be byte-identical. */
 const PARTIAL_PERMITTED = [
@@ -252,7 +449,11 @@ function byteCapHistory(): string[] {
     return i < 576 ? id + pad.repeat(347) : `${id}${pad.repeat(346)}aa`;
   });
 }
-/** 999 entries of 1,045 bytes: 1,047,951 serialized bytes, so a 700-byte cursor overflows ONLY the byte cap. */
+/**
+ * 999 entries of 1,045 bytes: 1,047,951 serialized bytes (2 + 999 × 1,047 + 998 × 2). An ASCII cursor of n
+ * characters adds n + 4, so n = 620 / 621 / 622 gives a 1,048,575 / 1,048,576 / 1,048,577-byte
+ * candidate. A 700-byte cursor overflows ONLY the byte cap.
+ */
 function nearByteCapHistory(): string[] {
   const pad = String.fromCodePoint(0x4e00);
   return Array.from({ length: 999 }, (_, i) => `n${String(i).padStart(3, "0")}${pad.repeat(347)}`);
@@ -279,51 +480,57 @@ describe("AM-F2 runtime packet 1 — state-writer history admission (real Postgr
     await loadSchema({ cwd: process.cwd(), databaseUrl: guardedUrl, logger: { log: () => {} } });
   }, 300_000);
 
-  it("F2-01 a partial continuation APPENDS the exact decoded cursor after the lane's prior entries; the other lane and unrelated state stay exact", async () => {
-    const { scope, integrationId } = await seedChannel(["syn-h-1", "syn-h-2"]);
-    const claim = await claimHistorical(scope, integrationId);
+  it("§5 row 1 an ordinary continuation APPENDS the exact decoded cursor after the lane's prior entries, records attempt-oldest and passes the turn; the other lane and unrelated state stay exact", async () => {
+    const seeded = await seedWideSegment(["syn-h-1", "syn-h-2"]);
+    const { scope } = seeded;
+    const claim = await claimHistorical(seeded);
     const before = await rowDigestExcept(scope, PARTIAL_PERMITTED);
-    const outcome = await admit(claim, { terminal: false, nextCursor: "syn-h-3", oldestTs: "1718900400.000000" });
+    const outcome = await admit(claim, { terminal: false, nextCursor: "syn-h-3", oldestTs: seeded.pageOldest });
     expect({
       outcome,
       facts: await historicalFacts(scope, "syn-h-3", ["syn-h-1", "syn-h-2", "syn-h-3"]),
+      bookkeeping: await bookkeeping(scope, seeded.pageOldest),
       unrelatedUnchanged: (await rowDigestExcept(scope, PARTIAL_PERMITTED)) === before,
     }, "the cursor is appended (not replaced) as H's final element; nothing outside the permitted partial fields moves").toEqual({
       outcome: { accept: { outcome: "written" } },
       facts: { cursor_is_expected: true, history_is_expected: true, entries: 3, generation: 4, newest_lane_unchanged: true },
+      bookkeeping: {
+        next_lane: "newest", claimed_lane: null, lease_cleared: true, last_read_set: true, last_error_code: null,
+        attempt_oldest_is_expected: true,
+      },
       unrelatedUnchanged: true,
     });
   });
 
-  it("F2-02 an exact repetition is rejected as cursor_repeated, and the same-transaction passed-turn release is the only change", async () => {
-    const { scope, integrationId } = await seedChannel(["syn-h-1", "syn-h-2"]);
-    const claim = await claimHistorical(scope, integrationId);
+  it("F2-01 (partial) / F2-06 an exact repetition on a WIDE segment is rejected as cursor_repeated (never subdivided); the same-transaction passed-turn release is the only change", async () => {
+    const seeded = await seedWideSegment(["syn-h-1", "syn-h-2"]);
+    const { scope } = seeded;
+    const claim = await claimHistorical(seeded);
     const before = await rowDigestExcept(scope, RELEASE_PERMITTED);
-    const outcome = await admit(claim, { terminal: false, nextCursor: "syn-h-1", oldestTs: "1718900400.000000" });
-    const bookkeeping = await tx(async (session) => (await session.executeSql<Record<string, unknown>>(
-      `select next_lane, claimed_lane, lease_owner is null as lease_cleared, last_error_code
-         from slack_sync_channels where team_id = $1 and workspace_id = $2 and channel_id = $3`,
-      [scope.teamId, scope.workspaceId, scope.channelId]
-    )).rows[0]);
+    const outcome = await admit(claim, { terminal: false, nextCursor: "syn-h-1", oldestTs: seeded.pageOldest });
     expect({
-      outcome, bookkeeping,
+      outcome, bookkeeping: await bookkeeping(scope, null),
       facts: await historicalFacts(scope, "syn-h-2", ["syn-h-1", "syn-h-2"]),
       onlyReleaseFieldsMoved: (await rowDigestExcept(scope, RELEASE_PERMITTED)) === before,
-    }, "typed cursor_repeated; no history, cursor, generation, progress or certification change; the turn passes").toEqual({
+    }, "typed cursor_repeated; no history, cursor, generation, segment, progress or certification change; the turn passes").toEqual({
       outcome: { accept: { outcome: "rejected", category: "cursor_repeated" }, release: "written" },
-      bookkeeping: { next_lane: "newest", claimed_lane: null, lease_cleared: true, last_error_code: "cursor_repeated" },
+      bookkeeping: {
+        next_lane: "newest", claimed_lane: null, lease_cleared: true, last_read_set: false, last_error_code: "cursor_repeated",
+        attempt_oldest_is_expected: true,
+      },
       facts: { cursor_is_expected: true, history_is_expected: true, entries: 2, generation: 4, newest_lane_unchanged: true },
       onlyReleaseFieldsMoved: true,
     });
   });
 
-  it("F2-02 repetition AT the entry cap is still cursor_repeated (repetition precedes capacity)", async () => {
+  it("F2-01 (partial) / F2-04 repetition AT the entry cap on a WIDE segment is still cursor_repeated (repetition precedes capacity; never subdivided)", async () => {
     const history = entryCapHistory();
-    const { scope, integrationId } = await seedChannel(history);
-    expect((await storedHistoricalSize(scope)).entries, "fixture: the historical lane is at the 1,000-entry cap").toBe(1000);
-    const claim = await claimHistorical(scope, integrationId);
+    const seeded = await seedWideSegment(history);
+    const { scope } = seeded;
+    expect(await storedHistoricalSize(scope), "fixture: the historical lane is at the 1,000-entry cap").toEqual({ entries: 1000, bytes: 10000 });
+    const claim = await claimHistorical(seeded);
     const before = await rowDigestExcept(scope, RELEASE_PERMITTED);
-    const outcome = await admit(claim, { terminal: false, nextCursor: history[500], oldestTs: "1718900400.000000" });
+    const outcome = await admit(claim, { terminal: false, nextCursor: history[500], oldestTs: seeded.pageOldest });
     expect({ outcome, onlyReleaseFieldsMoved: (await rowDigestExcept(scope, RELEASE_PERMITTED)) === before },
       "a repeated cursor at the cap is repetition, not entry overflow").toEqual({
       outcome: { accept: { outcome: "rejected", category: "cursor_repeated" }, release: "written" }, onlyReleaseFieldsMoved: true,
@@ -331,93 +538,276 @@ describe("AM-F2 runtime packet 1 — state-writer history admission (real Postgr
   });
 
   it.each([
-    { label: "ENTRY overflow (1,000 short entries + one new cursor)", history: entryCapHistory, cursor: "cap-new", category: "cursor_history_entries_exceeded" },
-    { label: "BYTE overflow only (999 entries near the byte cap + a 700-byte cursor)", history: nearByteCapHistory, cursor: "z".repeat(700), category: "cursor_history_bytes_exceeded" },
-    { label: "BOTH caps (a maximum history + one new cursor) is entries", history: byteCapHistory, cursor: "both-new", category: "cursor_history_entries_exceeded" },
-  ])("F2-03/04 $label is the typed $category, computed on the actual candidate, with only the release moving", async ({ history, cursor, category }) => {
-    const { scope, integrationId } = await seedChannel(history());
-    const size = await storedHistoricalSize(scope);
-    expect(size.entries <= 1000 && size.bytes <= 1048576, "fixture: the stored history is within both caps").toBe(true);
-    const claim = await claimHistorical(scope, integrationId);
+    {
+      label: "ENTRY overflow (1,000 short entries + one new cursor)", history: entryCapHistory, cursor: "cap-new",
+      stored: { entries: 1000, bytes: 10000 }, candidate: { entries: 1001, bytes: 10011 }, category: "cursor_history_entries_exceeded",
+    },
+    {
+      label: "BYTE overflow only (999 entries near the byte cap + a 700-byte cursor)", history: nearByteCapHistory, cursor: "z".repeat(700),
+      stored: { entries: 999, bytes: 1047951 }, candidate: { entries: 1000, bytes: 1048655 }, category: "cursor_history_bytes_exceeded",
+    },
+    {
+      label: "BOTH caps (a maximum history + one new cursor) resolving to entries", history: byteCapHistory, cursor: "both-new",
+      stored: { entries: 1000, bytes: 1048576 }, candidate: { entries: 1001, bytes: 1048588 }, category: "cursor_history_entries_exceeded",
+    },
+  ])("F2-04/F2-05 on a SINGLETON segment, $label is the typed $category, computed on the actual candidate, with only the release moving", async ({ history, cursor, stored, candidate, category }) => {
+    const seeded = await seedSingletonSegment(history());
+    const { scope } = seeded;
+    expect({ stored: await storedHistoricalSize(scope), candidate: await candidateHistoricalSize(scope, cursor) },
+      "fixture: SQL-sized stored and candidate histories").toEqual({ stored, candidate });
+    const claim = await claimHistorical(seeded);
     const before = await rowDigestExcept(scope, RELEASE_PERMITTED);
-    const outcome = await admit(claim, { terminal: false, nextCursor: cursor, oldestTs: "1718900400.000000" });
+    const outcome = await admit(claim, { terminal: false, nextCursor: cursor, oldestTs: seeded.pageOldest });
     expect({ outcome, onlyReleaseFieldsMoved: (await rowDigestExcept(scope, RELEASE_PERMITTED)) === before, after: await storedHistoricalSize(scope) },
-      `typed ${category}; the stored history is untouched`).toEqual({
-      outcome: { accept: { outcome: "rejected", category }, release: "written" }, onlyReleaseFieldsMoved: true, after: size,
+      `typed ${category}; an unsplittable range keeps the stored history untouched`).toEqual({
+      outcome: { accept: { outcome: "rejected", category }, release: "written" }, onlyReleaseFieldsMoved: true, after: stored,
     });
   });
 
   it.each([
-    { label: "the exact entry cap", history: entryCapHistory, entries: 1000 },
-    { label: "the exact byte cap (1,048,576 bytes)", history: byteCapHistory, entries: 1000 },
-  ])("F2-03/04 a TERMINAL page at $label is written: it appends no cursor", async ({ history, entries }) => {
-    const { scope, integrationId } = await seedChannel(history());
-    expect((await storedHistoricalSize(scope)).entries, "fixture: the lane is at its cap").toBe(entries);
-    const claim = await claimHistorical(scope, integrationId);
-    const outcome = await admit(claim, { terminal: true, nextCursor: null, oldestTs: "1718900100.000000" });
-    const facts = await historicalFacts(scope, null, []);
-    expect({ outcome, cursorCleared: facts.cursor_is_expected, historyCleared: facts.history_is_expected, newestUnchanged: facts.newest_lane_unchanged },
-      "a terminal page at a cap is admitted: C is cleared and H is empty, as linkage requires").toEqual({
-      outcome: { accept: { outcome: "written" } }, cursorCleared: true, historyCleared: true, newestUnchanged: true,
+    { label: "1,048,575 bytes (cap − 1) is written", length: 620, bytes: 1048575, admitted: true },
+    { label: "1,048,576 bytes (exactly the cap) is written", length: 621, bytes: 1048576, admitted: true },
+    { label: "1,048,577 bytes (cap + 1) is rejected", length: 622, bytes: 1048577, admitted: false },
+  ])("F2-05 inclusive byte boundary on a SINGLETON segment: a candidate of $label", async ({ length, bytes, admitted }) => {
+    const base = nearByteCapHistory();
+    const seeded = await seedSingletonSegment(base);
+    const { scope } = seeded;
+    const cursor = "w".repeat(length);
+    expect({ stored: await storedHistoricalSize(scope), candidate: await candidateHistoricalSize(scope, cursor) },
+      "fixture: the 999-entry base is exactly 1,047,951 bytes and the candidate is SQL-sized").toEqual({
+      stored: { entries: 999, bytes: 1047951 }, candidate: { entries: 1000, bytes },
+    });
+    const claim = await claimHistorical(seeded);
+    const beforePartial = await rowDigestExcept(scope, PARTIAL_PERMITTED);
+    const beforeRelease = await rowDigestExcept(scope, RELEASE_PERMITTED);
+    const outcome = await admit(claim, { terminal: false, nextCursor: cursor, oldestTs: seeded.pageOldest });
+    if (admitted) {
+      expect({
+        outcome, after: await storedHistoricalSize(scope),
+        facts: await historicalFacts(scope, cursor, [...base, cursor]),
+        unrelatedUnchanged: (await rowDigestExcept(scope, PARTIAL_PERMITTED)) === beforePartial,
+      }, "within the inclusive byte cap: appended, and the stored history IS the candidate").toEqual({
+        outcome: { accept: { outcome: "written" } }, after: { entries: 1000, bytes },
+        facts: { cursor_is_expected: true, history_is_expected: true, entries: 1000, generation: 4, newest_lane_unchanged: true },
+        unrelatedUnchanged: true,
+      });
+    } else {
+      expect({
+        outcome, after: await storedHistoricalSize(scope),
+        onlyReleaseFieldsMoved: (await rowDigestExcept(scope, RELEASE_PERMITTED)) === beforeRelease,
+      }, "one byte over the cap on an unsplittable range: rejected, the release is the only change").toEqual({
+        outcome: { accept: { outcome: "rejected", category: "cursor_history_bytes_exceeded" }, release: "written" },
+        after: { entries: 999, bytes: 1047951 }, onlyReleaseFieldsMoved: true,
+      });
+    }
+  });
+
+  it("F2-04 inclusive entry boundary on a SINGLETON segment: 999 → 1,000 entries is written", async () => {
+    const base = entryCapHistory().slice(0, 999);
+    const seeded = await seedSingletonSegment(base);
+    const { scope } = seeded;
+    const cursor = "cap999";
+    expect({ stored: await storedHistoricalSize(scope), candidate: await candidateHistoricalSize(scope, cursor) },
+      "fixture: 999 stored entries and a 1,000-entry candidate").toEqual({
+      stored: { entries: 999, bytes: 9990 }, candidate: { entries: 1000, bytes: 10000 },
+    });
+    const claim = await claimHistorical(seeded);
+    const before = await rowDigestExcept(scope, PARTIAL_PERMITTED);
+    const outcome = await admit(claim, { terminal: false, nextCursor: cursor, oldestTs: seeded.pageOldest });
+    expect({
+      outcome, after: await storedHistoricalSize(scope),
+      facts: await historicalFacts(scope, cursor, [...base, cursor]),
+      unrelatedUnchanged: (await rowDigestExcept(scope, PARTIAL_PERMITTED)) === before,
+    }, "the 1,000th entry is within the inclusive entry cap").toEqual({
+      outcome: { accept: { outcome: "written" } }, after: { entries: 1000, bytes: 10000 },
+      facts: { cursor_is_expected: true, history_is_expected: true, entries: 1000, generation: 4, newest_lane_unchanged: true },
+      unrelatedUnchanged: true,
     });
   });
 
-  it("F2-05 a lone surrogate is cursor_unrepresentable, and the raw value is NEVER sent to SQL", async () => {
-    const { scope, integrationId } = await seedChannel(["syn-h-1", "syn-h-2"]);
-    const claim = await claimHistorical(scope, integrationId);
+  it.each([
+    { label: "the exact entry cap", history: entryCapHistory, stored: { entries: 1000, bytes: 10000 } },
+    { label: "the exact byte cap (1,048,576 bytes)", history: byteCapHistory, stored: { entries: 1000, bytes: 1048576 } },
+  ])("§5 final terminal (S = L) / §6 / F2-04/F2-05 a TERMINAL page at $label finishes the envelope: real completion, not a restart", async ({ history, stored }) => {
+    const seeded = await seedWideSegment(history());
+    const { scope } = seeded;
+    expect(await storedHistoricalSize(scope), "fixture: the lane is exactly at its cap").toEqual(stored);
+    const claim = await claimHistorical(seeded);
+    const outcome = await admit(claim, { terminal: true, nextCursor: null, oldestTs: "1718900100.000000" });
+    expect({ outcome, completion: await historicalCompletion(scope, "1718900100.000000", HISTORICAL_ANCHOR) },
+      "a terminal page appends no cursor; the whole historical envelope is certified [page oldest, A] and its lane state cleared").toEqual({
+      outcome: { accept: { outcome: "written" } },
+      completion: {
+        anchor_cleared: true, segment_cleared: true, attempt_oldest_cleared: true, aggregate_cleared: true,
+        cursor_cleared: true, history_cleared: true, generation: 5, floor_reached: true,
+        completed_lower_is_expected: true, completed_upper_is_expected: true, provisional_cleared: true, newest_lane_unchanged: true,
+      },
+    });
+  });
+
+  it("F2-09 (partial) PRIMARY: an embedded lone HIGH surrogate on a SINGLETON segment is cursor_unrepresentable, and it NEVER reaches SQL", async () => {
+    const seeded = await seedSingletonSegment(["syn-h-1", "syn-h-2"]);
+    const { scope } = seeded;
+    const claim = await claimHistorical(seeded);
     const before = await rowDigestExcept(scope, RELEASE_PERMITTED);
-    const recorder = { loneSurrogateSent: false };
-    const lone = `syn-lone-${String.fromCharCode(0xd800)}-x`;
-    const outcome = await admit(claim, { terminal: false, nextCursor: lone, oldestTs: "1718900400.000000" }, recorder);
+    const recorder = newRecorder();
+    const lone = `${UNREPRESENTABLE_MARKER}${String.fromCharCode(0xd800)}-x`;
+    const outcome = await admit(claim, { terminal: false, nextCursor: lone, oldestTs: seeded.pageOldest }, recorder);
     expect({
-      outcome, loneSurrogateSentToSql: recorder.loneSurrogateSent,
+      outcome, unrepresentableCursorReachedSql: recorder.unrepresentableCursorSent, interceptorLive: recorder.statements > 0,
       onlyReleaseFieldsMoved: (await rowDigestExcept(scope, RELEASE_PERMITTED)) === before,
-    }, "typed cursor_unrepresentable before any SQL parameter carries the raw cursor").toEqual({
+    }, "typed cursor_unrepresentable; no SQL text or parameter ever carries the cursor").toEqual({
       outcome: { accept: { outcome: "rejected", category: "cursor_unrepresentable" }, release: "written" },
-      loneSurrogateSentToSql: false, onlyReleaseFieldsMoved: true,
+      unrepresentableCursorReachedSql: false, interceptorLive: true, onlyReleaseFieldsMoved: true,
+    });
+  });
+
+  it.each([
+    { label: "an embedded lone LOW surrogate", cursor: () => `${UNREPRESENTABLE_MARKER}${String.fromCharCode(0xdc00)}-x` },
+    { label: "a TRAILING lone HIGH surrogate", cursor: () => `${UNREPRESENTABLE_MARKER}x${String.fromCharCode(0xdbff)}` },
+    { label: "an ISOLATED leading LOW surrogate", cursor: () => `${String.fromCharCode(0xdfff)}${UNREPRESENTABLE_MARKER}x` },
+  ])("F2-09 (partial) variant: $label on a SINGLETON segment is cursor_unrepresentable, and it NEVER reaches SQL", async ({ cursor }) => {
+    const seeded = await seedSingletonSegment(["syn-h-1", "syn-h-2"]);
+    const { scope } = seeded;
+    const claim = await claimHistorical(seeded);
+    const before = await rowDigestExcept(scope, RELEASE_PERMITTED);
+    const recorder = newRecorder();
+    const outcome = await admit(claim, { terminal: false, nextCursor: cursor(), oldestTs: seeded.pageOldest }, recorder);
+    expect({
+      outcome, unrepresentableCursorReachedSql: recorder.unrepresentableCursorSent, interceptorLive: recorder.statements > 0,
+      onlyReleaseFieldsMoved: (await rowDigestExcept(scope, RELEASE_PERMITTED)) === before,
+    }, "every unpaired surrogate shape is the same typed rejection with no SQL exposure").toEqual({
+      outcome: { accept: { outcome: "rejected", category: "cursor_unrepresentable" }, release: "written" },
+      unrepresentableCursorReachedSql: false, interceptorLive: true, onlyReleaseFieldsMoved: true,
     });
   });
 
   it.each([
     { label: "a valid surrogate pair", cursor: `syn-pair-${String.fromCodePoint(0x1f600)}-x` },
     { label: "a literal U+FFFD", cursor: `syn-fffd-${String.fromCodePoint(0xfffd)}-x` },
-  ])("F2-05 positive control: $label is representable and appended EXACTLY", async ({ cursor }) => {
-    const { scope, integrationId } = await seedChannel(["syn-h-1"]);
-    const claim = await claimHistorical(scope, integrationId);
-    const outcome = await admit(claim, { terminal: false, nextCursor: cursor, oldestTs: "1718900400.000000" });
-    expect({ outcome, facts: await historicalFacts(scope, cursor, ["syn-h-1", cursor]) }, "written, and the exact UTF-16 string is H's final element").toEqual({
+  ])("F2-09 positive control: $label is representable and appended EXACTLY", async ({ cursor }) => {
+    const seeded = await seedWideSegment(["syn-h-1"]);
+    const claim = await claimHistorical(seeded);
+    const outcome = await admit(claim, { terminal: false, nextCursor: cursor, oldestTs: seeded.pageOldest });
+    expect({ outcome, facts: await historicalFacts(seeded.scope, cursor, ["syn-h-1", cursor]) }, "written, and the exact UTF-16 string is H's final element").toEqual({
       outcome: { accept: { outcome: "written" } },
       facts: { cursor_is_expected: true, history_is_expected: true, entries: 2, generation: 4, newest_lane_unchanged: true },
     });
   });
 
+  it("F2-09 control: the pg-boundary recorder sees SQL text, nested parameters and the query-builder surface, classifies every surrogate shape, and is restored", async () => {
+    const marker = `${UNREPRESENTABLE_MARKER}calibration`;
+    const probe = async (fn: (session: TransactionSession) => Promise<unknown>) => {
+      const recorder = newRecorder();
+      await recordingTx(recorder, async (session) => { await fn(session); });
+      return { sent: recorder.unrepresentableCursorSent, live: recorder.statements > 0 };
+    };
+    const high = String.fromCharCode(0xd800);
+    const low = String.fromCharCode(0xdc00);
+    expect({
+      clean: await probe((session) => session.executeSql("select 1 as n")),
+      sqlText: await probe((session) => session.executeSql(`select 1 as n /* ${marker} */`)),
+      nestedParameter: await probe((session) => session.executeSql("select pg_catalog.cardinality($1::text[]) as n", [[["x", marker]]])),
+      queryBuilder: await probe(async (session) => {
+        const { error } = await session.db.from("slack_sync_channels").select("channel_id").eq("channel_id", marker);
+        if (error) throw new Error("fixture: query-builder probe failed");
+      }),
+      restored: Client.prototype.query === PG_QUERY,
+      pure: {
+        loneHigh: carriesUnrepresentableCursor(`a${high}b`), loneLow: carriesUnrepresentableCursor(`a${low}b`),
+        trailingHigh: carriesUnrepresentableCursor(`ab${high}`), isolatedLeadingLow: carriesUnrepresentableCursor(`${low}ab`),
+        reversedPair: carriesUnrepresentableCursor(`${low}${high}`), nested: carriesUnrepresentableCursor({ v: [[`a${high}`]] }),
+        validPair: carriesUnrepresentableCursor(String.fromCodePoint(0x1f600)), literalFffd: carriesUnrepresentableCursor(String.fromCodePoint(0xfffd)),
+      },
+    }, "the recorder is live on every surface, fails on each unpaired shape, passes valid controls, and leaves pg as it found it").toEqual({
+      clean: { sent: false, live: true }, sqlText: { sent: true, live: true }, nestedParameter: { sent: true, live: true },
+      queryBuilder: { sent: true, live: true }, restored: true,
+      pure: {
+        loneHigh: true, loneLow: true, trailingHigh: true, isolatedLeadingLow: true, reversedPair: true, nested: true,
+        validPair: false, literalFffd: false,
+      },
+    });
+  });
+
+  const OTHER_BINDER: Mutation = async ({ scope }) => {
+    await tx(async (session) => {
+      const other = (await session.executeSql<{ id: string }>(
+        `insert into integrations (team_id, type, name) values ($1, 'slack', 'history-admission-other-binder') returning id::text as id`, [scope.teamId]
+      )).rows[0].id;
+      await session.executeSql("update slack_sync_channels set binding_integration_id = $2::uuid where team_id = $1", [scope.teamId, other]);
+    });
+  };
+  const SUCCESSOR_RECLAIM: Mutation = async (seeded) => {
+    await EXPIRE_LEASE(seeded);
+    const successor = await tx((session) => claimSlackChannelPage(session, seeded.scope, {
+      bindingIntegrationId: seeded.integrationId, bindingConfigRevision: REVISION,
+    }));
+    expect(successor !== null && successor.lane === "historical", "fixture: a successor reclaims the expired historical lease").toBe(true);
+  };
+
   it.each([
-    { label: "an expired lease", sql: "update slack_sync_channels set lease_expires_at = clock_timestamp() - interval '1 second' where team_id = $1" },
-    { label: "a changed binding revision", sql: `update slack_sync_channels set binding_config_revision = '${OTHER_REVISION}' where team_id = $1` },
-    { label: "a revoked public proof", sql: "update slack_sync_channels set public_state = 'private' where team_id = $1" },
-    { label: "moved segment bounds under the same generation", sql: "update slack_sync_channels set historical_segment_upper_ts = '1718900400.000000' where team_id = $1" },
-  ])("F2-06 stale authority — $label — beats cursor classification: refused, and the row is byte-identical", async ({ sql }) => {
-    const { scope, integrationId } = await seedChannel(["syn-h-1", "syn-h-2"]);
-    const claim = await claimHistorical(scope, integrationId);
-    await tx((session) => session.executeSql(sql, [scope.teamId]));
+    { label: "lease expired", mutate: EXPIRE_LEASE },
+    { label: "binding config revision changed", mutate: sqlMutation(`update slack_sync_channels set binding_config_revision = '${OTHER_REVISION}' where team_id = $1`) },
+    { label: "binding integration id changed", mutate: OTHER_BINDER },
+    { label: "public proof revoked", mutate: REVOKE_PUBLIC },
+    { label: "historical segment UPPER bound moved under the same generation", mutate: sqlMutation("update slack_sync_channels set historical_segment_upper_ts = '1718900400.000000' where team_id = $1") },
+    { label: "historical segment LOWER bound moved under the same generation", mutate: sqlMutation("update slack_sync_channels set historical_segment_lower_ts = '1718900000.000000' where team_id = $1") },
+    { label: "historical scan generation drifted", mutate: sqlMutation("update slack_sync_channels set historical_scan_generation = 5 where team_id = $1") },
+    {
+      label: "historical cursor drifted",
+      mutate: sqlMutation(`update slack_sync_channels set historical_cursor = 'syn-h-x', historical_cursor_history = '["syn-h-1", "syn-h-2", "syn-h-x"]'::jsonb where team_id = $1`),
+    },
+    { label: "successor reclaimed after expiry", mutate: SUCCESSOR_RECLAIM },
+  ])("F2-11/DH-08 (partial: historical lane, single session) channel fence — $label — is refused before cursor classification, and the row is exact", async ({ mutate }) => {
+    const seeded = await seedWideSegment(["syn-h-1", "syn-h-2"]);
+    const { scope } = seeded;
+    const claim = await claimHistorical(seeded);
+    await mutate(seeded);
     const before = await rowDigestExcept(scope, []);
     // A REPEATED cursor: were the fence not first, this would classify as cursor_repeated.
-    const outcome = await admit(claim, { terminal: false, nextCursor: "syn-h-1", oldestTs: "1718900400.000000" });
+    const outcome = await admit(claim, { terminal: false, nextCursor: "syn-h-1", oldestTs: seeded.pageOldest });
     expect({ outcome, rowUnchanged: (await rowDigestExcept(scope, [])) === before }, "stale authority is refused before any cursor category").toEqual({
       outcome: { accept: { outcome: "refused" } }, rowUnchanged: true,
     });
   });
 
-  it("§3.1 histories never leave SQL: no older history entry appears in a claim, an ensured or due state, or a written state", async () => {
-    const { scope, integrationId } = await seedChannel(["syn-h-older", "syn-h-2"]);
-    const claim = await claimHistorical(scope, integrationId);
+  const MOVE_SINGLETON = sqlMutation(
+    "update slack_sync_channels set historical_segment_lower_ts = '1718900400.000000', historical_segment_upper_ts = '1718900400.000000' where team_id = $1"
+  );
+  const LONE_SURROGATE = { cursor: () => `${UNREPRESENTABLE_MARKER}${String.fromCharCode(0xd800)}-x`, history: () => ["syn-h-1", "syn-h-2"], recorded: true };
+  const ENTRY_OVERFLOW = { cursor: () => "cap-new", history: entryCapHistory, recorded: false };
+
+  it.each([
+    { label: "a lone surrogate under an expired lease", mutate: EXPIRE_LEASE, risk: LONE_SURROGATE },
+    { label: "a lone surrogate under a revoked public proof", mutate: REVOKE_PUBLIC, risk: LONE_SURROGATE },
+    { label: "a lone surrogate under a moved segment", mutate: MOVE_SINGLETON, risk: LONE_SURROGATE },
+    { label: "an entry overflow under an expired lease", mutate: EXPIRE_LEASE, risk: ENTRY_OVERFLOW },
+    { label: "an entry overflow under a revoked public proof", mutate: REVOKE_PUBLIC, risk: ENTRY_OVERFLOW },
+    { label: "an entry overflow under a moved segment", mutate: MOVE_SINGLETON, risk: ENTRY_OVERFLOW },
+  ])("F2-11/DH-08 + F2-09 authority before early classification on a SINGLETON segment: $label is refused, the row is exact", async ({ mutate, risk }) => {
+    const seeded = await seedSingletonSegment(risk.history());
+    const { scope } = seeded;
+    const claim = await claimHistorical(seeded);
+    await mutate(seeded);
+    const before = await rowDigestExcept(scope, []);
+    const recorder = newRecorder();
+    const outcome = await admit(claim, { terminal: false, nextCursor: risk.cursor(), oldestTs: seeded.pageOldest }, risk.recorded ? recorder : undefined);
+    expect({
+      outcome, rowUnchanged: (await rowDigestExcept(scope, [])) === before,
+      ...(risk.recorded ? { unrepresentableCursorReachedSql: recorder.unrepresentableCursorSent, interceptorLive: recorder.statements > 0 } : {}),
+    }, "stale authority wins over an unrepresentable or over-cap cursor, and the stale branch never parameterizes the cursor").toEqual({
+      outcome: { accept: { outcome: "refused" } }, rowUnchanged: true,
+      ...(risk.recorded ? { unrepresentableCursorReachedSql: false, interceptorLive: true } : {}),
+    });
+  });
+
+  it("§3.1 / F2-10 (partial) histories never leave SQL: no older history entry appears in a claim, an ensured or due state, or a release's written state", async () => {
+    const seeded = await seedWideSegment([OLDER_ENTRY, "syn-h-2"]);
+    const { scope } = seeded;
+    const claim = await claimHistorical(seeded);
     const ensured = await tx((session) => ensureSlackChannel(session, scope));
     const due = await tx((session) => dueSlackChannels(session, { teamId: scope.teamId, workspaceId: WORKSPACE, channelIds: [CHANNEL] }));
     const released = await tx((session) => releaseSlackChannelForRetry(session, claim, { errorCode: "boundary_probe", turn: "kept", nextDueAt: null }));
-    const leaks = (value: unknown): { historyKey: boolean; olderEntry: boolean } => {
-      const text = JSON.stringify(value);
-      return { historyKey: /history/i.test(text), olderEntry: text.includes("syn-h-older") };
-    };
     expect({
       stored: (await storedHistoricalSize(scope)).entries,
       claim: leaks(claim), ensured: leaks(ensured), due: leaks(due), released: { outcome: released.outcome, ...leaks(released) },
@@ -425,6 +815,24 @@ describe("AM-F2 runtime packet 1 — state-writer history admission (real Postgr
       stored: 2,
       claim: { historyKey: false, olderEntry: false }, ensured: { historyKey: false, olderEntry: false },
       due: { historyKey: false, olderEntry: false }, released: { outcome: "written", historyKey: false, olderEntry: false },
+    });
+  });
+
+  it("§3.1 / F2-10 (partial) an ACCEPTED written state carries no history key and no older history entry", async () => {
+    const seeded = await seedWideSegment([OLDER_ENTRY, "syn-h-2"]);
+    const claim = await claimHistorical(seeded);
+    let view: Record<string, unknown>;
+    try {
+      view = await tx(async (session) => {
+        const accepted = await acceptSlackChannelPage(session, claim, { terminal: false, nextCursor: "syn-h-3", oldestTs: seeded.pageOldest });
+        return { outcome: accepted.outcome, ...leaks(accepted) };
+      });
+    } catch (error) {
+      view = sanitized(error);
+    }
+    expect({ view, stored: (await storedHistoricalSize(seeded.scope)).entries },
+      "the acceptance writer's own returned state is history-free while SQL holds 3 entries").toEqual({
+      view: { outcome: "written", historyKey: false, olderEntry: false }, stored: 3,
     });
   });
 
