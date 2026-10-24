@@ -355,6 +355,10 @@ import { agePublicProof, closeRawSql, elapse, expireChannelLease } from "./slack
  *  - the NEWEST lane's S > L internal terminal, and segment application across a real provider
  *    traversal (DH-01/02/03/04/05). The historical inner terminal and the exact high-epoch capacity
  *    and restart subdivisions are constructed-literal cases in packet 8.
+ *    Still deferred subdivisions, none asserted in this file: a WIDE-segment byte-cap
+ *    `cursor_history_bytes_exceeded` subdivision; a WIDE-segment lone-surrogate
+ *    `cursor_unrepresentable` subdivision; and any NEWEST-lane acceptance subdivision. Packet 8b's
+ *    capacity case is the historical ENTRY cap only.
  *    Claim-time initialization is covered by packet 2 (historical) and packet 3 (newest, including
  *    the L > A typed delay);
  *  - OUTSIDE THIS FILE, covered by the caller packet in other suites (still RED where production is
