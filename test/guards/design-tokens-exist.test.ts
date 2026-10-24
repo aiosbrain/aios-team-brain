@@ -56,7 +56,8 @@ const isNonColour = (base: string) =>
   // `border-t-0`, `border-x-2` — a side plus a width, not a colour at all.
   /^(?:b|t|l|r|x|y|s|e)-\d+$/.test(base);
 
-const FILES = ["components/admin/integrations-manager.tsx"];
+// The Google Drive panel was split out of the manager (AIO-1167 r38); its classes stay guarded.
+const FILES = ["components/admin/integrations-manager.tsx", "components/admin/google-drive-panel.tsx"];
 
 describe("design tokens referenced by the admin integrations surface actually exist", () => {
   it("globals.css yields a non-trivial token set (guard is not vacuous)", () => {

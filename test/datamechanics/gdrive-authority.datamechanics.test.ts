@@ -15,6 +15,7 @@ import {
   authorizeGdriveAdminTestCall,
   provisionGdriveConnectorPrincipal,
 } from "@/lib/integrations/gdrive-authority";
+import { getPipelineHealth } from "@/lib/ingest/pipeline-health";
 import { approvedAudienceProject, db, placeMemberByTier, seedTeam, sha, type Seed } from "./helpers";
 
 const GOOGLE_SECRET = JSON.stringify({
@@ -188,12 +189,84 @@ describe("AIO-1167 F1: a busy scheduled/notification deferral is neutral in the 
     expect((await s.ledger()).map((row) => row.ok)).toEqual([false]);
   });
 
-  it("a healthy partial run keeps its existing ledger semantics", async () => {
+  // r37 (Fable finding 2): healthy partial progress is neutral too — it neither extends a failure
+  // streak nor counts as a success. Superseded the r36 assertion that it appended `ok:false`.
+  const HEALTHY_PARTIAL: Report = { ...BUSY, status: "partial", error: undefined, skipped: 0, created: 3, backlog: 2 };
+  const FAILED_PARTIAL: Report = { ...HEALTHY_PARTIAL, failed: 1, error: "malformed_document" };
+  const FAILURE: Report = { ...BUSY, status: "failed", error: "provider_unavailable", skipped: 0, failed: 1 };
+  const COMPLETE: Report = { ...BUSY, status: "complete", error: undefined, skipped: 0, created: 1, backlog: 0, authoritativeComplete: true };
+
+  it("repeated healthy partial runs keep their durable reports and append nothing to the ledger", async () => {
     const s = await scheduled();
-    await s.report({ ...BUSY, status: "partial", error: undefined, skipped: 0, created: 3, backlog: 2 });
-    const rows = await s.ledger();
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ ok: false, meta: { status: "partial", backlog: 2 } });
+    for (let n = 0; n < 3; n++) expect((await s.report(HEALTHY_PARTIAL)).status).toBe(200);
+    // A rate-limit or deadline deferral inside an otherwise healthy partial run is still healthy.
+    await s.report({ ...HEALTHY_PARTIAL, error: "rate_limited" });
+    expect((await s.reports()).map((r) => r.status)).toEqual(["partial", "partial", "partial", "partial"]);
+    expect(await s.ledger()).toEqual([]);
+  });
+
+  it("a partial run that failed work is a failure", async () => {
+    const s = await scheduled();
+    await s.report(FAILED_PARTIAL);
+    expect((await s.ledger()).map((row) => row.ok)).toEqual([false]);
+  });
+
+  it("genuine failures separated by healthy partial and busy wakes stay one unbroken failure streak", async () => {
+    const s = await scheduled();
+    await s.report(FAILURE);
+    await s.report(HEALTHY_PARTIAL);
+    await s.report(BUSY);
+    await s.report(HEALTHY_PARTIAL);
+    await s.report(FAILURE);
+    expect((await s.ledger()).map((row) => row.ok)).toEqual([false, false]);
+    // …which the pipeline banner reads as a CONFIRMED failure, not two lone ones.
+    const health = await getPipelineHealth(s.seed.teamId);
+    expect(health.legs.find((leg) => leg.source === "gdrive")).toMatchObject({ ok: false, failureClass: "confirmed" });
+    // No complete report: neither partial progress nor a busy wake advanced complete-success time.
+    expect((await s.reports()).some((r) => r.status === "complete")).toBe(false);
+  });
+
+  it("only an authoritative completion ends the streak", async () => {
+    const s = await scheduled();
+    await s.report(FAILURE);
+    await s.report(HEALTHY_PARTIAL);
+    await s.report(FAILURE);
+    await s.report(HEALTHY_PARTIAL);
+    await s.report(COMPLETE);
+    expect((await s.ledger()).map((row) => row.ok)).toEqual([false, false, true]);
+    expect((await getPipelineHealth(s.seed.teamId)).legs.find((leg) => leg.source === "gdrive"))
+      .toMatchObject({ ok: true, failureClass: "ok" });
+  });
+});
+
+describe("AIO-1167 r37: manual Drive runs follow the same ledger rule (real Postgres)", () => {
+  async function manualRun(seed: Seed, integrationId: string, trusted: { key: string }) {
+    const { data: queued } = await db().from("gdrive_run_requests").insert({
+      team_id: seed.teamId, integration_id: integrationId, requested_by: seed.memberId,
+      trigger: "manual", status: "pending",
+    }).select("id").single();
+    const claimed = await (await runsGET(getRequest("http://test/api/v1/integrations/gdrive/runs", trusted.key, seed.teamSlug))).json();
+    return { requestId: (queued as { id: string }).id, attemptToken: claimed.request.attempt_token as string };
+  }
+  const ledger = async (seed: Seed) => ((await db().from("ingest_runs").select("id,ok")
+    .eq("team_id", seed.teamId).eq("source", "gdrive").order("id", { ascending: true })).data ?? []) as { ok: boolean }[];
+
+  it("a healthy partial manual run is neutral; a failed partial manual run is a failure", async () => {
+    const seed = await seedTeam();
+    const integrationId = await integration(seed, `manual-${randomUUID().slice(0, 8)}`);
+    const trusted = await provision(seed, integrationId);
+    const post = (claim: { requestId: string; attemptToken: string }, fields: Record<string, unknown>) =>
+      runsPOST(request("http://test/api/v1/integrations/gdrive/runs", trusted.key, seed.teamSlug, { ...claim, ...fields }));
+
+    const healthy = await manualRun(seed, integrationId, trusted);
+    expect((await post(healthy, { status: "partial", created: 2, failed: 0, backlog: 4 })).status).toBe(200);
+    const { data: kept } = await db().from("gdrive_run_requests").select("status").eq("id", healthy.requestId).single();
+    expect(kept).toMatchObject({ status: "partial" });
+    expect(await ledger(seed)).toEqual([]);
+
+    const failing = await manualRun(seed, integrationId, trusted);
+    expect((await post(failing, { status: "partial", created: 2, failed: 1, backlog: 4, error: "malformed_document" })).status).toBe(200);
+    expect((await ledger(seed)).map((row) => row.ok)).toEqual([false]);
   });
 });
 

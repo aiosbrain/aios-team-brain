@@ -3,6 +3,7 @@ import { adminClient } from "@/lib/db/admin";
 import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { listIntegrations } from "@/lib/integrations/read";
+import { listGdriveRunStatus } from "@/lib/integrations/gdrive-runs";
 import { IntegrationsManager, type IntegrationRow } from "@/components/admin/integrations-manager";
 import { GithubReposPanel } from "@/components/admin/github-repos-panel";
 import { OpenrouterPanel } from "@/components/admin/openrouter-panel";
@@ -55,7 +56,7 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
     : { data: null };
 
   const db = adminClient();
-  const [integrations, ingestRuns, pipelineHealth, freshness, retrievalHealth, gdriveRunsResult] = await Promise.all([
+  const [integrations, ingestRuns, pipelineHealth, freshness, retrievalHealth, gdriveStatus] = await Promise.all([
     listIntegrations(db, team.id, { role: me?.role as string | undefined }) as Promise<IntegrationRow[]>,
     listRecentIngestRuns(db, team.id, 30),
     getPipelineHealth(team.id),
@@ -68,11 +69,9 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
       me ? await (await import("@/lib/access/posture")).resolveViewerPosture(db, team.id, (me as { id: string }).id) : "external"
     ),
     getRetrievalHealth(team.id),
-    db.from("gdrive_run_requests")
-      .select("id,integration_id,trigger,status,created_at,started_at,finished_at,summary,error")
-      .eq("team_id", team.id)
-      .order("created_at", { ascending: false })
-      .limit(25),
+    // Per connection: latest attempt, latest progress and latest AUTHORITATIVE success, each read
+    // independently — never inferred from a recent page of the team's attempts (AIO-1167 r37).
+    listGdriveRunStatus(team.id),
   ]);
   const githubIntegration = integrations.find((i) => i.type === "github") ?? null;
   const openrouter = integrations.find((i) => i.type === "openrouter") ?? null;
@@ -205,11 +204,7 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
               }
             : null
         }
-        gdriveRuns={(gdriveRunsResult.data ?? []) as Array<{
-          id: string; integration_id: string; trigger: string; status: string;
-          created_at: string; started_at: string | null; finished_at: string | null;
-          summary: Record<string, unknown>; error: string | null;
-        }>}
+        gdriveStatus={gdriveStatus}
         answering={{
           provider: answeringProvider,
           models: answeringModels,

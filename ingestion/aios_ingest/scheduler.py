@@ -134,20 +134,101 @@ def build_scheduler(
     return sched
 
 
+# Authority-loss categories a concurrent pause/disconnect can produce. Neither is suppressed on its
+# own: each only triggers a re-read of the connection's current Admin state (see `_poll_job`).
+_PAUSE_AUTHORITY_LOSS = frozenset({"connection_unavailable", "stale_execution"})
+# The one category an unexpected coordinator exception is reported under. Fixed on purpose: the
+# exception's text (a key-file path, a provider message) never leaves this process; its class name
+# is logged locally for the operator.
+_COORDINATOR_ERROR = "coordinator_error"
+_REREAD_BEFORE_REPORTING = _PAUSE_AUTHORITY_LOSS | {_COORDINATOR_ERROR}
+
+
+def _gdrive_exception_summary(conn: Connection, row: dict, exc: Exception):
+    """A scheduled Drive run that RAISED (stream setup — e.g. a configured service-account key file
+    that is missing — or any other unexpected coordinator error) as an ordinary failed summary, so
+    it reaches the durable report, the attempt ledger and the banner like any other failure.
+
+    The integration id is the one the preflight already resolved from Admin state for this exact
+    connection — never invented: a row without an id yields none, and the run stays a local
+    diagnostic. Nothing was acknowledged, so backlog stays unknown and no completion is claimed;
+    the coordinator's own cleanup already released the lease and left progress and hints pending.
+    """
+    from .engine import IngestSummary
+    log.warning("Drive poll for %s raised %s; reporting it as %s",
+                conn.name, type(exc).__name__, _COORDINATOR_ERROR)
+    return IngestSummary(
+        conn.name, failed=1, failure_categories={_COORDINATOR_ERROR: 1},
+        backlog=None, integration_id=str(row.get("id") or "") or None,
+    )
+
+
+async def _gdrive_admin_row(
+    settings: BrainSettings, conn: Connection, integration_id: str | None = None,
+) -> dict | None:
+    """The Admin row this Drive connection runs as: by its immutable id — ``integration_id`` once the
+    run has resolved it, else the one the configuration names — or, with neither, by name
+    (documented local service-account configs). ``None`` when no row matches. A selection read
+    failure raises: nothing runs on unknown Admin state."""
+    from .brain_client import BrainClient
+    async with BrainClient(settings.base_url, settings.api_key, settings.team) as client:
+        rows = await client.fetch_integration_selections(include_disabled=True)
+    wanted_id = str(integration_id or conn.options.get("integration_id") or "")
+    return next((
+        row for row in rows
+        if row.get("type") == "gdrive"
+        and (str(row.get("id") or "") == wanted_id if wanted_id else row.get("name") == conn.name)
+    ), None)
+
+
 async def _poll_job(settings: BrainSettings, conn: Connection, state: StateStore) -> None:
     if conn.source == "gdrive":
+        # PREFLIGHT (AIO-1167 r37): a paused or disconnected connection is not polled at all, so its
+        # pause never becomes a failure report and a failure banner. The brain's execution fence
+        # stays the authority for the race below; this only avoids asking it when the answer is known.
+        row = await _gdrive_admin_row(settings, conn)
+        if row is None:
+            log.warning(
+                "Drive connection %s matches no Admin integration; not polled and nothing reported",
+                conn.name,
+            )
+            return
+        if row.get("status") != "enabled":
+            log.info("Drive connection %s is paused or disconnected; not polled", conn.name)
+            return
         started = _now_iso()
         report_id = str(uuid.uuid4())
-        summary = await run_gdrive_stream(settings, conn, state)
+        try:
+            summary = await run_gdrive_stream(settings, conn, state)
+        except Exception as exc:  # never BaseException: cancellation and shutdown still propagate
+            summary = _gdrive_exception_summary(conn, row, exc)
         integration_id = summary.integration_id or str(conn.options.get("integration_id") or "")
-        if integration_id:
-            status = _gdrive_outcome_status(summary)
-            error = ", ".join(sorted((summary.failure_categories or {}).keys())) or None
-            from .brain_client import BrainClient
-            async with BrainClient(settings.base_url, settings.api_key, settings.team) as client:
-                await client.report_scheduled_gdrive_run(
-                    report_id, integration_id, started, summary, status=status, error=error,
-                )
+        if not integration_id:
+            # Failed before the immutable integration id was resolved: there is no connection to
+            # report against, and an id is never invented. Say so locally instead.
+            log.warning(
+                "Drive connection %s failed before its integration was resolved (%s); nothing reported",
+                conn.name, ", ".join(sorted((summary.failure_categories or {}).keys())) or "unknown",
+            )
+            return
+        if _REREAD_BEFORE_REPORTING & set(summary.failure_categories or {}):
+            # The connection may have been paused or disconnected during this poll: before the
+            # brain's authority check (`connection_unavailable`), or after this run had acquired its
+            # execution, which a pause fences off (`stale_execution` on the next fenced request).
+            # An unexpected coordinator error may be that same pause seen from a provider call.
+            # That pause is not a failure — but an ENABLED connection refused this way is, so
+            # re-read THIS connection, by its resolved id, and report unless it is now gone or paused.
+            after = await _gdrive_admin_row(settings, conn, integration_id)
+            if after is None or after.get("status") != "enabled":
+                log.info("Drive connection %s was paused during the poll; nothing reported", conn.name)
+                return
+        status = _gdrive_outcome_status(summary)
+        error = ", ".join(sorted((summary.failure_categories or {}).keys())) or None
+        from .brain_client import BrainClient
+        async with BrainClient(settings.base_url, settings.api_key, settings.team) as client:
+            await client.report_scheduled_gdrive_run(
+                report_id, integration_id, started, summary, status=status, error=error,
+            )
         return
     since = state.get_cursor(conn.name)
     started = _now_iso()

@@ -521,9 +521,13 @@ async def run_gdrive_stream(
         try:
             execution = await client.acquire_gdrive_execution(integration_id, owner)
         except BrainError as exc:
+            busy = exc.code == "execution_busy"
+            # Busy is a neutral deferral: another coordinator owns the work. Any other refusal of the
+            # execution authority (paused, reconnect required, rotated principal, …) is a failure of
+            # this run — counted as one, so it can never pass for healthy partial progress.
             return IngestSummary(
-                conn.name, skipped=1, failure_categories={exc.code: 1},
-                deferred=exc.code == "execution_busy", backlog=None, integration_id=integration_id,
+                conn.name, skipped=1, failed=0 if busy else 1, failure_categories={exc.code: 1},
+                deferred=busy, backlog=None, integration_id=integration_id,
             )
         # One absolute deadline for the whole run. It travels with the execution so every sink and
         # reconcile call — limiter wait, request and retry — is bounded by the same instant.
@@ -582,11 +586,14 @@ async def run_gdrive_stream(
                 return total
             auth_mode = str(options.get("auth_mode") or "oauth")
             token_provider = None
+            # From here on the immutable integration id is known: every early return carries it,
+            # so `_poll_job` can report the failure for a local configuration too (AIO-1167 r37).
             if auth_mode == "oauth":
                 try:
                     grant = await client.broker_gdrive_access_token(execution)
                 except BrainError as exc:
-                    return IngestSummary(conn.name, failed=1, failure_categories={exc.code: 1})
+                    return IngestSummary(conn.name, failed=1, failure_categories={exc.code: 1},
+                                         integration_id=integration_id)
                 options["granted_scopes"] = list(grant.get("scopes") or [])
                 account = grant.get("account") or {}
                 options["credential_identity"] = account.get("subject") or account.get("email") or options["credential_identity"]
@@ -602,7 +609,8 @@ async def run_gdrive_stream(
                         pass
                 if not valid_service_account:
                     return IngestSummary(conn.name, failed=1,
-                                         failure_categories={"service_account_credentials_missing": 1})
+                                         failure_categories={"service_account_credentials_missing": 1},
+                                         integration_id=integration_id)
 
             provider_gate = client.gdrive_provider_gate(execution)
             control = {"credential_identity", "integration_id", "auth_mode", "service_account_status", "webhook_url", "watch_ttl_seconds"}
@@ -622,12 +630,15 @@ async def run_gdrive_stream(
                         return IngestSummary(
                             conn.name, failed=1,
                             failure_categories={"service_account_identity_unverified": 1},
+                            integration_id=integration_id,
                         )
                     await client.verify_gdrive_service_account(execution, identity)
                 except BrainError as exc:
-                    return IngestSummary(conn.name, failed=1, failure_categories={exc.code: 1})
+                    return IngestSummary(conn.name, failed=1, failure_categories={exc.code: 1},
+                                         integration_id=integration_id)
                 except ProviderDeferred as exc:
-                    return IngestSummary(conn.name, failed=1, failure_categories={exc.category: 1})
+                    return IngestSummary(conn.name, failed=1, failure_categories={exc.category: 1},
+                                         integration_id=integration_id)
             generation = execution.generation
             total = IngestSummary(conn.name, failure_categories={}, integration_id=integration_id)
 

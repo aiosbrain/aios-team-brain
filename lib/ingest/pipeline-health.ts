@@ -226,7 +226,11 @@ export function resolveBeatClock(args: {
  * ingested `items` are untouched — we only stop EXPECTING fresh syncs. Non-connector legs (llm,
  * dense, graph_*, meeting_notes, …) aren't integration-scoped and are never suppressed here.
  */
-const CONNECTOR_SOURCES: ReadonlySet<string> = new Set(["slack", "plane", "linear", "github"]);
+const CONNECTOR_SOURCES: ReadonlySet<string> = new Set(["slack", "plane", "linear", "github", "gdrive"]);
+// `gdrive` (AIO-1167 r37): a paused or disconnected Drive connection stops being polled, so a failure
+// recorded before the pause is frozen exactly like a deleted connector's. It is suppressed only when
+// NO enabled Drive connection remains — while any is enabled the Drive leg stays loud, so an enabled
+// connection's authority failure is never hidden.
 
 /**
  * Sources this banner does NOT speak for (LLMOBS-1). The banner's sentence is "N ingestion legs are

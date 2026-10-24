@@ -30,6 +30,10 @@ _DEFAULT_MAX_PER_MIN = 100
 _MAX_RETRIES = 5
 _GDRIVE_CHECKPOINT_MAX_ATTEMPTS = 6
 _GDRIVE_CHECKPOINT_DEADLINE_SECONDS = 45.0
+# A scheduled Drive report: room for three waits of the route's 30-second Retry-After, and no more,
+# so a report never holds its poll job (max_instances=1) past the next wake for long.
+_GDRIVE_REPORT_MAX_ATTEMPTS = 4
+_GDRIVE_REPORT_DEADLINE_SECONDS = 120.0
 # Provider ids one source-reconcile request may carry (the brain's GDRIVE_SNAPSHOT_PAGE_LIMIT).
 _GDRIVE_SNAPSHOT_PAGE = 10_000
 # Names a staged snapshot from its own membership, so the name survives a restart unchanged.
@@ -349,6 +353,18 @@ class BrainClient:
             )
         await self._sleep(delay)
 
+    async def _timeout_backoff(self, exc: BrainError, attempt: int, deadline: float) -> None:
+        """Wait out one unanswered request before re-sending it. There is no server-named delay, so
+        the wait is the same bounded exponential one `_backoff` falls back to, and a wait that cannot
+        fit the deadline is deferred with the time it may be retried — never slept past it."""
+        delay = min(2**attempt, 30) + _bounded_jitter(self._random())
+        if self._monotonic() + delay >= deadline:
+            raise BrainDeferred(
+                exc.status_code, exc.code, "the brain did not answer and no retry fits the deadline",
+                not_before=_iso_after(delay),
+            ) from exc
+        await self._sleep(delay)
+
     async def push(self, item: ItemPayload, *, execution: GdriveExecution | None = None) -> IngestResult:
         """POST one item. Retries on 429 (honoring backoff) and 5xx; raises BrainError
         on a definitive 4xx so a bad mapping fails loudly instead of silently dropping.
@@ -489,11 +505,38 @@ class BrainClient:
         }
         if error is not None:
             payload["error"] = error
-        resp = await self._client.post(
-            f"{self._base}/api/v1/integrations/gdrive/runs", json=payload, headers=self._headers,
-        )
-        if resp.status_code != 200:
-            raise BrainError(resp.status_code, *_error_fields(resp))
+        # AC-04: a retryable answer (429/5xx — the route's 503 `report_unavailable` among them) is
+        # re-sent with THIS payload and report id, unchanged, so a report that committed before its
+        # answer was lost replays idempotently instead of being recorded twice. Bounded by attempts
+        # and by one absolute deadline: a Retry-After that cannot fit defers (BrainDeferred) rather
+        # than sleeping past it, and nothing is slept after the last attempt. A typed 4xx refusal
+        # (stale authority, conflicting report) is final and is never retried. A request the brain
+        # did not answer in time (`brain_timeout`) may have committed too, so it is retried the same
+        # way, inside the same attempt and deadline budget.
+        url = f"{self._base}/api/v1/integrations/gdrive/runs"
+        deadline = self._monotonic() + _GDRIVE_REPORT_DEADLINE_SECONDS
+        for attempt in range(_GDRIVE_REPORT_MAX_ATTEMPTS):
+            try:
+                resp = await self._post_bounded(url, payload, self._headers, deadline)
+            except BrainDeferred:
+                raise  # the deadline arrived before a request was admitted or sent
+            except BrainError as exc:
+                if exc.code != "brain_timeout" or attempt + 1 >= _GDRIVE_REPORT_MAX_ATTEMPTS:
+                    raise
+                await self._timeout_backoff(exc, attempt, deadline)
+                continue
+            if resp.status_code == 200:
+                return
+            if resp.status_code != 429 and resp.status_code < 500:
+                raise BrainError(resp.status_code, *_error_fields(resp))
+            if attempt + 1 >= _GDRIVE_REPORT_MAX_ATTEMPTS:
+                code, message = _error_fields(resp)
+                raise BrainError(
+                    resp.status_code, code,
+                    f"{message}; gave up after {_GDRIVE_REPORT_MAX_ATTEMPTS} attempts",
+                )
+            await self._backoff(resp, attempt, deadline)
+        raise AssertionError("unreachable retry loop")
 
     async def checkpoint_gdrive_execution(
         self, execution: GdriveExecution, progress: dict[str, Any]

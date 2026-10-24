@@ -2,6 +2,44 @@ import "server-only";
 
 import { runSql, withTransaction } from "@/lib/db/pg/pool";
 
+import type { GdriveRunRow, GdriveRunStatus } from "@/lib/integrations/gdrive-run-status";
+
+/**
+ * Per-connection coordinator status for Admin (AIO-1167 AC-07): the latest attempt, the latest run
+ * that reported progress, and the latest AUTHORITATIVE complete success with no failed work — the
+ * same success the run ledger recognises (`gdriveLedgerDisposition`) — each read independently
+ * for EVERY Drive connection of the team. The success is never derived from a recent page of
+ * attempts: a connection with one success followed by any number of busy deferrals, or sharing the
+ * team's history with chattier connections, still shows it.
+ */
+export async function listGdriveRunStatus(teamId: string): Promise<Record<string, GdriveRunStatus>> {
+  const cols = `id, integration_id, trigger, status, created_at, started_at, finished_at, summary, error`;
+  const [attempts, reports, successes] = await Promise.all([
+    runSql<GdriveRunRow>(
+      `select distinct on (integration_id) ${cols} from gdrive_run_requests
+        where team_id=$1 order by integration_id, created_at desc, id desc`, [teamId]),
+    runSql<GdriveRunRow>(
+      `select distinct on (integration_id) ${cols} from gdrive_run_requests
+        where team_id=$1 and status in ('complete','partial','failed') and finished_at is not null
+        order by integration_id, finished_at desc, id desc`, [teamId]),
+    runSql<GdriveRunRow>(
+      `select distinct on (integration_id) ${cols} from gdrive_run_requests
+        where team_id=$1 and status='complete' and finished_at is not null
+          and coalesce(summary->>'authoritativeComplete','false')='true'
+          -- The ledger's recovery invariant (gdriveLedgerDisposition): no failed work. A jsonb
+          -- comparison, never a cast, so a legacy or malformed value (absent, a string, an object)
+          -- simply does not prove success instead of failing the whole read; 0 and 0.0 both match.
+          and summary->'failed' = '0'::jsonb
+        order by integration_id, finished_at desc, id desc`, [teamId]),
+  ]);
+  const out: Record<string, GdriveRunStatus> = {};
+  const slot = (id: string) => (out[id] ??= { latestAttempt: null, latestReport: null, latestSuccess: null });
+  for (const row of attempts.rows) slot(row.integration_id).latestAttempt = row;
+  for (const row of reports.rows) slot(row.integration_id).latestReport = row;
+  for (const row of successes.rows) slot(row.integration_id).latestSuccess = row;
+  return out;
+}
+
 function canonicalJson(value: Record<string, unknown>): string {
   return JSON.stringify(Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b))));
 }
@@ -20,43 +58,93 @@ export interface GdriveRunClaim {
  *  recovered. Age alone is never enough: a live execution lease is the attempt still working. */
 const INTERRUPTED_AFTER = "15 minutes";
 
-export async function recordScheduledGdriveRun(input: {
+/**
+ * A scheduled report the brain refuses for a TYPED reason (AIO-1167 r37): the reporting connector no
+ * longer holds the connection's authority, or the report id names a different report. Retrying
+ * cannot change either answer. Anything else thrown while recording is infrastructure (a database,
+ * lock or connection failure) and is retryable — the route keeps the two apart.
+ */
+export class GdriveScheduledReportRefused extends Error {
+  constructor(readonly code: "stale_authority" | "conflicting_replay", message: string) {
+    super(message);
+  }
+}
+
+type ScheduledReportInput = {
   reportId: string; integrationId: string; teamId: string; apiKeyId: string; memberId: string;
   status: "complete" | "partial" | "failed" | "deferred";
   summary: Record<string, unknown>; error?: string; startedAt: string;
-}): Promise<{ newly_completed: boolean; started_at: string }> {
+};
+
+async function assertScheduledReportAuthority(input: ScheduledReportInput): Promise<void> {
+  const { rows } = await runSql<{ ok: boolean }>(
+    `select true as ok from integrations i
+     join gdrive_connection_authority a on a.integration_id=i.id and a.team_id=i.team_id
+     join api_keys k on k.id=a.connector_api_key_id and k.member_id=a.connector_member_id
+     join members m on m.id=a.connector_member_id and m.team_id=a.team_id
+     where i.id=$1 and i.team_id=$2 and i.type='gdrive'
+       and a.connector_api_key_id=$3 and a.connector_member_id=$4
+       and k.revoked_at is null and m.status='active' and m.is_connector=true`,
+    [input.integrationId, input.teamId, input.apiKeyId, input.memberId],
+  );
+  if (!rows[0]) throw new GdriveScheduledReportRefused("stale_authority", "Google Drive scheduled report authority is stale");
+}
+
+/**
+ * The stored report under `input.reportId`, accepted only as an exact replay: the same team,
+ * connection and scheduler trigger (identity) and the same status, summary and error (content).
+ * A row that differs in any of them is a conflicting replay, never a success. The start time is
+ * not compared, as before r37: a replay writes nothing and reports the STORED start.
+ */
+async function storedScheduledReplay(
+  input: ScheduledReportInput,
+): Promise<{ newly_completed: false; started_at: string } | null> {
+  const { rows } = await runSql<{
+    team_id: string; integration_id: string; trigger: string;
+    status: string; summary: Record<string, unknown>; error: string | null; started_at: string;
+  }>(
+    `select team_id,integration_id,trigger,status,summary,error,started_at
+       from gdrive_run_requests where id=$1 for update`,
+    [input.reportId],
+  );
+  const row = rows[0];
+  if (!row) return null;
+  const same = row.team_id === input.teamId && row.integration_id === input.integrationId
+    && row.trigger === "scheduler" && row.status === input.status
+    && canonicalJson(row.summary ?? {}) === canonicalJson(input.summary)
+    && (row.error ?? undefined) === input.error;
+  if (!same) throw new GdriveScheduledReportRefused("conflicting_replay", "conflicting Google Drive scheduled report replay");
+  return { newly_completed: false, started_at: row.started_at };
+}
+
+export async function recordScheduledGdriveRun(
+  input: ScheduledReportInput,
+): Promise<{ newly_completed: boolean; started_at: string }> {
   return withTransaction(async () => {
-    const { rows: authority } = await runSql<{ ok: boolean }>(
-      `select true as ok from integrations i
-       join gdrive_connection_authority a on a.integration_id=i.id and a.team_id=i.team_id
-       join api_keys k on k.id=a.connector_api_key_id and k.member_id=a.connector_member_id
-       join members m on m.id=a.connector_member_id and m.team_id=a.team_id
-       where i.id=$1 and i.team_id=$2 and i.type='gdrive'
-         and a.connector_api_key_id=$3 and a.connector_member_id=$4
-         and k.revoked_at is null and m.status='active' and m.is_connector=true`,
-      [input.integrationId, input.teamId, input.apiKeyId, input.memberId],
-    );
-    if (!authority[0]) {
-      throw new Error("Google Drive scheduled report authority is stale");
-    }
-    const { rows: existing } = await runSql<{
-      status: string; summary: Record<string, unknown>; error: string | null; started_at: string;
-    }>(`select status,summary,error,started_at from gdrive_run_requests where id=$1 for update`, [input.reportId]);
-    if (existing[0]) {
-      const same = existing[0].status === input.status
-        && canonicalJson(existing[0].summary ?? {}) === canonicalJson(input.summary)
-        && (existing[0].error ?? undefined) === input.error;
-      if (!same) throw new Error("conflicting Google Drive scheduled report replay");
-      return { newly_completed: false, started_at: existing[0].started_at };
-    }
-    await runSql(
+    await assertScheduledReportAuthority(input);
+    const replay = await storedScheduledReplay(input);
+    if (replay) return replay;
+    // Two deliveries of one report can both find no row and both insert. `on conflict (id) do
+    // nothing` makes the loser wait for the winner's commit and then insert nothing, instead of
+    // aborting this transaction on a unique violation. Only the primary key is absorbed: any other
+    // constraint still raises, and an absorbed conflict is not yet a success.
+    const { rows: inserted } = await runSql<{ id: string }>(
       `insert into gdrive_run_requests
        (id,team_id,integration_id,trigger,status,created_at,started_at,finished_at,summary,error)
-       values($1,$2,$3,'scheduler',$4,$5::timestamptz,$5::timestamptz,now(),$6::jsonb,$7)`,
+       values($1,$2,$3,'scheduler',$4,$5::timestamptz,$5::timestamptz,now(),$6::jsonb,$7)
+       on conflict (id) do nothing returning id`,
       [input.reportId, input.teamId, input.integrationId, input.status, input.startedAt,
        JSON.stringify(input.summary), input.error ?? null],
     );
-    return { newly_completed: true, started_at: input.startedAt };
+    if (inserted[0]) return { newly_completed: true, started_at: input.startedAt };
+    // Lost the race: the winner's row is committed and visible to this new statement. It counts only
+    // as an exact replay, and only while this connector still holds the authority — re-read both.
+    await assertScheduledReportAuthority(input);
+    const raced = await storedScheduledReplay(input);
+    if (raced) return raced;
+    // The conflicting row was gone again by the re-read (deleted with its connection): unexplained,
+    // so retryable rather than a success.
+    throw new Error("Google Drive scheduled report id conflicted but no row was found on re-read");
   });
 }
 

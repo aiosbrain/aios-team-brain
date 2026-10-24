@@ -340,12 +340,16 @@ async def test_remote_poll_runs_only_unconfigured_enabled_oauth_selections(tmp_p
                 _oauth_row(later_id, "later-docs"),
             ]
         async def report_scheduled_gdrive_run(self, report_id, integration_id, started, summary, **kwargs):
-            reported.append((integration_id, kwargs["status"]))
+            reported.append({
+                "integration_id": integration_id, "status": kwargs["status"], "error": kwargs.get("error"),
+                "failed": summary.failed, "authoritative_complete": summary.authoritative_complete,
+                "failure_categories": dict(summary.failure_categories or {}),
+            })
 
     async def run(_settings, conn, _state):
         ran.append(conn)
         if conn.name == "admin-docs":
-            raise RuntimeError("first integration failed")
+            raise RuntimeError("first integration failed: do-not-leak-marker")
         return IngestSummary(conn.name, backlog=0, authoritative_complete=True,
                              integration_id=conn.options["integration_id"])
 
@@ -361,7 +365,17 @@ async def test_remote_poll_runs_only_unconfigured_enabled_oauth_selections(tmp_p
         assert conn.options["auth_mode"] == "oauth"
         assert conn.options["credential_identity"] == "subject:google-123"
         assert not {"service_account_key_path", "credential_json", "access_token"} & set(conn.options)
-    assert reported == [(later_id, "complete")]
+    # The integration whose run RAISED (still enabled on the re-read) is reported once, against its
+    # resolved id, as a sanitized non-authoritative failure under the fixed category — never the
+    # exception's text or class — and the later integration still runs and completes.
+    assert [(r["integration_id"], r["status"]) for r in reported] == [(admin_id, "partial"), (later_id, "complete")]
+    failed, completed = reported
+    assert failed == {
+        "integration_id": admin_id, "status": "partial", "error": "coordinator_error",
+        "failed": 1, "authoritative_complete": False, "failure_categories": {"coordinator_error": 1},
+    }
+    assert "do-not-leak-marker" not in repr(failed) and "RuntimeError" not in repr(failed)
+    assert completed["error"] is None and completed["authoritative_complete"] is True and completed["failed"] == 0
     state.close()
 
 

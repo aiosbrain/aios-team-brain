@@ -202,6 +202,38 @@ reporting ledger with scheduled runs. The Admin status shows last attempt/proven
 counts including skipped, nullable backlog and cursor age, and reconnect/pause state. A busy worker is
 deferred; zero counters never imply completion without terminal stream/snapshot/drain evidence.
 
+Every run report is kept, but only some reach the Admin run ledger that drives the failure banner.
+An authoritative complete run with no failed work is a success, and is the only thing that ends a
+failure streak. A run that failed work, failed outright, or was refused for any reason other than
+`execution_busy` is a failure. Two outcomes are neutral and add no ledger row: a run that found
+another coordinator holding the lease (`execution_busy`), and healthy partial progress (work done,
+nothing failed, not yet complete — a run budget, rate limit or deadline). A neutral outcome can
+neither confirm a failure banner nor clear a real one. A refused execution authority other than busy
+is reported with a failed count, so it never reads as healthy progress.
+
+A scheduled poll first re-reads the connection's Admin state. A paused or disconnected connection is
+not polled and reports nothing. A pause can also land after that check — before the brain's authority
+check (`connection_unavailable`) or after the run already holds its execution, whose next fenced
+request then answers `stale_execution`. Either category makes the poll re-read THAT connection by its
+resolved id: if it is now paused or gone, nothing is reported; if it is still enabled, the authority
+loss is actionable and is reported as a failure. A run that raises instead of returning (stream setup
+— e.g. a configured service-account key file that does not exist — or any other unexpected error) is
+reported the same way, against the id the preflight resolved, as one failure with the fixed category
+`coordinator_error`: the exception's text and class never leave the sidecar (the class is logged
+locally), nothing is claimed complete, backlog stays unknown, and pending hints and progress stand.
+Cancellation is never converted into a report. Once the integration id is resolved (by id, or by name for a local configuration), every
+failure is reported against it; a failure before that is only logged locally — no id is invented.
+Admin shows the latest attempt (a busy deferral included), counts, backlog and cursor age from the
+latest run that did work, and the latest authoritative success read per connection. A paused
+connection says so first, and once no Drive connection is enabled its earlier failure leaves the banner.
+
+Delivering the report is retried, boundedly. A 429 or 5xx answer (the brain's `503 report_unavailable`
+included), or a request the brain did not answer in time, re-sends the identical report — same report id, same body — so a report that committed
+before its answer was lost is accepted as a replay, never recorded twice. Up to four attempts within
+two minutes, honoring a valid `Retry-After` and backing off exponentially without one; a wait that
+cannot fit is not slept on (the report is deferred), and nothing waits after the last attempt. A typed
+refusal — `409 stale_execution` or `409 conflicting_report` — is final and is not retried.
+
 **Cursor age** is the time since the *stalest* required stream of the current generation last
 completed a durable drain the brain acknowledged: its terminal drain was clean, its checkpoint was
 acknowledged, and the all-stream reconciliation was acknowledged (or an empty selection's drain

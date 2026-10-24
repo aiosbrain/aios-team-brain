@@ -1006,3 +1006,198 @@ async def test_gdrive_reconcile_without_a_deadline_keeps_the_unbounded_retry_pol
 
     assert result == {"items": 1}
     assert calls == 2 and sleeps == [120.0]
+
+
+# ── AC-04: a scheduled Drive report's bounded retry (AIO-1167 r37) ─────────────────────────────
+
+_REPORT_ID = "55555555-5555-5555-5555-555555555555"
+_REPORT_INTEGRATION = "66666666-6666-6666-6666-666666666666"
+
+
+async def _report(client: BrainClient) -> None:
+    await client.report_scheduled_gdrive_run(
+        _REPORT_ID, _REPORT_INTEGRATION, "2026-10-23T10:00:00.123456+00:00",
+        IngestSummary("drive", unchanged=3, authoritative_complete=True, backlog=0, cursor_age_seconds=4.0),
+        status="complete",
+    )
+
+
+def _report_bodies(sent: list[bytes]) -> list[dict]:
+    return [json.loads(body) for body in sent]
+
+
+@pytest.mark.parametrize("status", [503, 429])
+async def test_scheduled_report_retries_a_retryable_answer_with_the_same_report_and_its_retry_after(status):
+    sent: list[bytes] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        sent.append(req.content)
+        if len(sent) == 1:
+            # The route's sanitized answer: the report may or may not have committed.
+            return httpx.Response(status, headers={"retry-after": "30"}, json={
+                "error": {"code": "report_unavailable", "message": "retry later"},
+            })
+        return httpx.Response(200, json={"ok": True})
+
+    client, sleeps, _clock = _clocked_client(httpx.MockTransport(handler))
+    async with client:
+        await _report(client)
+
+    first, second = _report_bodies(sent)
+    # Byte-for-byte the same delivery, so the brain can recognise the replay of a committed report.
+    assert sent[0] == sent[1]
+    assert first == second and first["reportId"] == _REPORT_ID
+    assert first["startedAt"] == "2026-10-23T10:00:00.123456+00:00"
+    assert sleeps == [30]
+
+
+async def test_scheduled_report_retry_is_bounded_and_never_sleeps_after_the_last_attempt():
+    sent: list[bytes] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        sent.append(req.content)
+        return httpx.Response(503, headers={"retry-after": "1"}, json={
+            "error": {"code": "report_unavailable", "message": "retry later"},
+        })
+
+    client, sleeps, _clock = _clocked_client(httpx.MockTransport(handler))
+    async with client:
+        with pytest.raises(BrainError) as failed:
+            await _report(client)
+
+    assert len(sent) == 4 and len(set(sent)) == 1
+    assert sleeps == [1, 1, 1]
+    assert (failed.value.status_code, failed.value.code) == (503, "report_unavailable")
+    assert not isinstance(failed.value, BrainDeferred)
+
+
+async def test_scheduled_report_retry_after_that_cannot_fit_the_deadline_defers_without_sleeping():
+    sent: list[bytes] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        sent.append(req.content)
+        return httpx.Response(503, headers={"retry-after": "600"}, json={
+            "error": {"code": "report_unavailable", "message": "retry later"},
+        })
+
+    client, sleeps, clock = _clocked_client(httpx.MockTransport(handler))
+    async with client:
+        with pytest.raises(BrainDeferred) as deferred:
+            await _report(client)
+
+    # Ten minutes is past the report's own deadline: not slept on, not looped on.
+    assert len(sent) == 1 and sleeps == [] and clock[0] == 100.0
+    assert deferred.value.not_before is not None
+
+
+async def test_scheduled_report_without_retry_after_backs_off_instead_of_looping():
+    sent: list[bytes] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        sent.append(req.content)
+        if len(sent) < 3:
+            return httpx.Response(502, text="bad gateway")
+        return httpx.Response(200, json={"ok": True})
+
+    client, sleeps, _clock = _clocked_client(httpx.MockTransport(handler))
+    async with client:
+        await _report(client)
+
+    assert len(sent) == 3 and len(set(sent)) == 1
+    assert sleeps == [1, 2]
+
+
+@pytest.mark.parametrize("code", ["stale_execution", "conflicting_report"])
+async def test_scheduled_report_typed_409_is_final_and_never_retried(code):
+    sent: list[bytes] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        sent.append(req.content)
+        return httpx.Response(409, headers={"retry-after": "1"}, json={
+            "error": {"code": code, "message": "refused"},
+        })
+
+    client, sleeps, _clock = _clocked_client(httpx.MockTransport(handler))
+    async with client:
+        with pytest.raises(BrainError) as refused:
+            await _report(client)
+
+    assert len(sent) == 1 and sleeps == []
+    assert (refused.value.status_code, refused.value.code) == (409, code)
+    assert not isinstance(refused.value, BrainDeferred)
+
+
+async def test_scheduled_report_unanswered_request_is_resent_identically_after_a_bounded_wait():
+    sent: list[bytes] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        sent.append(req.content)
+        if len(sent) == 1:
+            # Sent, maybe committed, never answered: only a same-id replay can settle which.
+            raise httpx.ReadTimeout("the brain did not answer", request=req)
+        return httpx.Response(200, json={"ok": True})
+
+    client, sleeps, _clock = _clocked_client(httpx.MockTransport(handler))
+    async with client:
+        await _report(client)
+
+    assert len(sent) == 2 and sent[0] == sent[1]
+    assert _report_bodies(sent)[1]["reportId"] == _REPORT_ID
+    assert sleeps == [1]
+
+
+async def test_scheduled_report_timeouts_exhaust_the_attempt_budget_as_an_ordinary_failure():
+    sent: list[bytes] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        sent.append(req.content)
+        raise httpx.ReadTimeout("the brain did not answer", request=req)
+
+    client, sleeps, _clock = _clocked_client(httpx.MockTransport(handler))
+    async with client:
+        with pytest.raises(BrainError) as failed:
+            await _report(client)
+
+    assert len(sent) == 4 and len(set(sent)) == 1
+    assert sleeps == [1, 2, 4]  # exponential, and nothing after the last attempt
+    assert (failed.value.status_code, failed.value.code) == (504, "brain_timeout")
+    assert not isinstance(failed.value, BrainDeferred)
+
+
+async def test_scheduled_report_timeouts_and_retryable_answers_share_one_attempt_budget():
+    sent: list[bytes] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        sent.append(req.content)
+        if len(sent) == 2:
+            return httpx.Response(503, headers={"retry-after": "1"}, json={
+                "error": {"code": "report_unavailable", "message": "retry later"},
+            })
+        raise httpx.ReadTimeout("the brain did not answer", request=req)
+
+    client, sleeps, _clock = _clocked_client(httpx.MockTransport(handler))
+    async with client:
+        with pytest.raises(BrainError) as failed:
+            await _report(client)
+
+    assert len(sent) == 4 and len(set(sent)) == 1
+    assert sleeps == [1, 1, 4]
+    assert failed.value.code == "brain_timeout"
+
+
+async def test_scheduled_report_timeout_with_no_room_for_another_attempt_is_deferred_not_slept():
+    sent: list[bytes] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        sent.append(req.content)
+        clock[0] += 119.5  # the unanswered request used up almost all of the two-minute deadline
+        raise httpx.ReadTimeout("the brain did not answer", request=req)
+
+    client, sleeps, clock = _clocked_client(httpx.MockTransport(handler))
+    async with client:
+        with pytest.raises(BrainDeferred) as deferred:
+            await _report(client)
+
+    assert len(sent) == 1 and sleeps == []
+    assert (deferred.value.status_code, deferred.value.code) == (504, "brain_timeout")
+    assert deferred.value.not_before is not None
