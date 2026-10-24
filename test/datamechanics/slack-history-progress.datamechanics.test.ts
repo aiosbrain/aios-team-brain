@@ -151,19 +151,58 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *   - initialize the opposite lane;
  *   - initialize an ineligible row.
  *
- * DEFERRED TO THE IMMEDIATELY FOLLOWING CALLER PACKET, NOT covered here:
- *  - NEWEST-lane claim initialization (L = max(0, B − skew allowance), S = L, U = A) and its
- *    resume-preserves-L rule. The claim does not yet receive the configured allowance, so this is
- *    pinned through discovery;
- *  - the L > A `delayed / scan_bounds_invalid` claim outcome: no lease, attempt, anchor, HTTP,
- *    reservation, root or coverage change;
+ * PACKET 3 — CLAIM-TIME SEGMENT INITIALIZATION, NEWEST LANE (7 tests, appended after packet 2; §4,
+ * §5). Each test calls `claimSlackChannelPage` directly with a configured `skewAllowanceMs`. The option
+ * travels in a non-literal object, so the file compiles against today's signature, which ignores it.
+ * The option NAME is this packet's choice, matching discovery's existing `skewAllowanceMs`; the
+ * contract requires only that the claim use the configured allowance. Expected L always comes from
+ * the test's own BigInt oracle (`boundMinusAllowance`), never from product code. "Today" is GREEN2
+ * production `a2dc9167` (test-only checkpoint `95c2e041`), where packets 1–2 are 47/47 GREEN. The
+ * file therefore totals 54: 6 RED, 48 GREEN.
+ *  - RED today (6), because today's claim initializes no newest segment and has no typed delay:
+ *     - ×2: the first newest claim freezes B by the existing rule (the certified top) and sets
+ *       L = S = max(0, B − allowance) and U = A, with cursor null, history empty and G unchanged.
+ *       One allowance is 90 s; the other is larger than the epoch and clamps to `0.000000`. Each
+ *       checks a whole-row digest outside the newest claim set;
+ *     - an anchored-but-uninitialized newest lane keeps its A and B bytes, U = canonical(A), and an
+ *       in-progress historical lane (segment, cursor, G 3) is byte-identical;
+ *     - a reclaim under a DIFFERENT allowance resumes a cursor-null post-split literal (S > L,
+ *       G + 1). It asserts literal A, B, L, S, U and G plus a lease-only digest; exceptions are
+ *       sanitized. Today it fails at its first, initialization assertion;
+ *     - ×2: candidate L > A, for an already-anchored lane whose B lies above A + allowance and for
+ *       an idle lane under a far-future certified top. Each returns `delayed / scan_bounds_invalid`
+ *       with the exact fixed detail. Only next_lane (to historical), the diagnostic, due_at and
+ *       updated_at change. No lease is taken, and no attempt, generation, anchor, progress or
+ *       certificate moves (an idle lane's anchor stays null). The typed result is read from
+ *       `unknown`, so the current type needs no change for this RED.
+ *  - GREEN today (1), control: an ineligible (private) row with an anchored newest lane is neither
+ *    claimed nor initialized.
+ *  Post-GREEN controlled-mutant evidence for this packet is PENDING:
+ *   - L from the request-time allowance on resume;
+ *   - U = A raw;
+ *   - initialize the historical lane;
+ *   - take the lease on L > A.
+ *
+ * DEFERRED TO THE FOLLOWING DISCOVERY-CALLER PACKET, NOT covered here:
+ *  - discovery passing the configured allowance to the claim, and sending the claim's exact S/U as
+ *    `oldest`/`latest` on every page (never A once U differs), with PA-3 inclusive flags;
+ *  - discovery reporting the L > A step: no HTTP, no method-budget reservation, continuing the
+ *    bounded candidate scan. Same-pass fairness and the DH-09 default-50 boundary matrix are part of
+ *    this;
  *  - discovery's raw-message timestamp validation against the claimed segment
  *    (`page_outside_segment`), after malformed_page, pagination_incomplete and malformed_timestamp,
  *    and before any root enqueue or state write;
  *  - discovery's handling of `rejected` (same-transaction release), `subdivided` (no second
  *    release, zero roots) and `refused`, with acceptance BEFORE root enqueue and one rollback
  *    boundary;
- *  - the static step details for each.
+ *  - the static step details for each;
+ *  - the §9.1/§9.2 fixture corrections in the discovery, fences and bootstrap suites (FX-01–FX-13
+ *    and the bootstrap progress inventory). The §9 census seed is already corrected at `95c2e041`.
+ * Also still deferred:
+ *  - two-session claim/accept races;
+ *  - the §3.4 maximum-history compatibility writers;
+ *  - the controlled mutants;
+ *  - MR-06.
  *
  * PRIVACY: cursors and histories are synthetic. They are compared only by SQL equality (booleans),
  * row md5 digests or SQL-computed counts and byte lengths. Errors are projected to SQLSTATE/name.
@@ -571,7 +610,7 @@ function nearByteCapHistory(): string[] {
   return Array.from({ length: 999 }, (_, i) => `n${String(i).padStart(3, "0")}${pad.repeat(347)}`);
 }
 
-describe("AM-F2 runtime packets 1–2 — state-writer history admission and historical claim initialization (real Postgres)", () => {
+describe("AM-F2 runtime packets 1–3 — state-writer history admission and claim-time segment initialization (real Postgres)", () => {
   beforeAll(async () => {
     // 1. The shared guard FIRST: only the isolated local runner or CI's service. The error never
     //    prints the URL, and nothing below runs unless the URL is accepted.
@@ -1181,6 +1220,139 @@ describe("AM-F2 runtime packets 1–2 — state-writer history admission and his
       claim: null, rowUnchanged: true,
     });
   });
+
+  // ── PACKET 3: claim-time segment initialization, NEWEST lane, direct claim (§4, §5) ─────────────
+
+  it.each([
+    { label: "a 90-second allowance", allowanceMs: 90_000, literalL: "1718899910.123456" },
+    { label: "an allowance larger than the epoch, clamped at zero", allowanceMs: 100 * 365 * 24 * 60 * 60 * 1000, literalL: "0.000000" },
+  ])("§5 newest init: the FIRST newest claim freezes B by the existing rule and initializes L = S = max(0, B − allowance), U = A, C = null, H = [] ($label)", async ({ allowanceMs, literalL }) => {
+    const B = "1718900000.123456";
+    const { scope, integrationId } = await seedNewestCandidate({
+      completed_lower_ts: "1718800000.000001", completed_upper_ts: B, historical_floor_reached: true,
+    });
+    const L = boundMinusAllowance(B, BigInt(allowanceMs));
+    expect(L, "fixture: the independent BigInt oracle agrees with the stated literal").toBe(literalL);
+    const before = await rowDigestExcept(scope, NEWEST_CLAIM_PERMITTED);
+    const claim = await claimNewest(scope, integrationId, allowanceMs);
+    const bounds = claimBounds(claim);
+    const anchor = typeof bounds.anchorTs === "string" ? bounds.anchorTs : "";
+    expect({
+      bounds: { ...bounds, anchorTs: undefined, segmentUpperTs: undefined },
+      anchorCanonical: CANONICAL_BOUND.test(anchor),
+      upperIsAnchor: bounds.segmentUpperTs === bounds.anchorTs,
+      stored: await newestInitFacts(scope, { anchor, lower: B, requestLower: L, upper: anchor }),
+      unrelatedUnchanged: (await rowDigestExcept(scope, NEWEST_CLAIM_PERMITTED)) === before,
+    }, "B is the certified top; [L, A] is the first newest segment; the historical lane and all else are exact").toEqual({
+      bounds: {
+        lane: "newest", anchorTs: undefined, segmentUpperTs: undefined,
+        lowerTs: B, requestLowerTs: L, segmentLowerTs: L, scanGeneration: 0, cursorNull: true,
+      },
+      anchorCanonical: true, upperIsAnchor: true,
+      stored: { anchor_is_expected: true, lower_is_expected: true, request_lower_is_expected: true, segment_is_expected: true, cursor_history_empty: true },
+      unrelatedUnchanged: true,
+    });
+  });
+
+  it("§4/§5 newest init: an ANCHORED-but-uninitialized newest lane keeps its A and B bytes, and only U is canonical; an in-progress historical lane is untouched", async () => {
+    const { scope, integrationId } = await seedNewestCandidate({
+      newest_anchor_ts: "1718900800.25", newest_lower_ts: "1718900400.5", newest_scan_generation: 2,
+      historical_anchor_ts: "1718900400.5", historical_segment_lower_ts: "0.000000", historical_segment_upper_ts: "1718900400.500000",
+      historical_cursor: "syn-h-1", historical_cursor_history: ["syn-h-1"], historical_scan_generation: 3,
+    });
+    const L = boundMinusAllowance("1718900400.5", BigInt(60_000));
+    expect(L, "fixture: oracle").toBe("1718900340.500000");
+    const before = await rowDigestExcept(scope, NEWEST_CLAIM_PERMITTED);
+    const claim = await claimNewest(scope, integrationId, 60_000);
+    expect({
+      bounds: claimBounds(claim),
+      stored: await newestInitFacts(scope, { anchor: "1718900800.25", lower: "1718900400.5", requestLower: L, upper: "1718900800.250000" }),
+      unrelatedUnchanged: (await rowDigestExcept(scope, NEWEST_CLAIM_PERMITTED)) === before,
+    }, "existing A/B are never re-rendered; U = canonical(A); the opposite lane is byte-identical").toEqual({
+      bounds: {
+        lane: "newest", anchorTs: "1718900800.25", lowerTs: "1718900400.5", requestLowerTs: L,
+        segmentLowerTs: L, segmentUpperTs: "1718900800.250000", scanGeneration: 2, cursorNull: true,
+      },
+      stored: { anchor_is_expected: true, lower_is_expected: true, request_lower_is_expected: true, segment_is_expected: true, cursor_history_empty: true },
+      unrelatedUnchanged: true,
+    });
+  });
+
+  it("§5 newest init: a reclaim RESUMES a progressed cursor-null post-split newest segment (S > L, G + 1) and never reinitializes it, even under a different allowance", async () => {
+    const B = "1718900000.123456";
+    const { scope, integrationId } = await seedNewestCandidate({
+      completed_lower_ts: "1718800000.000001", completed_upper_ts: B, historical_floor_reached: true,
+    });
+    const L = boundMinusAllowance(B, BigInt(60_000));
+    const first = claimBounds(await claimNewest(scope, integrationId, 60_000));
+    const initialized = first.requestLowerTs === L && first.segmentLowerTs === L && first.segmentUpperTs === first.anchorTs;
+    // A valid post-split literal: S = `1718899970.000000` (> L, as a split's M + 1 leaves it), U and
+    // A unchanged, C null, H empty, G + 1. Written ONLY over an initialized lane, because S without L
+    // and U violates the progress CHECK and would be a fixture error, not a behavioral RED.
+    if (initialized) {
+      await tx((session) => session.executeSql(
+        `update slack_sync_channels
+            set newest_segment_lower_ts = '1718899970.000000', newest_scan_generation = newest_scan_generation + 1
+          where team_id = $1`, [scope.teamId]
+      ));
+    }
+    const afterProgress = await rowDigestExcept(scope, LEASE_BOOKKEEPING);
+    await tx((session) => session.executeSql(
+      "update slack_sync_channels set lease_expires_at = clock_timestamp() - interval '1 second' where team_id = $1", [scope.teamId]
+    ));
+    // A DIFFERENT allowance on the reclaim: the frozen L must not follow it.
+    const second = claimBounds(await claimNewest(scope, integrationId, 30_000));
+    expect({
+      initialized, second,
+      laneUnchanged: (await rowDigestExcept(scope, LEASE_BOOKKEEPING)) === afterProgress,
+    }, "the reclaim carries the progressed A, B, L, S, U and G; only the lease bookkeeping moves").toEqual({
+      initialized: true,
+      second: {
+        lane: "newest", anchorTs: first.anchorTs, lowerTs: B, requestLowerTs: L,
+        segmentLowerTs: "1718899970.000000", segmentUpperTs: first.anchorTs, scanGeneration: 1, cursorNull: true,
+      },
+      laneUnchanged: true,
+    });
+  });
+
+  it("§5 newest init control: an INELIGIBLE row (not public) with an anchored newest lane is not claimed and not initialized; it is byte-identical", async () => {
+    const { scope, integrationId } = await seedNewestCandidate({
+      public_state: "private", newest_anchor_ts: "1718900800.25", newest_lower_ts: "1718900400.5",
+      completed_lower_ts: "1718800000.000001", completed_upper_ts: "1718900400.5", historical_floor_reached: true,
+    });
+    const before = await rowDigestExcept(scope, []);
+    const claim = await claimNewest(scope, integrationId, 60_000);
+    expect({ claim, rowUnchanged: (await rowDigestExcept(scope, [])) === before }, "eligibility precedes initialization").toEqual({
+      claim: null, rowUnchanged: true,
+    });
+  });
+
+  it.each([
+    {
+      label: "an already-ANCHORED newest lane whose frozen B lies above A + allowance",
+      over: {
+        newest_anchor_ts: "1718900800.000000", newest_lower_ts: "1718900900.000000",
+        completed_lower_ts: "1718800000.000001", completed_upper_ts: "1718900000.000000", historical_floor_reached: true,
+      },
+    },
+    {
+      label: "an IDLE newest lane whose certified top lies in the far future",
+      over: { completed_lower_ts: "1718800000.000001", completed_upper_ts: "4102444800.000000", historical_floor_reached: true },
+    },
+  ])("§5 newest init: candidate L > A ($label) is typed delayed / scan_bounds_invalid; no lease, attempt, anchor, generation, progress or certificate moves", async ({ over }) => {
+    const { scope, integrationId } = await seedNewestCandidate(over);
+    const before = await rowDigestExcept(scope, L_ABOVE_A_PERMITTED);
+    const result = await claimNewest(scope, integrationId, 60_000);
+    expect({
+      outcome: typedOutcome(result),
+      unchanged: (await rowDigestExcept(scope, L_ABOVE_A_PERMITTED)) === before,
+      bookkeeping: await delayBookkeeping(scope),
+    }, "only next_lane (to the opposite lane), the diagnostic, due_at and updated_at may change").toEqual({
+      outcome: { outcome: "delayed", category: "scan_bounds_invalid", detail: "The scan bounds are inconsistent; no provider request was sent." },
+      unchanged: true,
+      bookkeeping: { next_lane: "historical", last_error_code: "scan_bounds_invalid", lease_absent: true, due_now: true },
+    });
+  });
 });
 
 /** Columns a historical claim may change: lease bookkeeping, the frozen anchor, attempt-oldest reset, and S/U. */
@@ -1267,5 +1439,114 @@ async function newestUninitializedFacts(scope: SlackChannelScope, anchor: string
             newest_cursor is null and newest_cursor_history = '[]'::jsonb as cursor_history_empty
        from slack_sync_channels where team_id = $1 and workspace_id = $2 and channel_id = $3`,
     [scope.teamId, scope.workspaceId, scope.channelId, anchor, lower]
+  )).rows[0]);
+}
+
+// ── packet 3 helpers: newest-lane claim initialization ────────────────────────────────────────────
+
+/** Columns a NEWEST claim may change: lease bookkeeping, the frozen A and B, and the newest L/S/U. */
+const NEWEST_CLAIM_PERMITTED = [
+  ...LEASE_BOOKKEEPING,
+  "newest_anchor_ts", "newest_lower_ts", "newest_request_lower_ts", "newest_segment_lower_ts", "newest_segment_upper_ts",
+];
+/** Columns the L > A bookkeeping may change (§5): the turn, the diagnostic, due_at and updated_at. */
+const L_ABOVE_A_PERMITTED = ["next_lane", "last_error_code", "due_at", "updated_at"];
+const ORACLE_MICROS = BigInt(1_000_000);
+
+/**
+ * The test's OWN oracle for L = max(0, B − allowance), with BigInt microseconds only. It is never the
+ * product's helper and never `Number` arithmetic on a timestamp. B may be a noncanonical spelling;
+ * the result is canonical (seconds without leading zeroes, six fraction digits).
+ */
+function boundMinusAllowance(bound: string, allowanceMs: bigint): string {
+  const match = /^([0-9]+)[.]([0-9]{1,6})$/.exec(bound);
+  if (!match) throw new Error("fixture: the bound is not an exact timestamp");
+  const lowered = BigInt(match[1]) * ORACLE_MICROS + BigInt(match[2].padEnd(6, "0")) - allowanceMs * BigInt(1_000);
+  const clamped = lowered < BigInt(0) ? BigInt(0) : lowered;
+  return `${(clamped / ORACLE_MICROS).toString()}.${(clamped % ORACLE_MICROS).toString().padStart(6, "0")}`;
+}
+
+/**
+ * Claim with a configured skew allowance. The option travels in a NON-literal object, so this
+ * compiles against today's claim signature (which has no such option and ignores it at runtime). The
+ * result is `unknown`: either a claim, null, a typed delay, or a sanitized exception.
+ */
+async function claimNewest(scope: SlackChannelScope, integrationId: string, skewAllowanceMs: number): Promise<unknown> {
+  const opts = { bindingIntegrationId: integrationId, bindingConfigRevision: REVISION, skewAllowanceMs };
+  return tx((session) => claimSlackChannelPage(session, scope, opts)).catch(sanitized);
+}
+
+/** A typed claim outcome, projected from `unknown`: only its outcome, category and static detail. */
+function typedOutcome(result: unknown): Record<string, unknown> {
+  const value = (result ?? {}) as Record<string, unknown>;
+  return { outcome: value.outcome, category: value.category, detail: value.detail };
+}
+
+type NewestSeed = Partial<{
+  public_state: "public" | "private";
+  newest_anchor_ts: string;
+  newest_lower_ts: string;
+  newest_scan_generation: number;
+  historical_anchor_ts: string;
+  historical_segment_lower_ts: string;
+  historical_segment_upper_ts: string;
+  historical_cursor: string;
+  historical_cursor_history: string[];
+  historical_scan_generation: number;
+  completed_lower_ts: string;
+  completed_upper_ts: string;
+  historical_floor_reached: boolean;
+}>;
+
+/**
+ * A public, bound, due channel whose NEXT lane is newest. Its newest lane has no segment: it is idle,
+ * or anchored with B as the all-null initialization tuple §4 permits. Every column is a literal from
+ * `over`, or empty by default; histories default to `[]`.
+ */
+async function seedNewestCandidate(over: NewestSeed): Promise<{ scope: SlackChannelScope; integrationId: string }> {
+  const seed = await seedTeam();
+  const scope = { teamId: seed.teamId, workspaceId: WORKSPACE, channelId: CHANNEL };
+  const integrationId = await tx(async (session) => (await session.executeSql<{ id: string }>(
+    `insert into integrations (team_id, type, name) values ($1, 'slack', 'newest-init-binder') returning id::text as id`, [seed.teamId]
+  )).rows[0].id);
+  await tx((session) => session.executeSql(
+    `insert into slack_sync_channels
+       (team_id, workspace_id, channel_id, public_state, public_checked_at, binding_integration_id, binding_config_revision,
+        newest_anchor_ts, newest_lower_ts, newest_scan_generation,
+        historical_anchor_ts, historical_segment_lower_ts, historical_segment_upper_ts,
+        historical_cursor, historical_cursor_history, historical_scan_generation,
+        completed_lower_ts, completed_upper_ts, historical_floor_reached, next_lane, due_at)
+     values ($1, $2, $3, $4, '2026-01-01 00:00:00+00', $5::uuid, $6,
+             $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15, $16, $17, $18, 'newest', '2020-01-01 00:00:00+00')`,
+    [seed.teamId, WORKSPACE, CHANNEL, over.public_state ?? "public", integrationId, REVISION,
+      over.newest_anchor_ts ?? null, over.newest_lower_ts ?? null, over.newest_scan_generation ?? 0,
+      over.historical_anchor_ts ?? null, over.historical_segment_lower_ts ?? null, over.historical_segment_upper_ts ?? null,
+      over.historical_cursor ?? null, JSON.stringify(over.historical_cursor_history ?? []), over.historical_scan_generation ?? 0,
+      over.completed_lower_ts ?? null, over.completed_upper_ts ?? null, over.historical_floor_reached ?? false]
+  ));
+  return { scope, integrationId };
+}
+
+/** The stored newest initialization against literal expectations (booleans only). */
+async function newestInitFacts(scope: SlackChannelScope, expected: { anchor: string; lower: string; requestLower: string; upper: string }) {
+  return tx(async (session) => (await session.executeSql<Record<string, unknown>>(
+    `select newest_anchor_ts is not distinct from $4 as anchor_is_expected,
+            newest_lower_ts is not distinct from $5 as lower_is_expected,
+            newest_request_lower_ts is not distinct from $6 as request_lower_is_expected,
+            newest_segment_lower_ts is not distinct from $6 and newest_segment_upper_ts is not distinct from $7 as segment_is_expected,
+            newest_cursor is null and newest_cursor_history = '[]'::jsonb as cursor_history_empty
+       from slack_sync_channels where team_id = $1 and workspace_id = $2 and channel_id = $3`,
+    [scope.teamId, scope.workspaceId, scope.channelId, expected.anchor, expected.lower, expected.requestLower, expected.upper]
+  )).rows[0]);
+}
+
+/** The L > A bookkeeping (§5): the opposite turn, the diagnostic, no lease, and due at the DB clock. */
+async function delayBookkeeping(scope: SlackChannelScope) {
+  return tx(async (session) => (await session.executeSql<Record<string, unknown>>(
+    `select next_lane, last_error_code,
+            lease_owner is null and lease_expires_at is null and claimed_lane is null as lease_absent,
+            due_at > clock_timestamp() - interval '1 hour' and due_at <= clock_timestamp() as due_now
+       from slack_sync_channels where team_id = $1 and workspace_id = $2 and channel_id = $3`,
+    [scope.teamId, scope.workspaceId, scope.channelId]
   )).rows[0]);
 }
