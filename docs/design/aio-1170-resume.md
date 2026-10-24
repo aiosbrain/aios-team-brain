@@ -2,6 +2,37 @@
 
 Last updated: 2026-10-24. The newest current-state section governs. Older sections are preserved as historical stop records and may describe gates that have since been cleared. This is the tracked recovery record for draft [PR 714](https://github.com/aiosbrain/aios-team-brain/pull/714), targeting `staging`. It does not claim AC-02 or AIO-1170 complete.
 
+## Current state — 2026-10-24, invalid-cursor RED packet
+
+This section is newer than the one below and supersedes its "exact next stage" bullet.
+
+- **Test-only RED checkpoint `7161f92f554b27b1f5f1a3e996c8a1ac7eea4983`.** It is built on the remotely verified production GREEN head `f556163d09c08b5b32ff8295e853fa13cdcb20ae` through test-only commits `cd996f08`, `c2536ac6` and `7161f92f`. Only `test/datamechanics/slack-history-progress.datamechanics.test.ts` and `test/datamechanics/slack-source-discovery.datamechanics.test.ts` changed; production is unchanged.
+- **Coverage:**
+  - progressed wide subdivision and singleton restart, preserving privacy, the completed-segments aggregate, the certificate and the opposite lane;
+  - the full 12-predicate restart-writer fence, including lease owner alone, plus successor reclaim;
+  - actual `invalid_cursor` with a cursor present and with a null cursor;
+  - selection-first, same-transaction evidence for both the transition and the refusal;
+  - a lease expiring inside that transaction;
+  - typed stale-selection and stale-lease refusals;
+  - exact no-root, no-local-retry outcomes, with privacy-safe output.
+- **Exact RED evidence:** isolated real PostgreSQL produced exactly 14 intended behavioral RED / 267 pass / 1 expected fail = 282, with no setup, compiler or import failure. Durable local log `.context/aio-1170-resume/aio1170-invalid-cursor-refusal-red-final-observed.log`, SHA-256 `0edd6ab449938e812a0b59164b8735d59a7bca9d3b2c623c506d9a16fd90bfe0`. Typecheck, targeted ESLint and diff check pass.
+- **Reviews:**
+  - Fresh subscription Opus 5.5 HIGH affected review session `95c9db3e-4b46-4b5d-b9c9-99e32d8941b0` returned `RED PACKET READY FOR GREEN IMPLEMENTATION`, with no blocker, HIGH or MEDIUM; it closes both earlier MEDIUMs. It retained these non-gating LOWs, which are tracked without a new broad review loop:
+    - the tracking relies on SQL-shape matching of raw SQL only;
+    - stale-selection transaction coverage;
+    - an incomplete older acceptance-writer deferral note.
+  - The mandatory independent reviewer was dispatched as exact `gpt-6.1-sol` HIGH, task `/root/ac02_sol_finish_coordinator/aio1170_invalid_cursor_red_prepush_review`. It independently matched the exact head and evidence SHA, and returned `PASS — SAFE TO PUSH RED CHECKPOINT` with no findings. The runtime exposed the GPT-6 family name; the dispatch metadata confirms the exact alias.
+- **Capacity at the review boundary:** 9% five-hour / 42% seven-day, subscription-only, no API key, overage off.
+- **Exact next stage, after remote backup and readback:** the same sole writer implements GREEN in the existing restart export and the discovery caller:
+  - typed `subdivided` / `restarted` / `refused` outcomes;
+  - the full channel fence;
+  - the wide split and singleton restart, with the preserved facts;
+  - one selection-first authority transaction;
+  - static, privacy-safe mappings.
+
+  Exact evidence and reviews follow. Compatibility writers, controlled mutants, whole-scope finals and MR-06 remain later; MR-06 waits for PR 743's staging checkpoint.
+- **Held gates:** no activation, wiring, PR 743 edit, merge or deploy.
+
 ## Current state — 2026-10-24
 
 - **Exact local checkpoint before this recovery-note commit:** `2658324393c3b35341f57b0f4039300363be5096`, one production commit after the last independently verified remote checkpoint `f6c523ebf540e664565019fb95cbc411931d1a9d`. The branch is `codex/aio-1170-resume-20261005`; the authorized remote branch is `origin/codex/aio-1170-slack-timeline`. Push the recovery-note commit with the packet, then independently read back the exact remote SHA and PR state.
