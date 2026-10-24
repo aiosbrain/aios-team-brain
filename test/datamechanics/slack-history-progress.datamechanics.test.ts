@@ -311,6 +311,13 @@ import { agePublicProof, closeRawSql, elapse, expireChannelLease } from "./slack
  *    same revision makes the old integration's claim of an L > A candidate null (FN16).
  *  Not claimed by packet 8: the newest lane's inner terminal and terminal rules, full segment
  *  application across a provider traversal, MR-06, and any final acceptance.
+ * PACKET 9 — the deferred DH/F2 finite packet's two DIRECT state-writer cases (DH-PKT-02-H and
+ * DH-PKT-02-N; DH-02, DH-05, F2-05, F2-06), appended after packet 8d. Expected GREEN evidence at the
+ * unchanged checkpoint, not a demonstrated defect. A WIDE continuation over the SQL BYTE cap (341
+ * stored entries, 1,049,256 SQL-counted candidate bytes) is the typed bytes subdivision at the exact
+ * midpoint on each lane; the newest case then runs two inner terminals and its final terminal to
+ * PROVISIONAL coverage between ordinary historical continuation turns. Constructed literals; no queue
+ * claim (the discovery suite's deferred-DH packet carries the application and queue evidence).
  *
  * PRIVACY: cursors and histories are synthetic. They are compared only by SQL equality (booleans),
  * row md5 digests or SQL-computed counts and byte lengths. Errors are projected to SQLSTATE/name.
@@ -331,16 +338,15 @@ import { agePublicProof, closeRawSql, elapse, expireChannelLease } from "./slack
  *     columns, so seeding without this hit 42703. It is an idempotent replay.
  *
  * DEFERRED, NOT covered here:
- *  - the NEWEST lane as the claimed lane: its segment fences and its terminal rules (its B and L fences
- *    are packet 8d);
+ *  - the NEWEST lane as the claimed lane: its segment fences (its B and L fences are packet 8d; its
+ *    inner and final terminal transitions are packet 9 and the discovery suite's deferred-DH packet);
  *  - durable cycles A→A, A→B→A and A→B→C→D→B across separate connections and invocations, on both
  *    interleaved lanes, with a new-root canary (F2-01 remainder, DH-06);
  *  - F2-02 (same cursor valid in another lane, channel, workspace, team, segment or generation;
  *    binder takeover);
  *  - F2-03 (cursor grammar, length and round-trip edges, and malformed direct arrays);
  *  - F2-07 (lane-local pending across later events) and F2-08 (real recovery and turn handling);
- *  - DH-07 (crash, receipt loss and rollback) and DH-10 (the PA-3 margin surviving subdivision);
- *  - the NEWEST lane's actual provider invalid_cursor variants (the historical lane's are packet 6/6a);
+ *  - DH-07 (crash, receipt loss and rollback);
  *  - PostgreSQL-vs-JavaScript serialization difference evidence (F2-05 remainder);
  *  - repetition at the BYTE cap (repetition is covered here only at the entry cap);
  *  - stored-state fail-closed validation of a malformed or inconsistent persisted H;
@@ -350,17 +356,14 @@ import { agePublicProof, closeRawSql, elapse, expireChannelLease } from "./slack
  *  - for the ACCEPTANCE writer, the fence predicates claimed_lane, lease_generation alone and anchor
  *    drift. The restart writer's complete one-predicate matrix is packet 6a; the caller's selection
  *    authority and `lockSlackChannelForAcceptance` are exercised in the discovery suite;
- *  - surrogate variants through actual transport/discovery and URL parameterization (F2-09
- *    remainder, DH-03);
- *  - the NEWEST lane's S > L internal terminal, and segment application across a real provider
- *    traversal (DH-01/02/03/04/05). The historical inner terminal and the exact high-epoch capacity
- *    and restart subdivisions are constructed-literal cases in packet 8.
- *    Still deferred subdivisions, none asserted in this file: a WIDE-segment byte-cap
- *    `cursor_history_bytes_exceeded` subdivision; a WIDE-segment lone-surrogate
- *    `cursor_unrepresentable` subdivision; and any NEWEST-lane acceptance subdivision. Packet 8b's
- *    capacity case is the historical ENTRY cap only.
- *    Claim-time initialization is covered by packet 2 (historical) and packet 3 (newest, including
- *    the L > A typed delay);
+ *  - NO LONGER DEFERRED (pointer only): the newest lane's S > L inner terminal and its acceptance
+ *    subdivisions, WIDE byte-cap and lone-surrogate subdivisions, actual-transport surrogate and
+ *    invalid_cursor convergence on both lanes with URL round trips, DH-10's PA-3 margin through
+ *    subdivision, and segment application across real bound-aware provider traversals
+ *    (DH-01/02/03/04/05) are packet 9 here and the discovery suite's deferred-DH packet. The
+ *    historical inner terminal and the exact high-epoch subdivisions are packet 8. Claim-time
+ *    initialization is covered by packet 2 (historical) and packet 3 (newest, including the L > A
+ *    typed delay);
  *  - OUTSIDE THIS FILE, covered by the caller packet in other suites (still RED where production is
  *    pending):
  *     - the discovery/caller side of initialization and request bounds (S/U `oldest`/`latest`);
@@ -2102,6 +2105,210 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
   it("§5/§8 newest invalid_cursor fence: the logical lower B drifted by one microsecond makes the restart writer return typed refused, and the live row is exact", async () => {
     expect(await newestDriftRestart("logicalLower"), "the newest invalid_cursor transition is fenced on B exactly like acceptance").toEqual({
       outcome: { outcome: "refused", leaked: false }, rowUnchanged: true,
+    });
+  });
+
+  // ── PACKET 9 (deferred DH/F2 finite packet, DH-PKT-02): the SQL BYTE cap on a WIDE segment ─────────
+  // 341 distinct cursors, each four ASCII bytes plus 1,020 three-byte U+4E00 characters (1,024 UTF-16
+  // code units, the cursor maximum). PostgreSQL itself sizes the stored history at 341 entries and
+  // 1,046,188 bytes, and the candidate with one more such cursor at 342 entries and 1,049,256 bytes,
+  // so BYTES fail far below the entry cap. Constructed, CHECK-valid literals written directly; they are
+  // not provider traversals, and these direct writer cases make no queue claim.
+
+  /** One synthetic byte-heavy cursor: `k` + three digits, then 1,020 three-byte characters. */
+  const byteCursor = (i: number): string => `k${String(i).padStart(3, "0")}${String.fromCodePoint(0x4e00).repeat(1020)}`;
+  const byteHistory = (): string[] => Array.from({ length: 341 }, (_, i) => byteCursor(i));
+  const BYTE_CANDIDATE = byteCursor(341);
+  /** The newest-lane counterpart of the invalid_cursor allowance: S, C/H, G and the release. */
+  const NEWEST_SUBDIVISION_PERMITTED = [
+    "newest_cursor", "newest_cursor_history", "newest_scan_generation", "newest_segment_lower_ts", ...RELEASE_PERMITTED,
+  ];
+
+  /** SQL's own entry counts and serialized byte lengths of a lane's stored H and of H plus the candidate. */
+  async function laneHistorySize(scope: SlackChannelScope, lane: "newest" | "historical", candidate: string) {
+    // The lane is one of two literals, never an input.
+    return tx(async (session) => (await session.executeSql<Record<string, unknown>>(
+      `select pg_catalog.jsonb_array_length(${lane}_cursor_history)::int as stored_entries,
+              pg_catalog.octet_length(${lane}_cursor_history::text)::int as stored_bytes,
+              pg_catalog.jsonb_array_length(${lane}_cursor_history || pg_catalog.jsonb_build_array($4::text))::int as candidate_entries,
+              pg_catalog.octet_length((${lane}_cursor_history || pg_catalog.jsonb_build_array($4::text))::text)::int as candidate_bytes,
+              (${lane}_cursor_history -> -1) = pg_catalog.to_jsonb(${lane}_cursor) as linked,
+              not (${lane}_cursor_history @> pg_catalog.jsonb_build_array($4::text)) as candidate_distinct
+         from slack_sync_channels where team_id = $1 and workspace_id = $2 and channel_id = $3`,
+      [scope.teamId, scope.workspaceId, scope.channelId, candidate]
+    )).rows[0]);
+  }
+  const BYTE_SIZES = {
+    stored_entries: 341, stored_bytes: 1_046_188, candidate_entries: 342, candidate_bytes: 1_049_256, linked: true, candidate_distinct: true,
+  };
+
+  /** Claim this row's next lane, and require it to be the named one. */
+  async function claimLaneOf(scope: SlackChannelScope, integrationId: string, lane: "newest" | "historical"): Promise<SlackChannelClaim> {
+    const result = await tx((session) => claimSlackChannelPage(session, scope, { bindingIntegrationId: integrationId, bindingConfigRevision: REVISION }));
+    const claim = result !== null && !("outcome" in result) ? result : null;
+    expect({ lane: claim?.lane ?? null }, `fixture: the ${lane} lane is claimed`).toEqual({ lane });
+    return claim as SlackChannelClaim;
+  }
+
+  it("DH-PKT-02-H (DH-02, DH-05, F2-05/F2-06; DH-04): a WIDE historical continuation over the SQL BYTE cap (341 stored entries, 1,049,256 candidate bytes) is the typed bytes subdivision at the exact midpoint, and keeps the aggregate", async () => {
+    const seeded = await seedWideSegment(byteHistory());
+    await tx((session) => session.executeSql(
+      `update slack_sync_channels
+          set historical_anchor_ts = '15.000000', historical_segment_lower_ts = '10.000000', historical_segment_upper_ts = '13.000000',
+              historical_oldest_seen_ts = '12.000000', historical_completed_segments_oldest_ts = '14.000000'
+        where team_id = $1`,
+      [seeded.scope.teamId]
+    ));
+    expect({
+      sizes: await laneHistorySize(seeded.scope, "historical", BYTE_CANDIDATE),
+      seeded: await rowSelect(seeded.scope, `historical_anchor_ts = '15.000000' and historical_segment_lower_ts = '10.000000'
+          and historical_segment_upper_ts = '13.000000' and historical_scan_generation = 4 as bounds_and_generation,
+        historical_oldest_seen_ts = '12.000000' and historical_completed_segments_oldest_ts = '14.000000' as progress,
+        completed_lower_ts is null and completed_upper_ts is null and newest_catchup_upper_ts is null and last_read_at is null as uncertified_unread`),
+    }, "fixture: SQL-sized byte-cap history on the constructed wide historical segment").toEqual({
+      sizes: BYTE_SIZES, seeded: { bounds_and_generation: true, progress: true, uncertified_unread: true },
+    });
+    const claim = await claimHistorical(seeded);
+    const before = await rowDigestExcept(seeded.scope, INVALID_CURSOR_PERMITTED);
+    const outcome = await admit(claim, { terminal: false, nextCursor: BYTE_CANDIDATE, oldestTs: "12.500000" });
+    expect({
+      outcome,
+      facts: await rowSelect(seeded.scope, `historical_segment_lower_ts, historical_segment_upper_ts, historical_anchor_ts,
+        historical_cursor is null and historical_cursor_history = '[]'::jsonb as cursor_history_cleared,
+        historical_scan_generation::int as generation, historical_oldest_seen_ts is null as attempt_oldest_cleared,
+        historical_completed_segments_oldest_ts as aggregate, last_read_at is null as no_successful_read,
+        completed_lower_ts is null and completed_upper_ts is null and newest_catchup_upper_ts is null
+          and not historical_floor_reached as coverage_unchanged,
+        lease_owner is null and lease_expires_at is null and claimed_lane is null as released, next_lane, last_error_code`),
+      newestLaneUnchanged: await newestLaneExact(seeded.scope),
+      unrelatedUnchanged: (await rowDigestExcept(seeded.scope, INVALID_CURSOR_PERMITTED)) === before,
+    }, "typed bytes subdivision: S = 11.500001; U and A kept; C/H and attempt-oldest cleared; aggregate kept; G + 1; released, turn passed").toEqual({
+      outcome: { accept: { outcome: "subdivided", category: "cursor_history_bytes_exceeded" } },
+      facts: {
+        historical_segment_lower_ts: "11.500001", historical_segment_upper_ts: "13.000000", historical_anchor_ts: "15.000000",
+        cursor_history_cleared: true, generation: 5, attempt_oldest_cleared: true, aggregate: "14.000000", no_successful_read: true,
+        coverage_unchanged: true, released: true, next_lane: "newest", last_error_code: "cursor_history_bytes_exceeded",
+      },
+      newestLaneUnchanged: true,
+      unrelatedUnchanged: true,
+    });
+  });
+
+  it("DH-PKT-02-N (DH-02, DH-05, F2-05/F2-06; DH-04): a WIDE newest continuation over the SQL BYTE cap subdivides at the exact midpoint, then two inner terminals and a final terminal finish it as PROVISIONAL coverage while the initial historical envelope stays pending", async () => {
+    // Newest: A = 15, B = 9, L = 8, [S, U] = [10, 13], G 4, C = H's last. Historical: the initial
+    // envelope pending at anchor 9 (= B) on [0, 9], with an ordinary cursor. Nothing is certified.
+    const { scope, integrationId } = await seedNewestCandidate({
+      newest_anchor_ts: "15.000000", newest_lower_ts: "9.000000", newest_scan_generation: 4,
+      historical_anchor_ts: "9.000000", historical_segment_lower_ts: "0.000000", historical_segment_upper_ts: "9.000000",
+      historical_cursor: "syn-h-1", historical_cursor_history: ["syn-h-1"], historical_scan_generation: 4,
+    });
+    const history = byteHistory();
+    await tx((session) => session.executeSql(
+      `update slack_sync_channels
+          set newest_request_lower_ts = '8.000000', newest_segment_lower_ts = '10.000000', newest_segment_upper_ts = '13.000000',
+              newest_cursor = $2, newest_cursor_history = $3::jsonb
+        where team_id = $1`,
+      [scope.teamId, history[history.length - 1], JSON.stringify(history)]
+    ));
+    /** The newest lane and the coverage, as literal bounds, booleans and G (no cursor or history value). */
+    const newestFacts = () => rowSelect(scope, `newest_anchor_ts, newest_lower_ts, newest_request_lower_ts,
+        newest_segment_lower_ts, newest_segment_upper_ts,
+        newest_cursor is null and newest_cursor_history = '[]'::jsonb as cursor_history_cleared,
+        newest_scan_generation::int as generation, newest_catchup_upper_ts as provisional,
+        completed_lower_ts is null and completed_upper_ts is null as uncertified`);
+    /** The pending historical envelope: its anchor, segment, attempt-oldest, G and floor, plus H against a literal. */
+    const historicalFacts9 = (cursor: string, entries: string[]) => rowSelect(scope, `historical_anchor_ts,
+        historical_segment_lower_ts, historical_segment_upper_ts, historical_scan_generation::int as generation,
+        historical_oldest_seen_ts, historical_floor_reached,
+        historical_cursor = $4 and historical_cursor_history = $5::jsonb as cursor_and_history_expected`, [cursor, JSON.stringify(entries)]);
+    expect({
+      sizes: await laneHistorySize(scope, "newest", BYTE_CANDIDATE),
+      newest: await newestFacts(),
+      historical: await historicalFacts9("syn-h-1", ["syn-h-1"]),
+    }, "fixture: SQL-sized byte-cap history on the constructed wide newest segment, beside a pending historical envelope").toEqual({
+      sizes: BYTE_SIZES,
+      newest: {
+        newest_anchor_ts: "15.000000", newest_lower_ts: "9.000000", newest_request_lower_ts: "8.000000",
+        newest_segment_lower_ts: "10.000000", newest_segment_upper_ts: "13.000000", cursor_history_cleared: false,
+        generation: 4, provisional: null, uncertified: true,
+      },
+      historical: {
+        historical_anchor_ts: "9.000000", historical_segment_lower_ts: "0.000000", historical_segment_upper_ts: "9.000000",
+        generation: 4, historical_oldest_seen_ts: null, historical_floor_reached: false, cursor_and_history_expected: true,
+      },
+    });
+
+    // 1. The over-byte continuation: typed subdivision, newest lane only.
+    const claim = await claimLaneOf(scope, integrationId, "newest");
+    const before = await rowDigestExcept(scope, NEWEST_SUBDIVISION_PERMITTED);
+    const subdivided = await admit(claim, { terminal: false, nextCursor: BYTE_CANDIDATE, oldestTs: "12.500000" });
+    expect({
+      outcome: subdivided,
+      newest: await newestFacts(),
+      bookkeeping: await rowSelect(scope, `last_read_at is null as no_successful_read,
+        lease_owner is null and lease_expires_at is null and claimed_lane is null as released, next_lane, last_error_code`),
+      unrelatedUnchanged: (await rowDigestExcept(scope, NEWEST_SUBDIVISION_PERMITTED)) === before,
+    }, "typed bytes subdivision: S = 11.500001; U, A, B and L kept; C/H cleared; G + 1; no read or coverage write; released, turn passed").toEqual({
+      outcome: { accept: { outcome: "subdivided", category: "cursor_history_bytes_exceeded" } },
+      newest: {
+        newest_anchor_ts: "15.000000", newest_lower_ts: "9.000000", newest_request_lower_ts: "8.000000",
+        newest_segment_lower_ts: "11.500001", newest_segment_upper_ts: "13.000000", cursor_history_cleared: true,
+        generation: 5, provisional: null, uncertified: true,
+      },
+      bookkeeping: { no_successful_read: true, released: true, next_lane: "historical", last_error_code: "cursor_history_bytes_exceeded" },
+      unrelatedUnchanged: true,
+    });
+
+    /** An ORDINARY historical continuation: the legitimate use of the historical turn between newest claims. */
+    const historicalTurn = async (cursor: string, oldest: string) => {
+      const turn = await claimLaneOf(scope, integrationId, "historical");
+      expect(await admit(turn, { terminal: false, nextCursor: cursor, oldestTs: oldest }), "fixture: the historical turn appends an ordinary cursor").toEqual({
+        accept: { outcome: "written" },
+      });
+    };
+    /** A genuinely terminal newest page on the claimed segment, with its typed completion kept. */
+    const newestTerminal = async (oldest: string) =>
+      admitKeepingCompletion(await claimLaneOf(scope, integrationId, "newest"), { terminal: true, nextCursor: null, oldestTs: oldest });
+
+    // 2. [11.500001, 13]: an inner terminal; next [max(L, S − 2W), S − 1] = [8.500001, 11.500000].
+    await historicalTurn("syn-h-2", "5.000000");
+    expect({ outcome: await newestTerminal("12.000000"), newest: await newestFacts() }, "inner terminal 1: the adjacent doubled segment; nothing promoted").toEqual({
+      outcome: { outcome: "written", completion: "segment" },
+      newest: {
+        newest_anchor_ts: "15.000000", newest_lower_ts: "9.000000", newest_request_lower_ts: "8.000000",
+        newest_segment_lower_ts: "8.500001", newest_segment_upper_ts: "11.500000", cursor_history_cleared: true,
+        generation: 6, provisional: null, uncertified: true,
+      },
+    });
+
+    // 3. [8.500001, 11.500000]: an inner terminal; next clamps at L: [8.000000, 8.500000].
+    await historicalTurn("syn-h-3", "4.000000");
+    expect({ outcome: await newestTerminal("10.000000"), newest: await newestFacts() }, "inner terminal 2: clamped at L; nothing promoted").toEqual({
+      outcome: { outcome: "written", completion: "segment" },
+      newest: {
+        newest_anchor_ts: "15.000000", newest_lower_ts: "9.000000", newest_request_lower_ts: "8.000000",
+        newest_segment_lower_ts: "8.000000", newest_segment_upper_ts: "8.500000", cursor_history_cleared: true,
+        generation: 7, provisional: null, uncertified: true,
+      },
+    });
+
+    // 4. [8.000000, 8.500000] = [L, …]: the FINAL terminal. Nothing is certified, so A becomes provisional.
+    await historicalTurn("syn-h-4", "3.000000");
+    expect({
+      outcome: await newestTerminal("8.200000"),
+      newest: await newestFacts(),
+      historical: await historicalFacts9("syn-h-4", ["syn-h-1", "syn-h-2", "syn-h-3", "syn-h-4"]),
+    }, "final terminal: provisional upper = original A; only the newest lane cleared; the historical envelope and its progress kept").toEqual({
+      outcome: { outcome: "written", completion: "envelope" },
+      newest: {
+        newest_anchor_ts: null, newest_lower_ts: null, newest_request_lower_ts: null,
+        newest_segment_lower_ts: null, newest_segment_upper_ts: null, cursor_history_cleared: true,
+        generation: 8, provisional: "15.000000", uncertified: true,
+      },
+      historical: {
+        historical_anchor_ts: "9.000000", historical_segment_lower_ts: "0.000000", historical_segment_upper_ts: "9.000000",
+        generation: 4, historical_oldest_seen_ts: "3.000000", historical_floor_reached: false, cursor_and_history_expected: true,
+      },
     });
   });
 

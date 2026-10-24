@@ -1,3 +1,4 @@
+import { Client } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { TransactionSession } from "@/lib/db/types";
@@ -6,6 +7,7 @@ import { discoverSlackSource, type SlackSourceDiscoveryResult } from "@/lib/inge
 import { transactionCapability } from "@/lib/projects/context/transaction";
 import { db, seedTeam, transactionSessionDecoratedDb, type Seed } from "./helpers";
 import {
+  agePublicProof,
   authTestBody,
   channelInfoBody,
   channelRow,
@@ -20,6 +22,7 @@ import {
   seedSlackIntegration,
   setSlackChannelIds,
   slackJson,
+  slackRateLimited,
   threadRootTs,
   threadRows,
   type SlackCall,
@@ -2650,4 +2653,969 @@ describe("AIO-1170 §3.2/§5: the discovery caller's acceptance transaction", ()
       onlyExpiryMoved: true, leaseStillOwned: true, generationUnchanged: true,
     });
   });
+});
+
+// ── AIO-1170 deferred DH/F2 finite packet: application traversals ─────────────────────────────────
+
+/**
+ * AIO-1170 deferred DH/F2 finite packet (Astra HIGH, 2026-10-25): its 14 APPLICATION cases. The two
+ * direct state-writer cases (DH-PKT-02-H/N) are packet 9 of the history-progress suite.
+ *
+ * Every page goes through real `discoverSlackSource` → transport → fenced state writers → thread
+ * enqueue, in its own fresh invocation (and so its own transactions and connections). Wakes are
+ * paced by the existing clock fixture `elapse`, so the real method budget, due order and turn decide
+ * every slot; no reservation is mocked and no progress or turn field is written between pages. These
+ * are expected-GREEN evidence additions at the unchanged checkpoint, not demonstrated defects.
+ *  - DH-PKT-01: a width-two newest traversal (exactly three requests);
+ *  - DH-PKT-03 ×6: actual-transport lone-surrogate convergence, historical/newest × HIGH/LOW/EMBEDDED,
+ *    each on a first-page fixture and a later-page fixture;
+ *  - DH-PKT-04 ×2: 1,003 roots past the real 1,000-entry cap (2,004 requests);
+ *  - DH-PKT-05 ×2: client-paced actual invalid_cursor expiry, with a competing channel's 429;
+ *  - DH-PKT-06: PA-3 margin attribution through subdivision, with its narrow-margin control;
+ *  - DH-PKT-07 ×2: the newest singleton's terminal and its recovery.
+ *
+ * THE PROVIDER filters a fixed corpus by each request's own inclusive bounds and serves ONE message per
+ * successful page, whatever `limit` says (the page-limit policy is unchanged). Its cursors are opaque
+ * tokens it owns, scoped to the bounds of the attempt that minted them. Each request is recorded
+ * BEFORE its response is generated, and its lane is read from the committed in-flight claim.
+ * Historical cases schedule their opposite turn on an anchored-but-uninitialized newest candidate
+ * whose L > A: each such eligible turn is the zero-HTTP local delay, counted separately.
+ *
+ * PRIVACY: unusable cursors carry a synthetic marker plus an unpaired code unit, travel as real HTTP
+ * JSON and are decoded by the real transport. They are checked only as BOOLEANS at the pg query
+ * boundary, the returned result and every later request URL. No cursor, history, provider body or SQL
+ * parameter array is ever printed; requests are compared by their literal bounds and booleans.
+ */
+describe("AIO-1170 deferred DH/F2 packet: application traversals through real discovery, transport, state and enqueue", () => {
+  const SUBDIVIDED = "The scan was divided into a smaller time range; no roots from this page were accepted.";
+  const UNSPLITTABLE = "The provider continuation cannot be followed for this timestamp range; the scan remains incomplete.";
+  const RESTARTED = "The provider refused the cursor for this timestamp range; the scan remains incomplete.";
+  const SCAN_BOUNDS = "The scan bounds are inconsistent; no provider request was sent.";
+  const MARKER = "syn-unrep-";
+  const INVALID_CURSOR_BODY = { ok: false, error: "invalid_cursor" };
+  /** One paced wake: the clock fixture moves every persisted not-before back by this much. */
+  const PACING_MS = 120_000;
+  const COMPETITOR = "C0SOURCE9";
+  const FIRST_DUE = "2020-01-01 00:00:00+00";
+  const SECOND_DUE = "2020-01-01 00:00:01+00";
+  type Lane = "historical" | "newest";
+  type Shape = "HIGH" | "LOW" | "EMBEDDED";
+  type Row = Record<string, unknown> | null;
+
+  // ── privacy: booleans only ──────────────────────────────────────────────────
+
+  function hasLoneSurrogate(value: string): boolean {
+    for (let i = 0; i < value.length; i += 1) {
+      const unit = value.charCodeAt(i);
+      if (unit >= 0xd800 && unit <= 0xdbff) {
+        const next = value.charCodeAt(i + 1);
+        if (next >= 0xdc00 && next <= 0xdfff) i += 1;
+        else return true;
+      } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+        return true;
+      }
+    }
+    return false;
+  }
+  /** An unusable cursor anywhere in `value`: the marker (so an escaped or U+FFFD-substituted copy too) or an unpaired code unit. */
+  function carriesUnusable(value: unknown, seen: WeakSet<object> = new WeakSet(), depth = 0): boolean {
+    if (typeof value === "string") return value.includes(MARKER) || hasLoneSurrogate(value);
+    if (value === null || typeof value !== "object") return false;
+    if (depth > 32) return true;
+    if (seen.has(value)) return false;
+    seen.add(value);
+    if (value instanceof Uint8Array) return Buffer.from(value.buffer, value.byteOffset, value.byteLength).includes(MARKER);
+    if (value instanceof Date) return false;
+    const items: unknown[] = value instanceof Map ? [...value.keys(), ...value.values()]
+      : value instanceof Set ? [...value.values()]
+        : Array.isArray(value) ? value : Object.values(value);
+    return items.some((item) => carriesUnusable(item, seen, depth + 1));
+  }
+  const PG_QUERY = Client.prototype.query;
+  /** Run one invocation with the pg QUERY boundary scanned; only a boolean is kept. Restored in `finally`. */
+  async function recordingPg<T>(flag: { sent: boolean }, run: () => Promise<T>): Promise<T> {
+    const proto = Client.prototype as unknown as { query: (...args: unknown[]) => unknown };
+    const original = proto.query;
+    if (original !== (PG_QUERY as unknown)) throw new Error("fixture: the pg query recorder is already installed");
+    proto.query = function recordedQuery(this: unknown, ...args: unknown[]) {
+      if (carriesUnusable(args)) flag.sent = true;
+      return original.apply(this, args);
+    };
+    try {
+      return await run();
+    } finally {
+      proto.query = original;
+    }
+  }
+  /** A provider cursor that cannot be represented: the marker plus one unpaired UTF-16 code unit. */
+  const unusable = (shape: Shape, n: number): string =>
+    shape === "HIGH" ? `${MARKER}${n}-\uD800`
+      : shape === "LOW" ? `\uDC00${MARKER}${n}`
+        : `${MARKER}${n}-\uD83D-x`;
+  const NO_LEAK = { pg: false, result: false, url: false, unknownCursor: false, overCeiling: false };
+
+  // ── fixtures ────────────────────────────────────────────────────────────────
+
+  type Columns = Record<string, string | boolean>;
+  const SEED_COLUMNS = new Set([
+    "completed_lower_ts", "completed_upper_ts", "historical_floor_reached", "historical_anchor_ts",
+    "newest_anchor_ts", "newest_lower_ts", "next_lane",
+  ]);
+  /**
+   * Bring an integration selecting these channels to a verified binding through the real entrypoint,
+   * then REPLACE its channel rows with literal public, bound rows (the DH-09 `seededSelection`
+   * pattern). Due order follows `due`. Only whitelisted lane columns may be set.
+   */
+  async function boundRows(seed: Seed, channels: readonly { channelId: string; due: string; columns: Columns }[]): Promise<string> {
+    const integrationId = await setup(seed, channels.map((channel) => channel.channelId));
+    await discover(seed, integrationId, pass(() => slackJson(historyBody({ messages: [] }))));
+    const c = await rawSql();
+    const { rows } = await c.query<{ revision: string | null }>(
+      `select binding_config_revision as revision from slack_sync_channels where team_id = $1 and binding_config_revision is not null limit 1`,
+      [seed.teamId]
+    );
+    const revision = rows[0]?.revision;
+    if (!revision) throw new Error("fixture: the priming pass bound no channel");
+    await c.query(`delete from slack_sync_channels where team_id = $1`, [seed.teamId]);
+    for (const channel of channels) {
+      const names = Object.keys(channel.columns);
+      if (names.some((name) => !SEED_COLUMNS.has(name))) throw new Error("fixture: an unexpected seed column");
+      await c.query(
+        `insert into slack_sync_channels
+           (team_id, workspace_id, channel_id, public_state, public_checked_at, binding_integration_id, binding_config_revision, due_at${names.map((name) => `, ${name}`).join("")})
+         values ($1, $2, $3, 'public', clock_timestamp(), $4::uuid, $5, $6::timestamptz${names.map((_, i) => `, $${i + 7}`).join("")})`,
+        [seed.teamId, WORKSPACE, channel.channelId, integrationId, revision, channel.due, ...names.map((name) => channel.columns[name])]
+      );
+    }
+    await elapse(seed.teamId);
+    return integrationId;
+  }
+  /** A certified, floor-reached channel whose newest lane is anchored at A over the logical lower B, not yet initialized. */
+  const newestCertified = (input: { completedLower: string; completedUpper: string; anchor: string; lower: string }): Columns => ({
+    completed_lower_ts: input.completedLower, completed_upper_ts: input.completedUpper, historical_floor_reached: true,
+    newest_anchor_ts: input.anchor, newest_lower_ts: input.lower, next_lane: "newest",
+  });
+  /**
+   * The initial historical envelope, anchored at A and pending (no certificate). Its opposite turn is
+   * an anchored-but-uninitialized newest candidate with B − 60 s far above its A: every eligible newest
+   * turn is the zero-HTTP local delay, and it never supplies a root.
+   */
+  const historicalPending = (anchor: string): Columns => ({
+    historical_anchor_ts: anchor, next_lane: "historical", newest_anchor_ts: "1.000000", newest_lower_ts: "100000.000000",
+  });
+
+  async function claimedLaneOf(teamId: string, channelId: string): Promise<string | null> {
+    const c = await rawSql();
+    const { rows } = await c.query<{ claimed_lane: string | null }>(
+      `select claimed_lane from slack_sync_channels where team_id = $1 and workspace_id = $2 and channel_id = $3`,
+      [teamId, WORKSPACE, channelId]
+    );
+    return rows[0]?.claimed_lane ?? null;
+  }
+  /** This channel's queue rows, ascending by exact instant, and whether each root appears once. */
+  async function queueOf(teamId: string, channelId: string): Promise<{ roots: string[]; unique: boolean }> {
+    const rows = (await threadRows(teamId)).filter((row) => row.channel_id === channelId && row.workspace_id === WORKSPACE);
+    const roots = rows.map((row) => String(row.root_ts)).sort((a, b) => (tsMicros(a) < tsMicros(b) ? -1 : 1));
+    return { roots, unique: new Set(roots).size === roots.length };
+  }
+
+  // ── the bound-aware provider ────────────────────────────────────────────────
+
+  interface ProviderRequest {
+    readonly index: number;
+    readonly lane: string | null;
+    readonly oldest: string | null;
+    readonly latest: string | null;
+    readonly inclusive: string | null;
+    readonly hasCursor: boolean;
+    readonly cursorCarriesUnusable: boolean;
+    /** For a cursor request: whether it named a token this provider minted, exactly, for the same bounds. */
+    cursorKnown: boolean | null;
+    served: string[];
+    more: boolean;
+    answer: "page" | "invalid_cursor";
+  }
+  type Decision = { readonly kind: "page"; readonly more?: boolean; readonly cursor?: string } | { readonly kind: "invalid_cursor" };
+  interface BoundProvider {
+    readonly handler: SlackHandler;
+    readonly requests: ProviderRequest[];
+    readonly flags: { overCeiling: boolean; unknownCursor: boolean };
+    advance(ms: number): void;
+  }
+  function boundProvider(input: {
+    teamId: string;
+    channelId: string;
+    roots: readonly string[];
+    /** A hard ceiling: a request past it is recorded, flagged and refused. */
+    ceiling: number;
+    decide: (ctx: { index: number; firstPage: boolean; more: boolean; tokenAgeMs: number | null }) => Decision;
+    /** Representable continuation tokens, by issue number. */
+    token?: (issued: number) => string;
+    onRequest?: (index: number) => Promise<void>;
+  }): BoundProvider {
+    const requests: ProviderRequest[] = [];
+    const tokens = new Map<string, { lower: bigint; upper: bigint; offset: number; issuedAtMs: number }>();
+    const flags = { overCeiling: false, unknownCursor: false };
+    const corpus = [...input.roots].sort((a, b) => (tsMicros(a) < tsMicros(b) ? 1 : -1));
+    let issued = 0;
+    let clockMs = 0;
+    const handler: SlackHandler = async (call) => {
+      const latest = call.params.get("latest");
+      const oldest = call.params.get("oldest");
+      const cursor = call.params.get("cursor");
+      const record: ProviderRequest = {
+        index: requests.length + 1,
+        lane: await claimedLaneOf(input.teamId, input.channelId),
+        oldest, latest, inclusive: call.params.get("inclusive"), hasCursor: cursor !== null,
+        cursorCarriesUnusable: cursor !== null && carriesUnusable(cursor),
+        cursorKnown: null, served: [], more: false, answer: "page",
+      };
+      // Counted BEFORE any response is generated, error and rejected answers included.
+      requests.push(record);
+      if (record.index > input.ceiling) {
+        flags.overCeiling = true;
+        throw new Error("fixture: the history call ceiling was passed");
+      }
+      if (input.onRequest) await input.onRequest(record.index);
+      if (latest === null) throw new Error("fixture: a history request without latest");
+      const lower = oldest === null ? BigInt(0) : tsMicros(oldest);
+      const upper = tsMicros(latest);
+      let offset = 0;
+      let tokenAgeMs: number | null = null;
+      if (cursor !== null) {
+        const entry = tokens.get(cursor);
+        record.cursorKnown = entry !== undefined && entry.lower === lower && entry.upper === upper;
+        if (entry === undefined || !record.cursorKnown) {
+          flags.unknownCursor = true;
+          record.answer = "invalid_cursor";
+          return slackJson(INVALID_CURSOR_BODY);
+        }
+        offset = entry.offset;
+        tokenAgeMs = clockMs - entry.issuedAtMs;
+      }
+      const inRange = corpus.filter((ts) => tsMicros(ts) >= lower && tsMicros(ts) <= upper);
+      const served = inRange.slice(offset, offset + 1);
+      const decision = input.decide({ index: record.index, firstPage: cursor === null, more: offset + 1 < inRange.length, tokenAgeMs });
+      if (decision.kind === "invalid_cursor") {
+        record.answer = "invalid_cursor";
+        return slackJson(INVALID_CURSOR_BODY);
+      }
+      const more = decision.more ?? offset + 1 < inRange.length;
+      let next: string | null = null;
+      if (more) {
+        if (decision.cursor !== undefined) {
+          next = decision.cursor;
+        } else {
+          issued += 1;
+          next = input.token ? input.token(issued) : `tok-${issued}`;
+        }
+        if (!carriesUnusable(next)) tokens.set(next, { lower, upper, offset: offset + 1, issuedAtMs: clockMs });
+      }
+      record.served = served;
+      record.more = more;
+      return slackJson(historyBody({ messages: served.map((ts) => rootMessage(ts)), hasMore: more, nextCursor: next }));
+    };
+    return { handler, requests, flags, advance: (ms) => { clockMs += ms; } };
+  }
+
+  // ── one paced wake ──────────────────────────────────────────────────────────
+
+  interface Step { readonly result: string; readonly category: string | null; readonly detail: string | null; readonly channelId: string | null }
+  interface Invocation {
+    /** The provider request this wake made for the target channel, if any. */
+    readonly target: number | null;
+    /** All `conversations.history` requests this wake sent. */
+    readonly history: number;
+    readonly steps: Step[];
+    readonly resultLeak: boolean;
+    readonly pgLeak: boolean;
+  }
+  const label = (step: Step | undefined): string => (step === undefined ? "none" : `${step.result}:${step.category ?? ""}`);
+  const targetStep = (invocation: Invocation): Step | undefined => invocation.steps.find((step) => step.channelId === CHANNEL);
+  const isDelay = (invocation: Invocation): boolean =>
+    invocation.target === null && invocation.history === 0 && invocation.steps.length === 1
+    && label(invocation.steps[0]) === "delayed:scan_bounds_invalid" && invocation.steps[0].detail === SCAN_BOUNDS;
+
+  async function invoke(
+    seed: Seed,
+    integrationId: string,
+    fake: SlackFake,
+    provider: BoundProvider,
+    opts: { allowanceMs?: number; paced?: boolean } = {}
+  ): Promise<Invocation> {
+    if (opts.paced !== false) {
+      await elapse(seed.teamId, PACING_MS);
+      provider.advance(PACING_MS);
+    }
+    const historyBefore = fake.countOf("conversations.history");
+    const targetBefore = provider.requests.length;
+    const pg = { sent: false };
+    const result = await recordingPg(pg, () =>
+      discover(seed, integrationId, fake, opts.allowanceMs === undefined ? {} : { skewAllowanceMs: opts.allowanceMs }));
+    return {
+      target: provider.requests.length > targetBefore ? provider.requests.length : null,
+      history: fake.countOf("conversations.history") - historyBefore,
+      steps: result.steps.filter((s) => s.stage === "history").map((s) => ({
+        result: s.result, category: s.category ?? null, detail: s.detail ?? null, channelId: s.channelId ?? null,
+      })),
+      resultLeak: carriesUnusable(result),
+      pgLeak: pg.sent,
+    };
+  }
+
+  // ── projections and oracles ─────────────────────────────────────────────────
+
+  const wireOf = (request: ProviderRequest) => ({ oldest: request.oldest, latest: request.latest, inclusive: request.inclusive, cursor: request.hasCursor });
+  /** The expected wire form: the historical lane omits a zero `oldest`; the newest lane always sends it. */
+  const wire = (lane: Lane, lower: string, upper: string, cursor: boolean) => ({
+    oldest: lane === "historical" && lower === "0.000000" ? null : lower, latest: upper, inclusive: "true", cursor,
+  });
+  /** Each target request's own step, by request index. */
+  function outcomesOf(invocations: readonly Invocation[]): Map<number, Step | undefined> {
+    return new Map(invocations.filter((i) => i.target !== null).map((i): [number, Step | undefined] => [i.target as number, targetStep(i)]));
+  }
+  /** The windows of the genuinely terminal, accepted pages. */
+  function terminalWindows(provider: BoundProvider, outcomes: Map<number, Step | undefined>): { lower: string; upper: string }[] {
+    return provider.requests
+      .filter((r) => r.answer === "page" && !r.more && label(outcomes.get(r.index)) === "ok:")
+      .map((r) => ({ lower: r.oldest ?? "0.000000", upper: r.latest ?? "" }));
+  }
+  /** True when the windows tile [lower, upper] exactly: adjacent by one microsecond, no gap, no overlap. */
+  function partitions(windows: readonly { lower: string; upper: string }[], lower: string, upper: string): boolean {
+    const sorted = [...windows].sort((a, b) => (tsMicros(a.lower) < tsMicros(b.lower) ? -1 : 1));
+    if (sorted.length === 0 || sorted[0].lower !== lower || sorted[sorted.length - 1].upper !== upper) return false;
+    return sorted.every((w, i) => tsMicros(w.lower) <= tsMicros(w.upper)
+      && (i === 0 || tsMicros(w.lower) === tsMicros(sorted[i - 1].upper) + BigInt(1)));
+  }
+  const coverageOf = (row: Row) => ({
+    lower: row?.completed_lower_ts ?? null, upper: row?.completed_upper_ts ?? null,
+    floor: row?.historical_floor_reached ?? null, provisional: row?.newest_catchup_upper_ts ?? null,
+  });
+  const PROGRESS_COLUMNS = [
+    "historical_anchor_ts", "historical_cursor", "historical_cursor_history", "historical_scan_generation",
+    "historical_segment_lower_ts", "historical_segment_upper_ts", "historical_oldest_seen_ts", "historical_completed_segments_oldest_ts",
+    "newest_cursor", "newest_cursor_history", "newest_scan_generation", "newest_segment_lower_ts", "newest_segment_upper_ts",
+    "completed_lower_ts", "completed_upper_ts", "historical_floor_reached", "newest_catchup_upper_ts", "last_read_at",
+  ];
+  /** Whether two rows hold the same progress, certification and read facts (a boolean; no value is kept). */
+  const sameProgress = (a: Row, b: Row): boolean =>
+    JSON.stringify(PROGRESS_COLUMNS.map((column) => a?.[column] ?? null)) === JSON.stringify(PROGRESS_COLUMNS.map((column) => b?.[column] ?? null));
+  const privacyOf = (invocations: readonly Invocation[], provider: BoundProvider) => ({
+    pg: invocations.some((i) => i.pgLeak),
+    result: invocations.some((i) => i.resultLeak),
+    url: provider.requests.some((r) => r.cursorCarriesUnusable),
+    unknownCursor: provider.flags.unknownCursor,
+    overCeiling: provider.flags.overCeiling,
+  });
+
+  // ── DH-PKT-01 and DH-PKT-07: a valid newest clock-skew construction ─────────
+  // T = 1718900000.000100. B = T + 1 ms and the allowance is 1 ms, so the claim freezes L = S = T. This
+  // is a constructed clock-skew fixture (B > A), not evidence of normal-clock PA-3 behavior.
+
+  const T = "1718900000.000100";
+  const T_PLUS_1 = "1718900000.000101";
+  const SKEW_B = "1718900000.001100";
+  const SKEW_BOTTOM = "1718800000.000001";
+  const SKEW_COVERAGE = { lower: SKEW_BOTTOM, upper: SKEW_B, floor: true, provisional: null };
+
+  it("DH-PKT-01 (DH-04, DH-13; DH-03, DH-05, F2-08, F2-09): a width-two newest envelope converges in exactly three real requests — subdivision, internal completion, envelope completion — with one queue row per root", async () => {
+    expect({ l: shiftTs(SKEW_B, -msToMicros(1)), width: tsMicros(T_PLUS_1) - tsMicros(T) + BigInt(1) }, "fixture: L = B − 1 ms = T, and [T, A] is two microseconds wide").toEqual({
+      l: T, width: BigInt(2),
+    });
+    const seed = await seedTeam();
+    const integrationId = await boundRows(seed, [{
+      channelId: CHANNEL, due: FIRST_DUE,
+      columns: newestCertified({ completedLower: SKEW_BOTTOM, completedUpper: SKEW_B, anchor: T_PLUS_1, lower: SKEW_B }),
+    }]);
+    const provider = boundProvider({
+      teamId: seed.teamId, channelId: CHANNEL, roots: [T, T_PLUS_1], ceiling: 3,
+      // Only the first, nonterminal response carries an unusable cursor.
+      decide: ({ index, more }) => (index === 1 && more ? { kind: "page", cursor: unusable("EMBEDDED", 1) } : { kind: "page" }),
+    });
+    const fake = pass(provider.handler);
+    const invocations: Invocation[] = [];
+    const rows: Row[] = [];
+    const queues: string[][] = [];
+    // Exactly three wakes: a fourth request is never allowed.
+    for (let i = 0; i < 3; i++) {
+      invocations.push(await invoke(seed, integrationId, fake, provider, { allowanceMs: 1 }));
+      rows.push(await channelRow(seed.teamId, WORKSPACE, CHANNEL));
+      queues.push((await queueOf(seed.teamId, CHANNEL)).roots);
+    }
+    expect({
+      requests: provider.requests.map(wireOf),
+      lanes: provider.requests.map((r) => r.lane),
+      steps: invocations.map((i) => ({ step: label(targetStep(i)), detail: targetStep(i)?.detail ?? null, history: i.history })),
+      segments: rows.map((row) => [row?.newest_segment_lower_ts ?? null, row?.newest_segment_upper_ts ?? null]),
+      generations: rows.map((row) => Number(row?.newest_scan_generation)),
+      coverage: rows.map(coverageOf),
+      queues,
+      queue: await queueOf(seed.teamId, CHANNEL),
+      privacy: privacyOf(invocations, provider),
+    }, "[T, A] → subdivision at M + 1 = A → [A, A] terminal → [T, T] terminal: three requests, no cursor, original A certified last").toEqual({
+      requests: [wire("newest", T, T_PLUS_1, false), wire("newest", T_PLUS_1, T_PLUS_1, false), wire("newest", T, T, false)],
+      lanes: ["newest", "newest", "newest"],
+      steps: [
+        { step: "delayed:cursor_unrepresentable", detail: SUBDIVIDED, history: 1 },
+        { step: "ok:", detail: null, history: 1 },
+        { step: "ok:", detail: null, history: 1 },
+      ],
+      segments: [[T_PLUS_1, T_PLUS_1], [T, T], [null, null]],
+      generations: [1, 2, 3],
+      coverage: [SKEW_COVERAGE, SKEW_COVERAGE, { ...SKEW_COVERAGE, upper: T_PLUS_1 }],
+      queues: [[], [T_PLUS_1], [T, T_PLUS_1]],
+      queue: { roots: [T, T_PLUS_1], unique: true },
+      privacy: NO_LEAK,
+    });
+  });
+
+  it("DH-PKT-07-TERMINAL (DH-13; DH-03, DH-04, F2-08, F2-09): a newest singleton [T, T] with one genuinely terminal root is one request, one queue row and the final completion", async () => {
+    const seed = await seedTeam();
+    const integrationId = await boundRows(seed, [{
+      channelId: CHANNEL, due: FIRST_DUE, columns: newestCertified({ completedLower: SKEW_BOTTOM, completedUpper: SKEW_B, anchor: T, lower: SKEW_B }),
+    }]);
+    const provider = boundProvider({ teamId: seed.teamId, channelId: CHANNEL, roots: [T], ceiling: 1, decide: () => ({ kind: "page" }) });
+    const fake = pass(provider.handler);
+    const invocation = await invoke(seed, integrationId, fake, provider, { allowanceMs: 1 });
+    const row = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    expect({
+      requests: provider.requests.map(wireOf),
+      step: { step: label(targetStep(invocation)), history: invocation.history },
+      segment: [row?.newest_segment_lower_ts ?? null, row?.newest_segment_upper_ts ?? null],
+      coverage: coverageOf(row),
+      queue: await queueOf(seed.teamId, CHANNEL),
+      privacy: privacyOf([invocation], provider),
+    }, "one request [T, T], one queue row, the original A certified").toEqual({
+      requests: [wire("newest", T, T, false)],
+      step: { step: "ok:", history: 1 },
+      segment: [null, null],
+      coverage: { ...SKEW_COVERAGE, upper: T },
+      queue: { roots: [T], unique: true },
+      privacy: NO_LEAK,
+    });
+  });
+
+  it("DH-PKT-07-RECOVERY (DH-13; DH-03, DH-04, F2-08, F2-09): a newest singleton recovers through an unsplittable lone surrogate and a first-page invalid_cursor restart to one terminal, one request per wake", async () => {
+    const seed = await seedTeam();
+    const integrationId = await boundRows(seed, [{
+      channelId: CHANNEL, due: FIRST_DUE, columns: newestCertified({ completedLower: SKEW_BOTTOM, completedUpper: SKEW_B, anchor: T, lower: SKEW_B }),
+    }]);
+    const provider = boundProvider({
+      teamId: seed.teamId, channelId: CHANNEL, roots: [T], ceiling: 3,
+      decide: ({ index }) => (index === 1 ? { kind: "page", more: true, cursor: unusable("LOW", 1) }
+        : index === 2 ? { kind: "invalid_cursor" } : { kind: "page" }),
+    });
+    const fake = pass(provider.handler);
+    const invocations: Invocation[] = [];
+    const rows: Row[] = [];
+    const queues: string[][] = [];
+    for (let i = 0; i < 3; i++) {
+      invocations.push(await invoke(seed, integrationId, fake, provider, { allowanceMs: 1 }));
+      rows.push(await channelRow(seed.teamId, WORKSPACE, CHANNEL));
+      queues.push((await queueOf(seed.teamId, CHANNEL)).roots);
+    }
+    expect({
+      requests: provider.requests.map(wireOf),
+      steps: invocations.map((i) => ({ step: label(targetStep(i)), detail: targetStep(i)?.detail ?? null, history: i.history })),
+      segments: rows.map((row) => [row?.newest_request_lower_ts ?? null, row?.newest_segment_lower_ts ?? null, row?.newest_segment_upper_ts ?? null]),
+      generations: rows.map((row) => Number(row?.newest_scan_generation)),
+      errors: rows.map((row) => row?.last_error_code ?? null),
+      coverage: rows.map(coverageOf),
+      queues,
+      privacy: privacyOf(invocations, provider),
+    }, "unsplittable rejection (no G move) → same-range restart (G + 1) → terminal: bounds kept, nothing certified before the terminal").toEqual({
+      requests: [wire("newest", T, T, false), wire("newest", T, T, false), wire("newest", T, T, false)],
+      steps: [
+        { step: "delayed:cursor_unrepresentable", detail: UNSPLITTABLE, history: 1 },
+        { step: "delayed:invalid_cursor", detail: RESTARTED, history: 1 },
+        { step: "ok:", detail: null, history: 1 },
+      ],
+      segments: [[T, T, T], [T, T, T], [null, null, null]],
+      generations: [0, 1, 2],
+      errors: ["cursor_unrepresentable", "invalid_cursor", null],
+      coverage: [SKEW_COVERAGE, SKEW_COVERAGE, { ...SKEW_COVERAGE, upper: T }],
+      queues: [[], [], [T]],
+      privacy: NO_LEAK,
+    });
+  });
+
+  // ── DH-PKT-03: actual transport surrogate convergence ───────────────────────
+  // Roots 1, 2, 3 and 4 s; A = 4.000000; L = 0; one message per page. Historical: the initial envelope
+  // pending. Newest: certified to B = 1.000000 (bottom 0.5), allowance 1,000 ms, so L = 0.
+
+  const FOUR_ROOTS = ["1.000000", "2.000000", "3.000000", "4.000000"];
+  const fourRootLane = (lane: Lane): Columns => (lane === "historical"
+    ? historicalPending("4.000000")
+    : newestCertified({ completedLower: "0.500000", completedUpper: "1.000000", anchor: "4.000000", lower: "1.000000" }));
+  const fourRootAllowance = (lane: Lane): number | undefined => (lane === "newest" ? 1_000 : undefined);
+  const FOUR_ROOT_COVERAGE: Record<Lane, { before: ReturnType<typeof coverageOf>; after: ReturnType<typeof coverageOf> }> = {
+    historical: {
+      before: { lower: null, upper: null, floor: false, provisional: null },
+      after: { lower: "1.000000", upper: "4.000000", floor: true, provisional: null },
+    },
+    newest: {
+      before: { lower: "0.500000", upper: "1.000000", floor: true, provisional: null },
+      after: { lower: "0.500000", upper: "4.000000", floor: true, provisional: null },
+    },
+  };
+  type Program = readonly (readonly [string, string, boolean])[];
+  const SURROGATE_PROGRAM: Record<"first" | "later", { program: Program; steps: string[]; terminalSegments: number }> = {
+    first: {
+      program: [
+        ["0.000000", "4.000000", false], ["2.000001", "4.000000", false], ["3.000001", "4.000000", false], ["1.000001", "3.000000", false],
+        ["2.000001", "3.000000", false], ["0.000001", "2.000000", false], ["1.000001", "2.000000", false], ["0.000000", "1.000000", false],
+      ],
+      steps: ["delayed:cursor_unrepresentable", "delayed:cursor_unrepresentable", "ok:", "delayed:cursor_unrepresentable", "ok:", "delayed:cursor_unrepresentable", "ok:", "ok:"],
+      terminalSegments: 4,
+    },
+    later: {
+      program: [
+        ["0.000000", "4.000000", false], ["0.000000", "4.000000", true], ["2.000001", "4.000000", false],
+        ["2.000001", "4.000000", true], ["0.000000", "2.000000", false], ["0.000000", "2.000000", true],
+      ],
+      steps: ["ok:", "delayed:cursor_unrepresentable", "ok:", "ok:", "ok:", "ok:"],
+      terminalSegments: 2,
+    },
+  };
+  /** Representable later-variant tokens: a valid surrogate pair, a literal U+FFFD, then plain ASCII. */
+  const representable = (issued: number): string => (issued === 1 ? `tok-pair-1-${String.fromCodePoint(0x1f600)}`
+    : issued === 2 ? `tok-fffd-2-${String.fromCodePoint(0xfffd)}` : `tok-${issued}`);
+
+  async function surrogateTraversal(lane: Lane, shape: Shape, variant: "first" | "later") {
+    const expected = SURROGATE_PROGRAM[variant];
+    const seed = await seedTeam();
+    const integrationId = await boundRows(seed, [{ channelId: CHANNEL, due: FIRST_DUE, columns: fourRootLane(lane) }]);
+    const provider = boundProvider({
+      teamId: seed.teamId, channelId: CHANNEL, roots: FOUR_ROOTS, ceiling: expected.program.length, token: representable,
+      // First-page variant: every nonterminal page is unusable. Later-page variant: first pages are
+      // representable, every LATER nonterminal page is unusable. Terminals stay genuine terminals.
+      decide: ({ index, firstPage, more }) => (!more || (variant === "later" && firstPage) ? { kind: "page" }
+        : { kind: "page", cursor: unusable(shape, index) }),
+    });
+    const fake = pass(provider.handler);
+    const invocations: Invocation[] = [];
+    const rows: Row[] = [await channelRow(seed.teamId, WORKSPACE, CHANNEL)];
+    const queueSizes: number[] = [0];
+    let firstRoot4: string | null = null;
+    while (provider.requests.length < expected.program.length && invocations.length < expected.program.length * 2 + 2) {
+      invocations.push(await invoke(seed, integrationId, fake, provider, { allowanceMs: fourRootAllowance(lane) }));
+      rows.push(await channelRow(seed.teamId, WORKSPACE, CHANNEL));
+      queueSizes.push((await queueOf(seed.teamId, CHANNEL)).roots.length);
+      if (firstRoot4 === null) {
+        const root4 = (await threadRows(seed.teamId)).find((row) => row.channel_id === CHANNEL && row.root_ts === "4.000000");
+        if (root4) firstRoot4 = JSON.stringify(root4);
+      }
+    }
+    const outcomes = outcomesOf(invocations);
+    const steps = provider.requests.map((r) => label(outcomes.get(r.index)));
+    const finalRoot4 = (await threadRows(seed.teamId)).find((row) => row.channel_id === CHANNEL && row.root_ts === "4.000000");
+    return {
+      requests: provider.requests.map(wireOf),
+      lanes: provider.requests.map((r) => r.lane),
+      steps,
+      subdivisionDetails: provider.requests.every((r) => label(outcomes.get(r.index)) !== "delayed:cursor_unrepresentable" || outcomes.get(r.index)?.detail === SUBDIVIDED),
+      totals: {
+        requests: provider.requests.length,
+        subdivisions: steps.filter((step) => step === "delayed:cursor_unrepresentable").length,
+        terminalSegments: terminalWindows(provider, outcomes).length,
+      },
+      atMostOneRequestPerWake: invocations.every((i) => i.history <= 1),
+      delays: {
+        count: invocations.filter(isDelay).length,
+        keptProgress: invocations.every((i, k) => !isDelay(i) || sameProgress(rows[k], rows[k + 1])),
+      },
+      // A subdivided (bad) page adds no queue row.
+      badPagesQueuedNothing: invocations.every((i, k) => label(targetStep(i)) !== "delayed:cursor_unrepresentable" || queueSizes[k + 1] === queueSizes[k]),
+      roundTrips: provider.requests.filter((r) => r.hasCursor).map((r) => r.cursorKnown),
+      replayPreservedRoot4: variant === "later" ? firstRoot4 !== null && finalRoot4 !== undefined && JSON.stringify(finalRoot4) === firstRoot4 : null,
+      partitionsEnvelope: partitions(terminalWindows(provider, outcomes), "0.000000", "4.000000"),
+      uncertifiedUntilFinal: rows.slice(0, -1).every((row) => JSON.stringify(coverageOf(row)) === JSON.stringify(FOUR_ROOT_COVERAGE[lane].before)),
+      finalCoverage: coverageOf(rows[rows.length - 1]),
+      queue: await queueOf(seed.teamId, CHANNEL),
+      privacy: privacyOf(invocations, provider),
+    };
+  }
+  function surrogateExpected(lane: Lane, variant: "first" | "later") {
+    const expected = SURROGATE_PROGRAM[variant];
+    return {
+      requests: expected.program.map(([lower, upper, cursor]) => wire(lane, lower, upper, cursor)),
+      lanes: expected.program.map(() => lane),
+      steps: expected.steps,
+      subdivisionDetails: true,
+      totals: {
+        requests: expected.program.length,
+        subdivisions: expected.steps.filter((step) => step === "delayed:cursor_unrepresentable").length,
+        terminalSegments: expected.terminalSegments,
+      },
+      atMostOneRequestPerWake: true,
+      delays: { count: lane === "historical" ? expected.program.length - 1 : 0, keptProgress: true },
+      badPagesQueuedNothing: true,
+      roundTrips: variant === "later" ? [true, true, true] : [],
+      replayPreservedRoot4: variant === "later" ? true : null,
+      partitionsEnvelope: true,
+      uncertifiedUntilFinal: true,
+      finalCoverage: FOUR_ROOT_COVERAGE[lane].after,
+      queue: { roots: FOUR_ROOTS, unique: true },
+      privacy: NO_LEAK,
+    };
+  }
+
+  it.each<[string, Lane, Shape]>([
+    ["H-HIGH", "historical", "HIGH"],
+    ["H-LOW", "historical", "LOW"],
+    ["H-EMBEDDED", "historical", "EMBEDDED"],
+    ["N-HIGH", "newest", "HIGH"],
+    ["N-LOW", "newest", "LOW"],
+    ["N-EMBEDDED", "newest", "EMBEDDED"],
+  ])("DH-PKT-03-%s (DH-03, F2-09; DH-02, DH-04, DH-05, F2-08): actual-transport lone-surrogate continuations converge on first pages (8 requests) and on later pages (6 requests), with the queue exactly {1, 2, 3, 4}", async (_id, lane, shape) => {
+    for (const variant of ["first", "later"] as const) {
+      expect(await surrogateTraversal(lane, shape, variant), `${variant}-page fixture`).toEqual(surrogateExpected(lane, variant));
+    }
+  }, 300_000);
+
+  // ── DH-PKT-04: 1,003 roots past the real 1,000-entry cap ────────────────────
+
+  async function capTraversal(lane: Lane) {
+    const roots = Array.from({ length: 1003 }, (_, i) => `${i + 1}.000000`);
+    const seed = await seedTeam();
+    const integrationId = await boundRows(seed, [{
+      channelId: CHANNEL, due: FIRST_DUE,
+      columns: lane === "historical"
+        ? historicalPending("1003.000000")
+        : newestCertified({ completedLower: "0.500000", completedUpper: "60.000000", anchor: "1003.000000", lower: "60.000000" }),
+    }]);
+    const atTrigger = { entries: -1 };
+    const provider = boundProvider({
+      teamId: seed.teamId, channelId: CHANNEL, roots, ceiling: 2004, decide: () => ({ kind: "page" }),
+      onRequest: async (index) => {
+        if (index !== 1001) return;
+        // The in-flight attempt's history size, as SQL counts it; the lane is one of two literals.
+        const c = await rawSql();
+        const { rows } = await c.query<{ entries: number }>(
+          `select pg_catalog.jsonb_array_length(${lane}_cursor_history)::int as entries
+             from slack_sync_channels where team_id = $1 and workspace_id = $2 and channel_id = $3`,
+          [seed.teamId, WORKSPACE, CHANNEL]
+        );
+        atTrigger.entries = rows[0]?.entries ?? -1;
+      },
+    });
+    const fake = pass(provider.handler);
+    const initial = coverageOf(await channelRow(seed.teamId, WORKSPACE, CHANNEL));
+    const invocations: Invocation[] = [];
+    let afterTrigger: { row: Row; queue: { roots: string[]; unique: boolean } } | null = null;
+    while (provider.requests.length < 2004 && invocations.length < 2 * 2004 + 2) {
+      const invocation = await invoke(seed, integrationId, fake, provider, { allowanceMs: lane === "newest" ? 60_000 : undefined });
+      invocations.push(invocation);
+      if (invocation.target === 1001) afterTrigger = { row: await channelRow(seed.teamId, WORKSPACE, CHANNEL), queue: await queueOf(seed.teamId, CHANNEL) };
+    }
+    // The literal request program: [0, 1003] ×1,001; [501.500001, 1003] ×502; [0, 501.500000] ×501.
+    const program: ReturnType<typeof wire>[] = [];
+    for (let i = 1; i <= 1001; i++) program.push(wire(lane, "0.000000", "1003.000000", i > 1));
+    for (let i = 1002; i <= 1503; i++) program.push(wire(lane, "501.500001", "1003.000000", i > 1002));
+    for (let i = 1504; i <= 2004; i++) program.push(wire(lane, "0.000000", "501.500000", i > 1504));
+    const outcomes = outcomesOf(invocations);
+    const requestMismatch = provider.requests.findIndex((r, i) => JSON.stringify(wireOf(r)) !== JSON.stringify(program[i]));
+    const stepMismatch = provider.requests.findIndex((r) =>
+      label(outcomes.get(r.index)) !== (r.index === 1001 ? "delayed:cursor_history_entries_exceeded" : "ok:"));
+    const queue = await queueOf(seed.teamId, CHANNEL);
+    const row = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    return {
+      programLength: program.length,
+      requests: provider.requests.length,
+      firstRequestMismatch: requestMismatch === -1 ? null : requestMismatch + 1,
+      firstStepMismatch: stepMismatch === -1 ? null : stepMismatch + 1,
+      subdivisionDetail: outcomes.get(1001)?.detail ?? null,
+      terminalRequests: terminalWindows(provider, outcomes).length,
+      partitionsEnvelope: partitions(terminalWindows(provider, outcomes), "0.000000", "1003.000000"),
+      atTriggerEntries: atTrigger.entries,
+      afterTrigger: afterTrigger === null ? null : {
+        segment: [afterTrigger.row?.[`${lane}_segment_lower_ts`] ?? null, afterTrigger.row?.[`${lane}_segment_upper_ts`] ?? null],
+        cursorCleared: afterTrigger.row?.[`${lane}_cursor`] === null
+          && Array.isArray(afterTrigger.row?.[`${lane}_cursor_history`]) && (afterTrigger.row?.[`${lane}_cursor_history`] as unknown[]).length === 0,
+        generation: Number(afterTrigger.row?.[`${lane}_scan_generation`]),
+        coverageUnchanged: JSON.stringify(coverageOf(afterTrigger.row)) === JSON.stringify(initial),
+        root3Queued: afterTrigger.queue.roots.includes("3.000000"),
+        queued: afterTrigger.queue.roots.length,
+      },
+      acceptedObservations: provider.requests
+        .filter((r) => r.answer === "page" && label(outcomes.get(r.index)) === "ok:")
+        .reduce((sum, r) => sum + r.served.length, 0),
+      queue: { count: queue.roots.length, unique: queue.unique, complete: JSON.stringify(queue.roots) === JSON.stringify(roots) },
+      finalCoverage: coverageOf(row),
+      atMostOneRequestPerWake: invocations.every((i) => i.history <= 1),
+      delays: invocations.filter(isDelay).length,
+      privacy: privacyOf(invocations, provider),
+    };
+  }
+
+  it.each<[string, Lane]>([
+    ["H", "historical"],
+    ["N", "newest"],
+  ])("DH-PKT-04-%s (DH-01, DH-02, DH-04, DH-05, F2-04, F2-08): 1,003 one-message pages past the real 1,000-entry cap take exactly 2,004 requests, one subdivision and two terminal segments, and queue every root once", async (_id, lane) => {
+    expect(await capTraversal(lane), "the literal 2,004-request program under the unchanged cap").toEqual({
+      programLength: 2004,
+      requests: 2004,
+      firstRequestMismatch: null,
+      firstStepMismatch: null,
+      subdivisionDetail: SUBDIVIDED,
+      terminalRequests: 2,
+      partitionsEnvelope: true,
+      atTriggerEntries: 1000,
+      afterTrigger: {
+        segment: ["501.500001", "1003.000000"], cursorCleared: true, generation: 1, coverageUnchanged: true, root3Queued: false, queued: 1000,
+      },
+      acceptedObservations: 2003,
+      queue: { count: 1003, unique: true, complete: true },
+      finalCoverage: lane === "historical"
+        ? { lower: "1.000000", upper: "1003.000000", floor: true, provisional: null }
+        : { lower: "0.500000", upper: "1003.000000", floor: true, provisional: null },
+      atMostOneRequestPerWake: true,
+      delays: lane === "historical" ? 2003 : 0,
+      privacy: NO_LEAK,
+    });
+  }, 1_800_000);
+
+  // ── DH-PKT-05: client-paced actual invalid_cursor expiry ────────────────────
+  // The four-root lanes of DH-PKT-03. Tokens live 30 s on the provider's own clock, which advances with
+  // client pacing (120 s per paced wake), so every continuation is answered with the ACTUAL transport
+  // body `{ ok: false, error: "invalid_cursor" }`. Between target requests 1 and 2 a competing selected
+  // channel takes one real history slot and is answered with an actual 429 and Retry-After; its next
+  // metadata re-observation then finds it private, so it never takes another slot.
+
+  const TOKEN_TTL_MS = 30_000;
+  const EXPIRY_PROGRAM: Program = [
+    ["0.000000", "4.000000", false], ["0.000000", "4.000000", true], ["2.000001", "4.000000", false], ["2.000001", "4.000000", true],
+    ["3.000001", "4.000000", false], ["1.000001", "3.000000", false], ["1.000001", "3.000000", true], ["2.000001", "3.000000", false],
+    ["0.000001", "2.000000", false], ["0.000001", "2.000000", true], ["1.000001", "2.000000", false], ["0.000000", "1.000000", false],
+  ];
+  const EXPIRY_STEPS = ["ok:", "delayed:invalid_cursor", "ok:", "delayed:invalid_cursor", "ok:", "ok:", "delayed:invalid_cursor", "ok:",
+    "ok:", "delayed:invalid_cursor", "ok:", "ok:"];
+
+  async function expiryTraversal(lane: Lane) {
+    const seed = await seedTeam();
+    const integrationId = await boundRows(seed, [
+      { channelId: CHANNEL, due: FIRST_DUE, columns: fourRootLane(lane) },
+      // A fresh initial-scan channel, due just after the target.
+      { channelId: COMPETITOR, due: SECOND_DUE, columns: {} },
+    ]);
+    const provider = boundProvider({
+      teamId: seed.teamId, channelId: CHANNEL, roots: FOUR_ROOTS, ceiling: EXPIRY_PROGRAM.length,
+      decide: ({ firstPage, tokenAgeMs }) => (!firstPage && tokenAgeMs !== null && tokenAgeMs > TOKEN_TTL_MS ? { kind: "invalid_cursor" } : { kind: "page" }),
+    });
+    const competitor = { private: false, history: 0 };
+    const fake = fakeSlack({
+      "auth.test": () => slackJson(authTestBody({ app_id: APP })),
+      "conversations.info": (call) => {
+        const channel = call.params.get("channel") ?? "";
+        return slackJson(channelInfoBody(channel, competitor.private && channel === COMPETITOR ? { is_private: true } : {}));
+      },
+      "conversations.history": (call) => {
+        if (call.params.get("channel") === COMPETITOR) {
+          competitor.history += 1;
+          return slackRateLimited("90");
+        }
+        return provider.handler(call);
+      },
+    });
+    const allowanceMs = fourRootAllowance(lane);
+    const invocations: Invocation[] = [];
+    const rowsAfterTarget = new Map<number, Row>();
+    const record = async (invocation: Invocation) => {
+      invocations.push(invocation);
+      if (invocation.target !== null) rowsAfterTarget.set(invocation.target, await channelRow(seed.teamId, WORKSPACE, CHANNEL));
+    };
+
+    // Target request 1.
+    await record(await invoke(seed, integrationId, fake, provider, { allowanceMs }));
+    const afterFirst = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    // The competing channel's ONE real history slot: an actual 429 with Retry-After.
+    const contention = await invoke(seed, integrationId, fake, provider, { allowanceMs });
+    await agePublicProof(seed.teamId, COMPETITOR);
+    competitor.private = true;
+    // EARLY wakes inside that deadline: zero history HTTP, and the target's progress unchanged.
+    const early: Invocation[] = [await invoke(seed, integrationId, fake, provider, { allowanceMs, paced: false })];
+    if (lane === "historical") early.push(await invoke(seed, integrationId, fake, provider, { allowanceMs, paced: false }));
+    const afterEarly = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    // Every later continuation is past its TTL.
+    while (provider.requests.length < EXPIRY_PROGRAM.length && invocations.length < EXPIRY_PROGRAM.length * 2 + 4) {
+      await record(await invoke(seed, integrationId, fake, provider, { allowanceMs }));
+    }
+    const outcomes = outcomesOf(invocations);
+    const steps = provider.requests.map((r) => label(outcomes.get(r.index)));
+    const invalid = provider.requests.filter((r) => label(outcomes.get(r.index)) === "delayed:invalid_cursor");
+    const rows = provider.requests.map((r) => rowsAfterTarget.get(r.index) ?? null);
+    return {
+      requests: provider.requests.map(wireOf),
+      lanes: provider.requests.map((r) => r.lane),
+      steps,
+      answers: provider.requests.map((r) => r.answer),
+      // A wide interval is never a same-range restart.
+      invalidDetails: invalid.every((r) => outcomes.get(r.index)?.detail === SUBDIVIDED),
+      totals: {
+        target: provider.requests.length,
+        invalidCursorSubdivisions: invalid.length,
+        terminalSegments: terminalWindows(provider, outcomes).length,
+        history: fake.countOf("conversations.history"),
+        competitor: competitor.history,
+        metadata: fake.countOf("conversations.info"),
+      },
+      contention: {
+        target: contention.target,
+        history: contention.history,
+        steps: contention.steps.map((s) => `${s.channelId === COMPETITOR ? "competitor" : "target"}:${label(s)}`),
+      },
+      early: {
+        steps: early.map((i) => i.steps.map((s) => `${s.channelId === COMPETITOR ? "competitor" : "target"}:${label(s)}`)),
+        history: early.map((i) => i.history),
+        progressUnchanged: sameProgress(afterFirst, afterEarly),
+      },
+      // The completed-segments aggregate is untouched by every invalid_cursor subdivision.
+      aggregateSurvivedSplits: lane === "historical"
+        ? invalid.every((r) => (rows[r.index - 1]?.historical_completed_segments_oldest_ts ?? null) === (rows[r.index - 2]?.historical_completed_segments_oldest_ts ?? null))
+        : null,
+      noLocalRetry: [...invocations, contention, ...early].every((i) => i.history <= 1),
+      delays: invocations.filter(isDelay).length,
+      partitionsEnvelope: partitions(terminalWindows(provider, outcomes), "0.000000", "4.000000"),
+      uncertifiedUntilFinal: rows.slice(0, -1).every((row) => JSON.stringify(coverageOf(row)) === JSON.stringify(FOUR_ROOT_COVERAGE[lane].before)),
+      finalCoverage: coverageOf(rows[rows.length - 1] ?? null),
+      queue: await queueOf(seed.teamId, CHANNEL),
+      competitorQueue: (await queueOf(seed.teamId, COMPETITOR)).roots,
+      privacy: privacyOf([...invocations, contention, ...early], provider),
+    };
+  }
+
+  it.each<[string, Lane]>([
+    ["H", "historical"],
+    ["N", "newest"],
+  ])("DH-PKT-05-%s (DH-03, F2-08; DH-04, DH-05, DH-09): client-paced continuations that always expire are actual invalid_cursor subdivisions, converging in 12 target requests plus one competing 429 (13 sent), with the queue exactly {1, 2, 3, 4}", async (_id, lane) => {
+    expect(await expiryTraversal(lane), "literal bounds, actual invalid_cursor, no local retry, original A certified last").toEqual({
+      requests: EXPIRY_PROGRAM.map(([lower, upper, cursor]) => wire(lane, lower, upper, cursor)),
+      lanes: EXPIRY_PROGRAM.map(() => lane),
+      steps: EXPIRY_STEPS,
+      answers: EXPIRY_STEPS.map((step) => (step === "delayed:invalid_cursor" ? "invalid_cursor" : "page")),
+      invalidDetails: true,
+      totals: { target: 12, invalidCursorSubdivisions: 4, terminalSegments: 4, history: 13, competitor: 1, metadata: 1 },
+      contention: { target: null, history: 1, steps: ["competitor:delayed:rate_limited"] },
+      early: lane === "historical"
+        ? { steps: [["target:delayed:scan_bounds_invalid"], ["target:deferred:budget_deferred"]], history: [0, 0], progressUnchanged: true }
+        : { steps: [["target:deferred:budget_deferred"]], history: [0], progressUnchanged: true },
+      aggregateSurvivedSplits: lane === "historical" ? true : null,
+      noLocalRetry: true,
+      delays: lane === "historical" ? 10 : 0,
+      partitionsEnvelope: true,
+      uncertifiedUntilFinal: true,
+      finalCoverage: FOUR_ROOT_COVERAGE[lane].after,
+      queue: { roots: FOUR_ROOTS, unique: true },
+      competitorQueue: [],
+      privacy: NO_LEAK,
+    });
+  }, 300_000);
+
+  // ── DH-PKT-06: PA-3 margin attribution through subdivision ──────────────────
+  // Certified to B = 100.000000 (bottom 90), floor reached, newest A = 102.000000. The provider's clock
+  // lags the database's by 2 s, so a root posted at DB instant 101.000000 carries ts 99.000000; the
+  // corpus is roots 98, 99, 100, 101 and 102. Only the initial nonterminal response is unusable.
+
+  const MARGIN_ROOTS = ["98.000000", "99.000000", "100.000000", "101.000000", "102.000000"];
+  const MARGIN_COLUMNS = newestCertified({ completedLower: "90.000000", completedUpper: "100.000000", anchor: "102.000000", lower: "100.000000" });
+
+  async function marginTraversal(initialAllowanceMs: number, expectedRequests: number, ceiling: number) {
+    const seed = await seedTeam();
+    const integrationId = await boundRows(seed, [{ channelId: CHANNEL, due: FIRST_DUE, columns: MARGIN_COLUMNS }]);
+    const provider = boundProvider({
+      teamId: seed.teamId, channelId: CHANNEL, roots: MARGIN_ROOTS, ceiling,
+      decide: ({ index, more }) => (index === 1 && more ? { kind: "page", cursor: unusable("EMBEDDED", 1) } : { kind: "page" }),
+    });
+    const fake = pass(provider.handler);
+    const invocations: Invocation[] = [];
+    const rows: Row[] = [];
+    while (provider.requests.length < expectedRequests && invocations.length < expectedRequests + 2) {
+      // The changed setting applies from the second wake on; it must not move the frozen L.
+      invocations.push(await invoke(seed, integrationId, fake, provider, { allowanceMs: invocations.length === 0 ? initialAllowanceMs : 500 }));
+      rows.push(await channelRow(seed.teamId, WORKSPACE, CHANNEL));
+    }
+    const outcomes = outcomesOf(invocations);
+    return {
+      seed, integrationId, fake, provider, invocations, rows,
+      facts: {
+        requests: provider.requests.map(wireOf),
+        steps: provider.requests.map((r) => label(outcomes.get(r.index))),
+        // The frozen B and L, and the certified bottom, on every row while the envelope is open.
+        frozen: rows.slice(0, -1).map((row) => [row?.newest_lower_ts ?? null, row?.newest_request_lower_ts ?? null, row?.completed_lower_ts ?? null]),
+        certifiedTop: rows.map((row) => row?.completed_upper_ts ?? null),
+        queue: await queueOf(seed.teamId, CHANNEL),
+        privacy: privacyOf(invocations, provider),
+      },
+    };
+  }
+
+  it("DH-PKT-06 (DH-10; DH-03, DH-04, DH-05, F2-08): an adequate 2,000 ms margin frozen at L = 98 carries through a subdivision and queues the lagging root 99 once in six requests; the 500 ms control takes four and misses 98 and 99; the changed setting applies only to the next envelope", async () => {
+    expect(shiftTs("101.000000", -msToMicros(2_000)), "fixture: a 2 s provider lag stamps the DB instant 101 as 99").toBe("99.000000");
+
+    // ADEQUATE: L = 100 − 2 s = 98; request 1 subdivides at M + 1 = 100.000001.
+    const adequate = await marginTraversal(2_000, 6, 7);
+    const allowedTop = ["100.000000", "100.000000", "100.000000", "100.000000", "100.000000", "102.000000"];
+    expect(adequate.facts, "adequate margin: six requests at literal bounds; B, L and the bottom frozen; original A certified only at the final terminal").toEqual({
+      requests: [
+        wire("newest", "98.000000", "102.000000", false),
+        wire("newest", "100.000001", "102.000000", false), wire("newest", "100.000001", "102.000000", true),
+        wire("newest", "98.000000", "100.000000", false), wire("newest", "98.000000", "100.000000", true), wire("newest", "98.000000", "100.000000", true),
+      ],
+      steps: ["delayed:cursor_unrepresentable", "ok:", "ok:", "ok:", "ok:", "ok:"],
+      frozen: Array.from({ length: 5 }, () => ["100.000000", "98.000000", "90.000000"]),
+      certifiedTop: allowedTop,
+      queue: { roots: MARGIN_ROOTS, unique: true },
+      privacy: NO_LEAK,
+    });
+
+    // CONTROL: the same corpus and rejection rule under 500 ms from the start: L = 99.5.
+    const control = await marginTraversal(500, 4, 4);
+    expect(control.facts, "narrow-margin control: four requests at literal bounds; root 99 correctly absent").toEqual({
+      requests: [
+        wire("newest", "99.500000", "102.000000", false),
+        wire("newest", "100.750001", "102.000000", false), wire("newest", "100.750001", "102.000000", true),
+        wire("newest", "99.500000", "100.750000", false),
+      ],
+      steps: ["delayed:cursor_unrepresentable", "ok:", "ok:", "ok:"],
+      frozen: Array.from({ length: 3 }, () => ["100.000000", "99.500000", "90.000000"]),
+      certifiedTop: ["100.000000", "100.000000", "100.000000", "102.000000"],
+      queue: { roots: ["100.000000", "101.000000", "102.000000"], unique: true },
+      privacy: NO_LEAK,
+    });
+    expect(adequate.facts.queue.roots.filter((root) => !control.facts.queue.roots.includes(root)), "adequate minus control is exactly 98 and 99").toEqual([
+      "98.000000", "99.000000",
+    ]);
+
+    // THE NEXT ENVELOPE of the adequate fixture, anchored-but-uninitialized at A = 103 over B = 102:
+    // its first claim freezes the CHANGED setting, L = 102 − 500 ms = 101.5.
+    const c = await rawSql();
+    await c.query(
+      `update slack_sync_channels set newest_anchor_ts = '103.000000', newest_lower_ts = '102.000000'
+        where team_id = $1 and workspace_id = $2 and channel_id = $3`,
+      [adequate.seed.teamId, WORKSPACE, CHANNEL]
+    );
+    const staged = await channelRow(adequate.seed.teamId, WORKSPACE, CHANNEL);
+    expect({
+      lowerIsCertifiedTop: staged?.newest_lower_ts === staged?.completed_upper_ts,
+      uninitialized: staged?.newest_request_lower_ts === null && staged?.newest_segment_lower_ts === null && staged?.newest_cursor === null,
+    }, "fixture: the next envelope is anchored at 103 over the certified top 102, not yet initialized").toEqual({ lowerIsCertifiedTop: true, uninitialized: true });
+    const next = await invoke(adequate.seed, adequate.integrationId, adequate.fake, adequate.provider, { allowanceMs: 500 });
+    const after = await channelRow(adequate.seed.teamId, WORKSPACE, CHANNEL);
+    const request = adequate.provider.requests[6];
+    expect({
+      request: request === undefined ? null : wireOf(request),
+      served: request?.served ?? null,
+      step: label(targetStep(next)),
+      certifiedTop: after?.completed_upper_ts ?? null,
+      queue: await queueOf(adequate.seed.teamId, CHANNEL),
+      privacy: privacyOf([next], adequate.provider),
+    }, "the changed allowance applies to the next envelope only: one terminal request [101.5, 103], no margin recovered by accident").toEqual({
+      request: wire("newest", "101.500000", "103.000000", false),
+      served: ["102.000000"],
+      step: "ok:",
+      certifiedTop: "103.000000",
+      queue: { roots: MARGIN_ROOTS, unique: true },
+      privacy: NO_LEAK,
+    });
+  }, 300_000);
 });
