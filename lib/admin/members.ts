@@ -2,6 +2,7 @@ import "server-only";
 import { z } from "zod";
 import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
+import { deleteMemberWithIdentityRevision, disableMemberWithIdentityRevision } from "@/lib/identity/member-identities";
 
 /**
  * Shared admin primitive: create (or upsert) a member. Used by the admin server
@@ -163,7 +164,7 @@ export async function rollbackMemberCreation(
   memberId: string,
   opts: { actor?: ActorContext } = {}
 ): Promise<void> {
-  await admin.from("members").delete().eq("id", memberId);
+  await deleteMemberWithIdentityRevision(admin, teamId, memberId);
   await audit(admin, {
     team_id: teamId,
     actor_kind: opts.actor?.kind ?? "system",
@@ -324,14 +325,9 @@ export async function deleteMember(
   }
 
   if (opts.hard) {
-    const { error } = await admin.from("members").delete().eq("id", member.id);
-    if (error) throw new Error(`delete member failed: ${error.message}`);
+    await deleteMemberWithIdentityRevision(admin, teamId, member.id);
   } else {
-    const { error } = await admin
-      .from("members")
-      .update({ status: "disabled", auth_user_id: null })
-      .eq("id", member.id);
-    if (error) throw new Error(`disable member failed: ${error.message}`);
+    await disableMemberWithIdentityRevision(admin, teamId, member.id);
   }
 
   await audit(admin, {

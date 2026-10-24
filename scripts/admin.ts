@@ -435,7 +435,7 @@ export async function main(argv: string[]) {
           handle: (flags.handle as string) || undefined,
           email: (flags.email as string) || undefined,
         },
-        { force: Boolean(flags.force), actor: { kind: "system" } }
+        { force: Boolean(flags.force), explicit: true, actor: { kind: "system" } }
       );
       if (r.conflict) {
         die(`${provider}:${externalId} is already linked to a different member${r.note ? ` (${r.note})` : ""}; pass --force to reassign`);

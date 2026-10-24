@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { getWorkTimeline } from "@/lib/dashboard/work-timeline";
-import { getCachedWorkTimeline, purgeTimelineCacheTier, settleTimelineRefreshes, PAYLOAD_VERSION } from "@/lib/dashboard/timeline-cache";
+import { bustTeamTimeline, getCachedWorkTimeline, purgeTimelineCacheTier, settleTimelineRefreshes, timelineViewKey, PAYLOAD_VERSION } from "@/lib/dashboard/timeline-cache";
 import type { TimelineDay } from "@/lib/dashboard/timeline-group";
-import { db, seedTeam, ingest, type Seed } from "./helpers";
+import { db, seedTeam, ingest, liveTimelineStamps, type Seed } from "./helpers";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { contentTimelineEnforcement } from "@/lib/access/admission";
 
@@ -195,13 +195,15 @@ describe("visibility-keyed timeline cache (§5.8)", () => {
     await insertTask(seed, item.projectId!, { row_key: "AIO-50", title: "General note task", source_item_id: item.id });
     const member = await seedMember(seed);
     await backfillTeamContext(db(), seed.teamId);
-    // Poison the tier row: a payload naming restricted work, fresh enough to be served on a hit.
-    await db().from("work_timeline_cache").upsert({
-      team_id: seed.teamId,
-      group_key: "team",
-      payload: JSON.stringify({ v: PAYLOAD_VERSION, days: [{ date: "2026-08-12", people: [{ memberId: seed.memberId, name: "X", summary: "POISON restricted prose", tasks: [], unlinked: 0, total: 0, signals: [] }] }] }),
-      computed_at: new Date().toISOString(),
-    }, { onConflict: "team_id,group_key" });
+    // Poison the tier row: a payload naming restricted work that would be a HIT at the reader's own
+    // key — current version, live generations, the reader's item fingerprint, fresh. Only the KEY
+    // stands between it and the reader (an unstamped row is refused before the key is in question).
+    const poison = JSON.stringify({ v: PAYLOAD_VERSION, ...(await liveTimelineStamps(seed.teamId, member)), days: [{ date: "2026-08-12", people: [{ memberId: seed.memberId, name: "X", summary: "POISON restricted prose", tasks: [], other: [], unlinked: 0, total: 0, signals: [] }] }] });
+    const plant = async (group_key: string) =>
+      expect((await db().from("work_timeline_cache").upsert({
+        team_id: seed.teamId, group_key, payload: poison, computed_at: new Date().toISOString(),
+      }, { onConflict: "team_id,group_key" })).error, `cache fixture must upsert at ${group_key}`).toBeNull();
+    await plant("team");
 
     const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team", member);
     await settleTimelineRefreshes();
@@ -211,6 +213,14 @@ describe("visibility-keyed timeline cache (§5.8)", () => {
     const keys = ((rows ?? []) as { group_key: string }[]).map((r) => r.group_key);
     expect(keys.some((k) => k.startsWith("adm:me:team:")), `expected an adm:me:team:<hash> row, got ${keys.join()}`).toBe(true);
     expect(keys.some((k) => k.startsWith("vis:")), "the old namespace is never written").toBe(false);
+
+    // POSITIVE CONTROL: the SAME payload at the reader's OWN key is served, so the absence above is
+    // the key's doing and not a row the reader would have refused anywhere. (The bust only evicts the
+    // process copy the read above left behind; the upsert re-freshens the row it marks stale.)
+    await bustTeamTimeline(db(), seed.teamId);
+    await plant(await timelineViewKey(db(), seed.teamId, "team", member));
+    const own = await getCachedWorkTimeline(db(), seed.teamId, "team", member);
+    expect(JSON.stringify(own.days), "the same payload at the reader's own key is a hit").toContain("POISON");
   });
 
   it("two members with the SAME group signature share one variant row; a third with different groups gets another", async () => {
@@ -248,16 +258,28 @@ describe("visibility-keyed timeline cache (§5.8)", () => {
     await insertTask(seed, item.projectId!, { row_key: "AIO-70", title: "Salvage probe", source_item_id: item.id });
     const member = await seedMember(seed);
     await backfillTeamContext(db(), seed.teamId);
-    // A tier row whose per-person prose names restricted work, at an OLD version (salvage ignores version).
-    await db().from("work_timeline_cache").upsert({
-      team_id: seed.teamId,
-      group_key: "team",
-      payload: JSON.stringify({ v: PAYLOAD_VERSION - 1, days: [{ date: recentIso.slice(0, 10), people: [{ memberId: seed.memberId, name: "X", summary: "SALVAGE-POISON secret prose", tasks: [], unlinked: 0, total: 0, signals: [] }] }] }),
-      computed_at: new Date().toISOString(),
-    }, { onConflict: "team_id,group_key" });
+    // A tier row whose per-person prose names restricted work, and which salvage WOULD carry from the
+    // reader's own key: a FOREIGN version at or above the floor (so it is a miss, never a hit — `+1`
+    // is a newer build's row read after a rollback; `- 1` is below the floor and refused on version
+    // alone), live generations, the reader's item fingerprint, and a person-day the build renders.
+    const poison = JSON.stringify({ v: PAYLOAD_VERSION + 1, ...(await liveTimelineStamps(seed.teamId, member)), days: [{ date: recentIso.slice(0, 10), people: [{ memberId: seed.memberId, name: "X", summary: "SALVAGE-POISON secret prose", tasks: [], other: [], unlinked: 0, total: 0, signals: [] }] }] });
+    const plant = async (group_key: string) =>
+      expect((await db().from("work_timeline_cache").upsert({
+        team_id: seed.teamId, group_key, payload: poison, computed_at: new Date().toISOString(),
+      }, { onConflict: "team_id,group_key" })).error, `cache fixture must upsert at ${group_key}`).toBeNull();
+    await plant("team");
     const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team", member);
     await settleTimelineRefreshes();
     expect(JSON.stringify(days), "cross-key salvage would leak tier prose into an enforced payload").not.toContain("SALVAGE-POISON");
+
+    // POSITIVE CONTROL: the SAME payload at the reader's OWN key IS carried into the next cold build
+    // (same-key salvage), so the absence above is key isolation — not a version, stamp or person-day
+    // mismatch that would have refused the sentence from any key.
+    await bustTeamTimeline(db(), seed.teamId);
+    await plant(await timelineViewKey(db(), seed.teamId, "team", member));
+    const own = await getCachedWorkTimeline(db(), seed.teamId, "team", member);
+    await settleTimelineRefreshes();
+    expect(JSON.stringify(own.days), "same-key salvage carries the sentence").toContain("SALVAGE-POISON");
   });
 
   it("purgeTimelineCacheTier removes the tier row, every old vis variant AND every new adm variant of that tier (N4)", async () => {

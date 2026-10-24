@@ -58,7 +58,7 @@ export const STAGING_MARKER_TABLE = "staging_marker";
 export const STAGING_MARKER_REMEDY = `psql "$STAGING_REFRESH_TARGET_URL" -c 'create table if not exists ${STAGING_MARKER_TABLE} (note text primary key)'`;
 
 /**
- * Tables whose DATA never enters the dump. Two different categories, kept in one set because the
+ * Tables whose DATA never enters the dump. Three categories, kept in one set because the
  * script needs one list, but distinguished here because the REASONS are what a future reader has to
  * re-derive:
  *
@@ -72,6 +72,9 @@ export const STAGING_MARKER_REMEDY = `psql "$STAGING_REFRESH_TARGET_URL" -c 'cre
  *      "stalled", and `getPipelineHealth` then appends a synthetic `graph_extract` leg that is the one
  *      CONFIRMATION-EXEMPT leg in the system — no staleness threshold can ever clear it. A permanently
  *      red "graph extraction is broken" banner, manufactured by our own refresh.
+ *   3. INTEGRATION-OWNED SOURCE STATE — Slack binding, method-budget, and channel rows depend on
+ *      excluded integration credentials. Copying only these dependents would leave incoherent state;
+ *      the FK-closure guard checks the exclusion set as the schema evolves.
  */
 export const EXCLUDED_TABLE_DATA = Object.freeze([
   "gateway_approvals",
@@ -82,6 +85,9 @@ export const EXCLUDED_TABLE_DATA = Object.freeze([
   "graph_episodes",
   "integrations",
   "member_secrets",
+  "slack_integration_bindings",
+  "slack_method_budgets",
+  "slack_sync_channels",
 ]);
 
 /**
