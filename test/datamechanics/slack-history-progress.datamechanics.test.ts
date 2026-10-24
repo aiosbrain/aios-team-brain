@@ -233,17 +233,26 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *  Production GREEN for these REDs is still pending.
  *  (Packet 5 is GREEN since `f556163d`.)
  *  ACTUAL PROVIDER `invalid_cursor` (§5, DH-03/DH-05/DH-07/DH-13, F2-08/F2-11), RED against `f556163d`:
- *   - this file, packet 6a (3 direct-writer REDs). The SAME `restartSlackChannelScan` export must
- *     return:
- *      - `subdivided` on a wide segment: the exact midpoint by the test's own BigInt oracle;
- *      - `restarted` on a singleton;
- *      - `refused` when the segment moved under the same generation, with the row exact;
- *   - the discovery suite, packet 6 (7 REDs and 1 GREEN control):
- *      - wide midpoint subdivision, for C ≠ null and C = null, with the subdivision detail;
- *      - singleton same-range restart, for C ≠ null and C = null, with the singleton detail, still
- *        pending and with no local retry;
+ *   - this file, packet 6a (14 tests: 6 REDs and 8 GREEN controls). The SAME `restartSlackChannelScan`
+ *     export, with its result leak-checked through `project`, must return:
+ *      - `subdivided` on a PROGRESSED wide segment (S 1718900100, U 1718900300 < A, aggregate
+ *        1718900350, attempt-oldest 1718900200): S' = 1718900200.000001 by the test's own oracle, U
+ *        kept, aggregate byte-identical, attempt-oldest cleared (RED);
+ *      - `restarted` on a PROGRESSED singleton (S = U = 1718900300 < A) (RED);
+ *      - typed `refused`, with the live row exact, across the complete fence, 12 rows:
+ *         - segment S moved, segment U moved, public revoked and binding integration changed: RED,
+ *           because today's restart fence omits them;
+ *         - binding revision, lease expiry, successor reclaim, lease generation, claimed lane, scan
+ *           generation, cursor and anchor drift: GREEN controls;
+ *   - the discovery suite, packet 6 (8 REDs and 1 GREEN control):
+ *      - wide midpoint subdivision, for a PROGRESSED C ≠ null and for C = null, with the
+ *        subdivision detail;
+ *      - singleton same-range restart, for a PROGRESSED C ≠ null and for C = null, with the singleton
+ *        detail, still pending and with no local retry;
  *      - stale selection, stale lease and both, each refused before any transition (selection first);
- *      - control: the writer's own `refused` from the acceptance transaction.
+ *      - a lease expiring after the selection lock inside the invalid_cursor transaction (6.5);
+ *      - control 6.4: the writer's own `refused` from the acceptance transaction, injected after the
+ *        caller's channel lock.
  * Also still deferred:
  *  - two-session claim/accept races;
  *  - the §3.4 maximum-history compatibility writers;
@@ -1523,84 +1532,140 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
   //  - `subdivided`: S < U, the midpoint transition;
   //  - `restarted`: S = U, the same-range restart;
   //  - `refused`: a stale or moved fence.
-  // The result is projected from `unknown` to its outcome only. Every row fact is a boolean.
+  // The result goes through the file's no-leak projection (`project`/`returnedLeak`), so a leaking
+  // result fails as `leaked: true`. Every row fact is a boolean.
 
-  /** Restart under the claim; the result is reduced to its outcome (exceptions are sanitized). */
-  async function restartOutcome(claim: SlackChannelClaim): Promise<unknown> {
+  /** Restart under the claim; the result is projected and leak-checked (exceptions are sanitized). */
+  async function restartOutcome(claim: SlackChannelClaim): Promise<Record<string, unknown>> {
     const result = await tx((session) => restartSlackChannelScan(session, claim, { errorCode: "invalid_cursor" })).catch(sanitized);
-    return (result as { outcome?: unknown }).outcome ?? result;
+    const projected = project(result);
+    return { outcome: projected.outcome, leaked: projected.leaked === true };
   }
   /** Columns a historical invalid_cursor transition may change: lane C/H/attempt-oldest/G, S, and release. */
   const INVALID_CURSOR_PERMITTED = [
     "historical_cursor", "historical_cursor_history", "historical_oldest_seen_ts", "historical_scan_generation",
     "historical_segment_lower_ts", ...RELEASE_PERMITTED,
   ];
+  /**
+   * REAL progressed literals under A = `1718900500.000000`.
+   *  - Wide: S < U < A, with attempt-oldest in [S, U] and the completed-segments aggregate in (U, A].
+   *  - Singleton: S = U < A, with attempt-oldest equal to U and the aggregate above U.
+   */
+  const PROGRESSED = {
+    wide: { lower: "1718900100.000000", upper: "1718900300.000000", aggregate: "1718900350.000000", attemptOldest: "1718900200.000000" },
+    singleton: { lower: "1718900300.000000", upper: "1718900300.000000", aggregate: "1718900350.000000", attemptOldest: "1718900300.000000" },
+  } as const;
+  /** Seed the wide fixture, then write the progressed literal and assert it as a separate PRECONDITION. */
+  async function seedProgressed(width: "wide" | "singleton"): Promise<Seeded> {
+    const seeded = await seedWideSegment(["syn-h-1", "syn-h-2"]);
+    const p = PROGRESSED[width];
+    await tx((session) => session.executeSql(
+      `update slack_sync_channels
+          set historical_segment_lower_ts = $2, historical_segment_upper_ts = $3,
+              historical_completed_segments_oldest_ts = $4, historical_oldest_seen_ts = $5
+        where team_id = $1`,
+      [seeded.scope.teamId, p.lower, p.upper, p.aggregate, p.attemptOldest]
+    ));
+    const facts = await tx(async (session) => (await session.executeSql<Record<string, unknown>>(
+      `select historical_segment_lower_ts = $2 and historical_segment_upper_ts = $3 as bounds_seeded,
+              historical_completed_segments_oldest_ts = $4 as aggregate_seeded,
+              historical_oldest_seen_ts = $5 as attempt_oldest_seeded,
+              historical_cursor is not null and historical_anchor_ts = $6 as cursor_and_anchor
+         from slack_sync_channels where team_id = $1`,
+      [seeded.scope.teamId, p.lower, p.upper, p.aggregate, p.attemptOldest, HISTORICAL_ANCHOR]
+    )).rows[0]);
+    expect(facts, `fixture: the progressed ${width} literal is stored`).toEqual({
+      bounds_seeded: true, aggregate_seeded: true, attempt_oldest_seeded: true, cursor_and_anchor: true,
+    });
+    return seeded;
+  }
   /** Booleans about the historical lane after a restart, against literal expectations (no values printed). */
-  async function restartFacts(scope: SlackChannelScope, expectedLower: string, expectedUpper: string, expectedGeneration: number) {
+  async function restartFacts(scope: SlackChannelScope, expected: { lower: string; upper: string; aggregate: string; generation: number }) {
     return tx(async (session) => (await session.executeSql<Record<string, unknown>>(
       `select historical_segment_lower_ts is not distinct from $4 as lower_is_expected,
-              historical_segment_upper_ts is not distinct from $5 as upper_is_expected,
+              historical_segment_upper_ts is not distinct from $5 as upper_kept_not_reset_to_anchor,
               historical_anchor_ts is not distinct from $7 as anchor_kept,
+              historical_completed_segments_oldest_ts is not distinct from $8 as aggregate_byte_identical,
               historical_cursor is null and historical_cursor_history = '[]'::jsonb as cursor_history_cleared,
               historical_oldest_seen_ts is null as attempt_oldest_cleared,
               historical_scan_generation = $6::bigint as generation_is_expected,
               lease_owner is null and claimed_lane is null as released, next_lane, last_error_code
          from slack_sync_channels where team_id = $1 and workspace_id = $2 and channel_id = $3`,
-      [scope.teamId, scope.workspaceId, scope.channelId, expectedLower, expectedUpper, expectedGeneration, HISTORICAL_ANCHOR]
+      [scope.teamId, scope.workspaceId, scope.channelId, expected.lower, expected.upper, expected.generation, HISTORICAL_ANCHOR, expected.aggregate]
     )).rows[0]);
   }
+  const RESTART_FACTS_EXPECTED = {
+    lower_is_expected: true, upper_kept_not_reset_to_anchor: true, anchor_kept: true, aggregate_byte_identical: true,
+    cursor_history_cleared: true, attempt_oldest_cleared: true, generation_is_expected: true, released: true,
+    next_lane: "newest", last_error_code: "invalid_cursor",
+  };
 
-  it("§5 invalid_cursor RED: on a WIDE segment the restart writer SUBDIVIDES at the exact midpoint (independent BigInt oracle)", async () => {
-    const seeded = await seedWideSegment(["syn-h-1", "syn-h-2"]);
+  it("§5 invalid_cursor RED: on a PROGRESSED WIDE segment the restart writer SUBDIVIDES at the exact midpoint (independent BigInt oracle)", async () => {
+    const seeded = await seedProgressed("wide");
     const claim = await claimHistorical(seeded);
     const before = await rowDigestExcept(seeded.scope, INVALID_CURSOR_PERMITTED);
-    // M = floor((S + U) / 2) in ticks, then S = M + 1, from the literal S = 0 and U = A.
-    const midpointPlusOne = renderTicks((exactOracleTicks("0.000000") + exactOracleTicks(HISTORICAL_ANCHOR)) / BigInt(2) + BigInt(1));
-    expect(midpointPlusOne, "fixture: oracle").toBe("859450250.000001");
+    // M = floor((S + U) / 2) in ticks, then S = M + 1, from the literal S and U.
+    const midpointPlusOne = renderTicks((exactOracleTicks(PROGRESSED.wide.lower) + exactOracleTicks(PROGRESSED.wide.upper)) / BigInt(2) + BigInt(1));
+    expect(midpointPlusOne, "fixture: oracle").toBe("1718900200.000001");
     const outcome = await restartOutcome(claim);
     expect({
       outcome,
-      facts: await restartFacts(seeded.scope, midpointPlusOne, HISTORICAL_ANCHOR, 5),
+      facts: await restartFacts(seeded.scope, { lower: midpointPlusOne, upper: PROGRESSED.wide.upper, aggregate: PROGRESSED.wide.aggregate, generation: 5 }),
       unrelatedUnchanged: (await rowDigestExcept(seeded.scope, INVALID_CURSOR_PERMITTED)) === before,
-    }, "S = M + 1; U/L/A, aggregate, certificate and the newest lane preserved; C/H/attempt-oldest cleared; G + 1; released").toEqual({
-      outcome: "subdivided",
-      facts: {
-        lower_is_expected: true, upper_is_expected: true, anchor_kept: true, cursor_history_cleared: true,
-        attempt_oldest_cleared: true, generation_is_expected: true, released: true, next_lane: "newest", last_error_code: "invalid_cursor",
-      },
+    }, "S = M + 1; U (not A), L, A, the aggregate, the certificate and the newest lane preserved; C/H/attempt-oldest cleared; G + 1; released").toEqual({
+      outcome: { outcome: "subdivided", leaked: false },
+      facts: RESTART_FACTS_EXPECTED,
       unrelatedUnchanged: true,
     });
   });
 
-  it("§5 invalid_cursor RED: on a SINGLETON segment the restart writer is a same-range RESTART", async () => {
-    const seeded = await seedSingletonSegment(["syn-h-1", "syn-h-2"]);
+  it("§5 invalid_cursor RED: on a PROGRESSED SINGLETON segment the restart writer is a same-range RESTART", async () => {
+    const seeded = await seedProgressed("singleton");
     const claim = await claimHistorical(seeded);
     const before = await rowDigestExcept(seeded.scope, INVALID_CURSOR_PERMITTED);
     const outcome = await restartOutcome(claim);
     expect({
       outcome,
-      facts: await restartFacts(seeded.scope, HISTORICAL_ANCHOR, HISTORICAL_ANCHOR, 5),
+      facts: await restartFacts(seeded.scope, {
+        lower: PROGRESSED.singleton.lower, upper: PROGRESSED.singleton.upper, aggregate: PROGRESSED.singleton.aggregate, generation: 5,
+      }),
       unrelatedUnchanged: (await rowDigestExcept(seeded.scope, INVALID_CURSOR_PERMITTED)) === before,
-    }, "every bound kept; C/H/attempt-oldest cleared; G + 1; released").toEqual({
-      outcome: "restarted",
-      facts: {
-        lower_is_expected: true, upper_is_expected: true, anchor_kept: true, cursor_history_cleared: true,
-        attempt_oldest_cleared: true, generation_is_expected: true, released: true, next_lane: "newest", last_error_code: "invalid_cursor",
-      },
+    }, "every bound kept (U is not reset to A); the aggregate byte-identical; C/H/attempt-oldest cleared; G + 1; released").toEqual({
+      outcome: { outcome: "restarted", leaked: false },
+      facts: RESTART_FACTS_EXPECTED,
       unrelatedUnchanged: true,
     });
   });
 
-  it("§5/§8 invalid_cursor RED: a segment moved under the same generation is REFUSED by the restart writer's full fence; the row is exact", async () => {
+  // The COMPLETE historical fence (`channelFence`), one row per component, each applied AFTER the claim.
+  // Each mutation changes the live row, so the oracle is the POST-mutation row: the attempted restart
+  // must leave it byte-identical.
+  it.each([
+    { label: "segment LOWER bound moved", mutate: sqlMutation("update slack_sync_channels set historical_segment_lower_ts = '1718900000.000000' where team_id = $1") },
+    { label: "segment UPPER bound moved", mutate: sqlMutation("update slack_sync_channels set historical_segment_upper_ts = '1718900400.000000' where team_id = $1") },
+    { label: "public proof revoked", mutate: REVOKE_PUBLIC },
+    { label: "binding integration changed", mutate: OTHER_BINDER },
+    { label: "binding config revision changed", mutate: sqlMutation(`update slack_sync_channels set binding_config_revision = '${OTHER_REVISION}' where team_id = $1`) },
+    { label: "lease expired", mutate: EXPIRE_LEASE },
+    { label: "successor reclaimed after expiry", mutate: SUCCESSOR_RECLAIM },
+    { label: "lease generation bumped alone", mutate: sqlMutation("update slack_sync_channels set lease_generation = lease_generation + 1 where team_id = $1") },
+    { label: "claimed lane changed", mutate: sqlMutation("update slack_sync_channels set claimed_lane = 'newest' where team_id = $1") },
+    { label: "scan generation drifted", mutate: sqlMutation("update slack_sync_channels set historical_scan_generation = 5 where team_id = $1") },
+    {
+      label: "cursor drifted",
+      mutate: sqlMutation(`update slack_sync_channels set historical_cursor = 'syn-h-x', historical_cursor_history = '["syn-h-1", "syn-h-2", "syn-h-x"]'::jsonb where team_id = $1`),
+    },
+    { label: "anchor drifted", mutate: sqlMutation("update slack_sync_channels set historical_anchor_ts = '1718900600.000000' where team_id = $1") },
+  ])("§5/§8 invalid_cursor fence: with $label, the restart writer returns typed refused and the live row is exact", async ({ mutate }) => {
     const seeded = await seedWideSegment(["syn-h-1", "syn-h-2"]);
     const claim = await claimHistorical(seeded);
-    await tx((session) => session.executeSql(
-      "update slack_sync_channels set historical_segment_upper_ts = '1718900400.000000' where team_id = $1", [seeded.scope.teamId]
-    ));
+    await mutate(seeded);
     const before = await rowDigestExcept(seeded.scope, []);
     const outcome = await restartOutcome(claim);
     expect({ outcome, rowUnchanged: (await rowDigestExcept(seeded.scope, [])) === before },
-      "the invalid_cursor transition is fenced like acceptance").toEqual({ outcome: "refused", rowUnchanged: true });
+      "the invalid_cursor transition is fenced exactly like acceptance").toEqual({
+      outcome: { outcome: "refused", leaked: false }, rowUnchanged: true,
+    });
   });
 });
 
