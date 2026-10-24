@@ -2812,6 +2812,33 @@ describe("AIO-1170 deferred DH/F2 packet: application traversals through real di
     );
     return rows[0]?.claimed_lane ?? null;
   }
+  /**
+   * The packet's ONLY channel-row reader (the shared `channelRow` is left as it is). It projects ordinary
+   * scalar state, plus SQL-derived facts about each lane's cursor and history:
+   *  - whether the cursor is null;
+   *  - the history's entry count;
+   *  - an md5 digest of the cursor and history together, for exact unchanged comparisons.
+   * No cursor string and no cursor-history array ever leaves PostgreSQL through this packet.
+   */
+  async function packetRow(teamId: string, channelId: string): Promise<Row> {
+    const c = await rawSql();
+    const { rows } = await c.query<Record<string, unknown>>(
+      `select completed_lower_ts, completed_upper_ts, historical_floor_reached, newest_catchup_upper_ts,
+              historical_anchor_ts, historical_segment_lower_ts, historical_segment_upper_ts, historical_scan_generation,
+              historical_oldest_seen_ts, historical_completed_segments_oldest_ts,
+              newest_anchor_ts, newest_lower_ts, newest_request_lower_ts, newest_segment_lower_ts, newest_segment_upper_ts,
+              newest_scan_generation, last_error_code, last_read_at,
+              historical_cursor is null as historical_cursor_null,
+              pg_catalog.jsonb_array_length(historical_cursor_history)::int as historical_history_entries,
+              pg_catalog.md5(pg_catalog.jsonb_build_array(historical_cursor, historical_cursor_history)::text) as historical_lane_digest,
+              newest_cursor is null as newest_cursor_null,
+              pg_catalog.jsonb_array_length(newest_cursor_history)::int as newest_history_entries,
+              pg_catalog.md5(pg_catalog.jsonb_build_array(newest_cursor, newest_cursor_history)::text) as newest_lane_digest
+         from slack_sync_channels where team_id = $1 and workspace_id = $2 and channel_id = $3`,
+      [teamId, WORKSPACE, channelId]
+    );
+    return rows[0] ?? null;
+  }
   /** This channel's queue rows, ascending by exact instant, and whether each root appears once. */
   async function queueOf(teamId: string, channelId: string): Promise<{ roots: string[]; unique: boolean }> {
     const rows = (await threadRows(teamId)).filter((row) => row.channel_id === channelId && row.workspace_id === WORKSPACE);
@@ -2991,13 +3018,14 @@ describe("AIO-1170 deferred DH/F2 packet: application traversals through real di
     lower: row?.completed_lower_ts ?? null, upper: row?.completed_upper_ts ?? null,
     floor: row?.historical_floor_reached ?? null, provisional: row?.newest_catchup_upper_ts ?? null,
   });
+  /** `packetRow` facts only: scalar progress, the cursor-null booleans, history counts and SQL-side digests. */
   const PROGRESS_COLUMNS = [
-    "historical_anchor_ts", "historical_cursor", "historical_cursor_history", "historical_scan_generation",
+    "historical_anchor_ts", "historical_cursor_null", "historical_history_entries", "historical_lane_digest", "historical_scan_generation",
     "historical_segment_lower_ts", "historical_segment_upper_ts", "historical_oldest_seen_ts", "historical_completed_segments_oldest_ts",
-    "newest_cursor", "newest_cursor_history", "newest_scan_generation", "newest_segment_lower_ts", "newest_segment_upper_ts",
+    "newest_cursor_null", "newest_history_entries", "newest_lane_digest", "newest_scan_generation", "newest_segment_lower_ts", "newest_segment_upper_ts",
     "completed_lower_ts", "completed_upper_ts", "historical_floor_reached", "newest_catchup_upper_ts", "last_read_at",
   ];
-  /** Whether two rows hold the same progress, certification and read facts (a boolean; no value is kept). */
+  /** Whether two `packetRow` snapshots hold the same progress, certification and read facts (a boolean; no value is kept). */
   const sameProgress = (a: Row, b: Row): boolean =>
     JSON.stringify(PROGRESS_COLUMNS.map((column) => a?.[column] ?? null)) === JSON.stringify(PROGRESS_COLUMNS.map((column) => b?.[column] ?? null));
   const privacyOf = (invocations: readonly Invocation[], provider: BoundProvider) => ({
@@ -3039,7 +3067,7 @@ describe("AIO-1170 deferred DH/F2 packet: application traversals through real di
     // Exactly three wakes: a fourth request is never allowed.
     for (let i = 0; i < 3; i++) {
       invocations.push(await invoke(seed, integrationId, fake, provider, { allowanceMs: 1 }));
-      rows.push(await channelRow(seed.teamId, WORKSPACE, CHANNEL));
+      rows.push(await packetRow(seed.teamId, CHANNEL));
       queues.push((await queueOf(seed.teamId, CHANNEL)).roots);
     }
     expect({
@@ -3077,7 +3105,7 @@ describe("AIO-1170 deferred DH/F2 packet: application traversals through real di
     const provider = boundProvider({ teamId: seed.teamId, channelId: CHANNEL, roots: [T], ceiling: 1, decide: () => ({ kind: "page" }) });
     const fake = pass(provider.handler);
     const invocation = await invoke(seed, integrationId, fake, provider, { allowanceMs: 1 });
-    const row = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    const row = await packetRow(seed.teamId, CHANNEL);
     expect({
       requests: provider.requests.map(wireOf),
       step: { step: label(targetStep(invocation)), history: invocation.history },
@@ -3111,7 +3139,7 @@ describe("AIO-1170 deferred DH/F2 packet: application traversals through real di
     const queues: string[][] = [];
     for (let i = 0; i < 3; i++) {
       invocations.push(await invoke(seed, integrationId, fake, provider, { allowanceMs: 1 }));
-      rows.push(await channelRow(seed.teamId, WORKSPACE, CHANNEL));
+      rows.push(await packetRow(seed.teamId, CHANNEL));
       queues.push((await queueOf(seed.teamId, CHANNEL)).roots);
     }
     expect({
@@ -3194,12 +3222,12 @@ describe("AIO-1170 deferred DH/F2 packet: application traversals through real di
     });
     const fake = pass(provider.handler);
     const invocations: Invocation[] = [];
-    const rows: Row[] = [await channelRow(seed.teamId, WORKSPACE, CHANNEL)];
+    const rows: Row[] = [await packetRow(seed.teamId, CHANNEL)];
     const queueSizes: number[] = [0];
     let firstRoot4: string | null = null;
     while (provider.requests.length < expected.program.length && invocations.length < expected.program.length * 2 + 2) {
       invocations.push(await invoke(seed, integrationId, fake, provider, { allowanceMs: fourRootAllowance(lane) }));
-      rows.push(await channelRow(seed.teamId, WORKSPACE, CHANNEL));
+      rows.push(await packetRow(seed.teamId, CHANNEL));
       queueSizes.push((await queueOf(seed.teamId, CHANNEL)).roots.length);
       if (firstRoot4 === null) {
         const root4 = (await threadRows(seed.teamId)).find((row) => row.channel_id === CHANNEL && row.root_ts === "4.000000");
@@ -3300,13 +3328,13 @@ describe("AIO-1170 deferred DH/F2 packet: application traversals through real di
       },
     });
     const fake = pass(provider.handler);
-    const initial = coverageOf(await channelRow(seed.teamId, WORKSPACE, CHANNEL));
+    const initial = coverageOf(await packetRow(seed.teamId, CHANNEL));
     const invocations: Invocation[] = [];
     let afterTrigger: { row: Row; queue: { roots: string[]; unique: boolean } } | null = null;
     while (provider.requests.length < 2004 && invocations.length < 2 * 2004 + 2) {
       const invocation = await invoke(seed, integrationId, fake, provider, { allowanceMs: lane === "newest" ? 60_000 : undefined });
       invocations.push(invocation);
-      if (invocation.target === 1001) afterTrigger = { row: await channelRow(seed.teamId, WORKSPACE, CHANNEL), queue: await queueOf(seed.teamId, CHANNEL) };
+      if (invocation.target === 1001) afterTrigger = { row: await packetRow(seed.teamId, CHANNEL), queue: await queueOf(seed.teamId, CHANNEL) };
     }
     // The literal request program: [0, 1003] ×1,001; [501.500001, 1003] ×502; [0, 501.500000] ×501.
     const program: ReturnType<typeof wire>[] = [];
@@ -3318,7 +3346,7 @@ describe("AIO-1170 deferred DH/F2 packet: application traversals through real di
     const stepMismatch = provider.requests.findIndex((r) =>
       label(outcomes.get(r.index)) !== (r.index === 1001 ? "delayed:cursor_history_entries_exceeded" : "ok:"));
     const queue = await queueOf(seed.teamId, CHANNEL);
-    const row = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    const row = await packetRow(seed.teamId, CHANNEL);
     return {
       programLength: program.length,
       requests: provider.requests.length,
@@ -3330,8 +3358,8 @@ describe("AIO-1170 deferred DH/F2 packet: application traversals through real di
       atTriggerEntries: atTrigger.entries,
       afterTrigger: afterTrigger === null ? null : {
         segment: [afterTrigger.row?.[`${lane}_segment_lower_ts`] ?? null, afterTrigger.row?.[`${lane}_segment_upper_ts`] ?? null],
-        cursorCleared: afterTrigger.row?.[`${lane}_cursor`] === null
-          && Array.isArray(afterTrigger.row?.[`${lane}_cursor_history`]) && (afterTrigger.row?.[`${lane}_cursor_history`] as unknown[]).length === 0,
+        // SQL-derived: the cursor-null boolean and the history's entry count; no history leaves PostgreSQL.
+        cursorCleared: afterTrigger.row?.[`${lane}_cursor_null`] === true && afterTrigger.row?.[`${lane}_history_entries`] === 0,
         generation: Number(afterTrigger.row?.[`${lane}_scan_generation`]),
         coverageUnchanged: JSON.stringify(coverageOf(afterTrigger.row)) === JSON.stringify(initial),
         root3Queued: afterTrigger.queue.roots.includes("3.000000"),
@@ -3422,12 +3450,12 @@ describe("AIO-1170 deferred DH/F2 packet: application traversals through real di
     const rowsAfterTarget = new Map<number, Row>();
     const record = async (invocation: Invocation) => {
       invocations.push(invocation);
-      if (invocation.target !== null) rowsAfterTarget.set(invocation.target, await channelRow(seed.teamId, WORKSPACE, CHANNEL));
+      if (invocation.target !== null) rowsAfterTarget.set(invocation.target, await packetRow(seed.teamId, CHANNEL));
     };
 
     // Target request 1.
     await record(await invoke(seed, integrationId, fake, provider, { allowanceMs }));
-    const afterFirst = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    const afterFirst = await packetRow(seed.teamId, CHANNEL);
     // The competing channel's ONE real history slot: an actual 429 with Retry-After.
     const contention = await invoke(seed, integrationId, fake, provider, { allowanceMs });
     await agePublicProof(seed.teamId, COMPETITOR);
@@ -3435,7 +3463,7 @@ describe("AIO-1170 deferred DH/F2 packet: application traversals through real di
     // EARLY wakes inside that deadline: zero history HTTP, and the target's progress unchanged.
     const early: Invocation[] = [await invoke(seed, integrationId, fake, provider, { allowanceMs, paced: false })];
     if (lane === "historical") early.push(await invoke(seed, integrationId, fake, provider, { allowanceMs, paced: false }));
-    const afterEarly = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    const afterEarly = await packetRow(seed.teamId, CHANNEL);
     // Every later continuation is past its TTL.
     while (provider.requests.length < EXPIRY_PROGRAM.length && invocations.length < EXPIRY_PROGRAM.length * 2 + 4) {
       await record(await invoke(seed, integrationId, fake, provider, { allowanceMs }));
@@ -3532,7 +3560,7 @@ describe("AIO-1170 deferred DH/F2 packet: application traversals through real di
     while (provider.requests.length < expectedRequests && invocations.length < expectedRequests + 2) {
       // The changed setting applies from the second wake on; it must not move the frozen L.
       invocations.push(await invoke(seed, integrationId, fake, provider, { allowanceMs: invocations.length === 0 ? initialAllowanceMs : 500 }));
-      rows.push(await channelRow(seed.teamId, WORKSPACE, CHANNEL));
+      rows.push(await packetRow(seed.teamId, CHANNEL));
     }
     const outcomes = outcomesOf(invocations);
     return {
@@ -3594,13 +3622,13 @@ describe("AIO-1170 deferred DH/F2 packet: application traversals through real di
         where team_id = $1 and workspace_id = $2 and channel_id = $3`,
       [adequate.seed.teamId, WORKSPACE, CHANNEL]
     );
-    const staged = await channelRow(adequate.seed.teamId, WORKSPACE, CHANNEL);
+    const staged = await packetRow(adequate.seed.teamId, CHANNEL);
     expect({
       lowerIsCertifiedTop: staged?.newest_lower_ts === staged?.completed_upper_ts,
-      uninitialized: staged?.newest_request_lower_ts === null && staged?.newest_segment_lower_ts === null && staged?.newest_cursor === null,
+      uninitialized: staged?.newest_request_lower_ts === null && staged?.newest_segment_lower_ts === null && staged?.newest_cursor_null === true,
     }, "fixture: the next envelope is anchored at 103 over the certified top 102, not yet initialized").toEqual({ lowerIsCertifiedTop: true, uninitialized: true });
     const next = await invoke(adequate.seed, adequate.integrationId, adequate.fake, adequate.provider, { allowanceMs: 500 });
-    const after = await channelRow(adequate.seed.teamId, WORKSPACE, CHANNEL);
+    const after = await packetRow(adequate.seed.teamId, CHANNEL);
     const request = adequate.provider.requests[6];
     expect({
       request: request === undefined ? null : wireOf(request),
