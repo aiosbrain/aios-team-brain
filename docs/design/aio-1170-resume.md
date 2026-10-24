@@ -2,9 +2,51 @@
 
 Last updated: 2026-10-24. The newest current-state section governs. Older sections are preserved as historical stop records and may describe gates that have since been cleared. This is the tracked recovery record for draft [PR 714](https://github.com/aiosbrain/aios-team-brain/pull/714), targeting `staging`. It does not claim AC-02 or AIO-1170 complete.
 
+## Current state — 2026-10-24, the 11 guards: permanent discriminators and labeled rerun
+
+This section governs. It supersedes the campaign section below on the 11 guards, §11 status and the sequence; that section remains the historical campaign record.
+
+- **Checkpoint:** exact clean local, remote and PR 714 code checkpoint `a6d9a1ad9f63d4c5dc441f109a0fa4629497fcd1`. Branch `codex/aio-1170-resume-20261005`, remote `origin/codex/aio-1170-slack-timeline`, PR 714 draft to `staging`.
+- **Permanent discriminators:** history-progress packet 8 adds nine real-PostgreSQL tests on constructed, CHECK-valid literals. They are not provider traversals. The harness maps each of the 11 guards to an exact packet-8 title and intended-diff fragment; the one-site substitutions are unchanged.
+- **Labeled rerun `guards-11-permanent-v3`, run `2026-10-24T18-05-35-408Z-6265`:** exit 0, status `all_available_killed`.
+  - 57/57 inventory mutants KILLED, including the 11 formerly unavailable rows; 0 unavailable, 0 survived, 0 inconclusive.
+  - Baseline and restored suites: unit 100/100; PostgreSQL 304/304 accounting (303 ordinary passes + 1 expected failure). Baseline and restored test-name digests are identical.
+  - Canonical source restoration was exact, and the tracked tree was clean after the restored suites. Source SHA-256: state `8af4c51c2741d93a9d2f29bec70dfbe5c4599faaa5eb1f8e0157cadc9784641b`; segments `cc839ab02d46eb44f993126011d9579f034b03d7fa0d7c94ef1e59979dd717d1`; discovery `100dc5ae778c0e5b522efed2d43ea662e5965cd0e6c207e1e535731406d62859`.
+  - Raw evidence directory: `.context/aio-1170-resume/aio1170-deep-history-runtime-mutants/2026-10-24T18-05-35-408Z-6265/`. In it, `status.json` has SHA-256 `16806f614bf660666b756c3c3908ccd474e6a476b6972c23adbd6f581d3566d1` and `summary.md` has SHA-256 `e38cbd5c92854de3cdfd0134081ac9e5872e3f191b0e3d74405beca47bc1625a`. The raw artifacts are ignored and local-only, not remotely backed up.
+  - Harness `.context/aio-1170-resume/run-aio1170-deep-history-runtime-mutants.mjs`, SHA-256 `b550854058b9fee05c405ffa1409e6799ebef9c043299423cc91078b2b7e20f5`.
+- **Reviews:**
+  - Fresh Opus affected review (session `2b3c1f07-c59c-4271-8c3f-c7254ffcb09b`): READY, no blocker, HIGH or MEDIUM. Its one material ledger LOW is fixed in the final checkpoint.
+  - Mandatory exact-dispatch `gpt-6.1-sol` HIGH pre-push review: PASS, no actionable findings. The runtime exposed the GPT-6 family but no independently inspectable exact alias, so the dispatch metadata remains the exact-model evidence.
+- **Fresh Astra HIGH post-run adjudication:**
+  - `11 formerly unavailable rows: ACCEPTED` (closed).
+  - The bounded 57-row executed inventory: ACCEPTED.
+  - `entire accepted §11 matrix: NOT ACCEPTED as complete`.
+- **Remaining accepted work, with no waiver or expansion:**
+  1. Product-level progress and convergence falsifiers:
+     - a width-two, page-size-one real application traversal through discovery and state, with exactly three requests, literal bounds and one queue entry per root;
+     - DH-03 expiry convergence;
+     - DH-10 attribution of the margin through subdivision.
+  2. C2: its evidence proves only the reviewed no-op enqueue mutation (an omitted enqueue lets a provisional acceptance commit without roots). It is NOT evidence of commit after an actual enqueue failure. Literal enqueue-failure/atomicity mutation evidence, or an explicit evidence-backed equivalence adjudication, remains.
+  3. Deferred isolated DH/F2 acceptance:
+     - wide byte-cap and wide lone-surrogate subdivisions;
+     - newest-lane acceptance subdivision, and newest inner-terminal and certification behavior;
+     - bound-aware fake HTTP through real discovery and state on both lanes above 1,001 continuations;
+     - transport surrogate and expiry convergence;
+     - exact seams, queue completeness and PA-3 margin survival.
+
+     Every other ledger-deferred category, the schema campaign evidence and the held gates are preserved.
+  4. MR-06 composition and the final retest stay held until PR 743 establishes its staging checkpoint. The final Opus, fresh Astra HIGH and blind exact Sol HIGH reviews follow on the complete composed snapshot.
+- **Sequence (governing):**
+  1. This docs-only diff: its review and checks; then commit, push, an independent remote SHA readback, and the PR 714 readback.
+  2. Next finite packet: the product-level progress/convergence falsifiers (item 1) together with the remaining deferred isolated DH/F2 cases (item 3).
+  3. Then C2 literal enqueue-failure attribution (item 2).
+  4. MR-06 composition and final retest, held separately (item 4); then the final reviews on the complete composed snapshot.
+- **Capacity at this record:** 8% five-hour / 44% seven-day, subscription auth, overage unused/off, no API key.
+- **Held gates:** no activation, wiring, PR 743 edit, live P1/P2 certification, merge or deployment is approved.
+
 ## Current state — 2026-10-24, controlled runtime mutation campaign
 
-This section is newer than the packet-7 section below and supersedes its "exact next stage" bullet. This newest section clarifies the governing order (**Sequence**, at the end of this section). Interim whole-scope reviews may run before MR-06. The final reviews remain after all 11 UNAVAILABLE guards are resolved or adjudicated, and after MR-06 composition and the final retest on the post-PR 743 staging snapshot.
+The newer section above supersedes this section's 11-guard status, §11 status, final-completion list and sequence. This section is kept as the historical campaign record. When written, it was newer than the packet-7 section below and superseded that section's "exact next stage" bullet.
 
 - **Checkout:** HEAD stayed at the local and remote checkpoint `a8d228266e97df73ed302d15850d5e654216ad6a`. The tracked tree was clean at the start of each run. During each mutant, the harness deliberately wrote exactly one tracked source file under its lock, and every phase restored the exact canonical bytes. Each run ended canonical and tracked-clean after its restored suites. Branch `codex/aio-1170-resume-20261005`, remote `origin/codex/aio-1170-slack-timeline`, PR 714 draft to `staging`.
 - **Harness:** the ignored, reviewed harness `.context/aio-1170-resume/run-aio1170-deep-history-runtime-mutants.mjs`.
@@ -31,7 +73,7 @@ This section is newer than the packet-7 section below and supersedes its "exact 
     - discovery `100dc5ae778c0e5b522efed2d43ea662e5965cd0e6c207e1e535731406d62859`.
   - The restored suites passed: unit 100/100, and isolated PostgreSQL 294 pass + 1 expected fail = 295. The JSON reporter counts the expected fail as passed, so it reports 295/295. Their test-name digests matched the initial baselines.
   - Raw final evidence: `.context/aio-1170-resume/aio1170-deep-history-runtime-mutants/2026-10-24T16-35-20-226Z-80970/`. It is ignored and local-only, and is not remotely backed up.
-- **11 UNAVAILABLE guards, honest and neither accepted nor waived:** `P2b-writer-next-upper-is-S`, `P3c-writer-float-subdivision`, `P3d-writer-float-restart`, `P4c-writer-full-remainder`, `P4d-writer-nonadjacent`, `S1a-writer-complete-on-inner-terminal`, `S3a-clear-aggregate-on-subdivision`, `A3-evict-before-membership`, `FN13-newest-request-lower`, `FN14-newest-logical-lower`, `FN16-claim-binding-integration`.
+- **11 UNAVAILABLE guards at the time of this campaign (since closed: see the section above), honest and neither accepted nor waived then:** `P2b-writer-next-upper-is-S`, `P3c-writer-float-subdivision`, `P3d-writer-float-restart`, `P4c-writer-full-remainder`, `P4d-writer-nonadjacent`, `S1a-writer-complete-on-inner-terminal`, `S3a-clear-aggregate-on-subdivision`, `A3-evict-before-membership`, `FN13-newest-request-lower`, `FN14-newest-logical-lower`, `FN16-claim-binding-integration`.
 - **§11 remains OPEN.** The campaign closes only the rows that are currently AVAILABLE.
 - **Retained nonblocking review LOWs:**
   - C2's intended evidence keys only on `"thrown": true`;
@@ -39,14 +81,14 @@ This section is newer than the packet-7 section below and supersedes its "exact 
   - a permanent at-cap case that repeats H[0] could make A3 discriminating.
 - **Capacity, latest before the post-campaign writer stage:** 3% five-hour / 43% seven-day, subscription auth, no API key. No worker is active after this documentation turn.
 - **Final completion still requires all of:**
-  - each of the 11 UNAVAILABLE guards receives either a permanent discriminating test or an explicit Astra adjudication;
+  - each of the 11 UNAVAILABLE guards receives either a permanent discriminating test or an explicit Astra adjudication (done: see the section above);
   - MR-06 composition and the final retest, after PR 743 establishes its staging checkpoint;
   - the required re-reviews and final checks on that post-MR-06 stable snapshot.
-- **Sequence (governing; clarifies interim versus final review order):**
+- **Sequence (historical; clarifies interim versus final review order):**
   1. This docs-only diff: a fresh Opus review, an exact GPT-6.1 Sol HIGH pre-push review, and the diff, docs and skill checks.
   2. Commit and push, then readback: an independent remote SHA readback, and PR 714 read back as open, draft, base `staging`, with its body marker and attestation.
   3. If useful, INTERIM whole-scope reviews and adjudication on the current isolated snapshot: a fresh Opus completeness review, a fresh Astra HIGH review and a blind exact GPT-6.1 Sol HIGH review. These are completeness/adjudication reviews only. They cannot close §11, MR-06, AIO-1170 or AC-02, and no PASS from them is a final approval.
-  4. Resolve all 11 UNAVAILABLE guards, and complete MR-06 composition and the final retest after PR 743's staging checkpoint.
+  4. Resolve all 11 UNAVAILABLE guards (done: see the section above), and complete MR-06 composition and the final retest after PR 743's staging checkpoint.
   5. The final re-reviews and final checks on that post-MR-06 stable snapshot.
 - **Held gates:** no activation, wiring, PR 743 edit, merge or deploy.
 
