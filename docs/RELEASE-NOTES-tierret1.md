@@ -178,22 +178,37 @@ claimed for this release — the existing partition suites and the HTTP Graphiti
 
 ## Timeline cache — rollback and roll-forward
 
-- Rows now live under a NEW key namespace `adm:<class>:<tier>:<hash>` at payload version **16** (15 is
-  reserved by the pending Slack-semantics change). Previous code reads only `vis:<tier>:<hash>` rows, so
-  **rolling back cannot serve or salvage the wider new rows** — no purge is needed for rollback safety.
-  The old `vis:` rows are never read by the new code and may be deleted at leisure for space.
-- **MANDATORY before rolling FORWARD again after any rollback:** the old code cannot maintain `adm:` rows
-  (a reclassification during the rollback window leaves them stale), so delete them before the new build
-  serves requests:
+- Rows live under the key namespace `adm:<class>:<tier>:<hash>`, written at payload version **17**.
+  TIERRET-1 alone introduced the namespace at version 16 and reserved 15 for the Slack-semantics change
+  (PR #714); integrating that change took 17 and left 15 unused. A version-17 row is also stamped with
+  the team's Slack generations and the reader's item fingerprint, and this build serves or salvages a row
+  only when its version and both stamps match.
+- **Rolling back** — what the older build does with these rows depends on which build it is:
+  - *Pre-TIERRET code* reads only `vis:<tier>:<hash>` rows, so it **cannot serve or salvage the wider
+    `adm:` rows** — no purge is needed for rollback safety.
+  - *The TIERRET-1-only build (version 16)* reads the SAME `adm:` namespace. It serves only exact
+    version-16 rows, so a version-17 row is a miss and is rebuilt in place. Its synopsis salvage is
+    same-key with a floor of 11 and no stamp check, so that rebuild may carry a version-17 row's
+    per-person-day summaries (up to 48 hours old). The key is the same admission class, posture and grant
+    hash, so this never reaches another reader's row. To roll back without that carry, run the delete
+    below before the older build serves.
+
+  The old `vis:` rows are never read by this build and may be deleted at leisure for space.
+- **MANDATORY before rolling FORWARD again after any rollback:** neither older build keeps version-17
+  rows valid. Pre-TIERRET code cannot see `adm:` rows at all (a reclassification during the rollback
+  window leaves them stale). The version-16 build purges them on reclassification but has no Slack
+  generations to advance, so a version-17 row it did not rebuild still matches its stamps after a Slack
+  identity link or unlink made during the window. Delete them before the new build serves requests:
 
   ```sql
   delete from work_timeline_cache where group_key like 'adm:%';
   ```
 
   (Code equivalent: `lib/dashboard/timeline-cache.purgeAdmissionTimelineNamespace`, which also drops the
-  process-local copies; a fresh deploy starts with empty process caches.) Do not rely on TTL or on the
-  payload version for this.
-- A code rollback restores the old restrictive member filters and the old placement gate. It does not
+  process-local copies; a fresh deploy starts with empty process caches.) Do not rely on TTL, on the
+  payload version or on the stamps for this.
+- A code rollback to pre-TIERRET code restores the old restrictive member filters and the old placement
+  gate (a rollback to the version-16 build keeps the membership-only rules of this release). It does not
   retract content already read, and it may hide intentionally granted content again. Grants, labels and
   memberships are untouched either way.
 

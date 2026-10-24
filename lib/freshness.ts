@@ -59,18 +59,24 @@ export interface Freshness {
  *
  * `stale` is DERIVED here rather than passed in so the age→stale rule can't be spelled differently by
  * each caller — the drift shape that made "is this task active" five different predicates (H6).
+ *
+ * `opts.stale` is the ONE exception, and it only ever ADDS staleness: a producer that knows a young
+ * payload is already behind its source (the timeline cache serving a row whose Slack data or
+ * presentation generation lags) says so here, rather than hand-building an envelope beside this
+ * function. It can never declare a payload past its TTL fresh — `false` and absent both leave the
+ * age rule alone.
  */
 export function freshness(
   computedAt: number,
   ttlMs: number,
-  opts: { now?: number; degraded?: boolean } = {}
+  opts: { now?: number; degraded?: boolean; stale?: boolean } = {}
 ): Freshness {
   const now = opts.now ?? Date.now();
   // A non-finite `computed_at` (an unparseable row) is treated as INFINITELY old rather than as `now`.
   // The alternative — defaulting to now — would report a row we can't date as fresh, which is the exact
   // class of lie this module exists to remove.
   const at = Number.isFinite(computedAt) ? computedAt : 0;
-  return { computedAt: at, stale: now - at >= ttlMs, degraded: opts.degraded === true };
+  return { computedAt: at, stale: opts.stale === true || now - at >= ttlMs, degraded: opts.degraded === true };
 }
 
 /** An envelope for something computed right now, inline, with nothing cached behind it. */

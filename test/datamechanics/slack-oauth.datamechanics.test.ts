@@ -7,6 +7,7 @@ import { GET as statusGET } from "@/app/api/auth/slack/status/route";
 import { issueApiKey } from "@/lib/admin/keys";
 import { getMemberSecret } from "@/lib/member-secrets/manage";
 import { createSlackOAuthState, consumeSlackOAuthState } from "@/lib/auth/slack-oauth-state";
+import { removeMemberIdentity, setMemberIdentity } from "@/lib/identity/member-identities";
 import { db, seedTeam, type Seed } from "./helpers";
 
 // One-click Slack OAuth (start → callback → status), real handlers + real Postgres. Pins the
@@ -165,6 +166,29 @@ describe("one-click Slack OAuth (start/callback/status, real Postgres)", () => {
       .eq("member_id", owner.memberId)
       .single();
     expect((row as { secret_ciphertext: string }).secret_ciphertext).not.toContain(token);
+  });
+
+  it("callback saves the token but does not let the owner clear an admin's unlink", async () => {
+    // AIO-1170 review P2-03, ruled by Chetan 2026-09-21: the OAuth twin of the slack-token route test. An admin's
+    // unlink stays in force until an ADMIN relinks; the owner connecting their own Slack is a credential operation
+    // that reports the identity as pending instead of silently undoing the admin's decision.
+    const seed = await seedTeam();
+    const owner = await memberWithKey(seed);
+    await setMemberIdentity(db(), seed.teamId, owner.memberId, { provider: "slack", externalId: "U0FENCEDO" });
+    expect((await removeMemberIdentity(db(), seed.teamId, { provider: "slack", externalId: "U0FENCEDO" })).removed).toBe(true);
+    const state = await createSlackOAuthState(db(), seed.teamId, owner.memberId);
+    const token = mockSlack({ userId: "U0FENCEDO" });
+
+    const res = await callbackReq({ code: "good-code", state });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("identity pending"); // not the "Slack connected" success page
+    expect(html).toContain("unlinked");
+    expect(html).not.toContain(token);
+    expect((await getMemberSecret(db(), seed.teamId, owner.memberId, "slack"))?.secret).toBe(token); // credential kept
+    const { data: mapped } = await db().from("member_identities").select("member_id")
+      .eq("team_id", seed.teamId).eq("provider", "slack").eq("external_id", "U0FENCEDO");
+    expect(mapped).toEqual([]); // no mapping recreated
   });
 
   it("callback rejects a tampered/garbage state and stores nothing", async () => {

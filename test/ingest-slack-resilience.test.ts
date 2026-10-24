@@ -577,3 +577,235 @@ describe("SlackClient.threadExists — the deletion confirmation", () => {
     }
   });
 });
+
+/**
+ * AIO-1170 AC-07 (DIR-01, DIR-06): `usersDetailed` keeps Slack's five classification facts, and keeps
+ * them HONEST.
+ *
+ * A directory record says whether an account is a bot, an app user, deleted, a guest or a
+ * single-channel guest. Those facts decide whether an account may be linked to a person automatically,
+ * so the one thing this projection must never do is invent a `false`: a flag Slack did not send as a
+ * literal boolean is UNKNOWN, and unknown is not "human". The projection also has to survive a
+ * malformed entry without losing the valid people beside it, and without becoming a second request.
+ */
+describe("SlackClient.usersDetailed — classification projection (AC-07)", () => {
+  const FLAGS: [provider: string, projected: string][] = [
+    ["is_bot", "isBot"],
+    ["is_app_user", "isAppUser"],
+    ["deleted", "deleted"],
+    ["is_restricted", "isRestricted"],
+    ["is_ultra_restricted", "isUltraRestricted"],
+  ];
+  const PROJECTED_KEYS = ["id", "displayName", "email", ...FLAGS.map(([, projected]) => projected)];
+  type Projected = Record<string, unknown>;
+  type Page = { members?: unknown; cursor?: string } | { error: string };
+
+  /** `users.list`, one page per call. Anything else — another method, another host — fails the test. */
+  async function directory(pages: Page[]): Promise<{ users: Projected[]; requests: URL[] }> {
+    const requests: URL[] = [];
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async (input: unknown) => {
+      const url = new URL(String(input));
+      requests.push(url);
+      if (url.origin !== "https://slack.com" || url.pathname !== "/api/users.list") {
+        throw new Error(`fixture: unexpected request to ${url.origin}${url.pathname}`);
+      }
+      const page = pages[requests.length - 1];
+      if (!page) throw new Error("fixture: more users.list pages were requested than the provider has");
+      const body = "error" in page
+        ? { ok: false, error: page.error }
+        : { ok: true, members: page.members, response_metadata: page.cursor ? { next_cursor: page.cursor } : {} };
+      return { ok: true, status: 200, json: async () => body };
+    }) as unknown as typeof fetch;
+    try {
+      const users = (await new SlackClientCtor("xoxb-synthetic-directory").usersDetailed()) as unknown as Projected[];
+      return { users, requests };
+    } finally {
+      globalThis.fetch = orig;
+    }
+  }
+
+  /** Semantic unknown: an omitted key and an own `undefined` are the same thing to a reader. */
+  function expectFlags(user: Projected | undefined, expected: Record<string, boolean | undefined>): void {
+    expect(user, "the record is in the directory").toBeDefined();
+    for (const [, projected] of FLAGS) {
+      expect(user?.[projected], `${String(user?.id)}.${projected}`).toBe(expected[projected]);
+    }
+  }
+  const byId = (users: Projected[], id: string): Projected | undefined => users.find((user) => user.id === id);
+  const allFalse = { is_bot: false, is_app_user: false, deleted: false, is_restricted: false, is_ultra_restricted: false };
+  const allTrue = { is_bot: true, is_app_user: true, deleted: true, is_restricted: true, is_ultra_restricted: true };
+
+  it("DIR-01 retains all five facts as literal booleans, across two pages, in directory order", async () => {
+    const { users, requests } = await directory([
+      { cursor: "page-2", members: [
+        { id: "U0HUMAN1", name: "alice", profile: { display_name: "Alice", email: "alice@roster.test" }, ...allFalse },
+        { id: "U0BOT1", name: "deploybot", profile: { real_name: "Deploy Bot", email: "bot@roster.test" }, ...allFalse, is_bot: true },
+        { id: "U0APP1", real_name: "Connected App", profile: {}, ...allFalse, is_app_user: true },
+      ] },
+      { members: [
+        { id: "U0GUEST1", name: "guest", profile: { display_name: "Guest", email: "guest@roster.test" }, ...allFalse, is_restricted: true },
+        { id: "U0SINGLE1", name: "single", profile: { email: "single@roster.test" }, ...allFalse, is_restricted: true, is_ultra_restricted: true },
+        { id: "U0GONE1", name: "former", ...allFalse, deleted: true },
+        { id: "U0EVERY1", name: "everything", ...allTrue },
+      ] },
+    ]);
+
+    // One paginated `users.list` pass and nothing else: no second method, no extra request.
+    expect(requests.map((url) => url.pathname)).toEqual(["/api/users.list", "/api/users.list"]);
+    expect(requests.map((url) => url.searchParams.get("cursor"))).toEqual([null, "page-2"]);
+    expect(requests.map((url) => url.searchParams.get("limit"))).toEqual(["200", "200"]);
+
+    expect(users.map((user) => user.id)).toEqual(["U0HUMAN1", "U0BOT1", "U0APP1", "U0GUEST1", "U0SINGLE1", "U0GONE1", "U0EVERY1"]);
+    const none = { isBot: false, isAppUser: false, deleted: false, isRestricted: false, isUltraRestricted: false };
+    expectFlags(byId(users, "U0HUMAN1"), none);
+    expectFlags(byId(users, "U0BOT1"), { ...none, isBot: true });
+    expectFlags(byId(users, "U0APP1"), { ...none, isAppUser: true });
+    expectFlags(byId(users, "U0GUEST1"), { ...none, isRestricted: true });
+    expectFlags(byId(users, "U0SINGLE1"), { ...none, isRestricted: true, isUltraRestricted: true });
+    expectFlags(byId(users, "U0GONE1"), { ...none, deleted: true });
+    expectFlags(byId(users, "U0EVERY1"), { isBot: true, isAppUser: true, deleted: true, isRestricted: true, isUltraRestricted: true });
+
+    // Bot/app records stay in the directory with their names and email: transcripts still need them.
+    expect(users.map(({ id, displayName, email }) => ({ id, displayName, email }))).toEqual([
+      { id: "U0HUMAN1", displayName: "Alice", email: "alice@roster.test" },
+      { id: "U0BOT1", displayName: "Deploy Bot", email: "bot@roster.test" },
+      { id: "U0APP1", displayName: "Connected App", email: undefined },
+      { id: "U0GUEST1", displayName: "Guest", email: "guest@roster.test" },
+      { id: "U0SINGLE1", displayName: "single", email: "single@roster.test" },
+      { id: "U0GONE1", displayName: "former", email: undefined },
+      { id: "U0EVERY1", displayName: "everything", email: undefined },
+    ]);
+  });
+
+  // A value that is not a literal boolean is unknown. It is never coerced, parsed or defaulted.
+  const NOT_A_BOOLEAN: [string, unknown][] = [
+    ["null", null], ["0", 0], ["an empty string", ""], ['"false"', "false"], ['"true"', "true"], ["1", 1],
+    ["an array", []], ["an object", {}],
+  ];
+
+  it.each(FLAGS)("DIR-01 leaves %s unknown unless Slack sent a literal boolean, and keeps its siblings exact", async (provider, projected) => {
+    const absent: Record<string, unknown> = { ...allTrue };
+    delete absent[provider];
+    const members = [
+      { id: "U0ABSENT", name: "absent", ...absent },
+      ...NOT_A_BOOLEAN.map(([, value], index) => ({ id: `U0WRONG${index}`, name: `wrong-${index}`, ...allTrue, [provider]: value })),
+      // Controls: the same record with the flag as each literal boolean.
+      { id: "U0TRUE", name: "true", ...allFalse, [provider]: true },
+      { id: "U0FALSE", name: "false", ...allTrue, [provider]: false },
+    ];
+    const { users } = await directory([{ members }]);
+    expect(users.map((user) => user.id)).toEqual(members.map((member) => member.id));
+
+    const everyTrue = Object.fromEntries(FLAGS.map(([, key]) => [key, true as boolean | undefined]));
+    const everyFalse = Object.fromEntries(FLAGS.map(([, key]) => [key, false as boolean | undefined]));
+    expectFlags(byId(users, "U0ABSENT"), { ...everyTrue, [projected]: undefined });
+    NOT_A_BOOLEAN.forEach(([label], index) => {
+      const user = byId(users, `U0WRONG${index}`);
+      expect(user?.[projected], `${provider} = ${label}`).toBeUndefined();
+      // The four siblings are untouched by one unreadable flag.
+      expectFlags(user, { ...everyTrue, [projected]: undefined });
+    });
+    expectFlags(byId(users, "U0TRUE"), { ...everyFalse, [projected]: true });
+    expectFlags(byId(users, "U0FALSE"), { ...everyTrue, [projected]: false });
+  });
+
+  it("DIR-01 reads only the top-level fields: a look-alike nested in `profile` is not a classification", async () => {
+    const decoys = { is_bot: false, is_app_user: false, deleted: false, is_restricted: false, is_ultra_restricted: false };
+    const { users } = await directory([{ members: [
+      { id: "U0DECOY", name: "decoy", profile: { email: "decoy@roster.test", ...decoys } },
+      { id: "U0MIXED", name: "mixed", is_bot: true, profile: { email: "mixed@roster.test", is_bot: false, is_app_user: false } },
+      { id: "U0NOPROFILE", name: "bare" },
+      // Control: a top-level record beside them projects normally.
+      { id: "U0HUMAN1", name: "alice", profile: { email: "alice@roster.test", is_bot: true, is_app_user: true }, ...decoys },
+    ] }]);
+    const unknown = { isBot: undefined, isAppUser: undefined, deleted: undefined, isRestricted: undefined, isUltraRestricted: undefined };
+    expectFlags(byId(users, "U0DECOY"), unknown);
+    expectFlags(byId(users, "U0MIXED"), { ...unknown, isBot: true });
+    // A missing profile is a supported no-email record, not a classification and not an error.
+    expectFlags(byId(users, "U0NOPROFILE"), unknown);
+    expect(byId(users, "U0NOPROFILE")).toMatchObject({ id: "U0NOPROFILE", displayName: "bare" });
+    expect(byId(users, "U0NOPROFILE")?.email).toBeUndefined();
+    expectFlags(byId(users, "U0HUMAN1"), { isBot: false, isAppUser: false, deleted: false, isRestricted: false, isUltraRestricted: false });
+  });
+
+  it("DIR-01 keeps the display-name fallback order and returns no raw provider data", async () => {
+    const { users } = await directory([{ members: [
+      { id: "U0NAME1", name: "handle", real_name: "Top Real", profile: { display_name: "Display", real_name: "Profile Real", email: "one@roster.test" }, ...allFalse },
+      { id: "U0NAME2", name: "handle", real_name: "Top Real", profile: { display_name: "", real_name: "Profile Real" }, ...allFalse },
+      { id: "U0NAME3", name: "handle", real_name: "Top Real", profile: {}, ...allFalse },
+      { id: "U0NAME4", name: "handle", ...allFalse },
+      { id: "U0NAME5", ...allFalse, is_bot: true, is_admin: true, tz: "Etc/UTC", profile: { phone: "synthetic-phone", title: "synthetic-title", image_72: "synthetic-image" } },
+    ] }]);
+    expect(users.map(({ id, displayName, email }) => ({ id, displayName, email }))).toEqual([
+      { id: "U0NAME1", displayName: "Display", email: "one@roster.test" },
+      { id: "U0NAME2", displayName: "Profile Real", email: undefined },
+      { id: "U0NAME3", displayName: "Top Real", email: undefined },
+      { id: "U0NAME4", displayName: "handle", email: undefined },
+      { id: "U0NAME5", displayName: "U0NAME5", email: undefined },
+    ]);
+    expectFlags(byId(users, "U0NAME5"), { isBot: true, isAppUser: false, deleted: false, isRestricted: false, isUltraRestricted: false });
+    for (const user of users) {
+      for (const key of Object.keys(user)) expect(PROJECTED_KEYS, `${String(user.id)} carries ${key}`).toContain(key);
+    }
+    expect(JSON.stringify(users)).not.toMatch(/synthetic-phone|synthetic-title|synthetic-image|is_admin|Etc\/UTC/);
+  });
+
+  it("DIR-01 omits an entry with no usable id without aborting the valid records around it", async () => {
+    const { users, requests } = await directory([
+      { cursor: "page-2", members: [
+        null,
+        "U0BARESTRING",
+        42,
+        [],
+        { name: "no-id", profile: { email: "no-id@roster.test" }, ...allFalse },
+        { id: null, name: "null-id", ...allFalse },
+        { id: 1234567, name: "numeric-id", ...allFalse },
+        { id: true, name: "boolean-id", ...allFalse },
+        { id: { toString: () => "U0COERCED" }, name: "object-id", ...allFalse },
+        { id: ["U0ARRAY"], name: "array-id", ...allFalse },
+        { id: "", name: "empty-id", ...allFalse },
+        { id: "   ", name: "blank-id", ...allFalse },
+        { id: "U0VALID1", name: "first", profile: { email: "first@roster.test" }, ...allFalse },
+      ] },
+      { members: [
+        undefined,
+        { id: "\t", name: "tab-id", ...allFalse },
+        // A valid nonblank id is returned unchanged — outer whitespace and case included.
+        { id: " u0Padded ", name: "padded", ...allFalse, is_bot: true },
+        { id: "U0VALID2", name: "second", profile: { email: "second@roster.test" }, ...allFalse },
+      ] },
+    ]);
+    expect(requests).toHaveLength(2);
+    expect(users.map((user) => user.id)).toEqual(["U0VALID1", " u0Padded ", "U0VALID2"]);
+    expect(users.map((user) => user.email)).toEqual(["first@roster.test", undefined, "second@roster.test"]);
+    expectFlags(byId(users, " u0Padded "), { isBot: true, isAppUser: false, deleted: false, isRestricted: false, isUltraRestricted: false });
+    for (const user of users) expect(typeof user.id).toBe("string");
+    expect(JSON.stringify(users)).not.toMatch(/U0COERCED|U0ARRAY|U0BARESTRING|1234567/);
+  });
+
+  it("DIR-06 a late-page transient failure fails the whole directory — it is never a complete, classified result", async () => {
+    await expect(directory([
+      { cursor: "page-2", members: [{ id: "U0HUMAN1", name: "alice", profile: { email: "alice@roster.test" }, ...allFalse }] },
+      { error: "ratelimited" },
+    ])).rejects.toThrow(/ratelimited/);
+    await expect(directory([
+      { cursor: "page-2", members: [{ id: "U0HUMAN1", name: "alice", ...allFalse }] },
+      { error: "invalid_auth" },
+    ])).rejects.toThrow(/invalid_auth/);
+  });
+
+  it("DIR-06 a late-page missing scope keeps its existing partial result, classification intact", async () => {
+    const { users, requests } = await directory([
+      { cursor: "page-2", members: [
+        { id: "U0HUMAN1", name: "alice", profile: { email: "alice@roster.test" }, ...allFalse },
+        { id: "U0BOT1", name: "bot", ...allFalse, is_bot: true },
+      ] },
+      { error: "missing_scope" },
+    ]);
+    expect(requests).toHaveLength(2);
+    expect(users.map((user) => user.id)).toEqual(["U0HUMAN1", "U0BOT1"]);
+    expectFlags(byId(users, "U0HUMAN1"), { isBot: false, isAppUser: false, deleted: false, isRestricted: false, isUltraRestricted: false });
+    expectFlags(byId(users, "U0BOT1"), { isBot: true, isAppUser: false, deleted: false, isRestricted: false, isUltraRestricted: false });
+  });
+});

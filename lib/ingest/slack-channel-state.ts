@@ -1,0 +1,1578 @@
+import "server-only";
+import type { SqlQueryResult, TransactionSession } from "@/lib/db/types";
+import { parseSlackTimestamp } from "./sources/slack-message-evidence";
+import { scopedSlackChannelPathPrefix } from "./sources/slack-namespace";
+
+/**
+ * The single writer of `slack_sync_channels` — one channel's public proof, its two history scans,
+ * the ONE interval whose pages are certified read, and the lease that makes a bounded wake
+ * resumable (AIO-1170).
+ *
+ * ⚠️ WHAT A CLAIM PROVES. Ownership of one channel's next history request, under one lane, at one
+ * binding revision. It is not permission to publish, not proof the channel is still visible, and not
+ * a promise that the page it fetches may be stored — every one of those is re-checked at acceptance,
+ * while the row is locked.
+ *
+ * Five properties hold this module together:
+ *
+ *  1. IT NEVER OPENS A TRANSACTION. Every function takes the caller's `TransactionSession`, so the
+ *     acceptance — enqueue the roots, advance the frontier — is ONE commit. A caller must not hold
+ *     that transaction across the HTTP call; the orchestrator claims, commits, fetches, and only
+ *     then opens the acceptance transaction.
+ *  2. THE DATABASE IS THE CLOCK AND THE FENCE. Due-ness and lease expiry are `clock_timestamp()`
+ *     inside the statement's own `WHERE`. Every write matches the full scope AND the owner token AND
+ *     the lease generation AND an unexpired lease AND the claimed lane AND the lane's scan
+ *     generation AND its cursor AND the binding revision. Page acceptance (and its lock) also
+ *     matches the public proof, the binding integration and the lane's segment bounds
+ *     (`channelFence`). Zero rows means "you did not have the authority", returned as an explicit
+ *     outcome.
+ *  3. PROGRESS IS NOT CERTIFICATION. A partial page appends its cursor to the lane's SQL-local
+ *     history and moves nothing else. Only the genuinely terminal page of a scan's FINAL segment
+ *     replaces `completed_lower_ts`/`completed_upper_ts`, because absence
+ *     inside a certified interval is later evidence of deletion, and absence inside partial progress
+ *     is a hole we have simply not read yet.
+ *  4. TIMESTAMPS ARE COMPARED AS INTEGERS AND STORED AS BYTES. The shared parser's (seconds,
+ *     microseconds) pair decides which of two `ts` values is older; the STRING that gets stored is
+ *     the provider's original. A float comparison would erase the difference between `…000100` and
+ *     `…000101`, and a re-rendered string would mint an identity for a thread that does not exist.
+ *  5. NOTHING IS SWALLOWED. A SQL failure rejects. A refusal is `{ outcome: "refused" }` and NEVER
+ *     `{ ok: false }`, which `lib/db/pg/tx.ts` reads as a rollback signal — a caller returning one
+ *     of those straight out of its transaction would silently undo its own committed work.
+ *
+ * THE TWO LANES are documented on the table in `postgres/schema.sql`; the two rules that live HERE
+ * are what STARTS and what ENDS a scan.
+ *
+ *  • A scan ends when, and only when, the provider says `has_more: false`. There is no second,
+ *    locally-decided ending: a request we sent as "everything below this anchor" cannot be relabelled
+ *    as a completed interval after the fact just because the answer was inconveniently partial.
+ *  • The FIRST scan a channel ever runs is the HISTORICAL one, anchored at the DB clock and with no
+ *    lower bound — the accepted "initial anchored scan covers all provider-retained history". The
+ *    newest catch-up lane starts above that fixed anchor, and the two then alternate, so a partial
+ *    first page starves nothing: its continuation stays exactly where it was, as historical progress.
+ *
+ * A catch-up that completes while that initial scan is still draining has read a real interval that
+ * is NOT yet contiguous with anything certified, so it is recorded as `newest_catchup_upper_ts` —
+ * PROVISIONAL progress, deliberately a different column from `completed_*`. The two are joined into
+ * one certified interval when the historical scan finally reaches the retention floor.
+ */
+
+export type SlackScanLane = "newest" | "historical";
+export type SlackChannelPublicState = "unknown" | "public" | "private" | "unverifiable";
+
+/** Fully scoped identity of one channel's discovery state. `team_id` is a namespace above the ids. */
+export interface SlackChannelScope {
+  readonly teamId: string;
+  readonly workspaceId: string;
+  readonly channelId: string;
+}
+
+export interface SlackLaneState {
+  readonly anchorTs: string | null;
+  readonly lowerTs: string | null;
+  readonly cursor: string | null;
+  readonly scanGeneration: number;
+}
+
+export interface SlackChannelState {
+  readonly scope: SlackChannelScope;
+  readonly publicState: SlackChannelPublicState;
+  readonly publicCheckedAt: string | null;
+  readonly bindingIntegrationId: string | null;
+  readonly bindingConfigRevision: string | null;
+  readonly newest: SlackLaneState;
+  readonly historical: SlackLaneState;
+  readonly historicalOldestSeenTs: string | null;
+  readonly historicalFloorReached: boolean;
+  readonly completedLowerTs: string | null;
+  readonly completedUpperTs: string | null;
+  /** PROVISIONAL: fully read down to the initial anchor, but not yet contiguous with a certified interval. */
+  readonly newestCatchupUpperTs: string | null;
+  readonly metadataAttemptOwner: string | null;
+  readonly metadataAttemptGeneration: number;
+  readonly claimedLane: SlackScanLane | null;
+  readonly nextLane: SlackScanLane;
+  readonly leaseOwner: string | null;
+  readonly leaseGeneration: number;
+  readonly leaseExpiresAt: string | null;
+  readonly dueAt: string;
+  readonly attempts: number;
+  readonly lastErrorCode: string | null;
+  readonly lastReadAt: string | null;
+}
+
+/**
+ * What a successful claim hands back. A plain value, not a capability: the database re-checks every
+ * field of it on every write, so holding one proves nothing.
+ */
+export interface SlackChannelClaim {
+  readonly scope: SlackChannelScope;
+  readonly lane: SlackScanLane;
+  readonly leaseOwner: string;
+  readonly leaseGeneration: number;
+  readonly leaseExpiresAt: string;
+  readonly bindingConfigRevision: string;
+  readonly bindingIntegrationId: string;
+  /** The FROZEN upper bound of the scan this claim continues. */
+  readonly anchorTs: string;
+  /** The newest lane's overlap bound; null on a seed scan and on every historical scan. */
+  readonly lowerTs: string | null;
+  readonly cursor: string | null;
+  readonly scanGeneration: number;
+  /**
+   * The claimed lane's frozen request lower `L` (newest only; historical `L` is the implicit 0) and its
+   * active segment `[S, U]`. All three are null before the lane's segment is initialized. They are
+   * fence values like the cursor: acceptance refuses a claim whose segment has since moved.
+   */
+  readonly requestLowerTs: string | null;
+  readonly segmentLowerTs: string | null;
+  readonly segmentUpperTs: string | null;
+  readonly oldestSeenTs: string | null;
+  readonly completedLowerTs: string | null;
+  readonly completedUpperTs: string | null;
+  readonly newestCatchupUpperTs: string | null;
+}
+
+/**
+ * A claim that was ELIGIBLE but could not start, because the newest lane's first segment would be
+ * empty (L > A, §5). Nothing was leased and no request may be sent. The writer has already passed the
+ * turn and recorded the diagnostic; the caller reports this static result and moves on.
+ */
+export interface SlackChannelClaimDelay {
+  readonly outcome: "delayed";
+  readonly category: "scan_bounds_invalid";
+  readonly detail: "The scan bounds are inconsistent; no provider request was sent.";
+}
+
+const SCAN_BOUNDS_INVALID: SlackChannelClaimDelay = {
+  outcome: "delayed",
+  category: "scan_bounds_invalid",
+  detail: "The scan bounds are inconsistent; no provider request was sent.",
+};
+
+/**
+ * Ownership of ONE metadata observation of one channel.
+ *
+ * ⚠️ IT IS AN ORDERING FENCE, NOT A LEASE. It does not stop a second observation from starting —
+ * `conversations.info` is metered per (team, workspace, APP), so two integrations running two apps in
+ * one workspace legitimately have two allowances and two reads in flight. What it stops is the older
+ * of those two answers being applied AFTER the newer one: starting an attempt bumps the generation,
+ * and only an acceptance carrying the current owner and generation may write a verdict. A dead
+ * attempt (a crashed pass) therefore blocks nothing — the next attempt simply supersedes it.
+ */
+export interface SlackChannelMetadataAttempt {
+  readonly scope: SlackChannelScope;
+  readonly owner: string;
+  readonly generation: number;
+}
+
+export type SlackChannelWrite =
+  | { readonly outcome: "written"; readonly state: SlackChannelState }
+  | { readonly outcome: "refused" };
+
+/** Why a continuation cursor was not admitted to its lane's SQL-local history (§3.2). */
+export type SlackHistoryAdmissionCategory =
+  | "cursor_repeated"
+  | "cursor_history_entries_exceeded"
+  | "cursor_history_bytes_exceeded"
+  | "cursor_unrepresentable";
+
+/**
+ * What one page acceptance did. None of these carries a cursor history.
+ *  · `written`: the page's progress was stored. `completion` is `segment` for a genuinely terminal
+ *    page of an inner segment and `envelope` for the one that finished the whole scan.
+ *  · `refused`: the claim's authority is gone. Nothing was written.
+ *  · `rejected`: the continuation was not admitted, and NOTHING was written. The caller must release
+ *    the claim in the same transaction (`releaseSlackChannelForRetry`, turn passed, category as the
+ *    error code) and enqueue no root from the page.
+ *  · `subdivided`: an over-cap or unrepresentable continuation on a range that can still be split.
+ *    The writer has already narrowed the segment AND released the claim; the caller enqueues no root
+ *    and releases nothing.
+ */
+export type SlackChannelPageAcceptance =
+  | { readonly outcome: "written"; readonly state: SlackChannelState; readonly completion?: "segment" | "envelope" }
+  | { readonly outcome: "refused" }
+  | { readonly outcome: "rejected"; readonly category: SlackHistoryAdmissionCategory }
+  | {
+      readonly outcome: "subdivided";
+      readonly category: Exclude<SlackHistoryAdmissionCategory, "cursor_repeated">;
+      readonly state: SlackChannelState;
+    };
+
+/** How long a claim owns a channel. One wake is bounded well below this; a crash frees it. */
+export const SLACK_CHANNEL_LEASE_MS = 120_000;
+
+const MIN_LEASE_MS = 1_000;
+const MAX_LEASE_MS = 900_000;
+const MAX_CURSOR_LENGTH = 1_024;
+/** The per-lane history caps (§3.1), both inclusive; bytes are `octet_length(candidate::text)`, in SQL. */
+const MAX_HISTORY_ENTRIES = 1_000;
+const MAX_HISTORY_BYTES = 1_048_576;
+const MICROS_PER_SECOND = BigInt(1_000_000);
+const ONE_TICK = BigInt(1);
+const TWO = BigInt(2);
+/** The newest lane's default skew allowance (PA-3), for callers that configure none. */
+const DEFAULT_SKEW_ALLOWANCE_MS = 60_000;
+/** The largest supported bound (§4), in microsecond ticks: 253402300799.999999. */
+const MAX_BOUND_TICKS = BigInt(253_402_300_799) * BigInt(1_000_000) + BigInt(999_999);
+/** An exact Slack/bound instant: integer seconds (at most 12 significant digits) and 1–6 fraction digits. */
+const EXACT_INSTANT = /^([0-9]+)\.([0-9]{1,6})$/;
+const ERROR_CODE = /^[a-z][a-z0-9_]{0,39}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const REVISION = /^[0-9a-f]{64}$/;
+
+/**
+ * The DB clock as an exact Slack timestamp string, for freezing a scan's upper bound.
+ *
+ * `statement_timestamp()`, not `clock_timestamp()`: the expression reads the clock twice (once for
+ * the seconds, once for the microseconds) and `clock_timestamp()` is free to advance between them,
+ * which could pair one second's integer part with the next second's fraction. Due-ness elsewhere
+ * still uses `clock_timestamp()` — that is one read, and it must not be stale.
+ */
+const CLOCK_ANCHOR_TS = `(floor(extract(epoch from statement_timestamp()))::bigint::text
+       || '.'
+       || lpad(((extract(microseconds from statement_timestamp())::bigint) % 1000000)::text, 6, '0'))`;
+
+/**
+ * The canonical bound spelling of an exact instant (§4), by TEXT operations only:
+ *  - seconds without leading zeroes (`0` if they are all zeroes);
+ *  - a dot;
+ *  - the fraction right-padded to exactly six digits.
+ * No numeric or float cast is involved, so nothing is rounded. Null in, null out. The input is
+ * already shape-checked by the table's timestamp rule; a malformed result would fail the progress
+ * CHECK rather than be stored. `expr` is always a column expression of this module, never a value.
+ */
+function canonicalBoundSql(expr: string): string {
+  return `(case when pg_catalog.ltrim(pg_catalog.split_part(${expr}, '.', 1), '0') = '' then '0'
+                else pg_catalog.ltrim(pg_catalog.split_part(${expr}, '.', 1), '0') end
+           || '.' || pg_catalog.rpad(pg_catalog.split_part(${expr}, '.', 2), 6, '0'))`;
+}
+
+/**
+ * The historical anchor a claim of that lane holds, from the row being updated: the existing anchor
+ * byte for byte, else the certified bottom made canonical, else the DB clock (already canonical).
+ */
+const HISTORICAL_CLAIM_ANCHOR = `coalesce(c.historical_anchor_ts, ${canonicalBoundSql("c.completed_lower_ts")}, ${CLOCK_ANCHOR_TS})`;
+
+/**
+ * The historical lane's segment tuple is the all-null INITIALIZATION shape (§4): no S and no U, and so
+ * no cursor, an empty history, and no attempt or aggregate oldest. The whole tuple is tested, never
+ * the cursor alone: an initialized segment may legitimately have a null cursor.
+ */
+const HISTORICAL_SEGMENT_UNINITIALIZED = `(c.historical_segment_lower_ts is null and c.historical_segment_upper_ts is null
+                  and c.historical_cursor is null and c.historical_cursor_history = '[]'::pg_catalog.jsonb
+                  and c.historical_oldest_seen_ts is null and c.historical_completed_segments_oldest_ts is null)`;
+
+const STATE_COLUMNS = `team_id, workspace_id, channel_id, binding_integration_id, binding_config_revision,
+       public_state, public_checked_at, newest_anchor_ts, newest_lower_ts, newest_cursor,
+       newest_scan_generation::text as newest_scan_generation, historical_anchor_ts, historical_cursor,
+       historical_scan_generation::text as historical_scan_generation, historical_oldest_seen_ts,
+       historical_floor_reached, completed_lower_ts, completed_upper_ts, newest_catchup_upper_ts,
+       metadata_attempt_owner, metadata_attempt_generation::text as metadata_attempt_generation,
+       claimed_lane, next_lane,
+       lease_owner, lease_generation::text as lease_generation, lease_expires_at, due_at, attempts,
+       last_error_code, last_read_at`;
+
+/**
+ * The small bound fields a CLAIM carries for its fence (§4: "a claim includes A, B, L, S, U, G, C").
+ * Deliberately not part of `STATE_COLUMNS`: every other reader keeps its projection unchanged, and no
+ * projection here ever selects a cursor history.
+ */
+const LANE_BOUND_COLUMNS = `newest_request_lower_ts, newest_segment_lower_ts, newest_segment_upper_ts,
+       historical_segment_lower_ts, historical_segment_upper_ts`;
+
+interface LaneBoundRow {
+  newest_request_lower_ts: string | null;
+  newest_segment_lower_ts: string | null;
+  newest_segment_upper_ts: string | null;
+  historical_segment_lower_ts: string | null;
+  historical_segment_upper_ts: string | null;
+}
+
+interface StateRow {
+  team_id: string;
+  workspace_id: string;
+  channel_id: string;
+  binding_integration_id: string | null;
+  binding_config_revision: string | null;
+  public_state: string;
+  public_checked_at: Date | string | null;
+  newest_anchor_ts: string | null;
+  newest_lower_ts: string | null;
+  newest_cursor: string | null;
+  newest_scan_generation: string;
+  historical_anchor_ts: string | null;
+  historical_cursor: string | null;
+  historical_scan_generation: string;
+  historical_oldest_seen_ts: string | null;
+  historical_floor_reached: boolean;
+  completed_lower_ts: string | null;
+  completed_upper_ts: string | null;
+  newest_catchup_upper_ts: string | null;
+  metadata_attempt_owner: string | null;
+  metadata_attempt_generation: string;
+  claimed_lane: string | null;
+  next_lane: string;
+  lease_owner: string | null;
+  lease_generation: string;
+  lease_expires_at: Date | string | null;
+  due_at: Date | string;
+  attempts: number | string;
+  last_error_code: string | null;
+  last_read_at: Date | string | null;
+}
+
+export class SlackChannelStateError extends TypeError {
+  constructor(message: string) {
+    super(`slack channel state: ${message}`);
+    this.name = "SlackChannelStateError";
+  }
+}
+
+const SCOPE_PREDICATE = `team_id = $1 and workspace_id = $2 and channel_id = $3`;
+
+function scopeParams(scope: SlackChannelScope): [string, string, string] {
+  return [scope.teamId, scope.workspaceId, scope.channelId];
+}
+
+/**
+ * Scope validation, reusing the namespace helper for its VERDICT on the id alphabet and discarding
+ * its lower-cased result: the row keeps the provider's bytes, exactly as `slack-thread-state` does.
+ */
+function assertScope(scope: SlackChannelScope): void {
+  if (typeof scope?.teamId !== "string" || !UUID.test(scope.teamId)) {
+    throw new SlackChannelStateError(`teamId must be a UUID (got ${JSON.stringify(scope?.teamId)})`);
+  }
+  scopedSlackChannelPathPrefix(scope.workspaceId, scope.channelId);
+}
+
+/** The older of two Slack instants, as its ORIGINAL string. Integer parts only — never a float. */
+export function olderSlackTs(a: string | null, b: string | null): string | null {
+  if (a === null) return b;
+  if (b === null) return a;
+  const left = parseSlackTimestamp(a);
+  const right = parseSlackTimestamp(b);
+  if (!left || !right) {
+    throw new SlackChannelStateError("cannot order a value that is not an exact Slack timestamp");
+  }
+  if (left.seconds !== right.seconds) return left.seconds < right.seconds ? a : b;
+  return left.micros <= right.micros ? a : b;
+}
+
+// ── reads ────────────────────────────────────────────────────────────────────
+
+/** Create the channel's state row if it is not there yet: unverified, unbound, immediately due. */
+export async function ensureSlackChannel(
+  session: TransactionSession,
+  scope: SlackChannelScope
+): Promise<{ inserted: boolean; state: SlackChannelState }> {
+  assertScope(scope);
+  const inserted = await session.executeSql<StateRow>(
+    `insert into slack_sync_channels (team_id, workspace_id, channel_id)
+          values ($1, $2, $3)
+     on conflict (team_id, workspace_id, channel_id) do nothing
+       returning ${STATE_COLUMNS}`,
+    scopeParams(scope)
+  );
+  const fresh = single(inserted);
+  if (fresh) return { inserted: true, state: toState(fresh) };
+
+  const existing = await session.executeSql<StateRow>(
+    `select ${STATE_COLUMNS} from slack_sync_channels where ${SCOPE_PREDICATE}`,
+    scopeParams(scope)
+  );
+  const row = single(existing);
+  if (!row) {
+    // The insert conflicted, so a row existed; its disappearance inside this transaction is an
+    // anomaly, not an empty result to paper over.
+    throw new SlackChannelStateError(
+      "ensure conflicted but the conflicting row is gone — refusing to report a state it does not have"
+    );
+  }
+  return { inserted: false, state: toState(row) };
+}
+
+/**
+ * This integration's selected channels, DUE FIRST. `(due_at, channel_id)` is a total order, so the
+ * round-robin is deterministic: a channel that was just read has the newest `due_at` and goes last,
+ * which is what keeps one busy channel from taking every request slot.
+ */
+export async function dueSlackChannels(
+  session: TransactionSession,
+  input: {
+    teamId: string;
+    workspaceId: string;
+    channelIds: readonly string[];
+    limit?: number;
+  }
+): Promise<SlackChannelState[]> {
+  const limit = input.limit ?? 50;
+  if (!Number.isSafeInteger(limit) || limit <= 0) {
+    throw new SlackChannelStateError(`limit must be a positive whole number (got ${JSON.stringify(limit)})`);
+  }
+  if (input.channelIds.length === 0) return [];
+  const result = await session.executeSql<StateRow>(
+    `select ${STATE_COLUMNS} from slack_sync_channels
+      where team_id = $1 and workspace_id = $2 and channel_id = any($3::text[])
+      order by due_at asc, channel_id asc
+      limit $4`,
+    [input.teamId, input.workspaceId, [...input.channelIds], limit]
+  );
+  return result.rows.map(toState);
+}
+
+// ── metadata ─────────────────────────────────────────────────────────────────
+
+/**
+ * OPEN a metadata observation of this channel, BEFORE the `conversations.info` request goes out.
+ *
+ * Opening one bumps the channel's metadata generation and takes ownership of it, which is what makes
+ * the answers orderable. Without it, "which verdict is newer?" has no answer at all: the responses
+ * are two independent HTTP calls that can complete in either order, and the config re-check the
+ * acceptance already does cannot see the difference — neither integration's configuration changed.
+ *
+ * It is deliberately unconditional on the public state and the binding: a channel is re-observed
+ * precisely because its stored verdict may be out of date, and WHO may write the verdict is checked
+ * at acceptance, where the current selection is re-read under its row lock.
+ */
+export async function beginSlackChannelMetadata(
+  session: TransactionSession,
+  scope: SlackChannelScope
+): Promise<SlackChannelMetadataAttempt | null> {
+  assertScope(scope);
+  const result = await session.executeSql<StateRow>(
+    `update slack_sync_channels
+        set metadata_attempt_owner = gen_random_uuid()::text,
+            metadata_attempt_generation = metadata_attempt_generation + 1,
+            updated_at = clock_timestamp()
+      where ${SCOPE_PREDICATE}
+  returning ${STATE_COLUMNS}`,
+    scopeParams(scope)
+  );
+  const row = single(result);
+  if (!row) return null;
+  const state = toState(row);
+  if (state.metadataAttemptOwner === null) {
+    throw new SlackChannelStateError("a metadata attempt came back without an owner — refusing it");
+  }
+  return { scope: state.scope, owner: state.metadataAttemptOwner, generation: state.metadataAttemptGeneration };
+}
+
+/**
+ * Persist a DEFINITIVE public-status verdict, and bind the channel to the integration that proved it.
+ *
+ * Only a validated `conversations.info` response reaches here. A transient 429/timeout/5xx must NOT
+ * call this at all: the last valid proof is the best information there is, and overwriting it with
+ * "unknown" on a blip would close a channel that is perfectly fine — while writing "public" on no
+ * evidence would open one that is not.
+ *
+ * TWO fences, and they answer different questions. The caller re-reads its integration row under a
+ * lock (is this still the configuration that asked?), and `attempt` is matched here (is this still
+ * the newest observation of this channel?). A rate limit answers neither: the `conversations.info`
+ * allowance is per (team, workspace, app), so two apps in one workspace are never serialized by it.
+ * Ownership is RELEASED on acceptance, so a duplicate delivery of the same response writes once.
+ */
+export async function recordSlackChannelPublicState(
+  session: TransactionSession,
+  scope: SlackChannelScope,
+  binding: { integrationId: string; configRevision: string },
+  attempt: SlackChannelMetadataAttempt,
+  input: { publicState: Exclude<SlackChannelPublicState, "unknown">; errorCode?: string | null }
+): Promise<SlackChannelWrite> {
+  assertScope(scope);
+  assertScope(attempt.scope);
+  if (
+    attempt.scope.teamId !== scope.teamId ||
+    attempt.scope.workspaceId !== scope.workspaceId ||
+    attempt.scope.channelId !== scope.channelId
+  ) {
+    throw new SlackChannelStateError("the metadata attempt belongs to a different channel");
+  }
+  if (!Number.isSafeInteger(attempt.generation) || attempt.generation <= 0) {
+    throw new SlackChannelStateError("a metadata attempt generation must be a positive whole number");
+  }
+  if (!UUID.test(binding.integrationId)) {
+    throw new SlackChannelStateError("binding.integrationId must be a UUID");
+  }
+  if (!REVISION.test(binding.configRevision)) {
+    throw new SlackChannelStateError("binding.configRevision must be a sha256 hex digest");
+  }
+  if (input.publicState !== "public" && input.publicState !== "private" && input.publicState !== "unverifiable") {
+    throw new SlackChannelStateError(`unknown public state ${JSON.stringify(input.publicState)}`);
+  }
+  assertErrorCode(input.errorCode);
+
+  const result = await session.executeSql<StateRow>(
+    `update slack_sync_channels
+        set public_state = $4,
+            public_checked_at = clock_timestamp(),
+            binding_integration_id = $5::uuid,
+            binding_config_revision = $6,
+            last_error_code = $7,
+            metadata_attempt_owner = null,
+            -- A definitive non-public observation revokes every in-flight history acceptance,
+            -- even if a later observation makes the channel public again before the page returns.
+            lease_owner = case when $4 = 'public' then lease_owner else null end,
+            lease_expires_at = case when $4 = 'public' then lease_expires_at else null end,
+            claimed_lane = case when $4 = 'public' then claimed_lane else null end,
+            lease_generation = case when $4 = 'public' then lease_generation else lease_generation + 1 end,
+            due_at = clock_timestamp(),
+            updated_at = clock_timestamp()
+      where ${SCOPE_PREDICATE}
+        and metadata_attempt_owner = $8
+        and metadata_attempt_generation = $9::bigint
+  returning ${STATE_COLUMNS}`,
+    [
+      ...scopeParams(scope),
+      input.publicState,
+      binding.integrationId,
+      binding.configRevision,
+      input.errorCode ?? null,
+      attempt.owner,
+      String(attempt.generation),
+    ]
+  );
+  return written(result);
+}
+
+/**
+ * Record a transient failure that happened OUTSIDE a claim (a delayed metadata read). It touches the
+ * category — never the public proof, never a frontier.
+ *
+ * `dueAt` is null when the caller must NOT move the not-before, and that is the normal case for a
+ * metadata failure: `due_at` gates the HISTORY lane, while a `conversations.info` cooldown is about
+ * a different method with its own budget. Pushing it here would let one flaky metadata recheck stop
+ * a channel from being read at all — a proof we could not refresh is still a proof.
+ */
+export async function delaySlackChannel(
+  session: TransactionSession,
+  scope: SlackChannelScope,
+  attempt: SlackChannelMetadataAttempt,
+  input: { dueAt: Date | null; errorCode: string }
+): Promise<SlackChannelWrite> {
+  assertScope(scope);
+  assertScope(attempt.scope);
+  if (attempt.scope.teamId !== scope.teamId || attempt.scope.workspaceId !== scope.workspaceId || attempt.scope.channelId !== scope.channelId) {
+    throw new SlackChannelStateError("the metadata attempt belongs to a different channel");
+  }
+  assertErrorCode(input.errorCode);
+  if (input.dueAt !== null) assertInstant("dueAt", input.dueAt);
+  const result = await session.executeSql<StateRow>(
+    `update slack_sync_channels
+        set due_at = coalesce($5::timestamptz, due_at),
+            last_error_code = $4,
+            metadata_attempt_owner = null,
+            updated_at = clock_timestamp()
+      where ${SCOPE_PREDICATE}
+        and metadata_attempt_owner = $6
+        and metadata_attempt_generation = $7::bigint
+  returning ${STATE_COLUMNS}`,
+    [...scopeParams(scope), input.errorCode, input.dueAt, attempt.owner, String(attempt.generation)]
+  );
+  return written(result);
+}
+
+// ── the lease ────────────────────────────────────────────────────────────────
+
+/**
+ * Claim this channel's next history request: pick the lane, freeze the scan's anchor if it is
+ * starting, give a lane that has no segment yet its first one, and take the lease.
+ *
+ * TWO statements, in the caller's transaction and under ONE row lock:
+ *  1. A locking read, under every ordinary eligibility predicate. It reads the lane and the bound
+ *     values the newest initialization needs. No row means not eligible: nothing is written.
+ *  2. Either the claim UPDATE, or the §5 `scan_bounds_invalid` bookkeeping.
+ *
+ * First segments (§5), set only for a lane whose whole segment tuple is still the all-null
+ * initialization shape:
+ *  - historical: `[0, canonical(A)]`;
+ *  - newest: `[L, canonical(A)]`, with request lower `L = max(0, B − skew allowance)`, computed in
+ *    exact microsecond ticks. A and B keep their bytes; only the bounds are canonical.
+ * An existing segment, however progressed, is resumed untouched whatever allowance is passed now.
+ *
+ * If a newest first segment would be empty (L > A), nothing is leased. The turn passes to historical,
+ * the diagnostic is recorded, due_at and updated_at move to the DB clock, and the typed
+ * `SlackChannelClaimDelay` is returned. No attempt, lease generation, anchor, progress or certificate
+ * moves; an anchor that already existed keeps its bytes. Stored bounds outside the supported exact
+ * domain fail closed with a static error that quotes no value.
+ *
+ * The lane rule, and why it is here rather than in a caller: the newest lane is always pending
+ * (there is always more "now"), the historical lane is pending until it reaches the retention floor
+ * AND has a boundary to start from, and `next_lane` is PERSISTED so an empty lane lends its slot
+ * without losing its turn. A caller that recomputed the lane per invocation would hand every slot to
+ * the same lane and starve the other forever, which is exactly the failure this column prevents.
+ *
+ * The one lane the rule OVERRIDES `next_lane` for is the first scan a channel ever runs. It is the
+ * historical one, anchored at the DB clock, because there is nothing yet for a catch-up to be "above"
+ * — and that is also this statement's guarantee that a newest scan always has a lower bound: it can
+ * only start once a certified top, a provisional catch-up top or an initial anchor exists, and none
+ * of those three ever goes back to being absent.
+ *
+ * `null` means NOT CLAIMED: not due, not public, not bound to the CURRENT revision, or somebody's
+ * lease is still live. It can never mean a failed statement — a SQL error rejects.
+ */
+export async function claimSlackChannelPage(
+  session: TransactionSession,
+  scope: SlackChannelScope,
+  opts: { leaseMs?: number; bindingIntegrationId: string; bindingConfigRevision: string; skewAllowanceMs?: number }
+): Promise<SlackChannelClaim | SlackChannelClaimDelay | null> {
+  assertScope(scope);
+  const leaseMs = opts.leaseMs ?? SLACK_CHANNEL_LEASE_MS;
+  if (!Number.isSafeInteger(leaseMs) || leaseMs < MIN_LEASE_MS || leaseMs > MAX_LEASE_MS) {
+    throw new SlackChannelStateError(
+      `leaseMs must be between ${MIN_LEASE_MS} and ${MAX_LEASE_MS} (got ${JSON.stringify(leaseMs)})`
+    );
+  }
+  if (!UUID.test(opts.bindingIntegrationId)) {
+    throw new SlackChannelStateError("bindingIntegrationId must be a UUID");
+  }
+  if (!REVISION.test(opts.bindingConfigRevision)) {
+    throw new SlackChannelStateError("bindingConfigRevision must be a sha256 hex digest");
+  }
+  const skewAllowanceMs = opts.skewAllowanceMs ?? DEFAULT_SKEW_ALLOWANCE_MS;
+  if (!Number.isSafeInteger(skewAllowanceMs) || skewAllowanceMs <= 0) {
+    throw new SlackChannelStateError("skewAllowanceMs must be a positive whole number of milliseconds");
+  }
+
+  // 1. The locking read, under EVERY ordinary eligibility predicate, so an ineligible row is neither
+  //    claimed, initialized nor delayed. `for update` holds the row until this transaction ends.
+  const locked = single(
+    await session.executeSql<LockedClaimRow>(
+      `select case
+                -- THE INITIAL SCAN, whatever next_lane says: nothing is certified, nothing is
+                -- provisionally read and no anchor exists, so there is no boundary a catch-up could
+                -- run above. This is the anchored scan that covers all retained history.
+                when completed_upper_ts is null
+                     and newest_catchup_upper_ts is null
+                     and historical_anchor_ts is null
+                  then 'historical'
+                when next_lane = 'newest' then 'newest'
+                when not historical_floor_reached
+                     and (historical_anchor_ts is not null or completed_lower_ts is not null)
+                  then 'historical'
+                else 'newest'
+              end as lane,
+              newest_anchor_ts,
+              -- B as the claim UPDATE below freezes it: kept if the lane is anchored, else the top
+              -- of whatever is already read.
+              case when newest_anchor_ts is null
+                   then coalesce(completed_upper_ts, newest_catchup_upper_ts, historical_anchor_ts)
+                   else newest_lower_ts end as newest_lower,
+              (newest_request_lower_ts is null and newest_segment_lower_ts is null and newest_segment_upper_ts is null
+               and newest_cursor is null and newest_cursor_history = '[]'::pg_catalog.jsonb) as newest_uninitialized,
+              ${CLOCK_ANCHOR_TS} as clock_anchor
+         from slack_sync_channels
+        where ${SCOPE_PREDICATE}
+          and public_state = 'public'
+          and binding_integration_id = $4::uuid
+          and binding_config_revision = $5
+          and due_at <= clock_timestamp()
+          and (lease_owner is null or lease_expires_at <= clock_timestamp())
+          for update`,
+      [...scopeParams(scope), opts.bindingIntegrationId, opts.bindingConfigRevision]
+    )
+  );
+  if (!locked) return null;
+  const candidateLane = assertLane(locked.lane);
+
+  // The newest first segment, in exact ticks (§5), only for an all-null newest tuple.
+  let newestFirstSegment: { lower: string; upper: string } | null = null;
+  if (candidateLane === "newest" && locked.newest_uninitialized === true) {
+    const anchor = boundTicks(locked.newest_anchor_ts ?? locked.clock_anchor);
+    const logicalLower = boundTicks(locked.newest_lower);
+    if (anchor === null || logicalLower === null) {
+      throw new SlackChannelStateError(
+        "the newest lane's stored bounds are not exact supported timestamps — refusing to claim it"
+      );
+    }
+    const allowance = BigInt(skewAllowanceMs) * BigInt(1_000);
+    const requestLower = logicalLower > allowance ? logicalLower - allowance : BigInt(0);
+    if (requestLower > anchor) {
+      // 2b. L > A: an empty envelope. Pass the turn, record why, and lease nothing.
+      const delayed = await session.executeSql(
+        `update slack_sync_channels
+            set next_lane = 'historical',
+                last_error_code = 'scan_bounds_invalid',
+                due_at = clock_timestamp(),
+                updated_at = clock_timestamp()
+          where ${SCOPE_PREDICATE}`,
+        scopeParams(scope)
+      );
+      if (delayed.rowCount !== 1) {
+        throw new SlackChannelStateError("the locked channel row is gone — refusing to report a delay for it");
+      }
+      return SCAN_BOUNDS_INVALID;
+    }
+    newestFirstSegment = { lower: canonicalBound(requestLower), upper: canonicalBound(anchor) };
+  }
+
+  // 2a. The claim, on the locked row, under the same predicates, with the lane already chosen.
+  const result = await session.executeSql<StateRow & LaneBoundRow & { lane: string }>(
+    `with candidate as (
+        select id, $7::text as lane
+          from slack_sync_channels
+         where ${SCOPE_PREDICATE}
+      )
+      update slack_sync_channels c
+         set claimed_lane = candidate.lane,
+             lease_owner = gen_random_uuid()::text,
+             lease_generation = c.lease_generation + 1,
+             lease_expires_at = clock_timestamp() + ($6::double precision * interval '1 millisecond'),
+             attempts = c.attempts + 1,
+             -- Freeze the anchor ONLY when the lane's scan is starting; a resumed scan keeps the
+             -- upper bound it was anchored at, or its pages would come from a moving window. A new
+             -- one is the clock value the locking read saw, so the first segment's U matches it.
+             newest_anchor_ts = case
+               when candidate.lane = 'newest' then coalesce(c.newest_anchor_ts, $8::text)
+               else c.newest_anchor_ts end,
+             -- §5 NEWEST INITIALIZATION: [L, canonical(A)], computed above from the locked row.
+             newest_request_lower_ts = case
+               when candidate.lane = 'newest' and $9::boolean then $10::text else c.newest_request_lower_ts end,
+             newest_segment_lower_ts = case
+               when candidate.lane = 'newest' and $9::boolean then $10::text else c.newest_segment_lower_ts end,
+             newest_segment_upper_ts = case
+               when candidate.lane = 'newest' and $9::boolean then $11::text else c.newest_segment_upper_ts end,
+             -- A starting catch-up begins at the top of whatever is ALREADY fully read: the
+             -- certified interval, else the provisional catch-up top, else the initial anchor. The
+             -- three are tried in that order because that is the order they supersede each other in.
+             newest_lower_ts = case
+               when candidate.lane = 'newest' and c.newest_anchor_ts is null
+                 then coalesce(c.completed_upper_ts, c.newest_catchup_upper_ts, c.historical_anchor_ts)
+               else c.newest_lower_ts end,
+             -- A starting historical scan resumes at the certified bottom, or — the first time —
+             -- freezes the clock as the anchor everything else is measured against. A NEW anchor taken
+             -- from the certified bottom is stored canonically (§4); an EXISTING anchor keeps its bytes.
+             historical_anchor_ts = case
+               when candidate.lane = 'historical' then ${HISTORICAL_CLAIM_ANCHOR}
+               else c.historical_anchor_ts end,
+             historical_oldest_seen_ts = case
+               when candidate.lane = 'historical' and c.historical_anchor_ts is null then null
+               else c.historical_oldest_seen_ts end,
+             -- §5 INITIALIZATION, in this same statement and under the same predicates: only a claimed
+             -- historical lane whose WHOLE segment tuple is still the all-null initialization shape gets
+             -- its first segment [L = 0, U = canonical(A)]. Any existing segment, whether fresh,
+             -- split, lowered by a terminal segment or carrying a cursor, is resumed untouched. The
+             -- cursor, history, aggregate and generation are never written here. Attempt-oldest is
+             -- written only by the reset above, to null, when a NEW historical envelope starts (no
+             -- anchor yet).
+             historical_segment_lower_ts = case
+               when candidate.lane = 'historical' and ${HISTORICAL_SEGMENT_UNINITIALIZED} then '0.000000'
+               else c.historical_segment_lower_ts end,
+             historical_segment_upper_ts = case
+               when candidate.lane = 'historical' and ${HISTORICAL_SEGMENT_UNINITIALIZED}
+                 then ${canonicalBoundSql(HISTORICAL_CLAIM_ANCHOR)}
+               else c.historical_segment_upper_ts end,
+             updated_at = clock_timestamp()
+        from candidate
+       where c.id = candidate.id
+         and c.public_state = 'public'
+         and c.binding_integration_id = $4::uuid
+         and c.binding_config_revision = $5
+         and c.due_at <= clock_timestamp()
+         and (c.lease_owner is null or c.lease_expires_at <= clock_timestamp())
+   returning candidate.lane, ${STATE_COLUMNS}, ${LANE_BOUND_COLUMNS}`,
+    [
+      ...scopeParams(scope),
+      opts.bindingIntegrationId,
+      opts.bindingConfigRevision,
+      leaseMs,
+      candidateLane,
+      locked.clock_anchor,
+      newestFirstSegment !== null,
+      newestFirstSegment?.lower ?? null,
+      newestFirstSegment?.upper ?? null,
+    ]
+  );
+
+  const row = single(result);
+  if (!row) return null;
+  const state = toState(row);
+  const lane = assertLane(row.lane);
+  const laneState = lane === "newest" ? state.newest : state.historical;
+  if (state.leaseOwner === null || state.leaseExpiresAt === null || laneState.anchorTs === null) {
+    // Unreachable while the lease codec and the lane rule hold; asserted anyway, because the
+    // alternative is handing back a claim nobody can fence.
+    throw new SlackChannelStateError("claimed row came back without a lease or an anchor — refusing it");
+  }
+  if (lane === "newest" && laneState.lowerTs === null) {
+    // A catch-up with no lower bound is not a catch-up — it is an unbounded scan of the whole
+    // channel wearing that lane's name, and it would certify as one. The lane rule above is what
+    // prevents it; this refuses to proceed if that rule is ever weakened.
+    throw new SlackChannelStateError("a catch-up claim came back without a lower bound — refusing it");
+  }
+  return {
+    scope: state.scope,
+    lane,
+    leaseOwner: state.leaseOwner,
+    leaseGeneration: state.leaseGeneration,
+    leaseExpiresAt: state.leaseExpiresAt,
+    bindingConfigRevision: opts.bindingConfigRevision,
+    bindingIntegrationId: opts.bindingIntegrationId,
+    anchorTs: laneState.anchorTs,
+    lowerTs: laneState.lowerTs,
+    cursor: laneState.cursor,
+    scanGeneration: laneState.scanGeneration,
+    requestLowerTs: lane === "newest" ? row.newest_request_lower_ts : null,
+    segmentLowerTs: lane === "newest" ? row.newest_segment_lower_ts : row.historical_segment_lower_ts,
+    segmentUpperTs: lane === "newest" ? row.newest_segment_upper_ts : row.historical_segment_upper_ts,
+    // The oldest instant belongs to the HISTORICAL scan; a newest-lane claim carries none, so it
+    // cannot accidentally be folded into that lane's certification.
+    oldestSeenTs: lane === "historical" ? state.historicalOldestSeenTs : null,
+    completedLowerTs: state.completedLowerTs,
+    completedUpperTs: state.completedUpperTs,
+    newestCatchupUpperTs: state.newestCatchupUpperTs,
+  };
+}
+
+/**
+ * Lock this claim's channel row and re-check the WHOLE fence, without writing anything.
+ *
+ * It exists so the acceptance can be ordered the way it must be (§3.2/§5): verify FIRST, then advance
+ * the frontier through `acceptSlackChannelPage`, then, only for a `written` page, enqueue the roots,
+ * all in one transaction. A root is therefore never enqueued for a page the writer refused, rejected
+ * or subdivided, and a failed enqueue rolls the acceptance back with it. `for update` holds the row
+ * until this transaction ends, so no concurrent claim can slip in between the check and the advance.
+ *
+ * ⚠️ IT ALSO RE-CHECKS THE PUBLIC PROOF, and this is the ONLY place that check exists on the
+ * acceptance path — deliberately not repeated in the advance below, where a second copy would
+ * silently cover for this one going missing. The claim proved the channel public when it was taken;
+ * a definitive `private`/`unverifiable` observation made WHILE the page was in flight has to refuse
+ * it, or a revoked channel's messages are enqueued minutes after we were told to stop reading it.
+ */
+export async function lockSlackChannelForAcceptance(
+  session: TransactionSession,
+  claim: SlackChannelClaim
+): Promise<{ outcome: "locked" } | { outcome: "refused" }> {
+  assertScope(claim.scope);
+  const lane = assertLane(claim.lane);
+  const fence = channelFence(claim, lane);
+  const result = await session.executeSql(
+    `select id from slack_sync_channels
+      where ${SCOPE_PREDICATE}
+        and ${fence.predicate}
+        for update`,
+    [...scopeParams(claim.scope), ...fence.params]
+  );
+  return result.rows.length === 1 ? { outcome: "locked" } : { outcome: "refused" };
+}
+
+/**
+ * The COMPLETE channel fence of one claim, as `$4…` predicates over the scoped row (§5, §8). Every
+ * value comes from the claim and none of them is a cursor history:
+ *  - the public proof;
+ *  - lease owner, generation and DB-clock expiry;
+ *  - the claimed lane;
+ *  - the binding revision AND integration;
+ *  - the lane's scan generation, cursor and anchor;
+ *  - its segment `[S, U]`, plus, on the newest lane, the frozen request lower `L` and logical lower `B`.
+ * A claim built without the bound fields fences them as null, which refuses any initialized segment
+ * rather than ignoring it.
+ */
+function channelFence(claim: SlackChannelClaim, lane: SlackScanLane): { predicate: string; params: unknown[] } {
+  const predicates = [
+    `public_state = 'public'`,
+    `lease_owner = $4`,
+    `lease_generation = $5::bigint`,
+    `lease_expires_at > clock_timestamp()`,
+    `claimed_lane = $6`,
+    `binding_config_revision = $7`,
+    `binding_integration_id = $8::uuid`,
+    `${lane}_scan_generation = $9::bigint`,
+    `${lane}_cursor is not distinct from $10`,
+    `${lane}_anchor_ts is not distinct from $11`,
+    `${lane}_segment_lower_ts is not distinct from $12`,
+    `${lane}_segment_upper_ts is not distinct from $13`,
+  ];
+  const params: unknown[] = [
+    claim.leaseOwner,
+    String(claim.leaseGeneration),
+    lane,
+    claim.bindingConfigRevision,
+    claim.bindingIntegrationId,
+    String(claim.scanGeneration),
+    claim.cursor,
+    claim.anchorTs,
+    claim.segmentLowerTs ?? null,
+    claim.segmentUpperTs ?? null,
+  ];
+  if (lane === "newest") {
+    predicates.push(`newest_request_lower_ts is not distinct from $14`, `newest_lower_ts is not distinct from $15`);
+    params.push(claim.requestLowerTs ?? null, claim.lowerTs);
+  }
+  return { predicate: predicates.join("\n        and "), params };
+}
+
+/**
+ * Apply one page under the claim's FULL authority: admit its continuation to the lane's SQL-local
+ * cursor history, or finish its segment, or finish the whole scan (§3.1–§3.3, §5, §6).
+ *
+ * THE ORDER IS THE CONTRACT, and each step can end the call:
+ *  1. Structural, before any SQL: cursor grammar, an exact `oldestTs`, and that oldest inside the
+ *     claimed segment. Whether the cursor is well-formed UTF-16 is decided here as a BOOLEAN; an
+ *     unrepresentable cursor is never parameterized, logged or quoted, here or later.
+ *  2. Authority: the row is locked under the complete fence (`channelFence`). No row means
+ *     `refused`, and nothing was written.
+ *  3. Locked stored-state validity: a malformed or inconsistent stored history fails closed,
+ *     cursor-free.
+ *  4. Admission, for a continuation:
+ *      - unrepresentable;
+ *      - exact repetition of ANY entry in H;
+ *      - the candidate's entry count;
+ *      - its PostgreSQL byte length.
+ *     The counts are computed by SQL on the actual candidate `H || [cursor]`, so repetition at a
+ *     cap is repetition and an overflow of both caps is entries.
+ *  5. The transition:
+ *      - an admitted continuation APPENDS;
+ *      - a repetition, or a capacity/unrepresentable reason on a singleton `[S, U]`, is `rejected`
+ *        with no write (the caller releases);
+ *      - a capacity/unrepresentable reason on a wider segment is `subdivided`;
+ *      - a terminal page finishes its segment, or, at `S = L`, the envelope.
+ * Every write repeats the full fence in its WHERE, so a lease that expires between the lock and the
+ * write still refuses. Boundaries come from the LOCKED row, never from caller arithmetic.
+ *
+ * ⚠️ TERMINAL MEANS THE PROVIDER ENDED THE SCAN. A page that says `has_more` is progress, full stop.
+ * There is no case in which a request we sent as "everything below this anchor" is re-read, after
+ * its answer arrives, as a smaller request that happens to be complete: that is not a completed
+ * interval, it is an unfinished one relabelled, and the interval's whole purpose downstream is to be
+ * the range where an ABSENT message counts as evidence of deletion.
+ *
+ * The certification rules, which live here because the table's invariant does:
+ *  • PARTIAL: append the continuation cursor to H (it becomes C), remember the oldest instant the
+ *    current historical segment attempt has seen, and leave `completed_*` and the provisional
+ *    catch-up top exactly as they were.
+ *  • TERMINAL, inner segment (`S > L`): the segment is done, but the envelope is not. The next
+ *    segment is the adjacent older range `[max(L, S − 2W), S − 1]`. The historical attempt-oldest is
+ *    folded into the completed-segments aggregate, and NO coverage field moves.
+ * The remaining rules are for the FINAL segment (`S = L`, or a lane whose segment was never
+ * initialized):
+ *  • TERMINAL, newest lane, WITH a certified interval: its lower bound was that interval's top, so
+ *    the certified top extends to this scan's frozen anchor.
+ *  • TERMINAL, newest lane, with NOTHING certified yet: the initial scan is still draining below
+ *    this catch-up, so `[initial anchor, this anchor]` is genuinely read but not contiguous with a
+ *    certified interval. It is recorded as PROVISIONAL progress (`newest_catchup_upper_ts`) and
+ *    `completed_*` does not move. Writing it there would certify a range whose bottom half is a hole.
+ *  • TERMINAL, historical lane: the retention floor is reached, so everything from the oldest
+ *    instant ANY of its segments saw (completed-segments aggregate, the current attempt, and this
+ *    page) up to the provisional catch-up top (or the anchor, if no catch-up has finished) is now one
+ *    contiguous certified interval. The certified bottom never moves UP: `olderSlackTs` of the two.
+ *    The provisional column is cleared, because it has been absorbed.
+ * Coverage is computed from the LOCKED row, not from the claim's snapshot.
+ */
+export async function acceptSlackChannelPage(
+  session: TransactionSession,
+  claim: SlackChannelClaim,
+  page: { terminal: boolean; nextCursor: string | null; oldestTs: string | null }
+): Promise<SlackChannelPageAcceptance> {
+  // 1. Structural, before any SQL.
+  assertScope(claim.scope);
+  const lane = assertLane(claim.lane);
+  if (!page.terminal) assertCursor(page.nextCursor, { required: true });
+  if (page.oldestTs !== null && !parseSlackTimestamp(page.oldestTs)) {
+    throw new SlackChannelStateError("oldestTs must be an exact Slack timestamp or null");
+  }
+  assertOldestInClaimedSegment(claim, page.oldestTs);
+  // A terminal page appends nothing, so its cursor field is never read.
+  const cursor = page.terminal ? null : (page.nextCursor as string);
+  const unrepresentable = cursor !== null && hasLoneSurrogate(cursor);
+
+  // 2. Authority, and 3. the locked lane's stored-state validity, in one locking read.
+  const fence = channelFence(claim, lane);
+  const locked = single(
+    await session.executeSql<LockedLaneRow>(
+      `select ${lane}_segment_lower_ts as segment_lower,
+              ${lane}_segment_upper_ts as segment_upper,
+              ${lane === "newest" ? "newest_request_lower_ts" : "null::text"} as request_lower,
+              historical_oldest_seen_ts, historical_completed_segments_oldest_ts,
+              completed_lower_ts, completed_upper_ts, newest_catchup_upper_ts,
+              coalesce(public.slack_channel_cursor_history_valid(${lane}_cursor_history)
+                       and case when ${lane}_cursor is null then ${lane}_cursor_history = '[]'::pg_catalog.jsonb
+                                else pg_catalog.jsonb_array_length(${lane}_cursor_history) > 0
+                                     and (${lane}_cursor_history -> -1) = pg_catalog.to_jsonb(${lane}_cursor) end,
+                       false) as history_valid
+         from slack_sync_channels
+        where ${SCOPE_PREDICATE}
+          and ${fence.predicate}
+          for update`,
+      [...scopeParams(claim.scope), ...fence.params]
+    )
+  );
+  if (!locked) return { outcome: "refused" };
+  if (locked.history_valid !== true) {
+    throw new SlackChannelStateError(
+      "the claimed lane's stored cursor history is malformed or inconsistent — refusing to admit a page against it"
+    );
+  }
+  const segment = lockedSegment(lane, locked);
+
+  if (page.terminal) return acceptTerminalPage(session, claim, lane, fence, locked, segment, page.oldestTs);
+
+  if (segment === null) {
+    // An anchored lane whose segment was never initialized cannot hold a cursor (the progress CHECK
+    // says so). Initialization belongs to the claim; until it exists, a continuation fails closed.
+    throw new SlackChannelStateError(
+      "the claimed lane's segment is not initialized, so a continuation cannot be admitted to it"
+    );
+  }
+
+  // 4. Admission, in precedence order. The unrepresentable cursor never reaches the SQL below.
+  let category: SlackHistoryAdmissionCategory | null = null;
+  if (unrepresentable) {
+    category = "cursor_unrepresentable";
+  } else {
+    const sized = single(
+      await session.executeSql<{ repeated: boolean; entries: number | string; bytes: number | string }>(
+        `select ${lane}_cursor_history @> pg_catalog.jsonb_build_array($4::text) as repeated,
+                pg_catalog.jsonb_array_length(${lane}_cursor_history) + 1 as entries,
+                pg_catalog.octet_length(
+                  (${lane}_cursor_history || pg_catalog.jsonb_build_array($4::text))::pg_catalog.text) as bytes
+           from slack_sync_channels
+          where ${SCOPE_PREDICATE}`,
+        [...scopeParams(claim.scope), cursor]
+      )
+    );
+    if (!sized) {
+      throw new SlackChannelStateError("the locked channel row is gone — refusing to classify a page against it");
+    }
+    if (sized.repeated === true) category = "cursor_repeated";
+    else if (Number(sized.entries) > MAX_HISTORY_ENTRIES) category = "cursor_history_entries_exceeded";
+    else if (Number(sized.bytes) > MAX_HISTORY_BYTES) category = "cursor_history_bytes_exceeded";
+  }
+
+  // 5. The transition.
+  if (category === "cursor_repeated") return { outcome: "rejected", category };
+  if (category !== null) {
+    // A singleton range cannot be split: the reason stands, and the caller's release is the only change.
+    if (segment.lower === segment.upper) return { outcome: "rejected", category };
+    return subdivideSegment(session, claim, lane, fence, segment, category);
+  }
+
+  const state = await writeFenced(session, claim, fence, (bind) => {
+    const next = bind(cursor);
+    return [
+      `${lane}_cursor = ${next}`,
+      `${lane}_cursor_history = ${lane}_cursor_history || pg_catalog.jsonb_build_array(${next}::text)`,
+      ...(lane === "historical"
+        ? [`historical_oldest_seen_ts = ${bind(olderSlackTs(locked.historical_oldest_seen_ts, page.oldestTs))}`]
+        : []),
+      `last_error_code = null`,
+      `last_read_at = clock_timestamp()`,
+    ];
+  });
+  return state ? { outcome: "written", state } : { outcome: "refused" };
+}
+
+interface LockedLaneRow {
+  segment_lower: string | null;
+  segment_upper: string | null;
+  request_lower: string | null;
+  historical_oldest_seen_ts: string | null;
+  historical_completed_segments_oldest_ts: string | null;
+  completed_lower_ts: string | null;
+  completed_upper_ts: string | null;
+  newest_catchup_upper_ts: string | null;
+  history_valid: boolean | null;
+}
+
+/** A lane's locked segment in exact microsecond ticks, with its envelope floor `L`; null if uninitialized. */
+interface LaneSegment {
+  readonly lower: bigint;
+  readonly upper: bigint;
+  readonly floor: bigint;
+}
+
+function lockedSegment(
+  lane: SlackScanLane,
+  row: Pick<LockedLaneRow, "segment_lower" | "segment_upper" | "request_lower">
+): LaneSegment | null {
+  if (row.segment_lower === null && row.segment_upper === null) return null;
+  const lower = exactTicks(row.segment_lower);
+  const upper = exactTicks(row.segment_upper);
+  const floor = lane === "newest" ? exactTicks(row.request_lower) : BigInt(0);
+  if (lower === null || upper === null || floor === null || floor > lower || lower > upper) {
+    throw new SlackChannelStateError("the claimed lane's stored segment bounds are inconsistent — refusing the page");
+  }
+  return { lower, upper, floor };
+}
+
+/**
+ * The bookkeeping every successful or subdividing acceptance shares. The lane's turn is over whether
+ * or not its scan is: an empty lane lends its slot, it does not keep it.
+ */
+const PASS_TURN = [
+  `next_lane = case when claimed_lane = 'newest' then 'historical' else 'newest' end`,
+  `claimed_lane = null`,
+  `lease_owner = null`,
+  `lease_expires_at = null`,
+  `due_at = clock_timestamp()`,
+  `updated_at = clock_timestamp()`,
+];
+
+/**
+ * One UPDATE of the claimed row under the SAME full fence, plus the turn pass. `build` binds its own
+ * values after the fence's parameters. Null means the fence no longer matched (for example, the
+ * lease expired after the lock), and nothing was written.
+ */
+async function writeFenced(
+  session: TransactionSession,
+  claim: SlackChannelClaim,
+  fence: { predicate: string; params: unknown[] },
+  build: (bind: (value: unknown) => string) => string[]
+): Promise<SlackChannelState | null> {
+  const values: unknown[] = [];
+  const bind = (value: unknown): string => {
+    values.push(value);
+    return `$${3 + fence.params.length + values.length}`;
+  };
+  const assignments = [...build(bind), ...PASS_TURN];
+  const row = single(
+    await session.executeSql<StateRow>(
+      `update slack_sync_channels
+          set ${assignments.join(",\n              ")}
+        where ${SCOPE_PREDICATE}
+          and ${fence.predicate}
+    returning ${STATE_COLUMNS}`,
+      [...scopeParams(claim.scope), ...fence.params, ...values]
+    )
+  );
+  return row ? toState(row) : null;
+}
+
+/**
+ * §5 subdivision: `M = floor((S + U) / 2)`, then `S = M + 1`; `U`, `L`, `A` and `B` stay. The
+ * cursor, history and attempt-oldest are cleared, G increments, the completed-segments aggregate is
+ * preserved, and the claim is released with the reason as its diagnostic. No read time and no
+ * coverage moves: nothing from this page was accepted.
+ */
+async function subdivideSegment(
+  session: TransactionSession,
+  claim: SlackChannelClaim,
+  lane: SlackScanLane,
+  fence: { predicate: string; params: unknown[] },
+  segment: LaneSegment,
+  category: Exclude<SlackHistoryAdmissionCategory, "cursor_repeated">
+): Promise<SlackChannelPageAcceptance> {
+  const lower = canonicalBound((segment.lower + segment.upper) / TWO + ONE_TICK);
+  const state = await writeFenced(session, claim, fence, (bind) => [
+    `${lane}_segment_lower_ts = ${bind(lower)}`,
+    `${lane}_cursor = null`,
+    `${lane}_cursor_history = '[]'::pg_catalog.jsonb`,
+    ...(lane === "historical" ? [`historical_oldest_seen_ts = null`] : []),
+    `${lane}_scan_generation = ${lane}_scan_generation + 1`,
+    `last_error_code = ${bind(category)}`,
+  ]);
+  return state ? { outcome: "subdivided", category, state } : { outcome: "refused" };
+}
+
+/** A genuinely terminal page: finish the inner segment (`S > L`), or the whole envelope. */
+async function acceptTerminalPage(
+  session: TransactionSession,
+  claim: SlackChannelClaim,
+  lane: SlackScanLane,
+  fence: { predicate: string; params: unknown[] },
+  locked: LockedLaneRow,
+  segment: LaneSegment | null,
+  pageOldestTs: string | null
+): Promise<SlackChannelPageAcceptance> {
+  const success = [`${lane}_cursor = null`, `${lane}_cursor_history = '[]'::pg_catalog.jsonb`,
+    `${lane}_scan_generation = ${lane}_scan_generation + 1`, `last_error_code = null`, `last_read_at = clock_timestamp()`];
+
+  if (segment !== null && segment.lower > segment.floor) {
+    // §5 inner terminal: W = U − S + 1; the next segment is [max(L, S − 2W), S − 1].
+    const width = segment.upper - segment.lower + ONE_TICK;
+    const doubled = segment.lower - TWO * width;
+    const nextLower = doubled > segment.floor ? doubled : segment.floor;
+    const nextUpper = segment.lower - ONE_TICK;
+    const state = await writeFenced(session, claim, fence, (bind) => [
+      ...success,
+      `${lane}_segment_lower_ts = ${bind(canonicalBound(nextLower))}`,
+      `${lane}_segment_upper_ts = ${bind(canonicalBound(nextUpper))}`,
+      ...(lane === "historical"
+        ? [
+            `historical_oldest_seen_ts = null`,
+            `historical_completed_segments_oldest_ts = ${bind(
+              olderSlackTs(
+                olderSlackTs(locked.historical_completed_segments_oldest_ts, locked.historical_oldest_seen_ts),
+                pageOldestTs
+              )
+            )}`,
+          ]
+        : []),
+    ]);
+    return state ? { outcome: "written", state, completion: "segment" } : { outcome: "refused" };
+  }
+
+  // The FINAL segment: certify the envelope by §6, from the locked row and the ORIGINAL anchor.
+  if (lane === "historical") {
+    const seen = olderSlackTs(
+      olderSlackTs(locked.historical_completed_segments_oldest_ts, locked.historical_oldest_seen_ts),
+      pageOldestTs
+    );
+    const completedLower = olderSlackTs(locked.completed_lower_ts, seen) ?? claim.anchorTs;
+    const completedUpper = locked.completed_upper_ts ?? locked.newest_catchup_upper_ts ?? claim.anchorTs;
+    const state = await writeFenced(session, claim, fence, (bind) => [
+      ...success,
+      `historical_anchor_ts = null`,
+      `historical_segment_lower_ts = null`,
+      `historical_segment_upper_ts = null`,
+      `historical_oldest_seen_ts = null`,
+      `historical_completed_segments_oldest_ts = null`,
+      `historical_floor_reached = true`,
+      `completed_lower_ts = ${bind(completedLower)}`,
+      `completed_upper_ts = ${bind(completedUpper)}`,
+      `newest_catchup_upper_ts = null`,
+    ]);
+    return state ? { outcome: "written", state, completion: "envelope" } : { outcome: "refused" };
+  }
+
+  // Newest: extend a certified top to this anchor, or, with nothing certified yet, record it as
+  // PROVISIONAL progress. `completed_lower_ts` and the floor are never touched here.
+  const certified = locked.completed_upper_ts !== null;
+  const state = await writeFenced(session, claim, fence, (bind) => [
+    ...success,
+    `newest_anchor_ts = null`,
+    `newest_lower_ts = null`,
+    `newest_request_lower_ts = null`,
+    `newest_segment_lower_ts = null`,
+    `newest_segment_upper_ts = null`,
+    ...(certified
+      ? [`completed_upper_ts = ${bind(claim.anchorTs)}`, `newest_catchup_upper_ts = null`]
+      : [`newest_catchup_upper_ts = ${bind(claim.anchorTs)}`]),
+  ]);
+  return state ? { outcome: "written", state, completion: "envelope" } : { outcome: "refused" };
+}
+
+/**
+ * Structural: a page's oldest message must lie inside the claimed segment `[S, U]` (inclusive, exact
+ * ticks). Discovery refuses such a page as `page_outside_segment` before it gets here; this is the
+ * same rule for direct callers, raised without any value.
+ */
+function assertOldestInClaimedSegment(claim: SlackChannelClaim, oldestTs: string | null): void {
+  const lowerBound = claim.segmentLowerTs ?? null;
+  const upperBound = claim.segmentUpperTs ?? null;
+  if (oldestTs === null || lowerBound === null || upperBound === null) return;
+  const oldest = exactTicks(oldestTs);
+  const lower = exactTicks(lowerBound);
+  const upper = exactTicks(upperBound);
+  if (oldest === null || lower === null || upper === null || oldest < lower || oldest > upper) {
+    throw new SlackChannelStateError("the page's oldest message lies outside the claimed segment (page_outside_segment)");
+  }
+}
+
+/** Exact microsecond ticks of an instant or bound, with integer arithmetic only; null if it is not one. */
+function exactTicks(value: string | null): bigint | null {
+  if (value === null) return null;
+  const match = EXACT_INSTANT.exec(value);
+  if (!match) return null;
+  const seconds = match[1].replace(/^0+(?=[0-9])/, "");
+  if (seconds.length > 12) return null;
+  return BigInt(seconds) * MICROS_PER_SECOND + BigInt(match[2].padEnd(6, "0"));
+}
+
+/**
+ * Exact ticks of a stored instant that may become a bound, or null if it is absent, malformed or above
+ * the supported maximum (§4). The caller turns null into a STATIC error; the value is never quoted.
+ */
+function boundTicks(value: string | null): bigint | null {
+  const ticks = exactTicks(value);
+  return ticks !== null && ticks <= MAX_BOUND_TICKS ? ticks : null;
+}
+
+/** What the claim's locking read returns: the lane, and the stored values the newest bounds come from. */
+interface LockedClaimRow {
+  lane: string;
+  newest_anchor_ts: string | null;
+  newest_lower: string | null;
+  newest_uninitialized: boolean | null;
+  clock_anchor: string;
+}
+
+/** The canonical bound spelling (§4): seconds without leading zeroes, a dot, exactly six digits. */
+function canonicalBound(ticks: bigint): string {
+  const seconds = ticks / MICROS_PER_SECOND;
+  const micros = ticks % MICROS_PER_SECOND;
+  return `${seconds.toString()}.${micros.toString().padStart(6, "0")}`;
+}
+
+/** True if the string holds an UNPAIRED UTF-16 surrogate. A boolean only; the value is never kept. */
+function hasLoneSurrogate(value: string): boolean {
+  for (let i = 0; i < value.length; i += 1) {
+    const unit = value.charCodeAt(i);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) i += 1;
+      else return true;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** True if the string holds a C0 control (U+0000–001F, so NUL too) or DEL, which no stored cursor may. */
+function hasControlCharacter(value: string): boolean {
+  for (let i = 0; i < value.length; i += 1) {
+    const unit = value.charCodeAt(i);
+    if (unit <= 0x1f || unit === 0x7f) return true;
+  }
+  return false;
+}
+
+/**
+ * The provider refused our cursor (an actual `invalid_cursor`, §5). The lane's next state depends on
+ * its LOCKED segment:
+ *  - `subdivided` (S < U): `M = floor((S + U) / 2)` in exact ticks, then `S = M + 1`. U, L, A and B
+ *    stay, the completed-segments aggregate is preserved, the cursor, history and attempt-oldest are
+ *    cleared, and G increments once;
+ *  - `restarted` (S = U, or a lane with no segment): the SAME range again. Every bound and the
+ *    aggregate stay, the cursor, history and attempt-oldest are cleared, and G increments once;
+ *  - `refused`: the claim's authority is gone, and nothing was written.
+ *
+ * Either transition releases the claim and passes the sent request's turn, recording `errorCode` as
+ * the diagnostic. It is not a rollback: the certified interval is untouched, because a cursor the
+ * provider forgot says nothing about the pages already read. The generation bump is what makes a late
+ * acceptance from the abandoned attempt match no row.
+ *
+ * Authority is the COMPLETE channel fence (`channelFence`, the same as acceptance), checked by a
+ * locking read and repeated in the write, so an expiry between them still refuses. Boundaries come
+ * from the locked row, never from the claim's arithmetic. Nothing returned carries a cursor history.
+ */
+export type SlackChannelRestart =
+  | { readonly outcome: "subdivided"; readonly state: SlackChannelState }
+  | { readonly outcome: "restarted"; readonly state: SlackChannelState }
+  | { readonly outcome: "refused" };
+
+export async function restartSlackChannelScan(
+  session: TransactionSession,
+  claim: SlackChannelClaim,
+  input: { errorCode: string }
+): Promise<SlackChannelRestart> {
+  assertScope(claim.scope);
+  const lane = assertLane(claim.lane);
+  assertErrorCode(input.errorCode);
+  const fence = channelFence(claim, lane);
+  const locked = single(
+    await session.executeSql<{ segment_lower: string | null; segment_upper: string | null; request_lower: string | null }>(
+      `select ${lane}_segment_lower_ts as segment_lower,
+              ${lane}_segment_upper_ts as segment_upper,
+              ${lane === "newest" ? "newest_request_lower_ts" : "null::text"} as request_lower
+         from slack_sync_channels
+        where ${SCOPE_PREDICATE}
+          and ${fence.predicate}
+          for update`,
+      [...scopeParams(claim.scope), ...fence.params]
+    )
+  );
+  if (!locked) return { outcome: "refused" };
+  const segment = lockedSegment(lane, locked);
+  const split = segment !== null && segment.lower < segment.upper;
+  const state = await writeFenced(session, claim, fence, (bind) => [
+    ...(split && segment !== null
+      ? [`${lane}_segment_lower_ts = ${bind(canonicalBound((segment.lower + segment.upper) / TWO + ONE_TICK))}`]
+      : []),
+    `${lane}_cursor = null`,
+    `${lane}_cursor_history = '[]'::pg_catalog.jsonb`,
+    ...(lane === "historical" ? [`historical_oldest_seen_ts = null`] : []),
+    `${lane}_scan_generation = ${lane}_scan_generation + 1`,
+    `last_error_code = ${bind(input.errorCode)}`,
+  ]);
+  if (!state) return { outcome: "refused" };
+  return split ? { outcome: "subdivided", state } : { outcome: "restarted", state };
+}
+
+/**
+ * Hand the channel back for a later attempt with a sanitized category. Everything the scan had —
+ * anchor, cursor, generation, certified interval — is left exactly as it is, so the retry RESUMES
+ * the same anchored scan rather than restarting it at a new "now".
+ *
+ * THE TURN, which the CALLER states because only the caller knows what happened to the request:
+ *   · `passed` (the default) — the lane's turn passes to the other lane, so a channel failing on one
+ *     lane cannot starve the other. Right for a request that was sent and failed, and for a wake
+ *     that stopped at its own invocation ceiling.
+ *   · `kept`   — the claimed lane stays the pending one. Right ONLY for a request the durable method
+ *     budget refused before it was sent: the lanes alternate REQUEST SLOTS, and no slot was used. If
+ *     such a wake passed the turn, every early wake would hand the next real slot back to the lane
+ *     that just had one.
+ * This writer does not infer which it was from the error category; a category is a diagnostic.
+ *
+ * `nextDueAt` null means DUE NOW, and that is not the same decision as `delaySlackChannel`'s null
+ * (which leaves the not-before alone): here the channel is being handed back for its own lane, and
+ * the durable method budget — the cross-process gate — is what decides when the retry may actually
+ * send anything. A per-channel backoff curve belongs to the scheduler slice, not to this writer.
+ */
+export async function releaseSlackChannelForRetry(
+  session: TransactionSession,
+  claim: SlackChannelClaim,
+  input: { nextDueAt: Date | null; errorCode: string; turn?: "passed" | "kept" }
+): Promise<SlackChannelWrite> {
+  assertScope(claim.scope);
+  const lane = assertLane(claim.lane);
+  assertErrorCode(input.errorCode);
+  if (input.nextDueAt !== null) assertInstant("nextDueAt", input.nextDueAt);
+  const turn = input.turn ?? "passed";
+  if (turn !== "passed" && turn !== "kept") {
+    throw new SlackChannelStateError(`turn must be "passed" or "kept" (got ${JSON.stringify(turn)})`);
+  }
+  const result = await session.executeSql<StateRow>(
+    `update slack_sync_channels
+        set next_lane = case
+              when $13::boolean then claimed_lane
+              when claimed_lane = 'newest' then 'historical'
+              else 'newest' end,
+            claimed_lane = null,
+            lease_owner = null,
+            lease_expires_at = null,
+            due_at = coalesce($12::timestamptz, clock_timestamp()),
+            last_error_code = $11,
+            updated_at = clock_timestamp()
+      where ${SCOPE_PREDICATE}
+        and lease_owner = $4
+        and lease_generation = $5::bigint
+        and lease_expires_at > clock_timestamp()
+        and claimed_lane = $6
+        and binding_config_revision = $7
+        and ${lane}_scan_generation = $8::bigint
+        and ${lane}_cursor is not distinct from $9
+        and ${lane}_anchor_ts is not distinct from $10
+  returning ${STATE_COLUMNS}`,
+    [
+      ...scopeParams(claim.scope),
+      claim.leaseOwner,
+      String(claim.leaseGeneration),
+      lane,
+      claim.bindingConfigRevision,
+      String(claim.scanGeneration),
+      claim.cursor,
+      claim.anchorTs,
+      input.errorCode,
+      input.nextDueAt,
+      turn === "kept",
+    ]
+  );
+  return written(result);
+}
+
+// ── codecs ───────────────────────────────────────────────────────────────────
+
+function written(result: SqlQueryResult<StateRow>): SlackChannelWrite {
+  const row = single(result);
+  return row ? { outcome: "written", state: toState(row) } : { outcome: "refused" };
+}
+
+function toState(row: StateRow): SlackChannelState {
+  return {
+    scope: { teamId: row.team_id, workspaceId: row.workspace_id, channelId: row.channel_id },
+    publicState: assertPublicState(row.public_state),
+    publicCheckedAt: row.public_checked_at === null ? null : instant(row.public_checked_at),
+    bindingIntegrationId: row.binding_integration_id,
+    bindingConfigRevision: row.binding_config_revision,
+    newest: {
+      anchorTs: row.newest_anchor_ts,
+      lowerTs: row.newest_lower_ts,
+      cursor: row.newest_cursor,
+      scanGeneration: counter("newest_scan_generation", row.newest_scan_generation),
+    },
+    historical: {
+      anchorTs: row.historical_anchor_ts,
+      lowerTs: null, // the historical lane pages to the retention floor; it has no lower bound
+      cursor: row.historical_cursor,
+      scanGeneration: counter("historical_scan_generation", row.historical_scan_generation),
+    },
+    historicalOldestSeenTs: row.historical_oldest_seen_ts,
+    historicalFloorReached: row.historical_floor_reached === true,
+    completedLowerTs: row.completed_lower_ts,
+    completedUpperTs: row.completed_upper_ts,
+    newestCatchupUpperTs: row.newest_catchup_upper_ts,
+    metadataAttemptOwner: row.metadata_attempt_owner,
+    metadataAttemptGeneration: counter("metadata_attempt_generation", row.metadata_attempt_generation),
+    claimedLane: row.claimed_lane === null ? null : assertLane(row.claimed_lane),
+    nextLane: assertLane(row.next_lane),
+    leaseOwner: row.lease_owner,
+    leaseGeneration: counter("lease_generation", row.lease_generation),
+    leaseExpiresAt: row.lease_expires_at === null ? null : instant(row.lease_expires_at),
+    dueAt: instant(row.due_at),
+    attempts: counter("attempts", row.attempts),
+    lastErrorCode: row.last_error_code,
+    lastReadAt: row.last_read_at === null ? null : instant(row.last_read_at),
+  };
+}
+
+/**
+ * A lane name is INTERPOLATED into column names above, so it is validated as a closed union here and
+ * nowhere else. It never comes from a provider or a request — it comes from this module's own lane
+ * rule or from a stored value this function is also the reader of — but the interpolation is the
+ * reason the check is unconditional rather than a type-level assumption.
+ */
+function assertLane(value: unknown): SlackScanLane {
+  if (value !== "newest" && value !== "historical") {
+    throw new SlackChannelStateError(`unknown scan lane ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
+function assertPublicState(value: string): SlackChannelPublicState {
+  if (value !== "unknown" && value !== "public" && value !== "private" && value !== "unverifiable") {
+    throw new SlackChannelStateError(`unknown stored public state ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
+function assertCursor(value: string | null, opts: { required: boolean }): void {
+  if (value === null) {
+    if (opts.required) {
+      throw new SlackChannelStateError("a non-terminal page must carry the cursor that continues it");
+    }
+    return;
+  }
+  // `trim()` is exactly the contract's blank set, and `length` counts UTF-16 code units. The value is
+  // never quoted: it may be a provider token or an unrepresentable string.
+  if (typeof value !== "string" || value.trim() === "" || value.length > MAX_CURSOR_LENGTH || hasControlCharacter(value)) {
+    throw new SlackChannelStateError(
+      `a page cursor must be a non-blank string of at most ${MAX_CURSOR_LENGTH} UTF-16 code units, with no C0 ` +
+        `or DEL control character`
+    );
+  }
+}
+
+/**
+ * The one validator whose REJECTED VALUE IS ITSELF THE HAZARD — same rule, and same static message,
+ * as `slack-thread-state.assertErrorCode`. Quoting the refused value would copy a suspected provider
+ * message or token into the throw, the stack and every log that records it.
+ */
+function assertErrorCode(value: string | null | undefined): void {
+  if (value === null || value === undefined) return;
+  if (typeof value !== "string" || !ERROR_CODE.test(value)) {
+    throw new SlackChannelStateError(
+      `errorCode must be null, omitted, or a sanitized lower-case failure CATEGORY matching ` +
+        `${ERROR_CODE.source} — never a provider message, a token or free text. The rejected value ` +
+        `is deliberately omitted from this message.`
+    );
+  }
+}
+
+function assertInstant(field: string, value: Date): void {
+  if (!(value instanceof Date) || Number.isNaN(value.getTime())) {
+    throw new SlackChannelStateError(`${field} must be a valid Date (got ${JSON.stringify(value)})`);
+  }
+}
+
+function counter(field: string, value: number | string): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new SlackChannelStateError(`${field} is not representable as a safe integer (${value})`);
+  }
+  return parsed;
+}
+
+function instant(value: Date | string): string {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw new SlackChannelStateError(`unreadable timestamp from the database (${String(value)})`);
+  }
+  return date.toISOString();
+}
+
+function single<T>(result: SqlQueryResult<T>): T | undefined {
+  if (result.rows.length > 1) {
+    throw new SlackChannelStateError(`expected at most one row, got ${result.rows.length}`);
+  }
+  return result.rows[0];
+}

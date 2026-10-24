@@ -62,6 +62,7 @@ export async function GET(req: NextRequest) {
   const timeline =
     days <= WINDOW_DAYS
       ? (await getCachedWorkTimeline(adminClient(), team.id, tier, memberId)).days
-      : await getWorkTimeline(adminClient(), team.id, tier, days, await contentTimelineEnforcement(adminClient(), team.id, memberId));
+      : await getWorkTimeline(adminClient(), team.id, tier, days,
+        await contentTimelineEnforcement(adminClient(), team.id, memberId), true);
   return Response.json({ days: timeline, window_days: days });
 }

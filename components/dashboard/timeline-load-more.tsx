@@ -1,57 +1,76 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useReducer, useRef } from "react";
 import { ChevronDown, Loader2 } from "lucide-react";
 import type { TimelineDay } from "@/lib/dashboard/timeline-group";
 import { TimelineDays } from "@/components/dashboard/timeline-days";
+import { timelineExpansionReducer } from "@/components/dashboard/timeline-expansion-state";
 
 /**
- * "Show earlier days" — expands the Pulse Timeline beyond the SSR'd default window on demand. Each click
- * widens the lookback (+7 days, capped at `maxWindow`) and fetches the fuller ledger from
- * `/api/dashboard/timeline`, rendering ONLY days the server hasn't already shown (filtered by
- * `shownDates`, so no duplication and no dependency on count alignment between the cached SSR build and
- * this fresh one). Client-fetched so an uncached wider build never blocks the home SSR.
+ * Owns the SSR'd initial days and expands the Pulse Timeline on demand. A wider API response is a
+ * complete fresh snapshot: replacing the rendered days also updates same-date evidence and corrections.
+ * Client fetching keeps an uncached wider build off the home SSR path.
  */
 export function TimelineLoadMore({
   teamSlug,
-  shownDates,
+  initialDays,
   initialWindow,
   maxWindow,
 }: {
   teamSlug: string;
-  shownDates: string[];
+  initialDays: TimelineDay[];
   initialWindow: number;
   maxWindow: number;
 }) {
-  const [windowDays, setWindowDays] = useState(initialWindow);
-  const [older, setOlder] = useState<TimelineDay[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [failed, setFailed] = useState(false);
+  const [{ days, windowDays, loading, failed }, dispatch] = useReducer(timelineExpansionReducer, {
+    days: initialDays,
+    windowDays: initialWindow,
+    loading: false,
+    failed: false,
+    activeRequestId: null,
+  });
+  const inFlight = useRef(false);
+  const requestId = useRef(0);
+  const requestedWindow = useRef(initialWindow);
+  const controller = useRef<AbortController | null>(null);
 
-  const seen = new Set(shownDates);
   const atCap = windowDays >= maxWindow;
 
+  useEffect(() => () => {
+    requestId.current += 1;
+    controller.current?.abort();
+  }, []);
+
   async function loadMore() {
-    if (loading || atCap) return;
-    const next = Math.min(windowDays + 7, maxWindow);
-    setLoading(true);
-    setFailed(false);
+    // The ref closes the gap before React renders the disabled button after a rapid second click.
+    if (inFlight.current || requestedWindow.current >= maxWindow) return;
+    inFlight.current = true;
+    const id = ++requestId.current;
+    const abort = new AbortController();
+    controller.current = abort;
+    const next = Math.min(requestedWindow.current + 7, maxWindow);
+    dispatch({ type: "start", requestId: id });
     try {
       const res = await fetch(
-        `/api/dashboard/timeline?team=${encodeURIComponent(teamSlug)}&days=${next}`
+        `/api/dashboard/timeline?team=${encodeURIComponent(teamSlug)}&days=${next}`,
+        { signal: abort.signal }
       );
       if (!res.ok) throw new Error(String(res.status));
-      const data = (await res.json()) as { days: TimelineDay[] };
-      // A wider window is a superset, so REPLACE (not append): `fresh` is every day up to `next` the server
-      // hasn't already shown. Filtering by `shownDates` (not by count) means a gap week can't stop the
-      // expansion early or hide older work — only the `maxWindow` cap ends it.
-      const fresh = (data.days ?? []).filter((d) => !seen.has(d.date));
-      setOlder(fresh);
-      setWindowDays(next);
+      const data: unknown = await res.json();
+      if (!data || typeof data !== "object" || !("days" in data) || !Array.isArray(data.days)) {
+        throw new Error("invalid timeline response");
+      }
+      if (requestId.current !== id || abort.signal.aborted) return;
+      // The response is the entire requested window, including corrected recent dates.
+      requestedWindow.current = next;
+      dispatch({ type: "success", requestId: id, days: data.days as TimelineDay[], windowDays: next });
     } catch {
-      setFailed(true);
+      if (requestId.current === id && !abort.signal.aborted) dispatch({ type: "failure", requestId: id });
     } finally {
-      setLoading(false);
+      if (requestId.current === id) {
+        inFlight.current = false;
+        controller.current = null;
+      }
     }
   }
 
@@ -59,7 +78,14 @@ export function TimelineLoadMore({
 
   return (
     <>
-      {older.length > 0 && <TimelineDays days={older} />}
+      {days.length === 0 ? (
+        <p className="rounded-lg border border-border-subtle px-4 py-6 text-center text-sm text-ink-tertiary">
+          No work in the last {windowDays} days — the timeline fills in as commits, tasks, and docs land.
+          Look further back below.
+        </p>
+      ) : (
+        <TimelineDays days={days} />
+      )}
 
       {showButton && (
         <button
