@@ -188,6 +188,16 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *   - initialize the historical lane;
  *   - take the lease on L > A.
  *
+ * PACKET 4a — DIRECT CLAIM SAFETY (10 tests, appended after packet 3; review-required). Expected
+ * GREEN against GREEN3 `9ee7dbd7`; they are controls that pin GREEN3's validation, not REDs:
+ *  - an omitted `skewAllowanceMs` is exactly 60,000 ms (independent BigInt oracle; initialized L/S/U);
+ *  - ×6: zero, negative, fractional, unsafe, NaN and infinite allowances. Each fails with the fixed
+ *    static validation error before any SQL mutation, and the row is byte-identical;
+ *  - ×3: schema-permitted out-of-domain stored bounds: an idle B, an anchored B, and an anchored A.
+ *    Each fails closed with the fixed bound-free `SlackChannelStateError`; the error contains no
+ *    bound bytes and the row is byte-identical.
+ * File total after packet 4a: 68 (expected 68/68 GREEN on GREEN3).
+ *
  * GREEN3 ALSO CHANGES DISCOVERY MINIMALLY, without new tests here:
  *  - it passes its validated allowance to the claim;
  *  - on the typed delay it records one static `delayed / scan_bounds_invalid` history step for that
@@ -1399,7 +1409,98 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
     expect({ claim, rowUnchanged: (await rowDigestExcept(scope, [])) === before },
       "an ineligible row returns null with no delay bookkeeping").toEqual({ claim: null, rowUnchanged: true });
   });
+
+  // ── PACKET 4a: direct claim safety (default, invalid and out-of-domain allowance/bounds) ───────────
+
+  it("§5 claim safety: an OMITTED skewAllowanceMs is exactly 60,000 ms (independent BigInt oracle)", async () => {
+    const B = "1718900000.123456";
+    const { scope, integrationId } = await seedNewestCandidate({
+      completed_lower_ts: "1718800000.000001", completed_upper_ts: B, historical_floor_reached: true,
+    });
+    const L = boundMinusAllowance(B, BigInt(60_000));
+    expect(L, "fixture: oracle").toBe("1718899940.123456");
+    const claim = await tx((session) => claimSlackChannelPage(session, scope, { bindingIntegrationId: integrationId, bindingConfigRevision: REVISION }))
+      .catch(sanitized);
+    const bounds = claimBounds(claim);
+    expect({ ...bounds, anchorTs: undefined, segmentUpperTs: undefined, upperIsAnchor: bounds.segmentUpperTs === bounds.anchorTs },
+      "the default allowance initializes L = S = B − 60 s and U = A").toEqual({
+      lane: "newest", anchorTs: undefined, segmentUpperTs: undefined, upperIsAnchor: true,
+      lowerTs: B, requestLowerTs: L, segmentLowerTs: L, scanGeneration: 0, cursorNull: true,
+    });
+  });
+
+  it.each([
+    { label: "zero", value: 0 },
+    { label: "negative", value: -60_000 },
+    { label: "fractional", value: 1.5 },
+    { label: "unsafe", value: Number.MAX_SAFE_INTEGER + 1 },
+    { label: "NaN", value: Number.NaN },
+    { label: "infinite", value: Number.POSITIVE_INFINITY },
+  ])("§5 claim safety: a $label skewAllowanceMs fails with the fixed static error BEFORE any SQL mutation", async ({ value }) => {
+    const { scope, integrationId } = await seedNewestCandidate({
+      completed_lower_ts: "1718800000.000001", completed_upper_ts: "1718900000.123456", historical_floor_reached: true,
+    });
+    const before = await rowDigestExcept(scope, []);
+    const failure = await claimFailure(scope, integrationId, value);
+    expect({ failure, rowUnchanged: (await rowDigestExcept(scope, [])) === before }, "validation precedes SQL").toEqual({
+      failure: { name: "SlackChannelStateError", message: "slack channel state: skewAllowanceMs must be a positive whole number of milliseconds" },
+      rowUnchanged: true,
+    });
+  });
+
+  it.each([
+    {
+      label: "an IDLE newest lane whose schema-permitted certified top has 15 second digits",
+      over: { completed_lower_ts: "1718800000.000001", completed_upper_ts: "999999999999999.000000", historical_floor_reached: true },
+      canary: "999999999999999",
+    },
+    {
+      label: "an ANCHORED newest lane whose schema-permitted B has 15 second digits",
+      over: {
+        newest_anchor_ts: "1718900800.000000", newest_lower_ts: "888888888888888.5",
+        completed_lower_ts: "1718800000.000001", completed_upper_ts: "1718900000.000000", historical_floor_reached: true,
+      },
+      canary: "888888888888888",
+    },
+    {
+      label: "an ANCHORED newest lane whose schema-permitted A has 13 second digits",
+      over: {
+        newest_anchor_ts: "7777777777777.25", newest_lower_ts: "1718900400.5",
+        completed_lower_ts: "1718800000.000001", completed_upper_ts: "1718900000.000000", historical_floor_reached: true,
+      },
+      canary: "7777777777777",
+    },
+  ])("§4/§5 claim safety: $label fails closed with the fixed bound-free error, and the row is byte-identical", async ({ over, canary }) => {
+    const { scope, integrationId } = await seedNewestCandidate(over);
+    const before = await rowDigestExcept(scope, []);
+    const failure = await claimFailure(scope, integrationId, 60_000);
+    expect({
+      failure,
+      leaksBound: JSON.stringify(failure).includes(canary),
+      rowUnchanged: (await rowDigestExcept(scope, [])) === before,
+    }, "a corrupt or out-of-domain stored bound is corruption, never a delay or a claim").toEqual({
+      failure: { name: "SlackChannelStateError", message: "slack channel state: the newest lane's stored bounds are not exact supported timestamps — refusing to claim it" },
+      leaksBound: false,
+      rowUnchanged: true,
+    });
+  });
 });
+
+/**
+ * A claim that is expected to THROW, projected to its error name and its static message. The message
+ * of every state-writer validation error is a fixed sentence, which is exactly what this asserts.
+ */
+async function claimFailure(scope: SlackChannelScope, integrationId: string, skewAllowanceMs: number): Promise<Record<string, unknown>> {
+  try {
+    const result = await tx((session) => claimSlackChannelPage(session, scope, {
+      bindingIntegrationId: integrationId, bindingConfigRevision: REVISION, skewAllowanceMs,
+    }));
+    return { returned: result === null ? "null" : typeof result };
+  } catch (error) {
+    const e = (error ?? {}) as { name?: unknown; message?: unknown };
+    return { name: typeof e.name === "string" ? e.name : null, message: typeof e.message === "string" ? e.message : null };
+  }
+}
 
 /** Columns a historical claim may change: lease bookkeeping, the frozen anchor, attempt-oldest reset, and S/U. */
 const CLAIM_PERMITTED = [

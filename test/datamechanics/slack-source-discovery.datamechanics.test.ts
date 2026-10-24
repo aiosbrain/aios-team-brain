@@ -1119,3 +1119,136 @@ describe("history request slots alternate when a wake is deferred by the method 
     });
   }, 30_000);
 });
+
+// ── AIO-1170 packet 4b: the request carries the claim's FROZEN segment ────────────────────────
+
+/**
+ * AIO-1170 AM-F2 §5 — EVERY history request is `latest = U`, `inclusive = true`, `oldest = S` (the
+ * historical lane omits it at S = 0), and `cursor` only when one is stored. These are the claim's
+ * frozen segment values. They are not the anchor A, and not "the stored lower minus the allowance
+ * passed this time".
+ *
+ * Status against GREEN3 `9ee7dbd7`:
+ *  - RED (3), because discovery still sends `latest = A` and `oldest = B − allowance`:
+ *     - a progressed post-split newest segment (S > L): oldest must be S;
+ *     - a reclaim under a DIFFERENT allowance: oldest stays the frozen S on every page;
+ *     - a noncanonical anchor: latest must be canonical U, not the raw A bytes.
+ *  - Controls already covered elsewhere and unchanged: the historical S = 0 omission (seed-scan
+ *    tests) and the exact-zero newest oldest (the clamped-allowance PA-3 test).
+ * Every root is derived from the request's OWN bounds with the test's integer arithmetic.
+ */
+describe("AIO-1170 §5: every history request carries the claim's frozen segment", () => {
+  /** Exact request bounds, read from the request itself (oldest absent ⇒ 0). Fails the fixture if malformed. */
+  function requestBounds(call: SlackCall): { lower: bigint; upper: bigint } {
+    const latest = call.params.get("latest");
+    if (latest === null) throw new Error("fixture: a history request without latest");
+    const oldest = call.params.get("oldest");
+    return { lower: oldest === null ? BigInt(0) : tsMicros(oldest), upper: tsMicros(latest) };
+  }
+  const historyCategories = (result: SlackSourceDiscoveryResult) =>
+    result.steps.filter((s) => s.stage === "history").map((s) => `${s.result}:${s.category ?? ""}`);
+  const settle = (run: Promise<SlackSourceDiscoveryResult>) =>
+    run.then((result) => ({ categories: historyCategories(result) }), (error: unknown) => ({ thrown: error instanceof Error ? error.name : "non-error" }));
+
+  /** First pass: the initial historical scan, terminal and empty, certifying [A1, A1]. Returns A1. */
+  async function certifiedChannel(seed: Seed, integrationId: string, fake: SlackFake): Promise<string> {
+    await discover(seed, integrationId, fake);
+    const row = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    expect(row?.historical_floor_reached, "fixture: the initial scan certified").toBe(true);
+    return String(row?.completed_upper_ts);
+  }
+
+  it("a progressed post-split newest segment (S > L) is requested as oldest = S, latest = U, never B − allowance", async () => {
+    const seed = await seedTeam();
+    const integrationId = await setup(seed);
+    const fake = pass((call) => {
+      if (!isCatchUp(call)) return slackJson(historyBody({ messages: [] }));
+      const { upper } = requestBounds(call);
+      return slackJson(historyBody({ messages: [rootMessage(shiftTs("0.000000", upper))] }));
+    });
+    const top = await certifiedChannel(seed, integrationId, fake);
+    // A valid post-progress literal over the certified top: A = top + 10 s, B = top, L = B − 60 s,
+    // S = top + 2 s (> L), U = A, C/H empty, G + 1.
+    const A = shiftTs(top, msToMicros(10_000));
+    const L = shiftTs(top, -msToMicros(DEFAULT_SKEW_ALLOWANCE_MS));
+    const S = shiftTs(top, msToMicros(2_000));
+    const c = await rawSql();
+    await c.query(
+      `update slack_sync_channels
+          set newest_anchor_ts = $2, newest_lower_ts = $3, newest_request_lower_ts = $4,
+              newest_segment_lower_ts = $5, newest_segment_upper_ts = $2,
+              newest_scan_generation = newest_scan_generation + 1, next_lane = 'newest'
+        where team_id = $1`,
+      [seed.teamId, A, top, L, S]
+    );
+    await elapse(seed.teamId);
+    const outcome = await settle(discover(seed, integrationId, fake));
+    const sent = fake.calls.filter((call) => call.method === "conversations.history" && isCatchUp(call));
+    expect({
+      outcome,
+      request: sent.map((call) => ({ oldest: call.params.get("oldest"), latest: call.params.get("latest"), inclusive: call.params.get("inclusive"), cursor: call.params.get("cursor") })),
+    }, "the frozen segment, exactly").toEqual({
+      outcome: { categories: ["ok:"] },
+      request: [{ oldest: S, latest: A, inclusive: "true", cursor: null }],
+    });
+  });
+
+  it("a reclaim under a DIFFERENT configured allowance keeps every page of the segment at the frozen S and U", async () => {
+    const seed = await seedTeam();
+    const integrationId = await setup(seed);
+    const fake = pass((call) => {
+      if (!isCatchUp(call)) return slackJson(historyBody({ messages: [] }));
+      const { upper } = requestBounds(call);
+      const root = rootMessage(shiftTs("0.000000", upper));
+      return call.params.get("cursor") === null
+        ? slackJson(historyBody({ messages: [root], hasMore: true, nextCursor: "n-1" }))
+        : slackJson(historyBody({ messages: [root] }));
+    });
+    const top = await certifiedChannel(seed, integrationId, fake);
+    await elapse(seed.teamId);
+    const first = await settle(discover(seed, integrationId, fake, { skewAllowanceMs: 90_000 }));
+    await elapse(seed.teamId);
+    const second = await settle(discover(seed, integrationId, fake, { skewAllowanceMs: 30_000 }));
+    const sent = fake.calls.filter((call) => call.method === "conversations.history" && isCatchUp(call));
+    const frozenS = shiftTs(top, -msToMicros(90_000));
+    expect({
+      outcomes: [first, second],
+      oldest: sent.map((call) => call.params.get("oldest")),
+      sameLatest: sent.length === 2 && sent[0].params.get("latest") === sent[1].params.get("latest"),
+      cursors: sent.map((call) => call.params.get("cursor")),
+    }, "L/S are frozen by the claim that initialized the segment; a later allowance does not move them").toEqual({
+      outcomes: [{ categories: ["ok:"] }, { categories: ["ok:"] }],
+      oldest: [frozenS, frozenS],
+      sameLatest: true,
+      cursors: [null, "n-1"],
+    });
+  });
+
+  it("an anchored newest lane with a NONCANONICAL anchor is requested at canonical U, not the raw A bytes", async () => {
+    const seed = await seedTeam();
+    const integrationId = await setup(seed);
+    const fake = pass((call) => {
+      if (!isCatchUp(call)) return slackJson(historyBody({ messages: [] }));
+      return slackJson(historyBody({ messages: [] }));
+    });
+    const top = await certifiedChannel(seed, integrationId, fake);
+    // A noncanonical anchor one and a half seconds above the top, with B = top (the all-null tuple).
+    const seconds = BigInt(top.split(".")[0]) + BigInt(1);
+    const rawA = `${seconds}.5`;
+    const c = await rawSql();
+    await c.query(
+      `update slack_sync_channels set newest_anchor_ts = $2, newest_lower_ts = $3, next_lane = 'newest' where team_id = $1`,
+      [seed.teamId, rawA, top]
+    );
+    await elapse(seed.teamId);
+    const outcome = await settle(discover(seed, integrationId, fake));
+    const sent = fake.calls.filter((call) => call.method === "conversations.history" && isCatchUp(call));
+    expect({ outcome, latest: sent.map((call) => call.params.get("latest")), oldest: sent.map((call) => call.params.get("oldest")) },
+      "latest is U = canonical(A); the stored anchor keeps its bytes").toEqual({
+      outcome: { categories: ["ok:"] },
+      latest: [`${seconds}.500000`],
+      oldest: [shiftTs(top, -msToMicros(DEFAULT_SKEW_ALLOWANCE_MS))],
+    });
+    // (A's byte preservation itself is proven at the claim, in the progress suite's packet 3.)
+  });
+});
