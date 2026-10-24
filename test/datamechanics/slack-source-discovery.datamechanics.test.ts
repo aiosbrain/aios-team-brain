@@ -1252,3 +1252,229 @@ describe("AIO-1170 §5: every history request carries the claim's frozen segment
     // (A's byte preservation itself is proven at the claim, in the progress suite's packet 3.)
   });
 });
+
+// ── AIO-1170 packet 4c/4d: the L > A step end to end (DH-09), and page_outside_segment (DH-13) ───
+
+/**
+ * Status against GREEN3 `9ee7dbd7`:
+ *  - 4c, DH-09 (2 tests), expected GREEN: GREEN3 already records the claim-local delay and continues.
+ *    These pin that behavior end to end on real PostgreSQL:
+ *     - an invalid candidate gives exactly one static `delayed / scan_bounds_invalid` step, one
+ *       bookkeeping transition, zero history HTTP and its certificate unchanged;
+ *     - 51 invalid candidates (historical work exhausted) come before a 52nd eligible one, past the
+ *       default 50-row boundary. That candidate's history is `ok` in the SAME pass with exactly one
+ *       HTTP request, and every invalid candidate is transitioned exactly once.
+ *    The unsent provider-budget refusal that KEEPS its turn is the contrast already pinned by
+ *    "gives the newest lane the next real slot after a deferred wake".
+ *  - 4d, page_outside_segment (5 tests):
+ *     - RED (3): a non-root message above U on the historical lane; a root at S − 1 µs and a root at
+ *       U + 1 µs on the newest lane. Today the first is accepted and certified, and the second two
+ *       reach the state writer, which throws;
+ *     - GREEN controls (2): exact S and U are accepted, and an out-of-range `thread_ts` is not
+ *       range-filtered; malformed_timestamp precedes the range check.
+ *    The successor-safety part of the release is deferred to the implementation packet's two-session
+ *    proof.
+ */
+describe("AIO-1170 DH-09 / DH-13: claim-local delay end to end, and the page range guard", () => {
+  const SCAN_BOUNDS_DETAIL = "The scan bounds are inconsistent; no provider request was sent.";
+  const OUTSIDE_DETAIL = "The provider returned a message outside the requested time range; the scan remains incomplete.";
+  /** Columns a released, sent-but-refused page may change (§3.2 / §5). */
+  const RELEASE = ["next_lane", "claimed_lane", "lease_owner", "lease_expires_at", "due_at", "last_error_code", "updated_at"];
+  const without = (row: Record<string, unknown> | null | undefined, keys: readonly string[]) =>
+    Object.fromEntries(Object.entries(row ?? {}).filter(([key]) => !keys.includes(key)));
+  const historySteps = (result: SlackSourceDiscoveryResult) =>
+    result.steps.filter((s) => s.stage === "history").map((s) => ({ result: s.result, category: s.category ?? null, detail: s.detail ?? null, channelId: s.channelId ?? null }));
+  const settle = (run: Promise<SlackSourceDiscoveryResult>) =>
+    run.then((result) => ({ steps: historySteps(result) }), (error: unknown) => ({ thrown: error instanceof Error ? error.name : "non-error" }));
+  const ids = (count: number) => Array.from({ length: count }, (_, i) => `C0DH${String(i).padStart(3, "0")}`);
+
+  /**
+   * Bring an integration selecting `channels` to a verified binding, then REPLACE its channel rows
+   * with literal public, bound rows. `invalid` channels sit under a far-future certified top
+   * (newest L > A; historical floor reached); the rest are fresh. The due order follows array order.
+   */
+  async function seededSelection(seed: Seed, channels: readonly string[], invalid: number): Promise<string> {
+    const integrationId = await setup(seed, channels);
+    await discover(seed, integrationId, pass(() => slackJson(historyBody({ messages: [] }))));
+    const c = await rawSql();
+    const { rows } = await c.query<{ revision: string | null }>(
+      `select binding_config_revision as revision from slack_sync_channels where team_id = $1 and binding_config_revision is not null limit 1`,
+      [seed.teamId]
+    );
+    const revision = rows[0]?.revision;
+    if (!revision) throw new Error("fixture: the first pass bound no channel");
+    await c.query(`delete from slack_sync_channels where team_id = $1`, [seed.teamId]);
+    for (const [i, channelId] of channels.entries()) {
+      const bad = i < invalid;
+      await c.query(
+        `insert into slack_sync_channels
+           (team_id, workspace_id, channel_id, public_state, public_checked_at, binding_integration_id, binding_config_revision,
+            completed_lower_ts, completed_upper_ts, historical_floor_reached, next_lane, due_at)
+         values ($1, $2, $3, 'public', clock_timestamp(), $4::uuid, $5, $6, $7, $8, $9,
+                 timestamptz '2020-01-01 00:00:00+00' + ($10::int * interval '1 second'))`,
+        [seed.teamId, WORKSPACE, channelId, integrationId, revision,
+          bad ? "1718800000.000001" : null, bad ? "4102444800.000000" : null, bad, bad ? "newest" : "historical", i]
+      );
+    }
+    await elapse(seed.teamId);
+    return integrationId;
+  }
+
+  /** A db client that COUNTS the L > A bookkeeping statements (a count only; no SQL text or value kept). */
+  function countingDelays(counter: { delays: number }) {
+    return transactionSessionDecoratedDb(db(), (session) => ({
+      ...session,
+      executeSql: (async (text: string, params?: unknown[]) => {
+        if (/last_error_code\s*=\s*'scan_bounds_invalid'/.test(text)) counter.delays += 1;
+        return session.executeSql(text, params);
+      }) as TransactionSession["executeSql"],
+    }));
+  }
+
+  it("DH-09: an invalid candidate is one static delayed step and one bookkeeping transition, with zero history HTTP and its certificate unchanged", async () => {
+    const seed = await seedTeam();
+    const [only] = ids(1);
+    const integrationId = await seededSelection(seed, [only], 1);
+    const before = await channelRow(seed.teamId, WORKSPACE, only);
+    const fake = pass(() => slackJson(historyBody({ messages: [] })));
+    const counter = { delays: 0 };
+    const result = await discover(seed, integrationId, fake, { client: countingDelays(counter) });
+    const after = await channelRow(seed.teamId, WORKSPACE, only);
+    expect({
+      steps: historySteps(result),
+      historyHttp: fake.countOf("conversations.history"),
+      delays: counter.delays,
+      certificate: [after?.completed_lower_ts, after?.completed_upper_ts, after?.historical_floor_reached],
+      lease: [after?.lease_owner, after?.claimed_lane, Number(after?.attempts), Number(after?.lease_generation)],
+      turn: after?.next_lane,
+    }, "a local delay sends nothing and moves only its bookkeeping").toEqual({
+      steps: [{ result: "delayed", category: "scan_bounds_invalid", detail: SCAN_BOUNDS_DETAIL, channelId: only }],
+      historyHttp: 0,
+      delays: 1,
+      certificate: [before?.completed_lower_ts, before?.completed_upper_ts, before?.historical_floor_reached],
+      lease: [null, null, Number(before?.attempts), Number(before?.lease_generation)],
+      turn: "historical",
+    });
+  });
+
+  it("DH-09: 51 invalid candidates do not block a 52nd eligible one past the default 50-row boundary, in the SAME pass", async () => {
+    const seed = await seedTeam();
+    const channels = ids(52);
+    const integrationId = await seededSelection(seed, channels, 51);
+    const fake = pass(() => slackJson(historyBody({ messages: [] })));
+    const counter = { delays: 0 };
+    const result = await discover(seed, integrationId, fake, { client: countingDelays(counter) });
+    const steps = historySteps(result);
+    const eligible = channels[51];
+    const rows = await Promise.all(channels.slice(0, 51).map((channelId) => channelRow(seed.teamId, WORKSPACE, channelId)));
+    expect({
+      delayedSteps: steps.filter((s) => s.category === "scan_bounds_invalid").length,
+      delayedChannels: new Set(steps.filter((s) => s.category === "scan_bounds_invalid").map((s) => s.channelId)).size,
+      last: steps.at(-1),
+      historyHttp: fake.countOf("conversations.history"),
+      delays: counter.delays,
+      invalidCertificatesUnchanged: rows.every((row) => row?.completed_upper_ts === "4102444800.000000" && row?.lease_owner === null),
+    }, "every invalid candidate is transitioned once and the eligible one is read in the same bounded pass").toEqual({
+      delayedSteps: 51,
+      delayedChannels: 51,
+      last: { result: "ok", category: null, detail: null, channelId: eligible },
+      historyHttp: 1,
+      delays: 51,
+      invalidCertificatesUnchanged: true,
+    });
+  }, 60_000);
+
+  /** The historical initial scan's in-flight row, then a page built from that request's bounds. */
+  function guardedPass(page: (bounds: { lower: bigint; upper: bigint }, call: SlackCall) => Record<string, unknown>) {
+    const seen: { inFlight: Record<string, unknown> | null } = { inFlight: null };
+    const fake = pass(async (call) => {
+      const latest = call.params.get("latest");
+      if (latest === null) throw new Error("fixture: a history request without latest");
+      const oldest = call.params.get("oldest");
+      // The claim is committed before the request, so this is the row the release must leave alone.
+      seen.inFlight = await channelRow(currentTeam.id, WORKSPACE, CHANNEL);
+      return slackJson(page({ lower: oldest === null ? BigInt(0) : tsMicros(oldest), upper: tsMicros(latest) }, call));
+    });
+    return { fake, seen };
+  }
+  const currentTeam = { id: "" };
+  const at = (micros: bigint) => shiftTs("0.000000", micros);
+
+  /** Expect a refused-and-released page: the exact step, no roots, and only release bookkeeping moved. */
+  async function expectOutsideSegment(seed: Seed, outcome: unknown, inFlight: Record<string, unknown> | null, rootsBefore: string[]) {
+    const after = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    expect({
+      outcome,
+      roots: await threadRootTs(seed.teamId),
+      onlyRelease: JSON.stringify(without(after, RELEASE)) === JSON.stringify(without(inFlight, RELEASE)),
+      released: { lease: after?.lease_owner ?? null, error: after?.last_error_code ?? null },
+    }, "the whole page is refused before any root or state write; only the fenced claim is released").toEqual({
+      outcome: { steps: [{ result: "delayed", category: "page_outside_segment", detail: OUTSIDE_DETAIL, channelId: CHANNEL }] },
+      roots: rootsBefore,
+      onlyRelease: true,
+      released: { lease: null, error: "page_outside_segment" },
+    });
+  }
+
+  it("DH-13 RED: a NON-ROOT message above U refuses the whole historical page (thread_ts in range does not save it)", async () => {
+    const seed = await seedTeam();
+    currentTeam.id = seed.teamId;
+    const integrationId = await setup(seed);
+    const { fake, seen } = guardedPass(({ upper }) => historyBody({
+      messages: [rootMessage(at(upper)), rootMessage(at(upper + BigInt(1)), { thread_ts: at(upper) })],
+    }));
+    const outcome = await settle(discover(seed, integrationId, fake));
+    await expectOutsideSegment(seed, outcome, seen.inFlight, []);
+    expect(JSON.stringify(outcome), "no raw timestamp in the report").not.toMatch(/[0-9]{10}[.][0-9]{6}/);
+  });
+
+  it.each([
+    { label: "a root at S − 1 µs", root: (b: { lower: bigint; upper: bigint }) => b.lower - BigInt(1) },
+    { label: "a root at U + 1 µs (same millisecond as U)", root: (b: { lower: bigint; upper: bigint }) => b.upper + BigInt(1) },
+  ])("DH-13 RED: on the newest lane, $label refuses the whole page", async ({ root }) => {
+    const seed = await seedTeam();
+    currentTeam.id = seed.teamId;
+    const integrationId = await setup(seed);
+    const { fake, seen } = guardedPass((bounds, call) => historyBody({
+      messages: isCatchUp(call) ? [rootMessage(at(root(bounds)))] : [],
+    }));
+    await discover(seed, integrationId, fake); // initial historical, terminal and empty
+    await elapse(seed.teamId);
+    const outcome = await settle(discover(seed, integrationId, fake));
+    await expectOutsideSegment(seed, outcome, seen.inFlight, []);
+  });
+
+  it("DH-13 control: roots at EXACTLY S and U are accepted, and an out-of-range thread_ts is not range-filtered", async () => {
+    const seed = await seedTeam();
+    currentTeam.id = seed.teamId;
+    const integrationId = await setup(seed);
+    const { fake } = guardedPass(({ lower, upper }, call) => historyBody({
+      messages: isCatchUp(call)
+        ? [rootMessage(at(upper)), rootMessage(at(upper - BigInt(2)), { thread_ts: "1718900000.000100" }), rootMessage(at(lower))]
+        : [],
+    }));
+    await discover(seed, integrationId, fake);
+    await elapse(seed.teamId);
+    const result = await discover(seed, integrationId, fake);
+    const catchUp = fake.calls.filter((call) => call.method === "conversations.history" && isCatchUp(call))[0];
+    expect({
+      steps: historySteps(result).map((s) => `${s.result}:${s.category ?? ""}`),
+      roots: await threadRootTs(seed.teamId),
+    }, "inclusive edges are inside; a reply's root identity is not a range test").toEqual({
+      steps: ["ok:"],
+      roots: [catchUp?.params.get("oldest"), catchUp?.params.get("latest")],
+    });
+  });
+
+  it("DH-13 control: malformed_timestamp still precedes the range check", async () => {
+    const seed = await seedTeam();
+    currentTeam.id = seed.teamId;
+    const integrationId = await setup(seed);
+    const { fake } = guardedPass(({ upper }) => historyBody({
+      messages: [rootMessage(at(upper + BigInt(1))), rootMessage("not-a-timestamp")],
+    }));
+    const result = await discover(seed, integrationId, fake);
+    expect(historySteps(result).map((s) => s.category)).toEqual(["malformed_timestamp"]);
+    expect(await threadRootTs(seed.teamId)).toEqual([]);
+  });
+});
