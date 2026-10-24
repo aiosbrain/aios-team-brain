@@ -20,7 +20,10 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
 /**
  * AIO-1170 AM-F2 — RED-FIRST RUNTIME PACKET 1: STATE-WRITER HISTORY ADMISSION
  * (accepted consolidated contract `aio1170-am-f2-deep-history-consolidated-accepted-spec-migration-v1-20261023.md`,
- * §3.1–§3.3, §4, §5, §6; PARTIAL coverage of F2-01/04/05/06/09/10/11 and DH-02/06/08).
+ * §3.1–§3.3, §4, §5, §6; PARTIAL coverage of F2-01/04/05/06/09/10/11). DH IDs are named only as
+ * §10.1 derives them from those F2 rows: F2-01 → DH-06/08, F2-04 → DH-02/06/13, F2-05 → DH-02,
+ * F2-06 → DH-02/07/12/13, F2-09 → DH-03/12/13, F2-10 → DH-08/09/12, F2-11 → DH-07/08. No DH row is
+ * covered in full here.
  *
  * ONE SEAM: `acceptSlackChannelPage`, called directly, as the SQL authority over the HISTORICAL
  * lane's SQL-local cursor history H. It runs on the real data-mechanics PostgreSQL, with the
@@ -51,7 +54,11 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  * LEDGER. Each test's label carries its contract ID. "Today" is the implementation at this file's
  * base checkpoint.
  *
- * RED today (28). Each fails on its behavioral `expect`.
+ * NO-LEAK RULE: every returned acceptance outcome (written, rejected, refused, subdivided) and every
+ * release outcome is checked for an unrepresentable cursor, a history key and the older H entry. A
+ * leak becomes an extra `leaked: true` field that no expectation contains.
+ *
+ * RED today (31). Each fails on its behavioral `expect`.
  *  - §5 row 1, ordinary continuation (1). Appends the exact cursor as H's last element and records
  *    attempt-oldest. Turn passed, lease cleared, last_read_at set, last_error_code null; the newest
  *    lane is exact. Today: 23514.
@@ -68,16 +75,26 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *    Today: 23514.
  *  - F2-04 entry boundary (1): 999 → 1,000 entries is written, singleton. Today: 23514.
  *  - §5 final terminal (S = L) / §6 / F2-04/F2-05 terminal at either cap (2). This is real envelope
- *    completion:
+ *    completion from a seeded prior attempt-oldest OLDER than the page oldest and a non-null
+ *    diagnostic:
  *     - historical A, S, U, attempt-oldest and aggregate are null; C and H are cleared;
  *     - G = 5; floor true;
- *     - completed bounds are [page oldest, A] and provisional is null;
- *     - the newest lane is exact.
+ *     - completed bounds are [prior attempt-oldest, A] and provisional is null;
+ *     - turn passed, lease cleared, last_read_at set, last_error_code cleared;
+ *     - the newest lane is exact, and a whole-row digest proves nothing outside the terminal fields
+ *       moved.
  *    Today: 23514.
  *  - F2-09 (partial: direct writer only) lone surrogates, singleton (4): the primary embedded lone
  *    HIGH, then lone LOW, trailing HIGH and isolated leading LOW. Each must be
  *    `rejected/cursor_unrepresentable`, with the release as the only change and no unrepresentable
  *    cursor reaching any SQL statement. Today the raw cursor is a SQL parameter, then 23514.
+ *  - F2-09 (partial) unrepresentable PRECEDENCE, singleton (3). A lone HIGH must stay
+ *    `cursor_unrepresentable` in each case, with no SQL exposure, the release as the only change and
+ *    the stored size unchanged:
+ *     - at the entry cap (not entries_exceeded);
+ *     - at both caps (not entries_exceeded);
+ *     - against a stored literal-U+FFFD spelling of the same text (not cursor_repeated).
+ *    Today the raw cursor is a SQL parameter, then 23514.
  *  - F2-09 positive controls (2): a surrogate pair and a literal U+FFFD are appended exactly. Today:
  *    23514.
  *  - F2-11/DH-08 (partial) channel-fence matrix (4 of 9): binding integration changed, public proof
@@ -126,6 +143,11 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *  - F2-02 (same cursor valid in another lane, channel, workspace, team, segment or generation;
  *    binder takeover);
  *  - F2-03 (cursor grammar, length and round-trip edges, and malformed direct arrays);
+ *  - F2-07 (lane-local pending across later events) and F2-08 (real recovery and turn handling);
+ *  - DH-07 (crash, receipt loss and rollback) and DH-10 (the PA-3 margin surviving subdivision);
+ *  - the actual provider invalid_cursor restart and subdivision variants;
+ *  - PostgreSQL-vs-JavaScript serialization difference evidence (F2-05 remainder);
+ *  - repetition at the BYTE cap (repetition is covered here only at the entry cap);
  *  - stored-state fail-closed validation of a malformed or inconsistent persisted H;
  *  - two-session races and expiry between lock and write; stale-release successor protection;
  *  - the remaining fence predicates: claimed_lane, lease_generation alone, anchor drift, the
@@ -240,22 +262,54 @@ async function recordingTx<T>(recorder: SqlRecorder, fn: (session: TransactionSe
   }
 }
 
-/** A typed outcome reduced to `{ outcome, category? }`; nothing else (no state, no cursor) is kept. */
-function project(result: unknown): Record<string, unknown> {
-  const value = (result ?? {}) as { outcome?: unknown; category?: unknown };
-  return value.category === undefined ? { outcome: value.outcome } : { outcome: value.outcome, category: value.category };
-}
-
 /** Any exception reduced to SQLSTATE and name; nothing value-bearing is kept. */
 function sanitized(error: unknown): Record<string, unknown> {
   const e = (error ?? {}) as { code?: unknown; name?: unknown };
   return { threw: true, code: typeof e.code === "string" ? e.code : null, name: typeof e.name === "string" ? e.name : null };
 }
 
+/**
+ * True if any PROPERTY NAME, at any depth, names a history. Values are not matched, because the
+ * contract's own categories (`cursor_history_*`) legitimately appear as a category or last error code.
+ */
+function hasHistoryKey(value: unknown, seen: WeakSet<object> = new WeakSet()): boolean {
+  if (value === null || typeof value !== "object" || seen.has(value)) return false;
+  seen.add(value);
+  return Object.entries(value).some(([key, item]) => /history/i.test(key) || hasHistoryKey(item, seen));
+}
+
 /** Booleans only: does a returned value name a history, or carry the older H entry? */
 function leaks(value: unknown): { historyKey: boolean; olderEntry: boolean } {
   const text = JSON.stringify(value) ?? "";
-  return { historyKey: /history/i.test(text), olderEntry: text.includes(OLDER_ENTRY) };
+  return { historyKey: hasHistoryKey(value), olderEntry: text.includes(OLDER_ENTRY) };
+}
+
+/**
+ * True if a RETURNED value leaks anything: an unrepresentable cursor (checked first, so such a
+ * value is never stringified), a history key, or the older H entry.
+ */
+function returnedLeak(value: unknown): boolean {
+  if (carriesUnrepresentableCursor(value)) return true;
+  const found = leaks(value);
+  return found.historyKey || found.olderEntry;
+}
+
+/**
+ * A typed outcome reduced to `{ outcome, category? }`; nothing else (no state, no cursor) is kept.
+ * The no-leak check applies to EVERY returned outcome (written, rejected, refused, subdivided). A
+ * leaking value gains `leaked: true`, which no expectation contains, so the leak is an assertion
+ * mismatch without its value ever being printed.
+ */
+function project(result: unknown): Record<string, unknown> {
+  const value = (result ?? {}) as { outcome?: unknown; category?: unknown };
+  const base: Record<string, unknown> = value.category === undefined ? { outcome: value.outcome } : { outcome: value.outcome, category: value.category };
+  return returnedLeak(result) ? { ...base, leaked: true } : base;
+}
+
+/** A release outcome under the same no-leak rule: its bare outcome when clean, else a leak marker. */
+function releaseView(released: unknown): unknown {
+  const outcome = (released as { outcome?: unknown } | null)?.outcome;
+  return returnedLeak(released) ? { outcome, leaked: true } : outcome;
 }
 
 type Page = { terminal: boolean; nextCursor: string | null; oldestTs: string | null };
@@ -271,7 +325,7 @@ async function admit(claim: SlackChannelClaim, page: Page, recorder?: SqlRecorde
     const view = accepted as unknown as { outcome: string; category?: string };
     if (view.outcome === "rejected" && typeof view.category === "string") {
       const released = await releaseSlackChannelForRetry(session, claim, { errorCode: view.category, turn: "passed", nextDueAt: null });
-      return { accept: project(accepted), release: released.outcome };
+      return { accept: project(accepted), release: releaseView(released) };
     }
     return { accept: project(accepted) };
   };
@@ -431,6 +485,16 @@ const REVOKE_PUBLIC = sqlMutation("update slack_sync_channels set public_state =
 /** Columns a PARTIAL acceptance may change; every other column must be byte-identical. */
 const PARTIAL_PERMITTED = [
   "historical_cursor", "historical_cursor_history", "historical_oldest_seen_ts",
+  "next_lane", "claimed_lane", "lease_owner", "lease_expires_at", "last_error_code", "last_read_at", "due_at", "updated_at",
+];
+/**
+ * Columns a historical §5 final terminal (S = L) / §6 envelope completion may change; every other
+ * column, including the whole newest lane, attempts and lease_generation, must be byte-identical.
+ */
+const TERMINAL_PERMITTED = [
+  "historical_anchor_ts", "historical_cursor", "historical_cursor_history", "historical_scan_generation",
+  "historical_segment_lower_ts", "historical_segment_upper_ts", "historical_oldest_seen_ts", "historical_completed_segments_oldest_ts",
+  "historical_floor_reached", "completed_lower_ts", "completed_upper_ts", "newest_catchup_upper_ts",
   "next_lane", "claimed_lane", "lease_owner", "lease_expires_at", "last_error_code", "last_read_at", "due_at", "updated_at",
 ];
 /** Columns the §3.2 passed-turn release may change after a true rejection; nothing else may move. */
@@ -631,17 +695,42 @@ describe("AM-F2 runtime packet 1 — state-writer history admission (real Postgr
   ])("§5 final terminal (S = L) / §6 / F2-04/F2-05 a TERMINAL page at $label finishes the envelope: real completion, not a restart", async ({ history, stored }) => {
     const seeded = await seedWideSegment(history());
     const { scope } = seeded;
-    expect(await storedHistoricalSize(scope), "fixture: the lane is exactly at its cap").toEqual(stored);
+    // Discriminating prior state: a current-attempt oldest OLDER than the page's oldest (so the §6
+    // merge must pick it) and a non-null diagnostic (so the success must clear it).
+    const priorAttemptOldest = "1718900050.000000";
+    const pageOldest = "1718900100.000000";
+    await tx((session) => session.executeSql(
+      "update slack_sync_channels set historical_oldest_seen_ts = $2, last_error_code = 'prior_failure' where team_id = $1",
+      [scope.teamId, priorAttemptOldest]
+    ));
+    expect({ size: await storedHistoricalSize(scope), prior: await bookkeeping(scope, priorAttemptOldest) },
+      "fixture: the lane is exactly at its cap, with a prior attempt-oldest and diagnostic").toEqual({
+      size: stored,
+      prior: {
+        next_lane: "historical", claimed_lane: null, lease_cleared: true, last_read_set: false, last_error_code: "prior_failure",
+        attempt_oldest_is_expected: true,
+      },
+    });
     const claim = await claimHistorical(seeded);
-    const outcome = await admit(claim, { terminal: true, nextCursor: null, oldestTs: "1718900100.000000" });
-    expect({ outcome, completion: await historicalCompletion(scope, "1718900100.000000", HISTORICAL_ANCHOR) },
-      "a terminal page appends no cursor; the whole historical envelope is certified [page oldest, A] and its lane state cleared").toEqual({
+    const before = await rowDigestExcept(scope, TERMINAL_PERMITTED);
+    const outcome = await admit(claim, { terminal: true, nextCursor: null, oldestTs: pageOldest });
+    expect({
+      outcome,
+      completion: await historicalCompletion(scope, priorAttemptOldest, HISTORICAL_ANCHOR),
+      bookkeeping: await bookkeeping(scope, null),
+      onlyTerminalFieldsMoved: (await rowDigestExcept(scope, TERMINAL_PERMITTED)) === before,
+    }, "a terminal page appends no cursor; the whole historical envelope is certified [older of prior attempt-oldest and page oldest, A], its lane state cleared, and nothing else moves").toEqual({
       outcome: { accept: { outcome: "written" } },
       completion: {
         anchor_cleared: true, segment_cleared: true, attempt_oldest_cleared: true, aggregate_cleared: true,
         cursor_cleared: true, history_cleared: true, generation: 5, floor_reached: true,
         completed_lower_is_expected: true, completed_upper_is_expected: true, provisional_cleared: true, newest_lane_unchanged: true,
       },
+      bookkeeping: {
+        next_lane: "newest", claimed_lane: null, lease_cleared: true, last_read_set: true, last_error_code: null,
+        attempt_oldest_is_expected: true,
+      },
+      onlyTerminalFieldsMoved: true,
     });
   });
 
@@ -679,6 +768,43 @@ describe("AM-F2 runtime packet 1 — state-writer history admission (real Postgr
     }, "every unpaired surrogate shape is the same typed rejection with no SQL exposure").toEqual({
       outcome: { accept: { outcome: "rejected", category: "cursor_unrepresentable" }, release: "written" },
       unrepresentableCursorReachedSql: false, interceptorLive: true, onlyReleaseFieldsMoved: true,
+    });
+  });
+
+  // The stored spelling a lone HIGH would collapse to under UTF-8 replacement: same marker and
+  // suffix, with a literal U+FFFD. It is NOT the final element, so the current cursor (sent by every
+  // fence) carries no marker.
+  const FFFD_SPELLING = `${UNREPRESENTABLE_MARKER}${String.fromCodePoint(0xfffd)}-x`;
+  it.each([
+    {
+      label: "at the ENTRY cap, where a fitting check would say entries_exceeded", history: entryCapHistory,
+      stored: { entries: 1000, bytes: 10000 },
+    },
+    {
+      label: "at BOTH caps, where a fitting check would say entries_exceeded", history: byteCapHistory,
+      stored: { entries: 1000, bytes: 1048576 },
+    },
+    {
+      label: "against a stored literal-U+FFFD spelling, where a replacement-encoded comparison would say cursor_repeated",
+      history: () => [FFFD_SPELLING, "syn-h-2"], stored: null,
+    },
+  ])("F2-09 (partial) precedence on a SINGLETON segment: a lone HIGH surrogate $label is still cursor_unrepresentable, and it NEVER reaches SQL", async ({ history, stored }) => {
+    const seeded = await seedSingletonSegment(history());
+    const { scope } = seeded;
+    const sizeBefore = await storedHistoricalSize(scope);
+    if (stored) expect(sizeBefore, "fixture: the stored history is exactly at the named cap").toEqual(stored);
+    const claim = await claimHistorical(seeded);
+    const before = await rowDigestExcept(scope, RELEASE_PERMITTED);
+    const recorder = newRecorder();
+    const lone = `${UNREPRESENTABLE_MARKER}${String.fromCharCode(0xd800)}-x`;
+    const outcome = await admit(claim, { terminal: false, nextCursor: lone, oldestTs: seeded.pageOldest }, recorder);
+    expect({
+      outcome, unrepresentableCursorReachedSql: recorder.unrepresentableCursorSent, interceptorLive: recorder.statements > 0,
+      onlyReleaseFieldsMoved: (await rowDigestExcept(scope, RELEASE_PERMITTED)) === before,
+      sizeUnchanged: JSON.stringify(await storedHistoricalSize(scope)) === JSON.stringify(sizeBefore),
+    }, "unrepresentable precedes repetition and capacity; the release is the only change").toEqual({
+      outcome: { accept: { outcome: "rejected", category: "cursor_unrepresentable" }, release: "written" },
+      unrepresentableCursorReachedSql: false, interceptorLive: true, onlyReleaseFieldsMoved: true, sizeUnchanged: true,
     });
   });
 
