@@ -211,6 +211,36 @@ const CLOCK_ANCHOR_TS = `(floor(extract(epoch from statement_timestamp()))::bigi
        || '.'
        || lpad(((extract(microseconds from statement_timestamp())::bigint) % 1000000)::text, 6, '0'))`;
 
+/**
+ * The canonical bound spelling of an exact instant (§4), by TEXT operations only:
+ *  - seconds without leading zeroes (`0` if they are all zeroes);
+ *  - a dot;
+ *  - the fraction right-padded to exactly six digits.
+ * No numeric or float cast is involved, so nothing is rounded. Null in, null out. The input is
+ * already shape-checked by the table's timestamp rule; a malformed result would fail the progress
+ * CHECK rather than be stored. `expr` is always a column expression of this module, never a value.
+ */
+function canonicalBoundSql(expr: string): string {
+  return `(case when pg_catalog.ltrim(pg_catalog.split_part(${expr}, '.', 1), '0') = '' then '0'
+                else pg_catalog.ltrim(pg_catalog.split_part(${expr}, '.', 1), '0') end
+           || '.' || pg_catalog.rpad(pg_catalog.split_part(${expr}, '.', 2), 6, '0'))`;
+}
+
+/**
+ * The historical anchor a claim of that lane holds, from the row being updated: the existing anchor
+ * byte for byte, else the certified bottom made canonical, else the DB clock (already canonical).
+ */
+const HISTORICAL_CLAIM_ANCHOR = `coalesce(c.historical_anchor_ts, ${canonicalBoundSql("c.completed_lower_ts")}, ${CLOCK_ANCHOR_TS})`;
+
+/**
+ * The historical lane's segment tuple is the all-null INITIALIZATION shape (§4): no S and no U, and so
+ * no cursor, an empty history, and no attempt or aggregate oldest. The whole tuple is tested, never
+ * the cursor alone: an initialized segment may legitimately have a null cursor.
+ */
+const HISTORICAL_SEGMENT_UNINITIALIZED = `(c.historical_segment_lower_ts is null and c.historical_segment_upper_ts is null
+                  and c.historical_cursor is null and c.historical_cursor_history = '[]'::pg_catalog.jsonb
+                  and c.historical_oldest_seen_ts is null and c.historical_completed_segments_oldest_ts is null)`;
+
 const STATE_COLUMNS = `team_id, workspace_id, channel_id, binding_integration_id, binding_config_revision,
        public_state, public_checked_at, newest_anchor_ts, newest_lower_ts, newest_cursor,
        newest_scan_generation::text as newest_scan_generation, historical_anchor_ts, historical_cursor,
@@ -524,7 +554,12 @@ export async function delaySlackChannel(
 
 /**
  * Claim this channel's next history request: pick the lane, freeze the scan's anchor if it is
- * starting, and take the lease — all in ONE conditional statement.
+ * starting, give a HISTORICAL lane that has no segment yet its first one (`[0, canonical(A)]`), and
+ * take the lease — all in ONE conditional statement.
+ *
+ * Newest-lane segment initialization (L = max(0, B − skew allowance)) is not here yet: it needs the
+ * configured allowance, which this writer does not receive. A newest lane is still claimed
+ * unsegmented, and its terminal page is accepted as before.
  *
  * The lane rule, and why it is here rather than in a caller: the newest lane is always pending
  * (there is always more "now"), the historical lane is pending until it reaches the retention floor
@@ -599,14 +634,26 @@ export async function claimSlackChannelPage(
                  then coalesce(c.completed_upper_ts, c.newest_catchup_upper_ts, c.historical_anchor_ts)
                else c.newest_lower_ts end,
              -- A starting historical scan resumes at the certified bottom, or — the first time —
-             -- freezes the clock as the anchor everything else is measured against.
+             -- freezes the clock as the anchor everything else is measured against. A NEW anchor taken
+             -- from the certified bottom is stored canonically (§4); an EXISTING anchor keeps its bytes.
              historical_anchor_ts = case
-               when candidate.lane = 'historical'
-                 then coalesce(c.historical_anchor_ts, c.completed_lower_ts, ${CLOCK_ANCHOR_TS})
+               when candidate.lane = 'historical' then ${HISTORICAL_CLAIM_ANCHOR}
                else c.historical_anchor_ts end,
              historical_oldest_seen_ts = case
                when candidate.lane = 'historical' and c.historical_anchor_ts is null then null
                else c.historical_oldest_seen_ts end,
+             -- §5 INITIALIZATION, in this same statement and under the same predicates: only a claimed
+             -- historical lane whose WHOLE segment tuple is still the all-null initialization shape gets
+             -- its first segment [L = 0, U = canonical(A)]. Any existing segment, whether fresh,
+             -- split, lowered by a terminal segment or carrying a cursor, is resumed untouched. The
+             -- cursor, history, attempt-oldest, aggregate and generation are never written here.
+             historical_segment_lower_ts = case
+               when candidate.lane = 'historical' and ${HISTORICAL_SEGMENT_UNINITIALIZED} then '0.000000'
+               else c.historical_segment_lower_ts end,
+             historical_segment_upper_ts = case
+               when candidate.lane = 'historical' and ${HISTORICAL_SEGMENT_UNINITIALIZED}
+                 then ${canonicalBoundSql(HISTORICAL_CLAIM_ANCHOR)}
+               else c.historical_segment_upper_ts end,
              updated_at = clock_timestamp()
         from candidate
        where c.id = candidate.id
