@@ -202,6 +202,11 @@ function exactTicks(value: string): bigint | null {
 const PAGE_UNREADABLE_DETAIL = "The page could not be read in full, so nothing from it was enqueued or certified.";
 const PAGE_OUTSIDE_SEGMENT_DETAIL =
   "The provider returned a message outside the requested time range; the scan remains incomplete.";
+/** The fixed details of the state writer's typed admission outcomes (§3.2, §5). */
+const CURSOR_REPEATED_DETAIL = "The page repeated a saved cursor; no roots or coverage were accepted.";
+const SUBDIVIDED_DETAIL = "The scan was divided into a smaller time range; no roots from this page were accepted.";
+const UNSPLITTABLE_DETAIL =
+  "The provider continuation cannot be followed for this timestamp range; the scan remains incomplete.";
 
 /**
  * The claim's frozen active segment, which is the request's and the validator's single source of
@@ -241,12 +246,17 @@ function segmentTicks(segment: SlackHistorySegment): { lower: bigint; upper: big
  * THE ORDER IS THE CONTRACT (§5):
  *  1. malformed_page;
  *  2. both pagination_incomplete contradictions;
- *  3. cursor_repeated;
- *  4. malformed_timestamp, for any `ts` or `thread_ts`;
- *  5. and only then, when the claimed `segment` is given, `page_outside_segment`.
- * Step 5 tests EVERY raw message `ts`, root or not, against [S, U] inclusive, in exact microseconds.
+ *  3. malformed_timestamp, for any `ts` or `thread_ts`;
+ *  4. when the claimed `segment` is given, `page_outside_segment`;
+ *  5. and only then, when `sentCursor` is given, an immediate repeat is `cursor_repeated`.
+ * Step 4 tests EVERY raw message `ts`, root or not, against [S, U] inclusive, in exact microseconds.
  * A `thread_ts` is not range-tested: a reply in range may belong to a root outside it. Without a
- * segment (a direct structural check) step 5 does not run.
+ * segment (a direct structural check) step 4 does not run.
+ *
+ * Step 5 is NOT structural. Repetition is an admission decision, and in the discovery caller it is
+ * made inside the acceptance transaction, AFTER selection and channel authority. The caller therefore
+ * validates with `sentCursor: null`, so an immediate repeat reaches the state writer, whose durable
+ * check covers it. Step 5 remains for direct callers that ask.
  */
 export function validateSlackHistoryPage(
   page: SlackPage,
@@ -260,9 +270,6 @@ export function validateSlackHistoryPage(
   // an absent flag as false). Taken as the terminal page it would certify the interval and close the historical
   // lane with the rest of the history never read, so it is refused like its sibling above.
   if (!page.hasMore && page.nextCursor !== null) return { ok: false, category: "pagination_incomplete" };
-  if (page.nextCursor !== null && page.nextCursor === opts.sentCursor) {
-    return { ok: false, category: "cursor_repeated" };
-  }
 
   const roots: string[] = [];
   let oldestTs: string | null = null;
@@ -287,6 +294,10 @@ export function validateSlackHistoryPage(
       const at = exactTicks((message as { ts: string }).ts);
       if (at === null || at < lower || at > upper) return { ok: false, category: "page_outside_segment" };
     }
+  }
+  // Last, and only when asked: every structural refusal above takes precedence over a repeat.
+  if (page.nextCursor !== null && page.nextCursor === opts.sentCursor) {
+    return { ok: false, category: "cursor_repeated" };
   }
   return { ok: true, roots, oldestTs, hasMore: page.hasMore, nextCursor: page.nextCursor };
 }
@@ -1048,7 +1059,10 @@ async function fetchAndAccept(
   }
 
   // Structural, BEFORE the acceptance transaction: the same segment the request was sent for.
-  const page = validateSlackHistoryPage(call.page, { sentCursor: claim.cursor, segment });
+  // `sentCursor: null` ON PURPOSE. Repetition, immediate or durable, is an ADMISSION decision, made
+  // by the state writer inside the transaction below, after selection and channel authority. The
+  // sent cursor is H's last entry, so the writer's durable check sees an immediate repeat too.
+  const page = validateSlackHistoryPage(call.page, { sentCursor: null, segment });
   if (!page.ok) {
     // The request WAS sent, so its slot was used and the turn passes. Only this fenced claim is
     // released: a stale release refuses rather than overwriting a successor. No root, frontier,
@@ -1085,26 +1099,59 @@ async function fetchAndAccept(
     const locked = await lockSlackChannelForAcceptance(session, claim);
     if (locked.outcome === "refused") return { outcome: "refused" as const };
 
-    // Verified FIRST, then enqueued, then advanced — and all three in this one commit. A refusal
-    // discovered after the enqueues could not un-write them, because returning a refusal COMMITS.
-    for (const rootTs of page.roots) {
-      await enqueueSlackThread(session, { ...claim.scope, rootTs });
-    }
+    // Verified, then ACCEPTED, then enqueued, all in this one commit (§3.2/§5). The writer re-checks
+    // the full fence and the stored state, then admits or refuses. Roots are enqueued only for a
+    // `written` page, AFTER acceptance; if any enqueue fails, the throw rolls back the acceptance too.
     const advanced = await acceptSlackChannelPage(session, claim, {
       terminal,
       nextCursor: page.nextCursor,
       oldestTs: page.oldestTs,
     });
-    if (advanced.outcome !== "written") {
-      // Unreachable while the row lock above is held. THROWN rather than returned: a returned
-      // refusal would commit the roots this transaction just enqueued for a frontier that never moved.
-      throw new Error("slack source discovery: the frontier refused a write made under its own row lock");
+    switch (advanced.outcome) {
+      case "written":
+        for (const rootTs of page.roots) {
+          await enqueueSlackThread(session, { ...claim.scope, rootTs });
+        }
+        return { outcome: "accepted" as const };
+      case "refused":
+        // Nothing was written; returning commits nothing.
+        return { outcome: "refused" as const };
+      case "subdivided":
+        // The writer narrowed the segment AND released the claim itself: no second release here.
+        return { outcome: "subdivided" as const, category: advanced.category };
+      case "rejected": {
+        // Released in this SAME transaction, the sent request's turn passed. A stale release
+        // (expired or superseded) writes nothing and is reported as a refusal.
+        const released = await releaseSlackChannelForRetry(session, claim, {
+          nextDueAt: null,
+          errorCode: advanced.category,
+          turn: "passed",
+        });
+        return released.outcome === "written"
+          ? { outcome: "rejected" as const, category: advanced.category }
+          : { outcome: "refused" as const };
+      }
     }
-    return { outcome: "accepted" as const };
   });
 
   if (accepted.outcome === "accepted") {
     step(pass, { stage: "history", method: "conversations.history", result: "ok", channelId });
+    return;
+  }
+  if (accepted.outcome === "rejected" || accepted.outcome === "subdivided") {
+    step(pass, {
+      stage: "history",
+      method: "conversations.history",
+      result: "delayed",
+      category: accepted.category,
+      channelId,
+      detail:
+        accepted.outcome === "subdivided"
+          ? SUBDIVIDED_DETAIL
+          : accepted.category === "cursor_repeated"
+            ? CURSOR_REPEATED_DETAIL
+            : UNSPLITTABLE_DETAIL,
+    });
     return;
   }
   if (accepted.outcome === "stale") {
