@@ -168,14 +168,14 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *       in-progress historical lane (segment, cursor, G 3) is byte-identical;
  *     - a reclaim under a DIFFERENT allowance resumes a valid cursor-null post-progress literal
  *       (S > L, G + 1). It asserts literal A, B, L, S, U and G plus a lease-only digest; exceptions
- *       are sanitized. Today it fails at its first, initialization assertion;
+ *       are sanitized. At RED3 it failed at its first, initialization assertion;
  *     - ×2: candidate L > A, for an already-anchored lane whose B lies above A + allowance and for
  *       an idle lane under a far-future certified top. Each returns `delayed / scan_bounds_invalid`
  *       with the exact fixed detail. Only next_lane (to historical), the diagnostic, due_at and
- *       updated_at change. No lease is taken, and no attempt, generation, anchor, progress or
- *       certificate moves (an idle lane's anchor stays null). The typed result is read from
- *       `unknown`, so the current type needs no change for this RED.
- *  - GREEN today (5), controls:
+ *       updated_at change. due_at and updated_at must each lie inside a database-clock window taken
+ *       immediately around the claim (SQL booleans). No lease is taken, and no attempt, generation,
+ *       anchor, progress or certificate moves (an idle lane's anchor stays null).
+ *  - GREEN at RED3 and still GREEN (5), controls:
  *     - an ineligible (private) row with an anchored newest lane is neither claimed nor initialized;
  *     - ×4: ELIGIBILITY precedes the L > A evaluation. The same CHECK-valid L > A anchored
  *       candidate is made ineligible after seeding, in four independent ways: a private row, a
@@ -188,12 +188,17 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *   - initialize the historical lane;
  *   - take the lease on L > A.
  *
+ * GREEN3 ALSO CHANGES DISCOVERY MINIMALLY, without new tests here:
+ *  - it passes its validated allowance to the claim;
+ *  - on the typed delay it records one static `delayed / scan_bounds_invalid` history step for that
+ *    channel, sends and reserves nothing, and continues its selected-channel loop.
+ *
  * DEFERRED TO THE FOLLOWING DISCOVERY-CALLER PACKET, NOT covered here:
- *  - discovery passing the configured allowance to the claim, and sending the claim's exact S/U as
- *    `oldest`/`latest` on every page (never A once U differs), with PA-3 inclusive flags;
- *  - discovery reporting the L > A step: no HTTP, no method-budget reservation, continuing the
- *    bounded candidate scan. Same-pass fairness and the DH-09 default-50 boundary matrix are part of
- *    this;
+ *  - discovery sending the claim's exact S/U as `oldest`/`latest` on every page (never A once U
+ *    differs), with PA-3 inclusive flags;
+ *  - end-to-end discovery proof of the L > A step: no HTTP, no method-budget reservation, and the
+ *    bounded candidate scan continuing. Same-pass fairness and the DH-09 default-50 boundary matrix
+ *    are part of this;
  *  - discovery's raw-message timestamp validation against the claimed segment
  *    (`page_outside_segment`), after malformed_page, pagination_incomplete and malformed_timestamp,
  *    and before any root enqueue or state write;
