@@ -11,7 +11,8 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  * (accepted consolidated contract `aio1170-am-f2-deep-history-consolidated-accepted-spec-migration-v1-20261023.md`,
  * §3.1, §4, §9, §9.3 MR-02/MR-03/MR-05, §10 DH-11, §10.1 F2-12, §12).
  *
- * THREE DESCRIBES.
+ * FIVE DESCRIBES: the MR-05 mutation-hook guard (static), then the four below. The fifth, the
+ * DH-11 legacy three-column and unrelated-writer describe (C9), is described in the ledger.
  *  - The first, RED PACKET 2's case, was written against the comment-only scaffold. It is GREEN
  *    since the reserved migration `postgres/migrations/20261023120000_slack_channel_history_segments.sql`
  *    gained its executable block. It applies that migration to a populated pre-F2 table and
@@ -161,10 +162,19 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *  - MR-03 / F2-12, COVERED in this phase (introduction-variants describe): the COMMITTING
  *    single-lane (newest) segment-unit introduction, and progress plus maximum histories AFTER
  *    every variant's introduction, followed by exact replay of both entrypoints.
- *  - REMAINING CHECKLIST, in priority order, continued by the same writer from this checkpoint:
- *    A3 · staged-snapshot, published-item and ledger evidence rows from the actual current tables,
- *         preserved exactly across first execution and every replay (only queued thread rows
- *         here);
+ *  - MIGRATION-VERIFICATION PHASE, COMPLETED items (by continuation):
+ *    A3 · DONE (continuation 7), in the statement-order describe. The evidence categories, traced
+ *         to their ACTUAL persistence:
+ *         · STAGED SNAPSHOT: `slack_thread_snapshots`, FK to its queued `slack_sync_threads` row;
+ *         · PUBLISHED ITEM: `items`, under a `projects` row;
+ *         · LEDGER: `slack_messages`, FK `(team_id, item_id)` to that item.
+ *         Literal rows (1 project, 1 item, 2 ledger rows, 1 staged snapshot) are seeded in each
+ *         of the four order databases. Each table is md5-digested whole and must be byte-identical
+ *         after the first introduction, after the second entrypoint and every replay, after the
+ *         replays over progress, and after the full-loader replay. They are compared WITHIN each
+ *         database, not across databases, because later migrations may add `now()`-defaulted
+ *         columns this packet does not pin, and excluding them would hide drift. The variant
+ *         describes do not seed them;
  *    A4 · DONE (continuation 2). After the progressed replays, the real deploy loader
  *         (`loadSchema`: schema.sql then every migration, on its own fresh session) is replayed
  *         over the POPULATED, progressed rows:
@@ -196,9 +206,16 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *         refusal. The B8 TAIL is DONE in continuation 6: the REAL deploy loader refuses EVERY
  *         one of those fixtures, plus the three replay-time refusals. No fixture is excluded; the
  *         source-backed reachability is noted at the conflicts suite's LOADER_SET;
- *    C9 · DH-11: the legacy three-column test, renamed to `re-adds the three legacy
- *         metadata/provisional columns without restarting an initialized segment`, and maximum
- *         histories through the unrelated writers;
+ *    C9 · PARTLY DONE (continuation 7), in the DH-11 describe: a migration-scope test titled
+ *         exactly `re-adds the three legacy metadata/provisional columns without restarting an
+ *         initialized segment`. It has initialized segments and a MAXIMUM history (1,000 entries,
+ *         1,048,576 bytes) on BOTH lanes:
+ *         · removing ONLY the three legacy columns and replaying the real deploy loader re-adds
+ *           them with exact metadata. Every other column, updated_at included, is byte-identical
+ *           (no restart), and both maximum histories survive;
+ *         · the in-scope UNRELATED DB-level writer, the integration delete (`ON DELETE SET NULL`
+ *           plus the binding-clear trigger), changes only the binding pair. Both history CHECKs
+ *           re-pass on that UPDATE, and both maximum histories survive;
  *    C10 · DONE (continuation 6): tracked, restorable MR-05 mutation HOOKS, with no production
  *         edit. An ABSOLUTE path in an environment variable redirects the source the tests read:
  *         · `AIO1170_MR05_MIGRATION_FILE` (this file and the conflicts suite): a comment-only
@@ -208,8 +225,20 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *           copy must fail the static parity assertion.
  *         A static guard test in each file fails any run with a hook set. The coordinator still
  *         executes baseline, mutant and restored runs, and the structural sweeps;
- *    and, not scheduled here: the omitted-lease-invalidation mutant (not measured), the §9 named
- *    DH-11 source-fence tests, and MR-06 (held until PR743 staging).
+ *  - REMAINING, with source-backed boundaries:
+ *    · C9 RENAME: the existing test named in §9, `re-adds every column this slice introduced,
+ *      preserving the progress already stored`, lives in
+ *      `test/datamechanics/slack-source-fences.datamechanics.test.ts:376`. That file is outside
+ *      this packet's permitted migration test files, so it is NOT renamed here; that is a later
+ *      bounded test edit;
+ *    · C9 RUNTIME WRITERS: §3.4's maximum-history writers are application functions, not reachable
+ *      from this migration test area. They need the not-yet-wired runtime packet:
+ *      claimSlackChannelPage, releaseSlackChannelForRetry, beginSlackChannelMetadata,
+ *      recordSlackChannelPublicState, delaySlackChannel, opposite-lane acceptSlackChannelPage and
+ *      restartSlackChannelScan, the fenced rejection/release path, elapse, expireChannelLease and
+ *      agePublicProof. Only the DB-level integration-delete path is proved here;
+ *    · not scheduled here: the omitted-lease-invalidation mutant (not measured), the §9 named
+ *      DH-11 source-fence tests, and MR-06 (held until PR743 staging).
  */
 
 const SCRATCH_TIMEOUT = 300_000;
@@ -779,6 +808,70 @@ async function orderEvidence(client: Client) {
   };
 }
 type OrderEvidence = Awaited<ReturnType<typeof orderEvidence>>;
+
+/**
+ * A3: the accepted evidence categories, in their ACTUAL current PostgreSQL persistence (traced in
+ * `postgres/schema.sql`):
+ *  - STAGED SNAPSHOT: `slack_thread_snapshots`, with a composite FK to its `slack_sync_threads`
+ *    row;
+ *  - PUBLISHED ITEM: the canonical `items` row, under its `projects` row;
+ *  - LEDGER: `slack_messages`, which `schema.sql` itself calls "the ledger", with a composite FK
+ *    `(team_id, item_id)` to that item.
+ * Each table is digested whole (md5 only), so a change to any column, including a generated one,
+ * is caught. These are compared WITHIN one database through every lifecycle step, never across
+ * databases: later migrations may add `now()`-defaulted columns this packet does not pin, and
+ * excluding them would hide drift.
+ */
+async function slackEvidence(client: Client) {
+  return (await client.query<{ projects: string; items: string; ledger: string; snapshots: string; counts: string }>(
+    `select
+       (select coalesce(pg_catalog.md5(pg_catalog.string_agg(pg_catalog.to_jsonb(p)::text, '|' order by p.id)), 'no rows')
+          from public.projects p where p.team_id = $1) as projects,
+       (select coalesce(pg_catalog.md5(pg_catalog.string_agg(pg_catalog.to_jsonb(i)::text, '|' order by i.id)), 'no rows')
+          from public.items i where i.team_id = $1) as items,
+       (select coalesce(pg_catalog.md5(pg_catalog.string_agg(pg_catalog.to_jsonb(m)::text, '|' order by m.message_ts collate "C")), 'no rows')
+          from public.slack_messages m where m.team_id = $1) as ledger,
+       (select coalesce(pg_catalog.md5(pg_catalog.string_agg(pg_catalog.to_jsonb(n)::text, '|' order by n.root_ts collate "C")), 'no rows')
+          from public.slack_thread_snapshots n where n.team_id = $1) as snapshots,
+       (select pg_catalog.count(*) from public.projects where team_id = $1) || '/' ||
+       (select pg_catalog.count(*) from public.items where team_id = $1) || '/' ||
+       (select pg_catalog.count(*) from public.slack_messages where team_id = $1) || '/' ||
+       (select pg_catalog.count(*) from public.slack_thread_snapshots where team_id = $1) as counts`, [ORDER_TEAM_ID]
+  )).rows[0];
+}
+/** Literal staged-snapshot, published-item and ledger rows, with valid FKs, for the order fixture. */
+async function seedSlackEvidence(client: Client): Promise<void> {
+  await orderFixture(client,
+    `insert into public.projects (id, team_id, slug, name, created_at)
+     values ('0f000000-0000-4000-8000-000000000a01', $1, 'order-evidence', 'Order Evidence', '2026-01-01 00:00:00+00')`, [ORDER_TEAM_ID]);
+  await orderFixture(client,
+    `insert into public.items (id, team_id, project_id, path, kind, access, frontmatter, body, content_sha256, actor,
+                               created_at, work_at, work_at_from_source, synced_at, updated_at)
+     values ('0f000000-0000-4000-8000-000000000a02', $1, '0f000000-0000-4000-8000-000000000a01',
+             'slack/T0ORDER001/C0ORDER0001/1718900200.000200.md', 'artifact', 'team', '{"source": "slack"}'::jsonb,
+             'synthetic order evidence body', $2, 'slack',
+             '2026-01-01 00:00:00+00', '2024-06-20 16:16:40+00', true, '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00')`,
+    [ORDER_TEAM_ID, "a".repeat(64)]);
+  for (const [id, ts, isRoot, eligible, reason, author] of [
+    ["0f000000-0000-4000-8000-000000000a03", "1718900200.000200", true, true, null, "U0ORDER1"],
+    ["0f000000-0000-4000-8000-000000000a04", "1718900201.000201", false, false, "bot_message", null],
+  ] as Array<[string, string, boolean, boolean, string | null, string | null]>) {
+    await orderFixture(client,
+      `insert into public.slack_messages (id, team_id, workspace_id, channel_id, message_ts, root_ts, item_id, author_external_id,
+                                          occurred_at, is_root, eligible, exclusion_reason, last_seen_generation, source_hash, observed_at)
+       values ($1, $2, $3, 'C0ORDER0001', $4, '1718900200.000200', '0f000000-0000-4000-8000-000000000a02', $5,
+               '2024-06-20 16:16:40+00', $6, $7, $8, 1, $9, '2026-01-01 00:00:00+00')`,
+      [id, ORDER_TEAM_ID, ORDER_WORKSPACE, ts, author, isRoot, eligible, reason, "b".repeat(64)]);
+  }
+  // The staged snapshot of the queued thread C0ORDER0001/1718900200.000200; stored_bytes is
+  // computed by PostgreSQL from the exact stored jsonb, as its CHECK requires.
+  await orderFixture(client,
+    `insert into public.slack_thread_snapshots (team_id, workspace_id, channel_id, root_ts, snapshot_generation, messages,
+                                                stored_bytes, seen_cursors, expires_at, complete, created_at, updated_at)
+     values ($1, $2, 'C0ORDER0001', '1718900200.000200', 1, $3::jsonb, pg_catalog.octet_length($3::jsonb::text),
+             $4::jsonb, '2026-03-01 00:00:00+00', false, '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00')`,
+    [ORDER_TEAM_ID, ORDER_WORKSPACE, JSON.stringify([{ ts: "1718900200.000200", text: "synthetic staged message" }]), JSON.stringify(["syn-snapshot-cursor-1"])]);
+}
 /** Complete rows, compared exactly (within one database). */
 const exactRows = (evidence: OrderEvidence) => ({
   channels: evidence.channels.map((row) => ({ channel_id: row.channel_id, full_row: row.full_row })),
@@ -897,6 +990,9 @@ describe("AM-F2 + AC-02 history/segment block — MR-03 statement order: migrati
             await orderFixture(c, `insert into teams (id, slug, name) values ($1, 'order-team', 'Order Team')`, [ORDER_TEAM_ID]);
             for (const row of ORDER_CHANNELS) await insertLiteralRow(c, "slack_sync_channels", row);
             for (const row of ORDER_THREADS) await insertLiteralRow(c, "slack_sync_threads", row);
+            await seedSlackEvidence(c);
+            const seededEvidence = await slackEvidence(c);
+            expect(seededEvidence.counts, `${label} fixture: 1 project, 1 published item, 2 ledger rows and 1 staged snapshot are present`).toBe("1/1/2/1");
             const seeded = await orderEvidence(c);
 
             // ── FIRST entrypoint: the one-time union introduction. ──
@@ -910,6 +1006,7 @@ describe("AM-F2 + AC-02 history/segment block — MR-03 statement order: migrati
                  from public.slack_sync_channels order by channel_id collate "C"`, [ORDER_SEEDED_UPDATED_AT]
             )).rows, `${label}: one restart and fence per active lane; updated_at moved ONLY on the restarted rows`).toEqual(ORDER_RESTART_FACTS);
             const introduced = await orderEvidence(c);
+            expect(await slackEvidence(c), `${label}: the staged snapshot, published item and ledger rows are byte-identical after introduction`).toEqual(seededEvidence);
             // The unrestarted row (apart from the eight introduced columns) and every thread row are byte-identical to the seed.
             expect({
               unrestarted: introduced.channels.filter((row) => !ORDER_RESTARTED.has(row.channel_id)).map((row) => row.pre_f2_part),
@@ -933,6 +1030,7 @@ describe("AM-F2 + AC-02 history/segment block — MR-03 statement order: migrati
               expect(await apply(entry), `${label}: ${step} ${entry} commits with no NOTICE`).toEqual({ outcome: "committed", notices: [] });
               expect(exactRows(await orderEvidence(c)), `${label}: after the ${step} ${entry}, every channel and thread row is exact, updated_at included`).toEqual(exactRows(introduced));
               expect(await slackCatalog(c), `${label}: after the ${step} ${entry}, the Slack catalog is unchanged`).toEqual(introducedCatalog);
+              expect(await slackEvidence(c), `${label}: after the ${step} ${entry}, the evidence rows are byte-identical`).toEqual(seededEvidence);
             }
 
             // ── Initialized segment progress and MAXIMUM histories on both lanes, identical literal writes. ──
@@ -972,12 +1070,14 @@ describe("AM-F2 + AC-02 history/segment block — MR-03 statement order: migrati
               expect(await apply(entry), `${label}: ${entry} replay after progress commits with no NOTICE`).toEqual({ outcome: "committed", notices: [] });
               expect(exactRows(await orderEvidence(c)), `${label}: after the ${entry} replay over progress and maximum histories, every row is exact, updated_at included`).toEqual(exactRows(progressed));
               expect(await slackCatalog(c), `${label}: after the ${entry} replay over progress, the Slack catalog is unchanged`).toEqual(progressedCatalog);
+              expect(await slackEvidence(c), `${label}: after the ${entry} replay over progress, the evidence rows are byte-identical`).toEqual(seededEvidence);
             }
             // ── The FULL deploy loader (schema.sql, then every migration) replayed over the populated, progressed rows. ──
             // The loader opens its OWN fresh session; this session is idle, so it holds no lock the loader needs.
             expect(await sanitizedLoaderReplay(loadSchema, scratch.url), `${label}: the full-loader replay over progress commits`).toEqual({ outcome: "committed" });
             expect(exactRows(await orderEvidence(c)), `${label}: after a full-loader replay over progress and maximum histories, every row is exact, updated_at included`).toEqual(exactRows(progressed));
             expect(await slackCatalog(c), `${label}: after a full-loader replay over progress, the Slack catalog is unchanged`).toEqual(progressedCatalog);
+            expect(await slackEvidence(c), `${label}: after a full-loader replay over progress, the evidence rows are byte-identical`).toEqual(seededEvidence);
 
             runs[label] = {
               introducedLogical: logicalRows(introduced), introducedCatalog,
@@ -1560,6 +1660,99 @@ describe("AM-F2 + AC-02 history/segment block — MR-03 introduction variants un
       expect([[newestMax.length, jsonbTextBytes(newestMax)], [historicalMax.length, jsonbTextBytes(historicalMax)]],
         "fixture: both maximum histories are 1,000 entries of exactly 1,048,576 bytes").toEqual([[1000, 1048576], [1000, 1048576]]);
       await runIntroductionVariant(newestUnitVariant(newestMax, historicalMax));
+    },
+    ORDER_TIMEOUT
+  );
+});
+
+// ── DH-11 / C9: the legacy three-column replay, and maximum histories through an unrelated DB writer ──
+
+const LEGACY_THREE_COLUMNS = ["newest_catchup_upper_ts", "metadata_attempt_owner", "metadata_attempt_generation"];
+const C9_INTEGRATION_ID = "0f000000-0000-4000-8000-000000000c90";
+const C9_CHANNEL = "C0LEGACY3001";
+
+describe("AM-F2 + AC-02 history/segment block — DH-11 legacy three-column replay and unrelated-writer maximum histories (real Postgres)", () => {
+  it(
+    "re-adds the three legacy metadata/provisional columns without restarting an initialized segment",
+    async () => {
+      const { loadSchema } = await import("@/scripts/pg-load-schema.mjs");
+      const newestMax = orderMaxHistory("x");
+      const historicalMax = orderMaxHistory("y");
+      expect([[newestMax.length, jsonbTextBytes(newestMax)], [historicalMax.length, jsonbTextBytes(historicalMax)]],
+        "fixture: both maximum histories are 1,000 entries of exactly 1,048,576 bytes").toEqual([[1000, 1048576], [1000, 1048576]]);
+      const name = `slackc9_${randomUUID().replace(/-/g, "").slice(0, 8)}`;
+      // The shared guard refuses BEFORE any connection or database creation.
+      const scratch = await createIsolatedScratchDatabase(name);
+      try {
+        await loadSchema({ cwd: process.cwd(), databaseUrl: scratch.url, logger: { log: () => {} } });
+        const c = new Client({ connectionString: scratch.url });
+        await c.connect();
+        try {
+          await c.query("set time zone 'UTC'");
+          await orderFixture(c, `insert into teams (id, slug, name) values ($1, 'c9-team', 'C9 Team')`, [ORDER_TEAM_ID]);
+          await orderFixture(c, `insert into public.integrations (id, team_id, type, name) values ($1, $2, 'slack', 'c9-binder')`, [C9_INTEGRATION_ID, ORDER_TEAM_ID]);
+          // Initialized segments on BOTH lanes, a MAXIMUM history on each, a binding, and planted legacy values.
+          await insertLiteralRow(c, "slack_sync_channels", variantRow({
+            id: "0f000000-0000-4000-8000-000000000c91", channel_id: C9_CHANNEL, public_state: "public", public_checked_at: "2026-01-01 00:00:00+00",
+            binding_integration_id: C9_INTEGRATION_ID, binding_config_revision: "c9".repeat(32),
+            newest_anchor_ts: "1718900800.000000", newest_lower_ts: "1718900700.000000", ...NEWEST_SEGMENTS,
+            newest_cursor: newestMax[999], newest_cursor_history: JSON.stringify(newestMax), newest_scan_generation: 7,
+            historical_anchor_ts: "1718900500.000000", historical_segment_lower_ts: "0.000000", historical_segment_upper_ts: "1718900300.000000",
+            historical_completed_segments_oldest_ts: "1718900350.5", historical_oldest_seen_ts: "1718900250.000100",
+            historical_cursor: historicalMax[999], historical_cursor_history: JSON.stringify(historicalMax), historical_scan_generation: 3,
+            newest_catchup_upper_ts: "1718900900.000000", metadata_attempt_owner: "metadata-c9", metadata_attempt_generation: 3,
+            lease_generation: 6, next_lane: "historical", attempts: 2, due_at: "2026-01-02 00:00:00+00", created_at: "2025-12-31 00:00:00+00",
+          }));
+          const MAX = { bytes: 1048576, entries: 1000 };
+          const sizes = async () => [await storedHistorySize(c, C9_CHANNEL, "newest_cursor_history"), await storedHistorySize(c, C9_CHANNEL, "historical_cursor_history")];
+          const digestExcept = async (excluded: string[]): Promise<string> => (await digestsExcept(c, excluded))[0].digest;
+          expect(await sizes(), "fixture: both lanes hold a maximum history").toEqual([MAX, MAX]);
+          const beforeLegacy = await digestExcept(LEGACY_THREE_COLUMNS);
+
+          // ── FIXTURE DDL: remove ONLY the three legacy columns; the real deploy loader must re-add them. ──
+          await c.query("alter table public.slack_sync_channels drop column newest_catchup_upper_ts, drop column metadata_attempt_owner, drop column metadata_attempt_generation");
+          expect(await sanitizedLoaderReplay(loadSchema, scratch.url), "the full-loader replay commits").toEqual({ outcome: "committed" });
+          expect((await c.query(
+            `select a.attname as name, pg_catalog.format_type(a.atttypid, a.atttypmod) as type, a.attnotnull as not_null,
+                    pg_catalog.pg_get_expr(d.adbin, d.adrelid) as default_expr
+               from pg_catalog.pg_attribute a left join pg_catalog.pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum
+              where a.attrelid = 'public.slack_sync_channels'::regclass and not a.attisdropped and a.attname = any($1::text[])
+              order by a.attname collate "C"`, [LEGACY_THREE_COLUMNS]
+          )).rows, "the three legacy columns are re-added with their exact metadata").toEqual([
+            { name: "metadata_attempt_generation", type: "bigint", not_null: true, default_expr: "0" },
+            { name: "metadata_attempt_owner", type: "text", not_null: false, default_expr: null },
+            { name: "newest_catchup_upper_ts", type: "text", not_null: false, default_expr: null },
+          ]);
+          expect((await c.query(
+            "select newest_catchup_upper_ts, metadata_attempt_owner, metadata_attempt_generation::int as metadata_attempt_generation from public.slack_sync_channels where channel_id = $1",
+            [C9_CHANNEL]
+          )).rows[0], "the re-added legacy columns carry their re-add values (the dropped values are gone, by design)").toEqual({
+            newest_catchup_upper_ts: null, metadata_attempt_owner: null, metadata_attempt_generation: 0,
+          });
+          // NO restart: every other column, generations, cursors, histories, segments and updated_at included, is byte-identical.
+          expect(await digestExcept(LEGACY_THREE_COLUMNS), "no segment restarted: every column outside the three legacy ones is byte-identical").toBe(beforeLegacy);
+          expect(await sizes(), "both maximum histories survive the legacy re-add").toEqual([MAX, MAX]);
+
+          // ── An UNRELATED DB-level writer: integration delete → ON DELETE SET NULL → the binding-clear trigger. ──
+          const BINDING = ["binding_integration_id", "binding_config_revision"];
+          const beforeDelete = await digestExcept(BINDING);
+          await orderFixture(c, "delete from public.integrations where id = $1", [C9_INTEGRATION_ID]);
+          expect((await c.query(
+            "select binding_integration_id is null as integration_cleared, binding_config_revision is null as revision_cleared from public.slack_sync_channels where channel_id = $1",
+            [C9_CHANNEL]
+          )).rows[0], "the FK cleared the binding and the trigger cleared its paired revision").toEqual({ integration_cleared: true, revision_cleared: true });
+          expect(await digestExcept(BINDING), "the binding writer changed nothing else; both history CHECKs re-passed on that UPDATE").toBe(beforeDelete);
+          expect(await sizes(), "both maximum histories survive the unrelated binding writer").toEqual([MAX, MAX]);
+        } finally {
+          await c.end().catch(() => {});
+        }
+      } finally {
+        // Cleanup never replaces the primary failure: every step is caught, as the repository precedent does.
+        const dropper = new Client({ connectionString: scratch.adminUrl });
+        await dropper.connect().catch(() => {});
+        await dropper.query(`drop database if exists ${name} with (force)`).catch(() => {});
+        await dropper.end().catch(() => {});
+      }
     },
     ORDER_TIMEOUT
   );

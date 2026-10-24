@@ -208,16 +208,22 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *  - MR-03:
  *    · mirror-only execution and both execution orders on independent fixtures;
  *    · a COMMITTING segment-only introduction on an F2-only SCHEMA state (only its refusal is here);
- *    · staged/published/ledger evidence rows.
+ *    · (staged/published/ledger evidence rows are covered since continuation 7, within each
+ *      database, by `slack-history-progress-upgrade`'s statement-order describe:
+ *      `slack_thread_snapshots`, `items` under `projects`, and `slack_messages`).
  *  - MR-04 refusals not yet exercised:
  *    · (not missing, for clarity: the B5/B6 replay-time cases run through both the migration and
  *      the marked mirror. Of the B7 cases, only cancellation does; concurrency uses two migration
  *      executions, and the later-query retry starts from the complete loader, then uses migration
  *      failure and migration retry, as itemized above);
  *    · identity metadata (not representable on PostgreSQL 16; see above).
- *  - DH-11: the §9 named tests in the source-fences/upgrade files, including renaming the legacy
- *    three-column replay test to `re-adds the three legacy metadata/provisional columns without
- *    restarting an initialized segment`, and maximum histories through unrelated writers.
+ *  - DH-11, remaining:
+ *    · the §9 named source-fence tests;
+ *    · RENAMING the existing `slack-source-fences.datamechanics.test.ts:376` test, which is outside
+ *      the permitted migration test files. A migration-scope test under the exact required title
+ *      now lives in `slack-history-progress-upgrade`;
+ *    · maximum histories through §3.4's RUNTIME writers. They need runtime wiring; only the
+ *      DB-level integration-delete writer is proved, in `slack-history-progress-upgrade`.
  *  - MR-05 structural sweeps; MR-06 (held until PR743 staging); every runtime/DH-12/DH-13 behavior,
  *    which needs the not-yet-wired writer and is not claimed by this migration packet.
  */
