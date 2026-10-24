@@ -1706,3 +1706,340 @@ describe("AIO-1170 DH-09 / DH-13: claim-local delay end to end, and the page ran
     });
   });
 });
+
+// ── AIO-1170 packet 5: the caller's acceptance transaction (§3.2, §3.3, §5) ─────────────────────
+
+/**
+ * AIO-1170 AM-F2 §3.2/§5 — what discovery does with each typed acceptance outcome, and in what order.
+ *
+ * The contract:
+ *  - structural validation runs first, before the transaction;
+ *  - then, inside ONE transaction: selection authority, the full channel fence, stored-state
+ *    validity, then admission (unrepresentable, repetition, entries, bytes);
+ *  - acceptance comes BEFORE root enqueue, and any later failure rolls the whole transaction back;
+ *  - `rejected` is released in that SAME transaction, with the sent turn passed;
+ *  - `subdivided` is the writer's own transition and release, with no second caller release;
+ *  - nothing is enqueued from a rejected, subdivided or refused page.
+ *
+ * Status against GREEN4 `3c822f1f`:
+ *  - RED (6), because today the caller validates an immediate repeat early, enqueues roots before
+ *    accepting, and THROWS on any non-`written` result:
+ *     1. a durable repetition (A → B → A of an older saved cursor) must be `delayed / cursor_repeated`
+ *        with its exact detail, zero new roots and a release-only row;
+ *     2a. an immediate repeat under a SUPERSEDED lease must be `refused / stale_channel_lease`, with
+ *        no cursor-repeated diagnostic, and the successor row exact;
+ *     2b. an immediate repeat under a CHANGED selection must be `refused / binding_changed`, with no
+ *        cursor-repeated diagnostic, and progress unchanged;
+ *     3. a wide over-cap continuation must be `delayed / cursor_history_entries_exceeded` with the
+ *        subdivision detail. It persists the exact midpoint transition, enqueues zero roots and makes
+ *        NO caller release;
+ *     4. a singleton over-cap continuation must be `delayed / cursor_history_entries_exceeded` with the
+ *        unsplittable detail, one release, a release-only row and zero roots;
+ *     6. acceptance before enqueue. A test-only trigger refuses a root insert while this claim's lease
+ *        is still live (that is, before acceptance released it); a valid partial page must succeed.
+ *  - GREEN controls (3):
+ *     5. a successor reclaim during the request: `refused / stale_channel_lease`, zero roots, and the
+ *        successor row exact;
+ *     7. a test-only root-insert failure makes discovery THROW and roll back everything. The channel
+ *        row equals its in-flight (claimed) state and there are no roots. After GREEN this failure
+ *        comes after provisional acceptance;
+ *     8. a stale STRUCTURAL release under a successor's lease changes nothing in the successor row.
+ * Steps are projected to { result, category, detail } only. No cursor, bound or payload is kept.
+ */
+describe("AIO-1170 §3.2/§5: the discovery caller's acceptance transaction", () => {
+  const REPEAT_DETAIL = "The page repeated a saved cursor; no roots or coverage were accepted.";
+  const SUBDIVIDED_DETAIL = "The scan was divided into a smaller time range; no roots from this page were accepted.";
+  const UNSPLITTABLE_DETAIL = "The provider continuation cannot be followed for this timestamp range; the scan remains incomplete.";
+  /** §3.2: the only columns a true rejection's release may change. */
+  const RELEASE = ["next_lane", "claimed_lane", "lease_owner", "lease_expires_at", "due_at", "last_error_code", "updated_at"];
+  /** §5: the columns the writer's subdivision may change. */
+  const SUBDIVISION = [
+    "historical_segment_lower_ts", "historical_cursor", "historical_cursor_history", "historical_oldest_seen_ts",
+    "historical_scan_generation", ...RELEASE,
+  ];
+  const without = (row: Record<string, unknown> | null | undefined, keys: readonly string[]) =>
+    JSON.stringify(Object.fromEntries(Object.entries(row ?? {}).filter(([key]) => !keys.includes(key))));
+  const steps = (result: SlackSourceDiscoveryResult) =>
+    result.steps.filter((s) => s.stage === "history").map((s) => ({ result: s.result, category: s.category ?? null, detail: s.detail ?? null }));
+  const settle = (run: Promise<SlackSourceDiscoveryResult>) =>
+    run.then((result) => ({ steps: steps(result) }), (error: unknown) => ({ thrown: error instanceof Error ? error.name : "non-error" }));
+  const row = (seed: Seed) => channelRow(seed.teamId, WORKSPACE, CHANNEL);
+  const fillers = (count: number) => Array.from({ length: count }, (_, i) => `fill-${String(i).padStart(3, "0")}`);
+
+  /**
+   * A historical scan whose continuations are scripted by `continuation`. The first page is partial
+   * with cursor `c-1` (and `firstRoots`), and every catch-up is an empty terminal page. `inFlight`
+   * holds the claimed row as each continuation request saw it.
+   */
+  function scripted(
+    seed: Seed,
+    continuation: (call: SlackCall) => Promise<Response> | Response,
+    firstRoots: string[] = []
+  ): { fake: SlackFake; inFlight: { row: Record<string, unknown> | null } } {
+    const inFlight: { row: Record<string, unknown> | null } = { row: null };
+    const fake = pass(async (call) => {
+      if (isCatchUp(call)) return slackJson(historyBody({ messages: [] }));
+      if (call.params.get("cursor") === null) {
+        return slackJson(historyBody({ messages: firstRoots.map((ts) => rootMessage(ts)), hasMore: true, nextCursor: "c-1" }));
+      }
+      inFlight.row = await row(seed);
+      return continuation(call);
+    });
+    return { fake, inFlight };
+  }
+  /** Initial historical page (cursor c-1), then the empty newest catch-up. The next wake is historical. */
+  async function startedScan(seed: Seed, integrationId: string, fake: SlackFake): Promise<void> {
+    await discover(seed, integrationId, fake);
+    await elapse(seed.teamId);
+    await discover(seed, integrationId, fake);
+    await elapse(seed.teamId);
+    expect(await row(seed), "fixture: the historical continuation is next").toMatchObject({ historical_cursor: "c-1", next_lane: "historical" });
+  }
+  /** A db client that COUNTS release statements (a count only; no SQL text or value is kept). */
+  function countingReleases(counter: { releases: number }) {
+    return transactionSessionDecoratedDb(db(), (session) => ({
+      ...session,
+      executeSql: (async (text: string, params?: unknown[]) => {
+        if (/due_at\s*=\s*coalesce\(\$12::timestamptz,\s*clock_timestamp\(\)\)/.test(text)) counter.releases += 1;
+        return session.executeSql(text, params);
+      }) as TransactionSession["executeSql"],
+    }));
+  }
+  /** Supersede the in-flight claim the way a reclaim leaves it: a new owner and a bumped fence. */
+  async function successorReclaim(seed: Seed): Promise<void> {
+    const c = await rawSql();
+    await c.query(
+      `update slack_sync_channels
+          set lease_owner = gen_random_uuid()::text, lease_generation = lease_generation + 1,
+              lease_expires_at = clock_timestamp() + interval '5 minutes'
+        where team_id = $1`,
+      [seed.teamId]
+    );
+  }
+
+  it("1 RED: a durable repetition of an OLDER saved cursor is delayed / cursor_repeated, released in the same pass, with zero roots", async () => {
+    const seed = await seedTeam();
+    const integrationId = await setup(seed);
+    const { fake, inFlight } = scripted(seed, (call) => {
+      // c-1 → c-2, then c-2 → c-1: the repeated cursor is an OLDER entry of H, not the one just sent.
+      return call.params.get("cursor") === "c-1"
+        ? slackJson(historyBody({ messages: [rootMessage("1718900000.000800")], hasMore: true, nextCursor: "c-2" }))
+        : slackJson(historyBody({ messages: [rootMessage("1718900000.000700")], hasMore: true, nextCursor: "c-1" }));
+    }, ["1718900000.000900"]);
+    await startedScan(seed, integrationId, fake);
+    await discover(seed, integrationId, fake); // c-1 → c-2, accepted
+    await elapse(seed.teamId);
+    await discover(seed, integrationId, fake); // newest, empty
+    await elapse(seed.teamId);
+    const rootsBefore = await threadRootTs(seed.teamId);
+    const counter = { releases: 0 };
+    const outcome = await settle(discover(seed, integrationId, fake, { client: countingReleases(counter) })); // c-2 → c-1
+    const after = await row(seed);
+    expect({
+      outcome, releases: counter.releases, roots: await threadRootTs(seed.teamId),
+      onlyRelease: without(after, RELEASE) === without(inFlight.row, RELEASE),
+      released: { next: after?.next_lane, lease: after?.lease_owner, claimed: after?.claimed_lane, error: after?.last_error_code },
+    }, "durable repetition: typed rejection, one same-pass release, no root, nothing else moved").toEqual({
+      outcome: { steps: [{ result: "delayed", category: "cursor_repeated", detail: REPEAT_DETAIL }] },
+      releases: 1, roots: rootsBefore, onlyRelease: true,
+      released: { next: "newest", lease: null, claimed: null, error: "cursor_repeated" },
+    });
+  });
+
+  it.each([
+    { label: "a superseded lease", stale: "stale_channel_lease", mutate: (seed: Seed) => successorReclaim(seed), exactRow: true },
+    { label: "a changed selection", stale: "binding_changed", mutate: (seed: Seed) => setSlackChannelIds(seed, [CHANNEL, "C0SOURCE9"]), exactRow: false },
+  ])("2 RED: authority beats repetition — an immediate repeat under $label is refused, never cursor_repeated", async ({ stale, mutate, exactRow }) => {
+    const seed = await seedTeam();
+    const integrationId = await setup(seed);
+    let afterMutation: Record<string, unknown> | null = null;
+    const { fake, inFlight } = scripted(seed, async (call) => {
+      await mutate(seed);
+      afterMutation = await row(seed);
+      // Otherwise valid: an in-range root, and the SAME cursor it was asked with.
+      return slackJson(historyBody({ messages: [rootMessage(rootAtUpper(call))], hasMore: true, nextCursor: String(call.params.get("cursor")) }));
+    }, ["1718900000.000900"]);
+    await startedScan(seed, integrationId, fake);
+    const rootsBefore = await threadRootTs(seed.teamId);
+    const outcome = await settle(discover(seed, integrationId, fake));
+    const after = await row(seed);
+    expect({
+      outcome, roots: await threadRootTs(seed.teamId),
+      // A superseded lease leaves the SUCCESSOR's row exactly; a stale selection may only release.
+      preserved: exactRow
+        ? JSON.stringify(after) === JSON.stringify(afterMutation)
+        : without(after, RELEASE) === without(inFlight.row, RELEASE),
+    }, "stale authority is refused before any admission category").toEqual({
+      outcome: { steps: [{ result: "refused", category: stale, detail: "The world changed while the page was in flight; no root was queued and no cursor moved." }] },
+      roots: rootsBefore,
+      preserved: true,
+    });
+  });
+
+  it("3 RED: a WIDE over-cap continuation is the writer's subdivision: exact midpoint, zero roots, no caller release", async () => {
+    const seed = await seedTeam();
+    const integrationId = await setup(seed);
+    const { fake, inFlight } = scripted(seed, (call) =>
+      slackJson(historyBody({ messages: [rootMessage(rootAtUpper(call))], hasMore: true, nextCursor: "c-new" })));
+    await startedScan(seed, integrationId, fake);
+    const c = await rawSql();
+    // At the 1,000-entry cap on the wide [0, A] segment: 999 fillers, then the current cursor c-1.
+    await c.query(`update slack_sync_channels set historical_cursor_history = $2::jsonb where team_id = $1`,
+      [seed.teamId, JSON.stringify([...fillers(999), "c-1"])]);
+    const counter = { releases: 0 };
+    const outcome = await settle(discover(seed, integrationId, fake, { client: countingReleases(counter) }));
+    const after = await row(seed);
+    const upper = tsMicros(String(inFlight.row?.historical_segment_upper_ts));
+    const midpointPlusOne = shiftTs("0.000000", (tsMicros(String(inFlight.row?.historical_segment_lower_ts)) + upper) / BigInt(2) + BigInt(1));
+    expect({
+      outcome, releases: counter.releases, roots: await threadRootTs(seed.teamId),
+      unauthorizedUnchanged: without(after, SUBDIVISION) === without(inFlight.row, SUBDIVISION),
+      transition: {
+        lower: after?.historical_segment_lower_ts, upper: after?.historical_segment_upper_ts, cursor: after?.historical_cursor,
+        history: after?.historical_cursor_history, attemptOldest: after?.historical_oldest_seen_ts,
+        generation: Number(after?.historical_scan_generation), next: after?.next_lane, lease: after?.lease_owner,
+        claimed: after?.claimed_lane, error: after?.last_error_code,
+      },
+    }, "the subdivision is the writer's own transition and release").toEqual({
+      outcome: { steps: [{ result: "delayed", category: "cursor_history_entries_exceeded", detail: SUBDIVIDED_DETAIL }] },
+      releases: 0, roots: [], unauthorizedUnchanged: true,
+      transition: {
+        lower: midpointPlusOne, upper: inFlight.row?.historical_segment_upper_ts, cursor: null, history: [], attemptOldest: null,
+        generation: Number(inFlight.row?.historical_scan_generation) + 1, next: "newest", lease: null, claimed: null,
+        error: "cursor_history_entries_exceeded",
+      },
+    });
+  });
+
+  it("4 RED: a SINGLETON over-cap continuation is an unsplittable rejection: one release only, zero roots", async () => {
+    const seed = await seedTeam();
+    const integrationId = await setup(seed);
+    const { fake, inFlight } = scripted(seed, (call) =>
+      slackJson(historyBody({ messages: [rootMessage(rootAtUpper(call))], hasMore: true, nextCursor: "c-new" })));
+    await startedScan(seed, integrationId, fake);
+    const c = await rawSql();
+    // A singleton S = U = A segment at the entry cap.
+    await c.query(
+      `update slack_sync_channels
+          set historical_segment_lower_ts = historical_segment_upper_ts, historical_oldest_seen_ts = null,
+              historical_cursor_history = $2::jsonb
+        where team_id = $1`,
+      [seed.teamId, JSON.stringify([...fillers(999), "c-1"])]
+    );
+    const counter = { releases: 0 };
+    const outcome = await settle(discover(seed, integrationId, fake, { client: countingReleases(counter) }));
+    const after = await row(seed);
+    expect({
+      outcome, releases: counter.releases, roots: await threadRootTs(seed.teamId),
+      onlyRelease: without(after, RELEASE) === without(inFlight.row, RELEASE),
+      released: { next: after?.next_lane, lease: after?.lease_owner, error: after?.last_error_code },
+    }, "an unsplittable range: typed rejection, one same-pass release, nothing else moved").toEqual({
+      outcome: { steps: [{ result: "delayed", category: "cursor_history_entries_exceeded", detail: UNSPLITTABLE_DETAIL }] },
+      releases: 1, roots: [], onlyRelease: true,
+      released: { next: "newest", lease: null, error: "cursor_history_entries_exceeded" },
+    });
+  });
+
+  it("5 control: a successor reclaim during the request is refused / stale_channel_lease, zero roots, the successor row exact", async () => {
+    const seed = await seedTeam();
+    const integrationId = await setup(seed);
+    let afterMutation: Record<string, unknown> | null = null;
+    const { fake } = scripted(seed, async (call) => {
+      await successorReclaim(seed);
+      afterMutation = await row(seed);
+      return slackJson(historyBody({ messages: [rootMessage(rootAtUpper(call))], hasMore: true, nextCursor: "c-2" }));
+    }, ["1718900000.000900"]);
+    await startedScan(seed, integrationId, fake);
+    const rootsBefore = await threadRootTs(seed.teamId);
+    const outcome = await settle(discover(seed, integrationId, fake));
+    expect({ outcome, roots: await threadRootTs(seed.teamId), successorExact: JSON.stringify(await row(seed)) === JSON.stringify(afterMutation) }).toEqual({
+      outcome: { steps: [{ result: "refused", category: "stale_channel_lease", detail: "The world changed while the page was in flight; no root was queued and no cursor moved." }] },
+      roots: rootsBefore, successorExact: true,
+    });
+  });
+
+  /**
+   * A TEST-ONLY trigger on root insertion, scoped to ONE team by a literal UUID and dropped in
+   * `finally`. Its deterministic name is unique to this packet, and its static message carries no
+   * cursor, bound or value.
+   *  - `when = "lease_live"` refuses a root while this channel's claim is still leased, so the
+   *    insert must come AFTER the acceptance that releases it;
+   *  - `when = "always"` refuses every root for the team.
+   */
+  async function withRootTrigger<T>(seed: Seed, when: "lease_live" | "always", run: () => Promise<T>): Promise<T> {
+    if (!/^[0-9a-f-]{36}$/.test(seed.teamId)) throw new Error("fixture: the team id is not a UUID");
+    const c = await rawSql();
+    const condition = when === "always"
+      ? "true"
+      : `exists (select 1 from public.slack_sync_channels s where s.team_id = new.team_id and s.workspace_id = new.workspace_id
+                   and s.channel_id = new.channel_id and s.lease_owner is not null)`;
+    await c.query(
+      `create or replace function public.aio1170_test_root_insert_oracle() returns trigger language plpgsql as $oracle$
+       begin
+         if new.team_id = '${seed.teamId}'::uuid and ${condition} then
+           raise exception using errcode = 'P0001', message = 'AIO1170_TEST_ROOT_INSERT_ORACLE';
+         end if;
+         return new;
+       end
+       $oracle$`
+    );
+    await c.query(`drop trigger if exists aio1170_test_root_insert_oracle on public.slack_sync_threads`);
+    await c.query(
+      `create trigger aio1170_test_root_insert_oracle before insert on public.slack_sync_threads
+         for each row execute function public.aio1170_test_root_insert_oracle()`
+    );
+    try {
+      return await run();
+    } finally {
+      await c.query(`drop trigger if exists aio1170_test_root_insert_oracle on public.slack_sync_threads`);
+      await c.query(`drop function if exists public.aio1170_test_root_insert_oracle()`);
+    }
+  }
+
+  it("6 RED: acceptance comes BEFORE root enqueue — a root insert refused while the claim is still leased must not be reached first", async () => {
+    const seed = await seedTeam();
+    const integrationId = await setup(seed);
+    const fake = pass(() => slackJson(historyBody({ messages: [rootMessage("1718900000.000900")], hasMore: true, nextCursor: "c-1" })));
+    const outcome = await withRootTrigger(seed, "lease_live", () => settle(discover(seed, integrationId, fake)));
+    const after = await row(seed);
+    expect({ outcome, roots: await threadRootTs(seed.teamId), cursor: after?.historical_cursor, history: after?.historical_cursor_history },
+      "the partial page is accepted first, then its one root is enqueued, in one commit").toEqual({
+      outcome: { steps: [{ result: "ok", category: null, detail: null }] },
+      roots: ["1718900000.000900"], cursor: "c-1", history: ["c-1"],
+    });
+  });
+
+  it("7 control: a root-insert failure makes discovery THROW and rolls back BOTH the acceptance and the roots", async () => {
+    const seed = await seedTeam();
+    const integrationId = await setup(seed);
+    let inFlight: Record<string, unknown> | null = null;
+    const fake = pass(async () => {
+      inFlight = await row(seed);
+      return slackJson(historyBody({ messages: [rootMessage("1718900000.000900")], hasMore: true, nextCursor: "c-1" }));
+    });
+    const outcome = await withRootTrigger(seed, "always", () => settle(discover(seed, integrationId, fake)));
+    expect({ thrown: "thrown" in outcome, roots: await threadRootTs(seed.teamId), rowIsClaimed: JSON.stringify(await row(seed)) === JSON.stringify(inFlight) },
+      "no committing result: the claimed row is exactly as the request saw it and no root exists").toEqual({
+      thrown: true, roots: [], rowIsClaimed: true,
+    });
+  });
+
+  it("8 control: a stale STRUCTURAL release under a successor's lease changes nothing in the successor row", async () => {
+    const seed = await seedTeam();
+    const integrationId = await setup(seed);
+    let afterMutation: Record<string, unknown> | null = null;
+    const { fake } = scripted(seed, async (call) => {
+      await successorReclaim(seed);
+      afterMutation = await row(seed);
+      // pagination_incomplete: has_more with no cursor, and an in-range root.
+      return slackJson(historyBody({ messages: [rootMessage(rootAtUpper(call))], hasMore: true, nextCursor: null }));
+    }, ["1718900000.000900"]);
+    await startedScan(seed, integrationId, fake);
+    const rootsBefore = await threadRootTs(seed.teamId);
+    const outcome = await settle(discover(seed, integrationId, fake));
+    expect({ outcome, roots: await threadRootTs(seed.teamId), successorExact: JSON.stringify(await row(seed)) === JSON.stringify(afterMutation) }).toEqual({
+      outcome: { steps: [{ result: "delayed", category: "pagination_incomplete", detail: "The page could not be read in full, so nothing from it was enqueued or certified." }] },
+      roots: rootsBefore, successorExact: true,
+    });
+  });
+});

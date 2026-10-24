@@ -214,11 +214,16 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *   - `page_outside_segment` (DH-13): 3 behavioral REDs and 3 precedence/edge controls;
  *   - the §9.1/§9.2 fixture corrections: FX-01–FX-13, the bootstrap progress inventory with its
  *     own-property and oracle checks, and the §9 census seed at `95c2e041`.
- *  STILL DEFERRED TO PRODUCTION GREEN, which those REDs await, with no new tests yet:
- *   - discovery's handling of `rejected` (same-transaction release), `subdivided` (no second
- *     release, zero roots) and `refused`, with acceptance BEFORE root enqueue and one rollback
- *     boundary, plus the static step details for each;
- *   - the successor-safety proof of a stale release.
+ *  CALLER TRANSACTION SEMANTICS, discovery suite packet 5 (6 behavioral REDs and 3 GREEN controls):
+ *   - durable repetition: `delayed / cursor_repeated`, released in the same pass;
+ *   - authority (lease or selection) beats an immediate repeat;
+ *   - wide subdivision: the writer's transition, with no caller release;
+ *   - singleton unsplittable rejection;
+ *   - acceptance BEFORE root enqueue, proved by a test-only insert trigger;
+ *   - the single rollback boundary;
+ *   - stale-release successor safety;
+ *   - the exact static details for each.
+ *  Production GREEN for the six REDs is still pending.
  * Also still deferred:
  *  - two-session claim/accept races;
  *  - the §3.4 maximum-history compatibility writers;
@@ -272,8 +277,8 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *     - DH-09 same-pass scheduling/fairness, including the default-50 boundary and no reservation;
  *    all in `slack-source-discovery.datamechanics.test.ts`. The §9.1/§9.2 fixture corrections are in
  *    the discovery, fences and bootstrap suites;
- *  - still deferred everywhere: root-enqueue atomicity/rollback with acceptance BEFORE enqueue, and
- *    the rejected/subdivided/refused caller handling;
+ *  - acceptance BEFORE enqueue, the rollback boundary and the rejected/subdivided/refused caller
+ *    handling are tested in the discovery suite's packet 5 (RED until production GREEN);
  *  - the §3.4 maximum-history compatibility writers;
  *  - the full DH-11/12/13 matrices and the controlled mutants;
  *  - end-to-end composition (runner → discovery → state → timeline).
