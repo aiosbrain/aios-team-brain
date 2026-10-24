@@ -151,14 +151,14 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *   - initialize the opposite lane;
  *   - initialize an ineligible row.
  *
- * PACKET 3 — CLAIM-TIME SEGMENT INITIALIZATION, NEWEST LANE (7 tests, appended after packet 2; §4,
+ * PACKET 3 — CLAIM-TIME SEGMENT INITIALIZATION, NEWEST LANE (11 tests, appended after packet 2; §4,
  * §5). Each test calls `claimSlackChannelPage` directly with a configured `skewAllowanceMs`. The option
  * travels in a non-literal object, so the file compiles against today's signature, which ignores it.
  * The option NAME is this packet's choice, matching discovery's existing `skewAllowanceMs`; the
  * contract requires only that the claim use the configured allowance. Expected L always comes from
  * the test's own BigInt oracle (`boundMinusAllowance`), never from product code. "Today" is GREEN2
- * production `a2dc9167` (test-only checkpoint `95c2e041`), where packets 1–2 are 47/47 GREEN. The
- * file therefore totals 54: 6 RED, 48 GREEN.
+ * production `a2dc9167`, unchanged through test-only checkpoint `8fcb4e3b`, where packets 1–2 are
+ * 47/47 GREEN. The file therefore totals 58: 6 RED, 52 GREEN.
  *  - RED today (6), because today's claim initializes no newest segment and has no typed delay:
  *     - ×2: the first newest claim freezes B by the existing rule (the certified top) and sets
  *       L = S = max(0, B − allowance) and U = A, with cursor null, history empty and G unchanged.
@@ -166,17 +166,22 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *       checks a whole-row digest outside the newest claim set;
  *     - an anchored-but-uninitialized newest lane keeps its A and B bytes, U = canonical(A), and an
  *       in-progress historical lane (segment, cursor, G 3) is byte-identical;
- *     - a reclaim under a DIFFERENT allowance resumes a cursor-null post-split literal (S > L,
- *       G + 1). It asserts literal A, B, L, S, U and G plus a lease-only digest; exceptions are
- *       sanitized. Today it fails at its first, initialization assertion;
+ *     - a reclaim under a DIFFERENT allowance resumes a valid cursor-null post-progress literal
+ *       (S > L, G + 1). It asserts literal A, B, L, S, U and G plus a lease-only digest; exceptions
+ *       are sanitized. Today it fails at its first, initialization assertion;
  *     - ×2: candidate L > A, for an already-anchored lane whose B lies above A + allowance and for
  *       an idle lane under a far-future certified top. Each returns `delayed / scan_bounds_invalid`
  *       with the exact fixed detail. Only next_lane (to historical), the diagnostic, due_at and
  *       updated_at change. No lease is taken, and no attempt, generation, anchor, progress or
  *       certificate moves (an idle lane's anchor stays null). The typed result is read from
  *       `unknown`, so the current type needs no change for this RED.
- *  - GREEN today (1), control: an ineligible (private) row with an anchored newest lane is neither
- *    claimed nor initialized.
+ *  - GREEN today (5), controls:
+ *     - an ineligible (private) row with an anchored newest lane is neither claimed nor initialized;
+ *     - ×4: ELIGIBILITY precedes the L > A evaluation. The same CHECK-valid L > A anchored
+ *       candidate is made ineligible after seeding, in four independent ways: a private row, a
+ *       future due_at, a live competing lease (owner, expiry and claimed lane together), or a stale
+ *       binding revision. Each must return null with the whole row byte-identical, and no delay
+ *       bookkeeping is written.
  *  Post-GREEN controlled-mutant evidence for this packet is PENDING:
  *   - L from the request-time allowance on resume;
  *   - U = A raw;
@@ -240,8 +245,9 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *    caller's selection/config/token authority, and `lockSlackChannelForAcceptance`;
  *  - surrogate variants through actual transport/discovery and URL parameterization (F2-09
  *    remainder, DH-03);
- *  - subdivision, the S > L internal terminal, and segment application (DH-01/02/03/04/05). Historical
- *    claim-time initialization is packet 2 below; the newest lane's is deferred with the caller packet;
+ *  - subdivision, the S > L internal terminal, and segment application (DH-01/02/03/04/05).
+ *    Claim-time initialization is covered by packet 2 (historical) and packet 3 (newest, including
+ *    the L > A typed delay). Only the discovery/caller side of initialization remains deferred;
  *  - discovery's structural validation order, root-enqueue atomicity/rollback, and static detail
  *    messages;
  *  - the §3.4 maximum-history compatibility writers;
@@ -1286,9 +1292,12 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
     const L = boundMinusAllowance(B, BigInt(60_000));
     const first = claimBounds(await claimNewest(scope, integrationId, 60_000));
     const initialized = first.requestLowerTs === L && first.segmentLowerTs === L && first.segmentUpperTs === first.anchorTs;
-    // A valid post-split literal: S = `1718899970.000000` (> L, as a split's M + 1 leaves it), U and
-    // A unchanged, C null, H empty, G + 1. Written ONLY over an initialized lane, because S without L
-    // and U violates the progress CHECK and would be a fixture error, not a behavioral RED.
+    // A valid post-progress literal state, of the kind later progress could leave:
+    //  - S = `1718899970.000000`, chosen inside (L, U] (it is not computed by the midpoint formula);
+    //  - U and A unchanged;
+    //  - C null, H empty, G + 1.
+    // Written ONLY over an initialized lane, because S without L and U violates the progress CHECK and
+    // would be a fixture error, not a behavioral RED.
     if (initialized) {
       await tx((session) => session.executeSql(
         `update slack_sync_channels
@@ -1352,6 +1361,29 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
       unchanged: true,
       bookkeeping: { next_lane: "historical", last_error_code: "scan_bounds_invalid", lease_absent: true, due_now: true },
     });
+  });
+
+  it.each([
+    { label: "a private row", sql: "update slack_sync_channels set public_state = 'private' where team_id = $1" },
+    { label: "a future due_at", sql: "update slack_sync_channels set due_at = clock_timestamp() + interval '1 hour' where team_id = $1" },
+    {
+      label: "a live competing lease",
+      sql: `update slack_sync_channels
+               set lease_owner = 'competing-owner', lease_expires_at = clock_timestamp() + interval '5 minutes', claimed_lane = 'newest'
+             where team_id = $1`,
+    },
+    { label: "a stale binding revision", sql: `update slack_sync_channels set binding_config_revision = '${OTHER_REVISION}' where team_id = $1` },
+  ])("§5 newest init control: ELIGIBILITY precedes the L > A evaluation — $label is not claimed, not delayed, and byte-identical", async ({ sql }) => {
+    // The same CHECK-valid L > A candidate as the anchored RED above, made ineligible after seeding.
+    const { scope, integrationId } = await seedNewestCandidate({
+      newest_anchor_ts: "1718900800.000000", newest_lower_ts: "1718900900.000000",
+      completed_lower_ts: "1718800000.000001", completed_upper_ts: "1718900000.000000", historical_floor_reached: true,
+    });
+    await tx((session) => session.executeSql(sql, [scope.teamId]));
+    const before = await rowDigestExcept(scope, []);
+    const claim = await claimNewest(scope, integrationId, 60_000);
+    expect({ claim, rowUnchanged: (await rowDigestExcept(scope, [])) === before },
+      "an ineligible row returns null with no delay bookkeeping").toEqual({ claim: null, rowUnchanged: true });
   });
 });
 
