@@ -125,6 +125,52 @@ describe("validateSlackHistoryPage", () => {
       category: "malformed_page",
     });
   });
+
+  // AIO-1170 §5 / DH-13: the claimed segment [S, U], inclusive, in exact microseconds. A page outside it
+  // is refused WHOLE, and only after every structural refusal. (The release, turn and queue effects are
+  // proven on real PostgreSQL in the discovery data-mechanics suite; this is the pure precedence.)
+  describe("against the claimed segment", () => {
+    const S = "1718900000.123456";
+    const U = "1718900005.123456";
+    const segment = { lowerTs: S, upperTs: U };
+    const withSegment = (p: SlackPage, sentCursor: string | null = null) => validateSlackHistoryPage(p, { sentCursor, segment });
+
+    it("accepts messages at EXACTLY S and U, and does not range-test thread_ts", () => {
+      const result = ok(withSegment(page({
+        messages: [{ ts: U }, { ts: "1718900002.000000", thread_ts: "1718800000.000100" }, { ts: S }],
+      })));
+      expect(result.roots).toEqual([U, S]);
+    });
+
+    it("refuses the whole page for any message — root or not — at S − 1 µs or U + 1 µs", () => {
+      for (const messages of [
+        [{ ts: U }, { ts: "1718900000.123455" }],
+        [{ ts: "1718900005.123457" }, { ts: S }],
+        [{ ts: S }, { ts: "1718900005.123457", thread_ts: S }],
+      ]) {
+        expect(withSegment(page({ messages }))).toEqual({ ok: false, category: "page_outside_segment" });
+      }
+    });
+
+    it("compares exact instants, so a zero-padded spelling of an in-range ts is inside", () => {
+      expect(ok(withSegment(page({ messages: [{ ts: "0001718900001.5" }] }))).roots).toEqual(["0001718900001.5"]);
+    });
+
+    it("keeps every structural refusal ahead of the range check", () => {
+      const outside = { ts: "1718900005.123457" };
+      expect(withSegment({ hasMore: false, nextCursor: null })).toMatchObject({ category: "malformed_page" });
+      expect(withSegment(page({ messages: [outside], hasMore: true, nextCursor: null }))).toMatchObject({ category: "pagination_incomplete" });
+      expect(withSegment(page({ messages: [outside], hasMore: false, nextCursor: "page-2" }))).toMatchObject({ category: "pagination_incomplete" });
+      expect(withSegment(page({ messages: [outside], hasMore: true, nextCursor: "same" }), "same")).toMatchObject({ category: "cursor_repeated" });
+      expect(withSegment(page({ messages: [outside, { ts: "not-a-timestamp" }] }))).toMatchObject({ category: "malformed_timestamp" });
+    });
+
+    it("runs no range check when no segment is given (a direct structural check)", () => {
+      expect(ok(validateSlackHistoryPage(page({ messages: [{ ts: "1718900005.123457" }] }), { sentCursor: null })).roots).toEqual([
+        "1718900005.123457",
+      ]);
+    });
+  });
 });
 
 describe("classifySlackCall", () => {

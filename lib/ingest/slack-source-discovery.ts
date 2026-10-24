@@ -87,6 +87,8 @@ export const SLACK_METADATA_INTERVAL_MS = 30 * 60 * 1000;
  * misses a root the provider stamped just under it after the previous page was served. It must stay
  * above the database-to-Slack skew plus request latency, and it is not free: the margin is re-read
  * on the shared history budget every catch-up. The live soak measures the skew before this changes.
+ * It is applied ONCE, by the claim that freezes a newest scan's request lower L; every request of that
+ * scan then sends the claim's frozen segment.
  */
 export const SLACK_SKEW_ALLOWANCE_MS = 60 * 1000;
 
@@ -165,8 +167,65 @@ export type SlackHistoryPageValidation =
     }
   | {
       readonly ok: false;
-      readonly category: "malformed_page" | "malformed_timestamp" | "pagination_incomplete" | "cursor_repeated";
+      readonly category:
+        | "malformed_page"
+        | "malformed_timestamp"
+        | "pagination_incomplete"
+        | "cursor_repeated"
+        | "page_outside_segment";
     };
+
+/**
+ * The claimed segment a page was REQUESTED for, as stored bound strings (§5): `lowerTs` is S, `upperTs`
+ * is U, and both are inclusive. Given to the validator, every raw message `ts` must lie inside it.
+ */
+export interface SlackHistorySegment {
+  readonly lowerTs: string;
+  readonly upperTs: string;
+}
+
+const MICROS_PER_SECOND = BigInt(1_000_000);
+const EXACT_BOUND = /^([0-9]+)[.]([0-9]{1,6})$/;
+
+/**
+ * Exact microsecond ticks of a timestamp or bound string, with integer arithmetic only. This is not
+ * `parseSlackTimestamp`, because a bound may legitimately be `0.000000`. Null means it is not an
+ * exact instant.
+ */
+function exactTicks(value: string): bigint | null {
+  const match = EXACT_BOUND.exec(value);
+  if (!match) return null;
+  return BigInt(match[1]) * MICROS_PER_SECOND + BigInt(match[2].padEnd(6, "0"));
+}
+
+/** The fixed operator details for a refused page. They never carry a timestamp, a bound or a cursor. */
+const PAGE_UNREADABLE_DETAIL = "The page could not be read in full, so nothing from it was enqueued or certified.";
+const PAGE_OUTSIDE_SEGMENT_DETAIL =
+  "The provider returned a message outside the requested time range; the scan remains incomplete.";
+
+/**
+ * The claim's frozen active segment, which is the request's and the validator's single source of
+ * truth. Every claim initializes it before it is returned, so a missing bound is an anomaly: it throws
+ * a static, value-free error rather than sending an unbounded or anchor-shaped request.
+ */
+function claimedSegment(claim: SlackChannelClaim): SlackHistorySegment {
+  if (claim.segmentLowerTs === null || claim.segmentUpperTs === null) {
+    throw new Error("slack source discovery: a history claim came back without its segment bounds");
+  }
+  const segment = { lowerTs: claim.segmentLowerTs, upperTs: claim.segmentUpperTs };
+  segmentTicks(segment);
+  return segment;
+}
+
+/** A claimed segment in exact ticks. A bound that is not an exact instant is a static, value-free error. */
+function segmentTicks(segment: SlackHistorySegment): { lower: bigint; upper: bigint } {
+  const lower = exactTicks(segment.lowerTs);
+  const upper = exactTicks(segment.upperTs);
+  if (lower === null || upper === null || lower > upper) {
+    throw new Error("slack source discovery: a claimed segment bound is not an exact timestamp range");
+  }
+  return { lower, upper };
+}
 
 /**
  * Read one `conversations.history` page, or refuse the WHOLE of it.
@@ -178,10 +237,20 @@ export type SlackHistoryPageValidation =
  *
  * Root-ness is `!thread_ts || thread_ts === ts` — the same rule as `fetchSlackChannel`'s
  * `isTopLevel`, deliberately unchanged, and with NO content filter after it.
+ *
+ * THE ORDER IS THE CONTRACT (§5):
+ *  1. malformed_page;
+ *  2. both pagination_incomplete contradictions;
+ *  3. cursor_repeated;
+ *  4. malformed_timestamp, for any `ts` or `thread_ts`;
+ *  5. and only then, when the claimed `segment` is given, `page_outside_segment`.
+ * Step 5 tests EVERY raw message `ts`, root or not, against [S, U] inclusive, in exact microseconds.
+ * A `thread_ts` is not range-tested: a reply in range may belong to a root outside it. Without a
+ * segment (a direct structural check) step 5 does not run.
  */
 export function validateSlackHistoryPage(
   page: SlackPage,
-  opts: { sentCursor: string | null }
+  opts: { sentCursor: string | null; segment?: SlackHistorySegment }
 ): SlackHistoryPageValidation {
   // ABSENT is not `[]`. The transport preserves that difference exactly so that a response which
   // never mentioned messages cannot be read here as an empty range we may certify.
@@ -208,6 +277,16 @@ export function validateSlackHistoryPage(
     }
     oldestTs = olderSlackTs(oldestTs, ts);
     if (threadTs === undefined || threadTs === ts) roots.push(ts);
+  }
+
+  // Every timestamp is now known to be exact, so the range test can neither mask nor be masked by a
+  // malformed one.
+  if (opts.segment !== undefined) {
+    const { lower, upper } = segmentTicks(opts.segment);
+    for (const message of page.messages) {
+      const at = exactTicks((message as { ts: string }).ts);
+      if (at === null || at < lower || at > upper) return { ok: false, category: "page_outside_segment" };
+    }
   }
   return { ok: true, roots, oldestTs, hasMore: page.hasMore, nextCursor: page.nextCursor };
 }
@@ -898,29 +977,6 @@ async function readOnePage(
   }
 }
 
-/**
- * An exact Slack `ts` moved EARLIER by a whole number of milliseconds, in the six-digit microsecond
- * form Slack expects, clamped at zero — the only floor there is, since no "historical floor"
- * timestamp exists. Seconds and microseconds stay separate integers throughout: a float cannot hold
- * a current `ts` to the microsecond.
- */
-function slackTsMinusMs(ts: string, ms: number): string {
-  const parsed = parseSlackTimestamp(ts);
-  if (!parsed) {
-    // Unreachable for a bound this module froze from the database clock. THROWN rather than sent
-    // unshifted: a silently narrower seam is the defect the margin exists to close.
-    throw new Error("slack source discovery: a newest lower bound is not an exact Slack timestamp");
-  }
-  let seconds = parsed.seconds - Math.floor(ms / 1000);
-  let micros = parsed.micros - (ms % 1000) * 1000;
-  if (micros < 0) {
-    micros += 1_000_000;
-    seconds -= 1;
-  }
-  if (seconds < 0) return "0.000000";
-  return `${seconds}.${String(micros).padStart(6, "0")}`;
-}
-
 async function fetchAndAccept(
   pass: Pass,
   selection: SlackSelection,
@@ -929,22 +985,20 @@ async function fetchAndAccept(
   claim: SlackChannelClaim
 ): Promise<void> {
   const channelId = claim.scope.channelId;
-  // ⚠️ THE SEAM'S MARGIN IS TAKEN OFF HERE AND NOWHERE ELSE. Only the REQUEST moves: `claim.lowerTs`
-  // is what the acceptance writes back, so the stored bound and every `completed_*` value are
-  // exactly what they were, and each page of one scan — a separate wake, a separate claim — derives
-  // the same `oldest` from the same stored bound. Writing the shifted value back would subtract the
-  // allowance again on every page. A historical scan has no lower bound, and gains none.
-  const oldest =
-    claim.lowerTs === null
-      ? null
-      : slackTsMinusMs(claim.lowerTs, pass.options.skewAllowanceMs ?? SLACK_SKEW_ALLOWANCE_MS);
+  // ⚠️ THE REQUEST IS THE CLAIM'S FROZEN SEGMENT, NOTHING ELSE (§5): `latest = U`, `oldest = S`.
+  //  - The PA-3 skew margin was taken off ONCE, when the claim froze a newest scan's L (= its first S).
+  //  - It is never re-derived here from B or from this pass's allowance.
+  //  - It is never sent as the anchor A, which a progressed segment's U may lie below.
+  // Every page of one segment therefore sends the same bounds. A historical segment at S = 0 omits
+  // `oldest` (the unbounded-below request); a newest segment always sends its S, zero included.
+  const segment = claimedSegment(claim);
   const params: Record<string, string> = {
     channel: channelId,
-    latest: claim.anchorTs,
+    latest: segment.upperTs,
     // INCLUSIVE, so a catch-up scan re-reads everything down to its lower boundary. A duplicate root
     // is deduplicated by the exact-key thread enqueue; trimming the seam is what loses a thread.
     inclusive: "true",
-    ...(oldest === null ? {} : { oldest }),
+    ...(claim.lane === "historical" && exactTicks(segment.lowerTs) === BigInt(0) ? {} : { oldest: segment.lowerTs }),
     ...(claim.cursor === null ? {} : { cursor: claim.cursor }),
   };
   const scope = verifiedScope(selection, bound);
@@ -993,10 +1047,14 @@ async function fetchAndAccept(
     return;
   }
 
-  const page = validateSlackHistoryPage(call.page, { sentCursor: claim.cursor });
+  // Structural, BEFORE the acceptance transaction: the same segment the request was sent for.
+  const page = validateSlackHistoryPage(call.page, { sentCursor: claim.cursor, segment });
   if (!page.ok) {
+    // The request WAS sent, so its slot was used and the turn passes. Only this fenced claim is
+    // released: a stale release refuses rather than overwriting a successor. No root, frontier,
+    // generation or certificate moves.
     await runContextTransaction(pass.input.db, (session) =>
-      releaseSlackChannelForRetry(session, claim, { nextDueAt: null, errorCode: page.category })
+      releaseSlackChannelForRetry(session, claim, { nextDueAt: null, errorCode: page.category, turn: "passed" })
     );
     step(pass, {
       stage: "history",
@@ -1004,7 +1062,7 @@ async function fetchAndAccept(
       result: "delayed",
       category: page.category,
       channelId,
-      detail: "The page could not be read in full, so nothing from it was enqueued or certified.",
+      detail: page.category === "page_outside_segment" ? PAGE_OUTSIDE_SEGMENT_DETAIL : PAGE_UNREADABLE_DETAIL,
     });
     return;
   }
