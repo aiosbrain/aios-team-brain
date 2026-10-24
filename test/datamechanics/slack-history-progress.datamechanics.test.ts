@@ -118,18 +118,37 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *  - §3.1 claim/ensured/due/release projection boundary;
  *  - §3.1 `STATE_COLUMNS` source boundary.
  *
- * PACKET 2 — CLAIM-TIME SEGMENT INITIALIZATION (6 tests, appended at the end of the describe). The
- * historical lane is claimed directly; the newest lane's initialization needs the configured skew
- * allowance and is pinned through discovery in `slack-source-discovery.datamechanics.test.ts`. "Today"
- * for this packet is checkpoint `06528f96`, where the 37 packet-1 tests and 3 precedence tests are
- * GREEN.
+ * PACKET 2 — CLAIM-TIME SEGMENT INITIALIZATION, HISTORICAL LANE ONLY (6 tests, appended at the end of
+ * the describe; §4, §5). Each test calls `claimSlackChannelPage` directly on a literal row. "Today"
+ * for this packet is checkpoint `06528f96`, where all 40 packet-1 tests are GREEN.
  *  - RED today (4), because today's claim freezes A but initializes no segment:
- *     - the first claim initializes S = L = 0, U = A, C = null, H = [] and carries those bounds;
+ *     - the first claim initializes S = L = 0, U = A, C = null, H = [] and carries those bounds. A is
+ *       the DB clock, so it is checked as canonical and equal to U, never against a JS clock;
  *     - a NEW anchor from a noncanonical completed_lower_ts is stored canonically, with U = A;
  *     - an already-anchored uninitialized lane keeps its anchor bytes, with U = canonical(A);
- *     - a reclaim after expiry resumes the initialized segment without reinitializing it.
+ *     - a reclaim after expiry resumes a PROGRESSED initialized segment (S above the floor, a stored
+ *       cursor) without reinitializing it. Today it fails at the first, initialization assertion.
+ *    Each also proves, by a digest of every column outside the claim-permitted set, that the newest
+ *    lane and all unrelated state are byte-identical.
  *  - GREEN today (2), controls: an existing narrower segment is preserved by its claim; an ineligible
  *    (private) row is neither claimed nor initialized.
+ *  This packet refines the single root cause of the 32 broad related-suite failures at `06528f96`
+ *  (a continuation reaching an uninitialized segment). It does NOT by itself restore them, because
+ *  most of them run through discovery and the newest lane.
+ *
+ * DEFERRED TO THE IMMEDIATELY FOLLOWING CALLER PACKET, NOT covered here:
+ *  - NEWEST-lane claim initialization (L = max(0, B − skew allowance), S = L, U = A) and its
+ *    resume-preserves-L rule. The claim does not yet receive the configured allowance, so this is
+ *    pinned through discovery;
+ *  - the L > A `delayed / scan_bounds_invalid` claim outcome: no lease, attempt, anchor, HTTP,
+ *    reservation, root or coverage change;
+ *  - discovery's raw-message timestamp validation against the claimed segment
+ *    (`page_outside_segment`), after malformed_page, pagination_incomplete and malformed_timestamp,
+ *    and before any root enqueue or state write;
+ *  - discovery's handling of `rejected` (same-transaction release), `subdivided` (no second
+ *    release, zero roots) and `refused`, with acceptance BEFORE root enqueue and one rollback
+ *    boundary;
+ *  - the static step details for each.
  *
  * PRIVACY: cursors and histories are synthetic. They are compared only by SQL equality (booleans),
  * row md5 digests or SQL-computed counts and byte lengths. Errors are projected to SQLSTATE/name.
@@ -167,13 +186,14 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *    caller's selection/config/token authority, and `lockSlackChannelForAcceptance`;
  *  - surrogate variants through actual transport/discovery and URL parameterization (F2-09
  *    remainder, DH-03);
- *  - subdivision, the S > L internal terminal, and segment application (DH-01/02/03/04/05); claim-time
- *    initialization is packet 2 below, plus the discovery suite's integration block;
+ *  - subdivision, the S > L internal terminal, and segment application (DH-01/02/03/04/05). Historical
+ *    claim-time initialization is packet 2 below; the newest lane's is deferred with the caller packet;
  *  - discovery's structural validation order, root-enqueue atomicity/rollback, and static detail
  *    messages;
  *  - the §3.4 maximum-history compatibility writers;
  *  - the §9.1/§9.2 fixture corrections; DH-09 scheduling/fairness;
- *  - the full DH-11/12/13 matrices and the controlled mutants.
+ *  - the full DH-11/12/13 matrices and the controlled mutants;
+ *  - end-to-end composition (runner → discovery → state → timeline).
  */
 
 const WORKSPACE = "T0HISTADM1";
@@ -1043,16 +1063,35 @@ describe("AM-F2 runtime packet 1 — state-writer history admission (real Postgr
     const first = await tx((session) => claimSlackChannelPage(session, scope, { bindingIntegrationId: integrationId, bindingConfigRevision: REVISION }));
     const firstBounds = claimBounds(first);
     const initialized = firstBounds.segmentLowerTs === "0.000000" && firstBounds.segmentUpperTs === firstBounds.anchorTs;
-    const afterFirst = await rowDigestExcept(scope, LEASE_BOOKKEEPING);
+    // DISCRIMINATING progress, as a split plus an accepted continuation would leave it: S above the
+    // floor and a stored cursor. A claim that re-initialized would reset both. Applied ONLY to an
+    // initialized lane, because S without U violates the progress CHECK and would be a fixture error,
+    // not a behavioral RED.
+    if (initialized) {
+      await tx((session) => session.executeSql(
+        `update slack_sync_channels
+            set historical_segment_lower_ts = '1.000000', historical_cursor = 'syn-h-r',
+                historical_cursor_history = '["syn-h-r"]'::jsonb
+          where team_id = $1`, [scope.teamId]
+      ));
+    }
+    const afterProgress = await rowDigestExcept(scope, LEASE_BOOKKEEPING);
     await tx((session) => session.executeSql(
       "update slack_sync_channels set lease_expires_at = clock_timestamp() - interval '1 second' where team_id = $1", [scope.teamId]
     ));
     const second = await tx((session) => claimSlackChannelPage(session, scope, { bindingIntegrationId: integrationId, bindingConfigRevision: REVISION }));
     expect({
       initialized,
-      sameBounds: JSON.stringify(claimBounds(second)) === JSON.stringify(firstBounds),
-      laneUnchanged: (await rowDigestExcept(scope, LEASE_BOOKKEEPING)) === afterFirst,
-    }, "only the lease bookkeeping moves on a reclaim").toEqual({ initialized: true, sameBounds: true, laneUnchanged: true });
+      resumed: { ...claimBounds(second), cursorResumed: (second as { cursor?: unknown } | null)?.cursor === "syn-h-r" },
+      laneUnchanged: (await rowDigestExcept(scope, LEASE_BOOKKEEPING)) === afterProgress,
+    }, "the reclaim carries the progressed segment and cursor; only the lease bookkeeping moves").toEqual({
+      initialized: true,
+      resumed: {
+        lane: "historical", anchorTs: firstBounds.anchorTs, requestLowerTs: null,
+        segmentLowerTs: "1.000000", segmentUpperTs: firstBounds.anchorTs, cursorResumed: true,
+      },
+      laneUnchanged: true,
+    });
   });
 
   it("§5 init control: a claim of an EXISTING narrower segment with a stored cursor preserves it and carries its exact bounds", async () => {
