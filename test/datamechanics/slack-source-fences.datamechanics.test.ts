@@ -26,6 +26,7 @@ import {
   slackJson,
   threadRootTs,
   type Row,
+  type SlackCall,
   type SlackFake,
 } from "./slack-source-helpers";
 
@@ -101,6 +102,28 @@ function partialPage(rootTs: string, cursor: string): () => Response {
   return () =>
     slackJson(historyBody({ messages: [rootMessage(rootTs)], hasMore: true, nextCursor: cursor }));
 }
+
+const FX_MICROS = BigInt(1_000_000);
+/** A six-digit request bound as exact microseconds; anything else fails the fixture. */
+function fxTicks(ts: string): bigint {
+  const match = /^([0-9]+)[.]([0-9]{6})$/.exec(ts);
+  if (!match) throw new Error("fixture: a malformed history request bound");
+  return BigInt(match[1]) * FX_MICROS + BigInt(match[2]);
+}
+/**
+ * AIO-1170 §9.1 ordinary one-root replacement: a root at the request's own U, with exact integer
+ * arithmetic. `latest` is required and an omitted `oldest` is zero; the window must be non-empty.
+ */
+function rootAtUpper(call: SlackCall): string {
+  const latest = call.params.get("latest");
+  if (latest === null) throw new Error("fixture: a history request without latest");
+  const oldest = call.params.get("oldest");
+  const upper = fxTicks(latest);
+  if ((oldest === null ? BigInt(0) : fxTicks(oldest)) > upper) throw new Error("fixture: an empty history request window");
+  return `${(upper / FX_MICROS).toString()}.${(upper % FX_MICROS).toString().padStart(6, "0")}`;
+}
+const historyCategories = (result: SlackSourceDiscoveryResult): string[] =>
+  result.steps.filter((s) => s.stage === "history").map((s) => `${s.result}:${s.category ?? ""}`);
 
 // ── 1. the metadata observation fence ────────────────────────────────────────
 
@@ -193,7 +216,7 @@ describe("a channel's public verdict is fenced by the attempt that asked for it"
     const reader = await seedSlackIntegration(seed, { channelIds: [CHANNEL], token: TOKEN });
 
     // A real first scan, left mid-page so the next claim has somewhere to continue from.
-    await discover(
+    const first = await discover(
       seed,
       reader,
       warmUp(APP_A, {
@@ -203,6 +226,8 @@ describe("a channel's public verdict is fenced by the attempt that asked for it"
           ),
       })
     );
+    // §9.1 FX-03: the initial historical `.000900` page is in range and ACCEPTED.
+    expect(historyCategories(first), "the initial historical page is accepted").toEqual(["ok:"]);
     const seeded = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
     const rootsBefore = await threadRootTs(seed.teamId);
     expect(rootsBefore).toEqual(["1718900000.000900"]);
@@ -222,15 +247,15 @@ describe("a channel's public verdict is fenced by the attempt that asked for it"
       "conversations.info": () => {
         throw new Error("the proof is fresh when the outer pass starts; it must not re-observe");
       },
-      "conversations.history": async () => {
+      "conversations.history": async (call) => {
+        // §9.1 FX-03: the root is derived from the HELD request, BEFORE the nested privacy observation.
+        const root = rootAtUpper(call);
         // ⚠️ CLOCK FIXTURE, inside the held handler: only now is the proof past its cadence.
         await agePublicProof(seed.teamId, CHANNEL);
         await discover(seed, reader, observing);
         revokedWhileInFlight =
           (await channelRow(seed.teamId, WORKSPACE, CHANNEL))?.public_state === "private";
-        return slackJson(
-          historyBody({ messages: [rootMessage("1718900000.000800")], hasMore: true, nextCursor: "cursor-2" })
-        );
+        return slackJson(historyBody({ messages: [rootMessage(root)], hasMore: true, nextCursor: "cursor-2" }));
       },
     });
 
@@ -264,6 +289,43 @@ describe("a channel's public verdict is fenced by the attempt that asked for it"
     );
     expect(claim).toBeNull();
   });
+
+  // §9.1 FX-03 matched POSITIVE CONTROL, in its own setup so it cannot erase the refusal evidence
+  // above. The newest page is built exactly as there (one root at the held request's own U, more to
+  // come, cursor-2), but nothing revokes the channel, so the same page is accepted.
+  it("accepts the same bound-derived newest page when nothing revokes the channel (FX-03 control)", async () => {
+    const seed = await seedTeam();
+    const reader = await seedSlackIntegration(seed, { channelIds: [CHANNEL], token: TOKEN });
+    const first = await discover(
+      seed,
+      reader,
+      warmUp(APP_A, {
+        "conversations.history": () =>
+          slackJson(
+            historyBody({ messages: [rootMessage("1718900000.000900")], hasMore: true, nextCursor: "cursor-1" })
+          ),
+      })
+    );
+    expect(historyCategories(first), "the initial historical page is accepted").toEqual(["ok:"]);
+    await elapse(seed.teamId);
+    let root: string | null = null;
+    const quiet = fakeSlack({
+      "conversations.history": (call) => {
+        root = rootAtUpper(call);
+        return slackJson(historyBody({ messages: [rootMessage(root)], hasMore: true, nextCursor: "cursor-2" }));
+      },
+    });
+    const result = await discover(seed, reader, quiet);
+    expect({
+      history: historyCategories(result),
+      roots: await threadRootTs(seed.teamId),
+      newestCursor: (await channelRow(seed.teamId, WORKSPACE, CHANNEL))?.newest_cursor,
+    }, "the non-revoked page is accepted with its root and cursor").toEqual({
+      history: ["ok:"],
+      roots: ["1718900000.000900", String(root)].sort(),
+      newestCursor: "cursor-2",
+    });
+  });
 });
 
 // ── 2. deleting an integration ───────────────────────────────────────────────
@@ -290,7 +352,15 @@ describe("deleting an integration unbinds the channel without losing it", () => 
     await elapse(seed.teamId);
     // …then the SAME binder's next wake leaves the catch-up lane mid-page too, so the delete below
     // has both lanes' progress to preserve.
-    await discover(seed, bound, warmUp(APP_A, { "conversations.history": partialPage("1718900000.000850", "cursor-2") }));
+    // §9.1 FX-04: only the `.000850` root is replaced, by a value captured from THIS newest request's U.
+    let newestRoot: string | null = null;
+    const newestPage = await discover(seed, bound, warmUp(APP_A, {
+      "conversations.history": (call) => {
+        newestRoot = rootAtUpper(call);
+        return slackJson(historyBody({ messages: [rootMessage(newestRoot)], hasMore: true, nextCursor: "cursor-2" }));
+      },
+    }));
+    expect(historyCategories(newestPage), "the newest partial page is accepted").toEqual(["ok:"]);
     await elapse(seed.teamId);
     await discover(seed, shared, identityOnly(APP_A), { maxRequests: 1 });
     await discover(seed, untouched, warmUp(APP_A));
@@ -349,11 +419,10 @@ describe("deleting an integration unbinds the channel without losing it", () => 
     expect(rebound?.binding_integration_id).toBe(shared);
     expect(rebound?.binding_config_revision).not.toBeNull();
     expect(resumed.paramsOf("conversations.history")[0].get("cursor")).toBe("cursor-1");
-    expect(await threadRootTs(seed.teamId)).toEqual([
-      "1718900000.000800",
-      "1718900000.000850",
-      "1718900000.000900",
-    ]);
+    // The exact three-key queue, with the captured newest root substituted, sorted as the reader sorts.
+    expect(await threadRootTs(seed.teamId)).toEqual(
+      ["1718900000.000800", String(newestRoot), "1718900000.000900"].sort()
+    );
   });
 });
 

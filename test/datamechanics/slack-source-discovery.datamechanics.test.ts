@@ -11,6 +11,7 @@ import {
   channelRow,
   closeRawSql,
   elapse,
+  expireChannelLease,
   fakeSlack,
   historyBody,
   rawSql,
@@ -128,6 +129,30 @@ function shiftTs(ts: string, deltaMicros: bigint): string {
   const shifted = tsMicros(ts) + deltaMicros;
   const clamped = shifted < BigInt(0) ? BigInt(0) : shifted;
   return `${clamped / MICROS_PER_SECOND}.${String(clamped % MICROS_PER_SECOND).padStart(6, "0")}`;
+}
+
+/**
+ * AIO-1170 §9.1 FIXTURE RULE: a request's own exact bounds, with integer arithmetic only. `latest` is
+ * required and an omitted (historical) `oldest` is zero. A malformed or empty window fails the
+ * fixture; there is no wall-clock fallback.
+ */
+function requestWindow(call: SlackCall): { lower: bigint; upper: bigint } {
+  const latest = call.params.get("latest");
+  if (latest === null) throw new Error("fixture: a history request without latest");
+  const oldest = call.params.get("oldest");
+  const window = { lower: oldest === null ? BigInt(0) : tsMicros(oldest), upper: tsMicros(latest) };
+  if (window.lower > window.upper) throw new Error("fixture: an empty history request window");
+  return window;
+}
+/** The §9.1 ordinary one-root replacement: a root at the request's own U. */
+function rootAtUpper(call: SlackCall): string {
+  return shiftTs("0.000000", requestWindow(call).upper);
+}
+/** True when `ts` lies inside the request's inclusive [S, U]. */
+function insideRequest(call: SlackCall, ts: string): boolean {
+  const { lower, upper } = requestWindow(call);
+  const at = tsMicros(ts);
+  return at >= lower && at <= upper;
 }
 
 // ── the first page ───────────────────────────────────────────────────────────
@@ -363,7 +388,8 @@ describe("the roots and the frontier are one commit", () => {
         return session.executeSql(text, params);
       }) as TransactionSession["executeSql"],
     }));
-    const fake = pass(() => slackJson(historyBody({ messages: [rootMessage("1718900000.000700")] })));
+    // §9.1 FX-01: the one root is derived from THIS newest request's own U (was a fixed `.000700`).
+    const fake = pass((call) => slackJson(historyBody({ messages: [rootMessage(rootAtUpper(call))] })));
 
     await expect(discover(seed, integrationId, fake, { client: failing })).rejects.toThrow(
       /forced frontier failure/
@@ -385,6 +411,25 @@ describe("the roots and the frontier are one commit", () => {
       [seed.teamId]
     );
     expect(rows[0]?.due).toBe(true);
+
+    // §9.1 FX-01 matched control, AFTER every faulted assertion above. Elapse for budget/due
+    // eligibility and expire the still-live claim explicitly; an unfaulted retry through the ordinary
+    // client resumes the SAME frozen newest anchor and accepts its own bound-derived root.
+    const failedLatest = fake.paramsOf("conversations.history")[0]?.get("latest");
+    await elapse(seed.teamId);
+    await expireChannelLease(seed.teamId, CHANNEL);
+    const retry = pass((call) => slackJson(historyBody({ messages: [rootMessage(rootAtUpper(call))] })));
+    const retried = await discover(seed, integrationId, retry);
+    const retryRequest = retry.paramsOf("conversations.history")[0];
+    expect({
+      history: retried.steps.filter((s) => s.stage === "history").map((s) => `${s.result}:${s.category ?? ""}`),
+      sameAnchor: retryRequest?.get("latest") === failedLatest && typeof failedLatest === "string",
+      roots: await threadRootTs(seed.teamId),
+    }, "the unfaulted retry resumes the same anchored newest scan and commits its root").toEqual({
+      history: ["ok:"],
+      sameAnchor: true,
+      roots: [retryRequest?.get("latest")],
+    });
   });
 
   it("refuses a page whose lease was reclaimed during the request", async () => {
@@ -668,9 +713,20 @@ describe("replay and overlap", () => {
   it("re-reports a root without disturbing the work already running on it", async () => {
     const seed = await seedTeam();
     const integrationId = await setup(seed);
-    const root = "1718900000.000100";
-    const fake = pass(() => slackJson(historyBody({ messages: [rootMessage(root)] })));
-    await discover(seed, integrationId, fake);
+    // §9.1 FX-02: the root is captured ONCE, from the initial request's own U, and the identical string
+    // is reused for the claimed thread and the second page. U = A1 lies inside the next catch-up's
+    // skew overlap, which the second request asserts; it is never regenerated.
+    let captured: string | null = null;
+    let secondInside: boolean | null = null;
+    const fake = pass((call) => {
+      if (captured === null) captured = rootAtUpper(call);
+      else secondInside = insideRequest(call, captured);
+      return slackJson(historyBody({ messages: [rootMessage(captured)] }));
+    });
+    const historyOk = (result: SlackSourceDiscoveryResult) =>
+      result.steps.filter((s) => s.stage === "history").map((s) => `${s.result}:${s.category ?? ""}`);
+    expect(historyOk(await discover(seed, integrationId, fake)), "the initial page is accepted").toEqual(["ok:"]);
+    const root = String(captured);
 
     // Somebody is mid-page on that thread: a lease, a fence and a stored cursor.
     const scope = { teamId: seed.teamId, workspaceId: WORKSPACE, channelId: CHANNEL, rootTs: root };
@@ -681,7 +737,8 @@ describe("replay and overlap", () => {
 
     // The overlap seam re-reports the same root on the next scan.
     await elapse(seed.teamId);
-    await discover(seed, integrationId, fake);
+    expect(historyOk(await discover(seed, integrationId, fake)), "the overlap page is accepted").toEqual(["ok:"]);
+    expect(secondInside, "the captured root lies inside the second request's actual bounds").toBe(true);
 
     const [after] = await threadRows(seed.teamId);
     expect(after).toEqual(before);
