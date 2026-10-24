@@ -1162,9 +1162,20 @@ describe("slack repair census: stored source, queue and gate observations (real 
     // Same root in another workspace, and in another channel: neither is this scope's queue.
     await runSql(thread, [seed.teamId, "T0SECOND", CHANNEL, R3, null]);
     await runSql(thread, [seed.teamId, WORKSPACE, "C0OTHER", R3, "timeout"]);
+    // AIO-1170 §9 seed correction (shape only): a coherent initialized segment on each lane, so the
+    // seed satisfies the progress CHECKs. The anchors and coverage asserted below are unchanged.
+    //  - Newest: B below A, L = S = B − 60 s, U = A.
+    //  - Historical: S = 0, U = A.
+    //  - Both lanes: empty C/H and no attempt or aggregate oldest.
     await committed(
       `update slack_sync_channels
-          set newest_anchor_ts = '1718999999.000900', historical_anchor_ts = '1718800000.000001',
+          set newest_anchor_ts = '1718999999.000900', newest_lower_ts = '1718999900.000900',
+              newest_request_lower_ts = '1718999840.000900', newest_segment_lower_ts = '1718999840.000900',
+              newest_segment_upper_ts = '1718999999.000900', newest_cursor = null, newest_cursor_history = '[]'::jsonb,
+              historical_anchor_ts = '1718800000.000001',
+              historical_segment_lower_ts = '0.000000', historical_segment_upper_ts = '1718800000.000001',
+              historical_cursor = null, historical_cursor_history = '[]'::jsonb,
+              historical_oldest_seen_ts = null, historical_completed_segments_oldest_ts = null,
               completed_lower_ts = '1718800000.000001', completed_upper_ts = '1718999999.000900'
         where team_id = $1 and workspace_id = $2 and channel_id = $3`,
       [seed.teamId, WORKSPACE, CHANNEL]
