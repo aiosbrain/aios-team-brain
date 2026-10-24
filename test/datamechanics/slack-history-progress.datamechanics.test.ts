@@ -266,10 +266,17 @@ import { agePublicProof, closeRawSql, elapse, expireChannelLease } from "./slack
  *      - the NEWEST lane's invalid_cursor transitions.
  * PACKET 7 — §3.4 / F2-10 (partial) MAXIMUM-HISTORY COMPATIBILITY WRITERS (13 tests, expected GREEN on
  * current source). Each runs on a FRESH row whose two lane histories are both at their exact maximum
- * shape: 1,000 entries and 1,048,576 bytes, distinct per lane and linked to their cursors. The fixture
- * is proved by SQL before each action. A digest of every column outside the writer's existing allowed
- * set then proves both histories, and all unrelated progress and certification, byte-identical; the
- * allowed effects are SQL booleans and counts.
+ * shape: 1,000 entries and 1,048,576 bytes, distinct per lane and linked to their cursors.
+ * The row also carries legal, discriminating non-null facts, so preservation is proved against
+ * clearing:
+ *  - a provisional newest catch-up top, which is the newest lane's B;
+ *  - `last_read_at` and a prior `last_error_code`;
+ *  - a historical attempt-oldest inside [S, U];
+ *  - a completed-segments aggregate in (U, A], on the final segment [0, U] with U < A.
+ * The fixture is proved by SQL before each action. A digest of every column outside the writer's
+ * existing allowed set then proves both histories, and all unrelated progress and certification,
+ * byte-identical; the allowed effects are SQL booleans and counts. Every returned value must carry no
+ * history key and no non-current entry of either history.
  *  - claimSlackChannelPage;
  *  - releaseSlackChannelForRetry;
  *  - beginSlackChannelMetadata;
@@ -280,7 +287,8 @@ import { agePublicProof, closeRawSql, elapse, expireChannelLease } from "./slack
  *  - opposite-lane restartSlackChannelScan (invalid_cursor, typed `subdivided`);
  *  - the fenced rejection/release path;
  *  - the unchanged test-only elapse, expireChannelLease and agePublicProof;
- *  - ensureSlackChannel's insert-on-conflict-do-nothing, which neither updates nor rechecks the row.
+ *  - ensureSlackChannel's insert-on-conflict-do-nothing, which neither updates nor rechecks the row
+ *    (its `xmin` row version is unchanged).
  * Not claimed by packet 7: the rest of F2-10 (the 200-channel bulk projection and long-cycle
  * detection) and any DH row beyond these writers.
  * Also still deferred:
@@ -340,7 +348,9 @@ import { agePublicProof, closeRawSql, elapse, expireChannelLease } from "./slack
  *    the discovery, fences and bootstrap suites;
  *  - acceptance BEFORE enqueue, the rollback boundary and the rejected/subdivided/refused caller
  *    handling are tested in the discovery suite's packet 5 (GREEN since `f556163d`);
- *  - the §3.4 maximum-history compatibility writers are packet 7 of this file;
+ *  - beyond packet 7's matrix (see its ledger above): the newest lane as the CLAIMED lane of a
+ *    compatibility writer, public/binder verdict variants other than the one private-under-claim case,
+ *    the 200-channel bulk projection, and long-cycle detection;
  *  - the full DH-11/12/13 matrices and the controlled mutants;
  *  - end-to-end composition (runner → discovery → state → timeline).
  */
@@ -1721,14 +1731,31 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
       return i < 576 ? id + pad.repeat(347) : `${id}${pad.repeat(346)}aa`;
     });
   }
-  type MaxSeeded = Seeded & { historicalHistory: string[] };
   /**
-   * A public, bound, due channel with BOTH lanes initialized and at maximum history.
-   *  - Historical: A = `1718900500.000000`, the wide segment [0, A], C = its last entry, G 4.
-   *  - Newest: the coherent fixture tuple (B = the historical anchor, L = S < B < U = A), C = its last
-   *    entry, G 2.
-   * `next_lane` is historical.
+   * The shared fixture's legal, DISCRIMINATING non-null facts, so preservation is proved against
+   * clearing.
+   *  - Historical: A = `1718900500.000000`, on the FINAL segment [S = L = 0, U = `1718900300.000000`]
+   *    with U < A, after earlier terminal upper segments. The aggregate `1718900350.000000` is in
+   *    (U, A], the attempt-oldest `1718900200.000000` is in [S, U], and G is 4.
+   *  - Newest: a provisional catch-up top `1718900650.000000` is the newest lane's B. Then
+   *    L = S = B − 60 s, U = A = `1718900800.000000`, and G is 2.
+   *  - Row-wide: `last_read_at` and a prior `last_error_code` are set.
    */
+  const MAX_ROW = {
+    historicalUpper: "1718900300.000000",
+    aggregate: "1718900350.000000",
+    attemptOldest: "1718900200.000000",
+    catchupTop: "1718900650.000000",
+    newestAnchor: "1718900800.000000",
+    newestRequestLower: "1718900590.000000",
+    lastRead: "2026-01-02 00:00:00+00",
+    lastError: "prior_compat",
+    // Inside [S, U] and NEWER than the attempt-oldest, so the §6 terminal's completed lower must come
+    // from the locked attempt-oldest, not from the page.
+    pageOldest: "1718900250.000000",
+  } as const;
+  type MaxSeeded = Seeded & { historicalHistory: string[]; sentinels: readonly string[] };
+  /** A public, bound, due channel with BOTH lanes initialized at maximum history; `next_lane` is historical. */
   async function seedMaxBoth(): Promise<MaxSeeded> {
     const seed = await seedTeam();
     const scope = { teamId: seed.teamId, workspaceId: WORKSPACE, channelId: CHANNEL };
@@ -1741,22 +1768,37 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
       `insert into slack_sync_channels
          (team_id, workspace_id, channel_id, public_state, public_checked_at, binding_integration_id, binding_config_revision,
           newest_anchor_ts, newest_lower_ts, newest_request_lower_ts, newest_segment_lower_ts, newest_segment_upper_ts,
-          newest_cursor, newest_cursor_history, newest_scan_generation,
+          newest_cursor, newest_cursor_history, newest_scan_generation, newest_catchup_upper_ts,
           historical_anchor_ts, historical_segment_lower_ts, historical_segment_upper_ts,
           historical_cursor, historical_cursor_history, historical_scan_generation,
-          next_lane, due_at)
+          historical_oldest_seen_ts, historical_completed_segments_oldest_ts,
+          last_read_at, last_error_code, next_lane, due_at)
        values ($1, $2, $3, 'public', '2026-01-01 00:00:00+00', $4::uuid, $5,
-               $6, $7, $8, $9, $10, $11, $12::jsonb, 2,
-               $13, '0.000000', $13, $14, $15::jsonb, 4,
-               'historical', '2020-01-01 00:00:00+00')`,
+               $6, $7, $8, $8, $6, $9, $10::jsonb, 2, $7,
+               $11, '0.000000', $12, $13, $14::jsonb, 4,
+               $15, $16,
+               $17::timestamptz, $18, 'historical', '2020-01-01 00:00:00+00')`,
       [seed.teamId, WORKSPACE, CHANNEL, integrationId, REVISION,
-        NEWEST_FIXTURE.newest_anchor_ts, NEWEST_FIXTURE.newest_lower_ts, NEWEST_FIXTURE.newest_request_lower_ts,
-        NEWEST_FIXTURE.newest_segment_lower_ts, NEWEST_FIXTURE.newest_segment_upper_ts,
+        MAX_ROW.newestAnchor, MAX_ROW.catchupTop, MAX_ROW.newestRequestLower,
         newestHistory[999], JSON.stringify(newestHistory),
-        HISTORICAL_ANCHOR, historicalHistory[999], JSON.stringify(historicalHistory)]
+        HISTORICAL_ANCHOR, MAX_ROW.historicalUpper, historicalHistory[999], JSON.stringify(historicalHistory),
+        MAX_ROW.attemptOldest, MAX_ROW.aggregate, MAX_ROW.lastRead, MAX_ROW.lastError]
     ));
-    return { scope, integrationId, width: "wide", pageOldest: HISTORICAL_SEGMENTS.wide.pageOldest, historicalHistory };
+    return {
+      scope, integrationId, width: "wide", pageOldest: MAX_ROW.pageOldest, historicalHistory,
+      // NON-CURRENT entries of each history: a returned value carrying one has leaked a history.
+      sentinels: [historicalHistory[0], historicalHistory[500], newestHistory[0], newestHistory[500]],
+    };
   }
+  /** True if any string anywhere in `value` contains a sentinel. Only a boolean is kept. */
+  function carriesSentinel(value: unknown, sentinels: readonly string[], seen: WeakSet<object> = new WeakSet()): boolean {
+    if (typeof value === "string") return sentinels.some((sentinel) => value.includes(sentinel));
+    if (value === null || typeof value !== "object" || seen.has(value)) return false;
+    seen.add(value);
+    return Object.values(value).some((item) => carriesSentinel(item, sentinels, seen));
+  }
+  /** A returned value is leak-free when it names no history and carries no non-current history entry. */
+  const leakFree = (value: unknown, seeded: MaxSeeded) => !hasHistoryKey(value) && !carriesSentinel(value, seeded.sentinels);
   /** SQL-computed facts about both histories (counts, bytes and booleans only). */
   async function maxFacts(scope: SlackChannelScope) {
     return tx(async (session) => (await session.executeSql<Record<string, unknown>>(
@@ -1775,11 +1817,6 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
     historical_entries: 1000, historical_bytes: 1048576, newest_entries: 1000, newest_bytes: 1048576,
     linked: true, distinct_sentinels: true,
   };
-  /** The newest lane alone, still at maximum and linked (for writers that legitimately clear the historical lane). */
-  async function newestStillMax(scope: SlackChannelScope) {
-    const facts = await maxFacts(scope);
-    return facts.newest_entries === 1000 && facts.newest_bytes === 1048576;
-  }
   /** One SQL projection of the claimed row: booleans/counts/static strings only. */
   async function rowSelect(scope: SlackChannelScope, sql: string, extra: unknown[] = []) {
     return tx(async (session) => (await session.executeSql<Record<string, unknown>>(
@@ -1787,11 +1824,60 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
       [scope.teamId, scope.workspaceId, scope.channelId, ...extra]
     )).rows[0]);
   }
-  /** Seed, then prove the maximum fixture as a separate PRECONDITION. */
+  /**
+   * The newest lane alone, EXACTLY as seeded: its maximum history, cursor, bounds and G (one
+   * boolean). Use it for writers that legitimately clear the historical lane.
+   */
+  async function newestStillMax(scope: SlackChannelScope): Promise<boolean> {
+    const newest = maxHistory("n");
+    const facts = await rowSelect(scope, `coalesce(newest_cursor = $4 and newest_cursor_history = $5::jsonb
+        and newest_scan_generation = 2 and newest_anchor_ts = $6 and newest_segment_upper_ts = $6 and newest_lower_ts = $7
+        and newest_request_lower_ts = $8 and newest_segment_lower_ts = $8, false) as exact`,
+      [newest[999], JSON.stringify(newest), MAX_ROW.newestAnchor, MAX_ROW.catchupTop, MAX_ROW.newestRequestLower]);
+    return facts.exact === true;
+  }
+  /** Seed, then prove the maximum fixture and its discriminating non-null facts as separate PRECONDITIONS. */
   async function maxFixture(): Promise<MaxSeeded> {
     const seeded = await seedMaxBoth();
     expect(await maxFacts(seeded.scope), "fixture: both histories are at their exact maximum, linked and distinct").toEqual(MAX_FACTS);
+    expect(await rowSelect(seeded.scope, `newest_catchup_upper_ts = $4 and newest_catchup_upper_ts = newest_lower_ts as provisional_is_b,
+        historical_segment_lower_ts = '0.000000' and historical_segment_upper_ts = $5
+          and historical_segment_upper_ts::numeric < historical_anchor_ts::numeric as final_segment_below_a,
+        historical_oldest_seen_ts = $6 as attempt_oldest_seeded, historical_completed_segments_oldest_ts = $7 as aggregate_seeded,
+        last_read_at = $8::timestamptz as read_seeded, last_error_code = $9 as error_seeded,
+        completed_lower_ts is null and completed_upper_ts is null and not coalesce(historical_floor_reached, false) as uncertified`,
+      [MAX_ROW.catchupTop, MAX_ROW.historicalUpper, MAX_ROW.attemptOldest, MAX_ROW.aggregate, MAX_ROW.lastRead, MAX_ROW.lastError]),
+    "fixture: the discriminating non-null facts are seeded").toEqual({
+      provisional_is_b: true, final_segment_below_a: true, attempt_oldest_seeded: true, aggregate_seeded: true,
+      read_seeded: true, error_seeded: true, uncertified: true,
+    });
     return seeded;
+  }
+  /**
+   * `admit` on the maximum row, plus the sentinel no-leak check over the RAW accept (and release)
+   * results. Only static strings and booleans are kept.
+   */
+  async function admitMax(seeded: MaxSeeded, claim: SlackChannelClaim, page: Page): Promise<Record<string, unknown>> {
+    try {
+      return await tx(async (session) => {
+        const accepted = await acceptSlackChannelPage(session, claim, page);
+        const view = accepted as unknown as { outcome: string; category?: string; completion?: unknown };
+        if (view.outcome === "rejected" && typeof view.category === "string") {
+          const released = await releaseSlackChannelForRetry(session, claim, { errorCode: view.category, turn: "passed", nextDueAt: null });
+          return { accept: project(accepted), release: releaseView(released), leakFree: leakFree([accepted, released], seeded) };
+        }
+        const completion = typeof view.completion === "string" ? view.completion : null;
+        return { accept: project(accepted), completion, leakFree: leakFree(accepted, seeded) };
+      });
+    } catch (error) {
+      return sanitized(error);
+    }
+  }
+  /** `restartOutcome` on the maximum row, plus the sentinel no-leak check over the RAW result. */
+  async function restartMax(seeded: MaxSeeded, claim: SlackChannelClaim): Promise<Record<string, unknown>> {
+    const result = await tx((session) => restartSlackChannelScan(session, claim, { errorCode: "invalid_cursor" })).catch(sanitized);
+    const projected = project(result);
+    return { outcome: projected.outcome, leaked: projected.leaked === true, leakFree: leakFree(result, seeded) };
   }
   const claimOf = (seeded: MaxSeeded) =>
     tx((session) => claimSlackChannelPage(session, seeded.scope, { bindingIntegrationId: seeded.integrationId, bindingConfigRevision: REVISION }));
@@ -1818,11 +1904,11 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
       const claim = await claimOf(seeded);
       expect({
         lane: claim !== null && !("outcome" in claim) ? claim.lane : null,
-        historyInProjection: hasHistoryKey(claim),
+        leakFree: leakFree(claim, seeded),
         facts: await rowSelect(seeded.scope, "claimed_lane, lease_owner is not null and lease_expires_at > clock_timestamp() as leased, attempts::int as attempts, lease_generation::int as lease_generation"),
         unchanged: (await rowDigestExcept(seeded.scope, LEASE_BOOKKEEPING)) === before,
       }).toEqual({
-        lane: "historical", historyInProjection: false,
+        lane: "historical", leakFree: true,
         facts: { claimed_lane: "historical", leased: true, attempts: 1, lease_generation: 1 },
         unchanged: true,
       });
@@ -1834,12 +1920,12 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
       const before = await rowDigestExcept(seeded.scope, RELEASE_PERMITTED);
       const released = await tx((session) => releaseSlackChannelForRetry(session, claim, { errorCode: "compat_probe", turn: "passed", nextDueAt: null }));
       expect({
-        outcome: released.outcome, historyInProjection: hasHistoryKey(released),
+        outcome: released.outcome, leakFree: leakFree(released, seeded),
         facts: await rowSelect(seeded.scope, `next_lane, claimed_lane is null and lease_owner is null and lease_expires_at is null as released,
           last_error_code, due_at > clock_timestamp() - interval '1 minute' as due_now`),
         unchanged: (await rowDigestExcept(seeded.scope, RELEASE_PERMITTED)) === before,
       }).toEqual({
-        outcome: "written", historyInProjection: false,
+        outcome: "written", leakFree: true,
         facts: { next_lane: "newest", released: true, last_error_code: "compat_probe", due_now: true },
         unchanged: true,
       });
@@ -1850,10 +1936,10 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
       const before = await rowDigestExcept(seeded.scope, METADATA_BEGIN);
       const attempt = await tx((session) => beginSlackChannelMetadata(session, seeded.scope));
       expect({
-        generation: attempt?.generation ?? null,
+        generation: attempt?.generation ?? null, leakFree: leakFree(attempt, seeded),
         facts: await rowSelect(seeded.scope, "metadata_attempt_owner is not null as owned, metadata_attempt_generation::int as generation"),
         unchanged: (await rowDigestExcept(seeded.scope, METADATA_BEGIN)) === before,
-      }).toEqual({ generation: 1, facts: { owned: true, generation: 1 }, unchanged: true });
+      }).toEqual({ generation: 1, leakFree: true, facts: { owned: true, generation: 1 }, unchanged: true });
     });
 
     it("recordSlackChannelPublicState (private, under a live claim): public proof, binding, attempt, revocation and schedule move; nothing else", async () => {
@@ -1865,7 +1951,7 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
       const recorded = await tx((session) => recordSlackChannelPublicState(session, seeded.scope,
         { integrationId: seeded.integrationId, configRevision: REVISION }, attempt, { publicState: "private" }));
       expect({
-        outcome: recorded.outcome, historyInProjection: hasHistoryKey(recorded),
+        outcome: recorded.outcome, leakFree: leakFree(recorded, seeded),
         facts: await rowSelect(seeded.scope, `public_state, public_checked_at > timestamptz '2026-01-01 00:00:00+00' as checked_now,
           binding_integration_id = $4::uuid and binding_config_revision = $5 as binding_kept, last_error_code,
           metadata_attempt_owner is null as attempt_closed,
@@ -1874,7 +1960,7 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
           [seeded.integrationId, REVISION]),
         unchanged: (await rowDigestExcept(seeded.scope, RECORD_PRIVATE)) === before,
       }).toEqual({
-        outcome: "written", historyInProjection: false,
+        outcome: "written", leakFree: true,
         facts: {
           public_state: "private", checked_now: true, binding_kept: true, last_error_code: null, attempt_closed: true,
           lease_revoked: true, lease_generation: 2, due_now: true,
@@ -1890,12 +1976,12 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
       const before = await rowDigestExcept(seeded.scope, DELAY);
       const delayed = await tx((session) => delaySlackChannel(session, seeded.scope, attempt, { dueAt: null, errorCode: "metadata_delay" }));
       expect({
-        outcome: delayed.outcome, historyInProjection: hasHistoryKey(delayed),
+        outcome: delayed.outcome, leakFree: leakFree(delayed, seeded),
         facts: await rowSelect(seeded.scope, `due_at = timestamptz '2020-01-01 00:00:00+00' as due_kept, last_error_code,
           metadata_attempt_owner is null as attempt_closed`),
         unchanged: (await rowDigestExcept(seeded.scope, DELAY)) === before,
       }).toEqual({
-        outcome: "written", historyInProjection: false,
+        outcome: "written", leakFree: true,
         facts: { due_kept: true, last_error_code: "metadata_delay", attempt_closed: true },
         unchanged: true,
       });
@@ -1912,45 +1998,75 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
       }).toEqual({ facts: { binding_cleared: true }, unchanged: true });
     });
 
-    it("opposite-lane acceptSlackChannelPage (historical terminal at its cap): the historical envelope completes; the newest maximum history is exact", async () => {
+    it("opposite-lane acceptSlackChannelPage (historical terminal at its cap): §6 certifies the envelope from the locked row; the newest maximum history and all unrelated state are exact", async () => {
       const seeded = await maxFixture();
       const claim = await claimedMax(seeded);
       const before = await rowDigestExcept(seeded.scope, TERMINAL_PERMITTED);
-      const outcome = await admit(claim, { terminal: true, nextCursor: null, oldestTs: "1718900100.000000" });
+      const outcome = await admitMax(seeded, claim, { terminal: true, nextCursor: null, oldestTs: seeded.pageOldest });
+      // §6 oracles from the seeded literals. Lower: the oldest of the aggregate, attempt-oldest and
+      // page oldest (the attempt-oldest here), with nothing certified before. Upper: the provisional
+      // newest catch-up top, because nothing is certified yet.
+      const attemptOldest = exactOracleTicks(MAX_ROW.attemptOldest);
+      expect({ lower: attemptOldest < exactOracleTicks(MAX_ROW.pageOldest) && attemptOldest < exactOracleTicks(MAX_ROW.aggregate) },
+        "fixture: oracle").toEqual({ lower: true });
       expect({
         outcome,
-        facts: await rowSelect(seeded.scope, `historical_anchor_ts is null and historical_cursor is null
-          and historical_cursor_history = '[]'::jsonb as historical_cleared, historical_floor_reached as floor_reached,
-          historical_scan_generation::int as generation, next_lane`),
+        facts: await rowSelect(seeded.scope, `historical_anchor_ts is null and historical_segment_lower_ts is null
+            and historical_segment_upper_ts is null and historical_cursor is null
+            and historical_cursor_history = '[]'::jsonb as historical_cleared,
+          historical_oldest_seen_ts is null as attempt_oldest_cleared,
+          historical_completed_segments_oldest_ts is null as aggregate_cleared,
+          historical_floor_reached as floor_reached, historical_scan_generation::int as generation,
+          coalesce(completed_lower_ts = $4, false) as completed_lower_exact,
+          coalesce(completed_upper_ts = $5, false) as completed_upper_is_provisional_top,
+          newest_catchup_upper_ts is null as provisional_absorbed,
+          coalesce(last_read_at > $6::timestamptz and last_read_at > clock_timestamp() - interval '1 minute', false) as read_now,
+          last_error_code,
+          lease_owner is null and lease_expires_at is null and claimed_lane is null as released,
+          coalesce(due_at > clock_timestamp() - interval '1 minute', false) as due_now, next_lane`,
+          [MAX_ROW.attemptOldest, MAX_ROW.catchupTop, MAX_ROW.lastRead]),
         newestStillMax: await newestStillMax(seeded.scope),
-        unchanged: (await rowDigestExcept(seeded.scope, TERMINAL_PERMITTED)) === before,
+        unrelatedUnchanged: (await rowDigestExcept(seeded.scope, TERMINAL_PERMITTED)) === before,
       }).toEqual({
-        outcome: { accept: { outcome: "written" } },
-        facts: { historical_cleared: true, floor_reached: true, generation: 5, next_lane: "newest" },
+        outcome: { accept: { outcome: "written" }, completion: "envelope", leakFree: true },
+        facts: {
+          historical_cleared: true, attempt_oldest_cleared: true, aggregate_cleared: true,
+          floor_reached: true, generation: 5,
+          completed_lower_exact: true, completed_upper_is_provisional_top: true, provisional_absorbed: true,
+          read_now: true, last_error_code: null, released: true, due_now: true, next_lane: "newest",
+        },
         newestStillMax: true,
-        unchanged: true,
+        unrelatedUnchanged: true,
       });
     });
 
-    it("opposite-lane restartSlackChannelScan (invalid_cursor on the wide historical segment): typed subdivided; the newest maximum history is exact", async () => {
+    it("opposite-lane restartSlackChannelScan (invalid_cursor on the wide historical segment): typed subdivided with the full release; the newest maximum history is exact", async () => {
       const seeded = await maxFixture();
       const claim = await claimedMax(seeded);
       const before = await rowDigestExcept(seeded.scope, INVALID_CURSOR_PERMITTED);
-      const midpointPlusOne = renderTicks((exactOracleTicks("0.000000") + exactOracleTicks(HISTORICAL_ANCHOR)) / BigInt(2) + BigInt(1));
-      expect(midpointPlusOne, "fixture: oracle").toBe("859450250.000001");
-      const outcome = await restartOutcome(claim);
+      const midpointPlusOne = renderTicks((exactOracleTicks("0.000000") + exactOracleTicks(MAX_ROW.historicalUpper)) / BigInt(2) + BigInt(1));
+      expect(midpointPlusOne, "fixture: oracle").toBe("859450150.000001");
+      const outcome = await restartMax(seeded, claim);
       expect({
         outcome,
-        facts: await rowSelect(seeded.scope, `historical_segment_lower_ts = $4 as split_at_midpoint,
+        facts: await rowSelect(seeded.scope, `coalesce(historical_segment_lower_ts = $4 and historical_segment_upper_ts = $5, false) as split_at_midpoint,
           historical_cursor is null and historical_cursor_history = '[]'::jsonb as historical_cleared,
-          historical_scan_generation::int as generation, next_lane, last_error_code`, [midpointPlusOne]),
+          historical_oldest_seen_ts is null as attempt_oldest_cleared,
+          coalesce(historical_completed_segments_oldest_ts = $6, false) as aggregate_kept,
+          historical_scan_generation::int as generation,
+          lease_owner is null and lease_expires_at is null and claimed_lane is null as released,
+          coalesce(due_at > clock_timestamp() - interval '1 minute', false) as due_now, next_lane, last_error_code`,
+          [midpointPlusOne, MAX_ROW.historicalUpper, MAX_ROW.aggregate]),
         newestStillMax: await newestStillMax(seeded.scope),
-        unchanged: (await rowDigestExcept(seeded.scope, INVALID_CURSOR_PERMITTED)) === before,
+        unrelatedUnchanged: (await rowDigestExcept(seeded.scope, INVALID_CURSOR_PERMITTED)) === before,
       }).toEqual({
-        outcome: { outcome: "subdivided", leaked: false },
-        facts: { split_at_midpoint: true, historical_cleared: true, generation: 5, next_lane: "newest", last_error_code: "invalid_cursor" },
+        outcome: { outcome: "subdivided", leaked: false, leakFree: true },
+        facts: {
+          split_at_midpoint: true, historical_cleared: true, attempt_oldest_cleared: true, aggregate_kept: true, generation: 5,
+          released: true, due_now: true, next_lane: "newest", last_error_code: "invalid_cursor",
+        },
         newestStillMax: true,
-        unchanged: true,
+        unrelatedUnchanged: true,
       });
     });
 
@@ -1958,14 +2074,15 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
       const seeded = await maxFixture();
       const claim = await claimedMax(seeded);
       const before = await rowDigestExcept(seeded.scope, RELEASE_PERMITTED);
-      const outcome = await admit(claim, { terminal: false, nextCursor: seeded.historicalHistory[500], oldestTs: seeded.pageOldest });
+      // The repeated cursor is itself a sentinel, so an echo of the candidate is a detected leak.
+      const outcome = await admitMax(seeded, claim, { terminal: false, nextCursor: seeded.historicalHistory[500], oldestTs: seeded.pageOldest });
       expect({
         outcome,
         facts: await rowSelect(seeded.scope, "next_lane, lease_owner is null and claimed_lane is null as released, last_error_code"),
         stillMax: await maxFacts(seeded.scope),
         unchanged: (await rowDigestExcept(seeded.scope, RELEASE_PERMITTED)) === before,
       }).toEqual({
-        outcome: { accept: { outcome: "rejected", category: "cursor_repeated" }, release: "written" },
+        outcome: { accept: { outcome: "rejected", category: "cursor_repeated" }, release: "written", leakFree: true },
         facts: { next_lane: "newest", released: true, last_error_code: "cursor_repeated" },
         stillMax: MAX_FACTS,
         unchanged: true,
@@ -2009,11 +2126,15 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
     it("ensureSlackChannel on an existing row: insert-on-conflict-do-nothing neither updates nor rechecks it", async () => {
       const seeded = await maxFixture();
       const before = await rowDigestExcept(seeded.scope, []);
+      // The row version: any UPDATE, even one writing identical values, gives the row a new `xmin`.
+      const versionBefore = (await rowSelect(seeded.scope, "xmin::text as version")).version;
       const ensured = await tx((session) => ensureSlackChannel(session, seeded.scope));
+      const versionAfter = (await rowSelect(seeded.scope, "xmin::text as version")).version;
       expect({
-        inserted: ensured.inserted, historyInProjection: hasHistoryKey(ensured),
+        inserted: ensured.inserted, leakFree: leakFree(ensured, seeded),
+        versionRead: typeof versionBefore === "string", versionKept: versionAfter === versionBefore,
         unchanged: (await rowDigestExcept(seeded.scope, [])) === before,
-      }).toEqual({ inserted: false, historyInProjection: false, unchanged: true });
+      }).toEqual({ inserted: false, leakFree: true, versionRead: true, versionKept: true, unchanged: true });
     });
   });
 });
