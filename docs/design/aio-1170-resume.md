@@ -2,6 +2,41 @@
 
 Last updated: 2026-10-24. The newest current-state section governs. Older sections are preserved as historical stop records and may describe gates that have since been cleared. This is the tracked recovery record for draft [PR 714](https://github.com/aiosbrain/aios-team-brain/pull/714), targeting `staging`. It does not claim AC-02 or AIO-1170 complete.
 
+## Current state — 2026-10-24, invalid-cursor GREEN checkpoint
+
+This section is newer than the RED section below and supersedes its "exact next stage" bullet.
+
+- **Production checkpoint `4c9d2bdb`**, on the remotely verified RED recovery head `765974b9`. It is the sole production commit: only `lib/ingest/slack-channel-state.ts` and `lib/ingest/slack-source-discovery.ts` changed (+120/−62). The reviewed RED tests are unchanged.
+- **State writer:** the existing `restartSlackChannelScan` export now returns a typed `subdivided`, `restarted` or `refused`.
+  - The complete channel fence is checked by a locking read and repeated in the write.
+  - A wide segment gets the exact BigInt midpoint on the same row: S becomes M + 1 µs and U is retained.
+  - A singleton restarts the same range.
+  - Either transition clears C, H and attempt-oldest, increments G once, and keeps the completed-segments aggregate, the certificate, the opposite lane and the accepted bounds.
+  - There is exactly one release, with the turn passed, and the output is privacy-safe.
+- **Discovery caller:**
+  - An actual `invalid_cursor` is handled in one post-provider, selection-first transaction, with the restart writer on the same session.
+  - The outcome mapping is exact and static.
+  - There are no roots, no acceptance, no new reservation, no local retry and no second release.
+  - All other provider, structural and acceptance paths are preserved.
+- **Exact GREEN evidence:**
+  - Isolated PostgreSQL: 281 pass / 1 expected fail = 282. Log `.context/aio-1170-resume/aio1170-invalid-cursor-refusal-green-observed.log`, SHA-256 `b914530f991fdc2a6a03232edcc595ba7b63979fc6e47f15c7969288a153de96`.
+  - Unit: 38/38. Log `.context/aio-1170-resume/aio1170-invalid-cursor-refusal-green-unit-observed.log`, SHA-256 `2e387f53b8546aa56bfcf1c5455a9fd1503c8c923151864019fc369d7d695b35`.
+  - Typecheck, targeted ESLint and diff check pass.
+- **Reviews:**
+  - A fresh Opus 5.5 HIGH review returned `GREEN READY FOR REMOTE CHECKPOINT`, with no blocker, HIGH or MEDIUM. Its non-gating LOWs are not claimed covered:
+    - malformed stored history relies on the validated CHECK, and is explicitly deferred;
+    - the newest-lane, lock-to-update and no-segment variants are deferred;
+    - the stale-selection release uses the narrower but safe lease fence;
+    - one test regex is sensitive to SQL shape.
+  - The exact-dispatch `gpt-6.1-sol` HIGH pre-push task `/root/ac02_sol_finish_coordinator/aio1170_invalid_cursor_green_prepush_review` returned `PASS — SAFE TO PUSH GREEN CHECKPOINT`, with no actionable findings. The exact alias comes from the dispatch metadata.
+- **Capacity, latest:** 10% five-hour / 42% seven-day, subscription only, no API key, overage off.
+- **Exact next stage, after remote backup and readback:**
+  1. The finite remaining accepted runtime evidence: the compatibility writers and the controlled mutants.
+  2. Then the required whole-scope reviews and checks.
+
+  MR-06 composition and retesting still wait for PR 743's staging checkpoint.
+- **Held gates:** no activation, wiring, PR 743 edit, merge or deploy.
+
 ## Current state — 2026-10-24, invalid-cursor RED packet
 
 This section is newer than the one below and supersedes its "exact next stage" bullet.
