@@ -188,8 +188,10 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *         · of all four statement-order databases;
  *         · of every introduction-variant database.
  *         Complete rows (updated_at included) and the Slack catalog must stay exact. The loader's
- *         own notices are not asserted, since schema.sql's `if not exists` DDL may notice. A
- *         whole-schema REFUSAL entrypoint is still not exercised;
+ *         notices are not asserted: `scripts/pg-load-schema.mjs` prints every PostgreSQL notice
+ *         to stdout (console.log) whatever logger is passed, and schema.sql's `if not exists` DDL
+ *         may notice. A whole-schema REFUSAL entrypoint is not exercised IN THIS FILE; the
+ *         real-loader refusal matrix is in `slack-history-progress-conflicts` (B8 tail);
  *    B5 · DONE (continuation 2), in `slack-history-progress-conflicts`: a pure replay refusing a
  *         stored invalid progress tuple, via both entrypoints;
  *    B6 · DONE (continuation 2), in `slack-history-progress-conflicts`, via both entrypoints:
@@ -209,8 +211,11 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *         this file go through a sanitized wrapper that reports only success, SQLSTATE and field
  *         presence;
  *    B8 · DONE (continuation 4), in `slack-history-progress-conflicts`. Marked-mirror refusal is
- *         EXHAUSTIVE: the matrix, the state refusals, and twins of every dedicated migration-only
- *         refusal. The B8 TAIL is DONE in continuation 6: the REAL deploy loader refuses EVERY
+ *         EXHAUSTIVE for its refusal set: the matrix, the state refusals, and literal twins of NINE
+ *         dedicated migration-only refusals. The history-only restart-hiding case (attempt-oldest
+ *         below S) and the inactive-historical attempt-oldest case are covered by refusal CLASS
+ *         through STATE_REFUSALS fixtures on different rows, not as literal twins. The B8 TAIL is
+ *         DONE in continuation 6: the REAL deploy loader refuses EVERY
  *         one of those fixtures, plus the three replay-time refusals. No fixture is excluded; the
  *         source-backed reachability is noted at the conflicts suite's LOADER_SET;
  *    C9 · PARTLY DONE (continuation 7), in the DH-11 describe: a migration-scope test titled
@@ -910,10 +915,14 @@ const logicalRows = (evidence: OrderEvidence) => ({
 });
 
 /**
- * A populated FULL-LOADER replay whose failure can never print data. On error, the raw
+ * A populated FULL-LOADER replay whose FAILURE diagnostic cannot carry data. On error, the raw
  * PostgreSQL error stays in memory only. The returned diagnostic carries at most the SQLSTATE
  * and the PRESENCE (booleans) of its diagnostic fields, never a message, detail, hint, query,
  * row, cursor, token or member value. Success is exactly `{ outcome: "committed" }`.
+ * NOT claimed: global notice privacy. `scripts/pg-load-schema.mjs` prints every PostgreSQL
+ * notice to stdout (console.log) whatever logger is passed, and those notices are not asserted.
+ * This file's owned block is expected to emit no NOTICE (asserted for the two marked
+ * entrypoints), and its fixtures and static failure messages are privacy-safe.
  */
 async function sanitizedLoaderReplay(
   loadSchema: (options: Record<string, unknown>) => Promise<void>, databaseUrl: string,
@@ -1764,6 +1773,15 @@ describe("AM-F2 + AC-02 history/segment block — DH-11 legacy three-column repl
 
           // ── An UNRELATED DB-level writer: integration delete → ON DELETE SET NULL → the binding-clear trigger. ──
           const BINDING = ["binding_integration_id", "binding_config_revision"];
+          // Non-vacuity: the four owned named CHECKs exist and are VALIDATED, so the UPDATE below really re-checks them.
+          const catalogBeforeDelete = await slackCatalog(c);
+          expect(catalogBeforeDelete.checks.map((row) => ({ name: row.name, validated: row.validated })),
+            "the four owned named CHECKs are present and validated before the unrelated writer runs").toEqual([
+            { name: "slack_sync_channels_historical_cursor_history_check", validated: true },
+            { name: "slack_sync_channels_historical_progress_check", validated: true },
+            { name: "slack_sync_channels_newest_cursor_history_check", validated: true },
+            { name: "slack_sync_channels_newest_progress_check", validated: true },
+          ]);
           const beforeDelete = await digestExcept(BINDING);
           await orderFixture(c, "delete from public.integrations where id = $1", [C9_INTEGRATION_ID]);
           expect((await c.query(
@@ -1772,6 +1790,7 @@ describe("AM-F2 + AC-02 history/segment block — DH-11 legacy three-column repl
           )).rows[0], "the FK cleared the binding and the trigger cleared its paired revision").toEqual({ integration_cleared: true, revision_cleared: true });
           expect(await digestExcept(BINDING), "the binding writer changed nothing else; both history CHECKs re-passed on that UPDATE").toBe(beforeDelete);
           expect(await sizes(), "both maximum histories survive the unrelated binding writer").toEqual([MAX, MAX]);
+          expect(await slackCatalog(c), "the Slack catalog, the four validated named CHECKs included, is unchanged by the unrelated writer").toEqual(catalogBeforeDelete);
         } finally {
           await c.end().catch(() => {});
         }

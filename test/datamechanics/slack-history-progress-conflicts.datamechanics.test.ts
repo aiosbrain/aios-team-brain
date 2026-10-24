@@ -87,10 +87,16 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *    validator conflict (AM_F2), one state rejection (AC02) and one restart-hiding prevalidation
  *    (AC02). Both paths use the same runner, the same expected static error and the same
  *    rollback evidence. B8 (continuation 4) makes the mirror EXHAUSTIVE: every matrix case, the
- *    state refusals, and literal twins of the dedicated migration-only refusals. The REAL deploy
+ *    state refusals, and literal twins of NINE of the dedicated migration-only refusals. The
+ *    other two dedicated refusals are covered by refusal CLASS, not by literal twin: the
+ *    history-only restart-hiding case and the inactive-historical attempt-oldest case. Their
+ *    STATE_REFUSALS counterparts use different literal fixtures. The REAL deploy
  *    loader (whole `schema.sql`, one atomic query, run before any migration) refuses EVERY one of
  *    those fixtures (B8 tail, continuation 6), with the source-backed reachability noted at
- *    LOADER_SET. Its notices go to its own logger and are not asserted.
+ *    LOADER_SET. Loader notices are NOT asserted: `scripts/pg-load-schema.mjs` prints every
+ *    PostgreSQL notice to stdout (console.log) whatever logger is passed. The owned block is
+ *    expected to emit no NOTICE (asserted for the two marked entrypoints), and its fixtures and
+ *    static failure messages are privacy-safe; global notice privacy is not claimed.
  *    POSTGRESQL 16 REPRESENTABILITY:
  *    · an IDENTITY column must be smallint/integer/bigint, so it cannot be built on an owned jsonb
  *      or text column; GENERATED is covered instead;
@@ -158,8 +164,16 @@ import { createIsolatedScratchDatabase } from "./slack-history-isolated-url";
  *  - 45 in the EXHAUSTIVE schema-mirror refusal set:
  *    · the 34 matrix cases;
  *    · 2 state refusals;
- *    · 9 literal twins of the dedicated migration-only refusals (defaulted helper, the two
- *      newest-lane state rejections, five persisted-history defects, segment-only restart-hiding);
+ *    · 9 literal twins of dedicated migration-only refusals: the defaulted helper, the two
+ *      newest-lane state rejections, five persisted-history defects, and segment-only
+ *      restart-hiding;
+ *    · NOT literal twins, covered by refusal class only:
+ *      - the dedicated history-only restart-hiding case plants an attempt-oldest BELOW S on
+ *        `C0HIDEOLDEST`; its STATE_REFUSALS counterpart plants one ABOVE U on the baseline row;
+ *      - the dedicated inactive-historical attempt-oldest case uses `C0INACTOLD01`; its
+ *        counterpart uses `C0MATRIXOLD1` beside the baseline.
+ *      Same block refusal path (historical progress prevalidation, and final validation, AC02),
+ *      different literal fixture;
  *  - 45 whole-schema refusals through the REAL deploy loader: the same exhaustive set, every
  *    fixture reachable;
  *  - 11 replay-time cases (B5/B6). The three refusals run through the migration, the marked mirror
@@ -716,8 +730,9 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
    *  - the migration file;
    *  - the marked mirror statement;
    *  - the REAL deploy loader (`loadSchema`: the whole `schema.sql` as ONE atomic query, then every
-   *    migration, on its own fresh session). Its notices go to its own logger, so they are NOT
-   *    captured or asserted for the loader.
+   *    migration, on its own fresh session). `scripts/pg-load-schema.mjs` prints every PostgreSQL
+   *    notice to stdout (console.log) whatever logger is passed, so loader notices are NOT captured
+   *    or asserted; the returned `notices` is always empty for this entrypoint.
    */
   const applyEntry = async (entry: Entry): Promise<{ error: unknown; notices: string[] }> => {
     if (entry !== "full loader") return applyStatement(entry === "migration" ? migration : MIRROR_STATEMENT);
@@ -1125,9 +1140,12 @@ describe("AM-F2 + AC-02 history/segment migration — catalog identity, conflict
 
   const MIGRATION_MATRIX: Refusal[] = [...WRONG_KIND, ...PARTIAL_UNITS, ...METADATA, ...VALIDATOR_CONFLICTS];
   /**
-   * B8: marked-mirror TWINS of the dedicated migration-only refusal tests below. Each uses the
-   * same literal defect as its migration twin, rebuilt as a Refusal so it runs through the shared
-   * baseline, fact, privacy and whole-rollback oracle.
+   * B8: marked-mirror TWINS of NINE of the dedicated migration-only refusal tests below. Each uses
+   * the same literal defect as its migration twin, rebuilt as a Refusal so it runs through the
+   * shared baseline, fact, privacy and whole-rollback oracle. Two dedicated refusals are NOT
+   * twinned literally: the history-only restart-hiding case (attempt-oldest BELOW S) and the
+   * inactive-historical attempt-oldest case. Their refusal class runs in STATE_REFUSALS, with
+   * different literal fixtures (attempt-oldest ABOVE U on the baseline row; `C0MATRIXOLD1`).
    */
   /** The same literal initialized newest tuple as NEWEST_INITIALIZED below (declared here, before first use). */
   const NEWEST_INITIALIZED_FOR_TWINS = {
