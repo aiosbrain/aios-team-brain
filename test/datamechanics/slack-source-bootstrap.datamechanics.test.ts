@@ -35,6 +35,7 @@ import {
   threadRootTs,
   threadRows,
   type Row,
+  type SlackCall,
   type SlackFake,
 } from "./slack-source-helpers";
 
@@ -102,6 +103,41 @@ function fullPass(over: Parameters<typeof fakeSlack>[0] = {}): SlackFake {
 
 function categories(result: SlackSourceDiscoveryResult, stage: string): string[] {
   return result.steps.filter((s) => s.stage === stage).map((s) => `${s.result}:${s.category ?? ""}`);
+}
+
+const FX_MICROS = BigInt(1_000_000);
+const FX_ONE = BigInt(1);
+/** A six-digit request bound as exact microseconds; anything else fails the fixture. */
+function fxTicks(ts: string): bigint {
+  const match = /^([0-9]+)[.]([0-9]{6})$/.exec(ts);
+  if (!match) throw new Error("fixture: a malformed history request bound");
+  return BigInt(match[1]) * FX_MICROS + BigInt(match[2]);
+}
+function fxRender(ticks: bigint): string {
+  return `${(ticks / FX_MICROS).toString()}.${(ticks % FX_MICROS).toString().padStart(6, "0")}`;
+}
+/**
+ * AIO-1170 §9.1 bootstrap two-root terminal, derived from the request's OWN bounds with exact integer
+ * arithmetic. Roots are at U and U − 1 µs. `latest` is required and an omitted `oldest` is zero.
+ * S ≤ U − 1 µs is asserted, so both roots lie inside [S, U]. There is no wall-clock fallback.
+ */
+function twoRootTerminal(call: SlackCall): Response {
+  const latest = call.params.get("latest");
+  if (latest === null) throw new Error("fixture: a history request without latest");
+  const oldest = call.params.get("oldest");
+  const upper = fxTicks(latest);
+  const lower = oldest === null ? BigInt(0) : fxTicks(oldest);
+  if (lower > upper - FX_ONE) throw new Error("fixture: the request window cannot hold U − 1 µs");
+  return slackJson(historyBody({ messages: [rootMessage(fxRender(upper)), rootMessage(fxRender(upper - FX_ONE))] }));
+}
+/** The §9.1 ordinary one-root replacement: a root at the request's own U, returned for capture. */
+function rootAtUpper(call: SlackCall): string {
+  const latest = call.params.get("latest");
+  if (latest === null) throw new Error("fixture: a history request without latest");
+  const oldest = call.params.get("oldest");
+  const upper = fxTicks(latest);
+  if ((oldest === null ? BigInt(0) : fxTicks(oldest)) > upper) throw new Error("fixture: an empty history request window");
+  return fxRender(upper);
 }
 
 // ── the stored shape ─────────────────────────────────────────────────────────
@@ -386,19 +422,24 @@ describe("channel public proof", () => {
     await agePublicProof(seed.teamId, CHANNEL); // seven days old
     await elapse(seed.teamId);
 
+    // §9.1 FX-05: these two newest responses are bound-derived two-root terminals, each history ok.
     const withinCadence = fullPass({
       "auth.test": () => { throw new Error("the binding is already verified"); },
       "conversations.info": () => { throw new Error("the 14-day cadence should reuse this proof"); },
+      "conversations.history": twoRootTerminal,
     });
-    await discover(seed, integrationId, withinCadence, { metadataIntervalMs: 14 * 24 * 60 * 60 * 1000 });
+    const withinResult = await discover(seed, integrationId, withinCadence, { metadataIntervalMs: 14 * 24 * 60 * 60 * 1000 });
     expect(withinCadence.countOf("conversations.info")).toBe(0);
+    expect(categories(withinResult, "history")).toEqual(["ok:"]);
 
     await elapse(seed.teamId);
     const defaultCadence = fullPass({
       "auth.test": () => { throw new Error("the binding is already verified"); },
+      "conversations.history": twoRootTerminal,
     });
-    await discover(seed, integrationId, defaultCadence);
+    const defaultResult = await discover(seed, integrationId, defaultCadence);
     expect(defaultCadence.countOf("conversations.info")).toBe(1);
+    expect(categories(defaultResult, "history")).toEqual(["ok:"]);
   });
 
   it("blocks discovery for a private channel, and dispatches no history", async () => {
@@ -444,9 +485,11 @@ describe("channel public proof", () => {
     await agePublicProof(seed.teamId, CHANNEL);
     await elapse(seed.teamId);
     const proved = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
-    const flaky = fullPass({ "conversations.info": () => slackRateLimited("1") });
-    await discover(seed, integrationId, flaky);
+    // §9.1 FX-06: this nonempty newest page is the bound-derived two-root terminal, history ok.
+    const flaky = fullPass({ "conversations.info": () => slackRateLimited("1"), "conversations.history": twoRootTerminal });
+    const flakyResult = await discover(seed, integrationId, flaky);
     expect(flaky.countOf("conversations.info")).toBe(1);
+    expect(categories(flakyResult, "history")).toEqual(["ok:"]);
     const after = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
     expect(after?.public_state).toBe("public");
     // The proof is not evidence that expired: neither the verdict nor its time was rewritten.
@@ -503,8 +546,10 @@ describe("token and config changes invalidate the binding", () => {
     const beforeRow = await integrationRow(integrationId);
 
     await elapse(seed.teamId);
-    const rotated = fullPass();
-    await discover(seed, integrationId, rotated, { envToken: () => ROTATED });
+    // §9.1 FX-07: this newest response is the bound-derived two-root terminal, history ok.
+    const rotated = fullPass({ "conversations.history": twoRootTerminal });
+    const rotatedResult = await discover(seed, integrationId, rotated, { envToken: () => ROTATED });
+    expect(categories(rotatedResult, "history")).toEqual(["ok:"]);
 
     // ⚠️ THE INTEGRATION ROW DID NOT MOVE — which is exactly why the fingerprint exists. A
     // revision built from `updated_at` alone cannot see an env rotation at all.
@@ -576,8 +621,10 @@ describe("channel state is scoped, and shared where the provider shares it", () 
 
     // Later wakes change none of that: the binder is inside its cadence, the sibling still stands down.
     await elapse(seed.teamId);
-    const binderAgain = fullPass();
-    await discover(seed, first, binderAgain);
+    // §9.1 FX-08: the binder's newest response is the bound-derived two-root terminal, history ok.
+    const binderAgain = fullPass({ "conversations.history": twoRootTerminal });
+    const binderAgainResult = await discover(seed, first, binderAgain);
+    expect(categories(binderAgainResult, "history")).toEqual(["ok:"]);
     await elapse(seed.teamId);
     const siblingAgain = fullPass();
     await discover(seed, second, siblingAgain);
@@ -843,7 +890,38 @@ const ACCEPTED_PROGRESS = [
   "completed_upper_ts",
   "newest_catchup_upper_ts",
   "last_read_at",
+  // AIO-1170 §9.2: the historical segment, its completed-segments aggregate, and both cursor
+  // histories are progress too, and survive a takeover byte for byte.
+  "historical_segment_lower_ts",
+  "historical_segment_upper_ts",
+  "historical_completed_segments_oldest_ts",
+  "newest_cursor_history",
+  "historical_cursor_history",
 ] as const;
+/** The §9.2 newest bounds a no-send claim may INITIALIZE (from null) but never move once set. */
+const NEWEST_SEGMENT_BOUNDS = ["newest_request_lower_ts", "newest_segment_lower_ts", "newest_segment_upper_ts"] as const;
+/** All eight §9.2 names; each must be an OWN property of a `select *` row before it is compared. */
+const SECTION_9_2_FIELDS = [...ACCEPTED_PROGRESS.slice(-5), ...NEWEST_SEGMENT_BOUNDS] as const;
+
+/** Throws unless every §9.2 name is an own property of the row; absence is a fixture error, not evidence. */
+function expectSection92Fields(row: Row | null | undefined, label: string): void {
+  for (const field of SECTION_9_2_FIELDS) {
+    expect(Object.prototype.hasOwnProperty.call(row ?? {}, field), `${label}: ${field} is an own property`).toBe(true);
+  }
+}
+/** The test's OWN default-60 s request lower: max(0, B − 60,000 ms), in BigInt microseconds. */
+function defaultRequestLower(b: string): string {
+  const match = /^([0-9]+)[.]([0-9]{1,6})$/.exec(b);
+  if (!match) throw new Error("fixture: B is not an exact timestamp");
+  const lowered = BigInt(match[1]) * FX_MICROS + BigInt(match[2].padEnd(6, "0")) - BigInt(60_000) * BigInt(1_000);
+  return fxRender(lowered < BigInt(0) ? BigInt(0) : lowered);
+}
+/** The test's OWN canonical bound spelling of an exact instant. */
+function canonicalOf(a: string): string {
+  const match = /^([0-9]+)[.]([0-9]{1,6})$/.exec(a);
+  if (!match) throw new Error("fixture: A is not an exact timestamp");
+  return fxRender(BigInt(match[1]) * FX_MICROS + BigInt(match[2].padEnd(6, "0")));
+}
 
 function tx<T>(fn: (session: TransactionSession) => Promise<T>): Promise<T> {
   return transactionCapability(db()).transaction(fn);
@@ -949,12 +1027,34 @@ async function expectTakeoverPreservingProgress(
     binding_config_revision: siblingBinding?.config_revision,
   });
   expect(await channelRows(seed.teamId)).toHaveLength(opts.frontiers ?? 1);
+  // §9.2: every new name must EXIST in both rows before anything is compared.
+  expectSection92Fields(before, "before");
+  expectSection92Fields(after, "after");
   for (const column of ACCEPTED_PROGRESS) {
     expect(after?.[column], `${column} must survive the takeover`).toEqual(before[column]);
   }
   // A newest bound that was already initialized is progress too; an unset one may be initialized.
   for (const column of ["newest_anchor_ts", "newest_lower_ts"]) {
     if (before[column] !== null) expect(after?.[column], column).toEqual(before[column]);
+  }
+  // §9.2: the three newest segment bounds. Each one is either set for the first time, to EXACTLY the
+  // starting shape, or byte-identical. Null after the claim is never allowed. B is the before
+  // historical anchor (nothing is certified or provisional for these callers), L comes from this
+  // file's own default-60 s BigInt oracle, and U is the canonical spelling of the after anchor.
+  const B = String(before.historical_anchor_ts);
+  const startingShape: Record<(typeof NEWEST_SEGMENT_BOUNDS)[number], string> = {
+    newest_request_lower_ts: defaultRequestLower(B),
+    newest_segment_lower_ts: defaultRequestLower(B),
+    newest_segment_upper_ts: canonicalOf(String(after?.newest_anchor_ts)),
+  };
+  for (const column of NEWEST_SEGMENT_BOUNDS) {
+    expect(after?.[column], `${column} is never null after the claim`).not.toBeNull();
+    if (before[column] === null) {
+      expect(after?.[column], `${column} is initialized to the starting shape`).toBe(startingShape[column]);
+      expect(after?.newest_lower_ts, "the frozen B is the before historical anchor").toBe(B);
+    } else {
+      expect(after?.[column], `${column} is byte-identical once set`).toEqual(before[column]);
+    }
   }
   // The no-send claim/release passed the turn on and left no lease behind.
   expect(after).toMatchObject({ next_lane: "historical", lease_owner: null });
@@ -997,15 +1097,18 @@ describe("a coalesced channel is read only by its binder (PA-2)", () => {
     }
 
     // The BINDER's cadence is still the existing predicate's: nothing inside it, once past it.
-    const inside = fullPass();
-    await discover(seed, binder, inside);
+    // §9.1 FX-09: both binder newest responses are bound-derived two-root terminals, each history ok.
+    const inside = fullPass({ "conversations.history": twoRootTerminal });
+    const insideResult = await discover(seed, binder, inside);
     expect(inside.countOf("auth.test")).toBe(0);
     expect(inside.countOf("conversations.info")).toBe(0);
+    expect(categories(insideResult, "history")).toEqual(["ok:"]);
     await agePublicProof(seed.teamId, CHANNEL);
     await elapse(seed.teamId);
-    const due = fullPass();
-    await discover(seed, binder, due);
+    const due = fullPass({ "conversations.history": twoRootTerminal });
+    const dueResult = await discover(seed, binder, due);
     expect(due.paramsOf("conversations.info").map((p) => p.get("channel"))).toEqual([CHANNEL]);
+    expect(categories(dueResult, "history")).toEqual(["ok:"]);
     expect(await channelRow(seed.teamId, WORKSPACE, CHANNEL)).toMatchObject({ binding_integration_id: binder });
   });
 
@@ -1135,11 +1238,18 @@ describe("a coalesced channel is read only by its binder (PA-2)", () => {
     expect(historyPage).toHaveLength(50);
     expect(historyPage.map((state) => state.scope.channelId)).not.toContain(eligible);
 
+    // §9.1 FX-13: the preceding proof froze this channel's historical anchor and passed its turn, so
+    // this response is NEWEST. Its one root is captured from the request's own bounds (was `.000700`);
+    // the scheduling is not changed to make the fixture pass.
+    let readingRoot: string | null = null;
     const reading = fullPass({
       "auth.test": () => {
         throw new Error("the sibling is already verified; auth.test must not repeat");
       },
-      "conversations.history": () => slackJson(historyBody({ messages: [rootMessage("1718900000.000700")] })),
+      "conversations.history": (call) => {
+        readingRoot = rootAtUpper(call);
+        return slackJson(historyBody({ messages: [rootMessage(readingRoot)] }));
+      },
     });
     const read = await discover(seed, sibling, reading);
 
@@ -1149,7 +1259,7 @@ describe("a coalesced channel is read only by its binder (PA-2)", () => {
     ]);
     expect(categories(read, "history")).toEqual(["ok:"]);
     expect(read.steps.filter((s) => s.stage === "metadata")).toHaveLength(50);
-    expect(await threadRootTs(seed.teamId)).toEqual(["1718900000.000700"]);
+    expect(await threadRootTs(seed.teamId)).toEqual([String(readingRoot)]);
     // The fifty foreign-bound rows are still exactly as their binder left them.
     for (const channelId of foreignBound) {
       expect(await channelRow(seed.teamId, WORKSPACE, channelId), channelId).toEqual(before.get(channelId));
@@ -1166,10 +1276,12 @@ describe("a coalesced channel is read only by its binder (PA-2)", () => {
 
     // THE ORDER IS THE TEST: the binder finishes its bootstrap and its proof BEFORE the sibling runs.
     await setSlackChannelIds(seed, [CHANNEL, OTHER_CHANNEL], "slack-a");
-    const reproof = fullPass();
-    await discover(seed, binder, reproof);
+    // §9.1 FX-10: this newest response is the bound-derived two-root terminal, history ok for CHANNEL.
+    const reproof = fullPass({ "conversations.history": twoRootTerminal });
+    const reproved = await discover(seed, binder, reproof);
     expect(reproof.countOf("auth.test")).toBe(1);
     expect(reproof.paramsOf("conversations.info").map((p) => p.get("channel"))).toEqual([CHANNEL]);
+    expect(reproved.steps.filter((s) => s.stage === "history").map((s) => `${s.channelId}:${s.result}`)).toEqual([`${CHANNEL}:ok`]);
     const rebound = (await bindingRow(seed.teamId, binder))?.config_revision;
     expect(rebound).not.toBe(boundAt);
 
@@ -1218,12 +1330,15 @@ describe("a coalesced channel is read only by its binder (PA-2)", () => {
     expect(await channelRow(seed.teamId, WORKSPACE, CHANNEL)).toMatchObject({ binding_integration_id: binder });
 
     // A binder that is not verified is not valid: the sibling, with budget, proves and takes the row.
+    // §9.1 FX-11: the takeover's inherited newest response is the bound-derived two-root terminal.
     const takeover = viaBotsInfo({
       "auth.test": () => {
         throw new Error("the sibling is already verified; auth.test must not repeat");
       },
+      "conversations.history": twoRootTerminal,
     });
-    await discover(seed, sibling, takeover);
+    const tookOver = await discover(seed, sibling, takeover);
+    expect(categories(tookOver, "history")).toEqual(["ok:"]);
     expect(takeover.countOf("bots.info")).toBe(0);
     expect(takeover.paramsOf("conversations.info").map((p) => p.get("channel"))).toEqual([CHANNEL]);
     const taken = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
@@ -1276,8 +1391,10 @@ describe("a coalesced channel is read only by its binder (PA-2)", () => {
     expect(await channelRow(seed.teamId, WORKSPACE, CHANNEL)).toEqual(row);
 
     // Then the binder runs, through its bootstrap, and re-proves exactly once at its new revision.
-    const reproof = fullPass();
-    await discover(seed, binder, reproof);
+    // §9.1 FX-12: its newest response is the bound-derived two-root terminal, history ok.
+    const reproof = fullPass({ "conversations.history": twoRootTerminal });
+    const reproved = await discover(seed, binder, reproof);
+    expect(categories(reproved, "history")).toEqual(["ok:"]);
     expect(reproof.countOf("auth.test")).toBe(1);
     expect(reproof.paramsOf("conversations.info").map((p) => p.get("channel"))).toEqual([CHANNEL]);
     const rebound = (await bindingRow(seed.teamId, binder))?.config_revision;
@@ -1436,6 +1553,9 @@ describe("a coalesced channel is read only by its binder (PA-2)", () => {
     expect(result.outcome).toBe("idle");
     // The binder's partial scan is exactly where it left it — named column by column, then whole.
     const after = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    // §9.2 second consumer: the new names must EXIST in both rows before they are compared.
+    expectSection92Fields(row, "before");
+    expectSection92Fields(after, "after");
     for (const column of ACCEPTED_PROGRESS) {
       expect(after?.[column], `${column} must survive the stand-down`).toEqual(row[column]);
     }

@@ -216,8 +216,10 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *    release, zero roots) and `refused`, with acceptance BEFORE root enqueue and one rollback
  *    boundary;
  *  - the static step details for each;
- *  - the §9.1/§9.2 fixture corrections in the discovery, fences and bootstrap suites (FX-01–FX-13
- *    and the bootstrap progress inventory). The §9 census seed is already corrected at `95c2e041`.
+ *  (The §9.1/§9.2 fixture corrections are DONE in the caller packet: FX-01–FX-13 across the
+ *  discovery, fences and bootstrap suites; the bootstrap progress inventory with its own-property and
+ *  oracle checks; and the §9 census seed at `95c2e041`. The caller packet's six intended behavioral
+ *  REDs are in the discovery suite: three request-bound and three page-range.)
  * Also still deferred:
  *  - two-session claim/accept races;
  *  - the §3.4 maximum-history compatibility writers;
