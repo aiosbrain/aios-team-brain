@@ -207,6 +207,11 @@ const CURSOR_REPEATED_DETAIL = "The page repeated a saved cursor; no roots or co
 const SUBDIVIDED_DETAIL = "The scan was divided into a smaller time range; no roots from this page were accepted.";
 const UNSPLITTABLE_DETAIL =
   "The provider continuation cannot be followed for this timestamp range; the scan remains incomplete.";
+/** An actual `invalid_cursor` on a singleton range: the same range restarts (§5). */
+const INVALID_CURSOR_RESTART_DETAIL =
+  "The provider refused the cursor for this timestamp range; the scan remains incomplete.";
+/** Any refused history page or transition: the claim's authority moved while the request was in flight. */
+const STALE_PAGE_DETAIL = "The world changed while the page was in flight; no root was queued and no cursor moved.";
 
 /**
  * The claim's frozen active segment, which is the request's and the validator's single source of
@@ -1025,11 +1030,53 @@ async function fetchAndAccept(
   });
   if (!call) return;
 
+  if (call.kind === "refused" && call.category === "invalid_cursor") {
+    // `invalid_cursor` is the one refusal with its own repair (§5), applied in ONE transaction:
+    //  - selection authority first, under the integration row lock;
+    //  - then the restart writer, under the complete channel fence, on the SAME session.
+    // A wide segment is subdivided at its midpoint; a singleton restarts the same range. Either way
+    // the certified interval is untouched, the sent request's turn passes, nothing is enqueued, and
+    // the writer's own release is the only one. No lock is held across the provider call above.
+    const restarted = await runContextTransaction(pass.input.db, async (session) => {
+      const read = await lockSlackSelection(session, {
+        teamId: selection.teamId,
+        integrationId: selection.integrationId,
+        envToken: pass.options.envToken,
+      });
+      if (read.outcome !== "current" || !sameSelection(read.selection, ref)) return { outcome: "stale" as const };
+      return restartSlackChannelScan(session, claim, { errorCode: "invalid_cursor" });
+    });
+    if (restarted.outcome === "stale") {
+      // Only the BINDING moved: hand the fenced claim back (a successor's lease cannot match).
+      await runContextTransaction(pass.input.db, (session) =>
+        releaseSlackChannelForRetry(session, claim, { nextDueAt: null, errorCode: "binding_changed" })
+      );
+      step(pass, { stage: "history", method: "conversations.history", result: "refused", category: "binding_changed", channelId, detail: STALE_PAGE_DETAIL });
+      return;
+    }
+    switch (restarted.outcome) {
+      case "subdivided":
+      case "restarted":
+        step(pass, {
+          stage: "history",
+          method: "conversations.history",
+          result: "delayed",
+          category: "invalid_cursor",
+          channelId,
+          detail: restarted.outcome === "subdivided" ? SUBDIVIDED_DETAIL : INVALID_CURSOR_RESTART_DETAIL,
+        });
+        return;
+      case "refused":
+        step(pass, { stage: "history", method: "conversations.history", result: "refused", category: "stale_channel_lease", channelId, detail: STALE_PAGE_DETAIL });
+        return;
+      default: {
+        const unreachable: never = restarted;
+        throw new Error(`slack source discovery: unknown restart outcome ${String((unreachable as { outcome?: unknown }).outcome)}`);
+      }
+    }
+  }
+
   if (call.kind !== "ok") {
-    // `invalid_cursor` is the one refusal with its own repair: the SAME anchored scan restarts with
-    // a fresh generation and no cursor, and the certified interval is untouched — a cursor the
-    // provider forgot says nothing about the pages already read.
-    const restart = call.kind === "refused" && call.category === "invalid_cursor";
     // ⚠️ THE LANES ALTERNATE REQUEST SLOTS, NOT WAKES. A wake is frequent and a slot is one a minute:
     // the wake after a historical page usually arrives inside that minute, claims the newest lane and
     // is refused by the budget. If handing the lane back passed the turn on, the next real slot went
@@ -1039,13 +1086,11 @@ async function fetchAndAccept(
     // sent, whatever came back, used its slot and passes the turn as it always did.
     const turn = wire.sent ? "passed" : "kept";
     await runContextTransaction(pass.input.db, (session) =>
-      restart
-        ? restartSlackChannelScan(session, claim, { errorCode: sanitize(call.category) })
-        : releaseSlackChannelForRetry(session, claim, {
-            nextDueAt: deadline(call),
-            errorCode: sanitize(call.category),
-            turn,
-          })
+      releaseSlackChannelForRetry(session, claim, {
+        nextDueAt: deadline(call),
+        errorCode: sanitize(call.category),
+        turn,
+      })
     );
     step(pass, {
       stage: "history",
@@ -1131,6 +1176,11 @@ async function fetchAndAccept(
           ? { outcome: "rejected" as const, category: advanced.category }
           : { outcome: "refused" as const };
       }
+      default: {
+        // Exhaustive: a new acceptance outcome must be handled here before it can commit anything.
+        const unreachable: never = advanced;
+        throw new Error(`slack source discovery: unknown acceptance outcome ${String((unreachable as { outcome?: unknown }).outcome)}`);
+      }
     }
   });
 
@@ -1167,7 +1217,7 @@ async function fetchAndAccept(
     result: "refused",
     category: accepted.outcome === "stale" ? "binding_changed" : "stale_channel_lease",
     channelId,
-    detail: "The world changed while the page was in flight; no root was queued and no cursor moved.",
+    detail: STALE_PAGE_DETAIL,
   });
 }
 

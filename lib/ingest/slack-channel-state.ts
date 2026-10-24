@@ -826,11 +826,11 @@ export async function claimSlackChannelPage(
 /**
  * Lock this claim's channel row and re-check the WHOLE fence, without writing anything.
  *
- * It exists so the acceptance can be ordered the way it must be: verify FIRST, then enqueue the
- * roots, then advance the frontier. A refusal discovered after the enqueues would have to un-write
- * them — and a refusal reported as a return value cannot, since the transaction would commit.
- * `for update` holds the row until this transaction ends, so no concurrent claim can slip in between
- * the check and the advance.
+ * It exists so the acceptance can be ordered the way it must be (§3.2/§5): verify FIRST, then advance
+ * the frontier through `acceptSlackChannelPage`, then, only for a `written` page, enqueue the roots,
+ * all in one transaction. A root is therefore never enqueued for a page the writer refused, rejected
+ * or subdivided, and a failed enqueue rolls the acceptance back with it. `for update` holds the row
+ * until this transaction ends, so no concurrent claim can slip in between the check and the advance.
  *
  * ⚠️ IT ALSO RE-CHECKS THE PUBLIC PROOF, and this is the ONLY place that check exists on the
  * acceptance path — deliberately not repeated in the advance below, where a second copy would
@@ -1079,7 +1079,10 @@ interface LaneSegment {
   readonly floor: bigint;
 }
 
-function lockedSegment(lane: SlackScanLane, row: LockedLaneRow): LaneSegment | null {
+function lockedSegment(
+  lane: SlackScanLane,
+  row: Pick<LockedLaneRow, "segment_lower" | "segment_upper" | "request_lower">
+): LaneSegment | null {
   if (row.segment_lower === null && row.segment_upper === null) return null;
   const lower = exactTicks(row.segment_lower);
   const upper = exactTicks(row.segment_upper);
@@ -1314,60 +1317,65 @@ function hasControlCharacter(value: string): boolean {
 }
 
 /**
- * Restart the SAME anchored scan after the provider refused our cursor: drop the cursor, bump the
- * scan generation, keep the anchor.
+ * The provider refused our cursor (an actual `invalid_cursor`, §5). The lane's next state depends on
+ * its LOCKED segment:
+ *  - `subdivided` (S < U): `M = floor((S + U) / 2)` in exact ticks, then `S = M + 1`. U, L, A and B
+ *    stay, the completed-segments aggregate is preserved, the cursor, history and attempt-oldest are
+ *    cleared, and G increments once;
+ *  - `restarted` (S = U, or a lane with no segment): the SAME range again. Every bound and the
+ *    aggregate stay, the cursor, history and attempt-oldest are cleared, and G increments once;
+ *  - `refused`: the claim's authority is gone, and nothing was written.
  *
- * It is not a rollback. The certified interval is untouched, because a cursor the provider forgot
- * says nothing about the pages we already read; and the generation bump is what makes a late
- * acceptance from the abandoned attempt match no row. The lane's cursor history goes with its cursor
- * (a null cursor has an empty history). The segment-aware `invalid_cursor` subdivision of §5 is not
- * here yet: this remains the same-range restart.
+ * Either transition releases the claim and passes the sent request's turn, recording `errorCode` as
+ * the diagnostic. It is not a rollback: the certified interval is untouched, because a cursor the
+ * provider forgot says nothing about the pages already read. The generation bump is what makes a late
+ * acceptance from the abandoned attempt match no row.
+ *
+ * Authority is the COMPLETE channel fence (`channelFence`, the same as acceptance), checked by a
+ * locking read and repeated in the write, so an expiry between them still refuses. Boundaries come
+ * from the locked row, never from the claim's arithmetic. Nothing returned carries a cursor history.
  */
+export type SlackChannelRestart =
+  | { readonly outcome: "subdivided"; readonly state: SlackChannelState }
+  | { readonly outcome: "restarted"; readonly state: SlackChannelState }
+  | { readonly outcome: "refused" };
+
 export async function restartSlackChannelScan(
   session: TransactionSession,
   claim: SlackChannelClaim,
   input: { errorCode: string }
-): Promise<SlackChannelWrite> {
+): Promise<SlackChannelRestart> {
   assertScope(claim.scope);
   const lane = assertLane(claim.lane);
   assertErrorCode(input.errorCode);
-  const result = await session.executeSql<StateRow>(
-    `update slack_sync_channels
-        set ${lane}_cursor = null,
-            ${lane}_cursor_history = '[]'::pg_catalog.jsonb,
-            ${lane}_scan_generation = ${lane}_scan_generation + 1,
-            ${lane === "newest" ? "newest_lower_ts" : "historical_oldest_seen_ts"} =
-              ${lane === "newest" ? "newest_lower_ts" : "null"},
-            next_lane = case when claimed_lane = 'newest' then 'historical' else 'newest' end,
-            claimed_lane = null,
-            lease_owner = null,
-            lease_expires_at = null,
-            last_error_code = $11,
-            due_at = clock_timestamp(),
-            updated_at = clock_timestamp()
-      where ${SCOPE_PREDICATE}
-        and lease_owner = $4
-        and lease_generation = $5::bigint
-        and lease_expires_at > clock_timestamp()
-        and claimed_lane = $6
-        and binding_config_revision = $7
-        and ${lane}_scan_generation = $8::bigint
-        and ${lane}_cursor is not distinct from $9
-        and ${lane}_anchor_ts is not distinct from $10
-  returning ${STATE_COLUMNS}`,
-    [
-      ...scopeParams(claim.scope),
-      claim.leaseOwner,
-      String(claim.leaseGeneration),
-      lane,
-      claim.bindingConfigRevision,
-      String(claim.scanGeneration),
-      claim.cursor,
-      claim.anchorTs,
-      input.errorCode,
-    ]
+  const fence = channelFence(claim, lane);
+  const locked = single(
+    await session.executeSql<{ segment_lower: string | null; segment_upper: string | null; request_lower: string | null }>(
+      `select ${lane}_segment_lower_ts as segment_lower,
+              ${lane}_segment_upper_ts as segment_upper,
+              ${lane === "newest" ? "newest_request_lower_ts" : "null::text"} as request_lower
+         from slack_sync_channels
+        where ${SCOPE_PREDICATE}
+          and ${fence.predicate}
+          for update`,
+      [...scopeParams(claim.scope), ...fence.params]
+    )
   );
-  return written(result);
+  if (!locked) return { outcome: "refused" };
+  const segment = lockedSegment(lane, locked);
+  const split = segment !== null && segment.lower < segment.upper;
+  const state = await writeFenced(session, claim, fence, (bind) => [
+    ...(split && segment !== null
+      ? [`${lane}_segment_lower_ts = ${bind(canonicalBound((segment.lower + segment.upper) / TWO + ONE_TICK))}`]
+      : []),
+    `${lane}_cursor = null`,
+    `${lane}_cursor_history = '[]'::pg_catalog.jsonb`,
+    ...(lane === "historical" ? [`historical_oldest_seen_ts = null`] : []),
+    `${lane}_scan_generation = ${lane}_scan_generation + 1`,
+    `last_error_code = ${bind(input.errorCode)}`,
+  ]);
+  if (!state) return { outcome: "refused" };
+  return split ? { outcome: "subdivided", state } : { outcome: "restarted", state };
 }
 
 /**
