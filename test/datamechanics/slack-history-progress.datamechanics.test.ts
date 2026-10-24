@@ -1,14 +1,17 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Client } from "pg";
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { loadSchema } from "../../scripts/pg-load-schema.mjs";
 import type { TransactionSession } from "@/lib/db/types";
 import {
   acceptSlackChannelPage,
+  beginSlackChannelMetadata,
   claimSlackChannelPage,
+  delaySlackChannel,
   dueSlackChannels,
   ensureSlackChannel,
+  recordSlackChannelPublicState,
   releaseSlackChannelForRetry,
   restartSlackChannelScan,
   type SlackChannelClaim,
@@ -17,6 +20,7 @@ import {
 import { transactionCapability } from "@/lib/projects/context/transaction";
 import { db, seedTeam } from "./helpers";
 import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
+import { agePublicProof, closeRawSql, elapse, expireChannelLease } from "./slack-source-helpers";
 
 /**
  * AIO-1170 AM-F2 — RED-FIRST RUNTIME PACKET 1: STATE-WRITER HISTORY ADMISSION
@@ -260,9 +264,27 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *      - the restart writer's own locked stored-state validity;
  *      - an expiry between the restart writer's own locking read and its UPDATE;
  *      - the NEWEST lane's invalid_cursor transitions.
+ * PACKET 7 — §3.4 / F2-10 (partial) MAXIMUM-HISTORY COMPATIBILITY WRITERS (13 tests, expected GREEN on
+ * current source). Each runs on a FRESH row whose two lane histories are both at their exact maximum
+ * shape: 1,000 entries and 1,048,576 bytes, distinct per lane and linked to their cursors. The fixture
+ * is proved by SQL before each action. A digest of every column outside the writer's existing allowed
+ * set then proves both histories, and all unrelated progress and certification, byte-identical; the
+ * allowed effects are SQL booleans and counts.
+ *  - claimSlackChannelPage;
+ *  - releaseSlackChannelForRetry;
+ *  - beginSlackChannelMetadata;
+ *  - recordSlackChannelPublicState (private, under a live claim);
+ *  - delaySlackChannel;
+ *  - integration delete (ON DELETE SET NULL plus its binding-clear trigger);
+ *  - opposite-lane acceptSlackChannelPage (a historical terminal);
+ *  - opposite-lane restartSlackChannelScan (invalid_cursor, typed `subdivided`);
+ *  - the fenced rejection/release path;
+ *  - the unchanged test-only elapse, expireChannelLease and agePublicProof;
+ *  - ensureSlackChannel's insert-on-conflict-do-nothing, which neither updates nor rechecks the row.
+ * Not claimed by packet 7: the rest of F2-10 (the 200-channel bulk projection and long-cycle
+ * detection) and any DH row beyond these writers.
  * Also still deferred:
  *  - two-session claim/accept races;
- *  - the §3.4 maximum-history compatibility writers;
  *  - the controlled mutants;
  *  - MR-06.
  *
@@ -317,8 +339,8 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *    all in `slack-source-discovery.datamechanics.test.ts`. The §9.1/§9.2 fixture corrections are in
  *    the discovery, fences and bootstrap suites;
  *  - acceptance BEFORE enqueue, the rollback boundary and the rejected/subdivided/refused caller
- *    handling are tested in the discovery suite's packet 5 (RED until production GREEN);
- *  - the §3.4 maximum-history compatibility writers;
+ *    handling are tested in the discovery suite's packet 5 (GREEN since `f556163d`);
+ *  - the §3.4 maximum-history compatibility writers are packet 7 of this file;
  *  - the full DH-11/12/13 matrices and the controlled mutants;
  *  - end-to-end composition (runner → discovery → state → timeline).
  */
@@ -1680,6 +1702,318 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
     expect({ outcome, rowUnchanged: (await rowDigestExcept(seeded.scope, [])) === before },
       "the invalid_cursor transition is fenced exactly like acceptance").toEqual({
       outcome: { outcome: "refused", leaked: false }, rowUnchanged: true,
+    });
+  });
+
+  // ── PACKET 7: §3.4 / F2-10 maximum-history compatibility writers ────────────────────────────────
+  // PostgreSQL rechecks BOTH history CHECKs on every update of the row. Each writer below therefore
+  // runs against a FRESH row whose two histories sit at their exact maximum accepted shape (1,000
+  // entries, 1,048,576 bytes each, distinct per lane). The fixture is proved by SQL before each action.
+  // A digest of every column outside the writer's existing allowed set then proves that both
+  // histories, and all unrelated progress and certification, are byte-identical. The allowed effects
+  // are asserted as SQL booleans and counts. No history or cursor is ever projected or printed.
+
+  /** A maximum accepted history; `prefix` makes the two lanes' histories distinct sentinels. */
+  function maxHistory(prefix: "h" | "n"): string[] {
+    const pad = String.fromCodePoint(0x4e00);
+    return Array.from({ length: 1000 }, (_, i) => {
+      const id = `${prefix}${String(i).padStart(3, "0")}`;
+      return i < 576 ? id + pad.repeat(347) : `${id}${pad.repeat(346)}aa`;
+    });
+  }
+  type MaxSeeded = Seeded & { historicalHistory: string[] };
+  /**
+   * A public, bound, due channel with BOTH lanes initialized and at maximum history.
+   *  - Historical: A = `1718900500.000000`, the wide segment [0, A], C = its last entry, G 4.
+   *  - Newest: the coherent fixture tuple (B = the historical anchor, L = S < B < U = A), C = its last
+   *    entry, G 2.
+   * `next_lane` is historical.
+   */
+  async function seedMaxBoth(): Promise<MaxSeeded> {
+    const seed = await seedTeam();
+    const scope = { teamId: seed.teamId, workspaceId: WORKSPACE, channelId: CHANNEL };
+    const historicalHistory = maxHistory("h");
+    const newestHistory = maxHistory("n");
+    const integrationId = await tx(async (session) => (await session.executeSql<{ id: string }>(
+      `insert into integrations (team_id, type, name) values ($1, 'slack', 'compat-binder') returning id::text as id`, [seed.teamId]
+    )).rows[0].id);
+    await tx((session) => session.executeSql(
+      `insert into slack_sync_channels
+         (team_id, workspace_id, channel_id, public_state, public_checked_at, binding_integration_id, binding_config_revision,
+          newest_anchor_ts, newest_lower_ts, newest_request_lower_ts, newest_segment_lower_ts, newest_segment_upper_ts,
+          newest_cursor, newest_cursor_history, newest_scan_generation,
+          historical_anchor_ts, historical_segment_lower_ts, historical_segment_upper_ts,
+          historical_cursor, historical_cursor_history, historical_scan_generation,
+          next_lane, due_at)
+       values ($1, $2, $3, 'public', '2026-01-01 00:00:00+00', $4::uuid, $5,
+               $6, $7, $8, $9, $10, $11, $12::jsonb, 2,
+               $13, '0.000000', $13, $14, $15::jsonb, 4,
+               'historical', '2020-01-01 00:00:00+00')`,
+      [seed.teamId, WORKSPACE, CHANNEL, integrationId, REVISION,
+        NEWEST_FIXTURE.newest_anchor_ts, NEWEST_FIXTURE.newest_lower_ts, NEWEST_FIXTURE.newest_request_lower_ts,
+        NEWEST_FIXTURE.newest_segment_lower_ts, NEWEST_FIXTURE.newest_segment_upper_ts,
+        newestHistory[999], JSON.stringify(newestHistory),
+        HISTORICAL_ANCHOR, historicalHistory[999], JSON.stringify(historicalHistory)]
+    ));
+    return { scope, integrationId, width: "wide", pageOldest: HISTORICAL_SEGMENTS.wide.pageOldest, historicalHistory };
+  }
+  /** SQL-computed facts about both histories (counts, bytes and booleans only). */
+  async function maxFacts(scope: SlackChannelScope) {
+    return tx(async (session) => (await session.executeSql<Record<string, unknown>>(
+      `select pg_catalog.jsonb_array_length(historical_cursor_history)::int as historical_entries,
+              pg_catalog.octet_length(historical_cursor_history::text)::int as historical_bytes,
+              pg_catalog.jsonb_array_length(newest_cursor_history)::int as newest_entries,
+              pg_catalog.octet_length(newest_cursor_history::text)::int as newest_bytes,
+              coalesce((historical_cursor_history -> -1) = pg_catalog.to_jsonb(historical_cursor), false)
+                and coalesce((newest_cursor_history -> -1) = pg_catalog.to_jsonb(newest_cursor), false) as linked,
+              historical_cursor_history <> newest_cursor_history as distinct_sentinels
+         from slack_sync_channels where team_id = $1 and workspace_id = $2 and channel_id = $3`,
+      [scope.teamId, scope.workspaceId, scope.channelId]
+    )).rows[0]);
+  }
+  const MAX_FACTS = {
+    historical_entries: 1000, historical_bytes: 1048576, newest_entries: 1000, newest_bytes: 1048576,
+    linked: true, distinct_sentinels: true,
+  };
+  /** The newest lane alone, still at maximum and linked (for writers that legitimately clear the historical lane). */
+  async function newestStillMax(scope: SlackChannelScope) {
+    const facts = await maxFacts(scope);
+    return facts.newest_entries === 1000 && facts.newest_bytes === 1048576;
+  }
+  /** One SQL projection of the claimed row: booleans/counts/static strings only. */
+  async function rowSelect(scope: SlackChannelScope, sql: string, extra: unknown[] = []) {
+    return tx(async (session) => (await session.executeSql<Record<string, unknown>>(
+      `select ${sql} from slack_sync_channels where team_id = $1 and workspace_id = $2 and channel_id = $3`,
+      [scope.teamId, scope.workspaceId, scope.channelId, ...extra]
+    )).rows[0]);
+  }
+  /** Seed, then prove the maximum fixture as a separate PRECONDITION. */
+  async function maxFixture(): Promise<MaxSeeded> {
+    const seeded = await seedMaxBoth();
+    expect(await maxFacts(seeded.scope), "fixture: both histories are at their exact maximum, linked and distinct").toEqual(MAX_FACTS);
+    return seeded;
+  }
+  const claimOf = (seeded: MaxSeeded) =>
+    tx((session) => claimSlackChannelPage(session, seeded.scope, { bindingIntegrationId: seeded.integrationId, bindingConfigRevision: REVISION }));
+  /** A claimed historical lane, asserted as a fixture step. */
+  async function claimedMax(seeded: MaxSeeded): Promise<SlackChannelClaim> {
+    const result = await claimOf(seeded);
+    const claim = result !== null && !("outcome" in result) ? result : null;
+    expect({ lane: claim?.lane ?? null }, "fixture: the historical lane is claimed").toEqual({ lane: "historical" });
+    return claim as SlackChannelClaim;
+  }
+  const METADATA_BEGIN = ["metadata_attempt_owner", "metadata_attempt_generation", "updated_at"];
+  const RECORD_PRIVATE = [
+    "public_state", "public_checked_at", "binding_integration_id", "binding_config_revision", "last_error_code",
+    "metadata_attempt_owner", "lease_owner", "lease_expires_at", "claimed_lane", "lease_generation", "due_at", "updated_at",
+  ];
+  const DELAY = ["due_at", "last_error_code", "metadata_attempt_owner", "updated_at"];
+
+  describe("§3.4 / F2-10 every compatibility writer keeps BOTH maximum histories valid and exact", () => {
+    afterAll(closeRawSql);
+
+    it("claimSlackChannelPage: only the lease bookkeeping moves", async () => {
+      const seeded = await maxFixture();
+      const before = await rowDigestExcept(seeded.scope, LEASE_BOOKKEEPING);
+      const claim = await claimOf(seeded);
+      expect({
+        lane: claim !== null && !("outcome" in claim) ? claim.lane : null,
+        historyInProjection: hasHistoryKey(claim),
+        facts: await rowSelect(seeded.scope, "claimed_lane, lease_owner is not null and lease_expires_at > clock_timestamp() as leased, attempts::int as attempts, lease_generation::int as lease_generation"),
+        unchanged: (await rowDigestExcept(seeded.scope, LEASE_BOOKKEEPING)) === before,
+      }).toEqual({
+        lane: "historical", historyInProjection: false,
+        facts: { claimed_lane: "historical", leased: true, attempts: 1, lease_generation: 1 },
+        unchanged: true,
+      });
+    });
+
+    it("releaseSlackChannelForRetry: only the §3.2 release bookkeeping moves, turn passed", async () => {
+      const seeded = await maxFixture();
+      const claim = await claimedMax(seeded);
+      const before = await rowDigestExcept(seeded.scope, RELEASE_PERMITTED);
+      const released = await tx((session) => releaseSlackChannelForRetry(session, claim, { errorCode: "compat_probe", turn: "passed", nextDueAt: null }));
+      expect({
+        outcome: released.outcome, historyInProjection: hasHistoryKey(released),
+        facts: await rowSelect(seeded.scope, `next_lane, claimed_lane is null and lease_owner is null and lease_expires_at is null as released,
+          last_error_code, due_at > clock_timestamp() - interval '1 minute' as due_now`),
+        unchanged: (await rowDigestExcept(seeded.scope, RELEASE_PERMITTED)) === before,
+      }).toEqual({
+        outcome: "written", historyInProjection: false,
+        facts: { next_lane: "newest", released: true, last_error_code: "compat_probe", due_now: true },
+        unchanged: true,
+      });
+    });
+
+    it("beginSlackChannelMetadata: only the metadata attempt moves", async () => {
+      const seeded = await maxFixture();
+      const before = await rowDigestExcept(seeded.scope, METADATA_BEGIN);
+      const attempt = await tx((session) => beginSlackChannelMetadata(session, seeded.scope));
+      expect({
+        generation: attempt?.generation ?? null,
+        facts: await rowSelect(seeded.scope, "metadata_attempt_owner is not null as owned, metadata_attempt_generation::int as generation"),
+        unchanged: (await rowDigestExcept(seeded.scope, METADATA_BEGIN)) === before,
+      }).toEqual({ generation: 1, facts: { owned: true, generation: 1 }, unchanged: true });
+    });
+
+    it("recordSlackChannelPublicState (private, under a live claim): public proof, binding, attempt, revocation and schedule move; nothing else", async () => {
+      const seeded = await maxFixture();
+      await claimedMax(seeded);
+      const attempt = await tx((session) => beginSlackChannelMetadata(session, seeded.scope));
+      if (!attempt) throw new Error("fixture: the metadata attempt did not open");
+      const before = await rowDigestExcept(seeded.scope, RECORD_PRIVATE);
+      const recorded = await tx((session) => recordSlackChannelPublicState(session, seeded.scope,
+        { integrationId: seeded.integrationId, configRevision: REVISION }, attempt, { publicState: "private" }));
+      expect({
+        outcome: recorded.outcome, historyInProjection: hasHistoryKey(recorded),
+        facts: await rowSelect(seeded.scope, `public_state, public_checked_at > timestamptz '2026-01-01 00:00:00+00' as checked_now,
+          binding_integration_id = $4::uuid and binding_config_revision = $5 as binding_kept, last_error_code,
+          metadata_attempt_owner is null as attempt_closed,
+          lease_owner is null and lease_expires_at is null and claimed_lane is null as lease_revoked,
+          lease_generation::int as lease_generation, due_at > clock_timestamp() - interval '1 minute' as due_now`,
+          [seeded.integrationId, REVISION]),
+        unchanged: (await rowDigestExcept(seeded.scope, RECORD_PRIVATE)) === before,
+      }).toEqual({
+        outcome: "written", historyInProjection: false,
+        facts: {
+          public_state: "private", checked_now: true, binding_kept: true, last_error_code: null, attempt_closed: true,
+          lease_revoked: true, lease_generation: 2, due_now: true,
+        },
+        unchanged: true,
+      });
+    });
+
+    it("delaySlackChannel (no new due time): only the diagnostic and the attempt move; due_at is kept", async () => {
+      const seeded = await maxFixture();
+      const attempt = await tx((session) => beginSlackChannelMetadata(session, seeded.scope));
+      if (!attempt) throw new Error("fixture: the metadata attempt did not open");
+      const before = await rowDigestExcept(seeded.scope, DELAY);
+      const delayed = await tx((session) => delaySlackChannel(session, seeded.scope, attempt, { dueAt: null, errorCode: "metadata_delay" }));
+      expect({
+        outcome: delayed.outcome, historyInProjection: hasHistoryKey(delayed),
+        facts: await rowSelect(seeded.scope, `due_at = timestamptz '2020-01-01 00:00:00+00' as due_kept, last_error_code,
+          metadata_attempt_owner is null as attempt_closed`),
+        unchanged: (await rowDigestExcept(seeded.scope, DELAY)) === before,
+      }).toEqual({
+        outcome: "written", historyInProjection: false,
+        facts: { due_kept: true, last_error_code: "metadata_delay", attempt_closed: true },
+        unchanged: true,
+      });
+    });
+
+    it("integration delete (ON DELETE SET NULL + binding-clear trigger): only the binding pair is cleared", async () => {
+      const seeded = await maxFixture();
+      const BINDING = ["binding_integration_id", "binding_config_revision"];
+      const before = await rowDigestExcept(seeded.scope, BINDING);
+      await tx((session) => session.executeSql("delete from integrations where id = $1::uuid", [seeded.integrationId]));
+      expect({
+        facts: await rowSelect(seeded.scope, "binding_integration_id is null and binding_config_revision is null as binding_cleared"),
+        unchanged: (await rowDigestExcept(seeded.scope, BINDING)) === before,
+      }).toEqual({ facts: { binding_cleared: true }, unchanged: true });
+    });
+
+    it("opposite-lane acceptSlackChannelPage (historical terminal at its cap): the historical envelope completes; the newest maximum history is exact", async () => {
+      const seeded = await maxFixture();
+      const claim = await claimedMax(seeded);
+      const before = await rowDigestExcept(seeded.scope, TERMINAL_PERMITTED);
+      const outcome = await admit(claim, { terminal: true, nextCursor: null, oldestTs: "1718900100.000000" });
+      expect({
+        outcome,
+        facts: await rowSelect(seeded.scope, `historical_anchor_ts is null and historical_cursor is null
+          and historical_cursor_history = '[]'::jsonb as historical_cleared, historical_floor_reached as floor_reached,
+          historical_scan_generation::int as generation, next_lane`),
+        newestStillMax: await newestStillMax(seeded.scope),
+        unchanged: (await rowDigestExcept(seeded.scope, TERMINAL_PERMITTED)) === before,
+      }).toEqual({
+        outcome: { accept: { outcome: "written" } },
+        facts: { historical_cleared: true, floor_reached: true, generation: 5, next_lane: "newest" },
+        newestStillMax: true,
+        unchanged: true,
+      });
+    });
+
+    it("opposite-lane restartSlackChannelScan (invalid_cursor on the wide historical segment): typed subdivided; the newest maximum history is exact", async () => {
+      const seeded = await maxFixture();
+      const claim = await claimedMax(seeded);
+      const before = await rowDigestExcept(seeded.scope, INVALID_CURSOR_PERMITTED);
+      const midpointPlusOne = renderTicks((exactOracleTicks("0.000000") + exactOracleTicks(HISTORICAL_ANCHOR)) / BigInt(2) + BigInt(1));
+      expect(midpointPlusOne, "fixture: oracle").toBe("859450250.000001");
+      const outcome = await restartOutcome(claim);
+      expect({
+        outcome,
+        facts: await rowSelect(seeded.scope, `historical_segment_lower_ts = $4 as split_at_midpoint,
+          historical_cursor is null and historical_cursor_history = '[]'::jsonb as historical_cleared,
+          historical_scan_generation::int as generation, next_lane, last_error_code`, [midpointPlusOne]),
+        newestStillMax: await newestStillMax(seeded.scope),
+        unchanged: (await rowDigestExcept(seeded.scope, INVALID_CURSOR_PERMITTED)) === before,
+      }).toEqual({
+        outcome: { outcome: "subdivided", leaked: false },
+        facts: { split_at_midpoint: true, historical_cleared: true, generation: 5, next_lane: "newest", last_error_code: "invalid_cursor" },
+        newestStillMax: true,
+        unchanged: true,
+      });
+    });
+
+    it("the fenced rejection/release path (a repeated cursor at the cap): rejected / cursor_repeated, one release, both histories exact", async () => {
+      const seeded = await maxFixture();
+      const claim = await claimedMax(seeded);
+      const before = await rowDigestExcept(seeded.scope, RELEASE_PERMITTED);
+      const outcome = await admit(claim, { terminal: false, nextCursor: seeded.historicalHistory[500], oldestTs: seeded.pageOldest });
+      expect({
+        outcome,
+        facts: await rowSelect(seeded.scope, "next_lane, lease_owner is null and claimed_lane is null as released, last_error_code"),
+        stillMax: await maxFacts(seeded.scope),
+        unchanged: (await rowDigestExcept(seeded.scope, RELEASE_PERMITTED)) === before,
+      }).toEqual({
+        outcome: { accept: { outcome: "rejected", category: "cursor_repeated" }, release: "written" },
+        facts: { next_lane: "newest", released: true, last_error_code: "cursor_repeated" },
+        stillMax: MAX_FACTS,
+        unchanged: true,
+      });
+    });
+
+    it("test-only elapse: only due_at moves, by exactly the elapsed interval", async () => {
+      const seeded = await maxFixture();
+      const before = await rowDigestExcept(seeded.scope, ["due_at"]);
+      await elapse(seeded.scope.teamId);
+      expect({
+        facts: await rowSelect(seeded.scope, "due_at = timestamptz '2020-01-01 00:00:00+00' - interval '120000 milliseconds' as moved_exactly"),
+        stillMax: await maxFacts(seeded.scope),
+        unchanged: (await rowDigestExcept(seeded.scope, ["due_at"])) === before,
+      }).toEqual({ facts: { moved_exactly: true }, stillMax: MAX_FACTS, unchanged: true });
+    });
+
+    it("test-only expireChannelLease: only lease_expires_at moves; the lease owner is kept", async () => {
+      const seeded = await maxFixture();
+      await claimedMax(seeded);
+      const before = await rowDigestExcept(seeded.scope, ["lease_expires_at"]);
+      await expireChannelLease(seeded.scope.teamId, CHANNEL);
+      expect({
+        facts: await rowSelect(seeded.scope, "lease_expires_at <= clock_timestamp() as expired, lease_owner is not null as owned"),
+        stillMax: await maxFacts(seeded.scope),
+        unchanged: (await rowDigestExcept(seeded.scope, ["lease_expires_at"])) === before,
+      }).toEqual({ facts: { expired: true, owned: true }, stillMax: MAX_FACTS, unchanged: true });
+    });
+
+    it("test-only agePublicProof: only public_checked_at moves, by exactly the aged days", async () => {
+      const seeded = await maxFixture();
+      const before = await rowDigestExcept(seeded.scope, ["public_checked_at"]);
+      await agePublicProof(seeded.scope.teamId, CHANNEL, 7);
+      expect({
+        facts: await rowSelect(seeded.scope, "public_checked_at = timestamptz '2026-01-01 00:00:00+00' - interval '7 days' as aged_exactly"),
+        stillMax: await maxFacts(seeded.scope),
+        unchanged: (await rowDigestExcept(seeded.scope, ["public_checked_at"])) === before,
+      }).toEqual({ facts: { aged_exactly: true }, stillMax: MAX_FACTS, unchanged: true });
+    });
+
+    it("ensureSlackChannel on an existing row: insert-on-conflict-do-nothing neither updates nor rechecks it", async () => {
+      const seeded = await maxFixture();
+      const before = await rowDigestExcept(seeded.scope, []);
+      const ensured = await tx((session) => ensureSlackChannel(session, seeded.scope));
+      expect({
+        inserted: ensured.inserted, historyInProjection: hasHistoryKey(ensured),
+        unchanged: (await rowDigestExcept(seeded.scope, [])) === before,
+      }).toEqual({ inserted: false, historyInProjection: false, unchanged: true });
     });
   });
 });
