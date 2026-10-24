@@ -192,7 +192,8 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  * GREEN against GREEN3 `9ee7dbd7`; they are controls that pin GREEN3's validation, not REDs:
  *  - an omitted `skewAllowanceMs` is exactly 60,000 ms (independent BigInt oracle; initialized L/S/U);
  *  - ×6: zero, negative, fractional, unsafe, NaN and infinite allowances. Each fails with the fixed
- *    static validation error before any SQL mutation, and the row is byte-identical;
+ *    static validation error. The evidence is that the claim transaction rolls back and NO mutation is
+ *    committed (the row is byte-identical afterwards); it does not prove that no statement ran;
  *  - ×3: schema-permitted out-of-domain stored bounds: an idle B, an anchored B, and an anchored A.
  *    Each fails closed with the fixed bound-free `SlackChannelStateError`; the error contains no
  *    bound bytes and the row is byte-identical.
@@ -203,23 +204,21 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *  - on the typed delay it records one static `delayed / scan_bounds_invalid` history step for that
  *    channel, sends and reserves nothing, and continues its selected-channel loop.
  *
- * DEFERRED TO THE FOLLOWING DISCOVERY-CALLER PACKET, NOT covered here:
- *  - discovery sending the claim's exact S/U as `oldest`/`latest` on every page (never A once U
- *    differs), with PA-3 inclusive flags;
- *  - end-to-end discovery proof of the L > A step: no HTTP, no method-budget reservation, and the
- *    bounded candidate scan continuing. Same-pass fairness and the DH-09 default-50 boundary matrix
- *    are part of this;
- *  - discovery's raw-message timestamp validation against the claimed segment
- *    (`page_outside_segment`), after malformed_page, pagination_incomplete and malformed_timestamp,
- *    and before any root enqueue or state write;
- *  - discovery's handling of `rejected` (same-transaction release), `subdivided` (no second
- *    release, zero roots) and `refused`, with acceptance BEFORE root enqueue and one rollback
- *    boundary;
- *  - the static step details for each;
- *  (The §9.1/§9.2 fixture corrections are DONE in the caller packet: FX-01–FX-13 across the
- *  discovery, fences and bootstrap suites; the bootstrap progress inventory with its own-property and
- *  oracle checks; and the §9 census seed at `95c2e041`. The caller packet's six intended behavioral
- *  REDs are in the discovery suite: three request-bound and three page-range.)
+ * THE DISCOVERY-CALLER RED PACKET, in the discovery, fences and bootstrap suites.
+ *  TEST COVERAGE NOW PRESENT:
+ *   - request bounds: 5 behavioral REDs. Every page sends the claim's exact S/U as `oldest`/`latest`,
+ *     never A once U differs, with PA-3 inclusive flags, including the literal newest U < A and
+ *     historical 0 < S ≤ U < A cases;
+ *   - the end-to-end L > A step (DH-09): GREEN controls. No HTTP and no reservation; the bounded
+ *     candidate scan continues past the default-50 boundary;
+ *   - `page_outside_segment` (DH-13): 3 behavioral REDs and 3 precedence/edge controls;
+ *   - the §9.1/§9.2 fixture corrections: FX-01–FX-13, the bootstrap progress inventory with its
+ *     own-property and oracle checks, and the §9 census seed at `95c2e041`.
+ *  STILL DEFERRED TO PRODUCTION GREEN, which those REDs await, with no new tests yet:
+ *   - discovery's handling of `rejected` (same-transaction release), `subdivided` (no second
+ *     release, zero roots) and `refused`, with acceptance BEFORE root enqueue and one rollback
+ *     boundary, plus the static step details for each;
+ *   - the successor-safety proof of a stale release.
  * Also still deferred:
  *  - two-session claim/accept races;
  *  - the §3.4 maximum-history compatibility writers;
@@ -1438,13 +1437,13 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
     { label: "unsafe", value: Number.MAX_SAFE_INTEGER + 1 },
     { label: "NaN", value: Number.NaN },
     { label: "infinite", value: Number.POSITIVE_INFINITY },
-  ])("§5 claim safety: a $label skewAllowanceMs fails with the fixed static error BEFORE any SQL mutation", async ({ value }) => {
+  ])("§5 claim safety: a $label skewAllowanceMs fails with the fixed static error and commits no mutation", async ({ value }) => {
     const { scope, integrationId } = await seedNewestCandidate({
       completed_lower_ts: "1718800000.000001", completed_upper_ts: "1718900000.123456", historical_floor_reached: true,
     });
     const before = await rowDigestExcept(scope, []);
     const failure = await claimFailure(scope, integrationId, value);
-    expect({ failure, rowUnchanged: (await rowDigestExcept(scope, [])) === before }, "validation precedes SQL").toEqual({
+    expect({ failure, rowUnchanged: (await rowDigestExcept(scope, [])) === before }, "the transaction rolls back; nothing is committed").toEqual({
       failure: { name: "SlackChannelStateError", message: "slack channel state: skewAllowanceMs must be a positive whole number of milliseconds" },
       rowUnchanged: true,
     });

@@ -1186,10 +1186,14 @@ describe("history request slots alternate when a wake is deferred by the method 
  * passed this time".
  *
  * Status against GREEN3 `9ee7dbd7`:
- *  - RED (3), because discovery still sends `latest = A` and `oldest = B − allowance`:
+ *  - RED (5), because discovery still sends `latest = A` and `oldest = B − allowance` (none on the
+ *    historical lane):
  *     - a progressed post-split newest segment (S > L): oldest must be S;
  *     - a reclaim under a DIFFERENT allowance: oldest stays the frozen S on every page;
- *     - a noncanonical anchor: latest must be canonical U, not the raw A bytes.
+ *     - a noncanonical anchor: latest must be canonical U, not the raw A bytes;
+ *     - a literal newest U BELOW A: latest must be that U, which also kills `latest = canonical(A)`;
+ *     - a literal historical 0 < S ≤ U < A: oldest = S and latest = U, which kills an omitted oldest.
+ *    The last two answer every request with an empty page, so they fail only on the request.
  *  - Controls already covered elsewhere and unchanged: the historical S = 0 omission (seed-scan
  *    tests) and the exact-zero newest oldest (the clamped-allowance PA-3 test).
  * Every root is derived from the request's OWN bounds with the test's integer arithmetic.
@@ -1308,6 +1312,75 @@ describe("AIO-1170 §5: every history request carries the claim's frozen segment
     });
     // (A's byte preservation itself is proven at the claim, in the progress suite's packet 3.)
   });
+
+  /** The outbound request bounds, projected (bounds and flags only). */
+  const requestOf = (fake: SlackFake) =>
+    fake.calls.filter((call) => call.method === "conversations.history").slice(-1).map((call) => ({
+      oldest: call.params.get("oldest"), latest: call.params.get("latest"),
+      inclusive: call.params.get("inclusive"), cursor: call.params.get("cursor"),
+    }));
+
+  it("a newest segment whose stored U lies BELOW A (after an internal terminal) is requested at latest = literal U, never canonical(A)", async () => {
+    const seed = await seedTeam();
+    const integrationId = await setup(seed);
+    // Every response is empty, so the only thing under test is the outbound request.
+    const fake = pass(() => slackJson(historyBody({ messages: [] })));
+    const top = await certifiedChannel(seed, integrationId, fake);
+    // A valid progressed literal: A = top + 10 s, B = top, L = B − 60 s, S = top + 2 s, and
+    // U = top + 5 s < A (a terminal upper segment lowered it). C/H empty, G + 1.
+    const A = shiftTs(top, msToMicros(10_000));
+    const L = shiftTs(top, -msToMicros(DEFAULT_SKEW_ALLOWANCE_MS));
+    const S = shiftTs(top, msToMicros(2_000));
+    const U = shiftTs(top, msToMicros(5_000));
+    expect(tsMicros(U) < tsMicros(A) && tsMicros(S) <= tsMicros(U), "fixture: S ≤ U < A").toBe(true);
+    const c = await rawSql();
+    await c.query(
+      `update slack_sync_channels
+          set newest_anchor_ts = $2, newest_lower_ts = $3, newest_request_lower_ts = $4,
+              newest_segment_lower_ts = $5, newest_segment_upper_ts = $6,
+              newest_scan_generation = newest_scan_generation + 1, next_lane = 'newest'
+        where team_id = $1`,
+      [seed.teamId, A, top, L, S, U]
+    );
+    await elapse(seed.teamId);
+    const outcome = await settle(discover(seed, integrationId, fake));
+    expect({ outcome, request: requestOf(fake) }, "the active segment's literal U is the upper bound, not the envelope anchor").toEqual({
+      outcome: { categories: ["ok:"] },
+      request: [{ oldest: S, latest: U, inclusive: "true", cursor: null }],
+    });
+  });
+
+  it("a historical segment with literal 0 < S ≤ U < A is requested as oldest = S, latest = U, inclusive = true", async () => {
+    const seed = await seedTeam();
+    const integrationId = await setup(seed);
+    const fake = pass(() => slackJson(historyBody({ messages: [] })));
+    const top = await certifiedChannel(seed, integrationId, fake);
+    // A valid progressed historical literal resumed below the certified bottom:
+    //  - A = top, S = top − 20 s, U = top − 10 s, so 0 < S ≤ U < A;
+    //  - the completed-segments aggregate is top − 5 s, in (U, A];
+    //  - attempt-oldest null, C/H empty, G + 1, and the floor not yet reached.
+    const S = shiftTs(top, -msToMicros(20_000));
+    const U = shiftTs(top, -msToMicros(10_000));
+    const aggregate = shiftTs(top, -msToMicros(5_000));
+    expect(tsMicros(S) > BigInt(0) && tsMicros(S) <= tsMicros(U) && tsMicros(U) < tsMicros(top), "fixture: 0 < S ≤ U < A").toBe(true);
+    const c = await rawSql();
+    await c.query(
+      `update slack_sync_channels
+          set historical_anchor_ts = $2, historical_segment_lower_ts = $3, historical_segment_upper_ts = $4,
+              historical_completed_segments_oldest_ts = $5, historical_oldest_seen_ts = null,
+              historical_cursor = null, historical_cursor_history = '[]'::jsonb,
+              historical_scan_generation = historical_scan_generation + 1,
+              historical_floor_reached = false, next_lane = 'historical'
+        where team_id = $1`,
+      [seed.teamId, top, S, U, aggregate]
+    );
+    await elapse(seed.teamId);
+    const outcome = await settle(discover(seed, integrationId, fake));
+    expect({ outcome, request: requestOf(fake) }, "a historical segment above zero sends its own S and U").toEqual({
+      outcome: { categories: ["ok:"] },
+      request: [{ oldest: S, latest: U, inclusive: "true", cursor: null }],
+    });
+  });
 });
 
 // ── AIO-1170 packet 4c/4d: the L > A step end to end (DH-09), and page_outside_segment (DH-13) ───
@@ -1323,12 +1396,17 @@ describe("AIO-1170 §5: every history request carries the claim's frozen segment
  *       HTTP request, and every invalid candidate is transitioned exactly once.
  *    The unsent provider-budget refusal that KEEPS its turn is the contrast already pinned by
  *    "gives the newest lane the next real slot after a deferred wake".
- *  - 4d, page_outside_segment (5 tests):
- *     - RED (3): a non-root message above U on the historical lane; a root at S − 1 µs and a root at
- *       U + 1 µs on the newest lane. Today the first is accepted and certified, and the second two
- *       reach the state writer, which throws;
- *     - GREEN controls (2): exact S and U are accepted, and an out-of-range `thread_ts` is not
- *       range-filtered; malformed_timestamp precedes the range check.
+ *  - 4d, page_outside_segment (6 tests):
+ *     - RED (3), each requiring the exact step, no roots, release-only row changes, and a FULL
+ *       release with the turn passed to the opposite lane (claimed lane and lease expiry null):
+ *        - a non-root message above U on the historical lane;
+ *        - a root at S − 1 µs and a root at U + 1 µs on the newest lane. These use a deterministic
+ *          literal segment whose remainders keep each edge inside its bound's millisecond.
+ *       Today the first is accepted and certified, and the newest two reach the state writer, which
+ *       throws;
+ *     - GREEN controls (3): exact S and U are accepted and an out-of-range `thread_ts` is not
+ *       range-filtered; malformed_timestamp precedes the range check; pagination_incomplete precedes
+ *       the range check.
  *    The successor-safety part of the release is deferred to the implementation packet's two-session
  *    proof.
  */
@@ -1457,19 +1535,35 @@ describe("AIO-1170 DH-09 / DH-13: claim-local delay end to end, and the page ran
   const currentTeam = { id: "" };
   const at = (micros: bigint) => shiftTs("0.000000", micros);
 
-  /** Expect a refused-and-released page: the exact step, no roots, and only release bookkeeping moved. */
-  async function expectOutsideSegment(seed: Seed, outcome: unknown, inFlight: Record<string, unknown> | null, rootsBefore: string[]) {
+  /**
+   * Expect a refused-and-released page: the exact step, no roots, and only release bookkeeping moved.
+   * The release is FULL and the sent request's turn PASSED. `next_lane` is the exact opposite of the
+   * claimed lane, and the claimed lane, lease owner and lease expiry are all null.
+   */
+  async function expectOutsideSegment(
+    seed: Seed,
+    outcome: unknown,
+    inFlight: Record<string, unknown> | null,
+    rootsBefore: string[],
+    passedTurnTo: "newest" | "historical"
+  ) {
     const after = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
     expect({
       outcome,
       roots: await threadRootTs(seed.teamId),
       onlyRelease: JSON.stringify(without(after, RELEASE)) === JSON.stringify(without(inFlight, RELEASE)),
-      released: { lease: after?.lease_owner ?? null, error: after?.last_error_code ?? null },
-    }, "the whole page is refused before any root or state write; only the fenced claim is released").toEqual({
+      released: {
+        nextLane: after?.next_lane ?? null,
+        claimedLane: after?.claimed_lane ?? null,
+        lease: after?.lease_owner ?? null,
+        leaseExpiresAt: after?.lease_expires_at ?? null,
+        error: after?.last_error_code ?? null,
+      },
+    }, "the whole page is refused before any root or state write; only the fenced claim is released, turn passed").toEqual({
       outcome: { steps: [{ result: "delayed", category: "page_outside_segment", detail: OUTSIDE_DETAIL, channelId: CHANNEL }] },
       roots: rootsBefore,
       onlyRelease: true,
-      released: { lease: null, error: "page_outside_segment" },
+      released: { nextLane: passedTurnTo, claimedLane: null, lease: null, leaseExpiresAt: null, error: "page_outside_segment" },
     });
   }
 
@@ -1481,24 +1575,48 @@ describe("AIO-1170 DH-09 / DH-13: claim-local delay end to end, and the page ran
       messages: [rootMessage(at(upper)), rootMessage(at(upper + BigInt(1)), { thread_ts: at(upper) })],
     }));
     const outcome = await settle(discover(seed, integrationId, fake));
-    await expectOutsideSegment(seed, outcome, seen.inFlight, []);
+    // The claimed lane was historical, so the passed turn is newest.
+    await expectOutsideSegment(seed, outcome, seen.inFlight, [], "newest");
     expect(JSON.stringify(outcome), "no raw timestamp in the report").not.toMatch(/[0-9]{10}[.][0-9]{6}/);
   });
 
+  // DETERMINISTIC same-millisecond edges: a literal initialized newest segment, never clock-derived.
+  // S and U end in `.123456`, so S − 1 µs (`.123455`) and U + 1 µs (`.123457`) stay inside the SAME
+  // millisecond (remainders 456 ≠ 0 and 456 ≠ 999). No formatting or millisecond rounding can carry
+  // either edge back into range.
+  const EDGE = {
+    anchor: "1761000005.123456", lower: "1761000001.123456", requestLower: "1760999941.123456",
+    segmentLower: "1761000000.123456", segmentUpper: "1761000005.123456",
+  };
   it.each([
-    { label: "a root at S − 1 µs", root: (b: { lower: bigint; upper: bigint }) => b.lower - BigInt(1) },
-    { label: "a root at U + 1 µs (same millisecond as U)", root: (b: { lower: bigint; upper: bigint }) => b.upper + BigInt(1) },
-  ])("DH-13 RED: on the newest lane, $label refuses the whole page", async ({ root }) => {
+    { label: "a root at S − 1 µs (same millisecond as S)", bound: EDGE.segmentLower, delta: BigInt(-1), forbidden: BigInt(0) },
+    { label: "a root at U + 1 µs (same millisecond as U)", bound: EDGE.segmentUpper, delta: BigInt(1), forbidden: BigInt(999) },
+  ])("DH-13 RED: on the newest lane, $label refuses the whole page", async ({ bound, delta, forbidden }) => {
+    const edge = tsMicros(bound) + delta;
+    expect({
+      remainderSafe: tsMicros(bound) % BigInt(1_000) !== forbidden,
+      sameMillisecond: edge / BigInt(1_000) === tsMicros(bound) / BigInt(1_000),
+    }, "fixture: the edge stays inside its bound's millisecond").toEqual({ remainderSafe: true, sameMillisecond: true });
     const seed = await seedTeam();
     currentTeam.id = seed.teamId;
     const integrationId = await setup(seed);
-    const { fake, seen } = guardedPass((bounds, call) => historyBody({
-      messages: isCatchUp(call) ? [rootMessage(at(root(bounds)))] : [],
+    const { fake, seen } = guardedPass((_bounds, call) => historyBody({
+      messages: isCatchUp(call) ? [rootMessage(at(edge))] : [],
     }));
     await discover(seed, integrationId, fake); // initial historical, terminal and empty
+    // A valid literal initialized newest segment: L ≤ S ≤ U ≤ A, L ≤ B, C/H empty.
+    const c = await rawSql();
+    await c.query(
+      `update slack_sync_channels
+          set newest_anchor_ts = $2, newest_lower_ts = $3, newest_request_lower_ts = $4,
+              newest_segment_lower_ts = $5, newest_segment_upper_ts = $6, next_lane = 'newest'
+        where team_id = $1`,
+      [seed.teamId, EDGE.anchor, EDGE.lower, EDGE.requestLower, EDGE.segmentLower, EDGE.segmentUpper]
+    );
     await elapse(seed.teamId);
     const outcome = await settle(discover(seed, integrationId, fake));
-    await expectOutsideSegment(seed, outcome, seen.inFlight, []);
+    // The claimed lane was newest, so the passed turn is historical.
+    await expectOutsideSegment(seed, outcome, seen.inFlight, [], "historical");
   });
 
   it("DH-13 control: roots at EXACTLY S and U are accepted, and an out-of-range thread_ts is not range-filtered", async () => {
@@ -1533,5 +1651,29 @@ describe("AIO-1170 DH-09 / DH-13: claim-local delay end to end, and the page ran
     const result = await discover(seed, integrationId, fake);
     expect(historySteps(result).map((s) => s.category)).toEqual(["malformed_timestamp"]);
     expect(await threadRootTs(seed.teamId)).toEqual([]);
+  });
+
+  it("DH-13 control: pagination_incomplete (has_more with no cursor) still precedes the range check", async () => {
+    const seed = await seedTeam();
+    currentTeam.id = seed.teamId;
+    const integrationId = await setup(seed);
+    // The root lies OUTSIDE the segment (U + 1 µs), and the pagination contradiction must win anyway.
+    const { fake } = guardedPass(({ upper }) => historyBody({
+      messages: [rootMessage(at(upper + BigInt(1)))], hasMore: true, nextCursor: null,
+    }));
+    const result = await discover(seed, integrationId, fake);
+    const row = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    expect({
+      categories: historySteps(result).map((s) => `${s.result}:${s.category ?? ""}`),
+      roots: await threadRootTs(seed.teamId),
+      state: {
+        cursor: row?.historical_cursor ?? null, completedLower: row?.completed_lower_ts ?? null,
+        completedUpper: row?.completed_upper_ts ?? null, error: row?.last_error_code ?? null,
+      },
+    }, "a structurally contradictory page is refused for that reason, with nothing written").toEqual({
+      categories: ["delayed:pagination_incomplete"],
+      roots: [],
+      state: { cursor: null, completedLower: null, completedUpper: null, error: "pagination_incomplete" },
+    });
   });
 });
