@@ -214,16 +214,21 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *   - `page_outside_segment` (DH-13): 3 behavioral REDs and 3 precedence/edge controls;
  *   - the §9.1/§9.2 fixture corrections: FX-01–FX-13, the bootstrap progress inventory with its
  *     own-property and oracle checks, and the §9 census seed at `95c2e041`.
- *  CALLER TRANSACTION SEMANTICS, discovery suite packet 5 (6 behavioral REDs and 3 GREEN controls):
- *   - durable repetition: `delayed / cursor_repeated`, released in the same pass;
- *   - authority (lease or selection) beats an immediate repeat;
+ *  CALLER TRANSACTION SEMANTICS, discovery suite packet 5 (11 behavioral REDs and 3 GREEN controls),
+ *  plus 2 pure-validator REDs in `test/slack-source-discovery.test.ts`:
+ *   - repetition, durable and immediate: `delayed / cursor_repeated`, released in the same pass,
+ *     with identical detail and row effects;
+ *   - structural precedence over repetition: out-of-segment and malformed timestamps;
+ *   - authority beats repetition: a stale lease, a stale selection, or both (selection first);
+ *   - a lease that expires after the writer's real rejection but before the caller's release is
+ *     refused, not released;
  *   - wide subdivision: the writer's transition, with no caller release;
  *   - singleton unsplittable rejection;
  *   - acceptance BEFORE root enqueue, proved by a test-only insert trigger;
  *   - the single rollback boundary;
- *   - stale-release successor safety;
+ *   - a stale structural release under a successor (successor row exact);
  *   - the exact static details for each.
- *  Production GREEN for the six REDs is still pending.
+ *  Production GREEN for these REDs is still pending.
  * Also still deferred:
  *  - two-session claim/accept races;
  *  - the §3.4 maximum-history compatibility writers;

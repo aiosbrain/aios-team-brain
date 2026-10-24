@@ -95,13 +95,15 @@ describe("validateSlackHistoryPage", () => {
     }
   });
 
-  it("refuses a page whose paging cannot be continued or is looping", () => {
+  it("refuses a page whose paging cannot be continued; a repeated cursor is NOT a structural refusal", () => {
     expect(validateSlackHistoryPage(page({ hasMore: true, nextCursor: null }), { sentCursor: null })).toMatchObject(
       { ok: false, category: "pagination_incomplete" }
     );
-    expect(
-      validateSlackHistoryPage(page({ hasMore: true, nextCursor: "same" }), { sentCursor: "same" })
-    ).toMatchObject({ ok: false, category: "cursor_repeated" });
+    // AIO-1170 §3.2/§5: repetition is an ADMISSION decision, made inside the acceptance transaction
+    // AFTER selection and channel authority. An early structural "cursor_repeated" would let a stale
+    // claim report repetition instead of refusal, so the validator accepts this structurally valid
+    // page and leaves repetition to the writer.
+    expect(ok(validateSlackHistoryPage(page({ hasMore: true, nextCursor: "same" }), { sentCursor: "same" })).nextCursor).toBe("same");
   });
 
   it("refuses a page that offers a continuation cursor while saying, or omitting, that there is no more", () => {
@@ -156,13 +158,17 @@ describe("validateSlackHistoryPage", () => {
       expect(ok(withSegment(page({ messages: [{ ts: "0001718900001.5" }] }))).roots).toEqual(["0001718900001.5"]);
     });
 
-    it("keeps every structural refusal ahead of the range check", () => {
+    it("keeps every structural refusal ahead of the range check, and repetition out of structure entirely", () => {
       const outside = { ts: "1718900005.123457" };
+      // Structural order (§5): malformed_page, pagination_incomplete, malformed_timestamp, page_outside_segment.
       expect(withSegment({ hasMore: false, nextCursor: null })).toMatchObject({ category: "malformed_page" });
       expect(withSegment(page({ messages: [outside], hasMore: true, nextCursor: null }))).toMatchObject({ category: "pagination_incomplete" });
       expect(withSegment(page({ messages: [outside], hasMore: false, nextCursor: "page-2" }))).toMatchObject({ category: "pagination_incomplete" });
-      expect(withSegment(page({ messages: [outside], hasMore: true, nextCursor: "same" }), "same")).toMatchObject({ category: "cursor_repeated" });
       expect(withSegment(page({ messages: [outside, { ts: "not-a-timestamp" }] }))).toMatchObject({ category: "malformed_timestamp" });
+      // A repeated cursor never pre-empts a structural category: out of range is reported as such.
+      expect(withSegment(page({ messages: [outside], hasMore: true, nextCursor: "same" }), "same")).toEqual({ ok: false, category: "page_outside_segment" });
+      // …and a repeated cursor with a malformed timestamp is malformed_timestamp.
+      expect(withSegment(page({ messages: [{ ts: "not-a-timestamp" }], hasMore: true, nextCursor: "same" }), "same")).toMatchObject({ category: "malformed_timestamp" });
     });
 
     it("runs no range check when no segment is given (a direct structural check)", () => {
