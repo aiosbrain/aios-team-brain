@@ -1293,7 +1293,8 @@ describe("AIO-1170 §5: every history request carries the claim's frozen segment
       return slackJson(historyBody({ messages: [] }));
     });
     const top = await certifiedChannel(seed, integrationId, fake);
-    // A noncanonical anchor one and a half seconds above the top, with B = top (the all-null tuple).
+    // A noncanonical anchor (`<top seconds + 1>.5`) between 0.5 s and 1.5 s above the top, depending
+    // on the clock's fraction, with B = top (the all-null tuple).
     const seconds = BigInt(top.split(".")[0]) + BigInt(1);
     const rawA = `${seconds}.5`;
     const c = await rawSql();
@@ -1455,6 +1456,17 @@ describe("AIO-1170 DH-09 / DH-13: claim-local delay end to end, and the page ran
     return integrationId;
   }
 
+  /** This team's `conversations.history` budget rows (the same table FX-01 reads), as text values. */
+  async function historyBudgetRows(teamId: string): Promise<Record<string, unknown>[]> {
+    const c = await rawSql();
+    const { rows } = await c.query<Record<string, unknown>>(
+      `select to_jsonb(b)::text as row from slack_method_budgets b
+        where team_id = $1 and method = 'conversations.history' order by 1`,
+      [teamId]
+    );
+    return rows;
+  }
+
   /** A db client that COUNTS the L > A bookkeeping statements (a count only; no SQL text or value kept). */
   function countingDelays(counter: { delays: number }) {
     return transactionSessionDecoratedDb(db(), (session) => ({
@@ -1471,6 +1483,7 @@ describe("AIO-1170 DH-09 / DH-13: claim-local delay end to end, and the page ran
     const [only] = ids(1);
     const integrationId = await seededSelection(seed, [only], 1);
     const before = await channelRow(seed.teamId, WORKSPACE, only);
+    const budgetBefore = await historyBudgetRows(seed.teamId);
     const fake = pass(() => slackJson(historyBody({ messages: [] })));
     const counter = { delays: 0 };
     const result = await discover(seed, integrationId, fake, { client: countingDelays(counter) });
@@ -1479,13 +1492,16 @@ describe("AIO-1170 DH-09 / DH-13: claim-local delay end to end, and the page ran
       steps: historySteps(result),
       historyHttp: fake.countOf("conversations.history"),
       delays: counter.delays,
+      // DIRECT no-reservation evidence: the history method's budget rows are exactly as before.
+      budgetUnchanged: JSON.stringify(await historyBudgetRows(seed.teamId)) === JSON.stringify(budgetBefore),
       certificate: [after?.completed_lower_ts, after?.completed_upper_ts, after?.historical_floor_reached],
       lease: [after?.lease_owner, after?.claimed_lane, Number(after?.attempts), Number(after?.lease_generation)],
       turn: after?.next_lane,
-    }, "a local delay sends nothing and moves only its bookkeeping").toEqual({
+    }, "a local delay sends nothing, reserves nothing and moves only its bookkeeping").toEqual({
       steps: [{ result: "delayed", category: "scan_bounds_invalid", detail: SCAN_BOUNDS_DETAIL, channelId: only }],
       historyHttp: 0,
       delays: 1,
+      budgetUnchanged: true,
       certificate: [before?.completed_lower_ts, before?.completed_upper_ts, before?.historical_floor_reached],
       lease: [null, null, Number(before?.attempts), Number(before?.lease_generation)],
       turn: "historical",
@@ -1508,7 +1524,10 @@ describe("AIO-1170 DH-09 / DH-13: claim-local delay end to end, and the page ran
       last: steps.at(-1),
       historyHttp: fake.countOf("conversations.history"),
       delays: counter.delays,
-      invalidCertificatesUnchanged: rows.every((row) => row?.completed_upper_ts === "4102444800.000000" && row?.lease_owner === null),
+      // All three certificate fields exactly as seeded, and no lease left behind.
+      invalidCertificatesUnchanged: rows.every((row) =>
+        row?.completed_lower_ts === "1718800000.000001" && row?.completed_upper_ts === "4102444800.000000"
+        && row?.historical_floor_reached === true && row?.lease_owner === null),
     }, "every invalid candidate is transitioned once and the eligible one is read in the same bounded pass").toEqual({
       delayedSteps: 51,
       delayedChannels: 51,
@@ -1580,12 +1599,14 @@ describe("AIO-1170 DH-09 / DH-13: claim-local delay end to end, and the page ran
     expect(JSON.stringify(outcome), "no raw timestamp in the report").not.toMatch(/[0-9]{10}[.][0-9]{6}/);
   });
 
-  // DETERMINISTIC same-millisecond edges: a literal initialized newest segment, never clock-derived.
+  // DETERMINISTIC same-millisecond edges: a literal PROGRESSED newest segment, never clock-derived.
   // S and U end in `.123456`, so S − 1 µs (`.123455`) and U + 1 µs (`.123457`) stay inside the SAME
   // millisecond (remainders 456 ≠ 0 and 456 ≠ 999). No formatting or millisecond rounding can carry
   // either edge back into range.
+  // U lies strictly BELOW A (`1761000010.123456`), so U + 1 µs is still inside [S, A]. A guard that
+  // validated against the anchor A instead of the segment upper U would accept it, and is killed.
   const EDGE = {
-    anchor: "1761000005.123456", lower: "1761000001.123456", requestLower: "1760999941.123456",
+    anchor: "1761000010.123456", lower: "1761000001.123456", requestLower: "1760999941.123456",
     segmentLower: "1761000000.123456", segmentUpper: "1761000005.123456",
   };
   it.each([
@@ -1604,12 +1625,15 @@ describe("AIO-1170 DH-09 / DH-13: claim-local delay end to end, and the page ran
       messages: isCatchUp(call) ? [rootMessage(at(edge))] : [],
     }));
     await discover(seed, integrationId, fake); // initial historical, terminal and empty
-    // A valid literal initialized newest segment: L ≤ S ≤ U ≤ A, L ≤ B, C/H empty.
+    // A valid literal PROGRESSED newest segment, as a split (S > L) and a terminal upper segment
+    // (U < A) would leave it, each incrementing G: L ≤ S ≤ U < A, L ≤ B, C/H empty, G + 1.
+    expect(tsMicros(EDGE.segmentUpper) + BigInt(1) <= tsMicros(EDGE.anchor), "fixture: U + 1 µs is still at or below A").toBe(true);
     const c = await rawSql();
     await c.query(
       `update slack_sync_channels
           set newest_anchor_ts = $2, newest_lower_ts = $3, newest_request_lower_ts = $4,
-              newest_segment_lower_ts = $5, newest_segment_upper_ts = $6, next_lane = 'newest'
+              newest_segment_lower_ts = $5, newest_segment_upper_ts = $6,
+              newest_scan_generation = newest_scan_generation + 1, next_lane = 'newest'
         where team_id = $1`,
       [seed.teamId, EDGE.anchor, EDGE.lower, EDGE.requestLower, EDGE.segmentLower, EDGE.segmentUpper]
     );
@@ -1658,21 +1682,26 @@ describe("AIO-1170 DH-09 / DH-13: claim-local delay end to end, and the page ran
     currentTeam.id = seed.teamId;
     const integrationId = await setup(seed);
     // The root lies OUTSIDE the segment (U + 1 µs), and the pagination contradiction must win anyway.
-    const { fake } = guardedPass(({ upper }) => historyBody({
+    const { fake, seen } = guardedPass(({ upper }) => historyBody({
       messages: [rootMessage(at(upper + BigInt(1)))], hasMore: true, nextCursor: null,
     }));
     const result = await discover(seed, integrationId, fake);
     const row = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
     expect({
       categories: historySteps(result).map((s) => `${s.result}:${s.category ?? ""}`),
+      details: historySteps(result).map((s) => s.detail),
       roots: await threadRootTs(seed.teamId),
+      // Against the in-flight (claimed) row: nothing outside the release bookkeeping moved.
+      onlyRelease: seen.inFlight !== null && JSON.stringify(without(row, RELEASE)) === JSON.stringify(without(seen.inFlight, RELEASE)),
       state: {
         cursor: row?.historical_cursor ?? null, completedLower: row?.completed_lower_ts ?? null,
         completedUpper: row?.completed_upper_ts ?? null, error: row?.last_error_code ?? null,
       },
     }, "a structurally contradictory page is refused for that reason, with nothing written").toEqual({
       categories: ["delayed:pagination_incomplete"],
+      details: ["The page could not be read in full, so nothing from it was enqueued or certified."],
       roots: [],
+      onlyRelease: true,
       state: { cursor: null, completedLower: null, completedUpper: null, error: "pagination_incomplete" },
     });
   });

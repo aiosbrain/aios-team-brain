@@ -263,11 +263,18 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *    remainder, DH-03);
  *  - subdivision, the S > L internal terminal, and segment application (DH-01/02/03/04/05).
  *    Claim-time initialization is covered by packet 2 (historical) and packet 3 (newest, including
- *    the L > A typed delay). Only the discovery/caller side of initialization remains deferred;
- *  - discovery's structural validation order, root-enqueue atomicity/rollback, and static detail
- *    messages;
+ *    the L > A typed delay);
+ *  - OUTSIDE THIS FILE, covered by the caller packet in other suites (still RED where production is
+ *    pending):
+ *     - the discovery/caller side of initialization and request bounds (S/U `oldest`/`latest`);
+ *     - discovery's structural validation order before `page_outside_segment`, with its static
+ *       details;
+ *     - DH-09 same-pass scheduling/fairness, including the default-50 boundary and no reservation;
+ *    all in `slack-source-discovery.datamechanics.test.ts`. The §9.1/§9.2 fixture corrections are in
+ *    the discovery, fences and bootstrap suites;
+ *  - still deferred everywhere: root-enqueue atomicity/rollback with acceptance BEFORE enqueue, and
+ *    the rejected/subdivided/refused caller handling;
  *  - the §3.4 maximum-history compatibility writers;
- *  - the §9.1/§9.2 fixture corrections; DH-09 scheduling/fairness;
  *  - the full DH-11/12/13 matrices and the controlled mutants;
  *  - end-to-end composition (runner → discovery → state → timeline).
  */
