@@ -152,14 +152,14 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *   - initialize an ineligible row.
  *
  * PACKET 3 — CLAIM-TIME SEGMENT INITIALIZATION, NEWEST LANE (11 tests, appended after packet 2; §4,
- * §5). Each test calls `claimSlackChannelPage` directly with a configured `skewAllowanceMs`. The option
- * travels in a non-literal object, so the file compiles against today's signature, which ignores it.
- * The option NAME is this packet's choice, matching discovery's existing `skewAllowanceMs`; the
- * contract requires only that the claim use the configured allowance. Expected L always comes from
- * the test's own BigInt oracle (`boundMinusAllowance`), never from product code. "Today" is GREEN2
- * production `a2dc9167`, unchanged through test-only checkpoint `8fcb4e3b`, where packets 1–2 are
- * 47/47 GREEN. The file therefore totals 58: 6 RED, 52 GREEN.
- *  - RED today (6), because today's claim initializes no newest segment and has no typed delay:
+ * §5). Each test calls `claimSlackChannelPage` directly with a configured `skewAllowanceMs`, the
+ * claim's validated option (default 60,000 ms). Expected L always comes from the test's own BigInt
+ * oracle (`boundMinusAllowance`), never from product code. The delay is read from `unknown`; the
+ * claim's declared result is the union `SlackChannelClaim | SlackChannelClaimDelay | null`.
+ * STATUS: RED3 (6 RED, 52 GREEN, 58 total) against GREEN2 production `a2dc9167`, at test checkpoint
+ * `33ea6693`. GREEN3 is the claim writer's newest initialization plus its claim-local L > A delay:
+ * all 58 are expected GREEN.
+ *  - formerly RED (6), the GREEN3 behaviors:
  *     - ×2: the first newest claim freezes B by the existing rule (the certified top) and sets
  *       L = S = max(0, B − allowance) and U = A, with cursor null, history empty and G unchanged.
  *       One allowance is 90 s; the other is larger than the epoch and clamps to `0.000000`. Each
@@ -480,7 +480,9 @@ const seedWideSegment = (history: string[]) => seedChannel("wide", history);
 const seedSingletonSegment = (history: string[]) => seedChannel("singleton", history);
 
 async function claimHistorical({ scope, integrationId }: Seeded): Promise<SlackChannelClaim> {
-  const claim = await tx((session) => claimSlackChannelPage(session, scope, { bindingIntegrationId: integrationId, bindingConfigRevision: REVISION }));
+  const result = await tx((session) => claimSlackChannelPage(session, scope, { bindingIntegrationId: integrationId, bindingConfigRevision: REVISION }));
+  // The claim result is a union (claim | typed delay | null); only a real claim carries a lane.
+  const claim = result !== null && !("outcome" in result) ? result : null;
   expect({ claimed: claim !== null, lane: claim?.lane, generation: claim?.scanGeneration }, "fixture: the historical lane is claimed at generation 4").toEqual({
     claimed: true, lane: "historical", generation: 4,
   });
@@ -961,7 +963,8 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
     const successor = await tx((session) => claimSlackChannelPage(session, seeded.scope, {
       bindingIntegrationId: seeded.integrationId, bindingConfigRevision: REVISION,
     }));
-    expect(successor !== null && successor.lane === "historical", "fixture: a successor reclaims the expired historical lease").toBe(true);
+    expect(successor !== null && !("outcome" in successor) && successor.lane === "historical",
+      "fixture: a successor reclaims the expired historical lease").toBe(true);
   };
 
   it.each([
@@ -1351,15 +1354,21 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
   ])("§5 newest init: candidate L > A ($label) is typed delayed / scan_bounds_invalid; no lease, attempt, anchor, generation, progress or certificate moves", async ({ over }) => {
     const { scope, integrationId } = await seedNewestCandidate(over);
     const before = await rowDigestExcept(scope, L_ABOVE_A_PERMITTED);
+    // Database-clock bounds taken immediately around the claim's own transaction.
+    const clockBefore = await dbClockText();
     const result = await claimNewest(scope, integrationId, 60_000);
+    const clockAfter = await dbClockText();
     expect({
       outcome: typedOutcome(result),
       unchanged: (await rowDigestExcept(scope, L_ABOVE_A_PERMITTED)) === before,
-      bookkeeping: await delayBookkeeping(scope),
-    }, "only next_lane (to the opposite lane), the diagnostic, due_at and updated_at may change").toEqual({
+      bookkeeping: await delayBookkeeping(scope, clockBefore, clockAfter),
+    }, "only next_lane (to the opposite lane), the diagnostic, due_at and updated_at may change, the last two to the DB clock").toEqual({
       outcome: { outcome: "delayed", category: "scan_bounds_invalid", detail: "The scan bounds are inconsistent; no provider request was sent." },
       unchanged: true,
-      bookkeeping: { next_lane: "historical", last_error_code: "scan_bounds_invalid", lease_absent: true, due_now: true },
+      bookkeeping: {
+        next_lane: "historical", last_error_code: "scan_bounds_invalid", lease_absent: true,
+        due_in_window: true, updated_in_window: true,
+      },
     });
   });
 
@@ -1572,13 +1581,22 @@ async function newestInitFacts(scope: SlackChannelScope, expected: { anchor: str
   )).rows[0]);
 }
 
-/** The L > A bookkeeping (§5): the opposite turn, the diagnostic, no lease, and due at the DB clock. */
-async function delayBookkeeping(scope: SlackChannelScope) {
+/** The database clock, as full-precision timestamptz text (never parsed in JavaScript). */
+async function dbClockText(): Promise<string> {
+  return tx(async (session) => (await session.executeSql<{ now: string }>(`select clock_timestamp()::text as now`)).rows[0].now);
+}
+
+/**
+ * The L > A bookkeeping (§5): the opposite turn, the diagnostic and no lease. due_at and updated_at
+ * must each lie inside the database-clock window taken around the claim, as booleans.
+ */
+async function delayBookkeeping(scope: SlackChannelScope, clockBefore: string, clockAfter: string) {
   return tx(async (session) => (await session.executeSql<Record<string, unknown>>(
     `select next_lane, last_error_code,
             lease_owner is null and lease_expires_at is null and claimed_lane is null as lease_absent,
-            due_at > clock_timestamp() - interval '1 hour' and due_at <= clock_timestamp() as due_now
+            due_at between $4::timestamptz and $5::timestamptz as due_in_window,
+            updated_at between $4::timestamptz and $5::timestamptz as updated_in_window
        from slack_sync_channels where team_id = $1 and workspace_id = $2 and channel_id = $3`,
-    [scope.teamId, scope.workspaceId, scope.channelId]
+    [scope.teamId, scope.workspaceId, scope.channelId, clockBefore, clockAfter]
   )).rows[0]);
 }

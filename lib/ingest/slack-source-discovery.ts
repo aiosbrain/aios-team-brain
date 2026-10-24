@@ -872,11 +872,26 @@ async function readOnePage(
       return claimSlackChannelPage(session, state.scope, {
         bindingIntegrationId: selection.integrationId,
         bindingConfigRevision: ref.configRevision,
+        // The SAME validated allowance the pass uses: it freezes a newest scan's request lower once.
+        skewAllowanceMs: pass.options.skewAllowanceMs ?? SLACK_SKEW_ALLOWANCE_MS,
         ...(pass.options.leaseMs === undefined ? {} : { leaseMs: pass.options.leaseMs }),
       });
     });
     // Not due, or somebody else's live claim: try the next channel, in `(due_at, channel_id)` order.
     if (!claim) continue;
+    if ("outcome" in claim) {
+      // An eligible channel whose newest first segment would be empty (§5). The writer already passed
+      // the turn and recorded why. No request was reserved or sent, so this pass moves on to the
+      // next selected channel; it does not come back to this one.
+      step(pass, {
+        stage: "history",
+        result: "delayed",
+        category: claim.category,
+        detail: claim.detail,
+        channelId: state.scope.channelId,
+      });
+      continue;
+    }
 
     await fetchAndAccept(pass, selection, ref, bound, claim);
     return;

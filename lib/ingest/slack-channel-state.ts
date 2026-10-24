@@ -133,6 +133,23 @@ export interface SlackChannelClaim {
 }
 
 /**
+ * A claim that was ELIGIBLE but could not start, because the newest lane's first segment would be
+ * empty (L > A, §5). Nothing was leased and no request may be sent. The writer has already passed the
+ * turn and recorded the diagnostic; the caller reports this static result and moves on.
+ */
+export interface SlackChannelClaimDelay {
+  readonly outcome: "delayed";
+  readonly category: "scan_bounds_invalid";
+  readonly detail: "The scan bounds are inconsistent; no provider request was sent.";
+}
+
+const SCAN_BOUNDS_INVALID: SlackChannelClaimDelay = {
+  outcome: "delayed",
+  category: "scan_bounds_invalid",
+  detail: "The scan bounds are inconsistent; no provider request was sent.",
+};
+
+/**
  * Ownership of ONE metadata observation of one channel.
  *
  * ⚠️ IT IS AN ORDERING FENCE, NOT A LEASE. It does not stop a second observation from starting —
@@ -193,6 +210,10 @@ const MAX_HISTORY_BYTES = 1_048_576;
 const MICROS_PER_SECOND = BigInt(1_000_000);
 const ONE_TICK = BigInt(1);
 const TWO = BigInt(2);
+/** The newest lane's default skew allowance (PA-3), for callers that configure none. */
+const DEFAULT_SKEW_ALLOWANCE_MS = 60_000;
+/** The largest supported bound (§4), in microsecond ticks: 253402300799.999999. */
+const MAX_BOUND_TICKS = BigInt(253_402_300_799) * BigInt(1_000_000) + BigInt(999_999);
 /** An exact Slack/bound instant: integer seconds (at most 12 significant digits) and 1–6 fraction digits. */
 const EXACT_INSTANT = /^([0-9]+)\.([0-9]{1,6})$/;
 const ERROR_CODE = /^[a-z][a-z0-9_]{0,39}$/;
@@ -554,12 +575,25 @@ export async function delaySlackChannel(
 
 /**
  * Claim this channel's next history request: pick the lane, freeze the scan's anchor if it is
- * starting, give a HISTORICAL lane that has no segment yet its first one (`[0, canonical(A)]`), and
- * take the lease — all in ONE conditional statement.
+ * starting, give a lane that has no segment yet its first one, and take the lease.
  *
- * Newest-lane segment initialization (L = max(0, B − skew allowance)) is not here yet: it needs the
- * configured allowance, which this writer does not receive. A newest lane is still claimed
- * unsegmented, and its terminal page is accepted as before.
+ * TWO statements, in the caller's transaction and under ONE row lock:
+ *  1. A locking read, under every ordinary eligibility predicate. It reads the lane and the bound
+ *     values the newest initialization needs. No row means not eligible: nothing is written.
+ *  2. Either the claim UPDATE, or the §5 `scan_bounds_invalid` bookkeeping.
+ *
+ * First segments (§5), set only for a lane whose whole segment tuple is still the all-null
+ * initialization shape:
+ *  - historical: `[0, canonical(A)]`;
+ *  - newest: `[L, canonical(A)]`, with request lower `L = max(0, B − skew allowance)`, computed in
+ *    exact microsecond ticks. A and B keep their bytes; only the bounds are canonical.
+ * An existing segment, however progressed, is resumed untouched whatever allowance is passed now.
+ *
+ * If a newest first segment would be empty (L > A), nothing is leased. The turn passes to historical,
+ * the diagnostic is recorded, due_at and updated_at move to the DB clock, and the typed
+ * `SlackChannelClaimDelay` is returned. No attempt, lease generation, anchor, progress or certificate
+ * moves; an anchor that already existed keeps its bytes. Stored bounds outside the supported exact
+ * domain fail closed with a static error that quotes no value.
  *
  * The lane rule, and why it is here rather than in a caller: the newest lane is always pending
  * (there is always more "now"), the historical lane is pending until it reaches the retention floor
@@ -579,8 +613,8 @@ export async function delaySlackChannel(
 export async function claimSlackChannelPage(
   session: TransactionSession,
   scope: SlackChannelScope,
-  opts: { leaseMs?: number; bindingIntegrationId: string; bindingConfigRevision: string }
-): Promise<SlackChannelClaim | null> {
+  opts: { leaseMs?: number; bindingIntegrationId: string; bindingConfigRevision: string; skewAllowanceMs?: number }
+): Promise<SlackChannelClaim | SlackChannelClaimDelay | null> {
   assertScope(scope);
   const leaseMs = opts.leaseMs ?? SLACK_CHANNEL_LEASE_MS;
   if (!Number.isSafeInteger(leaseMs) || leaseMs < MIN_LEASE_MS || leaseMs > MAX_LEASE_MS) {
@@ -594,24 +628,87 @@ export async function claimSlackChannelPage(
   if (!REVISION.test(opts.bindingConfigRevision)) {
     throw new SlackChannelStateError("bindingConfigRevision must be a sha256 hex digest");
   }
+  const skewAllowanceMs = opts.skewAllowanceMs ?? DEFAULT_SKEW_ALLOWANCE_MS;
+  if (!Number.isSafeInteger(skewAllowanceMs) || skewAllowanceMs <= 0) {
+    throw new SlackChannelStateError("skewAllowanceMs must be a positive whole number of milliseconds");
+  }
 
+  // 1. The locking read, under EVERY ordinary eligibility predicate, so an ineligible row is neither
+  //    claimed, initialized nor delayed. `for update` holds the row until this transaction ends.
+  const locked = single(
+    await session.executeSql<LockedClaimRow>(
+      `select case
+                -- THE INITIAL SCAN, whatever next_lane says: nothing is certified, nothing is
+                -- provisionally read and no anchor exists, so there is no boundary a catch-up could
+                -- run above. This is the anchored scan that covers all retained history.
+                when completed_upper_ts is null
+                     and newest_catchup_upper_ts is null
+                     and historical_anchor_ts is null
+                  then 'historical'
+                when next_lane = 'newest' then 'newest'
+                when not historical_floor_reached
+                     and (historical_anchor_ts is not null or completed_lower_ts is not null)
+                  then 'historical'
+                else 'newest'
+              end as lane,
+              newest_anchor_ts,
+              -- B as the claim UPDATE below freezes it: kept if the lane is anchored, else the top
+              -- of whatever is already read.
+              case when newest_anchor_ts is null
+                   then coalesce(completed_upper_ts, newest_catchup_upper_ts, historical_anchor_ts)
+                   else newest_lower_ts end as newest_lower,
+              (newest_request_lower_ts is null and newest_segment_lower_ts is null and newest_segment_upper_ts is null
+               and newest_cursor is null and newest_cursor_history = '[]'::pg_catalog.jsonb) as newest_uninitialized,
+              ${CLOCK_ANCHOR_TS} as clock_anchor
+         from slack_sync_channels
+        where ${SCOPE_PREDICATE}
+          and public_state = 'public'
+          and binding_integration_id = $4::uuid
+          and binding_config_revision = $5
+          and due_at <= clock_timestamp()
+          and (lease_owner is null or lease_expires_at <= clock_timestamp())
+          for update`,
+      [...scopeParams(scope), opts.bindingIntegrationId, opts.bindingConfigRevision]
+    )
+  );
+  if (!locked) return null;
+  const candidateLane = assertLane(locked.lane);
+
+  // The newest first segment, in exact ticks (§5), only for an all-null newest tuple.
+  let newestFirstSegment: { lower: string; upper: string } | null = null;
+  if (candidateLane === "newest" && locked.newest_uninitialized === true) {
+    const anchor = boundTicks(locked.newest_anchor_ts ?? locked.clock_anchor);
+    const logicalLower = boundTicks(locked.newest_lower);
+    if (anchor === null || logicalLower === null) {
+      throw new SlackChannelStateError(
+        "the newest lane's stored bounds are not exact supported timestamps — refusing to claim it"
+      );
+    }
+    const allowance = BigInt(skewAllowanceMs) * BigInt(1_000);
+    const requestLower = logicalLower > allowance ? logicalLower - allowance : BigInt(0);
+    if (requestLower > anchor) {
+      // 2b. L > A: an empty envelope. Pass the turn, record why, and lease nothing.
+      const delayed = await session.executeSql(
+        `update slack_sync_channels
+            set next_lane = 'historical',
+                last_error_code = 'scan_bounds_invalid',
+                due_at = clock_timestamp(),
+                updated_at = clock_timestamp()
+          where ${SCOPE_PREDICATE}`,
+        scopeParams(scope)
+      );
+      if (delayed.rowCount !== 1) {
+        throw new SlackChannelStateError("the locked channel row is gone — refusing to report a delay for it");
+      }
+      return SCAN_BOUNDS_INVALID;
+    }
+    newestFirstSegment = { lower: canonicalBound(requestLower), upper: canonicalBound(anchor) };
+  }
+
+  // 2a. The claim, on the locked row, under the same predicates, with the lane already chosen.
   const result = await session.executeSql<StateRow & LaneBoundRow & { lane: string }>(
     `with candidate as (
-        select id,
-               case
-                 -- THE INITIAL SCAN, whatever next_lane says: nothing is certified, nothing is
-                 -- provisionally read and no anchor exists, so there is no boundary a catch-up could
-                 -- run above. This is the anchored scan that covers all retained history.
-                 when completed_upper_ts is null
-                      and newest_catchup_upper_ts is null
-                      and historical_anchor_ts is null
-                   then 'historical'
-                 when next_lane = 'newest' then 'newest'
-                 when not historical_floor_reached
-                      and (historical_anchor_ts is not null or completed_lower_ts is not null)
-                   then 'historical'
-                 else 'newest'
-               end as lane
+        select id, $7::text as lane
           from slack_sync_channels
          where ${SCOPE_PREDICATE}
       )
@@ -622,10 +719,18 @@ export async function claimSlackChannelPage(
              lease_expires_at = clock_timestamp() + ($6::double precision * interval '1 millisecond'),
              attempts = c.attempts + 1,
              -- Freeze the anchor ONLY when the lane's scan is starting; a resumed scan keeps the
-             -- upper bound it was anchored at, or its pages would come from a moving window.
+             -- upper bound it was anchored at, or its pages would come from a moving window. A new
+             -- one is the clock value the locking read saw, so the first segment's U matches it.
              newest_anchor_ts = case
-               when candidate.lane = 'newest' then coalesce(c.newest_anchor_ts, ${CLOCK_ANCHOR_TS})
+               when candidate.lane = 'newest' then coalesce(c.newest_anchor_ts, $8::text)
                else c.newest_anchor_ts end,
+             -- §5 NEWEST INITIALIZATION: [L, canonical(A)], computed above from the locked row.
+             newest_request_lower_ts = case
+               when candidate.lane = 'newest' and $9::boolean then $10::text else c.newest_request_lower_ts end,
+             newest_segment_lower_ts = case
+               when candidate.lane = 'newest' and $9::boolean then $10::text else c.newest_segment_lower_ts end,
+             newest_segment_upper_ts = case
+               when candidate.lane = 'newest' and $9::boolean then $11::text else c.newest_segment_upper_ts end,
              -- A starting catch-up begins at the top of whatever is ALREADY fully read: the
              -- certified interval, else the provisional catch-up top, else the initial anchor. The
              -- three are tried in that order because that is the order they supersede each other in.
@@ -646,7 +751,9 @@ export async function claimSlackChannelPage(
              -- historical lane whose WHOLE segment tuple is still the all-null initialization shape gets
              -- its first segment [L = 0, U = canonical(A)]. Any existing segment, whether fresh,
              -- split, lowered by a terminal segment or carrying a cursor, is resumed untouched. The
-             -- cursor, history, attempt-oldest, aggregate and generation are never written here.
+             -- cursor, history, aggregate and generation are never written here. Attempt-oldest is
+             -- written only by the reset above, to null, when a NEW historical envelope starts (no
+             -- anchor yet).
              historical_segment_lower_ts = case
                when candidate.lane = 'historical' and ${HISTORICAL_SEGMENT_UNINITIALIZED} then '0.000000'
                else c.historical_segment_lower_ts end,
@@ -663,7 +770,17 @@ export async function claimSlackChannelPage(
          and c.due_at <= clock_timestamp()
          and (c.lease_owner is null or c.lease_expires_at <= clock_timestamp())
    returning candidate.lane, ${STATE_COLUMNS}, ${LANE_BOUND_COLUMNS}`,
-    [...scopeParams(scope), opts.bindingIntegrationId, opts.bindingConfigRevision, leaseMs]
+    [
+      ...scopeParams(scope),
+      opts.bindingIntegrationId,
+      opts.bindingConfigRevision,
+      leaseMs,
+      candidateLane,
+      locked.clock_anchor,
+      newestFirstSegment !== null,
+      newestFirstSegment?.lower ?? null,
+      newestFirstSegment?.upper ?? null,
+    ]
   );
 
   const row = single(result);
@@ -1145,6 +1262,24 @@ function exactTicks(value: string | null): bigint | null {
   const seconds = match[1].replace(/^0+(?=[0-9])/, "");
   if (seconds.length > 12) return null;
   return BigInt(seconds) * MICROS_PER_SECOND + BigInt(match[2].padEnd(6, "0"));
+}
+
+/**
+ * Exact ticks of a stored instant that may become a bound, or null if it is absent, malformed or above
+ * the supported maximum (§4). The caller turns null into a STATIC error; the value is never quoted.
+ */
+function boundTicks(value: string | null): bigint | null {
+  const ticks = exactTicks(value);
+  return ticks !== null && ticks <= MAX_BOUND_TICKS ? ticks : null;
+}
+
+/** What the claim's locking read returns: the lane, and the stored values the newest bounds come from. */
+interface LockedClaimRow {
+  lane: string;
+  newest_anchor_ts: string | null;
+  newest_lower: string | null;
+  newest_uninitialized: boolean | null;
+  clock_anchor: string;
 }
 
 /** The canonical bound spelling (§4): seconds without leading zeroes, a dot, exactly six digits. */
