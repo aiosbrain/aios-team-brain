@@ -233,26 +233,33 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *  Production GREEN for these REDs is still pending.
  *  (Packet 5 is GREEN since `f556163d`.)
  *  ACTUAL PROVIDER `invalid_cursor` (§5, DH-03/DH-05/DH-07/DH-13, F2-08/F2-11), RED against `f556163d`:
- *   - this file, packet 6a (14 tests: 6 REDs and 8 GREEN controls). The SAME `restartSlackChannelScan`
- *     export, with its result leak-checked through `project`, must return:
- *      - `subdivided` on a PROGRESSED wide segment (S 1718900100, U 1718900300 < A, aggregate
- *        1718900350, attempt-oldest 1718900200): S' = 1718900200.000001 by the test's own oracle, U
- *        kept, aggregate byte-identical, attempt-oldest cleared (RED);
- *      - `restarted` on a PROGRESSED singleton (S = U = 1718900300 < A) (RED);
- *      - typed `refused`, with the live row exact, across the complete fence, 12 rows:
+ *   - this file, packet 6a (15 tests: 6 REDs and 9 GREEN controls). The SAME `restartSlackChannelScan`
+ *     export, with its result leak-checked through `project` against a LIVE older H entry, must
+ *     return:
+ *      - `subdivided` on a constructed progressed wide segment (S 1718900100, U 1718900300 < A,
+ *        aggregate 1718900350, attempt-oldest 1718900200): S' = 1718900200.000001 by the test's own
+ *        oracle, U kept, aggregate byte-identical, attempt-oldest cleared (RED);
+ *      - `restarted` on a constructed progressed singleton (S = U = 1718900300 < A) (RED);
+ *      - typed `refused`, with the live row exact, across the complete one-predicate fence, 13 rows:
  *         - segment S moved, segment U moved, public revoked and binding integration changed: RED,
  *           because today's restart fence omits them;
- *         - binding revision, lease expiry, successor reclaim, lease generation, claimed lane, scan
- *           generation, cursor and anchor drift: GREEN controls;
+ *         - binding revision, lease expiry, successor reclaim, lease generation alone, lease owner
+ *           alone, claimed lane, scan generation, cursor and anchor drift: GREEN controls;
  *   - the discovery suite, packet 6 (8 REDs and 1 GREEN control):
- *      - wide midpoint subdivision, for a PROGRESSED C ≠ null and for C = null, with the
+ *      - wide midpoint subdivision, for a constructed progressed C ≠ null and for C = null, with the
  *        subdivision detail;
- *      - singleton same-range restart, for a PROGRESSED C ≠ null and for C = null, with the singleton
- *        detail, still pending and with no local retry;
+ *      - singleton same-range restart, for a constructed progressed C ≠ null and for C = null, with
+ *        the singleton detail, still pending and with no local retry;
+ *      - for the wide, singleton and 6.5 cases, proof that selection authority and the transition (or
+ *        its refusing fence) ran on ONE transaction session;
  *      - stale selection, stale lease and both, each refused before any transition (selection first);
  *      - a lease expiring after the selection lock inside the invalid_cursor transaction (6.5);
  *      - control 6.4: the writer's own `refused` from the acceptance transaction, injected after the
  *        caller's channel lock.
+ *   NOT pinned by packet 6:
+ *      - the restart writer's own locked stored-state validity;
+ *      - an expiry between the restart writer's own locking read and its UPDATE;
+ *      - the NEWEST lane's invalid_cursor transitions.
  * Also still deferred:
  *  - two-session claim/accept races;
  *  - the §3.4 maximum-history compatibility writers;
@@ -286,13 +293,16 @@ import { requireIsolatedTestUrl } from "./slack-history-isolated-url";
  *  - F2-03 (cursor grammar, length and round-trip edges, and malformed direct arrays);
  *  - F2-07 (lane-local pending across later events) and F2-08 (real recovery and turn handling);
  *  - DH-07 (crash, receipt loss and rollback) and DH-10 (the PA-3 margin surviving subdivision);
- *  - the actual provider invalid_cursor restart and subdivision variants;
+ *  - the NEWEST lane's actual provider invalid_cursor variants (the historical lane's are packet 6/6a);
  *  - PostgreSQL-vs-JavaScript serialization difference evidence (F2-05 remainder);
  *  - repetition at the BYTE cap (repetition is covered here only at the entry cap);
  *  - stored-state fail-closed validation of a malformed or inconsistent persisted H;
- *  - two-session races and expiry between lock and write; stale-release successor protection;
- *  - the remaining fence predicates: claimed_lane, lease_generation alone, anchor drift, the
- *    caller's selection/config/token authority, and `lockSlackChannelForAcceptance`;
+ *  - true two-session races; an expiry between the restart writer's own locking read and its UPDATE.
+ *    Stale-release successor protection and the acceptance-path expiries are covered in the discovery
+ *    suite's packets 5–6;
+ *  - for the ACCEPTANCE writer, the fence predicates claimed_lane, lease_generation alone and anchor
+ *    drift. The restart writer's complete one-predicate matrix is packet 6a; the caller's selection
+ *    authority and `lockSlackChannelForAcceptance` are exercised in the discovery suite;
  *  - surrogate variants through actual transport/discovery and URL parameterization (F2-09
  *    remainder, DH-03);
  *  - subdivision, the S > L internal terminal, and segment application (DH-01/02/03/04/05).
@@ -1547,7 +1557,8 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
     "historical_segment_lower_ts", ...RELEASE_PERMITTED,
   ];
   /**
-   * REAL progressed literals under A = `1718900500.000000`.
+   * CONSTRUCTED, CHECK-valid progressed literals under the seeded A = `1718900500.000000`. They are
+   * written directly; they are not reached here by the normal split/terminal transitions.
    *  - Wide: S < U < A, with attempt-oldest in [S, U] and the completed-segments aggregate in (U, A].
    *  - Singleton: S = U < A, with attempt-oldest equal to U and the aggregate above U.
    */
@@ -1557,7 +1568,8 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
   } as const;
   /** Seed the wide fixture, then write the progressed literal and assert it as a separate PRECONDITION. */
   async function seedProgressed(width: "wide" | "singleton"): Promise<Seeded> {
-    const seeded = await seedWideSegment(["syn-h-1", "syn-h-2"]);
+    // The older H entry makes the result's no-leak check LIVE.
+    const seeded = await seedWideSegment([OLDER_ENTRY, "syn-h-2"]);
     const p = PROGRESSED[width];
     await tx((session) => session.executeSql(
       `update slack_sync_channels
@@ -1649,15 +1661,18 @@ describe("AM-F2 runtime packets 1–3 — state-writer history admission and cla
     { label: "lease expired", mutate: EXPIRE_LEASE },
     { label: "successor reclaimed after expiry", mutate: SUCCESSOR_RECLAIM },
     { label: "lease generation bumped alone", mutate: sqlMutation("update slack_sync_channels set lease_generation = lease_generation + 1 where team_id = $1") },
+    { label: "lease owner changed alone", mutate: sqlMutation("update slack_sync_channels set lease_owner = gen_random_uuid()::text where team_id = $1") },
     { label: "claimed lane changed", mutate: sqlMutation("update slack_sync_channels set claimed_lane = 'newest' where team_id = $1") },
     { label: "scan generation drifted", mutate: sqlMutation("update slack_sync_channels set historical_scan_generation = 5 where team_id = $1") },
     {
       label: "cursor drifted",
-      mutate: sqlMutation(`update slack_sync_channels set historical_cursor = 'syn-h-x', historical_cursor_history = '["syn-h-1", "syn-h-2", "syn-h-x"]'::jsonb where team_id = $1`),
+      // Linkage stays valid: the older entry is kept and the drifted cursor is H's last element.
+      mutate: sqlMutation(`update slack_sync_channels set historical_cursor = 'syn-h-x', historical_cursor_history = '["${OLDER_ENTRY}", "syn-h-2", "syn-h-x"]'::jsonb where team_id = $1`),
     },
     { label: "anchor drifted", mutate: sqlMutation("update slack_sync_channels set historical_anchor_ts = '1718900600.000000' where team_id = $1") },
   ])("§5/§8 invalid_cursor fence: with $label, the restart writer returns typed refused and the live row is exact", async ({ mutate }) => {
-    const seeded = await seedWideSegment(["syn-h-1", "syn-h-2"]);
+    // The older H entry makes the result's no-leak check LIVE: a result carrying H would fail it.
+    const seeded = await seedWideSegment([OLDER_ENTRY, "syn-h-2"]);
     const claim = await claimHistorical(seeded);
     await mutate(seeded);
     const before = await rowDigestExcept(seeded.scope, []);

@@ -2245,7 +2245,12 @@ describe("AIO-1170 §3.2/§5: the discovery caller's acceptance transaction", ()
   // ── PACKET 6: an ACTUAL provider invalid_cursor, and the caller's writer-`refused` branch ─────────
   //
   // §5 / DH-03 / F2-08 / F2-11: an actual `invalid_cursor` is handled in ONE selection-first authority
-  // transaction, under the same full channel fence and stored-state validity as acceptance:
+  // transaction, under the same full channel fence as acceptance. This packet pins:
+  //  - that one-transaction ordering, proved per session for 6.1, 6.2 and 6.5;
+  //  - the authority outcomes and the transitions below.
+  // It does NOT pin the restart writer's own locked stored-state validity, an expiry between its own
+  // locking read and its UPDATE, or the NEWEST lane's invalid_cursor transitions. Those stay deferred.
+  // The transitions:
   //  - S < U: the exact midpoint subdivision, reported `delayed / invalid_cursor` with the subdivision
   //    detail;
   //  - S = U: a same-range restart, with the singleton detail;
@@ -2255,9 +2260,10 @@ describe("AIO-1170 §3.2/§5: the discovery caller's acceptance transaction", ()
   // Status against GREEN5 `f556163d`, where an invalid_cursor runs the same-range restart in its OWN
   // transaction with no selection lock, no width decision and no detail:
   //  - RED (8):
-  //     - the wide PROGRESSED C ≠ null subdivision (S' = 1718900200.000001, U kept below A) and the
-  //       C = null subdivision;
-  //     - the singleton PROGRESSED C ≠ null and the C = null restart details;
+  //     - the wide constructed-progressed C ≠ null subdivision (S' = 1718900200.000001, U kept below
+  //       the real frozen A) and the C = null subdivision, each on the selection-locked session;
+  //     - the singleton constructed-progressed C ≠ null and C = null restart details, each on the
+  //       selection-locked session;
   //     - stale selection, stale lease, and both;
   //     - 6.5, a lease expiring inside the invalid_cursor authority transaction (selection lock first);
   //  - GREEN control (1): 6.4, the writer's own `refused` from the acceptance transaction, injected
@@ -2292,7 +2298,9 @@ describe("AIO-1170 §3.2/§5: the discovery caller's acceptance transaction", ()
     attemptOldestCleared: true, generationIncrementedOnce: true, released: true, next: "newest", error: "invalid_cursor", stillPending: true,
   };
   /**
-   * REAL progressed literals under A = `1718900500.000000`.
+   * CONSTRUCTED, CHECK-valid progressed literals, written directly: they are not reached here by the
+   * normal split/terminal transitions. The scan's REAL frozen anchor A (the DB clock at its claim) is
+   * NOT moved; every literal lies below it.
    *  - Wide: S < U < A, attempt-oldest in [S, U], aggregate in (U, A].
    *  - Singleton: S = U < A, attempt-oldest = U, aggregate above U.
    */
@@ -2300,28 +2308,92 @@ describe("AIO-1170 §3.2/§5: the discovery caller's acceptance transaction", ()
     wide: { lower: "1718900100.000000", upper: "1718900300.000000", aggregate: "1718900350.000000", attemptOldest: "1718900200.000000" },
     singleton: { lower: "1718900300.000000", upper: "1718900300.000000", aggregate: "1718900350.000000", attemptOldest: "1718900300.000000" },
   } as const;
-  const PROGRESSED_ANCHOR = "1718900500.000000";
-  /** Write a progressed literal over the started (unleased) scan, keeping C = c-1, and assert it as a PRECONDITION. */
+  /**
+   * Write a progressed literal over the started (unleased) scan, keeping C = c-1 and the frozen
+   * anchor, then assert it as a separate PRECONDITION. The checks: the literal is stored; A is
+   * retained byte for byte and lies above S, U and the aggregate.
+   */
   async function writeProgressed(seed: Seed, width: "wide" | "singleton"): Promise<void> {
     const p = PROGRESSED[width];
+    const anchorBefore = (await row(seed))?.historical_anchor_ts;
     const c = await rawSql();
     await c.query(
       `update slack_sync_channels
-          set historical_anchor_ts = $2, historical_segment_lower_ts = $3, historical_segment_upper_ts = $4,
-              historical_completed_segments_oldest_ts = $5, historical_oldest_seen_ts = $6
+          set historical_segment_lower_ts = $2, historical_segment_upper_ts = $3,
+              historical_completed_segments_oldest_ts = $4, historical_oldest_seen_ts = $5
         where team_id = $1`,
-      [seed.teamId, PROGRESSED_ANCHOR, p.lower, p.upper, p.aggregate, p.attemptOldest]
+      [seed.teamId, p.lower, p.upper, p.aggregate, p.attemptOldest]
     );
     const stored = await row(seed);
+    const anchor = typeof stored?.historical_anchor_ts === "string" ? tsMicros(stored.historical_anchor_ts) : BigInt(-1);
     expect({
       bounds: stored?.historical_segment_lower_ts === p.lower && stored?.historical_segment_upper_ts === p.upper,
-      anchor: stored?.historical_anchor_ts === PROGRESSED_ANCHOR,
+      anchorRetained: typeof anchorBefore === "string" && stored?.historical_anchor_ts === anchorBefore,
+      anchorAboveLiterals: anchor > tsMicros(p.upper) && anchor >= tsMicros(p.aggregate),
       aggregate: stored?.historical_completed_segments_oldest_ts === p.aggregate,
       attemptOldest: stored?.historical_oldest_seen_ts === p.attemptOldest,
       cursor: stored?.historical_cursor === "c-1",
       unleased: stored?.lease_owner === null,
-    }, `fixture: the progressed ${width} literal is stored`).toEqual({
-      bounds: true, anchor: true, aggregate: true, attemptOldest: true, cursor: true, unleased: true,
+    }, `fixture: the progressed ${width} literal is stored under the real frozen anchor`).toEqual({
+      bounds: true, anchorRetained: true, anchorAboveLiterals: true, aggregate: true, attemptOldest: true, cursor: true, unleased: true,
+    });
+  }
+
+  /**
+   * ONE-TRANSACTION proof for the invalid_cursor path (counts only; no SQL or value is kept). Each
+   * transaction session gets its own `selectionLockedHere` flag, set when the integration selection
+   * lock returns. After `armed()` (that is, after the provider answered), every channel-state statement
+   * is counted ON or OFF a selection-locked session.
+   *
+   * The transition is the lane's generation-bumping channel UPDATE. That shape is shared by today's
+   * same-range restart and the accepted extension of the SAME `restartSlackChannelScan` export
+   * (subdivided/restarted).
+   *
+   * `inject`, when given, runs once on the selection session immediately after its lock returns.
+   */
+  const INVALID_CURSOR_TRANSITION = /update\s+slack_sync_channels[\s\S]*historical_scan_generation\s*=\s*historical_scan_generation\s*\+\s*1/i;
+  const CHANNEL_STATEMENT = /\bslack_sync_channels\b/i;
+  type AuthorityTracker = {
+    transitionsOnSelection: number; transitionsOffSelection: number;
+    channelOnSelection: number; channelOffSelection: number; channelAfterInjection: number; injected: number;
+  };
+  const newAuthorityTracker = (): AuthorityTracker => ({
+    transitionsOnSelection: 0, transitionsOffSelection: 0, channelOnSelection: 0, channelOffSelection: 0, channelAfterInjection: 0, injected: 0,
+  });
+  function authorityTracked(
+    base: ReturnType<typeof countingReleases>,
+    armed: () => boolean,
+    tracker: AuthorityTracker,
+    inject?: (session: TransactionSession) => Promise<void>
+  ) {
+    return transactionSessionDecoratedDb(base, (session) => {
+      let selectionLockedHere = false;
+      let injectedHere = false;
+      return {
+        ...session,
+        executeSql: (async (text: string, params?: unknown[]) => {
+          const isSelection = SELECTION_LOCK.test(text);
+          if (armed() && !isSelection && CHANNEL_STATEMENT.test(text)) {
+            if (selectionLockedHere) tracker.channelOnSelection += 1;
+            else tracker.channelOffSelection += 1;
+            if (INVALID_CURSOR_TRANSITION.test(text)) {
+              if (selectionLockedHere) tracker.transitionsOnSelection += 1;
+              else tracker.transitionsOffSelection += 1;
+            }
+            if (injectedHere) tracker.channelAfterInjection += 1;
+          }
+          const result = await session.executeSql(text, params);
+          if (isSelection && armed()) {
+            selectionLockedHere = true;
+            if (inject && tracker.injected === 0) {
+              tracker.injected += 1;
+              injectedHere = true;
+              await inject(session);
+            }
+          }
+          return result;
+        }) as TransactionSession["executeSql"],
+      };
     });
   }
 
@@ -2344,13 +2416,16 @@ describe("AIO-1170 §3.2/§5: the discovery caller's acceptance transaction", ()
     });
     if (started) {
       await startedScan(seed, integrationId, fake);
-      // A real progressed state: U < A, an aggregate above U, an attempt-oldest inside [S, U], C = c-1.
+      // A CONSTRUCTED, CHECK-valid progressed state under the real frozen A: U < A, an aggregate above
+      // U, an attempt-oldest inside [S, U], C = c-1.
       await writeProgressed(seed, "wide");
     }
     const rootsBefore = await threadRootTs(seed.teamId);
     const historyBefore = fake.countOf("conversations.history");
     const counter = newCounter();
-    const outcome = await settle(discover(seed, integrationId, fake, { client: countingReleases(counter) }));
+    const authority = newAuthorityTracker();
+    const client = authorityTracked(countingReleases(counter), () => seen.decisive === 1, authority);
+    const outcome = await settle(discover(seed, integrationId, fake, { client }));
     const after = await row(seed);
     expect({
       decisive: seen.decisive,
@@ -2368,10 +2443,17 @@ describe("AIO-1170 §3.2/§5: the discovery caller's acceptance transaction", ()
       roots: await rootFacts(seed, rootsBefore),
       unauthorizedUnchanged: without(after, INVALID_CURSOR) === without(seen.row, INVALID_CURSOR),
       transition: transitionFacts(after, seen.row, expectedLower),
+      // ONE transaction: the subdivision ran on the selection-locked session, and nothing touched the
+      // channel row off it.
+      oneTransaction: {
+        transitionsOnSelection: authority.transitionsOnSelection, transitionsOffSelection: authority.transitionsOffSelection,
+        channelOffSelection: authority.channelOffSelection,
+      },
     }, "S = M + 1 from the locked row; U (not A), L, A, the aggregate, the certificate and the newest lane preserved").toEqual({
       outcome: { steps: [{ result: "delayed", category: "invalid_cursor", detail: SUBDIVIDED_DETAIL, keysAllowed: true }] },
       releases: 0, requests: 1, roots: { count: rootsBefore.length, exact: true }, unauthorizedUnchanged: true,
       transition: EXPECTED_TRANSITION,
+      oneTransaction: { transitionsOnSelection: 1, transitionsOffSelection: 0, channelOffSelection: 0 },
     });
   });
 
@@ -2384,7 +2466,8 @@ describe("AIO-1170 §3.2/§5: the discovery caller's acceptance transaction", ()
     const { fake, inFlight } = scripted(seed, () => slackJson(INVALID_CURSOR_BODY), ["1718900000.000900"]);
     await startedScan(seed, integrationId, fake);
     if (keepCursor) {
-      // A real progressed singleton: S = U = 1718900300 < A, attempt-oldest = U, aggregate above U, C = c-1.
+      // A CONSTRUCTED, CHECK-valid progressed singleton under the real frozen A: S = U = 1718900300 < A,
+      // attempt-oldest = U, aggregate above U, C = c-1.
       await writeProgressed(seed, "singleton");
     } else {
       // A CONSTRUCTED singleton S = U = A with no cursor (C null, H empty). It is CHECK-valid and
@@ -2411,7 +2494,9 @@ describe("AIO-1170 §3.2/§5: the discovery caller's acceptance transaction", ()
     const historyBefore = singletonFake.countOf("conversations.history");
     inFlight.continuations = 0;
     const counter = newCounter();
-    const outcome = await settle(discover(seed, integrationId, singletonFake, { client: countingReleases(counter) }));
+    const authority = newAuthorityTracker();
+    const client = authorityTracked(countingReleases(counter), () => inFlight.continuations === 1, authority);
+    const outcome = await settle(discover(seed, integrationId, singletonFake, { client }));
     const after = await row(seed);
     expect({
       continuationRan: inFlight.continuations,
@@ -2427,10 +2512,15 @@ describe("AIO-1170 §3.2/§5: the discovery caller's acceptance transaction", ()
       roots: await rootFacts(seed, rootsBefore),
       unauthorizedUnchanged: without(after, INVALID_CURSOR) === without(inFlight.row, INVALID_CURSOR),
       transition: transitionFacts(after, inFlight.row, String(inFlight.row?.historical_segment_lower_ts)),
+      oneTransaction: {
+        transitionsOnSelection: authority.transitionsOnSelection, transitionsOffSelection: authority.transitionsOffSelection,
+        channelOffSelection: authority.channelOffSelection,
+      },
     }, "every bound kept; the range stays pending and is never certified; no local retry").toEqual({
       outcome: { steps: [{ result: "delayed", category: "invalid_cursor", detail: SINGLETON_DETAIL, keysAllowed: true }] },
       releases: 0, requests: 1, roots: { count: rootsBefore.length, exact: true }, unauthorizedUnchanged: true,
       transition: EXPECTED_TRANSITION,
+      oneTransaction: { transitionsOnSelection: 1, transitionsOffSelection: 0, channelOffSelection: 0 },
     });
   });
 
@@ -2529,36 +2619,34 @@ describe("AIO-1170 §3.2/§5: the discovery caller's acceptance transaction", ()
     // TRANSACTION-LOCAL injection. Only after the provider answered (the decisive continuation ran),
     // and only on the session that just ran the selection lock, the claim is expired as that lock
     // returns. Any channel fence or restart write in the same transaction must then see the expiry.
-    const injection = { afterSelectionLock: 0 };
     const counter = newCounter();
-    const releaseCounting = countingReleases(counter);
-    const client = transactionSessionDecoratedDb(releaseCounting, (session) => ({
-      ...session,
-      executeSql: (async (text: string, params?: unknown[]) => {
-        const result = await session.executeSql(text, params);
-        if (inFlight.continuations === 1 && injection.afterSelectionLock === 0 && SELECTION_LOCK.test(text)) {
-          injection.afterSelectionLock += 1;
-          await session.executeSql(
-            "update slack_sync_channels set lease_expires_at = clock_timestamp() - interval '1 second' where team_id = $1",
-            [seed.teamId]
-          );
-        }
-        return result;
-      }) as TransactionSession["executeSql"],
-    }));
+    const authority = newAuthorityTracker();
+    const client = authorityTracked(countingReleases(counter), () => inFlight.continuations === 1, authority, (session) =>
+      session.executeSql(
+        "update slack_sync_channels set lease_expires_at = clock_timestamp() - interval '1 second' where team_id = $1",
+        [seed.teamId]
+      ).then(() => undefined));
     const outcome = await settle(discover(seed, integrationId, fake, { client }));
     const after = await row(seed);
     expect({ continuationRan: inFlight.continuations }, "fixture: exactly the decisive historical continuation ran").toEqual({ continuationRan: 1 });
     expect({
       outcome, releases: counter.releases, roots: await rootFacts(seed, rootsBefore),
-      // The injection firing at all proves the invalid_cursor handling took the selection lock first.
-      injectedAfterSelectionLock: injection.afterSelectionLock,
+      // The injection firing proves the invalid_cursor handling took the selection lock in a
+      // transaction. The refusing fence must then run on THAT session, after the injection, and
+      // nothing may touch the channel row off it.
+      oneTransaction: {
+        injectedAfterSelectionLock: authority.injected,
+        fenceAfterInjectionOnSelection: authority.channelAfterInjection >= 1,
+        transitionsOffSelection: authority.transitionsOffSelection,
+        channelOffSelection: authority.channelOffSelection,
+      },
       onlyExpiryMoved: without(after, ["lease_expires_at"]) === without(inFlight.row, ["lease_expires_at"]),
       leaseStillOwned: after?.lease_owner === inFlight.row?.lease_owner && after?.lease_owner !== null,
       generationUnchanged: Number(after?.historical_scan_generation) === Number(inFlight.row?.historical_scan_generation),
-    }, "selection first, then the full fence: an expired lease is refused before any invalid_cursor transition").toEqual({
+    }, "selection first, then the full fence, in ONE transaction: an expired lease is refused before any invalid_cursor transition").toEqual({
       outcome: { steps: [{ result: "refused", category: "stale_channel_lease", detail: STALE_DETAIL, keysAllowed: true }] },
-      releases: 0, roots: { count: rootsBefore.length, exact: true }, injectedAfterSelectionLock: 1,
+      releases: 0, roots: { count: rootsBefore.length, exact: true },
+      oneTransaction: { injectedAfterSelectionLock: 1, fenceAfterInjectionOnSelection: true, transitionsOffSelection: 0, channelOffSelection: 0 },
       onlyExpiryMoved: true, leaseStillOwned: true, generationUnchanged: true,
     });
   });
