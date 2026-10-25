@@ -351,12 +351,18 @@ async def _gdrive_hint_job(
 def _gdrive_outcome_status(summary) -> str:
     """Use coordinator evidence, never counter optimism, to classify a Drive run.
 
-    ``deferred`` wins (a busy or deadline deferral), then authoritative completion — including a
-    valid EMPTY one — is ``complete``. A run that only FAILED is ``failed``: failed work, no document
-    it created, updated, kept or removed, and no measured backlog to resume (a raised run, a refused
+    ``deferred`` wins, and only the ``execution_busy`` refusal sets it (another coordinator holds the
+    lease; this run did nothing). Run-deadline and budget stops are NOT deferred: they count the
+    unread work as ``skipped`` and classify below. Then authoritative completion — including a valid
+    EMPTY one — is ``complete``. A run that only FAILED is ``failed``: failed work, no document it
+    created, updated, kept or removed, and no measured backlog to resume (a raised run, a refused
     authority). Counting that as partial presented a failure as progress. Everything else that did
     or holds work is ``partial``: real progress (even beside failures), a skipped-only deadline or
     budget stop, and any run whose measured backlog says the next run resumes it.
+
+    This is the reported status only. Whether a run touches the Admin run ledger is decided
+    separately by the brain (`lib/integrations/gdrive-run-ledger.ts`): a ``partial`` with no failed
+    work is neutral there, but a ``partial`` that failed work is a failure.
     """
     if summary.deferred:
         return "deferred"

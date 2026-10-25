@@ -160,6 +160,33 @@ async def test_fetch_integration_selections_parses_list_and_sends_auth():
     assert sels[0]["config"]["channelIds"] == ["C1"]
 
 
+@pytest.mark.parametrize("include_disabled, query", [
+    # The default read is the enabled-only contract: no query at all.
+    (None, b""),
+    (False, b""),
+    # The explicit disabled-inclusive read is exactly `include_disabled=1` — the one form the brain
+    # recognises (`app/api/v1/integrations/route.ts`); a `true` or `True` would silently read enabled-only.
+    (True, b"include_disabled=1"),
+])
+async def test_fetch_integration_selections_serializes_the_include_disabled_contract(include_disabled, query):
+    seen: list[httpx.URL] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req.url)
+        return httpx.Response(200, json={"integrations": [
+            {"id": "i1", "type": "gdrive", "name": "docs", "config": {}, "status": "disabled"},
+        ]})
+
+    async with _client(httpx.MockTransport(handler)) as c:
+        sels = (await c.fetch_integration_selections() if include_disabled is None
+                else await c.fetch_integration_selections(include_disabled=include_disabled))
+
+    [url] = seen
+    assert url.path == "/api/v1/integrations"
+    assert url.query == query
+    assert [row["status"] for row in sels] == ["disabled"]  # returned as the brain sent it
+
+
 async def test_fetch_integration_selections_returns_empty_on_404():
     def handler(req: httpx.Request) -> httpx.Response:
         return httpx.Response(404, json={"error": {"code": "not_found", "message": "no route"}})
