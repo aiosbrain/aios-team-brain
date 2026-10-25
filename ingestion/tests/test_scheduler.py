@@ -38,11 +38,15 @@ def test_gdrive_run_status_reports_a_run_that_only_failed_as_failed():
     IngestSummary("g", created=2, updated=1, failed=1),
     IngestSummary("g", unchanged=4, failed=2),
     IngestSummary("g", removed=1, failed=1),
-    # A resumable deadline or budget stop, skipped-only — never every skipped-only run as failed.
+    # A skipped-only stop (e.g. the pre-drain run deadline) — never every skipped-only run as failed.
     IngestSummary("g", skipped=3, failure_categories={"run_deadline": 1}),
     IngestSummary("g", skipped=5, backlog=5),
     # Failed work with a MEASURED backlog is resumable coordinator state, not an outright failure.
     IngestSummary("g", failed=1, backlog=1, failure_categories={"cleanup_unavailable": 1}),
+    # A page-loop/drain-loop run-deadline stop adds no `skipped`: its measured backlog carries the work.
+    IngestSummary("g", skipped=0, backlog=3, failure_categories={"run_deadline": 1}),
+    # A discovery/work budget exhausted: no failure category, nothing skipped, backlog outstanding.
+    IngestSummary("g", backlog=4, failure_categories={}),
 ])
 def test_gdrive_run_status_keeps_genuine_and_resumable_progress_partial(summary):
     assert _gdrive_outcome_status(summary) == "partial"

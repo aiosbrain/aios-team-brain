@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { GET as integrationsGET } from "@/app/api/v1/integrations/route";
 import { issueApiKey } from "@/lib/admin/keys";
 import { ensureAuthUser, linkMemberByEmail } from "@/lib/auth/pg-login";
+import { getPool } from "@/lib/db/pg/pool";
 import {
   upsertIntegration,
   setIntegrationSecret,
@@ -165,6 +166,18 @@ describe("integrations API read — explicit include_disabled=1 (real Postgres, 
       type: "slack", name: "paused-eng", config: { channelIds: ["C2"] }, status: "disabled",
     });
     await setIntegrationSecret(db(), a, paused.id, PAUSED_TOKEN);
+    // Fixture evidence: both team-A rows really hold stored secret material, so every "no secret in
+    // the response" assertion below is made against data that has some. Presence is derived IN SQL —
+    // the ciphertext itself is never fetched, so no failure output can ever contain it.
+    const { rows: stored } = await getPool().query<{ id: string; has_secret: boolean }>(
+      `select id, secret_ciphertext is not null as has_secret
+         from integrations where team_id=$1 and id = any($2::uuid[])`,
+      [teamA.teamId, [enabled.id, paused.id]],
+    );
+    const byId = (x: { id: string }, y: { id: string }) => (x.id < y.id ? -1 : x.id > y.id ? 1 : 0);
+    expect([...stored].sort(byId)).toEqual(
+      [{ id: enabled.id, has_secret: true }, { id: paused.id, has_secret: true }].sort(byId),
+    );
     // Another team's rows, enabled and disabled: never in team A's read.
     const b = auth(teamB.teamId, teamB.memberId);
     await upsertIntegration(db(), b, { type: "slack", name: "b-enabled", config: { channelIds: ["CB"] } });
