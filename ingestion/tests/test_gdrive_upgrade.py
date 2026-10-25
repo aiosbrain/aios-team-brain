@@ -4234,7 +4234,7 @@ def test_sink_call_stopped_by_the_run_deadline_leaves_its_work_untouched_and_sta
 # one, the PAGE-LOOP stop adds none (its cursor carries the outstanding work).
 
 class _DeadlineStreamBrain(_RecordingBrain):
-    """`_RecordingBrain` that also keeps every acknowledged checkpoint, and may react to one."""
+    """`_RecordingBrain` that also records every checkpoint attempt, and may react to one."""
 
     def __init__(self, on_checkpoint=None):
         super().__init__()
