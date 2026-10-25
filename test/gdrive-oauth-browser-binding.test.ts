@@ -211,3 +211,58 @@ describe("AIO-1167 Google Drive OAuth: callback is bound to the initiating brows
     expect(h.publish).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("AIO-1167 R41: the callback carries Google's email_verified claim, never infers it", () => {
+  /** Google answers the account lookup with exactly `userinfo`. */
+  function googleReturns(userinfo: Record<string, unknown>) {
+    vi.mocked(fetch).mockReset()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        access_token: "callback-access", refresh_token: "callback-refresh",
+        scope: "https://www.googleapis.com/auth/drive.file",
+      }), { status: 200, headers: { "content-type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(userinfo), {
+        status: 200, headers: { "content-type": "application/json" },
+      }));
+  }
+
+  it.each([
+    ["literal true", { email_verified: true }, true],
+    ["false", { email_verified: false }, false],
+    ["missing", {}, false],
+    ["the string \"true\"", { email_verified: "true" }, false],
+  ])("email_verified %s is passed as emailVerified=%s", async (_label, claim, expected) => {
+    googleReturns({ sub: "google-subject", email: "admin@example.com", ...claim });
+    const { state, binding } = await start();
+
+    const response = await callback(state, binding);
+
+    expect(response.status).toBe(200);
+    expect(h.publish).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      subject: "google-subject", email: "admin@example.com", emailVerified: expected,
+    }));
+    const body = await response.text();
+    if (!expected) expect(body).toContain("was not linked to a member");
+  });
+
+  it("a verified subject with no email still connects, by subject, unlinked", async () => {
+    googleReturns({ sub: "google-subject" });
+    const { state, binding } = await start();
+
+    const response = await callback(state, binding);
+
+    expect(response.status).toBe(200);
+    expect(h.publish).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      subject: "google-subject", email: null, emailVerified: false,
+    }));
+  });
+
+  it("no subject is still no connection", async () => {
+    googleReturns({ email: "admin@example.com", email_verified: true });
+    const { state, binding } = await start();
+
+    const response = await callback(state, binding);
+
+    expect(response.status).toBe(422);
+    expect(h.publish).not.toHaveBeenCalled();
+  });
+});

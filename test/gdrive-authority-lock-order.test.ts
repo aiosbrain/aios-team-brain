@@ -342,7 +342,7 @@ describe("OAuth publication: one transaction, canonical order", () => {
     publishGoogleDriveOAuthCredential({
       teamId: TEAM, memberId: ADMIN, integrationName: NAME,
       clientId: "oauth-client", clientSecret: "client-secret",
-      subject: "acct-1", email: "Shared@Example.com", name: "Shared",
+      subject: "acct-1", email: "Shared@Example.com", emailVerified: true, name: "Shared",
       refreshToken: "fresh-refresh", scopes: ["https://www.googleapis.com/auth/drive.file"],
       ...over,
     });
@@ -488,7 +488,7 @@ describe("OAuth publication: one transaction, canonical order", () => {
     let seen: Entry[] = [];
     await publishGoogleDriveOAuthCredential({
       teamId: TEAM, memberId: ADMIN, integrationName: NAME, clientId: "oauth-client",
-      clientSecret: "client-secret", subject: "acct-1", email: "shared@example.com", refreshToken: "fresh-refresh",
+      clientSecret: "client-secret", subject: "acct-1", email: "shared@example.com", emailVerified: true, refreshToken: "fresh-refresh",
     }, { afterLocks: async () => { seen = [...c.work]; } });
     expect(seen.some(isIdentityLock) && seen.some(isNamedLock) && seen.some(isConnectionLock) && seen.some(isAdminLock)).toBe(true);
     expect(which(seen, isWrite)).toEqual([]);

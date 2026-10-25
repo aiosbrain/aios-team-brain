@@ -1023,6 +1023,10 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
       serviceAccountStatus: z.enum(["pending", "verified", "failed"]).optional(),
       serviceAccountIdentity: z.string().email().max(320).optional(),
       authenticatedAccount: z.string().email().max(320).optional(),
+      // Whether Google verified `authenticatedAccount` (its `email_verified` claim). `false` marks
+      // the address as untrusted account metadata: it created no identity mapping (AIO-1167 R41).
+      // Absent on connections made before the claim was carried.
+      authenticatedAccountEmailVerified: z.boolean().optional(),
       authenticatedAccountId: z.string().min(1).max(300).optional(),
       scopeSet: z.array(z.string().min(1).max(200)).max(20).optional(),
       audienceProjectIds: z.array(z.string().uuid()).max(100).optional(),

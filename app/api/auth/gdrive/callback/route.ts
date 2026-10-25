@@ -52,13 +52,20 @@ export async function GET(req: NextRequest) {
     headers: { Authorization: `Bearer ${tokens.access_token}` },
     cache: "no-store",
   });
-  const user = await userResponse.json() as { sub?: string; email?: string; name?: string };
-  if (!userResponse.ok || !user.sub || !user.email) return html(422, "Google Drive connection failed", "The connected Google account could not be verified.");
+  const user = await userResponse.json() as { sub?: unknown; email?: unknown; email_verified?: unknown; name?: unknown };
+  // The account's stable subject is what the exchange proves, and all the credential needs. Its
+  // email is separate evidence: Google states it in `email_verified`, carried here as is — only the
+  // literal `true` lets the publisher link the account to a member by email (AIO-1167 R41).
+  const subject = typeof user.sub === "string" && user.sub ? user.sub : null;
+  if (!userResponse.ok || !subject) return html(422, "Google Drive connection failed", "The connected Google account could not be verified.");
+  const email = typeof user.email === "string" && user.email ? user.email : null;
+  const emailVerified = user.email_verified === true;
 
   try {
     await publishGoogleDriveOAuthCredential({
       teamId: bound.teamId, memberId: bound.memberId, integrationName: bound.integrationName,
-      clientId, clientSecret, subject: user.sub, email: user.email, name: user.name,
+      clientId, clientSecret, subject, email, emailVerified,
+      name: typeof user.name === "string" ? user.name : undefined,
       refreshToken: typeof tokens.refresh_token === "string" ? tokens.refresh_token : undefined,
       scopes: typeof tokens.scope === "string" ? tokens.scope.split(/\s+/).filter(Boolean) : undefined,
     });
@@ -74,5 +81,8 @@ export async function GET(req: NextRequest) {
     }
     return html(500, "Google Drive connection failed", "The verified credential could not be stored. The previous connection was left unchanged.");
   }
-  return html(200, "Google Drive connected", `Connected ${user.email}. Return to Integrations to choose files or folders.`);
+  if (!email || !emailVerified) {
+    return html(200, "Google Drive connected", `Connected ${email ?? "a Google account without an email"}. Google did not verify this account's email, so it was not linked to a member: map it under Admin → Members → Identities. Return to Integrations to choose files or folders.`);
+  }
+  return html(200, "Google Drive connected", `Connected ${email}. Return to Integrations to choose files or folders.`);
 }

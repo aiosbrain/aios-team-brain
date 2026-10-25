@@ -148,14 +148,29 @@ async function repairOneItem(
   return { item: itemUpdates, versions: versionUpdates, contributions: contribution.observed };
 }
 
+/**
+ * Record a failed attempt for a retry — only while the obligation is still CURRENT work.
+ *
+ * Terminal states are final: a late failure from a worker that lost a race must not turn an
+ * `obsolete` (or `complete`) obligation back into scheduled work (AIO-1167 R41). So the transition
+ * is limited to the non-terminal states, and to the revision the identity mapping still has — an
+ * obligation for a superseded revision is left for the drain to retire as obsolete, never retried.
+ * One UPDATE: under the row lock the status is rechecked against the committed row, so a concurrent
+ * obsolete/complete write wins.
+ */
 async function markRetry(obligation: Obligation, error: unknown): Promise<void> {
   const message = (error instanceof Error ? error.message : String(error)).slice(0, 1000);
   await runSql(
-    `update identity_repair_obligations set status='retry',attempts=attempts+1,last_error=$5,
+    `update identity_repair_obligations o set status='retry',attempts=attempts+1,last_error=$5,
             next_attempt_at=now() + (least(3600, power(2,least(attempts,10)))::text || ' seconds')::interval,
             updated_at=now()
-      where team_id=$1 and provider=$2 and external_id=$3 and mapping_revision=$4
-        and status<>'complete'`,
+      where o.team_id=$1 and o.provider=$2 and o.external_id=$3 and o.mapping_revision=$4
+        and o.status in ('pending','running','retry')
+        and exists (
+          select 1 from member_identity_mapping_state s
+           where s.team_id=o.team_id and s.provider=o.provider and s.external_id=o.external_id
+             and s.revision=o.mapping_revision
+        )`,
     [obligation.team_id, obligation.provider, obligation.external_id, obligation.mapping_revision, message],
   );
 }

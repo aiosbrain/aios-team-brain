@@ -219,6 +219,9 @@ export async function saveIntegration(
         ...(existing?.config.authenticatedAccount
           ? { authenticatedAccount: existing.config.authenticatedAccount }
           : {}),
+        ...(typeof existing?.config.authenticatedAccountEmailVerified === "boolean"
+          ? { authenticatedAccountEmailVerified: existing.config.authenticatedAccountEmailVerified }
+          : {}),
         ...(existing?.config.authenticatedAccountId
           ? { authenticatedAccountId: existing.config.authenticatedAccountId }
           : {}),
@@ -228,6 +231,7 @@ export async function saveIntegration(
       const authMode = String(config.authMode ?? "oauth");
       if (authMode === "service_account") {
         delete config.authenticatedAccount;
+        delete config.authenticatedAccountEmailVerified;
         delete config.authenticatedAccountId;
         delete config.scopeSet;
         config = {

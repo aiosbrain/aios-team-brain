@@ -967,7 +967,17 @@ Shared Drive and (when selected) My Drive. A selected file or folder that lives 
 reported only by that drive's change log, so every selected root is first bound — durably, once per
 generation, by one provider read — to the drive that contains it, and is enumerated and drained through
 that drive's stream and cursor. A binding adds no drive root: the drive's other content stays
-unselected. Until every root is bound no stream is enumerated. The selected root id stays the
+unselected. Every selected file/folder root is a durable OBLIGATION (`selection_root_bindings`, one
+row per connection/generation/kind/provider id): a root whose metadata cannot be read is `unresolved`
+with NO drive (never a guessed My Drive), opens no stream and is retried every run, while the roots and
+explicitly selected Shared Drives that are known still bind and run (AC-04; R41). Connection-wide
+authority loss and an exhausted provider budget still stop binding. While any root is `unresolved` or
+`uncertain` the stream roster may be incomplete, so authoritative completion is withheld and
+`_cross_stream_removal` infers no absence from stream membership — only a document's own provider
+not-found/trash (AC-05) still removes. Completion requires positive coverage: every selected root
+bound and settled (a root with no obligation row is unknown, not resolved). Root obligations ride
+every coordinator checkpoint as the brain-fenced `roots` section and are re-adopted by a sidecar that
+lost its SQLite state (`connector_state`, `_adopt_remote_root_evidence`). The selected root id stays the
 selection when the root is moved to another drive; only its binding changes, and never by inference.
 The old drive reports a moved root, and everything under it, as removed and lists it as empty, so a
 bound root's current metadata is read under the execution fence before a change page may retire a
@@ -1096,6 +1106,26 @@ acknowledges exactly that sequence once a page read in that run reaches the term
 notification arriving mid-drain stays pending for the next one; production watch create/renew acquires the
 same immutable execution and broker grant, fences channel publication, and never resets the
 consumption cursor. Periodic polling remains the recovery authority.
+**Watch lifecycle (R41, `aios_ingest/watch_lifecycle.py`, `watch_renewal.py`).** Channel creation is a
+non-transactional external call, so each attempt is a typed record: a durable `prepared` intent
+(attempt/channel id, connection/account/drive/generation, predecessor, verification HASH, requested
+expiry) and a fenced `dispatched` marker precede ONE provider request (never retried); only a
+validated response (exact channel id, resource id, an expiration not past and not beyond the request —
+no optimistic defaults) published under the fence is `active`. A lost response, timeout, cancellation
+after dispatch or failed publication leaves `uncertain` — polling covers the stream, and the record is
+stopped (`cleanup_pending` → `retired`) once a resource id is observed or `expired` at its requested
+expiry; a definitive provider refusal or a step that provably never started is `retired`; terminal
+records are never reopened, and unresolved attempts per stream are bounded. Provider work (client
+construction, credential refresh, the live authority check, the call) runs in a renewal-owned thread
+pool under an absolute per-connection deadline with a publication reserve and a cleanup allowance, so
+the scheduler loop stays responsive; an abandoned worker's late result can only become cleanup
+evidence, and its resources close only when it ends. Early `sync` notifications for a pending attempt
+whose token matches the persisted hash are recorded as evidence (202) — never activation, never a
+hint. **One owner per section of the fenced connector state (`connector_state.py`)**: the coordinator
+owns `streams`/top-level cursors and `roots`; renewal owns `watches`; each carries the other's part
+unchanged (`coordinator_document`/`renewal_document`), so a poll can no longer erase renewal's records.
+`webhook_channels` is a projection of `watches` (state column; only `active` rows validate
+notifications), rebuilt from the brain at every sweep.
 Immediately before every new Drive/Docs request, pagination step, retry, or watch call, the sidecar
 renews and revalidates the current server authority. A failed check is run-terminal and remains
 outside provider-read recovery catches. Watch renewal first acquires current authority and derives
@@ -1163,9 +1193,14 @@ without a permission id use `author-email:<address>`. Opaque Google ids are case
 ownership and connector/service-account transport identity are retained as provenance/diagnostics,
 not promoted to human authorship.
 
-When an OAuth account email is an exact, unambiguous match to an active roster identity, callback
-publication atomically records both its `subject:<sub>` transport identity and an
-`author-email:<address>` attribution bridge. Shared or unmatched login accounts remain unlinked for
+When an OAuth account email is VERIFIED by Google (`email_verified` literally `true`, carried by the
+callback and enforced again by the publisher) and is an exact, unambiguous match to an active roster
+identity, callback publication atomically records both its `subject:<sub>` transport identity and an
+`author-email:<address>` attribution bridge. A false/missing claim or no email creates NEITHER mapping,
+no revision and no repair obligation (R41): the credential is stored by subject, the address is kept
+only as untrusted account metadata (`integrations.config.authenticatedAccountEmailVerified: false`,
+never `member_identities.email`), existing deliberate links are untouched, and attribution stays
+unresolved for the audited manual mapping. Shared or unmatched login accounts remain unlinked for
 an audited Admin decision. A durable unlink tombstone blocks the email bridge from being silently
 recreated by roster-email fallback; only a newer explicit mapping revision can restore it.
 
@@ -1174,7 +1209,9 @@ survives unlink. Every link/remap/unlink serializes on the exact team/provider/i
 current active non-connector member and expected revision, audits the mutation, and enqueues an
 `identity_repair_obligations` row for that revision. Repair is bounded and restartable by item cursor;
 each item is locked and the mapping revision plus `member_id_locked` correction policy is rechecked at
-write time, so a stale worker cannot restore old credit. The obligation only ever touches a Drive
+write time, so a stale worker cannot restore old credit. A failed attempt moves to `retry` only while the
+obligation is non-terminal and its revision is still the mapping's current one: a late failure never
+reopens `obsolete`/`complete` work nor reschedules a superseded revision (R41). The obligation only ever touches a Drive
 document, and what makes a row one is the persisted same-team `gdrive` row in `source_item_mappings`
 together with current Drive source evidence on the row (`lib/ingest/repair-eligibility.ts`): that rule
 bounds candidate nomination alongside the author and cursor bounds, and is rechecked by its own
@@ -2446,7 +2483,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/auth/slack/callback` — browser (no API key): verify+consume state nonce, exchange `code` (`oauth.v2.access`), re-validate via `auth.test`, store the user token encrypted (`member_secrets`) + capture identity; renders HTML (never the token)
 - `GET /api/auth/slack/status` — member-authed: `{ connected, slack_user_id, workspace }` (never returns the token; `no-store`)
 - `GET /api/auth/gdrive/start` — team-admin-authenticated Google Drive OAuth start; signed single-use team/member-bound state whose browser half is an HttpOnly binding cookie, and explicit per-file vs folder-discovery scopes
-- `GET /api/auth/gdrive/callback` — redeem the state only with the initiating browser's binding cookie and only for the session of the Admin who started it, then exchange and verify the Google account and atomically publish account config + encrypted refresh credential; an old refresh token is reusable only for the same verified subject/client pair
+- `GET /api/auth/gdrive/callback` — redeem the state only with the initiating browser's binding cookie and only for the session of the Admin who started it, then exchange and verify the Google account's subject and atomically publish account config + encrypted refresh credential (an email creates identity mappings only when Google's `email_verified` is literally `true`; a missing or unverified email still connects, by subject, unlinked); an old refresh token is reusable only for the same verified subject/client pair
 - `POST /api/v1/integrations/gdrive/execution` — dedicated connector-principal acquire/checkpoint/release for the current immutable integration generation + lease fence and authoritative progress revision; acquire never self-binds, and every commit transaction rereads the bound key/member/posture plus connection/fence. Selection/account/credential changes advance the content generation and reset its cursor obligations; status-only pause/resume instead advances the fence, clears the lease, and retains generation/progress so resumption cannot skip acknowledged work or request a fresh start token
 - `POST /api/v1/integrations/gdrive/token` — fenced no-store OAuth access-token broker; refresh/client secrets remain server-side, and bound-principal revocation is reread after provider refresh before issuance, in the one row-locked transaction that also records the issuance — a pause, disconnect, rebind or key revocation cannot commit between that check and the token's release
 - `GET /api/v1/integrations/gdrive/runs` — connection-bound connector claim for durable Admin Run-now/retry requests

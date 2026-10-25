@@ -422,3 +422,84 @@ describe("AIO-1167 Drive identity repair (real Postgres)", () => {
     expect(await authorizationEpoch(db(),seed.teamId)).toBeGreaterThan(aliasEpoch);
   });
 });
+
+describe("AIO-1167 R41: a late worker failure never reopens terminal or superseded repair work (real Postgres)", () => {
+  /**
+   * Spec. `retry` is a transition for CURRENT, non-terminal obligations only. A worker that fails
+   * after its obligation became `obsolete` or `complete` — or after the mapping moved to a newer
+   * revision — must leave it exactly as it is: terminal states are final, and a superseded
+   * revision is retired by the drain, never rescheduled.
+   */
+  async function status(seed: Seed, revision: number) {
+    const { data } = await db().from("identity_repair_obligations").select("status,attempts")
+      .eq("team_id", seed.teamId).eq("provider", "gdrive").eq("external_id", EXTERNAL_ID)
+      .eq("mapping_revision", revision).single();
+    return data as { status: string; attempts: number };
+  }
+
+  async function linked(seed: Seed) {
+    const alice = await member(seed, "Alice", "provider@example.com");
+    await driveItem(seed, "race");
+    const link = await setMemberIdentity(db(), seed.teamId, alice, {
+      provider: "gdrive", externalId: EXTERNAL_ID, email: "provider@example.com",
+    });
+    return { alice, revision: link.mappingRevision! };
+  }
+
+  it.each(["obsolete", "complete"])("an obligation made %s while the worker ran stays so after it fails", async (terminal) => {
+    const seed = await seedTeam();
+    const { revision } = await linked(seed);
+    const work = await obligation(seed, revision);
+    const before = await status(seed, revision);
+
+    await expect(runIdentityRepairObligation(db(), work, {
+      hooks: {
+        afterSnapshot: async () => {
+          await db().from("identity_repair_obligations").update({ status: terminal })
+            .eq("team_id", seed.teamId).eq("provider", "gdrive").eq("external_id", EXTERNAL_ID)
+            .eq("mapping_revision", revision);
+          throw new Error("late worker failure");
+        },
+      },
+    })).rejects.toThrow("late worker failure");
+
+    expect(await status(seed, revision)).toEqual({ status: terminal, attempts: before.attempts });
+  });
+
+  it("a failure after the mapping moved on does not reschedule the superseded revision", async () => {
+    const seed = await seedTeam();
+    const { revision } = await linked(seed);
+    const bob = await member(seed, "Bob");
+    const work = await obligation(seed, revision);
+    const before = await status(seed, revision);
+
+    await expect(runIdentityRepairObligation(db(), work, {
+      hooks: {
+        afterSnapshot: async () => {
+          await setMemberIdentity(db(), seed.teamId, bob, {
+            provider: "gdrive", externalId: EXTERNAL_ID,
+          }, { force: true, expectedRevision: revision });
+          throw new Error("late worker failure");
+        },
+      },
+    })).rejects.toThrow("late worker failure");
+
+    const after = await status(seed, revision);
+    // Whatever the mapping writer did with the old revision, the late failure added nothing to it.
+    expect(after.status).not.toBe("retry");
+    expect(after.attempts).toBe(before.attempts);
+  });
+
+  it("positive control: a failure of CURRENT work is still scheduled for retry", async () => {
+    const seed = await seedTeam();
+    const { revision } = await linked(seed);
+    const work = await obligation(seed, revision);
+    const before = await status(seed, revision);
+
+    await expect(runIdentityRepairObligation(db(), work, {
+      hooks: { afterSnapshot: async () => { throw new Error("transient failure"); } },
+    })).rejects.toThrow("transient failure");
+
+    expect(await status(seed, revision)).toEqual({ status: "retry", attempts: before.attempts + 1 });
+  });
+});

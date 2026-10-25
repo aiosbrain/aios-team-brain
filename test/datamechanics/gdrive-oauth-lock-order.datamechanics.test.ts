@@ -88,7 +88,7 @@ const publication = (w: World, name: string, over: { subject?: string; email?: s
   clientId: "oauth-client", clientSecret: "new-secret",
   subject: over.subject ?? `acct-${randomUUID().slice(0, 8)}`,
   // An exact roster address of the OTHER Admin: the publication writes both verified mappings.
-  email: over.email ?? w.other.email, name: "Verified Account",
+  email: over.email ?? w.other.email, emailVerified: true, name: "Verified Account",
   refreshToken: "published-refresh", scopes: ["https://www.googleapis.com/auth/drive.file"],
 });
 

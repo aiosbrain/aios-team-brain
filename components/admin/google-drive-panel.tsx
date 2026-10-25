@@ -38,7 +38,13 @@ function describeAuthorization(drive: IntegrationRow, summarize: GoogleDrivePane
   if (drive.config.authMode === "service_account") {
     return `Service-account mode: ${String(drive.config.serviceAccountStatus ?? "pending")} ${drive.config.serviceAccountIdentity ? `(${String(drive.config.serviceAccountIdentity)})` : ""}. Credentials remain local to the sidecar. ${summarize(drive.config)}.`;
   }
-  return `${drive.hasSecret ? `Connected as ${String(drive.config.authenticatedAccount ?? "an unverified account")}` : "Reconnect required"}. ${drive.status === "disabled" ? "Paused or disconnected. " : ""}${summarize(drive.config)}. Shared-login member credit is managed under Members → Identities.`;
+  // An address Google did not verify is account metadata only: it linked no member, so its credit
+  // stays unresolved until an Admin maps it under Members → Identities.
+  const unverified = drive.config.authenticatedAccountEmailVerified === false;
+  const account = drive.config.authenticatedAccount
+    ? `${String(drive.config.authenticatedAccount)}${unverified ? " (email not verified by Google; attribution unresolved until mapped)" : ""}`
+    : "an account without a verified email (attribution unresolved until mapped)";
+  return `${drive.hasSecret ? `Connected as ${account}` : "Reconnect required"}. ${drive.status === "disabled" ? "Paused or disconnected. " : ""}${summarize(drive.config)}. Shared-login member credit is managed under Members → Identities.`;
 }
 
 export function GoogleDrivePanel(props: GoogleDrivePanelProps) {
