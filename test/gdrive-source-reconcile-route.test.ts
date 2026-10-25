@@ -114,6 +114,8 @@ describe("POST /api/v1/items/source-reconcile staged snapshot continuation", () 
     await expect(response.json()).resolves.toMatchObject({ snapshotApplied: false, snapshotStaged: 20_000 });
     expect(h.commit).toHaveBeenCalledExactlyOnceWith(
       h.auth, { integrationId: INTEGRATION, generation: 7, fence: 3, owner: OWNER }, expect.any(Function),
+      // An inspection decides no absence: the root-coverage gate is not requested.
+      { requireRootCoverage: false },
     );
     expect(h.stage.mock.calls[0][2]).toMatchObject({
       connectionId: INTEGRATION,
@@ -265,5 +267,43 @@ describe("POST /api/v1/items/source-reconcile failure responses (AIO-1167 F2)", 
     expect(await read(await post())).toMatchObject({
       status: 409, json: { error: { code: "snapshot_incomplete", message: "snapshot is not complete" } },
     });
+  });
+});
+
+
+describe("AIO-1167 R41: a complete snapshot is applied only behind the root-coverage gate", () => {
+  function postBody(extra: Record<string, unknown>): Promise<Response> {
+    return POST(new Request("https://brain.example.com/api/v1/items/source-reconcile", {
+      method: "POST",
+      headers: { Authorization: "Bearer aios_key-1_secret", "Content-Type": "application/json" },
+      body: JSON.stringify({
+        source: "gdrive", integration_id: INTEGRATION, generation: 7, fence: 3, owner: OWNER,
+        removed_provider_ids: [], reason: "provider-confirmed removal", ...extra,
+      }),
+    }) as unknown as NextRequest);
+  }
+
+  it.each([
+    ["a single-request complete snapshot", { complete: true, provider_ids: ["doc"] }, true],
+    ["a finalizing staged page", { complete: true, provider_ids: ["doc-20000"], snapshot_id: SNAPSHOT, total: 20_001 }, true],
+    ["a non-final staged page", { complete: false, provider_ids: ["doc"], snapshot_id: SNAPSHOT }, false],
+  ])("%s requests requireRootCoverage=%s from the fenced commit", async (_label, snapshot, required) => {
+    await post(snapshot);
+    expect(h.commit.mock.calls[0][3]).toEqual({ requireRootCoverage: required });
+  });
+
+  it("an explicit provider-confirmed removal (no snapshot) is not roster-gated", async () => {
+    await postBody({ removed_provider_ids: ["gone"] });
+    expect(h.commit.mock.calls[0][3]).toEqual({ requireRootCoverage: false });
+  });
+
+  it("a refusal for incomplete root coverage is a typed 409 and drains nothing", async () => {
+    h.commit.mockRejectedValueOnce(new h.GdriveAuthorityError(
+      "root_coverage_incomplete", "Google Drive selection is not fully resolved (root_unresolved); a complete snapshot cannot be applied", 409,
+    ));
+    const response = await post({ complete: true, provider_ids: ["doc"] });
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "root_coverage_incomplete" } });
+    expect(h.drain).not.toHaveBeenCalled();
   });
 });

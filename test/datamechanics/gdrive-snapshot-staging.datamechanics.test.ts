@@ -52,8 +52,18 @@ function request(url: string, c: Pick<Connector, "seed" | "key">, body: unknown,
   }) as NextRequest;
 }
 
-/** A Drive connection, its bound connector key, and a live execution — what the worker holds. */
-async function connector(): Promise<Connector> {
+/** The coordinator's fenced root evidence for this fixture's one selected file root (AIO-1167 R41). */
+const rootEvidence = (generation: number, status = "bound") => ({
+  version: 2, streams: {},
+  roots: { generation, items: [{ kind: "file", id: "DocA", status, drive_id: status === "bound" ? "my-drive" : null }] },
+});
+
+/**
+ * A Drive connection, its bound connector key, and a live execution — what the worker holds.
+ * Like a real coordinator, it has checkpointed its selected-root evidence before any complete
+ * snapshot (`evidence: false` leaves none, `"unresolved"` records the root as unresolved).
+ */
+async function connector(evidence: false | "bound" | "unresolved" = "bound"): Promise<Connector> {
   const seed = await seedTeam();
   const audienceProjectId = await approvedAudienceProject(seed);
   const row = await upsertIntegration(db(), { teamId: seed.teamId, memberId: seed.memberId }, {
@@ -79,7 +89,14 @@ async function connector(): Promise<Connector> {
     action: "acquire", integration_id: row.id, owner,
   }));
   expect(acquired.status).toBe(200);
-  const lease = await acquired.json() as { generation: number; fence: number };
+  const lease = await acquired.json() as { generation: number; fence: number; progress_revision: number };
+  if (evidence) {
+    const checkpointed = await executionPOST(request("http://test/api/v1/integrations/gdrive/execution", { seed, key: issued.key }, {
+      action: "checkpoint", integration_id: row.id, owner, generation: lease.generation, fence: lease.fence,
+      progress_revision: lease.progress_revision, progress: rootEvidence(lease.generation, evidence),
+    }));
+    expect(checkpointed.status).toBe(200);
+  }
   return { seed, integrationId: row.id, key: issued.key, execution: { generation: lease.generation, fence: lease.fence, owner } };
 }
 
@@ -389,4 +406,43 @@ describe("AIO-1167 source reconciliation above 10,000 selected documents (real P
     expect(restarted).toMatchObject({ status: 200, body: { snapshotStaged: second.length } });
     expect(await stagedMembers(c)).toBe(second.length);
   }, 120_000);
+});
+
+
+describe("AIO-1167 R41: the absence boundary refuses a complete snapshot without full root coverage (real Postgres)", () => {
+  it.each([
+    ["no root evidence at all", false as const],
+    ["an unresolved selected root", "unresolved" as const],
+  ])("%s: the complete snapshot is refused and retires nothing", async (_label, evidence) => {
+    const c = await connector(evidence);
+    await claimDocument(c, "doc-kept");
+
+    const refused = await reconcile(c, { complete: true, provider_ids: [] });
+
+    expect(refused.status).toBe(409);
+    expect(refused.body.error?.code).toBe("root_coverage_incomplete");
+    // The claim the empty "complete" snapshot would have retired is still active.
+    expect(await activeClaims(c)).toEqual(["doc-kept"]);
+  });
+
+  it("with every selected root bound, the same complete snapshot is applied", async () => {
+    const c = await connector("bound");
+    await claimDocument(c, "doc-gone");
+
+    const applied = await reconcile(c, { complete: true, provider_ids: [] });
+
+    expect(applied.status).toBe(200);
+    expect(await activeClaims(c)).toEqual([]);
+  });
+
+  it("an explicit provider-confirmed removal is not roster-gated", async () => {
+    const c = await connector("unresolved");
+    await claimDocument(c, "doc-deleted");
+    const response = await reconcilePOST(request("http://test/api/v1/items/source-reconcile", c, {
+      source: "gdrive", integration_id: c.integrationId, ...c.execution,
+      removed_provider_ids: ["doc-deleted"], reason: "provider confirmed deletion",
+    }));
+    expect(response.status).toBe(200);
+    expect(await activeClaims(c)).toEqual([]);
+  });
 });

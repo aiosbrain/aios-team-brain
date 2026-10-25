@@ -120,7 +120,10 @@ export async function POST(req: NextRequest) {
         reason: parsed.data.reason,
       },
       { memberId: auth.memberId, apiKeyId: auth.apiKeyId },
-    ));
+    // A complete snapshot asserts connection-wide absence: refused unless the coordinator's fenced
+    // root evidence covers every selected root (AIO-1167 R41). Explicit provider-confirmed removals
+    // and non-final staged pages decide no roster-wide absence and are not gated here.
+    ), { requireRootCoverage: parsed.data.snapshot?.complete === true });
     // Physical cache/graph/item cleanup is explicitly outside the execution-fence transaction.
     // Durable suppression + epoch already committed, so failure here is safe and retryable.
     const cleaned = await drainGdriveCleanupObligations(db, auth.teamId);

@@ -197,6 +197,7 @@ class _Brain:
         self.checkpoints: list[dict] = []
         self.checkpoint_faults: list = []  # callables(payload) -> exception | None
         self.gate_closed = False
+        self.gate_closed_event = threading.Event()
 
     def install(self, monkeypatch):
         brain = self
@@ -208,6 +209,7 @@ class _Brain:
             def close(self):
                 brain.gate_closed = True
                 brain.events.append("gate-close")
+                brain.gate_closed_event.set()
 
         class Client:
             def __init__(self, *args, **kwargs): pass
@@ -470,84 +472,103 @@ async def test_uncertain_attempts_expire_at_their_requested_expiry_and_stay_term
     state.close()
 
 
+def _controlled_deadline(monkeypatch) -> asyncio.Event:
+    """The renewal's worker deadline passes exactly when the test sets the returned event.
+
+    Replaces only the bounded wait (``watch_renewal._wait_bounded``): the worker, the thread pool,
+    the abandonment, late-result handling and publication are all the production code.
+    """
+    deadline_passed = asyncio.Event()
+
+    async def wait_until_the_test_says(awaitable, _timeout):
+        waiter = asyncio.ensure_future(awaitable)
+        stopper = asyncio.ensure_future(deadline_passed.wait())
+        done, _pending = await asyncio.wait({waiter, stopper}, return_when=asyncio.FIRST_COMPLETED)
+        if waiter in done:
+            stopper.cancel()
+            return waiter.result()
+        waiter.cancel()  # cancels the shield's outer future; the worker itself keeps running
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(watch_renewal, "_wait_bounded", wait_until_the_test_says)
+    return deadline_passed
+
+
+def _blocking_provider(brain: _Brain, resource_id: str):
+    entered, release = threading.Event(), threading.Event()
+
+    def blocked(record, token):
+        entered.set()
+        assert release.wait(10), "the test never released the provider call"
+        return {"id": record.attempt_id, "resourceId": resource_id, "expiration": _ms(timedelta(days=6))}
+
+    return _Provider(brain, on_dispatch=blocked), entered, release
+
+
 async def test_slow_provider_work_leaves_unrelated_scheduler_work_responsive_and_late_results_inert(
     tmp_path, monkeypatch,
 ):
-    monkeypatch.setattr(watch_renewal, "WATCH_RUN_SECONDS", 1.0)
-    monkeypatch.setattr(watch_renewal, "WATCH_CLEANUP_SECONDS", 0.05)
+    deadline_passed = _controlled_deadline(monkeypatch)
     brain = _Brain().install(monkeypatch)
-    release = threading.Event()
-    entered = threading.Event()
-
-    def slow(record, token):
-        entered.set()
-        release.wait(5)
-        return {"id": record.attempt_id, "resourceId": "res-late", "expiration": _ms(timedelta(days=6))}
-
-    provider = _Provider(brain, on_dispatch=slow)
+    provider, entered, release = _blocking_provider(brain, "res-late")
     state = StateStore(str(tmp_path / "slow.sqlite"))
-    ticks = []
 
+    sweep = asyncio.create_task(watch_renewal.renew_watches(state, provider, [_conn()], SETTINGS))
+    await asyncio.to_thread(entered.wait, 10)
+
+    # The provider call is stuck in its worker thread. Unrelated work on the same event loop runs
+    # to completion meanwhile — the sweep has not finished, and nothing waits on the provider.
     async def unrelated_job():
-        # Another scheduler job sharing the event loop.
-        while len(ticks) < 50:
-            ticks.append(time.monotonic())
-            await asyncio.sleep(0.01)
+        for _ in range(50):
+            await asyncio.sleep(0)
+        return "done"
 
-    started = time.monotonic()
-    await asyncio.gather(watch_renewal.renew_watches(state, provider, [_conn()], SETTINGS), unrelated_job())
+    assert await unrelated_job() == "done"
+    assert not sweep.done()
 
-    assert entered.is_set()
-    assert len(ticks) == 50  # the loop kept running while the provider call was stuck
-    assert time.monotonic() - started < 4  # bounded by the run deadline, not by the provider
+    # The deadline passes: the worker is abandoned and the outcome published as unknown.
+    deadline_passed.set()
+    await sweep
     (record,) = brain.records().values()
     assert record.state == UNCERTAIN
-    # The abandoned worker still holds the authority gate: it is not closed underneath it.
+    # The abandoned worker still uses the authority gate: it is not closed underneath it.
     assert brain.gate_closed is False
     assert brain.events.count("release") == 1
 
+    # The worker finishes. Its late answer is cleanup evidence — never an activation — and only
+    # now are its resources closed.
     release.set()
-    for _ in range(100):
-        await asyncio.sleep(0.02)
-        if brain.gate_closed and state.watch_evidence("gd", record.attempt_id):
-            break
-    # Its late answer is evidence that the channel exists — never an activation.
+    assert await asyncio.to_thread(brain.gate_closed_event.wait, 10)
+    await asyncio.sleep(0)  # the evidence write was handed to the loop before the gate closed
     assert state.watch_evidence("gd", record.attempt_id) == "res-late"
     assert state.list_channels("gd", active_only=True) == []
     assert brain.records()[record.attempt_id].state == UNCERTAIN
-    assert brain.gate_closed is True
     state.close()
 
 
 async def test_cancellation_after_dispatch_stops_further_work_and_never_activates(tmp_path, monkeypatch):
     brain = _Brain().install(monkeypatch)
-    release = threading.Event()
-    entered = threading.Event()
-
-    def blocked(record, token):
-        entered.set()
-        release.wait(5)
-        return {"id": record.attempt_id, "resourceId": "res-after-cancel", "expiration": _ms(timedelta(days=6))}
-
-    provider = _Provider(brain, on_dispatch=blocked)
+    provider, entered, release = _blocking_provider(brain, "res-after-cancel")
     state = StateStore(str(tmp_path / "cancel.sqlite"))
+
     sweep = asyncio.create_task(watch_renewal.renew_watches(state, provider, [_conn()], SETTINGS))
-    while not entered.is_set():
-        await asyncio.sleep(0.01)
+    await asyncio.to_thread(entered.wait, 10)
     sweep.cancel()
     with pytest.raises(asyncio.CancelledError):
         await sweep
 
     (record,) = brain.records().values()
-    assert record.state == DISPATCHED  # durably "may exist"; nothing published after cancellation
+    assert record.state == DISPATCHED  # durably "may exist"; nothing was published after cancellation
+    assert brain.events.count("release") == 1
+    assert brain.gate_closed is False  # the surviving worker still holds it
+
     release.set()
-    for _ in range(100):
-        await asyncio.sleep(0.02)
-        if state.watch_evidence("gd", record.attempt_id):
-            break
+    assert await asyncio.to_thread(brain.gate_closed_event.wait, 10)
+    await asyncio.sleep(0)
+    assert state.watch_evidence("gd", record.attempt_id) == "res-after-cancel"
     assert state.list_channels("gd", active_only=True) == []
 
-    # The next sweep owns it: uncertain → stopped by the late response's evidence.
+    # The next sweep owns it: what Google answered late identifies it, so it is stopped.
     provider.on_dispatch = _Provider(brain).on_dispatch
     await watch_renewal.renew_watches(state, provider, [_conn()], SETTINGS)
     assert brain.records()[record.attempt_id].state == RETIRED
@@ -666,9 +687,7 @@ def _manager_with(outcome, gate_error=None):
         if gate_error is not None:
             raise gate_error
 
-    manager = GoogleDriveWatchManager(
-        webhook_url="https://example.test/watch", page_token="unused", provider_gate=gate,
-    )
+    manager = GoogleDriveWatchManager(webhook_url="https://example.test/watch", provider_gate=gate)
     manager._service = lambda deadline=None: Service()
     return manager, seen
 

@@ -434,12 +434,52 @@ def _root_coverage_complete(
     resolved, and an unresolved, uncertain or relocating one leaves the roster incomplete. This is
     the gate in front of every connection-wide absence conclusion.
     """
+    if str(options.get("selection_state") or "") == "empty":
+        # An intentionally empty selection names no root to bind.
+        return not state.unsettled_roots(integration_id, generation)
     obligations = state.root_obligations(integration_id, generation)
     return all(
         (binding := obligations.get(root)) is not None and binding.status == "bound"
         and bool(binding.drive_id)
         for root in _selected_roots(options)
     ) and not state.unsettled_roots(integration_id, generation)
+
+
+class IncompleteRootCoverage(BrainError):
+    """A complete snapshot was about to be submitted while the selected-root roster is not covered."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            409, "root_coverage_incomplete",
+            "selected roots are not all resolved; a complete snapshot would infer absence",
+        )
+
+
+async def _submit_complete_snapshot(
+    client: BrainClient, execution: GdriveExecution, state: StateStore, options: dict[str, Any],
+    snapshot: list[str], *, reason: str,
+) -> dict[str, Any]:
+    """THE coordinator's only way to submit a complete snapshot (connection-wide absence).
+
+    It re-derives root coverage itself rather than trusting its caller, so a future call site
+    cannot skip the gate; ``test_only_the_typed_boundary_submits_complete_snapshots`` fails the
+    build if ``complete_snapshot_ids=`` appears anywhere else. The brain enforces the same rule
+    against the fenced ``roots`` evidence (`lib/integrations/gdrive-root-coverage.ts`) — this side
+    refuses before a request is made, that side refuses whatever the caller.
+    """
+    generation = int(execution.generation)
+    if not _root_coverage_complete(state, execution.integration_id, generation, options):
+        raise IncompleteRootCoverage()
+    # The brain judges coverage from the root evidence it last ACKNOWLEDGED. A root can settle in a
+    # run that writes no other checkpoint (a relocation cancelled during binding, every stream
+    # already complete-pending), so the current evidence is published first whenever it differs —
+    # otherwise the boundary would refuse a covered snapshot forever.
+    current = roots_section(generation, state.root_obligations(execution.integration_id, generation))
+    if execution.progress.get(ROOTS_KEY) != current:
+        streams = state.list_progress(execution.integration_id, generation)
+        if streams:
+            await _checkpoint_progress(client, execution, state, streams[0].namespace)
+    return await client.reconcile_gdrive(execution, complete_snapshot_ids=snapshot, reason=reason)
 
 
 def _stream_ids(
@@ -629,8 +669,8 @@ async def run_gdrive_stream(
                 )
                 total = IngestSummary(conn.name, failure_categories={}, integration_id=integration_id)
                 try:
-                    reconciled = await client.reconcile_gdrive(
-                        execution, complete_snapshot_ids=[],
+                    reconciled = await _submit_complete_snapshot(
+                        client, execution, state, options, [],
                         reason=f"complete empty gdrive scope generation {execution.generation}",
                     )
                     total.removed += int(reconciled.get("items") or 0)
@@ -918,8 +958,8 @@ async def run_gdrive_stream(
                     )
                 })
                 try:
-                    reconciled = await client.reconcile_gdrive(
-                        execution, complete_snapshot_ids=snapshot,
+                    reconciled = await _submit_complete_snapshot(
+                        client, execution, state, options, snapshot,
                         reason=f"complete multi-stream gdrive scope generation {generation}",
                     )
                     total.removed += int(reconciled.get("items") or 0)

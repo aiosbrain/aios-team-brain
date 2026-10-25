@@ -73,6 +73,15 @@ RENEWAL_SKEW_SECONDS = 600
 _POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="gdrive-watch")
 
 
+async def _wait_bounded(awaitable: Any, timeout: float) -> Any:
+    """Wait for a worker's result for at most ``timeout`` seconds (``asyncio.TimeoutError`` after).
+
+    The one place a blocking step's deadline is enforced — a seam, so tests decide exactly when
+    the deadline passes instead of racing a wall clock.
+    """
+    return await asyncio.wait_for(awaitable, timeout=timeout)
+
+
 class WatchStepTimeout(Exception):
     """A blocking step outlived the run deadline. ``started``: whether it ever began."""
 
@@ -131,7 +140,7 @@ class _Run:
         self.running.append(future)
         future.add_done_callback(lambda done: self.running.remove(done) if done in self.running else None)
         try:
-            return await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(future)), timeout=remaining)
+            return await _wait_bounded(asyncio.shield(asyncio.wrap_future(future)), remaining)
         except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
             started = not future.cancel()
             if started and on_late is not None:

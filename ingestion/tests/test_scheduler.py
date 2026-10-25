@@ -484,23 +484,6 @@ async def test_manual_request_runs_oauth_only_connection_without_a_local_stub(
     state.close()
 
 
-async def test_renewal_job_renews_due_channels(tmp_path):
-    state = StateStore(str(tmp_path / "s.sqlite"))
-    conn = Connection(name="gd", source="gdrive", options={"folder_id": "f"})
-    # An already-expired channel must be renewed.
-    state.save_channel(Channel("gd", "old-ch", "tok", "2000-01-01T00:00:00+00:00"))
-
-    class FakeWatch:
-        def renew(self, channel, page_token=None):
-            return Channel(channel.connection, "new-ch", "tok2", "2099-01-01T00:00:00+00:00")
-
-    await _renewal_job(state, FakeWatch(), [conn])
-    refreshed = state.get_channel("gd")
-    assert refreshed.channel_id == "new-ch"
-    assert refreshed.expires_at == "2099-01-01T00:00:00+00:00"
-    state.close()
-
-
 async def test_renewal_job_rereads_pause_after_scheduler_start(tmp_path, monkeypatch):
     state = StateStore(str(tmp_path / "paused.sqlite"))
     conn = Connection(name="gd", source="gdrive", options={"api_mode": "docs"})

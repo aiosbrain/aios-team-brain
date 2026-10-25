@@ -12,7 +12,7 @@ import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Protocol
+from typing import Any, Protocol
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -29,16 +29,18 @@ _RENEWAL_SKEW = 600
 
 
 class WatchManager(Protocol):
-    """Creates and stops Drive watch channels.
+    """Creates and stops Drive watch channels for the fenced lifecycle (``watch_renewal``).
 
-    The fenced scheduler path (``watch_renewal``) uses ``dispatch``/``stop`` — one bounded provider
-    request per call, never retried, run in a worker thread. ``renew`` is the legacy local path for
-    a scheduler built without brain settings.
+    One bounded provider request per call, never retried, always run in a renewal-owned worker
+    thread — the scheduler loop never makes a provider call itself. There is no other creation path.
     """
 
-    def renew(self, channel: Channel, page_token: str | None = None,
-              access_token: str | None = None, provider_gate=None,
-              drive_id: str | None = None) -> Channel: ...
+    def dispatch(self, record: Any, *, page_token: str, verification_token: str,
+                 access_token: str | None = None, provider_gate=None,
+                 deadline: float | None = None) -> dict: ...
+
+    def stop(self, record: Any, resource_id: str, *, access_token: str | None = None,
+             provider_gate=None, deadline: float | None = None) -> None: ...
 
 
 def _now_iso() -> str:
@@ -386,20 +388,14 @@ def _gdrive_outcome_status(summary) -> str:
 
 async def _renewal_job(
     state: StateStore, manager: WatchManager, connections: list[Connection],
-    settings: BrainSettings | None = None,
+    settings: BrainSettings,
 ) -> None:
     # Re-read authoritative Admin state on every sweep. A scheduler that started while enabled must
-    # not renew a watch after pause/disconnect, and a selection read failure fails closed.
+    # not renew a watch after pause/disconnect, and a selection read failure fails closed. There is
+    # deliberately no path without brain settings: an unfenced, synchronous renewal on the event
+    # loop was the defect this lifecycle replaces (AIO-1167 R41).
     now = _now_iso()
     channels = state.list_channels(active_only=True)
-    if settings is None:  # unit/local compatibility; production always supplies settings.
-        configured = {conn.name for conn in connections}
-        for ch in due_for_renewal([c for c in channels if c.connection in configured], now):
-            progress = state.get_progress(ch.namespace) if ch.namespace else None
-            page_token = (progress.page_token or progress.baseline_start_token) if progress else None
-            state.save_channel(manager.renew(ch, page_token))
-        return
-
     # The fenced lifecycle (AIO-1167 R41): durable intent before dispatch, bounded offloaded
     # provider work, uncertain-outcome recovery and cleanup, renewal-owned state that never touches
     # a cursor. Admin state is re-read there on every sweep; pause/disconnect renews nothing.

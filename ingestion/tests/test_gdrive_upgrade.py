@@ -1057,24 +1057,34 @@ def test_real_google_transport_unrelated_error_is_not_classified_as_refreshable(
 
 
 @pytest.mark.parametrize("drive_id", ["shared-a", "shared-b", "my-drive"])
-def test_watch_preserves_authoritative_token_drive_pair(drive_id):
+def test_watch_dispatch_preserves_authoritative_token_drive_pair(drive_id):
+    """The cursor and drive of a creation come from its lifecycle record and the brain's stream,
+    together; My Drive deliberately omits ``driveId``."""
+    from datetime import datetime, timedelta, timezone
+    from aios_ingest.watch_lifecycle import DISPATCHED, WatchRecord
+
     seen = []
 
     class Changes:
         def watch(self, **kwargs):
             seen.append(kwargs)
-            return _Request({"id": f"channel-{drive_id}", "resourceId": "resource"})
+
+            class Request:
+                def execute(self, num_retries=None):
+                    return {"id": "attempt", "resourceId": "resource"}
+            return Request()
 
     class Service:
         def changes(self): return Changes()
 
-    manager = GoogleDriveWatchManager(
-        webhook_url="https://example.test/watch", page_token="fallback",
-        drive_id=drive_id,
+    manager = GoogleDriveWatchManager(webhook_url="https://example.test/watch")
+    manager._service = lambda deadline=None: Service()
+    record = WatchRecord(
+        attempt_id="attempt", connection="gd", integration_id="i", account_id="a", drive_id=drive_id,
+        generation=1, namespace="namespace", verification_hash="hash",
+        requested_expiry=(datetime.now(timezone.utc) + timedelta(days=7)).isoformat(), state=DISPATCHED,
     )
-    manager._service = lambda: Service()
-    channel = Channel("gd", "old", "old-resource", None, "namespace")
-    manager.renew(channel, "authoritative-token", drive_id)
+    manager.dispatch(record, page_token="authoritative-token", verification_token="raw")
 
     assert seen[0]["pageToken"] == "authoritative-token"
     if drive_id == "my-drive":
@@ -1084,27 +1094,33 @@ def test_watch_preserves_authoritative_token_drive_pair(drive_id):
         assert seen[0]["supportsAllDrives"] is True
 
 
-def test_configured_watch_router_forwards_authoritative_drive_id(monkeypatch):
+def test_configured_watch_router_forwards_the_records_drive_and_cursor(monkeypatch):
     seen = []
 
     class Manager:
         def __init__(self, **kwargs):
-            seen.append(("init", kwargs["drive_id"], kwargs["page_token"]))
-        def renew(self, channel, page_token=None, drive_id=None):
-            seen.append(("renew", drive_id, page_token))
-            return channel
+            seen.append(("init", kwargs["drive_id"], kwargs["access_token"]))
+        def dispatch(self, record, *, page_token, verification_token, deadline=None):
+            seen.append(("dispatch", record.drive_id, page_token, verification_token))
+            return {}
 
     monkeypatch.setattr("aios_ingest.sources.gdrive_watch.GoogleDriveWatchManager", Manager)
     router = ConfiguredGoogleDriveWatchManager([
         Connection("gd", "gdrive", options={"webhook_url": "https://example.test/watch"}),
     ])
-    channel = Channel("gd", "old", "resource", None, "namespace")
-    router.renew(channel, "cursor", "access", None, "shared-drive")
+    record = type("Record", (), {"connection": "gd", "drive_id": "shared-drive", "attempt_id": "a"})()
+    router.dispatch(record, page_token="cursor", verification_token="raw", access_token="access")
 
     assert seen == [
-        ("init", "shared-drive", "cursor"),
-        ("renew", "shared-drive", "cursor"),
+        ("init", "shared-drive", "access"),
+        ("dispatch", "shared-drive", "cursor", "raw"),
     ]
+
+
+def test_watch_managers_have_no_unfenced_creation_path():
+    """R41: the legacy synchronous ``renew`` is gone from both managers — creation is lifecycle-only."""
+    assert not hasattr(GoogleDriveWatchManager, "renew")
+    assert not hasattr(ConfiguredGoogleDriveWatchManager, "renew")
 
 
 def test_namespaced_progress_pending_ack_and_validated_overlapping_channels(tmp_path):

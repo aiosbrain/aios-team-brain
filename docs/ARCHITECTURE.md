@@ -975,7 +975,15 @@ authority loss and an exhausted provider budget still stop binding. While any ro
 `uncertain` the stream roster may be incomplete, so authoritative completion is withheld and
 `_cross_stream_removal` infers no absence from stream membership — only a document's own provider
 not-found/trash (AC-05) still removes. Completion requires positive coverage: every selected root
-bound and settled (a root with no obligation row is unknown, not resolved). Root obligations ride
+bound and settled (a root with no obligation row is unknown, not resolved). The absence boundary is
+enforced on BOTH sides: the sidecar submits complete snapshots only through
+`_submit_complete_snapshot` (which re-derives coverage; an AST guard pins it as the sole caller, and
+`_drain_pending` as the sole per-document removal caller), and the brain's fenced commit refuses any
+complete snapshot whose locked row's `progress.roots` does not cover every selected root for the
+generation (`withGdriveExecutionCommit(..., { requireRootCoverage })` →
+`lib/integrations/gdrive-root-coverage.ts`, `409 root_coverage_incomplete`) — so no connector-key
+caller can assert completion past an unknown roster. Explicit provider-confirmed removals and
+non-final staged pages are not roster-gated. Root obligations ride
 every coordinator checkpoint as the brain-fenced `roots` section and are re-adopted by a sidecar that
 lost its SQLite state (`connector_state`, `_adopt_remote_root_evidence`). The selected root id stays the
 selection when the root is moved to another drive; only its binding changes, and never by inference.
@@ -1125,7 +1133,9 @@ hint. **One owner per section of the fenced connector state (`connector_state.py
 owns `streams`/top-level cursors and `roots`; renewal owns `watches`; each carries the other's part
 unchanged (`coordinator_document`/`renewal_document`), so a poll can no longer erase renewal's records.
 `webhook_channels` is a projection of `watches` (state column; only `active` rows validate
-notifications), rebuilt from the brain at every sweep.
+notifications), rebuilt from the brain at every sweep. The unfenced synchronous `renew()` path and the
+settings-less renewal job are removed: `_renewal_job` requires brain settings and the managers expose
+only `dispatch`/`stop`.
 Immediately before every new Drive/Docs request, pagination step, retry, or watch call, the sidecar
 renews and revalidates the current server authority. A failed check is run-terminal and remains
 outside provider-read recovery catches. Watch renewal first acquires current authority and derives
@@ -2462,7 +2472,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `POST /api/internal/executor-gateway/v1/admin/:teamSlug/service-identities/:serviceIdentityId/credentials` — add a client-generated overlapping credential without returning its secret
 - `POST /api/internal/executor-gateway/v1/admin/:teamSlug/service-identities/:serviceIdentityId/credentials/:credentialId/revoke` — advisory-lock-linearized credential revocation
 - `POST /api/v1/items` — upsert synced content; its ingest owner transaction locks candidate path/provider identities and requires the current Drive execution when incoming provenance OR the persisted item/mapping is Drive-owned, so omission/relabel and first-create races cannot bypass the fence. The refusal itself lives in the common writer (`ingestItem` → `assertNotDriveOwnedTarget`), on the locked canonical row and before any changed or unchanged mutation, for EVERY caller that is not the fenced commit — `note.create` via `POST /api/v1/actions` or an approval, meetings, connectors, the scanner and seeding included. Only a commit minted inside `ingestGdriveApiItem`'s validated `withGdriveExecutionCommit` (a module-private capability) may write Drive content or a Drive-owned item — an unfenced `source: 'gdrive'` payload is refused even for a first creation or a tombstone restore; a Drive-sourced payload, action policy, an API key or an internal option is not authority, and a paused or disconnected connection writes nothing
-- `POST /api/v1/items/source-reconcile` — authenticated gdrive tombstone/complete-snapshot reconciliation through the shared ingest purge owner; incomplete snapshots never delete; a snapshot above 10,000 ids is staged in pages and finalized atomically
+- `POST /api/v1/items/source-reconcile` — authenticated gdrive tombstone/complete-snapshot reconciliation through the shared ingest purge owner; incomplete snapshots never delete; a snapshot above 10,000 ids is staged in pages and finalized atomically; a complete snapshot is refused (`409 root_coverage_incomplete`) unless the fenced `progress.roots` evidence covers every selected file/folder root
 - `GET /api/v1/items` — tier-filtered, keyset-paginated pull
 - `GET /api/v1/items/:id` — single item fetch
 - `GET /api/v1/tasks` — dashboard task changes for `aios pull` writeback; `?all=1` selects the tier-filtered full tasks-table read (bounded at 500 rows, `updated_at` ASC, no cursor — a full page is the STALEST prefix, so it can confirm a key but can never prove one absent); `?mode=table&keys=A,B` (brain-api 1.14) is the by-key lookup that can — bounded by the keys asked for, answering `unknown_keys` outright (`null` = couldn't determine, never a wrong list). Refused outside table mode, since the other modes filter rows and a real key would look missing

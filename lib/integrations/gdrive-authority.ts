@@ -14,13 +14,14 @@ import { applyGdriveConnectionAudience } from "@/lib/projects/context/gdrive-cla
 import { lockProjectRows } from "@/lib/projects/project-row-locks";
 import { decryptSecret } from "@/lib/secrets/crypto";
 import { validateIntegrationConfig } from "@/lib/api/schemas";
+import { selectedRootCoverage } from "@/lib/integrations/gdrive-root-coverage";
 
 const LEASE_SECONDS = 10 * 60;
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 
 export class GdriveAuthorityError extends Error {
   constructor(
-    readonly code: "connector_principal_required" | "connection_unavailable" | "wrong_connection" | "execution_busy" | "stale_execution" | "stale_progress" | "reconnect_required" | "provider_unavailable" | "admin_authority_changed",
+    readonly code: "connector_principal_required" | "connection_unavailable" | "wrong_connection" | "execution_busy" | "stale_execution" | "stale_progress" | "reconnect_required" | "provider_unavailable" | "admin_authority_changed" | "root_coverage_incomplete",
     message: string,
     readonly status: number,
   ) {
@@ -74,6 +75,14 @@ export interface GdriveCommitScope {
    * Reconciliation plans nothing: it writes no project.
    */
   projects?: () => Promise<GdriveCommitProjectPlan>;
+  /**
+   * The commit asserts connection-wide ABSENCE from a complete snapshot (AIO-1167 R41). Evaluated
+   * against the LOCKED authority row, before anything else: every selected file/folder root must
+   * have bound, settled evidence in the coordinator's fenced `progress.roots` for this generation
+   * (`selectedRootCoverage`). Missing or unsettled evidence refuses the commit — the absence
+   * boundary cannot be passed with an unknown stream roster, whoever is calling.
+   */
+  requireRootCoverage?: boolean;
 }
 
 /** Admin-save validation lives in the integration domain, not the app route. */
@@ -700,6 +709,16 @@ export async function withGdriveExecutionCommit<T>(
   return withTransaction(async () => {
     const audience = await withBoundedLockWaits(async () => {
       const row = await assertLockedExecution(auth, ref);
+      if (scope.requireRootCoverage) {
+        const coverage = selectedRootCoverage(row.config, row.progress, ref.generation);
+        if (!coverage.complete) {
+          throw new GdriveAuthorityError(
+            "root_coverage_incomplete",
+            `Google Drive selection is not fully resolved (${coverage.gap}); a complete snapshot cannot be applied`,
+            409,
+          );
+        }
+      }
       return approvedAudience(row, await scope.projects?.());
     });
     return fn(audience);
