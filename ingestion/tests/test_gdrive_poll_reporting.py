@@ -31,7 +31,7 @@ import pytest
 
 from aios_ingest.brain_client import BrainClient
 from aios_ingest.config import BrainSettings, Connection
-from aios_ingest.scheduler import _poll_job
+from aios_ingest.scheduler import _manual_gdrive_job, _poll_job
 from aios_ingest.sources.gdrive import ProviderDeferred
 from aios_ingest.state import StateStore, StreamKey
 
@@ -42,11 +42,12 @@ INTEGRATION = "00000000-0000-0000-0000-0000000000d1"
 class Brain:
     """A scripted brain: answers by route and records every request it saw."""
 
-    def __init__(self, *, rows, acquire=None, token=None, verify=None):
+    def __init__(self, *, rows, acquire=None, token=None, verify=None, claim=None):
         self.rows = rows  # a list, or a list of lists consumed one per selection read
         self.acquire = acquire or (lambda: (409, {"error": {"code": "execution_busy", "message": "busy"}}))
         self.token = token
         self.verify = verify or (lambda: (200, {"ok": True}))
+        self.claim = claim  # the durable Admin request a manual-run claim returns, or None
         self.requests: list[tuple[str, str, dict | None]] = []
 
     def selections(self):
@@ -73,6 +74,8 @@ class Brain:
             status, payload = self.token()
             return httpx.Response(status, json=payload)
         if path == "/api/v1/integrations/gdrive/runs":
+            if request.method == "GET":
+                return httpx.Response(200, json={"request": self.claim})
             return httpx.Response(200, json={"ok": True})
         return httpx.Response(404, json={"error": {"code": "not_found", "message": path}})
 
@@ -388,7 +391,8 @@ async def test_a_stream_setup_exception_on_an_enabled_connection_is_one_sanitize
     assert report["integrationId"] == INTEGRATION
     assert report["error"] == "coordinator_error"
     assert report["failed"] == 1 and report["authoritativeComplete"] is False
-    assert report["status"] not in {"complete", "deferred"} and report["backlog"] is None
+    # A run that only failed is durably a failure, never presented as partial progress.
+    assert report["status"] == "failed" and report["backlog"] is None
     # Nothing about the exception leaves the process: no path, no marker, no class name, no text.
     wire = json.dumps(report)
     for leak in (key_path, SECRET_MARKER, "Errno", "No such file", "FileNotFoundError", "RuntimeError"):
@@ -442,5 +446,54 @@ async def test_cancellation_during_the_stream_is_never_converted_into_a_report(t
             "local-docs", "gdrive",
             options={"integration_id": INTEGRATION, "service_account_key_path": "/local/key.json"},
         ), state)
+    assert b.reports() == []
+    state.close()
+
+
+MANUAL_CLAIM = {
+    "id": "00000000-0000-0000-0000-0000000000e1", "integration_id": INTEGRATION, "name": "local-docs",
+    "trigger": "retry", "created_at": "2026-10-26T10:00:00+00:00",
+    "attempt_token": "00000000-0000-0000-0000-0000000000e2",
+}
+
+
+async def test_a_manual_run_that_raises_reports_the_same_fixed_category_and_nothing_of_the_exception(
+    tmp_path, brain, monkeypatch,
+):
+    """Run now / Retry: a claimed request whose run raises completes as one sanitized failure."""
+    state = StateStore(str(tmp_path / "manual-raised.sqlite"))
+    b = brain(Brain(rows=[row()], claim=MANUAL_CLAIM))
+    key_path = f"/secrets/{SECRET_MARKER}/service-account.json"
+
+    async def raising_run(_settings, _connection, _state):
+        raise FileNotFoundError(f"[Errno 2] No such file or directory: '{key_path}'")
+
+    monkeypatch.setattr("aios_ingest.scheduler.run_gdrive_stream", raising_run)
+    await _manual_gdrive_job(SETTINGS, [], state)
+
+    [report] = b.reports()
+    # The claimed request, under the attempt token its claim returned — completion is unchanged.
+    assert report["requestId"] == MANUAL_CLAIM["id"] and report["attemptToken"] == MANUAL_CLAIM["attempt_token"]
+    assert report["error"] == "coordinator_error" and report["status"] == "failed"
+    assert report["failed"] == 1 and report["authoritativeComplete"] is False and report["backlog"] is None
+    # The serialized wire report carries nothing of the exception: no text, path, marker or class.
+    wire = json.dumps(report)
+    for leak in (key_path, SECRET_MARKER, "Errno", "No such file", "FileNotFoundError"):
+        assert leak not in wire
+    state.close()
+
+
+async def test_cancellation_of_a_manual_run_is_never_converted_into_a_completion(tmp_path, brain, monkeypatch):
+    import asyncio
+
+    state = StateStore(str(tmp_path / "manual-cancelled.sqlite"))
+    b = brain(Brain(rows=[row()], claim=MANUAL_CLAIM))
+
+    async def cancelled_run(_settings, _connection, _state):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr("aios_ingest.scheduler.run_gdrive_stream", cancelled_run)
+    with pytest.raises(asyncio.CancelledError):
+        await _manual_gdrive_job(SETTINGS, [], state)
     assert b.reports() == []
     state.close()

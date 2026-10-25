@@ -285,11 +285,15 @@ async def _manual_gdrive_job(
         summary = await run_gdrive_stream(settings, connection, state)
         status = _gdrive_outcome_status(summary)
         error = ", ".join(sorted((summary.failure_categories or {}).keys())) or None
-    except Exception as exc:
+    except Exception as exc:  # never BaseException: cancellation and shutdown still propagate
+        # The same fixed category as a scheduled run that raised: the exception's text and class
+        # never reach the brain; only the class is logged here, for the operator.
         from .engine import IngestSummary
-        summary = IngestSummary(connection.name, failed=1, failure_categories={type(exc).__name__: 1})
+        log.warning("manual Drive run for %s raised %s; reporting it as %s",
+                    connection.name, type(exc).__name__, _COORDINATOR_ERROR)
+        summary = IngestSummary(connection.name, failed=1, failure_categories={_COORDINATOR_ERROR: 1})
         status = "failed"
-        error = type(exc).__name__
+        error = _COORDINATOR_ERROR
     async with BrainClient(settings.base_url, settings.api_key, settings.team) as client:
         await client.complete_gdrive_run_request(request, summary, status=status, error=error)
 
@@ -345,11 +349,22 @@ async def _gdrive_hint_job(
 
 
 def _gdrive_outcome_status(summary) -> str:
-    """Use coordinator evidence, never counter optimism, to classify a Drive run."""
+    """Use coordinator evidence, never counter optimism, to classify a Drive run.
+
+    ``deferred`` wins (a busy or deadline deferral), then authoritative completion — including a
+    valid EMPTY one — is ``complete``. A run that only FAILED is ``failed``: failed work, no document
+    it created, updated, kept or removed, and no measured backlog to resume (a raised run, a refused
+    authority). Counting that as partial presented a failure as progress. Everything else that did
+    or holds work is ``partial``: real progress (even beside failures), a skipped-only deadline or
+    budget stop, and any run whose measured backlog says the next run resumes it.
+    """
     if summary.deferred:
         return "deferred"
     if summary.authoritative_complete:
         return "complete"
+    succeeded = summary.created + summary.updated + summary.unchanged + summary.removed
+    if summary.failed > 0 and succeeded == 0 and summary.backlog is None:
+        return "failed"
     if summary.total > 0 or summary.backlog is not None:
         return "partial"
     return "failed"

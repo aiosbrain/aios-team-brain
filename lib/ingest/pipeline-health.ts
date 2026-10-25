@@ -228,9 +228,12 @@ export function resolveBeatClock(args: {
  */
 const CONNECTOR_SOURCES: ReadonlySet<string> = new Set(["slack", "plane", "linear", "github", "gdrive"]);
 // `gdrive` (AIO-1167 r37): a paused or disconnected Drive connection stops being polled, so a failure
-// recorded before the pause is frozen exactly like a deleted connector's. It is suppressed only when
-// NO enabled Drive connection remains — while any is enabled the Drive leg stays loud, so an enabled
-// connection's authority failure is never hidden.
+// recorded before the pause is frozen exactly like a deleted connector's. The orphan suppression
+// applies only when NO enabled Drive connection remains: while any is enabled, the source-wide
+// `gdrive` leg is never suppressed here. That is all it guarantees. The leg is ONE team-scoped
+// streak over every Drive connection's runs, so one enabled connection's failures can be broken —
+// and kept off the banner — by another connection's successes; per-connection failure is shown in
+// Admin's per-connection coordinator status, not by this banner.
 
 /**
  * Sources this banner does NOT speak for (LLMOBS-1). The banner's sentence is "N ingestion legs are

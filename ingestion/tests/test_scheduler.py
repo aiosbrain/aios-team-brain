@@ -22,6 +22,42 @@ def test_gdrive_run_status_requires_authoritative_coordinator_completion():
     )) == "complete"
 
 
+def test_gdrive_run_status_reports_a_run_that_only_failed_as_failed():
+    # A raised run (the sanitized exception summary) and a refused authority did no document work
+    # and measured no backlog: they are failures, not progress.
+    assert _gdrive_outcome_status(IngestSummary(
+        "g", failed=1, failure_categories={"coordinator_error": 1},
+    )) == "failed"
+    assert _gdrive_outcome_status(IngestSummary(
+        "g", skipped=1, failed=1, failure_categories={"reconnect_required": 1},
+    )) == "failed"
+
+
+@pytest.mark.parametrize("summary", [
+    # Real progress beside failures stays partial: some documents succeeded.
+    IngestSummary("g", created=2, updated=1, failed=1),
+    IngestSummary("g", unchanged=4, failed=2),
+    IngestSummary("g", removed=1, failed=1),
+    # A resumable deadline or budget stop, skipped-only — never every skipped-only run as failed.
+    IngestSummary("g", skipped=3, failure_categories={"run_deadline": 1}),
+    IngestSummary("g", skipped=5, backlog=5),
+    # Failed work with a MEASURED backlog is resumable coordinator state, not an outright failure.
+    IngestSummary("g", failed=1, backlog=1, failure_categories={"cleanup_unavailable": 1}),
+])
+def test_gdrive_run_status_keeps_genuine_and_resumable_progress_partial(summary):
+    assert _gdrive_outcome_status(summary) == "partial"
+
+
+def test_gdrive_run_status_precedence_for_deferral_and_authoritative_empty_completion():
+    # A busy deferral is deferred even though it skipped (and whatever else it carries).
+    assert _gdrive_outcome_status(IngestSummary(
+        "g", skipped=1, deferred=True, failure_categories={"execution_busy": 1},
+    )) == "deferred"
+    # A valid EMPTY authoritative completion (an empty selection, drained) is complete.
+    assert _gdrive_outcome_status(IngestSummary("g", backlog=0, authoritative_complete=True)) == "complete"
+    assert _gdrive_outcome_status(IngestSummary("g", authoritative_complete=True)) == "complete"
+
+
 def test_due_for_renewal_selects_expiring_and_past():
     chans = [
         Channel("c-soon", "ch1", None, "2026-06-14T12:05:00+00:00"),   # 5m out -> due (skew 600)
@@ -368,10 +404,10 @@ async def test_remote_poll_runs_only_unconfigured_enabled_oauth_selections(tmp_p
     # The integration whose run RAISED (still enabled on the re-read) is reported once, against its
     # resolved id, as a sanitized non-authoritative failure under the fixed category — never the
     # exception's text or class — and the later integration still runs and completes.
-    assert [(r["integration_id"], r["status"]) for r in reported] == [(admin_id, "partial"), (later_id, "complete")]
+    assert [(r["integration_id"], r["status"]) for r in reported] == [(admin_id, "failed"), (later_id, "complete")]
     failed, completed = reported
     assert failed == {
-        "integration_id": admin_id, "status": "partial", "error": "coordinator_error",
+        "integration_id": admin_id, "status": "failed", "error": "coordinator_error",
         "failed": 1, "authoritative_complete": False, "failure_categories": {"coordinator_error": 1},
     }
     assert "do-not-leak-marker" not in repr(failed) and "RuntimeError" not in repr(failed)
