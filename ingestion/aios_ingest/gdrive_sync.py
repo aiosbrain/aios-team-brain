@@ -23,6 +23,7 @@ from pydantic import ValidationError
 
 from .brain_client import BrainClient, BrainDeferred, BrainError, GdriveExecution
 from .config import BrainSettings, Connection
+from .connector_state import ROOTS_KEY, coordinator_document, parse_roots_section, roots_section
 from .engine import IngestSummary
 from .normalize import normalize
 from .sources.gdrive import (
@@ -375,29 +376,91 @@ def _bind_selected_roots(
     consumed through that drive's stream and cursor. A binding only says where a root lives: it
     adds no ``drive`` root, so nothing else in that drive becomes selected. Bindings are durable
     and fixed for the generation — one provider read per root, resumed across runs.
+
+    A root whose metadata cannot be read is an UNRESOLVED obligation, recorded durably with no
+    drive at all: no stream is guessed for it — least of all My Drive — and nothing is enumerated
+    through it. Binding then continues with the next root, so one unreadable selection never
+    blocks the roots that can be read or the Shared Drives selected outright; the connection just
+    cannot be complete, and no absence is inferred from stream membership, while any obligation is
+    unresolved. Connection-wide authority loss (``BrainError``) and an exhausted provider budget
+    (``ProviderDeferred``) are not one root's failure: they stop the binding as before.
+
+    Returns the drive of every root whose drive is KNOWN.
     """
     bindings = state.root_bindings(integration_id, generation)
     for kind, root_id in _selected_roots(options):
         if (kind, root_id) in bindings:
             continue
-        meta = source._metadata(root_id)
+        try:
+            meta = source._metadata(root_id)
+        except (BrainError, ProviderDeferred):
+            raise
+        except Exception as exc:
+            status = _provider_status(exc)
+            state.mark_root_unresolved(
+                integration_id, generation, kind, root_id,
+                detail=(
+                    "selected root not found" if status == 404
+                    else f"selected root metadata unreadable ({status or type(exc).__name__})"
+                ),
+            )
+            continue
         drive_id = str(meta.get("driveId") or "my-drive")
         state.bind_root(integration_id, generation, kind, root_id, drive_id)
         bindings[(kind, root_id)] = drive_id
     return bindings
 
 
+def _adopt_remote_root_evidence(
+    state: StateStore, execution: GdriveExecution, integration_id: str, generation: int,
+) -> None:
+    """Recover root obligations the brain acknowledged that local state does not hold.
+
+    SQLite is resumable work storage, not authority: a sidecar that lost it (or never had it) must
+    not re-guess where a root lives, nor forget that one is unresolved, relocating or uncertain.
+    The fenced checkpoint carries every obligation of the generation (``connector_state``); this
+    fills in only roots with no local row, so newer local evidence stands.
+    """
+    for (kind, root_id), binding in parse_roots_section(execution.progress, generation).items():
+        state.restore_root_obligation(integration_id, generation, kind, root_id, binding)
+
+
+def _root_coverage_complete(
+    state: StateStore, integration_id: str, generation: int, options: dict[str, Any],
+) -> bool:
+    """Whether EVERY selected file/folder root is bound to a known drive and settled.
+
+    Coverage is positive evidence: a selected root with no obligation at all is unknown, not
+    resolved, and an unresolved, uncertain or relocating one leaves the roster incomplete. This is
+    the gate in front of every connection-wide absence conclusion.
+    """
+    obligations = state.root_obligations(integration_id, generation)
+    return all(
+        (binding := obligations.get(root)) is not None and binding.status == "bound"
+        and bool(binding.drive_id)
+        for root in _selected_roots(options)
+    ) and not state.unsettled_roots(integration_id, generation)
+
+
 def _stream_ids(
     options: dict[str, Any], bindings: dict[tuple[str, str], str] | None = None,
 ) -> list[str]:
-    """Return every independently consumed Drive change stream for the selected scope."""
+    """Return every independently consumed Drive change stream for the selected scope.
+
+    With ``bindings`` (the coordinator always resolves them), a root without a known drive opens
+    no stream: it is an unresolved obligation, never a guessed My Drive root. Only a caller that
+    never resolved bindings at all (``None`` — the single-stream contract of direct unit callers)
+    reads a file/folder root as a My Drive root.
+    """
     if str(options.get("selection_state") or "selected") == "empty":
         # A synthetic no-provider stream makes the authoritative empty snapshot durable without
         # interpreting empty as all of My Drive.
         return ["my-drive"]
     streams = {str(value) for value in options.get("shared_drive_ids") or [] if value}
-    # Without bindings (callers that never resolved them) a file/folder root is a My Drive root.
-    streams.update((bindings or {}).get(root, "my-drive") for root in _selected_roots(options))
+    if bindings is None:
+        streams.update("my-drive" for _root in _selected_roots(options))
+    else:
+        streams.update(bindings[root] for root in _selected_roots(options) if root in bindings)
     return sorted(streams, key=lambda value: (value != "my-drive", value))
 
 
@@ -415,11 +478,19 @@ def _configured_roots(
     bindings: dict[tuple[str, str], str] | None = None,
 ) -> list[tuple[str, str, str, bool]]:
     """The selected roots one stream enumerates: those bound to its drive, plus the drive itself
-    only when the whole Shared Drive was selected."""
+    only when the whole Shared Drive was selected.
+
+    A root with no known drive is enumerated by NO stream (see ``_stream_ids``); only a caller that
+    never resolved bindings (``None``) reads file/folder roots as My Drive roots."""
+    def bound_here(root: tuple[str, str]) -> bool:
+        if bindings is None:
+            return drive_id == "my-drive"
+        return bindings.get(root) == drive_id
+
     configured: list[tuple[str, str, str, bool]] = [
         (root_id, kind, drive_id, kind == "folder" and bool(options.get("recursive")))
         for kind, root_id in _selected_roots(options)
-        if (bindings or {}).get((kind, root_id), "my-drive") == drive_id
+        if bound_here((kind, root_id))
     ]
     if drive_id in {str(value) for value in options.get("shared_drive_ids") or []}:
         configured.append((drive_id, "drive", drive_id, True))
@@ -653,10 +724,15 @@ async def run_gdrive_stream(
                 return started is not None and _unstarted(started)
 
             # Which streams exist depends on where each selected root lives, so every root is bound
-            # before any start token is captured. An unreadable root has no known stream: nothing
-            # is enumerated on a guess, and the generation resumes binding on the next run.
+            # before any start token is captured. An unreadable root is a durable UNRESOLVED
+            # obligation with no stream: nothing is enumerated on a guess, its binding is retried on
+            # every run, and the roots and Shared Drives that ARE known still run (AC-04) — the
+            # connection just cannot be complete, nor infer absence, until it resolves. Root
+            # evidence the brain acknowledged is adopted first, so a sidecar that lost its local
+            # state neither re-guesses a root's drive nor forgets one that is unresolved.
             # A root on its way to a drive whose change log an earlier run could not open is read
             # again here, so the streams below are those of where it is now.
+            _adopt_remote_root_evidence(state, execution, integration_id, generation)
             try:
                 root_bindings = _bind_selected_roots(
                     source, state, integration_id, generation, options,
@@ -672,10 +748,15 @@ async def run_gdrive_stream(
                 total.failed += 1
                 total.failure_categories[exc.category] = 1
                 return total
-            except Exception:
+            unresolved_roots = [
+                root for root, binding in state.unsettled_roots(integration_id, generation).items()
+                if binding.status == "unresolved"
+            ]
+            if unresolved_roots:
+                # Diagnosed and counted as backlog below — one outstanding obligation per root —
+                # without pretending to know what lies under a root nothing has read.
                 total.failed += 1
-                total.failure_categories["selection_root_unresolved"] = 1
-                return total
+                total.failure_categories["selection_root_unresolved"] = len(unresolved_roots)
             # A stream this generation already consumes stays accounted for, so local state written
             # before roots were bound cannot leave a cursor that no run ever finishes.
             # A root read in another drive stays bound where it was until that drive's stream has a
@@ -695,8 +776,11 @@ async def run_gdrive_stream(
                 state, integration_id, generation, execution.progress, configured=required,
             )
             if not streams:
-                total.failed = 1
-                total.failure_categories["selection_unresolved"] = 1
+                if not unresolved_roots:
+                    total.failed = 1
+                    total.failure_categories["selection_unresolved"] = 1
+                # Every selected root is unresolved: there is no stream to run, and no backlog is
+                # measured — nothing is known about what lies under them.
                 return total
 
             # Close the backfill race independently for every required stream before enumerating
@@ -800,11 +884,13 @@ async def run_gdrive_stream(
                 # work capacity, which permits checkpoint recovery but no provider-page drain.
 
             progresses = state.list_progress(integration_id, generation)
-            # A selected root that is uncertain or on its way to another drive, and a stream whose
-            # published snapshot is not of the roots it enumerates now, are an incomplete
-            # connection: reconciling would turn what has not been verified into absence.
-            unsettled = state.unsettled_roots(integration_id, generation)
-            verified = not unsettled and not any(
+            # A selected root that is unresolved, uncertain or on its way to another drive — or has
+            # no obligation recorded at all — and a stream whose published snapshot is not of the
+            # roots it enumerates now, are an incomplete connection: reconciling would turn what
+            # has not been verified into absence.
+            verified = _root_coverage_complete(
+                state, integration_id, generation, options,
+            ) and not any(
                 any(_bound_root_drift(
                     state, p.namespace, generation, p.active_snapshot, p.key.drive_id,
                     root_bindings, set(),
@@ -2164,10 +2250,15 @@ def _cross_stream_removal(
     is read: gone at the provider, it is absent now, without waiting for a snapshot that peer may
     never complete.
 
-    A connection with one stream has nothing to wait for: its removals are ``absent`` at once.
+    A connection with one stream has nothing to wait for: its removals are ``absent`` at once —
+    unless a selected root is unresolved or uncertain. Such a root may live in a drive whose stream
+    nobody knows of yet, so "no peer holds it" is not evidence there; until the roster is known, a
+    removal is ``absent`` only when the document's own metadata says it is gone (AC-05's positive
+    verification of a deletion or lost access), and is otherwise withheld.
     """
     own = state.get_progress(work.namespace)
     connection_id = own.key.connection_id if own is not None else execution.integration_id
+    roster_unknown = state.unknown_root_count(connection_id, work.generation) > 0
     local = {
         progress.key.drive_id: progress
         for progress in state.list_progress(connection_id, work.generation)
@@ -2185,7 +2276,7 @@ def _cross_stream_removal(
             )
             if drive_id != own.key.drive_id
         }
-    if not peers:
+    if not peers and not roster_unknown:
         return "absent"
     by_namespace = {progress.namespace: progress for progress in local.values()}
     claimants = state.streams_claiming(
@@ -2207,15 +2298,22 @@ def _cross_stream_removal(
             state.raise_removal_barrier(work, key, renew=True)
             barrier = "standing"
         barriers[drive_id] = barrier
-    if not claimants and all(barrier == "passed" for barrier in barriers.values()):
+    if (
+        not claimants and not roster_unknown
+        and all(barrier == "passed" for barrier in barriers.values())
+    ):
         return "absent"
     unreadable = [
         drive_id for drive_id, barrier in barriers.items()
         if barrier != "passed" and _cannot_read(local.get(drive_id))
     ]
-    # Behind an unreadable stream that claims nothing, the document is read for itself here; a
-    # claim was already weighed against the provider's answer above, and is not read again.
-    if not claimants and unreadable and _document_loss_verified(source, work.item_key):
+    # Behind an unreadable stream that claims nothing — or a roster an unresolved root may extend —
+    # the document is read for itself here; a claim was already weighed against the provider's
+    # answer above, and is not read again.
+    if (
+        not claimants and (unreadable or roster_unknown)
+        and _document_loss_verified(source, work.item_key)
+    ):
         return "absent"
     # Attempted again each run, behind retries that have waited less.
     state.fail_work(work, f"{_CROSS_STREAM_PENDING}: awaiting the other streams' next drain")
@@ -2363,7 +2461,16 @@ async def _checkpoint_progress(
     streams[progress.key.drive_id] = stream_payload
     # Keep the active stream mirrored at top level for old sidecars/watch readers while v2 readers
     # consume the authoritative per-drive map.
-    payload: dict[str, Any] = {"version": 2, "streams": streams, **stream_payload}
+    cursor_document: dict[str, Any] = {"version": 2, "streams": streams, **stream_payload}
+    # Root-resolution evidence travels with every cursor checkpoint, under the same fence, so a
+    # sidecar that lost its local state recovers it from the brain (`_adopt_remote_root_evidence`).
+    cursor_document[ROOTS_KEY] = roots_section(
+        execution.generation,
+        state.root_obligations(execution.integration_id, execution.generation),
+    )
+    # The coordinator owns cursors and roots, never renewal's channel lifecycle: that is carried
+    # from the acknowledged document unchanged, so a poll cannot erase a watch intent or record.
+    payload = coordinator_document(execution.progress, cursor_document)
     ack = await client.checkpoint_gdrive_execution(execution, payload) or {}
     acknowledged = dict(ack.get("progress") or payload)
     execution.progress.clear()

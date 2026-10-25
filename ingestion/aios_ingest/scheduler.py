@@ -18,9 +18,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from .config import BrainSettings, Connection
 from .engine import run_connection
-from .state import Channel, StateStore, StreamKey
-from .gdrive_sync import credential_identity, run_gdrive_stream
-from .selections import effective_gdrive_connection, merge_selections
+from .state import Channel, StateStore
+from .gdrive_sync import run_gdrive_stream
+from .selections import merge_selections
 
 log = logging.getLogger(__name__)
 
@@ -29,7 +29,12 @@ _RENEWAL_SKEW = 600
 
 
 class WatchManager(Protocol):
-    """Renews an expiring push/watch channel, returning the replacement."""
+    """Creates and stops Drive watch channels.
+
+    The fenced scheduler path (``watch_renewal``) uses ``dispatch``/``stop`` — one bounded provider
+    request per call, never retried, run in a worker thread. ``renew`` is the legacy local path for
+    a scheduler built without brain settings.
+    """
 
     def renew(self, channel: Channel, page_token: str | None = None,
               access_token: str | None = None, provider_gate=None,
@@ -395,102 +400,11 @@ async def _renewal_job(
             state.save_channel(manager.renew(ch, page_token))
         return
 
-    try:
-        from .brain_client import BrainClient
-        async with BrainClient(settings.base_url, settings.api_key, settings.team) as discovery:
-            remote = await discovery.fetch_integration_selections(include_disabled=True)
-    except Exception:
-        return
-    remote_by_name = {
-        str(row.get("name")): row for row in remote
-        if row.get("type") == "gdrive" and row.get("status") == "enabled"
-    }
-    for conn in (candidate for candidate in connections if candidate.source == "gdrive"):
-        row = remote_by_name.get(conn.name)
-        if not row or not row.get("id"):
-            continue
-        execution = None
-        provider_gate = None
-        try:
-            async with BrainClient(settings.base_url, settings.api_key, settings.team) as client:
-                execution = await client.acquire_gdrive_execution(str(row["id"]), str(uuid.uuid4()))
-                effective = effective_gdrive_connection(conn, execution.config, execution.integration_id)
-                account_id = str(
-                    execution.config.get("authenticatedAccountId")
-                    or execution.config.get("authenticatedAccount")
-                    or credential_identity(effective.options)
-                )
-                token = None
-                auth_mode = str(effective.options.get("auth_mode") or "oauth")
-                if auth_mode == "oauth":
-                    token = (await client.broker_gdrive_access_token(execution))["access_token"]
-                elif not (effective.options.get("service_account_key_path") or effective.options.get("credential_json")):
-                    continue
-                provider_gate = client.gdrive_provider_gate(execution)
-                progress_doc = dict(execution.progress)
-                stream_map = progress_doc.get("streams")
-                if isinstance(stream_map, dict):
-                    streams = [(str(drive_id), dict(progress)) for drive_id, progress in stream_map.items()
-                               if isinstance(progress, dict)]
-                else:
-                    streams = [(str(progress_doc.get("drive_id") or ""), progress_doc)]
-                for drive_id, progress in streams:
-                    page_token = str(progress.get("page_token") or progress.get("baseline_start_token") or "")
-                    if not drive_id or not page_token:
-                        continue
-                    namespace = StreamKey(
-                        settings.team, execution.integration_id, account_id, drive_id,
-                    ).namespace(execution.generation)
-                    current_channels = [
-                        channel for channel in state.list_channels(conn.name, active_only=True)
-                        if channel.namespace == namespace
-                    ]
-                    current = current_channels[0] if current_channels else None
-                    if current and current not in due_for_renewal([current], now):
-                        continue
-                    channel = current or Channel(
-                        conn.name, "bootstrap", None,
-                        "1970-01-01T00:00:00+00:00", namespace,
-                    )
-                    replacement = manager.renew(
-                        channel, page_token, token, provider_gate, drive_id,
-                    )
-                    updated_stream = dict(progress)
-                    updated_stream.update({
-                        "drive_id": drive_id,
-                        "page_token": page_token,
-                        "watch_channel_id": replacement.channel_id,
-                        "watch_resource_id": replacement.resource_id,
-                        "watch_expires_at": replacement.expires_at,
-                    })
-                    if isinstance(stream_map, dict):
-                        updated_map = dict(progress_doc.get("streams") or {})
-                        updated_map[drive_id] = updated_stream
-                        checkpoint = {**progress_doc, "version": 2, "streams": updated_map,
-                                      **updated_stream}
-                    else:
-                        checkpoint = updated_stream
-                    ack = await client.checkpoint_gdrive_execution(execution, checkpoint) or {}
-                    progress_doc = dict(ack.get("progress") or checkpoint)
-                    stream_map = progress_doc.get("streams")
-                    execution.progress.clear()
-                    execution.progress.update(progress_doc)
-                    state.save_channel(replacement)
-        except Exception:
-            # Fail closed: the old overlapping channel and polling remain in place.
-            continue
-        finally:
-            if provider_gate is not None:
-                try:
-                    provider_gate.close()
-                except Exception:
-                    pass
-            if execution is not None:
-                try:
-                    async with BrainClient(settings.base_url, settings.api_key, settings.team) as releaser:
-                        await releaser.release_gdrive_execution(execution)
-                except Exception:
-                    pass
+    # The fenced lifecycle (AIO-1167 R41): durable intent before dispatch, bounded offloaded
+    # provider work, uncertain-outcome recovery and cleanup, renewal-owned state that never touches
+    # a cursor. Admin state is re-read there on every sweep; pause/disconnect renews nothing.
+    from .watch_renewal import renew_watches
+    await renew_watches(state, manager, connections, settings)
     for ch in channels:
         if ch.expires_at and _parse(ch.expires_at) <= _parse(now):
             state.retire_channel(ch.connection, ch.channel_id, at=now)

@@ -95,6 +95,14 @@ def _gdrive_notification(headers: dict[str, str]) -> Response:
             channel_id=channel_id, resource_id=resource_id, verification_token=token
         )
         if not channel:
+            # Google may send a channel's first (``sync``) message before the watch response
+            # arrives. For an attempt that is durably pending, a message whose token matches the
+            # persisted hash is recorded as cleanup evidence (the channel exists, with this
+            # resource id) — it activates nothing and schedules no read.
+            if state.observe_pending_notification(
+                channel_id=channel_id, resource_id=resource_id, verification_token=token,
+            ):
+                return Response(status_code=202, content="Drive channel not active; recorded")
             return Response(status_code=401, content="invalid Drive notification")
         if channel.namespace:
             progress = state.get_progress(channel.namespace)

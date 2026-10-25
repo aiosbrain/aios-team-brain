@@ -4808,46 +4808,208 @@ async def test_a_selection_wholly_inside_shared_drives_opens_no_my_drive_stream(
     state.close()
 
 
+@pytest.mark.parametrize("file_ids", [
+    ["file-b", "file-a"],  # the unreadable root is selected BEFORE the readable one
+    ["file-a", "file-b"],  # …and after it
+], ids=["unresolved-first", "unresolved-last"])
 @pytest.mark.asyncio
-async def test_unreadable_selected_root_enumerates_nothing_and_binding_resumes_where_it_stopped(
-    tmp_path, monkeypatch,
+async def test_unreadable_selected_root_is_an_unresolved_obligation_and_known_streams_still_run(
+    tmp_path, monkeypatch, file_ids,
 ):
+    """AIO-1167 R41. One unreadable root must not stall the roots and drives that can be read.
+
+    Its binding is a durable unresolved obligation with NO drive (never a guessed My Drive): no
+    stream enumerates it. Binding continues with the next root, the readable root's drive and the
+    Shared Drive selected outright both start and run, and the obligation is retried on the next run
+    until it resolves — into the stream of the drive it is actually in.
+    """
     integration_id = "00000000-0000-0000-0000-000000000033"
     available = {"file-a": {"id": "file-a", "driveId": "shared-x"}}
 
     def metadata(file_id):
         if file_id not in available:
-            raise RuntimeError("404 file not found")
+            raise _ProviderHttpError(403)
         return available[file_id]
 
     starts, reads, runs = _binding_harness(
-        monkeypatch, file_ids=["file-a", "file-b"], folder_ids=[], shared_drive_ids=["shared-z"],
+        monkeypatch, file_ids=file_ids, folder_ids=[], shared_drive_ids=["shared-z"],
         metadata=metadata,
     )
     settings = BrainSettings("http://brain", "key", "team")
     connection = Connection("docs", "gdrive", options={"integration_id": integration_id})
     state = StateStore(str(tmp_path / "unreadable-root.sqlite"))
 
-    blocked = await run_gdrive_stream(settings, connection, state)
+    partial = await run_gdrive_stream(settings, connection, state)
 
-    assert blocked.failed == 1 and blocked.failure_categories == {"selection_root_unresolved": 1}
-    assert reads == ["file-a", "file-b"]
-    # Where `file-b` lives is unknown, so the set of streams is unknown: none is started on a guess.
-    assert starts == [] and runs == []
-    assert state.list_progress(integration_id, 5) == []
-
-    available["file-b"] = {"id": "file-b"}
-    reads.clear()
-    resumed = await run_gdrive_stream(settings, connection, state)
-
-    assert resumed.failed == 0
-    assert reads == ["file-b"]
-    assert starts == ["my-drive", "shared-x", "shared-z"]
+    # Every root was read — the unreadable one did not stop the binding of the next.
+    assert sorted(reads) == ["file-a", "file-b"]
+    assert partial.failure_categories == {"selection_root_unresolved": 1}
+    assert partial.authoritative_complete is False
+    # The known streams started and ran; nothing started on a guess for `file-b`.
+    assert starts == ["shared-x", "shared-z"]
     assert dict(runs) == {
-        "my-drive": [("file-b", "file", "my-drive", False)],
         "shared-x": [("file-a", "file", "shared-x", False)],
         "shared-z": [("shared-z", "drive", "shared-z", True)],
     }
+    assert "my-drive" not in {p.key.drive_id for p in state.list_progress(integration_id, 5)}
+    # `file-b` is a durable obligation without a drive — and opens no stream.
+    obligation = state.root_obligations(integration_id, 5)[("file", "file-b")]
+    assert (obligation.status, obligation.drive_id) == ("unresolved", "")
+    assert obligation.detail == "selected root metadata unreadable (403)"
+    assert state.root_bindings(integration_id, 5) == {("file", "file-a"): "shared-x"}
+
+    # Readable now, in My Drive. Only `file-b` is read again, and only its drive gets a new token.
+    available["file-b"] = {"id": "file-b"}
+    reads.clear(), starts.clear(), runs.clear()
+    resumed = await run_gdrive_stream(settings, connection, state)
+
+    assert reads == ["file-b"]
+    assert starts == ["my-drive"]
+    assert resumed.failure_categories == {}
+    assert dict(runs)["my-drive"] == [("file-b", "file", "my-drive", False)]
+    assert state.root_bindings(integration_id, 5) == {
+        ("file", "file-a"): "shared-x", ("file", "file-b"): "my-drive",
+    }
+    assert state.unsettled_roots(integration_id, 5) == {}
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_an_unresolved_root_withholds_connection_completeness_until_it_resolves(
+    tmp_path, monkeypatch,
+):
+    """Healthy streams finish, but the connection is not complete while a selected root is unknown:
+    the roster of streams it implies is unknown, so no complete-snapshot reconciliation is sent and
+    backlog counts the obligation."""
+    world = _DriveWorld(file_ids=["file-b", "file-a"]).install(monkeypatch)
+    world.config["sharedDriveIds"] = ["shared-z"]
+    world.put("file-a", drive="shared-x")
+    world.put("doc-z", drive="shared-z")
+    world.unreadable["file-b"] = _ProviderHttpError(403)
+    state = StateStore(str(tmp_path / "unresolved-completeness.sqlite"))
+
+    partial = await world.run(state)
+
+    assert sorted(world.pushed) == ["doc-z", "file-a"]
+    assert world.reconciled == [] and world.removed == []
+    assert partial.authoritative_complete is False
+    assert partial.failure_categories.get("selection_root_unresolved") == 1
+    assert partial.backlog is not None and partial.backlog >= 1
+    # Both known streams are complete-pending; neither is published current.
+    assert {world.stream(drive)["phase"] for drive in ("shared-x", "shared-z")} == {"partial"}
+    # The obligation is in the brain's fenced record, with no drive.
+    (item,) = [item for item in world.progress["roots"]["items"] if item["id"] == "file-b"]
+    assert (item["status"], item["drive_id"]) == ("unresolved", None)
+    assert world.progress["roots"]["generation"] == 9
+
+    # Resolved into its own drive: a token is captured there first, then everything reconciles.
+    del world.unreadable["file-b"]
+    world.put("file-b", drive="shared-y")
+    world.calls.clear()
+    complete = await world.run(state)
+
+    reads = [index for index, call in enumerate(world.calls) if call == ("metadata", "file-b")]
+    # Bound first (one read), then its drive's token, then its baseline read — never the reverse.
+    assert reads[0] < world.calls.index(("start", "shared-y")) < reads[1]
+    assert complete.authoritative_complete is True and complete.backlog == 0
+    assert world.reconciled == [["doc-z", "file-a", "file-b"]]
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_an_unresolved_root_withholds_membership_inferred_removal_but_not_verified_loss(
+    tmp_path, monkeypatch,
+):
+    """With a selected root unresolved, "no other stream holds it" proves nothing — the root may
+    live in a drive no stream knows of. A removal is withheld then, unless the document's OWN
+    metadata says it is gone (AC-05's verified deletion or loss of access), which still removes."""
+    world = _DriveWorld(file_ids=["file-b"], folder_ids=["folder-k"]).install(monkeypatch)
+    world.put("folder-k", drive="shared-a", folder=True)
+    world.put("doc-k", drive="shared-a", parent="folder-k")
+    world.put("doc-gone", drive="shared-a", parent="folder-k")
+    world.unreadable["file-b"] = _ProviderHttpError(403)
+    state = StateStore(str(tmp_path / "unresolved-removal.sqlite"))
+    await world.run(state)
+    assert sorted(world.pushed) == ["doc-gone", "doc-k"]
+
+    # `doc-k` moved to a drive nothing here consumes; `doc-gone` was deleted. Both are reported
+    # removed by shared-a's change log.
+    world.move("doc-k", source="shared-a", destination="shared-q")
+    world.logs["shared-a"].append({"fileId": "doc-gone", "removed": True})
+    del world.files["doc-gone"]
+    summary = await world.run(state)
+
+    # The deletion is verified by the provider's own answer, so it is absence; the move is not.
+    assert world.removed == ["doc-gone"]
+    assert summary.failure_categories.get("cross_stream_move_pending") == 1
+    assert world.reconciled == []
+    # The withheld removal stays a durable obligation.
+    assert state.pending_count(world.namespace("shared-a"), 9) == 1
+
+    # Still unresolved, still withheld, run after run — the obligation is not dropped.
+    await world.run(state)
+    assert world.removed == ["doc-gone"]
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_root_evidence_survives_lost_local_state_through_the_fenced_checkpoint(
+    tmp_path, monkeypatch,
+):
+    """SQLite is resumable work storage, not authority. A sidecar that lost it adopts the root
+    obligations the brain acknowledged instead of re-guessing — a bound root keeps its drive even
+    when its metadata cannot be read now, and an unresolved one stays unresolved."""
+    world = _DriveWorld(file_ids=["file-x", "file-b"]).install(monkeypatch)
+    world.put("file-x", drive="shared-a")
+    world.unreadable["file-b"] = _ProviderHttpError(403)
+    first = StateStore(str(tmp_path / "before-loss.sqlite"))
+    await world.run(first)
+    first.close()
+
+    # Local state is gone. `file-x` cannot be read now either.
+    world.unreadable["file-x"] = _ProviderHttpError(403)
+    fresh = StateStore(str(tmp_path / "after-loss.sqlite"))
+    await world.run(fresh)
+
+    obligations = fresh.root_obligations(_WORLD_INTEGRATION, 9)
+    # Without adoption this read failure would have made `file-x` unresolved.
+    assert (obligations[("file", "file-x")].status, obligations[("file", "file-x")].drive_id) == (
+        "bound", "shared-a",
+    )
+    assert (obligations[("file", "file-b")].status, obligations[("file", "file-b")].drive_id) == (
+        "unresolved", "",
+    )
+    # No stream was guessed for the unresolved root after the loss either.
+    assert "my-drive" not in {p.key.drive_id for p in fresh.list_progress(_WORLD_INTEGRATION, 9)}
+    fresh.close()
+
+
+def test_root_obligation_transitions_never_guess_or_downgrade(tmp_path):
+    state = StateStore(str(tmp_path / "root-obligations.sqlite"))
+    state.mark_root_unresolved("c", 1, "file", "f", detail="selected root not found")
+    # An unresolved root has no drive to be uncertain about, nor to relocate from.
+    state.mark_root_uncertain("c", 1, "file", "f", "my-drive", detail="unreadable")
+    state.mark_root_relocating("c", 1, "file", "f", "my-drive", destination="shared-x")
+    assert state.root_bindings("c", 1) == {}
+    assert state.root_obligations("c", 1)[("file", "f")].status == "unresolved"
+    assert state.unknown_root_count("c", 1) == 1
+    # Resolution lands on the obligation it was waiting on.
+    state.bind_root("c", 1, "file", "f", "shared-x")
+    assert state.root_bindings("c", 1) == {("file", "f"): "shared-x"}
+    assert state.unsettled_roots("c", 1) == {}
+    # A bound root is never downgraded to unresolved, and the first binding stands.
+    state.mark_root_unresolved("c", 1, "file", "f", detail="later failure")
+    state.bind_root("c", 1, "file", "f", "shared-y")
+    assert state.root_bindings("c", 1) == {("file", "f"): "shared-x"}
+    with pytest.raises(ValueError):
+        state.bind_root("c", 1, "file", "g", "")
+    # Remote evidence fills in only what is missing locally, and never a malformed record.
+    from aios_ingest.state import RootBinding
+    assert state.restore_root_obligation("c", 1, "file", "f", RootBinding("other")) is False
+    assert state.restore_root_obligation("c", 1, "file", "g", RootBinding("", "bound")) is False
+    assert state.restore_root_obligation("c", 1, "file", "g", RootBinding("", "weird")) is False
+    assert state.restore_root_obligation("c", 1, "file", "g", RootBinding("", "unresolved")) is True
+    assert state.root_obligations("c", 1)[("file", "g")].status == "unresolved"
     state.close()
 
 

@@ -7,6 +7,8 @@ from aios_ingest.engine import IngestSummary
 from aios_ingest.normalize import RawDoc
 from aios_ingest.state import Channel, StateStore, StreamKey
 from aios_ingest.brain_client import BrainError, GdriveExecution, GdriveRunRequest, IngestResult
+import json
+from datetime import datetime, timedelta, timezone
 import pytest
 
 SETTINGS = BrainSettings(base_url="http://brain", api_key="aios_a_b", team="demo")
@@ -525,6 +527,16 @@ async def test_renewal_job_rereads_pause_after_scheduler_start(tmp_path, monkeyp
     state.close()
 
 
+
+def _watch_response(record):
+    expiration = int((datetime.now(timezone.utc) + timedelta(days=6)).timestamp() * 1000)
+    return {"id": record.attempt_id, "resourceId": f"resource-{record.drive_id}", "expiration": str(expiration)}
+
+
+def _watch_states(payload):
+    return tuple(sorted(r["state"] for r in payload.get("watches", {}).get("records", [])))
+
+
 async def test_oauth_watch_renewal_uses_execution_broker_and_fences_publication(tmp_path, monkeypatch):
     state = StateStore(str(tmp_path / "oauth-watch.sqlite"))
     integration_id = "00000000-0000-0000-0000-000000000001"
@@ -536,6 +548,7 @@ async def test_oauth_watch_renewal_uses_execution_broker_and_fences_publication(
     events = []
 
     class Client:
+        revision = 7
         def __init__(self, *args, **kwargs): pass
         async def __aenter__(self): return self
         async def __aexit__(self, *args): pass
@@ -550,8 +563,11 @@ async def test_oauth_watch_renewal_uses_execution_broker_and_fences_publication(
             events.append("broker")
             return {"access_token": "memory-only"}
         async def checkpoint_gdrive_execution(self, execution, payload):
-            events.append(("checkpoint", payload["page_token"], payload["watch_channel_id"]))
-            return {"progress_revision": 8}
+            # Renewal never moves the cursor: every checkpoint carries it unchanged.
+            events.append(("checkpoint", payload["page_token"], _watch_states(payload)))
+            assert "memory-only" not in json.dumps(payload)
+            Client.revision += 1
+            return {"progress_revision": Client.revision}
         async def release_gdrive_execution(self, execution):
             events.append("release")
         def gdrive_provider_gate(self, execution):
@@ -561,17 +577,26 @@ async def test_oauth_watch_renewal_uses_execution_broker_and_fences_publication(
             return Gate()
 
     class Watch:
-        def renew(self, channel, page_token=None, access_token=None, provider_gate=None, drive_id=None):
+        def ttl_seconds(self, _name): return 7 * 86_400
+        def dispatch(self, record, *, page_token, verification_token, access_token=None,
+                     provider_gate=None, deadline=None):
             provider_gate()
-            events.append(("renew", page_token, access_token, drive_id))
-            return Channel("gd", "new", "new-resource", "2099-01-01T00:00:00+00:00", channel.namespace)
+            events.append(("dispatch", page_token, access_token, record.drive_id, record.predecessor))
+            return _watch_response(record)
 
     monkeypatch.setattr("aios_ingest.brain_client.BrainClient", Client)
     await _renewal_job(state, Watch(), [conn], SETTINGS)
-    assert events[:4] == ["acquire", "broker", "gate", ("renew", "consume-from-here", "memory-only", "my-drive")]
-    assert events[4] == ("checkpoint", "consume-from-here", "new")
-    assert state.get_channel("gd").channel_id == "new"
-    assert "release" in events
+    assert events[:2] == ["acquire", "broker"]
+    assert events[2:5] == [
+        ("checkpoint", "consume-from-here", ("prepared",)),
+        ("checkpoint", "consume-from-here", ("dispatched",)),
+        "gate",
+    ]
+    # The brokered token reaches the provider only; the old local channel is the predecessor.
+    assert events[5] == ("dispatch", "consume-from-here", "memory-only", "my-drive", "old")
+    assert events[6] == ("checkpoint", "consume-from-here", ("active",))
+    assert state.get_channel("gd").resource_id == "resource-my-drive"
+    assert events[-1] == "release" and events.count("release") == 1
     state.close()
 
 
@@ -586,6 +611,7 @@ async def test_watch_renewal_ignores_stale_account_scope_and_drive_namespaces(tm
     seen = []
 
     class Client:
+        revision = 11
         def __init__(self, *args, **kwargs): pass
         async def __aenter__(self): return self
         async def __aexit__(self, *args): pass
@@ -607,14 +633,17 @@ async def test_watch_renewal_ignores_stale_account_scope_and_drive_namespaces(tm
             return Gate()
         async def checkpoint_gdrive_execution(self, execution, payload):
             seen.append(("checkpoint", payload["drive_id"], payload["page_token"]))
-            return {"progress_revision": 12}
+            Client.revision += 1
+            return {"progress_revision": Client.revision}
         async def release_gdrive_execution(self, execution):
             seen.append(("release", execution.generation))
 
     class Watch:
-        def renew(self, channel, page_token=None, access_token=None, provider_gate=None, drive_id=None):
-            seen.append(("renew", channel.channel_id, channel.namespace, page_token, drive_id))
-            return Channel("gd", "current", "resource", "2099-02-01T00:00:00+00:00", channel.namespace)
+        def ttl_seconds(self, _name): return 7 * 86_400
+        def dispatch(self, record, *, page_token, verification_token, access_token=None,
+                     provider_gate=None, deadline=None):
+            seen.append(("dispatch", record.predecessor, record.namespace, page_token, record.drive_id))
+            return _watch_response(record)
 
     monkeypatch.setattr("aios_ingest.brain_client.BrainClient", Client)
     await _renewal_job(state, Watch(), [conn], SETTINGS)
@@ -622,10 +651,12 @@ async def test_watch_renewal_ignores_stale_account_scope_and_drive_namespaces(tm
     current_namespace = StreamKey(
         "demo", integration_id, "account-current", "drive-current",
     ).namespace(9)
-    assert ("renew", "bootstrap", current_namespace, "server-current-token", "drive-current") in seen
+    # Channels of an older account or drive namespace are neither renewed nor predecessors.
+    assert ("dispatch", None, current_namespace, "server-current-token", "drive-current") in seen
     assert ("checkpoint", "drive-current", "server-current-token") in seen
     assert ("release", 9) in seen
-    assert state.get_channel("gd").channel_id == "current"
+    current = [c for c in state.list_channels("gd") if c.namespace == current_namespace]
+    assert len(current) == 1 and current[0].resource_id == "resource-drive-current"
     state.close()
 
 
@@ -634,6 +665,11 @@ async def test_watch_renewal_covers_each_authoritative_v2_stream(tmp_path, monke
     integration_id = "00000000-0000-0000-0000-000000000001"
     conn = Connection(name="gd", source="gdrive", options={"webhook_url": "https://example.test/watch"})
     renewed = []
+    streams = {
+        "my-drive": {"drive_id": "my-drive", "page_token": "my-token"},
+        "shared-a": {"drive_id": "shared-a", "page_token": "a-token"},
+        "shared-b": {"drive_id": "shared-b", "page_token": "b-token"},
+    }
 
     class Client:
         revision = 20
@@ -648,27 +684,27 @@ async def test_watch_renewal_covers_each_authoritative_v2_stream(tmp_path, monke
                 {"authMode": "oauth", "authenticatedAccountId": "account",
                  "fileIds": ["doc"], "sharedDriveIds": ["shared-a", "shared-b"],
                  "selectionState": "selected"},
-                {"version": 2, "streams": {
-                    "my-drive": {"drive_id": "my-drive", "page_token": "my-token"},
-                    "shared-a": {"drive_id": "shared-a", "page_token": "a-token"},
-                    "shared-b": {"drive_id": "shared-b", "page_token": "b-token"},
-                }}, 19,
+                {"version": 2, "streams": json.loads(json.dumps(streams))}, 19,
             )
         async def broker_gdrive_access_token(self, execution): return {"access_token": "memory"}
         def gdrive_provider_gate(self, execution):
             class Gate:
+                def __call__(self): pass
                 def close(self): pass
             return Gate()
         async def checkpoint_gdrive_execution(self, execution, payload):
-            self.revision += 1
-            return {"progress_revision": self.revision, "progress": payload}
+            # No stream record is ever changed by renewal.
+            assert payload["streams"] == streams
+            Client.revision += 1
+            return {"progress_revision": Client.revision, "progress": payload}
         async def release_gdrive_execution(self, execution): pass
 
     class Watch:
-        def renew(self, channel, page_token=None, access_token=None, provider_gate=None, drive_id=None):
-            renewed.append((drive_id, page_token, channel.namespace))
-            return Channel("gd", f"channel-{drive_id}", f"resource-{drive_id}",
-                           "2099-02-01T00:00:00+00:00", channel.namespace)
+        def ttl_seconds(self, _name): return 7 * 86_400
+        def dispatch(self, record, *, page_token, verification_token, access_token=None,
+                     provider_gate=None, deadline=None):
+            renewed.append((record.drive_id, page_token, record.namespace))
+            return _watch_response(record)
 
     monkeypatch.setattr("aios_ingest.brain_client.BrainClient", Client)
     await _renewal_job(state, Watch(), [conn], SETTINGS)
@@ -677,8 +713,8 @@ async def test_watch_renewal_covers_each_authoritative_v2_stream(tmp_path, monke
         ("my-drive", "my-token"), ("shared-a", "a-token"), ("shared-b", "b-token"),
     ]
     assert len({namespace for _, _, namespace in renewed}) == 3
-    assert {channel.channel_id for channel in state.list_channels("gd")} == {
-        "channel-my-drive", "channel-shared-a", "channel-shared-b",
+    assert {channel.resource_id for channel in state.list_channels("gd")} == {
+        "resource-my-drive", "resource-shared-a", "resource-shared-b",
     }
     state.close()
 
@@ -693,6 +729,7 @@ async def test_watch_releases_acquired_authority_after_every_failure_stage(
     events = []
 
     class Client:
+        revision = 3
         def __init__(self, *args, **kwargs): pass
         async def __aenter__(self): return self
         async def __aexit__(self, *args): pass
@@ -720,24 +757,27 @@ async def test_watch_releases_acquired_authority_after_every_failure_stage(
             events.append("checkpoint")
             if failure_stage == "checkpoint":
                 raise RuntimeError("checkpoint failed")
-            return {"progress_revision": 4}
+            Client.revision += 1
+            return {"progress_revision": Client.revision}
         async def release_gdrive_execution(self, execution):
             events.append("release")
             raise RuntimeError("release also failed")
 
     class Watch:
-        def renew(self, channel, page_token=None, access_token=None, provider_gate=None, drive_id=None):
+        def ttl_seconds(self, _name): return 7 * 86_400
+        def dispatch(self, record, *, page_token, verification_token, access_token=None,
+                     provider_gate=None, deadline=None):
             events.append("provider")
             if failure_stage == "provider":
                 raise RuntimeError("provider failed")
             provider_gate()
-            return Channel("gd", "new", "resource", "2099-01-01T00:00:00+00:00", channel.namespace)
+            return _watch_response(record)
 
     if failure_stage == "local-save":
-        def fail_save(_channel):
+        def fail_save(_record):
             events.append("local-save")
             raise OSError("disk failed")
-        monkeypatch.setattr(state, "save_channel", fail_save)
+        monkeypatch.setattr(state, "save_watch_record", fail_save)
     monkeypatch.setattr("aios_ingest.brain_client.BrainClient", Client)
 
     await _renewal_job(state, Watch(), [conn], SETTINGS)
@@ -745,6 +785,8 @@ async def test_watch_releases_acquired_authority_after_every_failure_stage(
     assert events[0] == "acquire"
     assert events[-1] == "release"
     assert events.count("release") == 1
+    if failure_stage in ("broker", "checkpoint", "local-save"):
+        assert "provider" not in events  # nothing is dispatched without a durable intent
     if failure_stage == "local-save":
         assert events.index("checkpoint") < events.index("local-save") < events.index("release")
     state.close()

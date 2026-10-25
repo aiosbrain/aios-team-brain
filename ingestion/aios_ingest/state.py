@@ -266,6 +266,10 @@ class RootBinding:
     detail: str | None = None
 
 
+# The states a selected-root obligation can be in (see ``StateStore.bind_root``).
+ROOT_STATES = frozenset({"unresolved", "bound", "uncertain", "relocating"})
+
+
 @dataclass(frozen=True)
 class StreamProgress:
     namespace: str
@@ -392,6 +396,7 @@ class StateStore:
             self._db.execute("ALTER TABLE selection_root_bindings ADD COLUMN detail TEXT")
         self._upgrade_observation_revisions()
         self._upgrade_legacy_channels()
+        self._upgrade_watch_columns()
         self._db.commit()
 
     def _upgrade_observation_revisions(self) -> None:
@@ -552,6 +557,34 @@ class StateStore:
             """
         )
 
+    # Watch lifecycle projection (AIO-1167 R41). A legacy channel row is an active channel; a row
+    # written by the lifecycle carries its state. ``observed_*`` is webhook/late-response EVIDENCE
+    # about a pending attempt, never state: only the renewal owner turns it into a transition.
+    _WATCH_COLUMNS = (
+        ("state", "TEXT NOT NULL DEFAULT 'active'"),
+        ("integration_id", "TEXT"),
+        ("account_id", "TEXT"),
+        ("drive_id", "TEXT"),
+        ("generation", "INTEGER"),
+        ("predecessor", "TEXT"),
+        ("requested_expiry", "TEXT"),
+        ("detail", "TEXT"),
+        ("updated_at", "TEXT"),
+        ("stop_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("observed_resource_id", "TEXT"),
+        ("observed_at", "TEXT"),
+    )
+
+    def _upgrade_watch_columns(self) -> None:
+        columns = {r[1] for r in self._db.execute("PRAGMA table_info(webhook_channels)")}
+        for name, ddl in self._WATCH_COLUMNS:
+            if name not in columns:
+                self._db.execute(f"ALTER TABLE webhook_channels ADD COLUMN {name} {ddl}")
+        # A row retired before the lifecycle existed is not active.
+        self._db.execute(
+            "UPDATE webhook_channels SET state='retired' WHERE retired_at IS NOT NULL AND state='active'"
+        )
+
     def close(self) -> None:
         self._db.close()
 
@@ -570,14 +603,16 @@ class StateStore:
         self._db.commit()
 
     # -- webhook channels ---------------------------------------------------
+    # Only ``state='active'`` rows are channels for notifications, renewal decisions and listing; a
+    # pending lifecycle attempt (prepared/dispatched/uncertain) or a cleanup is never one.
     def save_channel(self, ch: Channel) -> None:
         self._db.execute(
-            "INSERT INTO webhook_channels(connection, channel_id, resource_id, expires_at, namespace, verification_hash, retired_at) "
-            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(connection,channel_id) DO UPDATE SET "
+            "INSERT INTO webhook_channels(connection, channel_id, resource_id, expires_at, namespace, verification_hash, retired_at, state) "
+            "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(connection,channel_id) DO UPDATE SET "
             "resource_id=excluded.resource_id, expires_at=excluded.expires_at, namespace=excluded.namespace, "
-            "verification_hash=excluded.verification_hash, retired_at=excluded.retired_at",
+            "verification_hash=excluded.verification_hash, retired_at=excluded.retired_at, state=excluded.state",
             (ch.connection, ch.channel_id, ch.resource_id, ch.expires_at, ch.namespace,
-             ch.verification_hash, ch.retired_at),
+             ch.verification_hash, ch.retired_at, "active" if ch.retired_at is None else "retired"),
         )
         self._db.commit()
 
@@ -585,13 +620,88 @@ class StateStore:
         with closing(
             self._db.execute(
                 "SELECT connection, channel_id, resource_id, expires_at, namespace, verification_hash, retired_at "
-                "FROM webhook_channels WHERE connection=? AND retired_at IS NULL "
+                "FROM webhook_channels WHERE connection=? AND retired_at IS NULL AND state='active' "
                 "ORDER BY expires_at DESC LIMIT 1",
                 (connection,),
             )
         ) as c:
             row = c.fetchone()
         return Channel(*row) if row else None
+
+    def save_watch_record(self, record: Any) -> None:
+        """Project one lifecycle record (``watch_lifecycle.WatchRecord``) into the local table.
+
+        Webhook evidence already observed for the attempt is kept. Terminal records are retired
+        locally too, so no reader can mistake them for live channels.
+        """
+        terminal = record.state in ("retired", "expired")
+        self._db.execute(
+            "INSERT INTO webhook_channels(connection, channel_id, resource_id, expires_at, namespace, "
+            "verification_hash, retired_at, state, integration_id, account_id, drive_id, generation, "
+            "predecessor, requested_expiry, detail, updated_at, stop_attempts) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(connection,channel_id) DO UPDATE SET "
+            "resource_id=excluded.resource_id, expires_at=excluded.expires_at, namespace=excluded.namespace, "
+            "verification_hash=excluded.verification_hash, "
+            "retired_at=CASE WHEN excluded.retired_at IS NULL THEN NULL "
+            "ELSE coalesce(webhook_channels.retired_at, excluded.retired_at) END, "
+            "state=excluded.state, integration_id=excluded.integration_id, account_id=excluded.account_id, "
+            "drive_id=excluded.drive_id, generation=excluded.generation, predecessor=excluded.predecessor, "
+            "requested_expiry=excluded.requested_expiry, detail=excluded.detail, "
+            "updated_at=excluded.updated_at, stop_attempts=excluded.stop_attempts",
+            (record.connection, record.attempt_id, record.resource_id,
+             record.expires_at if record.state == "active" else (record.expires_at or record.requested_expiry),
+             record.namespace, record.verification_hash, _now_iso() if terminal else None,
+             record.state, record.integration_id, record.account_id, record.drive_id,
+             int(record.generation), record.predecessor, record.requested_expiry, record.detail,
+             record.updated_at, int(record.stop_attempts)),
+        )
+        self._db.commit()
+
+    def watch_evidence(self, connection: str, attempt_id: str) -> str | None:
+        """A resource id observed for a pending attempt (early notification or late response)."""
+        row = self._db.execute(
+            "SELECT observed_resource_id FROM webhook_channels WHERE connection=? AND channel_id=?",
+            (connection, attempt_id),
+        ).fetchone()
+        return str(row["observed_resource_id"]) if row and row["observed_resource_id"] else None
+
+    def record_watch_evidence(self, connection: str, attempt_id: str, resource_id: str) -> bool:
+        """Remember that the provider named ``resource_id`` for a NON-active attempt.
+
+        Evidence lets a channel that may exist be stopped; it never activates one, and an active
+        or terminal row is not touched.
+        """
+        if not resource_id:
+            return False
+        cur = self._db.execute(
+            "UPDATE webhook_channels SET observed_resource_id=?, observed_at=? WHERE connection=? "
+            "AND channel_id=? AND state IN ('prepared','dispatched','uncertain','cleanup_pending')",
+            (resource_id, _now_iso(), connection, attempt_id),
+        )
+        self._db.commit()
+        return cur.rowcount == 1
+
+    def observe_pending_notification(
+        self, *, channel_id: str, resource_id: str | None, verification_token: str | None,
+    ) -> bool:
+        """Record a notification for an attempt that is not active yet — Google may send the
+        ``sync`` message before the watch response arrives.
+
+        Accepted as evidence only when the persisted verification hash matches; it schedules no
+        read and activates nothing. Returns whether it was recorded.
+        """
+        if not resource_id:
+            return False
+        row = self._db.execute(
+            "SELECT connection, verification_hash FROM webhook_channels WHERE channel_id=? "
+            "AND state IN ('prepared','dispatched','uncertain')",
+            (channel_id,),
+        ).fetchone()
+        if not row or not row["verification_hash"]:
+            return False
+        if not hmac.compare_digest(_token_hash(verification_token or ""), str(row["verification_hash"])):
+            return False
+        return self.record_watch_evidence(str(row["connection"]), channel_id, resource_id)
 
     def list_channels(self, connection: str | None = None, *, active_only: bool = True) -> list[Channel]:
         where: list[str] = []
@@ -601,6 +711,7 @@ class StateStore:
             args.append(connection)
         if active_only:
             where.append("retired_at IS NULL")
+            where.append("state='active'")
         sql = (
             "SELECT connection, channel_id, resource_id, expires_at, namespace, verification_hash, retired_at "
             "FROM webhook_channels"
@@ -612,7 +723,8 @@ class StateStore:
 
     def retire_channel(self, connection: str, channel_id: str, *, at: str | None = None) -> None:
         self._db.execute(
-            "UPDATE webhook_channels SET retired_at=? WHERE connection=? AND channel_id=?",
+            "UPDATE webhook_channels SET retired_at=?, state=CASE WHEN state='active' THEN 'retired' "
+            "ELSE state END WHERE connection=? AND channel_id=?",
             (at or _now_iso(), connection, channel_id),
         )
         self._db.commit()
@@ -622,7 +734,7 @@ class StateStore:
     ) -> Channel | None:
         row = self._db.execute(
             "SELECT connection, channel_id, resource_id, expires_at, namespace, verification_hash, retired_at "
-            "FROM webhook_channels WHERE channel_id=? AND retired_at IS NULL",
+            "FROM webhook_channels WHERE channel_id=? AND retired_at IS NULL AND state='active'",
             (channel_id,),
         ).fetchone()
         if not row:
@@ -773,33 +885,122 @@ class StateStore:
         return "standing"
 
     # -- selected-root drive bindings ----------------------------------------
+    # Every selected file/folder root of a generation is an OBLIGATION with one row here, keyed by
+    # connection, generation, root kind and exact provider id. Four states, all durable:
+    #
+    #   · ``unresolved`` — its initial binding never succeeded: the drive that contains it has never
+    #     been read, so it has NO drive (``drive_id`` is the empty string, never a guess) and no stream
+    #     enumerates it. It is retried on every run and only resolution — or a new selection
+    #     generation — ends it.
+    #   · ``bound`` — known to live in ``drive_id``, whose stream enumerates it.
+    #   · ``uncertain`` — it WAS bound, and where it is now could not be read.
+    #   · ``relocating`` — it was read in ``pending_drive_id``, whose stream has not taken it over.
+    #
+    # Every state but ``bound`` leaves the connection incomplete and is never absence evidence; a
+    # selected root with no row at all is unknown, never resolved.
     def bind_root(
         self, connection_id: str, generation: int, root_kind: str, root_id: str, drive_id: str,
     ) -> None:
-        """Record the drive that contains one selected root. The first binding stands."""
+        """Record the drive that contains one selected root.
+
+        The first binding stands; an ``unresolved`` obligation is the one row this resolves, so a
+        retried binding lands on the obligation it was waiting on. ``drive_id`` must be a real drive.
+        """
+        if not drive_id:
+            raise ValueError("a root binding needs the drive that was read for it")
         self._db.execute(
-            "INSERT OR IGNORE INTO selection_root_bindings(connection_id,generation,root_kind,root_id,drive_id) "
-            "VALUES(?,?,?,?,?)",
-            (connection_id, generation, root_kind, root_id, drive_id),
+            "INSERT INTO selection_root_bindings(connection_id,generation,root_kind,root_id,drive_id) "
+            "VALUES(?,?,?,?,?) ON CONFLICT(connection_id,generation,root_kind,root_id) DO UPDATE SET "
+            "drive_id=excluded.drive_id,status='bound',pending_drive_id=NULL,detail=NULL,bound_at=? "
+            "WHERE selection_root_bindings.status='unresolved'",
+            (connection_id, generation, root_kind, root_id, drive_id, _now_iso()),
+        )
+        self._db.commit()
+
+    def mark_root_unresolved(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str, *, detail: str,
+    ) -> None:
+        """Record that a selected root's INITIAL binding failed. It gets no drive.
+
+        A root already bound (in any state) is never downgraded: what was read about it stands.
+        """
+        self._db.execute(
+            "INSERT INTO selection_root_bindings(connection_id,generation,root_kind,root_id,drive_id,status,detail) "
+            "VALUES(?,?,?,?,'','unresolved',?) ON CONFLICT(connection_id,generation,root_kind,root_id) DO UPDATE SET "
+            "detail=excluded.detail WHERE selection_root_bindings.status='unresolved'",
+            (connection_id, generation, root_kind, root_id, detail),
         )
         self._db.commit()
 
     def root_bindings(self, connection_id: str, generation: int) -> dict[tuple[str, str], str]:
+        """The drive of every selected root whose drive is KNOWN. An unresolved root has none."""
         rows = self._db.execute(
             "SELECT root_kind,root_id,drive_id FROM selection_root_bindings "
-            "WHERE connection_id=? AND generation=?",
+            "WHERE connection_id=? AND generation=? AND status<>'unresolved'",
             (connection_id, generation),
         ).fetchall()
         return {(str(r["root_kind"]), str(r["root_id"])): str(r["drive_id"]) for r in rows}
 
-    # A binding is ``bound`` while its root is known to live in ``drive_id``. Two other states are
-    # durable and both mean the connection is not complete: ``uncertain`` — where the root is now
-    # could not be read, so nothing is concluded about it — and ``relocating`` — it was read in
-    # ``pending_drive_id``, whose stream has not taken it over yet. Neither is absence evidence.
+    def root_obligations(
+        self, connection_id: str, generation: int,
+    ) -> dict[tuple[str, str], RootBinding]:
+        """Every selected-root obligation of a generation, in every state."""
+        rows = self._db.execute(
+            "SELECT root_kind,root_id,drive_id,status,pending_drive_id,detail FROM selection_root_bindings "
+            "WHERE connection_id=? AND generation=? ORDER BY root_kind,root_id",
+            (connection_id, generation),
+        ).fetchall()
+        return {
+            (str(r["root_kind"]), str(r["root_id"])): RootBinding(
+                str(r["drive_id"]), str(r["status"]), r["pending_drive_id"], r["detail"],
+            )
+            for r in rows
+        }
+
+    def restore_root_obligation(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str,
+        binding: RootBinding,
+    ) -> bool:
+        """Adopt one obligation the brain acknowledged, when this state holds none for that root.
+
+        Local evidence, where present, stands: this only fills in what a lost or older local state
+        lacks. An obligation whose state is unknown, or a bound one with no drive, is not adopted.
+        """
+        if binding.status not in ROOT_STATES:
+            return False
+        if binding.status != "unresolved" and not binding.drive_id:
+            return False
+        if binding.status == "relocating" and not binding.pending_drive_id:
+            return False
+        cur = self._db.execute(
+            "INSERT OR IGNORE INTO selection_root_bindings"
+            "(connection_id,generation,root_kind,root_id,drive_id,status,pending_drive_id,detail) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (connection_id, generation, root_kind, root_id,
+             "" if binding.status == "unresolved" else binding.drive_id, binding.status,
+             binding.pending_drive_id if binding.status == "relocating" else None, binding.detail),
+        )
+        self._db.commit()
+        return cur.rowcount == 1
+
+    def unknown_root_count(self, connection_id: str, generation: int) -> int:
+        """Selected roots whose drive is unknown or unreadable now: either may hide a stream."""
+        row = self._db.execute(
+            "SELECT count(*) AS n FROM selection_root_bindings WHERE connection_id=? AND generation=? "
+            "AND status IN ('unresolved','uncertain')",
+            (connection_id, generation),
+        ).fetchone()
+        return int(row["n"])
+
+    # A binding is ``bound`` while its root is known to live in ``drive_id``. The other states are
+    # durable and all mean the connection is not complete: ``unresolved`` (above), ``uncertain`` —
+    # where the root is now could not be read, so nothing is concluded about it — and ``relocating``
+    # — it was read in ``pending_drive_id``, whose stream has not taken it over yet. None of them is
+    # absence evidence.
     def unsettled_roots(
         self, connection_id: str, generation: int,
     ) -> dict[tuple[str, str], RootBinding]:
-        """Every selected root that is uncertain or on its way to another drive's stream."""
+        """Every selected root that is unresolved, uncertain or on its way to another drive."""
         rows = self._db.execute(
             "SELECT root_kind,root_id,drive_id,status,pending_drive_id,detail FROM selection_root_bindings "
             "WHERE connection_id=? AND generation=? AND status<>'bound' ORDER BY root_kind,root_id",
@@ -816,11 +1017,13 @@ class StateStore:
         self, connection_id: str, generation: int, root_kind: str, root_id: str, drive_id: str,
         *, detail: str,
     ) -> None:
-        """Record that a root's location is unverified. A root already relocating stays that."""
+        """Record that a root's location is unverified. A root already relocating stays that, and an
+        unresolved one — never bound, so it has no drive to be uncertain about — stays unresolved."""
         self._db.execute(
             "INSERT INTO selection_root_bindings(connection_id,generation,root_kind,root_id,drive_id,status,detail) "
             "VALUES(?,?,?,?,?,'uncertain',?) ON CONFLICT(connection_id,generation,root_kind,root_id) DO UPDATE SET "
-            "status='uncertain',detail=excluded.detail WHERE selection_root_bindings.status<>'relocating'",
+            "status='uncertain',detail=excluded.detail "
+            "WHERE selection_root_bindings.status NOT IN ('relocating','unresolved')",
             (connection_id, generation, root_kind, root_id, drive_id, detail),
         )
         self._db.commit()
@@ -829,11 +1032,15 @@ class StateStore:
         self, connection_id: str, generation: int, root_kind: str, root_id: str, drive_id: str,
         *, destination: str,
     ) -> None:
-        """Record the drive a root was read in. It stays bound to ``drive_id`` until rebound."""
+        """Record the drive a root was read in. It stays bound to ``drive_id`` until rebound.
+
+        Only a root that was bound can relocate: an unresolved obligation is resolved by
+        ``bind_root``, never by inventing the drive it supposedly left."""
         self._db.execute(
             "INSERT INTO selection_root_bindings(connection_id,generation,root_kind,root_id,drive_id,status,pending_drive_id,detail) "
             "VALUES(?,?,?,?,?,'relocating',?,?) ON CONFLICT(connection_id,generation,root_kind,root_id) DO UPDATE SET "
-            "status='relocating',pending_drive_id=excluded.pending_drive_id,detail=excluded.detail",
+            "status='relocating',pending_drive_id=excluded.pending_drive_id,detail=excluded.detail "
+            "WHERE selection_root_bindings.status<>'unresolved'",
             (connection_id, generation, root_kind, root_id, drive_id, destination,
              f"observed in drive {destination}"),
         )
