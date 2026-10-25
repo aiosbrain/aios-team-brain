@@ -4177,6 +4177,9 @@ def test_expired_run_deadline_starts_no_provider_or_sink_work_and_fails_nothing(
     assert consumed == 0
     assert source.reads == [] and client.pushed == [] and client.removed == []
     assert summary.failed == 0 and summary.failure_categories == {"run_deadline": 1}
+    # A drain-loop deadline exit adds nothing to `skipped` (only the pre-drain stop adds one): the
+    # retained pending rows below are what carry the outstanding work.
+    assert summary.skipped == 0
     # Out of time is not a failed attempt: nothing was charged or pushed back.
     assert _pending_rows(state, progress.namespace) == [
         ("a", 0, None, None), ("b", 0, None, None), ("c", 0, None, None),
@@ -4219,6 +4222,8 @@ def test_sink_call_stopped_by_the_run_deadline_leaves_its_work_untouched_and_sta
     # `b` and `c` were never read from Drive: nothing is started once the sink is out of time.
     assert client.pushed == ["a"] and source.reads == ["a"]
     assert summary.failed == 0 and summary.failure_categories == {"run_deadline": 1}
+    # A deadline stop mid-drain adds nothing to `skipped` (only the pre-drain stop adds one).
+    assert summary.skipped == 0
     assert _pending_rows(state, progress.namespace) == [
         ("a", 0, None, None), ("b", 0, None, None), ("c", 0, None, None),
     ]
