@@ -4230,6 +4230,146 @@ def test_sink_call_stopped_by_the_run_deadline_leaves_its_work_untouched_and_sta
     state.close()
 
 
+# The two stream-level run-deadline exits, told apart by `skipped`: the PRE-DRAIN stop adds exactly
+# one, the PAGE-LOOP stop adds none (its cursor carries the outstanding work).
+
+class _DeadlineStreamBrain(_RecordingBrain):
+    """`_RecordingBrain` that also keeps every acknowledged checkpoint, and may react to one."""
+
+    def __init__(self, on_checkpoint=None):
+        super().__init__()
+        self.checkpoints: list[dict] = []
+        self._on_checkpoint = on_checkpoint
+
+    async def checkpoint_gdrive_execution(self, execution, progress):
+        self.checkpoints.append(dict(progress))
+        if self._on_checkpoint is not None:
+            self._on_checkpoint(progress)
+        return await super().checkpoint_gdrive_execution(execution, progress)
+
+
+class _NoProviderReads:
+    """Drive + source fakes that record any provider read (none is expected before a deadline)."""
+
+    def __init__(self):
+        self.reads: list[str] = []
+        outer = self
+
+        class Changes:
+            def list(self, **kwargs):
+                outer.reads.append(f"changes.list:{kwargs.get('pageToken')}")
+                return _Request({"changes": [], "newStartPageToken": "terminal"})
+
+            def getStartPageToken(self, **kwargs):
+                outer.reads.append("changes.getStartPageToken")
+                return _Request({"startPageToken": "fresh"})
+
+        class Drive:
+            def changes(self):
+                return Changes()
+
+        class Source:
+            def _execute(self, request):
+                return request.execute()
+
+            def _metadata(self, file_id):
+                outer.reads.append(f"metadata:{file_id}")
+                return {"id": file_id}
+
+            def _raw_doc(self, meta):
+                outer.reads.append(f"raw_doc:{meta['id']}")
+                return RawDoc(source="gdrive", external_id=meta["id"], body="body")
+
+        self.drive, self.source = Drive(), Source()
+
+
+def _established_stream(state, generation, *, pending=()):
+    """A started, listing-complete stream with a durable cursor — no recovery is owed."""
+    key = StreamKey("team", "connection", "account", "my-drive")
+    namespace = key.namespace(generation)
+    state.begin_generation(key, generation, start_token="start")
+    state.update_progress(namespace, phase="partial", page_token="cursor-1", listing_complete=True)
+    for item in pending:
+        state.enqueue_work(namespace, generation, item, "upsert")
+    return namespace
+
+
+@pytest.mark.asyncio
+async def test_pre_drain_run_deadline_stop_skips_exactly_one_and_reads_nothing(tmp_path):
+    state = StateStore(str(tmp_path / "deadline-pre-drain.sqlite"))
+    namespace = _established_stream(state, 21, pending=("a",))
+    expired = time.monotonic() - 1
+    client, provider = _DeadlineStreamBrain(), _NoProviderReads()
+
+    summary = await _run_gdrive_stream_unlocked(
+        BrainSettings("http://brain", "key", "team"), Connection("docs", "gdrive"), state,
+        client=client,
+        # Set on the execution AND passed as the stream's deadline, as `run_gdrive_stream` does: the
+        # pre-drain check reads the parameter.
+        execution=GdriveExecution("connection", 21, 1, "owner", "later", "scope", {}, run_deadline=expired),
+        options={"credential_identity": "account", "selection_state": "selected"},
+        source=provider.source, drive=provider.drive, generation=21, drive_id="my-drive",
+        namespace=namespace, max_work=5, discovery_budget=2, retry_budget=1, run_deadline=expired,
+    )
+
+    assert summary.skipped == 1
+    assert summary.failed == 0
+    assert summary.failure_categories == {"run_deadline": 1}
+    # Nothing read from Drive and nothing written to the brain's content.
+    assert provider.reads == [] and client.pushed == [] and client.removed == []
+    # The deadline was recorded on the stream; no drain observation was opened.
+    assert [(c["phase"], c["last_error"]) for c in client.checkpoints] == [
+        ("partial", "overall run deadline exhausted"),
+    ]
+    # The cursor and the pending work stand for the next run.
+    after = state.get_progress(namespace)
+    assert after.page_token == "cursor-1"
+    assert [work.item_key for work in state.list_pending(namespace, 21)] == ["a"]
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_page_loop_run_deadline_stop_skips_nothing_and_reads_no_change_page(tmp_path, monkeypatch):
+    state = StateStore(str(tmp_path / "deadline-page-loop.sqlite"))
+    namespace = _established_stream(state, 22)
+    deadline = 100.0
+    clock = [50.0]  # before the deadline: the pre-drain check passes
+    monkeypatch.setattr("aios_ingest.gdrive_sync.time.monotonic", lambda: clock[0])
+
+    def deadline_after_drain_observation(progress):
+        # The one brain call between the pre-drain check and the page loop's: the checkpoint that
+        # opens this drain's observation before the first change page. Time runs out right there.
+        if progress.get("phase") == "catching_up" and progress.get("drain_observation") == 1:
+            clock[0] = deadline
+
+    client, provider = _DeadlineStreamBrain(deadline_after_drain_observation), _NoProviderReads()
+
+    summary = await _run_gdrive_stream_unlocked(
+        BrainSettings("http://brain", "key", "team"), Connection("docs", "gdrive"), state,
+        client=client,
+        execution=GdriveExecution("connection", 22, 1, "owner", "later", "scope", {}, run_deadline=deadline),
+        options={"credential_identity": "account", "selection_state": "selected"},
+        source=provider.source, drive=provider.drive, generation=22, drive_id="my-drive",
+        namespace=namespace, max_work=5, discovery_budget=2, retry_budget=1, run_deadline=deadline,
+    )
+
+    # The boundary was crossed where intended: the drain observation opened, then the deadline.
+    assert [(c["phase"], c["last_error"]) for c in client.checkpoints] == [
+        ("catching_up", None), ("partial", "overall run deadline exhausted"),
+    ]
+    assert summary.skipped == 0
+    assert summary.failed == 0
+    assert summary.failure_categories == {"run_deadline": 1}
+    # No change page was read (nor anything else from Drive), and nothing was written.
+    assert provider.reads == [] and client.pushed == [] and client.removed == []
+    # The cursor stands, and no work or page was invented.
+    after = state.get_progress(namespace)
+    assert after.page_token == "cursor-1"
+    assert state.pending_count(namespace, 22) == 0
+    assert state.next_uncommitted_page(namespace, 22) is None
+    state.close()
+
+
 def test_sink_wait_the_brain_named_beyond_the_deadline_is_kept_as_the_retry_time_and_ends_the_drain(
     tmp_path,
 ):
