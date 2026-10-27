@@ -144,6 +144,13 @@ export async function reconcileItemUnit(
  * Durable visibility suppression used by source revocation. Retraction leaves membership history
  * intact but every enforced reader rejects the unit until a surviving claim reactivates it through
  * `reconcileItemUnit(…, { reactivate: true })`.
+ *
+ * Idempotent for an item that has NO unit yet (AIO-1167 R44 C1) — a migrated Drive claim can lose
+ * its legacy unit before adoption. The suppression is then written as a unit that starts
+ * `retracted`, under the same item lock: that row is the durable barrier, because the ordinary
+ * mirror (`reconcileItemUnit` without `reactivate`, which context backfill uses) never changes a
+ * unit's state, so backfill finds a retracted unit instead of creating a visible one. Any other
+ * failure still fails the call.
  */
 export async function retractItemUnit(
   db: DbClient,
@@ -164,8 +171,23 @@ export async function retractItemUnit(
         .select("id")
         .maybeSingle();
       if (error) return { ok: false, error: error.message };
-      if (!data) return { ok: false, error: "context unit not found" };
-      return { ok: true, unitId: (data as { id: string }).id, created: false };
+      if (data) return { ok: true, unitId: (data as { id: string }).id, created: false };
+      const { data: created, error: createError } = await session.db
+        .from("project_context_units")
+        .insert({
+          team_id: teamId,
+          unit_kind: "item",
+          source_item_id: itemId,
+          unit_key: "item",
+          audience: context.item.access,
+          content_sha256: context.item.content_sha256,
+          occurred_at: context.item.work_at,
+          state: "retracted",
+        })
+        .select("id")
+        .single();
+      if (createError || !created) return { ok: false, error: createError?.message ?? "retracted unit insert failed" };
+      return { ok: true, unitId: (created as { id: string }).id, created: true };
     });
   } catch (error) {
     return { ok: false, error: contextFailureMessage(error) };

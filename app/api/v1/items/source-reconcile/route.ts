@@ -123,7 +123,9 @@ export async function POST(req: NextRequest) {
     // A complete snapshot asserts connection-wide absence: refused unless the coordinator's fenced
     // root evidence covers every selected root (AIO-1167 R41). Explicit provider-confirmed removals
     // and non-final staged pages decide no roster-wide absence and are not gated here.
-    ), { requireRootCoverage: parsed.data.snapshot?.complete === true });
+    // Reconciliation only takes content AWAY from an audience: it is a `reduce` commit, so a lost
+    // grant or deleted destination never blocks it (AIO-1167 R44 C2).
+    ), { requireRootCoverage: parsed.data.snapshot?.complete === true, operation: "reduce" });
     // Physical cache/graph/item cleanup is explicitly outside the execution-fence transaction.
     // Durable suppression + epoch already committed, so failure here is safe and retryable.
     const cleaned = await drainGdriveCleanupObligations(db, auth.teamId);

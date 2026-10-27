@@ -208,6 +208,9 @@ def world_for(monkeypatch, *, generation=6, drives=("drive-a", "drive-b"), selec
     world = SimpleNamespace(
         generation=generation, drives=list(drives), selection=selection,
         reconcile=[], fail_finalize=False, stalled=set(), reconciles=0, checkpoints=0,
+        # What the brain last acknowledged, returned at acquisition as the real brain does — and,
+        # as there, reset when the generation changes (the authority trigger clears progress).
+        progress={}, progress_generation=generation,
     )
 
     class Client:
@@ -220,7 +223,8 @@ def world_for(monkeypatch, *, generation=6, drives=("drive-a", "drive-b"), selec
                 "authMode": "oauth", "authenticatedAccountId": "account",
                 "fileIds": [], "folderIds": [], "sharedDriveIds": list(world.drives),
                 "selectionState": world.selection,
-            })
+            }, progress=world.progress if world.progress_generation == world.generation else {},
+                progress_revision=world.checkpoints)
 
         async def broker_gdrive_access_token(self, execution):
             return {"access_token": "memory", "account": {"subject": "account"}}
@@ -238,6 +242,7 @@ def world_for(monkeypatch, *, generation=6, drives=("drive-a", "drive-b"), selec
             if world.fail_finalize and payload.get("phase") == "current":
                 raise BrainError(503, "checkpoint_unavailable", "the brain did not acknowledge the checkpoint")
             world.checkpoints += 1
+            world.progress, world.progress_generation = payload, world.generation
             return {"progress_revision": world.checkpoints, "progress": payload}
 
         async def reconcile_gdrive(self, execution, **kwargs):

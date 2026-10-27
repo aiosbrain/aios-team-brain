@@ -114,8 +114,9 @@ describe("POST /api/v1/items/source-reconcile staged snapshot continuation", () 
     await expect(response.json()).resolves.toMatchObject({ snapshotApplied: false, snapshotStaged: 20_000 });
     expect(h.commit).toHaveBeenCalledExactlyOnceWith(
       h.auth, { integrationId: INTEGRATION, generation: 7, fence: 3, owner: OWNER }, expect.any(Function),
-      // An inspection decides no absence: the root-coverage gate is not requested.
-      { requireRootCoverage: false },
+      // An inspection decides no absence: the root-coverage gate is not requested. Every
+      // reconciliation is a visibility-REDUCING commit (AIO-1167 R44 C2).
+      { requireRootCoverage: false, operation: "reduce" },
     );
     expect(h.stage.mock.calls[0][2]).toMatchObject({
       connectionId: INTEGRATION,
@@ -289,12 +290,12 @@ describe("AIO-1167 R41: a complete snapshot is applied only behind the root-cove
     ["a non-final staged page", { complete: false, provider_ids: ["doc"], snapshot_id: SNAPSHOT }, false],
   ])("%s requests requireRootCoverage=%s from the fenced commit", async (_label, snapshot, required) => {
     await post(snapshot);
-    expect(h.commit.mock.calls[0][3]).toEqual({ requireRootCoverage: required });
+    expect(h.commit.mock.calls[0][3]).toEqual({ requireRootCoverage: required, operation: "reduce" });
   });
 
   it("an explicit provider-confirmed removal (no snapshot) is not roster-gated", async () => {
     await postBody({ removed_provider_ids: ["gone"] });
-    expect(h.commit.mock.calls[0][3]).toEqual({ requireRootCoverage: false });
+    expect(h.commit.mock.calls[0][3]).toEqual({ requireRootCoverage: false, operation: "reduce" });
   });
 
   it("a refusal for incomplete root coverage is a typed 409 and drains nothing", async () => {

@@ -7,6 +7,7 @@ import {
   gdriveRequestScopes,
   isGdriveGrantMode,
   parseGrantedScopes,
+  storedGrantCeiling,
 } from "@/lib/integrations/gdrive-grant-policy";
 
 /**
@@ -87,5 +88,32 @@ describe("evaluateGdriveGrant — folders", () => {
   it("full drive access is beyond discovery", () => {
     expect(evaluateGdriveGrant("folders", [DRIVE_READONLY_SCOPE, `${G}drive`]))
       .toEqual({ ok: false, reason: "broader", unexpected: [`${G}drive`] });
+  });
+});
+
+describe("storedGrantCeiling — the broker's ceiling for a stored credential (R44 C15)", () => {
+  it("a recorded mode is the ceiling, whatever scopes were recorded", () => {
+    expect(storedGrantCeiling("files", [DRIVE_FILE_SCOPE])).toBe("files");
+    expect(storedGrantCeiling("folders", undefined)).toBe("folders");
+  });
+
+  it.each([["everything"], [1], [""], [{}]])("an invalid recorded mode %s has no ceiling", (mode) => {
+    expect(storedGrantCeiling(mode, [DRIVE_FILE_SCOPE])).toBeNull();
+  });
+
+  it("a legacy credential is held to the NARROWEST mode its own recorded grant fits", () => {
+    expect(storedGrantCeiling(undefined, ["openid", DRIVE_FILE_SCOPE])).toBe("files");
+    expect(storedGrantCeiling(undefined, [DRIVE_READONLY_SCOPE])).toBe("folders");
+    expect(storedGrantCeiling(null, [DRIVE_READONLY_SCOPE, DRIVE_FILE_SCOPE])).toBe("folders");
+  });
+
+  it.each([
+    ["no recorded scopes", undefined],
+    ["a non-array", "drive.file"],
+    ["an empty list", []],
+    ["identity only", ["openid", "email"]],
+    ["full Drive", [`${G}drive`]],
+  ])("a legacy credential with %s must reconnect", (_case, scopes) => {
+    expect(storedGrantCeiling(undefined, scopes)).toBeNull();
   });
 });

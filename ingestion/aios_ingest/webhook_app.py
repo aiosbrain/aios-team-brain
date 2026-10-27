@@ -17,6 +17,7 @@ from .config import BrainSettings, Connection, load_connections
 from .engine import ingest_docs
 from .sources import build_source
 from .state import StateStore
+from .state_path import resolve_state_db
 
 app = FastAPI(title="aios-ingest webhooks")
 
@@ -89,7 +90,7 @@ def _gdrive_notification(headers: dict[str, str]) -> Response:
     token = headers.get("x-goog-channel-token")
     if not channel_id or not resource_id:
         return Response(status_code=401, content="invalid Drive notification")
-    state = StateStore(os.environ.get("AIOS_INGEST_STATE", "aios_ingest_state.sqlite"))
+    state = StateStore(resolve_state_db())
     try:
         channel = state.validate_notification(
             channel_id=channel_id, resource_id=resource_id, verification_token=token
@@ -111,6 +112,9 @@ def _gdrive_notification(headers: dict[str, str]) -> Response:
                 # may have been created under an earlier scope generation; the stream (connection,
                 # account, drive) is what the current coordinator reads, so that is what is marked.
                 state.record_stream_hint(progress.key)
-        return Response(status_code=202, content="Drive poll scheduled")
+                return Response(status_code=202, content="Drive poll scheduled")
+        # A valid channel with no stream to wake (a legacy row without a namespace, or progress not
+        # yet created): accepted, and said truthfully — nothing was scheduled (AIO-1167 R44 C12).
+        return Response(status_code=202, content="Drive notification accepted; nothing to schedule")
     finally:
         state.close()

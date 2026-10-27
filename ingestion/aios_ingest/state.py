@@ -740,12 +740,20 @@ class StateStore:
         if not row:
             return None
         channel = Channel(*row)
-        if channel.resource_id and channel.resource_id != resource_id:
+        # Admission needs every piece of the channel's identity to be KNOWN and to match (AIO-1167
+        # R44 C12): a row with no stored resource id or verification hash (a legacy migration can
+        # leave either empty) proves nothing about the caller, and an expired channel is no longer
+        # Google's. Each missing piece refuses — it is never skipped as "nothing to compare".
+        if not channel.resource_id or not resource_id or not hmac.compare_digest(
+            str(channel.resource_id), str(resource_id)
+        ):
             return None
-        if channel.verification_hash:
-            supplied = _token_hash(verification_token or "")
-            if not hmac.compare_digest(supplied, channel.verification_hash):
-                return None
+        if not channel.verification_hash or not hmac.compare_digest(
+            _token_hash(verification_token or ""), str(channel.verification_hash)
+        ):
+            return None
+        if not _unexpired(channel.expires_at):
+            return None
         return channel
 
     # -- notification hints --------------------------------------------------
@@ -2282,3 +2290,16 @@ def _token_hash(token: str) -> str:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _unexpired(value: object, *, now: datetime | None = None) -> bool:
+    """True only for a parseable expiration strictly in the future; anything else is expired."""
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return at > (now or datetime.now(timezone.utc))

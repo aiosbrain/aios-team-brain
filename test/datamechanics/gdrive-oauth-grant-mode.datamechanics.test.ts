@@ -154,6 +154,75 @@ describe("the broker enforces the recorded mode on every refresh (R43 F3)", () =
   });
 });
 
+describe("broker: OAuth mode only, and a conservative ceiling for legacy credentials (R44 C15)", () => {
+  it("a service-account connection that still holds an OAuth secret is never brokered", async () => {
+    const seed = await seedTeam();
+    const id = await connection(seed, "sa-with-oauth-secret", credential("files", [FILE]));
+    const { rows } = await getPool().query<{ config: Record<string, unknown> }>("select config from integrations where id=$1", [id]);
+    await upsertIntegration(db(), { teamId: seed.teamId, memberId: seed.memberId }, {
+      type: "gdrive", name: "sa-with-oauth-secret", status: "enabled", config: { ...rows[0].config, authMode: "service_account" },
+    });
+    const { response, raw } = await brokered(seed, id, `openid ${FILE}`);
+    expect(response.status).toBe(409);
+    expect(JSON.parse(raw).error.code).toBe("reconnect_required");
+    expect(raw).not.toContain("refreshed-access-token");
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(await audits(seed.teamId, id, "gdrive.token_issued")).toEqual([]);
+  });
+
+  it("a switch to service-account mode DURING the refresh withholds the token", async () => {
+    const seed = await seedTeam();
+    const id = await connection(seed, "sa-switch", credential("files", [FILE]));
+    const issued = await provisionGdriveConnectorPrincipal({ teamId: seed.teamId, integrationId: id, actorMemberId: seed.memberId });
+    const owner = randomUUID();
+    const acquired = await executionPOST(post("http://test/api/v1/integrations/gdrive/execution", issued.key, seed.teamSlug, {
+      action: "acquire", integration_id: id, owner,
+    }));
+    const lease = await acquired.json() as { generation: number; fence: number };
+    vi.spyOn(globalThis, "fetch").mockImplementationOnce(async () => {
+      const { rows } = await getPool().query<{ config: Record<string, unknown> }>("select config from integrations where id=$1", [id]);
+      await upsertIntegration(db(), { teamId: seed.teamId, memberId: seed.memberId }, {
+        type: "gdrive", name: "sa-switch", status: "enabled", config: { ...rows[0].config, authMode: "service_account" },
+      });
+      return new Response(JSON.stringify({ access_token: "refreshed-access-token", expires_in: 600, scope: FILE }), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    });
+    const response = await tokenPOST(post("http://test/api/v1/integrations/gdrive/token", issued.key, seed.teamSlug, {
+      integration_id: id, generation: lease.generation, fence: lease.fence, owner,
+    }));
+    expect(response.status).toBe(409);
+    expect(await response.text()).not.toContain("refreshed-access-token");
+    expect(await audits(seed.teamId, id, "gdrive.token_issued")).toEqual([]);
+  });
+
+  it("a legacy credential (no recorded mode) is held to its recorded grant", async () => {
+    const seed = await seedTeam();
+    const id = await connection(seed, "legacy-ok", credential(undefined, [FILE]));
+    expect((await brokered(seed, id, `openid ${FILE}`)).response.status).toBe(200);
+  });
+
+  it("a legacy credential whose refresh broadens beyond its recorded grant is refused", async () => {
+    const seed = await seedTeam();
+    const id = await connection(seed, "legacy-broad", credential(undefined, [FILE]));
+    const { response, raw } = await brokered(seed, id, `openid ${FILE} ${READONLY}`);
+    expect(response.status).toBe(409);
+    expect(raw).not.toContain("refreshed-access-token");
+  });
+
+  it.each([
+    ["no recorded mode and no recorded scopes", credential(undefined, undefined)],
+    ["an invalid recorded mode", JSON.stringify({ ...JSON.parse(credential("files", [FILE])), grant_mode: "everything" })],
+  ])("%s must reconnect, and Google is never asked", async (_case, stored) => {
+    const seed = await seedTeam();
+    const id = await connection(seed, "legacy-unknown", stored);
+    const { response, raw } = await brokered(seed, id, `openid ${FILE}`);
+    expect(response.status).toBe(409);
+    expect(JSON.parse(raw).error.code).toBe("reconnect_required");
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+});
+
 describe("the publisher reuses a stored credential only within its recorded grant (R43 F3)", () => {
   it.each([
     ["broader stored grant (folders) under files consent", credential("folders", [READONLY])],

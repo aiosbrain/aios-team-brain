@@ -186,7 +186,11 @@ def scan(repo_path, slug, full_name, window_days, backfill, rubric_path) -> None
 @click.option("--config", "config_path", required=True, help="connections.yaml path")
 @click.option("--poll-interval", default=300, type=int, help="seconds between polls")
 @click.option("--renewal-interval", default=1800, type=int, help="seconds between authorized Drive watch-channel sweeps")
-@click.option("--state-db", default="aios_ingest_state.sqlite", help="sqlite path for cursors/channels")
+@click.option(
+    "--state-db", default=None,
+    help="sqlite path for cursors/channels (default: $AIOS_INGEST_STATE, else aios_ingest_state.sqlite). "
+    "The webhook receiver must use the same file: set AIOS_INGEST_STATE for both processes.",
+)
 @click.option(
     "--use-brain-selections/--no-use-brain-selections",
     "use_brain_selections",
@@ -203,11 +207,12 @@ def schedule(config_path, poll_interval, renewal_interval, state_db, use_brain_s
     """
     from .scheduler import run as run_scheduler
     from .state import StateStore
+    from .state_path import resolve_state_db
     from .sources.gdrive_watch import ConfiguredGoogleDriveWatchManager
 
     settings = BrainSettings.from_env()
     conns = load_connections(config_path)
-    state = StateStore(state_db)
+    state = StateStore(resolve_state_db(state_db))
     click.echo(f"scheduling {len(conns)} connection(s), poll every {poll_interval}s — Ctrl-C to stop")
     watch_manager = ConfiguredGoogleDriveWatchManager(conns) if any(
         conn.source == "gdrive" and conn.options.get("webhook_url") for conn in conns

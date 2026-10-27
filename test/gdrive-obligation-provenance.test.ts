@@ -107,7 +107,9 @@ const isItemWrite = (e: Entry) => e.sql.startsWith("update items set member_id=$
 const isVersionWrite = (e: Entry) => e.sql === "update item_versions set member_id=$2 where id=$1";
 const isEvidenceWrite = (e: Entry) => e.sql.startsWith("insert into gdrive_contribution_evidence");
 const isObligationCursor = (e: Entry) => e.sql.startsWith("update identity_repair_obligations set cursor_item_id=$5");
-const isObligationRetry = (e: Entry) => e.sql.startsWith("update identity_repair_obligations set status='retry'");
+// The retry write may alias its table (`identity_repair_obligations o`): the alias is legal SQL, the
+// status transition is what this matcher identifies.
+const isObligationRetry = (e: Entry) => /^update identity_repair_obligations(?: o)? set status='retry'/.test(e.sql);
 const isObligationComplete = (e: Entry) => e.sql.startsWith("update identity_repair_obligations set status='complete'");
 const isCreditWrite = (e: Entry) => isItemWrite(e) || isVersionWrite(e) || isEvidenceWrite(e);
 

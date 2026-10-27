@@ -16,14 +16,14 @@ import { decryptSecret } from "@/lib/secrets/crypto";
 import { validateIntegrationConfig } from "@/lib/api/schemas";
 import { selectedRootCoverage } from "@/lib/integrations/gdrive-root-coverage";
 import { mergeLockedGdriveCredentialFields, unverifiedOauthRoots } from "@/lib/integrations/gdrive-credential-fields";
-import { evaluateGdriveGrant, isGdriveGrantMode } from "@/lib/integrations/gdrive-grant-policy";
+import { evaluateGdriveGrant, storedGrantCeiling } from "@/lib/integrations/gdrive-grant-policy";
 
 const LEASE_SECONDS = 10 * 60;
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 
 export class GdriveAuthorityError extends Error {
   constructor(
-    readonly code: "connector_principal_required" | "connection_unavailable" | "wrong_connection" | "execution_busy" | "stale_execution" | "stale_progress" | "reconnect_required" | "provider_unavailable" | "admin_authority_changed" | "root_coverage_incomplete",
+    readonly code: "connector_principal_required" | "connection_unavailable" | "wrong_connection" | "execution_busy" | "stale_execution" | "stale_progress" | "reconnect_required" | "provider_unavailable" | "admin_authority_changed" | "root_coverage_incomplete" | "audience_unavailable",
     message: string,
     readonly status: number,
   ) {
@@ -70,6 +70,18 @@ export interface GdriveCommitProjectPlan {
 
 export interface GdriveCommitScope {
   /**
+   * What the commit does to visibility (AIO-1167 R44 C2), classified by the caller, never inferred.
+   *   · `publish` (default) — content or a new placement: the connection's approved audience must be
+   *     healthy (every destination exists and still holds a grant), or the commit is refused with
+   *     the NON-terminal `audience_unavailable`.
+   *   · `reduce` — provider-confirmed removal / snapshot reconciliation, which only retires claims
+   *     and suppresses content. It still requires the live principal, team, connection, generation,
+   *     lease and (when asked) root coverage, and takes the audience rows that still exist in the
+   *     same ordered pass — but a lost grant or a deleted destination never blocks taking content
+   *     AWAY from an audience.
+   */
+  operation?: "publish" | "reduce";
+  /**
    * Plans the project rows the commit will touch besides its audience. Called after the connection
    * authority is held and before any project row is locked, so the COMPLETE set is taken in the one
    * ordered pass below and nothing is acquired or strengthened later. A plan row that is gone by the
@@ -115,16 +127,35 @@ const NO_PROJECT_PLAN: GdriveCommitProjectPlan = { writeProjectIds: [], referenc
  * references by key `for key share` (where a canonical item already lives). A storage project that
  * is also an audience project is write-locked once and never share-locked at all.
  */
+function configuredAudience(row: AuthorityRow): string[] {
+  const raw = row.config.audienceProjectIds;
+  return Array.isArray(raw)
+    ? [...new Set(raw.filter((id): id is string => typeof id === "string" && /^[0-9a-f-]{36}$/i.test(id)))]
+    : [];
+}
+
+/**
+ * The audience rows a visibility-REDUCING commit takes (AIO-1167 R44 C2): every configured audience
+ * row that still exists, share-locked in the same ordered pass as `approvedAudience`, with no grant
+ * requirement. A deleted destination is simply absent; an unresolved audience locks nothing.
+ */
+async function reducingAudience(row: AuthorityRow, plan: GdriveCommitProjectPlan = NO_PROJECT_PLAN): Promise<GdriveApprovedAudience> {
+  const projectIds = configuredAudience(row);
+  const locked = await lockProjectRows(runSql, row.team_id, {
+    write: plan.writeProjectIds,
+    share: projectIds,
+    reference: plan.referenceProjectIds,
+  });
+  return { projectIds: projectIds.filter((id) => locked.has(id.toLowerCase())), lockedProjects: locked };
+}
+
 async function approvedAudience(
   row: AuthorityRow,
   plan: GdriveCommitProjectPlan = NO_PROJECT_PLAN,
 ): Promise<GdriveApprovedAudience> {
-  const raw = row.config.audienceProjectIds;
-  const projectIds = Array.isArray(raw)
-    ? [...new Set(raw.filter((id): id is string => typeof id === "string" && /^[0-9a-f-]{36}$/i.test(id)))]
-    : [];
+  const projectIds = configuredAudience(row);
   if (projectIds.length === 0) {
-    throw new GdriveAuthorityError("connection_unavailable", "Google Drive audience is not resolved", 409);
+    throw new GdriveAuthorityError("audience_unavailable", "Google Drive audience is not resolved", 409);
   }
   const locked = await lockProjectRows(runSql, row.team_id, {
     write: plan.writeProjectIds,
@@ -140,7 +171,7 @@ async function approvedAudience(
   );
   if (rows.length !== projectIds.length || rows.some((project) => !project.granted)
       || projectIds.some((id) => !locked.has(id.toLowerCase()))) {
-    throw new GdriveAuthorityError("connection_unavailable", "Google Drive audience grant is missing or no longer valid", 409);
+    throw new GdriveAuthorityError("audience_unavailable", "Google Drive audience grant is missing or no longer valid", 409);
   }
   return { projectIds, lockedProjects: locked };
 }
@@ -684,7 +715,10 @@ export async function acquireGdriveExecution(
       throw new GdriveAuthorityError("reconnect_required", "Google Drive connection requires reconnection", 409);
     }
     await assertLiveBoundPrincipal(row, auth);
-    await approvedAudience(row);
+    // No audience health check here (AIO-1167 R44 C2): an execution is also how provider-confirmed
+    // removals and snapshot reconciliation reach the brain, and those must still run after a
+    // destination loses its grant or is deleted. Every CONTENT commit re-validates the audience
+    // (`withGdriveExecutionCommit`, operation `publish`) and is refused without it.
 
     const activeOther = row.lease_owner && row.lease_owner !== owner
       && row.lease_until && new Date(row.lease_until).getTime() > Date.now();
@@ -759,7 +793,8 @@ export async function withGdriveExecutionCommit<T>(
           );
         }
       }
-      return approvedAudience(row, await scope.projects?.());
+      const plan = await scope.projects?.();
+      return scope.operation === "reduce" ? reducingAudience(row, plan) : approvedAudience(row, plan);
     });
     return fn(audience);
   });
@@ -886,9 +921,18 @@ export interface GoogleAccessGrant {
 }
 
 /** Refresh on the brain and re-check the fence after the network call before releasing a token. */
+function assertOAuthMode(row: AuthorityRow): void {
+  if (String(row.config.authMode ?? "oauth") !== "oauth") {
+    throw new GdriveAuthorityError("reconnect_required", "Google Drive connection is not using OAuth", 409);
+  }
+}
+
 export async function brokerGoogleAccessToken(auth: ApiAuth, ref: GdriveExecutionRef): Promise<GoogleAccessGrant> {
   const credential = await withTransaction(async () => {
     const row = await assertLockedExecution(auth, ref);
+    // Only an OAuth connection is brokered (AIO-1167 R44 C15): a service-account connection that
+    // still holds an earlier OAuth secret must not have it refreshed. Checked again at issuance.
+    assertOAuthMode(row);
     if (!row.secret_ciphertext) throw new GdriveAuthorityError("reconnect_required", "Google Drive connection requires reconnection", 409);
     let parsed: StoredOAuthSecret;
     try {
@@ -899,8 +943,15 @@ export async function brokerGoogleAccessToken(auth: ApiAuth, ref: GdriveExecutio
     if (!parsed.client_id || !parsed.client_secret || !parsed.refresh_token) {
       throw new GdriveAuthorityError("reconnect_required", "Google Drive connection requires reconnection", 409);
     }
+    // The ceiling every refresh is held to, decided BEFORE asking Google: the recorded mode, or for a
+    // legacy credential the narrowest mode its own recorded grant fits. No usable evidence → reconnect.
+    const ceiling = storedGrantCeiling(parsed.grant_mode, parsed.scopes);
+    if (!ceiling) {
+      throw new GdriveAuthorityError("reconnect_required", "Google Drive credential has no verifiable approved access; reconnect", 409);
+    }
     return {
       ...parsed,
+      ceiling,
       email: String(row.config.authenticatedAccount ?? ""),
       subject: String(row.config.authenticatedAccountId ?? parsed.account_subject ?? ""),
       configuredScopes: Array.isArray(row.config.scopeSet) ? row.config.scopeSet.map(String) : [],
@@ -938,18 +989,14 @@ export async function brokerGoogleAccessToken(auth: ApiAuth, ref: GdriveExecutio
   // The consent mode recorded with the credential is a ceiling on EVERY grant, not just the first
   // (AIO-1167 R43 F3). A refresh reporting authority outside it is refused and the token withheld —
   // never released with the unexpected scope filtered out of the list, which would hide it.
-  if (credential.grant_mode !== undefined) {
-    const verdict = isGdriveGrantMode(credential.grant_mode)
-      ? evaluateGdriveGrant(credential.grant_mode, granted)
-      : null;
-    if (!verdict?.ok) {
-      await audit(adminClient(), {
-        team_id: auth.teamId, actor_kind: "api_key", member_id: auth.memberId, api_key_id: auth.apiKeyId,
-        action: "gdrive.token_denied", target_type: "integration", target_id: ref.integrationId,
-        meta: { generation: ref.generation, fence: ref.fence, grantOutsideMode: verdict?.reason ?? "unknown_mode" },
-      });
-      throw new GdriveAuthorityError("reconnect_required", "Google Drive credential no longer matches its approved access; reconnect", 409);
-    }
+  const verdict = evaluateGdriveGrant(credential.ceiling, granted);
+  if (!verdict.ok) {
+    await audit(adminClient(), {
+      team_id: auth.teamId, actor_kind: "api_key", member_id: auth.memberId, api_key_id: auth.apiKeyId,
+      action: "gdrive.token_denied", target_type: "integration", target_id: ref.integrationId,
+      meta: { generation: ref.generation, fence: ref.fence, grantOutsideMode: verdict.reason },
+    });
+    throw new GdriveAuthorityError("reconnect_required", "Google Drive credential no longer matches its approved access; reconnect", 409);
   }
   const expiresIn = Math.max(1, Math.min(Number(payload.expires_in) || 3600, 3600));
   // A pause, disconnect, scope change, lease replacement, rebind, or key revocation during refresh
@@ -960,7 +1007,7 @@ export async function brokerGoogleAccessToken(auth: ApiAuth, ref: GdriveExecutio
   // the return. A record PostgreSQL rejects aborts the transaction and the commit is refused, so
   // the token is withheld rather than released unrecorded.
   await withTransaction(async () => {
-    await assertLockedExecution(auth, ref);
+    assertOAuthMode(await assertLockedExecution(auth, ref));
     await audit(adminClient(), {
       team_id: auth.teamId, actor_kind: "api_key", member_id: auth.memberId, api_key_id: auth.apiKeyId,
       action: "gdrive.token_issued", target_type: "integration", target_id: ref.integrationId,

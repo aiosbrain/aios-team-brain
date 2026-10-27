@@ -60,7 +60,11 @@ aios-ingest schedule --config connections.yaml --poll-interval 300
 
 `schedule` polls each connection on an interval (sha256 dedup makes re-polls cheap no-ops).
 Drive baseline/change tokens, page obligations and overlapping watch channels live in a local SQLite
-file (`--state-db`). Tokens remain opaque and are namespaced by team, immutable integration,
+file. `sync`, `schedule` and the separately launched webhook receiver must use the SAME file: set
+`AIOS_INGEST_STATE=/path/state.sqlite` in the environment of every process (the receiver validates
+notifications against channels the scheduler persisted). `schedule --state-db` overrides it for that
+process only; `AIOS_STATE_DB` is still read as a legacy alias when `AIOS_INGEST_STATE` is unset, and
+the two set to different paths is refused. Default: `aios_ingest_state.sqlite` in the working directory. Tokens remain opaque and are namespaced by team, immutable integration,
 credential, selected drive and the brain-issued monotonic generation. SQLite is resumable work state,
 not write authority: the brain owns the active generation/lease fence and rejects stale content,
 reconciliation and progress commits. Pause/resume is a control-state transition: it advances the

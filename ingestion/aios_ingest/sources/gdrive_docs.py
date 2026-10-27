@@ -169,6 +169,15 @@ class _Renderer:
                         "textRun.content is missing or not a string", True,
                     )
                     continue
+                # The canonical view is the document's CURRENT content, without proposed edits
+                # (AIO-1167 R44 S6a): the request asks for PREVIEW_WITHOUT_SUGGESTIONS, and should a
+                # suggestion still arrive, a proposed insertion is not content yet (omitted, and
+                # disclosed) while a proposed deletion is still content (kept, and disclosed).
+                if text_run.get("suggestedInsertionIds"):
+                    self.issue("suggested_insertion_omitted", iloc, "proposed (unaccepted) insertion omitted")
+                    continue
+                if text_run.get("suggestedDeletionIds"):
+                    self.issue("suggested_deletion_retained", iloc, "text proposed for deletion is still current content")
                 link = (text_run.get("textStyle") or {}).get("link")
                 url = link.get("url") if isinstance(link, dict) else None
                 clean = text.rstrip("\n")
@@ -195,6 +204,21 @@ class _Renderer:
                 if not isinstance(footnote, dict):
                     self.issue("missing_footnote", iloc, f"footnote {fid!r} was referenced but not returned", True)
                 continue
+            if "richLink" in inline:
+                self.render_rich_link(inline["richLink"], location=f"{iloc}/richLink")
+                continue
+            if "person" in inline:
+                self.render_chip_text(
+                    inline["person"], "personProperties", ("name", "email"), location=f"{iloc}/person",
+                    kind="person",
+                )
+                continue
+            if "dateElement" in inline:
+                self.render_chip_text(
+                    inline["dateElement"], "dateElementProperties", ("displayText",),
+                    location=f"{iloc}/dateElement", kind="date",
+                )
+                continue
             if "inlineObjectElement" in inline:
                 self.issue("unsupported_inline_object", iloc, "inline object omitted")
                 self.add("[unsupported inline object]", iloc)
@@ -202,6 +226,39 @@ class _Renderer:
                 self.issue("unsupported_inline", iloc, f"unsupported inline keys: {sorted(inline)}")
         if self.parts and not self.parts[-1].endswith("\n"):
             self.add("\n", location)
+
+    def render_rich_link(self, chip: Any, *, location: str) -> None:
+        """A rich-link chip IS a readable link (AIO-1167 R44 C9): render the title and URI Google
+        returned, never fetching the target. Without a usable returned link the required content is
+        missing, so the extraction is incomplete rather than silently link-less. Only http(s) targets
+        become links; another scheme keeps its title and is disclosed."""
+        props = chip.get("richLinkProperties") if isinstance(chip, dict) else None
+        uri = props.get("uri") if isinstance(props, dict) else None
+        title = props.get("title") if isinstance(props, dict) else None
+        if not isinstance(uri, str) or not uri.strip():
+            self.issue("malformed_rich_link", location, "rich link has no returned URI", True)
+            return
+        uri = uri.strip()
+        label = title.strip() if isinstance(title, str) and title.strip() else uri
+        if not uri.lower().startswith(("https://", "http://")):
+            self.issue("rich_link_scheme_omitted", location, "rich link target is not an http(s) URL; title kept")
+            self.add(label, location)
+            return
+        self.add(f"[{label}]({uri})", location)
+
+    def render_chip_text(
+        self, chip: Any, properties_key: str, fields: tuple[str, ...], *, location: str, kind: str,
+    ) -> None:
+        """Person and date chips: their returned readable text, or a specific disclosure. Full chip
+        semantics are not required content (accepted spec: disclosed unsupported elements)."""
+        props = chip.get(properties_key) if isinstance(chip, dict) else None
+        values = [props.get(field) for field in fields] if isinstance(props, dict) else []
+        readable = [value.strip() for value in values if isinstance(value, str) and value.strip()]
+        if not readable:
+            self.issue(f"unsupported_{kind}_chip", location, f"{kind} chip carried no readable text")
+            self.add(f"[{kind}]", location)
+            return
+        self.add(readable[0] if len(readable) == 1 else f"{readable[0]} <{readable[1]}>", location)
 
     def render_table(self, table: Any, *, location: str, footnotes: dict[str, Any]) -> None:
         rows = table.get("tableRows") if isinstance(table, dict) else None
@@ -254,6 +311,35 @@ def _walk_tabs(
         yield from _walk_tabs(children, renderer, location=f"{tab_location}/childTabs")
 
 
+def _render_segments(
+    renderer: _Renderer, doc_tab: dict[str, Any], segment: str, *, location: str, footnotes: dict[str, Any],
+) -> list[list[Any]]:
+    """Render a tab's header or footer segments (AIO-1167 R44 F2).
+
+    `DocumentTab.headers`/`footers` are maps keyed by segment id, OUTSIDE the body: their text is
+    readable content the body traversal never sees. Each segment is rendered once (sections that
+    reuse a header reference the same id), in provider order, with a `[segment id, start, end]` span.
+    A malformed map or segment is blocking: the document stays incomplete and retryable rather than
+    reported complete without that text.
+    """
+    spans: list[list[Any]] = []
+    if segment not in doc_tab:
+        return spans
+    raw = doc_tab.get(segment)
+    if not isinstance(raw, dict):
+        renderer.issue(f"malformed_{segment}", f"{location}/{segment}", f"present {segment} must be an object", True)
+        return spans
+    label = segment[:-1]
+    for segment_id, value in raw.items():
+        seg_location = f"{location}/{label}:{segment_id}"
+        start = renderer.length
+        renderer.add(f"\n<!-- {label}:{segment_id} -->\n", seg_location)
+        renderer.render_content(value.get("content") if isinstance(value, dict) else None,
+                                location=seg_location, footnotes=footnotes)
+        renderer.record_span(spans, [str(segment_id), start, renderer.length], seg_location)
+    return spans
+
+
 def extract_google_doc(document: dict[str, Any], *, max_chars: int = 2_000_000) -> DocsExtraction:
     """Render every root/child tab in provider order from a Docs API response."""
     renderer = _Renderer(max_chars=max_chars)
@@ -274,8 +360,12 @@ def extract_google_doc(document: dict[str, Any], *, max_chars: int = 2_000_000) 
         # includeTabsContent should normally carry tabs. The fallback applies only when the field is
         # absent; a supplied null/scalar/empty value is malformed and must never hide behind root body.
         renderer.issue("legacy_root_body", "document", "Docs response contained no tabs; used root body")
+        legacy_tab: dict[str, Any] = {"body": document.get("body"), "footnotes": document.get("footnotes") or {}}
+        for segment in ("headers", "footers"):
+            if segment in document:
+                legacy_tab[segment] = document.get(segment)
         tabs = [({"tabProperties": {"tabId": "root", "title": document.get("title") or "Document"},
-                  "documentTab": {"body": document.get("body"), "footnotes": document.get("footnotes") or {}}},
+                  "documentTab": legacy_tab},
                  "document/root")]
 
     for order, (tab, supplied_location) in enumerate(tabs):
@@ -336,6 +426,8 @@ def extract_google_doc(document: dict[str, Any], *, max_chars: int = 2_000_000) 
                                     location=f"{location}/footnote:{fid}", footnotes={})
             renderer.record_span(footnote_spans, [str(fid), footnote_start, renderer.length],
                                  f"{location}/footnote:{fid}")
+        for segment in ("headers", "footers"):
+            entry[segment] = _render_segments(renderer, doc_tab, segment, location=location, footnotes=footnotes)
         entry["text_end"] = renderer.length
 
     raw = "".join(renderer.parts)
@@ -352,6 +444,8 @@ def extract_google_doc(document: dict[str, Any], *, max_chars: int = 2_000_000) 
         entry["blocks"] = [[index, rebase(start), rebase(end), provider]
                            for index, start, end, provider in entry["blocks"]]
         entry["footnotes"] = [[fid, rebase(start), rebase(end)] for fid, start, end in entry["footnotes"]]
+        for segment in ("headers", "footers"):
+            entry[segment] = [[sid, rebase(start), rebase(end)] for sid, start, end in entry.get(segment, [])]
 
     complete = bool(tab_manifest) and not any(issue.blocking for issue in renderer.issues)
     return DocsExtraction(text, complete, tab_manifest, renderer.issues,

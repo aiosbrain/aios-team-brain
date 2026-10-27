@@ -86,3 +86,17 @@ export function evaluateGdriveGrant(mode: GdriveGrantMode, granted: readonly unk
   if (!scopes.includes(policy.required)) return { ok: false, reason: "insufficient" };
   return { ok: true, scopes };
 }
+
+/**
+ * The grant ceiling of a stored credential (AIO-1167 R44 C15). A credential published with a recorded
+ * `grant_mode` is held to exactly that mode; an invalid recorded mode has no ceiling and is refused.
+ * A legacy credential with NO recorded mode is held to the narrowest mode its own recorded grant
+ * fits — never to "anything Google returns": with no usable recorded grant there is no evidence to
+ * set a ceiling from, so it must reconnect (`null`).
+ */
+export function storedGrantCeiling(grantMode: unknown, recordedScopes: unknown): GdriveGrantMode | null {
+  if (grantMode !== undefined && grantMode !== null) return isGdriveGrantMode(grantMode) ? grantMode : null;
+  const recorded = Array.isArray(recordedScopes) ? recordedScopes : null;
+  for (const mode of GDRIVE_GRANT_MODES) if (evaluateGdriveGrant(mode, recorded).ok) return mode;
+  return null;
+}

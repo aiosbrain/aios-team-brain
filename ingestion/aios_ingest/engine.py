@@ -8,7 +8,6 @@ rate limiter. The brain's sha256 dedup makes re-runs idempotent.
 from __future__ import annotations
 
 import asyncio
-import os
 from collections import Counter
 from dataclasses import dataclass
 from typing import Iterable, Iterator
@@ -175,8 +174,9 @@ async def run_connection(
     if conn.source == "gdrive":
         from .gdrive_sync import run_gdrive_stream
         from .state import StateStore
+        from .state_path import resolve_state_db
         owned_state = state is None
-        store = state or StateStore(os.environ.get("AIOS_STATE_DB", "aios_ingest_state.sqlite"))
+        store = state or StateStore(resolve_state_db())
         try:
             return await run_gdrive_stream(
                 settings, conn, store,

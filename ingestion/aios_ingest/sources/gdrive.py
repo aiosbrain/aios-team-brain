@@ -841,7 +841,12 @@ class GoogleDriveSource(PullOnlySource, Source):
         if docs is None:
             _, docs = self._services()
         document = self._request(
-            lambda: docs.documents().get(documentId=file_id, includeTabsContent=True)
+            # The canonical view: current content WITHOUT proposed edits, whatever the credential's
+            # access level would show by default (AIO-1167 R44 S6a).
+            lambda: docs.documents().get(
+                documentId=file_id, includeTabsContent=True,
+                suggestionsViewMode="PREVIEW_WITHOUT_SUGGESTIONS",
+            )
         )
         extracted = extract_google_doc(document, max_chars=self._max_chars)
         if not extracted.complete:
