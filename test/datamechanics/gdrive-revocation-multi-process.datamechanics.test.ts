@@ -28,33 +28,65 @@ import { db, driveFixture, seedTeam, type Seed } from "./helpers";
 const TITLE = `Multi-process revocation ${randomUUID().slice(0, 8)}`;
 const CHILD = resolve(__dirname, "processes/timeline-reader.ts");
 
+const ROOT = resolve(__dirname, "../..");
+
 class Reader {
   private readonly child: ChildProcessWithoutNullStreams;
-  private readonly queue: Array<(value: Record<string, unknown>) => void> = [];
+  private readonly queue: Array<{ resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }> = [];
   private readonly pending: Record<string, unknown>[] = [];
+  private stderr = "";
+  private failure: Error | null = null;
 
   constructor() {
+    // A real, separate Node process. `tsx` compiles the TypeScript and maps `@/` through the repo's
+    // tsconfig (named explicitly, from the repo root, whatever the worker's cwd); `react-server`
+    // resolves `server-only` to its empty module, as inside the Next server. The parent's env
+    // (DATABASE_URL and the tier's other pins) is inherited.
     this.child = spawn(process.execPath, ["--conditions=react-server", "--import", "tsx", CHILD], {
-      env: process.env, stdio: ["pipe", "pipe", "pipe"],
+      cwd: ROOT,
+      env: { ...process.env, TSX_TSCONFIG_PATH: resolve(ROOT, "tsconfig.json") },
+      stdio: ["pipe", "pipe", "pipe"],
     });
+    // Always drain stderr: an unread pipe fills and blocks the child mid-startup, which looks like a
+    // hang. Keep the tail for the failure message.
+    this.child.stderr.setEncoding("utf8");
+    this.child.stderr.on("data", (chunk: string) => { this.stderr = (this.stderr + chunk).slice(-8_000); });
+    this.child.on("error", (error) => this.fail(new Error(`reader process failed to start: ${error.message}`)));
+    // `close`, not `exit`: it fires once stdio has closed, so the stderr tail is complete.
+    this.child.on("close", (code, signal) => this.fail(new Error(
+      `reader process exited (code ${code}, signal ${signal}); stderr:\n${this.stderr}`,
+    )));
     createInterface({ input: this.child.stdout }).on("line", (line) => {
       let value: Record<string, unknown>;
       try { value = JSON.parse(line) as Record<string, unknown>; } catch { return; }
       const waiter = this.queue.shift();
-      if (waiter) waiter(value); else this.pending.push(value);
+      if (waiter) waiter.resolve(value); else this.pending.push(value);
     });
+  }
+
+  private fail(error: Error): void {
+    this.failure ??= error;
+    while (this.queue.length) this.queue.shift()!.reject(this.failure);
   }
 
   next(timeoutMs = 60_000): Promise<Record<string, unknown>> {
     const ready = this.pending.shift();
     if (ready) return Promise.resolve(ready);
+    if (this.failure) return Promise.reject(this.failure);
     return new Promise((resolveValue, reject) => {
-      const timer = setTimeout(() => reject(new Error("reader process did not answer")), timeoutMs);
-      this.queue.push((value) => { clearTimeout(timer); resolveValue(value); });
+      const timer = setTimeout(
+        () => reject(new Error(`reader process did not answer in ${timeoutMs} ms; stderr:\n${this.stderr}`)),
+        timeoutMs,
+      );
+      this.queue.push({
+        resolve: (value) => { clearTimeout(timer); resolveValue(value); },
+        reject: (error) => { clearTimeout(timer); reject(error); },
+      });
     });
   }
 
   send(command: Record<string, unknown>): void {
+    if (this.failure) throw this.failure;
     this.child.stdin.write(`${JSON.stringify(command)}\n`);
   }
 
@@ -66,7 +98,8 @@ class Reader {
   }
 
   stop(): void {
-    try { this.send({ op: "exit" }); } catch { /* already gone */ }
+    this.failure ??= new Error("reader stopped");
+    try { this.child.stdin.write(`${JSON.stringify({ op: "exit" })}\n`); } catch { /* already gone */ }
     this.child.kill();
   }
 }

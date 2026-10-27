@@ -89,3 +89,31 @@ def test_no_catch_up_when_the_regular_sweep_is_early_enough(tmp_path):
                                lead_seconds=WATCH_RUN_SECONDS + RENEWAL_SKEW_SECONDS)
     assert scheduler.jobs == []
     state.close()
+
+
+@pytest.mark.asyncio
+async def test_a_refused_renewal_leaves_the_due_predecessor_active(tmp_path, monkeypatch):
+    """The predecessor is only ever retired by its own expiry, never by a renewal that failed."""
+    from aios_ingest import watch_renewal
+    from aios_ingest.watch_lifecycle import ACTIVE, WatchRefused, to_section
+    from test_watch_lifecycle import SETTINGS, _Brain, _conn, _Provider, _record
+
+    due = (datetime.now(timezone.utc) + timedelta(minutes=20)).isoformat()  # inside the default window
+    brain = _Brain()
+    brain.progress["watches"] = to_section({"current": _record(
+        ACTIVE, attempt_id="current", resource_id="res-current", expires_at=due,
+    )})
+    brain.install(monkeypatch)
+
+    def refused(record, token):
+        raise WatchRefused(400)
+
+    provider = _Provider(brain, on_dispatch=refused)
+    state = StateStore(str(tmp_path / "refused-renewal.sqlite"))
+    await watch_renewal.renew_watches(state, provider, [_conn()], SETTINGS)
+
+    records = brain.records()
+    assert records["current"].state == ACTIVE  # still serving notifications
+    assert len(records) == 2  # a successor was attempted (and refused)
+    assert "current" in {c.channel_id for c in state.list_channels("gd", active_only=True)}
+    state.close()

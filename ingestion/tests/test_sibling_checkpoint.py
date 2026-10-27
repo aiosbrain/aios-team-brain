@@ -95,3 +95,34 @@ async def test_another_accounts_streams_are_not_published(tmp_path):
     await _checkpoint_progress(client, execution, state, _ns("drive-a"))
     assert "drive-z" not in client.payloads[-1]["streams"]
     state.close()
+
+
+@pytest.mark.asyncio
+async def test_a_budget_boundary_and_restart_before_bs_turn_still_never_regress_b(tmp_path):
+    """The run ends (budget spent) before B's turn; the next run acquires from the brain's last
+    acknowledgment and again checkpoints A first. B stays the newer acknowledged copy, the stale local
+    B is never stamped current, and B's already-acknowledged obligations are untouched."""
+    owner_one = _store(tmp_path, "restart.sqlite", b_token="b-stale", revision=3)
+    owner_one.enqueue_work(_ns("drive-b"), GEN, "done-doc", "upsert", {})
+    (done,) = owner_one.list_pending(_ns("drive-b"), GEN)
+    owner_one.ack_work(done)
+    remote = {"version": 2, "streams": {
+        "drive-a": {"drive_id": "drive-a", "page_token": "a-remote"},
+        "drive-b": {"drive_id": "drive-b", "page_token": "b-newer"},
+    }}
+    client = _Client(7)
+    first_run = GdriveExecution("conn", GEN, 2, "owner-1", "later", "scope", {}, progress=remote, progress_revision=7)
+    await _checkpoint_progress(client, first_run, owner_one, _ns("drive-a"), page_token="a-1")
+
+    # Restart: a new execution from exactly what the brain acknowledged.
+    acknowledged = client.payloads[-1]
+    second_run = GdriveExecution("conn", GEN, 3, "owner-1", "later", "scope", {},
+                                 progress=dict(acknowledged), progress_revision=client.revision)
+    await _checkpoint_progress(client, second_run, owner_one, _ns("drive-a"), page_token="a-2")
+
+    sent = client.payloads[-1]["streams"]
+    assert sent["drive-a"]["page_token"] == "a-2"
+    assert sent["drive-b"]["page_token"] == "b-newer"
+    assert owner_one.get_progress(_ns("drive-b")).server_revision == 3
+    assert owner_one.pending_count(_ns("drive-b"), GEN) == 0  # the completed obligation stays completed
+    owner_one.close()

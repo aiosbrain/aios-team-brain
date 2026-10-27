@@ -205,3 +205,66 @@ async def test_a_sent_request_that_times_out_is_still_a_counted_failure(world):
     await _drain(state, namespace, source, summary)
     assert summary.failed == 1 and summary.failure_categories == {"provider_timeout": 1}
     assert _row(state, namespace)["attempts"] == 1
+
+
+# --- U3: a successful push whose checkpoint is deferred -------------------------------------------
+
+class _PushedSource(_Source):
+    def _raw_doc(self, meta):
+        from aios_ingest.normalize import RawDoc
+
+        self.calls.append(("docs", meta["id"]))
+        return RawDoc(source="gdrive", external_id=meta["id"], title="Doc", body="the document body")
+
+
+class _DeferringBrain:
+    """The sink accepts the document; the cursor checkpoint is rate limited past the run budget."""
+
+    def __init__(self, not_before):
+        self.not_before, self.pushes, self.checkpoints = not_before, [], 0
+
+    async def push(self, item, *, execution=None):
+        from aios_ingest.brain_client import IngestResult
+
+        self.pushes.append(item.path)
+        return IngestResult(status="created" if len(self.pushes) == 1 else "unchanged", id="item-1", path=item.path)
+
+    async def checkpoint_gdrive_execution(self, execution, payload):
+        from aios_ingest.brain_client import BrainDeferred
+
+        self.checkpoints += 1
+        if self.not_before:
+            raise BrainDeferred(429, "rate_limited", "wait", not_before=self.not_before)
+        return {"progress_revision": 2, "progress": payload}
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_checkpoint_after_a_successful_push_keeps_the_acknowledgment_pending(world):
+    """AIO-1167 R44 U3: the push counts as pushed; the acknowledgment stays owed with the brain's
+    not-before (no long sleep); the restart replays the push idempotently and then acknowledges."""
+    state, namespace = world
+    state.enqueue_work(namespace, 2, "doc", "upsert", {})
+    later = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+    brain = _DeferringBrain(later)
+    source = _PushedSource()
+    summary = IngestSummary("docs", failure_categories={})
+    conn = Connection("docs", "gdrive", options={}, project="docs")
+    execution = GdriveExecution("conn", 2, 1, "owner", "later", "scope", {})  # this test's own
+
+    await _drain_pending(brain, execution, source, conn, state, namespace, 2, summary, 10)
+
+    assert brain.pushes and summary.created == 1  # truthful: the document reached the brain
+    assert summary.failure_categories.get("rate_limited") == 1
+    row = _row(state, namespace)
+    assert _parse(row["not_before"]) >= _parse(later)  # the brain's wait, preserved
+    assert state.pending_count(namespace, 2) == 1  # acknowledgment still owed
+    assert state.list_pending(namespace, 2) == []  # and not retried before the wait
+
+    # Restart after the wait: the replay is idempotent and the obligation is acknowledged.
+    state._db.execute("UPDATE pending_work SET not_before=NULL WHERE item_key='doc'")
+    state._db.commit()
+    brain.not_before = None
+    replay = IngestSummary("docs", failure_categories={})
+    await _drain_pending(brain, execution, source, conn, state, namespace, 2, replay, 10)
+    assert len(brain.pushes) == 2 and replay.unchanged == 1
+    assert state.pending_count(namespace, 2) == 0

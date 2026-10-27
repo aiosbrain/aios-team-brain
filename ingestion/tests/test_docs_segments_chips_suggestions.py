@@ -191,3 +191,39 @@ def test_a_returned_suggestion_never_blends_into_current_content():
     assert "PROPOSED-INSERT" not in with_suggestions.text
     assert with_suggestions.text == without.text
     assert {("suggested_insertion_omitted", False), ("suggested_deletion_retained", False)} <= _codes(with_suggestions)
+
+
+@pytest.mark.asyncio
+async def test_an_incomplete_document_never_overwrites_the_stored_one_or_advances_success(tmp_path):
+    """F2 through the adapter into the drain: a document whose footer map is malformed is not pushed
+    (the brain keeps its known-complete body), stays owed and retryable, and the stream's last complete
+    success does not move."""
+    from aios_ingest.brain_client import GdriveExecution
+    from aios_ingest.config import Connection
+    from aios_ingest.engine import IngestSummary
+    from aios_ingest.gdrive_sync import _drain_pending
+    from aios_ingest.state import StateStore, StreamKey
+
+    class Brain:
+        pushes: list = []
+
+        async def push(self, item, *, execution=None):
+            self.pushes.append(item)
+            raise AssertionError("an incomplete document must never reach the sink")
+
+    state = StateStore(str(tmp_path / "incomplete.sqlite"))
+    progress = state.begin_generation(StreamKey("team", "conn", "acct", "my-drive"), 2, start_token="start")
+    state.update_progress(progress.namespace, last_success_at="2026-10-01T00:00:00+00:00")
+    state.enqueue_work(progress.namespace, 2, "doc1", "upsert", {})
+    source, _ = _source({"title": "Doc", "tabs": [_tab("root", [_paragraph("known complete body\n")], footers="nope")]})
+    summary = IngestSummary("docs", failure_categories={})
+
+    await _drain_pending(Brain(), GdriveExecution("conn", 2, 1, "owner", "later", "scope", {}), source,
+                         Connection("docs", "gdrive", options={}, project="docs"), state, progress.namespace, 2,
+                         summary, 10)
+
+    assert Brain.pushes == []
+    assert summary.failure_categories == {"incomplete_extraction": 1} and summary.failed == 1
+    assert state.pending_count(progress.namespace, 2) == 1  # owed: completeness and absence withheld
+    assert state.get_progress(progress.namespace).last_success_at == "2026-10-01T00:00:00+00:00"
+    state.close()
