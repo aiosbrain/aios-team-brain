@@ -42,6 +42,7 @@ async def test_returning_to_selection_a_starts_a_fresh_generation_and_revives_no
 
     # A notification for drive-a arrives before the return.
     state.record_stream_hint(_key("drive-a"))
+    assert state.pending_stream_hint(_key("drive-a")) is not None
 
     # Back to selection A: the brain issues generation 8.
     clock.advance(60)
@@ -61,4 +62,7 @@ async def test_returning_to_selection_a_starts_a_fresh_generation_and_revives_no
     assert (retained.page_token, retained.last_success_at) == (old_progress.page_token, old_progress.last_success_at)
     # The generation-8 run is judged on generation 8 alone.
     assert returned.authoritative_complete is True
+    # The pre-return notification woke the stream and was consumed by generation 8's drain: it is
+    # acknowledged, and what it woke was generation 8's fresh work, not generation 6's queue.
+    assert state.pending_stream_hint(_key("drive-a")) is None
     state.close()
