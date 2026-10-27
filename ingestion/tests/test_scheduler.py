@@ -236,9 +236,12 @@ async def test_hint_sweep_honors_admin_state_and_keeps_local_connections(tmp_pat
         _oauth_row(local_id, "local-docs"),
     ])
     await _gdrive_hint_job(SETTINGS, [local], state, {})
-    # Paused and unknown connections are not woken; a locally configured name runs as itself.
+    # Paused and unknown connections are not woken; a locally configured name runs as itself —
+    # a legacy name-only entry is bound once to the row's immutable id (AIO-1167 R44 C11), its own
+    # local options otherwise unchanged.
     assert [conn.name for conn in ran] == ["admin-docs", "local-docs"]
-    assert ran[1] is local
+    assert ran[1].options == {**local.options, "integration_id": local_id}
+    assert "integration_id" not in local.options  # the configured entry itself is not mutated
     state.close()
 
 
@@ -474,12 +477,16 @@ async def test_manual_request_runs_oauth_only_connection_without_a_local_stub(
     await _manual_gdrive_job(SETTINGS, [other, local] if configured else [other], state)
 
     assert completed == [(request, "admin-docs", "complete", None)]
+    # An explicit Admin run re-arms exhausted retries (AIO-1167 R44 C7).
     if configured:
         # A same-named local connection keeps the request; it is never replaced by a broker stub.
-        assert ran == [local]
+        # Name-only, it is bound to the request's immutable id (R44 C11).
+        assert [(conn.name, conn.options) for conn in ran] == [
+            ("admin-docs", {**local.options, "integration_id": integration_id, "rearm_exhausted": True}),
+        ]
     else:
         assert [(conn.name, conn.source, conn.options) for conn in ran] == [
-            ("admin-docs", "gdrive", {"integration_id": integration_id, "auth_mode": "oauth"}),
+            ("admin-docs", "gdrive", {"integration_id": integration_id, "auth_mode": "oauth", "rearm_exhausted": True}),
         ]
     state.close()
 

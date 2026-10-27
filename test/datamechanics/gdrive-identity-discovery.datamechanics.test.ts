@@ -139,3 +139,40 @@ describe("Drive identity discovery at the fenced ingest boundary (R44 F1, real P
     expect(await mapped(w.seed.teamId)).toEqual([]);
   });
 });
+
+describe("Drive identity discovery under a concurrent mapping decision (R44 F1)", () => {
+  it("an unlink committed while discovery waits on the identity wins: nothing is linked", async () => {
+    const w = await world();
+    const holder = await getPool().connect();
+    let discovering: Promise<unknown> | undefined;
+    try {
+      // Another writer holds THIS identity's lock and is about to record a deliberate unlink.
+      await holder.query("begin");
+      await holder.query("select pg_advisory_xact_lock(hashtextextended($1, 0))",
+        [`${w.seed.teamId}:identity:gdrive:permission:P`]);
+      discovering = discoverGdriveContributorIdentities(db(), w.auth, w.ref, observed(w.a.email));
+      // Discovery reaches the identity lock and waits there.
+      let waiting = 0;
+      for (let tries = 0; tries < 320 && waiting === 0; tries++) {
+        const { rows } = await getPool().query<{ n: number }>(
+          "select count(*)::int as n from pg_stat_activity where datname=current_database() and wait_event_type='Lock'");
+        waiting = rows[0].n;
+        if (waiting === 0) await new Promise((r) => setTimeout(r, 25));
+      }
+      expect(waiting, "discovery is parked on the identity lock").toBeGreaterThan(0);
+      await holder.query(
+        `insert into member_identity_mapping_state(team_id,provider,external_id,member_id,revision,state)
+         values ($1,'gdrive','permission:P',null,1,'unlinked')`,
+        [w.seed.teamId],
+      );
+      await holder.query("commit");
+    } finally {
+      await holder.query("rollback").catch(() => undefined);
+      holder.release();
+    }
+    const outcome = await discovering as Record<string, number>;
+    expect(outcome.linked).toBe(0);
+    expect(outcome.reviewed).toBe(1);
+    expect(await mapped(w.seed.teamId)).toEqual([]);
+  }, 30_000);
+});
