@@ -168,3 +168,34 @@ def merge_selections(local: list[Connection], remote: list[dict]) -> list[Connec
             )
 
     return merged
+
+
+def bind_local_gdrive(
+    connections: list[Connection], row_id: str, row_name: str,
+) -> tuple[Connection | None, bool]:
+    """The local Drive entry an Admin row (immutable ``row_id``, mutable ``row_name``) runs as, and
+    whether the configuration CONTRADICTS that row (AIO-1167 R44 C11).
+
+    · An entry naming ``row_id`` explicitly is that row's entry (the immutable id wins; its local
+      label may differ from the Admin name).
+    · A legacy name-only entry (no ``integration_id``) with the row's name is bound once: returned
+      with the row's id written into its options, so everything downstream runs by id.
+    · An entry with the row's NAME but a different explicit id is a contradiction: ``(None, True)``.
+      The caller runs nothing for that row — never the other id, never a guess.
+    · No matching entry: ``(None, False)`` (a remote-only connection).
+    """
+    gdrive = [conn for conn in connections if conn.source == "gdrive"]
+    for conn in gdrive:
+        if str(conn.options.get("integration_id") or "") == row_id:
+            return conn, False
+    for conn in gdrive:
+        if conn.name != row_name:
+            continue
+        explicit = str(conn.options.get("integration_id") or "")
+        if explicit:
+            return None, True
+        return Connection(
+            conn.name, conn.source, options={**conn.options, "integration_id": row_id},
+            project=conn.project, access=conn.access, actor=conn.actor,
+        ), False
+    return None, False

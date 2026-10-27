@@ -43,11 +43,21 @@ export interface AuthorIdentity {
   key?: string | null;
 }
 
-/** Build lookup tables mapping author identity → member_id for the team. */
+/**
+ * Build lookup tables mapping author identity → member_id for the team.
+ *
+ * `includeDeactivated` (AIO-1167 R44 C4) separates two questions the roster status answers
+ * differently. Who may be NEWLY linked or authenticated excludes a deactivated member — the default,
+ * used by account linking and identity sync. Whose ESTABLISHED work this is does not: offboarding is
+ * not an unlink, so attribution writers (ingest, repair, author resolution) and contribution display
+ * pass `includeDeactivated` and keep resolving a deactivated member's existing aliases and provider
+ * identities. Deliberate unlink tombstones and remaps still apply. `activeMemberIds` lists active
+ * members only, in both modes.
+ */
 export async function buildIdentityMap(
   db: DbClient,
   teamId: string,
-  opts: { strict?: boolean } = {},
+  opts: { strict?: boolean; includeDeactivated?: boolean } = {},
 ): Promise<IdentityMap> {
   const { data, error: membersError } = await db
     .from("members")
@@ -59,6 +69,8 @@ export async function buildIdentityMap(
   const emailDomains = new Set<string>();
   const ambiguousEmails = new Set<string>();
   const activeMemberIds = new Set<string>();
+  /** Members whose identities resolve in this map: the active ones, plus deactivated ones on request. */
+  const resolvableMemberIds = new Set<string>();
   const assignUnique = (
     target: Map<string, string>, ambiguous: Set<string>, key: string, memberId: string,
   ) => {
@@ -77,8 +89,12 @@ export async function buildIdentityMap(
     actor_handle: string | null;
     status?: string | null;
   }[]) {
-    if (r.status === "disabled") continue;
-    activeMemberIds.add(r.id);
+    if (r.status === "disabled") {
+      if (!opts.includeDeactivated) continue;
+    } else {
+      activeMemberIds.add(r.id);
+    }
+    resolvableMemberIds.add(r.id);
     if (r.email) {
       const email = r.email.toLowerCase();
       assignUnique(byEmail, ambiguousEmails, email, r.id);
@@ -98,7 +114,7 @@ export async function buildIdentityMap(
     .eq("team_id", teamId);
   if (opts.strict && aliasesError) throw new Error(`identity aliases read failed: ${aliasesError.message}`);
   for (const a of (aliases ?? []) as { email: string; member_id: string }[]) {
-    if (a.email && activeMemberIds.has(a.member_id)) {
+    if (a.email && resolvableMemberIds.has(a.member_id)) {
       assignUnique(byEmail, ambiguousEmails, a.email.toLowerCase(), a.member_id);
     }
   }
@@ -113,7 +129,7 @@ export async function buildIdentityMap(
     .eq("team_id", teamId);
   if (opts.strict && identitiesError) throw new Error(`provider identities read failed: ${identitiesError.message}`);
   for (const i of (identities ?? []) as { provider: string; external_id: string; email: string | null; member_id: string }[]) {
-    if (!activeMemberIds.has(i.member_id)) continue;
+    if (!resolvableMemberIds.has(i.member_id)) continue;
     if (i.provider && i.external_id) {
       assignUnique(byProviderId, ambiguousProviderIds, providerKey(i.provider, i.external_id), i.member_id);
     }

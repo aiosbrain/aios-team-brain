@@ -20,7 +20,7 @@ from .config import BrainSettings, Connection
 from .engine import run_connection
 from .state import Channel, StateStore
 from .gdrive_sync import run_gdrive_stream
-from .selections import merge_selections
+from .selections import bind_local_gdrive, merge_selections
 
 log = logging.getLogger(__name__)
 
@@ -148,6 +148,8 @@ _PAUSE_AUTHORITY_LOSS = frozenset({"connection_unavailable", "stale_execution"})
 # exception's text (a key-file path, a provider message) never leaves this process; its class name
 # is logged locally for the operator.
 _COORDINATOR_ERROR = "coordinator_error"
+# A local entry names the claimed/notified row's name with ANOTHER integration id (R44 C11).
+_BINDING_CONFLICT = "connection_binding_conflict"
 _REREAD_BEFORE_REPORTING = _PAUSE_AUTHORITY_LOSS | {_COORDINATOR_ERROR}
 
 
@@ -259,11 +261,19 @@ async def _remote_gdrive_poll_job(
     from .brain_client import BrainClient
     async with BrainClient(settings.base_url, settings.api_key, settings.team) as client:
         remote = await client.fetch_integration_selections(include_disabled=True)
-    configured = {conn.name for conn in connections if conn.source == "gdrive"}
-    unconfigured = [
-        row for row in remote
-        if row.get("type") == "gdrive" and row.get("name") not in configured
-    ]
+    unconfigured = []
+    for row in remote:
+        if row.get("type") != "gdrive":
+            continue
+        bound, conflict = bind_local_gdrive(connections, str(row.get("id") or ""), str(row.get("name") or ""))
+        if conflict:
+            # A local entry with this name names ANOTHER integration id: nothing runs for this row
+            # until the configuration is fixed (AIO-1167 R44 C11).
+            log.warning("Drive connection %s: local configuration names a different integration id; not polled",
+                        row.get("name"))
+            continue
+        if bound is None:
+            unconfigured.append(row)
     for conn in merge_selections([], unconfigured):
         try:
             await _poll_job(settings, conn, state)
@@ -281,10 +291,17 @@ async def _manual_gdrive_job(
         request = await client.claim_gdrive_run_request()
     if request is None:
         return
-    configured = next(
-        (conn for conn in connections if conn.source == "gdrive" and conn.name == request.name),
-        None,
-    )
+    from .engine import IngestSummary
+    configured, conflict = bind_local_gdrive(connections, request.integration_id, request.name)
+    if conflict:
+        # The claimed request is completed as a failure for ITS integration; no other id runs.
+        log.warning("manual Drive run for %s: local configuration names a different integration id",
+                    request.name)
+        summary = IngestSummary(request.name, failed=1, failure_categories={_BINDING_CONFLICT: 1},
+                                integration_id=request.integration_id)
+        async with BrainClient(settings.base_url, settings.api_key, settings.team) as client:
+            await client.complete_gdrive_run_request(request, summary, status="failed", error=_BINDING_CONFLICT)
+        return
     connection = configured or Connection(
         request.name, "gdrive", options={"integration_id": request.integration_id, "auth_mode": "oauth"},
     )
@@ -295,7 +312,6 @@ async def _manual_gdrive_job(
     except Exception as exc:  # never BaseException: cancellation and shutdown still propagate
         # The same fixed category as a scheduled run that raised: the exception's text and class
         # never reach the brain; only the class is logged here, for the operator.
-        from .engine import IngestSummary
         log.warning("manual Drive run for %s raised %s; reporting it as %s",
                     connection.name, type(exc).__name__, _COORDINATOR_ERROR)
         summary = IngestSummary(connection.name, failed=1, failure_categories={_COORDINATOR_ERROR: 1})
@@ -341,10 +357,11 @@ async def _gdrive_hint_job(
         row = by_id.get(cid)
         if not row or row.get("status") != "enabled":
             continue
-        configured = next(
-            (conn for conn in connections if conn.source == "gdrive" and conn.name == row.get("name")),
-            None,
-        )
+        configured, conflict = bind_local_gdrive(connections, cid, str(row.get("name") or ""))
+        if conflict:
+            log.warning("Drive notification for %s: local configuration names a different integration id; not woken",
+                        row.get("name"))
+            continue
         connection = configured or next(iter(merge_selections([], [row])), None)
         if connection is None:
             continue

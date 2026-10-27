@@ -325,7 +325,9 @@ describe("AIO-1167 common repair admits Drive documents by their persisted mappi
       .toEqual([[first.email, bob.id, revision], [second.email, null, revision]].sort());
   }, 60_000);
 
-  it("member DEACTIVATION clears the deactivated member's Drive credit — item, their versions and their evidence — and leaves the rest", async () => {
+  // AIO-1167 R44 C4: offboarding is not an unlink. The deactivated member's ESTABLISHED Drive
+  // credit — item, versions and evidence — survives the repair the deactivation triggers.
+  it("member DEACTIVATION keeps the deactivated member's established Drive credit — item, their versions and their evidence", async () => {
     const seed = await adminSeed();
     const c = await driveConnection(seed);
     const carol = await member(seed, "Carol");
@@ -344,13 +346,13 @@ describe("AIO-1167 common repair admits Drive documents by their persisted mappi
     await repairToCompletion(seed);
 
     const now = await credit(itemId);
-    expect(now.item.member_id).toBeNull();
+    expect(now.item.member_id).toBe(carol.id);
     expect(now.versions).toEqual([
       { author: first.email, member_id: dave.id },
-      { author: second.email, member_id: null },
+      { author: second.email, member_id: carol.id },
     ]);
     expect(now.evidence.map((row) => [row.email, row.member_id]).sort())
-      .toEqual([[first.email, dave.id], [second.email, null]].sort());
+      .toEqual([[first.email, dave.id], [second.email, carol.id]].sort());
   }, 60_000);
 
   it("the mapping is the trust root after DISCONNECT: no active claim, no lease, a disabled connection, a NULL connection id", async () => {

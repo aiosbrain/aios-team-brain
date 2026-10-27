@@ -87,14 +87,9 @@ function nextCredit(
 ): string | null {
   const resolved = resolveItemAuthorMember(snapshot.map, frontmatter, snapshot.connectorIds);
   if (resolved) return resolved;
-  const currentDeactivated = Boolean(
-    current && snapshot.map.activeMemberIds && !snapshot.map.activeMemberIds.has(current),
-  );
-  if (current && (
-    snapshot.connectorIds.has(current)
-    || explicitlyUnlinked(snapshot, frontmatter)
-    || (currentDeactivated && parseAuthorRefs(frontmatter).length > 0)
-  )) return null;
+  // Deactivation is not an unlink (AIO-1167 R44 C4): a deactivated author keeps established credit.
+  // Only a connector owner or a deliberate unlink clears it.
+  if (current && (snapshot.connectorIds.has(current) || explicitlyUnlinked(snapshot, frontmatter))) return null;
   return current;
 }
 

@@ -48,7 +48,7 @@ from .connector_state import renewal_document
 from .gdrive_sync import (
     ServiceAccountBindingRefused, oauth_account_namespace, provider_source_options, service_account_namespace,
 )
-from .selections import effective_gdrive_connection
+from .selections import bind_local_gdrive, effective_gdrive_connection
 from .state import StateStore, StreamKey, verification_hash
 from .watch_lifecycle import (
     ACTIVE, CLEANUP_PENDING, DISPATCHED, EXPIRED, PENDING_STATES, PREPARED, RETIRED, UNCERTAIN,
@@ -511,14 +511,20 @@ async def renew_watches(
         raise
     except Exception:
         return  # unknown Admin state: renew nothing
-    enabled = {
-        str(row.get("name")): row for row in remote
+    enabled = [
+        row for row in remote
         if row.get("type") == "gdrive" and row.get("status") == "enabled" and row.get("id")
-    }
+    ]
     budget = _Budget()
     now = datetime.now(timezone.utc)
-    for conn in (candidate for candidate in connections if candidate.source == "gdrive"):
-        row = enabled.get(conn.name)
-        if row is None:
+    # Each enabled row renews under the local entry BOUND to its immutable id (AIO-1167 R44 C11):
+    # an entry with the row's name but another explicit id renews nothing, never the other id.
+    for row in enabled:
+        conn, conflict = bind_local_gdrive(connections, str(row["id"]), str(row.get("name") or ""))
+        if conflict:
+            log.warning("Drive watch renewal for %s: local configuration names a different integration id",
+                        row.get("name"))
+            continue
+        if conn is None:
             continue
         await _renew_connection(settings, conn, row, state, manager, budget, now)

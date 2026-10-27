@@ -434,7 +434,8 @@ export async function getWorkTimeline(
   const primaryOf = (r: ItemRow, from = credit): string | null => from.get(r.id)?.primaryId ?? r.member_id;
   // Google contribution observations resolve through the same shared registry as ingest and the
   // member identity UI. STRICT: a failed alias/provider read must not become a cached partial ledger.
-  const googleIdentities = await buildIdentityMap(db, teamId, { strict: true });
+  // Contribution history: a deactivated author's established Drive work stays theirs (R44 C4).
+  const googleIdentities = await buildIdentityMap(db, teamId, { strict: true, includeDeactivated: true });
 
   type GdriveLedgerRow = {
     item_id: string;

@@ -105,7 +105,8 @@ export async function buildIdentityAuthoritySnapshot(
       throw new Error("identity authority state is incomplete");
     }
     const [map, connectorIds] = await Promise.all([
-      buildIdentityMap(db, teamId, { strict: true }),
+      // Attribution authority: a deactivated member keeps their ESTABLISHED credit (R44 C4).
+      buildIdentityMap(db, teamId, { strict: true, includeDeactivated: true }),
       connectorMemberIds(db, teamId, { strict: true }),
     ]);
     return {

@@ -158,7 +158,9 @@ describe("reattributeItems (real Postgres)", () => {
     expect(await memberOf(seed.teamId, "slack/eng/never-reviewed.md")).toBe(author);
   });
 
-  it("clears retained unlocked provider credit when the mapped member is deactivated", async () => {
+  // AIO-1167 R44 C4: deactivation is not an unlink. A deactivated author keeps ESTABLISHED credit;
+  // only a deliberate unlink (or remap) clears or moves it.
+  it("keeps retained unlocked provider credit when the mapped member is deactivated", async () => {
     const seed=await seedTeam();
     const author=await addMember(seed.teamId);
     await setMemberIdentity(db(),seed.teamId,author,{provider:"slack",externalId:"U-disabled"});
@@ -167,8 +169,29 @@ describe("reattributeItems (real Postgres)", () => {
     });
     await db().from("members").update({status:"disabled"}).eq("id",author).eq("team_id",seed.teamId);
     await reattributeItems(db(),seed.teamId);
-    expect(await memberOf(seed.teamId,"slack/eng/disabled.md")).toBeNull();
-    expect(await versionMembersOf(seed.teamId,"slack/eng/disabled.md")).toEqual([null]);
+    expect(await memberOf(seed.teamId,"slack/eng/disabled.md")).toBe(author);
+    expect(await versionMembersOf(seed.teamId,"slack/eng/disabled.md")).toEqual([author]);
+
+    // Reactivation changes nothing; the credit was never lost.
+    await db().from("members").update({status:"active"}).eq("id",author).eq("team_id",seed.teamId);
+    await reattributeItems(db(),seed.teamId);
+    expect(await memberOf(seed.teamId,"slack/eng/disabled.md")).toBe(author);
+  });
+
+  it("a deliberate unlink still clears a deactivated member's credit, and a new link to them is refused", async () => {
+    const seed=await seedTeam();
+    const author=await addMember(seed.teamId);
+    await setMemberIdentity(db(),seed.teamId,author,{provider:"slack",externalId:"U-offboarded"});
+    await putResolved(seed,seed.memberId,author,"slack/eng/offboarded.md",{
+      source:"slack",author_id:"U-offboarded",
+    });
+    await db().from("members").update({status:"disabled"}).eq("id",author).eq("team_id",seed.teamId);
+    await expect(setMemberIdentity(db(),seed.teamId,author,{provider:"slack",externalId:"U-new-link"}))
+      .rejects.toThrow(/deactivated/);
+    await removeMemberIdentity(db(),seed.teamId,{provider:"slack",externalId:"U-offboarded"});
+    await reattributeItems(db(),seed.teamId);
+    expect(await memberOf(seed.teamId,"slack/eng/offboarded.md")).toBeNull();
+    expect(await versionMembersOf(seed.teamId,"slack/eng/offboarded.md")).toEqual([null]);
   });
 
   it("re-points a git commit item once an email alias is added", async () => {

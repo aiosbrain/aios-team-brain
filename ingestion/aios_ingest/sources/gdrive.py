@@ -427,6 +427,7 @@ class GoogleDriveSource(PullOnlySource, Source):
         # credential object provider calls use, never from a path (AIO-1167 R44 F3). Injected only
         # alongside injected services, by tests.
         self._service_account_email = _service_account_email
+        self._credentials: Any | None = None
         self._metadata_loader = metadata_loader
         self._revisions_loader = revisions_loader
         self._provider_gate = provider_gate
@@ -669,15 +670,19 @@ class GoogleDriveSource(PullOnlySource, Source):
         """Build and execute a provider request after authority, rebuilding it on retry."""
         return self._provider_call(request_factory=factory)
 
-    def _services(self) -> tuple[Any, Any]:
-        if self._drive is not None and self._docs is not None:
-            return self._drive, self._docs
+    def _load_credentials(self) -> Any:
+        """Load the run's credential ONCE; the identity and every provider call use this object.
+
+        Cached, so a key file replaced on disk between reading the identity and building the
+        services cannot make the two disagree (AIO-1167 R44 F3).
+        """
+        if self._credentials is not None:
+            return self._credentials
         try:
             from google.oauth2 import service_account  # type: ignore
             from google.oauth2.credentials import Credentials  # type: ignore
-            from googleapiclient.discovery import build  # type: ignore
         except ImportError as exc:  # pragma: no cover - optional live dependency
-            raise MissingExtraError("gdrive", "google-api-python-client google-auth") from exc
+            raise MissingExtraError("gdrive", "google-auth") from exc
         default_scopes = [DRIVE_READONLY_SCOPE, DOCS_READONLY_SCOPE]
         if self._token_provider:
             credentials = Credentials(
@@ -704,6 +709,17 @@ class GoogleDriveSource(PullOnlySource, Source):
                 raise ValueError(
                     "Google Drive credentials must be a local service account or a brokered access token"
                 )
+        self._credentials = credentials
+        return credentials
+
+    def _services(self) -> tuple[Any, Any]:
+        if self._drive is not None and self._docs is not None:
+            return self._drive, self._docs
+        try:
+            from googleapiclient.discovery import build  # type: ignore
+        except ImportError as exc:  # pragma: no cover - optional live dependency
+            raise MissingExtraError("gdrive", "google-api-python-client google-auth") from exc
+        credentials = self._load_credentials()
         if self._token_provider:
             # google-auth-httplib2 normally catches a provider 401 and calls Credentials.refresh().
             # These OAuth credentials deliberately contain no refresh token: replacement belongs
@@ -744,10 +760,11 @@ class GoogleDriveSource(PullOnlySource, Source):
     def service_account_identity(self) -> str | None:
         """The service account the loaded credential authenticates as; ``None`` for OAuth.
 
-        Loads the credential (building the provider services) if that has not happened yet, so the
-        identity always describes the material provider calls will actually use.
+        Loads the run's one credential if that has not happened yet; the provider services are
+        later built from that same object, so the identity describes the material actually used.
         """
-        self._services()
+        if self._drive is None or self._docs is None:
+            self._load_credentials()
         return self._service_account_email
 
     def _metadata(self, file_id: str) -> dict[str, Any]:

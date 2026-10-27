@@ -127,7 +127,7 @@ export async function syncGdriveContributionEvidence(
   if (text(frontmatter.source).toLowerCase() !== "gdrive") return { observed: 0, resolved: 0, diagnostics: 0 };
   // Strict reads are part of the mutation transaction. If any identity owner is unavailable, throw;
   // the surrounding ingest/repair transaction rolls back rather than publishing partial credit.
-  const map = identities ?? await buildIdentityMap(db, teamId, { strict: true });
+  const map = identities ?? await buildIdentityMap(db, teamId, { strict: true, includeDeactivated: true });
   const externalIds = [...new Set(rows.flatMap((r) => r.externalId ? [r.externalId] : []))];
   const revisions = new Map<string, number>();
   if (externalIds.length) {
