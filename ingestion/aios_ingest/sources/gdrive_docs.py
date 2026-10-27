@@ -44,6 +44,24 @@ def _proposed_insertion(payload: Any) -> bool:
     return isinstance(payload, dict) and bool(payload.get("suggestedInsertionIds"))
 
 
+def _footnote_ids(node: Any) -> set[str]:
+    """Every footnote id referenced anywhere under ``node`` — what a skipped proposed element
+    (table, row, cell, table of contents) would have referenced."""
+    found: set[str] = set()
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            ref = current.get("footnoteReference")
+            fid = ref.get("footnoteId") if isinstance(ref, dict) else None
+            if isinstance(fid, str) and fid.strip():
+                found.add(fid)
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
+    return found
+
+
 def tab_anchor(tab_id: str) -> str:
     """The text marker for one tab boundary. The id is percent-encoded (``-`` included), so an
     anchor can never close its HTML comment or be confused with another tab's."""
@@ -88,6 +106,8 @@ class _Renderer:
         proposed for deletion is still current (False: keep it, disclosed)."""
         if _proposed_insertion(payload):
             self.issue("suggested_insertion_omitted", location, f"proposed (unaccepted) {what} omitted")
+            # Whatever footnotes the omitted element referenced are proposed with it.
+            self.proposed_footnotes |= _footnote_ids(payload)
             return True
         if isinstance(payload, dict) and payload.get("suggestedDeletionIds"):
             self.issue("suggested_deletion_retained", location, f"{what} proposed for deletion is still current content")

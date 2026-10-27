@@ -291,6 +291,22 @@ def test_a_proposed_footnote_reference_proposes_its_footnote():
     assert "KEPT-NOTE" in with_suggestion.text and "PROPOSED-NOTE" not in with_suggestion.text
 
 
+@pytest.mark.parametrize("proposed_at", ["table", "row", "cell"])
+def test_a_footnote_referenced_only_inside_a_proposed_table_part_is_proposed_too(proposed_at):
+    noted = {"content": [{"paragraph": {"elements": [
+        {"textRun": {"content": "cell"}}, {"footnoteReference": {"footnoteId": "fn.inside"}},
+        {"textRun": {"content": "\n"}},
+    ]}}]}
+    cell = {**noted, **(_PROPOSED if proposed_at == "cell" else {})}
+    row = {"tableCells": [cell], **(_PROPOSED if proposed_at == "row" else {})}
+    table = {"table": {"tableRows": [row], **(_PROPOSED if proposed_at == "table" else {})}}
+    tab = _tab("root", [_paragraph("body\n"), table])
+    tab["documentTab"]["footnotes"] = {"fn.inside": {"content": [_paragraph("INSIDE-NOTE\n")]}}
+    extraction = extract_google_doc({"title": "Doc", "tabs": [tab]})
+    assert extraction.complete
+    assert "INSIDE-NOTE" not in extraction.text and "[^fn.inside]" not in extraction.text
+
+
 @pytest.mark.asyncio
 async def test_an_incomplete_document_never_overwrites_the_stored_one_or_advances_success(tmp_path):
     """F2 through the adapter into the drain: a document whose footer map is malformed is not pushed
