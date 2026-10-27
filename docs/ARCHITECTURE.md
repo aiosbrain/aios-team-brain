@@ -988,7 +988,9 @@ R44 contracts (AIO-1167):
   (`state_path.py`), and a notification needs a known resource, hash and unexpired channel.
 - **Docs extraction:** header/footer segments are rendered with segment provenance (malformed →
   incomplete); rich-link chips render their returned link; documents are read
-  `PREVIEW_WITHOUT_SUGGESTIONS`.
+  `PREVIEW_WITHOUT_SUGGESTIONS`, and any suggestion that still arrives — on text, a chip, an inline
+  object, a footnote reference (and its footnote), a whole paragraph, a table, row or cell — is
+  disclosed: a proposed insertion is omitted, content proposed for deletion is kept.
 - **Audit:** a successful `POST /api/v1/graph-query` records a sanitized `graph.query` audit again.
 
 `GET /api/v1/integrations` remains selection-only, and a Drive row's account and selection metadata

@@ -12,8 +12,10 @@ target keeps its title and is disclosed. Person/date chips render their returned
 disclosed specifically — never silently dropped.
 
 S6a — suggestions. Documents are requested as PREVIEW_WITHOUT_SUGGESTIONS (current content, without
-proposed edits). Should a suggestion still arrive, a proposed insertion is omitted and a proposed
-deletion is kept, so view-only and edit-capable credentials yield the same intended text.
+proposed edits). Should a suggestion still arrive — on text, a chip, an inline object, a footnote
+reference (and so its footnote), a whole paragraph, a table, a row or a cell — a proposed insertion is
+omitted and content proposed for deletion is kept, both disclosed, so view-only and edit-capable
+credentials yield the text of the document as it currently stands.
 """
 
 from __future__ import annotations
@@ -191,6 +193,102 @@ def test_a_returned_suggestion_never_blends_into_current_content():
     assert "PROPOSED-INSERT" not in with_suggestions.text
     assert with_suggestions.text == without.text
     assert {("suggested_insertion_omitted", False), ("suggested_deletion_retained", False)} <= _codes(with_suggestions)
+
+
+_PROPOSED = {"suggestedInsertionIds": ["s-ins"]}
+_DELETING = {"suggestedDeletionIds": ["s-del"]}
+
+
+def _same_as_never_suggested(with_suggestion, without):
+    """The S6a criterion: the extraction equals that of the document as it currently stands."""
+    assert with_suggestion.complete and without.complete
+    assert with_suggestion.text == without.text
+    return _codes(with_suggestion)
+
+
+@pytest.mark.parametrize("kind, payload", [
+    ("richLink", {"richLinkProperties": {"title": "PROPOSED-LINK", "uri": "https://x.example/p"}}),
+    ("person", {"personProperties": {"name": "PROPOSED-PERSON", "email": "p@example.com"}}),
+    ("dateElement", {"dateElementProperties": {"displayText": "PROPOSED-DATE"}}),
+    ("inlineObjectElement", {"inlineObjectId": "kix.proposed"}),
+])
+def test_a_proposed_chip_or_object_is_not_current_content(kind, payload):
+    keep = {"textRun": {"content": "Kept "}}
+    codes = _same_as_never_suggested(
+        extract_google_doc(_inline_doc(keep, {kind: {**payload, **_PROPOSED}})),
+        extract_google_doc(_inline_doc(keep)),
+    )
+    assert ("suggested_insertion_omitted", False) in codes
+
+
+@pytest.mark.parametrize("kind, payload, rendered", [
+    ("richLink", {"richLinkProperties": {"title": "Roadmap", "uri": "https://x.example/r"}}, "[Roadmap](https://x.example/r)"),
+    ("person", {"personProperties": {"name": "Ada"}}, "Ada"),
+    ("dateElement", {"dateElementProperties": {"displayText": "Oct 27, 2026"}}, "Oct 27, 2026"),
+])
+def test_a_chip_proposed_for_deletion_is_still_current_content(kind, payload, rendered):
+    with_suggestion = extract_google_doc(_inline_doc({kind: {**payload, **_DELETING}}))
+    _same_as_never_suggested(with_suggestion, extract_google_doc(_inline_doc({kind: payload})))
+    assert rendered in with_suggestion.text
+    assert ("suggested_deletion_retained", False) in _codes(with_suggestion)
+
+
+def test_a_proposed_paragraph_leaves_no_heading_or_bullet_behind():
+    proposed = {"paragraph": {
+        "paragraphStyle": {"namedStyleType": "HEADING_2"}, "bullet": {"nestingLevel": 0},
+        "elements": [{"textRun": {"content": "PROPOSED-PARAGRAPH\n", **_PROPOSED}}],
+    }}
+    body = [_paragraph("before\n"), proposed, _paragraph("after\n")]
+    codes = _same_as_never_suggested(
+        extract_google_doc({"title": "Doc", "tabs": [_tab("root", body)]}),
+        extract_google_doc({"title": "Doc", "tabs": [_tab("root", [_paragraph("before\n"), _paragraph("after\n")])]}),
+    )
+    assert ("suggested_insertion_omitted", False) in codes
+
+
+def _cell(text, **suggestion):
+    return {"content": [_paragraph(f"{text}\n")], **suggestion}
+
+
+def _table(*rows, **suggestion):
+    return {"table": {"tableRows": [{"tableCells": list(cells), **extra} for cells, extra in rows], **suggestion}}
+
+
+def test_a_proposed_table_row_and_cell_are_not_current_content():
+    current = _table(([_cell("h1"), _cell("h2")], {}), ([_cell("a"), _cell("b")], {}))
+    proposed_table = _table(([_cell("PROPOSED-TABLE")], {}), **_PROPOSED)
+    with_row = _table(([_cell("h1"), _cell("h2")], {}), ([_cell("PROPOSED-ROW"), _cell("x")], _PROPOSED),
+                      ([_cell("a"), _cell("b")], {}))
+    codes = _same_as_never_suggested(
+        extract_google_doc({"title": "Doc", "tabs": [_tab("root", [proposed_table, with_row])]}),
+        extract_google_doc({"title": "Doc", "tabs": [_tab("root", [current])]}),
+    )
+    assert ("suggested_insertion_omitted", False) in codes
+
+    # A proposed column: its cell is empty in the current table, and the others keep their columns.
+    with_column = _table(([_cell("h1"), _cell("PROPOSED-COL", **_PROPOSED), _cell("h2")], {}),
+                         ([_cell("a"), _cell("PROPOSED-COL", **_PROPOSED), _cell("b")], {}))
+    extraction = extract_google_doc({"title": "Doc", "tabs": [_tab("root", [with_column])]})
+    assert extraction.complete and "PROPOSED-COL" not in extraction.text
+    assert "| h1 |  | h2 |" in extraction.text and "| a |  | b |" in extraction.text
+
+
+def test_a_proposed_footnote_reference_proposes_its_footnote():
+    def doc(*inlines, footnotes):
+        tab = _tab("root", [{"paragraph": {"elements": [*inlines, {"textRun": {"content": "\n"}}]}}])
+        tab["documentTab"]["footnotes"] = footnotes
+        return {"title": "Doc", "tabs": [tab]}
+
+    kept = {"footnoteReference": {"footnoteId": "fn.kept"}}
+    proposed = {"footnoteReference": {"footnoteId": "fn.proposed", **_PROPOSED}}
+    footnotes = {"fn.kept": {"content": [_paragraph("KEPT-NOTE\n")]},
+                 "fn.proposed": {"content": [_paragraph("PROPOSED-NOTE\n")]}}
+    with_suggestion = extract_google_doc(doc({"textRun": {"content": "Text"}}, kept, proposed, footnotes=footnotes))
+    _same_as_never_suggested(
+        with_suggestion,
+        extract_google_doc(doc({"textRun": {"content": "Text"}}, kept, footnotes={"fn.kept": footnotes["fn.kept"]})),
+    )
+    assert "KEPT-NOTE" in with_suggestion.text and "PROPOSED-NOTE" not in with_suggestion.text
 
 
 @pytest.mark.asyncio

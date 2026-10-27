@@ -25,6 +25,24 @@ from urllib.parse import quote
 # non-blocking issue): the text itself is unaffected, and frontmatter stays bounded.
 MAX_BLOCK_ENTRIES = 5000
 
+# Every inline element kind the Docs API returns; each one's payload may carry suggestion ids.
+_INLINE_KINDS = (
+    "textRun", "footnoteReference", "richLink", "person", "dateElement", "inlineObjectElement",
+    "autoText", "pageBreak", "columnBreak", "horizontalRule", "equation",
+)
+
+
+def _inline_payload(inline: dict[str, Any]) -> Any:
+    """The payload of one inline element (the value under its kind key), or None if unknown."""
+    for kind in _INLINE_KINDS:
+        if kind in inline:
+            return inline[kind]
+    return None
+
+
+def _proposed_insertion(payload: Any) -> bool:
+    return isinstance(payload, dict) and bool(payload.get("suggestedInsertionIds"))
+
 
 def tab_anchor(tab_id: str) -> str:
     """The text marker for one tab boundary. The id is percent-encoded (``-`` included), so an
@@ -59,6 +77,21 @@ class _Renderer:
         self.truncated = False
         self.block_entries = 0
         self.block_map_truncated = False
+        # Footnotes referenced by current content, and those referenced only by a proposed insertion.
+        self.referenced_footnotes: set[str] = set()
+        self.proposed_footnotes: set[str] = set()
+
+    def suggested(self, payload: Any, location: str, what: str) -> bool:
+        """The canonical view is the document's CURRENT content, without proposed edits (AIO-1167
+        R44 S6a). The request asks for PREVIEW_WITHOUT_SUGGESTIONS; should a suggestion still arrive on
+        any element, a proposed insertion is not content yet (True: omit it, disclosed) while content
+        proposed for deletion is still current (False: keep it, disclosed)."""
+        if _proposed_insertion(payload):
+            self.issue("suggested_insertion_omitted", location, f"proposed (unaccepted) {what} omitted")
+            return True
+        if isinstance(payload, dict) and payload.get("suggestedDeletionIds"):
+            self.issue("suggested_deletion_retained", location, f"{what} proposed for deletion is still current content")
+        return False
 
     def record_span(self, sink: list[list[Any]] | None, entry: list[Any], location: str) -> None:
         """Append one bounded provenance span; past the bound, disclose once and stop."""
@@ -118,8 +151,9 @@ class _Renderer:
                 self.render_table(element["table"], location=loc, footnotes=footnotes or {})
             elif "tableOfContents" in element:
                 toc = element["tableOfContents"]
-                self.render_content(toc.get("content") if isinstance(toc, dict) else None,
-                                    location=f"{loc}/toc", footnotes=footnotes)
+                if not self.suggested(toc, f"{loc}/toc", "table of contents"):
+                    self.render_content(toc.get("content") if isinstance(toc, dict) else None,
+                                        location=f"{loc}/toc", footnotes=footnotes)
             elif "sectionBreak" in element:
                 continue
             else:
@@ -135,6 +169,20 @@ class _Renderer:
         if not isinstance(paragraph, dict):
             self.issue("malformed_paragraph", location, "paragraph is not an object", True)
             return
+        elements = paragraph.get("elements")
+        if not isinstance(elements, list):
+            self.issue("malformed_paragraph", location, "paragraph.elements is missing", True)
+            return
+        # A paragraph whose every element is a proposed insertion is a proposed paragraph: nothing of
+        # it — not even its heading or bullet marker — is current content (S6a).
+        if elements and all(isinstance(inline, dict) and _proposed_insertion(_inline_payload(inline))
+                            for inline in elements):
+            for i, inline in enumerate(elements):
+                payload = _inline_payload(inline)
+                if isinstance(inline.get("footnoteReference"), dict):
+                    self.note_proposed_footnote(payload)
+                self.suggested(payload, f"{location}/inline:{i}", "paragraph content")
+            return
         style = paragraph.get("paragraphStyle") or {}
         named = str(style.get("namedStyleType") or "")
         heading = {f"HEADING_{n}": "#" * n for n in range(1, 7)}.get(named)
@@ -145,10 +193,6 @@ class _Renderer:
             level = bullet.get("nestingLevel", 0)
             level = level if isinstance(level, int) and level >= 0 else 0
             self.add(f"{'  ' * level}- ", location)
-        elements = paragraph.get("elements")
-        if not isinstance(elements, list):
-            self.issue("malformed_paragraph", location, "paragraph.elements is missing", True)
-            return
         for i, inline in enumerate(elements):
             iloc = f"{location}/inline:{i}"
             if not isinstance(inline, dict):
@@ -169,15 +213,8 @@ class _Renderer:
                         "textRun.content is missing or not a string", True,
                     )
                     continue
-                # The canonical view is the document's CURRENT content, without proposed edits
-                # (AIO-1167 R44 S6a): the request asks for PREVIEW_WITHOUT_SUGGESTIONS, and should a
-                # suggestion still arrive, a proposed insertion is not content yet (omitted, and
-                # disclosed) while a proposed deletion is still content (kept, and disclosed).
-                if text_run.get("suggestedInsertionIds"):
-                    self.issue("suggested_insertion_omitted", iloc, "proposed (unaccepted) insertion omitted")
+                if self.suggested(text_run, iloc, "text"):
                     continue
-                if text_run.get("suggestedDeletionIds"):
-                    self.issue("suggested_deletion_retained", iloc, "text proposed for deletion is still current content")
                 link = (text_run.get("textStyle") or {}).get("link")
                 url = link.get("url") if isinstance(link, dict) else None
                 clean = text.rstrip("\n")
@@ -199,33 +236,48 @@ class _Renderer:
                         "footnoteReference.footnoteId is missing or not a non-empty string", True,
                     )
                     continue
+                if self.suggested(ref, iloc, "footnote reference"):
+                    self.note_proposed_footnote(ref)
+                    continue
+                self.referenced_footnotes.add(fid)
                 self.add(f"[^{fid}]", iloc)
                 footnote = footnotes.get(fid)
                 if not isinstance(footnote, dict):
                     self.issue("missing_footnote", iloc, f"footnote {fid!r} was referenced but not returned", True)
                 continue
             if "richLink" in inline:
-                self.render_rich_link(inline["richLink"], location=f"{iloc}/richLink")
+                if not self.suggested(inline["richLink"], iloc, "rich link"):
+                    self.render_rich_link(inline["richLink"], location=f"{iloc}/richLink")
                 continue
             if "person" in inline:
-                self.render_chip_text(
-                    inline["person"], "personProperties", ("name", "email"), location=f"{iloc}/person",
-                    kind="person",
-                )
+                if not self.suggested(inline["person"], iloc, "person chip"):
+                    self.render_chip_text(
+                        inline["person"], "personProperties", ("name", "email"), location=f"{iloc}/person",
+                        kind="person",
+                    )
                 continue
             if "dateElement" in inline:
-                self.render_chip_text(
-                    inline["dateElement"], "dateElementProperties", ("displayText",),
-                    location=f"{iloc}/dateElement", kind="date",
-                )
+                if not self.suggested(inline["dateElement"], iloc, "date chip"):
+                    self.render_chip_text(
+                        inline["dateElement"], "dateElementProperties", ("displayText",),
+                        location=f"{iloc}/dateElement", kind="date",
+                    )
                 continue
             if "inlineObjectElement" in inline:
+                if self.suggested(inline["inlineObjectElement"], iloc, "inline object"):
+                    continue
                 self.issue("unsupported_inline_object", iloc, "inline object omitted")
                 self.add("[unsupported inline object]", iloc)
             else:
                 self.issue("unsupported_inline", iloc, f"unsupported inline keys: {sorted(inline)}")
         if self.parts and not self.parts[-1].endswith("\n"):
             self.add("\n", location)
+
+    def note_proposed_footnote(self, ref: Any) -> None:
+        """A footnote reference that is itself a proposed insertion proposes its footnote too."""
+        fid = ref.get("footnoteId") if isinstance(ref, dict) else None
+        if isinstance(fid, str) and fid.strip():
+            self.proposed_footnotes.add(fid)
 
     def render_rich_link(self, chip: Any, *, location: str) -> None:
         """A rich-link chip IS a readable link (AIO-1167 R44 C9): render the title and URI Google
@@ -261,22 +313,35 @@ class _Renderer:
         self.add(readable[0] if len(readable) == 1 else f"{readable[0]} <{readable[1]}>", location)
 
     def render_table(self, table: Any, *, location: str, footnotes: dict[str, Any]) -> None:
+        if self.suggested(table, location, "table"):
+            return
         rows = table.get("tableRows") if isinstance(table, dict) else None
         if not isinstance(rows, list):
             self.issue("malformed_table", location, "tableRows is missing", True)
             return
         rendered_rows: list[list[str]] = []
         for r_index, row in enumerate(rows):
+            row_location = f"{location}/row:{r_index}"
+            if self.suggested(row, row_location, "table row"):
+                continue
             cells = row.get("tableCells") if isinstance(row, dict) else None
             if not isinstance(cells, list):
-                self.issue("malformed_table_row", f"{location}/row:{r_index}", "tableCells is missing", True)
+                self.issue("malformed_table_row", row_location, "tableCells is missing", True)
                 continue
             rendered: list[str] = []
             for c_index, cell in enumerate(cells):
+                cell_location = f"{row_location}/cell:{c_index}"
+                # A proposed cell (a proposed column) is empty in the current table: keep the column
+                # position so the remaining cells stay under their headers.
+                if self.suggested(cell, cell_location, "table cell"):
+                    rendered.append("")
+                    continue
                 nested = _Renderer(max_chars=max(0, self.max_chars - self.length))
                 cell_content = cell.get("content") if isinstance(cell, dict) else None
-                nested.render_content(cell_content, location=f"{location}/row:{r_index}/cell:{c_index}", footnotes=footnotes)
+                nested.render_content(cell_content, location=cell_location, footnotes=footnotes)
                 self.issues.extend(nested.issues)
+                self.referenced_footnotes |= nested.referenced_footnotes
+                self.proposed_footnotes |= nested.proposed_footnotes
                 rendered.append(" ".join("".join(nested.parts).strip().splitlines()).replace("|", "\\|"))
             rendered_rows.append(rendered)
         if not rendered_rows:
@@ -420,6 +485,9 @@ def extract_google_doc(document: dict[str, Any], *, max_chars: int = 2_000_000) 
         renderer.render_content(body.get("content") if isinstance(body, dict) else None,
                                 location=location, footnotes=footnotes, blocks=blocks)
         for fid, footnote in footnotes.items():
+            # A footnote only a proposed reference points to is itself proposed content (S6a).
+            if fid in renderer.proposed_footnotes and fid not in renderer.referenced_footnotes:
+                continue
             footnote_start = renderer.length
             renderer.add(f"\n[^{fid}]: ", f"{location}/footnote:{fid}")
             renderer.render_content(footnote.get("content") if isinstance(footnote, dict) else None,
