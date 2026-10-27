@@ -214,8 +214,11 @@ export async function runIdentityRepairObligation(
         );
         return { status: "obsolete" as const, scanned: 0, finished: false };
       }
+      // A healthy batch is not an attempt: `attempts` counts failures (`markRetry`), the same rule as
+      // the team-wide repair (`beginIdentityRepairBatch`), so a long obligation that converges batch
+      // by batch does not inflate the backoff a later real failure gets (AIO-1167 R44 C13).
       await runSql(
-        `update identity_repair_obligations set status='running',attempts=attempts+1,
+        `update identity_repair_obligations set status='running',
                 last_error=null,next_attempt_at=null,updated_at=now()
           where team_id=$1 and provider=$2 and external_id=$3 and mapping_revision=$4`,
         [current.team_id, current.provider, current.external_id, current.mapping_revision],
