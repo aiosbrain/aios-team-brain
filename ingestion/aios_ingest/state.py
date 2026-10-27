@@ -152,6 +152,7 @@ CREATE TABLE IF NOT EXISTS pending_work (
   last_error TEXT,
   acknowledged_at TEXT,
   superseded_at TEXT,
+  exhausted_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (namespace, generation, item_key, action)
@@ -380,6 +381,10 @@ class StateStore:
             )
         if "superseded_at" not in work_columns:
             self._db.execute("ALTER TABLE pending_work ADD COLUMN superseded_at TEXT")
+        if "exhausted_at" not in work_columns:
+            # AIO-1167 R44 C7: automatic retries ran out; the obligation stays owed (and keeps the
+            # run partial) until an explicit Admin run or a new observation re-arms it.
+            self._db.execute("ALTER TABLE pending_work ADD COLUMN exhausted_at TEXT")
         outcome_columns = {r[1] for r in self._db.execute("PRAGMA table_info(page_obligation_outcomes)")}
         if "superseded_by_snapshot" not in outcome_columns:
             self._db.execute(
@@ -1253,7 +1258,7 @@ class StateStore:
             "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(namespace,generation,item_key,action) DO UPDATE SET "
             "observation_revision=excluded.observation_revision,payload=excluded.payload,page_id=excluded.page_id,"
             "attempts=0,not_before=NULL,last_error=NULL,acknowledged_at=NULL,superseded_at=NULL,"
-            "updated_at=datetime('now')",
+            "exhausted_at=NULL,updated_at=datetime('now')",
             (namespace, generation, item_key, action, revision, serialized, page_id, now, now),
         )
         self._db.execute(
@@ -1298,7 +1303,7 @@ class StateStore:
         )
         rows = self._db.execute(
             "SELECT * FROM pending_work WHERE namespace=? AND generation=? "
-            "AND acknowledged_at IS NULL AND superseded_at IS NULL "
+            "AND acknowledged_at IS NULL AND superseded_at IS NULL AND exhausted_at IS NULL "
             "AND (not_before IS NULL OR not_before<=?) " + class_clause + " "
             "ORDER BY attempts ASC,created_at,item_key LIMIT ?",
             (namespace, generation, _now_iso(), max(1, limit)),
@@ -1433,15 +1438,40 @@ class StateStore:
         )
         self._db.commit()
 
-    def fail_work(self, work: PendingWork, error: str, *, not_before: str | None = None) -> None:
+    def fail_work(
+        self, work: PendingWork, error: str, *, not_before: str | None = None, exhaust: bool = False,
+    ) -> None:
+        """Record one failed attempt. The obligation stays owed either way; with ``exhaust`` it is no
+        longer picked automatically (``list_pending``) but still counts as pending work."""
         self._db.execute(
-            "UPDATE pending_work SET attempts=attempts+1,last_error=?,not_before=?,updated_at=datetime('now') "
+            "UPDATE pending_work SET attempts=attempts+1,last_error=?,not_before=?,"
+            "exhausted_at=CASE WHEN ? THEN datetime('now') ELSE exhausted_at END,updated_at=datetime('now') "
             "WHERE namespace=? AND generation=? AND item_key=? AND action=? AND observation_revision=? "
             "AND superseded_at IS NULL",
-            (error[:1000], not_before, work.namespace, work.generation, work.item_key, work.action,
-             work.observation_revision),
+            (error[:1000], not_before, 1 if exhaust else 0, work.namespace, work.generation, work.item_key,
+             work.action, work.observation_revision),
         )
         self._db.commit()
+
+    def exhausted_count(self, namespace: str, generation: int) -> int:
+        """Owed obligations whose automatic retries ran out (AIO-1167 R44 C7)."""
+        return int(self._db.execute(
+            "SELECT count(*) FROM pending_work WHERE namespace=? AND generation=? "
+            "AND acknowledged_at IS NULL AND superseded_at IS NULL AND exhausted_at IS NOT NULL",
+            (namespace, generation),
+        ).fetchone()[0])
+
+    def rearm_exhausted(self, namespace: str, generation: int) -> int:
+        """An explicit Admin run: exhausted obligations become retryable again, from attempt zero.
+        Their evidence (last error) is kept until the next attempt replaces it."""
+        cur = self._db.execute(
+            "UPDATE pending_work SET exhausted_at=NULL,attempts=0,not_before=NULL,updated_at=datetime('now') "
+            "WHERE namespace=? AND generation=? AND acknowledged_at IS NULL AND superseded_at IS NULL "
+            "AND exhausted_at IS NOT NULL",
+            (namespace, generation),
+        )
+        self._db.commit()
+        return int(cur.rowcount or 0)
 
     def pending_count(self, namespace: str, generation: int) -> int:
         return int(self._db.execute(

@@ -338,12 +338,81 @@ async def test_gdrive_checkpoint_retry_is_bounded_by_deadline():
         "22222222-2222-2222-2222-222222222222", "later", "scope", {},
     )
     async with client:
-        with pytest.raises(BrainError) as exc:
+        with pytest.raises(BrainDeferred) as exc:
             await client.checkpoint_gdrive_execution(execution, {"page_token": "next"})
 
+    # AIO-1167 R44 U3: a wait that does not fit is neither truncated nor slept — the checkpoint is
+    # deferred with the time it may be retried, and its acknowledgment stays pending.
     assert exc.value.code == "unavailable"
     assert calls == 1
-    assert sleeps == [45.0]
+    assert sleeps == []
+    assert exc.value.not_before is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_after, run_left, expect_sleep", [("3", 10.0, True), ("8", 5.0, False)])
+async def test_gdrive_checkpoint_is_bounded_by_the_runs_remaining_budget(retry_after, run_left, expect_sleep):
+    calls = 0
+    sleeps = []
+    clock = [100.0]
+
+    async def sleep(delay):
+        sleeps.append(delay)
+        clock[0] += delay
+
+    def handler(request: httpx.Request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(429, headers={"retry-after": retry_after}, json={
+                "error": {"code": "rate_limited", "message": "wait"},
+            })
+        payload = json.loads(request.content)
+        return httpx.Response(200, json={"progress_revision": payload["progress_revision"] + 1, "progress": {}})
+
+    client = BrainClient(
+        "http://brain", "aios_abc_def", "demo", sleep=sleep,
+        random_fn=lambda: 0, monotonic_fn=lambda: clock[0],
+    )
+    await client._client.aclose()
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    execution = GdriveExecution(
+        "11111111-1111-1111-1111-111111111111", 2, 4,
+        "22222222-2222-2222-2222-222222222222", "later", "scope", {},
+        run_deadline=clock[0] + run_left,
+    )
+    async with client:
+        if expect_sleep:
+            await client.checkpoint_gdrive_execution(execution, {"page_token": "next"})
+            assert sleeps == [float(retry_after)] and calls == 2
+        else:
+            with pytest.raises(BrainDeferred) as deferred:
+                await client.checkpoint_gdrive_execution(execution, {"page_token": "next"})
+            assert deferred.value.not_before is not None
+            assert sleeps == [] and calls == 1
+
+
+@pytest.mark.asyncio
+async def test_gdrive_checkpoint_past_the_run_deadline_is_deferred_unsent():
+    calls = 0
+
+    def handler(_request: httpx.Request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"progress_revision": 1, "progress": {}})
+
+    clock = [100.0]
+    client = BrainClient("http://brain", "aios_abc_def", "demo", monotonic_fn=lambda: clock[0])
+    await client._client.aclose()
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    execution = GdriveExecution(
+        "11111111-1111-1111-1111-111111111111", 2, 4,
+        "22222222-2222-2222-2222-222222222222", "later", "scope", {}, run_deadline=99.0,
+    )
+    async with client:
+        with pytest.raises(BrainDeferred) as deferred:
+            await client.checkpoint_gdrive_execution(execution, {"page_token": "next"})
+    assert deferred.value.not_before is None and calls == 0
 
 
 def _scan_client(

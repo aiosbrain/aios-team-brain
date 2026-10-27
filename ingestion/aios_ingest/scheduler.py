@@ -9,6 +9,7 @@ unit-tested; the actual Drive API call lives behind a pluggable WatchManager.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -134,7 +135,7 @@ def build_scheduler(
             "interval",
             seconds=renewal_interval,
             id="renewal-sweep",
-            args=[state, watch_manager, connections, settings],
+            args=[state, watch_manager, connections, settings, renewal_interval, sched],
             max_instances=1,
             coalesce=True,
         )
@@ -305,6 +306,8 @@ async def _manual_gdrive_job(
     connection = configured or Connection(
         request.name, "gdrive", options={"integration_id": request.integration_id, "auth_mode": "oauth"},
     )
+    # An explicit Admin run re-arms work whose automatic retries ran out (AIO-1167 R44 C7).
+    connection = dataclasses.replace(connection, options={**connection.options, "rearm_exhausted": True})
     try:
         summary = await run_gdrive_stream(settings, connection, state)
         status = _gdrive_outcome_status(summary)
@@ -405,7 +408,7 @@ def _gdrive_outcome_status(summary) -> str:
 
 async def _renewal_job(
     state: StateStore, manager: WatchManager, connections: list[Connection],
-    settings: BrainSettings,
+    settings: BrainSettings, sweep_seconds: float | None = None, scheduler: Any = None,
 ) -> None:
     # Re-read authoritative Admin state on every sweep. A scheduler that started while enabled must
     # not renew a watch after pause/disconnect, and a selection read failure fails closed. There is
@@ -416,11 +419,43 @@ async def _renewal_job(
     # The fenced lifecycle (AIO-1167 R41): durable intent before dispatch, bounded offloaded
     # provider work, uncertain-outcome recovery and cleanup, renewal-owned state that never touches
     # a cursor. Admin state is re-read there on every sweep; pause/disconnect renews nothing.
-    from .watch_renewal import renew_watches
-    await renew_watches(state, manager, connections, settings)
+    from .watch_renewal import DEFAULT_SWEEP_SECONDS, WATCH_RUN_SECONDS, RENEWAL_SKEW_SECONDS, renew_watches
+    interval = float(sweep_seconds or DEFAULT_SWEEP_SECONDS)
+    await renew_watches(state, manager, connections, settings, sweep_seconds=interval)
     for ch in channels:
         if ch.expires_at and _parse(ch.expires_at) <= _parse(now):
             state.retire_channel(ch.connection, ch.channel_id, at=now)
+    _schedule_catch_up_renewal(state, manager, connections, settings, interval, scheduler,
+                               lead_seconds=WATCH_RUN_SECONDS + RENEWAL_SKEW_SECONDS)
+
+
+def _schedule_catch_up_renewal(
+    state: StateStore, manager: WatchManager, connections: list[Connection], settings: BrainSettings,
+    interval: float, scheduler: Any, *, lead_seconds: float,
+) -> None:
+    """A channel Google gave a lifetime SHORTER than the sweep interval would expire between two
+    regular sweeps (AIO-1167 R44 C8). Schedule one extra sweep early enough to publish its successor
+    before it expires — never more than one pending catch-up, which a later sweep replaces."""
+    if scheduler is None:
+        return
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    next_regular = now + timedelta(seconds=interval)
+    soonest = min(
+        (_parse(ch.expires_at) for ch in state.list_channels(active_only=True) if ch.expires_at),
+        default=None,
+    )
+    if soonest is None:
+        return
+    run_at = soonest - timedelta(seconds=lead_seconds)
+    if run_at >= next_regular - timedelta(seconds=lead_seconds):
+        return  # the regular sweep is early enough
+    scheduler.add_job(
+        _renewal_job, "date", run_date=max(run_at, now + timedelta(seconds=1)),
+        id="renewal-catch-up", replace_existing=True,
+        args=[state, manager, connections, settings, interval, scheduler],
+    )
 
 
 def run(

@@ -3158,16 +3158,35 @@ def test_retry_after_supports_header_container_http_date_and_rejects_invalid():
 
 
 def test_stalled_provider_call_is_rejected_after_explicit_deadline(monkeypatch):
+    # deadline (10.0+1) · before validation · before dispatch · AFTER the call returns, late.
+    ticks = iter([10.0, 10.1, 10.2, 11.2])
+    monkeypatch.setattr("aios_ingest.sources.gdrive.time.monotonic", lambda: next(ticks))
+    source = GoogleDriveSource(
+        file_ids=["doc"], api_mode="docs", drive_service=object(), docs_service=object(),
+        request_deadline_seconds=1, provider_retry_attempts=2,
+    )
+    called = []
+    with pytest.raises(Exception) as raised:
+        source._provider_call(lambda: called.append(1) or {"late": True})
+    assert type(raised.value).__name__ == "ProviderDeferred"
+    assert raised.value.category == "provider_timeout"
+    assert called == [1]
+
+
+def test_a_budget_exhausted_before_dispatch_is_a_local_deferral_not_a_provider_timeout(monkeypatch):
+    """AIO-1167 R44 U5: nothing reached Google, so it is not a provider failure."""
     ticks = iter([10.0, 10.1, 11.2])
     monkeypatch.setattr("aios_ingest.sources.gdrive.time.monotonic", lambda: next(ticks))
     source = GoogleDriveSource(
         file_ids=["doc"], api_mode="docs", drive_service=object(), docs_service=object(),
         request_deadline_seconds=1, provider_retry_attempts=2,
     )
+    called = []
     with pytest.raises(Exception) as raised:
-        source._provider_call(lambda: {"late": True})
+        source._provider_call(lambda: called.append(1))
     assert type(raised.value).__name__ == "ProviderDeferred"
-    assert raised.value.category == "provider_timeout"
+    assert raised.value.category == "dispatch_deadline"
+    assert called == []
 
 
 def test_provider_call_tightens_real_transport_timeout_to_remaining_deadline(monkeypatch):

@@ -12,6 +12,7 @@ import dataclasses
 import hashlib
 import json
 import math
+import random
 import time
 import uuid
 from dataclasses import dataclass
@@ -80,8 +81,57 @@ def credential_identity(options: dict[str, Any]) -> str:
 
 _CONTROL_OPTIONS = frozenset({
     "credential_identity", "integration_id", "auth_mode", "service_account_status", "webhook_url",
-    "watch_ttl_seconds",
+    "watch_ttl_seconds", "rearm_exhausted",
 })
+
+# Durable document retries (AIO-1167 R44 C7): capped exponential backoff with jitter, from the
+# PERSISTED attempt count, and a bounded number of automatic attempts. An exhausted obligation stays
+# owed — the run stays partial and absence stays withheld — until an explicit Admin run (Run now /
+# Retry) or a new observation of the document re-arms it.
+_RETRY_BASE_SECONDS = 60
+_RETRY_CAP_SECONDS = 6 * 3600
+_MAX_AUTOMATIC_ATTEMPTS = 8
+
+
+def _backoff_seconds(attempts_so_far: int, rng: Any = None) -> float:
+    """Delay before the next attempt after ``attempts_so_far + 1`` failures: base·2^n, capped, with
+    jitter in [50%, 100%] so a burst of failures does not retry in lockstep."""
+    delay = min(_RETRY_CAP_SECONDS, _RETRY_BASE_SECONDS * (2 ** min(max(0, attempts_so_far), 20)))
+    return delay * (0.5 + 0.5 * float((rng or random.random)()))
+
+
+def _fail_work(
+    state: StateStore, work: PendingWork, detail: str, *, retry_after: str | None = None,
+) -> bool:
+    """Record one failed attempt of ``work``; returns whether its automatic retries are exhausted.
+
+    The next attempt is no earlier than the attempt-aware backoff and no earlier than a wait the
+    provider or brain named (``retry_after``) — the later of the two, so Retry-After is always
+    honoured."""
+    from datetime import timedelta
+
+    not_before = datetime.now(timezone.utc) + timedelta(seconds=_backoff_seconds(work.attempts))
+    if retry_after:
+        try:
+            named = datetime.fromisoformat(retry_after.replace("Z", "+00:00"))
+            if named.tzinfo is None:
+                named = named.replace(tzinfo=timezone.utc)
+            not_before = max(not_before, named)
+        except ValueError:
+            pass
+    exhausted = work.attempts + 1 >= _MAX_AUTOMATIC_ATTEMPTS
+    state.fail_work(work, detail, not_before=not_before.isoformat(), exhaust=exhausted)
+    return exhausted
+
+
+class _ProviderAdmissionClosed(Exception):
+    """Google refused this account's calls until ``not_before`` (AIO-1167 R44 C6). The whole drain
+    for the account stops; no further provider call is made for it before that instant."""
+
+    def __init__(self, not_before: str, category: str):
+        super().__init__(category)
+        self.not_before = not_before
+        self.category = category
 
 
 def provider_source_options(options: dict[str, Any]) -> dict[str, Any]:
@@ -676,6 +726,8 @@ async def run_gdrive_stream(
     *,
     max_work: int = 500,
 ) -> IngestSummary:
+    # Set only by the scheduler for an explicit Admin run (Run now / Retry) — R44 C7.
+    rearm_exhausted = bool(conn.options.get("rearm_exhausted"))
     options = dict(conn.options)
     async with BrainClient(settings.base_url, settings.api_key, settings.team) as client:
         integration_id = str(options.get("integration_id") or "")
@@ -968,6 +1020,9 @@ async def run_gdrive_stream(
                 root_bindings = state.root_bindings(integration_id, generation)
 
             remaining = max(0, max_work)
+            # A stream whose provider read was refused this run (R44 C5): the others still run, but
+            # no complete snapshot is submitted — its membership is not known now.
+            stream_access_failed = False
             scheduled_streams = state.rotate_streams(
                 integration_id, generation, [value for value in streams if value not in blocked],
             )
@@ -979,16 +1034,67 @@ async def run_gdrive_stream(
                 stream_work_budget = (
                     0 if remaining <= 0 else max(1, math.ceil(remaining / streams_left))
                 )
-                part = await _run_gdrive_stream_unlocked(
-                    settings, conn, state, client=client, execution=execution, options=options,
-                    source=source, drive=drive, generation=generation, drive_id=str(drive_id),
-                    namespace=key.namespace(generation), max_work=stream_work_budget,
-                    discovery_budget=_MAX_DISCOVERY_PAGES_PER_STREAM,
-                    retry_budget=_MAX_RETRY_WORK_PER_STREAM,
-                    run_deadline=run_deadline,
-                    provider_gate=provider_gate,
-                    root_bindings=root_bindings,
-                )
+                if rearm_exhausted:
+                    # An explicit Admin run (Run now / Retry): exhausted obligations retry again.
+                    state.rearm_exhausted(key.namespace(generation), generation)
+                try:
+                    part = await _run_gdrive_stream_unlocked(
+                        settings, conn, state, client=client, execution=execution, options=options,
+                        source=source, drive=drive, generation=generation, drive_id=str(drive_id),
+                        namespace=key.namespace(generation), max_work=stream_work_budget,
+                        discovery_budget=_MAX_DISCOVERY_PAGES_PER_STREAM,
+                        retry_budget=_MAX_RETRY_WORK_PER_STREAM,
+                        run_deadline=run_deadline,
+                        provider_gate=provider_gate,
+                        root_bindings=root_bindings,
+                    )
+                except _ProviderAdmissionClosed as closed:
+                    # The provider's wait governs the ACCOUNT (AIO-1167 R44 C6): every stream of it
+                    # is held until then — persisted, so a restart makes no early call — and no
+                    # further provider call is made this run. Remaining work is untouched.
+                    for held in scheduled_streams:
+                        held_ns = StreamKey(
+                            settings.team, integration_id, credential_identity(options), str(held),
+                        ).namespace(generation)
+                        if state.get_progress(held_ns) is not None:
+                            state.update_progress(
+                                held_ns, retry_not_before=closed.not_before, last_error=closed.category,
+                            )
+                    # The hold is also published, so a restart that restores from the brain's
+                    # checkpoint cannot drop it. A failed publication keeps the local hold.
+                    held_progress = state.get_progress(key.namespace(generation))
+                    if held_progress is not None:
+                        try:
+                            await _checkpoint_progress(client, execution, state, key.namespace(generation))
+                        except BrainError as exc:
+                            if _is_terminal_authority(exc):
+                                raise
+                    total.failure_categories[closed.category] = total.failure_categories.get(closed.category, 0) + 1
+                    break
+                except Exception as exc:
+                    if not _stream_access_refusal(exc):
+                        raise
+                    # A started stream the provider refuses (a non-quota 403/404 on its drive) is
+                    # THIS stream's failure, not the connection's (AIO-1167 R44 C5): its cursor,
+                    # membership and owed work are kept, the refusal is recorded durably, and the
+                    # independent streams still run. A 403/404 proves nothing deleted.
+                    stream_access_failed = True
+                    namespace_now = key.namespace(generation)
+                    if state.get_progress(namespace_now) is not None:
+                        state.update_progress(
+                            namespace_now, last_error="stream_access_denied", last_attempt_at=_now(),
+                        )
+                    part = IngestSummary(
+                        conn.name, failed=1, failure_categories={"stream_access_denied": 1},
+                        integration_id=integration_id,
+                    )
+                exhausted = state.exhausted_count(key.namespace(generation), generation)
+                if exhausted:
+                    # Owed work whose automatic retries ran out: actionable, and still owed.
+                    part.failed += exhausted
+                    part.failure_categories["retry_exhausted"] = (
+                        part.failure_categories.get("retry_exhausted", 0) + exhausted
+                    )
                 _merge_summary(total, part)
                 # Fresh capacity is reserved independently of retries/failures. Debiting the
                 # allocation (rather than summary counts) prevents malformed retry work in one
@@ -1005,7 +1111,7 @@ async def run_gdrive_stream(
             # no obligation recorded at all — and a stream whose published snapshot is not of the
             # roots it enumerates now, are an incomplete connection: reconciling would turn what
             # has not been verified into absence.
-            verified = _root_coverage_complete(
+            verified = not stream_access_failed and _root_coverage_complete(
                 state, integration_id, generation, options,
             ) and not any(
                 any(_bound_root_drift(
@@ -2157,7 +2263,7 @@ async def _push_doc(
         summary.failed += 1
         summary.failure_categories["incomplete_extraction"] = summary.failure_categories.get("incomplete_extraction", 0) + 1
         if work:
-            state.fail_work(work, detail, not_before=_defer_until())
+            _fail_work(state, work, detail)
         return True
     if work and not state.work_membership_current(work):
         # A newer remove/move observation won while extraction was in flight, or the snapshot
@@ -2175,7 +2281,7 @@ async def _push_doc(
         summary.failed += 1
         summary.failure_categories["invalid_payload"] = summary.failure_categories.get("invalid_payload", 0) + 1
         if work:
-            state.fail_work(work, _validation_detail(exc), not_before=_defer_until())
+            _fail_work(state, work, _validation_detail(exc))
         return True
     text_map = item.frontmatter.get("gdrive_text_map")
     if isinstance(text_map, dict):
@@ -2267,10 +2373,7 @@ async def _drain_pending(
             # all current before content extraction.
             meta = source._metadata(work.item_key)
             if not _metadata_in_current_selection(state, work, meta):
-                state.fail_work(
-                    work, "provider item is no longer in the current selected membership",
-                    not_before=_defer_until(),
-                )
+                _fail_work(state, work, "provider item is no longer in the current selected membership")
                 summary.failed += 1
                 summary.failure_categories["membership_changed"] = (
                     summary.failure_categories.get("membership_changed", 0) + 1
@@ -2282,28 +2385,32 @@ async def _drain_pending(
         except BrainError:
             raise
         except ProviderDeferred as exc:
-            state.fail_work(work, str(exc), not_before=exc.not_before)
+            if exc.category == "dispatch_deadline":
+                # Nothing was sent: the run's budget ran out before this read (AIO-1167 R44 U5). Not
+                # an attempt and not a provider failure — the work is left exactly as it was.
+                summary.failure_categories.setdefault("run_deadline", 1)
+                break
+            if exc.category == "rate_limited":
+                # The provider's wait governs this account, not this one document (R44 C6): stop
+                # every further call for it, and leave this obligation untouched.
+                raise _ProviderAdmissionClosed(exc.not_before or _defer_until(), exc.category) from exc
+            _fail_work(state, work, str(exc))
             summary.failed += 1
             summary.failure_categories[exc.category] = summary.failure_categories.get(exc.category, 0) + 1
             continue
         except ProviderCursorInvalid:
             # Cursor validity is only meaningful for change enumeration, never an item fetch.
-            state.fail_work(
-                work, "unexpected invalid cursor while reading document",
-                not_before=_defer_until(),
-            )
+            _fail_work(state, work, "unexpected invalid cursor while reading document")
             summary.failed += 1
             summary.failure_categories["provider_read"] = summary.failure_categories.get("provider_read", 0) + 1
             continue
         except IncompleteExtractionError as exc:
-            state.fail_work(work, str(exc), not_before=_defer_until())
+            _fail_work(state, work, str(exc))
             summary.failed += 1
             summary.failure_categories["incomplete_extraction"] = summary.failure_categories.get("incomplete_extraction", 0) + 1
             continue
         except Exception as exc:
-            state.fail_work(
-                work, f"{type(exc).__name__}: {exc}", not_before=_defer_until(),
-            )
+            _fail_work(state, work, f"{type(exc).__name__}: {exc}")
             summary.failed += 1
             summary.failure_categories["provider_read"] = summary.failure_categories.get("provider_read", 0) + 1
             continue
@@ -2437,6 +2544,22 @@ def _cross_stream_removal(
     return "withheld"
 
 
+def _stream_access_refusal(exc: BaseException) -> bool:
+    """A provider refusal of ONE stream's reads: a non-retryable HTTP 403/404 from Google. Brain
+    authority errors (including the connection-wide provider-unauthorized), deferrals, cancellation
+    and every other exception are not this, and keep their existing run-terminal handling."""
+    if isinstance(exc, (BrainError, ProviderDeferred, ProviderCursorInvalid)) or not isinstance(exc, Exception):
+        return False
+    # The HTTP status as the source reads it (`GoogleDriveSource._status`), read here directly so a
+    # substituted source class can never turn this check into a different error.
+    response = getattr(exc, "resp", None)
+    value = getattr(response, "status", None) or getattr(exc, "status_code", None)
+    try:
+        return int(value) in (403, 404) if value is not None else False
+    except (TypeError, ValueError):
+        return False
+
+
 def _cannot_read(progress: Any) -> bool:
     """A peer stream with no local state, no token, or a recovery waiting on its start token."""
     return progress is None or _unstarted(progress) or _start_recovery_blocked(progress)
@@ -2463,7 +2586,7 @@ def _record_sink_failure(
         return False
     summary.failed += 1
     if work:
-        state.fail_work(work, str(exc), not_before=not_before or _defer_until())
+        _fail_work(state, work, str(exc), retry_after=not_before)
     return not deferred
 
 
@@ -2554,7 +2677,20 @@ async def _checkpoint_progress(
         legacy_drive = str(execution.progress.get("drive_id") or "")
         if legacy_drive:
             streams[legacy_drive] = dict(execution.progress)
+    # A sibling's LOCAL copy replaces the acknowledged remote one only when it is at least as new
+    # as what this execution acquired (AIO-1167 R44 S1). A sibling whose local copy has not yet been
+    # restored from that remote (`server_revision` behind) is stale: the newer remote stream is kept
+    # as acknowledged, and the sibling is restored from it at its own turn. Only streams of THIS
+    # account are this coordinator's.
+    acquired_revision = int(execution.progress_revision or 0)
+    published: set[str] = set()
     for local in state.list_progress(execution.integration_id, execution.generation):
+        if local.namespace != namespace and local.key.credential_id != progress.key.credential_id:
+            continue
+        if (local.namespace != namespace and local.key.drive_id in streams
+                and local.server_revision < acquired_revision):
+            continue
+        published.add(local.namespace)
         streams[local.key.drive_id] = {
             "phase": local.phase, "drive_id": local.key.drive_id,
             "page_token": local.page_token,
@@ -2600,8 +2736,10 @@ async def _checkpoint_progress(
     )
     if publish_snapshot is not None:
         state.publish_selection_snapshot(namespace, execution.generation, publish_snapshot)
+    # Only a sibling whose local copy this checkpoint actually published is now current; a stale
+    # one keeps its older revision, so it is still restored from the brain before it is used.
     for local in state.list_progress(execution.integration_id, execution.generation):
-        if local.namespace != namespace and local.server_revision < revision:
+        if local.namespace != namespace and local.namespace in published and local.server_revision < revision:
             state.update_progress(local.namespace, server_revision=revision)
 
 

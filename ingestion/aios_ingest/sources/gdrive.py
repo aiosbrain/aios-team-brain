@@ -130,6 +130,9 @@ class _AbsoluteDeadlineHttp:
             raise ProviderDeferred(
                 "Google service-account transport deadline expired before HTTP dispatch",
                 not_before=datetime.now(timezone.utc).isoformat(),
+                # The transport cannot tell whether an earlier request of this call was sent (a
+                # retry, a redirect, a token refresh): it stays a provider timeout. The pre-send
+                # case is classified by `_provider_call`, which does know (AIO-1167 R44 U5).
                 category="provider_timeout",
             )
         return remaining
@@ -580,14 +583,17 @@ class GoogleDriveSource(PullOnlySource, Source):
         if self._run_deadline_monotonic is not None:
             deadline = min(deadline, self._run_deadline_monotonic)
         replaced_token = False
+        sent = False
 
         def remaining_or_defer(stage: str) -> float:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                # Before ANY request of this call was sent, an exhausted budget is a local deferral,
+                # not a provider failure (AIO-1167 R44 U5): nothing reached Google.
                 raise ProviderDeferred(
                     f"Google provider request deadline expired {stage}",
                     not_before=datetime.now(timezone.utc).isoformat(),
-                    category="provider_timeout",
+                    category="provider_timeout" if sent else "dispatch_deadline",
                 )
             return remaining
 
@@ -618,6 +624,7 @@ class GoogleDriveSource(PullOnlySource, Source):
             self._bind_transport_deadline(attempt_transport, deadline)
             self._bound_transport_timeout(attempt_transport, remaining)
             try:
+                sent = True
                 result = attempt_call()
                 if time.monotonic() > deadline:
                     raise ProviderDeferred(

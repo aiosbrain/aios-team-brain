@@ -543,11 +543,18 @@ class BrainClient:
     ) -> dict[str, Any]:
         key = (execution.integration_id, execution.generation, execution.fence, execution.owner)
         revision = self._gdrive_progress_revisions.setdefault(key, execution.progress_revision)
+        # Bounded by the RUN's remaining budget as well as the checkpoint's own (AIO-1167 R44 U3):
+        # a checkpoint near the end of a run defers instead of extending it.
         deadline = self._monotonic() + _GDRIVE_CHECKPOINT_DEADLINE_SECONDS
+        if execution.run_deadline is not None:
+            deadline = min(deadline, execution.run_deadline)
         last_response: httpx.Response | None = None
         for attempt in range(_GDRIVE_CHECKPOINT_MAX_ATTEMPTS):
             remaining_before_call = deadline - self._monotonic()
             if remaining_before_call <= 0:
+                if last_response is None:
+                    # Nothing was sent: the caller's acknowledgment stays pending, retryable at once.
+                    raise BrainDeferred(503, "checkpoint_deadline", "Google Drive checkpoint deadline expired before it was sent")
                 break
             resp = await self._client.post(
                 f"{self._base}/api/v1/integrations/gdrive/execution",
@@ -567,14 +574,16 @@ class BrainClient:
             last_response = resp
             if resp.status_code != 429 and resp.status_code < 500:
                 raise BrainError(resp.status_code, *_error_fields(resp))
-            remaining = deadline - self._monotonic()
-            if attempt + 1 >= _GDRIVE_CHECKPOINT_MAX_ATTEMPTS or remaining <= 0:
-                break
+            if attempt + 1 >= _GDRIVE_CHECKPOINT_MAX_ATTEMPTS:
+                break  # no further attempt will be sent: never sleep for one (R44 U4)
             server_delay = _retry_after(resp)
-            delay = server_delay if server_delay is not None else min(2**attempt, 8)
-            delay = min(delay + _bounded_jitter(self._random()), remaining)
-            if delay <= 0:
-                break
+            delay = (server_delay if server_delay is not None else min(2**attempt, 8)) + _bounded_jitter(self._random())
+            if self._monotonic() + delay >= deadline:
+                # A wait that does not fit is not slept or truncated: the checkpoint is deferred,
+                # with the time it may be retried (R44 U3).
+                raise BrainDeferred(
+                    resp.status_code, *_error_fields(resp), not_before=_iso_after(delay),
+                )
             await self._sleep(delay)
         if last_response is None:
             raise BrainError(503, "checkpoint_deadline", "Google Drive checkpoint deadline expired")

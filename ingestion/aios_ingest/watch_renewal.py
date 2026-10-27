@@ -71,6 +71,20 @@ MAX_UNRESOLVED_PER_STREAM = 2
 # Stop attempts per channel; afterwards it is left to expire at the bound of its life.
 MAX_STOP_ATTEMPTS = 5
 RENEWAL_SKEW_SECONDS = 600
+# The scheduler's default sweep interval (`schedule --renewal-interval`).
+DEFAULT_SWEEP_SECONDS = 1800
+
+
+def renewal_window_seconds(sweep_seconds: float) -> float:
+    """How long before expiry a channel must be renewed (AIO-1167 R44 C8).
+
+    The NEXT sweep may start up to one interval later and needs one run budget to publish a
+    successor, so the window is interval + run budget + the safety skew. With the default 1800 s
+    sweep a channel is renewed with ~41 minutes left, and the following sweep still lands at least
+    the skew before expiry. A skew-only window let a sweep 11 minutes out skip it and the next one
+    arrive after the channel had already expired.
+    """
+    return max(0.0, float(sweep_seconds)) + WATCH_RUN_SECONDS + RENEWAL_SKEW_SECONDS
 
 _POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="gdrive-watch")
 
@@ -96,6 +110,8 @@ class WatchStepTimeout(Exception):
 class _Budget:
     creates: int = MAX_CREATES_PER_SWEEP
     stops: int = MAX_STOPS_PER_SWEEP
+    # The configured sweep interval: decides how early a channel is due (R44 C8).
+    sweep_seconds: float = DEFAULT_SWEEP_SECONDS
 
 
 @dataclass
@@ -280,9 +296,9 @@ def _publish_reserve() -> float:
     return min(5.0, WATCH_RUN_SECONDS * 0.25)
 
 
-def _due(expires_at: str | None, now: datetime) -> bool:
+def _due(expires_at: str | None, now: datetime, sweep_seconds: float = DEFAULT_SWEEP_SECONDS) -> bool:
     parsed = parse_instant(expires_at)
-    return parsed is None or (parsed - now).total_seconds() <= RENEWAL_SKEW_SECONDS
+    return parsed is None or (parsed - now).total_seconds() <= renewal_window_seconds(sweep_seconds)
 
 
 async def _create(
@@ -487,7 +503,7 @@ async def _create_where_due(
             default=None,
         )
         if active or legacy:
-            if not _due(newest_expiry, now):
+            if not _due(newest_expiry, now, budget.sweep_seconds):
                 continue
         predecessor = (active[-1].attempt_id if active else (legacy[-1].channel_id if legacy else None))
         budget.creates -= 1
@@ -500,6 +516,7 @@ async def _create_where_due(
 
 async def renew_watches(
     state: StateStore, manager: Any, connections: list[Connection], settings: BrainSettings,
+    *, sweep_seconds: float = DEFAULT_SWEEP_SECONDS,
 ) -> None:
     """One renewal sweep over every enabled Drive connection. Admin state is re-read first."""
     try:
@@ -515,7 +532,7 @@ async def renew_watches(
         row for row in remote
         if row.get("type") == "gdrive" and row.get("status") == "enabled" and row.get("id")
     ]
-    budget = _Budget()
+    budget = _Budget(sweep_seconds=sweep_seconds)
     now = datetime.now(timezone.utc)
     # Each enabled row renews under the local entry BOUND to its immutable id (AIO-1167 R44 C11):
     # an entry with the row's name but another explicit id renews nothing, never the other id.
