@@ -8,3 +8,11 @@ const PORT = /^\d+$/.test(process.env.HTTP_TEST_PORT ?? "") ? process.env.HTTP_T
 
 export const HTTP_TEST_PORT = PORT;
 export const BASE_URL = `http://127.0.0.1:${PORT}`;
+
+/** The OAuth client the TEST server is configured with (AIO-1167 R44 T2), shared by the harness's
+ *  loopback Google fixture (global-setup) and the test that drives the real start → callback flow. */
+export const FAKE_GOOGLE_CLIENT = {
+  id: "http-test-oauth-client",
+  secret: "http-test-oauth-client-secret",
+  redirect: `${BASE_URL}/api/auth/gdrive/callback`,
+} as const;

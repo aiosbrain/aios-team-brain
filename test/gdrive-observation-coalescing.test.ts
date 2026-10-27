@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { googleDriveContributionEvidence } from "@/lib/dashboard/gdrive-contributions";
 import type { IdentityMap } from "@/lib/identity/resolve";
 import { normalizeGdriveContributions, supersededEvidenceKeys } from "@/lib/ingest/gdrive-contribution-store";
-import { coalesceGdriveObservations, mergeGdriveContributions } from "@/lib/ingest/gdrive-ledger";
+import { coalesceGdriveObservations, coalesceStoredGdriveEvidence, mergeGdriveContributions } from "@/lib/ingest/gdrive-ledger";
 
 /**
  * AIO-1167 R44 S4 — one observation, reported first by email and later by permission id, is ONE
@@ -79,5 +79,28 @@ describe("the ledger, the evidence store and the Timeline read agree", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ memberId: "member-a", role: "editor" });
     expect(rows[0].id).toContain("permission:P");
+  });
+});
+
+describe("the Timeline's stored-evidence read (coalesceStoredGdriveEvidence)", () => {
+  const row = (item: string, key: string, fields: { external_id?: string | null; email: string | null; role?: string; source_at?: string }) => ({
+    item_id: item, evidence_key: key, external_id: fields.external_id ?? null, email: fields.email,
+    role: fields.role ?? "editor", source_at: fields.source_at ?? "2026-10-20 10:00:00+00",
+  });
+  const emailOnly = row("item-1", "email-key", { email: "person@example.com" });
+  const stable = row("item-1", "stable-key", { external_id: "permission:P", email: "Person@Example.com" });
+
+  it.each([[[emailOnly, stable]], [[stable, emailOnly]]])("an evidence pair stored before coalescing is one row, the stable one", (rows) => {
+    expect(coalesceStoredGdriveEvidence(rows)).toEqual([stable]);
+  });
+
+  it("only within one item: the same person, role and instant on ANOTHER item is another observation", () => {
+    const elsewhere = { ...emailOnly, item_id: "item-2" };
+    expect(coalesceStoredGdriveEvidence([elsewhere, stable])).toEqual([elsewhere, stable]);
+  });
+
+  it("two stable ids carrying the email leave the email-only row", () => {
+    const other = row("item-1", "other-key", { external_id: "permission:Q", email: "person@example.com" });
+    expect(coalesceStoredGdriveEvidence([emailOnly, stable, other])).toEqual([emailOnly, stable, other]);
   });
 });

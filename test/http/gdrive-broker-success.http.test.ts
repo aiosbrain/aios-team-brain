@@ -5,7 +5,8 @@ import { publishGoogleDriveOAuthCredential } from "@/lib/integrations/gdrive-oau
 import { provisionGdriveConnectorPrincipal } from "@/lib/integrations/gdrive-authority";
 import { setIntegrationStatus, upsertIntegration } from "@/lib/integrations/manage";
 import { approvedAudienceProject } from "../datamechanics/helpers";
-import { BASE_URL, db, issueKeyFor, keyHeaders, seedTeam, type Seed } from "./http-helpers";
+import { BASE_URL, db, issueKeyFor, keyHeaders, seedMemberEmail, seedTeam, type Seed } from "./http-helpers";
+import { FAKE_GOOGLE_CLIENT } from "./server-url";
 
 /**
  * AIO-1167 R44 T2 — the Drive credential's SUCCESS path over real HTTP: a real `next start` server,
@@ -15,6 +16,8 @@ import { BASE_URL, db, issueKeyFor, keyHeaders, seedTeam, type Seed } from "./ht
  * publisher brokers a short-lived access token to its bound connector, refreshes it again on demand,
  * and after a selection save still uses the SAME stored credential. Nothing secret crosses the wire.
  * A wrong principal, team or integration gets nothing; a pause and a provider revocation stop issuance.
+ * The bootstrap itself also runs end to end: a signed-in Admin's real start → Google → callback flow
+ * (Google answered by the harness fixture) stores the exchanged credential, which the broker then uses.
  */
 
 async function bootstrap(seed: Seed, refreshToken = `refresh-${randomUUID().slice(0, 8)}`) {
@@ -60,6 +63,40 @@ async function token(key: string, team: string, ref: Record<string, unknown>) {
 
 const SECRETS = ["oauth-client-secret-never-leaves", "refresh-"];
 
+/** A REAL browser session: seed a member, make it an Admin, sign in over the wire, keep the cookie. */
+async function signInAdmin(seed: Seed): Promise<string> {
+  const login = await seedMemberEmail(seed);
+  expect((await db().from("members").update({ role: "admin" }).eq("id", login.memberId)).error).toBeNull();
+  const response = await fetch(`${BASE_URL}/api/auth/login`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: login.email, password: login.password }),
+  });
+  const cookie = response.headers.get("set-cookie")?.split(";")[0];
+  if (!cookie) throw new Error("fixture login cookie missing");
+  return cookie;
+}
+
+/** The browser half of the OAuth flow: start (redirect to Google) and the callback Google redirects to. */
+async function startConsent(session: string, seed: Seed, name: string) {
+  const started = await fetch(
+    `${BASE_URL}/api/auth/gdrive/start?team=${encodeURIComponent(seed.teamSlug)}&name=${encodeURIComponent(name)}&mode=files`,
+    { headers: { Cookie: session }, redirect: "manual" },
+  );
+  expect([302, 303, 307]).toContain(started.status);
+  const location = new URL(started.headers.get("location") ?? "");
+  const binding = started.headers.getSetCookie().find((cookie) => cookie.startsWith("aios_gdrive_oauth="))?.split(";")[0];
+  if (!binding) throw new Error("the start route set no browser binding cookie");
+  return { location, state: location.searchParams.get("state") ?? "", binding };
+}
+
+async function callback(session: string, binding: string, state: string, code: string) {
+  const response = await fetch(
+    `${BASE_URL}/api/auth/gdrive/callback?state=${encodeURIComponent(state)}&code=${encodeURIComponent(code)}`,
+    { headers: { Cookie: `${session}; ${binding}` }, redirect: "manual" },
+  );
+  return { status: response.status, html: await response.text() };
+}
+
 describe("Drive broker success over real HTTP (R44 T2)", () => {
   it("bootstraps, issues, refreshes, survives a selection save, and never discloses the credential", async () => {
     const seed = await seedTeam();
@@ -94,6 +131,57 @@ describe("Drive broker success over real HTTP (R44 T2)", () => {
     expect(reacquired.status).toBe(200);
     expect(JSON.parse((await token(c.connectorKey, seed.teamSlug, reacquired.ref)).raw).access_token)
       .toBe(`fake-access-for-${c.refreshToken}`);
+  });
+
+  it("bootstraps through the real start → callback flow, and the broker uses the exchanged credential", async () => {
+    const seed = await seedTeam();
+    const session = await signInAdmin(seed);
+    const name = `docs-${randomUUID().slice(0, 6)}`;
+    const consent = await startConsent(session, seed, name);
+    expect(consent.location.origin).toBe("https://accounts.google.com");
+    expect(consent.location.searchParams.get("client_id")).toBe(FAKE_GOOGLE_CLIENT.id);
+    expect(consent.location.searchParams.get("redirect_uri")).toBe(FAKE_GOOGLE_CLIENT.redirect);
+    expect(consent.location.searchParams.get("scope")?.split(" ")).toContain("https://www.googleapis.com/auth/drive.file");
+    expect(consent.state).not.toBe("");
+
+    const code = `code${randomUUID().slice(0, 8)}`;
+    const connected = await callback(session, consent.binding, consent.state, code);
+    expect(connected.status).toBe(200);
+    expect(connected.html).toContain("Google Drive connected");
+    for (const secret of [FAKE_GOOGLE_CLIENT.secret, `refresh-${code}`, `code-access-${code}`]) {
+      expect(connected.html).not.toContain(secret);
+    }
+    // The state was single-use: replaying Google's redirect stores nothing new.
+    expect((await callback(session, consent.binding, consent.state, `${code}x`)).status).toBe(400);
+
+    const { data: row } = await db().from("integrations").select("id,config")
+      .eq("team_id", seed.teamId).eq("type", "gdrive").eq("name", name).single();
+    const integration = row as { id: string; config: Record<string, unknown> };
+    expect(JSON.stringify(integration.config)).not.toContain(`refresh-${code}`);
+    expect(JSON.stringify(integration.config)).not.toContain(FAKE_GOOGLE_CLIENT.secret);
+
+    // The Admin's selection, then the bound connector: the broker refreshes the CALLBACK's credential.
+    await db().from("members").update({ role: "admin" }).eq("id", seed.memberId).eq("team_id", seed.teamId);
+    const audience = await approvedAudienceProject(seed);
+    await upsertIntegration(db(), { teamId: seed.teamId, memberId: seed.memberId }, {
+      type: "gdrive", name, status: "enabled",
+      config: { ...integration.config, fileIds: ["Doc"], selectionState: "selected", audienceProjectIds: [audience] },
+    });
+    const connector = await provisionGdriveConnectorPrincipal({
+      teamId: seed.teamId, integrationId: integration.id, actorMemberId: seed.memberId,
+    });
+    const acquired = await acquire(connector.key, seed, integration.id);
+    expect(acquired.status).toBe(200);
+    const issued = await token(connector.key, seed.teamSlug, acquired.ref);
+    expect(issued.status).toBe(200);
+    const grant = JSON.parse(issued.raw);
+    expect(grant).toMatchObject({
+      access_token: `fake-access-for-refresh-${code}`,
+      scopes: ["https://www.googleapis.com/auth/drive.file"],
+      account: { subject: `subject:sub-${code}` },
+    });
+    expect(issued.raw.replace(grant.access_token, "")).not.toContain(`refresh-${code}`);
+    expect(issued.raw).not.toContain(FAKE_GOOGLE_CLIENT.secret);
   });
 
   it("a wrong principal, team or integration gets no token", async () => {

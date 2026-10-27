@@ -30,7 +30,7 @@ import { rowVisibleByProvenanceCtx } from "@/lib/access/provenance";
 import { isCalendarEvent } from "@/lib/meetings/from-calendar";
 import { buildIdentityMap } from "@/lib/identity/resolve";
 import { googleDriveContributionEvidence } from "./gdrive-contributions";
-import { gdriveObservationIdentity } from "@/lib/ingest/gdrive-ledger";
+import { coalesceStoredGdriveEvidence, gdriveObservationIdentity } from "@/lib/ingest/gdrive-ledger";
 
 // Only ACTIVE tasks are considered work "in progress". Since brain-api v1.21 (AIO-950) a Linear
 // "In Review" state normalizes to its own `in_review` rather than collapsing into `in_progress`;
@@ -494,8 +494,11 @@ export async function getWorkTimeline(
   // e-mail or timestamp-spelling change can still be there. The most recently written row speaks
   // for the observation: the older one must neither double the credit nor resolve it through an
   // e-mail the person no longer has. Decided before anything is resolved, across every page.
+  // An email-only row the ONE stable-id row of that item, role and instant names (S4) is the same
+  // observation: a ledger written before coalescing — or adopted from one by the migration's evidence
+  // backfill — can hold both until the item's next write retires it.
   const gdriveObservations = new Map<string, GdriveLedgerRow>();
-  for (const row of gdriveRows) {
+  for (const row of coalesceStoredGdriveEvidence(gdriveRows)) {
     const { stableId, person, role, at } = gdriveObservationIdentity({
       external_id: row.external_id, role: row.role, at: row.source_at,
     });

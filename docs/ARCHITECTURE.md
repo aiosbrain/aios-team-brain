@@ -959,8 +959,9 @@ R44 contracts (AIO-1167):
   created `retracted` (`retractItemUnit`), the barrier context backfill cannot reopen.
 - **Broker:** OAuth mode only (checked before refresh and at issuance); every refresh is held to the
   credential's recorded `grant_mode`, or for a legacy credential to the narrowest mode its recorded
-  scopes fit, else reconnect. The token endpoint is fixed to Google in product code; the HTTP tier
-  answers it from a loopback fixture through a harness-only preload (`test/http/google-token-intercept.mjs`).
+  scopes fit, else reconnect. The token and userinfo endpoints are fixed to Google in product code; the
+  HTTP tier answers exactly those two URLs from a loopback fixture through a harness-only preload
+  (`test/http/google-token-intercept.mjs`), so the real start → callback → broker flow runs over HTTP.
 - **Identity:** `buildIdentityMap({ includeDeactivated })` resolves a deactivated member ONLY through
   their existing identity mappings (explicit aliases, provider identities) — never roster email,
   handle or domain — for source-supported credit (attribution snapshot, Drive evidence store and
@@ -970,7 +971,10 @@ R44 contracts (AIO-1167):
   `discoverMemberIdentity`), only for an id never reviewed — links, manual mappings and unlink
   tombstones stand; a disagreeing email is an audited conflict, never a transfer. An email-only
   observation coalesces into the one stable-id observation carrying that email at the same role and
-  instant (`coalesceGdriveObservations`, used by the ledger, the evidence store and the Timeline).
+  instant (`coalesceGdriveObservations`, used by the ledger, the evidence store and the Timeline's
+  frontmatter display; the Timeline's stored-evidence leg applies the same rule per item through
+  `coalesceStoredGdriveEvidence`, so evidence stored before coalescing — or adopted by the migration's
+  backfill — still counts once).
 - **Sidecar:** a service-account run is namespaced by the account its LOADED key authenticates as and
   refused before any progress is used when that differs from the verified identity; watch renewal
   resolves the same namespace. Jobs bind local entries by immutable integration id (a same-name entry

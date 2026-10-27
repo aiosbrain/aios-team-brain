@@ -4,7 +4,14 @@ import { describe, expect, it } from "vitest";
 
 import { POST as executionPOST } from "@/app/api/v1/integrations/gdrive/execution/route";
 import { POST as itemsPOST } from "@/app/api/v1/items/route";
+import { AttributionRepairPendingError } from "@/lib/access/authorization-epoch";
+import { getCachedWorkTimeline } from "@/lib/dashboard/timeline-cache";
+import type { TimelineDay } from "@/lib/dashboard/timeline-group";
+import { getWorkTimeline } from "@/lib/dashboard/work-timeline";
 import { getPool } from "@/lib/db/pg/pool";
+import { listMemberIdentities } from "@/lib/identity/list";
+import { drainIdentityRepairs } from "@/lib/ingest/identity-repair";
+import { repairAttributionNow } from "@/lib/ingest/reconcile-attribution";
 import { provisionGdriveConnectorPrincipal } from "@/lib/integrations/gdrive-authority";
 import { setIntegrationSecret, upsertIntegration } from "@/lib/integrations/manage";
 import { approvedAudienceProject, db, seedTeam, sha, type Seed } from "./helpers";
@@ -18,6 +25,10 @@ import { approvedAudienceProject, db, seedTeam, sha, type Seed } from "./helpers
  *     document and its contribution evidence are credited to A in the SAME push;
  *   · a replay of that observation whose email now belongs to B is still ONE observation, still A's —
  *     the stable id is the person, an email change transfers nothing.
+ * The Admin identity list shows the link. The new mapping fences attributed Timeline reads until its
+ * repair completes (neither the primed old payload nor a partial one is served); afterwards the
+ * Timeline — uncached, and through the cache primed BEFORE the push — shows that one Drive activity
+ * under A and none under B.
  */
 
 function post(url: string, key: string, team: string, body: unknown, headers: Record<string, string> = {}) {
@@ -70,7 +81,8 @@ async function world() {
   return { seed, integrationId: row.id, key: connector.key, headers, a: await member(seed, "alice"), b: await member(seed, "bob") };
 }
 
-const AT = "2026-10-20T10:00:00Z";
+// Inside the Timeline window, and fixed for both pushes so the replay is the SAME observation.
+const AT = new Date(Date.now() - 3_600_000).toISOString();
 
 function push(w: Awaited<ReturnType<typeof world>>, body: string, email: string) {
   const contribution = { external_id: "permission:P", email, role: "editor", at: AT };
@@ -97,15 +109,43 @@ async function credit(teamId: string) {
   return { item, evidence, mapping };
 }
 
+/** Who the Timeline credits with Drive work, and how many observations each. */
+function driveCredit(days: TimelineDay[]) {
+  return days.flatMap((day) => day.people).flatMap((person) =>
+    [...person.tasks.flatMap((task) => task.sources), ...person.other]
+      .filter((source) => source.source === "gdrive")
+      .map((source) => [person.memberId, source.count] as const));
+}
+
+async function timelines(w: Awaited<ReturnType<typeof world>>, itemId: string) {
+  const uncached = await getWorkTimeline(db(), w.seed.teamId, "team", undefined, { visibleItemIds: new Set([itemId]) });
+  const cached = await getCachedWorkTimeline(db(), w.seed.teamId, "team", w.seed.memberId);
+  return { uncached: driveCredit(uncached), cached: driveCredit(cached.days) };
+}
+
 describe("Drive identity discovery through the fenced ingest route (R44 F1, real Postgres)", () => {
   it("links P to A and credits A in the same push; a replay under B's email transfers nothing", async () => {
     const w = await world();
+    // Prime the reader's cached Timeline before anything is linked or pushed.
+    expect(driveCredit((await getCachedWorkTimeline(db(), w.seed.teamId, "team", w.seed.memberId)).days)).toEqual([]);
     expect((await push(w, "first body", w.a.email)).status).toBe(201);
 
     const first = await credit(w.seed.teamId);
     expect(first.mapping).toEqual([w.a.id]);
     expect(first.item.member_id).toBe(w.a.id);
     expect(first.evidence).toEqual([{ external_id: "permission:P", member_id: w.a.id }]);
+    const listed = await listMemberIdentities(db(), w.seed.teamId);
+    expect(listed.get(w.a.id)?.providers.map((p) => [p.provider, p.externalId])).toEqual([["gdrive", "permission:P"]]);
+    expect(listed.get(w.b.id)?.providers ?? []).toEqual([]);
+
+    // The new mapping's repair fences the attributed read; drained, the read serves A's credit.
+    await expect(getCachedWorkTimeline(db(), w.seed.teamId, "team", w.seed.memberId))
+      .rejects.toBeInstanceOf(AttributionRepairPendingError);
+    await drainIdentityRepairs(db(), { maxObligations: 50, batchSize: 50 });
+    await repairAttributionNow(db(), w.seed.teamId, w.seed.teamSlug, { maxBatches: 10, batchSize: 50 });
+    expect((await db().from("team_identity_authority").select("repair_status")
+      .eq("team_id", w.seed.teamId).single()).data).toMatchObject({ repair_status: "complete" });
+    expect(await timelines(w, first.item.id)).toEqual({ uncached: [[w.a.id, 1]], cached: [[w.a.id, 1]] });
 
     // The same observation, re-reported with an email that now belongs to B.
     const replay = await push(w, "second body", w.b.email);
@@ -116,5 +156,6 @@ describe("Drive identity discovery through the fenced ingest route (R44 F1, real
     expect(after.item.member_id).toBe(w.a.id);
     expect(after.evidence).toEqual([{ external_id: "permission:P", member_id: w.a.id }]);
     expect((after.item.frontmatter.contributions as unknown[]).length).toBe(1);
+    expect(await timelines(w, after.item.id)).toEqual({ uncached: [[w.a.id, 1]], cached: [[w.a.id, 1]] });
   });
 });

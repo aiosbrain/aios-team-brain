@@ -72,6 +72,32 @@ export function coalesceGdriveObservations<T extends object>(rows: readonly T[])
   });
 }
 
+/** A stored Drive evidence row, as far as observation identity is concerned. */
+export interface StoredGdriveEvidenceRow {
+  item_id: string;
+  external_id: string | null;
+  email: string | null;
+  role: string;
+  source_at: string;
+}
+
+/**
+ * Stored evidence rows with each item's email-only duplicates folded into the one stable-id row that
+ * names the same email, role and instant (AIO-1167 R44 S4) — the ledger's own coalescing rule, applied
+ * per item, so the Timeline counts that observation once whatever state the ledger was stored in.
+ * Rows are otherwise returned unchanged, in order.
+ */
+export function coalesceStoredGdriveEvidence<T extends StoredGdriveEvidenceRow>(rows: readonly T[]): T[] {
+  const byItem = new Map<string, T[]>();
+  for (const row of rows) byItem.set(row.item_id, [...(byItem.get(row.item_id) ?? []), row]);
+  const kept = new Set<T>();
+  for (const itemRows of byItem.values()) {
+    const views = itemRows.map((row) => ({ external_id: row.external_id, email: row.email, role: row.role, at: row.source_at, row }));
+    for (const view of coalesceGdriveObservations(views)) kept.add(view.row);
+  }
+  return rows.filter((row) => kept.has(row));
+}
+
 /** Preserve each source-observed person/role/instant and deduplicate exact replays. */
 export function mergeGdriveContributions(
   stored: unknown,
