@@ -1096,7 +1096,9 @@ export function IntegrationsManager({
         onSubmit={(e) => {
           e.preventDefault();
           run(async () => {
-            const res = await saveIntegration(teamSlug, form);
+            // Drive takes no pasted credential (the server refuses one); drop any value left in
+            // the hidden field from another type so a Drive save is never refused for it.
+            const res = await saveIntegration(teamSlug, form.type === "gdrive" ? { ...form, secret: "" } : form);
             if (res.ok)
               setForm({ type: form.type, name: "", selection: "", secret: "", inboundApply: false });
             return res;

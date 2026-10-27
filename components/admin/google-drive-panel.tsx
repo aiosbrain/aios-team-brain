@@ -143,7 +143,9 @@ export function GoogleDrivePanel(props: GoogleDrivePanelProps) {
           </div>
           <p className="text-xs text-ink-tertiary">
             Reconnecting replaces credentials for this named connection without expanding its saved
-            file, folder, Shared Drive, project, or audience selection.
+            file, folder, Shared Drive, project, or audience selection. A paused connection stays
+            paused until you resume it. Google must grant exactly the access you chose: per-file
+            access is refused if an earlier, broader grant to this app is still active.
           </p>
         </>
       )}

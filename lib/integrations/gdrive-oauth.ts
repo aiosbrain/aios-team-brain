@@ -9,10 +9,31 @@ import { resolveConfirmedEmail } from "@/lib/identity/provider-sync";
 import { lockActiveTeamAdmin, lockGdriveConnection } from "@/lib/integrations/gdrive-authority";
 import { reserveGdriveIntegration, setIntegrationSecret, upsertIntegration } from "@/lib/integrations/manage";
 import { decryptSecret } from "@/lib/secrets/crypto";
+import { evaluateGdriveGrant, type GdriveGrantMode } from "@/lib/integrations/gdrive-grant-policy";
 
 export class IncompleteGoogleOAuthPairError extends Error {}
 export class InvalidGoogleOAuthInitiatorError extends Error {}
 export class GoogleIdentityConflictError extends Error {}
+/**
+ * Google granted authority the bound consent mode does not allow, or not the authority it needs
+ * (AIO-1167 R43 F3). Nothing is published; the prior connection is unchanged.
+ */
+export class GoogleGrantOutsideModeError extends Error {
+  constructor(readonly reason: "missing" | "insufficient" | "broader") {
+    super(`google_grant_${reason}`);
+  }
+}
+/**
+ * Google returned no new refresh credential and the stored one cannot be shown to fit the bound
+ * mode (different/unknown recorded grant), so it may not be reused under this consent (R43 F3).
+ */
+export class IncompatibleStoredGoogleCredentialError extends Error {}
+
+/** What the publication did to the connection's run state (AIO-1167 R43 F2). */
+export interface GoogleDriveOAuthPublication {
+  /** `disabled` when an existing paused/disconnected connection was reconnected: it stays paused. */
+  status: "enabled" | "disabled";
+}
 
 /** Deterministic concurrency seam for real-Postgres lock-order regressions. */
 export interface GoogleDriveOAuthPublicationHooks {
@@ -51,6 +72,19 @@ export interface GoogleDriveOAuthPublicationHooks {
  * manual mapping path resolves it. An unverified email is kept only as explicitly untrusted account
  * metadata on the connection (`authenticatedAccountEmailVerified: false`), never in
  * `member_identities.email`, which the shared resolver folds into its email map.
+ *
+ * GRANT POLICY (AIO-1167 R43 F3). `grantMode` is the consent mode signed into the OAuth state. The
+ * scopes Google granted must fit it (`evaluateGdriveGrant`), and the mode is recorded in the
+ * credential (`grant_mode`) so the broker enforces the same ceiling on every refresh. A missing new
+ * refresh token may reuse the stored one only when it belongs to the same subject and client AND its
+ * recorded grant fits this mode — an older, broader or unrecorded grant is never relabelled as this
+ * consent. The recorded scopes are always those of the refresh credential actually stored.
+ *
+ * RUN STATE (AIO-1167 R43 F2). Reconnecting repairs a credential; it is not Resume. The status comes
+ * from the row held under the connection lock: an existing paused or disconnected (`disabled`) row
+ * stays `disabled`, an enabled one stays enabled, and only a connection this publication creates
+ * starts enabled. A pause committed before this publication survives it; one queued behind it wins
+ * when it commits.
  */
 export async function publishGoogleDriveOAuthCredential(
   input: {
@@ -66,10 +100,13 @@ export async function publishGoogleDriveOAuthCredential(
     emailVerified: boolean;
     name?: string;
     refreshToken?: string;
+    /** The consent mode bound into the OAuth state at start. */
+    grantMode: GdriveGrantMode;
+    /** The scopes Google reported for this exchange. */
     scopes?: string[];
   },
   hooks: GoogleDriveOAuthPublicationHooks = {},
-): Promise<void> {
+): Promise<GoogleDriveOAuthPublication> {
   const db = adminClient();
   const auth = { teamId: input.teamId, memberId: input.memberId };
   const subject = input.subject.startsWith("subject:") ? input.subject : `subject:${input.subject}`;
@@ -78,8 +115,12 @@ export async function publishGoogleDriveOAuthCredential(
     : null;
   // Strict on purpose: a truthy string or a missing claim from a direct caller is not verification.
   const verifiedEmail = input.emailVerified === true ? accountEmail : null;
+  // The exchange's own grant must fit the bound mode, whether or not a new refresh token came with
+  // it: a broader grant now means the account's credential carries broader authority.
+  const exchanged = evaluateGdriveGrant(input.grantMode, input.scopes);
+  if (!exchanged.ok) throw new GoogleGrantOutsideModeError(exchanged.reason);
   /** The published config over whatever the connection already holds (nothing, when it is new). */
-  const publishedConfig = (prior: Record<string, unknown>) => {
+  const publishedConfig = (prior: Record<string, unknown>, scopes: string[]) => {
     const config: Record<string, unknown> = {
       fileIds: [], folderIds: [], sharedDriveIds: [], recursive: false,
       selectionState: "absent" as const, access: "team" as const,
@@ -88,7 +129,7 @@ export async function publishGoogleDriveOAuthCredential(
       // service-account mode must not survive and bypass the broker on the next execution.
       authMode: "oauth" as const,
       authenticatedAccountId: subject,
-      ...(input.scopes ? { scopeSet: input.scopes } : {}),
+      scopeSet: scopes,
     };
     // The account's email describes THIS account only: a previous account's survives nowhere.
     delete config.authenticatedAccount;
@@ -100,7 +141,7 @@ export async function publishGoogleDriveOAuthCredential(
     return config;
   };
 
-  await withTransaction(async () => {
+  return withTransaction(async () => {
     await lockIdentityMutationAuthorities([input.teamId]);
     await runSql(`select pg_advisory_xact_lock(hashtextextended($1, 0))`, [
       `${input.teamId}:gdrive:${input.integrationName}`,
@@ -114,7 +155,7 @@ export async function publishGoogleDriveOAuthCredential(
     );
     const target = named[0]
       ? { id: named[0].id, reserved: false }
-      : await reserveGdriveIntegration(db, input.teamId, input.integrationName, publishedConfig({}));
+      : await reserveGdriveIntegration(db, input.teamId, input.integrationName, publishedConfig({}, exchanged.scopes));
     const connection = await lockGdriveConnection(input.teamId, target.id);
 
     if (!await lockActiveTeamAdmin(input.teamId, input.memberId)) {
@@ -138,19 +179,32 @@ export async function publishGoogleDriveOAuthCredential(
       : decryptSecret(connection.secretCiphertext);
     let old: Record<string, unknown> = {};
     try { old = priorSecret ? JSON.parse(priorSecret) as Record<string, unknown> : {}; } catch { old = {}; }
-    const mayReuse = old.account_subject === subject && old.client_id === input.clientId
-      && typeof old.refresh_token === "string" && Boolean(old.refresh_token);
-    const refreshToken = input.refreshToken || (mayReuse ? String(old.refresh_token) : "");
-    if (!refreshToken) throw new IncompleteGoogleOAuthPairError("incomplete_oauth_pair");
+    let refreshToken = input.refreshToken ?? "";
+    let credentialScopes = exchanged.scopes;
+    if (!refreshToken) {
+      const sameCredential = old.account_subject === subject && old.client_id === input.clientId
+        && typeof old.refresh_token === "string" && Boolean(old.refresh_token);
+      if (!sameCredential) throw new IncompleteGoogleOAuthPairError("incomplete_oauth_pair");
+      // The stored refresh token keeps ITS grant, whatever this exchange reported: reuse it only
+      // when that recorded grant was made under this same mode and still fits it.
+      const stored = evaluateGdriveGrant(input.grantMode, Array.isArray(old.scopes) ? old.scopes : null);
+      if (old.grant_mode !== input.grantMode || !stored.ok) {
+        throw new IncompatibleStoredGoogleCredentialError("stored_credential_outside_mode");
+      }
+      refreshToken = String(old.refresh_token);
+      credentialScopes = stored.scopes;
+    }
 
-    const config = publishedConfig(priorConfig);
+    const config = publishedConfig(priorConfig, credentialScopes);
     const secret = JSON.stringify({
       client_id: input.clientId, client_secret: input.clientSecret,
       refresh_token: refreshToken, token_uri: "https://oauth2.googleapis.com/token",
-      scopes: config.scopeSet, account_subject: subject,
+      scopes: credentialScopes, grant_mode: input.grantMode, account_subject: subject,
     });
+    // Reconnecting is not Resume: an existing row keeps the status held under its lock.
+    const status: "enabled" | "disabled" = !target.reserved && connection.status !== "enabled" ? "disabled" : "enabled";
     const { id } = await upsertIntegration(db, auth, {
-      type: "gdrive", name: input.integrationName, config, status: "enabled",
+      type: "gdrive", name: input.integrationName, config, status,
     });
     await setIntegrationSecret(db, auth, id, secret);
     if (verifiedMemberId && verifiedEmail) {
@@ -166,5 +220,6 @@ export async function publishGoogleDriveOAuthCredential(
         throw new GoogleIdentityConflictError("verified Google identity conflicts with an existing manual mapping");
       }
     }
+    return { status };
   });
 }

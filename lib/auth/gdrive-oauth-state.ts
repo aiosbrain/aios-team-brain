@@ -2,6 +2,7 @@ import "server-only";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { SignJWT, jwtVerify } from "jose";
 import type { DbClient } from "@/lib/db/types";
+import { isGdriveGrantMode, type GdriveGrantMode } from "@/lib/integrations/gdrive-grant-policy";
 
 const ALG = "HS256";
 const TTL_S = 600;
@@ -42,6 +43,12 @@ interface Claims {
   nonce: string;
   integrationName: string;
   teamSlug: string;
+  /**
+   * The consent mode the Admin chose at start (AIO-1167 R43 F3). Signed here so the callback judges
+   * Google's grant against it; a callback query parameter never supplies it. A state without a valid
+   * mode (one minted before this claim existed, or tampered) is refused — the Admin starts again.
+   */
+  mode: GdriveGrantMode;
   /** sha256 of the initiating browser's binding cookie. */
   browser: string;
 }
@@ -64,6 +71,7 @@ export async function createGoogleDriveOAuthState(
 ): Promise<string> {
   const { browserBinding, ...context } = input;
   if (!browserBinding) throw new Error("Google Drive OAuth state requires a browser binding");
+  if (!isGdriveGrantMode(context.mode)) throw new Error("Google Drive OAuth state requires a consent mode");
   const nonce = randomUUID();
   const expiresAt = new Date(Date.now() + TTL_S * 1000).toISOString();
   const { error } = await db.from("oauth_states").insert({
@@ -98,6 +106,7 @@ export async function consumeGoogleDriveOAuthState(
     for (const key of ["memberId", "teamId", "nonce", "integrationName", "teamSlug", "browser"] as const) {
       if (typeof payload[key] !== "string" || !payload[key]) return null;
     }
+    if (!isGdriveGrantMode(payload.mode)) return null;
     claims = payload as unknown as Claims;
   } catch {
     return null;
@@ -120,5 +129,6 @@ export async function consumeGoogleDriveOAuthState(
     memberId: claims.memberId,
     integrationName: claims.integrationName,
     teamSlug: claims.teamSlug,
+    mode: claims.mode,
   };
 }

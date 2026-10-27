@@ -194,6 +194,10 @@ async function rejectPrivateSlackChannels(
   }
 }
 
+/** Why a pasted Drive credential is refused: OAuth credentials come only from the verified callback. */
+const GDRIVE_SECRET_REFUSAL =
+  "Google Drive credentials are not accepted here: use Connect or Reconnect with Google. Service-account keys stay with the local sidecar. Nothing was saved.";
+
 export async function saveIntegration(
   teamSlug: string,
   form: {
@@ -209,6 +213,8 @@ export async function saveIntegration(
   if (!ctx) return { ok: false, error: "admins only" };
   const name = form.name.trim();
   if (!name) return { ok: false, error: "name is required" };
+  // Refused before anything is read, verified or written (AIO-1167 R43 F1).
+  if (form.type === "gdrive" && form.secret) return { ok: false, error: GDRIVE_SECRET_REFUSAL };
   const auth = { teamId: ctx.teamId, memberId: ctx.memberId };
   try {
     let config = buildConfig(form.type, form.selection, { inboundApply: form.inboundApply });
@@ -263,7 +269,7 @@ export async function saveIntegration(
       }
       // Locked save: a narrowed audience is applied to every claimed document before this returns,
       // and the connection keeps its paused/enabled status.
-      await saveGdriveConnectionConfig(adminClient(), auth, { name, config, secret: form.secret });
+      await saveGdriveConnectionConfig(adminClient(), auth, { name, config });
       revalidatePath(`/t/${teamSlug}/admin/integrations`);
       return { ok: true };
     }
@@ -313,6 +319,14 @@ export async function rotateSecret(
   if (!ctx) return { ok: false, error: "admins only" };
   if (!secret) return { ok: false, error: "secret is required" };
   try {
+    // Team-scoped type check BEFORE the write: a Drive credential is replaced only by the verified
+    // OAuth reconnect, never by a pasted secret (AIO-1167 R43 F1). A row's type never changes, so the
+    // read cannot go stale before the write. An id this team does not own rotates nothing.
+    const { data: target, error: targetError } = await adminClient().from("integrations").select("type")
+      .eq("id", id).eq("team_id", ctx.teamId).maybeSingle();
+    if (targetError) return { ok: false, error: "could not rotate" };
+    if (!target) return { ok: false, error: "integration not found" };
+    if ((target as { type: string }).type === "gdrive") return { ok: false, error: GDRIVE_SECRET_REFUSAL };
     await setIntegrationSecret(adminClient(), { teamId: ctx.teamId, memberId: ctx.memberId }, id, secret);
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not rotate" };

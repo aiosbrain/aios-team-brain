@@ -7,19 +7,27 @@ import {
   gdriveOAuthBindingCookieOptions,
   newGoogleDriveOAuthBinding,
 } from "@/lib/auth/gdrive-oauth-state";
+import { gdriveRequestScopes, isGdriveGrantMode } from "@/lib/integrations/gdrive-grant-policy";
 
 export const runtime = "nodejs";
 
-const FILE_SCOPES = ["openid", "email", "profile", "https://www.googleapis.com/auth/drive.file"];
-const DISCOVERY_SCOPES = ["openid", "email", "profile", "https://www.googleapis.com/auth/drive.readonly"];
+/**
+ * Admin-only OAuth start. The consent mode (`files` = per-file `drive.file`, `folders` = explicit
+ * `drive.readonly` discovery) is required, signed into the one-use state, and requests EXACTLY that
+ * mode's scopes: no `include_granted_scopes`, so a per-file consent never silently inherits an
+ * earlier broad grant (AIO-1167 R43 F3). The callback still verifies what Google actually granted.
+ */
 
 export async function GET(req: NextRequest) {
   const params = req.nextUrl.searchParams;
   const teamSlug = params.get("team") ?? "";
   const name = (params.get("name") ?? "google-drive").trim().slice(0, 120);
-  const mode = params.get("mode") === "files" ? "files" : "folders";
+  const mode = params.get("mode");
   const auth = await requireTeamAdmin(teamSlug);
   if (!auth) return new Response("admins only", { status: 403 });
+  if (!isGdriveGrantMode(mode)) {
+    return new Response("Choose per-file access or folder discovery to connect Google Drive", { status: 400 });
+  }
   const clientId = process.env.GOOGLE_DRIVE_CLIENT_ID;
   const redirectUri = process.env.GOOGLE_DRIVE_OAUTH_REDIRECT;
   if (!clientId || !redirectUri || !process.env.AUTH_SECRET) {
@@ -36,6 +44,7 @@ export async function GET(req: NextRequest) {
     memberId: auth.memberId,
     integrationName: name || "google-drive",
     teamSlug,
+    mode,
     browserBinding,
   });
   const authorize = new URL("https://accounts.google.com/o/oauth2/v2/auth");
@@ -45,8 +54,7 @@ export async function GET(req: NextRequest) {
     response_type: "code",
     access_type: "offline",
     prompt: "consent",
-    include_granted_scopes: "true",
-    scope: (mode === "files" ? FILE_SCOPES : DISCOVERY_SCOPES).join(" "),
+    scope: gdriveRequestScopes(mode).join(" "),
     state,
   }).toString();
   const response = NextResponse.redirect(authorize);

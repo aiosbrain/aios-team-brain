@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { SignJWT } from "jose";
 import type { DbClient } from "@/lib/db/types";
@@ -22,7 +23,7 @@ class OAuthStateDb {
 }
 
 const SECRET = "aio-1167-test-secret-at-least-sixteen";
-const CONTEXT = { teamId: "team-a", memberId: "admin-a", integrationName: "docs", teamSlug: "alpha" };
+const CONTEXT = { teamId: "team-a", memberId: "admin-a", integrationName: "docs", teamSlug: "alpha", mode: "files" as const };
 
 const previousSecret = process.env.AUTH_SECRET;
 afterEach(() => { process.env.AUTH_SECRET = previousSecret; });
@@ -93,5 +94,45 @@ describe("AIO-1167 Google Drive OAuth state", () => {
 
     await expect(consumeGoogleDriveOAuthState(fake as unknown as DbClient, unbound, "browser-a")).resolves.toBeNull();
     expect(fake.updatePayload).toBeNull();
+  });
+
+  // AIO-1167 R43 F3 — the consent mode is part of the signed state, never a callback parameter.
+  it("R43 F3: the chosen consent mode round-trips through the signed state", async () => {
+    process.env.AUTH_SECRET = SECRET;
+    const db = new OAuthStateDb() as unknown as DbClient;
+    const state = await createGoogleDriveOAuthState(db, { ...CONTEXT, mode: "folders", browserBinding: "browser-a" });
+    await expect(consumeGoogleDriveOAuthState(db, state, "browser-a")).resolves.toEqual({ ...CONTEXT, mode: "folders" });
+  });
+
+  it.each([["missing", undefined], ["unknown", "everything"], ["non-string", 1]])(
+    "R43 F3: a correctly signed, browser-bound state with a %s mode is refused WITHOUT consuming its nonce",
+    async (_case, mode) => {
+      process.env.AUTH_SECRET = SECRET;
+      const fake = new OAuthStateDb();
+      fake.row = { nonce: "modeless-nonce", team_id: CONTEXT.teamId, member_id: CONTEXT.memberId };
+      const claims: Record<string, unknown> = {
+        teamId: CONTEXT.teamId, memberId: CONTEXT.memberId, integrationName: CONTEXT.integrationName,
+        teamSlug: CONTEXT.teamSlug, nonce: "modeless-nonce",
+        browser: createHash("sha256").update("browser-a").digest("base64url"),
+      };
+      if (mode !== undefined) claims.mode = mode;
+      const token = await new SignJWT(claims)
+        .setProtectedHeader({ alg: "HS256" })
+        .setIssuedAt()
+        .setExpirationTime("600s")
+        .sign(new TextEncoder().encode(SECRET));
+
+      await expect(consumeGoogleDriveOAuthState(fake as unknown as DbClient, token, "browser-a")).resolves.toBeNull();
+      expect(fake.updatePayload).toBeNull();
+    },
+  );
+
+  it("R43 F3: refuses to mint a state without a valid consent mode", async () => {
+    process.env.AUTH_SECRET = SECRET;
+    const fake = new OAuthStateDb();
+    await expect(createGoogleDriveOAuthState(fake as unknown as DbClient, {
+      ...CONTEXT, mode: "everything" as unknown as "files", browserBinding: "browser-a",
+    })).rejects.toThrow(/consent mode/);
+    expect(fake.row).toBeNull();
   });
 });

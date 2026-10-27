@@ -9,13 +9,14 @@ import type { DbClient } from "@/lib/db/types";
 import { withBoundedLockWaits } from "@/lib/db/pg/bounded-lock";
 import { runSql, withTransaction } from "@/lib/db/pg/pool";
 import { lockIdentityAuthority, lockIdentityMutationAuthorities } from "@/lib/identity/authority";
-import { setIntegrationSecret, upsertIntegration } from "@/lib/integrations/manage";
+import { upsertIntegration } from "@/lib/integrations/manage";
 import { applyGdriveConnectionAudience } from "@/lib/projects/context/gdrive-claims";
 import { lockProjectRows } from "@/lib/projects/project-row-locks";
 import { decryptSecret } from "@/lib/secrets/crypto";
 import { validateIntegrationConfig } from "@/lib/api/schemas";
 import { selectedRootCoverage } from "@/lib/integrations/gdrive-root-coverage";
 import { mergeLockedGdriveCredentialFields, unverifiedOauthRoots } from "@/lib/integrations/gdrive-credential-fields";
+import { evaluateGdriveGrant, isGdriveGrantMode } from "@/lib/integrations/gdrive-grant-policy";
 
 const LEASE_SECONDS = 10 * 60;
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -398,11 +399,15 @@ export async function publishGdriveVerifiedConfig(
  * so an OAuth reconnect that committed in between is never overwritten by the previous account, and
  * an OAuth save that would ADD a root the held row does not have — one only a provider-verified
  * publication may add — is refused as stale with nothing written.
+ *
+ * It writes CONFIG only, never a credential (AIO-1167 R43 F1): a Drive credential enters only through
+ * the verified OAuth publication (`publishGoogleDriveOAuthCredential`), which binds it to the account
+ * it proved; service-account keys stay with the local sidecar and are never uploaded.
  */
 export async function saveGdriveConnectionConfig(
   db: DbClient,
   auth: { teamId: string; memberId: string },
-  input: { name: string; config: Record<string, unknown>; secret?: string },
+  input: { name: string; config: Record<string, unknown> },
 ): Promise<{ id: string }> {
   return withTransaction(async () => {
     const { rows: named } = await runSql<{ id: string }>(
@@ -424,7 +429,6 @@ export async function saveGdriveConnectionConfig(
       config: mergeLockedGdriveCredentialFields(input.config, locked),
       status: existing?.status === "disabled" ? "disabled" : "enabled",
     });
-    if (input.secret) await setIntegrationSecret(db, auth, id, input.secret);
     if (existing) await applyGdriveConnectionAudience(db, auth.teamId, id);
     return { id };
   });
@@ -869,6 +873,8 @@ interface StoredOAuthSecret {
   refresh_token?: string;
   token_uri?: string;
   scopes?: unknown;
+  /** The consent mode the OAuth publisher recorded (AIO-1167 R43 F3); the broker's grant ceiling. */
+  grant_mode?: unknown;
   account_subject?: string;
 }
 
@@ -929,6 +935,22 @@ export async function brokerGoogleAccessToken(auth: ApiAuth, ref: GdriveExecutio
   const granted = typeof payload.scope === "string"
     ? payload.scope.split(/\s+/).filter(Boolean)
     : (Array.isArray(credential.scopes) ? credential.scopes.map(String) : credential.configuredScopes);
+  // The consent mode recorded with the credential is a ceiling on EVERY grant, not just the first
+  // (AIO-1167 R43 F3). A refresh reporting authority outside it is refused and the token withheld —
+  // never released with the unexpected scope filtered out of the list, which would hide it.
+  if (credential.grant_mode !== undefined) {
+    const verdict = isGdriveGrantMode(credential.grant_mode)
+      ? evaluateGdriveGrant(credential.grant_mode, granted)
+      : null;
+    if (!verdict?.ok) {
+      await audit(adminClient(), {
+        team_id: auth.teamId, actor_kind: "api_key", member_id: auth.memberId, api_key_id: auth.apiKeyId,
+        action: "gdrive.token_denied", target_type: "integration", target_id: ref.integrationId,
+        meta: { generation: ref.generation, fence: ref.fence, grantOutsideMode: verdict?.reason ?? "unknown_mode" },
+      });
+      throw new GdriveAuthorityError("reconnect_required", "Google Drive credential no longer matches its approved access; reconnect", 409);
+    }
+  }
   const expiresIn = Math.max(1, Math.min(Number(payload.expires_in) || 3600, 3600));
   // A pause, disconnect, scope change, lease replacement, rebind, or key revocation during refresh
   // wins — and so does one that arrives while the issuance is being recorded. The final validation
