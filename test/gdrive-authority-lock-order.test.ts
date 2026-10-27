@@ -94,6 +94,8 @@ import {
   type GdriveAdminTestAuthority,
 } from "@/lib/integrations/gdrive-authority";
 import {
+  GoogleGrantOutsideModeError,
+  IncompatibleStoredGoogleCredentialError,
   IncompleteGoogleOAuthPairError,
   InvalidGoogleOAuthInitiatorError,
   publishGoogleDriveOAuthCredential,
@@ -134,7 +136,11 @@ const isWrite = (e: Entry) => /^(insert|update|delete) /.test(e.sql);
 const indexOf = (entries: Entry[], match: (e: Entry) => boolean) => entries.findIndex(match);
 const which = (entries: Entry[], match: (e: Entry) => boolean) => entries.filter(match);
 
-const OAUTH_SECRET = { client_id: "oauth-client", client_secret: "client-secret", refresh_token: "stored-refresh", account_subject: "subject:acct-1" };
+const OAUTH_SECRET = {
+  client_id: "oauth-client", client_secret: "client-secret", refresh_token: "stored-refresh", account_subject: "subject:acct-1",
+  // The grant the stored refresh token was published under (AIO-1167 R43 F3): reuse requires it.
+  scopes: ["https://www.googleapis.com/auth/drive.file"], grant_mode: "files",
+};
 
 /** A scripted database holding (or not holding) one Drive connection. */
 function database(opts: {
@@ -343,7 +349,7 @@ describe("OAuth publication: one transaction, canonical order", () => {
       teamId: TEAM, memberId: ADMIN, integrationName: NAME,
       clientId: "oauth-client", clientSecret: "client-secret",
       subject: "acct-1", email: "Shared@Example.com", emailVerified: true, name: "Shared",
-      refreshToken: "fresh-refresh", scopes: ["https://www.googleapis.com/auth/drive.file"],
+      refreshToken: "fresh-refresh", scopes: ["https://www.googleapis.com/auth/drive.file"], grantMode: "files",
       ...over,
     });
   /** The JSON-ish parameters of a statement, parsed where they are strings. */
@@ -452,6 +458,67 @@ describe("OAuth publication: one transaction, canonical order", () => {
     }
   });
 
+  // AIO-1167 R43 F3: a missing new refresh token reuses the stored one only when ITS recorded grant
+  // was made under this mode and fits it; anything else is refused with nothing written.
+  it.each([
+    ["no recorded mode", { grant_mode: undefined }, "files"],
+    ["another recorded mode", { grant_mode: "folders", scopes: ["https://www.googleapis.com/auth/drive.readonly"] }, "files"],
+    ["a broader recorded grant", { scopes: ["https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/drive.readonly"] }, "files"],
+    ["no recorded scopes", { scopes: undefined }, "files"],
+    ["a narrow grant asked to serve discovery", {}, "folders"],
+  ] as const)("REUSE REFUSED (%s): the stored credential is not relabelled as this consent", async (_case, over, grantMode) => {
+    const c = use(new ScriptedConnection(database({ secret: { ...OAUTH_SECRET, ...over } })));
+    const scopes = grantMode === "folders" ? ["https://www.googleapis.com/auth/drive.readonly"] : ["https://www.googleapis.com/auth/drive.file"];
+    await expect(publish({ refreshToken: undefined, grantMode, scopes }))
+      .rejects.toBeInstanceOf(IncompatibleStoredGoogleCredentialError);
+    expect(which(c.work, isWrite)).toEqual([]);
+    expect(c.log.at(-1)!.sql).toBe("rollback");
+  });
+
+  it("REUSE ALLOWED: a compatible stored grant is reused and its OWN scopes are recorded", async () => {
+    const c = use(new ScriptedConnection(database()));
+    await publish({ refreshToken: undefined, scopes: ["openid", "https://www.googleapis.com/auth/drive.file"] });
+    expect(publishedSecret(c)).toMatchObject({
+      refresh_token: "stored-refresh", grant_mode: "files", scopes: ["https://www.googleapis.com/auth/drive.file"],
+    });
+    expect(publishedConfig(c)).toMatchObject({ scopeSet: ["https://www.googleapis.com/auth/drive.file"] });
+  });
+
+  it("a fresh credential records its grant and mode", async () => {
+    const c = use(new ScriptedConnection(database()));
+    await publish({ grantMode: "folders", scopes: ["openid", "https://www.googleapis.com/auth/drive.readonly"] });
+    expect(publishedSecret(c)).toMatchObject({
+      refresh_token: "fresh-refresh", grant_mode: "folders", scopes: ["openid", "https://www.googleapis.com/auth/drive.readonly"],
+    });
+  });
+
+  it.each([
+    ["broader", ["https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/drive"]],
+    ["insufficient", ["openid", "email"]],
+    ["missing", undefined],
+  ] as const)("an exchanged grant that is %s for the mode is refused before any statement", async (reason, scopes) => {
+    const c = use(new ScriptedConnection(database()));
+    const error: unknown = await publish({ scopes: scopes as string[] | undefined }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(GoogleGrantOutsideModeError);
+    expect((error as InstanceType<typeof GoogleGrantOutsideModeError>).reason).toBe(reason);
+    expect(c.log).toEqual([]);
+  });
+
+  // AIO-1167 R43 F2: reconnecting is not Resume — the status comes from the row held under the lock.
+  it.each([
+    ["an enabled connection stays enabled", { status: "enabled" }, "enabled"],
+    ["a paused/disconnected connection stays disabled", { status: "disabled" }, "disabled"],
+    ["a connection this publication creates starts enabled", { named: [null] as (string | null)[], secret: null }, "enabled"],
+  ] as const)("RUN STATE: %s", async (_case, opts, expected) => {
+    const c = use(new ScriptedConnection(database(opts)));
+    await expect(publish()).resolves.toEqual({ status: expected });
+    const published = which(c.work, isPublication)[0];
+    expect(published.params).toContain(expected);
+    expect(published.params).not.toContain(expected === "enabled" ? "disabled" : "enabled");
+    // Chosen under the held connection lock, never before it.
+    expect(indexOf(c.work, isConnectionLock)).toBeLessThan(indexOf(c.work, isPublication));
+  });
+
   it.each([
     ["demoted", { role: "member", status: "active" }],
     ["deactivated", { role: "admin", status: "disabled" }],
@@ -489,6 +556,7 @@ describe("OAuth publication: one transaction, canonical order", () => {
     await publishGoogleDriveOAuthCredential({
       teamId: TEAM, memberId: ADMIN, integrationName: NAME, clientId: "oauth-client",
       clientSecret: "client-secret", subject: "acct-1", email: "shared@example.com", emailVerified: true, refreshToken: "fresh-refresh",
+      grantMode: "files", scopes: ["https://www.googleapis.com/auth/drive.file"],
     }, { afterLocks: async () => { seen = [...c.work]; } });
     expect(seen.some(isIdentityLock) && seen.some(isNamedLock) && seen.some(isConnectionLock) && seen.some(isAdminLock)).toBe(true);
     expect(which(seen, isWrite)).toEqual([]);

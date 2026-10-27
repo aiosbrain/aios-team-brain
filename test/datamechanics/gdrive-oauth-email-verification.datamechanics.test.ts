@@ -50,7 +50,7 @@ function publication(w: World, over: Record<string, unknown> = {}) {
     clientId: "oauth-client", clientSecret: "client-secret",
     subject: `acct-${randomUUID().slice(0, 8)}`, email: w.author.email, emailVerified: true,
     name: "Google Account", refreshToken: "fresh-refresh",
-    scopes: ["https://www.googleapis.com/auth/drive.file"],
+    scopes: ["https://www.googleapis.com/auth/drive.file"], grantMode: "files",
     ...over,
   } as Parameters<typeof publishGoogleDriveOAuthCredential>[0];
 }

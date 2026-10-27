@@ -54,7 +54,7 @@ vi.mock("@/lib/integrations/manage", async (importOriginal) => {
 const { saveIntegration, saveGoogleDrivePickerSelection } = await import("@/app/t/[team]/admin/integrations/actions");
 
 const OLD = { subject: "subject:acct-old", email: "old@example.com", scopes: ["scope-old"] };
-const NEW = { subject: "subject:acct-new", email: "new@example.com", scopes: ["scope-new"] };
+const NEW = { subject: "subject:acct-new", email: "new@example.com", scopes: ["openid", "https://www.googleapis.com/auth/drive.file"] };
 const DOC_MIME = "application/vnd.google-apps.document";
 
 async function oauthConnection(seed: Seed, name: string, fileIds: string[]) {
@@ -83,7 +83,7 @@ function reconnect(seed: Seed, name: string): Promise<void> {
   return publishGoogleDriveOAuthCredential({
     teamId: seed.teamId, memberId: seed.memberId, integrationName: name,
     clientId: "client", clientSecret: "secret", subject: NEW.subject, email: NEW.email,
-    emailVerified: false, refreshToken: "new-refresh", scopes: NEW.scopes,
+    emailVerified: false, refreshToken: "new-refresh", scopes: NEW.scopes, grantMode: "files",
   });
 }
 

@@ -941,6 +941,15 @@ A Picker save above 100 unique Docs is refused whole with the saved selection un
 truncated, because the publication replaces the file list (AIO-1167 R42 F6).
 The sidecar also retains service-account configuration compatibility.
 
+Drive credentials enter ONLY through the verified OAuth publication (AIO-1167 R43 F1): the Admin
+`saveIntegration` and `rotateSecret` actions refuse any Drive secret before reading, verifying or
+writing (service-account keys stay with the local sidecar), and the config owner
+`saveGdriveConnectionConfig` has no secret input. The publication records the consent mode with the
+credential (`grant_mode`) and the broker refuses — and audits as `gdrive.token_denied` — any refresh
+whose granted scopes leave that mode, rather than filtering the extra scope out (R43 F3). It takes the
+connection's status from the row it holds under the connection lock: only a connection it creates
+starts enabled; reconnecting is never an implicit Resume (R43 F2).
+
 `GET /api/v1/integrations` remains selection-only, and a Drive row's account and selection metadata
 (account email/subject/verified flag, scopes, selected ids, audience projects, service-account
 identity) is returned only to that connection's LIVE BOUND connector principal; every other key —
@@ -2511,8 +2520,8 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/auth/slack/start` — member-authed: mint single-use state nonce + return Slack OAuth authorize_url with the full `slack-personal` user-scope set (including matched conversation read/history scopes and `files:write`; signed short-TTL state JWT; CSRF/replay guard)
 - `GET /api/auth/slack/callback` — browser (no API key): verify+consume state nonce, exchange `code` (`oauth.v2.access`), re-validate via `auth.test`, store the user token encrypted (`member_secrets`) + capture identity; renders HTML (never the token)
 - `GET /api/auth/slack/status` — member-authed: `{ connected, slack_user_id, workspace }` (never returns the token; `no-store`)
-- `GET /api/auth/gdrive/start` — team-admin-authenticated Google Drive OAuth start; signed single-use team/member-bound state whose browser half is an HttpOnly binding cookie, and explicit per-file vs folder-discovery scopes
-- `GET /api/auth/gdrive/callback` — redeem the state only with the initiating browser's binding cookie and only for the session of the Admin who started it, then exchange and verify the Google account's subject and atomically publish account config + encrypted refresh credential (an email creates identity mappings only when Google's `email_verified` is literally `true`; a missing or unverified email still connects, by subject, unlinked); an old refresh token is reusable only for the same verified subject/client pair
+- `GET /api/auth/gdrive/start` — team-admin-authenticated Google Drive OAuth start; signed single-use team/member-bound state whose browser half is an HttpOnly binding cookie; a REQUIRED `mode` (`files`/`folders`, anything else 400) signed into the state, requesting exactly that mode's scopes with no `include_granted_scopes` (AIO-1167 R43 F3)
+- `GET /api/auth/gdrive/callback` — redeem the state only with the initiating browser's binding cookie and only for the session of the Admin who started it, then exchange and verify the Google account's subject and atomically publish account config + encrypted refresh credential (an email creates identity mappings only when Google's `email_verified` is literally `true`; a missing or unverified email still connects, by subject, unlinked); an old refresh token is reusable only for the same verified subject/client pair AND when its recorded grant was made under the same mode and fits it. The granted scopes are judged against the SIGNED mode (`lib/integrations/gdrive-grant-policy.ts`) before userinfo and again by the publisher; a broader, insufficient or missing grant publishes nothing. Each provider leg (token, userinfo) is bounded at 15 s including its body, shape-checked, never retried; transport/timeout/5xx/429 → sanitized 503, unusable replies → 422, all `no-store`, with the state left consumed. Reconnecting keeps an existing connection's status (a paused one stays paused until Resume) and says so (AIO-1167 R43 F2–F4)
 - `POST /api/v1/integrations/gdrive/execution` — dedicated connector-principal acquire/checkpoint/release for the current immutable integration generation + lease fence and authoritative progress revision; acquire never self-binds, and every commit transaction rereads the bound key/member/posture plus connection/fence. Selection/account/credential changes advance the content generation and reset its cursor obligations; status-only pause/resume instead advances the fence, clears the lease, and retains generation/progress so resumption cannot skip acknowledged work or request a fresh start token
 - `POST /api/v1/integrations/gdrive/token` — fenced no-store OAuth access-token broker; refresh/client secrets remain server-side, and bound-principal revocation is reread after provider refresh before issuance, in the one row-locked transaction that also records the issuance — a pause, disconnect, rebind or key revocation cannot commit between that check and the token's release
 - `GET /api/v1/integrations/gdrive/runs` — connection-bound connector claim for durable Admin Run-now/retry requests

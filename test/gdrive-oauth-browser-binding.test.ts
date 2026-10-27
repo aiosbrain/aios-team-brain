@@ -35,6 +35,10 @@ vi.mock("@/lib/integrations/gdrive-oauth", () => ({
   IncompleteGoogleOAuthPairError: class extends Error {},
   GoogleIdentityConflictError: class extends Error {},
   InvalidGoogleOAuthInitiatorError: class extends Error {},
+  GoogleGrantOutsideModeError: class extends Error {
+    constructor(readonly reason: string) { super(reason); }
+  },
+  IncompatibleStoredGoogleCredentialError: class extends Error {},
   publishGoogleDriveOAuthCredential: h.publish,
 }));
 
@@ -81,7 +85,7 @@ beforeEach(() => {
   h.db = db;
   h.admin = ADMIN;
   h.adminSlugs = [];
-  h.publish.mockReset().mockResolvedValue(undefined);
+  h.publish.mockReset().mockResolvedValue({ status: "enabled" });
   // Google: the token exchange, then the account lookup. Nothing else may be fetched.
   vi.spyOn(globalThis, "fetch")
     .mockResolvedValueOnce(new Response(JSON.stringify({

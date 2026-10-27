@@ -715,7 +715,7 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
     process.env.GOOGLE_DRIVE_OAUTH_REDIRECT = "http://test/api/auth/gdrive/callback";
     const state = await createGoogleDriveOAuthState(db(), {
       teamId: seed.teamId, memberId: seed.memberId, integrationName: "callback-docs", teamSlug: seed.teamSlug,
-      browserBinding: startedBy(seed),
+      mode: "files", browserBinding: startedBy(seed),
     });
     const provider = vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(new Response(JSON.stringify({
@@ -781,7 +781,7 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
     const state = await createGoogleDriveOAuthState(db(), {
       teamId: seed.teamId, memberId: seed.memberId,
       integrationName: "exact-member-account", teamSlug: seed.teamSlug,
-      browserBinding: startedBy(seed),
+      mode: "files", browserBinding: startedBy(seed),
     });
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(new Response(JSON.stringify({
@@ -832,10 +832,10 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
     const before = await getIntegrationWithSecret(db(), seed.teamId, "gdrive", "atomic-pair");
     const state = await createGoogleDriveOAuthState(db(), {
       teamId: seed.teamId, memberId: seed.memberId, integrationName: "atomic-pair", teamSlug: seed.teamSlug,
-      browserBinding: startedBy(seed),
+      mode: "files", browserBinding: startedBy(seed),
     });
     vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(new Response(JSON.stringify({ access_token: "new-account-no-refresh" }), {
+      .mockResolvedValueOnce(new Response(JSON.stringify({ access_token: "new-account-no-refresh", scope: "https://www.googleapis.com/auth/drive.file" }), {
         status: 200, headers: { "content-type": "application/json" },
       }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ sub: "different-subject", email: "other@example.com" }), {
@@ -869,11 +869,12 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
     const state = await createGoogleDriveOAuthState(db(), {
       teamId: seed.teamId, memberId: seed.memberId,
       integrationName: "service-to-oauth", teamSlug: seed.teamSlug,
-      browserBinding: startedBy(seed),
+      mode: "files", browserBinding: startedBy(seed),
     });
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(new Response(JSON.stringify({
         access_token: "oauth-access", refresh_token: "oauth-refresh",
+        scope: "https://www.googleapis.com/auth/drive.file",
       }), { status: 200, headers: { "content-type": "application/json" } }))
       .mockResolvedValueOnce(new Response(JSON.stringify({
         sub: "oauth-subject", email: "oauth@example.com",
@@ -898,7 +899,7 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
     process.env.GOOGLE_DRIVE_OAUTH_REDIRECT = "http://test/api/auth/gdrive/callback";
     const state = await createGoogleDriveOAuthState(db(), {
       teamId: seed.teamId, memberId: seed.memberId, integrationName: "leaked-state", teamSlug: seed.teamSlug,
-      browserBinding: startedBy(seed),
+      mode: "files", browserBinding: startedBy(seed),
     });
     const provider = vi.spyOn(globalThis, "fetch");
     const url = `http://test/api/auth/gdrive/callback?state=${encodeURIComponent(state)}&code=one-time-code`;
@@ -917,7 +918,7 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
 
     provider
       .mockResolvedValueOnce(new Response(JSON.stringify({
-        access_token: "callback-access", refresh_token: "callback-refresh",
+        access_token: "callback-access", refresh_token: "callback-refresh", scope: "https://www.googleapis.com/auth/drive.file",
       }), { status: 200, headers: { "content-type": "application/json" } }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ sub: "rightful-subject", email: "rightful@example.com" }), {
         status: 200, headers: { "content-type": "application/json" },
@@ -938,7 +939,7 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
     const before = await getIntegrationWithSecret(db(), seed.teamId, "gdrive", "session-changed");
     const state = await createGoogleDriveOAuthState(db(), {
       teamId: seed.teamId, memberId: seed.memberId, integrationName: "session-changed", teamSlug: seed.teamSlug,
-      browserBinding: startedBy(seed),
+      mode: "files", browserBinding: startedBy(seed),
     });
     const provider = vi.spyOn(globalThis, "fetch");
     // Same browser, but the Admin who started the grant is no longer the one signed in.
@@ -971,13 +972,13 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
     const state = await createGoogleDriveOAuthState(db(), {
       teamId: seed.teamId, memberId: seed.memberId,
       integrationName: `initiator-${_case}`, teamSlug: seed.teamSlug,
-      browserBinding: startedBy(seed),
+      mode: "files", browserBinding: startedBy(seed),
     });
     vi.spyOn(globalThis, "fetch")
       .mockImplementationOnce(async () => {
         await db().from("members").update(mutation).eq("id", seed.memberId).eq("team_id", seed.teamId);
         return new Response(JSON.stringify({
-          access_token: "new-access", refresh_token: "new-refresh",
+          access_token: "new-access", refresh_token: "new-refresh", scope: "https://www.googleapis.com/auth/drive.file",
         }), { status: 200, headers: { "content-type": "application/json" } });
       })
       .mockResolvedValueOnce(new Response(JSON.stringify({
@@ -1007,7 +1008,7 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
     const state = await createGoogleDriveOAuthState(db(), {
       teamId: seed.teamId, memberId: seed.memberId,
       integrationName: "initiator-transferred", teamSlug: seed.teamSlug,
-      browserBinding: startedBy(seed),
+      mode: "files", browserBinding: startedBy(seed),
     });
     vi.spyOn(globalThis, "fetch")
       .mockImplementationOnce(async () => {
@@ -1016,7 +1017,7 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
           .eq("id", seed.memberId).eq("team_id", seed.teamId);
         if (error) throw new Error(error.message);
         return new Response(JSON.stringify({
-          access_token: "new-access", refresh_token: "new-refresh",
+          access_token: "new-access", refresh_token: "new-refresh", scope: "https://www.googleapis.com/auth/drive.file",
         }), { status: 200, headers: { "content-type": "application/json" } });
       })
       .mockResolvedValueOnce(new Response(JSON.stringify({
