@@ -1,0 +1,120 @@
+import { randomUUID } from "node:crypto";
+import { NextRequest } from "next/server";
+import { describe, expect, it } from "vitest";
+
+import { POST as executionPOST } from "@/app/api/v1/integrations/gdrive/execution/route";
+import { POST as itemsPOST } from "@/app/api/v1/items/route";
+import { getPool } from "@/lib/db/pg/pool";
+import { provisionGdriveConnectorPrincipal } from "@/lib/integrations/gdrive-authority";
+import { setIntegrationSecret, upsertIntegration } from "@/lib/integrations/manage";
+import { approvedAudienceProject, db, seedTeam, sha, type Seed } from "./helpers";
+
+/**
+ * AIO-1167 R44 F1 — end to end through the real fenced ingest route.
+ *
+ * Spec (AC-08 closure). A Drive push whose contribution carries an unmapped `permission:P` and the
+ * confirmed email of active member A, under the connector's live execution:
+ *   · creates the shared identity link P → A (the registry an Admin's identity list reads), and the
+ *     document and its contribution evidence are credited to A in the SAME push;
+ *   · a replay of that observation whose email now belongs to B is still ONE observation, still A's —
+ *     the stable id is the person, an email change transfers nothing.
+ */
+
+function post(url: string, key: string, team: string, body: unknown, headers: Record<string, string> = {}) {
+  return new Request(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}`, "X-AIOS-Team": team, "Content-Type": "application/json", ...headers },
+    body: JSON.stringify(body),
+  }) as NextRequest;
+}
+
+async function member(seed: Seed, name: string) {
+  const email = `${name}-${randomUUID().slice(0, 6)}@example.com`;
+  const { data } = await db().from("members").insert({
+    team_id: seed.teamId, email, display_name: name, actor_handle: `${name}-${randomUUID().slice(0, 6)}`,
+    role: "member", tier: "team", status: "active",
+  }).select("id").single();
+  return { id: (data as { id: string }).id, email };
+}
+
+async function world() {
+  const seed = await seedTeam();
+  await db().from("members").update({ role: "admin" }).eq("id", seed.memberId).eq("team_id", seed.teamId);
+  const audience = await approvedAudienceProject(seed);
+  const auth = { teamId: seed.teamId, memberId: seed.memberId };
+  const row = await upsertIntegration(db(), auth, {
+    type: "gdrive", name: "route-docs", status: "enabled",
+    config: {
+      fileIds: ["d1"], folderIds: [], sharedDriveIds: [], recursive: false, selectionState: "selected",
+      projectSlug: "docs", access: "team", authMode: "oauth", authenticatedAccountId: "subject:acct",
+      scopeSet: ["https://www.googleapis.com/auth/drive.file"], audienceProjectIds: [audience],
+    },
+  });
+  await setIntegrationSecret(db(), auth, row.id, JSON.stringify({
+    client_id: "client", client_secret: "secret", refresh_token: "refresh", grant_mode: "files",
+    scopes: ["https://www.googleapis.com/auth/drive.file"], account_subject: "subject:acct",
+  }));
+  const connector = await provisionGdriveConnectorPrincipal({ teamId: seed.teamId, integrationId: row.id, actorMemberId: seed.memberId });
+  const owner = randomUUID();
+  const acquired = await executionPOST(post("http://test/api/v1/integrations/gdrive/execution", connector.key, seed.teamSlug, {
+    action: "acquire", integration_id: row.id, owner,
+  }));
+  expect(acquired.status).toBe(200);
+  const lease = await acquired.json() as { generation: number; fence: number };
+  const headers = {
+    "X-AIOS-Integration-Id": row.id,
+    "X-AIOS-Execution-Generation": String(lease.generation),
+    "X-AIOS-Execution-Fence": String(lease.fence),
+    "X-AIOS-Execution-Owner": owner,
+  };
+  return { seed, integrationId: row.id, key: connector.key, headers, a: await member(seed, "alice"), b: await member(seed, "bob") };
+}
+
+const AT = "2026-10-20T10:00:00Z";
+
+function push(w: Awaited<ReturnType<typeof world>>, body: string, email: string) {
+  const contribution = { external_id: "permission:P", email, role: "editor", at: AT };
+  return itemsPOST(post("http://test/api/v1/items", w.key, w.seed.teamSlug, {
+    project: "docs", path: "gdrive/d1.md", kind: "deliverable", access: "team", actor: "gdrive-sync",
+    body, content_sha256: sha(body),
+    frontmatter: {
+      source: "gdrive", source_id: "d1", connection_id: w.integrationId, source_ts: AT,
+      authors: [{ provider: "gdrive", external_id: "permission:P", email, role: "editor" }],
+      contributions: [contribution],
+    },
+  }, w.headers));
+}
+
+async function credit(teamId: string) {
+  const pool = getPool();
+  const item = (await pool.query<{ id: string; member_id: string | null; frontmatter: Record<string, unknown> }>(
+    "select id, member_id, frontmatter from items where team_id=$1 and path='gdrive/d1.md'", [teamId])).rows[0];
+  const evidence = (await pool.query<{ external_id: string | null; member_id: string | null }>(
+    "select external_id, member_id from gdrive_contribution_evidence where team_id=$1 and item_id=$2", [teamId, item.id])).rows;
+  const mapping = (await pool.query<{ member_id: string }>(
+    "select member_id from member_identities where team_id=$1 and provider='gdrive' and external_id='permission:P'",
+    [teamId])).rows.map((row) => row.member_id);
+  return { item, evidence, mapping };
+}
+
+describe("Drive identity discovery through the fenced ingest route (R44 F1, real Postgres)", () => {
+  it("links P to A and credits A in the same push; a replay under B's email transfers nothing", async () => {
+    const w = await world();
+    expect((await push(w, "first body", w.a.email)).status).toBe(201);
+
+    const first = await credit(w.seed.teamId);
+    expect(first.mapping).toEqual([w.a.id]);
+    expect(first.item.member_id).toBe(w.a.id);
+    expect(first.evidence).toEqual([{ external_id: "permission:P", member_id: w.a.id }]);
+
+    // The same observation, re-reported with an email that now belongs to B.
+    const replay = await push(w, "second body", w.b.email);
+    expect([200, 201]).toContain(replay.status);
+
+    const after = await credit(w.seed.teamId);
+    expect(after.mapping).toEqual([w.a.id]);
+    expect(after.item.member_id).toBe(w.a.id);
+    expect(after.evidence).toEqual([{ external_id: "permission:P", member_id: w.a.id }]);
+    expect((after.item.frontmatter.contributions as unknown[]).length).toBe(1);
+  });
+});
