@@ -15,9 +15,10 @@ import { db, seedTeam } from "./helpers";
  *   · New links and authentication: a deactivated member is NOT eligible. The default identity map
  *     (account linking, identity sync) resolves none of their aliases or provider identities, and a
  *     new identity link to them is refused.
- *   · Established history: offboarding is not an unlink. The attribution map
- *     (`includeDeactivated`) still resolves their existing alias and provider identity, so their
- *     Drive contribution evidence keeps rendering as theirs; `activeMemberIds` still excludes them.
+ *   · Source-supported history: offboarding is not an unlink. The attribution map
+ *     (`includeDeactivated`) still resolves their EXISTING identity mappings — explicit alias and
+ *     provider identity — so their Drive contribution evidence keeps rendering as theirs; their roster
+ *     email resolves nothing, and `activeMemberIds` still excludes them.
  */
 
 async function member(teamId: string, name: string) {
@@ -49,6 +50,8 @@ describe("a deactivated member's history versus new eligibility (R44 C4, real Po
     expect(history.byEmail.get(alias)).toBe(carol.id);
     expect(resolveByProviderId(history, "gdrive", "permission:carol-perm")).toBe(carol.id);
     expect(history.activeMemberIds?.has(carol.id)).toBe(false);
+    // Only EXISTING identity mappings resolve an offboarded member — never roster heuristics.
+    expect(history.byEmail.get(carol.email.toLowerCase())).toBeUndefined();
 
     const frontmatter = {
       source: "gdrive", title: "Plan",

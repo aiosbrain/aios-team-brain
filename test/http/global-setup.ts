@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { once } from "node:events";
 import { BASE_URL, HTTP_TEST_PORT as PORT } from "./server-url";
 
@@ -28,10 +29,12 @@ async function waitForReady(): Promise<void> {
 }
 
 /**
- * A controlled Google OAuth token endpoint on loopback (AIO-1167 R44 T2). The server's broker is
- * pointed at it through `AIOS_TEST_GOOGLE_TOKEN_URL` (honoured for loopback only). A refresh token
- * named `revoked-refresh` is refused `invalid_grant`; any other is exchanged for a short-lived token
- * that names the refresh token it came from, so a test can tell which credential the broker used.
+ * A controlled Google OAuth token endpoint on loopback (AIO-1167 R44 T2). Production code is not
+ * configurable: the broker always calls Google's fixed endpoint. The interception lives entirely in
+ * this harness — `google-token-intercept.mjs`, preloaded into the test server only, answers that one
+ * URL from this fixture. A refresh token named `revoked-refresh` is refused `invalid_grant`; any
+ * other is exchanged for a short-lived token naming the refresh token it came from, so a test can
+ * tell which credential the broker used.
  */
 async function startFakeGoogle(): Promise<Server> {
   const server = createServer((req, res) => {
@@ -68,8 +71,12 @@ export default async function setup(): Promise<() => Promise<void>> {
   }
 
   const fakeGoogle = await startFakeGoogle();
-  process.env.AIOS_TEST_GOOGLE_TOKEN_URL =
-    `http://127.0.0.1:${(fakeGoogle.address() as AddressInfo).port}/token`;
+  const intercept = pathToFileURL(resolve("test/http/google-token-intercept.mjs")).href;
+  // Only the spawned TEST server gets the preload and the fixture URL; nothing else reads them.
+  const harnessEnv = {
+    AIOS_HTTP_FAKE_GOOGLE_TOKEN_URL: `http://127.0.0.1:${(fakeGoogle.address() as AddressInfo).port}/token`,
+    NODE_OPTIONS: [process.env.NODE_OPTIONS, `--import ${intercept}`].filter(Boolean).join(" "),
+  };
 
   const nextBin = resolve("node_modules/.bin/next");
   // The MCP outer runner owns a detached Vitest process group. Keep its server
@@ -78,7 +85,7 @@ export default async function setup(): Promise<() => Promise<void>> {
   const server: ChildProcess = spawn(nextBin, ["start", "-p", PORT], {
     // Inherit the backend/secret env pinned in vitest.http.config.ts; PORT is also
     // honored by `next start`. detached so we can kill the whole process group.
-    env: { ...process.env, PORT },
+    env: { ...process.env, ...harnessEnv, PORT },
     stdio: ["ignore", "inherit", "inherit"],
     detached,
   });

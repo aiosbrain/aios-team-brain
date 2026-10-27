@@ -959,12 +959,13 @@ R44 contracts (AIO-1167):
   created `retracted` (`retractItemUnit`), the barrier context backfill cannot reopen.
 - **Broker:** OAuth mode only (checked before refresh and at issuance); every refresh is held to the
   credential's recorded `grant_mode`, or for a legacy credential to the narrowest mode its recorded
-  scopes fit, else reconnect. `AIOS_TEST_GOOGLE_TOKEN_URL` (loopback http only) points the broker at
-  the HTTP tier's provider fixture.
-- **Identity:** `buildIdentityMap({ includeDeactivated })` resolves a deactivated member's existing
-  aliases/identities for ESTABLISHED credit (attribution snapshot, Drive evidence store and display);
-  linking and identity sync keep the active-only default, so offboarding is not an unlink and a
-  deactivated member gets no new link. A fenced Drive push first links an observed `permission:` id
+  scopes fit, else reconnect. The token endpoint is fixed to Google in product code; the HTTP tier
+  answers it from a loopback fixture through a harness-only preload (`test/http/google-token-intercept.mjs`).
+- **Identity:** `buildIdentityMap({ includeDeactivated })` resolves a deactivated member ONLY through
+  their existing identity mappings (explicit aliases, provider identities) — never roster email,
+  handle or domain — for source-supported credit (attribution snapshot, Drive evidence store and
+  display); linking and identity sync keep the active-only default, so offboarding is not an unlink and
+  a deactivated member gets no new link or authentication. A fenced Drive push first links an observed `permission:` id
   whose email names exactly one active member (`lib/integrations/gdrive-identity-discovery.ts` →
   `discoverMemberIdentity`), only for an id never reviewed — links, manual mappings and unlink
   tombstones stand; a disagreeing email is an audited conflict, never a transfer. An email-only

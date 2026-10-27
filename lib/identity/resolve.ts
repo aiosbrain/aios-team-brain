@@ -48,11 +48,12 @@ export interface AuthorIdentity {
  *
  * `includeDeactivated` (AIO-1167 R44 C4) separates two questions the roster status answers
  * differently. Who may be NEWLY linked or authenticated excludes a deactivated member — the default,
- * used by account linking and identity sync. Whose ESTABLISHED work this is does not: offboarding is
- * not an unlink, so attribution writers (ingest, repair, author resolution) and contribution display
- * pass `includeDeactivated` and keep resolving a deactivated member's existing aliases and provider
- * identities. Deliberate unlink tombstones and remaps still apply. `activeMemberIds` lists active
- * members only, in both modes.
+ * used by account linking and identity sync. Whose work the SOURCE says this is does not: offboarding
+ * is not an unlink, so attribution writers (ingest, repair, author resolution) and contribution display
+ * pass `includeDeactivated` and keep resolving a deactivated member through their EXISTING identity
+ * mappings — explicit aliases and provider identities — and only those: their roster email, handle
+ * and domain are heuristics and resolve nothing once they are offboarded. Deliberate unlink tombstones
+ * and remaps still apply. `activeMemberIds` lists active members only, in both modes.
  */
 export async function buildIdentityMap(
   db: DbClient,
@@ -90,10 +91,13 @@ export async function buildIdentityMap(
     status?: string | null;
   }[]) {
     if (r.status === "disabled") {
-      if (!opts.includeDeactivated) continue;
-    } else {
-      activeMemberIds.add(r.id);
+      // A deactivated member resolves ONLY through an existing identity mapping (an explicit alias
+      // or a provider identity, below) — never through roster heuristics (primary email, handle,
+      // email domain), which identify nobody once the person is offboarded.
+      if (opts.includeDeactivated) resolvableMemberIds.add(r.id);
+      continue;
     }
+    activeMemberIds.add(r.id);
     resolvableMemberIds.add(r.id);
     if (r.email) {
       const email = r.email.toLowerCase();

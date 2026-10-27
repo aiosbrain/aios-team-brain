@@ -20,24 +20,6 @@ import { evaluateGdriveGrant, storedGrantCeiling } from "@/lib/integrations/gdri
 
 const LEASE_SECONDS = 10 * 60;
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
-const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
-
-/**
- * Where the broker refreshes. Always Google — except that the real-HTTP test tier (AIO-1167 R44 T2)
- * points `AIOS_TEST_GOOGLE_TOKEN_URL` at a controlled provider fixture on THIS machine. The override
- * is honoured only for a plain-http LOOPBACK URL, so no configuration can send a refresh credential
- * to another host through it; anything else is ignored.
- */
-function googleTokenUrl(): string {
-  const override = process.env.AIOS_TEST_GOOGLE_TOKEN_URL;
-  if (!override) return GOOGLE_TOKEN_URL;
-  try {
-    const url = new URL(override);
-    return url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname) ? url.toString() : GOOGLE_TOKEN_URL;
-  } catch {
-    return GOOGLE_TOKEN_URL;
-  }
-}
 
 export class GdriveAuthorityError extends Error {
   constructor(
@@ -987,7 +969,7 @@ export async function brokerGoogleAccessToken(auth: ApiAuth, ref: GdriveExecutio
 
   let response: Response;
   try {
-    response = await fetch(googleTokenUrl(), {
+    response = await fetch(GOOGLE_TOKEN_URL, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
