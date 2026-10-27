@@ -1,5 +1,6 @@
 import { adminClient } from "@/lib/db/admin";
-import { getCachedWorkTimeline } from "@/lib/dashboard/timeline-cache";
+import { AttributionRepairPendingError } from "@/lib/access/authorization-epoch";
+import { getCachedWorkTimeline, TimelineAuthorizationChangedError, type CachedTimeline } from "@/lib/dashboard/timeline-cache";
 import { WINDOW_DAYS, MAX_WINDOW_DAYS } from "@/lib/dashboard/work-timeline";
 import { TimelineDays } from "@/components/dashboard/timeline-days";
 import { TimelineLoadMore } from "@/components/dashboard/timeline-load-more";
@@ -14,6 +15,12 @@ import { TimelineLoadMore } from "@/components/dashboard/timeline-load-more";
  * (`TimelineLoadMore`) expands the lookback on demand up to `MAX_WINDOW_DAYS`. Best-effort: an empty week
  * still offers the expansion (older work may exist beyond the default window). `adminClient` is safe
  * because `visibleItems`/`visibleTasks` apply the tier filter regardless.
+ *
+ * The two EXPECTED unavailability errors (an identity-attribution repair in progress, or authorization
+ * moving under both read attempts) degrade only this panel to a temporary notice — the same condition
+ * the timeline routes answer with 503. No ledger is shown in that state (never stale evidence), and the
+ * rest of the page keeps rendering because the error never reaches the segment boundary. Anything else
+ * is unexpected and still throws.
  */
 
 export async function TimelinePanel({
@@ -31,7 +38,15 @@ export async function TimelinePanel({
   // Payload only: this panel renders the ledger and has no freshness affordance today. Surfacing
   // `freshness.stale` here (a "last updated" line) is a UI change, deliberately not bundled with the
   // wire fix — see the PR's follow-ups.
-  const { days } = await getCachedWorkTimeline(adminClient(), teamId, tier, memberId);
+  const read = await readTimeline(teamId, tier, memberId);
+  if ("notice" in read) {
+    return (
+      <p role="status" className="rounded-lg border border-border-subtle px-4 py-6 text-center text-sm text-ink-tertiary">
+        {read.notice}
+      </p>
+    );
+  }
+  const { days } = read.timeline;
   const shownDates = days.map((d) => d.date);
 
   return (
@@ -53,4 +68,30 @@ export async function TimelinePanel({
       />
     </div>
   );
+}
+
+/** The ledger, or the notice for an expected, retryable unavailability. Unexpected errors propagate. */
+async function readTimeline(
+  teamId: string,
+  tier: "team" | "external",
+  memberId: string,
+): Promise<{ timeline: CachedTimeline } | { notice: string }> {
+  try {
+    return { timeline: await getCachedWorkTimeline(adminClient(), teamId, tier, memberId) };
+  } catch (error) {
+    const notice = unavailableNotice(error);
+    if (notice === null) throw error;
+    return { notice };
+  }
+}
+
+/** The panel's copy for an expected, retryable unavailability; `null` for anything unexpected. */
+function unavailableNotice(error: unknown): string | null {
+  if (error instanceof AttributionRepairPendingError) {
+    return "Timeline is temporarily unavailable while work attribution is being repaired. Refresh in a moment.";
+  }
+  if (error instanceof TimelineAuthorizationChangedError) {
+    return "Timeline access changed while it was loading. Refresh to see the current view.";
+  }
+  return null;
 }

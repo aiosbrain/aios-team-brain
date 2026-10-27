@@ -15,6 +15,7 @@ import { lockProjectRows } from "@/lib/projects/project-row-locks";
 import { decryptSecret } from "@/lib/secrets/crypto";
 import { validateIntegrationConfig } from "@/lib/api/schemas";
 import { selectedRootCoverage } from "@/lib/integrations/gdrive-root-coverage";
+import { mergeLockedGdriveCredentialFields, unverifiedOauthRoots } from "@/lib/integrations/gdrive-credential-fields";
 
 const LEASE_SECONDS = 10 * 60;
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -161,11 +162,16 @@ interface AuthorityRow {
   credential_revision: string | number;
 }
 
+/** The request-level half of the connector check; the persisted binding is the other half. */
+export function isGdriveConnectorPrincipal(auth: ApiAuth): boolean {
+  return auth.isConnector && auth.actorHandle === "gdrive-sync" && auth.memberTier === "team";
+}
+
 function requireConnectorPrincipal(auth: ApiAuth): void {
   // `is_connector` alone is not authority: this dedicated actor handle plus the persisted API-key
   // binding below prevents Slack/GitHub connectors, ordinary members, and external clients from
   // claiming a Drive execution.
-  if (!auth.isConnector || auth.actorHandle !== "gdrive-sync" || auth.memberTier !== "team") {
+  if (!isGdriveConnectorPrincipal(auth)) {
     throw new GdriveAuthorityError("connector_principal_required", "trusted Google Drive connector principal required", 403);
   }
 }
@@ -345,7 +351,14 @@ export async function publishGdriveVerifiedConfig(
   await withTransaction(async () => {
     const row = await lockedAuthority(authority.integrationId, authority.teamId);
     await assertLiveAdminConnection(row, authority);
-    const config = validateIntegrationConfig("gdrive", nextConfig);
+    // The credential's account fields come from the LOCKED row, never from the caller's config: a
+    // manual verified save builds its config from a read taken before this snapshot. The snapshot's
+    // generation (which covers `authMode`) still matches, so the row is the OAuth connection the
+    // provider proof ran against.
+    const config = validateIntegrationConfig(
+      "gdrive",
+      mergeLockedGdriveCredentialFields({ ...nextConfig, authMode: "oauth" }, row.config ?? {}),
+    );
     const { rows } = await runSql<{ id: string }>(
       `update integrations set config=$1::jsonb,updated_at=now()
         where id=$2 and team_id=$3 and status='enabled'
@@ -379,6 +392,12 @@ export async function publishGdriveVerifiedConfig(
  * document in the same transaction (`applyGdriveConnectionAudience`): a narrowing is in force when
  * this returns, paused or not. A save never changes the connection's status — resuming is its own
  * action — so narrowing a paused connection's audience does not restart its reads.
+ *
+ * The caller's config was built from an earlier, unlocked read (AIO-1167 R42 F6). Under the lock,
+ * the credential-owned fields are re-derived from the held row (`mergeLockedGdriveCredentialFields`),
+ * so an OAuth reconnect that committed in between is never overwritten by the previous account, and
+ * an OAuth save that would ADD a root the held row does not have — one only a provider-verified
+ * publication may add — is refused as stale with nothing written.
  */
 export async function saveGdriveConnectionConfig(
   db: DbClient,
@@ -391,10 +410,18 @@ export async function saveGdriveConnectionConfig(
       [auth.teamId, input.name],
     );
     const existing = named[0] ? await lockedAuthority(named[0].id, auth.teamId) : null;
+    const locked = existing?.config ?? {};
+    if (unverifiedOauthRoots(input.config, locked).length > 0) {
+      throw new GdriveAuthorityError(
+        "admin_authority_changed",
+        "Google Drive selection changed since this form was loaded; reload and save again",
+        409,
+      );
+    }
     const { id } = await upsertIntegration(db, auth, {
       type: "gdrive",
       name: input.name,
-      config: input.config,
+      config: mergeLockedGdriveCredentialFields(input.config, locked),
       status: existing?.status === "disabled" ? "disabled" : "enabled",
     });
     if (input.secret) await setIntegrationSecret(db, auth, id, input.secret);
@@ -403,20 +430,29 @@ export async function saveGdriveConnectionConfig(
   });
 }
 
-async function assertLiveBoundPrincipal(row: AuthorityRow, auth: ApiAuth): Promise<void> {
-  if (!row.connector_api_key_id || !row.connector_member_id
-      || row.connector_api_key_id !== auth.apiKeyId || row.connector_member_id !== auth.memberId) {
-    throw new GdriveAuthorityError("wrong_connection", "Google Drive connection is not bound to this connector principal", 403);
-  }
-  const { rows } = await runSql<{ valid: boolean }>(
-    `select (k.revoked_at is null and m.status = 'active' and m.is_connector is true
+/**
+ * The one definition of a LIVE Drive connector principal, over `api_keys k` and `members m`, with the
+ * team id as `$1`: an unrevoked key of an active `gdrive-sync` connector member in the team's builtin
+ * Everyone group. Shared by the execution boundary below and the integrations read projection
+ * (`gdrive-selection-projection`), so "who may see a connection's full config" cannot drift from
+ * "who may run it".
+ */
+export const LIVE_GDRIVE_CONNECTOR_SQL = `k.revoked_at is null and m.status = 'active' and m.is_connector is true
              and m.actor_handle = 'gdrive-sync'
              and exists (
                select 1 from group_members gm
                join groups g on g.id = gm.group_id and g.team_id = gm.team_id
                where gm.team_id = $1 and gm.member_id = m.id
                  and g.slug = 'everyone' and g.is_builtin is true
-             )) as valid
+             )`;
+
+async function assertLiveBoundPrincipal(row: AuthorityRow, auth: ApiAuth): Promise<void> {
+  if (!row.connector_api_key_id || !row.connector_member_id
+      || row.connector_api_key_id !== auth.apiKeyId || row.connector_member_id !== auth.memberId) {
+    throw new GdriveAuthorityError("wrong_connection", "Google Drive connection is not bound to this connector principal", 403);
+  }
+  const { rows } = await runSql<{ valid: boolean }>(
+    `select (${LIVE_GDRIVE_CONNECTOR_SQL}) as valid
        from api_keys k
        join members m on m.id = k.member_id and m.team_id = k.team_id
       where k.id = $2 and k.team_id = $1 and k.member_id = $3

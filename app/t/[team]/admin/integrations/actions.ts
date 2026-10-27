@@ -66,6 +66,7 @@ import {
   validateGdriveAudienceProjects,
   type GdriveAdminTestAuthority,
 } from "@/lib/integrations/gdrive-authority";
+import { gdriveRootKeys } from "@/lib/integrations/gdrive-credential-fields";
 
 export type PrimaryPmProvider = "plane" | "linear" | null;
 
@@ -213,38 +214,12 @@ export async function saveIntegration(
     let config = buildConfig(form.type, form.selection, { inboundApply: form.inboundApply });
     if (form.type === "gdrive") {
       const existing = await getIntegrationWithSecret(adminClient(), ctx.teamId, "gdrive", name);
-      // Selection saves must not erase OAuth account/scope diagnostics or change credential mode.
-      config = {
-        ...config,
-        ...(existing?.config.authenticatedAccount
-          ? { authenticatedAccount: existing.config.authenticatedAccount }
-          : {}),
-        ...(typeof existing?.config.authenticatedAccountEmailVerified === "boolean"
-          ? { authenticatedAccountEmailVerified: existing.config.authenticatedAccountEmailVerified }
-          : {}),
-        ...(existing?.config.authenticatedAccountId
-          ? { authenticatedAccountId: existing.config.authenticatedAccountId }
-          : {}),
-        ...(existing?.config.scopeSet ? { scopeSet: existing.config.scopeSet } : {}),
-        authMode: config.authMode ?? existing?.config.authMode ?? "oauth",
-      };
+      // A selection save keeps the connection's credential mode. The credential-owned fields (OAuth
+      // account/subject/scopes, service-account verification) are NOT taken from this unlocked read:
+      // the locked owners re-derive them from the row they hold (`gdrive-credential-fields`), so a
+      // reconnect committing after this read is never overwritten (AIO-1167 R42 F6).
+      config = { ...config, authMode: config.authMode ?? existing?.config.authMode ?? "oauth" };
       const authMode = String(config.authMode ?? "oauth");
-      if (authMode === "service_account") {
-        delete config.authenticatedAccount;
-        delete config.authenticatedAccountEmailVerified;
-        delete config.authenticatedAccountId;
-        delete config.scopeSet;
-        config = {
-          ...config,
-          serviceAccountStatus:
-            existing?.config.authMode === "service_account"
-              ? (existing.config.serviceAccountStatus ?? "pending")
-              : "pending",
-          ...(existing?.config.serviceAccountIdentity
-            ? { serviceAccountIdentity: existing.config.serviceAccountIdentity }
-            : {}),
-        };
-      }
       const audience = Array.isArray(config.audienceProjectIds)
         ? [...new Set(config.audienceProjectIds.filter((id): id is string => typeof id === "string"))]
         : [];
@@ -259,18 +234,11 @@ export async function saveIntegration(
         ...((config.folderIds as string[] | undefined) ?? []).map((id) => ({ kind: "folder" as const, id })),
         ...((config.sharedDriveIds as string[] | undefined) ?? []).map((id) => ({ kind: "drive" as const, id })),
       ];
-      const oldRoots = new Set([
-        ...((existing?.config.fileIds as string[] | undefined) ?? []).map((id) => `file:${id}`),
-        ...((existing?.config.folderIds as string[] | undefined) ?? []).map((id) => `folder:${id}`),
-        ...((existing?.config.sharedDriveIds as string[] | undefined) ?? []).map((id) => `drive:${id}`),
-      ]);
-      const added = roots.filter((root) => !oldRoots.has(`${root.kind}:${root.id}`));
-      const rootSelectionChanged = roots.length !== oldRoots.size || added.length > 0;
-      if (authMode === "service_account"
-          && (rootSelectionChanged || existing?.config.authMode !== "service_account")) {
-        config.serviceAccountStatus = "pending";
-        delete config.serviceAccountIdentity;
-      }
+      const addedTo = (prior: Record<string, unknown> | undefined) => {
+        const held = gdriveRootKeys(prior ?? {});
+        return roots.filter((root) => !held.has(`${root.kind}:${root.id}`));
+      };
+      const added = addedTo(existing?.config);
       if (added.length > 0) {
         if (authMode === "service_account") {
           // Local credentials are deliberately not uploaded. Their first fenced provider read
@@ -281,7 +249,10 @@ export async function saveIntegration(
           const authority = await acquireGdriveAdminTestAuthority({
             teamId: ctx.teamId, memberId: ctx.memberId, integrationName: name,
           });
-          const proof = await verifyGdriveTargets(authority, added);
+          // Prove every root the LOCKED snapshot lacks, not just those the earlier read lacked: a
+          // root removed in between must be verified again before it returns. The publication
+          // refuses if the snapshot's generation has moved since.
+          const proof = await verifyGdriveTargets(authority, addedTo(authority.config));
           if (proof.denied > 0) {
             return { ok: false, error: `${proof.denied} pasted root ID(s) are not accessible to this Google connection; the saved selection was unchanged` };
           }
@@ -1271,6 +1242,9 @@ export async function testGoogleDriveConnection(
   }
 }
 
+/** The most Picker documents one save verifies (one provider read each, under the Admin snapshot). */
+const GDRIVE_PICKER_MAX_DOCS = 100;
+
 /** Persist only Google Docs that Picker granted to this OAuth client and the server can verify.
  * Picker's browser token is intentionally never sent here; the encrypted refresh credential owner
  * performs the proof, and selection publication revalidates the same Admin/credential generation. */
@@ -1281,8 +1255,16 @@ export async function saveGoogleDrivePickerSelection(
 ): Promise<{ ok: boolean; error?: string; message?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
-  const ids = [...new Set(selectedIds.map((id) => id.trim()).filter(Boolean))].slice(0, 100);
+  const ids = [...new Set(selectedIds.map((id) => id.trim()).filter(Boolean))];
   if (ids.length === 0) return { ok: false, error: "No Google Docs were selected" };
+  // Refused whole, never truncated: the publication REPLACES the file list, so keeping only the
+  // first N would silently drop the rest while reporting success (AIO-1167 R42 F6).
+  if (ids.length > GDRIVE_PICKER_MAX_DOCS) {
+    return {
+      ok: false,
+      error: `${ids.length} Google Docs were selected; at most ${GDRIVE_PICKER_MAX_DOCS} can be saved at once. The saved selection was unchanged`,
+    };
+  }
   try {
     const authority = await acquireGdriveAdminTestAuthority({
       teamId: ctx.teamId, memberId: ctx.memberId, integrationName: name,
