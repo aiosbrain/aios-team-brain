@@ -789,7 +789,7 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
         scope: "https://www.googleapis.com/auth/drive.file",
       }), { status: 200, headers: { "content-type": "application/json" } }))
       .mockResolvedValueOnce(new Response(JSON.stringify({
-        sub: "exact-google-subject", email: memberRow.email, name: "Exact Member",
+        sub: "exact-google-subject", email: memberRow.email, email_verified: true, name: "Exact Member",
       }), { status: 200, headers: { "content-type": "application/json" } }));
 
     const callback = await oauthCallbackGET(new NextRequest(
