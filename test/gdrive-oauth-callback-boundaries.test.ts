@@ -150,7 +150,8 @@ describe("R43 F3: start requests exactly the chosen mode's scopes, bound into th
       const response = await startRequest(query);
       expect(response.status).toBe(400);
       expect(db.row).toBeNull();
-      expect(response.cookies.get(GDRIVE_OAUTH_BINDING_COOKIE)).toBeUndefined();
+      // A refusal is a plain Response: no binding cookie is ever set.
+      expect(response.headers.get("set-cookie")).toBeNull();
     },
   );
 });
