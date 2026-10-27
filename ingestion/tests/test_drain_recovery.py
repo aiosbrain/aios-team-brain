@@ -1,7 +1,8 @@
 """Bounded document recovery in the Drive drain (AIO-1167 R44 C6, C7, U5).
 
 C7 — retries. A failed document waits a capped exponential backoff with jitter computed from its
-PERSISTED attempt count (never a constant), and never less than a wait the provider or brain named.
+PERSISTED failure count (never a constant, and never inflated by runs in which it only waited behind
+another stream), and never less than a wait the provider or brain named.
 After a bounded number of automatic attempts it is EXHAUSTED: no longer retried automatically, still
 owed (it keeps counting as pending, so the run stays partial and absence stays withheld), until an
 explicit Admin run re-arms it or a new observation of the document resets it.
@@ -125,6 +126,51 @@ def test_exhausted_work_stops_retrying_but_stays_owed_until_rearmed_or_reobserve
         _fail_work(state, _row_work(state, namespace), "broken again")
     state.enqueue_work(namespace, 2, "doc", "upsert", {"modified": "later"})
     assert _row(state, namespace)["exhausted_at"] is None
+
+
+def test_waiting_behind_another_stream_spends_no_retry_budget(world, monkeypatch):
+    """A document WITHHELD (it waits on another stream's drain) is re-attempted every run without
+    failing. However long it waited, its first real failure backs off by the FIRST-failure delay and
+    does not exhaust it; the waiting still orders it behind fresher work (``attempts``)."""
+    monkeypatch.setattr("aios_ingest.gdrive_sync.random.random", lambda: 1.0)
+    state, namespace = world
+    state.enqueue_work(namespace, 2, "doc", "upsert", {})
+    for _ in range(_MAX_AUTOMATIC_ATTEMPTS + 2):
+        state.fail_work(_row_work(state, namespace), "cross-stream move unresolved", failure=False)
+    assert state.work_failures(_row_work(state, namespace)) == 0
+    assert _row(state, namespace)["attempts"] == _MAX_AUTOMATIC_ATTEMPTS + 2
+
+    before = datetime.now(timezone.utc)
+    exhausted = _fail_work(state, _row_work(state, namespace), "provider_read")
+    row = _row(state, namespace)
+    assert exhausted is False and row["exhausted_at"] is None
+    wait = (_parse(row["not_before"]) - before).total_seconds()
+    assert _RETRY_BASE_SECONDS - 2 <= wait <= _RETRY_BASE_SECONDS + 2
+    assert state.work_failures(_row_work(state, namespace)) == 1
+
+    # A new observation resets the failure count with the attempts.
+    state.enqueue_work(namespace, 2, "doc", "upsert", {"modified": "later"})
+    assert state.work_failures(_row_work(state, namespace)) == 0
+
+
+def test_a_state_file_from_before_the_failure_count_opens_with_none(tmp_path):
+    import sqlite3
+
+    path = str(tmp_path / "legacy.sqlite")
+    StateStore(path).close()
+    legacy = sqlite3.connect(path)
+    legacy.executescript(
+        "ALTER TABLE pending_work RENAME TO pending_work_new;"
+        "CREATE TABLE pending_work AS SELECT namespace,generation,item_key,action,observation_revision,payload,"
+        "page_id,attempts,not_before,last_error,acknowledged_at,superseded_at,exhausted_at,created_at,updated_at "
+        "FROM pending_work_new;"
+        "DROP TABLE pending_work_new;"
+    )
+    legacy.close()
+    reopened = StateStore(path)
+    columns = {r[1] for r in reopened._db.execute("PRAGMA table_info(pending_work)")}
+    assert "failures" in columns
+    reopened.close()
 
 
 # --- C6 / U5: the drain itself --------------------------------------------------------------------

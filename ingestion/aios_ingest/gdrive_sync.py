@@ -85,7 +85,7 @@ _CONTROL_OPTIONS = frozenset({
 })
 
 # Durable document retries (AIO-1167 R44 C7): capped exponential backoff with jitter, from the
-# PERSISTED attempt count, and a bounded number of automatic attempts. An exhausted obligation stays
+# PERSISTED failure count, and a bounded number of automatic failures. An exhausted obligation stays
 # owed — the run stays partial and absence stays withheld — until an explicit Admin run (Run now /
 # Retry) or a new observation of the document re-arms it.
 _RETRY_BASE_SECONDS = 60
@@ -107,10 +107,15 @@ def _fail_work(
 
     The next attempt is no earlier than the attempt-aware backoff and no earlier than a wait the
     provider or brain named (``retry_after``) — the later of the two, so Retry-After is always
-    honoured."""
+    honoured.
+
+    Backoff and exhaustion count FAILURES as persisted (``StateStore.work_failures``), not the
+    obligation's ``attempts``: a document withheld behind another stream's drain is re-attempted each
+    run without failing, and that waiting must not spend its retry budget."""
     from datetime import timedelta
 
-    not_before = datetime.now(timezone.utc) + timedelta(seconds=_backoff_seconds(work.attempts))
+    failures = state.work_failures(work)
+    not_before = datetime.now(timezone.utc) + timedelta(seconds=_backoff_seconds(failures))
     if retry_after:
         try:
             named = datetime.fromisoformat(retry_after.replace("Z", "+00:00"))
@@ -119,7 +124,7 @@ def _fail_work(
             not_before = max(not_before, named)
         except ValueError:
             pass
-    exhausted = work.attempts + 1 >= _MAX_AUTOMATIC_ATTEMPTS
+    exhausted = failures + 1 >= _MAX_AUTOMATIC_ATTEMPTS
     state.fail_work(work, detail, not_before=not_before.isoformat(), exhaust=exhausted)
     return exhausted
 
@@ -2539,8 +2544,9 @@ def _cross_stream_removal(
         and _document_loss_verified(source, work.item_key)
     ):
         return "absent"
-    # Attempted again each run, behind retries that have waited less.
-    state.fail_work(work, f"{_CROSS_STREAM_PENDING}: awaiting the other streams' next drain")
+    # Attempted again each run, behind retries that have waited less. Waiting is not failing: it
+    # spends none of the retry budget C7's backoff and exhaustion are computed from.
+    state.fail_work(work, f"{_CROSS_STREAM_PENDING}: awaiting the other streams' next drain", failure=False)
     return "withheld"
 
 

@@ -979,7 +979,8 @@ R44 contracts (AIO-1167):
   refused before any progress is used when that differs from the verified identity; watch renewal
   resolves the same namespace. Jobs bind local entries by immutable integration id (a same-name entry
   with another id runs nothing). Document retries back off exponentially with jitter from the
-  persisted attempt count and exhaust after 8 attempts into a still-owed state an Admin run re-arms; a
+  persisted FAILURE count (a document only waiting behind another stream's drain spends none of it)
+  and exhaust after 8 failures into a still-owed state an Admin run re-arms; a
   provider rate limit holds every stream of the account until its not-before; pre-dispatch budget
   expiry is a local stop; a started stream's 403/404 is isolated and withholds completion; checkpoints
   are bounded by the run deadline and defer unfit waits; a stale local sibling never overwrites newer

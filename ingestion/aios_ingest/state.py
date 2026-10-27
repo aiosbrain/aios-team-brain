@@ -148,6 +148,7 @@ CREATE TABLE IF NOT EXISTS pending_work (
   payload TEXT NOT NULL DEFAULT '{}',
   page_id TEXT,
   attempts INTEGER NOT NULL DEFAULT 0,
+  failures INTEGER NOT NULL DEFAULT 0,
   not_before TEXT,
   last_error TEXT,
   acknowledged_at TEXT,
@@ -385,6 +386,12 @@ class StateStore:
             # AIO-1167 R44 C7: automatic retries ran out; the obligation stays owed (and keeps the
             # run partial) until an explicit Admin run or a new observation re-arms it.
             self._db.execute("ALTER TABLE pending_work ADD COLUMN exhausted_at TEXT")
+        if "failures" not in work_columns:
+            # AIO-1167 R44 C7: the retry policy's own count — real failures only. `attempts` also
+            # counts a document merely WITHHELD (waiting on another stream's drain), which orders it
+            # behind fresher work but is not a failure. Existing rows start at zero: their old
+            # `attempts` cannot tell the two apart, and over-counting would exhaust work that never failed.
+            self._db.execute("ALTER TABLE pending_work ADD COLUMN failures INTEGER NOT NULL DEFAULT 0")
         outcome_columns = {r[1] for r in self._db.execute("PRAGMA table_info(page_obligation_outcomes)")}
         if "superseded_by_snapshot" not in outcome_columns:
             self._db.execute(
@@ -1257,7 +1264,7 @@ class StateStore:
             "INSERT INTO pending_work(namespace,generation,item_key,action,observation_revision,payload,page_id,created_at,updated_at) "
             "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(namespace,generation,item_key,action) DO UPDATE SET "
             "observation_revision=excluded.observation_revision,payload=excluded.payload,page_id=excluded.page_id,"
-            "attempts=0,not_before=NULL,last_error=NULL,acknowledged_at=NULL,superseded_at=NULL,"
+            "attempts=0,failures=0,not_before=NULL,last_error=NULL,acknowledged_at=NULL,superseded_at=NULL,"
             "exhausted_at=NULL,updated_at=datetime('now')",
             (namespace, generation, item_key, action, revision, serialized, page_id, now, now),
         )
@@ -1440,18 +1447,31 @@ class StateStore:
 
     def fail_work(
         self, work: PendingWork, error: str, *, not_before: str | None = None, exhaust: bool = False,
+        failure: bool = True,
     ) -> None:
-        """Record one failed attempt. The obligation stays owed either way; with ``exhaust`` it is no
-        longer picked automatically (``list_pending``) but still counts as pending work."""
+        """Record one attempt that did not complete. The obligation stays owed either way; with
+        ``exhaust`` it is no longer picked automatically (``list_pending``) but still counts as pending
+        work. ``failure=False`` records a document WITHHELD for a reason that is not its own failure
+        (it waits on another stream): it still moves behind fresher work, but spends none of the retry
+        budget (``failures``) that backoff and exhaustion are computed from (AIO-1167 R44 C7)."""
         self._db.execute(
-            "UPDATE pending_work SET attempts=attempts+1,last_error=?,not_before=?,"
+            "UPDATE pending_work SET attempts=attempts+1,failures=failures+?,last_error=?,not_before=?,"
             "exhausted_at=CASE WHEN ? THEN datetime('now') ELSE exhausted_at END,updated_at=datetime('now') "
             "WHERE namespace=? AND generation=? AND item_key=? AND action=? AND observation_revision=? "
             "AND superseded_at IS NULL",
-            (error[:1000], not_before, 1 if exhaust else 0, work.namespace, work.generation, work.item_key,
-             work.action, work.observation_revision),
+            (1 if failure else 0, error[:1000], not_before, 1 if exhaust else 0, work.namespace,
+             work.generation, work.item_key, work.action, work.observation_revision),
         )
         self._db.commit()
+
+    def work_failures(self, work: PendingWork) -> int:
+        """The PERSISTED count of real failures of this observation's obligation (0 if none is owed)."""
+        row = self._db.execute(
+            "SELECT failures FROM pending_work WHERE namespace=? AND generation=? AND item_key=? "
+            "AND action=? AND observation_revision=? AND superseded_at IS NULL",
+            (work.namespace, work.generation, work.item_key, work.action, work.observation_revision),
+        ).fetchone()
+        return int(row["failures"]) if row else 0
 
     def exhausted_count(self, namespace: str, generation: int) -> int:
         """Owed obligations whose automatic retries ran out (AIO-1167 R44 C7)."""
@@ -1465,7 +1485,7 @@ class StateStore:
         """An explicit Admin run: exhausted obligations become retryable again, from attempt zero.
         Their evidence (last error) is kept until the next attempt replaces it."""
         cur = self._db.execute(
-            "UPDATE pending_work SET exhausted_at=NULL,attempts=0,not_before=NULL,updated_at=datetime('now') "
+            "UPDATE pending_work SET exhausted_at=NULL,attempts=0,failures=0,not_before=NULL,updated_at=datetime('now') "
             "WHERE namespace=? AND generation=? AND acknowledged_at IS NULL AND superseded_at IS NULL "
             "AND exhausted_at IS NOT NULL",
             (namespace, generation),
