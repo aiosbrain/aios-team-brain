@@ -400,6 +400,7 @@ class GoogleDriveSource(PullOnlySource, Source):
         api_mode: str = "legacy",
         _drive_service: Any | None = None,
         _docs_service: Any | None = None,
+        _service_account_email: str | None = None,
     ):
         self._folder_ids = list(folder_ids or ([] if not folder_id else [folder_id]))
         self._file_ids = list(file_ids or [])
@@ -422,6 +423,10 @@ class GoogleDriveSource(PullOnlySource, Source):
         self._api_mode = api_mode
         self._drive = drive_service or _drive_service
         self._docs = docs_service or _docs_service
+        # The account the LOADED service-account credential authenticates as — read from the very
+        # credential object provider calls use, never from a path (AIO-1167 R44 F3). Injected only
+        # alongside injected services, by tests.
+        self._service_account_email = _service_account_email
         self._metadata_loader = metadata_loader
         self._revisions_loader = revisions_loader
         self._provider_gate = provider_gate
@@ -686,6 +691,7 @@ class GoogleDriveSource(PullOnlySource, Source):
             credentials = service_account.Credentials.from_service_account_file(
                 self._key_path, scopes=default_scopes
             )
+            self._service_account_email = str(getattr(credentials, "service_account_email", "") or "") or None
         else:
             raw = self._credential_json
             info = json.loads(raw) if isinstance(raw, str) else (raw or {})
@@ -693,6 +699,7 @@ class GoogleDriveSource(PullOnlySource, Source):
                 credentials = service_account.Credentials.from_service_account_info(
                     info, scopes=default_scopes
                 )
+                self._service_account_email = str(getattr(credentials, "service_account_email", "") or "") or None
             else:
                 raise ValueError(
                     "Google Drive credentials must be a local service account or a brokered access token"
@@ -733,6 +740,15 @@ class GoogleDriveSource(PullOnlySource, Source):
                 transport=docs_http,
             )
         return self._drive, self._docs
+
+    def service_account_identity(self) -> str | None:
+        """The service account the loaded credential authenticates as; ``None`` for OAuth.
+
+        Loads the credential (building the provider services) if that has not happened yet, so the
+        identity always describes the material provider calls will actually use.
+        """
+        self._services()
+        return self._service_account_email
 
     def _metadata(self, file_id: str) -> dict[str, Any]:
         if self._metadata_loader:

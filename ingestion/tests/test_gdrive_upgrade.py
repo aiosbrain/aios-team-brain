@@ -1440,6 +1440,7 @@ async def test_explicit_service_account_mode_never_uses_broker_and_requires_comp
         def __init__(self, **kwargs): self.kwargs = kwargs
         def _execute(self, request): return request.execute()
         def _metadata(self, file_id): return {"id": file_id}
+        def service_account_identity(self): return "svc@example.com"
         def _services(self):
             class Changes:
                 def getStartPageToken(self, **kwargs): return _Request({"startPageToken": "start"})

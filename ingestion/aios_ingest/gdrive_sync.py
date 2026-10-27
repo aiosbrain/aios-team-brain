@@ -78,6 +78,68 @@ def credential_identity(options: dict[str, Any]) -> str:
     return hashlib.sha256(subject.encode()).hexdigest()
 
 
+_CONTROL_OPTIONS = frozenset({
+    "credential_identity", "integration_id", "auth_mode", "service_account_status", "webhook_url",
+    "watch_ttl_seconds",
+})
+
+
+def provider_source_options(options: dict[str, Any]) -> dict[str, Any]:
+    """The options a provider source is built from: everything but coordinator control fields."""
+    return {key: value for key, value in options.items() if key not in _CONTROL_OPTIONS}
+
+
+class ServiceAccountBindingRefused(Exception):
+    """The loaded service-account credential cannot run this connection (AIO-1167 R44 F3)."""
+
+    def __init__(self, category: str):
+        super().__init__(category)
+        self.category = category
+
+
+def _account_hash(account: str) -> str:
+    return hashlib.sha256(account.strip().lower().encode()).hexdigest()
+
+
+def oauth_account_namespace(config: dict[str, Any], grant: dict[str, Any] | None, options: dict[str, Any]) -> str:
+    """The OAuth credential namespace, the same for the coordinator and watch renewal (R44 S2):
+    the broker's verified account (subject, else email) first, then the connection's recorded
+    account, then the configured fallback."""
+    account = (grant or {}).get("account") or {}
+    return str(
+        account.get("subject") or account.get("email")
+        or config.get("authenticatedAccountId") or config.get("authenticatedAccount")
+        or credential_identity(options)
+    )
+
+
+def service_account_namespace(source: Any, config: dict[str, Any], status: str | None) -> str:
+    """Bind a service-account run to the account its LOADED credential authenticates as.
+
+    A pathname is not an account: replacing the key file with another account's key keeps the path
+    and changes the account. So the namespace is derived from the credential object provider calls
+    will use, and — once the brain has verified an identity for this connection — that account must
+    be the verified one. A mismatch (or a verified status with no recorded identity) is refused
+    before any local or remote progress is restored or consumed; nothing is inferred deleted. The
+    same account with rotated key material keeps its namespace. Malformed material is refused as
+    invalid credentials; an unreadable file raises as before (a sanitized coordinator failure) —
+    both fail closed.
+    """
+    try:
+        loaded = source.service_account_identity()
+    except (ValueError, TypeError, KeyError):
+        raise ServiceAccountBindingRefused("service_account_credentials_invalid") from None
+    if not isinstance(loaded, str) or not loaded.strip():
+        raise ServiceAccountBindingRefused("service_account_credentials_invalid")
+    if status == "verified":
+        verified = str(config.get("serviceAccountIdentity") or "").strip().lower()
+        if not verified:
+            raise ServiceAccountBindingRefused("service_account_identity_unverified")
+        if verified != loaded.strip().lower():
+            raise ServiceAccountBindingRefused("service_account_identity_changed")
+    return _account_hash(loaded)
+
+
 @dataclass(frozen=True)
 class ChangePage:
     changes: list[dict[str, Any]]
@@ -706,8 +768,7 @@ async def run_gdrive_stream(
                     return IngestSummary(conn.name, failed=1, failure_categories={exc.code: 1},
                                          integration_id=integration_id)
                 options["granted_scopes"] = list(grant.get("scopes") or [])
-                account = grant.get("account") or {}
-                options["credential_identity"] = account.get("subject") or account.get("email") or options["credential_identity"]
+                options["credential_identity"] = oauth_account_namespace(config, grant, options)
                 token_provider = client.gdrive_token_provider(execution, grant)
             else:
                 valid_service_account = bool(options.get("service_account_key_path"))
@@ -724,13 +785,22 @@ async def run_gdrive_stream(
                                          integration_id=integration_id)
 
             provider_gate = client.gdrive_provider_gate(execution)
-            control = {"credential_identity", "integration_id", "auth_mode", "service_account_status", "webhook_url", "watch_ttl_seconds"}
-            source_options = {key: value for key, value in options.items() if key not in control}
+            source_options = provider_source_options(options)
             source = GoogleDriveSource(
                 **source_options, provider_gate=provider_gate, token_provider=token_provider,
             )
             if hasattr(source, "set_run_deadline"):
                 source.set_run_deadline(run_deadline)
+            if auth_mode == "service_account":
+                # Bound to the account the loaded key authenticates as, BEFORE any stream (local
+                # or remote) is restored or consumed under it (AIO-1167 R44 F3).
+                try:
+                    options["credential_identity"] = service_account_namespace(
+                        source, config, options.get("service_account_status"),
+                    )
+                except ServiceAccountBindingRefused as exc:
+                    return IngestSummary(conn.name, failed=1, failure_categories={exc.category: 1},
+                                         integration_id=integration_id)
             drive, _ = source._services()
             if auth_mode == "service_account" and options.get("service_account_status") == "pending":
                 try:
@@ -741,6 +811,13 @@ async def run_gdrive_stream(
                         return IngestSummary(
                             conn.name, failed=1,
                             failure_categories={"service_account_identity_unverified": 1},
+                            integration_id=integration_id,
+                        )
+                    # What Drive says this credential is must be the loaded credential's account.
+                    if options["credential_identity"] != _account_hash(identity):
+                        return IngestSummary(
+                            conn.name, failed=1,
+                            failure_categories={"service_account_identity_mismatch": 1},
                             integration_id=integration_id,
                         )
                     await client.verify_gdrive_service_account(execution, identity)

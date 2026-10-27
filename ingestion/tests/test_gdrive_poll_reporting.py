@@ -132,6 +132,11 @@ def drive_identity(about):
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
+        def service_account_identity(self):
+            # The account the loaded key authenticates as — the one Drive names, when it names one.
+            self._services()
+            return "svc@example.com"
+
         def _execute(self, request):
             if isinstance(about, Exception):
                 raise about
@@ -355,6 +360,9 @@ def raising_setup(message: str):
         def _services(self):
             raise RuntimeError(message)
 
+        def service_account_identity(self):
+            return self._services()  # as the real source: loading the credential builds services
+
     return Source
 
 
@@ -439,6 +447,9 @@ async def test_cancellation_during_the_stream_is_never_converted_into_a_report(t
 
         def _services(self):
             raise asyncio.CancelledError()
+
+        def service_account_identity(self):
+            return self._services()
 
     monkeypatch.setattr("aios_ingest.gdrive_sync.GoogleDriveSource", Cancelled)
     with pytest.raises(asyncio.CancelledError):

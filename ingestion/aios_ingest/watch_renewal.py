@@ -45,7 +45,9 @@ from . import brain_client
 from .brain_client import BrainClient, BrainError
 from .config import BrainSettings, Connection
 from .connector_state import renewal_document
-from .gdrive_sync import credential_identity
+from .gdrive_sync import (
+    ServiceAccountBindingRefused, oauth_account_namespace, provider_source_options, service_account_namespace,
+)
 from .selections import effective_gdrive_connection
 from .state import StateStore, StreamKey, verification_hash
 from .watch_lifecycle import (
@@ -404,18 +406,28 @@ async def _renew_connection(
             execution = await asyncio.wait_for(acquire, timeout=max(0.1, remaining))
             run = _Run(client, execution, state, settings.team, deadline, from_section(execution.progress))
             effective = effective_gdrive_connection(conn, execution.config, execution.integration_id)
-            account_id = str(
-                execution.config.get("authenticatedAccountId")
-                or execution.config.get("authenticatedAccount")
-                or credential_identity(effective.options)
-            )
             access_token = None
             auth_mode = str(effective.options.get("auth_mode") or "oauth")
+            # The account namespace is resolved exactly as the coordinator resolves it (AIO-1167 R44
+            # S2/F3), so a channel's notification marks the stream the coordinator actually reads.
             if auth_mode == "oauth":
                 grant = await run.bounded(client.broker_gdrive_access_token(execution))
                 access_token = grant["access_token"]
+                account_id = oauth_account_namespace(execution.config, grant, effective.options)
             elif not (effective.options.get("service_account_key_path") or effective.options.get("credential_json")):
                 return
+            else:
+                from .sources.gdrive import GoogleDriveSource
+
+                try:
+                    account_id = service_account_namespace(
+                        GoogleDriveSource(**provider_source_options(effective.options)),
+                        execution.config, effective.options.get("service_account_status"),
+                    )
+                except ServiceAccountBindingRefused as exc:
+                    # Fail closed: no channel under an account the coordinator will not run as.
+                    log.warning("Drive watch renewal for %s refused: %s", conn.name, exc.category)
+                    return
             provider_gate = client.gdrive_provider_gate(execution)
             closers.append(provider_gate.close)
             # The local projection is rebuilt from the brain's record — what a lost or stale local
