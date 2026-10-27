@@ -18,6 +18,7 @@ import {
   shouldScheduleMeetingBackfill,
 } from "@/lib/meetings/schedule-backfill";
 import { GdriveAuthorityError } from "@/lib/integrations/gdrive-authority";
+import { discoverGdriveContributorIdentities } from "@/lib/integrations/gdrive-identity-discovery";
 import { IdentitySnapshotChangedError } from "@/lib/identity/authority";
 import { ProjectPlanChangedError } from "@/lib/projects/project-row-locks";
 import { GdriveIngestStateChangedError } from "@/lib/ingest/gdrive-commit-locks";
@@ -146,6 +147,18 @@ export async function POST(req: NextRequest) {
   }
 
   try {
+    const hasExecutionHeaders = req.headers.has("x-aios-integration-id")
+      || req.headers.has("x-aios-execution-owner")
+      || req.headers.has("x-aios-execution-generation")
+      || req.headers.has("x-aios-execution-fence");
+    const execution = hasExecutionHeaders ? gdriveExecution(req) : undefined;
+    // A Drive commit first turns observed stable collaborator ids into durable identity links
+    // (AIO-1167 R44 F1) — only under the caller's LIVE execution (validated in the same transaction)
+    // and BEFORE the attribution snapshot below, which then sees them. Never for an external key.
+    if (execution && !isRestrictedTier(auth.memberTier)
+        && String(parsed.data.frontmatter?.source ?? "").toLowerCase() === "gdrive") {
+      await discoverGdriveContributorIdentities(db, auth, execution, parsed.data.frontmatter ?? {});
+    }
     // Resolve the item's author from its frontmatter at INGEST → attribute to the real human, never
     // silently to the ingesting connector. ONLY for trusted team-tier keys: an external (client) key
     // must not be able to attribute content to a team member (spoofing) — it keeps actor attribution.
@@ -155,11 +168,6 @@ export async function POST(req: NextRequest) {
     // Pass the key's tier: ingestItem resolves the item's tier from it on BOTH write paths, so an
     // external key can neither reclassify an existing item nor declare `team` on a new one.
     const pusherTier = isRestrictedTier(auth.memberTier) ? "external" : "team";
-    const hasExecutionHeaders = req.headers.has("x-aios-integration-id")
-      || req.headers.has("x-aios-execution-owner")
-      || req.headers.has("x-aios-execution-generation")
-      || req.headers.has("x-aios-execution-fence");
-    const execution = hasExecutionHeaders ? gdriveExecution(req) : undefined;
     const result = await ingestApiItem(
       db,auth,parsed.data,tier,opts,pusherTier,execution,
     );

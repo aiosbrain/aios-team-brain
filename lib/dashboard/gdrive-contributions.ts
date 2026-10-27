@@ -1,4 +1,5 @@
 import { providerIdentityState, resolveByProviderId, type IdentityMap } from "@/lib/identity/resolve";
+import { coalesceGdriveObservations } from "@/lib/ingest/gdrive-ledger";
 
 export interface GoogleDriveContributionEvidence {
   id: string;
@@ -38,9 +39,12 @@ export function googleDriveContributionEvidence(
   // member is an explicit "credit nobody" decision; a non-null lock deliberately collapses every
   // retained role/time observation to that person without discarding the distinct roles.
   if (correction.memberIdLocked && !correction.memberId) return [];
-  const refs = Array.isArray(frontmatter.contributions)
-    ? frontmatter.contributions as ContributionRef[]
-    : [];
+  // A stored ledger written before observations coalesced may still hold both forms of one
+  // observation: read it once (R44 S4).
+  const refs = coalesceGdriveObservations(Array.isArray(frontmatter.contributions)
+    ? (frontmatter.contributions as unknown[]).filter((row): row is ContributionRef =>
+        Boolean(row) && typeof row === "object" && !Array.isArray(row))
+    : []);
   const seen = new Set<string>();
   const rows: GoogleDriveContributionEvidence[] = [];
   for (const raw of refs) {

@@ -20,6 +20,24 @@ import { evaluateGdriveGrant, storedGrantCeiling } from "@/lib/integrations/gdri
 
 const LEASE_SECONDS = 10 * 60;
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+
+/**
+ * Where the broker refreshes. Always Google — except that the real-HTTP test tier (AIO-1167 R44 T2)
+ * points `AIOS_TEST_GOOGLE_TOKEN_URL` at a controlled provider fixture on THIS machine. The override
+ * is honoured only for a plain-http LOOPBACK URL, so no configuration can send a refresh credential
+ * to another host through it; anything else is ignored.
+ */
+function googleTokenUrl(): string {
+  const override = process.env.AIOS_TEST_GOOGLE_TOKEN_URL;
+  if (!override) return GOOGLE_TOKEN_URL;
+  try {
+    const url = new URL(override);
+    return url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname) ? url.toString() : GOOGLE_TOKEN_URL;
+  } catch {
+    return GOOGLE_TOKEN_URL;
+  }
+}
 
 export class GdriveAuthorityError extends Error {
   constructor(
@@ -749,6 +767,15 @@ export async function acquireGdriveExecution(
   });
 }
 
+/**
+ * Hold `ref` as this principal's live execution, under the connection lock order, for a caller that
+ * writes something other than content in the same transaction (the Drive identity discovery, AIO-1167
+ * R44 F1). Must run inside a transaction; refuses exactly as a content commit would.
+ */
+export async function lockLiveGdriveExecution(auth: ApiAuth, ref: GdriveExecutionRef): Promise<void> {
+  await assertLockedExecution(auth, ref);
+}
+
 async function assertLockedExecution(auth: ApiAuth, ref: GdriveExecutionRef): Promise<AuthorityRow> {
   requireConnectorPrincipal(auth);
   const row = await lockedAuthority(ref.integrationId, auth.teamId);
@@ -960,7 +987,7 @@ export async function brokerGoogleAccessToken(auth: ApiAuth, ref: GdriveExecutio
 
   let response: Response;
   try {
-    response = await fetch(GOOGLE_TOKEN_URL, {
+    response = await fetch(googleTokenUrl(), {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({

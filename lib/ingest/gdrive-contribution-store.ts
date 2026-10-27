@@ -9,7 +9,7 @@ import {
   type IdentityMap,
 } from "@/lib/identity/resolve";
 import { runSql } from "@/lib/db/pg/pool";
-import { gdriveObservationIdentity } from "@/lib/ingest/gdrive-ledger";
+import { coalesceGdriveObservations, gdriveObservationIdentity } from "@/lib/ingest/gdrive-ledger";
 
 type RawContribution = Record<string, unknown>;
 
@@ -30,9 +30,10 @@ const text = (value: unknown): string => typeof value === "string" ? value.trim(
  * remain durable and diagnosable, but cannot become Timeline evidence until repaired at the source. */
 export function normalizeGdriveContributions(frontmatter: Record<string, unknown>): NormalizedGdriveContribution[] {
   if (text(frontmatter.source).toLowerCase() !== "gdrive") return [];
-  const input = Array.isArray(frontmatter.contributions)
+  // An email-only observation proven to be a stable-id one is the same observation (R44 S4).
+  const input = coalesceGdriveObservations(Array.isArray(frontmatter.contributions)
     ? frontmatter.contributions.filter((r): r is RawContribution => Boolean(r) && typeof r === "object" && !Array.isArray(r))
-    : [];
+    : []);
   const out = new Map<string, NormalizedGdriveContribution>();
   for (const row of input) {
     const externalId = text(row.external_id) || null;
@@ -72,6 +73,8 @@ export function normalizeGdriveContributions(frontmatter: Record<string, unknown
 export interface StoredGdriveEvidence {
   evidence_key: string;
   external_id: string | null;
+  /** Read for coalescing a legacy email-only row (R44 S4); absent in older callers' rows. */
+  email?: string | null;
   role: string;
   source_at: string | null;
   source_at_raw: string;
@@ -89,9 +92,25 @@ export function supersededEvidenceKeys(
 ): string[] {
   const currentKeys = new Set(current.filter((row) => row.externalId).map((row) => row.evidenceKey));
   if (currentKeys.size === 0) return [];
+  // A stored EMAIL-ONLY row is the same observation as exactly one current stable-id row naming that
+  // email at the same role and instant (R44 S4): it is replaced too, never counted twice.
+  const stableByEmail = new Map<string, Set<string>>();
+  for (const row of current) {
+    if (!row.externalId || !row.email) continue;
+    const key = `${row.email}\u001f${row.role}\u001f${row.sourceAt ?? row.sourceAtRaw}`;
+    stableByEmail.set(key, (stableByEmail.get(key) ?? new Set()).add(row.externalId));
+  }
   const superseded: string[] = [];
   for (const row of stored) {
-    if (!row.external_id || currentKeys.has(row.evidence_key)) continue;
+    if (currentKeys.has(row.evidence_key)) continue;
+    if (!row.external_id) {
+      const email = (row.email ?? "").trim().toLowerCase();
+      const at = row.source_at ? new Date(row.source_at).toISOString() : row.source_at_raw;
+      if (email && stableByEmail.get(`${email}\u001f${row.role}\u001f${at}`)?.size === 1) {
+        superseded.push(row.evidence_key);
+      }
+      continue;
+    }
     const [asWrittenNow] = normalizeGdriveContributions({
       source: "gdrive",
       contributions: [{ external_id: row.external_id, role: row.role, at: row.source_at ?? row.source_at_raw }],
@@ -142,7 +161,7 @@ export async function syncGdriveContributionEvidence(
   // here cannot change before the writes below replace them.
   if (rows.some((row) => row.externalId)) {
     const stored = await db.from("gdrive_contribution_evidence")
-      .select("evidence_key,external_id,role,source_at,source_at_raw")
+      .select("evidence_key,external_id,email,role,source_at,source_at_raw")
       .eq("team_id", teamId).eq("item_id", itemId);
     if (stored.error) throw new Error(`gdrive contribution evidence read failed: ${stored.error.message}`);
     const superseded = supersededEvidenceKeys((stored.data ?? []) as StoredGdriveEvidence[], rows);

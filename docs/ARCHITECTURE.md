@@ -950,6 +950,42 @@ whose granted scopes leave that mode, rather than filtering the extra scope out 
 connection's status from the row it holds under the connection lock: only a connection it creates
 starts enabled; reconnecting is never an implicit Resume (R43 F2).
 
+R44 contracts (AIO-1167):
+- **Revocation never waits on a healthy audience.** Acquiring an execution does not check the
+  audience; `withGdriveExecutionCommit` classifies each commit: `publish` (content, placements) still
+  requires every destination to exist with a grant and refuses with the non-terminal
+  `audience_unavailable`; `reduce` (source reconciliation) takes the surviving audience rows in the
+  same lock order and needs no grant. A claim whose context unit is missing retires into a unit
+  created `retracted` (`retractItemUnit`), the barrier context backfill cannot reopen.
+- **Broker:** OAuth mode only (checked before refresh and at issuance); every refresh is held to the
+  credential's recorded `grant_mode`, or for a legacy credential to the narrowest mode its recorded
+  scopes fit, else reconnect. `AIOS_TEST_GOOGLE_TOKEN_URL` (loopback http only) points the broker at
+  the HTTP tier's provider fixture.
+- **Identity:** `buildIdentityMap({ includeDeactivated })` resolves a deactivated member's existing
+  aliases/identities for ESTABLISHED credit (attribution snapshot, Drive evidence store and display);
+  linking and identity sync keep the active-only default, so offboarding is not an unlink and a
+  deactivated member gets no new link. A fenced Drive push first links an observed `permission:` id
+  whose email names exactly one active member (`lib/integrations/gdrive-identity-discovery.ts` →
+  `discoverMemberIdentity`), only for an id never reviewed — links, manual mappings and unlink
+  tombstones stand; a disagreeing email is an audited conflict, never a transfer. An email-only
+  observation coalesces into the one stable-id observation carrying that email at the same role and
+  instant (`coalesceGdriveObservations`, used by the ledger, the evidence store and the Timeline).
+- **Sidecar:** a service-account run is namespaced by the account its LOADED key authenticates as and
+  refused before any progress is used when that differs from the verified identity; watch renewal
+  resolves the same namespace. Jobs bind local entries by immutable integration id (a same-name entry
+  with another id runs nothing). Document retries back off exponentially with jitter from the
+  persisted attempt count and exhaust after 8 attempts into a still-owed state an Admin run re-arms; a
+  provider rate limit holds every stream of the account until its not-before; pre-dispatch budget
+  expiry is a local stop; a started stream's 403/404 is isolated and withholds completion; checkpoints
+  are bounded by the run deadline and defer unfit waits; a stale local sibling never overwrites newer
+  acknowledged progress. Renewal admits a channel within interval + run budget + skew of expiry, with a
+  catch-up sweep for shorter lifetimes. `sync`, `schedule` and the webhook share one state DB
+  (`state_path.py`), and a notification needs a known resource, hash and unexpired channel.
+- **Docs extraction:** header/footer segments are rendered with segment provenance (malformed →
+  incomplete); rich-link chips render their returned link; documents are read
+  `PREVIEW_WITHOUT_SUGGESTIONS`.
+- **Audit:** a successful `POST /api/v1/graph-query` records a sanitized `graph.query` audit again.
+
 `GET /api/v1/integrations` remains selection-only, and a Drive row's account and selection metadata
 (account email/subject/verified flag, scopes, selected ids, audience projects, service-account
 identity) is returned only to that connection's LIVE BOUND connector principal; every other key —

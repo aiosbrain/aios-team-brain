@@ -186,6 +186,78 @@ export async function setMemberIdentity(
   });
 }
 
+export type DiscoveredIdentityOutcome = "linked" | "exists" | "conflict" | "reviewed" | "ineligible";
+
+/**
+ * An evidence-backed AUTOMATIC link of a stable provider identity (AIO-1167 R44 F1) — far narrower
+ * than `setMemberIdentity`. It creates a link only for an identity that has NEVER been reviewed: no
+ * mapping row and no mapping state at all, so a deliberate unlink tombstone, an existing link, or a
+ * manual mapping always wins. It never remaps (a different existing owner is a `conflict`, audited,
+ * nothing changes) and never links a deactivated member or a connector. A created link goes through
+ * the same mapping-state revision, repair obligation and epoch protocol as every other link.
+ * The caller decides the evidence; this owner decides only whether a link may be created.
+ */
+export async function discoverMemberIdentity(
+  admin: DbClient,
+  teamId: string,
+  memberId: string,
+  input: { provider: string; externalId: string; email?: string | null; handle?: string | null },
+  opts: { actor?: IdentityActor } = {},
+): Promise<DiscoveredIdentityOutcome> {
+  const provider = input.provider.trim().toLowerCase();
+  const externalId = input.externalId.trim();
+  if (!provider || !externalId) throw new Error("provider and externalId are required");
+  if (provider === "gdrive" && !/^permission:[^\s:][^\s]*$/i.test(externalId)) {
+    throw new Error("automatic Google Drive links are made only for permission: identities");
+  }
+  const email = (input.email ?? "").trim().toLowerCase();
+  const handle = (input.handle ?? "").trim();
+  return withIdentityMutationBoundary(teamId, async () => {
+    await runSql(`select pg_advisory_xact_lock(hashtextextended($1, 0))`, [
+      `${teamId}:identity:${provider}:${externalId}`,
+    ]);
+    const { rows: members } = await runSql<{ status: string; is_connector: boolean }>(
+      `select status,is_connector from members where team_id=$1 and id=$2 for share`,
+      [teamId, memberId],
+    );
+    const target = members[0];
+    if (!target || target.status === "disabled" || target.is_connector) return "ineligible";
+    const { rows: existing } = await runSql<{ member_id: string }>(
+      `select member_id from member_identities where team_id=$1 and provider=$2 and external_id=$3 for update`,
+      [teamId, provider, externalId],
+    );
+    if (existing[0]) {
+      if (existing[0].member_id === memberId) return "exists";
+      await audit(admin, {
+        team_id: teamId, actor_kind: opts.actor?.kind ?? "system", member_id: opts.actor?.memberId ?? null,
+        action: "identity.discovery_conflict", target_type: "member", target_id: memberId,
+        meta: { provider, external_id: externalId, mapped_member_id: existing[0].member_id },
+      });
+      return "conflict";
+    }
+    const { rows: states } = await runSql<{ state: string }>(
+      `select state from member_identity_mapping_state
+        where team_id=$1 and provider=$2 and external_id=$3 for update`,
+      [teamId, provider, externalId],
+    );
+    if (states[0]) return "reviewed"; // an unlink tombstone (or any prior decision) stands
+    await runSql(
+      `insert into member_identities(team_id,member_id,provider,external_id,handle,email)
+       values ($1,$2,$3,$4,$5,$6)`,
+      [teamId, memberId, provider, externalId, handle, email],
+    );
+    const mappingRevision = await advanceIdentityMappingState({
+      teamId, provider, externalId, memberId, state: "linked",
+    });
+    await audit(admin, {
+      team_id: teamId, actor_kind: opts.actor?.kind ?? "system", member_id: opts.actor?.memberId ?? null,
+      action: "identity.discovered", target_type: "member", target_id: memberId,
+      meta: { provider, external_id: externalId, mapping_revision: mappingRevision },
+    });
+    return "linked";
+  });
+}
+
 /** Remove a provider identity mapping (admins correcting/clearing a link). Audited; no-op if absent. */
 export async function removeMemberIdentity(
   admin: DbClient,

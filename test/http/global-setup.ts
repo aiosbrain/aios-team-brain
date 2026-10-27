@@ -1,5 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { resolve } from "node:path";
 import { once } from "node:events";
 import { BASE_URL, HTTP_TEST_PORT as PORT } from "./server-url";
@@ -25,6 +27,38 @@ async function waitForReady(): Promise<void> {
   throw new Error(`HTTP tier: server at ${BASE_URL} never became ready (no 401 on /api/v1/items)`);
 }
 
+/**
+ * A controlled Google OAuth token endpoint on loopback (AIO-1167 R44 T2). The server's broker is
+ * pointed at it through `AIOS_TEST_GOOGLE_TOKEN_URL` (honoured for loopback only). A refresh token
+ * named `revoked-refresh` is refused `invalid_grant`; any other is exchanged for a short-lived token
+ * that names the refresh token it came from, so a test can tell which credential the broker used.
+ */
+async function startFakeGoogle(): Promise<Server> {
+  const server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      const form = new URLSearchParams(body);
+      const refresh = form.get("refresh_token") ?? "";
+      res.setHeader("content-type", "application/json");
+      if (req.method !== "POST" || form.get("grant_type") !== "refresh_token" || !refresh) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ error: "invalid_request" }));
+      } else if (refresh === "revoked-refresh") {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ error: "invalid_grant" }));
+      } else {
+        res.end(JSON.stringify({
+          access_token: `fake-access-for-${refresh}`, expires_in: 600,
+          scope: "https://www.googleapis.com/auth/drive.file",
+        }));
+      }
+    });
+  });
+  await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  return server;
+}
+
 export default async function setup(): Promise<() => Promise<void>> {
   if (!existsSync(resolve(".next/BUILD_ID"))) {
     throw new Error(
@@ -32,6 +66,10 @@ export default async function setup(): Promise<() => Promise<void>> {
         "Run `npm run build` first, or use `npm run test:http:local` which builds for you."
     );
   }
+
+  const fakeGoogle = await startFakeGoogle();
+  process.env.AIOS_TEST_GOOGLE_TOKEN_URL =
+    `http://127.0.0.1:${(fakeGoogle.address() as AddressInfo).port}/token`;
 
   const nextBin = resolve("node_modules/.bin/next");
   // The MCP outer runner owns a detached Vitest process group. Keep its server
@@ -64,6 +102,7 @@ export default async function setup(): Promise<() => Promise<void>> {
         /* already gone */
       }
     }
+    fakeGoogle.close();
     throw e;
   }
 
@@ -79,6 +118,7 @@ export default async function setup(): Promise<() => Promise<void>> {
         if (server.signalCode === "SIGKILL") throw new Error("HTTP server required forced termination");
       } finally { clearTimeout(timeout); }
     }
+    await new Promise<void>((resolveClose) => fakeGoogle.close(() => resolveClose()));
     console.log("HTTP_SERVER_CLEANUP_OK");
   };
 }
