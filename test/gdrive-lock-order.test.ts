@@ -129,7 +129,7 @@ import {
   type ProjectSqlExecutor,
 } from "@/lib/projects/project-row-locks";
 
-function use(connection: ScriptedConnection): ScriptedConnection {
+function track(connection: ScriptedConnection): ScriptedConnection {
   h.connection = connection;
   return connection;
 }
@@ -309,7 +309,7 @@ describe("one key per Drive path identity", () => {
     await lockIngestIdentity(session, TEAM, STORAGE, PATH);
     const sessionLock = seen.find((entry) => entry.sql.includes("pg_advisory_xact_lock"))!;
 
-    const c = use(new ScriptedConnection(driveDatabase()));
+    const c = track(new ScriptedConnection(driveDatabase()));
     await planAndLock();
     const ambientLock = which(c.log, isPathLock).find((entry) =>
       entry.params[1] === drivePathIdentityKey(TEAM, { projectId: STORAGE, path: PATH }))!;
@@ -338,7 +338,7 @@ describe("one key per Drive path identity", () => {
 describe("the plan: every project, path and item, read without a lock", () => {
   it("takes no lock, and names the projects a mapping and its candidates live in", async () => {
     const elsewhere = project(9);
-    const c = use(new ScriptedConnection(driveDatabase({
+    const c = track(new ScriptedConnection(driveDatabase({
       mappings: [{ item_id: item(7), project_id: elsewhere, canonical_path: "gdrive/kept.md" }],
       mappedItem: [[item(7), elsewhere]],
       discoveries: [[item(1), [item(7), elsewhere]]],
@@ -357,11 +357,11 @@ describe("the plan: every project, path and item, read without a lock", () => {
   });
 
   it("recovers an unmapped document by provenance; a mapped one by its mapping, never by a scan", async () => {
-    const unmapped = use(new ScriptedConnection(driveDatabase()));
+    const unmapped = track(new ScriptedConnection(driveDatabase()));
     await withTransaction(planTheDocument);
     expect(which(unmapped.work, isProvenanceRead).length).toBeGreaterThan(0);
 
-    const mapped = use(new ScriptedConnection(driveDatabase({
+    const mapped = track(new ScriptedConnection(driveDatabase({
       mappings: [{ item_id: item(1), project_id: STORAGE, canonical_path: PATH }],
     })));
     const plan = await withTransaction(planTheDocument);
@@ -385,7 +385,7 @@ describe("the plan: where the document already IS joins the path set", () => {
   };
 
   it("a historical item's own location is planned, its project referenced, and both are held and revalidated", async () => {
-    const c = use(new ScriptedConnection(withLegacyItem()));
+    const c = track(new ScriptedConnection(withLegacyItem()));
     const { plan, locks } = await planAndLock();
     const legacyKey = drivePathIdentityKey(TEAM, { projectId: elsewhere, path: "gdrive/legacy.md" });
     expect(plan.candidates).toEqual([{ id: item(7), projectId: elsewhere, path: "gdrive/legacy.md" }]);
@@ -405,14 +405,14 @@ describe("the plan: where the document already IS joins the path set", () => {
   });
 
   it("a historical item that MOVED before its row lock abandons the attempt", async () => {
-    use(new ScriptedConnection(withLegacyItem({ ...legacy, path: "gdrive/renamed.md" })));
+    track(new ScriptedConnection(withLegacyItem({ ...legacy, path: "gdrive/renamed.md" })));
     await expect(planAndLock()).rejects.toBeInstanceOf(GdriveIngestStateChangedError);
   });
 });
 
 describe("ingest: provider → mapping → paths → attribution advisories → item rows", () => {
   it("takes every level in order, sorted within a level, each wait under the 10s bound", async () => {
-    const c = use(new ScriptedConnection(driveDatabase({ discoveries: [[item(2), item(1)]] })));
+    const c = track(new ScriptedConnection(driveDatabase({ discoveries: [[item(2), item(1)]] })));
     const before: string[] = [];
     const { locks } = await planAndLock({ beforeAttributionLock: async (id: string) => { before.push(id); } });
 
@@ -459,7 +459,7 @@ describe("ingest: provider → mapping → paths → attribution advisories → 
 
   it("a tombstoned mapping: its restore path is held and its item id is advisory-locked with no row to lock", async () => {
     const elsewhere = project(9);
-    const c = use(new ScriptedConnection(driveDatabase({
+    const c = track(new ScriptedConnection(driveDatabase({
       mappings: [{ item_id: item(7), project_id: elsewhere, canonical_path: "gdrive/kept--drive-0123456789.md" }],
     })));
     const { plan, locks } = await planAndLock();
@@ -475,7 +475,7 @@ describe("ingest: provider → mapping → paths → attribution advisories → 
 
 describe("a plan that does not survive its locks abandons the attempt", () => {
   const abandoned = async (database: ReturnType<typeof driveDatabase>) => {
-    const c = use(new ScriptedConnection(database));
+    const c = track(new ScriptedConnection(database));
     const error = await planAndLock().catch((caught) => caught);
     expect(error).toBeInstanceOf(GdriveIngestStateChangedError);
     expect(error).toMatchObject({ code: "gdrive-ingest-state-changed" });
@@ -508,7 +508,7 @@ describe("a plan that does not survive its locks abandons the attempt", () => {
   });
 
   it("a planned project that is not held is never replaced by a late lock", async () => {
-    const c = use(new ScriptedConnection(driveDatabase({
+    const c = track(new ScriptedConnection(driveDatabase({
       mappings: [{ item_id: item(7), project_id: project(9), canonical_path: PATH }],
     })));
     const error = await withTransaction(async () => {
@@ -551,7 +551,7 @@ describe("a plan that does not survive its locks abandons the attempt", () => {
 describe("the whole Drive ingest: identity → connection → the complete project set, then the document", () => {
   it("plans after the connection authority, takes every project before the provider, and none after", async () => {
     const elsewhere = project(9);
-    const c = use(new ScriptedConnection(driveDatabase({
+    const c = track(new ScriptedConnection(driveDatabase({
       audience: [project(5), project(1)],
       mappings: [{ item_id: item(7), project_id: elsewhere, canonical_path: "gdrive/kept.md" }],
       mappedItem: [[item(7), elsewhere]],
@@ -604,7 +604,7 @@ describe("the whole Drive ingest: identity → connection → the complete proje
   });
 
   it("refuses a Drive payload without its connection before taking any lock", async () => {
-    const c = use(new ScriptedConnection(driveDatabase()));
+    const c = track(new ScriptedConnection(driveDatabase()));
     await expect(ingestApiItem(NOT_A_DATABASE, auth, drivePayload(), "team", undefined, "team"))
       .rejects.toMatchObject({ code: "connector_principal_required", status: 403 });
     await expect(ingestApiItem(NOT_A_DATABASE, auth, drivePayload(), "team", undefined, "team", { ...execution, integrationId: OWNER }))
@@ -613,7 +613,7 @@ describe("the whole Drive ingest: identity → connection → the complete proje
   });
 
   it("a stale execution is refused at the connection authority, before planning or any project, provider or item lock", async () => {
-    const c = use(new ScriptedConnection(driveDatabase()));
+    const c = track(new ScriptedConnection(driveDatabase()));
     await expect(ingestApiItem(NOT_A_DATABASE, auth, drivePayload(), "team", undefined, "team", { ...execution, fence: 4 }))
       .rejects.toMatchObject({ code: "stale_execution", status: 409 });
     expect(which(c.work, isMappingRead)).toEqual([]);
@@ -624,7 +624,7 @@ describe("the whole Drive ingest: identity → connection → the complete proje
 
   it("RETRYABLE: the first attempt rolls back whole and the second plans again from the connection authority", async () => {
     // Attempt 1 plans item 1, which is gone by the row lock. Attempt 2 plans an empty path.
-    const c = use(new ScriptedConnection(driveDatabase({ discoveries: [[item(1)], [], []], rowLocks: [[]] })));
+    const c = track(new ScriptedConnection(driveDatabase({ discoveries: [[item(1)], [], []], rowLocks: [[]] })));
     const attempts: number[] = [];
     await expect(ingestApiItem(new PgClient(), auth, drivePayload(), "team", undefined, "team", execution, {
       beforeDriveAttempt: async (attempt) => { attempts.push(attempt); },
@@ -648,7 +648,7 @@ describe("the whole Drive ingest: identity → connection → the complete proje
   });
 
   it("a plan that fails on BOTH attempts aborts by name after exactly two", async () => {
-    const c = use(new ScriptedConnection(driveDatabase({ discoveries: [[item(1)]], rowLocks: [[]] })));
+    const c = track(new ScriptedConnection(driveDatabase({ discoveries: [[item(1)]], rowLocks: [[]] })));
     await expect(ingestApiItem(new PgClient(), auth, drivePayload(), "team", undefined, "team", execution))
       .rejects.toBeInstanceOf(GdriveIngestStateChangedError);
     expect(c.count("begin")).toBe(2);
@@ -659,7 +659,7 @@ describe("the whole Drive ingest: identity → connection → the complete proje
     ["a project row", (sql: string) => / for (key share|share|no key update)$/.test(sql) && sql.includes("from projects")],
     ["the provider identity", (_sql: string, params: unknown[]) => String(params[0]).startsWith(`${TEAM}:gdrive:`)],
   ])("BOUNDED TIMEOUT: %s that times out fails the ingest once, with no retry and nothing below it taken", async (_name, blocked) => {
-    const c = use(new ScriptedConnection(driveDatabase({
+    const c = track(new ScriptedConnection(driveDatabase({
       fail: (sql, params) => (blocked(sql, params) ? sqlError("canceling statement due to lock timeout", "55P03") : null),
     })));
     await expect(ingestApiItem(new PgClient(), auth, drivePayload(), "team", undefined, "team", execution))
@@ -676,7 +676,7 @@ describe("the whole Drive ingest: identity → connection → the complete proje
     ["a client that cannot run the publishing transaction", () => NOT_A_DATABASE, drivePayload(), STOPS_AFTER_LOCKS],
   ] as const)("VALIDATE BEFORE MUTATION: %s is refused after the connection authority and before any project is created or locked", async (_name, client, payload, refusal) => {
     // The storage project does not exist: a commit that got that far would create it.
-    const c = use(new ScriptedConnection((sql, params) => {
+    const c = track(new ScriptedConnection((sql, params) => {
       if (isSourceProjectRead({ sql, params, lockTimeout: "" })) return [];
       if (isProjectCreate({ sql, params, lockTimeout: "" })) return [{ id: STORAGE }];
       return driveDatabase()(sql, params);
@@ -693,7 +693,7 @@ describe("the whole Drive ingest: identity → connection → the complete proje
   });
 
   it("an ABSENT storage project is created inside the commit, before the project pass, and locked for write with the rest", async () => {
-    const c = use(new ScriptedConnection((sql, params) => {
+    const c = track(new ScriptedConnection((sql, params) => {
       if (isSourceProjectRead({ sql, params, lockTimeout: "" })) return [];
       if (isProjectCreate({ sql, params, lockTimeout: "" })) return [{ id: STORAGE }];
       return driveDatabase()(sql, params);
@@ -725,7 +725,7 @@ describe("the whole Drive ingest: identity → connection → the complete proje
 
 describe("the public wrapper: project-before-item, so it holds nothing of its own", () => {
   it("a payload that is not Drive-sourced takes NO lock before ingestItem — only an unlocked read", async () => {
-    const c = use(new ScriptedConnection(driveDatabase()));
+    const c = track(new ScriptedConnection(driveDatabase()));
     const payload = { ...drivePayload(), frontmatter: { source: "notion" } } as ItemPayload;
     await expect(ingestApiItem(NOT_A_DATABASE, auth, payload, "team", undefined, "team")).rejects.toThrow(STOPS_AFTER_LOCKS);
     // `ingestItem` stopped before its project acquisition, so this is everything the wrapper did —
@@ -753,7 +753,7 @@ describe("the public wrapper: project-before-item, so it holds nothing of its ow
       { item_source: "notion", drive_mapped: true },
       { item_source: null, drive_mapped: true },
     ]) {
-      const c = use(new ScriptedConnection((sql) => (sql.includes("as item_source") ? [stored] : [])));
+      const c = track(new ScriptedConnection((sql) => (sql.includes("as item_source") ? [stored] : [])));
       const payload = { ...drivePayload(), frontmatter: {} } as ItemPayload;
       await expect(ingestApiItem(NOT_A_DATABASE, auth, payload, "team", undefined, "team", ref))
         .rejects.toMatchObject({ code, status: 403 });
@@ -764,7 +764,7 @@ describe("the public wrapper: project-before-item, so it holds nothing of its ow
 
 describe("project rows: one ascending pass, each row once in its final mode, no upgrade", () => {
   async function commit(audience: string[], plan?: GdriveCommitProjectPlan) {
-    const c = use(new ScriptedConnection(driveDatabase({ audience })));
+    const c = track(new ScriptedConnection(driveDatabase({ audience })));
     let seen: unknown;
     await withGdriveExecutionCommit(auth, execution, async (approved) => {
       seen = approved;
@@ -836,7 +836,7 @@ describe("project rows: one ascending pass, each row once in its final mode, no 
   });
 
   it("a planned project that is gone under its lock is reported as not held, not assumed", async () => {
-    const c = use(new ScriptedConnection((sql, params) => {
+    const c = track(new ScriptedConnection((sql, params) => {
       const reply = driveDatabase({ audience: [project(1)] })(sql, params);
       // The storage row lock finds nothing.
       return /for no key update$/.test(sql) ? [] : reply;
@@ -851,7 +851,7 @@ describe("project rows: one ascending pass, each row once in its final mode, no 
     // A commit locks its connection and then its bound connector MEMBER. A roster writer holds the
     // identity authority before a member row, and a hard deletion's foreign-key actions then reach
     // the connection — so the authority is the head of this order whether or not a revision is checked.
-    const c = use(new ScriptedConnection(driveDatabase()));
+    const c = track(new ScriptedConnection(driveDatabase()));
     await withGdriveExecutionCommit(auth, execution, async () => undefined);
     const work = c.work;
     expect(isIdentityLock(work[0])).toBe(true);
@@ -862,7 +862,7 @@ describe("project rows: one ascending pass, each row once in its final mode, no 
   });
 
   it("the lock_timeout is back to the caller's value for the commit body", async () => {
-    const c = use(new ScriptedConnection(driveDatabase()));
+    const c = track(new ScriptedConnection(driveDatabase()));
     await withGdriveExecutionCommit(auth, execution, async () => {
       await runSql("DEPENDENT WRITE");
     });
@@ -872,7 +872,7 @@ describe("project rows: one ascending pass, each row once in its final mode, no 
 
 describe("reconciliation: connection → every provider → attribution advisories → the complete item set, then the first write", () => {
   it("takes all provider locks (sorted), their mapping rows, every attribution advisory, then every item row in id order — bounded — before writing", async () => {
-    const c = use(new ScriptedConnection((sql) => {
+    const c = track(new ScriptedConnection((sql) => {
       if (sql.startsWith("select provider_id from gdrive_item_claims")) {
         return [{ provider_id: "b" }, { provider_id: "c" }, { provider_id: "a" }];
       }
@@ -917,7 +917,7 @@ describe("reconciliation: connection → every provider → attribution advisori
   });
 
   it("providers that name no item take no advisory and no item row", async () => {
-    const c = use(new ScriptedConnection((sql) =>
+    const c = track(new ScriptedConnection((sql) =>
       (sql.startsWith("select provider_id from gdrive_item_claims") ? [{ provider_id: "a" }] : [])));
     await stageGdriveReconciliation(NOT_A_DATABASE, TEAM, {
       connectionId: INTEGRATION, removedProviderIds: ["a"], reason: "removed upstream",
@@ -929,7 +929,7 @@ describe("reconciliation: connection → every provider → attribution advisori
   });
 
   it("takes no provider or item lock when nothing is retired", async () => {
-    const c = use(new ScriptedConnection());
+    const c = track(new ScriptedConnection());
     await stageGdriveReconciliation(NOT_A_DATABASE, TEAM, {
       connectionId: INTEGRATION, removedProviderIds: ["a"], reason: "noop",
     });
@@ -941,7 +941,7 @@ describe("reconciliation: connection → every provider → attribution advisori
 
 describe("project rows for every ingest: planned by unlocked reads, created or abandoned, locked once", () => {
   const exec = (respond: (sql: string, params: unknown[], log: Entry[]) => Reply) => {
-    const c = use(new ScriptedConnection(respond));
+    const c = track(new ScriptedConnection(respond));
     const run: ProjectSqlExecutor = async <T,>(text: string, params: unknown[] = []) =>
       (await c.query(text, params)) as unknown as { rows: T[] };
     return { c, run };
@@ -1034,7 +1034,7 @@ describe("an ordinary ingest: project acquisition is inside the publishing trans
     ).finally(() => expect(c.release).toHaveBeenCalled());
 
   it("plans by unlocked reads, creates the absent project in the transaction, and takes the whole set once", async () => {
-    const c = use(new ScriptedConnection(ordinaryDatabase()));
+    const c = track(new ScriptedConnection(ordinaryDatabase()));
     await run(c);
 
     const begin = c.log.findIndex((entry) => entry.sql === "begin");
@@ -1089,7 +1089,7 @@ describe("an ordinary ingest: project acquisition is inside the publishing trans
   });
 
   it("BOUNDED TIMEOUT: a held item-attribution advisory fails the ingest once (55P03) — after project and path, before the item row, with no retry", async () => {
-    const c = use(new ScriptedConnection((sql, params) =>
+    const c = track(new ScriptedConnection((sql, params) =>
       (isAttributionLock({ sql, params, lockTimeout: "" })
         ? sqlError("canceling statement due to lock timeout", "55P03")
         : ordinaryDatabase()(sql, params))));
@@ -1116,7 +1116,7 @@ describe("an ordinary ingest: project acquisition is inside the publishing trans
   });
 
   it("ROLLBACK: a failure after the project setup takes the created project with it", async () => {
-    const c = use(new ScriptedConnection(ordinaryDatabase({ pointerReadable: false })));
+    const c = track(new ScriptedConnection(ordinaryDatabase({ pointerReadable: false })));
     const error = await run(c);
     expect(error?.message).toMatch(/graph pointer/);
     expect(which(c.work, isProjectCreate)).toHaveLength(1);
@@ -1133,7 +1133,7 @@ describe("an ordinary ingest: project acquisition is inside the publishing trans
     ["the source project is gone under its row lock", (ids: string[]) => ids.filter((id) => id !== STORAGE).map(lockedProjectRow)],
     ["a planned system destination is gone under its row lock", (ids: string[]) => ids.filter((id) => id !== project(9)).map(lockedProjectRow)],
   ])("PLAN CHANGED: %s — abandoned by name, not retried, nothing below it taken", async (_name, lockedRows) => {
-    const c = use(new ScriptedConnection(ordinaryDatabase({ lockedRows })));
+    const c = track(new ScriptedConnection(ordinaryDatabase({ lockedRows })));
     const error = await run(c);
     expect(error).toBeInstanceOf(ProjectPlanChangedError);
     // One attempt: an invalid plan is not one of the context engine's retryable causes.
@@ -1146,7 +1146,7 @@ describe("an ordinary ingest: project acquisition is inside the publishing trans
   });
 
   it("BOUNDED TIMEOUT: a held project row fails the ingest once (55P03), with no retry", async () => {
-    const c = use(new ScriptedConnection((sql, params) =>
+    const c = track(new ScriptedConnection((sql, params) =>
       (/ for no key update$/.test(sql)
         ? sqlError("canceling statement due to lock timeout", "55P03")
         : ordinaryDatabase()(sql, params))));
@@ -1204,7 +1204,7 @@ describe("a DIRECT Drive ingest takes the fenced order: provider → mapping →
   };
 
   it("ABSENT MAPPING: provider advisory, then the (absent) mapping row, then both paths — and only then is the (rolled-back) mapping written, with no connection id, before the refusal", async () => {
-    const c = use(new ScriptedConnection(directDatabase()));
+    const c = track(new ScriptedConnection(directDatabase()));
     const outcome = await direct();
     // AIO-1167: having taken the fenced order, the direct writer is refused on its locked target —
     // even for a first creation under an id it minted — and commits nothing.
@@ -1254,7 +1254,7 @@ describe("a DIRECT Drive ingest takes the fenced order: provider → mapping →
 
   it("CANONICAL ELSEWHERE: requested from one project, living in another — the canonical project by key, its path in the set, the item held before the session reads", async () => {
     const elsewhere = project(9);
-    const c = use(new ScriptedConnection(directDatabase({
+    const c = track(new ScriptedConnection(directDatabase({
       mappings: [{ item_id: item(7), project_id: elsewhere, canonical_path: "gdrive/kept.md" }],
       mappedItem: [[item(7), elsewhere]],
       discoveries: [[[item(7), elsewhere]]],
@@ -1298,7 +1298,7 @@ describe("a DIRECT Drive ingest takes the fenced order: provider → mapping →
   });
 
   it("CHANGED PLAN: a mapping that differs under the provider advisory abandons the ingest — once, with nothing owned below it and nothing written", async () => {
-    const c = use(new ScriptedConnection(directDatabase({
+    const c = track(new ScriptedConnection(directDatabase({
       mappings: [null, { item_id: item(7), project_id: STORAGE, canonical_path: PATH }],
     })));
     // `directDatabase` answers the session's own reads from the first non-null mapping; this
@@ -1319,7 +1319,7 @@ describe("a DIRECT Drive ingest takes the fenced order: provider → mapping →
   });
 
   it("BOUNDED: a held provider identity times the direct ingest out once (55P03), before the mapping row or any path", async () => {
-    const c = use(new ScriptedConnection(directDatabase({
+    const c = track(new ScriptedConnection(directDatabase({
       fail: (_sql, params) => (String(params[0]).startsWith(`${TEAM}:gdrive:`)
         ? sqlError("canceling statement due to lock timeout", "55P03") : null),
     })));
