@@ -108,6 +108,17 @@ export async function buildIdentityMap(
     if (r.actor_handle) byHandle.set(r.actor_handle.toLowerCase(), r.id);
   }
 
+  // A deactivated member's mapped emails are kept apart and only fill addresses NO active member
+  // holds (AIO-1167 R44 C4). An offboarded person's address is routinely reassigned; sharing one
+  // ambiguity set would make that address ambiguous for the ACTIVE member who holds it now and drop
+  // their new work's attribution, while the deactivated member keeps their stable provider ids.
+  const deactivatedByEmail = new Map<string, string>();
+  const deactivatedAmbiguousEmails = new Set<string>();
+  const assignEmail = (email: string, memberId: string) => {
+    if (activeMemberIds.has(memberId)) assignUnique(byEmail, ambiguousEmails, email, memberId);
+    else assignUnique(deactivatedByEmail, deactivatedAmbiguousEmails, email, memberId);
+  };
+
   // Fold in explicit git-author aliases (e.g. GitHub noreply emails) as EXACT byEmail matches.
   // Deliberately NOT added to emailDomains — alias domains like users.noreply.github.com are
   // shared, so widening the handle heuristic with them would re-introduce cross-author
@@ -118,9 +129,7 @@ export async function buildIdentityMap(
     .eq("team_id", teamId);
   if (opts.strict && aliasesError) throw new Error(`identity aliases read failed: ${aliasesError.message}`);
   for (const a of (aliases ?? []) as { email: string; member_id: string }[]) {
-    if (a.email && resolvableMemberIds.has(a.member_id)) {
-      assignUnique(byEmail, ambiguousEmails, a.email.toLowerCase(), a.member_id);
-    }
+    if (a.email && resolvableMemberIds.has(a.member_id)) assignEmail(a.email.toLowerCase(), a.member_id);
   }
 
   // Cross-provider identities (Slack/Linear/… user ids). Keyed by (provider, external_id); any
@@ -137,7 +146,13 @@ export async function buildIdentityMap(
     if (i.provider && i.external_id) {
       assignUnique(byProviderId, ambiguousProviderIds, providerKey(i.provider, i.external_id), i.member_id);
     }
-    if (i.email) assignUnique(byEmail, ambiguousEmails, i.email.toLowerCase(), i.member_id);
+    if (i.email) assignEmail(i.email.toLowerCase(), i.member_id);
+  }
+  for (const [email, memberId] of deactivatedByEmail) {
+    if (!byEmail.has(email) && !ambiguousEmails.has(email)) byEmail.set(email, memberId);
+  }
+  for (const email of deactivatedAmbiguousEmails) {
+    if (!byEmail.has(email)) ambiguousEmails.add(email);
   }
 
   const providerIdentityStates = new Map<string, "linked" | "unlinked">();

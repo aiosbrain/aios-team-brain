@@ -64,4 +64,39 @@ describe("a deactivated member's history versus new eligibility (R44 C4, real Po
       .toEqual([[carol.id, "editor"], [carol.id, "commenter"]]);
     expect(googleDriveContributionEvidence(frontmatter, "item-1", linking)).toEqual([]);
   });
+
+  it("an address reassigned to an active member is theirs; the offboarded member keeps their stable ids", async () => {
+    const seed = await seedTeam();
+    const carol = await member(seed.teamId, "carol");
+    const shared = `team-inbox-${randomUUID().slice(0, 6)}@example.com`;
+    // Carol's provider identity carries the address (one mapped-email path; aliases share `assignEmail`).
+    await setMemberIdentity(db(), seed.teamId, carol.id, {
+      provider: "gdrive", externalId: "permission:carol-perm", email: shared,
+    });
+    expect(await deleteMember(db(), seed.teamId, carol.email)).toMatchObject({ deleted: true, mode: "soft" });
+    // Positive control: while nobody active holds the address, carol's mapping still resolves it.
+    const before = await buildIdentityMap(db(), seed.teamId, { strict: true, includeDeactivated: true });
+    expect(before.byEmail.get(shared)).toBe(carol.id);
+    // The address now belongs to an active member.
+    const { data } = await db().from("members").insert({
+      team_id: seed.teamId, email: shared, display_name: "dave", actor_handle: `dave-${randomUUID().slice(0, 6)}`,
+      role: "member", tier: "team", status: "active",
+    }).select("id").single();
+    const dave = (data as { id: string }).id;
+
+    const history = await buildIdentityMap(db(), seed.teamId, { strict: true, includeDeactivated: true });
+    expect(history.byEmail.get(shared)).toBe(dave);
+    expect(history.ambiguousEmails?.has(shared)).toBe(false);
+    expect(resolveByProviderId(history, "gdrive", "permission:carol-perm")).toBe(carol.id);
+
+    const frontmatter = {
+      source: "gdrive", title: "Plan",
+      contributions: [
+        { external_id: "permission:carol-perm", role: "editor", at: "2026-10-20T10:00:00Z" },
+        { email: shared, role: "commenter", at: "2026-10-27T10:00:00Z" },
+      ],
+    };
+    expect(googleDriveContributionEvidence(frontmatter, "item-1", history).map((row) => [row.memberId, row.role]))
+      .toEqual([[carol.id, "editor"], [dave, "commenter"]]);
+  });
 });

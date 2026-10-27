@@ -965,7 +965,9 @@ R44 contracts (AIO-1167):
 - **Identity:** `buildIdentityMap({ includeDeactivated })` resolves a deactivated member ONLY through
   their existing identity mappings (explicit aliases, provider identities) — never roster email,
   handle or domain — for source-supported credit (attribution snapshot, Drive evidence store and
-  display); linking and identity sync keep the active-only default, so offboarding is not an unlink and
+  display); a deactivated member's mapped EMAIL only fills an address no active member holds, so a
+  reassigned address stays its active holder's (stable provider ids keep resolving to the offboarded
+  member); linking and identity sync keep the active-only default, so offboarding is not an unlink and
   a deactivated member gets no new link or authentication. A fenced Drive push first links an observed `permission:` id
   whose email names exactly one active member (`lib/integrations/gdrive-identity-discovery.ts` →
   `discoverMemberIdentity`), only for an id never reviewed — links, manual mappings and unlink
