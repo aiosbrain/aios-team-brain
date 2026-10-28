@@ -11,9 +11,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
  * not be followed by a token: either the revocation is seen and the token withheld, or the
  * revocation cannot commit until the broker has.
  *
- * The record is suspended here, at the audit seam, on exactly that action. Each revocation is then
- * started for real against the same connection and either commits or is observed waiting on a row
- * lock — a fact read from `pg_stat_activity`, not inferred from a delay.
+ * The record is suspended here, at the REQUIRED-audit seam the broker writes it through
+ * (`auditRequiredInTransaction`, inside its final authority/fence transaction), on exactly that
+ * action; once released, the REAL required write runs. Each revocation is then started for real
+ * against the same connection and either commits or is observed waiting on a row lock — a fact read
+ * from `pg_stat_activity`, not inferred from a delay.
  */
 const record = vi.hoisted(() => ({
   hold: null as null | { entered: () => void; released: Promise<void> },
@@ -23,13 +25,13 @@ vi.mock("@/lib/api/audit", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api/audit")>();
   return {
     ...actual,
-    audit: async (...args: Parameters<typeof actual.audit>) => {
+    auditRequiredInTransaction: async (...args: Parameters<typeof actual.auditRequiredInTransaction>) => {
       const hold = record.hold;
-      if (hold && args[1].action === "gdrive.token_issued") {
+      if (hold && args[0].action === "gdrive.token_issued") {
         hold.entered();
         await hold.released;
       }
-      return actual.audit(...args);
+      return actual.auditRequiredInTransaction(...args);
     },
   };
 });
@@ -170,6 +172,11 @@ describe("AIO-1167 token broker: a revocation racing the issuance record (real P
     expect(queued).toBe(true);
     expect(response.status).toBe(200);
     expect(body).toContain(ISSUED_TOKEN);
+    // The released hold ran the REAL required write: the token went out with exactly one record.
+    const { rows: issuedRecords } = await getPool().query(
+      `select 1 from audit_log where team_id=$1 and target_id::text=$2 and action='gdrive.token_issued'`,
+      [seed.teamId, integrationId]);
+    expect(issuedRecords).toHaveLength(1);
     // … and the revocation, committed now, stops everything after it.
     record.hold = null;
     const after = await tokenRequest();
