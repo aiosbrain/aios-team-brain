@@ -25,6 +25,7 @@ import { formatAccessHealth } from "@/lib/admin/access-health-format";
 import { ingestItem } from "@/lib/ingest";
 import { TierViolationError } from "@/lib/api/schemas";
 import { settleTimelineRefreshes } from "@/lib/dashboard/timeline-cache";
+import { repairAttributionNow } from "@/lib/ingest/reconcile-attribution";
 
 /**
  * TIERRET-1 / AIO-1045 — membership is the ONLY member content read rule (accepted spec
@@ -210,6 +211,11 @@ async function buildFixture(): Promise<Fx> {
 
   const { key: externalKey } = await issueApiKey(db(), seed.teamId, m.id, "ext");
   const { key: teamPeerKey } = await issueApiKey(db(), seed.teamId, peer.id, "peer");
+  // The member insert/delete/status writes above open an identity-attribution repair; attributed
+  // reads (timeline) are fenced (503) until it completes. Complete it before the fixture is used.
+  await repairAttributionNow(db(), seed.teamId, seed.teamSlug, { maxBatches: 10, batchSize: 50 });
+  expect((await db().from("team_identity_authority").select("repair_status")
+    .eq("team_id", seed.teamId).maybeSingle()).data?.repair_status ?? "complete").toBe("complete");
   return {
     seed,
     srcId,
