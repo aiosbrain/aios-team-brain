@@ -959,7 +959,9 @@ R44 contracts (AIO-1167):
   created `retracted` (`retractItemUnit`), the barrier context backfill cannot reopen.
 - **Broker:** OAuth mode only (checked before refresh and at issuance); every refresh is held to the
   credential's recorded `grant_mode`, or for a legacy credential to the narrowest mode its recorded
-  scopes fit, else reconnect. The token and userinfo endpoints are fixed to Google in product code; the
+  scopes fit, else reconnect. Issuance is recorded or not released: the `gdrive.token_issued` row is
+  REQUIRED evidence written in the final authority/fence transaction (`auditRequiredInTransaction`),
+  and a rejected record withholds the token (503 `issuance_unrecorded`). The token and userinfo endpoints are fixed to Google in product code; the
   HTTP tier answers exactly those two URLs from a loopback fixture through a harness-only preload
   (`test/http/google-token-intercept.mjs`), so the real start → callback → broker flow runs over HTTP.
 - **Identity:** `buildIdentityMap({ includeDeactivated })` resolves a deactivated member ONLY through

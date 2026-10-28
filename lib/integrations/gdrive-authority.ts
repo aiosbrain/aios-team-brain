@@ -2,7 +2,7 @@ import "server-only";
 
 import { createHash, randomBytes } from "node:crypto";
 import { ensureBuiltins, writeInviteDefaultMembership } from "@/lib/access/groups";
-import { audit } from "@/lib/api/audit";
+import { audit, auditRequiredInTransaction } from "@/lib/api/audit";
 import type { ApiAuth } from "@/lib/api/auth";
 import { adminClient } from "@/lib/db/admin";
 import type { DbClient } from "@/lib/db/types";
@@ -23,7 +23,7 @@ const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 
 export class GdriveAuthorityError extends Error {
   constructor(
-    readonly code: "connector_principal_required" | "connection_unavailable" | "wrong_connection" | "execution_busy" | "stale_execution" | "stale_progress" | "reconnect_required" | "provider_unavailable" | "admin_authority_changed" | "root_coverage_incomplete" | "audience_unavailable",
+    readonly code: "connector_principal_required" | "connection_unavailable" | "wrong_connection" | "execution_busy" | "stale_execution" | "stale_progress" | "reconnect_required" | "provider_unavailable" | "admin_authority_changed" | "root_coverage_incomplete" | "audience_unavailable" | "issuance_unrecorded",
     message: string,
     readonly status: number,
   ) {
@@ -1013,15 +1013,24 @@ export async function brokerGoogleAccessToken(auth: ApiAuth, ref: GdriveExecutio
   // and its `gdrive.token_issued` row are ONE transaction: the connection, authority, key and
   // member rows stay locked from the check to COMMIT, so a revocation either committed first (and
   // the check refuses) or queues behind this commit. Nothing is awaited between that commit and
-  // the return. A record PostgreSQL rejects aborts the transaction and the commit is refused, so
-  // the token is withheld rather than released unrecorded.
+  // the return. The record is REQUIRED evidence (AC-07; AIO-1167 R44 adjudication): written on the
+  // transaction's own connection by `auditRequiredInTransaction`, so a record PostgreSQL rejects
+  // fails this transaction and the token is withheld — never released unrecorded. The best-effort
+  // `audit()` would have swallowed that failure.
   await withTransaction(async () => {
     assertOAuthMode(await assertLockedExecution(auth, ref));
-    await audit(adminClient(), {
-      team_id: auth.teamId, actor_kind: "api_key", member_id: auth.memberId, api_key_id: auth.apiKeyId,
-      action: "gdrive.token_issued", target_type: "integration", target_id: ref.integrationId,
-      meta: { generation: ref.generation, fence: ref.fence, scopeCount: granted.length, expiresIn },
-    });
+    try {
+      await auditRequiredInTransaction({
+        team_id: auth.teamId, actor_kind: "api_key", member_id: auth.memberId, api_key_id: auth.apiKeyId,
+        action: "gdrive.token_issued", target_type: "integration", target_id: ref.integrationId,
+        meta: { generation: ref.generation, fence: ref.fence, scopeCount: granted.length, expiresIn },
+      });
+    } catch {
+      // Retryable and sanitized: the database's message is not the connector's to read.
+      throw new GdriveAuthorityError(
+        "issuance_unrecorded", "Google Drive token issuance could not be recorded; no token was released — retry", 503,
+      );
+    }
   });
   return {
     accessToken: payload.access_token,

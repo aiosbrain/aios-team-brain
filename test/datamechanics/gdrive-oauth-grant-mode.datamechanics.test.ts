@@ -213,6 +213,10 @@ describe("broker: OAuth mode only, and a conservative ceiling for legacy credent
   it.each([
     ["no recorded mode and no recorded scopes", credential(undefined, undefined)],
     ["an invalid recorded mode", JSON.stringify({ ...JSON.parse(credential("files", [FILE])), grant_mode: "everything" })],
+    // Invalid recorded scopes on a legacy credential: no mode fits them, so there is no ceiling.
+    ["a legacy grant broader than every mode (full drive)", credential(undefined, [`${G}drive`])],
+    ["a legacy grant with no Drive scope at all", credential(undefined, ["openid", "email"])],
+    ["legacy recorded scopes that are not a list", JSON.stringify({ ...JSON.parse(credential(undefined, undefined)), scopes: FILE })],
   ])("%s must reconnect, and Google is never asked", async (_case, stored) => {
     const seed = await seedTeam();
     const id = await connection(seed, "legacy-unknown", stored);
@@ -220,6 +224,54 @@ describe("broker: OAuth mode only, and a conservative ceiling for legacy credent
     expect(response.status).toBe(409);
     expect(JSON.parse(raw).error.code).toBe("reconnect_required");
     expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * AIO-1167 R44 adjudication (AC-07) — the `gdrive.token_issued` record is REQUIRED evidence: it is
+ * written in the same transaction as the final authority/fence check, and a record PostgreSQL
+ * rejects releases no token. The failure is injected in the database itself, scoped to this test's
+ * integration, so the broker's real transaction is what fails.
+ */
+async function refuseIssuanceRecords(integrationId: string): Promise<() => Promise<void>> {
+  const name = `aio1167_refuse_issued_${integrationId.replace(/-/g, "")}`;
+  const pool = getPool();
+  await pool.query(`create function ${name}() returns trigger language plpgsql as $$
+    begin raise exception 'injected audit failure'; end $$`);
+  await pool.query(`create trigger ${name} before insert on audit_log for each row
+    when (new.action = 'gdrive.token_issued' and new.target_id::text = '${integrationId}')
+    execute function ${name}()`);
+  return async () => {
+    await pool.query(`drop trigger if exists ${name} on audit_log`);
+    await pool.query(`drop function if exists ${name}()`);
+  };
+}
+
+describe("token issuance is recorded or not released (R44, AC-07)", () => {
+  it("a rejected gdrive.token_issued record withholds the refreshed token", async () => {
+    const seed = await seedTeam();
+    const id = await connection(seed, "issuance-refused", credential("files", [FILE]));
+    const restore = await refuseIssuanceRecords(id);
+    try {
+      const { response, raw } = await brokered(seed, id, `openid ${FILE}`);
+      // Google WAS asked and answered: the token is withheld because its record failed.
+      expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+      expect(response.status).toBe(503);
+      expect(JSON.parse(raw).error.code).toBe("issuance_unrecorded");
+      expect(raw).not.toContain("refreshed-access-token");
+      expect(raw).not.toContain("injected audit failure"); // sanitized
+      expect(await audits(seed.teamId, id, "gdrive.token_issued")).toEqual([]);
+    } finally {
+      await restore();
+    }
+
+    // Positive control: the same flow on a connection whose record is accepted releases the token
+    // with exactly one issuance record.
+    const accepted = await connection(seed, "issuance-recorded", credential("files", [FILE]));
+    const ok = await brokered(seed, accepted, `openid ${FILE}`);
+    expect(ok.response.status).toBe(200);
+    expect(JSON.parse(ok.raw).access_token).toBe("refreshed-access-token");
+    expect((await audits(seed.teamId, accepted, "gdrive.token_issued")).map((row) => row.meta.scopeCount)).toEqual([2]);
   });
 });
 
