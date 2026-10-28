@@ -674,19 +674,14 @@ async def test_materialized_body_carries_tab_anchors_and_an_exact_offset_map(tmp
 @pytest.mark.parametrize("pages,category", [
     ([_GoogleHttpError(403, "insufficientPermissions")], "provider_read"),
     ([_GoogleHttpError(403, "appNotAuthorizedToFile")], "provider_read"),
-    # Drive's 403 rate-limit reasons are quota answers: deferred as rate limits, never read failures.
-    ([_GoogleHttpError(403, "userRateLimitExceeded")], "rate_limited"),
-    ([_GoogleHttpError(403, "rateLimitExceeded")], "rate_limited"),
     ([_GoogleHttpError(403, "domainPolicy")], "provider_read"),
     ([_GoogleHttpError(403)], "provider_read"),
-    ([_GoogleHttpError(429)], "rate_limited"),
     ([_GoogleHttpError(503)], "provider_unavailable"),
     # Denied part-way through: pages were read, so this is a failed read, not an unreadable history.
     ([{"revisions": [{"modifiedTime": "2026-09-01T00:00:00Z", "lastModifyingUser": {
         "permissionId": "perm-a"}}], "nextPageToken": "p2"},
       _GoogleHttpError(403, "insufficientFilePermissions")], "provider_read"),
-], ids=["scope", "app-not-authorized", "user-rate", "project-rate", "policy", "unspecified", "rate",
-        "unavailable", "denied-mid-history"])
+], ids=["scope", "app-not-authorized", "policy", "unspecified", "unavailable", "denied-mid-history"])
 @pytest.mark.asyncio
 async def test_other_revision_history_failures_still_fail_closed_and_stay_retryable(
     tmp_path, pages, category,
@@ -702,6 +697,38 @@ async def test_other_revision_history_failures_still_fail_closed_and_stay_retrya
     ((item_key, attempts, not_before, last_error),) = _pending_rows(state, namespace)
     assert (item_key, attempts) == ("doc", 1)
     assert not_before is not None and last_error
+    state.close()
+
+
+@pytest.mark.parametrize("pages", [
+    # Drive's 403 rate-limit reasons are quota answers, exactly like a 429: never read failures.
+    [_GoogleHttpError(403, "userRateLimitExceeded")],
+    [_GoogleHttpError(403, "rateLimitExceeded")],
+    [_GoogleHttpError(429)],
+], ids=["user-rate", "project-rate", "rate"])
+@pytest.mark.asyncio
+async def test_a_rate_limited_revision_history_closes_admission_for_the_account(tmp_path, pages):
+    """AIO-1167 R44 C6: a rate limit on the revision history is the PROVIDER's wait for the account,
+    not this document's failure. The drain stops with the provider's not-before — no content is
+    pushed, no per-item attempt or backoff is spent, and no further Drive call is made (the stop is
+    raised out of the drain; across several owed documents this is pinned in test_drain_recovery)."""
+    from aios_ingest.gdrive_sync import _ProviderAdmissionClosed
+
+    state, namespace = _readable_doc_owed_an_upsert(tmp_path, "history-rate-limited.sqlite")
+    source, drive, docs = _history_source(pages)
+    client = _PayloadBrain()
+
+    with pytest.raises(_ProviderAdmissionClosed) as closed:
+        await _drain_one(source, state, namespace, client)
+
+    assert closed.value.category == "rate_limited" and closed.value.not_before
+    assert client.payloads == []  # nothing pushed
+    # The one history call that answered with the limit, and no Drive call after it.
+    assert len(drive.history.calls) == 1 and len(docs.api.calls) == 1
+    # The obligation is untouched: no attempt, no backoff, no failure recorded against the document.
+    ((item_key, attempts, not_before, last_error),) = _pending_rows(state, namespace)
+    assert (item_key, attempts, not_before, last_error) == ("doc", 0, None, None)
+    assert state.work_failures(state.list_pending(namespace, 9)[0]) == 0
     state.close()
 
 
