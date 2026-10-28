@@ -67,6 +67,7 @@ import {
   type GdriveAdminTestAuthority,
 } from "@/lib/integrations/gdrive-authority";
 import { gdriveRootKeys } from "@/lib/integrations/gdrive-credential-fields";
+import { getIntegrationType } from "@/lib/integrations/read";
 
 export type PrimaryPmProvider = "plane" | "linear" | null;
 
@@ -320,13 +321,17 @@ export async function rotateSecret(
   if (!secret) return { ok: false, error: "secret is required" };
   try {
     // Team-scoped type check BEFORE the write: a Drive credential is replaced only by the verified
-    // OAuth reconnect, never by a pasted secret (AIO-1167 R43 F1). A row's type never changes, so the
-    // read cannot go stale before the write. An id this team does not own rotates nothing.
-    const { data: target, error: targetError } = await adminClient().from("integrations").select("type")
-      .eq("id", id).eq("team_id", ctx.teamId).maybeSingle();
-    if (targetError) return { ok: false, error: "could not rotate" };
-    if (!target) return { ok: false, error: "integration not found" };
-    if ((target as { type: string }).type === "gdrive") return { ok: false, error: GDRIVE_SECRET_REFUSAL };
+    // OAuth reconnect, never by a pasted secret (AIO-1167 R43 F1). Read through the admin-gated
+    // dashboard reader (`requireAdmin` above resolved this caller as an admin). A row's type never
+    // changes, so the read cannot go stale before the write. An id this team does not own rotates nothing.
+    let type: string | null;
+    try {
+      type = await getIntegrationType(adminClient(), ctx.teamId, id, { role: "admin" });
+    } catch {
+      return { ok: false, error: "could not rotate" };
+    }
+    if (!type) return { ok: false, error: "integration not found" };
+    if (type === "gdrive") return { ok: false, error: GDRIVE_SECRET_REFUSAL };
     await setIntegrationSecret(adminClient(), { teamId: ctx.teamId, memberId: ctx.memberId }, id, secret);
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not rotate" };

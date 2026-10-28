@@ -1528,6 +1528,16 @@ export const ENTRY_INVENTORY: Record<string, EntryRecord> = {
       "execution route). It hands the fenced connector a short-lived Google access token and writes " +
       "no item",
   },
+  "app/api/v1/integrations/route.ts": {
+    class: "IMPORT_ONLY",
+    reason:
+      "imports gdriveConnectionsBoundTo / projectSelectionsFor from " +
+      "lib/integrations/gdrive-selection-projection, which takes isGdriveConnectorPrincipal and " +
+      "LIVE_GDRIVE_CONNECTOR_SQL from lib/integrations/gdrive-authority (AIO-1167 R44: the metadata " +
+      "projection shares the execution boundary's live-bound-connector predicate) — the same closure " +
+      "edge as the execution route. It READS integration selections, reduces a Drive row's config for " +
+      "any key but its live bound connector, and audits the read; no item write",
+  },
   "app/api/v1/items/source-reconcile/route.ts": {
     class: "IMPORT_ONLY",
     reason:

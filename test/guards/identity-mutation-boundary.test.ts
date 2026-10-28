@@ -11,7 +11,10 @@ const EXPECTED = new Map<string, number>([
   ["lib/admin/aliases.ts", 3],
   ["lib/admin/members.ts", 5],
   ["lib/auth/pg-login.ts", 2],
-  ["lib/identity/member-identities.ts", 4],
+  // 5: the 4 link/unlink writes + `discoverMemberIdentity`'s insert (AIO-1167 R44 F1), which runs
+  // inside `withIdentityMutationBoundary` under the exact-identity lock, through the same
+  // mapping-state revision / repair obligation / epoch protocol, and is audited (`identity.discovered`).
+  ["lib/identity/member-identities.ts", 5],
   ["lib/ingest/run.ts", 1],
   ["lib/integrations/gdrive-authority.ts", 1],
   ["scripts/seed-demo.ts", 1],
