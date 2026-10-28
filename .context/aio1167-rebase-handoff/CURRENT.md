@@ -12,14 +12,14 @@ Resolved current implementation questions: retain source-supported credit for a 
 
 - Worktree: `/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree`
 - Branch: `codex/aio-1167-google-docs-connector-rebased`, based on recorded `origin/staging` `8df51664809cfc12740a39d0e98fdb9c8ad05ad8`.
-- Current local HEAD: `670a77b4ca7c74fefeac10d72322467768d45e3b` (`test(tierret): repair identity after variant principals`), pushed and verified on `origin/codex/aio-1167-checkpoint-20261027`.
-- Recovery branch: `origin/codex/aio-1167-checkpoint-20261027`. Push and remote readback verified exact SHA `63dd3f115deac26ec37b1aa65218d7566b479cc2`; pre-push docs/skill checks passed. PR #743's divergent branch was not modified or force-pushed.
+- Current local HEAD: `8671684e2a34af66c826bf4e8956392a5bbe110f` (`docs(aio1167): record verification checkpoint`), a handoff-only commit after source/test snapshot `670a77b4ca7c74fefeac10d72322467768d45e3b`.
+- Recovery branch: `origin/codex/aio-1167-checkpoint-20261027`. Push and remote readback verified exact SHA `8671684e2a34af66c826bf4e8956392a5bbe110f`; pre-push docs/skill checks passed. PR #743's divergent branch was not modified or force-pushed.
 - The prior detailed history and results are preserved in `ARCHIVE-current-state-through-20261027-before-8e960b85.md`. Load only that archive/evidence needed for a specific decision.
 
 ## Writer and admission
 
-- Sole writer: existing Claude session `628402d5-a1c6-42b7-b736-e84358c1a749`, displayed as `aio1167-r30-opus-writer`; terminal `exec` session `57820`. It was interrupted at its 10-minute deadline and its edits were checkpointed at `0495f63d`; terminal output has been quiet. Resume this same session; do not create a replacement or second writer.
-- Fresh exact-session `/usage` (2026-10-28 about 7:41 a.m. Asia/Kolkata, after session reset): session 0%, all-model week 3%, Fable week 0%, credits off. Weekly reset Nov 3 at 5:30 p.m. All applicable limits remain below pause threshold. Full-user CLI verified `loggedIn:true`, `authMethod:claude.ai`, first-party Max subscription. Continue only the existing Opus session; do not create another run. Recheck at phase boundaries and every 20 minutes while active.
+- Sole writer: existing Claude session `628402d5-a1c6-42b7-b736-e84358c1a749`, displayed as `aio1167-r30-opus-writer`; terminal `exec` session `57820`. It is idle with its edits checkpointed; resume this same session only after Claude capacity is confirmed below the 90% threshold. Do not create a replacement or second writer.
+- Fresh exact-session `/usage` (2026-10-28 about 8:24 a.m. Asia/Calcutta): session 99%, all-model week 13%, Fable week 19%, credits off; session reset reported 12:50 p.m. Asia/Calcutta and weekly reset Nov 3 at 5:30 p.m. This meets the 90% pause rule. The Fable review was stopped and its CLI process plus child reviewers verified inactive. Do not resume Claude until fresh authoritative usage shows every applicable window below 90%; a reset-time crossing alone is insufficient. Full-user CLI remains verified `loggedIn:true`, `authMethod:claude.ai`, first-party Max subscription.
 - No credentials, tokens or account secrets belong in the handoff.
 
 ## Current implementation state
@@ -64,12 +64,14 @@ At `ba2b2603` and `670a77b4`, corrected the TIERRET timeline fixture to complete
 
 At `670a77b4`, `npm run typecheck`, changed-file ESLint for both edited data-mechanics tests, and `npm run check:docs` all passed. The focused identity-discovery test passed 1/1; the focused TIERRET member-read suite passed 25/25. The only full data-mechanics failures are the two environment gates above.
 
-The exact failure was sent to the existing Opus session; do not create a replacement. Full-user CLI authentication is verified as first-party Max; sandboxed status cannot see that session. Latest `/usage` is 4% session / 2% all-model week / 0% Fable, credits off.
+Fresh read-only Fable 5.1 review session `72da6a32-a286-4fb6-90b2-105f32b741d3` started against exact snapshot `8671684e2a34af66c826bf4e8956392a5bbe110f` and staging base `8df51664809cfc12740a39d0e98fdb9c8ad05ad8`. It inspected the large diff and traced identity-repair/member-resolution paths, then was interrupted at the 99% quota threshold while consolidating findings. It returned no verdict and produced no report artifact; do not call it a pass. Its process and reviewer children are verified stopped. Current source snapshot remains unchanged and the remote recovery branch contains exact SHA `8671684e2a34af66c826bf4e8956392a5bbe110f`.
+
+An hourly task heartbeat `aio-1167-claude-quota-recheck` is ACTIVE on this thread. It must read this handoff, verify real subscription usage, and resume the same Fable review if possible (otherwise one fresh review of the same snapshot) only after all applicable windows are confirmed below 90%. The existing Opus writer session `628402d5-a1c6-42b7-b736-e84358c1a749` remains the sole implementation writer and is idle; no second writer was started.
 
 ## Next action
 
-1. Obtain fresh Fable 5.1, blind Astra HIGH and blind GPT-6.1 Sol HIGH reviews on the exact final snapshot, adjudicate, and rerun invalidated checks. Full Python suite previously passed 700/28 skipped; the full TypeScript unit run at the prior production-code snapshot had environment/archive and unchanged graph CDC failures; targeted AIO guards passed 242/242. Avoid repeating unchanged costly suites unless code changes or a specific unresolved finding warrants it.
-2. Then prepare the authorized staging PR/checkpoint. Existing PR branch is divergent: do not force-push or overwrite it. No merge/deployment authorization.
+1. Honor the active hourly quota-check heartbeat. Resume Fable review only after fresh `/usage` confirms session and all applicable weekly/model windows <90%; then adjudicate findings through the existing Opus writer and rerun affected checks. Obtain the required fresh blind Astra HIGH and blind GPT-6.1 Sol HIGH reviews on the resulting exact snapshot. Full Python suite previously passed 700/28 skipped; focused data-mechanics fixes passed; full isolated data-mechanics run had only the two documented environment-gated failures. Typecheck, changed-file lint, docs drift, and production build passed. The full TypeScript unit run at the prior production-code snapshot had documented environment/archive and unchanged graph CDC failures; targeted AIO guards passed 242/242.
+2. Then prepare the authorized staging PR/checkpoint. Existing PR #743 branch is divergent: do not force-push or overwrite it. No merge/deployment authorization.
 
 ## Review and rollout gates
 
