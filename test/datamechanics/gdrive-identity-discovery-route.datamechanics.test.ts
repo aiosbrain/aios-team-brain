@@ -25,9 +25,11 @@ import { approvedAudienceProject, db, seedTeam, sha, type Seed } from "./helpers
  *     document and its contribution evidence are credited to A in the SAME push;
  *   · a replay of that observation whose email now belongs to B is still ONE observation, still A's —
  *     the stable id is the person, an email change transfers nothing.
- * The Admin identity list shows the link. The new mapping fences attributed Timeline reads until its
- * repair completes (neither the primed old payload nor a partial one is served); afterwards the
- * Timeline — uncached, and through the cache primed BEFORE the push — shows that one Drive activity
+ * The Admin identity list shows the link. P is first observed with an address naming no member, so an
+ * unattributed row exists before the link (a link with nothing behind it completes its repair at
+ * once, by design). The new mapping then fences attributed Timeline reads until its repair completes
+ * (neither the primed unattributed payload nor a partial one is served); afterwards the Timeline —
+ * uncached, and through the cache primed on the unattributed state — shows that one Drive activity
  * under A and none under B.
  */
 
@@ -126,11 +128,23 @@ async function timelines(w: Awaited<ReturnType<typeof world>>, itemId: string) {
 describe("Drive identity discovery through the fenced ingest route (R44 F1, real Postgres)", () => {
   it("links P to A and credits A in the same push; a replay under B's email transfers nothing", async () => {
     const w = await world();
-    // Prime the reader's cached Timeline before anything is linked or pushed.
-    expect(driveCredit((await getCachedWorkTimeline(db(), w.seed.teamId, "team", w.seed.memberId)).days)).toEqual([]);
-    expect((await push(w, "first body", w.a.email)).status).toBe(201);
+    // An attribution-bearing row exists BEFORE the link: P is first observed with an address that
+    // names no member, so nothing is linked and nobody is credited. (With no such row, a new link has
+    // nothing to repair and the authority completes at once — there would be no fence to observe.)
+    const unmapped = `nobody-${randomUUID().slice(0, 6)}@example.com`;
+    expect((await push(w, "first body", unmapped)).status).toBe(201);
+    const before = await credit(w.seed.teamId);
+    expect(before.mapping).toEqual([]);
+    expect(before.item.member_id).toBeNull();
+    expect(before.evidence).toEqual([{ external_id: "permission:P", member_id: null }]);
+    // Prime the reader's cached Timeline on that unattributed state.
+    expect(await timelines(w, before.item.id)).toEqual({ uncached: [], cached: [] });
+
+    // The same observation, now carrying A's confirmed address: discovery links P → A.
+    expect([200, 201]).toContain((await push(w, "linked body", w.a.email)).status);
 
     const first = await credit(w.seed.teamId);
+    expect(first.item.id).toBe(before.item.id);
     expect(first.mapping).toEqual([w.a.id]);
     expect(first.item.member_id).toBe(w.a.id);
     expect(first.evidence).toEqual([{ external_id: "permission:P", member_id: w.a.id }]);
