@@ -3,15 +3,14 @@ import Link from "next/link";
 import type { ConflictMember, IdentityConflictPage, IdentityConflictRow } from "@/lib/identity/discovery-conflicts";
 
 /**
- * Admin → Members: automatic identity links that were refused (AIO-1167 R45, AC-08). Read-only.
+ * Admin → Members: Google Drive automatic identity links that were refused (AIO-1167 R45, AC-08).
+ * Read-only, and Drive-only by adjudication.
  *
  * Each row is ONE historical observation (latest of any repeats) shown beside the identity's CURRENT
  * mapping, re-read now — so an event an Admin has since resolved reads as history, not as a standing
  * conflict. The fix is the existing Identities control on the member row this links to; nothing here
  * changes a mapping.
  */
-
-const PROVIDER_LABEL: Record<string, string> = { gdrive: "Google Drive", slack: "Slack", linear: "Linear", plane: "Plane" };
 
 function name(member: ConflictMember | null, fallback: string): string {
   return member ? member.displayName || "(unnamed member)" : fallback;
@@ -42,25 +41,26 @@ export function IdentityConflicts({ page, nextHref }: { page: IdentityConflictPa
   return (
     <section className="prism-card flex flex-col gap-2 p-4" aria-labelledby="identity-conflicts-heading">
       <h2 id="identity-conflicts-heading" className="text-sm font-semibold text-ink">
-        Automatic identity links that were refused
+        Google Drive: automatic identity links that were refused
       </h2>
       <p className="text-xs text-ink-secondary">
-        A connector observed an account whose confirmed email named one member while the account was
-        already mapped to another. The automatic link was refused and the existing mapping was kept.
+        The Google Drive connector observed a Drive account whose confirmed email named one member while
+        the account was already mapped to another. The automatic link was refused and the existing
+        mapping was kept.
         Review each in that member&apos;s <strong>Identities</strong> column and link, remap or unlink it there.
       </p>
       {page.status === "unavailable" ? (
         <p role="status" className="text-xs text-amber-600">
-          Refused-link diagnostics are unavailable right now. This does not mean there are none — try again.
+          Google Drive refused-link diagnostics are unavailable right now. This does not mean there are none — try again.
         </p>
       ) : page.rows.length === 0 ? (
-        <p className="text-xs text-ink-tertiary">No automatic links have been refused.</p>
+        <p className="text-xs text-ink-tertiary">No Google Drive automatic links have been refused.</p>
       ) : (
         <table className="w-full text-xs">
           <thead>
             <tr className="border-b border-border-subtle text-left uppercase tracking-wide text-ink-tertiary">
               <th className="py-2 pr-3">Last observed</th>
-              <th className="py-2 pr-3">Account</th>
+              <th className="py-2 pr-3">Drive account</th>
               <th className="py-2 pr-3">Observed member</th>
               <th className="py-2 pr-3">Mapped to then</th>
               <th className="py-2 pr-3">Mapping now</th>
@@ -74,7 +74,7 @@ export function IdentityConflicts({ page, nextHref }: { page: IdentityConflictPa
                   {new Date(row.observedAt).toISOString().replace("T", " ").slice(0, 16)} UTC
                   {row.occurrences > 1 ? <span className="text-ink-tertiary"> · {row.occurrences}×</span> : null}
                 </td>
-                <td className="py-2 pr-3 font-mono">{PROVIDER_LABEL[row.provider] ?? row.provider} · {row.externalId}</td>
+                <td className="py-2 pr-3 font-mono">{row.externalId}</td>
                 <td className="py-2 pr-3"><MemberLink member={row.candidate} fallback="a removed member" /></td>
                 <td className="py-2 pr-3"><MemberLink member={row.heldThen} fallback="a removed member" /></td>
                 <td className="py-2 pr-3 text-ink-secondary">{currentText(row)}</td>
@@ -85,7 +85,7 @@ export function IdentityConflicts({ page, nextHref }: { page: IdentityConflictPa
         </table>
       )}
       {page.status === "ok" && nextHref ? (
-        <Link href={nextHref} className="self-start text-xs text-violet hover:underline">Older refused links →</Link>
+        <Link href={nextHref} className="self-start text-xs text-violet hover:underline">Older refused Drive links →</Link>
       ) : null}
     </section>
   );

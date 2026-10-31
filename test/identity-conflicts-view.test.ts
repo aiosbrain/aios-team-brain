@@ -8,7 +8,7 @@ import { IdentityConflicts } from "@/components/admin/identity-conflicts";
 import type { IdentityConflictRow } from "@/lib/identity/discovery-conflicts";
 
 /**
- * AIO-1167 R45 (AC-08) — what an Admin SEES for refused automatic identity links.
+ * AIO-1167 R45 (AC-08) — what an Admin SEES for refused Google Drive automatic identity links.
  *
  * Spec. A row states that the automatic link was refused and the existing mapping kept, names the
  * account, the observed member and who held it then, shows the mapping NOW and whether the event is
@@ -30,7 +30,9 @@ describe("refused automatic identity links — Admin view", () => {
   it("states the refusal and shows the account, both members, the mapping now and its standing", () => {
     const html = render({ status: "ok", rows: [ROW], nextCursor: null });
     expect(html).toContain("automatic link was refused and the existing mapping was kept");
-    expect(html).toContain("Google Drive · permission:L");
+    expect(html).toContain("Google Drive: automatic identity links that were refused");
+    expect(html).toContain("Drive account");
+    expect(html).toContain("permission:L");
     expect(html).toContain('href="#member-m-alice"');
     expect(html).toContain('href="#member-m-bob"');
     expect(html).toContain("legacy mapping that was never reviewed");
@@ -52,12 +54,12 @@ describe("refused automatic identity links — Admin view", () => {
   it("a read failure is shown as unavailable, never as none", () => {
     const html = render({ status: "unavailable" });
     expect(html).toContain("unavailable");
-    expect(html).not.toContain("No automatic links have been refused");
+    expect(html).not.toContain("No Google Drive automatic links have been refused");
   });
 
   it("an empty page says none; a forbidden viewer sees nothing at all; a next page is linked", () => {
-    expect(render({ status: "ok", rows: [], nextCursor: null })).toContain("No automatic links have been refused");
+    expect(render({ status: "ok", rows: [], nextCursor: null })).toContain("No Google Drive automatic links have been refused");
     expect(render({ status: "forbidden" })).toBe("");
-    expect(render({ status: "ok", rows: [ROW], nextCursor: "c" }, "/t/x/admin/members?conflicts=c")).toContain("Older refused links");
+    expect(render({ status: "ok", rows: [ROW], nextCursor: "c" }, "/t/x/admin/members?conflicts=c")).toContain("Older refused Drive links");
   });
 });

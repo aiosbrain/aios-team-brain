@@ -5,10 +5,11 @@ import { getPool } from "@/lib/db/pg/pool";
 import type { DbClient } from "@/lib/db/types";
 import { listIdentityDiscoveryConflicts, type IdentityConflictPage } from "@/lib/identity/discovery-conflicts";
 import { discoverMemberIdentity, removeMemberIdentity, setMemberIdentity } from "@/lib/identity/member-identities";
-import { db, placeMemberByTier, seedTeam, type Seed } from "./helpers";
+import { db, driveFixture, placeMemberByTier, seedTeam, type Seed } from "./helpers";
 
 /**
- * AIO-1167 R45 (AC-08) — the Admin diagnostic for refused automatic identity links, on real Postgres.
+ * AIO-1167 R45 (AC-08) — the Admin diagnostic for refused GOOGLE DRIVE automatic identity links, on
+ * real Postgres. Drive-only by adjudication: another provider's refused links are never projected.
  *
  * Spec (Astra adjudication). A refused automatic link — a connector observed an account whose
  * confirmed email names member A while an UNREVIEWED legacy mapping gives it to B — is visible to a
@@ -17,7 +18,8 @@ import { db, placeMemberByTier, seedTeam, type Seed } from "./helpers";
  * current state is re-read, so a later remap or unlink reads as resolved history. Only allowlisted
  * fields leave the projection. A read failure is `unavailable`, never an empty list. Only an active
  * admin of THAT team at team posture may read it. A reviewed mapping or an unlink tombstone is never
- * a conflict, whatever email is observed later — and nothing here changes a mapping.
+ * a conflict, whatever email is observed later — and nothing here changes a mapping, or the credit
+ * existing content already carries through it.
  */
 
 async function member(seed: Seed, name: string, over: Partial<{ role: string; status: string }> = {}) {
@@ -173,5 +175,69 @@ describe("refused automatic identity links — the Admin diagnostic (R45, real P
     const states = (await getPool().query(
       "select external_id, state from member_identity_mapping_state where team_id=$1 order by external_id", [seed.teamId])).rows;
     expect(states).toEqual([{ external_id: "permission:R", state: "linked" }, { external_id: "permission:T", state: "unlinked" }]);
+  });
+
+  it("is Google Drive-only: another provider's refused link is never projected", async () => {
+    const seed = await seedTeam();
+    const viewer = { teamId: seed.teamId, memberId: await adminOf(seed) };
+    const alice = await member(seed, "alice");
+    const bob = await member(seed, "bob");
+    await getPool().query(
+      "insert into member_identities(team_id, member_id, provider, external_id, handle, email) values ($1,$2,'slack','U-LEGACY','','')",
+      [seed.teamId, bob]);
+    expect(await discoverMemberIdentity(db(), seed.teamId, alice, { provider: "slack", externalId: "U-LEGACY", email: "x@example.com" }))
+      .toBe("conflict");
+    await legacyMapping(seed, bob, "permission:D");
+    expect(await refuse(seed, alice, "permission:D")).toBe("conflict");
+
+    expect(await conflictEvents(seed.teamId)).toBe(2); // both refusals were audited …
+    const rows = ok(await listIdentityDiscoveryConflicts(db(), viewer)).rows;
+    expect(rows.map((r) => [r.provider, r.externalId])).toEqual([["gdrive", "permission:D"]]); // … only Drive's is shown
+  });
+
+  it("observing and displaying a legacy conflict leaves the credit existing content carries through it unchanged", async () => {
+    const seed = await seedTeam();
+    const viewer = { teamId: seed.teamId, memberId: await adminOf(seed) };
+    const alice = await member(seed, "alice");
+    const bob = await member(seed, "bob");
+    await legacyMapping(seed, bob, "permission:L");
+    // A Drive document whose contribution names permission:L — credited to Bob THROUGH that legacy mapping.
+    const at = new Date(Date.now() - 3_600_000).toISOString();
+    const item = await driveFixture(seed, {
+      project: "drive-conflict", path: `gdrive/conflict-${randomUUID()}.md`, body: "legacy-credited body",
+      frontmatter: {
+        source: "gdrive", source_id: `doc-${randomUUID().slice(0, 8)}`, title: "Legacy credited", source_ts: at,
+        authors: [{ provider: "gdrive", external_id: "permission:L", role: "editor" }],
+        contributions: [{ external_id: "permission:L", role: "editor", at }],
+      },
+    }, { attribution: { authorMemberId: bob } });
+    const pool = getPool();
+    const credit = async () => JSON.stringify({
+      item: (await pool.query("select member_id, member_id_locked from items where team_id=$1 and id=$2", [seed.teamId, item.id])).rows,
+      evidence: (await pool.query(
+        "select external_id, member_id from gdrive_contribution_evidence where team_id=$1 and item_id=$2 order by evidence_key",
+        [seed.teamId, item.id])).rows,
+      versions: (await pool.query("select id, member_id from item_versions where item_id=$1 order by id", [item.id])).rows,
+      mapping: (await pool.query(
+        "select member_id from member_identities where team_id=$1 and provider='gdrive' and external_id='permission:L'",
+        [seed.teamId])).rows,
+      states: (await pool.query(
+        "select state, revision from member_identity_mapping_state where team_id=$1 and external_id='permission:L'",
+        [seed.teamId])).rows,
+      authority: (await pool.query("select revision from team_identity_authority where team_id=$1", [seed.teamId])).rows,
+      obligations: (await pool.query(
+        "select mapping_revision from identity_repair_obligations where team_id=$1 and external_id='permission:L'",
+        [seed.teamId])).rows,
+    });
+    // Positive control: Bob really is credited, on the item and on its evidence, through permission:L.
+    const before = await credit();
+    expect(JSON.parse(before).item).toEqual([{ member_id: bob, member_id_locked: false }]);
+    expect(JSON.parse(before).evidence).toEqual([{ external_id: "permission:L", member_id: bob }]);
+
+    expect(await refuse(seed, alice, "permission:L")).toBe("conflict"); // observed with Alice's email
+    const page = ok(await listIdentityDiscoveryConflicts(db(), viewer)); // and displayed
+    expect(page.rows.map((r) => [r.externalId, r.candidate?.id, r.current.holder?.id])).toEqual([["permission:L", alice, bob]]);
+
+    expect(await credit()).toBe(before); // nothing about the credit, the mapping or its repair state moved
   });
 });

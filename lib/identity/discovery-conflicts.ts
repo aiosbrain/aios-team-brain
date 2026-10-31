@@ -6,7 +6,9 @@ import { runSql } from "@/lib/db/pg/pool";
 import type { DbClient } from "@/lib/db/types";
 
 /**
- * AIO-1167 R45 (AC-08) — the Admin diagnostic for AUTOMATIC identity links that were refused.
+ * AIO-1167 R45 (AC-08) — the Admin diagnostic for GOOGLE DRIVE automatic identity links that were
+ * refused. Scoped to Drive by adjudication: only `identity.discovery_conflict` events whose normalized
+ * provider is `gdrive` are projected; no other provider's events are read into it.
  *
  * When a Drive push observes a stable collaborator id whose confirmed email names member A, but that
  * id is already held by another member B through a legacy mapping that was never reviewed, the shared
@@ -109,7 +111,7 @@ with events as (
    where a.team_id = $1
      and a.action = 'identity.discovery_conflict'
      and a.target_type = 'member'
-     and coalesce(a.meta->>'provider', '') <> ''
+     and lower(a.meta->>'provider') = 'gdrive'
      and coalesce(a.meta->>'external_id', '') <> ''
 ), latest as (
   select distinct on (provider, external_id, candidate)
