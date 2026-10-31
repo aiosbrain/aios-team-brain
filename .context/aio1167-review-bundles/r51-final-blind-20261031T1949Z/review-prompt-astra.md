@@ -1,13 +1,13 @@
 Perform a fresh, blind, read-only final review of the exact AIO-1167 candidate identified below. This is an independent review; do not open prior review reports, adjudications, acceptance mappings, handoffs, writer explanations, or conversation history. In particular, do not inspect other files under .context beyond the explicitly named review inputs below.
 
 Inputs:
-- User request: user-request.md
-- Accepted specification: accepted-spec.md
-- Repository instructions: AGENTS.md and workflow-skill.md
+- User request: /Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-recovery-publish-20261031/.context/aio1167-review-bundles/r51-final-blind-20261031T1949Z/user-request.md
+- Accepted specification: /Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-recovery-publish-20261031/.context/aio1167-review-bundles/r51-final-blind-20261031T1949Z/accepted-spec.md
+- Repository instructions: /Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-recovery-publish-20261031/.context/aio1167-review-bundles/r51-final-blind-20261031T1949Z/AGENTS.md and /Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-recovery-publish-20261031/.context/aio1167-review-bundles/r51-final-blind-20261031T1949Z/workflow-skill.md
 - Base SHA: 5ecd2989e21fded915b41b508477bb267aaec06d
-- Exact 46-path source manifest: manifest.json
-- Tracked source diff: tracked-source.diff
-- Added source files: untracked-source.tar.gz
+- Exact 46-path source manifest: /Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-recovery-publish-20261031/.context/aio1167-review-bundles/r51-final-blind-20261031T1949Z/manifest.json
+- Tracked source diff: /Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-recovery-publish-20261031/.context/aio1167-review-bundles/r51-final-blind-20261031T1949Z/tracked-source.diff
+- Added source files: /Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-recovery-publish-20261031/.context/aio1167-review-bundles/r51-final-blind-20261031T1949Z/untracked-source.tar.gz
 - The candidate source tree is available read-only at /Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree.
 
 Snapshot fingerprints: tracked patch SHA-256 7bce966593bb2e4c67374d17aa7317f1a0386c92eee34f37c8a97d2b4e165e6f; untracked archive SHA-256 bfbc6e4e13ea011d51a1312d3d652a1f118644830bb7a54927333c0c592dffb4; manifest SHA-256 dfce2bf22f2717b1e688fe7b44bbc0cfdbddae80ed2b2fd281cbc61bd05f3c82.
