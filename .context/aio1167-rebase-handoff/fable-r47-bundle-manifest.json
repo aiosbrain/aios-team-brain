@@ -1,0 +1,86 @@
+{
+  "base": "8df51664809cfc12740a39d0e98fdb9c8ad05ad8",
+  "implementation_head": "5ecd2989e21fded915b41b508477bb267aaec06d",
+  "branch": "codex/aio-1167-google-docs-connector-rebased",
+  "working_tree_status": " M .context/aio1167-rebase-handoff/CURRENT.md\n M app/t/[team]/admin/integrations/actions.ts\n M app/t/[team]/admin/members/actions.ts\n M components/admin/identity-conflicts.tsx\n M docs/ARCHITECTURE.md\n M ingestion/aios_ingest/brain_client.py\n M ingestion/aios_ingest/connector_state.py\n M ingestion/aios_ingest/gdrive_sync.py\n M ingestion/aios_ingest/state.py\n M ingestion/tests/test_gdrive_poll_reporting.py\n M lib/identity/member-identities.ts\n M lib/integrations/gdrive-authority.ts\n M lib/integrations/gdrive-oauth.ts\n M test/datamechanics/gdrive-admin-credential-race.datamechanics.test.ts\n M test/datamechanics/gdrive-admin-test.datamechanics.test.ts\n M test/datamechanics/gdrive-authority.datamechanics.test.ts\n M test/datamechanics/gdrive-oauth-lock-order.datamechanics.test.ts\n M test/datamechanics/identity-discovery-conflicts.datamechanics.test.ts\n M test/identity-conflicts-view.test.ts\n?? ingestion/tests/test_account_hold_before_streams.py\n?? ingestion/tests/test_checkpoint_acknowledgment.py\n?? ingestion/tests/test_checkpoint_uncertainty_latch.py\n?? ingestion/tests/test_exhaustion_is_not_completion.py\n?? test/datamechanics/gdrive-admin-grant-policy.datamechanics.test.ts\n?? test/datamechanics/gdrive-identity-tombstone-email.datamechanics.test.ts\n",
+  "changed_file_count": 364,
+  "untracked_count": 6,
+  "tracked_diff_sha256": "2a123ab8bd37fafd5ed72311b79620dca815da8044001837d8988f58cb15c342",
+  "files": [
+    {
+      "path": "AGENTS.md",
+      "sha256": "e4117721d454be48f881a878037a07353ea7b355741e366169746276466bdb72",
+      "size": 13460
+    },
+    {
+      "path": "accepted-spec.md",
+      "sha256": "297ee1df91463fd0b6c4863b34be8b999ad176fc7d40f0637bf196660bd65e3d",
+      "size": 60056
+    },
+    {
+      "path": "base.txt",
+      "sha256": "6216fbf53e6f0d6d17eca892f6ce555f9396155f0dc2735a99f24d1fcfa03a26",
+      "size": 41
+    },
+    {
+      "path": "changed-files.txt",
+      "sha256": "feff444af03d051fff1d8006f818d436a01437ece64a7432f30004ebb75a7cdc",
+      "size": 15506
+    },
+    {
+      "path": "full.diff",
+      "sha256": "2a123ab8bd37fafd5ed72311b79620dca815da8044001837d8988f58cb15c342",
+      "size": 5052754
+    },
+    {
+      "path": "head.txt",
+      "sha256": "d2ed16f6d2c95c01990eb314987b4bec41b7ec25bd5883817916c872022032d9",
+      "size": 41
+    },
+    {
+      "path": "name-status.txt",
+      "sha256": "b39b84ae38531ff42f197914b6bb38c2aeaf1299b6c2aed07b44ec09e0ca24b7",
+      "size": 15875
+    },
+    {
+      "path": "status.txt",
+      "sha256": "acd0dbb8d7aebef339107be477cda12462a9e177bc5b96cc0e91c0f6462a7fcb",
+      "size": 1264
+    },
+    {
+      "path": "untracked/ingestion/tests/test_account_hold_before_streams.py",
+      "sha256": "4b2f4b7ab783a9805364e78ecaf5f76d4d83197c8ab31bebe5b89d4454c50924",
+      "size": 12964
+    },
+    {
+      "path": "untracked/ingestion/tests/test_checkpoint_acknowledgment.py",
+      "sha256": "b1dbe4aada8f26d1ec85de5957b7c818d71c910bdec9ae293db3092ff3078f48",
+      "size": 13053
+    },
+    {
+      "path": "untracked/ingestion/tests/test_checkpoint_uncertainty_latch.py",
+      "sha256": "c8f2f19674f32dcf142d01ba4cbea64083fc64b4e3aa6dfbdf371b3f9c1ea63c",
+      "size": 5592
+    },
+    {
+      "path": "untracked/ingestion/tests/test_exhaustion_is_not_completion.py",
+      "sha256": "98932c8cb3aef54f976fe7d6cab0c354305edc7feae4436f3beac9c3e9b1e31e",
+      "size": 2835
+    },
+    {
+      "path": "untracked/test/datamechanics/gdrive-admin-grant-policy.datamechanics.test.ts",
+      "sha256": "fea3264eefc7d4f6b8c7df33dcc706994a3e0b6c85f0d313f000c757eb26d31e",
+      "size": 9115
+    },
+    {
+      "path": "untracked/test/datamechanics/gdrive-identity-tombstone-email.datamechanics.test.ts",
+      "sha256": "c5ca3d2b36823128f2553a2659ef582b8a9569409ce632dc876c4e658357cb64",
+      "size": 15598
+    },
+    {
+      "path": "untracked-manifest.json",
+      "sha256": "6ab02e468f12d0fa8d175e15d25f833883c3d118d830f444d6840cd8622ed3ef",
+      "size": 1092
+    }
+  ]
+}
