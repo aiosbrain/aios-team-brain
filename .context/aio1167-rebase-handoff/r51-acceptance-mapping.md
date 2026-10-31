@@ -88,3 +88,7 @@ This supersedes R50 boundary 3 (repeated rescans for a timeout root).
 
 - Focused Python command across the four R51 test modules: **44 passed in 1.82s**.
 - Full sidecar `.venv/bin/pytest -q`: **928 passed, 28 skipped, 1 failed, 2 errors in 20.74s**. The failure is the stale `dispatch_deadline` expectation in `test_drain_recovery.py::test_budget_expiry_between_metadata_and_docs_is_local_and_untouched`; the two setup errors are loopback `PermissionError` in `test_two_process_sidecars.py` under sandbox denial. Details and exact next action are in `r51-coordinator-verification.md`. No R51 check is yet a full-suite pass.
+
+## Bounded test expectation correction
+
+The same sole writer changed only the stale assertion in `test_drain_recovery.py::test_budget_expiry_between_metadata_and_docs_is_local_and_untouched` from `run_deadline` to `dispatch_deadline`. The separate run-deadline control is unchanged. Writer ran nothing. This corrected snapshot is frozen in `r51-post-fix-20261031T153305Z-a1`; rerun focused/full Python checks before replacing the initial verification status.
