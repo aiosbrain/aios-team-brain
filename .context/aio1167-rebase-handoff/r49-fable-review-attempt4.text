@@ -1,0 +1,78 @@
+I'll start by reading the R49 patch, then the accepted spec and the R48 adjudication, and then inspect the live files and their callers.
+
+I've finished the code inspection and am checking one last item, the R49 writer prompt's wording on generation keying, before writing up the verdict.
+
+**Prompt restated:** independent read-only Fable 5.1 review of the AIO-1167 R49 snapshot (base `5ecd2989`, tracked diff `ae1a7e04…`, patch `d7af0659…` with 12 new tests), judged against the accepted spec and the Astra R48 adjudication, with the acceptance mapping read last. No files were modified, no commands or tests were run.
+
+## Verdict
+
+**Changes required. Not ready for publication.** The R49 corrections are implemented where the adjudication pointed (document restrictions owned apart from retry bookkeeping, F2 settle-only-present plus quota routing, F3 clear-only-on-accepted-ingestion, checkpoint-uncertainty latch, Admin refresh through the broker's grant policy), and the sidecar regression suite is well aimed. One finding contradicts a binding adjudication constraint and I treat it as a blocker unless Astra explicitly accepts it. Three Medium risks need an adjudication decision or a follow-up slice. The TypeScript data-mechanics tests in this snapshot were not run by the writer, so their green status is a hypothesis.
+
+## Findings
+
+**Blocker 1 (High): a scope change waives every provider minimum.** Document restrictions and account holds are keyed by generation. A scope change allocates a new generation, so the adopter ignores the old section, the standing-set helpers filter by the new generation, and the first checkpoint of the new generation drops the old section from the brain's document.
+- Trigger: a document holds an unrepresentable (never-lapsing) or multi-year restriction. The Admin adds or removes any root. The next run reads that document immediately.
+- Expected: the adjudication says "Do not use scope changes, queue replacement or rescan as an implicit override" and F4 says "Scope change is not an approved recovery workaround". A provider's Retry-After binds the account and document at Google, not a selection generation.
+- Actual: `ingestion/aios_ingest/gdrive_sync.py:265-301` returns early on a generation mismatch, `gdrive_sync.py:236-245` and `:200-208` read only the current generation, and `gdrive_sync.py:3130-3141` rebuilds both sections for the current generation only, which `coordinator_document` then publishes wholesale (`ingestion/aios_ingest/connector_state.py:60-87`). The SQLite rows survive but are never consulted again.
+- Impact: the F4 "no override" decision is void. Any scope edit is a one-click early retry, including for the fail-closed sentinel. The same applies to the R47 account hold.
+- Note: the adjudication's own table says "with generation/context validation", so the writer followed one line while breaking another. Astra must resolve that tension. My recommendation is to key restrictions and holds by connection, account and provider id, record generation as context, and carry forward any still-standing entry into the new generation's published section.
+- Regression: restrict a document with the sentinel, publish, bump the execution's generation in the double, run with rearm, assert no read of that document and that the published section still names it.
+
+**Risk 2 (Medium): rearm now keeps the local backoff, not only the provider minimum.** The eighth failure stores `not_before` as the later of backoff and provider deadline (`gdrive_sync.py:126-137`); backoff at seven failures is roughly one to two hours. Rearm no longer clears it (`ingestion/aios_ingest/state.py:1622-1634`), so Run now or Retry within that window neither retries the document nor reports why: `retry_exhausted` is cleared and the row is simply ineligible.
+- Expected: the adjudication's narrow correction was to preserve the provider deadline. With `document_restrictions` now the owner, the backoff component only delays an explicit Admin action.
+- Evidence of masking: every coordinator-level test zeroes `_backoff_seconds` (`ingestion/tests/test_document_restrictions.py` clock fixture, `test_exhaustion_is_not_completion.py:3727`), and `test_rearm_resets_the_attempt_budget…` pins the new behavior with a year-2099 value.
+- Regression: real backoff, exhaust a non-restricted document, run with rearm at once, assert it is read (or assert a named diagnostic if the wait is the intended product behavior).
+
+**Risk 3 (Medium): a non-quota deferral before any stream exists opens an account hold.** `_open_account_hold` holds the account for every deferral except the two local-deadline categories (`gdrive_sync.py:301-341`), and it is called for root binding, relocation re-reads, the service-account identity read and start-token capture (`:1126-1129`, `:1164-1166`, `:1228-1230`).
+- Expected: the writer prompt says "Do not route nonquota deferrals as account holds" and ARCHITECTURE now says "A per-document 503 is never an account hold". In the drain and change-page paths that rule holds.
+- Actual: one root's 503 carrying a valid Retry-After holds every stream and every later run for the full provider deadline, and publishes it. A transient timeout on start-token capture becomes a published hold too, though only for the fallback's few seconds.
+- Coverage: `test_account_hold_before_streams.py` parametrizes only `rate_limited` and `dispatch_deadline`; the root-phase cases in `test_retry_after_holds.py` all use status 429. No test sends a 503 to a root read.
+- Regression: root metadata answers 503 with Retry-After 99999999 while another root and drive are readable. Assert no account hold, the other stream runs, and the root is unresolved or uncertain with that deadline.
+
+**Risk 4 (Medium, design): a restricted selected file root freezes its stream in baseline.** In a rescan or fresh-state rebuild the root's page is never materialized and the baseline returns incomplete (`gdrive_sync.py:2286-2307`, `:2466-2472`), so the stream never reaches catching up and no edit to any other document in that drive is observed until the restriction lapses. For the sentinel that is forever.
+- The initial-baseline case is fine because baseline pages commit without acknowledgments (`:2542`). The gate bites only after a 410 rescan, rebind or fresh state, which is exactly when `test_a_restricted_selected_file_root_is_not_read_by_a_controlled_rescan` runs, and that test does not assert that later edits to the other file still flow.
+- The adjudication asked to "Preserve independent-document progress". Materializing the page without a read would wrongly infer absence, so the clean fix needs a decision: carry the prior snapshot's membership for that root into the new snapshot without a provider read, or accept and document the freeze.
+
+**Risk 5 (Low): automatic publication checks the tombstone before the existing-owner conflict.** `lib/identity/member-identities.ts:148-152` returns `tombstoned` whenever mapping state is `unlinked`, before `:195-199` would detect a row held by another member. Normal writers cannot produce that shape, but a raw legacy row plus an unlinked state would publish the credential without the 409 review page. Move the conflict test ahead of the tombstone return and add one data-mechanics case.
+
+**Risk 6 (Low): a permanently refused post-push checkpoint re-pushes forever with no backoff.** `_push_doc` now treats every non-terminal checkpoint error as control-plane and calls `fail_work` only for a deferral with a date (`gdrive_sync.py:2667-2681`). A 4xx the brain returns on every attempt, such as an oversized progress document, re-pushes the same content each poll with only the error code as diagnostic. Adjudicated as stage-based, so this is a follow-up: cap or report repeated control-plane refusals of one obligation.
+
+**Risk 7 (Low): diagnostics gaps.** The change-page path records unavailable detail but never counts `selection_root_unavailable` (`gdrive_sync.py:1971-1978` versus `:2248-2257`). A restriction whose checkpoint fails has no `…_unpublished` counterpart to the account hold's; only the checkpoint's error code is reported, though the adjudication asked to "report that remote durability is unconfirmed".
+
+## What I verified and coverage limits
+
+Verified against live code: the brain acknowledges an identical replay at a lower revision (`lib/integrations/gdrive-authority.ts:896-910`), so the client's identical-retry comment is true. `coordinator_document` copies the cursor document wholesale, so lapsed holds and restrictions drop as the tests assert. `settle_root`'s widening touches only the unavailable detail, since no other writer puts detail on a bound row (`state.py:941-1142`). The F3 predicate runs after a fresh metadata read under the live gate and clears only after `client.push` returns, before the acknowledging checkpoint. The quota path in `absence_withheld` reaches the coordinator's hold handler with no intervening catch. Watch renewal acquires its own execution per sweep (`watch_renewal.py:420`), so the latch cannot wedge it across sweeps. Admin test, Picker and manual-root paths all surface the authority error text through their catches, and `acquireGdriveAdminTestAuthority` has no Run-now caller. `canonicalIdentityId` is applied consistently at observation and write in `linkMemberIdentity`. The Admin conflicts copy matches the view test strings. The migration the seed test reads exists and contains the matched statement. The data-mechanics config serializes files, so the seed statement cannot bleed into a parallel file.
+
+Coverage limits: the writer ran the Python suite and one Postgres test only. `gdrive-admin-grant-policy`, `gdrive-identity-tombstone-email`, the new 409-callback test, the migration-seed test and the four edited fixtures are unexecuted in this snapshot. The lost-acknowledgment restriction test uses a client double without the latch, so the interaction of an uncertain checkpoint with a newly recorded restriction is untested. No test covers scope change for holds or restrictions. `list_pending` now depends on SQLite's `json_each`; confirm the production image's SQLite build.
+
+**Prompt restated:** the stop hook from the claude-mem plugin ran its session summarizer after my R49 review was delivered.
+
+The hook completed with no errors and needs no action. My review above stands as delivered: changes required, one High finding (scope change waives provider minima via generation keying) treated as a blocker pending Astra's decision, three Medium risks (rearm keeps local backoff, non-quota pre-stream deferrals open account holds, restricted file root freezes a rescanned stream), and the noted coverage limits, chiefly that the TypeScript data-mechanics tests in this snapshot were not executed.
+
+**Prompt restated:** the claude-mem stop hook ran its summarizer again after my previous reply.
+
+Nothing further is needed. The hook reported no errors, and the R49 review is complete as delivered. No files were modified and no commands were run.
+
+**Prompt restated:** the claude-mem stop hook fired a third time with no stderr output.
+
+No action is required from me. The hook is informational, the R49 review is already delivered in full, and the session has nothing outstanding.
+
+**Prompt restated:** the claude-mem stop hook reported another clean summarize run.
+
+Nothing to do. The review is complete and no work is pending.
+
+**Prompt restated:** the claude-mem stop hook completed again without errors.
+
+No action needed. The R49 review stands as delivered and the session is idle.
+
+**Prompt restated:** the claude-mem stop hook ran once more with no stderr.
+
+Nothing outstanding. The review is complete; I have no further work in this session.
+
+**Prompt restated:** another clean run of the claude-mem stop hook.
+
+No action required. The R49 review is delivered and nothing remains to do.
+
+**Prompt restated:** the claude-mem stop hook reported a clean summarize run again.
+
+No action needed; the review is complete and the session is idle.
