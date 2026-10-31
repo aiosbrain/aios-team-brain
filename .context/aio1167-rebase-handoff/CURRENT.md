@@ -74,3 +74,19 @@ Keep R49 F6, H2, M-b/M-c/M-d, live Google certification/soak, opt-in/runner, can
 - The exact focused six-module command now passes: **78 passed in 2.31s**, including the new L1/L2 regressions and existing drain/restriction/checkpoint controls. The strict timestamp ordering assertion remains intact. Full sidecar and broader coordinator checks remain pending; this is not final snapshot verification.
 - Coordinator verification is `r51-lowfix-verification-attempt3.md`. Updated acceptance mapping is inside `r51-lowfix-checkpoint3-20261031T163553_673956Z/acceptance-mapping.md` and in the feature worktree. Checkpoint 3, including the paired-time fix, was pushed and remote-verified at `1fbdbfb7d426243c47b7d7f5e267c988d3bc77a7` before this focused run.
 - Next: run the full ingestion sidecar suite. Then rerun the appropriate cross-owner checks that the focused changes touch, freeze the new source snapshot, and obtain fresh delta review plus blind Astra HIGH and GPT-6.1 Sol HIGH reviews. Keep release/rollout gates open.
+
+## 2026-10-31 16:39 UTC — full R51 low-fix Python verification passed
+
+- Focused six-module suite: **78 passed in 2.31s**. Full ingestion sidecar suite through normal loopback permission: **957 passed, 28 skipped, one existing Starlette/httpx deprecation warning in 22.67s**. `git diff --check HEAD` passed. Exact record: `r51-lowfix-verification-attempt4.md`; acceptance mapping is updated in checkpoint 3.
+- No TypeScript/Postgres production owner changed in the Low-fix slice; prior R50 checks remain valid for those unchanged owners. Final review of the new Python delta is still required.
+- Next: build and remotely checkpoint a hash-pinned final source manifest/diff and Fable delta prompt, refresh subscription `/usage`, obtain fresh Fable 5.1 review of the new corrections, then fresh blind Astra HIGH and GPT-6.1 Sol HIGH reviews. Keep all operational/release gates open.
+
+
+## 2026-10-31 16:43 UTC — R51 Low-fix delta review ready
+
+- The existing Opus 5.5 HIGH writer is complete and idle; no writer process/session is active. No second writer was started.
+- The exact final source snapshot remains based on `5ecd2989e21fded915b41b508477bb267aaec06d`. Full source patch SHA-256 `c09abf59b6a6d30993088321da612e1d384365ffad8d87bcb100cac2b715dfbe` (42 paths including untracked archive); manifest SHA-256 `ec8237e7050d579da03ef0594600cb6b46aff6446164197c5b5498df93d67e03`; untracked-source archive SHA-256 `759e017355249678e6a0eb8b8d59926e4112d788e0b289706be0e1962bb38994`; delta map SHA-256 `a6f375601277653cf548a53bc5df95e1e43ae1421b68567494a7eb962d09089e`. Exact bundle is `r51-lowfix-final-review-20261031T164048Z/`.
+- The delta from the prior Fable-reviewed R51 snapshot is limited to `brain_client.py`, `gdrive_sync.py`, and new `test_brain_minimum_provenance.py`, `test_flush_authority_outcome.py`. The other 38 paths are content-identical to Fable's prior reviewed patch. The prompt SHA-256 is `a3384718075132b2a3e85adbc8a552358fe3a787bf6e2b514f2aaade24b0a68c`.
+- Coordinator verification: focused six-module suite 78 passed; full sidecar 957 passed, 28 skipped, one existing deprecation warning; `git diff --check HEAD` passed. Full record: `r51-lowfix-verification-attempt4.md`. No source changed after these checks.
+- Fresh full-user interactive Claude `/usage` at 16:42 UTC: session 31%, all-model week 33%, Fable week 40%, credits off; no applicable window is near the 90% pause threshold. This is the admission reading for one Fable 5.1 review.
+- Next: run a single Fable 5.1 read-only delta review using the preserved prompt and bundle. If no High/Medium finding or coverage HOLD, proceed to fresh blind Astra HIGH and GPT-6.1 Sol HIGH final reviews. If Fable finds actionable issues, adjudicate before the same sole writer is resumed. Keep R49 F6, H2, M-b/M-c/M-d, live Google certification/soak, opt-in/runner, canary and rollout gates open. No merge/deployment.

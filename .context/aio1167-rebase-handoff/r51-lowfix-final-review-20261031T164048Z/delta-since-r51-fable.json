@@ -1,0 +1,31 @@
+{
+  "previous_source_patch_sha256": "8a1afd7dbc75b495e9c1086a29ce11fbd4a7474eb876e3f0e964b569bf2af27b",
+  "current_base": "5ecd2989e21fded915b41b508477bb267aaec06d",
+  "changed_paths": [
+    {
+      "path": "ingestion/aios_ingest/brain_client.py",
+      "previous_sha256": "fc6c5bcf2dcf072dde3783f129f1aaa6918535f5adba4df9938e64ea08262c5d",
+      "current_sha256": "8a67ef0f5454b15436027d7ff3af472111d772dc2db779d0499d805753bebf13",
+      "status": "content_changed"
+    },
+    {
+      "path": "ingestion/aios_ingest/gdrive_sync.py",
+      "previous_sha256": "26e656b85a0ba2ad8145cf75504be3a23d5709af71dbfdf14579cdef88883f81",
+      "current_sha256": "9e64bc20204f882fb7a3cf900fe284b7a487818805741f0628687dda8b2c45e8",
+      "status": "content_changed"
+    },
+    {
+      "path": "ingestion/tests/test_brain_minimum_provenance.py",
+      "previous_sha256": null,
+      "current_sha256": "99306fe85c6fa67f4b81dd461e6702265dcef2edc5b0b475b2fee7041f6f483c",
+      "status": "added"
+    },
+    {
+      "path": "ingestion/tests/test_flush_authority_outcome.py",
+      "previous_sha256": null,
+      "current_sha256": "21a6364f90739ecc1c80913cc0ec54c154b587a5b5350a39c65ee47ff3cd1a5a",
+      "status": "added"
+    }
+  ],
+  "unchanged_path_count": 38
+}
