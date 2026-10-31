@@ -1,0 +1,39 @@
+{
+  "is_error": false,
+  "session_id": "a117d33a-ebdd-473f-8e87-cae22ebfb558",
+  "subtype": "success",
+  "usage": {
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 5163,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "cache_creation_input_tokens": 5163,
+    "cache_read_input_tokens": 535,
+    "fallback_credit": null,
+    "inference_geo": "global",
+    "input_tokens": 2,
+    "iterations": [
+      {
+        "cache_creation": {
+          "ephemeral_1h_input_tokens": 5163,
+          "ephemeral_5m_input_tokens": 0
+        },
+        "cache_creation_input_tokens": 5163,
+        "cache_read_input_tokens": 535,
+        "input_tokens": 2,
+        "output_tokens": 544,
+        "type": "message"
+      }
+    ],
+    "output_tokens": 544,
+    "output_tokens_details": {
+      "thinking_tokens": 0
+    },
+    "server_tool_use": {
+      "web_fetch_requests": 0,
+      "web_search_requests": 0
+    },
+    "service_tier": "standard",
+    "speed": "standard"
+  }
+}
