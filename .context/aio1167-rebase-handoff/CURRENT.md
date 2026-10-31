@@ -109,3 +109,10 @@ Keep R49 F6, H2, M-b/M-c/M-d, live Google certification/soak, opt-in/runner, can
 - Verified the designated writer with `claude agents --json`: session `628402d5-a1c6-42b7-b736-e84358c1a749`, name `aio1167-r30-opus-writer`, status `idle`, PID 97379; no active correction turn. Reuse only this Opus 5.5 HIGH session. Latest authenticated terminal `/usage` at 16:54 UTC: session 34%, all-model week 33%, Fable week 41%, credits off.
 - Before this correction, recovery checkpoint `039b11791ae889b77f5e90b4470fad444fdfbdea` was pushed and independently read back. Next: commit/push this Astra decision and bounded prompt, resume the same writer, then coordinator verifies and checkpoints before Fable delta review and blind Astra HIGH / GPT-6.1 Sol HIGH final reviews.
 - Keep R49 F6, H2, M-b/M-c/M-d, live Google certification/soak, opt-in/runner proof, canary/rollback and all release gates open. No merge/deployment/readiness claim.
+
+
+## 2026-10-31 17:00 UTC — R51 Note A writer correction checkpoint
+
+- Existing Opus 5.5 HIGH writer session `628402d5-a1c6-42b7-b736-e84358c1a749` completed successfully, first-party, 8 turns. Safe activity: Read 2, Grep 3, Edit 2; no command/test/subagent use. It changed only `gdrive_sync.py` and `test_flush_authority_outcome.py`; parameterized cases cover both authority codes through existing-cause and binding-catch flows. Acceptance row is coordinator-updated and PENDING tests. Writer result is in `r51-counter-wip-20261031T1700Z/writer-result.md`.
+- Source base `5ecd2989e21fded915b41b508477bb267aaec06d`; 42 source paths; tracked patch SHA `a7d20559ee27e01f665a622069042f3fab6c218f914cf5cc559331e07bcdf773`; untracked archive SHA `d554a5aea12094048b6d1df881dc85f79b768a5622adac5c79e05ef3898abe11`; manifest SHA `dff71f20a16aa67487b09648dbc0537ea1be33aa61cff6c3ff40609aaf31a959`. Bundle: `r51-counter-wip-20261031T1700Z/`.
+- Next: push this checkpoint, run focused `test_flush_authority_outcome.py` then the full sidecar suite, update acceptance results, and obtain a fresh Fable delta review of Note A before blind Astra HIGH and GPT-6.1 Sol HIGH reviews. Note B, R49 F6 and all release gates remain open.

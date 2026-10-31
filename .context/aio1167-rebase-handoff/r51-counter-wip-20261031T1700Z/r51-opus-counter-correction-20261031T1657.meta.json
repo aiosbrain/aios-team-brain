@@ -1,0 +1,88 @@
+{
+  "assistant_text_chars": 3622,
+  "is_error": false,
+  "model": "claude-opus-5-5",
+  "model_usage": {
+    "claude-opus-5-5": {
+      "cacheCreationInputTokens": 5755895,
+      "cacheReadInputTokens": 332277550,
+      "canonicalModel": "claude-opus-5-5",
+      "contextWindow": 1000000,
+      "costBasis": "list",
+      "costUSD": 129.41562300000004,
+      "inputTokens": 4659,
+      "maxOutputTokens": 128000,
+      "outputTokens": 845151,
+      "provider": "firstParty",
+      "thinkingTokens": 336303,
+      "webSearchRequests": 0
+    }
+  },
+  "num_turns": 8,
+  "partial_text_chars": 0,
+  "session_id": "628402d5-a1c6-42b7-b736-e84358c1a749",
+  "stop_reason": "end_turn",
+  "subtype": "success",
+  "terminal_reason": "completed",
+  "text_source": "result",
+  "tools": [
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "DesignSync",
+    "Edit",
+    "EnterWorktree",
+    "ExitWorktree",
+    "Glob",
+    "Grep",
+    "ListAgents",
+    "Monitor",
+    "PushNotification",
+    "Read",
+    "RemoteTrigger",
+    "ReportFindings",
+    "ScheduleWakeup",
+    "SendMessage",
+    "Skill",
+    "TaskStop",
+    "ToolSearch",
+    "WebFetch",
+    "WebSearch",
+    "Workflow",
+    "Write"
+  ],
+  "usage": {
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 567157,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "cache_creation_input_tokens": 567157,
+    "cache_read_input_tokens": 3381552,
+    "fallback_credit": null,
+    "inference_geo": "global",
+    "input_tokens": 14,
+    "iterations": [
+      {
+        "cache_creation": {
+          "ephemeral_1h_input_tokens": 1170,
+          "ephemeral_5m_input_tokens": 0
+        },
+        "cache_creation_input_tokens": 1170,
+        "cache_read_input_tokens": 565987,
+        "input_tokens": 2,
+        "output_tokens": 1629,
+        "type": "message"
+      }
+    ],
+    "output_tokens": 4860,
+    "output_tokens_details": {
+      "thinking_tokens": 548
+    },
+    "server_tool_use": {
+      "web_fetch_requests": 0,
+      "web_search_requests": 0
+    },
+    "service_tier": "standard",
+    "speed": "standard"
+  }
+}

@@ -79,8 +79,9 @@ This supersedes R50 boundary 3 (repeated rescans for a timeout root).
 2. A held nested edit is not ingested until the root's verified enumeration (accepted by Astra).
 3. The F4 probe is per run at coordinator level (`deferred_root_probes`); direct callers of the stream
    routine without the coordinator get a per-call set.
-4. A terminal authority refusal met while publishing on an orderly return WITHOUT a prior BrainError
-   is still raised (as any checkpoint's would be); with a prior BrainError cause it is only reported.
+4. ~~A terminal authority refusal met while publishing on an orderly return WITHOUT a prior BrainError
+   is still raised~~ — superseded by the R51 L1 correction below: it is now reported beside the run's
+   accumulated outcome, never raised as a generic coordinator error.
 5. No migration-number or schema change; no new owner, retry service, outage detector or override.
 
 ## Coordinator verification attempt 1
@@ -97,3 +98,50 @@ This supersedes R50 boundary 3 (repeated rescans for a timeout root).
 - `npm run check:docs`: passed (77 routes, 107 tables, 8 sources); `git diff --check HEAD`: passed.
 - No R51 TypeScript or Postgres production owner changed. R50 `typecheck`, build, ESLint, migration and related HTTP/authority suites remain previously verified for their unchanged owners. Re-run them if the fresh review or later corrections changes those owners/contracts.
 - Fresh Fable review and Astra adjudication are still pending; no whole-branch or release-readiness claim.
+
+
+## R51 Low corrections (Astra `astra-r51-low-adjudication.md`) — focused and full sidecar verification passed; final review pending
+
+Input snapshot: base `5ecd2989e21fded915b41b508477bb267aaec06d`, pre-correction patch SHA-256
+`8a1afd7dbc75b495e9c1086a29ce11fbd4a7474eb876e3f0e964b569bf2af27b` (40 paths; Fable: no actionable
+High/Medium, no HOLD). The coordinator verification above attests that pre-correction snapshot only.
+**The writer ran no test or command. Coordinator focused verification passed (78 tests) and the full sidecar passed (957 passed, 28 skipped); final review is pending.** Only L1 and L2
+are resolved in the implementation. R49 F6 stays DEFERRED (before unattended rollout); H2,
+M-b/M-c/M-d, live Google certification/soak, opt-in/runner proof, canary and rollback stay open. No
+TypeScript, Postgres, schema or `scheduler.py` change: scheduled/manual status follows the existing
+`_gdrive_outcome_status` classification and the existing pause/disconnect re-read.
+
+### L1 — terminal checkpoint refusal at an orderly return keeps the hold outcome (resolved in implementation)
+
+| Requirement | Owner | Regression | Result |
+|---|---|---|---|
+| Standing-hold repair refused with `stale_execution` / `connection_unavailable`: summary keeps hold category, adds the authority code once and both unpublished categories; local hold and restriction persist; no provider read; no later checkpoint; lease released | `_flush_restriction_evidence` (no re-raise; `_note_unpublished` + new `_note_flush_authority`) | `test_flush_authority_outcome.py::test_a_terminal_refusal_at_standing_hold_repair_keeps_the_hold_outcome[stale_execution]`, `[connection_unavailable]` | PASS — focused 78 passed; full sidecar 957 passed / 28 skipped |
+| Scheduled and manual reports carry that summary (no `coordinator_error`), status = existing classification; paused/disconnected re-read still suppresses | `scheduler._poll_job` / `_manual_gdrive_job` (unchanged) | `test_flush_authority_outcome.py::test_scheduled_and_manual_reports_carry_the_hold_outcome_not_a_coordinator_error[stale_execution]`, `[connection_unavailable]` | PASS — focused 78 passed; full sidecar 957 passed / 28 skipped |
+| Equivalent drain catch: `closed.partial` progress and hold diagnostics kept, authority code + `account_hold_unpublished` reported, run returns at once (no end flush, no further read/checkpoint); status `partial` beside progress | coordinator `_ProviderAdmissionClosed` handler (`authority_lost`) | `test_flush_authority_outcome.py::test_a_terminal_refusal_of_the_drain_hold_checkpoint_keeps_progress_and_the_hold[stale_execution]`, `[connection_unavailable]` | PASS — focused 78 passed; full sidecar 957 passed / 28 skipped |
+| End-of-run flush keeps accumulated counts/categories; an existing nonterminal cause stays beside the distinct flush authority code | `_flush_restriction_evidence`, `_note_flush_authority` | `test_flush_authority_outcome.py::test_the_end_of_run_flush_keeps_accumulated_progress_and_an_existing_cause[stale_execution]`, `[connection_unavailable]` | PASS — focused 78 passed; full sidecar 957 passed / 28 skipped |
+
+Retained: a terminal `cause` still suppresses publication entirely (unpublished noted); exception text
+is never reported; existing pre-correction tests for terminal causes are unchanged.
+
+### L2 — brain-named minimum separated from local BrainClient fallback (resolved in implementation)
+
+| Requirement | Owner | Regression | Result |
+|---|---|---|---|
+| `BrainDeferred.provider_not_before` carries only the brain-named Retry-After (valid zero included); absent for no header / malformed; `not_before` stays the combined local eligibility | `brain_client.BrainDeferred`, `_named_retry_after`, `_backoff` | `test_brain_minimum_provenance.py::test_a_brain_deferral_carries_only_the_brain_named_minimum[no-header]`, `[malformed]`, `[positive]`, `[zero]` | PASS — focused 78 passed; full sidecar 957 passed / 28 skipped |
+| Unanswered-request (timeout) fallback names no minimum | `_timeout_backoff` | `test_brain_minimum_provenance.py::test_an_unanswered_request_fallback_names_no_minimum` | PASS — focused 78 passed; full sidecar 957 passed / 28 skipped |
+| Checkpoint deferral carries only the brain-named minimum; uncertainty latch unchanged | `checkpoint_gdrive_execution` | `test_brain_minimum_provenance.py::test_a_deferred_checkpoint_carries_only_the_brain_named_minimum_and_latches[no-header]`, `[positive]` | PASS — focused 78 passed; full sidecar 957 passed / 28 skipped |
+| Exhausting sink failure on local fallback (503 without header, malformed header, timeout): no external minimum; rearm → eligible at once | `_record_sink_failure` → `_fail_work(external=False, minimum=provider_not_before)` | `test_brain_minimum_provenance.py::test_an_exhausting_sink_failure_on_local_fallback_leaves_no_minimum_and_rearm_reads_at_once[no-header]`, `[malformed]`, `[timeout]` | PASS — focused 78 passed; full sidecar 957 passed / 28 skipped |
+| Controls: valid positive minimum survives rearm; valid zero recorded and already elapsed; earlier minimum never erased; non-exhausted work keeps ordinary backoff | `_fail_work(minimum=)`, `StateStore.fail_work` monotonic merge (unchanged), `rearm_exhausted` (unchanged) | `test_brain_minimum_provenance.py::test_a_valid_positive_brain_minimum_survives_rearm`; `::test_a_valid_zero_brain_minimum_is_recorded_and_already_elapsed`; `::test_an_earlier_brain_minimum_is_never_erased_by_a_later_local_fallback`; `::test_non_exhausted_work_keeps_its_ordinary_backoff` | PASS — focused 78 passed; full sidecar 957 passed / 28 skipped |
+| Accepted-content checkpoint deferral: local-only minimum absent (brain-named recorded), failure budget unchanged, obligation retained, latch honoured; immediate rearm eligibility NOT demanded | `_push_doc` checkpoint branch (`minimum=provider_not_before`, `failure=False`) | `test_brain_minimum_provenance.py::test_an_accepted_documents_deferred_checkpoint_records_only_a_brain_named_minimum[acknowledged-refusal-local-only]`, `[acknowledged-refusal-brain-named]`, `[latched-local-only]`, `[latched-brain-named]` | PASS — focused 78 passed; full sidecar 957 passed / 28 skipped |
+
+Unknown legacy minima (`deadline_tracked=0`) and the wait actually slept are unchanged; this does not
+implement R49 F6.
+
+
+## R51 Note A — duplicate failed-run charge at terminal flush (Low)
+
+| Requirement | Owner | Regression | Result |
+|---|---|---|---|
+| A terminal authority refusal after an already-counted nonterminal cause preserves `failed == 1`, original cause, and authority/unpublished categories once each; no-cause path still charges one failure and accumulated progress remains | `_flush_restriction_evidence` → `_note_flush_authority(charge=cause is None)` | `test_flush_authority_outcome.py::test_the_end_of_run_flush_keeps_accumulated_progress_and_an_existing_cause[stale_execution|connection_unavailable]`; `::test_a_binding_brain_error_then_a_refused_flush_is_charged_once[stale_execution|connection_unavailable]` | **PENDING coordinator verification** |
+
+Astra Note B (backlog measurement after authority loss) remains deferred. This narrow correction changes neither authority/hold behavior nor status classification.

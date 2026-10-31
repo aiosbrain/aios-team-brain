@@ -1,0 +1,36 @@
+**What you asked for (R51 Note A):** fix only Astra's Low duplicate failure count. When a terminal authority refusal hits during the flush after a nonterminal cause already charged the run, keep `failed` and the original cause, and add the authority and unpublished categories once. Keep the no-cause path's single charge, add regressions, and leave Note B, verification and the handoff files alone.
+
+The fix and two regressions are written, uncommitted. **I ran no tests or commands**, and no subagents.
+
+## Changed paths
+- `ingestion/aios_ingest/gdrive_sync.py`
+- `ingestion/tests/test_flush_authority_outcome.py`
+
+## Behaviour
+- `_note_flush_authority` now takes `charge: bool = True`. It still records the authority code once; it adds to `failed` only when `charge` is true.
+- `_flush_restriction_evidence` passes `charge=cause is None`. Both callers that pass a `cause` (the binding catch and the coordinator's start-token `BrainError` catch) already did `failed += 1` before flushing, so one terminating run is now counted once.
+- **No-cause path unchanged:** the refusal is still this run's one failure. An earlier document failure does not stand in for it.
+- **Drain catch unchanged:** it still uses the default `charge=True`, because nothing charges that run before it.
+- Not touched: count caps, status classification, hold/publication/lease behaviour, the terminal-`cause` short-circuit, and Note B.
+
+## Tests added (not run)
+- **Extended:** `test_the_end_of_run_flush_keeps_accumulated_progress_and_an_existing_cause[stale_execution|connection_unavailable]`.
+  - The existing-cause case now also asserts `caused.failed == 1`, with `server_error` unchanged and the authority and unpublished categories once each.
+  - The no-cause control still asserts `failed == 1` and the accumulated counts.
+- **New:** `test_a_binding_brain_error_then_a_refused_flush_is_charged_once[stale_execution|connection_unavailable]`. It goes through the real binding catch:
+  - root A returns a 503 with a long Retry-After, so its minimum is journaled;
+  - root B raises a nonterminal `server_error`;
+  - the flush is refused with the authority code.
+  - It asserts `failed == 1`, `server_error` once, the authority code once, `document_restriction_unpublished` once, no `coordinator_error`, exactly one refused checkpoint, and that A's minimum is kept locally.
+
+## Acceptance mapping
+Your prompt asked both for a mapping update and for no handoff edits. I treated the no-edit instruction as the binding one, so I did not touch `r51-acceptance-mapping.md`. Proposed row for you to add:
+
+| Requirement | Owner | Regression | Result |
+|---|---|---|---|
+| R51 Note A: a terminal flush refusal after a charged nonterminal cause keeps `failed == 1`, the original cause, and the authority and unpublished categories once each; the no-cause path still charges one failure | `_flush_restriction_evidence` → `_note_flush_authority(charge=cause is None)` | `test_flush_authority_outcome.py::test_the_end_of_run_flush_keeps_accumulated_progress_and_an_existing_cause[stale_execution\|connection_unavailable]`; `::test_a_binding_brain_error_then_a_refused_flush_is_charged_once[stale_execution\|connection_unavailable]` | NOT RUN — coordinator |
+
+## Still open
+- Note B is still deferred, as Astra decided.
+- If a future caller passes a `cause` without having charged it first, that run would be under-counted. The two current callers both charge before they flush.
+- R49 F6, H2, M-b/M-c/M-d, live Google certification and soak, opt-in/runner proof, canary and rollback all remain open. No readiness claim.
