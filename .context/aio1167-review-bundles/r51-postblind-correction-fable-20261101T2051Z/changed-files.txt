@@ -1,0 +1,14 @@
+modified	docs/ARCHITECTURE.md
+modified	ingestion/aios_ingest/connector_state.py
+modified	ingestion/aios_ingest/gdrive_sync.py
+modified	ingestion/aios_ingest/sources/gdrive.py
+added	ingestion/aios_ingest/sources/gdrive_watch.py
+modified	ingestion/aios_ingest/state.py
+added	ingestion/aios_ingest/watch_lifecycle.py
+modified	ingestion/aios_ingest/watch_renewal.py
+added	ingestion/tests/test_deferred_folder_enumeration.py
+added	ingestion/tests/test_explicit_trash_evidence.py
+modified	ingestion/tests/test_gdrive_upgrade.py
+added	ingestion/tests/test_watch_lifecycle.py
+added	ingestion/tests/test_watch_quota_hold.py
+added	test/datamechanics/gdrive-audience-claims.datamechanics.test.ts

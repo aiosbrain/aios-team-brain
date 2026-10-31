@@ -1,0 +1,92 @@
+{
+  "current_candidate_path_count": 53,
+  "delta_path_count": 14,
+  "paths": [
+    {
+      "change": "modified",
+      "current_sha256": "bb55814c4315c169bf993e7c2995b46272cc7cccf024253478f838c6f3048b97",
+      "path": "docs/ARCHITECTURE.md",
+      "previous_sha256": "6d42631a0475905321d0b56accce118e37e55a0dc1af4dac706a3f9f02e1250c"
+    },
+    {
+      "change": "modified",
+      "current_sha256": "2d98520ea89276812f85fa09dbf7f6f75dcc3bb00aacc4f14cd61bb4653af990",
+      "path": "ingestion/aios_ingest/connector_state.py",
+      "previous_sha256": "1c5e99bfc74f58d9cd9ed0b4cdd9f3e487cd54b7cf63bbd7169df53ebd181646"
+    },
+    {
+      "change": "modified",
+      "current_sha256": "951cdd00e3b5c0191b2b1b8896a3a8738cbd9b943faa63185f5f2f578619abb1",
+      "path": "ingestion/aios_ingest/gdrive_sync.py",
+      "previous_sha256": "756542ae18332128fff143b7cd88423c9aec320aecd1d1a68af2e2538b1e8aaf"
+    },
+    {
+      "change": "modified",
+      "current_sha256": "7785c430f61c7b094cc3e53fe8a50f682f42b17603c5581746454b98b37fbc64",
+      "path": "ingestion/aios_ingest/sources/gdrive.py",
+      "previous_sha256": "a341d3e7b9e826c1b3d9a952896f73e164c64181f4fbc499cfdaea1174ee2db5"
+    },
+    {
+      "change": "added",
+      "current_sha256": "787ff87f1f69c3be6b4a38111696d284ced6f9f618179df557a6bd3bbc8ea8ee",
+      "path": "ingestion/aios_ingest/sources/gdrive_watch.py",
+      "previous_sha256": null
+    },
+    {
+      "change": "modified",
+      "current_sha256": "5476a73e964d7e28278841284bd9c7b706da455b90434fa62df11e41b22e8695",
+      "path": "ingestion/aios_ingest/state.py",
+      "previous_sha256": "db9c2c20f94cb679228354acd455b037fd89fcddf7505c2b59733fa8eb6d1253"
+    },
+    {
+      "change": "added",
+      "current_sha256": "c447e1b89119949a375749102ec7db4c1d22f5f46f9e83df86feebe07931cd16",
+      "path": "ingestion/aios_ingest/watch_lifecycle.py",
+      "previous_sha256": null
+    },
+    {
+      "change": "modified",
+      "current_sha256": "f666b58dcad106cd31c57de4ac2c95adf9a9b2d2050df9f2892ae3f514b2e416",
+      "path": "ingestion/aios_ingest/watch_renewal.py",
+      "previous_sha256": "6f4b7684e00f53a9a60ae4118988a2b09df8d0f478ccdd1cb5d4b2346b565525"
+    },
+    {
+      "change": "added",
+      "current_sha256": "1c25a14b5e0cbd9773dc1b104246e704f32bc185249a8653352071c128897bfe",
+      "path": "ingestion/tests/test_deferred_folder_enumeration.py",
+      "previous_sha256": null
+    },
+    {
+      "change": "added",
+      "current_sha256": "6c232c6fa20a7d7c005cb97158cffb1e89fcb8a108c5de4787fd473629ba353e",
+      "path": "ingestion/tests/test_explicit_trash_evidence.py",
+      "previous_sha256": null
+    },
+    {
+      "change": "modified",
+      "current_sha256": "cd5e7e19657a302d0a278df7fa145bb4c2c05ecda214eda875a074109dcb5352",
+      "path": "ingestion/tests/test_gdrive_upgrade.py",
+      "previous_sha256": "3098840cc5e49d038c1f82377f9bd80e2e9537dfe7741166c075a4cf3e0c499b"
+    },
+    {
+      "change": "added",
+      "current_sha256": "03e5ccf5e494bcfe071bdf7497360ab9af979f6eebfcfc0ff4866999613ff700",
+      "path": "ingestion/tests/test_watch_lifecycle.py",
+      "previous_sha256": null
+    },
+    {
+      "change": "added",
+      "current_sha256": "8a623513bf3d68190df76072859db99683e570518d4c37c11bfbc638b1b17881",
+      "path": "ingestion/tests/test_watch_quota_hold.py",
+      "previous_sha256": null
+    },
+    {
+      "change": "added",
+      "current_sha256": "8fb39b31fab19813761300db5b7ea3ccdbe38ba1cf3157131bd960c0e0468109",
+      "path": "test/datamechanics/gdrive-audience-claims.datamechanics.test.ts",
+      "previous_sha256": null
+    }
+  ],
+  "previous_candidate_path_count": 46,
+  "previous_fable_review": "r51-fable-correction-delta-20261031T1932Z"
+}

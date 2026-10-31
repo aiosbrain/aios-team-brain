@@ -1,0 +1,223 @@
+{
+  "base_head": "5ecd2989e21fded915b41b508477bb267aaec06d",
+  "captured_at_utc": "2026-10-31T20:47:46.480195+00:00",
+  "paths": [
+    {
+      "path": "app/t/[team]/admin/integrations/actions.ts",
+      "sha256": "657f0fb09cfe243578d5bffa4f2bf6363e4459f5a4d2bc9cf5881baebe1f1968"
+    },
+    {
+      "path": "app/t/[team]/admin/members/actions.ts",
+      "sha256": "4af529fb0b13ed6c3e990c6c1ceb5090fcb391124267e9459ae878f2899561b1"
+    },
+    {
+      "path": "components/admin/identity-conflicts.tsx",
+      "sha256": "ce6404ff329fb2c9b9a2049a091132c2d62ea8351e641b8a77c5822e3b2b91dd"
+    },
+    {
+      "path": "docs/ARCHITECTURE.md",
+      "sha256": "bb55814c4315c169bf993e7c2995b46272cc7cccf024253478f838c6f3048b97"
+    },
+    {
+      "path": "ingestion/aios_ingest/brain_client.py",
+      "sha256": "8a67ef0f5454b15436027d7ff3af472111d772dc2db779d0499d805753bebf13"
+    },
+    {
+      "path": "ingestion/aios_ingest/connector_state.py",
+      "sha256": "2d98520ea89276812f85fa09dbf7f6f75dcc3bb00aacc4f14cd61bb4653af990"
+    },
+    {
+      "path": "ingestion/aios_ingest/gdrive_sync.py",
+      "sha256": "951cdd00e3b5c0191b2b1b8896a3a8738cbd9b943faa63185f5f2f578619abb1"
+    },
+    {
+      "path": "ingestion/aios_ingest/sources/gdrive.py",
+      "sha256": "7785c430f61c7b094cc3e53fe8a50f682f42b17603c5581746454b98b37fbc64"
+    },
+    {
+      "path": "ingestion/aios_ingest/sources/gdrive_watch.py",
+      "sha256": "787ff87f1f69c3be6b4a38111696d284ced6f9f618179df557a6bd3bbc8ea8ee"
+    },
+    {
+      "path": "ingestion/aios_ingest/state.py",
+      "sha256": "5476a73e964d7e28278841284bd9c7b706da455b90434fa62df11e41b22e8695"
+    },
+    {
+      "path": "ingestion/aios_ingest/watch_lifecycle.py",
+      "sha256": "c447e1b89119949a375749102ec7db4c1d22f5f46f9e83df86feebe07931cd16"
+    },
+    {
+      "path": "ingestion/aios_ingest/watch_renewal.py",
+      "sha256": "f666b58dcad106cd31c57de4ac2c95adf9a9b2d2050df9f2892ae3f514b2e416"
+    },
+    {
+      "path": "ingestion/tests/test_account_hold_before_streams.py",
+      "sha256": "dc6c5e5a3ee1d30af6b7268b775403d548575443ef36462dbcf8145f1f58f768"
+    },
+    {
+      "path": "ingestion/tests/test_bound_root_loss.py",
+      "sha256": "0dd5be18bc2d14b63a8896e806a49e9ef8e86c991b1b7e61f7fa2d5b223e4056"
+    },
+    {
+      "path": "ingestion/tests/test_brain_minimum_provenance.py",
+      "sha256": "99306fe85c6fa67f4b81dd461e6702265dcef2edc5b0b475b2fee7041f6f483c"
+    },
+    {
+      "path": "ingestion/tests/test_checkpoint_acknowledgment.py",
+      "sha256": "8a9fbe4d0a191110f49d758891491a73121a0d6dde4736ee253d9267a136c076"
+    },
+    {
+      "path": "ingestion/tests/test_checkpoint_uncertainty_latch.py",
+      "sha256": "c8f2f19674f32dcf142d01ba4cbea64083fc64b4e3aa6dfbdf371b3f9c1ea63c"
+    },
+    {
+      "path": "ingestion/tests/test_deferred_folder_enumeration.py",
+      "sha256": "1c25a14b5e0cbd9773dc1b104246e704f32bc185249a8653352071c128897bfe"
+    },
+    {
+      "path": "ingestion/tests/test_deferred_root_scope.py",
+      "sha256": "39a4f3d755178a2ef5bdbc7b4a144d09a0ff09a139dbc69f3a05b44347f51f8a"
+    },
+    {
+      "path": "ingestion/tests/test_document_restrictions.py",
+      "sha256": "7df63b454dcda4ce94788a54250a6d34080dff69eaf5a1e13c1470f9191b46ce"
+    },
+    {
+      "path": "ingestion/tests/test_drain_recovery.py",
+      "sha256": "f4fb7515441f9c2afc9b983580a81ce1ddc12dae87a021e777c1caed58cef492"
+    },
+    {
+      "path": "ingestion/tests/test_exhaustion_is_not_completion.py",
+      "sha256": "98932c8cb3aef54f976fe7d6cab0c354305edc7feae4436f3beac9c3e9b1e31e"
+    },
+    {
+      "path": "ingestion/tests/test_explicit_trash_evidence.py",
+      "sha256": "6c232c6fa20a7d7c005cb97158cffb1e89fcb8a108c5de4787fd473629ba353e"
+    },
+    {
+      "path": "ingestion/tests/test_flush_authority_outcome.py",
+      "sha256": "8d0a18706cd6167587679ffa10fbf3d7bed704a0a8d82342faa3fc0b7998479c"
+    },
+    {
+      "path": "ingestion/tests/test_gdrive_poll_reporting.py",
+      "sha256": "76166eb459c227b2b15951aa5706177808cf9f819aee824041a52807882366e4"
+    },
+    {
+      "path": "ingestion/tests/test_gdrive_upgrade.py",
+      "sha256": "cd5e7e19657a302d0a278df7fa145bb4c2c05ecda214eda875a074109dcb5352"
+    },
+    {
+      "path": "ingestion/tests/test_identity_prerequisite_publication.py",
+      "sha256": "7c2dc6acd861a000a14b61c774f64b061fbe66aa62a79a9aade4f81a4ba500a0"
+    },
+    {
+      "path": "ingestion/tests/test_pre_stream_scope.py",
+      "sha256": "ff26f1a4d1b03ac0c30d21829bd3cfbb314deafd311e176bd10a3747727451bd"
+    },
+    {
+      "path": "ingestion/tests/test_restricted_removal.py",
+      "sha256": "608b6ebb1eba5ee1b6c18ef72f3c35af0dede2eb43687f9787cca2c180d3257e"
+    },
+    {
+      "path": "ingestion/tests/test_restricted_root_recovery.py",
+      "sha256": "f0bebdcee179d06a44b581ecbc9a72f28b1b4a60b5f555e0e419acee520a6400"
+    },
+    {
+      "path": "ingestion/tests/test_restriction_lifetime.py",
+      "sha256": "e23e15e6a957cf00d8c87517b4f4d0ea088c06f93896dd8cd7f54233af92ee6e"
+    },
+    {
+      "path": "ingestion/tests/test_restriction_publication_recovery.py",
+      "sha256": "23d5b1ade655a7c350753e2c26ddd5d0166ce380505feeaf7cb6cd5fca8f296e"
+    },
+    {
+      "path": "ingestion/tests/test_retry_after_holds.py",
+      "sha256": "18337db7a6d6f8b23a42e24e808190948555d9c2164beef3c4d11c43ffaa2ed6"
+    },
+    {
+      "path": "ingestion/tests/test_retry_after_parsing.py",
+      "sha256": "afab189721e54ef9cef2a77db6226832552a25a868d2107647680775fbed23cb"
+    },
+    {
+      "path": "ingestion/tests/test_root_evidence_r49.py",
+      "sha256": "8e7e2565f48b14dbad8d5cbc0312d30b1957dc0e8d88ddcb833782f013d50682"
+    },
+    {
+      "path": "ingestion/tests/test_watch_account_hold.py",
+      "sha256": "72ef0e68e0052f5f9dd34395c97adada2a0d354f2ef4798c0c87ad69cb0b480b"
+    },
+    {
+      "path": "ingestion/tests/test_watch_lifecycle.py",
+      "sha256": "03e5ccf5e494bcfe071bdf7497360ab9af979f6eebfcfc0ff4866999613ff700"
+    },
+    {
+      "path": "ingestion/tests/test_watch_quota_hold.py",
+      "sha256": "8a623513bf3d68190df76072859db99683e570518d4c37c11bfbc638b1b17881"
+    },
+    {
+      "path": "lib/identity/member-identities.ts",
+      "sha256": "0b2fb413ddd055ef31bd5e480666ae950edc2e5d46e15999eced72433a86e800"
+    },
+    {
+      "path": "lib/integrations/gdrive-authority.ts",
+      "sha256": "edf9cc6453e967b8fa24a434cd5e7085c699b123c959b2e4e026ee1edecdba52"
+    },
+    {
+      "path": "lib/integrations/gdrive-oauth.ts",
+      "sha256": "368d69a01a1ed63b8bc50025b023138320c8dd288ac32f3f99a8fe0195f08223"
+    },
+    {
+      "path": "postgres/migrations/20261031140000_gdrive_restriction_generation_lifetime.sql",
+      "sha256": "5e0feb43c34157b81c073e51c590b67d9cc4188c5027445b61c67f3000b411f5"
+    },
+    {
+      "path": "postgres/schema.sql",
+      "sha256": "c59db6714d10b17b1155c8b72e16815341aa8fdf6cefcbc5cf3526d882ff3d6e"
+    },
+    {
+      "path": "test/datamechanics/gdrive-admin-credential-race.datamechanics.test.ts",
+      "sha256": "3c15216883df57ed2d106ffb298c16b61eb9cc599647a1adc469ef42ba4a7313"
+    },
+    {
+      "path": "test/datamechanics/gdrive-admin-grant-policy.datamechanics.test.ts",
+      "sha256": "fea3264eefc7d4f6b8c7df33dcc706994a3e0b6c85f0d313f000c757eb26d31e"
+    },
+    {
+      "path": "test/datamechanics/gdrive-admin-test.datamechanics.test.ts",
+      "sha256": "441119dece8db8315ccd9608b6e94e489130aba2e695caf2c72d4ff0a1a3f3ca"
+    },
+    {
+      "path": "test/datamechanics/gdrive-audience-claims.datamechanics.test.ts",
+      "sha256": "8fb39b31fab19813761300db5b7ea3ccdbe38ba1cf3157131bd960c0e0468109"
+    },
+    {
+      "path": "test/datamechanics/gdrive-authority.datamechanics.test.ts",
+      "sha256": "9c26c25e1c10cf417ed52a2315c76e2404bce5a4ccb921fd8db07ed1b81f1c4c"
+    },
+    {
+      "path": "test/datamechanics/gdrive-complete-snapshot-overlap.datamechanics.test.ts",
+      "sha256": "53bb0c645254a06f0f2e3abcf8e49af564615b70126a51edbf785d3f8edf9ddf"
+    },
+    {
+      "path": "test/datamechanics/gdrive-identity-tombstone-email.datamechanics.test.ts",
+      "sha256": "292186cfc3c30b52da8e0573c5ec32e6322fd0e7e37a58c8c6474f4841317be7"
+    },
+    {
+      "path": "test/datamechanics/gdrive-oauth-lock-order.datamechanics.test.ts",
+      "sha256": "04af79657b1299037d6051f1c0059d0dfa55472ac212837b9203a2042b911c39"
+    },
+    {
+      "path": "test/datamechanics/identity-discovery-conflicts.datamechanics.test.ts",
+      "sha256": "b71dd6aa508cbce39b177ca6e74ebc5f9d4d819b001daecafb6bb2053b593c0a"
+    },
+    {
+      "path": "test/identity-conflicts-view.test.ts",
+      "sha256": "cf5a393d3e9dcafbaa58d3aa603e30f8a031b9f1419cd5f36a295e86ac31b552"
+    }
+  ],
+  "source_worktree": "/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree",
+  "tracked_diff_sha256": "fb4f8d6ebc1817d0f76292069a3b92c20ce5b779fb081c3e4803cd903cd010c8",
+  "tracked_path_count": 27,
+  "untracked_archive_sha256": "f0a9d8fec533f743251dd17ab68128790788e61430ec589db9bd75e6ad6bb4c0",
+  "untracked_path_count": 26
+}
