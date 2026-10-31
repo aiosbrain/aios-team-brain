@@ -1,0 +1,22 @@
+# AIO-1167 R50 Fable findings — fresh GPT-6 Astra MEDIUM adjudication
+
+Role: specification/adjudication owner. This is a fresh read-only decision on Fable's exact R50 review findings, not implementation. Do not edit files, run tests/commands, or communicate with external services.
+
+Read:
+- Accepted spec: `.context/aio1167-rebase-handoff/accepted-spec.md`
+- Astra R49 adjudication: `.context/aio1167-rebase-handoff/astra-r49-adjudication.md`
+- R50 acceptance map and coordinator results: `.context/aio1167-rebase-handoff/r50-acceptance-mapping.md`
+- Claude Fable 5.1 curated R50 report: `.context/aio1167-rebase-handoff/r50-fable-review-report.md` (SHA-256 `624cdcd178a3eb3a58edef7a01283c8c138a54fc46829c27f4835b89f5114299`)
+- Exact R50 source patch: `.context/aio1167-rebase-handoff/r50-review-source.diff` (SHA-256 `53c3d7068b1977e35fae8280475b05a24276dbc557fdd60b92fe71a65aaa37fd`), base `5ecd2989e21fded915b41b508477bb267aaec06d`.
+- Source worktree: `/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree`
+
+Independently verify the concrete code paths for each finding before deciding. Fable's report is evidence, not authority. Adjudicate each as fix in this slice, accept as already satisfied, narrow, or explicitly defer with a specific rollout gate. Include evidence and exact next actions/tests. Specifically assess:
+
+1. **F4 High — deferred folder root and nested membership.** Fable traces `retained_root_membership` preserved without its `traversal_additions` ancestry. A subsequent change for a nested retained document may be treated as out of scope and emit a removal while the root is deferred. Verify whether this violates the accepted no-inferred-absence/retained-membership contract. If valid, prescribe a narrow state representation or admission fix that retains the derivation needed for nested scope without falsely marking the root complete; specify regressions for timeout-deferred and mid-run-expired restrictions, and preserve root-coverage/claim-retirement gates.
+2. **F3 Medium — binding early-return loses prior root minimum.** A first file root gets a valid long `Retry-After`; a later root gets quota or BrainError and returns before deferred-root persistence. Verify behavior and require an owner/order correction so each already-observed provider minimum is durable even when later work short-circuits. Specify a two-root regression proving no early retry after the account hold lapses.
+3. **F7/F1 Medium — drain-phase hold publication failure.** A 429 during drain records a local account hold, then the checkpoint fails; current report claims only `rate_limited`, later runs return early and do not republish. Verify whether account-hold evidence is lost from acknowledged recovery and whether existing `account_hold_unpublished` is intended to cover it. Specify recovery after lost checkpoint, diagnostic and fresh-state assertions.
+4. **F4 Medium — timeout-only deferred root repeatedly rescans the whole stream.** Determine if this is covered by the explicit F6 deferral or remains an accepted bounded liveness/efficiency tradeoff. If fix is required, constrain it to the existing root/stream owner, preserving eligibility after recovery and avoiding a new retry/override owner. Give a focused repeated-poll test and an explicit gate if deferred.
+5. **Low findings:** (a) Run now does not clear backoff for non-exhausted work—does the accepted rearm promise apply only to exhausted work? (b) local timeout/malformed-header fallback passed as `retry_after` may be treated as external and survive rearm—does it violate owner separation? (c) `dispatch_deadline` reported as `run_deadline`—is this a correction now or follow-up? Decide each with rationale and exact scope.
+6. **Coverage limit:** Fable says it did not re-review the earlier R47 Admin refresh/grant-policy TypeScript in the 37-path patch and did not inspect `lib/integrations/gdrive-root-coverage.ts` beyond section reads. Determine what additional review is necessary before claiming R50 coverage. Do not overstate the existing verdict's scope.
+
+The R50 source patch is frozen and all coordinator checks are recorded. The Fable verdict is changes required. No final blind review should run until any adjudicated corrections are implemented and verified. Return a concise but evidence-based adjudication with priorities, disposition, invariant, exact bounded writer scope and regression matrix. Do not change source or ask the user for another authorization.

@@ -96,3 +96,14 @@ The reviewed source delta remains frozen at base `5ecd2989e21fded915b41b508477bb
 - Full data-mechanics tier remains the previously recorded 314 files passed, 2 skipped and 2 environment-gated failures (`graph-tier` requires Neo4j; `staging-coordinator-lock-lifetime` requires the canonical live lock owner). Those failures are unrelated to this delta and are not represented as passes.
 
 These checks verify implementation behavior but do not replace fresh independent R50 Fable review or the required fresh blind Astra and GPT-6.1 Sol reviews. The HTTP tier was targeted; live Google certification, production evidence and rollout gates remain open.
+
+
+## Independent R50 review — Fable 5.1
+
+- Exact source patch: SHA-256 `53c3d7068b1977e35fae8280475b05a24276dbc557fdd60b92fe71a65aaa37fd`; base `5ecd2989e21fded915b41b508477bb267aaec06d`.
+- Reviewer: subscription-authenticated `claude-fable-5-1`, session `7618b881-663e-4587-96de-989a2900d887`, terminal success, 65 turns, no stderr, no source edits or tests. Filter metadata: `r50-fable-review.meta.json`. Curated report: `r50-fable-review-report.md`.
+- Verdict: **changes required before blind final reviews**. Fable confirms R50 F1, F2, F5 and deferred F6 as implemented/not claimed. It identifies one High, three Medium and three Low findings; exact triggers, evidence and suggested regressions are in the curated report.
+- Adjudication requested next: F4 High (nested document under deferred folder root can be removed without a verified listing); F3 Medium (a later binding quota/authority error can skip persisting an earlier root's Retry-After); F7 Medium (drain-phase account hold with failed checkpoint is neither reported as unpublished nor retried); F4 Medium (timeout-deferred root causes bounded but repeated whole-stream rescans). Low findings: rearm semantics for non-exhausted work, local fallback recorded as external minimum, and dispatch-deadline diagnostic label.
+- Reviewer scope limit: although the report says it read all 37 patch paths, it did not re-review the earlier R47 Admin refresh/grant-policy TypeScript and did not inspect the root-coverage helper beyond its section read. Do not treat this as a whole-branch review or complete attestation; adjudicate any remaining coverage gap.
+
+No source changes were made after the reviewed patch. The next action is a fresh GPT-6 Astra MEDIUM adjudication of the findings and bounded correction scope. Do not dispatch the Opus writer or the final blind reviews until that adjudication is recorded.
