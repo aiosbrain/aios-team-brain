@@ -1,0 +1,5 @@
+# AIO-1167 R51 — test-fixture correction only
+
+Resume only the existing sole Opus 5.5 HIGH session `628402d5-a1c6-42b7-b736-e84358c1a749`; do not start another writer. The coordinator owns tests/commands/checkpoints. The first coordinator focused run was **64 passed, 14 failed**; all 14 failures are the new `ingestion/tests/test_brain_minimum_provenance.py` helper constructing `BrainClient(..., api_key="key", ...)`, which fails its existing `aios_` format validation before any behavior under test. No production defect is indicated by those failures. Existing tests use harmless fixture key `aios_a_b`.
+
+Change only `ingestion/tests/test_brain_minimum_provenance.py` to use a valid fake `aios_`-prefixed fixture key (for example `aios_a_b`) in `_client`. Do not change any production behavior, expectations, other tests, or acceptance requirements. Do not run commands/tests, commit/push, or touch user/unrelated files or Claude memory. Return a concise one-file change report. The coordinator will rerun the same focused suite.
