@@ -1,0 +1,88 @@
+{
+  "assistant_text_chars": 5313,
+  "is_error": false,
+  "model": "claude-fable-5-1",
+  "model_usage": {
+    "claude-fable-5-1": {
+      "cacheCreationInputTokens": 91702,
+      "cacheReadInputTokens": 404246,
+      "canonicalModel": "claude-fable-5-1",
+      "contextWindow": 1000000,
+      "costBasis": "list",
+      "costUSD": 2.6294115000000002,
+      "inputTokens": 226,
+      "maxOutputTokens": 64000,
+      "outputTokens": 13841,
+      "provider": "firstParty",
+      "thinkingTokens": 6412,
+      "webSearchRequests": 0
+    }
+  },
+  "num_turns": 34,
+  "partial_text_chars": 0,
+  "session_id": "48148ee0-520d-477f-819f-36c7aefe2b24",
+  "stop_reason": "end_turn",
+  "subtype": "success",
+  "terminal_reason": "completed",
+  "text_source": "result",
+  "tools": [
+    "Task",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "DesignSync",
+    "EnterWorktree",
+    "ExitWorktree",
+    "Glob",
+    "Grep",
+    "ListAgents",
+    "Monitor",
+    "NotebookEdit",
+    "PushNotification",
+    "Read",
+    "RemoteTrigger",
+    "ReportFindings",
+    "ScheduleWakeup",
+    "SendMessage",
+    "Skill",
+    "TaskStop",
+    "ToolSearch",
+    "WebFetch",
+    "WebSearch",
+    "Workflow"
+  ],
+  "usage": {
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 91702,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "cache_creation_input_tokens": 91702,
+    "cache_read_input_tokens": 404246,
+    "fallback_credit": null,
+    "inference_geo": "global",
+    "input_tokens": 226,
+    "iterations": [
+      {
+        "cache_creation": {
+          "ephemeral_1h_input_tokens": 10707,
+          "ephemeral_5m_input_tokens": 0
+        },
+        "cache_creation_input_tokens": 10707,
+        "cache_read_input_tokens": 94498,
+        "input_tokens": 32,
+        "output_tokens": 3587,
+        "type": "message"
+      }
+    ],
+    "output_tokens": 13841,
+    "output_tokens_details": {
+      "thinking_tokens": 6412
+    },
+    "server_tool_use": {
+      "web_fetch_requests": 0,
+      "web_search_requests": 0
+    },
+    "service_tier": "standard",
+    "speed": "standard"
+  }
+}
