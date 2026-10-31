@@ -83,3 +83,8 @@ This supersedes R50 boundary 3 (repeated rescans for a timeout root).
 4. A terminal authority refusal met while publishing on an orderly return WITHOUT a prior BrainError
    is still raised (as any checkpoint's would be); with a prior BrainError cause it is only reported.
 5. No migration-number or schema change; no new owner, retry service, outage detector or override.
+
+## Coordinator verification attempt 1
+
+- Focused Python command across the four R51 test modules: **44 passed in 1.82s**.
+- Full sidecar `.venv/bin/pytest -q`: **928 passed, 28 skipped, 1 failed, 2 errors in 20.74s**. The failure is the stale `dispatch_deadline` expectation in `test_drain_recovery.py::test_budget_expiry_between_metadata_and_docs_is_local_and_untouched`; the two setup errors are loopback `PermissionError` in `test_two_process_sidecars.py` under sandbox denial. Details and exact next action are in `r51-coordinator-verification.md`. No R51 check is yet a full-suite pass.
