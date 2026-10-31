@@ -1,6 +1,6 @@
 # AIO-1167 current handoff
 
-Updated: 2026-10-31 15:55 UTC (Asia/Kolkata)
+Updated: 2026-10-31 16:18 UTC (Asia/Kolkata)
 
 ## Objective and guardrails
 
@@ -30,3 +30,12 @@ Keep R49 F6, H2, M-b/M-c/M-d, live Google certification/soak, opt-in/runner, can
 - Coverage: all six Astra-accepted R50 corrections verified closed; Fable read all material R47 Admin refresh/grant-policy and root-coverage/claim-retirement interactions, finding no defect. It marks all 40 manifest paths FULL or PARTIAL, with no material path/interaction uninspected. Earlier whole-repository/rollout gates remain open; R49 F6, H2, M-b/M-c/M-d, live Google certification/soak, opt-in/runner proof, canary and rollback are not claimed complete.
 - Curated report: `r51-fable-review-report.md`, SHA-256 `5ed7e76fcfcca4d4d33e18558daa46af4a572a0fc9407e0f35c8d0410e602114`; metadata: `r51-fable-review-meta.json`, SHA-256 `2dbebb74a614c4f3cc430e3b4e784767e27f0952125a9d30062c01cf321ed5e5`. The exact patch and report are preserved locally; next obtain fresh GPT-6 Astra MEDIUM adjudication of both Low findings and the stated rollout boundaries. No source files changed during Fable review.
 - Recovery checkpoint including this review was pushed and independently verified at `7b6fd987a5587eee129cbc4457516d0910ed8790` on `origin/codex/aio-1167-checkpoint-20261027`; the report/meta are also retained in the feature worktree. No feature source files changed.
+
+
+## 2026-10-31 16:18 UTC — Astra R51 Low adjudication
+
+- GPT-6 Astra MEDIUM completed the bounded read-only adjudication. Report `astra-r51-low-adjudication.md`, SHA-256 `19158700f503fc43bcecf098f04fdb4b916daed5b6903e211a521215703fb1d4`. Both Fable findings are confirmed Low and should be fixed in one bounded slice; neither invalidates Fable's no-High/Medium/no-HOLD verdict.
+- L1 is diagnostic-only: preserve hold/progress summary and add terminal checkpoint authority code without resuming provider work or losing lease cleanup; also preserve diagnostics in the equivalent drain catch. Test scheduled/manual and both terminal codes.
+- L2 is a real provenance violation: separate brain-supplied Retry-After minimum from BrainClient local fallback/jitter; persist only provider minima, preserve zero and existing/unknown minima, acknowledgment and uncertainty-latch semantics. Add exhaustion/rearm plus timeout, accepted-content and non-exhausted controls.
+- Same sole Opus writer session `628402d5-a1c6-42b7-b736-e84358c1a749` is the next step after fresh Opus-specific `/usage` admission. Prompt `r51-opus-low-remediation-prompt.md`, SHA-256 `1a1e2594c9831496a187f5c38b8e313ea5d4913750c83715681bcc4be4893f7a`. Writer edits only these two corrections, regressions and acceptance map; coordinator owns tests/reviews/checkpoints.
+- Keep R49 F6 and all operational/release gates open; no merge/deployment.
