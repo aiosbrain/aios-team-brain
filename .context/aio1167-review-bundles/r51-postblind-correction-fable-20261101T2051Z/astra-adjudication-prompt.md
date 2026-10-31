@@ -1,0 +1,15 @@
+# Astra HIGH adjudication prompt — Fable R51 correction review
+
+Review packet directory: `/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-recovery-publish-20261031/.context/aio1167-review-bundles/r51-postblind-correction-fable-20261101T2051Z`.
+
+Perform a fresh, read-only **adjudication** of Fable 5.1's three findings in `review.text`, against `accepted-spec.md`, `accepted-adjudication.md`, `accepted-correction-prompt.md`, the exact current manifest/delta, verification evidence, and the live source worktree `/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree`. The coordinator verified all 53 candidate file hashes again after review. This is an adjudication of correction findings, not the later blind final code review.
+
+Fable verdict: CHANGES REQUIRED. It reports:
+
+1. **F1 High:** `mark_root_uncertain` replaces the `ROOT_DEFERRED_PREFIX` detail with any later metadata-read error. A subsequent successful root metadata read can then settle a still-unlisted subtree as bound and permit complete-snapshot reconciliation. Decide whether this is a confirmed defect under the accepted rule that only recursive listing completion, relocation/rebind, or verified not-found clears the deferral. Specify the narrowest safe fix and a discriminating regression if accepted.
+2. **F2 Medium:** on watch-create quota response, `_create` publishes the attempt as RETIRED before `_renew_connection` journals the account hold. If RETIRED publication fails or times out, the exception reaches the generic handler without journaling, so the next sweep/poll may call Google before Retry-After. Decide whether this violates the accepted requirement to journal first and enforce the hold despite publication failure; specify the narrowest fix and a failure-injection test if accepted.
+3. **F3 Low:** a deferred folder that answers 404 may retain membership from the closed placeholder snapshot. Decide whether this is a confirmed contract violation or acceptable until controlled rescan/per-file evidence, and whether a separate guard/test is warranted.
+
+Inspect the exact call chains and state transitions rather than relying on the report alone. Preserve the accepted semantics for current fences/revisions, durable local evidence, authority refusal, uncertainty latches, no restricted provider reads, safe lease release, survivor claims, ambiguous removal barriers, and non-quota controls. Check that any recommended fix composes with existing callers and restart recovery. Do not inspect or change the held identity/tombstone slice.
+
+Return a concise but evidence-backed decision per finding: ACCEPT/FIX, ACCEPT/DEFER with trigger, REJECT, or request bounded evidence. Include severity, acceptance impact, exact current file/line evidence, root cause, smallest safe correction and required regression assertions. State what remains frozen and the exact next authorized step. Do not edit files, run tests/commands, delegate, or claim readiness. No source writer resumes until this adjudication is complete.
