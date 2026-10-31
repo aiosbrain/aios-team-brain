@@ -1,0 +1,18 @@
+{
+  "previous_manifest": "/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree/.context/aio1167-review-bundles/r51-counter-final-review-20261031T1700Z/manifest.json",
+  "previous_source_patch_sha256": "a7d20559ee27e01f665a622069042f3fab6c218f914cf5cc559331e07bcdf773",
+  "changed_or_added_paths": [
+    {
+      "path": "ingestion/aios_ingest/gdrive_sync.py",
+      "previous_sha256": "f0872b8942eca500cf58149ea7e59ad0c0342d4222e635022b48eca370f1ce2e",
+      "current_sha256": "47714e163ec0e469f1b7a07b346c3998db57299f8c32359a263a4207ccb61b65",
+      "status": "M"
+    },
+    {
+      "path": "ingestion/tests/test_flush_authority_outcome.py",
+      "previous_sha256": "2c0a0236e9c86b2490f7d67829e1fa0fc8634d26d4e47882b39404b4799d3c27",
+      "current_sha256": "afb5eda934b2597222446fa99a748dc8da3994766f3d55292a7528a0a7f20453",
+      "status": "A"
+    }
+  ]
+}
