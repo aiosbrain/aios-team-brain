@@ -1,0 +1,5 @@
+# AIO-1167 R51 — direct-helper test fixture correction
+
+Resume only the existing sole Opus 5.5 HIGH writer session `628402d5-a1c6-42b7-b736-e84358c1a749` after fresh subscription quota admission. The first focused run of `tests/test_flush_authority_outcome.py` reported 16 passed and 2 failed: both are parametrizations of `test_the_end_of_run_flush_keeps_accumulated_progress_and_an_existing_cause`, which directly calls `_flush_restriction_evidence(..., cause=cause)` but omits the new explicit `run_failure_counted=True` signal. The run-level state is no longer inferred from `cause`.
+
+Make only the test-fixture correction needed to describe an already-counted run at that direct call (pass `run_failure_counted=True`). Do not change production code or weaken the assertion. Preserve the no-cause charge control, the real binding-catch path and all new tests. Do not run tests/commands, commit, push or review. Return changed paths and confirm no other edits. Coordinator owns verification and checkpointing.
