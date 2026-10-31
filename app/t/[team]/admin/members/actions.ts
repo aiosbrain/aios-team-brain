@@ -7,7 +7,7 @@ import { reconcileAttribution, repairAttributionNow } from "@/lib/ingest/reconci
 import { describeManualRepair, reportRepairHandover } from "@/lib/ingest/attribution-repair-report";
 import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { linkGithub } from "@/lib/codebases/github";
-import { setMemberIdentity, removeMemberIdentity } from "@/lib/identity/member-identities";
+import { canonicalIdentityId, setMemberIdentity, removeMemberIdentity } from "@/lib/identity/member-identities";
 import { withIdentityMutationBoundary } from "@/lib/identity/authority";
 import { addAuthorAlias, removeAuthorAlias } from "@/lib/admin/aliases";
 import { adminSetPassword } from "@/lib/auth/pg-login";
@@ -197,8 +197,12 @@ export async function linkMemberIdentity(
   }
   const p = provider.trim().toLowerCase();
   if (!PROVIDERS.has(p)) return { ok: false, error: `unsupported provider "${provider}"` };
-  const ext = externalId.trim();
+  // The requested id in the spelling the writer will store (AIO-1167 R47 F8): an `author-email:`
+  // address is canonicalized, so lookup, revision observation and write all name ONE row; opaque ids
+  // keep their exact bytes.
+  const ext = canonicalIdentityId(p, externalId);
   if (!ext) return { ok: false, error: `${p} user id is required` };
+  if (p === "gdrive" && /^author-email:$/.test(ext)) return { ok: false, error: "gdrive user id is required" };
   // A fenced call whose observation cannot be read is refused, never downgraded to an unfenced one.
   if (observed !== undefined && !isLinkObservation(observed)) return { ok: false, error: STALE_IDENTITY };
   try {

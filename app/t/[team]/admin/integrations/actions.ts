@@ -62,7 +62,9 @@ import {
   provisionGdriveConnectorPrincipal,
   publishGdriveVerifiedSelection,
   publishGdriveVerifiedConfig,
+  refreshGdriveAdminAccess,
   saveGdriveConnectionConfig,
+  GdriveAuthorityError,
   validateGdriveAudienceProjects,
   type GdriveAdminTestAuthority,
 } from "@/lib/integrations/gdrive-authority";
@@ -75,20 +77,8 @@ async function verifyGdriveTargets(
   authority: GdriveAdminTestAuthority,
   targets: Array<{ kind: "file" | "folder" | "drive"; id: string }>,
 ): Promise<{ denied: number }> {
-  await authorizeGdriveAdminTestCall(authority);
-  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_id: authority.credential.clientId, client_secret: authority.credential.clientSecret,
-      refresh_token: authority.credential.refreshToken, grant_type: "refresh_token",
-    }),
-    cache: "no-store", signal: AbortSignal.timeout(15_000),
-  });
-  const token = await tokenResponse.json().catch(() => ({})) as Record<string, unknown>;
-  await authorizeGdriveAdminTestCall(authority);
-  if (!tokenResponse.ok || typeof token.access_token !== "string") {
-    throw new Error("Google authorization is unavailable; reconnect this account");
-  }
+  // Held to the broker's grant policy before any Drive read (AIO-1167 R47 F6); refusals are sanitized.
+  const { accessToken } = await refreshGdriveAdminAccess(authority);
   let denied = 0;
   for (const target of targets) {
     await authorizeGdriveAdminTestCall(authority);
@@ -96,7 +86,7 @@ async function verifyGdriveTargets(
       ? `https://www.googleapis.com/drive/v3/drives/${encodeURIComponent(target.id)}?fields=id,name`
       : `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(target.id)}?supportsAllDrives=true&fields=id,mimeType,trashed`;
     const response = await fetch(path, {
-      headers: { Authorization: `Bearer ${token.access_token}` }, cache: "no-store",
+      headers: { Authorization: `Bearer ${accessToken}` }, cache: "no-store",
       signal: AbortSignal.timeout(10_000),
     });
     const metadata = response.ok
@@ -1189,24 +1179,7 @@ export async function testGoogleDriveConnection(
     const authority = await acquireGdriveAdminTestAuthority({
       teamId: ctx.teamId, memberId: ctx.memberId, integrationName: name,
     });
-    await authorizeGdriveAdminTestCall(authority);
-    const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
-      method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        client_id: authority.credential.clientId,
-        client_secret: authority.credential.clientSecret,
-        refresh_token: authority.credential.refreshToken,
-        grant_type: "refresh_token",
-      }),
-      cache: "no-store", signal: AbortSignal.timeout(15_000),
-    });
-    const token = await tokenResponse.json().catch(() => ({})) as Record<string, unknown>;
-    await authorizeGdriveAdminTestCall(authority);
-    if (!tokenResponse.ok || typeof token.access_token !== "string") {
-      return { ok: false, error: tokenResponse.status === 400 || tokenResponse.status === 401
-        ? "Google authorization was revoked; reconnect this account"
-        : "Google Drive is temporarily unavailable" };
-    }
+    const { accessToken, scopes } = await refreshGdriveAdminAccess(authority);
     const config = authority.config;
     const targets = [
       ...((config.fileIds as string[] | undefined) ?? []).map((id) => ({ kind: "file", id })),
@@ -1226,7 +1199,7 @@ export async function testGoogleDriveConnection(
       let response: Response;
       try {
         response = await fetch(path, {
-          headers: { Authorization: `Bearer ${token.access_token}` }, cache: "no-store",
+          headers: { Authorization: `Bearer ${accessToken}` }, cache: "no-store",
           signal: AbortSignal.timeout(10_000),
         });
       } catch {
@@ -1243,9 +1216,6 @@ export async function testGoogleDriveConnection(
       else denied += 1;
     }
     await authorizeGdriveAdminTestCall(authority);
-    const scopes = typeof token.scope === "string"
-      ? token.scope.split(/\s+/).filter(Boolean)
-      : ((config.scopeSet as string[] | undefined) ?? []);
     const empty = config.selectionState === "empty";
     const next = start + checked < targets.length ? start + checked : undefined;
     return {
@@ -1256,7 +1226,9 @@ export async function testGoogleDriveConnection(
       total: targets.length,
       continuation: next,
     };
-  } catch {
+  } catch (error) {
+    // Authority refusals carry sanitized, actionable text (reconnect, paused, temporarily unavailable).
+    if (error instanceof GdriveAuthorityError) return { ok: false, error: error.message };
     return { ok: false, error: "Google Drive connection test failed without changing the saved selection" };
   }
 }
@@ -1288,29 +1260,14 @@ export async function saveGoogleDrivePickerSelection(
     const authority = await acquireGdriveAdminTestAuthority({
       teamId: ctx.teamId, memberId: ctx.memberId, integrationName: name,
     });
-    await authorizeGdriveAdminTestCall(authority);
-    const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
-      method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        client_id: authority.credential.clientId,
-        client_secret: authority.credential.clientSecret,
-        refresh_token: authority.credential.refreshToken,
-        grant_type: "refresh_token",
-      }),
-      cache: "no-store", signal: AbortSignal.timeout(15_000),
-    });
-    const token = await tokenResponse.json().catch(() => ({})) as Record<string, unknown>;
-    await authorizeGdriveAdminTestCall(authority);
-    if (!tokenResponse.ok || typeof token.access_token !== "string") {
-      return { ok: false, error: "Google authorization is unavailable; reconnect this account" };
-    }
+    const { accessToken } = await refreshGdriveAdminAccess(authority);
     const verified: string[] = [];
     const denied: string[] = [];
     for (const id of ids) {
       await authorizeGdriveAdminTestCall(authority);
       const response = await fetch(
         `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(id)}?supportsAllDrives=true&fields=id,mimeType,trashed`,
-        { headers: { Authorization: `Bearer ${token.access_token}` }, cache: "no-store", signal: AbortSignal.timeout(10_000) },
+        { headers: { Authorization: `Bearer ${accessToken}` }, cache: "no-store", signal: AbortSignal.timeout(10_000) },
       );
       const metadata = response.ok
         ? await response.json().catch(() => ({})) as { id?: string; mimeType?: string; trashed?: boolean }

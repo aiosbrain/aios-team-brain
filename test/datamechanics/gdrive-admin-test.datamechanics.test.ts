@@ -19,9 +19,11 @@ const {
   provisionGoogleDriveConnector, runGoogleDriveNow,
 } = await import("@/app/t/[team]/admin/integrations/actions");
 
+/** A legacy-shaped credential (no recorded mode) whose recorded grant fixes its ceiling at `folders`. */
+const GRANTED = "https://www.googleapis.com/auth/drive.readonly";
 const SECRET = JSON.stringify({
   client_id: "client", client_secret: "secret", refresh_token: "refresh",
-  account_subject: "subject:account", scopes: ["drive"],
+  account_subject: "subject:account", scopes: ["openid", GRANTED],
 });
 
 async function configured(seed: Seed, name: string, files = ["one", "two"]): Promise<string> {
@@ -32,7 +34,7 @@ async function configured(seed: Seed, name: string, files = ["one", "two"]): Pro
       fileIds: files, folderIds: [], sharedDriveIds: [], recursive: false,
       selectionState: "selected", access: "team", authMode: "oauth",
       authenticatedAccount: "docs@example.com", authenticatedAccountId: "subject:account",
-      scopeSet: ["drive"],
+      scopeSet: ["openid", GRANTED],
     },
   });
   await setIntegrationSecret(db(), { teamId: seed.teamId, memberId: seed.memberId }, row.id, SECRET);
@@ -55,7 +57,7 @@ describe("AIO-1167 Admin Google Drive test authority", () => {
       await setIntegrationStatus(
         db(), { teamId: seed.teamId, memberId: seed.memberId }, integrationId, "disabled",
       );
-      return Response.json({ access_token: "must-not-be-used", scope: "drive" });
+      return Response.json({ access_token: "must-not-be-used", scope: GRANTED });
     });
 
     const result = await testGoogleDriveConnection(seed.teamSlug, "admin-refresh-pause");
@@ -70,7 +72,7 @@ describe("AIO-1167 Admin Google Drive test authority", () => {
     adminContext.teamId = seed.teamId;
     adminContext.memberId = seed.memberId;
     const provider = vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(Response.json({ access_token: "short-lived", scope: "drive" }))
+      .mockResolvedValueOnce(Response.json({ access_token: "short-lived", scope: GRANTED }))
       .mockImplementationOnce(async () => {
         await db().from("members").update({ role: "member" })
           .eq("id", seed.memberId).eq("team_id", seed.teamId);
@@ -93,7 +95,7 @@ describe("AIO-1167 Admin Google Drive test authority", () => {
         db(), { teamId: seed.teamId, memberId: seed.memberId }, integrationId,
         JSON.stringify({ ...JSON.parse(SECRET), refresh_token: "replacement" }),
       );
-      return Response.json({ access_token: "old-pair", scope: "drive" });
+      return Response.json({ access_token: "old-pair", scope: GRANTED });
     });
 
     const result = await testGoogleDriveConnection(seed.teamSlug, "admin-credential-change");
@@ -108,7 +110,7 @@ describe("AIO-1167 Admin Google Drive test authority", () => {
     adminContext.teamId = seed.teamId;
     adminContext.memberId = seed.memberId;
     vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(Response.json({ access_token: "short-lived", scope: "drive" }))
+      .mockResolvedValueOnce(Response.json({ access_token: "short-lived", scope: GRANTED }))
       .mockImplementation(async (input) => {
         const id = decodeURIComponent(String(input).split("/files/")[1]!.split("?")[0]!);
         return Response.json({ id, mimeType: "application/vnd.google-apps.document" });
@@ -125,7 +127,7 @@ describe("AIO-1167 Admin Google Drive test authority", () => {
     adminContext.teamId = seed.teamId;
     adminContext.memberId = seed.memberId;
     vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(Response.json({ access_token: "short-lived", scope: "drive" }))
+      .mockResolvedValueOnce(Response.json({ access_token: "short-lived", scope: GRANTED }))
       .mockResolvedValueOnce(Response.json({ id: "one", mimeType: "application/vnd.google-apps.document" }))
       .mockRejectedValueOnce(new Error("provider interrupted"));
     expect(await testGoogleDriveConnection(seed.teamSlug, "admin-preview-interrupted"))

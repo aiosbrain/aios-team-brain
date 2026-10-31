@@ -3,8 +3,14 @@ import Link from "next/link";
 import type { ConflictMember, IdentityConflictPage, IdentityConflictRow } from "@/lib/identity/discovery-conflicts";
 
 /**
- * Admin → Members: Google Drive automatic identity links that were refused (AIO-1167 R45, AC-08).
+ * Admin → Members: RECORDED, LEGACY Google Drive refusals (AIO-1167 R45; scoped by R47 F2).
  * Read-only, and Drive-only by adjudication.
+ *
+ * Historical only. A refusal is recorded solely for a mapping that predates review state, which a
+ * normally upgraded instance no longer has (the repair-ledger migration seeds state for every link).
+ * A later email that disagrees with an approved mapping is NOT a conflict and is not listed here: the
+ * approved mapping stands (AC-08). Reachable conflicting decisions surface where they are made — the
+ * revision-fenced remap offer on a member's Identities control, and the OAuth existing-owner refusal.
  *
  * Each row is ONE historical observation (latest of any repeats) shown beside the identity's CURRENT
  * mapping, re-read now — so an event an Admin has since resolved reads as history, not as a standing
@@ -41,20 +47,20 @@ export function IdentityConflicts({ page, nextHref }: { page: IdentityConflictPa
   return (
     <section className="prism-card flex flex-col gap-2 p-4" aria-labelledby="identity-conflicts-heading">
       <h2 id="identity-conflicts-heading" className="text-sm font-semibold text-ink">
-        Google Drive: automatic identity links that were refused
+        Google Drive: recorded legacy refusals (history)
       </h2>
       <p className="text-xs text-ink-secondary">
-        The Google Drive connector observed a Drive account whose confirmed email named one member while
-        the account was already mapped to another. The automatic link was refused and the existing
-        mapping was kept.
-        Review each in that member&apos;s <strong>Identities</strong> column and link, remap or unlink it there.
+        Historical record. Before identity mappings were reviewed, the Google Drive connector refused to
+        auto-link an account whose confirmed email named one member while an unreviewed mapping gave it to
+        another, and kept the existing mapping. A later email that differs from an approved mapping is not
+        a conflict and is not listed. To change a mapping, use that member&apos;s <strong>Identities</strong> column.
       </p>
       {page.status === "unavailable" ? (
         <p role="status" className="text-xs text-amber-600">
-          Google Drive refused-link diagnostics are unavailable right now. This does not mean there are none — try again.
+          Recorded Google Drive refusals are unavailable right now. This does not mean there are none — try again.
         </p>
       ) : page.rows.length === 0 ? (
-        <p className="text-xs text-ink-tertiary">No Google Drive automatic links have been refused.</p>
+        <p className="text-xs text-ink-tertiary">No legacy Google Drive refusals are recorded.</p>
       ) : (
         <table className="w-full text-xs">
           <thead>
@@ -85,7 +91,7 @@ export function IdentityConflicts({ page, nextHref }: { page: IdentityConflictPa
         </table>
       )}
       {page.status === "ok" && nextHref ? (
-        <Link href={nextHref} className="self-start text-xs text-violet hover:underline">Older refused Drive links →</Link>
+        <Link href={nextHref} className="self-start text-xs text-violet hover:underline">Older recorded refusals →</Link>
       ) : null}
     </section>
   );

@@ -32,6 +32,8 @@ export interface SetIdentityResult {
   memberId: string;
   mappingRevision?: number;
   note?: string;
+  /** `respectTombstone` only: the identity was deliberately unlinked, so nothing was written. */
+  tombstoned?: boolean;
 }
 
 export async function advanceIdentityMappingState(input: {
@@ -69,15 +71,41 @@ export async function advanceIdentityMappingState(input: {
   return revision;
 }
 
+/**
+ * The canonical spelling of an identity id for WRITING a link (AIO-1167 R47 F8). Only the email
+ * namespace has one: `author-email:<address>` is case-insensitive, so its address is trimmed and
+ * lowercased — the spelling the OAuth publisher and the sidecar already produce. Opaque provider ids
+ * (`subject:`, `permission:`, and every non-Drive provider's ids) are case-sensitive and keep their
+ * exact bytes. Unlink deliberately does NOT canonicalize: it removes an existing row by its stored
+ * spelling, so a legacy differently-spelled row can still be removed explicitly.
+ */
+export function canonicalIdentityId(provider: string, externalId: string): string {
+  const id = externalId.trim();
+  const match = /^author-email:(.*)$/i.exec(id);
+  if (provider.trim().toLowerCase() !== "gdrive" || !match) return id;
+  return `author-email:${match[1].trim().toLowerCase()}`;
+}
+
 export async function setMemberIdentity(
   admin: DbClient,
   teamId: string,
   memberId: string,
   input: SetIdentityInput,
-  opts: { force?: boolean; expectedRevision?: number; actor?: IdentityActor } = {}
+  opts: {
+    force?: boolean;
+    expectedRevision?: number;
+    actor?: IdentityActor;
+    /**
+     * AUTOMATIC publication (AIO-1167 R47 F1): a deliberate unlink tombstone stands. An identity
+     * whose mapping state is `unlinked` is left exactly as it is — no row, no state, no repair, no
+     * epoch — and reported `tombstoned`. Explicit Admin links never pass this, so a revision-fenced
+     * manual relink of a tombstone stays available.
+     */
+    respectTombstone?: boolean;
+  } = {}
 ): Promise<SetIdentityResult> {
   const provider = input.provider.trim().toLowerCase();
-  const externalId = input.externalId.trim();
+  const externalId = canonicalIdentityId(provider, input.externalId);
   if (!provider || !externalId) throw new Error("provider and externalId are required");
   if (provider === "gdrive" && !/^(subject|permission|author-email):[^\s:][^\s]*$/i.test(externalId)) {
     throw new Error("Google Drive identity must use a verified subject:, permission:, or author-email: key");
@@ -108,14 +136,33 @@ export async function setMemberIdentity(
       [teamId, provider, externalId],
     );
     const ex = rows[0];
-    const { rows: mappingRows } = await runSql<{ revision: string | number }>(
-      `select revision from member_identity_mapping_state
+    const { rows: mappingRows } = await runSql<{ revision: string | number; state: string }>(
+      `select revision,state from member_identity_mapping_state
         where team_id=$1 and provider=$2 and external_id=$3 for update`,
       [teamId, provider, externalId],
     );
     const currentRevision = Number(mappingRows[0]?.revision ?? 0);
     if (opts.expectedRevision !== undefined && opts.expectedRevision !== currentRevision) {
       throw new Error("identity mapping changed concurrently; refresh and retry");
+    }
+    if (opts.respectTombstone && mappingRows[0]?.state === "unlinked") {
+      res.tombstoned = true;
+      res.mappingRevision = currentRevision;
+      return res;
+    }
+    if (!ex && provider === "gdrive" && externalId.startsWith("author-email:")) {
+      // The same address in another spelling is the same person-key: never merged or overwritten
+      // here — the Admin unlinks the differently spelled row explicitly, then links (R47 F8).
+      const { rows: spelled } = await runSql<{ external_id: string }>(
+        `select external_id from member_identities
+          where team_id=$1 and provider=$2 and lower(external_id)=$3 and external_id<>$3 limit 1`,
+        [teamId, provider, externalId],
+      );
+      if (spelled[0]) {
+        throw new Error(
+          `a differently spelled Google identity (${spelled[0].external_id}) already exists; unlink it first, then link ${externalId}`,
+        );
+      }
     }
     let mappingChanged = false;
     if (!ex) {

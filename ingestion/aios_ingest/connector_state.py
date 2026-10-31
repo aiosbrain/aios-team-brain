@@ -34,6 +34,10 @@ from typing import Any
 from .state import ROOT_STATES, RootBinding
 
 ROOTS_KEY = "roots"
+# The coordinator's account-level provider hold (AIO-1167 R47 F5): ``{generation, credential,
+# not_before, category}``. Published with the coordinator's checkpoints, so a sidecar that restores
+# from the brain makes no provider call for that account before ``not_before``.
+ACCOUNT_HOLD_KEY = "account_hold"
 WATCHES_KEY = "watches"
 # Renewal's legacy per-stream fields. A stream record is otherwise the coordinator's alone.
 RENEWAL_STREAM_PREFIX = "watch_"

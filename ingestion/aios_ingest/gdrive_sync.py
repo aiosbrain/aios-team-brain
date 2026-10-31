@@ -8,6 +8,7 @@ state only. Notifications, manual runs and periodic polling converge here.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 import json
@@ -24,7 +25,9 @@ from pydantic import ValidationError
 
 from .brain_client import BrainClient, BrainDeferred, BrainError, GdriveExecution
 from .config import BrainSettings, Connection
-from .connector_state import ROOTS_KEY, coordinator_document, parse_roots_section, roots_section
+from .connector_state import (
+    ACCOUNT_HOLD_KEY, ROOTS_KEY, coordinator_document, parse_roots_section, roots_section,
+)
 from .engine import IngestSummary
 from .normalize import normalize
 from .sources.gdrive import (
@@ -150,6 +153,27 @@ class _ProviderAdmissionClosed(Exception):
         self.partial: IngestSummary | None = None
 
 
+class _AcknowledgmentUncertain(Exception):
+    """A checkpoint may have committed on the brain without its acknowledgment arriving, or the
+    brain's revision is not the one this run holds (AIO-1167 R47 F3). A CONTROL signal: the run's
+    progress revision is unknown, so no further changed checkpoint is sent and the run ends partial;
+    the next acquisition restores the brain's authoritative progress, and the owed work — never
+    acknowledged here — replays idempotently. Never a document failure. ``partial`` carries the
+    counts completed before it, as ``_ProviderAdmissionClosed`` does."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+        self.partial: IngestSummary | None = None
+
+
+def _progress_uncertain(client: BrainClient, execution: GdriveExecution) -> bool:
+    """Whether the client latched this execution's revision as unknown (R47 F3). A brain double
+    without the latch has none to report."""
+    probe = getattr(client, "gdrive_progress_uncertain", None)
+    return bool(probe(execution)) if callable(probe) else False
+
+
 # Provider deferrals caused by this run's own budget, never by Google (U5 pre-dispatch; R45 M6 late
 # but in-time response). They stop the drain without charging the document.
 _LOCAL_DEADLINE_CATEGORIES = frozenset({"dispatch_deadline", "run_deadline"})
@@ -158,6 +182,78 @@ _LOCAL_DEADLINE_CATEGORIES = frozenset({"dispatch_deadline", "run_deadline"})
 def _account_hold(exc: ProviderDeferred) -> _ProviderAdmissionClosed:
     """The account-wide hold a provider rate limit opens (C6), from wherever it was read."""
     return _ProviderAdmissionClosed(exc.not_before or _defer_until(), exc.category)
+
+
+def _standing_account_hold(
+    state: StateStore, integration_id: str, generation: int, credential: str,
+) -> dict[str, Any] | None:
+    """The account hold in force now, as the document it is published as; ``None`` once it passed."""
+    hold = state.connection_hold(integration_id, generation, credential)
+    if hold is None or not _retry_deferred(hold[0]):
+        return None
+    return {"generation": generation, "credential": credential, "not_before": hold[0], "category": hold[1]}
+
+
+def _adopt_remote_account_hold(
+    state: StateStore, execution: GdriveExecution, integration_id: str, generation: int, credential: str,
+) -> None:
+    """Restore the hold the brain acknowledged (AIO-1167 R47 F5) — for this generation and this
+    verified account only — so a restart, or another state file, cannot forget it. Monotonic."""
+    remote = execution.progress.get(ACCOUNT_HOLD_KEY)
+    if not isinstance(remote, dict):
+        return
+    try:
+        remote_generation = int(remote.get("generation"))
+    except (TypeError, ValueError):
+        return
+    not_before = remote.get("not_before")
+    if (remote_generation != generation or str(remote.get("credential") or "") != credential
+            or not isinstance(not_before, str) or not not_before):
+        return
+    state.hold_connection(
+        integration_id, generation, credential, not_before, str(remote.get("category") or "rate_limited"),
+    )
+
+
+async def _open_account_hold(
+    client: BrainClient,
+    execution: GdriveExecution,
+    state: StateStore,
+    integration_id: str,
+    credential: str,
+    exc: ProviderDeferred,
+    total: IngestSummary,
+) -> None:
+    """A provider wait read before any stream could carry it (AIO-1167 R47 F5): root metadata,
+    relocation re-reads, start-token capture, the service-account identity read.
+
+    Held for the ACCOUNT, durably — locally first, then published onto the acknowledged document
+    unchanged but for the hold, so no stream, root or watch the brain holds can regress. A failed
+    publication keeps the local hold and says so; it is never reported as remote-durable. Reported as
+    a held (partial) run, never a document failure or deletion evidence. A local budget stop is not
+    a provider wait and opens no hold."""
+    total.skipped += 1
+    total.failure_categories[exc.category] = total.failure_categories.get(exc.category, 0) + 1
+    if exc.category in _LOCAL_DEADLINE_CATEGORIES:
+        return
+    state.hold_connection(
+        integration_id, execution.generation, credential, exc.not_before or _defer_until(), exc.category,
+    )
+    document = _standing_account_hold(state, integration_id, execution.generation, credential)
+    if document is None:
+        return
+    payload = copy.deepcopy(execution.progress)
+    payload[ACCOUNT_HOLD_KEY] = document
+    try:
+        ack = await client.checkpoint_gdrive_execution(execution, payload) or {}
+    except BrainError as error:
+        if _is_terminal_authority(error):
+            raise
+        total.failure_categories["account_hold_unpublished"] = 1
+        return
+    acknowledged = dict(ack.get("progress") or payload)
+    execution.progress.clear()
+    execution.progress.update(acknowledged)
 
 
 def provider_source_options(options: dict[str, Any]) -> dict[str, Any]:
@@ -879,6 +975,16 @@ async def run_gdrive_stream(
                 except ServiceAccountBindingRefused as exc:
                     return IngestSummary(conn.name, failed=1, failure_categories={exc.category: 1},
                                          integration_id=integration_id)
+            # The account's provider hold — this run's state, or the brain's — is honoured before
+            # the first Drive call of the run, streams or not (AIO-1167 R47 F5).
+            account = credential_identity(options)
+            _adopt_remote_account_hold(state, execution, integration_id, execution.generation, account)
+            standing = _standing_account_hold(state, integration_id, execution.generation, account)
+            if standing is not None:
+                return IngestSummary(
+                    conn.name, skipped=1, failure_categories={str(standing["category"]): 1},
+                    integration_id=integration_id,
+                )
             drive, _ = source._services()
             if auth_mode == "service_account" and options.get("service_account_status") == "pending":
                 try:
@@ -903,8 +1009,9 @@ async def run_gdrive_stream(
                     return IngestSummary(conn.name, failed=1, failure_categories={exc.code: 1},
                                          integration_id=integration_id)
                 except ProviderDeferred as exc:
-                    return IngestSummary(conn.name, failed=1, failure_categories={exc.category: 1},
-                                         integration_id=integration_id)
+                    held = IngestSummary(conn.name, failure_categories={}, integration_id=integration_id)
+                    await _open_account_hold(client, execution, state, integration_id, account, exc, held)
+                    return held
             generation = execution.generation
             total = IngestSummary(conn.name, failure_categories={}, integration_id=integration_id)
 
@@ -940,8 +1047,7 @@ async def run_gdrive_stream(
                 total.failure_categories[exc.code] = 1
                 return total
             except ProviderDeferred as exc:
-                total.failed += 1
-                total.failure_categories[exc.category] = 1
+                await _open_account_hold(client, execution, state, integration_id, account, exc, total)
                 return total
             unresolved_roots = [
                 root for root, binding in state.unsettled_roots(integration_id, generation).items()
@@ -1005,8 +1111,7 @@ async def run_gdrive_stream(
                         total.failure_categories[exc.code] = 1
                         return total
                     except ProviderDeferred as exc:
-                        total.failed += 1
-                        total.failure_categories[exc.category] = 1
+                        await _open_account_hold(client, execution, state, integration_id, account, exc, total)
                         return total
                     except StreamStartUnavailable as exc:
                         # This drive's change log cannot be opened — a root that lives in a Shared
@@ -1049,6 +1154,8 @@ async def run_gdrive_stream(
             # A stream whose provider read was refused this run (R44 C5): the others still run, but
             # no complete snapshot is submitted — its membership is not known now.
             stream_access_failed = False
+            # A checkpoint whose acknowledgment was lost this run (R47 F3): nothing more is sent.
+            acknowledgment_uncertain = False
             scheduled_streams = state.rotate_streams(
                 integration_id, generation, [value for value in streams if value not in blocked],
             )
@@ -1078,6 +1185,11 @@ async def run_gdrive_stream(
                     # The provider's wait governs the ACCOUNT (AIO-1167 R44 C6): every stream of it
                     # is held until then — persisted, so a restart makes no early call — and no
                     # further provider call is made this run. Remaining work is untouched.
+                    # Held for the account too, so the next run's root and start-token reads wait
+                    # as well, not just its drains (AIO-1167 R47 F5).
+                    state.hold_connection(
+                        integration_id, generation, account, closed.not_before, closed.category,
+                    )
                     for held in scheduled_streams:
                         held_ns = StreamKey(
                             settings.team, integration_id, credential_identity(options), str(held),
@@ -1098,6 +1210,16 @@ async def run_gdrive_stream(
                     if closed.partial is not None:
                         _merge_summary(total, closed.partial)  # work completed before the limit
                     total.failure_categories[closed.category] = total.failure_categories.get(closed.category, 0) + 1
+                    break
+                except _AcknowledgmentUncertain as uncertain:
+                    # The brain may hold a checkpoint this run never saw acknowledged (AIO-1167 R47
+                    # F3). No further changed checkpoint is sent under a guessed revision — that
+                    # could replace newer sibling streams, roots or watch state — and no document is
+                    # charged. The run ends partial; the next acquisition restores the authority.
+                    if uncertain.partial is not None:
+                        _merge_summary(total, uncertain.partial)
+                    total.failure_categories.setdefault("checkpoint_unacknowledged", 1)
+                    acknowledgment_uncertain = True
                     break
                 except Exception as exc:
                     if not _stream_access_refusal(exc):
@@ -1139,7 +1261,7 @@ async def run_gdrive_stream(
             # no obligation recorded at all — and a stream whose published snapshot is not of the
             # roots it enumerates now, are an incomplete connection: reconciling would turn what
             # has not been verified into absence.
-            verified = not stream_access_failed and _root_coverage_complete(
+            verified = not stream_access_failed and not acknowledgment_uncertain and _root_coverage_complete(
                 state, integration_id, generation, options,
             ) and not any(
                 any(_bound_root_drift(
@@ -1514,9 +1636,10 @@ async def _run_gdrive_stream_unlocked(
                     root_bindings=root_bindings,
                 )
                 fresh_remaining = max(0, fresh_remaining - consumed)
-            except (BrainError, _ProviderAdmissionClosed):
+            except (BrainError, _ProviderAdmissionClosed, _AcknowledgmentUncertain):
                 # Authority errors stay run-terminal; an account rate limit raised by the baseline's
-                # drain is the coordinator's account hold, never a baseline read failure (R45 H1).
+                # drain is the coordinator's account hold, never a baseline read failure (R45 H1);
+                # an unacknowledged checkpoint is the coordinator's to stop on (R47 F3).
                 raise
             except ProviderDeferred as exc:
                 if exc.category == "rate_limited":
@@ -1927,13 +2050,19 @@ async def _run_gdrive_stream_unlocked(
                 client, execution, state, namespace, generation,
             )
         return summary
-    except _ProviderAdmissionClosed as closed:
-        # Whatever this stream completed before the limit is still reported by the coordinator.
+    except (_ProviderAdmissionClosed, _AcknowledgmentUncertain) as closed:
+        # Whatever this stream completed before the stop is still reported by the coordinator.
         closed.partial = summary
         raise
     except BrainError as exc:
-        summary.failed += 1
         summary.failure_categories[exc.code] = summary.failure_categories.get(exc.code, 0) + 1
+        if not _is_terminal_authority(exc) and _progress_uncertain(client, execution):
+            # A checkpoint of this stream's own may have committed unacknowledged (R47 F3): the
+            # revision is unknown to every stream of the run, so the coordinator stops.
+            uncertain = _AcknowledgmentUncertain(exc.code)
+            uncertain.partial = summary
+            raise uncertain from exc
+        summary.failed += 1
         return summary
 
 
@@ -2345,21 +2474,21 @@ async def _push_doc(
         await _checkpoint_progress(client, execution, state, namespace,
                                    phase=progress.phase if progress else "working")
         state.ack_work(work)
-    except BrainDeferred as exc:
-        if _is_terminal_authority(exc):
-            raise
-        # The content was ACCEPTED; only its durable acknowledgment is owed (AIO-1167 R45 M5). A
-        # control-plane wait is not the document's failure: the obligation stays owed and
-        # unacknowledged (its page is not retired) with the brain's not-before, and spends none of
-        # the retry budget backoff and exhaustion are computed from. The replayed push is idempotent.
-        summary.failure_categories[exc.code] = summary.failure_categories.get(exc.code, 0) + 1
-        if exc.not_before is not None:
-            state.fail_work(work, f"checkpoint deferred: {exc.code}", not_before=exc.not_before, failure=False)
-        return False  # the brain is deferring: start no further work this run
     except BrainError as exc:
         if _is_terminal_authority(exc):
             raise
-        return _record_sink_failure(state, work, exc, summary)
+        # The content was ACCEPTED; only its durable acknowledgment is owed (AIO-1167 R45 M5, R47 F3).
+        # Whatever stopped the checkpoint — a deferral, a 5xx, `stale_progress`, a lost response —
+        # is the control plane's, judged by STAGE, not by exception type: the obligation stays owed
+        # and unacknowledged (its page is not retired), spends none of the retry budget backoff and
+        # exhaustion are computed from, and the replayed push is idempotent.
+        summary.failure_categories[exc.code] = summary.failure_categories.get(exc.code, 0) + 1
+        if isinstance(exc, BrainDeferred) and exc.not_before is not None:
+            state.fail_work(work, f"checkpoint deferred: {exc.code}", not_before=exc.not_before, failure=False)
+        if _progress_uncertain(client, execution):
+            # What was sent may have committed: the revision is unknown, so the run stops here.
+            raise _AcknowledgmentUncertain(exc.code) from exc
+        return False  # nothing committed, but the brain is refusing: start no further work this run
     return True
 
 
@@ -2779,6 +2908,13 @@ async def _checkpoint_progress(
         execution.generation,
         state.root_obligations(execution.integration_id, execution.generation),
     )
+    # A standing account hold travels with every cursor checkpoint (AIO-1167 R47 F5); one that has
+    # passed is dropped.
+    hold = _standing_account_hold(
+        state, execution.integration_id, execution.generation, progress.key.credential_id,
+    )
+    if hold is not None:
+        cursor_document[ACCOUNT_HOLD_KEY] = hold
     # The coordinator owns cursors and roots, never renewal's channel lifecycle: that is carried
     # from the acknowledged document unchanged, so a poll cannot erase a watch intent or record.
     payload = coordinator_document(execution.progress, cursor_document)

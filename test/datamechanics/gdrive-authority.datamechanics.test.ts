@@ -8,6 +8,7 @@ import { POST as itemsPOST } from "@/app/api/v1/items/route";
 import { GET as runsGET, POST as runsPOST } from "@/app/api/v1/integrations/gdrive/runs/route";
 import { GET as oauthCallbackGET } from "@/app/api/auth/gdrive/callback/route";
 import { issueApiKey, revokeApiKey } from "@/lib/admin/keys";
+import { getPool } from "@/lib/db/pg/pool";
 import { createGoogleDriveOAuthState, GDRIVE_OAUTH_BINDING_COOKIE } from "@/lib/auth/gdrive-oauth-state";
 import { getIntegrationWithSecret, upsertIntegration, setIntegrationSecret, setIntegrationStatus } from "@/lib/integrations/manage";
 import {
@@ -16,6 +17,7 @@ import {
   provisionGdriveConnectorPrincipal,
 } from "@/lib/integrations/gdrive-authority";
 import { getPipelineHealth } from "@/lib/ingest/pipeline-health";
+import { setMemberIdentity } from "@/lib/identity/member-identities";
 import { approvedAudienceProject, db, placeMemberByTier, seedTeam, sha, type Seed } from "./helpers";
 
 const GOOGLE_SECRET = JSON.stringify({
@@ -766,6 +768,53 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
     expect(grant).toMatchObject({ access_token: "broker-access", account: { subject: "subject:google-subject" } });
     expect(JSON.stringify(grant)).not.toContain("callback-refresh");
     expect(provider).toHaveBeenCalledTimes(3);
+  });
+
+  it("an OAuth account another member already holds is a VISIBLE refusal; nothing is published or remapped (R47 F2)", async () => {
+    const seed = await seedTeam();
+    await db().from("members").update({ role: "admin" }).eq("id", seed.memberId).eq("team_id", seed.teamId);
+    const { data: bobRow } = await db().from("members").insert({
+      team_id: seed.teamId, email: `bob-${randomUUID().slice(0, 6)}@example.com`, display_name: "Bob",
+      actor_handle: `bob-${randomUUID().slice(0, 6)}`, role: "member", tier: "team", status: "active",
+    }).select("id").single();
+    const bob = (bobRow as { id: string }).id;
+    await setMemberIdentity(db(), seed.teamId, bob, { provider: "gdrive", externalId: "subject:held-subject" });
+    // The callback links identities only for the initiating Admin's OWN verified account.
+    const { data: adminRow } = await db().from("members").select("email")
+      .eq("id", seed.memberId).eq("team_id", seed.teamId).single();
+    const adminEmail = (adminRow as { email: string }).email;
+    process.env.AUTH_SECRET = "aio-1167-data-mechanics-auth-secret";
+    process.env.GOOGLE_DRIVE_CLIENT_ID = "oauth-client";
+    process.env.GOOGLE_DRIVE_CLIENT_SECRET = "oauth-secret";
+    process.env.GOOGLE_DRIVE_OAUTH_REDIRECT = "http://test/api/auth/gdrive/callback";
+    const state = await createGoogleDriveOAuthState(db(), {
+      teamId: seed.teamId, memberId: seed.memberId, integrationName: "conflict-docs", teamSlug: seed.teamSlug,
+      mode: "files", browserBinding: startedBy(seed),
+    });
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        access_token: "callback-access", refresh_token: "callback-refresh", expires_in: 3600,
+        scope: "https://www.googleapis.com/auth/drive.file",
+      }), { status: 200, headers: { "content-type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ sub: "held-subject", email: adminEmail, email_verified: true, name: "Admin" }), {
+        status: 200, headers: { "content-type": "application/json" },
+      }));
+
+    const callback = await oauthCallbackGET(new NextRequest(
+      `http://test/api/auth/gdrive/callback?state=${encodeURIComponent(state)}&code=one-time-code`,
+      INITIATING_BROWSER,
+    ));
+
+    expect(callback.status).toBe(409);
+    const page = await callback.text();
+    expect(page).toContain("Google identity needs review");
+    expect(page).toContain("Admin → Members");
+    expect(page).not.toContain("callback-refresh");
+    expect(await getIntegrationWithSecret(db(), seed.teamId, "gdrive", "conflict-docs")).toBeNull();
+    const { rows } = await getPool().query(
+      "select member_id from member_identities where team_id=$1 and provider='gdrive' and external_id='subject:held-subject'",
+      [seed.teamId]);
+    expect(rows).toEqual([{ member_id: bob }]);
   });
 
   it("atomically links an exact verified OAuth account in subject and author-email namespaces", async () => {

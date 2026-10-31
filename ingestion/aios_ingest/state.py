@@ -232,6 +232,15 @@ CREATE TABLE IF NOT EXISTS removal_barriers (
   raised_at TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (namespace, generation, item_key, observation_revision, peer_drive_id)
 );
+CREATE TABLE IF NOT EXISTS connection_holds (
+  connection_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  credential_id TEXT NOT NULL,
+  not_before TEXT NOT NULL,
+  category TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (connection_id, generation, credential_id)
+);
 """
 
 
@@ -1191,6 +1200,41 @@ class StateStore:
         )
         self._db.commit()
         return rotated
+
+    def hold_connection(
+        self, connection_id: str, generation: int, credential_id: str, not_before: str, category: str,
+    ) -> tuple[str, str]:
+        """Record a provider hold on one verified account of one connection (AIO-1167 R47 F5).
+
+        Independent of streams: a rate limit read while binding roots or capturing start tokens is
+        held before any stream exists. Monotonic — a later, shorter wait never shortens a standing
+        one — and returns the hold now in force."""
+        row = self._db.execute(
+            "SELECT not_before, category FROM connection_holds "
+            "WHERE connection_id=? AND generation=? AND credential_id=?",
+            (connection_id, generation, credential_id),
+        ).fetchone()
+        if row is not None and _instant(row["not_before"]) >= _instant(not_before):
+            return str(row["not_before"]), str(row["category"])
+        self._db.execute(
+            "INSERT INTO connection_holds(connection_id,generation,credential_id,not_before,category,updated_at) "
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(connection_id,generation,credential_id) DO UPDATE SET "
+            "not_before=excluded.not_before,category=excluded.category,updated_at=excluded.updated_at",
+            (connection_id, generation, credential_id, not_before, category, _now_iso()),
+        )
+        self._db.commit()
+        return not_before, category
+
+    def connection_hold(
+        self, connection_id: str, generation: int, credential_id: str,
+    ) -> tuple[str, str] | None:
+        """The recorded hold ``(not_before, category)`` for this account, expired or not."""
+        row = self._db.execute(
+            "SELECT not_before, category FROM connection_holds "
+            "WHERE connection_id=? AND generation=? AND credential_id=?",
+            (connection_id, generation, credential_id),
+        ).fetchone()
+        return (str(row["not_before"]), str(row["category"])) if row is not None else None
 
     def update_progress(self, namespace: str, **changes: Any) -> None:
         allowed = {
@@ -2340,6 +2384,15 @@ def _token_hash(token: str) -> str:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _instant(value: object) -> datetime:
+    """An ISO instant for ordering; an unparseable value sorts first, so it never outranks a real one."""
+    try:
+        at = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    return at if at.tzinfo is not None else at.replace(tzinfo=timezone.utc)
 
 
 def _unexpired(value: object, *, now: datetime | None = None) -> bool:

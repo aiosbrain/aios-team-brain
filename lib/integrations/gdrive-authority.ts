@@ -16,7 +16,7 @@ import { decryptSecret } from "@/lib/secrets/crypto";
 import { validateIntegrationConfig } from "@/lib/api/schemas";
 import { selectedRootCoverage } from "@/lib/integrations/gdrive-root-coverage";
 import { mergeLockedGdriveCredentialFields, unverifiedOauthRoots } from "@/lib/integrations/gdrive-credential-fields";
-import { evaluateGdriveGrant, storedGrantCeiling } from "@/lib/integrations/gdrive-grant-policy";
+import { evaluateGdriveGrant, storedGrantCeiling, type GdriveGrantMode } from "@/lib/integrations/gdrive-grant-policy";
 
 const LEASE_SECONDS = 10 * 60;
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -268,7 +268,15 @@ export interface GdriveAdminTestAuthority {
   generation: number;
   credentialRevision: number;
   config: Record<string, unknown>;
-  credential: { clientId: string; clientSecret: string; refreshToken: string };
+  credential: {
+    clientId: string;
+    clientSecret: string;
+    refreshToken: string;
+    /** The stored grant ceiling every Admin refresh is held to — the broker's, decided the same way. */
+    ceiling: GdriveGrantMode;
+    /** The grant recorded with the credential: the fallback when Google omits `scope`. */
+    recordedScopes: unknown;
+  };
 }
 
 /** A connection as an OAuth publication reads it: under its row locks, credential still encrypted. */
@@ -351,6 +359,12 @@ export async function acquireGdriveAdminTestAuthority(input: {
     if (!secret.client_id || !secret.client_secret || !secret.refresh_token) {
       throw new GdriveAuthorityError("reconnect_required", "Google Drive OAuth reconnection is required", 409);
     }
+    // The same ceiling the broker holds execution to (AIO-1167 R47 F6), decided before any provider
+    // call: an Admin preview must never report healthy what execution will refuse.
+    const ceiling = storedGrantCeiling(secret.grant_mode, secret.scopes);
+    if (!ceiling) {
+      throw new GdriveAuthorityError("reconnect_required", "Google Drive credential has no verifiable approved access; reconnect", 409);
+    }
     return {
       integrationId: row.integration_id,
       teamId: input.teamId,
@@ -362,6 +376,8 @@ export async function acquireGdriveAdminTestAuthority(input: {
         clientId: secret.client_id,
         clientSecret: secret.client_secret,
         refreshToken: secret.refresh_token,
+        ceiling,
+        recordedScopes: secret.scopes,
       },
     };
   });
@@ -375,6 +391,48 @@ export async function authorizeGdriveAdminTestCall(
     const row = await lockedAuthority(authority.integrationId, authority.teamId);
     await assertLiveAdminConnection(row, authority);
   });
+}
+
+/**
+ * The one Admin test/preview refresh (AIO-1167 R47 F6): the connection test, Picker verification and
+ * manual-root verification all get their short-lived token here, held to the SAME grant policy as
+ * the connector broker — the stored ceiling, and the broker's fallback when Google omits `scope`.
+ * The Admin snapshot is rechecked on both sides of the network call, so a pause, credential change
+ * or role loss during the refresh refuses before any Drive read. The token stays server-side.
+ */
+export async function refreshGdriveAdminAccess(
+  authority: GdriveAdminTestAuthority,
+): Promise<{ accessToken: string; scopes: string[] }> {
+  await authorizeGdriveAdminTestCall(authority);
+  let response: Response;
+  try {
+    response = await fetch(GOOGLE_TOKEN_URL, {
+      method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: authority.credential.clientId, client_secret: authority.credential.clientSecret,
+        refresh_token: authority.credential.refreshToken, grant_type: "refresh_token",
+      }),
+      cache: "no-store", signal: AbortSignal.timeout(15_000),
+    });
+  } catch {
+    throw new GdriveAuthorityError("provider_unavailable", "Google Drive is temporarily unavailable", 503);
+  }
+  const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
+  await authorizeGdriveAdminTestCall(authority);
+  if (!response.ok || typeof payload.access_token !== "string") {
+    const revoked = response.status === 400 || response.status === 401;
+    throw new GdriveAuthorityError(
+      revoked ? "reconnect_required" : "provider_unavailable",
+      revoked ? "Google authorization was revoked; reconnect this account" : "Google Drive is temporarily unavailable",
+      revoked ? 409 : 503,
+    );
+  }
+  const configured = Array.isArray(authority.config.scopeSet) ? authority.config.scopeSet.map(String) : [];
+  const granted = refreshedGrantScopes(payload, authority.credential.recordedScopes, configured);
+  if (!evaluateGdriveGrant(authority.credential.ceiling, granted).ok) {
+    throw new GdriveAuthorityError("reconnect_required", "Google Drive credential no longer matches its approved access; reconnect", 409);
+  }
+  return { accessToken: payload.access_token, scopes: granted };
 }
 
 /** Atomically publish a Picker-verified selection against the exact Admin/config credential
@@ -929,6 +987,16 @@ export async function releaseGdriveExecution(auth: ApiAuth, ref: GdriveExecution
   });
 }
 
+/**
+ * The grant a refresh reports: Google's `scope` when present, else the grant recorded with the
+ * credential, else the connection's configured scope set. One rule for the broker and the Admin
+ * refresh, so the two cannot judge the same response differently.
+ */
+function refreshedGrantScopes(payload: Record<string, unknown>, recorded: unknown, configured: string[]): string[] {
+  if (typeof payload.scope === "string") return payload.scope.split(/\s+/).filter(Boolean);
+  return Array.isArray(recorded) ? recorded.map(String) : configured;
+}
+
 interface StoredOAuthSecret {
   client_id?: string;
   client_secret?: string;
@@ -1010,9 +1078,7 @@ export async function brokerGoogleAccessToken(auth: ApiAuth, ref: GdriveExecutio
     });
     throw new GdriveAuthorityError(revoked ? "reconnect_required" : "provider_unavailable", revoked ? "Google Drive connection requires reconnection" : "Google credential refresh is temporarily unavailable", revoked ? 409 : 503);
   }
-  const granted = typeof payload.scope === "string"
-    ? payload.scope.split(/\s+/).filter(Boolean)
-    : (Array.isArray(credential.scopes) ? credential.scopes.map(String) : credential.configuredScopes);
+  const granted = refreshedGrantScopes(payload, credential.scopes, credential.configuredScopes);
   // The consent mode recorded with the credential is a ceiling on EVERY grant, not just the first
   // (AIO-1167 R43 F3). A refresh reporting authority outside it is refused and the token withheld —
   // never released with the unexpected scope filtered out of the list, which would hide it.

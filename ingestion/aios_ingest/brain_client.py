@@ -294,6 +294,10 @@ class BrainClient:
         self._random = random_fn
         self._monotonic = monotonic_fn
         self._gdrive_progress_revisions: dict[tuple[str, int, int, str], int] = {}
+        # Executions whose last checkpoint may have committed without an acknowledgment reaching
+        # this client (AIO-1167 R47 F3). Their revision is unknown, so no further checkpoint is
+        # sent under them; a fresh acquisition restores the brain's authoritative progress.
+        self._gdrive_progress_uncertain: set[tuple[str, int, int, str]] = set()
 
     async def __aenter__(self) -> "BrainClient":
         return self
@@ -430,10 +434,16 @@ class BrainClient:
             progress=dict(data.get("progress") or {}),
             progress_revision=int(data.get("progress_revision") or 0),
         )
-        self._gdrive_progress_revisions[
-            (execution.integration_id, execution.generation, execution.fence, execution.owner)
-        ] = execution.progress_revision
+        acquired = (execution.integration_id, execution.generation, execution.fence, execution.owner)
+        self._gdrive_progress_revisions[acquired] = execution.progress_revision
+        self._gdrive_progress_uncertain.discard(acquired)
         return execution
+
+    def gdrive_progress_uncertain(self, execution: GdriveExecution) -> bool:
+        """Whether a checkpoint under this execution may have committed unacknowledged (R47 F3)."""
+        return (
+            execution.integration_id, execution.generation, execution.fence, execution.owner,
+        ) in self._gdrive_progress_uncertain
 
     async def claim_gdrive_run_request(self) -> GdriveRunRequest | None:
         resp = await self._client.get(
@@ -542,6 +552,14 @@ class BrainClient:
         self, execution: GdriveExecution, progress: dict[str, Any]
     ) -> dict[str, Any]:
         key = (execution.integration_id, execution.generation, execution.fence, execution.owner)
+        if key in self._gdrive_progress_uncertain:
+            # A checkpoint before this one may have committed, unacknowledged (AIO-1167 R47 F3): its
+            # revision is unknown, and sending a CHANGED document under a guessed one could replace
+            # newer sibling state. Nothing is sent; the next acquisition restores the authority.
+            raise BrainDeferred(
+                503, "checkpoint_unacknowledged",
+                "an earlier Google Drive checkpoint is unacknowledged; reacquire before checkpointing",
+            )
         revision = self._gdrive_progress_revisions.setdefault(key, execution.progress_revision)
         # Bounded by the RUN's remaining budget as well as the checkpoint's own (AIO-1167 R44 U3):
         # a checkpoint near the end of a run defers instead of extending it.
@@ -549,44 +567,65 @@ class BrainClient:
         if execution.run_deadline is not None:
             deadline = min(deadline, execution.run_deadline)
         last_response: httpx.Response | None = None
+        sent = False  # a request left this client: the brain may have committed it
         for attempt in range(_GDRIVE_CHECKPOINT_MAX_ATTEMPTS):
             remaining_before_call = deadline - self._monotonic()
             if remaining_before_call <= 0:
-                if last_response is None:
+                if not sent:
                     # Nothing was sent: the caller's acknowledgment stays pending, retryable at once.
                     raise BrainDeferred(503, "checkpoint_deadline", "Google Drive checkpoint deadline expired before it was sent")
                 break
-            resp = await self._client.post(
-                f"{self._base}/api/v1/integrations/gdrive/execution",
-                json={
-                    "action": "checkpoint", "integration_id": execution.integration_id,
-                    "generation": execution.generation, "fence": execution.fence,
-                    "owner": execution.owner, "progress_revision": revision,
-                    "progress": progress,
-                },
-                headers=self._headers,
-                timeout=max(0.1, min(15.0, remaining_before_call)),
-            )
-            if resp.status_code == 200:
+            sent = True
+            try:
+                resp = await self._client.post(
+                    f"{self._base}/api/v1/integrations/gdrive/execution",
+                    json={
+                        "action": "checkpoint", "integration_id": execution.integration_id,
+                        "generation": execution.generation, "fence": execution.fence,
+                        "owner": execution.owner, "progress_revision": revision,
+                        "progress": progress,
+                    },
+                    headers=self._headers,
+                    timeout=max(0.1, min(15.0, remaining_before_call)),
+                )
+            except httpx.TransportError:
+                # The request may have reached the brain and committed. The IDENTICAL payload is
+                # retried under the same revision: the brain acknowledges an exact replay of what it
+                # holds, and commits it if it never arrived (AIO-1167 R47 F3).
+                resp = None
+            if resp is not None and resp.status_code == 200:
                 result = dict(resp.json())
                 self._gdrive_progress_revisions[key] = int(result.get("progress_revision") or revision)
                 return result
-            last_response = resp
-            if resp.status_code != 429 and resp.status_code < 500:
-                raise BrainError(resp.status_code, *_error_fields(resp))
+            if resp is not None:
+                last_response = resp
+                if resp.status_code != 429 and resp.status_code < 500:
+                    if resp.status_code == 409:
+                        # `stale_progress`: the brain's revision is not the one this client holds.
+                        self._gdrive_progress_uncertain.add(key)
+                    raise BrainError(resp.status_code, *_error_fields(resp))
             if attempt + 1 >= _GDRIVE_CHECKPOINT_MAX_ATTEMPTS:
                 break  # no further attempt will be sent: never sleep for one (R44 U4)
-            server_delay = _retry_after(resp)
+            server_delay = _retry_after(resp) if resp is not None else None
             delay = (server_delay if server_delay is not None else min(2**attempt, 8)) + _bounded_jitter(self._random())
             if self._monotonic() + delay >= deadline:
                 # A wait that does not fit is not slept or truncated: the checkpoint is deferred,
-                # with the time it may be retried (R44 U3).
+                # with the time it may be retried (R44 U3). What was sent may have committed.
+                self._gdrive_progress_uncertain.add(key)
+                if resp is None:
+                    raise BrainDeferred(
+                        503, "checkpoint_unacknowledged", "Google Drive checkpoint acknowledgment was lost",
+                        not_before=_iso_after(delay),
+                    )
                 raise BrainDeferred(
                     resp.status_code, *_error_fields(resp), not_before=_iso_after(delay),
                 )
             await self._sleep(delay)
-        if last_response is None:
+        if not sent:
             raise BrainError(503, "checkpoint_deadline", "Google Drive checkpoint deadline expired")
+        self._gdrive_progress_uncertain.add(key)
+        if last_response is None:
+            raise BrainError(503, "checkpoint_unacknowledged", "Google Drive checkpoint acknowledgment was lost")
         raise BrainError(last_response.status_code, *_error_fields(last_response))
 
     async def verify_gdrive_service_account(
