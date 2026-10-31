@@ -178,3 +178,11 @@ Next: GPT-6 Astra medium, fresh ephemeral read-only adjudication of all seven Fa
 
 
 R50 timed WIP checkpoint captured 2026-10-31 13:52 UTC at `.context/aio1167-rebase-handoff/r50-wip-20261031T135200Z/`. Capture was stable across before/after status and content hashes. Manifest SHA-256: `d695f14ade7eb58ade277f7dcac98e1f815afc90709b7e1b19ea5b4b47bc1037`. `full.diff` SHA-256 `8d8d1b35c7dbed802a7b7b386b6b54fb9ad2e1cf91439e98f0bb1192e79c3fd8`; untracked archive SHA-256 `79afd7f48366b239213cf4cfb08cfee82663e469bd559694a3c16f6ee45b345b`; 13 untracked files captured. This includes the already checked-in/remote R49 source plus partial R50 changes. The recovery bundle must be included in the next remote checkpoint before the 30-minute deadline.
+
+
+2026-10-31 14:07 UTC quota/checkpoint update: a fresh interactive full-user Claude `/usage` completed at 14:07 UTC. Session 0% (reset 12:40 a.m. Asia/Calcutta), all-model week 28%, Fable week 33%, credits off; no window is near the 90% stop threshold. The sole R50 Opus 5.5 HIGH writer session `628402d5-a1c6-42b7-b736-e84358c1a749` remains active (CLI exec session `69077`). Last recovery push `d9d04f9273a7e186bc54370164a4d2b008ecf501` was independently read back from `origin/codex/aio-1167-checkpoint-20261027`. The 13:52 bundle is remotely preserved; capture and push the current R50 source before the next long check/review and by 14:22 UTC.
+
+Schema ownership reminder: the canonical fresh-schema owner remains `postgres/schema.sql` / `gdrive_execution_authority`; forward existing-database transition is reserved in `20261031140000_gdrive_restriction_generation_lifetime.sql`. PR #714's `20261023120000_slack_channel_history_segments.sql` reservation is distinct and earlier; AIO-1170's pending Slack schema block is separate. Recheck on the final staging base before publication.
+
+
+R50 timed WIP checkpoint captured 2026-10-31 14:07 UTC: `.context/aio1167-rebase-handoff/r50-wip-20261031T140700Z/`. Capture was stable across before/after status and content hashes; 16 untracked files are included. Manifest SHA-256 `a6e025c16b38d1d32c9cba73f6ab839dc8d2980b63782fa7be50d2e85a8cb5fe`; `full.diff` SHA-256 `f1e40ac9f7d65fac59ed6668e2bd4a0dca779e37f08f5cb62f2eedaf757524dc`; `untracked.tar.gz` SHA-256 `432493f64200ba81b39a776c55cb3f825e87bc938957e89e3ae0f6d77734d384`.

@@ -1,0 +1,38 @@
+ M .context/aio1167-rebase-handoff/CURRENT.md
+ M app/t/[team]/admin/integrations/actions.ts
+ M app/t/[team]/admin/members/actions.ts
+ M components/admin/identity-conflicts.tsx
+ M docs/ARCHITECTURE.md
+ M ingestion/aios_ingest/brain_client.py
+ M ingestion/aios_ingest/connector_state.py
+ M ingestion/aios_ingest/gdrive_sync.py
+ M ingestion/aios_ingest/sources/gdrive.py
+ M ingestion/aios_ingest/state.py
+ M ingestion/tests/test_gdrive_poll_reporting.py
+ M ingestion/tests/test_gdrive_upgrade.py
+ M lib/identity/member-identities.ts
+ M lib/integrations/gdrive-authority.ts
+ M lib/integrations/gdrive-oauth.ts
+ M postgres/schema.sql
+ M test/datamechanics/gdrive-admin-credential-race.datamechanics.test.ts
+ M test/datamechanics/gdrive-admin-test.datamechanics.test.ts
+ M test/datamechanics/gdrive-authority.datamechanics.test.ts
+ M test/datamechanics/gdrive-oauth-lock-order.datamechanics.test.ts
+ M test/datamechanics/identity-discovery-conflicts.datamechanics.test.ts
+ M test/identity-conflicts-view.test.ts
+?? ingestion/tests/test_account_hold_before_streams.py
+?? ingestion/tests/test_bound_root_loss.py
+?? ingestion/tests/test_checkpoint_acknowledgment.py
+?? ingestion/tests/test_checkpoint_uncertainty_latch.py
+?? ingestion/tests/test_document_restrictions.py
+?? ingestion/tests/test_exhaustion_is_not_completion.py
+?? ingestion/tests/test_pre_stream_scope.py
+?? ingestion/tests/test_restricted_root_recovery.py
+?? ingestion/tests/test_restriction_lifetime.py
+?? ingestion/tests/test_retry_after_holds.py
+?? ingestion/tests/test_retry_after_parsing.py
+?? ingestion/tests/test_root_evidence_r49.py
+?? postgres/migrations/20261031140000_gdrive_restriction_generation_lifetime.sql
+?? test/datamechanics/gdrive-admin-grant-policy.datamechanics.test.ts
+?? test/datamechanics/gdrive-complete-snapshot-overlap.datamechanics.test.ts
+?? test/datamechanics/gdrive-identity-tombstone-email.datamechanics.test.ts

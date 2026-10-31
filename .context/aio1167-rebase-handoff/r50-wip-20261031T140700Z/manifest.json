@@ -1,0 +1,32 @@
+{
+  "attempts": 1,
+  "branch": "codex/aio-1167-google-docs-connector-rebased",
+  "captured_utc": "2026-10-31T14:07:00Z",
+  "note": "Task-owned R49 plus current partial R50; sole writer remained active during this timed checkpoint.",
+  "sha256": {
+    "full.diff": "f1e40ac9f7d65fac59ed6668e2bd4a0dca779e37f08f5cb62f2eedaf757524dc",
+    "staged.diff": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "status.txt": "5a3f00c4b5c5bcb4ee0722f0d77a21e8a9c7eb12e3ab1b5177157e0a71d75a2e",
+    "untracked.tar.gz": "432493f64200ba81b39a776c55cb3f825e87bc938957e89e3ae0f6d77734d384"
+  },
+  "source_head": "5ecd2989e21fded915b41b508477bb267aaec06d",
+  "stable_during_capture": true,
+  "untracked_files": {
+    "ingestion/tests/test_account_hold_before_streams.py": "dc6c5e5a3ee1d30af6b7268b775403d548575443ef36462dbcf8145f1f58f768",
+    "ingestion/tests/test_bound_root_loss.py": "0dd5be18bc2d14b63a8896e806a49e9ef8e86c991b1b7e61f7fa2d5b223e4056",
+    "ingestion/tests/test_checkpoint_acknowledgment.py": "97117715d4eb82d7236f58468dd2499525a23ba83637ff4657e79a82fd74b1ba",
+    "ingestion/tests/test_checkpoint_uncertainty_latch.py": "c8f2f19674f32dcf142d01ba4cbea64083fc64b4e3aa6dfbdf371b3f9c1ea63c",
+    "ingestion/tests/test_document_restrictions.py": "8dab84ed307157f23bcbb5b47da26778cf56b5f8fbbce00eb4a5ce381c00b3a7",
+    "ingestion/tests/test_exhaustion_is_not_completion.py": "98932c8cb3aef54f976fe7d6cab0c354305edc7feae4436f3beac9c3e9b1e31e",
+    "ingestion/tests/test_pre_stream_scope.py": "ff26f1a4d1b03ac0c30d21829bd3cfbb314deafd311e176bd10a3747727451bd",
+    "ingestion/tests/test_restricted_root_recovery.py": "f0bebdcee179d06a44b581ecbc9a72f28b1b4a60b5f555e0e419acee520a6400",
+    "ingestion/tests/test_restriction_lifetime.py": "e23e15e6a957cf00d8c87517b4f4d0ea088c06f93896dd8cd7f54233af92ee6e",
+    "ingestion/tests/test_retry_after_holds.py": "18337db7a6d6f8b23a42e24e808190948555d9c2164beef3c4d11c43ffaa2ed6",
+    "ingestion/tests/test_retry_after_parsing.py": "afab189721e54ef9cef2a77db6226832552a25a868d2107647680775fbed23cb",
+    "ingestion/tests/test_root_evidence_r49.py": "8e7e2565f48b14dbad8d5cbc0312d30b1957dc0e8d88ddcb833782f013d50682",
+    "postgres/migrations/20261031140000_gdrive_restriction_generation_lifetime.sql": "5e0feb43c34157b81c073e51c590b67d9cc4188c5027445b61c67f3000b411f5",
+    "test/datamechanics/gdrive-admin-grant-policy.datamechanics.test.ts": "fea3264eefc7d4f6b8c7df33dcc706994a3e0b6c85f0d313f000c757eb26d31e",
+    "test/datamechanics/gdrive-complete-snapshot-overlap.datamechanics.test.ts": "53bb0c645254a06f0f2e3abcf8e49af564615b70126a51edbf785d3f8edf9ddf",
+    "test/datamechanics/gdrive-identity-tombstone-email.datamechanics.test.ts": "292186cfc3c30b52da8e0573c5ec32e6322fd0e7e37a58c8c6474f4841317be7"
+  }
+}
