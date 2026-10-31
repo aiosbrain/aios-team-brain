@@ -345,3 +345,8 @@ R50 complete writer snapshot preserved before coordinator checks. The remote che
 - GPT-6.1 Sol HIGH independently reviewed the same frozen candidate and returned one High plus three Medium findings. Its complete report is `r51-blind-final-sol-20261031.md`.
 - Astra and Sol agree on the High verified-removal suppression gap and Medium watch-renewal/account-hold gap. Astra additionally found a Medium where `_document_loss_verified()` discards `ProviderDeferred`; Sol additionally found a Medium retry-publication gap on the standing service-account prerequisite and a legacy mixed-case unlink-tombstone regression.
 - The two blind review reports are independently checkpointed; no review commands/tests/edits. No implementation writer has been resumed. Next: fresh Astra adjudication of the combined distinct findings; settle accepted fix scope, then dispatch one bounded correction to the existing sole Opus writer after fresh subscription admission.
+
+## 2026-10-31 19:05 UTC — Astra adjudication complete
+
+- Fresh GPT-6 Astra HIGH adjudication accepted/fix all five distinct blind-review issues: one High and four Medium. Detailed decisions, code evidence, bounded fix guidance and required regressions are in `r51-blind-final-adjudication-20261031.md`.
+- No user decision is required. Keep source frozen; perform overlap inspection before edits; then resume only the existing Opus 5.5 HIGH writer after fresh Claude subscription admission. Prior full-sidecar and focused-test evidence remains valid only for unchanged slices; rerun all tests invalidated by the five corrections.
