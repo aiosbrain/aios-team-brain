@@ -62,3 +62,9 @@ Keep R49 F6, H2, M-b/M-c/M-d, live Google certification/soak, opt-in/runner, can
 
 - After the API-key fixture fix, the focused six-module run reports **77 passed, 1 failed in 2.00s**. Sole failure: positive `Retry-After` made `BrainDeferred.not_before` six microseconds earlier than `provider_not_before`, because the two ISO timestamps were computed from separate `datetime.now` calls. This is a strict local-eligibility ordering edge, not a provider minimum persistence failure.
 - Exact result: `r51-lowfix-verification-attempt2.md`; bounded same-writer prompt: `r51-opus-followup-3-prompt.md`. The previous complete source snapshot is remotely preserved at `ec749657ade228a934ecd6a0fa3834f35c54f4fa`. Next resume the same Opus session for one-file paired timestamp construction in `_backoff` and named checkpoint deferrals, then rerun focused verification.
+
+## 2026-10-31 16:35 UTC — paired Retry-After timestamps captured
+
+- The same Opus 5.5 HIGH session completed the one-file `brain_client.py` consistency fix (4 turns, terminal success, first-party); both `_backoff` and named checkpoint deferrals now derive local eligibility and provider minimum from one captured UTC `now`. The strict test assertion remains unchanged; no other file changed and no tests were run by the writer. Result/meta are in the new bundle.
+- Updated complete recovery bundle: `r51-lowfix-checkpoint3-20261031T163553_673956Z/`; source patch SHA-256 `c09abf59b6a6d30993088321da612e1d384365ffad8d87bcb100cac2b715dfbe` (22 tracked paths); untracked-source archive SHA-256 `b486edb5c86fcb90348e0fb09752872d6bf256877427910aa21af4e38b574588` (20 paths); manifest SHA-256 `233457779c38330460d0f7995a042e4e5df00ab5ad794875dafe6466ffc7cb9c`.
+- Next rerun the same focused six-module coordinator suite. Previous 77-pass/1-failure timing-edge result remains separately recorded and is not a pass for this snapshot.
