@@ -146,10 +146,11 @@ class _ProviderAdmissionClosed(Exception):
     per-stream ``provider_read`` (R45 H1). ``partial`` carries the counts the interrupted stream had
     already completed, so the work done before the limit is still reported."""
 
-    def __init__(self, not_before: str, category: str):
+    def __init__(self, not_before: str, category: str, diagnostic: str | None = None):
         super().__init__(category)
         self.not_before = not_before
         self.category = category
+        self.diagnostic = diagnostic
         self.partial: IngestSummary | None = None
 
 
@@ -181,7 +182,18 @@ _LOCAL_DEADLINE_CATEGORIES = frozenset({"dispatch_deadline", "run_deadline"})
 
 def _account_hold(exc: ProviderDeferred) -> _ProviderAdmissionClosed:
     """The account-wide hold a provider rate limit opens (C6), from wherever it was read."""
-    return _ProviderAdmissionClosed(exc.not_before or _defer_until(), exc.category)
+    return _ProviderAdmissionClosed(
+        exc.not_before or _defer_until(), exc.category, getattr(exc, "diagnostic", None),
+    )
+
+
+def _count_retry_after_diagnostic(summary: IngestSummary, exc: object) -> None:
+    """Report a defective provider Retry-After beside the deferral it caused (AIO-1167 R48 D2):
+    ``retry_after_malformed`` (ignored for the bounded fallback) or ``retry_after_unrepresentable``
+    (held at the last representable instant)."""
+    diagnostic = getattr(exc, "diagnostic", None)
+    if diagnostic:
+        summary.failure_categories[diagnostic] = summary.failure_categories.get(diagnostic, 0) + 1
 
 
 def _standing_account_hold(
@@ -234,6 +246,7 @@ async def _open_account_hold(
     a provider wait and opens no hold."""
     total.skipped += 1
     total.failure_categories[exc.category] = total.failure_categories.get(exc.category, 0) + 1
+    _count_retry_after_diagnostic(total, exc)
     if exc.category in _LOCAL_DEADLINE_CATEGORIES:
         return
     state.hold_connection(
@@ -424,6 +437,10 @@ class RootObservation:
     state: str
     drive_id: str | None = None
     detail: str | None = None
+
+
+# The diagnostic a verified-unavailable selected root carries in the fenced root evidence (R48 D1).
+_ROOT_UNAVAILABLE_DETAIL = "selected root unavailable: the provider reports it not found; remove or reselect it"
 
 
 def _observe_root(
@@ -1210,6 +1227,7 @@ async def run_gdrive_stream(
                     if closed.partial is not None:
                         _merge_summary(total, closed.partial)  # work completed before the limit
                     total.failure_categories[closed.category] = total.failure_categories.get(closed.category, 0) + 1
+                    _count_retry_after_diagnostic(total, closed)
                     break
                 except _AcknowledgmentUncertain as uncertain:
                     # The brain may hold a checkpoint this run never saw acknowledged (AIO-1167 R47
@@ -1650,6 +1668,7 @@ async def _run_gdrive_stream_unlocked(
                 )
                 summary.failed += 1
                 summary.failure_categories[exc.category] = summary.failure_categories.get(exc.category, 0) + 1
+                _count_retry_after_diagnostic(summary, exc)
                 return summary
             except Exception as exc:
                 await _checkpoint_progress(
@@ -1783,6 +1802,7 @@ async def _run_gdrive_stream_unlocked(
                 )
                 summary.failed += 1
                 summary.failure_categories[exc.category] = 1
+                _count_retry_after_diagnostic(summary, exc)
                 return summary
             obligations: list[tuple[str, str, dict[str, Any]]] = []
             membership_additions: list[tuple[str, str, str] | tuple[str, str, str, str | None]] = []
@@ -2105,6 +2125,24 @@ async def _enumerate_baseline(
         bound = (root_bindings or {}).get((root_kind, str(root_id)))
         return (bound is not None and bound != drive_id) or (root_kind, str(root_id)) in leaving
 
+    # Bound roots whose OWN metadata the provider answered not-found under this run's authority
+    # (AIO-1167 R48 D1). Each is a resolved outcome — it supports nothing now — so its page or
+    # traversal is finished empty, without listing a folder that is gone. Only the root's own 404
+    # qualifies: a listing 404, a never-bound root, auth, quota, timeouts and transient errors
+    # remain conservative. Read again, a restored root is enumerated normally.
+    unavailable: set[str] = set()
+
+    def record_unavailable(root_kind: str, root_id: str) -> bool:
+        if not state.record_root_unavailable(
+            integration_id, generation, root_kind, root_id, detail=_ROOT_UNAVAILABLE_DETAIL,
+        ):
+            return False
+        unavailable.add(root_id)
+        summary.failure_categories["selection_root_unavailable"] = (
+            summary.failure_categories.get("selection_root_unavailable", 0) + 1
+        )
+        return True
+
     # A folder listing scoped to this drive is empty for a folder that was moved out of it, which
     # reads exactly like a folder that was emptied. So before a bound folder root is listed, its
     # own metadata is read: found in another drive, it is recorded as relocating and this baseline
@@ -2128,6 +2166,8 @@ async def _enumerate_baseline(
                 integration_id, generation, "folder", root_id, drive_id, detail=str(observed.detail),
             )
             raise SelectedRootUnverified(f"selected folder {root_id} could not be verified")
+        if observed.state == "absent" and record_unavailable("folder", root_id):
+            continue
         state.settle_root(integration_id, generation, "folder", root_id)
 
     # Explicit file selections are individual one-item enumeration pages. Their metadata must be
@@ -2149,7 +2189,17 @@ async def _enumerate_baseline(
                 # records nothing, and nothing is read through this stream.
                 meta = None
             else:
-                meta = source._metadata(root["root_id"])
+                try:
+                    meta = source._metadata(root["root_id"])
+                except (BrainError, ProviderDeferred):
+                    raise
+                except Exception as exc:
+                    # A bound file root's own not-found is its outcome (R48 D1): this page commits
+                    # with no membership. Anything else is raised exactly as before.
+                    if (bound_drive is None or _provider_status(exc) != 404
+                            or not record_unavailable("file", str(root["root_id"]))):
+                        raise
+                    meta = None
                 pages_read += 1
             if meta is None:
                 pass
@@ -2203,7 +2253,10 @@ async def _enumerate_baseline(
         token = str(row["page_token"] or "") or None
         page_id = _page_id("baseline", snapshot_id, row["root_id"], row["folder_id"], token)
         page = state.get_page(namespace, generation, page_id)
-        if page is None and another_streams(root_kinds.get(str(row["root_id"]), ""), row["root_id"]):
+        if page is None and (
+            another_streams(root_kinds.get(str(row["root_id"]), ""), row["root_id"])
+            or str(row["root_id"]) in unavailable
+        ):
             # A folder root that left this drive after this build was seeded. It is not listed
             # here — the listing would be empty and prove nothing — and its traversal is closed
             # with a page that records nothing, so the stream's other roots still finish.
@@ -2580,9 +2633,11 @@ async def _drain_pending(
                 # The provider's wait governs this account, not this one document (R44 C6): stop
                 # every further call for it, and leave this obligation untouched.
                 raise _account_hold(exc) from exc
-            _fail_work(state, work, str(exc))
+            # The provider's named deadline is the earliest retry, never the shorter backoff (R48 D2).
+            _fail_work(state, work, str(exc), retry_after=exc.not_before)
             summary.failed += 1
             summary.failure_categories[exc.category] = summary.failure_categories.get(exc.category, 0) + 1
+            _count_retry_after_diagnostic(summary, exc)
             continue
         except ProviderCursorInvalid:
             # Cursor validity is only meaningful for change enumeration, never an item fetch.

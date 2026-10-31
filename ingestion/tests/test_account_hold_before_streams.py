@@ -29,6 +29,7 @@ from aios_ingest.brain_client import BrainError, GdriveExecution, IngestResult
 from aios_ingest.config import BrainSettings, Connection
 from aios_ingest.gdrive_sync import run_gdrive_stream
 from aios_ingest.normalize import RawDoc
+from aios_ingest.sources.gdrive import GoogleDriveSource as RealDriveSource
 from aios_ingest.sources.gdrive import ProviderDeferred
 from aios_ingest.state import StateStore
 
@@ -52,12 +53,45 @@ def clock(monkeypatch):
     return now
 
 
-def world(monkeypatch, *, selection: dict, fail: str | None, category: str = "rate_limited"):
+def provider_deferral(status: int, retry_after: str | None) -> ProviderDeferred:
+    """The ProviderDeferred the REAL provider-call owner raises for one HTTP answer — so the
+    Retry-After is parsed and represented exactly as in production (AIO-1167 R48 D2)."""
+
+    class Response:
+        def __init__(self):
+            self.status = status
+            self.headers = {"Retry-After": retry_after} if retry_after is not None else {}
+
+    class GoogleHttpError(Exception):
+        resp = Response()
+
+    def request():
+        raise GoogleHttpError(f"HTTP {status}")
+
+    source = RealDriveSource(
+        file_ids=["any"], api_mode="docs", drive_service=object(), docs_service=object(),
+        request_deadline_seconds=1, provider_retry_attempts=1,
+    )
+    try:
+        source._provider_call(request)
+    except ProviderDeferred as exc:
+        return exc
+    raise AssertionError("the provider call did not defer")
+
+
+def world(
+    monkeypatch, *, selection: dict, fail: str | None, category: str = "rate_limited",
+    retry_after: str | None = None, status: int = 429,
+):
     """The real coordinator; Google and the brain are fakes. ``fail`` names the ONE provider phase
-    that answers ``category`` until it is cleared; ``checkpoint_error`` makes publication fail."""
+    that answers ``category`` until it is cleared; ``checkpoint_error`` makes publication fail.
+    With ``retry_after`` set, the deferral is the real provider owner's answer to HTTP ``status``
+    carrying that Retry-After header (R48 D2)."""
     w = SimpleNamespace(fail=fail, calls=[], pushes=[], progress={}, revision=0, checkpoint_error=None)
 
     def deferred() -> ProviderDeferred:
+        if retry_after is not None:
+            return provider_deferral(status, retry_after)
         until = HOLD_UNTIL if category == "rate_limited" else None
         return ProviderDeferred("429 Too Many Requests", not_before=until, category=category)
 
@@ -108,6 +142,8 @@ def world(monkeypatch, *, selection: dict, fail: str | None, category: str = "ra
 
         def _raw_doc(self, meta):
             w.calls.append("body")
+            if w.fail == "body":
+                raise deferred()
             return RawDoc(source="gdrive", external_id=meta["id"], title=meta["name"], body="body text")
 
     class Client:

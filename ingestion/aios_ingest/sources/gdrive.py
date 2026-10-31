@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import time
 import types
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_tz
 from typing import Any, Callable, Iterable, Iterator
 
 from ..brain_client import BrainError
@@ -65,12 +66,70 @@ class IncompleteExtractionError(RuntimeError):
 
 
 class ProviderDeferred(RuntimeError):
-    """A retryable provider call cannot complete inside the current bounded run."""
+    """A retryable provider call cannot complete inside the current bounded run.
 
-    def __init__(self, message: str, *, not_before: str | None = None, category: str = "provider_retry"):
+    ``diagnostic`` names a defect in the provider's Retry-After itself (AIO-1167 R48 D2):
+    ``retry_after_malformed`` (ignored; the bounded fallback was used) or
+    ``retry_after_unrepresentable`` (a valid wait past the last representable instant; held there)."""
+
+    def __init__(
+        self, message: str, *, not_before: str | None = None, category: str = "provider_retry",
+        diagnostic: str | None = None,
+    ):
         super().__init__(message)
         self.not_before = not_before
         self.category = category
+        self.diagnostic = diagnostic
+
+
+# The last instant a durable timestamp can name (AIO-1167 R48 D2). A valid Retry-After beyond it is
+# held HERE — fail closed, never read as permission to retry early — and reported as such.
+LATEST_INSTANT = datetime.max.replace(tzinfo=timezone.utc)
+# RFC 9110 delay-seconds is 1*DIGIT; a decimal fraction is tolerated as before. No sign, exponent,
+# whitespace inside, or NaN/infinity spelling: those are malformed, not delays.
+_DELAY_SECONDS = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+
+
+@dataclass(frozen=True)
+class RetryAfter:
+    """One provider Retry-After, classified (AIO-1167 R48 D2).
+
+    * ``valid`` — delay-seconds or an HTTP-date, as the absolute UTC ``deadline`` the provider
+      named. Never shortened or capped, however long: AC-04 honours valid Retry-After.
+    * ``malformed`` — not a delay and not a date: text, a sign or exponent, NaN/infinity, an
+      impossible calendar date. It names no deadline, so the existing bounded fallback applies.
+    * ``unrepresentable`` — syntactically valid, but later than any timestamp can name. Fail
+      closed: held at ``LATEST_INSTANT``, never retried early.
+    """
+
+    kind: str
+    deadline: datetime | None = None
+
+
+def parse_retry_after(value: object, now: datetime) -> RetryAfter:
+    """Classify one Retry-After value against ``now`` (UTC)."""
+    text = str(value).strip()
+    if _DELAY_SECONDS.fullmatch(text):
+        try:
+            seconds: float | int = float(text) if "." in text else int(text)
+            return RetryAfter("valid", now + timedelta(seconds=seconds))
+        except (OverflowError, ValueError):
+            # Only digits — a real delay — but too long for timedelta or for a datetime.
+            return RetryAfter("unrepresentable")
+    parsed = parsedate_tz(text)
+    if parsed is None:
+        return RetryAfter("malformed")
+    if parsed[0] > LATEST_INSTANT.year:
+        return RetryAfter("unrepresentable")
+    try:
+        named = datetime(*parsed[:6], tzinfo=timezone(timedelta(seconds=parsed[9] or 0)))
+    except (OverflowError, ValueError):
+        # A date-shaped value naming no real instant (31 February, hour 25, a bad offset).
+        return RetryAfter("malformed")
+    try:
+        return RetryAfter("valid", named.astimezone(timezone.utc))
+    except OverflowError:
+        return RetryAfter("unrepresentable")
 
 
 class ProviderCursorInvalid(RuntimeError):
@@ -500,7 +559,8 @@ class GoogleDriveSource(PullOnlySource, Source):
         return cls._status(exc) == 403 and cls._error_reasons(exc) == {"insufficientFilePermissions"}
 
     @staticmethod
-    def _retry_after(exc: Exception) -> float | None:
+    def _retry_after_header(exc: Exception) -> object | None:
+        """The raw Retry-After header of a provider error, or ``None``."""
         response = getattr(exc, "resp", None) or getattr(exc, "response", None)
         headers = getattr(response, "headers", None)
         if not isinstance(headers, Mapping) and isinstance(response, Mapping):
@@ -508,22 +568,23 @@ class GoogleDriveSource(PullOnlySource, Source):
             headers = response
         if not isinstance(headers, Mapping):
             return None
-        value = next(
+        return next(
             (candidate for key, candidate in headers.items() if str(key).lower() == "retry-after"),
             None,
         )
+
+    @classmethod
+    def _retry_after(cls, exc: Exception) -> float | None:
+        """Seconds until a VALID Retry-After deadline; ``None`` when absent, malformed or
+        unrepresentable (see ``parse_retry_after`` for how each is handled)."""
+        value = cls._retry_after_header(exc)
         if value is None:
             return None
-        try:
-            return max(0.0, float(value))
-        except (TypeError, ValueError):
-            try:
-                parsed = parsedate_to_datetime(str(value))
-                if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=timezone.utc)
-                return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
-            except (TypeError, ValueError, OverflowError):
-                return None
+        now = datetime.now(timezone.utc)
+        retry = parse_retry_after(value, now)
+        if retry.kind != "valid" or retry.deadline is None:
+            return None
+        return max(0.0, (retry.deadline - now).total_seconds())
 
     # Drive's documented quota/rate-limit reasons. Drive often sends these as 403, not 429; they say
     # nothing about access to the file or drive, so they are retried with backoff (honoring
@@ -660,19 +721,36 @@ class GoogleDriveSource(PullOnlySource, Source):
                 if not self._retryable(exc):
                     raise
                 remaining = deadline - time.monotonic()
-                delay = self._retry_after(exc)
-                if delay is None:
-                    delay = min(0.25 * (2**attempt), 4.0) + random.uniform(0, 0.1)
-                if attempt + 1 >= self._provider_retry_attempts or delay >= remaining:
-                    not_before = datetime.fromtimestamp(
-                        datetime.now(timezone.utc).timestamp() + max(0.0, delay), timezone.utc
-                    ).isoformat()
-                    category = "rate_limited" if self._rate_limited(exc) else (
-                        "provider_timeout" if status is None else "provider_unavailable"
-                    )
+                category = "rate_limited" if self._rate_limited(exc) else (
+                    "provider_timeout" if status is None else "provider_unavailable"
+                )
+                now = datetime.now(timezone.utc)
+                header = self._retry_after_header(exc)
+                retry = parse_retry_after(header, now) if header is not None else None
+                diagnostic = None
+                if retry is not None and retry.kind == "unrepresentable":
+                    # A real wait no timestamp can hold (AIO-1167 R48 D2): fail closed at the last
+                    # representable instant — never a crash, never an early retry.
                     raise ProviderDeferred(
-                        f"Google provider retry deferred after {type(exc).__name__}",
-                        not_before=not_before, category=category,
+                        f"Google provider retry deferred after {type(exc).__name__}: its Retry-After "
+                        f"is later than {LATEST_INSTANT.isoformat()}, so it is held there",
+                        not_before=LATEST_INSTANT.isoformat(), category=category,
+                        diagnostic="retry_after_unrepresentable",
+                    ) from exc
+                if retry is not None and retry.kind == "valid" and retry.deadline is not None:
+                    # The provider's own deadline, exactly — however long (AC-04).
+                    resume_at = max(retry.deadline, now)
+                    delay = (resume_at - now).total_seconds()
+                else:
+                    if retry is not None:
+                        diagnostic = "retry_after_malformed"
+                    delay = min(0.25 * (2**attempt), 4.0) + random.uniform(0, 0.1)
+                    resume_at = now + timedelta(seconds=delay)
+                if attempt + 1 >= self._provider_retry_attempts or delay >= remaining:
+                    reason = " (its Retry-After was malformed and ignored)" if diagnostic else ""
+                    raise ProviderDeferred(
+                        f"Google provider retry deferred after {type(exc).__name__}{reason}",
+                        not_before=resume_at.isoformat(), category=category, diagnostic=diagnostic,
                     ) from exc
                 time.sleep(delay)
         raise ProviderDeferred("Google provider retry budget exhausted")  # pragma: no cover

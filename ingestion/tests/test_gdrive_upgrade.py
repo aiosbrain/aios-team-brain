@@ -5380,6 +5380,9 @@ class _DriveWorld:
         self.malformed, self.checkpoint_faults, self.ledger = set(), [], None
         # Failures to raise, once each, from the next reconciliations that name removals.
         self.removal_faults = []
+        # Whether listing a folder that no longer exists answers 404, as Google may (R48 D1),
+        # instead of an empty page.
+        self.missing_folder_listing_404 = False
 
     def put(self, file_id, *, drive, parent=None, folder=False):
         self.files[file_id] = {
@@ -5442,6 +5445,8 @@ class _DriveWorld:
 
                 def listing():
                     world.calls.append(("list", drive_id, folder_id))
+                    if world.missing_folder_listing_404 and folder_id not in world.files:
+                        raise _ProviderHttpError(404)
                     found = {"files": [
                         dict(meta) for meta in world.files.values()
                         if folder_id in meta["parents"] and meta.get("driveId", "my-drive") == drive_id

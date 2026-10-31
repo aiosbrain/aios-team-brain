@@ -1076,13 +1076,34 @@ class StateStore:
         self._db.commit()
 
     def settle_root(self, connection_id: str, generation: int, root_kind: str, root_id: str) -> None:
-        """A root read where it is bound is no longer uncertain. A relocation is never settled here."""
+        """A root read where it is bound is no longer uncertain — nor unavailable (R48 D1): read
+        again, it is restored. A relocation is never settled here."""
         self._db.execute(
             "UPDATE selection_root_bindings SET status='bound',detail=NULL WHERE connection_id=? "
-            "AND generation=? AND root_kind=? AND root_id=? AND status='uncertain'",
+            "AND generation=? AND root_kind=? AND root_id=? "
+            "AND (status='uncertain' OR (status='bound' AND detail IS NOT NULL))",
             (connection_id, generation, root_kind, root_id),
         )
         self._db.commit()
+
+    def record_root_unavailable(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str, *, detail: str,
+    ) -> bool:
+        """Record a previously BOUND root's own verified not-found (AIO-1167 R48 D1).
+
+        The root stays bound to its drive — its location was known and its outcome is now known:
+        it supports nothing — with the diagnostic as its detail, which travels with the fenced
+        root evidence. Only a bound (or uncertain) root qualifies: a never-bound root stays
+        unresolved and a relocating one stays relocating; neither is evidence of loss. Returns
+        whether the root was recorded."""
+        cur = self._db.execute(
+            "UPDATE selection_root_bindings SET status='bound',detail=? WHERE connection_id=? "
+            "AND generation=? AND root_kind=? AND root_id=? AND status IN ('bound','uncertain') "
+            "AND drive_id IS NOT NULL AND drive_id<>''",
+            (detail, connection_id, generation, root_kind, root_id),
+        )
+        self._db.commit()
+        return cur.rowcount == 1
 
     def rebind_root(
         self, connection_id: str, generation: int, root_kind: str, root_id: str, destination: str,

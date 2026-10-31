@@ -1068,7 +1068,15 @@ removal is written, the old stream rebuilds its snapshot from its remaining root
 rebound only after the destination stream holds a start token captured before that root is enumerated
 there — the destination enumerates the root alone, never its drive. Unreadable (anything but an
 explicit not-found), the root is durably `uncertain`: the change page is not retained, the cursor does
-not pass it, and it is read again. All-stream reconciliation, and therefore `current`, requires that no
+not pass it, and it is read again. A previously BOUND root whose OWN metadata answers not-found under
+the execution's authority is a resolved outcome (AIO-1167 R48 D1): it stays `bound` with the
+actionable detail `selected root unavailable` (in the fenced `roots` evidence; run diagnostic
+`selection_root_unavailable`), its file page or folder traversal is finished EMPTY without listing it,
+and the rescan publishes — so a hard-deleted root no longer wedges the stream. Only that root's support
+is retired: direct and overlapping selections keep their membership, and the brain's claim-aware
+reconciliation keeps another connection's claims. A never-bound root's 404 stays `unresolved`; a listing
+404, auth, permission, quota, timeout and 5xx stay conservative. Read again, a restored root is settled
+and enumerated normally under the same provider ids. All-stream reconciliation, and therefore `current`, requires that no
 root is `relocating` or `uncertain` and that every stream's published snapshot is of exactly the bound
 roots it now holds — so the claims an old stream made are retired only by the destination's verified
 snapshot. Before any baseline listing, every required stream's start
@@ -1160,7 +1168,12 @@ all-stream snapshot can establish absence.
 Provider calls use explicit request/transport context (including OAuth and local service accounts),
 bounded deadline-aware retries with jitter, honor mapping-style and normal
 `Retry-After` headers, durably defer affected streams across restarts when a delay exceeds the run
-window, recompute the effective remainder after token refresh, authority validation, and request
+window (AIO-1167 R48 D2, `parse_retry_after` in `sources/gdrive.py`: a VALID delay-seconds or HTTP-date
+is the provider's deadline exactly — never capped or shortened, however long, and there is no Run-now
+bypass; malformed input — text, a sign or exponent, NaN/infinity, an impossible date — uses the bounded
+exponential fallback and reports `retry_after_malformed`; a syntactically valid wait no timestamp can
+hold is held at the last representable instant, fail closed, reporting `retry_after_unrepresentable`;
+a document's own deferral keeps the provider's deadline as its earliest retry), recompute the effective remainder after token refresh, authority validation, and request
 construction immediately before transport execution, tighten new and reused transport sockets from
 that reduced request/run budget, treat authentication loss as terminal, and recover an invalid opaque
 cursor only through a fresh-token controlled rescan. The local service-account `AuthorizedHttp` wraps
