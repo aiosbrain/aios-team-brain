@@ -167,3 +167,14 @@ Next: GPT-6 Astra medium, fresh ephemeral read-only adjudication of all seven Fa
 
 - Verified report, prompt and this handoff were checkpointed as `43dbff9fc18ad9ff2c46c8273b876225ce52a738`; the normal push to `origin/codex/aio-1167-checkpoint-20261027` completed successfully with docs-drift and skill-sync hooks passing. This is the confirmed remote recovery point before R50 writer continuation.
 - Next action is now to resume session `628402d5-a1c6-42b7-b736-e84358c1a749` as the sole Claude Opus 5.5 HIGH writer, using the hash-pinned R50 prompt. Latest subscription usage remains 13:23 UTC at 20% session / 23% all-model week / 33% Fable week, credits off; recheck at the 20-minute boundary or before any later review.
+
+
+2026-10-31 13:52 UTC — R50 writer active; quota and checkpoint status
+
+- Fresh authenticated Claude.ai `/usage` from the terminal at 13:43: current session 42%, all-model week 27%, Fable week 33%, usage credits off. Continue under subscription-only auth; next check by 14:03 UTC. User confirmed the terminal login; no login action is needed.
+- Sole writer is the resumed Opus 5.5 HIGH Claude session `628402d5-a1c6-42b7-b736-e84358c1a749`, active in exec session `69077`. It is editing the reserved migration `postgres/migrations/20261031140000_gdrive_restriction_generation_lifetime.sql`, canonical `postgres/schema.sql`, and existing restriction state/coordinator owners; no tests/commands have been run by the writer.
+- Migration/schema contract: `postgres/schema.sql` remains the canonical fresh-schema representation and current `gdrive_execution_authority` trigger owner; the forward-only, replayable `20261031140000_gdrive_restriction_generation_lifetime.sql` must deliver the matching transition behavior to existing databases. AIO-1170's current schema edit is isolated in the Slack `slack_sync_channels` section. PR #714's reservation `20261023120000_slack_channel_history_segments.sql` predates this reservation and is a separate Slack owner. Recheck against current target before publication.
+- Preserve partial R50 source and untracked regressions in the local WIP bundle below now; this is a timed recovery point, not an implementation completion or test result. Remote source checkpoint remains required by 14:10 UTC or before any long check/review.
+
+
+R50 timed WIP checkpoint captured 2026-10-31 13:52 UTC at `.context/aio1167-rebase-handoff/r50-wip-20261031T135200Z/`. Capture was stable across before/after status and content hashes. Manifest SHA-256: `d695f14ade7eb58ade277f7dcac98e1f815afc90709b7e1b19ea5b4b47bc1037`. `full.diff` SHA-256 `8d8d1b35c7dbed802a7b7b386b6b54fb9ad2e1cf91439e98f0bb1192e79c3fd8`; untracked archive SHA-256 `79afd7f48366b239213cf4cfb08cfee82663e469bd559694a3c16f6ee45b345b`; 13 untracked files captured. This includes the already checked-in/remote R49 source plus partial R50 changes. The recovery bundle must be included in the next remote checkpoint before the 30-minute deadline.

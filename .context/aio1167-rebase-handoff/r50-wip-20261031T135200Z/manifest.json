@@ -1,0 +1,29 @@
+{
+  "branch": "codex/aio-1167-google-docs-connector-rebased",
+  "capture_attempts": 1,
+  "captured_utc": "2026-10-31T13:52:00Z",
+  "note": "Task-owned R49 plus partial R50 working tree, captured while the sole writer was active. Re-capture at the next safe boundary if subsequent edits occur.",
+  "sha256": {
+    "full.diff": "8d8d1b35c7dbed802a7b7b386b6b54fb9ad2e1cf91439e98f0bb1192e79c3fd8",
+    "staged.diff": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "status.txt": "67d8bbc795629c943801755c86957c734f1ff40be5409fa0a101a52701c56036",
+    "untracked.tar.gz": "79afd7f48366b239213cf4cfb08cfee82663e469bd559694a3c16f6ee45b345b"
+  },
+  "source_head": "5ecd2989e21fded915b41b508477bb267aaec06d",
+  "stable_during_capture": true,
+  "untracked_files": {
+    "ingestion/tests/test_account_hold_before_streams.py": "f5ebe0165ac1e221c57b1459cda6311095e6c1b7f393ad4949d793162cfade00",
+    "ingestion/tests/test_bound_root_loss.py": "0dd5be18bc2d14b63a8896e806a49e9ef8e86c991b1b7e61f7fa2d5b223e4056",
+    "ingestion/tests/test_checkpoint_acknowledgment.py": "b1dbe4aada8f26d1ec85de5957b7c818d71c910bdec9ae293db3092ff3078f48",
+    "ingestion/tests/test_checkpoint_uncertainty_latch.py": "c8f2f19674f32dcf142d01ba4cbea64083fc64b4e3aa6dfbdf371b3f9c1ea63c",
+    "ingestion/tests/test_document_restrictions.py": "63e95ef40b027d755c7590ece1193435eceacd403a49b03cc555574f7d1ce43e",
+    "ingestion/tests/test_exhaustion_is_not_completion.py": "98932c8cb3aef54f976fe7d6cab0c354305edc7feae4436f3beac9c3e9b1e31e",
+    "ingestion/tests/test_retry_after_holds.py": "18337db7a6d6f8b23a42e24e808190948555d9c2164beef3c4d11c43ffaa2ed6",
+    "ingestion/tests/test_retry_after_parsing.py": "afab189721e54ef9cef2a77db6226832552a25a868d2107647680775fbed23cb",
+    "ingestion/tests/test_root_evidence_r49.py": "8e7e2565f48b14dbad8d5cbc0312d30b1957dc0e8d88ddcb833782f013d50682",
+    "postgres/migrations/20261031140000_gdrive_restriction_generation_lifetime.sql": "5e0feb43c34157b81c073e51c590b67d9cc4188c5027445b61c67f3000b411f5",
+    "test/datamechanics/gdrive-admin-grant-policy.datamechanics.test.ts": "fea3264eefc7d4f6b8c7df33dcc706994a3e0b6c85f0d313f000c757eb26d31e",
+    "test/datamechanics/gdrive-complete-snapshot-overlap.datamechanics.test.ts": "53bb0c645254a06f0f2e3abcf8e49af564615b70126a51edbf785d3f8edf9ddf",
+    "test/datamechanics/gdrive-identity-tombstone-email.datamechanics.test.ts": "c5ca3d2b36823128f2553a2659ef582b8a9569409ce632dc876c4e658357cb64"
+  }
+}
