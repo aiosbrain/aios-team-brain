@@ -975,7 +975,9 @@ R44 contracts (AIO-1167):
   `discoverMemberIdentity`), only for an id never reviewed — links, manual mappings and unlink
   tombstones stand; a disagreeing email is an audited conflict, never a transfer. Only an UNREVIEWED
   legacy mapping held by another member is such a conflict (a reviewed link or unlink tombstone is
-  `reviewed`, never audited as one). Admins see refused Google Drive automatic links on Admin → Members
+  `reviewed`, never audited as one). Admins see RECORDED LEGACY Google Drive refusals — a historical
+  record, labelled as such (AIO-1167 R47 F2): a normally upgraded instance no longer produces the shape,
+  since the repair-ledger migration seeds state for every link — on Admin → Members
   through `lib/identity/discovery-conflicts` — a read-only, team-scoped, paginated projection of the
   existing `identity.discovery_conflict` audit events whose normalized provider is `gdrive`, beside the CURRENT mapping (re-read), allowlisted fields
   only, `unavailable` on a read failure, active team-posture admins only, never an API surface
@@ -1201,8 +1203,14 @@ the scheduler loop stays responsive; an abandoned worker's late result can only 
 evidence, and its resources close only when it ends. Early `sync` notifications for a pending attempt
 whose token matches the persisted hash are recorded as evidence (202) — never activation, never a
 hint. **One owner per section of the fenced connector state (`connector_state.py`)**: the coordinator
-owns `streams`/top-level cursors and `roots`; renewal owns `watches`; each carries the other's part
-unchanged (`coordinator_document`/`renewal_document`), so a poll can no longer erase renewal's records.
+owns `streams`/top-level cursors, `roots` and `account_hold`; renewal owns `watches`; each carries the
+other's part unchanged (`coordinator_document`/`renewal_document`), so a poll can no longer erase
+renewal's records. `account_hold` (AIO-1167 R47 F5) is the provider Retry-After for one verified account
+of one generation, opened from ANY phase — root metadata, relocation re-reads, start-token capture,
+drains — and held locally first (SQLite `connection_holds`, monotonic) then published; every run adopts
+the brain's copy and honours it before its first Drive call, so a hold read before any stream exists
+survives retries, restarts and a fresh state file. A failed publication keeps the local hold and is
+reported (`account_hold_unpublished`), never claimed remote-durable.
 `webhook_channels` is a projection of `watches` (state column; only `active` rows validate
 notifications), rebuilt from the brain at every sweep. The unfenced synchronous `renew()` path and the
 settings-less renewal job are removed: `_renewal_job` requires brain settings and the managers expose
@@ -1216,9 +1224,21 @@ Shared Drive watches carry the authoritative cursor and `driveId` together throu
 layers; My Drive deliberately omits `driveId`. Execution quotas isolate provider checks, lifecycle,
 progress and release. Progress permits the 100/min ingestion envelope and uses revision-conditional,
 idempotent checkpoints; the client honors `Retry-After` within a fixed deadline, while cleanup
-release retains independent capacity. Admin connection tests use the same generation policy, bound
+release retains independent capacity. The client (`BrainClient`) is the one owner of each execution's
+progress revision, and of its UNCERTAINTY (AIO-1167 R47 F3): a checkpoint that was sent but never
+acknowledged (lost response, exhausted 5xx, a deferral after a send, `stale_progress`) latches the
+execution, the identical payload having first been retried within the bound; no further checkpoint is
+sent under it, and the coordinator ends the run partial (`checkpoint_unacknowledged`). Post-push
+checkpoint failures are control-plane by STAGE and never charge the accepted document; the next
+acquisition restores the brain's authoritative progress and the owed work replays idempotently.
+Admin connection tests use the same generation policy, bound
 also to credential revision and the initiating active Admin, with revalidation after refresh, before
-every selected-root call, and immediately before success. Preview is explicitly batched at 100 roots
+every selected-root call, and immediately before success. The connection test, Picker verification and
+manual-root verification all refresh through ONE owner, `refreshGdriveAdminAccess`
+(`lib/integrations/gdrive-authority`), held to the broker's grant policy (R47 F6): the stored ceiling
+(`storedGrantCeiling`) decided before the token exchange, the returned grant judged by
+`evaluateGdriveGrant` with the broker's omitted-scope fallback, before any Drive read — so a preview
+never reports healthy what execution will refuse. Preview is explicitly batched at 100 roots
 and returns checked/total/continuation rather than silently declaring an unchecked tail healthy.
 Admin Run now/retry writes a durable `gdrive_run_requests` row; the bound sidecar claims it and invokes
 the same coordinator as polling/watch work. Scheduled/manual/retry outcomes share this reporting
@@ -1270,14 +1290,21 @@ a replay that changes only the e-mail or the timestamp spelling updates that row
 permission identities (or exact verified email fallback) produce source-time UTC person/day Timeline
 evidence with the provider role rendered visibly. OAuth account subjects use the separate
 `subject:<sub>` namespace and are never treated as Drive permission IDs; author addresses retained
-without a permission id use `author-email:<address>`. Opaque Google ids are case-sensitive. Drive
+without a permission id use `author-email:<address>`. Opaque Google ids are case-sensitive; the
+`author-email:` namespace alone is canonical — trimmed and lowercased by `canonicalIdentityId`
+(`lib/identity/member-identities`) at the writer and the Admin link action, so a manual link resolves
+the connector's lowercased evidence; a differently spelled legacy row is refused, never merged
+(AIO-1167 R47 F8). Drive
 ownership and connector/service-account transport identity are retained as provenance/diagnostics,
 not promoted to human authorship.
 
 When an OAuth account email is VERIFIED by Google (`email_verified` literally `true`, carried by the
 callback and enforced again by the publisher) and is an exact, unambiguous match to an active roster
 identity, callback publication atomically records both its `subject:<sub>` transport identity and an
-`author-email:<address>` attribution bridge. A false/missing claim or no email creates NEITHER mapping,
+`author-email:<address>` attribution bridge — each checked on its own: one the Admin deliberately
+UNLINKED stays unlinked (no row, revision, repair or identity-authority change; `respectTombstone`),
+because reconnecting is credential authority, not a relink (AIO-1167 R47 F1); an explicit,
+revision-fenced Admin relink remains the way back. A false/missing claim or no email creates NEITHER mapping,
 no revision and no repair obligation (R41): the credential is stored by subject, the address is kept
 only as untrusted account metadata (`integrations.config.authenticatedAccountEmailVerified: false`,
 never `member_identities.email`), existing deliberate links are untouched, and attribution stays
