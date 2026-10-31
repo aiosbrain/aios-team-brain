@@ -1,0 +1,11 @@
+{
+  "captured_at_utc": "2026-10-31T18:18:47Z",
+  "source_path": "/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree/ingestion/tests/test_flush_authority_outcome.py",
+  "baseline_candidate_sha256": "19077b33c2bc40624b1eb9c2acf3aa58b7789ffa94119265f9408bdeac5086d1",
+  "captured_sha256": "8d0a18706cd6167587679ffa10fbf3d7bed704a0a8d82342faa3fc0b7998479c",
+  "size_bytes": 20230,
+  "stable_before_after": true,
+  "writer_session": "628402d5-a1c6-42b7-b736-e84358c1a749",
+  "writer_state": "active; bounded F1 test-only correction; no tests yet",
+  "remote_baseline_checkpoint": "4b337aa7db7878d001455163c28698e04e6e2eee"
+}
