@@ -1,0 +1,20 @@
+**Prompt restated:** AIO-1167 R51 Fable 5.1 read-only delta review of the F1 correction. The delta is one path, `ingestion/tests/test_flush_authority_outcome.py` (prior SHA `19077b33…`, current `8d0a1870…`), on base and HEAD `5ecd2989`. Confirm the new helper-level regression has the independent document `failed=1` in place before the charge decision, exercises both terminal codes, asserts the exact outcome, attempts one refusal, retains the local hold, and discriminates against inferring an already-counted run failure from `total.failed > 0`, while the stream-level control stays as separate evidence. Production source unchanged. No commands, no edits, no MCP.
+
+**Verdict:** No actionable findings at any severity. The delta satisfies Astra F1 items 1 through 4 exactly as adjudicated. Nothing here changes the prior "no HIGH/MEDIUM, no HOLD" verdict on the 41 unchanged paths, which this review did not re-read.
+
+**What the new test proves, with evidence**
+
+| Requirement | Evidence |
+|---|---|
+| `failed=1` with only `incomplete_extraction` exists before the charge decision | Summary built at `test_flush_authority_outcome.py:228` and passed at `:230`; the helper's only charge decision is `gdrive_sync.py:448` → `:464-465`, after the summary is already populated. Nothing between resets it. |
+| No `cause`, no `run_failure_counted` | Call at `:230` passes neither; defaults at `gdrive_sync.py:415-416`. |
+| Both codes exercised | `CODES` at `:33`, parametrized at `:213`. Both are in `_TERMINAL_AUTHORITY_CODES` (`gdrive_sync.py:46-49`). |
+| Reaches the refusal, not an early return | Local hold at `:225` with a 2099 `not_before` is standing (`_retry_deferred`), progress is `{}` so acknowledged evidence is empty, so `_restriction_outstanding` returns `{account_hold_unpublished}` (`:307-318`); `_progress_uncertain` is False via the fake (`:177-178`, `gdrive_sync.py:189-193`); payload differs from `{}` so the checkpoint is sent and raises the terminal code (`:401-404`). Identical fixture shape to the sibling at `:187-198`. |
+| Exact outcome | `:232-234`: `failed == 2`, categories exactly `incomplete_extraction`, the code, `account_hold_unpublished`, one send. `_note_unpublished` then `_note_flush_authority(charge=True)` at `gdrive_sync.py:447-448`. |
+| Local hold retained | `:235` compares to the tuple returned by `hold_connection`; `connection_hold` returns the same `(not_before, category)` strings (`state.py:1300-1324`), and the refusal path writes no state. |
+
+**Discrimination check.** A mutant `charge = total.failed == 0` (or any category-based inference) leaves `failed` at 1 and reddens `:232`. The opposite mutant, always charging regardless of `run_failure_counted`, is caught by the existing-cause half at `:204-209` asserting `failed == 1`. The pair covers both directions. The stream-level fixture at `:376-405` remains byte-identical and, as before, is preservation coverage only, since its document failure is merged after the drain-site charge. The new docstring at `:218-223` scopes this correctly.
+
+**Informational, not a finding, pre-existing.** The stream fixture's docstring at `:381-382` still says "a nonzero `failed` never suppresses it", which is the claim prior F1 showed that fixture cannot discriminate. A one-line docstring trim would keep the evidence map honest. Not caused by this delta and not blocking.
+
+**Scope and limits.** Read: the full changed test file; `gdrive_sync.py:44-62, 189-193, 217-503, 3796-3822`; `state.py:1285-1344`; `engine.py:23-39`; `brain_client.py:58-70`; `connector_state.py:223-237, 268-282, 344-351`; AC-07 at `accepted-spec.md:260-266, 335`; the packet's adjudication, prior report, mapping, verification, delta and manifest. I did not recompute any hash, open the archive, run tests, or re-read the 41 unchanged paths. The coordinator's "20 passed" is coordinator evidence; the file's test count does tally to 20. F2/F3, Note B and other deferred items are untouched. No whole-branch, merge, release or operational readiness claim. Memory and vault saves skipped because the review was constrained to read-only tools.

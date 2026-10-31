@@ -1,0 +1,21 @@
+{
+  "auth": "firstParty; apiKeySource=none",
+  "capture_note": "Substantive public review text captured before an unrelated environment Stop-hook notification; the hook response is not treated as review evidence.",
+  "duration_ms": 150506,
+  "is_error": false,
+  "model": "claude-fable-5-1",
+  "num_turns": 34,
+  "raw_stream_sha256": "6e37d416dc6aa7aff4a5d0d7eb40ac7b8bb5ed0582b4f79ef0b4088e31f1d1b6",
+  "report_sha256": "51d03d86f89c09315d4b287b02dc7a457a32b1742584d5064ed4d6df762f4da3",
+  "review_scope": "R51 F1 one-path test-only delta; no tests or edits by reviewer",
+  "terminal_subtype": "success",
+  "tools": "Read/Grep/Glob only; no MCP",
+  "usage": {
+    "cache_creation_input_tokens": 104605,
+    "cache_read_input_tokens": 1306787,
+    "output_tokens": 10498,
+    "thinking_tokens": 4458,
+    "uncached_input_tokens": 226
+  },
+  "verdict": "no actionable findings; no HOLD"
+}
