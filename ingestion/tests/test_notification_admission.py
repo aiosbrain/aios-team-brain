@@ -125,3 +125,43 @@ def test_the_receiver_wakes_the_stream_for_a_valid_channel_and_is_truthful_witho
     legacy = _notify("legacy", "res-legacy", TOKEN)
     assert legacy.status_code == 202 and b"nothing to schedule" in legacy.body
     assert _hints(state) == 1
+
+
+# --- the real HTTP route: Google's empty-body, header-only notification ----------------------------
+
+def _post(headers: dict[str, str], body: bytes = b""):
+    from fastapi.testclient import TestClient
+
+    from aios_ingest.webhook_app import app
+
+    with TestClient(app) as client:
+        return client.post("/webhooks/gdrive", content=body, headers=headers)
+
+
+def test_the_route_admits_googles_empty_body_sync_and_change_messages(world):
+    """Spec (AC-04 notification handshake). Google's watch messages carry no body: the channel's first
+    ``sync`` message and every ``change`` are header-only. Through the real FastAPI route, a valid
+    channel is admitted on headers alone, whatever (or no) body arrives — the body is never parsed —
+    and every message is ONE dirty mark on the stream, never a document read."""
+    state, progress = world
+    _save(state, progress, "chan")
+    base = {"x-goog-channel-id": "chan", "x-goog-resource-id": "res-1", "x-goog-channel-token": TOKEN}
+    sync = _post({**base, "x-goog-resource-state": "sync", "x-goog-message-number": "1"})
+    assert sync.status_code == 202 and sync.text == "Drive poll scheduled"
+    change = _post({**base, "x-goog-resource-state": "change", "x-goog-message-number": "2"},
+                   body=b"not json at all")
+    assert change.status_code == 202
+    assert _hints(state) == 2  # two messages, two marks on the ONE stream — nothing queued per document
+    assert state.pending_stream_hint(progress.key) == 2
+
+
+@pytest.mark.parametrize("missing", ["x-goog-channel-id", "x-goog-resource-id"])
+def test_the_route_refuses_a_notification_missing_its_channel_identity(world, missing):
+    state, progress = world
+    _save(state, progress, "chan")
+    headers = {"x-goog-channel-id": "chan", "x-goog-resource-id": "res-1", "x-goog-channel-token": TOKEN,
+               "x-goog-resource-state": "change"}
+    headers.pop(missing)
+    response = _post(headers)
+    assert response.status_code == 401
+    assert _hints(state) == 0

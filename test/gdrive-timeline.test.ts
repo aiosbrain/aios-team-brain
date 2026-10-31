@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { googleDriveContributionEvidence } from "@/lib/dashboard/gdrive-contributions";
+import { groupTimeline } from "@/lib/dashboard/timeline-group";
 import type { IdentityMap } from "@/lib/identity/resolve";
 import { mergeGdriveContributions } from "@/lib/ingest/gdrive-ledger";
 import { normalizeGdriveContributions, supersededEvidenceKeys } from "@/lib/ingest/gdrive-contribution-store";
@@ -47,6 +48,42 @@ describe("Google Drive source-time Timeline evidence", () => {
       expect.objectContaining({ id: "item-1:permission:a:editor:2026-11-01T05:30:00.000Z", memberId: "member-a", role: "editor", at: "2026-11-01T05:30:00.000Z" }),
       expect.objectContaining({ id: "item-1:permission:b:editor:2026-11-01T06:30:00.000Z", memberId: "member-b", role: "editor", at: "2026-11-01T06:30:00.000Z" }),
       expect.objectContaining({ id: "item-1:permission:a:owner:2026-11-01T05:30:00.000Z", memberId: "member-a", role: "owner", at: "2026-11-01T05:30:00.000Z" }),
+    ]);
+  });
+
+  it("AC-10: Drive work is bucketed by UTC day across a local midnight and the DST repeated hour", () => {
+    const rows = googleDriveContributionEvidence(
+      {
+        source: "gdrive", source_id: "Doc1", title: "Plan",
+        contributions: [
+          // 18:30 New York (EST) is 23:30 UTC on Nov 1; 19:30 is 00:30 UTC on Nov 2 — a local evening
+          // that crosses the UTC day.
+          { external_id: "permission:a", role: "editor", at: "2026-11-01T18:30:00-05:00" },
+          { external_id: "permission:a", role: "commenter", at: "2026-11-01T19:30:00-05:00" },
+          // The repeated 01:30 hour at the fall-back (EDT, then EST): two instants, the same UTC day.
+          { external_id: "permission:b", role: "editor", at: "2026-11-01T01:30:00-04:00" },
+          { external_id: "permission:b", role: "commenter", at: "2026-11-01T01:30:00-05:00" },
+        ],
+      },
+      "item-1",
+      map(),
+    );
+    const days = groupTimeline(
+      rows.map((row) => ({
+        id: row.id, memberId: row.memberId, title: "Plan", source: "gdrive", kind: "deliverable", at: row.at,
+        contributionRole: row.role,
+      })),
+      new Map(),
+      new Map([["member-a", { name: "A", handle: "a" }], ["member-b", { name: "B", handle: "b" }]]),
+      "2026-11-03",
+    );
+    // Per UTC day and person, how many Drive observations the Timeline counts.
+    const placed = days.flatMap((day) => day.people.flatMap((person) =>
+      person.other.filter((group) => group.source === "gdrive").map((group) => [day.date, person.memberId, group.count])));
+    expect(placed.sort()).toEqual([
+      ["2026-11-01", "member-a", 1], // the 18:30 EST edit (23:30 UTC)
+      ["2026-11-01", "member-b", 2], // both instants of the repeated hour, distinct and on one day
+      ["2026-11-02", "member-a", 1], // the 19:30 EST comment (00:30 UTC) — the next UTC day
     ]);
   });
 

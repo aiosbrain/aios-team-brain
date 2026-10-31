@@ -43,6 +43,11 @@ _TERMINAL_AUTHORITY_CODES = {
     "unauthorized", "connector_principal_required", "wrong_connection",
     "stale_execution", "connection_unavailable", "reconnect_required",
 }
+# What stops the coordinator from starting the NEXT stream: every brain authority refusal, plus Google
+# rejecting the account's credential. That rejection is the account's, not one stream's — every other
+# stream would present the same credential — so it ends the run (AIO-1167 R45 M8). Kept apart from
+# `_is_terminal_authority`, which classifies BRAIN responses on the sink/checkpoint paths.
+_RUN_TERMINAL_CODES = _TERMINAL_AUTHORITY_CODES | {"provider_unauthorized"}
 _MAX_PENDING_PER_STREAM = 5_000
 _MAX_DISCOVERY_PAGES_PER_STREAM = 25
 _MAX_RETRY_WORK_PER_STREAM = 25
@@ -1123,7 +1128,7 @@ async def run_gdrive_stream(
                 # allocation (rather than summary counts) prevents malformed retry work in one
                 # stream from stealing another stream's fresh-work turn.
                 remaining = max(0, remaining - stream_work_budget)
-                if any(code in _TERMINAL_AUTHORITY_CODES for code in part.failure_categories):
+                if any(code in _RUN_TERMINAL_CODES for code in part.failure_categories):
                     return total
                 # A depleted document budget must not prevent later streams from validating and
                 # durably restoring their independent cursor/snapshot state. They run with zero

@@ -682,9 +682,15 @@ export class TimelineAuthorizationChangedError extends Error {
   }
 }
 
+/** Where a served Timeline came from: this process's memory, a persisted row, or a cold build. */
+export type TimelineServeOrigin = "memory" | "persisted" | "cold";
+
 export interface TimelineReadHooks {
   /** Deterministic concurrency hook used by the epoch-race regression tests. */
   beforeColdPublish?: (attempt: number) => Promise<void>;
+  /** TEST observation only (AIO-1167 R45 L8): told which path served the payload, just before it is
+   *  returned. It cannot change what is served or written. */
+  onServed?: (origin: TimelineServeOrigin) => void;
 }
 
 /**
@@ -742,6 +748,7 @@ async function getCachedWorkTimelineAttempt(
     return { epoch: current, cached: hit?.authorizationEpoch === current ? hit : undefined };
   });
   if (cached && cached.authorizationEpoch === epoch && now - cached.at < TTL_MS) {
+    hooks.onServed?.("memory");
     return { days: cached.days, freshness: freshness(cached.at, TTL_MS, { now, degraded: cached.degraded }) };
   }
 
@@ -753,6 +760,7 @@ async function getCachedWorkTimelineAttempt(
     // actually taken (they were two separate readings of the clock in every earlier draft of this).
     // The PERSISTED verdict — so a reader who didn't do the work still learns the prose is missing.
     const f = freshness(persisted.at, TTL_MS, { now, degraded: persisted.degraded });
+    hooks.onServed?.("persisted");
     if (!f.stale) return { days: persisted.days, freshness: f };
     refreshInBackground(teamId, view); // stale → serve stale, rebuild behind the request
     return { days: persisted.days, freshness: f };
@@ -800,6 +808,7 @@ async function getCachedWorkTimelineAttempt(
     mem.set(key, { days, at, degraded: true, authorizationEpoch: epoch });
   }
   refreshInBackground(teamId, view);
+  hooks.onServed?.("cold");
   // DEGRADED, deliberately. A cold miss returns the pure ledger: its per-person-day synopses are either
   // absent (the background pass hasn't run) or SALVAGED from an older payload version. Both are "this is
   // real work data with prose that wasn't computed for it", which is precisely the plausible-but-partial

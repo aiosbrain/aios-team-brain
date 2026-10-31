@@ -38,6 +38,22 @@ describe("AIO-1167 Google Drive OAuth state", () => {
     await expect(consumeGoogleDriveOAuthState(db, state, "browser-a")).resolves.toBeNull();
   });
 
+  it("AC-01: an EXPIRED state is refused without consuming its nonce, even from the bound browser", async () => {
+    process.env.AUTH_SECRET = SECRET;
+    const fake = new OAuthStateDb();
+    // A correctly signed, correctly bound state whose expiry has passed.
+    const expired = await new SignJWT({
+      ...CONTEXT, nonce: "expired-nonce",
+      browser: createHash("sha256").update("browser-a").digest("base64url"),
+    })
+      .setProtectedHeader({ alg: "HS256" })
+      .setIssuedAt(Math.floor(Date.now() / 1000) - 1_200)
+      .setExpirationTime(Math.floor(Date.now() / 1000) - 600)
+      .sign(new TextEncoder().encode(SECRET));
+    await expect(consumeGoogleDriveOAuthState(fake as unknown as DbClient, expired, "browser-a")).resolves.toBeNull();
+    expect(fake.updatePayload).toBeNull();
+  });
+
   it("AC-01: rejects malformed callback state before trusting any callback association", async () => {
     process.env.AUTH_SECRET = SECRET;
     await expect(consumeGoogleDriveOAuthState({} as DbClient, "not-a-jwt", "browser-a")).resolves.toBeNull();

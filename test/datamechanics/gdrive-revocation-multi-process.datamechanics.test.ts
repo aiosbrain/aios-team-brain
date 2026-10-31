@@ -19,7 +19,9 @@ import { db, driveFixture, seedTeam, type Seed } from "./helpers";
  * variants). After B has served a Drive document to two audience variants — reader A through
  * connection A's project, reader B through connection B's — process A (this worker) revokes
  * connection A's claim through the production reconciliation writer. Then:
- *   · B refuses the old text to reader A — from memory and from its persisted row alike;
+ *   · B refuses the old text to reader A — from memory and from its persisted row alike. Before the
+ *     revocation each path is proven to have SERVED it (R45 L8): a warm memory hit in B, and a
+ *     persisted-row hit in a third process C that never had it in memory;
  *   · B still serves reader B, whose own claim stands;
  *   · a cold rebuild B started BEFORE the revocation and published AFTER it is refused, and what B
  *     serves and persists afterwards carries no old text.
@@ -91,10 +93,15 @@ class Reader {
   }
 
   async read(teamId: string, memberId: string): Promise<string> {
+    return (await this.served(teamId, memberId)).payload;
+  }
+
+  /** The payload AND which path served it in that process: memory, a persisted row, or a cold build. */
+  async served(teamId: string, memberId: string): Promise<{ payload: string; origin: string | null }> {
     this.send({ op: "read", teamId, memberId });
     const reply = await this.next();
-    if (!reply.ok) return `ERROR:${String(reply.error)}`;
-    return String(reply.payload);
+    if (!reply.ok) return { payload: `ERROR:${String(reply.error)}`, origin: null };
+    return { payload: String(reply.payload), origin: (reply.origin as string | null) ?? null };
   }
 
   stop(): void {
@@ -172,17 +179,38 @@ describe("Drive revocation across application processes (R44 T1, real Postgres)"
   it("another process's memory and persisted rows stop serving revoked text; the surviving audience keeps it", async () => {
     const w = await world();
     const processB = await startReader();
-    expect(await processB.read(w.seed.teamId, w.readerA)).toContain(TITLE);
+    const coldB = await processB.served(w.seed.teamId, w.readerA);
+    expect(coldB).toMatchObject({ origin: "cold" });
+    expect(coldB.payload).toContain(TITLE);
     expect(await processB.read(w.seed.teamId, w.readerB)).toContain(TITLE);
-    // Served again from process B's memory, still authorized.
-    expect(await processB.read(w.seed.teamId, w.readerA)).toContain(TITLE);
+    // R45 L8 — the two cache paths are proven SEPARATELY before the revocation:
+    // a WARM MEMORY hit in process B …
+    const warm = await processB.served(w.seed.teamId, w.readerA);
+    expect(warm).toMatchObject({ origin: "memory" });
+    expect(warm.payload).toContain(TITLE);
+    // … and, in a process with NO memory of it (process C, started cold), a PERSISTED-ROW hit.
+    const processC = await startReader();
+    const fromRow = await processC.served(w.seed.teamId, w.readerA);
+    expect(fromRow).toMatchObject({ origin: "persisted" });
+    expect(fromRow.payload).toContain(TITLE);
 
     await revokeA(w); // process A: the production revocation writer, which advances the epoch
 
-    const afterA = await processB.read(w.seed.teamId, w.readerA);
-    expect(afterA).not.toContain(TITLE);
-    expect(afterA.startsWith("ERROR:")).toBe(false);
+    // Neither path serves the old text. C reads FIRST, while the only row is the one it served
+    // before: that row is superseded, so C rebuilds cold under the new authorization.
+    const afterRow = await processC.served(w.seed.teamId, w.readerA);
+    expect(afterRow.payload.startsWith("ERROR:")).toBe(false);
+    expect(afterRow.payload).not.toContain(TITLE);
+    expect(afterRow.origin, "the superseded persisted row is not served").toBe("cold");
+    // B's memory entry is superseded too: never served from memory again. (It may serve the row C
+    // just wrote under the NEW authorization — which carries no revoked text.)
+    const afterMemory = await processB.served(w.seed.teamId, w.readerA);
+    expect(afterMemory.payload.startsWith("ERROR:")).toBe(false);
+    expect(afterMemory.payload).not.toContain(TITLE);
+    expect(afterMemory.origin, "the superseded memory entry is not served").not.toBe("memory");
+    // The surviving audience keeps it.
     expect(await processB.read(w.seed.teamId, w.readerB)).toContain(TITLE);
+    expect(await processC.read(w.seed.teamId, w.readerB)).toContain(TITLE);
   }, 120_000);
 
   it("a cold rebuild held across the revocation is never published with the old text", async () => {
