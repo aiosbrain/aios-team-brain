@@ -6,7 +6,11 @@ import { withTransaction } from "@/lib/db/pg/pool";
 import { discoverMemberIdentity, type DiscoveredIdentityOutcome } from "@/lib/identity/member-identities";
 import { resolveConfirmedEmail } from "@/lib/identity/provider-sync";
 import { buildIdentityMap, providerIdentityState } from "@/lib/identity/resolve";
-import { lockLiveGdriveExecution, type GdriveExecutionRef } from "@/lib/integrations/gdrive-authority";
+import {
+  assertGdrivePayloadBinding,
+  lockLiveGdriveExecution,
+  type GdriveExecutionRef,
+} from "@/lib/integrations/gdrive-authority";
 import { normalizeGdriveContributions } from "@/lib/ingest/gdrive-contribution-store";
 
 /**
@@ -22,6 +26,11 @@ import { normalizeGdriveContributions } from "@/lib/ingest/gdrive-contribution-s
  * refuses ambiguous and deactivated matches). The shared owner (`discoverMemberIdentity`) then
  * creates the link only if the id was never reviewed — an existing link, a manual mapping and an
  * unlink tombstone all stand, and a disagreeing email is recorded as a conflict, never a transfer.
+ *
+ * Payload binding first (AIO-1167 R45 L2): the evidence is admitted only from a payload bound to the
+ * live connection (`assertGdrivePayloadBinding`, the same check the content commit makes). A payload
+ * for another connection, or with no provider id, is refused here — before any identity read or
+ * write — so a push the commit would reject cannot change the shared registry or trigger a repair.
  */
 export async function discoverGdriveContributorIdentities(
   db: DbClient,
@@ -29,6 +38,7 @@ export async function discoverGdriveContributorIdentities(
   ref: GdriveExecutionRef,
   frontmatter: Record<string, unknown>,
 ): Promise<Record<DiscoveredIdentityOutcome, number>> {
+  assertGdrivePayloadBinding(frontmatter, ref);
   const outcomes: Record<DiscoveredIdentityOutcome, number> = {
     linked: 0, exists: 0, conflict: 0, reviewed: 0, ineligible: 0,
   };

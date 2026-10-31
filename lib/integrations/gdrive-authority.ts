@@ -51,6 +51,24 @@ export interface GdriveExecutionRef {
   owner: string;
 }
 
+/**
+ * The binding every Drive payload must carry to be written under `ref`: a non-empty provider id
+ * (`frontmatter.source_id`) and exactly the authorized connection (`frontmatter.connection_id`).
+ * ONE check for every consumer of a Drive payload — the content commit, and the identity discovery
+ * that runs before it (AIO-1167 R45 L2), so a payload bound to another connection, or to none,
+ * changes nothing anywhere: not content, and not the shared identity registry. Pure: it reads the
+ * payload and the claimed execution only; the live execution itself is validated under lock by each
+ * consumer.
+ */
+export function assertGdrivePayloadBinding(frontmatter: Record<string, unknown>, ref: GdriveExecutionRef): string {
+  const providerId = typeof frontmatter.source_id === "string" ? frontmatter.source_id.trim() : "";
+  const connectionId = typeof frontmatter.connection_id === "string" ? frontmatter.connection_id.trim() : "";
+  if (!providerId || connectionId !== ref.integrationId) {
+    throw new GdriveAuthorityError("wrong_connection", "Google Drive payload is not bound to this authorized connection", 403);
+  }
+  return providerId;
+}
+
 export interface GdriveApprovedAudience {
   projectIds: string[];
   /**

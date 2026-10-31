@@ -131,12 +131,28 @@ def _fail_work(
 
 class _ProviderAdmissionClosed(Exception):
     """Google refused this account's calls until ``not_before`` (AIO-1167 R44 C6). The whole drain
-    for the account stops; no further provider call is made for it before that instant."""
+    for the account stops; no further provider call is made for it before that instant.
+
+    A CONTROL signal, not a read failure: it must reach the coordinator's account-hold owner from
+    every phase (drain, baseline enumeration, change pages) and is never converted into a
+    per-stream ``provider_read`` (R45 H1). ``partial`` carries the counts the interrupted stream had
+    already completed, so the work done before the limit is still reported."""
 
     def __init__(self, not_before: str, category: str):
         super().__init__(category)
         self.not_before = not_before
         self.category = category
+        self.partial: IngestSummary | None = None
+
+
+# Provider deferrals caused by this run's own budget, never by Google (U5 pre-dispatch; R45 M6 late
+# but in-time response). They stop the drain without charging the document.
+_LOCAL_DEADLINE_CATEGORIES = frozenset({"dispatch_deadline", "run_deadline"})
+
+
+def _account_hold(exc: ProviderDeferred) -> _ProviderAdmissionClosed:
+    """The account-wide hold a provider rate limit opens (C6), from wherever it was read."""
+    return _ProviderAdmissionClosed(exc.not_before or _defer_until(), exc.category)
 
 
 def provider_source_options(options: dict[str, Any]) -> dict[str, Any]:
@@ -1074,6 +1090,8 @@ async def run_gdrive_stream(
                         except BrainError as exc:
                             if _is_terminal_authority(exc):
                                 raise
+                    if closed.partial is not None:
+                        _merge_summary(total, closed.partial)  # work completed before the limit
                     total.failure_categories[closed.category] = total.failure_categories.get(closed.category, 0) + 1
                     break
                 except Exception as exc:
@@ -1491,9 +1509,13 @@ async def _run_gdrive_stream_unlocked(
                     root_bindings=root_bindings,
                 )
                 fresh_remaining = max(0, fresh_remaining - consumed)
-            except BrainError:
+            except (BrainError, _ProviderAdmissionClosed):
+                # Authority errors stay run-terminal; an account rate limit raised by the baseline's
+                # drain is the coordinator's account hold, never a baseline read failure (R45 H1).
                 raise
             except ProviderDeferred as exc:
+                if exc.category == "rate_limited":
+                    raise _account_hold(exc) from exc
                 await _checkpoint_progress(
                     client, execution, state, namespace, phase="partial",
                     last_error=exc.category, retry_not_before=exc.not_before,
@@ -1624,6 +1646,9 @@ async def _run_gdrive_stream_unlocked(
                 summary.failure_categories["invalid_cursor"] = 1
                 return summary
             except ProviderDeferred as exc:
+                if exc.category == "rate_limited":
+                    # The account's wait, not this stream's: every stream of it is held (R45 H1).
+                    raise _account_hold(exc) from exc
                 await _checkpoint_progress(
                     client, execution, state, namespace, phase="partial",
                     last_error=exc.category, retry_not_before=exc.not_before,
@@ -1897,6 +1922,10 @@ async def _run_gdrive_stream_unlocked(
                 client, execution, state, namespace, generation,
             )
         return summary
+    except _ProviderAdmissionClosed as closed:
+        # Whatever this stream completed before the limit is still reported by the coordinator.
+        closed.partial = summary
+        raise
     except BrainError as exc:
         summary.failed += 1
         summary.failure_categories[exc.code] = summary.failure_categories.get(exc.code, 0) + 1
@@ -2299,12 +2328,29 @@ async def _push_doc(
         }
     try:
         result = await client.push(item, execution=execution)
-        setattr(summary, result.status, getattr(summary, result.status) + 1)
-        if work:
-            progress = state.get_progress(namespace)
-            await _checkpoint_progress(client, execution, state, namespace,
-                                       phase=progress.phase if progress else "working")
-            state.ack_work(work)
+    except BrainError as exc:
+        if _is_terminal_authority(exc):
+            raise
+        return _record_sink_failure(state, work, exc, summary)
+    setattr(summary, result.status, getattr(summary, result.status) + 1)
+    if not work:
+        return True
+    try:
+        progress = state.get_progress(namespace)
+        await _checkpoint_progress(client, execution, state, namespace,
+                                   phase=progress.phase if progress else "working")
+        state.ack_work(work)
+    except BrainDeferred as exc:
+        if _is_terminal_authority(exc):
+            raise
+        # The content was ACCEPTED; only its durable acknowledgment is owed (AIO-1167 R45 M5). A
+        # control-plane wait is not the document's failure: the obligation stays owed and
+        # unacknowledged (its page is not retired) with the brain's not-before, and spends none of
+        # the retry budget backoff and exhaustion are computed from. The replayed push is idempotent.
+        summary.failure_categories[exc.code] = summary.failure_categories.get(exc.code, 0) + 1
+        if exc.not_before is not None:
+            state.fail_work(work, f"checkpoint deferred: {exc.code}", not_before=exc.not_before, failure=False)
+        return False  # the brain is deferring: start no further work this run
     except BrainError as exc:
         if _is_terminal_authority(exc):
             raise
@@ -2390,15 +2436,16 @@ async def _drain_pending(
         except BrainError:
             raise
         except ProviderDeferred as exc:
-            if exc.category == "dispatch_deadline":
-                # Nothing was sent: the run's budget ran out before this read (AIO-1167 R44 U5). Not
-                # an attempt and not a provider failure — the work is left exactly as it was.
+            if exc.category in _LOCAL_DEADLINE_CATEGORIES:
+                # The RUN's budget, not the provider: either nothing was sent before it ran out
+                # (AIO-1167 R44 U5), or Google answered in time but after it (R45 M6). Not a provider
+                # failure — the work is left exactly as it was, for a fresh budget.
                 summary.failure_categories.setdefault("run_deadline", 1)
                 break
             if exc.category == "rate_limited":
                 # The provider's wait governs this account, not this one document (R44 C6): stop
                 # every further call for it, and leave this obligation untouched.
-                raise _ProviderAdmissionClosed(exc.not_before or _defer_until(), exc.category) from exc
+                raise _account_hold(exc) from exc
             _fail_work(state, work, str(exc))
             summary.failed += 1
             summary.failure_categories[exc.category] = summary.failure_categories.get(exc.category, 0) + 1

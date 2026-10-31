@@ -61,6 +61,7 @@ import {
   type GdriveIngestPlan,
 } from "@/lib/ingest/gdrive-commit-locks";
 import {
+  assertGdrivePayloadBinding,
   GdriveAuthorityError,
   type GdriveExecutionRef,
   withGdriveExecutionCommit,
@@ -368,14 +369,10 @@ async function ingestGdriveApiItem(
   concurrencyHooks: IngestConcurrencyHooks,
 ): Promise<IngestResult> {
   const frontmatter: Record<string, unknown> = rawPayload.frontmatter ?? {};
-  const providerId = typeof frontmatter.source_id === "string" ? frontmatter.source_id.trim() : "";
-  const connectionId = typeof frontmatter.connection_id === "string" ? frontmatter.connection_id.trim() : "";
   if (!execution) {
     throw new GdriveAuthorityError("connector_principal_required", "current Google Drive execution authority is required for this stored item", 403);
   }
-  if (!providerId || connectionId !== execution.integrationId) {
-    throw new GdriveAuthorityError("wrong_connection", "Google Drive payload is not bound to this authorized connection", 403);
-  }
+  const providerId = assertGdrivePayloadBinding(frontmatter, execution);
   const ref: GdriveExecutionRef = execution;
   const mappingRevision = opts?.mappingRevision;
   const commit = () => withTransaction(async () => {

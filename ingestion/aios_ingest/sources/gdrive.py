@@ -579,7 +579,8 @@ class GoogleDriveSource(PullOnlySource, Source):
     ) -> Any:
         if (call is None) == (request_factory is None):
             raise ValueError("provide exactly one provider callable or request factory")
-        deadline = time.monotonic() + self._request_deadline_seconds
+        request_deadline = time.monotonic() + self._request_deadline_seconds
+        deadline = request_deadline
         if self._run_deadline_monotonic is not None:
             deadline = min(deadline, self._run_deadline_monotonic)
         replaced_token = False
@@ -626,11 +627,18 @@ class GoogleDriveSource(PullOnlySource, Source):
             try:
                 sent = True
                 result = attempt_call()
-                if time.monotonic() > deadline:
+                finished = time.monotonic()
+                if finished > deadline:
+                    # Which deadline did it cross (AIO-1167 R45 M6)? A response that arrived within
+                    # its OWN request budget but after the local RUN budget is not a provider
+                    # failure — Google answered in time; this run simply has no budget left to use
+                    # the answer. The result is not used past the budget (nothing new starts), and
+                    # the obligation is left for a fresh budget. Only a request that exceeded its
+                    # own deadline is a provider timeout.
                     raise ProviderDeferred(
                         "Google provider request exceeded its deadline",
                         not_before=datetime.now(timezone.utc).isoformat(),
-                        category="provider_timeout",
+                        category="run_deadline" if finished <= request_deadline else "provider_timeout",
                     )
                 return result
             except ProviderDeferred:
