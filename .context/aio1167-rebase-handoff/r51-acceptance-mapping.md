@@ -184,3 +184,17 @@ The Opus-reported IST-window analyzer failure was independently rerun under UTC 
 - Fable 5.1 first-party, fresh read-only context, `Read/Glob/Grep` only: **PASS**, no confirmed High/Medium finding, no HOLD. Report SHA-256 `e9fc3274e7fbd5ef94960dc652b428b0b4a28c0bce421cc33cfda1321b85e6a5`.
 - Three non-blocking Low notes are pending Astra adjudication: JSON1 portability, repeated named deferrals consuming removal retry budget, and the identified specific coverage gaps. The reviewer ran no tests/commands and did not extract packet archives. Coordinator independently verified the full manifest and archive hashes.
 - After Astra disposition, obtain new blind Astra HIGH and GPT-6.1 Sol HIGH reviews for this exact full candidate; no prior blind verdict covers the corrections.
+
+
+## Fresh blind final review findings — adjudication pending
+
+Exact snapshot: base 5ecd2989e21fded915b41b508477bb267aaec06d; 46 paths; tracked patch 7bce966593bb2e4c67374d17aa7317f1a0386c92eee34f37c8a97d2b4e165e6f; untracked archive bfbc6e4e13ea011d51a1312d3d652a1f118644830bb7a54927333c0c592dffb4; manifest dfce2bf22f2717b1e688fe7b44bbc0cfdbddae80ed2b2fd281cbc61bd05f3c82. Both fresh blind reviewers independently matched all source file hashes and archive entries. The source is frozen; no reviewer ran tests or wrote files.
+
+| Finding | Reviewer evidence | Current disposition |
+|---|---|---|
+| P1: deferred selected folder may be marked enumerated after only metadata is readable, before its subtree is listed; resumed complete snapshot may reconcile away valid existing claims. | Astra HIGH final review; gdrive_sync.py around 2857, 2971 and 2163; AC-03/05/07. | Pending fresh Astra adjudication. |
+| P1: explicit file.trashed=true is withheld by an unrelated selected-parent root restriction, so no removal obligation is created and old membership/claim persists. | Sol HIGH final review; gdrive_sync.py around 2444, 2577, 2614 and 2962; AC-05/06. | Pending fresh Astra adjudication. |
+| P2: watch creation/cleanup Retry-After is not persisted as an account hold and later watch calls may proceed immediately. | Astra and Sol HIGH final reviews; watch_renewal.py and sources/gdrive_watch.py; AC-04. | Pending fresh Astra adjudication. |
+
+Required next: decide each finding with evidence, identify interaction/ownership, and bound corrections plus regressions. If accepted, resume the same sole Opus writer after fresh subscription quota admission, then verify affected suites, obtain Fable delta review, and repeat blind final review on the corrected source snapshot. The accepted identity/tombstone fix remains held for PR #714 ownership. No readiness or publication approval has been issued.
+
