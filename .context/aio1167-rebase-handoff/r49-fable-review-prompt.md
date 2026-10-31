@@ -1,0 +1,12 @@
+# AIO-1167 R49 — independent Fable 5.1 code review
+
+Review this exact uncommitted source snapshot read-only. Base `5ecd2989e21fded915b41b508477bb267aaec06d`; the tracked source diff (excluding `.context/`) has SHA-256 `ae1a7e04c34fd24c668c17002fc25ff5f9d1e088b61865bab52bedbf3d69fb93` (20 tracked files, +1,112/−189). The complete review patch, including all 12 new regression tests, is `/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree/.context/aio1167-rebase-handoff/r49-fable-review.diff` with SHA-256 `d7af06597815133665e4859c5cdd5881bee2059fa34ee705e3f62194c4b2448d`. Read the patch first, then inspect current files and surrounding callers/consumers in the worktree to verify the patch against actual code. The 12 new files are included as added-file patches. Do not treat the current handoff or author mapping as proof.
+
+Read these review authorities:
+- `/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree/.context/aio1167-rebase-handoff/accepted-spec.md`
+- `/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree/.context/aio1167-rebase-handoff/astra-r48-adjudication.md`
+- `/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree/.context/aio1167-rebase-handoff/r49-acceptance-mapping.md` only after your independent spec-to-code inspection
+
+The R49 change is intended to satisfy the adjudicated document restriction, quota/root diagnostics and verified file-root restoration corrections. Independently verify the actual ownership and transition paths, durable checkpoint/acknowledgment behavior, recovery and rearm behavior, monotonic waits, claim/fencing boundaries, provider reads, data-loss/privacy boundaries, and whether tests cover the acceptance behavior without weakening existing invariants. Inspect relevant unmodified callers and consumers beyond changed lines.
+
+Return a substantive review with a clear verdict. For each finding include severity, concrete trigger, expected versus actual behavior, exact file/line evidence, impact, and a focused regression recommendation. Separate confirmed blockers from risks or optional follow-ups. If no findings remain, state what you inspected and any meaningful coverage limitations. Do not modify files, run commands or tests, commit, or push. Do not repeat the author's test report; assess coverage independently.
