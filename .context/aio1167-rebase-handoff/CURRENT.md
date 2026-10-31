@@ -186,3 +186,13 @@ Schema ownership reminder: the canonical fresh-schema owner remains `postgres/sc
 
 
 R50 timed WIP checkpoint captured 2026-10-31 14:07 UTC: `.context/aio1167-rebase-handoff/r50-wip-20261031T140700Z/`. Capture was stable across before/after status and content hashes; 16 untracked files are included. Manifest SHA-256 `a6e025c16b38d1d32c9cba73f6ab839dc8d2980b63782fa7be50d2e85a8cb5fe`; `full.diff` SHA-256 `f1e40ac9f7d65fac59ed6668e2bd4a0dca779e37f08f5cb62f2eedaf757524dc`; `untracked.tar.gz` SHA-256 `432493f64200ba81b39a776c55cb3f825e87bc938957e89e3ae0f6d77734d384`.
+
+
+2026-10-31 14:14 UTC — R50 Opus correction turn completed
+
+- The resumed sole Claude Opus 5.5 HIGH session `628402d5-a1c6-42b7-b736-e84358c1a749` completed successfully, exit 0, `end_turn`, 173 turns, actual canonical model `claude-opus-5-5`; no writer remains active. Its completion report is `r50-opus-corrections-result.md` (SHA-256 `7fd970dcc0b8e3c6536d7911bd3eda1c8c82e34d5398634a2660deb5ce7a3208`). The CLI emitted no tests or commands (restricted tool set); all tests/typechecks/migrations remain coordinator-owned and unrun, not passes.
+- Corrections delivered per Astra: Fable findings 1–5 and 7; finding 6 remains deferred. New migration `postgres/migrations/20261031140000_gdrive_restriction_generation_lifetime.sql` mirrors the fresh-schema authority transition. Writer reports 3 new Python test modules, 1 acceptance mapping and the targeted test additions listed in the result. Restriction minima are stable account/resource owned; generation-specific execution remains fenced.
+- Writer-reported unresolved/behavior boundaries: empty selection carries minima without adoption until account verification; restricted-root removals wait for fresh listing; timeout-only deferred roots can be boundedly rescanned each run; loss of both local SQLite and unpublished minima remains unrecoverable. These need coordinator adjudication against Astra's acceptance before any review.
+- Last fresh full-user Claude `/usage` was 14:07 UTC: session 0%, all-model week 28%, Fable week 33%, credits off. Recheck within 20 minutes and before the next review.
+- Previous stable partial R50 bundle was pushed and independently read back at `aab40dc39f009b9cccf692dcf393ebb6e2c7ff74`. The complete R50 snapshot is now due for a new local and remote checkpoint before long verification/review.
+- Next: capture/push the completed source+tests+mapping and writer result; coordinator inspect every changed path and all accepted criteria, then run the exact focused Python/Postgres/TypeScript data-mechanics checks from Astra. Resolve any implementation/acceptance gaps with the same Opus writer only after a bounded report. Do not start reviews until the corrected exact snapshot and tests are verified.
