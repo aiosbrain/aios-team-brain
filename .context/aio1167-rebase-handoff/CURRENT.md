@@ -51,3 +51,9 @@ Keep R49 F6, H2, M-b/M-c/M-d, live Google certification/soak, opt-in/runner, can
 
 - Coordinator ran six focused modules: **64 passed, 14 failed in 2.37s**. All 14 are in the new `test_brain_minimum_provenance.py` and fail before behavior runs because `_client` uses invalid fake `api_key="key"`; existing `BrainClient` requires the harmless `aios_<id>_<secret>` shape. The other five modules passed. No production failure is established.
 - The source and tests remain fully recoverable at the prior remote checkpoint `c3c6d02884728867c460de058719708672380b62`; this attempt result and the one-file fix prompt are now saved for the next recovery checkpoint. Resume only the same Opus writer to correct that test fixture, then rerun the exact focused command. No further test result is claimed yet.
+
+## 2026-10-31 16:33 UTC — fixture-only correction captured
+
+- The same Opus 5.5 HIGH session resumed and changed only the invalid fake API key in `ingestion/tests/test_brain_minimum_provenance.py` from `key` to `aios_a_b`; terminal success, one `Edit`, no commands/tests. Writer result/meta are in `r51-lowfix-checkpoint2-20261031T163305_689658Z/`.
+- Updated complete recovery bundle: `r51-lowfix-checkpoint2-20261031T163305_689658Z/`; source patch remains SHA-256 `f77cd3e68fad887ac260670e95093deec070539cd64a18f5c62f936f40139bda` (tracked patch; 22 paths), untracked archive now SHA-256 `3a1c95ccee0e7ee1d537cd10bd70ae00a6043a72a0011f0ff5366540ee6fa502` (20 paths), manifest SHA-256 `d1a58a8e3a969677b8b7cfd6803b18af840a6be73672cf87c4d166a5d1067891`.
+- Next run the same focused six-module coordinator suite. The prior 64-pass/14-fixture-failure result remains recorded separately and is not a pass for the corrected tests.
