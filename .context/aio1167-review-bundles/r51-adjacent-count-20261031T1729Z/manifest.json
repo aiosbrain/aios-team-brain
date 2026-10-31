@@ -96,7 +96,7 @@
     {
       "path": "ingestion/tests/test_flush_authority_outcome.py",
       "status": "A",
-      "sha256": "afb5eda934b2597222446fa99a748dc8da3994766f3d55292a7528a0a7f20453"
+      "sha256": "19077b33c2bc40624b1eb9c2acf3aa58b7789ffa94119265f9408bdeac5086d1"
     },
     {
       "path": "ingestion/tests/test_gdrive_poll_reporting.py",
@@ -214,8 +214,8 @@
       "sha256": "cf5a393d3e9dcafbaa58d3aa603e30f8a031b9f1419cd5f36a295e86ac31b552"
     }
   ],
-  "tracked_diff_sha256": "3ce754c20a43052e797ebdc50ce5c2e3d7728caac784ceaad90eaa75330ff2ca",
-  "untracked_archive_sha256": "988af366d492f95676254e92cbb8887d3617f7a3a85a801d85c6d723db888469",
+  "tracked_diff_sha256": "3fba7ef58921884657d101cb3694683a2a25482d5a1cb0db10c1bd0554f3de40",
+  "untracked_archive_sha256": "6aa6101595f2a06fd8c0a6dbd28d639104f0e666cf19846c6869dd299f4cee2a",
   "untracked_paths": [
     "ingestion/tests/test_account_hold_before_streams.py",
     "ingestion/tests/test_bound_root_loss.py",

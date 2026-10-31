@@ -11,7 +11,7 @@
     {
       "path": "ingestion/tests/test_flush_authority_outcome.py",
       "previous_sha256": "2c0a0236e9c86b2490f7d67829e1fa0fc8634d26d4e47882b39404b4799d3c27",
-      "current_sha256": "afb5eda934b2597222446fa99a748dc8da3994766f3d55292a7528a0a7f20453",
+      "current_sha256": "19077b33c2bc40624b1eb9c2acf3aa58b7789ffa94119265f9408bdeac5086d1",
       "status": "A"
     }
   ]
