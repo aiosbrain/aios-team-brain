@@ -1,0 +1,2259 @@
+diff --git a/.context/aio1167-rebase-handoff/CURRENT.md b/.context/aio1167-rebase-handoff/CURRENT.md
+index 34dad22e..43f5cedb 100644
+--- a/.context/aio1167-rebase-handoff/CURRENT.md
++++ b/.context/aio1167-rebase-handoff/CURRENT.md
+@@ -12,18 +12,21 @@ Resolved current implementation questions: retain source-supported credit for a
+ 
+ - Worktree: `/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree`
+ - Branch: `codex/aio-1167-google-docs-connector-rebased`, based on recorded `origin/staging` `8df51664809cfc12740a39d0e98fdb9c8ad05ad8`.
+-- Current local HEAD: `02107ca6c539ec4efb06038bae82a43aa918bdaa` (`docs(aio1167): record diagnostic verification`), the exact snapshot reviewed by Fable R46.
+-- Recovery branch: `origin/codex/aio-1167-checkpoint-20261027`. The push server acknowledged advancement through `02107ca6`; docs and skill-runtime pre-push checks passed for every checkpoint. A separate `git ls-remote` readback earlier could not resolve github.com from the restricted network. Prior checkpoints `6920f9f3986755b978e9f2cac6907c2a84568526`, `3e31ab7d80c0632aac2f1881e9e7f9cebbf1a67c`, `72c82a3e95e405db93b0a6e0875080e02ea00cc8`, `3ea06e31220604359c36cf9551ba2222e74c1048`, `bcd9643d`, `a75ef838` and `67b64f38` remain recoverable parents. PR #743's divergent branch was not modified or force-pushed.
++- Fable R46 source snapshot: `02107ca6c539ec4efb06038bae82a43aa918bdaa`; current feature-branch HEAD before R47: `5ecd2989e21fded915b41b508477bb267aaec06d` (handoff-only commits after the reviewed source).
++- Recovery branch: `origin/codex/aio-1167-checkpoint-20261027`. Push acknowledgement and independent `git ls-remote` verify R48 source checkpoint `333bf6a798d75db03256ea9c17fc61f8a011f18b`. It contains the root-loss/Retry-After fixes, regressions and R48 result/mapping, atop R47. The exact pre-review local source bundle is `/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-review-bundles/20261031-r48-wip-5ecd2989/`; `full.diff` SHA-256 `b3b845c3cc9140107cf1c9c5b70f59b91973a67de0cd03fba350fb09782c53e8`, manifest SHA-256 `9160c45e05c83803f3c3ab8c63d83cfcfb96e50be38c310f0a21e9bdbddcb655`. It includes nine untracked test files and ten handoff files; hashes were verified. Pre-push docs-drift and skill-runtime checks passed. Earlier R47 source checkpoint `208f33a8f7084ded476b1ae4c613d5b1f8905b53` and prior checkpoints remain recoverable. PR #743's divergent branch was not modified or force-pushed.
+ - The prior detailed history and results are preserved in `ARCHIVE-current-state-through-20261027-before-8e960b85.md`. Load only that archive/evidence needed for a specific decision.
+ 
+ ## Writer and admission
+ 
+-- Sole writer: existing Claude session `628402d5-a1c6-42b7-b736-e84358c1a749`, displayed as `aio1167-r30-opus-writer`, in full-user subscription-authenticated terminal session `95971`, Opus 5.5 HIGH. This same session owns all implementation, including the next Astra-approved Admin diagnostic; no second writer is active. The user confirmed terminal login; the CLI usage panel is available in that authenticated session.
+-- Latest full-user Claude Max `/usage` after Fable R46 (2026-10-31, Asia/Kolkata, about 14:06): all-model week 20%, Fable week 23%, credits off. Live Fable CLI telemetry reports five-hour 16%, seven-day 19%, overage-inclusive 22%, `status=allowed`, and overage disabled. API-key environment overrides remain unset. All reported windows are below 90%.
++- Sole writer: existing Claude session `628402d5-a1c6-42b7-b736-e84358c1a749`, displayed as `aio1167-r30-opus-writer`, full-user terminal session `95971`, Opus 5.5 HIGH. Its R48 correction turn has returned after 17m25s; source changes remain uncommitted, and no second writer is active. The user confirmed terminal login; no login flow was run.
++- Fresh full-user Claude Max `/usage` after R48 on 2026-10-31 (Asia/Kolkata, about 16:26): session 14%, all-model week 22%, Fable week 26%, credits off. `claude auth status` confirmed `loggedIn:true`, `authMethod=claude.ai`, `apiProvider=firstParty`; API-key environment overrides are unset. All reported windows are below 90%.
++- R48 session usage metadata (completed writer turn; per CLI): 2 uncached input, 489,389 cache-read input, 410 cache-creation input, 1,652 output. These are per-turn session counts, not quota percentages; the slice remains incomplete pending independent coordinator verification and reviews.
+ - No credentials, tokens or account secrets belong in the handoff.
+ 
+ ## Current implementation state
+ 
++**Current R48 slice:** The same Opus 5.5 HIGH writer returned from the bounded D1/D2 task in `r48-opus-d1-d2-result.md` (SHA-256 `2d369e1419daab46ce8bbef1482f44f4d85f86bd603cb97faa2c1a3267c48058`); its acceptance mapping is `r48-acceptance-mapping.md` (SHA-256 `e981fb3db721998870950f1a6bb2030f6876e89a44f4c3da895b8af7b8a13bc1`). The non-`.context` source delta is 20 tracked files, +823/−181, SHA-256 `6b224debd0929032bc382424cf8019e18632c51f2aec1af255644831f61f3875`; nine new tests are included in the report. Coordinator independently ran the full Python suite: 855 passed, 28 skipped; `npm run typecheck`, changed-file ESLint, `npm run check:docs`, and `git diff --check` passed. Pre-push docs/skill-runtime checks passed. Fable 5.1 reviewed the exact R48 delta at commit `333bf6a798d75db03256ea9c17fc61f8a011f18b`, from prior R47 checkpoint `151fb88e245ba380acdf9d734845d54aa7ae5bb9`, bundle fingerprint `124a5cfb56f87ebd2e749180ea7740646c8cf52899c833d3935ee276303ef358`. Report `fable-r48-review.md` SHA-256 `778c7033902705d00c03d9c54182964b6aa9a7278c43a8e3b8672701dfd3d3b1`; metadata `fable-r48-run-metadata.json` SHA-256 `626b96d7eb4c28da7f39623f0abb7f9d4cd22a7ba5c87eed619d1895bcb68fab`. F1 is a confirmed Medium: `rearm_exhausted` erases a valid per-document provider deadline, permitting an early Run now/Retry. F2 and F3 are confirmed Lows: duplicate tombstone handling can clear the unavailable detail/drop Retry-After diagnostics, and a restored file root keeps stale unavailable detail. F5 is a Low actionability/diagnostic gap. F4 is a conditional long-hold limitation consistent with Astra's deferred override policy. F6 records coverage gaps around real cross-connection claim reconciliation and per-document restart. Astra adjudication and the retry/recovery architectural root-cause check are now required before another source edit. Writer source remains uncommitted in the feature worktree; remote recovery commit `333bf6a` contains this exact code snapshot.
++
+ R45 adjudicated fixes H1/M5/M6/L2 are implemented in source checkpoint `6920f9f3`; tests and report are committed at `3e31ab7d` and verified on the recovery branch. The resumed Opus 5.5 HIGH turn added tests in `ingestion/tests/test_account_hold_phases.py`, `ingestion/tests/test_drain_recovery.py`, `test/datamechanics/gdrive-identity-discovery-route.datamechanics.test.ts`, and updated `test/datamechanics/gdrive-identity-discovery.datamechanics.test.ts`. Writer details, exact checks and open scope: `r45-opus-corrections-result.md`. Coordinator reran focused Python (20 passed), `npm run typecheck` (exit 0), changed-file ESLint (exit 0), and isolated real-Postgres identity discovery suites (2 files/10 passed). Writer also reports full Python (709 passed, 28 skipped), 25 Vitest files/638 passed, and 4 isolated data-mechanics files/65 passed. The exact snapshot still needs independent delta review; do not claim merge readiness.
+ 
+ Phase two adds real-routine M8 and separate-cache-path L8 evidence plus acceptance-gap tests, committed and remotely verified at `72c82a3e`. Report: `r45-m8-l8-acceptance-result.md`. A narrow production fix makes provider `provider_unauthorized` terminal across streams; `timeline-cache.ts` adds a test-only origin callback. Coordinator verification: Python stream/notification suites 29 passed; typecheck/ESLint passed; focused Vitest 28 passed; isolated Postgres revocation/OAuth-expiry suites 3 passed. Writer reports the broader suites passed (see report). The exact combined snapshot remains unreviewed.
+@@ -92,9 +95,11 @@ The first H1/M5/M6/L2 Opus turn ended with a transient connection error, then th
+ 
+ ## Next action
+ 
+-1. Astra adjudicates Fable R46 findings F1-F8 against accepted spec and source. Fix accepted material findings with the same Opus 5.5 HIGH writer; preserve explicit deferred decisions for any finding kept out of scope. Then rerun affected verification and obtain a fresh Fable review, fresh blind Astra HIGH review, and GPT-6.1 Sol HIGH review of the exact corrected snapshot. Full Python suite previously passed 700/28 skipped; focused data-mechanics fixes passed; full isolated data-mechanics run had only the two documented environment-gated failures. Typecheck, changed-file lint, docs drift, and production build passed. The full TypeScript unit run at the prior production-code snapshot had documented environment/archive and unchanged graph CDC failures; targeted AIO guards passed 242/242.
+-2. Then prepare the authorized staging PR/checkpoint. Existing PR #743 branch is divergent: do not force-push or overwrite it. No merge/deployment authorization.
+-
++1. Astra R48 adjudication is complete in `astra-r48-adjudication.md` (SHA-256 `2b49c70f862f471787664629a1c0189f3b25f4355387c42a7f418c3c349c4b3c`). Decision: changes required. Root-cause finding: a provider restriction is incorrectly coupled to observation retry bookkeeping. `rearm_exhausted` and `_observe_work` can clear a document deadline, while acknowledged progress carries account/stream holds but no document restriction; fresh-state recovery can therefore read too early.
++2. Required bounded writer scope: separate document provider-minimum authority from attempt/exhaustion state, retain it through rearm/new observations, carry and restore it through the existing fenced progress protocol before provider reads, and fail closed when acknowledgment is uncertain. Fix F2 root diagnostics/quota routing and F3 verified file-root restoration detail. Add the adjudication's focused regressions and update architecture/acceptance notes. Preserve D1 verified-root/claim fences, R46 F4 absence withholding, monotonic account holds, valid long Retry-After and the deferred override policy. Do not add an Admin override, broad queue redesign, or new diagnostic surface.
++3. The adjudication and bounded R49 writer prompt are preserved in `astra-r48-adjudication.md` and `r49-opus-corrections-prompt.md`. Claude.ai CLI `/usage` was freshly read 2026-10-31: session 17%, all-model week 23%, Fable week 27%, credits off. `claude auth status` confirms first-party Max subscription auth. The existing Opus session remains the sole writer (`628402d5-a1c6-42b7-b736-e84358c1a749`); its CLI is idle on TTY `s042` with no active work child. The R48 adjudication checkpoint is remotely verified at `ce4201afdefdb3a42d62f022caf8191f7b939b49`. Resume that same session only; no new writer. The bounded R49 prompt is ready. Then coordinator verifies affected checks, checkpoints, and requests a fresh Fable review of substantive corrections.
++4. After fixes, obtain fresh blind Astra HIGH and GPT-6.1 Sol HIGH reviews of the exact final snapshot. Do not claim merge readiness while H2, M-b/M-c/M-d, live Google certification/soak and recorded rollout gates remain open.
++5. Inspect PR #743 before publication. Its prior branch is divergent; do not force-push or overwrite it. No merge/deployment authorization.
+ ## Review and rollout gates
+ 
+ R44 reviews cover only baseline `2c7dd5c3bca25d0a806678644a63da2528398a76`, not current code. The complete remaining must-fix scope and tests are in `r44-review/writer-scope.md`. Live Google certification (25 documents and 24-hour soak), opt-in/runner proof and canary comparison remain release gates. An earlier broad unit run had three failures in unchanged `test/gdrive-obligation-provenance.test.ts` from a stale SQL-alias matcher; see archived history. No merge or deployment is authorized.
+diff --git a/app/t/[team]/admin/integrations/actions.ts b/app/t/[team]/admin/integrations/actions.ts
+index f2cd071e..38db8c34 100644
+--- a/app/t/[team]/admin/integrations/actions.ts
++++ b/app/t/[team]/admin/integrations/actions.ts
+@@ -62,7 +62,9 @@ import {
+   provisionGdriveConnectorPrincipal,
+   publishGdriveVerifiedSelection,
+   publishGdriveVerifiedConfig,
++  refreshGdriveAdminAccess,
+   saveGdriveConnectionConfig,
++  GdriveAuthorityError,
+   validateGdriveAudienceProjects,
+   type GdriveAdminTestAuthority,
+ } from "@/lib/integrations/gdrive-authority";
+@@ -75,20 +77,8 @@ async function verifyGdriveTargets(
+   authority: GdriveAdminTestAuthority,
+   targets: Array<{ kind: "file" | "folder" | "drive"; id: string }>,
+ ): Promise<{ denied: number }> {
+-  await authorizeGdriveAdminTestCall(authority);
+-  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+-    method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+-    body: new URLSearchParams({
+-      client_id: authority.credential.clientId, client_secret: authority.credential.clientSecret,
+-      refresh_token: authority.credential.refreshToken, grant_type: "refresh_token",
+-    }),
+-    cache: "no-store", signal: AbortSignal.timeout(15_000),
+-  });
+-  const token = await tokenResponse.json().catch(() => ({})) as Record<string, unknown>;
+-  await authorizeGdriveAdminTestCall(authority);
+-  if (!tokenResponse.ok || typeof token.access_token !== "string") {
+-    throw new Error("Google authorization is unavailable; reconnect this account");
+-  }
++  // Held to the broker's grant policy before any Drive read (AIO-1167 R47 F6); refusals are sanitized.
++  const { accessToken } = await refreshGdriveAdminAccess(authority);
+   let denied = 0;
+   for (const target of targets) {
+     await authorizeGdriveAdminTestCall(authority);
+@@ -96,7 +86,7 @@ async function verifyGdriveTargets(
+       ? `https://www.googleapis.com/drive/v3/drives/${encodeURIComponent(target.id)}?fields=id,name`
+       : `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(target.id)}?supportsAllDrives=true&fields=id,mimeType,trashed`;
+     const response = await fetch(path, {
+-      headers: { Authorization: `Bearer ${token.access_token}` }, cache: "no-store",
++      headers: { Authorization: `Bearer ${accessToken}` }, cache: "no-store",
+       signal: AbortSignal.timeout(10_000),
+     });
+     const metadata = response.ok
+@@ -1189,24 +1179,7 @@ export async function testGoogleDriveConnection(
+     const authority = await acquireGdriveAdminTestAuthority({
+       teamId: ctx.teamId, memberId: ctx.memberId, integrationName: name,
+     });
+-    await authorizeGdriveAdminTestCall(authority);
+-    const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+-      method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+-      body: new URLSearchParams({
+-        client_id: authority.credential.clientId,
+-        client_secret: authority.credential.clientSecret,
+-        refresh_token: authority.credential.refreshToken,
+-        grant_type: "refresh_token",
+-      }),
+-      cache: "no-store", signal: AbortSignal.timeout(15_000),
+-    });
+-    const token = await tokenResponse.json().catch(() => ({})) as Record<string, unknown>;
+-    await authorizeGdriveAdminTestCall(authority);
+-    if (!tokenResponse.ok || typeof token.access_token !== "string") {
+-      return { ok: false, error: tokenResponse.status === 400 || tokenResponse.status === 401
+-        ? "Google authorization was revoked; reconnect this account"
+-        : "Google Drive is temporarily unavailable" };
+-    }
++    const { accessToken, scopes } = await refreshGdriveAdminAccess(authority);
+     const config = authority.config;
+     const targets = [
+       ...((config.fileIds as string[] | undefined) ?? []).map((id) => ({ kind: "file", id })),
+@@ -1226,7 +1199,7 @@ export async function testGoogleDriveConnection(
+       let response: Response;
+       try {
+         response = await fetch(path, {
+-          headers: { Authorization: `Bearer ${token.access_token}` }, cache: "no-store",
++          headers: { Authorization: `Bearer ${accessToken}` }, cache: "no-store",
+           signal: AbortSignal.timeout(10_000),
+         });
+       } catch {
+@@ -1243,9 +1216,6 @@ export async function testGoogleDriveConnection(
+       else denied += 1;
+     }
+     await authorizeGdriveAdminTestCall(authority);
+-    const scopes = typeof token.scope === "string"
+-      ? token.scope.split(/\s+/).filter(Boolean)
+-      : ((config.scopeSet as string[] | undefined) ?? []);
+     const empty = config.selectionState === "empty";
+     const next = start + checked < targets.length ? start + checked : undefined;
+     return {
+@@ -1256,7 +1226,9 @@ export async function testGoogleDriveConnection(
+       total: targets.length,
+       continuation: next,
+     };
+-  } catch {
++  } catch (error) {
++    // Authority refusals carry sanitized, actionable text (reconnect, paused, temporarily unavailable).
++    if (error instanceof GdriveAuthorityError) return { ok: false, error: error.message };
+     return { ok: false, error: "Google Drive connection test failed without changing the saved selection" };
+   }
+ }
+@@ -1288,29 +1260,14 @@ export async function saveGoogleDrivePickerSelection(
+     const authority = await acquireGdriveAdminTestAuthority({
+       teamId: ctx.teamId, memberId: ctx.memberId, integrationName: name,
+     });
+-    await authorizeGdriveAdminTestCall(authority);
+-    const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+-      method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+-      body: new URLSearchParams({
+-        client_id: authority.credential.clientId,
+-        client_secret: authority.credential.clientSecret,
+-        refresh_token: authority.credential.refreshToken,
+-        grant_type: "refresh_token",
+-      }),
+-      cache: "no-store", signal: AbortSignal.timeout(15_000),
+-    });
+-    const token = await tokenResponse.json().catch(() => ({})) as Record<string, unknown>;
+-    await authorizeGdriveAdminTestCall(authority);
+-    if (!tokenResponse.ok || typeof token.access_token !== "string") {
+-      return { ok: false, error: "Google authorization is unavailable; reconnect this account" };
+-    }
++    const { accessToken } = await refreshGdriveAdminAccess(authority);
+     const verified: string[] = [];
+     const denied: string[] = [];
+     for (const id of ids) {
+       await authorizeGdriveAdminTestCall(authority);
+       const response = await fetch(
+         `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(id)}?supportsAllDrives=true&fields=id,mimeType,trashed`,
+-        { headers: { Authorization: `Bearer ${token.access_token}` }, cache: "no-store", signal: AbortSignal.timeout(10_000) },
++        { headers: { Authorization: `Bearer ${accessToken}` }, cache: "no-store", signal: AbortSignal.timeout(10_000) },
+       );
+       const metadata = response.ok
+         ? await response.json().catch(() => ({})) as { id?: string; mimeType?: string; trashed?: boolean }
+diff --git a/app/t/[team]/admin/members/actions.ts b/app/t/[team]/admin/members/actions.ts
+index 6c0782a1..1675455b 100644
+--- a/app/t/[team]/admin/members/actions.ts
++++ b/app/t/[team]/admin/members/actions.ts
+@@ -7,7 +7,7 @@ import { reconcileAttribution, repairAttributionNow } from "@/lib/ingest/reconci
+ import { describeManualRepair, reportRepairHandover } from "@/lib/ingest/attribution-repair-report";
+ import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
+ import { linkGithub } from "@/lib/codebases/github";
+-import { setMemberIdentity, removeMemberIdentity } from "@/lib/identity/member-identities";
++import { canonicalIdentityId, setMemberIdentity, removeMemberIdentity } from "@/lib/identity/member-identities";
+ import { withIdentityMutationBoundary } from "@/lib/identity/authority";
+ import { addAuthorAlias, removeAuthorAlias } from "@/lib/admin/aliases";
+ import { adminSetPassword } from "@/lib/auth/pg-login";
+@@ -197,8 +197,12 @@ export async function linkMemberIdentity(
+   }
+   const p = provider.trim().toLowerCase();
+   if (!PROVIDERS.has(p)) return { ok: false, error: `unsupported provider "${provider}"` };
+-  const ext = externalId.trim();
++  // The requested id in the spelling the writer will store (AIO-1167 R47 F8): an `author-email:`
++  // address is canonicalized, so lookup, revision observation and write all name ONE row; opaque ids
++  // keep their exact bytes.
++  const ext = canonicalIdentityId(p, externalId);
+   if (!ext) return { ok: false, error: `${p} user id is required` };
++  if (p === "gdrive" && /^author-email:$/.test(ext)) return { ok: false, error: "gdrive user id is required" };
+   // A fenced call whose observation cannot be read is refused, never downgraded to an unfenced one.
+   if (observed !== undefined && !isLinkObservation(observed)) return { ok: false, error: STALE_IDENTITY };
+   try {
+diff --git a/components/admin/identity-conflicts.tsx b/components/admin/identity-conflicts.tsx
+index 29489d9b..ab680858 100644
+--- a/components/admin/identity-conflicts.tsx
++++ b/components/admin/identity-conflicts.tsx
+@@ -3,9 +3,15 @@ import Link from "next/link";
+ import type { ConflictMember, IdentityConflictPage, IdentityConflictRow } from "@/lib/identity/discovery-conflicts";
+ 
+ /**
+- * Admin → Members: Google Drive automatic identity links that were refused (AIO-1167 R45, AC-08).
++ * Admin → Members: RECORDED, LEGACY Google Drive refusals (AIO-1167 R45; scoped by R47 F2).
+  * Read-only, and Drive-only by adjudication.
+  *
++ * Historical only. A refusal is recorded solely for a mapping that predates review state, which a
++ * normally upgraded instance no longer has (the repair-ledger migration seeds state for every link).
++ * A later email that disagrees with an approved mapping is NOT a conflict and is not listed here: the
++ * approved mapping stands (AC-08). Reachable conflicting decisions surface where they are made — the
++ * revision-fenced remap offer on a member's Identities control, and the OAuth existing-owner refusal.
++ *
+  * Each row is ONE historical observation (latest of any repeats) shown beside the identity's CURRENT
+  * mapping, re-read now — so an event an Admin has since resolved reads as history, not as a standing
+  * conflict. The fix is the existing Identities control on the member row this links to; nothing here
+@@ -41,20 +47,20 @@ export function IdentityConflicts({ page, nextHref }: { page: IdentityConflictPa
+   return (
+     <section className="prism-card flex flex-col gap-2 p-4" aria-labelledby="identity-conflicts-heading">
+       <h2 id="identity-conflicts-heading" className="text-sm font-semibold text-ink">
+-        Google Drive: automatic identity links that were refused
++        Google Drive: recorded legacy refusals (history)
+       </h2>
+       <p className="text-xs text-ink-secondary">
+-        The Google Drive connector observed a Drive account whose confirmed email named one member while
+-        the account was already mapped to another. The automatic link was refused and the existing
+-        mapping was kept.
+-        Review each in that member&apos;s <strong>Identities</strong> column and link, remap or unlink it there.
++        Historical record. Before identity mappings were reviewed, the Google Drive connector refused to
++        auto-link an account whose confirmed email named one member while an unreviewed mapping gave it to
++        another, and kept the existing mapping. A later email that differs from an approved mapping is not
++        a conflict and is not listed. To change a mapping, use that member&apos;s <strong>Identities</strong> column.
+       </p>
+       {page.status === "unavailable" ? (
+         <p role="status" className="text-xs text-amber-600">
+-          Google Drive refused-link diagnostics are unavailable right now. This does not mean there are none — try again.
++          Recorded Google Drive refusals are unavailable right now. This does not mean there are none — try again.
+         </p>
+       ) : page.rows.length === 0 ? (
+-        <p className="text-xs text-ink-tertiary">No Google Drive automatic links have been refused.</p>
++        <p className="text-xs text-ink-tertiary">No legacy Google Drive refusals are recorded.</p>
+       ) : (
+         <table className="w-full text-xs">
+           <thead>
+@@ -85,7 +91,7 @@ export function IdentityConflicts({ page, nextHref }: { page: IdentityConflictPa
+         </table>
+       )}
+       {page.status === "ok" && nextHref ? (
+-        <Link href={nextHref} className="self-start text-xs text-violet hover:underline">Older refused Drive links →</Link>
++        <Link href={nextHref} className="self-start text-xs text-violet hover:underline">Older recorded refusals →</Link>
+       ) : null}
+     </section>
+   );
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+index d2c2e121..3ae76912 100644
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -975,7 +975,9 @@ R44 contracts (AIO-1167):
+   `discoverMemberIdentity`), only for an id never reviewed — links, manual mappings and unlink
+   tombstones stand; a disagreeing email is an audited conflict, never a transfer. Only an UNREVIEWED
+   legacy mapping held by another member is such a conflict (a reviewed link or unlink tombstone is
+-  `reviewed`, never audited as one). Admins see refused Google Drive automatic links on Admin → Members
++  `reviewed`, never audited as one). Admins see RECORDED LEGACY Google Drive refusals — a historical
++  record, labelled as such (AIO-1167 R47 F2): a normally upgraded instance no longer produces the shape,
++  since the repair-ledger migration seeds state for every link — on Admin → Members
+   through `lib/identity/discovery-conflicts` — a read-only, team-scoped, paginated projection of the
+   existing `identity.discovery_conflict` audit events whose normalized provider is `gdrive`, beside the CURRENT mapping (re-read), allowlisted fields
+   only, `unavailable` on a read failure, active team-posture admins only, never an API surface
+@@ -1066,7 +1068,22 @@ removal is written, the old stream rebuilds its snapshot from its remaining root
+ rebound only after the destination stream holds a start token captured before that root is enumerated
+ there — the destination enumerates the root alone, never its drive. Unreadable (anything but an
+ explicit not-found), the root is durably `uncertain`: the change page is not retained, the cursor does
+-not pass it, and it is read again. All-stream reconciliation, and therefore `current`, requires that no
++not pass it, and it is read again. A previously BOUND root whose OWN metadata answers not-found under
++the execution's authority is a resolved outcome (AIO-1167 R48 D1): it stays `bound` with the
++actionable detail `selected root unavailable` (in the fenced `roots` evidence; run diagnostic
++`selection_root_unavailable`), its file page or folder traversal is finished EMPTY without listing it,
++and the rescan publishes — so a hard-deleted root no longer wedges the stream. Only that root's support
++is retired: direct and overlapping selections keep their membership, and the brain's claim-aware
++reconciliation keeps another connection's claims. A never-bound root's 404 stays `unresolved`; a listing
++404, auth, permission, quota, timeout and 5xx stay conservative. Read again, a restored root is settled
++and enumerated normally under the same provider ids. On the change-page path (`absence_withheld`) only a root
++read present where it is bound is settled; a verified absence keeps (or records) its unavailable detail
++(R49 F2), a quota answer on that read goes to the account-hold owner (no further account call, the page
++stays unresolved) while a non-quota one stays the stream's, and its Retry-After diagnostic is kept. A
++restored selected FILE root's detail is cleared only when the same stable id is re-read fresh in its
++bound drive as a live Doc and its content is ACCEPTED by the brain, so the acknowledging checkpoint
++publishes the restored evidence (R49 F3); a change-log hint, another drive, failed access, superseded
++work or failed extraction never clears it. All-stream reconciliation, and therefore `current`, requires that no
+ root is `relocating` or `uncertain` and that every stream's published snapshot is of exactly the bound
+ roots it now holds — so the claims an old stream made are retired only by the destination's verified
+ snapshot. Before any baseline listing, every required stream's start
+@@ -1158,7 +1175,13 @@ all-stream snapshot can establish absence.
+ Provider calls use explicit request/transport context (including OAuth and local service accounts),
+ bounded deadline-aware retries with jitter, honor mapping-style and normal
+ `Retry-After` headers, durably defer affected streams across restarts when a delay exceeds the run
+-window, recompute the effective remainder after token refresh, authority validation, and request
++window (AIO-1167 R48 D2, `parse_retry_after` in `sources/gdrive.py`: a VALID delay-seconds or HTTP-date
++is the provider's deadline exactly — never capped or shortened, however long, and there is no Run-now
++bypass; malformed input — text, a sign or exponent, NaN/infinity, an impossible date — uses the bounded
++exponential fallback and reports `retry_after_malformed`; a syntactically valid wait no timestamp can
++hold is held at the last representable instant, fail closed, reporting `retry_after_unrepresentable`;
++a document's own deferral keeps the provider's deadline as its earliest retry — see the document
++restriction owner below), recompute the effective remainder after token refresh, authority validation, and request
+ construction immediately before transport execution, tighten new and reused transport sockets from
+ that reduced request/run budget, treat authentication loss as terminal, and recover an invalid opaque
+ cursor only through a fresh-token controlled rescan. The local service-account `AuthorizedHttp` wraps
+@@ -1201,8 +1224,31 @@ the scheduler loop stays responsive; an abandoned worker's late result can only
+ evidence, and its resources close only when it ends. Early `sync` notifications for a pending attempt
+ whose token matches the persisted hash are recorded as evidence (202) — never activation, never a
+ hint. **One owner per section of the fenced connector state (`connector_state.py`)**: the coordinator
+-owns `streams`/top-level cursors and `roots`; renewal owns `watches`; each carries the other's part
+-unchanged (`coordinator_document`/`renewal_document`), so a poll can no longer erase renewal's records.
++owns `streams`/top-level cursors, `roots` and `account_hold`; renewal owns `watches`; each carries the
++other's part unchanged (`coordinator_document`/`renewal_document`), so a poll can no longer erase
++renewal's records. `account_hold` (AIO-1167 R47 F5) is the provider Retry-After for one verified account
++of one generation, opened from ANY phase — root metadata, relocation re-reads, start-token capture,
++drains — and held locally first (SQLite `connection_holds`, monotonic) then published; every run adopts
++the brain's copy and honours it before its first Drive call, so a hold read before any stream exists
++survives retries, restarts and a fresh state file. A failed publication keeps the local hold and is
++reported (`account_hold_unpublished`), never claimed remote-durable.
++A provider-named minimum for ONE document (a non-quota answer — e.g. a 503 — with a valid or
++unrepresentable Retry-After) is that document's RESTRICTION, owned apart from its retry bookkeeping
++(AIO-1167 R49 F1): SQLite `document_restrictions`, keyed by connection, verified account, generation and
++stable provider id, merged monotonically (`StateStore.restrict_document`), and carried in every
++coordinator checkpoint as `document_restrictions` (`connector_state.DOCUMENT_RESTRICTIONS_KEY`). Every run
++adopts the brain's acknowledged copy — matching generation and account only — before its first Drive call;
++restricted documents are excluded from selection (`list_pending(restricted=…)`), so they are neither
++read, pushed nor acknowledged and spend no slot of the batch, and a selected file root that is restricted
++is not read by a baseline or controlled rescan (that baseline stays incomplete). Attempts and exhaustion
++stay on the observation: Run now / Retry (`rearm_exhausted`) resets only the attempt budget and keeps the
++obligation's `not_before`; a newer observation, a rescan or a rebuilt local state cannot waive a
++restriction. An unrepresentable restriction is classified as such and never lapses — the year-9999
++sentinel is not an ordinary expiring instant. A per-document 503 is never an account hold. A restricted
++owed document keeps the stream partial (`provider_restricted_document`), so exhaustion is never
++completion. Durability boundary: a restriction is remote-durable only once a checkpoint carrying it is
++acknowledged; until then it lives in local SQLite (an uncertain checkpoint ends the run per R47 F3), and
++losing both that file and the unpublished restriction is an explicit limitation. No Admin override exists.
+ `webhook_channels` is a projection of `watches` (state column; only `active` rows validate
+ notifications), rebuilt from the brain at every sweep. The unfenced synchronous `renew()` path and the
+ settings-less renewal job are removed: `_renewal_job` requires brain settings and the managers expose
+@@ -1216,9 +1262,21 @@ Shared Drive watches carry the authoritative cursor and `driveId` together throu
+ layers; My Drive deliberately omits `driveId`. Execution quotas isolate provider checks, lifecycle,
+ progress and release. Progress permits the 100/min ingestion envelope and uses revision-conditional,
+ idempotent checkpoints; the client honors `Retry-After` within a fixed deadline, while cleanup
+-release retains independent capacity. Admin connection tests use the same generation policy, bound
++release retains independent capacity. The client (`BrainClient`) is the one owner of each execution's
++progress revision, and of its UNCERTAINTY (AIO-1167 R47 F3): a checkpoint that was sent but never
++acknowledged (lost response, exhausted 5xx, a deferral after a send, `stale_progress`) latches the
++execution, the identical payload having first been retried within the bound; no further checkpoint is
++sent under it, and the coordinator ends the run partial (`checkpoint_unacknowledged`). Post-push
++checkpoint failures are control-plane by STAGE and never charge the accepted document; the next
++acquisition restores the brain's authoritative progress and the owed work replays idempotently.
++Admin connection tests use the same generation policy, bound
+ also to credential revision and the initiating active Admin, with revalidation after refresh, before
+-every selected-root call, and immediately before success. Preview is explicitly batched at 100 roots
++every selected-root call, and immediately before success. The connection test, Picker verification and
++manual-root verification all refresh through ONE owner, `refreshGdriveAdminAccess`
++(`lib/integrations/gdrive-authority`), held to the broker's grant policy (R47 F6): the stored ceiling
++(`storedGrantCeiling`) decided before the token exchange, the returned grant judged by
++`evaluateGdriveGrant` with the broker's omitted-scope fallback, before any Drive read — so a preview
++never reports healthy what execution will refuse. Preview is explicitly batched at 100 roots
+ and returns checked/total/continuation rather than silently declaring an unchecked tail healthy.
+ Admin Run now/retry writes a durable `gdrive_run_requests` row; the bound sidecar claims it and invokes
+ the same coordinator as polling/watch work. Scheduled/manual/retry outcomes share this reporting
+@@ -1270,14 +1328,21 @@ a replay that changes only the e-mail or the timestamp spelling updates that row
+ permission identities (or exact verified email fallback) produce source-time UTC person/day Timeline
+ evidence with the provider role rendered visibly. OAuth account subjects use the separate
+ `subject:<sub>` namespace and are never treated as Drive permission IDs; author addresses retained
+-without a permission id use `author-email:<address>`. Opaque Google ids are case-sensitive. Drive
++without a permission id use `author-email:<address>`. Opaque Google ids are case-sensitive; the
++`author-email:` namespace alone is canonical — trimmed and lowercased by `canonicalIdentityId`
++(`lib/identity/member-identities`) at the writer and the Admin link action, so a manual link resolves
++the connector's lowercased evidence; a differently spelled legacy row is refused, never merged
++(AIO-1167 R47 F8). Drive
+ ownership and connector/service-account transport identity are retained as provenance/diagnostics,
+ not promoted to human authorship.
+ 
+ When an OAuth account email is VERIFIED by Google (`email_verified` literally `true`, carried by the
+ callback and enforced again by the publisher) and is an exact, unambiguous match to an active roster
+ identity, callback publication atomically records both its `subject:<sub>` transport identity and an
+-`author-email:<address>` attribution bridge. A false/missing claim or no email creates NEITHER mapping,
++`author-email:<address>` attribution bridge — each checked on its own: one the Admin deliberately
++UNLINKED stays unlinked (no row, revision, repair or identity-authority change; `respectTombstone`),
++because reconnecting is credential authority, not a relink (AIO-1167 R47 F1); an explicit,
++revision-fenced Admin relink remains the way back. A false/missing claim or no email creates NEITHER mapping,
+ no revision and no repair obligation (R41): the credential is stored by subject, the address is kept
+ only as untrusted account metadata (`integrations.config.authenticatedAccountEmailVerified: false`,
+ never `member_identities.email`), existing deliberate links are untouched, and attribution stays
+diff --git a/ingestion/aios_ingest/brain_client.py b/ingestion/aios_ingest/brain_client.py
+index 35499773..f75420a6 100644
+--- a/ingestion/aios_ingest/brain_client.py
++++ b/ingestion/aios_ingest/brain_client.py
+@@ -294,6 +294,10 @@ class BrainClient:
+         self._random = random_fn
+         self._monotonic = monotonic_fn
+         self._gdrive_progress_revisions: dict[tuple[str, int, int, str], int] = {}
++        # Executions whose last checkpoint may have committed without an acknowledgment reaching
++        # this client (AIO-1167 R47 F3). Their revision is unknown, so no further checkpoint is
++        # sent under them; a fresh acquisition restores the brain's authoritative progress.
++        self._gdrive_progress_uncertain: set[tuple[str, int, int, str]] = set()
+ 
+     async def __aenter__(self) -> "BrainClient":
+         return self
+@@ -430,11 +434,17 @@ class BrainClient:
+             progress=dict(data.get("progress") or {}),
+             progress_revision=int(data.get("progress_revision") or 0),
+         )
+-        self._gdrive_progress_revisions[
+-            (execution.integration_id, execution.generation, execution.fence, execution.owner)
+-        ] = execution.progress_revision
++        acquired = (execution.integration_id, execution.generation, execution.fence, execution.owner)
++        self._gdrive_progress_revisions[acquired] = execution.progress_revision
++        self._gdrive_progress_uncertain.discard(acquired)
+         return execution
+ 
++    def gdrive_progress_uncertain(self, execution: GdriveExecution) -> bool:
++        """Whether a checkpoint under this execution may have committed unacknowledged (R47 F3)."""
++        return (
++            execution.integration_id, execution.generation, execution.fence, execution.owner,
++        ) in self._gdrive_progress_uncertain
++
+     async def claim_gdrive_run_request(self) -> GdriveRunRequest | None:
+         resp = await self._client.get(
+             f"{self._base}/api/v1/integrations/gdrive/runs", headers=self._headers,
+@@ -542,6 +552,14 @@ class BrainClient:
+         self, execution: GdriveExecution, progress: dict[str, Any]
+     ) -> dict[str, Any]:
+         key = (execution.integration_id, execution.generation, execution.fence, execution.owner)
++        if key in self._gdrive_progress_uncertain:
++            # A checkpoint before this one may have committed, unacknowledged (AIO-1167 R47 F3): its
++            # revision is unknown, and sending a CHANGED document under a guessed one could replace
++            # newer sibling state. Nothing is sent; the next acquisition restores the authority.
++            raise BrainDeferred(
++                503, "checkpoint_unacknowledged",
++                "an earlier Google Drive checkpoint is unacknowledged; reacquire before checkpointing",
++            )
+         revision = self._gdrive_progress_revisions.setdefault(key, execution.progress_revision)
+         # Bounded by the RUN's remaining budget as well as the checkpoint's own (AIO-1167 R44 U3):
+         # a checkpoint near the end of a run defers instead of extending it.
+@@ -549,44 +567,65 @@ class BrainClient:
+         if execution.run_deadline is not None:
+             deadline = min(deadline, execution.run_deadline)
+         last_response: httpx.Response | None = None
++        sent = False  # a request left this client: the brain may have committed it
+         for attempt in range(_GDRIVE_CHECKPOINT_MAX_ATTEMPTS):
+             remaining_before_call = deadline - self._monotonic()
+             if remaining_before_call <= 0:
+-                if last_response is None:
++                if not sent:
+                     # Nothing was sent: the caller's acknowledgment stays pending, retryable at once.
+                     raise BrainDeferred(503, "checkpoint_deadline", "Google Drive checkpoint deadline expired before it was sent")
+                 break
+-            resp = await self._client.post(
+-                f"{self._base}/api/v1/integrations/gdrive/execution",
+-                json={
+-                    "action": "checkpoint", "integration_id": execution.integration_id,
+-                    "generation": execution.generation, "fence": execution.fence,
+-                    "owner": execution.owner, "progress_revision": revision,
+-                    "progress": progress,
+-                },
+-                headers=self._headers,
+-                timeout=max(0.1, min(15.0, remaining_before_call)),
+-            )
+-            if resp.status_code == 200:
++            sent = True
++            try:
++                resp = await self._client.post(
++                    f"{self._base}/api/v1/integrations/gdrive/execution",
++                    json={
++                        "action": "checkpoint", "integration_id": execution.integration_id,
++                        "generation": execution.generation, "fence": execution.fence,
++                        "owner": execution.owner, "progress_revision": revision,
++                        "progress": progress,
++                    },
++                    headers=self._headers,
++                    timeout=max(0.1, min(15.0, remaining_before_call)),
++                )
++            except httpx.TransportError:
++                # The request may have reached the brain and committed. The IDENTICAL payload is
++                # retried under the same revision: the brain acknowledges an exact replay of what it
++                # holds, and commits it if it never arrived (AIO-1167 R47 F3).
++                resp = None
++            if resp is not None and resp.status_code == 200:
+                 result = dict(resp.json())
+                 self._gdrive_progress_revisions[key] = int(result.get("progress_revision") or revision)
+                 return result
+-            last_response = resp
+-            if resp.status_code != 429 and resp.status_code < 500:
+-                raise BrainError(resp.status_code, *_error_fields(resp))
++            if resp is not None:
++                last_response = resp
++                if resp.status_code != 429 and resp.status_code < 500:
++                    if resp.status_code == 409:
++                        # `stale_progress`: the brain's revision is not the one this client holds.
++                        self._gdrive_progress_uncertain.add(key)
++                    raise BrainError(resp.status_code, *_error_fields(resp))
+             if attempt + 1 >= _GDRIVE_CHECKPOINT_MAX_ATTEMPTS:
+                 break  # no further attempt will be sent: never sleep for one (R44 U4)
+-            server_delay = _retry_after(resp)
++            server_delay = _retry_after(resp) if resp is not None else None
+             delay = (server_delay if server_delay is not None else min(2**attempt, 8)) + _bounded_jitter(self._random())
+             if self._monotonic() + delay >= deadline:
+                 # A wait that does not fit is not slept or truncated: the checkpoint is deferred,
+-                # with the time it may be retried (R44 U3).
++                # with the time it may be retried (R44 U3). What was sent may have committed.
++                self._gdrive_progress_uncertain.add(key)
++                if resp is None:
++                    raise BrainDeferred(
++                        503, "checkpoint_unacknowledged", "Google Drive checkpoint acknowledgment was lost",
++                        not_before=_iso_after(delay),
++                    )
+                 raise BrainDeferred(
+                     resp.status_code, *_error_fields(resp), not_before=_iso_after(delay),
+                 )
+             await self._sleep(delay)
+-        if last_response is None:
++        if not sent:
+             raise BrainError(503, "checkpoint_deadline", "Google Drive checkpoint deadline expired")
++        self._gdrive_progress_uncertain.add(key)
++        if last_response is None:
++            raise BrainError(503, "checkpoint_unacknowledged", "Google Drive checkpoint acknowledgment was lost")
+         raise BrainError(last_response.status_code, *_error_fields(last_response))
+ 
+     async def verify_gdrive_service_account(
+diff --git a/ingestion/aios_ingest/connector_state.py b/ingestion/aios_ingest/connector_state.py
+index 749c03b2..5764f602 100644
+--- a/ingestion/aios_ingest/connector_state.py
++++ b/ingestion/aios_ingest/connector_state.py
+@@ -34,6 +34,14 @@ from typing import Any
+ from .state import ROOT_STATES, RootBinding
+ 
+ ROOTS_KEY = "roots"
++# The coordinator's account-level provider hold (AIO-1167 R47 F5): ``{generation, credential,
++# not_before, category}``. Published with the coordinator's checkpoints, so a sidecar that restores
++# from the brain makes no provider call for that account before ``not_before``.
++ACCOUNT_HOLD_KEY = "account_hold"
++# Provider-named minimums for single documents (AIO-1167 R49 F1): ``{generation, credential,
++# items: [{id, not_before, category, unrepresentable}]}``. The coordinator's, published with its
++# checkpoints and restored before any provider read of a listed document.
++DOCUMENT_RESTRICTIONS_KEY = "document_restrictions"
+ WATCHES_KEY = "watches"
+ # Renewal's legacy per-stream fields. A stream record is otherwise the coordinator's alone.
+ RENEWAL_STREAM_PREFIX = "watch_"
+diff --git a/ingestion/aios_ingest/gdrive_sync.py b/ingestion/aios_ingest/gdrive_sync.py
+index 222167e7..7a42e2f1 100644
+--- a/ingestion/aios_ingest/gdrive_sync.py
++++ b/ingestion/aios_ingest/gdrive_sync.py
+@@ -8,6 +8,7 @@ state only. Notifications, manual runs and periodic polling converge here.
+ 
+ from __future__ import annotations
+ 
++import copy
+ import dataclasses
+ import hashlib
+ import json
+@@ -24,7 +25,10 @@ from pydantic import ValidationError
+ 
+ from .brain_client import BrainClient, BrainDeferred, BrainError, GdriveExecution
+ from .config import BrainSettings, Connection
+-from .connector_state import ROOTS_KEY, coordinator_document, parse_roots_section, roots_section
++from .connector_state import (
++    ACCOUNT_HOLD_KEY, DOCUMENT_RESTRICTIONS_KEY, ROOTS_KEY, coordinator_document,
++    parse_roots_section, roots_section,
++)
+ from .engine import IngestSummary
+ from .normalize import normalize
+ from .sources.gdrive import (
+@@ -143,13 +147,35 @@ class _ProviderAdmissionClosed(Exception):
+     per-stream ``provider_read`` (R45 H1). ``partial`` carries the counts the interrupted stream had
+     already completed, so the work done before the limit is still reported."""
+ 
+-    def __init__(self, not_before: str, category: str):
++    def __init__(self, not_before: str, category: str, diagnostic: str | None = None):
+         super().__init__(category)
+         self.not_before = not_before
+         self.category = category
++        self.diagnostic = diagnostic
+         self.partial: IngestSummary | None = None
+ 
+ 
++class _AcknowledgmentUncertain(Exception):
++    """A checkpoint may have committed on the brain without its acknowledgment arriving, or the
++    brain's revision is not the one this run holds (AIO-1167 R47 F3). A CONTROL signal: the run's
++    progress revision is unknown, so no further changed checkpoint is sent and the run ends partial;
++    the next acquisition restores the brain's authoritative progress, and the owed work — never
++    acknowledged here — replays idempotently. Never a document failure. ``partial`` carries the
++    counts completed before it, as ``_ProviderAdmissionClosed`` does."""
++
++    def __init__(self, code: str):
++        super().__init__(code)
++        self.code = code
++        self.partial: IngestSummary | None = None
++
++
++def _progress_uncertain(client: BrainClient, execution: GdriveExecution) -> bool:
++    """Whether the client latched this execution's revision as unknown (R47 F3). A brain double
++    without the latch has none to report."""
++    probe = getattr(client, "gdrive_progress_uncertain", None)
++    return bool(probe(execution)) if callable(probe) else False
++
++
+ # Provider deferrals caused by this run's own budget, never by Google (U5 pre-dispatch; R45 M6 late
+ # but in-time response). They stop the drain without charging the document.
+ _LOCAL_DEADLINE_CATEGORIES = frozenset({"dispatch_deadline", "run_deadline"})
+@@ -157,7 +183,161 @@ _LOCAL_DEADLINE_CATEGORIES = frozenset({"dispatch_deadline", "run_deadline"})
+ 
+ def _account_hold(exc: ProviderDeferred) -> _ProviderAdmissionClosed:
+     """The account-wide hold a provider rate limit opens (C6), from wherever it was read."""
+-    return _ProviderAdmissionClosed(exc.not_before or _defer_until(), exc.category)
++    return _ProviderAdmissionClosed(
++        exc.not_before or _defer_until(), exc.category, getattr(exc, "diagnostic", None),
++    )
++
++
++def _count_retry_after_diagnostic(summary: IngestSummary, exc: object) -> None:
++    """Report a defective provider Retry-After beside the deferral it caused (AIO-1167 R48 D2):
++    ``retry_after_malformed`` (ignored for the bounded fallback) or ``retry_after_unrepresentable``
++    (held at the last representable instant)."""
++    diagnostic = getattr(exc, "diagnostic", None)
++    if diagnostic:
++        summary.failure_categories[diagnostic] = summary.failure_categories.get(diagnostic, 0) + 1
++
++
++def _standing_account_hold(
++    state: StateStore, integration_id: str, generation: int, credential: str,
++) -> dict[str, Any] | None:
++    """The account hold in force now, as the document it is published as; ``None`` once it passed."""
++    hold = state.connection_hold(integration_id, generation, credential)
++    if hold is None or not _retry_deferred(hold[0]):
++        return None
++    return {"generation": generation, "credential": credential, "not_before": hold[0], "category": hold[1]}
++
++
++def _adopt_remote_account_hold(
++    state: StateStore, execution: GdriveExecution, integration_id: str, generation: int, credential: str,
++) -> None:
++    """Restore the hold the brain acknowledged (AIO-1167 R47 F5) — for this generation and this
++    verified account only — so a restart, or another state file, cannot forget it. Monotonic."""
++    remote = execution.progress.get(ACCOUNT_HOLD_KEY)
++    if not isinstance(remote, dict):
++        return
++    try:
++        remote_generation = int(remote.get("generation"))
++    except (TypeError, ValueError):
++        return
++    not_before = remote.get("not_before")
++    if (remote_generation != generation or str(remote.get("credential") or "") != credential
++            or not isinstance(not_before, str) or not not_before):
++        return
++    state.hold_connection(
++        integration_id, generation, credential, not_before, str(remote.get("category") or "rate_limited"),
++    )
++
++
++def _restriction_standing(not_before: str, unrepresentable: bool) -> bool:
++    """A document restriction in force now. An unrepresentable one never lapses (fail closed)."""
++    return unrepresentable or _retry_deferred(not_before)
++
++
++def _standing_document_restrictions(
++    state: StateStore, integration_id: str, generation: int, credential: str,
++) -> dict[str, tuple[str, str, bool]]:
++    """The provider-named document minimums in force for this account and generation (R49 F1)."""
++    return {
++        provider_id: held
++        for provider_id, held in state.document_restrictions(integration_id, generation, credential).items()
++        if _restriction_standing(held[0], held[2])
++    }
++
++
++def _document_restrictions_section(
++    state: StateStore, integration_id: str, generation: int, credential: str,
++) -> dict[str, Any] | None:
++    """The standing document restrictions as the checkpoint carries them, or ``None``."""
++    standing = _standing_document_restrictions(state, integration_id, generation, credential)
++    if not standing:
++        return None
++    return {
++        "generation": generation,
++        "credential": credential,
++        "items": [
++            {"id": provider_id, "not_before": not_before, "category": category,
++             "unrepresentable": unrepresentable}
++            for provider_id, (not_before, category, unrepresentable) in sorted(standing.items())
++        ],
++    }
++
++
++def _adopt_remote_document_restrictions(
++    state: StateStore, execution: GdriveExecution, integration_id: str, generation: int, credential: str,
++) -> None:
++    """Restore the document restrictions the brain acknowledged (R49 F1) — this generation and this
++    verified account only, monotonically — before any provider read, so a restart or a fresh state
++    file cannot read a restricted document early. Anything malformed is ignored, never guessed."""
++    section = execution.progress.get(DOCUMENT_RESTRICTIONS_KEY)
++    if not isinstance(section, dict):
++        return
++    try:
++        if int(section.get("generation")) != generation:
++            return
++    except (TypeError, ValueError):
++        return
++    if str(section.get("credential") or "") != credential:
++        return
++    items = section.get("items")
++    if not isinstance(items, list):
++        return
++    for item in items:
++        if not isinstance(item, dict):
++            continue
++        provider_id, not_before = item.get("id"), item.get("not_before")
++        if not isinstance(provider_id, str) or not provider_id or not isinstance(not_before, str):
++            continue
++        try:
++            datetime.fromisoformat(not_before.replace("Z", "+00:00"))
++        except ValueError:
++            continue
++        state.restrict_document(
++            integration_id, generation, credential, provider_id, not_before,
++            str(item.get("category") or "provider_unavailable"),
++            unrepresentable=item.get("unrepresentable") is True,
++        )
++
++
++async def _open_account_hold(
++    client: BrainClient,
++    execution: GdriveExecution,
++    state: StateStore,
++    integration_id: str,
++    credential: str,
++    exc: ProviderDeferred,
++    total: IngestSummary,
++) -> None:
++    """A provider wait read before any stream could carry it (AIO-1167 R47 F5): root metadata,
++    relocation re-reads, start-token capture, the service-account identity read.
++
++    Held for the ACCOUNT, durably — locally first, then published onto the acknowledged document
++    unchanged but for the hold, so no stream, root or watch the brain holds can regress. A failed
++    publication keeps the local hold and says so; it is never reported as remote-durable. Reported as
++    a held (partial) run, never a document failure or deletion evidence. A local budget stop is not
++    a provider wait and opens no hold."""
++    total.skipped += 1
++    total.failure_categories[exc.category] = total.failure_categories.get(exc.category, 0) + 1
++    _count_retry_after_diagnostic(total, exc)
++    if exc.category in _LOCAL_DEADLINE_CATEGORIES:
++        return
++    state.hold_connection(
++        integration_id, execution.generation, credential, exc.not_before or _defer_until(), exc.category,
++    )
++    document = _standing_account_hold(state, integration_id, execution.generation, credential)
++    if document is None:
++        return
++    payload = copy.deepcopy(execution.progress)
++    payload[ACCOUNT_HOLD_KEY] = document
++    try:
++        ack = await client.checkpoint_gdrive_execution(execution, payload) or {}
++    except BrainError as error:
++        if _is_terminal_authority(error):
++            raise
++        total.failure_categories["account_hold_unpublished"] = 1
++        return
++    acknowledged = dict(ack.get("progress") or payload)
++    execution.progress.clear()
++    execution.progress.update(acknowledged)
+ 
+ 
+ def provider_source_options(options: dict[str, Any]) -> dict[str, Any]:
+@@ -330,6 +510,34 @@ class RootObservation:
+     detail: str | None = None
+ 
+ 
++# The diagnostic a verified-unavailable selected root carries in the fenced root evidence (R48 D1).
++_ROOT_UNAVAILABLE_DETAIL = "selected root unavailable: the provider reports it not found; remove or reselect it"
++
++
++def _restorable_file_root(
++    state: StateStore, execution: GdriveExecution, namespace: str, generation: int,
++    work: PendingWork, meta: dict[str, Any],
++) -> str | None:
++    """The selected file root this document's ingestion would prove restored (R49 F3), or ``None``.
++
++    Only the SAME stable id as a selected file root of this generation recorded unavailable, still
++    bound (no relocation pending) to this stream's drive, whose FRESH metadata — just read under the
++    live execution gate — shows a readable, nontrashed Google Doc in that drive. The detail is
++    cleared later, and only once the content is accepted (``_push_doc``)."""
++    binding = state.root_obligations(execution.integration_id, generation).get(("file", work.item_key))
++    if binding is None or binding.status != "bound" or not (binding.detail or "").startswith(
++        "selected root unavailable"
++    ):
++        return None
++    stream = state.get_progress(namespace)
++    actual_drive = str(meta.get("driveId") or "my-drive")
++    if stream is None or actual_drive != binding.drive_id or actual_drive != stream.key.drive_id:
++        return None
++    if meta.get("trashed") or meta.get("mimeType") != GOOGLE_DOC_MIME or str(meta.get("id")) != work.item_key:
++        return None
++    return work.item_key
++
++
+ def _observe_root(
+     source: GoogleDriveSource, root_id: str, drive_id: str, seen: dict[str, RootObservation],
+ ) -> RootObservation:
+@@ -879,6 +1087,19 @@ async def run_gdrive_stream(
+                 except ServiceAccountBindingRefused as exc:
+                     return IngestSummary(conn.name, failed=1, failure_categories={exc.category: 1},
+                                          integration_id=integration_id)
++            # The account's provider hold — this run's state, or the brain's — is honoured before
++            # the first Drive call of the run, streams or not (AIO-1167 R47 F5).
++            account = credential_identity(options)
++            _adopt_remote_account_hold(state, execution, integration_id, execution.generation, account)
++            _adopt_remote_document_restrictions(
++                state, execution, integration_id, execution.generation, account,
++            )
++            standing = _standing_account_hold(state, integration_id, execution.generation, account)
++            if standing is not None:
++                return IngestSummary(
++                    conn.name, skipped=1, failure_categories={str(standing["category"]): 1},
++                    integration_id=integration_id,
++                )
+             drive, _ = source._services()
+             if auth_mode == "service_account" and options.get("service_account_status") == "pending":
+                 try:
+@@ -903,8 +1124,9 @@ async def run_gdrive_stream(
+                     return IngestSummary(conn.name, failed=1, failure_categories={exc.code: 1},
+                                          integration_id=integration_id)
+                 except ProviderDeferred as exc:
+-                    return IngestSummary(conn.name, failed=1, failure_categories={exc.category: 1},
+-                                         integration_id=integration_id)
++                    held = IngestSummary(conn.name, failure_categories={}, integration_id=integration_id)
++                    await _open_account_hold(client, execution, state, integration_id, account, exc, held)
++                    return held
+             generation = execution.generation
+             total = IngestSummary(conn.name, failure_categories={}, integration_id=integration_id)
+ 
+@@ -940,8 +1162,7 @@ async def run_gdrive_stream(
+                 total.failure_categories[exc.code] = 1
+                 return total
+             except ProviderDeferred as exc:
+-                total.failed += 1
+-                total.failure_categories[exc.category] = 1
++                await _open_account_hold(client, execution, state, integration_id, account, exc, total)
+                 return total
+             unresolved_roots = [
+                 root for root, binding in state.unsettled_roots(integration_id, generation).items()
+@@ -1005,8 +1226,7 @@ async def run_gdrive_stream(
+                         total.failure_categories[exc.code] = 1
+                         return total
+                     except ProviderDeferred as exc:
+-                        total.failed += 1
+-                        total.failure_categories[exc.category] = 1
++                        await _open_account_hold(client, execution, state, integration_id, account, exc, total)
+                         return total
+                     except StreamStartUnavailable as exc:
+                         # This drive's change log cannot be opened — a root that lives in a Shared
+@@ -1049,6 +1269,8 @@ async def run_gdrive_stream(
+             # A stream whose provider read was refused this run (R44 C5): the others still run, but
+             # no complete snapshot is submitted — its membership is not known now.
+             stream_access_failed = False
++            # A checkpoint whose acknowledgment was lost this run (R47 F3): nothing more is sent.
++            acknowledgment_uncertain = False
+             scheduled_streams = state.rotate_streams(
+                 integration_id, generation, [value for value in streams if value not in blocked],
+             )
+@@ -1078,6 +1300,11 @@ async def run_gdrive_stream(
+                     # The provider's wait governs the ACCOUNT (AIO-1167 R44 C6): every stream of it
+                     # is held until then — persisted, so a restart makes no early call — and no
+                     # further provider call is made this run. Remaining work is untouched.
++                    # Held for the account too, so the next run's root and start-token reads wait
++                    # as well, not just its drains (AIO-1167 R47 F5).
++                    state.hold_connection(
++                        integration_id, generation, account, closed.not_before, closed.category,
++                    )
+                     for held in scheduled_streams:
+                         held_ns = StreamKey(
+                             settings.team, integration_id, credential_identity(options), str(held),
+@@ -1098,6 +1325,17 @@ async def run_gdrive_stream(
+                     if closed.partial is not None:
+                         _merge_summary(total, closed.partial)  # work completed before the limit
+                     total.failure_categories[closed.category] = total.failure_categories.get(closed.category, 0) + 1
++                    _count_retry_after_diagnostic(total, closed)
++                    break
++                except _AcknowledgmentUncertain as uncertain:
++                    # The brain may hold a checkpoint this run never saw acknowledged (AIO-1167 R47
++                    # F3). No further changed checkpoint is sent under a guessed revision — that
++                    # could replace newer sibling streams, roots or watch state — and no document is
++                    # charged. The run ends partial; the next acquisition restores the authority.
++                    if uncertain.partial is not None:
++                        _merge_summary(total, uncertain.partial)
++                    total.failure_categories.setdefault("checkpoint_unacknowledged", 1)
++                    acknowledgment_uncertain = True
+                     break
+                 except Exception as exc:
+                     if not _stream_access_refusal(exc):
+@@ -1139,7 +1377,7 @@ async def run_gdrive_stream(
+             # no obligation recorded at all — and a stream whose published snapshot is not of the
+             # roots it enumerates now, are an incomplete connection: reconciling would turn what
+             # has not been verified into absence.
+-            verified = not stream_access_failed and _root_coverage_complete(
++            verified = not stream_access_failed and not acknowledgment_uncertain and _root_coverage_complete(
+                 state, integration_id, generation, options,
+             ) and not any(
+                 any(_bound_root_drift(
+@@ -1514,9 +1752,10 @@ async def _run_gdrive_stream_unlocked(
+                     root_bindings=root_bindings,
+                 )
+                 fresh_remaining = max(0, fresh_remaining - consumed)
+-            except (BrainError, _ProviderAdmissionClosed):
++            except (BrainError, _ProviderAdmissionClosed, _AcknowledgmentUncertain):
+                 # Authority errors stay run-terminal; an account rate limit raised by the baseline's
+-                # drain is the coordinator's account hold, never a baseline read failure (R45 H1).
++                # drain is the coordinator's account hold, never a baseline read failure (R45 H1);
++                # an unacknowledged checkpoint is the coordinator's to stop on (R47 F3).
+                 raise
+             except ProviderDeferred as exc:
+                 if exc.category == "rate_limited":
+@@ -1527,6 +1766,7 @@ async def _run_gdrive_stream_unlocked(
+                 )
+                 summary.failed += 1
+                 summary.failure_categories[exc.category] = summary.failure_categories.get(exc.category, 0) + 1
++                _count_retry_after_diagnostic(summary, exc)
+                 return summary
+             except Exception as exc:
+                 await _checkpoint_progress(
+@@ -1660,6 +1900,7 @@ async def _run_gdrive_stream_unlocked(
+                 )
+                 summary.failed += 1
+                 summary.failure_categories[exc.category] = 1
++                _count_retry_after_diagnostic(summary, exc)
+                 return summary
+             obligations: list[tuple[str, str, dict[str, Any]]] = []
+             membership_additions: list[tuple[str, str, str] | tuple[str, str, str, str | None]] = []
+@@ -1705,6 +1946,11 @@ async def _run_gdrive_stream_unlocked(
+                     try:
+                         observed = _observe_root(source, root_id, drive_id, root_observations)
+                     except ProviderDeferred as exc:
++                        if exc.category == "rate_limited":
++                            # The account's wait, not this stream's (R49 F2): the account-hold owner
++                            # stops every further call for it. This page is not materialized, so it
++                            # stays unresolved and nothing is removed.
++                            raise _account_hold(exc) from exc
+                         unverified.append((root_id, exc))
+                         held = True
+                         continue
+@@ -1722,6 +1968,14 @@ async def _run_gdrive_stream_unlocked(
+                         )
+                         unverified.append((root_id, None))
+                         held = True
++                    elif observed.state == "absent":
++                        # A verified absence keeps — or records — the root's loss (R49 F2); only a
++                        # root read present where it is bound is settled. Claims and absence gates
++                        # are decided below exactly as before.
++                        state.record_root_unavailable(
++                            execution.integration_id, generation, root_kind, root_id,
++                            detail=_ROOT_UNAVAILABLE_DETAIL,
++                        )
+                     else:
+                         state.settle_root(execution.integration_id, generation, root_kind, root_id)
+                 return held
+@@ -1869,6 +2123,8 @@ async def _run_gdrive_stream_unlocked(
+                 category = deferred.category if deferred else "selection_root_unverified"
+                 summary.failed += 1
+                 summary.failure_categories[category] = summary.failure_categories.get(category, 0) + 1
++                if deferred is not None:
++                    _count_retry_after_diagnostic(summary, deferred)  # R49 F2: kept on this path
+                 return summary
+             if state.projected_pending_count(
+                 namespace, generation, [item_key for item_key, _action, _payload in obligations],
+@@ -1927,13 +2183,19 @@ async def _run_gdrive_stream_unlocked(
+                 client, execution, state, namespace, generation,
+             )
+         return summary
+-    except _ProviderAdmissionClosed as closed:
+-        # Whatever this stream completed before the limit is still reported by the coordinator.
++    except (_ProviderAdmissionClosed, _AcknowledgmentUncertain) as closed:
++        # Whatever this stream completed before the stop is still reported by the coordinator.
+         closed.partial = summary
+         raise
+     except BrainError as exc:
+-        summary.failed += 1
+         summary.failure_categories[exc.code] = summary.failure_categories.get(exc.code, 0) + 1
++        if not _is_terminal_authority(exc) and _progress_uncertain(client, execution):
++            # A checkpoint of this stream's own may have committed unacknowledged (R47 F3): the
++            # revision is unknown to every stream of the run, so the coordinator stops.
++            uncertain = _AcknowledgmentUncertain(exc.code)
++            uncertain.partial = summary
++            raise uncertain from exc
++        summary.failed += 1
+         return summary
+ 
+ 
+@@ -1976,6 +2238,24 @@ async def _enumerate_baseline(
+         bound = (root_bindings or {}).get((root_kind, str(root_id)))
+         return (bound is not None and bound != drive_id) or (root_kind, str(root_id)) in leaving
+ 
++    # Bound roots whose OWN metadata the provider answered not-found under this run's authority
++    # (AIO-1167 R48 D1). Each is a resolved outcome — it supports nothing now — so its page or
++    # traversal is finished empty, without listing a folder that is gone. Only the root's own 404
++    # qualifies: a listing 404, a never-bound root, auth, quota, timeouts and transient errors
++    # remain conservative. Read again, a restored root is enumerated normally.
++    unavailable: set[str] = set()
++
++    def record_unavailable(root_kind: str, root_id: str) -> bool:
++        if not state.record_root_unavailable(
++            integration_id, generation, root_kind, root_id, detail=_ROOT_UNAVAILABLE_DETAIL,
++        ):
++            return False
++        unavailable.add(root_id)
++        summary.failure_categories["selection_root_unavailable"] = (
++            summary.failure_categories.get("selection_root_unavailable", 0) + 1
++        )
++        return True
++
+     # A folder listing scoped to this drive is empty for a folder that was moved out of it, which
+     # reads exactly like a folder that was emptied. So before a bound folder root is listed, its
+     # own metadata is read: found in another drive, it is recorded as relocating and this baseline
+@@ -1999,8 +2279,19 @@ async def _enumerate_baseline(
+                 integration_id, generation, "folder", root_id, drive_id, detail=str(observed.detail),
+             )
+             raise SelectedRootUnverified(f"selected folder {root_id} could not be verified")
++        if observed.state == "absent" and record_unavailable("folder", root_id):
++            continue
+         state.settle_root(integration_id, generation, "folder", root_id)
+ 
++    # A selected file that is itself under a standing provider minimum (R49 F1) is not read here
++    # either — a rescan or a rebuilt local state is no way around it. Its page stays unmaterialized,
++    # so this baseline cannot complete, while the other roots still enumerate.
++    stream_progress = state.get_progress(namespace)
++    restricted_roots = set(_standing_document_restrictions(
++        state, integration_id, generation, stream_progress.key.credential_id,
++    )) if stream_progress is not None else set()
++    restricted_root_seen = False
++
+     # Explicit file selections are individual one-item enumeration pages. Their metadata must be
+     # proven before membership exists; an inaccessible file leaves this baseline partial.
+     for root in (row for row in roots if row["root_kind"] == "file"):
+@@ -2008,6 +2299,12 @@ async def _enumerate_baseline(
+         page = state.get_page(namespace, generation, page_id)
+         if page and page.committed_at:
+             continue
++        if page is None and str(root["root_id"]) in restricted_roots:
++            restricted_root_seen = True
++            summary.failure_categories["provider_restricted_document"] = max(
++                summary.failure_categories.get("provider_restricted_document", 0), 1,
++            )
++            continue
+         if page is None:
+             if pages_read >= page_budget:
+                 return False, work_consumed
+@@ -2020,7 +2317,17 @@ async def _enumerate_baseline(
+                 # records nothing, and nothing is read through this stream.
+                 meta = None
+             else:
+-                meta = source._metadata(root["root_id"])
++                try:
++                    meta = source._metadata(root["root_id"])
++                except (BrainError, ProviderDeferred):
++                    raise
++                except Exception as exc:
++                    # A bound file root's own not-found is its outcome (R48 D1): this page commits
++                    # with no membership. Anything else is raised exactly as before.
++                    if (bound_drive is None or _provider_status(exc) != 404
++                            or not record_unavailable("file", str(root["root_id"]))):
++                        raise
++                    meta = None
+                 pages_read += 1
+             if meta is None:
+                 pass
+@@ -2074,7 +2381,10 @@ async def _enumerate_baseline(
+         token = str(row["page_token"] or "") or None
+         page_id = _page_id("baseline", snapshot_id, row["root_id"], row["folder_id"], token)
+         page = state.get_page(namespace, generation, page_id)
+-        if page is None and another_streams(root_kinds.get(str(row["root_id"]), ""), row["root_id"]):
++        if page is None and (
++            another_streams(root_kinds.get(str(row["root_id"]), ""), row["root_id"])
++            or str(row["root_id"]) in unavailable
++        ):
+             # A folder root that left this drive after this build was seeded. It is not listed
+             # here — the listing would be empty and prove nothing — and its traversal is closed
+             # with a page that records nothing, so the stream's other roots still finish.
+@@ -2154,7 +2464,8 @@ async def _enumerate_baseline(
+             return False, work_consumed
+ 
+     return (
+-        state.next_traversal(namespace, generation, snapshot_id=snapshot_id) is None
++        not restricted_root_seen
++        and state.next_traversal(namespace, generation, snapshot_id=snapshot_id) is None
+         and state.next_uncommitted_page(
+             namespace, generation, snapshot_id=snapshot_id,
+         ) is None
+@@ -2287,8 +2598,14 @@ async def _push_doc(
+     generation: int,
+     summary: IngestSummary,
+     work: PendingWork | None = None,
++    *,
++    restored_root: str | None = None,
+ ) -> bool:
+-    """Push one document. Returns False only when the run's deadline deferred the sink call."""
++    """Push one document. Returns False only when the run's deadline deferred the sink call.
++
++    ``restored_root`` (R49 F3): the selected file root this ingestion proves restored. Its stale
++    unavailable detail is cleared only after the brain ACCEPTED the content, so the checkpoint that
++    acknowledges the document publishes the restored root evidence under the same fence."""
+     doc.extra_frontmatter["connection_id"] = execution.integration_id
+     doc.extra_frontmatter.setdefault("scope_generation", generation)
+     work = work or next((w for w in state.list_pending(namespace, generation, limit=1000)
+@@ -2340,26 +2657,28 @@ async def _push_doc(
+     setattr(summary, result.status, getattr(summary, result.status) + 1)
+     if not work:
+         return True
++    if restored_root is not None and state.work_membership_current(work):
++        state.settle_root(execution.integration_id, generation, "file", restored_root)
+     try:
+         progress = state.get_progress(namespace)
+         await _checkpoint_progress(client, execution, state, namespace,
+                                    phase=progress.phase if progress else "working")
+         state.ack_work(work)
+-    except BrainDeferred as exc:
++    except BrainError as exc:
+         if _is_terminal_authority(exc):
+             raise
+-        # The content was ACCEPTED; only its durable acknowledgment is owed (AIO-1167 R45 M5). A
+-        # control-plane wait is not the document's failure: the obligation stays owed and
+-        # unacknowledged (its page is not retired) with the brain's not-before, and spends none of
+-        # the retry budget backoff and exhaustion are computed from. The replayed push is idempotent.
++        # The content was ACCEPTED; only its durable acknowledgment is owed (AIO-1167 R45 M5, R47 F3).
++        # Whatever stopped the checkpoint — a deferral, a 5xx, `stale_progress`, a lost response —
++        # is the control plane's, judged by STAGE, not by exception type: the obligation stays owed
++        # and unacknowledged (its page is not retired), spends none of the retry budget backoff and
++        # exhaustion are computed from, and the replayed push is idempotent.
+         summary.failure_categories[exc.code] = summary.failure_categories.get(exc.code, 0) + 1
+-        if exc.not_before is not None:
++        if isinstance(exc, BrainDeferred) and exc.not_before is not None:
+             state.fail_work(work, f"checkpoint deferred: {exc.code}", not_before=exc.not_before, failure=False)
+-        return False  # the brain is deferring: start no further work this run
+-    except BrainError as exc:
+-        if _is_terminal_authority(exc):
+-            raise
+-        return _record_sink_failure(state, work, exc, summary)
++        if _progress_uncertain(client, execution):
++            # What was sent may have committed: the revision is unknown, so the run stops here.
++            raise _AcknowledgmentUncertain(exc.code) from exc
++        return False  # nothing committed, but the brain is refusing: start no further work this run
+     return True
+ 
+ 
+@@ -2377,9 +2696,26 @@ async def _drain_pending(
+     work_class: str | None = None,
+ ) -> int:
+     consumed = 0
++    stream = state.get_progress(namespace)
++    credential = stream.key.credential_id if stream is not None else ""
++    # Documents under a standing provider minimum are not read, pushed or acknowledged until it
++    # lapses — whatever rearm, a newer observation or a rescan did to their obligation (R49 F1).
++    restricted = _standing_document_restrictions(
++        state, execution.integration_id, generation, credential,
++    )
++    owed_restricted = sum(
++        1 for provider_id in restricted if state.has_owed_work(namespace, generation, provider_id)
++    )
++    if owed_restricted:
++        # The documents this stream holds back now — one count per document, however many drain
++        # passes the stream makes in a run.
++        summary.failure_categories["provider_restricted_document"] = max(
++            summary.failure_categories.get("provider_restricted_document", 0), owed_restricted,
++        )
+     for work in state.list_pending(
+-        namespace, generation, limit=max(1, budget), work_class=work_class,
++        namespace, generation, limit=max(1, budget), work_class=work_class, restricted=restricted,
+     )[:budget]:
++        restored_root: str | None = None
+         if _run_deadline_reached(execution):
+             # Out of time is not a failure of the work that was never started: it is left exactly
+             # as it was, and no further provider or sink call is made in this drain.
+@@ -2438,6 +2774,7 @@ async def _drain_pending(
+             doc = source._raw_doc(meta)
+             if not state.work_membership_current(work):
+                 continue
++            restored_root = _restorable_file_root(state, execution, namespace, generation, work, meta)
+         except BrainError:
+             raise
+         except ProviderDeferred as exc:
+@@ -2451,9 +2788,19 @@ async def _drain_pending(
+                 # The provider's wait governs this account, not this one document (R44 C6): stop
+                 # every further call for it, and leave this obligation untouched.
+                 raise _account_hold(exc) from exc
+-            _fail_work(state, work, str(exc))
++            # The provider's named deadline is the earliest retry, never the shorter backoff (R48 D2),
++            # and it outlives this observation: recorded as the DOCUMENT's restriction (R49 F1),
++            # carried in the fenced progress. A per-document 503 is never an account hold.
++            if getattr(exc, "provider_deadline", False) and exc.not_before and credential:
++                state.restrict_document(
++                    execution.integration_id, generation, credential, work.item_key,
++                    exc.not_before, exc.category,
++                    unrepresentable=getattr(exc, "diagnostic", None) == "retry_after_unrepresentable",
++                )
++            _fail_work(state, work, str(exc), retry_after=exc.not_before)
+             summary.failed += 1
+             summary.failure_categories[exc.category] = summary.failure_categories.get(exc.category, 0) + 1
++            _count_retry_after_diagnostic(summary, exc)
+             continue
+         except ProviderCursorInvalid:
+             # Cursor validity is only meaningful for change enumeration, never an item fetch.
+@@ -2473,6 +2820,7 @@ async def _drain_pending(
+             continue
+         if not await _push_doc(
+             client, execution, doc, conn, state, namespace, generation, summary, work,
++            restored_root=restored_root,
+         ):
+             break
+     return consumed
+@@ -2779,6 +3127,18 @@ async def _checkpoint_progress(
+         execution.generation,
+         state.root_obligations(execution.integration_id, execution.generation),
+     )
++    # A standing account hold travels with every cursor checkpoint (AIO-1167 R47 F5); one that has
++    # passed is dropped.
++    hold = _standing_account_hold(
++        state, execution.integration_id, execution.generation, progress.key.credential_id,
++    )
++    if hold is not None:
++        cursor_document[ACCOUNT_HOLD_KEY] = hold
++    restrictions = _document_restrictions_section(
++        state, execution.integration_id, execution.generation, progress.key.credential_id,
++    )
++    if restrictions is not None:
++        cursor_document[DOCUMENT_RESTRICTIONS_KEY] = restrictions
+     # The coordinator owns cursors and roots, never renewal's channel lifecycle: that is carried
+     # from the acknowledged document unchanged, so a poll cannot erase a watch intent or record.
+     payload = coordinator_document(execution.progress, cursor_document)
+diff --git a/ingestion/aios_ingest/sources/gdrive.py b/ingestion/aios_ingest/sources/gdrive.py
+index d0b7f58c..696b58f7 100644
+--- a/ingestion/aios_ingest/sources/gdrive.py
++++ b/ingestion/aios_ingest/sources/gdrive.py
+@@ -9,12 +9,13 @@ from __future__ import annotations
+ 
+ import json
+ import random
++import re
+ import time
+ import types
+ from collections.abc import Mapping
+ from dataclasses import dataclass
+-from datetime import datetime, timezone
+-from email.utils import parsedate_to_datetime
++from datetime import datetime, timedelta, timezone
++from email.utils import parsedate_tz
+ from typing import Any, Callable, Iterable, Iterator
+ 
+ from ..brain_client import BrainError
+@@ -65,12 +66,75 @@ class IncompleteExtractionError(RuntimeError):
+ 
+ 
+ class ProviderDeferred(RuntimeError):
+-    """A retryable provider call cannot complete inside the current bounded run."""
++    """A retryable provider call cannot complete inside the current bounded run.
+ 
+-    def __init__(self, message: str, *, not_before: str | None = None, category: str = "provider_retry"):
++    ``diagnostic`` names a defect in the provider's Retry-After itself (AIO-1167 R48 D2):
++    ``retry_after_malformed`` (ignored; the bounded fallback was used) or
++    ``retry_after_unrepresentable`` (a valid wait past the last representable instant; held there).
++
++    ``provider_deadline`` says ``not_before`` is the PROVIDER's named minimum (a valid or
++    unrepresentable Retry-After), not this sidecar's own backoff — the only kind of deadline that
++    becomes a durable document restriction (AIO-1167 R49 F1)."""
++
++    def __init__(
++        self, message: str, *, not_before: str | None = None, category: str = "provider_retry",
++        diagnostic: str | None = None, provider_deadline: bool = False,
++    ):
+         super().__init__(message)
+         self.not_before = not_before
+         self.category = category
++        self.diagnostic = diagnostic
++        self.provider_deadline = provider_deadline
++
++
++# The last instant a durable timestamp can name (AIO-1167 R48 D2). A valid Retry-After beyond it is
++# held HERE — fail closed, never read as permission to retry early — and reported as such.
++LATEST_INSTANT = datetime.max.replace(tzinfo=timezone.utc)
++# RFC 9110 delay-seconds is 1*DIGIT; a decimal fraction is tolerated as before. No sign, exponent,
++# whitespace inside, or NaN/infinity spelling: those are malformed, not delays.
++_DELAY_SECONDS = re.compile(r"[0-9]+(?:\.[0-9]+)?")
++
++
++@dataclass(frozen=True)
++class RetryAfter:
++    """One provider Retry-After, classified (AIO-1167 R48 D2).
++
++    * ``valid`` — delay-seconds or an HTTP-date, as the absolute UTC ``deadline`` the provider
++      named. Never shortened or capped, however long: AC-04 honours valid Retry-After.
++    * ``malformed`` — not a delay and not a date: text, a sign or exponent, NaN/infinity, an
++      impossible calendar date. It names no deadline, so the existing bounded fallback applies.
++    * ``unrepresentable`` — syntactically valid, but later than any timestamp can name. Fail
++      closed: held at ``LATEST_INSTANT``, never retried early.
++    """
++
++    kind: str
++    deadline: datetime | None = None
++
++
++def parse_retry_after(value: object, now: datetime) -> RetryAfter:
++    """Classify one Retry-After value against ``now`` (UTC)."""
++    text = str(value).strip()
++    if _DELAY_SECONDS.fullmatch(text):
++        try:
++            seconds: float | int = float(text) if "." in text else int(text)
++            return RetryAfter("valid", now + timedelta(seconds=seconds))
++        except (OverflowError, ValueError):
++            # Only digits — a real delay — but too long for timedelta or for a datetime.
++            return RetryAfter("unrepresentable")
++    parsed = parsedate_tz(text)
++    if parsed is None:
++        return RetryAfter("malformed")
++    if parsed[0] > LATEST_INSTANT.year:
++        return RetryAfter("unrepresentable")
++    try:
++        named = datetime(*parsed[:6], tzinfo=timezone(timedelta(seconds=parsed[9] or 0)))
++    except (OverflowError, ValueError):
++        # A date-shaped value naming no real instant (31 February, hour 25, a bad offset).
++        return RetryAfter("malformed")
++    try:
++        return RetryAfter("valid", named.astimezone(timezone.utc))
++    except OverflowError:
++        return RetryAfter("unrepresentable")
+ 
+ 
+ class ProviderCursorInvalid(RuntimeError):
+@@ -500,7 +564,8 @@ class GoogleDriveSource(PullOnlySource, Source):
+         return cls._status(exc) == 403 and cls._error_reasons(exc) == {"insufficientFilePermissions"}
+ 
+     @staticmethod
+-    def _retry_after(exc: Exception) -> float | None:
++    def _retry_after_header(exc: Exception) -> object | None:
++        """The raw Retry-After header of a provider error, or ``None``."""
+         response = getattr(exc, "resp", None) or getattr(exc, "response", None)
+         headers = getattr(response, "headers", None)
+         if not isinstance(headers, Mapping) and isinstance(response, Mapping):
+@@ -508,22 +573,23 @@ class GoogleDriveSource(PullOnlySource, Source):
+             headers = response
+         if not isinstance(headers, Mapping):
+             return None
+-        value = next(
++        return next(
+             (candidate for key, candidate in headers.items() if str(key).lower() == "retry-after"),
+             None,
+         )
++
++    @classmethod
++    def _retry_after(cls, exc: Exception) -> float | None:
++        """Seconds until a VALID Retry-After deadline; ``None`` when absent, malformed or
++        unrepresentable (see ``parse_retry_after`` for how each is handled)."""
++        value = cls._retry_after_header(exc)
+         if value is None:
+             return None
+-        try:
+-            return max(0.0, float(value))
+-        except (TypeError, ValueError):
+-            try:
+-                parsed = parsedate_to_datetime(str(value))
+-                if parsed.tzinfo is None:
+-                    parsed = parsed.replace(tzinfo=timezone.utc)
+-                return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
+-            except (TypeError, ValueError, OverflowError):
+-                return None
++        now = datetime.now(timezone.utc)
++        retry = parse_retry_after(value, now)
++        if retry.kind != "valid" or retry.deadline is None:
++            return None
++        return max(0.0, (retry.deadline - now).total_seconds())
+ 
+     # Drive's documented quota/rate-limit reasons. Drive often sends these as 403, not 429; they say
+     # nothing about access to the file or drive, so they are retried with backoff (honoring
+@@ -660,19 +726,39 @@ class GoogleDriveSource(PullOnlySource, Source):
+                 if not self._retryable(exc):
+                     raise
+                 remaining = deadline - time.monotonic()
+-                delay = self._retry_after(exc)
+-                if delay is None:
++                category = "rate_limited" if self._rate_limited(exc) else (
++                    "provider_timeout" if status is None else "provider_unavailable"
++                )
++                now = datetime.now(timezone.utc)
++                header = self._retry_after_header(exc)
++                retry = parse_retry_after(header, now) if header is not None else None
++                diagnostic = None
++                if retry is not None and retry.kind == "unrepresentable":
++                    # A real wait no timestamp can hold (AIO-1167 R48 D2): fail closed at the last
++                    # representable instant — never a crash, never an early retry.
++                    raise ProviderDeferred(
++                        f"Google provider retry deferred after {type(exc).__name__}: its Retry-After "
++                        f"is later than {LATEST_INSTANT.isoformat()}, so it is held there",
++                        not_before=LATEST_INSTANT.isoformat(), category=category,
++                        diagnostic="retry_after_unrepresentable", provider_deadline=True,
++                    ) from exc
++                provider_deadline = False
++                if retry is not None and retry.kind == "valid" and retry.deadline is not None:
++                    # The provider's own deadline, exactly — however long (AC-04).
++                    resume_at = max(retry.deadline, now)
++                    delay = (resume_at - now).total_seconds()
++                    provider_deadline = True
++                else:
++                    if retry is not None:
++                        diagnostic = "retry_after_malformed"
+                     delay = min(0.25 * (2**attempt), 4.0) + random.uniform(0, 0.1)
++                    resume_at = now + timedelta(seconds=delay)
+                 if attempt + 1 >= self._provider_retry_attempts or delay >= remaining:
+-                    not_before = datetime.fromtimestamp(
+-                        datetime.now(timezone.utc).timestamp() + max(0.0, delay), timezone.utc
+-                    ).isoformat()
+-                    category = "rate_limited" if self._rate_limited(exc) else (
+-                        "provider_timeout" if status is None else "provider_unavailable"
+-                    )
++                    reason = " (its Retry-After was malformed and ignored)" if diagnostic else ""
+                     raise ProviderDeferred(
+-                        f"Google provider retry deferred after {type(exc).__name__}",
+-                        not_before=not_before, category=category,
++                        f"Google provider retry deferred after {type(exc).__name__}{reason}",
++                        not_before=resume_at.isoformat(), category=category, diagnostic=diagnostic,
++                        provider_deadline=provider_deadline,
+                     ) from exc
+                 time.sleep(delay)
+         raise ProviderDeferred("Google provider retry budget exhausted")  # pragma: no cover
+diff --git a/ingestion/aios_ingest/state.py b/ingestion/aios_ingest/state.py
+index ae265109..35a9d7c7 100644
+--- a/ingestion/aios_ingest/state.py
++++ b/ingestion/aios_ingest/state.py
+@@ -20,7 +20,7 @@ import secrets
+ from contextlib import closing
+ from dataclasses import dataclass
+ from datetime import datetime, timezone
+-from typing import Any
++from typing import Any, Iterable
+ 
+ _SCHEMA = """
+ CREATE TABLE IF NOT EXISTS cursors (
+@@ -232,6 +232,26 @@ CREATE TABLE IF NOT EXISTS removal_barriers (
+   raised_at TEXT NOT NULL DEFAULT (datetime('now')),
+   PRIMARY KEY (namespace, generation, item_key, observation_revision, peer_drive_id)
+ );
++CREATE TABLE IF NOT EXISTS connection_holds (
++  connection_id TEXT NOT NULL,
++  generation INTEGER NOT NULL,
++  credential_id TEXT NOT NULL,
++  not_before TEXT NOT NULL,
++  category TEXT NOT NULL,
++  updated_at TEXT NOT NULL,
++  PRIMARY KEY (connection_id, generation, credential_id)
++);
++CREATE TABLE IF NOT EXISTS document_restrictions (
++  connection_id TEXT NOT NULL,
++  generation INTEGER NOT NULL,
++  credential_id TEXT NOT NULL,
++  provider_id TEXT NOT NULL,
++  not_before TEXT NOT NULL,
++  category TEXT NOT NULL,
++  unrepresentable INTEGER NOT NULL DEFAULT 0,
++  updated_at TEXT NOT NULL,
++  PRIMARY KEY (connection_id, generation, credential_id, provider_id)
++);
+ """
+ 
+ 
+@@ -1067,14 +1087,35 @@ class StateStore:
+         self._db.commit()
+ 
+     def settle_root(self, connection_id: str, generation: int, root_kind: str, root_id: str) -> None:
+-        """A root read where it is bound is no longer uncertain. A relocation is never settled here."""
++        """A root read where it is bound is no longer uncertain — nor unavailable (R48 D1): read
++        again, it is restored. A relocation is never settled here."""
+         self._db.execute(
+             "UPDATE selection_root_bindings SET status='bound',detail=NULL WHERE connection_id=? "
+-            "AND generation=? AND root_kind=? AND root_id=? AND status='uncertain'",
++            "AND generation=? AND root_kind=? AND root_id=? "
++            "AND (status='uncertain' OR (status='bound' AND detail IS NOT NULL))",
+             (connection_id, generation, root_kind, root_id),
+         )
+         self._db.commit()
+ 
++    def record_root_unavailable(
++        self, connection_id: str, generation: int, root_kind: str, root_id: str, *, detail: str,
++    ) -> bool:
++        """Record a previously BOUND root's own verified not-found (AIO-1167 R48 D1).
++
++        The root stays bound to its drive — its location was known and its outcome is now known:
++        it supports nothing — with the diagnostic as its detail, which travels with the fenced
++        root evidence. Only a bound (or uncertain) root qualifies: a never-bound root stays
++        unresolved and a relocating one stays relocating; neither is evidence of loss. Returns
++        whether the root was recorded."""
++        cur = self._db.execute(
++            "UPDATE selection_root_bindings SET status='bound',detail=? WHERE connection_id=? "
++            "AND generation=? AND root_kind=? AND root_id=? AND status IN ('bound','uncertain') "
++            "AND drive_id IS NOT NULL AND drive_id<>''",
++            (detail, connection_id, generation, root_kind, root_id),
++        )
++        self._db.commit()
++        return cur.rowcount == 1
++
+     def rebind_root(
+         self, connection_id: str, generation: int, root_kind: str, root_id: str, destination: str,
+     ) -> bool:
+@@ -1192,6 +1233,91 @@ class StateStore:
+         self._db.commit()
+         return rotated
+ 
++    def hold_connection(
++        self, connection_id: str, generation: int, credential_id: str, not_before: str, category: str,
++    ) -> tuple[str, str]:
++        """Record a provider hold on one verified account of one connection (AIO-1167 R47 F5).
++
++        Independent of streams: a rate limit read while binding roots or capturing start tokens is
++        held before any stream exists. Monotonic — a later, shorter wait never shortens a standing
++        one — and returns the hold now in force."""
++        row = self._db.execute(
++            "SELECT not_before, category FROM connection_holds "
++            "WHERE connection_id=? AND generation=? AND credential_id=?",
++            (connection_id, generation, credential_id),
++        ).fetchone()
++        if row is not None and _instant(row["not_before"]) >= _instant(not_before):
++            return str(row["not_before"]), str(row["category"])
++        self._db.execute(
++            "INSERT INTO connection_holds(connection_id,generation,credential_id,not_before,category,updated_at) "
++            "VALUES(?,?,?,?,?,?) ON CONFLICT(connection_id,generation,credential_id) DO UPDATE SET "
++            "not_before=excluded.not_before,category=excluded.category,updated_at=excluded.updated_at",
++            (connection_id, generation, credential_id, not_before, category, _now_iso()),
++        )
++        self._db.commit()
++        return not_before, category
++
++    def connection_hold(
++        self, connection_id: str, generation: int, credential_id: str,
++    ) -> tuple[str, str] | None:
++        """The recorded hold ``(not_before, category)`` for this account, expired or not."""
++        row = self._db.execute(
++            "SELECT not_before, category FROM connection_holds "
++            "WHERE connection_id=? AND generation=? AND credential_id=?",
++            (connection_id, generation, credential_id),
++        ).fetchone()
++        return (str(row["not_before"]), str(row["category"])) if row is not None else None
++
++    def restrict_document(
++        self, connection_id: str, generation: int, credential_id: str, provider_id: str,
++        not_before: str, category: str, *, unrepresentable: bool = False,
++    ) -> tuple[str, str, bool]:
++        """Record a provider-named minimum for ONE document (AIO-1167 R49 F1).
++
++        The provider restriction is the document's, not one observation's: it is keyed by the
++        verified connection/account, generation and stable provider id, and neither attempts,
++        exhaustion, rearm, a newer observation nor a rescan touches it. Monotonic — a later, shorter
++        minimum never shortens a standing one — and an unrepresentable restriction stays
++        unrepresentable: it is fail-closed, never an ordinary instant that expires. Returns the
++        restriction now in force."""
++        row = self._db.execute(
++            "SELECT not_before, category, unrepresentable FROM document_restrictions "
++            "WHERE connection_id=? AND generation=? AND credential_id=? AND provider_id=?",
++            (connection_id, generation, credential_id, provider_id),
++        ).fetchone()
++        if row is not None:
++            held_unrepresentable = bool(row["unrepresentable"])
++            if held_unrepresentable or (
++                not unrepresentable and _instant(row["not_before"]) >= _instant(not_before)
++            ):
++                return str(row["not_before"]), str(row["category"]), held_unrepresentable
++        self._db.execute(
++            "INSERT INTO document_restrictions(connection_id,generation,credential_id,provider_id,"
++            "not_before,category,unrepresentable,updated_at) VALUES(?,?,?,?,?,?,?,?) "
++            "ON CONFLICT(connection_id,generation,credential_id,provider_id) DO UPDATE SET "
++            "not_before=excluded.not_before,category=excluded.category,"
++            "unrepresentable=excluded.unrepresentable,updated_at=excluded.updated_at",
++            (connection_id, generation, credential_id, provider_id, not_before, category,
++             1 if unrepresentable else 0, _now_iso()),
++        )
++        self._db.commit()
++        return not_before, category, bool(unrepresentable)
++
++    def document_restrictions(
++        self, connection_id: str, generation: int, credential_id: str,
++    ) -> dict[str, tuple[str, str, bool]]:
++        """Every recorded document restriction of this account and generation, expired or not:
++        ``provider_id -> (not_before, category, unrepresentable)``."""
++        rows = self._db.execute(
++            "SELECT provider_id, not_before, category, unrepresentable FROM document_restrictions "
++            "WHERE connection_id=? AND generation=? AND credential_id=? ORDER BY provider_id",
++            (connection_id, generation, credential_id),
++        ).fetchall()
++        return {
++            str(r["provider_id"]): (str(r["not_before"]), str(r["category"]), bool(r["unrepresentable"]))
++            for r in rows
++        }
++
+     def update_progress(self, namespace: str, **changes: Any) -> None:
+         allowed = {
+             "phase", "page_token", "baseline_start_token", "traversal_token", "listing_complete",
+@@ -1299,8 +1425,11 @@ class StateStore:
+ 
+     def list_pending(
+         self, namespace: str, generation: int, *, limit: int = 100,
+-        work_class: str | None = None,
++        work_class: str | None = None, restricted: Iterable[str] = (),
+     ) -> list[PendingWork]:
++        """Owed work eligible now. ``restricted`` names documents under a standing provider
++        restriction (R49 F1): they are not selected, so they spend no slot of the batch and
++        independent documents keep progressing."""
+         if work_class not in {None, "fresh", "retry"}:
+             raise ValueError("work_class must be fresh, retry, or None")
+         class_clause = (
+@@ -1312,8 +1441,9 @@ class StateStore:
+             "SELECT * FROM pending_work WHERE namespace=? AND generation=? "
+             "AND acknowledged_at IS NULL AND superseded_at IS NULL AND exhausted_at IS NULL "
+             "AND (not_before IS NULL OR not_before<=?) " + class_clause + " "
++            "AND item_key NOT IN (SELECT value FROM json_each(?)) "
+             "ORDER BY attempts ASC,created_at,item_key LIMIT ?",
+-            (namespace, generation, _now_iso(), max(1, limit)),
++            (namespace, generation, _now_iso(), json.dumps(sorted(set(restricted))), max(1, limit)),
+         ).fetchall()
+         return [PendingWork(r["namespace"], r["generation"], r["item_key"], r["action"],
+                             r["observation_revision"], json.loads(r["payload"]),
+@@ -1473,6 +1603,14 @@ class StateStore:
+         ).fetchone()
+         return int(row["failures"]) if row else 0
+ 
++    def has_owed_work(self, namespace: str, generation: int, item_key: str) -> bool:
++        """Whether this stream still owes an outcome for ``item_key`` (acknowledged/superseded: no)."""
++        return self._db.execute(
++            "SELECT 1 FROM pending_work WHERE namespace=? AND generation=? AND item_key=? "
++            "AND acknowledged_at IS NULL AND superseded_at IS NULL LIMIT 1",
++            (namespace, generation, item_key),
++        ).fetchone() is not None
++
+     def exhausted_count(self, namespace: str, generation: int) -> int:
+         """Owed obligations whose automatic retries ran out (AIO-1167 R44 C7)."""
+         return int(self._db.execute(
+@@ -1483,9 +1621,11 @@ class StateStore:
+ 
+     def rearm_exhausted(self, namespace: str, generation: int) -> int:
+         """An explicit Admin run: exhausted obligations become retryable again, from attempt zero.
+-        Their evidence (last error) is kept until the next attempt replaces it."""
++        Their evidence (last error) is kept until the next attempt replaces it. Rearm owns the
++        attempt budget only: the obligation's ``not_before`` — which holds any provider-named
++        minimum — is kept (R49 F1), and document restrictions are never touched here."""
+         cur = self._db.execute(
+-            "UPDATE pending_work SET exhausted_at=NULL,attempts=0,failures=0,not_before=NULL,updated_at=datetime('now') "
++            "UPDATE pending_work SET exhausted_at=NULL,attempts=0,failures=0,updated_at=datetime('now') "
+             "WHERE namespace=? AND generation=? AND acknowledged_at IS NULL AND superseded_at IS NULL "
+             "AND exhausted_at IS NOT NULL",
+             (namespace, generation),
+@@ -2342,6 +2482,15 @@ def _now_iso() -> str:
+     return datetime.now(timezone.utc).isoformat()
+ 
+ 
++def _instant(value: object) -> datetime:
++    """An ISO instant for ordering; an unparseable value sorts first, so it never outranks a real one."""
++    try:
++        at = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
++    except ValueError:
++        return datetime.min.replace(tzinfo=timezone.utc)
++    return at if at.tzinfo is not None else at.replace(tzinfo=timezone.utc)
++
++
+ def _unexpired(value: object, *, now: datetime | None = None) -> bool:
+     """True only for a parseable expiration strictly in the future; anything else is expired."""
+     if not isinstance(value, str) or not value:
+diff --git a/ingestion/tests/test_gdrive_poll_reporting.py b/ingestion/tests/test_gdrive_poll_reporting.py
+index e504a4e3..e828c449 100644
+--- a/ingestion/tests/test_gdrive_poll_reporting.py
++++ b/ingestion/tests/test_gdrive_poll_reporting.py
+@@ -338,7 +338,13 @@ async def test_a_service_account_identity_failure_after_resolution_is_reported_a
+     [report] = b.reports()
+     assert report["integrationId"] == INTEGRATION
+     assert report["error"] == category
+-    assert report["failed"] == 1 and report["authoritativeComplete"] is False
++    assert report["authoritativeComplete"] is False
++    if case == "provider_deferred":
++        # A provider wait, not a failure (AIO-1167 R47 F5): the run is held — partial — and the
++        # account hold is recorded before any stream exists.
++        assert report["failed"] == 0 and report["skipped"] == 1 and report["status"] == "partial"
++    else:
++        assert report["failed"] == 1
+     verified = [body for method, path, body in b.requests
+                 if path == "/api/v1/integrations/gdrive/execution"
+                 and (body or {}).get("action") == "verify_service_account"]
+diff --git a/ingestion/tests/test_gdrive_upgrade.py b/ingestion/tests/test_gdrive_upgrade.py
+index 595d4eec..39348257 100644
+--- a/ingestion/tests/test_gdrive_upgrade.py
++++ b/ingestion/tests/test_gdrive_upgrade.py
+@@ -5380,6 +5380,9 @@ class _DriveWorld:
+         self.malformed, self.checkpoint_faults, self.ledger = set(), [], None
+         # Failures to raise, once each, from the next reconciliations that name removals.
+         self.removal_faults = []
++        # Whether listing a folder that no longer exists answers 404, as Google may (R48 D1),
++        # instead of an empty page.
++        self.missing_folder_listing_404 = False
+ 
+     def put(self, file_id, *, drive, parent=None, folder=False):
+         self.files[file_id] = {
+@@ -5442,6 +5445,8 @@ class _DriveWorld:
+ 
+                 def listing():
+                     world.calls.append(("list", drive_id, folder_id))
++                    if world.missing_folder_listing_404 and folder_id not in world.files:
++                        raise _ProviderHttpError(404)
+                     found = {"files": [
+                         dict(meta) for meta in world.files.values()
+                         if folder_id in meta["parents"] and meta.get("driveId", "my-drive") == drive_id
+diff --git a/lib/identity/member-identities.ts b/lib/identity/member-identities.ts
+index 8c554df3..1eba0538 100644
+--- a/lib/identity/member-identities.ts
++++ b/lib/identity/member-identities.ts
+@@ -32,6 +32,8 @@ export interface SetIdentityResult {
+   memberId: string;
+   mappingRevision?: number;
+   note?: string;
++  /** `respectTombstone` only: the identity was deliberately unlinked, so nothing was written. */
++  tombstoned?: boolean;
+ }
+ 
+ export async function advanceIdentityMappingState(input: {
+@@ -69,15 +71,41 @@ export async function advanceIdentityMappingState(input: {
+   return revision;
+ }
+ 
++/**
++ * The canonical spelling of an identity id for WRITING a link (AIO-1167 R47 F8). Only the email
++ * namespace has one: `author-email:<address>` is case-insensitive, so its address is trimmed and
++ * lowercased — the spelling the OAuth publisher and the sidecar already produce. Opaque provider ids
++ * (`subject:`, `permission:`, and every non-Drive provider's ids) are case-sensitive and keep their
++ * exact bytes. Unlink deliberately does NOT canonicalize: it removes an existing row by its stored
++ * spelling, so a legacy differently-spelled row can still be removed explicitly.
++ */
++export function canonicalIdentityId(provider: string, externalId: string): string {
++  const id = externalId.trim();
++  const match = /^author-email:(.*)$/i.exec(id);
++  if (provider.trim().toLowerCase() !== "gdrive" || !match) return id;
++  return `author-email:${match[1].trim().toLowerCase()}`;
++}
++
+ export async function setMemberIdentity(
+   admin: DbClient,
+   teamId: string,
+   memberId: string,
+   input: SetIdentityInput,
+-  opts: { force?: boolean; expectedRevision?: number; actor?: IdentityActor } = {}
++  opts: {
++    force?: boolean;
++    expectedRevision?: number;
++    actor?: IdentityActor;
++    /**
++     * AUTOMATIC publication (AIO-1167 R47 F1): a deliberate unlink tombstone stands. An identity
++     * whose mapping state is `unlinked` is left exactly as it is — no row, no state, no repair, no
++     * epoch — and reported `tombstoned`. Explicit Admin links never pass this, so a revision-fenced
++     * manual relink of a tombstone stays available.
++     */
++    respectTombstone?: boolean;
++  } = {}
+ ): Promise<SetIdentityResult> {
+   const provider = input.provider.trim().toLowerCase();
+-  const externalId = input.externalId.trim();
++  const externalId = canonicalIdentityId(provider, input.externalId);
+   if (!provider || !externalId) throw new Error("provider and externalId are required");
+   if (provider === "gdrive" && !/^(subject|permission|author-email):[^\s:][^\s]*$/i.test(externalId)) {
+     throw new Error("Google Drive identity must use a verified subject:, permission:, or author-email: key");
+@@ -108,8 +136,8 @@ export async function setMemberIdentity(
+       [teamId, provider, externalId],
+     );
+     const ex = rows[0];
+-    const { rows: mappingRows } = await runSql<{ revision: string | number }>(
+-      `select revision from member_identity_mapping_state
++    const { rows: mappingRows } = await runSql<{ revision: string | number; state: string }>(
++      `select revision,state from member_identity_mapping_state
+         where team_id=$1 and provider=$2 and external_id=$3 for update`,
+       [teamId, provider, externalId],
+     );
+@@ -117,6 +145,25 @@ export async function setMemberIdentity(
+     if (opts.expectedRevision !== undefined && opts.expectedRevision !== currentRevision) {
+       throw new Error("identity mapping changed concurrently; refresh and retry");
+     }
++    if (opts.respectTombstone && mappingRows[0]?.state === "unlinked") {
++      res.tombstoned = true;
++      res.mappingRevision = currentRevision;
++      return res;
++    }
++    if (!ex && provider === "gdrive" && externalId.startsWith("author-email:")) {
++      // The same address in another spelling is the same person-key: never merged or overwritten
++      // here — the Admin unlinks the differently spelled row explicitly, then links (R47 F8).
++      const { rows: spelled } = await runSql<{ external_id: string }>(
++        `select external_id from member_identities
++          where team_id=$1 and provider=$2 and lower(external_id)=$3 and external_id<>$3 limit 1`,
++        [teamId, provider, externalId],
++      );
++      if (spelled[0]) {
++        throw new Error(
++          `a differently spelled Google identity (${spelled[0].external_id}) already exists; unlink it first, then link ${externalId}`,
++        );
++      }
++    }
+     let mappingChanged = false;
+     if (!ex) {
+       await runSql(
+diff --git a/lib/integrations/gdrive-authority.ts b/lib/integrations/gdrive-authority.ts
+index 8dbf6c8d..7ab4a908 100644
+--- a/lib/integrations/gdrive-authority.ts
++++ b/lib/integrations/gdrive-authority.ts
+@@ -16,7 +16,7 @@ import { decryptSecret } from "@/lib/secrets/crypto";
+ import { validateIntegrationConfig } from "@/lib/api/schemas";
+ import { selectedRootCoverage } from "@/lib/integrations/gdrive-root-coverage";
+ import { mergeLockedGdriveCredentialFields, unverifiedOauthRoots } from "@/lib/integrations/gdrive-credential-fields";
+-import { evaluateGdriveGrant, storedGrantCeiling } from "@/lib/integrations/gdrive-grant-policy";
++import { evaluateGdriveGrant, storedGrantCeiling, type GdriveGrantMode } from "@/lib/integrations/gdrive-grant-policy";
+ 
+ const LEASE_SECONDS = 10 * 60;
+ const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
+@@ -268,7 +268,15 @@ export interface GdriveAdminTestAuthority {
+   generation: number;
+   credentialRevision: number;
+   config: Record<string, unknown>;
+-  credential: { clientId: string; clientSecret: string; refreshToken: string };
++  credential: {
++    clientId: string;
++    clientSecret: string;
++    refreshToken: string;
++    /** The stored grant ceiling every Admin refresh is held to — the broker's, decided the same way. */
++    ceiling: GdriveGrantMode;
++    /** The grant recorded with the credential: the fallback when Google omits `scope`. */
++    recordedScopes: unknown;
++  };
+ }
+ 
+ /** A connection as an OAuth publication reads it: under its row locks, credential still encrypted. */
+@@ -351,6 +359,12 @@ export async function acquireGdriveAdminTestAuthority(input: {
+     if (!secret.client_id || !secret.client_secret || !secret.refresh_token) {
+       throw new GdriveAuthorityError("reconnect_required", "Google Drive OAuth reconnection is required", 409);
+     }
++    // The same ceiling the broker holds execution to (AIO-1167 R47 F6), decided before any provider
++    // call: an Admin preview must never report healthy what execution will refuse.
++    const ceiling = storedGrantCeiling(secret.grant_mode, secret.scopes);
++    if (!ceiling) {
++      throw new GdriveAuthorityError("reconnect_required", "Google Drive credential has no verifiable approved access; reconnect", 409);
++    }
+     return {
+       integrationId: row.integration_id,
+       teamId: input.teamId,
+@@ -362,6 +376,8 @@ export async function acquireGdriveAdminTestAuthority(input: {
+         clientId: secret.client_id,
+         clientSecret: secret.client_secret,
+         refreshToken: secret.refresh_token,
++        ceiling,
++        recordedScopes: secret.scopes,
+       },
+     };
+   });
+@@ -377,6 +393,48 @@ export async function authorizeGdriveAdminTestCall(
+   });
+ }
+ 
++/**
++ * The one Admin test/preview refresh (AIO-1167 R47 F6): the connection test, Picker verification and
++ * manual-root verification all get their short-lived token here, held to the SAME grant policy as
++ * the connector broker — the stored ceiling, and the broker's fallback when Google omits `scope`.
++ * The Admin snapshot is rechecked on both sides of the network call, so a pause, credential change
++ * or role loss during the refresh refuses before any Drive read. The token stays server-side.
++ */
++export async function refreshGdriveAdminAccess(
++  authority: GdriveAdminTestAuthority,
++): Promise<{ accessToken: string; scopes: string[] }> {
++  await authorizeGdriveAdminTestCall(authority);
++  let response: Response;
++  try {
++    response = await fetch(GOOGLE_TOKEN_URL, {
++      method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
++      body: new URLSearchParams({
++        client_id: authority.credential.clientId, client_secret: authority.credential.clientSecret,
++        refresh_token: authority.credential.refreshToken, grant_type: "refresh_token",
++      }),
++      cache: "no-store", signal: AbortSignal.timeout(15_000),
++    });
++  } catch {
++    throw new GdriveAuthorityError("provider_unavailable", "Google Drive is temporarily unavailable", 503);
++  }
++  const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
++  await authorizeGdriveAdminTestCall(authority);
++  if (!response.ok || typeof payload.access_token !== "string") {
++    const revoked = response.status === 400 || response.status === 401;
++    throw new GdriveAuthorityError(
++      revoked ? "reconnect_required" : "provider_unavailable",
++      revoked ? "Google authorization was revoked; reconnect this account" : "Google Drive is temporarily unavailable",
++      revoked ? 409 : 503,
++    );
++  }
++  const configured = Array.isArray(authority.config.scopeSet) ? authority.config.scopeSet.map(String) : [];
++  const granted = refreshedGrantScopes(payload, authority.credential.recordedScopes, configured);
++  if (!evaluateGdriveGrant(authority.credential.ceiling, granted).ok) {
++    throw new GdriveAuthorityError("reconnect_required", "Google Drive credential no longer matches its approved access; reconnect", 409);
++  }
++  return { accessToken: payload.access_token, scopes: granted };
++}
++
+ /** Atomically publish a Picker-verified selection against the exact Admin/config credential
+  * snapshot used for provider verification. The integration trigger advances generation/fence when
+  * the effective selection changes, so an older connector cannot race the newly approved scope. */
+@@ -929,6 +987,16 @@ export async function releaseGdriveExecution(auth: ApiAuth, ref: GdriveExecution
+   });
+ }
+ 
++/**
++ * The grant a refresh reports: Google's `scope` when present, else the grant recorded with the
++ * credential, else the connection's configured scope set. One rule for the broker and the Admin
++ * refresh, so the two cannot judge the same response differently.
++ */
++function refreshedGrantScopes(payload: Record<string, unknown>, recorded: unknown, configured: string[]): string[] {
++  if (typeof payload.scope === "string") return payload.scope.split(/\s+/).filter(Boolean);
++  return Array.isArray(recorded) ? recorded.map(String) : configured;
++}
++
+ interface StoredOAuthSecret {
+   client_id?: string;
+   client_secret?: string;
+@@ -1010,9 +1078,7 @@ export async function brokerGoogleAccessToken(auth: ApiAuth, ref: GdriveExecutio
+     });
+     throw new GdriveAuthorityError(revoked ? "reconnect_required" : "provider_unavailable", revoked ? "Google Drive connection requires reconnection" : "Google credential refresh is temporarily unavailable", revoked ? 409 : 503);
+   }
+-  const granted = typeof payload.scope === "string"
+-    ? payload.scope.split(/\s+/).filter(Boolean)
+-    : (Array.isArray(credential.scopes) ? credential.scopes.map(String) : credential.configuredScopes);
++  const granted = refreshedGrantScopes(payload, credential.scopes, credential.configuredScopes);
+   // The consent mode recorded with the credential is a ceiling on EVERY grant, not just the first
+   // (AIO-1167 R43 F3). A refresh reporting authority outside it is refused and the token withheld —
+   // never released with the unexpected scope filtered out of the list, which would hide it.
+diff --git a/lib/integrations/gdrive-oauth.ts b/lib/integrations/gdrive-oauth.ts
+index ff3a67b4..881d2047 100644
+--- a/lib/integrations/gdrive-oauth.ts
++++ b/lib/integrations/gdrive-oauth.ts
+@@ -208,14 +208,20 @@ export async function publishGoogleDriveOAuthCredential(
+     });
+     await setIntegrationSecret(db, auth, id, secret);
+     if (verifiedMemberId && verifiedEmail) {
++      // Credential authority is not attribution intent (AIO-1167 R47 F1): connecting or reconnecting
++      // proves the Admin may use this Google account, not that a deliberate unlink should be undone.
++      // Each namespaced identity is checked on its own — a tombstoned one stays unlinked (and the
++      // account stays visibly unresolved for it); an explicit Admin → Members relink remains the way
++      // to restore it. A different existing owner is still a conflict, never treated as unlinked.
++      const automatic = { actor: { kind: "member" as const, memberId: input.memberId }, respectTombstone: true };
+       const subjectIdentity = await setMemberIdentity(db, input.teamId, verifiedMemberId, {
+         provider: "gdrive", externalId: subject, email: verifiedEmail,
+         handle: input.name ?? verifiedEmail,
+-      }, { actor: { kind: "member", memberId: input.memberId } });
++      }, automatic);
+       const emailIdentity = await setMemberIdentity(db, input.teamId, verifiedMemberId, {
+         provider: "gdrive", externalId: `author-email:${verifiedEmail}`,
+         email: verifiedEmail, handle: input.name ?? verifiedEmail,
+-      }, { actor: { kind: "member", memberId: input.memberId } });
++      }, automatic);
+       if (subjectIdentity.conflict || emailIdentity.conflict) {
+         throw new GoogleIdentityConflictError("verified Google identity conflicts with an existing manual mapping");
+       }
+diff --git a/test/datamechanics/gdrive-admin-credential-race.datamechanics.test.ts b/test/datamechanics/gdrive-admin-credential-race.datamechanics.test.ts
+index d3251053..25bb7f63 100644
+--- a/test/datamechanics/gdrive-admin-credential-race.datamechanics.test.ts
++++ b/test/datamechanics/gdrive-admin-credential-race.datamechanics.test.ts
+@@ -53,7 +53,7 @@ vi.mock("@/lib/integrations/manage", async (importOriginal) => {
+ 
+ const { saveIntegration, saveGoogleDrivePickerSelection } = await import("@/app/t/[team]/admin/integrations/actions");
+ 
+-const OLD = { subject: "subject:acct-old", email: "old@example.com", scopes: ["scope-old"] };
++const OLD = { subject: "subject:acct-old", email: "old@example.com", scopes: ["openid", "https://www.googleapis.com/auth/drive.readonly"] };
+ const NEW = { subject: "subject:acct-new", email: "new@example.com", scopes: ["openid", "https://www.googleapis.com/auth/drive.file"] };
+ const DOC_MIME = "application/vnd.google-apps.document";
+ 
+diff --git a/test/datamechanics/gdrive-admin-test.datamechanics.test.ts b/test/datamechanics/gdrive-admin-test.datamechanics.test.ts
+index 0ca3259f..e13dac4e 100644
+--- a/test/datamechanics/gdrive-admin-test.datamechanics.test.ts
++++ b/test/datamechanics/gdrive-admin-test.datamechanics.test.ts
+@@ -19,9 +19,11 @@ const {
+   provisionGoogleDriveConnector, runGoogleDriveNow,
+ } = await import("@/app/t/[team]/admin/integrations/actions");
+ 
++/** A legacy-shaped credential (no recorded mode) whose recorded grant fixes its ceiling at `folders`. */
++const GRANTED = "https://www.googleapis.com/auth/drive.readonly";
+ const SECRET = JSON.stringify({
+   client_id: "client", client_secret: "secret", refresh_token: "refresh",
+-  account_subject: "subject:account", scopes: ["drive"],
++  account_subject: "subject:account", scopes: ["openid", GRANTED],
+ });
+ 
+ async function configured(seed: Seed, name: string, files = ["one", "two"]): Promise<string> {
+@@ -32,7 +34,7 @@ async function configured(seed: Seed, name: string, files = ["one", "two"]): Pro
+       fileIds: files, folderIds: [], sharedDriveIds: [], recursive: false,
+       selectionState: "selected", access: "team", authMode: "oauth",
+       authenticatedAccount: "docs@example.com", authenticatedAccountId: "subject:account",
+-      scopeSet: ["drive"],
++      scopeSet: ["openid", GRANTED],
+     },
+   });
+   await setIntegrationSecret(db(), { teamId: seed.teamId, memberId: seed.memberId }, row.id, SECRET);
+@@ -55,7 +57,7 @@ describe("AIO-1167 Admin Google Drive test authority", () => {
+       await setIntegrationStatus(
+         db(), { teamId: seed.teamId, memberId: seed.memberId }, integrationId, "disabled",
+       );
+-      return Response.json({ access_token: "must-not-be-used", scope: "drive" });
++      return Response.json({ access_token: "must-not-be-used", scope: GRANTED });
+     });
+ 
+     const result = await testGoogleDriveConnection(seed.teamSlug, "admin-refresh-pause");
+@@ -70,7 +72,7 @@ describe("AIO-1167 Admin Google Drive test authority", () => {
+     adminContext.teamId = seed.teamId;
+     adminContext.memberId = seed.memberId;
+     const provider = vi.spyOn(globalThis, "fetch")
+-      .mockResolvedValueOnce(Response.json({ access_token: "short-lived", scope: "drive" }))
++      .mockResolvedValueOnce(Response.json({ access_token: "short-lived", scope: GRANTED }))
+       .mockImplementationOnce(async () => {
+         await db().from("members").update({ role: "member" })
+           .eq("id", seed.memberId).eq("team_id", seed.teamId);
+@@ -93,7 +95,7 @@ describe("AIO-1167 Admin Google Drive test authority", () => {
+         db(), { teamId: seed.teamId, memberId: seed.memberId }, integrationId,
+         JSON.stringify({ ...JSON.parse(SECRET), refresh_token: "replacement" }),
+       );
+-      return Response.json({ access_token: "old-pair", scope: "drive" });
++      return Response.json({ access_token: "old-pair", scope: GRANTED });
+     });
+ 
+     const result = await testGoogleDriveConnection(seed.teamSlug, "admin-credential-change");
+@@ -108,7 +110,7 @@ describe("AIO-1167 Admin Google Drive test authority", () => {
+     adminContext.teamId = seed.teamId;
+     adminContext.memberId = seed.memberId;
+     vi.spyOn(globalThis, "fetch")
+-      .mockResolvedValueOnce(Response.json({ access_token: "short-lived", scope: "drive" }))
++      .mockResolvedValueOnce(Response.json({ access_token: "short-lived", scope: GRANTED }))
+       .mockImplementation(async (input) => {
+         const id = decodeURIComponent(String(input).split("/files/")[1]!.split("?")[0]!);
+         return Response.json({ id, mimeType: "application/vnd.google-apps.document" });
+@@ -125,7 +127,7 @@ describe("AIO-1167 Admin Google Drive test authority", () => {
+     adminContext.teamId = seed.teamId;
+     adminContext.memberId = seed.memberId;
+     vi.spyOn(globalThis, "fetch")
+-      .mockResolvedValueOnce(Response.json({ access_token: "short-lived", scope: "drive" }))
++      .mockResolvedValueOnce(Response.json({ access_token: "short-lived", scope: GRANTED }))
+       .mockResolvedValueOnce(Response.json({ id: "one", mimeType: "application/vnd.google-apps.document" }))
+       .mockRejectedValueOnce(new Error("provider interrupted"));
+     expect(await testGoogleDriveConnection(seed.teamSlug, "admin-preview-interrupted"))
+diff --git a/test/datamechanics/gdrive-authority.datamechanics.test.ts b/test/datamechanics/gdrive-authority.datamechanics.test.ts
+index a2a148c1..bc06abb8 100644
+--- a/test/datamechanics/gdrive-authority.datamechanics.test.ts
++++ b/test/datamechanics/gdrive-authority.datamechanics.test.ts
+@@ -8,6 +8,7 @@ import { POST as itemsPOST } from "@/app/api/v1/items/route";
+ import { GET as runsGET, POST as runsPOST } from "@/app/api/v1/integrations/gdrive/runs/route";
+ import { GET as oauthCallbackGET } from "@/app/api/auth/gdrive/callback/route";
+ import { issueApiKey, revokeApiKey } from "@/lib/admin/keys";
++import { getPool } from "@/lib/db/pg/pool";
+ import { createGoogleDriveOAuthState, GDRIVE_OAUTH_BINDING_COOKIE } from "@/lib/auth/gdrive-oauth-state";
+ import { getIntegrationWithSecret, upsertIntegration, setIntegrationSecret, setIntegrationStatus } from "@/lib/integrations/manage";
+ import {
+@@ -16,6 +17,7 @@ import {
+   provisionGdriveConnectorPrincipal,
+ } from "@/lib/integrations/gdrive-authority";
+ import { getPipelineHealth } from "@/lib/ingest/pipeline-health";
++import { setMemberIdentity } from "@/lib/identity/member-identities";
+ import { approvedAudienceProject, db, placeMemberByTier, seedTeam, sha, type Seed } from "./helpers";
+ 
+ const GOOGLE_SECRET = JSON.stringify({
+@@ -768,6 +770,53 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
+     expect(provider).toHaveBeenCalledTimes(3);
+   });
+ 
++  it("an OAuth account another member already holds is a VISIBLE refusal; nothing is published or remapped (R47 F2)", async () => {
++    const seed = await seedTeam();
++    await db().from("members").update({ role: "admin" }).eq("id", seed.memberId).eq("team_id", seed.teamId);
++    const { data: bobRow } = await db().from("members").insert({
++      team_id: seed.teamId, email: `bob-${randomUUID().slice(0, 6)}@example.com`, display_name: "Bob",
++      actor_handle: `bob-${randomUUID().slice(0, 6)}`, role: "member", tier: "team", status: "active",
++    }).select("id").single();
++    const bob = (bobRow as { id: string }).id;
++    await setMemberIdentity(db(), seed.teamId, bob, { provider: "gdrive", externalId: "subject:held-subject" });
++    // The callback links identities only for the initiating Admin's OWN verified account.
++    const { data: adminRow } = await db().from("members").select("email")
++      .eq("id", seed.memberId).eq("team_id", seed.teamId).single();
++    const adminEmail = (adminRow as { email: string }).email;
++    process.env.AUTH_SECRET = "aio-1167-data-mechanics-auth-secret";
++    process.env.GOOGLE_DRIVE_CLIENT_ID = "oauth-client";
++    process.env.GOOGLE_DRIVE_CLIENT_SECRET = "oauth-secret";
++    process.env.GOOGLE_DRIVE_OAUTH_REDIRECT = "http://test/api/auth/gdrive/callback";
++    const state = await createGoogleDriveOAuthState(db(), {
++      teamId: seed.teamId, memberId: seed.memberId, integrationName: "conflict-docs", teamSlug: seed.teamSlug,
++      mode: "files", browserBinding: startedBy(seed),
++    });
++    vi.spyOn(globalThis, "fetch")
++      .mockResolvedValueOnce(new Response(JSON.stringify({
++        access_token: "callback-access", refresh_token: "callback-refresh", expires_in: 3600,
++        scope: "https://www.googleapis.com/auth/drive.file",
++      }), { status: 200, headers: { "content-type": "application/json" } }))
++      .mockResolvedValueOnce(new Response(JSON.stringify({ sub: "held-subject", email: adminEmail, email_verified: true, name: "Admin" }), {
++        status: 200, headers: { "content-type": "application/json" },
++      }));
++
++    const callback = await oauthCallbackGET(new NextRequest(
++      `http://test/api/auth/gdrive/callback?state=${encodeURIComponent(state)}&code=one-time-code`,
++      INITIATING_BROWSER,
++    ));
++
++    expect(callback.status).toBe(409);
++    const page = await callback.text();
++    expect(page).toContain("Google identity needs review");
++    expect(page).toContain("Admin → Members");
++    expect(page).not.toContain("callback-refresh");
++    expect(await getIntegrationWithSecret(db(), seed.teamId, "gdrive", "conflict-docs")).toBeNull();
++    const { rows } = await getPool().query(
++      "select member_id from member_identities where team_id=$1 and provider='gdrive' and external_id='subject:held-subject'",
++      [seed.teamId]);
++    expect(rows).toEqual([{ member_id: bob }]);
++  });
++
+   it("atomically links an exact verified OAuth account in subject and author-email namespaces", async () => {
+     const seed = await seedTeam();
+     await db().from("members").update({ role: "admin" }).eq("id", seed.memberId).eq("team_id", seed.teamId);
+diff --git a/test/datamechanics/gdrive-oauth-lock-order.datamechanics.test.ts b/test/datamechanics/gdrive-oauth-lock-order.datamechanics.test.ts
+index 068dd099..58b54c8d 100644
+--- a/test/datamechanics/gdrive-oauth-lock-order.datamechanics.test.ts
++++ b/test/datamechanics/gdrive-oauth-lock-order.datamechanics.test.ts
+@@ -41,6 +41,7 @@ import { db, seedTeam, type Seed } from "./helpers";
+ const STORED_SECRET = JSON.stringify({
+   client_id: "oauth-client", client_secret: "stored-secret", refresh_token: "stored-refresh",
+   token_uri: "https://oauth2.googleapis.com/token", account_subject: "subject:acct-1",
++  scopes: ["openid", "https://www.googleapis.com/auth/drive.file"], grant_mode: "files",
+ });
+ 
+ interface World {
+diff --git a/test/datamechanics/identity-discovery-conflicts.datamechanics.test.ts b/test/datamechanics/identity-discovery-conflicts.datamechanics.test.ts
+index f2365f1d..11198e03 100644
+--- a/test/datamechanics/identity-discovery-conflicts.datamechanics.test.ts
++++ b/test/datamechanics/identity-discovery-conflicts.datamechanics.test.ts
+@@ -1,4 +1,6 @@
+ import { randomUUID } from "node:crypto";
++import { readFileSync } from "node:fs";
++import { join } from "node:path";
+ import { describe, expect, it } from "vitest";
+ 
+ import { getPool } from "@/lib/db/pg/pool";
+@@ -37,7 +39,15 @@ async function adminOf(seed: Seed): Promise<string> {
+   return seed.memberId;
+ }
+ 
+-/** A LEGACY mapping: a member_identities row with no mapping-state row (never reviewed). */
++/**
++ * A LEGACY mapping: a member_identities row with no mapping-state row (never reviewed).
++ *
++ * COMPATIBILITY coverage only (AIO-1167 R47 F2): written by raw SQL AFTER migrations, this shape is
++ * not reachable on a normally upgraded database — the repair-ledger migration seeds state for every
++ * existing link, and every writer creates it. It exercises the historical-refusal projection; the
++ * reachable AC-08 evidence is the R47 describe at the end of this file, the manual remap offer
++ * (`identity-link-observation`) and the OAuth existing-owner refusal (`gdrive-authority`).
++ */
+ async function legacyMapping(seed: Seed, memberId: string, externalId: string) {
+   await getPool().query(
+     "insert into member_identities(team_id, member_id, provider, external_id, handle, email) values ($1,$2,'gdrive',$3,'','')",
+@@ -241,3 +251,57 @@ describe("refused automatic identity links — the Admin diagnostic (R45, real P
+     expect(await credit()).toBe(before); // nothing about the credit, the mapping or its repair state moved
+   });
+ });
++
++/** The repair-ledger migration's own seed statement, read from the migration so the test tracks it. */
++function migrationSeedSql(): string {
++  const sql = readFileSync(join(process.cwd(), "postgres/migrations/20260922180000_gdrive_identity_repair_ledger.sql"), "utf8");
++  const statement = /insert into member_identity_mapping_state\([\s\S]*?on conflict[^;]*do nothing;/i.exec(sql);
++  if (!statement) throw new Error("the repair-ledger migration no longer seeds mapping state");
++  return statement[0];
++}
++
++describe("R47 F2 — reachable AC-08 evidence on a normally upgraded database (real Postgres)", () => {
++  it("a migration-seeded link to B keeps B when A's confirmed email is observed: no remap, repair or conflict", async () => {
++    const seed = await seedTeam();
++    const viewer = { teamId: seed.teamId, memberId: await adminOf(seed) };
++    const alice = await member(seed, "alice");
++    const bob = await member(seed, "bob");
++    // A link that existed before the upgrade, then the upgrade's own seed.
++    await legacyMapping(seed, bob, "permission:M");
++    await getPool().query(migrationSeedSql());
++    const stateOf = async () => (await getPool().query(
++      "select member_id, state, revision::int as revision from member_identity_mapping_state where team_id=$1 and provider='gdrive' and external_id='permission:M'",
++      [seed.teamId])).rows;
++    expect(await stateOf()).toEqual([{ member_id: bob, state: "linked", revision: 1 }]);
++    const obligations = async () => Number((await getPool().query(
++      "select count(*)::int as n from identity_repair_obligations where team_id=$1", [seed.teamId])).rows[0].n);
++    const owedBefore = await obligations();
++
++    // The connector later observes the account with ALICE's confirmed email.
++    expect(await refuse(seed, alice, "permission:M")).toBe("reviewed");
++
++    expect(await stateOf()).toEqual([{ member_id: bob, state: "linked", revision: 1 }]);
++    const { rows } = await getPool().query(
++      "select member_id from member_identities where team_id=$1 and provider='gdrive' and external_id='permission:M'", [seed.teamId]);
++    expect(rows).toEqual([{ member_id: bob }]);
++    expect(await obligations()).toBe(owedBefore);
++    expect(await conflictEvents(seed.teamId)).toBe(0);
++    expect(ok(await listIdentityDiscoveryConflicts(db(), viewer)).rows).toEqual([]);
++  });
++
++  it("a deliberate unlink after the upgrade stays unlinked when the account is observed again", async () => {
++    const seed = await seedTeam();
++    const alice = await member(seed, "alice");
++    const bob = await member(seed, "bob");
++    await legacyMapping(seed, bob, "permission:U");
++    await getPool().query(migrationSeedSql());
++    await removeMemberIdentity(db(), seed.teamId, { provider: "gdrive", externalId: "permission:U" });
++
++    expect(await refuse(seed, alice, "permission:U")).toBe("reviewed");
++
++    const { rows } = await getPool().query(
++      "select count(*)::int as n from member_identities where team_id=$1 and provider='gdrive' and external_id='permission:U'", [seed.teamId]);
++    expect(rows[0].n).toBe(0);
++    expect(await conflictEvents(seed.teamId)).toBe(0);
++  });
++});
+diff --git a/test/identity-conflicts-view.test.ts b/test/identity-conflicts-view.test.ts
+index 915e8655..f03f89e0 100644
+--- a/test/identity-conflicts-view.test.ts
++++ b/test/identity-conflicts-view.test.ts
+@@ -26,11 +26,14 @@ const ROW: IdentityConflictRow = {
+ const render = (page: Parameters<typeof IdentityConflicts>[0]["page"], nextHref: string | null = null) =>
+   renderToStaticMarkup(createElement(IdentityConflicts, { page, nextHref }));
+ 
+-describe("refused automatic identity links — Admin view", () => {
++describe("recorded legacy Google Drive refusals — Admin view (historical; R47 F2)", () => {
+   it("states the refusal and shows the account, both members, the mapping now and its standing", () => {
+     const html = render({ status: "ok", rows: [ROW], nextCursor: null });
+-    expect(html).toContain("automatic link was refused and the existing mapping was kept");
+-    expect(html).toContain("Google Drive: automatic identity links that were refused");
++    // Labelled as the historical record it is, and never as a standing disagreement check (R47 F2).
++    expect(html).toContain("Google Drive: recorded legacy refusals (history)");
++    expect(html).toContain("Historical record");
++    expect(html).toContain("A later email that differs from an approved mapping is not");
++    expect(html).toContain("kept the existing mapping");
+     expect(html).toContain("Drive account");
+     expect(html).toContain("permission:L");
+     expect(html).toContain('href="#member-m-alice"');
+@@ -54,12 +57,12 @@ describe("refused automatic identity links — Admin view", () => {
+   it("a read failure is shown as unavailable, never as none", () => {
+     const html = render({ status: "unavailable" });
+     expect(html).toContain("unavailable");
+-    expect(html).not.toContain("No Google Drive automatic links have been refused");
++    expect(html).not.toContain("No legacy Google Drive refusals are recorded");
+   });
+ 
+   it("an empty page says none; a forbidden viewer sees nothing at all; a next page is linked", () => {
+-    expect(render({ status: "ok", rows: [], nextCursor: null })).toContain("No Google Drive automatic links have been refused");
++    expect(render({ status: "ok", rows: [], nextCursor: null })).toContain("No legacy Google Drive refusals are recorded");
+     expect(render({ status: "forbidden" })).toBe("");
+-    expect(render({ status: "ok", rows: [ROW], nextCursor: "c" }, "/t/x/admin/members?conflicts=c")).toContain("Older refused Drive links");
++    expect(render({ status: "ok", rows: [ROW], nextCursor: "c" }, "/t/x/admin/members?conflicts=c")).toContain("Older recorded refusals");
+   });
+ });

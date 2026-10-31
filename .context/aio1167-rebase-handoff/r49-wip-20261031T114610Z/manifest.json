@@ -1,0 +1,25 @@
+{
+  "branch": "codex/aio-1167-google-docs-connector-rebased",
+  "captured_utc": "20261031T114610Z",
+  "full_diff_bytes": 141615,
+  "full_diff_sha256": "217931229b329b87f8737b9af4979dd38bad31be4284f2f6267023f84f49c5b3",
+  "head": "5ecd2989e21fded915b41b508477bb267aaec06d",
+  "recovery_handoff_checkpoint": "origin/codex/aio-1167-checkpoint-20261027@8fa58e17feefa8837fa106a0fda1ecc97f88b46b",
+  "status_sha256": "6095bfa4945a375ac638672046a3215928d8014beb8f03205b7daec6c4a59f06",
+  "untracked_archive_sha256": "e6a4d55bf6a7827b4df6ebd3e98948fcf687a66a9836f17e4f82a900ff36f90e",
+  "untracked_files": {
+    "ingestion/tests/test_account_hold_before_streams.py": "f5ebe0165ac1e221c57b1459cda6311095e6c1b7f393ad4949d793162cfade00",
+    "ingestion/tests/test_bound_root_loss.py": "0dd5be18bc2d14b63a8896e806a49e9ef8e86c991b1b7e61f7fa2d5b223e4056",
+    "ingestion/tests/test_checkpoint_acknowledgment.py": "b1dbe4aada8f26d1ec85de5957b7c818d71c910bdec9ae293db3092ff3078f48",
+    "ingestion/tests/test_checkpoint_uncertainty_latch.py": "c8f2f19674f32dcf142d01ba4cbea64083fc64b4e3aa6dfbdf371b3f9c1ea63c",
+    "ingestion/tests/test_document_restrictions.py": "63e95ef40b027d755c7590ece1193435eceacd403a49b03cc555574f7d1ce43e",
+    "ingestion/tests/test_exhaustion_is_not_completion.py": "98932c8cb3aef54f976fe7d6cab0c354305edc7feae4436f3beac9c3e9b1e31e",
+    "ingestion/tests/test_retry_after_holds.py": "18337db7a6d6f8b23a42e24e808190948555d9c2164beef3c4d11c43ffaa2ed6",
+    "ingestion/tests/test_retry_after_parsing.py": "afab189721e54ef9cef2a77db6226832552a25a868d2107647680775fbed23cb",
+    "ingestion/tests/test_root_evidence_r49.py": "8e7e2565f48b14dbad8d5cbc0312d30b1957dc0e8d88ddcb833782f013d50682",
+    "test/datamechanics/gdrive-admin-grant-policy.datamechanics.test.ts": "fea3264eefc7d4f6b8c7df33dcc706994a3e0b6c85f0d313f000c757eb26d31e",
+    "test/datamechanics/gdrive-complete-snapshot-overlap.datamechanics.test.ts": "53bb0c645254a06f0f2e3abcf8e49af564615b70126a51edbf785d3f8edf9ddf",
+    "test/datamechanics/gdrive-identity-tombstone-email.datamechanics.test.ts": "c5ca3d2b36823128f2553a2659ef582b8a9569409ce632dc876c4e658357cb64"
+  },
+  "worktree": "/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree"
+}
