@@ -339,3 +339,9 @@ R50 complete writer snapshot preserved before coordinator checks. The remote che
 - High: document restrictions filter verified removal obligations and can retain previously imported content until the provider minimum. Medium: cross-stream removal probes swallow `ProviderDeferred`; Medium: watch renewal does not enforce the new account hold before provider calls.
 - Astra inspected the complete tracked patch and all 20 added files, with static review only. No tests or edits. The source candidate remains frozen.
 - GPT-6.1 Sol blind final review is still active; do not duplicate it. Hold the sole Opus writer. After Sol returns, adjudicate its independent evidence with Astra and issue a bounded correction only for accepted findings, preserving one writer and existing auth/quota/checkpoint controls.
+
+## 2026-10-31 19:04 UTC — blind Sol review also HOLD
+
+- GPT-6.1 Sol HIGH independently reviewed the same frozen candidate and returned one High plus three Medium findings. Its complete report is `r51-blind-final-sol-20261031.md`.
+- Astra and Sol agree on the High verified-removal suppression gap and Medium watch-renewal/account-hold gap. Astra additionally found a Medium where `_document_loss_verified()` discards `ProviderDeferred`; Sol additionally found a Medium retry-publication gap on the standing service-account prerequisite and a legacy mixed-case unlink-tombstone regression.
+- The two blind review reports are independently checkpointed; no review commands/tests/edits. No implementation writer has been resumed. Next: fresh Astra adjudication of the combined distinct findings; settle accepted fix scope, then dispatch one bounded correction to the existing sole Opus writer after fresh subscription admission.
