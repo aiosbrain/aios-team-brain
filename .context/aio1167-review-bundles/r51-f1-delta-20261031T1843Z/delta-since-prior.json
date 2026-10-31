@@ -1,0 +1,23 @@
+{
+  "previous": {
+    "base": "5ecd2989e21fded915b41b508477bb267aaec06d",
+    "head": "5ecd2989e21fded915b41b508477bb267aaec06d",
+    "tracked_diff_sha256": "3fba7ef58921884657d101cb3694683a2a25482d5a1cb0db10c1bd0554f3de40",
+    "untracked_archive_sha256": "6aa6101595f2a06fd8c0a6dbd28d639104f0e666cf19846c6869dd299f4cee2a"
+  },
+  "current": {
+    "base": "5ecd2989e21fded915b41b508477bb267aaec06d",
+    "head": "5ecd2989e21fded915b41b508477bb267aaec06d",
+    "tracked_diff_sha256": "3fba7ef58921884657d101cb3694683a2a25482d5a1cb0db10c1bd0554f3de40",
+    "untracked_archive_sha256": "fd271527592d6a38000bcc69a450a6571958bd03df04ffdcbb11d68155998c23",
+    "manifest_sha256": "4a3ceeecdceda08197cafe2fa0f374deb26abba6aa065f4f87fdbaf95d1332c3"
+  },
+  "changed_paths": [
+    {
+      "path": "ingestion/tests/test_flush_authority_outcome.py",
+      "before_sha256": "19077b33c2bc40624b1eb9c2acf3aa58b7789ffa94119265f9408bdeac5086d1",
+      "after_sha256": "8d0a18706cd6167587679ffa10fbf3d7bed704a0a8d82342faa3fc0b7998479c"
+    }
+  ],
+  "reused_unchanged_paths": 41
+}

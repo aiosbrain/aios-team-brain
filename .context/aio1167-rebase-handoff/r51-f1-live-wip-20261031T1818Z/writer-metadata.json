@@ -1,0 +1,112 @@
+{
+  "writer_session": "628402d5-a1c6-42b7-b736-e84358c1a749",
+  "session_transcript": "/Users/chetan/.claude/projects/-Users-chetan--codex-worktrees-8d96-aios-team-brain--context-aio1167-rebase-worktree/628402d5-a1c6-42b7-b736-e84358c1a749.jsonl",
+  "turn_started_after_utc": "2026-10-31T17:56:00",
+  "terminal_result_timestamp_utc": "2026-10-31T18:10:06.618Z",
+  "terminal_stop_reason": "end_turn",
+  "model": "claude-opus-5-5",
+  "apiKeySource": "not emitted for this turn; same persistent CLI session prior run metadata recorded apiKeySource=none",
+  "result_type": "end_turn",
+  "used_tools": [
+    "Bash",
+    "Edit",
+    "Grep",
+    "Read"
+  ],
+  "tool_use_count": 6,
+  "tool_paths": [
+    [
+      "Read",
+      "/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree/ingestion/tests/test_flush_authority_outcome.py"
+    ],
+    [
+      "Grep",
+      "/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree/ingestion/aios_ingest/gdrive_sync.py"
+    ],
+    [
+      "Read",
+      "/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree/ingestion/aios_ingest/gdrive_sync.py"
+    ],
+    [
+      "Edit",
+      "/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree/ingestion/tests/test_flush_authority_outcome.py"
+    ]
+  ],
+  "usage": {
+    "input_tokens": 2,
+    "cache_creation_input_tokens": 1212,
+    "cache_read_input_tokens": 508023,
+    "output_tokens": 909,
+    "output_tokens_details": {
+      "thinking_tokens": 167
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 1212,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "global",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 909,
+        "cache_read_input_tokens": 508023,
+        "cache_creation_input_tokens": 1212,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1212
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard",
+    "fallback_credit": null
+  },
+  "turn_duration_event": {
+    "parentUuid": "369eea6d-29c1-45ec-98ba-acd7cd084548",
+    "isSidechain": false,
+    "type": "system",
+    "subtype": "turn_duration",
+    "durationMs": 84653,
+    "messageCount": 2123,
+    "timestamp": "2026-10-31T18:10:07.236Z",
+    "uuid": "13d3a57e-c114-440e-a468-964caec46adb",
+    "isMeta": false,
+    "userType": "external",
+    "entrypoint": "cli",
+    "cwd": "/Users/chetan/.codex/worktrees/8d96/aios-team-brain/.context/aio1167-rebase-worktree/.context/aio1167-rebase-handoff",
+    "sessionId": "628402d5-a1c6-42b7-b736-e84358c1a749",
+    "version": "2.1.287",
+    "gitBranch": "codex/aio-1167-google-docs-connector-rebased",
+    "slug": "frolicking-weaving-frog"
+  },
+  "turn_finished_successfully": true,
+  "process_observation": "existing TUI process remains open at idle prompt; persisted assistant turn is terminal",
+  "usage_reading_utc": "2026-10-31T18:37:00Z (approximate; read from the same existing authenticated TUI)",
+  "subscription_usage_percent": {
+    "session": 47,
+    "all_model_week": 36,
+    "fable_week": 42,
+    "credits_enabled": false
+  },
+  "turn_usage": {
+    "uncached_input_tokens": 2,
+    "cache_read_input_tokens": 508023,
+    "cache_creation_input_tokens": 1212,
+    "output_tokens": 909,
+    "thinking_tokens": 167,
+    "service_tier": "standard",
+    "fallback_credit": null
+  },
+  "writer_report_sha256": "2b2947aee2aa57e9d3f8455284bc85bdeee8ef1f4ff76c4ac00b4e890e1e7ce3",
+  "source_file_at_terminal_sha256": "8d0a18706cd6167587679ffa10fbf3d7bed704a0a8d82342faa3fc0b7998479c",
+  "source_file_matches_stable_checkpoint": true,
+  "tests_run_by_writer": false,
+  "production_edits": false,
+  "terminal_turn_usage_note": "The long-lived TUI transcript does not expose a canonical per-turn usage object for this end_turn. Account /usage percentages were available; do not substitute session-wide token totals.",
+  "process_lifecycle_note": "CLI/TUI process remained open after the model turn. The persisted assistant end_turn at 18:10:06.618Z is the terminal completion signal; process liveness alone is not worker activity."
+}

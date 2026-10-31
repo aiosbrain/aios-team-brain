@@ -1,0 +1,16 @@
+{
+  "worker_session": "628402d5-a1c6-42b7-b736-e84358c1a749",
+  "model": "claude-opus-5-5",
+  "turn_state": "finished",
+  "terminal_event": "assistant.message.stop_reason=end_turn with final text",
+  "terminal_timestamp_utc": "2026-10-31T18:10:06.618Z",
+  "terminal_result_sha256": "2b2947aee2aa57e9d3f8455284bc85bdeee8ef1f4ff76c4ac00b4e890e1e7ce3",
+  "cli_tui": "still open at idle prompt; not an active model turn",
+  "source_changed_paths": [
+    "ingestion/tests/test_flush_authority_outcome.py"
+  ],
+  "source_file_sha256": "8d0a18706cd6167587679ffa10fbf3d7bed704a0a8d82342faa3fc0b7998479c",
+  "coordinator_focused_test": "20 passed in 0.54s",
+  "safe_supervisor": "watch-claude-safe.py --attach-existing classified persisted end_turn as WORKER_FINISHED without replaying transcript or displaying reasoning",
+  "auth": "same existing CLI session; prior run metadata apiKeySource=none; /usage read from authenticated TUI"
+}
