@@ -1,0 +1,37 @@
+{
+  "bundle_fingerprint_sha256": "124a5cfb56f87ebd2e749180ea7740646c8cf52899c833d3935ee276303ef358",
+  "changed_files": [
+    "docs/ARCHITECTURE.md",
+    "ingestion/aios_ingest/gdrive_sync.py",
+    "ingestion/aios_ingest/sources/gdrive.py",
+    "ingestion/aios_ingest/state.py",
+    "ingestion/tests/test_account_hold_before_streams.py",
+    "ingestion/tests/test_bound_root_loss.py",
+    "ingestion/tests/test_gdrive_upgrade.py",
+    "ingestion/tests/test_retry_after_holds.py",
+    "ingestion/tests/test_retry_after_parsing.py"
+  ],
+  "changed_source_sha256": {
+    "docs/ARCHITECTURE.md": "33b367163b14d76a61b2c3a859f7bd4670dd84207078df714f1d9d07b9672e7a",
+    "ingestion/aios_ingest/gdrive_sync.py": "9d10d2554686e662d9022585d26f215e82e5850f2ae26a7be966988b5b5a4da1",
+    "ingestion/aios_ingest/sources/gdrive.py": "17223784ebec06649e1087c4e6a3cfa6f7c8910d20ff3720397b8b1c4465d2d4",
+    "ingestion/aios_ingest/state.py": "575f5d8dd0655027f5a8c2957ce4eab98dcf2ab75d7b1464854def6c2e1b83fd",
+    "ingestion/tests/test_account_hold_before_streams.py": "f5ebe0165ac1e221c57b1459cda6311095e6c1b7f393ad4949d793162cfade00",
+    "ingestion/tests/test_bound_root_loss.py": "0dd5be18bc2d14b63a8896e806a49e9ef8e86c991b1b7e61f7fa2d5b223e4056",
+    "ingestion/tests/test_gdrive_upgrade.py": "3098840cc5e49d038c1f82377f9bd80e2e9537dfe7741166c075a4cf3e0c499b",
+    "ingestion/tests/test_retry_after_holds.py": "18337db7a6d6f8b23a42e24e808190948555d9c2164beef3c4d11c43ffaa2ed6",
+    "ingestion/tests/test_retry_after_parsing.py": "afab189721e54ef9cef2a77db6226832552a25a868d2107647680775fbed23cb"
+  },
+  "delta_base_r47_checkpoint": "151fb88e245ba380acdf9d734845d54aa7ae5bb9",
+  "diff_bytes": 63304,
+  "diff_sha256": "c085f1c8f3bb29d0584ca2f2b49c215a0fa28f752eefa1f1b6b419870bc173f4",
+  "handoff_sha256": {
+    "accepted-spec.md": "297ee1df91463fd0b6c4863b34be8b999ad176fc7d40f0637bf196660bd65e3d",
+    "astra-r47-adjudication.md": "013839ddbe1f0607120f0c85ea8220752e343f78ddf50f24f84609bd813abb2c",
+    "fable-r47-review.md": "b654ef1bb177cc7ae874bc652b4413ef775bc7253236fe5843b760ed9751be18",
+    "fable-r47-run-metadata.json": "f7a0787f31051f151d9b77565149eca7034c2d786e2fc889b35141985681ac07"
+  },
+  "reviewed_snapshot_commit": "333bf6a798d75db03256ea9c17fc61f8a011f18b",
+  "reviewed_snapshot_tree": "03f3f40d6e07bf69db996aa58f4e833c36a070f6",
+  "staging_base": "8df51664809cfc12740a39d0e98fdb9c8ad05ad8"
+}
