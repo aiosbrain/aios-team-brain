@@ -73,6 +73,10 @@ const observed = (email: string, id = "permission:P") => ({
   contributions: [{ external_id: id, email, role: "editor", at: "2026-10-20T10:00:00Z" }],
 });
 
+/** A payload bound to the live connection, as the content commit requires (R45 L2). */
+const bound = (ref: { integrationId: string }, frontmatter: Record<string, unknown>) =>
+  ({ ...frontmatter, source_id: "d", connection_id: ref.integrationId });
+
 async function mapped(teamId: string, id = "permission:P") {
   const { rows } = await getPool().query<{ member_id: string }>(
     "select member_id from member_identities where team_id=$1 and provider='gdrive' and external_id=$2", [teamId, id]);
@@ -82,7 +86,7 @@ async function mapped(teamId: string, id = "permission:P") {
 describe("Drive identity discovery at the fenced ingest boundary (R44 F1, real Postgres)", () => {
   it("links an unmapped stable id to the one member its email names, and never transfers it", async () => {
     const w = await world();
-    const outcome = await discoverGdriveContributorIdentities(db(), w.auth, w.ref, observed(w.a.email.toUpperCase()));
+    const outcome = await discoverGdriveContributorIdentities(db(), w.auth, w.ref, bound(w.ref, observed(w.a.email.toUpperCase())));
     expect(outcome.linked).toBe(1);
     expect(await mapped(w.seed.teamId)).toEqual([w.a.id]);
     const map = await buildIdentityMap(db(), w.seed.teamId, { strict: true });
@@ -93,7 +97,7 @@ describe("Drive identity discovery at the fenced ingest boundary (R44 F1, real P
     expect(obligations.length).toBeGreaterThan(0);
 
     // A replay whose email now belongs to B: no transfer.
-    const replay = await discoverGdriveContributorIdentities(db(), w.auth, w.ref, observed(w.b.email));
+    const replay = await discoverGdriveContributorIdentities(db(), w.auth, w.ref, bound(w.ref, observed(w.b.email)));
     expect(replay.linked).toBe(0);
     expect(await mapped(w.seed.teamId)).toEqual([w.a.id]);
   });
@@ -102,11 +106,11 @@ describe("Drive identity discovery at the fenced ingest boundary (R44 F1, real P
     const w = await world();
     await setMemberIdentity(db(), w.seed.teamId, w.a.id, { provider: "gdrive", externalId: "permission:P" });
     await removeMemberIdentity(db(), w.seed.teamId, { provider: "gdrive", externalId: "permission:P" });
-    await discoverGdriveContributorIdentities(db(), w.auth, w.ref, observed(w.a.email));
+    await discoverGdriveContributorIdentities(db(), w.auth, w.ref, bound(w.ref, observed(w.a.email)));
     expect(await mapped(w.seed.teamId)).toEqual([]);
 
     await setMemberIdentity(db(), w.seed.teamId, w.b.id, { provider: "gdrive", externalId: "permission:M" });
-    await discoverGdriveContributorIdentities(db(), w.auth, w.ref, observed(w.a.email, "permission:M"));
+    await discoverGdriveContributorIdentities(db(), w.auth, w.ref, bound(w.ref, observed(w.a.email, "permission:M")));
     expect(await mapped(w.seed.teamId, "permission:M")).toEqual([w.b.id]);
   });
 
@@ -127,14 +131,14 @@ describe("Drive identity discovery at the fenced ingest boundary (R44 F1, real P
         { external_id: "permission:P", email: w.b.email, role: "commenter", at: "2026-10-21T10:00:00Z" },
       ] };
     }
-    const outcome = await discoverGdriveContributorIdentities(db(), w.auth, w.ref, frontmatter);
+    const outcome = await discoverGdriveContributorIdentities(db(), w.auth, w.ref, bound(w.ref, frontmatter));
     expect(outcome.linked).toBe(0);
     expect(await mapped(w.seed.teamId)).toEqual([]);
   });
 
   it("a stale execution links nothing", async () => {
     const w = await world();
-    await expect(discoverGdriveContributorIdentities(db(), w.auth, { ...w.ref, fence: w.ref.fence + 5 }, observed(w.a.email)))
+    await expect(discoverGdriveContributorIdentities(db(), w.auth, { ...w.ref, fence: w.ref.fence + 5 }, bound(w.ref, observed(w.a.email))))
       .rejects.toMatchObject({ code: "stale_execution" });
     expect(await mapped(w.seed.teamId)).toEqual([]);
   });
@@ -150,7 +154,7 @@ describe("Drive identity discovery under a concurrent mapping decision (R44 F1)"
       await holder.query("begin");
       await holder.query("select pg_advisory_xact_lock(hashtextextended($1, 0))",
         [`${w.seed.teamId}:identity:gdrive:permission:P`]);
-      discovering = discoverGdriveContributorIdentities(db(), w.auth, w.ref, observed(w.a.email));
+      discovering = discoverGdriveContributorIdentities(db(), w.auth, w.ref, bound(w.ref, observed(w.a.email)));
       // Discovery reaches the identity lock and waits there.
       let waiting = 0;
       for (let tries = 0; tries < 320 && waiting === 0; tries++) {

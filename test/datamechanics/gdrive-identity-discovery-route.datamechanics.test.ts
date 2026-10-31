@@ -9,6 +9,7 @@ import { getCachedWorkTimeline } from "@/lib/dashboard/timeline-cache";
 import type { TimelineDay } from "@/lib/dashboard/timeline-group";
 import { getWorkTimeline } from "@/lib/dashboard/work-timeline";
 import { getPool } from "@/lib/db/pg/pool";
+import { revokeApiKey } from "@/lib/admin/keys";
 import { listMemberIdentities } from "@/lib/identity/list";
 import { drainIdentityRepairs } from "@/lib/ingest/identity-repair";
 import { repairAttributionNow } from "@/lib/ingest/reconcile-attribution";
@@ -80,7 +81,10 @@ async function world() {
     "X-AIOS-Execution-Fence": String(lease.fence),
     "X-AIOS-Execution-Owner": owner,
   };
-  return { seed, integrationId: row.id, key: connector.key, headers, a: await member(seed, "alice"), b: await member(seed, "bob") };
+  return {
+    seed, integrationId: row.id, key: connector.key, keyId: connector.keyId, headers, audience,
+    a: await member(seed, "alice"), b: await member(seed, "bob"),
+  };
 }
 
 // Inside the Timeline window, and fixed for both pushes so the replay is the SAME observation.
@@ -171,5 +175,101 @@ describe("Drive identity discovery through the fenced ingest route (R44 F1, real
     expect(after.evidence).toEqual([{ external_id: "permission:P", member_id: w.a.id }]);
     expect((after.item.frontmatter.contributions as unknown[]).length).toBe(1);
     expect(await timelines(w, after.item.id)).toEqual({ uncached: [[w.a.id, 1]], cached: [[w.a.id, 1]] });
+  });
+});
+
+/**
+ * AIO-1167 R45 L2 — discovery admits evidence only from a payload BOUND to the live connection.
+ *
+ * Spec (AC-01 binding, AC-08 authorized evidence). Under connection A's live execution, a payload
+ * bound to another connection B, or carrying no provider id, is refused before anything is read or
+ * written for identity: no link, no mapping state, no revision, no repair obligation — even when it
+ * carries a fresh `permission:` id with an active member's confirmed address. The same evidence in a
+ * payload bound to A links. A stale execution, another team, or a revoked key still refuses.
+ */
+describe("Drive identity discovery refuses a payload not bound to the live connection (R45 L2)", () => {
+  async function identityState(teamId: string) {
+    const pool = getPool();
+    const rows = async (sql: string) => (await pool.query(sql, [teamId])).rows;
+    return JSON.stringify({
+      identities: await rows("select member_id, provider, external_id from member_identities where team_id=$1 order by provider, external_id"),
+      states: await rows("select provider, external_id, member_id, state, revision from member_identity_mapping_state where team_id=$1 order by provider, external_id"),
+      obligations: await rows("select provider, external_id, mapping_revision, status from identity_repair_obligations where team_id=$1 order by provider, external_id, mapping_revision"),
+      authority: await rows("select revision, repair_status from team_identity_authority where team_id=$1"),
+    });
+  }
+
+  const evidence = (email: string, id: string) => ({
+    authors: [{ provider: "gdrive", external_id: id, email, role: "editor" }],
+    contributions: [{ external_id: id, email, role: "editor", at: AT }],
+  });
+
+  function pushBinding(
+    w: Awaited<ReturnType<typeof world>>, binding: Record<string, unknown>, id: string,
+    opts: { headers?: Record<string, string>; team?: string } = {},
+  ) {
+    const body = `bound body ${randomUUID()}`;
+    return itemsPOST(post("http://test/api/v1/items", w.key, opts.team ?? w.seed.teamSlug, {
+      project: "docs", path: `gdrive/${randomUUID().slice(0, 8)}.md`, kind: "deliverable", access: "team",
+      actor: "gdrive-sync", body, content_sha256: sha(body),
+      frontmatter: { source: "gdrive", source_ts: AT, ...binding, ...evidence(w.a.email, id) },
+    }, opts.headers ?? w.headers));
+  }
+
+  async function mapped(teamId: string, id: string) {
+    return (await getPool().query<{ member_id: string }>(
+      "select member_id from member_identities where team_id=$1 and provider='gdrive' and external_id=$2",
+      [teamId, id])).rows.map((row) => row.member_id);
+  }
+
+  it("payload B, a missing and a blank provider id change no identity state; matching A links", async () => {
+    const w = await world();
+    const other = await upsertIntegration(db(), { teamId: w.seed.teamId, memberId: w.seed.memberId }, {
+      type: "gdrive", name: "other-docs", status: "enabled",
+      config: {
+        fileIds: ["d2"], folderIds: [], sharedDriveIds: [], recursive: false, selectionState: "selected",
+        projectSlug: "docs", access: "team", authMode: "oauth", authenticatedAccountId: "subject:acct",
+        scopeSet: ["https://www.googleapis.com/auth/drive.file"], audienceProjectIds: [w.audience],
+      },
+    });
+    const before = await identityState(w.seed.teamId);
+    for (const binding of [
+      { source_id: "d1", connection_id: other.id }, // bound to connection B
+      { connection_id: w.integrationId }, // no provider id at all
+      { source_id: "   ", connection_id: w.integrationId }, // a blank provider id
+    ]) {
+      const res = await pushBinding(w, binding, "permission:Q");
+      expect(res.status, JSON.stringify(binding)).toBe(403);
+      expect((await res.json() as { error: { code: string } }).error.code).toBe("wrong_connection");
+      expect(await identityState(w.seed.teamId), JSON.stringify(binding)).toBe(before);
+    }
+    expect(await mapped(w.seed.teamId, "permission:Q")).toEqual([]);
+
+    // Positive control: the same evidence, bound to A, links.
+    const ok = await pushBinding(w, { source_id: "d1", connection_id: w.integrationId }, "permission:Q");
+    expect(ok.status).toBe(201);
+    expect(await mapped(w.seed.teamId, "permission:Q")).toEqual([w.a.id]);
+  });
+
+  it("a stale execution, another team and a revoked key still refuse, changing nothing", async () => {
+    const w = await world();
+    const bind = { source_id: "d1", connection_id: w.integrationId };
+    const before = await identityState(w.seed.teamId);
+
+    const stale = await pushBinding(w, bind, "permission:R", {
+      headers: { ...w.headers, "X-AIOS-Execution-Fence": String(Number(w.headers["X-AIOS-Execution-Fence"]) + 1) },
+    });
+    expect(stale.status).toBe(409);
+    expect((await stale.json() as { error: { code: string } }).error.code).toBe("stale_execution");
+
+    const otherTeam = await seedTeam();
+    expect((await pushBinding(w, bind, "permission:R", { team: otherTeam.teamSlug })).status).toBe(401);
+
+    const { data: keyRow } = await db().from("api_keys").select("id").eq("key_id", w.keyId).single();
+    await revokeApiKey(db(), w.seed.teamId, (keyRow as { id: string }).id);
+    expect((await pushBinding(w, bind, "permission:R")).status).toBe(401);
+
+    expect(await identityState(w.seed.teamId)).toBe(before);
+    expect(await mapped(w.seed.teamId, "permission:R")).toEqual([]);
   });
 });

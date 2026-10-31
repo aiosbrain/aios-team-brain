@@ -314,3 +314,113 @@ async def test_a_deferred_checkpoint_after_a_successful_push_keeps_the_acknowled
     await _drain_pending(brain, execution, source, conn, state, namespace, 2, replay, 10)
     assert len(brain.pushes) == 2 and replay.unchanged == 1
     assert state.pending_count(namespace, 2) == 0
+
+
+# --- R45 M5: a deferred checkpoint after an ACCEPTED push is not the document's failure ----------
+
+@pytest.mark.asyncio
+async def test_repeated_checkpoint_deferrals_never_exhaust_an_accepted_document(tmp_path):
+    """Eight (more than the automatic-retry budget) checkpoint deferrals after accepted pushes, the
+    state reopened between runs as across restarts: the document spends none of its retry budget,
+    is never exhausted, keeps the brain's not-before and stays owed (unacknowledged); reporting says
+    the push succeeded and the checkpoint was deferred. Once the brain accepts the checkpoint, the
+    obligation is acknowledged exactly once."""
+    path = str(tmp_path / "checkpoint-deferrals.sqlite")
+    state = StateStore(path)
+    progress = state.begin_generation(StreamKey("team", "conn", "acct", "my-drive"), 2, start_token="start")
+    namespace = progress.namespace
+    state.enqueue_work(namespace, 2, "doc", "upsert", {})
+    state.close()
+    conn = Connection("docs", "gdrive", options={}, project="docs")
+    execution = GdriveExecution("conn", 2, 1, "owner", "later", "scope", {})
+    source = _PushedSource()
+    rounds = _MAX_AUTOMATIC_ATTEMPTS + 2
+    for round_ in range(rounds):
+        later = (datetime.now(timezone.utc) + timedelta(hours=1 + round_)).isoformat()
+        brain = _DeferringBrain(later)
+        brain.pushes = ["prior"] * round_  # so the replayed push reports `unchanged`, as the sink does
+        state = StateStore(path)  # a restart between runs
+        summary = IngestSummary("docs", failure_categories={})
+        await _drain_pending(brain, execution, source, conn, state, namespace, 2, summary, 10)
+
+        assert summary.created + summary.unchanged == 1  # the push itself succeeded …
+        assert summary.failure_categories == {"rate_limited": 1}  # … and the checkpoint was deferred
+        assert summary.failed == 0  # an accepted document is not a failed one
+        row = _row(state, namespace)
+        assert row["exhausted_at"] is None and _parse(row["not_before"]) == _parse(later)
+        assert state.pending_count(namespace, 2) == 1  # still owed: no acknowledgment
+        # Not offered again before the brain's wait; release it for the next round.
+        assert state.list_pending(namespace, 2) == []
+        state._db.execute("UPDATE pending_work SET not_before=NULL WHERE item_key='doc'")
+        state._db.commit()
+        state.close()
+
+    state = StateStore(path)
+    owed = state.list_pending(namespace, 2)
+    assert [w.item_key for w in owed] == ["doc"] and state.work_failures(owed[0]) == 0
+    recovered = _DeferringBrain(None)
+    summary = IngestSummary("docs", failure_categories={})
+    await _drain_pending(recovered, execution, source, conn, state, namespace, 2, summary, 10)
+    assert recovered.checkpoints == 1 and summary.failure_categories == {}
+    assert state.pending_count(namespace, 2) == 0  # acknowledged once
+    state.close()
+
+
+# --- R45 M6: a response that arrives after the RUN budget, within its own, is not a failure ------
+
+class _Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+def _source_with_clock(monkeypatch, *, request_seconds=30.0):
+    from aios_ingest.sources.gdrive import GoogleDriveSource
+
+    clock = _Clock()
+    monkeypatch.setattr("aios_ingest.sources.gdrive.time.monotonic", clock)
+    source = GoogleDriveSource(file_ids=["doc"], api_mode="docs", _drive_service=object(),
+                               _docs_service=object(), request_deadline_seconds=request_seconds)
+    return source, clock
+
+
+@pytest.mark.parametrize("elapsed, run_budget, category", [
+    (5.0, 2.0, "run_deadline"),       # Google answered in 5 s (within 30 s) but after the 2 s run remainder
+    (31.0, 60.0, "provider_timeout"),  # the request itself overran its own 30 s deadline
+], ids=["late-for-the-run", "late-for-the-request"])
+def test_a_late_successful_response_is_classified_by_the_deadline_it_crossed(monkeypatch, elapsed, run_budget, category):
+    source, clock = _source_with_clock(monkeypatch)
+    source.set_run_deadline(clock.now + run_budget)
+
+    def call():
+        clock.now += elapsed  # the provider answers successfully, `elapsed` seconds later
+        return {"id": "doc"}
+
+    with pytest.raises(ProviderDeferred) as deferred:
+        source._provider_call(call)
+    assert deferred.value.category == category
+
+
+class _LateSource(_Source):
+    """Metadata answered in time for Google, after the run's budget — every run."""
+
+    def _metadata(self, file_id):
+        self.calls.append(("metadata", file_id))
+        raise ProviderDeferred("late for the run", category="run_deadline")
+
+
+@pytest.mark.asyncio
+async def test_a_document_that_always_lands_after_the_run_budget_is_never_charged(world):
+    state, namespace = world
+    state.enqueue_work(namespace, 2, "doc", "upsert", {})
+    for _ in range(_MAX_AUTOMATIC_ATTEMPTS + 2):
+        summary = IngestSummary("docs", failure_categories={})
+        await _drain(state, namespace, _LateSource(), summary)
+        assert summary.failed == 0 and summary.failure_categories == {"run_deadline": 1}
+    row = _row(state, namespace)
+    assert (row["attempts"], row["not_before"], row["exhausted_at"]) == (0, None, None)
+    assert state.work_failures(state.list_pending(namespace, 2)[0]) == 0
+    # A fresh budget reads it normally: the obligation is still there, untouched and offered.
+    assert [w.item_key for w in state.list_pending(namespace, 2)] == ["doc"]
