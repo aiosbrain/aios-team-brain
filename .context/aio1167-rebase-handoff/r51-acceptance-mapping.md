@@ -177,3 +177,10 @@ publication change. Binding-catch no-later-call hardening and Note B stay DEFERR
 Exact source snapshot and per-file hashes: `.context/aio1167-review-bundles/r51-correction-complete-20261031T192822Z/manifest.json`. The candidate is 46 paths (23 modified, 23 added), patch SHA-256 `7bce966593bb2e4c67374d17aa7317f1a0386c92eee34f37c8a97d2b4e165e6f`; untracked archive SHA-256 `bfbc6e4e13ea011d51a1312d3d652a1f118644830bb7a54927333c0c592dffb4`.
 
 The Opus-reported IST-window analyzer failure was independently rerun under UTC and passed (1 test). `npm run check:docs` and `git diff --check HEAD` passed. The approved loopback-enabled full sidecar run is the valid run; the initial sandbox socket-bind errors are not counted. TypeScript production, Vitest, data-mechanics and HTTP suites were not rerun for this Python/docs-only correction. This candidate needs a fresh Fable delta review, then fresh blind Astra HIGH and GPT-6.1 Sol HIGH reviews. The fifth accepted finding (legacy email unlink tombstones) remains held pending verified ownership agreement with PR #714; do not claim it fixed.
+
+## Fable delta review of four R51 blind-final corrections
+
+- Exact candidate: base `5ecd2989e21fded915b41b508477bb267aaec06d`, 46 paths, patch SHA-256 `7bce966593bb2e4c67374d17aa7317f1a0386c92eee34f37c8a97d2b4e165e6f`.
+- Fable 5.1 first-party, fresh read-only context, `Read/Glob/Grep` only: **PASS**, no confirmed High/Medium finding, no HOLD. Report SHA-256 `e9fc3274e7fbd5ef94960dc652b428b0b4a28c0bce421cc33cfda1321b85e6a5`.
+- Three non-blocking Low notes are pending Astra adjudication: JSON1 portability, repeated named deferrals consuming removal retry budget, and the identified specific coverage gaps. The reviewer ran no tests/commands and did not extract packet archives. Coordinator independently verified the full manifest and archive hashes.
+- After Astra disposition, obtain new blind Astra HIGH and GPT-6.1 Sol HIGH reviews for this exact full candidate; no prior blind verdict covers the corrections.
