@@ -350,3 +350,6 @@ R50 complete writer snapshot preserved before coordinator checks. The remote che
 
 - Fresh GPT-6 Astra HIGH adjudication accepted/fix all five distinct blind-review issues: one High and four Medium. Detailed decisions, code evidence, bounded fix guidance and required regressions are in `r51-blind-final-adjudication-20261031.md`.
 - No user decision is required. Keep source frozen; perform overlap inspection before edits; then resume only the existing Opus 5.5 HIGH writer after fresh Claude subscription admission. Prior full-sidecar and focused-test evidence remains valid only for unchanged slices; rerun all tests invalidated by the five corrections.
+
+- Ownership scan before implementation: the only open PR overlapping the five findings beyond #743 is #714, which edits `lib/identity/member-identities.ts` for Slack timeline identity generation/suppression. This intersects the exact `setMemberIdentity` area of the fifth legacy-tombstone fix. That identity slice is held pending owner confirmation; the bounded writer prompt covers only the four independent ingestion restriction/watch fixes. No overlapping open PR found for those four paths.
+- Exact sole-writer prompt: `r51-blind-final-correction-prompt-20261031.md`. Existing Opus session remains the sole writer; fresh subscription admission is required immediately before resume.
