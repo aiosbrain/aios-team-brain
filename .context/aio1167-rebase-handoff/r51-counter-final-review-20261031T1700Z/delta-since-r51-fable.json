@@ -1,0 +1,65 @@
+{
+  "base": "5ecd2989e21fded915b41b508477bb267aaec06d",
+  "changed_path_hashes": {
+    "ingestion/aios_ingest/gdrive_sync.py": {
+      "current": "f0872b8942eca500cf58149ea7e59ad0c0342d4222e635022b48eca370f1ce2e",
+      "prior": "9e64bc20204f882fb7a3cf900fe284b7a487818805741f0628687dda8b2c45e8"
+    },
+    "ingestion/tests/test_flush_authority_outcome.py": {
+      "current": "2c0a0236e9c86b2490f7d67829e1fa0fc8634d26d4e47882b39404b4799d3c27",
+      "prior": "21a6364f90739ecc1c80913cc0ec54c154b587a5b5350a39c65ee47ff3cd1a5a"
+    }
+  },
+  "changed_paths": [
+    "ingestion/aios_ingest/gdrive_sync.py",
+    "ingestion/tests/test_flush_authority_outcome.py"
+  ],
+  "current_manifest_sha256": "dff71f20a16aa67487b09648dbc0537ea1be33aa61cff6c3ff40609aaf31a959",
+  "current_tracked_patch_sha256": "a7d20559ee27e01f665a622069042f3fab6c218f914cf5cc559331e07bcdf773",
+  "current_untracked_archive_sha256": "d554a5aea12094048b6d1df881dc85f79b768a5622adac5c79e05ef3898abe11",
+  "path_count": 42,
+  "prior_manifest_sha256": "ec8237e7050d579da03ef0594600cb6b46aff6446164197c5b5498df93d67e03",
+  "prior_reviewed_patch_sha256": "c09abf59b6a6d30993088321da612e1d384365ffad8d87bcb100cac2b715dfbe",
+  "unchanged_paths": [
+    "app/t/[team]/admin/integrations/actions.ts",
+    "app/t/[team]/admin/members/actions.ts",
+    "components/admin/identity-conflicts.tsx",
+    "docs/ARCHITECTURE.md",
+    "ingestion/aios_ingest/brain_client.py",
+    "ingestion/aios_ingest/connector_state.py",
+    "ingestion/aios_ingest/sources/gdrive.py",
+    "ingestion/aios_ingest/state.py",
+    "ingestion/tests/test_account_hold_before_streams.py",
+    "ingestion/tests/test_bound_root_loss.py",
+    "ingestion/tests/test_brain_minimum_provenance.py",
+    "ingestion/tests/test_checkpoint_acknowledgment.py",
+    "ingestion/tests/test_checkpoint_uncertainty_latch.py",
+    "ingestion/tests/test_deferred_root_scope.py",
+    "ingestion/tests/test_document_restrictions.py",
+    "ingestion/tests/test_drain_recovery.py",
+    "ingestion/tests/test_exhaustion_is_not_completion.py",
+    "ingestion/tests/test_gdrive_poll_reporting.py",
+    "ingestion/tests/test_gdrive_upgrade.py",
+    "ingestion/tests/test_pre_stream_scope.py",
+    "ingestion/tests/test_restricted_root_recovery.py",
+    "ingestion/tests/test_restriction_lifetime.py",
+    "ingestion/tests/test_restriction_publication_recovery.py",
+    "ingestion/tests/test_retry_after_holds.py",
+    "ingestion/tests/test_retry_after_parsing.py",
+    "ingestion/tests/test_root_evidence_r49.py",
+    "lib/identity/member-identities.ts",
+    "lib/integrations/gdrive-authority.ts",
+    "lib/integrations/gdrive-oauth.ts",
+    "postgres/migrations/20261031140000_gdrive_restriction_generation_lifetime.sql",
+    "postgres/schema.sql",
+    "test/datamechanics/gdrive-admin-credential-race.datamechanics.test.ts",
+    "test/datamechanics/gdrive-admin-grant-policy.datamechanics.test.ts",
+    "test/datamechanics/gdrive-admin-test.datamechanics.test.ts",
+    "test/datamechanics/gdrive-authority.datamechanics.test.ts",
+    "test/datamechanics/gdrive-complete-snapshot-overlap.datamechanics.test.ts",
+    "test/datamechanics/gdrive-identity-tombstone-email.datamechanics.test.ts",
+    "test/datamechanics/gdrive-oauth-lock-order.datamechanics.test.ts",
+    "test/datamechanics/identity-discovery-conflicts.datamechanics.test.ts",
+    "test/identity-conflicts-view.test.ts"
+  ]
+}
