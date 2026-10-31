@@ -1,0 +1,7 @@
+You are doing a bounded no-tools preflight for an independent Fable 5.1 code review. This is not the review and must not issue a verdict.
+
+Task: review the R51 AIO-1167 correction to Google Drive ingestion restrictions. Four adjudicated issues are being corrected: (1) restricted items can suppress verified removals; (2) cross-stream removal probes can swallow ProviderDeferred and lose quota/resource Retry-After evidence; (3) watch renewal can make Google provider calls during an account hold; (4) a standing service-account identity prerequisite can skip publication recovery.
+
+The accepted invariants are: keep restrictions durable and correctly scoped; process verified removals without an unauthorized/early document read; preserve unresolved removals until safe; stop account calls on quota holds; retain resource-only minima without widening account authority; do not make watch calls before the verified account's hold expires; retry retained restriction publication without an identity provider read; preserve claim/credential boundaries and recovery behavior. One separate legacy mixed-case identity tombstone finding is held because PR #714 owns the overlapping identity writer; do not recommend editing that slice in this correction.
+
+Confirm in a concise task-specific response that you understand the four review targets and these safety boundaries. Do not claim the code is correct, do not produce a verdict, do not use tools, do not access MCP, and do not write or update memory.

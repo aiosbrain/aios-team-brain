@@ -1,0 +1,7 @@
+docs/ARCHITECTURE.md
+ingestion/aios_ingest/gdrive_sync.py
+ingestion/aios_ingest/state.py
+ingestion/aios_ingest/watch_renewal.py
+ingestion/tests/test_identity_prerequisite_publication.py
+ingestion/tests/test_restricted_removal.py
+ingestion/tests/test_watch_account_hold.py

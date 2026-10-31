@@ -1,0 +1,49 @@
+{
+  "base": "5ecd2989e21fded915b41b508477bb267aaec06d",
+  "baseline_manifest_sha256": "377c227e0992f9e80d2a2ef92ad8bbc2f83b9b22e48d99bafdf80cb36df1b685",
+  "current_manifest_sha256": "dfce2bf22f2717b1e688fe7b44bbc0cfdbddae80ed2b2fd281cbc61bd05f3c82",
+  "changes": [
+    {
+      "path": "docs/ARCHITECTURE.md",
+      "status": "changed",
+      "baseline_sha256": "5acf28fe96b9991cad7d93e0a294df2a21d2bce0a325e26afde0cd4e02eb1ba2",
+      "current_sha256": "6d42631a0475905321d0b56accce118e37e55a0dc1af4dac706a3f9f02e1250c"
+    },
+    {
+      "path": "ingestion/aios_ingest/gdrive_sync.py",
+      "status": "changed",
+      "baseline_sha256": "47714e163ec0e469f1b7a07b346c3998db57299f8c32359a263a4207ccb61b65",
+      "current_sha256": "756542ae18332128fff143b7cd88423c9aec320aecd1d1a68af2e2538b1e8aaf"
+    },
+    {
+      "path": "ingestion/aios_ingest/state.py",
+      "status": "changed",
+      "baseline_sha256": "dc10d3b65f28dd95cab2b75ce4bfe20177045bd1d22be0d39cc906a63edcb5e4",
+      "current_sha256": "db9c2c20f94cb679228354acd455b037fd89fcddf7505c2b59733fa8eb6d1253"
+    },
+    {
+      "path": "ingestion/aios_ingest/watch_renewal.py",
+      "status": "added",
+      "baseline_sha256": null,
+      "current_sha256": "6f4b7684e00f53a9a60ae4118988a2b09df8d0f478ccdd1cb5d4b2346b565525"
+    },
+    {
+      "path": "ingestion/tests/test_identity_prerequisite_publication.py",
+      "status": "added",
+      "baseline_sha256": null,
+      "current_sha256": "7c2dc6acd861a000a14b61c774f64b061fbe66aa62a79a9aade4f81a4ba500a0"
+    },
+    {
+      "path": "ingestion/tests/test_restricted_removal.py",
+      "status": "added",
+      "baseline_sha256": null,
+      "current_sha256": "608b6ebb1eba5ee1b6c18ef72f3c35af0dede2eb43687f9787cca2c180d3257e"
+    },
+    {
+      "path": "ingestion/tests/test_watch_account_hold.py",
+      "status": "added",
+      "baseline_sha256": null,
+      "current_sha256": "72ef0e68e0052f5f9dd34395c97adada2a0d354f2ef4798c0c87ad69cb0b480b"
+    }
+  ]
+}
