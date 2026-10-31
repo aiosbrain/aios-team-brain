@@ -353,3 +353,5 @@ R50 complete writer snapshot preserved before coordinator checks. The remote che
 
 - Ownership scan before implementation: the only open PR overlapping the five findings beyond #743 is #714, which edits `lib/identity/member-identities.ts` for Slack timeline identity generation/suppression. This intersects the exact `setMemberIdentity` area of the fifth legacy-tombstone fix. That identity slice is held pending owner confirmation; the bounded writer prompt covers only the four independent ingestion restriction/watch fixes. No overlapping open PR found for those four paths.
 - Exact sole-writer prompt: `r51-blind-final-correction-prompt-20261031.md`. Existing Opus session remains the sole writer; fresh subscription admission is required immediately before resume.
+
+- Writer admission before the next Opus turn (2026-10-31 19:08 UTC): session 47%, all-model week 36%, Fable week 43%, credits off; `claude auth status` is first-party Claude.ai Max. Existing Opus 5.5 HIGH session `628402d5-a1c6-42b7-b736-e84358c1a749` is idle and remains the sole writer. Resume only with the exact bounded prompt; no identity-file edits.
