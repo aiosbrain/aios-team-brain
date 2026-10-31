@@ -9,15 +9,21 @@ import { RemoveMemberButton } from "@/components/admin/remove-member-button";
 import { ManagerSelect } from "@/components/admin/manager-select";
 import { MemberProvisioningCell } from "@/components/admin/member-provisioning-cell";
 import { listMemberIdentities } from "@/lib/identity/list";
+import { IdentityConflicts } from "@/components/admin/identity-conflicts";
+import { listIdentityDiscoveryConflicts, type IdentityConflictPage } from "@/lib/identity/discovery-conflicts";
+import { requireTeamAdmin } from "@/lib/auth/guard";
 import { getProvisioningAvailabilityAction } from "@/app/t/[team]/admin/actions";
 import { getMemberProvisioning } from "@/lib/provisioning/run";
 
 export default async function MembersAdminPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ team: string }>;
+  searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
 }) {
   const { team: teamSlug } = await params;
+  const conflictCursor = (await searchParams).conflicts;
   const db = await serverClient();
 
   const { data: team } = await db
@@ -63,6 +69,17 @@ export default async function MembersAdminPage({
     listMemberIdentities(db, team.id),
   ]);
   const provisioningByMember = new Map(provisioningEntries);
+  // Refused automatic identity links (AC-08): an explicit team-admin read for THIS session, through the
+  // diagnostic's own owner, which re-checks the viewer and returns allowlisted fields only.
+  const viewer = await requireTeamAdmin(teamSlug);
+  const conflicts: IdentityConflictPage = viewer && viewer.teamId === team.id
+    ? await listIdentityDiscoveryConflicts(adminDb, viewer, {
+      cursor: typeof conflictCursor === "string" ? conflictCursor : null,
+    })
+    : { status: "forbidden" };
+  const nextConflictsHref = conflicts.status === "ok" && conflicts.nextCursor
+    ? `/t/${teamSlug}/admin/members?conflicts=${encodeURIComponent(conflicts.nextCursor)}`
+    : null;
   const providerOf = (memberId: string, provider: string): ProviderLink | null => {
     const p = identities.get(memberId)?.providers.find((x) => x.provider === provider);
     return p ? {
@@ -89,6 +106,7 @@ export default async function MembersAdminPage({
           <InviteMember teamSlug={teamSlug} provisioningAvailability={provisioningAvailability} />
         </div>
       </div>
+      <IdentityConflicts page={conflicts} nextHref={nextConflictsHref} />
       <div className="prism-card overflow-x-auto">
         <table className="w-full text-sm">
           <thead>
@@ -108,7 +126,7 @@ export default async function MembersAdminPage({
           </thead>
           <tbody>
             {(members ?? []).map((m) => (
-              <tr key={m.id} className="border-b border-border-subtle last:border-0 align-top">
+              <tr key={m.id} id={`member-${m.id}`} className="border-b border-border-subtle last:border-0 align-top">
                 <td className="px-4 py-3 font-medium text-ink">{m.display_name}</td>
                 <td className="px-4 py-3 text-ink-secondary">{m.email}</td>
                 <td className="px-4 py-3 font-mono text-xs text-ink-secondary">{m.actor_handle}</td>

@@ -192,8 +192,10 @@ export type DiscoveredIdentityOutcome = "linked" | "exists" | "conflict" | "revi
  * An evidence-backed AUTOMATIC link of a stable provider identity (AIO-1167 R44 F1) — far narrower
  * than `setMemberIdentity`. It creates a link only for an identity that has NEVER been reviewed: no
  * mapping row and no mapping state at all, so a deliberate unlink tombstone, an existing link, or a
- * manual mapping always wins. It never remaps (a different existing owner is a `conflict`, audited,
- * nothing changes) and never links a deactivated member or a connector. A created link goes through
+ * manual mapping always wins. It never remaps and never links a deactivated member or a connector. A
+ * reviewed decision (a mapping-state row: a link or an unlink tombstone) is `reviewed` whatever email
+ * is observed later; only an UNREVIEWED legacy mapping held by another member is a `conflict` —
+ * audited (`identity.discovery_conflict`), nothing changes. A created link goes through
  * the same mapping-state revision, repair obligation and epoch protocol as every other link.
  * The caller decides the evidence; this owner decides only whether a link may be created.
  */
@@ -226,8 +228,19 @@ export async function discoverMemberIdentity(
       `select member_id from member_identities where team_id=$1 and provider=$2 and external_id=$3 for update`,
       [teamId, provider, externalId],
     );
+    if (existing[0]?.member_id === memberId) return "exists";
+    // Same lock order as before (identity row, then mapping state); the DECISION waits for both.
+    const { rows: states } = await runSql<{ state: string }>(
+      `select state from member_identity_mapping_state
+        where team_id=$1 and provider=$2 and external_id=$3 for update`,
+      [teamId, provider, externalId],
+    );
+    // Any prior decision — a reviewed link to someone else, or an unlink tombstone — stands, and a later
+    // email disagreeing with it is NOT a conflict (AIO-1167 R45, AC-08): it is not audited as one.
+    if (states[0]) return "reviewed";
     if (existing[0]) {
-      if (existing[0].member_id === memberId) return "exists";
+      // Only an UNREVIEWED legacy mapping held by another member is a refused automatic link — the
+      // event the Admin diagnostic (`lib/identity/discovery-conflicts`) surfaces.
       await audit(admin, {
         team_id: teamId, actor_kind: opts.actor?.kind ?? "system", member_id: opts.actor?.memberId ?? null,
         action: "identity.discovery_conflict", target_type: "member", target_id: memberId,
@@ -235,12 +248,6 @@ export async function discoverMemberIdentity(
       });
       return "conflict";
     }
-    const { rows: states } = await runSql<{ state: string }>(
-      `select state from member_identity_mapping_state
-        where team_id=$1 and provider=$2 and external_id=$3 for update`,
-      [teamId, provider, externalId],
-    );
-    if (states[0]) return "reviewed"; // an unlink tombstone (or any prior decision) stands
     await runSql(
       `insert into member_identities(team_id,member_id,provider,external_id,handle,email)
        values ($1,$2,$3,$4,$5,$6)`,

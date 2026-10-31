@@ -973,7 +973,13 @@ R44 contracts (AIO-1167):
   a deactivated member gets no new link or authentication. A fenced Drive push first links an observed `permission:` id
   whose email names exactly one active member (`lib/integrations/gdrive-identity-discovery.ts` →
   `discoverMemberIdentity`), only for an id never reviewed — links, manual mappings and unlink
-  tombstones stand; a disagreeing email is an audited conflict, never a transfer. An email-only
+  tombstones stand; a disagreeing email is an audited conflict, never a transfer. Only an UNREVIEWED
+  legacy mapping held by another member is such a conflict (a reviewed link or unlink tombstone is
+  `reviewed`, never audited as one). Admins see refused automatic links on Admin → Members through
+  `lib/identity/discovery-conflicts` — a read-only, team-scoped, paginated projection of the existing
+  `identity.discovery_conflict` audit events beside the CURRENT mapping (re-read), allowlisted fields
+  only, `unavailable` on a read failure, active team-posture admins only, never an API surface
+  (guarded by `test/guards/identity-conflicts-surface.test.ts`). No new mapping authority. An email-only
   observation coalesces into the one stable-id observation carrying that email at the same role and
   instant (`coalesceGdriveObservations`, used by the ledger, the evidence store and the Timeline's
   frontmatter display; the Timeline's stored-evidence leg applies the same rule per item through
