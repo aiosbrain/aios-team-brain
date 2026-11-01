@@ -1,0 +1,5 @@
+# Opus R51 post-blind correction result
+
+The existing sole Opus 5.5 HIGH writer completed the bounded F1–F3 correction prompt in session `628402d5-a1c6-42b7-b736-e84358c1a749` at 2026-11-01 02:50:16 UTC. It changed only the three production paths and two test paths listed in the recovery packet. It ran no tests, made no commits or pushes, and dispatched no reviews.
+
+Corrections and regression cases are described in the exact adjudication at `.context/aio1167-review-bundles/r51-postblind-correction-fable-20261101T2051Z/astra-adjudication-result.md` and the writer prompt at the same packet's `opus-correction-prompt.md`. Limitations reported by the writer: the Drive fake does not paginate; restart-closed-root coverage uses nested folders plus existing interrupted-listing tests; poll admission is asserted through the reopened-state gate with existing full-path coverage; lost acknowledgment is modeled as persisted state followed by timeout; non-404/restricted/trash controls remain existing tests.
