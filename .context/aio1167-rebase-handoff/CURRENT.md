@@ -510,3 +510,8 @@ R50 complete writer snapshot preserved before coordinator checks. The remote che
 
 - First review command exited `1` before opening a model turn: Claude CLI reported that `--print` requires stdin or a prompt argument. Because `--add-dir` accepts multiple following paths, the shell invocation's positional prompt was parsed as another directory. Captured `attempt1.stderr`, `attempt1.exit`, and `attempt1.launch.json`; stream file was zero bytes. No provider refusal, no model review, no source change.
 - Next: preserve this no-call launch failure in the remote checkpoint, then run the same exact read-only Fable prompt via stdin (with the same model and tool restrictions). Do not retry with a different model or duplicate an active review.
+
+## 2026-11-01 03:10 UTC — stream-JSON CLI requires verbose flag
+
+- Attempt 2 passed the same prompt via stdin but exited before model start because the installed CLI requires `--verbose` with `--output-format=stream-json`. `attempt2.stderr`, `attempt2.exit`, and launch metadata are checkpointed; stream is zero bytes. No model call, provider refusal, review verdict, or source change.
+- Next: push this evidence and retry once with `--verbose`; retain exact model, prompt, tool limits, and authenticated subscription path.

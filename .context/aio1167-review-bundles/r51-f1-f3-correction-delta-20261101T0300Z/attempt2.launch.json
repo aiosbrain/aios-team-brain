@@ -1,0 +1,13 @@
+{
+  "model": "claude-fable-5-1",
+  "api_key_env": "unset",
+  "tools": "Read,Glob,Grep",
+  "disallowed_tools": "Write,Edit,Bash,Task",
+  "strict_mcp_config": true,
+  "safe_mode": true,
+  "restricted": true,
+  "prompt_delivery": "stdin",
+  "cli_error": "--output-format=stream-json requires --verbose",
+  "stream_bytes": 0,
+  "exit": 1
+}
