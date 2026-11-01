@@ -1,0 +1,18 @@
+{
+  "model": "claude-fable-5-1",
+  "session_id": "f7e1e5a2-c69b-4d1e-ac96-3a2aac1e4403",
+  "api_key_source": "none",
+  "mcp_servers": 0,
+  "result_subtype": "success",
+  "is_error": false,
+  "duration_ms": 507385,
+  "turns": 44,
+  "usage": {
+    "input_tokens": 226,
+    "cache_read_input_tokens": 963828,
+    "cache_creation_input_tokens": 222993,
+    "output_tokens": 34409
+  },
+  "report_sha256": "c7183f6dd0aa50ba23fe807e3ab84f9ba00822676fce8c138c8e4313c0030e83",
+  "report_chars": 6319
+}
