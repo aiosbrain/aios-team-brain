@@ -1,0 +1,12 @@
+{
+  "model": "claude-fable-5-1",
+  "api_key_env": "unset",
+  "tools": "Read,Glob,Grep",
+  "disallowed_tools": "Write,Edit,Bash,Task",
+  "strict_mcp_config": true,
+  "safe_mode": true,
+  "restricted": true,
+  "prompt_delivery": "attempted positional arg after --add-dir; CLI rejected before model start",
+  "stream_bytes": 0,
+  "exit": 1
+}
