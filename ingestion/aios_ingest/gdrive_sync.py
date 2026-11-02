@@ -2904,6 +2904,27 @@ async def _enumerate_baseline(
             )
             raise SelectedRootUnverified(f"selected folder {root_id} could not be verified")
         if observed.state == "absent" and record_unavailable("folder", root_id):
+            # What this build already listed through the lost folder — while its pagination or a
+            # sibling root kept the build open — supports nothing now (AIO-1167 final review, High):
+            # it is withdrawn from the building snapshot before anything can publish it. Support
+            # through other roots stays; the rest of the folder's traversal closes empty below.
+            state.withdraw_lost_root_support(namespace, generation, root_id, snapshot_id=snapshot_id)
+            continue
+        binding = state.root_obligations(integration_id, generation).get(("folder", root_id))
+        if (
+            binding is not None
+            and (binding.detail or "").startswith("selected root unavailable")
+            and not state.root_traversal_open(namespace, generation, root_id, snapshot_id=snapshot_id)
+        ):
+            # Restored after this build already finished its traversal without it — closed empty, its
+            # support withdrawn. Settling it here would publish a snapshot with none of its contents,
+            # so it becomes a DEFERRED obligation instead: the connection stays partial and the
+            # controlled rescan (`_deferred_root_admissible`) lists it under a fresh snapshot.
+            state.mark_root_deferred(
+                integration_id, generation, "folder", root_id, drive_id,
+                detail="restored after its loss was recorded; it must be listed again",
+            )
+            deferred.add(root_id)
             continue
         # Read where it is bound: a merely uncertain or unavailable root is settled by that read (a
         # DEFERRED one is untouched here — `settle_root` without `enumerated`).

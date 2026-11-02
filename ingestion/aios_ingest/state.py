@@ -2171,6 +2171,92 @@ class StateStore:
                 claimants.append(str(row["namespace"]))
         return claimants
 
+    def withdraw_lost_root_support(
+        self, namespace: str, generation: int, root_id: str, *, snapshot_id: int,
+    ) -> list[str]:
+        """Withdraw a verified-lost root's support from a BUILDING snapshot (AIO-1167 final review, High).
+
+        A root whose own metadata the provider answered not-found supports nothing (R48 D1). What
+        this build already materialized through it — pages listed before the loss, while pagination
+        or a sibling root kept the build open — must not survive into its publication. In one
+        transaction: the root leaves every member's ``root_ids`` (with its ancestry), a member left
+        with no root leaves the snapshot, and an upsert owed by THIS snapshot's own pages for such a
+        member is superseded exactly as publication supersedes a retired snapshot's — it would ingest
+        a document the snapshot no longer selects. Support through any other root (a direct file, an
+        overlapping folder) is kept, other snapshots and other streams are not touched, and nothing is
+        removed from the brain: the fenced reconciliation of the published snapshot does that.
+
+        Page membership is applied once, when a page is first materialized, and never on replay, so a
+        withdrawn root cannot be restored by replaying its old pages. Only a ``building`` snapshot is
+        changed — a published one is never rewritten here. Idempotent. Returns the provider ids that
+        lost their final support."""
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            status = self._db.execute(
+                "SELECT status FROM selection_snapshots WHERE namespace=? AND generation=? AND snapshot_id=?",
+                (namespace, generation, snapshot_id),
+            ).fetchone()
+            if status is None or status["status"] != "building":
+                self._db.rollback()
+                return []
+            lost: list[str] = []
+            for row in self._db.execute(
+                "SELECT provider_id,root_ids FROM selected_membership "
+                "WHERE namespace=? AND generation=? AND snapshot_id=? ORDER BY provider_id",
+                (namespace, generation, snapshot_id),
+            ).fetchall():
+                roots = set(json.loads(row["root_ids"]))
+                if root_id not in roots:
+                    continue
+                roots.discard(root_id)
+                provider_id = str(row["provider_id"])
+                self._db.execute(
+                    "DELETE FROM membership_ancestry WHERE namespace=? AND generation=? AND snapshot_id=? "
+                    "AND provider_id=? AND root_id=?",
+                    (namespace, generation, snapshot_id, provider_id, root_id),
+                )
+                if roots:
+                    self._db.execute(
+                        "UPDATE selected_membership SET root_ids=?,seen_at=? WHERE namespace=? "
+                        "AND generation=? AND snapshot_id=? AND provider_id=?",
+                        (json.dumps(sorted(roots)), _now_iso(), namespace, generation, snapshot_id,
+                         provider_id),
+                    )
+                else:
+                    self._db.execute(
+                        "DELETE FROM selected_membership WHERE namespace=? AND generation=? "
+                        "AND snapshot_id=? AND provider_id=?",
+                        (namespace, generation, snapshot_id, provider_id),
+                    )
+                    lost.append(provider_id)
+            now = _now_iso()
+            for provider_id in lost:
+                for obsolete in self._db.execute(
+                    "SELECT w.observation_revision,w.page_id FROM pending_work w "
+                    "JOIN materialized_pages p ON p.namespace=w.namespace AND p.generation=w.generation "
+                    "AND p.page_id=w.page_id "
+                    "WHERE w.namespace=? AND w.generation=? AND w.item_key=? AND w.action='upsert' "
+                    "AND w.acknowledged_at IS NULL AND w.superseded_at IS NULL AND p.snapshot_id=?",
+                    (namespace, generation, provider_id, snapshot_id),
+                ).fetchall():
+                    self._db.execute(
+                        "UPDATE pending_work SET superseded_at=?,updated_at=? WHERE namespace=? "
+                        "AND generation=? AND item_key=? AND action='upsert' AND observation_revision=?",
+                        (now, now, namespace, generation, provider_id, obsolete["observation_revision"]),
+                    )
+                    self._db.execute(
+                        "UPDATE page_obligation_outcomes SET status='superseded',superseded_by_snapshot=?,"
+                        "updated_at=? WHERE namespace=? AND generation=? AND page_id=? AND item_key=? "
+                        "AND observation_revision=? AND status='pending'",
+                        (snapshot_id, now, namespace, generation, obsolete["page_id"], provider_id,
+                         obsolete["observation_revision"]),
+                    )
+            self._db.commit()
+            return lost
+        except Exception:
+            self._db.rollback()
+            raise
+
     def remove_membership(self, namespace: str, generation: int, provider_id: str,
                           *, snapshot_id: int | None = None) -> bool:
         selected = snapshot_id if snapshot_id is not None else self.snapshot_id(namespace)

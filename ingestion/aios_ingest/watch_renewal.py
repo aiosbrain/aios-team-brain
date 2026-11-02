@@ -23,7 +23,8 @@ Blocking work — client construction, credential refresh, the live authority ch
 call — runs in a small pool OWNED by this module, under one absolute run deadline, so the event loop
 and every other scheduler job stay responsive. SQLite is touched only from the event loop. A worker
 that is still running when its deadline passes cannot be stopped; it is abandoned, not trusted: its
-result can only ever add cleanup evidence for its attempt (never activation), and the resources it
+result can only ever add cleanup evidence for its attempt (never activation) or, for a quota answer,
+the verified account's local hold (published later, under fresh authority), and the resources it
 uses are closed only once it has finished.
 """
 
@@ -244,28 +245,74 @@ def _close_when_idle(run: _Run | None, closers: list[Callable[[], None]]) -> Non
         future.add_done_callback(close_all)
 
 
-def _late_evidence(
-    loop: asyncio.AbstractEventLoop, state: StateStore, record: WatchRecord,
-) -> Callable[[Future], None]:
-    """What an abandoned creation worker's eventual result may do: record cleanup evidence.
+def _on_loop(loop: asyncio.AbstractEventLoop, fn: Callable[..., Any], *args: Any) -> None:
+    """Hand one SQLite step from a worker thread back to the event loop that owns the StateStore."""
+    try:
+        loop.call_soon_threadsafe(fn, *args)
+    except RuntimeError:  # the loop is gone; nothing can be journaled from here
+        pass
 
-    It runs in the worker's thread, so the SQLite write is handed back to the event loop. A late
-    response can show that a channel exists (and how to stop it); it can never activate one.
+
+def _journal_late_hold(
+    state: StateStore, connection_id: str, generation: int, account_id: str, deferral: Any,
+) -> None:
+    """Journal an abandoned watch worker's quota answer as the account's hold (AIO-1167 final review).
+
+    Runs on the event loop. The existing monotonic owner (``hold_connection``) is used, so a later,
+    shorter answer never shortens a standing hold, and only the verified account the worker's
+    transport used is held. Nothing is published, activated, retired or advanced here: the hold is
+    published by the next acquisition that holds fresh authority (``_publish_watch_restrictions``)."""
+    not_before = getattr(deferral, "not_before", None)
+    if not not_before or not account_id:
+        return
+    try:
+        state.hold_connection(
+            connection_id, generation, account_id, str(not_before),
+            str(getattr(deferral, "category", None) or "rate_limited"),
+        )
+    except Exception as exc:  # a closed store: the evidence is lost, never misreported
+        log.warning("Drive watch late quota evidence could not be journaled: %s", type(exc).__name__)
+
+
+def _late_evidence(
+    loop: asyncio.AbstractEventLoop, state: StateStore, record: WatchRecord | None,
+    *, hold: tuple[str, int, str] | None = None,
+) -> Callable[[Future], None]:
+    """What an abandoned worker's eventual result may do — creation or stop.
+
+    It runs in the worker's thread, so every SQLite write is handed back to the event loop. A late
+    creation response can show that a channel exists (and how to stop it); it can never activate
+    one. A late ``WatchQuotaLimited`` — from a creation or a stop — is the ACCOUNT's quota: it is
+    journaled as a hold for ``hold`` = ``(connection_id, generation, account_id)``, the verified
+    account of the transport that made the call (captured when it was dispatched, never derived from
+    an older channel record). A cancelled future, a non-quota error, or a worker that never started
+    adds nothing.
     """
     def deliver(future: Future) -> None:
-        if future.cancelled() or future.exception() is not None:
+        if future.cancelled():
+            return
+        error = future.exception()
+        if isinstance(error, WatchQuotaLimited):
+            if hold is not None:
+                _on_loop(loop, _journal_late_hold, state, *hold, error.deferral)
+            return
+        if error is not None or record is None:
             return
         response = future.result()
         resource_id = response.get("resourceId") if isinstance(response, dict) else None
         if not isinstance(resource_id, str) or not resource_id:
             return
-        try:
-            loop.call_soon_threadsafe(
-                state.record_watch_evidence, record.connection, record.attempt_id, resource_id,
-            )
-        except RuntimeError:  # the loop is gone; the record stays uncertain until its expiry
-            pass
+        # The record stays uncertain until the next owner sees this and stops the channel.
+        _on_loop(loop, state.record_watch_evidence, record.connection, record.attempt_id, resource_id)
     return deliver
+
+
+def _account_held(run: "_Run", account_id: str) -> bool:
+    """Whether a hold now stands for this account — including one a late worker's quota answer just
+    journaled on this loop — so the sweep makes no further watch call for it."""
+    return _standing_account_hold(
+        run.state, run.execution.integration_id, run.execution.generation, account_id,
+    ) is not None
 
 
 def _past(instant: str | None, now: datetime) -> bool:
@@ -362,7 +409,10 @@ async def _create(
                 dispatched, page_token=cursor, verification_token=token,
                 access_token=access_token, provider_gate=provider_gate, deadline=dispatch_deadline,
             ),
-            on_late=_late_evidence(loop, run.state, dispatched),
+            on_late=_late_evidence(
+                loop, run.state, dispatched,
+                hold=(run.execution.integration_id, int(run.execution.generation), account_id),
+            ),
             deadline=dispatch_deadline,
         )
     except asyncio.CancelledError:
@@ -425,19 +475,28 @@ async def _create(
 
 async def _cleanup(
     run: _Run, manager: Any, connection: str, budget: _Budget, *, access_token: str | None,
-    provider_gate: Any,
+    provider_gate: Any, account_id: str | None = None,
 ) -> None:
+    """Stop known channels. ``account_id`` is the verified account of the CURRENT transport — the one
+    a quota answer to a stop belongs to, which an older channel record's account may not be."""
+    loop = asyncio.get_running_loop()
+    hold = (
+        (run.execution.integration_id, int(run.execution.generation), account_id)
+        if account_id else None
+    )
     for record in sorted(run.records.values(), key=lambda r: r.attempt_id):
         if record.connection != connection or record.state != CLEANUP_PENDING or not record.resource_id:
             continue
         if budget.stops <= 0 or record.stop_attempts >= MAX_STOP_ATTEMPTS or run.remaining() <= 0:
             return
+        if account_id and _account_held(run, account_id):
+            return  # a hold adopted during this sweep (e.g. a late worker's quota answer) stands
         budget.stops -= 1
         try:
             await run.offload(lambda r=record: manager.stop(
                 r, str(r.resource_id), access_token=access_token, provider_gate=provider_gate,
                 deadline=run.deadline,
-            ))
+            ), on_late=_late_evidence(loop, run.state, None, hold=hold))
         except asyncio.CancelledError:
             raise
         except BrainError:
@@ -530,7 +589,7 @@ async def _renew_connection(
                 )
                 await _cleanup(
                     run, manager, conn.name, budget, access_token=access_token,
-                    provider_gate=provider_gate,
+                    provider_gate=provider_gate, account_id=account_id,
                 )
             except _AccountQuotaHeld as held:
                 # The account's quota, learned from a watch call (R51 final 3): journaled locally
@@ -593,6 +652,8 @@ async def _create_where_due(
             if not _due(newest_expiry, now, budget.sweep_seconds):
                 continue
         predecessor = (active[-1].attempt_id if active else (legacy[-1].channel_id if legacy else None))
+        if _account_held(run, account_id):
+            return  # a hold adopted during this sweep (e.g. a late worker's quota answer) stands
         budget.creates -= 1
         await _create(
             run, manager, conn, account_id=account_id, drive_id=drive_id, cursor=cursor,
