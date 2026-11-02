@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
 import { getPool } from "@/lib/db/pg/pool";
+import { withIdentityMutationBoundary } from "@/lib/identity/authority";
 import { buildIdentityMap, resolveByProviderId } from "@/lib/identity/resolve";
 import { removeMemberIdentity, setMemberIdentity } from "@/lib/identity/member-identities";
 import { GoogleIdentityConflictError, publishGoogleDriveOAuthCredential } from "@/lib/integrations/gdrive-oauth";
@@ -347,6 +348,24 @@ describe("PR743 — author-email tombstones are decided across equivalent legacy
     });
   }
 
+  /**
+   * The email keys' own rows, mapping histories/revisions and repair obligations, WITHOUT the team-wide
+   * authority revision. For publisher runs only: a publication also links its separate `subject:` key,
+   * which legitimately advances the team revision; that transition is asserted on its own. Direct
+   * refusals keep the full `sideEffects` comparison, team revision, epoch and audits included.
+   */
+  async function emailState(teamId: string, ids: string[]) {
+    const { authority: _teamRevision, ...email } = JSON.parse(await identityState(teamId, ids));
+    return JSON.stringify(email);
+  }
+
+  /** Raw historical mapping state, as an older writer or a pre-canonicalization era left it. */
+  async function rawState(seed: Seed, key: string, state: "linked" | "unlinked", memberId: string | null) {
+    await getPool().query(
+      "insert into member_identity_mapping_state(team_id,provider,external_id,member_id,revision,state,updated_at) values ($1,'gdrive',$2,$3,1,$4,now())",
+      [seed.teamId, key, memberId, state]);
+  }
+
   /** Mapping states with numeric revisions (a bigint column may arrive as a string). */
   const statesOf = async (teamId: string, ids: string[]) =>
     (JSON.parse(await identityState(teamId, ids)).states as { external_id: string; state: string; revision: string | number }[])
@@ -359,8 +378,8 @@ describe("PR743 — author-email tombstones are decided across equivalent legacy
     const seed = await adminTeam();
     const alice = await member(seed, "alice");
     const k = spellings(alice.email);
-    // The SQL candidate filter matches this key (it CONTAINS the address); the canonical comparison
-    // rejects it, so it does not block or confuse the decision.
+    // This key CONTAINS the address but is a different address: the canonical comparison rejects it,
+    // so it does not block or confuse the decision.
     await legacyTombstone(seed, alice.id, `author-email:x${alice.email}`);
     const name = `docs-${randomUUID().slice(0, 6)}`;
     await publish(seed, S(), alice.email, name);
@@ -386,15 +405,17 @@ describe("PR743 — author-email tombstones are decided across equivalent legacy
       expect(await automatic(seed, alice.id, k.canonical)).toMatchObject({ tombstoned: true }); // repeated
       expect(await sideEffects(seed.teamId, ids)).toBe(before);
 
-      // Through the publisher: the credential is published, the email stays unlinked.
+      // Through the publisher: the credential is published, the email stays unlinked. The publication
+      // links its never-reviewed subject — its own transition, asserted separately.
       const name = `docs-${randomUUID().slice(0, 6)}`;
       const subject = S();
-      const identityBefore = await identityState(seed.teamId, ids);
+      const emailBefore = await emailState(seed.teamId, ids);
       await publish(seed, subject, alice.email, name); // Connect
-      await publish(seed, subject, alice.email, name); // Reconnect
+      await publish(seed, subject, alice.email, name); // Reconnect (same subject)
       expect(await credentialStored(seed.teamId, name)).toBe(true);
-      expect(await identityState(seed.teamId, ids)).toBe(identityBefore);
+      expect(await emailState(seed.teamId, ids)).toBe(emailBefore);
       expect(await emailOf(seed, k.canonical)).toBeNull();
+      expect(await emailOf(seed, subject)).toBe(alice.id);
     });
 
   it("several equivalent histories fail closed: no mapping is selected or published", async () => {
@@ -404,9 +425,7 @@ describe("PR743 — author-email tombstones are decided across equivalent legacy
     await legacyTombstone(seed, alice.id, k.mixedAddress);
     await legacyTombstone(seed, alice.id, k.upperPrefix);
     // A legacy linked STATE with no row (another historical record of the same person-key).
-    await getPool().query(
-      "insert into member_identity_mapping_state(team_id,provider,external_id,member_id,revision,state,updated_at) values ($1,'gdrive',$2,$3,1,'linked',now())",
-      [seed.teamId, k.mixedBoth, alice.id]);
+    await rawState(seed, k.mixedBoth, "linked", alice.id);
     const ids = [k.canonical, k.mixedAddress, k.upperPrefix, k.mixedBoth];
     const before = await sideEffects(seed.teamId, ids);
 
@@ -419,11 +438,103 @@ describe("PR743 — author-email tombstones are decided across equivalent legacy
     expect(await sideEffects(seed.teamId, ids)).toBe(before);
 
     const name = `docs-${randomUUID().slice(0, 6)}`;
-    const identityBefore = await identityState(seed.teamId, ids);
-    await publish(seed, S(), alice.email, name);
+    const subject = S();
+    const emailBefore = await emailState(seed.teamId, ids);
+    await publish(seed, subject, alice.email, name);
     expect(await credentialStored(seed.teamId, name)).toBe(true);
-    expect(await identityState(seed.teamId, ids)).toBe(identityBefore);
+    expect(await emailState(seed.teamId, ids)).toBe(emailBefore);
     expect(await emailOf(seed, k.canonical)).toBeNull();
+    expect(await emailOf(seed, subject)).toBe(alice.id); // the subject's own, separate transition
+  });
+
+  it("several all-LINKED histories also fail closed; a fenced canonical relink resolves them and reconnect proceeds", async () => {
+    const seed = await adminTeam();
+    const alice = await member(seed, "alice");
+    const k = spellings(alice.email);
+    // Two legacy linked histories, no live row, no canonical state.
+    await rawState(seed, k.mixedAddress, "linked", alice.id);
+    await rawState(seed, k.upperPrefix, "linked", alice.id);
+    const ids = [k.canonical, k.mixedAddress, k.upperPrefix];
+    const legacyStates = await statesOf(seed.teamId, [k.mixedAddress, k.upperPrefix]);
+    const before = await sideEffects(seed.teamId, ids);
+
+    const refused = await automatic(seed, alice.id, k.canonical);
+    expect(refused).toMatchObject({ ambiguous: true, created: false, updated: false, conflict: false });
+    expect(refused.mappingKey).toBeUndefined();
+    expect(await automatic(seed, alice.id, k.canonical)).toMatchObject({ ambiguous: true }); // repeated
+    expect(await sideEffects(seed.teamId, ids)).toBe(before);
+
+    // The publisher still publishes the credential and links nothing for the email.
+    const name = `docs-${randomUUID().slice(0, 6)}`;
+    const subject = S();
+    const emailBefore = await emailState(seed.teamId, ids);
+    await publish(seed, subject, alice.email, name);
+    expect(await credentialStored(seed.teamId, name)).toBe(true);
+    expect(await emailState(seed.teamId, ids)).toBe(emailBefore);
+    expect(await emailOf(seed, k.canonical)).toBeNull();
+
+    // An explicit relink fenced on exactly the canonical key (never-stated: revision 0) decides.
+    const relinked = await setMemberIdentity(db(), seed.teamId, alice.id, { provider: "gdrive", externalId: k.canonical },
+      { force: true, expectedRevision: 0, expectedRevisionKey: k.canonical });
+    expect(relinked).toMatchObject({ created: true, mappingKey: k.canonical, mappingRevision: 1 });
+    expect(await statesOf(seed.teamId, [k.mixedAddress, k.upperPrefix])).toEqual(legacyStates);
+
+    // Reconnect (same subject) succeeds; neither legacy history is rewritten.
+    await publish(seed, subject, alice.email, name);
+    expect(await emailOf(seed, k.canonical)).toBe(alice.id);
+    expect(await statesOf(seed.teamId, [k.mixedAddress, k.upperPrefix])).toEqual(legacyStates);
+  });
+
+  it("exactly one legacy history that is not a tombstone keeps the ordinary path", async () => {
+    const seed = await adminTeam();
+    const alice = await member(seed, "alice");
+    const k = spellings(alice.email);
+    await rawState(seed, k.mixedBoth, "linked", alice.id);
+    expect(await automatic(seed, alice.id, k.canonical)).toMatchObject({ created: true, mappingKey: k.canonical });
+    expect(await statesOf(seed.teamId, [k.mixedBoth]))
+      .toEqual([{ external_id: k.mixedBoth, state: "linked", revision: 1 }]);
+  });
+
+  it("equivalence is JavaScript's alone: Unicode outer whitespace, mixed-case prefix, non-ASCII case fold", async () => {
+    const seed = await adminTeam();
+    const alice = await member(seed, "alice");
+    const bob = await member(seed, "bob");
+    const id = randomUUID().slice(0, 6);
+    const canonical = `author-email:élodie-${id}@example.com`;
+    // Ideographic space before, no-break space after (both stripped by JavaScript `trim`, neither an
+    // ASCII space), a mixed-case prefix, padding after the colon, and a non-ASCII upper-case address.
+    const legacy = `　Author-EMAIL:  ÉLODIE-${id.toUpperCase()}@EXAMPLE.COM `;
+    // A merely similar, unaccented address is a DIFFERENT key and must not count.
+    const unaccented = `author-email:elodie-${id}@example.com`;
+    await rawState(seed, legacy, "unlinked", null);
+    await rawState(seed, unaccented, "unlinked", null);
+    const ids = [canonical, legacy, unaccented];
+    const before = await sideEffects(seed.teamId, ids);
+
+    expect(await automatic(seed, alice.id, canonical))
+      .toMatchObject({ tombstoned: true, mappingKey: legacy, mappingRevision: 1 });
+    expect(await sideEffects(seed.teamId, ids)).toBe(before);
+
+    // The live-row side uses the same comparison: Bob's equivalent legacy row is Alice's conflict.
+    const other = `author-email:zoë-${id}@example.com`;
+    await rawLink(seed, bob.id, `　AUTHOR-EMAIL:ZOË-${id.toUpperCase()}@EXAMPLE.COM`);
+    expect(await automatic(seed, alice.id, other)).toMatchObject({ conflict: true, created: false });
+  });
+
+  it("revision evidence is byte-exact: a padded canonical key with the matching revision is refused", async () => {
+    const seed = await adminTeam();
+    const alice = await member(seed, "alice");
+    const k = spellings(alice.email);
+    await setMemberIdentity(db(), seed.teamId, alice.id, { provider: "gdrive", externalId: k.canonical });
+    const removed = await removeMemberIdentity(db(), seed.teamId, { provider: "gdrive", externalId: k.canonical });
+    const before = await sideEffects(seed.teamId, [k.canonical]);
+    for (const padded of [` ${k.canonical}`, `${k.canonical} `, `${k.canonical} `]) {
+      await expect(setMemberIdentity(db(), seed.teamId, alice.id, { provider: "gdrive", externalId: k.canonical },
+        { force: true, expectedRevision: removed.mappingRevision, expectedRevisionKey: padded })).rejects.toThrow(/changed concurrently/);
+    }
+    expect(await sideEffects(seed.teamId, [k.canonical])).toBe(before);
+    expect(await statesOf(seed.teamId, [k.canonical]))
+      .toEqual([{ external_id: k.canonical, state: "unlinked", revision: removed.mappingRevision }]);
   });
 
   it("a different live owner under an equivalent spelling is the visible conflict before any tombstone", async () => {
@@ -541,20 +652,21 @@ describe("PR743 — author-email tombstones are decided across equivalent legacy
       .toEqual([{ external_id: k.mixedAddress, state: "unlinked", revision: 2 }]);
   });
 
-  it("an unlink of an equivalent spelling racing a publication never yields a canonical link, in either order", async () => {
+  it("publication-first overlap: an unlink of an equivalent spelling queued behind a publication never yields a canonical link, nor does a later reconnect", async () => {
     const seed = await adminTeam();
     const alice = await member(seed, "alice");
     const k = spellings(alice.email);
     await legacyTombstone(seed, alice.id, k.upperPrefix);
     await rawLink(seed, alice.id, k.mixedAddress); // alice's live legacy row
     const emailIds = [k.canonical, k.upperPrefix, k.mixedAddress];
+    const subject = S();
 
     // Publication first: it holds the identity authority; the unlink queues behind it and lands last.
     const publishing = gate();
     const name = `docs-${randomUUID().slice(0, 6)}`;
     const oauth = settled(publishGoogleDriveOAuthCredential({
       teamId: seed.teamId, memberId: seed.memberId, integrationName: name,
-      clientId: "oauth-client", clientSecret: "client-secret", subject: S(), email: alice.email, emailVerified: true,
+      clientId: "oauth-client", clientSecret: "client-secret", subject, email: alice.email, emailVerified: true,
       refreshToken: "refresh-race", grantMode: "files", scopes: ["openid", "https://www.googleapis.com/auth/drive.file"],
     }, { afterLocks: async () => { publishing.reached(); await publishing.open; } }));
     let unlinking: Settled<unknown> | undefined;
@@ -575,11 +687,56 @@ describe("PR743 — author-email tombstones are decided across equivalent legacy
     expect(afterRace.states.map((s: { external_id: string; state: string }) => [s.external_id, s.state]).sort())
       .toEqual([[k.mixedAddress, "unlinked"], [k.upperPrefix, "unlinked"]].sort());
 
-    // Unlink first (now committed): two legacy histories, so a reconnect links nothing.
-    const before = await identityState(seed.teamId, emailIds);
-    await publish(seed, S(), alice.email, name);
-    expect(await identityState(seed.teamId, emailIds)).toBe(before);
+    // Sequential, after the unlink committed (NOT an overlap — see the next case): two legacy histories,
+    // so a reconnect with the same subject links nothing for the email.
+    const before = await emailState(seed.teamId, emailIds);
+    await publish(seed, subject, alice.email, name);
+    expect(await emailState(seed.teamId, emailIds)).toBe(before);
     expect(await emailOf(seed, k.canonical)).toBeNull();
+  });
+
+  it("unlink-first overlap: a publication queued behind a held unlink boundary never yields a canonical link", async () => {
+    const seed = await adminTeam();
+    const alice = await member(seed, "alice");
+    const k = spellings(alice.email);
+    await legacyTombstone(seed, alice.id, k.upperPrefix);
+    await rawLink(seed, alice.id, k.mixedAddress); // alice's live legacy row
+    const emailIds = [k.canonical, k.upperPrefix, k.mixedAddress];
+    const subject = S();
+    const name = `docs-${randomUUID().slice(0, 6)}`;
+
+    // The unlink holds the team's identity mutation boundary (the writer joins that transaction) and
+    // parks before committing; no production hook is involved.
+    const holding = gate();
+    const unlinking = settled(withIdentityMutationBoundary(seed.teamId, async () => {
+      const removed = await removeMemberIdentity(db(), seed.teamId, { provider: "gdrive", externalId: k.mixedAddress });
+      holding.reached();
+      await holding.open;
+      return removed;
+    }));
+    let oauth: Settled<unknown> | undefined;
+    try {
+      await holding.at;
+      // Started from the TEST's context, outside the held boundary's async context, so it opens its own
+      // transaction and queues on the team authority instead of joining the unlink's transaction.
+      oauth = settled(publish(seed, subject, alice.email, name));
+      await waitForOneAdvisoryWaiter();
+    } finally {
+      holding.release();
+      await unlinking;
+      await oauth;
+    }
+    expect((await unlinking).error).toBeNull();
+    expect((await unlinking).value).toMatchObject({ removed: true, mappingKey: k.mixedAddress });
+    // The publication saw the committed unlink: two legacy histories, no canonical decision → no email link.
+    expect((await oauth!).error).toBeNull();
+    expect(await credentialStored(seed.teamId, name)).toBe(true);
+    const after = JSON.parse(await identityState(seed.teamId, emailIds));
+    expect(after.rows).toEqual([]);
+    expect(after.states.map((s: { external_id: string; state: string }) => [s.external_id, s.state]).sort())
+      .toEqual([[k.mixedAddress, "unlinked"], [k.upperPrefix, "unlinked"]].sort());
+    expect(await emailOf(seed, k.canonical)).toBeNull();
+    expect(await emailOf(seed, subject)).toBe(alice.id);
   });
 
   it("opaque ids stay case-sensitive: a tombstone on one spelling never blocks another", async () => {

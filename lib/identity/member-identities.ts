@@ -96,16 +96,14 @@ export function canonicalIdentityId(provider: string, externalId: string): strin
  * GOOGLE EMAIL EQUIVALENCE (AIO-1167 PR743, Astra PR714/PR743 decision). Two `gdrive` keys are the same
  * person-key exactly when `canonicalIdentityId` maps both to the same `author-email:` key: the whole id
  * trimmed, the `author-email:` prefix matched case-insensitively, the address trimmed and lowercased
- * (JavaScript `toLowerCase`). That function is the ONLY arbiter. SQL merely pre-selects candidates — an
- * ASCII-case-insensitive prefix match plus `position(<canonical address> in lower(external_id))`, a
- * superset wherever Postgres `lower` and JavaScript `toLowerCase` agree on the address (all ASCII
- * addresses, which is every address Google issues for Workspace and consumer accounts in practice) —
- * and every candidate is then compared with `canonicalIdentityId`. No Unicode normalization, no
- * provider-independent folding; opaque ids (`subject:`, `permission:`, every other provider) never
- * enter this comparison and keep exact bytes. Stored keys are never rewritten.
+ * (JavaScript `trim` and `toLowerCase`). That function is the ONLY arbiter, on both sides of the
+ * comparison. SQL does no case folding or whitespace classification of its own: it selects this team's
+ * `gdrive` rows and every one of them is compared with `canonicalIdentityId` here, so no key the
+ * function considers equivalent can be missed by a database collation or regex class. No Unicode
+ * normalization, no provider-independent folding; opaque ids (`subject:`, `permission:`, every other
+ * provider) never match an `author-email:` canonical key and keep exact bytes. Stored keys are never
+ * rewritten.
  */
-const GOOGLE_EMAIL_PREFIX_PATTERN = "^\\s*author-email:";
-
 async function lockEquivalentGoogleEmailRows(
   teamId: string,
   canonical: string,
@@ -113,20 +111,19 @@ async function lockEquivalentGoogleEmailRows(
   live: { id: string; external_id: string; member_id: string }[];
   states: { external_id: string; revision: number; state: string }[];
 }> {
-  const address = canonical.slice("author-email:".length);
   // Deterministic order (external_id), identity rows before mapping states — the writer's existing
   // order. Every caller already holds the team identity authority, so these locks only order rows.
   const { rows: live } = await runSql<{ id: string; external_id: string; member_id: string }>(
     `select id,external_id,member_id from member_identities
-      where team_id=$1 and provider='gdrive' and external_id ~* $2 and position($3 in lower(external_id))>0
+      where team_id=$1 and provider='gdrive'
       order by external_id for update`,
-    [teamId, GOOGLE_EMAIL_PREFIX_PATTERN, address],
+    [teamId],
   );
   const { rows: states } = await runSql<{ external_id: string; revision: string | number; state: string }>(
     `select external_id,revision,state from member_identity_mapping_state
-      where team_id=$1 and provider='gdrive' and external_id ~* $2 and position($3 in lower(external_id))>0
+      where team_id=$1 and provider='gdrive'
       order by external_id for update`,
-    [teamId, GOOGLE_EMAIL_PREFIX_PATTERN, address],
+    [teamId],
   );
   const same = (key: string) => canonicalIdentityId("gdrive", key) === canonical;
   return {
@@ -152,7 +149,8 @@ export async function setMemberIdentity(
     expectedRevision?: number;
     /**
      * The exact key the caller observed `expectedRevision` for (AIO-1167 PR743). When given it must be
-     * byte-identical to the canonical key written, or the write is refused as stale — so a revision
+     * byte-identical to the canonical key written — compared as given, never trimmed or folded — or
+     * the write is refused as stale. So a revision
      * observed for a legacy spelling can never pass as the canonical key's. Requires `expectedRevision`.
      */
     expectedRevisionKey?: string;
@@ -169,8 +167,9 @@ export async function setMemberIdentity(
      *      `conflict` (unless `force`), never hidden behind a tombstone;
      *   2. the canonical key's OWN mapping state, when present, governs alone (an explicit relink
      *      writes it, which is how a relink resolves older equivalent history);
-     *   3. otherwise the equivalent legacy states: none unlinked → the ordinary path; exactly one
-     *      state and it is unlinked → `tombstoned`; several states with any unlinked → `ambiguous`.
+     *   3. otherwise the equivalent legacy states: none, or exactly one that is not a tombstone → the
+     *      ordinary path; exactly one and it is unlinked → `tombstoned`; more than one, whatever
+     *      their values → `ambiguous`. Legacy revisions are never rewritten.
      *      `tombstoned` and `ambiguous` write nothing: no row, revision, repair, epoch or audit.
      */
     respectTombstone?: boolean;
@@ -235,7 +234,7 @@ export async function setMemberIdentity(
     }
     const currentRevision = canonicalState?.revision ?? 0;
     // The fence names ONE exact key: the canonical key written here (PR743).
-    if (opts.expectedRevisionKey !== undefined && opts.expectedRevisionKey.trim() !== externalId) {
+    if (opts.expectedRevisionKey !== undefined && opts.expectedRevisionKey !== externalId) {
       throw new Error("identity mapping changed concurrently; refresh and retry");
     }
     if (opts.expectedRevision !== undefined && opts.expectedRevision !== currentRevision) {
@@ -262,18 +261,19 @@ export async function setMemberIdentity(
           res.mappingKey = externalId;
           return res;
         }
-      } else if (otherStates.some((row) => row.state === "unlinked")) {
-        if (otherStates.length === 1) {
-          // One applicable equivalent tombstone: the deliberate unlink stands under this spelling too.
-          res.tombstoned = true;
-          res.mappingRevision = otherStates[0].revision;
-          res.mappingKey = otherStates[0].external_id;
-          return res;
-        }
-        // Several equivalent histories and no canonical decision: none is selected (fail closed).
+      } else if (otherStates.length > 1) {
+        // Several equivalent histories — linked, unlinked or mixed — and no canonical decision: none
+        // is selected and nothing is written (fail closed) until an explicit relink decides.
         res.ambiguous = true;
         return res;
+      } else if (otherStates[0]?.state === "unlinked") {
+        // One applicable equivalent tombstone: the deliberate unlink stands under this spelling too.
+        res.tombstoned = true;
+        res.mappingRevision = otherStates[0].revision;
+        res.mappingKey = otherStates[0].external_id;
+        return res;
       }
+      // Zero legacy states, or exactly one that is not a tombstone: the ordinary path.
     }
     if (!ex && otherLive[0]) {
       // The same address in another spelling is the same person-key: never merged or overwritten
