@@ -1,0 +1,28 @@
+{
+  "model": "claude-fable-5-1",
+  "session_id": "2e7f8ffa-c8c1-49af-a8e3-442364d26634",
+  "source_base": "b86b22d2e6b1561d0f7e57e0a4caac07e9880fb3",
+  "source_head": "1a9ca6151a4ad98fe704476382f0bfd1170ea253",
+  "source_delta_sha256": "3f5e580dffe1634d5c83f3b76cd3d43c1a4169bcfea7ee52ee1239fb9f96b2db",
+  "terminal_reason": "api_error",
+  "exit_code": 0,
+  "is_error": true,
+  "result": "Request timed out",
+  "duration_ms": 887129,
+  "provider": "firstParty",
+  "usage": {
+    "uncached_input_tokens": 578,
+    "cache_creation_input_tokens": 236420,
+    "cache_read_input_tokens": 3566072,
+    "output_tokens": 6580,
+    "thinking_tokens": 1399
+  },
+  "coverage": "Incomplete. Read the complete delta patch and began inspecting live worktree callers; timed out before inspecting all requested flow. No verdict and no clean review coverage.",
+  "subscription_usage_after_attempt_utc": {
+    "checked_at": "2026-11-02T21:22:16Z",
+    "all_model_week_percent": 48,
+    "fable_week_percent": 60,
+    "credits": "off",
+    "session_percent": null
+  }
+}
