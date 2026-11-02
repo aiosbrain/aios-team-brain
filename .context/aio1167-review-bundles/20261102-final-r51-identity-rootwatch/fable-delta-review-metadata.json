@@ -1,0 +1,39 @@
+{
+  "model": "claude-fable-5-1",
+  "session_id": "db4e44fc-9a82-4e12-aee7-93f1f560d74c",
+  "terminal_reason": "completed",
+  "stop_reason": "end_turn",
+  "exit_code": 0,
+  "is_error": false,
+  "review_base": "b86b22d2e6b1561d0f7e57e0a4caac07e9880fb3",
+  "source_commit": "4f515e0ee20e25649019b5889188977dedbf92f0",
+  "review_head": "05944f3bf42b265e6a994779b1074bc4af0f1edb",
+  "source_delta_sha256": "5a20b1683a6ddc817eefd7e2875c3c9f7e65077d85872ca9b239a7263e65c013",
+  "duration_ms": 380064,
+  "result_nonempty": true,
+  "assistant_text_blocks": 3,
+  "assistant_text_sha256": "5f2da343148581737e2e574c5a7403f9febbdc18041b71cfc3b6643a9648038d",
+  "usage": {
+    "uncached_input": 290,
+    "cache_creation_input": 208344,
+    "cache_read_input": 1103967,
+    "output": 28162,
+    "thinking": 20371
+  },
+  "provider": "firstParty",
+  "permissions": "safe-mode, empty MCP config, Read/Glob/Grep only; Bash/Edit/Write denied",
+  "review_verdict": "CHANGES REQUIRED",
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "High",
+      "summary": "Restored folder with still-open traversal can be settled without a full rescan after its support was withdrawn, allowing a complete snapshot that omits existing documents."
+    },
+    {
+      "id": "F2",
+      "severity": "Low",
+      "summary": "OAuth callback drops the subject-unlinked notice for preserved or linked email outcomes."
+    }
+  ],
+  "limitations": "Static review; no tests/shell. Reviewer did not inspect the Drive test harness, final page materialization/reconciliation, provenance SQL, authority helper, provider-sync, or PR714 worktree."
+}
