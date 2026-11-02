@@ -1,0 +1,14 @@
+{
+  "captured_at_utc": "2026-11-02T13:07:45Z",
+  "base_head": "b9b7dd3bfa7f96f1f7c7e40bddbdb073e1350af8",
+  "tracked_diff_sha256": "076ba86757903b8d0c39b7dfd677c373eb7db71674a4a903a28f6a6c47c9dbd7",
+  "tracked_diff_bytes": 15908,
+  "untracked": [
+    {
+      "path": "ingestion/tests/test_watch_late_quota.py",
+      "sha256": "778165a0a85cd398dfc8a95b17ce8cc975d48bc2871d80d0420b26b9e9fb1b91",
+      "bytes": 17612
+    }
+  ],
+  "status": " M ingestion/aios_ingest/gdrive_sync.py\n M ingestion/aios_ingest/state.py\n M ingestion/aios_ingest/watch_renewal.py\n?? ingestion/tests/test_watch_late_quota.py\n"
+}
