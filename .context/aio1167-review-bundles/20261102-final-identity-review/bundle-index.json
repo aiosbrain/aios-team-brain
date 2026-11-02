@@ -1,0 +1,17 @@
+{
+  "candidate_head": "b86b22d2e6b1561d0f7e57e0a4caac07e9880fb3",
+  "source_diff_sha256": "12a01ea69ba22264e00cf28f21ad8013bed13ab713db603ccd52e2795cddbe8c",
+  "bundle_files": {
+    "acceptance-mapping.md": "01bd2f6617b725d5192924a2526cbdd9b32d26dbd58a3525ad5afdc06d82b903",
+    "accepted-spec.md": "297ee1df91463fd0b6c4863b34be8b999ad176fc7d40f0637bf196660bd65e3d",
+    "changed-files.txt": "913845ae0f404252c8bb7a28200e3d1a97eb7b38514cf60c0d60dbff9307810d",
+    "full-source.diff": "12a01ea69ba22264e00cf28f21ad8013bed13ab713db603ccd52e2795cddbe8c",
+    "identity-adjudication.md": "6508e98eb16c4bc7f9e277e0f12cb8a3ad0e3fe6a9700a6de7f8ee1c84c8ae8f",
+    "identity-writer-corrections.md": "a801f3febac6faee6b9f46c049c15656ff0b2b43bc9a1c26725d900f48f6071f",
+    "ownership-ack.md": "155ae2b2a1e6c8f2e298bd93bcdeb52d3f1249e8df1c833055b4bf5e2dd89412",
+    "pr714-identity-decision.md": "ff374ee337ebf52eb102c969a18d3326693a6577f0ea5d3b2a49bc7031ad476c",
+    "review-prompt.md": "0ad09d56062e1c6a1bd9ec83cf9d60466bcc9defb1844910728fb79ea3838e67",
+    "source-manifest.json": "013f4265b84b44e592badf7e0319a1e580d7c6e95a41f675c0f04da7a5374d59",
+    "verification-evidence.md": "b79ebb2628a37a42c0b762b3515682efea6d388485adbf1c85e463958186e123"
+  }
+}

@@ -1,0 +1,328 @@
+{
+  "base": "5ecd2989e21fded915b41b508477bb267aaec06d",
+  "head": "b86b22d2e6b1561d0f7e57e0a4caac07e9880fb3",
+  "source_path_count": 53,
+  "source_diff_sha256": "12a01ea69ba22264e00cf28f21ad8013bed13ab713db603ccd52e2795cddbe8c",
+  "source_diff_bytes": 647874,
+  "working_tree_status": "clean",
+  "files": [
+    {
+      "status": "M",
+      "path": "app/t/[team]/admin/integrations/actions.ts",
+      "base_sha256": "901e6732cb48e7206b2cb5582142389736946eadded4cd138575e0cc9cc3dde4",
+      "head_sha256": "657f0fb09cfe243578d5bffa4f2bf6363e4459f5a4d2bc9cf5881baebe1f1968"
+    },
+    {
+      "status": "M",
+      "path": "app/t/[team]/admin/members/actions.ts",
+      "base_sha256": "98139cb2aef1fb6f7897791f99c0df077e7af404960000326a9ca74f551b1f39",
+      "head_sha256": "8f88b29c7cda53c255bbeea31454f1b6a434e62d1939e3de76ed667143fe187e"
+    },
+    {
+      "status": "M",
+      "path": "components/admin/identity-conflicts.tsx",
+      "base_sha256": "a4e5faf733d108a017d7786992280d478a58f2ab0d6b45e53a9ceef84d1ddb19",
+      "head_sha256": "ce6404ff329fb2c9b9a2049a091132c2d62ea8351e641b8a77c5822e3b2b91dd"
+    },
+    {
+      "status": "M",
+      "path": "docs/ARCHITECTURE.md",
+      "base_sha256": "865dac9c543d016321a966f323c1d1d037e8db12107366149ad07ee601102dd1",
+      "head_sha256": "bb55814c4315c169bf993e7c2995b46272cc7cccf024253478f838c6f3048b97"
+    },
+    {
+      "status": "M",
+      "path": "ingestion/aios_ingest/brain_client.py",
+      "base_sha256": "3665cf32bb2de9b98952260cf5342880c1186dbd1fd3233a702452f1d3d9b088",
+      "head_sha256": "8a67ef0f5454b15436027d7ff3af472111d772dc2db779d0499d805753bebf13"
+    },
+    {
+      "status": "M",
+      "path": "ingestion/aios_ingest/connector_state.py",
+      "base_sha256": "413e3f59d56cde213d5523b6deb5722ef3249b8941badcccb11975e6938cd61a",
+      "head_sha256": "2d98520ea89276812f85fa09dbf7f6f75dcc3bb00aacc4f14cd61bb4653af990"
+    },
+    {
+      "status": "M",
+      "path": "ingestion/aios_ingest/gdrive_sync.py",
+      "base_sha256": "3337e364c43b8b1a02d897cb36c1257bd269258f9f1a6f0f18222ecf486af22b",
+      "head_sha256": "ce878de82665e2bee921caf69b7a980cfe0740eff4e8a156093ebf476bded9ad"
+    },
+    {
+      "status": "M",
+      "path": "ingestion/aios_ingest/sources/gdrive.py",
+      "base_sha256": "60599696a7b747c21a3020b3b50d5ab616afe0dbbc1cf90c93a0e471517cf19e",
+      "head_sha256": "7785c430f61c7b094cc3e53fe8a50f682f42b17603c5581746454b98b37fbc64"
+    },
+    {
+      "status": "M",
+      "path": "ingestion/aios_ingest/sources/gdrive_watch.py",
+      "base_sha256": "2d6c53616a153193da704fde755a46d815e155cffc3a30b3542de0a706e81186",
+      "head_sha256": "787ff87f1f69c3be6b4a38111696d284ced6f9f618179df557a6bd3bbc8ea8ee"
+    },
+    {
+      "status": "M",
+      "path": "ingestion/aios_ingest/state.py",
+      "base_sha256": "b8e89facdcff25167310e0c23c99d68f62129a6d9c579bf53290d7da0c02ddc2",
+      "head_sha256": "37aca50c6b99abfe03e5f2e4e1a9c510fdc5ac609560b4ed678268db7268c966"
+    },
+    {
+      "status": "M",
+      "path": "ingestion/aios_ingest/watch_lifecycle.py",
+      "base_sha256": "5b5a865dbdcefb016bbab526892bacaa7daece3de65c085b4d372d5931b51d7d",
+      "head_sha256": "c447e1b89119949a375749102ec7db4c1d22f5f46f9e83df86feebe07931cd16"
+    },
+    {
+      "status": "M",
+      "path": "ingestion/aios_ingest/watch_renewal.py",
+      "base_sha256": "c2bac53377b779688dfda5d115c4f3a11a7a86426ab67d755cdb972c37e22942",
+      "head_sha256": "081aef6b8087d76c11f40fb1c7922684a7e2f1089b43827fb5166328c60c14b9"
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_account_hold_before_streams.py",
+      "base_sha256": null,
+      "head_sha256": "dc6c5e5a3ee1d30af6b7268b775403d548575443ef36462dbcf8145f1f58f768"
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_bound_root_loss.py",
+      "base_sha256": null,
+      "head_sha256": "0dd5be18bc2d14b63a8896e806a49e9ef8e86c991b1b7e61f7fa2d5b223e4056"
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_brain_minimum_provenance.py",
+      "base_sha256": null,
+      "head_sha256": "99306fe85c6fa67f4b81dd461e6702265dcef2edc5b0b475b2fee7041f6f483c"
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_checkpoint_acknowledgment.py",
+      "base_sha256": null,
+      "head_sha256": "8a9fbe4d0a191110f49d758891491a73121a0d6dde4736ee253d9267a136c076"
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_checkpoint_uncertainty_latch.py",
+      "base_sha256": null,
+      "head_sha256": "c8f2f19674f32dcf142d01ba4cbea64083fc64b4e3aa6dfbdf371b3f9c1ea63c"
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_deferred_folder_enumeration.py",
+      "base_sha256": null,
+      "head_sha256": "2225d7e9075d56bfb66fc9fec9950398aff93eb809968b8aebc79dc6b590081d"
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_deferred_root_scope.py",
+      "base_sha256": null,
+      "head_sha256": "39a4f3d755178a2ef5bdbc7b4a144d09a0ff09a139dbc69f3a05b44347f51f8a"
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_document_restrictions.py",
+      "base_sha256": null,
+      "head_sha256": "7df63b454dcda4ce94788a54250a6d34080dff69eaf5a1e13c1470f9191b46ce"
+    },
+    {
+      "status": "M",
+      "path": "ingestion/tests/test_drain_recovery.py",
+      "base_sha256": "df49d5ab186c6b8694b91b8f7accf249e9a7aba16c4f6ff7eb3102eff7c2eafa",
+      "head_sha256": "f4fb7515441f9c2afc9b983580a81ce1ddc12dae87a021e777c1caed58cef492"
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_exhaustion_is_not_completion.py",
+      "base_sha256": null,
+      "head_sha256": "98932c8cb3aef54f976fe7d6cab0c354305edc7feae4436f3beac9c3e9b1e31e"
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_explicit_trash_evidence.py",
+      "base_sha256": null,
+      "head_sha256": "6c232c6fa20a7d7c005cb97158cffb1e89fcb8a108c5de4787fd473629ba353e"
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_flush_authority_outcome.py",
+      "base_sha256": null,
+      "head_sha256": "8d0a18706cd6167587679ffa10fbf3d7bed704a0a8d82342faa3fc0b7998479c"
+    },
+    {
+      "status": "M",
+      "path": "ingestion/tests/test_gdrive_poll_reporting.py",
+      "base_sha256": "fdf4763507af1defa578854e9252ffd32028e131b86cfdb44553d45728932168",
+      "head_sha256": "76166eb459c227b2b15951aa5706177808cf9f819aee824041a52807882366e4"
+    },
+    {
+      "status": "M",
+      "path": "ingestion/tests/test_gdrive_upgrade.py",
+      "base_sha256": "86391045a2bd27fce05041604ece79eaac912b6d6f7ee7b1f6eecd7eaf1047e6",
+      "head_sha256": "cd5e7e19657a302d0a278df7fa145bb4c2c05ecda214eda875a074109dcb5352"
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_identity_prerequisite_publication.py",
+      "base_sha256": null,
+      "head_sha256": "7c2dc6acd861a000a14b61c774f64b061fbe66aa62a79a9aade4f81a4ba500a0"
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_pre_stream_scope.py",
+      "base_sha256": null,
+      "head_sha256": "ff26f1a4d1b03ac0c30d21829bd3cfbb314deafd311e176bd10a3747727451bd"
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_restricted_removal.py",
+      "base_sha256": null,
+      "head_sha256": "608b6ebb1eba5ee1b6c18ef72f3c35af0dede2eb43687f9787cca2c180d3257e"
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_restricted_root_recovery.py",
+      "base_sha256": null,
+      "head_sha256": "f0bebdcee179d06a44b581ecbc9a72f28b1b4a60b5f555e0e419acee520a6400"
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_restriction_lifetime.py",
+      "base_sha256": null,
+      "head_sha256": "e23e15e6a957cf00d8c87517b4f4d0ea088c06f93896dd8cd7f54233af92ee6e"
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_restriction_publication_recovery.py",
+      "base_sha256": null,
+      "head_sha256": "23d5b1ade655a7c350753e2c26ddd5d0166ce380505feeaf7cb6cd5fca8f296e"
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_retry_after_holds.py",
+      "base_sha256": null,
+      "head_sha256": "18337db7a6d6f8b23a42e24e808190948555d9c2164beef3c4d11c43ffaa2ed6"
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_retry_after_parsing.py",
+      "base_sha256": null,
+      "head_sha256": "afab189721e54ef9cef2a77db6226832552a25a868d2107647680775fbed23cb"
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_root_evidence_r49.py",
+      "base_sha256": null,
+      "head_sha256": "8e7e2565f48b14dbad8d5cbc0312d30b1957dc0e8d88ddcb833782f013d50682"
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_watch_account_hold.py",
+      "base_sha256": null,
+      "head_sha256": "c88b084c82e669fb3a180c05f6666f7fea6f75b39a7fa246c61da1235f3d9ba2"
+    },
+    {
+      "status": "M",
+      "path": "ingestion/tests/test_watch_lifecycle.py",
+      "base_sha256": "c09285c85de019742a7c0543607523d28b6dd6c23b17ab9c14a0c1736ec60260",
+      "head_sha256": "03e5ccf5e494bcfe071bdf7497360ab9af979f6eebfcfc0ff4866999613ff700"
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_watch_quota_hold.py",
+      "base_sha256": null,
+      "head_sha256": "09ca544b8ff87e5d9961e5a5ca62586ecabf15f7de8b10cc94076023e52dd4f8"
+    },
+    {
+      "status": "M",
+      "path": "lib/identity/member-identities.ts",
+      "base_sha256": "f7287aff32d94ccbb3f0a54590ba7fdee08614739e400f781aecb82686731d26",
+      "head_sha256": "48e0de7a72a8a83b1f4d3dfc084a05bf24d3aa7927ce35599dc1c4dbb165751a"
+    },
+    {
+      "status": "M",
+      "path": "lib/integrations/gdrive-authority.ts",
+      "base_sha256": "3eaf414617e60771fb775f92418015afc9880aceb14de3ff3b747dc4e14cff29",
+      "head_sha256": "edf9cc6453e967b8fa24a434cd5e7085c699b123c959b2e4e026ee1edecdba52"
+    },
+    {
+      "status": "M",
+      "path": "lib/integrations/gdrive-oauth.ts",
+      "base_sha256": "517946505de8f59344dfa82b1827b4c513f3092bb015e427ad914f1370e73a84",
+      "head_sha256": "c028c940f40adc1e5c76814784b2445487942e640b96bc3d0603df89975d6540"
+    },
+    {
+      "status": "A",
+      "path": "postgres/migrations/20261031140000_gdrive_restriction_generation_lifetime.sql",
+      "base_sha256": null,
+      "head_sha256": "5e0feb43c34157b81c073e51c590b67d9cc4188c5027445b61c67f3000b411f5"
+    },
+    {
+      "status": "M",
+      "path": "postgres/schema.sql",
+      "base_sha256": "5c280c607ceb783f4f20e7c2e1c709b00f43a237b920db7103dc641a55b9b7e5",
+      "head_sha256": "c59db6714d10b17b1155c8b72e16815341aa8fdf6cefcbc5cf3526d882ff3d6e"
+    },
+    {
+      "status": "M",
+      "path": "test/datamechanics/gdrive-admin-credential-race.datamechanics.test.ts",
+      "base_sha256": "fad7c0a01d36eb97ca185dc8c6c829fa7169772eb24d5d466ce29bb0f9f136c9",
+      "head_sha256": "3c15216883df57ed2d106ffb298c16b61eb9cc599647a1adc469ef42ba4a7313"
+    },
+    {
+      "status": "A",
+      "path": "test/datamechanics/gdrive-admin-grant-policy.datamechanics.test.ts",
+      "base_sha256": null,
+      "head_sha256": "fea3264eefc7d4f6b8c7df33dcc706994a3e0b6c85f0d313f000c757eb26d31e"
+    },
+    {
+      "status": "M",
+      "path": "test/datamechanics/gdrive-admin-test.datamechanics.test.ts",
+      "base_sha256": "f79ca3b1edb29602301012505754bed117eaa5105381bd0e45a17ae4c3151200",
+      "head_sha256": "441119dece8db8315ccd9608b6e94e489130aba2e695caf2c72d4ff0a1a3f3ca"
+    },
+    {
+      "status": "M",
+      "path": "test/datamechanics/gdrive-audience-claims.datamechanics.test.ts",
+      "base_sha256": "fe2a6daa6b8c019ebcb3a17599bf48b153912cbe9060c00ad960342ac7db427d",
+      "head_sha256": "8fb39b31fab19813761300db5b7ea3ccdbe38ba1cf3157131bd960c0e0468109"
+    },
+    {
+      "status": "M",
+      "path": "test/datamechanics/gdrive-authority.datamechanics.test.ts",
+      "base_sha256": "ce9ae35c5bb63ffcaccf5554cffda82e2f358746de291ed87583f49d424af702",
+      "head_sha256": "9c26c25e1c10cf417ed52a2315c76e2404bce5a4ccb921fd8db07ed1b81f1c4c"
+    },
+    {
+      "status": "A",
+      "path": "test/datamechanics/gdrive-complete-snapshot-overlap.datamechanics.test.ts",
+      "base_sha256": null,
+      "head_sha256": "53bb0c645254a06f0f2e3abcf8e49af564615b70126a51edbf785d3f8edf9ddf"
+    },
+    {
+      "status": "A",
+      "path": "test/datamechanics/gdrive-identity-tombstone-email.datamechanics.test.ts",
+      "base_sha256": null,
+      "head_sha256": "543bda291a0717b422986e0a26bb483f65f65d26e6fbe26053ee03284de5c66e"
+    },
+    {
+      "status": "M",
+      "path": "test/datamechanics/gdrive-oauth-lock-order.datamechanics.test.ts",
+      "base_sha256": "34e319ecf3307611a5a860f3cb14183e75cb5611e9cd65310e4b35617d60a418",
+      "head_sha256": "04af79657b1299037d6051f1c0059d0dfa55472ac212837b9203a2042b911c39"
+    },
+    {
+      "status": "M",
+      "path": "test/datamechanics/identity-discovery-conflicts.datamechanics.test.ts",
+      "base_sha256": "5048d9319eef4cbb287335c2c544b08bfea79dedd02f7c5fd4b2dee955fc9c97",
+      "head_sha256": "b71dd6aa508cbce39b177ca6e74ebc5f9d4d819b001daecafb6bb2053b593c0a"
+    },
+    {
+      "status": "M",
+      "path": "test/identity-conflicts-view.test.ts",
+      "base_sha256": "e972472d148a7f0865bd871039072945cdda18594885011a50eba53ad8f55684",
+      "head_sha256": "cf5a393d3e9dcafbaa58d3aa603e30f8a031b9f1419cd5f36a295e86ac31b552"
+    }
+  ]
+}
