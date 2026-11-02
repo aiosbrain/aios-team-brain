@@ -465,3 +465,10 @@ R50 complete writer snapshot preserved before coordinator checks. The remote che
 
 - On source checkpoint `7424d0a4ab545922d2470d4e80370682112d2799`, the new root/watch suites passed: **13 passed in 2.50s**. Adjacent root and watch regressions passed: **111 passed in 4.52s**. `git diff --check HEAD` passed before the source checkpoint. Ruff is unavailable in this venv; no lint pass is claimed. Exact commands and scope are recorded in `pr743-root-watch-verification-20261102.md`.
 - These are focused affected-slice results, not full ingestion-suite verification. Next is the Google-only identity/reader/repair/OAuth outcome correction under the newly acknowledged PR714 decision, followed by coordinator verification and fresh exact-candidate reviews. Latest `/usage` remains 43% all-model /49% Fable weekly, credits off, no session percentage displayed.
+
+
+## 2026-11-02 13:13 UTC — Google identity slice prepared
+
+- The root/watch implementation checkpoint and verification record are pushed at `1f6e5977d0f7a0f1f6a2b915aad13b5cc5c030ca`; remote `ls-remote` confirmed the same recovery ref before this phase. Focused new tests passed 13/13 and adjacent root/watch tests passed 111/111.
+- Prepared `pr743-google-identity-reader-correction-prompt-20261102.md` for the existing Opus 5.5 HIGH writer. It reconciles the combined review adjudication with PR714's fresh Google-reader ownership conditions, scopes only Google `author-email:` behavior in shared files, retains the ten Slack invariants, and prohibits tests/shell/commit/push/review actions by the writer. Root/watch corrections are already complete and must remain unchanged.
+- Next: checkpoint this prompt, refresh first-party auth and `/usage`, verify the same Opus session's turn is terminal/idle, then submit this one bounded identity correction turn.
