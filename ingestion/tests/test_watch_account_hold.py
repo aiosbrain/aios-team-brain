@@ -150,4 +150,3 @@ async def test_a_hold_from_an_earlier_generation_of_the_same_account_still_holds
     assert provider.dispatched == []
     assert state.connection_hold(INTEGRATION, GEN, ACCOUNT) == (HOLD_UNTIL, "rate_limited")
     state.close()
-
