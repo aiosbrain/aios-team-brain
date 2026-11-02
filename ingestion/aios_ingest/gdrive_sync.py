@@ -2837,9 +2837,14 @@ async def _enumerate_baseline(
         else:
             diagnostic = "provider_restricted_document" if root_kind == "file" else "provider_restricted_resource"
             summary.failure_categories[diagnostic] = max(summary.failure_categories.get(diagnostic, 0), 1)
-        state.mark_root_deferred(
+        # Atomically with the deferral, a root this build already listed part of has its remaining
+        # traversal closed (R51 F1): a later recovery can never "finish" an old remainder around a
+        # withheld part — only a fresh controlled rescan lists it. An untouched root keeps its seed for
+        # the placeholder below.
+        state.defer_root_in_build(
             integration_id, generation, root_kind, root_id, drive_id,
             detail="its read is withheld; membership retained, not verified",
+            namespace=namespace, snapshot_id=snapshot_id,
         )
         deferred.add(root_id)
 
@@ -2851,7 +2856,10 @@ async def _enumerate_baseline(
     #     complete snapshot, and once it publishes the controlled rescan (`_deferred_root_admissible`)
     #     lists the folder under a fresh snapshot and page identity.
     #   * If its traversal is still open, it is listed now — descendants and further pages included,
-    #     across runs if interrupted — and settled only when no entry of it remains (`listed`).
+    #     across runs if interrupted — and settled only when no entry of it remains (`listed`). That
+    #     open traversal is always a genuine listing in progress: a root withheld after this build
+    #     touched it has its remaining traversal closed in the same transaction as its deferral
+    #     (`defer_root_in_build`, R51 F1), so no old remainder around a withheld part is ever resumed.
     previously_deferred = {
         root_id for kind, root_id in state.deferred_roots(integration_id, generation, drive_id)
         if kind == "folder"
@@ -2914,15 +2922,23 @@ async def _enumerate_baseline(
         if (
             binding is not None
             and (binding.detail or "").startswith("selected root unavailable")
-            and not state.root_traversal_open(namespace, generation, root_id, snapshot_id=snapshot_id)
+            and (
+                state.root_traversal_touched(namespace, generation, root_id, snapshot_id=snapshot_id)
+                or not state.root_traversal_open(namespace, generation, root_id, snapshot_id=snapshot_id)
+            )
         ):
-            # Restored after this build already finished its traversal without it — closed empty, its
-            # support withdrawn. Settling it here would publish a snapshot with none of its contents,
-            # so it becomes a DEFERRED obligation instead: the connection stays partial and the
-            # controlled rescan (`_deferred_root_admissible`) lists it under a fresh snapshot.
-            state.mark_root_deferred(
+            # Restored after its loss was recorded, in a build that already touched it — listed part of
+            # it (support then withdrawn) or closed part of it empty — whether or not entries remain
+            # open (R51 F1). Neither settling it nor finishing the old remainder can restore what was
+            # withdrawn (a materialized page never reapplies membership), so it becomes a DEFERRED
+            # obligation and, in the same transaction, its remaining traversal is closed: the
+            # connection stays partial and the controlled rescan (`_deferred_root_admissible`) lists it
+            # in full under a fresh snapshot and fresh page identities. An untouched root — its seed
+            # still open, nothing of it finished in this build — is simply listed in full below.
+            state.defer_root_in_build(
                 integration_id, generation, "folder", root_id, drive_id,
                 detail="restored after its loss was recorded; it must be listed again",
+                namespace=namespace, snapshot_id=snapshot_id,
             )
             deferred.add(root_id)
             continue

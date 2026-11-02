@@ -181,9 +181,11 @@ export async function GET(req: NextRequest) {
 }
 
 /**
- * What the Admin needs to know about the EMAIL attribution bridge (AIO-1167 PR743). The credential is
- * connected either way, and the account's Google subject is reported for what it is: a held email
- * bridge is not an unlinked account. A preserved same-member mapping is neither held nor unlinked.
+ * What the Admin needs to know about the account's two attribution identities (AIO-1167 PR743). The
+ * credential is connected either way. The Google subject and the verified email are decided
+ * independently, so each is reported on its own: a held email bridge is not an unlinked account, a
+ * deliberately unlinked subject is reported (with its repair path) whatever the email outcome, and a
+ * held subject does not stop attribution through an independently linked or preserved email.
  */
 function emailAttributionNote(identity: GoogleDriveOAuthPublication["identity"] | undefined): string {
   if (!identity) return "";
@@ -198,8 +200,17 @@ function emailAttributionNote(identity: GoogleDriveOAuthPublication["identity"] 
   if (identity.email === "ambiguous") {
     return `${subject} its email address has several earlier mapping histories, so documents are not credited through that email until an Admin resolves it under Admin → Members → Identities.`;
   }
+  // The email bridge is open (linked or preserved). A deliberately unlinked subject is still reported,
+  // with its repair path, and without suggesting that it holds back the email's attribution.
+  const heldSubject = identity.subject === "tombstoned"
+    ? " The account's Google identity was deliberately unlinked earlier and stays unlinked; an Admin can relink it under Admin → Members → Identities."
+    : "";
   if (identity.email === "preserved") {
-    return " Its email address was already linked to the same member under an earlier spelling; that mapping was kept.";
+    const credited = heldSubject ? " Documents are still credited to that member through the email address." : "";
+    return `${heldSubject} Its email address was already linked to the same member under an earlier spelling; that mapping was kept.${credited}`;
+  }
+  if (identity.email === "linked" && heldSubject) {
+    return `${heldSubject} Its email address is linked to the member, so documents are still credited through that email address.`;
   }
   return "";
 }

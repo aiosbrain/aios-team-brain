@@ -96,4 +96,26 @@ describe("PR743 — the Google callback presents the identity outcome", () => {
     expect(text).toContain("email address was deliberately unlinked earlier");
     expect(text).toContain("This connection is paused");
   });
+
+  // Fable R51 F2: the subject outcome is reported independently of an open email bridge.
+  it("an unlinked subject with a LINKED email: the subject stays unlinked with its repair path; the email still credits", async () => {
+    const { status, text } = await callback({ status: "enabled", identity: { subject: "tombstoned", email: "linked" } });
+    expect(status).toBe(200);
+    expect(text).toContain("Google identity was deliberately unlinked earlier and stays unlinked");
+    expect(text).toContain("Admin → Members → Identities");
+    expect(text).toContain("email address is linked to the member, so documents are still credited");
+    expect(text).not.toContain("not credited");
+    expect(text).not.toContain("This connection is paused");
+  });
+
+  it("an unlinked subject with a PRESERVED email on a paused connection reports all three accurately", async () => {
+    const { status, text } = await callback({ status: "disabled", identity: { subject: "tombstoned", email: "preserved" } });
+    expect(status).toBe(200);
+    expect(text).toContain("Google identity was deliberately unlinked earlier and stays unlinked");
+    expect(text).toContain("Admin → Members → Identities");
+    expect(text).toContain("already linked to the same member under an earlier spelling; that mapping was kept");
+    expect(text).toContain("Documents are still credited to that member through the email address");
+    expect(text).not.toContain("not credited");
+    expect(text).toContain("This connection is paused");
+  });
 });

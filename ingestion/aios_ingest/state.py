@@ -1077,6 +1077,14 @@ class StateStore:
         A DEFERRED root keeps its ``ROOT_DEFERRED_PREFIX`` detail (AIO-1167 R51 F1): ordinary
         uncertainty is not a listing, so it must not erase the enumeration debt that only a listing,
         a relocation/rebind or a verified not-found may discharge."""
+        self._write_root_uncertain(connection_id, generation, root_kind, root_id, drive_id, detail=detail)
+        self._db.commit()
+
+    def _write_root_uncertain(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str, drive_id: str,
+        *, detail: str,
+    ) -> None:
+        """``mark_root_uncertain``'s statement, without committing (for a caller's transaction)."""
         deferred = f"{ROOT_DEFERRED_PREFIX}%"
         self._db.execute(
             "INSERT INTO selection_root_bindings(connection_id,generation,root_kind,root_id,drive_id,status,detail) "
@@ -1088,7 +1096,6 @@ class StateStore:
             "WHERE selection_root_bindings.status NOT IN ('relocating','unresolved')",
             (connection_id, generation, root_kind, root_id, drive_id, detail, deferred, deferred),
         )
-        self._db.commit()
 
     def mark_root_relocating(
         self, connection_id: str, generation: int, root_kind: str, root_id: str, drive_id: str,
@@ -1140,6 +1147,77 @@ class StateStore:
             connection_id, generation, root_kind, root_id, drive_id,
             detail=f"{ROOT_DEFERRED_PREFIX}: {detail}",
         )
+
+    def defer_root_in_build(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str, drive_id: str,
+        *, detail: str, namespace: str, snapshot_id: int,
+    ) -> bool:
+        """Defer a root (as ``mark_root_deferred``) and, in the SAME transaction, end what this building
+        snapshot can still say about it (AIO-1167 final review R51 F1, High).
+
+        If the BUILDING snapshot already finished any traversal entry of the root — it listed part of
+        it, or closed part of it unlisted after a loss — then this snapshot can no longer establish the
+        root's complete membership: what it withdrew or never listed is not coming back by finishing
+        the old remainder (a materialized page never reapplies membership). So every remaining entry of
+        the root is closed now, atomically with the deferral, and nothing of it is left to "resume". The
+        deferred root then keeps the connection partial, and only the controlled rescan
+        (`_deferred_root_admissible`) lists it in full, under a fresh snapshot and fresh page identities.
+        A crash cannot separate the two writes, so no restart can see a deferred root with an old
+        remainder still open.
+
+        An untouched root (nothing of it finished in this snapshot) keeps its open seed: listing it from
+        there IS a full enumeration. Only an actual deferral (a relocating or unresolved root is not
+        deferred) closes anything. Returns whether the remaining traversal was closed."""
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            self._write_root_uncertain(
+                connection_id, generation, root_kind, root_id, drive_id,
+                detail=f"{ROOT_DEFERRED_PREFIX}: {detail}",
+            )
+            binding = self._db.execute(
+                "SELECT status,detail FROM selection_root_bindings WHERE connection_id=? AND generation=? "
+                "AND root_kind=? AND root_id=?",
+                (connection_id, generation, root_kind, root_id),
+            ).fetchone()
+            deferred = bool(
+                binding is not None and binding["status"] == "uncertain"
+                and str(binding["detail"] or "").startswith(ROOT_DEFERRED_PREFIX)
+            )
+            snapshot = self._db.execute(
+                "SELECT status FROM selection_snapshots WHERE namespace=? AND generation=? AND snapshot_id=?",
+                (namespace, generation, snapshot_id),
+            ).fetchone()
+            closed = False
+            if deferred and snapshot is not None and snapshot["status"] == "building" and self._root_traversal_touched(
+                namespace, generation, root_id, snapshot_id,
+            ):
+                cur = self._db.execute(
+                    "UPDATE traversal_queue SET completed_at=? WHERE namespace=? AND generation=? "
+                    "AND snapshot_id=? AND root_id=? AND completed_at IS NULL",
+                    (_now_iso(), namespace, generation, snapshot_id, root_id),
+                )
+                closed = cur.rowcount > 0
+            self._db.commit()
+            return closed
+        except Exception:
+            self._db.rollback()
+            raise
+
+    def _root_traversal_touched(
+        self, namespace: str, generation: int, root_id: str, snapshot_id: int,
+    ) -> bool:
+        return self._db.execute(
+            "SELECT 1 FROM traversal_queue WHERE namespace=? AND generation=? AND snapshot_id=? "
+            "AND root_id=? AND completed_at IS NOT NULL LIMIT 1",
+            (namespace, generation, snapshot_id, root_id),
+        ).fetchone() is not None
+
+    def root_traversal_touched(
+        self, namespace: str, generation: int, root_id: str, *, snapshot_id: int,
+    ) -> bool:
+        """Whether this snapshot already finished any traversal entry of ``root_id`` — listed part of
+        it, or closed part of it unlisted (R51 F1). An untouched root can still be listed in full."""
+        return self._root_traversal_touched(namespace, generation, root_id, snapshot_id)
 
     def deferred_roots(
         self, connection_id: str, generation: int, drive_id: str,
