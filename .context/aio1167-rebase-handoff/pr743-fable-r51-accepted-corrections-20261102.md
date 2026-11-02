@@ -12,4 +12,4 @@ Updated: 2026-11-02 14:54 UTC.
 
 ## Resume checkpoint
 
-No correction source edits have started. Existing branch source checkpoint remains `4f515e0`; prior feature head with review records is `d6b88f7`. The latest remote branch read was unavailable in the sandbox due DNS/network restriction and must be checked through the normal approved full-user route before the next long writer turn. No changes were made to the clean PR714 worktree.
+No correction source edits have started. Existing branch source checkpoint remains `4f515e0`; prior feature head with review records is `d6b88f7`. Handoff/prompt checkpoint is `efc18849f2b2f6f7e66b22cbc4eddde408286767`, pushed to `origin/codex/aio-1167-r51-resume-20261102` and independently read back with `git ls-remote`. Prompt SHA-256 is `65b3501d0fe655a499c48e12c302d1f17cb5d0424e888dd26796e2663474c2ea`; handoff SHA-256 before this checkpoint note was updated is `66f344124bea4bfab7951549c0a496eca559e97997d31e02c4078834b4bc40d6`. No changes were made to the clean PR714 worktree.
