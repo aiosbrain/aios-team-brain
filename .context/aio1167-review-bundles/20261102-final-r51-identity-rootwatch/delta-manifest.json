@@ -1,0 +1,148 @@
+{
+  "source_base": "5ecd2989e21fded915b41b508477bb267aaec06d",
+  "last_reviewed_snapshot": "b86b22d2e6b1561d0f7e57e0a4caac07e9880fb3",
+  "review_snapshot": "4f515e0ee20e25649019b5889188977dedbf92f0",
+  "later_handoff_head": "04beb9301926b8396f449019032545f9e069174f",
+  "remote_checkpoint_ref": "origin/codex/aio-1167-r51-resume-20261102",
+  "changed_source_file_count": 18,
+  "diff_sha256": "5a20b1683a6ddc817eefd7e2875c3c9f7e65077d85872ca9b239a7263e65c013",
+  "diff_bytes": 107857,
+  "compressed_sha256": "04a680368770e5435ba57a66ccf0c7de8c534f6749c2c9b4c753c99b0916101f",
+  "files": [
+    {
+      "status": "M",
+      "path": "app/api/auth/gdrive/callback/route.ts",
+      "blob": "440ae3ef5d59f3dbc072dc384d8c9a265ec6945d",
+      "sha256": "6f7889e83283e1d1c07cbc2ebc1e017565e14b23dee1518f5bec2c72e2df8518",
+      "bytes": 12868
+    },
+    {
+      "status": "M",
+      "path": "ingestion/aios_ingest/gdrive_sync.py",
+      "blob": "403200612065adada7b9dd6b05a6d0e5196e6822",
+      "sha256": "13c23a0cbc981f6cab09e3f98d32bebcde84c4219071d11b2585d3dde49adf68",
+      "bytes": 222441
+    },
+    {
+      "status": "M",
+      "path": "ingestion/aios_ingest/state.py",
+      "blob": "932cc8c2ca2da9a49075d486d102dd640e19a376",
+      "sha256": "9014f5011dcd4b2a85e1992d6c39f24c953fa705a4839925d70d7d73701a6d65",
+      "bytes": 144897
+    },
+    {
+      "status": "M",
+      "path": "ingestion/aios_ingest/watch_renewal.py",
+      "blob": "135ec2e2d6c6a66cff4595eb32458d3f372f41ea",
+      "sha256": "b9d6495c47587ddbbdfe37a5e208e64cdefe4c772c2030e399780065b64830eb",
+      "bytes": 35253
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_lost_root_in_partial_build.py",
+      "blob": "aa86015c3c728b0133e06a610b317e011d2132c8",
+      "sha256": "d4e36aa20f4859b31c6b8136247fdcda71a03a2f27f4598fdf607cca1703fb77",
+      "bytes": 12704
+    },
+    {
+      "status": "A",
+      "path": "ingestion/tests/test_watch_late_quota.py",
+      "blob": "71356224b116d9edabed72755bcf439b83b5fd59",
+      "sha256": "778165a0a85cd398dfc8a95b17ce8cc975d48bc2871d80d0420b26b9e9fb1b91",
+      "bytes": 17612
+    },
+    {
+      "status": "M",
+      "path": "lib/attribution/resolve-authors.ts",
+      "blob": "f50c19e3dfe0b4625f59d5191c87e4612e94fef9",
+      "sha256": "8dad27d0b8ca67e2df8b31dd741c254eca1f37e98256fd1c4ecd9c9b07d067b5",
+      "bytes": 14572
+    },
+    {
+      "status": "M",
+      "path": "lib/dashboard/gdrive-contributions.ts",
+      "blob": "a1392797f2665d3a2ffe6da1034a4fc9b01ca7bc",
+      "sha256": "c5d9e4ba0a12794a0ae2e5859a1f49fb5ff9815079dff67cb9b2aa7fa0a6303f",
+      "bytes": 3892
+    },
+    {
+      "status": "A",
+      "path": "lib/identity/google-email-authority.ts",
+      "blob": "a018624e85ea07a4c2d7acefaeb3dac2d8c54041",
+      "sha256": "bdc4b9464f0b8886aaf750b9da3b60604bd5341db2e73822ef19edbdc9a95f94",
+      "bytes": 2849
+    },
+    {
+      "status": "M",
+      "path": "lib/identity/member-identities.ts",
+      "blob": "6bdfeb211b1c3ab98c18d305d277441ab6a123ba",
+      "sha256": "f4438e278e25843c6060ae894d50b0ef729f2d034249ebb912258a6183c2b27a",
+      "bytes": 25689
+    },
+    {
+      "status": "M",
+      "path": "lib/identity/resolve.ts",
+      "blob": "6fb3021f785b95414df75897ede8708d9ef60832",
+      "sha256": "118dc3ccd8fc2b1fba27ac0fe20345bc144964fa551cc9fe5f3f8f4bbd3577ed",
+      "bytes": 13967
+    },
+    {
+      "status": "M",
+      "path": "lib/ingest/gdrive-contribution-store.ts",
+      "blob": "a16cf3c0297e97921929a4be07bdd1b23043d788",
+      "sha256": "9c2e4a53969c4e0d27fcf269e901ca46baa8bee4e167a160fbd7d5311036dad3",
+      "bytes": 10183
+    },
+    {
+      "status": "M",
+      "path": "lib/ingest/identity-repair.ts",
+      "blob": "bf43d18efb2f06fc1b73f2e5ca70b2fb9286f4bf",
+      "sha256": "c2d782852ef67b3a74b9f0ea990e87cce5a4331557c0c1880b8a0986e0a57236",
+      "bytes": 19434
+    },
+    {
+      "status": "M",
+      "path": "lib/ingest/reattribute.ts",
+      "blob": "4dc6cca23f7b5ca6afca5513b7a7e8f85ab942ad",
+      "sha256": "21fd7ccfbad2ee8c2b1457567ff0be5947b2c6ec2d057b585ff08abdf5d302a4",
+      "bytes": 16794
+    },
+    {
+      "status": "M",
+      "path": "lib/integrations/gdrive-oauth.ts",
+      "blob": "541acdcf3c92cd27deabf1da1c54d0b10bbceb72",
+      "sha256": "7e18f280f4beb3f2cae953a74a48843ac439825e43e4f13ac5849e6b6fe1bd04",
+      "bytes": 15025
+    },
+    {
+      "status": "A",
+      "path": "test/datamechanics/gdrive-identity-email-reader.datamechanics.test.ts",
+      "blob": "4ad8faa8b29a4971442b36806bfe342ebe105825",
+      "sha256": "eeff8aafdcab3f9742e4e780f1d536ee807c3c80a83c12ba0993287b74a35e72",
+      "bytes": 14344
+    },
+    {
+      "status": "M",
+      "path": "test/datamechanics/gdrive-identity-tombstone-email.datamechanics.test.ts",
+      "blob": "c05f2571bccce8257f7efc2e18291b75eb04abd7",
+      "sha256": "f654b81e6666b5b8292b47d6c502e23098b00ad87c615756322f99160b01937e",
+      "bytes": 49181
+    },
+    {
+      "status": "A",
+      "path": "test/gdrive-callback-identity-outcome.test.ts",
+      "blob": "4241b1e87832668a032e24bb406c4e9f12b42790",
+      "sha256": "4c4d47c8c66303968cc06b7da9e261f2c1f4b4b9a2e585dbd2891316ffcddb06",
+      "bytes": 5047
+    }
+  ],
+  "review_packet_commit_before_delta": "04beb9301926b8396f449019032545f9e069174f",
+  "fable_full_attempt_record": "fable-full-review-attempt.json",
+  "usage_read_before_next_fable": {
+    "time_utc": "2026-11-02 13:53",
+    "all_model_week_percent": 43,
+    "fable_week_percent": 51,
+    "credits": "off",
+    "session_percent": "not displayed"
+  }
+}

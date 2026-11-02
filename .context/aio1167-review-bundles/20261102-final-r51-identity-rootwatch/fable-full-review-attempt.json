@@ -1,0 +1,20 @@
+{
+  "kind": "invalid-review-attempt-no-verdict",
+  "model": "claude-fable-5-1",
+  "session_id": "321dc05c-0146-47a4-8382-1104225165df",
+  "review_head": "05944f3bf42b265e6a994779b1074bc4af0f1edb",
+  "duration_ms": 951034,
+  "exit_code": 0,
+  "terminal_reason": "completed",
+  "is_error": false,
+  "result_nonempty": false,
+  "permission_denials": ["claude-mem smart_unfold was denied; review tools remained Read/Glob/Grep"],
+  "usage": {
+    "input_tokens": 418,
+    "cache_creation_input_tokens": 518844,
+    "cache_read_input_tokens": 7414881,
+    "output_tokens": 65886,
+    "thinking_tokens": 45869
+  },
+  "disposition": "Not a review verdict. The CLI completed without a substantive final answer, so it cannot count as Fable coverage. Retry as a focused delta review from the last independently reviewed snapshot b86b22d2e6b1561d0f7e57e0a4caac07e9880fb3 to current source commit 4f515e0ee20e25649019b5889188977dedbf92f0. The current source remains frozen."
+}
