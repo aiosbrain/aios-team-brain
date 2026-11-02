@@ -1,5 +1,6 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
+import { googleEmailHistory, googleEmailKey, type GoogleEmailState } from "@/lib/identity/google-email-authority";
 
 /**
  * Shared identity resolution: git/provider author identity → roster `member_id` for a team.
@@ -21,18 +22,25 @@ export interface IdentityMap {
   /** Exact keys observed for more than one member. They fail closed instead of last-row-wins. */
   ambiguousEmails?: ReadonlySet<string>;
   ambiguousProviderIds?: ReadonlySet<string>;
-  /** Durable mapping authority, including unlink tombstones. Presence blocks heuristic fallback. */
-  providerIdentityStates?: ReadonlyMap<string, "linked" | "unlinked">;
+  /** Durable mapping authority, including unlink tombstones. Presence blocks heuristic fallback.
+   *  `ambiguous` occurs only for a Google `author-email:` identity with several equivalent histories
+   *  and no canonical decision (AIO-1167 PR743): it blocks provider credit and fallback, but is not an
+   *  unlink. */
+  providerIdentityStates?: ReadonlyMap<string, ProviderIdentityState>;
   /** Active/invited human-or-connector rows participating in this complete snapshot. */
   activeMemberIds?: ReadonlySet<string>;
 }
 
+export type ProviderIdentityState = "linked" | "unlinked" | "ambiguous";
+
 function providerKey(provider: string, externalId: string): string {
   const normalizedProvider = provider.trim().toLowerCase();
   // Google subject and permission ids are opaque identifiers, not human handles. Preserve their
-  // exact bytes so differently-cased accounts cannot collapse into one attribution authority.
+  // exact bytes so differently-cased accounts cannot collapse into one attribution authority. A Google
+  // `author-email:` identity alone compares under its canonical key — the writer's one contract
+  // (`google-email-authority`), so every equivalent spelling is one lookup key (AIO-1167 PR743).
   const normalizedExternalId = normalizedProvider === "gdrive"
-    ? externalId.trim()
+    ? googleEmailKey(normalizedProvider, externalId) ?? externalId.trim()
     : externalId.trim().toLowerCase();
   return `${normalizedProvider}:${normalizedExternalId}`;
 }
@@ -155,7 +163,7 @@ export async function buildIdentityMap(
     if (!byEmail.has(email)) ambiguousEmails.add(email);
   }
 
-  const providerIdentityStates = new Map<string, "linked" | "unlinked">();
+  const providerIdentityStates = new Map<string, ProviderIdentityState>();
   const { data: mappingStates, error: mappingStatesError } = await db
     .from("member_identity_mapping_state")
     .select("provider, external_id, state")
@@ -163,14 +171,33 @@ export async function buildIdentityMap(
   if (opts.strict && mappingStatesError) {
     throw new Error(`provider identity authority read failed: ${mappingStatesError.message}`);
   }
+  // Google `author-email:` histories are GROUPED by canonical key and decided once, order-independently,
+  // by the writer's own rule — never last-row-wins (AIO-1167 PR743). Every other key is exact, as before.
+  const googleEmailStates = new Map<string, GoogleEmailState[]>();
   for (const state of (mappingStates ?? []) as {
     provider: string;
     external_id: string;
     state: "linked" | "unlinked";
   }[]) {
-    if (state.provider && state.external_id && (state.state === "linked" || state.state === "unlinked")) {
-      providerIdentityStates.set(providerKey(state.provider, state.external_id), state.state);
+    if (!state.provider || !state.external_id || (state.state !== "linked" && state.state !== "unlinked")) continue;
+    const canonical = googleEmailKey(state.provider, state.external_id);
+    if (canonical) {
+      const group = googleEmailStates.get(canonical) ?? [];
+      group.push({ externalId: state.external_id, state: state.state });
+      googleEmailStates.set(canonical, group);
+      continue;
     }
+    providerIdentityStates.set(providerKey(state.provider, state.external_id), state.state);
+  }
+  for (const [canonical, states] of googleEmailStates) {
+    const key = `gdrive:${canonical}`;
+    const { history } = googleEmailHistory(canonical, states);
+    if (history === "none") continue;
+    providerIdentityStates.set(key, history);
+    // An applicable unlink or an ambiguity blocks this identity's Google provider credit as well as its
+    // email/handle fallback — even if an equivalent legacy row is still live. A different-owner
+    // conflict between live spellings is already fail-closed (`ambiguousProviderIds`).
+    if (history !== "linked") byProviderId.delete(key);
   }
 
   return {
@@ -191,9 +218,22 @@ export function providerIdentityState(
   map: IdentityMap,
   provider: string,
   externalId: string,
-): "linked" | "unlinked" | null {
+): ProviderIdentityState | null {
   if (!externalId) return null;
   return map.providerIdentityStates?.get(providerKey(provider, externalId)) ?? null;
+}
+
+/**
+ * Whether a Google evidence email's OWN `author-email:` identity holds an applicable unlink or an
+ * ambiguity (AIO-1167 PR743). The email attribution bridge for that address is then held: Google
+ * evidence must not reach the member through a roster/alias email match. Only Google consumers ask
+ * this; roster email itself, and every other provider, are unaffected.
+ */
+export function googleEmailAttributionHeld(map: IdentityMap, email: string | null | undefined): boolean {
+  const address = (email ?? "").trim();
+  if (!address) return false;
+  const state = providerIdentityState(map, "gdrive", `author-email:${address}`);
+  return state === "unlinked" || state === "ambiguous";
 }
 
 /** How an identity resolved — the attribution CONFIDENCE. `email`/`handle` are exact matches;

@@ -29,10 +29,32 @@ export class GoogleGrantOutsideModeError extends Error {
  */
 export class IncompatibleStoredGoogleCredentialError extends Error {}
 
-/** What the publication did to the connection's run state (AIO-1167 R43 F2). */
+/**
+ * What automatic publication decided for ONE namespaced Google identity (AIO-1167 PR743):
+ *   `linked`     — the mapping was created or already belonged to the member;
+ *   `preserved`  — the same member already holds this email under an equivalent legacy spelling, kept
+ *                  exactly as stored (not an unlink);
+ *   `tombstoned` — a deliberate unlink stands, so nothing was written;
+ *   `ambiguous`  — several equivalent earlier histories and no canonical decision, so nothing was written;
+ *   `unresolved` — no verified email matched a member, so no mapping was attempted.
+ */
+export type GoogleIdentityOutcome = "linked" | "preserved" | "tombstoned" | "ambiguous" | "unresolved";
+
+/** What the publication did to the connection's run state (AIO-1167 R43 F2) and to attribution. */
 export interface GoogleDriveOAuthPublication {
   /** `disabled` when an existing paused/disconnected connection was reconnected: it stays paused. */
   status: "enabled" | "disabled";
+  /** The subject and email identity outcomes, each decided on its own. */
+  identity: { subject: GoogleIdentityOutcome; email: GoogleIdentityOutcome };
+}
+
+function identityOutcome(result: {
+  tombstoned?: boolean; ambiguous?: boolean; preserved?: boolean;
+}): GoogleIdentityOutcome {
+  if (result.preserved) return "preserved";
+  if (result.ambiguous) return "ambiguous";
+  if (result.tombstoned) return "tombstoned";
+  return "linked";
 }
 
 /** Deterministic concurrency seam for real-Postgres lock-order regressions. */
@@ -207,6 +229,7 @@ export async function publishGoogleDriveOAuthCredential(
       type: "gdrive", name: input.integrationName, config, status,
     });
     await setIntegrationSecret(db, auth, id, secret);
+    let identity: GoogleDriveOAuthPublication["identity"] = { subject: "unresolved", email: "unresolved" };
     if (verifiedMemberId && verifiedEmail) {
       // Credential authority is not attribution intent (AIO-1167 R47 F1): connecting or reconnecting
       // proves the Admin may use this Google account, not that a deliberate unlink should be undone.
@@ -215,7 +238,8 @@ export async function publishGoogleDriveOAuthCredential(
       // to restore it. A different existing owner is still a conflict, never treated as unlinked.
       // The email key is decided across its equivalent spellings (PR743): one legacy tombstone stands
       // (`tombstoned`), several equivalent histories with no canonical decision link nothing
-      // (`ambiguous`) — the credential is published either way, the attribution left unresolved.
+      // (`ambiguous`) — the credential is published either way, the attribution left unresolved. The
+      // same member's standing legacy spelling is kept exactly (`preserved`), never reported as unlinked.
       const automatic = { actor: { kind: "member" as const, memberId: input.memberId }, respectTombstone: true };
       const subjectIdentity = await setMemberIdentity(db, input.teamId, verifiedMemberId, {
         provider: "gdrive", externalId: subject, email: verifiedEmail,
@@ -228,7 +252,8 @@ export async function publishGoogleDriveOAuthCredential(
       if (subjectIdentity.conflict || emailIdentity.conflict) {
         throw new GoogleIdentityConflictError("verified Google identity conflicts with an existing manual mapping");
       }
+      identity = { subject: identityOutcome(subjectIdentity), email: identityOutcome(emailIdentity) };
     }
-    return { status };
+    return { status, identity };
   });
 }

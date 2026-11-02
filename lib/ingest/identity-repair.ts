@@ -3,6 +3,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { runSql, withTransaction } from "@/lib/db/pg/pool";
 import type { IdentityMap } from "@/lib/identity/resolve";
+import { googleEmailKey } from "@/lib/identity/google-email-authority";
 import { resolveItemAuthorMember } from "@/lib/attribution/resolve-authors";
 import { syncGdriveContributionEvidence } from "@/lib/ingest/gdrive-contribution-store";
 import { purgeTeamLearningCachesStrict } from "@/lib/ingest/reconcile-attribution";
@@ -36,6 +37,30 @@ function hasRetainedGdriveEvidence(frontmatter: Record<string, unknown>): boolea
     (Array.isArray(frontmatter.authors) && frontmatter.authors.length > 0) ||
     (Array.isArray(frontmatter.contributions) && frontmatter.contributions.length > 0)
   );
+}
+
+/**
+ * Whether a Drive document's retained evidence names one Google email identity (AIO-1167 PR743): an
+ * author/contribution whose external id is EQUIVALENT to the obligation's key under the one comparison
+ * contract (`google-email-authority` — prefix/address whitespace, prefix case and JavaScript case
+ * folding included), or whose optional email is that address. Evidence without an email is covered by
+ * its external id alone.
+ */
+function namesGoogleEmail(frontmatter: Record<string, unknown>, canonical: string): boolean {
+  const address = canonical.slice("author-email:".length);
+  const text = (value: unknown): string => typeof value === "string" ? value : "";
+  for (const list of [frontmatter.authors, frontmatter.contributions]) {
+    if (!Array.isArray(list)) continue;
+    for (const raw of list) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+      const entry = raw as Record<string, unknown>;
+      const externalId = text(entry.external_id) || text(entry.externalId);
+      if (externalId && googleEmailKey("gdrive", externalId) === canonical) return true;
+      const email = text(entry.email).trim().toLowerCase();
+      if (email && email === address) return true;
+    }
+  }
+  return false;
 }
 
 async function currentObligation(obligation: Obligation): Promise<Obligation | null> {
@@ -226,30 +251,48 @@ export async function runIdentityRepairObligation(
       // Nomination, bounded by the obligation's cursor: Drive documents by the provenance rule —
       // the persisted same-team mapping and current Drive source evidence — that name this
       // identity among their authors or contributions.
-      const { rows: candidates } = await runSql<{ id: string }>(
-        `select i.id from items i
-          where i.team_id=$1 and ${DRIVE_OBLIGATION_PROVENANCE}
-            and ($3::uuid is null or i.id>$3::uuid)
-            and (
-              exists (select 1 from jsonb_array_elements(
-                case when jsonb_typeof(i.frontmatter->'authors')='array'
-                     then i.frontmatter->'authors' else '[]'::jsonb end
-              ) a where a->>'external_id'=$2
-                    or ($5::text is not null and lower(a->>'email')=$5))
-              or exists (select 1 from jsonb_array_elements(
-                case when jsonb_typeof(i.frontmatter->'contributions')='array'
-                     then i.frontmatter->'contributions' else '[]'::jsonb end
-              ) c where c->>'external_id'=$2
-                    or ($5::text is not null and lower(c->>'email')=$5))
-            )
-          order by i.id limit $4`,
-        [
-          current.team_id, current.external_id, current.cursor_item_id, batchSize,
-          current.external_id.toLowerCase().startsWith("author-email:")
-            ? current.external_id.slice("author-email:".length).toLowerCase()
-            : null,
-        ],
-      );
+      //
+      // A Google EMAIL identity is matched by the one JavaScript comparison contract, never by SQL
+      // folding (AIO-1167 PR743): the bounded scan selects every Drive document with retained author or
+      // contribution evidence — a guaranteed superset — and `namesGoogleEmail` decides. The cursor still
+      // advances over the whole scanned page, so the drain stays bounded and makes progress. Every
+      // other identity keeps its exact external-id match. The obligation tuple itself stays exact.
+      const emailKey = googleEmailKey(current.provider, current.external_id);
+      let scannedPage: { id: string }[];
+      let candidates: { id: string }[];
+      if (emailKey) {
+        const { rows } = await runSql<{ id: string; frontmatter: Record<string, unknown> }>(
+          `select i.id,i.frontmatter from items i
+            where i.team_id=$1 and ${DRIVE_OBLIGATION_PROVENANCE}
+              and ($2::uuid is null or i.id>$2::uuid)
+              and (jsonb_typeof(i.frontmatter->'authors')='array'
+                   or jsonb_typeof(i.frontmatter->'contributions')='array')
+            order by i.id limit $3`,
+          [current.team_id, current.cursor_item_id, batchSize],
+        );
+        scannedPage = rows;
+        candidates = rows.filter((row) => namesGoogleEmail(row.frontmatter ?? {}, emailKey));
+      } else {
+        const { rows } = await runSql<{ id: string }>(
+          `select i.id from items i
+            where i.team_id=$1 and ${DRIVE_OBLIGATION_PROVENANCE}
+              and ($3::uuid is null or i.id>$3::uuid)
+              and (
+                exists (select 1 from jsonb_array_elements(
+                  case when jsonb_typeof(i.frontmatter->'authors')='array'
+                       then i.frontmatter->'authors' else '[]'::jsonb end
+                ) a where a->>'external_id'=$2)
+                or exists (select 1 from jsonb_array_elements(
+                  case when jsonb_typeof(i.frontmatter->'contributions')='array'
+                       then i.frontmatter->'contributions' else '[]'::jsonb end
+                ) c where c->>'external_id'=$2)
+              )
+            order by i.id limit $4`,
+          [current.team_id, current.external_id, current.cursor_item_id, batchSize],
+        );
+        scannedPage = rows;
+        candidates = rows;
+      }
       let itemUpdates = 0;
       let versionUpdates = 0;
       let contributionUpdates = 0;
@@ -261,7 +304,7 @@ export async function runIdentityRepairObligation(
         versionUpdates += result.versions;
         contributionUpdates += result.contributions;
       }
-      const last = candidates.at(-1)?.id ?? current.cursor_item_id;
+      const last = scannedPage.at(-1)?.id ?? current.cursor_item_id;
       await runSql(
         `update identity_repair_obligations set cursor_item_id=$5,
                 items_scanned=items_scanned+$6,items_updated=items_updated+$7,
@@ -274,7 +317,7 @@ export async function runIdentityRepairObligation(
       return {
         status: "partial" as const,
         scanned: candidates.length,
-        finished: candidates.length < batchSize,
+        finished: scannedPage.length < batchSize,
       };
     });
     if (batch.status === "obsolete") return batch;

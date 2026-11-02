@@ -10,6 +10,7 @@ import {
   GoogleIdentityConflictError,
   InvalidGoogleOAuthInitiatorError,
   publishGoogleDriveOAuthCredential,
+  type GoogleDriveOAuthPublication,
 } from "@/lib/integrations/gdrive-oauth";
 
 export const runtime = "nodejs";
@@ -143,8 +144,9 @@ export async function GET(req: NextRequest) {
   const emailVerified = user.email_verified === true;
 
   let status: "enabled" | "disabled";
+  let identity: GoogleDriveOAuthPublication["identity"];
   try {
-    ({ status } = await publishGoogleDriveOAuthCredential({
+    ({ status, identity } = await publishGoogleDriveOAuthCredential({
       teamId: bound.teamId, memberId: bound.memberId, integrationName: bound.integrationName,
       clientId, clientSecret, subject, email, emailVerified,
       name: typeof user.name === "string" ? user.name : undefined,
@@ -175,5 +177,29 @@ export async function GET(req: NextRequest) {
   if (!email || !emailVerified) {
     return html(200, "Google Drive connected", `Connected ${email ?? "a Google account without an email"}. Google did not verify this account's email, so it was not linked to a member: map it under Admin → Members → Identities.${paused} Return to Integrations to choose files or folders.`);
   }
-  return html(200, "Google Drive connected", `Connected ${email}.${paused} Return to Integrations to choose files or folders.`);
+  return html(200, "Google Drive connected", `Connected ${email}.${emailAttributionNote(identity)}${paused} Return to Integrations to choose files or folders.`);
+}
+
+/**
+ * What the Admin needs to know about the EMAIL attribution bridge (AIO-1167 PR743). The credential is
+ * connected either way, and the account's Google subject is reported for what it is: a held email
+ * bridge is not an unlinked account. A preserved same-member mapping is neither held nor unlinked.
+ */
+function emailAttributionNote(identity: GoogleDriveOAuthPublication["identity"] | undefined): string {
+  if (!identity) return "";
+  const subject = identity.subject === "linked"
+    ? " The account's Google identity is linked to the member;"
+    : identity.subject === "tombstoned"
+      ? " The account's Google identity was deliberately unlinked earlier and stays unlinked;"
+      : " The account's Google identity is not linked to a member;";
+  if (identity.email === "tombstoned") {
+    return `${subject} its email address was deliberately unlinked earlier, so documents are not credited through that email until an Admin relinks it under Admin → Members → Identities.`;
+  }
+  if (identity.email === "ambiguous") {
+    return `${subject} its email address has several earlier mapping histories, so documents are not credited through that email until an Admin resolves it under Admin → Members → Identities.`;
+  }
+  if (identity.email === "preserved") {
+    return " Its email address was already linked to the same member under an earlier spelling; that mapping was kept.";
+  }
+  return "";
 }

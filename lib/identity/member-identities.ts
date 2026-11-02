@@ -4,6 +4,7 @@ import { audit } from "@/lib/api/audit";
 import { runSql } from "@/lib/db/pg/pool";
 import { advanceAuthorizationEpoch } from "@/lib/access/authorization-epoch";
 import { withIdentityMutationBoundary } from "@/lib/identity/authority";
+import { googleEmailHistory, googleEmailKey } from "@/lib/identity/google-email-authority";
 
 /**
  * The single writer for `member_identities` — maps a provider's stable user id (Slack `Uxxx`,
@@ -40,6 +41,12 @@ export interface SetIdentityResult {
   /** `respectTombstone` only: several equivalent historical states and no canonical decision, so no
    * applicable state can be chosen. Nothing was written (fail closed). */
   ambiguous?: boolean;
+  /** `respectTombstone` only (Google email): the SAME member already holds this address under an
+   * equivalent legacy spelling. That standing mapping is kept exactly as stored — no canonical row or
+   * state, no metadata refresh, no repair/epoch/audit — and no revision is claimed for it. */
+  preserved?: boolean;
+  /** With `preserved`: the exact stored spellings of the standing mapping, sorted. */
+  preservedKeys?: string[];
 }
 
 export async function advanceIdentityMappingState(input: {
@@ -86,10 +93,9 @@ export async function advanceIdentityMappingState(input: {
  * spelling, so a legacy differently-spelled row can still be removed explicitly.
  */
 export function canonicalIdentityId(provider: string, externalId: string): string {
-  const id = externalId.trim();
-  const match = /^author-email:(.*)$/i.exec(id);
-  if (provider.trim().toLowerCase() !== "gdrive" || !match) return id;
-  return `author-email:${match[1].trim().toLowerCase()}`;
+  // One comparison contract for writers and readers (`google-email-authority`); everything that is not
+  // a Google email identity keeps its trimmed exact bytes.
+  return googleEmailKey(provider, externalId) ?? externalId.trim();
 }
 
 /**
@@ -125,7 +131,7 @@ async function lockEquivalentGoogleEmailRows(
       order by external_id for update`,
     [teamId],
   );
-  const same = (key: string) => canonicalIdentityId("gdrive", key) === canonical;
+  const same = (key: string) => googleEmailKey("gdrive", key) === canonical;
   return {
     live: live.filter((row) => same(row.external_id)),
     states: states.filter((row) => same(row.external_id))
@@ -253,27 +259,38 @@ export async function setMemberIdentity(
         res.note = `${provider} identity ${externalId} already maps to a different member; pass force to remap`;
         return res;
       }
-      if (canonicalState) {
-        // The canonical key's own decision governs alone; older equivalent spellings do not reopen it.
-        if (canonicalState.state === "unlinked") {
-          res.tombstoned = true;
-          res.mappingRevision = currentRevision;
-          res.mappingKey = externalId;
-          return res;
-        }
-      } else if (otherStates.length > 1) {
+      // The one order-independent history decision the readers apply too (`google-email-authority`):
+      // the canonical key's own state governs alone; otherwise zero → ordinary, one → that decision,
+      // several (whatever their values) → ambiguous. Revisions stay with their own exact key.
+      const states = [
+        ...(canonicalState ? [{ externalId, state: canonicalState.state, revision: canonicalState.revision }] : []),
+        ...otherStates.map((row) => ({ externalId: row.external_id, state: row.state, revision: row.revision })),
+      ];
+      const { history, governing } = googleEmailHistory(externalId, states);
+      if (history === "unlinked") {
+        // The deliberate unlink stands — under this spelling or the one equivalent legacy spelling.
+        const decided = states.find((row) => row.externalId === governing?.externalId);
+        res.tombstoned = true;
+        res.mappingRevision = decided?.revision;
+        res.mappingKey = decided?.externalId;
+        return res;
+      }
+      if (history === "ambiguous") {
         // Several equivalent histories — linked, unlinked or mixed — and no canonical decision: none
         // is selected and nothing is written (fail closed) until an explicit relink decides.
         res.ambiguous = true;
         return res;
-      } else if (otherStates[0]?.state === "unlinked") {
-        // One applicable equivalent tombstone: the deliberate unlink stands under this spelling too.
-        res.tombstoned = true;
-        res.mappingRevision = otherStates[0].revision;
-        res.mappingKey = otherStates[0].external_id;
+      }
+      if (!ex && otherLive.length) {
+        // The SAME member already holds this address under an equivalent legacy spelling (a different
+        // owner was refused above). Credential authority is not attribution intent: the standing
+        // mapping is preserved exactly — no canonical row/state, no metadata refresh, no repair, epoch
+        // or audit, and no revision claimed — and the caller's credential publication goes on.
+        res.preserved = true;
+        res.preservedKeys = otherLive.map((row) => row.external_id).sort();
         return res;
       }
-      // Zero legacy states, or exactly one that is not a tombstone: the ordinary path.
+      // Zero legacy histories, or exactly one linked one: the ordinary path.
     }
     if (!ex && otherLive[0]) {
       // The same address in another spelling is the same person-key: never merged or overwritten

@@ -2,6 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import type { ItemPayload } from "@/lib/api/schemas";
 import {
+  googleEmailAttributionHeld,
   providerIdentityState,
   resolveByProviderId,
   resolveMemberDetailed,
@@ -161,6 +162,9 @@ function resolveRef(map: IdentityMap, ref: AuthorRef): { memberId: string | null
     // display name into a verified Google link.
     if (ref.provider?.toLowerCase() === "gdrive") {
       const email = ref.email.trim().toLowerCase();
+      // The address's own Google email identity was unlinked, or its histories are ambiguous: the
+      // email bridge is held for Google evidence (AIO-1167 PR743).
+      if (googleEmailAttributionHeld(map, email)) return { memberId: null, method: "unresolved" };
       const exact = !map.ambiguousEmails?.has(email) ? map.byEmail.get(email) : undefined;
       if (exact) return { memberId: exact, method: "email" };
       return { memberId: null, method: "unresolved" };

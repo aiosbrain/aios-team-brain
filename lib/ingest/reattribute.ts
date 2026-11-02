@@ -76,6 +76,11 @@ function explicitlyUnlinked(
     if (ref.provider && ref.externalId
         && providerIdentityState(snapshot.map, ref.provider, ref.externalId) === "unlinked") return true;
     const email = ref.email?.trim().toLowerCase();
+    // Google evidence: the address's own `author-email:` identity, decided across its equivalent
+    // spellings (AIO-1167 PR743). Only a definite unlink clears established credit; an ambiguity blocks
+    // new resolution but is not an unlink.
+    if (email && ref.provider?.trim().toLowerCase() === "gdrive"
+        && providerIdentityState(snapshot.map, "gdrive", `author-email:${email}`) === "unlinked") return true;
     return Boolean(email && providerIdentityState(snapshot.map, "email-alias", email) === "unlinked");
   });
 }

@@ -1,4 +1,6 @@
-import { providerIdentityState, resolveByProviderId, type IdentityMap } from "@/lib/identity/resolve";
+import {
+  googleEmailAttributionHeld, providerIdentityState, resolveByProviderId, type IdentityMap,
+} from "@/lib/identity/resolve";
 import { coalesceGdriveObservations } from "@/lib/ingest/gdrive-ledger";
 
 export interface GoogleDriveContributionEvidence {
@@ -58,7 +60,9 @@ export function googleDriveContributionEvidence(
     const hasMappingAuthority = externalId
       ? providerIdentityState(identities, "gdrive", externalId) !== null
       : false;
+    // An address whose own Google email identity is unlinked or ambiguous never bridges by email (PR743).
     const exactEmail = !hasMappingAuthority && email && !identities.ambiguousEmails?.has(email)
+      && !googleEmailAttributionHeld(identities, email)
       ? identities.byEmail.get(email) ?? null
       : null;
     const resolvedMemberId =

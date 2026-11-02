@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import type { DbClient } from "@/lib/db/types";
 import {
   buildIdentityMap,
+  googleEmailAttributionHeld,
   providerIdentityState,
   resolveByProviderId,
   type IdentityMap,
@@ -127,6 +128,8 @@ function exactMember(identities: IdentityMap, row: NormalizedGdriveContribution)
   // In particular, an explicit unlink must not be silently undone by the same row's email fallback.
   if (row.externalId && providerIdentityState(identities, "gdrive", row.externalId)) return null;
   if (!row.email || identities.ambiguousEmails?.has(row.email)) return null;
+  // The address's own Google email identity is unlinked or ambiguous: its email bridge is held (PR743).
+  if (googleEmailAttributionHeld(identities, row.email)) return null;
   return identities.byEmail.get(row.email) ?? null;
 }
 

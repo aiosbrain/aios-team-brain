@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import { getPool } from "@/lib/db/pg/pool";
 import { withIdentityMutationBoundary } from "@/lib/identity/authority";
-import { buildIdentityMap, resolveByProviderId } from "@/lib/identity/resolve";
+import { buildIdentityMap, providerIdentityState, resolveByProviderId } from "@/lib/identity/resolve";
 import { removeMemberIdentity, setMemberIdentity } from "@/lib/identity/member-identities";
 import { GoogleIdentityConflictError, publishGoogleDriveOAuthCredential } from "@/lib/integrations/gdrive-oauth";
 import { db, seedTeam, type Seed } from "./helpers";
@@ -755,5 +755,81 @@ describe("PR743 — author-email tombstones are decided across equivalent legacy
     const map = await buildIdentityMap(db(), seed.teamId, { strict: true });
     expect(resolveByProviderId(map, "gdrive", subject)).toBe(alice.id);
     expect(resolveByProviderId(map, "gdrive", upper)).toBeNull();
+  });
+
+  // --------------------------------------------------------------------------------------------- //
+  // Combined final review §2: the same member's STANDING legacy spelling is preserved, not refused
+  // --------------------------------------------------------------------------------------------- //
+
+  it.each([
+    { name: "no mapping state", linkedState: false },
+    { name: "one linked legacy state", linkedState: true },
+  ])("a same-member legacy live spelling ($name) is preserved: credential publishes, history byte-exact", async ({ linkedState }) => {
+    const seed = await adminTeam();
+    const alice = await member(seed, "alice");
+    const k = spellings(alice.email);
+    // Mixed case and outer whitespace, exactly as a pre-canonicalization writer stored it.
+    const legacy = `  ${k.mixedBoth}  `;
+    await rawLink(seed, alice.id, legacy);
+    if (linkedState) await rawState(seed, legacy, "linked", alice.id);
+    const ids = [k.canonical, legacy];
+    const before = await sideEffects(seed.teamId, ids);
+
+    const preserved = await automatic(seed, alice.id, k.canonical);
+    expect(preserved).toMatchObject({
+      preserved: true, preservedKeys: [legacy], created: false, updated: false, conflict: false,
+    });
+    expect(preserved.tombstoned).toBeUndefined();
+    expect(preserved.ambiguous).toBeUndefined();
+    expect(preserved.mappingRevision).toBeUndefined(); // no unobserved revision is claimed
+    expect(await automatic(seed, alice.id, k.canonical)).toMatchObject({ preserved: true }); // repeated
+    expect(await sideEffects(seed.teamId, ids)).toBe(before); // rows, histories, repair, revision, epoch, audit
+
+    // Through the publisher: no generic failure, the credential is stored, the outcome is typed.
+    const name = `docs-${randomUUID().slice(0, 6)}`;
+    const subject = S();
+    const emailBefore = await emailState(seed.teamId, ids);
+    const published = await publish(seed, subject, alice.email, name);
+    expect(published.identity).toEqual({ subject: "linked", email: "preserved" });
+    expect(await credentialStored(seed.teamId, name)).toBe(true);
+    expect(await emailState(seed.teamId, ids)).toBe(emailBefore); // the legacy row's bytes are unchanged
+    // The standing owner resolves canonical connector evidence.
+    expect(await emailOf(seed, k.canonical)).toBe(alice.id);
+
+    // Explicit Admin linking keeps its unlink-first refusal for a differently spelled live mapping.
+    await expect(setMemberIdentity(db(), seed.teamId, alice.id, { provider: "gdrive", externalId: k.canonical },
+      { force: true, expectedRevision: 0, expectedRevisionKey: k.canonical })).rejects.toThrow(/differently spelled/);
+    expect(await emailState(seed.teamId, ids)).toBe(emailBefore);
+  });
+
+  it("a same-member live legacy spelling beside a legacy tombstone or several histories is held, not preserved", async () => {
+    const seed = await adminTeam();
+    const alice = await member(seed, "alice");
+    const k = spellings(alice.email);
+    await rawLink(seed, alice.id, k.mixedAddress);
+    await rawState(seed, k.upperPrefix, "unlinked", null);
+    expect(await automatic(seed, alice.id, k.canonical)).toMatchObject({ tombstoned: true, mappingKey: k.upperPrefix });
+    await rawState(seed, k.mixedBoth, "linked", alice.id);
+    const refused = await automatic(seed, alice.id, k.canonical);
+    expect(refused).toMatchObject({ ambiguous: true });
+    expect(refused.preserved).toBeUndefined();
+    const published = await publish(seed, S(), alice.email);
+    expect(published.identity.email).toBe("ambiguous");
+    expect(await emailOf(seed, k.canonical)).toBeNull(); // the reader holds it too
+  });
+
+  it("history decisions do not depend on row order", async () => {
+    // The same equivalent histories, stored in opposite orders in two teams, decide identically.
+    for (const order of [[0, 1], [1, 0]]) {
+      const seed = await adminTeam();
+      const alice = await member(seed, "alice");
+      const k = spellings(alice.email);
+      const histories: [string, "linked" | "unlinked"][] = [[k.upperPrefix, "unlinked"], [k.mixedBoth, "linked"]];
+      for (const index of order) await rawState(seed, histories[index][0], histories[index][1], alice.id);
+      expect(await automatic(seed, alice.id, k.canonical)).toMatchObject({ ambiguous: true });
+      const map = await buildIdentityMap(db(), seed.teamId, { strict: true });
+      expect(providerIdentityState(map, "gdrive", k.canonical)).toBe("ambiguous");
+      expect(providerIdentityState(map, "gdrive", ` ${k.mixedAddress} `)).toBe("ambiguous");
+    }
   });
 });
