@@ -31,9 +31,15 @@ export interface SetIdentityResult {
   conflict: boolean;
   memberId: string;
   mappingRevision?: number;
+  /** The EXACT mapping-state key `mappingRevision` belongs to. Revisions of different spellings are
+   * independent counters: a revision is meaningful only together with this key. */
+  mappingKey?: string;
   note?: string;
   /** `respectTombstone` only: the identity was deliberately unlinked, so nothing was written. */
   tombstoned?: boolean;
+  /** `respectTombstone` only: several equivalent historical states and no canonical decision, so no
+   * applicable state can be chosen. Nothing was written (fail closed). */
+  ambiguous?: boolean;
 }
 
 export async function advanceIdentityMappingState(input: {
@@ -86,6 +92,50 @@ export function canonicalIdentityId(provider: string, externalId: string): strin
   return `author-email:${match[1].trim().toLowerCase()}`;
 }
 
+/**
+ * GOOGLE EMAIL EQUIVALENCE (AIO-1167 PR743, Astra PR714/PR743 decision). Two `gdrive` keys are the same
+ * person-key exactly when `canonicalIdentityId` maps both to the same `author-email:` key: the whole id
+ * trimmed, the `author-email:` prefix matched case-insensitively, the address trimmed and lowercased
+ * (JavaScript `toLowerCase`). That function is the ONLY arbiter. SQL merely pre-selects candidates — an
+ * ASCII-case-insensitive prefix match plus `position(<canonical address> in lower(external_id))`, a
+ * superset wherever Postgres `lower` and JavaScript `toLowerCase` agree on the address (all ASCII
+ * addresses, which is every address Google issues for Workspace and consumer accounts in practice) —
+ * and every candidate is then compared with `canonicalIdentityId`. No Unicode normalization, no
+ * provider-independent folding; opaque ids (`subject:`, `permission:`, every other provider) never
+ * enter this comparison and keep exact bytes. Stored keys are never rewritten.
+ */
+const GOOGLE_EMAIL_PREFIX_PATTERN = "^\\s*author-email:";
+
+async function lockEquivalentGoogleEmailRows(
+  teamId: string,
+  canonical: string,
+): Promise<{
+  live: { id: string; external_id: string; member_id: string }[];
+  states: { external_id: string; revision: number; state: string }[];
+}> {
+  const address = canonical.slice("author-email:".length);
+  // Deterministic order (external_id), identity rows before mapping states — the writer's existing
+  // order. Every caller already holds the team identity authority, so these locks only order rows.
+  const { rows: live } = await runSql<{ id: string; external_id: string; member_id: string }>(
+    `select id,external_id,member_id from member_identities
+      where team_id=$1 and provider='gdrive' and external_id ~* $2 and position($3 in lower(external_id))>0
+      order by external_id for update`,
+    [teamId, GOOGLE_EMAIL_PREFIX_PATTERN, address],
+  );
+  const { rows: states } = await runSql<{ external_id: string; revision: string | number; state: string }>(
+    `select external_id,revision,state from member_identity_mapping_state
+      where team_id=$1 and provider='gdrive' and external_id ~* $2 and position($3 in lower(external_id))>0
+      order by external_id for update`,
+    [teamId, GOOGLE_EMAIL_PREFIX_PATTERN, address],
+  );
+  const same = (key: string) => canonicalIdentityId("gdrive", key) === canonical;
+  return {
+    live: live.filter((row) => same(row.external_id)),
+    states: states.filter((row) => same(row.external_id))
+      .map((row) => ({ external_id: row.external_id, revision: Number(row.revision), state: row.state })),
+  };
+}
+
 export async function setMemberIdentity(
   admin: DbClient,
   teamId: string,
@@ -93,13 +143,35 @@ export async function setMemberIdentity(
   input: SetIdentityInput,
   opts: {
     force?: boolean;
+    /**
+     * Compare-and-set on the mapping-state revision of EXACTLY ONE key: the canonical key this call
+     * writes (`canonicalIdentityId(provider, externalId)`), 0 when that key has never had a state.
+     * It never fences another spelling's state — those are independent counters, and an equal number
+     * for a different key is not the same observation.
+     */
     expectedRevision?: number;
+    /**
+     * The exact key the caller observed `expectedRevision` for (AIO-1167 PR743). When given it must be
+     * byte-identical to the canonical key written, or the write is refused as stale — so a revision
+     * observed for a legacy spelling can never pass as the canonical key's. Requires `expectedRevision`.
+     */
+    expectedRevisionKey?: string;
     actor?: IdentityActor;
     /**
      * AUTOMATIC publication (AIO-1167 R47 F1): a deliberate unlink tombstone stands. An identity
      * whose mapping state is `unlinked` is left exactly as it is — no row, no state, no repair, no
      * epoch — and reported `tombstoned`. Explicit Admin links never pass this, so a revision-fenced
      * manual relink of a tombstone stays available.
+     *
+     * For a Google `author-email:` key the decision is read across the equivalence class (PR743),
+     * in this precedence, all before any mutation:
+     *   1. a live row of a DIFFERENT member — the exact key or an equivalent spelling — is a visible
+     *      `conflict` (unless `force`), never hidden behind a tombstone;
+     *   2. the canonical key's OWN mapping state, when present, governs alone (an explicit relink
+     *      writes it, which is how a relink resolves older equivalent history);
+     *   3. otherwise the equivalent legacy states: none unlinked → the ordinary path; exactly one
+     *      state and it is unlinked → `tombstoned`; several states with any unlinked → `ambiguous`.
+     *      `tombstoned` and `ambiguous` write nothing: no row, revision, repair, epoch or audit.
      */
     respectTombstone?: boolean;
   } = {}
@@ -112,6 +184,10 @@ export async function setMemberIdentity(
   }
   const handle = (input.handle ?? "").trim();
   const email = (input.email ?? "").trim().toLowerCase();
+  if (opts.expectedRevisionKey !== undefined && opts.expectedRevision === undefined) {
+    throw new Error("expectedRevisionKey requires expectedRevision");
+  }
+  const googleEmail = provider === "gdrive" && externalId.startsWith("author-email:");
   return withIdentityMutationBoundary(teamId, async () => {
     const res: SetIdentityResult = { created: false, updated: false, conflict: false, memberId };
     // Team lock first, then exact identity lock: snapshots/repairs use the same order, preventing
@@ -130,48 +206,81 @@ export async function setMemberIdentity(
       throw new Error("Google Drive identities cannot be credited to connector service accounts");
     }
 
-    const { rows } = await runSql<{ id: string; member_id: string }>(
-      `select id,member_id from member_identities
-        where team_id=$1 and provider=$2 and external_id=$3 for update`,
-      [teamId, provider, externalId],
-    );
-    const ex = rows[0];
-    const { rows: mappingRows } = await runSql<{ revision: string | number; state: string }>(
-      `select revision,state from member_identity_mapping_state
-        where team_id=$1 and provider=$2 and external_id=$3 for update`,
-      [teamId, provider, externalId],
-    );
-    const currentRevision = Number(mappingRows[0]?.revision ?? 0);
+    let ex: { id: string; member_id: string } | undefined;
+    let canonicalState: { revision: number; state: string } | undefined;
+    // Equivalent spellings other than the canonical key (Google `author-email:` only; empty otherwise).
+    let otherLive: { external_id: string; member_id: string }[] = [];
+    let otherStates: { external_id: string; revision: number; state: string }[] = [];
+    if (googleEmail) {
+      const equivalent = await lockEquivalentGoogleEmailRows(teamId, externalId);
+      ex = equivalent.live.find((row) => row.external_id === externalId);
+      otherLive = equivalent.live.filter((row) => row.external_id !== externalId);
+      canonicalState = equivalent.states.find((row) => row.external_id === externalId);
+      otherStates = equivalent.states.filter((row) => row.external_id !== externalId);
+    } else {
+      const { rows } = await runSql<{ id: string; member_id: string }>(
+        `select id,member_id from member_identities
+          where team_id=$1 and provider=$2 and external_id=$3 for update`,
+        [teamId, provider, externalId],
+      );
+      ex = rows[0];
+      const { rows: mappingRows } = await runSql<{ revision: string | number; state: string }>(
+        `select revision,state from member_identity_mapping_state
+          where team_id=$1 and provider=$2 and external_id=$3 for update`,
+        [teamId, provider, externalId],
+      );
+      canonicalState = mappingRows[0]
+        ? { revision: Number(mappingRows[0].revision), state: mappingRows[0].state }
+        : undefined;
+    }
+    const currentRevision = canonicalState?.revision ?? 0;
+    // The fence names ONE exact key: the canonical key written here (PR743).
+    if (opts.expectedRevisionKey !== undefined && opts.expectedRevisionKey.trim() !== externalId) {
+      throw new Error("identity mapping changed concurrently; refresh and retry");
+    }
     if (opts.expectedRevision !== undefined && opts.expectedRevision !== currentRevision) {
       throw new Error("identity mapping changed concurrently; refresh and retry");
     }
-    if (opts.respectTombstone && mappingRows[0]?.state === "unlinked") {
-      // A different existing owner is checked BEFORE the tombstone (AIO-1167 R50 F5). Normal writers
-      // never leave a row behind an unlinked state, but an inconsistent legacy/raw row would
-      // otherwise let an automatic publication pass silently; it gets the same visible conflict
-      // refusal as any other existing owner, and the caller's transaction writes nothing.
-      if (ex && ex.member_id !== memberId && !opts.force) {
+    if (opts.respectTombstone) {
+      // A different existing owner is checked BEFORE any tombstone (AIO-1167 R50 F5) — the exact key
+      // or an equivalent live spelling (PR743). Normal writers never leave a row behind an unlinked
+      // state, but an inconsistent legacy/raw row would otherwise let an automatic publication pass
+      // silently; it gets the same visible conflict refusal as any other existing owner, and the
+      // caller's transaction writes nothing.
+      const otherOwner = (ex && ex.member_id !== memberId ? ex : undefined)
+        ?? otherLive.find((row) => row.member_id !== memberId);
+      if (otherOwner && !opts.force) {
         res.conflict = true;
         res.note = `${provider} identity ${externalId} already maps to a different member; pass force to remap`;
         return res;
       }
-      res.tombstoned = true;
-      res.mappingRevision = currentRevision;
-      return res;
+      if (canonicalState) {
+        // The canonical key's own decision governs alone; older equivalent spellings do not reopen it.
+        if (canonicalState.state === "unlinked") {
+          res.tombstoned = true;
+          res.mappingRevision = currentRevision;
+          res.mappingKey = externalId;
+          return res;
+        }
+      } else if (otherStates.some((row) => row.state === "unlinked")) {
+        if (otherStates.length === 1) {
+          // One applicable equivalent tombstone: the deliberate unlink stands under this spelling too.
+          res.tombstoned = true;
+          res.mappingRevision = otherStates[0].revision;
+          res.mappingKey = otherStates[0].external_id;
+          return res;
+        }
+        // Several equivalent histories and no canonical decision: none is selected (fail closed).
+        res.ambiguous = true;
+        return res;
+      }
     }
-    if (!ex && provider === "gdrive" && externalId.startsWith("author-email:")) {
+    if (!ex && otherLive[0]) {
       // The same address in another spelling is the same person-key: never merged or overwritten
       // here — the Admin unlinks the differently spelled row explicitly, then links (R47 F8).
-      const { rows: spelled } = await runSql<{ external_id: string }>(
-        `select external_id from member_identities
-          where team_id=$1 and provider=$2 and lower(external_id)=$3 and external_id<>$3 limit 1`,
-        [teamId, provider, externalId],
+      throw new Error(
+        `a differently spelled Google identity (${otherLive[0].external_id}) already exists; unlink it first, then link ${externalId}`,
       );
-      if (spelled[0]) {
-        throw new Error(
-          `a differently spelled Google identity (${spelled[0].external_id}) already exists; unlink it first, then link ${externalId}`,
-        );
-      }
     }
     let mappingChanged = false;
     if (!ex) {
@@ -225,6 +334,7 @@ export async function setMemberIdentity(
         res.mappingRevision = Number(stateRows[0].revision);
       }
     }
+    res.mappingKey = externalId;
 
     await audit(admin, {
       team_id: teamId,
@@ -327,7 +437,7 @@ export async function removeMemberIdentity(
   teamId: string,
   input: { provider: string; externalId: string },
   opts: { expectedRevision?: number; actor?: IdentityActor } = {}
-): Promise<{ removed: boolean; mappingRevision?: number }> {
+): Promise<{ removed: boolean; mappingRevision?: number; mappingKey?: string }> {
   const provider = input.provider.trim().toLowerCase();
   const externalId = input.externalId.trim();
   if (!provider || !externalId) throw new Error("provider and externalId are required");
@@ -368,6 +478,7 @@ export async function removeMemberIdentity(
       target_id: ex.member_id,
       meta: { provider, external_id: externalId, mapping_revision: mappingRevision },
     });
-    return { removed: true, mappingRevision };
+    // Unlink is exact-spelling: the revision belongs to the stored key removed, never a canonical one.
+    return { removed: true, mappingRevision, mappingKey: externalId };
   });
 }

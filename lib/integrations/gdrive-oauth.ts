@@ -213,6 +213,9 @@ export async function publishGoogleDriveOAuthCredential(
       // Each namespaced identity is checked on its own — a tombstoned one stays unlinked (and the
       // account stays visibly unresolved for it); an explicit Admin → Members relink remains the way
       // to restore it. A different existing owner is still a conflict, never treated as unlinked.
+      // The email key is decided across its equivalent spellings (PR743): one legacy tombstone stands
+      // (`tombstoned`), several equivalent histories with no canonical decision link nothing
+      // (`ambiguous`) — the credential is published either way, the attribution left unresolved.
       const automatic = { actor: { kind: "member" as const, memberId: input.memberId }, respectTombstone: true };
       const subjectIdentity = await setMemberIdentity(db, input.teamId, verifiedMemberId, {
         provider: "gdrive", externalId: subject, email: verifiedEmail,

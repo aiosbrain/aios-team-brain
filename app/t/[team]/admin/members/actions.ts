@@ -261,8 +261,12 @@ export async function linkMemberIdentity(
           }
         }
         // The writer enters the same boundary and joins this transaction: the displayed identity
-        // validated above is still what it was when the requested id is written.
-        const res = await setMemberIdentity(identityDb, ctx.teamId, memberId, identity, { force, expectedRevision, actor });
+        // validated above is still what it was when the requested id is written. Every revision
+        // above was observed for exactly `ext` (the displayed id only when it IS `ext`, byte for
+        // byte), and the writer is told so: a revision is never accepted for another spelling (PR743).
+        const res = await setMemberIdentity(identityDb, ctx.teamId, memberId, identity, {
+          force, expectedRevision, expectedRevisionKey: ext, actor,
+        });
         // Unforced, the writer reports — and does not write — an id another member holds.
         return res.conflict ? { ok: false, error: STALE_IDENTITY } : { ok: true };
       });
