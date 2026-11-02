@@ -1,0 +1,31 @@
+{
+  "review_snapshot": "4f515e0ee20e25649019b5889188977dedbf92f0",
+  "attempts": [
+    {
+      "kind": "delta-review-no-verdict",
+      "session_id": "d81a6a86-5a12-4fc2-bdd0-78da095b54cd",
+      "model": "claude-fable-5-1",
+      "terminal_reason": "completed",
+      "exit_code": 0,
+      "result_nonempty": false,
+      "permission_denials": 2,
+      "usage_tokens": {"uncached_input": 354, "cache_creation_input": 385434, "cache_read_input": 5380407, "output": 44927, "thinking": 32492},
+      "disposition": "No substantive report was returned; not a verdict."
+    },
+    {
+      "kind": "delta-review-no-verdict",
+      "model": "claude-fable-5-1",
+      "terminal_reason": "completed",
+      "exit_code": 0,
+      "stdout_bytes": 1,
+      "stderr_bytes": 0,
+      "disposition": "Text output was also empty; not a verdict. Session usage metadata was not returned."
+    },
+    {
+      "kind": "cli-validation-failure-before-review",
+      "exit_code": 1,
+      "stderr": "stream-json output requires --verbose",
+      "disposition": "No model review started. The corrected invocation will use verbose stream output and filter to assistant text plus terminal metadata only."
+    }
+  ]
+}
