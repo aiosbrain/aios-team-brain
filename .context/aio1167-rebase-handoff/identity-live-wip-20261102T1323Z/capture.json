@@ -1,0 +1,14 @@
+{
+  "captured_at_utc": "2026-11-02T13:27:25Z",
+  "base_head": "48d672d55843af490ca7570a2c3dae5d2c57be89",
+  "tracked_diff_sha256": "3a0949a6b286c14a256c814df0e37258d72b0320cf7ac52e460be11166be08a4",
+  "tracked_diff_bytes": 36360,
+  "untracked": [
+    {
+      "path": "lib/identity/google-email-authority.ts",
+      "sha256": "bdc4b9464f0b8886aaf750b9da3b60604bd5341db2e73822ef19edbdc9a95f94",
+      "bytes": 2849
+    }
+  ],
+  "status": " M app/api/auth/gdrive/callback/route.ts\n M lib/attribution/resolve-authors.ts\n M lib/dashboard/gdrive-contributions.ts\n M lib/identity/member-identities.ts\n M lib/identity/resolve.ts\n M lib/ingest/gdrive-contribution-store.ts\n M lib/ingest/identity-repair.ts\n M lib/ingest/reattribute.ts\n M lib/integrations/gdrive-oauth.ts\n M test/datamechanics/gdrive-identity-tombstone-email.datamechanics.test.ts\n?? lib/identity/google-email-authority.ts\n"
+}

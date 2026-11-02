@@ -1,0 +1,643 @@
+diff --git a/app/api/auth/gdrive/callback/route.ts b/app/api/auth/gdrive/callback/route.ts
+index fbf184ee..440ae3ef 100644
+--- a/app/api/auth/gdrive/callback/route.ts
++++ b/app/api/auth/gdrive/callback/route.ts
+@@ -10,6 +10,7 @@ import {
+   GoogleIdentityConflictError,
+   InvalidGoogleOAuthInitiatorError,
+   publishGoogleDriveOAuthCredential,
++  type GoogleDriveOAuthPublication,
+ } from "@/lib/integrations/gdrive-oauth";
+ 
+ export const runtime = "nodejs";
+@@ -143,8 +144,9 @@ export async function GET(req: NextRequest) {
+   const emailVerified = user.email_verified === true;
+ 
+   let status: "enabled" | "disabled";
++  let identity: GoogleDriveOAuthPublication["identity"];
+   try {
+-    ({ status } = await publishGoogleDriveOAuthCredential({
++    ({ status, identity } = await publishGoogleDriveOAuthCredential({
+       teamId: bound.teamId, memberId: bound.memberId, integrationName: bound.integrationName,
+       clientId, clientSecret, subject, email, emailVerified,
+       name: typeof user.name === "string" ? user.name : undefined,
+@@ -175,5 +177,29 @@ export async function GET(req: NextRequest) {
+   if (!email || !emailVerified) {
+     return html(200, "Google Drive connected", `Connected ${email ?? "a Google account without an email"}. Google did not verify this account's email, so it was not linked to a member: map it under Admin → Members → Identities.${paused} Return to Integrations to choose files or folders.`);
+   }
+-  return html(200, "Google Drive connected", `Connected ${email}.${paused} Return to Integrations to choose files or folders.`);
++  return html(200, "Google Drive connected", `Connected ${email}.${emailAttributionNote(identity)}${paused} Return to Integrations to choose files or folders.`);
++}
++
++/**
++ * What the Admin needs to know about the EMAIL attribution bridge (AIO-1167 PR743). The credential is
++ * connected either way, and the account's Google subject is reported for what it is: a held email
++ * bridge is not an unlinked account. A preserved same-member mapping is neither held nor unlinked.
++ */
++function emailAttributionNote(identity: GoogleDriveOAuthPublication["identity"] | undefined): string {
++  if (!identity) return "";
++  const subject = identity.subject === "linked"
++    ? " The account's Google identity is linked to the member;"
++    : identity.subject === "tombstoned"
++      ? " The account's Google identity was deliberately unlinked earlier and stays unlinked;"
++      : " The account's Google identity is not linked to a member;";
++  if (identity.email === "tombstoned") {
++    return `${subject} its email address was deliberately unlinked earlier, so documents are not credited through that email until an Admin relinks it under Admin → Members → Identities.`;
++  }
++  if (identity.email === "ambiguous") {
++    return `${subject} its email address has several earlier mapping histories, so documents are not credited through that email until an Admin resolves it under Admin → Members → Identities.`;
++  }
++  if (identity.email === "preserved") {
++    return " Its email address was already linked to the same member under an earlier spelling; that mapping was kept.";
++  }
++  return "";
+ }
+diff --git a/lib/attribution/resolve-authors.ts b/lib/attribution/resolve-authors.ts
+index f8a7f459..f50c19e3 100644
+--- a/lib/attribution/resolve-authors.ts
++++ b/lib/attribution/resolve-authors.ts
+@@ -2,6 +2,7 @@ import "server-only";
+ import type { DbClient } from "@/lib/db/types";
+ import type { ItemPayload } from "@/lib/api/schemas";
+ import {
++  googleEmailAttributionHeld,
+   providerIdentityState,
+   resolveByProviderId,
+   resolveMemberDetailed,
+@@ -161,6 +162,9 @@ function resolveRef(map: IdentityMap, ref: AuthorRef): { memberId: string | null
+     // display name into a verified Google link.
+     if (ref.provider?.toLowerCase() === "gdrive") {
+       const email = ref.email.trim().toLowerCase();
++      // The address's own Google email identity was unlinked, or its histories are ambiguous: the
++      // email bridge is held for Google evidence (AIO-1167 PR743).
++      if (googleEmailAttributionHeld(map, email)) return { memberId: null, method: "unresolved" };
+       const exact = !map.ambiguousEmails?.has(email) ? map.byEmail.get(email) : undefined;
+       if (exact) return { memberId: exact, method: "email" };
+       return { memberId: null, method: "unresolved" };
+diff --git a/lib/dashboard/gdrive-contributions.ts b/lib/dashboard/gdrive-contributions.ts
+index 24ae27d7..a1392797 100644
+--- a/lib/dashboard/gdrive-contributions.ts
++++ b/lib/dashboard/gdrive-contributions.ts
+@@ -1,4 +1,6 @@
+-import { providerIdentityState, resolveByProviderId, type IdentityMap } from "@/lib/identity/resolve";
++import {
++  googleEmailAttributionHeld, providerIdentityState, resolveByProviderId, type IdentityMap,
++} from "@/lib/identity/resolve";
+ import { coalesceGdriveObservations } from "@/lib/ingest/gdrive-ledger";
+ 
+ export interface GoogleDriveContributionEvidence {
+@@ -58,7 +60,9 @@ export function googleDriveContributionEvidence(
+     const hasMappingAuthority = externalId
+       ? providerIdentityState(identities, "gdrive", externalId) !== null
+       : false;
++    // An address whose own Google email identity is unlinked or ambiguous never bridges by email (PR743).
+     const exactEmail = !hasMappingAuthority && email && !identities.ambiguousEmails?.has(email)
++      && !googleEmailAttributionHeld(identities, email)
+       ? identities.byEmail.get(email) ?? null
+       : null;
+     const resolvedMemberId =
+diff --git a/lib/identity/member-identities.ts b/lib/identity/member-identities.ts
+index dc74c538..6bdfeb21 100644
+--- a/lib/identity/member-identities.ts
++++ b/lib/identity/member-identities.ts
+@@ -4,6 +4,7 @@ import { audit } from "@/lib/api/audit";
+ import { runSql } from "@/lib/db/pg/pool";
+ import { advanceAuthorizationEpoch } from "@/lib/access/authorization-epoch";
+ import { withIdentityMutationBoundary } from "@/lib/identity/authority";
++import { googleEmailHistory, googleEmailKey } from "@/lib/identity/google-email-authority";
+ 
+ /**
+  * The single writer for `member_identities` — maps a provider's stable user id (Slack `Uxxx`,
+@@ -40,6 +41,12 @@ export interface SetIdentityResult {
+   /** `respectTombstone` only: several equivalent historical states and no canonical decision, so no
+    * applicable state can be chosen. Nothing was written (fail closed). */
+   ambiguous?: boolean;
++  /** `respectTombstone` only (Google email): the SAME member already holds this address under an
++   * equivalent legacy spelling. That standing mapping is kept exactly as stored — no canonical row or
++   * state, no metadata refresh, no repair/epoch/audit — and no revision is claimed for it. */
++  preserved?: boolean;
++  /** With `preserved`: the exact stored spellings of the standing mapping, sorted. */
++  preservedKeys?: string[];
+ }
+ 
+ export async function advanceIdentityMappingState(input: {
+@@ -86,10 +93,9 @@ export async function advanceIdentityMappingState(input: {
+  * spelling, so a legacy differently-spelled row can still be removed explicitly.
+  */
+ export function canonicalIdentityId(provider: string, externalId: string): string {
+-  const id = externalId.trim();
+-  const match = /^author-email:(.*)$/i.exec(id);
+-  if (provider.trim().toLowerCase() !== "gdrive" || !match) return id;
+-  return `author-email:${match[1].trim().toLowerCase()}`;
++  // One comparison contract for writers and readers (`google-email-authority`); everything that is not
++  // a Google email identity keeps its trimmed exact bytes.
++  return googleEmailKey(provider, externalId) ?? externalId.trim();
+ }
+ 
+ /**
+@@ -125,7 +131,7 @@ async function lockEquivalentGoogleEmailRows(
+       order by external_id for update`,
+     [teamId],
+   );
+-  const same = (key: string) => canonicalIdentityId("gdrive", key) === canonical;
++  const same = (key: string) => googleEmailKey("gdrive", key) === canonical;
+   return {
+     live: live.filter((row) => same(row.external_id)),
+     states: states.filter((row) => same(row.external_id))
+@@ -253,27 +259,38 @@ export async function setMemberIdentity(
+         res.note = `${provider} identity ${externalId} already maps to a different member; pass force to remap`;
+         return res;
+       }
+-      if (canonicalState) {
+-        // The canonical key's own decision governs alone; older equivalent spellings do not reopen it.
+-        if (canonicalState.state === "unlinked") {
+-          res.tombstoned = true;
+-          res.mappingRevision = currentRevision;
+-          res.mappingKey = externalId;
+-          return res;
+-        }
+-      } else if (otherStates.length > 1) {
++      // The one order-independent history decision the readers apply too (`google-email-authority`):
++      // the canonical key's own state governs alone; otherwise zero → ordinary, one → that decision,
++      // several (whatever their values) → ambiguous. Revisions stay with their own exact key.
++      const states = [
++        ...(canonicalState ? [{ externalId, state: canonicalState.state, revision: canonicalState.revision }] : []),
++        ...otherStates.map((row) => ({ externalId: row.external_id, state: row.state, revision: row.revision })),
++      ];
++      const { history, governing } = googleEmailHistory(externalId, states);
++      if (history === "unlinked") {
++        // The deliberate unlink stands — under this spelling or the one equivalent legacy spelling.
++        const decided = states.find((row) => row.externalId === governing?.externalId);
++        res.tombstoned = true;
++        res.mappingRevision = decided?.revision;
++        res.mappingKey = decided?.externalId;
++        return res;
++      }
++      if (history === "ambiguous") {
+         // Several equivalent histories — linked, unlinked or mixed — and no canonical decision: none
+         // is selected and nothing is written (fail closed) until an explicit relink decides.
+         res.ambiguous = true;
+         return res;
+-      } else if (otherStates[0]?.state === "unlinked") {
+-        // One applicable equivalent tombstone: the deliberate unlink stands under this spelling too.
+-        res.tombstoned = true;
+-        res.mappingRevision = otherStates[0].revision;
+-        res.mappingKey = otherStates[0].external_id;
++      }
++      if (!ex && otherLive.length) {
++        // The SAME member already holds this address under an equivalent legacy spelling (a different
++        // owner was refused above). Credential authority is not attribution intent: the standing
++        // mapping is preserved exactly — no canonical row/state, no metadata refresh, no repair, epoch
++        // or audit, and no revision claimed — and the caller's credential publication goes on.
++        res.preserved = true;
++        res.preservedKeys = otherLive.map((row) => row.external_id).sort();
+         return res;
+       }
+-      // Zero legacy states, or exactly one that is not a tombstone: the ordinary path.
++      // Zero legacy histories, or exactly one linked one: the ordinary path.
+     }
+     if (!ex && otherLive[0]) {
+       // The same address in another spelling is the same person-key: never merged or overwritten
+diff --git a/lib/identity/resolve.ts b/lib/identity/resolve.ts
+index 0c5a530e..6fb3021f 100644
+--- a/lib/identity/resolve.ts
++++ b/lib/identity/resolve.ts
+@@ -1,5 +1,6 @@
+ import "server-only";
+ import type { DbClient } from "@/lib/db/types";
++import { googleEmailHistory, googleEmailKey, type GoogleEmailState } from "@/lib/identity/google-email-authority";
+ 
+ /**
+  * Shared identity resolution: git/provider author identity → roster `member_id` for a team.
+@@ -21,18 +22,25 @@ export interface IdentityMap {
+   /** Exact keys observed for more than one member. They fail closed instead of last-row-wins. */
+   ambiguousEmails?: ReadonlySet<string>;
+   ambiguousProviderIds?: ReadonlySet<string>;
+-  /** Durable mapping authority, including unlink tombstones. Presence blocks heuristic fallback. */
+-  providerIdentityStates?: ReadonlyMap<string, "linked" | "unlinked">;
++  /** Durable mapping authority, including unlink tombstones. Presence blocks heuristic fallback.
++   *  `ambiguous` occurs only for a Google `author-email:` identity with several equivalent histories
++   *  and no canonical decision (AIO-1167 PR743): it blocks provider credit and fallback, but is not an
++   *  unlink. */
++  providerIdentityStates?: ReadonlyMap<string, ProviderIdentityState>;
+   /** Active/invited human-or-connector rows participating in this complete snapshot. */
+   activeMemberIds?: ReadonlySet<string>;
+ }
+ 
++export type ProviderIdentityState = "linked" | "unlinked" | "ambiguous";
++
+ function providerKey(provider: string, externalId: string): string {
+   const normalizedProvider = provider.trim().toLowerCase();
+   // Google subject and permission ids are opaque identifiers, not human handles. Preserve their
+-  // exact bytes so differently-cased accounts cannot collapse into one attribution authority.
++  // exact bytes so differently-cased accounts cannot collapse into one attribution authority. A Google
++  // `author-email:` identity alone compares under its canonical key — the writer's one contract
++  // (`google-email-authority`), so every equivalent spelling is one lookup key (AIO-1167 PR743).
+   const normalizedExternalId = normalizedProvider === "gdrive"
+-    ? externalId.trim()
++    ? googleEmailKey(normalizedProvider, externalId) ?? externalId.trim()
+     : externalId.trim().toLowerCase();
+   return `${normalizedProvider}:${normalizedExternalId}`;
+ }
+@@ -155,7 +163,7 @@ export async function buildIdentityMap(
+     if (!byEmail.has(email)) ambiguousEmails.add(email);
+   }
+ 
+-  const providerIdentityStates = new Map<string, "linked" | "unlinked">();
++  const providerIdentityStates = new Map<string, ProviderIdentityState>();
+   const { data: mappingStates, error: mappingStatesError } = await db
+     .from("member_identity_mapping_state")
+     .select("provider, external_id, state")
+@@ -163,14 +171,33 @@ export async function buildIdentityMap(
+   if (opts.strict && mappingStatesError) {
+     throw new Error(`provider identity authority read failed: ${mappingStatesError.message}`);
+   }
++  // Google `author-email:` histories are GROUPED by canonical key and decided once, order-independently,
++  // by the writer's own rule — never last-row-wins (AIO-1167 PR743). Every other key is exact, as before.
++  const googleEmailStates = new Map<string, GoogleEmailState[]>();
+   for (const state of (mappingStates ?? []) as {
+     provider: string;
+     external_id: string;
+     state: "linked" | "unlinked";
+   }[]) {
+-    if (state.provider && state.external_id && (state.state === "linked" || state.state === "unlinked")) {
+-      providerIdentityStates.set(providerKey(state.provider, state.external_id), state.state);
++    if (!state.provider || !state.external_id || (state.state !== "linked" && state.state !== "unlinked")) continue;
++    const canonical = googleEmailKey(state.provider, state.external_id);
++    if (canonical) {
++      const group = googleEmailStates.get(canonical) ?? [];
++      group.push({ externalId: state.external_id, state: state.state });
++      googleEmailStates.set(canonical, group);
++      continue;
+     }
++    providerIdentityStates.set(providerKey(state.provider, state.external_id), state.state);
++  }
++  for (const [canonical, states] of googleEmailStates) {
++    const key = `gdrive:${canonical}`;
++    const { history } = googleEmailHistory(canonical, states);
++    if (history === "none") continue;
++    providerIdentityStates.set(key, history);
++    // An applicable unlink or an ambiguity blocks this identity's Google provider credit as well as its
++    // email/handle fallback — even if an equivalent legacy row is still live. A different-owner
++    // conflict between live spellings is already fail-closed (`ambiguousProviderIds`).
++    if (history !== "linked") byProviderId.delete(key);
+   }
+ 
+   return {
+@@ -191,11 +218,24 @@ export function providerIdentityState(
+   map: IdentityMap,
+   provider: string,
+   externalId: string,
+-): "linked" | "unlinked" | null {
++): ProviderIdentityState | null {
+   if (!externalId) return null;
+   return map.providerIdentityStates?.get(providerKey(provider, externalId)) ?? null;
+ }
+ 
++/**
++ * Whether a Google evidence email's OWN `author-email:` identity holds an applicable unlink or an
++ * ambiguity (AIO-1167 PR743). The email attribution bridge for that address is then held: Google
++ * evidence must not reach the member through a roster/alias email match. Only Google consumers ask
++ * this; roster email itself, and every other provider, are unaffected.
++ */
++export function googleEmailAttributionHeld(map: IdentityMap, email: string | null | undefined): boolean {
++  const address = (email ?? "").trim();
++  if (!address) return false;
++  const state = providerIdentityState(map, "gdrive", `author-email:${address}`);
++  return state === "unlinked" || state === "ambiguous";
++}
++
+ /** How an identity resolved — the attribution CONFIDENCE. `email`/`handle` are exact matches;
+  *  `heuristic` is the softer email-local-part → team-handle guess; `unresolved` is no match. */
+ export type ResolveMethod = "email" | "handle" | "heuristic" | "unresolved";
+diff --git a/lib/ingest/gdrive-contribution-store.ts b/lib/ingest/gdrive-contribution-store.ts
+index 7bff19cc..a16cf3c0 100644
+--- a/lib/ingest/gdrive-contribution-store.ts
++++ b/lib/ingest/gdrive-contribution-store.ts
+@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
+ import type { DbClient } from "@/lib/db/types";
+ import {
+   buildIdentityMap,
++  googleEmailAttributionHeld,
+   providerIdentityState,
+   resolveByProviderId,
+   type IdentityMap,
+@@ -127,6 +128,8 @@ function exactMember(identities: IdentityMap, row: NormalizedGdriveContribution)
+   // In particular, an explicit unlink must not be silently undone by the same row's email fallback.
+   if (row.externalId && providerIdentityState(identities, "gdrive", row.externalId)) return null;
+   if (!row.email || identities.ambiguousEmails?.has(row.email)) return null;
++  // The address's own Google email identity is unlinked or ambiguous: its email bridge is held (PR743).
++  if (googleEmailAttributionHeld(identities, row.email)) return null;
+   return identities.byEmail.get(row.email) ?? null;
+ }
+ 
+diff --git a/lib/ingest/identity-repair.ts b/lib/ingest/identity-repair.ts
+index d7a07a6b..bf43d18e 100644
+--- a/lib/ingest/identity-repair.ts
++++ b/lib/ingest/identity-repair.ts
+@@ -3,6 +3,7 @@ import "server-only";
+ import type { DbClient } from "@/lib/db/types";
+ import { runSql, withTransaction } from "@/lib/db/pg/pool";
+ import type { IdentityMap } from "@/lib/identity/resolve";
++import { googleEmailKey } from "@/lib/identity/google-email-authority";
+ import { resolveItemAuthorMember } from "@/lib/attribution/resolve-authors";
+ import { syncGdriveContributionEvidence } from "@/lib/ingest/gdrive-contribution-store";
+ import { purgeTeamLearningCachesStrict } from "@/lib/ingest/reconcile-attribution";
+@@ -38,6 +39,30 @@ function hasRetainedGdriveEvidence(frontmatter: Record<string, unknown>): boolea
+   );
+ }
+ 
++/**
++ * Whether a Drive document's retained evidence names one Google email identity (AIO-1167 PR743): an
++ * author/contribution whose external id is EQUIVALENT to the obligation's key under the one comparison
++ * contract (`google-email-authority` — prefix/address whitespace, prefix case and JavaScript case
++ * folding included), or whose optional email is that address. Evidence without an email is covered by
++ * its external id alone.
++ */
++function namesGoogleEmail(frontmatter: Record<string, unknown>, canonical: string): boolean {
++  const address = canonical.slice("author-email:".length);
++  const text = (value: unknown): string => typeof value === "string" ? value : "";
++  for (const list of [frontmatter.authors, frontmatter.contributions]) {
++    if (!Array.isArray(list)) continue;
++    for (const raw of list) {
++      if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
++      const entry = raw as Record<string, unknown>;
++      const externalId = text(entry.external_id) || text(entry.externalId);
++      if (externalId && googleEmailKey("gdrive", externalId) === canonical) return true;
++      const email = text(entry.email).trim().toLowerCase();
++      if (email && email === address) return true;
++    }
++  }
++  return false;
++}
++
+ async function currentObligation(obligation: Obligation): Promise<Obligation | null> {
+   const { rows } = await runSql<Obligation>(
+     `select team_id,provider,external_id,mapping_revision,cursor_item_id,
+@@ -226,30 +251,48 @@ export async function runIdentityRepairObligation(
+       // Nomination, bounded by the obligation's cursor: Drive documents by the provenance rule —
+       // the persisted same-team mapping and current Drive source evidence — that name this
+       // identity among their authors or contributions.
+-      const { rows: candidates } = await runSql<{ id: string }>(
+-        `select i.id from items i
+-          where i.team_id=$1 and ${DRIVE_OBLIGATION_PROVENANCE}
+-            and ($3::uuid is null or i.id>$3::uuid)
+-            and (
+-              exists (select 1 from jsonb_array_elements(
+-                case when jsonb_typeof(i.frontmatter->'authors')='array'
+-                     then i.frontmatter->'authors' else '[]'::jsonb end
+-              ) a where a->>'external_id'=$2
+-                    or ($5::text is not null and lower(a->>'email')=$5))
+-              or exists (select 1 from jsonb_array_elements(
+-                case when jsonb_typeof(i.frontmatter->'contributions')='array'
+-                     then i.frontmatter->'contributions' else '[]'::jsonb end
+-              ) c where c->>'external_id'=$2
+-                    or ($5::text is not null and lower(c->>'email')=$5))
+-            )
+-          order by i.id limit $4`,
+-        [
+-          current.team_id, current.external_id, current.cursor_item_id, batchSize,
+-          current.external_id.toLowerCase().startsWith("author-email:")
+-            ? current.external_id.slice("author-email:".length).toLowerCase()
+-            : null,
+-        ],
+-      );
++      //
++      // A Google EMAIL identity is matched by the one JavaScript comparison contract, never by SQL
++      // folding (AIO-1167 PR743): the bounded scan selects every Drive document with retained author or
++      // contribution evidence — a guaranteed superset — and `namesGoogleEmail` decides. The cursor still
++      // advances over the whole scanned page, so the drain stays bounded and makes progress. Every
++      // other identity keeps its exact external-id match. The obligation tuple itself stays exact.
++      const emailKey = googleEmailKey(current.provider, current.external_id);
++      let scannedPage: { id: string }[];
++      let candidates: { id: string }[];
++      if (emailKey) {
++        const { rows } = await runSql<{ id: string; frontmatter: Record<string, unknown> }>(
++          `select i.id,i.frontmatter from items i
++            where i.team_id=$1 and ${DRIVE_OBLIGATION_PROVENANCE}
++              and ($2::uuid is null or i.id>$2::uuid)
++              and (jsonb_typeof(i.frontmatter->'authors')='array'
++                   or jsonb_typeof(i.frontmatter->'contributions')='array')
++            order by i.id limit $3`,
++          [current.team_id, current.cursor_item_id, batchSize],
++        );
++        scannedPage = rows;
++        candidates = rows.filter((row) => namesGoogleEmail(row.frontmatter ?? {}, emailKey));
++      } else {
++        const { rows } = await runSql<{ id: string }>(
++          `select i.id from items i
++            where i.team_id=$1 and ${DRIVE_OBLIGATION_PROVENANCE}
++              and ($3::uuid is null or i.id>$3::uuid)
++              and (
++                exists (select 1 from jsonb_array_elements(
++                  case when jsonb_typeof(i.frontmatter->'authors')='array'
++                       then i.frontmatter->'authors' else '[]'::jsonb end
++                ) a where a->>'external_id'=$2)
++                or exists (select 1 from jsonb_array_elements(
++                  case when jsonb_typeof(i.frontmatter->'contributions')='array'
++                       then i.frontmatter->'contributions' else '[]'::jsonb end
++                ) c where c->>'external_id'=$2)
++              )
++            order by i.id limit $4`,
++          [current.team_id, current.external_id, current.cursor_item_id, batchSize],
++        );
++        scannedPage = rows;
++        candidates = rows;
++      }
+       let itemUpdates = 0;
+       let versionUpdates = 0;
+       let contributionUpdates = 0;
+@@ -261,7 +304,7 @@ export async function runIdentityRepairObligation(
+         versionUpdates += result.versions;
+         contributionUpdates += result.contributions;
+       }
+-      const last = candidates.at(-1)?.id ?? current.cursor_item_id;
++      const last = scannedPage.at(-1)?.id ?? current.cursor_item_id;
+       await runSql(
+         `update identity_repair_obligations set cursor_item_id=$5,
+                 items_scanned=items_scanned+$6,items_updated=items_updated+$7,
+@@ -274,7 +317,7 @@ export async function runIdentityRepairObligation(
+       return {
+         status: "partial" as const,
+         scanned: candidates.length,
+-        finished: candidates.length < batchSize,
++        finished: scannedPage.length < batchSize,
+       };
+     });
+     if (batch.status === "obsolete") return batch;
+diff --git a/lib/ingest/reattribute.ts b/lib/ingest/reattribute.ts
+index f3c490cb..4dc6cca2 100644
+--- a/lib/ingest/reattribute.ts
++++ b/lib/ingest/reattribute.ts
+@@ -76,6 +76,11 @@ function explicitlyUnlinked(
+     if (ref.provider && ref.externalId
+         && providerIdentityState(snapshot.map, ref.provider, ref.externalId) === "unlinked") return true;
+     const email = ref.email?.trim().toLowerCase();
++    // Google evidence: the address's own `author-email:` identity, decided across its equivalent
++    // spellings (AIO-1167 PR743). Only a definite unlink clears established credit; an ambiguity blocks
++    // new resolution but is not an unlink.
++    if (email && ref.provider?.trim().toLowerCase() === "gdrive"
++        && providerIdentityState(snapshot.map, "gdrive", `author-email:${email}`) === "unlinked") return true;
+     return Boolean(email && providerIdentityState(snapshot.map, "email-alias", email) === "unlinked");
+   });
+ }
+diff --git a/lib/integrations/gdrive-oauth.ts b/lib/integrations/gdrive-oauth.ts
+index 5572efd0..541acdcf 100644
+--- a/lib/integrations/gdrive-oauth.ts
++++ b/lib/integrations/gdrive-oauth.ts
+@@ -29,10 +29,32 @@ export class GoogleGrantOutsideModeError extends Error {
+  */
+ export class IncompatibleStoredGoogleCredentialError extends Error {}
+ 
+-/** What the publication did to the connection's run state (AIO-1167 R43 F2). */
++/**
++ * What automatic publication decided for ONE namespaced Google identity (AIO-1167 PR743):
++ *   `linked`     — the mapping was created or already belonged to the member;
++ *   `preserved`  — the same member already holds this email under an equivalent legacy spelling, kept
++ *                  exactly as stored (not an unlink);
++ *   `tombstoned` — a deliberate unlink stands, so nothing was written;
++ *   `ambiguous`  — several equivalent earlier histories and no canonical decision, so nothing was written;
++ *   `unresolved` — no verified email matched a member, so no mapping was attempted.
++ */
++export type GoogleIdentityOutcome = "linked" | "preserved" | "tombstoned" | "ambiguous" | "unresolved";
++
++/** What the publication did to the connection's run state (AIO-1167 R43 F2) and to attribution. */
+ export interface GoogleDriveOAuthPublication {
+   /** `disabled` when an existing paused/disconnected connection was reconnected: it stays paused. */
+   status: "enabled" | "disabled";
++  /** The subject and email identity outcomes, each decided on its own. */
++  identity: { subject: GoogleIdentityOutcome; email: GoogleIdentityOutcome };
++}
++
++function identityOutcome(result: {
++  tombstoned?: boolean; ambiguous?: boolean; preserved?: boolean;
++}): GoogleIdentityOutcome {
++  if (result.preserved) return "preserved";
++  if (result.ambiguous) return "ambiguous";
++  if (result.tombstoned) return "tombstoned";
++  return "linked";
+ }
+ 
+ /** Deterministic concurrency seam for real-Postgres lock-order regressions. */
+@@ -207,6 +229,7 @@ export async function publishGoogleDriveOAuthCredential(
+       type: "gdrive", name: input.integrationName, config, status,
+     });
+     await setIntegrationSecret(db, auth, id, secret);
++    let identity: GoogleDriveOAuthPublication["identity"] = { subject: "unresolved", email: "unresolved" };
+     if (verifiedMemberId && verifiedEmail) {
+       // Credential authority is not attribution intent (AIO-1167 R47 F1): connecting or reconnecting
+       // proves the Admin may use this Google account, not that a deliberate unlink should be undone.
+@@ -215,7 +238,8 @@ export async function publishGoogleDriveOAuthCredential(
+       // to restore it. A different existing owner is still a conflict, never treated as unlinked.
+       // The email key is decided across its equivalent spellings (PR743): one legacy tombstone stands
+       // (`tombstoned`), several equivalent histories with no canonical decision link nothing
+-      // (`ambiguous`) — the credential is published either way, the attribution left unresolved.
++      // (`ambiguous`) — the credential is published either way, the attribution left unresolved. The
++      // same member's standing legacy spelling is kept exactly (`preserved`), never reported as unlinked.
+       const automatic = { actor: { kind: "member" as const, memberId: input.memberId }, respectTombstone: true };
+       const subjectIdentity = await setMemberIdentity(db, input.teamId, verifiedMemberId, {
+         provider: "gdrive", externalId: subject, email: verifiedEmail,
+@@ -228,7 +252,8 @@ export async function publishGoogleDriveOAuthCredential(
+       if (subjectIdentity.conflict || emailIdentity.conflict) {
+         throw new GoogleIdentityConflictError("verified Google identity conflicts with an existing manual mapping");
+       }
++      identity = { subject: identityOutcome(subjectIdentity), email: identityOutcome(emailIdentity) };
+     }
+-    return { status };
++    return { status, identity };
+   });
+ }
+diff --git a/test/datamechanics/gdrive-identity-tombstone-email.datamechanics.test.ts b/test/datamechanics/gdrive-identity-tombstone-email.datamechanics.test.ts
+index 82fd66fe..c05f2571 100644
+--- a/test/datamechanics/gdrive-identity-tombstone-email.datamechanics.test.ts
++++ b/test/datamechanics/gdrive-identity-tombstone-email.datamechanics.test.ts
+@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
+ 
+ import { getPool } from "@/lib/db/pg/pool";
+ import { withIdentityMutationBoundary } from "@/lib/identity/authority";
+-import { buildIdentityMap, resolveByProviderId } from "@/lib/identity/resolve";
++import { buildIdentityMap, providerIdentityState, resolveByProviderId } from "@/lib/identity/resolve";
+ import { removeMemberIdentity, setMemberIdentity } from "@/lib/identity/member-identities";
+ import { GoogleIdentityConflictError, publishGoogleDriveOAuthCredential } from "@/lib/integrations/gdrive-oauth";
+ import { db, seedTeam, type Seed } from "./helpers";
+@@ -756,4 +756,80 @@ describe("PR743 — author-email tombstones are decided across equivalent legacy
+     expect(resolveByProviderId(map, "gdrive", subject)).toBe(alice.id);
+     expect(resolveByProviderId(map, "gdrive", upper)).toBeNull();
+   });
++
++  // --------------------------------------------------------------------------------------------- //
++  // Combined final review §2: the same member's STANDING legacy spelling is preserved, not refused
++  // --------------------------------------------------------------------------------------------- //
++
++  it.each([
++    { name: "no mapping state", linkedState: false },
++    { name: "one linked legacy state", linkedState: true },
++  ])("a same-member legacy live spelling ($name) is preserved: credential publishes, history byte-exact", async ({ linkedState }) => {
++    const seed = await adminTeam();
++    const alice = await member(seed, "alice");
++    const k = spellings(alice.email);
++    // Mixed case and outer whitespace, exactly as a pre-canonicalization writer stored it.
++    const legacy = `  ${k.mixedBoth}  `;
++    await rawLink(seed, alice.id, legacy);
++    if (linkedState) await rawState(seed, legacy, "linked", alice.id);
++    const ids = [k.canonical, legacy];
++    const before = await sideEffects(seed.teamId, ids);
++
++    const preserved = await automatic(seed, alice.id, k.canonical);
++    expect(preserved).toMatchObject({
++      preserved: true, preservedKeys: [legacy], created: false, updated: false, conflict: false,
++    });
++    expect(preserved.tombstoned).toBeUndefined();
++    expect(preserved.ambiguous).toBeUndefined();
++    expect(preserved.mappingRevision).toBeUndefined(); // no unobserved revision is claimed
++    expect(await automatic(seed, alice.id, k.canonical)).toMatchObject({ preserved: true }); // repeated
++    expect(await sideEffects(seed.teamId, ids)).toBe(before); // rows, histories, repair, revision, epoch, audit
++
++    // Through the publisher: no generic failure, the credential is stored, the outcome is typed.
++    const name = `docs-${randomUUID().slice(0, 6)}`;
++    const subject = S();
++    const emailBefore = await emailState(seed.teamId, ids);
++    const published = await publish(seed, subject, alice.email, name);
++    expect(published.identity).toEqual({ subject: "linked", email: "preserved" });
++    expect(await credentialStored(seed.teamId, name)).toBe(true);
++    expect(await emailState(seed.teamId, ids)).toBe(emailBefore); // the legacy row's bytes are unchanged
++    // The standing owner resolves canonical connector evidence.
++    expect(await emailOf(seed, k.canonical)).toBe(alice.id);
++
++    // Explicit Admin linking keeps its unlink-first refusal for a differently spelled live mapping.
++    await expect(setMemberIdentity(db(), seed.teamId, alice.id, { provider: "gdrive", externalId: k.canonical },
++      { force: true, expectedRevision: 0, expectedRevisionKey: k.canonical })).rejects.toThrow(/differently spelled/);
++    expect(await emailState(seed.teamId, ids)).toBe(emailBefore);
++  });
++
++  it("a same-member live legacy spelling beside a legacy tombstone or several histories is held, not preserved", async () => {
++    const seed = await adminTeam();
++    const alice = await member(seed, "alice");
++    const k = spellings(alice.email);
++    await rawLink(seed, alice.id, k.mixedAddress);
++    await rawState(seed, k.upperPrefix, "unlinked", null);
++    expect(await automatic(seed, alice.id, k.canonical)).toMatchObject({ tombstoned: true, mappingKey: k.upperPrefix });
++    await rawState(seed, k.mixedBoth, "linked", alice.id);
++    const refused = await automatic(seed, alice.id, k.canonical);
++    expect(refused).toMatchObject({ ambiguous: true });
++    expect(refused.preserved).toBeUndefined();
++    const published = await publish(seed, S(), alice.email);
++    expect(published.identity.email).toBe("ambiguous");
++    expect(await emailOf(seed, k.canonical)).toBeNull(); // the reader holds it too
++  });
++
++  it("history decisions do not depend on row order", async () => {
++    // The same equivalent histories, stored in opposite orders in two teams, decide identically.
++    for (const order of [[0, 1], [1, 0]]) {
++      const seed = await adminTeam();
++      const alice = await member(seed, "alice");
++      const k = spellings(alice.email);
++      const histories: [string, "linked" | "unlinked"][] = [[k.upperPrefix, "unlinked"], [k.mixedBoth, "linked"]];
++      for (const index of order) await rawState(seed, histories[index][0], histories[index][1], alice.id);
++      expect(await automatic(seed, alice.id, k.canonical)).toMatchObject({ ambiguous: true });
++      const map = await buildIdentityMap(db(), seed.teamId, { strict: true });
++      expect(providerIdentityState(map, "gdrive", k.canonical)).toBe("ambiguous");
++      expect(providerIdentityState(map, "gdrive", ` ${k.mixedAddress} `)).toBe("ambiguous");
++    }
++  });
+ });
