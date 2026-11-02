@@ -1,0 +1,12 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "session_id": "d57b2dde-4df2-48a5-920f-92629b422d0d",
+  "uuid": "29ffa0bf-2b55-43e7-bb27-83dba490a4a6",
+  "duration_ms": 972181,
+  "stop_reason": "end_turn",
+  "model": "claude-fable-5-1",
+  "source_commit": "b86b22d2e6b1561d0f7e57e0a4caac07e9880fb3",
+  "source_patch_sha256": "12a01ea69ba22264e00cf28f21ad8013bed13ab713db603ccd52e2795cddbe8c"
+}
