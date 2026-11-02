@@ -2722,6 +2722,27 @@ returns text language sql immutable parallel safe as $$
   )::text)
 $$;
 
+-- AIO-1167 R50: the provider-minimum sections a scope/credential transition keeps. Lifetime of a
+-- provider minimum is the verified connection/account and resource, never a selection generation
+-- (mirrors postgres/migrations/20261031140000_gdrive_restriction_generation_lifetime.sql).
+create or replace function gdrive_retained_restriction_progress(p_progress jsonb)
+returns jsonb language plpgsql immutable as $$
+declare
+  retained jsonb := '{}'::jsonb;
+  section text;
+begin
+  if p_progress is null or jsonb_typeof(p_progress) <> 'object' then
+    return retained;
+  end if;
+  foreach section in array array['account_hold', 'document_restrictions', 'retained_restrictions'] loop
+    if p_progress ? section then
+      retained := retained || jsonb_build_object(section, p_progress -> section);
+    end if;
+  end loop;
+  return retained;
+end
+$$;
+
 create or replace function sync_gdrive_connection_authority()
 returns trigger language plpgsql as $$
 declare
@@ -2750,7 +2771,12 @@ begin
     fence = gdrive_connection_authority.fence + case when status_changed then 1 else 0 end,
     lease_owner = case when scope_changed or credential_changed or status_changed then null else gdrive_connection_authority.lease_owner end,
     lease_until = case when scope_changed or credential_changed or status_changed then null else gdrive_connection_authority.lease_until end,
-    progress = case when scope_changed or credential_changed then '{}'::jsonb else gdrive_connection_authority.progress end,
+    -- Generation-specific progress is reset; provider-minimum evidence is kept (AIO-1167 R50).
+    progress = case
+      when scope_changed or credential_changed
+        then gdrive_retained_restriction_progress(gdrive_connection_authority.progress)
+      else gdrive_connection_authority.progress
+    end,
     progress_revision = gdrive_connection_authority.progress_revision
       + case when scope_changed or credential_changed then 1 else 0 end,
     progress_updated_at = case when scope_changed or credential_changed then null else gdrive_connection_authority.progress_updated_at end,

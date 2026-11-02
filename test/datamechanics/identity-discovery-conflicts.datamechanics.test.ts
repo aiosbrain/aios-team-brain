@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { getPool } from "@/lib/db/pg/pool";
@@ -37,7 +39,15 @@ async function adminOf(seed: Seed): Promise<string> {
   return seed.memberId;
 }
 
-/** A LEGACY mapping: a member_identities row with no mapping-state row (never reviewed). */
+/**
+ * A LEGACY mapping: a member_identities row with no mapping-state row (never reviewed).
+ *
+ * COMPATIBILITY coverage only (AIO-1167 R47 F2): written by raw SQL AFTER migrations, this shape is
+ * not reachable on a normally upgraded database — the repair-ledger migration seeds state for every
+ * existing link, and every writer creates it. It exercises the historical-refusal projection; the
+ * reachable AC-08 evidence is the R47 describe at the end of this file, the manual remap offer
+ * (`identity-link-observation`) and the OAuth existing-owner refusal (`gdrive-authority`).
+ */
 async function legacyMapping(seed: Seed, memberId: string, externalId: string) {
   await getPool().query(
     "insert into member_identities(team_id, member_id, provider, external_id, handle, email) values ($1,$2,'gdrive',$3,'','')",
@@ -239,5 +249,59 @@ describe("refused automatic identity links — the Admin diagnostic (R45, real P
     expect(page.rows.map((r) => [r.externalId, r.candidate?.id, r.current.holder?.id])).toEqual([["permission:L", alice, bob]]);
 
     expect(await credit()).toBe(before); // nothing about the credit, the mapping or its repair state moved
+  });
+});
+
+/** The repair-ledger migration's own seed statement, read from the migration so the test tracks it. */
+function migrationSeedSql(): string {
+  const sql = readFileSync(join(process.cwd(), "postgres/migrations/20260922180000_gdrive_identity_repair_ledger.sql"), "utf8");
+  const statement = /insert into member_identity_mapping_state\([\s\S]*?on conflict[^;]*do nothing;/i.exec(sql);
+  if (!statement) throw new Error("the repair-ledger migration no longer seeds mapping state");
+  return statement[0];
+}
+
+describe("R47 F2 — reachable AC-08 evidence on a normally upgraded database (real Postgres)", () => {
+  it("a migration-seeded link to B keeps B when A's confirmed email is observed: no remap, repair or conflict", async () => {
+    const seed = await seedTeam();
+    const viewer = { teamId: seed.teamId, memberId: await adminOf(seed) };
+    const alice = await member(seed, "alice");
+    const bob = await member(seed, "bob");
+    // A link that existed before the upgrade, then the upgrade's own seed.
+    await legacyMapping(seed, bob, "permission:M");
+    await getPool().query(migrationSeedSql());
+    const stateOf = async () => (await getPool().query(
+      "select member_id, state, revision::int as revision from member_identity_mapping_state where team_id=$1 and provider='gdrive' and external_id='permission:M'",
+      [seed.teamId])).rows;
+    expect(await stateOf()).toEqual([{ member_id: bob, state: "linked", revision: 1 }]);
+    const obligations = async () => Number((await getPool().query(
+      "select count(*)::int as n from identity_repair_obligations where team_id=$1", [seed.teamId])).rows[0].n);
+    const owedBefore = await obligations();
+
+    // The connector later observes the account with ALICE's confirmed email.
+    expect(await refuse(seed, alice, "permission:M")).toBe("reviewed");
+
+    expect(await stateOf()).toEqual([{ member_id: bob, state: "linked", revision: 1 }]);
+    const { rows } = await getPool().query(
+      "select member_id from member_identities where team_id=$1 and provider='gdrive' and external_id='permission:M'", [seed.teamId]);
+    expect(rows).toEqual([{ member_id: bob }]);
+    expect(await obligations()).toBe(owedBefore);
+    expect(await conflictEvents(seed.teamId)).toBe(0);
+    expect(ok(await listIdentityDiscoveryConflicts(db(), viewer)).rows).toEqual([]);
+  });
+
+  it("a deliberate unlink after the upgrade stays unlinked when the account is observed again", async () => {
+    const seed = await seedTeam();
+    const alice = await member(seed, "alice");
+    const bob = await member(seed, "bob");
+    await legacyMapping(seed, bob, "permission:U");
+    await getPool().query(migrationSeedSql());
+    await removeMemberIdentity(db(), seed.teamId, { provider: "gdrive", externalId: "permission:U" });
+
+    expect(await refuse(seed, alice, "permission:U")).toBe("reviewed");
+
+    const { rows } = await getPool().query(
+      "select count(*)::int as n from member_identities where team_id=$1 and provider='gdrive' and external_id='permission:U'", [seed.teamId]);
+    expect(rows[0].n).toBe(0);
+    expect(await conflictEvents(seed.teamId)).toBe(0);
   });
 });

@@ -26,11 +26,14 @@ const ROW: IdentityConflictRow = {
 const render = (page: Parameters<typeof IdentityConflicts>[0]["page"], nextHref: string | null = null) =>
   renderToStaticMarkup(createElement(IdentityConflicts, { page, nextHref }));
 
-describe("refused automatic identity links — Admin view", () => {
+describe("recorded legacy Google Drive refusals — Admin view (historical; R47 F2)", () => {
   it("states the refusal and shows the account, both members, the mapping now and its standing", () => {
     const html = render({ status: "ok", rows: [ROW], nextCursor: null });
-    expect(html).toContain("automatic link was refused and the existing mapping was kept");
-    expect(html).toContain("Google Drive: automatic identity links that were refused");
+    // Labelled as the historical record it is, and never as a standing disagreement check (R47 F2).
+    expect(html).toContain("Google Drive: recorded legacy refusals (history)");
+    expect(html).toContain("Historical record");
+    expect(html).toContain("A later email that differs from an approved mapping is not");
+    expect(html).toContain("kept the existing mapping");
     expect(html).toContain("Drive account");
     expect(html).toContain("permission:L");
     expect(html).toContain('href="#member-m-alice"');
@@ -54,12 +57,12 @@ describe("refused automatic identity links — Admin view", () => {
   it("a read failure is shown as unavailable, never as none", () => {
     const html = render({ status: "unavailable" });
     expect(html).toContain("unavailable");
-    expect(html).not.toContain("No Google Drive automatic links have been refused");
+    expect(html).not.toContain("No legacy Google Drive refusals are recorded");
   });
 
   it("an empty page says none; a forbidden viewer sees nothing at all; a next page is linked", () => {
-    expect(render({ status: "ok", rows: [], nextCursor: null })).toContain("No Google Drive automatic links have been refused");
+    expect(render({ status: "ok", rows: [], nextCursor: null })).toContain("No legacy Google Drive refusals are recorded");
     expect(render({ status: "forbidden" })).toBe("");
-    expect(render({ status: "ok", rows: [ROW], nextCursor: "c" }, "/t/x/admin/members?conflicts=c")).toContain("Older refused Drive links");
+    expect(render({ status: "ok", rows: [ROW], nextCursor: "c" }, "/t/x/admin/members?conflicts=c")).toContain("Older recorded refusals");
   });
 });

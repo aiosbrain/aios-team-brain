@@ -1,0 +1,9 @@
+# PR743 acknowledgment of PR714 identity ownership decision
+
+Acknowledged on 2026-11-02. The decision file is `/Users/chetan/.codex/worktrees/b81f/aios-team-brain/.context/aio-1170-resume/aio1170-pr743-legacy-unlink-astra-decision-20261101.md`, SHA-256 `ff374ee337ebf52eb102c969a18d3326693a6577f0ea5d3b2a49bc7031ad476c`.
+
+PR743 accepts the conditional ownership and compatibility decision. PR743 owns the bounded Google `author-email:` equivalent-tombstone correction in its serialized identity mutation boundary. PR714 retains Slack suppression, generation, and attended-cutover behavior; MR-06 must consume the PR743 implementation and preserve both contracts without a second canonicalizer or parallel fix.
+
+The implementation must use one documented comparison domain consistent across JavaScript and SQL, preserve exact-spelling unlink and historical mapping/revision rows, check live-owner conflicts before tombstone refusal, fail closed on multiple applicable historical states, and allow explicit revision-fenced canonical relink. Automatic refusal must leave identity rows, mapping revisions, repair obligations, authority revision, epoch, and successful-transition audit unchanged. Required tests include zero/one/multiple equivalent historical states, mixed-case/prefix variants, conflict precedence, stale and successful fenced relink followed by reconnect, concurrent unlink/publication, and case-sensitive opaque-ID controls. No historical-key rewrite or migration is authorized by this decision.
+
+The decision called out a mismatch between an earlier supplied patch fingerprint (`3fba7ef…`) and the earlier live tracked diff (`781f4dd…`). This acknowledgment does not bless that stale candidate. The resumed candidate is bound to its newly captured base, complete manifest, and patch hashes before review. PR743 remains unmerged; staging integration and MR-06 remain separate steps.

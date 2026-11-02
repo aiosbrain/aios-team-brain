@@ -20,7 +20,7 @@ import secrets
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Iterable
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cursors (
@@ -154,6 +154,8 @@ CREATE TABLE IF NOT EXISTS pending_work (
   acknowledged_at TEXT,
   superseded_at TEXT,
   exhausted_at TEXT,
+  minimum_not_before TEXT,
+  deadline_tracked INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (namespace, generation, item_key, action)
@@ -232,6 +234,26 @@ CREATE TABLE IF NOT EXISTS removal_barriers (
   raised_at TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (namespace, generation, item_key, observation_revision, peer_drive_id)
 );
+CREATE TABLE IF NOT EXISTS connection_holds (
+  connection_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  credential_id TEXT NOT NULL,
+  not_before TEXT NOT NULL,
+  category TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (connection_id, generation, credential_id)
+);
+CREATE TABLE IF NOT EXISTS document_restrictions (
+  connection_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  credential_id TEXT NOT NULL,
+  provider_id TEXT NOT NULL,
+  not_before TEXT NOT NULL,
+  category TEXT NOT NULL,
+  unrepresentable INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (connection_id, generation, credential_id, provider_id)
+);
 """
 
 
@@ -270,6 +292,9 @@ class RootBinding:
 
 # The states a selected-root obligation can be in (see ``StateStore.bind_root``).
 ROOT_STATES = frozenset({"unresolved", "bound", "uncertain", "relocating"})
+# The detail of an ``uncertain`` root its stream's enumeration DEFERRED (AIO-1167 R50 F4): read
+# withheld by a provider minimum or a non-quota deferral; membership retained, not verified.
+ROOT_DEFERRED_PREFIX = "selected root deferred"
 
 
 @dataclass(frozen=True)
@@ -392,6 +417,15 @@ class StateStore:
             # behind fresher work but is not a failure. Existing rows start at zero: their old
             # `attempts` cannot tell the two apart, and over-counting would exhaust work that never failed.
             self._db.execute("ALTER TABLE pending_work ADD COLUMN failures INTEGER NOT NULL DEFAULT 0")
+        if "minimum_not_before" not in work_columns:
+            # AIO-1167 R50: the EXTERNAL minimum (provider- or brain-named) folded into
+            # `not_before`, kept apart from the local exponential backoff so an explicit rearm can
+            # drop the backoff without waiving the minimum.
+            self._db.execute("ALTER TABLE pending_work ADD COLUMN minimum_not_before TEXT")
+        if "deadline_tracked" not in work_columns:
+            # 1 once `not_before` was written with its provenance recorded. Existing rows start at 0:
+            # their combined deadline cannot be assumed to be local backoff only, so rearm keeps it.
+            self._db.execute("ALTER TABLE pending_work ADD COLUMN deadline_tracked INTEGER NOT NULL DEFAULT 0")
         outcome_columns = {r[1] for r in self._db.execute("PRAGMA table_info(page_obligation_outcomes)")}
         if "superseded_by_snapshot" not in outcome_columns:
             self._db.execute(
@@ -1038,13 +1072,21 @@ class StateStore:
         *, detail: str,
     ) -> None:
         """Record that a root's location is unverified. A root already relocating stays that, and an
-        unresolved one — never bound, so it has no drive to be uncertain about — stays unresolved."""
+        unresolved one — never bound, so it has no drive to be uncertain about — stays unresolved.
+
+        A DEFERRED root keeps its ``ROOT_DEFERRED_PREFIX`` detail (AIO-1167 R51 F1): ordinary
+        uncertainty is not a listing, so it must not erase the enumeration debt that only a listing,
+        a relocation/rebind or a verified not-found may discharge."""
+        deferred = f"{ROOT_DEFERRED_PREFIX}%"
         self._db.execute(
             "INSERT INTO selection_root_bindings(connection_id,generation,root_kind,root_id,drive_id,status,detail) "
             "VALUES(?,?,?,?,?,'uncertain',?) ON CONFLICT(connection_id,generation,root_kind,root_id) DO UPDATE SET "
-            "status='uncertain',detail=excluded.detail "
+            "status='uncertain',detail=CASE WHEN selection_root_bindings.status='uncertain' "
+            "AND coalesce(selection_root_bindings.detail,'') LIKE ? "
+            "AND coalesce(excluded.detail,'') NOT LIKE ? "
+            "THEN selection_root_bindings.detail ELSE excluded.detail END "
             "WHERE selection_root_bindings.status NOT IN ('relocating','unresolved')",
-            (connection_id, generation, root_kind, root_id, drive_id, detail),
+            (connection_id, generation, root_kind, root_id, drive_id, detail, deferred, deferred),
         )
         self._db.commit()
 
@@ -1066,14 +1108,71 @@ class StateStore:
         )
         self._db.commit()
 
-    def settle_root(self, connection_id: str, generation: int, root_kind: str, root_id: str) -> None:
-        """A root read where it is bound is no longer uncertain. A relocation is never settled here."""
+    def settle_root(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str,
+        *, enumerated: bool = False,
+    ) -> None:
+        """A root read where it is bound is no longer uncertain — nor unavailable (R48 D1): read
+        again, it is restored. A relocation is never settled here.
+
+        A DEFERRED root (``ROOT_DEFERRED_PREFIX``, AIO-1167 R50 F4) is different: its stream's
+        snapshot holds only retained membership for it, so reading its metadata proves where it is,
+        not what is under it. Only the enumeration that lists it again (``enumerated``) settles it."""
         self._db.execute(
             "UPDATE selection_root_bindings SET status='bound',detail=NULL WHERE connection_id=? "
-            "AND generation=? AND root_kind=? AND root_id=? AND status='uncertain'",
-            (connection_id, generation, root_kind, root_id),
+            "AND generation=? AND root_kind=? AND root_id=? "
+            "AND (status='uncertain' OR (status='bound' AND detail IS NOT NULL)) "
+            "AND (? OR NOT (status='uncertain' AND coalesce(detail,'') LIKE ?))",
+            (connection_id, generation, root_kind, root_id, 1 if enumerated else 0,
+             f"{ROOT_DEFERRED_PREFIX}%"),
         )
         self._db.commit()
+
+    def mark_root_deferred(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str, drive_id: str,
+        *, detail: str,
+    ) -> None:
+        """Record that a bound root could not be read by its stream's enumeration now (R50 F4): a
+        provider minimum or a non-quota deferral. It becomes ``uncertain`` with a
+        ``ROOT_DEFERRED_PREFIX`` detail — a durable unresolved obligation that keeps the connection
+        partial and withholds absence — until an enumeration lists it again."""
+        self.mark_root_uncertain(
+            connection_id, generation, root_kind, root_id, drive_id,
+            detail=f"{ROOT_DEFERRED_PREFIX}: {detail}",
+        )
+
+    def deferred_roots(
+        self, connection_id: str, generation: int, drive_id: str,
+    ) -> list[tuple[str, str]]:
+        """``(kind, id)`` of every root of this drive's stream deferred by its enumeration."""
+        return [
+            (str(row["root_kind"]), str(row["root_id"]))
+            for row in self._db.execute(
+                "SELECT root_kind,root_id FROM selection_root_bindings WHERE connection_id=? "
+                "AND generation=? AND drive_id=? AND status='uncertain' AND coalesce(detail,'') LIKE ? "
+                "ORDER BY root_kind,root_id",
+                (connection_id, generation, drive_id, f"{ROOT_DEFERRED_PREFIX}%"),
+            ).fetchall()
+        ]
+
+    def record_root_unavailable(
+        self, connection_id: str, generation: int, root_kind: str, root_id: str, *, detail: str,
+    ) -> bool:
+        """Record a previously BOUND root's own verified not-found (AIO-1167 R48 D1).
+
+        The root stays bound to its drive — its location was known and its outcome is now known:
+        it supports nothing — with the diagnostic as its detail, which travels with the fenced
+        root evidence. Only a bound (or uncertain) root qualifies: a never-bound root stays
+        unresolved and a relocating one stays relocating; neither is evidence of loss. Returns
+        whether the root was recorded."""
+        cur = self._db.execute(
+            "UPDATE selection_root_bindings SET status='bound',detail=? WHERE connection_id=? "
+            "AND generation=? AND root_kind=? AND root_id=? AND status IN ('bound','uncertain') "
+            "AND drive_id IS NOT NULL AND drive_id<>''",
+            (detail, connection_id, generation, root_kind, root_id),
+        )
+        self._db.commit()
+        return cur.rowcount == 1
 
     def rebind_root(
         self, connection_id: str, generation: int, root_kind: str, root_id: str, destination: str,
@@ -1192,6 +1291,108 @@ class StateStore:
         self._db.commit()
         return rotated
 
+    # Provider minimums (account holds and resource restrictions) are bound to the verified
+    # connection/account and the stable provider resource — never to a selection generation
+    # (AIO-1167 R50). ``generation`` is still recorded with each row as observation context, but every
+    # read below spans all generations of the account and every write is monotonic against that, so a
+    # scope edit, an empty selection, a reselection or a same-account reconnect cannot lower, expire
+    # or waive a standing minimum. Another account's evidence is never read for this one.
+    def hold_connection(
+        self, connection_id: str, generation: int, credential_id: str, not_before: str, category: str,
+    ) -> tuple[str, str]:
+        """Record a provider hold on one verified account of one connection (AIO-1167 R47 F5).
+
+        Independent of streams: a rate limit read while binding roots or capturing start tokens is
+        held before any stream exists. Monotonic across generations — a later, shorter wait never
+        shortens a standing one — and returns the hold now in force."""
+        held = self.connection_hold(connection_id, generation, credential_id)
+        if held is not None and _instant(held[0]) >= _instant(not_before):
+            return held
+        self._db.execute(
+            "INSERT INTO connection_holds(connection_id,generation,credential_id,not_before,category,updated_at) "
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(connection_id,generation,credential_id) DO UPDATE SET "
+            "not_before=excluded.not_before,category=excluded.category,updated_at=excluded.updated_at",
+            (connection_id, generation, credential_id, not_before, category, _now_iso()),
+        )
+        self._db.commit()
+        return not_before, category
+
+    def connection_hold(
+        self, connection_id: str, generation: int, credential_id: str,
+    ) -> tuple[str, str] | None:
+        """The strongest hold ``(not_before, category)`` recorded for this account in ANY
+        generation, expired or not (``generation`` is accepted for call-site symmetry only)."""
+        strongest: tuple[str, str] | None = None
+        for row in self._db.execute(
+            "SELECT not_before, category FROM connection_holds WHERE connection_id=? AND credential_id=?",
+            (connection_id, credential_id),
+        ).fetchall():
+            if strongest is None or _instant(row["not_before"]) > _instant(strongest[0]):
+                strongest = (str(row["not_before"]), str(row["category"]))
+        return strongest
+
+    def restriction_credentials(self, connection_id: str) -> set[str]:
+        """Every verified account of this connection with recorded provider-minimum evidence."""
+        rows = self._db.execute(
+            "SELECT credential_id FROM connection_holds WHERE connection_id=? "
+            "UNION SELECT credential_id FROM document_restrictions WHERE connection_id=?",
+            (connection_id, connection_id),
+        ).fetchall()
+        return {str(row[0]) for row in rows if row[0]}
+
+    def restrict_document(
+        self, connection_id: str, generation: int, credential_id: str, provider_id: str,
+        not_before: str, category: str, *, unrepresentable: bool = False,
+    ) -> tuple[str, str, bool]:
+        """Record a provider-named minimum for ONE provider resource (AIO-1167 R49 F1, R50).
+
+        The provider restriction is the resource's, not one observation's: it is keyed by the
+        verified connection/account and stable provider id (the generation is context only), and
+        neither attempts, exhaustion, rearm, a newer observation, a rescan nor a new selection
+        generation touches it. Monotonic across generations — a later, shorter minimum never
+        shortens a standing one — and an unrepresentable restriction stays unrepresentable: it is
+        fail-closed, never an ordinary instant that expires. Returns the restriction now in force.
+
+        Resources are documents and roots (by provider id) and the operation keys of
+        ``gdrive_sync`` for a stream's start token or the service-account identity prerequisite."""
+        held = self.document_restrictions(connection_id, generation, credential_id).get(provider_id)
+        if held is not None and (
+            held[2] or (not unrepresentable and _instant(held[0]) >= _instant(not_before))
+        ):
+            return held
+        self._db.execute(
+            "INSERT INTO document_restrictions(connection_id,generation,credential_id,provider_id,"
+            "not_before,category,unrepresentable,updated_at) VALUES(?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(connection_id,generation,credential_id,provider_id) DO UPDATE SET "
+            "not_before=excluded.not_before,category=excluded.category,"
+            "unrepresentable=excluded.unrepresentable,updated_at=excluded.updated_at",
+            (connection_id, generation, credential_id, provider_id, not_before, category,
+             1 if unrepresentable else 0, _now_iso()),
+        )
+        self._db.commit()
+        return not_before, category, bool(unrepresentable)
+
+    def document_restrictions(
+        self, connection_id: str, generation: int, credential_id: str,
+    ) -> dict[str, tuple[str, str, bool]]:
+        """Every recorded restriction of this account in ANY generation, expired or not, merged per
+        resource (unrepresentable wins, then the later instant):
+        ``provider_id -> (not_before, category, unrepresentable)``. ``generation`` is accepted for
+        call-site symmetry only."""
+        merged: dict[str, tuple[str, str, bool]] = {}
+        for r in self._db.execute(
+            "SELECT provider_id, not_before, category, unrepresentable FROM document_restrictions "
+            "WHERE connection_id=? AND credential_id=? ORDER BY provider_id, generation",
+            (connection_id, credential_id),
+        ).fetchall():
+            candidate = (str(r["not_before"]), str(r["category"]), bool(r["unrepresentable"]))
+            held = merged.get(str(r["provider_id"]))
+            if held is None or (not held[2] and (
+                candidate[2] or _instant(candidate[0]) > _instant(held[0])
+            )):
+                merged[str(r["provider_id"])] = candidate
+        return dict(sorted(merged.items()))
+
     def update_progress(self, namespace: str, **changes: Any) -> None:
         allowed = {
             "phase", "page_token", "baseline_start_token", "traversal_token", "listing_complete",
@@ -1261,10 +1462,12 @@ class StateStore:
             (namespace, generation, item_key),
         )
         self._db.execute(
-            "INSERT INTO pending_work(namespace,generation,item_key,action,observation_revision,payload,page_id,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(namespace,generation,item_key,action) DO UPDATE SET "
+            "INSERT INTO pending_work(namespace,generation,item_key,action,observation_revision,payload,page_id,"
+            "deadline_tracked,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,1,?,?) ON CONFLICT(namespace,generation,item_key,action) DO UPDATE SET "
             "observation_revision=excluded.observation_revision,payload=excluded.payload,page_id=excluded.page_id,"
-            "attempts=0,failures=0,not_before=NULL,last_error=NULL,acknowledged_at=NULL,superseded_at=NULL,"
+            "attempts=0,failures=0,not_before=NULL,minimum_not_before=NULL,deadline_tracked=1,"
+            "last_error=NULL,acknowledged_at=NULL,superseded_at=NULL,"
             "exhausted_at=NULL,updated_at=datetime('now')",
             (namespace, generation, item_key, action, revision, serialized, page_id, now, now),
         )
@@ -1299,8 +1502,13 @@ class StateStore:
 
     def list_pending(
         self, namespace: str, generation: int, *, limit: int = 100,
-        work_class: str | None = None,
+        work_class: str | None = None, restricted: Iterable[str] = (),
     ) -> list[PendingWork]:
+        """Owed work eligible now. ``restricted`` names documents under a standing provider
+        restriction (R49 F1): their reads, upserts and restorations are not selected, so they spend
+        no slot of the batch and independent documents keep progressing. A verified ``remove`` is
+        still selected (R51 blind-final 1): it needs no early read to reach the claim-aware removal
+        owner, and the caller withholds any removal that would need a probe of the document."""
         if work_class not in {None, "fresh", "retry"}:
             raise ValueError("work_class must be fresh, retry, or None")
         class_clause = (
@@ -1312,8 +1520,9 @@ class StateStore:
             "SELECT * FROM pending_work WHERE namespace=? AND generation=? "
             "AND acknowledged_at IS NULL AND superseded_at IS NULL AND exhausted_at IS NULL "
             "AND (not_before IS NULL OR not_before<=?) " + class_clause + " "
+            "AND (action='remove' OR item_key NOT IN (SELECT value FROM json_each(?))) "
             "ORDER BY attempts ASC,created_at,item_key LIMIT ?",
-            (namespace, generation, _now_iso(), max(1, limit)),
+            (namespace, generation, _now_iso(), json.dumps(sorted(set(restricted))), max(1, limit)),
         ).fetchall()
         return [PendingWork(r["namespace"], r["generation"], r["item_key"], r["action"],
                             r["observation_revision"], json.loads(r["payload"]),
@@ -1447,19 +1656,34 @@ class StateStore:
 
     def fail_work(
         self, work: PendingWork, error: str, *, not_before: str | None = None, exhaust: bool = False,
-        failure: bool = True,
+        failure: bool = True, minimum: str | None = None,
     ) -> None:
         """Record one attempt that did not complete. The obligation stays owed either way; with
         ``exhaust`` it is no longer picked automatically (``list_pending``) but still counts as pending
         work. ``failure=False`` records a document WITHHELD for a reason that is not its own failure
         (it waits on another stream): it still moves behind fresher work, but spends none of the retry
-        budget (``failures``) that backoff and exhaustion are computed from (AIO-1167 R44 C7)."""
+        budget (``failures``) that backoff and exhaustion are computed from (AIO-1167 R44 C7).
+
+        ``not_before`` is the combined eligibility instant; ``minimum`` is the EXTERNAL part of it — a
+        provider- or brain-named minimum (AIO-1167 R50). It is recorded apart from the local backoff,
+        merged monotonically with any earlier one for this observation, so an explicit rearm can drop
+        the backoff (``rearm_exhausted``) and never the minimum."""
+        row = self._db.execute(
+            "SELECT minimum_not_before FROM pending_work WHERE namespace=? AND generation=? "
+            "AND item_key=? AND action=? AND observation_revision=? AND superseded_at IS NULL",
+            (work.namespace, work.generation, work.item_key, work.action, work.observation_revision),
+        ).fetchone()
+        recorded = row["minimum_not_before"] if row is not None else None
+        merged = recorded
+        if minimum and (merged is None or _instant(minimum) > _instant(merged)):
+            merged = minimum
         self._db.execute(
             "UPDATE pending_work SET attempts=attempts+1,failures=failures+?,last_error=?,not_before=?,"
+            "minimum_not_before=?,deadline_tracked=1,"
             "exhausted_at=CASE WHEN ? THEN datetime('now') ELSE exhausted_at END,updated_at=datetime('now') "
             "WHERE namespace=? AND generation=? AND item_key=? AND action=? AND observation_revision=? "
             "AND superseded_at IS NULL",
-            (1 if failure else 0, error[:1000], not_before, 1 if exhaust else 0, work.namespace,
+            (1 if failure else 0, error[:1000], not_before, merged, 1 if exhaust else 0, work.namespace,
              work.generation, work.item_key, work.action, work.observation_revision),
         )
         self._db.commit()
@@ -1473,6 +1697,17 @@ class StateStore:
         ).fetchone()
         return int(row["failures"]) if row else 0
 
+    def has_owed_work(
+        self, namespace: str, generation: int, item_key: str, *, exclude_action: str | None = None,
+    ) -> bool:
+        """Whether this stream still owes an outcome for ``item_key`` (acknowledged/superseded: no),
+        optionally ignoring obligations of ``exclude_action``."""
+        return self._db.execute(
+            "SELECT 1 FROM pending_work WHERE namespace=? AND generation=? AND item_key=? "
+            "AND acknowledged_at IS NULL AND superseded_at IS NULL AND action<>? LIMIT 1",
+            (namespace, generation, item_key, exclude_action or ""),
+        ).fetchone() is not None
+
     def exhausted_count(self, namespace: str, generation: int) -> int:
         """Owed obligations whose automatic retries ran out (AIO-1167 R44 C7)."""
         return int(self._db.execute(
@@ -1483,9 +1718,18 @@ class StateStore:
 
     def rearm_exhausted(self, namespace: str, generation: int) -> int:
         """An explicit Admin run: exhausted obligations become retryable again, from attempt zero.
-        Their evidence (last error) is kept until the next attempt replaces it."""
+        Their evidence (last error) is kept until the next attempt replaces it.
+
+        Rearm owns the attempt budget and the LOCAL exponential backoff (AIO-1167 R50): where the
+        deadline's provenance is recorded (``deadline_tracked``), ``not_before`` falls back to the
+        external minimum alone — so unrestricted work is eligible at once, while a provider- or
+        brain-named minimum still holds. A legacy row whose combined deadline has no recorded
+        provenance keeps it: it cannot be assumed to be local backoff only. Resource restrictions
+        (``document_restrictions``) are a separate owner and are never touched here."""
         cur = self._db.execute(
-            "UPDATE pending_work SET exhausted_at=NULL,attempts=0,failures=0,not_before=NULL,updated_at=datetime('now') "
+            "UPDATE pending_work SET exhausted_at=NULL,attempts=0,failures=0,"
+            "not_before=CASE WHEN deadline_tracked=1 THEN minimum_not_before ELSE not_before END,"
+            "updated_at=datetime('now') "
             "WHERE namespace=? AND generation=? AND acknowledged_at IS NULL AND superseded_at IS NULL "
             "AND exhausted_at IS NOT NULL",
             (namespace, generation),
@@ -1702,6 +1946,21 @@ class StateStore:
             (namespace, generation, selected),
         ).fetchone()
 
+    def root_traversal_open(
+        self, namespace: str, generation: int, root_id: str, *, snapshot_id: int | None = None,
+    ) -> bool:
+        """Whether ``root_id`` still has an unfinished traversal entry in this snapshot — the folder,
+        a descendant or a further page is still to be listed (AIO-1167 R51 final 1). A root with no
+        entry at all, or whose every entry is finished, is not open."""
+        selected = snapshot_id if snapshot_id is not None else self.snapshot_id(namespace)
+        if selected is None:
+            return False
+        return self._db.execute(
+            "SELECT 1 FROM traversal_queue WHERE namespace=? AND generation=? AND snapshot_id=? "
+            "AND root_id=? AND completed_at IS NULL LIMIT 1",
+            (namespace, generation, selected, root_id),
+        ).fetchone() is not None
+
     def complete_traversal(self, namespace: str, generation: int, root_id: str,
                            folder_id: str, page_token: str | None,
                            *, snapshot_id: int | None = None) -> None:
@@ -1794,6 +2053,37 @@ class StateStore:
             if roots == {root_id}:
                 final.append(str(row["provider_id"]))
         return affected, final
+
+    def retained_root_membership(
+        self, namespace: str, generation: int, root_id: str,
+    ) -> list[tuple[str, str, str]]:
+        """``(provider_id, root_id, drive_id)`` for each member the stream's PUBLISHED snapshot
+        claims through ``root_id`` (AIO-1167 R50 F4).
+
+        Retained evidence for a root that cannot be read now, never a current observation. A stream
+        with no published snapshot — fresh local state — has none: membership is never invented
+        from a root binding or a snapshot id."""
+        progress = self._db.execute(
+            "SELECT active_snapshot FROM stream_progress WHERE namespace=?", (namespace,),
+        ).fetchone()
+        if progress is None or progress["active_snapshot"] is None:
+            return []
+        active = int(progress["active_snapshot"])
+        status = self._db.execute(
+            "SELECT status FROM selection_snapshots WHERE namespace=? AND generation=? AND snapshot_id=?",
+            (namespace, generation, active),
+        ).fetchone()
+        if status is None or status["status"] != "active":
+            return []
+        return [
+            (str(row["provider_id"]), root_id, str(row["drive_id"]))
+            for row in self._db.execute(
+                "SELECT provider_id,root_ids,drive_id FROM selected_membership "
+                "WHERE namespace=? AND generation=? AND snapshot_id=? ORDER BY provider_id",
+                (namespace, generation, active),
+            ).fetchall()
+            if root_id in set(json.loads(row["root_ids"]))
+        ]
 
     def membership_impacts_for_ancestor(
         self, namespace: str, generation: int, ancestor_id: str,
@@ -2132,8 +2422,8 @@ class StateStore:
                     ):
                         self._db.execute(
                             "INSERT OR IGNORE INTO pending_work(namespace,generation,item_key,action,"
-                            "observation_revision,payload,page_id,created_at,updated_at) "
-                            "VALUES(?,?,?,?,?,?,?,?,?)",
+                            "observation_revision,payload,page_id,deadline_tracked,created_at,updated_at) "
+                            "VALUES(?,?,?,?,?,?,?,1,?,?)",
                             (namespace, generation, item_key, action,
                              int(replay["observation_revision"]),
                              json.dumps(payload, separators=(",", ":")), page_id,
@@ -2340,6 +2630,15 @@ def _token_hash(token: str) -> str:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _instant(value: object) -> datetime:
+    """An ISO instant for ordering; an unparseable value sorts first, so it never outranks a real one."""
+    try:
+        at = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    return at if at.tzinfo is not None else at.replace(tzinfo=timezone.utc)
 
 
 def _unexpired(value: object, *, now: datetime | None = None) -> bool:

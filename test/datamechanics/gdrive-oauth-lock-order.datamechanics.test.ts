@@ -41,6 +41,7 @@ import { db, seedTeam, type Seed } from "./helpers";
 const STORED_SECRET = JSON.stringify({
   client_id: "oauth-client", client_secret: "stored-secret", refresh_token: "stored-refresh",
   token_uri: "https://oauth2.googleapis.com/token", account_subject: "subject:acct-1",
+  scopes: ["openid", "https://www.googleapis.com/auth/drive.file"], grant_mode: "files",
 });
 
 interface World {

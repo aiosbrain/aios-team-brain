@@ -208,14 +208,20 @@ export async function publishGoogleDriveOAuthCredential(
     });
     await setIntegrationSecret(db, auth, id, secret);
     if (verifiedMemberId && verifiedEmail) {
+      // Credential authority is not attribution intent (AIO-1167 R47 F1): connecting or reconnecting
+      // proves the Admin may use this Google account, not that a deliberate unlink should be undone.
+      // Each namespaced identity is checked on its own — a tombstoned one stays unlinked (and the
+      // account stays visibly unresolved for it); an explicit Admin → Members relink remains the way
+      // to restore it. A different existing owner is still a conflict, never treated as unlinked.
+      const automatic = { actor: { kind: "member" as const, memberId: input.memberId }, respectTombstone: true };
       const subjectIdentity = await setMemberIdentity(db, input.teamId, verifiedMemberId, {
         provider: "gdrive", externalId: subject, email: verifiedEmail,
         handle: input.name ?? verifiedEmail,
-      }, { actor: { kind: "member", memberId: input.memberId } });
+      }, automatic);
       const emailIdentity = await setMemberIdentity(db, input.teamId, verifiedMemberId, {
         provider: "gdrive", externalId: `author-email:${verifiedEmail}`,
         email: verifiedEmail, handle: input.name ?? verifiedEmail,
-      }, { actor: { kind: "member", memberId: input.memberId } });
+      }, automatic);
       if (subjectIdentity.conflict || emailIdentity.conflict) {
         throw new GoogleIdentityConflictError("verified Google identity conflicts with an existing manual mapping");
       }

@@ -5380,6 +5380,9 @@ class _DriveWorld:
         self.malformed, self.checkpoint_faults, self.ledger = set(), [], None
         # Failures to raise, once each, from the next reconciliations that name removals.
         self.removal_faults = []
+        # Whether listing a folder that no longer exists answers 404, as Google may (R48 D1),
+        # instead of an empty page.
+        self.missing_folder_listing_404 = False
 
     def put(self, file_id, *, drive, parent=None, folder=False):
         self.files[file_id] = {
@@ -5442,6 +5445,8 @@ class _DriveWorld:
 
                 def listing():
                     world.calls.append(("list", drive_id, folder_id))
+                    if world.missing_folder_listing_404 and folder_id not in world.files:
+                        raise _ProviderHttpError(404)
                     found = {"files": [
                         dict(meta) for meta in world.files.values()
                         if folder_id in meta["parents"] and meta.get("driveId", "my-drive") == drive_id
@@ -7514,11 +7519,17 @@ async def test_document_the_provider_says_is_gone_is_removed_at_once_behind_a_pe
     world.calls.clear()
     promptly = await world.run(state)
 
-    # The removal was read from the origin's change log, the document was then read for itself,
-    # and the provider's own answer made it absence — in that run, with the peer still unopened
-    # and no complete snapshot of the connection ever taken.
-    assert (world.calls.index(("changes", "shared-a", "shared-a@0"))
-            < world.calls.index(("metadata", "doc-1")))
+    # The removal was read from the origin's change log and became absence in that run, with the
+    # peer still unopened and no complete snapshot of the connection ever taken. A deleted or
+    # access-lost document was then read for itself, and the provider's own answer confirmed it.
+    # Explicit trash already IS that answer about the document: it is reconciled from the change's
+    # own evidence, without a metadata read (AIO-1167 R51 final 2).
+    if loss == "trashed":
+        assert ("changes", "shared-a", "shared-a@0") in world.calls
+        assert ("metadata", "doc-1") not in world.calls
+    else:
+        assert (world.calls.index(("changes", "shared-a", "shared-a@0"))
+                < world.calls.index(("metadata", "doc-1")))
     assert world.removed == ["doc-1"]
     assert world.reconciled == []
     assert state.pending_count(origin, 9) == 0 and _barrier_peers(state, origin) == []
@@ -7656,8 +7667,9 @@ async def test_stale_claim_of_a_recovery_blocked_peer_does_not_swallow_a_confirm
     if sink == "fails-once":
         world.removal_faults.append(BrainError(503, "cleanup_unavailable", "retry"))
 
-        # The provider confirmed the loss, so the removal went to the brain despite the stale
-        # claim — and the brain's failure leaves it durable and retryable, removing nothing.
+        # The provider confirmed the loss (explicit trash in the change itself, or the document's own
+        # metadata), so the removal went to the brain despite the stale claim — and the brain's
+        # failure leaves it durable and retryable, removing nothing.
         failed = await world.run(state)
         assert failed.failure_categories.get("cleanup_unavailable") == 1
         assert world.removed == []
@@ -7679,9 +7691,14 @@ async def test_stale_claim_of_a_recovery_blocked_peer_does_not_swallow_a_confirm
     world.calls.clear()
     promptly = await world.run(state)
 
-    # The document was read for itself, the provider's answer made the removal the connection's,
-    # and it was reconciled while the peer still holds it and still cannot recover.
-    assert ("metadata", "doc-1") in world.calls
+    # The provider's answer made the removal the connection's, and it was reconciled while the peer
+    # still holds it and still cannot recover. A deleted or access-lost document was read for itself
+    # to get that answer; explicit trash carries it in the change, so it is never read — the stale
+    # claim neither withholds it nor sends it to a probe (AIO-1167 R51 final 2).
+    if loss == "trashed":
+        assert ("metadata", "doc-1") not in world.calls
+    else:
+        assert ("metadata", "doc-1") in world.calls
     assert world.removed == ["doc-1"]
     assert state.pending_count(origin, 9) == 0 and _barrier_peers(state, origin) == []
     assert state.membership_ids(origin, 9) == ["doc-ka"]

@@ -975,7 +975,9 @@ R44 contracts (AIO-1167):
   `discoverMemberIdentity`), only for an id never reviewed — links, manual mappings and unlink
   tombstones stand; a disagreeing email is an audited conflict, never a transfer. Only an UNREVIEWED
   legacy mapping held by another member is such a conflict (a reviewed link or unlink tombstone is
-  `reviewed`, never audited as one). Admins see refused Google Drive automatic links on Admin → Members
+  `reviewed`, never audited as one). Admins see RECORDED LEGACY Google Drive refusals — a historical
+  record, labelled as such (AIO-1167 R47 F2): a normally upgraded instance no longer produces the shape,
+  since the repair-ledger migration seeds state for every link — on Admin → Members
   through `lib/identity/discovery-conflicts` — a read-only, team-scoped, paginated projection of the
   existing `identity.discovery_conflict` audit events whose normalized provider is `gdrive`, beside the CURRENT mapping (re-read), allowlisted fields
   only, `unavailable` on a read failure, active team-posture admins only, never an API surface
@@ -1066,7 +1068,23 @@ removal is written, the old stream rebuilds its snapshot from its remaining root
 rebound only after the destination stream holds a start token captured before that root is enumerated
 there — the destination enumerates the root alone, never its drive. Unreadable (anything but an
 explicit not-found), the root is durably `uncertain`: the change page is not retained, the cursor does
-not pass it, and it is read again. All-stream reconciliation, and therefore `current`, requires that no
+not pass it, and it is read again. A previously BOUND root whose OWN metadata answers not-found under
+the execution's authority is a resolved outcome (AIO-1167 R48 D1): it stays `bound` with the
+actionable detail `selected root unavailable` (in the fenced `roots` evidence; run diagnostic
+`selection_root_unavailable`), its file page or folder traversal is finished EMPTY without listing it,
+and the rescan publishes — so a hard-deleted root no longer wedges the stream. Only that root's support
+is retired: direct and overlapping selections keep their membership, and the brain's claim-aware
+reconciliation keeps another connection's claims. A never-bound root's 404 stays `unresolved`; a listing
+404, auth, permission, quota, timeout and 5xx stay conservative. Read again, a restored root is settled
+and enumerated normally under the same provider ids. On the change-page path (`absence_withheld`) only a root
+read present where it is bound is settled; a verified absence keeps (or records) its unavailable detail
+(R49 F2), a quota answer on that read goes to the account-hold owner (no further account call, the page
+stays unresolved) while a non-quota one is that root's (its provider-named minimum recorded as the
+root's restriction, R50 F3), and its Retry-After diagnostic is kept. A
+restored selected FILE root's detail is cleared only when the same stable id is re-read fresh in its
+bound drive as a live Doc and its content is ACCEPTED by the brain, so the acknowledging checkpoint
+publishes the restored evidence (R49 F3); a change-log hint, another drive, failed access, superseded
+work or failed extraction never clears it. All-stream reconciliation, and therefore `current`, requires that no
 root is `relocating` or `uncertain` and that every stream's published snapshot is of exactly the bound
 roots it now holds — so the claims an old stream made are retired only by the destination's verified
 snapshot. Before any baseline listing, every required stream's start
@@ -1091,13 +1109,19 @@ restart. Behind a peer that cannot be read (no local state, no token, or a recov
 an ambiguous removal stays withheld, while the document's own metadata is read under the execution
 fence: an explicit not-found (deleted, or access lost) or a trashed document is retired at once by a
 targeted removal, without a complete snapshot; a readable document or any other failure verifies
-nothing. An unstarted stream no root needs any more is forgotten locally and leaves the brain's
+nothing. An explicit `file.trashed=true` is persisted in that removal obligation before parent-root
+absence gates, so a standing root/document read restriction blocks reads but does not block the
+claim-aware retirement; ambiguous `removed=true` remains on the cross-stream barrier/probe path.
+An unstarted stream no root needs any more is forgotten locally and leaves the brain's
 checkpoint with the run's next checkpoint. Shared Drive listing, traversal, rescan, and parent-membership checks use the
 provider's actual `driveId` as the root; the former synthetic `root` key is repaired only when the
 persisted root/drive identity matches exactly, otherwise the stream enters controlled recovery and
 cannot treat the mismatch as removal evidence. Each stream has an explicit snapshot incarnation: roots and traversal seeds are
 created atomically, a replacement builds beside the prior authoritative membership, and only a fully
-enumerated snapshot is published. Missing or mismatched local durable state for remote v2 progress
+enumerated snapshot is published. Recovering a deferred folder's metadata does not prove that its
+recursive contents were listed: if its placeholder traversal already closed the build, that build stays
+incomplete and controlled recovery relists the folder and descendants under fresh page identities; if
+the traversal is still open, enumeration settles only after the folder's final page. Missing or mismatched local durable state for remote v2 progress
 enters controlled recovery; absence reconciliation remains disabled until a fresh baseline is
 published. A build is evidence only with the start token it was begun under, so a recovery or
 invalid-cursor rescan that captures a new token resumes nothing (`restart_selection_snapshot`, one
@@ -1158,7 +1182,13 @@ all-stream snapshot can establish absence.
 Provider calls use explicit request/transport context (including OAuth and local service accounts),
 bounded deadline-aware retries with jitter, honor mapping-style and normal
 `Retry-After` headers, durably defer affected streams across restarts when a delay exceeds the run
-window, recompute the effective remainder after token refresh, authority validation, and request
+window (AIO-1167 R48 D2, `parse_retry_after` in `sources/gdrive.py`: a VALID delay-seconds or HTTP-date
+is the provider's deadline exactly — never capped or shortened, however long, and there is no Run-now
+bypass; malformed input — text, a sign or exponent, NaN/infinity, an impossible date — uses the bounded
+exponential fallback and reports `retry_after_malformed`; a syntactically valid wait no timestamp can
+hold is held at the last representable instant, fail closed, reporting `retry_after_unrepresentable`;
+a document's own deferral keeps the provider's deadline as its earliest retry — see the document
+restriction owner below), recompute the effective remainder after token refresh, authority validation, and request
 construction immediately before transport execution, tighten new and reused transport sockets from
 that reduced request/run budget, treat authentication loss as terminal, and recover an invalid opaque
 cursor only through a fresh-token controlled rescan. The local service-account `AuthorizedHttp` wraps
@@ -1201,8 +1231,115 @@ the scheduler loop stays responsive; an abandoned worker's late result can only 
 evidence, and its resources close only when it ends. Early `sync` notifications for a pending attempt
 whose token matches the persisted hash are recorded as evidence (202) — never activation, never a
 hint. **One owner per section of the fenced connector state (`connector_state.py`)**: the coordinator
-owns `streams`/top-level cursors and `roots`; renewal owns `watches`; each carries the other's part
-unchanged (`coordinator_document`/`renewal_document`), so a poll can no longer erase renewal's records.
+owns `streams`/top-level cursors, `roots` and `account_hold`; renewal owns `watches`; each carries the
+other's part unchanged (`coordinator_document`/`renewal_document`), so a poll can no longer erase
+renewal's records. `account_hold` (AIO-1167 R47 F5, scoped by R50 F3) is a QUOTA answer's provider
+Retry-After for one verified account — a 429, or a 403 naming a rate-limit reason — opened from ANY phase
+(root metadata, relocation re-reads, start-token capture, the service-account identity read, drains,
+or watch creation/stopping) and held locally first (SQLite `connection_holds`, monotonic) then published;
+watch quota refusals use the same classifier and restriction owner, stop further account watch calls
+in that sweep, keep quota-rejected stops `cleanup_pending`, and never retry non-idempotent creation.
+Every run adopts the
+brain's copy and honours it before its first Drive call, so a hold read before any stream exists
+survives retries, restarts and a fresh state file. A failed publication keeps the local hold and is
+reported (`account_hold_unpublished`), never claimed remote-durable. **Pre-stream answers are scoped to
+the operation they were read for (R50 F3)**, not to the account merely because no stream exists yet: a
+non-quota answer (a 503, a timeout) on a root's metadata or relocation re-read defers THAT root
+(`_bind_selected_roots`/`_reobserve_stalled_relocations` with `deferred=`, the root stays an unresolved
+or relocating obligation, other roots and streams run); on a start-token or change-log request it
+defers THAT stream (`start-token:<drive>` resource; `_stream_start_deferred` in the stream routine, the
+same rule in the coordinator's capture loop — nothing enumerated without the token); on the
+service-account identity read it defers the connection's PREREQUISITE
+(`prerequisite:service-account-identity`) without an account hold. Terminal authority, the local run
+budget (`dispatch_deadline`/`run_deadline`, never a provider wait) and malformed-header diagnostics are
+unchanged.
+A provider-named minimum for ONE resource — a document, a selected root, a stream's start token or the
+identity prerequisite; a non-quota answer with a valid or unrepresentable Retry-After — is that
+resource's RESTRICTION, owned apart from its retry bookkeeping (AIO-1167 R49 F1; `_restrict_resource`,
+which records only a provider-named deadline — a malformed header's bounded fallback and a timeout stay
+attempt-local): SQLite `document_restrictions`, merged monotonically (`StateStore.restrict_document`).
+**Its lifetime is bound to the verified account and stable provider id, not the execution generation
+(R50 F1)**: `connection_hold`/`document_restrictions`/`restrict_document` aggregate every generation of
+the connection and account (unrepresentable wins, then the later instant), so a scope edit (add/remove
+root, empty selection, deselect/reselect) or a same-account reconnect cannot expire, lower or waive it.
+The brain keeps it too: the `sync_gdrive_connection_authority()` trigger, which resets `progress` on a
+scope or credential change, retains exactly the three restriction sections
+(`gdrive_retained_restriction_progress`, migration
+`20261031140000_gdrive_restriction_generation_lifetime.sql`, mirrored in `schema.sql`) while
+streams/roots/watches/cursors still reset and the stale worker is still refused. In the checkpoint the
+coordinator writes this account's evidence as `account_hold`/`document_restrictions` and every OTHER
+verified account's as `retained_restrictions` (`connector_state.restriction_sections`), built from the
+acknowledged evidence merged with the local journal, so publication only adds or extends. Every run
+adopts the brain's evidence for its OWN verified account (`_adopt_remote_restriction_evidence`) before
+its first Drive call — another account neither inherits nor erases it. A deselected document's
+restriction is retained but is not backlog; reselecting it cannot read early. Admission
+(`_standing_document_restrictions`) precedes every direct read: pending selection
+(`list_pending(restricted=…)` — neither read, pushed nor acknowledged, no batch slot — EXCEPT a verified
+`remove`, which needs no read and still reaches the claim-aware removal owner; a removal that would
+need a probe of the restricted document is retained, never probed early, and no claim is honoured
+without the provider's answer: `_cross_stream_removal(restricted=…)`, R51 blind-final 1), initial root
+binding, relocation re-reads, start-token capture, baseline and controlled-rescan root reads, and the
+identity read. **A restricted selected root does not freeze recovery (R50 F4)**: a baseline or rescan
+that cannot read it — restricted, or answered by a non-quota deferral — marks it a durable DEFERRED
+obligation (`StateStore.mark_root_deferred`: `uncertain` with detail prefix `ROOT_DEFERRED_PREFIX`) and
+commits its page (or closes its folder traversal) carrying only the membership the stream's PUBLISHED
+snapshot already proved through it (`StateStore.retained_root_membership` — none on fresh local state,
+so nothing is invented). The stream publishes and independent documents keep their discovery and change
+processing, while the `uncertain` root keeps the connection partial and no complete snapshot infers
+absence; a change page cannot settle it (`settle_root(enumerated=False)` refuses), only an enumeration
+that lists it again (`enumerated=True`). **A deferred root's retained membership is admission
+evidence, not scope loss (R51 F1)**: its snapshot carries no traversal for it, so a nested document's
+parent is unknown to the change-page classifier. A previously selected document whose only claim
+toward "out of scope" is that unknown ancestry under a deferred root (`StateStore.deferred_roots` ∩
+`membership_roots`) is HELD — no remove obligation, no membership drop, no rescan for it, reported
+`deferred_root_document_held` — even if the root's metadata now reads present, because a metadata read
+is not subtree enumeration. Explicit tombstones, verified root loss, relocation, overlapping claims and
+the restriction gate are unchanged; nothing is upserted from retained evidence, so scope never widens.
+**Recovery is bounded (R51 F4)**: before a deferred root alone starts a whole-stream controlled rescan,
+`_deferred_root_admissible` makes ONE root-local metadata probe per root per run (the coordinator's
+`deferred_root_probes` set) through the existing provider gate and deadline — never for a root under a
+standing minimum. A quota answer is the account's hold; a local budget stop ends probing; any other
+deferral keeps the root deferred (recording a newly named minimum) while the stream's independent
+changes drain WITHOUT relisting healthy siblings; an answer that locates the root only authorizes the
+normal controlled rescan, which settles it and re-derives membership, so a removal that arrived
+meanwhile is applied only through that verified path. On the change-page path (`absence_withheld`) a
+restricted root is held without a read, and a non-quota named deferral there is recorded as that root's
+restriction. Attempts and exhaustion stay on the observation: **Run now / Retry (`rearm_exhausted`)
+resets the attempt budget AND the local exponential backoff of EXHAUSTED work (R50 F2)**; work that is
+not exhausted keeps its backoff. Provenance is explicit on
+`pending_work`: `minimum_not_before` holds the external minimum (a provider-NAMED deadline or a
+brain-named checkpoint-deferral minimum, merged monotonically by `fail_work(minimum=…)`) — a timeout's
+or a malformed Retry-After's bounded fallback still delays the attempt but is local backoff
+(`_fail_work(external=False)`, R51 F5) — and `deadline_tracked` marks rows whose
+`not_before` composition is known; rearm sets `not_before` to `minimum_not_before` (often NULL) on
+tracked rows and leaves an untracked legacy row's combined deadline intact, since it cannot tell backoff
+from a provider minimum. Restrictions are a separate owner and are never waived by rearm. An
+unrepresentable restriction is classified as such and never lapses — the year-9999 sentinel is not an
+ordinary expiring instant. A per-document 503 is never an account hold. A restricted owed document
+keeps the stream partial (`provider_restricted_document`), so exhaustion is never completion. A
+deferred cross-stream removal probe (`_document_loss_verified`) is RAISED, never answered: a quota
+answer is the account's hold, a named wait is that document's restriction (`_defer_document_read`, the
+same owner as a content read), the run's own deadline only stops — and the removal stays owed and
+unacknowledged (R51 blind-final 2). A standing service-account identity prerequisite still flushes its
+local evidence once before returning (R51 blind-final 4).
+Diagnostics (R50 F7): a root verified unavailable is counted once per run however many phases or
+streams observed it (`_note_root_unavailable`, merged by `_merge_summary`). Standing local evidence the
+brain has not acknowledged is compared PER OWNER (`_restriction_outstanding`, R51 F3) and reported once
+per run each (`_note_unpublished`): account holds as `account_hold_unpublished`, resource restrictions as
+`document_restriction_unpublished`. A root's provider-named minimum is written to the local journal the
+moment it is read (`observe=` on `_bind_selected_roots`/`_reobserve_stalled_relocations`, R51 F2), so a
+later quota answer, BrainError or local budget stop in the same binding cannot drop it. Every orderly
+coordinator return — the account hold, a local stop, an early BrainError (never masking it, never
+publishing under a terminal authority refusal), the no-streams path, the standing-hold early return
+after a fresh acquisition (no provider call), and the normal end of run (which also repairs a
+drain-phase hold whose checkpoint failed, keeping that checkpoint's error category) — calls
+`_flush_restriction_evidence`: one publication of the restriction sections from the latest acknowledged
+document, never a loop, and nothing at all under the BrainClient uncertainty latch
+(`gdrive_progress_uncertain`). Local stops keep their own category (`dispatch_deadline` vs
+`run_deadline`, R51 F7) on the start-token and drain paths.
+Durability boundary: a restriction is remote-durable only once a checkpoint carrying it is
+acknowledged; until then it lives in local SQLite (an uncertain checkpoint ends the run per R47 F3), and
+losing both that file and the unpublished restriction is an explicit limitation. No Admin override exists.
 `webhook_channels` is a projection of `watches` (state column; only `active` rows validate
 notifications), rebuilt from the brain at every sweep. The unfenced synchronous `renew()` path and the
 settings-less renewal job are removed: `_renewal_job` requires brain settings and the managers expose
@@ -1211,14 +1348,30 @@ Immediately before every new Drive/Docs request, pagination step, retry, or watc
 renews and revalidates the current server authority. A failed check is run-terminal and remains
 outside provider-read recovery catches. Watch renewal first acquires current authority and derives
 its exact account/drive/generation namespace and cursor from server progress; stale SQLite channels
-can overlap for notification delivery but can never choose a renewal cursor.
+can overlap for notification delivery but can never choose a renewal cursor. Once the account is
+verified it adopts that account's acknowledged minimums (`_adopt_remote_restriction_evidence`) and,
+while its account hold stands — local or acknowledged, from any generation of the same account, never
+another credential's — it makes no watch creation or cleanup call; record recovery (no provider call)
+still runs, and channels, evidence and cursors are left as they are (R51 blind-final 3).
 Shared Drive watches carry the authoritative cursor and `driveId` together through both watch-manager
 layers; My Drive deliberately omits `driveId`. Execution quotas isolate provider checks, lifecycle,
 progress and release. Progress permits the 100/min ingestion envelope and uses revision-conditional,
 idempotent checkpoints; the client honors `Retry-After` within a fixed deadline, while cleanup
-release retains independent capacity. Admin connection tests use the same generation policy, bound
+release retains independent capacity. The client (`BrainClient`) is the one owner of each execution's
+progress revision, and of its UNCERTAINTY (AIO-1167 R47 F3): a checkpoint that was sent but never
+acknowledged (lost response, exhausted 5xx, a deferral after a send, `stale_progress`) latches the
+execution, the identical payload having first been retried within the bound; no further checkpoint is
+sent under it, and the coordinator ends the run partial (`checkpoint_unacknowledged`). Post-push
+checkpoint failures are control-plane by STAGE and never charge the accepted document; the next
+acquisition restores the brain's authoritative progress and the owed work replays idempotently.
+Admin connection tests use the same generation policy, bound
 also to credential revision and the initiating active Admin, with revalidation after refresh, before
-every selected-root call, and immediately before success. Preview is explicitly batched at 100 roots
+every selected-root call, and immediately before success. The connection test, Picker verification and
+manual-root verification all refresh through ONE owner, `refreshGdriveAdminAccess`
+(`lib/integrations/gdrive-authority`), held to the broker's grant policy (R47 F6): the stored ceiling
+(`storedGrantCeiling`) decided before the token exchange, the returned grant judged by
+`evaluateGdriveGrant` with the broker's omitted-scope fallback, before any Drive read — so a preview
+never reports healthy what execution will refuse. Preview is explicitly batched at 100 roots
 and returns checked/total/continuation rather than silently declaring an unchecked tail healthy.
 Admin Run now/retry writes a durable `gdrive_run_requests` row; the bound sidecar claims it and invokes
 the same coordinator as polling/watch work. Scheduled/manual/retry outcomes share this reporting
@@ -1270,14 +1423,25 @@ a replay that changes only the e-mail or the timestamp spelling updates that row
 permission identities (or exact verified email fallback) produce source-time UTC person/day Timeline
 evidence with the provider role rendered visibly. OAuth account subjects use the separate
 `subject:<sub>` namespace and are never treated as Drive permission IDs; author addresses retained
-without a permission id use `author-email:<address>`. Opaque Google ids are case-sensitive. Drive
+without a permission id use `author-email:<address>`. Opaque Google ids are case-sensitive; the
+`author-email:` namespace alone is canonical — trimmed and lowercased by `canonicalIdentityId`
+(`lib/identity/member-identities`) at the writer and the Admin link action, so a manual link resolves
+the connector's lowercased evidence; a differently spelled legacy row is refused, never merged
+(AIO-1167 R47 F8). Drive
 ownership and connector/service-account transport identity are retained as provenance/diagnostics,
 not promoted to human authorship.
 
 When an OAuth account email is VERIFIED by Google (`email_verified` literally `true`, carried by the
 callback and enforced again by the publisher) and is an exact, unambiguous match to an active roster
 identity, callback publication atomically records both its `subject:<sub>` transport identity and an
-`author-email:<address>` attribution bridge. A false/missing claim or no email creates NEITHER mapping,
+`author-email:<address>` attribution bridge — each checked on its own: one the Admin deliberately
+UNLINKED stays unlinked (no row, revision, repair or identity-authority change; `respectTombstone`),
+because reconnecting is credential authority, not a relink (AIO-1167 R47 F1). An INCONSISTENT tombstone —
+one whose identity row now names a different owner — is detected before that early return
+(`linkMemberIdentity` reports `conflict`; R50 F5), so automatic publication raises
+`GoogleIdentityConflictError` and rolls back everything (credential, both mappings, revision) instead of
+reporting the identity skipped; an ordinary tombstone still publishes without relinking. An explicit,
+revision-fenced Admin relink remains the way back. A false/missing claim or no email creates NEITHER mapping,
 no revision and no repair obligation (R41): the credential is stored by subject, the address is kept
 only as untrusted account metadata (`integrations.config.authenticatedAccountEmailVerified: false`,
 never `member_identities.email`), existing deliberate links are untouched, and attribution stays

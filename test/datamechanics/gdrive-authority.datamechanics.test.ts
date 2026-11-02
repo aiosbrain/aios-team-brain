@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { NextRequest } from "next/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -8,6 +10,7 @@ import { POST as itemsPOST } from "@/app/api/v1/items/route";
 import { GET as runsGET, POST as runsPOST } from "@/app/api/v1/integrations/gdrive/runs/route";
 import { GET as oauthCallbackGET } from "@/app/api/auth/gdrive/callback/route";
 import { issueApiKey, revokeApiKey } from "@/lib/admin/keys";
+import { getPool } from "@/lib/db/pg/pool";
 import { createGoogleDriveOAuthState, GDRIVE_OAUTH_BINDING_COOKIE } from "@/lib/auth/gdrive-oauth-state";
 import { getIntegrationWithSecret, upsertIntegration, setIntegrationSecret, setIntegrationStatus } from "@/lib/integrations/manage";
 import {
@@ -16,6 +19,7 @@ import {
   provisionGdriveConnectorPrincipal,
 } from "@/lib/integrations/gdrive-authority";
 import { getPipelineHealth } from "@/lib/ingest/pipeline-health";
+import { setMemberIdentity } from "@/lib/identity/member-identities";
 import { approvedAudienceProject, db, placeMemberByTier, seedTeam, sha, type Seed } from "./helpers";
 
 const GOOGLE_SECRET = JSON.stringify({
@@ -768,6 +772,53 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
     expect(provider).toHaveBeenCalledTimes(3);
   });
 
+  it("an OAuth account another member already holds is a VISIBLE refusal; nothing is published or remapped (R47 F2)", async () => {
+    const seed = await seedTeam();
+    await db().from("members").update({ role: "admin" }).eq("id", seed.memberId).eq("team_id", seed.teamId);
+    const { data: bobRow } = await db().from("members").insert({
+      team_id: seed.teamId, email: `bob-${randomUUID().slice(0, 6)}@example.com`, display_name: "Bob",
+      actor_handle: `bob-${randomUUID().slice(0, 6)}`, role: "member", tier: "team", status: "active",
+    }).select("id").single();
+    const bob = (bobRow as { id: string }).id;
+    await setMemberIdentity(db(), seed.teamId, bob, { provider: "gdrive", externalId: "subject:held-subject" });
+    // The callback links identities only for the initiating Admin's OWN verified account.
+    const { data: adminRow } = await db().from("members").select("email")
+      .eq("id", seed.memberId).eq("team_id", seed.teamId).single();
+    const adminEmail = (adminRow as { email: string }).email;
+    process.env.AUTH_SECRET = "aio-1167-data-mechanics-auth-secret";
+    process.env.GOOGLE_DRIVE_CLIENT_ID = "oauth-client";
+    process.env.GOOGLE_DRIVE_CLIENT_SECRET = "oauth-secret";
+    process.env.GOOGLE_DRIVE_OAUTH_REDIRECT = "http://test/api/auth/gdrive/callback";
+    const state = await createGoogleDriveOAuthState(db(), {
+      teamId: seed.teamId, memberId: seed.memberId, integrationName: "conflict-docs", teamSlug: seed.teamSlug,
+      mode: "files", browserBinding: startedBy(seed),
+    });
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        access_token: "callback-access", refresh_token: "callback-refresh", expires_in: 3600,
+        scope: "https://www.googleapis.com/auth/drive.file",
+      }), { status: 200, headers: { "content-type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ sub: "held-subject", email: adminEmail, email_verified: true, name: "Admin" }), {
+        status: 200, headers: { "content-type": "application/json" },
+      }));
+
+    const callback = await oauthCallbackGET(new NextRequest(
+      `http://test/api/auth/gdrive/callback?state=${encodeURIComponent(state)}&code=one-time-code`,
+      INITIATING_BROWSER,
+    ));
+
+    expect(callback.status).toBe(409);
+    const page = await callback.text();
+    expect(page).toContain("Google identity needs review");
+    expect(page).toContain("Admin → Members");
+    expect(page).not.toContain("callback-refresh");
+    expect(await getIntegrationWithSecret(db(), seed.teamId, "gdrive", "conflict-docs")).toBeNull();
+    const { rows } = await getPool().query(
+      "select member_id from member_identities where team_id=$1 and provider='gdrive' and external_id='subject:held-subject'",
+      [seed.teamId]);
+    expect(rows).toEqual([{ member_id: bob }]);
+  });
+
   it("atomically links an exact verified OAuth account in subject and author-email namespaces", async () => {
     const seed = await seedTeam();
     await db().from("members").update({ role: "admin" }).eq("id", seed.memberId).eq("team_id", seed.teamId);
@@ -1227,6 +1278,130 @@ describe("AIO-1167 Drive principal, broker, generation, and fence (real Postgres
       };
     expect(Number(afterAccount.generation)).toBe(Number(afterSelection.generation) + 1);
     expect(afterAccount.progress).toEqual({});
+  });
+
+  it("R50: a scope or credential transition keeps provider-minimum evidence, resets everything else, and still refuses the stale worker", async () => {
+    const seed = await seedTeam();
+    const integrationId = await integration(seed, "restriction-lifetime", ["A"]);
+    const trusted = await provision(seed, integrationId);
+    const active = await acquire(trusted.key, seed, integrationId);
+    const LONG = "2029-12-01T00:00:00+00:00";
+    const SENTINEL = "9999-12-31T23:59:59.999999+00:00";
+    const restrictionSections = {
+      account_hold: { generation: active.body.generation, credential: "acct-a", not_before: LONG, category: "rate_limited" },
+      document_restrictions: {
+        generation: active.body.generation, credential: "acct-a",
+        items: [
+          { id: "doc-long", not_before: LONG, category: "provider_unavailable", unrepresentable: false },
+          { id: "doc-sentinel", not_before: SENTINEL, category: "provider_unavailable", unrepresentable: true },
+        ],
+      },
+      retained_restrictions: {
+        "acct-b": { items: [{ id: "doc-b", not_before: LONG, category: "provider_unavailable", unrepresentable: false }] },
+      },
+    };
+    const checkpoint = await executionPOST(request(
+      "http://test/api/v1/integrations/gdrive/execution", trusted.key, seed.teamSlug,
+      {
+        action: "checkpoint", integration_id: integrationId,
+        generation: active.body.generation, fence: active.body.fence, owner: active.owner,
+        progress_revision: active.body.progress_revision,
+        progress: {
+          version: 2, phase: "current", page_token: "generation-bound-cursor",
+          streams: { "my-drive": { phase: "current", page_token: "generation-bound-cursor" } },
+          roots: { generation: active.body.generation, items: [] },
+          watches: { "my-drive": { state: "active" } },
+          ...restrictionSections,
+        },
+      },
+    ));
+    expect(checkpoint.status).toBe(200);
+    const committed = await checkpoint.json();
+
+    const authority = async () => (await db().from("gdrive_connection_authority")
+      .select("generation,progress,progress_revision").eq("integration_id", integrationId).single()).data as {
+        generation: string | number; progress: Record<string, unknown>; progress_revision: string | number;
+      };
+
+    // A selection change (an added root): a new generation; streams, cursor, roots and watches reset;
+    // exactly the three restriction sections kept — long and unrepresentable minimums, both accounts.
+    await upsertIntegration(db(), { teamId: seed.teamId, memberId: seed.memberId }, {
+      type: "gdrive", name: "restriction-lifetime", status: "enabled",
+      config: { ...active.body.config, fileIds: ["A", "B"] },
+    });
+    const afterScope = await authority();
+    expect(Number(afterScope.generation)).toBe(Number(active.body.generation) + 1);
+    expect(Number(afterScope.progress_revision)).toBe(Number(committed.progress_revision) + 1);
+    expect(afterScope.progress).toEqual(restrictionSections);
+
+    // An emptied selection, then a reselection: still kept.
+    await upsertIntegration(db(), { teamId: seed.teamId, memberId: seed.memberId }, {
+      type: "gdrive", name: "restriction-lifetime", status: "enabled",
+      config: { ...active.body.config, fileIds: [], selectionState: "empty" },
+    });
+    await upsertIntegration(db(), { teamId: seed.teamId, memberId: seed.memberId }, {
+      type: "gdrive", name: "restriction-lifetime", status: "enabled",
+      config: { ...active.body.config, fileIds: ["A"] },
+    });
+    const afterReselect = await authority();
+    expect(Number(afterReselect.generation)).toBe(Number(afterScope.generation) + 2);
+    expect(afterReselect.progress).toEqual(restrictionSections);
+
+    // A credential replacement (a reconnect): still kept — applicability is the sidecar's, by account.
+    const { data: row } = await db().from("integrations").select("id")
+      .eq("team_id", seed.teamId).eq("name", "restriction-lifetime").single();
+    await setIntegrationSecret(db(), { teamId: seed.teamId, memberId: seed.memberId },
+      (row as { id: string }).id, GOOGLE_SECRET.replace("never-return-refresh", "reconnected-refresh"));
+    const afterReconnect = await authority();
+    expect(Number(afterReconnect.generation)).toBe(Number(afterReselect.generation) + 1);
+    expect(afterReconnect.progress).toEqual(restrictionSections);
+
+    // A pause/resume is not a transition: progress is untouched.
+    await setIntegrationStatus(db(), { teamId: seed.teamId, memberId: seed.memberId }, integrationId, "disabled");
+    await setIntegrationStatus(db(), { teamId: seed.teamId, memberId: seed.memberId }, integrationId, "enabled");
+    expect((await authority()).progress).toEqual(restrictionSections);
+
+    // The stale worker of the first generation can no longer publish anything.
+    const stale = await executionPOST(request(
+      "http://test/api/v1/integrations/gdrive/execution", trusted.key, seed.teamSlug,
+      {
+        action: "checkpoint", integration_id: integrationId,
+        generation: active.body.generation, fence: active.body.fence, owner: active.owner,
+        progress_revision: Number(afterReconnect.progress_revision), progress: { version: 2, phase: "current" },
+      },
+    ));
+    expect(stale.status).toBe(409);
+    expect((await authority()).progress).toEqual(restrictionSections);
+
+    // The current worker acquires the retained evidence.
+    const current = await acquire(trusted.key, seed, integrationId, randomUUID());
+    expect(current.response.status).toBe(200);
+    expect(Number(current.body.generation)).toBe(Number(afterReconnect.generation));
+    expect(current.body.progress).toEqual(restrictionSections);
+  });
+
+  it("R50: the restriction-lifetime migration replays safely and its helper keeps only the three sections", async () => {
+    const migration = readFileSync(
+      join(process.cwd(), "postgres/migrations/20261031140000_gdrive_restriction_generation_lifetime.sql"), "utf8",
+    );
+    await getPool().query(migration);
+    await getPool().query(migration); // replay-safe: create-or-replace only
+    const { rows } = await getPool().query<{ kept: Record<string, unknown>; scalar: Record<string, unknown>; none: Record<string, unknown> }>(
+      `select gdrive_retained_restriction_progress($1::jsonb) as kept,
+              gdrive_retained_restriction_progress('"scalar"'::jsonb) as scalar,
+              gdrive_retained_restriction_progress(null) as none`,
+      [JSON.stringify({
+        streams: { x: { page_token: "t" } }, roots: { generation: 1, items: [] }, watches: {},
+        account_hold: { credential: "a", not_before: "2029-01-01T00:00:00+00:00", category: "rate_limited" },
+        retained_restrictions: { b: { items: [] } },
+      })],
+    );
+    expect(rows[0].kept).toEqual({
+      account_hold: { credential: "a", not_before: "2029-01-01T00:00:00+00:00", category: "rate_limited" },
+      retained_restrictions: { b: { items: [] } },
+    });
+    expect(rows[0].scalar).toEqual({});
+    expect(rows[0].none).toEqual({});
   });
 
   it("allows 100/min progress, isolates release capacity, and makes checkpoint replay monotonic", async () => {

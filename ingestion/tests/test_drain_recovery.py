@@ -237,7 +237,7 @@ async def test_budget_expiry_between_metadata_and_docs_is_local_and_untouched(wo
     await _drain(state, namespace, source, summary)
 
     assert source.calls == [("metadata", "doc"), ("docs", "doc")]  # no further provider call
-    assert summary.failed == 0 and summary.failure_categories == {"run_deadline": 1}
+    assert summary.failed == 0 and summary.failure_categories == {"dispatch_deadline": 1}
     assert _row(state, namespace)["attempts"] == 0 and _row(state, namespace)["not_before"] is None
     assert state.pending_count(namespace, 2) == 2
 

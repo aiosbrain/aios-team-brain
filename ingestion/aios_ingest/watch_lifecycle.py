@@ -88,6 +88,20 @@ class WatchRefused(RuntimeError):
         self.status = status
 
 
+class WatchQuotaLimited(RuntimeError):
+    """The provider answered a watch creation or stop with an ACCOUNT quota response — 429, or a 403
+    naming a quota reason — classified exactly as a polling provider call is (AIO-1167 R51 final 3).
+
+    ``deferral`` is the polling owner's ``ProviderDeferred`` for that answer: its ``not_before`` is the
+    parsed Retry-After deadline unshortened (or the bounded fallback / last-instant sentinel, with its
+    diagnostic). For a creation it is also a definitive refusal — nothing was created — but the
+    attempt's retirement is not the whole outcome: the account is held."""
+
+    def __init__(self, deferral: Any):
+        super().__init__(str(deferral))
+        self.deferral = deferral
+
+
 class InvalidWatchResponse(ValueError):
     """A creation response that does not name exactly the channel this attempt asked for.
 

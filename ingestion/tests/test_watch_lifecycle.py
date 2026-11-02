@@ -32,7 +32,7 @@ from aios_ingest.connector_state import coordinator_document, renewal_document
 from aios_ingest.state import Channel, StateStore, StreamKey, verification_hash
 from aios_ingest.watch_lifecycle import (
     ACTIVE, CLEANUP_PENDING, DISPATCHED, EXPIRED, PREPARED, RETIRED, UNCERTAIN,
-    InvalidWatchResponse, InvalidWatchTransition, WatchNotDispatched, WatchRecord, WatchRefused,
+    InvalidWatchResponse, InvalidWatchTransition, WatchNotDispatched, WatchQuotaLimited, WatchRecord, WatchRefused,
     from_section, to_section, transition, validate_watch_response,
 )
 from aios_ingest import watch_renewal
@@ -711,10 +711,20 @@ def test_dispatch_classifies_not_sent_refused_and_unknown_outcomes():
         manager.dispatch(record, page_token="c", verification_token="t")
     assert isinstance(not_sent.value.__cause__, BrainError) and seen["executions"] == []
 
-    for status in (400, 403, 404, 429):
+    for status in (400, 403, 404):
         manager, _ = _manager_with(_HttpError(status))
         with pytest.raises(WatchRefused):
             manager.dispatch(record, page_token="c", verification_token="t")
+    # A 429 is a definitive refusal AND the account's quota (AIO-1167 R51 final 3): it carries the
+    # polling owner's rate-limited deferral so the shared restriction owner can hold the account.
+    # (No Retry-After here, so the bounded fallback; parsing is covered by test_watch_quota_hold.py.)
+    manager, seen = _manager_with(_HttpError(429))
+    with pytest.raises(WatchQuotaLimited) as quota:
+        manager.dispatch(record, page_token="c", verification_token="t")
+    assert quota.value.deferral.category == "rate_limited"
+    assert quota.value.deferral.not_before is not None
+    assert quota.value.deferral.provider_deadline is False
+    assert seen["executions"] == [("watch", 0)]  # one attempt, never a blind retry
     for failure in (_HttpError(500), _HttpError(408), TimeoutError("lost")):
         manager, seen = _manager_with(failure)
         with pytest.raises(type(failure)):

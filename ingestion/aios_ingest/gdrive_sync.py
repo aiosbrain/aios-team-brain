@@ -8,6 +8,7 @@ state only. Notifications, manual runs and periodic polling converge here.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 import json
@@ -17,14 +18,17 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from pydantic import ValidationError
 
 from .brain_client import BrainClient, BrainDeferred, BrainError, GdriveExecution
 from .config import BrainSettings, Connection
-from .connector_state import ROOTS_KEY, coordinator_document, parse_roots_section, roots_section
+from .connector_state import (
+    ROOTS_KEY, add_hold, add_resource, apply_restriction_sections, coordinator_document,
+    parse_restriction_evidence, parse_roots_section, restriction_sections, roots_section,
+)
 from .engine import IngestSummary
 from .normalize import normalize
 from .sources.gdrive import (
@@ -107,30 +111,47 @@ def _backoff_seconds(attempts_so_far: int, rng: Any = None) -> float:
 
 def _fail_work(
     state: StateStore, work: PendingWork, detail: str, *, retry_after: str | None = None,
+    external: bool = True, minimum: str | None = None,
 ) -> bool:
     """Record one failed attempt of ``work``; returns whether its automatic retries are exhausted.
 
     The next attempt is no earlier than the attempt-aware backoff and no earlier than a wait the
     provider or brain named (``retry_after``) — the later of the two, so Retry-After is always
-    honoured.
+    honoured. ``external`` says whether that wait is an EXTERNAL minimum (provider-named or
+    brain-named) recorded apart from the backoff; a local fallback (``external=False``, R51 F5)
+    delays the attempt the same way but is backoff a rearm may drop. When ``retry_after`` combines
+    a named minimum with local fallback (a ``BrainDeferred``), ``minimum`` carries the named part
+    alone and is the only part recorded as external (R51 L2); a valid zero is still a minimum.
 
     Backoff and exhaustion count FAILURES as persisted (``StateStore.work_failures``), not the
     obligation's ``attempts``: a document withheld behind another stream's drain is re-attempted each
     run without failing, and that waiting must not spend its retry budget."""
     from datetime import timedelta
 
+    def instant(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
     failures = state.work_failures(work)
     not_before = datetime.now(timezone.utc) + timedelta(seconds=_backoff_seconds(failures))
-    if retry_after:
-        try:
-            named = datetime.fromisoformat(retry_after.replace("Z", "+00:00"))
-            if named.tzinfo is None:
-                named = named.replace(tzinfo=timezone.utc)
-            not_before = max(not_before, named)
-        except ValueError:
-            pass
+    recorded: datetime | None = None
+    for value, is_external in ((retry_after, external), (minimum, True)):
+        named = instant(value)
+        if named is None:
+            continue
+        not_before = max(not_before, named)
+        if is_external:
+            recorded = named if recorded is None else max(recorded, named)
+    minimum = recorded.isoformat() if recorded is not None else None
     exhausted = failures + 1 >= _MAX_AUTOMATIC_ATTEMPTS
-    state.fail_work(work, detail, not_before=not_before.isoformat(), exhaust=exhausted)
+    # The named wait is recorded apart from the local backoff (R50 F2): an explicit Admin rearm
+    # drops the backoff, never the external minimum.
+    state.fail_work(work, detail, not_before=not_before.isoformat(), exhaust=exhausted, minimum=minimum)
     return exhausted
 
 
@@ -143,11 +164,33 @@ class _ProviderAdmissionClosed(Exception):
     per-stream ``provider_read`` (R45 H1). ``partial`` carries the counts the interrupted stream had
     already completed, so the work done before the limit is still reported."""
 
-    def __init__(self, not_before: str, category: str):
+    def __init__(self, not_before: str, category: str, diagnostic: str | None = None):
         super().__init__(category)
         self.not_before = not_before
         self.category = category
+        self.diagnostic = diagnostic
         self.partial: IngestSummary | None = None
+
+
+class _AcknowledgmentUncertain(Exception):
+    """A checkpoint may have committed on the brain without its acknowledgment arriving, or the
+    brain's revision is not the one this run holds (AIO-1167 R47 F3). A CONTROL signal: the run's
+    progress revision is unknown, so no further changed checkpoint is sent and the run ends partial;
+    the next acquisition restores the brain's authoritative progress, and the owed work — never
+    acknowledged here — replays idempotently. Never a document failure. ``partial`` carries the
+    counts completed before it, as ``_ProviderAdmissionClosed`` does."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+        self.partial: IngestSummary | None = None
+
+
+def _progress_uncertain(client: BrainClient, execution: GdriveExecution) -> bool:
+    """Whether the client latched this execution's revision as unknown (R47 F3). A brain double
+    without the latch has none to report."""
+    probe = getattr(client, "gdrive_progress_uncertain", None)
+    return bool(probe(execution)) if callable(probe) else False
 
 
 # Provider deferrals caused by this run's own budget, never by Google (U5 pre-dispatch; R45 M6 late
@@ -157,7 +200,306 @@ _LOCAL_DEADLINE_CATEGORIES = frozenset({"dispatch_deadline", "run_deadline"})
 
 def _account_hold(exc: ProviderDeferred) -> _ProviderAdmissionClosed:
     """The account-wide hold a provider rate limit opens (C6), from wherever it was read."""
-    return _ProviderAdmissionClosed(exc.not_before or _defer_until(), exc.category)
+    return _ProviderAdmissionClosed(
+        exc.not_before or _defer_until(), exc.category, getattr(exc, "diagnostic", None),
+    )
+
+
+def _count_retry_after_diagnostic(summary: IngestSummary, exc: object) -> None:
+    """Report a defective provider Retry-After beside the deferral it caused (AIO-1167 R48 D2):
+    ``retry_after_malformed`` (ignored for the bounded fallback) or ``retry_after_unrepresentable``
+    (held at the last representable instant)."""
+    diagnostic = getattr(exc, "diagnostic", None)
+    if diagnostic:
+        summary.failure_categories[diagnostic] = summary.failure_categories.get(diagnostic, 0) + 1
+
+
+def _standing_account_hold(
+    state: StateStore, integration_id: str, generation: int, credential: str,
+) -> dict[str, Any] | None:
+    """The account hold in force now, as the document it is published as; ``None`` once it passed."""
+    hold = state.connection_hold(integration_id, generation, credential)
+    if hold is None or not _retry_deferred(hold[0]):
+        return None
+    return {"generation": generation, "credential": credential, "not_before": hold[0], "category": hold[1]}
+
+
+def _restriction_standing(not_before: str, unrepresentable: bool) -> bool:
+    """A provider minimum in force now. An unrepresentable one never lapses (fail closed)."""
+    return unrepresentable or _retry_deferred(not_before)
+
+
+def _standing_document_restrictions(
+    state: StateStore, integration_id: str, generation: int, credential: str,
+) -> dict[str, tuple[str, str, bool]]:
+    """The provider-named resource minimums in force for this verified account (R49 F1), from every
+    generation of it (R50): a new selection generation never waives one."""
+    return {
+        provider_id: held
+        for provider_id, held in state.document_restrictions(integration_id, generation, credential).items()
+        if _restriction_standing(held[0], held[2])
+    }
+
+
+# Operation-scoped resource keys in the same restriction owner (AIO-1167 R50 F3). A provider answer
+# for a stream's start token or for the service-account identity prerequisite governs THAT operation,
+# not the account: it is recorded as a resource restriction under a key no Drive file id can take.
+_START_TOKEN_RESOURCE = "start-token:"
+_IDENTITY_PREREQUISITE_RESOURCE = "prerequisite:service-account-identity"
+
+
+def _restriction_evidence(
+    state: StateStore, execution: GdriveExecution, *, local: bool = True,
+) -> dict[str, dict[str, Any]]:
+    """Every provider minimum known for this connection: the brain's acknowledged evidence for
+    every verified account, merged with this sidecar's local journal (``local``), monotonically."""
+    evidence = parse_restriction_evidence(execution.progress)
+    if local:
+        for account in state.restriction_credentials(execution.integration_id):
+            add_hold(evidence, account, state.connection_hold(
+                execution.integration_id, execution.generation, account,
+            ))
+            for provider_id, held in state.document_restrictions(
+                execution.integration_id, execution.generation, account,
+            ).items():
+                add_resource(evidence, account, provider_id, held)
+    return evidence
+
+
+def _restriction_sections(
+    state: StateStore, execution: GdriveExecution, credential: str,
+) -> dict[str, Any]:
+    """The three restriction sections a checkpoint of ``credential``'s worker publishes (R50).
+
+    Built from the acknowledged evidence AND the local journal, so publication can only add or extend
+    a standing minimum: another account's evidence is carried forward in ``retained_restrictions``,
+    and nothing standing is dropped merely because this worker did not adopt it. Lapsed minimums are
+    not republished; an unrepresentable one never lapses."""
+    return restriction_sections(
+        _restriction_evidence(state, execution), credential=credential,
+        generation=int(execution.generation), standing=_restriction_standing,
+    )
+
+
+# The two restriction owners and the truthful diagnostic each reports while its standing local
+# evidence is not acknowledged by the brain (R50 F7, R51 F3).
+_HOLD_UNPUBLISHED = "account_hold_unpublished"
+_RESOURCE_UNPUBLISHED = "document_restriction_unpublished"
+
+
+def _standing_resources(evidence: dict[str, dict[str, Any]]) -> dict[tuple[str, str], Any]:
+    return {
+        (account, provider_id): held
+        for account, entry in evidence.items()
+        for provider_id, held in (entry.get("resources") or {}).items()
+        if held is not None and _restriction_standing(held[0], held[2])
+    }
+
+
+def _standing_holds(evidence: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    return {
+        account: entry["hold"]
+        for account, entry in evidence.items()
+        if entry.get("hold") is not None and _retry_deferred(entry["hold"][0])
+    }
+
+
+def _restriction_outstanding(state: StateStore, execution: GdriveExecution) -> set[str]:
+    """Which owners hold a standing local minimum — newly learned or extended — that the brain has
+    not acknowledged: account holds (``account_hold_unpublished``) and resource restrictions
+    (``document_restriction_unpublished``), compared separately (R50 F7, R51 F3)."""
+    local = _restriction_evidence(state, execution)
+    acknowledged = _restriction_evidence(state, execution, local=False)
+    outstanding: set[str] = set()
+    if _standing_holds(local) != _standing_holds(acknowledged):
+        outstanding.add(_HOLD_UNPUBLISHED)
+    if _standing_resources(local) != _standing_resources(acknowledged):
+        outstanding.add(_RESOURCE_UNPUBLISHED)
+    return outstanding
+
+
+def _note_unpublished(summary: IngestSummary, categories: set[str]) -> None:
+    """Report each unpublished restriction owner ONCE per run (R51 F3), however many publications
+    were attempted or streams observed it; ``_merge_summary`` keeps the same dedupe."""
+    seen: set[str] = summary.__dict__.setdefault("_unpublished_restrictions", set())
+    seen.update(categories)
+    summary.failure_categories = summary.failure_categories or {}
+    for category in seen:
+        summary.failure_categories[category] = 1
+
+
+def _adopt_remote_restriction_evidence(
+    state: StateStore, execution: GdriveExecution, integration_id: str, generation: int, credential: str,
+) -> None:
+    """Restore the provider minimums the brain acknowledged for THIS verified account (R47 F5,
+    R49 F1) — from whatever generation they were observed in (R50) — before any provider read, so a
+    restart, a fresh state file, a scope edit or a same-account reconnect cannot read early. Another
+    account's evidence is not adopted (it is carried, untouched, by ``_restriction_sections``).
+    Monotonic; anything malformed is ignored, never guessed."""
+    account = parse_restriction_evidence(execution.progress).get(credential)
+    if not account:
+        return
+    hold = account.get("hold")
+    if hold is not None:
+        state.hold_connection(integration_id, generation, credential, hold[0], hold[1])
+    for provider_id, (not_before, category, unrepresentable) in (account.get("resources") or {}).items():
+        state.restrict_document(
+            integration_id, generation, credential, provider_id, not_before, category,
+            unrepresentable=unrepresentable,
+        )
+
+
+def _restrict_resource(
+    state: StateStore, execution: GdriveExecution, credential: str, resource: str, exc: ProviderDeferred,
+) -> bool:
+    """Record a provider-named minimum for ONE resource or operation (R49 F1, R50 F3), never the
+    account. Only a provider-named deadline (a valid or unrepresentable Retry-After) is recorded; a
+    malformed header's bounded fallback and a timeout stay attempt-local. Returns whether recorded."""
+    if not (getattr(exc, "provider_deadline", False) and exc.not_before and credential and resource):
+        return False
+    state.restrict_document(
+        execution.integration_id, execution.generation, credential, resource, exc.not_before, exc.category,
+        unrepresentable=getattr(exc, "diagnostic", None) == "retry_after_unrepresentable",
+    )
+    return True
+
+
+def _count(summary: IngestSummary, category: str, amount: int = 1) -> None:
+    summary.failure_categories = summary.failure_categories or {}
+    summary.failure_categories[category] = summary.failure_categories.get(category, 0) + amount
+
+
+def _note_root_unavailable(summary: IngestSummary, kind: str, root_id: str) -> None:
+    """Count a root whose OWN not-found was verified in this run — once per root per run (R50 F7),
+    however many phases or streams observed it; a retained historical detail is never counted."""
+    seen: set[tuple[str, str]] = summary.__dict__.setdefault("_verified_unavailable_roots", set())
+    seen.add((kind, root_id))
+    summary.failure_categories = summary.failure_categories or {}
+    summary.failure_categories["selection_root_unavailable"] = len(seen)
+
+
+async def _publish_restriction_evidence(
+    client: BrainClient, execution: GdriveExecution, state: StateStore, credential: str,
+    total: IngestSummary,
+) -> bool:
+    """Publish the restriction sections onto the LATEST acknowledged document, changing nothing
+    else, so no stream, root or watch the brain holds can regress. One attempt, never a loop.
+
+    A refused or lost publication keeps the local journal and says so — each outstanding owner once
+    (``_note_unpublished``) — and is never reported as remote-durable. Under the BrainClient
+    uncertainty latch nothing is sent at all: only a fresh acquisition restores the revision
+    (R47 F3). A terminal authority refusal is re-raised. Returns whether nothing is outstanding."""
+    outstanding = _restriction_outstanding(state, execution)
+    payload = copy.deepcopy(execution.progress)
+    apply_restriction_sections(payload, _restriction_sections(state, execution, credential))
+    if payload == execution.progress:
+        return True  # the acknowledged document already carries every section
+    if _progress_uncertain(client, execution):
+        _note_unpublished(total, outstanding or {_RESOURCE_UNPUBLISHED})
+        return False
+    try:
+        ack = await client.checkpoint_gdrive_execution(execution, payload) or {}
+    except BrainError as error:
+        if _is_terminal_authority(error):
+            raise
+        _note_unpublished(total, outstanding or {_RESOURCE_UNPUBLISHED})
+        return False
+    acknowledged = dict(ack.get("progress") or payload)
+    execution.progress.clear()
+    execution.progress.update(acknowledged)
+    return True
+
+
+async def _flush_restriction_evidence(
+    client: BrainClient, execution: GdriveExecution, state: StateStore, credential: str,
+    total: IngestSummary, *, cause: BaseException | None = None,
+    run_failure_counted: bool = False,
+) -> None:
+    """On an orderly early return, publish the minimums already observed this run (R51 F2) when
+    the execution's authority still permits it — never under a terminal authority refusal, never
+    through the uncertainty latch.
+
+    The run's accumulated outcome is NEVER replaced (R51 L1). A terminal authority refusal met
+    while publishing (``stale_execution``, ``connection_unavailable``, …) is reported as that
+    authority code — beside, never instead of, any ``cause`` that already ended the run — with
+    the applicable unpublished categories; the local journal keeps the evidence. Every caller
+    returns right after this, so nothing further is read or sent under the lost authority, and the
+    coordinator's ``finally`` still releases the lease. The exception's text is never reported.
+
+    Two separate inputs (R51 Note A, adjacent run-count correction): ``cause`` only decides whether
+    publication is attempted at all (a terminal cause suppresses it); ``run_failure_counted`` says
+    the coordinator ALREADY charged this run its one run-level failure (an early BrainError, an
+    unresolved selection, a failed reconciliation), so a refusal here adds its category but no
+    second charge. It is set only by those identified charges — never inferred from ``failed``,
+    from categories, or from document failures."""
+    outstanding = _restriction_outstanding(state, execution)
+    if not outstanding:
+        return
+    if isinstance(cause, BrainError) and _is_terminal_authority(cause):
+        _note_unpublished(total, outstanding)
+        return
+    try:
+        await _publish_restriction_evidence(client, execution, state, credential, total)
+    except BrainError as error:
+        # `_publish_restriction_evidence` lets only a terminal authority refusal escape. When the
+        # coordinator already charged this run, the authority code is reported beside that charge,
+        # never charged a second time (R51 Note A).
+        _note_unpublished(total, outstanding)
+        _note_flush_authority(total, error, charge=not run_failure_counted)
+
+
+def _note_flush_authority(total: IngestSummary, error: BrainError, *, charge: bool = True) -> None:
+    """Report a terminal authority refusal met at an orderly-return checkpoint as its code — once —
+    keeping every category, count and partial result the summary already holds (R51 L1).
+
+    ``charge`` says whether it is this run's one failed outcome, as an early authority refusal is.
+    It is ``False`` only when the coordinator already charged this run its run-level failure, so
+    one terminating run is never counted twice (R51 Note A); a document failure elsewhere in the run
+    is never taken to stand in for it. Status then follows the ordinary classification: a run that also
+    made progress or holds backlog is not reported as a bare failure, and a paused/disconnected
+    connection is still suppressed by the scheduler's re-read."""
+    total.failure_categories = total.failure_categories or {}
+    if error.code not in total.failure_categories:
+        total.failure_categories[error.code] = 1
+        if charge:
+            total.failed += 1
+
+
+async def _open_account_hold(
+    client: BrainClient,
+    execution: GdriveExecution,
+    state: StateStore,
+    integration_id: str,
+    credential: str,
+    exc: ProviderDeferred,
+    total: IngestSummary,
+    *,
+    run_failure_counted: bool = False,
+) -> None:
+    """A QUOTA answer read before any stream could carry it (AIO-1167 R47 F5; scoped by R50 F3):
+    root metadata, relocation re-reads, start-token capture, the service-account identity read.
+
+    Only a rate limit (429, or a 403 naming a quota reason) is the ACCOUNT's: it is held durably —
+    locally first, then published onto the acknowledged document unchanged but for the restriction
+    sections. A failed publication keeps the local hold and says so. A local budget stop is not a
+    provider wait and opens no hold, and neither does any other provider answer: its scope is the
+    resource or operation it was read for (``_restrict_resource``), never the account. Reported as a
+    held (partial) run, never a document failure or deletion evidence.
+
+    Either way the run returns here, so every minimum already observed this run — a root's 503
+    recorded before this answer (R51 F2) — is published with the hold, or flushed on its own for a
+    local stop; a quota answer adds the account hold and never replaces a resource minimum.
+    ``run_failure_counted`` is passed through to the flush unchanged (R51 Note A)."""
+    total.skipped += 1
+    _count(total, exc.category)
+    _count_retry_after_diagnostic(total, exc)
+    if exc.category == "rate_limited":
+        state.hold_connection(
+            integration_id, execution.generation, credential, exc.not_before or _defer_until(), exc.category,
+        )
+    await _flush_restriction_evidence(
+        client, execution, state, credential, total, run_failure_counted=run_failure_counted,
+    )
 
 
 def provider_source_options(options: dict[str, Any]) -> dict[str, Any]:
@@ -321,6 +663,106 @@ def _capture_start_token(source: GoogleDriveSource, drive: Any, drive_id: str) -
         raise StreamStartUnavailable(drive_id, status) from exc
 
 
+def _start_token_restricted(
+    state: StateStore, execution: GdriveExecution, options: dict[str, Any], drive_id: str,
+) -> bool:
+    """Whether this stream's start token is under a standing provider minimum (R50 F3 admission)."""
+    return f"{_START_TOKEN_RESOURCE}{drive_id}" in _standing_document_restrictions(
+        state, execution.integration_id, execution.generation, credential_identity(options),
+    )
+
+
+def _deferred_root_admissible(
+    state: StateStore, execution: GdriveExecution, options: dict[str, Any], generation: int,
+    drive_id: str,
+    *,
+    source: GoogleDriveSource | None = None,
+    probed: set[tuple[str, str]] | None = None,
+    diagnostics: IngestSummary | None = None,
+) -> bool:
+    """Whether a controlled rescan should start because a root this drive's enumeration deferred
+    (R50 F4) may be read again.
+
+    A root under a standing provider minimum is never read early: it cannot authorize a rescan. Any
+    other deferred root first gets a bounded ROOT-LOCAL probe (R51 F4) — one metadata read through
+    the existing provider gate, deadline and retry contract, at most once per root per run
+    (``probed``, owned by the coordinator) — so a root that keeps timing out does not relist its
+    healthy siblings on every poll:
+
+      * a quota answer is the account's hold (raised);
+      * the run's own budget ends probing for this run, the rescan not started;
+      * any other deferral keeps the root deferred, records a newly named provider minimum, and
+        the stream's independent changes drain without a rescan;
+      * an answer that locates the root (present here, elsewhere, or verified not-found) only
+        AUTHORIZES the normal controlled rescan, whose own evidence paths decide; the probe never
+        settles the root nor establishes membership.
+
+    With no ``source`` (no probe possible) the pre-R51 rule applies: any unrestricted deferred root."""
+    deferred = state.deferred_roots(execution.integration_id, generation, drive_id)
+    if not deferred:
+        return False
+    credential = credential_identity(options)
+    restricted = set(_standing_document_restrictions(
+        state, execution.integration_id, generation, credential,
+    ))
+    eligible = [(kind, root_id) for kind, root_id in deferred if root_id not in restricted]
+    if not eligible:
+        return False
+    if source is None:
+        return True
+    probed = probed if probed is not None else set()
+    report = diagnostics if diagnostics is not None else IngestSummary("probe", failure_categories={})
+    for kind, root_id in eligible:
+        if (kind, root_id) in probed:
+            continue
+        probed.add((kind, root_id))
+        try:
+            observed = _observe_root(source, root_id, drive_id, {})
+        except ProviderDeferred as exc:
+            if exc.category == "rate_limited":
+                raise _account_hold(exc) from exc
+            _count(report, exc.category)
+            _count_retry_after_diagnostic(report, exc)
+            if exc.category in _LOCAL_DEADLINE_CATEGORIES:
+                return False
+            _restrict_resource(state, execution, credential, root_id, exc)
+            continue
+        if observed.state == "unverified":
+            _count(report, "selection_root_deferred")
+            continue
+        return True
+    return False
+
+
+def _stream_start_deferred(
+    state: StateStore, execution: GdriveExecution, options: dict[str, Any], drive_id: str,
+    exc: ProviderDeferred | None, summary: IngestSummary,
+) -> IngestSummary:
+    """One stream's start token could not be captured now (R50 F3). ``exc`` is ``None`` when its
+    standing minimum withheld the request. A quota answer is the account's hold; the run's own
+    budget is a local stop; any other answer (a 503, a timeout) is THIS stream's: nothing is
+    enumerated without its token, its named minimum is kept, and the other streams still run."""
+    if exc is None:
+        summary.skipped += 1
+        _count(summary, "provider_restricted_resource")
+        return summary
+    if exc.category == "rate_limited":
+        raise _account_hold(exc) from exc
+    summary.skipped += 1
+    if exc.category in _LOCAL_DEADLINE_CATEGORIES:
+        # A local stop keeps its own category — `dispatch_deadline` or `run_deadline` (R51 F7) —
+        # and is neither a provider hold nor a restriction.
+        summary.failure_categories = summary.failure_categories or {}
+        summary.failure_categories.setdefault(exc.category, 1)
+        return summary
+    _count(summary, exc.category)
+    _count_retry_after_diagnostic(summary, exc)
+    _restrict_resource(
+        state, execution, credential_identity(options), f"{_START_TOKEN_RESOURCE}{drive_id}", exc,
+    )
+    return summary
+
+
 @dataclass(frozen=True)
 class RootObservation:
     """Where one selected root is now: ``here`` (the stream's own drive), ``elsewhere`` (another
@@ -328,6 +770,34 @@ class RootObservation:
     state: str
     drive_id: str | None = None
     detail: str | None = None
+
+
+# The diagnostic a verified-unavailable selected root carries in the fenced root evidence (R48 D1).
+_ROOT_UNAVAILABLE_DETAIL = "selected root unavailable: the provider reports it not found; remove or reselect it"
+
+
+def _restorable_file_root(
+    state: StateStore, execution: GdriveExecution, namespace: str, generation: int,
+    work: PendingWork, meta: dict[str, Any],
+) -> str | None:
+    """The selected file root this document's ingestion would prove restored (R49 F3), or ``None``.
+
+    Only the SAME stable id as a selected file root of this generation recorded unavailable, still
+    bound (no relocation pending) to this stream's drive, whose FRESH metadata — just read under the
+    live execution gate — shows a readable, nontrashed Google Doc in that drive. The detail is
+    cleared later, and only once the content is accepted (``_push_doc``)."""
+    binding = state.root_obligations(execution.integration_id, generation).get(("file", work.item_key))
+    if binding is None or binding.status != "bound" or not (binding.detail or "").startswith(
+        "selected root unavailable"
+    ):
+        return None
+    stream = state.get_progress(namespace)
+    actual_drive = str(meta.get("driveId") or "my-drive")
+    if stream is None or actual_drive != binding.drive_id or actual_drive != stream.key.drive_id:
+        return None
+    if meta.get("trashed") or meta.get("mimeType") != GOOGLE_DOC_MIME or str(meta.get("id")) != work.item_key:
+        return None
+    return work.item_key
 
 
 def _observe_root(
@@ -369,6 +839,10 @@ def _leaving_roots(state: StateStore, integration_id: str, generation: int) -> s
 def _reobserve_stalled_relocations(
     source: GoogleDriveSource, state: StateStore, integration_id: str, generation: int,
     destination_blocked: Any,
+    *,
+    restricted: set[str] | frozenset[str] = frozenset(),
+    deferred: list[tuple[str, ProviderDeferred | None]] | None = None,
+    observe: Callable[[str, ProviderDeferred], None] | None = None,
 ) -> None:
     """Read again, on every run, each relocating root whose destination has no start token.
 
@@ -379,6 +853,11 @@ def _reobserve_stalled_relocations(
     it is still bound to, it never left that stream. Still there, unreadable or gone, nothing is
     concluded. In every case the root stays bound where it was until a hand-over, the claims made
     through it stand, and the connection stays incomplete.
+
+    Admission and scope (AIO-1167 R50): a root under a standing provider minimum is not read early,
+    and a non-quota deferral of its read is that root's (reported through ``deferred``, and handed
+    to the coordinator's ``observe`` the moment it is read, R51 F2); a quota answer or the run's own
+    budget still stops the run as before.
     """
     seen: dict[str, RootObservation] = {}
     for (root_kind, root_id), binding in state.unsettled_roots(integration_id, generation).items():
@@ -386,7 +865,20 @@ def _reobserve_stalled_relocations(
             continue
         if not destination_blocked(str(binding.pending_drive_id)):
             continue
-        observed = _observe_root(source, root_id, binding.drive_id, seen)
+        if root_id in restricted:
+            if deferred is not None:
+                deferred.append((root_id, None))
+            continue
+        try:
+            observed = _observe_root(source, root_id, binding.drive_id, seen)
+        except ProviderDeferred as exc:
+            if exc.category == "rate_limited" or exc.category in _LOCAL_DEADLINE_CATEGORIES:
+                raise
+            if observe is not None:
+                observe(root_id, exc)
+            if deferred is not None:
+                deferred.append((root_id, exc))
+            continue
         if observed.state == "here":
             state.cancel_relocation(integration_id, generation, root_kind, root_id)
         elif observed.state == "elsewhere" and observed.drive_id != binding.pending_drive_id:
@@ -507,6 +999,10 @@ def _bind_selected_roots(
     integration_id: str,
     generation: int,
     options: dict[str, Any],
+    *,
+    restricted: set[str] | frozenset[str] = frozenset(),
+    deferred: list[tuple[str, ProviderDeferred | None]] | None = None,
+    observe: Callable[[str, ProviderDeferred], None] | None = None,
 ) -> dict[tuple[str, str], str]:
     """Bind every selected file/folder root to the change stream of the drive that contains it.
 
@@ -520,8 +1016,14 @@ def _bind_selected_roots(
     through it. Binding then continues with the next root, so one unreadable selection never
     blocks the roots that can be read or the Shared Drives selected outright; the connection just
     cannot be complete, and no absence is inferred from stream membership, while any obligation is
-    unresolved. Connection-wide authority loss (``BrainError``) and an exhausted provider budget
-    (``ProviderDeferred``) are not one root's failure: they stop the binding as before.
+    unresolved. Connection-wide authority loss (``BrainError``), a QUOTA answer (the account's
+    hold) and the run's own budget stop the binding as before.
+
+    Admission (AIO-1167 R50): a root under a standing provider minimum (``restricted``) is not read
+    early — it stays an unresolved obligation. Any other provider deferral of a root's metadata (a
+    503, a timeout) is THAT root's: it stays unresolved, its named minimum is handed to the
+    coordinator's ``observe`` (its restriction journal) BEFORE the next root is read (R51 F2), it is
+    reported through ``deferred``, and binding goes on with the next root.
 
     Returns the drive of every root whose drive is KNOWN.
     """
@@ -529,10 +1031,30 @@ def _bind_selected_roots(
     for kind, root_id in _selected_roots(options):
         if (kind, root_id) in bindings:
             continue
+        if root_id in restricted:
+            state.mark_root_unresolved(
+                integration_id, generation, kind, root_id,
+                detail="selected root held by a provider minimum; not read before it passes",
+            )
+            if deferred is not None:
+                deferred.append((root_id, None))
+            continue
         try:
             meta = source._metadata(root_id)
-        except (BrainError, ProviderDeferred):
+        except BrainError:
             raise
+        except ProviderDeferred as exc:
+            if exc.category == "rate_limited" or exc.category in _LOCAL_DEADLINE_CATEGORIES:
+                raise
+            state.mark_root_unresolved(
+                integration_id, generation, kind, root_id,
+                detail=f"selected root metadata deferred ({exc.category})",
+            )
+            if observe is not None:
+                observe(root_id, exc)
+            if deferred is not None:
+                deferred.append((root_id, exc))
+            continue
         except Exception as exc:
             status = _provider_status(exc)
             state.mark_root_unresolved(
@@ -879,8 +1401,45 @@ async def run_gdrive_stream(
                 except ServiceAccountBindingRefused as exc:
                     return IngestSummary(conn.name, failed=1, failure_categories={exc.category: 1},
                                          integration_id=integration_id)
+            # The account's provider hold — this run's state, or the brain's — is honoured before
+            # the first Drive call of the run, streams or not (AIO-1167 R47 F5).
+            account = credential_identity(options)
+            # This verified account's acknowledged minimums — from whatever generation they were
+            # observed in (R50) — are adopted before any provider read; another account's are not.
+            _adopt_remote_restriction_evidence(
+                state, execution, integration_id, execution.generation, account,
+            )
+            standing = _standing_account_hold(state, integration_id, execution.generation, account)
+            if standing is not None:
+                held = IngestSummary(
+                    conn.name, skipped=1, failure_categories={str(standing["category"]): 1},
+                    integration_id=integration_id,
+                )
+                # A hold (or a resource minimum) a previous run kept only locally — its publication
+                # refused or lost — is repaired HERE, from this fresh acquisition's acknowledged
+                # document, before returning and with no provider call while the hold stands
+                # (R51 F3). One attempt; a failure stays truthfully unpublished.
+                await _flush_restriction_evidence(client, execution, state, account, held)
+                return held
+
+            def restricted_now() -> set[str]:
+                """The resources and operations under a standing provider minimum (R50 admission)."""
+                return set(_standing_document_restrictions(state, integration_id, execution.generation, account))
+
             drive, _ = source._services()
             if auth_mode == "service_account" and options.get("service_account_status") == "pending":
+                if _IDENTITY_PREREQUISITE_RESOURCE in restricted_now():
+                    # The identity prerequisite is under a provider minimum: not read again early.
+                    held = IngestSummary(
+                        conn.name, skipped=1, failure_categories={"provider_restricted_resource": 1},
+                        integration_id=integration_id,
+                    )
+                    # A restriction an earlier run kept only locally — its publication refused or
+                    # lost — is published from this fresh acquisition, once, before returning
+                    # (R51 blind-final 4), with the flush's authority-loss, uncertainty-latch and
+                    # unpublished-diagnostic semantics. No identity read is made while it stands.
+                    await _flush_restriction_evidence(client, execution, state, account, held)
+                    return held
                 try:
                     about = source._execute(drive.about().get(fields="user(emailAddress,permissionId)"))
                     user = about.get("user") or {}
@@ -903,8 +1462,20 @@ async def run_gdrive_stream(
                     return IngestSummary(conn.name, failed=1, failure_categories={exc.code: 1},
                                          integration_id=integration_id)
                 except ProviderDeferred as exc:
-                    return IngestSummary(conn.name, failed=1, failure_categories={exc.category: 1},
-                                         integration_id=integration_id)
+                    held = IngestSummary(conn.name, failure_categories={}, integration_id=integration_id)
+                    if exc.category == "rate_limited" or exc.category in _LOCAL_DEADLINE_CATEGORIES:
+                        await _open_account_hold(client, execution, state, integration_id, account, exc, held)
+                    else:
+                        # A non-quota answer defers this connection's identity PREREQUISITE (R50 F3):
+                        # the run cannot go on without it, but it is no evidence of an account-wide
+                        # outage, so it opens no account hold. A named minimum is kept for the
+                        # prerequisite itself and published.
+                        held.skipped += 1
+                        _count(held, exc.category)
+                        _count_retry_after_diagnostic(held, exc)
+                        _restrict_resource(state, execution, account, _IDENTITY_PREREQUISITE_RESOURCE, exc)
+                        await _flush_restriction_evidence(client, execution, state, account, held)
+                    return held
             generation = execution.generation
             total = IngestSummary(conn.name, failure_categories={}, integration_id=integration_id)
 
@@ -928,21 +1499,57 @@ async def run_gdrive_stream(
             # A root on its way to a drive whose change log an earlier run could not open is read
             # again here, so the streams below are those of where it is now.
             _adopt_remote_root_evidence(state, execution, integration_id, generation)
+            # A root metadata or relocation answer that is not a quota answer is that ROOT's (R50 F3):
+            # it is deferred with its named minimum, and the readable roots and streams go on.
+            deferred_roots: list[tuple[str, ProviderDeferred | None]] = []
+            # Whether THIS run's one run-level failure has been charged (R51 Note A). Set only where
+            # the coordinator itself charges the run — never inferred from `total.failed`,
+            # categories or document failures — and handed to every later flush/drain refusal so
+            # a terminal authority refusal adds its category without a second charge.
+            run_failure_counted = False
+
+            def observe_root_minimum(root_id: str, deferral: ProviderDeferred) -> None:
+                # Recorded in the local journal the moment it is read (R51 F2) — before the next
+                # root's read can end the binding with a quota answer, a BrainError or the run's own
+                # budget — so a later short circuit can never drop it.
+                _restrict_resource(state, execution, account, root_id, deferral)
+
+            def report_deferred_roots() -> None:
+                for _root_id, deferral in deferred_roots:
+                    if deferral is None:
+                        _count(total, "provider_restricted_resource")
+                        continue
+                    _count(total, deferral.category)
+                    _count_retry_after_diagnostic(total, deferral)
+
             try:
                 root_bindings = _bind_selected_roots(
                     source, state, integration_id, generation, options,
+                    restricted=restricted_now(), deferred=deferred_roots, observe=observe_root_minimum,
                 )
                 _reobserve_stalled_relocations(
                     source, state, integration_id, generation, start_blocked,
+                    restricted=restricted_now(), deferred=deferred_roots, observe=observe_root_minimum,
                 )
             except BrainError as exc:
                 total.failed += 1
+                run_failure_counted = True
                 total.failure_categories[exc.code] = 1
+                report_deferred_roots()
+                # Already-observed minimums are flushed where authority allows; the original
+                # error stays the run's outcome either way (R51 F2).
+                await _flush_restriction_evidence(
+                    client, execution, state, account, total, cause=exc,
+                    run_failure_counted=run_failure_counted,
+                )
                 return total
             except ProviderDeferred as exc:
-                total.failed += 1
-                total.failure_categories[exc.category] = 1
+                # Only a quota answer (the account's hold) or the run's own budget reaches here. The
+                # roots deferred before it keep their recorded minimums, published with the hold.
+                report_deferred_roots()
+                await _open_account_hold(client, execution, state, integration_id, account, exc, total)
                 return total
+            report_deferred_roots()
             unresolved_roots = [
                 root for root, binding in state.unsettled_roots(integration_id, generation).items()
                 if binding.status == "unresolved"
@@ -951,6 +1558,7 @@ async def run_gdrive_stream(
                 # Diagnosed and counted as backlog below — one outstanding obligation per root —
                 # without pretending to know what lies under a root nothing has read.
                 total.failed += 1
+                run_failure_counted = True
                 total.failure_categories["selection_root_unresolved"] = len(unresolved_roots)
             # A stream this generation already consumes stays accounted for, so local state written
             # before roots were bound cannot leave a cursor that no run ever finishes.
@@ -973,9 +1581,15 @@ async def run_gdrive_stream(
             if not streams:
                 if not unresolved_roots:
                     total.failed = 1
+                    run_failure_counted = True
                     total.failure_categories["selection_unresolved"] = 1
                 # Every selected root is unresolved: there is no stream to run, and no backlog is
-                # measured — nothing is known about what lies under them.
+                # measured — nothing is known about what lies under them. A minimum learned while
+                # binding is still published, since no stream checkpoint will carry it. Either arm
+                # above has charged the run, so a refused publication is not charged again.
+                await _flush_restriction_evidence(
+                    client, execution, state, account, total, run_failure_counted=run_failure_counted,
+                )
                 return total
 
             # Close the backfill race independently for every required stream before enumerating
@@ -998,16 +1612,41 @@ async def run_gdrive_stream(
                         # No token, yet something was enumerated through it: its own run asks for
                         # the token as the first step of a controlled rescan, never as a resume.
                         continue
+                    if f"{_START_TOKEN_RESOURCE}{drive_id}" in restricted_now():
+                        # This stream's start token is under a provider minimum: it is not asked for
+                        # early, and nothing is enumerated without it; the other streams run.
+                        _count(total, "provider_restricted_resource")
+                        blocked.add(drive_id)
+                        continue
                     try:
                         start = _capture_start_token(source, drive, drive_id)
                     except BrainError as exc:
                         total.failed += 1
+                        run_failure_counted = True
                         total.failure_categories[exc.code] = 1
+                        await _flush_restriction_evidence(
+                            client, execution, state, account, total, cause=exc,
+                            run_failure_counted=run_failure_counted,
+                        )
                         return total
                     except ProviderDeferred as exc:
-                        total.failed += 1
-                        total.failure_categories[exc.category] = 1
-                        return total
+                        if exc.category == "rate_limited" or exc.category in _LOCAL_DEADLINE_CATEGORIES:
+                            # A quota answer is the account's hold; a local budget stop keeps its own
+                            # category (`dispatch_deadline` or `run_deadline`, R51 F7) and opens none.
+                            await _open_account_hold(
+                                client, execution, state, integration_id, account, exc, total,
+                                run_failure_counted=run_failure_counted,
+                            )
+                            return total
+                        # A 503 or timeout for one stream's start token is that STREAM's (R50 F3): it
+                        # cannot enumerate without its token, and its named minimum is kept, while
+                        # the independent streams still run.
+                        total.skipped += 1
+                        _count(total, exc.category)
+                        _count_retry_after_diagnostic(total, exc)
+                        _restrict_resource(state, execution, account, f"{_START_TOKEN_RESOURCE}{drive_id}", exc)
+                        blocked.add(drive_id)
+                        continue
                     except StreamStartUnavailable as exc:
                         # This drive's change log cannot be opened — a root that lives in a Shared
                         # Drive the account cannot list changes for. That is this stream's failure,
@@ -1049,6 +1688,10 @@ async def run_gdrive_stream(
             # A stream whose provider read was refused this run (R44 C5): the others still run, but
             # no complete snapshot is submitted — its membership is not known now.
             stream_access_failed = False
+            # A checkpoint whose acknowledgment was lost this run (R47 F3): nothing more is sent.
+            acknowledgment_uncertain = False
+            # One probe per deferred root per run, across every stream visit (R51 F4).
+            deferred_root_probes: set[tuple[str, str]] = set()
             scheduled_streams = state.rotate_streams(
                 integration_id, generation, [value for value in streams if value not in blocked],
             )
@@ -1073,11 +1716,17 @@ async def run_gdrive_stream(
                         run_deadline=run_deadline,
                         provider_gate=provider_gate,
                         root_bindings=root_bindings,
+                        deferred_root_probes=deferred_root_probes,
                     )
                 except _ProviderAdmissionClosed as closed:
                     # The provider's wait governs the ACCOUNT (AIO-1167 R44 C6): every stream of it
                     # is held until then — persisted, so a restart makes no early call — and no
                     # further provider call is made this run. Remaining work is untouched.
+                    # Held for the account too, so the next run's root and start-token reads wait
+                    # as well, not just its drains (AIO-1167 R47 F5).
+                    state.hold_connection(
+                        integration_id, generation, account, closed.not_before, closed.category,
+                    )
                     for held in scheduled_streams:
                         held_ns = StreamKey(
                             settings.team, integration_id, credential_identity(options), str(held),
@@ -1089,15 +1738,42 @@ async def run_gdrive_stream(
                     # The hold is also published, so a restart that restores from the brain's
                     # checkpoint cannot drop it. A failed publication keeps the local hold.
                     held_progress = state.get_progress(key.namespace(generation))
+                    authority_lost = False
                     if held_progress is not None:
                         try:
                             await _checkpoint_progress(client, execution, state, key.namespace(generation))
                         except BrainError as exc:
                             if _is_terminal_authority(exc):
-                                raise
+                                # The execution's authority ended (R51 L1): the hold, the progress
+                                # made before it and the refusal are reported — not a generic
+                                # coordinator error — and nothing further is sent or read.
+                                authority_lost = True
+                                # Not charged again when the run's failure was already charged
+                                # (an unresolved selected root, R51 Note A).
+                                _note_flush_authority(total, exc, charge=not run_failure_counted)
+                            else:
+                                # The checkpoint's own error stays reported (R51 F3); the unpublished
+                                # hold is reported and repaired by the end-of-run publisher below.
+                                total.failure_categories.setdefault(exc.code, 1)
                     if closed.partial is not None:
                         _merge_summary(total, closed.partial)  # work completed before the limit
                     total.failure_categories[closed.category] = total.failure_categories.get(closed.category, 0) + 1
+                    _count_retry_after_diagnostic(total, closed)
+                    if authority_lost:
+                        outstanding = _restriction_outstanding(state, execution)
+                        if outstanding:
+                            _note_unpublished(total, outstanding)
+                        return total
+                    break
+                except _AcknowledgmentUncertain as uncertain:
+                    # The brain may hold a checkpoint this run never saw acknowledged (AIO-1167 R47
+                    # F3). No further changed checkpoint is sent under a guessed revision — that
+                    # could replace newer sibling streams, roots or watch state — and no document is
+                    # charged. The run ends partial; the next acquisition restores the authority.
+                    if uncertain.partial is not None:
+                        _merge_summary(total, uncertain.partial)
+                    total.failure_categories.setdefault("checkpoint_unacknowledged", 1)
+                    acknowledgment_uncertain = True
                     break
                 except Exception as exc:
                     if not _stream_access_refusal(exc):
@@ -1139,7 +1815,7 @@ async def run_gdrive_stream(
             # no obligation recorded at all — and a stream whose published snapshot is not of the
             # roots it enumerates now, are an incomplete connection: reconciling would turn what
             # has not been verified into absence.
-            verified = not stream_access_failed and _root_coverage_complete(
+            verified = not stream_access_failed and not acknowledgment_uncertain and _root_coverage_complete(
                 state, integration_id, generation, options,
             ) and not any(
                 any(_bound_root_drift(
@@ -1186,6 +1862,7 @@ async def run_gdrive_stream(
                     # the brain already holds, and the next run continues from them.
                     if not isinstance(exc, BrainDeferred):
                         total.failed += 1
+                        run_failure_counted = True
                     total.failure_categories[exc.code] = total.failure_categories.get(exc.code, 0) + 1
             # Report only coordinator evidence, never infer zero from counters. A partial listing,
             # deferred retry, uncommitted page, or unacknowledged notification is backlog even when
@@ -1214,6 +1891,16 @@ async def run_gdrive_stream(
                     # Absence is not established until its final acknowledgment, so that
                     # reconciliation is the outstanding work: zero would report it done.
                     total.backlog = 1
+            # A minimum this run learned or extended that no checkpoint carried — a deferred start
+            # token, a drain-phase account hold whose checkpoint failed, a lost acknowledgment — is
+            # published now, in ONE attempt (R50 F7, R51 F3). If that is refused or lost too
+            # (including under the client's uncertainty latch, which sends nothing), the local
+            # journal keeps it and the run says so, once per owner: `account_hold_unpublished`,
+            # `document_restriction_unpublished`. A run already charged (an unresolved root, a failed
+            # reconciliation) is not charged again by a refused publication here (R51 Note A).
+            await _flush_restriction_evidence(
+                client, execution, state, account, total, run_failure_counted=run_failure_counted,
+            )
             # Cursor age is NOT an attempt clock: it is the age of the stalest required stream's
             # last acknowledged durable drain, over exactly this generation's roster, or unknown.
             total.cursor_age_seconds = _roster_cursor_age_seconds(
@@ -1258,8 +1945,12 @@ async def _run_gdrive_stream_unlocked(
     run_deadline: float | None = None,
     provider_gate=None,
     root_bindings: dict[tuple[str, str], str] | None = None,
+    deferred_root_probes: set[tuple[str, str]] | None = None,
 ) -> IngestSummary:
     discovery_budget = max(0, discovery_budget if discovery_budget is not None else max_work)
+    # The deferred roots already probed this run (R51 F4): the coordinator passes ONE set for the
+    # whole run, so each root is probed at most once however many times its stream is visited.
+    probe_report = IngestSummary(conn.name, failure_categories={})
     retry_budget = max(0, retry_budget if retry_budget is not None else min(max_work, 10))
     if run_deadline is not None and hasattr(source, "set_run_deadline"):
         source.set_run_deadline(run_deadline)
@@ -1372,8 +2063,16 @@ async def _run_gdrive_stream_unlocked(
         )
         return IngestSummary(conn.name, failure_categories={})
     if progress is None or (_unstarted(progress) and not _holds_enumeration(progress)):
+        if _start_token_restricted(state, execution, options, drive_id):
+            return _stream_start_deferred(
+                state, execution, options, drive_id, None, IngestSummary(conn.name, failure_categories={}),
+            )
         try:
             start = _capture_start_token(source, drive, drive_id)
+        except ProviderDeferred as exc:
+            return _stream_start_deferred(
+                state, execution, options, drive_id, exc, IngestSummary(conn.name, failure_categories={}),
+            )
         except StreamStartUnavailable as exc:
             # Nothing is enumerated without a token: the stream is only its diagnostic.
             if progress is None:
@@ -1401,8 +2100,17 @@ async def _run_gdrive_stream_unlocked(
             or _unstarted(progress)
         )
         if needs_recovery:
+            if _start_token_restricted(state, execution, options, drive_id):
+                return _stream_start_deferred(
+                    state, execution, options, drive_id, None, IngestSummary(conn.name, failure_categories={}),
+                )
             try:
                 fresh = _capture_start_token(source, drive, drive_id)
+            except ProviderDeferred as exc:
+                # What this stream holds stays exactly as it is; only its recovery waits (R50 F3).
+                return _stream_start_deferred(
+                    state, execution, options, drive_id, exc, IngestSummary(conn.name, failure_categories={}),
+                )
             except StreamStartUnavailable as exc:
                 # The recovery cannot begin. What this stream holds stays exactly as it is — its
                 # cursor, its published membership, the claims made through it — and the stream
@@ -1459,10 +2167,17 @@ async def _run_gdrive_stream_unlocked(
             )
             if missing:
                 state.begin_selection_snapshot(namespace, generation, current_roots)
-        elif state.snapshot_complete(namespace, generation, progress.active_snapshot) and any(
-            _bound_root_drift(
+        elif state.snapshot_complete(namespace, generation, progress.active_snapshot) and (
+            any(_bound_root_drift(
                 state, namespace, generation, progress.active_snapshot, drive_id,
                 root_bindings, leaving,
+            ))
+            # A root this stream's enumeration deferred (R50 F4) whose read is admissible again: its
+            # retained membership is replaced by a verified one through the same controlled rescan —
+            # started only once a bounded root-local probe located the root (R51 F4).
+            or _deferred_root_admissible(
+                state, execution, options, generation, drive_id,
+                source=source, probed=deferred_root_probes, diagnostics=probe_report,
             )
         ):
             state.begin_selection_snapshot(namespace, generation, current_roots)
@@ -1477,6 +2192,7 @@ async def _run_gdrive_stream_unlocked(
         progress = state.get_progress(namespace)
 
     summary = IngestSummary(conn.name, failure_categories={})
+    _merge_summary(summary, probe_report)  # a deferred root's probe diagnostics, never charged
     state.update_progress(namespace, last_attempt_at=_now())
     try:
         if run_deadline is not None and time.monotonic() >= run_deadline:
@@ -1514,9 +2230,10 @@ async def _run_gdrive_stream_unlocked(
                     root_bindings=root_bindings,
                 )
                 fresh_remaining = max(0, fresh_remaining - consumed)
-            except (BrainError, _ProviderAdmissionClosed):
+            except (BrainError, _ProviderAdmissionClosed, _AcknowledgmentUncertain):
                 # Authority errors stay run-terminal; an account rate limit raised by the baseline's
-                # drain is the coordinator's account hold, never a baseline read failure (R45 H1).
+                # drain is the coordinator's account hold, never a baseline read failure (R45 H1);
+                # an unacknowledged checkpoint is the coordinator's to stop on (R47 F3).
                 raise
             except ProviderDeferred as exc:
                 if exc.category == "rate_limited":
@@ -1527,6 +2244,7 @@ async def _run_gdrive_stream_unlocked(
                 )
                 summary.failed += 1
                 summary.failure_categories[exc.category] = summary.failure_categories.get(exc.category, 0) + 1
+                _count_retry_after_diagnostic(summary, exc)
                 return summary
             except Exception as exc:
                 await _checkpoint_progress(
@@ -1627,8 +2345,14 @@ async def _run_gdrive_stream_unlocked(
                 # A 410 never becomes an empty snapshot. Retain the old cursor as evidence, clear
                 # only the selected-membership traversal, and capture a fresh start token before
                 # the controlled baseline rescan.
+                if _start_token_restricted(state, execution, options, drive_id):
+                    return _stream_start_deferred(state, execution, options, drive_id, None, summary)
                 try:
                     fresh = _capture_start_token(source, drive, drive_id)
+                except ProviderDeferred as deferral:
+                    # The rejected cursor and the published membership stay; only the recovery's
+                    # start token waits — this stream's alone, unless it is a quota answer (R50 F3).
+                    return _stream_start_deferred(state, execution, options, drive_id, deferral, summary)
                 except StreamStartUnavailable as exc:
                     # The cursor is gone and its drive will not issue another. Nothing is reset:
                     # the old cursor and the published membership stay, and the recovery this
@@ -1660,6 +2384,7 @@ async def _run_gdrive_stream_unlocked(
                 )
                 summary.failed += 1
                 summary.failure_categories[exc.category] = 1
+                _count_retry_after_diagnostic(summary, exc)
                 return summary
             obligations: list[tuple[str, str, dict[str, Any]]] = []
             membership_additions: list[tuple[str, str, str] | tuple[str, str, str, str | None]] = []
@@ -1691,6 +2416,20 @@ async def _run_gdrive_stream_unlocked(
             )
             root_observations: dict[str, RootObservation] = {}
             unverified: list[tuple[str, ProviderDeferred | None]] = []
+            # Roots under a standing provider minimum are not read here either (R50 admission).
+            restricted_roots = set(_standing_document_restrictions(
+                state, execution.integration_id, generation, credential_identity(options),
+            ))
+            # Roots this stream's enumeration DEFERRED (R50 F4): their snapshot membership is
+            # retained, not enumerated, so their ancestry is incomplete — conservative admission
+            # evidence for the per-document classifier below (R51 F1). Durable, so it survives a
+            # reopened state; empty on fresh state, where no membership is retained either.
+            deferred_here = {
+                root_id for _kind, root_id in state.deferred_roots(
+                    execution.integration_id, generation, drive_id,
+                )
+            }
+            held_by_deferred_root = False
 
             def absence_withheld(root_ids: Any) -> bool:
                 """Whether a removal under these roots must NOT become absence. Records why."""
@@ -1702,9 +2441,30 @@ async def _run_gdrive_stream_unlocked(
                     if (root_kind, root_id) in leaving:
                         held = True
                         continue
+                    if root_id in restricted_roots:
+                        # Not read before its minimum passes. Its claims stand — nothing under it is
+                        # absence — and the page itself is not blocked: the rescan it seeds defers
+                        # this root and lets the independent work go on (R50 F3/F4).
+                        held = True
+                        continue
                     try:
                         observed = _observe_root(source, root_id, drive_id, root_observations)
                     except ProviderDeferred as exc:
+                        if exc.category == "rate_limited":
+                            # The account's wait, not this stream's (R49 F2): the account-hold owner
+                            # stops every further call for it. This page is not materialized, so it
+                            # stays unresolved and nothing is removed.
+                            raise _account_hold(exc) from exc
+                        if exc.category not in _LOCAL_DEADLINE_CATEGORIES and _restrict_resource(
+                            state, execution, credential_identity(options), root_id, exc,
+                        ):
+                            # A named minimum for this ROOT (R50 F3): kept, reported, and from here
+                            # on handled as a restricted root — claims stand, the page goes on.
+                            restricted_roots.add(root_id)
+                            _count(summary, exc.category)
+                            _count_retry_after_diagnostic(summary, exc)
+                            held = True
+                            continue
                         unverified.append((root_id, exc))
                         held = True
                         continue
@@ -1722,6 +2482,22 @@ async def _run_gdrive_stream_unlocked(
                         )
                         unverified.append((root_id, None))
                         held = True
+                    elif observed.state == "absent" and root_id in deferred_here:
+                        # A DEFERRED root's snapshot holds only retained placeholder membership
+                        # (AIO-1167 R51 F3-A). Its 404 here would discharge the listing debt while
+                        # the placeholder's other members stay unverified, so it is not recorded:
+                        # the removal is withheld, the caller seeds recovery, and the controlled
+                        # replacement snapshot's open traversal records the 404 itself.
+                        held = True
+                    elif observed.state == "absent":
+                        # A verified absence keeps — or records — the root's loss (R49 F2); only a
+                        # root read present where it is bound is settled. Claims and absence gates
+                        # are decided below exactly as before. Counted once per run (R50 F7).
+                        if state.record_root_unavailable(
+                            execution.integration_id, generation, root_kind, root_id,
+                            detail=_ROOT_UNAVAILABLE_DETAIL,
+                        ):
+                            _note_root_unavailable(summary, root_kind, root_id)
                     else:
                         state.settle_root(execution.integration_id, generation, root_kind, root_id)
                 return held
@@ -1805,7 +2581,11 @@ async def _run_gdrive_stream_unlocked(
                             for item_id in sorted(final_items)
                         )
                     continue
-                removed = bool(change.get("removed") or file.get("trashed"))
+                # Explicit trash is evidence about the DOCUMENT itself — loss wherever it lives — and
+                # is kept apart from an ambiguous `removed` hint (a move, lost access, or a root that
+                # left this drive), which stays on the absence gates below (AIO-1167 R51 final 2).
+                trashed = bool(file.get("trashed"))
+                removed = bool(change.get("removed") or trashed)
                 selected = file_id in state.membership_ids(namespace, generation)
                 root_parents = sorted({
                     (root, str(parent))
@@ -1830,6 +2610,29 @@ async def _run_gdrive_stream_unlocked(
                     direct and file_id in bound_root_kinds and file
                     and str(file.get("driveId") or "my-drive") != drive_id
                 )
+                if selected and not in_scope and not removed and not moved_out and (
+                    deferred_here & set(state.membership_roots(namespace, generation, file_id))
+                ):
+                    # "Out of scope" here only means its parent is unknown — and it is unknown
+                    # because a root it is claimed through is DEFERRED (R51 F1): that root's snapshot
+                    # carries retained membership without its traversal, so a nested document's
+                    # parent is absent from the ancestry. Reading the root's metadata is not
+                    # enumerating its subtree. The document is held: no remove, its membership,
+                    # claim and the root's recovery obligation stand, and no rescan is started
+                    # for it — the deferred root's own recovery re-lists it.
+                    held_by_deferred_root = True
+                    continue
+                if trashed and selected:
+                    # Verified trash needs no root to vouch for it: a restricted, deferred, leaving or
+                    # unreadable parent root blocks READS, not the reconciliation of evidence already
+                    # in hand. The evidence travels in the obligation (`trashed`), so the removal
+                    # drain settles it without a parent or document probe — through retries, a
+                    # failed sink acknowledgment and a restart alike — via the claim-aware owner.
+                    obligations.append((file_id, "remove", {
+                        "file_id": file_id, "trashed": True, "reason": "explicit_trash",
+                    }))
+                    membership_removals.append(file_id)
+                    continue
                 if removed or moved_out or (selected and not in_scope):
                     if (selected or moved_out) and absence_withheld(
                         {*state.membership_roots(namespace, generation, file_id),
@@ -1855,6 +2658,10 @@ async def _run_gdrive_stream_unlocked(
                     for root in ([file_id] if direct else ([drive_root] if drive_root else [])):
                         membership_additions.append((file_id, root, drive_id, None))
                 obligations.append((file_id, "upsert", {"file_id": file_id, "metadata": file}))
+            if held_by_deferred_root:
+                # Reported, never charged: the document is owed to the deferred root's recovery.
+                summary.failure_categories = summary.failure_categories or {}
+                summary.failure_categories.setdefault("deferred_root_document_held", 1)
             if unverified:
                 # Where a root is could not be read, so this page's removals under it are neither
                 # absence nor a move. The page is not retained and the cursor does not pass it:
@@ -1869,6 +2676,8 @@ async def _run_gdrive_stream_unlocked(
                 category = deferred.category if deferred else "selection_root_unverified"
                 summary.failed += 1
                 summary.failure_categories[category] = summary.failure_categories.get(category, 0) + 1
+                if deferred is not None:
+                    _count_retry_after_diagnostic(summary, deferred)  # R49 F2: kept on this path
                 return summary
             if state.projected_pending_count(
                 namespace, generation, [item_key for item_key, _action, _payload in obligations],
@@ -1927,13 +2736,19 @@ async def _run_gdrive_stream_unlocked(
                 client, execution, state, namespace, generation,
             )
         return summary
-    except _ProviderAdmissionClosed as closed:
-        # Whatever this stream completed before the limit is still reported by the coordinator.
+    except (_ProviderAdmissionClosed, _AcknowledgmentUncertain) as closed:
+        # Whatever this stream completed before the stop is still reported by the coordinator.
         closed.partial = summary
         raise
     except BrainError as exc:
-        summary.failed += 1
         summary.failure_categories[exc.code] = summary.failure_categories.get(exc.code, 0) + 1
+        if not _is_terminal_authority(exc) and _progress_uncertain(client, execution):
+            # A checkpoint of this stream's own may have committed unacknowledged (R47 F3): the
+            # revision is unknown to every stream of the run, so the coordinator stops.
+            uncertain = _AcknowledgmentUncertain(exc.code)
+            uncertain.partial = summary
+            raise uncertain from exc
+        summary.failed += 1
         return summary
 
 
@@ -1976,6 +2791,79 @@ async def _enumerate_baseline(
         bound = (root_bindings or {}).get((root_kind, str(root_id)))
         return (bound is not None and bound != drive_id) or (root_kind, str(root_id)) in leaving
 
+    # Bound roots whose OWN metadata the provider answered not-found under this run's authority
+    # (AIO-1167 R48 D1). Each is a resolved outcome — it supports nothing now — so its page or
+    # traversal is finished empty, without listing a folder that is gone. Only the root's own 404
+    # qualifies: a listing 404, a never-bound root, auth, quota, timeouts and transient errors
+    # remain conservative. Read again, a restored root is enumerated normally.
+    unavailable: set[str] = set()
+
+    def record_unavailable(root_kind: str, root_id: str) -> bool:
+        if not state.record_root_unavailable(
+            integration_id, generation, root_kind, root_id, detail=_ROOT_UNAVAILABLE_DETAIL,
+        ):
+            return False
+        unavailable.add(root_id)
+        _note_root_unavailable(summary, root_kind, root_id)  # once per root per run (R50 F7)
+        return True
+
+    # Roots this enumeration cannot read now (AIO-1167 R50 F3/F4): under a standing provider minimum
+    # (admission — never read early, whatever a rescan or rebuilt local state asks), or answered by
+    # a non-quota deferral (a 503 or timeout — that ROOT's, its named minimum kept). Each is finished
+    # WITHOUT a read: its page or traversal commits carrying only the membership this stream's
+    # published snapshot already proved through it (retained evidence — none on fresh local state,
+    # where nothing is invented), and the root becomes a durable DEFERRED obligation (`uncertain`).
+    # So the independent roots and documents keep their discovery and change processing, while
+    # the connection stays partial and no complete snapshot can infer absence until a later
+    # enumeration lists the root again (`_deferred_root_admissible`). A quota answer is still the
+    # account's hold and the run's own budget still stops the run.
+    stream_progress = state.get_progress(namespace)
+    credential = stream_progress.key.credential_id if stream_progress is not None else ""
+    restricted_roots = set(_standing_document_restrictions(
+        state, integration_id, generation, credential,
+    )) if stream_progress is not None else set()
+    deferred: set[str] = set()
+
+    def defer_root(root_kind: str, root_id: str, exc: ProviderDeferred | None) -> None:
+        if exc is not None:
+            if exc.category == "rate_limited":
+                raise _account_hold(exc) from exc
+            if exc.category in _LOCAL_DEADLINE_CATEGORIES:
+                raise exc
+            _count(summary, exc.category)
+            _count_retry_after_diagnostic(summary, exc)
+            if _restrict_resource(state, execution, credential, root_id, exc):
+                restricted_roots.add(root_id)
+        else:
+            diagnostic = "provider_restricted_document" if root_kind == "file" else "provider_restricted_resource"
+            summary.failure_categories[diagnostic] = max(summary.failure_categories.get(diagnostic, 0), 1)
+        state.mark_root_deferred(
+            integration_id, generation, root_kind, root_id, drive_id,
+            detail="its read is withheld; membership retained, not verified",
+        )
+        deferred.add(root_id)
+
+    # A deferred folder root is settled only by the listing of its subtree, never by its metadata
+    # (AIO-1167 R51 final 1). Metadata proves where the folder is, not what is under it.
+    #   * If this build's traversal of a previously deferred folder was already closed — by the
+    #     placeholder its deferral wrote (retained membership only, none on fresh state) — the
+    #     build cannot witness its contents: the root stays deferred, this build cannot support a
+    #     complete snapshot, and once it publishes the controlled rescan (`_deferred_root_admissible`)
+    #     lists the folder under a fresh snapshot and page identity.
+    #   * If its traversal is still open, it is listed now — descendants and further pages included,
+    #     across runs if interrupted — and settled only when no entry of it remains (`listed`).
+    previously_deferred = {
+        root_id for kind, root_id in state.deferred_roots(integration_id, generation, drive_id)
+        if kind == "folder"
+    }
+    listed: set[str] = set()
+
+    def settle_listed() -> None:
+        for listed_root in sorted(listed):
+            if not state.root_traversal_open(namespace, generation, listed_root, snapshot_id=snapshot_id):
+                state.settle_root(integration_id, generation, "folder", listed_root, enumerated=True)
+                listed.discard(listed_root)
+
     # A folder listing scoped to this drive is empty for a folder that was moved out of it, which
     # reads exactly like a folder that was emptied. So before a bound folder root is listed, its
     # own metadata is read: found in another drive, it is recorded as relocating and this baseline
@@ -1985,7 +2873,23 @@ async def _enumerate_baseline(
         root_id = str(root["root_id"])
         if ("folder", root_id) not in (root_bindings or {}) or another_streams("folder", root_id):
             continue
-        observed = _observe_root(source, root_id, drive_id, {})
+        if root_id in restricted_roots:
+            defer_root("folder", root_id, None)
+            continue
+        if root_id in previously_deferred and not state.root_traversal_open(
+            namespace, generation, root_id, snapshot_id=snapshot_id,
+        ):
+            # Closed by its deferral's placeholder in this build (AIO-1167 R51 F3): it stays deferred
+            # and its metadata is not read now. Any answer here — even a verified not-found — would
+            # be recorded against a snapshot whose committed page still carries the retained
+            # membership. The controlled rescan (`_deferred_root_admissible`) decides it under a
+            # fresh snapshot, whose open traversal lists a present folder or finishes a gone one empty.
+            continue
+        try:
+            observed = _observe_root(source, root_id, drive_id, {})
+        except ProviderDeferred as exc:
+            defer_root("folder", root_id, exc)
+            continue
         if observed.state == "elsewhere":
             state.mark_root_relocating(
                 integration_id, generation, "folder", root_id, drive_id,
@@ -1999,7 +2903,13 @@ async def _enumerate_baseline(
                 integration_id, generation, "folder", root_id, drive_id, detail=str(observed.detail),
             )
             raise SelectedRootUnverified(f"selected folder {root_id} could not be verified")
+        if observed.state == "absent" and record_unavailable("folder", root_id):
+            continue
+        # Read where it is bound: a merely uncertain or unavailable root is settled by that read (a
+        # DEFERRED one is untouched here — `settle_root` without `enumerated`).
         state.settle_root(integration_id, generation, "folder", root_id)
+        if root_id in previously_deferred:
+            listed.add(root_id)  # open (checked above): listed below; settled once its subtree is listed
 
     # Explicit file selections are individual one-item enumeration pages. Their metadata must be
     # proven before membership exists; an inaccessible file leaves this baseline partial.
@@ -2019,8 +2929,37 @@ async def _enumerate_baseline(
                 # before this local state was written, or it was read there since. Its page here
                 # records nothing, and nothing is read through this stream.
                 meta = None
+            elif str(root["root_id"]) in restricted_roots:
+                # Under a standing provider minimum (R49 F1): not read, by a rescan or a rebuilt
+                # local state either. Deferred instead of left unmaterialized (R50 F4): the page
+                # commits carrying only the membership the published snapshot already proved
+                # through this root, and the other roots and documents go on.
+                meta = None
+                defer_root("file", str(root["root_id"]), None)
+                membership_additions.extend(
+                    state.retained_root_membership(namespace, generation, str(root["root_id"])),
+                )
             else:
-                meta = source._metadata(root["root_id"])
+                try:
+                    meta = source._metadata(root["root_id"])
+                except BrainError:
+                    raise
+                except ProviderDeferred as exc:
+                    # A quota answer is the account's (re-raised as its hold) and the run's own
+                    # budget stops the run; any other deferral is THIS root's (R50 F3): deferred
+                    # exactly as a restricted one, its named minimum kept.
+                    defer_root("file", str(root["root_id"]), exc)
+                    meta = None
+                    membership_additions.extend(
+                        state.retained_root_membership(namespace, generation, str(root["root_id"])),
+                    )
+                except Exception as exc:
+                    # A bound file root's own not-found is its outcome (R48 D1): this page commits
+                    # with no membership. Anything else is raised exactly as before.
+                    if (bound_drive is None or _provider_status(exc) != 404
+                            or not record_unavailable("file", str(root["root_id"]))):
+                        raise
+                    meta = None
                 pages_read += 1
             if meta is None:
                 pass
@@ -2046,7 +2985,8 @@ async def _enumerate_baseline(
                         "file_id": str(meta["id"]), "metadata": meta,
                     }))
             if meta is not None and bound_drive is not None:
-                state.settle_root(integration_id, generation, "file", str(root["root_id"]))
+                # Read by this enumeration: a deferred file root is settled here, and only here.
+                state.settle_root(integration_id, generation, "file", str(root["root_id"]), enumerated=True)
             if state.projected_pending_count(
                 namespace, generation, [item_key for item_key, _action, _payload in obligations],
             ) > _MAX_PENDING_PER_STREAM:
@@ -2074,7 +3014,25 @@ async def _enumerate_baseline(
         token = str(row["page_token"] or "") or None
         page_id = _page_id("baseline", snapshot_id, row["root_id"], row["folder_id"], token)
         page = state.get_page(namespace, generation, page_id)
-        if page is None and another_streams(root_kinds.get(str(row["root_id"]), ""), row["root_id"]):
+        if page is None and str(row["root_id"]) in deferred:
+            # A deferred folder root (R50 F4) is not listed now. Its traversal is closed without a
+            # read; the root's own top row carries the membership the published snapshot already
+            # proved through it — retained evidence, never a current observation — so nothing it
+            # claimed is dropped and nothing is invented, and the stream's other roots finish.
+            retained = (
+                state.retained_root_membership(namespace, generation, str(row["root_id"]))
+                if str(row["folder_id"]) == str(row["root_id"]) and token is None else []
+            )
+            page = state.materialize_page(
+                namespace, generation, page_id, "baseline", token, None, None, [],
+                snapshot_id=snapshot_id,
+                membership_additions=retained,
+                traversal_completion=(row["root_id"], row["folder_id"], token),
+            )
+        if page is None and (
+            another_streams(root_kinds.get(str(row["root_id"]), ""), row["root_id"])
+            or str(row["root_id"]) in unavailable
+        ):
             # A folder root that left this drive after this build was seeded. It is not listed
             # here — the listing would be empty and prove nothing — and its traversal is closed
             # with a page that records nothing, so the stream's other roots still finish.
@@ -2152,7 +3110,12 @@ async def _enumerate_baseline(
         page = state.get_page(namespace, generation, page_id)
         if not page or not page.committed_at:
             return False, work_consumed
+        settle_listed()  # a recovered deferred folder whose whole subtree is now listed (R51 final 1)
 
+    settle_listed()
+    # A deferred root does not make this enumeration complete as a statement of its membership: its
+    # `uncertain` obligation keeps the connection partial and withholds absence (R50 F4). It only lets
+    # the snapshot publish so independent change processing can continue.
     return (
         state.next_traversal(namespace, generation, snapshot_id=snapshot_id) is None
         and state.next_uncommitted_page(
@@ -2287,8 +3250,14 @@ async def _push_doc(
     generation: int,
     summary: IngestSummary,
     work: PendingWork | None = None,
+    *,
+    restored_root: str | None = None,
 ) -> bool:
-    """Push one document. Returns False only when the run's deadline deferred the sink call."""
+    """Push one document. Returns False only when the run's deadline deferred the sink call.
+
+    ``restored_root`` (R49 F3): the selected file root this ingestion proves restored. Its stale
+    unavailable detail is cleared only after the brain ACCEPTED the content, so the checkpoint that
+    acknowledges the document publishes the restored root evidence under the same fence."""
     doc.extra_frontmatter["connection_id"] = execution.integration_id
     doc.extra_frontmatter.setdefault("scope_generation", generation)
     work = work or next((w for w in state.list_pending(namespace, generation, limit=1000)
@@ -2340,26 +3309,33 @@ async def _push_doc(
     setattr(summary, result.status, getattr(summary, result.status) + 1)
     if not work:
         return True
+    if restored_root is not None and state.work_membership_current(work):
+        state.settle_root(execution.integration_id, generation, "file", restored_root)
     try:
         progress = state.get_progress(namespace)
         await _checkpoint_progress(client, execution, state, namespace,
                                    phase=progress.phase if progress else "working")
         state.ack_work(work)
-    except BrainDeferred as exc:
-        if _is_terminal_authority(exc):
-            raise
-        # The content was ACCEPTED; only its durable acknowledgment is owed (AIO-1167 R45 M5). A
-        # control-plane wait is not the document's failure: the obligation stays owed and
-        # unacknowledged (its page is not retired) with the brain's not-before, and spends none of
-        # the retry budget backoff and exhaustion are computed from. The replayed push is idempotent.
-        summary.failure_categories[exc.code] = summary.failure_categories.get(exc.code, 0) + 1
-        if exc.not_before is not None:
-            state.fail_work(work, f"checkpoint deferred: {exc.code}", not_before=exc.not_before, failure=False)
-        return False  # the brain is deferring: start no further work this run
     except BrainError as exc:
         if _is_terminal_authority(exc):
             raise
-        return _record_sink_failure(state, work, exc, summary)
+        # The content was ACCEPTED; only its durable acknowledgment is owed (AIO-1167 R45 M5, R47 F3).
+        # Whatever stopped the checkpoint — a deferral, a 5xx, `stale_progress`, a lost response —
+        # is the control plane's, judged by STAGE, not by exception type: the obligation stays owed
+        # and unacknowledged (its page is not retired), spends none of the retry budget backoff and
+        # exhaustion are computed from, and the replayed push is idempotent.
+        summary.failure_categories[exc.code] = summary.failure_categories.get(exc.code, 0) + 1
+        if isinstance(exc, BrainDeferred) and exc.not_before is not None:
+            # The combined wait delays the next attempt; only a minimum the BRAIN named survives rearm
+            # (R50 F2) — the client's own exponential fallback and jitter never do (R51 L2).
+            state.fail_work(
+                work, f"checkpoint deferred: {exc.code}", not_before=exc.not_before, failure=False,
+                minimum=getattr(exc, "provider_not_before", None),
+            )
+        if _progress_uncertain(client, execution):
+            # What was sent may have committed: the revision is unknown, so the run stops here.
+            raise _AcknowledgmentUncertain(exc.code) from exc
+        return False  # nothing committed, but the brain is refusing: start no further work this run
     return True
 
 
@@ -2377,9 +3353,34 @@ async def _drain_pending(
     work_class: str | None = None,
 ) -> int:
     consumed = 0
+    stream = state.get_progress(namespace)
+    credential = stream.key.credential_id if stream is not None else ""
+    # Documents under a standing provider minimum are not read, pushed or acknowledged until it
+    # lapses — whatever rearm, a newer observation or a rescan did to their obligation (R49 F1).
+    restricted = _standing_document_restrictions(
+        state, execution.integration_id, generation, credential,
+    )
+    # The documents this stream holds back now — one count per document, however many drain passes
+    # the stream makes in a run. A verified removal is not held back (R51 blind-final 1) unless it
+    # would need an early probe of the restricted document (added below when withheld).
+    held_back = {
+        provider_id for provider_id in restricted
+        if state.has_owed_work(namespace, generation, provider_id, exclude_action="remove")
+    }
+
+    def note_held_back(provider_id: str | None = None) -> None:
+        if provider_id is not None:
+            held_back.add(provider_id)
+        if held_back:
+            summary.failure_categories["provider_restricted_document"] = max(
+                summary.failure_categories.get("provider_restricted_document", 0), len(held_back),
+            )
+
+    note_held_back()
     for work in state.list_pending(
-        namespace, generation, limit=max(1, budget), work_class=work_class,
+        namespace, generation, limit=max(1, budget), work_class=work_class, restricted=restricted,
     )[:budget]:
+        restored_root: str | None = None
         if _run_deadline_reached(execution):
             # Out of time is not a failure of the work that was never started: it is left exactly
             # as it was, and no further provider or sink call is made in this drain.
@@ -2396,7 +3397,27 @@ async def _drain_pending(
         if work.action == "remove":
             if not state.work_is_current(work):
                 continue
-            verdict = _cross_stream_removal(state, execution, source, work)
+            try:
+                verdict = _cross_stream_removal(
+                    state, execution, source, work, restricted=work.item_key in restricted,
+                )
+            except ProviderDeferred as exc:
+                # The removal probe was deferred (R51 blind-final 2): neither survival nor loss is
+                # known, so the removal stays owed and unacknowledged, routed by the SAME owners as
+                # a document read: the run's own deadline stops the drain, a quota answer is the
+                # account's hold, a named wait is this document's restriction.
+                if exc.category in _LOCAL_DEADLINE_CATEGORIES:
+                    summary.failure_categories.setdefault(exc.category, 1)
+                    break
+                if exc.category == "rate_limited":
+                    raise _account_hold(exc) from exc
+                _defer_document_read(state, execution, generation, credential, work, exc, summary)
+                continue
+            if verdict == "restricted":
+                # Settling it would need a probe of a document under a standing provider minimum:
+                # retained, and nothing is read before the minimum lapses.
+                note_held_back(work.item_key)
+                continue
             if verdict == "claimed":
                 # Moved between two selected roots of this connection: only this stream's own
                 # membership ended, and that was recorded with the page. Nothing is removed.
@@ -2438,22 +3459,22 @@ async def _drain_pending(
             doc = source._raw_doc(meta)
             if not state.work_membership_current(work):
                 continue
+            restored_root = _restorable_file_root(state, execution, namespace, generation, work, meta)
         except BrainError:
             raise
         except ProviderDeferred as exc:
             if exc.category in _LOCAL_DEADLINE_CATEGORIES:
                 # The RUN's budget, not the provider: either nothing was sent before it ran out
                 # (AIO-1167 R44 U5), or Google answered in time but after it (R45 M6). Not a provider
-                # failure — the work is left exactly as it was, for a fresh budget.
-                summary.failure_categories.setdefault("run_deadline", 1)
+                # failure — the work is left exactly as it was, for a fresh budget. Its own category
+                # is kept: `dispatch_deadline` or `run_deadline` (R51 F7).
+                summary.failure_categories.setdefault(exc.category, 1)
                 break
             if exc.category == "rate_limited":
                 # The provider's wait governs this account, not this one document (R44 C6): stop
                 # every further call for it, and leave this obligation untouched.
                 raise _account_hold(exc) from exc
-            _fail_work(state, work, str(exc))
-            summary.failed += 1
-            summary.failure_categories[exc.category] = summary.failure_categories.get(exc.category, 0) + 1
+            _defer_document_read(state, execution, generation, credential, work, exc, summary)
             continue
         except ProviderCursorInvalid:
             # Cursor validity is only meaningful for change enumeration, never an item fetch.
@@ -2473,13 +3494,43 @@ async def _drain_pending(
             continue
         if not await _push_doc(
             client, execution, doc, conn, state, namespace, generation, summary, work,
+            restored_root=restored_root,
         ):
             break
     return consumed
 
 
+def _defer_document_read(
+    state: StateStore, execution: GdriveExecution, generation: int, credential: str,
+    work: PendingWork, exc: ProviderDeferred, summary: IngestSummary,
+) -> None:
+    """A non-quota provider deferral of one document's read — its content read or its removal
+    probe (R51 blind-final 2) — never an account hold.
+
+    The provider's named deadline is the earliest retry, never the shorter backoff (R48 D2), and it
+    outlives this observation: recorded as the DOCUMENT's restriction (R49 F1), carried in the
+    fenced progress. Only a provider-NAMED deadline is an external minimum that survives an explicit
+    rearm (R51 F5); a malformed header's bounded fallback or a timeout is this sidecar's own wait,
+    still delaying the next attempt as local backoff. The obligation is never acknowledged here."""
+    if getattr(exc, "provider_deadline", False) and exc.not_before and credential:
+        state.restrict_document(
+            execution.integration_id, generation, credential, work.item_key,
+            exc.not_before, exc.category,
+            unrepresentable=getattr(exc, "diagnostic", None) == "retry_after_unrepresentable",
+        )
+    _fail_work(
+        state, work, str(exc), retry_after=exc.not_before,
+        external=bool(getattr(exc, "provider_deadline", False)),
+    )
+    summary.failed += 1
+    summary.failure_categories[exc.category] = summary.failure_categories.get(exc.category, 0) + 1
+    _count_retry_after_diagnostic(summary, exc)
+
+
 # A removal one stream observed while another stream of the connection had not yet drained past it.
 _CROSS_STREAM_PENDING = "cross-stream move unresolved"
+# A removal whose settlement needs a probe of a document under a standing provider minimum.
+_RESTRICTED_PROBE_PENDING = "removal probe waits on the document's provider restriction"
 
 
 def _document_loss_verified(source: GoogleDriveSource, file_id: str) -> bool:
@@ -2490,13 +3541,14 @@ def _document_loss_verified(source: GoogleDriveSource, file_id: str) -> bool:
     not. An explicit not-found — it was deleted, or the account no longer has access to it — and
     a trashed document are absence whichever drive it was in. Anything else verifies nothing: it
     is readable, so it is somewhere, or the read failed in a way that says nothing about it.
+
+    A DEFERRED probe (``ProviderDeferred``) is raised, never answered (R51 blind-final 2): it is
+    neither survival nor loss evidence, and its wait belongs to the removal drain's owners.
     """
     try:
         meta = source._metadata(file_id)
-    except BrainError:
+    except (BrainError, ProviderDeferred):
         raise
-    except ProviderDeferred:
-        return False
     except Exception as exc:
         return _provider_status(exc) == 404
     return bool(meta.get("trashed"))
@@ -2504,6 +3556,7 @@ def _document_loss_verified(source: GoogleDriveSource, file_id: str) -> bool:
 
 def _cross_stream_removal(
     state: StateStore, execution: GdriveExecution, source: GoogleDriveSource, work: PendingWork,
+    *, restricted: bool = False,
 ) -> str:
     """What one stream's removal means for a connection that consumes other streams too.
 
@@ -2536,7 +3589,19 @@ def _cross_stream_removal(
     nobody knows of yet, so "no peer holds it" is not evidence there; until the roster is known, a
     removal is ``absent`` only when the document's own metadata says it is gone (AC-05's positive
     verification of a deletion or lost access), and is otherwise withheld.
+
+    ``restricted`` — the document is under a standing provider minimum (R51 blind-final 1). A removal
+    that needs no read (one stream, known roster; or every peer passed its barrier) still settles;
+    one that would need the document's own metadata is ``restricted``: retained, never probed early,
+    and a claim is never honoured without the provider's answer.
+
+    A removal carrying EXPLICIT trash evidence (``payload["trashed"]``, R51 final 2) is ``absent`` at
+    once: the provider already said the document itself is trashed — the very answer a probe would
+    seek — so no peer, barrier or probe can add to it, and no restriction is consulted (no read is
+    made). An ambiguous ``removed`` hint never carries it.
     """
+    if (work.payload or {}).get("trashed") is True:
+        return "absent"
     own = state.get_progress(work.namespace)
     connection_id = own.key.connection_id if own is not None else execution.integration_id
     roster_unknown = state.unknown_root_count(connection_id, work.generation) > 0
@@ -2566,6 +3631,9 @@ def _cross_stream_removal(
     # A claim is membership a stream recorded, not an observation that the document survived the
     # removal — even where that stream's change log can be read now. So the provider's own answer
     # is read before any claim is honoured, and read once: gone at the provider, no claim keeps it.
+    if claimants and restricted:
+        state.fail_work(work, _RESTRICTED_PROBE_PENDING, not_before=work.not_before, failure=False)
+        return "restricted"
     if claimants and _document_loss_verified(source, work.item_key):
         return "absent"
     if any(not _cannot_read(by_namespace.get(namespace)) for namespace in claimants):
@@ -2591,6 +3659,9 @@ def _cross_stream_removal(
     # Behind an unreadable stream that claims nothing — or a roster an unresolved root may extend —
     # the document is read for itself here; a claim was already weighed against the provider's
     # answer above, and is not read again.
+    if not claimants and (unreadable or roster_unknown) and restricted:
+        state.fail_work(work, _RESTRICTED_PROBE_PENDING, not_before=work.not_before, failure=False)
+        return "restricted"
     if (
         not claimants and (unreadable or roster_unknown)
         and _document_loss_verified(source, work.item_key)
@@ -2644,7 +3715,12 @@ def _record_sink_failure(
         return False
     summary.failed += 1
     if work:
-        _fail_work(state, work, str(exc), retry_after=not_before)
+        # The combined wait (Retry-After or the client's own fallback, plus jitter) only delays the
+        # next attempt; the brain-named part alone is an external minimum (R51 L2).
+        _fail_work(
+            state, work, str(exc), retry_after=not_before, external=False,
+            minimum=getattr(exc, "provider_not_before", None),
+        )
     return not deferred
 
 
@@ -2779,6 +3855,13 @@ async def _checkpoint_progress(
         execution.generation,
         state.root_obligations(execution.integration_id, execution.generation),
     )
+    # Standing provider minimums travel with every cursor checkpoint (AIO-1167 R47 F5, R49 F1): this
+    # account's own hold and resource restrictions, and every other account's evidence carried
+    # forward unchanged (R50). Built from the acknowledged evidence and the local journal, so a
+    # checkpoint can add or extend a minimum but never drop a standing one; a lapsed one is dropped.
+    apply_restriction_sections(
+        cursor_document, _restriction_sections(state, execution, progress.key.credential_id),
+    )
     # The coordinator owns cursors and roots, never renewal's channel lifecycle: that is carried
     # from the acknowledged document unchanged, so a poll cannot erase a watch intent or record.
     payload = coordinator_document(execution.progress, cursor_document)
@@ -2838,6 +3921,16 @@ def _merge_summary(target: IngestSummary, source: IngestSummary) -> None:
     target.failure_categories = target.failure_categories or {}
     for key, value in (source.failure_categories or {}).items():
         target.failure_categories[key] = target.failure_categories.get(key, 0) + value
+    # A root verified unavailable by several streams or phases counts once per run (R50 F7).
+    roots = source.__dict__.get("_verified_unavailable_roots")
+    if roots:
+        seen: set[tuple[str, str]] = target.__dict__.setdefault("_verified_unavailable_roots", set())
+        seen.update(roots)
+        target.failure_categories["selection_root_unavailable"] = len(seen)
+    # An unpublished restriction owner is reported once per run, however many streams saw it (R51 F3).
+    unpublished = source.__dict__.get("_unpublished_restrictions")
+    if unpublished:
+        _note_unpublished(target, set(unpublished))
 
 
 def _retry_deferred(not_before: str | None, *, now: str | None = None) -> bool:

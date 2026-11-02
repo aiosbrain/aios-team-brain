@@ -338,7 +338,13 @@ async def test_a_service_account_identity_failure_after_resolution_is_reported_a
     [report] = b.reports()
     assert report["integrationId"] == INTEGRATION
     assert report["error"] == category
-    assert report["failed"] == 1 and report["authoritativeComplete"] is False
+    assert report["authoritativeComplete"] is False
+    if case == "provider_deferred":
+        # A provider wait, not a failure (AIO-1167 R47 F5): the run is held — partial — and the
+        # account hold is recorded before any stream exists.
+        assert report["failed"] == 0 and report["skipped"] == 1 and report["status"] == "partial"
+    else:
+        assert report["failed"] == 1
     verified = [body for method, path, body in b.requests
                 if path == "/api/v1/integrations/gdrive/execution"
                 and (body or {}).get("action") == "verify_service_account"]

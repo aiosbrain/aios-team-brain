@@ -14,7 +14,7 @@ import json
 import time
 from typing import Any
 
-from ..watch_lifecycle import WatchNotDispatched, WatchRecord, WatchRefused, parse_instant
+from ..watch_lifecycle import WatchNotDispatched, WatchQuotaLimited, WatchRecord, WatchRefused, parse_instant
 from .base import MissingExtraError
 
 # Default bound for one provider request when the caller supplies no absolute deadline.
@@ -28,6 +28,17 @@ def _status_of(exc: Exception) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _raise_if_quota(exc: Exception) -> None:
+    """An account quota answer (429, or a 403 naming a quota reason) is the ACCOUNT's, classified and
+    represented by the polling provider owner (R51 final 3) — raised as ``WatchQuotaLimited``. Any
+    other answer is left to the caller's existing handling."""
+    from .gdrive import quota_deferral
+
+    deferral = quota_deferral(exc)
+    if deferral is not None:
+        raise WatchQuotaLimited(deferral) from exc
 
 
 def _remaining(deadline: float | None) -> float:
@@ -137,6 +148,8 @@ class GoogleDriveWatchManager:
         try:
             return dict(request.execute(num_retries=0))
         except Exception as exc:
+            # A quota answer is a definitive refusal (nothing created) AND the account's hold.
+            _raise_if_quota(exc)
             status = _status_of(exc)
             if status is not None and 400 <= status < 500 and status != 408:
                 raise WatchRefused(status) from exc
@@ -153,6 +166,7 @@ class GoogleDriveWatchManager:
         except Exception as exc:
             if _status_of(exc) == 404:
                 return
+            _raise_if_quota(exc)  # the channel still exists: its record stays cleanup_pending
             raise
 
 

@@ -16,7 +16,25 @@ Section                            Owner (sole writer)             Every other w
 ``watches``                        renewal — channel lifecycle     the coordinator carries it unchanged;
                                    (intents, active, uncertain,    a poll may never erase an intent or
                                    cleanup, retired)               a terminal record
+``account_hold``,                  the shared restriction owner    renewal's lifecycle checkpoints carry
+``document_restrictions``,         (``gdrive_sync._publish_        them unchanged; the brain's
+``retained_restrictions``          restriction_evidence``) —       scope/credential transition keeps
+                                   provider minimums observed by   exactly these three
+                                   the coordinator (R47 F5, R49
+                                   F1, R50) or by renewal's watch
+                                   calls (R51 final 3)
 =================================  ==============================  ===================================
+
+Renewal contributes a provider minimum only as an OBSERVATION through that same owner — journaled
+locally, then published onto the latest acknowledged document under its own fence and revision,
+monotonically (add or extend, never shorten or drop) — never as a separate watch hold, and never by
+writing coordinator sections itself (AIO-1167 R51 final 3).
+
+Provider minimums are bound to the verified account and the stable provider resource, never to a
+selection generation (AIO-1167 R50): ``account_hold`` and ``document_restrictions`` hold the
+publishing worker's OWN verified account, ``retained_restrictions`` carries every OTHER account's
+standing evidence forward unchanged, so another account neither inherits nor erases it. The
+generation recorded in a section is observation context only.
 
 A legacy checkpoint kept renewal's fields inside each stream record (``watch_*``); the coordinator
 carries those per stream too, so an upgrade cannot erase them either.
@@ -29,11 +47,25 @@ whole contract: the coordinator builds its document with :func:`coordinator_docu
 from __future__ import annotations
 
 import copy
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Callable
 
 from .state import ROOT_STATES, RootBinding
 
 ROOTS_KEY = "roots"
+# The coordinator's account-level provider hold (AIO-1167 R47 F5): ``{generation, credential,
+# not_before, category}``. Published with the coordinator's checkpoints, so a sidecar that restores
+# from the brain makes no provider call for that account before ``not_before``.
+ACCOUNT_HOLD_KEY = "account_hold"
+# Provider-named minimums for single documents (AIO-1167 R49 F1): ``{generation, credential,
+# items: [{id, not_before, category, unrepresentable}]}``. The coordinator's, published with its
+# checkpoints and restored before any provider read of a listed document.
+DOCUMENT_RESTRICTIONS_KEY = "document_restrictions"
+# Standing provider minimums of the connection's OTHER verified accounts (AIO-1167 R50):
+# ``{credential: {account_hold?: {not_before, category}, items: [{id, not_before, category,
+# unrepresentable}]}}``. Carried forward unchanged by a worker of another account.
+RETAINED_RESTRICTIONS_KEY = "retained_restrictions"
+RESTRICTION_KEYS = (ACCOUNT_HOLD_KEY, DOCUMENT_RESTRICTIONS_KEY, RETAINED_RESTRICTIONS_KEY)
 WATCHES_KEY = "watches"
 # Renewal's legacy per-stream fields. A stream record is otherwise the coordinator's alone.
 RENEWAL_STREAM_PREFIX = "watch_"
@@ -144,3 +176,185 @@ def parse_roots_section(document: dict[str, Any], generation: int) -> dict[tuple
             str(detail)[:_DETAIL_LIMIT] if isinstance(detail, str) else None,
         )
     return parsed
+
+
+# -- provider-minimum evidence (AIO-1167 R50) ------------------------------------------------------
+#
+# Evidence is keyed by verified account (the sidecar's credential namespace) and, for a resource,
+# by stable provider id: ``{credential: {"hold": (not_before, category) | None,
+# "resources": {provider_id: (not_before, category, unrepresentable)}}}``. Every merge is
+# monotonic — a later, shorter minimum never shortens a standing one — and an unrepresentable
+# resource minimum stays unrepresentable: it is fail-closed, never an ordinary instant that lapses.
+
+Hold = tuple[str, str]
+Resource = tuple[str, str, bool]
+
+
+def _moment(value: object) -> datetime | None:
+    """An ISO instant for ordering, or ``None`` when it is not one (never guessed)."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return at if at.tzinfo is not None else at.replace(tzinfo=timezone.utc)
+
+
+def merge_hold(held: Hold | None, other: Hold | None) -> Hold | None:
+    """The later of two account holds."""
+    if held is None:
+        return other
+    if other is None:
+        return held
+    current, candidate = _moment(held[0]), _moment(other[0])
+    if candidate is not None and (current is None or candidate > current):
+        return other
+    return held
+
+
+def merge_resource(held: Resource | None, other: Resource | None) -> Resource | None:
+    """The stronger of two resource minimums: unrepresentable wins, then the later instant."""
+    if held is None:
+        return other
+    if other is None:
+        return held
+    if held[2]:
+        return held
+    if other[2]:
+        return other
+    current, candidate = _moment(held[0]), _moment(other[0])
+    if candidate is not None and (current is None or candidate > current):
+        return other
+    return held
+
+
+def add_hold(evidence: dict[str, dict[str, Any]], credential: str, hold: Hold | None) -> None:
+    """Merge one account hold into ``evidence`` (monotonic)."""
+    if not credential or hold is None:
+        return
+    account = evidence.setdefault(credential, {"hold": None, "resources": {}})
+    account["hold"] = merge_hold(account["hold"], hold)
+
+
+def add_resource(
+    evidence: dict[str, dict[str, Any]], credential: str, provider_id: str, resource: Resource | None,
+) -> None:
+    """Merge one resource minimum into ``evidence`` (monotonic, unrepresentable sticky)."""
+    if not credential or not provider_id or resource is None:
+        return
+    account = evidence.setdefault(credential, {"hold": None, "resources": {}})
+    account["resources"][provider_id] = merge_resource(account["resources"].get(provider_id), resource)
+
+
+def _parse_items(items: object) -> list[tuple[str, Resource]]:
+    parsed: list[tuple[str, Resource]] = []
+    if not isinstance(items, list):
+        return parsed
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        provider_id, not_before = item.get("id"), item.get("not_before")
+        if not isinstance(provider_id, str) or not provider_id or _moment(not_before) is None:
+            continue
+        parsed.append((provider_id, (
+            str(not_before), str(item.get("category") or "provider_unavailable"),
+            item.get("unrepresentable") is True,
+        )))
+    return parsed
+
+
+def _parse_hold(hold: object, default_credential: str | None = None) -> tuple[str, Hold] | None:
+    if not isinstance(hold, dict):
+        return None
+    credential = hold.get("credential", default_credential)
+    not_before = hold.get("not_before")
+    if not isinstance(credential, str) or not credential or _moment(not_before) is None:
+        return None
+    return credential, (str(not_before), str(hold.get("category") or "rate_limited"))
+
+
+def parse_restriction_evidence(document: object) -> dict[str, dict[str, Any]]:
+    """Every provider minimum an acknowledged document holds, for every verified account.
+
+    The generation a section names is observation context, not a lifetime: it is read but never
+    used to discard evidence. Anything malformed is ignored, never guessed into a minimum.
+    """
+    evidence: dict[str, dict[str, Any]] = {}
+    if not isinstance(document, dict):
+        return evidence
+    own_hold = _parse_hold(document.get(ACCOUNT_HOLD_KEY))
+    if own_hold is not None:
+        add_hold(evidence, *own_hold)
+    section = document.get(DOCUMENT_RESTRICTIONS_KEY)
+    if isinstance(section, dict) and isinstance(section.get("credential"), str) and section["credential"]:
+        for provider_id, resource in _parse_items(section.get("items")):
+            add_resource(evidence, section["credential"], provider_id, resource)
+    retained = document.get(RETAINED_RESTRICTIONS_KEY)
+    if isinstance(retained, dict):
+        for credential, entry in retained.items():
+            if not isinstance(credential, str) or not credential or not isinstance(entry, dict):
+                continue
+            hold = _parse_hold(entry.get(ACCOUNT_HOLD_KEY), credential)
+            if hold is not None:
+                add_hold(evidence, credential, hold[1])
+            for provider_id, resource in _parse_items(entry.get("items")):
+                add_resource(evidence, credential, provider_id, resource)
+    return evidence
+
+
+def restriction_sections(
+    evidence: dict[str, dict[str, Any]],
+    *,
+    credential: str,
+    generation: int,
+    standing: Callable[[str, bool], bool],
+) -> dict[str, Any]:
+    """The three restriction sections a worker of ``credential`` publishes from ``evidence``.
+
+    ``standing(not_before, unrepresentable)`` drops what has lapsed; an unrepresentable minimum
+    never lapses. The worker's own account goes in ``account_hold`` / ``document_restrictions``
+    (with this generation as context); every other account's standing evidence goes, unchanged, in
+    ``retained_restrictions``. A key whose value is ``None`` is not published.
+    """
+    sections: dict[str, Any] = {key: None for key in RESTRICTION_KEYS}
+    retained: dict[str, Any] = {}
+    for account_id in sorted(evidence):
+        account = evidence[account_id]
+        hold = account.get("hold")
+        if hold is not None and not standing(hold[0], False):
+            hold = None
+        items = [
+            {"id": provider_id, "not_before": resource[0], "category": resource[1],
+             "unrepresentable": resource[2]}
+            for provider_id, resource in sorted((account.get("resources") or {}).items())
+            if resource is not None and standing(resource[0], resource[2])
+        ]
+        if account_id == credential:
+            if hold is not None:
+                sections[ACCOUNT_HOLD_KEY] = {
+                    "generation": int(generation), "credential": account_id,
+                    "not_before": hold[0], "category": hold[1],
+                }
+            if items:
+                sections[DOCUMENT_RESTRICTIONS_KEY] = {
+                    "generation": int(generation), "credential": account_id, "items": items,
+                }
+        elif hold is not None or items:
+            entry: dict[str, Any] = {"items": items}
+            if hold is not None:
+                entry[ACCOUNT_HOLD_KEY] = {"not_before": hold[0], "category": hold[1]}
+            retained[account_id] = entry
+    if retained:
+        sections[RETAINED_RESTRICTIONS_KEY] = retained
+    return sections
+
+
+def apply_restriction_sections(document: dict[str, Any], sections: dict[str, Any]) -> None:
+    """Write the three restriction sections into ``document``; a ``None`` section is removed."""
+    for key in RESTRICTION_KEYS:
+        value = sections.get(key)
+        if value is None:
+            document.pop(key, None)
+        else:
+            document[key] = copy.deepcopy(value)

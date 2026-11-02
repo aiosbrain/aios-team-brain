@@ -53,7 +53,7 @@ vi.mock("@/lib/integrations/manage", async (importOriginal) => {
 
 const { saveIntegration, saveGoogleDrivePickerSelection } = await import("@/app/t/[team]/admin/integrations/actions");
 
-const OLD = { subject: "subject:acct-old", email: "old@example.com", scopes: ["scope-old"] };
+const OLD = { subject: "subject:acct-old", email: "old@example.com", scopes: ["openid", "https://www.googleapis.com/auth/drive.readonly"] };
 const NEW = { subject: "subject:acct-new", email: "new@example.com", scopes: ["openid", "https://www.googleapis.com/auth/drive.file"] };
 const DOC_MIME = "application/vnd.google-apps.document";
 

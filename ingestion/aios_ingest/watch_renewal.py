@@ -45,15 +45,18 @@ from . import brain_client
 from .brain_client import BrainClient, BrainError
 from .config import BrainSettings, Connection
 from .connector_state import renewal_document
+from .engine import IngestSummary
 from .gdrive_sync import (
-    ServiceAccountBindingRefused, oauth_account_namespace, provider_source_options, service_account_namespace,
+    ServiceAccountBindingRefused, _adopt_remote_restriction_evidence, _flush_restriction_evidence,
+    _standing_account_hold, oauth_account_namespace, provider_source_options, service_account_namespace,
 )
 from .selections import bind_local_gdrive, effective_gdrive_connection
 from .state import StateStore, StreamKey, verification_hash
 from .watch_lifecycle import (
     ACTIVE, CLEANUP_PENDING, DISPATCHED, EXPIRED, PENDING_STATES, PREPARED, RETIRED, UNCERTAIN,
-    InvalidWatchResponse, WatchNotDispatched, WatchRecord, WatchRefused, from_section, now_iso,
-    parse_instant, requested_expiry, to_section, transition, validate_watch_response,
+    InvalidWatchResponse, WatchNotDispatched, WatchQuotaLimited, WatchRecord, WatchRefused,
+    from_section, now_iso, parse_instant, requested_expiry, to_section, transition,
+    validate_watch_response,
 )
 
 log = logging.getLogger(__name__)
@@ -96,6 +99,35 @@ async def _wait_bounded(awaitable: Any, timeout: float) -> Any:
     the deadline passes instead of racing a wall clock.
     """
     return await asyncio.wait_for(awaitable, timeout=timeout)
+
+
+class _AccountQuotaHeld(Exception):
+    """A watch creation or stop met the account's quota (R51 final 3): no further watch call is made
+    for this account in this sweep. ``deferral`` is the polling owner's ``ProviderDeferred``."""
+
+    def __init__(self, deferral: Any):
+        super().__init__("watch account quota")
+        self.deferral = deferral
+
+
+async def _publish_watch_restrictions(run: "_Run", conn: Connection, account_id: str) -> None:
+    """Publish the account's standing provider minimums from renewal through the coordinator's ONE
+    restriction owner (R51 final 3): onto the latest acknowledged document, under this execution's
+    fence and progress revision, adding or extending only. A failed or lost acknowledgment keeps the
+    local journal and is reported unpublished; under the uncertainty latch nothing is sent; a terminal
+    authority refusal is reported, not raised. One attempt, never a loop."""
+    report = IngestSummary(conn.name, failure_categories={}, integration_id=run.execution.integration_id)
+    try:
+        await run.bounded(_flush_restriction_evidence(
+            run.client, run.execution, run.state, account_id, report,
+        ))
+    except WatchStepTimeout:
+        report.failure_categories["account_hold_unpublished"] = 1
+    if report.failure_categories:
+        log.warning(
+            "Drive watch renewal for %s: restriction evidence %s",
+            conn.name, ", ".join(sorted(report.failure_categories)),
+        )
 
 
 class WatchStepTimeout(Exception):
@@ -348,6 +380,23 @@ async def _create(
         if isinstance(exc.__cause__, BrainError):
             raise exc.__cause__  # the live authority check refused: nothing more for this connection
         return
+    except WatchQuotaLimited as exc:
+        # Definitive — nothing was created — so this attempt retires; but the answer is the
+        # ACCOUNT's quota (R51 final 3): renewal stops here and the hold is journaled and published.
+        # Creation is never retried automatically; the predecessor and the cursor are untouched.
+        # The hold is journaled BEFORE the retirement is published (R51 F2): if that publication
+        # fails, times out, loses its acknowledgment, is refused or is cancelled, its own outcome
+        # propagates unchanged and ends this connection's run — nothing is projected, no further
+        # watch call is made — while the local hold still blocks polling and renewal until
+        # Retry-After. A fresh acquisition publishes it through the shared restriction owner.
+        # (The outer handler's second, monotonic write on success is harmless.)
+        deferral = exc.deferral
+        run.state.hold_connection(
+            run.execution.integration_id, run.execution.generation, account_id,
+            str(deferral.not_before), str(getattr(deferral, "category", "rate_limited")),
+        )
+        await run.publish(transition(dispatched, RETIRED, detail="provider quota limited"))
+        raise _AccountQuotaHeld(deferral) from exc
     except WatchRefused as exc:
         await run.publish(transition(dispatched, RETIRED, detail=f"provider refused ({exc.status})"))
         return
@@ -393,6 +442,10 @@ async def _cleanup(
             raise
         except BrainError:
             raise
+        except WatchQuotaLimited as exc:
+            # The channel still exists: the record stays cleanup_pending, spending no stop attempt —
+            # the account's quota is not this channel's failure (R51 final 3).
+            raise _AccountQuotaHeld(exc.deferral) from exc
         except Exception as exc:
             await run.publish(_bump_stop(record, f"stop failed: {type(exc).__name__}"))
             continue
@@ -444,22 +497,56 @@ async def _renew_connection(
                     # Fail closed: no channel under an account the coordinator will not run as.
                     log.warning("Drive watch renewal for %s refused: %s", conn.name, exc.category)
                     return
-            provider_gate = client.gdrive_provider_gate(execution)
-            closers.append(provider_gate.close)
+            # The verified account's provider hold binds the watch lifecycle too (R51 blind-final 3):
+            # the brain's acknowledged minimums for THIS account — never another credential's — are
+            # adopted through the coordinator's own restriction owner, and a standing hold, local or
+            # acknowledged, stops every watch creation and cleanup call until it lapses.
+            _adopt_remote_restriction_evidence(
+                state, execution, execution.integration_id, execution.generation, account_id,
+            )
+            hold = _standing_account_hold(
+                state, execution.integration_id, execution.generation, account_id,
+            )
             # The local projection is rebuilt from the brain's record — what a lost or stale local
-            # state lacks is restored before any decision is made.
+            # state lacks is restored before any decision is made. Recovery publishes record outcomes
+            # under the fence and makes no provider call, so it runs under a hold as well.
             for record in run.records.values():
                 if record.connection == conn.name:
                     state.save_watch_record(record)
             await _recover(run, conn.name, now)
-            await _create_where_due(
-                run, manager, conn, budget, now, account_id=account_id,
-                access_token=access_token, provider_gate=provider_gate,
-            )
-            await _cleanup(
-                run, manager, conn.name, budget, access_token=access_token,
-                provider_gate=provider_gate,
-            )
+            if hold is not None:
+                # Existing channels, their evidence and every cursor stay exactly as they are;
+                # polling's own admission honours the same hold. A hold an earlier sweep or run kept
+                # only locally is published from this fresh acquisition, once (R51 final 3).
+                await _publish_watch_restrictions(run, conn, account_id)
+                log.info("Drive watch renewal for %s held until %s", conn.name, hold["not_before"])
+                return
+            provider_gate = client.gdrive_provider_gate(execution)
+            closers.append(provider_gate.close)
+            try:
+                await _create_where_due(
+                    run, manager, conn, budget, now, account_id=account_id,
+                    access_token=access_token, provider_gate=provider_gate,
+                )
+                await _cleanup(
+                    run, manager, conn.name, budget, access_token=access_token,
+                    provider_gate=provider_gate,
+                )
+            except _AccountQuotaHeld as held:
+                # The account's quota, learned from a watch call (R51 final 3): journaled locally
+                # FIRST — monotonic, under this verified account — so no watch or polling call for
+                # it is made before the deadline whatever happens next; then published through the
+                # shared restriction owner. No further creation or cleanup in this sweep either way.
+                deferral = held.deferral
+                state.hold_connection(
+                    execution.integration_id, execution.generation, account_id,
+                    str(deferral.not_before), str(getattr(deferral, "category", "rate_limited")),
+                )
+                await _publish_watch_restrictions(run, conn, account_id)
+                log.info(
+                    "Drive watch renewal for %s stopped by the account quota until %s",
+                    conn.name, deferral.not_before,
+                )
     except asyncio.CancelledError:
         raise
     except Exception as exc:

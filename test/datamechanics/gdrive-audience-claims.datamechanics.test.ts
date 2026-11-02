@@ -199,6 +199,55 @@ describe("AIO-1167 Drive audience claims (real Postgres)", () => {
     },
   );
 
+  it("a verified-trash removal retires only the reporting connection's claim and suppresses on the last (R51 final 2)", async () => {
+    // The sidecar reconciles explicit trash evidence — even under a restricted parent root, with no
+    // provider read — through this one claim-aware owner, with the reason text it always sends. The
+    // outcome must be the real PostgreSQL one, not only the sidecar's in-memory ledger.
+    const seed = await seedTeam();
+    const { data: other } = await db().from("members").insert({
+      team_id: seed.teamId, email: `${randomUUID()}@test.local`, display_name: "Other",
+      actor_handle: `other-${randomUUID()}`, role: "member", tier: "team", status: "active",
+    }).select("id").single();
+    const otherId = (other as { id: string }).id;
+    const projectA = await privateAudience(seed, seed.memberId, "trash-a");
+    const projectB = await privateAudience(seed, otherId, "trash-b");
+    const connectionA = await connection(seed, "trash-connection-a", projectA);
+    const connectionB = await connection(seed, "trash-connection-b", projectB);
+    const item = await driveFixture(seed, {
+      project: "drive-trash", path: "gdrive/trashed-doc.md", body: "verified trash body",
+      frontmatter: { source: "gdrive", source_id: "trashed-doc", title: "Trashed Drive doc" },
+    }, { unclaimed: true });
+    for (const [integrationId, projectId] of [[connectionA, projectA], [connectionB, projectB]] as const) {
+      await recordGdriveItemClaim(db(), {
+        teamId: seed.teamId, integrationId, providerId: "trashed-doc", itemId: item.id,
+        generation: 1, audienceProjectIds: [projectId],
+      });
+    }
+    const readerA = { teamId: seed.teamId, memberId: seed.memberId };
+    const readerB = { teamId: seed.teamId, memberId: otherId };
+    expect(await canSeeItem(db(), readerA, item.id)).toBe(true);
+    expect(await canSeeItem(db(), readerB, item.id)).toBe(true);
+    const trash = (connectionId: string) => reconcileGdriveItems(db(), seed.teamId, {
+      connectionId, removedProviderIds: ["trashed-doc"],
+      reason: "Google Drive removal, trash, or access denial",
+    });
+
+    // Connection A reports the trash: only A's claim is retired; B's valid claim keeps the item.
+    await trash(connectionA);
+    expect(await canSeeItem(db(), readerA, item.id)).toBe(false);
+    expect(await canSeeItem(db(), readerB, item.id)).toBe(true);
+
+    // Connection B reports it too: the last claim — the content is suppressed for every reader.
+    await trash(connectionB);
+    expect(await canSeeItem(db(), readerA, item.id)).toBe(false);
+    expect(await canSeeItem(db(), readerB, item.id)).toBe(false);
+
+    // A replay after a lost acknowledgment changes nothing and restores nothing.
+    await trash(connectionA);
+    expect(await canSeeItem(db(), readerA, item.id)).toBe(false);
+    expect(await canSeeItem(db(), readerB, item.id)).toBe(false);
+  });
+
   it("never adopts an unrelated exact path and deterministically allocates a safe Drive path", async () => {
     const seed = await seedTeam();
     const original = await ingest(seed, {
