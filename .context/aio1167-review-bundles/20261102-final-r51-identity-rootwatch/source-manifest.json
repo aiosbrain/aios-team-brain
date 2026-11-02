@@ -1,0 +1,450 @@
+{
+  "base": "5ecd2989e21fded915b41b508477bb267aaec06d",
+  "review_head": "05944f3bf42b265e6a994779b1074bc4af0f1edb",
+  "source_commit": "4f515e0ee20e25649019b5889188977dedbf92f0",
+  "branch": "codex/aio-1167-google-docs-connector-rebased",
+  "remote_checkpoint": {
+    "ref": "origin/codex/aio-1167-r51-resume-20261102",
+    "sha": "05944f3bf42b265e6a994779b1074bc4af0f1edb"
+  },
+  "source_file_count": 65,
+  "workflow_evidence_file_count": 34,
+  "source_diff_sha256": "b1d4eec438083a50d1a22bce73389b1ff28a11238a57e61e5b7d4760cceb1d79",
+  "source_diff_bytes": 747399,
+  "all_changed_path_status": [
+    "M\t.context/aio1167-rebase-handoff/CURRENT.md",
+    "A\t.context/aio1167-rebase-handoff/identity-live-wip-20261102T1323Z/capture.json",
+    "A\t.context/aio1167-rebase-handoff/identity-live-wip-20261102T1323Z/tracked.diff",
+    "A\t.context/aio1167-rebase-handoff/identity-live-wip-20261102T1323Z/untracked/lib/identity/google-email-authority.ts",
+    "A\t.context/aio1167-rebase-handoff/pr743-current-candidate-verification-20261102.md",
+    "A\t.context/aio1167-rebase-handoff/pr743-google-identity-reader-correction-prompt-20261102.md",
+    "A\t.context/aio1167-rebase-handoff/pr743-identity-adjudication-20261102.md",
+    "A\t.context/aio1167-rebase-handoff/pr743-identity-fix-prompt-20261102.md",
+    "A\t.context/aio1167-rebase-handoff/pr743-identity-verification-corrections-20261102.md",
+    "A\t.context/aio1167-rebase-handoff/pr743-pr714-google-reader-ownership-ack-20261102.md",
+    "A\t.context/aio1167-rebase-handoff/pr743-pr714-ownership-ack-20261102.md",
+    "A\t.context/aio1167-rebase-handoff/pr743-root-watch-correction-result-20261102.md",
+    "A\t.context/aio1167-rebase-handoff/pr743-root-watch-verification-20261102.md",
+    "A\t.context/aio1167-rebase-handoff/root-watch-live-wip-20261102T1304Z/capture.json",
+    "A\t.context/aio1167-rebase-handoff/root-watch-live-wip-20261102T1304Z/tracked.diff",
+    "A\t.context/aio1167-rebase-handoff/root-watch-live-wip-20261102T1304Z/untracked/ingestion/tests/test_watch_late_quota.py",
+    "A\t.context/aio1167-review-bundles/20261102-final-identity-review/acceptance-mapping.md",
+    "A\t.context/aio1167-review-bundles/20261102-final-identity-review/accepted-spec.md",
+    "A\t.context/aio1167-review-bundles/20261102-final-identity-review/astra-final-review.md",
+    "A\t.context/aio1167-review-bundles/20261102-final-identity-review/bundle-index.json",
+    "A\t.context/aio1167-review-bundles/20261102-final-identity-review/changed-files.txt",
+    "A\t.context/aio1167-review-bundles/20261102-final-identity-review/fable-review-metadata.json",
+    "A\t.context/aio1167-review-bundles/20261102-final-identity-review/fable-review-report.md",
+    "A\t.context/aio1167-review-bundles/20261102-final-identity-review/fable-review.json",
+    "A\t.context/aio1167-review-bundles/20261102-final-identity-review/fable-review.stderr",
+    "A\t.context/aio1167-review-bundles/20261102-final-identity-review/full-source.diff",
+    "A\t.context/aio1167-review-bundles/20261102-final-identity-review/identity-adjudication.md",
+    "A\t.context/aio1167-review-bundles/20261102-final-identity-review/identity-writer-corrections.md",
+    "A\t.context/aio1167-review-bundles/20261102-final-identity-review/ownership-ack.md",
+    "A\t.context/aio1167-review-bundles/20261102-final-identity-review/pr714-identity-decision.md",
+    "A\t.context/aio1167-review-bundles/20261102-final-identity-review/review-prompt.md",
+    "A\t.context/aio1167-review-bundles/20261102-final-identity-review/sol-final-review.md",
+    "A\t.context/aio1167-review-bundles/20261102-final-identity-review/source-manifest.json",
+    "A\t.context/aio1167-review-bundles/20261102-final-identity-review/verification-evidence.md",
+    "M\tapp/api/auth/gdrive/callback/route.ts",
+    "M\tapp/t/[team]/admin/integrations/actions.ts",
+    "M\tapp/t/[team]/admin/members/actions.ts",
+    "M\tcomponents/admin/identity-conflicts.tsx",
+    "M\tdocs/ARCHITECTURE.md",
+    "M\tingestion/aios_ingest/brain_client.py",
+    "M\tingestion/aios_ingest/connector_state.py",
+    "M\tingestion/aios_ingest/gdrive_sync.py",
+    "M\tingestion/aios_ingest/sources/gdrive.py",
+    "M\tingestion/aios_ingest/sources/gdrive_watch.py",
+    "M\tingestion/aios_ingest/state.py",
+    "M\tingestion/aios_ingest/watch_lifecycle.py",
+    "M\tingestion/aios_ingest/watch_renewal.py",
+    "A\tingestion/tests/test_account_hold_before_streams.py",
+    "A\tingestion/tests/test_bound_root_loss.py",
+    "A\tingestion/tests/test_brain_minimum_provenance.py",
+    "A\tingestion/tests/test_checkpoint_acknowledgment.py",
+    "A\tingestion/tests/test_checkpoint_uncertainty_latch.py",
+    "A\tingestion/tests/test_deferred_folder_enumeration.py",
+    "A\tingestion/tests/test_deferred_root_scope.py",
+    "A\tingestion/tests/test_document_restrictions.py",
+    "M\tingestion/tests/test_drain_recovery.py",
+    "A\tingestion/tests/test_exhaustion_is_not_completion.py",
+    "A\tingestion/tests/test_explicit_trash_evidence.py",
+    "A\tingestion/tests/test_flush_authority_outcome.py",
+    "M\tingestion/tests/test_gdrive_poll_reporting.py",
+    "M\tingestion/tests/test_gdrive_upgrade.py",
+    "A\tingestion/tests/test_identity_prerequisite_publication.py",
+    "A\tingestion/tests/test_lost_root_in_partial_build.py",
+    "A\tingestion/tests/test_pre_stream_scope.py",
+    "A\tingestion/tests/test_restricted_removal.py",
+    "A\tingestion/tests/test_restricted_root_recovery.py",
+    "A\tingestion/tests/test_restriction_lifetime.py",
+    "A\tingestion/tests/test_restriction_publication_recovery.py",
+    "A\tingestion/tests/test_retry_after_holds.py",
+    "A\tingestion/tests/test_retry_after_parsing.py",
+    "A\tingestion/tests/test_root_evidence_r49.py",
+    "A\tingestion/tests/test_watch_account_hold.py",
+    "A\tingestion/tests/test_watch_late_quota.py",
+    "M\tingestion/tests/test_watch_lifecycle.py",
+    "A\tingestion/tests/test_watch_quota_hold.py",
+    "M\tlib/attribution/resolve-authors.ts",
+    "M\tlib/dashboard/gdrive-contributions.ts",
+    "A\tlib/identity/google-email-authority.ts",
+    "M\tlib/identity/member-identities.ts",
+    "M\tlib/identity/resolve.ts",
+    "M\tlib/ingest/gdrive-contribution-store.ts",
+    "M\tlib/ingest/identity-repair.ts",
+    "M\tlib/ingest/reattribute.ts",
+    "M\tlib/integrations/gdrive-authority.ts",
+    "M\tlib/integrations/gdrive-oauth.ts",
+    "A\tpostgres/migrations/20261031140000_gdrive_restriction_generation_lifetime.sql",
+    "M\tpostgres/schema.sql",
+    "M\ttest/datamechanics/gdrive-admin-credential-race.datamechanics.test.ts",
+    "A\ttest/datamechanics/gdrive-admin-grant-policy.datamechanics.test.ts",
+    "M\ttest/datamechanics/gdrive-admin-test.datamechanics.test.ts",
+    "M\ttest/datamechanics/gdrive-audience-claims.datamechanics.test.ts",
+    "M\ttest/datamechanics/gdrive-authority.datamechanics.test.ts",
+    "A\ttest/datamechanics/gdrive-complete-snapshot-overlap.datamechanics.test.ts",
+    "A\ttest/datamechanics/gdrive-identity-email-reader.datamechanics.test.ts",
+    "A\ttest/datamechanics/gdrive-identity-tombstone-email.datamechanics.test.ts",
+    "M\ttest/datamechanics/gdrive-oauth-lock-order.datamechanics.test.ts",
+    "M\ttest/datamechanics/identity-discovery-conflicts.datamechanics.test.ts",
+    "A\ttest/gdrive-callback-identity-outcome.test.ts",
+    "M\ttest/identity-conflicts-view.test.ts"
+  ],
+  "working_tree_status": "",
+  "current_file_hashes": [
+    {
+      "path": "app/api/auth/gdrive/callback/route.ts",
+      "sha256": "6f7889e83283e1d1c07cbc2ebc1e017565e14b23dee1518f5bec2c72e2df8518",
+      "bytes": 12868
+    },
+    {
+      "path": "app/t/[team]/admin/integrations/actions.ts",
+      "sha256": "657f0fb09cfe243578d5bffa4f2bf6363e4459f5a4d2bc9cf5881baebe1f1968",
+      "bytes": 64760
+    },
+    {
+      "path": "app/t/[team]/admin/members/actions.ts",
+      "sha256": "8f88b29c7cda53c255bbeea31454f1b6a434e62d1939e3de76ed667143fe187e",
+      "bytes": 32530
+    },
+    {
+      "path": "components/admin/identity-conflicts.tsx",
+      "sha256": "ce6404ff329fb2c9b9a2049a091132c2d62ea8351e641b8a77c5822e3b2b91dd",
+      "bytes": 5509
+    },
+    {
+      "path": "docs/ARCHITECTURE.md",
+      "sha256": "bb55814c4315c169bf993e7c2995b46272cc7cccf024253478f838c6f3048b97",
+      "bytes": 640594
+    },
+    {
+      "path": "ingestion/aios_ingest/brain_client.py",
+      "sha256": "8a67ef0f5454b15436027d7ff3af472111d772dc2db779d0499d805753bebf13",
+      "bytes": 44069
+    },
+    {
+      "path": "ingestion/aios_ingest/connector_state.py",
+      "sha256": "2d98520ea89276812f85fa09dbf7f6f75dcc3bb00aacc4f14cd61bb4653af990",
+      "bytes": 17246
+    },
+    {
+      "path": "ingestion/aios_ingest/gdrive_sync.py",
+      "sha256": "13c23a0cbc981f6cab09e3f98d32bebcde84c4219071d11b2585d3dde49adf68",
+      "bytes": 222441
+    },
+    {
+      "path": "ingestion/aios_ingest/sources/gdrive.py",
+      "sha256": "7785c430f61c7b094cc3e53fe8a50f682f42b17603c5581746454b98b37fbc64",
+      "bytes": 56090
+    },
+    {
+      "path": "ingestion/aios_ingest/sources/gdrive_watch.py",
+      "sha256": "787ff87f1f69c3be6b4a38111696d284ced6f9f618179df557a6bd3bbc8ea8ee",
+      "bytes": 10457
+    },
+    {
+      "path": "ingestion/aios_ingest/state.py",
+      "sha256": "9014f5011dcd4b2a85e1992d6c39f24c953fa705a4839925d70d7d73701a6d65",
+      "bytes": 144897
+    },
+    {
+      "path": "ingestion/aios_ingest/watch_lifecycle.py",
+      "sha256": "c447e1b89119949a375749102ec7db4c1d22f5f46f9e83df86feebe07931cd16",
+      "bytes": 12429
+    },
+    {
+      "path": "ingestion/aios_ingest/watch_renewal.py",
+      "sha256": "b9d6495c47587ddbbdfe37a5e208e64cdefe4c772c2030e399780065b64830eb",
+      "bytes": 35253
+    },
+    {
+      "path": "ingestion/tests/test_account_hold_before_streams.py",
+      "sha256": "dc6c5e5a3ee1d30af6b7268b775403d548575443ef36462dbcf8145f1f58f768",
+      "bytes": 15413
+    },
+    {
+      "path": "ingestion/tests/test_bound_root_loss.py",
+      "sha256": "0dd5be18bc2d14b63a8896e806a49e9ef8e86c991b1b7e61f7fa2d5b223e4056",
+      "bytes": 13630
+    },
+    {
+      "path": "ingestion/tests/test_brain_minimum_provenance.py",
+      "sha256": "99306fe85c6fa67f4b81dd461e6702265dcef2edc5b0b475b2fee7041f6f483c",
+      "bytes": 11359
+    },
+    {
+      "path": "ingestion/tests/test_checkpoint_acknowledgment.py",
+      "sha256": "8a9fbe4d0a191110f49d758891491a73121a0d6dde4736ee253d9267a136c076",
+      "bytes": 18475
+    },
+    {
+      "path": "ingestion/tests/test_checkpoint_uncertainty_latch.py",
+      "sha256": "c8f2f19674f32dcf142d01ba4cbea64083fc64b4e3aa6dfbdf371b3f9c1ea63c",
+      "bytes": 5592
+    },
+    {
+      "path": "ingestion/tests/test_deferred_folder_enumeration.py",
+      "sha256": "2225d7e9075d56bfb66fc9fec9950398aff93eb809968b8aebc79dc6b590081d",
+      "bytes": 21531
+    },
+    {
+      "path": "ingestion/tests/test_deferred_root_scope.py",
+      "sha256": "39a4f3d755178a2ef5bdbc7b4a144d09a0ff09a139dbc69f3a05b44347f51f8a",
+      "bytes": 14694
+    },
+    {
+      "path": "ingestion/tests/test_document_restrictions.py",
+      "sha256": "7df63b454dcda4ce94788a54250a6d34080dff69eaf5a1e13c1470f9191b46ce",
+      "bytes": 25246
+    },
+    {
+      "path": "ingestion/tests/test_drain_recovery.py",
+      "sha256": "f4fb7515441f9c2afc9b983580a81ce1ddc12dae87a021e777c1caed58cef492",
+      "bytes": 20611
+    },
+    {
+      "path": "ingestion/tests/test_exhaustion_is_not_completion.py",
+      "sha256": "98932c8cb3aef54f976fe7d6cab0c354305edc7feae4436f3beac9c3e9b1e31e",
+      "bytes": 2835
+    },
+    {
+      "path": "ingestion/tests/test_explicit_trash_evidence.py",
+      "sha256": "6c232c6fa20a7d7c005cb97158cffb1e89fcb8a108c5de4787fd473629ba353e",
+      "bytes": 7424
+    },
+    {
+      "path": "ingestion/tests/test_flush_authority_outcome.py",
+      "sha256": "8d0a18706cd6167587679ffa10fbf3d7bed704a0a8d82342faa3fc0b7998479c",
+      "bytes": 20230
+    },
+    {
+      "path": "ingestion/tests/test_gdrive_poll_reporting.py",
+      "sha256": "76166eb459c227b2b15951aa5706177808cf9f819aee824041a52807882366e4",
+      "bytes": 24387
+    },
+    {
+      "path": "ingestion/tests/test_gdrive_upgrade.py",
+      "sha256": "cd5e7e19657a302d0a278df7fa145bb4c2c05ecda214eda875a074109dcb5352",
+      "bytes": 403860
+    },
+    {
+      "path": "ingestion/tests/test_identity_prerequisite_publication.py",
+      "sha256": "7c2dc6acd861a000a14b61c774f64b061fbe66aa62a79a9aade4f81a4ba500a0",
+      "bytes": 8544
+    },
+    {
+      "path": "ingestion/tests/test_lost_root_in_partial_build.py",
+      "sha256": "d4e36aa20f4859b31c6b8136247fdcda71a03a2f27f4598fdf607cca1703fb77",
+      "bytes": 12704
+    },
+    {
+      "path": "ingestion/tests/test_pre_stream_scope.py",
+      "sha256": "ff26f1a4d1b03ac0c30d21829bd3cfbb314deafd311e176bd10a3747727451bd",
+      "bytes": 8878
+    },
+    {
+      "path": "ingestion/tests/test_restricted_removal.py",
+      "sha256": "608b6ebb1eba5ee1b6c18ef72f3c35af0dede2eb43687f9787cca2c180d3257e",
+      "bytes": 13878
+    },
+    {
+      "path": "ingestion/tests/test_restricted_root_recovery.py",
+      "sha256": "f0bebdcee179d06a44b581ecbc9a72f28b1b4a60b5f555e0e419acee520a6400",
+      "bytes": 11669
+    },
+    {
+      "path": "ingestion/tests/test_restriction_lifetime.py",
+      "sha256": "e23e15e6a957cf00d8c87517b4f4d0ea088c06f93896dd8cd7f54233af92ee6e",
+      "bytes": 8995
+    },
+    {
+      "path": "ingestion/tests/test_restriction_publication_recovery.py",
+      "sha256": "23d5b1ade655a7c350753e2c26ddd5d0166ce380505feeaf7cb6cd5fca8f296e",
+      "bytes": 9853
+    },
+    {
+      "path": "ingestion/tests/test_retry_after_holds.py",
+      "sha256": "18337db7a6d6f8b23a42e24e808190948555d9c2164beef3c4d11c43ffaa2ed6",
+      "bytes": 11589
+    },
+    {
+      "path": "ingestion/tests/test_retry_after_parsing.py",
+      "sha256": "afab189721e54ef9cef2a77db6226832552a25a868d2107647680775fbed23cb",
+      "bytes": 8506
+    },
+    {
+      "path": "ingestion/tests/test_root_evidence_r49.py",
+      "sha256": "8e7e2565f48b14dbad8d5cbc0312d30b1957dc0e8d88ddcb833782f013d50682",
+      "bytes": 15147
+    },
+    {
+      "path": "ingestion/tests/test_watch_account_hold.py",
+      "sha256": "c88b084c82e669fb3a180c05f6666f7fea6f75b39a7fa246c61da1235f3d9ba2",
+      "bytes": 6719
+    },
+    {
+      "path": "ingestion/tests/test_watch_late_quota.py",
+      "sha256": "778165a0a85cd398dfc8a95b17ce8cc975d48bc2871d80d0420b26b9e9fb1b91",
+      "bytes": 17612
+    },
+    {
+      "path": "ingestion/tests/test_watch_lifecycle.py",
+      "sha256": "03e5ccf5e494bcfe071bdf7497360ab9af979f6eebfcfc0ff4866999613ff700",
+      "bytes": 35721
+    },
+    {
+      "path": "ingestion/tests/test_watch_quota_hold.py",
+      "sha256": "09ca544b8ff87e5d9961e5a5ca62586ecabf15f7de8b10cc94076023e52dd4f8",
+      "bytes": 25142
+    },
+    {
+      "path": "lib/attribution/resolve-authors.ts",
+      "sha256": "8dad27d0b8ca67e2df8b31dd741c254eca1f37e98256fd1c4ecd9c9b07d067b5",
+      "bytes": 14572
+    },
+    {
+      "path": "lib/dashboard/gdrive-contributions.ts",
+      "sha256": "c5d9e4ba0a12794a0ae2e5859a1f49fb5ff9815079dff67cb9b2aa7fa0a6303f",
+      "bytes": 3892
+    },
+    {
+      "path": "lib/identity/google-email-authority.ts",
+      "sha256": "bdc4b9464f0b8886aaf750b9da3b60604bd5341db2e73822ef19edbdc9a95f94",
+      "bytes": 2849
+    },
+    {
+      "path": "lib/identity/member-identities.ts",
+      "sha256": "f4438e278e25843c6060ae894d50b0ef729f2d034249ebb912258a6183c2b27a",
+      "bytes": 25689
+    },
+    {
+      "path": "lib/identity/resolve.ts",
+      "sha256": "118dc3ccd8fc2b1fba27ac0fe20345bc144964fa551cc9fe5f3f8f4bbd3577ed",
+      "bytes": 13967
+    },
+    {
+      "path": "lib/ingest/gdrive-contribution-store.ts",
+      "sha256": "9c2e4a53969c4e0d27fcf269e901ca46baa8bee4e167a160fbd7d5311036dad3",
+      "bytes": 10183
+    },
+    {
+      "path": "lib/ingest/identity-repair.ts",
+      "sha256": "c2d782852ef67b3a74b9f0ea990e87cce5a4331557c0c1880b8a0986e0a57236",
+      "bytes": 19434
+    },
+    {
+      "path": "lib/ingest/reattribute.ts",
+      "sha256": "21fd7ccfbad2ee8c2b1457567ff0be5947b2c6ec2d057b585ff08abdf5d302a4",
+      "bytes": 16794
+    },
+    {
+      "path": "lib/integrations/gdrive-authority.ts",
+      "sha256": "edf9cc6453e967b8fa24a434cd5e7085c699b123c959b2e4e026ee1edecdba52",
+      "bytes": 53964
+    },
+    {
+      "path": "lib/integrations/gdrive-oauth.ts",
+      "sha256": "7e18f280f4beb3f2cae953a74a48843ac439825e43e4f13ac5849e6b6fe1bd04",
+      "bytes": 15025
+    },
+    {
+      "path": "postgres/migrations/20261031140000_gdrive_restriction_generation_lifetime.sql",
+      "sha256": "5e0feb43c34157b81c073e51c590b67d9cc4188c5027445b61c67f3000b411f5",
+      "bytes": 4246
+    },
+    {
+      "path": "postgres/schema.sql",
+      "sha256": "c59db6714d10b17b1155c8b72e16815341aa8fdf6cefcbc5cf3526d882ff3d6e",
+      "bytes": 202582
+    },
+    {
+      "path": "test/datamechanics/gdrive-admin-credential-race.datamechanics.test.ts",
+      "sha256": "3c15216883df57ed2d106ffb298c16b61eb9cc599647a1adc469ef42ba4a7313",
+      "bytes": 14957
+    },
+    {
+      "path": "test/datamechanics/gdrive-admin-grant-policy.datamechanics.test.ts",
+      "sha256": "fea3264eefc7d4f6b8c7df33dcc706994a3e0b6c85f0d313f000c757eb26d31e",
+      "bytes": 9115
+    },
+    {
+      "path": "test/datamechanics/gdrive-admin-test.datamechanics.test.ts",
+      "sha256": "441119dece8db8315ccd9608b6e94e489130aba2e695caf2c72d4ff0a1a3f3ca",
+      "bytes": 12115
+    },
+    {
+      "path": "test/datamechanics/gdrive-audience-claims.datamechanics.test.ts",
+      "sha256": "8fb39b31fab19813761300db5b7ea3ccdbe38ba1cf3157131bd960c0e0468109",
+      "bytes": 49999
+    },
+    {
+      "path": "test/datamechanics/gdrive-authority.datamechanics.test.ts",
+      "sha256": "9c26c25e1c10cf417ed52a2315c76e2404bce5a4ccb921fd8db07ed1b81f1c4c",
+      "bytes": 82193
+    },
+    {
+      "path": "test/datamechanics/gdrive-complete-snapshot-overlap.datamechanics.test.ts",
+      "sha256": "53bb0c645254a06f0f2e3abcf8e49af564615b70126a51edbf785d3f8edf9ddf",
+      "bytes": 3804
+    },
+    {
+      "path": "test/datamechanics/gdrive-identity-email-reader.datamechanics.test.ts",
+      "sha256": "eeff8aafdcab3f9742e4e780f1d536ee807c3c80a83c12ba0993287b74a35e72",
+      "bytes": 14344
+    },
+    {
+      "path": "test/datamechanics/gdrive-identity-tombstone-email.datamechanics.test.ts",
+      "sha256": "f654b81e6666b5b8292b47d6c502e23098b00ad87c615756322f99160b01937e",
+      "bytes": 49181
+    },
+    {
+      "path": "test/datamechanics/gdrive-oauth-lock-order.datamechanics.test.ts",
+      "sha256": "04af79657b1299037d6051f1c0059d0dfa55472ac212837b9203a2042b911c39",
+      "bytes": 26841
+    },
+    {
+      "path": "test/datamechanics/identity-discovery-conflicts.datamechanics.test.ts",
+      "sha256": "b71dd6aa508cbce39b177ca6e74ebc5f9d4d819b001daecafb6bb2053b593c0a",
+      "bytes": 18530
+    },
+    {
+      "path": "test/gdrive-callback-identity-outcome.test.ts",
+      "sha256": "4c4d47c8c66303968cc06b7da9e261f2c1f4b4b9a2e585dbd2891316ffcddb06",
+      "bytes": 5047
+    },
+    {
+      "path": "test/identity-conflicts-view.test.ts",
+      "sha256": "cf5a393d3e9dcafbaa58d3aa603e30f8a031b9f1419cd5f36a295e86ac31b552",
+      "bytes": 3808
+    }
+  ],
+  "remote_patch_archive": {
+    "path": ".context/aio1167-review-bundles/20261102-final-r51-identity-rootwatch/source-candidate.diff.gz",
+    "sha256": "4d7d9478cfffcf4aa948e092199746d37bdfdde06a88a437ca77a5e0f0f4997b",
+    "bytes": 169502,
+    "uncompressed_sha256": "b1d4eec438083a50d1a22bce73389b1ff28a11238a57e61e5b7d4760cceb1d79",
+    "note": "Readable uncompressed patch stays available locally to Read/Glob/Grep review tools and can be regenerated from base and review_head."
+  }
+}
