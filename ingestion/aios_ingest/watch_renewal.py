@@ -532,12 +532,22 @@ async def _cleanup(
             return
         if account_id and _account_held(run, account_id):
             return  # a hold adopted during this sweep (e.g. a late worker's quota answer) stands
+        stop_operation = f"{WATCH_STOP_RESOURCE}{record.resource_id}"
+        if account_id and _operation_restricted(run.state, run.execution, account_id, stop_operation):
+            # A provider minimum for stopping THIS channel stands (A4) — learned earlier, possibly in
+            # this very sweep by a late worker. Waiting is not a failed stop: no attempt is spent, the
+            # record stays cleanup_pending, and the other channels are still stopped.
+            continue
         budget.stops -= 1
+        operation = (
+            (run.execution.integration_id, int(run.execution.generation), account_id, stop_operation)
+            if account_id else None
+        )
         try:
             await run.offload(lambda r=record: manager.stop(
                 r, str(r.resource_id), access_token=access_token, provider_gate=provider_gate,
                 deadline=run.deadline,
-            ), on_late=_late_evidence(loop, run.state, None, hold=hold))
+            ), on_late=_late_evidence(loop, run.state, None, hold=hold, operation=operation))
         except asyncio.CancelledError:
             raise
         except BrainError:
@@ -546,6 +556,14 @@ async def _cleanup(
             # The channel still exists: the record stays cleanup_pending, spending no stop attempt —
             # the account's quota is not this channel's failure (R51 final 3).
             raise _AccountQuotaHeld(exc.deferral) from exc
+        except WatchProviderMinimum as exc:
+            # A named minimum for stopping THIS channel (A4), under the verified account of the
+            # transport that made the call — not the record's possibly older account. The channel
+            # still exists; waiting is not a failed stop, so no attempt is spent and nothing is
+            # published for the record.
+            if account_id:
+                _restrict_operation(run.state, run.execution, account_id, stop_operation, exc.deferral)
+            continue
         except Exception as exc:
             await run.publish(_bump_stop(record, f"stop failed: {type(exc).__name__}"))
             continue
@@ -632,6 +650,11 @@ async def _renew_connection(
                     run, manager, conn.name, budget, access_token=access_token,
                     provider_gate=provider_gate, account_id=account_id,
                 )
+                # Operation minima learned in this sweep (A4) are already in the local journal; publish
+                # them now under this execution's live fence through the ONE restriction owner (a no-op
+                # when nothing is outstanding). A failed or lost acknowledgment keeps the journal, and
+                # the next acquisition or poll checkpoint publishes it.
+                await _publish_watch_restrictions(run, conn, account_id)
             except _AccountQuotaHeld as held:
                 # The account's quota, learned from a watch call (R51 final 3): journaled locally
                 # FIRST — monotonic, under this verified account — so no watch or polling call for
@@ -695,6 +718,11 @@ async def _create_where_due(
         predecessor = (active[-1].attempt_id if active else (legacy[-1].channel_id if legacy else None))
         if _account_held(run, account_id):
             return  # a hold adopted during this sweep (e.g. a late worker's quota answer) stands
+        if _operation_restricted(run.state, run.execution, account_id, f"{WATCH_CREATE_RESOURCE}{drive_id}"):
+            # A provider minimum for creating a channel on THIS drive stands (A4) — from an earlier
+            # sweep, a fresh store's adopted evidence, or a late worker in this one. No new attempt
+            # before it; other drives, valid predecessors and polling are unaffected.
+            continue
         budget.creates -= 1
         await _create(
             run, manager, conn, account_id=account_id, drive_id=drive_id, cursor=cursor,
