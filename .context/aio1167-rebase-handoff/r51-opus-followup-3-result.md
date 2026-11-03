@@ -1,0 +1,9 @@
+Opus 5.5 HIGH, existing sole writer session `628402d5-a1c6-42b7-b736-e84358c1a749`; terminal `end_turn`, non-error at `2026-11-03T05:40:17.009Z`.
+
+The A1 paging/order gap required a narrow source fix. Changes are page-at-a-time: normally a page-1 explicit trash is acknowledged before page 2's restore is visible; the removal stands and the restored file returns only through controlled root rescan after the restriction minimum. The unsafe case is an explicit-trash removal still owed when page 2 reveals restoration. Added `StateStore.supersede_pending_trash`, which supersedes only unacknowledged, unsuperseded `explicit_trash` removal evidence and records the page outcome; ambiguous removals are untouched and the method performs no upsert. The changes-page loop invokes it for a later non-trashed file body. Same-page ordering remains handled by the existing filter.
+
+Added deterministic two-page regressions with actual next-page tokens. One asserts the acknowledged page-1 removal, no premature read/upsert from page 2, cursor advancement, and eventual controlled relisting after the root restriction expires. Two variants (sink failure and lost acknowledgment) assert a still-owed removal is superseded, never resent after restore, and both pages commit. Also added A3 operation-key A→B→A coverage: B neither inherits nor erases A's listing minimum; it applies when returning to A.
+
+Limitations recorded by the writer: an already-acknowledged trash removal remains historical until root recovery; if publishing provider-minimum evidence fails and the local journal is discarded, that local-only minimum is lost; the paging test harness uses its `drive@position` token format.
+
+No tests, typecheck, lint, commit or push were run by the writer. Coordinator must inspect, verify and checkpoint these changes before long checks/reviews.

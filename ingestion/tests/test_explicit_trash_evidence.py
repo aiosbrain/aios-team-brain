@@ -175,21 +175,21 @@ async def test_an_ambiguous_removed_hint_under_a_restricted_parent_is_not_trash_
 # AIO-1167 final review A1 — explicit trash after LOCAL MEMBERSHIP LOSS (fresh-state recovery)
 # ------------------------------------------------------------------------------------------------ #
 
-def _acknowledged_restriction(world, resource):
+def _acknowledged_restriction(world, resource, until=FAR):
     """A provider minimum the brain already acknowledged for this account (adopted by a fresh store)."""
     world.progress["document_restrictions"] = {
         "generation": GEN, "credential": "account",
-        "items": [{"id": resource, "not_before": FAR, "category": "provider_unavailable", "unrepresentable": False}],
+        "items": [{"id": resource, "not_before": until, "category": "provider_unavailable", "unrepresentable": False}],
     }
 
 
-async def _recover_fresh_behind_restricted_parent(tmp_path, world, name):
+async def _recover_fresh_behind_restricted_parent(tmp_path, world, name, until=FAR):
     """Import and keep the brain's claims, then recover with a NEW SQLite store while the selected
     parent folder is restricted: the stream holds no local membership for its documents."""
     first = StateStore(str(tmp_path / f"{name}-first.sqlite"))
     assert (await run(world, first)).authoritative_complete is True
     first.close()
-    _acknowledged_restriction(world, "folder-r")
+    _acknowledged_restriction(world, "folder-r", until)
     path = str(tmp_path / f"{name}-fresh.sqlite")
     fresh = StateStore(path)
     world.calls.clear()
@@ -328,6 +328,133 @@ async def test_with_no_local_membership_trash_then_restore_in_one_page_removes_n
     _trash(world, "doc-n")
     await run(world, state)
     assert "doc-n" in world.removed
+    state.close()
+
+
+def _one_change_per_page(monkeypatch):
+    """Drive answers one change per page, with a real next-page token — a deterministic two-page feed
+    through the production page reader and cursor (``_DriveWorld`` itself returns one page)."""
+    from aios_ingest import gdrive_sync
+    from aios_ingest.gdrive_sync import ChangePage
+
+    original = gdrive_sync.read_change_page
+
+    def paged(drive, page_token, drive_id=None, provider_gate=None, request_executor=None):
+        page = original(drive, page_token, drive_id, provider_gate, request_executor)
+        if len(page.changes) <= 1:
+            return page
+        name, _, position = page_token.rpartition("@")
+        return ChangePage(
+            changes=page.changes[:1], next_page_token=f"{name}@{int(position) + 1}", new_start_page_token=None,
+        )
+
+    monkeypatch.setattr(gdrive_sync, "read_change_page", paged)
+
+
+def _change_pages(state, world):
+    return state._db.execute(
+        "SELECT count(*) FROM materialized_pages WHERE namespace=? AND page_kind='changes'",
+        (world.namespace(DRIVE),),
+    ).fetchone()[0]
+
+
+def _restore(world, doc):
+    world.files[doc]["trashed"] = False
+    world.logs.setdefault(DRIVE, []).append({"fileId": doc, "file": dict(world.files[doc])})
+
+
+@pytest.mark.asyncio
+async def test_two_pages_trash_then_restore_with_no_membership_settles_trash_then_recovers_by_relisting(
+    tmp_path, monkeypatch, clock,
+):
+    """Page 1: explicit trash of a document with no local membership under a still-restricted root.
+    Page 2: its later restore. The page-at-a-time contract settles page 1 before page 2 is read, so the
+    acknowledged trash retires this connection's claim; the restore — out of scope while the root is
+    unreadable — reads and upserts nothing early. The documented eventual result: once the root's
+    minimum passes, its controlled rescan lists the restored document and its claim/visibility return."""
+    from datetime import timedelta
+
+    world = _nested_world(monkeypatch)
+    until = (clock.at + timedelta(days=1)).isoformat()
+    _path, state = await _recover_fresh_behind_restricted_parent(tmp_path, world, "a1-two-pages", until)
+    _one_change_per_page(monkeypatch)
+    pages_before = _change_pages(state, world)
+    _trash(world, "doc-n")
+    _restore(world, "doc-n")
+    world.calls.clear()
+    world.pushed.clear()
+    await run(world, state)
+
+    assert _change_pages(state, world) - pages_before == 2  # two durable pages, in order
+    assert state.get_progress(world.namespace(DRIVE)).page_token == f"{DRIVE}@{len(world.logs[DRIVE])}"
+    assert "doc-n" in world.removed  # page 1's verified trash, settled before page 2 was read
+    assert world.removed.count("doc-n") == 1  # one bounded obligation, sent once
+    assert _owed_removal_payload(state, world, "doc-n") is None
+    assert not RESTRICTED_READS & set(world.calls) and _reads_of(world, "doc-n") == []
+    assert "doc-n" not in world.pushed  # no premature read or upsert from page 2
+
+    # Eventual recovery: the root's minimum passes and the controlled rescan relists the document.
+    clock.at += timedelta(days=1, minutes=5)
+    for _ in range(4):
+        outcome = await run(world, state)
+        if outcome.authoritative_complete:
+            break
+    assert ("list", DRIVE, "folder-r") in world.calls
+    assert "doc-n" in world.pushed
+    assert world.integration_id in world.ledger.claims["doc-n"]  # the claim (and visibility) is back
+    assert outcome.authoritative_complete is True
+    state.close()
+
+
+@pytest.mark.parametrize("failure", ["sink-failure", "acknowledgment-lost"])
+@pytest.mark.asyncio
+async def test_two_pages_a_later_restore_supersedes_a_still_owed_trash_removal(
+    tmp_path, monkeypatch, clock, failure,
+):
+    """If page 1's trash removal is still OWED when page 2's restore is read — its sink call failed, or
+    its acknowledgment was lost — the restore supersedes it: the stale removal is never (re)sent, the
+    first page can commit, and the cursor passes both pages."""
+    from datetime import timedelta
+
+    from aios_ingest import gdrive_sync
+
+    world = _nested_world(monkeypatch)
+    _path, state = await _recover_fresh_behind_restricted_parent(tmp_path, world, f"a1-owed-{failure}")
+    _one_change_per_page(monkeypatch)
+    pages_before = _change_pages(state, world)
+    client = gdrive_sync.BrainClient
+    original = client.reconcile_gdrive
+    sent_after_restore: list[int] = []
+
+    async def owed_until_restored(self, execution, **kwargs):
+        # Page 1's removal stays OWED until page 2 (the restore) has been read and materialized.
+        names = kwargs.get("removed_provider_ids") or []
+        restored = _change_pages(state, world) - pages_before >= 2
+        if "doc-n" in names and restored:
+            sent_after_restore.append(1)
+        if "doc-n" in names and not restored:
+            if failure == "acknowledgment-lost":
+                await original(self, execution, **kwargs)  # applied; its answer never arrives
+            raise BrainError(503, "server_error", "removal not acknowledged")
+        return await original(self, execution, **kwargs)
+
+    monkeypatch.setattr(client, "reconcile_gdrive", owed_until_restored)
+    _trash(world, "doc-n")
+    _restore(world, "doc-n")
+    for _ in range(4):
+        await run(world, state)
+        clock.at += timedelta(minutes=1)
+
+    assert _change_pages(state, world) - pages_before == 2
+    assert sent_after_restore == []  # the stale removal was never (re)sent after the restore
+    assert _owed_removal_payload(state, world, "doc-n") is None  # superseded, not owed
+    namespace = world.namespace(DRIVE)
+    assert state.next_uncommitted_page(namespace, GEN) is None  # both pages could commit
+    assert state.get_progress(namespace).page_token == f"{DRIVE}@{len(world.logs[DRIVE])}"
+    if failure == "sink-failure":
+        assert world.ledger.claims["doc-n"] == {world.integration_id}  # the claim was never retired
+        assert "doc-n" not in world.removed
+    assert _reads_of(world, "doc-n") == [] and "doc-n" not in world.pushed
     state.close()
 
 

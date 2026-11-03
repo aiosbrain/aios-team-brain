@@ -2644,6 +2644,12 @@ async def _run_gdrive_stream_unlocked(
                     # The document's own latest state in this page (only a change carrying its body
                     # says whether it is trashed; a bare `removed` says nothing about restoration).
                     last_trashed[file_id] = trashed
+                    if not trashed:
+                        # Across pages (A1 ordering): a restore read after an EARLIER page's explicit
+                        # trash supersedes that trash removal if it is still owed (its sink
+                        # acknowledgment failed or was lost) — the stale removal is never sent. One
+                        # already acknowledged stays history; root recovery relists the document.
+                        state.supersede_pending_trash(namespace, generation, file_id)
                 removed = bool(change.get("removed") or trashed)
                 selected = file_id in state.membership_ids(namespace, generation)
                 root_parents = sorted({

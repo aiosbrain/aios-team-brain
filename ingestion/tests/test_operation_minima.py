@@ -188,6 +188,40 @@ async def test_a_listing_minimum_whose_acknowledgment_was_lost_is_honoured_from_
     fresh.close()
 
 
+@pytest.mark.asyncio
+async def test_a_listing_minimum_is_neither_inherited_nor_erased_by_another_account_and_applies_on_return(
+    tmp_path, monkeypatch, clock,
+):
+    """A→B→A, by the account-transition pattern of ``test_restriction_lifetime``: the operation minimum
+    is account-bound resource evidence. Account B does not inherit it (B lists the folder) and does not
+    erase it (it is carried in ``retained_restrictions``); back on account A it applies again."""
+    from test_restriction_lifetime import _published_ids, transition, use_account
+
+    world = _world(monkeypatch)
+    world.calls = _FailingCalls({("list", DRIVE, "folder-a"): [real_deferral(503, LONG)]})
+    state = StateStore(str(tmp_path / "a-b-a.sqlite"))
+    await run(world, state)
+    assert "list-folder:folder-a" in _published_ids(world, "account")
+
+    transition(world)
+    use_account(world, monkeypatch, "account-b")
+    world.calls = _FailingCalls({})
+    for _ in range(2):
+        await run(world, state)
+    assert ("list", DRIVE, "folder-a") in world.calls  # B: no inheritance
+    assert "list-folder:folder-a" in _published_ids(world, "account")  # and not erased for A
+
+    transition(world)
+    use_account(world, monkeypatch, "account")
+    world.calls = _FailingCalls({})
+    for _ in range(2):
+        await run(world, state)
+    assert ("list", DRIVE, "folder-a") not in world.calls  # A again: the minimum applies
+    assert ("list", DRIVE, "folder-b") in world.calls
+    assert "list-folder:folder-a" in _published_ids(world, "account")
+    state.close()
+
+
 @pytest.mark.parametrize("header", [None, "soon"], ids=["missing", "malformed"])
 @pytest.mark.asyncio
 async def test_a_listing_or_change_answer_naming_no_minimum_stays_attempt_local(

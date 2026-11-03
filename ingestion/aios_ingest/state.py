@@ -2341,6 +2341,44 @@ class StateStore:
             self._db.rollback()
             raise
 
+    def supersede_pending_trash(self, namespace: str, generation: int, item_key: str) -> bool:
+        """A LATER observation shows the document is not trashed (AIO-1167 final review A1 ordering).
+
+        An explicit-trash removal still owed for it — not yet acknowledged by the sink, e.g. after a
+        failed or lost acknowledgment on an earlier page — is superseded exactly as publication
+        supersedes obsolete work: never sent, its page outcome recorded superseded, its page free to
+        commit. Only evidence-bearing trash removals are touched (an ambiguous removal stays on its
+        own gates), nothing is upserted here, and a removal already acknowledged is history. Idempotent.
+        Returns whether anything was superseded."""
+        rows = self._db.execute(
+            "SELECT observation_revision,page_id,payload FROM pending_work WHERE namespace=? AND generation=? "
+            "AND item_key=? AND action='remove' AND acknowledged_at IS NULL AND superseded_at IS NULL",
+            (namespace, generation, item_key),
+        ).fetchall()
+        superseded = False
+        now = _now_iso()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except ValueError:
+                continue
+            if payload.get("trashed") is not True or payload.get("reason") != "explicit_trash":
+                continue
+            self._db.execute(
+                "UPDATE pending_work SET superseded_at=?,updated_at=? WHERE namespace=? AND generation=? "
+                "AND item_key=? AND action='remove' AND observation_revision=?",
+                (now, now, namespace, generation, item_key, row["observation_revision"]),
+            )
+            self._db.execute(
+                "UPDATE page_obligation_outcomes SET status='superseded',updated_at=? WHERE namespace=? "
+                "AND generation=? AND page_id=? AND item_key=? AND observation_revision=? AND status='pending'",
+                (now, namespace, generation, row["page_id"], item_key, row["observation_revision"]),
+            )
+            superseded = True
+        if superseded:
+            self._db.commit()
+        return superseded
+
     def remove_membership(self, namespace: str, generation: int, provider_id: str,
                           *, snapshot_id: int | None = None) -> bool:
         selected = snapshot_id if snapshot_id is not None else self.snapshot_id(namespace)
