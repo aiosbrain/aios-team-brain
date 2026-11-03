@@ -48,7 +48,6 @@ from aios_ingest.watch_lifecycle import (
 from test_watch_lifecycle import (
     ACCOUNT, INTEGRATION, SETTINGS, _conn, _controlled_deadline, _Provider, _record,
 )
-from test_watch_operation_minima import _minimum
 from test_watch_quota_hold import GEN, LONG, _hold, _local_watch_state, _near, _published_hold, _quota_brain
 
 OTHER_ACCOUNT = "previous-account"
@@ -61,6 +60,15 @@ def _at(seconds: float) -> str:
 def _deferral(not_before: str) -> SimpleNamespace:
     """The polling owner's deferral as a watch quota answer carries it."""
     return SimpleNamespace(not_before=not_before, category="rate_limited", provider_deadline=True)
+
+
+def _minimum(seconds: int = 86_400) -> SimpleNamespace:
+    """The shared parser's non-quota provider minimum as a watch call carries it — the same shape as
+    ``test_watch_operation_minima._minimum``, defined here because that module imports from this one."""
+    return SimpleNamespace(
+        not_before=(datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat(),
+        category="provider_unavailable", provider_deadline=True, diagnostic=None,
+    )
 
 
 async def _until(condition, tries: int = 500) -> None:
