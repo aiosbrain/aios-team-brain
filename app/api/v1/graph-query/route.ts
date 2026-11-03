@@ -5,6 +5,7 @@ import { authenticateApiKey } from "@/lib/api/auth";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { errorResponse } from "@/lib/api/schemas";
 import { audit } from "@/lib/api/audit";
+import { revocationEpoch } from "@/lib/access/authorization-epoch";
 import { neo4jConfigured } from "@/lib/graph/neo4j";
 import { GraphProvenanceUnavailableError, readAuthorizedGraphFactsResult } from "@/lib/graph/provenance-read";
 
@@ -53,11 +54,14 @@ export async function POST(req: NextRequest) {
   const { projectIds } = await visibleProjects(db, { teamId: auth.teamId, memberId: auth.memberId });
   let groupIds: string[] = [];
   if (projectIds.size > 0) {
+    // Only the member's VISIBLE system projects: another member's broken partition is not this
+    // member's wiring fault, and must not fail a healthy visible scope.
     const { data: visibleSystems } = await db
       .from("projects")
       .select("id,graph_group_id")
       .eq("team_id", auth.teamId)
-      .eq("kind", "system");
+      .eq("kind", "system")
+      .in("id", [...projectIds]);
     if (((visibleSystems ?? []) as Array<{ graph_group_id: string | null }>)
       .some((project) => !project.graph_group_id)) {
       console.error(`[graph-query] member ${auth.memberId} on team ${auth.teamId}: visible SYSTEM project is missing its stored graph pointer`);
@@ -104,7 +108,8 @@ export async function POST(req: NextRequest) {
     });
     // A successful authorized read is audited, as before the provenance owner existed (AIO-1167 R44
     // C14): who asked and how much came back — counts only, never query text or fact content. A
-    // refused or failed read throws before this and is never recorded as a success.
+    // refused or failed read throws before this and is never recorded as a success. Audited once per
+    // request: the candidate is never re-read after this, so no second success is recorded for it.
     await audit(db, {
       team_id: auth.teamId,
       actor_kind: "api_key",
@@ -116,6 +121,15 @@ export async function POST(req: NextRequest) {
         checked: result.checked, incomplete: result.incomplete,
       },
     });
+    // The LAST await before publication (accepted spec §Revocation barriers; the events route's
+    // rule). The read re-checked its epoch before returning, but the audit write is another await: a
+    // revocation processed during it must not see these facts served. A changed — or unreadable —
+    // epoch withholds the candidate as the retryable unavailable answer; nothing asynchronous may
+    // follow this check.
+    const current = await revocationEpoch(db, auth.teamId).catch(() => null);
+    if (result.epoch !== null && current !== result.epoch) {
+      throw new GraphProvenanceUnavailableError("graph authorization changed before publication");
+    }
     return Response.json({ facts: result.facts.map((fact) => ({
       uuid: fact.id,
       fact: fact.fact,

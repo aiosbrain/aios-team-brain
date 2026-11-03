@@ -33,6 +33,12 @@ export interface AuthorizedGraphFactsResult {
   incomplete: boolean;
   nextOffset: number | null;
   checked: number;
+  /**
+   * The revocation epoch these facts were read under and re-checked against at this read's own last
+   * await; `null` only when nothing was read (no partitions). It never leaves the server. A caller that
+   * awaits anything else before publishing (an audit write) must re-check it as ITS last await.
+   */
+  epoch: number | null;
 }
 
 /** An authorized fact with its absolute position in the ordered discovery stream. */
@@ -100,7 +106,7 @@ export async function readAuthorizedGraphFactsResult(
   },
 ): Promise<AuthorizedGraphFactsResult> {
   const groups = [...new Set(args.groupIds.filter(Boolean))];
-  if (groups.length === 0) return { facts: [], incomplete: false, nextOffset: null, checked: 0 };
+  if (groups.length === 0) return { facts: [], incomplete: false, nextOffset: null, checked: 0, epoch: null };
   if (!neo4jConfigured()) {
     throw new GraphProvenanceUnavailableError("provenance-complete Neo4j reads are not configured");
   }
@@ -164,7 +170,7 @@ export async function readAuthorizedGraphFactsResult(
       // Authorized facts read beyond the limit are overflow, not consumed: resume AT the first of
       // them. Only a response that published everything it read may resume after the last page.
       const nextOffset = overflowAt ?? (more ? offset : null);
-      return { facts, incomplete: nextOffset !== null, nextOffset, checked };
+      return { facts, incomplete: nextOffset !== null, nextOffset, checked, epoch };
     } catch (error) {
       if (error instanceof ArcSynthesisAuthorizationChangedError && attempt === 0) continue;
       if (

@@ -1,10 +1,32 @@
+import { googleEmailKey } from "@/lib/identity/google-email-authority";
+
 const record = (value: unknown): value is Record<string, unknown> =>
   Boolean(value) && typeof value === "object" && !Array.isArray(value);
 
 const text = (value: unknown): string => typeof value === "string" ? value.trim() : "";
 
+/**
+ * The observation's stable provider id, or `null`. `author-email:<address>` is NOT one: Drive's
+ * producer writes it when it withholds a permission id, so it names the address only — the same
+ * evidence an email-only observation carries (AIO-1167 R51). Every other provider key (`permission:`)
+ * is.
+ */
+export function gdriveStableId(externalId: unknown): string | null {
+  const id = text(externalId);
+  return id && !googleEmailKey("gdrive", id) ? id : null;
+}
+
+/** The address an observation names: its `email`, else the one its `author-email:` key carries. */
+export function gdriveObservedEmail(row: { external_id?: unknown; email?: unknown }): string {
+  const email = text(row.email).toLowerCase();
+  if (email) return email;
+  const key = googleEmailKey("gdrive", text(row.external_id));
+  return key ? key.slice("author-email:".length) : "";
+}
+
 export interface GdriveObservationIdentity {
-  /** The provider's stable id for the person (`permission:<id>`), when the observation carries one. */
+  /** The provider's stable id for the person (`permission:<id>`), when the observation carries one;
+   *  never an `author-email:` key (`gdriveStableId`). */
   stableId: string | null;
   person: string;
   role: string;
@@ -20,8 +42,11 @@ export interface GdriveObservationIdentity {
  * that changes only that metadata is the same observation in both.
  */
 export function gdriveObservationIdentity(row: Record<string, unknown>): GdriveObservationIdentity {
-  const stableId = text(row.external_id) || null;
-  const email = text(row.email).toLowerCase();
+  const stableId = gdriveStableId(row.external_id);
+  // The address an email-only observation names. A legacy bare-email row `{email: E}` and the
+  // producer's `{external_id: "author-email:E", email: E}` both name only E, so at the same role and
+  // instant they are ONE observation (AIO-1167 R52); neither is a stable id.
+  const email = gdriveObservedEmail(row);
   const displayName = text(row.display_name);
   const person = stableId
     ? `id:${stableId}`
@@ -46,13 +71,15 @@ export function gdriveObservationIdentity(row: Record<string, unknown>): GdriveO
  * itself — the stable-id row names the same email at the same role and instant. Only an UNAMBIGUOUS
  * match coalesces: exactly one stable id carrying that email there. Sharing an AIOS member is never
  * evidence (one person may hold several accounts). The stable-id row is kept; it carries the email,
- * so no provenance is lost. Rows are otherwise returned unchanged, in order.
+ * so no provenance is lost. An `author-email:E` observation is email-only here (`gdriveStableId`): it
+ * folds the same way, and never stands as a stable id beside `permission:P`. Rows are otherwise
+ * returned unchanged, in order.
  */
 export function coalesceGdriveObservations<T extends object>(rows: readonly T[]): T[] {
   const stableByEmail = new Map<string, Set<string>>();
   const fields = (row: T) => row as Record<string, unknown>;
   const emailKey = (row: Record<string, unknown>) => {
-    const email = text(row.email).toLowerCase();
+    const email = gdriveObservedEmail(row);
     if (!email) return null;
     const { role, at } = gdriveObservationIdentity(row);
     return `${email}\0${role}\0${at}`;
@@ -98,6 +125,38 @@ export function coalesceStoredGdriveEvidence<T extends StoredGdriveEvidenceRow>(
   return rows.filter((row) => kept.has(row));
 }
 
+/**
+ * One stored evidence row per item observation, as the Timeline reads them: email-only rows folded
+ * into their one stable-id row (`coalesceStoredGdriveEvidence`), then, per item, one row per stable id
+ * or address with its role and instant. A legacy bare-email row and the producer's `author-email:`
+ * row of one email, role and instant are one observation (R52), and — as in `mergeGdriveContributions`
+ * — the row carrying the provider key speaks for it whatever the order or write times: it keeps the
+ * exact `author-email:` mapping authority, which a bare row would trade for a roster-email guess.
+ * Between rows of the same provenance the most recently written one speaks. A row naming neither
+ * stays keyed by its own evidence key.
+ */
+export function latestStoredGdriveObservations<
+  T extends StoredGdriveEvidenceRow & { evidence_key: string; updated_at: string },
+>(rows: readonly T[]): T[] {
+  const latest = new Map<string, T>();
+  for (const row of coalesceStoredGdriveEvidence(rows)) {
+    const { person, role, at } = gdriveObservationIdentity({
+      external_id: row.external_id, email: row.email, role: row.role, at: row.source_at,
+    });
+    const key = row.external_id || row.email
+      ? `${row.item_id}\0${person}\0${role}\0${at}`
+      : `${row.item_id}\0${row.evidence_key}`;
+    const seen = latest.get(key);
+    const keyed = Boolean(text(row.external_id));
+    const seenKeyed = Boolean(seen && text(seen.external_id));
+    if (!seen || (keyed && !seenKeyed)
+      || (keyed === seenKeyed && Date.parse(row.updated_at) > Date.parse(seen.updated_at))) {
+      latest.set(key, row);
+    }
+  }
+  return [...latest.values()];
+}
+
 /** Preserve each source-observed person/role/instant and deduplicate exact replays. */
 export function mergeGdriveContributions(
   stored: unknown,
@@ -110,7 +169,12 @@ export function mergeGdriveContributions(
   const byObservation = new Map<string, Record<string, unknown>>();
   for (const row of rows) {
     const { person, role, at } = gdriveObservationIdentity(row);
-    byObservation.set(`${person}\0${role}\0${at}`, row);
+    const key = `${person}\0${role}\0${at}`;
+    // A replay of one observation replaces it — except that a legacy bare-email row never replaces
+    // the producer's `author-email:` row for the same observation, in either order (R52).
+    const seen = byObservation.get(key);
+    if (seen && text(seen.external_id) && !text(row.external_id)) continue;
+    byObservation.set(key, row);
   }
   return coalesceGdriveObservations([...byObservation.values()]);
 }

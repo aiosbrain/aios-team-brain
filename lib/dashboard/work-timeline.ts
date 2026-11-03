@@ -30,7 +30,7 @@ import { rowVisibleByProvenanceCtx } from "@/lib/access/provenance";
 import { isCalendarEvent } from "@/lib/meetings/from-calendar";
 import { buildIdentityMap } from "@/lib/identity/resolve";
 import { googleDriveContributionEvidence } from "./gdrive-contributions";
-import { coalesceStoredGdriveEvidence, gdriveObservationIdentity } from "@/lib/ingest/gdrive-ledger";
+import { latestStoredGdriveObservations } from "@/lib/ingest/gdrive-ledger";
 
 // Only ACTIVE tasks are considered work "in progress". Since brain-api v1.21 (AIO-950) a Linear
 // "In Review" state normalizes to its own `in_review` rather than collapsing into `in_progress`;
@@ -496,18 +496,9 @@ export async function getWorkTimeline(
   // e-mail the person no longer has. Decided before anything is resolved, across every page.
   // An email-only row the ONE stable-id row of that item, role and instant names (S4) is the same
   // observation: a ledger written before coalescing — or adopted from one by the migration's evidence
-  // backfill — can hold both until the item's next write retires it.
-  const gdriveObservations = new Map<string, GdriveLedgerRow>();
-  for (const row of coalesceStoredGdriveEvidence(gdriveRows)) {
-    const { stableId, person, role, at } = gdriveObservationIdentity({
-      external_id: row.external_id, role: row.role, at: row.source_at,
-    });
-    const key = stableId
-      ? `${row.item_id}\0${person}\0${role}\0${at}`
-      : `${row.item_id}\0${row.evidence_key}`;
-    const seen = gdriveObservations.get(key);
-    if (!seen || Date.parse(row.updated_at) > Date.parse(seen.updated_at)) gdriveObservations.set(key, row);
-  }
+  // backfill — can hold both until the item's next write retires it. So is a legacy bare-email row
+  // and the producer's `author-email:` row of one email, role and instant (R52).
+  const gdriveObservations = latestStoredGdriveObservations(gdriveRows);
 
   // In-window evidence items (commits + docs) with the text an issue key would appear in. A git
   // commit's key is in its BODY; other items' in the title/path (no large-body fetch — see the
@@ -518,7 +509,7 @@ export async function getWorkTimeline(
   // never copied into the payload.
   type Ev = EvidenceItem & { memberId: string; text: string; sha?: string; itemId?: string };
   const evItems: Ev[] = [];
-  for (const row of gdriveObservations.values()) {
+  for (const row of gdriveObservations) {
     const fm = row.frontmatter ?? {};
     const title = str(fm.title) || (row.path ? basename(row.path) : "") || "Google document";
     const contributions = [{

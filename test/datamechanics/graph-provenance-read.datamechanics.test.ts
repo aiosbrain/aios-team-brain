@@ -59,7 +59,23 @@ vi.mock("@/lib/graph/neo4j", async (importOriginal) => ({
   },
 }));
 
+// The real audit write, with a hook that runs while the route's `graph.query` audit is in flight (R51
+// revocation barrier) — only that one: key issuance and authentication audit too. Unset, every audit
+// is exactly production's.
+const auditPause = vi.hoisted(() => ({ during: null as null | (() => Promise<void>) }));
+vi.mock("@/lib/api/audit", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api/audit")>();
+  return {
+    ...actual,
+    audit: async (...args: Parameters<typeof actual.audit>) => {
+      await actual.audit(...args);
+      if (auditPause.during && args[1].action === "graph.query") await auditPause.during();
+    },
+  };
+});
+
 beforeEach(() => {
+  auditPause.during = null;
   graph.edges = [];
   graph.episodes = [];
   graph.factScopes = [];
@@ -198,5 +214,76 @@ describe("AIO-1167 provenance-complete graph read — positive path (real Postgr
     expect(forExternal.ids).toEqual(["f-external"]);
     const asked = new Set([...graph.factScopes, ...graph.episodeScopes].flat());
     expect([...asked]).toEqual([externalShared]);
+  });
+});
+
+/** An external member whose only visible partition is external-shared, holding one authorized fact. */
+async function externalFixture(): Promise<{ seed: Seed; external: string }> {
+  const seed = await seedTeam();
+  const item = await ingest(seed, { path: "ext.md", body: "external payments", access: "external", project: "src-ext" });
+  expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
+  await backfillTeamContext(db(), seed.teamId);
+  const externalShared = await systemGroup(seed, EXTERNAL_SHARED_SLUG);
+  graph.episodes.push({ uuid: "ep-external", groupId: externalShared, name: episodeName(item.id, 0, 1) });
+  graph.edges.push({
+    id: "f-external", fact: "Alex owns payments (external)", at: new Date().toISOString(),
+    groupId: externalShared, episodeUuids: ["ep-external"],
+  });
+  await convergeIdentityAttribution(seed);
+  return { seed, external: await externalMember(seed) };
+}
+
+async function graphQueryAudits(seed: Seed): Promise<number> {
+  const { rows } = await runSql<{ n: string | number }>(
+    "select count(*) as n from audit_log where team_id = $1 and action = 'graph.query'", [seed.teamId],
+  );
+  return Number(rows[0]?.n ?? 0);
+}
+
+describe("AIO-1167 R51 — graph-query missing-pointer check reads only VISIBLE system projects", () => {
+  it("a broken system project the member cannot see does not fail its healthy visible partition", async () => {
+    const { seed, external } = await externalFixture();
+    const { data: general } = await db().from("projects").select("id")
+      .eq("team_id", seed.teamId).eq("slug", GENERAL_SLUG).single();
+    const generalId = (general as { id: string }).id;
+    // The fixture's one condition: General is a system project this member cannot see.
+    const { visibleProjects } = await import("@/lib/access/oracle");
+    const { projectIds } = await visibleProjects(db(), { teamId: seed.teamId, memberId: external });
+    expect(projectIds.has(generalId)).toBe(false);
+    await runSql("update projects set graph_group_id = null where id = $1", [generalId]);
+
+    const r = await post(seed, external);
+    expect(r.status, JSON.stringify(r.body)).toBe(200);
+    expect(r.ids).toEqual(["f-external"]);
+  });
+
+  it("the member's own VISIBLE system project missing its pointer is still the loud 500", async () => {
+    const { seed, external } = await externalFixture();
+    await runSql("update projects set graph_group_id = null where team_id = $1 and slug = $2", [seed.teamId, EXTERNAL_SHARED_SLUG]);
+    expect((await post(seed, external)).status).toBe(500);
+  });
+});
+
+describe("AIO-1167 R51 — graph-query re-checks the revocation epoch after its audit await", () => {
+  it("a revocation processed while the audit is written withholds the captured facts: 503, one audit", async () => {
+    const { seed, external } = await externalFixture();
+    const { advanceAuthorizationEpoch } = await import("@/lib/access/authorization-epoch");
+    // Pause inside the audit write and process a revocation there: the durable epoch advances after
+    // the read's own last check and before the route publishes.
+    auditPause.during = async () => { await advanceAuthorizationEpoch(seed.teamId); };
+
+    const r = await post(seed, external);
+    expect(r.status, JSON.stringify(r.body)).toBe(503);
+    expect(r.ids).toEqual([]);
+    expect(JSON.stringify(r.body)).not.toContain("Alex owns payments");
+    // The withheld candidate was audited once — never re-read and audited again.
+    expect(await graphQueryAudits(seed)).toBe(1);
+
+    // The positive control: with no revocation in the gap, the same request serves the fact.
+    auditPause.during = null;
+    const again = await post(seed, external);
+    expect(again.status, JSON.stringify(again.body)).toBe(200);
+    expect(again.ids).toEqual(["f-external"]);
+    expect(await graphQueryAudits(seed)).toBe(2);
   });
 });
