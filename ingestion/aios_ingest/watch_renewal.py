@@ -48,14 +48,16 @@ from .config import BrainSettings, Connection
 from .connector_state import renewal_document
 from .engine import IngestSummary
 from .gdrive_sync import (
+    WATCH_CREATE_RESOURCE, WATCH_STOP_RESOURCE,
     ServiceAccountBindingRefused, _adopt_remote_restriction_evidence, _flush_restriction_evidence,
+    _operation_restricted, _restrict_operation,
     _standing_account_hold, oauth_account_namespace, provider_source_options, service_account_namespace,
 )
 from .selections import bind_local_gdrive, effective_gdrive_connection
 from .state import StateStore, StreamKey, verification_hash
 from .watch_lifecycle import (
     ACTIVE, CLEANUP_PENDING, DISPATCHED, EXPIRED, PENDING_STATES, PREPARED, RETIRED, UNCERTAIN,
-    InvalidWatchResponse, WatchNotDispatched, WatchQuotaLimited, WatchRecord, WatchRefused,
+    InvalidWatchResponse, WatchNotDispatched, WatchProviderMinimum, WatchQuotaLimited, WatchRecord, WatchRefused,
     from_section, now_iso, parse_instant, requested_expiry, to_section, transition,
     validate_watch_response,
 )
@@ -274,9 +276,28 @@ def _journal_late_hold(
         log.warning("Drive watch late quota evidence could not be journaled: %s", type(exc).__name__)
 
 
+def _journal_late_restriction(
+    state: StateStore, connection_id: str, generation: int, account_id: str, resource: str, deferral: Any,
+) -> None:
+    """Journal an abandoned watch worker's NON-quota provider minimum for its operation (A4), on the
+    event loop, through the monotonic resource owner. Nothing is published or activated here."""
+    not_before = getattr(deferral, "not_before", None)
+    if not getattr(deferral, "provider_deadline", False) or not not_before or not account_id:
+        return
+    try:
+        state.restrict_document(
+            connection_id, generation, account_id, resource, str(not_before),
+            str(getattr(deferral, "category", None) or "provider_unavailable"),
+            unrepresentable=getattr(deferral, "diagnostic", None) == "retry_after_unrepresentable",
+        )
+    except Exception as exc:  # a closed store: the evidence is lost, never misreported
+        log.warning("Drive watch late operation minimum could not be journaled: %s", type(exc).__name__)
+
+
 def _late_evidence(
     loop: asyncio.AbstractEventLoop, state: StateStore, record: WatchRecord | None,
     *, hold: tuple[str, int, str] | None = None,
+    operation: tuple[str, int, str, str] | None = None,
 ) -> Callable[[Future], None]:
     """What an abandoned worker's eventual result may do — creation or stop.
 
@@ -295,6 +316,12 @@ def _late_evidence(
         if isinstance(error, WatchQuotaLimited):
             if hold is not None:
                 _on_loop(loop, _journal_late_hold, state, *hold, error.deferral)
+            return
+        if isinstance(error, WatchProviderMinimum):
+            # A named non-quota minimum for THIS operation (A4): `operation` =
+            # `(connection_id, generation, account_id, resource)`, captured at dispatch.
+            if operation is not None:
+                _on_loop(loop, _journal_late_restriction, state, *operation, error.deferral)
             return
         if error is not None or record is None:
             return
@@ -412,6 +439,10 @@ async def _create(
             on_late=_late_evidence(
                 loop, run.state, dispatched,
                 hold=(run.execution.integration_id, int(run.execution.generation), account_id),
+                operation=(
+                    run.execution.integration_id, int(run.execution.generation), account_id,
+                    f"{WATCH_CREATE_RESOURCE}{drive_id}",
+                ),
             ),
             deadline=dispatch_deadline,
         )
@@ -449,6 +480,16 @@ async def _create(
         raise _AccountQuotaHeld(deferral) from exc
     except WatchRefused as exc:
         await run.publish(transition(dispatched, RETIRED, detail=f"provider refused ({exc.status})"))
+        return
+    except WatchProviderMinimum as exc:
+        # A non-quota answer naming a provider minimum (A4). The outcome stays UNKNOWN — a 503 is no
+        # proof nothing was created, and creation is never resent blindly — and the minimum restricts
+        # creation on THIS account/drive (not this random attempt). It is journaled BEFORE the fallible
+        # publication, so a failed, lost, refused or cancelled publication cannot lose it.
+        _restrict_operation(
+            run.state, run.execution, account_id, f"{WATCH_CREATE_RESOURCE}{drive_id}", exc.deferral,
+        )
+        await run.publish(transition(dispatched, UNCERTAIN, detail="outcome unknown: provider minimum named"))
         return
     except Exception as exc:
         await run.publish(transition(dispatched, UNCERTAIN, detail=f"outcome unknown: {type(exc).__name__}"))

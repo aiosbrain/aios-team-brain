@@ -456,9 +456,16 @@ export async function removeMemberIdentity(
   opts: { expectedRevision?: number; actor?: IdentityActor } = {}
 ): Promise<{ removed: boolean; mappingRevision?: number; mappingKey?: string }> {
   const provider = input.provider.trim().toLowerCase();
-  const externalId = input.externalId.trim();
-  if (!provider || !externalId) throw new Error("provider and externalId are required");
-  if (provider === "gdrive" && !/^(subject|permission|author-email):[^\s:][^\s]*$/i.test(externalId)) {
+  // A recognized Google `author-email:` key is removed by its EXACT persisted bytes (AIO-1167 final
+  // review A5): a legacy spelling may carry outer or post-prefix whitespace, and the canonical writer
+  // refuses to link while it is live, so the exact row must be removable. Never canonicalized: an
+  // equivalent spelling names a different row, lock key, history and revision. Every other key keeps
+  // its trimming and its strict format validation.
+  const exactGoogleEmail = provider === "gdrive" && googleEmailKey(provider, input.externalId) !== null;
+  const externalId = exactGoogleEmail ? input.externalId : input.externalId.trim();
+  if (!provider || !externalId.trim()) throw new Error("provider and externalId are required");
+  if (provider === "gdrive" && !exactGoogleEmail
+      && !/^(subject|permission|author-email):[^\s:][^\s]*$/i.test(externalId)) {
     throw new Error("Google Drive identity must use a verified subject:, permission:, or author-email: key");
   }
 

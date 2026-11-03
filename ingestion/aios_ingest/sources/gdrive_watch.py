@@ -14,7 +14,9 @@ import json
 import time
 from typing import Any
 
-from ..watch_lifecycle import WatchNotDispatched, WatchQuotaLimited, WatchRecord, WatchRefused, parse_instant
+from ..watch_lifecycle import (
+    WatchNotDispatched, WatchProviderMinimum, WatchQuotaLimited, WatchRecord, WatchRefused, parse_instant,
+)
 from .base import MissingExtraError
 
 # Default bound for one provider request when the caller supplies no absolute deadline.
@@ -39,6 +41,20 @@ def _raise_if_quota(exc: Exception) -> None:
     deferral = quota_deferral(exc)
     if deferral is not None:
         raise WatchQuotaLimited(deferral) from exc
+
+
+def _raise_if_provider_minimum(exc: Exception) -> None:
+    """A non-quota 5xx/408 (or transport failure) naming a valid Retry-After is a provider minimum for
+    THIS operation (AIO-1167 final review A4), raised as ``WatchProviderMinimum``; one naming no
+    minimum — or a definitive 4xx — is left to the caller's existing handling."""
+    from .gdrive import operation_deferral
+
+    status = _status_of(exc)
+    if status is not None and status < 500 and status != 408:
+        return
+    deferral = operation_deferral(exc)
+    if deferral is not None:
+        raise WatchProviderMinimum(deferral) from exc
 
 
 def _remaining(deadline: float | None) -> float:
@@ -150,6 +166,8 @@ class GoogleDriveWatchManager:
         except Exception as exc:
             # A quota answer is a definitive refusal (nothing created) AND the account's hold.
             _raise_if_quota(exc)
+            # A named non-quota minimum keeps the outcome UNKNOWN and restricts this operation.
+            _raise_if_provider_minimum(exc)
             status = _status_of(exc)
             if status is not None and 400 <= status < 500 and status != 408:
                 raise WatchRefused(status) from exc
@@ -167,6 +185,7 @@ class GoogleDriveWatchManager:
             if _status_of(exc) == 404:
                 return
             _raise_if_quota(exc)  # the channel still exists: its record stays cleanup_pending
+            _raise_if_provider_minimum(exc)  # likewise, with this stop operation's named minimum
             raise
 
 

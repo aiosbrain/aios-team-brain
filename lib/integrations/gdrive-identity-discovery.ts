@@ -5,7 +5,7 @@ import type { DbClient } from "@/lib/db/types";
 import { withTransaction } from "@/lib/db/pg/pool";
 import { discoverMemberIdentity, type DiscoveredIdentityOutcome } from "@/lib/identity/member-identities";
 import { resolveConfirmedEmail } from "@/lib/identity/provider-sync";
-import { buildIdentityMap, providerIdentityState } from "@/lib/identity/resolve";
+import { buildIdentityMap, googleEmailAttributionHeld, providerIdentityState } from "@/lib/identity/resolve";
 import {
   assertGdrivePayloadBinding,
   lockLiveGdriveExecution,
@@ -59,6 +59,17 @@ export async function discoverGdriveContributorIdentities(
     for (const [externalId, email] of [...candidates].sort(([a], [b]) => a.localeCompare(b))) {
       // Already decided — linked, remapped or unlinked: nothing to discover (the owner re-checks).
       if (providerIdentityState(linking, "gdrive", externalId) !== null) {
+        outcomes.reviewed++;
+        continue;
+      }
+      // The ONLY evidence for a never-reviewed permission id is this email. If the email's own Google
+      // identity was deliberately unlinked, or its equivalent histories are ambiguous, that decision
+      // stands: the held email cannot mint a new stable mapping (AIO-1167 final review A2). Decided on
+      // the map read above, under the identity authority this transaction already holds, so a
+      // concurrent unlink is either seen here or serialized after this link. Roster email for other
+      // providers is untouched, and an independently established permission mapping (above) keeps
+      // its authority.
+      if (googleEmailAttributionHeld(linking, email)) {
         outcomes.reviewed++;
         continue;
       }

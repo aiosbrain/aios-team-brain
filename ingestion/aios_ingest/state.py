@@ -20,7 +20,7 @@ import secrets
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Collection, Iterable
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cursors (
@@ -2013,15 +2013,21 @@ class StateStore:
         self._db.commit()
 
     def next_traversal(self, namespace: str, generation: int,
-                       *, snapshot_id: int | None = None) -> sqlite3.Row | None:
+                       *, snapshot_id: int | None = None,
+                       exclude_folders: Collection[str] = ()) -> sqlite3.Row | None:
+        """The oldest unfinished traversal entry. ``exclude_folders`` skips entries of folders whose
+        listing may not be dispatched now (a standing provider minimum, AIO-1167 final review A3):
+        they stay unfinished, and the other folders' entries are not held behind them."""
         selected = snapshot_id if snapshot_id is not None else self.snapshot_id(namespace)
         if selected is None:
             return None
+        excluded = sorted(set(exclude_folders))
+        clause = f"AND folder_id NOT IN ({','.join('?' for _ in excluded)}) " if excluded else ""
         return self._db.execute(
             "SELECT * FROM traversal_queue WHERE namespace=? AND generation=? AND snapshot_id=? "
-            "AND completed_at IS NULL "
+            f"AND completed_at IS NULL {clause}"
             "ORDER BY rowid LIMIT 1",
-            (namespace, generation, selected),
+            (namespace, generation, selected, *excluded),
         ).fetchone()
 
     def root_traversal_open(

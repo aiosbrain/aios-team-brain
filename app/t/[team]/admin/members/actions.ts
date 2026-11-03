@@ -9,6 +9,7 @@ import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { linkGithub } from "@/lib/codebases/github";
 import { canonicalIdentityId, setMemberIdentity, removeMemberIdentity } from "@/lib/identity/member-identities";
 import { withIdentityMutationBoundary } from "@/lib/identity/authority";
+import { googleEmailKey } from "@/lib/identity/google-email-authority";
 import { addAuthorAlias, removeAuthorAlias } from "@/lib/admin/aliases";
 import { adminSetPassword } from "@/lib/auth/pg-login";
 import { isPasswordStrongEnough, randomPassword, MIN_PASSWORD_LENGTH } from "@/lib/auth/password";
@@ -336,8 +337,11 @@ export async function unlinkMemberIdentity(
     return { ok: false, error: "provider and externalId are required" };
   }
   const p = provider.trim().toLowerCase();
-  const ext = externalId.trim();
-  if (!p || !ext) return { ok: false, error: "provider and externalId are required" };
+  // The DISPLAYED id, by its exact persisted bytes when it is a recognized Google email key (AIO-1167
+  // final review A5): a padded legacy spelling is observed, fenced and removed as itself — never as an
+  // equivalent canonical spelling, which is a different row. Every other id is trimmed as before.
+  const ext = p === "gdrive" && googleEmailKey(p, externalId) !== null ? externalId : externalId.trim();
+  if (!p || !ext.trim()) return { ok: false, error: "provider and externalId are required" };
   // No observation, or one that cannot be read: refused, never downgraded to an unfenced removal.
   if (!isUnlinkObservation(observed)) return { ok: false, error: STALE_IDENTITY };
   const displayed = { memberId: observed.memberId.trim(), revision: observed.revision };

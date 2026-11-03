@@ -102,6 +102,19 @@ class WatchQuotaLimited(RuntimeError):
         self.deferral = deferral
 
 
+class WatchProviderMinimum(RuntimeError):
+    """A watch creation or stop answered with a NON-quota provider minimum — a 5xx/408 carrying a valid
+    (or unrepresentable) Retry-After, classified by the shared parser (AIO-1167 final review A4).
+
+    For a creation the outcome stays UNKNOWN (a 503 is no proof that nothing was created; the call is
+    never resent blindly); for a stop the channel still exists. ``deferral`` is the shared owner's
+    ``ProviderDeferred`` with ``provider_deadline``: it restricts that OPERATION, never the account."""
+
+    def __init__(self, deferral: Any):
+        super().__init__(str(deferral))
+        self.deferral = deferral
+
+
 class InvalidWatchResponse(ValueError):
     """A creation response that does not name exactly the channel this attempt asked for.
 

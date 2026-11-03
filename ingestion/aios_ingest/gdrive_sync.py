@@ -246,6 +246,37 @@ def _standing_document_restrictions(
 # not the account: it is recorded as a resource restriction under a key no Drive file id can take.
 _START_TOKEN_RESOURCE = "start-token:"
 _IDENTITY_PREREQUISITE_RESOURCE = "prerequisite:service-account-identity"
+# AIO-1167 final review A3/A4: the remaining provider operations whose named minimum must survive a
+# generation transition. Each binds to the STABLE operation — never a page token, cursor, generation or
+# attempt id — under the verified account the restriction owner already keys by:
+#   * listing one folder's children (`files.list` of that folder);
+#   * reading one drive's change pages;
+#   * creating a watch channel on one drive; stopping one known channel resource.
+_FOLDER_LISTING_RESOURCE = "list-folder:"
+_CHANGES_RESOURCE = "changes:"
+WATCH_CREATE_RESOURCE = "watch-create:"
+WATCH_STOP_RESOURCE = "watch-stop:"
+
+
+def _operation_restricted(
+    state: StateStore, execution: GdriveExecution, credential: str, resource: str,
+) -> bool:
+    """Whether a provider-named minimum still stands for one operation of this verified account."""
+    return resource in _standing_document_restrictions(
+        state, execution.integration_id, execution.generation, credential,
+    )
+
+
+def _restrict_operation(
+    state: StateStore, execution: GdriveExecution, credential: str, resource: str, exc: ProviderDeferred,
+) -> bool:
+    """Journal a valid provider minimum for one operation through the ONE restriction owner (A3/A4).
+    An account quota answer stays the account's hold and the run's own budget stays local; a missing
+    or malformed Retry-After's fallback is attempt-local (`_restrict_resource` records only a
+    provider-named deadline)."""
+    if exc.category == "rate_limited" or exc.category in _LOCAL_DEADLINE_CATEGORIES:
+        return False
+    return _restrict_resource(state, execution, credential, resource, exc)
 
 
 def _restriction_evidence(
@@ -2335,6 +2366,18 @@ async def _run_gdrive_stream_unlocked(
                 # A terminal page that seeded a rescan was read before that rescan enumerated
                 # anything: the drain goes on from its token, and only a page read now can end it.
                 continue
+            changes_operation = f"{_CHANGES_RESOURCE}{drive_id}"
+            if _operation_restricted(state, execution, credential_identity(options), changes_operation):
+                # A provider-named minimum for THIS drive's change pages stands (A3) — learned in an
+                # earlier generation, run or fresh store, it is not waived by a scope edit, reconnect
+                # or restart. No page is read before it; the cursor stays; the stream is partial.
+                await _checkpoint_progress(
+                    client, execution, state, namespace, phase="partial",
+                    last_error="provider_restricted_resource",
+                )
+                summary.skipped += 1
+                _count(summary, "provider_restricted_resource")
+                return summary
             try:
                 page = read_change_page(
                     drive, token, None if drive_id == "my-drive" else str(drive_id),
@@ -2378,6 +2421,9 @@ async def _run_gdrive_stream_unlocked(
                 if exc.category == "rate_limited":
                     # The account's wait, not this stream's: every stream of it is held (R45 H1).
                     raise _account_hold(exc) from exc
+                # A provider-named minimum for this drive's change pages is journaled durably for the
+                # operation (A3) BEFORE the checkpoint, so a generation transition cannot waive it.
+                _restrict_operation(state, execution, credential_identity(options), changes_operation, exc)
                 await _checkpoint_progress(
                     client, execution, state, namespace, phase="partial",
                     last_error=exc.category, retry_not_before=exc.not_before,
@@ -2622,16 +2668,26 @@ async def _run_gdrive_stream_unlocked(
                     # for it — the deferred root's own recovery re-lists it.
                     held_by_deferred_root = True
                     continue
-                if trashed and selected:
+                if trashed and (selected or file.get("mimeType") in (None, GOOGLE_DOC_MIME)):
                     # Verified trash needs no root to vouch for it: a restricted, deferred, leaving or
                     # unreadable parent root blocks READS, not the reconciliation of evidence already
                     # in hand. The evidence travels in the obligation (`trashed`), so the removal
                     # drain settles it without a parent or document probe — through retries, a
                     # failed sink acknowledgment and a restart alike — via the claim-aware owner.
+                    #
+                    # Local membership is NOT required (AIO-1167 final review A1): after recovery
+                    # with fresh local state behind a restricted root, this stream may hold no
+                    # membership while the brain still holds this connection's claim. Whether a claim
+                    # exists is the fenced, connection-scoped reconciler's question, never local
+                    # state's: for a document this connection never claimed the removal is a no-op,
+                    # and another connection's claim is never a candidate. Only POSITIVE document
+                    # trash qualifies — an ambiguous `removed`, missing local state or root
+                    # uncertainty stays on the absence gates below.
                     obligations.append((file_id, "remove", {
                         "file_id": file_id, "trashed": True, "reason": "explicit_trash",
                     }))
-                    membership_removals.append(file_id)
+                    if selected:
+                        membership_removals.append(file_id)
                     continue
                 if removed or moved_out or (selected and not in_scope):
                     if (selected or moved_out) and absence_withheld(
@@ -3044,8 +3100,17 @@ async def _enumerate_baseline(
             return False, work_consumed
 
     root_kinds = {str(row["root_id"]): str(row["root_kind"]) for row in roots}
+    # Folders whose LISTING operation is under a standing provider minimum (A3). Their traversal rows
+    # are left open — never read before the minimum, whatever generation, reconnect or fresh store
+    # this is — while every other folder's rows go on; the build simply cannot complete meanwhile.
+    restricted_listings = {
+        key[len(_FOLDER_LISTING_RESOURCE):] for key in restricted_roots
+        if key.startswith(_FOLDER_LISTING_RESOURCE)
+    }
     while pages_read < page_budget:
-        row = state.next_traversal(namespace, generation, snapshot_id=snapshot_id)
+        row = state.next_traversal(
+            namespace, generation, snapshot_id=snapshot_id, exclude_folders=restricted_listings,
+        )
         if row is None:
             break
         token = str(row["page_token"] or "") or None
@@ -3091,7 +3156,15 @@ async def _enumerate_baseline(
             }
             if row["drive_id"] != "my-drive":
                 kwargs.update(corpora="drive", driveId=row["drive_id"])
-            response = source._execute(drive.files().list(**kwargs))
+            try:
+                response = source._execute(drive.files().list(**kwargs))
+            except ProviderDeferred as exc:
+                # A provider-named minimum for listing THIS folder is journaled for the folder
+                # operation (A3) — not the page token — before the stream's handler checkpoints it.
+                _restrict_operation(
+                    state, execution, credential, f"{_FOLDER_LISTING_RESOURCE}{row['folder_id']}", exc,
+                )
+                raise
             pages_read += 1
             obligations = []
             membership_additions = []

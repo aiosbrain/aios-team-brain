@@ -169,3 +169,136 @@ async def test_an_ambiguous_removed_hint_under_a_restricted_parent_is_not_trash_
     assert not RESTRICTED_READS & set(world.calls) and _reads_of(world, "doc-n") == []
     assert _owed_removal_payload(state, world, "doc-n") is None  # no trash-bearing obligation
     state.close()
+
+
+# ------------------------------------------------------------------------------------------------ #
+# AIO-1167 final review A1 — explicit trash after LOCAL MEMBERSHIP LOSS (fresh-state recovery)
+# ------------------------------------------------------------------------------------------------ #
+
+def _acknowledged_restriction(world, resource):
+    """A provider minimum the brain already acknowledged for this account (adopted by a fresh store)."""
+    world.progress["document_restrictions"] = {
+        "generation": GEN, "credential": "account",
+        "items": [{"id": resource, "not_before": FAR, "category": "provider_unavailable", "unrepresentable": False}],
+    }
+
+
+async def _recover_fresh_behind_restricted_parent(tmp_path, world, name):
+    """Import and keep the brain's claims, then recover with a NEW SQLite store while the selected
+    parent folder is restricted: the stream holds no local membership for its documents."""
+    first = StateStore(str(tmp_path / f"{name}-first.sqlite"))
+    assert (await run(world, first)).authoritative_complete is True
+    first.close()
+    _acknowledged_restriction(world, "folder-r")
+    path = str(tmp_path / f"{name}-fresh.sqlite")
+    fresh = StateStore(path)
+    world.calls.clear()
+    for _ in range(2):
+        await run(world, fresh)
+    assert not RESTRICTED_READS & set(world.calls)
+    assert "doc-n" not in fresh.membership_ids(world.namespace(DRIVE), GEN)  # nothing invented
+    return path, fresh
+
+
+@pytest.mark.parametrize("other_claim", [False, True], ids=["last-claim", "second-connection-claim"])
+@pytest.mark.asyncio
+async def test_explicit_trash_with_no_local_membership_is_still_reconciled_without_a_read(
+    tmp_path, monkeypatch, clock, other_claim,
+):
+    world = _nested_world(monkeypatch)
+    if other_claim:
+        world.ledger.push("another-connection", "doc-n")
+    _path, state = await _recover_fresh_behind_restricted_parent(tmp_path, world, f"a1-{other_claim}")
+    reconciled = list(world.reconciled)
+    last_success = world.stream(DRIVE).get("last_success_at")
+
+    _trash(world, "doc-n")
+    world.calls.clear()
+    outcome = await run(world, state)
+
+    assert not RESTRICTED_READS & set(world.calls) and _reads_of(world, "doc-n") == []
+    assert "doc-n" in world.removed
+    assert (world.integration_id, "doc-n") in world.ledger.retired
+    if other_claim:
+        assert world.ledger.claims["doc-n"] == {"another-connection"}
+        assert "doc-n" not in world.ledger.deleted
+    else:
+        assert "doc-n" in world.ledger.deleted
+    # Root recovery is still owed: the run stays partial and no complete success is recorded.
+    assert outcome.authoritative_complete is False
+    assert world.reconciled == reconciled
+    assert world.stream(DRIVE).get("last_success_at") == last_success
+    assert "doc-d" not in world.removed
+    state.close()
+
+
+@pytest.mark.parametrize("failure", ["sink-failure", "acknowledgment-lost"])
+@pytest.mark.asyncio
+async def test_membershipless_trash_evidence_survives_sink_failure_or_lost_ack_and_replays(
+    tmp_path, monkeypatch, clock, failure,
+):
+    from datetime import timedelta
+
+    from aios_ingest import gdrive_sync
+
+    world = _nested_world(monkeypatch)
+    path, state = await _recover_fresh_behind_restricted_parent(tmp_path, world, f"a1-{failure}")
+    if failure == "sink-failure":
+        world.removal_faults = [BrainError(503, "server_error", "sink unavailable")]
+    else:
+        # The brain applies the removal, and its answer never arrives.
+        client = gdrive_sync.BrainClient
+        original = client.reconcile_gdrive
+        lost: list[int] = []
+
+        async def applied_then_lost(self, execution, **kwargs):
+            result = await original(self, execution, **kwargs)
+            if kwargs.get("removed_provider_ids") and not lost:
+                lost.append(1)
+                raise BrainError(503, "server_error", "acknowledgment lost")
+            return result
+
+        monkeypatch.setattr(client, "reconcile_gdrive", applied_then_lost)
+    _trash(world, "doc-n")
+    await run(world, state)
+
+    payload = _owed_removal_payload(state, world, "doc-n")
+    assert payload is not None and payload.get("trashed") is True  # still owed, evidence durable
+    state.close()
+
+    state = StateStore(path)  # reopen and replay
+    clock.at += timedelta(minutes=1)
+    world.calls.clear()
+    await run(world, state)
+    assert _owed_removal_payload(state, world, "doc-n") is None  # acknowledged only now
+    assert not RESTRICTED_READS & set(world.calls) and _reads_of(world, "doc-n") == []
+    assert world.ledger.retired.count((world.integration_id, "doc-n")) == 1  # idempotent replay
+    assert "doc-n" in world.ledger.deleted
+    state.close()
+
+
+@pytest.mark.asyncio
+async def test_with_no_local_membership_an_ambiguous_removal_keeps_the_claim_and_stray_trash_is_harmless(
+    tmp_path, monkeypatch, clock,
+):
+    world = _nested_world(monkeypatch)
+    world.put("doc-x", drive=DRIVE)  # never selected by this connection
+    world.ledger.push("another-connection", "doc-x")
+    _path, state = await _recover_fresh_behind_restricted_parent(tmp_path, world, "a1-negatives")
+
+    # An ambiguous `removed` (no file body) under the same uncertainty is not trash.
+    world.logs.setdefault(DRIVE, []).append({"fileId": "doc-n", "removed": True})
+    # Explicit trash of a document this connection never claimed.
+    _trash(world, "doc-x")
+    world.calls.clear()
+    await run(world, state)
+
+    assert _owed_removal_payload(state, world, "doc-n") is None
+    assert "doc-n" not in world.removed
+    assert world.ledger.claims["doc-n"] == {world.integration_id}  # the claim is retained
+    assert not RESTRICTED_READS & set(world.calls) and _reads_of(world, "doc-n") == []
+    # The stray trash reaches the connection-scoped owner and changes nothing there.
+    assert (world.integration_id, "doc-x") not in world.ledger.retired
+    assert world.ledger.claims["doc-x"] == {"another-connection"}
+    assert "doc-x" not in world.ledger.deleted
+    state.close()

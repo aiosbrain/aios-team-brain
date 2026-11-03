@@ -187,6 +187,18 @@ def quota_deferral(exc: Exception) -> ProviderDeferred | None:
     return deferral
 
 
+def operation_deferral(exc: Exception) -> ProviderDeferred | None:
+    """A PROVIDER-NAMED minimum on a non-quota answer (AIO-1167 final review A4): a valid or
+    unrepresentable Retry-After, classified by the one shared owner (``_provider_deferral``). ``None``
+    for a quota answer (that is the account's — ``quota_deferral``) and for an answer naming no
+    minimum: a missing or malformed header's bounded fallback stays attempt-local and never becomes a
+    durable operation restriction."""
+    if GoogleDriveSource._rate_limited(exc):
+        return None
+    deferral, _delay = _provider_deferral(exc, "provider_unavailable", 0)
+    return deferral if deferral.provider_deadline else None
+
+
 class ProviderCursorInvalid(RuntimeError):
     """Drive rejected an opaque change token; the coordinator must perform a controlled rescan."""
 
