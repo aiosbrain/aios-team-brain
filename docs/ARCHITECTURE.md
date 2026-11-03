@@ -986,7 +986,15 @@ R44 contracts (AIO-1167):
   instant (`coalesceGdriveObservations`, used by the ledger, the evidence store and the Timeline's
   frontmatter display; the Timeline's stored-evidence leg applies the same rule per item through
   `coalesceStoredGdriveEvidence`, so evidence stored before coalescing — or adopted by the migration's
-  backfill — still counts once).
+  backfill — still counts once). Two stable permission ids carrying that email there are ambiguous:
+  nothing folds. `author-email:<address>` — what the producer emits when Drive withholds a permission
+  id — is email evidence, never a stable id (`gdriveStableId`), and a legacy bare-email row and an
+  `author-email:` row of the same normalized email, role and instant are ONE observation (AIO-1167 R52).
+  Of that pair the provider-keyed row always speaks, whatever the input or write order
+  (`mergeGdriveContributions`), so its exact `author-email:` mapping authority is never traded for a
+  roster-email match; the evidence store retires the stored equivalent (`supersededEvidenceKeys`), and the
+  Timeline reads one row per item observation through `latestStoredGdriveObservations`, where recency
+  decides only between rows of the same provenance.
 - **Sidecar:** a service-account run is namespaced by the account its LOADED key authenticates as and
   refused before any progress is used when that differs from the verified identity; watch renewal
   resolves the same namespace. Jobs bind local entries by immutable integration id (a same-name entry

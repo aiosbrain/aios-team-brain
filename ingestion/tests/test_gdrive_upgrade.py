@@ -526,6 +526,37 @@ def test_service_account_and_owner_metadata_never_become_human_authorship_or_wor
     }
 
 
+def test_editor_without_permission_id_is_emitted_as_canonical_author_email_evidence():
+    """AIO-1167 R52 producer contract: the brain treats `author-email:<address>` as the address only
+    (email evidence, never a stable id) and coalesces it with a bare-email observation of the same
+    normalized email, role and instant. That holds only if the producer emits the canonical key — the
+    trimmed, lowercased address — beside the same normalized email and a UTC millisecond instant."""
+    drive = _Drive([], {
+        "doc1": {
+            "id": "doc1", "name": "Edited", "mimeType": "application/vnd.google-apps.document",
+            "modifiedTime": "2026-09-02T06:32:03+05:30",
+            "lastModifyingUser": {"emailAddress": "  Person.Name@Example.COM  ", "displayName": " Person Name "},
+        },
+    })
+    docs = _Docs({"doc1": {
+        "title": "Edited", "tabs": [{
+            "tabProperties": {"tabId": "root", "title": "Root"},
+            "documentTab": {"body": {"content": [_paragraph("body\n")]}},
+        }],
+    }})
+    doc = next(iter(GoogleDriveSource(
+        file_ids=["doc1"], api_mode="docs", _drive_service=drive, _docs_service=docs,
+    ).fetch()))
+    identity = {
+        "provider": "gdrive", "role": "editor", "external_id": "author-email:person.name@example.com",
+        "email": "person.name@example.com", "display_name": "Person Name",
+    }
+    assert doc.authors == [identity]
+    # No readable history here: the latest editor is the one contribution, at the UTC instant.
+    assert doc.extra_frontmatter["contributions"] == [{**identity, "at": "2026-09-02T01:02:03.000Z"}]
+    assert "latest_editor_only" in {row["code"] for row in doc.extra_frontmatter["attribution_diagnostics"]}
+
+
 class _GoogleHttpError(Exception):
     """A Google API error as googleapiclient raises it: status on ``resp``, reasons in the body."""
 
