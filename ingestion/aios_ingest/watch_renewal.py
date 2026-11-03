@@ -513,11 +513,9 @@ async def _create(
     # published inside the run deadline.
     dispatch_deadline = run.deadline - _publish_reserve()
 
-    def dispatch_when_admitted() -> Any:
-        # The final provider-dispatch boundary. A queued worker may start only after an abandoned one
-        # has finished — and journaled its restriction — so admission is asked once more, on the loop
-        # that owns the StateStore, immediately before the request. A refusal, or no answer, means
-        # the request is never sent: `WatchNotDispatched` retires the attempt.
+    def confirm_admission() -> None:
+        # Asked from the worker, answered on the loop that owns the StateStore. A refusal, or no
+        # answer, means the request is never sent: `WatchNotDispatched` retires the attempt.
         try:
             refused = _ask_loop(
                 loop, lambda: _creation_refusal(run, account_id, drive_id),
@@ -527,9 +525,24 @@ async def _create(
             raise WatchNotDispatched("not dispatched: admission could not be confirmed") from None
         if refused is not None:
             raise WatchNotDispatched(refused)
+
+    def admitted_gate() -> None:
+        # The manager calls its provider gate immediately before `request.execute`, and the live
+        # authority check inside it can block — long enough for an abandoned worker to journal the
+        # account's quota or this drive's creation minimum. So admission is decided once more AFTER
+        # that check returns: the authority answer keeps its precedence, and a restriction that landed
+        # meanwhile still stops the request before it is sent.
+        if provider_gate is not None:
+            provider_gate()
+        confirm_admission()
+
+    def dispatch_when_admitted() -> Any:
+        # A queued worker may start only after an abandoned one has finished — and journaled its
+        # restriction — so admission is asked before any client work too.
+        confirm_admission()
         return manager.dispatch(
             dispatched, page_token=cursor, verification_token=token,
-            access_token=access_token, provider_gate=provider_gate, deadline=dispatch_deadline,
+            access_token=access_token, provider_gate=admitted_gate, deadline=dispatch_deadline,
         )
 
     try:

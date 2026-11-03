@@ -48,7 +48,9 @@ from aios_ingest.watch_lifecycle import (
 from test_watch_lifecycle import (
     ACCOUNT, INTEGRATION, SETTINGS, _conn, _controlled_deadline, _Provider, _record,
 )
-from test_watch_quota_hold import GEN, LONG, _hold, _local_watch_state, _near, _published_hold, _quota_brain
+from test_watch_quota_hold import (
+    GEN, LONG, _fake_drive, _hold, _local_watch_state, _manager, _near, _published_hold, _quota_brain,
+)
 
 OTHER_ACCOUNT = "previous-account"
 
@@ -583,4 +585,84 @@ async def test_a_creation_queued_behind_the_abandoned_worker_is_refused_at_the_d
     assert records["current"].state == ACTIVE
     assert brain.progress["streams"] == streams_before
     assert _published_hold(brain) is None
+    state.close()
+
+
+class _BlockingGate:
+    """The brain's live authority gate, whose FIRST check blocks in the worker until released."""
+
+    def __init__(self):
+        self.entered, self.release = threading.Event(), threading.Event()
+        self.checks = 0
+
+    def __call__(self):
+        self.checks += 1
+        if self.checks == 1:
+            self.entered.set()
+            assert self.release.wait(10), "the test never released the authority check"
+
+    def close(self):
+        pass
+
+
+_REFUSALS = {
+    "quota": "not dispatched: the account's provider quota hold stands",
+    "minimum": "not dispatched: a provider minimum for creating a channel on this drive stands",
+}
+
+
+@pytest.mark.parametrize("answer", ["quota", "minimum"])
+@pytest.mark.asyncio
+async def test_a_restriction_journaled_while_the_production_managers_authority_check_blocks_prevents_the_request(
+    tmp_path, monkeypatch, answer,
+):
+    """The PRODUCTION watch manager makes the live authority check immediately before
+    ``request.execute``, and that check can block. A fresh sweep's my-drive creation passes every
+    earlier admission and blocks inside it; meanwhile the cancelled sweep's abandoned worker answers and
+    its restriction — the account's quota or my-drive's creation minimum — is journaled on the loop.
+    When the check returns, admission is decided once more: ``request.execute`` is never called and the
+    attempt retires as provably not dispatched. A drive minimum leaves the independent drive's creation
+    alone; the account hold stops every further watch call."""
+    brain = _quota_brain(due=True).install(monkeypatch)
+    streams_before = copy.deepcopy(brain.progress["streams"])
+    state = StateStore(str(tmp_path / f"gate-{answer}.sqlite"))
+    late = _LateAnswerProvider(brain, _late_answer(answer))
+    abandoned = await _abandon_first_creation(state, late)
+
+    # Sweep 2 runs through the production manager over a scripted transport: every `request.execute`
+    # is recorded in `drive.calls`. Its authority check blocks the first time.
+    drive = _fake_drive(monkeypatch)
+    gate = _BlockingGate()
+    monkeypatch.setattr(
+        watch_renewal.brain_client.BrainClient, "gdrive_provider_gate", lambda self, execution: gate,
+    )
+    second = asyncio.create_task(watch_renewal.renew_watches(state, _manager(), [_conn()], SETTINGS))
+    await asyncio.to_thread(gate.entered.wait, 10)
+    assert _restriction(state, answer) is None  # every admission before the authority check passed
+    (attempt,) = [r for r in brain.records().values()
+                  if r.predecessor == "current" and r.attempt_id != abandoned.attempt_id]
+    assert attempt.state == DISPATCHED  # durably marked, inside the manager, not yet sent
+
+    late.release.set()  # the abandoned worker answers; its restriction is journaled on this loop
+    await _until(lambda: _restriction(state, answer) is not None)
+    gate.release.set()
+    await second
+
+    watch_requests = [call for call in drive.calls if call[0] == "watch"]
+    assert ("watch", "my-drive") not in watch_requests  # `request.execute` was never called for it
+    if answer == "quota":
+        assert drive.calls == []  # the account hold stops every watch call, stops included
+        assert _published_hold(brain) is None  # a late hold waits for a fresh acquisition
+    else:
+        assert watch_requests == [("watch", "shared-x")]  # the independent drive is still created
+    records = brain.records()
+    retired = records[attempt.attempt_id]
+    assert retired.state == RETIRED and retired.detail == _REFUSALS[answer]
+    assert retired.resource_id is None
+    assert _local_watch_state(state, attempt.attempt_id) == RETIRED
+    assert records[abandoned.attempt_id].state == UNCERTAIN  # recovered, never activated
+    assert records["current"].state == ACTIVE  # the predecessor is untouched
+    assert brain.progress["streams"] == streams_before  # no cursor moved
+    assert _restriction(state, answer) is not None  # the restriction persists
+    assert brain.events[-1] == "release"
     state.close()
